@@ -13,7 +13,6 @@ import (
 	"net"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -937,13 +936,13 @@ func (c *clientConn) handleStartup() error {
 	}
 
 	for {
-		params, err := wire.ReadStartupMessage(c.reader)
+		startup, err := wire.ReadStartupMessage(c.reader)
 		if err != nil {
 			return err
 		}
 
 		// Handle GSSENCRequest - decline and let client retry with SSL
-		if params["__gssenc_request"] == "true" {
+		if startup.GSSENCRequest {
 			c.logger().Debug("GSSENCRequest received, declining.", "remote_addr", c.conn.RemoteAddr())
 			if _, err := c.conn.Write([]byte("N")); err != nil {
 				return err
@@ -952,7 +951,7 @@ func (c *clientConn) handleStartup() error {
 		}
 
 		// Handle SSL request - upgrade to TLS
-		if params["__ssl_request"] == "true" {
+		if startup.SSLRequest {
 			if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
 				return fmt.Errorf("failed to clear startup deadline: %w", err)
 			}
@@ -985,18 +984,13 @@ func (c *clientConn) handleStartup() error {
 		}
 
 		// Handle cancel request
-		if params["__cancel_request"] == "true" {
-			// Extract pid and secret key from the cancel request
-			if pidStr, ok := params["__cancel_pid"]; ok {
-				if secretKeyStr, ok := params["__cancel_secret_key"]; ok {
-					pid, _ := strconv.ParseInt(pidStr, 10, 32)
-					secretKey, _ := strconv.ParseInt(secretKeyStr, 10, 32)
-					key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
-					c.server.CancelQuery(key)
-				}
+		if startup.CancelRequest {
+			if startup.CancelCredentialsPresent {
+				c.server.CancelQuery(BackendKey{Pid: startup.CancelPID, SecretKey: startup.CancelSecretKey})
 			}
 			return errCancelHandled
 		}
+		params := startup.Params
 
 		// Reject non-TLS connections
 		if !tlsUpgraded {

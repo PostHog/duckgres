@@ -64,24 +64,37 @@ const (
 	maxMessageLength = 1 << 30
 )
 
-// readStartupMessage reads the initial startup message from the client
-func ReadStartupMessage(r io.Reader) (map[string]string, error) {
+// StartupMessage is the parsed initial message from a PostgreSQL client. Cancel
+// credentials intentionally live outside Params: callers log ordinary startup
+// fields such as user and application_name, but must never log a cancel key.
+type StartupMessage struct {
+	Params                   map[string]string
+	SSLRequest               bool
+	GSSENCRequest            bool
+	CancelRequest            bool
+	CancelCredentialsPresent bool
+	CancelPID                int32
+	CancelSecretKey          int32
+}
+
+// ReadStartupMessage reads the initial startup message from the client.
+func ReadStartupMessage(r io.Reader) (StartupMessage, error) {
 	// Read message length (4 bytes)
 	var length int32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-		return nil, fmt.Errorf("failed to read startup message length: %w", err)
+		return StartupMessage{}, fmt.Errorf("failed to read startup message length: %w", err)
 	}
 
 	// Validate before allocating: minimum 8 = length field (4) + protocol
 	// version (4), which also guarantees remaining[:4] below is in range.
 	if length < 8 || length > maxStartupMessageLength {
-		return nil, fmt.Errorf("invalid startup message length: %d", length)
+		return StartupMessage{}, fmt.Errorf("invalid startup message length: %d", length)
 	}
 
 	// Read remaining bytes
 	remaining := make([]byte, length-4)
 	if _, err := io.ReadFull(r, remaining); err != nil {
-		return nil, fmt.Errorf("failed to read startup message body: %w", err)
+		return StartupMessage{}, fmt.Errorf("failed to read startup message body: %w", err)
 	}
 
 	// Read protocol version (4 bytes)
@@ -89,28 +102,27 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 
 	// Check for SSL request (80877103)
 	if protocolVersion == 80877103 {
-		return map[string]string{"__ssl_request": "true"}, nil
+		return StartupMessage{SSLRequest: true}, nil
 	}
 
 	// Check for GSSENCRequest (80877104, PostgreSQL 12+)
 	// JDBC drivers with gssEncMode=prefer send this before SSLRequest.
 	if protocolVersion == 80877104 {
-		return map[string]string{"__gssenc_request": "true"}, nil
+		return StartupMessage{GSSENCRequest: true}, nil
 	}
 
 	// Check for cancel request (80877102)
 	// Format: 4 bytes length, 4 bytes request code, 4 bytes pid, 4 bytes secret key
 	if protocolVersion == 80877102 {
 		if len(remaining) >= 12 {
-			cancelPid := binary.BigEndian.Uint32(remaining[4:8])
-			cancelSecretKey := binary.BigEndian.Uint32(remaining[8:12])
-			return map[string]string{
-				"__cancel_request":    "true",
-				"__cancel_pid":        fmt.Sprintf("%d", cancelPid),
-				"__cancel_secret_key": fmt.Sprintf("%d", cancelSecretKey),
+			return StartupMessage{
+				CancelRequest:            true,
+				CancelCredentialsPresent: true,
+				CancelPID:                int32(binary.BigEndian.Uint32(remaining[4:8])),
+				CancelSecretKey:          int32(binary.BigEndian.Uint32(remaining[8:12])),
 			}, nil
 		}
-		return map[string]string{"__cancel_request": "true"}, nil
+		return StartupMessage{CancelRequest: true}, nil
 	}
 
 	// Parse parameters (null-terminated key-value pairs)
@@ -149,7 +161,7 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 		}
 	}
 
-	return params, nil
+	return StartupMessage{Params: params}, nil
 }
 
 // readMessage reads a single message from the client

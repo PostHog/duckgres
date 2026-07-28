@@ -712,7 +712,7 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 	if ok && cancel != nil {
 		cancel()
 		queryCancellationsCounter.Inc()
-		slog.Info("Query cancelled via cancel request.", "pid", key.Pid, "secret_key", key.SecretKey)
+		slog.Info("Query cancelled via cancel request.", "pid", key.Pid)
 		return true
 	}
 	return false
@@ -2542,7 +2542,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// should be read by the child process after FD passing.
 	// The SSL request is a single, small message and the client waits for 'S'
 	// before sending the TLS ClientHello, so unbuffered reads are safe here.
-	params, err := wire.ReadStartupMessage(conn)
+	startup, err := wire.ReadStartupMessage(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
@@ -2557,7 +2557,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// Handle GSSENCRequest - decline and re-read for SSLRequest.
 	// Loop to handle the unlikely case of multiple GSSENCRequests.
 	for range 3 {
-		if params["__gssenc_request"] != "true" {
+		if !startup.GSSENCRequest {
 			break
 		}
 		slog.Debug("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
@@ -2568,7 +2568,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 			return
 		}
 		// Re-read: client will send SSLRequest next
-		params, err = wire.ReadStartupMessage(conn)
+		startup, err = wire.ReadStartupMessage(conn)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, io.EOF) {
 				slog.Debug("Client closed connection after GSSENC decline.", "remote_addr", remoteAddr)
@@ -2582,15 +2582,17 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	}
 
 	// Handle cancel request in parent (no child spawn needed)
-	if params["__cancel_request"] == "true" {
-		s.handleCancelRequestIsolated(params)
+	if startup.CancelRequest {
+		if startup.CancelCredentialsPresent {
+			s.handleCancelRequestIsolated(BackendKey{Pid: startup.CancelPID, SecretKey: startup.CancelSecretKey})
+		}
 		s.rateLimiter.UnregisterConnection(remoteAddr)
 		_ = conn.Close()
 		return
 	}
 
 	// Handle SSL request: send 'S' then spawn child for TLS handshake
-	if params["__ssl_request"] == "true" {
+	if startup.SSLRequest {
 		if err := conn.SetReadDeadline(time.Time{}); err != nil {
 			slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
 			s.rateLimiter.UnregisterConnection(remoteAddr)
@@ -2643,22 +2645,6 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 }
 
 // handleCancelRequestIsolated handles a cancel request in process isolation mode.
-func (s *Server) handleCancelRequestIsolated(params map[string]string) {
-	pidStr := params["__cancel_pid"]
-	secretKeyStr := params["__cancel_secret_key"]
-
-	if pidStr == "" || secretKeyStr == "" {
-		return
-	}
-
-	var pid, secretKey int64
-	if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
-		return
-	}
-	if _, err := fmt.Sscanf(secretKeyStr, "%d", &secretKey); err != nil {
-		return
-	}
-
-	key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
+func (s *Server) handleCancelRequestIsolated(key BackendKey) {
 	s.CancelQueryBySignal(key)
 }
