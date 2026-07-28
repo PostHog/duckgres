@@ -297,16 +297,22 @@ func (s *reconnectRuntimeStore) TryAcquireOrgConnectionLeaseForRef(ref configsto
 }
 
 type blockingCreateSessionPool struct {
-	worker *ManagedWorker
+	worker       *ManagedWorker
+	releaseCalls atomic.Int32
+	retireCalls  atomic.Int32
 }
 
 func (p *blockingCreateSessionPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
 	return p.worker, nil
 }
 
-func (p *blockingCreateSessionPool) ReleaseWorker(id int) {}
+func (p *blockingCreateSessionPool) ReleaseWorker(id int) {
+	p.releaseCalls.Add(1)
+}
 
-func (p *blockingCreateSessionPool) RetireWorker(id int) {}
+func (p *blockingCreateSessionPool) RetireWorker(id int) {
+	p.retireCalls.Add(1)
+}
 
 func (p *blockingCreateSessionPool) RetireWorkerIfNoSessions(id int) bool {
 	return false
@@ -898,6 +904,62 @@ func TestDestroyAllSessionsRejectsInFlightCreateBeforeRegistration(t *testing.T)
 	}
 	if got := flightClient.destroyCalls.Load(); got != 1 {
 		t.Fatalf("expected worker session to be destroyed once, got %d", got)
+	}
+}
+
+func TestDestroyAllSessionsRetiresWorkerWhenUnregisteredSessionCleanupTimesOut(t *testing.T) {
+	flightClient := &blockingCreateSessionFlightClient{
+		createStarted:   make(chan struct{}),
+		allowCreate:     make(chan struct{}),
+		createSucceeded: make(chan struct{}),
+		destroyRecvErr:  context.DeadlineExceeded,
+	}
+	worker := &ManagedWorker{
+		ID:     7,
+		client: &flightsql.Client{Client: flightClient},
+		done:   make(chan struct{}),
+	}
+	pool := &blockingCreateSessionPool{worker: worker}
+	sm := NewSessionManager(pool, nil)
+
+	createErr := make(chan error, 1)
+	go func() {
+		_, _, err := sm.CreateSessionWithProtocol(context.Background(), "root", 1010, "", 0, "postgres", nil)
+		createErr <- err
+	}()
+
+	select {
+	case <-flightClient.createStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CreateSession RPC to start")
+	}
+
+	sm.mu.Lock()
+	close(flightClient.allowCreate)
+	select {
+	case <-flightClient.createSucceeded:
+	case <-time.After(time.Second):
+		sm.mu.Unlock()
+		t.Fatal("timed out waiting for worker CreateSession to succeed")
+	}
+	go sm.BeginDrain()
+	waitForSessionManagerDraining(t, sm)
+	sm.mu.Unlock()
+
+	select {
+	case err := <-createErr:
+		if !errors.Is(err, ErrSessionManagerDraining) {
+			t.Fatalf("CreateSessionWithProtocol error = %v, want %v", err, ErrSessionManagerDraining)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for CreateSession to return")
+	}
+
+	if got := pool.releaseCalls.Load(); got != 0 {
+		t.Fatalf("ReleaseWorker calls = %d after timed-out cleanup, want 0", got)
+	}
+	if got := pool.retireCalls.Load(); got != 1 {
+		t.Fatalf("RetireWorker calls = %d after timed-out cleanup, want 1", got)
 	}
 }
 
