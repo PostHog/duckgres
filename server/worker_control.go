@@ -12,6 +12,7 @@ type (
 	WorkerDestroySessionPayload     = wire.WorkerDestroySessionPayload
 	WorkerHealthCheckPayload        = wire.WorkerHealthCheckPayload
 	WorkerWaitSessionIdlePayload    = wire.WorkerWaitSessionIdlePayload
+	WorkerSetS3CachePayload         = wire.WorkerSetS3CachePayload
 	WorkerReleaseQueryHandlePayload = wire.WorkerReleaseQueryHandlePayload
 	WorkerQueryLogPayload           = wire.WorkerQueryLogPayload
 )

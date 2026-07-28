@@ -279,15 +279,19 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 			}, nil
 		}
 
-		// duckgres-namespaced custom GUC (duckgres.query_source): intercepted
-		// session-side, never deparsed/forwarded to DuckDB. Return early so the
-		// connection layer can store/echo it.
-		if transformResult.QuerySourceSet != nil || transformResult.QuerySourceShow {
+		// duckgres-namespaced custom GUCs (duckgres.query_source,
+		// duckgres.s3_cache): intercepted session-side, never
+		// deparsed/forwarded to DuckDB. Return early so the connection layer
+		// can store/apply/echo them.
+		if transformResult.QuerySourceSet != nil || transformResult.QuerySourceShow ||
+			transformResult.S3CacheSet != nil || transformResult.S3CacheShow {
 			return &Result{
 				SQL:             sql,
 				ParamCount:      transformResult.ParamCount,
 				QuerySourceSet:  transformResult.QuerySourceSet,
 				QuerySourceShow: transformResult.QuerySourceShow,
+				S3CacheSet:      transformResult.S3CacheSet,
+				S3CacheShow:     transformResult.S3CacheShow,
 			}, nil
 		}
 

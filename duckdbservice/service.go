@@ -90,6 +90,23 @@ type SessionPool struct {
 	// (see TestReuseExistingActivationDoesNotBlockHealthChecks).
 	refreshS3Secret func(*sql.DB, server.DuckLakeConfig, chan struct{}) error
 
+	// secretSwapMu serializes rebuilds of the tenant ducklake_s3 secret (the
+	// credential-refresh path in reuseExistingActivation vs the per-session
+	// duckgres.s3_cache toggle in SetS3CacheEnabled) so the last-applied
+	// transport always matches s3CacheBypassed. Never held across p.mu waits;
+	// held across the (slow) CREATE OR REPLACE SECRET, which p.mu must not be.
+	secretSwapMu sync.Mutex
+	// s3CacheBypassed is true while the tenant S3 secret carries the org's
+	// native HTTPS transport instead of the cache-proxy transport, i.e. the
+	// current session set `duckgres.s3_cache = off`. Flipped only under
+	// secretSwapMu (read under p.mu); the one exception is activateTenant's
+	// reset-to-false at first-activation commit, which cannot race a swap
+	// because SetS3CacheEnabled refuses to run before an activation exists
+	// (and taking secretSwapMu there would invert the secretSwapMu→p.mu lock
+	// order). CreateSession restores the proxy transport before a new session
+	// starts so a bypass can never leak into the org's next session.
+	s3CacheBypassed bool
+
 	drainMu       sync.Mutex
 	draining      bool
 	activeWork    int
@@ -1063,6 +1080,21 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 		return nil, nil, cfgErr
 	}
 
+	// Restore the cache-proxy S3 transport if the previous session's
+	// `duckgres.s3_cache = off` left the tenant secret bypassing the cache. A
+	// leaked bypass silently routes every subsequent session past the NVMe
+	// cache (the mw-prod-us 2026-07-17 failure mode), so this restore is a
+	// hard invariant: failure fails the session create — the control plane
+	// retries on a fresh worker — rather than starting a session in an
+	// unknown transport state. No-op unless a bypass is actually in effect.
+	if err := p.SetS3CacheEnabled(true); err != nil {
+		_ = conn.Close()
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
+		return nil, nil, fmt.Errorf("restore S3 cache transport before session start: %w", err)
+	}
+
 	if err := initAttachedDuckLakeSessionMetadata(conn, db, sessionCfg); err != nil {
 		_ = conn.Close()
 		p.mu.Lock()
@@ -1324,6 +1356,16 @@ func (p *SessionPool) DestroySession(token string) error {
 			slog.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
 		}
 		wipeCancel()
+	}
+
+	// Best-effort restore of the cache-proxy S3 transport if this session
+	// disabled it (`duckgres.s3_cache = off`). The mandatory restore happens
+	// at the next CreateSession; this one just narrows the hot-idle window in
+	// which the worker's checkpointer would write past the cache proxy.
+	if p.sharedWarmMode {
+		if err := p.SetS3CacheEnabled(true); err != nil {
+			slog.Warn("Failed to restore S3 cache transport on session destroy.", "user", session.Username, "error", err)
+		}
 	}
 
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
@@ -1736,6 +1778,8 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 		return s.handler.doHealthCheck(cmd.Body, stream)
 	case "WaitSessionIdle":
 		return s.handler.doWaitSessionIdle(cmd.Body, stream)
+	case "SetSessionS3Cache":
+		return s.handler.doSetSessionS3Cache(cmd.Body, stream)
 	case "ReleaseQueryHandle":
 		return s.handler.doReleaseQueryHandle(cmd.Body, stream)
 	case "LogQuery":

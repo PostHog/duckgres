@@ -468,6 +468,32 @@ func (h *FlightSQLHandler) doWaitSessionIdle(body []byte, stream flight.FlightSe
 	return sendActionResult(stream, &flight.Result{Body: resp})
 }
 
+// doSetSessionS3Cache applies the `duckgres.s3_cache` session GUC: it swaps
+// the tenant S3 secret between the cache-proxy transport (enabled) and the
+// org's native HTTPS transport (bypassed). Requires a live session — the swap
+// is instance-global, which is session-scoped only under the one-session-per-
+// worker contract, and a sessionless caller has no business toggling it.
+// Errors surface to the control plane so the client's SET fails rather than
+// silently not taking effect.
+func (h *FlightSQLHandler) doSetSessionS3Cache(body []byte, stream flight.FlightService_DoActionServer) error {
+	var req server.WorkerSetS3CachePayload
+	if err := json.Unmarshal(body, &req); err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid SetSessionS3Cache request: %v", err)
+	}
+	if err := h.pool.validateControlMetadata(req.WorkerControlMetadata); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "stale worker owner: %v", err)
+	}
+	if _, err := h.sessionFromContext(stream.Context()); err != nil {
+		return err
+	}
+	if err := h.pool.SetS3CacheEnabled(req.Enabled); err != nil {
+		return status.Errorf(codes.Internal, "set session s3 cache: %v", err)
+	}
+
+	resp, _ := json.Marshal(map[string]bool{"ok": true})
+	return sendActionResult(stream, &flight.Result{Body: resp})
+}
+
 func (h *FlightSQLHandler) doReleaseQueryHandle(body []byte, stream flight.FlightService_DoActionServer) error {
 	var req server.WorkerReleaseQueryHandlePayload
 	if err := json.Unmarshal(body, &req); err != nil {

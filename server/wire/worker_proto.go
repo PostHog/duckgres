@@ -56,6 +56,18 @@ type WorkerWaitSessionIdlePayload struct {
 	WorkerControlMetadata
 }
 
+// WorkerSetS3CachePayload asks a worker to route the tenant's S3 traffic
+// through the node-local cache proxy (Enabled=true, the default transport) or
+// to bypass it (Enabled=false: the S3 secret is rebuilt with the org's native
+// HTTPS transport, so the proxy blind-tunnels via CONNECT and never serves or
+// fills its cache). Session-scoped in effect because remote workers run one
+// session at a time; the worker restores the proxy transport before the next
+// session starts. Carries the `duckgres.s3_cache` session GUC.
+type WorkerSetS3CachePayload struct {
+	WorkerControlMetadata
+	Enabled bool `json:"enabled"`
+}
+
 // WorkerReleaseQueryHandlePayload asks a worker to release a statement query
 // handle that was created by GetFlightInfo but abandoned before DoGet could
 // consume it.

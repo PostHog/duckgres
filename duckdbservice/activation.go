@@ -150,10 +150,76 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 		payload: payload,
 		db:      db,
 	}
+	// A fresh activation always attaches with the cache-proxy transport
+	// (overrideS3EndpointForCacheProxy above), so the bypass flag starts clean.
+	p.s3CacheBypassed = false
 	p.ownerEpoch = payload.OwnerEpoch
 	p.ownerCPInstanceID = payload.CPInstanceID
 	p.workerID = payload.WorkerID
 	stampWorkerLogIdentity(payload.OrgID, payload.WorkerID)
+	return nil
+}
+
+// SetS3CacheEnabled applies the `duckgres.s3_cache` session GUC on the worker:
+// enabled=true keeps/restores the default cache-proxy transport on the tenant
+// ducklake_s3 secret; enabled=false rebuilds the secret with the org's native
+// HTTPS transport instead, so every S3 request CONNECT-tunnels through the
+// node-local proxy as opaque TLS — no cache reads, no cache fills. Secrets are
+// consulted per request, so the swap takes effect immediately post-attach, and
+// they are instance-global — which is session-scoped in practice because
+// remote workers serve exactly one session at a time (the same contract the
+// user-secret wipe relies on).
+//
+// The swap runs on controlDB so it never queues behind a long-running client
+// query, and under secretSwapMu so it cannot interleave with a concurrent
+// credential refresh rebuilding the same secret (reuseExistingActivation).
+// No-op when this node has no cache proxy (nothing to bypass) or the worker is
+// not a shared-warm tenant worker (the proxy transport is applied only by
+// tenant activation).
+func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
+	if !p.sharedWarmMode || !cacheEnabled() {
+		return nil
+	}
+
+	p.secretSwapMu.Lock()
+	defer p.secretSwapMu.Unlock()
+
+	p.mu.RLock()
+	act := p.activation
+	bypassed := p.s3CacheBypassed
+	refreshDB := p.controlDB
+	refreshFn := p.refreshS3Secret
+	sem := p.duckLakeSem
+	p.mu.RUnlock()
+
+	if act == nil {
+		return fmt.Errorf("worker is not activated")
+	}
+	if bypassed == !enabled {
+		return nil
+	}
+	cfg := act.payload.DuckLake
+	if cfg.ObjectStore == "" {
+		// No S3-backed catalog — no secret to swap.
+		return nil
+	}
+	if refreshDB == nil {
+		refreshDB = act.db
+	}
+	if refreshFn == nil {
+		refreshFn = server.RefreshS3Secret
+	}
+	if enabled {
+		overrideS3EndpointForCacheProxy(&cfg)
+	}
+	if err := refreshFn(refreshDB, cfg, sem); err != nil {
+		return fmt.Errorf("swap S3 secret transport (s3_cache=%v): %w", enabled, err)
+	}
+
+	p.mu.Lock()
+	p.s3CacheBypassed = !enabled
+	p.mu.Unlock()
+	slog.Info("Swapped tenant S3 secret transport.", "org", act.payload.OrgID, "s3_cache_enabled", enabled)
 	return nil
 }
 
@@ -249,9 +315,26 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 			// path-style plain-HTTP secret with a vhost/HTTPS one and every S3
 			// read CONNECT-tunnels past the NVMe cache for the rest of the
 			// worker's life (mw-prod-us 2026-07-17).
+			//
+			// UNLESS the live session bypassed the cache (`duckgres.s3_cache =
+			// off`): then the rebuild must keep the native HTTPS transport, or
+			// a mid-session credential rotation would silently re-route the
+			// session through the cache. secretSwapMu serializes this rebuild
+			// against SetS3CacheEnabled so the secret always matches
+			// s3CacheBypassed; it is never held while waiting on p.mu, so the
+			// health-check responsiveness this unlocked phase exists for is
+			// preserved.
+			p.secretSwapMu.Lock()
+			p.mu.RLock()
+			bypassed := p.s3CacheBypassed
+			p.mu.RUnlock()
 			refreshCfg := payload.DuckLake
-			overrideS3EndpointForCacheProxy(&refreshCfg)
-			if err := refreshFn(refreshDB, refreshCfg, sem); err != nil {
+			if !bypassed {
+				overrideS3EndpointForCacheProxy(&refreshCfg)
+			}
+			err := refreshFn(refreshDB, refreshCfg, sem)
+			p.secretSwapMu.Unlock()
+			if err != nil {
 				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
 				return false
 			}
