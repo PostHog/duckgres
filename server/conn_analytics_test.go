@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/internal/analytics"
+	"github.com/posthog/duckgres/server/observe"
 )
 
 type capturedQueryEvent struct {
@@ -87,5 +89,53 @@ func TestLogQueryErrorClassifiesUserError(t *testing.T) {
 	e := fake.events[0]
 	if e.props["error_category"] != "user" {
 		t.Errorf("error_category = %v, want user", e.props["error_category"])
+	}
+}
+
+func TestLogQueryEmitsQueryCompletedOnSuccess(t *testing.T) {
+	fake := installFakeQueryTracker(t)
+	// No server → queryLogSink is nil, so this exercises the analytics emission
+	// independently of the query-log sink.
+	c := &clientConn{orgID: "acme", username: "root", ctx: context.Background()}
+	c.lastProfilingSummary = observe.QueryProfilingSummary{CPUTimeSeconds: 2.5}
+
+	c.logQuery(time.Now().Add(-100*time.Millisecond), "SELECT 1", "SELECT 1", "SELECT", 1, 0, "", "", "simple")
+
+	if len(fake.events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(fake.events))
+	}
+	e := fake.events[0]
+	if e.event != "query_completed" {
+		t.Errorf("event = %q, want query_completed", e.event)
+	}
+	if e.orgID != "acme" {
+		t.Errorf("orgID = %q, want acme", e.orgID)
+	}
+	if e.props["cpu_seconds"] != 2.5 {
+		t.Errorf("cpu_seconds = %v, want 2.5", e.props["cpu_seconds"])
+	}
+	if e.props["query_kind"] != "Select" {
+		t.Errorf("query_kind = %v, want Select", e.props["query_kind"])
+	}
+	if e.props["result_rows"] != int64(1) {
+		t.Errorf("result_rows = %v, want 1", e.props["result_rows"])
+	}
+	if d, ok := e.props["duration_ms"].(int64); !ok || d <= 0 {
+		t.Errorf("duration_ms = %v, want positive int64", e.props["duration_ms"])
+	}
+}
+
+func TestLogQueryDoesNotEmitCompletedOnError(t *testing.T) {
+	fake := installFakeQueryTracker(t)
+	c := &clientConn{orgID: "acme", username: "root", ctx: context.Background()}
+
+	// A failed query carries a non-empty errCode; query_completed is success-only
+	// (the failure is covered by query_failed), so nothing should be emitted here.
+	c.logQuery(time.Now(), "SELECT * FROM nope", "SELECT * FROM nope", "SELECT", 0, 0, "42P01", "table missing", "simple")
+
+	for _, e := range fake.events {
+		if e.event == "query_completed" {
+			t.Fatalf("query_completed emitted for a failed query")
+		}
 	}
 }
