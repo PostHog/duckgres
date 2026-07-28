@@ -111,6 +111,22 @@ type QueryLogEntry struct {
 	PostgresScanMs        int64
 	CPUTimeSeconds        float64
 	PeakBufferMemoryBytes int64
+
+	// QueryMetadata is the JSON-encoded querymeta.Metadata for the statement:
+	// what it reads, what it writes, which columns and functions it touches,
+	// and the access class each of those implies. Recorded for audit today and
+	// intended as the input a future authorization policy is evaluated against,
+	// which is why it carries its own completeness flag rather than letting an
+	// empty list stand for "nothing touched".
+	QueryMetadata string
+	// AccessKinds is the statement's access classes, comma-separated, lifted
+	// out of QueryMetadata so the common "show me every write" filter is a
+	// plain column scan instead of JSON extraction.
+	AccessKinds string
+	// MetadataComplete is false when extraction could not see the whole
+	// statement. A consumer that gates on QueryMetadata must treat false as
+	// "unknown", never as "nothing touched".
+	MetadataComplete bool
 }
 
 // WorkerQueryLogPayload carries a batch of completed query-log entries to the

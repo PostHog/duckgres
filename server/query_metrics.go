@@ -5,6 +5,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/posthog/duckgres/server/querymeta"
 )
 
 type queryStatus string
@@ -66,6 +68,10 @@ type queryMetricsScope struct {
 	// startLogged guards QueryStart emission so a statement that takes several
 	// cancellable contexts (COPY, cursor FETCH) still logs exactly one start.
 	startLogged bool
+	// metadata is what the statement touches (querymeta). Computed at most once
+	// per statement — the start and terminal events share it.
+	metadata     querymeta.Metadata
+	metadataDone bool
 }
 
 func (c *clientConn) beginQueryMetrics(start time.Time) *queryMetricsScope {

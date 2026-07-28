@@ -174,6 +174,14 @@ normal `go test ./...` lane.
   SQL comment, which only survives if the ORIGINAL inbound text is logged (the
   transpiler deparses from the AST and drops comments).
 
+- **query log access metadata** — a `SELECT` and an `INSERT` over the same table
+  must log different `access_kinds` and land in `read_relations` /
+  `write_relations` respectively, and a DuckDB-native statement the PostgreSQL
+  parser rejects must log `metadata_complete=false` rather than an empty
+  relation list. These are the signals a future authorization policy will be
+  evaluated against, so "referenced nothing" and "we could not tell" have to
+  stay distinguishable on real traffic, not just in unit fixtures.
+
 ### Deliberately not covered here
 
 - **The query log on an EXTERNAL (RDS) metadata store** — the suite provisions

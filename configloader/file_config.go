@@ -74,6 +74,8 @@ type QueryLogFileConfig struct {
 	// StartEvents: "data" (default) | "all" | "off" — which statements emit a
 	// QueryStart event. Terminal events are always logged.
 	StartEvents string `yaml:"start_events"`
+	// Metadata enables per-statement relation/column/access extraction.
+	Metadata *bool `yaml:"metadata"`
 }
 
 type TLSConfig struct {

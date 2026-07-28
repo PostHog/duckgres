@@ -158,6 +158,37 @@ Terminal events are always logged regardless of this setting, so nothing
 disappears from the log; cheap statements simply have no paired start row. Also
 settable via `DUCKGRES_QUERY_LOG_START_EVENTS`.
 
+Each event also records **what the statement touches**, extracted from its
+parse tree (`server/querymeta`):
+
+- `access_kinds` — the access classes the statement needs, comma-separated:
+  `read`, `write`, `ddl`, `config`, `admin`, `transaction`, `metadata`,
+  `unknown`. A statement can be several at once: `WITH x AS (INSERT …) SELECT`
+  is both a read and a write, which a classifier based on the command tag gets
+  wrong.
+- `query_metadata` — JSON with the resolved detail: `read_relations` and
+  `write_relations` (split, because grants are directional), `columns`,
+  `functions`, and `table_functions`.
+- `metadata_complete` — **false when extraction could not see the whole
+  statement.** DuckDB-native syntax (`ATTACH`, `CREATE SECRET`, `PIVOT`,
+  `SUMMARIZE`) is not parseable as PostgreSQL and falls back to a coarse
+  lexical classification.
+
+That last column is load-bearing. These signals exist to let an authorization
+policy be evaluated against real traffic before it denies anything, so
+"referenced no relations" and "we could not tell what it referenced" must never
+be the same answer: **a consumer that gates on `query_metadata` must treat
+`metadata_complete = false` as unknown, and deny.** For the same reason,
+`table_functions` is recorded alongside relations — `read_parquet('s3://…')`
+reaches data without naming a relation, so a policy built on relation names
+alone would not see it. Its arguments are sanitized (a presigned URL carries
+credentials in its query string).
+
+Extraction runs on the **redacted** statement text, so credential material never
+reaches the parser. It costs one parse per distinct statement, memoized per
+process; disable with `query_log.metadata: false` or
+`DUCKGRES_QUERY_LOG_METADATA=false`.
+
 The column set has a single source of truth: `queryLogColumns` in
 `server/querylog_schema.go`. It generates the `CREATE TABLE` DDL, the
 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration that brings already

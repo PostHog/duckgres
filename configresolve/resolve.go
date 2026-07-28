@@ -170,6 +170,7 @@ func DefaultServerConfig() server.Config {
 			FlushInterval: 5 * time.Second,
 			BatchSize:     1000,
 			StartEvents:   server.QueryStartEventsData,
+			Metadata:      true,
 		},
 	}
 }
@@ -440,6 +441,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			} else {
 				warn("Invalid query_log.flush_interval duration: " + err.Error())
 			}
+		}
+		if fileCfg.QueryLog.Metadata != nil {
+			cfg.QueryLog.Metadata = *fileCfg.QueryLog.Metadata
 		}
 		if fileCfg.QueryLog.StartEvents != "" {
 			cfg.QueryLog.StartEvents = server.NormalizeQueryStartEvents(fileCfg.QueryLog.StartEvents)
@@ -906,6 +910,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			cfg.QueryLog.FlushInterval = d
 		} else {
 			warn("Invalid DUCKGRES_QUERY_LOG_FLUSH_INTERVAL duration: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_METADATA"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.QueryLog.Metadata = b
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_METADATA: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_QUERY_LOG_START_EVENTS"); v != "" {

@@ -74,6 +74,9 @@ var queryLogColumns = []queryLogColumn{
 	{Name: "query_id", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return e.QueryID }},
 	{Name: "parent_query_id", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return e.ParentQueryID }},
 	{Name: "statement_index", PGType: "INTEGER DEFAULT 0", Arg: func(e QueryLogEntry) any { return e.StatementIndex }},
+	{Name: "access_kinds", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return e.AccessKinds }},
+	{Name: "metadata_complete", PGType: "BOOLEAN", Arg: func(e QueryLogEntry) any { return e.MetadataComplete }},
+	{Name: "query_metadata", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return truncateQueryMetadata(e.QueryMetadata) }},
 }
 
 // queryLogEntryColumns returns the columns duckgres writes, in INSERT order.

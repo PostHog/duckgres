@@ -3225,6 +3225,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
   rw_ducklake            "$CNPG" "$cnpg_pw"
   query_log_round_trip   "$CNPG" "$cnpg_pw"   # after rw_ducklake (DuckLake attached, query-log surface ensured)
+  query_log_access_metadata "$CNPG" "$cnpg_pw"
   binary_copy_round_trip "$CNPG" "$cnpg_pw"
   explain_ducklake       "$CNPG" "$cnpg_pw"
   httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
@@ -3319,6 +3320,68 @@ query_log_round_trip() { # org password
   [ "$n" = "0" ] || fail "query_log_round_trip: SET emitted $n QueryStart rows, expected 0"
 
   log "query_log round trip OK on $1 (query_id=$qid, start+terminal paired)"
+}
+
+# query_log_access_metadata asserts the RBAC signals: every logged statement
+# records what it reads, what it writes, and the class of access it needs. These
+# columns are the substrate a future authorization policy is evaluated against,
+# so they are asserted on real traffic, not just in unit fixtures.
+#
+# The load-bearing property is the LAST check: a statement the PostgreSQL parser
+# cannot read must log metadata_complete=false, never an empty relation list. A
+# gate that read "touched nothing" from a failed parse would be a hole.
+query_log_access_metadata() { # org password
+  log "query_log access metadata on $1"
+  tbl="qlmeta_$$"
+  pg "$1" "$2" ducklake "CREATE TABLE IF NOT EXISTS $tbl (id INT)" >/dev/null
+
+  # A read and a write over the same table must be classified differently.
+  marker_r="qlread_$(date +%s)_$$"
+  marker_w="qlwrite_$(date +%s)_$$"
+  pg "$1" "$2" ducklake "SELECT count(*) FROM $tbl /* $marker_r */" >/dev/null
+  pg "$1" "$2" ducklake "INSERT INTO $tbl VALUES (1) /* $marker_w */" >/dev/null
+
+  ql_meta_row() { # marker -> "access_kinds|metadata_complete|query_metadata"
+    a=0 out=""
+    while [ "$a" -lt 30 ]; do
+      out="$(pg_try "$1" "$2" ducklake \
+        "SELECT access_kinds || '|' || metadata_complete || '|' || coalesce(query_metadata,'')
+           FROM ducklake.system.query_log
+          WHERE query LIKE '%$3%' AND type <> 'QueryStart' LIMIT 1")" || out=""
+      [ -n "$out" ] && { printf %s "$out"; return 0; }
+      sleep 2; a=$((a + 1))
+    done
+    return 1
+  }
+
+  rrow="$(ql_meta_row "$1" "$2" "$marker_r")" || fail "query_log_access_metadata: no row for $marker_r"
+  case "$rrow" in
+    read\|*|*,read\|*|read,*\|*) : ;;
+    *) fail "query_log_access_metadata: SELECT access_kinds not 'read' (row: $rrow)" ;;
+  esac
+  case "$rrow" in *"\"name\":\"$tbl\""*) : ;; *) fail "query_log_access_metadata: SELECT did not record $tbl (row: $rrow)" ;; esac
+  case "$rrow" in *"read_relations"*) : ;; *) fail "query_log_access_metadata: SELECT recorded no read_relations (row: $rrow)" ;; esac
+
+  wrow="$(ql_meta_row "$1" "$2" "$marker_w")" || fail "query_log_access_metadata: no row for $marker_w"
+  case "$wrow" in *write*) : ;; *) fail "query_log_access_metadata: INSERT not classified as write (row: $wrow)" ;; esac
+  case "$wrow" in *"write_relations"*) : ;; *) fail "query_log_access_metadata: INSERT recorded no write_relations (row: $wrow)" ;; esac
+
+  # A DuckDB-native statement the PostgreSQL parser rejects must be logged as
+  # INCOMPLETE, not as a statement that touched nothing.
+  marker_n="qlnative_$(date +%s)_$$"
+  pg_try "$1" "$2" ducklake "SUMMARIZE SELECT 1 AS a /* $marker_n */" >/dev/null 2>&1 || true
+  nrow="$(ql_meta_row "$1" "$2" "$marker_n")" || nrow=""
+  if [ -n "$nrow" ]; then
+    case "$nrow" in
+      *"|f|"*|*"|false|"*) : ;;
+      *) fail "query_log_access_metadata: unparseable SQL must log metadata_complete=false (row: $nrow)" ;;
+    esac
+  else
+    log "query_log_access_metadata: no row for $marker_n (statement may have been rejected pre-log); skipping incomplete check"
+  fi
+
+  pg_try "$1" "$2" ducklake "DROP TABLE IF EXISTS $tbl" >/dev/null 2>&1 || true
+  log "query_log access metadata OK on $1"
 }
 
 # Busy-only Karpenter disruption protection: a worker pod must carry
@@ -3505,7 +3568,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

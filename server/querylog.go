@@ -426,25 +426,29 @@ func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
 	}
 
 	clientAddr, clientPort := c.clientAddrPort()
+	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(c.queryMetadata(scope))
 	ql.Log(QueryLogEntry{
-		QueryID:         scope.queryID,
-		ParentQueryID:   scope.parentQueryID,
-		StatementIndex:  scope.statementIndex,
-		EventTime:       scope.start,
-		Type:            QueryEventStart,
-		Query:           query,
-		QueryKind:       classifyQuery(leadingSQLKeyword(query)),
-		NormalizedHash:  normalizeQueryHash(query),
-		UserName:        c.username,
-		OrgID:           c.orgID,
-		CurrentDatabase: c.database,
-		ClientAddress:   clientAddr,
-		ClientPort:      clientPort,
-		ApplicationName: c.applicationName,
-		PID:             c.pid,
-		WorkerID:        c.workerID,
-		TraceID:         observe.TraceIDFromContext(c.ctx),
-		SpanID:          observe.SpanIDFromContext(c.ctx),
+		QueryID:          scope.queryID,
+		ParentQueryID:    scope.parentQueryID,
+		StatementIndex:   scope.statementIndex,
+		EventTime:        scope.start,
+		Type:             QueryEventStart,
+		Query:            query,
+		QueryKind:        classifyQuery(leadingSQLKeyword(query)),
+		NormalizedHash:   normalizeQueryHash(query),
+		UserName:         c.username,
+		OrgID:            c.orgID,
+		CurrentDatabase:  c.database,
+		ClientAddress:    clientAddr,
+		ClientPort:       clientPort,
+		ApplicationName:  c.applicationName,
+		PID:              c.pid,
+		WorkerID:         c.workerID,
+		TraceID:          observe.TraceIDFromContext(c.ctx),
+		SpanID:           observe.SpanIDFromContext(c.ctx),
+		QueryMetadata:    encodedMeta,
+		AccessKinds:      accessKinds,
+		MetadataComplete: metaComplete,
 	})
 }
 
@@ -501,6 +505,15 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	if scope != nil {
 		parentQueryID, statementIndex = scope.parentQueryID, scope.statementIndex
 	}
+	// The terminal event carries the same extraction as the start event. When
+	// the scope has none (a path that logs without one), fall back to the
+	// statement text this call was handed so the row still says what was
+	// touched.
+	meta := c.queryMetadata(scope)
+	if scope == nil && c.server != nil && c.server.cfg.QueryLog.Metadata {
+		meta = extractQueryMetadata(query)
+	}
+	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(meta)
 	ql.Log(QueryLogEntry{
 		QueryID:               c.currentQueryID(),
 		ParentQueryID:         parentQueryID,
@@ -531,6 +544,9 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		PostgresScanMs:        pgScanMs,
 		CPUTimeSeconds:        profilingSummary.CPUTimeSeconds,
 		PeakBufferMemoryBytes: profilingSummary.PeakBufferMemoryBytes,
+		QueryMetadata:         encodedMeta,
+		AccessKinds:           accessKinds,
+		MetadataComplete:      metaComplete,
 	})
 }
 
