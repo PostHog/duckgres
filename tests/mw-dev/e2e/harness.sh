@@ -2968,22 +2968,22 @@ duckling_shard_backfill() { # cnpgOrg
 
 # ---- reshard operations (metadata-store migrations) -------------------------
 # Backed by controlplane/admin/reshard.go + provisioner/reshard_runner.go +
-# configstore/reshard.go. mw-dev has ONE cnpg shard, so the shard→shard
-# positive path can't run here; these exercise what matters against the real
-# cluster instead:
+# configstore/reshard.go. The dedicated lane uses shard-001 as the source and
+# the healthy shard-002 provisioner endpoint as its destination:
 #   * validation 400s (same shard, bad targets)
 #   * cancel during drain (a held session keeps the drain waiting; new
 #     connections are 57P03-blocked; cancel rolls back; org healthy)
-#   * bogus-shard rollback (flip → Synced=False → flip-timeout → rollback;
-#     data intact, spec.cnpgShard patched back; short per-op
-#     cutover_timeout_seconds keeps it fast). Also asserts the wait-loop
+#   * forced target-convergence timeout (flip → timeout → rollback; data
+#     intact, spec.cnpgShard patched back; short per-op cutover_timeout_seconds
+#     keeps it fast without shortening source fencing/recovery). Also asserts
+#     the wait-loop
 #     diagnostics: deadline announce, periodic "waiting for target"
 #     observations, and the flip-timeout error carrying the last observation.
 # External-store migrations are covered by the focused admin/provisioner unit
 # tests. This live harness intentionally provisions CNPG metadata stores only.
 
 reshard_post() { # org body
-  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
+  curl --fail-with-body -sS -X POST -H "$H" -H 'Content-Type: application/json' -d "$2" \
     "$API/api/v1/orgs/$1/reshard"
 }
 
@@ -3117,7 +3117,7 @@ reshard_cancel_during_drain() { # org password
   holder=$!
   sleep 5
 
-  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-009"},"drain_timeout_seconds":600}')" \
+  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"},"drain_timeout_seconds":600}')" \
     || fail "reshard cancel: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
   [ -n "$opid" ] && [ "$opid" != "null" ] || fail "reshard cancel: no op id: $out"
@@ -3169,19 +3169,21 @@ reshard_cancel_during_drain() { # org password
   log "reshard cancel OK (op $opid)"
 }
 
-reshard_bogus_shard_rollback() { # org password
+reshard_forced_cutover_rollback() { # org password
   org="$1"; pw="$2"; d="$(echo "$org" | tr 'A-Z' 'a-z')"
-  log "reshard rollback: bogus target shard → flip-timeout → rollback, data intact"
+  log "reshard rollback: reachable target → forced flip-timeout → rollback, data intact"
   pg "$org" "$pw" ducklake "DROP TABLE IF EXISTS reshard_marker; CREATE TABLE reshard_marker AS SELECT 42 AS v;"
 
-  # Short per-op cutover timeout: the bogus shard can never converge, so the
-  # flip wait is pure dead time before the rollback we're here to assert.
-  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-099"},"drain_timeout_seconds":300,"cutover_timeout_seconds":90}')" \
+  # The target must pass the new credentialed destination preflight. A
+  # one-second cutover budget is deliberately shorter than Crossplane's
+  # reconciliation loop, forcing the same pre-commit rollback path without
+  # relying on a nonexistent/unreachable shard.
+  out="$(reshard_post "$org" '{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"},"drain_timeout_seconds":300,"cutover_timeout_seconds":1}')" \
     || fail "reshard rollback: start failed: $out"
   opid="$(echo "$out" | jq -r .id)"
 
   # Budget: runner-pod schedule/pull + drain + snapshot-propagation waits +
-  # the 90s per-op cutover timeout + rollback convergence.
+  # the forced per-op cutover timeout + rollback convergence.
   st="$(reshard_wait_terminal "$opid" 900)"
   [ "$st" = "failed" ] || { reshard_dump_log "$opid"; fail "reshard rollback: final state $st, want failed"; }
   reshard_log_has "$opid" "rolling back" || fail "reshard rollback: no rollback log"
@@ -3787,8 +3789,8 @@ main() {
     reshard_targets
     reshard_validation "$CNPG"
     reshard_cancel_during_drain "$RES2" "$res2_pw"
-    reshard_bogus_shard_rollback "$RES2" "$res2_pw"
-    log "PASS: reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback)"
+    reshard_forced_cutover_rollback "$RES2" "$res2_pw"
+    log "PASS: reshard(targets-discovery + validation + cancel-during-drain + forced-cutover-rollback)"
     return
   fi
 

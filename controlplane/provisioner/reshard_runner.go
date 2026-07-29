@@ -145,6 +145,7 @@ type reshardDucklingClient interface {
 	SetReshardMaintenanceCleanup(ctx context.Context, name string, operationID int64) error
 	ReshardMaintenanceRoleRemoved(ctx context.Context, name string) (bool, error)
 	ReshardMaintenanceCleanupComplete(ctx context.Context, name string) (complete bool, detail string, err error)
+	CnpgProvisionerEndpoint(ctx context.Context, shard string) (CatalogEndpoint, error)
 }
 
 // NewReshardRunner builds a runner over the real config store + duckling
@@ -152,10 +153,10 @@ type reshardDucklingClient interface {
 // post-block propagation wait is honest.
 //
 // Env-only knob DUCKGRES_RESHARD_FLIP_TIMEOUT (Go duration) overrides the
-// DEFAULT cutover wait (15m) — how long a flip waits for the composition to
-// converge before rolling back. Individual operations override it per-op via
-// cutover_timeout_seconds (what the e2e's bogus-shard rollback uses to stay
-// fast without shortening real cutovers).
+// DEFAULT controller-convergence and cutover wait (15m). Individual operations
+// may shorten only the target cutover convergence wait via
+// cutover_timeout_seconds; source fencing, cleanup, and recovery always retain
+// the full default budget.
 // backuper is the pre-flip catalog backuper (nil-safe: a nil backuper skips the
 // best-effort backup on non-destructive directions and HARD-fails the
 // destructive cnpg→external direction, which must never flip without a backup).
@@ -405,12 +406,20 @@ func (o *opRun) flipTimeout() time.Duration {
 	return o.r.flipTimeout
 }
 
+// sourceMaintenanceTimeout is deliberately independent of a per-operation
+// cutover override. Preparing, fencing, disabling, retaining, and cleaning up
+// source resources are safety-critical controller/database transitions; they
+// retain the runner's full convergence budget.
+func (o *opRun) sourceMaintenanceTimeout() time.Duration {
+	return o.r.flipTimeout
+}
+
 // sourceRecoveryTimeout is deliberately independent of a per-operation
 // cutover override. Operators may shorten an expected-to-fail target wait, but
 // restoring provider-sql resources on the known-good source can require the
 // full controller convergence budget and must not inherit that shorter bound.
 func (o *opRun) sourceRecoveryTimeout() time.Duration {
-	return o.r.flipTimeout
+	return o.sourceMaintenanceTimeout()
 }
 
 func (o *opRun) step(step string) error {
@@ -655,6 +664,9 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 			}
 		}
 	} else {
+		if err := o.preflightCnpgTarget(ctx); err != nil {
+			return err
+		}
 		if err := o.flipToCnpg(ctx); err != nil {
 			return err
 		}
@@ -670,6 +682,20 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 	}
 
 	return o.finalize(ctx)
+}
+
+func (o *opRun) preflightCnpgTarget(ctx context.Context) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	target, err := o.r.duckling.CnpgProvisionerEndpoint(probeCtx, o.op.ToShard)
+	if err != nil {
+		return fmt.Errorf("destination shard %s preflight credential: %w", o.op.ToShard, err)
+	}
+	if err := o.r.copier.Probe(probeCtx, target); err != nil {
+		return fmt.Errorf("destination shard %s stopped accepting PostgreSQL connections before cutover: %w", o.op.ToShard, err)
+	}
+	o.logf("info", "destination shard %s passed the immediate pre-cutover PostgreSQL probe", o.op.ToShard)
+	return nil
 }
 
 // resumeTakeover continues only phases whose durable inputs are sufficient to
@@ -813,7 +839,8 @@ func (o *opRun) prepareSourceAccess(ctx context.Context) error {
 }
 
 func (o *opRun) waitForMaintenance(ctx context.Context, wantFenced bool) (*DucklingStatus, error) {
-	deadline := time.Now().Add(o.flipTimeout())
+	timeout := o.sourceMaintenanceTimeout()
+	deadline := time.Now().Add(timeout)
 	var last string
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
@@ -838,7 +865,7 @@ func (o *opRun) waitForMaintenance(ctx context.Context, wantFenced bool) (*Duckl
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("reshard maintenance did not reach fenced=%t within %s; last observation: %s", wantFenced, o.flipTimeout(), last)
+	return nil, fmt.Errorf("reshard maintenance did not reach fenced=%t within %s; last observation: %s", wantFenced, timeout, last)
 }
 
 func (o *opRun) waitForSourceMaintenanceUnfenced(ctx context.Context) error {
@@ -876,7 +903,8 @@ func (o *opRun) waitForSourceMaintenanceUnfenced(ctx context.Context) error {
 }
 
 func (o *opRun) waitForMaintenanceEnabled(ctx context.Context) (*DucklingStatus, error) {
-	deadline := time.Now().Add(o.flipTimeout())
+	timeout := o.sourceMaintenanceTimeout()
+	deadline := time.Now().Add(timeout)
 	var last string
 	for time.Now().Before(deadline) {
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -896,11 +924,12 @@ func (o *opRun) waitForMaintenanceEnabled(ctx context.Context) (*DucklingStatus,
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("maintenance LOGIN was not observed within %s; last observation: %s", o.flipTimeout(), last)
+	return nil, fmt.Errorf("maintenance LOGIN was not observed within %s; last observation: %s", timeout, last)
 }
 
 func (o *opRun) waitForMaintenanceDisabled(ctx context.Context) error {
-	deadline := time.Now().Add(o.flipTimeout())
+	timeout := o.sourceMaintenanceTimeout()
+	deadline := time.Now().Add(timeout)
 	var last string
 	for time.Now().Before(deadline) {
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -918,7 +947,7 @@ func (o *opRun) waitForMaintenanceDisabled(ctx context.Context) error {
 			return err
 		}
 	}
-	return fmt.Errorf("maintenance identity was not disabled within %s; last observation: %s", o.flipTimeout(), last)
+	return fmt.Errorf("maintenance identity was not disabled within %s; last observation: %s", timeout, last)
 }
 
 func (o *opRun) cleanupMaintenance(ctx context.Context) error {
@@ -932,7 +961,8 @@ func (o *opRun) cleanupMaintenance(ctx context.Context) error {
 	if err := o.r.duckling.SetReshardMaintenanceCleanup(ctx, o.op.DucklingName, o.op.ID); err != nil {
 		return err
 	}
-	roleDeadline := time.Now().Add(o.flipTimeout())
+	timeout := o.sourceMaintenanceTimeout()
+	roleDeadline := time.Now().Add(timeout)
 	for time.Now().Before(roleDeadline) {
 		removed, err := o.r.duckling.ReshardMaintenanceRoleRemoved(ctx, o.op.DucklingName)
 		if err != nil {
@@ -950,12 +980,12 @@ func (o *opRun) cleanupMaintenance(ctx context.Context) error {
 		return err
 	}
 	if !removed {
-		return fmt.Errorf("operation-scoped maintenance role was not removed within %s", o.flipTimeout())
+		return fmt.Errorf("operation-scoped maintenance role was not removed within %s", timeout)
 	}
 	if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, nil); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(o.flipTimeout())
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
 		statusGone := err == nil && st.ReshardMaintenance.OperationID != o.op.ID
@@ -974,7 +1004,7 @@ func (o *opRun) cleanupMaintenance(ctx context.Context) error {
 			return err
 		}
 	}
-	return fmt.Errorf("operation-scoped maintenance identity was not removed within %s", o.flipTimeout())
+	return fmt.Errorf("operation-scoped maintenance identity was not removed within %s", timeout)
 }
 
 // disableMaintenance closes the privileged-login cleanup race. The fencer
@@ -1018,7 +1048,7 @@ func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() err
 		Host: host, Port: 5432, User: m.User, Password: m.Password,
 		Database: "postgres", SSLMode: sslModeFor(o.op.SourceKind),
 	}
-	disableCtx, cancel := context.WithTimeout(ctx, o.flipTimeout())
+	disableCtx, cancel := context.WithTimeout(ctx, o.sourceMaintenanceTimeout())
 	defer cancel()
 	if err := o.r.fencer.DisableMaintenanceAndTerminate(disableCtx, admin, func() error {
 		if beforeDisable != nil {
@@ -1085,7 +1115,7 @@ func (o *opRun) fenceSource(ctx context.Context) error {
 		Host: ms.Endpoint, Port: 5432, User: m.User, Password: m.Password,
 		Database: ms.Database, SSLMode: sslModeFor(o.op.SourceKind),
 	}
-	fenceCtx, cancel := context.WithTimeout(ctx, o.flipTimeout())
+	fenceCtx, cancel := context.WithTimeout(ctx, o.sourceMaintenanceTimeout())
 	defer cancel()
 	if err := o.r.fencer.TerminateAndWait(fenceCtx, maintenance, o.tenantUser, o.tenantDatabase); err != nil {
 		return err
@@ -1528,8 +1558,9 @@ func (o *opRun) orphanCnpgSource(ctx context.Context) error {
 	// Wait until the cnpg Role+Database MRs reflect the no-Delete policy, so the
 	// type flip orphans (not deletes) them. Closes the race where the flip
 	// un-renders the MRs before the retain policy propagated.
-	o.logf("info", "retainCnpgOnFlip=true confirmed on the duckling spec (the XRD carries the field); waiting up to %s for the composition to re-render the cnpg Role/Database MRs without Delete", o.flipTimeout())
-	deadline := time.Now().Add(o.flipTimeout())
+	timeout := o.sourceMaintenanceTimeout()
+	o.logf("info", "retainCnpgOnFlip=true confirmed on the duckling spec (the XRD carries the field); waiting up to %s for the composition to re-render the cnpg Role/Database MRs without Delete", timeout)
+	deadline := time.Now().Add(timeout)
 	lastLog := time.Time{}
 	lastObserved := "no successful read yet"
 	for {
@@ -1540,7 +1571,7 @@ func (o *opRun) orphanCnpgSource(ctx context.Context) error {
 			return errReshardCancelled
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("cnpg source role/DB did not reflect the retain (no-Delete) policy within %s — refusing to flip (the composition may not honor retainCnpgOnFlip; charts/composition skew?); last observation: %s", o.flipTimeout(), lastObserved)
+			return fmt.Errorf("cnpg source role/DB did not reflect the retain (no-Delete) policy within %s — refusing to flip (the composition may not honor retainCnpgOnFlip; charts/composition skew?); last observation: %s", timeout, lastObserved)
 		}
 		orphaned, mrsPresent, detail, err := o.r.duckling.CnpgSourceMRsOrphaned(ctx, o.op.DucklingName)
 		switch {
@@ -2082,14 +2113,15 @@ func (o *opRun) recoverFromExternal(ctx context.Context) bool {
 	// deadline rather than bail: a charts/composition fix can converge the
 	// password mid-wait, and giving up early would leave the org worse off.
 	sourcePrefix := o.op.FromShard + "-pooler."
-	o.logf("info", "recovery: waiting up to %s for the composition to re-adopt the cnpg role/DB on %s* and for the tenant role to answer", o.flipTimeout(), sourcePrefix)
-	deadline := time.Now().Add(o.flipTimeout())
+	timeout := o.sourceRecoveryTimeout()
+	o.logf("info", "recovery: waiting up to %s for the composition to re-adopt the cnpg role/DB on %s* and for the tenant role to answer", timeout, sourcePrefix)
+	deadline := time.Now().Add(timeout)
 	lastLog := time.Time{}
 	lastObserved := "no successful duckling read yet"
 	preparedRequested := false
 	for {
 		if time.Now().After(deadline) {
-			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s); last observation: %s", o.flipTimeout(), o.op.FromShard, lastObserved)
+			o.logf("error", "recovery: source shard did not become ready within %s — org stays blocked; investigate (the orphaned role/DB should still exist on %s); last observation: %s", timeout, o.op.FromShard, lastObserved)
 			return false
 		}
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
