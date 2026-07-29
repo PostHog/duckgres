@@ -301,11 +301,23 @@ type fakeDuckling struct {
 	mrsReadErr error
 	// mrsStuckWithDelete models a composition that never honors the retain
 	// flag: the MRs stay at full lifecycle ["*"] no matter what.
-	mrsStuckWithDelete bool
-	maintenancePhase   string
-	maintenanceShard   string
-	cleanupRemaining   int
-	cleanupChecks      int
+	mrsStuckWithDelete  bool
+	maintenancePhase    string
+	maintenanceShard    string
+	cleanupRemaining    int
+	cleanupChecks       int
+	provisionerEndpoint CatalogEndpoint
+	provisionerErr      error
+}
+
+func (f *fakeDuckling) CnpgProvisionerEndpoint(context.Context, string) (CatalogEndpoint, error) {
+	if f.provisionerErr != nil {
+		return CatalogEndpoint{}, f.provisionerErr
+	}
+	if f.provisionerEndpoint.Host != "" {
+		return f.provisionerEndpoint, nil
+	}
+	return CatalogEndpoint{Host: "target-rw", Port: 5432, User: "tenant_provisioner", Database: "postgres", Password: "pw", SSLMode: "require"}, nil
 }
 
 func (f *fakeDuckling) Get(context.Context, string) (*DucklingStatus, error) {
@@ -520,6 +532,31 @@ type blockingCopier struct {
 	started  chan struct{}
 	released chan struct{}
 	canceled chan struct{}
+}
+
+func TestCnpgDestinationIsReprobedImmediatelyBeforeCutover(t *testing.T) {
+	op := cnpgOp()
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{probeFn: func(ep CatalogEndpoint) error {
+		if ep.Host == "target-rw" {
+			return errors.New("primary unavailable")
+		}
+		return nil
+	}}
+	run := &opRun{
+		r:  &ReshardRunner{duckling: duckling, copier: copier},
+		op: op,
+	}
+
+	err := run.preflightCnpgTarget(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "stopped accepting PostgreSQL connections before cutover") {
+		t.Fatalf("preflight error = %v", err)
+	}
+	for _, kind := range duckling.callKinds() {
+		if kind == "cnpg" {
+			t.Fatal("Duckling was repointed despite failed immediate destination probe")
+		}
+	}
 }
 
 func newBlockingCopier() *blockingCopier {
@@ -749,9 +786,9 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	}
 	// flip → copy → recheck → drop source, in that order.
 	kinds := copier.kinds()
-	// probe(target, flip wait) → probe(source) → probe(target) → copy →
-	// stability recheck → source drop.
-	if fmt.Sprint(kinds) != fmt.Sprint([]string{"probe", "probe", "probe", "copy", "dropdb"}) {
+	// provisioner preflight → probe(target, flip wait) → probe(source) →
+	// probe(target) → copy → stability recheck → source drop.
+	if fmt.Sprint(kinds) != fmt.Sprint([]string{"probe", "probe", "probe", "probe", "copy", "dropdb"}) {
 		t.Fatalf("copier calls = %v", kinds)
 	}
 	// The copy's SOURCE is the recorded pre-flip endpoint, not the new one.
@@ -1436,6 +1473,44 @@ func TestSourceRecoveryTimeoutIgnoresShortCutoverOverride(t *testing.T) {
 	}
 	if got, want := run.sourceRecoveryTimeout(), 15*time.Minute; got != want {
 		t.Fatalf("source recovery timeout = %s, want %s", got, want)
+	}
+}
+
+func TestSourceMaintenanceTimeoutIgnoresShortCutoverOverride(t *testing.T) {
+	runner := &ReshardRunner{flipTimeout: 15 * time.Minute}
+	run := &opRun{
+		r: runner,
+		op: &configstore.ReshardOperation{
+			CutoverTimeoutSeconds: 1,
+		},
+	}
+	if got, want := run.sourceMaintenanceTimeout(), 15*time.Minute; got != want {
+		t.Fatalf("source maintenance timeout = %s, want %s", got, want)
+	}
+	if got, want := run.flipTimeout(), time.Second; got != want {
+		t.Fatalf("target cutover timeout = %s, want %s", got, want)
+	}
+}
+
+func TestMaintenanceWaitUsesFullSourceBudgetInsteadOfCutoverOverride(t *testing.T) {
+	op := &configstore.ReshardOperation{
+		ID:                    1,
+		DucklingName:          "org-a",
+		CutoverTimeoutSeconds: 1,
+	}
+	runner := &ReshardRunner{
+		duckling:    &fakeDuckling{status: cnpgSourceStatus()},
+		store:       newFakeReshardStore(op),
+		flipTimeout: 25 * time.Millisecond,
+		loopPoll:    time.Millisecond,
+	}
+	run := &opRun{r: runner, op: op}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	_, err := run.waitForMaintenance(ctx, false)
+	if err == nil || !strings.Contains(err.Error(), "within 25ms") {
+		t.Fatalf("maintenance wait error = %v, want full source timeout", err)
 	}
 }
 

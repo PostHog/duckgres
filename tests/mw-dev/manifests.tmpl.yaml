@@ -188,6 +188,38 @@ roleRef:
 # the grant must live on duckgres-duckling-reader (see charts repo,
 # charts/duckgres/templates/rbac.yaml) and be deployed to the cluster.
 ---
+# Destination preflight uses the same two configured dev-shard provisioner
+# Secrets as the production chart. Keep this disposable grant by-name and
+# read-only; its ci-pr label lets teardown remove the cross-namespace objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-cnpg-provisioner-secret-reader
+  namespace: ducklings
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - cnpg-shard-001-provisioner
+      - cnpg-shard-002-provisioner
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-cnpg-provisioner-secret-reader
+  namespace: ducklings
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+subjects:
+  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
+roleRef:
+  kind: Role
+  name: duckgres-ci-pr-${PR_NUMBER}-cnpg-provisioner-secret-reader
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:

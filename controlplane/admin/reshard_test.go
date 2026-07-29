@@ -187,8 +187,11 @@ func (f fakeShardLister) CRMetadataStores(context.Context) (map[string]DucklingM
 
 // fakeProber records the last probe and returns a canned error (nil = success).
 type fakeProber struct {
-	err    error
-	called bool
+	err        error
+	called     bool
+	cnpgErr    error
+	cnpgCalled bool
+	lastShard  string
 	// last* capture the resolved args so a test can assert defaulting.
 	lastEndpoint, lastUser, lastDatabase, lastPassword, lastSSLMode string
 }
@@ -197,6 +200,12 @@ func (p *fakeProber) Probe(_ context.Context, endpoint, user, database, password
 	p.called = true
 	p.lastEndpoint, p.lastUser, p.lastDatabase, p.lastPassword, p.lastSSLMode = endpoint, user, database, password, sslMode
 	return p.err
+}
+
+func (p *fakeProber) ProbeCNPG(_ context.Context, shard string) error {
+	p.cnpgCalled = true
+	p.lastShard = shard
+	return p.cnpgErr
 }
 
 // defaultShardLister matches the default fake warehouse: a cnpg-shard org
@@ -216,30 +225,30 @@ func externalShardLister(endpoint string) DucklingMetadataLister {
 }
 
 func reshardRouter(store *fakeReshardStore) *gin.Engine {
-	r, _ := reshardRouterFull(store, nil, nil)
+	r, _ := reshardRouterFull(store, nil, nil, &fakeProber{})
 	return r
 }
 
 func reshardRouterWithCluster(store *fakeReshardStore, cluster kubernetes.Interface) *gin.Engine {
-	r, _ := reshardRouterFull(store, cluster, nil)
+	r, _ := reshardRouterFull(store, cluster, nil, &fakeProber{})
 	return r
 }
 
 // reshardRouterLister registers the API with a specific duckling lister (nil
 // allowed — the degraded no-duckling-client path).
 func reshardRouterLister(store *fakeReshardStore, lister DucklingMetadataLister) *gin.Engine {
-	r, _ := reshardRouterSpawner(store, nil, nil, &fakeSpawner{}, "internal-secret", lister)
+	r, _ := reshardRouterSpawner(store, nil, nil, &fakeProber{}, &fakeSpawner{}, "internal-secret", lister)
 	return r
 }
 
 // reshardRouterFull registers the API with a fakeSpawner and an
 // internal-secret identity on every request (the password endpoint gates on
 // it; production wiring runs AuthMiddleware in front).
-func reshardRouterFull(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber) (*gin.Engine, *fakeSpawner) {
-	return reshardRouterSpawner(store, cluster, prober, &fakeSpawner{}, "internal-secret", defaultShardLister())
+func reshardRouterFull(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber, cnpgProber CnpgTargetProber) (*gin.Engine, *fakeSpawner) {
+	return reshardRouterSpawner(store, cluster, prober, cnpgProber, &fakeSpawner{}, "internal-secret", defaultShardLister())
 }
 
-func reshardRouterSpawner(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber, spawner ReshardPodSpawner, identitySource string, lister DucklingMetadataLister) (*gin.Engine, *fakeSpawner) {
+func reshardRouterSpawner(store *fakeReshardStore, cluster kubernetes.Interface, prober ExternalTargetProber, cnpgProber CnpgTargetProber, spawner ReshardPodSpawner, identitySource string, lister DucklingMetadataLister) (*gin.Engine, *fakeSpawner) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(func(c *gin.Context) {
@@ -252,7 +261,7 @@ func reshardRouterSpawner(store *fakeReshardStore, cluster kubernetes.Interface,
 		}
 		c.Next()
 	})
-	RegisterReshardAPI(r.Group("/api/v1"), store, lister, spawner, cluster, prober)
+	RegisterReshardAPI(r.Group("/api/v1"), store, lister, spawner, cluster, prober, cnpgProber)
 	fs, _ := spawner.(*fakeSpawner)
 	return r, fs
 }
@@ -269,11 +278,15 @@ func doJSON(r *gin.Engine, method, path, body string) *httptest.ResponseRecorder
 // target on the op row.
 func TestReshardStartCnpg(t *testing.T) {
 	store := newFakeReshardStore()
-	r, spawner := reshardRouterFull(store, nil, nil)
+	prober := &fakeProber{}
+	r, spawner := reshardRouterFull(store, nil, nil, prober)
 	w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"},"drain_timeout_seconds":120,"cutover_timeout_seconds":45}`)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("status = %d body %s, want 202", w.Code, w.Body.String())
+	}
+	if !prober.cnpgCalled || prober.lastShard != "shard-002" {
+		t.Fatalf("CNPG preflight = called %t shard %q, want called for shard-002", prober.cnpgCalled, prober.lastShard)
 	}
 	var op configstore.ReshardOperation
 	if err := json.Unmarshal(w.Body.Bytes(), &op); err != nil {
@@ -293,6 +306,32 @@ func TestReshardStartCnpg(t *testing.T) {
 	}
 	if spawner.spawned[0].PasswordURL != "" || op.PasswordURL != "" {
 		t.Fatalf("cnpg target must carry no password URL (got %q)", spawner.spawned[0].PasswordURL)
+	}
+}
+
+func TestReshardStartCnpgRequiresSuccessfulConnectivityProbe(t *testing.T) {
+	body := `{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`
+
+	for _, tc := range []struct {
+		name       string
+		prober     CnpgTargetProber
+		wantStatus int
+		wantError  string
+	}{
+		{name: "unreachable", prober: &fakeProber{cnpgErr: errors.New("no PostgreSQL backend")}, wantStatus: http.StatusServiceUnavailable, wantError: `"code":"destination_shard_unavailable"`},
+		{name: "guard unavailable", prober: nil, wantStatus: http.StatusServiceUnavailable, wantError: "destination shard connectivity guard is unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeReshardStore()
+			r, _ := reshardRouterFull(store, nil, nil, tc.prober)
+			w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard", body)
+			if w.Code != tc.wantStatus || !strings.Contains(w.Body.String(), tc.wantError) {
+				t.Fatalf("status/body = %d %s, want %d containing %q", w.Code, w.Body.String(), tc.wantStatus, tc.wantError)
+			}
+			if len(store.ops) != 0 {
+				t.Fatalf("created %d operations despite failed-closed destination guard", len(store.ops))
+			}
+		})
 	}
 }
 
@@ -503,7 +542,7 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 	// Passing prober → 202, op created, probe saw the resolved args.
 	store := newFakeReshardStore()
 	pb := &fakeProber{}
-	rp, _ := reshardRouterFull(store, nil, pb)
+	rp, _ := reshardRouterFull(store, nil, pb, &fakeProber{})
 	w := doJSON(rp, http.MethodPost, "/api/v1/orgs/acme/reshard", body)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("passing prober: status = %d body %s, want 202", w.Code, w.Body.String())
@@ -521,7 +560,7 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 	// Failing prober → 400, redacted message, NO op created.
 	store = newFakeReshardStore()
 	pb = &fakeProber{err: errors.New("connection refused")}
-	rp, _ = reshardRouterFull(store, nil, pb)
+	rp, _ = reshardRouterFull(store, nil, pb, &fakeProber{})
 	w = doJSON(rp, http.MethodPost, "/api/v1/orgs/acme/reshard", body)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("failing prober: status = %d body %s, want 400", w.Code, w.Body.String())
@@ -538,7 +577,7 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 
 	// Nil prober → check skipped, op created.
 	store = newFakeReshardStore()
-	rp, _ = reshardRouterFull(store, nil, nil)
+	rp, _ = reshardRouterFull(store, nil, nil, &fakeProber{})
 	w = doJSON(rp, http.MethodPost, "/api/v1/orgs/acme/reshard", body)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("nil prober: status = %d body %s, want 202", w.Code, w.Body.String())
@@ -556,7 +595,7 @@ func TestReshardExtPreflightProbe(t *testing.T) {
 // only endpoint (covered by TestReshardPasswordEndpoint).
 func TestReshardExtPasswordStashedNotPersisted(t *testing.T) {
 	store := newFakeReshardStore()
-	r, spawner := reshardRouterFull(store, nil, nil)
+	r, spawner := reshardRouterFull(store, nil, nil, &fakeProber{})
 	w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"duckling-my-secret","user":"postgres","database":"postgres","password":"hunter2"}}`)
 	if w.Code != http.StatusAccepted {
@@ -596,7 +635,7 @@ func TestReshardPasswordEndpoint(t *testing.T) {
 
 	// Same handler instance must serve start + pull (the stash is in-memory).
 	store := newFakeReshardStore()
-	r, _ := reshardRouterFull(store, nil, nil)
+	r, _ := reshardRouterFull(store, nil, nil, &fakeProber{})
 	if w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard", start); w.Code != http.StatusAccepted {
 		t.Fatalf("start: %d %s", w.Code, w.Body.String())
 	}
@@ -628,7 +667,7 @@ func TestReshardPasswordEndpoint(t *testing.T) {
 
 	// An SSO admin identity is refused — internal secret ONLY.
 	ssoStore := newFakeReshardStore()
-	ssoR, _ := reshardRouterSpawner(ssoStore, nil, nil, &fakeSpawner{}, "sso", defaultShardLister())
+	ssoR, _ := reshardRouterSpawner(ssoStore, nil, nil, &fakeProber{}, &fakeSpawner{}, "sso", defaultShardLister())
 	if w := doJSON(ssoR, http.MethodPost, "/api/v1/orgs/acme/reshard", start); w.Code != http.StatusAccepted {
 		t.Fatalf("sso start: %d", w.Code)
 	}
@@ -643,7 +682,7 @@ func TestReshardPasswordEndpoint(t *testing.T) {
 	// A replica that never saw the start request has no stash → 404.
 	otherStore := newFakeReshardStore()
 	otherStore.ops[1] = &configstore.ReshardOperation{ID: 1, OrgID: "acme", State: configstore.ReshardStateRunning}
-	otherR, _ := reshardRouterFull(otherStore, nil, nil)
+	otherR, _ := reshardRouterFull(otherStore, nil, nil, &fakeProber{})
 	if w := doJSON(otherR, http.MethodGet, "/api/v1/reshards/1/password", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("stashless replica pull = %d, want 404", w.Code)
 	}
@@ -657,7 +696,7 @@ func TestReshardPasswordEndpoint(t *testing.T) {
 func TestReshardStartSpawnFailure(t *testing.T) {
 	// Spawn error → 502, op failed.
 	store := newFakeReshardStore()
-	r, _ := reshardRouterSpawner(store, nil, nil, &fakeSpawner{spawnErr: errors.New("pods is forbidden")}, "internal-secret", defaultShardLister())
+	r, _ := reshardRouterSpawner(store, nil, nil, &fakeProber{}, &fakeSpawner{spawnErr: errors.New("pods is forbidden")}, "internal-secret", defaultShardLister())
 	w := doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`)
 	if w.Code != http.StatusBadGateway {
@@ -670,7 +709,7 @@ func TestReshardStartSpawnFailure(t *testing.T) {
 	// Ext target + no self pod IP → 500, op failed, no spawn attempted.
 	store = newFakeReshardStore()
 	sp := &fakeSpawner{noURL: true}
-	r, _ = reshardRouterSpawner(store, nil, nil, sp, "internal-secret", defaultShardLister())
+	r, _ = reshardRouterSpawner(store, nil, nil, &fakeProber{}, sp, "internal-secret", defaultShardLister())
 	w = doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"external","endpoint":"rds.example.com","password_aws_secret":"duckling-x","password":"p"}}`)
 	if w.Code != http.StatusInternalServerError {
@@ -682,7 +721,7 @@ func TestReshardStartSpawnFailure(t *testing.T) {
 
 	// Nil spawner → 503, nothing created.
 	store = newFakeReshardStore()
-	r, _ = reshardRouterSpawner(store, nil, nil, nil, "internal-secret", defaultShardLister())
+	r, _ = reshardRouterSpawner(store, nil, nil, &fakeProber{}, nil, "internal-secret", defaultShardLister())
 	w = doJSON(r, http.MethodPost, "/api/v1/orgs/acme/reshard",
 		`{"target":{"type":"cnpg-shard","cnpg_shard":"shard-002"}}`)
 	if w.Code != http.StatusServiceUnavailable {

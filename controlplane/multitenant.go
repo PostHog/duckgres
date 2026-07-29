@@ -21,6 +21,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -30,9 +31,12 @@ import (
 // credentials / missing DB) BEFORE the destructive flip. It parses the
 // admin-supplied endpoint as host[:port] (default 5432), mirroring how the
 // reshard runner builds the external target CatalogEndpoint.
-type catalogCopierProber struct{}
+type catalogCopierProber struct {
+	cluster kubernetes.Interface
+	probe   func(context.Context, provisioner.CatalogEndpoint) error
+}
 
-func (catalogCopierProber) Probe(ctx context.Context, endpoint, user, database, password, sslMode string) error {
+func (p catalogCopierProber) Probe(ctx context.Context, endpoint, user, database, password, sslMode string) error {
 	host, port := endpoint, 5432
 	if h, p, err := net.SplitHostPort(endpoint); err == nil {
 		host = h
@@ -40,14 +44,40 @@ func (catalogCopierProber) Probe(ctx context.Context, endpoint, user, database, 
 			port = n
 		}
 	}
-	return provisioner.PGCatalogCopier{}.Probe(ctx, provisioner.CatalogEndpoint{
+	target := provisioner.CatalogEndpoint{
 		Host:     host,
 		Port:     port,
 		User:     user,
 		Database: database,
 		Password: password,
 		SSLMode:  sslMode,
-	})
+	}
+	if p.probe != nil {
+		return p.probe(ctx, target)
+	}
+	return provisioner.PGCatalogCopier{}.Probe(ctx, target)
+}
+
+func (p catalogCopierProber) ProbeCNPG(ctx context.Context, shard string) error {
+	if p.cluster == nil {
+		return fmt.Errorf("kubernetes client unavailable")
+	}
+	secretName := "cnpg-" + shard + "-provisioner"
+	secret, err := p.cluster.CoreV1().Secrets("ducklings").Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read shard provisioner credential %s: %w", secretName, err)
+	}
+	endpoint := string(secret.Data["endpoint"])
+	user := string(secret.Data["username"])
+	password := string(secret.Data["password"])
+	port := string(secret.Data["port"])
+	if endpoint == "" || user == "" || password == "" {
+		return fmt.Errorf("shard provisioner credential %s is missing endpoint, username, or password", secretName)
+	}
+	if port != "" {
+		endpoint = net.JoinHostPort(endpoint, port)
+	}
+	return p.Probe(ctx, endpoint, user, "postgres", password, "require")
 }
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
@@ -655,7 +685,8 @@ func SetupMultiTenant(
 	// SELECT-1 probe to fail-fast an unreachable/bad-credential target before
 	// the destructive flip. Always available in the k8s CP build; nil-degrades
 	// in tests / non-k8s (the runner's copy still catches a bad credential).
-	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardSpawnerHandle, clusterClient, catalogCopierProber{})
+	targetProber := catalogCopierProber{cluster: clusterClient}
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardSpawnerHandle, clusterClient, targetProber, targetProber)
 
 	// Break-glass internal-secret login (the SPA owns "/" and app routes).
 	admin.RegisterLogin(engine, adminTokens)

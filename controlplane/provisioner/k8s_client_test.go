@@ -48,6 +48,32 @@ func credentialSecret(name, password string) *unstructured.Unstructured {
 	}}
 }
 
+func TestCnpgProvisionerEndpointReadsCompleteScopedSecret(t *testing.T) {
+	data := map[string]interface{}{}
+	for key, value := range map[string]string{
+		"endpoint": "shard-004-rw.cnpg-shards.svc.cluster.local",
+		"port":     "5432", "username": "tenant_provisioner", "password": "secret",
+	} {
+		data[key] = base64.StdEncoding.EncodeToString([]byte(value))
+	}
+	secret := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1", "kind": "Secret",
+		"metadata": map[string]interface{}{"name": "cnpg-shard-004-provisioner", "namespace": ducklingNamespace},
+		"data":     data,
+	}}
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), secret)
+
+	endpoint, err := NewDucklingClientWithDynamic(fakeK8s).CnpgProvisionerEndpoint(context.Background(), "shard-004")
+	if err != nil {
+		t.Fatalf("CnpgProvisionerEndpoint: %v", err)
+	}
+	if endpoint.Host != "shard-004-rw.cnpg-shards.svc.cluster.local" || endpoint.Port != 5432 ||
+		endpoint.User != "tenant_provisioner" || endpoint.Database != "postgres" ||
+		endpoint.Password != "secret" || endpoint.SSLMode != "require" {
+		t.Fatalf("endpoint = %+v", endpoint.Redacted())
+	}
+}
+
 func TestGetResolvesMetadataPasswordFromCredentialSecretRef(t *testing.T) {
 	cr := ducklingWithCredentialRef("acme", SecretReference{
 		Name: "cnpg-tenant-acme-password", Namespace: ducklingNamespace, Key: "password",
