@@ -301,11 +301,23 @@ type fakeDuckling struct {
 	mrsReadErr error
 	// mrsStuckWithDelete models a composition that never honors the retain
 	// flag: the MRs stay at full lifecycle ["*"] no matter what.
-	mrsStuckWithDelete bool
-	maintenancePhase   string
-	maintenanceShard   string
-	cleanupRemaining   int
-	cleanupChecks      int
+	mrsStuckWithDelete  bool
+	maintenancePhase    string
+	maintenanceShard    string
+	cleanupRemaining    int
+	cleanupChecks       int
+	provisionerEndpoint CatalogEndpoint
+	provisionerErr      error
+}
+
+func (f *fakeDuckling) CnpgProvisionerEndpoint(context.Context, string) (CatalogEndpoint, error) {
+	if f.provisionerErr != nil {
+		return CatalogEndpoint{}, f.provisionerErr
+	}
+	if f.provisionerEndpoint.Host != "" {
+		return f.provisionerEndpoint, nil
+	}
+	return CatalogEndpoint{Host: "target-rw", Port: 5432, User: "tenant_provisioner", Database: "postgres", Password: "pw", SSLMode: "require"}, nil
 }
 
 func (f *fakeDuckling) Get(context.Context, string) (*DucklingStatus, error) {
@@ -520,6 +532,31 @@ type blockingCopier struct {
 	started  chan struct{}
 	released chan struct{}
 	canceled chan struct{}
+}
+
+func TestCnpgDestinationIsReprobedImmediatelyBeforeCutover(t *testing.T) {
+	op := cnpgOp()
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+	copier := &fakeCopier{probeFn: func(ep CatalogEndpoint) error {
+		if ep.Host == "target-rw" {
+			return errors.New("primary unavailable")
+		}
+		return nil
+	}}
+	run := &opRun{
+		r:  &ReshardRunner{duckling: duckling, copier: copier},
+		op: op,
+	}
+
+	err := run.preflightCnpgTarget(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "stopped accepting PostgreSQL connections before cutover") {
+		t.Fatalf("preflight error = %v", err)
+	}
+	for _, kind := range duckling.callKinds() {
+		if kind == "cnpg" {
+			t.Fatal("Duckling was repointed despite failed immediate destination probe")
+		}
+	}
 }
 
 func newBlockingCopier() *blockingCopier {
@@ -749,9 +786,9 @@ func TestReshardHappyPathCnpgToCnpg(t *testing.T) {
 	}
 	// flip → copy → recheck → drop source, in that order.
 	kinds := copier.kinds()
-	// probe(target, flip wait) → probe(source) → probe(target) → copy →
-	// stability recheck → source drop.
-	if fmt.Sprint(kinds) != fmt.Sprint([]string{"probe", "probe", "probe", "copy", "dropdb"}) {
+	// provisioner preflight → probe(target, flip wait) → probe(source) →
+	// probe(target) → copy → stability recheck → source drop.
+	if fmt.Sprint(kinds) != fmt.Sprint([]string{"probe", "probe", "probe", "probe", "copy", "dropdb"}) {
 		t.Fatalf("copier calls = %v", kinds)
 	}
 	// The copy's SOURCE is the recorded pre-flip endpoint, not the new one.

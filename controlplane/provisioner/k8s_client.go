@@ -573,6 +573,55 @@ func (d *DucklingClient) readSecretKey(ctx context.Context, ref SecretReference)
 	return string(decoded), nil
 }
 
+// CnpgProvisionerEndpoint resolves the shard-scoped administrative credential
+// used to prove a real primary accepts queries. The Secret is restricted by
+// resourceName in deployment RBAC and its values are never logged.
+func (d *DucklingClient) CnpgProvisionerEndpoint(ctx context.Context, shard string) (CatalogEndpoint, error) {
+	name := "cnpg-" + shard + "-provisioner"
+	secret, err := d.client.Resource(secretGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return CatalogEndpoint{}, fmt.Errorf("get Secret %s/%s: %w", ducklingNamespace, name, err)
+	}
+	read := func(key string) (string, error) {
+		encoded, found, nestedErr := unstructured.NestedString(secret.Object, "data", key)
+		if nestedErr != nil {
+			return "", fmt.Errorf("read Secret %s/%s key %q: %w", ducklingNamespace, name, key, nestedErr)
+		}
+		if !found || encoded == "" {
+			return "", fmt.Errorf("Secret %s/%s has no non-empty %q key", ducklingNamespace, name, key)
+		}
+		decoded, decodeErr := base64.StdEncoding.DecodeString(encoded)
+		if decodeErr != nil || len(decoded) == 0 {
+			return "", fmt.Errorf("Secret %s/%s has invalid %q data", ducklingNamespace, name, key)
+		}
+		return string(decoded), nil
+	}
+	endpoint, err := read("endpoint")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	portText, err := read("port")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return CatalogEndpoint{}, fmt.Errorf("Secret %s/%s has invalid port", ducklingNamespace, name)
+	}
+	user, err := read("username")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	password, err := read("password")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	return CatalogEndpoint{
+		Host: endpoint, Port: port, User: user, Password: password,
+		Database: "postgres", SSLMode: "require",
+	}, nil
+}
+
 // ComposedResourceError describes one composed managed resource that is not
 // healthy — Crossplane could not sync it to the provider (Synced=False) or the
 // provider reports it not ready (Ready=False) — along with that condition's

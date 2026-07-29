@@ -12,6 +12,15 @@ Runner pod resources default to `2` CPU and `8Gi` memory. Override them with
 quantities fail the pod spawn with an operator-visible error; they never panic
 the control plane.
 
+## Destination preflight rejection
+
+A cnpg-shard reshard is rejected before operation creation unless the control
+plane can read the destination's provisioner Secret and execute `SELECT 1`
+against its primary service. Check the CNPG Cluster `Ready` condition, database
+instance pods, PVCs, and init-job scheduling events. Pooler readiness alone
+does not establish shard health. Fix the shard and retry; there is no reshard
+operation to recover or cancel after a preflight rejection.
+
 ## Consuming the resharding signal
 
 The runner's first mutation is the advisory-locked warehouse

@@ -145,6 +145,7 @@ type reshardDucklingClient interface {
 	SetReshardMaintenanceCleanup(ctx context.Context, name string, operationID int64) error
 	ReshardMaintenanceRoleRemoved(ctx context.Context, name string) (bool, error)
 	ReshardMaintenanceCleanupComplete(ctx context.Context, name string) (complete bool, detail string, err error)
+	CnpgProvisionerEndpoint(ctx context.Context, shard string) (CatalogEndpoint, error)
 }
 
 // NewReshardRunner builds a runner over the real config store + duckling
@@ -655,6 +656,9 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 			}
 		}
 	} else {
+		if err := o.preflightCnpgTarget(ctx); err != nil {
+			return err
+		}
 		if err := o.flipToCnpg(ctx); err != nil {
 			return err
 		}
@@ -670,6 +674,20 @@ func (o *opRun) run(ctx context.Context, fenced <-chan struct{}) error {
 	}
 
 	return o.finalize(ctx)
+}
+
+func (o *opRun) preflightCnpgTarget(ctx context.Context) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	target, err := o.r.duckling.CnpgProvisionerEndpoint(probeCtx, o.op.ToShard)
+	if err != nil {
+		return fmt.Errorf("destination shard %s preflight credential: %w", o.op.ToShard, err)
+	}
+	if err := o.r.copier.Probe(probeCtx, target); err != nil {
+		return fmt.Errorf("destination shard %s stopped accepting PostgreSQL connections before cutover: %w", o.op.ToShard, err)
+	}
+	o.logf("info", "destination shard %s passed the immediate pre-cutover PostgreSQL probe", o.op.ToShard)
+	return nil
 }
 
 // resumeTakeover continues only phases whose durable inputs are sufficient to

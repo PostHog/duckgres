@@ -158,6 +158,11 @@ func hasESOReadablePrefix(name string) bool {
 // counts as a connect failure → 400.
 const externalProbeTimeout = 8 * time.Second
 
+// cnpgProbeTimeout bounds the destination-shard preflight. Unlike checking
+// for a Pooler pod or TCP listener, this executes SELECT 1 through PostgreSQL
+// with the shard provisioner credential, proving a real primary is available.
+const cnpgProbeTimeout = 8 * time.Second
+
 // ExternalTargetProber verifies the CP can actually reach + authenticate
 // against a cnpg→external reshard target Postgres before the op is created —
 // the destructive cnpg→ext flip (Crossplane DELETEs the source role/DB) happens
@@ -172,6 +177,14 @@ type ExternalTargetProber interface {
 	// 5432) as user/database with password over the given sslmode and runs a
 	// trivial liveness query. It MUST NOT echo the password in its error.
 	Probe(ctx context.Context, endpoint, user, database, password, sslMode string) error
+}
+
+// CnpgTargetProber verifies that a destination shard is accepting real
+// PostgreSQL queries before an operation is created. Production uses the
+// shard-scoped provisioner Secret; failure to configure this guard fails
+// reshard submission closed.
+type CnpgTargetProber interface {
+	ProbeCNPG(ctx context.Context, shard string) error
 }
 
 type reshardTargetRequest struct {
@@ -205,8 +218,8 @@ type startReshardRequest struct {
 // back to the shards tenants already occupy. prober may be nil (tests /
 // non-k8s) — the external target pre-flight connection check is then SKIPPED
 // (see ExternalTargetProber).
-func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, spawner ReshardPodSpawner, cluster kubernetes.Interface, prober ExternalTargetProber) {
-	h := &reshardHandler{store: store, lister: lister, spawner: spawner, cluster: cluster, prober: prober, stash: newReshardPasswordStash()}
+func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingMetadataLister, spawner ReshardPodSpawner, cluster kubernetes.Interface, prober ExternalTargetProber, cnpgProber CnpgTargetProber) {
+	h := &reshardHandler{store: store, lister: lister, spawner: spawner, cluster: cluster, prober: prober, cnpgProber: cnpgProber, stash: newReshardPasswordStash()}
 	r.POST("/orgs/:id/reshard", h.start)
 	r.GET("/orgs/:id/reshards", h.listForOrg)
 	r.GET("/reshards", h.listAll)
@@ -219,12 +232,13 @@ func RegisterReshardAPI(r *gin.RouterGroup, store ReshardStore, lister DucklingM
 }
 
 type reshardHandler struct {
-	store   ReshardStore
-	lister  DucklingMetadataLister
-	spawner ReshardPodSpawner
-	cluster kubernetes.Interface
-	prober  ExternalTargetProber
-	stash   *reshardPasswordStash
+	store      ReshardStore
+	lister     DucklingMetadataLister
+	spawner    ReshardPodSpawner
+	cluster    kubernetes.Interface
+	prober     ExternalTargetProber
+	cnpgProber CnpgTargetProber
+	stash      *reshardPasswordStash
 }
 
 // cnpgShardsNamespace is where the shared CNPG metadata shards run; instance
@@ -425,6 +439,23 @@ func (h *reshardHandler) start(c *gin.Context) {
 		}
 		if sourceKind == configstore.MetadataStoreKindCnpgShard && currentShard != "" && shard == currentShard {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "target shard equals the org's current shard (" + currentShard + ")"})
+			return
+		}
+		if h.cnpgProber == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"code":  "destination_shard_guard_unavailable",
+				"error": "destination shard connectivity guard is unavailable; refusing to create a reshard operation",
+			})
+			return
+		}
+		probeCtx, cancel := context.WithTimeout(c.Request.Context(), cnpgProbeTimeout)
+		err := h.cnpgProber.ProbeCNPG(probeCtx, shard)
+		cancel()
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"code":  "destination_shard_unavailable",
+				"error": fmt.Sprintf("destination shard %s is not accepting PostgreSQL connections: %v", shard, err),
+			})
 			return
 		}
 		op.TargetKind = configstore.MetadataStoreKindCnpgShard

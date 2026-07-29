@@ -91,6 +91,20 @@ The runner re-checks at `recordSource` (pre-flip, defense in depth for ops
 created by older CPs or hand-inserted rows): a status type that contradicts
 the op's recorded `source_kind` fails the op before anything is flipped.
 
+## Destination connectivity preflight
+
+Before accepting a cnpg-shard target, the start handler reads that shard's
+resource-name-scoped `cnpg-<shard>-provisioner` Secret and runs `SELECT 1`
+against the shard primary (`-rw`), using the provisioner login and `postgres`
+database. A Ready Pooler or open TCP port is not sufficient: PgBouncer can be
+healthy while the CNPG cluster has no PostgreSQL instances. An unavailable
+guard fails closed with 503; an unreadable Secret, authentication failure,
+timeout, or query failure also returns retryable 503 with the stable
+`destination_shard_unavailable` code, before an operation or runner pod exists.
+The runner repeats the same credentialed probe immediately before cutover to
+close the admission-to-cutover race. External targets retain their equivalent
+credentialed preflight.
+
 This guards against a real prod incident: an org whose config-store metadata
 block was EMPTY (previously silently defaulted to cnpg-shard) and whose
 duckling *spec* type had drifted from its *status* (the org actually lived on
