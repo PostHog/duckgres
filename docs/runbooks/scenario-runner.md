@@ -6,6 +6,16 @@ The scenario runner executes end-to-end managed-warehouse flows against a config
 
 The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. `fast-suite.yaml` follows the same flow without dbt. The standalone provisioning, frozen metadata, perf, and dbt scenarios remain available for focused debugging.
 
+The targeted frozen-perf scenario additionally creates production-shaped DuckLake
+tables, `posthog.events` and `posthog.persons`, from those raw views. It uses the
+PostHog backfill schema pinned at `056583335dc739b9e025efede811c9b4f5e153f5`,
+rewritten inserts, and `year(timestamp), month(timestamp), day(timestamp)` /
+`year(_timestamp), month(_timestamp)` partitioning. The raw views are deliberately
+retained as the later paired-query performance-control target.
+
+`project_id` is the one mapping exception: it is derived from `team_id`, exactly
+as the pinned production exporter does, so no `project_id` fixture column is needed.
+
 ## Required Environment
 
 Set these before running a real scenario:
@@ -90,6 +100,14 @@ Run frozen perf queries:
 just scenario-frozen-perf
 ```
 
+This runs, in order: raw-view setup, source-column preflight, explicit PostHog
+table DDL and partition setup, deterministic rewritten inserts, then schema,
+partition, count, timestamp-range, key-null-count, and bidirectional parity
+validation. The setup records the pinned revision, `rewritten_insert`, partition
+specifications, and source/destination row counts in
+`main.posthog_table_setup_manifest`. Neither `fast-suite` nor `full-suite` enables
+these tables yet.
+
 Run frozen dbt lifecycle:
 
 ```bash
@@ -164,3 +182,14 @@ The smoke scenario has an `always_run` deprovision step, but an interrupted proc
 4. If deletion does not complete, inspect the dev control-plane logs and the managed warehouse deprovision runbook.
 
 Use placeholders in shared notes and PRs; keep concrete dev values local.
+
+## Frozen PostHog Table Setup Recovery
+
+If the targeted frozen-perf setup or validation fails, retain the scenario error:
+it identifies missing required fixture column names, schema/partition drift, or a
+non-sensitive parity check. Do not edit the raw views to mask it. The warehouse is
+disposable and the next targeted run creates a new one; within a retried setup the
+transaction deletes both destination tables before inserting, so it cannot duplicate
+rows after partial setup. Refresh the fixture only after confirming the pinned
+backfill mapping remains appropriate; change the pin and mappings together when
+upstream production schema changes.

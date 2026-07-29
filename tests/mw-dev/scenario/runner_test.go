@@ -496,6 +496,142 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	}
 }
 
+func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen perf scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-perf-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	steps := make(map[string]core.Step, len(resolved.Steps))
+	for _, step := range resolved.Steps {
+		steps[step.ID] = step
+	}
+	setup, ok := steps["setup_posthog_tables"]
+	if !ok {
+		t.Fatal("expected posthog table setup step")
+	}
+	if got := setup.DependsOn; len(got) != 1 || got[0] != "setup_frozen_views" {
+		t.Fatalf("posthog setup dependencies = %#v, want [setup_frozen_views]", got)
+	}
+	setupFile, _ := setup.With["file"].(string)
+	if !strings.HasSuffix(setupFile, filepath.Join("sql", "setup_posthog_tables.sql")) {
+		t.Fatalf("posthog setup file = %q, want setup_posthog_tables.sql", setupFile)
+	}
+	if _, err := os.Stat(setupFile); err != nil {
+		t.Fatalf("posthog setup file %q should exist: %v", setupFile, err)
+	}
+	validation, ok := steps["validate_posthog_tables"]
+	if !ok {
+		t.Fatal("expected posthog table validation step")
+	}
+	if got := validation.DependsOn; len(got) != 1 || got[0] != "setup_posthog_tables" {
+		t.Fatalf("posthog validation dependencies = %#v, want [setup_posthog_tables]", got)
+	}
+	if got := steps["perf_queries"].DependsOn; len(got) != 1 || got[0] != "validate_posthog_tables" {
+		t.Fatalf("perf dependencies = %#v, want [validate_posthog_tables]", got)
+	}
+}
+
+func TestComposedFrozenSuitesDoNotEnablePostHogTableSetup(t *testing.T) {
+	for _, scenarioFile := range []string{"fast-suite.yaml", "full-suite.yaml"} {
+		t.Run(scenarioFile, func(t *testing.T) {
+			scenario, err := core.LoadScenario(filepath.Join("scenarios", scenarioFile))
+			if err != nil {
+				t.Fatalf("load scenario: %v", err)
+			}
+			for _, step := range scenario.Steps {
+				if step.ID == "setup_posthog_tables" || step.ID == "validate_posthog_tables" {
+					t.Fatalf("%s must not enable %s before scheduled rollout", scenarioFile, step.ID)
+				}
+			}
+		})
+	}
+}
+
+func TestPostHogTableSetupIsExplicitAndRerunnable(t *testing.T) {
+	setupFile := filepath.Join("sql", "setup_posthog_tables.sql")
+	raw, err := os.ReadFile(setupFile)
+	if err != nil {
+		t.Fatalf("read posthog table setup: %v", err)
+	}
+	sql := string(raw)
+	for _, want := range []string{
+		"CREATE SCHEMA IF NOT EXISTS posthog",
+		"CREATE TABLE IF NOT EXISTS posthog.events (",
+		"CREATE TABLE IF NOT EXISTS posthog.persons (",
+		"DELETE FROM posthog.events",
+		"DELETE FROM posthog.persons",
+		"INSERT INTO posthog.events (",
+		"INSERT INTO posthog.persons (",
+		"SET PARTITIONED BY (year(timestamp), month(timestamp), day(timestamp))",
+		"SET PARTITIONED BY (year(_timestamp), month(_timestamp))",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("posthog setup missing %q", want)
+		}
+	}
+	if strings.Contains(sql, "CREATE TABLE AS") || strings.Contains(sql, "SELECT *") {
+		t.Fatal("posthog setup must use explicit table and select column lists")
+	}
+}
+
+func TestPostHogTableSetupValidatesRequiredSourceColumnsAndMappings(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("sql", "setup_posthog_tables.sql"))
+	if err != nil {
+		t.Fatalf("read posthog table setup: %v", err)
+	}
+	sql := string(raw)
+	for _, want := range []string{
+		"056583335dc739b9e025efede811c9b4f5e153f5",
+		"frozen_v1.events_file_view",
+		"frozen_v1.persons_file_view",
+		"information_schema.columns",
+		"missing required source columns",
+		"CAST(properties AS VARCHAR)",
+		"CAST(person_properties AS VARCHAR)",
+		"CAST(team_id AS BIGINT) AS project_id",
+		"CAST(person_version AS UBIGINT)",
+		"CAST(historical_migration AS BOOLEAN)",
+		"CAST(\"timestamp\" AS TIMESTAMPTZ)",
+		"CAST(_timestamp AS TIMESTAMPTZ)",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("posthog setup missing explicit source mapping or diagnostic %q", want)
+		}
+	}
+}
+
+func TestPostHogTableValidationFailsOnParityMismatchWithUsefulDiagnostics(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("sql", "validate_posthog_tables.sql"))
+	if err != nil {
+		t.Fatalf("read posthog table validation: %v", err)
+	}
+	sql := string(raw)
+	for _, want := range []string{
+		"EXCEPT ALL",
+		"ordinal_position",
+		"posthog events parity mismatch",
+		"posthog persons parity mismatch",
+		"posthog.events row-count mismatch",
+		"posthog.persons row-count mismatch",
+		"posthog.events timestamp range mismatch",
+		"posthog.persons timestamp range mismatch",
+		"DESCRIBE posthog.events",
+		"DESCRIBE posthog.persons",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("posthog setup missing parity validation %q", want)
+		}
+	}
+}
+
 func TestFrozenDBTScenarioUsesSupportedStepsAndRelativeProject(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")

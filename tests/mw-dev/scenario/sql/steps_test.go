@@ -503,6 +503,61 @@ func TestExecutorTemplatesSQLFileEnvVars(t *testing.T) {
 	}
 }
 
+func TestExecutorPropagatesPostHogValidationDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		file       string
+		diagnostic string
+		contains   string
+	}{
+		{
+			name:       "missing source columns",
+			file:       filepath.Join("setup_posthog_tables.sql"),
+			diagnostic: "posthog events missing required source columns: group4_properties",
+			contains:   "information_schema.columns",
+		},
+		{
+			name:       "parity mismatch",
+			file:       filepath.Join("validate_posthog_tables.sql"),
+			diagnostic: "posthog events parity mismatch",
+			contains:   "EXCEPT ALL",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provisionState := provision.NewState()
+			provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+				Org: "scenario-org", Username: "root", Password: "root-password",
+			})
+			var gotSQL string
+			executor := NewExecutor(ExecutorConfig{
+				ProvisionState: provisionState,
+				Connection: ConnectionConfig{
+					DialHost: "10.0.0.10", SNISuffix: ".dev.example", Port: 5432, SSLMode: "require",
+				},
+				Driver: &fakeDriver{executeFunc: func(_ context.Context, req QueryRequest) (QueryResult, error) {
+					gotSQL = req.SQL
+					return QueryResult{}, errors.New(tc.diagnostic)
+				}},
+			})
+
+			err := executor.ExecuteStep(context.Background(), core.Step{
+				ID: "validate_posthog_tables", Type: StepTypeSQL,
+				With: map[string]any{"org_id": "scenario-org", "file": tc.file},
+			})
+			if !strings.Contains(gotSQL, tc.contains) {
+				t.Fatalf("validation SQL missing %q", tc.contains)
+			}
+			if !strings.Contains(err.Error(), tc.diagnostic) {
+				t.Fatalf("error = %v, want diagnostic %q", err, tc.diagnostic)
+			}
+			var classified classifiedError
+			if !errors.As(err, &classified) || classified.ErrorClass() != ErrorClassSQL {
+				t.Fatalf("error = %T %v, want class %q", err, err, ErrorClassSQL)
+			}
+		})
+	}
+}
+
 func TestExecutorUsesProvisionCredentialsInDSN(t *testing.T) {
 	provisionState := provision.NewState()
 	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
