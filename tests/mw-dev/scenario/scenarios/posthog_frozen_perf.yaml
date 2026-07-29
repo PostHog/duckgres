@@ -34,8 +34,29 @@ steps:
       max_attempts: 12
       retry_interval: 10s
 
+  - id: setup_posthog_tables
+    type: sql
+    depends_on: [setup_frozen_views]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/setup_posthog_tables.sql
+      max_attempts: 3
+      retry_interval: 10s
+
+  - id: validate_posthog_tables
+    type: sql
+    depends_on: [setup_posthog_tables]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/validate_posthog_tables.sql
+      max_attempts: 3
+      retry_interval: 10s
+
   - id: perf_queries
     type: perf_queries
+    depends_on: [validate_posthog_tables]
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
