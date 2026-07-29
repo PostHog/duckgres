@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -89,6 +90,9 @@ const (
 	ReshardMaintenancePhasePrepared = "prepared"
 	ReshardMaintenancePhaseFenced   = "fenced"
 	ReshardMaintenancePhaseDisabled = "disabled"
+
+	reshardMaintenanceCleanupAnnotation = "duckgres.posthog.com/reshard-cleanup-operation"
+	reshardMaintenanceCleanupSignal     = "cleanup"
 )
 
 // ReshardMaintenanceStatus contains no credential value, only the Secret
@@ -434,6 +438,11 @@ func (d *DucklingClient) SetReshardMaintenance(ctx context.Context, name string,
 		}
 	}
 	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				reshardMaintenanceCleanupAnnotation: nil,
+			},
+		},
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
 				"reshardMaintenance": value,
@@ -449,6 +458,52 @@ func (d *DucklingClient) SetReshardMaintenance(ctx context.Context, name string,
 		return fmt.Errorf("patch duckling CR %q reshard maintenance: %w", name, err)
 	}
 	return nil
+}
+
+// SetReshardMaintenanceCleanup asks the composition to stop rendering only the
+// temporary provider-sql Role while retaining its password chain. The
+// operation-matched annotation avoids an XRD schema rollout/restart and cannot
+// affect a later operation after SetReshardMaintenance clears it.
+func (d *DucklingClient) SetReshardMaintenanceCleanup(ctx context.Context, name string, operationID int64) error {
+	if operationID <= 0 {
+		return fmt.Errorf("reshard maintenance cleanup operationID must be positive")
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				reshardMaintenanceCleanupAnnotation: strconv.FormatInt(operationID, 10),
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal reshard maintenance cleanup patch for %q: %w", name, err)
+	}
+	if _, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	); err != nil {
+		return fmt.Errorf("patch duckling CR %q reshard maintenance cleanup: %w", name, err)
+	}
+	return nil
+}
+
+// ReshardMaintenanceRoleRemoved proves provider-sql has finished deleting the
+// temporary role. The composition keeps passwordSecretRef's credential chain
+// desired until this becomes true because provider-sql reads the Secret while
+// running its deletion finalizer.
+func (d *DucklingClient) ReshardMaintenanceRoleRemoved(ctx context.Context, name string) (bool, error) {
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))[:16]
+	roleName := "cnpg-reshard-" + hash
+	_, err := d.client.Resource(schema.GroupVersionResource{
+		Group: cnpgTenantMRGroup, Version: "v1alpha1", Resource: "roles",
+	}).Namespace(ducklingNamespace).Get(ctx, roleName, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		return false, nil
+	case apierrors.IsNotFound(err):
+		return true, nil
+	default:
+		return false, fmt.Errorf("check cleanup of role %s: %w", roleName, err)
+	}
 }
 
 // ReshardMaintenanceCleanupComplete proves that the operation-scoped

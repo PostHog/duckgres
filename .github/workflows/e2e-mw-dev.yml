@@ -61,7 +61,9 @@ on:
 # PR-scoped names until Duckling CR deletion completes; e2e-cleanup is the
 # backstop for namespaces with no follow-up run.
 concurrency:
-  group: e2e-mw-dev-${{ github.event.pull_request.number || github.ref }}
+  # Manual runs use unique resource identities, so do not let a later dispatch
+  # cancel an unrelated run whose teardown cannot reap those identities.
+  group: e2e-mw-dev-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -81,7 +83,7 @@ jobs:
     with:
       dockerfile: Dockerfile
       image-name: duckgres
-      tag: pr-${{ github.event.pull_request.number }}-${{ github.sha }}-arm64
+      tag: pr-${{ github.event.pull_request.number || github.run_id }}-${{ github.sha }}-arm64
       platform: linux/arm64
       cache-scope: e2e-duckgres-arm64
       # Default DuckDB row (1.5.3) — mirrors the default:true matrix entry in
@@ -95,14 +97,25 @@ jobs:
     secrets:
       ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
-  e2e:
+  e2e_lanes:
     needs: [build]
     if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: full
+            lane_prefix: "1"
+          - suite: reshard
+            lane_prefix: "2"
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     env:
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      NAMESPACE: duckgres-ci-pr-${{ github.event.pull_request.number }}
+      # Partition both lanes so no lane can collide with a real PR number.
+      # workflow_dispatch has no pull_request payload, so it uses run_id.
+      PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
+      NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
+      E2E_SUITE: ${{ matrix.suite }}
       # Single all-in-one image for both CP and workers (mw-dev parity).
       WORKER_IMAGE: ${{ needs.build.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ needs.build.outputs.image }}
@@ -171,6 +184,18 @@ jobs:
         if: failure()
         run: bash tests/mw-dev/run.sh diagnostics
 
+  # Preserve one stable required-check name while exposing each matrix lane's
+  # result independently.
+  e2e:
+    needs: [e2e_lanes]
+    if: ${{ always() && github.event_name != 'schedule' }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Require every e2e lane
+        env:
+          LANES_RESULT: ${{ needs.e2e_lanes.result }}
+        run: test "$LANES_RESULT" = success
+
   # Teardown runs as its OWN job so the gating `e2e` check completes the moment
   # the harness verdict is known instead of waiting ~1min for deprovision +
   # namespace delete. cmd_teardown recovers the internal secret from the
@@ -180,15 +205,23 @@ jobs:
   # deploy cleans the stale namespace first thing, and the 6h e2e-cleanup sweep
   # is the backstop for namespaces with no follow-up push.
   e2e-teardown:
-    needs: [e2e]
+    needs: [e2e_lanes]
     # Run on e2e success OR failure (not when e2e was skipped because build
     # failed — nothing was deployed). Scheduled trigger never reaches here.
-    if: ${{ always() && github.event_name != 'schedule' && contains(fromJSON('["success","failure"]'), needs.e2e.result) }}
+    if: ${{ always() && github.event_name != 'schedule' && contains(fromJSON('["success","failure"]'), needs.e2e_lanes.result) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: full
+            lane_prefix: "1"
+          - suite: reshard
+            lane_prefix: "2"
     env:
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      NAMESPACE: duckgres-ci-pr-${{ github.event.pull_request.number }}
+      PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
+      NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
       KUBE_CONTEXT: posthog-mw-dev
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev

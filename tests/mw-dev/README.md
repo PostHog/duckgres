@@ -16,6 +16,15 @@ cnpg-shard metadata stores.
    Postgres + a control-plane Deployment on the test image, spawning worker pods
    in the same namespace.
 4. **Test** via an in-cluster payload Job hitting the CP ClusterIP service.
+   The PR workflow runs `E2E_SUITE=full` and `E2E_SUITE=reshard` as parallel
+   matrix lanes. The reshard lane starts its target-discovery, validation,
+   cancellation, and rollback checks immediately after provisioning; the full
+   lane runs the remaining behavioral suite. The lanes use partitioned numeric
+   identities `1<base>` and `2<base>`, where `base` is the PR number or the
+   workflow run ID for a manual invocation. Their namespaces, Ducklings,
+   metadata roles, and teardown are therefore isolated while still matching
+   the CI RBAC allowlist. Each matrix cell is visible separately, while the
+   lightweight aggregate `e2e` job preserves a stable branch-protection check.
    `test-e2e` runs `e2e/harness.sh`; `test-scenario` runs the scenario named by
    `SCENARIO_NAME`, which defaults to `full-suite`. Scenario artifacts are
    copied to `SCENARIO_ARTIFACTS_DIR`, which defaults to
@@ -311,7 +320,7 @@ normal `go test ./...` lane.
 
 ## Isolation model
 
-Dedicated CP + throwaway config-store **per PR**, provisioning three **real**
+Dedicated CP + throwaway config-store **per e2e lane**, provisioning three **real**
 CNPG-backed ducklings (org IDs `ci-pr-<N>-cnpg` plus the ducklake-only
 resilience-lane orgs `ci-pr-<N>-res1`/`-res2`) through the **shared**
 Crossplane / cnpg-shards infra. The config-store
@@ -320,7 +329,7 @@ erase provisioned org rows. Everything PR-specific lives in the namespace and
 is deleted; the shared-infra footprint is removed by deprovisioning the
 ducklings first.
 
-Each deploy first reaps any existing resources for the same PR number (namespace,
+Each deploy first reaps any existing resources for the same lane identity (namespace,
 Duckling CRs, pod identity association, cross-namespace bindings, and cnpg role).
 It fails before applying manifests if the same-PR Duckling CRs do not fully
 delete, so a rerun never reuses PR-scoped bucket/org names while Crossplane
@@ -420,6 +429,11 @@ id committed).
 - **Shared-infra contention.** Concurrent PRs provision real ducklings against
   the same cnpg-shards infra. Org-ID prefix keeps them
   distinct; watch quay.io / cnpg pooler limits under parallelism.
+- **Parallel-lane recovery.** The `full` and `reshard` jobs have matching
+  teardown matrix entries and `fail-fast: false`, so one lane failing does not
+  cancel the other or skip its cleanup. A cancelled workflow can still strand a
+  lane temporarily; rerunning reaps that lane identity before deploy, and the
+  scheduled `e2e-cleanup` sweep remains the final backstop.
 - **e2e-cleanup** is wired: the `e2e-mw-dev.yml` `schedule` trigger runs
   `run.sh e2e-cleanup` every 6h, reaping `duckgres-ci-pr-*` namespaces older than
   6h (`E2E_CLEANUP_MAX_AGE_HOURS`) along with their ducklings, cnpg role+db, Pod

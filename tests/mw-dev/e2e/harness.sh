@@ -3670,30 +3670,41 @@ main() {
   # then retry-connect in a tight loop: the CP rate-limiter bans the source IP
   # after a handful of failed auths, and a fresh password isn't live until the
   # next config-store poll. Provision returns the live password directly.
-  # All three orgs provision CONCURRENTLY (independent ducklings), then all three
-  # readiness waits run concurrently too — provisioning cost is paid once, not
-  # per org.
+  # Independent Ducklings provision concurrently. The focused reshard lane
+  # needs CNPG plus RES2 only; RES1 exists solely for the full suite's worker
+  # disruption assertions.
   provision "$CNPG" "$CNPG_BODY"        > "$LANE_DIR/prov_cnpg.json" &
   prov1=$!
-  provision "$RES1" "$(res_body "$RES1")" > "$LANE_DIR/prov_res1.json" &
-  prov2=$!
   provision "$RES2" "$(res_body "$RES2")" > "$LANE_DIR/prov_res2.json" &
   prov3=$!
+  if [ "${E2E_SUITE:-full}" = "full" ]; then
+    provision "$RES1" "$(res_body "$RES1")" > "$LANE_DIR/prov_res1.json" &
+    prov2=$!
+  fi
   wait "$prov1" || fail "provision $CNPG failed"
-  wait "$prov2" || fail "provision $RES1 failed"
   wait "$prov3" || fail "provision $RES2 failed"
+  if [ "${E2E_SUITE:-full}" = "full" ]; then
+    wait "$prov2" || fail "provision $RES1 failed"
+  fi
   cnpg_pw="$(jq -r .password "$LANE_DIR/prov_cnpg.json")"
-  res1_pw="$(jq -r .password "$LANE_DIR/prov_res1.json")"
   res2_pw="$(jq -r .password "$LANE_DIR/prov_res2.json")"
-  for v in "$cnpg_pw" "$res1_pw" "$res2_pw"; do
+  for v in "$cnpg_pw" "$res2_pw"; do
     case "$v" in ""|null) fail "a provision call returned no password" ;; esac
   done
+  if [ "${E2E_SUITE:-full}" = "full" ]; then
+    res1_pw="$(jq -r .password "$LANE_DIR/prov_res1.json")"
+    case "$res1_pw" in ""|null) fail "provision $RES1 returned no password" ;; esac
+  fi
   bootstrap_kubectl
 
   run_lane ready_cnpg wait_state "$CNPG" ready "$READY_TIMEOUT"
-  run_lane ready_res1 wait_state "$RES1" ready "$READY_TIMEOUT"
   run_lane ready_res2 wait_state "$RES2" ready "$READY_TIMEOUT"
-  join_lanes ready_cnpg ready_res1 ready_res2
+  if [ "${E2E_SUITE:-full}" = "full" ]; then
+    run_lane ready_res1 wait_state "$RES1" ready "$READY_TIMEOUT"
+    join_lanes ready_cnpg ready_res1 ready_res2
+  else
+    join_lanes ready_cnpg ready_res2
+  fi
 
   # Settle: let the CP's config-store poll pick up the provisioned orgs/users
   # before the first connection, so we don't burn failed-auth attempts against
@@ -3702,6 +3713,18 @@ main() {
   # covers two full poll cycles; CONFIG_POLL_SETTLE overrides if that drifts.
   log "settling ${CONFIG_POLL_SETTLE:-12}s for CP auth cache…"
   sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  # The dedicated reshard workflow lane has a disjoint PR identity and starts
+  # these assertions immediately after provisioning. The long general suite
+  # executes concurrently in its own namespace and deliberately skips them.
+  if [ "${E2E_SUITE:-full}" = "reshard" ]; then
+    reshard_targets
+    reshard_validation "$CNPG"
+    reshard_cancel_during_drain "$RES2" "$res2_pw"
+    reshard_bogus_shard_rollback "$RES2" "$res2_pw"
+    log "PASS: reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback)"
+    return
+  fi
 
   # Admin models explorer: orgs + their users now exist in the config store, so
   # the sidebar counts are non-trivial and the org-users redaction check bites
@@ -3777,12 +3800,6 @@ main() {
   # ---- cross-tenant isolation between independent CNPG-backed orgs ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$RES1" "$res1_pw"
 
-  # ---- reshard operations (validation, cancel, and rollback on res2) ----
-  reshard_targets
-  reshard_validation "$CNPG"
-  reshard_cancel_during_drain "$RES2" "$res2_pw"
-  reshard_bogus_shard_rollback "$RES2" "$res2_pw"
-
   # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
   # (res1/res2 are deprovisioned by run.sh teardown; the cascade assertion
   # only needs one cnpg-shard org.)
@@ -3792,7 +3809,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + reshard(targets-discovery + validation + cancel-during-drain + bogus-shard-rollback) + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

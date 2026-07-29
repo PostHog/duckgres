@@ -446,6 +446,17 @@ func (f *fakeDuckling) ReshardMaintenanceCleanupComplete(context.Context, string
 	return true, "all operation-scoped maintenance resources deleted", nil
 }
 
+func (f *fakeDuckling) ReshardMaintenanceRoleRemoved(context.Context, string) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeDuckling) SetReshardMaintenanceCleanup(context.Context, string, int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, ducklingCall{kind: "maintenance", phase: reshardMaintenanceCleanupSignal})
+	return nil
+}
+
 func (f *fakeDuckling) reconcileMaintenanceStatus() {
 	m := &f.status.ReshardMaintenance
 	if f.maintenancePhase == "" {
@@ -1367,7 +1378,7 @@ func TestReshardTakeoverAfterFencePatchRestoresLoginBeforeCleanup(t *testing.T) 
 	if store.warehouseState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("warehouse state = %s, want ready after verified rollback", store.warehouseState)
 	}
-	want := []string{ReshardMaintenancePhasePrepared, ReshardMaintenancePhaseDisabled, ""}
+	want := []string{ReshardMaintenancePhasePrepared, ReshardMaintenancePhaseDisabled, reshardMaintenanceCleanupSignal, ""}
 	if got := duckling.maintenancePhases(); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("maintenance phases = %v, want %v", got, want)
 	}
@@ -1447,6 +1458,7 @@ func TestReshardCrashAfterSourceDropRollsForwardInsteadOfRepointingEmptySource(t
 		ReshardMaintenancePhaseDisabled,
 		ReshardMaintenancePhasePrepared,
 		ReshardMaintenancePhaseDisabled,
+		reshardMaintenanceCleanupSignal,
 		"",
 	}
 	if got := duckling.maintenancePhases(); fmt.Sprint(got) != fmt.Sprint(wantPhases) {

@@ -28,6 +28,11 @@ SCENARIO_NAME="${SCENARIO_NAME:-full-suite}"
 SCENARIO_ARTIFACTS_DIR="${SCENARIO_ARTIFACTS_DIR:-$HERE/../../artifacts/scenario-dev}"
 DUCKGRES_K8S_WORKER_CPU_REQUEST="${DUCKGRES_K8S_WORKER_CPU_REQUEST:-750m}"
 DUCKGRES_K8S_WORKER_MEMORY_REQUEST="${DUCKGRES_K8S_WORKER_MEMORY_REQUEST:-1536Mi}"
+E2E_SUITE="${E2E_SUITE:-full}"
+case "$E2E_SUITE" in
+  full|reshard) ;;
+  *) echo "E2E_SUITE must be full or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
+esac
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -310,6 +315,7 @@ spec:
           env:
             - { name: NAMESPACE, value: "$NS" }
             - { name: PR_NUMBER, value: "$PR_NUMBER" }
+            - { name: E2E_SUITE, value: "$E2E_SUITE" }
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
             - { name: INTERNAL_SECRET_FALLBACK, value: "$INTERNAL_SECRET_FALLBACK" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }

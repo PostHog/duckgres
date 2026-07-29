@@ -142,6 +142,8 @@ type reshardDucklingClient interface {
 	CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, detail string, err error)
 	SetMetadataStoreCnpgAdopt(ctx context.Context, name, shard string) error
 	SetReshardMaintenance(ctx context.Context, name string, maintenance *ReshardMaintenanceSpec) error
+	SetReshardMaintenanceCleanup(ctx context.Context, name string, operationID int64) error
+	ReshardMaintenanceRoleRemoved(ctx context.Context, name string) (bool, error)
 	ReshardMaintenanceCleanupComplete(ctx context.Context, name string) (complete bool, detail string, err error)
 }
 
@@ -913,6 +915,33 @@ func (o *opRun) waitForMaintenanceDisabled(ctx context.Context) error {
 func (o *opRun) cleanupMaintenance(ctx context.Context) error {
 	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
 		return nil
+	}
+	// Keep the credential chain desired while provider-sql deletes the role:
+	// its finalizer still reads passwordSecretRef during deletion. Cleanup is
+	// an operation-matched cleanup annotation so the composition can omit only
+	// the Role first without adding a transient phase to the public XRD schema.
+	if err := o.r.duckling.SetReshardMaintenanceCleanup(ctx, o.op.DucklingName, o.op.ID); err != nil {
+		return err
+	}
+	roleDeadline := time.Now().Add(o.flipTimeout())
+	for time.Now().Before(roleDeadline) {
+		removed, err := o.r.duckling.ReshardMaintenanceRoleRemoved(ctx, o.op.DucklingName)
+		if err != nil {
+			return err
+		}
+		if removed {
+			break
+		}
+		if err := maintenancePollSleep(ctx, o.r.loopPoll); err != nil {
+			return err
+		}
+	}
+	removed, err := o.r.duckling.ReshardMaintenanceRoleRemoved(ctx, o.op.DucklingName)
+	if err != nil {
+		return err
+	}
+	if !removed {
+		return fmt.Errorf("operation-scoped maintenance role was not removed within %s", o.flipTimeout())
 	}
 	if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, nil); err != nil {
 		return err

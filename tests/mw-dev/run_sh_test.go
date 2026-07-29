@@ -819,6 +819,81 @@ func TestE2EHarnessPodIsProtectedFromKarpenterDisruption(t *testing.T) {
 	}
 }
 
+func TestE2EHarnessJobReceivesSuiteSelection(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	for _, want := range []string{
+		`E2E_SUITE="${E2E_SUITE:-full}"`,
+		`{ name: E2E_SUITE, value: "$E2E_SUITE" }`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("run.sh missing e2e suite contract %q", want)
+		}
+	}
+}
+
+func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
+	raw, err := os.ReadFile("../../.github/workflows/e2e-mw-dev.yml")
+	if err != nil {
+		t.Fatalf("read e2e workflow: %v", err)
+	}
+	workflow := string(raw)
+	for _, want := range []string{
+		"matrix:",
+		"suite: full",
+		"suite: reshard",
+		`lane_prefix: "1"`,
+		`lane_prefix: "2"`,
+		"github.event.pull_request.number || github.run_id",
+		"github.event_name == 'workflow_dispatch' && github.run_id",
+		"NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix",
+		"E2E_SUITE: ${{ matrix.suite }}",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("e2e workflow missing parallel suite contract %q", want)
+		}
+	}
+	for _, duplicated := range []string{
+		"suite: full",
+		"suite: reshard",
+		`lane_prefix: "1"`,
+		`lane_prefix: "2"`,
+	} {
+		if got := strings.Count(workflow, duplicated); got != 2 {
+			t.Fatalf("e2e and teardown matrices must share %q exactly twice; got %d", duplicated, got)
+		}
+	}
+	for _, want := range []string{
+		"e2e:\n    needs: [e2e_lanes]",
+		"LANES_RESULT: ${{ needs.e2e_lanes.result }}",
+		`run: test "$LANES_RESULT" = success`,
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("e2e workflow missing stable aggregate gate %q", want)
+		}
+	}
+}
+
+func TestFocusedReshardSuiteDoesNotProvisionUnusedResilienceOrg(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	script := string(raw)
+	for _, want := range []string{
+		`if [ "${E2E_SUITE:-full}" = "full" ]; then`,
+		`provision "$RES1" "$(res_body "$RES1")"`,
+		`join_lanes ready_cnpg ready_res2`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("e2e harness missing focused-suite contract %q", want)
+		}
+	}
+}
+
 func manifestName(manifest map[string]any) string {
 	metadata, _ := manifest["metadata"].(map[string]any)
 	name, _ := metadata["name"].(string)

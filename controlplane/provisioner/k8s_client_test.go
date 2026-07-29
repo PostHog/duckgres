@@ -115,6 +115,14 @@ func TestReshardMaintenanceCleanupCompleteObservesNamedResources(t *testing.T) {
 	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), role, usage)
 	client := NewDucklingClientWithDynamic(fakeK8s)
 
+	removed, err := client.ReshardMaintenanceRoleRemoved(context.Background(), name)
+	if err != nil {
+		t.Fatalf("role removal observation: %v", err)
+	}
+	if removed {
+		t.Fatal("role removed=true while maintenance Role still exists")
+	}
+
 	complete, detail, err := client.ReshardMaintenanceCleanupComplete(context.Background(), name)
 	if err != nil {
 		t.Fatalf("cleanup observation: %v", err)
@@ -126,6 +134,13 @@ func TestReshardMaintenanceCleanupCompleteObservesNamedResources(t *testing.T) {
 		Group: cnpgTenantMRGroup, Version: "v1alpha1", Resource: "roles",
 	}).Namespace(ducklingNamespace).Delete(context.Background(), roleName, metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("delete role: %v", err)
+	}
+	removed, err = client.ReshardMaintenanceRoleRemoved(context.Background(), name)
+	if err != nil {
+		t.Fatalf("role removal observation after deletion: %v", err)
+	}
+	if !removed {
+		t.Fatal("role removed=false after maintenance Role deletion")
 	}
 
 	complete, detail, err = client.ReshardMaintenanceCleanupComplete(context.Background(), name)
