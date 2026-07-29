@@ -9,6 +9,16 @@ const (
 	ProtocolFlight Protocol = "flight"
 )
 
+// StorageTarget identifies the physical relation family selected for a paired
+// catalog query. It is runtime-only metadata; artifacts continue to use the
+// existing query ID and intent ID fields.
+type StorageTarget string
+
+const (
+	StorageTargetRawView      StorageTarget = "raw_view"
+	StorageTargetManagedTable StorageTarget = "managed_table"
+)
+
 type Catalog struct {
 	Name              string     `yaml:"name"`
 	Description       string     `yaml:"description"`
@@ -21,12 +31,13 @@ type Catalog struct {
 }
 
 type Query struct {
-	QueryID    string         `yaml:"query_id"`
-	IntentID   string         `yaml:"intent_id"`
-	Tags       []string       `yaml:"tags"`
-	Params     map[string]any `yaml:"params"`
-	PGWireSQL  string         `yaml:"pgwire_sql"`
-	DuckhogSQL string         `yaml:"duckhog_sql"`
+	QueryID       string         `yaml:"query_id"`
+	IntentID      string         `yaml:"intent_id"`
+	Tags          []string       `yaml:"tags"`
+	Params        map[string]any `yaml:"params"`
+	PGWireSQL     string         `yaml:"pgwire_sql"`
+	DuckhogSQL    string         `yaml:"duckhog_sql"`
+	StorageTarget StorageTarget  `yaml:"-" json:"-"`
 }
 
 type ExecutionResult struct {

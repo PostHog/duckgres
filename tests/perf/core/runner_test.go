@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -9,13 +10,53 @@ import (
 type testDriver struct {
 	protocol Protocol
 	calls    int
+	queryIDs []string
 }
 
 func (d *testDriver) Protocol() Protocol { return d.protocol }
 
-func (d *testDriver) Execute(_ context.Context, _ Query, _ []any) (ExecutionResult, error) {
+func (d *testDriver) Execute(_ context.Context, query Query, _ []any) (ExecutionResult, error) {
 	d.calls++
+	d.queryIDs = append(d.queryIDs, query.QueryID)
 	return ExecutionResult{Rows: 1}, nil
+}
+
+func TestRunnerExecutesPairedQueriesThroughExistingRuntimeContract(t *testing.T) {
+	catalog, err := ParseCatalog([]byte(pairedCatalogYAML(`
+paired_queries:
+  - query_id_base: q_events
+    intent_id: ph.events.v1
+    tags: [posthog]
+    params: {}
+    sql_template: SELECT COUNT(*) FROM {{ relation "events" }}
+`)))
+	if err != nil {
+		t.Fatalf("ParseCatalog returned error: %v", err)
+	}
+	driver := &testDriver{protocol: ProtocolPGWire}
+	sink := &inMemorySink{}
+	runner := NewQueryRunner(RunnerConfig{
+		Catalog: catalog,
+		Drivers: map[Protocol]ProtocolDriver{
+			ProtocolPGWire: driver,
+		},
+		Sink: sink,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+	if _, err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	wantIDs := []string{"q_events__raw_view", "q_events__managed_table"}
+	if !reflect.DeepEqual(driver.queryIDs, wantIDs) {
+		t.Fatalf("driver query order: got %v want %v", driver.queryIDs, wantIDs)
+	}
+	gotIDs := make([]string, 0, len(sink.results))
+	for _, result := range sink.results {
+		gotIDs = append(gotIDs, result.QueryID)
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("result query IDs: got %v want %v", gotIDs, wantIDs)
+	}
 }
 
 func (d *testDriver) Close() error { return nil }
