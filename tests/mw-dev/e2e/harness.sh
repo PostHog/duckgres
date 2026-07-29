@@ -3163,7 +3163,8 @@ reshard_cancel_during_drain() { # org password
 
   kill "$holder" 2>/dev/null || true
   wait "$holder" 2>/dev/null || true
-  [ "$(state_of "$org")" = "ready" ] || fail "reshard cancel: warehouse state $(state_of "$org"), want ready"
+  state="$(state_of "$org")"
+  [ "$state" = "ready" ] || { reshard_dump_log "$opid"; fail "reshard cancel: warehouse state $state, want ready"; }
   pg "$org" "$pw" ducklake "SELECT 1" >/dev/null
   discovery_metadata_converged "$org"
   log "reshard cancel OK (op $opid)"
@@ -3198,7 +3199,8 @@ reshard_bogus_shard_rollback() { # org password
   # VALUE back — it never removes the key).
   spec="$("$KUBECTL" -n ducklings get duckling "$d" -o jsonpath='{.spec.metadataStore.cnpgShard}')"
   [ "$spec" = "shard-001" ] || fail "reshard rollback: spec.cnpgShard=$spec, want shard-001"
-  [ "$(state_of "$org")" = "ready" ] || fail "reshard rollback: warehouse $(state_of "$org"), want ready"
+  state="$(state_of "$org")"
+  [ "$state" = "ready" ] || { reshard_dump_log "$opid"; fail "reshard rollback: warehouse $state, want ready"; }
 
   got="$(pg "$org" "$pw" ducklake "SELECT v FROM reshard_marker")"
   echo "$got" | grep -q 42 || fail "reshard rollback: marker data lost (got '$got')"

@@ -1439,6 +1439,35 @@ func TestSourceRecoveryTimeoutIgnoresShortCutoverOverride(t *testing.T) {
 	}
 }
 
+// TestReshardRollbackMaintenanceCleanupUsesSourceRecoveryTimeout ensures that
+// the rollback's entire source-access recovery, including removal of the
+// transient maintenance identity, is not shortened by a deliberately small
+// cutover timeout. The target timeout controls how long we wait for a bad
+// destination; it must not cap restoration of the known-good source.
+func TestReshardRollbackMaintenanceCleanupUsesSourceRecoveryTimeout(t *testing.T) {
+	op := cnpgOp()
+	op.CutoverTimeoutSeconds = 1
+	store := newFakeReshardStore(op)
+	duckling := &stuckCnpgDuckling{fakeDuckling: &fakeDuckling{
+		status:           cnpgSourceStatus(),
+		cleanupRemaining: 250, // 1.25s at the test runner's 5ms poll interval
+	}}
+	runner := testRunner(store, duckling, &fakeCopier{})
+	runner.flipTimeout = 2 * time.Second
+
+	runOp(t, runner, store)
+
+	if store.op.State != configstore.ReshardStateFailed {
+		t.Fatalf("state = %s, want failed cutover followed by rollback", store.op.State)
+	}
+	if store.warehouseState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("warehouse state = %s, want ready after full rollback recovery", store.warehouseState)
+	}
+	if duckling.cleanupChecks < 251 {
+		t.Fatalf("cleanup observations = %d, want it to outlast the 1s cutover timeout", duckling.cleanupChecks)
+	}
+}
+
 func TestReshardCrashAfterSourceDropRollsForwardInsteadOfRepointingEmptySource(t *testing.T) {
 	store := newFakeReshardStore(cnpgOp())
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}

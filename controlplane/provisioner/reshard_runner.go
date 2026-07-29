@@ -559,7 +559,7 @@ func (o *opRun) rollForwardAfterSourceDrop(ctx context.Context) error {
 			}
 		}
 	} else if o.op.MaintenanceDisabledAt == nil {
-		if err := o.disableMaintenance(ctx, nil); err != nil {
+		if err := o.disableMaintenance(ctx, nil, o.flipTimeout()); err != nil {
 			return err
 		}
 	}
@@ -875,8 +875,8 @@ func (o *opRun) waitForSourceMaintenanceUnfenced(ctx context.Context) error {
 	return fmt.Errorf("source endpoint and tenant login were not restored within %s; last observation: %s", timeout, last)
 }
 
-func (o *opRun) waitForMaintenanceEnabled(ctx context.Context) (*DucklingStatus, error) {
-	deadline := time.Now().Add(o.flipTimeout())
+func (o *opRun) waitForMaintenanceEnabled(ctx context.Context, timeout time.Duration) (*DucklingStatus, error) {
+	deadline := time.Now().Add(timeout)
 	var last string
 	for time.Now().Before(deadline) {
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -896,11 +896,11 @@ func (o *opRun) waitForMaintenanceEnabled(ctx context.Context) (*DucklingStatus,
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("maintenance LOGIN was not observed within %s; last observation: %s", o.flipTimeout(), last)
+	return nil, fmt.Errorf("maintenance LOGIN was not observed within %s; last observation: %s", timeout, last)
 }
 
-func (o *opRun) waitForMaintenanceDisabled(ctx context.Context) error {
-	deadline := time.Now().Add(o.flipTimeout())
+func (o *opRun) waitForMaintenanceDisabled(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
 	var last string
 	for time.Now().Before(deadline) {
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
@@ -918,10 +918,10 @@ func (o *opRun) waitForMaintenanceDisabled(ctx context.Context) error {
 			return err
 		}
 	}
-	return fmt.Errorf("maintenance identity was not disabled within %s; last observation: %s", o.flipTimeout(), last)
+	return fmt.Errorf("maintenance identity was not disabled within %s; last observation: %s", timeout, last)
 }
 
-func (o *opRun) cleanupMaintenance(ctx context.Context) error {
+func (o *opRun) cleanupMaintenance(ctx context.Context, timeout time.Duration) error {
 	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard {
 		return nil
 	}
@@ -932,7 +932,7 @@ func (o *opRun) cleanupMaintenance(ctx context.Context) error {
 	if err := o.r.duckling.SetReshardMaintenanceCleanup(ctx, o.op.DucklingName, o.op.ID); err != nil {
 		return err
 	}
-	roleDeadline := time.Now().Add(o.flipTimeout())
+	roleDeadline := time.Now().Add(timeout)
 	for time.Now().Before(roleDeadline) {
 		removed, err := o.r.duckling.ReshardMaintenanceRoleRemoved(ctx, o.op.DucklingName)
 		if err != nil {
@@ -950,12 +950,12 @@ func (o *opRun) cleanupMaintenance(ctx context.Context) error {
 		return err
 	}
 	if !removed {
-		return fmt.Errorf("operation-scoped maintenance role was not removed within %s", o.flipTimeout())
+		return fmt.Errorf("operation-scoped maintenance role was not removed within %s", timeout)
 	}
 	if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, nil); err != nil {
 		return err
 	}
-	deadline := time.Now().Add(o.flipTimeout())
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
 		statusGone := err == nil && st.ReshardMaintenance.OperationID != o.op.ID
@@ -974,14 +974,14 @@ func (o *opRun) cleanupMaintenance(ctx context.Context) error {
 			return err
 		}
 	}
-	return fmt.Errorf("operation-scoped maintenance identity was not removed within %s", o.flipTimeout())
+	return fmt.Errorf("operation-scoped maintenance identity was not removed within %s", timeout)
 }
 
 // disableMaintenance closes the privileged-login cleanup race. The fencer
 // establishes a final maintenance session first, runs beforeDisable while
 // LOGIN is still available, then requests/observes maintenance NOLOGIN,
 // terminates every other session for that role, and finally closes itself.
-func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() error) error {
+func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() error, timeout time.Duration) error {
 	if o.op.SourceKind != configstore.MetadataStoreKindCnpgShard || o.op.MaintenanceDisabledAt != nil {
 		if beforeDisable != nil {
 			return beforeDisable()
@@ -1004,7 +1004,7 @@ func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() err
 		if err := o.r.duckling.SetReshardMaintenance(ctx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhasePrepared)); err != nil {
 			return fmt.Errorf("re-enable maintenance identity after an interrupted disable: %w", err)
 		}
-		st, err = o.waitForMaintenanceEnabled(ctx)
+		st, err = o.waitForMaintenanceEnabled(ctx, timeout)
 		if err != nil {
 			return err
 		}
@@ -1018,7 +1018,7 @@ func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() err
 		Host: host, Port: 5432, User: m.User, Password: m.Password,
 		Database: "postgres", SSLMode: sslModeFor(o.op.SourceKind),
 	}
-	disableCtx, cancel := context.WithTimeout(ctx, o.flipTimeout())
+	disableCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := o.r.fencer.DisableMaintenanceAndTerminate(disableCtx, admin, func() error {
 		if beforeDisable != nil {
@@ -1029,7 +1029,7 @@ func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() err
 		if err := o.r.duckling.SetReshardMaintenance(disableCtx, o.op.DucklingName, o.maintenanceSpec(ReshardMaintenancePhaseDisabled)); err != nil {
 			return err
 		}
-		return o.waitForMaintenanceDisabled(disableCtx)
+		return o.waitForMaintenanceDisabled(disableCtx, timeout)
 	}); err != nil {
 		return fmt.Errorf("disable and drain maintenance identity: %w", err)
 	}
@@ -1676,7 +1676,7 @@ func (o *opRun) dropOrphanedCnpgSource(ctx context.Context) error {
 		o.op.SourceDroppedAt = at
 		o.logf("info", "orphaned cnpg source database dropped (the source role remains NOLOGIN)")
 		return nil
-	}); err != nil {
+	}, o.flipTimeout()); err != nil {
 		return err
 	}
 	if err := o.r.duckling.SetMetadataStoreRetainCnpgOnFlip(ctx, o.op.DucklingName, false); err != nil {
@@ -1791,7 +1791,7 @@ func (o *opRun) cleanupSource(ctx context.Context) error {
 		o.op.SourceDroppedAt = at
 		o.logf("info", "source database dropped; source tenant and maintenance roles remain NOLOGIN")
 		return nil
-	})
+	}, o.flipTimeout())
 }
 
 func (o *opRun) releaseSourceFence() {
@@ -1808,11 +1808,11 @@ func (o *opRun) finalize(ctx context.Context) error {
 	o.restoreCompaction(ctx)
 	if o.op.SourceKind == configstore.MetadataStoreKindCnpgShard {
 		if o.op.MaintenanceDisabledAt == nil {
-			if err := o.disableMaintenance(ctx, nil); err != nil {
+			if err := o.disableMaintenance(ctx, nil, o.flipTimeout()); err != nil {
 				return err
 			}
 		}
-		if err := o.cleanupMaintenance(ctx); err != nil {
+		if err := o.cleanupMaintenance(ctx, o.flipTimeout()); err != nil {
 			return fmt.Errorf("remove disabled reshard maintenance identity before finalizing: %w", err)
 		}
 		at, err := o.mark("maintenance_cleaned_at")
@@ -2023,10 +2023,10 @@ func (o *opRun) restoreAndCleanupMaintenance(ctx context.Context) error {
 		return err
 	}
 	o.logf("info", "source tenant login confirmed during rollback")
-	if err := o.disableMaintenance(ctx, nil); err != nil {
+	if err := o.disableMaintenance(ctx, nil, o.sourceRecoveryTimeout()); err != nil {
 		return err
 	}
-	if err := o.cleanupMaintenance(ctx); err != nil {
+	if err := o.cleanupMaintenance(ctx, o.sourceRecoveryTimeout()); err != nil {
 		return fmt.Errorf("remove operation-scoped maintenance identity: %w", err)
 	}
 	at, err := o.mark("maintenance_cleaned_at")
