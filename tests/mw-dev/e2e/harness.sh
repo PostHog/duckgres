@@ -125,6 +125,11 @@ RES2="ci-pr-${PR_NUMBER}-res2"
 # before this budget.
 READY_TIMEOUT="${READY_TIMEOUT:-1200}"
 
+# A worker can retire immediately after the harness's prior query. Bound the
+# pod-inspection reselect loop so the assertion tolerates normal replacement
+# without masking a genuinely missing worker forever.
+WORKER_INSPECTION_ATTEMPTS=30
+
 # The bundled extensions MUST be the PostHog forks. These are the short commit
 # SHAs duckdb_extensions() reports for the tags the image pins
 # (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.6, HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry).
@@ -1082,39 +1087,100 @@ newest_org_worker() { # org
     -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
 }
 
-assert_worker_pod() { # org
+newest_running_org_worker() { # org
+  k get pods -l "app=duckgres-worker,duckgres/active-org=$1" \
+    --field-selector=status.phase=Running \
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
+}
+
+# A pod list only proves the selected name existed at list time. Read every
+# assertion field in one GET so a successful snapshot can still be checked even
+# if Kubernetes removes the pod immediately afterward. The pipe separator is
+# safe for these Kubernetes scalar fields and avoids a JSON parser dependency in
+# the harness image.
+WORKER_INSPECTION_JSONPATH='{.metadata.deletionTimestamp}{"|"}{.status.phase}{"|"}{.metadata.labels.app}{"|"}{.metadata.labels.duckgres/control-plane}{"|"}{.metadata.labels.duckgres/worker-id}{"|"}{.spec.securityContext.runAsNonRoot}{"|"}{.spec.securityContext.runAsUser}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].securityContext.allowPrivilegeEscalation}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="POD_NAME")].valueFrom.fieldRef.fieldPath}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="NODE_NAME")].valueFrom.fieldRef.fieldPath}{"|"}{range .spec.volumes[*]}{.name}{","}{end}{"|"}{range .spec.containers[*].volumeMounts[*]}{.mountPath}{","}{end}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].resources.requests.cpu}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].resources.requests.memory}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="DUCKGRES_MEMORY_LIMIT")].value}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="GOMEMLIMIT")].value}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="DUCKGRES_THREADS")].value}'
+
+worker_inspection_snapshot() { # org password
+  org="$1"; pw="$2"; attempt=0; replacement_requested=false
+  while [ "$attempt" -lt "$WORKER_INSPECTION_ATTEMPTS" ]; do
+    # A NotFound from either the list or GET is normal lifecycle churn. Retry a
+    # newly selected name; never reuse a name that has already raced away.
+    pod="$(newest_running_org_worker "$org" || true)"
+    if [ -n "$pod" ] && snapshot="$(k get pod "$pod" -o jsonpath="$WORKER_INSPECTION_JSONPATH" 2>/dev/null)"; then
+      IFS='|' read -r worker_deleting worker_phase worker_app worker_control_plane \
+        worker_id worker_non_root worker_uid worker_privilege_escalation \
+        worker_pod_name worker_node_name worker_volumes worker_mounts worker_cpu \
+        worker_memory worker_memory_limit worker_go_memory_limit worker_threads <<EOF
+$snapshot
+EOF
+      if [ -z "$worker_deleting" ] && [ "$worker_phase" = "Running" ]; then
+        worker_pod="$pod"
+        return 0
+      fi
+      if [ -n "$worker_deleting" ]; then
+        log "worker $pod is retiring during inspection; reselecting"
+        if [ "$replacement_requested" = false ]; then
+          # A terminating worker can remain visible for its grace period. Trigger
+          # the normal on-demand acquire path once instead of polling that pod.
+          wait_worker "$org" "$pw" ducklake
+          replacement_requested=true
+        fi
+      else
+        log "worker $pod phase=$worker_phase during inspection; reselecting"
+      fi
+    elif [ -n "$pod" ]; then
+      log "worker $pod disappeared during inspection; reselecting"
+    else
+      log "no live worker pod found for $org; waiting for an on-demand replacement"
+      if [ "$replacement_requested" = false ]; then
+        # There is no warm pool. A normal query is the only supported way to
+        # ensure an org with no remaining worker gets a replacement to inspect.
+        wait_worker "$org" "$pw" ducklake
+        replacement_requested=true
+      fi
+    fi
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+assert_worker_pod() { # org password
   log "worker pod labels / securityContext / downward-env / SA-token"
-  pod="$(newest_org_worker "$1")"; [ -n "$pod" ] || fail "no worker pod found for $1"
+  worker_inspection_snapshot "$1" "$2" \
+    || fail "no live worker pod found for $1 after ${WORKER_INSPECTION_ATTEMPTS} inspection attempts"
+  pod="$worker_pod"
 
   # Labels: app + non-empty control-plane + worker-id (TestK8sWorkerPodCreation).
-  [ "$(k get pod "$pod" -o jsonpath='{.metadata.labels.app}')" = "duckgres-worker" ] \
+  [ "$worker_app" = "duckgres-worker" ] \
     || fail "worker $pod missing app=duckgres-worker"
-  [ -n "$(k get pod "$pod" -o jsonpath='{.metadata.labels.duckgres/control-plane}')" ] \
+  [ -n "$worker_control_plane" ] \
     || fail "worker $pod missing duckgres/control-plane label"
-  [ -n "$(k get pod "$pod" -o jsonpath='{.metadata.labels.duckgres/worker-id}')" ] \
+  [ -n "$worker_id" ] \
     || fail "worker $pod missing duckgres/worker-id label"
 
   # securityContext: non-root, uid 1000, no privilege escalation
   # (TestK8sWorkerSecurityContext).
-  [ "$(k get pod "$pod" -o jsonpath='{.spec.securityContext.runAsNonRoot}')" = "true" ] \
+  [ "$worker_non_root" = "true" ] \
     || fail "worker $pod runAsNonRoot != true"
-  [ "$(k get pod "$pod" -o jsonpath='{.spec.securityContext.runAsUser}')" = "1000" ] \
+  [ "$worker_uid" = "1000" ] \
     || fail "worker $pod runAsUser != 1000"
-  esc="$(k get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="duckdb-worker")].securityContext.allowPrivilegeEscalation}')"
+  esc="$worker_privilege_escalation"
   [ "$esc" = "false" ] || fail "worker $pod allowPrivilegeEscalation != false ('$esc')"
 
   # Downward-API env: POD_NAME / NODE_NAME (TestK8sWorkerAlwaysStampedWithPodAndNode).
-  pn="$(k get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="POD_NAME")].valueFrom.fieldRef.fieldPath}')"
+  pn="$worker_pod_name"
   [ "$pn" = "metadata.name" ] || fail "worker $pod POD_NAME fieldRef '$pn' != metadata.name"
-  nn="$(k get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="NODE_NAME")].valueFrom.fieldRef.fieldPath}')"
+  nn="$worker_node_name"
   [ "$nn" = "spec.nodeName" ] || fail "worker $pod NODE_NAME fieldRef '$nn' != spec.nodeName"
 
   # No ambient SA token (TestK8sWorkerPodsDoNotMountServiceAccountToken). The
   # worker SA is automountServiceAccountToken:false, so the pod has no
   # kube-api-access volume and no token mount.
-  vols="$(k get pod "$pod" -o jsonpath='{.spec.volumes[*].name}')"
+  vols="$worker_volumes"
   case " $vols " in *kube-api-access*) fail "worker $pod has a kube-api-access SA-token volume" ;; esac
-  mounts="$(k get pod "$pod" -o jsonpath='{range .spec.containers[*].volumeMounts[*]}{.mountPath}{"\n"}{end}')"
+  mounts="$worker_mounts"
   if echo "$mounts" | grep -q '/var/run/secrets/kubernetes.io/serviceaccount'; then
     fail "worker $pod mounts a kubernetes.io/serviceaccount token"
   fi
@@ -1123,8 +1189,8 @@ assert_worker_pod() { # org
   # the pool-default resource requests. With the exclusive-node pod anti-affinity
   # removed, requests are the ONLY thing keeping co-scheduled workers from
   # overcommitting a node — a BestEffort default worker is a regression.
-  dcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
-  dmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  dcpu="$worker_cpu"
+  dmem="$worker_memory"
   [ "$dcpu" = "750m" ] || fail "default worker $pod requests.cpu='$dcpu' want '750m' (pool default; BestEffort regression?)"
   [ "$dmem" = "1536Mi" ] || fail "default worker $pod requests.memory='$dmem' want '1536Mi'"
 
@@ -1134,11 +1200,11 @@ assert_worker_pod() { # org
   # /proc/meminfo and all pre-session work (DuckLake ATTACH, activation) runs
   # effectively unbounded. Values derive from the 750m/1536Mi pool default:
   # 75% of 1536Mi floors to 1GB; GOMEMLIMIT is 1/8 pod = 192MiB; 750m -> 1.
-  dml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_MEMORY_LIMIT\")].value}")"
+  dml="$worker_memory_limit"
   [ "$dml" = "1GB" ] || fail "default worker $pod DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of 1536Mi, GB-floored)"
-  gml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"GOMEMLIMIT\")].value}")"
+  gml="$worker_go_memory_limit"
   [ "$gml" = "192MiB" ] || fail "default worker $pod GOMEMLIMIT='$gml' want '192MiB' (1/8 of 1536Mi)"
-  thr="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_THREADS\")].value}")"
+  thr="$worker_threads"
   [ "$thr" = "1" ] || fail "default worker $pod DUCKGRES_THREADS='$thr' want '1' (750m rounds up)"
 }
 
@@ -3456,7 +3522,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   server_side_cursors    "$CNPG" "$cnpg_pw"
   cancel_then_reuse_same_session "$CNPG" "$cnpg_pw"
   assert_fork_extensions "$CNPG" "$cnpg_pw"   # after a DuckLake R/W (httpfs loaded)
-  assert_worker_pod      "$CNPG"   # newest org pod = a DuckLake worker above
+  assert_worker_pod      "$CNPG" "$cnpg_pw"  # reacquires a live DuckLake worker if one just retired
   concurrent_connections "$CNPG" "$cnpg_pw"
   concurrent_writers     "$CNPG" "$cnpg_pw"
   # Worker sizing on DuckLake: verified fresh sized spawn + same-shape reuse.
