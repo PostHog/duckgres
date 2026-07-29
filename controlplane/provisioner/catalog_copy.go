@@ -293,7 +293,7 @@ func (PGCatalogCopier) DropDatabase(ctx context.Context, ep CatalogEndpoint, dbN
 	// FORCE: pgbouncer may hold idle server connections into the tenant DB
 	// for a few minutes; terminating same-role backends is permitted for the
 	// database owner.
-	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP DATABASE %s WITH (FORCE)", quoteIdent(dbName))); err != nil {
+	if _, err := conn.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(dbName))); err != nil {
 		return fmt.Errorf("drop database %s: %w", dbName, err)
 	}
 	return nil

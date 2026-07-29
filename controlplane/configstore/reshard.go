@@ -88,6 +88,20 @@ type ReshardOperation struct {
 	BlockedAt   *time.Time `json:"blocked_at"`
 	UnblockedAt *time.Time `json:"unblocked_at"`
 
+	// Durable reshard fence milestones are written only after the corresponding
+	// external state was positively observed. Step is stamped at step entry and
+	// therefore cannot safely answer crash-boundary questions on its own.
+	MaintenancePreparedAt  *time.Time `json:"maintenance_prepared_at"`
+	SourceFenceRequestedAt *time.Time `json:"source_fence_requested_at"`
+	SourceFencedAt         *time.Time `json:"source_fenced_at"`
+	TargetRenderedAt       *time.Time `json:"target_rendered_at"`
+	TargetLoginReadyAt     *time.Time `json:"target_login_ready_at"`
+	ExternalVerifiedAt     *time.Time `json:"external_verified_at"`
+	SourceDropCommittedAt  *time.Time `json:"source_drop_committed_at"`
+	SourceDroppedAt        *time.Time `json:"source_dropped_at"`
+	MaintenanceDisabledAt  *time.Time `json:"maintenance_disabled_at"`
+	MaintenanceCleanedAt   *time.Time `json:"maintenance_cleaned_at"`
+
 	// Copy report counters (mirrored into the end-of-op report log entry).
 	TablesCopied int64 `gorm:"not null;default:0" json:"tables_copied"`
 	RowsCopied   int64 `gorm:"not null;default:0" json:"rows_copied"`

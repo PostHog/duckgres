@@ -12,6 +12,16 @@ Runner pod resources default to `2` CPU and `8Gi` memory. Override them with
 quantities fail the pod spawn with an operator-visible error; they never panic
 the control plane.
 
+## Consuming the resharding signal
+
+The runner's first mutation is the advisory-locked warehouse
+`ready → resharding` transition. Services using the control-plane API should
+read `GET /api/v1/warehouses` and treat `state: "resharding"` (and therefore
+`writable: false`) as the signal to stop or defer warehouse work. The warehouse
+remains in the response throughout the operation. This lifecycle state is
+server-managed; clients must not try to set it through the warehouse update
+endpoint.
+
 ## Failed or stale runner
 
 1. Inspect the operation log and `duckgres-reshard-op-<id>` pod events.
@@ -39,6 +49,20 @@ Duckling points at the intended source or target, its tenant role answers, and
 the catalog fingerprint/table set is complete. Only then restore warehouse
 readiness. For a damaged catalog, use the `pg_restore` command recorded beside
 `backup_s3_uri` in the operation log.
+
+Also inspect `status.metadataStore.reshardMaintenance`. A failed operation
+must not be manually unblocked while its status says `fenced=true`: that means
+the tenant role is still `NOLOGIN`. Repair the source pointer first, change the
+maintenance phase to `prepared`, wait until status reports
+`tenantLogin=true` and `maintenanceLogin=true`, then set the phase to
+`disabled` and wait for `maintenanceNoLogin=true`. Terminate any remaining
+sessions for the maintenance username, remove `reshardMaintenance`, and verify
+every resource in its published `resourceRefs` is absent. Removing the field
+before observing the factual login states loses the clearest declarative
+recovery signal. The temporary role is operation-scoped and privileged; a
+leftover maintenance identity, credential Secret, password generator,
+ExternalSecret, Crossplane Usage, or transient RBAC object is a security
+incident to clean up before admitting traffic.
 
 One blocked shape is deliberate: when the op's recorded source identity was
 unusable (empty/invalid `from_shard`, or an external source block without
