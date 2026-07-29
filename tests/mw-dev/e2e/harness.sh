@@ -1087,36 +1087,47 @@ newest_org_worker() { # org
     -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
 }
 
+newest_running_org_worker() { # org
+  k get pods -l "app=duckgres-worker,duckgres/active-org=$1" \
+    --field-selector=status.phase=Running \
+    --sort-by=.metadata.creationTimestamp \
+    -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null
+}
+
 # A pod list only proves the selected name existed at list time. Read every
 # assertion field in one GET so a successful snapshot can still be checked even
 # if Kubernetes removes the pod immediately afterward. The pipe separator is
 # safe for these Kubernetes scalar fields and avoids a JSON parser dependency in
 # the harness image.
-WORKER_INSPECTION_JSONPATH='{.metadata.deletionTimestamp}{"|"}{.metadata.labels.app}{"|"}{.metadata.labels.duckgres/control-plane}{"|"}{.metadata.labels.duckgres/worker-id}{"|"}{.spec.securityContext.runAsNonRoot}{"|"}{.spec.securityContext.runAsUser}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].securityContext.allowPrivilegeEscalation}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="POD_NAME")].valueFrom.fieldRef.fieldPath}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="NODE_NAME")].valueFrom.fieldRef.fieldPath}{"|"}{range .spec.volumes[*]}{.name}{","}{end}{"|"}{range .spec.containers[*].volumeMounts[*]}{.mountPath}{","}{end}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].resources.requests.cpu}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].resources.requests.memory}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="DUCKGRES_MEMORY_LIMIT")].value}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="GOMEMLIMIT")].value}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="DUCKGRES_THREADS")].value}'
+WORKER_INSPECTION_JSONPATH='{.metadata.deletionTimestamp}{"|"}{.status.phase}{"|"}{.metadata.labels.app}{"|"}{.metadata.labels.duckgres/control-plane}{"|"}{.metadata.labels.duckgres/worker-id}{"|"}{.spec.securityContext.runAsNonRoot}{"|"}{.spec.securityContext.runAsUser}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].securityContext.allowPrivilegeEscalation}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="POD_NAME")].valueFrom.fieldRef.fieldPath}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="NODE_NAME")].valueFrom.fieldRef.fieldPath}{"|"}{range .spec.volumes[*]}{.name}{","}{end}{"|"}{range .spec.containers[*].volumeMounts[*]}{.mountPath}{","}{end}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].resources.requests.cpu}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].resources.requests.memory}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="DUCKGRES_MEMORY_LIMIT")].value}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="GOMEMLIMIT")].value}{"|"}{.spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="DUCKGRES_THREADS")].value}'
 
 worker_inspection_snapshot() { # org password
   org="$1"; pw="$2"; attempt=0; replacement_requested=false
   while [ "$attempt" -lt "$WORKER_INSPECTION_ATTEMPTS" ]; do
     # A NotFound from either the list or GET is normal lifecycle churn. Retry a
     # newly selected name; never reuse a name that has already raced away.
-    pod="$(newest_org_worker "$org" || true)"
+    pod="$(newest_running_org_worker "$org" || true)"
     if [ -n "$pod" ] && snapshot="$(k get pod "$pod" -o jsonpath="$WORKER_INSPECTION_JSONPATH" 2>/dev/null)"; then
-      IFS='|' read -r worker_deleting worker_app worker_control_plane worker_id \
-        worker_non_root worker_uid worker_privilege_escalation worker_pod_name \
-        worker_node_name worker_volumes worker_mounts worker_cpu worker_memory \
-        worker_memory_limit worker_go_memory_limit worker_threads <<EOF
+      IFS='|' read -r worker_deleting worker_phase worker_app worker_control_plane \
+        worker_id worker_non_root worker_uid worker_privilege_escalation \
+        worker_pod_name worker_node_name worker_volumes worker_mounts worker_cpu \
+        worker_memory worker_memory_limit worker_go_memory_limit worker_threads <<EOF
 $snapshot
 EOF
-      if [ -z "$worker_deleting" ]; then
+      if [ -z "$worker_deleting" ] && [ "$worker_phase" = "Running" ]; then
         worker_pod="$pod"
         return 0
       fi
-      log "worker $pod is retiring during inspection; reselecting"
-      if [ "$replacement_requested" = false ]; then
-        # A terminating worker can remain visible for its grace period. Trigger
-        # the normal on-demand acquire path once instead of polling that pod.
-        wait_worker "$org" "$pw" ducklake
-        replacement_requested=true
+      if [ -n "$worker_deleting" ]; then
+        log "worker $pod is retiring during inspection; reselecting"
+        if [ "$replacement_requested" = false ]; then
+          # A terminating worker can remain visible for its grace period. Trigger
+          # the normal on-demand acquire path once instead of polling that pod.
+          wait_worker "$org" "$pw" ducklake
+          replacement_requested=true
+        fi
+      else
+        log "worker $pod phase=$worker_phase during inspection; reselecting"
       fi
     elif [ -n "$pod" ]; then
       log "worker $pod disappeared during inspection; reselecting"

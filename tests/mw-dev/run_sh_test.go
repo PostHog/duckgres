@@ -624,6 +624,7 @@ func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
 				"duckgres/worker-id":     "worker-123",
 			},
 		},
+		"status": map[string]any{"phase": "Running"},
 		"spec": map[string]any{
 			"securityContext": map[string]any{
 				"runAsNonRoot": true,
@@ -658,7 +659,7 @@ func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
 	if err := template.Execute(&got, pod); err != nil {
 		t.Fatalf("execute worker inspection JSONPath: %v", err)
 	}
-	const want = "|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1"
+	const want = "|Running|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1"
 	if got.String() != want {
 		t.Fatalf("worker inspection snapshot = %q, want %q", got.String(), want)
 	}
@@ -692,19 +693,46 @@ func TestE2EHarnessWorkerPodInspectionReacquiresReplacement(t *testing.T) {
 	writeFake(t, dir, "kubectl", `#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$HARNESS_TEST_CALLS"
 if [[ "$*" == *"get pods -l app=duckgres-worker,duckgres/active-org=test-org"* ]]; then
-  if [[ -e "$HARNESS_TEST_SELECTION" ]]; then
-    printf 'replacement-worker'
-  else
-    touch "$HARNESS_TEST_SELECTION"
+  selection="$(cat "$HARNESS_TEST_SELECTION" 2>/dev/null || true)"
+  case "$selection" in
+  "")
+    printf 'stale' > "$HARNESS_TEST_SELECTION"
     printf 'stale-worker'
-  fi
+    ;;
+  stale)
+    printf 'transitioned' > "$HARNESS_TEST_SELECTION"
+    if [[ "$*" == *"--field-selector=status.phase=Running"* ]]; then
+      printf 'transitioned-worker'
+    else
+      printf 'pending-worker'
+    fi
+    ;;
+  *)
+    if [[ "$*" == *"--field-selector=status.phase=Running"* ]]; then
+      printf 'replacement-worker'
+    else
+      printf 'pending-worker'
+    fi
+    ;;
+  esac
   exit 0
 fi
 if [[ "$*" == *"get pod stale-worker"* ]]; then
   echo 'Error from server (NotFound): pods "stale-worker" not found' >&2
   exit 1
 fi
-if [[ "$*" == *"get pod replacement-worker"* && "$*" == *"-o jsonpath="* ]]; then
+if [[ "$*" == *"get pod pending-worker"* && "$*" == *"-o jsonpath="* ]] || \
+   [[ "$*" == *"get pod transitioned-worker"* && "$*" == *"-o jsonpath="* ]] || \
+   [[ "$*" == *"get pod replacement-worker"* && "$*" == *"-o jsonpath="* ]]; then
+  phase=""
+  case "$*" in
+    *"get pod pending-worker"*) phase=Pending ;;
+    *"get pod transitioned-worker"*) phase=Succeeded ;;
+    *"get pod replacement-worker"*) phase=Running ;;
+  esac
+  if [[ "$*" == *".status.phase"* ]]; then
+    printf '|%s' "$phase"
+  fi
   printf '%s' '|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1'
   exit 0
 fi
@@ -735,11 +763,20 @@ exit 1
 		t.Fatalf("read kubectl calls: %v", err)
 	}
 	callLog := string(calls)
-	if got := strings.Count(callLog, "get pods -l app=duckgres-worker,duckgres/active-org=test-org"); got != 2 {
-		t.Fatalf("worker selections = %d, want 2 (stale then replacement); calls:\n%s", got, callLog)
+	if got := strings.Count(callLog, "get pods -l app=duckgres-worker,duckgres/active-org=test-org"); got != 3 {
+		t.Fatalf("worker selections = %d, want 3 (stale, terminal, then replacement); calls:\n%s", got, callLog)
+	}
+	if got := strings.Count(callLog, "--field-selector=status.phase=Running"); got != 3 {
+		t.Fatalf("running-worker selections = %d, want 3; calls:\n%s", got, callLog)
 	}
 	if !strings.Contains(callLog, "get pod stale-worker") {
 		t.Fatalf("fixture did not inspect the stale worker first; calls:\n%s", callLog)
+	}
+	if strings.Contains(callLog, "get pod pending-worker") {
+		t.Fatalf("inspection accepted a non-Running pod; calls:\n%s", callLog)
+	}
+	if got := strings.Count(callLog, "get pod transitioned-worker"); got != 1 {
+		t.Fatalf("terminal transition inspections = %d, want 1; calls:\n%s", got, callLog)
 	}
 	if got := strings.Count(callLog, "get pod replacement-worker"); got != 1 {
 		t.Fatalf("replacement inspection reads = %d, want 1 atomic snapshot; calls:\n%s", got, callLog)
