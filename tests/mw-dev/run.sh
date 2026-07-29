@@ -244,6 +244,8 @@ wait_ci_ducklings_deleted() { # pr-number timeout
 delete_ci_bindings() { # pr-number
   local pr="$1"
   "${KUBECTL[@]}" delete clusterrolebinding -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
+  "${KUBECTL[@]}" -n ducklings delete role,rolebinding \
+    -l "duckgres.posthog.com/ci-pr=${pr}" --ignore-not-found
 }
 
 reset_pr_stack() {

@@ -13,6 +13,17 @@ import (
 	kjsonpath "k8s.io/client-go/util/jsonpath"
 )
 
+func stringSlice(value any) []string {
+	items, _ := value.([]any)
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if text, ok := item.(string); ok {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
 func TestDeployFailsWhenSamePRDucklingsDoNotDelete(t *testing.T) {
 	fakes := newRunSHFakes(t)
 
@@ -913,6 +924,100 @@ func TestControlPlaneServiceExposesFlight(t *testing.T) {
 	}
 
 	t.Fatal("duckgres-control-plane Service missing from manifests template")
+}
+
+func TestReshardLaneCanReadOnlyConfiguredShardProvisionerSecrets(t *testing.T) {
+	raw, err := os.ReadFile("manifests.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+	rendered := strings.NewReplacer(
+		"${NAMESPACE}", "test-namespace",
+		"${PR_NUMBER}", "123",
+		"${CONTROLPLANE_IMAGE}", "example.invalid/duckgres:test",
+		"${WORKER_IMAGE}", "example.invalid/duckgres:test",
+		"${INTERNAL_SECRET}", "test-secret",
+		"${INTERNAL_SECRET_FALLBACK}", "test-secret-fallback",
+		"${USER_SECRET_KEY}", "test-user-secret-key",
+	).Replace(string(raw))
+
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
+	var role, binding map[string]any
+	for {
+		var manifest map[string]any
+		err := decoder.Decode(&manifest)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode manifests template: %v", err)
+		}
+		switch {
+		case manifest["kind"] == "Role" && manifestName(manifest) == "duckgres-ci-pr-123-cnpg-provisioner-secret-reader":
+			role = manifest
+		case manifest["kind"] == "RoleBinding" && manifestName(manifest) == "duckgres-ci-pr-123-cnpg-provisioner-secret-reader":
+			binding = manifest
+		}
+	}
+	if role == nil || binding == nil {
+		t.Fatalf("scoped provisioner Role/RoleBinding missing: role=%t binding=%t", role != nil, binding != nil)
+	}
+	metadata := role["metadata"].(map[string]any)
+	if metadata["namespace"] != "ducklings" {
+		t.Fatalf("Role namespace = %v, want ducklings", metadata["namespace"])
+	}
+	labels := metadata["labels"].(map[string]any)
+	if labels["duckgres.posthog.com/ci-pr"] != "123" {
+		t.Fatalf("Role cleanup label = %v, want PR number", labels)
+	}
+	rules := role["rules"].([]any)
+	if len(rules) != 1 {
+		t.Fatalf("Role rules = %v, want exactly one", rules)
+	}
+	rule := rules[0].(map[string]any)
+	if got := strings.Join(stringSlice(rule["apiGroups"]), ","); got != "" {
+		t.Fatalf("apiGroups = %q, want core API group", got)
+	}
+	if got := strings.Join(stringSlice(rule["resources"]), ","); got != "secrets" {
+		t.Fatalf("resources = %q, want secrets", got)
+	}
+	if got := strings.Join(stringSlice(rule["verbs"]), ","); got != "get" {
+		t.Fatalf("verbs = %q, want get", got)
+	}
+	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner" {
+		t.Fatalf("resourceNames = %q", got)
+	}
+	bindingMetadata := binding["metadata"].(map[string]any)
+	if bindingMetadata["namespace"] != "ducklings" {
+		t.Fatalf("RoleBinding namespace = %v, want ducklings", bindingMetadata["namespace"])
+	}
+	subjects := binding["subjects"].([]any)
+	if len(subjects) != 1 {
+		t.Fatalf("RoleBinding subjects = %v, want exactly one", subjects)
+	}
+	subject := subjects[0].(map[string]any)
+	if subject["kind"] != "ServiceAccount" || subject["name"] != "duckgres" || subject["namespace"] != "test-namespace" {
+		t.Fatalf("RoleBinding subject = %v, want disposable lane ServiceAccount", subject)
+	}
+	roleRef := binding["roleRef"].(map[string]any)
+	if roleRef["kind"] != "Role" || roleRef["name"] != "duckgres-ci-pr-123-cnpg-provisioner-secret-reader" {
+		t.Fatalf("RoleBinding roleRef = %v, want scoped Role", roleRef)
+	}
+}
+
+func TestReshardE2EUsesReachableDestinationAndForcesRollbackAfterPreflight(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read harness: %v", err)
+	}
+	script := string(raw)
+	if strings.Contains(script, `"cnpg_shard":"shard-009"`) || strings.Contains(script, `"cnpg_shard":"shard-099"`) {
+		t.Fatal("reshard e2e still relies on an unreachable destination rejected by preflight")
+	}
+	if !strings.Contains(script, `"cnpg_shard":"shard-002"`) ||
+		!strings.Contains(script, `"cutover_timeout_seconds":1`) {
+		t.Fatal("reshard rollback e2e must use reachable shard-002 with a forced one-second cutover timeout")
+	}
 }
 
 func TestControlPlaneWorkerDefaultsAreConfigurable(t *testing.T) {

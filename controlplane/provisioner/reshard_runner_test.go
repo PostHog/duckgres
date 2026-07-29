@@ -1476,6 +1476,44 @@ func TestSourceRecoveryTimeoutIgnoresShortCutoverOverride(t *testing.T) {
 	}
 }
 
+func TestSourceMaintenanceTimeoutIgnoresShortCutoverOverride(t *testing.T) {
+	runner := &ReshardRunner{flipTimeout: 15 * time.Minute}
+	run := &opRun{
+		r: runner,
+		op: &configstore.ReshardOperation{
+			CutoverTimeoutSeconds: 1,
+		},
+	}
+	if got, want := run.sourceMaintenanceTimeout(), 15*time.Minute; got != want {
+		t.Fatalf("source maintenance timeout = %s, want %s", got, want)
+	}
+	if got, want := run.flipTimeout(), time.Second; got != want {
+		t.Fatalf("target cutover timeout = %s, want %s", got, want)
+	}
+}
+
+func TestMaintenanceWaitUsesFullSourceBudgetInsteadOfCutoverOverride(t *testing.T) {
+	op := &configstore.ReshardOperation{
+		ID:                    1,
+		DucklingName:          "org-a",
+		CutoverTimeoutSeconds: 1,
+	}
+	runner := &ReshardRunner{
+		duckling:    &fakeDuckling{status: cnpgSourceStatus()},
+		store:       newFakeReshardStore(op),
+		flipTimeout: 25 * time.Millisecond,
+		loopPoll:    time.Millisecond,
+	}
+	run := &opRun{r: runner, op: op}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	_, err := run.waitForMaintenance(ctx, false)
+	if err == nil || !strings.Contains(err.Error(), "within 25ms") {
+		t.Fatalf("maintenance wait error = %v, want full source timeout", err)
+	}
+}
+
 func TestReshardCrashAfterSourceDropRollsForwardInsteadOfRepointingEmptySource(t *testing.T) {
 	store := newFakeReshardStore(cnpgOp())
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}

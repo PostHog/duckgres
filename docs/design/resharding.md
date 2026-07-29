@@ -632,17 +632,15 @@ charts side (composition + `retainCnpgOnFlip` XRD field) is tested by
 managementPolicies variants render; the XRD field defaults false). e2e
 (`tests/mw-dev/e2e/harness.sh`): validation 400s (incl. a non-allowlisted
 external secret name), cancel-during-drain (drain-not-kill + 57P03 visible),
-bogus-shard rollback (real flip → Synced=False → rollback, data intact), the
-**ext→cnpg positive path** (real catalog move off the harness RDS onto
-shard-001) — which, since reshards execute in dedicated pods, also asserts the
-op is created `pending`, the `duckgres-reshard-op-<id>` pod appears with the
-right labels while the op runs, and the leader reconciler reaps it after the
-op finishes — and which also asserts the pre-flip backup completed and recorded a
-`backup_s3_uri` under `_reshard_catalog_backups/` (the Job has no aws CLI, so it
-asserts the recorded URI + restore command in the op log, not an S3 list — same
-limitation as the tenant-isolation object-store half), and the LOAD-BEARING
-`lifecycle_teardown_cnpg` (a normal cnpg tenant deprovision still fully deletes
-the Duckling CR + its cnpg role/DB — the deprovision-unaffected regression net
-for `retainCnpgOnFlip`). cnpg→cnpg positive path needs a second mw-dev shard
-(follow-up infra); the cnpg→ext positive path is unit-test-only (the harness has
-no RDS password — the start API requires it ephemerally).
+a credentialed destination preflight against healthy shard-002, and a forced
+one-second target-convergence timeout (real flip → rollback to shard-001, data
+intact). The short per-op timeout applies only to the target wait; source
+fencing and rollback retain the full controller-convergence budget. Since
+reshards execute in dedicated pods, the lane also asserts the operation is
+created `pending`, the `duckgres-reshard-op-<id>` pod appears with the right
+labels while the operation runs, and the leader reconciler reaps it afterwards.
+The full lane retains the LOAD-BEARING `lifecycle_teardown_cnpg` assertion: a
+normal cnpg tenant deprovision still fully deletes the Duckling CR and its cnpg
+role/DB (the deprovision-unaffected regression net for
+`retainCnpgOnFlip`). External-store positive paths remain unit-test-only
+because the live harness deliberately provisions CNPG metadata stores only.
