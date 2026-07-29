@@ -1,6 +1,7 @@
 package e2emwdev_test
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+	kjsonpath "k8s.io/client-go/util/jsonpath"
 )
 
 func TestDeployFailsWhenSamePRDucklingsDoNotDelete(t *testing.T) {
@@ -596,6 +598,151 @@ func TestE2EHarnessUsesOnlyCnpgMetadataStores(t *testing.T) {
 	}
 	if strings.Contains(string(runRaw), "ci-pr-${pr}-ext") {
 		t.Error("run.sh still includes the external-metadata org in e2e lifecycle cleanup")
+	}
+}
+
+func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	const prefix = "WORKER_INSPECTION_JSONPATH='"
+	_, expression, found := strings.Cut(string(raw), prefix)
+	if !found {
+		t.Fatal("worker inspection JSONPath is missing")
+	}
+	expression, _, found = strings.Cut(expression, "'\n")
+	if !found {
+		t.Fatal("worker inspection JSONPath is not a single quoted expression")
+	}
+
+	pod := map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]any{
+				"app":                    "duckgres-worker",
+				"duckgres/control-plane": "control-plane",
+				"duckgres/worker-id":     "worker-123",
+			},
+		},
+		"spec": map[string]any{
+			"securityContext": map[string]any{
+				"runAsNonRoot": true,
+				"runAsUser":    1000,
+			},
+			"volumes": []any{map[string]any{"name": "data"}},
+			"containers": []any{map[string]any{
+				"name": "duckdb-worker",
+				"securityContext": map[string]any{
+					"allowPrivilegeEscalation": false,
+				},
+				"env": []any{
+					map[string]any{"name": "POD_NAME", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.name"}}},
+					map[string]any{"name": "NODE_NAME", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "spec.nodeName"}}},
+					map[string]any{"name": "DUCKGRES_MEMORY_LIMIT", "value": "1GB"},
+					map[string]any{"name": "GOMEMLIMIT", "value": "192MiB"},
+					map[string]any{"name": "DUCKGRES_THREADS", "value": "1"},
+				},
+				"volumeMounts": []any{map[string]any{"mountPath": "/data"}},
+				"resources": map[string]any{
+					"requests": map[string]any{"cpu": "750m", "memory": "1536Mi"},
+				},
+			}},
+		},
+	}
+
+	template := kjsonpath.New("worker-inspection").AllowMissingKeys(true)
+	if err := template.Parse(expression); err != nil {
+		t.Fatalf("parse worker inspection JSONPath: %v", err)
+	}
+	var got bytes.Buffer
+	if err := template.Execute(&got, pod); err != nil {
+		t.Fatalf("execute worker inspection JSONPath: %v", err)
+	}
+	const want = "|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1"
+	if got.String() != want {
+		t.Fatalf("worker inspection snapshot = %q, want %q", got.String(), want)
+	}
+}
+
+func TestE2EHarnessWorkerPodInspectionReacquiresReplacement(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+
+	// Run only the assertion against a fake in-cluster kubectl. The first list
+	// returns a worker that disappears before its GET; a replacement is then
+	// immediately available. This is the normal worker-retirement race the e2e
+	// harness must tolerate without turning the NotFound into empty assertions.
+	harness := strings.Replace(string(raw), "\nstart_kubectl_download\nk() {", "\nKUBECTL=\"${TEST_KUBECTL:?}\"\nk() {", 1)
+	harness = strings.Replace(harness, "\nmain \"$@\"\n", "\nassert_worker_pod test-org test-password\n", 1)
+	if harness == string(raw) {
+		t.Fatal("could not prepare e2e harness assertion fixture")
+	}
+
+	dir := t.TempDir()
+	harnessPath := filepath.Join(dir, "harness.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o755); err != nil {
+		t.Fatalf("write harness fixture: %v", err)
+	}
+
+	callsPath := filepath.Join(dir, "kubectl-calls.log")
+	selectionPath := filepath.Join(dir, "worker-selection")
+	kubectlPath := filepath.Join(dir, "kubectl")
+	writeFake(t, dir, "kubectl", `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$HARNESS_TEST_CALLS"
+if [[ "$*" == *"get pods -l app=duckgres-worker,duckgres/active-org=test-org"* ]]; then
+  if [[ -e "$HARNESS_TEST_SELECTION" ]]; then
+    printf 'replacement-worker'
+  else
+    touch "$HARNESS_TEST_SELECTION"
+    printf 'stale-worker'
+  fi
+  exit 0
+fi
+if [[ "$*" == *"get pod stale-worker"* ]]; then
+  echo 'Error from server (NotFound): pods "stale-worker" not found' >&2
+  exit 1
+fi
+if [[ "$*" == *"get pod replacement-worker"* && "$*" == *"-o jsonpath="* ]]; then
+  printf '%s' '|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1'
+  exit 0
+fi
+echo "unexpected kubectl invocation: $*" >&2
+exit 1
+`)
+	writeFake(t, dir, "sleep", "#!/usr/bin/env bash\nexit 0\n")
+
+	cmd := exec.Command("sh", harnessPath)
+	cmd.Env = append(os.Environ(),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TEST_KUBECTL="+kubectlPath,
+		"HARNESS_TEST_CALLS="+callsPath,
+		"HARNESS_TEST_SELECTION="+selectionPath,
+		"CP_API=http://test.invalid",
+		"CP_PG_HOST=control-plane.test",
+		"INTERNAL_SECRET=test-secret",
+		"NAMESPACE=test-namespace",
+		"PR_NUMBER=123",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("worker pod inspection did not reacquire a replacement: %v\n%s", err, out)
+	}
+
+	calls, err := os.ReadFile(callsPath)
+	if err != nil {
+		t.Fatalf("read kubectl calls: %v", err)
+	}
+	callLog := string(calls)
+	if got := strings.Count(callLog, "get pods -l app=duckgres-worker,duckgres/active-org=test-org"); got != 2 {
+		t.Fatalf("worker selections = %d, want 2 (stale then replacement); calls:\n%s", got, callLog)
+	}
+	if !strings.Contains(callLog, "get pod stale-worker") {
+		t.Fatalf("fixture did not inspect the stale worker first; calls:\n%s", callLog)
+	}
+	if got := strings.Count(callLog, "get pod replacement-worker"); got != 1 {
+		t.Fatalf("replacement inspection reads = %d, want 1 atomic snapshot; calls:\n%s", got, callLog)
 	}
 }
 
