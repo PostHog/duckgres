@@ -235,7 +235,10 @@ blocking → preparing_access → draining → fencing_source → pausing_compac
    Ready condition, `SELECT 1` with tenant creds. Timeout → rollback. The
    wait is bounded per-op by `cutover_timeout_seconds` (0 = default 15m /
    `DUCKGRES_RESHARD_FLIP_TIMEOUT`); real cnpg cutovers need minutes —
-   provider-sql role/DB creation plus cnpg SASL credential propagation.
+   provider-sql role/DB creation plus cnpg SASL credential propagation. This
+   per-op override bounds only target convergence. Rollback restoration of the
+   known-good source always retains the runner's full timeout, so a deliberately
+   short failed-target test cannot leave the source tenant `NOLOGIN`.
 8. **copying** — source read via its recorded pre-flip endpoint (the orphaned
    role/DB survives a shard flip; an ext source is reached direct-to-RDS with
    TLS because the flip deletes its ESO sync + pgbouncer). One

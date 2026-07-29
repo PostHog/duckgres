@@ -405,6 +405,14 @@ func (o *opRun) flipTimeout() time.Duration {
 	return o.r.flipTimeout
 }
 
+// sourceRecoveryTimeout is deliberately independent of a per-operation
+// cutover override. Operators may shorten an expected-to-fail target wait, but
+// restoring provider-sql resources on the known-good source can require the
+// full controller convergence budget and must not inherit that shorter bound.
+func (o *opRun) sourceRecoveryTimeout() time.Duration {
+	return o.r.flipTimeout
+}
+
 func (o *opRun) step(step string) error {
 	if err := o.r.store.UpdateReshardStep(o.op.ID, o.r.cpID, o.op.RunnerEpoch, step); err != nil {
 		return err
@@ -834,7 +842,8 @@ func (o *opRun) waitForMaintenance(ctx context.Context, wantFenced bool) (*Duckl
 }
 
 func (o *opRun) waitForSourceMaintenanceUnfenced(ctx context.Context) error {
-	deadline := time.Now().Add(o.flipTimeout())
+	timeout := o.sourceRecoveryTimeout()
+	deadline := time.Now().Add(timeout)
 	var last string
 	sourcePrefix := o.op.FromShard + "-pooler."
 	for time.Now().Before(deadline) {
@@ -863,7 +872,7 @@ func (o *opRun) waitForSourceMaintenanceUnfenced(ctx context.Context) error {
 			return err
 		}
 	}
-	return fmt.Errorf("source endpoint and tenant login were not restored within %s; last observation: %s", o.flipTimeout(), last)
+	return fmt.Errorf("source endpoint and tenant login were not restored within %s; last observation: %s", timeout, last)
 }
 
 func (o *opRun) waitForMaintenanceEnabled(ctx context.Context) (*DucklingStatus, error) {

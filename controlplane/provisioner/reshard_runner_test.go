@@ -1426,6 +1426,19 @@ func TestReshardFinalizationWaitsForMaintenanceResourcesToDisappear(t *testing.T
 	}
 }
 
+func TestSourceRecoveryTimeoutIgnoresShortCutoverOverride(t *testing.T) {
+	runner := &ReshardRunner{flipTimeout: 15 * time.Minute}
+	run := &opRun{
+		r: runner,
+		op: &configstore.ReshardOperation{
+			CutoverTimeoutSeconds: 90,
+		},
+	}
+	if got, want := run.sourceRecoveryTimeout(), 15*time.Minute; got != want {
+		t.Fatalf("source recovery timeout = %s, want %s", got, want)
+	}
+}
+
 func TestReshardCrashAfterSourceDropRollsForwardInsteadOfRepointingEmptySource(t *testing.T) {
 	store := newFakeReshardStore(cnpgOp())
 	duckling := &fakeDuckling{status: cnpgSourceStatus()}
