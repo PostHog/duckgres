@@ -26,3 +26,40 @@ var (
 		Help: "Total number of DuckLake transaction conflicts where all retries were exhausted (worker)",
 	})
 )
+
+// Commit-loop stats re-exported from the ducklake extension's
+// ducklake_commit_stats() table function (see commit_stats.go). These see
+// INSIDE the extension's internal commit retry loop, unlike the
+// duckgres_worker_ducklake_conflict_* counters above, which only see conflicts
+// that escape it. Labelled by DuckLake catalog name; conflicts additionally by
+// conflict cause.
+var (
+	ducklakeCommitAttemptsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_ducklake_commit_attempts_total",
+		Help: "Total DuckLake commit attempts inside the ducklake extension's commit retry loop (worker)",
+	}, []string{"catalog"})
+	ducklakeCommitSuccessesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_ducklake_commit_successes_total",
+		Help: "Total DuckLake commits that succeeded inside the ducklake extension's commit retry loop (worker)",
+	}, []string{"catalog"})
+	ducklakeCommitRetriesExhaustedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_ducklake_commit_retries_exhausted_total",
+		Help: "Total DuckLake commits that exhausted the ducklake extension's internal retries (worker)",
+	}, []string{"catalog"})
+	ducklakeCommitNonretryableErrorsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_ducklake_commit_nonretryable_errors_total",
+		Help: "Total DuckLake commit failures the ducklake extension classified as non-retryable (worker)",
+	}, []string{"catalog"})
+	ducklakeCommitBackoffMsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_ducklake_commit_backoff_ms_total",
+		Help: "Total milliseconds spent backing off between DuckLake commit retries inside the ducklake extension (worker)",
+	}, []string{"catalog"})
+	ducklakeCommitDurationMsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_ducklake_commit_duration_ms_total",
+		Help: "Total milliseconds spent in DuckLake commits inside the ducklake extension's commit loop (worker)",
+	}, []string{"catalog"})
+	ducklakeCommitConflictsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_ducklake_commit_conflicts_total",
+		Help: "Total DuckLake commit conflicts observed inside the ducklake extension's commit retry loop, by cause (worker)",
+	}, []string{"catalog", "cause"})
+)
