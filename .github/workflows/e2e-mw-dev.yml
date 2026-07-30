@@ -95,7 +95,7 @@ jobs:
         DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
         POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
     secrets:
-      ecr-role: ${{ vars.AWS_ECR_PUBLISH_IAM_ROLE }}
+      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
 
   e2e_lanes:
     needs: [build]
