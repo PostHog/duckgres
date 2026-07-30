@@ -43,20 +43,14 @@ RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
     -o duckgres-controlplane \
     ./cmd/duckgres-controlplane
 
-FROM debian:bookworm-slim
+FROM chainguard/wolfi-base:latest
 
-# postgresql-client-18 provides pg_dump/pg_restore for the reshard runner's
+# postgresql-18-client provides pg_dump/pg_restore for the reshard runner's
 # pre-flip catalog backup (docs/design/resharding.md). Pinned to PG 18 to match
-# the cnpg shard major so it can dump PG-18 catalogs. From the PGDG apt repo
-# because Debian bookworm's stock repo only carries PG 15.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg wget \
-    && install -d /usr/share/postgresql-common/pgdg \
-    && wget -qO /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
-    && apt-get update && apt-get install -y --no-install-recommends postgresql-client-18 \
-    && apt-get purge -y gnupg wget && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
-RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
+# the cnpg shard major so it can dump PG-18 catalogs. No libstdc++ here: this
+# image does not link libduckdb (pg_query_go's libpg_query is plain C).
+RUN apk add --no-cache ca-certificates-bundle postgresql-18-client \
+    && addgroup -S duckgres && adduser -S -G duckgres -h /app duckgres
 
 WORKDIR /app
 COPY --from=builder /build/duckgres-controlplane .

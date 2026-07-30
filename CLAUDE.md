@@ -840,7 +840,7 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   kept on success. The objects carry NO object tag: PutObject with x-amz-tagging
   needs `s3:PutObjectTagging`, which the org duckling roles do not grant (a
   tagged upload 403s on the real cluster — mw-dev e2e regression). pg_dump/pg_restore ship in the CP image
-  (`postgresql-client-18`, PGDG repo, in BOTH `Dockerfile` and
+  (Wolfi's `postgresql-18-client` apk, in BOTH `Dockerfile` and
   `Dockerfile.controlplane`). Full design + restore procedure:
   `docs/design/resharding.md`.
 - **Source identity: the duckling STATUS is authoritative, validated at
