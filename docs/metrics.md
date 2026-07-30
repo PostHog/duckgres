@@ -33,7 +33,7 @@ Histograms expose the usual `_bucket`, `_count`, and `_sum` series.
 | Admission queue | `duckgres_session_admission_wait_seconds`, `duckgres_session_admission_requests_total` | After a request is successfully enqueued until grant, hard rejection, timeout, cancellation, or evaluation error. Enqueue failures are excluded. |
 | Admission state | `duckgres_session_admission_queue_depth`, `duckgres_session_admission_active_vcpus`, `duckgres_session_admission_limit_vcpus` | Local waiting callers, live local lease handles, and the effective org cap reconciled for active org stacks from each control-plane process's current config snapshot. |
 | Worker acquisition | `duckgres_worker_acquire_*` | After admission grants until an existing, hot-idle, or newly spawned worker is allocated. |
-| Session start | `duckgres_session_start_duration_seconds` | After successful PostgreSQL authentication until `ReadyForQuery` is flushed or session bootstrap terminates. |
+| Session start | `duckgres_session_start_duration_seconds`, `duckgres_postgres_session_start_total` | After successful PostgreSQL authentication until `ReadyForQuery` is flushed or session bootstrap terminates. The counter records exactly one terminal result after server-side retries. |
 | Query | `duckgres_query_total`, `duckgres_query_duration_seconds` | One non-empty query attempt and its execution duration. |
 
 Session start includes profile resolution, admission, worker
@@ -52,12 +52,24 @@ session defaults, and the final ready flush. It excludes failed authentication.
 | `duckgres_session_admission_active_vcpus` | Gauge | `org` | Requested vCPUs held by live local lease handles. It is admitted capacity, not measured CPU usage or the exact durable lease-row total. |
 | `duckgres_session_admission_limit_vcpus` | Gauge | `org` | Effective org cap for an active org stack, reconciled from this process's current config snapshot. `0` means unlimited. |
 | `duckgres_session_start_duration_seconds` | Histogram | `org`, `protocol`, `outcome` | Authenticated PostgreSQL create-to-ready latency. |
+| `duckgres_postgres_session_start_total` | Counter | `org`, `outcome`, `failure_class` | Exactly one terminal authenticated PostgreSQL session-start result after server-side retries. |
 
 Admission request outcomes are `granted`, `rejected`, `timeout`, `canceled`,
 and `error`. `rejected` means the requested worker shape can never fit its hard
 organization or user vCPU ceiling.
 Session-start outcomes are `success`, `timeout`, `canceled`, `capacity`,
 `draining`, and `error`.
+
+The PostgreSQL terminal counter collapses those outcomes to `success` or
+`failure`. Success always has `failure_class="none"`. Failure classes are
+`capacity`, `worker`, `metadata_store`, `control_plane`, `client`, `lifecycle`,
+`canceled`, `transport`, and `unknown`. The first four represent failures an
+operator can usually alleviate. The remaining classes let alerts exclude bad
+client input, planned lifecycle transitions, client disconnects, wire errors,
+and newly added paths that have not yet been classified. Flight SQL does not
+emit this counter. `capacity` covers runtime worker exhaustion and admission
+timeouts; requests that exceed a configured hard org or user vCPU limit are
+classified as `client`.
 
 Evaluation decisions are `granted_current`, `already_granted`, `rejected`,
 `blocked`, `waiting`, `inactive`, `missing`, `canceled`, `timeout`, and `error`.

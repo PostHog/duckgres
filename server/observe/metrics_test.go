@@ -1,6 +1,7 @@
 package observe
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -85,10 +86,12 @@ func TestObserveConnectionDurationRecordsPerOrgSample(t *testing.T) {
 func TestSessionStartScopeRecordsExactlyOnce(t *testing.T) {
 	const org = "session-start-test-org"
 	before := sessionStartSampleCount(t, org, "postgres", "success")
+	terminalBefore := postgresSessionStartCount(t, org, "success", SessionStartFailureNone)
+	failureBefore := postgresSessionStartCount(t, org, "failure", SessionStartFailureControlPlane)
 
 	scope := BeginSessionStart(org, "postgres")
-	scope.Finish("success")
-	scope.Finish("error")
+	scope.Finish("success", SessionStartFailureControlPlane)
+	scope.Finish("error", SessionStartFailureControlPlane)
 
 	if got := sessionStartSampleCount(t, org, "postgres", "success"); got != before+1 {
 		t.Fatalf("success sample count = %d, want %d", got, before+1)
@@ -96,6 +99,88 @@ func TestSessionStartScopeRecordsExactlyOnce(t *testing.T) {
 	if got := sessionStartSampleCount(t, org, "postgres", "error"); got != 0 {
 		t.Fatalf("error sample count = %d, want 0", got)
 	}
+	if got := postgresSessionStartCount(t, org, "success", SessionStartFailureNone); got != terminalBefore+1 {
+		t.Fatalf("terminal success count = %v, want %v", got, terminalBefore+1)
+	}
+	if got := postgresSessionStartCount(t, org, "failure", SessionStartFailureControlPlane); got != failureBefore {
+		t.Fatalf("second Finish changed terminal classification: count = %v, want %v", got, failureBefore)
+	}
+}
+
+func TestSessionStartScopeRecordsPostgresTerminalFailure(t *testing.T) {
+	const org = "session-start-terminal-failure-org"
+	before := postgresSessionStartCount(t, org, "failure", SessionStartFailureMetadataStore)
+	histogramBefore := sessionStartSampleCount(t, org, "postgres", "timeout")
+
+	BeginSessionStart(org, "postgres").Finish("timeout", SessionStartFailureMetadataStore)
+
+	if got := postgresSessionStartCount(t, org, "failure", SessionStartFailureMetadataStore); got != before+1 {
+		t.Fatalf("terminal failure count = %v, want %v", got, before+1)
+	}
+	if got := sessionStartSampleCount(t, org, "postgres", "timeout"); got != histogramBefore+1 {
+		t.Fatalf("timeout histogram count = %d, want %d", got, histogramBefore+1)
+	}
+}
+
+func TestSessionStartScopeNormalizesUnsafeFailureClasses(t *testing.T) {
+	tests := []struct {
+		name         string
+		outcome      string
+		failureClass string
+		wantOutcome  string
+		wantClass    string
+	}{
+		{
+			name:         "success always uses none",
+			outcome:      "success",
+			failureClass: SessionStartFailureWorker,
+			wantOutcome:  "success",
+			wantClass:    SessionStartFailureNone,
+		},
+		{
+			name:         "failure cannot use none",
+			outcome:      "error",
+			failureClass: SessionStartFailureNone,
+			wantOutcome:  "failure",
+			wantClass:    SessionStartFailureUnknown,
+		},
+		{
+			name:         "unknown class stays non-pageable",
+			outcome:      "error",
+			failureClass: "new-unclassified-path",
+			wantOutcome:  "failure",
+			wantClass:    SessionStartFailureUnknown,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			org := fmt.Sprintf("session-start-normalization-%d", i)
+			before := postgresSessionStartCount(t, org, tt.wantOutcome, tt.wantClass)
+
+			BeginSessionStart(org, "postgres").Finish(tt.outcome, tt.failureClass)
+
+			if got := postgresSessionStartCount(t, org, tt.wantOutcome, tt.wantClass); got != before+1 {
+				t.Fatalf("normalized terminal count = %v, want %v", got, before+1)
+			}
+		})
+	}
+}
+
+func TestSessionStartScopeDoesNotExportFlightTerminalCounter(t *testing.T) {
+	const org = "session-start-obsolete-flight-org"
+	before := postgresSessionStartCount(t, org, "failure", SessionStartFailureMetadataStore)
+
+	BeginSessionStart(org, "flight").Finish("error", SessionStartFailureMetadataStore)
+
+	if got := postgresSessionStartCount(t, org, "failure", SessionStartFailureMetadataStore); got != before {
+		t.Fatalf("obsolete Flight path changed PostgreSQL terminal count: got %v, want %v", got, before)
+	}
+}
+
+func postgresSessionStartCount(t *testing.T, org, outcome, failureClass string) float64 {
+	t.Helper()
+	return counterVecValue(t, postgresSessionStartCounter, org, outcome, failureClass)
 }
 
 func sessionStartSampleCount(t *testing.T, org, protocol, outcome string) uint64 {

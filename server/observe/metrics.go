@@ -41,6 +41,27 @@ func ObserveConnectionDuration(org string, seconds float64) {
 	connectionDurationHistogram.WithLabelValues(org).Observe(seconds)
 }
 
+// PostgreSQL session-start failure classes are intentionally bounded. Alerting
+// may allowlist operator-actionable classes, while client, lifecycle, transport,
+// and unknown failures remain available for diagnosis without paging.
+const (
+	SessionStartFailureNone          = "none"
+	SessionStartFailureCapacity      = "capacity"
+	SessionStartFailureWorker        = "worker"
+	SessionStartFailureMetadataStore = "metadata_store"
+	SessionStartFailureControlPlane  = "control_plane"
+	SessionStartFailureClient        = "client"
+	SessionStartFailureLifecycle     = "lifecycle"
+	SessionStartFailureCanceled      = "canceled"
+	SessionStartFailureTransport     = "transport"
+	SessionStartFailureUnknown       = "unknown"
+)
+
+var postgresSessionStartCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_postgres_session_start_total",
+	Help: "Terminal outcomes for authenticated PostgreSQL session starts after all server-side retries.",
+}, []string{"org", "outcome", "failure_class"})
+
 var sessionStartDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_session_start_duration_seconds",
 	Help:    "Authenticated session bootstrap time through protocol readiness, partitioned by org, protocol, and terminal outcome.",
@@ -48,7 +69,7 @@ var sessionStartDurationHistogram = promauto.NewHistogramVec(prometheus.Histogra
 }, []string{"org", "protocol", "outcome"})
 
 // SessionStartScope records one logical protocol bootstrap. Finish is
-// idempotent so a default-error defer can coexist with an explicit success.
+// idempotent so a default-error defer can coexist with an explicit result.
 type SessionStartScope struct {
 	started  time.Time
 	org      string
@@ -65,7 +86,7 @@ func BeginSessionStart(org, protocol string) *SessionStartScope {
 	return &SessionStartScope{started: time.Now(), org: org, protocol: protocol}
 }
 
-func (s *SessionStartScope) Finish(outcome string) {
+func (s *SessionStartScope) Finish(outcome, failureClass string) {
 	if s == nil {
 		return
 	}
@@ -74,13 +95,40 @@ func (s *SessionStartScope) Finish(outcome string) {
 	default:
 		outcome = "error"
 	}
+	terminalOutcome, failureClass := normalizePostgresSessionStartResult(outcome, failureClass)
 	s.once.Do(func() {
 		duration := time.Since(s.started)
 		if duration < 0 {
 			duration = 0
 		}
 		sessionStartDurationHistogram.WithLabelValues(s.org, s.protocol, outcome).Observe(duration.Seconds())
+		if s.protocol == "postgres" {
+			postgresSessionStartCounter.WithLabelValues(s.org, terminalOutcome, failureClass).Inc()
+		}
 	})
+}
+
+func normalizePostgresSessionStartResult(outcome, failureClass string) (string, string) {
+	if outcome == "success" {
+		return "success", SessionStartFailureNone
+	}
+
+	switch failureClass {
+	case SessionStartFailureCapacity,
+		SessionStartFailureWorker,
+		SessionStartFailureMetadataStore,
+		SessionStartFailureControlPlane,
+		SessionStartFailureClient,
+		SessionStartFailureLifecycle,
+		SessionStartFailureCanceled,
+		SessionStartFailureTransport,
+		SessionStartFailureUnknown:
+		return "failure", failureClass
+	default:
+		// A failed session must never be reported with class=none, and newly
+		// added unclassified paths must stay outside paging allowlists.
+		return "failure", SessionStartFailureUnknown
+	}
 }
 
 // S3BytesReadTotal counts bytes read from S3 by DuckDB, labeled by org.
