@@ -373,7 +373,7 @@ Run with config file:
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
-| `DUCKGRES_METADATA_HOSTNAME_SUFFIXES` | Comma-separated SNI suffixes for the explicitly enabled native metadata Postgres proxy, such as `.md.us.postwh.com` | - |
+| `DUCKGRES_METADATA_HOSTNAME_SUFFIXES` | Comma-separated SNI suffixes for the explicitly enabled native metadata Postgres proxy, such as `.md.dev.postwh.com`, `.md.us.postwh.com`, or `.md.eu.postwh.com` | - |
 | `DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG` | Maximum admitted metadata proxy sessions per org on each control-plane replica | `20` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
@@ -906,8 +906,11 @@ existing Duckgres password and must send the exact non-empty
 database, and PgBouncer endpoint internally. The endpoint and password are
 never sent to the client; the upstream role and database may be visible
 through normal PostgreSQL introspection such as `current_user` and
-`current_database()`. The per-org connection limit is enforced independently
-on every control-plane replica. Internal target resolution and
+`current_database()`. Managed-warehouse deployments configure their own
+environment suffix (`.md.dev.postwh.com`, `.md.us.postwh.com`, or
+`.md.eu.postwh.com`); suffixes are never inferred from the ordinary Duckgres
+hostname. The per-org connection limit is enforced independently on every
+control-plane replica. Internal target resolution and
 connect/auth/synchronization have a fixed 10-second bootstrap deadline; the
 deadline does not apply after the relay is established. An admin/UI update that
 includes `metadata_proxy_enabled` reloads the local config snapshot and

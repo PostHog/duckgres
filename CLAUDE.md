@@ -31,8 +31,9 @@ PG Client → TLS/Auth/PG Protocol → Control Plane pod
 
 The Kubernetes control plane can expose explicitly opted-in CNPG-backed
 warehouse metadata databases on a separate SNI suffix
-(`DUCKGRES_METADATA_HOSTNAME_SUFFIXES`, for example
-`.md.us.postwh.com`). This is an early connection branch, not a DuckDB
+(`DUCKGRES_METADATA_HOSTNAME_SUFFIXES`; managed-warehouse deployments use
+`.md.dev.postwh.com`, `.md.us.postwh.com`, or `.md.eu.postwh.com`). This is an
+early connection branch, not a DuckDB
 executor: the existing org `root` password authenticates at Duckgres, the
 startup database MUST be exactly `metadata`, and the control plane resolves
 the real endpoint/database/tenant role/password internally through

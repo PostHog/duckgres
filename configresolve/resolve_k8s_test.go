@@ -30,14 +30,14 @@ func TestResolveEffectiveParsesMetadataHostnameSuffixes(t *testing.T) {
 	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
 		switch key {
 		case "DUCKGRES_METADATA_HOSTNAME_SUFFIXES":
-			return " .md.us.postwh.com, .md.eu.postwh.com "
+			return " .md.dev.postwh.com, .md.us.postwh.com, .md.eu.postwh.com "
 		case "DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG":
 			return "7"
 		}
 		return ""
 	}, nil)
 
-	want := []string{".md.us.postwh.com", ".md.eu.postwh.com"}
+	want := []string{".md.dev.postwh.com", ".md.us.postwh.com", ".md.eu.postwh.com"}
 	if !slices.Equal(resolved.MetadataHostnameSuffixes, want) {
 		t.Fatalf("expected metadata hostname suffixes %v, got %v", want, resolved.MetadataHostnameSuffixes)
 	}
