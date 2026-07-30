@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -308,9 +309,17 @@ type fakeDuckling struct {
 	cleanupChecks       int
 	provisionerEndpoint CatalogEndpoint
 	provisionerErr      error
+	provisionerShards   []string
+	provisionerDeadline time.Time
 }
 
-func (f *fakeDuckling) CnpgProvisionerEndpoint(context.Context, string) (CatalogEndpoint, error) {
+func (f *fakeDuckling) CnpgProvisionerEndpoint(ctx context.Context, shard string) (CatalogEndpoint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.provisionerShards = append(f.provisionerShards, shard)
+	if deadline, ok := ctx.Deadline(); ok {
+		f.provisionerDeadline = deadline
+	}
 	if f.provisionerErr != nil {
 		return CatalogEndpoint{}, f.provisionerErr
 	}
@@ -640,15 +649,21 @@ type fakeBackuper struct {
 type fakeSourceFencer struct {
 	mu               sync.Mutex
 	calls            int
+	disableEndpoint  CatalogEndpoint
 	before           func() error
 	err              error
 	disableCalls     int
 	disableErrsAfter int
+	disableDeadline  time.Time
 }
 
-func (f *fakeSourceFencer) DisableMaintenanceAndTerminate(_ context.Context, _ CatalogEndpoint, disableAndWait func() error) error {
+func (f *fakeSourceFencer) DisableMaintenanceAndTerminate(ctx context.Context, endpoint CatalogEndpoint, disableAndWait func() error) error {
 	f.mu.Lock()
 	f.disableCalls++
+	f.disableEndpoint = endpoint
+	if deadline, ok := ctx.Deadline(); ok {
+		f.disableDeadline = deadline
+	}
 	f.mu.Unlock()
 	if err := disableAndWait(); err != nil {
 		return err
@@ -1489,6 +1504,106 @@ func TestSourceMaintenanceTimeoutIgnoresShortCutoverOverride(t *testing.T) {
 	}
 	if got, want := run.flipTimeout(), time.Second; got != want {
 		t.Fatalf("target cutover timeout = %s, want %s", got, want)
+	}
+}
+
+func TestDisableMaintenanceUsesDirectSourceEndpoint(t *testing.T) {
+	op := cnpgOp()
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{
+		status: cnpgSourceStatus(),
+		provisionerEndpoint: CatalogEndpoint{
+			Host: "shard-001-rw.cnpg-shards.svc.cluster.local", Port: 6432,
+			User: "provisioner", Password: "provisioner-password", Database: "postgres", SSLMode: "require",
+		},
+	}
+	if err := duckling.SetReshardMaintenance(context.Background(), op.DucklingName, &ReshardMaintenanceSpec{
+		OperationID: op.ID,
+		SourceShard: op.FromShard,
+		Phase:       ReshardMaintenancePhasePrepared,
+	}); err != nil {
+		t.Fatalf("prepare maintenance: %v", err)
+	}
+	fencer := &fakeSourceFencer{}
+	runner := testRunner(store, duckling, &fakeCopier{})
+	runner.fencer = fencer
+
+	run := &opRun{r: runner, op: op}
+	if err := run.disableMaintenance(context.Background(), nil); err != nil {
+		t.Fatalf("disable maintenance: %v", err)
+	}
+
+	if want := []string{"shard-001"}; !reflect.DeepEqual(duckling.provisionerShards, want) {
+		t.Fatalf("provisioner endpoint shards = %v, want %v", duckling.provisionerShards, want)
+	}
+	got := fencer.disableEndpoint
+	if got.Host != "shard-001-rw.cnpg-shards.svc.cluster.local" || got.Port != 6432 || got.SSLMode != "require" {
+		t.Fatalf("maintenance endpoint = %s, want direct source primary with TLS", got.Redacted())
+	}
+	if got.User != "reshard_1" || got.Password != "maintenance-password" || got.Database != "postgres" {
+		t.Fatalf("maintenance credentials = user %q password %q database %q, want operation-scoped credentials", got.User, got.Password, got.Database)
+	}
+	if !fencer.disableDeadline.After(duckling.provisionerDeadline) {
+		t.Fatalf("disable deadline = %s, want a fresh budget after endpoint lookup deadline %s", fencer.disableDeadline, duckling.provisionerDeadline)
+	}
+}
+
+func TestDisableMaintenanceFailsClosedWhenDirectEndpointUnavailable(t *testing.T) {
+	op := cnpgOp()
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), provisionerErr: errors.New("source primary unavailable")}
+	if err := duckling.SetReshardMaintenance(context.Background(), op.DucklingName, &ReshardMaintenanceSpec{
+		OperationID: op.ID,
+		SourceShard: op.FromShard,
+		Phase:       ReshardMaintenancePhasePrepared,
+	}); err != nil {
+		t.Fatalf("prepare maintenance: %v", err)
+	}
+	fencer := &fakeSourceFencer{}
+	runner := testRunner(store, duckling, &fakeCopier{})
+	runner.fencer = fencer
+
+	run := &opRun{r: runner, op: op}
+	err := run.disableMaintenance(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "source primary unavailable") {
+		t.Fatalf("disable maintenance error = %v, want direct endpoint failure", err)
+	}
+	if fencer.disableCalls != 0 {
+		t.Fatalf("disable calls = %d, want 0 without direct endpoint", fencer.disableCalls)
+	}
+	if got := duckling.status.ReshardMaintenance.MaintenanceNoLogin; got {
+		t.Fatal("maintenance role set NOLOGIN without a direct cleanup endpoint")
+	}
+}
+
+func TestDisableMaintenanceKeepsNoLoginWhenDirectEndpointUnavailable(t *testing.T) {
+	op := cnpgOp()
+	store := newFakeReshardStore(op)
+	duckling := &fakeDuckling{status: cnpgSourceStatus(), provisionerErr: errors.New("source primary unavailable")}
+	if err := duckling.SetReshardMaintenance(context.Background(), op.DucklingName, &ReshardMaintenanceSpec{
+		OperationID: op.ID,
+		SourceShard: op.FromShard,
+		Phase:       ReshardMaintenancePhaseDisabled,
+	}); err != nil {
+		t.Fatalf("disable maintenance for takeover: %v", err)
+	}
+	fencer := &fakeSourceFencer{}
+	runner := testRunner(store, duckling, &fakeCopier{})
+	runner.fencer = fencer
+
+	run := &opRun{r: runner, op: op}
+	err := run.disableMaintenance(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "source primary unavailable") {
+		t.Fatalf("disable maintenance error = %v, want direct endpoint failure", err)
+	}
+	if got := duckling.maintenancePhases(); !reflect.DeepEqual(got, []string{ReshardMaintenancePhaseDisabled}) {
+		t.Fatalf("maintenance phases = %v, want role left NOLOGIN", got)
+	}
+	if !duckling.status.ReshardMaintenance.MaintenanceNoLogin {
+		t.Fatal("maintenance role re-enabled before direct endpoint was available")
+	}
+	if fencer.disableCalls != 0 {
+		t.Fatalf("disable calls = %d, want 0 without direct endpoint", fencer.disableCalls)
 	}
 }
 
