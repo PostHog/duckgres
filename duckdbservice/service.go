@@ -514,6 +514,7 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
 	go pool.metadataMetricsLoop()
+	go pool.commitStatsLoop()
 
 	return &DuckDBService{
 		cfg:  cfg,
