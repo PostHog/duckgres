@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ReshardSourceFencer removes sessions which bypass Duckgres after the
@@ -32,22 +33,43 @@ func (PGReshardSourceFencer) TerminateAndWait(ctx context.Context, maintenance C
 }
 
 func (PGReshardSourceFencer) DisableMaintenanceAndTerminate(ctx context.Context, maintenance CatalogEndpoint, disableAndWait func() error) error {
-	// Establish the final administrative session before requesting NOLOGIN.
-	// Once PostgreSQL confirms NOLOGIN, this already-authenticated session can
-	// terminate every other maintenance session and then close itself. There
-	// is no gap in which a new privileged session can race cleanup.
 	conn, err := pgx.Connect(ctx, maintenance.DSN())
 	if err != nil {
 		return fmt.Errorf("connect before disabling reshard maintenance identity %s: %w", maintenance.Redacted(), err)
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+	return disableMaintenanceAndTerminateOnSession(ctx, conn, maintenance.User, disableAndWait)
+}
+
+type reshardSQLSession interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func disableMaintenanceAndTerminateOnSession(ctx context.Context, session reshardSQLSession, username string, disableAndWait func() error) error {
+	// PgBouncer accepts a client connection before assigning a PostgreSQL
+	// backend. Pin one with an explicit transaction while the maintenance role
+	// still has LOGIN; otherwise the first SQL can be delayed until after the
+	// role becomes NOLOGIN and fail with PgBouncer's cached
+	// server_login_retry error. The transaction also keeps transaction-pooling
+	// PgBouncer from returning that authenticated backend before cleanup.
+	if _, err := session.Exec(ctx, "BEGIN"); err != nil {
+		return fmt.Errorf("pin backend before disabling reshard maintenance identity: %w", err)
+	}
+	defer func() {
+		_, _ = session.Exec(context.WithoutCancel(ctx), "ROLLBACK")
+	}()
+
+	// Once PostgreSQL confirms NOLOGIN, this already-authenticated backend can
+	// terminate every other maintenance session and then close itself. There
+	// is no gap in which a new privileged session can race cleanup.
 	if err := disableAndWait(); err != nil {
 		return err
 	}
-	return terminateRoleSessionsAndWait(ctx, conn, maintenance.User, "")
+	return terminateRoleSessionsAndWait(ctx, session, username, "")
 }
 
-func terminateRoleSessionsAndWait(ctx context.Context, conn *pgx.Conn, username, database string) error {
+func terminateRoleSessionsAndWait(ctx context.Context, conn reshardSQLSession, username, database string) error {
 	const terminate = `
 SELECT pg_terminate_backend(pid)
 FROM pg_stat_activity
