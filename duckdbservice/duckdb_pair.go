@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"log/slog"
 	"time"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -86,6 +87,12 @@ type workerRequiredExtensionExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
+// workerLateMaterializationMaxRows caps how many rows DuckDB late-materializes
+// for LIMIT/SAMPLE queries. late_materialization_max_rows is session-scoped
+// (LOCAL) in DuckDB, so it must be applied with SET GLOBAL for the value to
+// reach every session connection on the shared connector.
+const workerLateMaterializationMaxRows = 6000
+
 func loadWorkerRequiredExtensions(db workerRequiredExtensionExecer) error {
 	if _, err := db.Exec("LOAD postgres_scanner"); err != nil {
 		return fmt.Errorf("load required worker extension postgres_scanner: %w", err)
@@ -146,6 +153,9 @@ func OpenDuckDBPair(cfg server.Config, username string) (*DuckDBPair, error) {
 		_ = controlDB.Close()
 		_ = connector.Close()
 		return nil, err
+	}
+	if _, err := mainDB.Exec(fmt.Sprintf("SET GLOBAL late_materialization_max_rows = %d", workerLateMaterializationMaxRows)); err != nil {
+		slog.Warn("Failed to set DuckDB late_materialization_max_rows.", "late_materialization_max_rows", workerLateMaterializationMaxRows, "error", err)
 	}
 	if err := loadWorkerRequiredExtensions(mainDB); err != nil {
 		_ = mainDB.Close()
