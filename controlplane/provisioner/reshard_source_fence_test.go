@@ -4,6 +4,7 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -14,15 +15,17 @@ import (
 )
 
 type recordingReshardSession struct {
-	events []string
+	events   []string
+	probeErr error
 }
 
 func (s *recordingReshardSession) Exec(_ context.Context, query string, _ ...any) (pgconn.CommandTag, error) {
 	switch {
-	case strings.TrimSpace(query) == "BEGIN":
-		s.events = append(s.events, "begin")
-	case strings.TrimSpace(query) == "ROLLBACK":
-		s.events = append(s.events, "rollback")
+	case strings.TrimSpace(query) == "SELECT 1":
+		s.events = append(s.events, "probe")
+		if s.probeErr != nil {
+			return pgconn.CommandTag{}, s.probeErr
+		}
 	case strings.Contains(query, "pg_terminate_backend"):
 		s.events = append(s.events, "terminate")
 	default:
@@ -58,7 +61,7 @@ func (r reshardCountRow) Scan(dest ...any) error {
 	return nil
 }
 
-func TestDisableMaintenancePinsBackendBeforeNoLogin(t *testing.T) {
+func TestDisableMaintenanceAuthenticatesBackendBeforeNoLogin(t *testing.T) {
 	session := &recordingReshardSession{}
 	err := disableMaintenanceAndTerminateOnSession(context.Background(), session, "reshard_op", func() error {
 		session.events = append(session.events, "disable")
@@ -67,8 +70,27 @@ func TestDisableMaintenancePinsBackendBeforeNoLogin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("disable maintenance: %v", err)
 	}
-	want := []string{"begin", "disable", "terminate", "count", "rollback"}
+	want := []string{"probe", "disable", "terminate", "count"}
 	if !reflect.DeepEqual(session.events, want) {
+		t.Fatalf("events = %v, want %v", session.events, want)
+	}
+}
+
+func TestDisableMaintenanceStopsBeforeNoLoginWhenBackendProbeFails(t *testing.T) {
+	probeErr := errors.New("backend unavailable")
+	session := &recordingReshardSession{probeErr: probeErr}
+	disableCalled := false
+	err := disableMaintenanceAndTerminateOnSession(context.Background(), session, "reshard_op", func() error {
+		disableCalled = true
+		return nil
+	})
+	if !errors.Is(err, probeErr) {
+		t.Fatalf("disable maintenance error = %v, want %v", err, probeErr)
+	}
+	if disableCalled {
+		t.Fatal("disable callback called without an authenticated backend")
+	}
+	if want := []string{"probe"}; !reflect.DeepEqual(session.events, want) {
 		t.Fatalf("events = %v, want %v", session.events, want)
 	}
 }

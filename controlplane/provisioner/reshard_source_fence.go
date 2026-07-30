@@ -47,18 +47,13 @@ type reshardSQLSession interface {
 }
 
 func disableMaintenanceAndTerminateOnSession(ctx context.Context, session reshardSQLSession, username string, disableAndWait func() error) error {
-	// PgBouncer accepts a client connection before assigning a PostgreSQL
-	// backend. Pin one with an explicit transaction while the maintenance role
-	// still has LOGIN; otherwise the first SQL can be delayed until after the
-	// role becomes NOLOGIN and fail with PgBouncer's cached
-	// server_login_retry error. The transaction also keeps transaction-pooling
-	// PgBouncer from returning that authenticated backend before cleanup.
-	if _, err := session.Exec(ctx, "BEGIN"); err != nil {
-		return fmt.Errorf("pin backend before disabling reshard maintenance identity: %w", err)
+	// PgBouncer can accept the client before it has authenticated a PostgreSQL
+	// backend. Force that authentication while the maintenance role still has
+	// LOGIN. CNPG's shard Pooler uses session mode, so this backend remains
+	// attached without holding a transaction across the reconciliation wait.
+	if _, err := session.Exec(ctx, "SELECT 1"); err != nil {
+		return fmt.Errorf("authenticate backend before disabling reshard maintenance identity: %w", err)
 	}
-	defer func() {
-		_, _ = session.Exec(context.WithoutCancel(ctx), "ROLLBACK")
-	}()
 
 	// Once PostgreSQL confirms NOLOGIN, this already-authenticated backend can
 	// terminate every other maintenance session and then close itself. There
