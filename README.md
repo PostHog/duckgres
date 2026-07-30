@@ -93,7 +93,7 @@ labels, aggregation rules, PromQL examples, and admission metric migration.
 | `duckgres_session_admission_reclaim_reservation_capacity` | Gauge | Cleanup-ownership slot capacity for this control-plane process (4096 per reclaimer by default) |
 | `duckgres_session_admission_reclaim_reservation_rejections_total{reason}` | Counter | Reservations rejected because capacity was `full`, the reclaimer was `closed`, or the exact reference was a `duplicate` |
 | `duckgres_session_start_duration_seconds{org,protocol,outcome}` | Histogram | Authenticated PostgreSQL session bootstrap through flushed `ReadyForQuery` |
-| `duckgres_postgres_session_start_total{org,outcome,failure_class}` | Counter | Exactly one terminal result per authenticated PostgreSQL session start after server retries; `outcome` is `success\|failure` and failure classes distinguish operator-actionable failures from client/lifecycle noise |
+| `duckgres_postgres_session_start_total{org,outcome,reason}` | Counter | Exactly one terminal result per authenticated PostgreSQL session start after server retries; `outcome` is `success\|failure` and bounded reasons distinguish operator-actionable failures from client/lifecycle noise |
 | `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
 | `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |

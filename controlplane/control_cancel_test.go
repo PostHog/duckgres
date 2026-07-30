@@ -199,17 +199,17 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 
 func TestControlPlaneSessionStartResult(t *testing.T) {
 	tests := []struct {
-		name             string
-		err              error
-		wantOutcome      string
-		wantFailureClass string
+		name        string
+		err         error
+		wantOutcome string
+		wantReason  string
 	}{
-		{name: "success", wantOutcome: "success", wantFailureClass: observe.SessionStartFailureNone},
-		{name: "canceled", err: context.Canceled, wantOutcome: "canceled", wantFailureClass: observe.SessionStartFailureCanceled},
-		{name: "deadline", err: context.DeadlineExceeded, wantOutcome: "timeout", wantFailureClass: observe.SessionStartFailureCapacity},
-		{name: "queue timeout", err: ErrTooManyConnections, wantOutcome: "timeout", wantFailureClass: observe.SessionStartFailureCapacity},
-		{name: "draining", err: ErrSessionManagerDraining, wantOutcome: "draining", wantFailureClass: observe.SessionStartFailureLifecycle},
-		{name: "worker capacity", err: NewWorkerCapacityExhaustedError(time.Second), wantOutcome: "capacity", wantFailureClass: observe.SessionStartFailureCapacity},
+		{name: "success", wantOutcome: "success", wantReason: observe.SessionStartReasonNone},
+		{name: "canceled", err: context.Canceled, wantOutcome: "canceled", wantReason: observe.SessionStartReasonCanceled},
+		{name: "deadline", err: context.DeadlineExceeded, wantOutcome: "timeout", wantReason: observe.SessionStartReasonCapacity},
+		{name: "queue timeout", err: ErrTooManyConnections, wantOutcome: "timeout", wantReason: observe.SessionStartReasonCapacity},
+		{name: "draining", err: ErrSessionManagerDraining, wantOutcome: "draining", wantReason: observe.SessionStartReasonLifecycle},
+		{name: "worker capacity", err: NewWorkerCapacityExhaustedError(time.Second), wantOutcome: "capacity", wantReason: observe.SessionStartReasonCapacity},
 		{
 			name: "admission hard rejection",
 			err: &configstore.OrgConnectionAdmissionRejectedError{
@@ -217,18 +217,18 @@ func TestControlPlaneSessionStartResult(t *testing.T) {
 				RequestedVCPUs: 4,
 				MaximumVCPUs:   2,
 			},
-			wantOutcome:      "capacity",
-			wantFailureClass: observe.SessionStartFailureClient,
+			wantOutcome: "capacity",
+			wantReason:  observe.SessionStartReasonClient,
 		},
-		{name: "generic error", err: errors.New("bootstrap failed"), wantOutcome: "error", wantFailureClass: observe.SessionStartFailureWorker},
+		{name: "generic error", err: errors.New("bootstrap failed"), wantOutcome: "error", wantReason: observe.SessionStartReasonWorker},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotOutcome, gotFailureClass := controlPlaneSessionStartResult(tt.err)
-			if gotOutcome != tt.wantOutcome || gotFailureClass != tt.wantFailureClass {
+			gotOutcome, gotReason := controlPlaneSessionStartResult(tt.err)
+			if gotOutcome != tt.wantOutcome || gotReason != tt.wantReason {
 				t.Fatalf("controlPlaneSessionStartResult(%v) = (%q, %q), want (%q, %q)",
-					tt.err, gotOutcome, gotFailureClass, tt.wantOutcome, tt.wantFailureClass)
+					tt.err, gotOutcome, gotReason, tt.wantOutcome, tt.wantReason)
 			}
 		})
 	}
@@ -237,54 +237,54 @@ func TestControlPlaneSessionStartResult(t *testing.T) {
 func TestControlPlaneSessionStartOperationResultPrefersContext(t *testing.T) {
 	operationErr := errors.New("metadata initialization failed")
 	tests := []struct {
-		name             string
-		contextErr       error
-		draining         bool
-		wantOutcome      string
-		wantFailureClass string
+		name        string
+		contextErr  error
+		draining    bool
+		wantOutcome string
+		wantReason  string
 	}{
-		{name: "client canceled", contextErr: context.Canceled, wantOutcome: "canceled", wantFailureClass: observe.SessionStartFailureCanceled},
-		{name: "operation timed out", contextErr: context.DeadlineExceeded, wantOutcome: "timeout", wantFailureClass: observe.SessionStartFailureMetadataStore},
-		{name: "ordinary metadata error", wantOutcome: "error", wantFailureClass: observe.SessionStartFailureMetadataStore},
-		{name: "draining wins", contextErr: context.Canceled, draining: true, wantOutcome: "draining", wantFailureClass: observe.SessionStartFailureLifecycle},
+		{name: "client canceled", contextErr: context.Canceled, wantOutcome: "canceled", wantReason: observe.SessionStartReasonCanceled},
+		{name: "operation timed out", contextErr: context.DeadlineExceeded, wantOutcome: "timeout", wantReason: observe.SessionStartReasonMetadataStore},
+		{name: "ordinary metadata error", wantOutcome: "error", wantReason: observe.SessionStartReasonMetadataStore},
+		{name: "draining wins", contextErr: context.Canceled, draining: true, wantOutcome: "draining", wantReason: observe.SessionStartReasonLifecycle},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotOutcome, gotFailureClass := controlPlaneSessionStartOperationResult(
+			gotOutcome, gotReason := controlPlaneSessionStartOperationResult(
 				operationErr,
 				tt.contextErr,
 				tt.draining,
-				observe.SessionStartFailureMetadataStore,
+				observe.SessionStartReasonMetadataStore,
 			)
-			if gotOutcome != tt.wantOutcome || gotFailureClass != tt.wantFailureClass {
+			if gotOutcome != tt.wantOutcome || gotReason != tt.wantReason {
 				t.Fatalf("operation result = (%q, %q), want (%q, %q)",
-					gotOutcome, gotFailureClass, tt.wantOutcome, tt.wantFailureClass)
+					gotOutcome, gotReason, tt.wantOutcome, tt.wantReason)
 			}
 		})
 	}
 }
 
-func TestMissingOrgStackFailureClass(t *testing.T) {
+func TestMissingOrgStackReason(t *testing.T) {
 	tests := []struct {
 		name      string
 		state     string
 		orgExists bool
 		want      string
 	}{
-		{name: "missing org", orgExists: false, want: observe.SessionStartFailureClient},
-		{name: "legacy ready state", orgExists: true, state: "", want: observe.SessionStartFailureControlPlane},
-		{name: "ready warehouse", orgExists: true, state: string(configstore.ManagedWarehouseStateReady), want: observe.SessionStartFailureControlPlane},
-		{name: "failed provisioning", orgExists: true, state: string(configstore.ManagedWarehouseStateFailed), want: observe.SessionStartFailureLifecycle},
-		{name: "deleting", orgExists: true, state: string(configstore.ManagedWarehouseStateDeleting), want: observe.SessionStartFailureLifecycle},
-		{name: "resharding", orgExists: true, state: string(configstore.ManagedWarehouseStateResharding), want: observe.SessionStartFailureLifecycle},
-		{name: "pending", orgExists: true, state: string(configstore.ManagedWarehouseStatePending), want: observe.SessionStartFailureLifecycle},
+		{name: "missing org", orgExists: false, want: observe.SessionStartReasonClient},
+		{name: "legacy ready state", orgExists: true, state: "", want: observe.SessionStartReasonControlPlane},
+		{name: "ready warehouse", orgExists: true, state: string(configstore.ManagedWarehouseStateReady), want: observe.SessionStartReasonControlPlane},
+		{name: "failed provisioning", orgExists: true, state: string(configstore.ManagedWarehouseStateFailed), want: observe.SessionStartReasonLifecycle},
+		{name: "deleting", orgExists: true, state: string(configstore.ManagedWarehouseStateDeleting), want: observe.SessionStartReasonLifecycle},
+		{name: "resharding", orgExists: true, state: string(configstore.ManagedWarehouseStateResharding), want: observe.SessionStartReasonLifecycle},
+		{name: "pending", orgExists: true, state: string(configstore.ManagedWarehouseStatePending), want: observe.SessionStartReasonLifecycle},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := missingOrgStackFailureClass(tt.state, tt.orgExists); got != tt.want {
-				t.Fatalf("missingOrgStackFailureClass(%q, %t) = %q, want %q", tt.state, tt.orgExists, got, tt.want)
+			if got := missingOrgStackReason(tt.state, tt.orgExists); got != tt.want {
+				t.Fatalf("missingOrgStackReason(%q, %t) = %q, want %q", tt.state, tt.orgExists, got, tt.want)
 			}
 		})
 	}

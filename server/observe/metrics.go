@@ -41,26 +41,26 @@ func ObserveConnectionDuration(org string, seconds float64) {
 	connectionDurationHistogram.WithLabelValues(org).Observe(seconds)
 }
 
-// PostgreSQL session-start failure classes are intentionally bounded. Alerting
-// may allowlist operator-actionable classes, while client, lifecycle, transport,
+// PostgreSQL session-start reasons are intentionally bounded. Alerting may
+// allowlist operator-actionable reasons, while client, lifecycle, transport,
 // and unknown failures remain available for diagnosis without paging.
 const (
-	SessionStartFailureNone          = "none"
-	SessionStartFailureCapacity      = "capacity"
-	SessionStartFailureWorker        = "worker"
-	SessionStartFailureMetadataStore = "metadata_store"
-	SessionStartFailureControlPlane  = "control_plane"
-	SessionStartFailureClient        = "client"
-	SessionStartFailureLifecycle     = "lifecycle"
-	SessionStartFailureCanceled      = "canceled"
-	SessionStartFailureTransport     = "transport"
-	SessionStartFailureUnknown       = "unknown"
+	SessionStartReasonNone          = "none"
+	SessionStartReasonCapacity      = "capacity"
+	SessionStartReasonWorker        = "worker"
+	SessionStartReasonMetadataStore = "metadata_store"
+	SessionStartReasonControlPlane  = "control_plane"
+	SessionStartReasonClient        = "client"
+	SessionStartReasonLifecycle     = "lifecycle"
+	SessionStartReasonCanceled      = "canceled"
+	SessionStartReasonTransport     = "transport"
+	SessionStartReasonUnknown       = "unknown"
 )
 
 var postgresSessionStartCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_postgres_session_start_total",
 	Help: "Terminal outcomes for authenticated PostgreSQL session starts after all server-side retries.",
-}, []string{"org", "outcome", "failure_class"})
+}, []string{"org", "outcome", "reason"})
 
 var sessionStartDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_session_start_duration_seconds",
@@ -86,7 +86,7 @@ func BeginSessionStart(org, protocol string) *SessionStartScope {
 	return &SessionStartScope{started: time.Now(), org: org, protocol: protocol}
 }
 
-func (s *SessionStartScope) Finish(outcome, failureClass string) {
+func (s *SessionStartScope) Finish(outcome, reason string) {
 	if s == nil {
 		return
 	}
@@ -95,7 +95,7 @@ func (s *SessionStartScope) Finish(outcome, failureClass string) {
 	default:
 		outcome = "error"
 	}
-	terminalOutcome, failureClass := normalizePostgresSessionStartResult(outcome, failureClass)
+	terminalOutcome, reason := normalizePostgresSessionStartResult(outcome, reason)
 	s.once.Do(func() {
 		duration := time.Since(s.started)
 		if duration < 0 {
@@ -103,31 +103,31 @@ func (s *SessionStartScope) Finish(outcome, failureClass string) {
 		}
 		sessionStartDurationHistogram.WithLabelValues(s.org, s.protocol, outcome).Observe(duration.Seconds())
 		if s.protocol == "postgres" {
-			postgresSessionStartCounter.WithLabelValues(s.org, terminalOutcome, failureClass).Inc()
+			postgresSessionStartCounter.WithLabelValues(s.org, terminalOutcome, reason).Inc()
 		}
 	})
 }
 
-func normalizePostgresSessionStartResult(outcome, failureClass string) (string, string) {
+func normalizePostgresSessionStartResult(outcome, reason string) (string, string) {
 	if outcome == "success" {
-		return "success", SessionStartFailureNone
+		return "success", SessionStartReasonNone
 	}
 
-	switch failureClass {
-	case SessionStartFailureCapacity,
-		SessionStartFailureWorker,
-		SessionStartFailureMetadataStore,
-		SessionStartFailureControlPlane,
-		SessionStartFailureClient,
-		SessionStartFailureLifecycle,
-		SessionStartFailureCanceled,
-		SessionStartFailureTransport,
-		SessionStartFailureUnknown:
-		return "failure", failureClass
+	switch reason {
+	case SessionStartReasonCapacity,
+		SessionStartReasonWorker,
+		SessionStartReasonMetadataStore,
+		SessionStartReasonControlPlane,
+		SessionStartReasonClient,
+		SessionStartReasonLifecycle,
+		SessionStartReasonCanceled,
+		SessionStartReasonTransport,
+		SessionStartReasonUnknown:
+		return "failure", reason
 	default:
-		// A failed session must never be reported with class=none, and newly
+		// A failed session must never be reported with reason=none, and newly
 		// added unclassified paths must stay outside paging allowlists.
-		return "failure", SessionStartFailureUnknown
+		return "failure", SessionStartReasonUnknown
 	}
 }
 

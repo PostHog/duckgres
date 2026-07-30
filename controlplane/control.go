@@ -1144,7 +1144,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
 	clog.Info("User authenticated.")
 	sessionStart := observe.BeginSessionStart(orgID, "postgres")
-	defer sessionStart.Finish("error", observe.SessionStartFailureUnknown)
+	defer sessionStart.Finish("error", observe.SessionStartReasonUnknown)
 
 	// Resolve the requested worker shape from the connection-string startup
 	// options (duckgres.worker_cpu / worker_memory / worker_ttl), layered on
@@ -1159,7 +1159,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	workerProfile, profileWarns, orgProfileApplied, profileErr := cp.resolveWorkerProfile(startupOptions, orgProfileDefaults)
 	if profileErr != nil {
-		sessionStart.Finish("error", observe.SessionStartFailureClient)
+		sessionStart.Finish("error", observe.SessionStartReasonClient)
 		clog.Warn("Rejected worker profile.", "error", profileErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "22023", profileErr.Error())
 		_ = writer.Flush()
@@ -1182,7 +1182,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	rawS3Cache, s3CacheRequested := startupOptions[server.S3CacheGUCName]
 	if s3CacheRequested {
 		if err := server.ValidateS3CacheOption(rawS3Cache); err != nil {
-			sessionStart.Finish("error", observe.SessionStartFailureClient)
+			sessionStart.Finish("error", observe.SessionStartReasonClient)
 			clog.Warn("Rejected s3_cache startup option.", "error", err)
 			_ = server.WriteErrorResponse(writer, "FATAL", "22023", err.Error())
 			_ = writer.Flush()
@@ -1199,7 +1199,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// hitting a partially-migrated catalog. The client gets a clear error
 		// and can retry after the migration completes.
 		if cp.orgRouter.IsMigratingForOrg(orgID) {
-			sessionStart.Finish("error", observe.SessionStartFailureLifecycle)
+			sessionStart.Finish("error", observe.SessionStartReasonLifecycle)
 			clog.Info("Connection rejected during DuckLake migration.")
 			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
@@ -1215,7 +1215,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// connection advisory lock.)
 		if whState, ok := cp.configStore.OrgWarehouseStatus(orgID); ok &&
 			whState == string(configstore.ManagedWarehouseStateResharding) {
-			sessionStart.Finish("error", observe.SessionStartFailureLifecycle)
+			sessionStart.Finish("error", observe.SessionStartReasonLifecycle)
 			clog.Info("Connection rejected during metadata-store reshard.")
 			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 				"metadata-store reshard in progress for your organization, please retry shortly")
@@ -1230,7 +1230,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// the stack absence is expected and the client should be told to
 			// retry rather than receive a misleading auth-style error.
 			whState, orgExists := cp.configStore.OrgWarehouseStatus(orgID)
-			sessionStart.Finish("error", missingOrgStackFailureClass(whState, orgExists))
+			sessionStart.Finish("error", missingOrgStackReason(whState, orgExists))
 			switch {
 			case !orgExists:
 				_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
@@ -1267,14 +1267,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		rebalancer = cp.rebalancer
 	}
 	if cp.isDraining() {
-		sessionStart.Finish("draining", observe.SessionStartFailureLifecycle)
+		sessionStart.Finish("draining", observe.SessionStartReasonLifecycle)
 		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
 		_ = writer.Flush()
 		return
 	}
 	preReadyCtx, finishPreReady, err := cp.beginPreReadyHandshake(context.Background())
 	if err != nil {
-		sessionStart.Finish("draining", observe.SessionStartFailureLifecycle)
+		sessionStart.Finish("draining", observe.SessionStartReasonLifecycle)
 		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
 		_ = writer.Flush()
 		return
@@ -1291,7 +1291,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	defer server.CancelClientConn(tmpCC)
 	server.SendInitialParams(tmpCC)
 	if err := writer.Flush(); err != nil {
-		sessionStart.Finish("error", observe.SessionStartFailureTransport)
+		sessionStart.Finish("error", observe.SessionStartReasonTransport)
 		clog.Error("Failed to flush initial params.", "error", err)
 		return
 	}
@@ -1336,8 +1336,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			sessions.DestroySession(createdPID)
 			executor = nil
 		}
-		outcome, failureClass := controlPlaneSessionStartResult(err)
-		sessionStart.Finish(outcome, failureClass)
+		outcome, reason := controlPlaneSessionStartResult(err)
+		sessionStart.Finish(outcome, reason)
 		clog.Error("Failed to create session.", "error", err)
 		code, message := sessionCreationErrorResponse(err)
 		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
@@ -1367,13 +1367,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	attachContextErr := attachCtx.Err()
 	attachCancel()
 	if probeErr != nil {
-		outcome, failureClass := controlPlaneSessionStartOperationResult(
+		outcome, reason := controlPlaneSessionStartOperationResult(
 			probeErr,
 			attachContextErr,
 			cp.isDraining(),
-			observe.SessionStartFailureMetadataStore,
+			observe.SessionStartReasonMetadataStore,
 		)
-		sessionStart.Finish(outcome, failureClass)
+		sessionStart.Finish(outcome, reason)
 		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
 		_ = writer.Flush()
@@ -1384,7 +1384,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		var ok bool
 		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, duckLakeAttached)
 		if !ok {
-			sessionStart.Finish("error", observe.SessionStartFailureMetadataStore)
+			sessionStart.Finish("error", observe.SessionStartReasonMetadataStore)
 			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
 				"requested", requestedCatalog, "ducklake_attached", duckLakeAttached)
 			msg := "no catalog is available for this connection"
@@ -1427,13 +1427,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, executor, effectiveCatalog, metadataAccess); err != nil {
 			initContextErr := initCtx.Err()
 			initCancel()
-			outcome, failureClass := controlPlaneSessionStartOperationResult(
+			outcome, reason := controlPlaneSessionStartOperationResult(
 				err,
 				initContextErr,
 				cp.isDraining(),
-				observe.SessionStartFailureMetadataStore,
+				observe.SessionStartReasonMetadataStore,
 			)
-			sessionStart.Finish(outcome, failureClass)
+			sessionStart.Finish(outcome, reason)
 			clog.Error("Failed to initialize session database metadata.", "database", database, "error", err)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
 			_ = writer.Flush()
@@ -1453,13 +1453,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			spCancel()
 			if err != nil {
 				if source == sessionDefaultSourceConfiguredCatalog {
-					outcome, failureClass := controlPlaneSessionStartOperationResult(
+					outcome, reason := controlPlaneSessionStartOperationResult(
 						err,
 						spContextErr,
 						cp.isDraining(),
-						observe.SessionStartFailureMetadataStore,
+						observe.SessionStartReasonMetadataStore,
 					)
-					sessionStart.Finish(outcome, failureClass)
+					sessionStart.Finish(outcome, reason)
 					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
 					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 					_ = writer.Flush()
@@ -1482,13 +1482,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			initContextErr := initCtx.Err()
 			initCancel()
 			if err != nil {
-				outcome, failureClass := controlPlaneSessionStartOperationResult(
+				outcome, reason := controlPlaneSessionStartOperationResult(
 					err,
 					initContextErr,
 					cp.isDraining(),
-					observe.SessionStartFailureMetadataStore,
+					observe.SessionStartReasonMetadataStore,
 				)
-				sessionStart.Finish(outcome, failureClass)
+				sessionStart.Finish(outcome, reason)
 				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
 				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 				_ = writer.Flush()
@@ -1553,7 +1553,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// s3_cache=off must never silently run through the cache.
 	if s3CacheRequested {
 		if err := server.ApplyConnectionS3CacheOption(cc, rawS3Cache); err != nil {
-			sessionStart.Finish("error", observe.SessionStartFailureWorker)
+			sessionStart.Finish("error", observe.SessionStartReasonWorker)
 			clog.Error("Failed to apply s3_cache startup option.", "error", err)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", err.Error())
 			_ = writer.Flush()
@@ -1567,26 +1567,26 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	disconnect := disconnectWatcher.Stop()
 	drained := finishPreReady()
 	if disconnect.ClientCanceled {
-		sessionStart.Finish("canceled", observe.SessionStartFailureCanceled)
+		sessionStart.Finish("canceled", observe.SessionStartReasonCanceled)
 		return
 	}
 	if drained {
-		sessionStart.Finish("draining", observe.SessionStartFailureLifecycle)
+		sessionStart.Finish("draining", observe.SessionStartReasonLifecycle)
 		return
 	}
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
-		sessionStart.Finish("error", observe.SessionStartFailureTransport)
+		sessionStart.Finish("error", observe.SessionStartReasonTransport)
 		clog.Error("Failed to send ReadyForQuery.", "error", err)
 		return
 	}
 	if err := writer.Flush(); err != nil {
-		sessionStart.Finish("error", observe.SessionStartFailureTransport)
+		sessionStart.Finish("error", observe.SessionStartReasonTransport)
 		clog.Error("Failed to flush writer.", "error", err)
 		return
 	}
-	sessionStart.Finish("success", observe.SessionStartFailureNone)
+	sessionStart.Finish("success", observe.SessionStartReasonNone)
 	if orgID != "" {
 		observeOrgPgSessionAccepted(orgID, passthroughUser)
 	}
@@ -1599,34 +1599,34 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 }
 
-func controlPlaneSessionStartResult(err error) (outcome, failureClass string) {
+func controlPlaneSessionStartResult(err error) (outcome, reason string) {
 	var capacityErr *WorkerCapacityExhaustedError
 	var rejection *configstore.OrgConnectionAdmissionRejectedError
 	switch {
 	case err == nil:
-		return "success", observe.SessionStartFailureNone
+		return "success", observe.SessionStartReasonNone
 	case errors.As(err, &capacityErr):
-		return "capacity", observe.SessionStartFailureCapacity
+		return "capacity", observe.SessionStartReasonCapacity
 	case errors.As(err, &rejection):
-		return "capacity", observe.SessionStartFailureClient
+		return "capacity", observe.SessionStartReasonClient
 	case errors.Is(err, context.Canceled):
-		return "canceled", observe.SessionStartFailureCanceled
+		return "canceled", observe.SessionStartReasonCanceled
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, ErrTooManyConnections):
-		return "timeout", observe.SessionStartFailureCapacity
+		return "timeout", observe.SessionStartReasonCapacity
 	case errors.Is(err, ErrSessionManagerDraining):
-		return "draining", observe.SessionStartFailureLifecycle
+		return "draining", observe.SessionStartReasonLifecycle
 	default:
-		return "error", observe.SessionStartFailureWorker
+		return "error", observe.SessionStartReasonWorker
 	}
 }
 
 func controlPlaneSessionStartOperationResult(
 	err, contextErr error,
 	draining bool,
-	failureClass string,
-) (outcome, classifiedFailure string) {
+	reason string,
+) (outcome, classifiedReason string) {
 	if draining {
-		return "draining", observe.SessionStartFailureLifecycle
+		return "draining", observe.SessionStartReasonLifecycle
 	}
 	terminalErr := err
 	if contextErr != nil {
@@ -1635,24 +1635,24 @@ func controlPlaneSessionStartOperationResult(
 	outcome, _ = controlPlaneSessionStartResult(terminalErr)
 	switch outcome {
 	case "success":
-		return outcome, observe.SessionStartFailureNone
+		return outcome, observe.SessionStartReasonNone
 	case "canceled":
-		return outcome, observe.SessionStartFailureCanceled
+		return outcome, observe.SessionStartReasonCanceled
 	case "draining":
-		return outcome, observe.SessionStartFailureLifecycle
+		return outcome, observe.SessionStartReasonLifecycle
 	default:
-		return outcome, failureClass
+		return outcome, reason
 	}
 }
 
-func missingOrgStackFailureClass(warehouseState string, orgExists bool) string {
+func missingOrgStackReason(warehouseState string, orgExists bool) string {
 	if !orgExists {
-		return observe.SessionStartFailureClient
+		return observe.SessionStartReasonClient
 	}
 	if warehouseState == "" || warehouseState == string(configstore.ManagedWarehouseStateReady) {
-		return observe.SessionStartFailureControlPlane
+		return observe.SessionStartReasonControlPlane
 	}
-	return observe.SessionStartFailureLifecycle
+	return observe.SessionStartReasonLifecycle
 }
 
 func authorizedClientSearchPath(searchPath string, policy *server.QueryAccessPolicy) string {
