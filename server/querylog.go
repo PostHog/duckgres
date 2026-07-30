@@ -508,7 +508,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	query = usersecrets.RedactForLog(query)
 	transpiledQuery = usersecrets.RedactForLog(transpiledQuery)
 
-	// A failure that never reached an engine is ExceptionBeforeStart and has no
+	// A failure before execution began is ExceptionBeforeStart and has no
 	// QueryStart row to pair with. Without a scope we cannot know, so assume
 	// the statement started — claiming it never did would be a stronger
 	// statement than the evidence supports.

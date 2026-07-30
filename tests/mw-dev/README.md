@@ -185,9 +185,11 @@ normal `go test ./...` lane.
 
 - **query log access metadata** — a `SELECT` and an `INSERT` over the same table
   must log different `access_kinds` and land in `read_relations` /
-  `write_relations` respectively, and a DuckDB-native statement the PostgreSQL
+  `write_relations` respectively; a DuckDB-native statement the PostgreSQL
   parser rejects must log `metadata_complete=false` rather than an empty
-  relation list. These are the signals a future authorization policy will be
+  relation list; and a `CALL` must log `access_kinds=unknown` with
+  `metadata_complete=true` — parseable but opaque, which is a different fact
+  from unparseable even though both deny. These are the signals a future authorization policy will be
   evaluated against, so "referenced nothing" and "we could not tell" have to
   stay distinguishable on real traffic, not just in unit fixtures.
 

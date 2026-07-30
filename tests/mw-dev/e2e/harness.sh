@@ -3669,6 +3669,24 @@ query_log_access_metadata() { # org password
     log "query_log_access_metadata: no row for $marker_n (statement may have been rejected pre-log); skipping incomplete check"
   fi
 
+  # A CALL is parseable but its procedure body is not: access must come back
+  # `unknown` while metadata_complete stays TRUE. This pins the distinction the
+  # extraction depends on — "parsed, but its access is opaque" is a different
+  # fact from "we could not parse it", and only the latter is fixable by a
+  # better parser. Both deny, so conflating them would quietly turn an
+  # allowlistable procedure call into a parser bug report.
+  marker_c="qlcall_$(date +%s)_$$"
+  pg "$1" "$2" ducklake "CALL pragma_version() /* $marker_c */" >/dev/null
+  crow="$(ql_meta_row "$1" "$2" "$marker_c")" || fail "query_log_access_metadata: no row for $marker_c"
+  case "$crow" in
+    unknown\|*) : ;;
+    *) fail "query_log_access_metadata: CALL access_kinds should be 'unknown' (row: $crow)" ;;
+  esac
+  case "$crow" in
+    *"|true|"*) : ;;
+    *) fail "query_log_access_metadata: CALL parses, so metadata_complete must be true (row: $crow)" ;;
+  esac
+
   pg_try "$1" "$2" ducklake "DROP TABLE IF EXISTS $tbl" >/dev/null 2>&1 || true
   log "query_log access metadata OK on $1"
 }
@@ -3877,7 +3895,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty + CALL opaque-but-complete) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

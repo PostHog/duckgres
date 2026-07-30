@@ -14,10 +14,15 @@ const (
 	QueryEventStart = "QueryStart"
 	// QueryEventFinish is a statement that completed and returned to the client.
 	QueryEventFinish = "QueryFinish"
-	// QueryEventExceptionBeforeStart is a statement that failed before any
-	// engine saw it: auth or policy denial, a transpile error, a rejected
-	// Describe, or a failure to obtain a worker. There is no QueryStart for
-	// these, by definition.
+	// QueryEventExceptionBeforeStart is a statement that failed BEFORE
+	// EXECUTION BEGAN: auth or policy denial, a transpile error, a failure to
+	// obtain a worker — and, in practice most often, an extended-protocol
+	// Describe whose prepare the engine rejected (a binder error). That last
+	// case is why the boundary is "execution began", not "an engine saw it":
+	// Describe hands the statement to the worker to learn its result schema, so
+	// the engine does see it, and it still never runs. ClickHouse draws the
+	// line the same way — analysis-time failures are ExceptionBeforeStart.
+	// There is no QueryStart for these, by definition.
 	QueryEventExceptionBeforeStart = "ExceptionBeforeStart"
 	// QueryEventExceptionWhileProcessing is a statement that failed after
 	// execution began.
@@ -43,7 +48,7 @@ func queryEventCode(eventType string) uint8 {
 // terminalQueryEventType classifies a completed statement.
 //
 // execStarted is what separates the two exception types: a statement that
-// failed before the engine saw it is ExceptionBeforeStart, and it has no
+// failed before execution began is ExceptionBeforeStart, and it has no
 // QueryStart row to pair with. Callers with no observation scope pass
 // execStarted=true, which keeps the pre-existing behaviour of labelling every
 // failure ExceptionWhileProcessing rather than inventing a

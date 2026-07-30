@@ -131,9 +131,18 @@ Statements produce a pair of events, using ClickHouse's `type` vocabulary
 
 - `QueryStart` is emitted when the statement begins executing.
 - One terminal event follows: `QueryFinish`, or `ExceptionWhileProcessing` if it
-  failed after execution began, or `ExceptionBeforeStart` if it failed before
-  any engine saw it (auth or policy denial, a transpile error, a rejected
-  Describe). `ExceptionBeforeStart` events have no `QueryStart`, by definition.
+  failed after execution began, or `ExceptionBeforeStart` if it failed **before
+  execution began** — auth or policy denial, a transpile error, a failure to
+  obtain a worker, or an extended-protocol `Describe` whose prepare the engine
+  rejected. `ExceptionBeforeStart` events have no `QueryStart`, by definition.
+
+  The boundary is *execution began*, not *an engine saw it*: `Describe` hands
+  the statement to a worker to learn its result schema, so a binder error there
+  is an `ExceptionBeforeStart` even though the engine did see the SQL. This is
+  the same line ClickHouse draws — analysis-time failures are
+  `ExceptionBeforeStart`. In practice this is the largest source of them, so
+  when triaging, read `ExceptionBeforeStart` as "never ran", not as "never
+  reached a worker".
 
 **A `QueryStart` with no terminal event is a query that never came back** — a
 worker OOM-killed mid-statement, a pod evicted. That row is the only evidence
