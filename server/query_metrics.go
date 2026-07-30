@@ -59,11 +59,17 @@ type queryMetricsScope struct {
 	// event. For a batched simple query it is the individual statement, not the
 	// whole message.
 	queryText string
-	// execStarted records that the statement reached an engine. It is what
+	// execStarted records that the statement began EXECUTING. It is what
 	// separates ExceptionBeforeStart from ExceptionWhileProcessing, and it is
 	// set at the single point where a query becomes cancellable
 	// (queryContextInner) so every execution path — simple, batched, extended,
 	// COPY, cursor — marks it without its own call.
+	//
+	// Note this is narrower than "an engine saw the statement": the
+	// extended-protocol Describe path prepares the statement on the worker to
+	// learn its result schema without going through queryContextInner, so a
+	// binder error there is correctly ExceptionBeforeStart even though the
+	// engine did see it.
 	execStarted bool
 	// startLogged guards QueryStart emission so a statement that takes several
 	// cancellable contexts (COPY, cursor FETCH) still logs exactly one start.
@@ -123,7 +129,7 @@ func (c *clientConn) endStatementScope(scope *queryMetricsScope) {
 	}
 }
 
-// markExecStarted records that the statement reached an engine, and emits its
+// markExecStarted records that the statement began executing, and emits its
 // QueryStart event the first time. Both happen here because this is the same
 // instant: the query has become cancellable, so it is live from the client's
 // point of view, and any failure from now on is ExceptionWhileProcessing.

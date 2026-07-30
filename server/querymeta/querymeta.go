@@ -419,6 +419,28 @@ func (e *extractor) statement(node *pg_query.Node, cte map[string]struct{}) {
 		e.setKind(KindOther)
 		e.addKind(AccessAdmin)
 
+	case *pg_query.Node_CallStmt:
+		// CALL invokes a procedure whose body extraction cannot see, so the
+		// access it performs is genuinely undeterminable — AccessUnknown, which
+		// is what a gate denies on.
+		//
+		// It is NOT marked incomplete: the statement parsed fine and we saw all
+		// of it. "Parsed, but its access is opaque" and "we could not parse it"
+		// are different facts and must stay distinguishable — a consumer that
+		// treats incomplete as "retry with a better parser" would be wrong here,
+		// because no parser can see inside the procedure. Both still deny.
+		//
+		// The procedure name is recorded so a policy can allowlist specific
+		// procedures rather than refusing CALL wholesale.
+		e.setKind(KindOther)
+		e.addKind(AccessUnknown)
+		if call := stmt.CallStmt.Funccall; call != nil {
+			e.addFunction(functionName(call))
+			for _, arg := range call.Args {
+				e.read(arg, cte)
+			}
+		}
+
 	default:
 		// An unrecognized statement type is recorded as unknown rather than
 		// ignored: a future gate must see that we could not classify it.

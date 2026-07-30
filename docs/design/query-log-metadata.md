@@ -46,7 +46,7 @@ Three things, in dependency order:
    (UUIDv7) per inbound statement and emits a `QueryStart` row; the component
    that actually executes emits the terminal row (`QueryFinish` /
    `ExceptionWhileProcessing`), or the CP emits `ExceptionBeforeStart` if the
-   statement never reached an engine. Same `Enum8` vocabulary as CH:
+   statement never began executing. Same `Enum8` vocabulary as CH:
    `QueryStart=1, QueryFinish=2, ExceptionBeforeStart=3, ExceptionWhileProcessing=4`.
 2. **Extract what the statement touches** — catalog / schema / table / column —
    and **what kind of access it is** (read, write, DDL, config, admin).
@@ -141,15 +141,22 @@ stays CH-faithful; the nuance lives beside it.
 
 Note this reclassifies today's behaviour: `logQuery` currently stamps
 `ExceptionWhileProcessing` whenever `errCode != ""`, including for transpile
-errors and policy denials that never reached an engine. Those become
+errors and policy denials that never began executing. Those become
 `ExceptionBeforeStart`. The rule is mechanical — `execStartAt.IsZero()`.
+
+**The boundary is "execution began", not "an engine saw it."** Prod data settled
+this: the largest population of `ExceptionBeforeStart` is an extended-protocol
+`Describe` failing at prepare with a binder error — the statement reaches the
+worker (Describe asks it for the result schema) and still never runs. Reading the
+class as "never reached a worker" would mislead triage. ClickHouse draws the line
+the same way: analysis-time failures are `ExceptionBeforeStart`.
 
 ### 2.2 Who emits what
 
 ```
 CP: mint query_id (UUIDv7)
     ├─ extract metadata (§3), emit QueryStart              [type=1]
-    ├─ never reached an engine → emit ExceptionBeforeStart [type=3]  ← CP owns
+    ├─ never began executing → emit ExceptionBeforeStart  [type=3]  ← CP owns
     └─ dispatched to engine, propagate query_id
            │
            ▼
@@ -167,10 +174,12 @@ CP: mint query_id (UUIDv7)
   CP's trailer-based capture is unreliable.
 - It survives CP-side abandonment: client disconnect mid-query, CP pod eviction.
 
-**Why the CP still owns `ExceptionBeforeStart`:** by definition those statements
-have no engine. Auth failure, transpile error, policy denial, DML-RETURNING
-Describe rejection, worker acquisition failure at org cap — the worker does not
-know the statement exists.
+**Why the CP still owns `ExceptionBeforeStart`:** the engine either never sees
+these statements or never runs them, so it cannot report their outcome. Auth
+failure, transpile error, policy denial, worker acquisition failure at org cap —
+the worker does not know the statement exists. An extended-protocol `Describe`
+rejected at prepare does reach the worker, but only as a schema probe: there is
+no execution whose end the worker could report.
 
 **Honest limitation:** the highest-frequency incident — worker OOM-killed by its
 own heavy query — is precisely the case where the engine *cannot* emit. That is
