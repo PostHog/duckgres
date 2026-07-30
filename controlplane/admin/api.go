@@ -747,6 +747,7 @@ func managedWarehouseUpsertColumns() []string {
 		// DB column name. Mismatching this against the actual column makes
 		// the ON CONFLICT … DO UPDATE clause throw 42703.
 		"duck_lake_version",
+		"metadata_proxy_enabled",
 		"duckling_name",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",
@@ -807,6 +808,7 @@ type apiHandler struct {
 type managedWarehouseRequest struct {
 	Image                        string                                        `json:"image"`
 	DuckLakeVersion              string                                        `json:"ducklake_version"`
+	MetadataProxyEnabled         bool                                          `json:"metadata_proxy_enabled"`
 	DucklingName                 string                                        `json:"duckling_name"`
 	WarehouseDatabase            configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
 	MetadataStore                configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
@@ -1420,8 +1422,16 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 	// NAMES only — the values can carry credentials/secret refs, so we never put
 	// them in the audit log). Gives "changed: metadata_store, s3" instead of a
 	// bare "warehouse.update".
-	if changed := topLevelJSONKeys(body); len(changed) > 0 {
-		setAuditDetail(c, "changed: "+strings.Join(changed, ", "))
+	changedFields := topLevelJSONKeys(body)
+	if len(changedFields) > 0 {
+		setAuditDetail(c, "changed: "+strings.Join(changedFields, ", "))
+	}
+	metadataProxyChanged := false
+	for _, field := range changedFields {
+		if field == "metadata_proxy_enabled" {
+			metadataProxyChanged = true
+			break
+		}
 	}
 
 	// MutateManagedWarehouse locks the row inside a transaction, runs the
@@ -1466,6 +1476,16 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
+	}
+	if metadataProxyChanged {
+		// The proxy gate is consumed from each CP's in-memory snapshot. Reload
+		// locally and notify peers now so an explicit admin/UI toggle does not
+		// wait for the normal config poll interval. Established sessions
+		// recheck the refreshed gate at most five seconds later.
+		if err := h.notifyPeersOfChange(c); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	c.JSON(http.StatusOK, stored)
 }

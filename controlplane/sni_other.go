@@ -10,3 +10,7 @@ package controlplane
 func (cp *ControlPlane) extractOrgFromSNI(_ string) (string, bool) {
 	return "", false
 }
+
+func (cp *ControlPlane) extractMetadataOrgFromSNI(_ string) (string, bool) {
+	return "", false
+}

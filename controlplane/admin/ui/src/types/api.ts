@@ -209,6 +209,7 @@ export interface ManagedWarehouse {
   };
   data_store?: { kind: string; bucket_name?: string; region?: string };
   pgbouncer: { enabled: boolean };
+  metadata_proxy_enabled: boolean;
   s3: {
     provider: string;
     region: string;

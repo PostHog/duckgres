@@ -289,6 +289,10 @@ type ManagedWarehouse struct {
 
 	Image           string `gorm:"size:512" json:"image"`
 	DuckLakeVersion string `gorm:"size:32" json:"ducklake_version"`
+	// MetadataProxyEnabled explicitly opts this org into the customer-facing
+	// native Postgres metadata endpoint. It is never inferred from shard
+	// placement: moving an org must not silently publish its catalog database.
+	MetadataProxyEnabled bool `gorm:"not null;default:false" json:"metadata_proxy_enabled"`
 
 	// DucklingName is THE authoritative k8s Duckling CR name — nothing in the
 	// control plane derives or re-derives it. On warehouse create it defaults
@@ -619,8 +623,9 @@ type ManagedWarehouseConfig struct {
 	// as the org-teams info metric's join key.
 	DucklingName string
 
-	Image           string
-	DuckLakeVersion string
+	Image                string
+	DuckLakeVersion      string
+	MetadataProxyEnabled bool
 
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
@@ -653,6 +658,7 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 		DucklingName:                 warehouse.DucklingName,
 		Image:                        warehouse.Image,
 		DuckLakeVersion:              warehouse.DuckLakeVersion,
+		MetadataProxyEnabled:         warehouse.MetadataProxyEnabled,
 		WarehouseDatabase:            warehouse.WarehouseDatabase,
 		MetadataStore:                warehouse.MetadataStore,
 		PgBouncer:                    warehouse.PgBouncer,

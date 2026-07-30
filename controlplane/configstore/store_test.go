@@ -456,6 +456,19 @@ func TestHashPassword(t *testing.T) {
 	}
 }
 
+func TestDummyBcryptHashIsValidAtDefaultCost(t *testing.T) {
+	cost, err := bcrypt.Cost([]byte(dummyBcryptHash))
+	if err != nil {
+		t.Fatalf("dummy bcrypt hash is invalid: %v", err)
+	}
+	if cost != bcrypt.DefaultCost {
+		t.Fatalf("dummy bcrypt cost = %d, want %d", cost, bcrypt.DefaultCost)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte("never-the-dummy-password")); err != bcrypt.ErrMismatchedHashAndPassword {
+		t.Fatalf("dummy bcrypt comparison returned %v, want ErrMismatchedHashAndPassword", err)
+	}
+}
+
 func TestOrgWarehouseStatus(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
@@ -489,6 +502,113 @@ func TestOrgWarehouseStatus(t *testing.T) {
 			t.Errorf("OrgWarehouseStatus(%q) = (%q, %v); want (%q, %v)",
 				tt.orgID, gotState, gotExists, tt.wantState, tt.wantExists)
 		}
+	}
+}
+
+func TestOrgMetadataProxyEnabledFailsClosed(t *testing.T) {
+	cs := &ConfigStore{}
+	cs.snapshot = &Snapshot{Orgs: map[string]*OrgConfig{
+		"enabled": {
+			Name: "enabled",
+			Warehouse: &ManagedWarehouseConfig{
+				MetadataProxyEnabled: true,
+				State:                ManagedWarehouseStateReady,
+				MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+			},
+		},
+		"external": {
+			Name: "external",
+			Warehouse: &ManagedWarehouseConfig{
+				MetadataProxyEnabled: true,
+				State:                ManagedWarehouseStateReady,
+				MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindExternal},
+			},
+		},
+		"disabled": {
+			Name: "disabled",
+			Warehouse: &ManagedWarehouseConfig{
+				State:         ManagedWarehouseStateReady,
+				MetadataStore: ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+			},
+		},
+		"pending": {
+			Name: "pending",
+			Warehouse: &ManagedWarehouseConfig{
+				MetadataProxyEnabled: true,
+				State:                ManagedWarehouseStateProvisioning,
+				MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+			},
+		},
+		"no-warehouse": {Name: "no-warehouse"},
+	}}
+	if !cs.OrgMetadataProxyEnabled("enabled") {
+		t.Fatal("explicitly enabled ready CNPG org should be allowed")
+	}
+	for _, orgID := range []string{"external", "disabled", "pending", "no-warehouse", "unknown"} {
+		if cs.OrgMetadataProxyEnabled(orgID) {
+			t.Fatalf("org %q must fail closed", orgID)
+		}
+	}
+}
+
+func TestResolveMetadataProxyConnection(t *testing.T) {
+	root := OrgUserKey{OrgID: "acme", Username: "root"}
+	cs := &ConfigStore{snapshot: &Snapshot{
+		Orgs: map[string]*OrgConfig{
+			"acme": {
+				Name:         "acme",
+				DatabaseName: "acme_db",
+				Warehouse: &ManagedWarehouseConfig{
+					MetadataProxyEnabled: true,
+					State:                ManagedWarehouseStateReady,
+					MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+				},
+			},
+		},
+		HostnameAliasOrg: map[string]string{"acme-alias": "acme"},
+		OrgUserPassword:  map[OrgUserKey]string{root: mustHash(t, "secret")},
+		OrgUserDisabled:  map[OrgUserKey]bool{},
+	}}
+
+	orgID, enabled, authenticated := cs.ResolveMetadataProxyConnection("acme-alias", "root", "secret")
+	if orgID != "acme" || !enabled || !authenticated {
+		t.Fatalf("valid metadata connection = (%q, %v, %v), want (acme, true, true)",
+			orgID, enabled, authenticated)
+	}
+	if !cs.MetadataProxySessionAllowed("acme", "root") {
+		t.Fatal("authenticated root session should remain allowed")
+	}
+	if cs.MetadataProxySessionAllowed("acme", "other") {
+		t.Fatal("non-root metadata session must not be allowed")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		prefix   string
+		username string
+		password string
+		enabled  bool
+	}{
+		{name: "wrong password", prefix: "acme-alias", username: "root", password: "wrong", enabled: true},
+		{name: "wrong user", prefix: "acme-alias", username: "other", password: "secret", enabled: true},
+		{name: "unknown host", prefix: "unknown", username: "root", password: "secret", enabled: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotOrg, gotEnabled, gotAuthenticated := cs.ResolveMetadataProxyConnection(tc.prefix, tc.username, tc.password)
+			if gotEnabled != tc.enabled || gotAuthenticated {
+				t.Fatalf("metadata connection = (%q, %v, %v), want enabled=%v authenticated=false",
+					gotOrg, gotEnabled, gotAuthenticated, tc.enabled)
+			}
+		})
+	}
+
+	cs.snapshot.OrgUserDisabled[root] = true
+	_, enabled, authenticated = cs.ResolveMetadataProxyConnection("acme-alias", "root", "secret")
+	if !enabled || authenticated {
+		t.Fatalf("disabled root = (enabled=%v, authenticated=%v), want (true, false)", enabled, authenticated)
+	}
+	if cs.MetadataProxySessionAllowed("acme", "root") {
+		t.Fatal("disabled root's established metadata session must be revoked")
 	}
 }
 
@@ -634,12 +754,12 @@ func TestOrgUsageTeamID(t *testing.T) {
 		orgID, username string
 		want            int64
 	}{
-		{"multi", "reader", 99},    // user's own team wins
-		{"multi", "root", 42},      // user without a team → org's oldest team
-		{"multi", "zeroteam", 42},  // non-positive user team → oldest-team fallback
-		{"multi", "unknown", 42},   // unknown user → oldest-team fallback
-		{"no-teams", "anyone", 0},  // defensive: teamless org
-		{"unknown", "anyone", 0},   // unknown org
+		{"multi", "reader", 99},   // user's own team wins
+		{"multi", "root", 42},     // user without a team → org's oldest team
+		{"multi", "zeroteam", 42}, // non-positive user team → oldest-team fallback
+		{"multi", "unknown", 42},  // unknown user → oldest-team fallback
+		{"no-teams", "anyone", 0}, // defensive: teamless org
+		{"unknown", "anyone", 0},  // unknown org
 	}
 	for _, tt := range tests {
 		if got := cs.OrgUsageTeamID(tt.orgID, tt.username); got != tt.want {

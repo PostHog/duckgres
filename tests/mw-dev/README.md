@@ -96,6 +96,17 @@ client-go:
   backpressure was observed **and** handles it (queries retry through it).
 - **activation** — DuckLake catalogs attach, read/write, and run
   `EXPLAIN`/`EXPLAIN ANALYZE` on CNPG-backed tenants.
+- **native metadata Postgres proxy** — the Job reaches the actual proxy branch
+  over the control-plane ClusterIP while libpq sends a dedicated, non-resolving
+  TLS SNI name (`<org>.md.ci.duckgres.local`). It proves a ready CNPG org is
+  denied by default, enables only that org through the admin warehouse API,
+  initializes the DuckLake catalog once through the normal worker path, then
+  queries `public.ducklake_metadata` through the proxy and hidden per-tenant
+  CNPG credentials (the proxy query itself never uses a worker). It also checks
+  that both a normal Duckgres database and an explicitly empty startup database
+  are rejected (only exact
+  `dbname=metadata` is valid). A second ready org on the same shard remains
+  denied, then disabling the opted-in org blocks new connections again.
 - **binary COPY** — a `psql`-generated PostgreSQL binary fixture traverses the
   deployed pgwire → control-plane → Flight → worker → `postgres_scanner` →
   DuckLake path. It checks every natively routed scalar type, reordered/subset
@@ -194,6 +205,14 @@ normal `go test ./...` lane.
   stay distinguishable on real traffic, not just in unit fixtures.
 
 ### Deliberately not covered here
+
+- **Native metadata proxy denial for an external metadata-store org** — the
+  live suite intentionally provisions only CNPG-backed orgs and has no RDS
+  credential with which to create an external-store tenant. The backend-kind
+  gate is deterministic and covered by
+  `TestOrgMetadataProxyEnabledFailsClosed`; the live proxy check still proves
+  the independent access boundary by leaving a second ready tenant on the same
+  CNPG shard opted out.
 
 - **The query log on an EXTERNAL (RDS) metadata store** — the suite provisions
   only cnpg-shard orgs, so `query_log_round_trip` runs on cnpg alone. The

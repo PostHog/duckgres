@@ -123,7 +123,9 @@ type ControlPlaneConfig struct {
 	// single-label prefix is resolved as hostname_alias, database_name, or org
 	// name. Postgres still honors an explicit startup database, but only when it
 	// resolves to the same org as the managed hostname.
-	ManagedHostnameSuffixes []string
+	ManagedHostnameSuffixes  []string
+	MetadataHostnameSuffixes []string
+	MetadataProxyMaxConns    int
 
 	// DucklingBucketSuffix is the env suffix the control plane uses to name a
 	// type=s3bucket Duckling's per-org S3 bucket
@@ -244,7 +246,11 @@ type ControlPlane struct {
 	// durable buffer (remote/k8s backend with billing config only; nil
 	// otherwise — every call site is nil-safe). The leader-only drain loop that
 	// ships buffered usage to PostHog is wired separately in SetupMultiTenant.
-	computeMeter *computeMeter
+	computeMeter            *computeMeter
+	metadataPostgresURL     func(context.Context, string) (string, error)
+	metadataPostgresConnect func(context.Context, string) (metadataPostgresConn, error)
+	metadataSessions        *metadataProxySessionRegistry
+	proxyCancels            sync.Map
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -536,6 +542,13 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		}
 		cp.configStore = store
 		cp.orgRouter = adapter
+		if resolver, ok := adapter.(interface {
+			MetadataPostgresURL(context.Context, string) (string, error)
+			MetadataProxySessions() *metadataProxySessionRegistry
+		}); ok {
+			cp.metadataPostgresURL = resolver.MetadataPostgresURL
+			cp.metadataSessions = resolver.MetadataProxySessions()
+		}
 		cp.apiServer = apiServer
 		cp.runtimeTracker = runtimeTracker
 		cp.janitorLeader = janitorLeader
@@ -915,7 +928,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Handle cancel request
 	if params.cancelRequest {
 		key := server.BackendKey{Pid: params.cancelPid, SecretKey: params.cancelSecretKey}
-		cp.srv.CancelQuery(key)
+		if !cp.forwardMetadataCancel(key) {
+			cp.srv.CancelQuery(key)
+		}
 		_ = conn.Close()
 		return
 	}
@@ -1032,6 +1047,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	password := string(bytes.TrimRight(body, "\x00"))
+
+	if cp.tryMetadataProxy(context.Background(), tlsConn, reader, writer,
+		tlsConn.ConnectionState().ServerName, username, database, password) {
+		return
+	}
 
 	// Authenticate.
 	// In multi-tenant mode the org is resolved solely from the managed hostname

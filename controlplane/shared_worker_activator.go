@@ -676,16 +676,17 @@ func orgName(org *configstore.OrgConfig) string {
 	return org.Name
 }
 
-// MetadataPostgresURL resolves a standard postgres:// URL for an org's
-// DuckLake metadata Postgres, for CP-side read-only queries (the storage
-// sampler — see storage_meter.go). Mirrors the resolution the worker
-// activation uses: prefer the Duckling CR (pgbouncer endpoint when present,
-// else the direct metadata endpoint), fall back to the config-store warehouse
-// shape. sslmode follows provisioner.ProbeMetadataStore's rules: "disable"
-// through the duckling's pgbouncer (plaintext worker↔pooler; the pooler
-// carries TLS to RDS), "require" against a direct RDS endpoint, "prefer" for
-// config-store warehouses (matches the DuckDB ATTACH default there).
-// Returns an error when the org has no DuckLake-enabled warehouse.
+// MetadataPostgresURL resolves a standard postgres:// URL for internal
+// control-plane callers of an org's DuckLake metadata Postgres (the storage
+// sampler and the explicitly enabled native metadata proxy). Mirrors the
+// resolution the worker activation uses: prefer the Duckling CR (pgbouncer
+// endpoint when present, else the direct metadata endpoint), fall back to the
+// config-store warehouse shape. sslmode follows
+// provisioner.ProbeMetadataStore's rules: "disable" through the duckling's
+// pgbouncer (plaintext worker↔pooler; the pooler carries TLS to RDS), "require"
+// against a direct RDS endpoint, "prefer" for config-store warehouses (matches
+// the DuckDB ATTACH default there). Returns an error when the org has no
+// DuckLake-enabled warehouse.
 func (a *SharedWorkerActivator) MetadataPostgresURL(ctx context.Context, orgID string) (string, error) {
 	if a.resolveDucklingStatus != nil {
 		status, err := a.resolveDucklingStatus(ctx, orgID)

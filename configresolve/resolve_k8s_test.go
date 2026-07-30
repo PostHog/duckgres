@@ -1,6 +1,7 @@
 package configresolve
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -22,6 +23,26 @@ func TestResolveEffectiveExposesDuckLakeDefaultSpecVersionForControlPlane(t *tes
 
 	if resolved.DuckLakeDefaultSpecVersion != "1.1" {
 		t.Fatalf("expected DuckLake default spec version 1.1, got %q", resolved.DuckLakeDefaultSpecVersion)
+	}
+}
+
+func TestResolveEffectiveParsesMetadataHostnameSuffixes(t *testing.T) {
+	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
+		switch key {
+		case "DUCKGRES_METADATA_HOSTNAME_SUFFIXES":
+			return " .md.us.postwh.com, .md.eu.postwh.com "
+		case "DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG":
+			return "7"
+		}
+		return ""
+	}, nil)
+
+	want := []string{".md.us.postwh.com", ".md.eu.postwh.com"}
+	if !slices.Equal(resolved.MetadataHostnameSuffixes, want) {
+		t.Fatalf("expected metadata hostname suffixes %v, got %v", want, resolved.MetadataHostnameSuffixes)
+	}
+	if resolved.MetadataProxyMaxConns != 7 {
+		t.Fatalf("expected metadata per-org connection cap 7, got %d", resolved.MetadataProxyMaxConns)
 	}
 }
 

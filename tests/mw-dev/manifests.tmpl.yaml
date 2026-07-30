@@ -307,7 +307,9 @@ spec:
             #   nonexistent hostPort proxy.
             # - DUCKGRES_CERT/_KEY (wildcard TLS) and DUCKGRES_TRINO_*: need
             #   cert-manager / a Trino cluster in the per-PR namespace; the CP
-            #   serves its self-signed cert and Trino is not under e2e.
+            #   serves its self-signed cert and Trino is not under e2e. The
+            #   metadata-proxy check uses sslmode=require, so that self-signed
+            #   cert still exercises the real TLS/SNI branch without public DNS.
             - { name: DUCKGRES_WORKER_QUEUE_TIMEOUT, value: "5m" }
             # Fast config-store poll for CI only (default 30s). The harness has
             # three waits bounded by this interval — the post-provision auth-cache
@@ -340,6 +342,10 @@ spec:
             # + hostaddr=<CP ClusterIP> (→ TCP target), and dbname selects the
             # catalog. Suffix is CI-internal; it never needs to resolve in DNS.
             - { name: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES, value: ".ci.duckgres.local" }
+            # Separate native metadata-Postgres proxy SNI. Like the managed
+            # hostname above, libpq sends this as TLS SNI while hostaddr keeps
+            # the TCP destination on the in-cluster CP Service.
+            - { name: DUCKGRES_METADATA_HOSTNAME_SUFFIXES, value: ".md.ci.duckgres.local" }
             - { name: DUCKGRES_SNI_ROUTING_MODE, value: "passthrough" }
           ports:
             - { name: pg, containerPort: 5432 }

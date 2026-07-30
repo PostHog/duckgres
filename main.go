@@ -391,6 +391,8 @@ func main() {
 			UserSecretKey:              resolved.UserSecretKey,
 			SNIRoutingMode:             resolved.SNIRoutingMode,
 			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
+			MetadataHostnameSuffixes:   resolved.MetadataHostnameSuffixes,
+			MetadataProxyMaxConns:      resolved.MetadataProxyMaxConns,
 			DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 			DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
 
