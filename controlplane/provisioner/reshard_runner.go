@@ -1026,6 +1026,15 @@ func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() err
 	if m.OperationID != o.op.ID || m.User == "" || m.Password == "" {
 		return fmt.Errorf("maintenance identity for operation %d is not available before cleanup", o.op.ID)
 	}
+	if !isValidCnpgShardName(o.op.FromShard) {
+		return fmt.Errorf("invalid source shard %q before disabling maintenance identity", o.op.FromShard)
+	}
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, o.sourceMaintenanceTimeout())
+	direct, err := o.r.duckling.CnpgProvisionerEndpoint(resolveCtx, o.op.FromShard)
+	resolveCancel()
+	if err != nil {
+		return fmt.Errorf("resolve direct source endpoint before disabling maintenance identity: %w", err)
+	}
 	if m.MaintenanceNoLogin {
 		// A prior runner can crash after PostgreSQL applied NOLOGIN and drained
 		// sessions but before it persisted maintenance_disabled_at. Re-enable
@@ -1040,13 +1049,9 @@ func (o *opRun) disableMaintenance(ctx context.Context, beforeDisable func() err
 		}
 		m = st.ReshardMaintenance
 	}
-	host := o.op.SourceEndpoint
-	if host == "" {
-		host = st.MetadataStore.Endpoint
-	}
 	admin := CatalogEndpoint{
-		Host: host, Port: 5432, User: m.User, Password: m.Password,
-		Database: "postgres", SSLMode: sslModeFor(o.op.SourceKind),
+		Host: direct.Host, Port: direct.Port, User: m.User, Password: m.Password,
+		Database: "postgres", SSLMode: direct.SSLMode,
 	}
 	disableCtx, cancel := context.WithTimeout(ctx, o.sourceMaintenanceTimeout())
 	defer cancel()

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ReshardSourceFencer removes sessions which bypass Duckgres after the
@@ -33,38 +32,23 @@ func (PGReshardSourceFencer) TerminateAndWait(ctx context.Context, maintenance C
 }
 
 func (PGReshardSourceFencer) DisableMaintenanceAndTerminate(ctx context.Context, maintenance CatalogEndpoint, disableAndWait func() error) error {
+	// Callers provide a direct PostgreSQL endpoint so the final administrative
+	// session is never returned to a pool after NOLOGIN. Once PostgreSQL
+	// confirms NOLOGIN, this already-authenticated session can terminate every
+	// other maintenance session and then close its own backend.
 	conn, err := pgx.Connect(ctx, maintenance.DSN())
 	if err != nil {
 		return fmt.Errorf("connect before disabling reshard maintenance identity %s: %w", maintenance.Redacted(), err)
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
-	return disableMaintenanceAndTerminateOnSession(ctx, conn, maintenance.User, disableAndWait)
-}
 
-type reshardSQLSession interface {
-	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
-func disableMaintenanceAndTerminateOnSession(ctx context.Context, session reshardSQLSession, username string, disableAndWait func() error) error {
-	// PgBouncer can accept the client before it has authenticated a PostgreSQL
-	// backend. Force that authentication while the maintenance role still has
-	// LOGIN. CNPG's shard Pooler uses session mode, so this backend remains
-	// attached without holding a transaction across the reconciliation wait.
-	if _, err := session.Exec(ctx, "SELECT 1"); err != nil {
-		return fmt.Errorf("authenticate backend before disabling reshard maintenance identity: %w", err)
-	}
-
-	// Once PostgreSQL confirms NOLOGIN, this already-authenticated backend can
-	// terminate every other maintenance session and then close itself. There
-	// is no gap in which a new privileged session can race cleanup.
 	if err := disableAndWait(); err != nil {
 		return err
 	}
-	return terminateRoleSessionsAndWait(ctx, session, username, "")
+	return terminateRoleSessionsAndWait(ctx, conn, maintenance.User, "")
 }
 
-func terminateRoleSessionsAndWait(ctx context.Context, conn reshardSQLSession, username, database string) error {
+func terminateRoleSessionsAndWait(ctx context.Context, conn *pgx.Conn, username, database string) error {
 	const terminate = `
 SELECT pg_terminate_backend(pid)
 FROM pg_stat_activity
