@@ -11,6 +11,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/observe"
 )
 
 func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) {
@@ -196,18 +197,19 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 	})
 }
 
-func TestControlPlaneSessionStartOutcome(t *testing.T) {
+func TestControlPlaneSessionStartResult(t *testing.T) {
 	tests := []struct {
-		name string
-		err  error
-		want string
+		name        string
+		err         error
+		wantOutcome string
+		wantReason  string
 	}{
-		{name: "success", want: "success"},
-		{name: "canceled", err: context.Canceled, want: "canceled"},
-		{name: "deadline", err: context.DeadlineExceeded, want: "timeout"},
-		{name: "queue timeout", err: ErrTooManyConnections, want: "timeout"},
-		{name: "draining", err: ErrSessionManagerDraining, want: "draining"},
-		{name: "worker capacity", err: NewWorkerCapacityExhaustedError(time.Second), want: "capacity"},
+		{name: "success", wantOutcome: "success", wantReason: observe.SessionStartReasonNone},
+		{name: "canceled", err: context.Canceled, wantOutcome: "canceled", wantReason: observe.SessionStartReasonCanceled},
+		{name: "deadline", err: context.DeadlineExceeded, wantOutcome: "timeout", wantReason: observe.SessionStartReasonCapacity},
+		{name: "queue timeout", err: ErrTooManyConnections, wantOutcome: "timeout", wantReason: observe.SessionStartReasonCapacity},
+		{name: "draining", err: ErrSessionManagerDraining, wantOutcome: "draining", wantReason: observe.SessionStartReasonLifecycle},
+		{name: "worker capacity", err: NewWorkerCapacityExhaustedError(time.Second), wantOutcome: "capacity", wantReason: observe.SessionStartReasonCapacity},
 		{
 			name: "admission hard rejection",
 			err: &configstore.OrgConnectionAdmissionRejectedError{
@@ -215,33 +217,76 @@ func TestControlPlaneSessionStartOutcome(t *testing.T) {
 				RequestedVCPUs: 4,
 				MaximumVCPUs:   2,
 			},
-			want: "capacity",
+			wantOutcome: "capacity",
+			wantReason:  observe.SessionStartReasonClient,
 		},
-		{name: "generic error", err: errors.New("bootstrap failed"), want: "error"},
+		{name: "generic error", err: errors.New("bootstrap failed"), wantOutcome: "error", wantReason: observe.SessionStartReasonWorker},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := controlPlaneSessionStartOutcome(tt.err); got != tt.want {
-				t.Fatalf("controlPlaneSessionStartOutcome(%v) = %q, want %q", tt.err, got, tt.want)
+			gotOutcome, gotReason := controlPlaneSessionStartResult(tt.err)
+			if gotOutcome != tt.wantOutcome || gotReason != tt.wantReason {
+				t.Fatalf("controlPlaneSessionStartResult(%v) = (%q, %q), want (%q, %q)",
+					tt.err, gotOutcome, gotReason, tt.wantOutcome, tt.wantReason)
 			}
 		})
 	}
 }
 
-func TestControlPlaneSessionStartOperationOutcomePrefersContext(t *testing.T) {
+func TestControlPlaneSessionStartOperationResultPrefersContext(t *testing.T) {
 	operationErr := errors.New("metadata initialization failed")
-	if got := controlPlaneSessionStartOperationOutcome(operationErr, context.Canceled, false); got != "canceled" {
-		t.Fatalf("canceled operation outcome = %q, want canceled", got)
+	tests := []struct {
+		name        string
+		contextErr  error
+		draining    bool
+		wantOutcome string
+		wantReason  string
+	}{
+		{name: "client canceled", contextErr: context.Canceled, wantOutcome: "canceled", wantReason: observe.SessionStartReasonCanceled},
+		{name: "operation timed out", contextErr: context.DeadlineExceeded, wantOutcome: "timeout", wantReason: observe.SessionStartReasonMetadataStore},
+		{name: "ordinary metadata error", wantOutcome: "error", wantReason: observe.SessionStartReasonMetadataStore},
+		{name: "draining wins", contextErr: context.Canceled, draining: true, wantOutcome: "draining", wantReason: observe.SessionStartReasonLifecycle},
 	}
-	if got := controlPlaneSessionStartOperationOutcome(operationErr, context.DeadlineExceeded, false); got != "timeout" {
-		t.Fatalf("timed-out operation outcome = %q, want timeout", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOutcome, gotReason := controlPlaneSessionStartOperationResult(
+				operationErr,
+				tt.contextErr,
+				tt.draining,
+				observe.SessionStartReasonMetadataStore,
+			)
+			if gotOutcome != tt.wantOutcome || gotReason != tt.wantReason {
+				t.Fatalf("operation result = (%q, %q), want (%q, %q)",
+					gotOutcome, gotReason, tt.wantOutcome, tt.wantReason)
+			}
+		})
 	}
-	if got := controlPlaneSessionStartOperationOutcome(operationErr, nil, false); got != "error" {
-		t.Fatalf("ordinary operation outcome = %q, want error", got)
+}
+
+func TestMissingOrgStackReason(t *testing.T) {
+	tests := []struct {
+		name      string
+		state     string
+		orgExists bool
+		want      string
+	}{
+		{name: "missing org", orgExists: false, want: observe.SessionStartReasonClient},
+		{name: "legacy ready state", orgExists: true, state: "", want: observe.SessionStartReasonControlPlane},
+		{name: "ready warehouse", orgExists: true, state: string(configstore.ManagedWarehouseStateReady), want: observe.SessionStartReasonControlPlane},
+		{name: "failed provisioning", orgExists: true, state: string(configstore.ManagedWarehouseStateFailed), want: observe.SessionStartReasonLifecycle},
+		{name: "deleting", orgExists: true, state: string(configstore.ManagedWarehouseStateDeleting), want: observe.SessionStartReasonLifecycle},
+		{name: "resharding", orgExists: true, state: string(configstore.ManagedWarehouseStateResharding), want: observe.SessionStartReasonLifecycle},
+		{name: "pending", orgExists: true, state: string(configstore.ManagedWarehouseStatePending), want: observe.SessionStartReasonLifecycle},
 	}
-	if got := controlPlaneSessionStartOperationOutcome(operationErr, context.Canceled, true); got != "draining" {
-		t.Fatalf("drain-canceled operation outcome = %q, want draining", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := missingOrgStackReason(tt.state, tt.orgExists); got != tt.want {
+				t.Fatalf("missingOrgStackReason(%q, %t) = %q, want %q", tt.state, tt.orgExists, got, tt.want)
+			}
+		})
 	}
 }
 
