@@ -29,19 +29,19 @@ jobs:
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: tests/mw-dev/scenario/Dockerfile
-      image-name: duckgres
+      image-name: duckgres-prs
       tag: scenario-runner-${{ github.run_id }}-${{ github.run_attempt }}-arm64
       platform: linux/arm64
       cache-scope: scenario-runner-arm64
     secrets:
-      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+      ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
 
   duckgres-image:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.duckgres_image == '' }}
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
-      image-name: duckgres
+      image-name: duckgres-prs
       tag: scenario-duckgres-${{ github.run_id }}-${{ github.run_attempt }}-arm64
       platform: linux/arm64
       cache-scope: scenario-duckgres-arm64
@@ -52,7 +52,7 @@ jobs:
         DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
         POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
     secrets:
-      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+      ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
 
   scenario:
     needs: [scenario-runner-image, duckgres-image]
