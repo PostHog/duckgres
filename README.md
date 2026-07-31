@@ -68,12 +68,18 @@ labels, aggregation rules, PromQL examples, and admission metric migration.
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `duckgres_connections_open` | Gauge | Number of currently open client connections |
-| `duckgres_connection_duration_seconds{org}` | Histogram | Client connection lifetime, accept→disconnect (includes `_count`, `_sum`, `_bucket`); `_sum` is exact total connection-seconds (per org) with no scrape-integral bias. The disconnect log also carries `duration_ms` |
+| `duckgres_connections_open` | Gauge | Process-wide number of currently open client connections, including native metadata-proxy sockets |
+| `duckgres_connection_duration_seconds{org}` | Histogram | Worker-backed Duckgres connection lifetime, accept→disconnect (includes `_count`, `_sum`, `_bucket`); excludes native metadata-proxy connections, which use their dedicated duration family |
+| `duckgres_metadata_proxy_connections_open{org}` | Gauge | Current admitted native metadata Postgres proxy connections; process-local, so sum across control-plane replicas |
+| `duckgres_metadata_proxy_connection_attempts_total{org,outcome}` | Counter | Metadata proxy attempts by bounded terminal outcome |
+| `duckgres_metadata_proxy_connection_duration_seconds{org}` | Histogram | Lifetime of admitted metadata proxy connections, including upstream bootstrap |
+| `duckgres_metadata_proxy_upstream_connect_duration_seconds{org,outcome}` | Histogram | Internal metadata Postgres connect/auth latency; outcome is `success` or `error` |
+| `duckgres_metadata_proxy_bytes_total{org,direction}` | Counter | Post-authentication pgwire bytes relayed in `client_to_upstream` or `upstream_to_client` direction |
+| `duckgres_metadata_proxy_cancel_requests_total{outcome}` | Counter | Raw metadata-proxy CancelRequests handled as `session_terminated` on the owning control-plane replica or `not_local` on another replica |
 | `duckgres_query_total{org,status,reason}` | Counter | Total non-empty query attempts. Valid status/reason pairs: `success/none`; `failure/user`, `failure/canceled`, `failure/conflict`; `error/metadata_connection_lost`, `error/system`. |
 | `duckgres_query_duration_seconds{org}` | Histogram | Simple/extended query execution latency (includes `_count`, `_sum`, `_bucket`); use `duckgres_query_total` for attempt totals |
-| `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
-| `duckgres_rate_limit_rejects_total` | Counter | Total number of connections rejected due to rate limiting |
+| `duckgres_auth_failures_total` | Counter | Process-wide authentication failures, including wrong-password metadata-proxy attempts; use `duckgres_metadata_proxy_connection_attempts_total{outcome="auth_failed"}` for the proxy-specific split |
+| `duckgres_rate_limit_rejects_total` | Counter | Process-wide pre-TLS connection rejections due to rate limiting; these cannot be attributed to the worker or metadata endpoint because SNI is not available yet |
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
 | `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
 | `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
@@ -367,6 +373,8 @@ Run with config file:
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
+| `DUCKGRES_METADATA_HOSTNAME_SUFFIXES` | Comma-separated SNI suffixes for the explicitly enabled native metadata Postgres proxy, such as `.md.dev.postwh.com`, `.md.us.postwh.com`, or `.md.eu.postwh.com` | - |
+| `DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG` | Maximum admitted metadata proxy sessions per org on each control-plane replica | `20` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
@@ -888,6 +896,43 @@ kill -USR2 <control-plane-pid>
 In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may use a durable session token to create a fresh remote session on the surviving worker if the token is still valid.
 
 Managed-hostname routing is controlled by `--sni-routing-mode` and `--managed-hostname-suffixes`. For Postgres, an explicit startup `database`/`dbname` takes priority, but when SNI matches a managed suffix the hostname prefix and requested database must resolve to the same org. If the startup database is empty, the managed SNI prefix is used as the database fallback. Unknown `--sni-routing-mode` values behave like `off`.
+
+The native metadata Postgres proxy is a separate, fail-closed SNI path selected
+by `DUCKGRES_METADATA_HOSTNAME_SUFFIXES`. It is available only when an org's
+warehouse explicitly has `metadata_proxy_enabled=true`, is ready, and uses a
+CNPG-shard metadata store. The client must connect as `root` with the org's
+existing Duckgres password and must send the exact non-empty
+`dbname=metadata`. Duckgres resolves and uses the real metadata role, password,
+database, and PgBouncer endpoint internally. The endpoint and password are
+never sent to the client; the upstream role and database may be visible
+through normal PostgreSQL introspection such as `current_user` and
+`current_database()`. Managed-warehouse deployments configure their own
+environment suffix (`.md.dev.postwh.com`, `.md.us.postwh.com`, or
+`.md.eu.postwh.com`); suffixes are never inferred from the ordinary Duckgres
+hostname. The per-org connection limit is enforced independently on every
+control-plane replica. Internal target resolution and
+connect/auth/synchronization have a fixed 10-second bootstrap deadline; the
+deadline does not apply after the relay is established. An admin/UI update that
+includes `metadata_proxy_enabled` reloads the local config snapshot and
+notifies peer replicas; established sessions close on their next five-second
+authorization recheck after the updated snapshot arrives.
+
+The initial rollout is restricted operationally to dedicated,
+single-customer CNPG shards. Do not enable `metadata_proxy_enabled` for an org
+on a shared shard until upstream database `CONNECT` ACLs and role hardening are
+in place: once the exact `metadata` database connection is established, the
+customer's `root` credential intentionally receives full access available to
+the internally resolved metadata role.
+
+Metadata-proxy cancellation is deliberately session-terminating: when a raw
+PostgreSQL `CancelRequest` reaches the control-plane replica that owns the
+synthetic backend key, Duckgres closes that exact frontend and upstream
+connection pair. PgBouncer cancellation keys are instance-local, so Duckgres
+does not redial the pooler Service. Like existing Duckgres cancellation, the
+raw follow-up TCP connection is control-plane-local behind the NLB; a request
+routed to another replica is counted as
+`duckgres_metadata_proxy_cancel_requests_total{outcome="not_local"}` and cannot
+terminate the owning session.
 
 Workers are spawned on demand: when an org opens a session with no reusable worker, the control plane creates a worker pod (sized from the connection's `duckgres.worker_cpu`/`worker_memory` request, or a default), activates it over the worker control RPC, and it becomes hot for that org. When its last session ends, the worker moves to `hot_idle` instead of being retired immediately: it keeps the org assignment and DuckLake attachment so any control-plane replica can reclaim it for the same org (by exact worker shape) without full reactivation, until its `duckgres.worker_ttl` expires. Hot-idle reuse is image/version strict. The janitor retires hot-idle workers at their TTL, but `default_worker_min_hot_idle` lets an org retain a minimum number of compatible default-profile hot-idle workers by skipping TTL retirement when the count is already at or below the floor. The default is `0` (disabled). The main lifecycle is: idle → reserved → activating → hot → hot_idle → retired. Workers can also move through `draining` during shutdown, rollout, or cleanup. (Spawn latency is hidden by the node-headroom controller, which keeps placeholder pods ready for real workers to preempt.)
 

@@ -51,7 +51,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 30)
 	requireGooseMigrationRecorded(t, db, 31)
 	requireGooseMigrationRecorded(t, db, 32)
-	requireGooseLatestVersion(t, db, 32)
+	requireGooseMigrationRecorded(t, db, 33)
+	requireGooseLatestVersion(t, db, 33)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -86,6 +87,10 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	} {
 		requireColumnPresent(t, db, "duckgres_reshard_operations", column)
 	}
+	// Migration 000033 added the fail-closed public metadata Postgres opt-in.
+	requireColumnPresent(t, db, "duckgres_managed_warehouses", "metadata_proxy_enabled")
+	requireColumnNotNull(t, db, "duckgres_managed_warehouses", "metadata_proxy_enabled")
+	requireColumnDefault(t, db, "duckgres_managed_warehouses", "metadata_proxy_enabled", "false")
 	requireTablePresent(t, db, "duckgres_reshard_operation_log")
 	requireColumnPresent(t, db, "duckgres_reshard_operation_log", "operation_id")
 
@@ -232,7 +237,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -278,7 +283,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 30)
 	requireGooseMigrationRecorded(t, upgradedDB, 31)
 	requireGooseMigrationRecorded(t, upgradedDB, 32)
-	requireGooseLatestVersion(t, upgradedDB, 32)
+	requireGooseMigrationRecorded(t, upgradedDB, 33)
+	requireGooseLatestVersion(t, upgradedDB, 33)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -292,6 +298,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireUniqueIndex(t, upgradedDB, "duckgres_org_teams", "org_id,schema_name")
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "max_connections")
 	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
+	requireColumnDefault(t, upgradedDB, "duckgres_managed_warehouses", "metadata_proxy_enabled", "false")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "default_catalog")
 }
 

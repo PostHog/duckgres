@@ -27,6 +27,69 @@ PG Client → TLS/Auth/PG Protocol → Control Plane pod
                                  → Flight SQL (TCP+TLS) → per-org Worker pod (DuckDB)
 ```
 
+### Native metadata Postgres proxy
+
+The Kubernetes control plane can expose explicitly opted-in CNPG-backed
+warehouse metadata databases on a separate SNI suffix
+(`DUCKGRES_METADATA_HOSTNAME_SUFFIXES`; managed-warehouse deployments use
+`.md.dev.postwh.com`, `.md.us.postwh.com`, or `.md.eu.postwh.com`). This is an
+early connection branch, not a DuckDB
+executor: the existing org `root` password authenticates at Duckgres, the
+startup database MUST be exactly `metadata`, and the control plane resolves
+the real endpoint/database/tenant role/password internally through
+`SharedWorkerActivator.MetadataPostgresURL`. After authenticating upstream
+with that internal credential, protocol traffic is relayed byte-for-byte. The
+endpoint and password remain internal; the upstream role and database can be
+visible to the fully privileged client through normal PostgreSQL introspection
+such as `current_user` and `current_database()`.
+
+Access is fail-closed on the warehouse row's `metadata_proxy_enabled` flag,
+`state=ready`, and `metadata_store_kind=cnpg-shard`. Never infer publication
+from shard placement and never pass a client-supplied upstream database,
+username, host, or password. `DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG`
+(default 20 per control-plane replica) bounds public sessions so they cannot
+exhaust the internal PgBouncer pool. These sessions participate in the
+existing per-user kill / disable fan-out, and an established session is closed
+if the warehouse gate stops being eligible. An admin warehouse PUT that
+explicitly includes `metadata_proxy_enabled` reloads the local config snapshot
+and notifies peer replicas; established sessions observe the new gate on their
+next five-second recheck after snapshot propagation.
+
+The initial scope is dedicated, single-customer CNPG shards only. Do not enable
+an org on a shared shard until upstream `CONNECT` ACLs and role hardening are in
+place. The exact virtual database check prevents selecting a different startup
+database, but after connection the customer `root` credential has the full
+access of the internally resolved metadata role.
+
+Observability stays explicit at the branch boundary:
+`duckgres_connections_open` includes these client sockets because it is the
+process-wide accepted-connection gauge, while
+`duckgres_metadata_proxy_connections_open`,
+`duckgres_metadata_proxy_connection_attempts_total`,
+`duckgres_metadata_proxy_connection_duration_seconds`,
+`duckgres_metadata_proxy_upstream_connect_duration_seconds`, and
+`duckgres_metadata_proxy_bytes_total` isolate proxy load and failures. The
+relay is intentionally opaque, so DuckDB query metrics, query logs, and query
+traces do not include SQL executed through it. Use the CNPG/PgBouncer metrics
+and the fixed upstream `application_name=duckgres-metadata-proxy` for
+database-side attribution; never make one org's metadata target part of the
+control-plane health check. Target resolution plus upstream
+connect/auth/synchronization has a fixed 10-second bootstrap deadline; the
+deadline is canceled after hijack and never applies to established relay
+traffic. `duckgres_auth_failures_total` includes wrong-password proxy attempts;
+the dedicated attempt counter with `outcome="auth_failed"` is the proxy split.
+Pre-TLS `duckgres_rate_limit_rejects_total` events cannot be assigned to either
+endpoint because SNI has not yet been observed.
+
+Metadata-proxy `CancelRequest` handling is session-terminating. Synthetic
+backend keys map to the exact established frontend/upstream connection pair on
+the owning control-plane replica, which closes both rather than redialing a
+PgBouncer Service where instance-local cancel keys could reach the wrong pod.
+Raw cancel connections remain control-plane-local behind the NLB, matching the
+existing cancellation locality: a synthetic-key miss on another replica is
+absorbed and counted by
+`duckgres_metadata_proxy_cancel_requests_total{outcome="not_local"}`.
+
 In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingress (`--flight-port`) for clients that prefer Flight over the PG wire protocol.
 
 ### Key Components

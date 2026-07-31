@@ -612,6 +612,65 @@ func TestE2EHarnessUsesOnlyCnpgMetadataStores(t *testing.T) {
 	}
 }
 
+func TestE2EHarnessCoversNativeMetadataProxy(t *testing.T) {
+	manifestRaw, err := os.ReadFile("manifests.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+	rendered := strings.NewReplacer(
+		"${NAMESPACE}", "duckgres-ci-pr-123",
+		"${PR_NUMBER}", "123",
+		"${CONTROLPLANE_IMAGE}", "example.invalid/duckgres:test",
+		"${WORKER_IMAGE}", "example.invalid/duckgres:test",
+		"${INTERNAL_SECRET}", "test-internal-secret",
+		"${INTERNAL_SECRET_FALLBACK}", "test-internal-secret-fallback",
+		"${USER_SECRET_KEY}", "test-user-secret-key",
+		"${DUCKGRES_K8S_WORKER_CPU_REQUEST}", "750m",
+		"${DUCKGRES_K8S_WORKER_MEMORY_REQUEST}", "1536Mi",
+	).Replace(string(manifestRaw))
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
+	foundDeployment := false
+	for {
+		var manifest map[string]any
+		err := decoder.Decode(&manifest)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode manifests template: %v", err)
+		}
+		if manifest["kind"] != "Deployment" || manifestName(manifest) != "duckgres-control-plane" {
+			continue
+		}
+		foundDeployment = true
+		env := deploymentContainerEnv(manifest, "controlplane")
+		if got := env["DUCKGRES_METADATA_HOSTNAME_SUFFIXES"]; got != ".md.ci.duckgres.local" {
+			t.Fatalf("DUCKGRES_METADATA_HOSTNAME_SUFFIXES = %q, want .md.ci.duckgres.local", got)
+		}
+	}
+	if !foundDeployment {
+		t.Fatal("duckgres-control-plane Deployment missing from manifests template")
+	}
+
+	harnessRaw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	harness := string(harnessRaw)
+	for _, want := range []string{
+		`METADATA_SNI_SUFFIX=".md.ci.duckgres.local"`,
+		"metadata_proxy_e2e()",
+		`{"metadata_proxy_enabled":true}`,
+		`database = ""`,
+		`public.ducklake_metadata`,
+		`metadata endpoint is unavailable`,
+	} {
+		if !strings.Contains(harness, want) {
+			t.Errorf("e2e harness is missing native metadata proxy coverage marker %q", want)
+		}
+	}
+}
+
 func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
 	raw, err := os.ReadFile("e2e/harness.sh")
 	if err != nil {

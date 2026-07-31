@@ -133,6 +133,8 @@ type Resolved struct {
 	UserSecretKey                   string
 	SNIRoutingMode                  string
 	ManagedHostnameSuffixes         []string
+	MetadataHostnameSuffixes        []string
+	MetadataProxyMaxConns           int
 	DucklingBucketSuffix            string
 	DuckLakeDefaultSpecVersion      string
 
@@ -222,6 +224,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var userSecretKey string
 	var sniRoutingMode string
 	var managedHostnameSuffixes []string
+	var metadataHostnameSuffixes []string
+	metadataProxyMaxConnections := 20
 	var ducklingBucketSuffix string
 
 	if fileCfg != nil {
@@ -786,6 +790,18 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_MANAGED_HOSTNAME_SUFFIXES"); v != "" {
 		managedHostnameSuffixes = splitAndTrim(v, ",")
 	}
+	if v := getenv("DUCKGRES_METADATA_HOSTNAME_SUFFIXES"); v != "" {
+		metadataHostnameSuffixes = splitAndTrim(v, ",")
+	}
+	if v := getenv("DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			metadataProxyMaxConnections = n
+		} else if err != nil {
+			warn("Invalid DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG: " + err.Error())
+		} else {
+			warn("DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG must be > 0")
+		}
+	}
 	// Env-only (set by the duckgres Helm chart per environment). The env suffix
 	// the control plane uses to name a type=s3bucket Duckling's per-org bucket:
 	// posthog-duckling-<compact-org>-<suffix>. Must equal crossplane-config's
@@ -1244,6 +1260,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		UserSecretKey:                   userSecretKey,
 		SNIRoutingMode:                  sniRoutingMode,
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,
+		MetadataHostnameSuffixes:        metadataHostnameSuffixes,
+		MetadataProxyMaxConns:           metadataProxyMaxConnections,
 		DucklingBucketSuffix:            ducklingBucketSuffix,
 		DuckLakeDefaultSpecVersion:      cfg.DuckLake.SpecVersion,
 

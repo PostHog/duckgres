@@ -15,7 +15,15 @@ import "strings"
 // covers single-label prefixes, so a multi-label SNI ("evil.acme.dw...")
 // would have already failed TLS — but we keep the check as defense in depth.
 func (cp *ControlPlane) extractOrgFromSNI(sni string) (string, bool) {
-	for _, suffix := range cp.cfg.ManagedHostnameSuffixes {
+	return extractPrefixFromSNI(sni, cp.cfg.ManagedHostnameSuffixes)
+}
+
+func (cp *ControlPlane) extractMetadataOrgFromSNI(sni string) (string, bool) {
+	return extractPrefixFromSNI(sni, cp.cfg.MetadataHostnameSuffixes)
+}
+
+func extractPrefixFromSNI(sni string, suffixes []string) (string, bool) {
+	for _, suffix := range suffixes {
 		if !strings.HasSuffix(sni, suffix) {
 			continue
 		}
