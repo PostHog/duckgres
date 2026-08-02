@@ -1174,7 +1174,10 @@ func TestOrgTeamUpsertValidation(t *testing.T) {
 
 func TestOrgTeamUpsertCreatesAndLists(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.orgs["acme"] = &configstore.Org{
+		Name:                          "acme",
+		DataImportsTableNamingVersion: configstore.DataImportsTableNamingVersionCopyV1,
+	}
 	router := newTestRouter(store)
 
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
@@ -1198,13 +1201,17 @@ func TestOrgTeamUpsertCreatesAndLists(t *testing.T) {
 		t.Fatalf("list status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 	var listing struct {
-		Teams []configstore.OrgTeam `json:"teams"`
+		Teams                         []configstore.OrgTeam `json:"teams"`
+		DataImportsTableNamingVersion string                `json:"data_imports_table_naming_version"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &listing); err != nil {
 		t.Fatalf("decode listing: %v", err)
 	}
 	if len(listing.Teams) != 1 || listing.Teams[0].TeamID != 7 {
 		t.Fatalf("listing = %+v, want the created team", listing.Teams)
+	}
+	if listing.DataImportsTableNamingVersion != configstore.DataImportsTableNamingVersionCopyV1 {
+		t.Fatalf("data imports naming version = %q, want copy_v1", listing.DataImportsTableNamingVersion)
 	}
 }
 

@@ -52,7 +52,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 31)
 	requireGooseMigrationRecorded(t, db, 32)
 	requireGooseMigrationRecorded(t, db, 33)
-	requireGooseLatestVersion(t, db, 33)
+	requireGooseMigrationRecorded(t, db, 34)
+	requireGooseLatestVersion(t, db, 34)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -119,6 +120,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnNullable(t, db, "duckgres_org_teams", "persons_table_name")
 	requireColumnNullable(t, db, "duckgres_org_teams", "schema_data_imports_name")
 	requireUniqueIndex(t, db, "duckgres_org_teams", "org_id,schema_name")
+
+	// Migration 000034 preserves the table naming used by existing orgs while
+	// selecting the copy workflow naming for orgs created after deployment.
+	requireColumnNotNull(t, db, "duckgres_orgs", "data_imports_table_naming_version")
+	requireColumnDefault(t, db, "duckgres_orgs", "data_imports_table_naming_version", "'copy_v1'::character varying")
 
 	// Migration 000026 added PostHog's cached earliest-event date (nullable
 	// DATE — NULL until the PostHog sensor resolves it).
@@ -207,8 +213,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	t.Cleanup(func() {
 		_ = baselineDB.Close()
 	})
-
 	if err := store.DB().Exec(`
+			ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
 			ALTER TABLE duckgres_orgs DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
@@ -237,7 +243,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -284,7 +290,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 31)
 	requireGooseMigrationRecorded(t, upgradedDB, 32)
 	requireGooseMigrationRecorded(t, upgradedDB, 33)
-	requireGooseLatestVersion(t, upgradedDB, 33)
+	requireGooseMigrationRecorded(t, upgradedDB, 34)
+	requireGooseLatestVersion(t, upgradedDB, 34)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -300,6 +307,68 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
 	requireColumnDefault(t, upgradedDB, "duckgres_managed_warehouses", "metadata_proxy_enabled", "false")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "default_catalog")
+
+}
+
+func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
+	_, connStr := newIsolatedConfigStoreSchema(t)
+	store, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("create baseline config store: %v", err)
+	}
+	baselineDB := storeDB(t, store)
+	t.Cleanup(func() {
+		_ = baselineDB.Close()
+	})
+
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_orgs (name, database_name, created_at, updated_at)
+		VALUES ('existing-naming-policy', 'existing-naming-policy', now(), now());
+		ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
+		DELETE FROM goose_db_version WHERE version_id = 34;
+	`).Error; err != nil {
+		t.Fatalf("restore pre-migration-34 schema: %v", err)
+	}
+	requireGooseLatestVersion(t, baselineDB, 33)
+
+	upgradedStore, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("apply migration 34: %v", err)
+	}
+	upgradedDB := storeDB(t, upgradedStore)
+	t.Cleanup(func() {
+		_ = upgradedDB.Close()
+	})
+
+	var existingNamingVersion string
+	if err := upgradedStore.DB().Raw(`
+		SELECT data_imports_table_naming_version
+		FROM duckgres_orgs
+		WHERE name = 'existing-naming-policy'
+	`).Scan(&existingNamingVersion).Error; err != nil {
+		t.Fatalf("read existing org naming version: %v", err)
+	}
+	if existingNamingVersion != cpconfigstore.DataImportsTableNamingVersionLegacyBatchV1 {
+		t.Fatalf("existing org naming version = %q, want legacy_batch_v1", existingNamingVersion)
+	}
+
+	if err := upgradedStore.DB().Exec(`
+		INSERT INTO duckgres_orgs (name, database_name, created_at, updated_at)
+		VALUES ('new-naming-policy', 'new-naming-policy', now(), now())
+	`).Error; err != nil {
+		t.Fatalf("create org after naming migration: %v", err)
+	}
+	var newNamingVersion string
+	if err := upgradedStore.DB().Raw(`
+		SELECT data_imports_table_naming_version
+		FROM duckgres_orgs
+		WHERE name = 'new-naming-policy'
+	`).Scan(&newNamingVersion).Error; err != nil {
+		t.Fatalf("read new org naming version: %v", err)
+	}
+	if newNamingVersion != cpconfigstore.DataImportsTableNamingVersionCopyV1 {
+		t.Fatalf("new org naming version = %q, want copy_v1", newNamingVersion)
+	}
 }
 
 func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
@@ -368,6 +437,17 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	}
 	requireColumnAbsent(t, sqlDB, "duckgres_orgs", "max_connections")
 	requireGooseMigrationRecorded(t, sqlDB, 3)
+	var namingVersion string
+	if err := store.DB().Raw(`
+		SELECT data_imports_table_naming_version
+		FROM duckgres_orgs
+		WHERE name = 'old-org'
+	`).Scan(&namingVersion).Error; err != nil {
+		t.Fatalf("read migrated data imports naming version: %v", err)
+	}
+	if namingVersion != cpconfigstore.DataImportsTableNamingVersionLegacyBatchV1 {
+		t.Fatalf("migrated data imports naming version = %q, want legacy_batch_v1", namingVersion)
+	}
 
 	// Migration 000024 backfilled the legacy default_team_id value into the
 	// org's team row and dropped the column.

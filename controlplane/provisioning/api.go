@@ -602,6 +602,15 @@ type orgTeamUpsertRequest struct {
 
 func (h *handler) listOrgTeams(c *gin.Context) {
 	orgID := c.Param("id")
+	org, err := h.store.GetOrg(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	teams, err := h.store.ListOrgTeams(orgID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -611,7 +620,10 @@ func (h *handler) listOrgTeams(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"teams": teams})
+	c.JSON(http.StatusOK, gin.H{
+		"teams":                             teams,
+		"data_imports_table_naming_version": org.DataImportsTableNamingVersion,
+	})
 }
 
 // upsertOrgTeam creates or overwrites one (org, team) row. This endpoint IS
