@@ -82,7 +82,7 @@ jobs:
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
-      image-name: duckgres
+      image-name: duckgres-prs
       tag: pr-${{ github.event.pull_request.number || github.run_id }}-${{ github.sha }}-arm64
       platform: linux/arm64
       cache-scope: e2e-duckgres-arm64
@@ -95,7 +95,7 @@ jobs:
         DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
         POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
     secrets:
-      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+      ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
 
   e2e_lanes:
     needs: [build]
