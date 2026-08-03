@@ -26,7 +26,6 @@ import (
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
-	"github.com/posthog/duckgres/server/flightsqlingress"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -212,13 +211,11 @@ type ControlPlane struct {
 	cfg             ControlPlaneConfig
 	pool            WorkerPool      // non-nil in single-tenant process mode
 	sessions        *SessionManager // non-nil in single-tenant process mode
-	flight          *FlightIngress
 	rebalancer      *MemoryRebalancer
 	srv             *server.Server // Minimal server for cancel request routing
 	rateLimiter     *server.RateLimiter
 	tlsConfig       *tls.Config
 	pgListener      net.Listener
-	flightListener  net.Listener
 	upgrader        *tableflip.Upgrader
 	parentPID       int // tableflip parent PID (0 if first generation)
 	activeConns     int64
@@ -262,12 +259,6 @@ type ConfigStoreInterface interface {
 	// It accepts hostname_alias, database_name, and DNS-safe org names.
 	ResolveSNIPrefix(prefix string) (orgID, databaseName string)
 	ResolvePostgresConnection(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution
-	ValidateOrgUser(orgID, username, password string) bool
-	// ValidateOrgUserAndGetPassthrough does both lookups against the same
-	// snapshot — the auth path needs both, and a single read closes the
-	// window where the snapshot could swap between two separate calls.
-	// passthrough is always false when valid is false.
-	ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool)
 	// OrgWarehouseStatus reports an org's current warehouse provisioning state so
 	// connection-time errors can distinguish "no such org" from "warehouse not
 	// ready yet". Returns (state, orgExists). state is "" when the org has no
@@ -284,11 +275,6 @@ type ConfigStoreInterface interface {
 	// (the connecting user's team, else the org's oldest team; 0 when unknown).
 	// A config-snapshot read, no I/O — the same resolver the compute meter uses.
 	OrgUsageTeamID(orgID, username string) int64
-	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
-	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
-	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
-	CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error
-	CloseFlightSessionRecordIfReconnectTargetUnchanged(stale configstore.FlightSessionRecord, closedAt time.Time) (bool, error)
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
@@ -408,16 +394,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		os.Exit(1)
 	}
 
-	var flightLn net.Listener
-	if cfg.FlightPort > 0 {
-		flightAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.FlightPort)
-		flightLn, err = upg.Listen("tcp", flightAddr)
-		if err != nil {
-			slog.Error("Failed to listen.", "addr", flightAddr, "error", err)
-			os.Exit(1)
-		}
-	}
-
 	// Save the tableflip parent PID before it potentially exits and we get
 	// reparented to init. We need this to kill a stuck parent during future
 	// upgrades (tableflip requires the parent to exit before the child can
@@ -426,9 +402,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if upg.HasParent() {
 		parentPID = os.Getppid()
 		slog.Info("Upgrade complete, inherited PG listener.", "addr", pgLn.Addr().String())
-		if flightLn != nil {
-			slog.Info("Upgrade complete, inherited Flight listener.", "addr", flightLn.Addr().String())
-		}
 	}
 
 	if !isK8s {
@@ -525,7 +498,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		rateLimiter:     server.NewRateLimiter(cfg.RateLimit),
 		tlsConfig:       tlsCfg,
 		pgListener:      pgLn,
-		flightListener:  flightLn,
 		upgrader:        upg,
 		parentPID:       parentPID,
 		acmeManager:     acmeMgr,
@@ -652,11 +624,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		go pool.HealthCheckLoop(makeShutdownCtx(), cfg.HealthCheckInterval, onCrash, onProgress)
 	}
 
-	// Flight ingress is created after worker/session wiring, but the TCP
-	// listener itself is pre-bound via tableflip so upgrades inherit the
-	// socket instead of racing a re-bind on the old process's 8815 listener.
-	cp.startFlightIngress()
-
 	// Handle SIGUSR1 for graceful upgrade (process mode only)
 	if !isK8s {
 		go func() {
@@ -720,7 +687,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	slog.Info("Control plane listening.",
 		"pg_addr", cp.pgListener.Addr().String(),
-		"flight_addr", cp.flightAddr(),
 		"worker_backend", cfg.WorkerBackend,
 		"process_min_workers", processMinWorkers,
 		"process_max_workers", processMaxWorkers,
@@ -1950,10 +1916,6 @@ func fullRead(conn net.Conn, buf []byte) (int, error) {
 func (cp *ControlPlane) shutdown() {
 	cp.stopAcceptingPGConnections()
 	cp.beginSessionDrain()
-	if cp.flight != nil {
-		cp.flight.Shutdown()
-		cp.flight = nil
-	}
 	if cp.janitorLeader != nil {
 		cp.janitorLeader.Stop()
 	}
@@ -1975,15 +1937,12 @@ func (cp *ControlPlane) shutdown() {
 func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
 	cp.stopAcceptingPGConnections()
 	cp.beginSessionDrain()
-	if cp.flight != nil {
-		cp.flight.BeginDrain()
-	}
 	// Park idle (zero-session) Hot workers into hot_idle NOW, at drain start, so
 	// the hot-idle TTL reaper (or a peer-CP takeover) reclaims them during the
 	// drain wait below. Without this they linger for the entire — possibly
 	// unbounded — wait, because ShutdownAll (which cleans idle workers) runs only
 	// AFTER waitForDrain returns. No new sessions can land on them: PG accept is
-	// already closed and Flight is draining. Busy workers are untouched.
+	// already closed. Busy workers are untouched.
 	if cp.orgRouter != nil {
 		cp.orgRouter.ReleaseIdleHotWorkers()
 	}
@@ -1993,13 +1952,9 @@ func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
 		slog.Info("Waiting for planned shutdown drain (unbounded — k8s SIGKILL is the wall).")
 	}
 	if cp.waitForDrain(timeout) {
-		slog.Info("All pgwire connections and Flight sessions drained before shutdown.")
+		slog.Info("All pgwire connections drained before shutdown.")
 	} else {
 		slog.Warn("Planned shutdown drain timeout exceeded, forcing shutdown.", "timeout", timeout)
-	}
-	if cp.flight != nil {
-		cp.flight.Shutdown()
-		cp.flight = nil
 	}
 	// Final compute-usage flush after connections have drained to their natural
 	// end (best-effort, nil-safe). See billing plan §5.3.
@@ -2035,8 +1990,8 @@ func (cp *ControlPlane) beginPreReadyHandshake(ctx context.Context) (context.Con
 	return cp.preReady.begin(ctx)
 }
 
-// waitForDrain blocks until both the pgwire and Flight server report
-// zero in-flight work, or the timeout fires. timeout == 0 means
+// waitForDrain blocks until pgwire reports zero in-flight work or the timeout
+// fires. timeout == 0 means
 // unbounded — k8s terminationGracePeriodSeconds becomes the only wall.
 // Returns true on clean drain, false on timeout.
 func (cp *ControlPlane) waitForDrain(timeout time.Duration) bool {
@@ -2053,31 +2008,12 @@ func (cp *ControlPlane) waitForDrain(timeout time.Duration) bool {
 		close(pgDone)
 	}()
 
-	flightDone := make(chan bool, 1)
-	go func() {
-		if cp.flight != nil {
-			flightDone <- cp.flight.WaitForZeroSessions(ctx)
-			return
-		}
-		flightDone <- true
-	}()
-
-	pgClosed := false
-	flightClosed := false
-	for !pgClosed || !flightClosed {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-pgDone:
-			pgClosed = true
-		case drained := <-flightDone:
-			if !drained {
-				return false
-			}
-			flightClosed = true
-		}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-pgDone:
+		return true
 	}
-	return true
 }
 
 func (cp *ControlPlane) shutdownRuntimeResources() {
@@ -2120,10 +2056,7 @@ func (cp *ControlPlane) healthReady() bool {
 	if cp.isDraining() {
 		return false
 	}
-	if cp.cfg.FlightPort <= 0 {
-		return true
-	}
-	return cp.flight != nil && cp.flight.Healthy()
+	return true
 }
 
 func (cp *ControlPlane) stopQueryLogger() {
@@ -2183,9 +2116,6 @@ func (cp *ControlPlane) handleUpgrade() {
 		}
 		cp.acmeDNSManager = nil
 	}
-
-	// Flight ingress is NOT stopped here — the old CP keeps serving Flight
-	// SQL clients during the upgrade. It is shut down in drainAfterUpgrade.
 
 	if err := sdNotify("RELOADING=1"); err != nil {
 		slog.Warn("sd_notify RELOADING failed.", "error", err)
@@ -2274,13 +2204,6 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 	cp.stopAcceptingPGConnections()
 	cp.beginSessionDrain()
 
-	// Shut down Flight ingress only after the shared session-creation barrier is
-	// closed; Flight shutdown may block while existing RPCs unwind.
-	if cp.flight != nil {
-		cp.flight.Shutdown()
-		cp.flight = nil
-	}
-
 	// Wait for in-flight connections to finish (with timeout)
 	drainDone := make(chan struct{})
 	go func() {
@@ -2312,152 +2235,11 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 	os.Exit(0)
 }
 
-// startFlightIngress creates and starts the Flight SQL ingress listener.
-// cpFlightCredentialValidator authenticates Flight SQL clients in
-// multi-tenant mode. Identity is derived solely from the managed hostname
-// (SNI): the org is resolved from the SNI prefix and the user is authenticated
-// within that org. Flight has no `database` param, so there is no catalog
-// selection here — the per-user default catalog applies.
-type cpFlightCredentialValidator struct {
-	cp *ControlPlane
-}
-
-func (v *cpFlightCredentialValidator) ValidateCredentials(username, password string) bool {
-	return v.ValidateCredentialsForSNI("", username, password)
-}
-
-// ValidateCredentialsForSNI authenticates (username, password) against the org
-// the connection's managed hostname (SNI) resolves to. It does NOT stash the
-// resolved org anywhere keyed by username — session routing re-derives the org
-// from the same SNI at create time (orgRoutedSessionProvider.resolveOrg), so the
-// authenticated principal stays bound to this connection's hostname rather than
-// a shared username→org map that two tenants could collide on.
-func (v *cpFlightCredentialValidator) ValidateCredentialsForSNI(sni, username, password string) bool {
-	cp := v.cp
-	sniPrefix, isManaged := cp.extractOrgFromSNI(sni)
-	if !isManaged {
-		// A username alone can collide across orgs, so identity requires a
-		// managed hostname — there is no username-scan fallback.
-		slog.Warn("Flight auth rejected: SNI does not match a managed hostname.",
-			"sni", sni, "expected", cp.managedHostnameHint(), "user", username)
-		return false
-	}
-	orgID, dbname := cp.configStore.ResolveSNIPrefix(sniPrefix)
-	if orgID == "" {
-		slog.Warn("Flight client SNI references unknown org.",
-			"sni", sni, "sni_prefix", sniPrefix, "user", username)
-		return false
-	}
-	observeSNIRoutingResolution("flight", dbname != sniPrefix)
-	return cp.configStore.ValidateOrgUser(orgID, username, password)
-}
-
-// flightOrgFromContext resolves the org for a Flight session from the request
-// context's SNI (the managed hostname). Used by orgRoutedSessionProvider to bind
-// each session to its connection's org, mirroring the auth-time resolution.
-func (cp *ControlPlane) flightOrgFromContext(ctx context.Context) (string, bool) {
-	return cp.resolveFlightOrgFromSNI(flightsqlingress.SNIFromContext(ctx))
-}
-
-// resolveFlightOrgFromSNI maps a TLS ServerName to its org, returning ok=false
-// for unmanaged hostnames or prefixes that resolve to no org.
-func (cp *ControlPlane) resolveFlightOrgFromSNI(sni string) (orgID string, ok bool) {
-	prefix, isManaged := cp.extractOrgFromSNI(sni)
-	if !isManaged {
-		return "", false
-	}
-	orgID, _ = cp.configStore.ResolveSNIPrefix(prefix)
-	return orgID, orgID != ""
-}
-
-func (cp *ControlPlane) startFlightIngress() {
-	if cp.cfg.FlightPort <= 0 {
-		return
-	}
-
-	var validator flightsqlingress.CredentialValidator
-	var provider flightsqlingress.SessionProvider
-
-	switch {
-	case cp.configStore != nil && cp.orgRouter != nil:
-		// Multi-tenant: auth via config store, sessions routed per-org. The
-		// managed hostname (SNI) is authoritative for org identity at both auth
-		// and session-create time; there is no username-keyed routing state.
-		orgProvider := &orgRoutedSessionProvider{
-			orgRouter:   cp.orgRouter,
-			configStore: cp.configStore,
-			pidSession:  make(map[int32]flightOwnedSession),
-			resolveOrg:  cp.flightOrgFromContext,
-		}
-		validator = &cpFlightCredentialValidator{cp: cp}
-		provider = orgProvider
-	case cp.sessions != nil:
-		// Single-tenant: static users map, single session manager.
-		validator = &flightsqlingress.MapCredentialValidator{Users: cp.cfg.Users}
-		provider = &flightSessionProvider{sm: cp.sessions}
-	default:
-		slog.Warn("Flight ingress disabled: no session manager or config store available.")
-		return
-	}
-
-	flightCfg := FlightIngressConfig{
-		SessionIdleTTL:     cp.cfg.FlightSessionIdleTTL,
-		SessionReapTick:    cp.cfg.FlightSessionReapInterval,
-		HandleIdleTTL:      cp.cfg.FlightHandleIdleTTL,
-		SessionTokenTTL:    cp.cfg.FlightSessionTokenTTL,
-		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
-		// Persistent-secret DDL is intercepted on the PG wire protocol only;
-		// over Flight it would execute, never persist, and be wiped at the
-		// next session — reject it up front instead.
-		RejectPersistentSecretDDL: cp.srv != nil && cp.srv.UserSecretManager() != nil,
-	}
-	// Reshard drain: parked reconnectable Flight sessions hold their
-	// connection lease for up to the token TTL and would stall a reshard's
-	// drain step forever. Mark sessions of resharding orgs drain-requested so
-	// the periodic reap destroys them once truly parked (no txn/stream/query
-	// — in-flight work still finishes). Each CP handles only its own parked
-	// sessions; the resharding state arrives via the config snapshot.
-	if orgProvider, ok := provider.(*orgRoutedSessionProvider); ok {
-		flightCfg.ForceDrainSession = func(pid int32) bool {
-			orgProvider.mu.RLock()
-			owned, ok := orgProvider.pidSession[pid]
-			orgProvider.mu.RUnlock()
-			return ok && orgProvider.orgResharding(owned.orgID)
-		}
-	}
-
-	var (
-		flightIngress *FlightIngress
-		err           error
-	)
-	if cp.flightListener != nil {
-		flightIngress, err = NewFlightIngressFromListener(cp.flightListener, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
-	} else {
-		flightIngress, err = NewFlightIngress(cp.cfg.Host, cp.cfg.FlightPort, cp.tlsConfig, validator, provider, cp.rateLimiter, flightCfg)
-	}
-	if err != nil {
-		slog.Error("Failed to initialize Flight ingress, continuing without Flight SQL.", "error", err)
-		return
-	}
-
-	cp.flight = flightIngress
-	if router, ok := cp.orgRouter.(interface {
-		SetProjectScopedUserChangeHandler(func(orgID, username string))
-	}); ok {
-		router.SetProjectScopedUserChangeHandler(func(orgID, username string) {
-			flightIngress.DrainUserSessions(orgID, username)
-		})
-	}
-	cp.flight.Start()
-}
-
 // recoverAfterFailedReload restores all subsystems that were shut down in the
 // SIGUSR1 handler when the new CP fails to complete the upgrade.
 func (cp *ControlPlane) recoverAfterFailedReload() {
 	cp.recoverMetricsAfterFailedReload()
 	cp.recoverACMEAfterFailedReload()
-	// Flight ingress is NOT shut down in the SIGUSR1 handler (it keeps
-	// serving during upgrade), so no recovery is needed here.
 }
 
 func (cp *ControlPlane) recoverMetricsAfterFailedReload() {
@@ -2507,11 +2289,4 @@ func (cp *ControlPlane) recoverACMEAfterFailedReload() {
 	cp.acmeManager = mgr
 	cp.tlsConfig = mgr.TLSConfig()
 	slog.Info("Recovered ACME manager after reload failure.")
-}
-
-func (cp *ControlPlane) flightAddr() string {
-	if cp.flight == nil {
-		return "disabled"
-	}
-	return cp.flight.Addr()
 }

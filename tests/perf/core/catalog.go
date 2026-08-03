@@ -42,7 +42,7 @@ func validateCatalog(c Catalog) error {
 	}
 	seenTargets := map[Protocol]struct{}{}
 	for _, target := range c.Targets {
-		if target != ProtocolPGWire && target != ProtocolFlight {
+		if target != ProtocolPGWire {
 			return fmt.Errorf("unsupported target protocol %q", target)
 		}
 		if _, ok := seenTargets[target]; ok {
@@ -68,9 +68,6 @@ func validateCatalog(c Catalog) error {
 		if q.PGWireSQL == "" {
 			return fmt.Errorf("query %s missing pgwire_sql", q.QueryID)
 		}
-		if q.DuckhogSQL == "" {
-			return fmt.Errorf("query %s missing duckhog_sql", q.QueryID)
-		}
 	}
 	return nil
 }
@@ -78,9 +75,6 @@ func validateCatalog(c Catalog) error {
 func ValidateReadOnlyCatalog(c Catalog) error {
 	for _, q := range c.Queries {
 		if err := validateSelectOnlySQL("pgwire_sql", q.QueryID, q.PGWireSQL); err != nil {
-			return err
-		}
-		if err := validateSelectOnlySQL("duckhog_sql", q.QueryID, q.DuckhogSQL); err != nil {
 			return err
 		}
 	}

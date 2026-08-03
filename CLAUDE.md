@@ -90,7 +90,7 @@ existing cancellation locality: a synthetic-key miss on another replica is
 absorbed and counted by
 `duckgres_metadata_proxy_cancel_requests_total{outcome="not_local"}`.
 
-In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingress (`--flight-port`) for clients that prefer Flight over the PG wire protocol.
+In topologies 2 and 3, the control plane exposes only PostgreSQL wire protocol to clients. Arrow Flight SQL is internal transport between the control plane and workers.
 
 ### Key Components
 
@@ -103,10 +103,8 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - DuckLake: `ducklake_migration.go`, `checkpoint.go`
   - Observability: `querylog.go`, `tracing.go`
   - ProcessIsolation child workers: `parent.go`, `worker.go`, `worker_activation.go`, `worker_control.go`
-  - Flight SQL ingress (shared with control plane): `flightsqlingress/`
 - **controlplane/** — Multi-process / multi-tenant control plane
   - Core: `control.go`, `session_mgr.go`, `worker_mgr.go`, `worker_pool.go` (process/k8s abstraction), `validation.go`, `sdnotify.go`
-  - Flight SQL ingress adapter: `flight_ingress.go`
   - Runtime loops: `janitor.go`, `leader_loop.go`, `memory_rebalancer.go`, `runtime_tracker.go`
   - K8s / multitenant under build tag `kubernetes` (including: `multitenant.go`, `k8s_pool.go`, `k8s_pool_acquire.go`, `k8s_pool_spawn.go`, `k8s_pool_lifecycle.go`, `k8s_pool_reconcile.go`, `k8s_pool_helpers.go`, `k8s_factory.go`, `org_router.go`, `org_reserved_pool.go`, `sts_broker.go`, `shared_worker_activator.go`, `worker_rpc_security.go`, `janitor_leader_k8s.go`)
   - Subpackages: `admin/` (HTTP admin API + dashboard, `kubernetes` tag; includes the models explorer UI `static/models.html` + `models_api.go`, and `devserver/` for local UI dev against a port-forwarded CP — see `admin/README.md`), `provisioner/` (k8s controller, `kubernetes` tag), `provisioning/` (HTTP API), `configstore/` (Postgres-backed config)
@@ -120,7 +118,7 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
 ## Run Modes
 
 - **standalone** (default): Single process, handles everything including TLS, auth, PG protocol, and DuckDB execution.
-- **control-plane**: Multi-process. Owns client connections end-to-end (TLS, auth, PG wire protocol, SQL transpilation, optional Flight SQL ingress) and routes queries to a worker pool.
+- **control-plane**: Multi-process. Owns pgwire client connections end-to-end (TLS, auth, protocol handling, SQL transpilation) and routes queries to a worker pool.
   - **Process backend** (default, `--worker-backend process`): local Flight SQL workers over Unix sockets.
   - **Remote backend** (`--worker-backend remote`): per-org Kubernetes worker pods over TCP+TLS. Multitenant; requires `-tags kubernetes` and a Postgres-backed config store. Adds config store, org router, runtime tracker, janitor/leader election, and a provisioning/admin HTTP API.
 - **duckdb-service**: Thin DuckDB execution engine exposed via Arrow Flight SQL. Spawned automatically by the control plane as worker processes, or run standalone for testing.
@@ -136,7 +134,6 @@ Key CLI flags for control-plane mode:
 - `--memory-budget SIZE` (default 75% RAM) / `--memory-rebalance`
 - `--socket-dir /path` (process backend)
 - `--handover-drain-timeout DURATION` (default `24h` process; **remote default is `0` = unbounded** — the CP waits for active sessions for as long as it takes and the pod's k8s `terminationGracePeriodSeconds` is the only hard wall. cloudflare/tableflip FD passing applies to process/standalone single-host upgrades, not k8s pod replacement.)
-- `--flight-port N` (Arrow Flight SQL ingress) plus `--flight-session-idle-ttl`, `--flight-session-reap-interval`, `--flight-handle-idle-ttl`, `--flight-session-token-ttl`
 - `--ducklake-delta-catalog-enabled` / `--ducklake-delta-catalog-path`
 - Remote backend (requires `--config-store`; `-tags kubernetes` for K8s pool):
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
@@ -391,10 +388,9 @@ Invariants for anyone touching this path:
   secret will NOT survive the session. Replay failures at session create are
   warnings, never connection refusals.
 - **No silent non-persistence.** Any path where persistent-secret DDL would
-  execute but not persist must REJECT instead: multi-statement batches and
-  parameterized statements (CP interception), and the Flight SQL ingress
-  (`flightsqlingress.Config.RejectPersistentSecretDDL`). Otherwise the secret
-  works for one session and is silently deleted by the next session's wipe.
+  execute but not persist must REJECT instead, including multi-statement batches
+  and parameterized statements in the control-plane interception path. Otherwise
+  the secret works for one session and is silently deleted by the next session's wipe.
 - **DROP's store-fallback is gated on DuckDB's not-found error only**
   (`isSecretNotFoundError`). Any other exec failure (cancel, RPC error,
   ambiguity, aborted txn) must surface and leave the store untouched — a
@@ -488,11 +484,10 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   - `POST …/users/:username/disable` is the **persistent block**: it sets the
     `duckgres_org_users.disabled` column (goose migration
     `000011_add_org_user_disabled.sql`), kills the user's live sessions, AND
-    refuses the user's NEW connections at auth time on BOTH front-ends — PG wire
-    (`control.go`, distinct `28000` "account is disabled" error, emitted only
-    after the password checks out so it never leaks account existence) and Flight
-    (`ConfigStore.ValidateOrgUser` / `ValidateOrgUserAndGetPassthrough` return
-    false). `enable` reverses it. The disabled state is read from the in-memory
+    refuses the user's NEW pgwire connections at auth time (`control.go`,
+    distinct `28000` "account is disabled" error, emitted only after the
+    password checks out so it never leaks account existence). `enable` reverses
+    it. The disabled state is read from the in-memory
     snapshot, so disable/enable call `ConfigStore.ReloadSnapshot()` to make the
     flip effective immediately instead of one config-poll later.
   - These are **cluster-wide**: a user's sessions live on whichever CP replica
@@ -577,7 +572,7 @@ Invariants:
   missing or disabled gets an empty, `ReadOnly` policy — a project user is
   DOWNGRADED, never left writing into a scope nothing can confirm.
 - **`QueryAccessPolicy.Authorize` (`server/query_access.go`) is the single tap**,
-  called on simple query, extended Parse, and both Flight paths. It is
+  called on simple query and extended Parse. It is
   default-deny: the parser is the authorization boundary, so anything
   `pg_query` cannot describe is rejected (this is why DuckDB-only spellings
   fail). `CREATE SCHEMA` / `ALTER … SET SCHEMA` stay denied: the schema set IS
@@ -852,8 +847,7 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
 - **Drain, never kill**: live queries always finish. Drain = leases==0 AND
   queue==0 (one tx) AND zero live org workers (each runs a catalog-writing
   `DuckLakeCheckpointer`). Lingering hot-idle workers are retired via the
-  standard CAS retire path only — never raw pod deletes. Parked reconnectable
-  Flight sessions are destroyed locally per CP (they'd hold leases ~1h).
+  standard CAS retire path only — never raw pod deletes.
 - **Flip semantics differ by direction**: a `cnpgShard` change re-points
   role/DB in place (source ORPHANED — explicit cleanup after verify); a TYPE
   flip to external un-renders the cnpg MRs, and whether Crossplane then DELETES

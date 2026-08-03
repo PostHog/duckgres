@@ -20,28 +20,25 @@ import (
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/tests/perf/core"
 	"github.com/posthog/duckgres/tests/perf/datasets"
-	flightdriver "github.com/posthog/duckgres/tests/perf/drivers/flight"
 	pgdriver "github.com/posthog/duckgres/tests/perf/drivers/pgwire"
 	"github.com/posthog/duckgres/tests/perf/publisher"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
-	perfRun                   = flag.Bool("perf-run", false, "run the perf harness against the configured catalog")
-	perfCatalog               = flag.String("perf-catalog", "queries/smoke.yaml", "path to perf catalog yaml")
-	perfOutputBase            = flag.String("perf-output-base", filepath.Clean("../../artifacts/perf"), "base output directory for perf artifacts")
-	perfRunID                 = flag.String("perf-run-id", "", "override run id; default is timestamp")
-	perfMetricsAddr           = flag.String("perf-metrics-addr", ":9095", "runner metrics listen address")
-	perfPGWireDSN             = flag.String("perf-pgwire-dsn", "", "optional pre-existing pgwire DSN; if empty harness auto-starts duckgres")
-	perfFlightAddr            = flag.String("perf-flight-addr", "", "optional pre-existing flight address host:port; if empty harness auto-starts duckgres")
-	perfUsername              = flag.String("perf-username", "perfuser", "username for harness-created duckgres")
-	perfPassword              = flag.String("perf-password", "perfpass", "password for harness-created duckgres")
-	perfFlightInsecureSkipTLS = flag.Bool("perf-flight-insecure-skip-verify", true, "skip TLS cert verification for Flight client")
-	perfDatasetManifestTable  = flag.String("perf-dataset-manifest-table", envOrDefault("DUCKGRES_PERF_DATASET_MANIFEST_TABLE", defaultDatasetManifestTable), "manifest table associated with frozen dataset runs")
-	perfPublishDSN            = flag.String("perf-publish-dsn", os.Getenv("DUCKGRES_PERF_PUBLISH_DSN"), "optional Duckgres DSN for publishing perf artifacts")
-	perfPublishPassword       = flag.String("perf-publish-password", os.Getenv("DUCKGRES_PERF_PUBLISH_PASSWORD"), "optional password override for the perf artifact publisher")
-	perfPublishSchema         = flag.String("perf-publish-schema", envOrDefault("DUCKGRES_PERF_PUBLISH_SCHEMA", "duckgres_perf"), "target schema for published perf artifacts")
-	perfPublishBootstrap      = flag.Bool("perf-publish-bootstrap-schema", envBoolOrDefault("DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA", true), "bootstrap publisher schema/table definitions before inserting rows")
+	perfRun                  = flag.Bool("perf-run", false, "run the perf harness against the configured catalog")
+	perfCatalog              = flag.String("perf-catalog", "queries/smoke.yaml", "path to perf catalog yaml")
+	perfOutputBase           = flag.String("perf-output-base", filepath.Clean("../../artifacts/perf"), "base output directory for perf artifacts")
+	perfRunID                = flag.String("perf-run-id", "", "override run id; default is timestamp")
+	perfMetricsAddr          = flag.String("perf-metrics-addr", ":9095", "runner metrics listen address")
+	perfPGWireDSN            = flag.String("perf-pgwire-dsn", "", "optional pre-existing pgwire DSN; if empty harness auto-starts duckgres")
+	perfUsername             = flag.String("perf-username", "perfuser", "username for harness-created duckgres")
+	perfPassword             = flag.String("perf-password", "perfpass", "password for harness-created duckgres")
+	perfDatasetManifestTable = flag.String("perf-dataset-manifest-table", envOrDefault("DUCKGRES_PERF_DATASET_MANIFEST_TABLE", defaultDatasetManifestTable), "manifest table associated with frozen dataset runs")
+	perfPublishDSN           = flag.String("perf-publish-dsn", os.Getenv("DUCKGRES_PERF_PUBLISH_DSN"), "optional Duckgres DSN for publishing perf artifacts")
+	perfPublishPassword      = flag.String("perf-publish-password", os.Getenv("DUCKGRES_PERF_PUBLISH_PASSWORD"), "optional password override for the perf artifact publisher")
+	perfPublishSchema        = flag.String("perf-publish-schema", envOrDefault("DUCKGRES_PERF_PUBLISH_SCHEMA", "duckgres_perf"), "target schema for published perf artifacts")
+	perfPublishBootstrap     = flag.Bool("perf-publish-bootstrap-schema", envBoolOrDefault("DUCKGRES_PERF_PUBLISH_BOOTSTRAP_SCHEMA", true), "bootstrap publisher schema/table definitions before inserting rows")
 )
 
 func TestGoldenQueryPerformanceHarness(t *testing.T) {
@@ -80,16 +77,14 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 	}
 
 	pgwireDSN := *perfPGWireDSN
-	flightAddr := *perfFlightAddr
 	var cpLogs bytes.Buffer
-	if pgwireDSN == "" || flightAddr == "" {
+	if pgwireDSN == "" {
 		h, err := startLocalDuckgres(t, *perfUsername, *perfPassword, &cpLogs)
 		if err != nil {
 			t.Fatalf("start local duckgres: %v", err)
 		}
 		t.Cleanup(func() { h.cleanup() })
 		pgwireDSN = h.pgwireDSN
-		flightAddr = h.flightAddr
 	}
 	pgwireDSN, err = pgwireDSNForHarness(pgwireDSN, *perfPassword)
 	if err != nil {
@@ -102,19 +97,12 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pg.Close() })
 
-	flight, err := flightdriver.NewFromAddress(flightAddr, *perfUsername, *perfPassword, *perfFlightInsecureSkipTLS)
-	if err != nil {
-		t.Fatalf("NewFromAddress(%s): %v", flightAddr, err)
-	}
-	t.Cleanup(func() { _ = flight.Close() })
-
 	runner := core.NewQueryRunner(core.RunnerConfig{
 		RunID:          runID,
 		Catalog:        catalog,
 		DatasetVersion: runtimeContract.DatasetVersion,
 		Drivers: map[core.Protocol]core.ProtocolDriver{
 			core.ProtocolPGWire: pg,
-			core.ProtocolFlight: flight,
 		},
 		Sink: sink,
 		OnSetup: func(ctx context.Context) error {
@@ -127,9 +115,6 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 			}
 			if err := seedDatasetViaDriver(ctx, pg, records); err != nil {
 				return fmt.Errorf("seed pgwire driver: %w", err)
-			}
-			if err := seedDatasetViaDriver(ctx, flight, records); err != nil {
-				return fmt.Errorf("seed flight driver: %w", err)
 			}
 			return nil
 		},
@@ -231,10 +216,9 @@ CREATE TABLE IF NOT EXISTS perf_orders(
 	if _, err := driver.Execute(
 		ctx,
 		core.Query{
-			QueryID:    "setup_create_perf_orders",
-			IntentID:   "setup_create_perf_orders",
-			PGWireSQL:  createSQL,
-			DuckhogSQL: createSQL,
+			QueryID:   "setup_create_perf_orders",
+			IntentID:  "setup_create_perf_orders",
+			PGWireSQL: createSQL,
 		},
 		nil,
 	); err != nil {
@@ -244,10 +228,9 @@ CREATE TABLE IF NOT EXISTS perf_orders(
 	if _, err := driver.Execute(
 		ctx,
 		core.Query{
-			QueryID:    "setup_clear_perf_orders",
-			IntentID:   "setup_clear_perf_orders",
-			PGWireSQL:  "DELETE FROM perf_orders",
-			DuckhogSQL: "DELETE FROM perf_orders",
+			QueryID:   "setup_clear_perf_orders",
+			IntentID:  "setup_clear_perf_orders",
+			PGWireSQL: "DELETE FROM perf_orders",
 		},
 		nil,
 	); err != nil {
@@ -264,10 +247,9 @@ CREATE TABLE IF NOT EXISTS perf_orders(
 		if _, err := driver.Execute(
 			ctx,
 			core.Query{
-				QueryID:    "setup_insert_perf_orders",
-				IntentID:   "setup_insert_perf_orders",
-				PGWireSQL:  insertSQL,
-				DuckhogSQL: insertSQL,
+				QueryID:   "setup_insert_perf_orders",
+				IntentID:  "setup_insert_perf_orders",
+				PGWireSQL: insertSQL,
 			},
 			nil,
 		); err != nil {
@@ -279,10 +261,9 @@ CREATE TABLE IF NOT EXISTS perf_orders(
 }
 
 type localDuckgres struct {
-	cmd        *exec.Cmd
-	pgwireDSN  string
-	flightAddr string
-	socketDir  string
+	cmd       *exec.Cmd
+	pgwireDSN string
+	socketDir string
 }
 
 func startLocalDuckgres(t *testing.T, username, password string, logOutput *bytes.Buffer) (*localDuckgres, error) {
@@ -310,11 +291,6 @@ func startLocalDuckgres(t *testing.T, username, password string, logOutput *byte
 	if err != nil {
 		return nil, fmt.Errorf("allocate pgwire port: %w", err)
 	}
-	flightPort, err := freePort()
-	if err != nil {
-		return nil, fmt.Errorf("allocate flight port: %w", err)
-	}
-
 	dataDir := filepath.Join(tmpDir, "data")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
@@ -327,14 +303,13 @@ func startLocalDuckgres(t *testing.T, username, password string, logOutput *byte
 	cfgPath := filepath.Join(tmpDir, "duckgres.yaml")
 	cfg := fmt.Sprintf(`host: 127.0.0.1
 port: %d
-flight_port: %d
 data_dir: %s
 tls:
   cert: %s
   key: %s
 users:
   %s: %s
-`, port, flightPort, dataDir, certPath, keyPath, username, password)
+`, port, dataDir, certPath, keyPath, username, password)
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		return nil, fmt.Errorf("write config: %w", err)
 	}
@@ -363,10 +338,9 @@ users:
 	}
 
 	return &localDuckgres{
-		cmd:        cmd,
-		pgwireDSN:  dsn,
-		flightAddr: fmt.Sprintf("127.0.0.1:%d", flightPort),
-		socketDir:  socketDir,
+		cmd:       cmd,
+		pgwireDSN: dsn,
+		socketDir: socketDir,
 	}, nil
 }
 

@@ -133,7 +133,6 @@ type RuntimeWorkerStore interface {
 	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
 	GetWorkerRecord(workerID int) (*configstore.WorkerRecord, error)
 	ObserveWorker(workerID int) (*configstore.WorkerSnapshot, error)
-	TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*configstore.WorkerRecord, error)
 }
 
 // K8sPoolFactory creates a K8sWorkerPool. Registered at init time by the

@@ -79,7 +79,7 @@ func main() {
 	mode := flag.String("mode", "control-plane", "Run mode: control-plane (default) or reshard-runner (dedicated per-operation reshard pod)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Duckgres control plane %s — PostgreSQL wire protocol + Flight ingress\n\n", version)
+		fmt.Fprintf(os.Stderr, "Duckgres control plane %s — PostgreSQL wire protocol\n\n", version)
 		fmt.Fprintln(os.Stderr, "Control-plane-only duckgres binary. Does NOT link libduckdb.")
 		fmt.Fprintln(os.Stderr, "Routes all SQL execution to remote duckdb-service worker pods")
 		fmt.Fprintln(os.Stderr, "via Arrow Flight SQL.")

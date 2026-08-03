@@ -7,8 +7,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-// --- Per-org metrics (multi-tenant mode) ---
-
 var orgSessionsActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_org_sessions_active",
 	Help: "Number of active sessions per org",
@@ -19,20 +17,11 @@ var orgWorkerCrashesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help: "Total worker crashes per org",
 }, []string{"org"})
 
-// orgPgSessionsAcceptedCounter tracks every PG session that completes auth and
-// is dispatched to a worker, partitioned by org and passthrough mode. Useful
-// for spotting unexpected passthrough usage spikes (a misconfigured client) or
-// validating that a newly onboarded org is actually getting traffic.
 var orgPgSessionsAcceptedCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_org_pg_sessions_accepted_total",
 	Help: "Total PG sessions accepted by the control plane, partitioned by org and passthrough mode",
 }, []string{"org", "passthrough"})
 
-// sniRoutingResolutionsCounter counts how SNI hostname prefixes resolve to a
-// database_name: via hostname_alias (translated) vs. as-is (alias absent or
-// prefix already equals dbname). Use to spot operators relying on the alias
-// path and to validate alias rollouts. Labelled by protocol so PG and Flight
-// can be analyzed separately.
 var sniRoutingResolutionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_sni_routing_resolutions_total",
 	Help: "SNI hostname prefix resolutions, partitioned by whether a hostname_alias was used",

@@ -35,7 +35,7 @@ Operator laptop (tailnet, group:managed-warehouse/engineering)
        audit middleware: append-only record of every mutation + impersonation
 ```
 
-Ports (unchanged): PG 5432, Flight 8815, **admin/api 8080**, Prometheus `/metrics` 9090.
+Ports: PG 5432, **admin/api 8080**, Prometheus `/metrics` 9090.
 
 ## Backend changes (`controlplane/admin/` + `controlplane/multitenant.go`)
 
@@ -94,7 +94,7 @@ org's connection limits, appears in the customer's session accounting) — audit
 ### 5. Config-store write coverage — extend `api.go`
 Existing typed CRUD covers orgs/users/warehouse/pinning. Add: `org_user_secrets`
 list+delete (configstore `DeleteOrgUserSecret` already exists, currently unrouted). Keep
-runtime tables (`worker_records`/`flight_session_records`/leases/queue) **read-only** in
+runtime tables (`worker_records`/leases/queue) **read-only** in
 the models explorer; any force-action (force-retire a wedged worker) must route through the
 existing epoch/CAS-fenced methods, never raw edits. Render warehouse `*_state` columns
 read-only (hand-editing desyncs the provisioner state machine).

@@ -559,35 +559,6 @@ func isDuplicateRuntimeWorkerClaim(worker *ManagedWorker, claimed *configstore.W
 	return state.Assignment.OrgID == assignment.OrgID
 }
 
-func (p *K8sWorkerPool) claimSpecificWorker(ctx context.Context, workerID int, expectedOwnerEpoch int64, assignment *WorkerAssignment) (*ManagedWorker, error) {
-	if p.runtimeStore == nil {
-		return nil, fmt.Errorf("runtime worker store is not configured")
-	}
-	if err := validateWorkerAssignment(assignment); err != nil {
-		return nil, err
-	}
-	record, err := p.runtimeStore.TakeOverWorker(workerID, p.cpInstanceID, assignment.OrgID, expectedOwnerEpoch)
-	if err != nil {
-		if stderrors.Is(err, configstore.ErrWorkerOwnerEpochMismatch) {
-			return nil, fmt.Errorf("worker %d ownership changed before takeover: %w", workerID, err)
-		}
-		return nil, err
-	}
-	if record == nil {
-		return nil, fmt.Errorf("worker %d could not be claimed", workerID)
-	}
-
-	if assignment.Image != "" && record.Image != assignment.Image {
-		return nil, fmt.Errorf("worker %d image mismatch (expected %q, got %q)", workerID, assignment.Image, record.Image)
-	}
-	if expCPU, expMem := assignment.Profile.Parts(); record.ProfileCPU != expCPU || record.ProfileMemory != expMem {
-		return nil, fmt.Errorf("worker %d profile mismatch (expected %s/%s, got %s/%s)",
-			workerID, expCPU, expMem, record.ProfileCPU, record.ProfileMemory)
-	}
-
-	return p.reserveClaimedWorker(ctx, record, assignment)
-}
-
 func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configstore.WorkerRecord) (*ManagedWorker, error) {
 	token, _, err := p.readWorkerRPCSecurity(ctx, claimed.PodName)
 	if err != nil {

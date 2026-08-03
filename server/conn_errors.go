@@ -141,9 +141,9 @@ func unwrapFlightError(msg string) string {
 		msg = msg[idx+len("desc = "):]
 	}
 	msg = strings.TrimSpace(msg)
-	// The worker's Flight SQL ingress wraps the raw DuckDB error one more time
+	// The worker's Flight SQL handler wraps the raw DuckDB error one more time
 	// with "failed to execute query: " / "failed to execute update: " (see
-	// server/flightsqlingress/ingress.go). That sits between "desc = " and the
+	// duckdbservice/flight_handler.go). That sits between "desc = " and the
 	// DuckDB exception prefix, so without stripping it the HasPrefix("Catalog
 	// Error:" …) classifiers below all miss and the error falls through to
 	// XX000. Strip any one such worker prefix so classification sees the bare

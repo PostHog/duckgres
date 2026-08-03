@@ -39,7 +39,6 @@ type OrgRouter struct {
 	nextWorkerID          atomic.Int32
 	draining              atomic.Bool
 	sharedCancel          context.CancelFunc
-	projectScopedUserChange   func(orgID, username string)
 	admissionReclaimer    admissionReclaimer
 	terminal              bool // protected by mu; no stack operation may start after this is set
 	stackOps              sync.WaitGroup
@@ -647,12 +646,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			tr.srv.DrainUserConnections(key.OrgID, key.Username)
 		}
 		tr.mu.RLock()
-		onProjectScopedUserChange := tr.projectScopedUserChange
-		tr.mu.RUnlock()
-		if onProjectScopedUserChange != nil {
-			onProjectScopedUserChange(key.OrgID, key.Username)
-		}
-		tr.mu.RLock()
 		stack := tr.orgs[key.OrgID]
 		tr.mu.RUnlock()
 		if stack != nil && stack.Sessions != nil {
@@ -683,12 +676,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			slog.Error("Failed to reconcile org stack on config change.", "org", name, "error", err)
 		}
 	}
-}
-
-func (tr *OrgRouter) setProjectScopedUserChangeHandler(handler func(orgID, username string)) {
-	tr.mu.Lock()
-	defer tr.mu.Unlock()
-	tr.projectScopedUserChange = handler
 }
 
 // changedProjectScopedUsers reports the project-scoped logins (reader OR user)

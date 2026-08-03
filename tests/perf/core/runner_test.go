@@ -33,7 +33,6 @@ func (s *inMemorySink) Close(RunSummary, string) error { return nil }
 
 func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 	pg := &testDriver{protocol: ProtocolPGWire}
-	fl := &testDriver{protocol: ProtocolFlight}
 	sink := &inMemorySink{}
 
 	setupCalled := 0
@@ -43,19 +42,17 @@ func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 			Name:              "smoke",
 			WarmupIterations:  1,
 			MeasureIterations: 2,
-			Targets:           []Protocol{ProtocolPGWire, ProtocolFlight},
+			Targets:           []Protocol{ProtocolPGWire},
 			Queries: []Query{
 				{
-					QueryID:    "q1",
-					IntentID:   "i1",
-					PGWireSQL:  "SELECT 1",
-					DuckhogSQL: "SELECT 1",
+					QueryID:   "q1",
+					IntentID:  "i1",
+					PGWireSQL: "SELECT 1",
 				},
 			},
 		},
 		Drivers: map[Protocol]ProtocolDriver{
 			ProtocolPGWire: pg,
-			ProtocolFlight: fl,
 		},
 		Sink:           sink,
 		DatasetVersion: "v1",
@@ -77,24 +74,22 @@ func TestRunnerLifecycleAndPerQueryRecording(t *testing.T) {
 	if setupCalled != 1 || teardownCalled != 1 {
 		t.Fatalf("expected setup/teardown once, got %d/%d", setupCalled, teardownCalled)
 	}
-	if pg.calls != 3 || fl.calls != 3 {
-		t.Fatalf("expected each driver to run 3 times (warmup+measure), got pg=%d flight=%d", pg.calls, fl.calls)
+	if pg.calls != 3 {
+		t.Fatalf("expected pgwire driver to run 3 times (warmup+measure), got %d", pg.calls)
 	}
-	if len(sink.results) != 4 {
-		t.Fatalf("expected 4 measured records, got %d", len(sink.results))
+	if len(sink.results) != 2 {
+		t.Fatalf("expected 2 measured records, got %d", len(sink.results))
 	}
 	for i, got := range []int{
 		sink.results[0].MeasureIteration,
 		sink.results[1].MeasureIteration,
-		sink.results[2].MeasureIteration,
-		sink.results[3].MeasureIteration,
 	} {
-		want := (i / 2) + 1
+		want := i + 1
 		if got != want {
 			t.Fatalf("result %d measure iteration = %d, want %d", i, got, want)
 		}
 	}
-	if summary.TotalQueries != 4 || summary.TotalErrors != 0 {
+	if summary.TotalQueries != 2 || summary.TotalErrors != 0 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
 	if summary.DatasetVersion != "v1" {
@@ -115,10 +110,9 @@ func TestRunnerUsesConfiguredRunID(t *testing.T) {
 			Targets:           []Protocol{ProtocolPGWire},
 			Queries: []Query{
 				{
-					QueryID:    "q1",
-					IntentID:   "i1",
-					PGWireSQL:  "SELECT 1",
-					DuckhogSQL: "SELECT 1",
+					QueryID:   "q1",
+					IntentID:  "i1",
+					PGWireSQL: "SELECT 1",
 				},
 			},
 		},

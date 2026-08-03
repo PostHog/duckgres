@@ -24,11 +24,6 @@ import "flag"
 func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	host := fs.String("host", "", "Host to bind to (env: DUCKGRES_HOST)")
 	port := fs.Int("port", 0, "Port to listen on (env: DUCKGRES_PORT)")
-	flightPort := fs.Int("flight-port", 0, "Control-plane Arrow Flight SQL ingress port, 0=disabled (env: DUCKGRES_FLIGHT_PORT)")
-	flightSessionIdleTTL := fs.String("flight-session-idle-ttl", "", "Flight auth session idle TTL (e.g., '10m') (env: DUCKGRES_FLIGHT_SESSION_IDLE_TTL)")
-	flightSessionReapInterval := fs.String("flight-session-reap-interval", "", "Flight auth session reap interval (e.g., '1m') (env: DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL)")
-	flightHandleIdleTTL := fs.String("flight-handle-idle-ttl", "", "Flight prepared/query handle idle TTL (e.g., '15m') (env: DUCKGRES_FLIGHT_HANDLE_IDLE_TTL)")
-	flightSessionTokenTTL := fs.String("flight-session-token-ttl", "", "Flight issued session token absolute TTL (e.g., '1h') (env: DUCKGRES_FLIGHT_SESSION_TOKEN_TTL)")
 	dataDir := fs.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := fs.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := fs.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
@@ -83,11 +78,6 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		})
 		cli.Host = *host
 		cli.Port = *port
-		cli.FlightPort = *flightPort
-		cli.FlightSessionIdleTTL = *flightSessionIdleTTL
-		cli.FlightSessionReapInterval = *flightSessionReapInterval
-		cli.FlightHandleIdleTTL = *flightHandleIdleTTL
-		cli.FlightSessionTokenTTL = *flightSessionTokenTTL
 		cli.DataDir = *dataDir
 		cli.CertFile = *certFile
 		cli.KeyFile = *keyFile

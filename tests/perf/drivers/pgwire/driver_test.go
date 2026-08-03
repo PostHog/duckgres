@@ -22,10 +22,9 @@ func TestDriverUsesPGWireVariant(t *testing.T) {
 	exec := &fakeExec{}
 	driver := NewWithExecutor(exec)
 	_, err := driver.Execute(context.Background(), core.Query{
-		QueryID:    "q1",
-		IntentID:   "i1",
-		PGWireSQL:  "SELECT 1",
-		DuckhogSQL: "SELECT 2",
+		QueryID:   "q1",
+		IntentID:  "i1",
+		PGWireSQL: "SELECT 1",
 	}, nil)
 	if err != nil {
 		t.Fatalf("Execute returned error: %v", err)

@@ -161,7 +161,7 @@ export function UsersPage() {
     <>
       <PageHeader
         title="Org Users"
-        description="Per-org database login accounts your customers use to connect to their warehouse (PG wire / Flight SQL) — not console operators."
+        description="Per-org database login accounts your customers use to connect to their warehouse over pgwire — not console operators."
         actions={
           <div className="flex items-center gap-2">
             <div className="relative">
@@ -251,7 +251,7 @@ export function UsersPage() {
             <DialogTitle>Disable "{disabling?.username}"?</DialogTitle>
             <DialogDescription>
               Blocks all new connections for <span className="font-mono">{disabling?.username}</span> @{" "}
-              <span className="font-mono">{disabling?.org_id}</span> (PG wire + Flight SQL) and kills their
+              <span className="font-mono">{disabling?.org_id}</span> over pgwire and kills their
               live sessions now. Reverse it any time with Enable.
             </DialogDescription>
           </DialogHeader>

@@ -239,7 +239,7 @@ steps:
 					CommandName: "run",
 					Status:      "failed",
 					ExitCode:    2,
-					Error:       "flight EOF",
+					Error:       "connection EOF",
 				}, {
 					Attempt:     2,
 					CommandName: "retry",

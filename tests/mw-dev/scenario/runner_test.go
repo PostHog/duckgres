@@ -90,9 +90,7 @@ func TestScenarioRunner(t *testing.T) {
 			ConnectTimeout:  intEnv(t, "DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT", 10),
 			ApplicationName: "duckgres-scenario-runner",
 		},
-		OutputDir:                scenarioOutputDir,
-		FlightAddr:               os.Getenv("DUCKGRES_SCENARIO_FLIGHT_ADDR"),
-		FlightInsecureSkipVerify: boolEnv(t, "DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY", true),
+		OutputDir: scenarioOutputDir,
 	})
 	dbtExecutor := scenariodbt.NewExecutor(scenariodbt.ExecutorConfig{
 		ProvisionState: provisionState,
@@ -487,9 +485,6 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		}
 		assertPerfQueryErrorsFailStep(t, step)
 		assertPerfTargetsOnlyPGWire(t, step)
-		if _, ok := step.With["flight_insecure_skip_verify"]; ok {
-			t.Fatal("perf scenario should use DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY default instead of hardcoding TLS behavior")
-		}
 	}
 	if !foundPerf {
 		t.Fatal("expected frozen perf scenario to include a perf_queries step")
@@ -934,19 +929,6 @@ func intEnv(t *testing.T, key string, fallback int) int {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		t.Fatalf("%s must be an integer: %v", key, err)
-	}
-	return parsed
-}
-
-func boolEnv(t *testing.T, key string, fallback bool) bool {
-	t.Helper()
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		t.Fatalf("%s must be a boolean: %v", key, err)
 	}
 	return parsed
 }

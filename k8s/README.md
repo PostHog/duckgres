@@ -27,7 +27,7 @@ This directory contains **development/reference manifests** for running duckgres
 │  └──────────────┘ └──────────────┘ └──────────────┘  │
 │                                                      │
 │  Runtime coordination lives in config-store Postgres │
-│  (`cp_instances`, `worker_records`, Flight sessions) │
+│  (`cp_instances`, `worker_records`, admission rows)  │
 │                                                      │
 │  Worker pods have:                                   │
 │  - SecurityContext: non-root (UID 1000)              │
@@ -88,7 +88,7 @@ For seamless planned deployments, use a rolling strategy with overlap and enough
 - `terminationGracePeriodSeconds: 900`
 - `--handover-drain-timeout 15m`
 
-That gives the old replica time to fail readiness, stop taking new pgwire sessions, keep existing pgwire and Flight sessions alive during the drain window, and then force shutdown at the timeout boundary if sessions remain.
+That gives the old replica time to fail readiness, stop taking new pgwire sessions, keep existing pgwire sessions alive during the drain window, and then force shutdown at the timeout boundary if sessions remain.
 
 ## Local Development with kind
 
@@ -101,7 +101,7 @@ just multitenant-port-forward-api
 PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres dbname=duckgres sslmode=require"
 ```
 
-`just multitenant-port-forward-pg` forwards both pgwire on `5432` and Flight SQL on `8815`.
+`just multitenant-port-forward-pg` forwards pgwire on `5432`.
 
 `just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and MinIO backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared-worker control plane.
 
@@ -121,7 +121,7 @@ just multitenant-port-forward-api
 PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres sslmode=require"
 ```
 
-`just multitenant-port-forward-pg` forwards both pgwire on `5432` and Flight SQL on `8815`.
+`just multitenant-port-forward-pg` forwards pgwire on `5432`.
 
 The admin dashboard requires the admin token printed in the control-plane logs. Fetch it with:
 

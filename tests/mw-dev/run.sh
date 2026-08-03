@@ -402,10 +402,9 @@ cmd_test_scenario() {
 }
 
 run_scenario() {
-  local scenario_name="$1" scenario_file="$2" job pod api_base pg flight suffix internal_secret artifact_rc=0 container_rc=0 container_exit_code scenario_rc=0
+  local scenario_name="$1" scenario_file="$2" job pod api_base pg suffix internal_secret artifact_rc=0 container_rc=0 container_exit_code scenario_rc=0
   api_base="http://duckgres-control-plane.$NS.svc:8080"
   pg="$("${KUBECTL[@]}" -n "$NS" get svc duckgres-control-plane -o jsonpath='{.spec.clusterIP}')"
-  flight="duckgres-control-plane.$NS.svc:8815"
   suffix=".ci.duckgres.local"
   internal_secret="$(cat "$internal_secret_file")"
   job="$(scenario_job_name "$scenario_name")"
@@ -440,8 +439,6 @@ spec:
             - { name: DUCKGRES_SCENARIO_PG_HOST, value: "$pg" }
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
-            - { name: DUCKGRES_SCENARIO_FLIGHT_ADDR, value: "$flight" }
-            - { name: DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY, value: "true" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
             # The Crossplane composition grants this isolated service account
             # exact-name access to only the matching CNPG credential Secret.

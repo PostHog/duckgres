@@ -55,10 +55,7 @@ Measured query errors fail the perf DAG step after its artifacts are written;
 independent sibling steps continue to run.
 
 A `perf_queries` step can set `with.targets` to a non-empty subset of the
-catalog's targets. If omitted, every target declared by the catalog runs. The
-frozen scenarios set `targets: [pgwire]` so they do not call the deprecated
-DuckHog Flight endpoint while the shared catalog remains usable by legacy perf
-jobs during the deprecation period.
+catalog's targets. Duckgres perf catalogs and scenarios are pgwire-only.
 
 Do not commit concrete dev endpoints, secrets, org IDs, or private bucket names.
 

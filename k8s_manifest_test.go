@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,25 @@ type deploymentManifest struct {
 			} `yaml:"spec"`
 		} `yaml:"template"`
 	} `yaml:"spec"`
+}
+
+func TestLiveControlPlaneManifestsExposeOnlyPGWire(t *testing.T) {
+	paths := []string{
+		filepath.Join("k8s", "control-plane-multitenant-local.yaml"),
+		filepath.Join("k8s", "kind", "control-plane.yaml"),
+		filepath.Join("k8s", "networkpolicy.yaml"),
+	}
+
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", path, err)
+		}
+		manifest := string(data)
+		if strings.Contains(manifest, "8815") || strings.Contains(manifest, "flight-port") || strings.Contains(manifest, "name: flight") {
+			t.Errorf("%s: control plane must not expose the obsolete Flight SQL ingress", path)
+		}
+	}
 }
 
 func TestLiveControlPlaneManifestsReadinessProbeTargetsAPIHealthEndpoint(t *testing.T) {

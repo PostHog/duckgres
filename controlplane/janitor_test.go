@@ -21,7 +21,6 @@ type captureControlPlaneExpiryStore struct {
 	stuckSpawningBefore   []time.Time
 	stuckActivatingBefore []time.Time
 	stuckWorkers          []configstore.WorkerRecord
-	expiredSessionsBefore []time.Time
 	expiredHotIdleWorkers []configstore.WorkerRecord
 	hotIdleCounts         map[string]int
 	hotIdleCountCalls     []string
@@ -80,13 +79,6 @@ func (s *captureControlPlaneExpiryStore) ListStuckWorkerSnapshots(spawningBefore
 		out = append(out, configstore.NewWorkerSnapshot(rec))
 	}
 	return out, nil
-}
-
-func (s *captureControlPlaneExpiryStore) ExpireFlightSessionRecords(before time.Time) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.expiredSessionsBefore = append(s.expiredSessionsBefore, before)
-	return 0, nil
 }
 
 // ListExpiredHotIdleSnapshots is the lifecycle-typed counterpart used
@@ -218,9 +210,6 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	}
 	if len(store.stuckSpawningBefore) == 0 || len(store.stuckActivatingBefore) == 0 {
 		t.Fatal("expected stuck worker cutoff lookup")
-	}
-	if len(store.expiredSessionsBefore) == 0 {
-		t.Fatal("expected expired flight session cleanup")
 	}
 }
 
@@ -511,9 +500,6 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	}
 	if len(store.stuckSpawningBefore) != 1 || len(store.stuckActivatingBefore) != 1 {
 		t.Fatalf("expected stuck worker lookup despite expiry error, got spawning=%d activating=%d", len(store.stuckSpawningBefore), len(store.stuckActivatingBefore))
-	}
-	if len(store.expiredSessionsBefore) != 1 {
-		t.Fatalf("expected flight session expiry despite expiry error, got %d", len(store.expiredSessionsBefore))
 	}
 	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 7 {
 		t.Fatalf("expected one orphan CAS for worker 7 despite expiry error, got %#v", got)

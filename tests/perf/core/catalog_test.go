@@ -11,7 +11,7 @@ name: smoke
 description: smoke suite
 seed: 7
 dataset_scale: 1
-targets: [pgwire, flight]
+targets: [pgwire]
 warmup_iterations: 1
 measure_iterations: 2
 queries:
@@ -21,7 +21,6 @@ queries:
     params:
       customer_id: 42
     pgwire_sql: SELECT 42
-    duckhog_sql: SELECT 42
 `
 	catalog, err := ParseCatalog([]byte(raw))
 	if err != nil {
@@ -51,11 +50,9 @@ queries:
   - query_id: q1
     intent_id: i1
     pgwire_sql: SELECT 1
-    duckhog_sql: SELECT 1
   - query_id: q1
     intent_id: i2
     pgwire_sql: SELECT 2
-    duckhog_sql: SELECT 2
 `
 	_, err := ParseCatalog([]byte(raw))
 	if err == nil {
@@ -71,10 +68,9 @@ func TestValidateReadOnlyCatalogAcceptsSelectOnlyQueries(t *testing.T) {
 	catalog := Catalog{
 		Queries: []Query{
 			{
-				QueryID:    "q1",
-				IntentID:   "i1",
-				PGWireSQL:  "SELECT 1;",
-				DuckhogSQL: "/* comment */ SELECT 1",
+				QueryID:   "q1",
+				IntentID:  "i1",
+				PGWireSQL: "SELECT 1;",
 			},
 		},
 	}
@@ -87,10 +83,9 @@ func TestValidateReadOnlyCatalogRejectsNonSelectQueries(t *testing.T) {
 	catalog := Catalog{
 		Queries: []Query{
 			{
-				QueryID:    "q_write",
-				IntentID:   "i_write",
-				PGWireSQL:  "INSERT INTO perf_orders VALUES (1, 'na', 100)",
-				DuckhogSQL: "SELECT 1",
+				QueryID:   "q_write",
+				IntentID:  "i_write",
+				PGWireSQL: "INSERT INTO perf_orders VALUES (1, 'na', 100)",
 			},
 		},
 	}

@@ -16,7 +16,7 @@ import (
 )
 
 func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
-	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire, perfcore.ProtocolFlight})
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
 	provisionState := provision.NewState()
 	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
 		Org:      "scenario-org",
@@ -35,7 +35,6 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 			ApplicationName: "duckgres-scenario-runner",
 		},
 		OutputDir:     t.TempDir(),
-		FlightAddr:    "flight.dev.example:443",
 		DriverFactory: factory,
 		Now: func() time.Time {
 			return time.Unix(1700000000, 0)
@@ -60,7 +59,7 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	if !ok {
 		t.Fatal("expected perf result to be recorded")
 	}
-	if result.Summary.RunID != "scenario-run-1" || result.Summary.TotalQueries != 2 || result.Summary.TotalErrors != 0 {
+	if result.Summary.RunID != "scenario-run-1" || result.Summary.TotalQueries != 1 || result.Summary.TotalErrors != 0 {
 		t.Fatalf("summary = %+v", result.Summary)
 	}
 	pgwireDSN := factory.pgwireConnection.DSN
@@ -72,15 +71,6 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	}
 	if factory.pgwireConnection.DialAddress != "10.0.0.10:5432" {
 		t.Fatalf("pgwire direct address = %q, want 10.0.0.10:5432", factory.pgwireConnection.DialAddress)
-	}
-	if factory.flightAddr != "flight.dev.example:443" || factory.flightUsername != "root" || factory.flightPassword != "root-password" {
-		t.Fatalf("flight config = %q/%q/%q", factory.flightAddr, factory.flightUsername, factory.flightPassword)
-	}
-	if factory.flightServerName != "scenario-org.dev.example" {
-		t.Fatalf("flight server name = %q, want managed scenario hostname", factory.flightServerName)
-	}
-	if factory.flightInsecureSkipVerify {
-		t.Fatal("flight insecure skip verify should come from executor config when step does not override it")
 	}
 
 	perfDir := filepath.Join(executor.OutputDir(), "perf")
@@ -97,13 +87,13 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	if !strings.Contains(csvText, "query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at") {
 		t.Fatalf("query_results.csv header changed: %q", csvText)
 	}
-	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") || !strings.Contains(csvText, "\nq1,i1,1,flight,ok,") {
-		t.Fatalf("query_results.csv missing measured pgwire/flight rows: %q", csvText)
+	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") {
+		t.Fatalf("query_results.csv missing measured pgwire row: %q", csvText)
 	}
 }
 
 func TestExecutorRestrictsCatalogToStepTargets(t *testing.T) {
-	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire, perfcore.ProtocolFlight})
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
 	provisionState := provision.NewState()
 	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
 		Org:      "scenario-org",
@@ -143,15 +133,12 @@ func TestExecutorRestrictsCatalogToStepTargets(t *testing.T) {
 	if result.Summary.TotalQueries != 1 || result.Summary.TotalErrors != 0 {
 		t.Fatalf("summary = %+v, want one successful pgwire query", result.Summary)
 	}
-	if factory.flightAddr != "" {
-		t.Fatalf("flight driver was configured with %q despite pgwire-only override", factory.flightAddr)
-	}
 	csvBytes, err := os.ReadFile(filepath.Join(executor.OutputDir(), "perf", "query_results.csv"))
 	if err != nil {
 		t.Fatalf("read query_results.csv: %v", err)
 	}
-	if strings.Contains(string(csvBytes), ",flight,") {
-		t.Fatalf("query_results.csv contains a Flight result despite pgwire-only override: %q", string(csvBytes))
+	if !strings.Contains(string(csvBytes), ",pgwire,") {
+		t.Fatalf("query_results.csv does not contain pgwire result: %q", string(csvBytes))
 	}
 }
 
@@ -171,7 +158,6 @@ func TestExecutorRejectsTargetOverrideOutsideCatalog(t *testing.T) {
 			SSLMode:   "require",
 		},
 		OutputDir:     t.TempDir(),
-		FlightAddr:    "flight.dev.example:443",
 		DriverFactory: &fakeDriverFactory{},
 	})
 
@@ -185,8 +171,8 @@ func TestExecutorRejectsTargetOverrideOutsideCatalog(t *testing.T) {
 			"targets":      []any{"flight"},
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "is not present in perf catalog") {
-		t.Fatalf("error = %v, want target subset validation error", err)
+	if err == nil || !strings.Contains(err.Error(), "unsupported perf protocol") {
+		t.Fatalf("error = %v, want unsupported protocol error", err)
 	}
 }
 
@@ -319,77 +305,6 @@ func TestExecutorCanReportPerfQueryErrorsWithoutFailingStep(t *testing.T) {
 	}
 }
 
-func TestExecutorRequiresFlightAddrWhenCatalogTargetsFlight(t *testing.T) {
-	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolFlight})
-	provisionState := provision.NewState()
-	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
-		Org:      "scenario-org",
-		Username: "root",
-		Password: "root-password",
-	})
-	executor := NewExecutor(ExecutorConfig{
-		ProvisionState: provisionState,
-		Connection: scenariosql.ConnectionConfig{
-			DialHost:  "10.0.0.10",
-			SNISuffix: ".dev.example",
-			SSLMode:   "require",
-		},
-		OutputDir:     t.TempDir(),
-		DriverFactory: &fakeDriverFactory{},
-	})
-
-	err := executor.ExecuteStep(context.Background(), core.Step{
-		ID:   "perf_queries",
-		Type: StepTypePerfQueries,
-		With: map[string]any{
-			"org_id":       "scenario-org",
-			"catalog_file": catalogPath,
-			"run_id":       "scenario-run-1",
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), "flight_addr") {
-		t.Fatalf("error = %v, want missing flight_addr", err)
-	}
-}
-
-func TestExecutorClosesCreatedDriversWhenLaterDriverCreationFails(t *testing.T) {
-	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire, perfcore.ProtocolFlight})
-	provisionState := provision.NewState()
-	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
-		Org:      "scenario-org",
-		Username: "root",
-		Password: "root-password",
-	})
-	factory := &fakeDriverFactory{flightErr: errors.New("flight unavailable")}
-	executor := NewExecutor(ExecutorConfig{
-		ProvisionState: provisionState,
-		Connection: scenariosql.ConnectionConfig{
-			DialHost:  "10.0.0.10",
-			SNISuffix: ".dev.example",
-			SSLMode:   "require",
-		},
-		OutputDir:     t.TempDir(),
-		FlightAddr:    "flight.dev.example:443",
-		DriverFactory: factory,
-	})
-
-	err := executor.ExecuteStep(context.Background(), core.Step{
-		ID:   "perf_queries",
-		Type: StepTypePerfQueries,
-		With: map[string]any{
-			"org_id":       "scenario-org",
-			"catalog_file": catalogPath,
-			"run_id":       "scenario-run-1",
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), "create flight perf driver") {
-		t.Fatalf("error = %v, want flight driver creation failure", err)
-	}
-	if factory.pgwireDriver == nil || !factory.pgwireDriver.closed {
-		t.Fatalf("expected pgwire driver to be closed after flight creation failure")
-	}
-}
-
 func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 	t.Helper()
 	var targetLines strings.Builder
@@ -411,8 +326,7 @@ func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 		"    intent_id: i1\n" +
 		"    tags: [test]\n" +
 		"    params: {}\n" +
-		"    pgwire_sql: SELECT 1\n" +
-		"    duckhog_sql: SELECT 1\n"
+		"    pgwire_sql: SELECT 1\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write perf catalog: %v", err)
 	}
@@ -420,33 +334,15 @@ func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 }
 
 type fakeDriverFactory struct {
-	pgwireConnection         scenariosql.PGWireConnection
-	pgwireErr                error
-	pgwireDriver             *fakeProtocolDriver
-	flightAddr               string
-	flightServerName         string
-	flightUsername           string
-	flightPassword           string
-	flightInsecureSkipVerify bool
-	flightErr                error
+	pgwireConnection scenariosql.PGWireConnection
+	pgwireErr        error
+	pgwireDriver     *fakeProtocolDriver
 }
 
 func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
 	f.pgwireConnection = connection
 	f.pgwireDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolPGWire, err: f.pgwireErr}
 	return f.pgwireDriver, nil
-}
-
-func (f *fakeDriverFactory) NewFlight(addr, serverName, username, password string, insecureSkipVerify bool) (perfcore.ProtocolDriver, error) {
-	f.flightAddr = addr
-	f.flightServerName = serverName
-	f.flightUsername = username
-	f.flightPassword = password
-	f.flightInsecureSkipVerify = insecureSkipVerify
-	if f.flightErr != nil {
-		return nil, f.flightErr
-	}
-	return &fakeProtocolDriver{protocol: perfcore.ProtocolFlight}, nil
 }
 
 type fakeProtocolDriver struct {

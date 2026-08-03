@@ -73,7 +73,7 @@ const (
 	LifecycleOriginPublicAPI LifecycleOrigin = "public_api"
 	// LifecycleOriginActivationFailure marks retire paths fired after a
 	// worker activation returned an error (org pool's
-	// activateWorkerForOrg / ReconnectFlightWorker).
+	// activateWorkerForOrg).
 	LifecycleOriginActivationFailure LifecycleOrigin = "activation_failure"
 	// LifecycleOriginCrashGeneric marks retire paths driven by a generic
 	// "worker died" signal that isn't covered by a more specific origin
