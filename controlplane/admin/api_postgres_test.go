@@ -104,6 +104,31 @@ func TestAdminAdmissionConfigMutationsSerializePostgres(t *testing.T) {
 	}
 }
 
+func TestAdminUpdateOrgPersistsDataImportsTableNamingVersionPostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	if err := store.DB().Create(&configstore.Org{
+		Name:                          "naming-policy-org",
+		DatabaseName:                  "naming_policy_org",
+		DataImportsTableNamingVersion: configstore.DataImportsTableNamingVersionLegacyBatchV1,
+	}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+	updated, found, err := apiStore.UpdateOrg("naming-policy-org", configstore.Org{
+		DataImportsTableNamingVersion: configstore.DataImportsTableNamingVersionCopyV1,
+	})
+	if err != nil {
+		t.Fatalf("update org: %v", err)
+	}
+	if !found {
+		t.Fatal("updated org was not found")
+	}
+	if updated.DataImportsTableNamingVersion != configstore.DataImportsTableNamingVersionCopyV1 {
+		t.Fatalf("stored naming version = %q, want copy_v1", updated.DataImportsTableNamingVersion)
+	}
+}
+
 func seedAdmissionMutationUser(t *testing.T, store *configstore.ConfigStore, orgID, username string) {
 	t.Helper()
 	if err := store.DB().Create(&configstore.Org{Name: orgID, DatabaseName: orgID}).Error; err != nil {
