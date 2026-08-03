@@ -762,6 +762,10 @@ are load-bearing for those consumers:
   reads as fleet-wide removal to every consumer).
 - **Teams come from `duckgres_org_teams`**, with RESOLVED table locations:
   `events_table`/`persons_table` = `<schema_name>.<override-or-derived>`,
+  `persons_distinct_ids_table` = `<schema_name>.` + the resolved persons
+  name with its `persons` prefix replaced by `persons_distinct_ids` (so a
+  suffixed override stays disambiguated: persons_ab12 →
+  persons_distinct_ids_ab12),
   `data_imports_schema` = override-or-`<schema>_data_imports`. The
   derivation lives ONCE, in `resolveTeamTables`; the legacy overrides are
   BARE identifiers (never schema-qualified), enforced at every write surface

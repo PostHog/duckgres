@@ -426,6 +426,32 @@ func TestResolvedTableNames(t *testing.T) {
 	if tm.EventsTable != "posthog.legacy_events" || tm.PersonsTable != "posthog.persons" || tm.DataImportsSchema != "posthog_data_imports" {
 		t.Fatalf("resolved table names wrong: %+v", tm)
 	}
+	// The distinct-ids table follows the resolved persons name.
+	if tm.PersonsDistinctIDsTable != "posthog.persons_distinct_ids" {
+		t.Fatalf("resolved distinct-ids table wrong: %+v", tm)
+	}
+}
+
+func TestResolvedDistinctIDsTableFollowsPersonsSuffix(t *testing.T) {
+	// Streamed persons replication lands two tables per team (persons +
+	// distinct-ids). The distinct-ids location must track the team's
+	// resolved persons name — including a suffixed override — so a viaduck
+	// persons pipeline never re-derives the suffix rule itself.
+	s := newFakeStore()
+	seedWarehouse(s, "org-a", nil, configstore.ManagedWarehouseStateReady, time.Now())
+	seedTeam(s, "org-a", configstore.OrgTeam{
+		TeamID:           2,
+		SchemaName:       "posthog",
+		Enabled:          true,
+		PersonsTableName: strPtrD("persons_ab12"),
+	})
+
+	var resp discoveryResponse
+	getJSON(t, newTestRouter(s), "/api/v1/warehouses", &resp)
+	tm := resp.Warehouses[0].Teams[0]
+	if tm.PersonsTable != "posthog.persons_ab12" || tm.PersonsDistinctIDsTable != "posthog.persons_distinct_ids_ab12" {
+		t.Fatalf("distinct-ids table must follow the persons suffix: %+v", tm)
+	}
 }
 
 func TestConfigGenerationAdvancesOnTeamChange(t *testing.T) {
