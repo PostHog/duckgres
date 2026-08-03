@@ -34,6 +34,8 @@ export interface Operator {
 
 // ---- Orgs (confirmed) ----
 
+export type DataImportsTableNamingVersion = "legacy_batch_v1" | "copy_v1";
+
 export interface SecretRef {
   namespace: string;
   name: string;
@@ -51,6 +53,7 @@ export interface Org {
   default_worker_memory: string;
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
+  data_imports_table_naming_version: DataImportsTableNamingVersion;
   users?: OrgUser[];
   warehouse?: ManagedWarehouse | null;
   created_at: string;
@@ -66,6 +69,7 @@ export interface OrgUpdate {
   default_worker_ttl?: string;
   default_worker_min_hot_idle?: number;
   hostname_alias?: string | null;
+  data_imports_table_naming_version?: DataImportsTableNamingVersion;
 }
 
 // One duckgres_org_teams row: a PostHog team mapped to this org and the

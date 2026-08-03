@@ -279,11 +279,11 @@
       padding: 6px 18px; border-bottom: 1px solid var(--line); align-items: center;
     }
     .dform .frow label { color: var(--dim); font-size: 11px; letter-spacing: .04em; }
-    .dform .frow input {
+    .dform .frow input, .dform .frow select {
       background: var(--panel2); border: 1px solid var(--line-bright); border-radius: 4px;
       color: var(--text); font-family: inherit; font-size: 12px; padding: 5px 8px; width: 100%;
     }
-    .dform .frow input:focus { outline: none; border-color: var(--worker); }
+    .dform .frow input:focus, .dform .frow select:focus { outline: none; border-color: var(--worker); }
     .dform .factions { display: flex; gap: 8px; padding: 13px 18px; }
 
     .empty { padding: 40px 22px; color: var(--dim); font-size: 12px; letter-spacing: .04em; }
@@ -725,7 +725,8 @@
   // intersected with the live listing columns (orgEditableCols) so the edit form
   // auto-adapts as columns are added/removed from the model — non-mergeable
   // columns (name, database_name, users, warehouse, *_state, timestamps) are
-  // simply never in this allowlist. "int" → numeric input, else text.
+  // simply never in this allowlist. "int" uses a numeric input and
+  // "naming-version" uses the two supported policy values.
   const ORG_EDIT_FIELDS = {
     max_workers: "int",
     max_vcpus: "int",
@@ -734,6 +735,7 @@
     default_worker_ttl: "text",
     default_worker_min_hot_idle: "int",
     hostname_alias: "text",
+    data_imports_table_naming_version: "naming-version",
   };
   function orgEditableCols() {
     const cols = (state.listing && state.listing.columns) || [];
@@ -835,11 +837,18 @@
   function orgEditFormHTML(row) {
     let html = '<div class="dform">';
     for (const c of orgEditableCols()) {
-      const type = ORG_EDIT_FIELDS[c] === "int" ? "number" : "text";
       const raw = row[c];
       const v = (raw === null || raw === undefined) ? "" : String(raw);
-      html += '<div class="frow"><label for="orgf-' + esc(c) + '">' + esc(c) + "</label>" +
-        '<input id="orgf-' + esc(c) + '" type="' + type + '" value="' + esc(v) + '"></div>';
+      if (ORG_EDIT_FIELDS[c] === "naming-version") {
+        const options = ["legacy_batch_v1", "copy_v1"].map(value =>
+          '<option value="' + value + '"' + (value === v ? " selected" : "") + ">" + value + "</option>").join("");
+        html += '<div class="frow"><label for="orgf-' + esc(c) + '">' + esc(c) + "</label>" +
+          '<select id="orgf-' + esc(c) + '">' + options + "</select></div>";
+      } else {
+        const type = ORG_EDIT_FIELDS[c] === "int" ? "number" : "text";
+        html += '<div class="frow"><label for="orgf-' + esc(c) + '">' + esc(c) + "</label>" +
+          '<input id="orgf-' + esc(c) + '" type="' + type + '" value="' + esc(v) + '"></div>';
+      }
     }
     html += '<div class="factions"><button class="btn" id="org-edit-save">Save</button>' +
       '<button class="btn" id="org-edit-cancel">Cancel</button></div></div>';

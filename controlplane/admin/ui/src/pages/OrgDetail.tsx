@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { StateBadge } from "@/components/StateBadge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AdminGate } from "@/components/AdminOnly";
@@ -44,7 +45,7 @@ import {
   LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { ManagedWarehouse, OrgTeam, OrgUpdate } from "@/types/api";
+import type { DataImportsTableNamingVersion, ManagedWarehouse, OrgTeam, OrgUpdate } from "@/types/api";
 
 interface FormState {
   max_workers: string;
@@ -54,6 +55,7 @@ interface FormState {
   default_worker_ttl: string;
   default_worker_min_hot_idle: string;
   hostname_alias: string;
+  data_imports_table_naming_version: DataImportsTableNamingVersion;
 }
 
 function orgToForm(o: {
@@ -64,6 +66,7 @@ function orgToForm(o: {
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
   hostname_alias: string | null;
+  data_imports_table_naming_version: DataImportsTableNamingVersion;
 }): FormState {
   return {
     max_workers: String(o.max_workers),
@@ -73,6 +76,7 @@ function orgToForm(o: {
     default_worker_ttl: o.default_worker_ttl,
     default_worker_min_hot_idle: String(o.default_worker_min_hot_idle),
     hostname_alias: o.hostname_alias ?? "",
+    data_imports_table_naming_version: o.data_imports_table_naming_version,
   };
 }
 
@@ -124,6 +128,7 @@ export function OrgDetail() {
       default_worker_ttl: form.default_worker_ttl,
       default_worker_min_hot_idle: Number(form.default_worker_min_hot_idle) || 0,
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
+      data_imports_table_naming_version: form.data_imports_table_naming_version,
     };
     try {
       await update.mutateAsync(body);
@@ -244,6 +249,35 @@ export function OrgDetail() {
                   onChange={(e) => set("hostname_alias", e.target.value)}
                 />
               </Field>
+              <Field label="Data import table naming">
+                <Select
+                  value={form.data_imports_table_naming_version}
+                  onValueChange={(value) => {
+                    if (value === "legacy_batch_v1" || value === "copy_v1") {
+                      setForm((current) =>
+                        current ? { ...current, data_imports_table_naming_version: value } : current,
+                      );
+                    }
+                  }}
+                >
+                  <SelectTrigger aria-label="Data import table naming">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="legacy_batch_v1">Legacy batch (legacy_batch_v1)</SelectItem>
+                    <SelectItem value="copy_v1">Copy workflow (copy_v1)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              {form.data_imports_table_naming_version !== org.data?.data_imports_table_naming_version && (
+                <p className="flex items-start gap-2 text-xs text-warning">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    Changing the naming version does not rename or move existing data. Migrate the
+                    existing tables before saving this change.
+                  </span>
+                </p>
+              )}
               <div className="flex items-center gap-3 pt-1">
                 <AdminGate>
                   <Button size="sm" onClick={save} disabled={update.isPending}>

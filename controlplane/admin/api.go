@@ -262,6 +262,9 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		"default_worker_ttl":          updates.DefaultWorkerTTL,
 		"default_worker_min_hot_idle": updates.DefaultWorkerMinHotIdle,
 	}
+	if updates.DataImportsTableNamingVersion != "" {
+		fields["data_imports_table_naming_version"] = updates.DataImportsTableNamingVersion
+	}
 	// HostnameAlias is *string: nil = preserve, "" = clear (NULL), "x" = set.
 	// NULL releases the unique-index slot so other orgs can take that alias.
 	if updates.HostnameAlias != nil {
@@ -937,6 +940,12 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if _, ok := fields["data_imports_table_naming_version"]; ok {
+		if err := validateDataImportsTableNamingVersion(updates.DataImportsTableNamingVersion); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 	existing, err := h.store.GetOrg(name)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -970,6 +979,9 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
+	if _, ok := fields["data_imports_table_naming_version"]; ok {
+		merged.DataImportsTableNamingVersion = updates.DataImportsTableNamingVersion
+	}
 	// Audit detail: which fields changed and their old → new values, so the
 	// console shows "max_workers 4 → 10" instead of a bare "org.update". These
 	// are all non-sensitive config columns (no credentials among them).
@@ -986,6 +998,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
 	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
 	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
+	addChange("data_imports_table_naming_version", existing.DataImportsTableNamingVersion, merged.DataImportsTableNamingVersion)
 	if len(changes) > 0 {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}
@@ -1307,6 +1320,11 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 			return err
 		}
 	}
+	if org.DataImportsTableNamingVersion != "" {
+		if err := validateDataImportsTableNamingVersion(org.DataImportsTableNamingVersion); err != nil {
+			return err
+		}
+	}
 	if err := validateOrgDefaultWorkerProfile(org); err != nil {
 		return err
 	}
@@ -1317,6 +1335,17 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
 	}
 	return nil
+}
+
+func validateDataImportsTableNamingVersion(version string) error {
+	if configstore.IsValidDataImportsTableNamingVersion(version) {
+		return nil
+	}
+	return fmt.Errorf(
+		"data_imports_table_naming_version must be %q or %q",
+		configstore.DataImportsTableNamingVersionLegacyBatchV1,
+		configstore.DataImportsTableNamingVersionCopyV1,
+	)
 }
 
 // validateOrgDefaultWorkerProfile rejects garbage default-worker-profile

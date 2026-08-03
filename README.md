@@ -952,6 +952,7 @@ The shared K8s pool spawns workers on-demand, reserves them per org, activates t
 Managed-warehouse contract notes:
 
 - At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
+- Each org has a `data_imports_table_naming_version`. Migration `000034` assigns `legacy_batch_v1` to orgs that already exist and changes the database default to `copy_v1` for orgs created afterward. `GET /api/v1/orgs/:id/teams` returns the org-level value alongside the team rows so every data-import reader and writer derives the same physical table name. Operators can change the policy in the admin console or with `PUT /api/v1/orgs/:id` using `{"data_imports_table_naming_version":"copy_v1"}`. Migrate existing tables before changing an org that has already written data.
 - The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
 - Org rows support optional `max_vcpus` on `POST /api/v1/orgs` and `PUT /api/v1/orgs/:id`. In K8s multi-tenant mode, this caps the org's active admitted worker pod vCPUs; `0` means unlimited.
 - User rows support an optional `max_vcpus` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. `max_vcpus` limits the user's active admitted worker pod vCPUs in K8s multi-tenant mode; `0` means unlimited.

@@ -21,14 +21,15 @@ type Org struct {
 	// human editability) applied to connections that don't size themselves via
 	// the duckgres.worker_* startup options. Empty = unset. Versioned SQL
 	// migrations add these columns.
-	DefaultWorkerCPU        string `gorm:"size:32" json:"default_worker_cpu"`
-	DefaultWorkerMemory     string `gorm:"size:32" json:"default_worker_memory"`
-	DefaultWorkerTTL        string `gorm:"size:32" json:"default_worker_ttl"`
-	DefaultWorkerMinHotIdle int    `gorm:"default:0" json:"default_worker_min_hot_idle"`
-	Teams         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
-	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt     time.Time         `json:"created_at"`
+	DefaultWorkerCPU              string            `gorm:"size:32" json:"default_worker_cpu"`
+	DefaultWorkerMemory           string            `gorm:"size:32" json:"default_worker_memory"`
+	DefaultWorkerTTL              string            `gorm:"size:32" json:"default_worker_ttl"`
+	DefaultWorkerMinHotIdle       int               `gorm:"default:0" json:"default_worker_min_hot_idle"`
+	DataImportsTableNamingVersion string            `gorm:"size:32;not null;default:copy_v1" json:"data_imports_table_naming_version"`
+	Teams                         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
+	Users                         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse                     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	CreatedAt                     time.Time         `json:"created_at"`
 	// UpdatedAt doubles as an input to the discovery change marker
 	// (ConfigStore.LatestConfigChange): DeleteOrgTeamTx touches it so a
 	// team-row DELETE — which leaves no updated_at of its own behind —

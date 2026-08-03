@@ -33,6 +33,7 @@ vi.mock("@/components/OrgTeamDialogs", () => ({
 import { OrgDetail } from "./OrgDetail";
 
 const warehouseUpdate = vi.fn();
+const orgUpdate = vi.fn();
 const ok = <T,>(data: T) => ({
   data,
   isSuccess: true,
@@ -56,6 +57,7 @@ const ORG: Org = {
   default_worker_memory: "8Gi",
   default_worker_ttl: "75m",
   default_worker_min_hot_idle: 0,
+  data_imports_table_naming_version: "legacy_batch_v1",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
 };
@@ -116,7 +118,7 @@ function renderPage(metadataProxyEnabled: boolean) {
   );
 }
 
-describe("Org warehouse metadata proxy setting", () => {
+describe("Org detail", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     identity.useIdentity.mockReturnValue({
@@ -124,7 +126,7 @@ describe("Org warehouse metadata proxy setting", () => {
       me: { email: "admin@example.com", role: "admin", source: "sso" },
     });
     hooks.useOrg.mockReturnValue(ok(ORG));
-    hooks.useUpdateOrg.mockReturnValue(mut());
+    hooks.useUpdateOrg.mockReturnValue(mut(orgUpdate));
     hooks.useDeleteOrg.mockReturnValue(mut());
     hooks.useUpdateWarehouse.mockReturnValue(mut(warehouseUpdate));
     hooks.useDeprovisionWarehouse.mockReturnValue(mut());
@@ -149,5 +151,23 @@ describe("Org warehouse metadata proxy setting", () => {
 
     expect(warehouseUpdate).toHaveBeenCalledTimes(1);
     expect(warehouseUpdate).toHaveBeenCalledWith({ metadata_proxy_enabled: next });
+  });
+
+  it("saves a changed data import table naming version", async () => {
+    const user = userEvent.setup();
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    renderPage(false);
+
+    const namingSelect = screen.getByLabelText("Data import table naming");
+    expect(namingSelect).toHaveTextContent("Legacy batch (legacy_batch_v1)");
+
+    namingSelect.focus();
+    await user.keyboard("{Enter}{ArrowDown}{Enter}");
+    await user.click(screen.getByText("Save changes"));
+
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data_imports_table_naming_version: "copy_v1" }),
+    );
   });
 });

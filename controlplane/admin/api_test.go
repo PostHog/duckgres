@@ -83,6 +83,9 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.DefaultWorkerMemory = updates.DefaultWorkerMemory
 	org.DefaultWorkerTTL = updates.DefaultWorkerTTL
 	org.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
+	if updates.DataImportsTableNamingVersion != "" {
+		org.DataImportsTableNamingVersion = updates.DataImportsTableNamingVersion
+	}
 	if updates.HostnameAlias != nil {
 		if *updates.HostnameAlias == "" {
 			org.HostnameAlias = nil
@@ -2346,6 +2349,105 @@ func TestUpdateOrgRejectsNegativeMaxVCPUs(t *testing.T) {
 	}
 	if store.orgs["analytics"].MaxVCPUs != 10 {
 		t.Fatalf("expected org max_vcpus to be preserved, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+}
+
+func TestUpdateOrgDataImportsTableNamingVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		from string
+		to   string
+	}{
+		{"legacy_to_copy", configstore.DataImportsTableNamingVersionLegacyBatchV1, configstore.DataImportsTableNamingVersionCopyV1},
+		{"copy_to_legacy", configstore.DataImportsTableNamingVersionCopyV1, configstore.DataImportsTableNamingVersionLegacyBatchV1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{
+				Name:                          "analytics",
+				DataImportsTableNamingVersion: tc.from,
+			}
+
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			var detail string
+			router.Use(func(c *gin.Context) {
+				c.Next()
+				detail = c.GetString(ctxAuditDetailKey)
+			})
+			registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics",
+				fmt.Sprintf(`{"data_imports_table_naming_version":%q}`, tc.to))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var response configstore.Org
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.DataImportsTableNamingVersion != tc.to {
+				t.Fatalf("response naming version = %q, want %q", response.DataImportsTableNamingVersion, tc.to)
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != tc.to {
+				t.Fatalf("stored naming version = %q, want %q", got, tc.to)
+			}
+			wantDetail := fmt.Sprintf("data_imports_table_naming_version %s → %s", tc.from, tc.to)
+			if !strings.Contains(detail, wantDetail) {
+				t.Fatalf("audit detail = %q, want %q", detail, wantDetail)
+			}
+
+			rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics", `{"max_workers":3}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("unrelated update status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != tc.to {
+				t.Fatalf("unrelated update changed naming version to %q", got)
+			}
+		})
+	}
+}
+
+func TestUpdateOrgRejectsInvalidDataImportsTableNamingVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"empty", `""`},
+		{"null", `null`},
+		{"unknown", `"future_v1"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{
+				Name:                          "analytics",
+				DataImportsTableNamingVersion: configstore.DataImportsTableNamingVersionLegacyBatchV1,
+			}
+			router := newTestAPIRouter(store)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics",
+				fmt.Sprintf(`{"data_imports_table_naming_version":%s}`, tc.value))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != configstore.DataImportsTableNamingVersionLegacyBatchV1 {
+				t.Fatalf("invalid update changed naming version to %q", got)
+			}
+		})
+	}
+}
+
+func TestCreateOrgRejectsInvalidDataImportsTableNamingVersion(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/orgs",
+		`{"name":"analytics","database_name":"analytics","team_id":1,"data_imports_table_naming_version":"future_v1"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("org must not be created with an invalid naming version")
 	}
 }
 
