@@ -432,3 +432,51 @@ func TestExtractHandlesEmptyAndGarbage(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractCallStatement covers a statement type real prod traffic hit that
+// extraction had no case for. A procedure's body is invisible to us, so its
+// access is undeterminable — but the statement itself parses, and that
+// distinction has to survive into the result.
+func TestExtractCallStatement(t *testing.T) {
+	meta := Extract("CALL my_schema.rebuild_rollups(1, 'daily')")
+
+	if !meta.HasKind(AccessUnknown) {
+		t.Fatalf("a procedure body is opaque, so access is unknown; got %v", meta.AccessKinds)
+	}
+	// "We parsed it but cannot see what it does" is NOT the same fact as "we
+	// could not parse it". A consumer must be able to tell them apart; both
+	// deny, but only one is fixable by a better parser.
+	if !meta.Complete {
+		t.Fatalf("CALL parses fine — it must not be reported as an incomplete extraction (%s)",
+			meta.IncompleteReason)
+	}
+	// The procedure name lets a policy allowlist specific procedures instead of
+	// refusing CALL wholesale.
+	found := false
+	for _, fn := range meta.Functions {
+		if fn == "rebuild_rollups" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the called procedure must be recorded, got functions %v", meta.Functions)
+	}
+}
+
+// TestUnknownAccessDistinguishesOpaqueFromUnparseable is the property the CALL
+// case exists to protect: both deny, but they are different facts.
+func TestUnknownAccessDistinguishesOpaqueFromUnparseable(t *testing.T) {
+	opaque := Extract("CALL do_something()")
+	unparseable := Extract("PIVOT main.events ON kind USING sum(v)")
+
+	if !opaque.HasKind(AccessUnknown) || !opaque.Complete {
+		t.Fatalf("opaque-but-parsed should be complete+unknown, got complete=%v kinds=%v",
+			opaque.Complete, opaque.AccessKinds)
+	}
+	if unparseable.Complete {
+		t.Fatal("unparseable input must be reported incomplete")
+	}
+	if unparseable.IncompleteReason == "" {
+		t.Fatal("an incomplete extraction must say why")
+	}
+}

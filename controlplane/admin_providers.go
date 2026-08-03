@@ -18,10 +18,11 @@ import (
 // srv is the local PG wire server, the only place the (redacted) in-flight SQL
 // text lives — so QueryDetailForPID is scoped to queries this replica owns.
 type clusterInfoProvider struct {
-	router   *OrgRouter
-	store    *configstore.ConfigStore
-	srv      *server.Server
-	selfCPID string
+	router           *OrgRouter
+	store            *configstore.ConfigStore
+	srv              *server.Server
+	selfCPID         string
+	metadataSessions *metadataProxySessionRegistry
 }
 
 var _ admin.LiveInfo = (*clusterInfoProvider)(nil)
@@ -228,11 +229,12 @@ func (p *clusterInfoProvider) RecentErrors(limit int) []admin.ErrorEntry {
 // connection) and sums the counts. An org with no live stack on this replica
 // (returns 0, not an error) is normal — its sessions, if any, live elsewhere.
 func (p *clusterInfoProvider) KillUserSessions(orgID, username string) int {
+	killed := p.metadataSessions.KillUser(orgID, username)
 	stack, ok := p.router.AllStacks()[orgID]
 	if !ok {
-		return 0
+		return killed
 	}
-	return stack.Sessions.DestroySessionsForUser(username)
+	return killed + stack.Sessions.DestroySessionsForUser(username)
 }
 
 // impersonator implements admin.Impersonator. It opens a real session as the

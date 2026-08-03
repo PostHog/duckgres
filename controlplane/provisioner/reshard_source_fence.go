@@ -32,15 +32,16 @@ func (PGReshardSourceFencer) TerminateAndWait(ctx context.Context, maintenance C
 }
 
 func (PGReshardSourceFencer) DisableMaintenanceAndTerminate(ctx context.Context, maintenance CatalogEndpoint, disableAndWait func() error) error {
-	// Establish the final administrative session before requesting NOLOGIN.
-	// Once PostgreSQL confirms NOLOGIN, this already-authenticated session can
-	// terminate every other maintenance session and then close itself. There
-	// is no gap in which a new privileged session can race cleanup.
+	// Callers provide a direct PostgreSQL endpoint so the final administrative
+	// session is never returned to a pool after NOLOGIN. Once PostgreSQL
+	// confirms NOLOGIN, this already-authenticated session can terminate every
+	// other maintenance session and then close its own backend.
 	conn, err := pgx.Connect(ctx, maintenance.DSN())
 	if err != nil {
 		return fmt.Errorf("connect before disabling reshard maintenance identity %s: %w", maintenance.Redacted(), err)
 	}
 	defer conn.Close(context.WithoutCancel(ctx))
+
 	if err := disableAndWait(); err != nil {
 		return err
 	}

@@ -19,7 +19,7 @@ func TestTerminalQueryEventType(t *testing.T) {
 		{"success", "", true, QueryEventFinish},
 		{"success without exec", "", false, QueryEventFinish},
 		{"failure after exec began", "42P01", true, QueryEventExceptionWhileProcessing},
-		{"failure before any engine saw it", "42601", false, QueryEventExceptionBeforeStart},
+		{"failure before execution began", "42601", false, QueryEventExceptionBeforeStart},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,7 +291,7 @@ func TestExecutionPathEmitsQueryStart(t *testing.T) {
 	if !scope.execStarted {
 		t.Fatal("reaching an engine must mark the statement as started")
 	}
-	// Having reached an engine, a later failure is ExceptionWhileProcessing.
+	// Execution having begun, a later failure is ExceptionWhileProcessing.
 	c.logQuery(scope.start, "UPDATE foo SET x = 1", "", "UPDATE", 0, 0, "XX000", "boom", "simple")
 	last := exec.entries[len(exec.entries)-1]
 	if last.Type != QueryEventExceptionWhileProcessing {

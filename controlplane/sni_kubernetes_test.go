@@ -58,6 +58,44 @@ func TestExtractOrgFromSNIEmptySuffixes(t *testing.T) {
 	}
 }
 
+func TestExtractMetadataOrgFromSNIAllManagedWarehouseEnvironments(t *testing.T) {
+	cp := &ControlPlane{
+		cfg: ControlPlaneConfig{
+			MetadataHostnameSuffixes: []string{
+				".md.dev.postwh.com",
+				".md.us.postwh.com",
+				".md.eu.postwh.com",
+			},
+		},
+	}
+
+	for _, hostname := range []string{
+		"acme.md.dev.postwh.com",
+		"acme.md.us.postwh.com",
+		"acme.md.eu.postwh.com",
+	} {
+		t.Run(hostname, func(t *testing.T) {
+			org, ok := cp.extractMetadataOrgFromSNI(hostname)
+			if !ok || org != "acme" {
+				t.Fatalf("extractMetadataOrgFromSNI(%q) = (%q, %v); want (\"acme\", true)", hostname, org, ok)
+			}
+		})
+	}
+
+	for _, hostname := range []string{
+		"acme.md.postwh.com",
+		"nested.acme.md.eu.postwh.com",
+		".md.dev.postwh.com",
+	} {
+		t.Run(hostname, func(t *testing.T) {
+			org, ok := cp.extractMetadataOrgFromSNI(hostname)
+			if ok || org != "" {
+				t.Fatalf("extractMetadataOrgFromSNI(%q) = (%q, %v); want (\"\", false)", hostname, org, ok)
+			}
+		})
+	}
+}
+
 func TestManagedHostnameHint(t *testing.T) {
 	cases := []struct {
 		name     string

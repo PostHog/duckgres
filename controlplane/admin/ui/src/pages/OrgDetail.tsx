@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
 import { StateBadge } from "@/components/StateBadge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AdminGate } from "@/components/AdminOnly";
@@ -359,6 +360,7 @@ function WarehousePanel({
   const metadata = useDucklingsMetadata();
   const [image, setImage] = useState("");
   const [version, setVersion] = useState("");
+  const [metadataProxyEnabled, setMetadataProxyEnabled] = useState(false);
   const [ducklingNameInput, setDucklingNameInput] = useState("");
   const [confirmDeprovision, setConfirmDeprovision] = useState(false);
   const [deprovisionConfirmText, setDeprovisionConfirmText] = useState("");
@@ -368,6 +370,7 @@ function WarehousePanel({
     if (data) {
       setImage(data.image ?? "");
       setVersion(data.ducklake_version ?? "");
+      setMetadataProxyEnabled(data.metadata_proxy_enabled ?? false);
       setDucklingNameInput(data.duckling_name ?? "");
     }
   }, [data]);
@@ -397,6 +400,9 @@ function WarehousePanel({
     const body: Partial<ManagedWarehouse> = {};
     if (image !== (data?.image ?? "")) body.image = image;
     if (version !== (data?.ducklake_version ?? "")) body.ducklake_version = version;
+    if (metadataProxyEnabled !== (data?.metadata_proxy_enabled ?? false)) {
+      body.metadata_proxy_enabled = metadataProxyEnabled;
+    }
     if (ducklingNameInput !== (data?.duckling_name ?? "")) {
       body.duckling_name = ducklingNameInput;
     }
@@ -513,6 +519,22 @@ function WarehousePanel({
                   className="font-mono text-xs"
                 />
               </Field>
+              <div className="flex items-center justify-between gap-4 rounded-md border border-border bg-background/40 px-3 py-2">
+                <div className="space-y-1">
+                  <Label htmlFor="metadata-proxy-enabled">Public metadata Postgres</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Initial scope: dedicated, single-customer CNPG shards only. Do not enable this
+                    for a shared shard until upstream CONNECT and role hardening lands. Clients use
+                    the org&apos;s root credential and exact dbname=metadata, with full metadata
+                    database access.
+                  </p>
+                </div>
+                <Switch
+                  id="metadata-proxy-enabled"
+                  checked={metadataProxyEnabled}
+                  onCheckedChange={setMetadataProxyEnabled}
+                />
+              </div>
               <div className="flex items-center gap-3">
                 <AdminGate>
                   <Button size="sm" onClick={save} disabled={update.isPending || ducklingNameEmpty}>

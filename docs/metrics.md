@@ -22,6 +22,8 @@ The request path uses these label terms consistently:
 - `reason`: a bounded, metric-specific cause. It is not a poll count.
 - `source`: how a worker was obtained.
 - `phase`: one internal worker-acquisition phase.
+- `direction`: a bounded byte-flow direction; the metadata proxy emits
+  `client_to_upstream` and `upstream_to_client`.
 
 Histograms expose the usual `_bucket`, `_count`, and `_sum` series.
 
@@ -33,12 +35,82 @@ Histograms expose the usual `_bucket`, `_count`, and `_sum` series.
 | Admission queue | `duckgres_session_admission_wait_seconds`, `duckgres_session_admission_requests_total` | After a request is successfully enqueued until grant, hard rejection, timeout, cancellation, or evaluation error. Enqueue failures are excluded. |
 | Admission state | `duckgres_session_admission_queue_depth`, `duckgres_session_admission_active_vcpus`, `duckgres_session_admission_limit_vcpus` | Local waiting callers, live local lease handles, and the effective org cap reconciled for active org stacks from each control-plane process's current config snapshot. |
 | Worker acquisition | `duckgres_worker_acquire_*` | After admission grants until an existing, hot-idle, or newly spawned worker is allocated. |
-| Session start | `duckgres_session_start_duration_seconds` | After successful PostgreSQL authentication until `ReadyForQuery` is flushed or session bootstrap terminates. |
+| Session start | `duckgres_session_start_duration_seconds`, `duckgres_postgres_session_start_total` | After successful PostgreSQL authentication until `ReadyForQuery` is flushed or session bootstrap terminates. The counter records exactly one terminal result after server-side retries. |
 | Query | `duckgres_query_total`, `duckgres_query_duration_seconds` | One non-empty query attempt and its execution duration. |
+| Native metadata proxy | `duckgres_metadata_proxy_*` | The separate metadata SNI branch, from its fail-closed auth/gate through internal Postgres connect and opaque pgwire relay. |
 
 Session start includes profile resolution, admission, worker
 allocation, worker session creation, catalog probing, metadata initialization,
 session defaults, and the final ready flush. It excludes failed authentication.
+
+## Native metadata Postgres proxy metrics
+
+The native metadata proxy branches before worker allocation. It has dedicated
+metric families rather than adding a protocol label to established metrics:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `duckgres_metadata_proxy_connections_open` | Gauge | `org` | Admitted proxy connections on this control-plane process, including upstream bootstrap. |
+| `duckgres_metadata_proxy_connection_attempts_total` | Counter | `org`, `outcome` | Exactly one terminal event per connection that matched a configured metadata SNI suffix. `success` is recorded when frontend `ReadyForQuery` is flushed. |
+| `duckgres_metadata_proxy_connection_duration_seconds` | Histogram | `org` | Lifetime from admission against the per-org proxy cap until teardown, including failed upstream bootstrap. |
+| `duckgres_metadata_proxy_upstream_connect_duration_seconds` | Histogram | `org`, `outcome` | Time spent connecting and authenticating to the internally resolved metadata Postgres target. Outcomes are `success` and `error`. |
+| `duckgres_metadata_proxy_bytes_total` | Counter | `org`, `direction` | Post-authentication pgwire bytes relayed in the fixed `client_to_upstream` or `upstream_to_client` direction. |
+| `duckgres_metadata_proxy_cancel_requests_total` | Counter | `outcome` | Raw proxy CancelRequests handled as `session_terminated` on the owning replica or `not_local` when the synthetic key is not registered on this replica. |
+
+Connection-attempt outcomes are the closed set `success`, `unavailable`,
+`invalid_database`, `auth_failed`, `draining`, `capacity`,
+`target_resolution_error`, `upstream_connect_error`, `upstream_sync_error`,
+`upstream_hijack_error`, `cancel_key_error`, and `handshake_error`. Unknown or
+disabled SNI prefixes use an empty `org` label so denial metrics do not invent
+tenant values.
+
+The open gauge is process-local because the configured safety cap is enforced
+per org on each replica. Use `sum by (org)` for fleet totals and retain the
+scrape target's `pod` label when diagnosing one replica at its cap. Counters
+and histograms can be summed across replicas normally.
+
+`duckgres_connections_open` is incremented before the SNI branch and therefore
+includes metadata proxy sockets. Existing worker-path metrics intentionally do
+not: `duckgres_connection_duration_seconds`,
+`duckgres_org_sessions_active`, `duckgres_org_pg_sessions_accepted_total`,
+admission/worker metrics, query metrics, durable query logs, and query traces
+remain DuckDB-worker-only. The relay is byte-opaque and cannot safely produce
+statement-level observations. Use the proxy connection/byte metrics together
+with CNPG and PgBouncer metrics for this path.
+
+Two process-wide security metrics also span the branch boundary.
+`duckgres_auth_failures_total` includes wrong-password metadata-proxy attempts;
+use
+`duckgres_metadata_proxy_connection_attempts_total{outcome="auth_failed"}` for
+the proxy-specific subset. `duckgres_rate_limit_rejects_total` is incremented
+for pre-TLS rate-limit rejections, before SNI is available, so those rejected
+sockets cannot be attributed to either the metadata endpoint or the DuckDB
+worker endpoint.
+
+The internal upstream session starts with the fixed
+`application_name=duckgres-metadata-proxy`, rather than forwarding the
+client-controlled application name, so it can be distinguished from DuckDB
+`postgres_scanner` sessions in `pg_stat_activity`. A client with full metadata
+database access can change its application name later, so this is operational
+attribution, not an authorization control. Upstream availability does not feed
+the control-plane health endpoint: one org's shard must not remove healthy
+control-plane pods from service. Target resolution and upstream
+connect/auth/synchronization share a 10-second bootstrap deadline; established
+relay traffic has no inherited bootstrap deadline. An admin warehouse update
+that includes `metadata_proxy_enabled` reloads the local snapshot and fans a
+reload out to peer replicas. Established sessions observe a disabled gate on
+their next five-second authorization recheck after that snapshot reaches the
+replica.
+
+Metadata-proxy cancellation intentionally closes the whole session, not only
+the in-flight statement. On a matching synthetic backend key, the owning
+control-plane replica closes the exact established frontend and upstream
+connections. It does not redial the PgBouncer Service because cancellation
+keys are local to the PgBouncer instance that accepted the session. A raw
+PostgreSQL `CancelRequest` uses a new TCP connection and the NLB can route it to
+a different control-plane replica, matching the existing control-plane
+locality constraint. Such a high-range synthetic-key miss is absorbed and
+counted with `outcome="not_local"`; the owning session remains active.
 
 ## Admission metrics
 
@@ -52,12 +124,24 @@ session defaults, and the final ready flush. It excludes failed authentication.
 | `duckgres_session_admission_active_vcpus` | Gauge | `org` | Requested vCPUs held by live local lease handles. It is admitted capacity, not measured CPU usage or the exact durable lease-row total. |
 | `duckgres_session_admission_limit_vcpus` | Gauge | `org` | Effective org cap for an active org stack, reconciled from this process's current config snapshot. `0` means unlimited. |
 | `duckgres_session_start_duration_seconds` | Histogram | `org`, `protocol`, `outcome` | Authenticated PostgreSQL create-to-ready latency. |
+| `duckgres_postgres_session_start_total` | Counter | `org`, `outcome`, `reason` | Exactly one terminal authenticated PostgreSQL session-start result after server-side retries. |
 
 Admission request outcomes are `granted`, `rejected`, `timeout`, `canceled`,
 and `error`. `rejected` means the requested worker shape can never fit its hard
 organization or user vCPU ceiling.
 Session-start outcomes are `success`, `timeout`, `canceled`, `capacity`,
 `draining`, and `error`.
+
+The PostgreSQL terminal counter collapses those outcomes to `success` or
+`failure`. Success always has `reason="none"`. Failure reasons are
+`capacity`, `worker`, `metadata_store`, `control_plane`, `client`, `lifecycle`,
+`canceled`, `transport`, and `unknown`. The first four represent failures an
+operator can usually alleviate. The remaining reasons let alerts exclude bad
+client input, planned lifecycle transitions, client disconnects, wire errors,
+and newly added paths that have not yet been classified. Flight SQL does not
+emit this counter. `capacity` covers runtime worker exhaustion and admission
+timeouts; requests that exceed a configured hard org or user vCPU limit are
+reported with reason `client`.
 
 Evaluation decisions are `granted_current`, `already_granted`, `rejected`,
 `blocked`, `waiting`, `inactive`, `missing`, `canceled`, `timeout`, and `error`.
@@ -162,6 +246,31 @@ histogram_quantile(
   sum by (org, protocol, outcome, le) (
     rate(duckgres_session_start_duration_seconds_bucket[5m])
   )
+)
+```
+
+Current metadata proxy connections by org and control-plane pod:
+
+```promql
+sum by (org, pod) (duckgres_metadata_proxy_connections_open)
+```
+
+Metadata proxy target-phase failure ratio:
+
+```promql
+sum by (org) (
+  rate(duckgres_metadata_proxy_connection_attempts_total{
+    outcome=~"target_resolution_error|upstream_(connect|sync|hijack)_error|cancel_key_error"
+  }[5m])
+)
+/
+clamp_min(
+  sum by (org) (
+    rate(duckgres_metadata_proxy_connection_attempts_total{
+      outcome=~"success|target_resolution_error|upstream_(connect|sync|hijack)_error|cancel_key_error"
+    }[5m])
+  ),
+  0.001
 )
 ```
 

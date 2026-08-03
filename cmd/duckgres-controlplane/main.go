@@ -246,6 +246,8 @@ func main() {
 		ReadOnlySecretFallbacks:   resolved.ReadOnlySecretFallbacks,
 		SNIRoutingMode:             resolved.SNIRoutingMode,
 		ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
+		MetadataHostnameSuffixes:   resolved.MetadataHostnameSuffixes,
+		MetadataProxyMaxConns:      resolved.MetadataProxyMaxConns,
 		DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 		DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
 

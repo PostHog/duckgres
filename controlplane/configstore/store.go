@@ -38,6 +38,11 @@ const (
 	OrgUserAccessModeProjectUser = "project_user"
 )
 
+// dummyBcryptHash is a syntactically valid bcrypt cost-10 hash used only to
+// equalize unknown-user authentication work. Its plaintext is irrelevant: no
+// code path accepts a successful comparison against it.
+const dummyBcryptHash = "$2a$10$Z2IMbWec4kIV53lYNMj4Ke1sA2FxSqavOSQXiOoEAosHLzpqdzpbe"
+
 // IsProjectScopedAccessMode reports whether mode binds a user to one team's
 // namespaces. Both scoped modes require a team_id and forbid passthrough.
 func IsProjectScopedAccessMode(mode string) bool {
@@ -557,7 +562,7 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	storedHash, ok := cs.snapshot.OrgUserPassword[key]
 	if !ok {
 		// Timing-leak guard: still spend bcrypt time on unknown users.
-		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 		return result
 	}
 	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
@@ -599,6 +604,72 @@ func (cs *ConfigStore) OrgWarehouseStatus(orgID string) (string, bool) {
 		return "", true
 	}
 	return string(oc.Warehouse.State), true
+}
+
+// OrgMetadataProxyEnabled is a snapshot-only, fail-closed check for the
+// customer-facing native metadata Postgres endpoint.
+func (cs *ConfigStore) OrgMetadataProxyEnabled(orgID string) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return metadataProxyEnabledFromSnapshot(cs.snapshot, orgID)
+}
+
+func metadataProxyEnabledFromSnapshot(snapshot *Snapshot, orgID string) bool {
+	if snapshot == nil {
+		return false
+	}
+	org, ok := snapshot.Orgs[orgID]
+	return ok && org.Warehouse != nil &&
+		org.Warehouse.MetadataProxyEnabled &&
+		org.Warehouse.State == ManagedWarehouseStateReady &&
+		org.Warehouse.MetadataStore.Kind == MetadataStoreKindCnpgShard
+}
+
+// MetadataProxySessionAllowed rechecks the mutable authorization state of an
+// established metadata session without re-running bcrypt. An explicit admin
+// metadata_proxy_enabled update reloads local/peer snapshots immediately, then
+// established proxy sessions observe the new gate on their periodic recheck.
+// Per-user disable additionally closes matching registered connections.
+func (cs *ConfigStore) MetadataProxySessionAllowed(orgID, username string) bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if !metadataProxyEnabledFromSnapshot(cs.snapshot, orgID) || username != "root" {
+		return false
+	}
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	_, exists := cs.snapshot.OrgUserPassword[key]
+	return exists && !cs.snapshot.OrgUserDisabled[key]
+}
+
+// ResolveMetadataProxyConnection atomically resolves the public hostname,
+// checks the explicit publication gate, and authenticates the org-scoped
+// credential against one immutable snapshot. Keeping all three decisions
+// under the same read lock prevents an alias or credential update from mixing
+// identities across snapshots.
+func (cs *ConfigStore) ResolveMetadataProxyConnection(prefix, username, password string) (orgID string, enabled, authenticated bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	if cs.snapshot == nil {
+		return "", false, false
+	}
+	orgID, _, _ = resolveSNIPrefixFromSnapshot(cs.snapshot, prefix)
+	if !metadataProxyEnabledFromSnapshot(cs.snapshot, orgID) {
+		return "", false, false
+	}
+
+	key := OrgUserKey{OrgID: orgID, Username: username}
+	storedHash, ok := cs.snapshot.OrgUserPassword[key]
+	if !ok {
+		// Spend bcrypt time on unknown users so the public endpoint does not
+		// expose a useful username-enumeration timing signal.
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
+		return orgID, true, false
+	}
+	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil ||
+		cs.snapshot.OrgUserDisabled[key] {
+		return orgID, true, false
+	}
+	return orgID, true, true
 }
 
 // OrgDefaultWorkerProfile returns the org's operator-set default worker
@@ -692,7 +763,7 @@ func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
 	storedHash, ok := cs.snapshot.OrgUserPassword[OrgUserKey{OrgID: orgID, Username: username}]
 	if !ok {
 		// Spend time on a dummy bcrypt compare to avoid timing leaks on username enumeration.
-		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 		return false
 	}
 	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
@@ -729,13 +800,13 @@ func (cs *ConfigStore) ValidateOrgUserAndGetPassthrough(orgID, username, passwor
 	if cs.snapshot == nil {
 		// Match ValidateOrgUser's timing-leak guard: still spend bcrypt time
 		// on failed auth so unknown-user paths look the same as wrong-password.
-		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 		return false, false
 	}
 	key := OrgUserKey{OrgID: orgID, Username: username}
 	storedHash, ok := cs.snapshot.OrgUserPassword[key]
 	if !ok {
-		_ = bcrypt.CompareHashAndPassword([]byte("$2a$10$000000000000000000000000000000000000000000000000000000"), []byte(password))
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
 		return false, false
 	}
 	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {

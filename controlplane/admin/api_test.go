@@ -1176,6 +1176,64 @@ func TestPutWarehouseDisablesPgBouncerWhenSetToFalse(t *testing.T) {
 	}
 }
 
+func TestPutWarehouseTogglesMetadataProxy(t *testing.T) {
+	const reloadPath = "/api/v1/internal/reload-snapshot"
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	fetcher := &fakePeerFetcher{}
+	router := newTestAPIRouterWithFetcher(store, fetcher)
+
+	for i, enabled := range []bool{true, false} {
+		body := []byte(fmt.Sprintf(`{"metadata_proxy_enabled": %t}`, enabled))
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("enabled=%v: status = %d, want %d: %s", enabled, rec.Code, http.StatusOK, rec.Body.String())
+		}
+		if got := store.warehouses["analytics"].MetadataProxyEnabled; got != enabled {
+			t.Fatalf("enabled=%v: stored metadata_proxy_enabled = %v", enabled, got)
+		}
+		if got := store.reloadSnapshotCalls; got != i+1 {
+			t.Fatalf("enabled=%v: reloadSnapshotCalls = %d, want %d", enabled, got, i+1)
+		}
+		if got := fetcher.postCallCount(); got != int32(i+1) {
+			t.Fatalf("enabled=%v: peer fan-out POSTs = %d, want %d", enabled, got, i+1)
+		}
+		fetcher.mu.Lock()
+		lastPath := fetcher.postPaths[len(fetcher.postPaths)-1]
+		fetcher.mu.Unlock()
+		if lastPath != reloadPath {
+			t.Fatalf("enabled=%v: peer fan-out path = %q, want %q", enabled, lastPath, reloadPath)
+		}
+	}
+}
+
+func TestPutWarehouseWithoutMetadataProxyFieldDoesNotReloadSnapshots(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	fetcher := &fakePeerFetcher{}
+	router := newTestAPIRouterWithFetcher(store, fetcher)
+
+	body := []byte(`{"pgbouncer":{"enabled":true}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.reloadSnapshotCalls; got != 0 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 0 for unrelated warehouse PUT", got)
+	}
+	if got := fetcher.postCallCount(); got != 0 {
+		t.Fatalf("peer fan-out POSTs = %d, want 0 for unrelated warehouse PUT", got)
+	}
+}
+
 func TestPutWarehouseRejectsRemovedIcebergField(t *testing.T) {
 	// Iceberg support was removed: "iceberg" is no longer a whitelisted field
 	// on the warehouse PUT, so the strict decode rejects it as unknown.
@@ -1698,6 +1756,9 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	}
 	if !slices.Contains(columns, "metadata_store_database_name") {
 		t.Fatal("expected metadata_store_database_name to be included in managed warehouse upserts")
+	}
+	if !slices.Contains(columns, "metadata_proxy_enabled") {
+		t.Fatal("expected metadata_proxy_enabled to be included in managed warehouse upserts")
 	}
 	// Regression guards: image and duck_lake_version must be in the upsert
 	// column list so the per-tenant pinning patch endpoint actually

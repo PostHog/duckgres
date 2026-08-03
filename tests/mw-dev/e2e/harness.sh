@@ -39,6 +39,11 @@
 #                  discards queued messages until Sync (#718). A same pgwire
 #                  session remains usable immediately after CancelRequest.
 #   activation   : DuckLake catalogs attach, read/write, and EXPLAIN/ANALYZE on cnpg.
+#   metadata pg  : the native TLS/SNI proxy is fail-closed until the warehouse
+#                  is explicitly opted in; only exact dbname=metadata passes,
+#                  and a real DuckLake metadata-table query reaches the hidden
+#                  per-tenant CNPG role/database. Another ready CNPG org stays
+#                  denied, proving enablement is per org rather than per shard.
 #   sizing       : a client-sized connection (duckgres.worker_cpu/memory/ttl)
 #                  spawns a worker pod carrying the requested CPU+memory, and a
 #                  same-shape reconnect reuses that hot-idle worker (no respawn)
@@ -217,6 +222,7 @@ wait_state() { # org target timeout_s
 # (.ci.duckgres.local) is CI-internal and never resolves in DNS — hostaddr is
 # what actually connects.
 SNI_SUFFIX=".ci.duckgres.local"
+METADATA_SNI_SUFFIX=".md.ci.duckgres.local"
 CP_IP=""
 resolve_cp_ip() {
   CP_IP="$(getent hosts "$PGHOST" | awk '{print $1}' | head -1)"
@@ -317,6 +323,180 @@ wait_worker() { # org password catalog
     attempt=$((attempt + 1))
   done
   fail "no Duckgres worker for $1/$3 after retries"
+}
+
+# ---- native metadata Postgres proxy ---------------------------------------
+# The metadata listener is the same CP pgwire port, selected by a distinct TLS
+# SNI suffix. `hostaddr` keeps the TCP destination on the ClusterIP while
+# `host` supplies the non-resolving SNI hostname, exactly like the DuckDB path.
+metadata_pg_try() { # org password dbname sql
+  PGPASSWORD="$2" psql \
+    "sslmode=require host=$1$METADATA_SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=$3 connect_timeout=10" \
+    -X -v ON_ERROR_STOP=1 -AtF '|' -c "$4" 2>&1
+}
+
+assert_metadata_proxy_denied() { # org password label
+  if out="$(metadata_pg_try "$1" "$2" metadata 'SELECT 1')"; then
+    fail "metadata proxy $3: disabled org $1 unexpectedly connected: $out"
+  fi
+  case "$out" in
+    *"metadata endpoint is unavailable"*) ;;
+    *) fail "metadata proxy $3: disabled org $1 failed for the wrong reason: $out" ;;
+  esac
+}
+
+# libpq treats an empty dbname as "use the default database", so it cannot prove
+# that an actually-empty StartupMessage value is rejected. Send the startup
+# packet directly after the PostgreSQL SSLRequest and cleartext-password
+# exchange. The proxy must answer 3D000 before any upstream connection.
+metadata_empty_database_try() { # org password
+  METADATA_PROXY_HOST="$1$METADATA_SNI_SUFFIX" \
+  METADATA_PROXY_ADDR="$CP_IP" \
+  METADATA_PROXY_PASSWORD="$2" \
+  python3 - <<'PY'
+import os
+import socket
+import ssl
+import struct
+import sys
+
+
+def recv_exact(conn, size):
+    data = b""
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise RuntimeError("connection closed before a complete pgwire message")
+        data += chunk
+    return data
+
+
+def recv_message(conn):
+    kind = recv_exact(conn, 1)
+    length = struct.unpack("!I", recv_exact(conn, 4))[0]
+    if length < 4:
+        raise RuntimeError(f"invalid pgwire message length {length}")
+    return kind, recv_exact(conn, length - 4)
+
+
+host = os.environ["METADATA_PROXY_HOST"]
+address = os.environ["METADATA_PROXY_ADDR"]
+password = os.environ["METADATA_PROXY_PASSWORD"].encode()
+
+raw = socket.create_connection((address, 5432), timeout=10)
+raw.sendall(struct.pack("!II", 8, 80877103))
+if recv_exact(raw, 1) != b"S":
+    raise RuntimeError("control plane refused PostgreSQL TLS")
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+conn = ctx.wrap_socket(raw, server_hostname=host)
+
+database = ""
+params = (
+    b"user\0root\0"
+    + b"database\0"
+    + database.encode()
+    + b"\0application_name\0mw-dev-metadata-empty-db\0\0"
+)
+conn.sendall(struct.pack("!II", len(params) + 8, 196608) + params)
+
+kind, payload = recv_message(conn)
+if kind != b"R" or len(payload) < 4 or struct.unpack("!I", payload[:4])[0] != 3:
+    raise RuntimeError("control plane did not request a cleartext password")
+conn.sendall(b"p" + struct.pack("!I", len(password) + 5) + password + b"\0")
+
+while True:
+    kind, payload = recv_message(conn)
+    if kind == b"E":
+        fields = {}
+        for field in payload.rstrip(b"\0").split(b"\0"):
+            if field:
+                fields[field[:1].decode()] = field[1:].decode(errors="replace")
+        print(f"SQLSTATE={fields.get('C', '')} MESSAGE={fields.get('M', '')}")
+        sys.exit(1)
+    if kind == b"Z":
+        print("empty database was accepted")
+        sys.exit(0)
+PY
+}
+
+metadata_proxy_e2e() { # opted-in org password, disabled sibling password
+  org="$1"; pw="$2"; disabled_org="$3"; disabled_pw="$4"
+  log "native metadata Postgres proxy on $org (explicit opt-in + exact virtual database)"
+
+  # The migration default is the access boundary: a ready CNPG-backed org is
+  # still private until an operator opts it in.
+  enabled="$(api_get "$org" warehouse | jq -r '.metadata_proxy_enabled')"
+  [ "$enabled" = "false" ] \
+    || fail "metadata proxy: $org default metadata_proxy_enabled=$enabled, want false"
+  assert_metadata_proxy_denied "$org" "$pw" "before opt-in"
+
+  updated="$(curl -fsS -X PUT -H "$H" -H 'Content-Type: application/json' \
+    -d '{"metadata_proxy_enabled":true}' "$API/api/v1/orgs/$org/warehouse")" \
+    || fail "metadata proxy: enable PUT failed"
+  echo "$updated" | jq -e '.metadata_proxy_enabled == true' >/dev/null \
+    || fail "metadata proxy: enable PUT did not round-trip true: $updated"
+
+  # Config-store snapshots poll asynchronously. Retry only the expected
+  # pre-poll denial; an auth/upstream/query error is a real failure.
+  expected_ident="mdstore_$(printf %s "$org" | tr 'A-Z-' 'a-z_' | tr -cd 'a-z0-9_')"
+  query="SELECT current_database(), current_user, EXISTS (SELECT 1 FROM public.ducklake_metadata WHERE key='version')"
+  out=""
+  for _ in $(seq 1 12); do
+    if out="$(metadata_pg_try "$org" "$pw" metadata "$query")"; then
+      break
+    fi
+    case "$out" in
+      *"metadata endpoint is unavailable"*) sleep 2 ;;
+      *) fail "metadata proxy: opted-in connection/query failed: $out" ;;
+    esac
+  done
+  [ "$out" = "$expected_ident|$expected_ident|t" ] \
+    || fail "metadata proxy: real metadata query returned '$out', want '$expected_ident|$expected_ident|t'"
+
+  # A normal Duckgres catalog name is forbidden on the metadata SNI.
+  if out="$(metadata_pg_try "$org" "$pw" ducklake 'SELECT 1')"; then
+    fail "metadata proxy: dbname=ducklake unexpectedly connected: $out"
+  fi
+  case "$out" in
+    *'database does not exist; connect with dbname="metadata"'*) ;;
+    *) fail "metadata proxy: wrong-database rejection was not explicit: $out" ;;
+  esac
+
+  # Exact empty database (not libpq's defaulting behavior) is also forbidden.
+  if out="$(metadata_empty_database_try "$org" "$pw")"; then
+    fail "metadata proxy: empty startup database unexpectedly connected: $out"
+  fi
+  case "$out" in
+    *'SQLSTATE=3D000'*'dbname="metadata"'*) ;;
+    *) fail "metadata proxy: empty-database rejection was wrong: $out" ;;
+  esac
+
+  # Enabling one tenant never publishes a sibling on the same CNPG shard.
+  assert_metadata_proxy_denied "$disabled_org" "$disabled_pw" "sibling remains opted out"
+
+  # Leave the shared test tenant private and prove the disable reaches the same
+  # live config-store gate used at connect time.
+  updated="$(curl -fsS -X PUT -H "$H" -H 'Content-Type: application/json' \
+    -d '{"metadata_proxy_enabled":false}' "$API/api/v1/orgs/$org/warehouse")" \
+    || fail "metadata proxy: disable PUT failed"
+  echo "$updated" | jq -e '.metadata_proxy_enabled == false' >/dev/null \
+    || fail "metadata proxy: disable PUT did not round-trip false: $updated"
+  for _ in $(seq 1 12); do
+    if out="$(metadata_pg_try "$org" "$pw" metadata 'SELECT 1')"; then
+      sleep 2
+      continue
+    fi
+    case "$out" in
+      *"metadata endpoint is unavailable"*)
+        log "native metadata Postgres proxy OK on $org"
+        return ;;
+      *) fail "metadata proxy: post-disable connection failed for the wrong reason: $out" ;;
+    esac
+  done
+  fail "metadata proxy: $org still accepted new connections after disable"
 }
 
 # ---- wire protocol --------------------------------------------------------
@@ -3669,6 +3849,24 @@ query_log_access_metadata() { # org password
     log "query_log_access_metadata: no row for $marker_n (statement may have been rejected pre-log); skipping incomplete check"
   fi
 
+  # A CALL is parseable but its procedure body is not: access must come back
+  # `unknown` while metadata_complete stays TRUE. This pins the distinction the
+  # extraction depends on — "parsed, but its access is opaque" is a different
+  # fact from "we could not parse it", and only the latter is fixable by a
+  # better parser. Both deny, so conflating them would quietly turn an
+  # allowlistable procedure call into a parser bug report.
+  marker_c="qlcall_$(date +%s)_$$"
+  pg "$1" "$2" ducklake "CALL pragma_version() /* $marker_c */" >/dev/null
+  crow="$(ql_meta_row "$1" "$2" "$marker_c")" || fail "query_log_access_metadata: no row for $marker_c"
+  case "$crow" in
+    unknown\|*) : ;;
+    *) fail "query_log_access_metadata: CALL access_kinds should be 'unknown' (row: $crow)" ;;
+  esac
+  case "$crow" in
+    *"|true|"*) : ;;
+    *) fail "query_log_access_metadata: CALL parses, so metadata_complete must be true (row: $crow)" ;;
+  esac
+
   pg_try "$1" "$2" ducklake "DROP TABLE IF EXISTS $tbl" >/dev/null 2>&1 || true
   log "query_log access metadata OK on $1"
 }
@@ -3794,6 +3992,14 @@ main() {
     return
   fi
 
+  # Initialize the tenant's DuckLake catalog once so public.ducklake_metadata
+  # deterministically exists before we query it through native Postgres. The
+  # subsequent metadata-proxy connection itself bypasses the worker entirely.
+  wait_worker "$CNPG" "$cnpg_pw" ducklake
+  # Assert the proxy before the three worker-churn lanes. RES2 is the
+  # same-backend disabled sibling.
+  metadata_proxy_e2e "$CNPG" "$cnpg_pw" "$RES2" "$res2_pw"
+
   # Admin models explorer: orgs + their users now exist in the config store, so
   # the sidebar counts are non-trivial and the org-users redaction check bites
   # against a real bcrypt-hash-bearing row.
@@ -3877,7 +4083,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + native-metadata-proxy(explicit-opt-in/exact-db/real-cnpg-query/per-org-disable) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty + CALL opaque-but-complete) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

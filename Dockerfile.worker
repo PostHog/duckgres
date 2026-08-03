@@ -155,10 +155,12 @@ RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
       echo "Verified: duckgres-worker linked against duckdb-go-bindings@$embedded" ; \
     fi
 
-FROM debian:bookworm-slim
+FROM chainguard/wolfi-base:latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
+# libstdc++ is the C++ runtime the CGO-linked DuckDB engine needs — present
+# implicitly on debian-slim, but not in wolfi-base.
+RUN apk add --no-cache ca-certificates-bundle libstdc++ \
+    && addgroup -S duckgres && adduser -S -G duckgres -h /app duckgres
 
 WORKDIR /app
 COPY --from=builder /build/duckgres-worker .

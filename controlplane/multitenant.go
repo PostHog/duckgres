@@ -83,7 +83,20 @@ func (p catalogCopierProber) ProbeCNPG(ctx context.Context, shard string) error 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
 // (for the control plane) and admin.OrgStackInfo (for the admin API).
 type orgRouterAdapter struct {
-	router *OrgRouter
+	router              *OrgRouter
+	metadataPostgresURL func(context.Context, string) (string, error)
+	metadataSessions    *metadataProxySessionRegistry
+}
+
+func (a *orgRouterAdapter) MetadataPostgresURL(ctx context.Context, orgID string) (string, error) {
+	if a.metadataPostgresURL == nil {
+		return "", fmt.Errorf("metadata Postgres resolver is not configured")
+	}
+	return a.metadataPostgresURL(ctx, orgID)
+}
+
+func (a *orgRouterAdapter) MetadataProxySessions() *metadataProxySessionRegistry {
+	return a.metadataSessions
 }
 
 // effectiveDefaultWorkerTTL resolves the janitor's hot-idle retention: the
@@ -113,10 +126,12 @@ func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 }
 
 func (a *orgRouterAdapter) BeginDrain() {
+	a.metadataSessions.KillAll()
 	a.router.BeginDrain()
 }
 
 func (a *orgRouterAdapter) ShutdownAll() {
+	a.metadataSessions.KillAll()
 	a.router.ShutdownAll()
 }
 
@@ -335,7 +350,8 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, nil, err
 	}
 
-	adpt := &orgRouterAdapter{router: router}
+	metadataSessions := newMetadataProxySessionRegistry(cfg.MetadataProxyMaxConns)
+	adpt := &orgRouterAdapter{router: router, metadataSessions: metadataSessions}
 	runtimeTracker := NewControlPlaneRuntimeTracker(
 		store,
 		cpInstanceID,
@@ -468,6 +484,7 @@ func SetupMultiTenant(
 		},
 	)
 	if refreshActivator != nil {
+		adpt.metadataPostgresURL = refreshActivator.MetadataPostgresURL
 		refreshActivator.resolveDucklingStatus = resolveDucklingStatus
 	}
 
@@ -606,7 +623,13 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
 	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
-	clusterInfo := &clusterInfoProvider{router: router, store: store, srv: srv, selfCPID: cpInstanceID}
+	clusterInfo := &clusterInfoProvider{
+		router:           router,
+		store:            store,
+		srv:              srv,
+		selfCPID:         cpInstanceID,
+		metadataSessions: metadataSessions,
+	}
 	imp := &impersonator{router: router}
 	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
 	// memory, so a single replica only sees its own slice. The fetcher fans the
