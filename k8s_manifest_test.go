@@ -49,6 +49,30 @@ func TestLiveControlPlaneManifestsExposeOnlyPGWire(t *testing.T) {
 	}
 }
 
+func TestControlPlaneImageExposesPGWireAdminAndMetrics(t *testing.T) {
+	data, err := os.ReadFile("Dockerfile.controlplane")
+	if err != nil {
+		t.Fatalf("ReadFile(Dockerfile.controlplane): %v", err)
+	}
+
+	var exposed []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "EXPOSE" {
+			exposed = append(exposed, fields[1:]...)
+		}
+	}
+	want := []string{"5432", "8080", "9090"}
+	if len(exposed) != len(want) {
+		t.Fatalf("Dockerfile.controlplane exposed ports = %v, want %v", exposed, want)
+	}
+	for i := range want {
+		if exposed[i] != want[i] {
+			t.Fatalf("Dockerfile.controlplane exposed ports = %v, want %v", exposed, want)
+		}
+	}
+}
+
 func TestLiveControlPlaneManifestsReadinessProbeTargetsAPIHealthEndpoint(t *testing.T) {
 	paths := []string{
 		filepath.Join("k8s", "control-plane-multitenant-local.yaml"),

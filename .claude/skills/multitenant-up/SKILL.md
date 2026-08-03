@@ -14,7 +14,7 @@ Boot up the multi-tenant K8s stack:
    ```bash
    pkill -f 'port-forward.*duckgres' 2>/dev/null; sleep 1
    kubectl -n duckgres port-forward svc/duckgres 5432:5432 &>/dev/null &
-   kubectl -n duckgres port-forward deployment/duckgres-control-plane 9090:9090 &>/dev/null &
+   kubectl -n duckgres port-forward deployment/duckgres-control-plane 8080:8080 &>/dev/null &
    ```
 
 3. Grab the admin API token:
@@ -23,6 +23,6 @@ Boot up the multi-tenant K8s stack:
    ```
 
 4. Report to the user:
-   - Admin dashboard: http://localhost:9090 (show the token)
+   - Admin dashboard: http://localhost:8080 (show the token)
    - PG: `PGSSLMODE=require PGPASSWORD=postgres psql -h localhost -U postgres`
    - Default credentials: postgres / postgres

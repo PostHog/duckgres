@@ -428,7 +428,7 @@ func sameTenantActivationRuntime(current, next ActivationPayload) bool {
 func (p *SessionPool) validateControlMetadata(meta server.WorkerControlMetadata) error {
 	// Epoch and CP instance ID checks are intentionally omitted here.
 	// Worker ownership is already serialized by the config store's transactional
-	// ClaimIdleWorker / ClaimHotIdleWorker / TakeOverWorker operations, and a
+	// ClaimIdleWorker / ClaimHotIdleWorker operations, and a
 	// worker's org assignment never changes after activation (hot → hot-idle
 	// stays on the same org until TTL expiry). Validating epoch/cpInstanceID
 	// on every health check caused cascading worker kills during CP rolling

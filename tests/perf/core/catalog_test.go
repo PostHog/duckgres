@@ -1,9 +1,42 @@
 package core
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCheckedInCatalogsLoad(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "queries", "*.yaml"))
+	if err != nil {
+		t.Fatalf("Glob perf catalogs: %v", err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("expected at least one checked-in perf catalog")
+	}
+
+	for _, path := range paths {
+		path := path
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			catalog, err := LoadCatalog(path)
+			if err != nil {
+				t.Fatalf("LoadCatalog(%s): %v", path, err)
+			}
+			if len(catalog.Targets) != 1 || catalog.Targets[0] != ProtocolPGWire {
+				t.Fatalf("catalog targets = %v, want [pgwire]", catalog.Targets)
+			}
+
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile(%s): %v", path, err)
+			}
+			if strings.Contains(string(raw), "duckhog_sql:") {
+				t.Fatal("catalog must not contain obsolete duckhog_sql entries")
+			}
+		})
+	}
+}
 
 func TestParseCatalogSuccess(t *testing.T) {
 	raw := `
