@@ -601,6 +601,8 @@ func TestPostHogTableSetupValidatesRequiredSourceColumnsAndMappings(t *testing.T
 		"CAST(historical_migration AS BOOLEAN)",
 		"CAST(\"timestamp\" AS TIMESTAMPTZ)",
 		"CAST(_timestamp AS TIMESTAMPTZ)",
+		"SET preserve_insertion_order = false",
+		"streaming_rewritten_insert",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("posthog setup missing explicit source mapping or diagnostic %q", want)

@@ -113,12 +113,17 @@ CREATE TABLE IF NOT EXISTS main.posthog_table_setup_manifest (
     created_at TIMESTAMPTZ
 );
 
-BEGIN TRANSACTION;
-
 -- Rewritten inserts make a partial setup retry deterministic: each run replaces
 -- the table contents rather than appending a second copy of the frozen fixture.
 DELETE FROM posthog.events;
 DELETE FROM posthog.persons;
+
+-- The frozen fixture is larger than the worker's temporary disk. Do not retain
+-- insertion order while writing its partitioned DuckLake tables: this lets
+-- DuckDB flush completed data blocks instead of accumulating spill state for
+-- the full backfill. Each large insert commits independently so its temporary
+-- state cannot be retained by the other relation's load.
+SET preserve_insertion_order = false;
 
 INSERT INTO posthog.events (
     uuid, event, properties, timestamp, team_id, project_id, distinct_id,
@@ -173,6 +178,8 @@ SELECT
     CAST(_inserted_at AS TIMESTAMPTZ)
 FROM frozen_v1.persons_file_view;
 
+BEGIN TRANSACTION;
+
 DELETE FROM main.posthog_table_setup_manifest
 WHERE production_schema_revision = '056583335dc739b9e025efede811c9b4f5e153f5';
 
@@ -189,7 +196,7 @@ INSERT INTO main.posthog_table_setup_manifest (
 )
 SELECT
     '056583335dc739b9e025efede811c9b4f5e153f5',
-    'rewritten_insert',
+    'streaming_rewritten_insert',
     'year(timestamp), month(timestamp), day(timestamp)',
     'year(_timestamp), month(_timestamp)',
     (SELECT COUNT(*) FROM frozen_v1.events_file_view),
