@@ -222,7 +222,7 @@ normal `go test ./...` lane.
   code. What an ext org would add is DSN/sslmode resolution, which
   `reshard_targets` and the activation assertions already cover.
 
-- **Mid-statement STS credential recovery (httpfs `v1.5.3-cred-refresh-write-retry`)** —
+- **Mid-statement STS credential recovery (patched PostHog httpfs)** —
   the worker image bundles the PostHog httpfs fork patch that re-resolves the
   latest committed `ducklake_s3` secret and retries on ExpiredToken read/write
   auth failures, letting a statement outlive the STS token it started with.
@@ -321,7 +321,7 @@ normal `go test ./...` lane.
   survive credential rotation (DuckDB resolves secrets through the
   statement's MVCC snapshot, and scan-workload file opens skip the HEAD that
   could trigger httpfs' refresh-on-403). With the bundled
-  `v1.5.3-cred-refresh-write-retry` fork build the floor is defense-in-depth rather than
+  `v1.5.5-cred-refresh-write-retry` fork build the floor is defense-in-depth rather than
   the only protection — see the mid-statement recovery bullet above.
 - **PostHog product-analytics events** (`internal/analytics`,
   `warehouse_provision_begin`/`_success`/`_failed`,
