@@ -53,7 +53,8 @@ type Statement struct {
 // system-issued catalog secrets, DuckDB's default names for unnamed secrets,
 // and a duckgres_ prefix reserved for future system use.
 var reservedNames = map[string]struct{}{
-	"ducklake_s3": {},
+	"ducklake_s3":                 {},
+	"posthog_staging_delta_https": {},
 }
 
 var reservedPrefixes = []string{"__default_", "duckgres_"}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -2051,43 +2052,66 @@ func createS3SecretWith(db attachSQLRunner, dlCfg DuckLakeConfig) error {
 	// Check if secret already exists to avoid unnecessary creation
 	var count int
 	err := db.queryRowScan("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_s3'", &count)
-	if err == nil && count > 0 {
-		return nil // Secret already exists
-	}
+	if err != nil || count == 0 {
+		// Determine provider: use credential_chain if explicitly set or if no access key provided
+		provider := S3ProviderForConfig(dlCfg)
 
-	// Determine provider: use credential_chain if explicitly set or if no access key provided
-	provider := S3ProviderForConfig(dlCfg)
+		var secretStmt string
 
-	var secretStmt string
-
-	switch provider {
-	case "aws_sdk":
-		// Use Go AWS SDK to fetch credentials (supports EKS Pod Identity, IRSA, etc.)
-		// Bounded so a hung credential source (e.g. a blackholed IMDS/Pod
-		// Identity endpoint) fails fast instead of stalling the attach.
-		sdkCtx, sdkCancel := context.WithTimeout(context.Background(), attachStepTimeout)
-		defer sdkCancel()
-		var err error
-		secretStmt, err = buildAWSSdkSecret(sdkCtx, dlCfg)
-		if err != nil {
-			return fmt.Errorf("aws_sdk credential fetch failed: %w", err)
+		switch provider {
+		case "aws_sdk":
+			// Use Go AWS SDK to fetch credentials (supports EKS Pod Identity, IRSA, etc.)
+			// Bounded so a hung credential source (e.g. a blackholed IMDS/Pod
+			// Identity endpoint) fails fast instead of stalling the attach.
+			sdkCtx, sdkCancel := context.WithTimeout(context.Background(), attachStepTimeout)
+			defer sdkCancel()
+			var err error
+			secretStmt, err = buildAWSSdkSecret(sdkCtx, dlCfg)
+			if err != nil {
+				return fmt.Errorf("aws_sdk credential fetch failed: %w", err)
+			}
+			slog.Info("Creating S3 secret with aws_sdk provider (Go SDK credentials).")
+		case "credential_chain":
+			// Use DuckDB's built-in credential chain (does NOT support EKS Pod Identity)
+			secretStmt = buildCredentialChainSecret(dlCfg)
+			slog.Info("Creating S3 secret with credential_chain provider.")
+		default:
+			// Use explicit credentials (config provider)
+			secretStmt = buildConfigSecret(dlCfg)
+			slog.Info("Creating S3 secret with config provider.", "endpoint", dlCfg.S3Endpoint)
 		}
-		slog.Info("Creating S3 secret with aws_sdk provider (Go SDK credentials).")
-	case "credential_chain":
-		// Use DuckDB's built-in credential chain (does NOT support EKS Pod Identity)
-		secretStmt = buildCredentialChainSecret(dlCfg)
-		slog.Info("Creating S3 secret with credential_chain provider.")
-	default:
-		// Use explicit credentials (config provider)
-		secretStmt = buildConfigSecret(dlCfg)
-		slog.Info("Creating S3 secret with config provider.", "endpoint", dlCfg.S3Endpoint)
+
+		if _, err := db.Exec(secretStmt); err != nil {
+			return err
+		}
+
+		slog.Info("Created S3 secret successfully.")
 	}
 
-	if _, err := db.Exec(secretStmt); err != nil {
+	if err := ensureStagingDeltaHTTPSSecret(db, dlCfg); err != nil {
 		return err
 	}
+	return nil
+}
 
-	slog.Info("Created S3 secret successfully.")
+func ensureStagingDeltaHTTPSSecret(db attachSQLRunner, dlCfg DuckLakeConfig) error {
+	stmt, ok := buildStagingDeltaHTTPSSecret(dlCfg)
+	if !ok {
+		return nil
+	}
+
+	var count int
+	err := db.queryRowScan(
+		"SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'posthog_staging_delta_https'",
+		&count,
+	)
+	if err == nil && count > 0 {
+		return nil
+	}
+	if _, err := db.Exec(stmt); err != nil {
+		return fmt.Errorf("create staging Delta HTTPS secret: %s", redactSecretStatementError(err.Error()))
+	}
+	slog.Info("Created staging Delta HTTPS S3 secret.")
 	return nil
 }
 
@@ -2121,17 +2145,24 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 		secretStmt = buildConfigSecret(dlCfg)
 	}
 
-	// If the previous session left the connection in DuckDB's "Current
-	// transaction is aborted" state, the exec will always fail. Issue a
-	// ROLLBACK to recover, matching the pattern in StartCredentialRefresh.
-	if _, err := ae.Exec(secretStmt); err != nil {
-		if isTransactionAborted(err) {
-			_, _ = ae.Exec("ROLLBACK")
-			if _, retryErr := ae.Exec(secretStmt); retryErr != nil {
-				return fmt.Errorf("refresh S3 secret after rollback: %s", redactSecretStatementError(retryErr.Error()))
+	secretStmts := []string{secretStmt}
+	if stagingStmt, ok := buildStagingDeltaHTTPSSecret(dlCfg); ok {
+		secretStmts = append(secretStmts, stagingStmt)
+	}
+
+	for _, stmt := range secretStmts {
+		// If the previous session left the connection in DuckDB's "Current
+		// transaction is aborted" state, the exec will always fail. Issue a
+		// ROLLBACK to recover, matching the pattern in StartCredentialRefresh.
+		if _, err := ae.Exec(stmt); err != nil {
+			if isTransactionAborted(err) {
+				_, _ = ae.Exec("ROLLBACK")
+				if _, retryErr := ae.Exec(stmt); retryErr != nil {
+					return fmt.Errorf("refresh S3 secret after rollback: %s", redactSecretStatementError(retryErr.Error()))
+				}
+			} else {
+				return fmt.Errorf("refresh S3 secret: %s", redactSecretStatementError(err.Error()))
 			}
-		} else {
-			return fmt.Errorf("refresh S3 secret: %s", redactSecretStatementError(err.Error()))
 		}
 	}
 	slog.Debug("Refreshed S3 secret for hot-idle reuse.", "provider", provider)
@@ -2237,6 +2268,52 @@ func buildConfigSecret(dlCfg DuckLakeConfig) string {
 
 	secret += "\n\t\t)"
 	return secret
+}
+
+func buildStagingDeltaHTTPSSecret(dlCfg DuckLakeConfig) (string, bool) {
+	if S3ProviderForConfig(dlCfg) != "config" || dlCfg.S3AccessKey == "" || dlCfg.S3SecretKey == "" {
+		return "", false
+	}
+	if dlCfg.S3Endpoint != "" && !isAWSS3Endpoint(dlCfg.S3Endpoint) {
+		return "", false
+	}
+	objectStore, err := url.Parse(dlCfg.ObjectStore)
+	if err != nil || objectStore.Scheme != "s3" || objectStore.Host == "" {
+		return "", false
+	}
+
+	region := dlCfg.S3Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	scope := fmt.Sprintf("s3://%s/__posthog_staging", objectStore.Host)
+	stmt := fmt.Sprintf(`
+		CREATE OR REPLACE SECRET posthog_staging_delta_https (
+			TYPE s3,
+			PROVIDER config,
+			KEY_ID '%s',
+			SECRET '%s',
+			REGION '%s',
+			URL_STYLE 'vhost',
+			USE_SSL true,
+			SESSION_TOKEN '%s',
+			SCOPE '%s'
+		)`,
+		dlCfg.S3AccessKey,
+		dlCfg.S3SecretKey,
+		region,
+		dlCfg.S3SessionToken,
+		scope,
+	)
+	return stmt, true
+}
+
+func isAWSS3Endpoint(endpoint string) bool {
+	host := strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+	host = strings.SplitN(host, "/", 2)[0]
+	host = strings.SplitN(host, ":", 2)[0]
+	return host == "s3.amazonaws.com" ||
+		(strings.HasPrefix(host, "s3.") && strings.HasSuffix(host, ".amazonaws.com"))
 }
 
 // buildCredentialChainSecret builds a CREATE SECRET statement using AWS SDK credential chain

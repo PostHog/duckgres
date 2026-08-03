@@ -124,7 +124,13 @@ func TestClassify(t *testing.T) {
 }
 
 func TestIsReservedName(t *testing.T) {
-	for _, name := range []string{"ducklake_s3", "DUCKLAKE_S3", "__default_s3", "duckgres_internal"} {
+	for _, name := range []string{
+		"ducklake_s3",
+		"posthog_staging_delta_https",
+		"DUCKLAKE_S3",
+		"__default_s3",
+		"duckgres_internal",
+	} {
 		if !IsReservedName(name) {
 			t.Errorf("IsReservedName(%q) = false, want true", name)
 		}

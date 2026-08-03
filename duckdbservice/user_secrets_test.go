@@ -59,6 +59,7 @@ func TestWipeUserSecrets(t *testing.T) {
 	// System-managed secrets (created with plain CREATE OR REPLACE SECRET, so
 	// they land in in-memory/temporary storage). These must survive the wipe.
 	mustExec("CREATE OR REPLACE SECRET ducklake_s3 (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
+	mustExec("CREATE OR REPLACE SECRET posthog_staging_delta_https (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
 	mustExec("CREATE OR REPLACE SECRET duckgres_internal (TYPE s3, KEY_ID 'sys', SECRET 'sys')")
 	// User secrets: a persistent one and a temporary one. Both must be dropped.
 	mustExec("CREATE PERSISTENT SECRET user_a (TYPE s3, KEY_ID 'a', SECRET 'a')")
@@ -78,7 +79,7 @@ func TestWipeUserSecrets(t *testing.T) {
 			t.Errorf("user secret %q remains after wipe; remaining: %v", leaked, remaining)
 		}
 	}
-	for _, sys := range []string{"ducklake_s3", "duckgres_internal"} {
+	for _, sys := range []string{"ducklake_s3", "posthog_staging_delta_https", "duckgres_internal"} {
 		if !remaining[sys] {
 			t.Errorf("system secret %q was wiped; remaining: %v", sys, remaining)
 		}

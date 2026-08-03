@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 )
@@ -121,6 +122,179 @@ func TestBuildConfigSecretAlwaysEmitsSessionToken(t *testing.T) {
 	})
 	if !strings.Contains(withToken, "SESSION_TOKEN 'tok'") {
 		t.Errorf("config secret must carry the explicit token:\n%s", withToken)
+	}
+}
+
+func TestBuildStagingDeltaHTTPSSecret(t *testing.T) {
+	t.Run("uses the activated credentials with a bucket-root staging scope", func(t *testing.T) {
+		stmt, ok := buildStagingDeltaHTTPSSecret(DuckLakeConfig{
+			ObjectStore:    "s3://managed-warehouse/catalog/",
+			S3Provider:     "config",
+			S3AccessKey:    "ASIAEXAMPLE",
+			S3SecretKey:    "secret",
+			S3SessionToken: "token",
+			S3Region:       "us-east-1",
+			S3Endpoint:     "s3.us-east-1.amazonaws.com",
+			S3UseSSL:       false,
+			S3URLStyle:     "path",
+			HTTPProxy:      "http://10.0.0.1:8080",
+		})
+		if !ok {
+			t.Fatal("expected an explicit staging secret")
+		}
+
+		for _, want := range []string{
+			"CREATE OR REPLACE SECRET posthog_staging_delta_https",
+			"PROVIDER config",
+			"KEY_ID 'ASIAEXAMPLE'",
+			"SECRET 'secret'",
+			"SESSION_TOKEN 'token'",
+			"REGION 'us-east-1'",
+			"URL_STYLE 'vhost'",
+			"USE_SSL true",
+			"SCOPE 's3://managed-warehouse/__posthog_staging'",
+		} {
+			if !strings.Contains(stmt, want) {
+				t.Errorf("staging secret missing %q:\n%s", want, stmt)
+			}
+		}
+		for _, forbidden := range []string{"PROVIDER credential_chain", "ENDPOINT", "10.0.0.1"} {
+			if strings.Contains(stmt, forbidden) {
+				t.Errorf("staging secret must bypass the cache transport; found %q:\n%s", forbidden, stmt)
+			}
+		}
+	})
+
+	t.Run("pins an empty session token", func(t *testing.T) {
+		stmt, ok := buildStagingDeltaHTTPSSecret(DuckLakeConfig{
+			ObjectStore: "s3://managed-warehouse/",
+			S3Provider:  "config",
+			S3AccessKey: "AKIAEXAMPLE",
+			S3SecretKey: "secret",
+		})
+		if !ok {
+			t.Fatal("expected an explicit staging secret")
+		}
+		if !strings.Contains(stmt, "SESSION_TOKEN ''") {
+			t.Fatalf("staging secret must pin the empty token:\n%s", stmt)
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		cfg  DuckLakeConfig
+	}{
+		{
+			name: "credential chain remains a legacy client fallback",
+			cfg: DuckLakeConfig{
+				ObjectStore: "s3://legacy-bucket/",
+				S3Provider:  "credential_chain",
+			},
+		},
+		{
+			name: "non-S3 object store",
+			cfg: DuckLakeConfig{
+				ObjectStore: "file:///tmp/ducklake",
+				S3Provider:  "config",
+				S3AccessKey: "key",
+				S3SecretKey: "secret",
+			},
+		},
+		{
+			name: "missing explicit credentials",
+			cfg: DuckLakeConfig{
+				ObjectStore: "s3://managed-warehouse/",
+				S3Provider:  "config",
+			},
+		},
+		{
+			name: "S3-compatible non-AWS endpoint",
+			cfg: DuckLakeConfig{
+				ObjectStore: "s3://local-bucket/",
+				S3Provider:  "config",
+				S3AccessKey: "key",
+				S3SecretKey: "secret",
+				S3Endpoint:  "localhost:19000",
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if stmt, ok := buildStagingDeltaHTTPSSecret(tt.cfg); ok || stmt != "" {
+				t.Fatalf("buildStagingDeltaHTTPSSecret() = (%q, %v), want no secret", stmt, ok)
+			}
+		})
+	}
+}
+
+func TestCreateAndRefreshS3SecretManageStagingDeltaHTTPSSecret(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("INSTALL httpfs"); err != nil {
+		t.Skip("httpfs extension not available:", err)
+	}
+	if _, err := db.Exec("LOAD httpfs"); err != nil {
+		t.Skip("httpfs extension not loadable:", err)
+	}
+
+	cfg := DuckLakeConfig{
+		ObjectStore:    "s3://managed-warehouse/",
+		S3Provider:     "config",
+		S3AccessKey:    "ASIAINITIAL",
+		S3SecretKey:    "initial-secret",
+		S3SessionToken: "initial-token",
+		S3Region:       "us-east-1",
+	}
+	if err := createS3Secret(db, cfg); err != nil {
+		t.Fatalf("createS3Secret() error: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`
+		SELECT count(*)
+		FROM duckdb_secrets()
+		WHERE name IN ('ducklake_s3', 'posthog_staging_delta_https')
+	`).Scan(&count); err != nil {
+		t.Fatalf("query managed secrets: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("managed secret count = %d, want 2", count)
+	}
+	if _, err := db.Exec("DROP SECRET posthog_staging_delta_https"); err != nil {
+		t.Fatalf("drop staging secret: %v", err)
+	}
+	if err := createS3Secret(db, cfg); err != nil {
+		t.Fatalf("createS3Secret() with existing catalog secret error: %v", err)
+	}
+	if err := db.QueryRow(`
+		SELECT count(*)
+		FROM duckdb_secrets()
+		WHERE name = 'posthog_staging_delta_https'
+	`).Scan(&count); err != nil {
+		t.Fatalf("query restored staging secret: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("restored staging secret count = %d, want 1", count)
+	}
+
+	cfg.S3AccessKey = "ASIAROTATED"
+	cfg.S3SecretKey = "rotated-secret"
+	cfg.S3SessionToken = "rotated-token"
+	if err := RefreshS3Secret(db, cfg, nil); err != nil {
+		t.Fatalf("RefreshS3Secret() error: %v", err)
+	}
+	if err := db.QueryRow(`
+		SELECT count(*)
+		FROM duckdb_secrets()
+		WHERE name IN ('ducklake_s3', 'posthog_staging_delta_https')
+	`).Scan(&count); err != nil {
+		t.Fatalf("query refreshed managed secrets: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("refreshed managed secret count = %d, want 2", count)
 	}
 }
 
