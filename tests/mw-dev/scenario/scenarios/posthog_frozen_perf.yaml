@@ -60,7 +60,7 @@ steps:
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
-      catalog_file: ../../../perf/queries/ducklake_frozen.yaml
+      catalog_file: ../../../perf/queries/ducklake_posthog_tables.yaml
       targets: [pgwire]
       run_id: ${run_id}
       dataset_version: posthog-file-views-v1
