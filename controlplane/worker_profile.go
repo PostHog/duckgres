@@ -259,3 +259,35 @@ func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int,
 	}
 	return int((millis + 999) / 1000), nil
 }
+
+// defaultExploratoryWorkerTTL keeps an org's exploratory worker parked
+// hot-idle for two days after its last connection — the "warm pod for every
+// recently-active team" retention from the tier design.
+const defaultExploratoryWorkerTTL = 48 * time.Hour
+
+// exploratoryWorkerProfile resolves the deployment's exploratory small-worker
+// shape. Returns nil when the tier is disabled OR unusable (missing/invalid
+// size) — a half-configured tier must degrade to today's behavior, never to a
+// BestEffort pod. Sizes are normalized so MatchKey-based reuse is canonical.
+func exploratoryWorkerProfile(k K8sConfig) (*WorkerProfile, []string) {
+	if !k.ExploratoryTierEnabled {
+		return nil, nil
+	}
+	var warns []string
+	if strings.TrimSpace(k.ExploratoryWorkerCPU) == "" || strings.TrimSpace(k.ExploratoryWorkerMemory) == "" {
+		return nil, append(warns, "exploratory tier enabled but DUCKGRES_EXPLORATORY_WORKER_CPU/MEMORY not both set; tier disabled")
+	}
+	cpu, _, err := sizeField("exploratory worker cpu", k.ExploratoryWorkerCPU, "", "")
+	if err != nil {
+		return nil, append(warns, fmt.Sprintf("invalid exploratory worker cpu; tier disabled: %v", err))
+	}
+	mem, _, err := sizeField("exploratory worker memory", k.ExploratoryWorkerMemory, "", "")
+	if err != nil {
+		return nil, append(warns, fmt.Sprintf("invalid exploratory worker memory; tier disabled: %v", err))
+	}
+	ttl := defaultExploratoryWorkerTTL
+	if k.ExploratoryWorkerTTL > 0 {
+		ttl = k.ExploratoryWorkerTTL
+	}
+	return &WorkerProfile{CPU: cpu, Memory: mem, TTL: ttl}, warns
+}

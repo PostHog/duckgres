@@ -401,3 +401,39 @@ func TestResolveWorkerProfileSizedNoTTLUsesWorkerDefaultTTL(t *testing.T) {
 		t.Fatalf("org ttl = %v, want 30m (org default beats deployment default)", p.TTL)
 	}
 }
+
+func TestExploratoryWorkerProfile(t *testing.T) {
+	k := K8sConfig{ExploratoryTierEnabled: true, ExploratoryWorkerCPU: "2", ExploratoryWorkerMemory: "4Gi", ExploratoryWorkerTTL: 48 * time.Hour}
+	p, warns := exploratoryWorkerProfile(k)
+	if p == nil || len(warns) != 0 {
+		t.Fatalf("p=%v warns=%v", p, warns)
+	}
+	if p.CPU != "2" || p.Memory != "4Gi" || p.TTL != 48*time.Hour {
+		t.Fatalf("profile=%+v", p)
+	}
+	// MatchKey must be a concrete shape, never the default "|" (that would
+	// let exploratory traffic reuse default-shape workers and vice versa).
+	if p.MatchKey() == "|" {
+		t.Fatal("exploratory profile must not share the default MatchKey")
+	}
+}
+
+func TestExploratoryWorkerProfileDisabledOrIncomplete(t *testing.T) {
+	if p, _ := exploratoryWorkerProfile(K8sConfig{}); p != nil {
+		t.Fatal("disabled tier must return nil")
+	}
+	// Enabled but no size configured: unusable — nil with a warning, so a
+	// half-configured deployment degrades to today's behavior, never to a
+	// BestEffort-pod tier.
+	p, warns := exploratoryWorkerProfile(K8sConfig{ExploratoryTierEnabled: true})
+	if p != nil || len(warns) == 0 {
+		t.Fatalf("p=%v warns=%v", p, warns)
+	}
+}
+
+func TestExploratoryWorkerProfileDefaultTTL(t *testing.T) {
+	p, _ := exploratoryWorkerProfile(K8sConfig{ExploratoryTierEnabled: true, ExploratoryWorkerCPU: "2", ExploratoryWorkerMemory: "4Gi"})
+	if p == nil || p.TTL != defaultExploratoryWorkerTTL {
+		t.Fatalf("want built-in 48h TTL, got %+v", p)
+	}
+}

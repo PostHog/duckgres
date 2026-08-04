@@ -201,6 +201,16 @@ type K8sConfig struct {
 	// hourly jobs) so scheduled workloads reuse hot-idle workers instead of
 	// cold-spawning every run — at the cost of idle worker nodes.
 	WorkerDefaultTTL time.Duration
+
+	// Exploratory small-worker tier (env-only DUCKGRES_EXPLORATORY_*): when
+	// enabled, connections without client duckgres.worker_* GUCs first land on
+	// a small worker of this shape and escalate to the org's normal profile on
+	// the first state-mutating statement or an out-of-memory read. CPU+Memory
+	// are both required for the tier to be usable; TTL 0 = built-in 48h.
+	ExploratoryTierEnabled  bool
+	ExploratoryWorkerCPU    string
+	ExploratoryWorkerMemory string
+	ExploratoryWorkerTTL    time.Duration
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
