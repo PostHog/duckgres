@@ -6,7 +6,6 @@ type Protocol string
 
 const (
 	ProtocolPGWire Protocol = "pgwire"
-	ProtocolFlight Protocol = "flight"
 )
 
 type Catalog struct {
@@ -21,12 +20,11 @@ type Catalog struct {
 }
 
 type Query struct {
-	QueryID    string         `yaml:"query_id"`
-	IntentID   string         `yaml:"intent_id"`
-	Tags       []string       `yaml:"tags"`
-	Params     map[string]any `yaml:"params"`
-	PGWireSQL  string         `yaml:"pgwire_sql"`
-	DuckhogSQL string         `yaml:"duckhog_sql"`
+	QueryID   string         `yaml:"query_id"`
+	IntentID  string         `yaml:"intent_id"`
+	Tags      []string       `yaml:"tags"`
+	Params    map[string]any `yaml:"params"`
+	PGWireSQL string         `yaml:"pgwire_sql"`
 }
 
 type ExecutionResult struct {

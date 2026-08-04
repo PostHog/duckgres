@@ -21,7 +21,6 @@ type controlPlaneExpiryStore interface {
 	ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error)
 	ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
 	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
-	ExpireFlightSessionRecords(before time.Time) (int64, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -123,7 +122,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 	// bug — the only janitor constructor (multitenant.go) sets it
 	// unconditionally. The guard remains as a fail-soft so that
 	// misconfiguration doesn't NPE the entire tick (the rest of
-	// runOnce — flight session expiry, version-reaper, stranded-pod
+	// runOnce — version reaping and stranded-pod cleanup
 	// cleanup, worker-lifecycle observation — still runs); the
 	// slog.Error makes the misconfiguration loud rather than silent.
 	if j.lifecycle == nil {
@@ -196,10 +195,6 @@ func (j *ControlPlaneJanitor) runOnce() {
 				observeHotIdleReapRun(j.now())
 			}
 		}
-	}
-
-	if _, err := j.store.ExpireFlightSessionRecords(j.now()); err != nil {
-		slog.Warn("Janitor failed to expire stale Flight sessions.", "error", err)
 	}
 
 	// Gradual rolling replacement of workers whose Deployment version

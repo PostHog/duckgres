@@ -97,7 +97,6 @@ func modelDescriptors() []modelDescriptor {
 
 		mk("cp-instances", "Control Plane Instances", modelGroupRuntime, true, configstore.ControlPlaneInstance{}),
 		mk("worker-records", "Worker Records", modelGroupRuntime, true, configstore.WorkerRecord{}),
-		mk("flight-session-records", "Flight Session Records", modelGroupRuntime, true, configstore.FlightSessionRecord{}),
 		mk("org-connection-queue", "Org Connection Queue", modelGroupRuntime, true, configstore.OrgConnectionQueueEntry{}),
 		mk("org-connection-leases", "Org Connection Leases", modelGroupRuntime, true, configstore.OrgConnectionLease{}),
 

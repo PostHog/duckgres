@@ -12,7 +12,6 @@ import (
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
-	flightdriver "github.com/posthog/duckgres/tests/perf/drivers/flight"
 	pgdriver "github.com/posthog/duckgres/tests/perf/drivers/pgwire"
 )
 
@@ -20,29 +19,24 @@ const StepTypePerfQueries = "perf_queries"
 
 type DriverFactory interface {
 	NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error)
-	NewFlight(addr, serverName, username, password string, insecureSkipVerify bool) (perfcore.ProtocolDriver, error)
 }
 
 type ExecutorConfig struct {
-	ProvisionState           *provision.State
-	Connection               scenariosql.ConnectionConfig
-	OutputDir                string
-	FlightAddr               string
-	FlightInsecureSkipVerify bool
-	DriverFactory            DriverFactory
-	State                    *State
-	Now                      func() time.Time
+	ProvisionState *provision.State
+	Connection     scenariosql.ConnectionConfig
+	OutputDir      string
+	DriverFactory  DriverFactory
+	State          *State
+	Now            func() time.Time
 }
 
 type Executor struct {
-	provisionState           *provision.State
-	connection               scenariosql.ConnectionConfig
-	outputDir                string
-	flightAddr               string
-	flightInsecureSkipVerify bool
-	driverFactory            DriverFactory
-	state                    *State
-	now                      func() time.Time
+	provisionState *provision.State
+	connection     scenariosql.ConnectionConfig
+	outputDir      string
+	driverFactory  DriverFactory
+	state          *State
+	now            func() time.Time
 }
 
 type State struct {
@@ -57,20 +51,17 @@ type StepResult struct {
 }
 
 type stepSpec struct {
-	OrgID                    string
-	Username                 string
-	Password                 string
-	CatalogFile              string
-	Targets                  []perfcore.Protocol
-	RunID                    string
-	DatasetVersion           string
-	Database                 string
-	OutputSubdir             string
-	ReadOnly                 bool
-	FailOnQueryErrors        bool
-	FlightAddr               string
-	FlightServerName         string
-	FlightInsecureSkipVerify bool
+	OrgID             string
+	Username          string
+	Password          string
+	CatalogFile       string
+	Targets           []perfcore.Protocol
+	RunID             string
+	DatasetVersion    string
+	Database          string
+	OutputSubdir      string
+	ReadOnly          bool
+	FailOnQueryErrors bool
 }
 
 type defaultDriverFactory struct{}
@@ -89,14 +80,12 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 		now = time.Now
 	}
 	return &Executor{
-		provisionState:           cfg.ProvisionState,
-		connection:               cfg.Connection,
-		outputDir:                cfg.OutputDir,
-		flightAddr:               cfg.FlightAddr,
-		flightInsecureSkipVerify: cfg.FlightInsecureSkipVerify,
-		driverFactory:            factory,
-		state:                    state,
-		now:                      now,
+		provisionState: cfg.ProvisionState,
+		connection:     cfg.Connection,
+		outputDir:      cfg.OutputDir,
+		driverFactory:  factory,
+		state:          state,
+		now:            now,
 	}
 }
 
@@ -242,20 +231,17 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	}
 
 	return stepSpec{
-		OrgID:                    orgID,
-		Username:                 username,
-		Password:                 password,
-		CatalogFile:              catalogFile,
-		Targets:                  targets,
-		RunID:                    runID,
-		DatasetVersion:           stringFromWith(step, "dataset_version", ""),
-		Database:                 stringFromWith(step, "catalog", "ducklake"),
-		OutputSubdir:             stringFromWith(step, "output_subdir", "perf"),
-		ReadOnly:                 boolFromWith(step, "read_only", true),
-		FailOnQueryErrors:        boolFromWith(step, "fail_on_query_errors", true),
-		FlightAddr:               stringFromWith(step, "flight_addr", e.flightAddr),
-		FlightServerName:         stringFromWith(step, "flight_server_name", e.defaultFlightServerName(orgID)),
-		FlightInsecureSkipVerify: boolFromWith(step, "flight_insecure_skip_verify", e.flightInsecureSkipVerify),
+		OrgID:             orgID,
+		Username:          username,
+		Password:          password,
+		CatalogFile:       catalogFile,
+		Targets:           targets,
+		RunID:             runID,
+		DatasetVersion:    stringFromWith(step, "dataset_version", ""),
+		Database:          stringFromWith(step, "catalog", "ducklake"),
+		OutputSubdir:      stringFromWith(step, "output_subdir", "perf"),
+		ReadOnly:          boolFromWith(step, "read_only", true),
+		FailOnQueryErrors: boolFromWith(step, "fail_on_query_errors", true),
 	}, nil
 }
 
@@ -278,7 +264,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire, perfcore.ProtocolFlight:
+		case perfcore.ProtocolPGWire:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -332,31 +318,12 @@ func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (m
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
 			drivers[target] = driver
-		case perfcore.ProtocolFlight:
-			if spec.FlightAddr == "" {
-				return nil, classified(ErrorClassConfig, fmt.Errorf("with.flight_addr or DUCKGRES_SCENARIO_FLIGHT_ADDR is required when perf catalog targets flight"))
-			}
-			if spec.FlightServerName == "" {
-				return nil, classified(ErrorClassConfig, fmt.Errorf("flight server name requires with.flight_server_name or a scenario SNI suffix"))
-			}
-			driver, err := e.driverFactory.NewFlight(spec.FlightAddr, spec.FlightServerName, spec.Username, spec.Password, spec.FlightInsecureSkipVerify)
-			if err != nil {
-				return nil, classified(ErrorClassConfig, fmt.Errorf("create flight perf driver: %w", err))
-			}
-			drivers[target] = driver
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("unsupported perf target protocol %q", target))
 		}
 	}
 	success = true
 	return drivers, nil
-}
-
-func (e *Executor) defaultFlightServerName(orgID string) string {
-	if e.connection.SNISuffix == "" {
-		return ""
-	}
-	return orgID + e.connection.SNISuffix
 }
 
 func (e *Executor) pgwireConnection(spec stepSpec) (scenariosql.PGWireConnection, error) {
@@ -384,16 +351,6 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (
 		return nil, err
 	}
 	return pgdriver.NewWithDB(db), nil
-}
-
-func (defaultDriverFactory) NewFlight(addr, serverName, username, password string, insecureSkipVerify bool) (perfcore.ProtocolDriver, error) {
-	return flightdriver.NewFromConfig(flightdriver.ConnectionConfig{
-		Addr:               addr,
-		ServerName:         serverName,
-		Username:           username,
-		Password:           password,
-		InsecureSkipVerify: insecureSkipVerify,
-	})
 }
 
 func requiredString(step core.Step, key string) (string, error) {

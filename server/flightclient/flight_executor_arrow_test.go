@@ -1401,8 +1401,8 @@ func TestExtractArrowValue_StructWithNullField(t *testing.T) {
 }
 
 // --- Tests verifying extractArrowValue → AppendValue round-trip for MAP ---
-// These simulate the exact code path in flightsqlingress/ingress.go:rowSetToRecord
-// where extractArrowValue output feeds into duckdbservice.AppendValue.
+// These simulate the Arrow conversion path where extractArrowValue output
+// feeds into duckdbservice.AppendValue.
 
 func TestExtractThenAppend_MapBasic(t *testing.T) {
 	// Build a source Arrow MAP record, extract via extractArrowValue,

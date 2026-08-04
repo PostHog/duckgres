@@ -17,16 +17,14 @@ go test ./tests/perf \
   -perf-catalog tests/perf/queries/smoke.yaml
 ```
 
-By default the harness auto-starts a temporary local Duckgres control-plane
-instance with Flight ingress, executes queries over both protocols, then shuts
-it down after artifact generation.
+By default the harness auto-starts a temporary local Duckgres control plane,
+executes queries over pgwire, then shuts it down after artifact generation.
 
 For frozen DuckLake dataset smoke runs, set:
 
 ```bash
 DUCKGRES_PERF_DATASET_VERSION=v1 \
 DUCKGRES_PERF_PGWIRE_DSN="host=127.0.0.1 port=5432 user=perfuser dbname=test sslmode=require" \
-DUCKGRES_PERF_FLIGHT_ADDR="127.0.0.1:50051" \
 ./scripts/perf_smoke.sh
 ```
 
@@ -77,7 +75,7 @@ Nightly uses lock/timeout guards:
 Nightly frozen dataset requirements:
 
 - `DUCKGRES_PERF_DATASET_VERSION` is required
-- `DUCKGRES_PERF_PGWIRE_DSN` and `DUCKGRES_PERF_FLIGHT_ADDR` are required
+- `DUCKGRES_PERF_PGWIRE_DSN` is required
 - default catalog is `tests/perf/queries/ducklake_frozen.yaml`
 - `dataset_manifest.json` must exist after run and match the configured dataset version
 
@@ -95,4 +93,3 @@ Optional artifact publisher:
 - `-perf-output-base`: base output directory.
 - `-perf-run-id`: fixed run id.
 - `-perf-pgwire-dsn`: use an existing PGWire endpoint instead of auto-start.
-- `-perf-flight-addr`: use an existing Flight endpoint instead of auto-start.

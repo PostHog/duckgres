@@ -276,21 +276,21 @@ func (s *runtimeLimiterTestStore) snapshot() ([]configstore.OrgResourceLimits, [
 	return tryLimits, tryRefs, s.queuedEntry
 }
 
-type reconnectRuntimeStore struct {
+type queuedRuntimeStore struct {
 	enqueues int
 	tries    int
 	entry    *configstore.OrgConnectionQueueEntry
 	tryRef   configstore.OrgConnectionAdmissionRef
 }
 
-func (s *reconnectRuntimeStore) EnqueueOrgConnectionRequest(entry *configstore.OrgConnectionQueueEntry) error {
+func (s *queuedRuntimeStore) EnqueueOrgConnectionRequest(entry *configstore.OrgConnectionQueueEntry) error {
 	s.enqueues++
 	entryCopy := *entry
 	s.entry = &entryCopy
 	return nil
 }
 
-func (s *reconnectRuntimeStore) TryAcquireOrgConnectionLeaseForRef(ref configstore.OrgConnectionAdmissionRef, _ configstore.OrgResourceLimits, _ time.Time) (*configstore.OrgConnectionLease, error) {
+func (s *queuedRuntimeStore) TryAcquireOrgConnectionLeaseForRef(ref configstore.OrgConnectionAdmissionRef, _ configstore.OrgResourceLimits, _ time.Time) (*configstore.OrgConnectionLease, error) {
 	s.tries++
 	s.tryRef = ref
 	return &configstore.OrgConnectionLease{LeaseID: ref.RequestID, RequestID: ref.RequestID}, nil
@@ -334,10 +334,8 @@ func (p *blockingCreateSessionPool) SetMaxWorkers(n int) {}
 func (p *blockingCreateSessionPool) ShutdownAll() {}
 
 type cancelAwareWorkerPool struct {
-	entered          chan struct{}
-	reconnectEntered chan struct{}
-	once             sync.Once
-	reconnectOnce    sync.Once
+	entered chan struct{}
+	once    sync.Once
 }
 
 func (p *cancelAwareWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
@@ -369,25 +367,6 @@ func (p *cancelAwareWorkerPool) SetMaxWorkers(n int) {}
 
 func (p *cancelAwareWorkerPool) ShutdownAll() {}
 
-func (p *cancelAwareWorkerPool) ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error) {
-	p.reconnectOnce.Do(func() {
-		if p.reconnectEntered != nil {
-			close(p.reconnectEntered)
-		}
-	})
-	<-ctx.Done()
-	return nil, ctx.Err()
-}
-
-type reconnectProfileWorkerPool struct {
-	cancelAwareWorkerPool
-	profile *WorkerProfile
-}
-
-func (p *reconnectProfileWorkerPool) ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error) {
-	return p.profile, nil
-}
-
 type countingConnectionLease struct {
 	releases atomic.Int32
 }
@@ -403,16 +382,6 @@ type blockingCreateSessionLimiter struct {
 
 func (l *blockingCreateSessionLimiter) Acquire(ctx context.Context, request connectionAdmissionRequest, limits func(string) configstore.OrgResourceLimits) (connectionLease, error) {
 	return l.lease, nil
-}
-
-type captureAdmissionLimiter struct {
-	request connectionAdmissionRequest
-	err     error
-}
-
-func (l *captureAdmissionLimiter) Acquire(ctx context.Context, request connectionAdmissionRequest, limits func(string) configstore.OrgResourceLimits) (connectionLease, error) {
-	l.request = request
-	return nil, l.err
 }
 
 type blockingAcquireLimiter struct {
@@ -1209,67 +1178,6 @@ func TestDestroyAllSessionsCancelsCreateBlockedInAcquireWorker(t *testing.T) {
 	}
 }
 
-func TestDestroyAllSessionsCancelsReconnectBlockedInReconnectWorker(t *testing.T) {
-	lease := &countingConnectionLease{}
-	pool := &cancelAwareWorkerPool{reconnectEntered: make(chan struct{})}
-	sm := NewSessionManager(pool, nil)
-	sm.SetConnectionLimiter(&blockingCreateSessionLimiter{lease: lease})
-
-	callerCtx, cancelCaller := context.WithCancel(context.Background())
-	defer cancelCaller()
-
-	reconnectErr := make(chan error, 1)
-	go func() {
-		_, _, err := sm.ReconnectFlightSession(callerCtx, "root", 7, 1)
-		reconnectErr <- err
-	}()
-
-	select {
-	case <-pool.reconnectEntered:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for ReconnectFlightWorker")
-	}
-
-	destroyDone := make(chan struct{})
-	go func() {
-		sm.DestroyAllSessions()
-		close(destroyDone)
-	}()
-	waitForSessionManagerDraining(t, sm)
-
-	select {
-	case err := <-reconnectErr:
-		if err == nil {
-			t.Fatal("expected ReconnectFlightSession to fail when drain cancels reconnect")
-		}
-	case <-time.After(100 * time.Millisecond):
-		cancelCaller()
-		select {
-		case <-reconnectErr:
-		case <-time.After(time.Second):
-			t.Fatal("timed out cleaning up blocked ReconnectFlightSession")
-		}
-		select {
-		case <-destroyDone:
-		case <-time.After(time.Second):
-			t.Fatal("timed out cleaning up blocked DestroyAllSessions")
-		}
-		t.Fatal("DestroyAllSessions did not cancel ReconnectFlightSession blocked in ReconnectFlightWorker")
-	}
-
-	select {
-	case <-destroyDone:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for DestroyAllSessions to return")
-	}
-	if got := sm.SessionCount(); got != 0 {
-		t.Fatalf("expected no sessions registered after drain, got %d", got)
-	}
-	if got := lease.releases.Load(); got != 1 {
-		t.Fatalf("expected acquired lease to be released once, got %d", got)
-	}
-}
-
 func waitForSessionManagerDraining(t *testing.T, sm *SessionManager) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -1347,72 +1255,6 @@ func TestSessionManager_RuntimeLimiterObservesDynamicResourceLimitWhileQueued(t 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for acquire")
-	}
-}
-
-func TestSessionManager_ReconnectFlightSessionUsesWorkerProfileForAdmission(t *testing.T) {
-	stop := errors.New("stop after admission")
-	pool := &reconnectProfileWorkerPool{
-		profile: &WorkerProfile{CPU: "4", Memory: "16Gi"},
-	}
-	sm := NewSessionManager(pool, nil)
-	sm.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
-		return requestedWorkerVCPUs(profile, "8")
-	})
-	limiter := &captureAdmissionLimiter{err: stop}
-	sm.SetConnectionLimiter(limiter)
-
-	_, _, err := sm.ReconnectFlightSession(context.Background(), "alice", 42, 7)
-	if !errors.Is(err, stop) {
-		t.Fatalf("ReconnectFlightSession error = %v, want %v", err, stop)
-	}
-	if limiter.request.Username != "alice" || limiter.request.Protocol != "flight" {
-		t.Fatalf("unexpected admission request: %#v", limiter.request)
-	}
-	if limiter.request.RequestedVCPUs != 4 {
-		t.Fatalf("RequestedVCPUs = %d, want 4 from reconnect worker profile", limiter.request.RequestedVCPUs)
-	}
-}
-
-func TestSessionManager_ReconnectFlightSessionUsesNormalAdmission(t *testing.T) {
-	stop := errors.New("stop after admission")
-	pool := &reconnectProfileWorkerPool{
-		profile: &WorkerProfile{CPU: "4", Memory: "16Gi"},
-	}
-	sm := NewSessionManager(pool, nil)
-	sm.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
-		return requestedWorkerVCPUs(profile, "8")
-	})
-	limiter := &captureAdmissionLimiter{err: stop}
-	sm.SetConnectionLimiter(limiter)
-
-	_, _, err := sm.ReconnectFlightSession(context.Background(), "alice", 42, 7)
-	if !errors.Is(err, stop) {
-		t.Fatalf("ReconnectFlightSession error = %v, want %v", err, stop)
-	}
-	if limiter.request.PID == 0 {
-		t.Fatalf("expected reconnect to reserve a replacement PID before admission, got %#v", limiter.request)
-	}
-	if limiter.request.Username != "alice" || limiter.request.Protocol != "flight" || limiter.request.RequestedVCPUs != 4 {
-		t.Fatalf("unexpected reconnect admission request: %#v", limiter.request)
-	}
-}
-
-func TestSessionManager_CreateFlightSessionReservesPIDBeforeAdmission(t *testing.T) {
-	stop := errors.New("stop after admission")
-	sm := NewSessionManager(nil, nil)
-	limiter := &captureAdmissionLimiter{err: stop}
-	sm.SetConnectionLimiter(limiter)
-
-	_, _, err := sm.CreateSessionWithProtocol(context.Background(), "alice", 0, "", 0, "flight", nil)
-	if !errors.Is(err, stop) {
-		t.Fatalf("CreateSessionWithProtocol error = %v, want %v", err, stop)
-	}
-	if limiter.request.PID == 0 {
-		t.Fatalf("expected Flight session creation to reserve a PID before admission, got %#v", limiter.request)
-	}
-	if limiter.request.Username != "alice" || limiter.request.Protocol != "flight" {
-		t.Fatalf("unexpected admission request: %#v", limiter.request)
 	}
 }
 
@@ -1499,8 +1341,8 @@ func TestRuntimeOrgConnectionLimiterKeepsQueuedLeaseWhenResourceLimitBecomesUnli
 	}
 }
 
-func TestRuntimeOrgConnectionLimiterReconnectCapableStoreUsesQueue(t *testing.T) {
-	store := &reconnectRuntimeStore{}
+func TestRuntimeOrgConnectionLimiterUsesQueue(t *testing.T) {
+	store := &queuedRuntimeStore{}
 	reclaimer := &recordingAdmissionReclaimer{}
 	limiter := &runtimeOrgConnectionLimiter{
 		store:        store,
@@ -1510,14 +1352,14 @@ func TestRuntimeOrgConnectionLimiterReconnectCapableStoreUsesQueue(t *testing.T)
 		queueTTL:     time.Second,
 		now:          time.Now,
 		newID: func() (string, error) {
-			return "reconnect-lease", nil
+			return "queued-lease", nil
 		},
 	}
 
 	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
 		PID:            2002,
 		Username:       "alice",
-		Protocol:       "flight",
+		Protocol:       "postgres",
 		RequestedVCPUs: 4,
 	}, func(username string) configstore.OrgResourceLimits {
 		return configstore.OrgResourceLimits{OrgMaxVCPUs: 4, UserMaxVCPUs: 4}
@@ -1526,27 +1368,27 @@ func TestRuntimeOrgConnectionLimiterReconnectCapableStoreUsesQueue(t *testing.T)
 		t.Fatalf("Acquire: %v", err)
 	}
 	if lease == nil {
-		t.Fatal("expected reconnect admission to return a lease")
+		t.Fatal("expected admission to return a lease")
 	}
 	if store.enqueues != 1 || store.tries != 1 {
-		t.Fatalf("expected reconnect admission to use queue path, got enqueues=%d tries=%d", store.enqueues, store.tries)
+		t.Fatalf("expected admission to use queue path, got enqueues=%d tries=%d", store.enqueues, store.tries)
 	}
-	wantRef := configstore.OrgConnectionAdmissionRef{RequestID: "reconnect-lease", OrgID: "org-1", CPInstanceID: "cp-new"}
+	wantRef := configstore.OrgConnectionAdmissionRef{RequestID: "queued-lease", OrgID: "org-1", CPInstanceID: "cp-new"}
 	if store.tryRef != wantRef {
-		t.Fatalf("reconnect admission ref = %#v, want %#v", store.tryRef, wantRef)
+		t.Fatalf("admission ref = %#v, want %#v", store.tryRef, wantRef)
 	}
 	if store.entry == nil {
 		t.Fatal("expected reconnect admission to enqueue a request")
 	}
-	if store.entry.Username != "alice" || store.entry.Protocol != "flight" || store.entry.RequestedVCPUs != 4 || store.entry.PID != 2002 {
-		t.Fatalf("unexpected queued reconnect request: %#v", store.entry)
+	if store.entry.Username != "alice" || store.entry.Protocol != "postgres" || store.entry.RequestedVCPUs != 4 || store.entry.PID != 2002 {
+		t.Fatalf("unexpected queued request: %#v", store.entry)
 	}
 	if err := lease.Release(context.Background()); err != nil {
-		t.Fatalf("release reconnect lease: %v", err)
+		t.Fatalf("release lease: %v", err)
 	}
 	submissions, _ := reclaimer.snapshot()
 	want := admissionReclaimSubmission{
-		ref:   configstore.OrgConnectionAdmissionRef{RequestID: "reconnect-lease", OrgID: "org-1", CPInstanceID: "cp-new"},
+		ref:   configstore.OrgConnectionAdmissionRef{RequestID: "queued-lease", OrgID: "org-1", CPInstanceID: "cp-new"},
 		cause: admissionReclaimCauseLeaseRelease,
 	}
 	if len(submissions) != 1 || submissions[0] != want {

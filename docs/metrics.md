@@ -138,8 +138,8 @@ The PostgreSQL terminal counter collapses those outcomes to `success` or
 `canceled`, `transport`, and `unknown`. The first four represent failures an
 operator can usually alleviate. The remaining reasons let alerts exclude bad
 client input, planned lifecycle transitions, client disconnects, wire errors,
-and newly added paths that have not yet been classified. Flight SQL does not
-emit this counter. `capacity` covers runtime worker exhaustion and admission
+and newly added paths that have not yet been classified. `capacity` covers
+runtime worker exhaustion and admission
 timeouts; requests that exceed a configured hard org or user vCPU limit are
 reported with reason `client`.
 

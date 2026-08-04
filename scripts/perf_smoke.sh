@@ -7,7 +7,6 @@ cd "$ROOT_DIR"
 DATASET_VERSION="${DUCKGRES_PERF_DATASET_VERSION:-}"
 MANIFEST_TABLE="${DUCKGRES_PERF_DATASET_MANIFEST_TABLE:-ducklake.main.dataset_manifest}"
 PGWIRE_DSN="${DUCKGRES_PERF_PGWIRE_DSN:-}"
-FLIGHT_ADDR="${DUCKGRES_PERF_FLIGHT_ADDR:-}"
 PERF_USERNAME="${DUCKGRES_PERF_USERNAME:-perfuser}"
 PERF_PASSWORD="${DUCKGRES_PERF_PASSWORD:-perfpass}"
 if [[ -n "$DATASET_VERSION" ]]; then
@@ -25,10 +24,6 @@ require_frozen_manifest() {
   fi
   if [[ -z "$PGWIRE_DSN" ]]; then
     echo "DUCKGRES_PERF_PGWIRE_DSN is required when DUCKGRES_PERF_DATASET_VERSION is set"
-    exit 1
-  fi
-  if [[ -z "$FLIGHT_ADDR" ]]; then
-    echo "DUCKGRES_PERF_FLIGHT_ADDR is required when DUCKGRES_PERF_DATASET_VERSION is set"
     exit 1
   fi
   if ! command -v psql >/dev/null 2>&1; then
@@ -75,9 +70,6 @@ go_test_args=(
 )
 if [[ -n "$PGWIRE_DSN" ]]; then
   go_test_args+=(-perf-pgwire-dsn "$PGWIRE_DSN")
-fi
-if [[ -n "$FLIGHT_ADDR" ]]; then
-  go_test_args+=(-perf-flight-addr "$FLIGHT_ADDR")
 fi
 "${go_test_args[@]}"
 

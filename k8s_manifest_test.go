@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,49 @@ type deploymentManifest struct {
 			} `yaml:"spec"`
 		} `yaml:"template"`
 	} `yaml:"spec"`
+}
+
+func TestLiveControlPlaneManifestsExposeOnlyPGWire(t *testing.T) {
+	paths := []string{
+		filepath.Join("k8s", "control-plane-multitenant-local.yaml"),
+		filepath.Join("k8s", "kind", "control-plane.yaml"),
+		filepath.Join("k8s", "networkpolicy.yaml"),
+	}
+
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%s): %v", path, err)
+		}
+		manifest := string(data)
+		if strings.Contains(manifest, "8815") || strings.Contains(manifest, "flight-port") || strings.Contains(manifest, "name: flight") {
+			t.Errorf("%s: control plane must not expose the obsolete Flight SQL ingress", path)
+		}
+	}
+}
+
+func TestControlPlaneImageExposesPGWireAdminAndMetrics(t *testing.T) {
+	data, err := os.ReadFile("Dockerfile.controlplane")
+	if err != nil {
+		t.Fatalf("ReadFile(Dockerfile.controlplane): %v", err)
+	}
+
+	var exposed []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == "EXPOSE" {
+			exposed = append(exposed, fields[1:]...)
+		}
+	}
+	want := []string{"5432", "8080", "9090"}
+	if len(exposed) != len(want) {
+		t.Fatalf("Dockerfile.controlplane exposed ports = %v, want %v", exposed, want)
+	}
+	for i := range want {
+		if exposed[i] != want[i] {
+			t.Fatalf("Dockerfile.controlplane exposed ports = %v, want %v", exposed, want)
+		}
+	}
 }
 
 func TestLiveControlPlaneManifestsReadinessProbeTargetsAPIHealthEndpoint(t *testing.T) {

@@ -58,7 +58,7 @@ RUN mkdir -p data certs && chown -R duckgres:duckgres /app
 
 USER duckgres
 
-# 5432 = PG wire (clients), 8816 = optional Flight SQL ingress, 9090 = metrics.
-EXPOSE 5432 8816 9090
+# 5432 = PG wire (clients), 8080 = admin API, 9090 = metrics.
+EXPOSE 5432 8080 9090
 
 ENTRYPOINT ["/app/duckgres-controlplane"]

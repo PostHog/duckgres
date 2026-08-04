@@ -5,14 +5,6 @@
 host: "0.0.0.0"
 port: 5432
 
-# Control-plane Arrow Flight SQL ingress (optional)
-# 0 or omitted disables Flight ingress.
-# flight_port: 8815
-# flight_session_idle_ttl: "10m"
-# flight_session_reap_interval: "1m"
-# flight_handle_idle_ttl: "15m"
-# flight_session_token_ttl: "1h"
-
 # Max time to wait for worker acquisition and per-org/per-user vCPU resource admission.
 # Default: 60s
 # worker_queue_timeout: "60s"

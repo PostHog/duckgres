@@ -33,10 +33,9 @@ func TestValidateRunModeRejectsUnsupportedMode(t *testing.T) {
 
 func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	fileCfg := &FileConfig{
-		Host:       "file-host",
-		Port:       5000,
-		FlightPort: 5001,
-		DataDir:    "/tmp/file-data",
+		Host:    "file-host",
+		Port:    5000,
+		DataDir: "/tmp/file-data",
 		TLS: TLSConfig{
 			Cert: "/tmp/file.crt",
 			Key:  "/tmp/file.key",
@@ -48,7 +47,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_HOST":              "env-host",
 		"DUCKGRES_PORT":              "6000",
-		"DUCKGRES_FLIGHT_PORT":       "6001",
 		"DUCKGRES_DATA_DIR":          "/tmp/env-data",
 		"DUCKGRES_CERT":              "/tmp/env.crt",
 		"DUCKGRES_KEY":               "/tmp/env.key",
@@ -60,7 +58,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		Set: map[string]bool{
 			"host":              true,
 			"port":              true,
-			"flight-port":       true,
 			"data-dir":          true,
 			"cert":              true,
 			"key":               true,
@@ -69,7 +66,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 		},
 		Host:             "cli-host",
 		Port:             7000,
-		FlightPort:       7001,
 		DataDir:          "/tmp/cli-data",
 		CertFile:         "/tmp/cli.crt",
 		KeyFile:          "/tmp/cli.key",
@@ -82,9 +78,6 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	}
 	if resolved.Server.Port != 7000 {
 		t.Fatalf("port precedence mismatch: got %d", resolved.Server.Port)
-	}
-	if resolved.Server.FlightPort != 7001 {
-		t.Fatalf("flight port precedence mismatch: got %d", resolved.Server.FlightPort)
 	}
 	if resolved.Server.DataDir != "/tmp/cli-data" {
 		t.Fatalf("data dir precedence mismatch: got %q", resolved.Server.DataDir)
@@ -105,15 +98,13 @@ func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 
 func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	fileCfg := &FileConfig{
-		Host:       "file-host",
-		Port:       5000,
-		FlightPort: 5001,
+		Host: "file-host",
+		Port: 5000,
 	}
 
 	env := map[string]string{
-		"DUCKGRES_HOST":        "env-host",
-		"DUCKGRES_PORT":        "6000",
-		"DUCKGRES_FLIGHT_PORT": "6001",
+		"DUCKGRES_HOST": "env-host",
+		"DUCKGRES_PORT": "6000",
 	}
 
 	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
@@ -123,9 +114,6 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 	}
 	if resolved.Server.Port != 6000 {
 		t.Fatalf("expected env port, got %d", resolved.Server.Port)
-	}
-	if resolved.Server.FlightPort != 6001 {
-		t.Fatalf("expected env flight port, got %d", resolved.Server.FlightPort)
 	}
 }
 
@@ -604,48 +592,6 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	}
 }
 
-func TestResolveEffectiveConfigFlightIngressDurations(t *testing.T) {
-	fileCfg := &FileConfig{
-		FlightSessionIdleTTL:      "7m",
-		FlightSessionReapInterval: "45s",
-		FlightHandleIdleTTL:       "3m",
-		FlightSessionTokenTTL:     "2h",
-	}
-
-	env := map[string]string{
-		"DUCKGRES_FLIGHT_SESSION_IDLE_TTL":      "9m",
-		"DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL": "30s",
-		"DUCKGRES_FLIGHT_HANDLE_IDLE_TTL":       "4m",
-		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "90m",
-	}
-
-	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
-		Set: map[string]bool{
-			"flight-session-idle-ttl":      true,
-			"flight-session-reap-interval": true,
-			"flight-handle-idle-ttl":       true,
-			"flight-session-token-ttl":     true,
-		},
-		FlightSessionIdleTTL:      "11m",
-		FlightSessionReapInterval: "15s",
-		FlightHandleIdleTTL:       "5m",
-		FlightSessionTokenTTL:     "75m",
-	}, envFromMap(env), nil)
-
-	if resolved.Server.FlightSessionIdleTTL != 11*time.Minute {
-		t.Fatalf("expected CLI flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
-	}
-	if resolved.Server.FlightSessionReapInterval != 15*time.Second {
-		t.Fatalf("expected CLI flight_session_reap_interval, got %s", resolved.Server.FlightSessionReapInterval)
-	}
-	if resolved.Server.FlightHandleIdleTTL != 5*time.Minute {
-		t.Fatalf("expected CLI flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
-	}
-	if resolved.Server.FlightSessionTokenTTL != 75*time.Minute {
-		t.Fatalf("expected CLI flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
-	}
-}
-
 func TestResolveEffectiveConfigSessionInitTimeout(t *testing.T) {
 	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, nil, nil)
 	if resolved.SessionInitTimeout != 10*time.Second {
@@ -677,83 +623,6 @@ func TestResolveEffectiveConfigSessionInitTimeoutPrecedence(t *testing.T) {
 	}
 	if resolved.Server.SessionInitTimeout != 11*time.Second {
 		t.Fatalf("expected server CLI session_init_timeout, got %s", resolved.Server.SessionInitTimeout)
-	}
-}
-
-func TestResolveEffectiveConfigFlightIngressDurationsFromFile(t *testing.T) {
-	fileCfg := &FileConfig{
-		FlightSessionIdleTTL:      "7m",
-		FlightSessionReapInterval: "45s",
-		FlightHandleIdleTTL:       "3m",
-		FlightSessionTokenTTL:     "2h",
-	}
-
-	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
-
-	if resolved.Server.FlightSessionIdleTTL != 7*time.Minute {
-		t.Fatalf("expected file flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
-	}
-	if resolved.Server.FlightSessionReapInterval != 45*time.Second {
-		t.Fatalf("expected file flight_session_reap_interval, got %s", resolved.Server.FlightSessionReapInterval)
-	}
-	if resolved.Server.FlightHandleIdleTTL != 3*time.Minute {
-		t.Fatalf("expected file flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
-	}
-	if resolved.Server.FlightSessionTokenTTL != 2*time.Hour {
-		t.Fatalf("expected file flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
-	}
-}
-
-func TestResolveEffectiveConfigFlightIngressDurationsFromEnv(t *testing.T) {
-	env := map[string]string{
-		"DUCKGRES_FLIGHT_SESSION_IDLE_TTL":      "9m",
-		"DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL": "30s",
-		"DUCKGRES_FLIGHT_HANDLE_IDLE_TTL":       "4m",
-		"DUCKGRES_FLIGHT_SESSION_TOKEN_TTL":     "30m",
-	}
-
-	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(env), nil)
-
-	if resolved.Server.FlightSessionIdleTTL != 9*time.Minute {
-		t.Fatalf("expected env flight_session_idle_ttl, got %s", resolved.Server.FlightSessionIdleTTL)
-	}
-	if resolved.Server.FlightSessionReapInterval != 30*time.Second {
-		t.Fatalf("expected env flight_session_reap_interval, got %s", resolved.Server.FlightSessionReapInterval)
-	}
-	if resolved.Server.FlightHandleIdleTTL != 4*time.Minute {
-		t.Fatalf("expected env flight_handle_idle_ttl, got %s", resolved.Server.FlightHandleIdleTTL)
-	}
-	if resolved.Server.FlightSessionTokenTTL != 30*time.Minute {
-		t.Fatalf("expected env flight_session_token_ttl, got %s", resolved.Server.FlightSessionTokenTTL)
-	}
-}
-
-func TestResolveEffectiveConfigInvalidFlightPortEnv(t *testing.T) {
-	fileCfg := &FileConfig{
-		FlightPort: 8815,
-	}
-	env := map[string]string{
-		"DUCKGRES_FLIGHT_PORT": "not-a-number",
-	}
-
-	var warns []string
-	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), func(msg string) {
-		warns = append(warns, msg)
-	})
-
-	if resolved.Server.FlightPort != 8815 {
-		t.Fatalf("invalid env flight port should not override valid file value, got %d", resolved.Server.FlightPort)
-	}
-
-	found := false
-	for _, w := range warns {
-		if strings.Contains(w, "Invalid DUCKGRES_FLIGHT_PORT") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatalf("expected warning about invalid DUCKGRES_FLIGHT_PORT, warnings: %v", warns)
 	}
 }
 

@@ -56,10 +56,9 @@ type OrgUserAccessConfig struct {
 	TeamID *int64
 }
 
-// OrgUserQueryAccess is the protocol-neutral project policy returned to the
-// PostgreSQL and Flight SQL ingress layers. The namespace grant is identical
-// for both scoped modes; ReadOnly is what separates a project reader from a
-// project user.
+// OrgUserQueryAccess is the project policy returned to pgwire and internal
+// admin sessions. The namespace grant is identical for both scoped modes;
+// ReadOnly is what separates a project reader from a project user.
 type OrgUserQueryAccess struct {
 	ReadOnly         bool
 	AllowedSchemas   []string
@@ -753,73 +752,6 @@ func (cs *ConfigStore) OrgUsageTeamID(orgID, username string) int64 {
 	return oc.OldestTeamID()
 }
 
-// ValidateOrgUser checks username/password scoped to a specific org.
-func (cs *ConfigStore) ValidateOrgUser(orgID, username, password string) bool {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	if cs.snapshot == nil {
-		return false
-	}
-	storedHash, ok := cs.snapshot.OrgUserPassword[OrgUserKey{OrgID: orgID, Username: username}]
-	if !ok {
-		// Spend time on a dummy bcrypt compare to avoid timing leaks on username enumeration.
-		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
-		return false
-	}
-	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
-		return false
-	}
-	// A disabled user (kill switch) is refused even with correct credentials.
-	return !cs.snapshot.OrgUserDisabled[OrgUserKey{OrgID: orgID, Username: username}]
-}
-
-// IsOrgUserPassthrough reports whether the given (org, user) is configured to
-// bypass the PostgreSQL compatibility layer. Returns false for unknown users —
-// callers must validate credentials separately before trusting this.
-//
-// Prefer ValidateOrgUserAndGetPassthrough when both auth and passthrough are
-// needed at the same point; this method is exposed for introspection (e.g.
-// admin dashboards) where credentials aren't being checked.
-func (cs *ConfigStore) IsOrgUserPassthrough(orgID, username string) bool {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	if cs.snapshot == nil {
-		return false
-	}
-	return cs.snapshot.OrgUserPassthrough[OrgUserKey{OrgID: orgID, Username: username}]
-}
-
-// ValidateOrgUserAndGetPassthrough validates credentials AND reads the
-// passthrough flag against the same snapshot, eliminating the swap window
-// that two separate ValidateOrgUser + IsOrgUserPassthrough calls would
-// expose. valid=false always returns passthrough=false — never leak the
-// flag for failed auth or unknown users.
-func (cs *ConfigStore) ValidateOrgUserAndGetPassthrough(orgID, username, password string) (valid, passthrough bool) {
-	cs.mu.RLock()
-	defer cs.mu.RUnlock()
-	if cs.snapshot == nil {
-		// Match ValidateOrgUser's timing-leak guard: still spend bcrypt time
-		// on failed auth so unknown-user paths look the same as wrong-password.
-		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
-		return false, false
-	}
-	key := OrgUserKey{OrgID: orgID, Username: username}
-	storedHash, ok := cs.snapshot.OrgUserPassword[key]
-	if !ok {
-		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
-		return false, false
-	}
-	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
-		return false, false
-	}
-	// A disabled user (kill switch) is refused even with correct credentials;
-	// valid=false also guarantees passthrough is never leaked for a disabled user.
-	if cs.snapshot.OrgUserDisabled[key] {
-		return false, false
-	}
-	return true, cs.snapshot.OrgUserPassthrough[key]
-}
-
 // HashPassword hashes a plaintext password using bcrypt.
 func HashPassword(password string) (string, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -1020,7 +952,6 @@ func autoMigrateRuntimeTables(db *gorm.DB, runtimeSchema string) error {
 	}{
 		{table: runtimeSchema + ".cp_instances", model: &ControlPlaneInstance{}},
 		{table: runtimeSchema + ".worker_records", model: &WorkerRecord{}},
-		{table: runtimeSchema + ".flight_session_records", model: &FlightSessionRecord{}},
 		{table: runtimeSchema + ".org_connection_queue", model: &OrgConnectionQueueEntry{}},
 		{table: runtimeSchema + ".org_connection_leases", model: &OrgConnectionLease{}},
 	} {
@@ -1434,42 +1365,21 @@ func (cs *ConfigStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID, image string
 // keying off it let a periodically-refreshed worker reset its own TTL forever.
 // Legacy rows with a NULL hot_idle_since fall back to updated_at so they still
 // expire. A worker's ttl_minutes governs it; 0 falls back to defaultTTL
-// (default/legacy and unassigned rows). Workers still backing a reclaimable
-// Flight session are spared (see reclaimableFlightSessionGuard).
+// (default/legacy and unassigned rows).
 func (cs *ConfigStore) ListExpiredHotIdleWorkers(now time.Time, defaultTTL time.Duration) ([]WorkerRecord, error) {
 	defMins := int64(defaultTTL.Minutes())
 	if defMins < 0 {
 		defMins = 0
 	}
 	var workers []WorkerRecord
-	clause, args := cs.reclaimableFlightSessionGuard()
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())+" AS w").
 		Where("w.state = ? AND COALESCE(w.hot_idle_since, w.updated_at) + (CASE WHEN COALESCE(w.ttl_minutes, 0) > 0 THEN w.ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
 			WorkerStateHotIdle, defMins, now).
-		Where(clause, args...).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers: %w", err)
 	}
 	return workers, nil
-}
-
-// reclaimableFlightSessionGuard returns a correlated NOT-EXISTS clause (and its
-// args) that spares a worker row (aliased `w`) which still backs a reclaimable
-// Flight session (Active or Reconnecting). It mirrors the same exclusion in
-// ListOrphanedWorkers so the hot-idle TTL reaper does not retire a worker whose
-// customer is mid-reconnect by session token — a retire there would kill the
-// in-flight query at the moment they reconnect. Bounded by
-// ExpireFlightSessionRecords: once the session record is moved to a terminal
-// state, the worker is no longer protected.
-func (cs *ConfigStore) reclaimableFlightSessionGuard() (string, []any) {
-	flightTable := cs.runtimeTable((&FlightSessionRecord{}).TableName())
-	reclaimableSessionStates := []FlightSessionState{
-		FlightSessionStateActive,
-		FlightSessionStateReconnecting,
-	}
-	return "NOT EXISTS (SELECT 1 FROM " + flightTable + " AS f " +
-		"WHERE f.worker_id = w.worker_id AND f.state IN ?)", []any{reclaimableSessionStates}
 }
 
 // ListExpiredHotIdleWorkersForCP is the owner-scoped variant of
@@ -1485,11 +1395,9 @@ func (cs *ConfigStore) ListExpiredHotIdleWorkersForCP(ownerCPInstanceID string, 
 		defMins = 0
 	}
 	var workers []WorkerRecord
-	clause, args := cs.reclaimableFlightSessionGuard()
 	err := cs.db.Table(cs.runtimeTable((&WorkerRecord{}).TableName())+" AS w").
 		Where("w.state = ? AND w.owner_cp_instance_id = ? AND COALESCE(w.hot_idle_since, w.updated_at) + (CASE WHEN COALESCE(w.ttl_minutes, 0) > 0 THEN w.ttl_minutes ELSE ? END) * interval '1 minute' <= ?",
 			WorkerStateHotIdle, ownerCPInstanceID, defMins, now).
-		Where(clause, args...).
 		Find(&workers).Error
 	if err != nil {
 		return nil, fmt.Errorf("list expired hot-idle workers for cp: %w", err)
@@ -1786,57 +1694,6 @@ func (cs *ConfigStore) RetireDrainingWorker(workerID int, ownerCPInstanceID stri
 	return result.RowsAffected > 0, nil
 }
 
-// TakeOverWorker transfers durable worker ownership to a new control-plane
-// instance when the caller still has the expected prior owner_epoch.
-func (cs *ConfigStore) TakeOverWorker(workerID int, ownerCPInstanceID, orgID string, expectedOwnerEpoch int64) (*WorkerRecord, error) {
-	var claimed *WorkerRecord
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		var current WorkerRecord
-		err := tx.Table(cs.runtimeTable(current.TableName())).
-			Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("worker_id = ?", workerID).
-			Take(&current).Error
-		if err != nil {
-			if err == gorm.ErrRecordNotFound {
-				return nil
-			}
-			return err
-		}
-		if current.OwnerEpoch != expectedOwnerEpoch {
-			return ErrWorkerOwnerEpochMismatch
-		}
-		if current.State != WorkerStateHot {
-			return nil
-		}
-		now := time.Now()
-		result := tx.Table(cs.runtimeTable(current.TableName())).
-			Where("worker_id = ?", current.WorkerID).
-			Updates(map[string]any{
-				"state":                WorkerStateReserved,
-				"org_id":               orgID,
-				"owner_cp_instance_id": ownerCPInstanceID,
-				"owner_epoch":          gorm.Expr("owner_epoch + 1"),
-				"updated_at":           now,
-			})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected == 0 {
-			return nil
-		}
-		if err := tx.Table(cs.runtimeTable(current.TableName())).
-			First(&current, "worker_id = ?", current.WorkerID).Error; err != nil {
-			return err
-		}
-		claimed = &current
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("take over worker: %w", err)
-	}
-	return claimed, nil
-}
-
 // CreateSpawningWorkerSlot creates a durable spawning worker row under an
 // advisory-lock-protected per-org capacity check. A nil result means the org
 // cap blocked the spawn. There is no global/cluster cap: maxOrgWorkers == 0
@@ -1929,15 +1786,6 @@ func (cs *ConfigStore) countOrgAdmittingWorkers(tx *gorm.DB, orgID, image, profi
 // The join switched from INNER to LEFT in Apr 2026 to handle (2)/(3);
 // the original implementation only handled (1).
 //
-// Apr 2026 also added an exclusion for workers with reclaimable Flight
-// sessions: a row with at least one flight_session_records entry in
-// active or reconnecting state is spared from orphan retirement so a
-// customer reconnecting by session token can establish a fresh remote
-// session on the surviving worker (see TakeOverWorker). Once the session
-// record itself becomes terminal (expired/closed via
-// ExpireFlightSessionRecords), the worker is retired normally on the next
-// sweep.
-//
 // See TestListOrphanedWorkers* in tests/configstore for the regression
 // fixtures.
 func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, error) {
@@ -1951,13 +1799,8 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 		WorkerStateHotIdle,
 		WorkerStateDraining,
 	}
-	reclaimableSessionStates := []FlightSessionState{
-		FlightSessionStateActive,
-		FlightSessionStateReconnecting,
-	}
 	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
 	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
-	flightTable := cs.runtimeTable((&FlightSessionRecord{}).TableName())
 	err := cs.db.Table(workerTable+" AS w").
 		Select("w.*").
 		Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = w.owner_cp_instance_id").
@@ -1973,14 +1816,6 @@ func (cs *ConfigStore) ListOrphanedWorkers(before time.Time) ([]WorkerRecord, er
 			before,
 			before,
 		).
-		// Spare workers with at least one reclaimable Flight session: a
-		// retire here would remove the worker before a token holder can
-		// establish a fresh remote session. Bounded by
-		// ExpireFlightSessionRecords — once the session record is moved
-		// to a terminal state, the worker is no longer protected.
-		Where("NOT EXISTS (SELECT 1 FROM "+flightTable+" AS f "+
-			"WHERE f.worker_id = w.worker_id AND f.state IN ?)",
-			reclaimableSessionStates).
 		Order("w.worker_id ASC").
 		Find(&workers).Error
 	if err != nil {
@@ -2010,22 +1845,6 @@ func (cs *ConfigStore) ListStuckWorkers(spawningBefore, activatingBefore time.Ti
 		return nil, fmt.Errorf("list stuck workers: %w", err)
 	}
 	return workers, nil
-}
-
-// ExpireFlightSessionRecords marks reconnectable Flight sessions expired when
-// their reconnect deadline has passed.
-func (cs *ConfigStore) ExpireFlightSessionRecords(before time.Time) (int64, error) {
-	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
-		Where("state NOT IN ?", []FlightSessionState{FlightSessionStateExpired, FlightSessionStateClosed}).
-		Where("expires_at <= ?", before).
-		Updates(map[string]any{
-			"state":      FlightSessionStateExpired,
-			"updated_at": time.Now(),
-		})
-	if result.Error != nil {
-		return 0, fmt.Errorf("expire flight session records: %w", result.Error)
-	}
-	return result.RowsAffected, nil
 }
 
 func (cs *ConfigStore) countActiveWorkers(tx *gorm.DB, where ...any) (int64, error) {
@@ -2081,79 +1900,6 @@ func advisoryLockKey(s string) int64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(s))
 	return int64(h.Sum64() & 0x7fffffffffffffff)
-}
-
-// UpsertFlightSessionRecord inserts or updates a durable Flight reconnect row.
-func (cs *ConfigStore) UpsertFlightSessionRecord(record *FlightSessionRecord) error {
-	if err := cs.db.Table(cs.runtimeTable(record.TableName())).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "session_token"}},
-		DoUpdates: clause.AssignmentColumns([]string{"username", "org_id", "worker_id", "p_id", "owner_epoch", "cp_instance_id", "state", "expires_at", "last_seen_at", "access_policy_recorded", "access_revision", "access_read_only", "allowed_schemas", "allowed_relations", "updated_at"}),
-	}).Create(record).Error; err != nil {
-		return fmt.Errorf("upsert flight session record: %w", err)
-	}
-	return nil
-}
-
-// GetFlightSessionRecord returns a durable Flight reconnect row by session token.
-func (cs *ConfigStore) GetFlightSessionRecord(sessionToken string) (*FlightSessionRecord, error) {
-	var record FlightSessionRecord
-	err := cs.db.Table(cs.runtimeTable(record.TableName())).First(&record, "session_token = ?", sessionToken).Error
-	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("get flight session record: %w", err)
-	}
-	return &record, nil
-}
-
-func (cs *ConfigStore) TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error {
-	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
-		Where("session_token = ?", sessionToken).
-		Updates(map[string]any{
-			"last_seen_at": lastSeenAt,
-			"updated_at":   time.Now(),
-		})
-	if result.Error != nil {
-		return fmt.Errorf("touch flight session record: %w", result.Error)
-	}
-	return nil
-}
-
-func (cs *ConfigStore) CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error {
-	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
-		Where("session_token = ?", sessionToken).
-		Updates(map[string]any{
-			"state":        FlightSessionStateClosed,
-			"last_seen_at": closedAt,
-			"updated_at":   time.Now(),
-		})
-	if result.Error != nil {
-		return fmt.Errorf("close flight session record: %w", result.Error)
-	}
-	return nil
-}
-
-func (cs *ConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(stale FlightSessionRecord, closedAt time.Time) (bool, error) {
-	result := cs.db.Table(cs.runtimeTable((&FlightSessionRecord{}).TableName())).
-		Where("session_token = ?", stale.SessionToken).
-		Where("state = ?", FlightSessionStateActive).
-		Where("username = ?", stale.Username).
-		Where("org_id = ?", stale.OrgID).
-		Where("worker_id = ?", stale.WorkerID).
-		Where("p_id = ?", stale.PID).
-		Where("owner_epoch = ?", stale.OwnerEpoch).
-		Where("cp_instance_id = ?", stale.CPInstanceID).
-		Where("access_revision = ?", stale.AccessRevision).
-		Updates(map[string]any{
-			"state":        FlightSessionStateClosed,
-			"last_seen_at": closedAt,
-			"updated_at":   time.Now(),
-		})
-	if result.Error != nil {
-		return false, fmt.Errorf("close flight session record if reconnect target unchanged: %w", result.Error)
-	}
-	return result.RowsAffected > 0, nil
 }
 
 // Reload forces an immediate config reload from the database.

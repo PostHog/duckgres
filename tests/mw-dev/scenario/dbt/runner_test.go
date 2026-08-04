@@ -241,7 +241,7 @@ func TestExecutorRetriesFailedDBTCommandAndRecordsRecoveredFailure(t *testing.T)
 			switch req.CommandName {
 			case "run":
 				runAttempts++
-				return CommandResult{ExitCode: 2, Stderr: "flight EOF"}
+				return CommandResult{ExitCode: 2, Stderr: "connection EOF"}
 			case "retry":
 				return CommandResult{Stdout: "retry recovered"}
 			default:

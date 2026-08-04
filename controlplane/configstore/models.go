@@ -108,7 +108,7 @@ type OrgUser struct {
 	AccessMode string `gorm:"size:32;not null;default:unrestricted" json:"access_mode"`
 	TeamID     *int64 `gorm:"index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:2;index:idx_duckgres_org_users_project_user_team,unique,where:access_mode = 'project_user',priority:2" json:"team_id,omitempty"`
 	// Disabled is the per-user kill switch: when true the user is refused at
-	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
+	// pgwire connect time. Toggling it on also tears down the
 	// user's live sessions (see admin disable endpoint).
 	Disabled  bool      `gorm:"not null;default:false" json:"disabled"`
 	MaxVCPUs  int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
@@ -466,39 +466,6 @@ type WorkerRecord struct {
 }
 
 func (WorkerRecord) TableName() string { return "worker_records" }
-
-// FlightSessionState is the durable reconnect state for Flight-only sessions.
-type FlightSessionState string
-
-const (
-	FlightSessionStateActive       FlightSessionState = "active"
-	FlightSessionStateReconnecting FlightSessionState = "reconnecting"
-	FlightSessionStateExpired      FlightSessionState = "expired"
-	FlightSessionStateClosed       FlightSessionState = "closed"
-)
-
-// FlightSessionRecord is the durable reconnect record for Flight sessions.
-type FlightSessionRecord struct {
-	SessionToken         string             `gorm:"primaryKey;size:255" json:"session_token"`
-	Username             string             `gorm:"size:255;not null" json:"username"`
-	OrgID                string             `gorm:"size:255;not null" json:"org_id"`
-	WorkerID             int                `gorm:"not null;index" json:"worker_id"`
-	PID                  int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
-	OwnerEpoch           int64              `gorm:"not null" json:"owner_epoch"`
-	CPInstanceID         string             `gorm:"size:255" json:"cp_instance_id"`
-	State                FlightSessionState `gorm:"size:32;not null" json:"state"`
-	ExpiresAt            time.Time          `gorm:"index" json:"expires_at"`
-	LastSeenAt           time.Time          `json:"last_seen_at"`
-	AccessPolicyRecorded bool               `gorm:"not null;default:false" json:"access_policy_recorded"`
-	AccessRevision       string             `gorm:"size:64" json:"access_revision,omitempty"`
-	AccessReadOnly       bool               `gorm:"not null;default:false" json:"access_read_only"`
-	AllowedSchemas       []string           `gorm:"serializer:json;type:text" json:"allowed_schemas,omitempty"`
-	AllowedRelations     []string           `gorm:"serializer:json;type:text" json:"allowed_relations,omitempty"`
-	CreatedAt            time.Time          `json:"created_at"`
-	UpdatedAt            time.Time          `json:"updated_at"`
-}
-
-func (FlightSessionRecord) TableName() string { return "flight_session_records" }
 
 // OrgResourceLimits is the current resource-admission ceiling for an org and
 // the connecting user. 0 means unlimited for either dimension.

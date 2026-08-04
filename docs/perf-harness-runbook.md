@@ -2,7 +2,7 @@
 
 ## Scope
 
-Golden-query performance signal collection for `pgwire` and `flight` protocols.
+Golden-query performance signal collection for the `pgwire` protocol.
 This is observability-only; there is no pass/fail performance gate.
 
 Status: the old prod-us deployed perf runner path is legacy while the dev Duckgres Scenario Runner replacement is being built. Prefer `tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml` for current frozen dataset end-to-end validation; keep this perf harness for local/library use and historical artifact compatibility until the scenario perf adapter is available.
@@ -23,22 +23,20 @@ Status: the old prod-us deployed perf runner path is legacy while the dev Duckgr
 ./scripts/perf_smoke.sh
 ```
 
-This default mode auto-starts a temporary local Duckgres control-plane with Flight ingress; you do not need to pre-start Duckgres.
+This default mode auto-starts a temporary local Duckgres control plane; you do not need to pre-start Duckgres.
 
-2. Optional: use a pre-started Duckgres instance by setting both endpoint env vars:
+2. Optional: use a pre-started Duckgres instance by setting its pgwire DSN:
 
 ```bash
 DUCKGRES_PERF_PGWIRE_DSN="host=127.0.0.1 port=5432 user=perfuser dbname=test sslmode=require" \
-DUCKGRES_PERF_FLIGHT_ADDR="127.0.0.1:50051" \
 ./scripts/perf_smoke.sh
 ```
 
-3. For frozen dataset smoke, also set dataset version (plus both endpoint env vars):
+3. For frozen dataset smoke, also set the dataset version:
 
 ```bash
 DUCKGRES_PERF_DATASET_VERSION=v1 \
 DUCKGRES_PERF_PGWIRE_DSN="host=127.0.0.1 port=5432 user=perfuser dbname=test sslmode=require" \
-DUCKGRES_PERF_FLIGHT_ADDR="127.0.0.1:50051" \
 ./scripts/perf_smoke.sh
 ```
 

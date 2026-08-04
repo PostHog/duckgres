@@ -25,11 +25,6 @@ func metricGaugeValue(t *testing.T, metricName string) float64 {
 		}
 		return fam.GetMetric()[0].GetGauge().GetValue()
 	}
-	// Match the lazy-init semantics of metricHistogramCount and
-	// metricCounterFamilyTotal: a Vec family doesn't appear in
-	// Gather() output until at least one label combination has been
-	// observed, so "not found" is a legitimate zero rather than a
-	// test failure.
 	return 0
 }
 

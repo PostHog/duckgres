@@ -201,8 +201,8 @@ func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
 		"x-duckgres-owner-epoch", strconv.FormatInt(e.ownerEpoch, 10),
 	)
 	// Sourced from the context rather than executor state: the executor is
-	// per-session and serves many statements, and both front-ends (PG wire and
-	// the Flight SQL ingress) reach it through the same call.
+	// per-session and serves many statements while pgwire reaches it through
+	// the same call.
 	if queryID := wire.QueryIDFromContext(ctx); queryID != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, wire.QueryIDMetadataKey, queryID)
 	}

@@ -32,7 +32,7 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 		QueryID:          "q2",
 		IntentID:         "i2",
 		MeasureIteration: 2,
-		Protocol:         ProtocolFlight,
+		Protocol:         ProtocolPGWire,
 		Status:           "error",
 		Error:            "boom",
 		Duration:         5 * time.Millisecond,
@@ -82,7 +82,7 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 	if !strings.Contains(csvText, "query_id,") || !strings.Contains(csvText, ",measure_iteration,") || !strings.Contains(csvText, ",protocol,") {
 		t.Fatalf("csv header missing query_id/measure_iteration/protocol: %q", csvText)
 	}
-	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") || !strings.Contains(csvText, "\nq2,i2,2,flight,error,boom,") {
+	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") || !strings.Contains(csvText, "\nq2,i2,2,pgwire,error,boom,") {
 		t.Fatalf("csv rows missing measure_iteration values: %q", csvText)
 	}
 }

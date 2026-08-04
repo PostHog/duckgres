@@ -171,30 +171,10 @@ func redactConnectionString(connStr string) string {
 }
 
 type Config struct {
-	Host string
-	Port int
-	// FlightPort enables Arrow Flight SQL ingress on the control plane.
-	// 0 disables Flight ingress.
-	FlightPort int
-
-	// FlightSessionIdleTTL controls how long an idle Flight auth session is kept
-	// before being reaped.
-	FlightSessionIdleTTL time.Duration
-
-	// FlightSessionReapInterval controls how frequently idle Flight auth sessions
-	// are scanned and reaped.
-	FlightSessionReapInterval time.Duration
-
-	// FlightHandleIdleTTL controls stale prepared/query handle cleanup inside a
-	// Flight auth session.
-	FlightHandleIdleTTL time.Duration
-
-	// FlightSessionTokenTTL controls the absolute lifetime of issued
-	// x-duckgres-session tokens. Expired tokens are rejected and require
-	// a fresh bootstrap request.
-	FlightSessionTokenTTL time.Duration
-	DataDir               string
-	Users                 map[string]string // username -> password
+	Host    string
+	Port    int
+	DataDir string
+	Users   map[string]string // username -> password
 
 	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file

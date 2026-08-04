@@ -945,7 +945,7 @@ func TestScenarioPodIsProtectedFromKarpenterDisruption(t *testing.T) {
 	}
 }
 
-func TestControlPlaneServiceExposesFlight(t *testing.T) {
+func TestControlPlaneServiceDoesNotExposeFlight(t *testing.T) {
 	raw, err := os.ReadFile("manifests.tmpl.yaml")
 	if err != nil {
 		t.Fatalf("read manifests template: %v", err)
@@ -975,11 +975,11 @@ func TestControlPlaneServiceExposesFlight(t *testing.T) {
 		}
 
 		for _, port := range manifestPorts(manifest) {
-			if port["name"] == "flight" && port["port"] == float64(8815) && port["targetPort"] == "flight" {
-				return
+			if port["name"] == "flight" || port["port"] == float64(8815) || port["targetPort"] == "flight" {
+				t.Fatalf("duckgres-control-plane Service exposes obsolete Flight port: %#v", port)
 			}
 		}
-		t.Fatalf("duckgres-control-plane Service does not expose flight port 8815 to targetPort flight")
+		return
 	}
 
 	t.Fatal("duckgres-control-plane Service missing from manifests template")

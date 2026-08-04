@@ -68,7 +68,7 @@ Added for the console:
 | `POST /api/v1/sessions/:pid/cancel` | admin | tear down a session by pid — LOCAL only (pid is per-CP); prefer the worker-id form |
 | `POST /api/v1/sessions/by-worker/:wid/cancel` | admin | tear down the session on a cluster-unique worker id; fans out to whichever CP owns it (pid can't be fanned out — it collides across CPs). Returns `{killed, cp_responders, cp_total}` |
 | `POST /api/v1/orgs/:id/users/:username/kill` | admin | per-user kill switch (one-shot): tear down ALL of a user's sessions + in-flight queries cluster-wide. Returns `{killed, cp_responders, cp_total}`. Does NOT block reconnects |
-| `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at connect on PG wire + Flight), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
+| `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at pgwire connect), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
 | `POST /api/v1/orgs/:id/users/:username/enable` | admin | persist `disabled=false` + reload cluster-wide so the user can reconnect at once |
 | `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
@@ -101,9 +101,8 @@ call `ConfigStore.ReloadSnapshot()` on every replica so the connect-time block
 (the `duckgres_org_users.disabled` column, goose migration
 `000011_add_org_user_disabled.sql`) takes effect cluster-wide immediately rather
 than one config-poll later. The disabled flag is enforced at auth in
-`control.go` (PG wire → distinct `28000` "account is disabled" error, only after
-the password checks out so it never leaks account existence) and in
-`ConfigStore.ValidateOrgUser*` (Flight ingress).
+`control.go` (pgwire → distinct `28000` "account is disabled" error, only after
+the password checks out so it never leaks account existence).
 
 ### Impersonation (`impersonate.go` + `controlplane/admin_providers.go`)
 
