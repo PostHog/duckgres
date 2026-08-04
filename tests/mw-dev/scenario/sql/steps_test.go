@@ -504,6 +504,8 @@ func TestExecutorTemplatesSQLFileEnvVars(t *testing.T) {
 }
 
 func TestExecutorPropagatesPostHogValidationDiagnostics(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+
 	for _, tc := range []struct {
 		name       string
 		file       string
@@ -517,10 +519,10 @@ func TestExecutorPropagatesPostHogValidationDiagnostics(t *testing.T) {
 			contains:   "information_schema.columns",
 		},
 		{
-			name:       "parity mismatch",
+			name:       "registered fixture mismatch",
 			file:       filepath.Join("validate_posthog_tables.sql"),
-			diagnostic: "posthog events parity mismatch",
-			contains:   "EXCEPT ALL",
+			diagnostic: "posthog frozen-file registration mismatch",
+			contains:   "ducklake_list_files",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

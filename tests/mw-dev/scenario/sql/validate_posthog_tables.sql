@@ -1,5 +1,6 @@
--- Validation for the production-shaped PostHog DuckLake tables. Every assertion
--- raises a concise, non-sensitive SQL error so the scenario fails before perf runs.
+-- Validation for the registered PostHog DuckLake tables. These assertions use
+-- schemas and file metadata only: the perf step is the first one that reads
+-- the fixture rows.
 
 DESCRIBE posthog.events;
 DESCRIBE posthog.persons;
@@ -104,140 +105,52 @@ SELECT CASE
 END
 FROM partition_mismatches;
 
-WITH counts AS (
-    SELECT
-        (SELECT COUNT(*) FROM frozen_v1.events_file_view) AS events_source_rows,
-        (SELECT COUNT(*) FROM posthog.events) AS events_destination_rows,
-        (SELECT COUNT(*) FROM frozen_v1.persons_file_view) AS persons_source_rows,
-        (SELECT COUNT(*) FROM posthog.persons) AS persons_destination_rows
-)
-SELECT CASE
-    WHEN events_source_rows = events_destination_rows THEN 1
-    ELSE error('posthog.events row-count mismatch')
-END,
-CASE
-    WHEN persons_source_rows = persons_destination_rows THEN 1
-    ELSE error('posthog.persons row-count mismatch')
-END
-FROM counts;
-
-WITH ranges AS (
-    SELECT
-        (SELECT MIN(CAST("timestamp" AS TIMESTAMPTZ)) FROM frozen_v1.events_file_view) AS events_source_min,
-        (SELECT MAX(CAST("timestamp" AS TIMESTAMPTZ)) FROM frozen_v1.events_file_view) AS events_source_max,
-        (SELECT MIN(timestamp) FROM posthog.events) AS events_destination_min,
-        (SELECT MAX(timestamp) FROM posthog.events) AS events_destination_max,
-        (SELECT MIN(CAST(_timestamp AS TIMESTAMPTZ)) FROM frozen_v1.persons_file_view) AS persons_source_min,
-        (SELECT MAX(CAST(_timestamp AS TIMESTAMPTZ)) FROM frozen_v1.persons_file_view) AS persons_source_max,
-        (SELECT MIN(_timestamp) FROM posthog.persons) AS persons_destination_min,
-        (SELECT MAX(_timestamp) FROM posthog.persons) AS persons_destination_max
-)
-SELECT CASE
-    WHEN events_source_min IS NOT DISTINCT FROM events_destination_min
-     AND events_source_max IS NOT DISTINCT FROM events_destination_max THEN 1
-    ELSE error('posthog.events timestamp range mismatch')
-END,
-CASE
-    WHEN persons_source_min IS NOT DISTINCT FROM persons_destination_min
-     AND persons_source_max IS NOT DISTINCT FROM persons_destination_max THEN 1
-    ELSE error('posthog.persons timestamp range mismatch')
-END
-FROM ranges;
-
-WITH null_counts AS (
-    SELECT
-        (SELECT COUNT(*) FROM frozen_v1.events_file_view WHERE uuid IS NULL OR event IS NULL OR "timestamp" IS NULL OR team_id IS NULL) AS events_source_nulls,
-        (SELECT COUNT(*) FROM posthog.events WHERE uuid IS NULL OR event IS NULL OR timestamp IS NULL OR team_id IS NULL) AS events_destination_nulls,
-        (SELECT COUNT(*) FROM frozen_v1.persons_file_view WHERE team_id IS NULL OR distinct_id IS NULL OR id IS NULL OR _timestamp IS NULL) AS persons_source_nulls,
-        (SELECT COUNT(*) FROM posthog.persons WHERE team_id IS NULL OR distinct_id IS NULL OR id IS NULL OR _timestamp IS NULL) AS persons_destination_nulls
-)
-SELECT CASE
-    WHEN events_source_nulls = events_destination_nulls THEN 1
-    ELSE error('posthog.events key null-count mismatch')
-END,
-CASE
-    WHEN persons_source_nulls = persons_destination_nulls THEN 1
-    ELSE error('posthog.persons key null-count mismatch')
-END
-FROM null_counts;
-
-WITH source_events AS (
-    SELECT
-        CAST(uuid AS VARCHAR) AS uuid, CAST(event AS VARCHAR) AS event,
-        CAST(properties AS VARCHAR) AS properties, CAST("timestamp" AS TIMESTAMPTZ) AS timestamp,
-        CAST(team_id AS BIGINT) AS team_id, CAST(team_id AS BIGINT) AS project_id,
-        CAST(distinct_id AS VARCHAR) AS distinct_id, CAST(elements_chain AS VARCHAR) AS elements_chain,
-        CAST(created_at AS TIMESTAMPTZ) AS created_at, CAST(person_id AS VARCHAR) AS person_id,
-        CAST(person_created_at AS TIMESTAMPTZ) AS person_created_at, CAST(person_properties AS VARCHAR) AS person_properties,
-        CAST(group0_properties AS VARCHAR) AS group0_properties, CAST(group1_properties AS VARCHAR) AS group1_properties,
-        CAST(group2_properties AS VARCHAR) AS group2_properties, CAST(group3_properties AS VARCHAR) AS group3_properties,
-        CAST(group4_properties AS VARCHAR) AS group4_properties, CAST(group0_created_at AS TIMESTAMPTZ) AS group0_created_at,
-        CAST(group1_created_at AS TIMESTAMPTZ) AS group1_created_at, CAST(group2_created_at AS TIMESTAMPTZ) AS group2_created_at,
-        CAST(group3_created_at AS TIMESTAMPTZ) AS group3_created_at, CAST(group4_created_at AS TIMESTAMPTZ) AS group4_created_at,
-        CAST(person_mode AS VARCHAR) AS person_mode, CAST(historical_migration AS BOOLEAN) AS historical_migration,
-        CAST(_inserted_at AS TIMESTAMPTZ) AS _inserted_at
-    FROM frozen_v1.events_file_view
+-- Exact file-list equality proves the tables refer to precisely the frozen
+-- objects. No data-file scan is required for this check.
+WITH expected_files AS (
+    SELECT 'events' AS table_name, file AS data_file
+    FROM glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}events/*.parquet')
+    UNION ALL
+    SELECT 'persons' AS table_name, file AS data_file
+    FROM glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet')
 ),
-left_difference AS (
-    SELECT uuid, event, properties, timestamp, team_id, project_id, distinct_id, elements_chain, created_at,
-        person_id, person_created_at, person_properties, group0_properties, group1_properties, group2_properties,
-        group3_properties, group4_properties, group0_created_at, group1_created_at, group2_created_at,
-        group3_created_at, group4_created_at, person_mode, historical_migration, _inserted_at
-    FROM source_events
-    EXCEPT ALL
-    SELECT uuid, event, properties, timestamp, team_id, project_id, distinct_id, elements_chain, created_at,
-        person_id, person_created_at, person_properties, group0_properties, group1_properties, group2_properties,
-        group3_properties, group4_properties, group0_created_at, group1_created_at, group2_created_at,
-        group3_created_at, group4_created_at, person_mode, historical_migration, _inserted_at
-    FROM posthog.events
+registered_files AS (
+    SELECT 'events' AS table_name, data_file, delete_file
+    FROM ducklake_list_files('ducklake', 'events', schema => 'posthog')
+    UNION ALL
+    SELECT 'persons' AS table_name, data_file, delete_file
+    FROM ducklake_list_files('ducklake', 'persons', schema => 'posthog')
 ),
-right_difference AS (
-    SELECT uuid, event, properties, timestamp, team_id, project_id, distinct_id, elements_chain, created_at,
-        person_id, person_created_at, person_properties, group0_properties, group1_properties, group2_properties,
-        group3_properties, group4_properties, group0_created_at, group1_created_at, group2_created_at,
-        group3_created_at, group4_created_at, person_mode, historical_migration, _inserted_at
-    FROM posthog.events
+missing_registrations AS (
+    SELECT table_name, data_file FROM expected_files
     EXCEPT ALL
-    SELECT uuid, event, properties, timestamp, team_id, project_id, distinct_id, elements_chain, created_at,
-        person_id, person_created_at, person_properties, group0_properties, group1_properties, group2_properties,
-        group3_properties, group4_properties, group0_created_at, group1_created_at, group2_created_at,
-        group3_created_at, group4_created_at, person_mode, historical_migration, _inserted_at
-    FROM source_events
+    SELECT table_name, data_file FROM registered_files
+),
+unexpected_registrations AS (
+    SELECT table_name, data_file FROM registered_files
+    EXCEPT ALL
+    SELECT table_name, data_file FROM expected_files
+),
+delete_files AS (
+    SELECT table_name FROM registered_files WHERE delete_file IS NOT NULL
 )
 SELECT CASE
-    WHEN (SELECT COUNT(*) FROM left_difference) = 0 AND (SELECT COUNT(*) FROM right_difference) = 0 THEN 1
-    ELSE error('posthog events parity mismatch')
+    WHEN (SELECT COUNT(*) FROM missing_registrations) = 0
+     AND (SELECT COUNT(*) FROM unexpected_registrations) = 0
+     AND (SELECT COUNT(*) FROM delete_files) = 0 THEN 1
+    ELSE error('posthog frozen-file registration mismatch')
 END;
 
-WITH source_persons AS (
-    SELECT
-        CAST(team_id AS BIGINT) AS team_id, CAST(distinct_id AS VARCHAR) AS distinct_id,
-        CAST(id AS VARCHAR) AS id, CAST(properties AS VARCHAR) AS properties,
-        CAST(created_at AS TIMESTAMPTZ) AS created_at, CAST(is_identified AS BOOLEAN) AS is_identified,
-        CAST(person_distinct_id_version AS BIGINT) AS person_distinct_id_version,
-        CAST(person_version AS UBIGINT) AS person_version, CAST(_timestamp AS TIMESTAMPTZ) AS _timestamp,
-        CAST(_inserted_at AS TIMESTAMPTZ) AS _inserted_at
-    FROM frozen_v1.persons_file_view
-),
-left_difference AS (
-    SELECT team_id, distinct_id, id, properties, created_at, is_identified,
-        person_distinct_id_version, person_version, _timestamp, _inserted_at
-    FROM source_persons
-    EXCEPT ALL
-    SELECT team_id, distinct_id, id, properties, created_at, is_identified,
-        person_distinct_id_version, person_version, _timestamp, _inserted_at
-    FROM posthog.persons
-),
-right_difference AS (
-    SELECT team_id, distinct_id, id, properties, created_at, is_identified,
-        person_distinct_id_version, person_version, _timestamp, _inserted_at
-    FROM posthog.persons
-    EXCEPT ALL
-    SELECT team_id, distinct_id, id, properties, created_at, is_identified,
-        person_distinct_id_version, person_version, _timestamp, _inserted_at
-    FROM source_persons
+WITH manifest AS (
+    SELECT *
+    FROM main.posthog_table_setup_manifest
+    WHERE fixture_schema_revision = '056583335dc739b9e025efede811c9b4f5e153f5'
 )
 SELECT CASE
-    WHEN (SELECT COUNT(*) FROM left_difference) = 0 AND (SELECT COUNT(*) FROM right_difference) = 0 THEN 1
-    ELSE error('posthog persons parity mismatch')
-END;
+    WHEN COUNT(*) = 1
+     AND MIN(load_mode) = 'registered_frozen_parquet'
+     AND MIN(events_source_files) = MIN(events_registered_files)
+     AND MIN(persons_source_files) = MIN(persons_registered_files) THEN 1
+    ELSE error('posthog table-registration manifest mismatch')
+END
+FROM manifest;
