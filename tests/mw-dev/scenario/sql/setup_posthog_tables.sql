@@ -59,16 +59,6 @@ FROM missing_persons;
 
 CREATE SCHEMA IF NOT EXISTS posthog;
 
-CREATE TABLE IF NOT EXISTS main.posthog_table_setup_manifest (
-    fixture_schema_revision VARCHAR,
-    load_mode VARCHAR,
-    events_source_files BIGINT,
-    events_registered_files BIGINT,
-    persons_source_files BIGINT,
-    persons_registered_files BIGINT,
-    created_at TIMESTAMPTZ
-);
-
 -- `ducklake_add_data_files` appends metadata registrations. Drop and recreate
 -- these scenario-only tables so a retry cannot retain a partial registration.
 BEGIN TRANSACTION;
@@ -141,26 +131,5 @@ SET PARTITIONED BY (year(timestamp), month(timestamp), day(timestamp));
 
 ALTER TABLE posthog.persons
 SET PARTITIONED BY (year(_timestamp), month(_timestamp));
-
-DELETE FROM main.posthog_table_setup_manifest
-WHERE fixture_schema_revision = '056583335dc739b9e025efede811c9b4f5e153f5';
-
-INSERT INTO main.posthog_table_setup_manifest (
-    fixture_schema_revision,
-    load_mode,
-    events_source_files,
-    events_registered_files,
-    persons_source_files,
-    persons_registered_files,
-    created_at
-)
-SELECT
-    '056583335dc739b9e025efede811c9b4f5e153f5',
-    'registered_frozen_parquet',
-    (SELECT COUNT(*) FROM glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}events/*.parquet')),
-    (SELECT COUNT(*) FROM ducklake_list_files('ducklake', 'events', schema => 'posthog')),
-    (SELECT COUNT(*) FROM glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet')),
-    (SELECT COUNT(*) FROM ducklake_list_files('ducklake', 'persons', schema => 'posthog')),
-    now();
 
 COMMIT;

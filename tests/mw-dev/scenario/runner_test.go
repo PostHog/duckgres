@@ -592,15 +592,12 @@ func TestPostHogTableSetupValidatesRequiredSourceColumnsAndMappings(t *testing.T
 	}
 	sql := string(raw)
 	for _, want := range []string{
-		"056583335dc739b9e025efede811c9b4f5e153f5",
 		"table_schema = 'frozen_v1'",
 		"table_name = 'events_file_view'",
 		"table_name = 'persons_file_view'",
 		"information_schema.columns",
 		"missing required source columns",
 		"('project_id')",
-		"registered_frozen_parquet",
-		"ducklake_list_files",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("posthog setup missing registration diagnostic %q", want)
@@ -620,7 +617,6 @@ func TestPostHogTableValidationChecksRegisteredFixtureMetadata(t *testing.T) {
 		"glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}events/*.parquet')",
 		"glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet')",
 		"posthog frozen-file registration mismatch",
-		"posthog table-registration manifest mismatch",
 		"DESCRIBE posthog.events",
 		"DESCRIBE posthog.persons",
 	} {
