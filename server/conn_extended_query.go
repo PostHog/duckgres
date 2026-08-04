@@ -657,6 +657,14 @@ func (c *clientConn) handleExecute(body []byte) {
 	cmdType := c.getCommandType(upperQuery)
 	returnsResults := queryReturnsResults(p.stmt.query)
 
+	// Secret DDL creates worker-side state and the interception below executes
+	// it above the general pin hook, so the exploratory tier escalates first
+	// (connection-fatal on failure, parked on c.fatalErr). See
+	// escalateForSecretDDL.
+	if err := c.escalateForSecretDDL(p.stmt.query); err != nil {
+		return
+	}
+
 	// Intercept persistent-secret DDL (multitenant remote backend): persist /
 	// delete the user's stored secret alongside the session-side DDL. Uses
 	// the original (untranspiled) text — secret DDL is DuckDB-native and

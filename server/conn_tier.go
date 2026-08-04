@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/posthog/duckgres/server/usersecrets"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -122,6 +123,32 @@ func (c *clientConn) escalateForPinningStatement(query string) error {
 		return nil
 	}
 	return c.escalateForPinningTier(query, classifyStatementTier(query) == tierPinning)
+}
+
+// escalateForSecretDDL escalates off the exploratory worker BEFORE the
+// user-secrets interception (handleUserSecretDDLSimple / …Extended) runs. That
+// interception owns its own execution and sits ABOVE the general pin hook on
+// both protocols, so without this the statement would touch the small worker:
+//
+//   - a plain / TEMPORARY CREATE SECRET is session-scoped worker state, so
+//     creating it on the exploratory worker and escalating later silently drops
+//     the credential;
+//   - the managed PERSISTENT path executes on the live session too (DuckDB
+//     validates before the store write), and DROP SECRET likewise mutates
+//     worker state.
+//
+// Detection is usersecrets.Classify, the same conservative-lexical classifier
+// the interception itself keys on — so anything that CAN be intercepted is
+// pinned first. A spelling Classify declines (KindNone) is not intercepted
+// either: it falls through to the normal execution path, where pg_query cannot
+// parse DuckDB's SECRET syntax and classifyStatementTier's parse-failure
+// default pins it at the general hook. Both ends of that chain pin; only the
+// timing differs.
+func (c *clientConn) escalateForSecretDDL(query string) error {
+	if !c.onExploratoryWorker {
+		return nil
+	}
+	return c.escalateForPinningTier(query, usersecrets.Classify(query).Kind != usersecrets.KindNone)
 }
 
 // escalateForPinningTier is escalateForPinningStatement for callers that

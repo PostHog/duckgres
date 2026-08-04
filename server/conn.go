@@ -1414,6 +1414,13 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		return c.handlePgStatActivity()
 	}
 
+	// Secret DDL creates worker-side state, and the interception below both
+	// executes it and sits above the general pin hook, so the exploratory tier
+	// escalates here (connection-fatal on failure). See escalateForSecretDDL.
+	if err := c.escalateForSecretDDL(query); err != nil {
+		return err
+	}
+
 	// Intercept persistent-secret DDL (CREATE PERSISTENT SECRET / DROP
 	// SECRET) when a user secret manager is configured (multitenant remote
 	// backend), so customer secrets survive across sessions and worker pods.

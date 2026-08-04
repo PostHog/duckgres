@@ -1366,6 +1366,167 @@ func TestExtendedExecuteMaxRowsUnchanged(t *testing.T) {
 	}
 }
 
+// --- 5. secret DDL pins before it is intercepted -----------------------
+
+// secretSentinel is a credential-shaped literal that must never appear in a
+// log line or an ErrorResponse.
+const secretSentinel = "SECRET_VALUE_XYZ"
+
+// secretDDLStatements are the shapes that must pin: the managed persistent
+// path (intercepted and EXECUTED above the general pin hook) and the plain
+// session-scoped path (whose secret is worker state that escalation drops).
+func secretDDLStatements() []string {
+	return []string{
+		"CREATE PERSISTENT SECRET my_s3 (TYPE s3, KEY_ID 'k', SECRET '" + secretSentinel + "')",
+		"CREATE SECRET my_s3 (TYPE s3, KEY_ID 'k', SECRET '" + secretSentinel + "')",
+		"DROP PERSISTENT SECRET my_s3",
+	}
+}
+
+// TestSecretDDLPinsBeforeInterceptionSimple asserts secret DDL escalates BEFORE
+// the user-secrets interception executes it. The interception sits above the
+// general pin hook (it owns its own execution), so without a hook of its own
+// the secret would be created on the exploratory worker — and a plain
+// (session-scoped) secret is silently dropped by the very next escalation.
+func TestSecretDDLPinsBeforeInterceptionSimple(t *testing.T) {
+	for _, stmt := range secretDDLStatements() {
+		t.Run(stmt[:12], func(t *testing.T) {
+			var order []string
+			small := &tierExecutor{name: "small", order: &order}
+			big := &tierExecutor{name: "big", order: &order}
+			c, _ := newBufferedConn(small)
+			c.server.cfg.UserSecrets = &fakeUserSecretMgr{delExist: true}
+			c.onExploratoryWorker = true
+			var reasons []string
+			c.workerSwitcher = func(_ context.Context, reason string) (QueryExecutor, int, string, error) {
+				reasons = append(reasons, reason)
+				order = append(order, "switch")
+				return big, 9, "worker-9", nil
+			}
+
+			if err := c.handleQuery(append([]byte(stmt), 0)); err != nil {
+				t.Fatalf("handleQuery: %v", err)
+			}
+			if len(reasons) != 1 || reasons[0] != escalateReasonState {
+				t.Fatalf("secret DDL did not pin: switcher reasons = %v", reasons)
+			}
+			if len(small.execCalls) != 0 || len(small.queryCalls) != 0 {
+				t.Fatalf("secret DDL ran on the exploratory worker: exec=%v query=%v", small.execCalls, small.queryCalls)
+			}
+			if len(order) == 0 || order[0] != "switch" {
+				t.Fatalf("escalation did not precede execution: %v", order)
+			}
+		})
+	}
+}
+
+// TestSecretDDLPinsBeforeInterceptionExtended is the extended-protocol sibling:
+// the interception at Execute likewise runs above the general pin hook.
+func TestSecretDDLPinsBeforeInterceptionExtended(t *testing.T) {
+	for _, stmt := range secretDDLStatements() {
+		t.Run(stmt[:12], func(t *testing.T) {
+			var order []string
+			small := &tierExecutor{name: "small", order: &order}
+			big := &tierExecutor{name: "big", order: &order}
+			c, _, reasons := newExtendedTierConn(small, big)
+			c.server.cfg.UserSecrets = &fakeUserSecretMgr{delExist: true}
+
+			if err := extRun(t, c, "s1", stmt); err != nil {
+				t.Fatalf("extended run: %v", err)
+			}
+			if len(*reasons) != 1 || (*reasons)[0] != escalateReasonState {
+				t.Fatalf("secret DDL did not pin: switcher reasons = %v", *reasons)
+			}
+			if len(small.execCalls) != 0 || len(small.queryCalls) != 0 {
+				t.Fatalf("secret DDL ran on the exploratory worker: exec=%v query=%v", small.execCalls, small.queryCalls)
+			}
+			if len(order) == 0 || order[0] != "switch" {
+				t.Fatalf("escalation did not precede execution: %v", order)
+			}
+		})
+	}
+}
+
+// TestSecretDDLEscalationFailureIsConnectionFatalAndRedacted asserts the
+// failure path: a FATAL with the mapped SQLSTATE, and — because engine and
+// server logs echo SQL — the credential appears in NEITHER the client's
+// ErrorResponse NOR any log line.
+func TestSecretDDLEscalationFailureIsConnectionFatalAndRedacted(t *testing.T) {
+	const stmt = "CREATE PERSISTENT SECRET my_s3 (TYPE s3, KEY_ID 'k', SECRET '" + secretSentinel + "')"
+	for _, protocol := range []string{"simple", "extended"} {
+		t.Run(protocol, func(t *testing.T) {
+			logs, restoreLogs := captureSlog(t)
+			defer restoreLogs()
+			small := &tierExecutor{name: "small"}
+			c, out, _ := newExtendedTierConn(small, nil)
+			c.server.cfg.UserSecrets = &fakeUserSecretMgr{}
+			c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+				return nil, 0, "", errors.New("worker capacity exhausted for organization")
+			}
+
+			var err error
+			if protocol == "simple" {
+				err = c.handleQuery(append([]byte(stmt), 0))
+			} else {
+				err = extRun(t, c, "s1", stmt)
+			}
+			if err == nil {
+				t.Fatal("returned nil; a failed escalation must terminate the connection")
+			}
+			if !errors.Is(err, errConnectionFatal) {
+				t.Fatalf("error %v does not carry errConnectionFatal", err)
+			}
+			msgs := parseWireMsgs(t, out.Bytes())
+			if !hasErrorResponse(msgs, "FATAL", "53300") {
+				t.Fatalf("want FATAL 53300, got %s", describeErrorResponses(msgs))
+			}
+			if len(small.execCalls) != 0 {
+				t.Fatalf("secret DDL ran on the dead exploratory session: %v", small.execCalls)
+			}
+			if bytes.Contains(out.Bytes(), []byte(secretSentinel)) {
+				t.Fatalf("credential leaked to the client: %s", describeErrorResponses(msgs))
+			}
+			if strings.Contains(logs.String(), secretSentinel) {
+				t.Fatalf("credential leaked to the logs: %s", logs.String())
+			}
+		})
+	}
+}
+
+// TestSecretDDLOffTierUnchanged is the negative control: without the
+// exploratory tier the statement is intercepted and executed exactly as before,
+// with no switcher involvement.
+func TestSecretDDLOffTierUnchanged(t *testing.T) {
+	const stmt = "CREATE PERSISTENT SECRET my_s3 (TYPE s3, KEY_ID 'k', SECRET 's')"
+	mgr := &fakeUserSecretMgr{}
+	exec := &tierExecutor{name: "std"}
+	c, out := newBufferedConn(exec)
+	c.server.cfg.UserSecrets = mgr
+	c.orgID, c.username = "org1", "alice"
+	switched := 0
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		switched++
+		return nil, 0, "", nil
+	}
+
+	if err := c.handleQuery(append([]byte(stmt), 0)); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+	if switched != 0 {
+		t.Fatalf("off-tier secret DDL escalated (%d switcher calls)", switched)
+	}
+	if len(exec.execCalls) != 1 {
+		t.Fatalf("executor calls = %v, want the statement executed once", exec.execCalls)
+	}
+	if len(mgr.putCalls) != 1 {
+		t.Fatalf("putCalls = %v, want the secret persisted", mgr.putCalls)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if countMsgs(msgs, 'E') != 0 {
+		t.Fatalf("unexpected ErrorResponse: %s", describeErrorResponses(msgs))
+	}
+}
+
 // --- SQLSTATE mapping helper ------------------------------------------
 
 func TestEscalationErrorSQLState(t *testing.T) {
