@@ -140,17 +140,3 @@ SELECT CASE
      AND (SELECT COUNT(*) FROM delete_files) = 0 THEN 1
     ELSE error('posthog frozen-file registration mismatch')
 END;
-
-WITH manifest AS (
-    SELECT *
-    FROM main.posthog_table_setup_manifest
-    WHERE fixture_schema_revision = '056583335dc739b9e025efede811c9b4f5e153f5'
-)
-SELECT CASE
-    WHEN COUNT(*) = 1
-     AND MIN(load_mode) = 'registered_frozen_parquet'
-     AND MIN(events_source_files) = MIN(events_registered_files)
-     AND MIN(persons_source_files) = MIN(persons_registered_files) THEN 1
-    ELSE error('posthog table-registration manifest mismatch')
-END
-FROM manifest;

@@ -101,9 +101,9 @@ This runs, in order: raw-view setup, source-column preflight, explicit PostHog
 table DDL, registration of the frozen Parquet files in DuckLake, then partition
 and file-metadata validation. Registration reads Parquet footers but does not
 rewrite the fixture rows, so the raw-view and DuckLake-table queries use the
-same frozen S3 objects. The setup records the pinned revision, registration
-mode, and source/registered file counts in `main.posthog_table_setup_manifest`.
-Neither `fast-suite` nor `full-suite` enables these tables yet.
+same frozen S3 objects. Validation checks the declared schema and partition
+metadata plus exact source/registered file-list equality. Neither `fast-suite`
+nor `full-suite` enables these tables yet.
 
 Run frozen dbt lifecycle:
 
