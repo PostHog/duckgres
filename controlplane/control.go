@@ -1170,6 +1170,29 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
 
+	// Exploratory tier: a connection that did not ask for a specific worker
+	// shape starts on the small exploratory worker and escalates on demand
+	// (first state-mutating statement, an OOM, or a heuristic — see
+	// server/conn_tier.go). workerProfile — the org default, else the pool
+	// default — stays the ESCALATION TARGET, so escalating lands exactly where
+	// the connection would have started without the tier.
+	//
+	// Remote backend only: the process backend and standalone have no per-org
+	// worker pods to size, and exploratoryWorkerProfile returns nil whenever
+	// the tier is off or half-configured, which degrades to today's behavior.
+	explProfile, explWarns := exploratoryWorkerProfile(cp.cfg.K8s)
+	for _, w := range explWarns {
+		clog.Warn("Exploratory tier config problem.", "detail", w)
+	}
+	useExploratory := cp.isRemoteBackend && explProfile != nil &&
+		!clientSuppliedWorkerGUCs(cp.cfg.K8s, startupOptions)
+	initialProfile := workerProfile
+	if useExploratory {
+		initialProfile = explProfile
+		clog.Info("Starting connection on exploratory worker.",
+			"cpu", explProfile.CPU, "memory", explProfile.Memory, "ttl", explProfile.TTL.String())
+	}
+
 	// Validate a `-c duckgres.s3_cache=...` startup option BEFORE acquiring a
 	// worker (same early-reject treatment as an invalid duckgres.worker_*
 	// option). The option is applied after the session executor is bound,
@@ -1301,7 +1324,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		threads  int
 	)
 	if cp.isRemoteBackend {
-		memLimit, threads = cp.workerDuckDBLimits(workerProfile)
+		memLimit, threads = cp.workerDuckDBLimits(initialProfile)
 	} else if rebalancer != nil {
 		memLimit = rebalancer.MemoryLimit()
 		threads = rebalancer.PerSessionThreads()
@@ -1315,7 +1338,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
 		func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
-			return sessions.CreateSession(ctx, username, pid, memLimit, threads, workerProfile)
+			return sessions.CreateSession(ctx, username, pid, memLimit, threads, initialProfile)
 		},
 	)
 	if cp.isDraining() {
@@ -1340,7 +1363,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		_ = writer.Flush()
 		return
 	}
-	// Worker is now assigned — capture identity for log correlation.
+	// Worker is now assigned — capture identity for log correlation. baseClog
+	// keeps the pre-worker logger so a tier escalation can re-derive a logger
+	// for the NEW worker instead of stamping a second, stale worker attribute.
+	baseClog := clog
 	workerID := sessions.WorkerIDForPID(pid)
 	workerPod := sessions.WorkerPodNameForPID(pid)
 	clog = clog.With("worker", workerID, "worker_pod", workerPod)
@@ -1399,7 +1425,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// backend leaves it zero so metering is skipped. Constant for the
 	// connection's life (computed once at teardown over its full lifetime).
 	if cp.isRemoteBackend {
-		millicores, mib := cp.workerBillingSize(workerProfile)
+		millicores, mib := cp.workerBillingSize(initialProfile)
 		server.SetConnectionWorkerSize(cc, millicores, mib)
 	}
 	// Record the connection's full lifetime exactly once, on every exit path
@@ -1444,6 +1470,50 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+	// Install the tier escalation switcher: the connection is running on the
+	// small exploratory worker and moves to a normal-size one (workerProfile —
+	// the org/pool default that a non-tiered connection would have started on)
+	// the first time it needs to. Invoked on the message-loop goroutine, so
+	// every field it touches is single-threaded with statement handling.
+	if useExploratory {
+		server.SetConnectionExploratory(cc, func(ctx context.Context, reason string) (server.QueryExecutor, int, string, error) {
+			// The exploratory session is stateless by construction (every
+			// state-mutating statement escalates BEFORE executing), so
+			// destroy-then-acquire is safe — and it releases the small worker
+			// to hot-idle before the org's worker cap is checked for the big
+			// one, so escalating can never deadlock against the org's own cap.
+			sessions.DestroySession(pid)
+			escMemLimit, escThreads := cp.workerDuckDBLimits(workerProfile)
+			createCtx, cancel := context.WithTimeout(ctx, cp.cfg.WorkerQueueTimeout)
+			defer cancel()
+			_, exec, err := sessions.CreateSession(createCtx, username, pid, escMemLimit, escThreads, workerProfile)
+			if err != nil {
+				return nil, 0, "", fmt.Errorf("escalate to standard worker: %w", err)
+			}
+			newWorkerID := sessions.WorkerIDForPID(pid)
+			newWorkerPod := sessions.WorkerPodNameForPID(pid)
+			escClog := baseClog.With("worker", newWorkerID, "worker_pod", newWorkerPod)
+			// The new worker's session is cold: re-run the same connect-time
+			// metadata init against it, with the identical connect-time inputs.
+			escMeta := sessionMeta
+			escMeta.clog = escClog
+			if _, initErr := cp.initSessionMetadata(createCtx, exec, escMeta); initErr != nil {
+				sessions.DestroySession(pid)
+				return nil, 0, "", fmt.Errorf("init session on standard worker: %w", initErr)
+			}
+			// DestroySession dropped the registration; re-register so
+			// OnWorkerCrash can still close the client socket.
+			sessions.SetConnCloser(pid, tlsConn)
+			// Billing: largest size wins for the whole connection (v1). Safe to
+			// write here because the switcher runs on the message-loop
+			// goroutine, the same one that computes the metric at teardown.
+			millicores, mib := cp.workerBillingSize(workerProfile)
+			server.SetConnectionWorkerSize(cc, millicores, mib)
+			escClog.Info("Connection escalated to standard worker.", "reason", reason)
+			return exec, newWorkerID, newWorkerPod, nil
+		})
+	}
+
 	// The normal PostgreSQL message loop is about to take ownership of reader.
 	// Join the disconnect watcher first; a FIN/RST at any point during session
 	// admission or metadata initialization tears down the session via the defer

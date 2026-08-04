@@ -86,6 +86,34 @@ func (c *clientConn) applyStartupS3Cache(raw string) error {
 	return c.applyS3CacheSetting(norm)
 }
 
+// reapplyS3CacheAfterWorkerSwitch re-asserts this session's `duckgres.s3_cache`
+// state on a freshly acquired worker after a tier escalation. The bypass lives
+// in the WORKER's `ducklake_s3` secret, not in session state, and a new session
+// always starts on the cache-proxy transport (CreateSession restores it before
+// the session starts, so a bypass never leaks into the org's next session).
+// Without this re-apply, a connection that asked for `off` would silently start
+// reading through the cache the moment it escalated — exactly the failure mode
+// applyS3CacheSetting exists to prevent, and one applyS3CacheSetting itself
+// cannot fix here because its "did the effective state change?" guard sees no
+// change. No-op when the session never bypassed the cache, or when the executor
+// has no cache to bypass.
+func (c *clientConn) reapplyS3CacheAfterWorkerSwitch(ctx context.Context) error {
+	if !c.s3CacheOff {
+		return nil
+	}
+	ctrl, ok := c.executor.(S3CacheControl)
+	if !ok {
+		return nil
+	}
+	applyCtx, cancel := context.WithTimeout(ctx, s3CacheApplyTimeout)
+	defer cancel()
+	if err := ctrl.SetS3CacheEnabled(applyCtx, false); err != nil {
+		return fmt.Errorf("failed to re-apply %s on the new worker: %w", s3CacheGUCName, err)
+	}
+	c.logger().Info("Re-applied duckgres.s3_cache after worker switch.", "enabled", false)
+	return nil
+}
+
 // S3CacheGUCName is the startup-option / GUC name, exported for the control
 // plane's startup-option parsing.
 const S3CacheGUCName = s3CacheGUCName

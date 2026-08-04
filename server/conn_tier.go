@@ -41,5 +41,14 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	c.onExploratoryWorker = false
 	exploratoryEscalationsTotal.WithLabelValues(reason).Inc()
 	c.logger().Info("Escalated connection off exploratory worker.", "reason", reason, "worker", workerID, "worker_pod", workerPod)
+	// The `duckgres.s3_cache` bypass is worker-side state, and the new session
+	// starts on the cache proxy — re-assert it or the connection silently
+	// starts reading cached mid-flight. On failure the session state is reset
+	// to match the transport the worker is actually in (SHOW must never lie)
+	// and the statement fails, rather than a benchmark quietly going cached.
+	if err := c.reapplyS3CacheAfterWorkerSwitch(ctx); err != nil {
+		c.s3CacheOff = false
+		return err
+	}
 	return nil
 }

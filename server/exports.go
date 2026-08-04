@@ -198,7 +198,9 @@ func (s *Server) ConnSummariesByWorkerID() map[int]ConnLiveSummary {
 // SetConnectionWorkerSize records the provisioned worker pod size (in
 // milli-units) on a control-plane connection for compute-usage billing.
 // millicores == 0 means the size is unknown (non-remote / standalone) and
-// metering is skipped. Constant for the connection's life.
+// metering is skipped. Constant for the connection's life, except that tier
+// escalation may raise it once (largest size wins) from the message-loop
+// goroutine — the same goroutine that reads it at teardown.
 func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 	if cc != nil {
 		cc.workerMillicores = millicores

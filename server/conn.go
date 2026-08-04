@@ -219,7 +219,9 @@ type clientConn struct {
 	// only). Counted in milli-units to avoid truncating a fractional-core or
 	// sub-GiB worker. workerMillicores == 0 means "unknown size" (non-remote /
 	// standalone), in which case metering is skipped. Constant for the
-	// connection's life; the metric is computed once at teardown over
+	// connection's life, except that exploratory-tier escalation may raise it
+	// once (largest size wins) on the message-loop goroutine — the same
+	// goroutine that reads it; the metric is computed once at teardown over
 	// backendStart→now.
 	workerMillicores int64
 	workerMiB        int64
