@@ -83,19 +83,23 @@ jobs:
                       # does not. See scripts/ducklake_version_matrix.sh
                       # commit history for the rationale on each row.
                       pg_scanner_repo: "https://extensions.duckdb.org"
-                      default: true
+                      # Rollback row: publishes suffixed tags only. Operators
+                      # roll a tenant back by re-pointing its `image`
+                      # config-store column at a …-duckdb1.5.3 tag.
+                      default: false
                     - version: "1.5.5"
                       go: "v2.10505.0"
                       bindings: "v0.10505.0"
-                      # Same credential-refresh/write-retry patch set as the
-                      # default row, rebuilt against DuckDB 1.5.5.
+                      # cred-refresh-write-retry rebuilt against DuckDB 1.5.5:
+                      # mid-statement S3 credential recovery on ExpiredToken
+                      # read/write auth failures (see the 1.5.3 row).
                       httpfs: "v1.5.5-cred-refresh-write-retry"
                       # First PostHog DuckLake release built for DuckDB 1.5.5.
                       ducklake: "v1.0-posthog.7"
                       pg_scanner_repo: "https://extensions.duckdb.org"
-                      # Canary only: publishes suffixed tags without moving the
-                      # fleet-wide unsuffixed tag or dispatching Charts.
-                      default: false
+                      # Fleet default: also publishes the unsuffixed tags and
+                      # dispatches Charts.
+                      default: true
                 platform:
                     - platform: linux/arm64
                       runner: ubuntu-24.04-arm
@@ -277,9 +281,9 @@ jobs:
             matrix:
                 duckdb:
                     - version: "1.5.3"
-                      default: true
-                    - version: "1.5.5"
                       default: false
+                    - version: "1.5.5"
+                      default: true
         runs-on: ubuntu-24.04
         permissions:
             id-token: write

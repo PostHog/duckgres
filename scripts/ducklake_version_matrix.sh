@@ -26,7 +26,7 @@ TEST_TIMEOUT="${DUCKLAKE_TEST_TIMEOUT:-300s}"
 #   v2.10502.0 → DuckDB 1.5.2 (DuckLake 1.0)
 #   v2.10503.0 → DuckDB 1.5.3 (DuckLake 1.0)
 #   v2.10505.0 → DuckDB 1.5.5 (DuckLake 1.0)
-# The current canary and rollback versions are benchmarked by default; older
+# The current default and rollback versions are benchmarked by default; older
 # versions remain testable on demand via DUCKLAKE_VERSIONS.
 DEFAULT_VERSIONS="v2.10505.0 v2.10503.0"
 VERSIONS="${DUCKLAKE_VERSIONS:-$DEFAULT_VERSIONS}"

@@ -86,8 +86,8 @@ jobs:
       tag: pr-${{ github.event.pull_request.number || github.run_id }}-${{ github.sha }}-arm64
       platform: linux/arm64
       cache-scope: e2e-duckgres-arm64
-      # DuckDB 1.5.5 canary row. The worker CD matrix keeps 1.5.3 as
-      # default:true until per-tenant canaries complete.
+      # Default DuckDB row (1.5.5) — mirrors the default:true matrix entry in
+      # container-image-worker-cd.yml. Keep in lock-step on a version bump.
       build-args: |
         DUCKDB_EXTENSION_VERSION=1.5.5
         HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
