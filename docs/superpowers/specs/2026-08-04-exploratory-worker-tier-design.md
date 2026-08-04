@@ -91,7 +91,21 @@ Per statement, three outcomes:
   `wipeUserSecrets` + `DestroySession` semantics; nothing new.
 - Billing v1: a connection bills at the **largest** worker size it used.
   Conservative; connections that stay small bill small. Per-segment
-  metering is an explicit follow-up, not v1.
+  metering is an explicit follow-up, not v1. Implemented by stamping the
+  escalation target's size on the connection at switch time — escalation
+  only ever goes exploratory→standard, so that stamp IS the maximum.
+- The new worker's session starts **cold**: the escalation switcher re-runs
+  the full connect-time session-metadata init (attached-catalog probe,
+  `InitSessionDatabaseMetadataWithAccess`, connect-time search_path /
+  passthrough catalog) against it, from the same connect-time inputs
+  (`ControlPlane.initSessionMetadata`).
+- `duckgres.s3_cache = off` must be **re-applied** on the escalated worker.
+  The bypass lives in the worker's `ducklake_s3` secret, and `CreateSession`
+  deliberately restores the cache-proxy transport before a session starts, so
+  a bypassed connection would otherwise silently start reading cached the
+  moment it escalated. A failed re-apply fails the statement AND resets the
+  session state to the worker's actual transport (`SHOW` must never report a
+  transport the worker isn't in).
 
 ### 6. Observability & tests
 

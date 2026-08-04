@@ -1504,7 +1504,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// DestroySession dropped the registration; re-register so
 			// OnWorkerCrash can still close the client socket.
 			sessions.SetConnCloser(pid, tlsConn)
-			// Billing: largest size wins for the whole connection (v1). Safe to
+			// Billing: the whole connection bills at the largest worker size it
+			// used (v1). Stamping the escalation target IS that maximum —
+			// escalation only ever goes exploratory→standard, and the
+			// exploratory profile is the small tier by construction. Safe to
 			// write here because the switcher runs on the message-loop
 			// goroutine, the same one that computes the metric at teardown.
 			millicores, mib := cp.workerBillingSize(workerProfile)
