@@ -8,7 +8,7 @@ Duckgres is a PostgreSQL wire protocol server backed by DuckDB. It allows any Po
 
 ## Architecture
 
-Duckgres has three deployment topologies, built from three run modes (`standalone`, `control-plane`, `duckdb-service`):
+Duckgres has three deployment topologies, built from three primary run modes (`standalone`, `control-plane`, `duckdb-service`; a fourth utility mode, `reshard-runner`, is the entrypoint of the dedicated per-operation reshard pods the control plane spawns — see the Resharding section):
 
 **1. Standalone** — single process. One binary running in `standalone` mode handles the PG wire protocol, auth, TLS, transpilation, and DuckDB execution itself. Each user gets their own DuckDB database in-process.
 ```
@@ -27,13 +27,76 @@ PG Client → TLS/Auth/PG Protocol → Control Plane pod
                                  → Flight SQL (TCP+TLS) → per-org Worker pod (DuckDB)
 ```
 
+### Native metadata Postgres proxy
+
+The Kubernetes control plane can expose explicitly opted-in CNPG-backed
+warehouse metadata databases on a separate SNI suffix
+(`DUCKGRES_METADATA_HOSTNAME_SUFFIXES`; managed-warehouse deployments use
+`.md.dev.postwh.com`, `.md.us.postwh.com`, or `.md.eu.postwh.com`). This is an
+early connection branch, not a DuckDB
+executor: the existing org `root` password authenticates at Duckgres, the
+startup database MUST be exactly `metadata`, and the control plane resolves
+the real endpoint/database/tenant role/password internally through
+`SharedWorkerActivator.MetadataPostgresURL`. After authenticating upstream
+with that internal credential, protocol traffic is relayed byte-for-byte. The
+endpoint and password remain internal; the upstream role and database can be
+visible to the fully privileged client through normal PostgreSQL introspection
+such as `current_user` and `current_database()`.
+
+Access is fail-closed on the warehouse row's `metadata_proxy_enabled` flag,
+`state=ready`, and `metadata_store_kind=cnpg-shard`. Never infer publication
+from shard placement and never pass a client-supplied upstream database,
+username, host, or password. `DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG`
+(default 20 per control-plane replica) bounds public sessions so they cannot
+exhaust the internal PgBouncer pool. These sessions participate in the
+existing per-user kill / disable fan-out, and an established session is closed
+if the warehouse gate stops being eligible. An admin warehouse PUT that
+explicitly includes `metadata_proxy_enabled` reloads the local config snapshot
+and notifies peer replicas; established sessions observe the new gate on their
+next five-second recheck after snapshot propagation.
+
+The initial scope is dedicated, single-customer CNPG shards only. Do not enable
+an org on a shared shard until upstream `CONNECT` ACLs and role hardening are in
+place. The exact virtual database check prevents selecting a different startup
+database, but after connection the customer `root` credential has the full
+access of the internally resolved metadata role.
+
+Observability stays explicit at the branch boundary:
+`duckgres_connections_open` includes these client sockets because it is the
+process-wide accepted-connection gauge, while
+`duckgres_metadata_proxy_connections_open`,
+`duckgres_metadata_proxy_connection_attempts_total`,
+`duckgres_metadata_proxy_connection_duration_seconds`,
+`duckgres_metadata_proxy_upstream_connect_duration_seconds`, and
+`duckgres_metadata_proxy_bytes_total` isolate proxy load and failures. The
+relay is intentionally opaque, so DuckDB query metrics, query logs, and query
+traces do not include SQL executed through it. Use the CNPG/PgBouncer metrics
+and the fixed upstream `application_name=duckgres-metadata-proxy` for
+database-side attribution; never make one org's metadata target part of the
+control-plane health check. Target resolution plus upstream
+connect/auth/synchronization has a fixed 10-second bootstrap deadline; the
+deadline is canceled after hijack and never applies to established relay
+traffic. `duckgres_auth_failures_total` includes wrong-password proxy attempts;
+the dedicated attempt counter with `outcome="auth_failed"` is the proxy split.
+Pre-TLS `duckgres_rate_limit_rejects_total` events cannot be assigned to either
+endpoint because SNI has not yet been observed.
+
+Metadata-proxy `CancelRequest` handling is session-terminating. Synthetic
+backend keys map to the exact established frontend/upstream connection pair on
+the owning control-plane replica, which closes both rather than redialing a
+PgBouncer Service where instance-local cancel keys could reach the wrong pod.
+Raw cancel connections remain control-plane-local behind the NLB, matching the
+existing cancellation locality: a synthetic-key miss on another replica is
+absorbed and counted by
+`duckgres_metadata_proxy_cancel_requests_total{outcome="not_local"}`.
+
 In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingress (`--flight-port`) for clients that prefer Flight over the PG wire protocol.
 
 ### Key Components
 
 - **main.go / config_resolution.go**: CLI flags; effective config resolution (CLI > env > YAML > defaults), including env-only K8s knobs.
 - **server/** — PG wire protocol server and DuckDB execution
-  - Wire protocol & connections: `server.go`, `conn.go`, `protocol.go`, `exports.go`
+  - Wire protocol & connections: `server.go`, `conn.go`, `conn_errors.go`, `conn_query_exec.go`, `conn_results.go`, `conn_copy.go`, `conn_extended_query.go`, `conn_pg_stat_activity.go`, `conn_cursor.go`, `protocol.go`, `exports.go`
   - Execution: `executor.go`, `flight_executor.go`, `chsql.go`, `transient.go`
   - Catalog & types: `catalog.go`, `types.go`, `session_database_metadata.go`
   - Auth, TLS, rate limiting: `auth_policy.go`, `ratelimit.go`, `certs.go`, `acme.go`
@@ -45,8 +108,8 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - Core: `control.go`, `session_mgr.go`, `worker_mgr.go`, `worker_pool.go` (process/k8s abstraction), `validation.go`, `sdnotify.go`
   - Flight SQL ingress adapter: `flight_ingress.go`
   - Runtime loops: `janitor.go`, `leader_loop.go`, `memory_rebalancer.go`, `runtime_tracker.go`
-  - K8s / multitenant under build tag `kubernetes` (including: `multitenant.go`, `k8s_pool.go`, `k8s_factory.go`, `org_router.go`, `org_reserved_pool.go`, `sts_broker.go`, `shared_worker_activator.go`, `worker_rpc_security.go`, `janitor_leader_k8s.go`)
-  - Subpackages: `admin/` (HTTP admin API, `kubernetes` tag), `provisioner/` (k8s controller, `kubernetes` tag), `provisioning/` (HTTP API), `configstore/` (Postgres-backed config)
+  - K8s / multitenant under build tag `kubernetes` (including: `multitenant.go`, `k8s_pool.go`, `k8s_pool_acquire.go`, `k8s_pool_spawn.go`, `k8s_pool_lifecycle.go`, `k8s_pool_reconcile.go`, `k8s_pool_helpers.go`, `k8s_factory.go`, `org_router.go`, `org_reserved_pool.go`, `sts_broker.go`, `shared_worker_activator.go`, `worker_rpc_security.go`, `janitor_leader_k8s.go`)
+  - Subpackages: `admin/` (HTTP admin API + dashboard, `kubernetes` tag; includes the models explorer UI `static/models.html` + `models_api.go`, and `devserver/` for local UI dev against a port-forwarded CP — see `admin/README.md`), `provisioner/` (k8s controller, `kubernetes` tag), `provisioning/` (HTTP API), `configstore/` (Postgres-backed config)
 - **duckdbservice/** — DuckDB Arrow Flight SQL service
   - Core: `service.go`, `flight_handler.go`, `arrow_helpers.go`, `auth.go`, `config.go`
   - Lifecycle, caching, profiling, metrics: `activation.go`, `transient.go`, `cache_proxy.go`, `profiling.go`, `progress.go`, `metrics.go`
@@ -61,22 +124,25 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - **Process backend** (default, `--worker-backend process`): local Flight SQL workers over Unix sockets.
   - **Remote backend** (`--worker-backend remote`): per-org Kubernetes worker pods over TCP+TLS. Multitenant; requires `-tags kubernetes` and a Postgres-backed config store. Adds config store, org router, runtime tracker, janitor/leader election, and a provisioning/admin HTTP API.
 - **duckdb-service**: Thin DuckDB execution engine exposed via Arrow Flight SQL. Spawned automatically by the control plane as worker processes, or run standalone for testing.
+- **reshard-runner** (`-tags kubernetes` only): entrypoint of the dedicated per-operation reshard pod (`duckgres-reshard-op-<id>`), spawned by the control plane when an operator starts a reshard. Claims ONE op (`DUCKGRES_RESHARD_OP_ID`), executes the reshard step machine to a terminal state, exits (0 unless an infrastructure error). See "Resharding" below.
 
 Key CLI flags for control-plane mode:
-- `--mode control-plane|duckdb-service|standalone`
+- `--mode control-plane|duckdb-service|standalone|reshard-runner`
 - `--worker-backend process|remote`
 - `--process-min-workers N` / `--process-max-workers N`
 - `--process-retire-on-session-end`
 - `--worker-queue-timeout DURATION` / `--worker-idle-timeout DURATION`
+- `--idle-timeout DURATION` — connection idle timeout: a client connection with no traffic for this long is closed and its worker released to hot-idle (in control-plane mode an idle connection otherwise pins a worker forever). **Control-plane default is `60s`** (`server.DefaultControlPlaneIdleTimeout`; standalone defaults to `24h`); a negative value disables it. `server.New` applies the standalone default, so the control plane sets it explicitly before `InitMinimalServer` (which skips that defaulting).
 - `--memory-budget SIZE` (default 75% RAM) / `--memory-rebalance`
 - `--socket-dir /path` (process backend)
-- `--handover-drain-timeout DURATION` (default `24h` process / `15m` remote; uses cloudflare/tableflip for FD passing)
+- `--handover-drain-timeout DURATION` (default `24h` process; **remote default is `0` = unbounded** — the CP waits for active sessions for as long as it takes and the pod's k8s `terminationGracePeriodSeconds` is the only hard wall. cloudflare/tableflip FD passing applies to process/standalone single-host upgrades, not k8s pod replacement.)
 - `--flight-port N` (Arrow Flight SQL ingress) plus `--flight-session-idle-ttl`, `--flight-session-reap-interval`, `--flight-handle-idle-ttl`, `--flight-session-token-ttl`
 - `--ducklake-delta-catalog-enabled` / `--ducklake-delta-catalog-path`
 - Remote backend (requires `--config-store`; `-tags kubernetes` for K8s pool):
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
-  - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account`, `--k8s-max-workers`, `--k8s-shared-warm-target`
+  - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
+  - Compute-usage billing needs no config: metering is always on for the remote backend and billing PULLS usage over the internal-secret-authed HTTP API (`GET /api/v1/billing/usage` + `POST /api/v1/billing/ack`). See `docs/design/billing-pull-api.md` and "Compute-Usage Billing" below.
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
 
 Key CLI flags for duckdb-service mode:
@@ -95,6 +161,20 @@ Configuration is resolved in `config_resolution.go` with the following precedenc
 
 Note: `--mode` is CLI-only (not loadable from YAML/env). A handful of K8s pod-scheduling knobs are env-only (no CLI flag).
 
+## Keep docs in sync with behavior
+
+When you change a behavior, default, flag, or invariant that is documented
+anywhere in the repo, **update that documentation in the same PR.** Stale docs
+are worse than no docs — they actively mislead the next reader (human or agent).
+This applies to, at least: this `CLAUDE.md`, `README.md`, `docs/`, CLI flag help
+text (`main.go` / `cliflags.go`), and any design/plan docs that pin the changed
+behavior. Concretely: if you change a default value, a flag's meaning, a drain or
+shutdown semantic, an activation/routing/teardown order, or any of the
+LOAD-BEARING CONTRACT sections below, grep for the old value/term across `*.md`
+and help strings and fix every mention. A behavior change that leaves a doc
+asserting the old behavior is incomplete, the same way a behavior change without
+a test is incomplete.
+
 ## Development
 
 The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes for building, testing, running, metrics, and scripts.
@@ -112,7 +192,7 @@ exercises it (and update it if the path moved) — a refactor that quietly drops
 e2e coverage is a regression in the test suite even if behavior is unchanged. Unit/package tests are necessary but not sufficient: a
 change is only "done" once it is exercised against the real mw-dev cluster —
 real worker pods, real Crossplane ducklings, real cnpg/RDS metadata, real
-Lakekeeper, real S3/Iceberg/STS. "Solid" means a deterministic pass/fail
+S3/STS. "Solid" means a deterministic pass/fail
 assertion of the actual user-visible behavior (not just "it didn't error"), with
 transient/cold-pool conditions handled, on both metadata backends (cnpg + ext)
 where it touches metadata. A bugfix gets a regression assertion that would have
@@ -125,20 +205,19 @@ Three test lanes worth knowing about, in increasing order of blast radius:
 
 - **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives. Includes `tests/manifests/` (static-manifest artifact asserts for `k8s/rbac.yaml` + `k8s/networkpolicy.yaml`).
 - **`tests/integration/`** (`just test-integration`): spins up the standalone server binary against a real MinIO + Postgres metadata store via docker compose. Covers wire protocol, DuckLake on real S3-compatible storage, transpilation against a live server.
-- **`tests/e2e-mw-dev/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real per-org Lakekeeper, real AWS S3/Iceberg. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/e2e-mw-dev/README.md`.
+- **`tests/e2e-mw-dev/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real AWS S3. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/e2e-mw-dev/README.md`.
 
 ### When code changes obligate test changes
 
 `tests/e2e-mw-dev/` is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating the harness as part of the change, not a follow-up:
 
-- `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`, `server.IcebergConfig`)
-- `server/server.go::AttachDeltaCatalog`, `server.AttachIcebergCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
-- `server/iceberg/` (config, dispatcher, backend implementations) — the harness provisions iceberg-enabled ducklings on both cnpg + ext backends and asserts the catalog attaches + reads/writes
+- `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`)
+- `server/server.go::AttachDeltaCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
 - `controlplane/configstore/models.go` — new columns flow through the provisioning API the harness calls; exercise them via a provision body field
 - `duckdbservice/activation.go`, `worker_activation.go` — worker-side activation order
 - Any code path that wires AWS credentials through to DuckDB SECRETs
 
-The contract: if the harness no longer exercises a path you changed, **update `harness.sh`**; if your change removes a path it asserts against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers / iceberg activation checks in `harness.sh` are the load-bearing ones for catalog wiring — keep them honest.
+The contract: if the harness no longer exercises a path you changed, **update `harness.sh`**; if your change removes a path it asserts against, **delete the assertion**. The DuckLake round-trip / durability / concurrent-writers checks in `harness.sh` are the load-bearing ones for catalog wiring — keep them honest.
 
 ## Dependencies
 
@@ -162,6 +241,780 @@ DML with RETURNING is rejected at extended-query Describe time with SQLSTATE `0A
 - LIMIT 0 does NOT prevent CTE side effects — Postgres CTEs are optimization fences, so writable CTEs execute even with LIMIT 0.
 - DuckDB does not currently support MERGE. If it adds MERGE RETURNING, add `MERGE` to the prefix check in `isDMLReturning`.
 
+## Worker Session Model (k8s / remote backend) — LOAD-BEARING CONTRACT
+
+In the **control-plane remote/k8s backend** a worker pod serves **exactly one
+client query session at a time**. This is deliberate: `workerDuckDBLimits`
+(`controlplane/control.go`) gives the single session ~75% of the *whole pod's*
+RAM + all CPU cores — it does NOT divide by session count. Two sessions on one
+pod would each believe they own 75% → ~150% overcommit → nondeterministic OOM /
+a heavy query killed by a co-resident one. Do not break the following:
+
+- **One session per worker is enforced, not emergent.** The CP spawns remote
+  worker pods with `DUCKGRES_DUCKDB_MAX_SESSIONS=1` (`k8s_pool.go::spawnWorker`).
+  A 2nd concurrent `CreateSession` on a worker is rejected, not silently
+  overcommitted. Internal control/maintenance work uses the worker's side
+  connections (`controlDB`/`warmupDB`), which are NOT counted sessions — so
+  cap=1 does not starve them. Do not raise this to >1 for k8s workers, and do not
+  route internal work through `CreateSession`.
+- **`OrgReservedPool` (remote/multitenant) must never co-assign.** It reuses only
+  idle (`activeSessions==0`, Hot, org-owned) workers via
+  `findIdleAssignedWorkerLocked`, or claims/spawns a fresh one. There is NO
+  least-loaded "share onto a busy worker" path (that exists only in the
+  single-tenant flat `K8sWorkerPool.AcquireWorker`, which is not used in remote
+  mode). Do NOT add one, and do not resurrect a `leastLoaded*` helper here.
+- **At org max workers + all busy → fail fast with the clear org-cap message**
+  (`WorkerClaimMissReasonOrgCap`, see `capacity_policy.go`). Never busy-wait at cap.
+- **Under cap → spawn a worker on demand** (`spawnReservedWorkerForSlot`). There
+  is no warm pool to wait on; the cap is re-checked authoritatively cross-CP in
+  `CreateSpawningWorkerSlot`. The spawn+activate runs DETACHED from the request
+  ctx (`context.WithoutCancel` + `workerSpawnActivateTimeout`): the requester
+  waits for the result or its own ctx, but a requester that gives up must NOT
+  kill the in-flight pod (doomed-spawn thrash). An abandoned spawn that succeeds
+  is parked hot-idle (`ReleaseWorker`/`TransitionToHotIdleIfNoSessions`, record
+  persisted) for the org's next connection; one that fails is retired. Nothing
+  may leak in Reserved/Activating.
+- **FIFO anti-snatch:** the slow acquisition path's DECISION section (idle-reuse
+  re-check → hot-idle claim → spawning-slot creation; `acquireDecision` in
+  `org_reserved_pool.go`) is serialized per org by `orgAcquireGate`
+  (`org_acquire_gate.go`) so a worker the CP scaled up for an earlier waiter
+  cannot be snatched by a later connection. The multi-minute spawn+activate runs
+  OUTSIDE the gate — each waiter is 1:1 bound to the claim/slot it owns and the
+  session is pre-claimed before the worker becomes Hot, so a cold burst ramps N
+  spawns in parallel without breaking anti-snatch. Keep the gate cancel-safe (a
+  queued waiter whose ctx is cancelled must be skipped, not deadlock the gate).
+- **Destroy-before-reuse ordering:** `SessionManager.DestroySession`
+  (`session_mgr.go`) MUST await the worker-side `DestroySession` RPC *before*
+  `ReleaseWorker`, so a reused (hot-idle) worker's prior session is gone before
+  the next one is assigned (otherwise cap=1 spuriously rejects the reuse).
+- **Cap-drift is recovered, not fatal:** if a worker still rejects a CP-scheduled
+  session at its cap (CP↔worker accounting drift — should never happen),
+  `SessionManager.CreateSessionWithProtocol` does NOT fail the client: it logs
+  loudly (ERROR), bumps `duckgres_control_plane_worker_session_cap_drift_total`,
+  retires (recycles) the inconsistent worker, and re-acquires a fresh one
+  (bounded by `maxWorkerSessionCapDriftRetries`). Detection is
+  `isWorkerSessionCapError` (matches the worker's "max sessions reached"
+  message). A nonzero drift metric means the scheduling invariant is broken —
+  fix the root cause, don't just lean on the retry.
+
+Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
+`k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`, or
+`duckdbservice` session counting → update the unit tests
+(`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
+`duckdbservice/service_test.go`) AND the `one_session_per_worker` +
+`cold_burst_parallel_spawns` assertions in `tests/mw-dev/e2e/harness.sh`.
+
+## Worker Drain Protocol (graceful shutdown, #690)
+
+Remote worker pods drain on SIGTERM (pod deletion): they reject new work, keep
+in-flight work alive, then exit; the CP marks them `Draining` (not crashed) and
+retires them cleanly. Drain readiness is tracked by a refcount (`activeWork` in
+`duckdbservice/service.go`) of "drain tokens" — one taken per unit of in-flight
+work (query, txn, metadata stream, COPY, activation), released when it finishes.
+Invariants: take exactly one token when work starts and release exactly one when
+it ends on **every** path (a leak hangs drain to the shutdown timeout, an early
+release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
+`GetFlightInfo` whose `DoGet` never arrived. `terminationGracePeriodSeconds=3600`
+(`k8s_pool.go`) must stay above `workerShutdownDrainTime` (55m).
+
+## Per-Session S3 Cache Bypass (`duckgres.s3_cache`, remote backend)
+
+`SET duckgres.s3_cache = on|off` (default `on`; also a `-c` startup option)
+lets a session bypass the node-local S3 cache-proxy DaemonSet — for cold-read
+benchmarking and ruling the cache out of correctness/staleness questions.
+Mechanism: the CP intercepts the duckgres-namespaced GUC (never forwarded to
+DuckDB) and, on every state flip, calls the worker's `SetSessionS3Cache`
+action (`flightclient.FlightExecutor.SetS3CacheEnabled` →
+`SessionPool.SetS3CacheEnabled`), which rebuilds the `ducklake_s3` secret:
+`off` = the org's native HTTPS transport, so httpfs CONNECT-tunnels through
+the proxy as opaque TLS (no cache reads/fills — the deliberate, reversible
+form of the mw-prod-us 2026-07-17 incident); `on` = the
+`overrideS3EndpointForCacheProxy` transport. Global `http_proxy` is never
+touched (post-attach propagation to DuckLake subcatalogs is unreliable;
+secrets are consulted per request). Instance-global secret + one session per
+worker = session-scoped in effect. Invariants:
+
+- **State follows the worker, never leads it.** The session flag
+  (`clientConn.s3CacheOff`) flips only after the worker swap succeeds; a
+  failed swap fails the SET (`XX000`) / the batch / the connect (startup
+  option), so `SHOW` can never report a transport the worker isn't using.
+- **A bypass must never leak into the org's next session.** `CreateSession`
+  restores the proxy transport before the session starts and a restore
+  failure fails the create (CP retries); `DestroySession` restores
+  best-effort. Both no-op unless a bypass is actually in effect.
+- **Credential rotation respects the flag.** The hot-idle/mid-session refresh
+  (`reuseExistingActivation`) rebuilds the secret with or without the proxy
+  transport according to `s3CacheBypassed`; all secret rebuilds serialize on
+  `secretSwapMu` so the last write always matches the flag. (Without this, an
+  hourly STS rotation silently re-enables the cache mid-benchmark — the
+  inverse of the 2026-07-17 incident.)
+- **Closed enum, validated on every set path** (`transform.NormalizeS3Cache`):
+  PostgreSQL boolean spellings, normalized to on/off; anything else is `22023`
+  (simple/batched SET, extended Parse, and the startup option — which the CP
+  validates BEFORE acquiring a worker). The rejection never echoes the value.
+- **Scope: remote/k8s shared-warm workers with a cache proxy.** Elsewhere
+  (standalone, process backend, no `DUCKGRES_CACHE_ENABLED`) the worker swap
+  is a no-op and the GUC is session-state only — there is no cache to bypass.
+  The query-log sink's activation stays proxied unconditionally.
+- Touching the interception, swap, restore, or refresh interplay → update
+  `transpiler/s3_cache_test.go`, `server/s3_cache_test.go`,
+  `duckdbservice/s3_cache_test.go`, AND the `s3_cache_guc` assertion in
+  `tests/mw-dev/e2e/harness.sh` (mw-dev has no cache proxy, so the e2e covers
+  the client-visible plumbing incl. the worker action round-trip; the swap
+  itself is unit-only — see the harness header note).
+
+## User Persistent Secrets (multitenant remote backend)
+
+`CREATE PERSISTENT SECRET` from a client survives across sessions and worker
+pods: the CP intercepts it (`server/conn_user_secrets.go`, classification in
+`server/usersecrets/`), executes it on the live session first (DuckDB
+validates), then stores the statement AES-GCM-encrypted in the config store
+(`duckgres_org_user_secrets`, keyed org/user/name) and replays it in the
+`CreateSession` payload on the user's future sessions
+(`duckdbservice/user_secrets.go`). Enabled by the env-only
+`DUCKGRES_USER_SECRET_KEY` (base64 32-byte AES key); unset → clear 0A000
+error. Plain/TEMPORARY `CREATE SECRET` stays session-scoped passthrough.
+Invariants for anyone touching this path:
+
+- **Cross-user isolation is the wipe at session create, not the destroy-time
+  cleanup.** DuckDB secrets are instance-global, and a hot-idle worker is
+  reused across users of an org: `wipeUserSecrets` drops ALL user-created
+  secrets — persistent ones AND non-persistent (plain/TEMPORARY `CREATE
+  SECRET`) ones, which pass through to the worker and would otherwise leak to
+  the next user. It preserves only the system-managed allowlist
+  (`usersecrets.IsReservedName`: `ducklake_s3`
+  + the `__default_*`/`duckgres_*` prefixes, which activation re-creates). It
+  MUST run before replay on every CreateSession in shared-warm mode, and a
+  wipe failure MUST fail the session.
+- **Execute-then-persist ordering.** Persist only statements DuckDB accepted;
+  a store failure after a successful exec is an ERROR telling the user the
+  secret will NOT survive the session. Replay failures at session create are
+  warnings, never connection refusals.
+- **No silent non-persistence.** Any path where persistent-secret DDL would
+  execute but not persist must REJECT instead: multi-statement batches and
+  parameterized statements (CP interception), and the Flight SQL ingress
+  (`flightsqlingress.Config.RejectPersistentSecretDDL`). Otherwise the secret
+  works for one session and is silently deleted by the next session's wipe.
+- **DROP's store-fallback is gated on DuckDB's not-found error only**
+  (`isSecretNotFoundError`). Any other exec failure (cancel, RPC error,
+  ambiguity, aborted txn) must surface and leave the store untouched — a
+  false "DROP succeeded" is fatal for a credential revocation.
+- **Never log/store secret statement text.** `usersecrets.RedactForLog` guards
+  client-query and worker-statement logs, `logQueryError`, the query log, spans,
+  and pg_stat_activity
+  (`currentQuery`); keep new logging of query text behind it. Engine **error
+  messages echo the offending SQL** (DuckDB emits `LINE 1: ... SECRET '...'`),
+  so a failed CREATE SECRET leaks the credential via the `error` attribute /
+  query-log `Exception` even when the query attribute is redacted —
+  `usersecrets.RedactErrorForLog(query, errMsg)` guards those error sinks
+  (`logQueryError`, `logQuery`); keep new error logging behind it too, and pass
+  the original (un-redacted) query so it can classify.
+- Touching the interception, wipe/replay, or payload shape → update
+  `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
+  and the `persistent_user_secret`(+`_isolation`) assertions in
+  `tests/mw-dev/e2e/harness.sh`.
+
+## Admin Console (VPC-private web UI, `kubernetes` tag)
+
+`controlplane/admin/` serves a React admin console + REST API on `:8080` — the
+operate-everything surface (metrics, live queries/sessions/connections, recent
+errors, worker fleet, live cluster node/pod topology, full config store, user
+impersonation, audit log; sliceable by org + user). Design + decisions:
+`docs/design/admin-ui.md`; package details:
+`controlplane/admin/README.md`. Exposed VPC-privately via an internal-scheme ALB
++ Cognito (Google SSO) behind Tailscale (charts: `ingress-admin.yaml`). Invariants:
+
+- **Frontend is an embedded React/Vite SPA** (`ui/`, built to `ui/dist/`,
+  `//go:embed all:ui/dist` in `embed_ui.go`, SPA-fallback served by Gin; the SPA
+  owns `/`). `ui/dist` is a **gitignored build artifact** — only `ui/dist/.gitkeep`
+  is tracked, so the embed has a target and `go build` compiles without node
+  (the server then serves a "UI not built" notice). `just ui-build` builds it
+  locally; both `Dockerfile` and `Dockerfile.controlplane` run `npm run build`
+  **before** `go build`. Do not delete `.gitkeep` and do not commit `ui/dist`.
+- **Two-tier authz** (`authz.go`): `AuthMiddleware` resolves every `/api/v1`
+  request to admin (valid `TokenSet` internal secret — service/break-glass) or to
+  an SSO identity from the ALB `X-Amzn-Oidc-Data` JWT. The SSO email
+  (`@posthog.com` + `email_verified != false`, else 401) is mapped to a role
+  **per-request** by a `RoleResolver` backed by the `duckgres_operators` config-schema
+  table (goose migration `000006_create_operators.sql`) — `admin` row → admin, else
+  viewer. Admins manage operators in the admin-only **Operators** page
+  (`ui/src/pages/Operators.tsx` → `/api/v1/operators`, `operators_api.go`) — a
+  deliberately distinct surface from the **Org Users** page (`ui/src/pages/Users.tsx`,
+  `/users`, per-org *database* logins). The two are labelled + cross-linked in the
+  UI so "users" is never ambiguous: Operators = who can sign in to this console;
+  Org Users = customer DB accounts. The operators GET is `RequireAdmin`, so
+  `useOperators` only fires for admins (viewers see an "admin only" notice). The
+  first SSO login auto-provisions a create-only **viewer** row, and the first
+  admin is minted by logging in over the break-glass internal token and patching
+  that row to `admin`. The **last-admin guard** (`operators_api.go`) refuses to
+  demote/delete the final admin (409) so the console can't be locked out.
+  `RoleGate` requires admin for all mutating verbs + the audit GET.
+  `AuditMiddleware` records every mutation. Keep new mutating routes under this
+  gate; never add a write path that bypasses RoleGate/audit.
+- **Impersonation is a real session** (`impersonate.go` + `admin_providers.go`):
+  it reuses `SessionManager.CreateSessionWithProtocol` (workers trust the CP — no
+  password) and **always** `DestroySession` in a defer. Admin-only, every
+  statement audited with the admin actor + `usersecrets.RedactForLog` SQL; writes
+  require `allow_write=true` (conservative classifier — WITH/CTEs count as
+  writes). It consumes a worker under one-session-per-worker and counts against
+  the org's connection limits — do not silently exempt it.
+- **Metrics proxy is allow-listed** (`metrics_proxy.go`): the client passes a
+  panel KEY, PromQL is built server-side from `rangePanels` (never an open PromQL
+  relay) and forwarded to `DUCKGRES_PROMETHEUS_URL`. Org-labelled panels keep
+  slicing enforced.
+- **Env-only knobs**: `DUCKGRES_PROMETHEUS_URL` (read in
+  `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit` is
+  AutoMigrated at startup (operational state, not goose-migrated tenant config).
+  The `duckgres_operators` table is authoritative access-control data, so it lives
+  in the config schema via goose migration `000006_create_operators.sql`, not
+  AutoMigrate.
+- `ManagedSession.Username` is populated at session create so the console can
+  slice live sessions/queries by user; keep it set on every create path.
+- **Errors page is a redacted, in-memory live-triage buffer** — NOT durable
+  history. Every failed query is captured into a bounded per-server ring
+  (`server/recent_errors.go`, `DefaultRecentErrorCap=500`) at the single
+  `logQueryError` tap (`server/conn.go`), surfaced at `GET /api/v1/errors` and
+  merged across CP replicas by `PeerFetcher.FetchPeers` (each error belongs to
+  exactly one CP — disjoint union, no worker-id dedup; sorted newest-first, then
+  capped). The ring stores ONLY the redacted forms: `Query` via
+  `RedactForLog`, `Message` via `RedactErrorForLog` — a failed CREATE SECRET
+  must never leak its credential into the ring. Keep the capture behind those
+  redactors; long-term error history lives in the external query-log pipeline
+  (Kafka sink), not here.
+- **Per-user kill switch** (`live.go` routes + `admin_providers.go` +
+  `session_mgr.go::DestroySessionsForUser` + `configstore` `disabled` column):
+  - `POST …/users/:username/kill` is a **one-shot** terminate — it tears down all
+    of a user's sessions + in-flight queries but does NOT block reconnects.
+  - `POST …/users/:username/disable` is the **persistent block**: it sets the
+    `duckgres_org_users.disabled` column (goose migration
+    `000011_add_org_user_disabled.sql`), kills the user's live sessions, AND
+    refuses the user's NEW connections at auth time on BOTH front-ends — PG wire
+    (`control.go`, distinct `28000` "account is disabled" error, emitted only
+    after the password checks out so it never leaks account existence) and Flight
+    (`ConfigStore.ValidateOrgUser` / `ValidateOrgUserAndGetPassthrough` return
+    false). `enable` reverses it. The disabled state is read from the in-memory
+    snapshot, so disable/enable call `ConfigStore.ReloadSnapshot()` to make the
+    flip effective immediately instead of one config-poll later.
+  - These are **cluster-wide**: a user's sessions live on whichever CP replica
+    owns each connection, so the handlers fan out the kill/disable/enable to peers
+    via `PeerFetcher.PostPeers` (POST sibling of the read fan-out, same
+    `?scope=local` recursion guard) and sum the per-CP `killed` counts. The
+    snapshot reload is fanned out too so every replica enforces the block at once.
+  - Kill must be **scoped to the target user** — never tear down another user's
+    sessions on the shared org stack (the regression the e2e asserts with a
+    concurrent root query that must survive).
+- **Live Nodes view** (`ui/src/pages/Nodes.tsx` + `pages/nodes/peepernetes.{ts,css}`,
+  a port of the standalone peepernetes visualizer): a full-bleed, animated
+  cluster node/pod TV — nodes grouped by karpenter nodepool (or by namespace /
+  deployment), CPU/MEM request bars, pod chips colored per deployment,
+  placeholder/system-pod classification, Karpenter empty-node reclaim countdown,
+  draining-duration on nodes (deletion-timestamp or client-tracked first-seen)
+  and terminating-duration on pods, each pod's running image, unscheduled tray,
+  and a synthesized event ticker. Its header carries only the filters; the
+  cluster counters live in the shared admin **Topbar** and show on EVERY page —
+  the Topbar polls `GET /cluster/summary` (`useClusterSummary`), a server-side
+  aggregate (`cluster.go`) of nodes (duckgres nodepools) · CP replicas · running
+  **workers** (label `app=duckgres-worker`, NOT every app pod — so it matches the
+  worker chips + the CP's own worker accounting) with their vCPU/GiB request
+  totals as a sub-line · **placeholders** with their vCPU/GiB and the cpu%/mem%
+  those headroom pods are OF the worker totals · pending. Computing it server-side
+  (not from the Nodes view's pushed counts) is what lets the totals appear on
+  every page, not just while the view is mounted. The view has no separate live
+  indicator — the Topbar's "Connected" dot (admin-API reachability) is the single
+  green pulsing live signal. It's imperative DOM (mounted
+  by the React page into a `.peeper` root, scoped CSS + `pn-`-prefixed keyframes)
+  and does NOT use native K8s watch — the browser can't reach the API, so it
+  POLLS four **read-only** projected endpoints (`server/`-free; `cluster.go`):
+  `GET /cluster/{nodes,pods,events}` project the in-cluster objects down to the
+  minimal K8s-shaped subset the view reads (annotations trimmed to
+  `kubernetes.io/config.mirror`; no raw objects), and `GET /cluster/nodepools`
+  proxies the karpenter NodePool CRD (v1→v1beta1, degrading to an empty list when
+  karpenter is absent). Backed by the shared K8s pool's clientset
+  (`Extras.ClusterClient`, nil on non-k8s backends → routes unregistered). All
+  four are GETs so RoleGate admits viewers; there is no mutation path. **RBAC:**
+  these reads are cluster-scoped / cross-namespace, which the CP's in-namespace
+  Role doesn't cover — the grant lives on its own `duckgres-control-plane-cluster-topology`
+  ClusterRole in the `charts` repo (`charts/duckgres/templates/rbac.yaml`), bound
+  to the CP SA. It's a *separate* role (not folded into `duckgres-duckling-reader`)
+  so binding duckling-reader elsewhere doesn't drag these broader reads along and
+  trip RBAC escalation-prevention. When the ClusterRole is absent the handlers
+  **degrade a Forbidden to an empty `{items:[]}` (200)** and log a warning, so the
+  view shows nothing rather than 500ing — the e2e CP hits exactly this path (its
+  SA can't be granted cluster-scoped RBAC from CI), so `admin_console_api` only
+  asserts the `{items:[...]}` envelope; projection shape is covered by
+  `cluster_test.go`. Touching
+  the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
+  and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
+  (`tests/mw-dev/e2e/harness.sh`).
+- Touching any of the above → update `controlplane/admin/*_test.go` (esp
+  `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`),
+  `controlplane/session_mgr_test.go`
+  (`TestDestroySessionsForUser`), `controlplane/configstore/store_test.go`
+  (`TestDisabledUserEnforcement`), the `Operators`/`Org Users` UI pages +
+  `ui/src/pages/Operators.test.tsx`, AND the `admin_*` / `admin_operators` /
+  `impersonation_*` / `user_kill_switch` / `user_disable_block` assertions in
+  `tests/mw-dev/e2e/harness.sh`.
+
+## Project-Scoped Logins (`project_reader` / `project_user`) — LOAD-BEARING CONTRACT
+
+A team can hold two generated logins, both bound to one `duckgres_org_teams`
+row via `duckgres_org_users.access_mode` + `team_id` (migrations `000026`,
+`000031`): `project_reader` (`posthog_team_<id>`, read-only — the PostHog SQL
+editor's login) and `project_user` (`posthog_team_<id>_rw`, read/write). Minted
+by `PUT /api/v1/orgs/:id/teams/:team_id/{project-reader,project-user}` (admin
+API only). Both are enforced by the **query gateway**, not PostgreSQL `GRANT`.
+Invariants:
+
+- **The two modes derive the SAME namespaces.** `ConfigStore.OrgUserQueryAccess`
+  computes `AllowedSchemas` (`<schema>`, `<schema>_data_imports`,
+  `shadow_<team>_models`) + `AllowedRelations` (the legacy `posthog.<events|
+  persons>` overrides — a non-NULL override grants it even when it spells the
+  derived default) identically for both; **`ReadOnly` is the only difference**.
+  Write authorization must NEVER widen the reachable relation set — a project
+  user is a project reader that may also mutate what it can already see. The
+  e2e asserts cross-project denial in read AND write shapes for this reason.
+- **Fail closed on an unresolvable team.** A scoped user whose team row is
+  missing or disabled gets an empty, `ReadOnly` policy — a project user is
+  DOWNGRADED, never left writing into a scope nothing can confirm.
+- **`QueryAccessPolicy.Authorize` (`server/query_access.go`) is the single tap**,
+  called on simple query, extended Parse, and both Flight paths. It is
+  default-deny: the parser is the authorization boundary, so anything
+  `pg_query` cannot describe is rejected (this is why DuckDB-only spellings
+  fail). `CREATE SCHEMA` / `ALTER … SET SCHEMA` stay denied: the schema set IS
+  the project boundary.
+- **A WRITE TARGET is checked by `authorizeWriteTarget`, never by the walk's
+  `authorizeRangeVar`.** The walk's check is the READ-position one: it accepts a
+  bare name that is a visible CTE (sound, because a defined CTE provably shadows
+  a base relation of the same name) or an unqualified pg_catalog compat name.
+  **Neither is sound for a target** — a write target does not bind to the CTE, so
+  it resolves against the session `search_path` (`sessionmeta` leaves it at
+  `main,memory.main`) and reaches a real relation outside the grant;
+  `WITH shared AS (…) INSERT INTO shared VALUES (1)` was a working escape into
+  `ducklake.main.shared` before this split. `authorizeWriteTarget` therefore
+  requires schema qualification unconditionally. Do NOT infer target-ness from
+  proto position: `walk()` descends into a Node's own oneof, so a bare
+  `*RangeVar` message reaches `walkMessage` for reads too. **Adding a case to
+  `authorizeWriteStatement` REQUIRES enumerating that statement's target
+  field(s) there by name** (`DropStmt` scopes its dotted-name lists itself); the
+  `walkMessage` `RangeVar` branch is only the lenient defense-in-depth net for
+  positions that enumeration does not cover (e.g. `Constraint.pktable`).
+  `TestQueryAccessPolicyRejectsUnqualifiedWriteTargets` is the tripwire.
+- **Neither mode may carry passthrough** (it bypasses the compat layer that
+  enforces the scope) — DB check constraint + admin API guard.
+- **A policy change tears down live sessions.** `changedProjectScopedUsers`
+  (`org_router.go`) fires on credential, team, disable AND **mode** flips; the
+  demotion direction is load-bearing (a demoted user must not keep a
+  write-authorized session). Deleting a team deletes BOTH of its logins.
+- **One of each per team**, via two SEPARATE partial unique indexes on
+  `(org_id, team_id)` — deliberately not one index across both modes, so a
+  reader and a writer coexist.
+- Touching any of this → update `server/query_access_test.go`,
+  `controlplane/configstore/query_access_test.go`,
+  `controlplane/admin/api_test.go`, `controlplane/org_router_test.go`,
+  `tests/configstore/org_teams_postgres_test.go` +
+  `migrations_postgres_test.go`, `docs/postgres-compatibility.md`, AND the
+  `project_reader_isolation` / `project_user_isolation` assertions in
+  `tests/mw-dev/e2e/harness.sh`.
+
+## Compute-Usage Billing (managed-warehouse, remote backend only)
+
+duckgres meters per-org compute usage of worker pods into 60s buckets in the
+config store; the billing service **pulls** the accumulated usage over an HTTP
+API and acks a watermark, at which point duckgres deletes the acked buckets.
+Full design + decisions: `docs/design/billing-pull-api.md` (supersedes the
+push/capture reporting hop of `billing-compute-seconds-plan.md`; the metering
+side of that doc still applies). Scope is **only** the remote/k8s backend
+(per-org worker pod with a known `WorkerProfile` size). Pipeline:
+
+```
+compute: conn end → in-proc counter keyed (org, informational team, query_source, worker size)
+              │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
+              ▼  duckgres_org_compute_usage (+ duckgres_compute_billing_cursor)
+storage: leader sampler (~30m) → org's DuckLake metadata Postgres
+              SUM(data+delete file sizes) × interval → duckgres_org_storage_usage
+billing: GET /api/v1/billing/usage (usage + storage arrays, per key per UTC day, watermarks)
+       → POST /api/v1/billing/ack {watermark_high} → cursor advance + delete ≤ it (BOTH tables)
+safety:  leader-only GC hard-deletes buckets older than 30 days (WARN, alertable)
+```
+
+Two raw metrics per connection over its full lifetime, using the **provisioned**
+worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
+ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
+**MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
+sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
+decimals (vCPU / GiB). `team_id` is **informational only** (an integer —
+PostHog's `Team.id`; a JSON NUMBER on every API surface): duckgres does NOT
+own team-level billing attribution — the external billing service maps
+org → team(s) itself. The stamp is resolved from the config snapshot at
+record time: compute buckets get the CONNECTING USER's team
+(`duckgres_org_users.team_id`, e.g. a project-reader login) when it has one,
+else the org's OLDEST team (min `created_at`, ties broken by the smaller
+`team_id` — in practice the provision-time first team; `ConfigStore.OrgUsageTeamID`);
+storage buckets always get the oldest team (`OrgOldestTeamID`). 0 appears
+only defensively (unknown org / stale snapshot — a committed org always has
+at least one team). Team changes/deletions NEVER re-attribute existing
+buckets; `query_source` is the
+`duckgres.query_source` session GUC (`standard` unless set; a mid-connection
+change bills the whole connection under the final value). The GUC is a **closed
+enum validated at SET time** (`transform.NormalizeQuerySource`): only
+`standard` | `endpoints` (case-insensitive, normalized to lowercase; empty =
+reset to default) — anything else is rejected with `22023` on every set path
+(simple/batched SET, extended Parse, and the `-c` startup option, which rejects
+the connection like invalid `duckgres.worker_*` options), and
+`server.ConnectionBilling` clamps a non-canonical value to `standard` as
+defense in depth so client junk can never become a billing bucket key.
+Invariants for anyone
+touching this path:
+
+- **Metering is strictly best-effort and off the hot path.** A metering error
+  (counter, flush) must NEVER block or fail a query or connection teardown. The
+  connection-end record is added to an in-process counter (map+mutex,
+  microseconds, no I/O); the flush is async. `cp.computeMeter` is nil outside
+  the remote backend — every call site is nil-safe. There is no enable knob:
+  the remote backend always meters.
+- **Worker size is plumbed onto the connection** (`server.SetConnectionWorkerSize`
+  → `clientConn.workerMillicores/workerMiB`, set in `control.go::handleConnection`
+  from `workerBillingSize(workerProfile)`, remote-only). `workerMillicores==0`
+  (non-remote / unknown) → metering skipped. The metric is computed once at the
+  SAME teardown point as `CloseConnectionMetrics` (the `#841` lifetime defer),
+  via `server.ConnectionBilling` (which also carries the query source).
+- **Bucket = connection-end time floored to 60s.** Flush carries the sub-unit
+  remainder forward so rounding never loses counts across flushes. Buffer flush
+  is UPSERT-increment so all CP pods sum into one row per key.
+- **Serve only closed buckets.** `watermark_high` = the newest bucket with
+  `bucket_start ≤ now − 60s − 30s grace` (grace > flush interval, so every
+  CP's contribution has landed before a minute is served). The GET aggregates
+  the window `(cursor, watermark_high]` into one row per
+  `(org, team, query_source, cpu, mem_gib)` per **UTC day** — response size is
+  bounded by active keys × days, so billing downtime can't make it explode.
+- **Ack is the only deletion path (plus the 30d GC).** `POST /billing/ack`
+  advances the single global cursor monotonically and deletes buckets
+  `≤ watermark_high` in one TXN (`AckComputeUsage`). Idempotent — re-acks and
+  stale acks are no-ops. An ack beyond the latest closed bucket is rejected
+  (400) so it can never delete buckets that were never served. Auth is the
+  admin internal secret (`RequireAdmin` on both routes, registered inside the
+  audited `/api/v1` group in `multitenant.go`).
+- **Safety GC is leader-only** (`runComputeUsageGC`, attached under the janitor
+  lease): hard-deletes buckets older than 30 days regardless of ack and logs a
+  WARN with the dropped count — nonzero means billing stopped pulling (alert).
+- **Graceful shutdown does a final flush** after connections drain to their
+  natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
+  last interval before exit.
+- **Org team CRUD (`duckgres_org_teams`)**: the PostHog backend manages an
+  org's team rows via `GET/POST /api/v1/orgs/:id/teams` +
+  `DELETE /api/v1/orgs/:id/teams/:team_id` (internal secret,
+  `controlplane/provisioning`). The POST is the **grandfather upsert**: it MAY
+  overwrite an existing row's `schema_name` and the legacy
+  `events_table_name`/`persons_table_name`/`schema_data_imports_name`
+  overrides (NULL = derive from `schema_name`: `<schema>.events`,
+  `<schema>.persons`, `<schema>_data_imports`), because the PostHog backfill
+  replaces migration 000024's `team_<id>` placeholder through it. Two teams in
+  one org can never share a schema (unique `(org_id, schema_name)`, migration
+  000025 → 409). Provisioning a warehouse for a NEW org REQUIRES `team_id`
+  (`ErrProvisionTeamRequired` → 400; `default_team_id` is accepted as a
+  transitional alias) and creates the org's first plain team row — a
+  warehouse cannot exist without a team. DELETE removes CONFIG only (never
+  warehouse data) and never touches usage buckets; the org's LAST team is
+  undeletable (409 — an org must always have at least one team; delete the
+  org instead). The admin console mirrors this on a user-facing surface
+  (`GET /teams`, `POST /teams`, `PUT /orgs/:id/teams/:team_id`) where
+  `schema_name` is immutable. Shared rules live in
+  `configstore.UpsertOrgTeamTx` / `DeleteOrgTeamTx`; tests:
+  `tests/configstore/org_teams_postgres_test.go`, the provisioning/admin API
+  tests, and `org_teams_crud` in the e2e harness.
+- **Storage metric** (`managed_warehouse_storage_gib_seconds`,
+  `storage_meter.go`): a LEADER-ONLY sampler (double writers would
+  double-bill — the UPSERT is additive) visits each Ready warehouse's DuckLake
+  metadata Postgres every 30m (env-only `DUCKGRES_STORAGE_SAMPLE_INTERVAL`;
+  e2e uses 60s) and credits exactly `tracked_bytes × interval` byte-seconds —
+  no elapsed-time tracking, a missed sample under-bills one interval. The SUM
+  is over `ducklake_data_file` + `ducklake_delete_file` with NO snapshot
+  filter (never `ducklake_table_info()`/`ducklake_table_stats` — current-
+  snapshot-only / approximate). byte-seconds are NUMERIC (BIGINT overflows);
+  served as exact-decimal GiB-seconds (÷2³⁰ terminates;
+  `byteSecondsToGiBSeconds` big-int math). Connection resolution reuses the
+  cross-org activator (`MetadataPostgresURL`: duckling pgbouncer → sslmode
+  disable, direct RDS → require). Drift gauges:
+  `duckgres_org_storage_pending_delete_files` (alert on sustained nonzero) +
+  `duckgres_org_storage_tracked_bytes`.
+- Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
+  the storage sampler, or the bucket keys → update
+  `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,
+  `compute_size_test.go`, `storage_meter_test.go`,
+  `configstore/storage_usage_test.go`, the migration assertion in
+  `tests/configstore/migrations_postgres_test.go`, and the
+  `compute_usage_pull_api` assertion (compute + storage) in
+  `tests/mw-dev/e2e/harness.sh`.
+
+## Discovery Endpoints (external-writer tenant listing)
+
+`GET /api/v1/warehouses` + `GET /api/v1/warehouse-team-ids` on the internal
+provisioning API (`controlplane/provisioning/discovery.go`) are the read-only
+"which tenants exist and where do I write" surface for EXTERNAL writers
+(viaduck destination discovery; millpond's include-values poller). Semantics
+are load-bearing for those consumers:
+
+- **Warehouse set = ready + resharding** (`discoveryStates`). Resharding is
+  listed with `writable=false` — vanishing would read as tenant REMOVAL
+  downstream, not a pause. The state enum is open: a new state MUST be
+  classified into `discoveryStates`/`discoveryExcludedStates`
+  (`TestDiscoveryStateClassification` is the tripwire; an unclassified state
+  reads as fleet-wide removal to every consumer).
+- **Teams come from `duckgres_org_teams`**, with RESOLVED table locations:
+  `events_table`/`persons_table` = `<schema_name>.<override-or-derived>`,
+  `data_imports_schema` = override-or-`<schema>_data_imports`. The
+  derivation lives ONCE, in `resolveTeamTables`; the legacy overrides are
+  BARE identifiers (never schema-qualified), enforced at every write surface
+  by `configstore.ValidateOrgTeamTableName`.
+- **`enabled` is passed through as information only** — it is the per-team
+  query-serving switch (migration 000024, not yet enforced), NOT an
+  ingestion signal. Disabled teams stay in BOTH endpoints; deriving
+  "stop ingesting" from it would turn a serving hold into permanent event
+  loss. The only ingestion-stop signal is row absence.
+- **Error contract:** transient store failures fail the WHOLE request (a
+  polling consumer keeps last-known-good — the safe direction); only a
+  warehouse with zero team rows degrades, per-warehouse, to an empty teams
+  array (`duckgres_discovery_broken_team_rows_total{reason}` counts it — a
+  sustained nonzero means a live tenant is silently unroutable).
+- **`config_generation` is an opaque change token**: max `updated_at` over
+  ALL warehouse+org+org-team rows regardless of state, read BEFORE the data
+  queries. Its delete-visibility depends on `DeleteOrgTeamTx` touching the
+  parent org row (a bare team DELETE leaves no timestamp behind) —
+  `TestLatestConfigChangeCoversTeamsPostgres` pins that pair; keep them in
+  sync. Compare for equality only.
+- **No plaintext credentials in the payload** — metadata-store passwords are
+  k8s SecretRefs. cnpg connection details are MIRRORED from the Duckling CR
+  status into the row by the provisioner's ready-reconcile
+  (`reconcileMetadataStoreRow`; drift-only writes so steady-state ticks
+  never bump `updated_at`/the change token; the state-CAS write is the
+  reshard fence — the runner owns those columns mid-flip). External rows
+  are provision-time inputs; only their credential Secret ref is mirrored.
+- **Auth is a SEPARATE, scoped surface** (`RegisterDiscoveryAPI` + its own
+  group in `multitenant.go` behind `admin.AnyTokenAuthMiddleware`): the
+  read-only discovery secret (`--read-only-secret` /
+  `DUCKGRES_READ_ONLY_SECRET`, sent in `X-Duckgres-Internal-Secret`, same
+  fallback-rotation semantics as the internal secret) works ONLY on these
+  two GETs; the admin internal secret also works here (operator/debug +
+  rotation window). Never register discovery routes inside the admin
+  `api` group and never accept `readOnlyTokens` anywhere else — external
+  writer pods carry this credential, and its blast radius must stay "read
+  the tenant list and its connection topology (RDS endpoints, bucket
+  names, k8s Secret names — never values)". Tripwires:
+  `TestAnyTokenAuthMiddlewareScoping` (token matrix incl. cross-surface
+  rejection) and `TestReadOnlyGroupTopology` (the group's exact route
+  set, against the real `registerReadOnlyGroup` wiring). A discovery
+  value equal to the internal secret (or any fallback) FAILS STARTUP —
+  `validateDistinctReadOnlySecret` — because a shared value silently
+  un-scopes the credential.
+- Touching the payload shape, states, team derivation, or the generation →
+  update `controlplane/provisioning/discovery_test.go`,
+  `tests/configstore/org_teams_postgres_test.go`, AND the
+  `discovery_endpoints` assertion in `tests/mw-dev/e2e/harness.sh`.
+
+## Resharding (metadata-store migrations) — LOAD-BEARING CONTRACT
+
+Operator-driven moves of an org's DuckLake catalog between metadata stores
+(cnpg↔cnpg, ext→cnpg, cnpg→ext escape hatch), admin-console-driven with a
+verbose op log. Full design: `docs/design/resharding.md`. Pieces:
+`configstore/reshard.go` (+ migrations `000018`/`000021`/`000022`),
+`provisioner/reshard_runner.go` + `catalog_copy.go` + `catalog_backup.go`
+(the step machine, executed in a DEDICATED per-op pod — see below),
+`controlplane/reshard_runner_mode.go` (`--mode reshard-runner`, the pod's
+entrypoint), `controlplane/reshard_pod.go` (spawner) +
+`reshard_reconciler.go` (leader-only pod janitor), `admin/reshard.go`, UI
+`ReshardForm.tsx`/`ReshardOperation.tsx`. Invariants:
+
+- **Reshards execute in a dedicated per-operation pod, NEVER in a CP
+  process** (`duckgres-reshard-op-<id>`, labels `app=duckgres-reshard` +
+  `duckgres-op-id`, restartPolicy Never, TGPS 600, requests=limits from the
+  env-only `DUCKGRES_RESHARD_POD_CPU`/`DUCKGRES_RESHARD_POD_MEMORY`, default
+  2/8Gi): a catalog pg_dump/copy must not compete with live traffic for CP
+  resources (a ~20k-table dump OOM-killed a 512Mi CP pod). The pod runs the
+  CP's OWN image + ServiceAccount (no new RBAC) and inherits an ALLOWLIST of
+  the CP's env spec verbatim (`reshardPodEnvAllowlist` — secretKeyRefs stay
+  refs; nothing secret lands in a pod spec). The start handler creates the op
+  PENDING and spawns the pod; the pod claims the row via the standard CAS,
+  runs the step machine to a terminal state, and exits 0 — the op row is the
+  OUTCOME's source of truth (failed/rolled-back still exits 0; only infra
+  errors — store unreachable, claim lost/fenced — exit nonzero). A leader-only
+  reconciler (attached under the janitor lease) respawns the pod of a
+  pending-past-grace or stale-heartbeat op (bounded, 3 attempts, then
+  force-fail with an operator-facing error) and reaps pods of terminal ops.
+  The e2e reshard pod netpol lives in `k8s/networkpolicy.yaml`
+  (`duckgres-reshard-runner-boundaries`, egress-only: DNS/5432/443/8080); the
+  production chart needs the equivalent (charts repo).
+
+- **The sound connection barrier is the lease-GRANT check**, not the
+  connect-time 57P03 gates: the grant transaction refuses `resharding` orgs
+  under the same per-org advisory lock `SetWarehouseResharding` takes for the
+  `ready→resharding` CAS. Never rely on the snapshot-polled connect gate
+  alone — a lease can be granted up to a queue-timeout after it ran.
+- **Drain, never kill**: live queries always finish. Drain = leases==0 AND
+  queue==0 (one tx) AND zero live org workers (each runs a catalog-writing
+  `DuckLakeCheckpointer`). Lingering hot-idle workers are retired via the
+  standard CAS retire path only — never raw pod deletes. Parked reconnectable
+  Flight sessions are destroyed locally per CP (they'd hold leases ~1h).
+- **Flip semantics differ by direction**: a `cnpgShard` change re-points
+  role/DB in place (source ORPHANED — explicit cleanup after verify); a TYPE
+  flip to external un-renders the cnpg MRs, and whether Crossplane then DELETES
+  or ORPHANS the role/DB depends on `spec.metadataStore.retainCnpgOnFlip`
+  (charts). **External stores are never modified/deleted.**
+- **cnpg→ext escape hatch = orphan-adopt then verified-delete** (charts
+  `retainCnpgOnFlip`): copy → verify source → set `retainCnpgOnFlip=true` AND
+  poll the cnpg Role/Database MRs until they carry the no-Delete policy (two-step
+  flip, closes the un-render-before-policy race; this MR read needs an explicit
+  get grant on roles+databases in `postgresql.sql.m.crossplane.io` — NOT covered
+  by duckling-reader; a Forbidden fails the wait immediately with the missing
+  grant named, and the periodic wait log + timeout error carry the observed
+  `managementPolicies`) → flip type to external (now
+  ORPHANS, not deletes, the cnpg role/DB) → verify the external catalog row
+  counts match the copy EXACTLY → only THEN `DROP DATABASE` the retained source +
+  clear the flag. ANY failure before that drop → flip back to cnpg-shard +
+  clear flag in one patch (`SetMetadataStoreCnpgAdopt`), provider-sql re-ADOPTS
+  the still-present role/DB by external-name — NO copy-back, NO empty-recreate
+  (replaces the old recreate+copy-back recovery that caused a data-loss
+  incident). **XRD-compat**: if the read-back shows the cluster's XRD lacks
+  `retainCnpgOnFlip` (patch pruned), REFUSE the reshard ("deploy charts first")
+  — safer than the destructive delete-on-flip.
+- **DEPROVISION-UNAFFECTED (non-negotiable)**: `retainCnpgOnFlip` defaults false
+  and is true only transiently mid-reshard; a normal never-resharded cnpg tenant
+  always has it false → its cnpg Role/DB render with full lifecycle `["*"]`
+  (Delete) → deprovision (Duckling delete → finalizer) drops them exactly as
+  before. The orphan is bound to the reshard type-flip, NEVER to Duckling
+  deletion. `lifecycle_teardown_cnpg` in the e2e is the regression net.
+- **Pre-flip catalog backup (safety net, `backup_catalog` step,
+  `catalog_backup.go`)**: after drain + pause-compaction + `recordSource` and
+  BEFORE any flip (for EVERY direction), the runner `pg_dump`s the SOURCE catalog
+  to the org's OWN S3 data bucket under
+  `s3://<bucket>/_reshard_catalog_backups/op-<id>-<ts>.dump` (custom format →
+  `pg_restore`; password via `PGPASSWORD`, never argv; bucket/region/IAM-role
+  from the duckling CR status; upload creds via STS AssumeRole of the org's own
+  role, injected as an `AssumeRoleFunc` from the reshard-runner mode
+  (`controlplane/reshard_runner_mode.go`) to avoid the import cycle). The dump
+  is STREAMED: pg_dump stdout flows straight into an S3 multipart upload
+  (16MiB parts × concurrency 2 bounds memory regardless of catalog size — no
+  temp file, no whole-dump buffering; a nonzero pg_dump exit or empty dump
+  deletes the partial object). **Gate by direction**: the destructive cnpg→external direction
+  (its verified-delete drops the source) HARD-FAILS the op before the flip if the
+  backup fails; non-destructive directions (source survives) log a warning and
+  continue. The URI is recorded on `backup_s3_uri` (migration `000021`) + the op
+  log, with the exact `pg_restore` recovery command. Retention is an S3 lifecycle
+  rule on the reserved key prefix (30d suggested) — no in-app GC; backups are
+  kept on success. The objects carry NO object tag: PutObject with x-amz-tagging
+  needs `s3:PutObjectTagging`, which the org duckling roles do not grant (a
+  tagged upload 403s on the real cluster — mw-dev e2e regression). pg_dump/pg_restore ship in the CP image
+  (Wolfi's `postgresql-18-client` apk, in BOTH `Dockerfile` and
+  `Dockerfile.controlplane`). Full design + restore procedure:
+  `docs/design/resharding.md`.
+- **Source identity: the duckling STATUS is authoritative, validated at
+  submit.** The start handler derives source_kind/from_shard/the external
+  source block from the duckling STATUS (where the catalog actually lives) and
+  400s an op whose identity is incomplete or contradicts the config-store row
+  (kind drift, cnpg source with unresolvable shard, external source with an
+  incomplete row block). The runner re-checks at recordSource (pre-flip).
+  Never re-introduce the old "empty row kind defaults to cnpg-shard" fallback
+  — it pointed a flip-before-copy reshard at a phantom cnpg source while the
+  org lived on an external RDS (prod incident: org re-pointed onto an empty
+  catalog, rollback patch rejected).
+- **Metadata credentials come from a referenced Secret, never CR status.**
+  `status.metadataStore.credentialSecretRef` names one key in a Secret in the
+  `ducklings` namespace; `DucklingClient.Get` resolves it before returning the
+  status used by activation, probes, metering, and resharding. References to
+  any other namespace are rejected. The name, namespace, and key are all
+  mandatory; an incomplete reference or an unreadable/missing Secret is a hard
+  error. Duckgres never reads credential material from Duckling CR status.
+- **Rollback patches the source shard VALUE back — never removes the key**
+  (precedence would fall through to the freshly-stamped bogus status pin);
+  ext→cnpg rollback must null `cnpgShard` (XRD CEL forbids it on external).
+  **Never emit a patch the XRD would reject**: an empty/invalid recorded
+  from_shard (`isValidCnpgShardName`, mirrors the XRD pattern) or an
+  incomplete external source block skips the flip-back/adopt patch, logs
+  ERROR operator instructions, and **intentionally leaves the warehouse
+  blocked in `resharding`** — unblocking onto the wrong store is worse than a
+  blocked org (see docs/design/resharding.md's never-stranded carve-out).
+  Takeover/endpoint reconstructions derive sslmode from the metadata-store
+  KIND via `sslModeFor` (cnpg → disable, external → require) — never
+  hardcode an sslmode.
+- **The compaction pause must never let XRD defaulting disable DuckLake**:
+  `SetCompactionEnabled` pins the org's effective `spec.ducklake.enabled`
+  (legacy type coupling, as the activator derives it) into the patch when the
+  CR has no `spec.ducklake` object — otherwise materializing the object gets
+  `enabled: false` stamped by the XRD default and every later activation
+  fails ("tenant activation requires a ducklake metadata_store"). The pinned
+  value is never removed afterwards (deliberate — see
+  `TestSetCompactionEnabledPinsDuckLakeEnablement`).
+- **The ext target password is ephemeral**: request → creating replica's
+  in-memory stash → one-shot pull by the runner pod → runner memory; never in
+  the op row, log, audit, k8s Secret, or any pod spec. The runner pod fetches
+  it at startup from `GET /api/v1/reshards/:id/password` on the CREATING
+  replica's pod IP (the URL — never the password — is persisted on
+  `password_url`, migration `000022`, so a reconciler respawn re-wires the
+  same handoff). The endpoint is INTERNAL-SECRET identity ONLY (an SSO admin
+  is 403'd — operators must never read tenant credentials); the stash is
+  pruned once the op turns terminal. A pull that 404s (creating replica gone)
+  is not an infra error: the runner proceeds stashless and the step machine
+  fails the op with the clear "password is not available … cancel and re-run"
+  message, then rolls back. (This replaces the old claim-on-create /
+  `CreateReshardOperationClaimed`+`AdoptClaimedOperation` path — with the op
+  no longer executing in a CP process, pinning it to the creating replica is
+  neither possible nor needed.)
+- **The ext SM secret must be ESO-readable and a raw string**: the ESO IAM
+  policy only allows `posthog-*`/`duckling-*` names, so the start handler
+  enforces a POSITIVE allowlist (`esoReadableSecretPrefixes`) — a name outside
+  it is 400'd, with RDS-managed `rds!…`/`rds/…/master` names
+  (`rdsManagedSecretNamePattern`) detected first for a more specific message.
+  The composition's ExternalSecret copies the whole value verbatim (no JSON
+  property). An unreadable name that slips through just hangs the cutover wait
+  until the per-op timeout, then recovers (flip-back + copy-back). The form
+  teaches the same rules (`ui/src/lib/reshard.ts::classifySecretName`).
+- **cnpg→ext fails fast at submit, before the destructive flip**: the flip
+  DELETEs the cnpg source, so both submit-time gates (the ESO-name allowlist
+  above + a bounded `SELECT 1` pre-flight connection check to the external
+  target, `admin.ExternalTargetProber` over `provisioner.PGCatalogCopier.Probe`,
+  `sslmode=require`, wired in `multitenant.go`) 400 a doomed op before anything
+  is created. The prober nil-degrades (tests / non-k8s → check skipped; the
+  runner's copy still catches a bad credential); when present and the connect
+  fails, the op is refused. The 400 never echoes the password.
+- **Runner fencing**: claim bumps `runner_epoch`; every runner write is
+  CAS-fenced on (runner, epoch); stale-heartbeat (>5m) ops are takeover-able;
+  the copy holds a target-DB advisory lock.
+- **Takeover rollback reconstructs progress from the persisted row.** The
+  in-process rollback flags (`blocked`, `compactionPaused`, `flipped`,
+  `retainRequested`) start false on a fresh `opRun`. A runner that CLAIMS an op a
+  prior epoch advanced (crash-takeover or replica switch) MUST call
+  `reconstructProgress()` before `run()` — otherwise a cancel/failure that
+  short-circuits before the steps re-execute (e.g. `run()`'s first
+  `cancelRequested()` check) rolls back with all-false flags and silently skips
+  unblocking the warehouse (org stuck in `resharding`) and restoring compaction.
+  Reconstruction is conservative: `blocked` ← `blocked_at` set OR step past
+  `blocking`; `compactionPaused` ← step past `pausing_compaction` (proves the
+  prior setting was recorded, else restore could wrongly re-enable compaction);
+  `flipped`/`retainRequested` ← step reached `cutover`/`orphaning_source`
+  (over-marking is safe — the flip-back/adopt patches are idempotent no-ops when
+  the store never moved). This was a real mw-dev incident: the blocking runner
+  OOM-crashed mid-backup, a sibling replica took over, saw the cancel flag, and
+  marked the op `cancelled` while leaving the warehouse blocked.
+- Touching any of this → update `tests/configstore/reshard_postgres_test.go`,
+  `provisioner/reshard_runner_test.go` (incl. the `TestReshardBackup*` cases),
+  `provisioner/k8s_client_test.go` (the compaction/ducklake-pin cases),
+  `admin/reshard_test.go`, `controlplane/reshard_pod_test.go` +
+  `reshard_reconciler_test.go` + `reshard_runner_mode_test.go`, the
+  migration asserts in `tests/configstore/migrations_postgres_test.go`, the
+  netpol assert in `tests/manifests/manifests_test.go`, AND
+  the `reshard_*` + `lifecycle_teardown_cnpg` assertions in
+  `tests/mw-dev/e2e/harness.sh` (validation, cancel-during-drain,
+  bogus-shard-rollback, ext→cnpg positive path incl. the pre-flip backup
+  assertion + the runner-pod appear/reap assertions, and the
+  deprovision-unaffected net). The cnpg→ext orphan-adopt
+  charts side (composition managementPolicies + `retainCnpgOnFlip` XRD field)
+  lives in the `charts` repo and is covered by
+  `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh`.
+  cnpg→ext positive path is unit-only (harness lacks the RDS password);
+  cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
+
 ## TODO Reference
 
-See `TODO.md` for the full feature roadmap and known issues.
+`TODO.md` is a lightweight backlog for ideas that do not yet have a better
+home. It is not the PostgreSQL compatibility source of truth; use
+`docs/postgres-compatibility.md` for compatibility status, test citations, and
+known gaps.

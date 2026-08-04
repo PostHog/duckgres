@@ -46,6 +46,44 @@ run-control-plane: build
 build-k8s-image tag="duckgres:test":
     docker build --build-arg BUILD_TAGS=kubernetes -t {{tag}} .
 
+# Build the admin console SPA into controlplane/admin/ui/dist (embedded by the
+# kubernetes build via //go:embed all:ui/dist). dist is a gitignored build
+# artifact (only .gitkeep is tracked); the Docker images rebuild it in a node
+# stage, so run this locally before `go build -tags kubernetes` if you want the
+# real bundle embedded instead of the "UI not built" fallback.
+[group('dev')]
+ui-build:
+    cd controlplane/admin/ui && npm ci && npm run build
+
+# Frontend typecheck + unit tests (Vitest) + production build — the derivation
+# logic guard, and proves the embedded SPA still builds on every PR.
+[group('dev')]
+ui-test:
+    cd controlplane/admin/ui && npm ci && npm run typecheck && npm run test && npm run build
+
+# Live React dev server (HMR) against a port-forwarded control plane. Point
+# VITE_PROXY_TARGET at the CP (or the Go devserver) — default http://127.0.0.1:8080.
+[group('dev')]
+ui-dev-vite target="http://127.0.0.1:8080":
+    cd controlplane/admin/ui && VITE_PROXY_TARGET={{target}} npm run dev
+
+# Serve the admin UI locally for one kube context. The devserver fetches the
+# internal secret, port-forwards that context's control plane, and serves the
+# built SPA with a context banner (RED when the context name contains "prod").
+[group('dev')]
+ui-dev context listen="127.0.0.1:5173" namespace="duckgres":
+    go run ./controlplane/admin/devserver --context {{context}} --namespace {{namespace}} --listen {{listen}}
+
+# Serve BOTH environments side by side: prod on :5173 (red banner), dev on :5174.
+[group('dev')]
+ui-dev-all prod_context="mw-prod-us-admin" dev_context="mw-dev-admin":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    go run ./controlplane/admin/devserver --context {{prod_context}} --listen 127.0.0.1:5173 &
+    go run ./controlplane/admin/devserver --context {{dev_context}}  --listen 127.0.0.1:5174 &
+    echo "prod → http://127.0.0.1:5173   dev → http://127.0.0.1:5174"
+    wait
+
 # Recreate the local kind cluster used by the portable K8s integration flow
 [group('dev')]
 kind-cluster-reset:
@@ -252,6 +290,7 @@ format:
 [group('test')]
 test:
     just test-unit
+    just test-scenario
     just test-integration
     just test-controlplane
     just test-configstore-integration
@@ -260,7 +299,18 @@ test:
 # Run unit tests only
 [group('test')]
 test-unit:
-    go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/...
+    go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/... ./tests/manifests/...
+    go test -v -count=1 ./tests/mw-dev/...
+
+# Run scenario runner unit tests
+[group('test')]
+test-scenario:
+    go test -v -count=1 ./tests/mw-dev/scenario/...
+
+# Run cache-proxy tests
+[group('test')]
+test-cache-proxy:
+    go test -v ./cmd/cache-proxy/...
 
 # Run integration tests
 [group('test')]
@@ -281,7 +331,12 @@ test-configstore-integration:
 # Run Kubernetes-only control plane package tests
 [group('test')]
 test-controlplane-k8s:
-    go test -v -count=1 -tags kubernetes ./controlplane ./controlplane/admin ./controlplane/provisioner
+    go test -v -count=1 -tags kubernetes . ./controlplane ./controlplane/admin ./controlplane/provisioner
+
+# Print the test impact plan for the current branch
+[group('test')]
+test-impact-plan base="origin/main" head="HEAD":
+    python3 scripts/test_impact_plan.py --base {{base}} --head {{head}}
 
 # Run Kubernetes integration tests against the default kind-backed multitenant setup
 [group('test')]
@@ -348,6 +403,41 @@ perf-smoke:
 perf-nightly:
     ./scripts/perf_nightly.sh
 
+# Run a Duckgres scenario file against a configured dev environment
+[group('test')]
+scenario scenario="tests/mw-dev/scenario/scenarios/provision_smoke.yaml":
+    ./scripts/scenario_run.sh {{scenario}}
+
+# Run the dev provision smoke scenario
+[group('test')]
+scenario-smoke:
+    just scenario-provision-success
+
+# Run the dev provision success scenario
+[group('test')]
+scenario-provision-success:
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/provision_smoke.yaml
+
+# Run the dev provision rejection scenario
+[group('test')]
+scenario-provision-rejection:
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/provision_rejection.yaml
+
+# Run the dev frozen dataset metadata exploration scenario
+[group('test')]
+scenario-frozen-metadata:
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_metadata.yaml
+
+# Run the dev frozen dataset perf scenario
+[group('test')]
+scenario-frozen-perf:
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml
+
+# Run the dev frozen dataset dbt scenario
+[group('test')]
+scenario-frozen-dbt:
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_dbt.yaml
+
 # Lint (matches CI — uses golangci-lint, not go vet)
 [group('test')]
 lint:
@@ -355,7 +445,7 @@ lint:
 
 # Run what CI runs locally (excluding kind-backed K8s integration)
 [group('test')]
-ci: lint test-unit test-integration test-controlplane test-configstore-integration test-controlplane-k8s
+ci: lint test-unit test-scenario test-cache-proxy test-integration test-controlplane test-configstore-integration test-controlplane-k8s
 
 # === Metrics ===
 

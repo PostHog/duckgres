@@ -14,6 +14,23 @@ func envFromMap(values map[string]string) func(string) string {
 	}
 }
 
+func TestValidateRunModeRejectsUnsupportedMode(t *testing.T) {
+	for _, mode := range []string{"standalone", "control-plane", "duckdb-service", "reshard-runner"} {
+		if err := validateRunMode(mode); err != nil {
+			t.Fatalf("expected mode %q to be valid: %v", mode, err)
+		}
+	}
+
+	err := validateRunMode("unsupported-mode")
+	if err == nil {
+		t.Fatal("expected unsupported mode to be rejected")
+	}
+	if !strings.Contains(err.Error(), "unsupported --mode") ||
+		!strings.Contains(err.Error(), "standalone, control-plane, duckdb-service") {
+		t.Fatalf("unexpected error for unsupported mode: %v", err)
+	}
+}
+
 func TestResolveEffectiveConfigPrecedence(t *testing.T) {
 	fileCfg := &FileConfig{
 		Host:       "file-host",
@@ -298,38 +315,10 @@ func TestResolveEffectiveConfigDuckLakeDeltaCatalog(t *testing.T) {
 	}
 }
 
-func TestResolveEffectiveConfigIceberg(t *testing.T) {
-	// Default-off: with no overrides, Iceberg stays disabled (opt-in unlike Delta).
-	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, envFromMap(nil), nil)
-	if resolved.Server.Iceberg.Enabled {
-		t.Fatal("expected Iceberg.Enabled to default to false")
-	}
-
-	// File config opts in; remaining knobs (region/namespace) flow through.
-	fileEnabled := true
-	resolved = configresolve.ResolveEffective(&FileConfig{
-		Iceberg: IcebergFileConfig{
-			Enabled:   &fileEnabled,
-			Region:    "us-east-1",
-			Namespace: "main",
-		},
-	}, configresolve.CLIInputs{}, envFromMap(nil), nil)
-	if !resolved.Server.Iceberg.Enabled {
-		t.Fatal("expected YAML iceberg.enabled=true to enable Iceberg")
-	}
-	if got, want := resolved.Server.Iceberg.Region, "us-east-1"; got != want {
-		t.Fatalf("expected YAML iceberg region %q, got %q", want, got)
-	}
-	if got, want := resolved.Server.Iceberg.Namespace, "main"; got != want {
-		t.Fatalf("expected YAML iceberg namespace %q, got %q", want, got)
-	}
-}
-
 func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	env := map[string]string{
-		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL":   "0s",
-		"DUCKGRES_QUERY_LOG_BATCH_SIZE":       "-1",
-		"DUCKGRES_QUERY_LOG_COMPACT_INTERVAL": "-1s",
+		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL": "0s",
+		"DUCKGRES_QUERY_LOG_BATCH_SIZE":     "-1",
 	}
 
 	var warns []string
@@ -343,14 +332,9 @@ func TestResolveEffectiveConfigInvalidQueryLogEnvValues(t *testing.T) {
 	if resolved.Server.QueryLog.BatchSize != 1000 {
 		t.Fatalf("expected default batch_size 1000, got %d", resolved.Server.QueryLog.BatchSize)
 	}
-	if resolved.Server.QueryLog.CompactInterval != 10*time.Minute {
-		t.Fatalf("expected default compact_interval 10m, got %s", resolved.Server.QueryLog.CompactInterval)
-	}
-
 	wantWarnings := []string{
 		"DUCKGRES_QUERY_LOG_FLUSH_INTERVAL must be > 0",
 		"DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0",
-		"DUCKGRES_QUERY_LOG_COMPACT_INTERVAL must be > 0",
 	}
 	for _, w := range wantWarnings {
 		found := false
@@ -496,9 +480,6 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 			MaxWorkers:         10,
 			RetireOnSessionEnd: &retireTrue,
 		},
-		K8s: K8sFileConfig{
-			MaxWorkers: 12,
-		},
 	}
 	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
 	if resolved.Server.MemoryBudget != "24GB" {
@@ -513,9 +494,6 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	if !resolved.ProcessRetireOnSessionEnd {
 		t.Fatal("expected process.retire_on_session_end from file")
 	}
-	if resolved.K8sMaxWorkers != 12 {
-		t.Fatalf("expected k8s.max_workers from file, got %d", resolved.K8sMaxWorkers)
-	}
 
 	// Env overrides file
 	env := map[string]string{
@@ -523,7 +501,6 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 		"DUCKGRES_PROCESS_MIN_WORKERS":           "4",
 		"DUCKGRES_PROCESS_MAX_WORKERS":           "20",
 		"DUCKGRES_PROCESS_RETIRE_ON_SESSION_END": "false",
-		"DUCKGRES_K8S_MAX_WORKERS":               "24",
 	}
 	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.MemoryBudget != "32GB" {
@@ -538,18 +515,14 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	if resolved.ProcessRetireOnSessionEnd {
 		t.Fatal("expected process.retire_on_session_end from env")
 	}
-	if resolved.K8sMaxWorkers != 24 {
-		t.Fatalf("expected k8s.max_workers from env, got %d", resolved.K8sMaxWorkers)
-	}
 
 	// CLI overrides env
 	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
-		Set:                       map[string]bool{"memory-budget": true, "process-min-workers": true, "process-max-workers": true, "process-retire-on-session-end": true, "k8s-max-workers": true},
+		Set:                       map[string]bool{"memory-budget": true, "process-min-workers": true, "process-max-workers": true, "process-retire-on-session-end": true},
 		MemoryBudget:              "48GB",
 		ProcessMinWorkers:         8,
 		ProcessMaxWorkers:         50,
 		ProcessRetireOnSessionEnd: true,
-		K8sMaxWorkers:             64,
 	}, envFromMap(env), nil)
 	if resolved.Server.MemoryBudget != "48GB" {
 		t.Fatalf("expected memory_budget from CLI, got %q", resolved.Server.MemoryBudget)
@@ -563,40 +536,7 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	if !resolved.ProcessRetireOnSessionEnd {
 		t.Fatal("expected process.retire_on_session_end from CLI")
 	}
-	if resolved.K8sMaxWorkers != 64 {
-		t.Fatalf("expected k8s.max_workers from CLI, got %d", resolved.K8sMaxWorkers)
-	}
 }
-
-func TestResolveEffectiveConfigK8sSharedWarmTarget(t *testing.T) {
-	fileCfg := &FileConfig{
-		K8s: K8sFileConfig{
-			SharedWarmTarget: 3,
-		},
-	}
-
-	resolved := configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(nil), nil)
-	if resolved.K8sSharedWarmTarget != 3 {
-		t.Fatalf("expected k8s shared warm target from file, got %d", resolved.K8sSharedWarmTarget)
-	}
-
-	env := map[string]string{
-		"DUCKGRES_K8S_SHARED_WARM_TARGET": "5",
-	}
-	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{}, envFromMap(env), nil)
-	if resolved.K8sSharedWarmTarget != 5 {
-		t.Fatalf("expected k8s shared warm target from env, got %d", resolved.K8sSharedWarmTarget)
-	}
-
-	resolved = configresolve.ResolveEffective(fileCfg, configresolve.CLIInputs{
-		Set:                 map[string]bool{"k8s-shared-warm-target": true},
-		K8sSharedWarmTarget: 8,
-	}, envFromMap(env), nil)
-	if resolved.K8sSharedWarmTarget != 8 {
-		t.Fatalf("expected k8s shared warm target from CLI, got %d", resolved.K8sSharedWarmTarget)
-	}
-}
-
 func TestResolveEffectiveConfigInvalidMemoryBudget(t *testing.T) {
 	env := map[string]string{
 		"DUCKGRES_MEMORY_BUDGET": "lots-of-memory",
@@ -628,7 +568,6 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 		"DUCKGRES_PROCESS_MIN_WORKERS":           "not-a-number",
 		"DUCKGRES_PROCESS_MAX_WORKERS":           "also-bad",
 		"DUCKGRES_PROCESS_RETIRE_ON_SESSION_END": "definitely-not-bool",
-		"DUCKGRES_K8S_MAX_WORKERS":               "still-bad",
 	}
 
 	var warns []string
@@ -642,9 +581,6 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	if resolved.ProcessMaxWorkers != 0 {
 		t.Fatalf("expected default process.max_workers, got %d", resolved.ProcessMaxWorkers)
 	}
-	if resolved.K8sMaxWorkers != 0 {
-		t.Fatalf("expected default k8s.max_workers, got %d", resolved.K8sMaxWorkers)
-	}
 	if resolved.ProcessRetireOnSessionEnd {
 		t.Fatal("expected default process.retire_on_session_end")
 	}
@@ -653,7 +589,6 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 		"Invalid DUCKGRES_PROCESS_MIN_WORKERS",
 		"Invalid DUCKGRES_PROCESS_MAX_WORKERS",
 		"Invalid DUCKGRES_PROCESS_RETIRE_ON_SESSION_END",
-		"Invalid DUCKGRES_K8S_MAX_WORKERS",
 	}
 	for _, w := range wantWarnings {
 		found := false

@@ -1,3 +1,13 @@
+# Build the admin console SPA (controlplane/admin/ui) so the kubernetes build
+# embeds a FRESH dist/ via //go:embed all:ui/dist, overwriting the committed
+# bundle. Runs before the Go build.
+FROM node:20-bookworm-slim AS uibuilder
+WORKDIR /ui
+COPY controlplane/admin/ui/package.json controlplane/admin/ui/package-lock.json ./
+RUN npm ci
+COPY controlplane/admin/ui/ ./
+RUN npm run build
+
 FROM golang:1.25-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev curl gzip && rm -rf /var/lib/apt/lists/*
@@ -12,9 +22,9 @@ RUN go mod download
 # previously ran after the source COPY + build, so they re-fetched on every
 # edit.)
 ARG TARGETARCH
-ARG DUCKDB_EXTENSION_VERSION=1.5.3
-ARG HTTPFS_EXTENSION_TAG=v1.5.3-stoi-fix
-ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
+ARG DUCKDB_EXTENSION_VERSION=1.5.5
+ARG HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
+ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # Repository for postgres_scanner specifically. Defaults to the stable
 # extensions repo, overridable per-row in CI (e.g. legacy DuckDB versions
@@ -42,23 +52,36 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \
     && curl -fsSL "${POSTGRES_SCANNER_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
-    && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/iceberg.duckdb_extension.gz" \
-      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/iceberg.duckdb_extension" \
-    && for f in httpfs ducklake json postgres_scanner iceberg; do \
+    && for f in httpfs ducklake json postgres_scanner; do \
          [ -s "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/$f.duckdb_extension" ] \
            || { echo "ERROR: $f.duckdb_extension is empty after fetch" >&2; exit 1; }; \
        done
 
 COPY . .
+# Overwrite the committed placeholder with the freshly built SPA so the
+# kubernetes build embeds the real bundle.
+COPY --from=uibuilder /ui/dist ./controlplane/admin/ui/dist
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_TAGS=""
+RUN CGO_ENABLED=1 \
+    DUCKGRES_TEST_DUCKDB_EXTENSION_DIRECTORY=/build/duckdb-extensions \
+    go test -count=1 -tags "${BUILD_TAGS}" \
+      -run '^TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner$' \
+      ./duckdbservice
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o duckgres .
 
-FROM debian:bookworm-slim
+FROM chainguard/wolfi-base:latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
+# postgresql-18-client provides pg_dump/pg_restore, used by the control-plane
+# reshard runner's pre-flip catalog backup (docs/design/resharding.md). Pinned
+# to PG 18 to match the cnpg shard major so it can dump PG-18 catalogs. mw-dev
+# runs this single all-in-one image as BOTH control plane and workers, so the
+# client must live here (not only in Dockerfile.controlplane). libstdc++ is
+# the C++ runtime the CGO-linked DuckDB engine needs — present implicitly on
+# debian-slim, but not in wolfi-base.
+RUN apk add --no-cache ca-certificates-bundle libstdc++ postgresql-18-client \
+    && addgroup -S duckgres && adduser -S -G duckgres -h /app duckgres
 
 WORKDIR /app
 COPY --from=builder /build/duckgres .

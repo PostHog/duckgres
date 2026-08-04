@@ -58,7 +58,7 @@ func extractDuckDBConnection(sqlConn *sql.Conn) (bindings.Connection, error) {
 	var duckConn bindings.Connection
 	err := sqlConn.Raw(func(driverConn interface{}) error {
 		v := reflect.ValueOf(driverConn)
-		if v.Kind() == reflect.Ptr {
+		if v.Kind() == reflect.Pointer {
 			v = v.Elem()
 		}
 		if v.Kind() != reflect.Struct {

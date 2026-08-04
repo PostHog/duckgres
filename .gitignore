@@ -36,19 +36,24 @@ duckgres_local_test.yaml
 artifacts/perf/
 /artifacts/
 
+# dbt local user identity
+.user.yml
+
 .gemini/
 gha-creds-*.json
 data-test/
 .claude/scheduled_tasks.lock
 .claude/worktrees/*/
 .worktrees/
+.codex/
 bench-results/
 /cache-proxy
 /cmd/cache-proxy/cache-proxy
 
-# Local prototype/scratch dirs (e.g. tmp/lakekeeper-proto/)
+# Local prototype/scratch dirs
 tmp/
 
 # Built Go binaries (build artifacts, never commit)
 /duckgres-controlplane
 /duckgres-worker
+/devserver

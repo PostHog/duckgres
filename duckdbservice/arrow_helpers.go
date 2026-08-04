@@ -10,6 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server/sqlcore"
 )
 
 // DuckDBTypeToArrow re-exports arrowmap.DuckDBTypeToArrow for backward
@@ -36,11 +37,32 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 	builder := array.NewRecordBuilder(alloc, schema)
 	defer builder.Release()
 
-	numFields := schema.NumFields()
+	scanFields := schema.NumFields()
+	explainValueColumn := -1
+	scanShapeResolved := false
 	count := 0
-	for rows.Next() && count < batchSize {
-		values := make([]interface{}, numFields)
-		valuePtrs := make([]interface{}, numFields)
+	// Order matters: check `count < batchSize` first, then call rows.Next().
+	// The reverse (rows.Next() && count < batchSize) advances the cursor once
+	// more after the final scan and that row is silently dropped — the next
+	// call to RowsToRecord starts from the row *after* the one we skipped.
+	// Production reads were losing one row at every batch boundary
+	// (batchSize=1024) for unbounded SELECTs; COUNT(*) still returned the
+	// parquet-metadata row count, so the discrepancy was invisible to
+	// aggregation queries. See TestRowsToRecordNoRowsLostAtBatchBoundary.
+	for count < batchSize && rows.Next() {
+		// Resolve the physical scan shape only after Next succeeds. Some drivers
+		// close rows automatically at EOF; calling Columns after that would turn
+		// normal completion into "sql: Rows are closed".
+		if !scanShapeResolved {
+			var err error
+			scanFields, explainValueColumn, err = rowScanShape(rows, schema)
+			if err != nil {
+				return nil, err
+			}
+			scanShapeResolved = true
+		}
+		values := make([]interface{}, scanFields)
+		valuePtrs := make([]interface{}, scanFields)
 		for i := range values {
 			valuePtrs[i] = &values[i]
 		}
@@ -49,8 +71,12 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 			return nil, err
 		}
 
-		for i, val := range values {
-			AppendValue(builder.Field(i), val)
+		if explainValueColumn >= 0 {
+			AppendValue(builder.Field(0), values[explainValueColumn])
+		} else {
+			for i, val := range values {
+				AppendValue(builder.Field(i), val)
+			}
 		}
 		count++
 	}
@@ -64,8 +90,52 @@ func RowsToRecord(alloc memory.Allocator, rows *sql.Rows, schema *arrow.Schema, 
 	return builder.NewRecordBatch(), nil
 }
 
+func rowScanShape(rows *sql.Rows, schema *arrow.Schema) (scanFields int, explainValueColumn int, err error) {
+	scanFields = schema.NumFields()
+	explainValueColumn = -1
+	if !isExplainPlanSchema(schema) {
+		return scanFields, explainValueColumn, nil
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return 0, -1, err
+	}
+	if len(cols) == 2 &&
+		strings.EqualFold(cols[0], "explain_key") &&
+		strings.EqualFold(cols[1], "explain_value") {
+		return 2, 1, nil
+	}
+	return scanFields, explainValueColumn, nil
+}
+
+func isExplainPlanSchema(schema *arrow.Schema) bool {
+	if schema == nil || schema.NumFields() != 1 {
+		return false
+	}
+	name := schema.Field(0).Name
+	return name == "physical_plan" || name == "analyzed_plan"
+}
+
 type contextQueryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// isExplainQuery reports whether the (already upper-cased) query is an EXPLAIN
+// statement, i.e. starts with the EXPLAIN keyword followed by a delimiter.
+func isExplainQuery(upper string) bool {
+	s := strings.TrimSpace(upper)
+	const kw = "EXPLAIN"
+	if !strings.HasPrefix(s, kw) {
+		return false
+	}
+	if len(s) == len(kw) {
+		return true
+	}
+	switch s[len(kw)] {
+	case ' ', '\t', '\n', '\r', '(':
+		return true
+	}
+	return false
 }
 
 func isNil(i contextQueryer) bool {
@@ -73,7 +143,7 @@ func isNil(i contextQueryer) bool {
 		return true
 	}
 	v := reflect.ValueOf(i)
-	return v.Kind() == reflect.Ptr && v.IsNil()
+	return v.Kind() == reflect.Pointer && v.IsNil()
 }
 
 // GetQuerySchema executes a query with LIMIT 0 to discover the result schema.
@@ -81,6 +151,20 @@ func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx con
 	q := strings.TrimRight(strings.TrimSpace(query), ";")
 	queryWithLimit := q
 	upper := strings.ToUpper(q)
+	// EXPLAIN [ANALYZE] returns a fixed single-column textual plan. We must NOT
+	// execute it to discover its schema: EXPLAIN ANALYZE runs the statement to
+	// gather statistics, so executing it here as a schema probe would run (and,
+	// for a write, mutate) the statement a second time on top of the real DoGet
+	// execution. Return a synthetic schema without executing.
+	if isExplainQuery(upper) {
+		name := "physical_plan"
+		if strings.Contains(upper, "ANALYZE") {
+			name = "analyzed_plan"
+		}
+		return arrow.NewSchema([]arrow.Field{
+			{Name: name, Type: arrowmap.DuckDBTypeToArrow("VARCHAR"), Nullable: true},
+		}, nil), nil
+	}
 	// Only append LIMIT 0 for SELECT/WITH/VALUES/TABLE statements.
 	// SHOW, DESCRIBE, EXPLAIN, PRAGMA, CALL etc. don't support LIMIT.
 	if !strings.Contains(upper, "LIMIT") && arrowmap.SupportsLimit(upper) {
@@ -107,7 +191,15 @@ func GetQuerySchema(ctx context.Context, db contextQueryer, query string, tx con
 
 	fields := make([]arrow.Field, len(colTypes))
 	for i, ct := range colTypes {
-		fields[i] = arrow.Field{Name: ct.Name(), Type: DuckDBTypeToArrow(ct.DatabaseTypeName()), Nullable: true}
+		databaseTypeName := ct.DatabaseTypeName()
+		fields[i] = arrow.Field{
+			Name:     ct.Name(),
+			Type:     DuckDBTypeToArrow(databaseTypeName),
+			Nullable: true,
+			Metadata: arrow.MetadataFrom(map[string]string{
+				sqlcore.ExactDatabaseTypeNameMetadataKey: databaseTypeName,
+			}),
+		}
 	}
 	return arrow.NewSchema(fields, nil), nil
 }

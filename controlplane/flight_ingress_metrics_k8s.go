@@ -14,28 +14,10 @@ var orgSessionsActiveGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Number of active sessions per org",
 }, []string{"org"})
 
-var orgWorkerSpawnsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_org_worker_spawns_total",
-	Help: "Total worker spawns per org",
-}, []string{"org"})
-
 var orgWorkerCrashesCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_org_worker_crashes_total",
 	Help: "Total worker crashes per org",
 }, []string{"org"})
-
-// orgColocatedQuotaRejectionsCounter counts colocated worker acquisitions an org
-// was denied because it would exceed its colocated CPU/memory budget. A sustained
-// nonzero rate means an org is hitting its colocated quota — alert/tune before it
-// silently caps that org's backfill throughput.
-var orgColocatedQuotaRejectionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_org_colocated_quota_rejections_total",
-	Help: "Total colocated worker acquisitions rejected by the per-org colocated resource quota",
-}, []string{"org"})
-
-func observeOrgColocatedQuotaRejection(orgID string) {
-	orgColocatedQuotaRejectionsCounter.WithLabelValues(orgID).Inc()
-}
 
 // orgPgSessionsAcceptedCounter tracks every PG session that completes auth and
 // is dispatched to a worker, partitioned by org and passthrough mode. Useful
@@ -58,10 +40,6 @@ var sniRoutingResolutionsCounter = promauto.NewCounterVec(prometheus.CounterOpts
 
 func observeOrgSessionsActive(org string, count int) {
 	orgSessionsActiveGauge.WithLabelValues(org).Set(float64(count))
-}
-
-func observeOrgWorkerSpawn(org string) {
-	orgWorkerSpawnsCounter.WithLabelValues(org).Inc()
 }
 
 func observeOrgWorkerCrash(org string) {

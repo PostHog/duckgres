@@ -11,21 +11,20 @@ import (
 )
 
 type captureControlPlaneExpiryStore struct {
-	mu                     sync.Mutex
-	cutoffs                []time.Time
-	count                  int64
-	expireErr              error
-	drainingCutoffs        []time.Time
-	drainingCount          int64
-	orphanedWorkers        []configstore.WorkerRecord
-	stuckSpawningBefore    []time.Time
-	stuckActivatingBefore  []time.Time
-	stuckWorkers           []configstore.WorkerRecord
-	expiredSessionsBefore  []time.Time
-	expiredHotIdleWorkers  []configstore.WorkerRecord
-	pruneMissBucketsBefore []time.Time
-	prunedMissBucketCount  int64
-	pruneMissBucketErr     error
+	mu                    sync.Mutex
+	cutoffs               []time.Time
+	count                 int64
+	expireErr             error
+	drainingCutoffs       []time.Time
+	drainingCount         int64
+	orphanedWorkers       []configstore.WorkerRecord
+	stuckSpawningBefore   []time.Time
+	stuckActivatingBefore []time.Time
+	stuckWorkers          []configstore.WorkerRecord
+	expiredSessionsBefore []time.Time
+	expiredHotIdleWorkers []configstore.WorkerRecord
+	hotIdleCounts         map[string]int
+	hotIdleCountCalls     []string
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
@@ -94,7 +93,7 @@ func (s *captureControlPlaneExpiryStore) ExpireFlightSessionRecords(before time.
 // by the migrated janitor hot-idle path. The mock wraps the same
 // underlying slice through NewWorkerSnapshot so existing
 // tests can opt into the lifecycle path by setting expiredHotIdleWorkers.
-func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(before time.Time) ([]configstore.WorkerSnapshot, error) {
+func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.expiredHotIdleWorkers) == 0 {
@@ -107,11 +106,15 @@ func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(before time
 	return out, nil
 }
 
-func (s *captureControlPlaneExpiryStore) PruneWarmCapacityMissBuckets(before time.Time) (int64, error) {
+func (s *captureControlPlaneExpiryStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pruneMissBucketsBefore = append(s.pruneMissBucketsBefore, before)
-	return s.prunedMissBucketCount, s.pruneMissBucketErr
+	key := orgID + "|" + image + "|" + profileCPU + "|" + profileMemory
+	s.hotIdleCountCalls = append(s.hotIdleCountCalls, key)
+	if s.hotIdleCounts == nil {
+		return 0, nil
+	}
+	return s.hotIdleCounts[key], nil
 }
 
 func TestControlPlaneJanitorRunExpiresStaleInstances(t *testing.T) {
@@ -174,41 +177,6 @@ func TestControlPlaneJanitorRunInvokesOnStop(t *testing.T) {
 	}
 }
 
-func TestControlPlaneJanitorRunPrunesWarmCapacityMissBuckets(t *testing.T) {
-	store := &captureControlPlaneExpiryStore{}
-	now := time.Date(2026, time.March, 26, 15, 0, 0, 0, time.UTC)
-	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
-	janitor.now = func() time.Time { return now }
-
-	janitor.runOnce()
-
-	if len(store.pruneMissBucketsBefore) != 1 {
-		t.Fatalf("expected one warm capacity miss bucket prune call, got %d", len(store.pruneMissBucketsBefore))
-	}
-	want := now.Add(-defaultWarmCapacityMissBucketTTL)
-	if got := store.pruneMissBucketsBefore[0]; !got.Equal(want) {
-		t.Fatalf("expected warm capacity miss bucket prune cutoff %v, got %v", want, got)
-	}
-}
-
-func TestControlPlaneJanitorRunPrunesWarmCapacityMissBucketsWithConfiguredTTL(t *testing.T) {
-	store := &captureControlPlaneExpiryStore{}
-	now := time.Date(2026, time.March, 26, 15, 0, 5, 0, time.UTC)
-	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
-	janitor.now = func() time.Time { return now }
-	janitor.warmCapacityMissBucketTTL = 7 * time.Minute
-
-	janitor.runOnce()
-
-	if len(store.pruneMissBucketsBefore) != 1 {
-		t.Fatalf("expected one warm capacity miss bucket prune call, got %d", len(store.pruneMissBucketsBefore))
-	}
-	want := now.Add(-7 * time.Minute).Truncate(configstore.WarmCapacityMissBucketSize)
-	if got := store.pruneMissBucketsBefore[0]; !got.Equal(want) {
-		t.Fatalf("expected warm capacity miss bucket prune cutoff %v, got %v", want, got)
-	}
-}
-
 func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{
 		orphanedWorkers: []configstore.WorkerRecord{
@@ -256,7 +224,7 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	}
 }
 
-func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
+func TestControlPlaneJanitorRunObservesWorkerLifecycle(t *testing.T) {
 	store := &captureControlPlaneExpiryStore{}
 	now := time.Date(2026, time.March, 27, 14, 0, 0, 0, time.UTC)
 	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
@@ -264,7 +232,7 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 
 	var mu sync.Mutex
 	calls := 0
-	janitor.reconcileWarmCapacity = func() {
+	janitor.observeWorkerLifecycle = func() {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
@@ -275,7 +243,7 @@ func TestControlPlaneJanitorRunReconcilesWarmCapacity(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	if calls != 1 {
-		t.Fatalf("expected janitor to reconcile warm capacity exactly once, got %d", calls)
+		t.Fatalf("expected janitor to observe worker lifecycle exactly once, got %d", calls)
 	}
 }
 
@@ -341,6 +309,55 @@ func TestControlPlaneJanitorHotIdleGoesThroughLifecycleWhenWired(t *testing.T) {
 	}
 	if got := cleanup.snapshot(); len(got) != 1 || got[0].workerID != 21 || got[0].reason != "hot_idle_ttl_expired" {
 		t.Fatalf("expected lifecycle cleanup for worker 21, got %#v", got)
+	}
+}
+
+func TestControlPlaneJanitorSkipsExpiredHotIdleWorkersProtectedByFloor(t *testing.T) {
+	now := time.Date(2026, time.May, 22, 14, 20, 0, 0, time.UTC)
+	protected := configstore.WorkerRecord{
+		WorkerID:          22,
+		PodName:           "duckgres-worker-22",
+		Image:             "duckgres:test",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	excess := configstore.WorkerRecord{
+		WorkerID:          23,
+		PodName:           "duckgres-worker-23",
+		Image:             "duckgres:test",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "billing",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
+		UpdatedAt:         now.Add(-2 * time.Minute),
+	}
+	store := &captureControlPlaneExpiryStore{
+		expiredHotIdleWorkers: []configstore.WorkerRecord{protected, excess},
+		hotIdleCounts: map[string]int{
+			"analytics|duckgres:test||": 1,
+			"billing|duckgres:test||":   2,
+		},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return now }
+	janitor.hotIdleTTL = time.Minute
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+	janitor.hotIdleFloor = func(snap configstore.WorkerSnapshot) int {
+		return 1
+	}
+
+	janitor.runOnce()
+
+	if got := lifecycleStore.terminalTransitions; len(got) != 1 || got[0].workerID != 23 {
+		t.Fatalf("expected only excess hot-idle worker 23 to be retired, got %#v", got)
+	}
+	if got := store.hotIdleCountCalls; len(got) != 2 {
+		t.Fatalf("expected compatible hot-idle count check for each expired worker, got %#v", got)
 	}
 }
 
@@ -434,10 +451,9 @@ func TestControlPlaneJanitorRunInvokesReconcilerAfterVersionReaper(t *testing.T)
 	}
 }
 
-func TestControlPlaneJanitorRunInvokesVersionReaperBeforeReconcile(t *testing.T) {
-	// The version-aware reaper must run before reconcileWarmCapacity in the
-	// same tick so that a retired-this-tick worker's warm slot is replenished
-	// immediately rather than waiting a full interval.
+func TestControlPlaneJanitorRunInvokesVersionReaperBeforeLifecycleObserve(t *testing.T) {
+	// The version-aware reaper must run before the lifecycle observation in the
+	// same tick so the gauges it refreshes reflect a worker retired this tick.
 	store := &captureControlPlaneExpiryStore{}
 	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
 
@@ -448,18 +464,18 @@ func TestControlPlaneJanitorRunInvokesVersionReaperBeforeReconcile(t *testing.T)
 		defer mu.Unlock()
 		order = append(order, "reap")
 	}
-	janitor.reconcileWarmCapacity = func() {
+	janitor.observeWorkerLifecycle = func() {
 		mu.Lock()
 		defer mu.Unlock()
-		order = append(order, "reconcile")
+		order = append(order, "observe")
 	}
 
 	janitor.runOnce()
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(order) != 2 || order[0] != "reap" || order[1] != "reconcile" {
-		t.Fatalf("expected reap→reconcile ordering, got %v", order)
+	if len(order) != 2 || order[0] != "reap" || order[1] != "observe" {
+		t.Fatalf("expected reap→observe ordering, got %v", order)
 	}
 }
 
@@ -481,11 +497,11 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
 
 	var mu sync.Mutex
-	reconciled := 0
-	janitor.reconcileWarmCapacity = func() {
+	lifecycleObserved := 0
+	janitor.observeWorkerLifecycle = func() {
 		mu.Lock()
 		defer mu.Unlock()
-		reconciled++
+		lifecycleObserved++
 	}
 
 	janitor.runOnce()
@@ -508,7 +524,7 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if reconciled != 1 {
-		t.Fatalf("expected warm capacity reconciliation despite expiry error, got %d", reconciled)
+	if lifecycleObserved != 1 {
+		t.Fatalf("expected worker lifecycle observation despite expiry error, got %d", lifecycleObserved)
 	}
 }

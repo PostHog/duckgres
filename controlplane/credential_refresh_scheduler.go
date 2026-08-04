@@ -10,6 +10,12 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
+// credentialRefreshLookahead and the broker's cache safety margin now live in
+// sts_broker.go alongside stsSessionDuration: all three derive from the
+// env-overridable session duration (DUCKGRES_STS_SESSION_DURATION), and the
+// former compile-time guard (margin strictly greater than lookahead) holds by
+// construction — stsCacheSafetyMargin = credentialRefreshLookahead + 5m.
+
 // credentialRefreshScheduleStore is the slice of the runtime store the
 // scheduler depends on. Defined narrowly so unit tests can fake it without
 // pulling in the full store.

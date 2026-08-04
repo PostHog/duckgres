@@ -8,7 +8,12 @@ import (
 	"github.com/posthog/duckgres/transpiler/transform"
 )
 
-var booleanPredicatePattern = regexp.MustCompile(`(?is)(?:\btrue\b|\bfalse\b)\s*(?:=|!=|<>)|(?:=|!=|<>)\s*(?:\btrue\b|\bfalse\b)`)
+// Matches a true/false literal adjacent to =, != or <> with any interleaving
+// of whitespace and closing/opening parens between them, so parenthesized
+// literals like "flag = ( ( true ) )" are gated too. False positives are safe
+// no-ops: the AST transform only rewrites real boolean comparisons (parens
+// produce no AST node).
+var booleanPredicatePattern = regexp.MustCompile(`(?is)(?:\btrue\b|\bfalse\b)[\s)]*(?:=|!=|<>)|(?:=|!=|<>)[\s(]*(?:\btrue\b|\bfalse\b)`)
 
 func NeedsBooleanPredicateRewrite(sql string) bool {
 	return booleanPredicatePattern.MatchString(sql)

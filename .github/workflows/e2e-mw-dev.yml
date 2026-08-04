@@ -1,10 +1,9 @@
 # Per-PR end-to-end test against the real posthog-mw-dev EKS cluster.
 #
 # Replaces what kind (tests/k8s/) cannot exercise: real Cilium network
-# policies, real Crossplane Duckling provisioning, real cnpg-shard + external
-# RDS metadata stores, and the real per-org Lakekeeper operator — the layers
-# where this quarter's bugs actually lived (Cilium egress, lakekeeper
-# encryption-key drift, cnpg role drift, RBAC delete gaps).
+# policies, real Crossplane Duckling provisioning, and real cnpg-shard metadata
+# stores — the production-like layers where this quarter's bugs actually lived
+# (Cilium egress, cnpg role drift, RBAC delete gaps).
 #
 # Flow:
 #   1. build arm64-only worker + control-plane images, tagged pr-<N>-<sha>,
@@ -15,9 +14,9 @@
 #      spawning worker pods in the same namespace.
 #   4. run the e2e harness as a Job INSIDE the namespace, talking to the CP
 #      ClusterIP service (no public DNS / NLB needed). Covers the cnpg-shard
-#      and external metadata backends.
+#      metadata backend.
 #   5. always tear the namespace down (and deprovision the ci-pr ducklings so
-#      no S3 / cnpg role / lakekeeper CR leaks on shared infra).
+#      no S3 / cnpg role leaks on shared infra).
 #
 # SECURITY — who can run this:
 #   Same model as the AWS/OIDC job in ci.yml: the gate is the repo setting
@@ -28,7 +27,7 @@
 #   required-reviewer Environment — that would either block external PRs even
 #   after approval, or force an approval click on every maintainer push.)
 #
-# Required repo configuration (one-time, see tests/e2e-mw-dev/README.md):
+# Required repo configuration (one-time, see tests/mw-dev/README.md):
 #   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV
 #   secrets: AWS_ECR_PUBLISH_IAM_ROLE (already exists, used by CD),
 #            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it)
@@ -47,7 +46,7 @@ on:
       - "go.mod"
       - "go.sum"
       - "Dockerfile*"
-      - "tests/e2e-mw-dev/**"
+      - "tests/mw-dev/**"
       - ".github/workflows/e2e-mw-dev.yml"
       - ".github/workflows/_image-build.yml"
   workflow_dispatch:
@@ -57,10 +56,14 @@ on:
   schedule:
     - cron: "0 */6 * * *"
 
-# One in-flight run per PR; a new push cancels the old run (and its namespace
-# is GC'd by the always() teardown of the cancelled run + the e2e-cleanup sweep).
+# One in-flight run per PR; a new push cancels the old run. The replacement
+# deploy starts by deleting same-PR shared resources and refuses to reuse the
+# PR-scoped names until Duckling CR deletion completes; e2e-cleanup is the
+# backstop for namespaces with no follow-up run.
 concurrency:
-  group: e2e-mw-dev-${{ github.event.pull_request.number || github.ref }}
+  # Manual runs use unique resource identities, so do not let a later dispatch
+  # cancel an unrelated run whose teardown cannot reap those identities.
+  group: e2e-mw-dev-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -79,29 +82,40 @@ jobs:
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: Dockerfile
-      image-name: duckgres
-      tag: pr-${{ github.event.pull_request.number }}-${{ github.sha }}-arm64
+      image-name: duckgres-prs
+      tag: pr-${{ github.event.pull_request.number || github.run_id }}-${{ github.sha }}-arm64
       platform: linux/arm64
       cache-scope: e2e-duckgres-arm64
-      # Default DuckDB row (1.5.3) — mirrors the default:true matrix entry in
+      # Default DuckDB row (1.5.5) — mirrors the default:true matrix entry in
       # container-image-worker-cd.yml. Keep in lock-step on a version bump.
       build-args: |
-        DUCKDB_EXTENSION_VERSION=1.5.3
-        HTTPFS_EXTENSION_TAG=v1.5.3-stoi-fix
-        DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
+        DUCKDB_EXTENSION_VERSION=1.5.5
+        HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
+        DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
         DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
         POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
     secrets:
-      ecr-role: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+      ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
 
-  e2e:
+  e2e_lanes:
     needs: [build]
     if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: full
+            lane_prefix: "1"
+          - suite: reshard
+            lane_prefix: "2"
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     env:
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      NAMESPACE: duckgres-ci-pr-${{ github.event.pull_request.number }}
+      # Partition both lanes so no lane can collide with a real PR number.
+      # workflow_dispatch has no pull_request payload, so it uses run_id.
+      PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
+      NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
+      E2E_SUITE: ${{ matrix.suite }}
       # Single all-in-one image for both CP and workers (mw-dev parity).
       WORKER_IMAGE: ${{ needs.build.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ needs.build.outputs.image }}
@@ -116,6 +130,14 @@ jobs:
       CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test e2e harness scripts
+        run: go test -count=1 ./tests/mw-dev
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
@@ -150,21 +172,81 @@ jobs:
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
 
       - name: Deploy isolated namespace
-        run: bash tests/e2e-mw-dev/run.sh deploy
+        run: bash tests/mw-dev/run.sh deploy
 
       - name: Run e2e harness (in-cluster Job)
-        run: bash tests/e2e-mw-dev/run.sh test
+        run: bash tests/mw-dev/run.sh test-e2e
 
+      # Diagnostics are only worth collecting (and only get read) when the
+      # harness failed — on green runs this step just added ~15s to the gating
+      # check. failure() also covers a failed deploy step.
       - name: Collect diagnostics
-        if: always()
-        run: bash tests/e2e-mw-dev/run.sh diagnostics
+        if: failure()
+        run: bash tests/mw-dev/run.sh diagnostics
 
-      # Always tear down — deprovision the ci-pr ducklings (so no S3 / cnpg
-      # role+db / lakekeeper CR leaks on shared infra) then delete the
-      # namespace. Runs even on cancel/failure.
+  # Preserve one stable required-check name while exposing each matrix lane's
+  # result independently.
+  e2e:
+    needs: [e2e_lanes]
+    if: ${{ always() && github.event_name != 'schedule' }}
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Require every e2e lane
+        env:
+          LANES_RESULT: ${{ needs.e2e_lanes.result }}
+        run: test "$LANES_RESULT" = success
+
+  # Teardown runs as its OWN job so the gating `e2e` check completes the moment
+  # the harness verdict is known instead of waiting ~1min for deprovision +
+  # namespace delete. cmd_teardown recovers the internal secret from the
+  # in-cluster duckgres-tokens Secret, so it doesn't need the deploy runner's
+  # disk. Trade-off vs the old in-job always() step: a run cancelled by
+  # concurrency (new push) also cancels this queued job — but the new push's
+  # deploy cleans the stale namespace first thing, and the 6h e2e-cleanup sweep
+  # is the backstop for namespaces with no follow-up push.
+  e2e-teardown:
+    needs: [e2e_lanes]
+    # Run on e2e success OR failure (not when e2e was skipped because build
+    # failed — nothing was deployed). Scheduled trigger never reaches here.
+    if: ${{ always() && github.event_name != 'schedule' && contains(fromJSON('["success","failure"]'), needs.e2e_lanes.result) }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: full
+            lane_prefix: "1"
+          - suite: reshard
+            lane_prefix: "2"
+    env:
+      PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
+      NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
+      KUBE_CONTEXT: posthog-mw-dev
+      CLUSTER_NAME: posthog-mw-dev
+      EKS_CLUSTER_NAME: posthog-mw-dev
+      AWS_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
+          aws-region: us-east-1
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
+        with:
+          oauth-client-id: ${{ vars.TS_WIF_CLIENT_ID_MW_DEV }}
+          audience: ${{ vars.TS_WIF_AUDIENCE_MW_DEV }}
+          tags: tag:github-runner
+      - name: Install kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
+      # Deprovision the ci-pr ducklings (so no S3 / cnpg role+db leaks on
+      # shared infra) then delete the namespace.
       - name: Teardown
-        if: always()
-        run: bash tests/e2e-mw-dev/run.sh teardown
+        run: bash tests/mw-dev/run.sh teardown
 
   # Backstop sweep of orphaned per-PR namespaces. Scheduled-trigger only (the
   # PR/manual triggers run build+e2e instead). Reuses the same Tailscale + e2e
@@ -198,4 +280,4 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region us-east-1 --alias "$KUBE_CONTEXT"
       - name: Sweep stale per-PR namespaces
-        run: bash tests/e2e-mw-dev/run.sh e2e-cleanup
+        run: bash tests/mw-dev/run.sh e2e-cleanup

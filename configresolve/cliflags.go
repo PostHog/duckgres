@@ -12,7 +12,7 @@ import "flag"
 //
 // A handful of CLIInputs fields (the K8s pod-scheduling knobs:
 // K8sWorkerCPURequest, K8sWorkerMemoryRequest, K8sWorkerNodeSelector,
-// K8sWorkerTolerationKey, K8sWorkerTolerationValue, K8sWorkerExclusiveNode)
+// K8sWorkerTolerationKey, K8sWorkerTolerationValue)
 // are env-only by design — see CLAUDE.md "K8s pod scheduling knobs are
 // env-only." They stay zero in the harvested CLIInputs and ResolveEffective
 // reads them directly from os.Getenv. Adding a flag for any of them is a
@@ -34,7 +34,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	keyFile := fs.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
 	filePersistence := fs.Bool("file-persistence", false, "Persist DuckDB to <data-dir>/<username>.duckdb instead of in-memory (env: DUCKGRES_FILE_PERSISTENCE)")
 	processIsolation := fs.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
-	idleTimeout := fs.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
+	idleTimeout := fs.String("idle-timeout", "", "Connection idle timeout: close a connection idle (no traffic) this long, freeing its worker (e.g., '30m', '1h', '-1s' to disable). Default 24h standalone, 60s control-plane where idle connections pin a worker (env: DUCKGRES_IDLE_TIMEOUT)")
 	sessionInitTimeout := fs.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
 	memoryLimit := fs.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := fs.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
@@ -43,13 +43,11 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	duckLakeDeltaCatalogEnabled := fs.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := fs.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach, defaults to sibling delta/ prefix at DuckLake object-store root (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	duckLakeDefaultSpecVersion := fs.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
-	icebergEnabled := fs.Bool("iceberg-enabled", false, "Attach a per-tenant Iceberg catalog (Lakekeeper REST) at session init (env: DUCKGRES_ICEBERG_ENABLED)")
-	icebergRegion := fs.String("iceberg-region", "", "AWS region for S3 object access by Iceberg (default: us-east-1) (env: DUCKGRES_ICEBERG_REGION)")
-	icebergNamespace := fs.String("iceberg-namespace", "", "Default Iceberg namespace (informational; default: main) (env: DUCKGRES_ICEBERG_NAMESPACE)")
 	processMinWorkers := fs.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
 	processMaxWorkers := fs.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
 	processRetireOnSessionEnd := fs.Bool("process-retire-on-session-end", false, "Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode) (env: DUCKGRES_PROCESS_RETIRE_ON_SESSION_END)")
 	workerQueueTimeout := fs.String("worker-queue-timeout", "", "How long to wait for an available worker/org connection slot (e.g., '60s') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
+	admissionReclaimerMaxReservations := fs.Int("admission-reclaimer-max-reservations", 0, "Max queued/live admission identities whose cleanup ownership one control plane may retain (default: 4096) (env: DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS)")
 	workerIdleTimeout := fs.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	handoverDrainTimeout := fs.String("handover-drain-timeout", "", "How long to wait for planned shutdowns/upgrades to drain before forcing exit (default: '24h' in process mode, '15m' in remote mode) (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
 	acmeDomain := fs.String("acme-domain", "", "Domain for ACME/Let's Encrypt certificate (env: DUCKGRES_ACME_DOMAIN)")
@@ -61,6 +59,9 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	configStoreConn := fs.String("config-store", "", "PostgreSQL connection string for config store (env: DUCKGRES_CONFIG_STORE)")
 	configPollInterval := fs.String("config-poll-interval", "", "How often to poll config store for changes (default: 30s) (env: DUCKGRES_CONFIG_POLL_INTERVAL)")
 	internalSecret := fs.String("internal-secret", "", "Shared secret for API authentication (env: DUCKGRES_INTERNAL_SECRET)")
+	internalSecretFallbacks := fs.String("internal-secret-fallbacks", "", "Comma-separated previous internal secrets still accepted for API authentication during rotation, newest first (env: DUCKGRES_INTERNAL_SECRET_FALLBACKS)")
+	readOnlySecret := fs.String("read-only-secret", "", "Read-only secret accepted ONLY on the discovery endpoints (GET /api/v1/warehouses, /api/v1/warehouse-team-ids), for external writers like millpond/viaduck; never grants admin access (env: DUCKGRES_READ_ONLY_SECRET)")
+	readOnlySecretFallbacks := fs.String("read-only-secret-fallbacks", "", "Comma-separated previous read-only secrets still accepted during rotation, newest first (env: DUCKGRES_READ_ONLY_SECRET_FALLBACKS)")
 	sniRoutingMode := fs.String("sni-routing-mode", "", "Hostname-based org routing: 'enforce' (default; require a managed SNI hostname that resolves to an org — the database name selects the catalog, not the org), 'passthrough' (warn on legacy hostnames), 'off' (no SNI handling; identity can no longer be resolved). Multi-tenant only. (env: DUCKGRES_SNI_ROUTING_MODE)")
 	managedHostnameSuffixes := fs.String("managed-hostname-suffixes", "", "Comma-separated DNS suffixes (each starting with '.') for managed tenant hostnames, e.g. '.dw.us.postwh.com'. (env: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES)")
 	workerBackend := fs.String("worker-backend", "", "Worker backend: process (default) or remote for config-store-backed K8s multitenant mode (env: DUCKGRES_WORKER_BACKEND)")
@@ -72,16 +73,8 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	k8sWorkerConfigMap := fs.String("k8s-worker-configmap", "", "ConfigMap name for worker duckgres.yaml (env: DUCKGRES_K8S_WORKER_CONFIGMAP)")
 	k8sWorkerImagePullPolicy := fs.String("k8s-worker-image-pull-policy", "", "Image pull policy for K8s worker pods: Always, IfNotPresent, Never (env: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY)")
 	k8sWorkerServiceAccount := fs.String("k8s-worker-service-account", "", "Neutral ServiceAccount name for K8s worker pods (default: duckgres-worker) (env: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT)")
-	k8sMaxWorkers := fs.Int("k8s-max-workers", 0, "Max K8s workers in the shared pool, 0=unbounded (env: DUCKGRES_K8S_MAX_WORKERS)")
-	k8sSharedWarmTarget := fs.Int("k8s-shared-warm-target", 0, "Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled (env: DUCKGRES_K8S_SHARED_WARM_TARGET)")
-	k8sDynamicWarmCapacityEnabled := fs.Bool("k8s-dynamic-warm-capacity-enabled", true, "Enable configstore-driven dynamic warm-capacity target computation (default true; use --k8s-dynamic-warm-capacity-enabled=false to disable; env: DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED)")
-	k8sWarmCapacityMissWindow := fs.String("k8s-warm-capacity-miss-window", "", "Recent no-idle miss window for dynamic warm-capacity demand (default: 2m) (env: DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW)")
-	k8sWarmCapacityMissesPerWorker := fs.Int("k8s-warm-capacity-misses-per-worker", 0, "Recent misses required for one extra dynamic warm worker (default: 8) (env: DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER)")
-	k8sWarmCapacityDemandTTL := fs.String("k8s-warm-capacity-demand-ttl", "", "Retention TTL for warm-capacity miss buckets (default: 15m) (env: DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL)")
-	k8sWarmCapacityDynamicImageCeiling := fs.Int("k8s-warm-capacity-dynamic-image-ceiling", 0, "Max dynamic extra warm workers per image, 0=unlimited (env: DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING)")
-	k8sWarmCapacityDynamicTotalCeiling := fs.Int("k8s-warm-capacity-dynamic-total-ceiling", 0, "Max dynamic extra warm workers across images, 0=unlimited (env: DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING)")
 	awsRegion := fs.String("aws-region", "", "AWS region for STS client (env: DUCKGRES_AWS_REGION)")
-	queryLog := fs.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
+	queryLog := fs.Bool("query-log", true, "Enable/disable query logging (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
 
 	return func() CLIInputs {
 		cli := CLIInputs{Set: map[string]bool{}}
@@ -109,13 +102,11 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.DuckLakeDeltaCatalogEnabled = *duckLakeDeltaCatalogEnabled
 		cli.DuckLakeDeltaCatalogPath = *duckLakeDeltaCatalogPath
 		cli.DuckLakeDefaultSpecVersion = *duckLakeDefaultSpecVersion
-		cli.IcebergEnabled = *icebergEnabled
-		cli.IcebergRegion = *icebergRegion
-		cli.IcebergNamespace = *icebergNamespace
 		cli.ProcessMinWorkers = *processMinWorkers
 		cli.ProcessMaxWorkers = *processMaxWorkers
 		cli.ProcessRetireOnSessionEnd = *processRetireOnSessionEnd
 		cli.WorkerQueueTimeout = *workerQueueTimeout
+		cli.AdmissionReclaimerMaxReservations = *admissionReclaimerMaxReservations
 		cli.WorkerIdleTimeout = *workerIdleTimeout
 		cli.HandoverDrainTimeout = *handoverDrainTimeout
 		cli.ACMEDomain = *acmeDomain
@@ -127,6 +118,9 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.ConfigStoreConn = *configStoreConn
 		cli.ConfigPollInterval = *configPollInterval
 		cli.InternalSecret = *internalSecret
+		cli.InternalSecretFallbacks = *internalSecretFallbacks
+		cli.ReadOnlySecret = *readOnlySecret
+		cli.ReadOnlySecretFallbacks = *readOnlySecretFallbacks
 		cli.SNIRoutingMode = *sniRoutingMode
 		cli.ManagedHostnameSuffixes = *managedHostnameSuffixes
 		cli.WorkerBackend = *workerBackend
@@ -138,14 +132,6 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.K8sWorkerConfigMap = *k8sWorkerConfigMap
 		cli.K8sWorkerImagePullPolicy = *k8sWorkerImagePullPolicy
 		cli.K8sWorkerServiceAccount = *k8sWorkerServiceAccount
-		cli.K8sMaxWorkers = *k8sMaxWorkers
-		cli.K8sSharedWarmTarget = *k8sSharedWarmTarget
-		cli.K8sDynamicWarmCapacityEnabled = *k8sDynamicWarmCapacityEnabled
-		cli.K8sWarmCapacityMissWindow = *k8sWarmCapacityMissWindow
-		cli.K8sWarmCapacityMissesPerWorker = *k8sWarmCapacityMissesPerWorker
-		cli.K8sWarmCapacityDemandTTL = *k8sWarmCapacityDemandTTL
-		cli.K8sWarmCapacityDynamicImageCeiling = *k8sWarmCapacityDynamicImageCeiling
-		cli.K8sWarmCapacityDynamicTotalCeiling = *k8sWarmCapacityDynamicTotalCeiling
 		cli.AWSRegion = *awsRegion
 		cli.QueryLog = *queryLog
 		return cli

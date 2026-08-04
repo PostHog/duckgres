@@ -342,7 +342,7 @@ func TestSharedWorkerActivatorDucklingCRRequiresSTSBroker(t *testing.T) {
 
 	_, err := activator.BuildActivationRequest(context.Background(), org, &WorkerAssignment{OrgID: "test-org"})
 	if err == nil {
-		t.Fatal("expected shared warm activation to fail without an STS broker")
+		t.Fatal("expected worker activation to fail without an STS broker")
 		return
 	}
 }

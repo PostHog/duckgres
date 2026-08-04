@@ -3,15 +3,17 @@ package flightclient
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"strconv"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -20,18 +22,68 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/posthog/duckgres/duckdbservice/arrowmap"
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sqlcore"
+	"github.com/posthog/duckgres/server/wire"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // MaxGRPCMessageSize is the max gRPC message size for Flight SQL communication.
 // DuckDB query results can easily exceed the default 4MB limit.
 const MaxGRPCMessageSize = 1 << 30 // 1GB
 
+const (
+	waitSessionIdleAction    = "WaitSessionIdle"
+	releaseQueryHandleAction = "ReleaseQueryHandle"
+	logQueryAction           = "LogQuery"
+	setSessionS3CacheAction  = "SetSessionS3Cache"
+	queryCloseWaitTimeout    = 30 * time.Second
+	queryLogForwardTimeout   = 5 * time.Second
+	queryLogMaxInFlight      = 64
+)
+
 // ErrWorkerDead is returned when the backing worker process has crashed.
 var ErrWorkerDead = errors.New("flight worker is dead")
+
+// QueryLogLimiter bounds concurrent control-plane query-log RPCs for one
+// worker. It holds no entries itself; sessions sharing a worker share the
+// same limiter so a stalled endpoint cannot accumulate unbounded goroutines.
+type QueryLogLimiter struct {
+	limit    int64
+	inFlight atomic.Int64
+}
+
+// NewQueryLogLimiter creates a limiter with the production per-worker limit.
+func NewQueryLogLimiter() *QueryLogLimiter {
+	return newQueryLogLimiter(queryLogMaxInFlight)
+}
+
+func newQueryLogLimiter(limit int64) *QueryLogLimiter {
+	if limit <= 0 {
+		limit = 1
+	}
+	return &QueryLogLimiter{limit: limit}
+}
+
+func (l *QueryLogLimiter) tryAcquire() bool {
+	for {
+		current := l.inFlight.Load()
+		if current >= l.limit {
+			return false
+		}
+		if l.inFlight.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+func (l *QueryLogLimiter) release() {
+	l.inFlight.Add(-1)
+}
 
 // FlightExecutor implements QueryExecutor backed by an Arrow Flight SQL client.
 // It routes queries to a duckdb-service worker process over a Unix socket.
@@ -54,6 +106,12 @@ type FlightExecutor struct {
 	// lastProfiling stores the most recent DuckDB profiling output received
 	// from the worker via gRPC trailing metadata.
 	lastProfiling atomic.Value // stores string
+
+	queryLogMu       sync.Mutex
+	queryLogClosed   bool
+	queryLogWG       sync.WaitGroup
+	queryLogStopOnce sync.Once
+	queryLogLimiter  *QueryLogLimiter
 }
 
 // NewFlightExecutor creates a FlightExecutor connected to the given address.
@@ -82,31 +140,44 @@ func NewFlightExecutor(addr, bearerToken, sessionToken string) (*FlightExecutor,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &FlightExecutor{
-		client:       client,
-		sessionToken: sessionToken,
-		ownerEpoch:   0,
-		alloc:        memory.DefaultAllocator,
-		ownsClient:   true,
-		ctx:          ctx,
-		cancel:       cancel,
-	}, nil
+	e := &FlightExecutor{
+		client:          client,
+		sessionToken:    sessionToken,
+		ownerEpoch:      0,
+		alloc:           memory.DefaultAllocator,
+		ownsClient:      true,
+		ctx:             ctx,
+		cancel:          cancel,
+		queryLogLimiter: NewQueryLogLimiter(),
+	}
+	return e, nil
 }
 
 // NewFlightExecutorFromClient creates a FlightExecutor that shares an existing
 // Flight SQL client. The client is NOT closed when this executor is closed.
 // This avoids creating a new gRPC connection per session.
 func NewFlightExecutorFromClient(client *flightsql.Client, sessionToken string) *FlightExecutor {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &FlightExecutor{
-		client:       client,
-		sessionToken: sessionToken,
-		ownerEpoch:   0,
-		alloc:        memory.DefaultAllocator,
-		ownsClient:   false,
-		ctx:          ctx,
-		cancel:       cancel,
+	return NewFlightExecutorFromClientWithQueryLogLimiter(client, sessionToken, nil)
+}
+
+// NewFlightExecutorFromClientWithQueryLogLimiter creates a per-session
+// executor whose asynchronous query-log calls share a worker-wide limiter.
+func NewFlightExecutorFromClientWithQueryLogLimiter(client *flightsql.Client, sessionToken string, limiter *QueryLogLimiter) *FlightExecutor {
+	if limiter == nil {
+		limiter = NewQueryLogLimiter()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &FlightExecutor{
+		client:          client,
+		sessionToken:    sessionToken,
+		ownerEpoch:      0,
+		alloc:           memory.DefaultAllocator,
+		ownsClient:      false,
+		ctx:             ctx,
+		cancel:          cancel,
+		queryLogLimiter: limiter,
+	}
+	return e
 }
 
 // MarkDead marks this executor's backing worker as dead. All subsequent RPC
@@ -122,13 +193,20 @@ func (e *FlightExecutor) IsDead() bool {
 
 // withSession adds the session token to the gRPC context.
 func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
-	return metadata.AppendToOutgoingContext(
+	ctx = metadata.AppendToOutgoingContext(
 		ctx,
 		"x-duckgres-session", e.sessionToken,
 		"x-duckgres-worker-id", strconv.Itoa(e.workerID),
 		"x-duckgres-cp-instance-id", e.cpInstanceID,
 		"x-duckgres-owner-epoch", strconv.FormatInt(e.ownerEpoch, 10),
 	)
+	// Sourced from the context rather than executor state: the executor is
+	// per-session and serves many statements, and both front-ends (PG wire and
+	// the Flight SQL ingress) reach it through the same call.
+	if queryID := wire.QueryIDFromContext(ctx); queryID != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, wire.QueryIDMetadataKey, queryID)
+	}
+	return ctx
 }
 
 func (e *FlightExecutor) SetOwnerEpoch(ownerEpoch int64) {
@@ -202,22 +280,38 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return &emptyRowSet{}, nil
 	}
 
-	reader, err := e.client.DoGet(reqCtx, info.Endpoint[0].Ticket)
+	ticket := info.Endpoint[0].Ticket
+	if err := reqCtx.Err(); err != nil {
+		_ = e.releaseQueryHandle(ticket)
+		_ = e.waitForSessionIdle()
+		return nil, err
+	}
+
+	reader, err := e.client.DoGet(reqCtx, ticket)
 	if err != nil {
+		// If cancellation lands after Execute has registered a worker-side
+		// handle but before DoGet returns a RowSet, there is no Close call to
+		// acknowledge the abandoned split-phase operation. Release the handle
+		// explicitly, then wait in case DoGet consumed it and is still unwinding.
+		_ = e.releaseQueryHandle(ticket)
+		_ = e.waitForSessionIdle()
 		return nil, fmt.Errorf("flight doget: %w", err)
 	}
 
 	schema, err := flight.DeserializeSchema(info.Schema, e.alloc)
 	if err != nil {
+		cancel()
 		reader.Release()
+		_ = e.waitForSessionIdle()
 		return nil, fmt.Errorf("flight deserialize schema: %w", err)
 	}
 
 	success = true
 	return &FlightRowSet{
-		reader: reader,
-		schema: schema,
-		cancel: cancel,
+		reader:        reader,
+		schema:        schema,
+		cancel:        cancel,
+		waitForClosed: e.waitForSessionIdle,
 	}, nil
 }
 
@@ -298,6 +392,11 @@ func (e *FlightExecutor) mergedContext(ctx context.Context) (context.Context, co
 }
 
 func (e *FlightExecutor) Close() error {
+	e.stopQueryLogForwarding()
+	if !e.waitQueryLogForwarding() && e.cancel != nil {
+		e.cancel()
+		e.queryLogWG.Wait()
+	}
 	if e.cancel != nil {
 		e.cancel()
 	}
@@ -305,6 +404,313 @@ func (e *FlightExecutor) Close() error {
 		return e.client.Close()
 	}
 	return nil
+}
+
+// Log implements the server query-log forwarding hook without making query
+// completion wait on worker RPC or DuckLake writes.
+func (e *FlightExecutor) Log(entry wire.QueryLogEntry) {
+	if e == nil {
+		return
+	}
+	if e.dead.Load() {
+		observe.AddQueryLogDroppedEntries("forward_worker_dead", 1)
+		return
+	}
+
+	e.queryLogMu.Lock()
+	if e.queryLogClosed {
+		e.queryLogMu.Unlock()
+		observe.AddQueryLogDroppedEntries("forward_closed", 1)
+		return
+	}
+	if e.dead.Load() {
+		e.queryLogMu.Unlock()
+		observe.AddQueryLogDroppedEntries("forward_worker_dead", 1)
+		return
+	}
+	if e.client == nil || e.client.Client == nil {
+		e.queryLogMu.Unlock()
+		observe.AddQueryLogDroppedEntries("forward_unavailable", 1)
+		return
+	}
+	limiter := e.queryLogLimiter
+	if limiter == nil {
+		limiter = NewQueryLogLimiter()
+		e.queryLogLimiter = limiter
+	}
+	if !limiter.tryAcquire() {
+		e.queryLogMu.Unlock()
+		observe.AddQueryLogDroppedEntries("forward_in_flight_limit", 1)
+		return
+	}
+	baseCtx := context.Background()
+	if e.ctx != nil {
+		baseCtx = e.ctx
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, queryLogForwardTimeout)
+	e.queryLogWG.Add(1)
+	e.queryLogMu.Unlock()
+
+	go func() {
+		defer e.queryLogWG.Done()
+		defer limiter.release()
+		defer cancel()
+		_ = e.forwardQueryLogEntry(ctx, entry)
+	}()
+}
+
+func (e *FlightExecutor) stopQueryLogForwarding() {
+	e.queryLogStopOnce.Do(func() {
+		e.queryLogMu.Lock()
+		e.queryLogClosed = true
+		e.queryLogMu.Unlock()
+	})
+}
+
+func (e *FlightExecutor) waitQueryLogForwarding() bool {
+	done := make(chan struct{})
+	go func() {
+		e.queryLogWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(queryLogForwardTimeout):
+		return false
+	}
+}
+
+func (e *FlightExecutor) forwardQueryLogEntry(ctx context.Context, entry wire.QueryLogEntry) (err error) {
+	if e.dead.Load() {
+		observe.AddQueryLogDroppedEntries("forward_worker_dead", 1)
+		return nil
+	}
+	if e.client == nil || e.client.Client == nil {
+		observe.AddQueryLogDroppedEntries("forward_unavailable", 1)
+		return nil
+	}
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil {
+			observe.AddQueryLogDroppedEntries("forward_error", 1)
+		}
+	}()
+
+	payload, err := json.Marshal(wire.WorkerQueryLogPayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Entries: []wire.QueryLogEntry{entry},
+	})
+	if err != nil {
+		return err
+	}
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(ctx),
+		&flight.Action{Type: logQueryAction, Body: payload},
+	)
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func isTerminalSessionIdleWaitError(err error) bool {
+	if strings.Contains(err.Error(), "flight client panic") {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Canceled, codes.Unavailable, codes.FailedPrecondition, codes.NotFound:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *FlightExecutor) waitForSessionIdle() (err error) {
+	if e.dead.Load() {
+		return nil
+	}
+	if e.client == nil || e.client.Client == nil {
+		return nil
+	}
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil && isTerminalSessionIdleWaitError(err) {
+			err = nil
+		}
+	}()
+
+	payload, err := json.Marshal(wire.WorkerWaitSessionIdlePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryCloseWaitTimeout)
+	defer cancel()
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(ctx),
+		&flight.Action{Type: waitSessionIdleAction, Body: payload},
+	)
+	if err != nil {
+		if isTerminalSessionIdleWaitError(err) {
+			return nil
+		}
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			if isTerminalSessionIdleWaitError(err) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// SetS3CacheEnabled asks the session's worker to route the tenant's S3
+// traffic through the node-local cache proxy (true, the default) or to bypass
+// it (false) by swapping the S3 secret's transport. Implements the server
+// package's S3CacheControl capability, backing the `duckgres.s3_cache`
+// session GUC. Unlike the best-effort teardown actions above, errors are
+// surfaced: a SET that did not take effect on the worker must fail, not
+// silently leave the session in the wrong cache state. Workers running an
+// image that predates the action reject it with Unimplemented, which also
+// surfaces as an error.
+func (e *FlightExecutor) SetS3CacheEnabled(ctx context.Context, enabled bool) (err error) {
+	if e.dead.Load() {
+		return ErrWorkerDead
+	}
+	if e.client == nil || e.client.Client == nil {
+		return ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
+	payload, err := json.Marshal(wire.WorkerSetS3CachePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Enabled: enabled,
+	})
+	if err != nil {
+		return err
+	}
+
+	merged, cancel := e.mergedContext(ctx)
+	defer cancel()
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(merged),
+		&flight.Action{Type: setSessionS3CacheAction, Body: payload},
+	)
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (e *FlightExecutor) releaseQueryHandle(ticket *flight.Ticket) (err error) {
+	if e.dead.Load() {
+		return nil
+	}
+	if e.client == nil || e.client.Client == nil || ticket == nil || len(ticket.Ticket) == 0 {
+		return nil
+	}
+	defer func() {
+		recoverClientPanic(&err)
+		if err != nil && isTerminalSessionIdleWaitError(err) {
+			err = nil
+		}
+	}()
+
+	payload, err := json.Marshal(wire.WorkerReleaseQueryHandlePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Ticket: ticket.Ticket,
+	})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryCloseWaitTimeout)
+	defer cancel()
+	if e.ctx != nil {
+		go func() {
+			select {
+			case <-e.ctx.Done():
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(ctx),
+		&flight.Action{Type: releaseQueryHandleAction, Body: payload},
+	)
+	if err != nil {
+		if isTerminalSessionIdleWaitError(err) {
+			return nil
+		}
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			if isTerminalSessionIdleWaitError(err) {
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 func (e *FlightExecutor) LastProfilingOutput() string {
@@ -331,12 +737,14 @@ type FlightRowSet struct {
 	schema *arrow.Schema
 
 	// Current batch state
-	currentBatch arrow.RecordBatch
-	batchRow     int // current row index within currentBatch
-	done         bool
-	err          error
-	closeOnce    sync.Once
-	cancel       context.CancelFunc
+	currentBatch  arrow.RecordBatch
+	batchRow      int // current row index within currentBatch
+	done          bool
+	err           error
+	closeOnce     sync.Once
+	closeErr      error
+	cancel        context.CancelFunc
+	waitForClosed func() error
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -350,7 +758,7 @@ func (r *FlightRowSet) Columns() ([]string, error) {
 func (r *FlightRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
 	types := make([]sqlcore.ColumnTyper, r.schema.NumFields())
 	for i := 0; i < r.schema.NumFields(); i++ {
-		types[i] = &arrowColumnType{dt: r.schema.Field(i).Type}
+		types[i] = newArrowColumnType(r.schema.Field(i))
 	}
 	return types, nil
 }
@@ -422,8 +830,11 @@ func (r *FlightRowSet) Close() error {
 			r.currentBatch = nil
 		}
 		r.reader.Release()
+		if r.waitForClosed != nil && (!r.done || r.err != nil) {
+			r.closeErr = r.waitForClosed()
+		}
 	})
-	return nil
+	return r.closeErr
 }
 
 func (r *FlightRowSet) Err() error {
@@ -433,12 +844,12 @@ func (r *FlightRowSet) Err() error {
 // emptyRowSet is returned when a query produces no endpoints and no schema.
 type emptyRowSet struct{}
 
-func (e *emptyRowSet) Columns() ([]string, error)          { return nil, nil }
+func (e *emptyRowSet) Columns() ([]string, error)                  { return nil, nil }
 func (e *emptyRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) { return nil, nil }
-func (e *emptyRowSet) Next() bool                          { return false }
-func (e *emptyRowSet) Scan(dest ...any) error              { return fmt.Errorf("no rows") }
-func (e *emptyRowSet) Close() error                        { return nil }
-func (e *emptyRowSet) Err() error                          { return nil }
+func (e *emptyRowSet) Next() bool                                  { return false }
+func (e *emptyRowSet) Scan(dest ...any) error                      { return fmt.Errorf("no rows") }
+func (e *emptyRowSet) Close() error                                { return nil }
+func (e *emptyRowSet) Err() error                                  { return nil }
 
 // emptySchemaRowSet is returned when a query produces no data rows but does
 // have schema information (e.g., SELECT ... LIMIT 0). This preserves column
@@ -459,15 +870,15 @@ func (e *emptySchemaRowSet) Columns() ([]string, error) {
 func (e *emptySchemaRowSet) ColumnTypes() ([]sqlcore.ColumnTyper, error) {
 	types := make([]sqlcore.ColumnTyper, e.schema.NumFields())
 	for i := 0; i < e.schema.NumFields(); i++ {
-		types[i] = &arrowColumnType{dt: e.schema.Field(i).Type}
+		types[i] = newArrowColumnType(e.schema.Field(i))
 	}
 	return types, nil
 }
 
-func (e *emptySchemaRowSet) Next() bool      { return false }
+func (e *emptySchemaRowSet) Next() bool        { return false }
 func (e *emptySchemaRowSet) Scan(...any) error { return fmt.Errorf("no rows") }
-func (e *emptySchemaRowSet) Close() error    { return nil }
-func (e *emptySchemaRowSet) Err() error      { return nil }
+func (e *emptySchemaRowSet) Close() error      { return nil }
+func (e *emptySchemaRowSet) Err() error        { return nil }
 
 // flightExecResult implements ExecResult for Flight SQL updates.
 type flightExecResult struct {
@@ -480,11 +891,26 @@ func (r *flightExecResult) RowsAffected() (int64, error) {
 
 // arrowColumnType implements ColumnTyper by mapping Arrow DataType to DuckDB type names.
 type arrowColumnType struct {
-	dt arrow.DataType
+	dt                    arrow.DataType
+	exactDatabaseTypeName string
+	hasExactDatabaseType  bool
+}
+
+func newArrowColumnType(field arrow.Field) *arrowColumnType {
+	exactType, ok := field.Metadata.GetValue(sqlcore.ExactDatabaseTypeNameMetadataKey)
+	return &arrowColumnType{
+		dt:                    field.Type,
+		exactDatabaseTypeName: exactType,
+		hasExactDatabaseType:  ok && exactType != "",
+	}
 }
 
 func (c *arrowColumnType) DatabaseTypeName() string {
 	return arrowTypeToDuckDB(c.dt)
+}
+
+func (c *arrowColumnType) ExactDatabaseTypeName() (string, bool) {
+	return c.exactDatabaseTypeName, c.hasExactDatabaseType
 }
 
 // arrowTypeToDuckDB maps an Arrow DataType back to a DuckDB type name string.
@@ -781,7 +1207,7 @@ func interpolateArgs(query string, args []any) string {
 }
 
 // scanQuoted returns the index just past a quoted region starting at start
-// (query[start] == quote), treating a doubled quote ('' or "") as an escape.
+// (query[start] == quote), treating a doubled quote (” or "") as an escape.
 func scanQuoted(query string, start int, quote byte) int {
 	for i := start + 1; i < len(query); i++ {
 		if query[i] != quote {
@@ -816,8 +1242,11 @@ func formatArgValue(v any) string {
 	}
 	switch val := v.(type) {
 	case string:
-		escaped := strings.ReplaceAll(val, `\`, `\\`)
-		escaped = strings.ReplaceAll(escaped, "'", "''")
+		// DuckDB standard '...' literals (like standard-conforming PostgreSQL)
+		// treat backslash as a literal character — only the single quote needs
+		// doubling. Doubling backslashes here corrupts the value: '\\' is the
+		// two-character string \\, not an escape for \.
+		escaped := strings.ReplaceAll(val, "'", "''")
 		return "'" + escaped + "'"
 	case []byte:
 		return `'\x` + hex.EncodeToString(val) + `'::BLOB`
@@ -845,9 +1274,9 @@ func formatArgValue(v any) string {
 	case float64:
 		return fmt.Sprintf("%g", val)
 	default:
-		// Treat unknown types as strings to avoid injection via Stringer
+		// Treat unknown types as strings to avoid injection via Stringer.
+		// Same literal semantics as the string case: quote-double only.
 		s := fmt.Sprintf("%v", val)
-		s = strings.ReplaceAll(s, `\`, `\\`)
 		s = strings.ReplaceAll(s, "'", "''")
 		return "'" + s + "'"
 	}

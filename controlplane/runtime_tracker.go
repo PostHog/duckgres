@@ -18,8 +18,6 @@ type ControlPlaneRuntimeTracker struct {
 	store             runtimeInstanceStore
 	id                string
 	podName           string
-	podUID            string
-	bootID            string
 	heartbeatInterval time.Duration
 	now               func() time.Time
 
@@ -31,7 +29,7 @@ type ControlPlaneRuntimeTracker struct {
 	drainingAt *time.Time
 }
 
-func NewControlPlaneRuntimeTracker(store runtimeInstanceStore, id, podName, podUID, bootID string, heartbeatInterval time.Duration) *ControlPlaneRuntimeTracker {
+func NewControlPlaneRuntimeTracker(store runtimeInstanceStore, id, podName string, heartbeatInterval time.Duration) *ControlPlaneRuntimeTracker {
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = 5 * time.Second
 	}
@@ -39,8 +37,6 @@ func NewControlPlaneRuntimeTracker(store runtimeInstanceStore, id, podName, podU
 		store:             store,
 		id:                id,
 		podName:           podName,
-		podUID:            podUID,
-		bootID:            bootID,
 		heartbeatInterval: heartbeatInterval,
 		now:               time.Now,
 	}
@@ -119,8 +115,6 @@ func (t *ControlPlaneRuntimeTracker) upsertAt(now time.Time) error {
 	return t.store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              t.id,
 		PodName:         t.podName,
-		PodUID:          t.podUID,
-		BootID:          t.bootID,
 		State:           state,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: now,

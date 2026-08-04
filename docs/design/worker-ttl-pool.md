@@ -1,0 +1,218 @@
+# Worker TTL pool: one pool, size-on-request, TTL lifecycle, node headroom
+
+Status: in progress (branch `ben/duckgres-worker-ttl-pool`). Scope: **remote/k8s
+backend only** (`-tags kubernetes`, `OrgReservedPool` / `K8sWorkerPool`).
+Standalone and process backends are unchanged.
+
+## Goal
+
+Replace the warm-pool + worker-profile/colocate machinery with a simple,
+predictable model:
+
+- A worker pod runs **one query session at a time** (already true) and has only
+  two live states: **hot-active** (a session is running) and **hot-idle** (no
+  session, alive until its TTL expires). No warm/neutral pool, no
+  reserved/activating warm slots kept around speculatively.
+- A connection asks for a worker **size** (`cpu`, `memory`) and a **ttl**. On a
+  query:
+  - if the org already has a **hot-idle** worker with cpu **and** memory ≥ the
+    request → reuse it (smallest-fitting one);
+  - else → spawn a fresh worker of the requested size.
+- **TTL** = how long a worker stays alive after its last query finishes. Every
+  query resets the worker's TTL to its initial value. The user picks it (and pays
+  for the idle time).
+- A **headroom controller** in the control plane runs low-priority placeholder
+  ("pause") pods — count and size derived dynamically from recent worker
+  spawns — so a real worker spawn schedules immediately (preempting the
+  placeholders) instead of waiting on a fresh Karpenter node.
+
+Removed concepts: warm pool / neutral pool / shared-warm-target, worker
+**profiles** and **tiers**, the **colocate** flag and the colocated nodepool /
+quota / warm-shapes, per-image warm reconcilers.
+
+Implemented follow-up: orgs may set `default_worker_min_hot_idle` through the
+admin API to retain a minimum number of default-profile hot-idle workers for
+small/default traffic. The default is `0` (disabled). This is a retention floor:
+the janitor skips TTL retirement when retiring an expired compatible worker would
+drop the org below the floor. It does not proactively spawn workers. Arbitrary
+per-profile reserved capacity remains future work.
+
+## Request grammar (libpq `options`, parsed like the existing GUCs)
+
+```
+options=-c duckgres.worker_cpu=8 -c duckgres.worker_memory=16Gi -c duckgres.worker_ttl=20m
+```
+
+- `duckgres.worker_cpu` — integer cores. Default **8**.
+- `duckgres.worker_memory` — k8s quantity. Default **16Gi**.
+- `duckgres.worker_ttl` — Go duration. Default **1m**.
+- Absent GUCs → defaults. Gated behind `AllowClientWorkerSizing`; sizes clamped
+  to `[min,max]` and ttl to `[0,maxTTL]` per deployment (out-of-range → clamp +
+  warn). Gate off → every request uses the defaults.
+
+TTL resolution, per request (the same chain whether the request is sized or
+not — there is exactly ONE default TTL however a worker comes to have no
+explicit one):
+
+1. client GUC `duckgres.worker_ttl` (gated, clamped to `WORKER_MAX_TTL`)
+2. org default `default_worker_ttl` (admin API `PUT /orgs/:id`, #742)
+3. deployment default `DUCKGRES_K8S_WORKER_DEFAULT_TTL`
+4. built-in **1m** (kept short so idle one-session worker pods + their nodes are
+   reclaimed quickly by default; raise the deployment/org default for tenants
+   that want warm reuse, or pin a floor via `default_worker_min_hot_idle`)
+
+`duckgres.colocate` / `worker_tier` are removed (unknown GUCs are ignored, so old
+clients that still send them degrade to defaults rather than erroring).
+
+## Worker identity / match
+
+A worker carries its size `{CPU cores, Memory bytes}` and `TTL`. Match for reuse:
+same org, lifecycle hot-idle, `worker.CPU >= req.CPU && worker.Mem >= req.Mem`.
+Pick the smallest-fitting (least CPU then least memory) to avoid pinning a big
+worker on a small query. On reuse, the worker's TTL is reset to the request's
+ttl and it transitions hot-idle → hot-active.
+
+DuckDB limits for the single session derive from the worker's **actual** size
+(75% of pod memory, all cores) — unchanged from `workerDuckDBLimits`, now keyed
+off size not profile.
+
+## Lifecycle
+
+```
+(none) --spawn(size)--> Activating --activated--> Hot(active, 1 session)
+Hot --session ends--> HotIdle (deadline = now + ttl)
+HotIdle --new query (size fits)--> Hot (deadline cleared, ttl reset on session end)
+HotIdle --deadline passed--> Retired (pod deleted, graceful drain)
+Hot/HotIdle --crash/evict--> Lost --> removed
+```
+
+The reaper (existing `idleReaper`, 1-min tick or faster) retires hot-idle workers
+whose `idleDeadline` (last-session-end + ttl) has passed. TTL is stored per
+worker (set at spawn, reset on each session end). No global `idleTimeout` knob
+governs it anymore — ttl is per worker.
+
+## Acquire path (consolidated `OrgReservedPool`)
+
+1. Reuse: smallest-fitting hot-idle org worker with size ≥ request → bump to
+   hot-active, return. (Ungated fast path; only reuses org-owned workers.)
+2. Else, under the FIFO gate (anti-snatch, kept): spawn a new worker of the
+   requested size for the org; activate; return. Bounded by ctx; clear org-cap
+   error if a per-org worker cap is hit (cap retained, now size-agnostic count).
+
+`ReserveSharedWorker` / `ClaimIdleWorker` / `ClaimHotIdleWorker` warm-claim
+machinery and the neutral-warm DB rows collapse to: "is there a reusable hot-idle
+worker for this org of sufficient size?" (in-memory + runtime-store query), else
+spawn. The runtime store keeps tracking workers (for cross-CP visibility and
+crash recovery) but the warm/neutral slot concept is gone.
+
+## Default hot-idle retention floor
+
+`default_worker_min_hot_idle` is enforced inside the janitor's hot-idle TTL
+cleanup path. It protects naturally-created hot-idle workers from expiry; it does
+not create new capacity.
+
+When the janitor considers an expired hot-idle worker, it:
+
+- resolves the org's current default worker profile and image;
+- counts compatible `hot_idle` workers for that org/image/profile bucket;
+- skips retiring the candidate when the compatible count is at or below the
+  configured floor.
+
+Because there is no background floor spawn, cold orgs still start cold and a
+burst can consume the retained hot-idle workers. The floor only preserves idle
+capacity that prior sessions have already created.
+
+## Headroom reconcile (new janitor hook, not a separate controller)
+
+Implemented as a **janitor reconcile hook** (`reconcileHeadroom`), invoked from
+`janitor.runOnce()` — it reuses the janitor's existing leader-gated tick, so
+there is no new loop, goroutine, or leader election. On each tick (leader CP
+only) it:
+
+- maintains low-priority **placeholder pods** ("slots") whose count and size
+  are derived DYNAMICALLY from the worker spawn log
+  (`duckgres_worker_spawn_log`, written best-effort by every CP replica at pod
+  create) — there is no configured count or size;
+- slot COUNT = `clamp(peak spawn burst, 1, cap)`: the peak number of spawns in
+  any one 5-minute bucket of the last hour (serial spawns reuse one warm slot;
+  only burst concurrency needs parallel warm capacity), floored at 1 (never
+  zero while enabled — one warm slot is the point of the feature) and capped
+  at `max(4, ceil(25% × live worker pods))`. The cap is fleet-RELATIVE so it
+  grows with the deployment without anyone bumping a constant, and it bounds a
+  spawn-storm bug's placeholder cost. Fleet size is only the CEILING, never
+  the target — an idle-worker leak cannot pull the placeholder count up (the
+  amplification failure of the retired demand-proportional mode);
+- slot SIZE = the componentwise max worker shape spawned in the last 7 days,
+  falling back to the live fleet's max shape, then to the pool's
+  configured/default worker request (fresh empty cluster). Client-sized (GUC)
+  workers can exceed any configured maximum, so sizing from observed spawns is
+  the only honest source. A spawn larger than one slot preempts several
+  placeholders — wrong sizing degrades to Karpenter latency, never a failure;
+- scale-up/refill is immediate; scale-down is LAZY (one slot per 10 minutes
+  while above target) and shape changes >20% replace placeholders in place, so
+  target/shape flapping never thrashes pods;
+- placeholder pods use a PriorityClass **below** the worker PriorityClass, so a
+  real worker spawn preempts them and schedules immediately; the evicted
+  placeholder triggers Karpenter to add a node in the background.
+- workers carry `karpenter.sh/do-not-disrupt` **only while busy** (set at pod
+  create — covering spawn/activate and the first session — re-added per
+  session, removed when parked hot-idle). With the worker nodepool on
+  `WhenEmptyOrUnderutilized`, Karpenter can consolidate nodes holding only
+  idle workers/placeholders, while a node running a query is never voluntarily
+  disrupted; pinning is bounded by query lifetime, not the worker TTL (which
+  would stall drift rollouts).
+
+Config: NONE beyond the PriorityClass names — headroom is enabled iff
+`DUCKGRES_K8S_PLACEHOLDER_PRIORITY_CLASS` is set (placeholders without a
+priority below the worker class would never be preempted, so the class is a
+hard prerequisite anyway); unset = disabled, existing placeholders are deleted.
+`DUCKGRES_K8S_HEADROOM_NODES` (constant node-sized mode) and
+`DUCKGRES_K8S_HEADROOM_PERCENT` (demand-proportional mode) are REMOVED: the
+constant mode hardcoded an r6gd node shape that over-reserved ~3× once workers
+shrank below node size, and the percent mode counted hot_idle workers as
+demand and so amplified any idle-worker leak into extra placeholders.
+Observability: `duckgres_headroom_slots_desired` / `_slots_cap` /
+`_peak_spawn_burst` / `_slot_cpu_millicores` / `_slot_memory_bytes` gauges —
+desired pinned at the cap means demand wants more headroom than the fleet
+ratio allows.
+
+## Config knobs (env-only K8s, per existing convention)
+
+Kept (client sizing + headroom): `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE`
+(master gate for the `duckgres.worker_cpu`/`worker_memory`/`worker_ttl` startup
+options), `DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU`/`_MAX_CPU`/`_MIN_MEMORY`/
+`_MAX_MEMORY` (clamps), `DUCKGRES_K8S_WORKER_MAX_TTL` (clamp ceiling) and
+`DUCKGRES_K8S_WORKER_DEFAULT_TTL` (the default for requests that specify no
+ttl — see the TTL resolution chain above),
+`DUCKGRES_K8S_PLACEHOLDER_IMAGE`/`_PRIORITY_CLASS` (the priority class doubles
+as the headroom enable switch; count/size knobs do not exist — both are
+derived from the spawn log, see "Headroom reconcile" above).
+
+Removed: all `DUCKGRES_K8S_*COLOCATED*`, `*WORKER_TIERS*`,
+`*ALLOW_CLIENT_EXCLUSIVE_NODE*`, `*SHARED_WARM_TARGET*`,
+`*DYNAMIC_WARM_CAPACITY*`, `*WARM_CAPACITY_*`, `*WARM_ACQUIRE_TIMEOUT*`,
+`*WORKER_EXCLUSIVE_NODE*` (the one-worker-per-node pod anti-affinity is gone;
+isolation comes from resource requests — workers are never BestEffort, falling
+back to the built-in default shape (8/16Gi) when neither the profile nor
+`DUCKGRES_K8S_WORKER_CPU_REQUEST`/`_MEMORY_REQUEST` set one, so co-scheduled
+workers cannot overcommit a node).
+
+## Testing
+
+- Unit: GUC parse/clamp/default; smallest-fitting reuse vs spawn; TTL reset on
+  query + reap after deadline; headroom controller target math (burst → count,
+  spawn-log → size, fleet-relative cap, lazy scale-down, shape-drift
+  replacement); gate/clamp. Spawn-log SQL: postgres round-trip in
+  `tests/configstore/spawn_log_postgres_test.go`.
+- e2e `harness.sh`: a query with `worker_cpu/memory/ttl` lands on a worker of
+  that size; a second query of a smaller size reuses it; after ttl the worker is
+  reaped; one-session-per-worker still holds. Headroom placeholders are NOT
+  exercised in the e2e job: the e2e CP deliberately sets no placeholder
+  PriorityClass — real placeholder pods would consume Karpenter capacity in the
+  shared mw-dev cluster and outlive the per-PR CP that owns them (nothing
+  deletes them after teardown). Covered by the fake-clientset unit tests above.
+
+## Rollout
+
+Build arm64 control-plane + worker images, push to ECR, deploy to **mw-dev only**
+(`tests/mw-dev/run.sh`), run harness, iterate. Never prod.

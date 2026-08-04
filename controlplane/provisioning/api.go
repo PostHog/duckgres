@@ -1,14 +1,18 @@
 package provisioning
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/internal/analytics"
 	"gorm.io/gorm"
 )
 
@@ -27,57 +31,115 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &s) && s.SQLState() == "23505"
 }
 
-// ducklingOrgIDPattern constrains org IDs that get a provisioned warehouse to a
-// single DNS-1123 label (lowercase alphanumerics + hyphens, start/end
-// alphanumeric). This is the shape every derived name needs:
-//   - the SNI prefix <org>.<managed-suffix> is a single DNS label already;
-//   - the Duckling CR / IAM role / S3 bucket / Lakekeeper CR names use the org
-//     ID verbatim (lowercased), so it must be a valid k8s/AWS name;
-//   - the Postgres identifier maps any non-[a-z0-9_] char to '_', which is only
-//     injective when the source charset excludes everything but hyphens.
-//
-// Validating here keeps the org ID → resource-name mappings collision-free.
+const (
+	// maxDucklingSlugOrgIDLength is the public Duckgres provisioning contract
+	// for non-UUID org IDs. It is intentionally stricter than most individual
+	// downstream limits: with the current managed-warehouse suffix "mw-prod-us",
+	// the S3 bucket name is:
+	//
+	//   posthog-duckling-<slug>-mw-prod-us
+	//
+	// S3 caps bucket names at 63 chars, leaving 35 chars for <slug>. That cap
+	// also leaves enough room for the other request-driven names derived from
+	// org ID today (Duckling k8s names, IAM roles, PgBouncer names,
+	// and Postgres identifiers). Canonical UUID org IDs are allowed separately
+	// because configstore.DucklingBucketName compacts them from 36 to 32 chars
+	// before building the S3 bucket name. If the managed bucket suffix grows
+	// beyond "mw-prod-us", lower this cap or validate the suffix at startup.
+	maxDucklingSlugOrgIDLength = 35
+)
+
+// ducklingOrgIDPattern constrains provisionable org IDs to a single DNS-1123
+// label (lowercase alphanumerics + hyphens, start/end alphanumeric). This keeps
+// SNI labels valid and makes the Postgres hyphen-to-underscore mapping
+// collision-free for names Duckgres derives from org ID.
 var ducklingOrgIDPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+
+// canonicalDucklingUUIDPattern matches the UUID-shaped org IDs PostHog sends.
+// These are longer than maxDucklingSlugOrgIDLength but safe because Duckgres
+// compacts UUID hyphens only for S3 bucket naming.
+var canonicalDucklingUUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func validateDucklingOrgID(orgID string) error {
+	if !ducklingOrgIDPattern.MatchString(orgID) {
+		return errors.New("org id must be a DNS-1123 label (lowercase alphanumerics and hyphens, starting and ending alphanumeric) so the derived resource names are valid and collision-free")
+	}
+	if !canonicalDucklingUUIDPattern.MatchString(orgID) && len(orgID) > maxDucklingSlugOrgIDLength {
+		return fmt.Errorf("org id must be a canonical UUID or a slug of at most %d characters", maxDucklingSlugOrgIDLength)
+	}
+	return nil
+}
 
 // Store defines the config store operations needed by the provisioning API.
 type Store interface {
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	GetOrg(orgID string) (*configstore.Org, error)
 	// Provision is the all-or-nothing entrypoint for POST /provision —
-	// wraps warehouse + root-user + optional Trino-opt-in writes in a
-	// single configstore transaction so partial failure rolls back
-	// cleanly. Use this for the public provision endpoint; the older
-	// per-step methods below are kept for the standalone surfaces
-	// (reset-password, enable/disable trino on an existing org).
+	// wraps warehouse + root-user writes in a single configstore
+	// transaction so partial failure rolls back cleanly. Use this for the
+	// public provision endpoint; the older per-step methods below are kept
+	// for the standalone surfaces (reset-password).
 	Provision(req ProvisionRequest) error
 	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
 	CreateOrgUser(orgID, username, passwordHash string) error
 	UpdateOrgUserPassword(orgID, username, passwordHash string) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 	IsDatabaseNameAvailable(name string) (bool, error)
-
-	// Trino lifecycle. EnableTrino is idempotent — re-enabling updates
-	// settings without flipping through a disabled state. DisableTrino
-	// leaves the row in place so the provisioner observes the transition
-	// and cleans up the catalog + password file entry on next reconcile.
-	EnableTrino(orgID string, settings configstore.TrinoSettings) error
-	DisableTrino(orgID string) error
+	// Team CRUD for the PostHog backend (duckgres_org_teams rows — config
+	// only, never warehouse data). ListOrgTeams returns
+	// gorm.ErrRecordNotFound for an unknown org. UpsertOrgTeam is the
+	// grandfather path: it MAY overwrite schema_name and the legacy table
+	// names of an existing row (see configstore.UpsertOrgTeamTx).
+	// DeleteOrgTeam enforces the last-team refusal (see
+	// configstore.DeleteOrgTeamTx).
+	ListOrgTeams(orgID string) ([]configstore.OrgTeam, error)
+	UpsertOrgTeam(orgID string, up configstore.OrgTeamUpsert) (*configstore.OrgTeam, error)
+	DeleteOrgTeam(orgID string, teamID int64) error
+	// Discovery backing (discovery.go): list live warehouses, batch-fetch
+	// their team rows, and the unfiltered change marker.
+	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
+	ListOrgTeamsByOrgIDs(orgIDs []string) ([]configstore.OrgTeam, error)
+	LatestConfigChange() (time.Time, error)
 }
 
 // RegisterAPI registers provisioning endpoints on the given router group.
-func RegisterAPI(r *gin.RouterGroup, store Store) {
-	h := &handler{store: store}
+// bucketSuffix is the env suffix used to compute the control-plane-owned
+// per-org s3bucket name at provision time (empty ⇒ the CP doesn't name buckets
+// and the composition derives).
+func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
+	h := &handler{store: store, bucketSuffix: bucketSuffix}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
 	r.POST("/orgs/:id/reset-password", h.resetPassword)
-	r.POST("/orgs/:id/trino", h.enableTrino)
-	r.DELETE("/orgs/:id/trino", h.disableTrino)
 	r.GET("/database-name/check", h.checkDatabaseName)
+	// Team CRUD: the PostHog backend manages the org's duckgres_org_teams
+	// rows through these (config only — deleting a team never touches
+	// warehouse data).
+	r.GET("/orgs/:id/teams", h.listOrgTeams)
+	r.POST("/orgs/:id/teams", h.upsertOrgTeam)
+	r.DELETE("/orgs/:id/teams/:team_id", h.deleteOrgTeam)
+}
+
+// RegisterDiscoveryAPI registers the read-only discovery endpoints for
+// external writers (millpond, viaduck) on their OWN router group — see
+// discovery.go for payload semantics. Deliberately separate from
+// RegisterAPI: the discovery group's auth accepts the scoped
+// read-only-secret (which must never reach the admin/provisioning
+// surface), so these routes must not be mounted behind the admin
+// middleware chain.
+func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
+	h := &handler{store: store}
+	r.GET("/warehouses", h.listWarehouses)
+	r.GET("/warehouse-team-ids", h.listWarehouseTeamIDs)
 }
 
 type handler struct {
 	store Store
+	// bucketSuffix is the env suffix (e.g. "mw-prod-us") used to compute the
+	// CP-owned s3bucket name; empty disables CP naming. See
+	// configstore.DucklingBucketName.
+	bucketSuffix string
 }
 
 // warehouseStatusResponse is the public-facing view of warehouse state.
@@ -93,6 +155,10 @@ type warehouseStatusResponse struct {
 	ReadyAt            *time.Time                                    `json:"ready_at,omitempty"`
 	FailedAt           *time.Time                                    `json:"failed_at,omitempty"`
 	Connection         *connectionDetails                            `json:"connection,omitempty"`
+	// Bucket is the authoritative per-org S3 bucket name the CP provisioned.
+	// Empty for external data stores or ducklings provisioned before CP-owned
+	// naming whose row hasn't been backfilled yet.
+	Bucket string `json:"bucket,omitempty"`
 }
 
 // connectionDetails is returned in status (without password) and in provision/reset-password (with password).
@@ -105,18 +171,24 @@ type connectionDetails struct {
 }
 
 type provisionRequest struct {
-	DatabaseName  string                 `json:"database_name"`
+	DatabaseName string `json:"database_name"`
+	// DefaultTeamID is a TRANSITIONAL alias for TeamID (the historical field
+	// name from when duckgres tracked a billing/default team). Treated
+	// exactly as team_id; remove once the PostHog backend sends team_id.
+	DefaultTeamID int64 `json:"default_team_id,omitempty"`
+	// TeamID is the org's first PostHog team — a JSON NUMBER, matching
+	// PostHog's integer Team.id (a quoted string is a 400 at decode time).
+	// REQUIRED when the provision creates a NEW org (400 otherwise — a
+	// warehouse cannot exist without a team; the row becomes the org's first
+	// duckgres_org_teams entry, no billing semantics attached). Optional on
+	// re-provision of an existing org: absent/0 leaves the stored teams
+	// untouched. SchemaName optionally overrides the conventional "team_<id>"
+	// warehouse schema for that first row; it requires a team id.
+	TeamID        int64                  `json:"team_id,omitempty"`
+	SchemaName    string                 `json:"schema_name,omitempty"`
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
 	DuckLake      *provisionDuckLakeReq  `json:"ducklake,omitempty"`
-	Iceberg       *provisionIcebergReq   `json:"iceberg,omitempty"`
-
-	// Trino is the opt-in flag for the customer-facing Trino cluster.
-	// Optional — when nil, the warehouse is provisioned with the existing
-	// PG-only behavior. When non-nil and Enabled=true, the provisioning
-	// handler additionally writes a ManagedWarehouseTrino row so the
-	// provisioner picks it up on the next reconcile.
-	Trino *provisionTrinoReq `json:"trino,omitempty"`
 }
 
 type provisionMetadataReq struct {
@@ -126,9 +198,9 @@ type provisionMetadataReq struct {
 	External *provisionExternalReq `json:"external,omitempty"`
 }
 
-// provisionDuckLakeReq toggles the DuckLake catalog. Independent of Iceberg and
-// of the metadata-store type: enable DuckLake, Iceberg, or both. At least one
-// catalog must be enabled.
+// provisionDuckLakeReq toggles the DuckLake catalog. Independent of the
+// metadata-store type; it must be enabled (a warehouse without a catalog has
+// nothing to attach).
 type provisionDuckLakeReq struct {
 	Enabled bool `json:"enabled"`
 }
@@ -151,46 +223,6 @@ type provisionDataStoreReq struct {
 	Type       string `json:"type"`
 	BucketName string `json:"bucket_name,omitempty"`
 	Region     string `json:"region,omitempty"`
-}
-
-// provisionIcebergReq toggles the per-tenant Lakekeeper Iceberg catalog. For
-// external metadata stores it's optional (enabled → iceberg+external, omitted
-// → ducklake+external); for cnpg-shard it's implied and always enabled.
-type provisionIcebergReq struct {
-	Enabled   bool   `json:"enabled"`
-	Namespace string `json:"namespace,omitempty"`
-}
-
-// provisionTrinoReq is the per-request Trino opt-in. Mirrored by the
-// standalone POST /orgs/:id/trino body (trinoRequest below) so both
-// surfaces accept the same shape.
-type provisionTrinoReq struct {
-	// Enabled flips Trino on for this org. False (or omitted) is a no-op:
-	// existing rows are not affected, so the provision endpoint can be
-	// retried with Trino={Enabled:false} without disabling a previously
-	// enabled org.
-	Enabled bool `json:"enabled"`
-
-	// Tier picks the resource-group limits applied to the org. Empty
-	// string is the default tier.
-	Tier string `json:"tier,omitempty"`
-}
-
-// trinoRequest is the body shape for POST /orgs/:id/trino (standalone
-// enable on an existing org). Mirrors provisionTrinoReq so callers can
-// use one schema for both surfaces.
-type trinoRequest struct {
-	Enabled bool   `json:"enabled"`
-	Tier    string `json:"tier,omitempty"`
-}
-
-// icebergNamespace returns the requested Iceberg namespace, or "" to let the
-// XRD default ("main") apply.
-func icebergNamespace(req *provisionIcebergReq) string {
-	if req == nil {
-		return ""
-	}
-	return req.Namespace
 }
 
 // resolveDataStore validates and normalizes the data-store request into the
@@ -222,8 +254,8 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if !ducklingOrgIDPattern.MatchString(orgID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be a DNS-1123 label (lowercase alphanumerics and hyphens, starting and ending alphanumeric) so the derived resource names are valid and collision-free"})
+	if err := validateDucklingOrgID(orgID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -237,14 +269,34 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// Catalogs are decoupled from the metadata backend: a duckling can run
-	// DuckLake, Iceberg, or both, on any of the three metadata stores. At least
-	// one catalog must be enabled (a warehouse with neither has nothing to
-	// attach).
+	// Resolve the transitional default_team_id alias and team_id into one
+	// effective team. Both fields keep working — the alias goes away once the
+	// PostHog backend sends team_id — but disagreement is a caller bug.
+	if req.TeamID != 0 && req.DefaultTeamID != 0 && req.TeamID != req.DefaultTeamID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("team_id (%d) and default_team_id (%d) disagree; send one, or the same value in both", req.TeamID, req.DefaultTeamID)})
+		return
+	}
+	effectiveTeamID := req.DefaultTeamID
+	if req.TeamID != 0 {
+		effectiveTeamID = req.TeamID
+	}
+	if req.SchemaName != "" {
+		if effectiveTeamID == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "schema_name requires team_id"})
+			return
+		}
+		if err := configstore.ValidateOrgTeamSchemaName(req.SchemaName); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	// The catalog is decoupled from the metadata backend: a duckling runs
+	// DuckLake on any of the metadata stores. It must be enabled (a warehouse
+	// without a catalog has nothing to attach).
 	ducklakeEnabled := req.DuckLake != nil && req.DuckLake.Enabled
-	icebergEnabled := req.Iceberg != nil && req.Iceberg.Enabled
-	if !ducklakeEnabled && !icebergEnabled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one of ducklake.enabled or iceberg.enabled must be true"})
+	if !ducklakeEnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ducklake.enabled must be true"})
 		return
 	}
 
@@ -254,21 +306,32 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
+	// Control-plane-owned bucket naming: for a fresh per-org bucket (s3bucket
+	// with no caller-supplied name) compute the name here, once, and pin it on
+	// the warehouse. It flows to the Duckling CR's spec.dataStore.bucketName
+	// (so the composition provisions exactly this bucket instead of deriving
+	// one) and back to the caller in the response below — so nothing downstream
+	// re-derives the name. No-op when bucketSuffix is unset (the composition
+	// derives, legacy behavior) or when the caller passed an explicit name.
+	if ds.Kind == "s3bucket" && ds.BucketName == "" {
+		ds.BucketName = configstore.DucklingBucketName(orgID, h.bucketSuffix)
+	}
+
 	warehouse := &configstore.ManagedWarehouse{
 		DataStore: ds,
 		DuckLake:  configstore.ManagedWarehouseDuckLake{Enabled: ducklakeEnabled},
+		// Stamp the authoritative Duckling CR name: the org ID verbatim. Org IDs
+		// are validated as lowercase DNS-1123 labels at this endpoint, so no
+		// transform is needed — and nothing downstream ever derives the name.
+		DucklingName: orgID,
 	}
-	if icebergEnabled {
-		warehouse.Iceberg = configstore.ManagedWarehouseIceberg{
-			Enabled:   true,
-			Backend:   configstore.IcebergBackendLakekeeper,
-			Namespace: icebergNamespace(req.Iceberg),
-		}
+	if warehouse.DucklingName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "duckling_name is required"})
+		return
 	}
-
-	// Metadata backend (the Postgres that hosts the DuckLake catalog and/or the
-	// Lakekeeper PG). Provisioning shape differs per type; the catalog choice
-	// above is orthogonal.
+	// Metadata backend (the Postgres that hosts the DuckLake catalog).
+	// Provisioning shape differs per type; the catalog choice above is
+	// orthogonal.
 	switch req.MetadataStore.Type {
 	case configstore.MetadataStoreKindCnpgShard:
 		// No per-claim config — the composition picks the active shard from
@@ -297,15 +360,6 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// orgID was already validated as a DNS-1123 label at the top of the handler
-	// (ducklingOrgIDPattern) — that's all the Trino catalog/group naming needs,
-	// since TrinoCatalogName sanitizes it injectively (org_<sanitize(Name)>_iceberg).
-	// No extra per-Trino constraint; org names are not numeric team_ids.
-	var trinoSettings *configstore.TrinoSettings
-	if req.Trino != nil && req.Trino.Enabled {
-		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier}
-	}
-
 	// Generate the root password. The plaintext is returned in this
 	// response only — it is never stored, only the bcrypt hash is
 	// persisted via the transactional Provision below.
@@ -320,16 +374,16 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// One transaction wraps warehouse + root user + optional Trino
-	// opt-in. Failure of any sub-step rolls the others back so the
-	// caller's retry sees the same starting state (no half-provisioned
-	// row blocking re-creation).
+	// One transaction wraps warehouse + root user. Failure of any
+	// sub-step rolls the others back so the caller's retry sees the same
+	// starting state (no half-provisioned row blocking re-creation).
 	if err := h.store.Provision(ProvisionRequest{
 		OrgID:        orgID,
 		DatabaseName: req.DatabaseName,
+		TeamID:       effectiveTeamID,
+		SchemaName:   req.SchemaName,
 		Warehouse:    warehouse,
 		RootUserHash: hash,
-		Trino:        trinoSettings,
 	}); err != nil {
 		// The warehouse-already-exists conflict is the only error
 		// shape that maps to 409. Everything else (DB write failure,
@@ -338,6 +392,20 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		// rewording the error message can't silently break the 409
 		// branch.
 		if errors.Is(err, ErrWarehouseNonTerminal) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		// Creating a NEW org requires team_id — a caller input problem, not
+		// a server failure. Decided in the store (only it knows whether the
+		// org exists), surfaced here as 400.
+		if errors.Is(err, ErrProvisionTeamRequired) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		// The provision team's schema_name collides with another team in the
+		// org (pre-checked in UpsertOrgTeamTx; the unique index catches the
+		// concurrent case below via isUniqueViolation).
+		if errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
@@ -352,89 +420,29 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusAccepted, gin.H{
+	// The handler only kicks off provisioning (the response is 202 Accepted);
+	// the warehouse is not usable yet. The terminal outcome —
+	// warehouse_provision_success / warehouse_provision_failed — is emitted by
+	// the async provisioner controller when the warehouse reaches Ready / Failed.
+	analytics.Default().Capture("warehouse_provision_begin", orgID, map[string]any{
+		"database_name":    req.DatabaseName,
+		"metadata_store":   string(req.MetadataStore.Type),
+		"ducklake_enabled": ducklakeEnabled,
+	})
+
+	resp := gin.H{
 		"status":   "provisioning started",
 		"org":      orgID,
 		"username": "root",
 		"password": plainPassword,
-	})
-}
-
-// enableTrino handles POST /orgs/:id/trino — opting an existing org
-// (provisioned previously without Trino) into the customer Trino cluster.
-// Idempotent: re-enabling updates the tier without flipping through a
-// disabled state.
-//
-// Note this does NOT require the org's ManagedWarehouse to exist — the
-// Trino provisioner gates on its own readiness signal (Iceberg-Ready in
-// Lakekeeper), not on the warehouse top-level state. Callers that need
-// the warehouse first should call /provision before /trino.
-func (h *handler) enableTrino(c *gin.Context) {
-	orgID := c.Param("id")
-	if orgID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
-		return
 	}
-	if !ducklingOrgIDPattern.MatchString(orgID) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org id must be a DNS-1123 label (lowercase alphanumerics + hyphens); got: " + orgID})
-		return
+	// Return the authoritative bucket name synchronously with the password, so
+	// callers persist the name the CP provisioned instead of re-deriving it.
+	// Empty (CP naming disabled, or external data store) is omitted.
+	if warehouse.DataStore.BucketName != "" {
+		resp["bucket"] = warehouse.DataStore.BucketName
 	}
-
-	var req trinoRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if !req.Enabled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true; use DELETE to disable"})
-		return
-	}
-
-	// Preflight: the FK on ManagedWarehouseTrino requires the Org row
-	// to exist. Without this check, EnableTrino's INSERT hits a
-	// foreign-key violation and we'd return a 500 with the raw Postgres
-	// error. 404 is the right shape: "the resource you're trying to
-	// modify doesn't exist." Callers that need to /provision first
-	// see the clear 404 here rather than parsing an FK error string.
-	if _, err := h.store.GetOrg(orgID); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "org not found; call /provision first"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier}); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusAccepted, gin.H{
-		"status": "trino enable queued",
-		"org":    orgID,
-		"tier":   req.Tier,
-	})
-}
-
-// disableTrino handles DELETE /orgs/:id/trino — opting the org out of
-// the customer Trino cluster. The row is kept (with Enabled=false) so
-// the provisioner observes the transition and removes the catalog +
-// password file entry on its next reconcile tick. Idempotent.
-func (h *handler) disableTrino(c *gin.Context) {
-	orgID := c.Param("id")
-	if orgID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
-		return
-	}
-	if err := h.store.DisableTrino(orgID); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusAccepted, gin.H{
-		"status": "trino disable queued",
-		"org":    orgID,
-	})
+	c.JSON(http.StatusAccepted, resp)
 }
 
 func (h *handler) deprovisionWarehouse(c *gin.Context) {
@@ -451,32 +459,11 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 	var err error
 	for _, state := range deprovisionableStates {
 		if err = h.store.SetWarehouseDeleting(orgID, state); err == nil {
-			// Also disable Trino so the reconcile loop tears down
-			// the customer-Trino projections (catalog, password/
-			// group file entries, OPA bundle ownership, resource
-			// group). Without this, deprovisioning a warehouse
-			// leaves the Trino row enabled forever — the CASCADE
-			// only fires when the Org row itself is deleted, and
-			// `reconcileDeleting` doesn't touch the Org row. We'd
-			// otherwise keep projecting the deprovisioned org's
-			// credentials into Trino indefinitely.
-			//
-			// Best-effort: failure to disable Trino doesn't abort
-			// the warehouse deprovision (the warehouse state is
-			// already moved to Deleting). Operator can retry by
-			// calling DELETE /orgs/:id/trino directly.
-			if disableErr := h.store.DisableTrino(orgID); disableErr != nil {
-				// Log via the response — there's no slog on the
-				// gin handler, but the caller will see the warning
-				// alongside the 202. Soft-fail so the warehouse
-				// deprovision still proceeds.
-				c.JSON(http.StatusAccepted, gin.H{
-					"status":  "deprovisioning started",
-					"org":     orgID,
-					"warning": "failed to disable trino in the same call; retry DELETE /orgs/:id/trino: " + disableErr.Error(),
-				})
-				return
-			}
+			// As with provisioning, this only starts the teardown. The terminal
+			// warehouse_deprovision_success / warehouse_deprovision_failed events
+			// are emitted by the async provisioner controller as it deletes the
+			// underlying resources.
+			analytics.Default().Capture("warehouse_deprovision_begin", orgID, nil)
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}
@@ -512,6 +499,7 @@ func (h *handler) getWarehouseStatus(c *gin.Context) {
 		SecretsState:       warehouse.SecretsState,
 		ReadyAt:            warehouse.ReadyAt,
 		FailedAt:           warehouse.FailedAt,
+		Bucket:             warehouse.DataStore.BucketName,
 	}
 
 	if warehouse.State == configstore.ManagedWarehouseStateReady {
@@ -561,6 +549,10 @@ func (h *handler) resetPassword(c *gin.Context) {
 		return
 	}
 
+	analytics.Default().Capture("warehouse_password_reset", orgID, map[string]any{
+		"username": "root",
+	})
+
 	c.JSON(http.StatusOK, gin.H{
 		"username": "root",
 		"password": plainPassword,
@@ -581,4 +573,160 @@ func (h *handler) checkDatabaseName(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"name": name, "available": available})
+}
+
+// --- Org teams (duckgres_org_teams CRUD for the PostHog backend) ---
+
+// orgTeamUpsertRequest is the POST /orgs/:id/teams body. Pointer fields are
+// presence-aware: absent preserves the stored value on an existing row (and
+// takes the documented default on a new one). The legacy *_name fields exist
+// for grandfathering pre-existing teams whose warehouse tables predate the
+// schema-per-team convention; NULL means "derive from schema_name".
+type orgTeamUpsertRequest struct {
+	TeamID     int64  `json:"team_id"`
+	SchemaName string `json:"schema_name"`
+	Enabled    *bool  `json:"enabled,omitempty"`
+	// BackfillEnabled: absent = TRUE on insert / preserve on update. The
+	// column is NOT NULL DEFAULT TRUE (migration 000028), so an explicit null
+	// is a 400 — there is no "unset" to clear back to.
+	BackfillEnabled       *bool   `json:"backfill_enabled,omitempty"`
+	EventsTableName       *string `json:"events_table_name,omitempty"`
+	PersonsTableName      *string `json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate is PostHog's cached backfill floor as a "YYYY-MM-DD"
+	// string (see configstore.OrgTeam.EarliestEventDate). Tri-state: an absent
+	// key preserves the stored value; an explicit null (or "") clears it back
+	// to NULL so the PostHog sensor re-resolves it; a value must parse.
+	EarliestEventDate *string `json:"earliest_event_date,omitempty"`
+}
+
+func (h *handler) listOrgTeams(c *gin.Context) {
+	orgID := c.Param("id")
+	org, err := h.store.GetOrg(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	teams, err := h.store.ListOrgTeams(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"teams":                             teams,
+		"data_imports_table_naming_version": org.DataImportsTableNamingVersion,
+	})
+}
+
+// upsertOrgTeam creates or overwrites one (org, team) row. This endpoint IS
+// the grandfather path: upserting an existing (org, team) MAY overwrite
+// schema_name and the legacy table names, because the PostHog-side backfill
+// needs to replace the migration's conventional "team_<id>" placeholder with
+// the team's real pre-existing names. Schema immutability is therefore NOT
+// enforced here — it is enforced on the user-facing surfaces (the admin API
+// update rejects schema changes).
+func (h *handler) upsertOrgTeam(c *gin.Context) {
+	orgID := c.Param("id")
+
+	// Read the body once: the typed struct gives values, the raw key set gives
+	// presence, so an explicit `"earliest_event_date": null` (clear) is
+	// distinguishable from an absent key (preserve) — same idiom as the admin
+	// team PUT.
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req orgTeamUpsertRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawFields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.TeamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id)"})
+		return
+	}
+	if err := configstore.ValidateOrgTeamSchemaName(req.SchemaName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if _, ok := rawFields["backfill_enabled"]; ok && req.BackfillEnabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "backfill_enabled cannot be null (the column always has a value); pass true or false, or omit the field to preserve it"})
+		return
+	}
+	_, earliestSet := rawFields["earliest_event_date"]
+	var earliest *configstore.EventDate
+	if earliestSet && req.EarliestEventDate != nil && *req.EarliestEventDate != "" {
+		d, err := configstore.ParseEventDate(*req.EarliestEventDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "earliest_event_date " + err.Error()})
+			return
+		}
+		earliest = &d
+	}
+
+	team, err := h.store.UpsertOrgTeam(orgID, configstore.OrgTeamUpsert{
+		TeamID:                req.TeamID,
+		SchemaName:            req.SchemaName,
+		Enabled:               req.Enabled,
+		BackfillEnabled:       req.BackfillEnabled,
+		EventsTableName:       req.EventsTableName,
+		PersonsTableName:      req.PersonsTableName,
+		SchemaDataImportsName: req.SchemaDataImportsName,
+		EarliestEventDateSet:  earliestSet,
+		EarliestEventDate:     earliest,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		case errors.Is(err, configstore.ErrOrgTeamSchemaConflict), isUniqueViolation(err):
+			// The pre-check catches the common case with a clean message; the
+			// unique (org_id, schema_name) index catches the concurrent one.
+			c.JSON(http.StatusConflict, gin.H{"error": configstore.ErrOrgTeamSchemaConflict.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, team)
+}
+
+// deleteOrgTeam removes one (org, team) CONFIG row — never warehouse data.
+// Deleting the org's last team is refused (an org must always have at least
+// one team). Buffered usage buckets are not touched — the stamped team_id is
+// informational; attribution is owned by the external billing service.
+func (h *handler) deleteOrgTeam(c *gin.Context) {
+	orgID := c.Param("id")
+	teamID, err := strconv.ParseInt(c.Param("team_id"), 10, 64)
+	if err != nil || teamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
+		return
+	}
+
+	if err := h.store.DeleteOrgTeam(orgID, teamID); err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrOrgTeamNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org team not found"})
+		case errors.Is(err, configstore.ErrLastOrgTeam):
+			c.JSON(http.StatusConflict, gin.H{"error": configstore.ErrLastOrgTeam.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": teamID, "org": orgID})
 }

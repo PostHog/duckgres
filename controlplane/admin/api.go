@@ -9,15 +9,27 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 var errWarehousePayloadNotAllowed = errors.New("warehouse payload must be updated via /orgs/:id/warehouse")
+
+// The teams association is read-only through the org endpoints: team rows are
+// managed via the dedicated team routes (POST /teams, PUT/DELETE
+// /orgs/:id/teams/:team_id), never inline on the org payload.
+var errOrgTeamsPayloadNotAllowed = errors.New("teams cannot be set directly on the org payload; use the team endpoints")
+
+var errWarehouseStillExists = errors.New("managed warehouse still exists for org")
 
 // maxWarehousePutBodyBytes caps the admin PUT body. Warehouse payloads are
 // under 10 KB in practice; 1 MiB leaves room for future fields while keeping
@@ -30,6 +42,9 @@ type WorkerStatus struct {
 	Org            string `json:"org"`
 	ActiveSessions int    `json:"active_sessions"`
 	Status         string `json:"status"`
+	CPU            string `json:"cpu"`
+	Memory         string `json:"memory"`
+	TTLSeconds     int    `json:"ttl_seconds"`
 }
 
 // SessionStatus represents an active session for the API.
@@ -37,6 +52,7 @@ type SessionStatus struct {
 	PID      int32  `json:"pid"`
 	WorkerID int    `json:"worker_id"`
 	Org      string `json:"org"`
+	User     string `json:"user"`
 	Protocol string `json:"protocol"`
 }
 
@@ -54,7 +70,6 @@ type OrgStatus struct {
 	Workers        int    `json:"workers"`
 	ActiveSessions int    `json:"active_sessions"`
 	MaxWorkers     int    `json:"max_workers"`
-	MemoryBudget   string `json:"memory_budget"`
 }
 
 // OrgStackInfo provides info about an org's live state.
@@ -69,12 +84,21 @@ type OrgStackInfo interface {
 }
 
 // RegisterAPI registers all admin REST endpoints on the given router group.
-func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo) {
-	registerAPIWithStore(r, newGormAPIStore(store), info)
+// fetcher (may be nil) aggregates per-CP live state (sessions/workers) across
+// replicas so the dashboard shows cluster-wide numbers instead of one CP's slice.
+func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo, fetcher PeerFetcher) {
+	registerAPIWithStore(r, newGormAPIStore(store), info, fetcher)
+	// Generic read-only models explorer (sidebar + table + detail UI). Reads
+	// the concrete store directly because it needs the runtime schema name and
+	// raw DB for tables the typed apiStore interface doesn't surface.
+	registerModelsAPI(r, store)
+	// Admin-only Operators management (the admin-console access list). Each
+	// route self-gates with RequireAdmin; mutations are audited via the group.
+	registerOperatorsAPI(r, store)
 }
 
-func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo) {
-	h := &apiHandler{store: store, info: info}
+func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo, fetcher PeerFetcher) {
+	h := &apiHandler{store: store, info: info, fetcher: fetcher}
 
 	// Orgs CRUD
 	r.GET("/orgs", h.listOrgs)
@@ -89,12 +113,33 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo)
 	// run without ever touching the config-store DB directly.
 	r.PATCH("/orgs/:id/warehouse/pinning", h.patchTenantPinning)
 
+	// Org teams (duckgres_org_teams). The per-org list/upsert/delete routes
+	// (GET/POST /orgs/:id/teams, DELETE /orgs/:id/teams/:team_id) are
+	// registered by the provisioning API on this same group — gin refuses
+	// duplicate routes, so the admin surface adds only what provisioning
+	// doesn't have: the cross-org list, a CREATE-ONLY POST (org_id in the
+	// body, mirroring POST /users), and the update. The PUT is the operator
+	// break-glass: it can edit EVERY team setting, including schema_name and
+	// the legacy table-name overrides — schema immutability is a rule for the
+	// user-facing product flows, not for operators repairing rows here.
+	r.GET("/teams", h.listAllOrgTeams)
+	r.POST("/teams", h.createOrgTeam)
+	r.PUT("/orgs/:id/teams/:team_id", h.updateOrgTeam)
+	// The two project-scoped logins for a team. They are separate credentials
+	// (distinct usernames, one of each per team) so a caller picks read-only or
+	// read/write by which one it connects with, and minting a writer never
+	// widens the reader the PostHog SQL editor already uses.
+	r.PUT("/orgs/:id/teams/:team_id/project-reader", h.upsertProjectReader)
+	r.PUT("/orgs/:id/teams/:team_id/project-user", h.upsertProjectUser)
+
 	// Users CRUD
 	r.GET("/users", h.listUsers)
 	r.POST("/users", h.createUser)
 	r.GET("/orgs/:id/users/:username", h.getUser)
 	r.PUT("/orgs/:id/users/:username", h.updateUser)
 	r.DELETE("/orgs/:id/users/:username", h.deleteUser)
+	// Peer-only fan-out target: see reloadSnapshot below.
+	r.POST("/internal/reload-snapshot", h.reloadSnapshot)
 
 	// Workers (read-only)
 	r.GET("/workers", h.listWorkers)
@@ -102,32 +147,47 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo)
 	// Sessions (read-only)
 	r.GET("/sessions", h.listSessions)
 
-	// Config singletons
-	r.GET("/config/global", h.getGlobalConfig)
-	r.PUT("/config/global", h.updateGlobalConfig)
-	r.GET("/config/ducklake", h.getDuckLakeConfig)
-	r.PUT("/config/ducklake", h.updateDuckLakeConfig)
-	r.GET("/config/ratelimit", h.getRateLimitConfig)
-	r.PUT("/config/ratelimit", h.updateRateLimitConfig)
-	r.GET("/config/querylog", h.getQueryLogConfig)
-	r.PUT("/config/querylog", h.updateQueryLogConfig)
-
 	// Overview
 	r.GET("/status", h.getClusterStatus)
 }
 
 type apiStore interface {
 	ListOrgs() ([]configstore.Org, error)
-	CreateOrg(org *configstore.Org) error
+	// CreateOrg creates the org row AND its required first team row (plain —
+	// no billing semantics) in one transaction; the handler validates
+	// teamID/schemaName before calling.
+	CreateOrg(org *configstore.Org, teamID int64, schemaName string) error
 	GetOrg(name string) (*configstore.Org, error)
+	// UpdateOrg persists the merged org row.
 	UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error)
 	DeleteOrg(name string) (bool, error)
+
+	// Org teams. CreateOrgTeam is create-only (the admin surface never
+	// overwrites an existing row); it returns errOrgTeamExists /
+	// configstore.ErrOrgTeamSchemaConflict for the two conflict shapes,
+	// gorm.ErrRecordNotFound for an unknown org. UpdateOrgTeam applies the
+	// presence-aware orgTeamUpdate (every column is editable — operator
+	// break-glass); it returns the row as it was BEFORE the update alongside
+	// the stored result so the handler can audit old → new per field. A
+	// schema_name change that collides with another team in the org returns
+	// configstore.ErrOrgTeamSchemaConflict. Per-org list and delete are
+	// served by the provisioning API's routes on the same router group
+	// (identical rules — configstore.DeleteOrgTeamTx).
+	ListAllOrgTeams() ([]configstore.OrgTeam, error)
+	CreateOrgTeam(orgID string, team *configstore.OrgTeam) error
+	UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (prev, stored *configstore.OrgTeam, err error)
 
 	ListUsers() ([]configstore.OrgUser, error)
 	CreateUser(user *configstore.OrgUser) error
 	GetUser(orgID, username string) (*configstore.OrgUser, error)
-	UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error)
+	UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error)
 	DeleteUser(orgID, username string) (bool, error)
+	// UpsertProjectLogin creates or rotates one team-scoped login. accessMode
+	// selects the capability (configstore.OrgUserAccessModeProjectReader or
+	// …ProjectUser); the row is otherwise identical, and a per-mode partial
+	// unique index keeps at most one of each per team. Returns
+	// configstore.ErrProjectTeamUnavailable when the team is missing/disabled.
+	UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error)
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
@@ -139,14 +199,11 @@ type apiStore interface {
 	// the org doesn't exist.
 	MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error)
 
-	GetGlobalConfig() (configstore.GlobalConfig, error)
-	SaveGlobalConfig(cfg *configstore.GlobalConfig) error
-	GetDuckLakeConfig() (configstore.DuckLakeConfig, error)
-	SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error
-	GetRateLimitConfig() (configstore.RateLimitConfig, error)
-	SaveRateLimitConfig(cfg *configstore.RateLimitConfig) error
-	GetQueryLogConfig() (configstore.QueryLogConfig, error)
-	SaveQueryLogConfig(cfg *configstore.QueryLogConfig) error
+	// ReloadSnapshot forces this replica's in-memory config snapshot to reload
+	// from the config-store DB immediately, bypassing the poll interval. Used
+	// by createUser/updateUser/deleteUser so a write is authable on this
+	// replica the instant the request returns — see notifyPeersOfChange.
+	ReloadSnapshot() error
 }
 
 type gormAPIStore struct {
@@ -163,20 +220,31 @@ func (s *gormAPIStore) db() *gorm.DB {
 
 func (s *gormAPIStore) ListOrgs() ([]configstore.Org, error) {
 	var orgs []configstore.Org
-	if err := s.db().Preload("Users").Preload("Warehouse").Find(&orgs).Error; err != nil {
+	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").Find(&orgs).Error; err != nil {
 		return nil, err
 	}
 	return orgs, nil
 }
 
-func (s *gormAPIStore) CreateOrg(org *configstore.Org) error {
+func (s *gormAPIStore) CreateOrg(org *configstore.Org, teamID int64, schemaName string) error {
 	org.Warehouse = nil
-	return s.db().Omit("Warehouse").Create(org).Error
+	// One transaction: org row + its first team row (same contract as the
+	// provisioning path — an org cannot exist without a team).
+	return s.db().Transaction(func(tx *gorm.DB) error {
+		if err := tx.Omit("Warehouse", "Teams").Create(org).Error; err != nil {
+			return err
+		}
+		_, err := configstore.UpsertOrgTeamTx(tx, org.Name, configstore.OrgTeamUpsert{
+			TeamID:     teamID,
+			SchemaName: schemaName,
+		})
+		return err
+	})
 }
 
 func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 	var org configstore.Org
-	if err := s.db().Preload("Users").Preload("Warehouse").First(&org, "name = ?", name).Error; err != nil {
+	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").First(&org, "name = ?", name).Error; err != nil {
 		return nil, err
 	}
 	return &org, nil
@@ -184,18 +252,18 @@ func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 
 func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configstore.Org, bool, error) {
 	fields := map[string]interface{}{
-		"max_workers":     updates.MaxWorkers,
-		"memory_budget":   updates.MemoryBudget,
-		"idle_timeout_s":  updates.IdleTimeoutS,
-		"max_connections": updates.MaxConnections,
+		"max_workers": updates.MaxWorkers,
+		"max_vcpus":   updates.MaxVCPUs,
+		// Org default worker profile: written unconditionally so an explicit
+		// empty string CLEARS the default (the handler's presence-merge keeps
+		// omitted fields at their stored values before this runs).
+		"default_worker_cpu":          updates.DefaultWorkerCPU,
+		"default_worker_memory":       updates.DefaultWorkerMemory,
+		"default_worker_ttl":          updates.DefaultWorkerTTL,
+		"default_worker_min_hot_idle": updates.DefaultWorkerMinHotIdle,
 	}
-	// Only update resource fields when explicitly provided to avoid clearing
-	// previously-set values when the caller omits them from the JSON payload.
-	if updates.WorkerCPURequest != "" {
-		fields["worker_cpu_request"] = updates.WorkerCPURequest
-	}
-	if updates.WorkerMemoryRequest != "" {
-		fields["worker_memory_request"] = updates.WorkerMemoryRequest
+	if updates.DataImportsTableNamingVersion != "" {
+		fields["data_imports_table_naming_version"] = updates.DataImportsTableNamingVersion
 	}
 	// HostnameAlias is *string: nil = preserve, "" = clear (NULL), "x" = set.
 	// NULL releases the unique-index slot so other orgs can take that alias.
@@ -206,11 +274,24 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 			fields["hostname_alias"] = *updates.HostnameAlias
 		}
 	}
-	result := s.db().Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
-	if result.Error != nil {
-		return nil, false, result.Error
+	found := false
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		// Serialize with org connection admission (request-owned leases read
+		// org limits under this lock) — see LockOrgConnectionAdmissionTx.
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, name); err != nil {
+			return err
+		}
+		result := tx.Model(&configstore.Org{}).Where("name = ?", name).Updates(fields)
+		if result.Error != nil {
+			return result.Error
+		}
+		found = result.RowsAffected > 0
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
 	}
-	if result.RowsAffected == 0 {
+	if !found {
 		return nil, false, nil
 	}
 	org, err := s.GetOrg(name)
@@ -223,6 +304,31 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 	returnRows := int64(0)
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, name); err != nil {
+			return err
+		}
+
+		// Deleting an org while a managed warehouse row is in a non-terminal
+		// state would leak the Duckling CR + AWS infra behind it, so those
+		// still block deletion. But deprovisioning does NOT remove the
+		// warehouse row — the provisioner tears the infra down and leaves the
+		// row in the terminal "deleted" state (controller.go reconcileDeleting).
+		// A "deleted" row means the infra is gone, so cascade it away here and
+		// let the org (and its unique database_name) be released. Without this,
+		// a fully deprovisioned org could never be deleted and its
+		// database_name would be squatted forever.
+		var liveWarehouses int64
+		if err := tx.Model(&configstore.ManagedWarehouse{}).
+			Where("org_id = ? AND state <> ?", name, configstore.ManagedWarehouseStateDeleted).
+			Count(&liveWarehouses).Error; err != nil {
+			return err
+		}
+		if liveWarehouses > 0 {
+			return errWarehouseStillExists
+		}
+		if err := tx.Where("org_id = ?", name).Delete(&configstore.ManagedWarehouse{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("org_id = ?", name).Delete(&configstore.OrgUser{}).Error; err != nil {
 			return err
 		}
@@ -237,6 +343,164 @@ func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 		return false, err
 	}
 	return returnRows > 0, nil
+}
+
+// errOrgTeamExists distinguishes the (org, team) primary-key conflict from
+// the schema-name conflict on the admin create endpoint — the admin surface
+// never overwrites an existing row (that's the internal provisioning
+// grandfather path), so an existing row is a 409, not an upsert.
+var errOrgTeamExists = errors.New("team already exists in this org")
+
+// orgTeamUpdate carries the admin-editable fields of one org team — every
+// column, this is the operator break-glass surface. Pointer fields are
+// presence-aware (nil = preserve). The *Set booleans distinguish an explicit
+// JSON null (clear to unset/NULL) from an absent key for the nullable columns.
+type orgTeamUpdate struct {
+	// SchemaName: nil = preserve. A non-nil value is the operator override —
+	// validated by the handler, refused with ErrOrgTeamSchemaConflict when
+	// another team in the org already uses it. Changing it does NOT move any
+	// warehouse data; tables under the old schema are not renamed.
+	SchemaName *string
+	Enabled    *bool
+	// Backfill: nil = preserve. The column is NOT NULL (migration 000028), so
+	// there is no clear path — the handler rejects an explicit null.
+	Backfill *bool
+	// Legacy explicit table names for grandfathered teams (NULL = derive from
+	// schema_name). XSet + nil value clears the column back to NULL.
+	EventsTableNameSet       bool
+	EventsTableName          *string
+	PersonsTableNameSet      bool
+	PersonsTableName         *string
+	SchemaDataImportsNameSet bool
+	SchemaDataImportsName    *string
+	// EarliestEventDate: PostHog's cached backfill floor (a cache owned by
+	// PostHog's sensor — see configstore.OrgTeam.EarliestEventDate). Set + nil
+	// clears the column back to NULL, making the sensor re-resolve it.
+	EarliestEventDateSet bool
+	EarliestEventDate    *configstore.EventDate
+}
+
+func (s *gormAPIStore) ListAllOrgTeams() ([]configstore.OrgTeam, error) {
+	var teams []configstore.OrgTeam
+	if err := s.db().Order("org_id, team_id").Find(&teams).Error; err != nil {
+		return nil, err
+	}
+	return teams, nil
+}
+
+func (s *gormAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) error {
+	return s.db().Transaction(func(tx *gorm.DB) error {
+		var orgCount int64
+		if err := tx.Model(&configstore.Org{}).Where("name = ?", orgID).Count(&orgCount).Error; err != nil {
+			return err
+		}
+		if orgCount == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		var dup int64
+		if err := tx.Model(&configstore.OrgTeam{}).
+			Where("org_id = ? AND team_id = ?", orgID, team.TeamID).Count(&dup).Error; err != nil {
+			return err
+		}
+		if dup > 0 {
+			return errOrgTeamExists
+		}
+		var schemaClash int64
+		if err := tx.Model(&configstore.OrgTeam{}).
+			Where("org_id = ? AND schema_name = ?", orgID, team.SchemaName).Count(&schemaClash).Error; err != nil {
+			return err
+		}
+		if schemaClash > 0 {
+			return configstore.ErrOrgTeamSchemaConflict
+		}
+		team.OrgID = orgID
+		// Capture intent BEFORE Create: gorm's RETURNING write-back stamps
+		// the DB row (enabled defaulted TRUE) back onto the struct, so the
+		// post-Create value lies about what the caller asked for.
+		wantDisabled := !team.Enabled
+		if err := tx.Create(team).Error; err != nil {
+			return err
+		}
+		// Enabled carries gorm's `default:true` tag: a zero-valued (false)
+		// field is omitted from the INSERT and the DB default TRUE wins —
+		// the same pitfall fixed in configstore.UpsertOrgTeamTx, on this
+		// surface reachable via POST /teams {"enabled":false}. Force the
+		// column explicitly. Pinned by TestAdminCreateOrgTeamDisabledPostgres.
+		if wantDisabled {
+			if err := tx.Model(&configstore.OrgTeam{}).
+				Where("org_id = ? AND team_id = ?", orgID, team.TeamID).
+				Update("enabled", false).Error; err != nil {
+				return err
+			}
+			team.Enabled = false // undo the RETURNING write-back for the caller
+		}
+		return nil
+	})
+}
+
+func (s *gormAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, *configstore.OrgTeam, error) {
+	var prev, stored configstore.OrgTeam
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		var team configstore.OrgTeam
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&team, "org_id = ? AND team_id = ?", orgID, teamID).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return configstore.ErrOrgTeamNotFound
+		}
+		if err != nil {
+			return err
+		}
+		prev = team
+
+		fields := map[string]interface{}{"updated_at": gorm.Expr("now()")}
+		if upd.SchemaName != nil && *upd.SchemaName != team.SchemaName {
+			// Pre-check the per-org schema uniqueness for a clean error; the
+			// unique (org_id, schema_name) index still backs it — a concurrent
+			// writer that slips past the check fails with a 23505 (same
+			// contract as configstore.UpsertOrgTeamTx).
+			var clash int64
+			if err := tx.Model(&configstore.OrgTeam{}).
+				Where("org_id = ? AND schema_name = ? AND team_id <> ?", orgID, *upd.SchemaName, teamID).
+				Count(&clash).Error; err != nil {
+				return err
+			}
+			if clash > 0 {
+				return configstore.ErrOrgTeamSchemaConflict
+			}
+			fields["schema_name"] = *upd.SchemaName
+		}
+		if upd.Enabled != nil {
+			fields["enabled"] = *upd.Enabled
+		}
+		if upd.Backfill != nil {
+			fields["backfill_enabled"] = *upd.Backfill
+		}
+		if upd.EventsTableNameSet {
+			fields["events_table_name"] = upd.EventsTableName
+		}
+		if upd.PersonsTableNameSet {
+			fields["persons_table_name"] = upd.PersonsTableName
+		}
+		if upd.SchemaDataImportsNameSet {
+			fields["schema_data_imports_name"] = upd.SchemaDataImportsName
+		}
+		if upd.EarliestEventDateSet {
+			fields["earliest_event_date"] = upd.EarliestEventDate
+		}
+		if len(fields) > 1 {
+			if err := tx.Model(&configstore.OrgTeam{}).
+				Where("org_id = ? AND team_id = ?", orgID, teamID).
+				Updates(fields).Error; err != nil {
+				return err
+			}
+		}
+
+		return tx.First(&stored, "org_id = ? AND team_id = ?", orgID, teamID).Error
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return &prev, &stored, nil
 }
 
 func (s *gormAPIStore) ListUsers() ([]configstore.OrgUser, error) {
@@ -259,7 +523,7 @@ func (s *gormAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &user, nil
 }
 
-func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error) {
+func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
@@ -267,8 +531,8 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	if passthrough != nil {
 		updates["passthrough"] = *passthrough
 	}
-	if defaultCatalog != nil {
-		updates["default_catalog"] = *defaultCatalog
+	if maxVCPUs != nil {
+		updates["max_vcpus"] = *maxVCPUs
 	}
 	if len(updates) == 0 {
 		// Nothing to change — return the current row so callers can still
@@ -282,11 +546,25 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 		}
 		return user, true, nil
 	}
-	result := s.db().Model(&configstore.OrgUser{}).Where("org_id = ? AND username = ?", orgID, username).Updates(updates)
-	if result.Error != nil {
-		return nil, false, result.Error
+	found := false
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+
+		result := tx.Model(&configstore.OrgUser{}).
+			Where("org_id = ? AND username = ?", orgID, username).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		found = result.RowsAffected > 0
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
 	}
-	if result.RowsAffected == 0 {
+	if !found {
 		return nil, false, nil
 	}
 	user, err := s.GetUser(orgID, username)
@@ -297,11 +575,86 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 }
 
 func (s *gormAPIStore) DeleteUser(orgID, username string) (bool, error) {
-	result := s.db().Where("org_id = ? AND username = ?", orgID, username).Delete(&configstore.OrgUser{})
-	if result.Error != nil {
-		return false, result.Error
+	found := false
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+
+		result := tx.Where("org_id = ? AND username = ?", orgID, username).Delete(&configstore.OrgUser{})
+		if result.Error != nil {
+			return result.Error
+		}
+		found = result.RowsAffected > 0
+		return nil
+	})
+	return found, err
+}
+
+func (s *gormAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error) {
+	if !configstore.IsProjectScopedAccessMode(accessMode) {
+		return nil, fmt.Errorf("access mode %q is not project-scoped", accessMode)
 	}
-	return result.RowsAffected > 0, nil
+	var stored configstore.OrgUser
+	err := s.db().Transaction(func(tx *gorm.DB) error {
+		var team configstore.OrgTeam
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&team, "org_id = ? AND team_id = ? AND enabled IS TRUE", orgID, teamID,
+		).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return configstore.ErrProjectTeamUnavailable
+			}
+			return err
+		}
+		passwordHash := ""
+		var existing configstore.OrgUser
+		existingResult := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&existing, "org_id = ? AND username = ?", orgID, username,
+		)
+		if existingResult.Error == nil && bcrypt.CompareHashAndPassword([]byte(existing.Password), []byte(password)) == nil {
+			passwordHash = existing.Password
+		} else if existingResult.Error != nil && !errors.Is(existingResult.Error, gorm.ErrRecordNotFound) {
+			return existingResult.Error
+		} else {
+			var err error
+			passwordHash, err = configstore.HashPassword(password)
+			if err != nil {
+				return err
+			}
+		}
+		boundTeamID := teamID
+		user := configstore.OrgUser{
+			OrgID:       orgID,
+			Username:    username,
+			Password:    passwordHash,
+			Passthrough: false,
+			AccessMode:  accessMode,
+			TeamID:      &boundTeamID,
+			Disabled:    false,
+		}
+		if err := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "org_id"}, {Name: "username"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"password":    passwordHash,
+				"passthrough": false,
+				"access_mode": accessMode,
+				"team_id":     teamID,
+				"disabled":    false,
+				"updated_at":  time.Now().UTC(),
+			}),
+		}).Create(&user).Error; err != nil {
+			return err
+		}
+		return tx.First(&stored, "org_id = ? AND username = ?", orgID, username).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &stored, nil
+}
+
+func (s *gormAPIStore) ReloadSnapshot() error {
+	return s.store.ReloadSnapshot()
 }
 
 func (s *gormAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -397,14 +750,11 @@ func managedWarehouseUpsertColumns() []string {
 		// DB column name. Mismatching this against the actual column makes
 		// the ON CONFLICT … DO UPDATE clause throw 42703.
 		"duck_lake_version",
-		"warehouse_database_region",
+		"metadata_proxy_enabled",
+		"duckling_name",
 		"warehouse_database_endpoint",
 		"warehouse_database_port",
-		"warehouse_database_database_name",
-		"warehouse_database_username",
 		"metadata_store_kind",
-		"metadata_store_engine",
-		"metadata_store_region",
 		"metadata_store_endpoint",
 		"metadata_store_port",
 		"metadata_store_database_name",
@@ -419,11 +769,7 @@ func managedWarehouseUpsertColumns() []string {
 		"s3_url_style",
 		"s3_delta_catalog_enabled",
 		"s3_delta_catalog_path",
-		"iceberg_enabled",
-		"iceberg_region",
-		"iceberg_namespace",
 		"worker_identity_namespace",
-		"worker_identity_service_account_name",
 		"worker_identity_iam_role_arn",
 		"warehouse_database_credentials_namespace",
 		"warehouse_database_credentials_name",
@@ -439,75 +785,20 @@ func managedWarehouseUpsertColumns() []string {
 		"runtime_config_key",
 		"state",
 		"status_message",
-		"warehouse_database_state",
-		"warehouse_database_status_message",
 		"metadata_store_state",
-		"metadata_store_status_message",
 		"s3_state",
-		"s3_status_message",
-		"iceberg_state",
-		"iceberg_status_message",
 		"identity_state",
-		"identity_status_message",
 		"secrets_state",
-		"secrets_status_message",
 		"ready_at",
 		"failed_at",
 		"updated_at",
 	}
 }
 
-func (s *gormAPIStore) GetGlobalConfig() (configstore.GlobalConfig, error) {
-	var cfg configstore.GlobalConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.GlobalConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveGlobalConfig(cfg *configstore.GlobalConfig) error {
-	return s.db().Save(cfg).Error
-}
-
-func (s *gormAPIStore) GetDuckLakeConfig() (configstore.DuckLakeConfig, error) {
-	var cfg configstore.DuckLakeConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.DuckLakeConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error {
-	return s.db().Save(cfg).Error
-}
-
-func (s *gormAPIStore) GetRateLimitConfig() (configstore.RateLimitConfig, error) {
-	var cfg configstore.RateLimitConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.RateLimitConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveRateLimitConfig(cfg *configstore.RateLimitConfig) error {
-	return s.db().Save(cfg).Error
-}
-
-func (s *gormAPIStore) GetQueryLogConfig() (configstore.QueryLogConfig, error) {
-	var cfg configstore.QueryLogConfig
-	if err := s.db().First(&cfg, 1).Error; err != nil {
-		return configstore.QueryLogConfig{}, err
-	}
-	return cfg, nil
-}
-
-func (s *gormAPIStore) SaveQueryLogConfig(cfg *configstore.QueryLogConfig) error {
-	return s.db().Save(cfg).Error
-}
-
 type apiHandler struct {
-	store apiStore
-	info  OrgStackInfo
+	store   apiStore
+	info    OrgStackInfo
+	fetcher PeerFetcher // nil = no cross-CP aggregation (single-CP or tests)
 }
 
 // managedWarehouseRequest is the whitelist of fields a caller may set on the
@@ -518,34 +809,27 @@ type apiHandler struct {
 // add a field here without a matching tag on ManagedWarehouse, strict decode
 // will accept it and the merge will silently drop it.
 type managedWarehouseRequest struct {
-	Image                          string                                        `json:"image"`
-	DuckLakeVersion                string                                        `json:"ducklake_version"`
-	WarehouseDatabase              configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
-	MetadataStore                  configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
-	PgBouncer                      configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
-	S3                             configstore.ManagedWarehouseS3                `json:"s3"`
-	Iceberg                        configstore.ManagedWarehouseIceberg           `json:"iceberg"`
-	WorkerIdentity                 configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
-	WarehouseDatabaseCredentials   configstore.SecretRef                         `json:"warehouse_database_credentials"`
-	MetadataStoreCredentials       configstore.SecretRef                         `json:"metadata_store_credentials"`
-	S3Credentials                  configstore.SecretRef                         `json:"s3_credentials"`
-	RuntimeConfig                  configstore.SecretRef                         `json:"runtime_config"`
-	State                          configstore.ManagedWarehouseProvisioningState `json:"state"`
-	StatusMessage                  string                                        `json:"status_message"`
-	WarehouseDatabaseState         configstore.ManagedWarehouseProvisioningState `json:"warehouse_database_state"`
-	WarehouseDatabaseStatusMessage string                                        `json:"warehouse_database_status_message"`
-	MetadataStoreState             configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
-	MetadataStoreStatusMessage     string                                        `json:"metadata_store_status_message"`
-	S3State                        configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
-	S3StatusMessage                string                                        `json:"s3_status_message"`
-	IcebergState                   configstore.ManagedWarehouseProvisioningState `json:"iceberg_state"`
-	IcebergStatusMessage           string                                        `json:"iceberg_status_message"`
-	IdentityState                  configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
-	IdentityStatusMessage          string                                        `json:"identity_status_message"`
-	SecretsState                   configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
-	SecretsStatusMessage           string                                        `json:"secrets_status_message"`
-	ReadyAt                        *time.Time                                    `json:"ready_at"`
-	FailedAt                       *time.Time                                    `json:"failed_at"`
+	Image                        string                                        `json:"image"`
+	DuckLakeVersion              string                                        `json:"ducklake_version"`
+	MetadataProxyEnabled         bool                                          `json:"metadata_proxy_enabled"`
+	DucklingName                 string                                        `json:"duckling_name"`
+	WarehouseDatabase            configstore.ManagedWarehouseDatabase          `json:"warehouse_database"`
+	MetadataStore                configstore.ManagedWarehouseMetadataStore     `json:"metadata_store"`
+	PgBouncer                    configstore.ManagedWarehousePgBouncer         `json:"pgbouncer"`
+	S3                           configstore.ManagedWarehouseS3                `json:"s3"`
+	WorkerIdentity               configstore.ManagedWarehouseWorkerIdentity    `json:"worker_identity"`
+	WarehouseDatabaseCredentials configstore.SecretRef                         `json:"warehouse_database_credentials"`
+	MetadataStoreCredentials     configstore.SecretRef                         `json:"metadata_store_credentials"`
+	S3Credentials                configstore.SecretRef                         `json:"s3_credentials"`
+	RuntimeConfig                configstore.SecretRef                         `json:"runtime_config"`
+	State                        configstore.ManagedWarehouseProvisioningState `json:"state"`
+	StatusMessage                string                                        `json:"status_message"`
+	MetadataStoreState           configstore.ManagedWarehouseProvisioningState `json:"metadata_store_state"`
+	S3State                      configstore.ManagedWarehouseProvisioningState `json:"s3_state"`
+	IdentityState                configstore.ManagedWarehouseProvisioningState `json:"identity_state"`
+	SecretsState                 configstore.ManagedWarehouseProvisioningState `json:"secrets_state"`
+	ReadyAt                      *time.Time                                    `json:"ready_at"`
+	FailedAt                     *time.Time                                    `json:"failed_at"`
 }
 
 // decodeStrictWarehouseRequest validates a PUT body by decoding it into
@@ -571,18 +855,41 @@ func (h *apiHandler) listOrgs(c *gin.Context) {
 	c.JSON(http.StatusOK, orgs)
 }
 
+// createOrgRequest is the POST /orgs body: the org config plus its REQUIRED
+// first team (same contract as the provisioning API — an org cannot exist
+// without a team). schema_name is optional; omitted derives the conventional
+// "team_<id>". No billing semantics — the row is a plain team.
+type createOrgRequest struct {
+	configstore.Org
+	TeamID     int64  `json:"team_id"`
+	SchemaName string `json:"schema_name"`
+}
+
 func (h *apiHandler) createOrg(c *gin.Context) {
-	var org configstore.Org
-	if err := c.ShouldBindJSON(&org); err != nil {
+	var req createOrgRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	org := req.Org
 	if err := validateOrgMutationPayload(&org); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	if org.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+	if req.TeamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id — every org must have at least one team)"})
+		return
+	}
+	schemaName := req.SchemaName
+	if schemaName == "" {
+		schemaName = fmt.Sprintf("team_%d", req.TeamID)
+	}
+	if err := configstore.ValidateOrgTeamSchemaName(schemaName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	// Normalize empty hostname_alias to NULL on insert so the unique index
@@ -592,7 +899,10 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 	if org.HostnameAlias != nil && *org.HostnameAlias == "" {
 		org.HostnameAlias = nil
 	}
-	if err := h.store.CreateOrg(&org); err != nil {
+	// POST /orgs has no :id param, so the audit org column is blank — record the
+	// created org's name here instead.
+	setAuditDetail(c, fmt.Sprintf("created org %s (first team %d, schema %s)", org.Name, req.TeamID, schemaName))
+	if err := h.store.CreateOrg(&org, req.TeamID, schemaName); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
@@ -630,6 +940,12 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if _, ok := fields["data_imports_table_naming_version"]; ok {
+		if err := validateDataImportsTableNamingVersion(updates.DataImportsTableNamingVersion); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 	existing, err := h.store.GetOrg(name)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -643,24 +959,50 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["max_workers"]; ok {
 		merged.MaxWorkers = updates.MaxWorkers
 	}
-	if _, ok := fields["memory_budget"]; ok {
-		merged.MemoryBudget = updates.MemoryBudget
+	if _, ok := fields["max_vcpus"]; ok {
+		merged.MaxVCPUs = updates.MaxVCPUs
 	}
-	if _, ok := fields["idle_timeout_s"]; ok {
-		merged.IdleTimeoutS = updates.IdleTimeoutS
+	// Org default worker profile: present-in-payload wins, including an
+	// explicit "" which clears the default.
+	if _, ok := fields["default_worker_cpu"]; ok {
+		merged.DefaultWorkerCPU = updates.DefaultWorkerCPU
 	}
-	if _, ok := fields["max_connections"]; ok {
-		merged.MaxConnections = updates.MaxConnections
+	if _, ok := fields["default_worker_memory"]; ok {
+		merged.DefaultWorkerMemory = updates.DefaultWorkerMemory
 	}
-	if _, ok := fields["worker_cpu_request"]; ok {
-		merged.WorkerCPURequest = updates.WorkerCPURequest
+	if _, ok := fields["default_worker_ttl"]; ok {
+		merged.DefaultWorkerTTL = updates.DefaultWorkerTTL
 	}
-	if _, ok := fields["worker_memory_request"]; ok {
-		merged.WorkerMemoryRequest = updates.WorkerMemoryRequest
+	if _, ok := fields["default_worker_min_hot_idle"]; ok {
+		merged.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
 	}
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
+	if _, ok := fields["data_imports_table_naming_version"]; ok {
+		merged.DataImportsTableNamingVersion = updates.DataImportsTableNamingVersion
+	}
+	// Audit detail: which fields changed and their old → new values, so the
+	// console shows "max_workers 4 → 10" instead of a bare "org.update". These
+	// are all non-sensitive config columns (no credentials among them).
+	var changes []string
+	addChange := func(key string, old, next any) {
+		if _, ok := fields[key]; ok && old != next {
+			changes = append(changes, fmt.Sprintf("%s %v → %v", key, old, next))
+		}
+	}
+	addChange("max_workers", existing.MaxWorkers, merged.MaxWorkers)
+	addChange("max_vcpus", existing.MaxVCPUs, merged.MaxVCPUs)
+	addChange("default_worker_cpu", orgStr(existing.DefaultWorkerCPU), orgStr(merged.DefaultWorkerCPU))
+	addChange("default_worker_memory", orgStr(existing.DefaultWorkerMemory), orgStr(merged.DefaultWorkerMemory))
+	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
+	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
+	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
+	addChange("data_imports_table_naming_version", existing.DataImportsTableNamingVersion, merged.DataImportsTableNamingVersion)
+	if len(changes) > 0 {
+		setAuditDetail(c, strings.Join(changes, ", "))
+	}
+
 	org, ok, err := h.store.UpdateOrg(name, merged)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -677,6 +1019,10 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 	name := c.Param("id")
 	ok, err := h.store.DeleteOrg(name)
 	if err != nil {
+		if errors.Is(err, errWarehouseStillExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": "warehouse still exists — deprovision it and wait for teardown to complete before deleting the org"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -687,6 +1033,278 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted": name})
 }
 
+// --- Org teams ---
+
+func (h *apiHandler) listAllOrgTeams(c *gin.Context) {
+	teams, err := h.store.ListAllOrgTeams()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"teams": teams})
+}
+
+// createOrgTeamRequest is the admin create body (POST /teams — the org rides
+// in the body like POST /users, because the /orgs/:id/teams POST route
+// belongs to the provisioning grandfather upsert). schema_name set here is
+// immutable through user-facing flows; operators can later change it via the
+// break-glass PUT, and the internal provisioning grandfather path may
+// overwrite it.
+type createOrgTeamRequest struct {
+	OrgID           string `json:"org_id"`
+	TeamID          int64  `json:"team_id"`
+	SchemaName      string `json:"schema_name"`
+	Enabled         *bool  `json:"enabled,omitempty"`
+	BackfillEnabled *bool  `json:"backfill_enabled,omitempty"`
+}
+
+func (h *apiHandler) createOrgTeam(c *gin.Context) {
+	var req createOrgTeamRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	orgID := req.OrgID
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org_id is required"})
+		return
+	}
+	if req.TeamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id)"})
+		return
+	}
+	if err := configstore.ValidateOrgTeamSchemaName(req.SchemaName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	backfill := req.BackfillEnabled == nil || *req.BackfillEnabled
+	team := configstore.OrgTeam{
+		OrgID:           orgID,
+		TeamID:          req.TeamID,
+		SchemaName:      req.SchemaName,
+		Enabled:         req.Enabled == nil || *req.Enabled,
+		BackfillEnabled: &backfill,
+	}
+	// POST /teams has no :id param, so the audit org column is blank — record
+	// the target org here (mirrors POST /users).
+	setAuditDetail(c, fmt.Sprintf("created team %d (schema %s) in org %s", req.TeamID, req.SchemaName, orgID))
+	if err := h.store.CreateOrgTeam(orgID, &team); err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		case errors.Is(err, errOrgTeamExists), errors.Is(err, configstore.ErrOrgTeamSchemaConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	c.JSON(http.StatusCreated, team)
+}
+
+// updateOrgTeamRequest is the admin PUT body — the operator break-glass that
+// can edit every team setting. All fields are presence-aware (absent =
+// preserve). schema_name may be CHANGED here (immutability is a user-facing
+// flow rule, not an operator one) but never cleared — it stays NOT NULL, and
+// backfill_enabled likewise rejects an explicit null (NOT NULL DEFAULT TRUE,
+// migration 000028). The nullable columns (earliest_event_date and the three
+// legacy table-name overrides) treat an explicit JSON null — and, for the
+// table names, "" — as "clear back to NULL".
+type updateOrgTeamRequest struct {
+	SchemaName            *string `json:"schema_name,omitempty"`
+	Enabled               *bool   `json:"enabled,omitempty"`
+	BackfillEnabled       *bool   `json:"backfill_enabled,omitempty"`
+	EventsTableName       *string `json:"events_table_name,omitempty"`
+	PersonsTableName      *string `json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string `json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate ("YYYY-MM-DD"): PostHog's cached backfill floor.
+	// Explicit null (or "") clears it to NULL so the PostHog sensor
+	// re-discovers the team's backfill range.
+	EarliestEventDate *string `json:"earliest_event_date,omitempty"`
+}
+
+// legacyTableNameUpdate folds one presence-aware legacy table-name field of
+// the PUT body into (set, value): absent = (false, nil); explicit null or ""
+// = (true, nil) — clear back to NULL / derive from schema_name; anything else
+// = (true, &value).
+func legacyTableNameUpdate(present bool, v *string) (bool, *string) {
+	if !present {
+		return false, nil
+	}
+	if v == nil || *v == "" {
+		return true, nil
+	}
+	return true, v
+}
+
+func (h *apiHandler) updateOrgTeam(c *gin.Context) {
+	orgID := c.Param("id")
+	teamID, perr := strconv.ParseInt(c.Param("team_id"), 10, 64)
+	if perr != nil || teamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
+		return
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var req updateOrgTeamRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if _, ok := fields["schema_name"]; ok {
+		// The operator override: changing the schema is allowed HERE (and only
+		// here — user-facing flows keep it immutable), but it must stay a
+		// valid, non-null identifier. It renames NOTHING in the warehouse.
+		if req.SchemaName == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "schema_name cannot be cleared; pass a valid schema name"})
+			return
+		}
+		if err := configstore.ValidateOrgTeamSchemaName(*req.SchemaName); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	for name, v := range map[string]*string{
+		"events_table_name":        req.EventsTableName,
+		"persons_table_name":       req.PersonsTableName,
+		"schema_data_imports_name": req.SchemaDataImportsName,
+	} {
+		if v == nil {
+			continue
+		}
+		// Shared bare-identifier contract (see configstore.ValidateOrgTeamTableName):
+		// overrides are never schema-qualified; a dot stored here would be
+		// silently ambiguous to every discovery consumer. "" passes (clear).
+		if err := configstore.ValidateOrgTeamTableName(name, *v); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	_, earliestSet := fields["earliest_event_date"]
+	var earliest *configstore.EventDate
+	if earliestSet && req.EarliestEventDate != nil && *req.EarliestEventDate != "" {
+		d, err := configstore.ParseEventDate(*req.EarliestEventDate)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "earliest_event_date " + err.Error()})
+			return
+		}
+		earliest = &d
+	}
+	if _, ok := fields["backfill_enabled"]; ok && req.BackfillEnabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "backfill_enabled cannot be null (the column always has a value); pass true or false, or omit the field to preserve it"})
+		return
+	}
+	_, eventsPresent := fields["events_table_name"]
+	_, personsPresent := fields["persons_table_name"]
+	_, importsPresent := fields["schema_data_imports_name"]
+	upd := orgTeamUpdate{
+		SchemaName:           req.SchemaName,
+		Enabled:              req.Enabled,
+		Backfill:             req.BackfillEnabled,
+		EarliestEventDateSet: earliestSet,
+		EarliestEventDate:    earliest,
+	}
+	upd.EventsTableNameSet, upd.EventsTableName = legacyTableNameUpdate(eventsPresent, req.EventsTableName)
+	upd.PersonsTableNameSet, upd.PersonsTableName = legacyTableNameUpdate(personsPresent, req.PersonsTableName)
+	upd.SchemaDataImportsNameSet, upd.SchemaDataImportsName = legacyTableNameUpdate(importsPresent, req.SchemaDataImportsName)
+
+	prev, team, err := h.store.UpdateOrgTeam(orgID, teamID, upd)
+	if err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrOrgTeamNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org team not found"})
+		case errors.Is(err, configstore.ErrOrgTeamSchemaConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	// Audit detail: which fields actually changed and their old → new values
+	// (same idiom as the org update). Computed AFTER the store call so the
+	// "old" side is the row the update really replaced; AuditMiddleware reads
+	// the detail once the handler returns.
+	var changes []string
+	addChange := func(key, old, next string) {
+		if old != next {
+			changes = append(changes, fmt.Sprintf("%s %s → %s", key, old, next))
+		}
+	}
+	addChange("schema_name", prev.SchemaName, team.SchemaName)
+	addChange("enabled", fmt.Sprintf("%v", prev.Enabled), fmt.Sprintf("%v", team.Enabled))
+	addChange("backfill_enabled", orgBoolPtr(prev.BackfillEnabled), orgBoolPtr(team.BackfillEnabled))
+	addChange("events_table_name", orgStrPtr(prev.EventsTableName), orgStrPtr(team.EventsTableName))
+	addChange("persons_table_name", orgStrPtr(prev.PersonsTableName), orgStrPtr(team.PersonsTableName))
+	addChange("schema_data_imports_name", orgStrPtr(prev.SchemaDataImportsName), orgStrPtr(team.SchemaDataImportsName))
+	addChange("earliest_event_date", orgDatePtr(prev.EarliestEventDate), orgDatePtr(team.EarliestEventDate))
+	if len(changes) > 0 {
+		setAuditDetail(c, fmt.Sprintf("team %d: %s", teamID, strings.Join(changes, ", ")))
+	}
+
+	c.JSON(http.StatusOK, team)
+}
+
+// topLevelJSONKeys returns the sorted top-level object keys of a JSON body, or
+// nil if it isn't a JSON object. Used to audit WHICH warehouse sections a PUT
+// touched without recording their (possibly secret) values.
+func topLevelJSONKeys(body []byte) []string {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// orgStr renders an org config string value for audit detail, showing "" as a
+// readable "(unset)" so a cleared field is unambiguous.
+func orgStr(s string) string {
+	if s == "" {
+		return "(unset)"
+	}
+	return s
+}
+
+// orgStrPtr renders an optional org config string (nil == unset) for audit
+// detail.
+func orgStrPtr(s *string) string {
+	if s == nil {
+		return "(unset)"
+	}
+	return orgStr(*s)
+}
+
+// orgDatePtr renders an optional calendar date (nil == unset) for audit
+// detail.
+func orgDatePtr(d *configstore.EventDate) string {
+	if d == nil {
+		return "(unset)"
+	}
+	return d.String()
+}
+
+// orgBoolPtr renders an optional tri-state boolean (nil == unset) for audit
+// detail.
+func orgBoolPtr(b *bool) string {
+	if b == nil {
+		return "(unset)"
+	}
+	return fmt.Sprintf("%v", *b)
+}
+
 func validateOrgMutationPayload(org *configstore.Org) error {
 	if org == nil {
 		return nil
@@ -694,9 +1312,70 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	if org.Warehouse != nil {
 		return errWarehousePayloadNotAllowed
 	}
+	if len(org.Teams) > 0 {
+		return errOrgTeamsPayloadNotAllowed
+	}
 	if org.HostnameAlias != nil {
 		if err := validateHostnameAlias(*org.HostnameAlias); err != nil {
 			return err
+		}
+	}
+	if org.DataImportsTableNamingVersion != "" {
+		if err := validateDataImportsTableNamingVersion(org.DataImportsTableNamingVersion); err != nil {
+			return err
+		}
+	}
+	if err := validateOrgDefaultWorkerProfile(org); err != nil {
+		return err
+	}
+	if org.DefaultWorkerMinHotIdle < 0 {
+		return fmt.Errorf("default_worker_min_hot_idle: value %d must be >= 0", org.DefaultWorkerMinHotIdle)
+	}
+	if org.MaxVCPUs < 0 {
+		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
+	}
+	return nil
+}
+
+func validateDataImportsTableNamingVersion(version string) error {
+	if configstore.IsValidDataImportsTableNamingVersion(version) {
+		return nil
+	}
+	return fmt.Errorf(
+		"data_imports_table_naming_version must be %q or %q",
+		configstore.DataImportsTableNamingVersionLegacyBatchV1,
+		configstore.DataImportsTableNamingVersionCopyV1,
+	)
+}
+
+// validateOrgDefaultWorkerProfile rejects garbage default-worker-profile
+// values at the API boundary so they can never enter the config store (the
+// control plane tolerates bad rows by ignoring them, but a 400 here surfaces
+// the typo to the operator instead of a silently-ignored default). Empty
+// strings are allowed: they mean "unset" on create / "clear" on update.
+func validateOrgDefaultWorkerProfile(org *configstore.Org) error {
+	for _, f := range []struct{ name, raw string }{
+		{"default_worker_cpu", org.DefaultWorkerCPU},
+		{"default_worker_memory", org.DefaultWorkerMemory},
+	} {
+		if f.raw == "" {
+			continue
+		}
+		q, err := resource.ParseQuantity(f.raw)
+		if err != nil {
+			return fmt.Errorf("%s: invalid quantity %q", f.name, f.raw)
+		}
+		if q.Sign() <= 0 {
+			return fmt.Errorf("%s: quantity %q must be positive", f.name, f.raw)
+		}
+	}
+	if raw := org.DefaultWorkerTTL; raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("default_worker_ttl: invalid duration %q (use a Go duration like \"30m\")", raw)
+		}
+		if d < 0 {
+			return fmt.Errorf("default_worker_ttl: duration %q must be >= 0", raw)
 		}
 	}
 	return nil
@@ -768,6 +1447,22 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		return
 	}
 
+	// Audit detail: the top-level warehouse sections touched by this PUT (field
+	// NAMES only — the values can carry credentials/secret refs, so we never put
+	// them in the audit log). Gives "changed: metadata_store, s3" instead of a
+	// bare "warehouse.update".
+	changedFields := topLevelJSONKeys(body)
+	if len(changedFields) > 0 {
+		setAuditDetail(c, "changed: "+strings.Join(changedFields, ", "))
+	}
+	metadataProxyChanged := false
+	for _, field := range changedFields {
+		if field == "metadata_proxy_enabled" {
+			metadataProxyChanged = true
+			break
+		}
+	}
+
 	// MutateManagedWarehouse locks the row inside a transaction, runs the
 	// closure, and commits — closing the race where two concurrent PUTs would
 	// otherwise Get + modify different snapshots and silently clobber each
@@ -778,6 +1473,9 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		// `{"metadata_store":{"database_name":"x"}}`) without wiping siblings.
 		if err := json.Unmarshal(body, w); err != nil {
 			return warehouseBadRequestError{err}
+		}
+		if w.DucklingName == "" {
+			return warehouseBadRequestError{errors.New("duckling_name cannot be empty")}
 		}
 		cfgView := &configstore.ManagedWarehouseConfig{
 			OrgID:                        orgID,
@@ -807,6 +1505,16 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
+	}
+	if metadataProxyChanged {
+		// The proxy gate is consumed from each CP's in-memory snapshot. Reload
+		// locally and notify peers now so an explicit admin/UI toggle does not
+		// wait for the normal config poll interval. Established sessions
+		// recheck the refreshed gate at most five seconds later.
+		if err := h.notifyPeersOfChange(c); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 	}
 	c.JSON(http.StatusOK, stored)
 }
@@ -863,6 +1571,16 @@ func (h *apiHandler) patchTenantPinning(c *gin.Context) {
 			return
 		}
 	}
+
+	// Audit detail: image / ducklake_version are safe (non-secret) pins.
+	var pins []string
+	if req.Image != nil {
+		pins = append(pins, "image="+orgStr(*req.Image))
+	}
+	if req.DuckLakeVersion != nil {
+		pins = append(pins, "ducklake_version="+orgStr(*req.DuckLakeVersion))
+	}
+	setAuditDetail(c, strings.Join(pins, ", "))
 
 	stored, ok, err := h.store.MutateManagedWarehouse(orgID, func(w *configstore.ManagedWarehouse) error {
 		if req.Image != nil {
@@ -925,11 +1643,11 @@ func (h *apiHandler) listUsers(c *gin.Context) {
 func (h *apiHandler) createUser(c *gin.Context) {
 	// Use a raw struct because OrgUser.Password has json:"-"
 	var raw struct {
-		Username       string `json:"username"`
-		Password       string `json:"password"`
-		OrgID          string `json:"org_id"`
-		Passthrough    bool   `json:"passthrough"`
-		DefaultCatalog string `json:"default_catalog"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		OrgID       string `json:"org_id"`
+		Passthrough bool   `json:"passthrough"`
+		MaxVCPUs    int    `json:"max_vcpus"`
 	}
 	if err := c.ShouldBindJSON(&raw); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -943,11 +1661,9 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "password is required"})
 		return
 	}
-	if catalog, err := validateDefaultCatalog(raw.DefaultCatalog); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if raw.MaxVCPUs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
 		return
-	} else {
-		raw.DefaultCatalog = catalog
 	}
 	hash, err := configstore.HashPassword(raw.Password)
 	if err != nil {
@@ -955,14 +1671,21 @@ func (h *apiHandler) createUser(c *gin.Context) {
 		return
 	}
 	user := configstore.OrgUser{
-		Username:       raw.Username,
-		Password:       hash,
-		OrgID:          raw.OrgID,
-		Passthrough:    raw.Passthrough,
-		DefaultCatalog: raw.DefaultCatalog,
+		Username:    raw.Username,
+		Password:    hash,
+		OrgID:       raw.OrgID,
+		Passthrough: raw.Passthrough,
+		MaxVCPUs:    raw.MaxVCPUs,
 	}
+	// The audit row's org/target columns come from URL params, but this route is
+	// the top-level POST /users with no params — record who was created here.
+	setAuditDetail(c, "created user "+raw.Username+" in org "+raw.OrgID)
 	if err := h.store.CreateUser(&user); err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusCreated, user)
@@ -985,13 +1708,28 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 	// Passthrough is *bool so omitting it preserves the stored value; sending
 	// `false` explicitly clears the flag.
 	var raw struct {
-		Password       string  `json:"password"`
-		Passthrough    *bool   `json:"passthrough,omitempty"`
-		DefaultCatalog *string `json:"default_catalog,omitempty"`
+		Password    string `json:"password"`
+		Passthrough *bool  `json:"passthrough,omitempty"`
+		MaxVCPUs    *int   `json:"max_vcpus,omitempty"`
 	}
-	if err := c.ShouldBindJSON(&raw); err != nil {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	maxVCPUs := raw.MaxVCPUs
+	if rawMaxVCPUs, ok := fields["max_vcpus"]; ok && bytes.Equal(bytes.TrimSpace(rawMaxVCPUs), []byte("null")) {
+		zero := 0
+		maxVCPUs = &zero
 	}
 	passwordHash := ""
 	if raw.Password != "" {
@@ -1002,15 +1740,44 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		}
 		passwordHash = hash
 	}
-	if raw.DefaultCatalog != nil {
-		catalog, err := validateDefaultCatalog(*raw.DefaultCatalog)
+	if maxVCPUs != nil && *maxVCPUs < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "max_vcpus must be >= 0"})
+		return
+	}
+	if raw.Passthrough != nil && *raw.Passthrough {
+		user, err := h.store.GetUser(orgID, username)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		raw.DefaultCatalog = &catalog
+		// Passthrough bypasses the compat layer that enforces the project
+		// scope, so no scoped login — reader or user — may carry it.
+		if configstore.IsProjectScopedAccessMode(user.AccessMode) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "project-scoped users cannot enable passthrough"})
+			return
+		}
 	}
-	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, raw.DefaultCatalog)
+	// Audit detail: which fields the update touched. The password is NEVER
+	// logged — only that it was reset.
+	var changes []string
+	if _, ok := fields["password"]; ok && raw.Password != "" {
+		changes = append(changes, "password reset")
+	}
+	if raw.Passthrough != nil {
+		changes = append(changes, fmt.Sprintf("passthrough=%v", *raw.Passthrough))
+	}
+	if maxVCPUs != nil {
+		changes = append(changes, fmt.Sprintf("max_vcpus=%d", *maxVCPUs))
+	}
+	if len(changes) > 0 {
+		setAuditDetail(c, strings.Join(changes, ", "))
+	}
+
+	user, ok, err := h.store.UpdateUser(orgID, username, passwordHash, raw.Passthrough, maxVCPUs)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1019,17 +1786,11 @@ func (h *apiHandler) updateUser(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, user)
-}
-
-func validateDefaultCatalog(raw string) (string, error) {
-	if raw == "" {
-		return "", nil
-	}
-	if raw == "iceberg" {
-		return raw, nil
-	}
-	return "", errors.New("default_catalog must be empty or iceberg")
 }
 
 func (h *apiHandler) deleteUser(c *gin.Context) {
@@ -1044,132 +1805,165 @@ func (h *apiHandler) deleteUser(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"deleted": username})
+}
+
+// upsertProjectReader creates or rotates the single read-only credential for
+// one PostHog project. The plaintext password is returned only in this
+// response; the config store persists only its bcrypt hash.
+// upsertProjectReader mints (or rotates) the team's read-only login.
+func (h *apiHandler) upsertProjectReader(c *gin.Context) {
+	h.upsertProjectLogin(c, configstore.OrgUserAccessModeProjectReader, projectReaderUsername)
+}
+
+// upsertProjectUser mints (or rotates) the team's read/write login. It is
+// scoped to exactly the same namespaces as the reader — the difference is that
+// DML and in-project DDL are authorized.
+func (h *apiHandler) upsertProjectUser(c *gin.Context) {
+	h.upsertProjectLogin(c, configstore.OrgUserAccessModeProjectUser, projectUserUsername)
+}
+
+// projectReaderUsername / projectUserUsername derive the two logins' names from
+// the team. They must stay distinct and stable: the name is the credential's
+// identity, so changing a derivation orphans every issued credential.
+func projectReaderUsername(teamID int64) string { return fmt.Sprintf("posthog_team_%d", teamID) }
+
+func projectUserUsername(teamID int64) string { return fmt.Sprintf("posthog_team_%d_rw", teamID) }
+
+func (h *apiHandler) upsertProjectLogin(c *gin.Context, accessMode string, usernameFor func(int64) string) {
+	orgID := c.Param("id")
+	teamID, err := strconv.ParseInt(c.Param("team_id"), 10, 64)
+	if err != nil || teamID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
+		return
+	}
+	var request struct {
+		Password string `json:"password"`
+	}
+	if c.Request.ContentLength > 0 {
+		decoder := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	password := request.Password
+	if password == "" {
+		password, err = configstore.GeneratePassword()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate password"})
+			return
+		}
+	} else if len(password) < 32 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password must be at least 32 characters"})
+		return
+	}
+	username := usernameFor(teamID)
+	user, err := h.store.UpsertProjectLogin(orgID, teamID, username, password, accessMode)
+	if err != nil {
+		if errors.Is(err, configstore.ErrProjectTeamUnavailable) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	setAuditDetail(c, fmt.Sprintf("created or rotated %s for team %d", accessMode, teamID))
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"username":    user.Username,
+		"password":    password,
+		"access_mode": user.AccessMode,
+	})
+}
+
+// notifyPeersOfChange reloads THIS replica's config snapshot immediately
+// (bypassing the poll interval, default 30s) and fans the same reload out to
+// every other CP replica, mirroring the disable/enable reload pattern in
+// live.go. Unlike disable/enable, the write has already landed in the shared
+// config-store DB by the time this runs, so a peer only needs to reload — it
+// must never re-run the create/update/delete (that would 409 or double-apply
+// against a row that's already there). Peer fan-out is best-effort: PostPeers
+// already drops a slow/down peer without error, so only a failure to reload
+// THIS replica is surfaced to the caller.
+func (h *apiHandler) notifyPeersOfChange(c *gin.Context) error {
+	if err := h.store.ReloadSnapshot(); err != nil {
+		return err
+	}
+	if h.fetcher != nil {
+		h.fetcher.PostPeers(c.Request.Context(), "/api/v1/internal/reload-snapshot")
+	}
+	return nil
+}
+
+// reloadSnapshot is a peer-fan-out target only (see notifyPeersOfChange): it
+// forces this replica's config snapshot to reload immediately. There is
+// nothing to re-execute here — the write already landed in the shared
+// config-store DB — so unlike the per-user kill-switch actions this handler
+// has no scope=local branch to guard: it never calls PostPeers itself, so it
+// cannot recurse regardless of who calls it.
+func (h *apiHandler) reloadSnapshot(c *gin.Context) {
+	if err := h.store.ReloadSnapshot(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"reloaded": true})
 }
 
 // --- Workers ---
 
 func (h *apiHandler) listWorkers(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, []WorkerStatus{})
-		return
+	workers := []WorkerStatus{}
+	if h.info != nil {
+		workers = h.info.AllWorkerStatuses()
 	}
-	c.JSON(http.StatusOK, h.info.AllWorkerStatuses())
+	// A worker is owned by exactly one CP (disjoint union); dedup makes it idempotent.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
+		mergePeer(&workers, bodies, func(e []WorkerStatus) []WorkerStatus { return e })
+		workers = dedupeBy(workers, func(w WorkerStatus) int { return w.ID })
+	}
+	c.JSON(http.StatusOK, workers)
 }
 
 // --- Sessions ---
 
 func (h *apiHandler) listSessions(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, []SessionStatus{})
-		return
+	sessions := []SessionStatus{}
+	if h.info != nil {
+		sessions = h.info.AllSessionStatuses()
 	}
-	c.JSON(http.StatusOK, h.info.AllSessionStatuses())
-}
-
-// --- Config Singletons ---
-
-func (h *apiHandler) getGlobalConfig(c *gin.Context) {
-	cfg, err := h.store.GetGlobalConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+	// A session lives on exactly one CP (disjoint union); dedup makes it idempotent.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
+		mergePeer(&sessions, bodies, func(e []SessionStatus) []SessionStatus { return e })
+		sessions = dedupeBy(sessions, func(s SessionStatus) int { return s.WorkerID })
 	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateGlobalConfig(c *gin.Context) {
-	var cfg configstore.GlobalConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveGlobalConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) getDuckLakeConfig(c *gin.Context) {
-	cfg, err := h.store.GetDuckLakeConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateDuckLakeConfig(c *gin.Context) {
-	var cfg configstore.DuckLakeConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveDuckLakeConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) getRateLimitConfig(c *gin.Context) {
-	cfg, err := h.store.GetRateLimitConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateRateLimitConfig(c *gin.Context) {
-	var cfg configstore.RateLimitConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveRateLimitConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) getQueryLogConfig(c *gin.Context) {
-	cfg, err := h.store.GetQueryLogConfig()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
-}
-
-func (h *apiHandler) updateQueryLogConfig(c *gin.Context) {
-	var cfg configstore.QueryLogConfig
-	if err := c.ShouldBindJSON(&cfg); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	cfg.ID = 1
-	if err := h.store.SaveQueryLogConfig(&cfg); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, cfg)
+	c.JSON(http.StatusOK, sessions)
 }
 
 // --- Status ---
 
 func (h *apiHandler) getClusterStatus(c *gin.Context) {
-	if h.info == nil {
-		c.JSON(http.StatusOK, ClusterStatus{})
-		return
+	orgStats := []OrgStatus{}
+	if h.info != nil {
+		orgStats = h.info.AllOrgStats()
+	}
+	// Per-org active-session counts are per-CP; merge every CP's slice so the
+	// Overview cards reflect the whole cluster instead of one replica's view.
+	if !localScope(c) && h.fetcher != nil {
+		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/status")
+		orgStats = mergeOrgStats(orgStats, bodies)
 	}
 
-	orgStats := h.info.AllOrgStats()
 	totalWorkers := 0
 	totalSessions := 0
 	for _, os := range orgStats {

@@ -26,7 +26,6 @@ type FileConfig struct {
 	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions                []string            `yaml:"extensions"`
 	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
-	Iceberg                   IcebergFileConfig   `yaml:"iceberg"`
 	FilePersistence           bool                `yaml:"file_persistence"`
 	ProcessIsolation          bool                `yaml:"process_isolation"`
 	IdleTimeout               string              `yaml:"idle_timeout"`
@@ -43,6 +42,8 @@ type FileConfig struct {
 	LogLevel                  string              `yaml:"log_level"`
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`
 
+	AdmissionReclaimerMaxReservations int `yaml:"admission_reclaimer_max_reservations"`
+
 	// Worker backend configuration
 	WorkerBackend string        `yaml:"worker_backend"` // "process" (default) or "remote"
 	K8s           K8sFileConfig `yaml:"k8s"`
@@ -56,30 +57,25 @@ type ProcessFileConfig struct {
 
 // K8sFileConfig holds Kubernetes worker configuration from YAML.
 type K8sFileConfig struct {
-	WorkerImage                     string `yaml:"worker_image"`
-	WorkerNamespace                 string `yaml:"worker_namespace"`
-	ControlPlaneID                  string `yaml:"control_plane_id"`
-	WorkerPort                      int    `yaml:"worker_port"`
-	WorkerSecret                    string `yaml:"worker_secret"`
-	WorkerConfigMap                 string `yaml:"worker_configmap"`
-	WorkerImagePullPolicy           string `yaml:"worker_image_pull_policy"`
-	WorkerServiceAccount            string `yaml:"worker_service_account"`
-	MaxWorkers                      int    `yaml:"max_workers"`
-	SharedWarmTarget                int    `yaml:"shared_warm_target"`
-	DynamicWarmCapacityEnabled      *bool  `yaml:"dynamic_warm_capacity_enabled"`
-	WarmCapacityMissWindow          string `yaml:"warm_capacity_miss_window"`
-	WarmCapacityMissesPerWorker     int    `yaml:"warm_capacity_misses_per_worker"`
-	WarmCapacityDemandTTL           string `yaml:"warm_capacity_demand_ttl"`
-	WarmCapacityDynamicImageCeiling int    `yaml:"warm_capacity_dynamic_image_ceiling"`
-	WarmCapacityDynamicTotalCeiling int    `yaml:"warm_capacity_dynamic_total_ceiling"`
+	WorkerImage           string `yaml:"worker_image"`
+	WorkerNamespace       string `yaml:"worker_namespace"`
+	ControlPlaneID        string `yaml:"control_plane_id"`
+	WorkerPort            int    `yaml:"worker_port"`
+	WorkerSecret          string `yaml:"worker_secret"`
+	WorkerConfigMap       string `yaml:"worker_configmap"`
+	WorkerImagePullPolicy string `yaml:"worker_image_pull_policy"`
+	WorkerServiceAccount  string `yaml:"worker_service_account"`
 }
 
 type QueryLogFileConfig struct {
-	Enabled              *bool  `yaml:"enabled"`
-	FlushInterval        string `yaml:"flush_interval"`
-	BatchSize            int    `yaml:"batch_size"`
-	CompactInterval      string `yaml:"compact_interval"`
-	DataInliningRowLimit int    `yaml:"data_inlining_row_limit"`
+	Enabled       *bool  `yaml:"enabled"`
+	FlushInterval string `yaml:"flush_interval"`
+	BatchSize     int    `yaml:"batch_size"`
+	// StartEvents: "data" (default) | "all" | "off" — which statements emit a
+	// QueryStart event. Terminal events are always logged.
+	StartEvents string `yaml:"start_events"`
+	// Metadata enables per-statement relation/column/access extraction.
+	Metadata *bool `yaml:"metadata"`
 }
 
 type TLSConfig struct {
@@ -102,15 +98,6 @@ type RateLimitFileConfig struct {
 	BanDuration         string `yaml:"ban_duration"`
 	MaxConnectionsPerIP int    `yaml:"max_connections_per_ip"`
 	MaxConnections      int    `yaml:"max_connections"`
-}
-
-// IcebergFileConfig is the YAML shape for opting a single-tenant duckgres
-// instance into Iceberg catalog attachment. In multi-tenant mode the
-// equivalent values come from the per-warehouse configstore row, not YAML.
-type IcebergFileConfig struct {
-	Enabled   *bool  `yaml:"enabled"`
-	Region    string `yaml:"region"`
-	Namespace string `yaml:"namespace"`
 }
 
 type DuckLakeFileConfig struct {

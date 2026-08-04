@@ -13,6 +13,7 @@ package arrowmap
 import (
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"strings"
@@ -96,9 +97,9 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return arrow.FixedWidthTypes.Date32
 
 	// Time
-	case "TIME":
+	case "TIME", "TIME WITHOUT TIME ZONE":
 		return arrow.FixedWidthTypes.Time64us
-	case "TIMETZ":
+	case "TIMETZ", "TIME WITH TIME ZONE":
 		// The Go driver converts TIMETZ to UTC (see duckdb-go getTimeTZ),
 		// discarding the original timezone offset before we see the value.
 		// Time64us preserves the UTC time-of-day correctly; the offset is
@@ -106,7 +107,7 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return arrow.FixedWidthTypes.Time64us
 
 	// Timestamps (no timezone → empty TimeZone string)
-	case "TIMESTAMP":
+	case "TIMESTAMP", "TIMESTAMP WITHOUT TIME ZONE":
 		return &arrow.TimestampType{Unit: arrow.Microsecond}
 	case "TIMESTAMP_S":
 		return &arrow.TimestampType{Unit: arrow.Second}
@@ -114,7 +115,7 @@ func DuckDBTypeToArrow(dbType string) arrow.DataType {
 		return &arrow.TimestampType{Unit: arrow.Millisecond}
 	case "TIMESTAMP_NS":
 		return &arrow.TimestampType{Unit: arrow.Nanosecond}
-	case "TIMESTAMPTZ":
+	case "TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE":
 		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
 
 	// Interval
@@ -625,6 +626,22 @@ func appendBuiltin(builder array.Builder, val any) {
 				b.Append(s[0:8] + "-" + s[8:12] + "-" + s[12:16] + "-" + s[16:20] + "-" + s[20:32])
 			} else {
 				b.Append(string(v))
+			}
+		case []interface{}, map[string]interface{}:
+			// DuckDB JSON columns map to an Arrow String column
+			// (DuckDBTypeToArrow("JSON") == String), but the database/sql
+			// driver decodes JSON values into native Go composites (array ->
+			// []interface{}, object -> map[string]interface{}). Serialize them
+			// back to JSON text — Go's %v default below would emit "[1 2 3 4]"
+			// / "map[a:1]", which is invalid JSON and is exactly what reached
+			// remote-backend clients for `jsonb ||` and any JSON array/object
+			// column (#716). A plain VARCHAR column never decodes to a
+			// composite, so this only ever fires for JSON. Mirrors the
+			// standalone wire path's server.encodeJSON.
+			if jb, err := json.Marshal(v); err == nil {
+				b.Append(string(jb))
+			} else {
+				b.Append(fmt.Sprintf("%v", v))
 			}
 		default:
 			b.Append(fmt.Sprintf("%v", v))

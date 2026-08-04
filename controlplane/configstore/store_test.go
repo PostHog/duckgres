@@ -25,22 +25,16 @@ func TestSnapshotBuild(t *testing.T) {
 
 	orgs := []Org{
 		{
-			Name:         "analytics",
-			MaxWorkers:   4,
-			MemoryBudget: "8GB",
+			Name:       "analytics",
+			MaxWorkers: 4,
 			Warehouse: &ManagedWarehouse{
 				OrgID: "analytics",
 				WarehouseDatabase: ManagedWarehouseDatabase{
-					Region:       "us-east-1",
-					Endpoint:     "analytics.cluster-xyz.us-east-1.rds.amazonaws.com",
-					Port:         5432,
-					DatabaseName: "analytics_wh",
-					Username:     "warehouse_user",
+					Endpoint: "analytics.cluster-xyz.us-east-1.rds.amazonaws.com",
+					Port:     5432,
 				},
 				MetadataStore: ManagedWarehouseMetadataStore{
 					Kind:         "dedicated_rds",
-					Engine:       "postgres",
-					Region:       "us-east-1",
 					Endpoint:     "analytics-meta.cluster-xyz.us-east-1.rds.amazonaws.com",
 					Port:         5432,
 					DatabaseName: "ducklake_metadata",
@@ -56,9 +50,8 @@ func TestSnapshotBuild(t *testing.T) {
 					URLStyle:   "vhost",
 				},
 				WorkerIdentity: ManagedWarehouseWorkerIdentity{
-					Namespace:          "duckgres",
-					ServiceAccountName: "org-analytics-worker",
-					IAMRoleARN:         "arn:aws:iam::123456789012:role/org-analytics-worker",
+					Namespace:  "duckgres",
+					IAMRoleARN: "arn:aws:iam::123456789012:role/org-analytics-worker",
 				},
 				WarehouseDatabaseCredentials: SecretRef{
 					Namespace: "duckgres",
@@ -80,14 +73,13 @@ func TestSnapshotBuild(t *testing.T) {
 					Name:      "analytics-runtime",
 					Key:       "duckgres.yaml",
 				},
-				State:                  ManagedWarehouseStateReady,
-				StatusMessage:          "warehouse ready",
-				WarehouseDatabaseState: ManagedWarehouseStateReady,
-				MetadataStoreState:     ManagedWarehouseStateReady,
-				S3State:                ManagedWarehouseStateReady,
-				IdentityState:          ManagedWarehouseStateReady,
-				SecretsState:           ManagedWarehouseStateReady,
-				ReadyAt:                &readyAt,
+				State:              ManagedWarehouseStateReady,
+				StatusMessage:      "warehouse ready",
+				MetadataStoreState: ManagedWarehouseStateReady,
+				S3State:            ManagedWarehouseStateReady,
+				IdentityState:      ManagedWarehouseStateReady,
+				SecretsState:       ManagedWarehouseStateReady,
+				ReadyAt:            &readyAt,
 			},
 			Users: []OrgUser{
 				{Username: "alice", Password: hash1, OrgID: "analytics"},
@@ -110,11 +102,9 @@ func TestSnapshotBuild(t *testing.T) {
 
 	for _, o := range orgs {
 		oc := &OrgConfig{
-			Name:         o.Name,
-			MaxWorkers:   o.MaxWorkers,
-			MemoryBudget: o.MemoryBudget,
-			IdleTimeoutS: o.IdleTimeoutS,
-			Users:        make(map[string]string),
+			Name:       o.Name,
+			MaxWorkers: o.MaxWorkers,
+			Users:      make(map[string]string),
 		}
 		if o.Warehouse != nil {
 			oc.Warehouse = copyManagedWarehouseConfig(o.Warehouse)
@@ -133,17 +123,14 @@ func TestSnapshotBuild(t *testing.T) {
 	if snap.Orgs["analytics"].MaxWorkers != 4 {
 		t.Errorf("expected analytics max_workers=4, got %d", snap.Orgs["analytics"].MaxWorkers)
 	}
-	if snap.Orgs["analytics"].MemoryBudget != "8GB" {
-		t.Errorf("expected analytics memory_budget=8GB, got %s", snap.Orgs["analytics"].MemoryBudget)
-	}
 	if len(snap.Orgs["analytics"].Users) != 2 {
 		t.Errorf("expected 2 analytics users, got %d", len(snap.Orgs["analytics"].Users))
 	}
 	if snap.Orgs["analytics"].Warehouse == nil {
 		t.Fatal("expected analytics warehouse to be present")
 	}
-	if snap.Orgs["analytics"].Warehouse.WarehouseDatabase.DatabaseName != "analytics_wh" {
-		t.Fatalf("expected analytics warehouse db name analytics_wh, got %q", snap.Orgs["analytics"].Warehouse.WarehouseDatabase.DatabaseName)
+	if snap.Orgs["analytics"].Warehouse.MetadataStore.DatabaseName != "ducklake_metadata" {
+		t.Fatalf("expected analytics metadata db name ducklake_metadata, got %q", snap.Orgs["analytics"].Warehouse.MetadataStore.DatabaseName)
 	}
 	if snap.Orgs["analytics"].Warehouse.MetadataStore.Kind != "dedicated_rds" {
 		t.Fatalf("expected metadata store kind dedicated_rds, got %q", snap.Orgs["analytics"].Warehouse.MetadataStore.Kind)
@@ -181,22 +168,22 @@ func TestDatabaseNameForSNIPrefix(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
 			Orgs: map[string]*OrgConfig{
-				"portola-uuid": {Name: "portola-uuid", DatabaseName: "portola"},
-				"acme":         {Name: "acme", DatabaseName: "acme"},
+				"tenant-alpha-uuid": {Name: "tenant-alpha-uuid", DatabaseName: "tenant_alpha"},
+				"acme":              {Name: "acme", DatabaseName: "acme"},
 			},
 			DatabaseOrg: map[string]string{
-				"portola": "portola-uuid",
-				"acme":    "acme",
+				"tenant_alpha": "tenant-alpha-uuid",
+				"acme":         "acme",
 			},
 			HostnameAliasOrg: map[string]string{
-				"entirely-chief-wildcat": "portola-uuid",
+				"entirely-chief-wildcat": "tenant-alpha-uuid",
 			},
 		},
 	}
 
 	// Alias resolves to the org's database_name (the security-through-obscurity case).
-	if got := cs.DatabaseNameForSNIPrefix("entirely-chief-wildcat"); got != "portola" {
-		t.Errorf("DatabaseNameForSNIPrefix(alias) = %q, want %q", got, "portola")
+	if got := cs.DatabaseNameForSNIPrefix("entirely-chief-wildcat"); got != "tenant_alpha" {
+		t.Errorf("DatabaseNameForSNIPrefix(alias) = %q, want %q", got, "tenant_alpha")
 	}
 	// Plain prefix passes through unchanged so legacy tenants (no alias) keep working.
 	if got := cs.DatabaseNameForSNIPrefix("acme"); got != "acme" {
@@ -221,19 +208,19 @@ func TestResolveSNIPrefix(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
 			Orgs: map[string]*OrgConfig{
-				"portola-uuid":    {Name: "portola-uuid", DatabaseName: "portola"},
+				"tenant-alpha-id": {Name: "tenant-alpha-id", DatabaseName: "tenant_alpha"},
 				"team-hyphen":     {Name: "team-hyphen", DatabaseName: "team_hyphen"},
 				"team_underscore": {Name: "team_underscore", DatabaseName: "teamdb"},
 				"acme":            {Name: "acme", DatabaseName: "acme"},
 			},
 			DatabaseOrg: map[string]string{
-				"portola":     "portola-uuid",
-				"team_hyphen": "team-hyphen",
-				"teamdb":      "team_underscore",
-				"acme":        "acme",
+				"tenant_alpha": "tenant-alpha-id",
+				"team_hyphen":  "team-hyphen",
+				"teamdb":       "team_underscore",
+				"acme":         "acme",
 			},
 			HostnameAliasOrg: map[string]string{
-				"entirely-chief-wildcat": "portola-uuid",
+				"entirely-chief-wildcat": "tenant-alpha-id",
 			},
 		},
 	}
@@ -244,7 +231,7 @@ func TestResolveSNIPrefix(t *testing.T) {
 		wantOrg string
 		wantDB  string
 	}{
-		{"hostname alias", "entirely-chief-wildcat", "portola-uuid", "portola"},
+		{"hostname alias", "entirely-chief-wildcat", "tenant-alpha-id", "tenant_alpha"},
 		{"database name", "acme", "acme", "acme"},
 		{"hyphenated org name", "team-hyphen", "team-hyphen", "team_hyphen"},
 		{"non DNS-safe org name", "team_underscore", "", ""},
@@ -295,9 +282,6 @@ func TestResolvePostgresConnection(t *testing.T) {
 			OrgUserPassthrough: map[OrgUserKey]bool{
 				{OrgID: "test-org-smoke-1778167994", Username: "root"}: true,
 			},
-			OrgUserDefaultCatalog: map[OrgUserKey]string{
-				{OrgID: "billing", Username: "root"}: "iceberg",
-			},
 		},
 	}
 
@@ -320,13 +304,15 @@ func TestResolvePostgresConnection(t *testing.T) {
 		}
 	})
 
-	t.Run("iceberg catalog selected", func(t *testing.T) {
+	t.Run("iceberg is no longer a selectable catalog", func(t *testing.T) {
+		// Iceberg/Lakekeeper support was removed: an "iceberg" database request
+		// now fails the catalog check even with valid SNI+auth.
 		got := cs.ResolvePostgresConnection("iceberg", "test-org-smoke-1778167994", true, "root", "secret")
-		if !got.CatalogValid || got.EffectiveCatalog != "iceberg" {
-			t.Fatalf("catalog = (valid=%v, %q), want iceberg: %+v", got.CatalogValid, got.EffectiveCatalog, got)
+		if got.CatalogValid {
+			t.Fatalf("iceberg must not be a selectable catalog: %+v", got)
 		}
-		if !got.Valid {
-			t.Fatalf("expected valid auth: %+v", got)
+		if got.EffectiveCatalog != "" {
+			t.Fatalf("EffectiveCatalog = %q, want empty for rejected catalog", got.EffectiveCatalog)
 		}
 	})
 
@@ -341,7 +327,7 @@ func TestResolvePostgresConnection(t *testing.T) {
 	})
 
 	t.Run("legacy database name is no longer a valid catalog", func(t *testing.T) {
-		// The org's old database_name is not "ducklake"/"iceberg", so it fails the
+		// The org's old database_name is not "ducklake", so it fails the
 		// catalog check even though SNI+auth would otherwise succeed.
 		got := cs.ResolvePostgresConnection("test_org_smoke_1778167994", "test-org-smoke-1778167994", true, "root", "secret")
 		if got.CatalogValid {
@@ -377,7 +363,7 @@ func TestResolvePostgresConnection(t *testing.T) {
 		}
 	})
 
-	t.Run("valid user includes configured default catalog", func(t *testing.T) {
+	t.Run("valid user via hostname alias", func(t *testing.T) {
 		got := cs.ResolvePostgresConnection("", "billing-alias", true, "root", "secret")
 		if !got.Valid {
 			t.Fatalf("expected valid auth: %+v", got)
@@ -385,8 +371,74 @@ func TestResolvePostgresConnection(t *testing.T) {
 		if got.OrgID != "billing" {
 			t.Fatalf("OrgID = %q, want billing (via hostname alias)", got.OrgID)
 		}
-		if got.DefaultCatalog != "iceberg" {
-			t.Fatalf("DefaultCatalog = %q, want iceberg", got.DefaultCatalog)
+	})
+}
+
+// TestDisabledUserEnforcement covers the per-user kill switch at the snapshot
+// level: a disabled user with CORRECT credentials is refused on every auth path
+// (PG resolution reports Valid+Disabled so the CP can emit a distinct error;
+// Flight's ValidateOrgUser* return false), while enabled users are unaffected.
+func TestDisabledUserEnforcement(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"acme": {Name: "acme", DatabaseName: "acme_db"},
+			},
+			DatabaseOrg: map[string]string{"acme_db": "acme"},
+			OrgUserPassword: map[OrgUserKey]string{
+				{OrgID: "acme", Username: "bob"}:   mustHash(t, "secret"),
+				{OrgID: "acme", Username: "alice"}: mustHash(t, "secret"),
+			},
+			OrgUserPassthrough: map[OrgUserKey]bool{
+				{OrgID: "acme", Username: "bob"}: true,
+			},
+			OrgUserDisabled: map[OrgUserKey]bool{
+				{OrgID: "acme", Username: "bob"}: true,
+			},
+		},
+	}
+
+	t.Run("PG resolution: disabled user authenticates but is flagged Disabled", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "acme", true, "bob", "secret")
+		if !got.Valid {
+			t.Fatalf("disabled user with correct creds should still authenticate (Valid=true) so the CP can distinguish from a bad password: %+v", got)
+		}
+		if !got.Disabled {
+			t.Fatalf("expected Disabled=true: %+v", got)
+		}
+	})
+
+	t.Run("PG resolution: wrong password never reveals Disabled", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "acme", true, "bob", "wrong")
+		if got.Valid || got.Disabled {
+			t.Fatalf("wrong password must not authenticate or leak Disabled: %+v", got)
+		}
+	})
+
+	t.Run("PG resolution: enabled user unaffected", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("ducklake", "acme", true, "alice", "secret")
+		if !got.Valid || got.Disabled {
+			t.Fatalf("enabled user should authenticate and not be Disabled: %+v", got)
+		}
+	})
+
+	t.Run("Flight ValidateOrgUser refuses disabled user", func(t *testing.T) {
+		if cs.ValidateOrgUser("acme", "bob", "secret") {
+			t.Fatal("ValidateOrgUser must return false for a disabled user")
+		}
+		if !cs.ValidateOrgUser("acme", "alice", "secret") {
+			t.Fatal("ValidateOrgUser must return true for an enabled user")
+		}
+	})
+
+	t.Run("ValidateOrgUserAndGetPassthrough refuses disabled user without leaking passthrough", func(t *testing.T) {
+		valid, passthrough := cs.ValidateOrgUserAndGetPassthrough("acme", "bob", "secret")
+		if valid || passthrough {
+			t.Fatalf("disabled user: want (false,false), got (%v,%v)", valid, passthrough)
+		}
+		valid, _ = cs.ValidateOrgUserAndGetPassthrough("acme", "alice", "secret")
+		if !valid {
+			t.Fatal("enabled user should validate")
 		}
 	})
 }
@@ -401,6 +453,19 @@ func TestHashPassword(t *testing.T) {
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("wrongpass")); err == nil {
 		t.Error("bcrypt.CompareHashAndPassword should have failed for wrong password")
+	}
+}
+
+func TestDummyBcryptHashIsValidAtDefaultCost(t *testing.T) {
+	cost, err := bcrypt.Cost([]byte(dummyBcryptHash))
+	if err != nil {
+		t.Fatalf("dummy bcrypt hash is invalid: %v", err)
+	}
+	if cost != bcrypt.DefaultCost {
+		t.Fatalf("dummy bcrypt cost = %d, want %d", cost, bcrypt.DefaultCost)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte("never-the-dummy-password")); err != bcrypt.ErrMismatchedHashAndPassword {
+		t.Fatalf("dummy bcrypt comparison returned %v, want ErrMismatchedHashAndPassword", err)
 	}
 }
 
@@ -440,6 +505,113 @@ func TestOrgWarehouseStatus(t *testing.T) {
 	}
 }
 
+func TestOrgMetadataProxyEnabledFailsClosed(t *testing.T) {
+	cs := &ConfigStore{}
+	cs.snapshot = &Snapshot{Orgs: map[string]*OrgConfig{
+		"enabled": {
+			Name: "enabled",
+			Warehouse: &ManagedWarehouseConfig{
+				MetadataProxyEnabled: true,
+				State:                ManagedWarehouseStateReady,
+				MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+			},
+		},
+		"external": {
+			Name: "external",
+			Warehouse: &ManagedWarehouseConfig{
+				MetadataProxyEnabled: true,
+				State:                ManagedWarehouseStateReady,
+				MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindExternal},
+			},
+		},
+		"disabled": {
+			Name: "disabled",
+			Warehouse: &ManagedWarehouseConfig{
+				State:         ManagedWarehouseStateReady,
+				MetadataStore: ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+			},
+		},
+		"pending": {
+			Name: "pending",
+			Warehouse: &ManagedWarehouseConfig{
+				MetadataProxyEnabled: true,
+				State:                ManagedWarehouseStateProvisioning,
+				MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+			},
+		},
+		"no-warehouse": {Name: "no-warehouse"},
+	}}
+	if !cs.OrgMetadataProxyEnabled("enabled") {
+		t.Fatal("explicitly enabled ready CNPG org should be allowed")
+	}
+	for _, orgID := range []string{"external", "disabled", "pending", "no-warehouse", "unknown"} {
+		if cs.OrgMetadataProxyEnabled(orgID) {
+			t.Fatalf("org %q must fail closed", orgID)
+		}
+	}
+}
+
+func TestResolveMetadataProxyConnection(t *testing.T) {
+	root := OrgUserKey{OrgID: "acme", Username: "root"}
+	cs := &ConfigStore{snapshot: &Snapshot{
+		Orgs: map[string]*OrgConfig{
+			"acme": {
+				Name:         "acme",
+				DatabaseName: "acme_db",
+				Warehouse: &ManagedWarehouseConfig{
+					MetadataProxyEnabled: true,
+					State:                ManagedWarehouseStateReady,
+					MetadataStore:        ManagedWarehouseMetadataStore{Kind: MetadataStoreKindCnpgShard},
+				},
+			},
+		},
+		HostnameAliasOrg: map[string]string{"acme-alias": "acme"},
+		OrgUserPassword:  map[OrgUserKey]string{root: mustHash(t, "secret")},
+		OrgUserDisabled:  map[OrgUserKey]bool{},
+	}}
+
+	orgID, enabled, authenticated := cs.ResolveMetadataProxyConnection("acme-alias", "root", "secret")
+	if orgID != "acme" || !enabled || !authenticated {
+		t.Fatalf("valid metadata connection = (%q, %v, %v), want (acme, true, true)",
+			orgID, enabled, authenticated)
+	}
+	if !cs.MetadataProxySessionAllowed("acme", "root") {
+		t.Fatal("authenticated root session should remain allowed")
+	}
+	if cs.MetadataProxySessionAllowed("acme", "other") {
+		t.Fatal("non-root metadata session must not be allowed")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		prefix   string
+		username string
+		password string
+		enabled  bool
+	}{
+		{name: "wrong password", prefix: "acme-alias", username: "root", password: "wrong", enabled: true},
+		{name: "wrong user", prefix: "acme-alias", username: "other", password: "secret", enabled: true},
+		{name: "unknown host", prefix: "unknown", username: "root", password: "secret", enabled: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotOrg, gotEnabled, gotAuthenticated := cs.ResolveMetadataProxyConnection(tc.prefix, tc.username, tc.password)
+			if gotEnabled != tc.enabled || gotAuthenticated {
+				t.Fatalf("metadata connection = (%q, %v, %v), want enabled=%v authenticated=false",
+					gotOrg, gotEnabled, gotAuthenticated, tc.enabled)
+			}
+		})
+	}
+
+	cs.snapshot.OrgUserDisabled[root] = true
+	_, enabled, authenticated = cs.ResolveMetadataProxyConnection("acme-alias", "root", "secret")
+	if !enabled || authenticated {
+		t.Fatalf("disabled root = (enabled=%v, authenticated=%v), want (true, false)", enabled, authenticated)
+	}
+	if cs.MetadataProxySessionAllowed("acme", "root") {
+		t.Fatal("disabled root's established metadata session must be revoked")
+	}
+}
+
 func TestTableNames(t *testing.T) {
 	// Verify all models use the correct table names
 	tests := []struct {
@@ -448,16 +620,205 @@ func TestTableNames(t *testing.T) {
 	}{
 		{Org{}, "duckgres_orgs"},
 		{OrgUser{}, "duckgres_org_users"},
+		{OrgTeam{}, "duckgres_org_teams"},
+		{OrgUserSecret{}, "duckgres_org_user_secrets"},
 		{ManagedWarehouse{}, "duckgres_managed_warehouses"},
-		{GlobalConfig{}, "duckgres_global_config"},
-		{DuckLakeConfig{}, "duckgres_ducklake_config"},
-		{RateLimitConfig{}, "duckgres_rate_limit_config"},
-		{QueryLogConfig{}, "duckgres_query_log_config"},
 	}
 
 	for _, tt := range tests {
 		if got := tt.model.TableName(); got != tt.want {
 			t.Errorf("%T.TableName() = %q, want %q", tt.model, got, tt.want)
 		}
+	}
+}
+
+func TestOrgDefaultWorkerProfile(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"unset": {Name: "unset"},
+				"full": {
+					Name:                "full",
+					DefaultWorkerCPU:    "2",
+					DefaultWorkerMemory: "8Gi",
+					DefaultWorkerTTL:    "75m",
+				},
+				"partial": {Name: "partial", DefaultWorkerTTL: "10m"},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID                     string
+		wantCPU, wantMem, wantTTL string
+	}{
+		{"unknown", "", "", ""},
+		{"unset", "", "", ""},
+		{"full", "2", "8Gi", "75m"},
+		{"partial", "", "", "10m"},
+	}
+	for _, tt := range tests {
+		cpu, mem, ttl := cs.OrgDefaultWorkerProfile(tt.orgID)
+		if cpu != tt.wantCPU || mem != tt.wantMem || ttl != tt.wantTTL {
+			t.Errorf("OrgDefaultWorkerProfile(%q) = (%q,%q,%q); want (%q,%q,%q)",
+				tt.orgID, cpu, mem, ttl, tt.wantCPU, tt.wantMem, tt.wantTTL)
+		}
+	}
+
+	// Nil snapshot (store not yet loaded) must read as "not set", not panic.
+	empty := &ConfigStore{}
+	if cpu, mem, ttl := empty.OrgDefaultWorkerProfile("full"); cpu != "" || mem != "" || ttl != "" {
+		t.Errorf("nil-snapshot OrgDefaultWorkerProfile = (%q,%q,%q); want all empty", cpu, mem, ttl)
+	}
+}
+
+func TestOrgOldestTeamID(t *testing.T) {
+	older := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"no-teams": {Name: "no-teams"},
+				"one-team": {
+					Name:  "one-team",
+					Teams: []OrgTeamConfig{{TeamID: 7, SchemaName: "team_7", Enabled: true, CreatedAt: newer}},
+				},
+				"multi": {
+					Name: "multi",
+					Teams: []OrgTeamConfig{
+						{TeamID: 7, SchemaName: "team_7", Enabled: true, CreatedAt: newer},
+						{TeamID: 42, SchemaName: "team_42", Enabled: true, CreatedAt: older},
+					},
+				},
+				"tie": {
+					Name: "tie",
+					Teams: []OrgTeamConfig{
+						{TeamID: 9, SchemaName: "team_9", Enabled: true, CreatedAt: older},
+						{TeamID: 3, SchemaName: "team_3", Enabled: true, CreatedAt: older},
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID string
+		want  int64
+	}{
+		{"unknown", 0},
+		{"no-teams", 0}, // defensive: a committed org always has ≥1 team
+		{"one-team", 7},
+		{"multi", 42}, // oldest created_at wins
+		{"tie", 3},    // created_at tie broken by the smaller team_id
+	}
+	for _, tt := range tests {
+		if got := cs.OrgOldestTeamID(tt.orgID); got != tt.want {
+			t.Errorf("OrgOldestTeamID(%q) = %d; want %d", tt.orgID, got, tt.want)
+		}
+	}
+
+	// Nil snapshot (store not yet loaded) must read as 0, not panic — callers
+	// tolerate 0 per the documented contract.
+	empty := &ConfigStore{}
+	if got := empty.OrgOldestTeamID("multi"); got != 0 {
+		t.Errorf("nil-snapshot OrgOldestTeamID = %d; want 0", got)
+	}
+}
+
+func TestOrgUsageTeamID(t *testing.T) {
+	older := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)
+	userTeam := int64(99)
+	zeroTeam := int64(0)
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"multi": {
+					Name: "multi",
+					Teams: []OrgTeamConfig{
+						{TeamID: 7, SchemaName: "team_7", Enabled: true, CreatedAt: newer},
+						{TeamID: 42, SchemaName: "team_42", Enabled: true, CreatedAt: older},
+					},
+				},
+				"no-teams": {Name: "no-teams"},
+			},
+			OrgUserAccess: map[OrgUserKey]OrgUserAccessConfig{
+				{OrgID: "multi", Username: "reader"}:   {Mode: OrgUserAccessModeProjectReader, TeamID: &userTeam},
+				{OrgID: "multi", Username: "zeroteam"}: {Mode: OrgUserAccessModeUnrestricted, TeamID: &zeroTeam},
+				{OrgID: "multi", Username: "root"}:     {Mode: OrgUserAccessModeUnrestricted},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID, username string
+		want            int64
+	}{
+		{"multi", "reader", 99},   // user's own team wins
+		{"multi", "root", 42},     // user without a team → org's oldest team
+		{"multi", "zeroteam", 42}, // non-positive user team → oldest-team fallback
+		{"multi", "unknown", 42},  // unknown user → oldest-team fallback
+		{"no-teams", "anyone", 0}, // defensive: teamless org
+		{"unknown", "anyone", 0},  // unknown org
+	}
+	for _, tt := range tests {
+		if got := cs.OrgUsageTeamID(tt.orgID, tt.username); got != tt.want {
+			t.Errorf("OrgUsageTeamID(%q, %q) = %d; want %d", tt.orgID, tt.username, got, tt.want)
+		}
+	}
+
+	empty := &ConfigStore{}
+	if got := empty.OrgUsageTeamID("multi", "reader"); got != 0 {
+		t.Errorf("nil-snapshot OrgUsageTeamID = %d; want 0", got)
+	}
+}
+
+func TestOrgDefaultWorkerMinHotIdle(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"unset": {Name: "unset"},
+				"full":  {Name: "full", DefaultWorkerMinHotIdle: 2},
+			},
+		},
+	}
+
+	tests := []struct {
+		orgID string
+		want  int
+	}{
+		{"unknown", 0},
+		{"unset", 0},
+		{"full", 2},
+	}
+	for _, tt := range tests {
+		if got := cs.OrgDefaultWorkerMinHotIdle(tt.orgID); got != tt.want {
+			t.Errorf("OrgDefaultWorkerMinHotIdle(%q) = %d; want %d", tt.orgID, got, tt.want)
+		}
+	}
+
+	empty := &ConfigStore{}
+	if got := empty.OrgDefaultWorkerMinHotIdle("full"); got != 0 {
+		t.Errorf("nil-snapshot OrgDefaultWorkerMinHotIdle = %d; want 0", got)
+	}
+}
+
+func TestWithSnapshotHoldsPublicationReadLock(t *testing.T) {
+	snapshot := &Snapshot{Orgs: map[string]*OrgConfig{"analytics": {Name: "analytics"}}}
+	store := &ConfigStore{snapshot: snapshot}
+	called := false
+
+	store.WithSnapshot(func(got *Snapshot) {
+		called = true
+		if got != snapshot {
+			t.Fatal("WithSnapshot did not expose the currently published snapshot")
+		}
+		if store.mu.TryLock() {
+			store.mu.Unlock()
+			t.Fatal("WithSnapshot callback ran without holding the publication read lock")
+		}
+	})
+	if !called {
+		t.Fatal("WithSnapshot did not invoke callback")
 	}
 }

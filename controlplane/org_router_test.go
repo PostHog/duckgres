@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -16,7 +17,8 @@ import (
 )
 
 type recordingOrgRouterPool struct {
-	events *[]string
+	events        *[]string
+	shutdownCount *atomic.Int32
 }
 
 func (p *recordingOrgRouterPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) (*ManagedWorker, error) {
@@ -47,7 +49,12 @@ func (p *recordingOrgRouterPool) HealthCheckLoop(ctx context.Context, interval t
 func (p *recordingOrgRouterPool) SetMaxWorkers(n int) {}
 
 func (p *recordingOrgRouterPool) ShutdownAll() {
-	*p.events = append(*p.events, "pool ShutdownAll")
+	if p.events != nil {
+		*p.events = append(*p.events, "pool ShutdownAll")
+	}
+	if p.shutdownCount != nil {
+		p.shutdownCount.Add(1)
+	}
 }
 
 type recordingOrgRouterLease struct {
@@ -59,36 +66,45 @@ func (l *recordingOrgRouterLease) Release(ctx context.Context) error {
 	return nil
 }
 
-func TestOrgRouterIcebergConfigForOrg(t *testing.T) {
+type blockingOrgRouterLease struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (l *blockingOrgRouterLease) Release(context.Context) error {
+	l.started <- struct{}{}
+	<-l.release
+	return nil
+}
+
+func TestOrgRouterBeginDrainStopsCreationWithoutDestroyingEstablishedSessions(t *testing.T) {
+	first := NewSessionManager(nil, nil)
+	second := NewSessionManager(nil, nil)
+	first.sessions[1010] = &ManagedSession{PID: 1010}
+	second.sessions[2020] = &ManagedSession{PID: 2020}
+
 	router := &OrgRouter{
 		orgs: map[string]*OrgStack{
-			"org-acme": {
-				Config: &configstore.OrgConfig{
-					Name: "org-acme",
-					Warehouse: &configstore.ManagedWarehouseConfig{
-						Iceberg: configstore.ManagedWarehouseIceberg{
-							Enabled:             true,
-							Backend:             configstore.IcebergBackendLakekeeper,
-							Namespace:           "main",
-							Region:              "us-east-1",
-							LakekeeperEndpoint:  "http://lakekeeper/catalog",
-							LakekeeperWarehouse: "org-acme",
-						},
-					},
-				},
-			},
+			"first":  {Sessions: first},
+			"second": {Sessions: second},
 		},
 	}
 
-	cfg, ok := router.IcebergConfigForOrg("org-acme")
-	if !ok {
-		t.Fatal("expected Iceberg config for org")
+	router.BeginDrain()
+
+	for name, sessions := range map[string]*SessionManager{"first": first, "second": second} {
+		if !sessions.lifecycle.isClosed() {
+			t.Fatalf("expected %s org session manager to stop creation", name)
+		}
+		if got := sessions.SessionCount(); got != 1 {
+			t.Fatalf("expected %s org established session to survive BeginDrain, got %d", name, got)
+		}
 	}
-	if !cfg.Enabled || cfg.LakekeeperEndpoint != "http://lakekeeper/catalog" || cfg.LakekeeperWarehouse != "org-acme" {
-		t.Fatalf("unexpected Iceberg config: %+v", cfg)
-	}
-	if cfg.Namespace != "main" || cfg.Region != "us-east-1" {
-		t.Fatalf("expected namespace and region to be preserved, got %+v", cfg)
+
+	late := NewSessionManager(nil, nil)
+	router.publishOrgStack("late", &OrgStack{Sessions: late})
+	if !late.lifecycle.isClosed() {
+		t.Fatal("expected an org stack published after BeginDrain to start drained")
 	}
 }
 
@@ -96,6 +112,7 @@ func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSess
 	events := []string{}
 	pool := &recordingOrgRouterPool{events: &events}
 	sessions := NewSessionManager(pool, nil)
+	reclaimer := &recordingAdmissionReclaimer{}
 
 	sessions.mu.Lock()
 	sessions.sessions[1010] = &ManagedSession{
@@ -107,6 +124,7 @@ func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSess
 	sessions.mu.Unlock()
 
 	tr := &OrgRouter{
+		admissionReclaimer: reclaimer,
 		orgs: map[string]*OrgStack{
 			"analytics": {
 				Pool:     pool,
@@ -130,65 +148,1015 @@ func TestOrgRouterDestroyOrgStackDrainsSessionsBeforePoolShutdownAndReleasesSess
 	if _, ok := tr.orgs["analytics"]; ok {
 		t.Fatal("expected org stack to be removed")
 	}
+	if _, drainCalls := reclaimer.snapshot(); drainCalls != 0 {
+		t.Fatalf("DestroyOrgStack drained the CP-wide admission reclaimer %d times, want 0", drainCalls)
+	}
 }
 
-func TestOrgRouterReconcileWarmCapacityUsesExplicitSharedWarmTarget(t *testing.T) {
-	sharedPool, _ := newTestK8sPool(t, 10)
-	sharedPool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
-		sharedPool.mu.Lock()
-		defer sharedPool.mu.Unlock()
-		sharedPool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
-		return nil
+func TestOrgRouterShutdownAllDrainsAdmissionReclaimerAfterAllSessions(t *testing.T) {
+	orgs := []string{"first", "second"}
+	for i, org := range orgs {
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+		sessionAdmissionLimitVCPUsGauge.WithLabelValues(org).Set(float64(i + 1))
+		org := org
+		t.Cleanup(func() { sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org) })
 	}
-	tr := &OrgRouter{
-		sharedPool: sharedPool,
-		globalCfg: ControlPlaneConfig{
-			K8s: K8sConfig{
-				SharedWarmTarget: 4,
+	events := []string{}
+	firstPool := &recordingOrgRouterPool{events: &events}
+	secondPool := &recordingOrgRouterPool{events: &events}
+	firstSessions := NewSessionManager(firstPool, nil)
+	secondSessions := NewSessionManager(secondPool, nil)
+
+	addSession := func(sm *SessionManager, pid int32, workerID int) {
+		sm.mu.Lock()
+		defer sm.mu.Unlock()
+		sm.sessions[pid] = &ManagedSession{
+			PID: pid, WorkerID: workerID, lease: &recordingOrgRouterLease{events: &events},
+		}
+		sm.byWorker[workerID] = []int32{pid}
+	}
+	addSession(firstSessions, 1010, 7)
+	addSession(secondSessions, 2020, 8)
+
+	allSessionsDrained := false
+	reclaimer := &recordingAdmissionReclaimer{onDrain: func() {
+		allSessionsDrained = firstSessions.SessionCount() == 0 && secondSessions.SessionCount() == 0
+		events = append(events, "admission DrainAndClose")
+	}}
+	router := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"first":  {Pool: firstPool, Sessions: firstSessions, cancel: func() {}},
+			"second": {Pool: secondPool, Sessions: secondSessions, cancel: func() {}},
+		},
+		admissionReclaimer: reclaimer,
+	}
+
+	router.ShutdownAll()
+	router.ShutdownAll()
+
+	if !allSessionsDrained {
+		t.Fatal("admission reclaimer drained before every org session manager completed cleanup")
+	}
+	_, drainCalls := reclaimer.snapshot()
+	if drainCalls != 1 {
+		t.Fatalf("admission reclaimer drain calls = %d, want 1", drainCalls)
+	}
+	for _, org := range orgs {
+		if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_session_admission_limit_vcpus", map[string]string{"org": org}); ok {
+			t.Fatalf("shutdown left admission limit series for org %q", org)
+		}
+	}
+}
+
+func TestOrgRouterShutdownAllWaitsForConcurrentOrgDestroyBeforeDrainingReclaimer(t *testing.T) {
+	events := []string{}
+	pool := &recordingOrgRouterPool{events: &events}
+	lease := &blockingOrgRouterLease{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	sessions := NewSessionManager(pool, nil)
+	sessions.mu.Lock()
+	sessions.sessions[1010] = &ManagedSession{PID: 1010, WorkerID: 7, lease: lease}
+	sessions.byWorker[7] = []int32{1010}
+	sessions.mu.Unlock()
+
+	drainStarted := make(chan struct{}, 1)
+	reclaimer := &recordingAdmissionReclaimer{onDrain: func() {
+		drainStarted <- struct{}{}
+	}}
+	router := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {Pool: pool, Sessions: sessions, cancel: func() {}},
+		},
+		admissionReclaimer: reclaimer,
+	}
+
+	destroyDone := make(chan struct{})
+	go func() {
+		router.DestroyOrgStack("analytics")
+		close(destroyDone)
+	}()
+	select {
+	case <-lease.started:
+	case <-time.After(time.Second):
+		t.Fatal("org destroy did not reach lease release")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		router.ShutdownAll()
+		close(shutdownDone)
+	}()
+	prematureDrain := false
+	select {
+	case <-drainStarted:
+		prematureDrain = true
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(lease.release)
+	select {
+	case <-destroyDone:
+	case <-time.After(time.Second):
+		t.Fatal("org destroy did not finish after lease release")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("router shutdown did not finish after org destroy")
+	}
+	if prematureDrain {
+		t.Fatal("admission reclaimer drained while a detached org stack was still releasing leases")
+	}
+}
+
+func TestOrgRouterSerializesCreationBehindDestroyTeardown(t *testing.T) {
+	events := []string{}
+	pool := &recordingOrgRouterPool{events: &events}
+	lease := &blockingOrgRouterLease{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	sessions := NewSessionManager(pool, nil)
+	sessions.mu.Lock()
+	sessions.sessions[1010] = &ManagedSession{PID: 1010, WorkerID: 7, lease: lease}
+	sessions.byWorker[7] = []int32{1010}
+	sessions.mu.Unlock()
+	router := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {Pool: pool, Sessions: sessions},
+		},
+	}
+
+	destroyDone := make(chan struct{})
+	go func() {
+		router.DestroyOrgStack("analytics")
+		close(destroyDone)
+	}()
+	select {
+	case <-lease.started:
+	case <-time.After(time.Second):
+		t.Fatal("org destroy did not reach lease cleanup")
+	}
+
+	type beginResult struct {
+		finish func()
+		err    error
+	}
+	creationResult := make(chan beginResult, 1)
+	go func() {
+		finish, err := router.beginOrgStackCreation("analytics")
+		creationResult <- beginResult{finish: finish, err: err}
+	}()
+	select {
+	case result := <-creationResult:
+		if result.finish != nil {
+			result.finish()
+		}
+		t.Fatalf("replacement creation started before old stack teardown finished: %v", result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(lease.release)
+	select {
+	case <-destroyDone:
+	case <-time.After(time.Second):
+		t.Fatal("org destroy did not finish after lease cleanup")
+	}
+	select {
+	case result := <-creationResult:
+		if result.err != nil {
+			t.Fatalf("replacement creation after teardown: %v", result.err)
+		}
+		if result.finish == nil {
+			t.Fatal("replacement creation did not acquire the org mutation slot")
+		}
+		result.finish()
+	case <-time.After(time.Second):
+		t.Fatal("replacement creation did not resume after old stack teardown")
+	}
+}
+
+func TestOrgRouterShutdownDoesNotTeardownStackOwnedByConcurrentDestroy(t *testing.T) {
+	var shutdownCount atomic.Int32
+	pool := &recordingOrgRouterPool{shutdownCount: &shutdownCount}
+	stack := &OrgStack{Pool: pool}
+	router := &OrgRouter{
+		orgs: map[string]*OrgStack{"analytics": stack},
+	}
+	finishDestroy, err := router.beginOrgStackMutation("analytics")
+	if err != nil {
+		t.Fatalf("begin destroy mutation: %v", err)
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		router.ShutdownAll()
+		close(shutdownDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		router.mu.RLock()
+		terminal := router.terminal
+		router.mu.RUnlock()
+		if terminal {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("router shutdown did not become terminal")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	router.mu.Lock()
+	delete(router.orgs, "analytics")
+	router.mu.Unlock()
+	shutdownOrgStack(stack)
+	finishDestroy()
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("router shutdown did not finish after destroy mutation")
+	}
+	if got := shutdownCount.Load(); got != 1 {
+		t.Fatalf("org pool shutdown count = %d, want exactly one teardown owner", got)
+	}
+}
+
+func TestOrgRouterShutdownAllWaitsForInflightCreateAndRejectsLatePublication(t *testing.T) {
+	events := []string{}
+	pool := &recordingOrgRouterPool{events: &events}
+	sessions := NewSessionManager(pool, nil)
+	drainStarted := make(chan struct{}, 1)
+	reclaimer := &recordingAdmissionReclaimer{onDrain: func() {
+		drainStarted <- struct{}{}
+	}}
+	router := &OrgRouter{
+		orgs:               make(map[string]*OrgStack),
+		admissionReclaimer: reclaimer,
+	}
+
+	finishCreate, ok := router.beginOrgStackOperation()
+	if !ok {
+		t.Fatal("expected stack creation to register before shutdown")
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		router.ShutdownAll()
+		close(shutdownDone)
+	}()
+
+	terminalObserved := false
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		router.mu.RLock()
+		terminalObserved = router.terminal
+		router.mu.RUnlock()
+		if terminalObserved {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	prematureDrain := false
+	select {
+	case <-drainStarted:
+		prematureDrain = true
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	late := &OrgStack{
+		Pool:     pool,
+		Sessions: sessions,
+		cancel: func() {
+			events = append(events, "stack cancel")
+		},
+	}
+	publishResult := router.publishOrgStack("late", late)
+	if publishResult != orgStackPublishAccepted {
+		shutdownUnpublishedOrgStack(late)
+	}
+	finishCreate()
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("router shutdown did not finish after in-flight creation completed")
+	}
+
+	if !terminalObserved {
+		t.Fatal("router shutdown did not enter its terminal state")
+	}
+	if prematureDrain {
+		t.Fatal("admission reclaimer drained while an org stack creation was still in flight")
+	}
+	if publishResult != orgStackPublishRejectedTerminal {
+		t.Fatalf("late org stack publish result = %v, want terminal rejection", publishResult)
+	}
+	if _, ok := router.StackForOrg("late"); ok {
+		t.Fatal("late org stack remained visible after shutdown")
+	}
+	wantEvents := []string{"stack cancel"}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("late org stack cleanup events = %v, want %v", events, wantEvents)
+	}
+	if !sessions.lifecycle.isClosed() {
+		t.Fatal("late unpublished stack session lifecycle remained open")
+	}
+}
+
+func TestOrgRouterPublishOrgStackIsInsertOnlyWithoutOrgScopedLoserCleanup(t *testing.T) {
+	type candidate struct {
+		stack  *OrgStack
+		events *[]string
+	}
+
+	newCandidate := func() candidate {
+		events := []string{}
+		pool := &recordingOrgRouterPool{events: &events}
+		sessions := NewSessionManager(pool, nil)
+
+		return candidate{
+			stack: &OrgStack{
+				Pool:       pool,
+				Sessions:   sessions,
+				Rebalancer: NewMemoryRebalancer(1, 1, nil, false),
+				cancel: func() {
+					events = append(events, "stack cancel")
+				},
+			},
+			events: &events,
+		}
+	}
+
+	router := &OrgRouter{orgs: make(map[string]*OrgStack)}
+	candidates := []candidate{newCandidate(), newCandidate()}
+	start := make(chan struct{})
+	publishResults := make(chan orgStackPublishResult, len(candidates))
+	for _, candidate := range candidates {
+		candidate := candidate
+		go func() {
+			<-start
+			result := router.publishOrgStack("analytics", candidate.stack)
+			if result != orgStackPublishAccepted {
+				shutdownUnpublishedOrgStack(candidate.stack)
+			}
+			publishResults <- result
+		}()
+	}
+	close(start)
+
+	publishedCount := 0
+	for range candidates {
+		if result := <-publishResults; result == orgStackPublishAccepted {
+			publishedCount++
+		} else if result != orgStackPublishRejectedDuplicate {
+			t.Fatalf("concurrent publish result = %v, want accepted or duplicate rejection", result)
+		}
+	}
+	if publishedCount != 1 {
+		t.Fatalf("published stack count = %d, want 1", publishedCount)
+	}
+
+	winner, ok := router.StackForOrg("analytics")
+	if !ok {
+		t.Fatal("published org stack is missing")
+	}
+	if len(router.orgs) != 1 {
+		t.Fatalf("router org stack count = %d, want 1", len(router.orgs))
+	}
+
+	wantLoserEvents := []string{"stack cancel"}
+	for i, candidate := range candidates {
+		if candidate.stack == winner {
+			if len(*candidate.events) != 0 {
+				t.Fatalf("winner %d cleanup events = %v, want none", i, *candidate.events)
+			}
+			select {
+			case <-candidate.stack.Rebalancer.stopDebounce:
+				t.Fatalf("winner %d rebalancer was stopped", i)
+			default:
+			}
+			continue
+		}
+		if !reflect.DeepEqual(*candidate.events, wantLoserEvents) {
+			t.Fatalf("loser %d cleanup events = %v, want %v", i, *candidate.events, wantLoserEvents)
+		}
+		if !candidate.stack.Sessions.lifecycle.isClosed() {
+			t.Fatalf("loser %d session lifecycle remained open", i)
+		}
+		select {
+		case <-candidate.stack.Rebalancer.stopDebounce:
+		default:
+			t.Fatalf("loser %d rebalancer was not stopped", i)
+		}
+	}
+}
+
+func TestOrgRouterPublishCandidateRejectsReadyConfigSupersededDuringConstruction(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	ready := &configstore.OrgConfig{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateReady,
+			Image: "posthog/duckgres:ready",
+		},
+	}
+	provisioning := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateProvisioning,
+		},
+	}
+	store := newTestConfigStoreWithSnapshot(&configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{"analytics": provisioning},
+	})
+	router := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
+		configStore: store,
+	}
+	candidate := &OrgStack{
+		Config: ready,
+		Pool:   NewOrgReservedPool(sharedPool, "analytics", ready.MaxWorkers, ready.Warehouse.Image, nil),
+	}
+
+	result, err := router.publishOrgStackCandidate("analytics", candidate)
+	if err == nil {
+		t.Fatal("candidate authorized by superseded ready config was not rejected")
+	}
+	if result != orgStackPublishRejectedConfig {
+		t.Fatalf("candidate publish result = %v, want config rejection", result)
+	}
+	if _, ok := router.StackForOrg("analytics"); ok {
+		t.Fatal("candidate authorized by superseded ready config was published")
+	}
+}
+
+func TestOrgRouterPublishCandidateRefreshesReadyConfigSupersededDuringConstruction(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	readyV1 := &configstore.OrgConfig{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateReady,
+			Image: "posthog/duckgres:v1",
+		},
+	}
+	readyV2 := &configstore.OrgConfig{
+		Name:       "analytics",
+		MaxWorkers: 7,
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateReady,
+			Image: "posthog/duckgres:v2",
+		},
+	}
+	store := newTestConfigStoreWithSnapshot(&configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{"analytics": readyV2},
+	})
+	pool := NewOrgReservedPool(sharedPool, "analytics", readyV1.MaxWorkers, readyV1.Warehouse.Image, nil)
+	candidate := &OrgStack{Config: readyV1, Pool: pool}
+	router := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
+		configStore: store,
+	}
+
+	result, err := router.publishOrgStackCandidate("analytics", candidate)
+	if err != nil {
+		t.Fatalf("publish candidate: %v", err)
+	}
+	if result != orgStackPublishAccepted {
+		t.Fatalf("candidate publish result = %v, want accepted", result)
+	}
+	if candidate.Config != readyV2 {
+		t.Fatal("candidate did not adopt the latest ready config before publication")
+	}
+	if pool.maxWorkers != readyV2.MaxWorkers {
+		t.Fatalf("candidate max workers = %d, want %d", pool.maxWorkers, readyV2.MaxWorkers)
+	}
+	if pool.image != readyV2.Warehouse.Image {
+		t.Fatalf("candidate image = %q, want %q", pool.image, readyV2.Warehouse.Image)
+	}
+	if got, ok := router.StackForOrg("analytics"); !ok || got != candidate {
+		t.Fatal("latest-ready candidate was not published")
+	}
+	router.DestroyOrgStack("analytics")
+}
+
+func TestOrgRouterPublishCandidateRejectsUnexpectedPoolType(t *testing.T) {
+	ready := &configstore.OrgConfig{Name: "analytics"}
+	store := newTestConfigStoreWithSnapshot(&configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{"analytics": ready},
+	})
+	router := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
+		configStore: store,
+	}
+	candidate := &OrgStack{Config: ready, Pool: &recordingOrgRouterPool{}}
+
+	result, err := router.publishOrgStackCandidate("analytics", candidate)
+	if err == nil {
+		t.Fatal("candidate with unexpected pool type was not rejected")
+	}
+	if result != orgStackPublishRejectedConfig {
+		t.Fatalf("candidate publish result = %v, want config rejection", result)
+	}
+	if _, ok := router.StackForOrg("analytics"); ok {
+		t.Fatal("candidate with unexpected pool type was published")
+	}
+}
+
+func TestOrgRouterSerializesConcurrentCreationBeforeBuildingDuplicatePool(t *testing.T) {
+	router := &OrgRouter{orgs: make(map[string]*OrgStack)}
+	finishFirst, err := router.beginOrgStackCreation("analytics")
+	if err != nil {
+		t.Fatalf("begin first creation: %v", err)
+	}
+
+	type beginResult struct {
+		finish func()
+		err    error
+	}
+	secondResult := make(chan beginResult, 1)
+	go func() {
+		finish, err := router.beginOrgStackCreation("analytics")
+		secondResult <- beginResult{finish: finish, err: err}
+	}()
+	select {
+	case result := <-secondResult:
+		if result.finish != nil {
+			result.finish()
+		}
+		t.Fatalf("second same-org creation was not serialized: %v", result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	router.mu.Lock()
+	router.orgs["analytics"] = &OrgStack{}
+	router.mu.Unlock()
+	finishFirst()
+
+	select {
+	case result := <-secondResult:
+		if result.finish != nil {
+			result.finish()
+			t.Fatal("second creation acquired ownership after the first published")
+		}
+		if result.err == nil {
+			t.Fatal("second creation did not report the published org stack")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second creation did not resume after the first finished")
+	}
+}
+
+func TestOrgRouterHandleConfigChangeStaleRemovalKeepsStackRequiredByLatestSnapshot(t *testing.T) {
+	org := &configstore.OrgConfig{Name: "analytics"}
+	latest := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{"analytics": org},
+	}
+	store := newTestConfigStoreWithSnapshot(latest)
+	var shutdownCount atomic.Int32
+	stack := &OrgStack{
+		Config: org,
+		Pool:   &recordingOrgRouterPool{shutdownCount: &shutdownCount},
+	}
+	router := &OrgRouter{
+		orgs:        map[string]*OrgStack{"analytics": stack},
+		configStore: store,
+	}
+
+	// Model an older removal callback that resumes after ConfigStore has already
+	// published a newer snapshot in which the org should remain available.
+	router.HandleConfigChange(latest, &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}})
+
+	got, ok := router.StackForOrg("analytics")
+	if !ok || got != stack {
+		t.Fatal("stale removal callback destroyed the stack required by the latest snapshot")
+	}
+	if got := shutdownCount.Load(); got != 0 {
+		t.Fatalf("stale removal callback shut down the current stack %d times, want 0", got)
+	}
+}
+
+func TestOrgRouterHandleConfigChangeStaleReadyDoesNotCreateAgainstLatestSnapshot(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	staleReady := &configstore.OrgConfig{Name: "analytics"}
+	latestDeleting := &configstore.OrgConfig{
+		Name: "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateDeleting,
+		},
+	}
+	store := newTestConfigStoreWithSnapshot(&configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{"analytics": latestDeleting},
+	})
+	router := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
+		configStore: store,
+		sharedPool:  sharedPool,
+	}
+	t.Cleanup(router.ShutdownAll)
+
+	// Model an older ready callback that resumes after the latest snapshot has
+	// moved the warehouse into deletion.
+	router.HandleConfigChange(
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": staleReady}},
+	)
+
+	_, created := router.StackForOrg("analytics")
+	if created {
+		t.Fatal("stale ready callback created a stack rejected by the latest snapshot")
+	}
+}
+
+func TestOrgRouterHandleConfigChangeDeletingDestroysExistingStackExactlyOnce(t *testing.T) {
+	ready := &configstore.OrgConfig{
+		Name:      "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{State: configstore.ManagedWarehouseStateReady},
+	}
+	deleting := &configstore.OrgConfig{
+		Name:      "analytics",
+		Warehouse: &configstore.ManagedWarehouseConfig{State: configstore.ManagedWarehouseStateDeleting},
+	}
+	latest := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": deleting}}
+	store := newTestConfigStoreWithSnapshot(latest)
+	var shutdownCount atomic.Int32
+	router := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {
+				Config: ready,
+				Pool:   &recordingOrgRouterPool{shutdownCount: &shutdownCount},
 			},
 		},
+		configStore: store,
 	}
 
-	snap := &configstore.Snapshot{
-		Orgs: map[string]*configstore.OrgConfig{
-			"analytics": {Name: "analytics"},
-			"billing":   {Name: "billing"},
-		},
+	router.HandleConfigChange(
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": ready}},
+		latest,
+	)
+
+	if _, ok := router.StackForOrg("analytics"); ok {
+		t.Fatal("deleting warehouse retained its org stack")
 	}
-
-	tr.reconcileWarmCapacity(snap)
-
-	if got := sharedPool.minWorkers; got != 4 {
-		t.Fatalf("expected shared warm target 4, got %d", got)
+	if got := shutdownCount.Load(); got != 1 {
+		t.Fatalf("deleting warehouse shut down stack %d times, want 1", got)
 	}
 }
 
-func TestOrgRouterAdapterSetWarmCapacityTargetZeroClearsAllWarmTargets(t *testing.T) {
-	sharedPool, _ := newTestK8sPool(t, 10)
-	sharedPool.SetWarmCapacityTarget(4)
-	sharedPool.SetPerImageWarmTargets(map[string]int{
-		"posthog/duckgres:default": 4,
-		"posthog/duckgres:v1.5.1":  1,
-	})
-	adapter := &orgRouterAdapter{
-		router: &OrgRouter{
-			sharedPool: sharedPool,
+func TestOrgRouterHandleConfigChangeReconcilesAfterRemovalBecomesStaleInFlight(t *testing.T) {
+	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
+	org := &configstore.OrgConfig{Name: "analytics"}
+	beforeRemoval := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{"analytics": org},
+		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+			key: {Mode: configstore.OrgUserAccessModeProjectReader},
 		},
 	}
-
-	adapter.SetWarmCapacityTarget(0)
-
-	if got := sharedPool.WarmCapacityTarget(); got != 0 {
-		t.Fatalf("expected shared warm target 0, got %d", got)
+	removed := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}}
+	restored := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{"analytics": org},
 	}
-	if got := sharedPool.PerImageWarmTargets(); len(got) != 0 {
-		t.Fatalf("expected per-image warm targets to be cleared, got %v", got)
+	store := newTestConfigStoreWithSnapshot(removed)
+	var shutdownCount atomic.Int32
+	stack := &OrgStack{
+		Config: org,
+		Pool:   &recordingOrgRouterPool{shutdownCount: &shutdownCount},
+	}
+	router := &OrgRouter{
+		orgs:        map[string]*OrgStack{"analytics": stack},
+		configStore: store,
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	releaseBarrier := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	t.Cleanup(releaseBarrier)
+	router.setProjectScopedUserChangeHandler(func(string, string) {
+		close(entered)
+		<-release
+	})
+	staleDone := make(chan struct{})
+	go func() {
+		router.HandleConfigChange(beforeRemoval, removed)
+		close(staleDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("stale removal callback did not reach the barrier")
+	}
+
+	setTestConfigStoreSnapshot(store, restored)
+	latestDone := make(chan struct{})
+	go func() {
+		router.HandleConfigChange(removed, restored)
+		close(latestDone)
+	}()
+	select {
+	case <-latestDone:
+	case <-time.After(time.Second):
+		t.Fatal("latest restore callback did not finish")
+	}
+	if got, ok := router.StackForOrg("analytics"); !ok || got != stack {
+		t.Fatal("latest restore callback did not preserve the current stack")
+	}
+
+	releaseBarrier()
+	select {
+	case <-staleDone:
+	case <-time.After(time.Second):
+		t.Fatal("stale removal callback did not finish")
+	}
+
+	got, ok := router.StackForOrg("analytics")
+	if !ok || got != stack {
+		t.Fatal("in-flight stale removal destroyed the stack restored by the latest snapshot")
+	}
+	if got := shutdownCount.Load(); got != 0 {
+		t.Fatalf("in-flight stale removal shut down the current stack %d times, want 0", got)
+	}
+}
+
+func TestOrgRouterHandleConfigChangeReconcilesLatestConfigAfterCreateBecomesStaleInFlight(t *testing.T) {
+	sharedPool, _ := newTestK8sPool(t, 10)
+	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
+	v1 := &configstore.OrgConfig{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateReady,
+			Image: "posthog/duckgres:v1",
+		},
+	}
+	v2 := &configstore.OrgConfig{
+		Name:       "analytics",
+		MaxWorkers: 7,
+		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateReady,
+			Image: "posthog/duckgres:v2",
+		},
+	}
+	userAccess := map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+		key: {Mode: configstore.OrgUserAccessModeProjectReader},
+	}
+	beforeCreate := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}}
+	readyV1 := &configstore.Snapshot{
+		Orgs:          map[string]*configstore.OrgConfig{"analytics": v1},
+		OrgUserAccess: userAccess,
+	}
+	readyV2 := &configstore.Snapshot{
+		Orgs:          map[string]*configstore.OrgConfig{"analytics": v2},
+		OrgUserAccess: userAccess,
+	}
+	store := newTestConfigStoreWithSnapshot(readyV1)
+	router := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
+		configStore: store,
+		sharedPool:  sharedPool,
+	}
+	t.Cleanup(router.ShutdownAll)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	releaseBarrier := func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}
+	t.Cleanup(releaseBarrier)
+	router.setProjectScopedUserChangeHandler(func(string, string) {
+		close(entered)
+		<-release
+	})
+	staleDone := make(chan struct{})
+	go func() {
+		router.HandleConfigChange(beforeCreate, readyV1)
+		close(staleDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("stale create callback did not reach the barrier")
+	}
+
+	setTestConfigStoreSnapshot(store, readyV2)
+	latestDone := make(chan struct{})
+	go func() {
+		router.HandleConfigChange(readyV1, readyV2)
+		close(latestDone)
+	}()
+	select {
+	case <-latestDone:
+	case <-time.After(time.Second):
+		t.Fatal("latest ready callback did not finish")
+	}
+	latestStack, ok := router.StackForOrg("analytics")
+	if !ok || latestStack.Config != v2 {
+		t.Fatal("latest ready callback did not publish the v2 stack")
+	}
+
+	releaseBarrier()
+	select {
+	case <-staleDone:
+	case <-time.After(time.Second):
+		t.Fatal("stale create callback did not finish")
+	}
+
+	stack, ok := router.StackForOrg("analytics")
+	if !ok {
+		t.Fatal("latest ready snapshot did not result in an org stack")
+	}
+	if stack != latestStack {
+		t.Fatal("stale callback replaced the generation published by the latest callback")
+	}
+	if stack.Config != v2 {
+		t.Fatal("in-flight stale create did not publish the latest org config")
+	}
+	pool, ok := stack.Pool.(*OrgReservedPool)
+	if !ok {
+		t.Fatalf("org stack pool type = %T, want *OrgReservedPool", stack.Pool)
+	}
+	if pool.maxWorkers != v2.MaxWorkers {
+		t.Fatalf("org stack max workers = %d, want %d", pool.maxWorkers, v2.MaxWorkers)
+	}
+	if pool.image != v2.Warehouse.Image {
+		t.Fatalf("org stack image = %q, want %q", pool.image, v2.Warehouse.Image)
+	}
+}
+
+func TestLatestOrgStackStateMatchesWarehouseLifecycle(t *testing.T) {
+	orgWithState := func(state configstore.ManagedWarehouseProvisioningState) *configstore.OrgConfig {
+		return &configstore.OrgConfig{
+			Name:      "analytics",
+			Warehouse: &configstore.ManagedWarehouseConfig{State: state},
+		}
+	}
+	tests := []struct {
+		name     string
+		snapshot *configstore.Snapshot
+		want     orgStackReconcileState
+	}{
+		{name: "snapshot unavailable", want: orgStackPreserve},
+		{name: "org removed", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}}, want: orgStackEnsureAbsent},
+		{name: "legacy org", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": {Name: "analytics"}}}, want: orgStackEnsurePresent},
+		{name: "ready", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": orgWithState(configstore.ManagedWarehouseStateReady)}}, want: orgStackEnsurePresent},
+		{name: "deleting", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": orgWithState(configstore.ManagedWarehouseStateDeleting)}}, want: orgStackEnsureAbsent},
+		{name: "deleted", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": orgWithState(configstore.ManagedWarehouseStateDeleted)}}, want: orgStackEnsureAbsent},
+		{name: "pending", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": orgWithState(configstore.ManagedWarehouseStatePending)}}, want: orgStackPreserve},
+		{name: "provisioning", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": orgWithState(configstore.ManagedWarehouseStateProvisioning)}}, want: orgStackPreserve},
+		{name: "failed", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": orgWithState(configstore.ManagedWarehouseStateFailed)}}, want: orgStackPreserve},
+		{name: "resharding", snapshot: &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": orgWithState(configstore.ManagedWarehouseStateResharding)}}, want: orgStackPreserve},
+	}
+
+	router := &OrgRouter{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got := router.latestOrgStackState("analytics", tt.snapshot)
+			if got != tt.want {
+				t.Fatalf("latestOrgStackState = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestChangedProjectReaderUsersDetectsNamespaceAndCredentialChanges(t *testing.T) {
+	teamID := int64(2)
+	key := configstore.OrgUserKey{OrgID: "org-a", Username: "posthog_team_2"}
+	old := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "team_2"}}},
+		},
+		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+			key: {Mode: configstore.OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "old-hash"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+	}
+	updatedNamespace := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "renamed"}}},
+		},
+		OrgUserAccess:   old.OrgUserAccess,
+		OrgUserPassword: old.OrgUserPassword,
+		OrgUserDisabled: old.OrgUserDisabled,
+	}
+	if _, ok := changedProjectScopedUsers(old, updatedNamespace)[key]; !ok {
+		t.Fatal("namespace change did not invalidate project reader")
+	}
+
+	updatedPassword := *old
+	updatedPassword.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new-hash"}
+	if _, ok := changedProjectScopedUsers(old, &updatedPassword)[key]; !ok {
+		t.Fatal("credential change did not invalidate project reader")
+	}
+}
+
+// A mode flip is a policy change: promoting a reader to a project user (or
+// demoting one back) must tear down the live sessions that were established
+// under the old capability, not wait for the user to reconnect. The demotion
+// direction is the load-bearing one — a demoted user keeping a write-authorized
+// session would still be writing after the operator revoked the grant.
+func TestChangedProjectScopedUsersDetectsAccessModeFlips(t *testing.T) {
+	teamID := int64(2)
+	key := configstore.OrgUserKey{OrgID: "org-a", Username: "posthog_team_2_rw"}
+	snapshotWithMode := func(mode string) *configstore.Snapshot {
+		return &configstore.Snapshot{
+			Orgs: map[string]*configstore.OrgConfig{
+				"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "team_2", Enabled: true}}},
+			},
+			OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+				key: {Mode: mode, TeamID: &teamID},
+			},
+			OrgUserPassword: map[configstore.OrgUserKey]string{key: "hash"},
+			OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+		}
+	}
+	reader := snapshotWithMode(configstore.OrgUserAccessModeProjectReader)
+	writer := snapshotWithMode(configstore.OrgUserAccessModeProjectUser)
+
+	if _, ok := changedProjectScopedUsers(reader, writer)[key]; !ok {
+		t.Fatal("promotion to project_user did not invalidate the session")
+	}
+	if _, ok := changedProjectScopedUsers(writer, reader)[key]; !ok {
+		t.Fatal("demotion to project_reader did not invalidate the write-authorized session")
+	}
+	if _, ok := changedProjectScopedUsers(writer, snapshotWithMode(configstore.OrgUserAccessModeProjectUser))[key]; ok {
+		t.Fatal("an unchanged project_user must not be invalidated")
+	}
+}
+
+// A project user's team edits invalidate its sessions the same way a reader's
+// do — the namespace derivation is shared, so a schema rename must not leave a
+// writer pointed at the old namespaces.
+func TestChangedProjectScopedUsersTracksProjectUserNamespaces(t *testing.T) {
+	teamID := int64(2)
+	key := configstore.OrgUserKey{OrgID: "org-a", Username: "posthog_team_2_rw"}
+	access := map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+		key: {Mode: configstore.OrgUserAccessModeProjectUser, TeamID: &teamID},
+	}
+	old := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "team_2", Enabled: true}}},
+		},
+		OrgUserAccess:   access,
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "hash"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+	}
+	renamed := &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{
+			"org-a": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, SchemaName: "renamed", Enabled: true}}},
+		},
+		OrgUserAccess:   access,
+		OrgUserPassword: old.OrgUserPassword,
+		OrgUserDisabled: old.OrgUserDisabled,
+	}
+	if _, ok := changedProjectScopedUsers(old, renamed)[key]; !ok {
+		t.Fatal("namespace change did not invalidate project user")
+	}
+}
+
+func TestOrgRouterHandleConfigChangeNotifiesFlightSessionRevocation(t *testing.T) {
+	teamID := int64(42)
+	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
+	old := &configstore.Snapshot{
+		Orgs:            map[string]*configstore.OrgConfig{"analytics": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, Enabled: true}}}},
+		OrgUserPassword: map[configstore.OrgUserKey]string{key: "old"},
+		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
+		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
+			key: {Mode: configstore.OrgUserAccessModeProjectReader, TeamID: &teamID},
+		},
+	}
+	updated := *old
+	updated.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new"}
+
+	var revokedOrg, revokedUser string
+	router := &OrgRouter{orgs: map[string]*OrgStack{
+		"analytics": {Config: old.Orgs["analytics"]},
+	}}
+	router.setProjectScopedUserChangeHandler(func(orgID, username string) {
+		revokedOrg, revokedUser = orgID, username
+	})
+	router.HandleConfigChange(old, &updated)
+
+	if revokedOrg != "analytics" || revokedUser != "reader" {
+		t.Fatalf("revoked user = %s/%s, want analytics/reader", revokedOrg, revokedUser)
 	}
 }
 
 func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil, 0, 0)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, sharedPool.workerImage, nil)
 
 	oldTC := &configstore.OrgConfig{
 		Name: "analytics",
@@ -214,7 +1182,7 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 				Pool:   pool,
 			},
 		},
-		baseCfg:   K8sWorkerPoolConfig{MaxWorkers: 2},
+		baseCfg:   K8sWorkerPoolConfig{},
 		globalCfg: ControlPlaneConfig{},
 	}
 
@@ -228,9 +1196,60 @@ func TestOrgRouterHandleConfigChangeRefreshesRuntimeOnlyUpdates(t *testing.T) {
 	}
 }
 
+func TestOrgRouterReconcilesAdmissionLimitGaugeWithOrgStackLifecycle(t *testing.T) {
+	const org = "admission-limit-lifecycle"
+	sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+
+	sharedPool, _ := newTestK8sPool(t, 10)
+	initial := &configstore.OrgConfig{Name: org, MaxVCPUs: 16}
+	initialSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{org: initial}}
+	store := newTestConfigStoreWithSnapshot(initialSnapshot)
+	tr := &OrgRouter{
+		orgs:        make(map[string]*OrgStack),
+		configStore: store,
+		baseCfg:     K8sWorkerPoolConfig{},
+		sharedPool:  sharedPool,
+		globalCfg:   ControlPlaneConfig{},
+	}
+	t.Cleanup(func() {
+		tr.DestroyOrgStack(org)
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+	})
+
+	if _, err := tr.createOrgStack(initial); err != nil {
+		t.Fatalf("createOrgStack: %v", err)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 16 {
+		t.Fatalf("initial admission limit = %v, want 16", got)
+	}
+
+	lowered := &configstore.OrgConfig{Name: org, MaxVCPUs: 8}
+	loweredSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{org: lowered}}
+	setTestConfigStoreSnapshot(store, loweredSnapshot)
+	tr.HandleConfigChange(initialSnapshot, loweredSnapshot)
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 8 {
+		t.Fatalf("lowered admission limit = %v, want 8", got)
+	}
+
+	unlimited := &configstore.OrgConfig{Name: org, MaxVCPUs: 0}
+	unlimitedSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{org: unlimited}}
+	setTestConfigStoreSnapshot(store, unlimitedSnapshot)
+	tr.HandleConfigChange(loweredSnapshot, unlimitedSnapshot)
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 0 {
+		t.Fatalf("unlimited admission limit = %v, want 0", got)
+	}
+
+	removedSnapshot := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}}
+	setTestConfigStoreSnapshot(store, removedSnapshot)
+	tr.HandleConfigChange(unlimitedSnapshot, removedSnapshot)
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_session_admission_limit_vcpus", map[string]string{"org": org}); ok {
+		t.Fatal("expected removed org's admission limit series to be deleted")
+	}
+}
+
 func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	pool := NewOrgReservedPool(sharedPool, "analytics", 2, "posthog/duckgres:v1.0.0", nil, 0, 0)
+	pool := NewOrgReservedPool(sharedPool, "analytics", 2, "posthog/duckgres:v1.0.0", nil)
 
 	oldTC := &configstore.OrgConfig{
 		Name: "analytics",
@@ -252,7 +1271,7 @@ func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
 				Pool:   pool,
 			},
 		},
-		baseCfg: K8sWorkerPoolConfig{MaxWorkers: 2, WorkerImage: "posthog/duckgres:v1.0.0"},
+		baseCfg: K8sWorkerPoolConfig{WorkerImage: "posthog/duckgres:v1.0.0"},
 	}
 
 	tr.HandleConfigChange(
@@ -265,12 +1284,67 @@ func TestOrgRouterHandleConfigChangeRefreshesOrgWorkerImage(t *testing.T) {
 	}
 }
 
+func TestOrgRouterHandleConfigChangeRefreshesDefaultWorkerMinHotIdle(t *testing.T) {
+	pool := &recordingFloorConfigPool{}
+
+	oldTC := &configstore.OrgConfig{Name: "analytics", DefaultWorkerMinHotIdle: 1}
+	newTC := &configstore.OrgConfig{Name: "analytics", DefaultWorkerMinHotIdle: 3}
+
+	tr := &OrgRouter{
+		orgs: map[string]*OrgStack{
+			"analytics": {
+				Config: oldTC,
+				Pool:   pool,
+			},
+		},
+		baseCfg: K8sWorkerPoolConfig{},
+	}
+
+	tr.HandleConfigChange(
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": oldTC}},
+		&configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{"analytics": newTC}},
+	)
+
+	if pool.floorUpdates != 0 {
+		t.Fatalf("retention-only floor should not update pool state, got %d calls", pool.floorUpdates)
+	}
+}
+
+type recordingFloorConfigPool struct {
+	floorUpdates int
+}
+
+func (p *recordingFloorConfigPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
+	return nil, nil
+}
+
+func (p *recordingFloorConfigPool) ReleaseWorker(id int) {}
+
+func (p *recordingFloorConfigPool) RetireWorker(id int) {}
+
+func (p *recordingFloorConfigPool) RetireWorkerIfNoSessions(id int) bool { return false }
+
+func (p *recordingFloorConfigPool) Worker(id int) (*ManagedWorker, bool) { return nil, false }
+
+func (p *recordingFloorConfigPool) SpawnMinWorkers(count int) error { return nil }
+
+func (p *recordingFloorConfigPool) HealthCheckLoop(ctx context.Context, interval time.Duration, onCrash WorkerCrashHandler, onProgress ProgressHandler) {
+}
+
+func (p *recordingFloorConfigPool) SetMaxWorkers(n int) {}
+
+func (p *recordingFloorConfigPool) ShutdownAll() {}
+
+func (p *recordingFloorConfigPool) SetDefaultWorkerMinHotIdle(n int) {
+	p.floorUpdates++
+}
+
 func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerActivator(t *testing.T) {
 	sharedPool, cs := newTestK8sPool(t, 10)
 	sharedPool.healthCheckFunc = func(ctx context.Context, worker *ManagedWorker) error {
 		return nil
 	}
-	sharedPool.spawnWarmWorkerFunc = func(ctx context.Context, id int) error {
+	sharedPool.spawnWorkerFunc = func(ctx context.Context, id int, image string, profile WorkerProfile) error {
 		sharedPool.mu.Lock()
 		sharedPool.workers[id] = &ManagedWorker{ID: id, done: make(chan struct{})}
 		sharedPool.mu.Unlock()
@@ -291,6 +1365,7 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 	oldOrg := &configstore.OrgConfig{
 		Name: "analytics",
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateReady,
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "tenant-a",
 			},
@@ -313,6 +1388,7 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 			"bob": "ignored",
 		},
 		Warehouse: &configstore.ManagedWarehouseConfig{
+			State: configstore.ManagedWarehouseStateReady,
 			WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
 				Namespace: "tenant-a",
 			},
@@ -335,13 +1411,15 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 			"analytics": oldOrg,
 		},
 	})
+	reclaimer := &recordingAdmissionReclaimer{}
 
 	tr := &OrgRouter{
-		orgs:        make(map[string]*OrgStack),
-		configStore: store,
-		baseCfg:     K8sWorkerPoolConfig{MaxWorkers: 2},
-		sharedPool:  sharedPool,
-		globalCfg:   ControlPlaneConfig{},
+		orgs:               make(map[string]*OrgStack),
+		configStore:        store,
+		baseCfg:            K8sWorkerPoolConfig{},
+		sharedPool:         sharedPool,
+		globalCfg:          ControlPlaneConfig{},
+		admissionReclaimer: reclaimer,
 	}
 
 	var captured TenantActivationPayload
@@ -353,6 +1431,13 @@ func TestOrgRouterCreateOrgStackActivatesUsingLatestSnapshotThroughSharedWorkerA
 	stack, err := tr.createOrgStack(oldOrg)
 	if err != nil {
 		t.Fatalf("createOrgStack: %v", err)
+	}
+	limiter, ok := stack.Sessions.limiter.(*runtimeOrgConnectionLimiter)
+	if !ok {
+		t.Fatalf("org stack limiter type = %T, want *runtimeOrgConnectionLimiter", stack.Sessions.limiter)
+	}
+	if limiter.reclaimer != reclaimer {
+		t.Fatalf("org stack limiter reclaimer = %p, want shared router reclaimer %p", limiter.reclaimer, reclaimer)
 	}
 
 	setTestConfigStoreSnapshot(store, &configstore.Snapshot{
@@ -454,134 +1539,5 @@ func TestWorkerImageForOrg(t *testing.T) {
 				t.Fatalf("expected %q, got %q", tt.expected, got)
 			}
 		})
-	}
-}
-
-func TestOrgRouterReconcileWarmCapacityFloorsOnePerActiveImage(t *testing.T) {
-	sharedPool, _ := newTestK8sPool(t, 10)
-
-	tr := &OrgRouter{
-		sharedPool: sharedPool,
-		baseCfg: K8sWorkerPoolConfig{
-			WorkerImage: "posthog/duckgres:default",
-		},
-		globalCfg: ControlPlaneConfig{},
-		orgs: map[string]*OrgStack{
-			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
-			"billing":   {Config: &configstore.OrgConfig{Name: "billing"}},
-			// orphans-without-stack — should NOT contribute to per-image floor
-		},
-	}
-
-	snap := &configstore.Snapshot{
-		Orgs: map[string]*configstore.OrgConfig{
-			"analytics": {
-				Name: "analytics",
-				Warehouse: &configstore.ManagedWarehouseConfig{
-					Image: "posthog/duckgres:v1.5.1",
-				},
-			},
-			"billing": {
-				Name: "billing",
-				// no Warehouse pin → falls back to cluster default
-			},
-			"dormant": {
-				Name: "dormant",
-				Warehouse: &configstore.ManagedWarehouseConfig{
-					Image: "posthog/duckgres:v1.4.0",
-				},
-				// not in tr.orgs → skipped
-			},
-		},
-	}
-
-	tr.reconcileWarmCapacity(snap)
-
-	got := sharedPool.PerImageWarmTargets()
-	want := map[string]int{
-		"posthog/duckgres:default": 1,
-		"posthog/duckgres:v1.5.1":  1,
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected per-image targets %v, got %v", want, got)
-	}
-}
-
-func TestOrgRouterReconcileWarmCapacityTreatsSharedWarmTargetAsDefaultImageBase(t *testing.T) {
-	sharedPool, _ := newTestK8sPool(t, 10)
-
-	tr := &OrgRouter{
-		sharedPool: sharedPool,
-		baseCfg: K8sWorkerPoolConfig{
-			WorkerImage: "posthog/duckgres:default",
-		},
-		globalCfg: ControlPlaneConfig{
-			K8s: K8sConfig{
-				SharedWarmTarget: 4,
-			},
-		},
-		orgs: map[string]*OrgStack{
-			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
-			"billing":   {Config: &configstore.OrgConfig{Name: "billing"}},
-		},
-	}
-
-	snap := &configstore.Snapshot{
-		Orgs: map[string]*configstore.OrgConfig{
-			"analytics": {
-				Name: "analytics",
-				Warehouse: &configstore.ManagedWarehouseConfig{
-					Image: "posthog/duckgres:v1.5.1",
-				},
-			},
-			"billing": {
-				Name: "billing",
-			},
-		},
-	}
-
-	tr.reconcileWarmCapacity(snap)
-
-	got := sharedPool.PerImageWarmTargets()
-	want := map[string]int{
-		"posthog/duckgres:default": 4,
-		"posthog/duckgres:v1.5.1":  1,
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected per-image targets %v, got %v", want, got)
-	}
-}
-
-func TestOrgRouterReconcileWarmCapacitySkipsEmptyClusterDefault(t *testing.T) {
-	sharedPool, _ := newTestK8sPool(t, 10)
-
-	tr := &OrgRouter{
-		sharedPool: sharedPool,
-		baseCfg:    K8sWorkerPoolConfig{}, // WorkerImage unset
-		globalCfg:  ControlPlaneConfig{},
-		orgs: map[string]*OrgStack{
-			"analytics": {Config: &configstore.OrgConfig{Name: "analytics"}},
-		},
-	}
-
-	snap := &configstore.Snapshot{
-		Orgs: map[string]*configstore.OrgConfig{
-			"analytics": {
-				Name: "analytics",
-				Warehouse: &configstore.ManagedWarehouseConfig{
-					Image: "posthog/duckgres:v1.5.1",
-				},
-			},
-		},
-	}
-
-	tr.reconcileWarmCapacity(snap)
-
-	got := sharedPool.PerImageWarmTargets()
-	want := map[string]int{
-		"posthog/duckgres:v1.5.1": 1,
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected per-image targets %v, got %v", want, got)
 	}
 }

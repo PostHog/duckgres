@@ -31,8 +31,8 @@ func TestLocalConfigStoreSeedSQL(t *testing.T) {
 	if orgCfg.Warehouse == nil {
 		t.Fatal("expected local warehouse from seed")
 	}
-	if orgCfg.Warehouse.WarehouseDatabase.DatabaseName != "duckgres_local" {
-		t.Fatalf("expected duckgres_local warehouse db, got %q", orgCfg.Warehouse.WarehouseDatabase.DatabaseName)
+	if orgCfg.Warehouse.WarehouseDatabase.Endpoint != "host.docker.internal" {
+		t.Fatalf("expected host.docker.internal warehouse db endpoint, got %q", orgCfg.Warehouse.WarehouseDatabase.Endpoint)
 	}
 	if orgCfg.Warehouse.MetadataStore.DatabaseName != "ducklake_metadata_local" {
 		t.Fatalf("expected ducklake_metadata_local metadata db, got %q", orgCfg.Warehouse.MetadataStore.DatabaseName)

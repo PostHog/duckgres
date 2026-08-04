@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,9 +34,17 @@ type OrgRouter struct {
 	globalCfg             ControlPlaneConfig
 	srv                   *server.Server
 	stsBroker             *STSBroker
+	userSecrets           *CPUserSecretManager
 	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
 	nextWorkerID          atomic.Int32
+	draining              atomic.Bool
 	sharedCancel          context.CancelFunc
+	projectScopedUserChange   func(orgID, username string)
+	admissionReclaimer    admissionReclaimer
+	terminal              bool // protected by mu; no stack operation may start after this is set
+	stackOps              sync.WaitGroup
+	orgStackMutations     map[string]chan struct{} // protected by mu; serializes one org generation through teardown/publication
+	shutdownOnce          sync.Once
 
 	// migrating tracks which orgs have a DuckLake migration in progress.
 	// During migration, new connections for the org are rejected with a
@@ -46,7 +53,7 @@ type OrgRouter struct {
 }
 
 // NewOrgRouter creates an OrgRouter from the initial config snapshot.
-func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker, resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)) (*OrgRouter, error) {
+func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, globalCfg ControlPlaneConfig, srv *server.Server, stsBroker *STSBroker, userSecrets *CPUserSecretManager, resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)) (*OrgRouter, error) {
 	tr := &OrgRouter{
 		orgs:                  make(map[string]*OrgStack),
 		configStore:           store,
@@ -54,6 +61,7 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 		globalCfg:             globalCfg,
 		srv:                   srv,
 		stsBroker:             stsBroker,
+		userSecrets:           userSecrets,
 		resolveDucklingStatus: resolveDucklingStatus,
 	}
 
@@ -73,6 +81,9 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 		return nil, fmt.Errorf("expected shared K8s pool, got %T", sharedPoolIface)
 	}
 	tr.sharedPool = sharedPool
+	tr.admissionReclaimer = NewAdmissionReclaimer(store, AdmissionReclaimerConfig{
+		MaxReservations: globalCfg.AdmissionReclaimerMaxReservations,
+	})
 
 	sharedCtx, sharedCancel := context.WithCancel(context.Background())
 	tr.sharedCancel = sharedCancel
@@ -91,35 +102,45 @@ func NewOrgRouter(store *configstore.ConfigStore, baseCfg K8sWorkerPoolConfig, g
 		}
 	}
 
-	tr.reconcileWarmCapacity(snap)
-
 	return tr, nil
 }
 
 // createOrgStack creates an isolated pool + session manager for an org.
 func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error) {
+	if tc == nil {
+		return nil, fmt.Errorf("org config is required")
+	}
+	finishCreation, err := tr.beginOrgStackCreation(tc.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer finishCreation()
+
+	// A config callback may have waited behind an older mutation. Resolve the
+	// authoritative config only after acquiring the per-org slot so stale
+	// callbacks cannot construct a generation the current snapshot rejects.
+	latest, state := tr.latestOrgStackState(tc.Name, &configstore.Snapshot{
+		Orgs: map[string]*configstore.OrgConfig{tc.Name: tc},
+	})
+	if state != orgStackEnsurePresent {
+		return nil, fmt.Errorf("current config does not allow an org stack for org %s", tc.Name)
+	}
+
+	return tr.createOrgStackWhileMutationHeld(latest)
+}
+
+// createOrgStackWhileMutationHeld constructs and publishes one org generation.
+// The caller must hold the org's mutation slot from before config selection
+// through this function's return.
+func (tr *OrgRouter) createOrgStackWhileMutationHeld(tc *configstore.OrgConfig) (*OrgStack, error) {
+
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Per-org worker cap. 0 = unbounded (the cluster autoscaler / node capacity
+	// is the only ceiling). There is no global/cluster-default fallback.
 	maxWorkers := tc.MaxWorkers
-	if maxWorkers == 0 {
-		maxWorkers = tr.baseCfg.MaxWorkers
-	}
 
-	// Apply per-org worker resource overrides to the shared pool.
-	if tc.WorkerCPURequest != "" || tc.WorkerMemoryRequest != "" {
-		cpu := tc.WorkerCPURequest
-		if cpu == "" {
-			cpu = tr.baseCfg.WorkerCPURequest
-		}
-		mem := tc.WorkerMemoryRequest
-		if mem == "" {
-			mem = tr.baseCfg.WorkerMemoryRequest
-		}
-		tr.sharedPool.SetWorkerResources(cpu, mem)
-	}
-
-	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker,
-		tr.globalCfg.K8s.OrgMaxColocatedCPU, parseK8sMemory(tr.globalCfg.K8s.OrgMaxColocatedMemory))
+	pool := NewOrgReservedPool(tr.sharedPool, tc.Name, maxWorkers, workerImageForOrg(tc, tr.baseCfg.WorkerImage), tr.stsBroker)
 	activator := NewSharedWorkerActivator(tr.sharedPool, tr.stsBroker, tr.globalCfg.DuckLakeDefaultSpecVersion, func(orgID string) (*configstore.OrgConfig, error) {
 		snap := tr.configStore.Snapshot()
 		if snap == nil {
@@ -138,12 +159,50 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 	// In K8s mode, DuckDB auto-detects memory from the container's cgroup limits.
 	// Pass 0/false to disable budget-based rebalancing.
 	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
-	sessions := NewSessionManager(pool, rebalancer)
-	sessions.SetMaxConnections(tc.MaxConnections)
-	sessions.SetConnectionLimiter(NewRuntimeOrgConnectionLimiter(tr.configStore, tc.Name, tr.baseCfg.CPInstanceID, tr.globalCfg.WorkerQueueTimeout))
+	sessions := NewOrgSessionManager(pool, rebalancer, tc.Name)
+	if tr.userSecrets != nil {
+		sessions.SetUserSecretLoader(tr.userSecrets.SessionSecretLoader(tc.Name))
+	}
+	sessions.SetResourceLimitsProvider(tr.resourceLimitsForOrg(tc.Name))
+	sessions.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
+		return requestedWorkerVCPUs(profile, tr.baseCfg.WorkerCPURequest)
+	})
+	sessions.SetConnectionLimiter(NewRuntimeOrgConnectionLimiter(
+		tr.configStore,
+		tc.Name,
+		tr.baseCfg.CPInstanceID,
+		tr.globalCfg.WorkerQueueTimeout,
+		tr.admissionReclaimer,
+	))
 	rebalancer.SetSessionLister(sessions)
 
-	// Periodic per-org metrics emission
+	stack := &OrgStack{
+		Config:     tc,
+		Pool:       pool,
+		Sessions:   sessions,
+		Rebalancer: rebalancer,
+		cancel:     cancel,
+	}
+
+	publishResult, publishErr := tr.publishOrgStackCandidate(tc.Name, stack)
+	if publishErr != nil {
+		shutdownUnpublishedOrgStack(stack)
+		return nil, publishErr
+	}
+	switch publishResult {
+	case orgStackPublishAccepted:
+	case orgStackPublishRejectedTerminal:
+		shutdownUnpublishedOrgStack(stack)
+		return nil, fmt.Errorf("org router is shutting down")
+	case orgStackPublishRejectedDuplicate:
+		shutdownUnpublishedOrgStack(stack)
+		return nil, fmt.Errorf("org stack already exists for org %s", tc.Name)
+	case orgStackPublishRejectedConfig:
+		shutdownUnpublishedOrgStack(stack)
+		return nil, fmt.Errorf("current config does not allow an org stack for org %s", tc.Name)
+	}
+
+	// Start candidate-owned background work only after successful publication.
 	orgID := tc.Name
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -159,40 +218,397 @@ func (tr *OrgRouter) createOrgStack(tc *configstore.OrgConfig) (*OrgStack, error
 		}
 	}()
 
-	stack := &OrgStack{
-		Config:     tc,
-		Pool:       pool,
-		Sessions:   sessions,
-		Rebalancer: rebalancer,
-		cancel:     cancel,
-	}
-
-	tr.mu.Lock()
-	tr.orgs[tc.Name] = stack
-	tr.mu.Unlock()
-
-	slog.Info("Org stack created.", "org", tc.Name, "max_workers", maxWorkers)
-	_ = ctx // keep linter happy
+	slog.Info("Org stack created.", "org", tc.Name, "max_workers", stack.Config.MaxWorkers)
 	return stack, nil
 }
 
-// DestroyOrgStack drains and cleans up an org's resources.
-func (tr *OrgRouter) DestroyOrgStack(orgID string) {
+// beginOrgStackOperation registers a create/destroy operation while holding the
+// same mutex that guards the terminal shutdown transition. This ordering makes
+// stackOps.Wait safe: once terminal is set, no later WaitGroup.Add can race it.
+func (tr *OrgRouter) beginOrgStackOperation() (func(), bool) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.terminal {
+		return nil, false
+	}
+	tr.stackOps.Add(1)
+	return tr.stackOps.Done, true
+}
+
+// beginOrgStackMutation holds one per-org generation slot through either
+// construction/publication or removal/teardown. OrgReservedPool.ShutdownAll is
+// intentionally org-scoped rather than pool-instance-scoped, so allowing old
+// teardown to overlap replacement construction could retire the replacement's
+// workers.
+func (tr *OrgRouter) beginOrgStackMutation(orgID string) (func(), error) {
+	finishOperation, ok := tr.beginOrgStackOperation()
+	if !ok {
+		return nil, fmt.Errorf("org router is shutting down")
+	}
+
+	for {
+		tr.mu.Lock()
+		if tr.terminal {
+			tr.mu.Unlock()
+			finishOperation()
+			return nil, fmt.Errorf("org router is shutting down")
+		}
+		if tr.orgStackMutations == nil {
+			tr.orgStackMutations = make(map[string]chan struct{})
+		}
+		if wait, exists := tr.orgStackMutations[orgID]; exists {
+			tr.mu.Unlock()
+			<-wait
+			continue
+		}
+
+		done := make(chan struct{})
+		tr.orgStackMutations[orgID] = done
+		tr.mu.Unlock()
+
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				tr.mu.Lock()
+				delete(tr.orgStackMutations, orgID)
+				close(done)
+				tr.mu.Unlock()
+				finishOperation()
+			})
+		}, nil
+	}
+}
+
+// beginOrgStackCreation acquires the per-org generation slot and verifies that
+// no published stack exists before the caller constructs any org-scoped pool.
+func (tr *OrgRouter) beginOrgStackCreation(orgID string) (func(), error) {
+	finish, err := tr.beginOrgStackMutation(orgID)
+	if err != nil {
+		return nil, err
+	}
+
+	tr.mu.RLock()
+	_, exists := tr.orgs[orgID]
+	terminal := tr.terminal
+	tr.mu.RUnlock()
+	if terminal {
+		finish()
+		return nil, fmt.Errorf("org router is shutting down")
+	}
+	if exists {
+		finish()
+		return nil, fmt.Errorf("org stack already exists for org %s", orgID)
+	}
+	return finish, nil
+}
+
+type orgStackPublishResult uint8
+
+const (
+	orgStackPublishAccepted orgStackPublishResult = iota
+	orgStackPublishRejectedDuplicate
+	orgStackPublishRejectedTerminal
+	orgStackPublishRejectedConfig
+)
+
+// publishOrgStackCandidate validates and publishes a fully built, unpublished
+// candidate atomically with respect to ConfigStore snapshot replacement. The
+// caller owns candidate cleanup on every rejected result.
+func (tr *OrgRouter) publishOrgStackCandidate(orgID string, stack *OrgStack) (orgStackPublishResult, error) {
+	if stack == nil || stack.Config == nil {
+		return orgStackPublishRejectedConfig, fmt.Errorf("org stack candidate config is required")
+	}
+
+	result := orgStackPublishRejectedConfig
+	var validationErr error
+	validateAndPublish := func(snapshot *configstore.Snapshot) {
+		tc, state := orgStackStateFromSnapshot(orgID, snapshot)
+		if state != orgStackEnsurePresent {
+			validationErr = fmt.Errorf("current config does not allow an org stack for org %s", orgID)
+			return
+		}
+		if tc.Name != orgID {
+			validationErr = fmt.Errorf("org config name %q does not match org %q", tc.Name, orgID)
+			return
+		}
+
+		// The candidate is still private under the org mutation slot. Bring the
+		// fields captured during construction forward to the config protected by
+		// this read lock before making the generation visible.
+		pool, ok := stack.Pool.(*OrgReservedPool)
+		if !ok {
+			validationErr = fmt.Errorf("org stack candidate has unexpected pool type %T", stack.Pool)
+			return
+		}
+		stack.Config = tc
+		pool.maxWorkers = tc.MaxWorkers
+		pool.image = workerImageForOrg(tc, tr.baseCfg.WorkerImage)
+		result = tr.publishOrgStack(orgID, stack)
+	}
+
+	if tr.configStore != nil {
+		tr.configStore.WithSnapshot(validateAndPublish)
+	} else {
+		validateAndPublish(&configstore.Snapshot{
+			Orgs: map[string]*configstore.OrgConfig{orgID: stack.Config},
+		})
+	}
+	return result, validationErr
+}
+
+// publishOrgStack closes the creation lifecycle before making a late-created
+// stack visible when the router is already draining. Holding mu across the
+// drain/terminal checks and publication closes the races with BeginDrain's and
+// ShutdownAll's stack snapshots. Publication is insert-only; a rejected
+// candidate remains owned by the registered creator, which must release only
+// its unpublished resources before completing the operation.
+func (tr *OrgRouter) publishOrgStack(orgID string, stack *OrgStack) orgStackPublishResult {
+	tr.mu.Lock()
+	if tr.terminal {
+		tr.mu.Unlock()
+		return orgStackPublishRejectedTerminal
+	}
+	if _, ok := tr.orgs[orgID]; ok {
+		tr.mu.Unlock()
+		return orgStackPublishRejectedDuplicate
+	}
+	if tr.draining.Load() && stack != nil && stack.Sessions != nil {
+		stack.Sessions.BeginDrain()
+	}
+	tr.orgs[orgID] = stack
+	if stack != nil && stack.Config != nil {
+		sessionAdmissionLimitVCPUsGauge.WithLabelValues(orgID).Set(float64(stack.Config.MaxVCPUs))
+	} else {
+		// Minimal stacks are valid in lifecycle and concurrency paths. Without a
+		// config there is no authoritative limit value to publish.
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
+	}
+	tr.mu.Unlock()
+	return orgStackPublishAccepted
+}
+
+func (tr *OrgRouter) resourceLimitsForOrg(orgID string) func(username string) configstore.OrgResourceLimits {
+	return func(username string) configstore.OrgResourceLimits {
+		snap := tr.configStore.Snapshot()
+		if snap == nil {
+			return configstore.OrgResourceLimits{}
+		}
+		limits := configstore.OrgResourceLimits{}
+		if org, ok := snap.Orgs[orgID]; ok && org != nil {
+			limits.OrgMaxVCPUs = org.MaxVCPUs
+		}
+		limits.UserMaxVCPUs = snap.OrgUserMaxVCPUs[configstore.OrgUserKey{OrgID: orgID, Username: username}]
+		return limits
+	}
+}
+
+type orgStackReconcileState uint8
+
+const (
+	// Preserve the current presence for transitional warehouse states. A
+	// running stack remains available while resharding, but a CP that starts in
+	// the middle of provisioning or resharding must not create a new one.
+	orgStackPreserve orgStackReconcileState = iota
+	orgStackEnsurePresent
+	orgStackEnsureAbsent
+)
+
+// latestOrgStackState reads the ConfigStore snapshot after the caller has
+// acquired the per-org mutation slot. ConfigStore publishes immutable snapshot
+// pointers before invoking callbacks, so this makes callbacks converge on the
+// latest published state even when callback executions overlap or reorder.
+// fallback keeps direct unit construction and routers without a ConfigStore
+// source-compatible with the callback snapshot they were given.
+func (tr *OrgRouter) latestOrgStackState(orgID string, fallback *configstore.Snapshot) (*configstore.OrgConfig, orgStackReconcileState) {
+	snapshot := fallback
+	if tr.configStore != nil {
+		snapshot = tr.configStore.Snapshot()
+	}
+	return orgStackStateFromSnapshot(orgID, snapshot)
+}
+
+func orgStackStateFromSnapshot(orgID string, snapshot *configstore.Snapshot) (*configstore.OrgConfig, orgStackReconcileState) {
+	if snapshot == nil {
+		return nil, orgStackPreserve
+	}
+
+	tc, exists := snapshot.Orgs[orgID]
+	if !exists || tc == nil {
+		return nil, orgStackEnsureAbsent
+	}
+	if tc.Warehouse == nil || tc.Warehouse.State == configstore.ManagedWarehouseStateReady {
+		return tc, orgStackEnsurePresent
+	}
+	if tc.Warehouse.State == configstore.ManagedWarehouseStateDeleting ||
+		tc.Warehouse.State == configstore.ManagedWarehouseStateDeleted {
+		return tc, orgStackEnsureAbsent
+	}
+	return tc, orgStackPreserve
+}
+
+// reconcileOrgStack serializes every callback for an org, then decides against
+// the latest published config while holding that slot. Every callback enters
+// this path even when its own old/new snapshots appear to require no action;
+// this is what lets a newer ready callback repair an older removal that was
+// already in flight.
+func (tr *OrgRouter) reconcileOrgStack(orgID string, fallback *configstore.Snapshot) error {
+	finishMutation, err := tr.beginOrgStackMutation(orgID)
+	if err != nil {
+		return err
+	}
+	defer finishMutation()
+
+	tc, state := tr.latestOrgStackState(orgID, fallback)
+	tr.mu.RLock()
+	stack, hasStack := tr.orgs[orgID]
+	tr.mu.RUnlock()
+
+	switch state {
+	case orgStackEnsureAbsent:
+		if !hasStack {
+			return nil
+		}
+		tr.removeOrgStackWhileMutationHeld(orgID, stack)
+		return nil
+	case orgStackEnsurePresent:
+		if !hasStack {
+			_, err := tr.createOrgStackWhileMutationHeld(tc)
+			return err
+		}
+	case orgStackPreserve:
+		if !hasStack || tc == nil {
+			return nil
+		}
+	}
+
+	tr.refreshOrgStackWhileMutationHeld(orgID, stack, tc)
+	return nil
+}
+
+func (tr *OrgRouter) refreshOrgStackWhileMutationHeld(orgID string, stack *OrgStack, tc *configstore.OrgConfig) {
+	if stack == nil || tc == nil {
+		return
+	}
+
+	tr.mu.Lock()
+	current, ok := tr.orgs[orgID]
+	if !ok || current != stack {
+		tr.mu.Unlock()
+		return
+	}
+	oldTC := stack.Config
+	stack.Config = tc
+	sessionAdmissionLimitVCPUsGauge.WithLabelValues(orgID).Set(float64(tc.MaxVCPUs))
+	tr.mu.Unlock()
+
+	limitsChanged := oldTC == nil || oldTC.MaxWorkers != tc.MaxWorkers
+	resourceLimitChanged := oldTC == nil || oldTC.MaxVCPUs != tc.MaxVCPUs
+	floorChanged := oldTC == nil || oldTC.DefaultWorkerMinHotIdle != tc.DefaultWorkerMinHotIdle
+	oldImage := tr.baseCfg.WorkerImage
+	if oldTC != nil {
+		oldImage = workerImageForOrg(oldTC, tr.baseCfg.WorkerImage)
+	}
+	newImage := workerImageForOrg(tc, tr.baseCfg.WorkerImage)
+	imageChanged := oldTC == nil || oldImage != newImage
+
+	if resourceLimitChanged {
+		oldMaxVCPUs := 0
+		if oldTC != nil {
+			oldMaxVCPUs = oldTC.MaxVCPUs
+		}
+		slog.Info("Org resource limit changed.", "org", orgID,
+			"old_max_vcpus", oldMaxVCPUs, "new_max_vcpus", tc.MaxVCPUs)
+	}
+	if limitsChanged && stack.Pool != nil {
+		oldMaxWorkers := 0
+		if oldTC != nil {
+			oldMaxWorkers = oldTC.MaxWorkers
+		}
+		slog.Info("Org config changed.", "org", orgID,
+			"old_max_workers", oldMaxWorkers, "new_max_workers", tc.MaxWorkers)
+		// 0 = unbounded; no global/cluster-default fallback.
+		stack.Pool.SetMaxWorkers(tc.MaxWorkers)
+	}
+	if floorChanged {
+		oldFloor := 0
+		if oldTC != nil {
+			oldFloor = oldTC.DefaultWorkerMinHotIdle
+		}
+		slog.Info("Org default hot-idle floor changed.", "org", orgID,
+			"old_default_worker_min_hot_idle", oldFloor,
+			"new_default_worker_min_hot_idle", tc.DefaultWorkerMinHotIdle)
+	}
+	if imageChanged {
+		slog.Info("Org worker image changed.", "org", orgID, "image", newImage)
+		if pool, ok := stack.Pool.(interface{ SetWorkerImage(string) }); ok {
+			pool.SetWorkerImage(newImage)
+		}
+	}
+}
+
+func (tr *OrgRouter) removeOrgStackWhileMutationHeld(orgID string, expected *OrgStack) {
 	tr.mu.Lock()
 	stack, ok := tr.orgs[orgID]
 	if !ok {
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
+		tr.mu.Unlock()
+		return
+	}
+	if expected != nil && stack != expected {
 		tr.mu.Unlock()
 		return
 	}
 	delete(tr.orgs, orgID)
+	sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
 	tr.mu.Unlock()
 
 	slog.Info("Destroying org stack.", "org", orgID)
-	stack.cancel()
+	shutdownOrgStack(stack)
+}
+
+// DestroyOrgStack drains and cleans up an org's resources.
+func (tr *OrgRouter) DestroyOrgStack(orgID string) {
+	finishMutation, err := tr.beginOrgStackMutation(orgID)
+	if err != nil {
+		return
+	}
+	defer finishMutation()
+
+	tr.removeOrgStackWhileMutationHeld(orgID, nil)
+}
+
+func shutdownOrgStack(stack *OrgStack) {
+	if stack == nil {
+		return
+	}
+	if stack.cancel != nil {
+		stack.cancel()
+	}
 	if stack.Sessions != nil {
 		stack.Sessions.DestroyAllSessions()
 	}
-	stack.Pool.ShutdownAll()
+	if stack.Pool != nil {
+		stack.Pool.ShutdownAll()
+	}
+	if stack.Rebalancer != nil {
+		stack.Rebalancer.Stop()
+	}
+}
+
+// shutdownUnpublishedOrgStack releases only resources owned by a candidate
+// that never became visible. Stack construction does not acquire workers or
+// create sessions. In particular, it must not call the org-scoped pool
+// ShutdownAll, which could retire workers owned by a published generation.
+func shutdownUnpublishedOrgStack(stack *OrgStack) {
+	if stack == nil {
+		return
+	}
+	if stack.cancel != nil {
+		stack.cancel()
+	}
+	if stack.Sessions != nil {
+		stack.Sessions.BeginDrain()
+	}
 	if stack.Rebalancer != nil {
 		stack.Rebalancer.Stop()
 	}
@@ -204,28 +620,6 @@ func (tr *OrgRouter) StackForOrg(orgID string) (*OrgStack, bool) {
 	stack, ok := tr.orgs[orgID]
 	tr.mu.RUnlock()
 	return stack, ok
-}
-
-func (tr *OrgRouter) IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool) {
-	tr.mu.RLock()
-	stack, ok := tr.orgs[orgID]
-	tr.mu.RUnlock()
-	if !ok || stack == nil || stack.Config == nil || stack.Config.Warehouse == nil {
-		return server.IcebergConfig{}, false
-	}
-
-	src := stack.Config.Warehouse.Iceberg
-	cfg := server.IcebergConfig{
-		Enabled:                   src.Enabled,
-		Backend:                   src.Backend,
-		Namespace:                 src.Namespace,
-		Region:                    src.Region,
-		LakekeeperEndpoint:        src.LakekeeperEndpoint,
-		LakekeeperWarehouse:       src.LakekeeperWarehouse,
-		LakekeeperClientID:        src.LakekeeperClientID,
-		LakekeeperOAuth2ServerURI: src.LakekeeperOAuth2ServerURI,
-	}
-	return cfg, true
 }
 
 // SetMigrating marks an org as having a DuckLake migration in progress.
@@ -248,115 +642,128 @@ func (tr *OrgRouter) IsMigrating(orgID string) bool {
 
 // HandleConfigChange reconciles org stacks when the config snapshot changes.
 func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
-	// Detect new orgs or orgs whose warehouse just became ready
-	for name, tc := range new.Orgs {
-		oldTC, existed := old.Orgs[name]
-
-		// Skip orgs with warehouses that aren't ready
-		if tc.Warehouse != nil && tc.Warehouse.State != configstore.ManagedWarehouseStateReady {
-			// If warehouse is being deleted, destroy existing stack
-			if tc.Warehouse.State == configstore.ManagedWarehouseStateDeleting ||
-				tc.Warehouse.State == configstore.ManagedWarehouseStateDeleted {
-				tr.mu.RLock()
-				_, hasStack := tr.orgs[name]
-				tr.mu.RUnlock()
-				if hasStack {
-					slog.Info("Warehouse deprovisioning, destroying stack.", "org", name)
-					tr.DestroyOrgStack(name)
-				}
-			}
-			continue
+	for key := range changedProjectScopedUsers(old, new) {
+		if tr.srv != nil {
+			tr.srv.DrainUserConnections(key.OrgID, key.Username)
 		}
-
 		tr.mu.RLock()
-		_, hasStack := tr.orgs[name]
+		onProjectScopedUserChange := tr.projectScopedUserChange
 		tr.mu.RUnlock()
-
-		if !existed && !hasStack {
-			// Brand new org -- create stack
-			slog.Info("New org detected, creating stack.", "org", name)
-			if _, err := tr.createOrgStack(tc); err != nil {
-				slog.Error("Failed to create org stack on config change.", "org", name, "error", err)
-			}
-		} else if existed && !hasStack {
-			// Existing org whose warehouse just became ready
-			warehouseJustReady := oldTC.Warehouse != nil &&
-				oldTC.Warehouse.State != configstore.ManagedWarehouseStateReady &&
-				tc.Warehouse != nil &&
-				tc.Warehouse.State == configstore.ManagedWarehouseStateReady
-			noWarehouse := tc.Warehouse == nil
-
-			if warehouseJustReady || noWarehouse {
-				slog.Info("Org warehouse ready, creating stack.", "org", name)
-				if _, err := tr.createOrgStack(tc); err != nil {
-					slog.Error("Failed to create org stack on config change.", "org", name, "error", err)
-				}
-			}
+		if onProjectScopedUserChange != nil {
+			onProjectScopedUserChange(key.OrgID, key.Username)
+		}
+		tr.mu.RLock()
+		stack := tr.orgs[key.OrgID]
+		tr.mu.RUnlock()
+		if stack != nil && stack.Sessions != nil {
+			stack.Sessions.DestroySessionsForUser(key.Username)
 		}
 	}
 
-	// Detect removed orgs
+	orgIDs := make(map[string]struct{}, len(old.Orgs)+len(new.Orgs))
 	for name := range old.Orgs {
-		if _, exists := new.Orgs[name]; !exists {
-			slog.Info("Org removed, destroying stack.", "org", name)
-			tr.DestroyOrgStack(name)
+		orgIDs[name] = struct{}{}
+	}
+	for name, tc := range new.Orgs {
+		orgIDs[name] = struct{}{}
+		oldTC, existed := old.Orgs[name]
+		if tr.srv != nil && tc.Warehouse != nil && tc.Warehouse.State == configstore.ManagedWarehouseStateResharding &&
+			(!existed || oldTC == nil || oldTC.Warehouse == nil || oldTC.Warehouse.State != configstore.ManagedWarehouseStateResharding) {
+			drained := tr.srv.DrainOrgConnections(name)
+			slog.Info("Warehouse resharding, draining PostgreSQL connections at their next idle boundary.",
+				"org", name, "connections", drained)
 		}
 	}
 
-	// Refresh existing org stacks and update worker limits when needed.
-	for name, newTC := range new.Orgs {
-		oldTC, existed := old.Orgs[name]
-		if !existed {
+	// Every affected org enters the keyed reconciler, including apparent
+	// no-ops. Callback snapshots describe why a callback fired, but only the
+	// ConfigStore's latest published snapshot decides the resulting stack.
+	for name := range orgIDs {
+		if err := tr.reconcileOrgStack(name, new); err != nil {
+			slog.Error("Failed to reconcile org stack on config change.", "org", name, "error", err)
+		}
+	}
+}
+
+func (tr *OrgRouter) setProjectScopedUserChangeHandler(handler func(orgID, username string)) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	tr.projectScopedUserChange = handler
+}
+
+// changedProjectScopedUsers reports the project-scoped logins (reader OR user)
+// whose effective policy moved between two snapshots. A mode flip counts: a
+// project_user demoted to project_reader must lose its live write-authorized
+// sessions immediately, not at the next reconnect.
+func changedProjectScopedUsers(old, new *configstore.Snapshot) map[configstore.OrgUserKey]struct{} {
+	changed := make(map[configstore.OrgUserKey]struct{})
+	keys := make(map[configstore.OrgUserKey]struct{}, len(old.OrgUserAccess)+len(new.OrgUserAccess))
+	for key := range old.OrgUserAccess {
+		keys[key] = struct{}{}
+	}
+	for key := range new.OrgUserAccess {
+		keys[key] = struct{}{}
+	}
+
+	for key := range keys {
+		oldAccess := old.OrgUserAccess[key]
+		newAccess := new.OrgUserAccess[key]
+		if !configstore.IsProjectScopedAccessMode(oldAccess.Mode) && !configstore.IsProjectScopedAccessMode(newAccess.Mode) {
 			continue
 		}
-		limitsChanged := oldTC.MaxWorkers != newTC.MaxWorkers
-		connLimitChanged := oldTC.MaxConnections != newTC.MaxConnections
-		imageChanged := workerImageForOrg(oldTC, tr.baseCfg.WorkerImage) != workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
-		resourcesChanged := oldTC.WorkerCPURequest != newTC.WorkerCPURequest ||
-			oldTC.WorkerMemoryRequest != newTC.WorkerMemoryRequest
-
-		tr.mu.Lock()
-		if stack, ok := tr.orgs[name]; ok {
-			stack.Config = newTC
-			if connLimitChanged {
-				slog.Info("Org connection limit changed.", "org", name,
-					"old_max_connections", oldTC.MaxConnections, "new_max_connections", newTC.MaxConnections)
-				stack.Sessions.SetMaxConnections(newTC.MaxConnections)
-			}
-			if limitsChanged {
-				slog.Info("Org config changed.", "org", name,
-					"old_max_workers", oldTC.MaxWorkers, "new_max_workers", newTC.MaxWorkers)
-				maxWorkers := newTC.MaxWorkers
-				if maxWorkers == 0 {
-					maxWorkers = tr.baseCfg.MaxWorkers
-				}
-				stack.Pool.SetMaxWorkers(maxWorkers)
-			}
-			if imageChanged {
-				image := workerImageForOrg(newTC, tr.baseCfg.WorkerImage)
-				slog.Info("Org worker image changed.", "org", name, "image", image)
-				if pool, ok := stack.Pool.(interface{ SetWorkerImage(string) }); ok {
-					pool.SetWorkerImage(image)
-				}
-			}
-			if resourcesChanged && (newTC.WorkerCPURequest != "" || newTC.WorkerMemoryRequest != "") {
-				cpu := newTC.WorkerCPURequest
-				if cpu == "" {
-					cpu = tr.baseCfg.WorkerCPURequest
-				}
-				mem := newTC.WorkerMemoryRequest
-				if mem == "" {
-					mem = tr.baseCfg.WorkerMemoryRequest
-				}
-				slog.Info("Org worker resources changed, updating shared pool defaults.",
-					"org", name, "cpu", cpu, "memory", mem)
-				tr.sharedPool.SetWorkerResources(cpu, mem)
-			}
+		if !sameProjectScopedAccess(oldAccess, newAccess) ||
+			old.OrgUserPassword[key] != new.OrgUserPassword[key] ||
+			old.OrgUserDisabled[key] != new.OrgUserDisabled[key] ||
+			!sameProjectScopedTeam(old, new, key.OrgID, oldAccess.TeamID, newAccess.TeamID) {
+			changed[key] = struct{}{}
 		}
-		tr.mu.Unlock()
 	}
+	return changed
+}
 
-	tr.reconcileWarmCapacity(new)
+func sameProjectScopedAccess(a, b configstore.OrgUserAccessConfig) bool {
+	if a.Mode != b.Mode || (a.TeamID == nil) != (b.TeamID == nil) {
+		return false
+	}
+	return a.TeamID == nil || *a.TeamID == *b.TeamID
+}
+
+func sameProjectScopedTeam(old, new *configstore.Snapshot, orgID string, oldTeamID, newTeamID *int64) bool {
+	if oldTeamID == nil || newTeamID == nil || *oldTeamID != *newTeamID {
+		return oldTeamID == nil && newTeamID == nil
+	}
+	oldTeam, oldFound := projectScopedTeam(old, orgID, *oldTeamID)
+	newTeam, newFound := projectScopedTeam(new, orgID, *newTeamID)
+	return oldFound == newFound && (!oldFound || sameOrgTeam(oldTeam, newTeam))
+}
+
+func sameOrgTeam(a, b configstore.OrgTeamConfig) bool {
+	return a.TeamID == b.TeamID &&
+		a.SchemaName == b.SchemaName &&
+		a.Enabled == b.Enabled &&
+		sameOptionalString(a.EventsTableName, b.EventsTableName) &&
+		sameOptionalString(a.PersonsTableName, b.PersonsTableName) &&
+		sameOptionalString(a.SchemaDataImportsName, b.SchemaDataImportsName)
+}
+
+func sameOptionalString(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func projectScopedTeam(snapshot *configstore.Snapshot, orgID string, teamID int64) (configstore.OrgTeamConfig, bool) {
+	org := snapshot.Orgs[orgID]
+	if org == nil {
+		return configstore.OrgTeamConfig{}, false
+	}
+	for _, team := range org.Teams {
+		if team.TeamID == teamID {
+			return team, true
+		}
+	}
+	return configstore.OrgTeamConfig{}, false
 }
 
 func workerImageForOrg(tc *configstore.OrgConfig, fallback string) string {
@@ -377,26 +784,47 @@ func (tr *OrgRouter) AllStacks() map[string]*OrgStack {
 	return result
 }
 
+// BeginDrain stops new and in-progress session creation for every org while
+// leaving established sessions intact so they can drain naturally.
+func (tr *OrgRouter) BeginDrain() {
+	tr.draining.Store(true)
+	stacks := tr.AllStacks()
+	for _, stack := range stacks {
+		if stack.Sessions != nil {
+			stack.Sessions.BeginDrain()
+		}
+	}
+}
+
 // ShutdownAll shuts down all org stacks.
 func (tr *OrgRouter) ShutdownAll() {
+	tr.shutdownOnce.Do(tr.shutdownAll)
+}
+
+func (tr *OrgRouter) shutdownAll() {
+	tr.draining.Store(true)
+	tr.mu.Lock()
+	tr.terminal = true
+	tr.mu.Unlock()
+
+	// Once terminal is set no new stack operation can register. Join every
+	// create/destroy that linearized before it before taking ownership of the
+	// remaining published stacks, so shutdown never races another teardown of
+	// the same org generation.
+	tr.stackOps.Wait()
+
 	tr.mu.Lock()
 	orgs := make(map[string]*OrgStack, len(tr.orgs))
 	for k, v := range tr.orgs {
 		orgs[k] = v
+		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(k)
 	}
 	tr.orgs = make(map[string]*OrgStack)
 	tr.mu.Unlock()
 
 	for name, stack := range orgs {
 		slog.Info("Shutting down org stack.", "org", name)
-		stack.cancel()
-		if stack.Sessions != nil {
-			stack.Sessions.DestroyAllSessions()
-		}
-		stack.Pool.ShutdownAll()
-		if stack.Rebalancer != nil {
-			stack.Rebalancer.Stop()
-		}
+		shutdownOrgStack(stack)
 	}
 
 	if tr.sharedCancel != nil {
@@ -405,54 +833,28 @@ func (tr *OrgRouter) ShutdownAll() {
 	if tr.sharedPool != nil {
 		tr.sharedPool.ShutdownAll()
 	}
-}
-
-func (tr *OrgRouter) reconcileWarmCapacity(snap *configstore.Snapshot) {
-	if tr.sharedPool == nil || snap == nil {
-		return
-	}
-
-	target := tr.globalCfg.K8s.SharedWarmTarget
-	if target < 0 {
-		target = 0
-	}
-
-	tr.sharedPool.SetWarmCapacityTarget(target)
-	tr.sharedPool.SetPerImageWarmTargets(tr.computeBaseWarmCapacityTargets(snap))
-}
-
-func (tr *OrgRouter) computeBaseWarmCapacityTargets(snap *configstore.Snapshot) map[string]int {
-	return computeBaseWarmCapacityTargets(
-		tr.baseCfg.WorkerImage,
-		tr.globalCfg.K8s.SharedWarmTarget,
-		tr.computePerImageWarmTargets(snap),
-	)
-}
-
-// computePerImageWarmTargets returns "keep at least 1 warm worker for each
-// distinct image" — covering the cluster default plus every pinned
-// Warehouse.Image used by an org that currently has an active stack. Orgs
-// without a live stack (e.g. warehouse not yet ready) are skipped so we don't
-// pre-warm pods for images nobody can route to yet.
-func (tr *OrgRouter) computePerImageWarmTargets(snap *configstore.Snapshot) map[string]int {
-	targets := make(map[string]int)
-	if defaultImage := strings.TrimSpace(tr.baseCfg.WorkerImage); defaultImage != "" {
-		targets[defaultImage] = 1
-	}
-	tr.mu.RLock()
-	defer tr.mu.RUnlock()
-	for orgID := range tr.orgs {
-		tc, ok := snap.Orgs[orgID]
-		if !ok || tc == nil {
-			continue
+	if tr.admissionReclaimer != nil {
+		timeout := tr.globalCfg.ShutdownTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
 		}
-		image := strings.TrimSpace(workerImageForOrg(tc, tr.baseCfg.WorkerImage))
-		if image == "" {
-			continue
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		if err := tr.admissionReclaimer.DrainAndClose(ctx); err != nil {
+			slog.Warn("Admission reclaimer did not fully drain during control-plane shutdown.", "error", err)
 		}
-		targets[image] = 1
+		cancel()
 	}
-	return targets
+}
+
+// ReleaseIdleHotWorkers parks this CP's idle (zero-session) Hot workers into
+// hot_idle so the TTL reaper can reclaim them, instead of letting them linger
+// for the whole (possibly unbounded) drain wait. All workers live in the shared
+// pool; per-org reserved pools are slices of it. Returns the number parked.
+func (tr *OrgRouter) ReleaseIdleHotWorkers() int {
+	if tr.sharedPool == nil {
+		return 0
+	}
+	return tr.sharedPool.ReleaseIdleHotWorkers(LifecycleOriginDrainReleaseIdle)
 }
 
 func (tr *OrgRouter) onSharedWorkerCrash(workerID int) {

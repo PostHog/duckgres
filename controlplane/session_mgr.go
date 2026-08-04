@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"go.opentelemetry.io/otel/attribute"
@@ -17,16 +19,6 @@ import (
 
 var ErrTooManyConnections = errors.New("too many connections")
 var ErrSessionManagerDraining = errors.New("session manager is draining")
-
-// ErrOrgResourceQuotaExceeded is returned when reserving a new colocated worker
-// would push the org over its colocated CPU/memory budget. Retryable: capacity
-// frees as the org's colocated sessions finish.
-var ErrOrgResourceQuotaExceeded = errors.New("organization colocated worker resource quota exceeded")
-
-const (
-	connectionLeaseReleaseMaxAttempts = 3
-	connectionLeaseReleaseRetryDelay  = 50 * time.Millisecond
-)
 
 // SessionProgress holds cached query progress from a worker health check.
 type SessionProgress struct {
@@ -39,8 +31,10 @@ type SessionProgress struct {
 // ManagedSession tracks a client session bound to a worker.
 type ManagedSession struct {
 	PID          int32
+	Username     string // org user the session was created for (for admin slicing/attribution)
 	WorkerID     int
-	Protocol     string // "postgres" or "flight"
+	Protocol     string    // "postgres" or "flight"
+	StartedAt    time.Time // when the session was created (UTC); surfaced in the Live view
 	SessionToken string
 	Executor     *flightclient.FlightExecutor
 	connCloser   io.Closer // TCP connection, closed on worker crash to unblock the message loop
@@ -48,6 +42,37 @@ type ManagedSession struct {
 
 	// Cached query progress from worker health checks.
 	queryProgress atomic.Value // stores *SessionProgress (or nil)
+}
+
+// globalNextPID hands out backend PIDs that are unique across the WHOLE control
+// plane process, not per-org. SessionManagers are per-org, but every client
+// connection registers into the ONE server.conns map keyed by pid, so per-org
+// pids (each manager starting at 1000) collided: two orgs' connections at the
+// same pid value would shadow each other in that map, corrupting
+// pg_stat_activity, cancel-by-pid routing, and any pid-keyed lookup. A single
+// process-global counter makes pids unique within the CP and eliminates the
+// collision. (Cross-CP pids can still coincide, but each CP has its own conns
+// map; cross-CP addressing uses the cluster-unique worker id.)
+var globalNextPID = func() *atomic.Int32 {
+	v := new(atomic.Int32)
+	v.Store(1000) // start above typical OS PIDs
+	return v
+}()
+
+// reservePID returns the next backend pid from counter, skipping 0. Backend pids
+// are int32; after ~2.1B connections in one process the counter wraps and passes
+// through 0, which the session-create path treats as "unset" (re-allocating and
+// shipping a stale pid to the client → broken cancel for that one connection).
+// Skipping 0 closes that wrap-time edge with a single extra Add. Negative values
+// after wrap are still unique within the CP's conns map and are left as-is
+// (reaching them needs a further ~2.1B connections, and a CP restarts on every
+// deploy long before either bound).
+func reservePID(counter *atomic.Int32) int32 {
+	p := counter.Add(1)
+	if p == 0 {
+		p = counter.Add(1)
+	}
+	return p
 }
 
 // SessionManager tracks all active sessions and their worker assignments.
@@ -58,17 +83,30 @@ type SessionManager struct {
 	pool       WorkerPool
 	rebalancer *MemoryRebalancer
 	lifecycle  *sessionLifecycle
-
-	nextPID atomic.Int32
+	// log carries the manager's org identity (multi-tenant: one manager per
+	// org stack) so every session/worker lifecycle line is org-filterable.
+	log *slog.Logger
 
 	maxConnections int
 	activeSlots    int
 	waiters        []*connectionWaiter
 	limiter        connectionLimiter
+	resourceLimits func(username string) configstore.OrgResourceLimits
+	requestedVCPUs func(profile *WorkerProfile) (int, error)
+
+	// userSecretLoader returns the user's persistent CREATE SECRET statements
+	// (decrypted) to replay on a worker at session creation. nil outside the
+	// multitenant/remote backend. A loader error must not block the session:
+	// callers log and continue without secrets.
+	userSecretLoader func(ctx context.Context, username string) ([]string, error)
 }
 
 type flightReconnectPool interface {
 	ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error)
+}
+
+type flightReconnectProfileProvider interface {
+	ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error)
 }
 
 type connectionWaiter struct {
@@ -79,14 +117,24 @@ type connectionWaiter struct {
 
 // NewSessionManager creates a new session manager.
 func NewSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer) *SessionManager {
+	return NewOrgSessionManager(pool, rebalancer, "")
+}
+
+// NewOrgSessionManager builds a SessionManager whose log lines all carry the
+// owning org (multi-tenant remote backend: one manager per org stack).
+func NewOrgSessionManager(pool WorkerPool, rebalancer *MemoryRebalancer, orgID string) *SessionManager {
+	log := slog.Default()
+	if orgID != "" {
+		log = log.With("org", orgID)
+	}
 	sm := &SessionManager{
 		sessions:   make(map[int32]*ManagedSession),
 		byWorker:   make(map[int][]int32),
 		pool:       pool,
 		rebalancer: rebalancer,
 		lifecycle:  newSessionLifecycle(),
+		log:        log,
 	}
-	sm.nextPID.Store(1000) // Start PIDs above typical OS PIDs
 	return sm
 }
 
@@ -98,6 +146,12 @@ func (sm *SessionManager) SetMaxConnections(n int) {
 	sm.grantWaitersLocked()
 }
 
+// SetUserSecretLoader installs the per-user persistent-secret loader used at
+// session creation (multitenant/remote backend only).
+func (sm *SessionManager) SetUserSecretLoader(loader func(ctx context.Context, username string) ([]string, error)) {
+	sm.userSecretLoader = loader
+}
+
 // SetConnectionLimiter replaces the local process limiter with a cluster-wide
 // admission limiter. Local session maps still track only this control-plane's
 // live sessions.
@@ -107,31 +161,66 @@ func (sm *SessionManager) SetConnectionLimiter(limiter connectionLimiter) {
 	sm.limiter = limiter
 }
 
+// SetResourceLimitsProvider installs the dynamic org/user resource-limit lookup
+// used by the runtime limiter. The callback must be safe for concurrent use.
+func (sm *SessionManager) SetResourceLimitsProvider(fn func(username string) configstore.OrgResourceLimits) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.resourceLimits = fn
+}
+
+// SetRequestedVCPUsResolver installs the worker-profile-to-vCPU resolver used
+// for resource admission. nil means every session costs one vCPU.
+func (sm *SessionManager) SetRequestedVCPUsResolver(fn func(profile *WorkerProfile) (int, error)) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.requestedVCPUs = fn
+}
+
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
-	return sm.nextPID.Add(1)
+	return reservePID(globalNextPID)
 }
 
 func (sm *SessionManager) acquireSlot(ctx context.Context) error {
-	_, err := sm.acquireConnectionSlot(ctx, 0, "postgres")
+	_, err := sm.acquireConnectionSlot(ctx, 0, "", "postgres", nil)
 	return err
 }
 
-func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, protocol string) (connectionLease, error) {
+func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, username string, protocol string, profile *WorkerProfile) (connectionLease, error) {
 	sm.mu.Lock()
 	if sm.lifecycle.isClosed() {
 		sm.mu.Unlock()
 		return nil, ErrSessionManagerDraining
 	}
 	limiter := sm.limiter
+	resourceLimits := sm.resourceLimits
+	requestedVCPUs := sm.requestedVCPUs
 	sm.mu.Unlock()
 	if limiter != nil {
-		maxConnections := func() int {
-			sm.mu.RLock()
-			defer sm.mu.RUnlock()
-			return sm.maxConnections
+		vcpus := 1
+		if requestedVCPUs != nil {
+			var err error
+			vcpus, err = requestedVCPUs(profile)
+			if err != nil {
+				return nil, err
+			}
 		}
-		lease, err := limiter.Acquire(ctx, pid, protocol, maxConnections)
+		if vcpus <= 0 {
+			return nil, fmt.Errorf("requested vcpus must be positive, got %d", vcpus)
+		}
+		limits := func(user string) configstore.OrgResourceLimits {
+			if resourceLimits == nil {
+				return configstore.OrgResourceLimits{}
+			}
+			return resourceLimits(user)
+		}
+		lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
+			PID:            pid,
+			Username:       username,
+			Protocol:       protocol,
+			RequestedVCPUs: vcpus,
+		}, limits)
 		if err != nil {
 			return nil, err
 		}
@@ -182,7 +271,7 @@ func (sm *SessionManager) releaseSlot() {
 
 func (sm *SessionManager) releaseConnectionSlot(lease connectionLease) {
 	if lease != nil {
-		releaseConnectionLeaseWithRetry(lease)
+		releaseConnectionLease(lease)
 		return
 	}
 
@@ -237,14 +326,30 @@ func (sm *SessionManager) CreateSession(ctx context.Context, username string, pi
 	return sm.CreateSessionWithProtocol(ctx, username, pid, memoryLimit, threads, "postgres", profile)
 }
 
-func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, username string, pid int32, memoryLimit string, threads int, protocol string, profile *WorkerProfile) (int32, *flightclient.FlightExecutor, error) {
-	ctx, endCreation, err := sm.beginSessionCreation(ctx)
+func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, username string, pid int32, memoryLimit string, threads int, protocol string, profile *WorkerProfile) (resultPID int32, resultExecutor *flightclient.FlightExecutor, resultErr error) {
+	ctx, finishCreation, err := sm.beginSessionCreation(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer endCreation()
+	defer func() {
+		if !finishCreation() {
+			return
+		}
+		if resultErr == nil && resultPID != 0 {
+			// Drain can close the lifecycle just after createSessionOnWorker
+			// publishes the session. Reclaim that raced success before returning
+			// it to a client that shutdown has already rejected.
+			sm.DestroySession(resultPID)
+			resultPID = 0
+			resultExecutor = nil
+		}
+		resultErr = ErrSessionManagerDraining
+	}()
 
-	lease, err := sm.acquireConnectionSlot(ctx, pid, protocol)
+	if protocol == "flight" && pid == 0 {
+		pid = sm.ReservePID()
+	}
+	lease, err := sm.acquireConnectionSlot(ctx, pid, username, protocol, profile)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -262,42 +367,145 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 	observeControlPlaneWorkerQueueDepthDelta(1)
 	defer observeControlPlaneWorkerQueueDepthDelta(-1)
 
-	acquireStart := time.Now()
-	ctx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
-	slog.Debug("Acquiring worker for session.", "pid", pid, "user", username)
-	worker, err := sm.pool.AcquireWorker(ctx, profile)
-	if err != nil {
-		var capacityErr *WarmCapacityExhaustedError
-		if errors.As(err, &capacityErr) {
-			missReason := capacityErr.missReason()
-			observeControlPlaneWorkerAcquireFailure("warm_capacity_exhausted")
-			observeControlPlaneWorkerAcquireFailure("warm_capacity_" + string(missReason))
-			acquireSpan.SetAttributes(
-				attribute.String("warm_capacity.reason", string(missReason)),
-				attribute.Int("warm_capacity.retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter)),
-			)
-			slog.Warn("Worker acquisition failed.",
-				"pid", pid,
-				"user", username,
-				"duration", time.Since(acquireStart),
-				"reason", missReason,
-				"retry_after", capacityErr.RetryAfter,
-				"retry_after_seconds", warmCapacityRetrySeconds(capacityErr.RetryAfter),
-				"error", err,
-			)
+	// Acquire a worker and create the session on it. Normally one pass. If the
+	// worker rejects our session because it already holds its max session — a
+	// CP↔worker accounting drift that must never happen under one-session-per-
+	// worker — we do NOT fail the client for our own broken logic: recycle the
+	// inconsistent worker and try a fresh one (bounded), logging loudly so the
+	// drift is visible. ctx is the budget; each attempt also re-checks it.
+	var lastCapDriftErr error
+	for attempt := 1; attempt <= maxWorkerSessionCapDriftRetries+1; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, nil, err
+		}
+
+		acquireStart := time.Now()
+		actx, acquireSpan := server.Tracer().Start(ctx, "duckgres.worker_acquire")
+		sm.log.Debug("Acquiring worker for session.", "pid", pid, "user", username, "attempt", attempt)
+		worker, err := sm.pool.AcquireWorker(actx, profile)
+		if err != nil {
+			var capacityErr *WorkerCapacityExhaustedError
+			if errors.As(err, &capacityErr) {
+				missReason := capacityErr.missReason()
+				observeControlPlaneWorkerAcquireFailure("worker_capacity_exhausted")
+				observeControlPlaneWorkerAcquireFailure("worker_capacity_" + string(missReason))
+				acquireSpan.SetAttributes(
+					attribute.String("worker_capacity.reason", string(missReason)),
+					attribute.Int("worker_capacity.retry_after_seconds", capacityRetrySeconds(capacityErr.RetryAfter)),
+				)
+				sm.log.Warn("Worker acquisition failed.",
+					"pid", pid,
+					"user", username,
+					"duration", time.Since(acquireStart),
+					"reason", missReason,
+					"retry_after", capacityErr.RetryAfter,
+					"retry_after_seconds", capacityRetrySeconds(capacityErr.RetryAfter),
+					"error", err,
+				)
+			}
+			acquireSpan.End()
+			return 0, nil, fmt.Errorf("acquire worker: %w", err)
 		}
 		acquireSpan.End()
-		return 0, nil, fmt.Errorf("acquire worker: %w", err)
-	}
-	acquireSpan.End()
-	slog.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
+		sm.log.Debug("Worker acquired.", "pid", pid, "worker", worker.ID, "user", username, "duration", time.Since(acquireStart))
 
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, memoryLimit, threads, worker, protocol, true, lease)
-	if err != nil {
-		return 0, nil, err
+		newPID, exec, err := sm.createSessionOnWorker(actx, username, pid, memoryLimit, threads, worker, protocol, true, lease)
+		if err == nil {
+			success = true
+			return newPID, exec, nil
+		}
+		switch {
+		case isWorkerSessionCapError(err):
+			// One-session-per-worker invariant violated: the CP scheduled this
+			// worker believing it idle, but the worker still holds a session.
+			// Loud ERROR + metric so we can find and fix the drift.
+			observeWorkerSessionCapDrift()
+			sm.log.Error("Worker rejected a CP-scheduled session at its session cap — one-session-per-worker accounting drift; recycling worker and re-acquiring.",
+				"pid", pid,
+				"user", username,
+				"worker", worker.ID,
+				"attempt", attempt,
+				"error", err,
+			)
+		case isWorkerConnPoolTimeoutError(err):
+			// The worker's single session connection never returned to its pool
+			// (a previous session's cleanup is stuck) — the worker is WEDGED, and
+			// because it still looks hot-idle, plain client retries deterministically
+			// reuse it and fail again (observed live: 12 straight failures against
+			// one worker). Recycle it and re-acquire a fresh one.
+			observeWorkerConnPoolWedge()
+			sm.log.Error("Worker session-create timed out acquiring its DB connection — wedged worker; recycling and re-acquiring.",
+				"pid", pid,
+				"user", username,
+				"worker", worker.ID,
+				"attempt", attempt,
+				"error", err,
+			)
+		case isWorkerS3CacheRestoreError(err):
+			// The worker couldn't restore the cache-proxy S3 transport a
+			// previous session's `duckgres.s3_cache = off` left behind (the
+			// mandatory pre-session restore in duckdbservice.CreateSession).
+			// The worker fails the create rather than start the session in an
+			// unknown transport state; a fresh (never-bypassed) worker's
+			// restore is a no-op, so recycle and re-acquire instead of failing
+			// the client — this is the retry the worker-side contract promises.
+			sm.log.Warn("Worker failed to restore its S3 cache transport before session start; recycling and re-acquiring.",
+				"pid", pid,
+				"user", username,
+				"worker", worker.ID,
+				"attempt", attempt,
+				"error", err,
+			)
+		default:
+			return 0, nil, err
+		}
+
+		// Recycle (graceful drain via retire) so the worker leaves the
+		// schedulable pool, and retry with a fresh worker.
+		lastCapDriftErr = err
+		sm.pool.RetireWorker(worker.ID)
 	}
-	success = true
-	return pid, exec, nil
+
+	// Exhausted retries — every fresh worker drifted, which means scheduling is
+	// systemically broken. Surface a clear error rather than spinning.
+	return 0, nil, fmt.Errorf("create session: worker session-cap drift persisted across %d attempts: %w", maxWorkerSessionCapDriftRetries+1, lastCapDriftErr)
+}
+
+// maxWorkerSessionCapDriftRetries bounds how many EXTRA fresh workers we try when
+// a worker rejects a CP-scheduled session at its cap (one-session-per-worker
+// accounting drift). Total attempts = this + 1. Small: a single drift is a rare
+// race that a fresh worker fixes; persistent drift is a bug to surface, not spin on.
+const maxWorkerSessionCapDriftRetries = 2
+
+// isWorkerSessionCapError reports whether err is a worker's rejection of a new
+// session because it already holds its configured maximum (MaxSessions). The
+// worker maps this to gRPC ResourceExhausted with the duckdbservice message
+// "max sessions reached (N)", which propagates through the wrapped error chain.
+func isWorkerSessionCapError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "max sessions reached")
+}
+
+// isWorkerS3CacheRestoreError reports whether err is the worker-side failure
+// to restore the cache-proxy S3 transport before a new session starts (a
+// previous session's `duckgres.s3_cache = off` bypass that could not be
+// undone; duckdbservice.CreateSession's "restore S3 cache transport before
+// session start" error). The failed worker must not serve the session — its
+// transport state is unknown — but a fresh worker's restore is a no-op, so
+// this class is retried on a recycled acquisition instead of failing the
+// client's connect.
+func isWorkerS3CacheRestoreError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "restore S3 cache transport")
+}
+
+// isWorkerConnPoolTimeoutError reports whether err is the worker-side
+// "failed to obtain connection from pool" session-create failure
+// (duckdbservice acquires the single-session DB connection with a 30s
+// timeout; see the MaxOpenConns=1 isolation contract). A worker returning
+// this is wedged — its connection never came back from the previous
+// session's cleanup — and because it parks hot-idle afterwards, plain
+// client retries deterministically reuse it; it must be recycled instead.
+func isWorkerConnPoolTimeoutError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed to obtain connection from pool")
 }
 
 func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) (string, int) {
@@ -313,14 +521,33 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 	return memoryLimit, threads
 }
 
-func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (int32, *flightclient.FlightExecutor, error) {
-	ctx, endCreation, err := sm.beginSessionCreation(ctx)
+func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (resultPID int32, resultExecutor *flightclient.FlightExecutor, resultErr error) {
+	ctx, finishCreation, err := sm.beginSessionCreation(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer endCreation()
+	defer func() {
+		if !finishCreation() {
+			return
+		}
+		if resultErr == nil && resultPID != 0 {
+			sm.DestroySession(resultPID)
+			resultPID = 0
+			resultExecutor = nil
+		}
+		resultErr = ErrSessionManagerDraining
+	}()
 
-	lease, err := sm.acquireConnectionSlot(ctx, 0, "flight")
+	var profile *WorkerProfile
+	if provider, ok := sm.pool.(flightReconnectProfileProvider); ok {
+		profile, err = provider.ReconnectFlightWorkerProfile(ctx, workerID, ownerEpoch)
+		if err != nil {
+			return 0, nil, fmt.Errorf("resolve reconnect worker profile %d: %w", workerID, err)
+		}
+	}
+
+	pid := sm.ReservePID()
+	lease, err := sm.acquireConnectionSlot(ctx, pid, username, "flight", profile)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -339,21 +566,25 @@ func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username s
 	if err != nil {
 		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
 	}
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, 0, "", 0, worker, "flight", false, lease)
+	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, "", 0, worker, "flight", false, lease)
 	if err != nil {
+		// ReconnectFlightWorker pre-claimed the session on the worker; undo
+		// the claim so the worker parks hot-idle instead of looking busy
+		// forever with no session on it.
+		sm.pool.ReleaseWorker(worker.ID)
 		return 0, nil, err
 	}
 	success = true
 	return pid, exec, nil
 }
 
-func (sm *SessionManager) beginSessionCreation(ctx context.Context) (context.Context, func(), error) {
+func (sm *SessionManager) beginSessionCreation(ctx context.Context) (context.Context, func() bool, error) {
 	return sm.lifecycle.begin(ctx)
 }
 
 func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username string, pid int32, memoryLimit string, threads int, worker *ManagedWorker, protocol string, retireOnFailure bool, lease connectionLease) (int32, *flightclient.FlightExecutor, error) {
 	createStart := time.Now()
-	slog.Info("Creating session on worker.",
+	sm.log.Info("Creating session on worker.",
 		"pid", pid,
 		"worker", worker.ID,
 		"user", username,
@@ -363,9 +594,23 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		"owner_cp_instance_id", worker.OwnerCPInstanceID(),
 		"owner_epoch", worker.OwnerEpoch(),
 	)
-	sessionToken, err := worker.CreateSession(ctx, username, memoryLimit, threads)
+	// Load the user's persistent secrets for replay. Failure to load degrades
+	// to a session without user secrets (logged loudly) rather than a refused
+	// connection: the config store being briefly unavailable must not lock
+	// every returning user out of their warehouse.
+	var secretStatements []string
+	if sm.userSecretLoader != nil {
+		var secretErr error
+		secretStatements, secretErr = sm.userSecretLoader(ctx, username)
+		if secretErr != nil {
+			sm.log.Error("Failed to load user persistent secrets; session starts without them.",
+				"pid", pid, "worker", worker.ID, "user", username, "error", secretErr)
+		}
+	}
+
+	sessionToken, secretWarnings, err := worker.CreateSession(ctx, username, memoryLimit, threads, secretStatements)
 	if err != nil {
-		slog.Warn("Failed to create session on worker.",
+		sm.log.Warn("Failed to create session on worker.",
 			"pid", pid,
 			"worker", worker.ID,
 			"user", username,
@@ -380,17 +625,28 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		return 0, nil, fmt.Errorf("create session on worker %d: %w", worker.ID, err)
 	}
 
-	executor := flightclient.NewFlightExecutorFromClient(worker.client, sessionToken)
+	for _, w := range secretWarnings {
+		sm.log.Warn("User persistent secret replay warning.",
+			"pid", pid, "worker", worker.ID, "user", username, "warning", w)
+	}
+
+	executor := flightclient.NewFlightExecutorFromClientWithQueryLogLimiter(
+		worker.client,
+		sessionToken,
+		worker.workerQueryLogLimiter(),
+	)
 	executor.SetControlMetadata(worker.ID, worker.OwnerCPInstanceID(), worker.OwnerEpoch())
 
 	if pid == 0 {
-		pid = sm.nextPID.Add(1)
+		pid = reservePID(globalNextPID)
 	}
 
 	session := &ManagedSession{
 		PID:          pid,
+		Username:     username,
 		WorkerID:     worker.ID,
 		Protocol:     protocol,
+		StartedAt:    time.Now().UTC(),
 		SessionToken: sessionToken,
 		Executor:     executor,
 		lease:        lease,
@@ -399,7 +655,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	sm.mu.Lock()
 	if sm.lifecycle.isClosed() {
 		sm.mu.Unlock()
-		sm.cleanupUnregisteredWorkerSession(worker, session.SessionToken)
+		sm.cleanupUnregisteredWorkerSession(worker, session)
 		return 0, nil, ErrSessionManagerDraining
 	}
 	sm.sessions[pid] = session
@@ -408,7 +664,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	workerSessionCount := len(sm.byWorker[worker.ID])
 	sm.mu.Unlock()
 
-	slog.Info("Session created on worker.",
+	sm.log.Info("Session created on worker.",
 		"pid", pid,
 		"worker", worker.ID,
 		"user", username,
@@ -425,18 +681,27 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 	return pid, executor, nil
 }
 
-func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker, sessionToken string) {
+func (sm *SessionManager) cleanupUnregisteredWorkerSession(worker *ManagedWorker, session *ManagedSession) {
+	if session.Executor != nil {
+		_ = session.Executor.Close()
+	}
 	if worker != nil {
+		var destroyErr error
 		select {
 		case <-worker.done:
 		default:
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := worker.DestroySession(ctx, sessionToken); err != nil {
-				slog.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", err)
+			destroyErr = worker.DestroySession(ctx, session.SessionToken)
+			if destroyErr != nil {
+				sm.log.Warn("Failed to destroy unregistered worker session during drain.", "worker", worker.ID, "error", destroyErr)
 			}
 			cancel()
 		}
-		sm.pool.ReleaseWorker(worker.ID)
+		if destroyErr != nil {
+			sm.pool.RetireWorker(worker.ID)
+		} else {
+			sm.pool.ReleaseWorker(worker.ID)
+		}
 	}
 }
 
@@ -448,14 +713,14 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	session, sessionCount, workerSessionCount, ok := sm.detachSessionLocked(pid)
 	if !ok {
 		sm.mu.Unlock()
-		slog.Warn("DestroySession called for unknown session.", "pid", pid)
+		sm.log.Warn("DestroySession called for unknown session.", "pid", pid)
 		return
 	}
 	finishCleanup := sm.lifecycle.beginCleanup()
 	sm.mu.Unlock()
 	defer finishCleanup()
 
-	slog.Info("Destroying session.",
+	sm.log.Info("Destroying session.",
 		"pid", pid,
 		"worker", session.WorkerID,
 		"protocol", session.Protocol,
@@ -488,7 +753,7 @@ func (sm *SessionManager) DestroySession(pid int32) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			workerDestroyErr = worker.DestroySession(ctx, session.SessionToken)
 			cancel()
-			slog.Info("Worker session destroy RPC completed.",
+			sm.log.Info("Worker session destroy RPC completed.",
 				"pid", pid,
 				"worker", session.WorkerID,
 				"protocol", session.Protocol,
@@ -498,11 +763,18 @@ func (sm *SessionManager) DestroySession(pid int32) {
 		}
 	}
 
-	// Release the worker for reuse after cleanup is complete.
-	sm.pool.ReleaseWorker(session.WorkerID)
+	// A failed destroy means worker-side cleanup may still own the session's
+	// sole DB connection. Never return that worker to the schedulable pool:
+	// the next CreateSession would block on db.Conn() until its 30s timeout.
+	if workerDestroyErr != nil {
+		sm.pool.RetireWorker(session.WorkerID)
+	} else {
+		// Release the worker for reuse only after cleanup completed.
+		sm.pool.ReleaseWorker(session.WorkerID)
+	}
 	sm.releaseSessionLease(session, "pid", pid)
 
-	slog.Info("Session destroyed.",
+	sm.log.Info("Session destroyed.",
 		"pid", pid,
 		"worker", session.WorkerID,
 		"protocol", session.Protocol,
@@ -519,13 +791,23 @@ func (sm *SessionManager) DestroySession(pid int32) {
 	}
 }
 
+// BeginDrain prevents new session creation and cancels every creation already
+// in progress without disturbing established sessions. It is intentionally
+// non-blocking: callers can continue waiting for established sessions to end
+// naturally before invoking DestroyAllSessions for final teardown.
+func (sm *SessionManager) BeginDrain() {
+	sm.lifecycle.close()
+	sm.mu.Lock()
+	sm.failWaitersLocked(ErrSessionManagerDraining)
+	sm.mu.Unlock()
+}
+
 // DestroyAllSessions destroys every active session without holding the manager
 // lock while running per-session cleanup.
 func (sm *SessionManager) DestroyAllSessions() {
 	for {
-		sm.lifecycle.close()
+		sm.BeginDrain()
 		sm.mu.Lock()
-		sm.failWaitersLocked(ErrSessionManagerDraining)
 		pids := sm.sessionPIDsLocked()
 		sm.mu.Unlock()
 		if len(pids) == 0 {
@@ -536,6 +818,42 @@ func (sm *SessionManager) DestroyAllSessions() {
 			sm.DestroySession(pid)
 		}
 	}
+}
+
+// DestroySessionsForUser tears down every active session owned by username (the
+// per-user kill switch). Each DestroySession cancels the session's in-flight
+// query (via the executor) and destroys the worker-side session; here we
+// additionally force-close the client TCP connection so the client is dropped
+// immediately rather than lingering until its next query returns ErrWorkerDead
+// (mirrors OnWorkerCrash). Returns the number of sessions destroyed.
+//
+// Unlike DestroyAllSessions this does NOT close the manager lifecycle: the org
+// stays open for other users, and (unless the user is also disabled) for the
+// killed user's subsequent reconnects.
+func (sm *SessionManager) DestroySessionsForUser(username string) int {
+	type target struct {
+		pid    int32
+		closer io.Closer
+	}
+	sm.mu.Lock()
+	var targets []target
+	for pid, s := range sm.sessions {
+		if s.Username == username {
+			targets = append(targets, target{pid: pid, closer: s.connCloser})
+		}
+	}
+	sm.mu.Unlock()
+
+	for _, t := range targets {
+		sm.DestroySession(t.pid)
+		// Drop the client connection immediately. The deferred close in
+		// handleConnection will also Close() this conn; a double close on a
+		// socket is harmless (the error is discarded).
+		if t.closer != nil {
+			_ = t.closer.Close()
+		}
+	}
+	return len(targets)
 }
 
 func (sm *SessionManager) sessionPIDsLocked() []int32 {
@@ -579,23 +897,14 @@ func (sm *SessionManager) releaseSessionLease(session *ManagedSession, attrs ...
 	if session == nil || session.lease == nil {
 		return
 	}
-	releaseConnectionLeaseWithRetry(session.lease, attrs...)
+	releaseConnectionLease(session.lease, attrs...)
 }
 
-func releaseConnectionLeaseWithRetry(lease connectionLease, attrs ...any) {
-	var err error
-	for attempt := 1; attempt <= connectionLeaseReleaseMaxAttempts; attempt++ {
-		err = lease.Release(context.Background())
-		if err == nil {
-			return
-		}
-		if attempt < connectionLeaseReleaseMaxAttempts {
-			time.Sleep(time.Duration(attempt) * connectionLeaseReleaseRetryDelay)
-		}
+func releaseConnectionLease(lease connectionLease, attrs ...any) {
+	if err := lease.Release(context.Background()); err != nil {
+		args := append([]any{"error", err}, attrs...)
+		slog.Warn("Failed to submit org connection lease for reclamation.", args...)
 	}
-
-	args := append([]any{"error", err, "attempts", connectionLeaseReleaseMaxAttempts}, attrs...)
-	slog.Warn("Failed to release org connection lease.", args...)
 }
 
 // OnWorkerCrash handles a worker crash by marking all affected executors as
@@ -616,7 +925,7 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 	}
 	sm.mu.Unlock()
 
-	slog.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids), "pids", pids)
+	sm.log.Warn("Worker crashed, notifying sessions.", "worker", workerID, "sessions", len(pids), "pids", pids)
 
 	for _, pid := range pids {
 		cleanupStart := time.Now()
@@ -647,7 +956,7 @@ func (sm *SessionManager) OnWorkerCrash(workerID int, errorFn func(pid int32)) {
 			_ = connCloser.Close()
 		}
 		sm.releaseSessionLease(session, "pid", pid)
-		slog.Info("Worker crash session cleanup completed.",
+		sm.log.Info("Worker crash session cleanup completed.",
 			"pid", pid,
 			"worker", workerID,
 			"session_found", ok,
@@ -704,6 +1013,32 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 	return -1
 }
 
+// SessionForWorker returns the session bound to the given cluster-unique worker
+// id, or ok=false if this stack has none. One session per worker, so the first
+// (only) pid in the worker's index is authoritative. Used by the admin
+// live-query detail to address a query by worker id instead of the per-org pid.
+func (sm *SessionManager) SessionForWorker(workerID int) (*ManagedSession, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	pids := sm.byWorker[workerID]
+	if len(pids) == 0 {
+		return nil, false
+	}
+	s, ok := sm.sessions[pids[0]]
+	return s, ok
+}
+
+// ProtocolForPID returns the wire protocol ("postgres"/"flight") for a session,
+// or "" if not found. O(1) lookup for the admin live-query detail view.
+func (sm *SessionManager) ProtocolForPID(pid int32) string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if s, ok := sm.sessions[pid]; ok {
+		return s.Protocol
+	}
+	return ""
+}
+
 // WorkerPodNameForPID returns the K8s pod name of the worker hosting the
 // session, or "" if not found or not running on K8s.
 func (sm *SessionManager) WorkerPodNameForPID(pid int32) string {
@@ -718,6 +1053,17 @@ func (sm *SessionManager) WorkerPodNameForPID(pid int32) string {
 		return ""
 	}
 	return worker.PodName()
+}
+
+// WorkerProfile returns the pod-shape profile (cpu/memory/ttl) of a worker by
+// ID, or false if the worker is not in the pool. The zero profile is the
+// default profile (empty cpu/memory).
+func (sm *SessionManager) WorkerProfile(workerID int) (WorkerProfile, bool) {
+	w, ok := sm.pool.Worker(workerID)
+	if !ok || w == nil {
+		return WorkerProfile{}, false
+	}
+	return w.Profile(), true
 }
 
 // GetProgress returns the cached query progress for a session, or nil.

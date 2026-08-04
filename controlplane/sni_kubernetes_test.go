@@ -58,6 +58,44 @@ func TestExtractOrgFromSNIEmptySuffixes(t *testing.T) {
 	}
 }
 
+func TestExtractMetadataOrgFromSNIAllManagedWarehouseEnvironments(t *testing.T) {
+	cp := &ControlPlane{
+		cfg: ControlPlaneConfig{
+			MetadataHostnameSuffixes: []string{
+				".md.dev.postwh.com",
+				".md.us.postwh.com",
+				".md.eu.postwh.com",
+			},
+		},
+	}
+
+	for _, hostname := range []string{
+		"acme.md.dev.postwh.com",
+		"acme.md.us.postwh.com",
+		"acme.md.eu.postwh.com",
+	} {
+		t.Run(hostname, func(t *testing.T) {
+			org, ok := cp.extractMetadataOrgFromSNI(hostname)
+			if !ok || org != "acme" {
+				t.Fatalf("extractMetadataOrgFromSNI(%q) = (%q, %v); want (\"acme\", true)", hostname, org, ok)
+			}
+		})
+	}
+
+	for _, hostname := range []string{
+		"acme.md.postwh.com",
+		"nested.acme.md.eu.postwh.com",
+		".md.dev.postwh.com",
+	} {
+		t.Run(hostname, func(t *testing.T) {
+			org, ok := cp.extractMetadataOrgFromSNI(hostname)
+			if ok || org != "" {
+				t.Fatalf("extractMetadataOrgFromSNI(%q) = (%q, %v); want (\"\", false)", hostname, org, ok)
+			}
+		})
+	}
+}
+
 func TestManagedHostnameHint(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -162,6 +200,15 @@ func (f *fakeConfigStore) OrgWarehouseStatus(string) (string, bool) {
 	// SNI tests don't exercise the warehouse-status connection-error path.
 	return "", false
 }
+func (f *fakeConfigStore) OrgDefaultWorkerProfile(string) (string, string, string) {
+	// SNI tests don't exercise worker-profile resolution; "not set" keeps the
+	// default (nil) profile semantics.
+	return "", "", ""
+}
+func (f *fakeConfigStore) OrgUsageTeamID(string, string) int64 {
+	// SNI tests don't exercise analytics team attribution.
+	return 0
+}
 func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
 	panic("UpsertFlightSessionRecord should not be called from SNI tests")
 }
@@ -173,6 +220,9 @@ func (f *fakeConfigStore) TouchFlightSessionRecord(string, time.Time) error {
 }
 func (f *fakeConfigStore) CloseFlightSessionRecord(string, time.Time) error {
 	panic("CloseFlightSessionRecord should not be called from SNI tests")
+}
+func (f *fakeConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(configstore.FlightSessionRecord, time.Time) (bool, error) {
+	panic("CloseFlightSessionRecordIfReconnectTargetUnchanged should not be called from SNI tests")
 }
 
 func newFlightValidator(t *testing.T, mode string, store *fakeConfigStore) *cpFlightCredentialValidator {
@@ -260,7 +310,7 @@ func TestPostgresSNIUnknownModeIgnoresSNI(t *testing.T) {
 	}
 }
 
-// A non-selectable database name (anything other than ducklake/iceberg/empty)
+// A non-selectable database name (anything other than ducklake/empty)
 // is rejected with 3D000 — the database param is now catalog selection, not an
 // org/identity routing key.
 func TestPostgresInvalidCatalogSQLSTATE(t *testing.T) {
@@ -274,7 +324,7 @@ func TestPostgresInvalidCatalogSQLSTATE(t *testing.T) {
 				OrgID:        "other-org",
 				SNIOrgID:     "other-org",
 				SNIResolved:  true,
-				CatalogValid: false, // "requested_db" is not ducklake/iceberg
+				CatalogValid: false, // "requested_db" is not ducklake
 				Valid:        true,
 			}
 		},

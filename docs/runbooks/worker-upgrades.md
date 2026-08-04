@@ -27,7 +27,7 @@ ducklake:
   default_spec_version: "1.0"
 ```
 
-When the Control Plane starts, the **Janitor** ensures that the shared "neutral" warm pool is populated with pods running this image.
+This image is what new worker pods are spawned from on demand (no pool is pre-populated at startup).
 
 ### 2. Available Worker Builds
 
@@ -127,8 +127,13 @@ The system is "version-aware" during worker reclamation. If a tenant is sitting 
 3.  Retire the old worker.
 4.  Spawn a new one with the correct build.
 
-### Neutral Pool
-The global "Neutral Warm Pool" (idle workers waiting for any org) **always** uses the global default image. This ensures that the most common path is always fast (sub-second connection). Tenants on custom/canary builds will experience a "cold start" (pod spawn penalty) on their first connection.
+### On-demand spawn + hot-idle reuse
+Workers are spawned on demand for an org from its resolved image (the global
+default unless the org pins a custom/canary build), and kept hot-idle for reuse
+until their TTL. The first connection after a hot-idle worker expires (or an
+image change) pays a cold-start pod-spawn penalty; the node-headroom controller
+keeps placeholder pods ready so that spawn schedules immediately rather than
+waiting on a fresh node.
 
 ## Background
 

@@ -1,0 +1,452 @@
+//go:build kubernetes
+
+package provisioner
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"fmt"
+	"strings"
+	"testing"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
+)
+
+func ducklingWithCredentialRef(name string, ref SecretReference) *unstructured.Unstructured {
+	metadataStore := map[string]interface{}{
+		"type":     configstore.MetadataStoreKindCnpgShard,
+		"endpoint": "metadata.internal",
+		"user":     "tenant",
+		"database": "tenant",
+	}
+	if ref.Name != "" {
+		metadataStore["credentialSecretRef"] = map[string]interface{}{
+			"name": ref.Name, "namespace": ref.Namespace, "key": ref.Key,
+		}
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ducklingNamespace},
+		"status":     map[string]interface{}{"metadataStore": metadataStore},
+	}}
+}
+
+func credentialSecret(name, password string) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ducklingNamespace},
+		"data":       map[string]interface{}{"password": base64.StdEncoding.EncodeToString([]byte(password))},
+	}}
+}
+
+func TestCnpgProvisionerEndpointReadsCompleteScopedSecret(t *testing.T) {
+	data := map[string]interface{}{}
+	for key, value := range map[string]string{
+		"endpoint": "shard-004-rw.cnpg-shards.svc.cluster.local",
+		"port":     "5432", "username": "tenant_provisioner", "password": "secret",
+	} {
+		data[key] = base64.StdEncoding.EncodeToString([]byte(value))
+	}
+	secret := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1", "kind": "Secret",
+		"metadata": map[string]interface{}{"name": "cnpg-shard-004-provisioner", "namespace": ducklingNamespace},
+		"data":     data,
+	}}
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), secret)
+
+	endpoint, err := NewDucklingClientWithDynamic(fakeK8s).CnpgProvisionerEndpoint(context.Background(), "shard-004")
+	if err != nil {
+		t.Fatalf("CnpgProvisionerEndpoint: %v", err)
+	}
+	if endpoint.Host != "shard-004-rw.cnpg-shards.svc.cluster.local" || endpoint.Port != 5432 ||
+		endpoint.User != "tenant_provisioner" || endpoint.Database != "postgres" ||
+		endpoint.Password != "secret" || endpoint.SSLMode != "require" {
+		t.Fatalf("endpoint = %+v", endpoint.Redacted())
+	}
+}
+
+func TestGetResolvesMetadataPasswordFromCredentialSecretRef(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{
+		Name: "cnpg-tenant-acme-password", Namespace: ducklingNamespace, Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr, credentialSecret("cnpg-tenant-acme-password", "live-secret-password"))
+
+	status, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := status.MetadataStore.Password; got != "live-secret-password" {
+		t.Fatalf("password = %q, want Secret value", got)
+	}
+}
+
+func TestGetResolvesReshardMaintenanceStatusAndPassword(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{
+		Name: "cnpg-tenant-acme-password", Namespace: ducklingNamespace, Key: "password",
+	})
+	metadataStore := cr.Object["status"].(map[string]interface{})["metadataStore"].(map[string]interface{})
+	metadataStore["reshardMaintenance"] = map[string]interface{}{
+		"operationID":        int64(42),
+		"user":               "reshard_42",
+		"prepared":           true,
+		"fenced":             true,
+		"tenantLogin":        false,
+		"tenantNoLogin":      true,
+		"maintenanceLogin":   true,
+		"maintenanceNoLogin": false,
+		"credentialSecretRef": map[string]interface{}{
+			"name": "cnpg-reshard-42-password", "namespace": ducklingNamespace, "key": "password",
+		},
+	}
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr,
+		credentialSecret("cnpg-tenant-acme-password", "tenant-password"),
+		credentialSecret("cnpg-reshard-42-password", "maintenance-password"))
+
+	status, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	m := status.ReshardMaintenance
+	if m.OperationID != 42 || m.User != "reshard_42" || !m.Prepared || !m.Fenced ||
+		m.TenantLogin || !m.TenantNoLogin || !m.MaintenanceLogin || m.MaintenanceNoLogin ||
+		m.Password != "maintenance-password" {
+		t.Fatalf("reshard maintenance status = %#v", m)
+	}
+}
+
+func TestReshardMaintenanceCleanupCompleteObservesNamedResources(t *testing.T) {
+	name := "acme"
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))[:16]
+	roleName := "cnpg-reshard-" + hash
+	usageName := roleName + "-uses-password"
+	role := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": cnpgTenantMRGroup + "/v1alpha1",
+		"kind":       "Role",
+		"metadata":   map[string]interface{}{"name": roleName, "namespace": ducklingNamespace},
+	}}
+	usage := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "protection.crossplane.io/v1beta1",
+		"kind":       "Usage",
+		"metadata":   map[string]interface{}{"name": usageName, "namespace": ducklingNamespace},
+	}}
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), role, usage)
+	client := NewDucklingClientWithDynamic(fakeK8s)
+
+	removed, err := client.ReshardMaintenanceRoleRemoved(context.Background(), name)
+	if err != nil {
+		t.Fatalf("role removal observation: %v", err)
+	}
+	if removed {
+		t.Fatal("role removed=true while maintenance Role still exists")
+	}
+
+	complete, detail, err := client.ReshardMaintenanceCleanupComplete(context.Background(), name)
+	if err != nil {
+		t.Fatalf("cleanup observation: %v", err)
+	}
+	if complete || !strings.Contains(detail, roleName) {
+		t.Fatalf("complete=%t detail=%q, want existing Role reported", complete, detail)
+	}
+	if err := fakeK8s.Resource(schema.GroupVersionResource{
+		Group: cnpgTenantMRGroup, Version: "v1alpha1", Resource: "roles",
+	}).Namespace(ducklingNamespace).Delete(context.Background(), roleName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete role: %v", err)
+	}
+	removed, err = client.ReshardMaintenanceRoleRemoved(context.Background(), name)
+	if err != nil {
+		t.Fatalf("role removal observation after deletion: %v", err)
+	}
+	if !removed {
+		t.Fatal("role removed=false after maintenance Role deletion")
+	}
+
+	complete, detail, err = client.ReshardMaintenanceCleanupComplete(context.Background(), name)
+	if err != nil {
+		t.Fatalf("cleanup observation after deletion: %v", err)
+	}
+	if complete || !strings.Contains(detail, usageName) {
+		t.Fatalf("complete=%t detail=%q, want existing Usage reported", complete, detail)
+	}
+	if err := fakeK8s.Resource(schema.GroupVersionResource{
+		Group: "protection.crossplane.io", Version: "v1beta1", Resource: "usages",
+	}).Namespace(ducklingNamespace).Delete(context.Background(), usageName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("delete usage: %v", err)
+	}
+
+	complete, detail, err = client.ReshardMaintenanceCleanupComplete(context.Background(), name)
+	if err != nil {
+		t.Fatalf("cleanup observation after usage deletion: %v", err)
+	}
+	if !complete {
+		t.Fatalf("complete=false detail=%q, want all resources absent", detail)
+	}
+}
+
+func TestGetRequiresMetadataCredentialSecretRef(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), "credentialSecretRef") {
+		t.Fatalf("Get error = %v, want missing credentialSecretRef error", err)
+	}
+}
+
+func TestGetDoesNotUsePlaintextCredentialFromStatus(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{})
+	metadataStore := cr.Object["status"].(map[string]interface{})["metadataStore"].(map[string]interface{})
+	metadataStore["password"] = "retired-plaintext-password"
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), "credentialSecretRef") {
+		t.Fatalf("Get error = %v, want missing credentialSecretRef error", err)
+	}
+}
+
+func TestGetFailsWhenReferencedCredentialIsUnavailable(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{
+		Name: "missing-password", Namespace: ducklingNamespace, Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), "missing-password") {
+		t.Fatalf("Get error = %v, want missing Secret error", err)
+	}
+}
+
+func TestGetRejectsCredentialSecretOutsideDucklingsNamespace(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{
+		Name: "password", Namespace: "other-namespace", Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), `namespace "other-namespace" is not allowed`) {
+		t.Fatalf("Get error = %v, want namespace rejection", err)
+	}
+}
+
+func TestGetRequiresExplicitCredentialSecretNamespace(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{
+		Name: "cnpg-tenant-acme-password", Key: "password",
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr, credentialSecret("cnpg-tenant-acme-password", "password"))
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), "namespace is required") {
+		t.Fatalf("Get error = %v, want missing namespace error", err)
+	}
+}
+
+func TestGetRequiresExplicitCredentialSecretKey(t *testing.T) {
+	cr := ducklingWithCredentialRef("acme", SecretReference{
+		Name: "cnpg-tenant-acme-password", Namespace: ducklingNamespace,
+	})
+	fakeK8s := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr, credentialSecret("cnpg-tenant-acme-password", "password"))
+
+	_, err := NewDucklingClientWithDynamic(fakeK8s).Get(context.Background(), "acme")
+	if err == nil || !strings.Contains(err.Error(), "key is required") {
+		t.Fatalf("Get error = %v, want missing key error", err)
+	}
+}
+
+func mrWithPolicies(policies []interface{}) *unstructured.Unstructured {
+	spec := map[string]interface{}{}
+	if policies != nil {
+		spec["managementPolicies"] = policies
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{"spec": spec}}
+}
+
+// TestDescribeManagementPolicies pins the op-log rendering of a managed
+// resource's managementPolicies (the orphan wait's periodic diagnostic), and
+// that its reading of "absent means full lifecycle" matches the conservative
+// managementPoliciesHaveDelete used for the orphan decision itself.
+func TestDescribeManagementPolicies(t *testing.T) {
+	cases := []struct {
+		name       string
+		policies   []interface{}
+		want       string
+		haveDelete bool
+	}{
+		{"absent defaults to full lifecycle", nil, `absent (defaults to ["*"], full lifecycle incl. Delete)`, true},
+		{"wildcard", []interface{}{"*"}, `["*"]`, true},
+		{"explicit delete", []interface{}{"Observe", "Create", "Update", "Delete"}, `["Observe","Create","Update","Delete"]`, true},
+		{"orphan-ready no-delete", []interface{}{"Observe", "Create", "Update"}, `["Observe","Create","Update"]`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obj := mrWithPolicies(tc.policies)
+			if got := describeManagementPolicies(obj); got != tc.want {
+				t.Fatalf("describeManagementPolicies = %q, want %q", got, tc.want)
+			}
+			if got := managementPoliciesHaveDelete(obj); got != tc.haveDelete {
+				t.Fatalf("managementPoliciesHaveDelete = %t, want %t", got, tc.haveDelete)
+			}
+		})
+	}
+}
+
+// seedDucklingForCompaction creates a Duckling CR with the given spec.ducklake
+// block (nil = the legacy no-spec.ducklake shape) and status metadata-store
+// type, for the compaction-patch tests.
+func seedDucklingForCompaction(t *testing.T, fakeK8s *dynamicfake.FakeDynamicClient, name string, ducklake map[string]interface{}, statusMetadataType string) {
+	t.Helper()
+	spec := map[string]interface{}{
+		"metadataStore": map[string]interface{}{"type": statusMetadataType},
+	}
+	if ducklake != nil {
+		spec["ducklake"] = ducklake
+	}
+	obj := map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata":   map[string]interface{}{"name": name, "namespace": ducklingNamespace},
+		"spec":       spec,
+		"status": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":     statusMetadataType,
+				"endpoint": "endpoint.example.internal",
+			},
+		},
+	}
+	cr := &unstructured.Unstructured{Object: obj}
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(context.Background(), cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("seed CR: %v", err)
+	}
+}
+
+// applyXRDDucklakeDefault simulates the Duckling XRD's structural-schema
+// defaulting: when spec.ducklake exists WITHOUT an `enabled` key, the API
+// server stamps the schema default `enabled: false` onto it. The fake dynamic
+// client performs no defaulting, so the tests apply it explicitly after each
+// patch — this is what makes the regression real: without the pin in
+// SetCompactionEnabled, a compaction patch that materializes spec.ducklake on
+// a legacy CR gets `enabled: false` stamped and DuckLake is silently disabled
+// for the org (the prod incident).
+func applyXRDDucklakeDefault(t *testing.T, fakeK8s *dynamicfake.FakeDynamicClient, name string) {
+	t.Helper()
+	ctx := context.Background()
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get CR for defaulting: %v", err)
+	}
+	spec, _ := cr.Object["spec"].(map[string]interface{})
+	dl, ok := spec["ducklake"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	if _, has := dl["enabled"]; !has {
+		dl["enabled"] = false
+		if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Update(ctx, cr, metav1.UpdateOptions{}); err != nil {
+			t.Fatalf("apply XRD default: %v", err)
+		}
+	}
+}
+
+// specDucklakeOf re-fetches the CR's spec.ducklake block (nil when absent).
+func specDucklakeOf(t *testing.T, fakeK8s *dynamicfake.FakeDynamicClient, name string) map[string]interface{} {
+	t.Helper()
+	cr, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("re-fetch CR: %v", err)
+	}
+	spec, _ := cr.Object["spec"].(map[string]interface{})
+	dl, _ := spec["ducklake"].(map[string]interface{})
+	return dl
+}
+
+// TestSetCompactionEnabledPinsDuckLakeEnablement pins the XRD-defaulting guard
+// (prod incident): the reshard's compaction merge patch on a legacy CR with NO
+// spec.ducklake object materializes that object, and the XRD's
+// `ducklake.enabled: {default: false}` then stamps `enabled: false` onto it —
+// silently disabling DuckLake for the org (every later activation fails with
+// "tenant activation requires a ducklake metadata_store"). SetCompactionEnabled
+// must pin the org's EFFECTIVE enablement (the legacy metadata-store type
+// coupling: external → enabled, matching
+// shared_worker_activator.buildDuckLakeConfigFromDuckling) into the same patch
+// when — and only when — it materializes the object.
+func TestSetCompactionEnabledPinsDuckLakeEnablement(t *testing.T) {
+	ctx := context.Background()
+	off := false
+
+	// Legacy CR (no spec.ducklake) on an EXTERNAL metadata store: the coupling
+	// says DuckLake is enabled, so the patch must pin enabled=true — XRD
+	// defaulting must find the key already present.
+	t.Run("legacy CR external status pins enabled=true", func(t *testing.T) {
+		dc, fakeK8s := newFakeDucklingClient()
+		seedDucklingForCompaction(t, fakeK8s, "org-a", nil, configstore.MetadataStoreKindExternal)
+		if err := dc.SetCompactionEnabled(ctx, "org-a", &off); err != nil {
+			t.Fatalf("SetCompactionEnabled: %v", err)
+		}
+		applyXRDDucklakeDefault(t, fakeK8s, "org-a")
+		dl := specDucklakeOf(t, fakeK8s, "org-a")
+		if enabled, ok := dl["enabled"].(bool); !ok || !enabled {
+			t.Fatalf("spec.ducklake.enabled = %v (present %t), want pinned true — XRD defaulting would otherwise disable DuckLake", dl["enabled"], ok)
+		}
+		enabled, present, err := dc.GetCompactionSetting(ctx, "org-a")
+		if err != nil || !present || enabled {
+			t.Fatalf("compaction = enabled %t present %t err %v, want explicit false", enabled, present, err)
+		}
+	})
+
+	// Legacy CR on a cnpg-shard metadata store: the coupling derives
+	// enabled=false, so pinning false matches (and the XRD default agrees).
+	t.Run("legacy CR cnpg status pins the coupling value", func(t *testing.T) {
+		dc, fakeK8s := newFakeDucklingClient()
+		seedDucklingForCompaction(t, fakeK8s, "org-b", nil, configstore.MetadataStoreKindCnpgShard)
+		if err := dc.SetCompactionEnabled(ctx, "org-b", &off); err != nil {
+			t.Fatalf("SetCompactionEnabled: %v", err)
+		}
+		applyXRDDucklakeDefault(t, fakeK8s, "org-b")
+		dl := specDucklakeOf(t, fakeK8s, "org-b")
+		if enabled, ok := dl["enabled"].(bool); !ok || enabled {
+			t.Fatalf("spec.ducklake.enabled = %v (present %t), want pinned false (matches the type coupling)", dl["enabled"], ok)
+		}
+	})
+
+	// CR that already HAS spec.ducklake: the patch must not touch `enabled`.
+	// enabled=true with a cnpg status is the discriminating shape — if the
+	// code wrongly pinned the coupling value (false), this would flip.
+	t.Run("existing spec.ducklake is left untouched", func(t *testing.T) {
+		dc, fakeK8s := newFakeDucklingClient()
+		seedDucklingForCompaction(t, fakeK8s, "org-c", map[string]interface{}{"enabled": true}, configstore.MetadataStoreKindCnpgShard)
+		if err := dc.SetCompactionEnabled(ctx, "org-c", &off); err != nil {
+			t.Fatalf("SetCompactionEnabled: %v", err)
+		}
+		applyXRDDucklakeDefault(t, fakeK8s, "org-c")
+		dl := specDucklakeOf(t, fakeK8s, "org-c")
+		if enabled, ok := dl["enabled"].(bool); !ok || !enabled {
+			t.Fatalf("spec.ducklake.enabled = %v (present %t), want the pre-existing true left untouched", dl["enabled"], ok)
+		}
+	})
+
+	// The restore path (enabled=nil removes the compaction key) can materialize
+	// the object just the same on a legacy CR — it must pin too.
+	t.Run("restore remove-path pins on a legacy CR", func(t *testing.T) {
+		dc, fakeK8s := newFakeDucklingClient()
+		seedDucklingForCompaction(t, fakeK8s, "org-d", nil, configstore.MetadataStoreKindExternal)
+		if err := dc.SetCompactionEnabled(ctx, "org-d", nil); err != nil {
+			t.Fatalf("SetCompactionEnabled(nil): %v", err)
+		}
+		applyXRDDucklakeDefault(t, fakeK8s, "org-d")
+		dl := specDucklakeOf(t, fakeK8s, "org-d")
+		if enabled, ok := dl["enabled"].(bool); !ok || !enabled {
+			t.Fatalf("spec.ducklake.enabled = %v (present %t), want pinned true on the remove-path too", dl["enabled"], ok)
+		}
+		if _, present, _ := dc.GetCompactionSetting(ctx, "org-d"); present {
+			t.Fatal("compaction key present after the remove-path, want absent")
+		}
+	})
+}

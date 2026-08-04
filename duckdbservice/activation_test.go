@@ -355,12 +355,114 @@ func TestSessionPoolActivateTenantAllowsSameOwnerSameEpochCredentialRetry(t *tes
 	current := pool.currentActivation()
 	if current == nil {
 		t.Fatal("expected activation to remain present")
+		return
 	}
 	if current.payload.DuckLake.S3AccessKey != "NEW_ACCESS_KEY" {
 		t.Fatalf("expected activation payload to be refreshed, got %q", current.payload.DuckLake.S3AccessKey)
 	}
 	if current.payload.OwnerEpoch != 2 {
 		t.Fatalf("expected owner epoch to remain 2, got %d", current.payload.OwnerEpoch)
+	}
+}
+
+// Regression test for the mw-prod-us 2026-07-17 cache bypass: the hot-idle
+// credential refresh rebuilt ducklake_s3 from the RAW activation payload,
+// dropping the cache-proxy transport (HTTPProxy + USE_SSL=false + pinned
+// endpoint) the attach path applies. The first CP-driven STS rotation then
+// flipped every worker to vhost/HTTPS CONNECT tunnels that the NVMe cache
+// proxy cannot cache. The refresh must see the same overridden config the
+// attach saw.
+func TestSessionPoolCredentialRefreshKeepsCacheProxyTransport(t *testing.T) {
+	t.Setenv("DUCKGRES_CACHE_ENABLED", "true")
+	t.Setenv("NODE_IP", "10.0.0.9")
+
+	pool := &SessionPool{
+		sessions:       make(map[string]*Session),
+		stopRefresh:    make(map[string]func()),
+		duckLakeSem:    make(chan struct{}, 1),
+		cfg:            server.Config{Users: map[string]string{"postgres": "postgres"}},
+		startTime:      time.Now(),
+		warmupDone:     make(chan struct{}),
+		sharedWarmMode: true,
+	}
+	close(pool.warmupDone)
+
+	var opened *sql.DB
+	pool.createDBPair = func(cfg server.Config, sem chan struct{}, username string, startTime time.Time, version string) (*DuckDBPair, error) {
+		db, err := sql.Open("duckdb", "")
+		if err != nil {
+			return nil, err
+		}
+		opened = db
+		return PairFromMain(db), nil
+	}
+	pool.activateDBConnection = func(db *sql.DB, cfg server.Config, sem chan struct{}, username string) error {
+		return nil
+	}
+	defer func() {
+		if opened != nil {
+			_ = opened.Close()
+		}
+	}()
+
+	first := ActivationPayload{
+		WorkerControlMetadata: server.WorkerControlMetadata{
+			OwnerEpoch:   2,
+			CPInstanceID: "cp-live:boot-a",
+			WorkerID:     17,
+		},
+		OrgID: "analytics",
+		DuckLake: server.DuckLakeConfig{
+			MetadataStore:  "postgres:host=metadata.internal port=5432 user=ducklake password=secret dbname=ducklake",
+			ObjectStore:    "s3://analytics/warehouse/",
+			S3Region:       "us-east-1",
+			S3AccessKey:    "OLD_ACCESS_KEY",
+			S3SecretKey:    "OLD_SECRET_KEY",
+			S3SessionToken: "OLD_SESSION_TOKEN",
+		},
+	}
+	if err := pool.activateTenant(first); err != nil {
+		t.Fatalf("first ActivateTenant: %v", err)
+	}
+
+	var refreshCalls int
+	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
+		refreshCalls++
+		if dlCfg.HTTPProxy != "http://10.0.0.9:8080" {
+			t.Errorf("refresh config lost cache-proxy HTTPProxy: got %q", dlCfg.HTTPProxy)
+		}
+		if dlCfg.S3UseSSL {
+			t.Error("refresh config lost USE_SSL=false override — secret would be rebuilt as HTTPS and bypass the cache proxy")
+		}
+		if dlCfg.S3Endpoint != "s3.us-east-1.amazonaws.com" {
+			t.Errorf("refresh config lost pinned S3 endpoint: got %q", dlCfg.S3Endpoint)
+		}
+		if dlCfg.S3AccessKey != "NEW_ACCESS_KEY" {
+			t.Errorf("expected refresh with rotated credentials, got %q", dlCfg.S3AccessKey)
+		}
+		return nil
+	}
+
+	second := first
+	second.DuckLake.S3AccessKey = "NEW_ACCESS_KEY"
+	second.DuckLake.S3SecretKey = "NEW_SECRET_KEY"
+	second.DuckLake.S3SessionToken = "NEW_SESSION_TOKEN"
+	if err := pool.activateTenant(second); err != nil {
+		t.Fatalf("credential rotation re-activation: %v", err)
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("expected one credential refresh, got %d", refreshCalls)
+	}
+
+	// The stored payload must keep the RAW config (no proxy fields) so
+	// needsRefresh DeepEqual comparisons against future raw payloads stay
+	// meaningful — the override belongs only to the exec'd refresh.
+	current := pool.currentActivation()
+	if current == nil {
+		t.Fatal("expected activation to remain present")
+	}
+	if current.payload.DuckLake.HTTPProxy != "" {
+		t.Fatalf("stored payload must stay raw, got HTTPProxy %q", current.payload.DuckLake.HTTPProxy)
 	}
 }
 
@@ -411,7 +513,7 @@ func TestHealthCheckFailsAfterCPRollingRestart(t *testing.T) {
 	// CP-new starts fresh after rolling update. It discovers the worker via
 	// K8s informer but hasn't re-activated it. Its in-memory epoch for this
 	// worker is 0 (default). This is exactly what the health check loop at
-	// k8s_pool.go:2270-2278 sends.
+	// k8s_pool_lifecycle.go health check loop sends.
 	err := pool.validateControlMetadata(server.WorkerControlMetadata{
 		WorkerID:     42,
 		OwnerEpoch:   0,
@@ -687,192 +789,5 @@ func TestConcurrentActivateTenantSamePayloadBothSucceed(t *testing.T) {
 	}
 	if pool.workerID != payload.WorkerID {
 		t.Errorf("workerID = %d, want %d", pool.workerID, payload.WorkerID)
-	}
-}
-
-// TestReuseExistingActivationRefreshesIcebergAlongsideS3 is the regression
-// net for PR #563 (commit 12a9304): on hot-idle reclaim with rotated STS
-// credentials, the iceberg_sigv4 secret must be refreshed alongside the
-// DuckLake S3 secret. Before the fix, only refreshS3Secret was invoked,
-// so long-lived workers' iceberg queries 403'd after STS expiry while
-// DuckLake queries kept working — a class of bug that's invisible to
-// tenants without iceberg enabled and silent for hours on tenants that
-// have it but query it rarely.
-//
-// We assert two things the original fix actually changed: (1) the iceberg
-// refresh function runs at all when Iceberg.Enabled=true on the payload,
-// and (2) it receives the NEW credentials from the rotated payload, not
-// the stale ones from the existing activation. Either failing reproduces
-// the production bug.
-func TestReuseExistingActivationRefreshesIcebergAlongsideS3(t *testing.T) {
-	mainDB, err := sql.Open("duckdb", "")
-	if err != nil {
-		t.Fatalf("open main duckdb: %v", err)
-	}
-	defer func() { _ = mainDB.Close() }()
-	controlDB, err := sql.Open("duckdb", "")
-	if err != nil {
-		t.Fatalf("open control duckdb: %v", err)
-	}
-	defer func() { _ = controlDB.Close() }()
-
-	pool := &SessionPool{
-		sessions:       make(map[string]*Session),
-		stopRefresh:    make(map[string]func()),
-		duckLakeSem:    make(chan struct{}, 1),
-		warmupDone:     make(chan struct{}),
-		sharedWarmMode: true,
-		warmupDB:       mainDB,
-		controlDB:      controlDB,
-		activation: &activatedTenantRuntime{
-			payload: ActivationPayload{
-				WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 1},
-				OrgID:                 "analytics",
-				DuckLake: server.DuckLakeConfig{
-					MetadataStore:  "postgres:host=meta port=5432 user=u password=p dbname=d",
-					ObjectStore:    "s3://analytics/",
-					S3AccessKey:    "OLD_AK",
-					S3SecretKey:    "OLD_SK",
-					S3SessionToken: "OLD_TOK",
-				},
-				Iceberg: server.IcebergConfig{
-					Enabled:             true,
-					LakekeeperEndpoint:  "http://lakekeeper-analytics.lakekeeper.svc:8181/catalog",
-					LakekeeperWarehouse: "org-analytics",
-					Region:              "us-east-1",
-					Namespace:           "main",
-				},
-			},
-			db: mainDB,
-		},
-		ownerEpoch: 1,
-	}
-	close(pool.warmupDone)
-
-	var s3Calls int
-	var icebergCalls int
-	var icebergKeyID, icebergSecret, icebergToken string
-	var icebergCfg server.IcebergConfig
-	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
-		s3Calls++
-		return nil
-	}
-	pool.refreshIcebergSecret = func(db *sql.DB, ic server.IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
-		icebergCalls++
-		icebergCfg = ic
-		icebergKeyID = keyID
-		icebergSecret = secret
-		icebergToken = sessionToken
-		return nil
-	}
-
-	newPayload := ActivationPayload{
-		WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 2},
-		OrgID:                 "analytics",
-		DuckLake: server.DuckLakeConfig{
-			MetadataStore:  "postgres:host=meta port=5432 user=u password=p dbname=d",
-			ObjectStore:    "s3://analytics/",
-			S3AccessKey:    "NEW_AK",
-			S3SecretKey:    "NEW_SK",
-			S3SessionToken: "NEW_TOK",
-		},
-		Iceberg: server.IcebergConfig{
-			Enabled:             true,
-			LakekeeperEndpoint:  "http://lakekeeper-analytics.lakekeeper.svc:8181/catalog",
-			LakekeeperWarehouse: "org-analytics",
-			Region:              "us-east-1",
-			Namespace:           "main",
-		},
-	}
-
-	if !pool.reuseExistingActivation(newPayload) {
-		t.Fatal("reuseExistingActivation returned false; expected hot-idle reclaim to succeed")
-	}
-
-	if s3Calls != 1 {
-		t.Errorf("refreshS3Secret called %d times, want 1", s3Calls)
-	}
-	if icebergCalls != 1 {
-		t.Fatalf("refreshIcebergSecret called %d times, want 1 — iceberg secret was NOT rotated alongside DuckLake (PR #563 regression)", icebergCalls)
-	}
-	if icebergKeyID != "NEW_AK" || icebergSecret != "NEW_SK" || icebergToken != "NEW_TOK" {
-		t.Errorf("iceberg refresh got stale credentials: keyID=%q secret=%q token=%q, want NEW_AK/NEW_SK/NEW_TOK",
-			icebergKeyID, icebergSecret, icebergToken)
-	}
-	if icebergCfg.LakekeeperWarehouse != newPayload.Iceberg.LakekeeperWarehouse || icebergCfg.Region != newPayload.Iceberg.Region {
-		t.Errorf("iceberg refresh got wrong config: %+v, want %+v", icebergCfg, newPayload.Iceberg)
-	}
-}
-
-// TestReuseExistingActivationSkipsIcebergRefreshWhenDisabled guards the
-// inverse: tenants that haven't opted into iceberg must not have the
-// iceberg refresh fn invoked at all on hot-idle reclaim. A regression
-// that unconditionally fires the refresh would run a CREATE OR REPLACE
-// SECRET against DuckDB for every reclaim, which is wasteful and — more
-// importantly — would mask the real bug if the iceberg secret SQL form
-// breaks for the disabled case (e.g. empty ARN/empty creds).
-func TestReuseExistingActivationSkipsIcebergRefreshWhenDisabled(t *testing.T) {
-	mainDB, err := sql.Open("duckdb", "")
-	if err != nil {
-		t.Fatalf("open main duckdb: %v", err)
-	}
-	defer func() { _ = mainDB.Close() }()
-	controlDB, err := sql.Open("duckdb", "")
-	if err != nil {
-		t.Fatalf("open control duckdb: %v", err)
-	}
-	defer func() { _ = controlDB.Close() }()
-
-	pool := &SessionPool{
-		sessions:       make(map[string]*Session),
-		stopRefresh:    make(map[string]func()),
-		duckLakeSem:    make(chan struct{}, 1),
-		warmupDone:     make(chan struct{}),
-		sharedWarmMode: true,
-		warmupDB:       mainDB,
-		controlDB:      controlDB,
-		activation: &activatedTenantRuntime{
-			payload: ActivationPayload{
-				WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 1},
-				OrgID:                 "billing",
-				DuckLake: server.DuckLakeConfig{
-					MetadataStore: "postgres:host=meta port=5432 user=u password=p dbname=d",
-					ObjectStore:   "s3://billing/",
-					S3AccessKey:   "OLD_AK",
-					S3SecretKey:   "OLD_SK",
-				},
-				// Iceberg disabled — typical for tenants on DuckLake-only.
-			},
-			db: mainDB,
-		},
-		ownerEpoch: 1,
-	}
-	close(pool.warmupDone)
-
-	var icebergCalls int
-	pool.refreshS3Secret = func(db *sql.DB, dlCfg server.DuckLakeConfig, sem chan struct{}) error {
-		return nil
-	}
-	pool.refreshIcebergSecret = func(db *sql.DB, ic server.IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
-		icebergCalls++
-		return nil
-	}
-
-	newPayload := ActivationPayload{
-		WorkerControlMetadata: server.WorkerControlMetadata{OwnerEpoch: 2},
-		OrgID:                 "billing",
-		DuckLake: server.DuckLakeConfig{
-			MetadataStore: "postgres:host=meta port=5432 user=u password=p dbname=d",
-			ObjectStore:   "s3://billing/",
-			S3AccessKey:   "NEW_AK",
-			S3SecretKey:   "NEW_SK",
-		},
-	}
-
-	if !pool.reuseExistingActivation(newPayload) {
-		t.Fatal("reuseExistingActivation returned false; expected hot-idle reclaim to succeed")
-	}
-	if icebergCalls != 0 {
-		t.Errorf("refreshIcebergSecret called %d times for iceberg-disabled tenant, want 0", icebergCalls)
 	}
 }

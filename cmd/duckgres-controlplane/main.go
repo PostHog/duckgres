@@ -7,8 +7,9 @@
 //
 //	go list -deps ./cmd/duckgres-controlplane | grep duckdb-go   # empty
 //
-// At runtime, this binary only supports control-plane mode; standalone /
-// duckdb-service modes belong in the all-in-one duckgres binary or
+// At runtime, this binary supports control-plane mode and reshard-runner mode
+// (the dedicated per-operation reshard pod, which runs the CP's own image);
+// standalone / duckdb-service modes belong in the all-in-one duckgres binary or
 // cmd/duckgres-worker respectively.
 package main
 
@@ -26,6 +27,7 @@ import (
 	"github.com/posthog/duckgres/configresolve"
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/crashhandler"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -51,6 +53,13 @@ func main() {
 	// all-in-one binary.
 	signal.Ignore(syscall.SIGPIPE)
 
+	// The native crash handler self-installs from a C constructor (importing
+	// the package links it in): a fatal signal on a native (cgo) thread must
+	// kill the process with a native backtrace, not wedge it forever.
+	if !crashhandler.Installed() {
+		slog.Warn("Native crash handler NOT installed; fatal signals on native threads may wedge the process.")
+	}
+
 	// CLIInputs-backed flags are registered via the shared helper so this
 	// binary and the all-in-one duckgres binary cannot drift on the
 	// resolver's CLI surface. The bespoke flags below (--config,
@@ -67,7 +76,7 @@ func main() {
 	// cmd/duckgres-worker, which accepts --mode duckdb-service for
 	// compatibility with hardcoded pod-spec args. This binary is
 	// control-plane by definition; any other value is loud misuse.
-	mode := flag.String("mode", "control-plane", "Run mode (must be 'control-plane'; accepted for symmetry with the all-in-one binary's CLI shape)")
+	mode := flag.String("mode", "control-plane", "Run mode: control-plane (default) or reshard-runner (dedicated per-operation reshard pod)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Duckgres control plane %s — PostgreSQL wire protocol + Flight ingress\n\n", version)
@@ -104,8 +113,8 @@ func main() {
 		flag.Usage()
 		os.Exit(0)
 	}
-	if *mode != "control-plane" {
-		fmt.Fprintf(os.Stderr, "duckgres-controlplane only supports --mode control-plane (got %q). Use the all-in-one duckgres binary for standalone or duckdb-service modes, or cmd/duckgres-worker for worker pods.\n", *mode)
+	if *mode != "control-plane" && *mode != "reshard-runner" {
+		fmt.Fprintf(os.Stderr, "duckgres-controlplane only supports --mode control-plane or --mode reshard-runner (got %q). Use the all-in-one duckgres binary for standalone or duckdb-service modes, or cmd/duckgres-worker for worker pods.\n", *mode)
 		os.Exit(2)
 	}
 
@@ -135,10 +144,12 @@ func main() {
 
 	loggingShutdown := cliboot.InitLogging()
 	defer loggingShutdown()
+	analyticsShutdown := cliboot.InitAnalytics()
+	defer analyticsShutdown()
 	tracingShutdown := cliboot.InitTracing()
 	defer tracingShutdown()
 
-	buildInfo().Log("control-plane")
+	buildInfo().Log(*mode)
 	server.SetProcessVersion(version)
 
 	if fileCfg != nil {
@@ -155,6 +166,24 @@ func main() {
 		slog.Warn(msg)
 	})
 	cfg := resolved.Server
+
+	// Reshard-runner mode: the entrypoint of a dedicated per-operation pod
+	// (duckgres-reshard-op-<id>) the control plane spawns for each reshard.
+	// Claims ONE operation (DUCKGRES_RESHARD_OP_ID), executes the step machine
+	// to a terminal state, exits. The op row is the source of truth for the
+	// OUTCOME (a failed/rolled-back op still exits 0); only infrastructure
+	// errors (config store unreachable, claim lost/fenced) exit nonzero. No PG
+	// listener, no TLS, no metrics endpoint, no data dir.
+	if *mode == "reshard-runner" {
+		if err := controlplane.RunReshardRunnerMode(controlplane.ReshardRunnerModeConfig{
+			ConfigStoreConn:    resolved.ConfigStoreConn,
+			ConfigPollInterval: resolved.ConfigPollInterval,
+			AWSRegion:          resolved.AWSRegion,
+		}); err != nil {
+			fatal("Reshard runner failed: " + err.Error())
+		}
+		return
+	}
 
 	// Process isolation is incompatible with control-plane mode — that mode
 	// already provides process-level isolation via the worker pool.
@@ -212,49 +241,44 @@ func main() {
 		ConfigStoreConn:            resolved.ConfigStoreConn,
 		ConfigPollInterval:         resolved.ConfigPollInterval,
 		InternalSecret:             resolved.InternalSecret,
+		InternalSecretFallbacks:    resolved.InternalSecretFallbacks,
+		ReadOnlySecret:            resolved.ReadOnlySecret,
+		ReadOnlySecretFallbacks:   resolved.ReadOnlySecretFallbacks,
 		SNIRoutingMode:             resolved.SNIRoutingMode,
 		ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
+		MetadataHostnameSuffixes:   resolved.MetadataHostnameSuffixes,
+		MetadataProxyMaxConns:      resolved.MetadataProxyMaxConns,
+		DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 		DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
+
+		AdmissionReclaimerMaxReservations: resolved.AdmissionReclaimerMaxReservations,
 		K8s: controlplane.K8sConfig{
-			WorkerImage:                     resolved.K8sWorkerImage,
-			WorkerNamespace:                 resolved.K8sWorkerNamespace,
-			ControlPlaneID:                  resolved.K8sControlPlaneID,
-			WorkerPort:                      resolved.K8sWorkerPort,
-			WorkerSecret:                    resolved.K8sWorkerSecret,
-			WorkerConfigMap:                 resolved.K8sWorkerConfigMap,
-			ImagePullPolicy:                 resolved.K8sWorkerImagePullPolicy,
-			ServiceAccount:                  resolved.K8sWorkerServiceAccount,
-			MaxWorkers:                      resolved.K8sMaxWorkers,
-			SharedWarmTarget:                resolved.K8sSharedWarmTarget,
-			DynamicWarmCapacityEnabled:      resolved.K8sDynamicWarmCapacityEnabled,
-			WarmCapacityMissWindow:          resolved.K8sWarmCapacityMissWindow,
-			WarmCapacityMissesPerWorker:     resolved.K8sWarmCapacityMissesPerWorker,
-			WarmCapacityDemandTTL:           resolved.K8sWarmCapacityDemandTTL,
-			WarmCapacityDynamicImageCeiling: resolved.K8sWarmCapacityDynamicImageCeiling,
-			WarmCapacityDynamicTotalCeiling: resolved.K8sWarmCapacityDynamicTotalCeiling,
-			WorkerCPURequest:                resolved.K8sWorkerCPURequest,
-			WorkerMemoryRequest:             resolved.K8sWorkerMemoryRequest,
-			WorkerNodeSelector:              resolved.K8sWorkerNodeSelector,
-			WorkerTolerationKey:             resolved.K8sWorkerTolerationKey,
-			WorkerTolerationValue:           resolved.K8sWorkerTolerationValue,
-			WorkerExclusiveNode:             resolved.K8sWorkerExclusiveNode,
-			AllowClientWorkerProfile:        resolved.K8sAllowClientWorkerProfile,
-			AllowClientExclusiveNode:        resolved.K8sAllowClientExclusiveNode,
-			ColocatedWorkerCPURequest:       resolved.K8sColocatedWorkerCPURequest,
-			ColocatedWorkerMemoryRequest:    resolved.K8sColocatedWorkerMemoryRequest,
-			ColocatedWarmShapes:             resolved.K8sColocatedWarmShapes,
-			WorkerPriorityClassName:         resolved.K8sWorkerPriorityClassName,
-			WorkerTiers:                     resolved.K8sWorkerTiers,
-			ColocatedWorkerNodeSelector:     resolved.K8sColocatedWorkerNodeSelector,
-			ColocatedWorkerTolerationKey:    resolved.K8sColocatedWorkerTolerationKey,
-			ColocatedWorkerTolerationValue:  resolved.K8sColocatedWorkerTolerationValue,
-			WorkerProfileMinCPU:             resolved.K8sWorkerProfileMinCPU,
-			WorkerProfileMaxCPU:             resolved.K8sWorkerProfileMaxCPU,
-			WorkerProfileMinMemory:          resolved.K8sWorkerProfileMinMemory,
-			WorkerProfileMaxMemory:          resolved.K8sWorkerProfileMaxMemory,
-			OrgMaxColocatedCPU:              resolved.K8sOrgMaxColocatedCPU,
-			OrgMaxColocatedMemory:           resolved.K8sOrgMaxColocatedMemory,
-			AWSRegion:                       resolved.AWSRegion,
+			WorkerImage:                  resolved.K8sWorkerImage,
+			WorkerNamespace:              resolved.K8sWorkerNamespace,
+			ControlPlaneID:               resolved.K8sControlPlaneID,
+			WorkerPort:                   resolved.K8sWorkerPort,
+			WorkerSecret:                 resolved.K8sWorkerSecret,
+			WorkerConfigMap:              resolved.K8sWorkerConfigMap,
+			ImagePullPolicy:              resolved.K8sWorkerImagePullPolicy,
+			ServiceAccount:               resolved.K8sWorkerServiceAccount,
+			WorkerCPURequest:             resolved.K8sWorkerCPURequest,
+			WorkerMemoryRequest:          resolved.K8sWorkerMemoryRequest,
+			WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
+			WorkerTolerationKey:          resolved.K8sWorkerTolerationKey,
+			WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
+			AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
+			WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
+			PlaceholderImage:             resolved.K8sPlaceholderImage,
+			PlaceholderPriorityClassName: resolved.K8sPlaceholderPriorityClassName,
+			WorkerProfileMinCPU:          resolved.K8sWorkerProfileMinCPU,
+			WorkerProfileMaxCPU:          resolved.K8sWorkerProfileMaxCPU,
+			WorkerProfileMinMemory:       resolved.K8sWorkerProfileMinMemory,
+			WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
+			WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
+			WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
+			ReshardPodCPU:                resolved.K8sReshardPodCPU,
+			ReshardPodMemory:             resolved.K8sReshardPodMemory,
+			AWSRegion:                    resolved.AWSRegion,
 		},
 	}
 	controlplane.RunControlPlane(cpCfg)

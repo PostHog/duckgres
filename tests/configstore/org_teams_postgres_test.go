@@ -1,0 +1,603 @@
+//go:build linux || darwin
+
+package configstore_test
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioning"
+	"gorm.io/gorm"
+)
+
+func seedOrg(t *testing.T, store *configstore.ConfigStore, name string) {
+	t.Helper()
+	if err := store.DB().Create(&configstore.Org{Name: name, DatabaseName: name + "db"}).Error; err != nil {
+		t.Fatalf("create org %s: %v", name, err)
+	}
+}
+
+// Migration 000031's constraints, exercised against the real migrated schema:
+// project_user is an accepted access mode, it shares the scoped shape rule with
+// project_reader (team required, passthrough forbidden), and the two modes have
+// SEPARATE per-team unique indexes so one team can hold both logins at once.
+func TestProjectUserAccessConstraintsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, created_at, updated_at)
+		VALUES ('acme', 5, 'team_5', TRUE, now(), now())`).Error; err != nil {
+		t.Fatalf("seed team: %v", err)
+	}
+	teamID := int64(5)
+	newUser := func(username, mode string, passthrough bool, team *int64) *configstore.OrgUser {
+		return &configstore.OrgUser{
+			OrgID:       "acme",
+			Username:    username,
+			Password:    "hash",
+			AccessMode:  mode,
+			TeamID:      team,
+			Passthrough: passthrough,
+		}
+	}
+
+	// A reader and a project user coexist on the same team.
+	if err := store.DB().Create(newUser("posthog_team_5", configstore.OrgUserAccessModeProjectReader, false, &teamID)).Error; err != nil {
+		t.Fatalf("create project reader: %v", err)
+	}
+	if err := store.DB().Create(newUser("posthog_team_5_rw", configstore.OrgUserAccessModeProjectUser, false, &teamID)).Error; err != nil {
+		t.Fatalf("create project user alongside reader: %v", err)
+	}
+
+	// ...but only one project user per team.
+	if err := store.DB().Create(newUser("second_writer", configstore.OrgUserAccessModeProjectUser, false, &teamID)).Error; err == nil {
+		t.Fatal("a second project_user for the same team must violate the partial unique index")
+	}
+
+	// The scoped shape rule applies to project_user exactly as it does to
+	// project_reader: a team is mandatory and passthrough is forbidden (it
+	// would bypass the layer that enforces the scope).
+	if err := store.DB().Create(newUser("teamless_writer", configstore.OrgUserAccessModeProjectUser, false, nil)).Error; err == nil {
+		t.Fatal("a project_user without a team must be rejected")
+	}
+	if err := store.DB().Create(newUser("passthrough_writer", configstore.OrgUserAccessModeProjectUser, true, &teamID)).Error; err == nil {
+		t.Fatal("a passthrough project_user must be rejected")
+	}
+
+	// The access_mode enum stays closed.
+	if err := store.DB().Create(newUser("bogus", "project_admin", false, &teamID)).Error; err == nil {
+		t.Fatal("an unknown access_mode must be rejected")
+	}
+}
+
+func readTeam(t *testing.T, store *configstore.ConfigStore, orgID string, teamID int64) configstore.OrgTeam {
+	t.Helper()
+	var team configstore.OrgTeam
+	if err := store.DB().First(&team, "org_id = ? AND team_id = ?", orgID, teamID).Error; err != nil {
+		t.Fatalf("read team (org=%s team=%d): %v", orgID, teamID, err)
+	}
+	return team
+}
+
+func strPtr(s string) *string { return &s }
+func boolPtr(b bool) *bool    { return &b }
+
+// TestUpsertOrgTeamGrandfatherPostgres pins the grandfather contract of the
+// provisioning upsert: an existing row's schema_name and legacy table names
+// ARE overwritable (the PostHog backfill replaces the migration's "team_<id>"
+// placeholder through this path), while omitted presence-aware fields
+// preserve the stored values.
+func TestUpsertOrgTeamGrandfatherPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	pstore := provisioning.NewGormStore(store)
+
+	created, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{
+		TeamID:     7,
+		SchemaName: "team_7",
+	})
+	if err != nil {
+		t.Fatalf("create upsert: %v", err)
+	}
+	if !created.Enabled || created.EventsTableName != nil {
+		t.Fatalf("created row = %+v, want enabled default true, legacy names NULL", created)
+	}
+	// backfill_enabled is NOT NULL DEFAULT TRUE (migration 000028): a create
+	// that omits the field gets TRUE.
+	if created.BackfillEnabled == nil || !*created.BackfillEnabled {
+		t.Fatalf("created row backfill_enabled = %v, want default TRUE", created.BackfillEnabled)
+	}
+
+	// Grandfather: replace the placeholder schema and set explicit names;
+	// disable backfill; enabled omitted must be preserved.
+	updated, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{
+		TeamID:                7,
+		SchemaName:            "legacy_wh",
+		BackfillEnabled:       boolPtr(false),
+		EventsTableName:       strPtr("legacy_events"),
+		PersonsTableName:      strPtr("legacy_persons"),
+		SchemaDataImportsName: strPtr("legacy_imports"),
+	})
+	if err != nil {
+		t.Fatalf("grandfather upsert: %v", err)
+	}
+	if updated.SchemaName != "legacy_wh" {
+		t.Fatalf("schema_name = %q, want overwritten legacy_wh", updated.SchemaName)
+	}
+	if updated.EventsTableName == nil || *updated.EventsTableName != "legacy_events" ||
+		updated.PersonsTableName == nil || *updated.PersonsTableName != "legacy_persons" ||
+		updated.SchemaDataImportsName == nil || *updated.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("legacy names not stored: %+v", updated)
+	}
+	if updated.BackfillEnabled == nil || *updated.BackfillEnabled {
+		t.Fatalf("backfill_enabled = %v, want false", updated.BackfillEnabled)
+	}
+	if !updated.Enabled {
+		t.Fatal("omitted enabled must preserve the stored value")
+	}
+
+	// Explicit "" clears a legacy override back to NULL (derive again).
+	cleared, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{
+		TeamID:          7,
+		SchemaName:      "legacy_wh",
+		EventsTableName: strPtr(""),
+	})
+	if err != nil {
+		t.Fatalf("clearing upsert: %v", err)
+	}
+	if cleared.EventsTableName != nil {
+		t.Fatalf("events_table_name = %v, want NULL after explicit empty", *cleared.EventsTableName)
+	}
+	if cleared.PersonsTableName == nil || *cleared.PersonsTableName != "legacy_persons" {
+		t.Fatalf("omitted persons_table_name must be preserved, got %+v", cleared)
+	}
+	if cleared.EarliestEventDate != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL before ever being set", cleared.EarliestEventDate)
+	}
+
+	// earliest_event_date round-trip through the real DATE column: set...
+	date, err := configstore.ParseEventDate("2023-04-17")
+	if err != nil {
+		t.Fatalf("parse date: %v", err)
+	}
+	withDate, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{
+		TeamID:               7,
+		SchemaName:           "legacy_wh",
+		EarliestEventDateSet: true,
+		EarliestEventDate:    &date,
+	})
+	if err != nil {
+		t.Fatalf("set earliest_event_date: %v", err)
+	}
+	if withDate.EarliestEventDate == nil || withDate.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("earliest_event_date = %v, want 2023-04-17", withDate.EarliestEventDate)
+	}
+	if got := readTeam(t, store, "acme", 7); got.EarliestEventDate == nil || got.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("re-read earliest_event_date = %v, want 2023-04-17", got.EarliestEventDate)
+	}
+
+	// ...preserve when the Set flag is off...
+	preserved, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 7, SchemaName: "legacy_wh"})
+	if err != nil {
+		t.Fatalf("preserving upsert: %v", err)
+	}
+	if preserved.EarliestEventDate == nil || preserved.EarliestEventDate.String() != "2023-04-17" {
+		t.Fatalf("unset earliest_event_date must be preserved, got %v", preserved.EarliestEventDate)
+	}
+
+	// ...and clear back to NULL with Set + nil.
+	dateCleared, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{
+		TeamID:               7,
+		SchemaName:           "legacy_wh",
+		EarliestEventDateSet: true,
+	})
+	if err != nil {
+		t.Fatalf("clearing earliest_event_date: %v", err)
+	}
+	if dateCleared.EarliestEventDate != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL after explicit clear", dateCleared.EarliestEventDate)
+	}
+}
+
+func TestUpsertOrgTeamSchemaConflictPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	seedOrg(t, store, "other")
+	pstore := provisioning.NewGormStore(store)
+
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 1, SchemaName: "shared"}); err != nil {
+		t.Fatalf("seed team: %v", err)
+	}
+
+	// Same org, different team, same schema → conflict.
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 2, SchemaName: "shared"}); !errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+		t.Fatalf("duplicate schema in org: err = %v, want ErrOrgTeamSchemaConflict", err)
+	}
+
+	// The same schema in a DIFFERENT org is fine (uniqueness is per org).
+	if _, err := pstore.UpsertOrgTeam("other", configstore.OrgTeamUpsert{TeamID: 9, SchemaName: "shared"}); err != nil {
+		t.Fatalf("same schema across orgs must be allowed: %v", err)
+	}
+
+	// Unknown org → not found.
+	if _, err := pstore.UpsertOrgTeam("ghost", configstore.OrgTeamUpsert{TeamID: 1, SchemaName: "x"}); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("unknown org: err = %v, want gorm.ErrRecordNotFound", err)
+	}
+
+	// The unique index backs the pre-check: a direct insert that bypasses the
+	// helper still fails at the database.
+	err := store.DB().Exec(`
+		INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, created_at, updated_at)
+		VALUES ('acme', 3, 'shared', TRUE, now(), now())`).Error
+	if err == nil {
+		t.Fatal("direct duplicate-schema insert must violate the unique index")
+	}
+}
+
+// TestDeleteOrgTeamPostgres covers the transactional delete rules: last-team
+// refusal (an org must always have at least one team), the project-reader
+// cleanup riding in the same transaction, and that a delete never touches
+// usage buckets or other team rows (no billing handover exists anymore).
+func TestDeleteOrgTeamPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	pstore := provisioning.NewGormStore(store)
+
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	for _, seed := range []struct {
+		team      int64
+		schema    string
+		createdAt time.Time
+	}{
+		{1, "team_1", base},
+		{3, "team_3", base.Add(time.Hour)},
+		{2, "team_2", base.Add(2 * time.Hour)},
+	} {
+		if err := store.DB().Exec(`
+			INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, created_at, updated_at)
+			VALUES ('acme', ?, ?, TRUE, ?, ?)`,
+			seed.team, seed.schema, seed.createdAt, seed.createdAt).Error; err != nil {
+			t.Fatalf("seed team %d: %v", seed.team, err)
+		}
+	}
+	// Both of the team's scoped logins — the reader AND the read/write project
+	// user — are seeded, so the delete below proves neither survives its team.
+	scopedTeamID := int64(2)
+	for _, login := range []struct{ username, mode string }{
+		{"posthog_team_2", configstore.OrgUserAccessModeProjectReader},
+		{"posthog_team_2_rw", configstore.OrgUserAccessModeProjectUser},
+	} {
+		if err := store.DB().Create(&configstore.OrgUser{
+			OrgID:      "acme",
+			Username:   login.username,
+			Password:   "hash",
+			AccessMode: login.mode,
+			TeamID:     &scopedTeamID,
+		}).Error; err != nil {
+			t.Fatalf("seed %s: %v", login.mode, err)
+		}
+	}
+	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
+	if err := store.FlushComputeUsage([]configstore.ComputeUsageDelta{{
+		OrgID: "acme", TeamID: 1, QuerySource: "standard",
+		Millicores: 2000, MiB: 4096, BucketStart: bucket,
+		CPUSeconds: 10, MemorySeconds: 20,
+	}}); err != nil {
+		t.Fatalf("seed compute usage: %v", err)
+	}
+
+	// Deleting a team removes its row and BOTH of its project-scoped logins —
+	// nothing else. A surviving project user would be the worse leak of the
+	// two: a write-authorized credential outliving the project it was scoped
+	// to, ready to be reactivated by recreating the team.
+	if err := pstore.DeleteOrgTeam("acme", 2); err != nil {
+		t.Fatalf("delete team: %v", err)
+	}
+	var scopedCount int64
+	if err := store.DB().Model(&configstore.OrgUser{}).
+		Where("org_id = ? AND username IN ?", "acme", []string{"posthog_team_2", "posthog_team_2_rw"}).
+		Count(&scopedCount).Error; err != nil {
+		t.Fatalf("count deleted project logins: %v", err)
+	}
+	if scopedCount != 0 {
+		t.Fatalf("project login count = %d, want 0 after team deletion", scopedCount)
+	}
+	if err := pstore.DeleteOrgTeam("acme", 1); err != nil {
+		t.Fatalf("delete team 1: %v", err)
+	}
+
+	// Usage buckets are NEVER re-attributed on team deletion: the bucket
+	// keeps its stamped (informational) team id — attribution belongs to the
+	// external billing service.
+	var usageTeams []int64
+	if err := store.DB().Raw(`SELECT team_id FROM duckgres_org_compute_usage WHERE org_id = 'acme'`).Scan(&usageTeams).Error; err != nil {
+		t.Fatalf("read usage teams: %v", err)
+	}
+	if len(usageTeams) != 1 || usageTeams[0] != 1 {
+		t.Fatalf("usage teams after deletes = %v, want stamped [1] untouched", usageTeams)
+	}
+
+	// The last team cannot be deleted.
+	if err := pstore.DeleteOrgTeam("acme", 3); !errors.Is(err, configstore.ErrLastOrgTeam) {
+		t.Fatalf("last-team delete: err = %v, want ErrLastOrgTeam", err)
+	}
+	if got := readTeam(t, store, "acme", 3); got.TeamID != 3 {
+		t.Fatal("last team must survive the refused delete")
+	}
+
+	// Unknown team → not found.
+	if err := pstore.DeleteOrgTeam("acme", 99); !errors.Is(err, configstore.ErrOrgTeamNotFound) {
+		t.Fatalf("unknown team delete: err = %v, want ErrOrgTeamNotFound", err)
+	}
+}
+
+// TestProvisionWithTeamIDAndSchemaNamePostgres: the org-create path with the
+// team_id+schema_name pair creates the first plain team row with the EXPLICIT
+// schema instead of the conventional "team_<id>"; a provision without a
+// schema keeps the convention, and a re-provision without a schema preserves
+// a grandfathered one.
+func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	pstore := provisioning.NewGormStore(store)
+
+	if err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "schemaorg",
+		DatabaseName: "schemaorgdb",
+		TeamID:       42,
+		SchemaName:   "custom_wh",
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "schemaorg"},
+		RootUserHash: "hash",
+	}); err != nil {
+		t.Fatalf("provision with schema: %v", err)
+	}
+
+	team := readTeam(t, store, "schemaorg", 42)
+	if team.SchemaName != "custom_wh" {
+		t.Fatalf("schema_name = %q, want explicit custom_wh", team.SchemaName)
+	}
+	if !team.Enabled {
+		t.Fatal("first team must be enabled")
+	}
+
+	// Grandfather a legacy override onto the provisioned team (the PostHog
+	// backfill path), then RE-provision the same org with the same team_id
+	// and NO schema_name: the stored custom schema AND the override must
+	// survive — the provision team-upsert looks up the existing row's schema
+	// instead of resetting it to the conventional "team_<id>", and its
+	// presence-aware merge leaves the override alone.
+	if _, err := pstore.UpsertOrgTeam("schemaorg", configstore.OrgTeamUpsert{
+		TeamID:          42,
+		SchemaName:      "custom_wh",
+		EventsTableName: strPtr("legacy_events"),
+	}); err != nil {
+		t.Fatalf("grandfather override: %v", err)
+	}
+	markWarehouseDeleted(t, store, "schemaorg")
+	if err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "schemaorg",
+		DatabaseName: "schemaorgdb",
+		TeamID:       42,
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "schemaorg"},
+		RootUserHash: "hash",
+	}); err != nil {
+		t.Fatalf("re-provision without schema: %v", err)
+	}
+	team = readTeam(t, store, "schemaorg", 42)
+	if team.SchemaName != "custom_wh" {
+		t.Fatalf("re-provision without schema reset schema_name to %q, want grandfathered custom_wh preserved", team.SchemaName)
+	}
+	if team.EventsTableName == nil || *team.EventsTableName != "legacy_events" {
+		t.Fatalf("re-provision without schema lost the legacy override: %+v", team)
+	}
+
+	// Re-provision whose requested schema collides with a DIFFERENT team's
+	// schema in the same org → ErrOrgTeamSchemaConflict (the provision
+	// handler maps it to 409).
+	if _, err := pstore.UpsertOrgTeam("schemaorg", configstore.OrgTeamUpsert{
+		TeamID:     43,
+		SchemaName: "other_wh",
+	}); err != nil {
+		t.Fatalf("seed second team: %v", err)
+	}
+	markWarehouseDeleted(t, store, "schemaorg")
+	err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "schemaorg",
+		DatabaseName: "schemaorgdb",
+		TeamID:       42,
+		SchemaName:   "other_wh",
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "schemaorg"},
+		RootUserHash: "hash",
+	})
+	if !errors.Is(err, configstore.ErrOrgTeamSchemaConflict) {
+		t.Fatalf("colliding re-provision schema: err = %v, want ErrOrgTeamSchemaConflict", err)
+	}
+	// The refused provision must leave the stored schema untouched.
+	if got := readTeam(t, store, "schemaorg", 42); got.SchemaName != "custom_wh" {
+		t.Fatalf("refused provision mutated schema_name to %q, want custom_wh", got.SchemaName)
+	}
+
+	// Without a schema the conventional name applies.
+	if err := pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "convorg",
+		DatabaseName: "convorgdb",
+		TeamID:       7,
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "convorg"},
+		RootUserHash: "hash",
+	}); err != nil {
+		t.Fatalf("provision without schema: %v", err)
+	}
+	if got := readTeam(t, store, "convorg", 7); got.SchemaName != "team_7" {
+		t.Fatalf("schema_name = %q, want conventional team_7", got.SchemaName)
+	}
+
+	// A NEW org without a team id is refused before any write.
+	err = pstore.Provision(provisioning.ProvisionRequest{
+		OrgID:        "noteam",
+		DatabaseName: "noteamdb",
+		Warehouse:    &configstore.ManagedWarehouse{DucklingName: "noteam"},
+		RootUserHash: "hash",
+	})
+	if !errors.Is(err, provisioning.ErrProvisionTeamRequired) {
+		t.Fatalf("teamless new-org provision: err = %v, want ErrProvisionTeamRequired", err)
+	}
+}
+
+// markWarehouseDeleted parks the org's warehouse row in the terminal
+// "deleted" state so a re-provision is accepted (a non-terminal row is a
+// 409/ErrWarehouseNonTerminal).
+func markWarehouseDeleted(t *testing.T, store *configstore.ConfigStore, orgID string) {
+	t.Helper()
+	res := store.DB().Model(&configstore.ManagedWarehouse{}).
+		Where("org_id = ?", orgID).
+		Update("state", configstore.ManagedWarehouseStateDeleted)
+	if res.Error != nil || res.RowsAffected == 0 {
+		t.Fatalf("mark warehouse deleted (org=%s): rows=%d err=%v", orgID, res.RowsAffected, res.Error)
+	}
+}
+
+// TestCreateOrgTeamDisabledPostgres pins the gorm default-tag pitfall: a team
+// created with enabled=false must be STORED as false — gorm omits zero-valued
+// default-tagged fields from the INSERT unless the create forces every
+// column, and the DB default TRUE would silently enable the team (serving it
+// on the query path and, via discovery, keeping it in ingest include-lists).
+func TestCreateOrgTeamDisabledPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "held")
+	pstore := provisioning.NewGormStore(store)
+
+	if _, err := pstore.UpsertOrgTeam("held", configstore.OrgTeamUpsert{
+		TeamID:     5,
+		SchemaName: "team_5",
+		Enabled:    boolPtr(false),
+	}); err != nil {
+		t.Fatalf("create disabled team: %v", err)
+	}
+	if got := readTeam(t, store, "held", 5); got.Enabled {
+		t.Fatal("team created with enabled=false was stored as enabled=true (gorm default-tag pitfall)")
+	}
+}
+
+// TestListOrgTeamsByOrgIDsPostgres pins the discovery batch fetch: only the
+// requested orgs, deterministic (org_id, team_id) order.
+func TestListOrgTeamsByOrgIDsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	pstore := provisioning.NewGormStore(store)
+	for _, org := range []string{"orga", "orgb", "orgc"} {
+		seedOrg(t, store, org)
+	}
+	for _, seed := range []struct {
+		org  string
+		team int64
+	}{{"orga", 9}, {"orga", 2}, {"orgb", 5}, {"orgc", 1}} {
+		if _, err := pstore.UpsertOrgTeam(seed.org, configstore.OrgTeamUpsert{
+			TeamID:     seed.team,
+			SchemaName: "s" + seed.org + "_" + string(rune('0'+seed.team)),
+		}); err != nil {
+			t.Fatalf("seed team %s/%d: %v", seed.org, seed.team, err)
+		}
+	}
+
+	teams, err := store.ListOrgTeamsByOrgIDs([]string{"orga", "orgb"})
+	if err != nil {
+		t.Fatalf("ListOrgTeamsByOrgIDs: %v", err)
+	}
+	var got []string
+	for _, tm := range teams {
+		got = append(got, tm.OrgID+"/"+string(rune('0'+tm.TeamID)))
+	}
+	want := []string{"orga/2", "orga/9", "orgb/5"}
+	if len(got) != len(want) {
+		t.Fatalf("teams = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("teams = %v, want %v (ordered org_id, team_id; only requested orgs)", got, want)
+		}
+	}
+}
+
+// TestLatestConfigChangeCoversTeamsPostgres pins the discovery change marker
+// against the real store: a team-row edit advances it, and — the case a
+// plain DELETE would hide — deleting a team advances it too
+// (DeleteOrgTeamTx touches the parent org row in the same transaction).
+func TestLatestConfigChangeCoversTeamsPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	pstore := provisioning.NewGormStore(store)
+
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 1, SchemaName: "team_1"}); err != nil {
+		t.Fatalf("seed team 1: %v", err)
+	}
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 2, SchemaName: "team_2"}); err != nil {
+		t.Fatalf("seed team 2: %v", err)
+	}
+
+	before, err := store.LatestConfigChange()
+	if err != nil {
+		t.Fatalf("LatestConfigChange (before): %v", err)
+	}
+
+	// A team-row UPDATE advances the marker.
+	time.Sleep(1100 * time.Millisecond) // unix-second granularity on the wire; updated_at itself is finer
+	if _, err := pstore.UpsertOrgTeam("acme", configstore.OrgTeamUpsert{TeamID: 2, SchemaName: "team_2_repointed"}); err != nil {
+		t.Fatalf("update team 2: %v", err)
+	}
+	afterUpdate, err := store.LatestConfigChange()
+	if err != nil {
+		t.Fatalf("LatestConfigChange (after update): %v", err)
+	}
+	if !afterUpdate.After(before) {
+		t.Fatalf("marker did not advance on team update: before=%v after=%v", before, afterUpdate)
+	}
+
+	// Deleting a team must advance it as well — the removal is exactly the
+	// signal a change-marker poller must not skip.
+	time.Sleep(1100 * time.Millisecond)
+	if err := pstore.DeleteOrgTeam("acme", 2); err != nil {
+		t.Fatalf("delete team 2: %v", err)
+	}
+	afterDelete, err := store.LatestConfigChange()
+	if err != nil {
+		t.Fatalf("LatestConfigChange (after delete): %v", err)
+	}
+	if !afterDelete.After(afterUpdate) {
+		t.Fatalf("marker did not advance on team delete: afterUpdate=%v afterDelete=%v", afterUpdate, afterDelete)
+	}
+}
+
+// TestUpsertOrgTeamRejectsQualifiedOverridesPostgres pins the bare-name
+// contract: legacy overrides are bare identifiers within the team's schema
+// (see resolveTeamTables in provisioning/discovery.go); a schema-qualified
+// name stored here would be silently ambiguous to every discovery consumer,
+// so the upsert rejects it at write time.
+func TestUpsertOrgTeamRejectsQualifiedOverridesPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "bare")
+	pstore := provisioning.NewGormStore(store)
+
+	_, err := pstore.UpsertOrgTeam("bare", configstore.OrgTeamUpsert{
+		TeamID:          1,
+		SchemaName:      "team_1",
+		EventsTableName: strPtr("posthog.legacy_events"),
+	})
+	if err == nil {
+		t.Fatal("schema-qualified events_table_name must be rejected")
+	}
+	// Bare override + explicit clear ("") both pass.
+	if _, err := pstore.UpsertOrgTeam("bare", configstore.OrgTeamUpsert{
+		TeamID:          1,
+		SchemaName:      "team_1",
+		EventsTableName: strPtr("legacy_events"),
+	}); err != nil {
+		t.Fatalf("bare override rejected: %v", err)
+	}
+	if _, err := pstore.UpsertOrgTeam("bare", configstore.OrgTeamUpsert{
+		TeamID:          1,
+		SchemaName:      "team_1",
+		EventsTableName: strPtr(""),
+	}); err != nil {
+		t.Fatalf("clear sentinel rejected: %v", err)
+	}
+}

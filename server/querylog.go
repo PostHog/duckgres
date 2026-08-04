@@ -1,8 +1,8 @@
 package server
 
 import (
+	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -10,182 +10,153 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
-	"github.com/posthog/duckgres/server/ducklake"
+	"github.com/posthog/duckgres/internal/analytics"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/usersecrets"
+	"github.com/posthog/duckgres/server/wire"
 )
 
 // QueryLogEntry represents a single entry in the query log.
-type QueryLogEntry struct {
-	EventTime       time.Time
-	QueryDurationMs int64
-	Type            string // "QueryFinish" or "ExceptionWhileProcessing"
-	Query           string
-	TranspiledQuery *string // nil if unchanged
-	QueryKind       string  // "Select","Insert","Update","Delete","DDL","Utility","Copy","Cursor"
-	NormalizedHash  int64
-	ResultRows      int64
-	WrittenRows     int64
-	ExceptionCode   string
-	Exception       string
-	UserName        string
-	OrgID           string
-	CurrentDatabase string
-	ClientAddress   string
-	ClientPort      int
-	ApplicationName string
-	PID             int32
-	WorkerID        int
-	IsTranspiled    bool
-	Protocol        string // "simple" or "extended"
-	TraceID         string // OTEL trace ID (empty when tracing is off)
-	SpanID          string // OTEL span ID (empty when tracing is off)
-	// PostgresScanMs is the thread-time spent in postgres_scan operators
-	// during this query — DuckLake metadata DB roundtrips. Zero when DuckDB
-	// returned no profiling output (cancelled / errored before exec /
-	// profiling disabled). Lets us answer "which query shape pounds the
-	// metadata DB?" against `system.query_log` without re-parsing profiling.
-	PostgresScanMs int64
+//
+// The concrete shape lives in server/wire so the DuckDB-free Flight client can
+// forward entries to worker pods without importing the full server package.
+type QueryLogEntry = wire.QueryLogEntry
+
+// QueryLogger batches query log entries and writes them to durable storage.
+type QueryLogger struct {
+	db           *sql.DB
+	cfg          QueryLogConfig
+	table        string
+	ch           chan QueryLogEntry
+	done         chan struct{}
+	stopOnce     sync.Once
+	ctx          context.Context
+	cancel       context.CancelFunc
+	buffered     atomic.Int64
+	closeDB      bool
+	prepareBatch func(context.Context, *sql.DB, []QueryLogEntry) error
 }
 
-// QueryLogger batches query log entries and writes them to a DuckLake table.
-type QueryLogger struct {
-	db       *sql.DB
-	cfg      QueryLogConfig
-	table    string
-	ch       chan QueryLogEntry
-	done     chan struct{}
-	stopOnce sync.Once
+// QueryLogSink accepts query log entries and drains them during shutdown.
+type QueryLogSink interface {
+	Log(QueryLogEntry)
+	StopContext(context.Context) error
+}
+
+type queryLogEntrySink interface {
+	Log(QueryLogEntry)
 }
 
 const (
-	queryLogChannelSize = 10000
-	maxQueryLength      = 4096
+	queryLogChannelSize        = 10000
+	queryLogInitTimeout        = 30 * time.Second
+	queryLogSurfaceInitTimeout = 2 * time.Second
+	maxQueryLength             = 4096
 )
 
-// NewQueryLogger opens a dedicated :memory: DuckDB, attaches DuckLake,
-// creates the system.query_log table, and starts the background flush goroutine.
-func NewQueryLogger(cfg Config) (*QueryLogger, error) {
+var newPostgresQueryLogSink = func(ctx context.Context, cfg Config) (QueryLogSink, error) {
+	return NewPostgresQueryLoggerContext(ctx, cfg.DuckLake, cfg.QueryLog)
+}
+
+// NewQueryLogSink creates the native Postgres-backed query-log sink.
+func NewQueryLogSink(cfg Config) (QueryLogSink, error) {
 	if !cfg.QueryLog.Enabled || cfg.DuckLake.MetadataStore == "" {
 		return nil, nil
 	}
-
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		return nil, fmt.Errorf("querylog: open duckdb: %w", err)
-	}
-
-	if err := setExtensionDirectory(db, cfg.DataDir); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: set extension directory: %w", err)
-	}
-
-	if err := LoadExtensions(db, []string{"ducklake"}); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: load ducklake: %w", err)
-	}
-
-	// Create S3 secret if needed (reuse the same logic as AttachDuckLake)
-	dlCfg := cfg.DuckLake
-	if dlCfg.ObjectStore != "" {
-		needsSecret := dlCfg.S3Endpoint != "" ||
-			dlCfg.S3AccessKey != "" ||
-			dlCfg.S3Provider == "credential_chain" ||
-			dlCfg.S3Provider == "aws_sdk" ||
-			dlCfg.S3Chain != "" ||
-			dlCfg.S3Profile != ""
-		if needsSecret {
-			if err := createS3Secret(db, dlCfg); err != nil {
-				_ = db.Close()
-				return nil, fmt.Errorf("querylog: create S3 secret: %w", err)
-			}
-		}
-	}
-
-	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: pre-attach settings: %w", err)
-	}
-
-	// Attach DuckLake
-	attachStmt := ducklake.BuildAttachStmt(dlCfg, ducklake.MigrationNeeded(dlCfg.MetadataStore))
-	if _, err := db.Exec(attachStmt); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: attach ducklake: %w", err)
-	}
-
-	configureDuckLakeMetadataPool(db)
-
-	// Create schema and table
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: create schema: %w", err)
-	}
-
-	if err := ensureQueryLogTable(db, "system", "query_log", "ducklake.system.query_log"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("querylog: ensure table: %w", err)
-	}
-
-	// Configure data inlining
-	inlineStmt := fmt.Sprintf(
-		"CALL ducklake.set_option('data_inlining_row_limit', %d, schema => 'system', table_name => 'query_log')",
-		cfg.QueryLog.DataInliningRowLimit)
-	if _, err := db.Exec(inlineStmt); err != nil {
-		slog.Warn("querylog: failed to set data_inlining_row_limit, continuing without it.", "error", err)
-	}
-
-	ql := &QueryLogger{
-		db:    db,
-		cfg:   cfg.QueryLog,
-		table: "ducklake.system.query_log",
-		ch:    make(chan QueryLogEntry, queryLogChannelSize),
-		done:  make(chan struct{}),
-	}
-
-	go ql.flushLoop()
-	slog.Info("Query log enabled.", "flush_interval", cfg.QueryLog.FlushInterval, "batch_size", cfg.QueryLog.BatchSize)
-	return ql, nil
+	ctx, cancel := context.WithTimeout(context.Background(), queryLogInitTimeout)
+	defer cancel()
+	return newPostgresQueryLogSink(ctx, cfg)
 }
 
 // Log sends an entry to the query log. Non-blocking; drops if channel is full.
 func (ql *QueryLogger) Log(entry QueryLogEntry) {
+	if ql == nil || ql.ch == nil {
+		return
+	}
+	ql.addBufferedEntries(1)
+	queued := false
+	defer func() {
+		if r := recover(); r != nil {
+			if !queued {
+				ql.addBufferedEntries(-1)
+				observe.AddQueryLogDroppedEntries("logger_closed", 1)
+			}
+			slog.Warn("querylog: logger stopped while writing entry; dropping entry.")
+		}
+	}()
 	select {
 	case ql.ch <- entry:
+		queued = true
+		observe.IncQueryLogEnqueuedEntries()
 	default:
+		ql.addBufferedEntries(-1)
+		observe.AddQueryLogDroppedEntries("buffer_full", 1)
 		slog.Warn("querylog: channel full, dropping entry.")
 	}
 }
 
 // Stop drains remaining entries and shuts down the flush goroutine.
 func (ql *QueryLogger) Stop() {
+	_ = ql.StopContext(context.Background())
+}
+
+// StopContext drains remaining entries until ctx expires. If the deadline is
+// reached, it cancels in-flight storage work; loggers that own a DB handle also
+// close it to unblock shutdown.
+func (ql *QueryLogger) StopContext(ctx context.Context) error {
 	if ql == nil {
-		return
+		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var stopErr error
 	ql.stopOnce.Do(func() {
 		if ql.ch != nil {
 			close(ql.ch)
 		}
 		if ql.done != nil {
-			<-ql.done
+			select {
+			case <-ql.done:
+			case <-ctx.Done():
+				stopErr = ctx.Err()
+				if ql.cancel != nil {
+					ql.cancel()
+				}
+			}
 		}
-		if ql.db != nil {
+		if ql.cancel != nil {
+			ql.cancel()
+		}
+		if ql.db != nil && ql.closeDB {
 			_ = ql.db.Close()
 		}
 	})
+	return stopErr
+}
+
+func queryLogStopContext(ctx context.Context, defaultTimeout time.Duration) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultTimeout)
 }
 
 func (ql *QueryLogger) flushLoop() {
 	defer close(ql.done)
+	defer observe.SetQueryLogBufferedEntries(0)
 
 	batch := make([]QueryLogEntry, 0, ql.cfg.BatchSize)
 	flushTicker := time.NewTicker(ql.cfg.FlushInterval)
 	defer flushTicker.Stop()
-
-	compactTicker := time.NewTicker(ql.cfg.CompactInterval)
-	defer compactTicker.Stop()
 
 	for {
 		select {
@@ -195,7 +166,6 @@ func (ql *QueryLogger) flushLoop() {
 				if len(batch) > 0 {
 					ql.flushBatch(batch)
 				}
-				ql.compactParquet()
 				return
 			}
 			batch = append(batch, entry)
@@ -208,80 +178,97 @@ func (ql *QueryLogger) flushLoop() {
 				ql.flushBatch(batch)
 				batch = batch[:0]
 			}
-		case <-compactTicker.C:
-			if len(batch) > 0 {
-				ql.flushBatch(batch)
-				batch = batch[:0]
-			}
-			ql.compactParquet()
 		}
 	}
 }
 
-func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
-	if len(batch) == 0 {
+func (ql *QueryLogger) addBufferedEntries(delta int64) {
+	if ql == nil {
 		return
 	}
+	buffered := ql.buffered.Add(delta)
+	if buffered < 0 {
+		ql.buffered.Store(0)
+		buffered = 0
+	}
+	observe.SetQueryLogBufferedEntries(int(buffered))
+}
 
-	// Build multi-row INSERT with placeholders
+func (ql *QueryLogger) context() context.Context {
+	if ql == nil {
+		return context.Background()
+	}
+	ctx := ql.ctx
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (ql *QueryLogger) flushBatch(batch []QueryLogEntry) {
+	defer ql.addBufferedEntries(-int64(len(batch)))
+	start := time.Now()
+	ctx := ql.context()
+	var err error
+	if ql.prepareBatch != nil {
+		err = ql.prepareBatch(ctx, ql.db, batch)
+	}
+	if err == nil {
+		err = insertQueryLogEntries(ctx, ql.db, ql.table, batch)
+	}
+	observe.ObserveQueryLogFlushDuration(time.Since(start))
+	if err != nil {
+		observe.IncQueryLogFlushErrors()
+		observe.AddQueryLogDroppedEntries("flush_error", len(batch))
+		slog.Error("querylog: flush failed.", "error", err, "batch_size", len(batch))
+		return
+	}
+	observe.AddQueryLogFlushedEntries(len(batch))
+}
+
+func insertQueryLogEntries(ctx context.Context, db *sql.DB, table string, batch []QueryLogEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	var sb strings.Builder
-	table := ql.table
 	if table == "" {
 		table = "query_log"
 	}
+	// Column list, placeholder count, and argument order all come from the
+	// single registry in querylog_schema.go so they cannot drift apart.
+	colsPerRow := len(queryLogEntryColumns())
 	sb.WriteString("INSERT INTO ")
 	sb.WriteString(table)
-	sb.WriteString(" (event_time, query_duration_ms, type, query, transpiled_query, query_kind, normalized_query_hash, result_rows, written_rows, exception_code, exception, user_name, org_id, current_database, client_address, client_port, application_name, pid, worker_id, is_transpiled, protocol, trace_id, span_id, postgres_scan_ms) VALUES ")
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(queryLogEntryColumnNames(), ", "))
+	sb.WriteString(") VALUES ")
 
-	const colsPerRow = 24
 	args := make([]any, 0, len(batch)*colsPerRow)
 	for i, e := range batch {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
 		base := i * colsPerRow
-		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
-			base+11, base+12, base+13, base+14, base+15, base+16, base+17, base+18, base+19, base+20, base+21, base+22, base+23, base+24)
+		sb.WriteByte('(')
+		for col := range colsPerRow {
+			if col > 0 {
+				sb.WriteByte(',')
+			}
+			fmt.Fprintf(&sb, "$%d", base+col+1)
+		}
+		sb.WriteByte(')')
 
-		args = append(args,
-			e.EventTime,
-			e.QueryDurationMs,
-			e.Type,
-			truncateQuery(e.Query),
-			truncateNullableQuery(e.TranspiledQuery),
-			e.QueryKind,
-			e.NormalizedHash,
-			e.ResultRows,
-			e.WrittenRows,
-			e.ExceptionCode,
-			e.Exception,
-			e.UserName,
-			e.OrgID,
-			e.CurrentDatabase,
-			e.ClientAddress,
-			e.ClientPort,
-			e.ApplicationName,
-			e.PID,
-			e.WorkerID,
-			e.IsTranspiled,
-			e.Protocol,
-			e.TraceID,
-			e.SpanID,
-			e.PostgresScanMs,
-		)
+		args = append(args, queryLogEntryInsertArgs(e)...)
 	}
 
-	if _, err := ql.db.Exec(sb.String(), args...); err != nil {
-		slog.Error("querylog: flush failed.", "error", err, "batch_size", len(batch))
+	if _, err := db.ExecContext(ctx, sb.String(), args...); err != nil {
+		return fmt.Errorf("insert query_log entries: %w", err)
 	}
-}
-
-func (ql *QueryLogger) compactParquet() {
-	_, err := ql.db.Exec("CALL ducklake_flush_inlined_data('ducklake', schema_name => 'system', table_name => 'query_log')")
-	if err != nil {
-		slog.Warn("querylog: compact failed.", "error", err)
-	}
+	return nil
 }
 
 // truncateQuery truncates a query string to maxQueryLength.
@@ -292,130 +279,29 @@ func truncateQuery(q string) string {
 	return q
 }
 
+// boundQueryLogText caps control-plane query-log text before it reaches logs,
+// in-memory queues, normalization, or RPC serialization. Clone the retained
+// text so a bounded entry cannot keep a much larger query allocation alive.
+func boundQueryLogText(text string) string {
+	if text == "" {
+		return ""
+	}
+	if len(text) > maxQueryLength {
+		end := maxQueryLength
+		for end > 0 && !utf8.RuneStart(text[end]) {
+			end--
+		}
+		text = text[:end]
+	}
+	return strings.Clone(text)
+}
+
 func truncateNullableQuery(q *string) *string {
 	if q == nil {
 		return nil
 	}
 	truncated := truncateQuery(*q)
 	return &truncated
-}
-
-func ensureQueryLogTable(db *sql.DB, tableSchema, tableName, fullTableName string) error {
-	colType, err := queryLogColumnType(db, fullTableName, tableSchema, tableName, "normalized_query_hash")
-	if err == nil && strings.ToUpper(colType) != "BIGINT" {
-		slog.Info("querylog: dropping query_log to migrate normalized_query_hash from UBIGINT to BIGINT.")
-		if _, dropErr := db.Exec("DROP TABLE " + fullTableName); dropErr != nil {
-			return fmt.Errorf("drop query_log for normalized_query_hash migration: %w", dropErr)
-		}
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("inspect normalized_query_hash column: %w", err)
-	}
-
-	if _, err := db.Exec(queryLogCreateTableSQL(fullTableName)); err != nil {
-		return fmt.Errorf("create query_log table: %w", err)
-	}
-
-	hasOrgID, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, "org_id")
-	if err != nil {
-		return fmt.Errorf("inspect org_id column: %w", err)
-	}
-	if !hasOrgID {
-		if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN org_id VARCHAR"); err != nil {
-			return fmt.Errorf("add org_id column: %w", err)
-		}
-	}
-
-	// Add trace_id and span_id columns for OTEL tracing correlation.
-	for _, col := range []string{"trace_id", "span_id"} {
-		hasCol, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, col)
-		if err != nil {
-			return fmt.Errorf("inspect %s column: %w", col, err)
-		}
-		if !hasCol {
-			if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN " + col + " VARCHAR"); err != nil {
-				return fmt.Errorf("add %s column: %w", col, err)
-			}
-		}
-	}
-
-	// Backfill postgres_scan_ms column on tables created before metadata-DB
-	// observability landed. New tables already get it from CREATE TABLE.
-	hasPgScan, err := queryLogColumnExists(db, fullTableName, tableSchema, tableName, "postgres_scan_ms")
-	if err != nil {
-		return fmt.Errorf("inspect postgres_scan_ms column: %w", err)
-	}
-	if !hasPgScan {
-		if _, err := db.Exec("ALTER TABLE " + fullTableName + " ADD COLUMN postgres_scan_ms BIGINT"); err != nil {
-			return fmt.Errorf("add postgres_scan_ms column: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func queryLogCreateTableSQL(fullTableName string) string {
-	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-		event_time          TIMESTAMPTZ NOT NULL,
-		query_duration_ms   BIGINT NOT NULL,
-		type                VARCHAR NOT NULL,
-		query               VARCHAR NOT NULL,
-		transpiled_query    VARCHAR,
-		query_kind          VARCHAR,
-		normalized_query_hash BIGINT,
-		result_rows         BIGINT,
-		written_rows        BIGINT,
-		exception_code      VARCHAR,
-		exception           VARCHAR,
-		user_name           VARCHAR NOT NULL,
-		org_id              VARCHAR,
-		current_database    VARCHAR,
-		client_address      VARCHAR,
-		client_port         INTEGER,
-		application_name    VARCHAR,
-		pid                 INTEGER,
-		worker_id           INTEGER,
-		is_transpiled       BOOLEAN,
-		protocol            VARCHAR,
-		trace_id            VARCHAR,
-		span_id             VARCHAR,
-		postgres_scan_ms    BIGINT
-	)`, fullTableName)
-}
-
-func queryLogColumnExists(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (bool, error) {
-	_, err := queryLogColumnType(db, fullTableName, tableSchema, tableName, columnName)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func queryLogColumnType(db *sql.DB, fullTableName, tableSchema, tableName, columnName string) (string, error) {
-	query := fmt.Sprintf("SELECT data_type FROM %s WHERE table_name = $1 AND column_name = $2", queryLogColumnsTable(fullTableName))
-	args := []any{tableName, columnName}
-	if strings.TrimSpace(tableSchema) != "" {
-		query += " AND table_schema = $3"
-		args = append(args, tableSchema)
-	}
-
-	var colType string
-	err := db.QueryRow(query, args...).Scan(&colType)
-	return colType, err
-}
-
-func queryLogColumnsTable(fullTableName string) string {
-	parts := strings.Split(fullTableName, ".")
-	if len(parts) == 3 {
-		return parts[0] + ".information_schema.columns"
-	}
-	return "information_schema.columns"
-}
-
-func escapeSQLStringLiteral(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
 }
 
 // classifyQuery maps a command type string to a query_kind value.
@@ -482,75 +368,215 @@ func isQueryLogSelfReferential(query string) bool {
 	return strings.Contains(upper, "SYSTEM.QUERY_LOG")
 }
 
-// logQuery builds a QueryLogEntry from the connection context and sends it to the logger.
-func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType string,
-	resultRows, writtenRows int64, errCode, errMsg, protocol string) {
+// queryLogSink resolves where this connection's query-log entries go. The
+// executor sink (the worker, in control-plane mode) wins: the worker owns the
+// tenant's query-log storage.
+func (c *clientConn) queryLogSink() queryLogEntrySink {
+	if c.server != nil && c.server.cfg.QueryLog.Enabled && c.executor != nil {
+		if sink, ok := c.executor.(queryLogEntrySink); ok {
+			return sink
+		}
+	}
+	if c.server != nil && c.server.queryLogSink != nil {
+		return c.server.queryLogSink
+	}
+	if c.server != nil && c.server.queryLogger != nil {
+		return c.server.queryLogger
+	}
+	return nil
+}
 
-	ql := c.server.queryLogger
+// clientAddrPort splits the peer address for the query log.
+func (c *clientConn) clientAddrPort() (string, int) {
+	addr := c.conn.RemoteAddr()
+	if addr == nil {
+		return "", 0
+	}
+	addrStr := addr.String()
+	host, portStr, err := splitHostPort(addrStr)
+	if err != nil {
+		return addrStr, 0
+	}
+	port, err := parsePort(portStr)
+	if err != nil {
+		return host, 0
+	}
+	return host, port
+}
+
+// logQueryStart emits the QueryStart event for a statement that is about to
+// execute. It carries identity and client context; resource columns stay zero
+// and are filled by the terminal event.
+//
+// This is what makes an in-flight query visible and, more importantly, what
+// makes a query that never returns detectable: a QueryStart with no terminal is
+// the only evidence left when a worker is OOM-killed mid-statement.
+func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
+	if scope == nil || c.server == nil || !c.server.cfg.QueryLog.StartEvents.enabled(scope.queryText) {
+		return
+	}
+	ql := c.queryLogSink()
 	if ql == nil {
 		return
 	}
+	// The scope's text is already redacted by the caller, but a query naming
+	// the log itself must not be logged or the poll recurses.
+	query := boundQueryLogText(scope.queryText)
 	if isQueryLogSelfReferential(query) {
 		return
 	}
 
-	entryType := "QueryFinish"
-	if errCode != "" {
-		entryType = "ExceptionWhileProcessing"
+	clientAddr, clientPort := c.clientAddrPort()
+	meta := c.queryMetadata(scope)
+	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(meta)
+	// Prefer the parsed kind. A leading-keyword guess reads "WITH ..." as a
+	// utility statement, which would make a start event disagree with its own
+	// terminal about what the statement was.
+	queryKind := meta.QueryKind
+	if queryKind == "" {
+		queryKind = classifyQuery(leadingSQLKeyword(query))
 	}
+	ql.Log(QueryLogEntry{
+		QueryID:          scope.queryID,
+		ParentQueryID:    scope.parentQueryID,
+		StatementIndex:   scope.statementIndex,
+		EventTime:        scope.start,
+		Type:             QueryEventStart,
+		Query:            query,
+		QueryKind:        queryKind,
+		NormalizedHash:   normalizeQueryHash(query),
+		UserName:         c.username,
+		OrgID:            c.orgID,
+		CurrentDatabase:  c.database,
+		ClientAddress:    clientAddr,
+		ClientPort:       clientPort,
+		ApplicationName:  c.applicationName,
+		PID:              c.pid,
+		WorkerID:         c.workerID,
+		TraceID:          observe.TraceIDFromContext(c.ctx),
+		SpanID:           observe.SpanIDFromContext(c.ctx),
+		QueryMetadata:    encodedMeta,
+		AccessKinds:      accessKinds,
+		MetadataComplete: metaComplete,
+	})
+}
 
-	var transpiled *string
-	if transpiledQuery != "" && transpiledQuery != query {
-		transpiled = &transpiledQuery
-	}
-
-	// Extract client address and port from the connection
-	var clientAddr string
-	var clientPort int
-	if addr := c.conn.RemoteAddr(); addr != nil {
-		addrStr := addr.String()
-		if host, portStr, err := splitHostPort(addrStr); err == nil {
-			clientAddr = host
-			if p, err := parsePort(portStr); err == nil {
-				clientPort = p
-			}
-		} else {
-			clientAddr = addrStr
-		}
-	}
+// logQuery builds a QueryLogEntry from the connection context and sends it to the logger.
+func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType string,
+	resultRows, writtenRows int64, errCode, errMsg, protocol string) {
 
 	// Consume the profiling rollup left behind by the most recent
-	// EnrichSpanWithProfiling on this connection and reset it so a later
-	// logQuery without a fresh exec (e.g. parse-failure path) doesn't
-	// reuse stale timings from a previous query.
-	pgScanMs := int64(c.lastProfilingSummary.PostgresScanSeconds * 1000)
+	// EnrichSpanWithProfiling up front, so the per-org analytics event and the
+	// query-log row observe the same values and it is reset even when the
+	// query-log sink is disabled (a later logQuery without a fresh exec must not
+	// reuse stale timings from a previous query).
+	profilingSummary := c.lastProfilingSummary
 	c.lastProfilingSummary = observe.QueryProfilingSummary{}
 
+	if isQueryLogSelfReferential(query) {
+		return
+	}
+
+	// Per-org product analytics for the terminal event of a successful query.
+	// Failures are already captured by query_failed (logQueryError), so gate on
+	// errCode == "" to keep the lifecycle clean (initiated -> completed | failed)
+	// and avoid double-counting. Emitted independently of the query-log sink so
+	// this usage signal does not depend on query-log configuration.
+	if errCode == "" {
+		analytics.Default().Capture("query_completed", c.orgID, map[string]any{
+			"user":        c.username,
+			"team_id":     c.teamID,
+			"trace_id":    observe.TraceIDFromContext(c.ctx),
+			"protocol":    protocol,
+			"query_kind":  classifyQuery(cmdType),
+			"duration_ms": time.Since(start).Milliseconds(),
+			"cpu_seconds": profilingSummary.CPUTimeSeconds,
+			"result_rows": resultRows,
+		})
+	}
+
+	ql := c.queryLogSink()
+	if ql == nil {
+		return
+	}
+
+	// CREATE SECRET option lists carry credential material; never persist
+	// them to the query log. The engine's error text echoes the offending SQL,
+	// so a failed CREATE SECRET leaks the credential via Exception unless the
+	// error is redacted too — classify against the original query first.
+	errMsg = boundQueryLogText(usersecrets.RedactErrorForLog(query, errMsg))
+	query = usersecrets.RedactForLog(query)
+	transpiledQuery = usersecrets.RedactForLog(transpiledQuery)
+
+	// A failure before execution began is ExceptionBeforeStart and has no
+	// QueryStart row to pair with. Without a scope we cannot know, so assume
+	// the statement started — claiming it never did would be a stronger
+	// statement than the evidence supports.
+	execStarted := true
+	scope := c.activeQueryMetrics
+	if scope != nil {
+		execStarted = scope.execStarted
+	}
+	entryType := terminalQueryEventType(errCode, execStarted)
+
+	isTranspiled := transpiledQuery != "" && transpiledQuery != query
+	query = boundQueryLogText(query)
+	var transpiled *string
+	if isTranspiled {
+		boundedTranspiledQuery := boundQueryLogText(transpiledQuery)
+		transpiled = &boundedTranspiledQuery
+	}
+
+	clientAddr, clientPort := c.clientAddrPort()
+
+	pgScanMs := int64(profilingSummary.PostgresScanSeconds * 1000)
+
+	parentQueryID, statementIndex := "", 0
+	if scope != nil {
+		parentQueryID, statementIndex = scope.parentQueryID, scope.statementIndex
+	}
+	// The terminal event carries the same extraction as the start event. When
+	// the scope has none (a path that logs without one), fall back to the
+	// statement text this call was handed so the row still says what was
+	// touched.
+	meta := c.queryMetadata(scope)
+	if scope == nil && c.server != nil && c.server.cfg.QueryLog.Metadata {
+		meta = extractQueryMetadata(query)
+	}
+	encodedMeta, accessKinds, metaComplete := queryMetadataColumns(meta)
 	ql.Log(QueryLogEntry{
-		EventTime:       start,
-		QueryDurationMs: time.Since(start).Milliseconds(),
-		Type:            entryType,
-		Query:           query,
-		TranspiledQuery: transpiled,
-		QueryKind:       classifyQuery(cmdType),
-		NormalizedHash:  normalizeQueryHash(query),
-		ResultRows:      resultRows,
-		WrittenRows:     writtenRows,
-		ExceptionCode:   errCode,
-		Exception:       errMsg,
-		UserName:        c.username,
-		OrgID:           c.orgID,
-		CurrentDatabase: c.database,
-		ClientAddress:   clientAddr,
-		ClientPort:      clientPort,
-		ApplicationName: c.applicationName,
-		PID:             c.pid,
-		WorkerID:        c.workerID,
-		IsTranspiled:    transpiled != nil,
-		Protocol:        protocol,
-		TraceID:         observe.TraceIDFromContext(c.ctx),
-		SpanID:          observe.SpanIDFromContext(c.ctx),
-		PostgresScanMs:  pgScanMs,
+		QueryID:               c.currentQueryID(),
+		ParentQueryID:         parentQueryID,
+		StatementIndex:        statementIndex,
+		EventTime:             start,
+		QueryDurationMs:       time.Since(start).Milliseconds(),
+		Type:                  entryType,
+		Query:                 query,
+		TranspiledQuery:       transpiled,
+		QueryKind:             classifyQuery(cmdType),
+		NormalizedHash:        normalizeQueryHash(query),
+		ResultRows:            resultRows,
+		WrittenRows:           writtenRows,
+		ExceptionCode:         errCode,
+		Exception:             errMsg,
+		UserName:              c.username,
+		OrgID:                 c.orgID,
+		CurrentDatabase:       c.database,
+		ClientAddress:         clientAddr,
+		ClientPort:            clientPort,
+		ApplicationName:       c.applicationName,
+		PID:                   c.pid,
+		WorkerID:              c.workerID,
+		IsTranspiled:          isTranspiled,
+		Protocol:              protocol,
+		TraceID:               observe.TraceIDFromContext(c.ctx),
+		SpanID:                observe.SpanIDFromContext(c.ctx),
+		PostgresScanMs:        pgScanMs,
+		CPUTimeSeconds:        profilingSummary.CPUTimeSeconds,
+		PeakBufferMemoryBytes: profilingSummary.PeakBufferMemoryBytes,
+		QueryMetadata:         encodedMeta,
+		AccessKinds:           accessKinds,
+		MetadataComplete:      metaComplete,
 	})
 }
 

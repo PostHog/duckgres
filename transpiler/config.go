@@ -90,6 +90,33 @@ type Result struct {
 	// that should be silently acknowledged without execution.
 	IsIgnoredSet bool
 
+	// QuerySourceSet, when non-nil, indicates a `SET duckgres.query_source =
+	// '<value>'` on the duckgres-namespaced custom GUC. The connection layer
+	// stores the pointed-to value on the session and acknowledges it as "SET"
+	// (it is NOT forwarded to DuckDB, which would reject the unknown setting).
+	// The value is pre-validated and canonical: "standard", "endpoints", or ""
+	// (reset to default) — an invalid value never reaches here (it surfaces as
+	// Error with SQLSTATE 22023 instead).
+	QuerySourceSet *string
+
+	// QuerySourceShow indicates a `SHOW duckgres.query_source`; the connection
+	// layer answers it from session state (defaulting to "standard").
+	QuerySourceShow bool
+
+	// S3CacheSet, when non-nil, indicates a `SET duckgres.s3_cache = '<value>'`
+	// on the duckgres-namespaced custom GUC. The connection layer applies the
+	// pointed-to value to the session (swapping the worker's S3 secret
+	// transport on or off the node-local cache proxy) and acknowledges it as
+	// "SET" — it is NOT forwarded to DuckDB, which would reject the unknown
+	// setting. The value is pre-validated and canonical: "on", "off", or ""
+	// (reset to the default "on") — an invalid value never reaches here (it
+	// surfaces as Error with SQLSTATE 22023 instead).
+	S3CacheSet *string
+
+	// S3CacheShow indicates a `SHOW duckgres.s3_cache`; the connection layer
+	// answers it from session state (defaulting to "on").
+	S3CacheShow bool
+
 	// Error is set when a transform detects an error that should be returned to the client
 	// (e.g., unrecognized configuration parameter in SHOW command)
 	Error error

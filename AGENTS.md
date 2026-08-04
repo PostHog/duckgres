@@ -13,3 +13,13 @@
 - Use `just` recipes instead of raw commands (run `just` to see all recipes).
 - `just ci` runs the full local CI pipeline (lint + unit + integration + controlplane tests).
 - `just lint` runs `golangci-lint` (not `go vet` — CI uses golangci-lint).
+
+##  Testing
+
+- Tests should model realistic user behavior, not work around current service limitations.
+- If a test exposes a platform bug, report the bug with exact failure details instead of fixing the test.
+
+## Security / Data Handling
+- **This repo is public.** Never expose customer or internal data in anything that lands here — PR titles/bodies, commit messages, code, comments, or test fixtures.
+- This includes customer/org IDs and UUIDs, customer names, internal hostnames/cluster names/endpoints, secrets, and internal-only identifiers.
+- When a diagnostic detail is needed for context, redact it (`<org-id>`, `org A`/`org B`, "the prod cluster") or keep it in the local conversation only — not in the published artifact.

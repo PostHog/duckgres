@@ -4,9 +4,13 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -25,6 +29,13 @@ var ducklingGVR = schema.GroupVersionResource{
 	Resource: "ducklings",
 }
 
+var secretGVR = schema.GroupVersionResource{Version: "v1", Resource: "secrets"}
+var externalSecretGVR = schema.GroupVersionResource{Group: "external-secrets.io", Version: "v1", Resource: "externalsecrets"}
+var passwordGeneratorGVR = schema.GroupVersionResource{Group: "generators.external-secrets.io", Version: "v1alpha1", Resource: "passwords"}
+var usageGVR = schema.GroupVersionResource{Group: "protection.crossplane.io", Version: "v1beta1", Resource: "usages"}
+var roleGVR = schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "roles"}
+var roleBindingGVR = schema.GroupVersionResource{Group: "rbac.authorization.k8s.io", Version: "v1", Resource: "rolebindings"}
+
 const ducklingNamespace = "ducklings"
 
 // DucklingStatus holds the parsed status from a Duckling CR.
@@ -40,28 +51,72 @@ type DucklingStatus struct {
 		User              string
 		Database          string
 	}
-	DataStore struct {
+	ReshardMaintenance          ReshardMaintenanceStatus
+	MetadataCredentialSecretRef SecretReference
+	DataStore                   struct {
 		Type       string
 		BucketName string
 		S3Region   string
 	}
-	// Iceberg is populated when spec.iceberg.enabled=true. The
-	// composition provisions a per-org Lakekeeper instance; the
-	// Lakekeeper provisioner extension drives readiness off the
-	// Lakekeeper CR itself, so we only need namespace/region here.
-	Iceberg struct {
-		NamespaceName string
-		Region        string
-	}
 	IAMRoleARN         string
 	ReadyCondition     bool
 	SyncedFalseMessage string
+	// ReadyFalseMessage is the Ready condition's message when Ready=False — the
+	// XR's roll-up of what is still unready (e.g. "Unready resources:
+	// s3-bucket"). Distinct from SyncedFalseMessage: the XR can be Synced=True
+	// (composed successfully) yet Ready=False (a composed resource has not
+	// reconciled), which is exactly the state a stuck S3 bucket produces.
+	ReadyFalseMessage string
 
 	// DuckLakeEnabled is spec.ducklake.enabled, read present/absent: nil when
 	// the CR predates the decoupled ducklake field (the worker activator then
 	// falls back to the legacy type-based default — DuckLake on for
 	// external, off for cnpg-shard). Non-nil for decoupled ducklings.
 	DuckLakeEnabled *bool
+}
+
+// ReshardMaintenanceSpec is the transient, source-shard-pinned access used by
+// a reshard runner. "prepared" creates the operation-specific login without
+// changing tenant access. "fenced" additionally makes the tenant role
+// NOLOGIN; the runner only requests that phase after Duckgres leases, queues,
+// and workers have drained.
+type ReshardMaintenanceSpec struct {
+	OperationID int64
+	SourceShard string
+	Phase       string
+}
+
+const (
+	ReshardMaintenancePhasePrepared = "prepared"
+	ReshardMaintenancePhaseFenced   = "fenced"
+	ReshardMaintenancePhaseDisabled = "disabled"
+
+	reshardMaintenanceCleanupAnnotation = "duckgres.posthog.com/reshard-cleanup-operation"
+	reshardMaintenanceCleanupSignal     = "cleanup"
+)
+
+// ReshardMaintenanceStatus contains no credential value, only the Secret
+// reference published by the composition.
+type ReshardMaintenanceStatus struct {
+	OperationID         int64
+	User                string
+	CredentialSecretRef SecretReference
+	Password            string
+	Prepared            bool
+	Fenced              bool
+	TenantLogin         bool
+	TenantNoLogin       bool
+	MaintenanceLogin    bool
+	MaintenanceNoLogin  bool
+}
+
+// SecretReference identifies one key in a namespaced Kubernetes Secret. The
+// Duckling composition publishes this non-sensitive reference instead of
+// copying the metadata database password into the CR status.
+type SecretReference struct {
+	Name      string
+	Namespace string
+	Key       string
 }
 
 // DucklingClient wraps a Kubernetes dynamic client for Duckling CR operations.
@@ -87,20 +142,6 @@ func NewDucklingClientWithDynamic(client dynamic.Interface) *DucklingClient {
 	return &DucklingClient{client: client}
 }
 
-// ducklingName is the k8s/AWS resource name derived from an org ID, used for
-// the Duckling CR, the IAM role (duckling-<name>), the S3 bucket, the
-// Lakekeeper CR/SA/Secret, etc. Org IDs are validated as DNS-1123 labels at
-// provision time (lowercase alphanumerics + hyphens), so this only lowercases:
-// hyphens are preserved, keeping in-cluster names human-readable and injective
-// with the org ID.
-//
-// (It used to strip hyphens to keep per-org Aurora RDS cluster identifiers
-// short, but the control plane no longer provisions per-org Aurora clusters,
-// and stripping was lossy — "a-b" and "ab" collided.)
-func ducklingName(orgID string) string {
-	return strings.ToLower(orgID)
-}
-
 // pgIdentSanitizeRe matches characters not allowed in an unquoted Postgres
 // identifier fragment.
 var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
@@ -110,20 +151,11 @@ var pgIdentSanitizeRe = regexp.MustCompile(`[^a-z0-9_]`)
 // mapped to '_'. Postgres identifiers can't contain hyphens unquoted, so PG
 // object names can't preserve them the way k8s names do. This mirrors the
 // Crossplane composition's $pgIdent transform for cnpg-shard, so the external
-// (provisioner-created) and cnpg-shard (composition-created) Lakekeeper
+// (provisioner-created) and cnpg-shard (composition-created)
 // databases follow the same convention. Injective for org IDs restricted to
 // [a-z0-9-], which the provision-time validation guarantees.
 func pgIdentSuffix(orgID string) string {
 	return pgIdentSanitizeRe.ReplaceAllString(strings.ToLower(orgID), "_")
-}
-
-// legacyDucklingName is the pre-hyphen-preservation transform (hyphens
-// stripped). Retained ONLY so lookups can still find Duckling CRs created
-// before ducklingName started preserving hyphens — e.g. a CR named
-// "018d351a9ff70000eaff4628875ad045" for org "018d351a-9ff7-0000-eaff-...".
-// New CRs are always created under ducklingName (hyphen-preserving).
-func legacyDucklingName(orgID string) string {
-	return strings.ReplaceAll(strings.ToLower(orgID), "-", "")
 }
 
 // CreateOptions carries per-org knobs that shape the generated Duckling CR.
@@ -150,36 +182,25 @@ type CreateOptions struct {
 	DataStoreBucket string
 	DataStoreRegion string
 
-	// IcebergEnabled toggles spec.iceberg.enabled on the Duckling CR. The
-	// composition only provisions the per-tenant Lakekeeper Iceberg catalog
-	// when this is true; flipping it post-create is handled by the controller's
-	// Ready-state drift logic.
-	IcebergEnabled bool
-	// IcebergNamespace is the Iceberg namespace within the tenant's catalog.
-	// Empty falls back to the XRD default ("main").
-	IcebergNamespace string
-
-	// DuckLakeEnabled toggles spec.ducklake.enabled. Independent of Iceberg and
-	// of the metadata-store type; at least one of DuckLakeEnabled/IcebergEnabled
-	// must be true (Create rejects a CR with neither).
+	// DuckLakeEnabled toggles spec.ducklake.enabled. Independent of the
+	// metadata-store type; must be true (Create rejects a CR without a catalog).
 	DuckLakeEnabled bool
 }
 
-// Create creates a Duckling CR for the given org.
-func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOptions) error {
-	name := ducklingName(orgID)
-
+// Create creates a Duckling CR named exactly `name`. The name comes from the
+// warehouse row's duckling_name (authoritative; the control plane never
+// derives it) and is used verbatim.
+func (d *DucklingClient) Create(ctx context.Context, name string, opts CreateOptions) error {
 	var metadataStore map[string]interface{}
 	switch opts.MetadataStoreType {
 	case configstore.MetadataStoreKindCnpgShard:
 		// The cnpg-shard metadata store is the per-tenant Postgres on the shared
 		// CloudNativePG shard, provisioned via provider-sql. It carries no
 		// per-claim config — the composition reads the active shard from chart
-		// values. It hosts the DuckLake catalog and/or the Lakekeeper PG
-		// depending on the catalog flags; a CR with neither catalog has nothing
-		// to attach, so refuse it.
-		if !opts.IcebergEnabled && !opts.DuckLakeEnabled {
-			return fmt.Errorf("create duckling CR %q: metadata store type %q requires at least one of ducklake or iceberg enabled", name, configstore.MetadataStoreKindCnpgShard)
+		// values. It hosts the DuckLake catalog; a CR without a catalog has
+		// nothing to attach, so refuse it.
+		if !opts.DuckLakeEnabled {
+			return fmt.Errorf("create duckling CR %q: metadata store type %q requires ducklake enabled", name, configstore.MetadataStoreKindCnpgShard)
 		}
 		// No pgbouncer block: cnpg-shard tenants reach Postgres through the
 		// shard's own session-mode Pooler, not a per-Duckling PgBouncer.
@@ -187,9 +208,8 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	case configstore.MetadataStoreKindExternal:
 		// A pre-existing Postgres (e.g. RDS), referenced by endpoint + an AWS
 		// Secrets Manager secret name for the password (resolved by the
-		// composition via ESO). Backs a DuckLake catalog (iceberg disabled) or
-		// the Lakekeeper catalog (iceberg enabled). User/Database are omitted
-		// when empty so the XRD defaults ("postgres") apply.
+		// composition via ESO). Backs a DuckLake catalog. User/Database are
+		// omitted when empty so the XRD defaults ("postgres") apply.
 		if opts.ExternalEndpoint == "" || opts.ExternalPasswordAWSSecret == "" {
 			return fmt.Errorf("create duckling CR %q: metadata store type %q requires endpoint and passwordAwsSecret", name, configstore.MetadataStoreKindExternal)
 		}
@@ -231,6 +251,14 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		dataStore = map[string]interface{}{"type": "external", "external": external}
 	case "", "s3bucket":
 		dataStore = map[string]interface{}{"type": "s3bucket"}
+		// When the control plane supplies the bucket name (CP-owned naming),
+		// pin it on the CR so the composition provisions exactly that bucket
+		// instead of deriving one. Empty ⇒ omit the field and let the
+		// composition derive (legacy ducklings + deployments without
+		// DUCKGRES_DUCKLING_BUCKET_SUFFIX).
+		if opts.DataStoreBucket != "" {
+			dataStore["bucketName"] = opts.DataStoreBucket
+		}
 	default:
 		return fmt.Errorf("create duckling CR %q: unsupported data store type %q", name, opts.DataStoreType)
 	}
@@ -243,13 +271,6 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 		// and only falls back to the legacy type-based default when the field is
 		// absent (i.e. for ducklings created before decoupling).
 		"ducklake": map[string]interface{}{"enabled": opts.DuckLakeEnabled},
-	}
-	if opts.IcebergEnabled {
-		iceberg := map[string]interface{}{"enabled": true}
-		if ns := opts.IcebergNamespace; ns != "" {
-			iceberg["namespace"] = ns
-		}
-		spec["iceberg"] = iceberg
 	}
 	cr := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -270,54 +291,468 @@ func (d *DucklingClient) Create(ctx context.Context, orgID string, opts CreateOp
 	return nil
 }
 
-// getCR fetches the org's Duckling CR, trying the current hyphen-preserving
-// name first and falling back to the legacy de-hyphenated name for CRs created
-// before ducklingName preserved hyphens. Returns the CR and the name it was
-// found under (callers that mutate need the actual name). When neither exists,
-// returns the current-name NotFound error so callers see the new scheme.
-func (d *DucklingClient) getCR(ctx context.Context, orgID string) (*unstructured.Unstructured, string, error) {
-	name := ducklingName(orgID)
-	cr, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
-	if err == nil {
-		return cr, name, nil
-	}
-	if legacy := legacyDucklingName(orgID); legacy != name && apierrors.IsNotFound(err) {
-		if lcr, lerr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, legacy, metav1.GetOptions{}); lerr == nil {
-			return lcr, legacy, nil
-		}
-	}
-	return nil, name, err
+// getCR fetches a Duckling CR by its exact name — the warehouse row's
+// duckling_name. The control plane never derives or re-maps the name.
+func (d *DucklingClient) getCR(ctx context.Context, name string) (*unstructured.Unstructured, error) {
+	return d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
 }
 
-// Get fetches the Duckling CR and parses its status.
-func (d *DucklingClient) Get(ctx context.Context, orgID string) (*DucklingStatus, error) {
-	cr, name, err := d.getCR(ctx, orgID)
+// ListCRNames returns the names of every Duckling CR in the namespace. Used by
+// the admin drift finder to detect orphan CRs (CRs with no warehouse row).
+func (d *DucklingClient) ListCRNames(ctx context.Context) ([]string, error) {
+	list, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list duckling CRs: %w", err)
+	}
+	names := make([]string, 0, len(list.Items))
+	for i := range list.Items {
+		names = append(names, list.Items[i].GetName())
+	}
+	return names, nil
+}
+
+// CRMetadataStore is the metadata-store slice of one Duckling CR's status —
+// the live (composition-assigned) backend, notably which cnpg shard a
+// cnpg-shard tenant landed on. The config store does not hold this (the
+// composition picks the active shard at provision time and only the CR status
+// carries the endpoint), so the admin console reads it from here.
+type CRMetadataStore struct {
+	Type     string // "cnpg-shard" | "external"
+	Endpoint string // Postgres host, e.g. "shard-001-pooler.cnpg-shards.svc.cluster.local"
+}
+
+// CRMetadataStores lists every Duckling CR and returns each one's
+// status.metadataStore type + endpoint, keyed by CR name. CRs whose status is
+// not yet populated (still provisioning) are skipped rather than failing the
+// whole listing.
+func (d *DucklingClient) CRMetadataStores(ctx context.Context) (map[string]CRMetadataStore, error) {
+	list, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list duckling CRs: %w", err)
+	}
+	out := make(map[string]CRMetadataStore, len(list.Items))
+	for i := range list.Items {
+		status, perr := parseDucklingStatus(&list.Items[i])
+		if perr != nil || status.MetadataStore.Endpoint == "" {
+			continue
+		}
+		out[list.Items[i].GetName()] = CRMetadataStore{
+			Type:     status.MetadataStore.Type,
+			Endpoint: status.MetadataStore.Endpoint,
+		}
+	}
+	return out, nil
+}
+
+// CRStatus reports whether the named Duckling CR exists and, if so, whether it
+// is Ready — without treating absence as an error. A NotFound resolves to
+// (false, false, nil) so the drift finder can classify a missing CR rather than
+// surfacing a 500. Any other error is returned as-is.
+func (d *DucklingClient) CRStatus(ctx context.Context, name string) (present bool, ready bool, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		if apierrors.IsNotFound(gerr) {
+			return false, false, nil
+		}
+		return false, false, gerr
+	}
+	status, perr := parseDucklingStatus(cr)
+	if perr != nil {
+		return true, false, perr
+	}
+	return true, status.ReadyCondition, nil
+}
+
+// GetStatusUnresolved returns the parsed CR status WITHOUT resolving the
+// credential Secret — for consumers that need only the connection fields and
+// the Secret REFERENCE (the metadata-store row mirror). Skipping resolution
+// avoids one Secret GET + a plaintext credential read per call, and decouples
+// the mirror from Secret readability (endpoint/db/user need no secret).
+func (d *DucklingClient) GetStatusUnresolved(ctx context.Context, name string) (*DucklingStatus, error) {
+	cr, err := d.getCR(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
 	return parseDucklingStatus(cr)
 }
 
-// Delete removes the Duckling CR for the given org. Resolves the legacy name so
-// pre-rename CRs are still deletable.
-func (d *DucklingClient) Delete(ctx context.Context, orgID string) error {
-	_, name, err := d.getCR(ctx, orgID)
-	if apierrors.IsNotFound(err) {
-		// Already gone — nothing to delete. (reconcileDeleting treats this as success.)
-		return err
+// Get fetches the named Duckling CR, parses its status, and resolves the
+// metadata credential Secret into MetadataStore.Password.
+func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus, error) {
+	cr, err := d.getCR(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
+	status, err := parseDucklingStatus(cr)
+	if err != nil {
+		return nil, err
+	}
+	ref := status.MetadataCredentialSecretRef
+	if ref.Name == "" {
+		// A newly-created or failed Duckling can legitimately have no resolved
+		// metadata-store status yet. Return its conditions so provisioning can
+		// report Crossplane failures; once a metadata store is published, its
+		// credential reference is mandatory.
+		if status.MetadataStore.Type == "" {
+			return status, nil
+		}
+		return nil, fmt.Errorf("duckling %q status.metadataStore.credentialSecretRef.name is required", name)
+	}
+	password, err := d.readSecretKey(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("resolve metadata credential Secret for duckling %q: %w", name, err)
+	}
+	status.MetadataStore.Password = password
+	maintenanceRef := status.ReshardMaintenance.CredentialSecretRef
+	if maintenanceRef.Name != "" {
+		password, err := d.readSecretKey(ctx, maintenanceRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolve reshard maintenance credential Secret for duckling %q: %w", name, err)
+		}
+		status.ReshardMaintenance.Password = password
+	}
+	return status, nil
+}
+
+// SetReshardMaintenance prepares, fences, or removes the transient CNPG
+// reshard identity. The composition pins it to sourceShard, so it does not
+// follow the tenant Role managed resource to the target during cutover.
+func (d *DucklingClient) SetReshardMaintenance(ctx context.Context, name string, maintenance *ReshardMaintenanceSpec) error {
+	var value interface{}
+	if maintenance != nil {
+		if maintenance.OperationID <= 0 {
+			return fmt.Errorf("reshard maintenance operationID must be positive")
+		}
+		if !isValidCnpgShardName(maintenance.SourceShard) {
+			return fmt.Errorf("invalid reshard maintenance source shard %q", maintenance.SourceShard)
+		}
+		if maintenance.Phase != ReshardMaintenancePhasePrepared &&
+			maintenance.Phase != ReshardMaintenancePhaseFenced &&
+			maintenance.Phase != ReshardMaintenancePhaseDisabled {
+			return fmt.Errorf("invalid reshard maintenance phase %q", maintenance.Phase)
+		}
+		value = map[string]interface{}{
+			"operationID": maintenance.OperationID,
+			"sourceShard": maintenance.SourceShard,
+			"phase":       maintenance.Phase,
+		}
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				reshardMaintenanceCleanupAnnotation: nil,
+			},
+		},
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"reshardMaintenance": value,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal reshard maintenance patch for %q: %w", name, err)
+	}
+	if _, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	); err != nil {
+		return fmt.Errorf("patch duckling CR %q reshard maintenance: %w", name, err)
+	}
+	return nil
+}
+
+// SetReshardMaintenanceCleanup asks the composition to stop rendering only the
+// temporary provider-sql Role while retaining its password chain. The
+// operation-matched annotation avoids an XRD schema rollout/restart and cannot
+// affect a later operation after SetReshardMaintenance clears it.
+func (d *DucklingClient) SetReshardMaintenanceCleanup(ctx context.Context, name string, operationID int64) error {
+	if operationID <= 0 {
+		return fmt.Errorf("reshard maintenance cleanup operationID must be positive")
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]interface{}{
+				reshardMaintenanceCleanupAnnotation: strconv.FormatInt(operationID, 10),
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal reshard maintenance cleanup patch for %q: %w", name, err)
+	}
+	if _, err := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	); err != nil {
+		return fmt.Errorf("patch duckling CR %q reshard maintenance cleanup: %w", name, err)
+	}
+	return nil
+}
+
+// ReshardMaintenanceRoleRemoved proves provider-sql has finished deleting the
+// temporary role. The composition keeps passwordSecretRef's credential chain
+// desired until this becomes true because provider-sql reads the Secret while
+// running its deletion finalizer.
+func (d *DucklingClient) ReshardMaintenanceRoleRemoved(ctx context.Context, name string) (bool, error) {
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))[:16]
+	roleName := "cnpg-reshard-" + hash
+	_, err := d.client.Resource(schema.GroupVersionResource{
+		Group: cnpgTenantMRGroup, Version: "v1alpha1", Resource: "roles",
+	}).Namespace(ducklingNamespace).Get(ctx, roleName, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		return false, nil
+	case apierrors.IsNotFound(err):
+		return true, nil
+	default:
+		return false, fmt.Errorf("check cleanup of role %s: %w", roleName, err)
+	}
+}
+
+// ReshardMaintenanceCleanupComplete proves that the operation-scoped
+// superuser and every credential-bearing/supporting object are gone. Names are
+// deterministic and the chart leaves an exact-resource GET-only observer RBAC
+// grant behind, so this remains checkable after the maintenance spec/status is
+// removed.
+func (d *DucklingClient) ReshardMaintenanceCleanupComplete(ctx context.Context, name string) (bool, string, error) {
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(name)))[:16]
+	checks := []struct {
+		gvr  schema.GroupVersionResource
+		name string
+	}{
+		{schema.GroupVersionResource{Group: cnpgTenantMRGroup, Version: "v1alpha1", Resource: "roles"}, "cnpg-reshard-" + hash},
+		{secretGVR, "cnpg-reshard-" + hash + "-password"},
+		{externalSecretGVR, "cnpg-reshard-" + hash + "-password"},
+		{passwordGeneratorGVR, "cnpg-reshard-" + hash + "-password"},
+		{usageGVR, "cnpg-reshard-" + hash + "-uses-password"},
+		{usageGVR, "cnpg-reshard-" + hash + "-uses-generator"},
+		{roleGVR, "duckgres-credential-" + hash + "-reshard"},
+		{roleBindingGVR, "duckgres-credential-" + hash + "-reshard"},
+	}
+	for _, check := range checks {
+		_, err := d.client.Resource(check.gvr).Namespace(ducklingNamespace).Get(ctx, check.name, metav1.GetOptions{})
+		switch {
+		case err == nil:
+			return false, fmt.Sprintf("%s %s still exists", check.gvr.Resource, check.name), nil
+		case apierrors.IsNotFound(err):
+			continue
+		default:
+			return false, "", fmt.Errorf("check cleanup of %s %s: %w", check.gvr.Resource, check.name, err)
+		}
+	}
+	return true, "all operation-scoped maintenance resources deleted", nil
+}
+
+func (d *DucklingClient) readSecretKey(ctx context.Context, ref SecretReference) (string, error) {
+	namespace := ref.Namespace
+	if namespace == "" {
+		return "", fmt.Errorf("namespace is required")
+	}
+	if namespace != ducklingNamespace {
+		return "", fmt.Errorf("namespace %q is not allowed", namespace)
+	}
+	key := ref.Key
+	if key == "" {
+		return "", fmt.Errorf("key is required")
+	}
+	secret, err := d.client.Resource(secretGVR).Namespace(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get Secret %s/%s: %w", namespace, ref.Name, err)
+	}
+	encoded, found, err := unstructured.NestedString(secret.Object, "data", key)
+	if err != nil {
+		return "", fmt.Errorf("read Secret %s/%s key %q: %w", namespace, ref.Name, key, err)
+	}
+	if !found || encoded == "" {
+		return "", fmt.Errorf("Secret %s/%s has no non-empty %q key", namespace, ref.Name, key)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("decode Secret %s/%s key %q: %w", namespace, ref.Name, key, err)
+	}
+	if len(decoded) == 0 {
+		return "", fmt.Errorf("Secret %s/%s key %q is empty", namespace, ref.Name, key)
+	}
+	return string(decoded), nil
+}
+
+// CnpgProvisionerEndpoint resolves the shard-scoped administrative credential
+// used to prove a real primary accepts queries. The Secret is restricted by
+// resourceName in deployment RBAC and its values are never logged.
+func (d *DucklingClient) CnpgProvisionerEndpoint(ctx context.Context, shard string) (CatalogEndpoint, error) {
+	name := "cnpg-" + shard + "-provisioner"
+	secret, err := d.client.Resource(secretGVR).Namespace(ducklingNamespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return CatalogEndpoint{}, fmt.Errorf("get Secret %s/%s: %w", ducklingNamespace, name, err)
+	}
+	read := func(key string) (string, error) {
+		encoded, found, nestedErr := unstructured.NestedString(secret.Object, "data", key)
+		if nestedErr != nil {
+			return "", fmt.Errorf("read Secret %s/%s key %q: %w", ducklingNamespace, name, key, nestedErr)
+		}
+		if !found || encoded == "" {
+			return "", fmt.Errorf("Secret %s/%s has no non-empty %q key", ducklingNamespace, name, key)
+		}
+		decoded, decodeErr := base64.StdEncoding.DecodeString(encoded)
+		if decodeErr != nil || len(decoded) == 0 {
+			return "", fmt.Errorf("Secret %s/%s has invalid %q data", ducklingNamespace, name, key)
+		}
+		return string(decoded), nil
+	}
+	endpoint, err := read("endpoint")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	portText, err := read("port")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return CatalogEndpoint{}, fmt.Errorf("Secret %s/%s has invalid port", ducklingNamespace, name)
+	}
+	user, err := read("username")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	password, err := read("password")
+	if err != nil {
+		return CatalogEndpoint{}, err
+	}
+	return CatalogEndpoint{
+		Host: endpoint, Port: port, User: user, Password: password,
+		Database: "postgres", SSLMode: "require",
+	}, nil
+}
+
+// ComposedResourceError describes one composed managed resource that is not
+// healthy — Crossplane could not sync it to the provider (Synced=False) or the
+// provider reports it not ready (Ready=False) — along with that condition's
+// message. It lets the provisioner surface the *actual* failure (e.g. an S3
+// "BucketNotEmpty" delete conflict) instead of only the Duckling XR's generic
+// "Unready resources: <name>" roll-up.
+type ComposedResourceError struct {
+	Kind    string
+	Name    string
+	Message string
+}
+
+// ComposedResourceErrors returns the unhealthy composed resources of the named
+// Duckling XR: it reads spec.crossplane.resourceRefs (the composition's composed
+// resources), fetches each, and reports any whose Synced or Ready condition is
+// False, with that condition's message.
+//
+// Best-effort and diagnostic-only: a ref that can't be fetched (already gone, or
+// an unexpected GVR) is skipped rather than failing the whole call, since the
+// result only feeds the human-facing status message. protection.crossplane.io
+// Usage guards are skipped — internal dependency ordering, not tenant infra.
+func (d *DucklingClient) ComposedResourceErrors(ctx context.Context, name string) ([]ComposedResourceError, error) {
+	cr, err := d.getCR(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	var out []ComposedResourceError
+	for _, ref := range nestedComposedRefs(cr) {
+		gvr, kind, refName, ok := composedRefGVR(ref)
+		if !ok || gvr.Group == "protection.crossplane.io" {
+			continue
+		}
+		obj, gerr := d.client.Resource(gvr).Namespace(ducklingNamespace).Get(ctx, refName, metav1.GetOptions{})
+		if gerr != nil {
+			continue
+		}
+		if msg, unhealthy := unhealthyConditionMessage(obj); unhealthy {
+			out = append(out, ComposedResourceError{Kind: kind, Name: refName, Message: msg})
+		}
+	}
+	return out, nil
+}
+
+// nestedComposedRefs pulls spec.crossplane.resourceRefs (the Crossplane v2
+// composed-resource references) off a Duckling XR. Missing or wrongly-typed
+// yields nil.
+func nestedComposedRefs(cr *unstructured.Unstructured) []map[string]interface{} {
+	spec, _ := cr.Object["spec"].(map[string]interface{})
+	xp, _ := spec["crossplane"].(map[string]interface{})
+	raw, _ := xp["resourceRefs"].([]interface{})
+	refs := make([]map[string]interface{}, 0, len(raw))
+	for _, r := range raw {
+		if m, ok := r.(map[string]interface{}); ok {
+			refs = append(refs, m)
+		}
+	}
+	return refs
+}
+
+// composedRefGVR turns a resourceRef ({apiVersion, kind, name}) into the GVR to
+// fetch it by. Resource is the lowercased plural of Kind — see kindToResource.
+func composedRefGVR(ref map[string]interface{}) (gvr schema.GroupVersionResource, kind, name string, ok bool) {
+	apiVersion := getNestedString(ref, "apiVersion")
+	kind = getNestedString(ref, "kind")
+	name = getNestedString(ref, "name")
+	if apiVersion == "" || kind == "" || name == "" {
+		return schema.GroupVersionResource{}, "", "", false
+	}
+	gv, err := schema.ParseGroupVersion(apiVersion)
+	if err != nil {
+		return schema.GroupVersionResource{}, "", "", false
+	}
+	return gv.WithResource(kindToResource(kind)), kind, name, true
+}
+
+// kindToResource lowercases a Kind and pluralizes it to the resource segment of
+// a GVR. It implements only the rules the Duckling composition's composed kinds
+// need (…y→…ies, otherwise +s): Bucket→buckets, BucketPolicy→bucketpolicies,
+// Role→roles, RolePolicy→rolepolicies, Database→databases, Object→objects,
+// Usage→usages. None of those end in s/x/z/ch/sh, so no -es rule is needed.
+func kindToResource(kind string) string {
+	lower := strings.ToLower(kind)
+	if strings.HasSuffix(lower, "y") {
+		return lower[:len(lower)-1] + "ies"
+	}
+	return lower + "s"
+}
+
+// unhealthyConditionMessage reports whether a composed managed resource has a
+// Synced=False or Ready=False condition, returning that condition's message.
+// Synced is preferred: a provider sync error (e.g. BucketNotEmpty) is the
+// actionable cause, whereas Ready=False is often just its downstream symptom.
+func unhealthyConditionMessage(obj *unstructured.Unstructured) (string, bool) {
+	status, _ := obj.Object["status"].(map[string]interface{})
+	conditions, _ := status["conditions"].([]interface{})
+	readyMsg := ""
+	readyBad := false
+	for _, c := range conditions {
+		cm, ok := c.(map[string]interface{})
+		if !ok || getNestedString(cm, "status") != "False" {
+			continue
+		}
+		switch getNestedString(cm, "type") {
+		case "Synced":
+			return getNestedString(cm, "message"), true
+		case "Ready":
+			readyMsg = getNestedString(cm, "message")
+			readyBad = true
+		}
+	}
+	return readyMsg, readyBad
+}
+
+// Delete removes the named Duckling CR.
+func (d *DucklingClient) Delete(ctx context.Context, name string) error {
 	if derr := d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Delete(ctx, name, metav1.DeleteOptions{}); derr != nil {
+		if apierrors.IsNotFound(derr) {
+			// Already gone — nothing to delete. (reconcileDeleting treats this as success.)
+			return derr
+		}
 		return fmt.Errorf("delete duckling CR %q: %w", name, derr)
 	}
 	return nil
 }
 
 // GetPgBouncerEnabled reads spec.metadataStore.pgbouncer.enabled from the
-// Duckling CR. Missing blocks (composition at an older schema, CR never
+// named Duckling CR. Missing blocks (composition at an older schema, CR never
 // carried a pgbouncer section) are reported as false — same as an explicit
 // opt-out — so the caller just needs to compare against the desired value.
-func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) (bool, error) {
-	cr, name, err := d.getCR(ctx, orgID)
+func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, name string) (bool, error) {
+	cr, err := d.getCR(ctx, name)
 	if err != nil {
 		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
@@ -338,14 +773,10 @@ func (d *DucklingClient) GetPgBouncerEnabled(ctx context.Context, orgID string) 
 }
 
 // SetPgBouncerEnabled patches spec.metadataStore.pgbouncer.enabled on the
-// Duckling CR for the given org. Uses a JSON merge patch (RFC 7396) so the
+// named Duckling CR. Uses a JSON merge patch (RFC 7396) so the
 // call is idempotent and only touches the pgbouncer block — sibling fields
 // under metadataStore (type, external) are left untouched.
-func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, enabled bool) error {
-	_, name, err := d.getCR(ctx, orgID)
-	if err != nil {
-		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
-	}
+func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, name string, enabled bool) error {
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
 			"metadataStore": map[string]interface{}{
@@ -367,57 +798,493 @@ func (d *DucklingClient) SetPgBouncerEnabled(ctx context.Context, orgID string, 
 	return nil
 }
 
-// GetIcebergEnabled reads spec.iceberg.enabled from the Duckling CR. Missing
-// blocks (composition at an older schema, CR predates iceberg support) are
-// reported as false — same as an explicit opt-out — so the caller can just
-// compare against the desired value.
-func (d *DucklingClient) GetIcebergEnabled(ctx context.Context, orgID string) (bool, error) {
-	cr, name, err := d.getCR(ctx, orgID)
+// GetDataStoreBucketName reads spec.dataStore.bucketName from the named
+// Duckling CR. Empty (missing block / missing key) means the CR predates
+// CP-owned naming and the composition is still deriving the name — the signal
+// the backfill in reconcileReady uses to decide whether to patch.
+func (d *DucklingClient) GetDataStoreBucketName(ctx context.Context, name string) (string, error) {
+	cr, err := d.getCR(ctx, name)
 	if err != nil {
-		return false, fmt.Errorf("get duckling CR %q: %w", name, err)
+		return "", fmt.Errorf("get duckling CR %q: %w", name, err)
 	}
 	spec, ok := cr.Object["spec"].(map[string]interface{})
 	if !ok {
-		return false, nil
+		return "", nil
 	}
-	iceberg, ok := spec["iceberg"].(map[string]interface{})
+	ds, ok := spec["dataStore"].(map[string]interface{})
 	if !ok {
-		return false, nil
+		return "", nil
 	}
-	enabled, _ := iceberg["enabled"].(bool)
-	return enabled, nil
+	bucket, _ := ds["bucketName"].(string)
+	return bucket, nil
 }
 
-// SetIcebergEnabled patches spec.iceberg.enabled on the Duckling CR for the
-// given org. Uses a JSON merge patch (RFC 7396) so the call is idempotent and
-// only touches the iceberg block — sibling fields under spec (metadataStore,
-// dataStore) are left untouched.
-//
-// Note: iceberg.namespace is enforced immutable by the XRD's CEL rule, so
-// this method intentionally only patches enabled — namespace changes have
-// to go through warehouse re-creation.
-func (d *DucklingClient) SetIcebergEnabled(ctx context.Context, orgID string, enabled bool) error {
-	_, name, err := d.getCR(ctx, orgID)
-	if err != nil {
-		return fmt.Errorf("resolve duckling CR for %q: %w", orgID, err)
-	}
+// SetDataStoreBucketName patches spec.dataStore.bucketName on the named
+// Duckling CR. JSON merge patch (RFC 7396) so it's idempotent and only touches
+// dataStore — the type field and any sibling under spec are left untouched.
+// Used to backfill the CP-owned name onto ducklings created before this field
+// existed (their spec.dataStore carries only {type: s3bucket}); the name
+// supplied here is the same string the composition was already deriving into
+// status, so the patch causes no bucket churn — it just moves the name from a
+// derived output into a durable input so the composition stops deriving.
+func (d *DucklingClient) SetDataStoreBucketName(ctx context.Context, name, bucket string) error {
 	patch, err := json.Marshal(map[string]interface{}{
 		"spec": map[string]interface{}{
-			"iceberg": map[string]interface{}{
-				"enabled": enabled,
+			"dataStore": map[string]interface{}{
+				"bucketName": bucket,
 			},
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("marshal iceberg patch for %q: %w", name, err)
+		return fmt.Errorf("marshal dataStore bucket patch for %q: %w", name, err)
 	}
 	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
 		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
 	)
 	if err != nil {
-		return fmt.Errorf("patch duckling CR %q iceberg: %w", name, err)
+		return fmt.Errorf("patch duckling CR %q dataStore bucketName: %w", name, err)
 	}
 	return nil
+}
+
+// GetCnpgShardState reads, in one CR read, the explicit shard override
+// (spec.metadataStore.cnpgShard) and the composition-pinned assignment
+// (status.metadataStore.assignedShard) of the named Duckling CR. An empty
+// specShard means no override is set (pre-backfill CR, or an XRD that pruned
+// the field); an empty assignedShard means the composition hasn't stamped the
+// pin yet (still provisioning) or the CR isn't cnpg-shard.
+func (d *DucklingClient) GetCnpgShardState(ctx context.Context, name string) (specShard, assignedShard string, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return "", "", fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	if spec, ok := cr.Object["spec"].(map[string]interface{}); ok {
+		if ms, ok := spec["metadataStore"].(map[string]interface{}); ok {
+			specShard, _ = ms["cnpgShard"].(string)
+		}
+	}
+	if status, ok := cr.Object["status"].(map[string]interface{}); ok {
+		if ms, ok := status["metadataStore"].(map[string]interface{}); ok {
+			assignedShard, _ = ms["assignedShard"].(string)
+		}
+	}
+	return specShard, assignedShard, nil
+}
+
+// SetMetadataStoreCnpgShard patches spec.metadataStore.cnpgShard on the named
+// Duckling CR. JSON merge patch (RFC 7396) so it's idempotent and only touches
+// that one field — type/external/pgbouncer siblings are left untouched.
+//
+// Setting it to the CR's own status.metadataStore.assignedShard (the backfill
+// in reconcileReady) is a pure no-op for the composition. Setting a DIFFERENT
+// shard is the cutover step of a metadata-store migration: the composition
+// re-points the per-tenant provider-sql Role/Database at the new shard's
+// ProviderConfig IN PLACE (same pgIdent, same pinned password; the old
+// shard's role/database are orphaned, not dropped) and does NOT copy any
+// catalog data — the caller is responsible for having restored the catalog
+// on the target shard first. Callers should read the value back with
+// GetCnpgShardState: an XRD that predates the field silently prunes the
+// patch, so a successful Patch alone does not mean the override applied.
+func (d *DucklingClient) SetMetadataStoreCnpgShard(ctx context.Context, name, shard string) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"cnpgShard": shard,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cnpgShard patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadataStore cnpgShard: %w", name, err)
+	}
+	return nil
+}
+
+// GetCompactionSetting reads spec.ducklake.maintenance.compaction.enabled,
+// distinguishing key-absent (present=false) from an explicit value. The
+// distinction is load-bearing for the reshard compaction pause: the chart's
+// name-list rollout can enable compaction when the key is ABSENT, so restoring
+// "absent" vs "false" after a reshard are different states.
+func (d *DucklingClient) GetCompactionSetting(ctx context.Context, name string) (enabled, present bool, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return false, false, fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	dl, ok := spec["ducklake"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	maint, ok := dl["maintenance"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	comp, ok := maint["compaction"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	v, ok := comp["enabled"].(bool)
+	return v, ok, nil
+}
+
+// SetCompactionEnabled patches spec.ducklake.maintenance.compaction.enabled
+// to an explicit value. enabled=nil REMOVES the key (JSON merge patch null),
+// restoring the pre-reshard "absent" state.
+//
+// XRD-defaulting guard (prod incident): a legacy CR can have NO spec.ducklake
+// object at all — its DuckLake enablement then comes from the legacy
+// metadata-store type coupling (see shared_worker_activator.go::
+// buildDuckLakeConfigFromDuckling). This merge patch MATERIALIZES the
+// spec.ducklake object, and the XRD's `ducklake.enabled: {default: false}`
+// stamps `enabled: false` onto the freshly created object — silently DISABLING
+// DuckLake for the org (the CP then builds an S3-only activation payload and
+// every activation fails with "tenant activation requires a ducklake
+// metadata_store"). When the object is absent, pin the org's EFFECTIVE
+// enablement into the same patch so defaulting cannot flip it; when it already
+// exists, patch exactly the compaction key and nothing else. The pinned
+// explicit value is deliberately NEVER removed afterwards (not by
+// restoreCompaction, not on takeover): it equals the effective value, so it is
+// a harmless no-op — whereas removing it after a successful flip would hand
+// enablement back to the type coupling, whose answer may have CHANGED with the
+// new metadata-store type (ext→cnpg would re-derive false — the same outage
+// through another door).
+func (d *DucklingClient) SetCompactionEnabled(ctx context.Context, name string, enabled *bool) error {
+	var value interface{}
+	if enabled != nil {
+		value = *enabled
+	}
+	ducklakeBlock := map[string]interface{}{
+		"maintenance": map[string]interface{}{
+			"compaction": map[string]interface{}{
+				"enabled": value,
+			},
+		},
+	}
+
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return fmt.Errorf("get duckling CR %q before compaction patch: %w", name, gerr)
+	}
+	hasDucklakeObject := false
+	if spec, ok := cr.Object["spec"].(map[string]interface{}); ok {
+		_, hasDucklakeObject = spec["ducklake"].(map[string]interface{})
+	}
+	if !hasDucklakeObject {
+		st, perr := parseDucklingStatus(cr)
+		if perr != nil {
+			return fmt.Errorf("parse duckling CR %q status before compaction patch: %w", name, perr)
+		}
+		// Mirror buildDuckLakeConfigFromDuckling's effective enablement: an
+		// explicit spec.ducklake.enabled wins (impossible here — the object is
+		// absent — but kept for symmetry), else the legacy coupling
+		// status.metadataStore.type != cnpg-shard.
+		effective := st.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
+		if st.DuckLakeEnabled != nil {
+			effective = *st.DuckLakeEnabled
+		}
+		ducklakeBlock["enabled"] = effective
+		slog.Info("Duckling has no spec.ducklake object; pinning effective ducklake enablement into the compaction patch so XRD defaulting cannot disable it.",
+			"duckling", name, "effective_enabled", effective, "status_metadata_store_type", st.MetadataStore.Type)
+	}
+
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"ducklake": ducklakeBlock,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal compaction patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q compaction enabled: %w", name, err)
+	}
+	return nil
+}
+
+// SetMetadataStoreCnpg patches the metadata store to a cnpg shard in one merge
+// patch: {type: cnpg-shard, cnpgShard: shard}. Used both for cnpg→cnpg shard
+// cutovers (type already cnpg-shard — idempotent) and for the ext→cnpg flip.
+// Any external block left in spec is ignored by the composition for the
+// cnpg-shard type.
+func (d *DucklingClient) SetMetadataStoreCnpg(ctx context.Context, name, shard string) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":      configstore.MetadataStoreKindCnpgShard,
+				"cnpgShard": shard,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cnpg metadata patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadata store to cnpg: %w", name, err)
+	}
+	return nil
+}
+
+// ExternalMetadataStoreSpec is the spec.metadataStore.external block for
+// SetMetadataStoreExternal.
+type ExternalMetadataStoreSpec struct {
+	Endpoint          string
+	PasswordAWSSecret string
+	User              string
+	Database          string
+}
+
+// SetMetadataStoreExternal patches the metadata store to external in one
+// merge patch, REMOVING cnpgShard (JSON merge patch null) — the XRD's CEL
+// forbids cnpgShard on the external type, so leaving the key would fail
+// admission. It deliberately does NOT touch retainCnpgOnFlip: the reshard
+// runner sets that true BEFORE this flip so the un-render ORPHANS the cnpg
+// role/DB. Used for the cnpg→ext escape-hatch flip and as the ext→cnpg
+// rollback patch. NOTE: this flip makes the composition STOP rendering the
+// cnpg Role/Database managed resources. Whether Crossplane then DELETES the
+// cnpg role/database or ORPHANS it depends on their managementPolicies:
+// retainCnpgOnFlip=true renders them WITHOUT Delete, so the flip orphans (the
+// orphan-adopt safety net); false (a normal tenant) renders them WITH Delete,
+// so the flip deletes them. Callers sequence this only after the catalog has
+// been copied and verified elsewhere.
+func (d *DucklingClient) SetMetadataStoreExternal(ctx context.Context, name string, ext ExternalMetadataStoreSpec) error {
+	if ext.Endpoint == "" || ext.PasswordAWSSecret == "" {
+		return fmt.Errorf("patch duckling CR %q metadata store to external: endpoint and passwordAwsSecret are required", name)
+	}
+	external := map[string]interface{}{
+		"endpoint":          ext.Endpoint,
+		"passwordAwsSecret": ext.PasswordAWSSecret,
+	}
+	if ext.User != "" {
+		external["user"] = ext.User
+	}
+	if ext.Database != "" {
+		external["database"] = ext.Database
+	}
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":      configstore.MetadataStoreKindExternal,
+				"cnpgShard": nil,
+				"external":  external,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal external metadata patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadata store to external: %w", name, err)
+	}
+	return nil
+}
+
+// SetMetadataStoreRetainCnpgOnFlip patches spec.metadataStore.retainCnpgOnFlip
+// on the named Duckling CR (JSON merge patch, idempotent, touches only that
+// field). true makes the composition render the per-tenant cnpg Role/Database
+// MRs WITHOUT Delete (managementPolicies ["Observe","Create","Update"], the v2
+// Orphan equivalent), so a subsequent type flip cnpg-shard→external ORPHANS the
+// role/DB instead of deleting them — the cnpg→external reshard escape hatch's
+// orphan-adopt safety net. false restores full lifecycle (Delete) so a normal
+// deprovision drops them. Callers MUST read the value back with
+// GetMetadataStoreRetainCnpgOnFlip: an XRD predating the field silently prunes
+// the patch, so a successful Patch alone does not mean the flag applied.
+func (d *DucklingClient) SetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string, retain bool) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"retainCnpgOnFlip": retain,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal retainCnpgOnFlip patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadataStore retainCnpgOnFlip: %w", name, err)
+	}
+	return nil
+}
+
+// GetMetadataStoreRetainCnpgOnFlip reads spec.metadataStore.retainCnpgOnFlip.
+// present is false when the key is absent — which, right after a
+// SetMetadataStoreRetainCnpgOnFlip(true), means the cluster's Duckling XRD
+// predates the field and the API server pruned the patch. The reshard runner
+// uses a post-set read-back (retain==true) to decide whether it is safe to
+// flip: if the field did not stick it REFUSES the cnpg→external flip rather
+// than risk the destructive delete-on-flip with no orphan-adopt safety net.
+func (d *DucklingClient) GetMetadataStoreRetainCnpgOnFlip(ctx context.Context, name string) (retain, present bool, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return false, false, fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	spec, ok := cr.Object["spec"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	ms, ok := spec["metadataStore"].(map[string]interface{})
+	if !ok {
+		return false, false, nil
+	}
+	v, ok := ms["retainCnpgOnFlip"].(bool)
+	if !ok {
+		return false, false, nil
+	}
+	return v, true, nil
+}
+
+// SetMetadataStoreCnpgAdopt is the cnpg→external orphan-adopt RECOVERY patch: it
+// flips the metadata store back to a cnpg shard AND clears retainCnpgOnFlip in
+// ONE merge patch. The composition re-renders the per-tenant cnpg Role/Database
+// MRs at full lifecycle (Delete restored) and provider-sql ADOPTS the
+// still-present orphaned role/DB by external-name (same pgIdent, same pinned
+// password) — instant recovery, no empty-recreate, no copy-back. Clearing the
+// flag in the same patch closes any window where the tenant is back on cnpg but
+// a deprovision would orphan (leak) the role/DB. Any leftover external block is
+// ignored by the composition for the cnpg-shard type (as with SetMetadataStoreCnpg).
+func (d *DucklingClient) SetMetadataStoreCnpgAdopt(ctx context.Context, name, shard string) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"spec": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":             configstore.MetadataStoreKindCnpgShard,
+				"cnpgShard":        shard,
+				"retainCnpgOnFlip": false,
+			},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cnpg-adopt patch for %q: %w", name, err)
+	}
+	_, err = d.client.Resource(ducklingGVR).Namespace(ducklingNamespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("patch duckling CR %q metadata store to cnpg (adopt): %w", name, err)
+	}
+	return nil
+}
+
+// cnpgTenantMRGroup is the provider-sql API group the per-tenant cnpg Role and
+// Database managed resources belong to (the composition's cnpg-tenant-role /
+// cnpg-tenant-database composed resources).
+const cnpgTenantMRGroup = "postgresql.sql.m.crossplane.io"
+
+// CnpgSourceMRsOrphaned reports whether the named Duckling's per-tenant cnpg
+// Role AND Database managed resources currently carry the retain (no-Delete)
+// managementPolicies — i.e. a type flip away from cnpg-shard will ORPHAN them
+// rather than delete them. present is true only when BOTH MRs were found (while
+// type is cnpg-shard the composite renders exactly one Role + one Database, the
+// source's). The reshard runner polls this after setting retainCnpgOnFlip=true
+// and only flips once both MRs reflect the policy — closing the race where the
+// flip un-renders the MRs before the retain policy propagated.
+//
+// detail is a one-line human-readable account of what was observed (per-MR
+// found/not-found + current managementPolicies), destined for the reshard op
+// log so a wait that is not converging is diagnosable from the log alone.
+//
+// NOTE this read needs RBAC the Duckling patch itself does not: get on
+// roles+databases in cnpgTenantMRGroup (the duckling-reader grant only covers
+// ducklings). A Forbidden here is a permanent misconfiguration — callers
+// should fail fast on it (apierrors.IsForbidden unwraps the %w chain), not
+// poll to a timeout.
+func (d *DucklingClient) CnpgSourceMRsOrphaned(ctx context.Context, name string) (orphaned, present bool, detail string, err error) {
+	cr, gerr := d.getCR(ctx, name)
+	if gerr != nil {
+		return false, false, "", fmt.Errorf("get duckling CR %q: %w", name, gerr)
+	}
+	var roleFound, dbFound, roleNoDelete, dbNoDelete bool
+	observed := map[string]string{}
+	for _, ref := range nestedComposedRefs(cr) {
+		gvr, kind, refName, ok := composedRefGVR(ref)
+		if !ok || gvr.Group != cnpgTenantMRGroup {
+			continue
+		}
+		if kind != "Role" && kind != "Database" {
+			continue
+		}
+		obj, gerr := d.client.Resource(gvr).Namespace(ducklingNamespace).Get(ctx, refName, metav1.GetOptions{})
+		if gerr != nil {
+			if apierrors.IsNotFound(gerr) {
+				observed[kind] = fmt.Sprintf("%s %q: referenced by the composite but not found", kind, refName)
+				continue
+			}
+			return false, false, "", fmt.Errorf("get %s %q: %w", kind, refName, gerr)
+		}
+		noDelete := !managementPoliciesHaveDelete(obj)
+		observed[kind] = fmt.Sprintf("%s %q: managementPolicies %s", kind, refName, describeManagementPolicies(obj))
+		switch kind {
+		case "Role":
+			roleFound, roleNoDelete = true, noDelete
+		case "Database":
+			dbFound, dbNoDelete = true, noDelete
+		}
+	}
+	parts := make([]string, 0, 2)
+	for _, kind := range []string{"Role", "Database"} {
+		if s, ok := observed[kind]; ok {
+			parts = append(parts, s)
+		} else {
+			parts = append(parts, fmt.Sprintf("%s: no composed resourceRef in group %s", kind, cnpgTenantMRGroup))
+		}
+	}
+	detail = strings.Join(parts, "; ")
+	present = roleFound && dbFound
+	orphaned = present && roleNoDelete && dbNoDelete
+	return orphaned, present, detail, nil
+}
+
+// managementPoliciesHaveDelete reports whether a managed resource's
+// spec.managementPolicies includes Delete (or the "*" wildcard). An
+// absent/empty field means the MR uses Crossplane's default ["*"] (full
+// lifecycle), so it is treated as HAVING Delete — the conservative reading:
+// only an explicit no-Delete policy counts as orphan-ready.
+func managementPoliciesHaveDelete(obj *unstructured.Unstructured) bool {
+	spec, _ := obj.Object["spec"].(map[string]interface{})
+	raw, ok := spec["managementPolicies"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return true
+	}
+	for _, p := range raw {
+		if s, _ := p.(string); s == "Delete" || s == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+// describeManagementPolicies renders a managed resource's
+// spec.managementPolicies for the reshard op log, making explicit that an
+// absent/empty field means Crossplane's default full lifecycle.
+func describeManagementPolicies(obj *unstructured.Unstructured) string {
+	spec, _ := obj.Object["spec"].(map[string]interface{})
+	raw, ok := spec["managementPolicies"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return `absent (defaults to ["*"], full lifecycle incl. Delete)`
+	}
+	parts := make([]string, len(raw))
+	for i, p := range raw {
+		parts[i] = fmt.Sprintf("%q", fmt.Sprint(p))
+	}
+	return "[" + strings.Join(parts, ",") + "]"
 }
 
 // readSpecDuckLakeEnabled returns spec.ducklake.enabled as *bool — nil when the
@@ -460,9 +1327,44 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		ds.MetadataStore.Type = getNestedString(md, "type")
 		ds.MetadataStore.Endpoint = getNestedString(md, "endpoint")
 		ds.MetadataStore.PgBouncerEndpoint = getNestedString(md, "pgbouncerEndpoint")
-		ds.MetadataStore.Password = getNestedString(md, "password")
 		ds.MetadataStore.User = getNestedString(md, "user")
 		ds.MetadataStore.Database = getNestedString(md, "database")
+		if ref, ok := md["credentialSecretRef"].(map[string]interface{}); ok {
+			ds.MetadataCredentialSecretRef = SecretReference{
+				Name:      getNestedString(ref, "name"),
+				Namespace: getNestedString(ref, "namespace"),
+				Key:       getNestedString(ref, "key"),
+			}
+		}
+		if maintenance, ok := md["reshardMaintenance"].(map[string]interface{}); ok {
+			opID, _ := maintenance["operationID"].(int64)
+			if opID == 0 {
+				if n, ok := maintenance["operationID"].(float64); ok {
+					opID = int64(n)
+				}
+			}
+			ds.ReshardMaintenance = ReshardMaintenanceStatus{
+				OperationID: opID,
+				User:        getNestedString(maintenance, "user"),
+			}
+			if prepared, ok := maintenance["prepared"].(bool); ok {
+				ds.ReshardMaintenance.Prepared = prepared
+			}
+			if fenced, ok := maintenance["fenced"].(bool); ok {
+				ds.ReshardMaintenance.Fenced = fenced
+			}
+			ds.ReshardMaintenance.TenantLogin, _ = maintenance["tenantLogin"].(bool)
+			ds.ReshardMaintenance.TenantNoLogin, _ = maintenance["tenantNoLogin"].(bool)
+			ds.ReshardMaintenance.MaintenanceLogin, _ = maintenance["maintenanceLogin"].(bool)
+			ds.ReshardMaintenance.MaintenanceNoLogin, _ = maintenance["maintenanceNoLogin"].(bool)
+			if ref, ok := maintenance["credentialSecretRef"].(map[string]interface{}); ok {
+				ds.ReshardMaintenance.CredentialSecretRef = SecretReference{
+					Name:      getNestedString(ref, "name"),
+					Namespace: getNestedString(ref, "namespace"),
+					Key:       getNestedString(ref, "key"),
+				}
+			}
+		}
 	}
 
 	// Parse status.dataStore
@@ -470,12 +1372,6 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		ds.DataStore.Type = getNestedString(store, "type")
 		ds.DataStore.BucketName = getNestedString(store, "bucketName")
 		ds.DataStore.S3Region = getNestedString(store, "s3Region")
-	}
-
-	// Parse status.iceberg (only populated when spec.iceberg.enabled=true)
-	if ic, ok := status["iceberg"].(map[string]interface{}); ok {
-		ds.Iceberg.NamespaceName = getNestedString(ic, "namespaceName")
-		ds.Iceberg.Region = getNestedString(ic, "region")
 	}
 
 	// Parse conditions
@@ -491,6 +1387,9 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 		switch condType {
 		case "Ready":
 			ds.ReadyCondition = condStatus == "True"
+			if condStatus == "False" {
+				ds.ReadyFalseMessage = getNestedString(condMap, "message")
+			}
 		case "Synced":
 			if condStatus == "False" {
 				ds.SyncedFalseMessage = getNestedString(condMap, "message")

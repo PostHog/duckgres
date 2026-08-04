@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -66,9 +67,6 @@ type TenantActivationPayload struct {
 	OrgID     string                `json:"org_id"`
 	Usernames []string              `json:"usernames,omitempty"`
 	DuckLake  server.DuckLakeConfig `json:"ducklake"`
-	// Iceberg is the per-tenant Iceberg catalog (AWS S3 Tables) config.
-	// Empty when the tenant has not opted in or hasn't been provisioned yet.
-	Iceberg server.IcebergConfig `json:"iceberg"`
 	// S3CredentialsExpiresAt is the absolute expiration time of the STS
 	// credentials embedded in DuckLake.{S3AccessKey,S3SecretKey,S3SessionToken}.
 	// nil for non-STS payloads (config-store-driven warehouses use static
@@ -171,7 +169,6 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 			},
 			OrgID:    payload.OrgID,
 			DuckLake: payload.DuckLake,
-			Iceberg:  payload.Iceberg,
 		})
 	}
 
@@ -320,7 +317,6 @@ func (a *SharedWorkerActivator) RefreshCredentials(ctx context.Context, worker *
 		},
 		OrgID:    payload.OrgID,
 		DuckLake: payload.DuckLake,
-		Iceberg:  payload.Iceberg,
 	}
 	if err := worker.ActivateTenant(ctx, rpcPayload); err != nil {
 		return fmt.Errorf("activate tenant for refresh: %w", err)
@@ -371,9 +367,11 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 		}
 	}
 	if a.resolveDucklingStatus == nil || err != nil {
-		// Config-store warehouses use static creds (no STS), so expiresAt
-		// stays nil and the credential refresh scheduler skips them.
-		dl, err = a.buildDuckLakeConfigFromConfigStore(ctx, org.Warehouse)
+		// Static-cred config-store warehouses (secret-ref S3 credentials)
+		// return a nil expiresAt and the credential refresh scheduler skips
+		// them; the "aws" provider path brokers STS creds and returns their
+		// expiration so the scheduler keeps those workers fresh.
+		dl, expiresAt, err = a.buildDuckLakeConfigFromConfigStore(ctx, org.Warehouse)
 	}
 	if err != nil {
 		return TenantActivationPayload{}, err
@@ -395,16 +393,10 @@ func (a *SharedWorkerActivator) BuildActivationRequest(ctx context.Context, org 
 	}
 	dl.SpecVersion = targetSpecVersion
 
-	ic, err := a.buildIcebergConfig(ctx, assignment.OrgID, &org.Warehouse.Iceberg)
-	if err != nil {
-		return TenantActivationPayload{}, err
-	}
-
 	return TenantActivationPayload{
 		OrgID:                  assignment.OrgID,
 		Usernames:              usernames,
 		DuckLake:               dl,
-		Iceberg:                ic,
 		S3CredentialsExpiresAt: expiresAt,
 	}, nil
 }
@@ -433,9 +425,7 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 	// spec.ducklake.enabled is authoritative (decoupled ducklings); legacy CRs
 	// that predate the field fall back to the historical coupling — DuckLake on
 	// for external, off for cnpg-shard. When on, the catalog lives in the
-	// metadata Postgres (the per-tenant lakekeeper_<org> DB on cnpg, or the
-	// metadata DB on external); when off the worker attaches Iceberg only
-	// (server.ActivateDBConnection takes its iceberg-only branch).
+	// metadata Postgres.
 	ducklakeEnabled := status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
 	if status.DuckLakeEnabled != nil {
 		ducklakeEnabled = *status.DuckLakeEnabled
@@ -460,10 +450,10 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromDuckling(ctx context.Cont
 
 	// Broker S3 credentials via STS AssumeRole
 	if status.IAMRoleARN == "" {
-		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no IAM role ARN for shared warm activation", orgID)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("duckling CR %q has no IAM role ARN for worker activation", orgID)
 	}
 	if a.stsBroker == nil {
-		return server.DuckLakeConfig{}, nil, fmt.Errorf("STS broker is required for shared warm activation for org %q", orgID)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("STS broker is required for worker activation for org %q", orgID)
 	}
 	creds, err := a.stsBroker.AssumeRole(ctx, status.IAMRoleARN)
 	if err != nil {
@@ -505,10 +495,10 @@ func ducklingMetadataStoreAddress(status *provisioner.DucklingStatus, orgID stri
 
 // buildDuckLakeConfigFromConfigStore reads infrastructure details from the config store
 // and K8s Secrets. Used for non-Crossplane warehouses (manual seed, MinIO, etc.).
-func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.Context, warehouse *configstore.ManagedWarehouseConfig) (server.DuckLakeConfig, error) {
+func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.Context, warehouse *configstore.ManagedWarehouseConfig) (server.DuckLakeConfig, *time.Time, error) {
 	metadataPassword, err := a.readSecretValue(ctx, warehouse.MetadataStoreCredentials)
 	if err != nil {
-		return server.DuckLakeConfig{}, fmt.Errorf("metadata store credentials: %w", err)
+		return server.DuckLakeConfig{}, nil, fmt.Errorf("metadata store credentials: %w", err)
 	}
 
 	dl := server.DuckLakeConfig{
@@ -532,7 +522,7 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 	case warehouse.S3Credentials.Name != "":
 		accessKey, secretKey, sessionToken, err := a.readS3Credentials(ctx, warehouse.S3Credentials)
 		if err != nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("s3 credentials: %w", err)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("s3 credentials: %w", err)
 		}
 		dl.S3Provider = "config"
 		dl.S3AccessKey = accessKey
@@ -540,30 +530,36 @@ func (a *SharedWorkerActivator) buildDuckLakeConfigFromConfigStore(ctx context.C
 		// session_token is optional in the secret payload — long-term IAM
 		// user keys don't have one. STS-vended temporary credentials
 		// (AccessKeyId starting with ASIA…) require it: AWS rejects the
-		// signing identity without the token and the iceberg REST endpoint
-		// returns 403. Letting the field through lets sandbox/CI fixtures
+		// signing identity without the token. Letting the field through lets sandbox/CI fixtures
 		// that source creds from STS use the same secret-ref schema as
 		// production's long-term keys.
 		dl.S3SessionToken = sessionToken
 	case strings.EqualFold(warehouse.S3.Provider, "aws"):
 		roleARN := warehouse.WorkerIdentity.IAMRoleARN
 		if roleARN == "" {
-			return server.DuckLakeConfig{}, fmt.Errorf("managed warehouse %q requires worker_identity.iam_role_arn for shared warm activation", warehouse.OrgID)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("managed warehouse %q requires worker_identity.iam_role_arn for worker activation", warehouse.OrgID)
 		}
 		if a.stsBroker == nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("STS broker is required for shared warm activation for org %q", warehouse.OrgID)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("STS broker is required for worker activation for org %q", warehouse.OrgID)
 		}
 		creds, err := a.stsBroker.AssumeRole(ctx, roleARN)
 		if err != nil {
-			return server.DuckLakeConfig{}, fmt.Errorf("STS AssumeRole for org %q: %w", warehouse.OrgID, err)
+			return server.DuckLakeConfig{}, nil, fmt.Errorf("STS AssumeRole for org %q: %w", warehouse.OrgID, err)
 		}
 		dl.S3Provider = "config"
 		dl.S3AccessKey = creds.AccessKeyID
 		dl.S3SecretKey = creds.SecretAccessKey
 		dl.S3SessionToken = creds.SessionToken
+		// STS-vended creds expire: surface the expiration so the
+		// credential-refresh scheduler keeps this worker's secret fresh.
+		// Without it the worker record's expiry stays NULL, the scheduler
+		// never lists the worker as due, and any session outliving the
+		// 1h token dies with ExpiredToken.
+		expiresAt := creds.Expiration
+		return dl, &expiresAt, nil
 	}
 
-	return dl, nil
+	return dl, nil, nil
 }
 
 func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Interface, defaultNamespace string, org *configstore.OrgConfig, stsBroker *STSBroker) (TenantActivationPayload, error) {
@@ -576,39 +572,6 @@ func BuildTenantActivationPayload(ctx context.Context, clientset kubernetes.Inte
 		OrgID: orgName(org),
 	}
 	return activator.BuildActivationRequest(ctx, org, assignment)
-}
-
-// buildIcebergConfig maps a stored ManagedWarehouseIceberg into the wire-level
-// IcebergConfig that ships to workers. Lakekeeper is the only backend, so the
-// fields populated here all describe the per-tenant Lakekeeper REST catalog.
-// Empty Lakekeeper fields are treated as "provisioner hasn't filled this in
-// yet" and the worker returns no-op for that org.
-//
-// With a non-empty LakekeeperClientCredentials SecretRef, the OAuth2
-// client_secret is resolved via readSecretValue just before sending. Empty
-// SecretRef is fine (allowall mode; OIDC SA-token auth supersedes this when
-// configured).
-func (a *SharedWorkerActivator) buildIcebergConfig(ctx context.Context, orgID string, src *configstore.ManagedWarehouseIceberg) (server.IcebergConfig, error) {
-	ic := server.IcebergConfig{
-		Enabled:   src.Enabled,
-		Backend:   src.Backend,
-		Namespace: src.Namespace,
-		Region:    src.Region,
-	}
-	// Lakekeeper is the only supported backend; populate its fields
-	// unconditionally.
-	ic.LakekeeperEndpoint = src.LakekeeperEndpoint
-	ic.LakekeeperWarehouse = src.LakekeeperWarehouse
-	ic.LakekeeperClientID = src.LakekeeperClientID
-	ic.LakekeeperOAuth2ServerURI = src.LakekeeperOAuth2ServerURI
-	if src.LakekeeperClientCredentials.Name != "" {
-		val, err := a.readSecretValue(ctx, src.LakekeeperClientCredentials)
-		if err != nil {
-			return server.IcebergConfig{}, fmt.Errorf("resolve lakekeeper client credentials for org %q: %w", orgID, err)
-		}
-		ic.LakekeeperClientSecret = val
-	}
-	return ic, nil
 }
 
 func (a *SharedWorkerActivator) readSecretValue(ctx context.Context, ref configstore.SecretRef) (string, error) {
@@ -711,4 +674,73 @@ func orgName(org *configstore.OrgConfig) string {
 		return ""
 	}
 	return org.Name
+}
+
+// MetadataPostgresURL resolves a standard postgres:// URL for internal
+// control-plane callers of an org's DuckLake metadata Postgres (the storage
+// sampler and the explicitly enabled native metadata proxy). Mirrors the
+// resolution the worker activation uses: prefer the Duckling CR (pgbouncer
+// endpoint when present, else the direct metadata endpoint), fall back to the
+// config-store warehouse shape. sslmode follows
+// provisioner.ProbeMetadataStore's rules: "disable" through the duckling's
+// pgbouncer (plaintext worker↔pooler; the pooler carries TLS to RDS), "require"
+// against a direct RDS endpoint, "prefer" for config-store warehouses (matches
+// the DuckDB ATTACH default there). Returns an error when the org has no
+// DuckLake-enabled warehouse.
+func (a *SharedWorkerActivator) MetadataPostgresURL(ctx context.Context, orgID string) (string, error) {
+	if a.resolveDucklingStatus != nil {
+		status, err := a.resolveDucklingStatus(ctx, orgID)
+		if err == nil {
+			ducklakeEnabled := status.MetadataStore.Type != configstore.MetadataStoreKindCnpgShard
+			if status.DuckLakeEnabled != nil {
+				ducklakeEnabled = *status.DuckLakeEnabled
+			}
+			if !ducklakeEnabled {
+				return "", fmt.Errorf("org %q has DuckLake disabled", orgID)
+			}
+			if status.MetadataStore.Password == "" {
+				return "", fmt.Errorf("duckling CR %q has no metadata store password", orgID)
+			}
+			host, port, viaPgBouncer, err := ducklingMetadataStoreAddress(status, orgID)
+			if err != nil {
+				return "", err
+			}
+			sslMode := "require"
+			if viaPgBouncer {
+				sslMode = "disable"
+			}
+			return metadataPostgresURL(host, port, status.MetadataStore.User, status.MetadataStore.Password, status.MetadataStore.Database, sslMode), nil
+		}
+		slog.Debug("Duckling CR metadata resolution failed, falling back to config store.", "org", orgID, "error", err)
+	}
+
+	org, err := a.lookupOrgConfig(orgID)
+	if err != nil {
+		return "", err
+	}
+	if org.Warehouse == nil {
+		return "", fmt.Errorf("org %q has no managed warehouse", orgID)
+	}
+	password, err := a.readSecretValue(ctx, org.Warehouse.MetadataStoreCredentials)
+	if err != nil {
+		return "", fmt.Errorf("metadata store credentials for org %q: %w", orgID, err)
+	}
+	ms := org.Warehouse.MetadataStore
+	return metadataPostgresURL(ms.Endpoint, ms.Port, ms.Username, password, ms.DatabaseName, "prefer"), nil
+}
+
+// metadataPostgresURL builds a postgres:// URL for database/sql ("pgx") from
+// the same fields the DuckDB ATTACH DSN uses. url.URL handles credential
+// escaping.
+func metadataPostgresURL(host string, port int, username, password, database, sslMode string) string {
+	if port == 0 {
+		port = 5432
+	}
+	return (&url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(username, password),
+		Host:     net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:     "/" + database,
+		RawQuery: "sslmode=" + sslMode + "&connect_timeout=5",
+	}).String()
 }

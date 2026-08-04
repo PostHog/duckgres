@@ -11,6 +11,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/posthog/duckgres/server/observe"
 )
 
 func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) {
@@ -23,6 +24,7 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 	errCh := make(chan error, 1)
 	go func() {
 		_, _, err := createSessionWithRegisteredCancel(
+			context.Background(),
 			srv,
 			200*time.Millisecond,
 			key,
@@ -63,6 +65,33 @@ func TestCreateSessionWithRegisteredCancel_CancelQueryCancelsWait(t *testing.T) 
 	}
 }
 
+func TestCreateSessionWithRegisteredCancelPreservesCanceledSuccessForCleanup(t *testing.T) {
+	srv := &server.Server{}
+	server.InitMinimalServer(srv, server.Config{}, nil)
+
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	wantExecutor := &flightclient.FlightExecutor{}
+	pid, executor, err := createSessionWithRegisteredCancel(
+		parent,
+		srv,
+		time.Second,
+		server.BackendKey{Pid: 4321, SecretKey: 8765},
+		func(context.Context) (int32, *flightclient.FlightExecutor, error) {
+			// Model a grant committing concurrently with cancellation. The helper
+			// must surface cancellation without discarding the session identity
+			// the caller needs to destroy the raced session.
+			return 4321, wantExecutor, nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if pid != 4321 || executor != wantExecutor {
+		t.Fatalf("canceled success = pid %d, executor %p; want pid 4321, executor %p", pid, executor, wantExecutor)
+	}
+}
+
 func TestSessionCreationErrorResponse(t *testing.T) {
 	t.Run("cancelled", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(context.Canceled)
@@ -94,12 +123,37 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("warm capacity exhausted", func(t *testing.T) {
-		code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedError(45 * time.Second))
+	t.Run("session manager draining", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(ErrSessionManagerDraining)
+		if code != "57P03" {
+			t.Fatalf("code = %q, want 57P03", code)
+		}
+		if message != "control plane is draining, retry shortly" {
+			t.Fatalf("message = %q", message)
+		}
+	})
+
+	t.Run("request exceeds org vcpu limit", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(&configstore.OrgConnectionAdmissionRejectedError{
+			Reason:         configstore.OrgConnectionAdmissionRejectedOrgVCPU,
+			RequestedVCPUs: 4,
+			MaximumVCPUs:   2,
+		})
+		if code != "53400" {
+			t.Fatalf("code = %q, want 53400", code)
+		}
+		want := "requested worker requires 4 vCPUs, exceeding the organization limit of 2 vCPUs; request a smaller worker or raise the limit"
+		if message != want {
+			t.Fatalf("message = %q, want %q", message, want)
+		}
+	})
+
+	t.Run("worker capacity exhausted", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(NewWorkerCapacityExhaustedError(45 * time.Second))
 		if code != "53300" {
 			t.Fatalf("code = %q, want 53300", code)
 		}
-		want := "no warm Duckgres worker is currently available; retry in about 45 seconds"
+		want := "no Duckgres worker is currently available; one is being spawned, retry in about 45 seconds"
 		if message != want {
 			t.Fatalf("message = %q, want %q", message, want)
 		}
@@ -113,12 +167,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		{
 			name:    "org capacity exhausted",
 			reason:  configstore.WorkerClaimMissReasonOrgCap,
-			message: "Duckgres worker capacity for this organization is currently exhausted; retry later",
-		},
-		{
-			name:    "global capacity exhausted",
-			reason:  configstore.WorkerClaimMissReasonGlobalCap,
-			message: "Duckgres worker capacity is currently exhausted; retry later",
+			message: "your organization has reached its maximum number of concurrent Duckgres workers and they are all busy; retry once a query finishes",
 		},
 		{
 			name:    "control plane shutting down",
@@ -127,7 +176,7 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			code, message := sessionCreationErrorResponse(NewWarmCapacityExhaustedErrorForReason(tt.reason, 45*time.Second))
+			code, message := sessionCreationErrorResponse(NewWorkerCapacityExhaustedErrorForReason(tt.reason, 45*time.Second))
 			if code != "53300" {
 				t.Fatalf("code = %q, want 53300", code)
 			}
@@ -148,26 +197,192 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 	})
 }
 
-func TestWarmCapacityMissPolicyForKnownReasons(t *testing.T) {
-	for _, tt := range []struct {
-		name                string
-		reason              configstore.WorkerClaimMissReason
-		policyReason        configstore.WorkerClaimMissReason
-		recordDynamicDemand bool
+func TestControlPlaneSessionStartResult(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantOutcome string
+		wantReason  string
 	}{
-		{name: "none defaults to no_idle", reason: configstore.WorkerClaimMissReasonNone, policyReason: configstore.WorkerClaimMissReasonNoIdle, recordDynamicDemand: true},
-		{name: "no_idle", reason: configstore.WorkerClaimMissReasonNoIdle, policyReason: configstore.WorkerClaimMissReasonNoIdle, recordDynamicDemand: true},
-		{name: "org_cap", reason: configstore.WorkerClaimMissReasonOrgCap, policyReason: configstore.WorkerClaimMissReasonOrgCap, recordDynamicDemand: false},
-		{name: "global_cap", reason: configstore.WorkerClaimMissReasonGlobalCap, policyReason: configstore.WorkerClaimMissReasonGlobalCap, recordDynamicDemand: false},
-		{name: "shutting_down", reason: configstore.WorkerClaimMissReasonShuttingDown, policyReason: configstore.WorkerClaimMissReasonShuttingDown, recordDynamicDemand: false},
+		{name: "success", wantOutcome: "success", wantReason: observe.SessionStartReasonNone},
+		{name: "canceled", err: context.Canceled, wantOutcome: "canceled", wantReason: observe.SessionStartReasonCanceled},
+		{name: "deadline", err: context.DeadlineExceeded, wantOutcome: "timeout", wantReason: observe.SessionStartReasonCapacity},
+		{name: "queue timeout", err: ErrTooManyConnections, wantOutcome: "timeout", wantReason: observe.SessionStartReasonCapacity},
+		{name: "draining", err: ErrSessionManagerDraining, wantOutcome: "draining", wantReason: observe.SessionStartReasonLifecycle},
+		{name: "worker capacity", err: NewWorkerCapacityExhaustedError(time.Second), wantOutcome: "capacity", wantReason: observe.SessionStartReasonCapacity},
+		{
+			name: "admission hard rejection",
+			err: &configstore.OrgConnectionAdmissionRejectedError{
+				Reason:         configstore.OrgConnectionAdmissionRejectedOrgVCPU,
+				RequestedVCPUs: 4,
+				MaximumVCPUs:   2,
+			},
+			wantOutcome: "capacity",
+			wantReason:  observe.SessionStartReasonClient,
+		},
+		{name: "generic error", err: errors.New("bootstrap failed"), wantOutcome: "error", wantReason: observe.SessionStartReasonWorker},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOutcome, gotReason := controlPlaneSessionStartResult(tt.err)
+			if gotOutcome != tt.wantOutcome || gotReason != tt.wantReason {
+				t.Fatalf("controlPlaneSessionStartResult(%v) = (%q, %q), want (%q, %q)",
+					tt.err, gotOutcome, gotReason, tt.wantOutcome, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestControlPlaneSessionStartOperationResultPrefersContext(t *testing.T) {
+	operationErr := errors.New("metadata initialization failed")
+	tests := []struct {
+		name        string
+		contextErr  error
+		draining    bool
+		wantOutcome string
+		wantReason  string
+	}{
+		{name: "client canceled", contextErr: context.Canceled, wantOutcome: "canceled", wantReason: observe.SessionStartReasonCanceled},
+		{name: "operation timed out", contextErr: context.DeadlineExceeded, wantOutcome: "timeout", wantReason: observe.SessionStartReasonMetadataStore},
+		{name: "ordinary metadata error", wantOutcome: "error", wantReason: observe.SessionStartReasonMetadataStore},
+		{name: "draining wins", contextErr: context.Canceled, draining: true, wantOutcome: "draining", wantReason: observe.SessionStartReasonLifecycle},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOutcome, gotReason := controlPlaneSessionStartOperationResult(
+				operationErr,
+				tt.contextErr,
+				tt.draining,
+				observe.SessionStartReasonMetadataStore,
+			)
+			if gotOutcome != tt.wantOutcome || gotReason != tt.wantReason {
+				t.Fatalf("operation result = (%q, %q), want (%q, %q)",
+					gotOutcome, gotReason, tt.wantOutcome, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestMissingOrgStackReason(t *testing.T) {
+	tests := []struct {
+		name      string
+		state     string
+		orgExists bool
+		want      string
+	}{
+		{name: "missing org", orgExists: false, want: observe.SessionStartReasonClient},
+		{name: "legacy ready state", orgExists: true, state: "", want: observe.SessionStartReasonControlPlane},
+		{name: "ready warehouse", orgExists: true, state: string(configstore.ManagedWarehouseStateReady), want: observe.SessionStartReasonControlPlane},
+		{name: "failed provisioning", orgExists: true, state: string(configstore.ManagedWarehouseStateFailed), want: observe.SessionStartReasonLifecycle},
+		{name: "deleting", orgExists: true, state: string(configstore.ManagedWarehouseStateDeleting), want: observe.SessionStartReasonLifecycle},
+		{name: "resharding", orgExists: true, state: string(configstore.ManagedWarehouseStateResharding), want: observe.SessionStartReasonLifecycle},
+		{name: "pending", orgExists: true, state: string(configstore.ManagedWarehouseStatePending), want: observe.SessionStartReasonLifecycle},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := missingOrgStackReason(tt.state, tt.orgExists); got != tt.want {
+				t.Fatalf("missingOrgStackReason(%q, %t) = %q, want %q", tt.state, tt.orgExists, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBeginSessionDrainMarksControlPlaneDraining(t *testing.T) {
+	sessions := NewSessionManager(nil, nil)
+	cp := &ControlPlane{sessions: sessions}
+	if cp.isDraining() {
+		t.Fatal("new control plane unexpectedly reports draining")
+	}
+
+	cp.beginSessionDrain()
+
+	if !cp.isDraining() {
+		t.Fatal("beginSessionDrain must make subsequent connection checks fail closed")
+	}
+	if !sessions.lifecycle.isClosed() {
+		t.Fatal("beginSessionDrain must close the session manager lifecycle")
+	}
+}
+
+func TestControlPlanePreReadyLifecycleLinearizesWithDrain(t *testing.T) {
+	t.Run("drain wins", func(t *testing.T) {
+		cp := &ControlPlane{}
+		ctx, finish, err := cp.beginPreReadyHandshake(context.Background())
+		if err != nil {
+			t.Fatalf("begin pre-ready handshake: %v", err)
+		}
+
+		cp.beginSessionDrain()
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("drain did not cancel the pre-ready handshake")
+		}
+		if !finish() {
+			t.Fatal("pre-ready finish must report that drain linearized first")
+		}
+
+		if _, _, err := cp.beginPreReadyHandshake(context.Background()); !errors.Is(err, ErrSessionManagerDraining) {
+			t.Fatalf("begin after drain error = %v, want %v", err, ErrSessionManagerDraining)
+		}
+	})
+
+	t.Run("handshake wins", func(t *testing.T) {
+		cp := &ControlPlane{}
+		_, finish, err := cp.beginPreReadyHandshake(context.Background())
+		if err != nil {
+			t.Fatalf("begin pre-ready handshake: %v", err)
+		}
+		if finish() {
+			t.Fatal("pre-ready finish unexpectedly reported drain")
+		}
+
+		cp.beginSessionDrain()
+		if finish() {
+			t.Fatal("repeated finish changed the original linearization result")
+		}
+	})
+}
+
+func TestBeginUpgradeDrainClosesPreReadyLifecycleSynchronously(t *testing.T) {
+	cp := &ControlPlane{}
+	ctx, finish, err := cp.beginPreReadyHandshake(context.Background())
+	if err != nil {
+		t.Fatalf("begin pre-ready handshake: %v", err)
+	}
+
+	cp.beginUpgradeDrain()
+	if !cp.upgradeDraining.Load() {
+		t.Fatal("upgrade drain flag was not set")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("upgrade drain did not cancel the pre-ready handshake")
+	}
+	if !finish() {
+		t.Fatal("pre-ready finish must report that upgrade drain linearized first")
+	}
+}
+
+func TestCapacityMissPolicyForKnownReasons(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		reason       configstore.WorkerClaimMissReason
+		policyReason configstore.WorkerClaimMissReason
+	}{
+		{name: "none defaults to no_idle", reason: configstore.WorkerClaimMissReasonNone, policyReason: configstore.WorkerClaimMissReasonNoIdle},
+		{name: "no_idle", reason: configstore.WorkerClaimMissReasonNoIdle, policyReason: configstore.WorkerClaimMissReasonNoIdle},
+		{name: "org_cap", reason: configstore.WorkerClaimMissReasonOrgCap, policyReason: configstore.WorkerClaimMissReasonOrgCap},
+		{name: "shutting_down", reason: configstore.WorkerClaimMissReasonShuttingDown, policyReason: configstore.WorkerClaimMissReasonShuttingDown},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			policy := warmCapacityMissPolicyForReason(tt.reason)
+			policy := capacityMissPolicyForReason(tt.reason)
 			if policy.reason != tt.policyReason {
 				t.Fatalf("policy reason = %q, want %q", policy.reason, tt.policyReason)
-			}
-			if policy.recordDynamicDemand != tt.recordDynamicDemand {
-				t.Fatalf("recordDynamicDemand = %v, want %v", policy.recordDynamicDemand, tt.recordDynamicDemand)
 			}
 		})
 	}

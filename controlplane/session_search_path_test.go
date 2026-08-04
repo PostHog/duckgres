@@ -1,24 +1,29 @@
 package controlplane
 
-import "testing"
+import (
+	"testing"
 
-func TestEffectiveSessionDefaultCommandUsesClientSearchPathBeforeCatalog(t *testing.T) {
-	got, source := effectiveSessionDefaultCommand("ducklake.main", "iceberg")
-	if got != "SET search_path = 'ducklake.main,memory.main'" {
-		t.Fatalf("command = %q, want SET search_path = 'ducklake.main,memory.main'", got)
+	"github.com/posthog/duckgres/server"
+)
+
+func TestAuthorizedClientSearchPath(t *testing.T) {
+	if got := authorizedClientSearchPath("team_7", &server.QueryAccessPolicy{ReadOnly: true}); got != "" {
+		t.Fatalf("scoped search path = %q, want empty", got)
 	}
-	if source != sessionSearchPathSourceClient {
-		t.Fatalf("source = %q, want %q", source, sessionSearchPathSourceClient)
+	if got := authorizedClientSearchPath("analytics", nil); got != "analytics" {
+		t.Fatalf("unscoped search path = %q, want analytics", got)
 	}
 }
 
-func TestEffectiveSessionDefaultCommandUsesIcebergCatalogWhenClientOmitted(t *testing.T) {
-	got, source := effectiveSessionDefaultCommand("", "iceberg")
-	if got != "USE iceberg.public" {
-		t.Fatalf("command = %q, want USE iceberg.public", got)
+func TestEffectiveSessionDefaultCommandDuckLakeClientSearchPathOnly(t *testing.T) {
+	// DuckLake's catalog switch is owned by InitSessionDatabaseMetadata's defer,
+	// so a client search_path is applied alone and best-effort.
+	got, source := effectiveSessionDefaultCommand("analytics", "ducklake")
+	if got != "SET search_path = 'analytics,memory.main'" {
+		t.Fatalf("command = %q, want SET search_path = 'analytics,memory.main'", got)
 	}
-	if source != sessionDefaultSourceConfiguredCatalog {
-		t.Fatalf("source = %q, want %q", source, sessionDefaultSourceConfiguredCatalog)
+	if source != sessionSearchPathSourceClient {
+		t.Fatalf("source = %q, want %q", source, sessionSearchPathSourceClient)
 	}
 }
 
@@ -36,12 +41,11 @@ func TestEffectiveSessionDefaultCommandEmptyForDuckLake(t *testing.T) {
 
 func TestPassthroughSessionDefaultCatalogCommand(t *testing.T) {
 	tests := []struct {
-		name            string
+		name             string
 		effectiveCatalog string
-		want            string
+		want             string
 	}{
 		{name: "ducklake selected", effectiveCatalog: "ducklake", want: "USE ducklake"},
-		{name: "iceberg selected", effectiveCatalog: "iceberg", want: "USE iceberg.public"},
 		{name: "nothing resolved leaves session as-is", effectiveCatalog: "", want: ""},
 	}
 	for _, tt := range tests {
@@ -55,27 +59,21 @@ func TestPassthroughSessionDefaultCatalogCommand(t *testing.T) {
 
 func TestResolveEffectiveCatalog(t *testing.T) {
 	tests := []struct {
-		name           string
-		requested      string
-		defaultCatalog string
-		duckLake       bool
-		iceberg        bool
-		want           string
-		wantOK         bool
+		name      string
+		requested string
+		duckLake  bool
+		want      string
+		wantOK    bool
 	}{
-		{name: "explicit ducklake attached", requested: "ducklake", duckLake: true, iceberg: true, want: "ducklake", wantOK: true},
-		{name: "explicit iceberg attached", requested: "iceberg", duckLake: true, iceberg: true, want: "iceberg", wantOK: true},
-		{name: "explicit ducklake not attached", requested: "ducklake", duckLake: false, iceberg: true, want: "", wantOK: false},
-		{name: "explicit iceberg not attached", requested: "iceberg", duckLake: true, iceberg: false, want: "", wantOK: false},
-		{name: "default prefers ducklake", requested: "", duckLake: true, iceberg: true, want: "ducklake", wantOK: true},
-		{name: "default honors per-user iceberg", requested: "", defaultCatalog: "iceberg", duckLake: true, iceberg: true, want: "iceberg", wantOK: true},
-		{name: "configured iceberg default not attached fails closed", requested: "", defaultCatalog: "iceberg", duckLake: true, iceberg: false, want: "", wantOK: false},
-		{name: "default falls back to iceberg-only", requested: "", duckLake: false, iceberg: true, want: "iceberg", wantOK: true},
-		{name: "nothing attached fails", requested: "", duckLake: false, iceberg: false, want: "", wantOK: false},
+		{name: "explicit ducklake attached", requested: "ducklake", duckLake: true, want: "ducklake", wantOK: true},
+		{name: "explicit ducklake not attached", requested: "ducklake", duckLake: false, want: "", wantOK: false},
+		{name: "default resolves to ducklake", requested: "", duckLake: true, want: "ducklake", wantOK: true},
+		{name: "nothing attached fails", requested: "", duckLake: false, want: "", wantOK: false},
+		{name: "iceberg is no longer a resolvable catalog", requested: "iceberg", duckLake: true, want: "", wantOK: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := resolveEffectiveCatalog(tt.requested, tt.defaultCatalog, tt.duckLake, tt.iceberg)
+			got, ok := resolveEffectiveCatalog(tt.requested, tt.duckLake)
 			if got != tt.want || ok != tt.wantOK {
 				t.Fatalf("resolveEffectiveCatalog = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.wantOK)
 			}

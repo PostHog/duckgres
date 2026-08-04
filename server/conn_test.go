@@ -37,7 +37,7 @@ func TestIsDuckDBUtilityCommand(t *testing.T) {
 		// they fell through to pg_query and failed with a syntax error on the
 		// PERSISTENT/TEMPORARY keyword.
 		{"drop persistent secret", `DROP PERSISTENT SECRET foo`, true},
-		{"drop persistent secret if exists quoted", `DROP PERSISTENT SECRET IF EXISTS "portola_warehouse_prod_s3"`, true},
+		{"drop persistent secret if exists quoted", `DROP PERSISTENT SECRET IF EXISTS "tenant_alpha_warehouse_prod_s3"`, true},
 		{"drop temporary secret", `DROP TEMPORARY SECRET foo`, true},
 		{"drop temporary secret if exists", `DROP TEMPORARY SECRET IF EXISTS foo`, true},
 		{"case insensitive", `drop persistent secret foo`, true},
@@ -1907,92 +1907,6 @@ func TestHandleExecuteAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
 		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedExecContextCalls)
 	}
 }
-
-func TestHandleExecuteUsesCompatibilityFallbackForIcebergDropSchemaCascade(t *testing.T) {
-	clientSide, serverSide := net.Pipe()
-	defer func() { _ = clientSide.Close() }()
-	defer func() { _ = serverSide.Close() }()
-
-	const query = "DROP SCHEMA IF EXISTS fivetran_testing_schema_abc CASCADE"
-	executor := &extendedDropSchemaCascadeFallbackExecutor{}
-
-	var out bytes.Buffer
-	c := &clientConn{
-		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
-		conn:     clientSide,
-		reader:   bufio.NewReader(clientSide),
-		writer:   bufio.NewWriter(&out),
-		ctx:      context.Background(),
-		cancel:   func() {},
-		txStatus: txStatusIdle,
-		executor: executor,
-		portals: map[string]*portal{
-			"p": {
-				stmt: &preparedStmt{
-					query:          query,
-					convertedQuery: query,
-				},
-			},
-		},
-	}
-
-	var body bytes.Buffer
-	body.WriteString("p")
-	body.WriteByte(0)
-	if err := binary.Write(&body, binary.BigEndian, int32(0)); err != nil {
-		t.Fatalf("encode execute body: %v", err)
-	}
-
-	c.handleExecute(body.Bytes())
-
-	if code, ok := errorResponseField(out.Bytes(), 'C'); ok {
-		t.Fatalf("unexpected ErrorResponse SQLSTATE %q", code)
-	}
-	if !slices.Equal(executor.execCalls, []string{query}) {
-		t.Fatalf("Exec calls = %v, want original query only", executor.execCalls)
-	}
-	wantExecContext := []string{`DROP SCHEMA IF EXISTS "iceberg"."fivetran_testing_schema_abc"`}
-	if !slices.Equal(executor.execContextCalls, wantExecContext) {
-		t.Fatalf("ExecContext calls = %v, want %v", executor.execContextCalls, wantExecContext)
-	}
-}
-
-type extendedDropSchemaCascadeFallbackExecutor struct {
-	noopProfiling
-	execCalls        []string
-	execContextCalls []string
-}
-
-func (e *extendedDropSchemaCascadeFallbackExecutor) QueryContext(_ context.Context, query string, _ ...any) (RowSet, error) {
-	if strings.Contains(query, "duckdb_settings()") {
-		return &icebergDropSchemaCascadeRows{values: []string{`"iceberg"."public",memory.main`}}, nil
-	}
-	return &icebergDropSchemaCascadeRows{values: nil}, nil
-}
-
-func (e *extendedDropSchemaCascadeFallbackExecutor) ExecContext(_ context.Context, query string, _ ...any) (ExecResult, error) {
-	e.execContextCalls = append(e.execContextCalls, strings.TrimSpace(query))
-	return &fakeExecResult{}, nil
-}
-
-func (e *extendedDropSchemaCascadeFallbackExecutor) Query(string, ...any) (RowSet, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (e *extendedDropSchemaCascadeFallbackExecutor) Exec(query string, _ ...any) (ExecResult, error) {
-	e.execCalls = append(e.execCalls, strings.TrimSpace(query))
-	return nil, errors.New("flight execute update: rpc error: code = InvalidArgument desc = failed to execute update: Not implemented Error: DROP SCHEMA <schema_name> CASCADE is not supported for Iceberg schemas currently")
-}
-
-func (e *extendedDropSchemaCascadeFallbackExecutor) ConnContext(context.Context) (RawConn, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (e *extendedDropSchemaCascadeFallbackExecutor) PingContext(context.Context) error {
-	return errors.New("not implemented")
-}
-
-func (e *extendedDropSchemaCascadeFallbackExecutor) Close() error { return nil }
 
 func TestHandleExecuteRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
@@ -3933,6 +3847,58 @@ func TestPgStatActivityColumnsAndOIDs(t *testing.T) {
 		if !found {
 			t.Errorf("expected column %q not found in pgStatActivityColumns", name)
 		}
+	}
+}
+
+func TestProjectReaderPgStatActivityCTECannotSeeOtherConnections(t *testing.T) {
+	var output bytes.Buffer
+	srv := &Server{conns: make(map[int32]*clientConn)}
+	reader := &clientConn{
+		server:   srv,
+		writer:   bufio.NewWriter(&output),
+		ctx:      context.Background(),
+		username: "project-reader-a",
+		orgID:    "org-a",
+		pid:      100,
+		txStatus: txStatusIdle,
+		queryAccessPolicy: &QueryAccessPolicy{
+			ReadOnly:       true,
+			AllowedSchemas: []string{"team_1"},
+		},
+	}
+	sameProject := &clientConn{username: "project-reader-a", orgID: "org-a", pid: 101}
+	sameProject.currentQuery.Store("same-project-visible-marker")
+	otherProject := &clientConn{username: "project-reader-b", orgID: "org-a", pid: 102}
+	otherProject.currentQuery.Store("same-org-hidden-marker")
+	otherOrg := &clientConn{username: "project-reader-a", orgID: "org-b", pid: 103}
+	otherOrg.currentQuery.Store("other-org-hidden-marker")
+
+	for _, conn := range []*clientConn{reader, sameProject, otherProject, otherOrg} {
+		srv.registerConn(conn)
+	}
+
+	query := "WITH pg_stat_activity AS (SELECT * FROM team_1.events) SELECT * FROM pg_stat_activity"
+	if err := reader.handleQuery([]byte(query + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+
+	if !bytes.Contains(output.Bytes(), []byte("same-project-visible-marker")) {
+		t.Fatal("project reader should see sessions for its own project credential")
+	}
+	for _, hidden := range []string{"same-org-hidden-marker", "other-org-hidden-marker"} {
+		if bytes.Contains(output.Bytes(), []byte(hidden)) {
+			t.Fatalf("project reader saw another project's pg_stat_activity row %q", hidden)
+		}
+	}
+}
+
+func TestSetQueryAccessPolicyDisablesPassthrough(t *testing.T) {
+	conn := &clientConn{passthrough: true}
+
+	SetQueryAccessPolicy(conn, &QueryAccessPolicy{ReadOnly: true})
+
+	if conn.passthrough {
+		t.Fatal("project-scoped connections must never use passthrough mode")
 	}
 }
 

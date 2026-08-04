@@ -33,41 +33,64 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 	return &PgCatalogTransform{
 		DuckLakeMode: duckLakeMode,
 		ViewMappings: map[string]string{
-			"pg_class":              "pg_class_full",
-			"pg_database":           "pg_database",
-			"pg_namespace":          "pg_namespace",
-			"pg_collation":          "pg_collation",
-			"pg_policy":             "pg_policy",
-			"pg_roles":              "pg_roles",
-			"pg_statistic_ext":      "pg_statistic_ext",
-			"pg_publication_tables": "pg_publication_tables",
-			"pg_rules":              "pg_rules",
-			"pg_publication":        "pg_publication",
-			"pg_publication_rel":    "pg_publication_rel",
-			"pg_inherits":           "pg_inherits",
-			"pg_matviews":           "pg_matviews",
-			"pg_stat_user_tables":   "pg_stat_user_tables",
-			"pg_statio_user_tables": "pg_statio_user_tables",
-			"pg_stat_statements":    "pg_stat_statements",
-			"pg_partitioned_table":  "pg_partitioned_table",
-			"pg_type":               "pg_type",
-			"pg_attribute":          "pg_attribute",
-			"pg_constraint":         "pg_constraint",
-			"pg_enum":               "pg_enum",
-			"pg_indexes":            "pg_indexes",
-			"pg_stat_activity":      "pg_stat_activity",
-			"pg_shdescription":          "pg_shdescription",
-			"pg_auth_members":           "pg_auth_members",
-			"pg_opclass":                "pg_opclass",
-			"pg_conversion":             "pg_conversion",
-			"pg_language":               "pg_language",
-			"pg_extension":              "pg_extension",
-			"pg_foreign_server":         "pg_foreign_server",
-			"pg_foreign_data_wrapper":   "pg_foreign_data_wrapper",
-			"pg_foreign_table":          "pg_foreign_table",
-			"pg_trigger":                "pg_trigger",
-			"pg_locks":                  "pg_locks",
-			"pg_rewrite":                "pg_rewrite",
+			"pg_class":                "pg_class_full",
+			"pg_database":             "pg_database",
+			"pg_namespace":            "pg_namespace",
+			"pg_tables":               "pg_tables",
+			"pg_views":                "pg_views",
+			"pg_sequences":            "pg_sequences",
+			"pg_collation":            "pg_collation",
+			"pg_policy":               "pg_policy",
+			"pg_roles":                "pg_roles",
+			"pg_statistic_ext":        "pg_statistic_ext",
+			"pg_publication_tables":   "pg_publication_tables",
+			"pg_rules":                "pg_rules",
+			"pg_publication":          "pg_publication",
+			"pg_publication_rel":      "pg_publication_rel",
+			"pg_inherits":             "pg_inherits",
+			"pg_matviews":             "pg_matviews",
+			"pg_stat_user_tables":     "pg_stat_user_tables",
+			"pg_statio_user_tables":   "pg_statio_user_tables",
+			"pg_stat_statements":      "pg_stat_statements",
+			"pg_partitioned_table":    "pg_partitioned_table",
+			"pg_type":                 "pg_type",
+			"pg_attribute":            "pg_attribute",
+			"pg_index":                "pg_index",
+			"pg_constraint":           "pg_constraint",
+			"pg_enum":                 "pg_enum",
+			"pg_indexes":              "pg_indexes",
+			"pg_stat_activity":        "pg_stat_activity",
+			"pg_shdescription":        "pg_shdescription",
+			"pg_auth_members":         "pg_auth_members",
+			"pg_opclass":              "pg_opclass",
+			"pg_conversion":           "pg_conversion",
+			"pg_language":             "pg_language",
+			"pg_extension":            "pg_extension",
+			"pg_foreign_server":       "pg_foreign_server",
+			"pg_foreign_data_wrapper": "pg_foreign_data_wrapper",
+			"pg_foreign_table":        "pg_foreign_table",
+			"pg_trigger":              "pg_trigger",
+			"pg_locks":                "pg_locks",
+			"pg_rewrite":              "pg_rewrite",
+			// Stub relations created by initPgCatalog for tool/driver introspection
+			// (server/catalog.go); identity mappings so DuckLake mode resolves them.
+			"pg_user":                 "pg_user",
+			"pg_shadow":               "pg_shadow",
+			"pg_authid":               "pg_authid",
+			"pg_cast":                 "pg_cast",
+			"pg_operator":             "pg_operator",
+			"pg_aggregate":            "pg_aggregate",
+			"pg_event_trigger":        "pg_event_trigger",
+			"pg_available_extensions": "pg_available_extensions",
+			"pg_timezone_names":       "pg_timezone_names",
+			"pg_stat_database":        "pg_stat_database",
+			"pg_stat_all_tables":      "pg_stat_all_tables",
+			"pg_replication_slots":    "pg_replication_slots",
+			"pg_db_role_setting":      "pg_db_role_setting",
+			"pg_default_acl":          "pg_default_acl",
+			"pg_range":                "pg_range",
+			"pg_largeobject":          "pg_largeobject",
+			"pg_cursors":              "pg_cursors",
 		},
 		Functions: map[string]bool{
 			"pg_get_userbyid":                 true,
@@ -102,6 +125,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"worker_version":                  true, // Worker process version
 			"div":                             true, // Integer division macro
 			"array_remove":                    true, // Remove element from array macro
+			"array_lower":                     true, // PostgreSQL array lower-bound compatibility macro
 			"to_number":                       true, // Parse formatted number string macro
 			"pg_backend_pid":                  true, // Backend process ID macro
 			"pg_total_relation_size":          true, // Total table size stub
@@ -116,12 +140,65 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_ident":                     true, // Quote identifier
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
+			// PostgreSQL builtin-compat macros
+			"set_config":                         true, // Session-setting writer (value-returning)
+			"uuid_generate_v4":                   true, // uuid-ossp v4 alias
+			"statement_timestamp":                true, // now() alias
+			"timeofday":                          true, // PG-shaped wall-clock text
+			"pg_get_function_arguments":          true, // \df signature stub
+			"pg_get_function_result":             true, // \df result-type stub
+			"pg_get_function_identity_arguments": true, // identity-arg stub
+			"pg_get_triggerdef":                  true, // Trigger DDL stub (NULL)
+			"pg_jit_available":                   true, // JIT stub (false)
+			"row_security_active":                true, // RLS stub (false)
+			"pg_collation_for":                   true, // Collation stub
+			"pg_input_is_valid":                  true, // Bounded input validator
+			"to_regclass":                        true, // Name->oid probe
+			"to_regtype":                         true, // Type-name->oid probe
+			"to_regproc":                         true, // Function-name->oid probe
+			"jsonb_pretty":                       true, // Indented JSON
+			"json_typeof":                        true, // PG-vocabulary JSON type name
+			"jsonb_typeof":                       true, // PG-vocabulary JSON type name
+			"duckgres_string_to_array3":          true, // 3-arg string_to_array (nullstr)
+			"to_ascii":                           true, // Accent-stripping transliteration
+			"convert_from":                       true, // bytea->text (UTF8)
+			"width_bucket":                       true, // Equi-width histogram bucketing
+			"scale":                              true, // Numeric scale
+			"min_scale":                          true, // Numeric min scale
+			"masklen":                            true, // inet prefix length
+			"hostmask":                           true, // inet host mask
+			"set_masklen":                        true, // inet set prefix length
+			"inet_same_family":                   true, // inet family compare
+			"array_positions":                    true, // indices of all matching elements
+			"array_replace":                      true, // replace all matching elements
+			"array_fill":                         true, // 1-D fill
+			"trim_array":                         true, // drop last n elements
+			"array_dims":                         true, // 1-D bounds string
+			"date_bin":                           true, // bin timestamp to stride
+			"make_interval":                      true, // interval from components
+			"justify_hours":                      true, // roll 24h into days
+			"justify_days":                       true, // roll 30d into months
+			"justify_interval":                   true, // roll hours and days
+			"decode":                             true, // bytea decode (base64/hex/escape) macro
+			"encode":                             true, // bytea encode (base64/hex/escape) macro
+			"inet_server_addr":                   true, // INET-typed NULL stub
+			"json_array_elements":                true, // SRF: array elements (json)
+			"jsonb_array_elements":               true, // SRF: array elements (jsonb)
+			"json_array_elements_text":           true, // SRF: array elements (text)
+			"jsonb_each":                         true, // SRF: object key/value (json)
+			"json_each_text":                     true, // SRF: object key/value (text)
+			"pg_options_to_table":                true, // SRF: reloptions split
+			"aclexplode":                         true, // SRF: ACL explode (empty)
+			"pg_get_keywords":                    true, // SRF: keyword catalog
+			"pg_identify_object":                 true, // object address -> identity row
 		},
 		// Our custom macros that are created in memory.main and need explicit qualification
 		// in DuckLake mode. These are NOT built-in DuckDB pg_catalog functions.
 		// IMPORTANT: Keep in sync with macros defined in server/catalog.go initPgCatalog()
 		CustomMacros: map[string]bool{
 			"pg_get_userbyid":                 true,
+			"pg_table_is_visible":             true, // search-path visibility stub (catalog.go initPgCatalog)
+			"array_to_string":                 true, // dual-arity macro (3-arg nullstr form) in catalog.go
 			"pg_encoding_to_char":             true,
 			"pg_is_in_recovery":               true,
 			"pg_relation_is_publishable":      true,
@@ -146,6 +223,7 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"worker_version":                  true, // Worker process version
 			"div":                             true, // Integer division
 			"array_remove":                    true, // Remove element from array
+			"array_lower":                     true, // PostgreSQL array lower-bound compatibility
 			"to_number":                       true, // Parse formatted number string
 			"pg_backend_pid":                  true, // Backend process ID
 			"pg_stat_get_numscans":            true, // Index/table scan count
@@ -160,33 +238,84 @@ func NewPgCatalogTransformWithConfig(duckLakeMode bool) *PgCatalogTransform {
 			"quote_ident":                     true, // Quote identifier
 			"quote_literal":                   true, // Quote literal
 			"quote_nullable":                  true, // Quote nullable value
+			// PostgreSQL builtin-compat macros
+			"set_config":                         true, // Session-setting writer (value-returning)
+			"uuid_generate_v4":                   true, // uuid-ossp v4 alias
+			"statement_timestamp":                true, // now() alias
+			"timeofday":                          true, // PG-shaped wall-clock text
+			"pg_get_function_arguments":          true, // \df signature stub
+			"pg_get_function_result":             true, // \df result-type stub
+			"pg_get_function_identity_arguments": true, // identity-arg stub
+			"pg_get_triggerdef":                  true, // Trigger DDL stub (NULL)
+			"pg_jit_available":                   true, // JIT stub (false)
+			"row_security_active":                true, // RLS stub (false)
+			"pg_collation_for":                   true, // Collation stub
+			"pg_input_is_valid":                  true, // Bounded input validator
+			"to_regclass":                        true, // Name->oid probe
+			"to_regtype":                         true, // Type-name->oid probe
+			"to_regproc":                         true, // Function-name->oid probe
+			"jsonb_pretty":                       true, // Indented JSON
+			"json_typeof":                        true, // PG-vocabulary JSON type name
+			"jsonb_typeof":                       true, // PG-vocabulary JSON type name
+			"duckgres_string_to_array3":          true, // 3-arg string_to_array (nullstr)
+			"to_ascii":                           true, // Accent-stripping transliteration
+			"convert_from":                       true, // bytea->text (UTF8)
+			"width_bucket":                       true, // Equi-width histogram bucketing
+			"scale":                              true, // Numeric scale
+			"min_scale":                          true, // Numeric min scale
+			"masklen":                            true, // inet prefix length
+			"hostmask":                           true, // inet host mask
+			"set_masklen":                        true, // inet set prefix length
+			"inet_same_family":                   true, // inet family compare
+			"array_positions":                    true, // indices of all matching elements
+			"array_replace":                      true, // replace all matching elements
+			"array_fill":                         true, // 1-D fill
+			"trim_array":                         true, // drop last n elements
+			"array_dims":                         true, // 1-D bounds string
+			"date_bin":                           true, // bin timestamp to stride
+			"make_interval":                      true, // interval from components
+			"justify_hours":                      true, // roll 24h into days
+			"justify_days":                       true, // roll 30d into months
+			"justify_interval":                   true, // roll hours and days
+			"decode":                             true, // bytea decode (base64/hex/escape) macro
+			"encode":                             true, // bytea encode (base64/hex/escape) macro
+			"inet_server_addr":                   true, // INET-typed NULL stub
+			"json_array_elements":                true, // SRF: array elements (json)
+			"jsonb_array_elements":               true, // SRF: array elements (jsonb)
+			"json_array_elements_text":           true, // SRF: array elements (text)
+			"jsonb_each":                         true, // SRF: object key/value (json)
+			"json_each_text":                     true, // SRF: object key/value (text)
+			"pg_options_to_table":                true, // SRF: reloptions split
+			"aclexplode":                         true, // SRF: ACL explode (empty)
+			"pg_get_keywords":                    true, // SRF: keyword catalog
+			"pg_identify_object":                 true, // object address -> identity row
 
 			// ClickHouse SQL macros (server/chsql.go initClickHouseMacros)
-			"tostring":        true,
-			"toint32":         true,
-			"toint64":         true,
-			"tofloat":         true,
-			"toint32ornull":   true,
-			"toint32orzero":   true,
-			"intdiv":          true,
-			"modulo":          true,
-			"empty":           true,
-			"notempty":        true,
-			"splitbychar":     true,
-			"lengthutf8":      true,
-			"toyear":          true,
-			"tomonth":         true,
-			"todayofmonth":    true,
-			"toyyyymmdd":      true,
-			"toyyyymm":        true,
-			"protocol":        true,
-			"domain":          true,
-			"topleveldomain":  true,
-			"ipv4numtostring": true,
+			"tostring":          true,
+			"toint32":           true,
+			"toint64":           true,
+			"tofloat":           true,
+			"toint32ornull":     true,
+			"toint32orzero":     true,
+			"intdiv":            true,
+			"modulo":            true,
+			"empty":             true,
+			"notempty":          true,
+			"splitbychar":       true,
+			"lengthutf8":        true,
+			"toyear":            true,
+			"tomonth":           true,
+			"todayofmonth":      true,
+			"toyyyymmdd":        true,
+			"toyyyymm":          true,
+			"protocol":          true,
+			"domain":            true,
+			"topleveldomain":    true,
+			"ipv4numtostring":   true,
 			"jsonextractstring": true,
-			"jsonhas":         true,
-			"generateuuidv4":  true,
-			"ifnull":          true,
+			"jsonhas":           true,
+			"generateuuidv4":    true,
+			"ifnull":            true,
 		},
 	}
 }

@@ -8,64 +8,41 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestDockerComposeIncludesLakekeeperStack(t *testing.T) {
+// TestDockerComposeCoreStack guards the shape of the integration compose
+// stack: the comparison Postgres, the DuckLake metadata Postgres, and the
+// MinIO object store the DuckLake tests run against.
+func TestDockerComposeCoreStack(t *testing.T) {
 	compose := readCompose(t)
 
-	metadata := serviceNamed(t, compose, "lakekeeper-metadata")
+	postgres := serviceNamed(t, compose, "postgres")
+	if postgres.Image != "postgres:16-alpine" {
+		t.Fatalf("postgres image = %q, want postgres:16-alpine", postgres.Image)
+	}
+	if !containsString(postgres.Ports, "35432:5432") {
+		t.Fatalf("postgres ports = %#v, want 35432:5432", postgres.Ports)
+	}
+
+	metadata := serviceNamed(t, compose, "ducklake-metadata")
 	if metadata.Image != "postgres:16-alpine" {
-		t.Fatalf("lakekeeper-metadata image = %q, want postgres:16-alpine", metadata.Image)
+		t.Fatalf("ducklake-metadata image = %q, want postgres:16-alpine", metadata.Image)
 	}
-	if got := envString(metadata.Environment, "POSTGRES_DB"); got != "lakekeeper" {
-		t.Fatalf("lakekeeper-metadata POSTGRES_DB = %q, want lakekeeper", got)
+	if got := envString(metadata.Environment, "POSTGRES_DB"); got != "ducklake" {
+		t.Fatalf("ducklake-metadata POSTGRES_DB = %q, want ducklake", got)
 	}
-	if !containsString(metadata.Ports, "35434:5432") {
-		t.Fatalf("lakekeeper-metadata ports = %#v, want 35434:5432", metadata.Ports)
-	}
-
-	migrate := serviceNamed(t, compose, "lakekeeper-migrate")
-	if migrate.Image != lakekeeperImage {
-		t.Fatalf("lakekeeper-migrate image = %q, want %s", migrate.Image, lakekeeperImage)
-	}
-	if !commandContains(migrate.Command, "migrate") {
-		t.Fatalf("lakekeeper-migrate command = %#v, want migrate", migrate.Command)
-	}
-	if _, ok := migrate.DependsOn["lakekeeper-metadata"]; !ok {
-		t.Fatalf("lakekeeper-migrate depends_on = %#v, want lakekeeper-metadata", migrate.DependsOn)
+	if !containsString(metadata.Ports, "35433:5432") {
+		t.Fatalf("ducklake-metadata ports = %#v, want 35433:5432", metadata.Ports)
 	}
 
-	lakekeeper := serviceNamed(t, compose, "lakekeeper")
-	if lakekeeper.Image != lakekeeperImage {
-		t.Fatalf("lakekeeper image = %q, want %s", lakekeeper.Image, lakekeeperImage)
-	}
-	if !commandContains(lakekeeper.Command, "serve") {
-		t.Fatalf("lakekeeper command = %#v, want serve", lakekeeper.Command)
-	}
-	if !containsString(lakekeeper.Ports, "38181:8181") {
-		t.Fatalf("lakekeeper ports = %#v, want 38181:8181", lakekeeper.Ports)
-	}
-	if _, ok := lakekeeper.DependsOn["lakekeeper-migrate"]; !ok {
-		t.Fatalf("lakekeeper depends_on = %#v, want lakekeeper-migrate", lakekeeper.DependsOn)
+	minio := serviceNamed(t, compose, "minio")
+	if !containsString(minio.Ports, "39000:9000") {
+		t.Fatalf("minio ports = %#v, want 39000:9000", minio.Ports)
 	}
 
-	wantEnv := map[string]string{
-		"LAKEKEEPER__PG_DATABASE_URL_READ":   "postgres://lakekeeper:lakekeeper@lakekeeper-metadata:5432/lakekeeper",
-		"LAKEKEEPER__PG_DATABASE_URL_WRITE":  "postgres://lakekeeper:lakekeeper@lakekeeper-metadata:5432/lakekeeper",
-		"LAKEKEEPER__PG_ENCRYPTION_KEY":      "duckgres-local-lakekeeper-key-32",
-		"LAKEKEEPER__BASE_URI":               "http://localhost:38181",
-		"LAKEKEEPER__ENABLE_DEFAULT_PROJECT": "true",
-		"LAKEKEEPER__AUTHZ_BACKEND":          "allowall",
-	}
-	for key, want := range wantEnv {
-		if got := envString(lakekeeper.Environment, key); got != want {
-			t.Fatalf("lakekeeper %s = %q, want %q", key, got, want)
-		}
-		if got := envString(migrate.Environment, key); got != want {
-			t.Fatalf("lakekeeper-migrate %s = %q, want %q", key, got, want)
-		}
+	minioInit := serviceNamed(t, compose, "minio-init")
+	if _, ok := minioInit.DependsOn["minio"]; !ok {
+		t.Fatalf("minio-init depends_on = %#v, want minio", minioInit.DependsOn)
 	}
 }
-
-const lakekeeperImage = "quay.io/lakekeeper/catalog:v0.12.2"
 
 type composeFile struct {
 	Services map[string]service `yaml:"services"`
@@ -73,7 +50,6 @@ type composeFile struct {
 
 type service struct {
 	Image       string         `yaml:"image"`
-	Command     any            `yaml:"command"`
 	Ports       []string       `yaml:"ports"`
 	Environment map[string]any `yaml:"environment"`
 	DependsOn   map[string]any `yaml:"depends_on"`
@@ -118,20 +94,6 @@ func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
 			return true
-		}
-	}
-	return false
-}
-
-func commandContains(command any, want string) bool {
-	switch v := command.(type) {
-	case string:
-		return v == want
-	case []any:
-		for _, item := range v {
-			if s, ok := item.(string); ok && s == want {
-				return true
-			}
 		}
 	}
 	return false

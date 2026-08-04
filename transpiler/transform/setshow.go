@@ -12,6 +12,93 @@ import (
 // (lowercase letters, digits, and underscores, starting with a letter)
 var configParamPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
+// querySourceParam is the duckgres-namespaced custom session GUC that carries
+// the pull-based-compute-billing query source. It is intercepted here and
+// stored session-side by the connection layer; it is NEVER forwarded to DuckDB
+// (DuckDB rejects unknown settings). See clientConn.QuerySource in server/.
+const querySourceParam = "duckgres.query_source"
+
+// Valid values for the duckgres.query_source GUC. The value is a billing
+// dimension — it lands verbatim in the compute-usage bucket key
+// (duckgres_org_compute_usage.query_source) and in the billing pull API — so
+// it is a closed enum: accepting arbitrary strings would hand clients
+// unbounded cardinality (and arbitrary junk) in the billing table and its
+// exports.
+const (
+	QuerySourceStandard  = "standard"
+	QuerySourceEndpoints = "endpoints"
+)
+
+// NormalizeQuerySource validates a client-supplied duckgres.query_source value
+// against the closed set above. Matching is case-insensitive (and ignores
+// surrounding whitespace); the returned value is canonical lowercase. Empty is
+// valid and means "reset to default" (the session then reports "standard").
+// An invalid value returns a 22023 (invalid_parameter_value) CodedError. The
+// message deliberately does NOT echo the offending value: it is arbitrary
+// client input (possibly huge) and error messages flow into logs, the query
+// log, and the admin recent-errors ring.
+func NormalizeQuerySource(raw string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", QuerySourceStandard, QuerySourceEndpoints:
+		return v, nil
+	default:
+		return "", errInvalidQuerySource()
+	}
+}
+
+// errInvalidQuerySource is the SET-time rejection for a bad
+// duckgres.query_source value: 22023 invalid_parameter_value, matching how the
+// control plane rejects invalid duckgres.worker_* startup options.
+func errInvalidQuerySource() *CodedError {
+	return &CodedError{
+		Code: "22023", // invalid_parameter_value
+		Message: fmt.Sprintf("invalid value for %q: must be %q or %q",
+			querySourceParam, QuerySourceStandard, QuerySourceEndpoints),
+	}
+}
+
+// s3CacheParam is the duckgres-namespaced custom session GUC that controls
+// whether the session's DuckLake S3 traffic is served through the node-local
+// cache proxy (remote/k8s workers). Intercepted here and applied by the
+// connection layer (which swaps the worker's S3 secret transport); it is NEVER
+// forwarded to DuckDB. See clientConn.S3CacheEnabled in server/.
+const s3CacheParam = "duckgres.s3_cache"
+
+// Canonical values for the duckgres.s3_cache GUC.
+const (
+	S3CacheOn  = "on"
+	S3CacheOff = "off"
+)
+
+// NormalizeS3Cache validates a client-supplied duckgres.s3_cache value. The
+// PostgreSQL boolean spellings are accepted (case-insensitively, ignoring
+// surrounding whitespace) and normalized to "on"/"off". Empty is valid and
+// means "reset to default" (the session then reports "on"). An invalid value
+// returns a 22023 (invalid_parameter_value) CodedError that, like
+// NormalizeQuerySource, does not echo the offending client input.
+func NormalizeS3Cache(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "":
+		return "", nil
+	case S3CacheOn, "true", "yes", "1":
+		return S3CacheOn, nil
+	case S3CacheOff, "false", "no", "0":
+		return S3CacheOff, nil
+	default:
+		return "", errInvalidS3Cache()
+	}
+}
+
+// errInvalidS3Cache is the SET-time rejection for a bad duckgres.s3_cache
+// value: 22023 invalid_parameter_value, same treatment as duckgres.query_source.
+func errInvalidS3Cache() *CodedError {
+	return &CodedError{
+		Code: "22023", // invalid_parameter_value
+		Message: fmt.Sprintf("invalid value for %q: must be %q or %q",
+			s3CacheParam, S3CacheOn, S3CacheOff),
+	}
+}
+
 // duckdbShowCommands are DuckDB-specific SHOW commands that should be passed
 // through to DuckDB rather than treated as PostgreSQL config parameters.
 var duckdbShowCommands = map[string]bool{
@@ -201,6 +288,17 @@ func (t *SetShowTransform) Name() string {
 func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
 	changed := false
 
+	// The duckgres.query_source custom GUC is intercepted session-side and
+	// surfaced on the whole-batch Result (QuerySourceSet/QuerySourceShow), which
+	// makes the transpiler return early for the ENTIRE batch. That is only safe
+	// for a single-statement batch: for a multi-statement simple query
+	// (e.g. `SET duckgres.query_source='x'; SHOW duckgres.query_source`) an early
+	// return would swallow every statement after the GUC one. When the batch has
+	// more than one statement we DON'T intercept here — the connection layer
+	// splits the batch and re-transpiles each statement on its own, and the
+	// single-statement transpile then intercepts the GUC correctly.
+	multiStatement := len(tree.Stmts) > 1
+
 	for i, stmt := range tree.Stmts {
 		if stmt.Stmt == nil {
 			continue
@@ -230,6 +328,73 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				}
 
 				paramName := strings.ToLower(n.VariableSetStmt.Name)
+
+				// duckgres.query_source: a duckgres-namespaced custom GUC. Intercept
+				// and hand the value to the connection layer to store on the session;
+				// do NOT forward to DuckDB (it would reject the unknown setting).
+				// RESET / SET ... TO DEFAULT restore the default (empty value).
+				// SET LOCAL is treated the same as SET here (there is no
+				// transaction-scoped restore for this billing GUC). The value is a
+				// billing dimension, so it is validated against the closed
+				// {standard, endpoints} set (case-insensitively, normalized to
+				// lowercase); anything else — including a value that is not a
+				// single simple constant/identifier — is rejected with 22023 via
+				// result.Error, which every protocol path (simple, split-batch,
+				// extended Parse) surfaces before storing anything on the session.
+				if paramName == querySourceParam && !multiStatement {
+					value := ""
+					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
+						extracted := false
+						if len(n.VariableSetStmt.Args) == 1 {
+							if v, ok := searchPathValue(n.VariableSetStmt.Args[0]); ok {
+								value, extracted = v, true
+							}
+						}
+						if !extracted {
+							// Multiple values / a non-string constant can never
+							// name a valid query source; reject rather than
+							// silently resetting to the default.
+							result.Error = errInvalidQuerySource()
+							return true, nil
+						}
+					}
+					norm, err := NormalizeQuerySource(value)
+					if err != nil {
+						result.Error = err
+						return true, nil
+					}
+					result.QuerySourceSet = &norm
+					return true, nil
+				}
+
+				// duckgres.s3_cache: same interception contract as
+				// duckgres.query_source above (single-statement only; RESET /
+				// SET ... TO DEFAULT map to the empty value = default "on";
+				// closed value set rejected with 22023 via result.Error). The
+				// connection layer applies the value by asking the worker to
+				// swap its S3 secret transport — never forwarded to DuckDB.
+				if paramName == s3CacheParam && !multiStatement {
+					value := ""
+					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
+						extracted := false
+						if len(n.VariableSetStmt.Args) == 1 {
+							if v, ok := searchPathValue(n.VariableSetStmt.Args[0]); ok {
+								value, extracted = v, true
+							}
+						}
+						if !extracted {
+							result.Error = errInvalidS3Cache()
+							return true, nil
+						}
+					}
+					norm, err := NormalizeS3Cache(value)
+					if err != nil {
+						result.Error = err
+						return true, nil
+					}
+					result.S3CacheSet = &norm
+					return true, nil
+				}
 
 				if paramName == "search_path" {
 					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt); ok {
@@ -282,6 +447,20 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 		case *pg_query.Node_VariableShowStmt:
 			if n.VariableShowStmt != nil {
 				paramName := strings.ToLower(n.VariableShowStmt.Name)
+
+				// duckgres.query_source: answered from session state by the
+				// connection layer (defaulting to "standard"), not DuckDB.
+				if paramName == querySourceParam && !multiStatement {
+					result.QuerySourceShow = true
+					return true, nil
+				}
+
+				// duckgres.s3_cache: answered from session state by the
+				// connection layer (defaulting to "on"), not DuckDB.
+				if paramName == s3CacheParam && !multiStatement {
+					result.S3CacheShow = true
+					return true, nil
+				}
 
 				// Passthrough params: SHOW → SELECT value FROM duckdb_settings() WHERE name = '...'
 				// (DuckDB's SHOW <name> describes a table, not a setting)

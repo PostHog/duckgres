@@ -1,7 +1,7 @@
 package transform
 
 // CodedError is a transform-detected error that carries an explicit PostgreSQL
-// SQLSTATE. conn.go reads the code via the SQLState() method when sending the
+// SQLSTATE. conn_errors.go reads the code via the SQLState() method when sending the
 // error to the client; errors without a code default to 42704.
 type CodedError struct {
 	Code    string

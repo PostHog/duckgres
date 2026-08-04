@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: frozen_v1
+    schema: frozen_v1
+    tables:
+      - name: persons_file_view
+      - name: events_file_view

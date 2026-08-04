@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +14,41 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCancelQueryDoesNotLogSecretKey(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	key := BackendKey{Pid: 42, SecretKey: 987654321}
+	s := &Server{activeQueries: map[BackendKey]context.CancelFunc{key: func() {}}}
+	if !s.CancelQuery(key) {
+		t.Fatal("CancelQuery returned false for a registered key")
+	}
+	if strings.Contains(logs.String(), "987654321") {
+		t.Fatalf("cancel secret key leaked to logs: %s", logs.String())
+	}
+}
+
+func TestNormalizeIdleTimeout(t *testing.T) {
+	const def = 60 * time.Second
+	cases := []struct {
+		name       string
+		configured time.Duration
+		want       time.Duration
+	}{
+		{"unset uses default", 0, def},
+		{"negative disables", -1, 0},
+		{"explicit positive passes through", 90 * time.Second, 90 * time.Second},
+		{"any negative disables", -5 * time.Minute, 0},
+	}
+	for _, tc := range cases {
+		if got := NormalizeIdleTimeout(tc.configured, def); got != tc.want {
+			t.Errorf("%s: NormalizeIdleTimeout(%v, %v) = %v, want %v", tc.name, tc.configured, def, got, tc.want)
+		}
+	}
+}
 
 type mockRefreshExecer struct {
 	mu            sync.Mutex

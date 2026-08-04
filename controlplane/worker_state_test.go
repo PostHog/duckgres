@@ -70,6 +70,27 @@ func TestSharedWorkerStateTransitionRejectsMissingOrInvalidAssignment(t *testing
 	}
 }
 
+func TestSharedWorkerStateAllowsUnassignedWorkerToDrain(t *testing.T) {
+	state, err := (SharedWorkerState{}).Transition(WorkerLifecycleDraining, nil)
+	if err != nil {
+		t.Fatalf("transition idle worker to draining: %v", err)
+	}
+	if got := state.NormalizedLifecycle(); got != WorkerLifecycleDraining {
+		t.Fatalf("expected draining lifecycle, got %q", got)
+	}
+	if state.Assignment != nil {
+		t.Fatalf("expected unassigned draining worker, got %#v", state.Assignment)
+	}
+
+	state, err = state.Transition(WorkerLifecycleRetired, nil)
+	if err != nil {
+		t.Fatalf("transition unassigned draining worker to retired: %v", err)
+	}
+	if got := state.NormalizedLifecycle(); got != WorkerLifecycleRetired {
+		t.Fatalf("expected retired lifecycle, got %q", got)
+	}
+}
+
 func TestSharedWorkerStateTransitionRejectsInvalidLifecycleMoves(t *testing.T) {
 	state, err := (SharedWorkerState{}).Transition(WorkerLifecycleReserved, &WorkerAssignment{
 		OrgID: "analytics",

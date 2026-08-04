@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -9,16 +10,16 @@ import (
 // PostgreSQL message types
 const (
 	// Frontend (client) messages
-	MsgQuery       = 'Q'
-	MsgTerminate   = 'X'
-	MsgPassword    = 'p'
-	MsgParse       = 'P'
-	MsgBind        = 'B'
-	MsgDescribe    = 'D'
-	MsgExecute     = 'E'
-	MsgSync        = 'S'
-	MsgClose       = 'C'
-	MsgFlush       = 'H'
+	MsgQuery     = 'Q'
+	MsgTerminate = 'X'
+	MsgPassword  = 'p'
+	MsgParse     = 'P'
+	MsgBind      = 'B'
+	MsgDescribe  = 'D'
+	MsgExecute   = 'E'
+	MsgSync      = 'S'
+	MsgClose     = 'C'
+	MsgFlush     = 'H'
 
 	// Backend (server) messages
 	MsgAuth            = 'R'
@@ -46,23 +47,55 @@ const (
 
 // Authentication types
 const (
-	authOK              = 0
-	authCleartextPwd    = 3
-	authMD5Pwd          = 5
+	authOK           = 0
+	authCleartextPwd = 3
+	authMD5Pwd       = 5
 )
 
-// readStartupMessage reads the initial startup message from the client
-func ReadStartupMessage(r io.Reader) (map[string]string, error) {
+// Message length bounds. Lengths are client-supplied (and read pre-auth for
+// startup messages), so they MUST be validated before allocation: a negative
+// or absurd length would otherwise panic in make() and crash the process.
+const (
+	// maxStartupMessageLength caps the startup packet. Matches PostgreSQL's
+	// MAX_STARTUP_PACKET_LENGTH and controlplane's readStartupFromRaw guard.
+	maxStartupMessageLength = 10000
+
+	// maxMessageLength caps regular protocol messages (1 GiB). Generous enough
+	// for large COPY data and bind parameters while bounding allocations.
+	maxMessageLength = 1 << 30
+)
+
+// StartupMessage is the parsed initial message from a PostgreSQL client. Cancel
+// credentials intentionally live outside Params: callers log ordinary startup
+// fields such as user and application_name, but must never log a cancel key.
+type StartupMessage struct {
+	Params                   map[string]string
+	SSLRequest               bool
+	GSSENCRequest            bool
+	CancelRequest            bool
+	CancelCredentialsPresent bool
+	CancelPID                int32
+	CancelSecretKey          int32
+}
+
+// ReadStartupMessage reads the initial startup message from the client.
+func ReadStartupMessage(r io.Reader) (StartupMessage, error) {
 	// Read message length (4 bytes)
 	var length int32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-		return nil, fmt.Errorf("failed to read startup message length: %w", err)
+		return StartupMessage{}, fmt.Errorf("failed to read startup message length: %w", err)
+	}
+
+	// Validate before allocating: minimum 8 = length field (4) + protocol
+	// version (4), which also guarantees remaining[:4] below is in range.
+	if length < 8 || length > maxStartupMessageLength {
+		return StartupMessage{}, fmt.Errorf("invalid startup message length: %d", length)
 	}
 
 	// Read remaining bytes
 	remaining := make([]byte, length-4)
 	if _, err := io.ReadFull(r, remaining); err != nil {
-		return nil, fmt.Errorf("failed to read startup message body: %w", err)
+		return StartupMessage{}, fmt.Errorf("failed to read startup message body: %w", err)
 	}
 
 	// Read protocol version (4 bytes)
@@ -70,28 +103,27 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 
 	// Check for SSL request (80877103)
 	if protocolVersion == 80877103 {
-		return map[string]string{"__ssl_request": "true"}, nil
+		return StartupMessage{SSLRequest: true}, nil
 	}
 
 	// Check for GSSENCRequest (80877104, PostgreSQL 12+)
 	// JDBC drivers with gssEncMode=prefer send this before SSLRequest.
 	if protocolVersion == 80877104 {
-		return map[string]string{"__gssenc_request": "true"}, nil
+		return StartupMessage{GSSENCRequest: true}, nil
 	}
 
 	// Check for cancel request (80877102)
 	// Format: 4 bytes length, 4 bytes request code, 4 bytes pid, 4 bytes secret key
 	if protocolVersion == 80877102 {
 		if len(remaining) >= 12 {
-			cancelPid := binary.BigEndian.Uint32(remaining[4:8])
-			cancelSecretKey := binary.BigEndian.Uint32(remaining[8:12])
-			return map[string]string{
-				"__cancel_request":    "true",
-				"__cancel_pid":        fmt.Sprintf("%d", cancelPid),
-				"__cancel_secret_key": fmt.Sprintf("%d", cancelSecretKey),
+			return StartupMessage{
+				CancelRequest:            true,
+				CancelCredentialsPresent: true,
+				CancelPID:                int32(binary.BigEndian.Uint32(remaining[4:8])),
+				CancelSecretKey:          int32(binary.BigEndian.Uint32(remaining[8:12])),
 			}, nil
 		}
-		return map[string]string{"__cancel_request": "true"}, nil
+		return StartupMessage{CancelRequest: true}, nil
 	}
 
 	// Parse parameters (null-terminated key-value pairs)
@@ -115,7 +147,11 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 		for valEnd < len(data) && data[valEnd] != 0 {
 			valEnd++
 		}
-		if valEnd > len(data) {
+		// An unterminated value (no trailing NUL) means a malformed/truncated
+		// packet. Break instead of re-slicing past the end: with valEnd ==
+		// len(data), data[valEnd+1:] would be data[len(data)+1:] and panic
+		// with "slice bounds out of range". Mirrors the key-scan guard above.
+		if valEnd >= len(data) {
 			break
 		}
 		value := string(data[:valEnd])
@@ -126,7 +162,7 @@ func ReadStartupMessage(r io.Reader) (map[string]string, error) {
 		}
 	}
 
-	return params, nil
+	return StartupMessage{Params: params}, nil
 }
 
 // readMessage reads a single message from the client
@@ -142,6 +178,11 @@ func ReadMessage(r io.Reader) (byte, []byte, error) {
 	var length int32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 		return 0, nil, fmt.Errorf("failed to read message length: %w", err)
+	}
+
+	// Validate before allocating: minimum 4 = the length field itself.
+	if length < 4 || length > maxMessageLength {
+		return 0, nil, fmt.Errorf("invalid message length: %d", length)
 	}
 
 	// Read message body
@@ -368,4 +409,33 @@ func WriteCopyData(w io.Writer, data []byte) error {
 // writeCopyDone signals the end of COPY data
 func WriteCopyDone(w io.Writer) error {
 	return WriteMessage(w, MsgCopyDone, nil)
+}
+
+// QueryIDMetadataKey carries the control plane's per-statement query ID on
+// worker RPCs. The worker stamps it on its own logs and events, so a statement
+// can be followed from the client connection through to the engine that ran it.
+const QueryIDMetadataKey = "x-duckgres-query-id"
+
+type queryIDContextKey struct{}
+
+// WithQueryID attaches a statement's query ID to a context.
+//
+// Propagation is context-based rather than executor state so it reaches the
+// worker from every front-end: the PostgreSQL wire path and the Flight SQL
+// ingress both funnel into the same executor, and neither has to know the
+// header exists.
+func WithQueryID(ctx context.Context, queryID string) context.Context {
+	if ctx == nil || queryID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, queryIDContextKey{}, queryID)
+}
+
+// QueryIDFromContext returns the statement's query ID, or "" if unset.
+func QueryIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	queryID, _ := ctx.Value(queryIDContextKey{}).(string)
+	return queryID
 }

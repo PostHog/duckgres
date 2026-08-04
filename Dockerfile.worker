@@ -50,9 +50,9 @@ RUN go mod download
 # depends only on the extension/pin args, not on source — a source-only PR
 # keeps the GHA layer-cache hit and skips the 5 downloads. (They previously
 # ran after the source COPY + build, so they re-fetched on every edit.)
-ARG DUCKDB_EXTENSION_VERSION=1.5.3
-ARG HTTPFS_EXTENSION_TAG=v1.5.3-stoi-fix
-ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.4
+ARG DUCKDB_EXTENSION_VERSION=1.5.5
+ARG HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
+ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # Repository for postgres_scanner specifically. Defaults to the stable
 # extensions repo, overridable per-row in CI (e.g. legacy DuckDB versions
@@ -61,9 +61,9 @@ ARG POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
 
 # Cross-check that DUCKDB_EXTENSION_VERSION (which keys the bundled-extension
 # directory layout) matches the DuckDB version implied by DUCKDB_BINDINGS_VERSION.
-# Encoding is `v0.<major><minor:02d><patch:02d>.0`, so 1.5.3 ↔ v0.10503.0.
-# Without this, a CI matrix slip (e.g. extension_version=1.5.3 while bindings=v0.10502.0)
-# would seed extensions under v1.5.3/ for a 1.5.2 engine that looks under v1.5.2/,
+# Encoding is `v0.<major><minor:02d><patch:02d>.0`, so 1.5.5 ↔ v0.10505.0.
+# Without this, a CI matrix slip (e.g. extension_version=1.5.5 while bindings=v0.10503.0)
+# would seed extensions under v1.5.5/ for a 1.5.3 engine that looks under v1.5.3/,
 # silently falling back to upstream extensions.duckdb.org for httpfs/ducklake
 # — the bundled PostHog forks would never load.
 RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ] && [ -n "$DUCKDB_EXTENSION_VERSION" ]; then \
@@ -100,9 +100,7 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \
     && curl -fsSL "${POSTGRES_SCANNER_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
-    && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/iceberg.duckdb_extension.gz" \
-      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/iceberg.duckdb_extension" \
-    && for f in httpfs ducklake json postgres_scanner iceberg; do \
+    && for f in httpfs ducklake json postgres_scanner; do \
          [ -s "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/$f.duckdb_extension" ] \
            || { echo "ERROR: $f.duckdb_extension is empty after fetch" >&2; exit 1; }; \
        done
@@ -129,6 +127,12 @@ ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_TAGS=""
 
+RUN CGO_ENABLED=1 \
+    DUCKGRES_TEST_DUCKDB_EXTENSION_DIRECTORY=/build/duckdb-extensions \
+    go test -count=1 -tags "${BUILD_TAGS}" \
+      -run '^TestDoCopyFromStdinIngestsPostgresBinaryWithBundledScanner$' \
+      ./duckdbservice
+
 RUN CGO_ENABLED=1 go build -tags "${BUILD_TAGS}" \
     -ldflags "-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -o duckgres-worker \
@@ -151,10 +155,12 @@ RUN if [ -n "$DUCKDB_BINDINGS_VERSION" ]; then \
       echo "Verified: duckgres-worker linked against duckdb-go-bindings@$embedded" ; \
     fi
 
-FROM debian:bookworm-slim
+FROM chainguard/wolfi-base:latest
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN groupadd -r duckgres && useradd -r -g duckgres -d /app duckgres
+# libstdc++ is the C++ runtime the CGO-linked DuckDB engine needs — present
+# implicitly on debian-slim, but not in wolfi-base.
+RUN apk add --no-cache ca-certificates-bundle libstdc++ \
+    && addgroup -S duckgres && adduser -S -G duckgres -h /app duckgres
 
 WORKDIR /app
 COPY --from=builder /build/duckgres-worker .

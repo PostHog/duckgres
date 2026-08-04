@@ -7,7 +7,7 @@ import (
 	"github.com/posthog/duckgres/transpiler/backend"
 )
 
-// DDLTransform strips unsupported DDL features for backends (DuckLake, Iceberg)
+// DDLTransform strips unsupported DDL features for backends (DuckLake)
 // that don't support: PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK constraints,
 // SERIAL types, DEFAULT now(), GENERATED columns, or indexes. Which behaviors
 // apply is driven by the backend's capabilities.
@@ -35,8 +35,11 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 		switch n := stmt.Stmt.Node.(type) {
 		case *pg_query.Node_CreateStmt:
 			if n.CreateStmt != nil {
-				if t.transformCreateStmt(n.CreateStmt) {
+				if t.transformCreateStmt(n.CreateStmt, result) {
 					changed = true
+				}
+				if result.Error != nil {
+					return true, nil
 				}
 			}
 
@@ -56,7 +59,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 					result.NoOpTag = "DROP INDEX"
 					return true, nil
 				}
-				// DuckLake/Iceberg don't support CASCADE on DROP TABLE/VIEW.
+				// DuckLake doesn't support CASCADE on DROP TABLE/VIEW.
 				// Strip CASCADE by converting to RESTRICT (same approach as dbt-duckdb).
 				// See: https://github.com/duckdb/dbt-duckdb/pull/557
 				// Note: DROP SCHEMA CASCADE is supported by DuckDB natively, so preserve it.
@@ -86,7 +89,7 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 
 		case *pg_query.Node_VacuumStmt:
 			// ANALYZE and VACUUM both parse as VacuumStmt; distinguish the command
-			// tag (DuckDB rejects either against an Iceberg/DuckLake catalog).
+			// tag (DuckDB rejects either against a DuckLake catalog).
 			if t.policy.UnsupportedDDL == backend.NoOpUnsupportedDDL {
 				result.IsNoOp = true
 				result.NoOpTag = "VACUUM"
@@ -140,8 +143,10 @@ func (t *DDLTransform) Transform(tree *pg_query.ParseResult, result *Result) (bo
 	return changed, nil
 }
 
-// transformCreateStmt modifies a CREATE TABLE statement for DuckLake compatibility
-func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt) bool {
+// transformCreateStmt modifies a CREATE TABLE statement for DuckLake compatibility.
+// Unenforceable constraints (PK/UNIQUE/CHECK/FK) and silently-NULL data features
+// (SERIAL, GENERATED STORED, DEFAULT <expr>) are stripped/rewritten.
+func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt, result *Result) bool {
 	changed := false
 
 	// Process column definitions
@@ -151,8 +156,11 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt) bool {
 		case *pg_query.Node_ColumnDef:
 			if n.ColumnDef != nil {
 				// Transform the column definition
-				if t.transformColumnDef(n.ColumnDef) {
+				if t.transformColumnDef(n.ColumnDef, result) {
 					changed = true
+				}
+				if result.Error != nil {
+					return changed
 				}
 				newTableElts = append(newTableElts, elt)
 			}
@@ -191,14 +199,19 @@ func (t *DDLTransform) transformCreateStmt(stmt *pg_query.CreateStmt) bool {
 	return changed
 }
 
-// transformColumnDef modifies a column definition for DuckLake compatibility
-func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef) bool {
+// transformColumnDef modifies a column definition for DuckLake compatibility.
+// SERIAL is rewritten to plain integer types; GENERATED STORED and DEFAULT <expr>
+// (which would silently produce NULL data on a lake catalog) are stripped.
+// Unenforceable column constraints (PK/UNIQUE/CHECK/FK) are stripped.
+func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef, result *Result) bool {
 	changed := false
 
-	// Convert SERIAL types to INTEGER types
-	if t.policy.RewriteSerial && col.TypeName != nil {
-		if t.convertSerialType(col.TypeName) {
-			changed = true
+	// SERIAL/BIGSERIAL: no backing sequence on a lake catalog -> ids silently NULL.
+	if col.TypeName != nil {
+		if serialTypeName(col.TypeName) != "" {
+			if t.policy.RewriteSerial && t.convertSerialType(col.TypeName) {
+				changed = true
+			}
 		}
 	}
 
@@ -206,27 +219,33 @@ func (t *DDLTransform) transformColumnDef(col *pg_query.ColumnDef) bool {
 	if len(col.Constraints) > 0 {
 		newConstraints := make([]*pg_query.Node, 0)
 		for _, c := range col.Constraints {
-			if constraint := c.GetConstraint(); constraint != nil {
-				if t.policy.ConstraintHandling == backend.StripConstraints && t.isUnsupportedColumnConstraint(constraint) {
-					changed = true
-					continue
-				}
-				// Check for DEFAULT now()/current_timestamp
-				if t.policy.StripVolatileDefaults && constraint.Contype == pg_query.ConstrType_CONSTR_DEFAULT {
-					if t.isUnsupportedDefault(constraint.RawExpr) {
-						changed = true
-						continue
-					}
-				}
-				// Check for GENERATED columns
-				if t.policy.StripVolatileDefaults && constraint.Contype == pg_query.ConstrType_CONSTR_GENERATED {
-					changed = true
-					continue
-				}
+			constraint := c.GetConstraint()
+			if constraint == nil {
 				newConstraints = append(newConstraints, c)
-			} else {
-				newConstraints = append(newConstraints, c)
+				continue
 			}
+			// Unenforceable constraints (PK/UNIQUE/CHECK/FK/EXCLUSION): strip.
+			if t.policy.ConstraintHandling == backend.StripConstraints && t.isUnsupportedColumnConstraint(constraint) {
+				changed = true
+				continue
+			}
+			// GENERATED ALWAYS AS (...) STORED: computed value would be silently NULL.
+			if constraint.Contype == pg_query.ConstrType_CONSTR_GENERATED {
+				if t.policy.StripVolatileDefaults {
+					changed = true
+					continue
+				}
+			}
+			// DEFAULT <expression>/now(): the default would be silently dropped (NULL).
+			// Literal int/float/string and DEFAULT NULL are not "unsupported" here and
+			// are passed through to the engine.
+			if constraint.Contype == pg_query.ConstrType_CONSTR_DEFAULT && t.isUnsupportedDefault(constraint.RawExpr) {
+				if t.policy.StripVolatileDefaults {
+					changed = true
+					continue
+				}
+			}
+			newConstraints = append(newConstraints, c)
 		}
 		col.Constraints = newConstraints
 	}
@@ -319,13 +338,18 @@ func (t *DDLTransform) isUnsupportedDefault(expr *pg_query.Node) bool {
 		return t.isUnsupportedDefault(typeCast.Arg)
 	}
 
-	// Check for A_Const nodes - only allow Integer and String
+	// Check for A_Const nodes - allow NULL and Integer/Float/String literals.
 	if aconst := expr.GetAConst(); aconst != nil {
+		// DEFAULT NULL is fine: NULL is the implicit default anyway, so it is
+		// neither stripped nor an error.
+		if aconst.Isnull {
+			return false
+		}
 		switch aconst.Val.(type) {
 		case *pg_query.A_Const_Ival, *pg_query.A_Const_Fval, *pg_query.A_Const_Sval:
 			return false // These are supported
 		default:
-			return true // Booleans, NULLs, etc. are not supported
+			return true // Booleans, etc. are not supported
 		}
 	}
 
@@ -351,14 +375,26 @@ func (t *DDLTransform) transformAlterTableStmt(stmt *pg_query.AlterTableStmt, re
 				"ALTER COLUMN TYPE ... USING <expression> is not supported on this catalog")
 			return false, nil
 		}
-		if t.isUnsupportedAlterCommand(alterCmd) {
+		// ADD COLUMN carries a full ColumnDef: apply the same SERIAL/GENERATED/
+		// DEFAULT-expr error and constraint-warn handling as CREATE TABLE.
+		if alterCmd.Subtype == pg_query.AlterTableType_AT_AddColumn {
+			if def := alterCmd.Def.GetColumnDef(); def != nil {
+				t.transformColumnDef(def, result)
+				if result.Error != nil {
+					return false, nil
+				}
+			}
+			// Make ADD COLUMN idempotent by adding IF NOT EXISTS.
+			// DuckLake reuses physical tables across sqlmesh snapshots, so
+			// columns may already exist when sqlmesh issues ALTER TABLE ADD COLUMN.
+			if !alterCmd.MissingOk {
+				alterCmd.MissingOk = true
+			}
+			supported = append(supported, cmd)
 			continue
 		}
-		// Make ADD COLUMN idempotent by adding IF NOT EXISTS.
-		// DuckLake reuses physical tables across sqlmesh snapshots, so
-		// columns may already exist when sqlmesh issues ALTER TABLE ADD COLUMN.
-		if alterCmd.Subtype == pg_query.AlterTableType_AT_AddColumn && !alterCmd.MissingOk {
-			alterCmd.MissingOk = true
+		if t.isUnsupportedAlterCommand(alterCmd) {
+			continue
 		}
 		supported = append(supported, cmd)
 	}
@@ -434,4 +470,24 @@ func (t *DDLTransform) isUnsupportedAlterCommand(cmd *pg_query.AlterTableCmd) bo
 		return true
 	}
 	return false
+}
+
+// serialTypeName returns the lowercased serial type name (serial/bigserial/...)
+// if the column type is a SERIAL pseudo-type, or "" otherwise.
+func serialTypeName(typeName *pg_query.TypeName) string {
+	if typeName == nil || len(typeName.Names) == 0 {
+		return ""
+	}
+	var typeStr string
+	for _, name := range typeName.Names {
+		if str := name.GetString_(); str != nil {
+			typeStr = strings.ToLower(str.Sval)
+			break
+		}
+	}
+	switch typeStr {
+	case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
+		return typeStr
+	}
+	return ""
 }

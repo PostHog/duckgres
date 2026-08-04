@@ -27,9 +27,14 @@ import (
 	"github.com/posthog/duckgres/server/ducklake"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/flightsqlingress"
+	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// DefaultAdmissionReclaimerMaxReservations bounds cleanup ownership retained by
+// one control-plane process when the operator does not configure a value.
+const DefaultAdmissionReclaimerMaxReservations = defaultAdmissionReclaimerReservations
 
 // ControlPlaneConfig extends server.Config with control-plane-specific settings.
 type ControlPlaneConfig struct {
@@ -45,6 +50,8 @@ type ControlPlaneConfig struct {
 	RetireOnSessionEnd   bool          // When true, process workers are retired immediately after their last session ends.
 	HandoverDrainTimeout time.Duration // How long to wait for connections to drain during upgrade. 0 = unbounded (wait until k8s SIGKILL via terminationGracePeriodSeconds). Default: 0 in remote mode (so a CP rolling out doesn't kill in-flight customer queries at a self-imposed wall — see drainAndShutdown), 24h in process mode.
 	MetricsServer        *http.Server  // Optional metrics server to shut down during upgrade
+
+	AdmissionReclaimerMaxReservations int // Max queued/live admission identities whose cleanup ownership this CP may retain (default: 4096)
 
 	// WorkerBackend selects the worker management backend.
 	// "process" (default): workers are local child processes communicating over Unix sockets.
@@ -68,6 +75,33 @@ type ControlPlaneConfig struct {
 	// When empty, a random secret is generated and logged at startup.
 	InternalSecret string
 
+	// InternalSecretFallbacks are previous internal secrets still accepted
+	// for API authentication during a rotation (newest first). Clients always
+	// send the primary InternalSecret; the server accepts any of
+	// {primary ∪ fallbacks}. Mirrors posthog's SECRET_KEY_FALLBACKS.
+	InternalSecretFallbacks []string
+
+	// ReadOnlySecret is a read-only secret accepted ONLY on the discovery
+	// endpoints (GET /api/v1/warehouses, GET /api/v1/warehouse-team-ids), so
+	// external writers (millpond, viaduck) don't have to carry the
+	// admin-capable InternalSecret. It never grants access to any other
+	// route. Empty disables the scoped path; the InternalSecret keeps
+	// working on the discovery endpoints either way (operator/debug access
+	// and rotation-window compatibility).
+	ReadOnlySecret string
+
+	// ReadOnlySecretFallbacks are previous read-only secrets still
+	// accepted during a rotation (newest first). Same semantics as
+	// InternalSecretFallbacks.
+	ReadOnlySecretFallbacks []string
+
+	// UserSecretKey is the base64-encoded 32-byte AES key for encrypting
+	// user persistent secrets in the config store (env-only:
+	// DUCKGRES_USER_SECRET_KEY). Empty disables the persistent secret
+	// manager: CREATE PERSISTENT SECRET is rejected with a clear error.
+	// Only used in multitenant remote mode.
+	UserSecretKey string
+
 	// SNIRoutingMode controls hostname-based org routing. Values:
 	//   "" or "off"   - SNI is ignored; legacy database-param routing only
 	//                   (default).
@@ -89,7 +123,19 @@ type ControlPlaneConfig struct {
 	// single-label prefix is resolved as hostname_alias, database_name, or org
 	// name. Postgres still honors an explicit startup database, but only when it
 	// resolves to the same org as the managed hostname.
-	ManagedHostnameSuffixes []string
+	ManagedHostnameSuffixes  []string
+	MetadataHostnameSuffixes []string
+	MetadataProxyMaxConns    int
+
+	// DucklingBucketSuffix is the env suffix the control plane uses to name a
+	// type=s3bucket Duckling's per-org S3 bucket
+	// (posthog-duckling-<compact-org>-<suffix>). It MUST equal the
+	// crossplane-config chart's envSuffix for this environment so the name the
+	// CP writes onto the Duckling CR's spec.dataStore.bucketName is exactly what
+	// the composition provisions. Empty ⇒ the CP does not name buckets and the
+	// composition derives the name (legacy behavior). See
+	// configstore.DucklingBucketName.
+	DucklingBucketSuffix string
 
 	// DuckLakeDefaultSpecVersion is the global default DuckLake spec version
 	// used for migration checks when an org doesn't specify an override.
@@ -103,71 +149,59 @@ type ProcessConfig struct {
 
 // K8sConfig holds Kubernetes worker backend configuration.
 type K8sConfig struct {
-	WorkerImage                     string        // Container image for worker pods (required)
-	WorkerNamespace                 string        // K8s namespace (default: auto-detect from service account)
-	ControlPlaneID                  string        // Unique CP identifier for labeling worker pods (default: os.Hostname())
-	WorkerPort                      int           // gRPC port on worker pods (default: 8816)
-	WorkerSecret                    string        // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
-	WorkerConfigMap                 string        // ConfigMap name for duckgres.yaml
-	ImagePullPolicy                 string        // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
-	ServiceAccount                  string        // Neutral ServiceAccount name for worker pods (default: "duckgres-worker")
-	MaxWorkers                      int           // Global cap for the shared K8s worker pool (0 = unbounded; cluster autoscaler is the natural ceiling)
-	SharedWarmTarget                int           // Neutral shared warm-worker target for K8s multi-tenant mode (0 = disabled)
-	DynamicWarmCapacityEnabled      bool          // Enable configstore-driven dynamic warm-capacity target computation
-	WarmCapacityMissWindow          time.Duration // Window of recent no-idle misses that contributes to dynamic targets
-	WarmCapacityMissesPerWorker     int           // Number of recent misses that translate to one extra warm worker
-	WarmCapacityDemandTTL           time.Duration // Retention TTL for warm-capacity miss buckets
-	WarmCapacityDynamicImageCeiling int           // Max dynamic extra warm workers per image (0 = unlimited)
-	WarmCapacityDynamicTotalCeiling int           // Max dynamic extra warm workers across images (0 = unlimited)
-	WorkerCPURequest                string        // CPU request for worker pods (e.g., "500m")
-	WorkerMemoryRequest             string        // Memory request for worker pods (e.g., "1Gi")
-	WorkerNodeSelector              string        // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
-	WorkerTolerationKey             string        // Taint key for worker pod NoSchedule toleration
-	WorkerTolerationValue           string        // Taint value for worker pod NoSchedule toleration
-	WorkerExclusiveNode             bool          // One worker per node via pod anti-affinity
-	WorkerPriorityClassName         string        // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
-	AWSRegion                       string        // AWS region for STS client
+	WorkerImage             string // Container image for worker pods (required)
+	WorkerNamespace         string // K8s namespace (default: auto-detect from service account)
+	ControlPlaneID          string // Unique CP identifier for labeling worker pods (default: os.Hostname())
+	WorkerPort              int    // gRPC port on worker pods (default: 8816)
+	WorkerSecret            string // Base name for per-worker K8s Secrets containing RPC bearer token and TLS material
+	WorkerConfigMap         string // ConfigMap name for duckgres.yaml
+	ImagePullPolicy         string // Image pull policy for worker pods (e.g., "Never", "IfNotPresent", "Always")
+	ServiceAccount          string // ServiceAccount name for worker pods (default: "duckgres-worker")
+	WorkerCPURequest        string // CPU request for worker pods (e.g., "500m")
+	WorkerMemoryRequest     string // Memory request for worker pods (e.g., "1Gi")
+	WorkerNodeSelector      string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
+	WorkerTolerationKey     string // Taint key for worker pod NoSchedule toleration
+	WorkerTolerationValue   string // Taint value for worker pod NoSchedule toleration
+	WorkerPriorityClassName string // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
+	AWSRegion               string // AWS region for STS client
 
-	// Connection-string worker-profile selection (duckgres.colocate / worker_cpu /
-	// worker_memory / worker_tier). All default to the off/empty state, so absent
-	// config = today's exclusive behavior. See docs/design/connection-string-worker-profile.md.
-	AllowClientWorkerProfile       bool                         // Master gate: honor duckgres.* startup options at all
-	AllowClientExclusiveNode       bool                         // Permit a client to request colocate=false (a full exclusive node)
-	ColocatedWorkerCPURequest      string                       // Default CPU for colocate=true with no size (e.g. "4")
-	ColocatedWorkerMemoryRequest   string                       // Default memory for colocate=true with no size (e.g. "16Gi")
-	ColocatedWarmShapes            []ColocatedWarmShape         // Colocated shapes to keep warm (each {cpu,memory,target}); empty = no colocated warm pool
-	ColocatedWorkerNodeSelector    string                       // JSON nodeSelector for colocated (bin-pack) worker pods
-	ColocatedWorkerTolerationKey   string                       // Taint key for colocated worker pod NoSchedule toleration
-	ColocatedWorkerTolerationValue string                       // Taint value for colocated worker pod NoSchedule toleration
-	WorkerProfileMinCPU            string                       // Clamp floor for a client-supplied cpu (e.g. "1")
-	WorkerProfileMaxCPU            string                       // Clamp ceiling for a client-supplied cpu (e.g. "16")
-	WorkerProfileMinMemory         string                       // Clamp floor for a client-supplied memory (e.g. "4Gi")
-	WorkerProfileMaxMemory         string                       // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
-	OrgMaxColocatedCPU             int                          // Per-org cap on summed colocated worker CPU cores (0 = unbounded)
-	OrgMaxColocatedMemory          string                       // Per-org cap on summed colocated worker memory (e.g. "256Gi")
-	WorkerTiers                    map[string]WorkerProfileSpec // Named tier aliases selectable via duckgres.worker_tier
-}
+	// Reshard runner pod shape (env-only DUCKGRES_RESHARD_POD_CPU /
+	// DUCKGRES_RESHARD_POD_MEMORY; requests=limits, Guaranteed QoS). Empty =
+	// built-in defaults (2 CPU / 8Gi). Reshard ops run in dedicated per-op
+	// pods so a catalog dump/copy never competes with live traffic for CP
+	// resources.
+	ReshardPodCPU    string
+	ReshardPodMemory string
 
-// ColocatedWarmShape is one colocated pod shape the control plane keeps warm:
-// `target` idle bin-packed workers of {CPU, Memory}. The warm pool is shape-aware
-// so distinct client shapes (e.g. 4/16 default and 8/48 for Iceberg orgs) each
-// get a ready pod. CPU/Memory must be canonical k8s quantities matching what the
-// resolver normalizes a client request to (e.g. "4", "16Gi"), or the warm worker
-// won't match.
-type ColocatedWarmShape struct {
-	CPU    string `json:"cpu"`
-	Memory string `json:"memory"`
-	Target int    `json:"target"`
-}
+	// Node-headroom controller holds preemptible low-priority placeholder pods so
+	// a worker spawn schedules immediately (preempting a placeholder) rather than
+	// waiting on a fresh Karpenter node. Slot count and size are derived
+	// dynamically from recent worker spawns (see controlplane/headroom.go) —
+	// there is no configured count. Enabled iff PlaceholderPriorityClassName is
+	// set; empty = disabled (existing placeholders converge to zero).
+	PlaceholderImage             string // Image for placeholder pods (a pause image)
+	PlaceholderPriorityClassName string // PriorityClass for placeholder pods — MUST rank below WorkerPriorityClassName. Empty = headroom disabled.
 
-// WorkerProfileSpec is a named tier alias: a preset {cpu, memory, colocate} bundle
-// a client can select with `duckgres.worker_tier=<name>` instead of inline sizes.
-// Explicit inline GUCs override a tier's fields. Colocate is a pointer so a tier
-// can pin exclusive (false) distinctly from "unset"; nil inherits the default.
-type WorkerProfileSpec struct {
-	CPU      string `json:"cpu"`
-	Memory   string `json:"memory"`
-	Colocate *bool  `json:"colocate"`
+	// Connection-string worker sizing (duckgres.worker_cpu / worker_memory /
+	// worker_ttl). All default to the off/empty state, so absent config = the
+	// default worker shape. See docs/design/connection-string-worker-profile.md.
+	AllowClientWorkerProfile bool          // Master gate: honor duckgres.* startup options at all
+	WorkerProfileMinCPU      string        // Clamp floor for a client-supplied cpu (e.g. "1")
+	WorkerProfileMaxCPU      string        // Clamp ceiling for a client-supplied cpu (e.g. "16")
+	WorkerProfileMinMemory   string        // Clamp floor for a client-supplied memory (e.g. "4Gi")
+	WorkerProfileMaxMemory   string        // Clamp ceiling for a client-supplied memory (e.g. "64Gi")
+	WorkerMaxTTL             time.Duration // Clamp ceiling for a client-supplied duckgres.worker_ttl (0 = unbounded)
+
+	// WorkerDefaultTTL is the hot-idle TTL applied when a request does not
+	// specify duckgres.worker_ttl (and no org default does either) — the
+	// "default TTL", pairing with WorkerMaxTTL (the clamp). It governs both
+	// no-ttl paths the same way: default-shape workers (reaped by the janitor)
+	// and sized-but-no-ttl workers (stamped at profile resolution). Per-request
+	// precedence: client GUC > org default > this > built-in (1m,
+	// defaultWorkerTTL). Raise it above a tenant's job cadence (e.g. 70m for
+	// hourly jobs) so scheduled workloads reuse hot-idle workers instead of
+	// cold-spawning every run — at the cost of idle worker nodes.
+	WorkerDefaultTTL time.Duration
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -193,6 +227,8 @@ type ControlPlane struct {
 	wg              sync.WaitGroup
 	reloading       atomic.Bool            // guards against concurrent upgrade from double SIGUSR1
 	upgradeDraining atomic.Bool            // true after upgrade succeeded; SIGTERM should exit immediately
+	sessionDraining atomic.Bool            // true once any shutdown path closes session creation
+	preReady        sessionLifecycle       // authenticated pgwire handshakes not yet handed to the message loop
 	acmeManager     *server.ACMEManager    // ACME manager for Let's Encrypt HTTP-01 (nil when using static certs)
 	acmeDNSManager  *server.ACMEDNSManager // ACME manager for DNS-01 (nil when not using DNS challenges)
 
@@ -205,6 +241,16 @@ type ControlPlane struct {
 	apiServer      *http.Server // API server on :8080 (shut down on graceful exit)
 	runtimeTracker *ControlPlaneRuntimeTracker
 	janitorLeader  *JanitorLeaderManager
+
+	// computeMeter accumulates per-org compute-usage and flushes it to the
+	// durable buffer (remote/k8s backend with billing config only; nil
+	// otherwise — every call site is nil-safe). The leader-only drain loop that
+	// ships buffered usage to PostHog is wired separately in SetupMultiTenant.
+	computeMeter            *computeMeter
+	metadataPostgresURL     func(context.Context, string) (string, error)
+	metadataPostgresConnect func(context.Context, string) (metadataPostgresConn, error)
+	metadataSessions        *metadataProxySessionRegistry
+	proxyCancels            sync.Map
 }
 
 // ConfigStoreInterface abstracts the config store for the control plane.
@@ -228,19 +274,33 @@ type ConfigStoreInterface interface {
 	// warehouse row (legacy single-tenant orgs); otherwise it is the lifecycle
 	// string (pending/provisioning/ready/failed/deleting/deleted).
 	OrgWarehouseStatus(orgID string) (state string, orgExists bool)
+	// OrgDefaultWorkerProfile returns the org's operator-set default worker
+	// profile (config-store columns default_worker_cpu/memory/ttl): cpu and
+	// memory as k8s resource-quantity strings, ttl as a Go duration string.
+	// Empty strings mean "not set" (including unknown orgs). Raw stored
+	// values — validation happens in resolveWorkerProfile.
+	OrgDefaultWorkerProfile(orgID string) (cpu, memory, ttl string)
+	// OrgUsageTeamID resolves the informational PostHog Team.id for a connection
+	// (the connecting user's team, else the org's oldest team; 0 when unknown).
+	// A config-snapshot read, no I/O — the same resolver the compute meter uses.
+	OrgUsageTeamID(orgID, username string) int64
 	UpsertFlightSessionRecord(record *configstore.FlightSessionRecord) error
 	GetFlightSessionRecord(sessionToken string) (*configstore.FlightSessionRecord, error)
 	TouchFlightSessionRecord(sessionToken string, lastSeenAt time.Time) error
 	CloseFlightSessionRecord(sessionToken string, closedAt time.Time) error
+	CloseFlightSessionRecordIfReconnectTargetUnchanged(stale configstore.FlightSessionRecord, closedAt time.Time) (bool, error)
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
 type OrgRouterInterface interface {
 	StackForOrg(orgID string) (pool WorkerPool, sessions *SessionManager, rebalancer *MemoryRebalancer, ok bool)
-	IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool)
 	IsMigratingForOrg(orgID string) bool
-	SetWarmCapacityTarget(n int)
+	BeginDrain()
 	ShutdownAll()
+	// ReleaseIdleHotWorkers parks idle (zero-session) Hot workers into hot_idle
+	// at drain start so the TTL reaper reclaims them instead of letting them
+	// linger for the whole drain wait. Returns the number parked.
+	ReleaseIdleHotWorkers() int
 }
 
 // RunControlPlane is the entry point for the control plane process.
@@ -407,8 +467,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if processMaxWorkers == 0 {
 		processMaxWorkers = tempRebalancer.DefaultMaxWorkers()
 	}
-	// K8s max_workers: 0 = unbounded (no cap derived from CP memory).
-	k8sMaxWorkers := cfg.K8s.MaxWorkers
 
 	rebalancer := NewMemoryRebalancer(memBudget, 0, nil, cfg.MemoryRebalance)
 
@@ -417,8 +475,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			"process_max_workers", processMaxWorkers,
 			"memory_budget", formatBytes(memBudget))
 	}
-	if isK8s && k8sMaxWorkers == 0 {
-		slog.Info("k8s.max_workers unset; worker pool is unbounded — cluster autoscaler (e.g. Karpenter) is the ceiling.")
+	if isK8s {
+		// K8s worker pools have no global/cluster cap. Per-org caps
+		// (Org.MaxWorkers, 0 = unbounded) plus the cluster autoscaler
+		// (e.g. Karpenter) are the only ceilings.
+		slog.Info("K8s worker pool has no global cap; per-org Org.MaxWorkers (0=unbounded) + cluster autoscaler are the ceilings.")
 	}
 
 	processMinWorkers := cfg.Process.MinWorkers
@@ -427,18 +488,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			"process_min_workers", processMinWorkers,
 			"process_max_workers", processMaxWorkers)
 		processMinWorkers = processMaxWorkers
-	}
-
-	k8sSharedWarmTarget := cfg.K8s.SharedWarmTarget
-	// Only cap the warm target if k8sMaxWorkers is an actual upper bound
-	// (>0). When k8sMaxWorkers == 0 the pool is unbounded and the warm
-	// target stands on its own.
-	if isK8s && k8sMaxWorkers > 0 && k8sSharedWarmTarget > k8sMaxWorkers {
-		slog.Warn("k8s.shared_warm_target exceeds k8s.max_workers; capping to k8s.max_workers.",
-			"k8s_shared_warm_target", k8sSharedWarmTarget,
-			"k8s_max_workers", k8sMaxWorkers)
-		k8sSharedWarmTarget = k8sMaxWorkers
-		cfg.K8s.SharedWarmTarget = k8sSharedWarmTarget
 	}
 
 	// In remote (multitenant) mode the global DuckLake.MetadataStore is empty
@@ -450,15 +499,24 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		cfg.AlwaysDuckLake = true
 	}
 
+	// Default the connection idle timeout to a short value: in control-plane
+	// mode an idle client connection pins a worker (a scarce k8s pod / local
+	// process), so a connection idle this long is closed and its worker released
+	// to hot-idle. InitMinimalServer does NOT run server.New's defaulting, so set
+	// it here. --idle-timeout overrides (negative disables). Standalone keeps the
+	// 24h default applied in server.New.
+	cfg.IdleTimeout = server.NormalizeIdleTimeout(cfg.IdleTimeout, server.DefaultControlPlaneIdleTimeout)
+	slog.Info("Control-plane connection idle timeout.", "timeout", cfg.IdleTimeout)
+
 	// Create a minimal server for cancel request routing
 	srv := &server.Server{}
 	server.InitMinimalServer(srv, cfg.Config, nil)
 
 	// Initialize query logger (non-fatal on error)
-	if ql, err := server.NewQueryLogger(cfg.Config); err != nil {
+	if sink, err := server.NewQueryLogSink(cfg.Config); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
-	} else if ql != nil {
-		server.SetQueryLogger(srv, ql)
+	} else if sink != nil {
+		server.SetQueryLogSink(srv, sink)
 	}
 
 	cp := &ControlPlane{
@@ -477,16 +535,24 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 
 	// Multi-tenant mode: config store + per-org pools (K8s remote backend only)
 	if cfg.WorkerBackend == "remote" {
-		store, adapter, apiServer, runtimeTracker, janitorLeader, err := SetupMultiTenant(cfg, srv, memBudget, k8sMaxWorkers, cp.healthReady)
+		store, adapter, apiServer, runtimeTracker, janitorLeader, meter, err := SetupMultiTenant(cfg, srv, memBudget, cp.healthReady)
 		if err != nil {
 			slog.Error("Failed to set up multi-tenant config store.", "error", err)
 			os.Exit(1)
 		}
 		cp.configStore = store
 		cp.orgRouter = adapter
+		if resolver, ok := adapter.(interface {
+			MetadataPostgresURL(context.Context, string) (string, error)
+			MetadataProxySessions() *metadataProxySessionRegistry
+		}); ok {
+			cp.metadataPostgresURL = resolver.MetadataPostgresURL
+			cp.metadataSessions = resolver.MetadataProxySessions()
+		}
 		cp.apiServer = apiServer
 		cp.runtimeTracker = runtimeTracker
 		cp.janitorLeader = janitorLeader
+		cp.computeMeter = meter
 		cp.cfg = cfg
 		_ = store // keep linter happy
 		if cp.runtimeTracker != nil {
@@ -613,6 +679,11 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 			os.Exit(0)
 		}
 		slog.Info("Received shutdown signal.", "signal", s)
+		// Close local admission before publishing the durable draining state.
+		// MarkDraining performs a database write and may block; no connection
+		// creation may remain live behind that write.
+		cp.stopAcceptingPGConnections()
+		cp.beginSessionDrain()
 		if cp.runtimeTracker != nil {
 			if err := cp.runtimeTracker.MarkDraining(); err != nil {
 				slog.Warn("Failed to mark control plane draining.", "error", err)
@@ -653,8 +724,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		"worker_backend", cfg.WorkerBackend,
 		"process_min_workers", processMinWorkers,
 		"process_max_workers", processMaxWorkers,
-		"k8s_max_workers", k8sMaxWorkers,
-		"k8s_shared_warm_target", k8sSharedWarmTarget,
 		"worker_queue_timeout", cfg.WorkerQueueTimeout,
 		"session_init_timeout", cfg.SessionInitTimeout,
 		"memory_budget", formatBytes(rebalancer.memoryBudget),
@@ -712,33 +781,48 @@ func (cp *ControlPlane) acceptLoop() {
 }
 
 func createSessionWithRegisteredCancel(
+	parent context.Context,
 	srv *server.Server,
 	timeout time.Duration,
 	key server.BackendKey,
 	createFn func(context.Context) (int32, *flightclient.FlightExecutor, error),
 ) (int32, *flightclient.FlightExecutor, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	srv.RegisterQuery(key, cancel)
 	defer srv.UnregisterQuery(key)
 
-	return createFn(ctx)
+	pid, executor, err := createFn(ctx)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return pid, executor, err
 }
 
 func sessionCreationErrorResponse(err error) (code string, message string) {
-	var capacityErr *WarmCapacityExhaustedError
+	var capacityErr *WorkerCapacityExhaustedError
+	var rejection *configstore.OrgConnectionAdmissionRejectedError
 	switch {
 	case errors.As(err, &capacityErr):
-		return "53300", warmCapacityMissPolicyForReason(capacityErr.missReason()).sqlMessage(capacityErr.RetryAfter)
+		return "53300", capacityMissPolicyForReason(capacityErr.missReason()).sqlMessage(capacityErr.RetryAfter)
+	case errors.As(err, &rejection):
+		scope := "organization"
+		if rejection.Reason == configstore.OrgConnectionAdmissionRejectedUserVCPU {
+			scope = "user"
+		}
+		return "53400", fmt.Sprintf("requested worker requires %d vCPUs, exceeding the %s limit of %d vCPUs; request a smaller worker or raise the limit", rejection.RequestedVCPUs, scope, rejection.MaximumVCPUs)
+	case errors.Is(err, ErrSessionManagerDraining):
+		return "57P03", "control plane is draining, retry shortly"
 	case errors.Is(err, context.Canceled):
 		return "57014", "canceling authentication due to user request"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "53300", "timed out waiting for an available worker"
 	case errors.Is(err, ErrTooManyConnections):
 		return "53300", "too many connections"
-	case errors.Is(err, ErrOrgResourceQuotaExceeded):
-		return "53400", "organization worker resource quota exceeded, please retry shortly"
 	default:
 		return "58000", fmt.Sprintf("failed to create session: %v", err)
 	}
@@ -793,13 +877,28 @@ func (cp *ControlPlane) managedHostnameHint() string {
 
 func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr()
-	slog.Info("Connection accepted.", "remote_addr", remoteAddr)
+	// Connection-scoped logger: grows identity attrs as they resolve
+	// (remote_addr -> user -> org -> worker), so every line in the request
+	// lifecycle is filterable without joining log streams.
+	clog := slog.With("remote_addr", remoteAddr)
+	clog.Info("Connection accepted.")
 	server.IncrementOpenConnections()
 	defer server.DecrementOpenConnections()
 
+	// Defense-in-depth: a panic in the pre-auth parsing path (e.g. a malformed
+	// startup packet) must degrade to a single dropped connection, never crash
+	// the shared multitenant control-plane process. Mirrors the standalone
+	// server's connection-handler recover. Won't catch C++ fatal signals.
+	defer func() {
+		if r := recover(); r != nil {
+			clog.Error("Recovered from panic in control-plane connection handler.", "panic", r)
+			_ = conn.Close()
+		}
+	}()
+
 	releaseRateLimit, msg := server.BeginRateLimitedAuthAttempt(cp.rateLimiter, remoteAddr)
 	if msg != "" {
-		slog.Warn("Connection rejected.", "remote_addr", remoteAddr, "reason", msg)
+		clog.Warn("Connection rejected.", "reason", msg)
 		_ = conn.Close()
 		return
 	}
@@ -808,7 +907,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Set a startup read timeout to prevent goroutine leaks from clients
 	// that connect but never send data (e.g., load balancer TCP health checks).
 	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		slog.Error("Failed to set startup deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to set startup deadline.", "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -818,9 +917,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	params, err := readStartupFromRaw(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
-			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
+			clog.Debug("Client closed connection before sending startup message.")
 		} else {
-			slog.Error("Failed to read startup.", "remote_addr", remoteAddr, "error", err)
+			clog.Error("Failed to read startup.", "error", err)
 		}
 		_ = conn.Close()
 		return
@@ -829,14 +928,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Handle cancel request
 	if params.cancelRequest {
 		key := server.BackendKey{Pid: params.cancelPid, SecretKey: params.cancelSecretKey}
-		cp.srv.CancelQuery(key)
+		if !cp.forwardMetadataCancel(key) {
+			cp.srv.CancelQuery(key)
+		}
 		_ = conn.Close()
 		return
 	}
 
 	// Clear the startup read deadline before proceeding to TLS (which sets its own).
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to clear startup deadline.", "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -848,14 +949,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// Send a PostgreSQL error so the client sees a clear message.
 			_ = server.WriteErrorResponse(conn, "FATAL", "28000", "SSL/TLS connection required. Connect with sslmode=require or higher.")
 		}
-		slog.Warn("Connection rejected: SSL required.", "remote_addr", remoteAddr)
+		clog.Warn("Connection rejected: SSL required.")
 		_ = conn.Close()
 		return
 	}
 
 	// Send 'S' to indicate SSL support
 	if _, err := conn.Write([]byte("S")); err != nil {
-		slog.Error("Failed to send SSL response.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to send SSL response.", "error", err)
 		_ = conn.Close()
 		return
 	}
@@ -866,20 +967,20 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// TLS handshake
 	tlsConn := tls.Server(conn, cp.tlsConfig)
 	if err := tlsConn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		slog.Error("Failed to set TLS deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to set TLS deadline.", "error", err)
 		_ = conn.Close()
 		return
 	}
 	if err := tlsConn.Handshake(); err != nil {
-		slog.Error("TLS handshake failed.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("TLS handshake failed.", "error", err)
 		_ = tlsConn.Close()
 		return
 	}
-	slog.Info("TLS connection established.", "remote_addr", remoteAddr)
+	clog.Info("TLS connection established.")
 	defer func() { _ = tlsConn.Close() }()
 
 	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
-		slog.Error("Failed to clear TLS deadline.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to clear TLS deadline.", "error", err)
 		return
 	}
 
@@ -887,20 +988,22 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	writer := bufio.NewWriter(tlsConn)
 
 	// Read startup message (user/database)
-	startupParams, err := server.ReadStartupMessage(reader)
+	startup, err := server.ReadStartupMessage(reader)
 	if err != nil {
-		slog.Error("Failed to read startup message.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to read startup message.", "error", err)
 		return
 	}
 
+	startupParams := startup.Params
 	username := startupParams["user"]
 	database := startupParams["database"]
 	applicationName := startupParams["application_name"]
+	clog = clog.With("user", username)
 
 	// Honor a client-supplied connect-time search_path from the startup
 	// `options` parameter (libpq `options=-c search_path=...`, PGOPTIONS, or
 	// pgjdbc `currentSchema`), so a session can pick its default catalog at
-	// connect (e.g. iceberg.public). Sanitized here at the trust boundary;
+	// connect (e.g. ducklake.main). Sanitized here at the trust boundary;
 	// empty/invalid falls back to the worker's default search_path.
 	startupOptions := server.ParseStartupOptions(startupParams["options"])
 	var clientSearchPath string
@@ -908,7 +1011,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if sp, ok := server.SanitizeSearchPath(raw); ok {
 			clientSearchPath = sp
 		} else {
-			slog.Warn("Ignoring unsafe client search_path option.", "remote_addr", remoteAddr, "search_path", raw)
+			clog.Warn("Ignoring unsafe client search_path option.", "search_path", raw)
 		}
 	}
 
@@ -921,18 +1024,18 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Request password
 	if err := server.WriteAuthCleartextPassword(writer); err != nil {
-		slog.Error("Failed to request password.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to request password.", "error", err)
 		return
 	}
 	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to flush writer.", "error", err)
 		return
 	}
 
 	// Read password response
 	msgType, body, err := server.ReadMessage(reader)
 	if err != nil {
-		slog.Error("Failed to read password message.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to read password message.", "error", err)
 		return
 	}
 
@@ -945,16 +1048,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	password := string(bytes.TrimRight(body, "\x00"))
 
+	if cp.tryMetadataProxy(context.Background(), tlsConn, reader, writer,
+		tlsConn.ConnectionState().ServerName, username, database, password) {
+		return
+	}
+
 	// Authenticate.
 	// In multi-tenant mode the org is resolved solely from the managed hostname
 	// (SNI); the user is authenticated within that org. The startup `database`
 	// param no longer identifies the org — it selects which attached catalog
-	// (ducklake/iceberg) the session defaults to.
+	// (ducklake) the session defaults to.
 	var (
-		orgID            string
-		passthroughUser  bool
-		defaultCatalog   string
-		requestedCatalog string // "" | "ducklake" | "iceberg" (validated below)
+		orgID             string
+		passthroughUser   bool
+		requestedCatalog  string // "" | "ducklake" (validated below)
+		queryAccessPolicy *server.QueryAccessPolicy
 	)
 	if cp.configStore != nil {
 		sni := tlsConn.ConnectionState().ServerName
@@ -963,13 +1071,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// Identity now comes solely from the managed hostname. The legacy
 			// database→org routing is gone, so an org cannot be resolved without
 			// SNI routing enabled. Warn loudly — this is a misconfiguration.
-			slog.Warn("Postgres connection: SNI routing disabled but identity now requires a managed hostname; set sni_routing_mode=enforce.",
-				"mode", cp.cfg.SNIRoutingMode, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			clog.Warn("Postgres connection: SNI routing disabled but identity now requires a managed hostname; set sni_routing_mode=enforce.",
+				"mode", cp.cfg.SNIRoutingMode, "application_name", applicationName)
 		}
 		if !sniResolution.isManaged {
 			hint := cp.managedHostnameHint()
-			slog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
-				"sni", sni, "expected", hint, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			clog.Warn("Postgres connection rejected: SNI does not match a managed hostname.",
+				"sni", sni, "expected", hint, "application_name", applicationName)
 			_ = server.WriteErrorResponse(writer, "FATAL", "08006",
 				fmt.Sprintf("this server requires connecting via %s", hint))
 			_ = writer.Flush()
@@ -981,8 +1089,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			observeSNIRoutingResolution("postgres", resolution.SNIAliasUsed)
 		}
 		if !resolution.SNIResolved {
-			slog.Warn("Postgres connection rejected: managed hostname does not resolve to a known organization.",
-				"sni", sni, "sni_prefix", sniResolution.sniPrefix, "remote_addr", remoteAddr, "user", username, "application_name", applicationName)
+			clog.Warn("Postgres connection rejected: managed hostname does not resolve to a known organization.",
+				"sni", sni, "sni_prefix", sniResolution.sniPrefix, "application_name", applicationName)
 			_ = server.WriteErrorResponse(writer, "FATAL", "08006",
 				fmt.Sprintf("this server requires connecting via %s", cp.managedHostnameHint()))
 			_ = writer.Flush()
@@ -990,67 +1098,116 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 		if !resolution.CatalogValid {
 			// The startup `database` is now a catalog selector; only
-			// "ducklake"/"iceberg"/empty are valid. No logical-name masking.
-			slog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
-				"database", database, "org", resolution.OrgID, "remote_addr", remoteAddr, "user", username)
+			// "ducklake"/empty are valid. No logical-name masking.
+			clog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
+				"database", database, "org", resolution.OrgID)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000",
-				fmt.Sprintf("database %q does not exist (connect with \"ducklake\" or \"iceberg\")", database))
+				fmt.Sprintf("database %q does not exist (connect with \"ducklake\")", database))
 			_ = writer.Flush()
 			return
 		}
 		if !resolution.Valid {
-			slog.Warn("Authentication failed.", "user", username, "org", resolution.OrgID, "database", database, "remote_addr", remoteAddr)
+			clog.Warn("Authentication failed.", "org", resolution.OrgID, "database", database)
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
-				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+				clog.Warn("IP banned after too many failed auth attempts.")
 			}
 			_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 			_ = writer.Flush()
 			return
 		}
+		if resolution.Disabled {
+			// Per-user kill switch: credentials are correct but the account is
+			// administratively disabled. Distinct from a bad password (28P01) so
+			// the user gets an actionable message; only reachable with valid creds,
+			// so it never leaks account existence to a password-guessing attacker.
+			clog.Warn("Postgres connection rejected: user is disabled.", "org", resolution.OrgID, "user", username)
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "this account is disabled; contact your administrator")
+			_ = writer.Flush()
+			return
+		}
 		orgID = resolution.OrgID
+		clog = clog.With("org", orgID)
 		passthroughUser = resolution.Passthrough
-		defaultCatalog = resolution.DefaultCatalog
 		requestedCatalog = resolution.EffectiveCatalog
+		if resolution.QueryAccess != nil {
+			queryAccessPolicy = &server.QueryAccessPolicy{
+				ReadOnly:         resolution.QueryAccess.ReadOnly,
+				AllowedSchemas:   resolution.QueryAccess.AllowedSchemas,
+				AllowedRelations: resolution.QueryAccess.AllowedRelations,
+			}
+		}
 		// `database` is finalized post-session to the real catalog the session
 		// defaults to (once worker attachment is known), so logs and the
 		// current_database() macro surface the actual catalog.
 	} else {
 		// Single-tenant: static users map
 		if !server.ValidateUserPassword(cp.cfg.Users, username, password) {
-			slog.Warn("Authentication failed.", "user", username, "remote_addr", remoteAddr)
+			clog.Warn("Authentication failed.")
 			banned := server.RecordFailedAuthAttempt(cp.rateLimiter, remoteAddr)
 			if banned {
-				slog.Warn("IP banned after too many failed auth attempts.", "remote_addr", remoteAddr)
+				clog.Warn("IP banned after too many failed auth attempts.")
 			}
 			_ = server.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
 			_ = writer.Flush()
 			return
 		}
 	}
+	clientSearchPath = authorizedClientSearchPath(clientSearchPath, queryAccessPolicy)
 
 	// Send auth OK
 	if err := server.WriteAuthOK(writer); err != nil {
-		slog.Error("Failed to send auth OK.", "remote_addr", remoteAddr, "error", err)
+		clog.Error("Failed to send auth OK.", "error", err)
 		return
 	}
 
 	server.RecordSuccessfulAuthAttempt(cp.rateLimiter, remoteAddr)
-	slog.Info("User authenticated.", "user", username, "remote_addr", remoteAddr)
+	clog.Info("User authenticated.")
+	sessionStart := observe.BeginSessionStart(orgID, "postgres")
+	defer sessionStart.Finish("error", observe.SessionStartReasonUnknown)
 
 	// Resolve the requested worker shape from the connection-string startup
-	// options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
-	// nil => the default exclusive profile. Gated off by default, so this is a
-	// no-op unless the deployment opts in. A rejected profile fails the connect.
-	workerProfile, profileWarns, profileErr := cp.resolveWorkerProfile(startupOptions)
+	// options (duckgres.worker_cpu / worker_memory / worker_ttl), layered on
+	// top of the org's operator-set default profile (multi-tenant only).
+	// nil => the default exclusive profile. Client sizing is gated off by
+	// default; org defaults apply regardless of that gate (they are operator
+	// config, not client input). A rejected client profile fails the connect.
+	var orgProfileDefaults orgWorkerProfileDefaults
+	if cp.configStore != nil && orgID != "" {
+		c, m, t := cp.configStore.OrgDefaultWorkerProfile(orgID)
+		orgProfileDefaults = orgWorkerProfileDefaults{CPU: c, Memory: m, TTL: t}
+	}
+	workerProfile, profileWarns, orgProfileApplied, profileErr := cp.resolveWorkerProfile(startupOptions, orgProfileDefaults)
 	if profileErr != nil {
-		slog.Warn("Rejected worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", profileErr)
+		sessionStart.Finish("error", observe.SessionStartReasonClient)
+		clog.Warn("Rejected worker profile.", "error", profileErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "22023", profileErr.Error())
 		_ = writer.Flush()
 		return
 	}
+
 	for _, w := range profileWarns {
-		slog.Warn("Adjusted worker profile.", "user", username, "org", orgID, "remote_addr", remoteAddr, "detail", w)
+		clog.Warn("Adjusted worker profile.", "detail", w)
+	}
+	if orgProfileApplied && workerProfile != nil {
+		// Once per connection so support can see which shape a tenant got.
+		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
+	}
+
+	// Validate a `-c duckgres.s3_cache=...` startup option BEFORE acquiring a
+	// worker (same early-reject treatment as an invalid duckgres.worker_*
+	// option). The option is applied after the session executor is bound,
+	// below — application swaps the worker's S3 secret transport off the
+	// node-local cache proxy for this session.
+	rawS3Cache, s3CacheRequested := startupOptions[server.S3CacheGUCName]
+	if s3CacheRequested {
+		if err := server.ValidateS3CacheOption(rawS3Cache); err != nil {
+			sessionStart.Finish("error", observe.SessionStartReasonClient)
+			clog.Warn("Rejected s3_cache startup option.", "error", err)
+			_ = server.WriteErrorResponse(writer, "FATAL", "22023", err.Error())
+			_ = writer.Flush()
+			return
+		}
 	}
 
 	// Resolve the session manager and rebalancer for this connection.
@@ -1062,9 +1219,26 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// hitting a partially-migrated catalog. The client gets a clear error
 		// and can retry after the migration completes.
 		if cp.orgRouter.IsMigratingForOrg(orgID) {
-			slog.Info("Connection rejected during DuckLake migration.", "user", username, "org", orgID, "remote_addr", remoteAddr)
+			sessionStart.Finish("error", observe.SessionStartReasonLifecycle)
+			clog.Info("Connection rejected during DuckLake migration.")
 			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 				"DuckLake catalog upgrade in progress for your organization, please retry in a few moments")
+			_ = writer.Flush()
+			return
+		}
+
+		// Reject connections while the org's metadata store is being resharded.
+		// The org stack stays up so in-flight sessions drain naturally; this
+		// gate stops NEW connections. (UX only — the sound cluster-wide barrier
+		// is the lease-grant check in configstore/org_connections.go, which
+		// serializes against the ready→resharding CAS under the org's
+		// connection advisory lock.)
+		if whState, ok := cp.configStore.OrgWarehouseStatus(orgID); ok &&
+			whState == string(configstore.ManagedWarehouseStateResharding) {
+			sessionStart.Finish("error", observe.SessionStartReasonLifecycle)
+			clog.Info("Connection rejected during metadata-store reshard.")
+			_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+				"metadata-store reshard in progress for your organization, please retry shortly")
 			_ = writer.Flush()
 			return
 		}
@@ -1076,6 +1250,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// the stack absence is expected and the client should be told to
 			// retry rather than receive a misleading auth-style error.
 			whState, orgExists := cp.configStore.OrgWarehouseStatus(orgID)
+			sessionStart.Finish("error", missingOrgStackReason(whState, orgExists))
 			switch {
 			case !orgExists:
 				_ = server.WriteErrorResponse(writer, "FATAL", "28000", "no org configured for user")
@@ -1091,6 +1266,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				whState == string(configstore.ManagedWarehouseStateDeleted):
 				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
 					"warehouse is being deleted")
+			case whState == string(configstore.ManagedWarehouseStateResharding):
+				// CP restarted mid-reshard: no stack was rebuilt for the
+				// non-ready warehouse, but the client-facing message should
+				// still say reshard, not "provisioning".
+				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
+					"metadata-store reshard in progress for your organization, please retry shortly")
 			default:
 				// pending / provisioning
 				_ = server.WriteErrorResponse(writer, "FATAL", "57P03",
@@ -1106,10 +1287,19 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		rebalancer = cp.rebalancer
 	}
 	if cp.isDraining() {
+		sessionStart.Finish("draining", observe.SessionStartReasonLifecycle)
 		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
 		_ = writer.Flush()
 		return
 	}
+	preReadyCtx, finishPreReady, err := cp.beginPreReadyHandshake(context.Background())
+	if err != nil {
+		sessionStart.Finish("draining", observe.SessionStartReasonLifecycle)
+		_ = server.WriteErrorResponse(writer, "FATAL", "57P03", "control plane is draining, retry shortly")
+		_ = writer.Flush()
+		return
+	}
+	defer finishPreReady()
 
 	// Feed initial parameters and backend key data to the client IMMEDIATELY.
 	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
@@ -1121,7 +1311,8 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	defer server.CancelClientConn(tmpCC)
 	server.SendInitialParams(tmpCC)
 	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush initial params.", "remote_addr", remoteAddr, "error", err)
+		sessionStart.Finish("error", observe.SessionStartReasonTransport)
+		clog.Error("Failed to flush initial params.", "error", err)
 		return
 	}
 
@@ -1140,7 +1331,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		threads = rebalancer.PerSessionThreads()
 	}
 
-	_, executor, err := createSessionWithRegisteredCancel(
+	admissionCtx, disconnectWatcher := startPreReadyDisconnectWatcher(preReadyCtx, tlsConn, reader)
+	defer disconnectWatcher.Stop()
+	createdPID, executor, err := createSessionWithRegisteredCancel(
+		admissionCtx,
 		cp.srv,
 		cp.cfg.WorkerQueueTimeout,
 		server.BackendKey{Pid: pid, SecretKey: secretKey},
@@ -1148,8 +1342,23 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return sessions.CreateSession(ctx, username, pid, memLimit, threads, workerProfile)
 		},
 	)
+	if cp.isDraining() {
+		err = ErrSessionManagerDraining
+	}
 	if err != nil {
-		slog.Error("Failed to create session.", "user", username, "remote_addr", remoteAddr, "error", err)
+		// Session creation may have committed at the same instant a CancelRequest,
+		// client FIN/RST, or drain canceled its context. Never retain that raced
+		// session without a live client to own it.
+		if executor != nil {
+			if createdPID == 0 {
+				createdPID = pid
+			}
+			sessions.DestroySession(createdPID)
+			executor = nil
+		}
+		outcome, reason := controlPlaneSessionStartResult(err)
+		sessionStart.Finish(outcome, reason)
+		clog.Error("Failed to create session.", "error", err)
 		code, message := sessionCreationErrorResponse(err)
 		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
 		_ = writer.Flush()
@@ -1158,6 +1367,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Worker is now assigned — capture identity for log correlation.
 	workerID := sessions.WorkerIDForPID(pid)
 	workerPod := sessions.WorkerPodNameForPID(pid)
+	clog = clog.With("worker", workerID, "worker_pod", workerPod)
 	if orgID != "" {
 		observeOrgSessionsActive(orgID, sessions.SessionCount())
 	}
@@ -1170,18 +1380,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Probe which catalogs the worker actually attached for this session, then
 	// resolve the real catalog the session defaults to. The startup `database`
-	// selected "ducklake"/"iceberg"/"" (default); fail closed (3D000) if the
+	// selected "ducklake"/"" (default); fail closed (3D000) if the
 	// requested catalog isn't attached.
-	attachCtx, attachCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-	duckLakeAttached, dlErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
-	icebergAttached, icErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalIcebergCatalog)
+	attachCtx, attachCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
+	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
+	attachContextErr := attachCtx.Err()
 	attachCancel()
-	probeErr := dlErr
-	if probeErr == nil {
-		probeErr = icErr
-	}
 	if probeErr != nil {
-		slog.Error("Failed to detect attached catalogs.", "user", username, "org", orgID, "remote_addr", remoteAddr, "error", probeErr, "worker", workerID, "worker_pod", workerPod)
+		outcome, reason := controlPlaneSessionStartOperationResult(
+			probeErr,
+			attachContextErr,
+			cp.isDraining(),
+			observe.SessionStartReasonMetadataStore,
+		)
+		sessionStart.Finish(outcome, reason)
+		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
 		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
 		_ = writer.Flush()
 		return
@@ -1189,10 +1402,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	var effectiveCatalog string
 	if cp.configStore != nil {
 		var ok bool
-		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, defaultCatalog, duckLakeAttached, icebergAttached)
+		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, duckLakeAttached)
 		if !ok {
-			slog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
-				"requested", requestedCatalog, "org", orgID, "ducklake_attached", duckLakeAttached, "iceberg_attached", icebergAttached, "remote_addr", remoteAddr, "user", username)
+			sessionStart.Finish("error", observe.SessionStartReasonMetadataStore)
+			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
+				"requested", requestedCatalog, "ducklake_attached", duckLakeAttached)
 			msg := "no catalog is available for this connection"
 			if requestedCatalog != "" {
 				msg = fmt.Sprintf("database %q does not exist", requestedCatalog)
@@ -1205,12 +1419,9 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// Single-tenant (process backend / static users): de-mask to the real
 		// attached catalog when present; otherwise keep the client's database name
 		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
-		switch {
-		case duckLakeAttached:
+		if duckLakeAttached {
 			effectiveCatalog = physicalDuckLakeCatalog
-		case icebergAttached:
-			effectiveCatalog = physicalIcebergCatalog
-		default:
+		} else {
 			effectiveCatalog = database
 		}
 	}
@@ -1225,10 +1436,25 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// worker session stays in DuckDB's empty in-memory catalog (see the
 	// passthrough branch below).
 	if !passthroughUser {
-		initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
-		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, effectiveCatalog); err != nil {
+		initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
+		var metadataAccess *sessionmeta.MetadataAccessPolicy
+		if queryAccessPolicy != nil {
+			metadataAccess = &sessionmeta.MetadataAccessPolicy{
+				AllowedSchemas:   queryAccessPolicy.AllowedSchemas,
+				AllowedRelations: queryAccessPolicy.AllowedRelations,
+			}
+		}
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, executor, effectiveCatalog, metadataAccess); err != nil {
+			initContextErr := initCtx.Err()
 			initCancel()
-			slog.Error("Failed to initialize session database metadata.", "user", username, "org", orgID, "database", database, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+			outcome, reason := controlPlaneSessionStartOperationResult(
+				err,
+				initContextErr,
+				cp.isDraining(),
+				observe.SessionStartReasonMetadataStore,
+			)
+			sessionStart.Finish(outcome, reason)
+			clog.Error("Failed to initialize session database metadata.", "database", database, "error", err)
 			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
 			_ = writer.Flush()
 			return
@@ -1239,36 +1465,51 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// It must run here, not on the worker at session create:
 		// InitSessionDatabaseMetadata's defer resets the catalog/search_path, so an
 		// earlier value would be clobbered. A client-supplied search_path is
-		// best-effort; the configured catalog (Iceberg) fails closed because
-		// silently falling back would route the user to the wrong catalog.
+		// best-effort.
 		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
-			spCtx, spCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+			spCtx, spCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(spCtx, cmd)
+			spContextErr := spCtx.Err()
 			spCancel()
 			if err != nil {
 				if source == sessionDefaultSourceConfiguredCatalog {
-					slog.Error("Failed to apply session default catalog.", "user", username, "org", orgID, "catalog", effectiveCatalog, "error", err)
+					outcome, reason := controlPlaneSessionStartOperationResult(
+						err,
+						spContextErr,
+						cp.isDraining(),
+						observe.SessionStartReasonMetadataStore,
+					)
+					sessionStart.Finish(outcome, reason)
+					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
 					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 					_ = writer.Flush()
 					return
 				}
-				slog.Warn("Failed to apply client connect-time search_path; using default.", "user", username, "org", orgID, "search_path", clientSearchPath, "error", err)
+				clog.Warn("Failed to apply client connect-time search_path; using default.", "search_path", clientSearchPath, "error", err)
 			}
 		}
 	} else {
 		// Passthrough: no pg_catalog views and no rewriting, but the session must
 		// still land in its selected catalog instead of the empty in-memory one.
-		// Standalone passthrough does this via server.setDuckLakeDefault/
-		// setIcebergDefault; the remote-worker path issues the equivalent here.
+		// Standalone passthrough does this via server.setDuckLakeDefault;
+		// the remote-worker path issues the equivalent here.
 		if clientSearchPath != "" {
-			slog.Warn("Ignoring client connect-time search_path for passthrough session.", "user", username, "org", orgID, "search_path", clientSearchPath, "remote_addr", remoteAddr)
+			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", clientSearchPath)
 		}
 		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
-			initCtx, initCancel := context.WithTimeout(context.Background(), cp.cfg.SessionInitTimeout)
+			initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
 			_, err := executor.ExecContext(initCtx, cmd)
+			initContextErr := initCtx.Err()
 			initCancel()
 			if err != nil {
-				slog.Error("Failed to apply passthrough session default catalog.", "user", username, "org", orgID, "command", cmd, "error", err, "worker", workerID, "worker_pod", workerPod)
+				outcome, reason := controlPlaneSessionStartOperationResult(
+					err,
+					initContextErr,
+					cp.isDraining(),
+					observe.SessionStartReasonMetadataStore,
+				)
+				sessionStart.Finish(outcome, reason)
+				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
 				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
 				_ = writer.Flush()
 				return
@@ -1282,41 +1523,166 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 
 	// Create real clientConn with FlightExecutor and worker assignment
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
-	if cp.orgRouter != nil && orgID != "" {
-		if icebergCfg, ok := cp.orgRouter.IcebergConfigForOrg(orgID); ok {
-			server.SetConnectionIcebergConfig(cc, icebergCfg)
+	// Stamp the PostHog team id (config-snapshot read, no I/O) so this
+	// connection's product-analytics events carry a PostHog-native key. Same
+	// resolution the compute meter uses: the connecting user's team, else the
+	// org's oldest team, else 0 (unknown / not-yet-loaded snapshot).
+	if cp.configStore != nil && orgID != "" {
+		server.SetConnectionTeamID(cc, cp.configStore.OrgUsageTeamID(orgID, username))
+	}
+	// Stamp the provisioned worker pod size for compute-usage billing. Only the
+	// remote/k8s backend has a per-org worker pod with a known size; the process
+	// backend leaves it zero so metering is skipped. Constant for the
+	// connection's life (computed once at teardown over its full lifetime).
+	if cp.isRemoteBackend {
+		millicores, mib := cp.workerBillingSize(workerProfile)
+		server.SetConnectionWorkerSize(cc, millicores, mib)
+	}
+	// Record the connection's full lifetime exactly once, on every exit path
+	// (clean disconnect, message-loop error, or handshake-completion failure):
+	// bumps duckgres_connection_duration_seconds (per org) and logs duration_ms,
+	// and meters compute-usage (best-effort; never affects the client).
+	defer func() {
+		dur := server.CloseConnectionMetrics(cc)
+		clog.Info("Client disconnected.", "duration_ms", dur.Milliseconds())
+		// Best-effort compute-usage metering. cp.computeMeter is nil outside the
+		// remote backend; Record is nil-safe and a zero worker size
+		// (non-remote/unknown) is a no-op. A panic here must never escape
+		// teardown.
+		if cp.computeMeter != nil {
+			func() {
+				defer func() { _ = recover() }()
+				billOrg, billUser, billSource, millicores, mib, billDur := server.ConnectionBilling(cc)
+				cp.computeMeter.Record(billOrg, billUser, billSource, millicores, mib, time.Now(), billDur)
+			}()
+		}
+	}()
+	// Record the resolved physical catalog so the transpiler selects the right
+	// backend profile (DuckLake DDL+DML policy) for this session.
+	server.SetConnectionPhysicalCatalog(cc, effectiveCatalog)
+	// Catalog USE rewriting (expanding bare `USE ducklake` to the reliable
+	// two-part target) is a non-passthrough feature; passthrough sessions
+	// talk raw DuckDB, so keep it disabled for them. Enabled whenever the
+	// catalog is attached.
+	server.SetCatalogUseRewrite(cc, duckLakeAttached && !passthroughUser)
+	server.SetPassthrough(cc, passthroughUser)
+	server.SetQueryAccessPolicy(cc, queryAccessPolicy)
+	// Apply the connect-time `-c duckgres.s3_cache=...` option (validated
+	// before worker acquisition, above) now that the session executor is
+	// bound. Failure refuses the connection: a session that asked for
+	// s3_cache=off must never silently run through the cache.
+	if s3CacheRequested {
+		if err := server.ApplyConnectionS3CacheOption(cc, rawS3Cache); err != nil {
+			sessionStart.Finish("error", observe.SessionStartReasonWorker)
+			clog.Error("Failed to apply s3_cache startup option.", "error", err)
+			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", err.Error())
+			_ = writer.Flush()
+			return
 		}
 	}
-	// Record the resolved physical catalog so the transpiler selects the right
-	// backend profile (DuckLake/Iceberg DDL+DML policy) for this session.
-	server.SetConnectionPhysicalCatalog(cc, effectiveCatalog)
-	// Catalog USE rewriting (expanding bare `USE ducklake`/`USE iceberg` to the
-	// reliable two-part target) is a non-passthrough feature; passthrough sessions
-	// talk raw DuckDB, so keep it disabled for them. Enabled whenever either
-	// catalog is attached.
-	server.SetCatalogUseRewrite(cc, (duckLakeAttached || icebergAttached) && !passthroughUser)
-	server.SetPassthrough(cc, passthroughUser)
-	if orgID != "" {
-		observeOrgPgSessionAccepted(orgID, passthroughUser)
+	// The normal PostgreSQL message loop is about to take ownership of reader.
+	// Join the disconnect watcher first; a FIN/RST at any point during session
+	// admission or metadata initialization tears down the session via the defer
+	// above instead of retaining its worker and vCPU lease.
+	disconnect := disconnectWatcher.Stop()
+	drained := finishPreReady()
+	if disconnect.ClientCanceled {
+		sessionStart.Finish("canceled", observe.SessionStartReasonCanceled)
+		return
+	}
+	if drained {
+		sessionStart.Finish("draining", observe.SessionStartReasonLifecycle)
+		return
 	}
 
 	// Send ReadyForQuery to signal that the handshake is complete
 	if err := server.WriteReadyForQuery(writer, 'I'); err != nil {
-		slog.Error("Failed to send ReadyForQuery.", "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+		sessionStart.Finish("error", observe.SessionStartReasonTransport)
+		clog.Error("Failed to send ReadyForQuery.", "error", err)
 		return
 	}
 	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush writer.", "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+		sessionStart.Finish("error", observe.SessionStartReasonTransport)
+		clog.Error("Failed to flush writer.", "error", err)
 		return
 	}
+	sessionStart.Finish("success", observe.SessionStartReasonNone)
+	if orgID != "" {
+		observeOrgPgSessionAccepted(orgID, passthroughUser)
+	}
 
-	// Run message loop
+	// Run message loop. Disconnect log + duration histogram are emitted by the
+	// deferred CloseConnectionMetrics above on every return path.
 	if err := server.RunMessageLoop(cc); err != nil {
-		slog.Error("Message loop error.", "user", username, "remote_addr", remoteAddr, "error", err, "worker", workerID, "worker_pod", workerPod)
+		clog.Error("Message loop error.", "error", err)
 		return
 	}
+}
 
-	slog.Info("Client disconnected.", "user", username, "remote_addr", remoteAddr, "worker", workerID, "worker_pod", workerPod)
+func controlPlaneSessionStartResult(err error) (outcome, reason string) {
+	var capacityErr *WorkerCapacityExhaustedError
+	var rejection *configstore.OrgConnectionAdmissionRejectedError
+	switch {
+	case err == nil:
+		return "success", observe.SessionStartReasonNone
+	case errors.As(err, &capacityErr):
+		return "capacity", observe.SessionStartReasonCapacity
+	case errors.As(err, &rejection):
+		return "capacity", observe.SessionStartReasonClient
+	case errors.Is(err, context.Canceled):
+		return "canceled", observe.SessionStartReasonCanceled
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, ErrTooManyConnections):
+		return "timeout", observe.SessionStartReasonCapacity
+	case errors.Is(err, ErrSessionManagerDraining):
+		return "draining", observe.SessionStartReasonLifecycle
+	default:
+		return "error", observe.SessionStartReasonWorker
+	}
+}
+
+func controlPlaneSessionStartOperationResult(
+	err, contextErr error,
+	draining bool,
+	reason string,
+) (outcome, classifiedReason string) {
+	if draining {
+		return "draining", observe.SessionStartReasonLifecycle
+	}
+	terminalErr := err
+	if contextErr != nil {
+		terminalErr = contextErr
+	}
+	outcome, _ = controlPlaneSessionStartResult(terminalErr)
+	switch outcome {
+	case "success":
+		return outcome, observe.SessionStartReasonNone
+	case "canceled":
+		return outcome, observe.SessionStartReasonCanceled
+	case "draining":
+		return outcome, observe.SessionStartReasonLifecycle
+	default:
+		return outcome, reason
+	}
+}
+
+func missingOrgStackReason(warehouseState string, orgExists bool) string {
+	if !orgExists {
+		return observe.SessionStartReasonClient
+	}
+	if warehouseState == "" || warehouseState == string(configstore.ManagedWarehouseStateReady) {
+		return observe.SessionStartReasonControlPlane
+	}
+	return observe.SessionStartReasonLifecycle
+}
+
+func authorizedClientSearchPath(searchPath string, policy *server.QueryAccessPolicy) string {
+	if policy != nil {
+		// Scoped users must use fully qualified project relations. Ignoring a
+		// client-controlled startup search_path also prevents namespace changes
+		// from influencing catalog compatibility views.
+		return ""
+	}
+	return searchPath
 }
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
@@ -1325,7 +1691,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // resources are not configured (DuckDB will then auto-detect on the worker).
 func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit string, threads int) {
 	// A non-default profile sizes DuckDB from the profile's pod shape, not the
-	// pool-global request, so a small colocated worker gets matching limits. An
+	// pool-global request, so a smaller sized worker gets matching limits. An
 	// empty profile field falls back to the pool-global request (today's value).
 	memReq := cp.cfg.K8s.WorkerMemoryRequest
 	cpuReq := cp.cfg.K8s.WorkerCPURequest
@@ -1339,17 +1705,7 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	if memReq != "" {
-		memBytes := parseK8sMemory(memReq)
-		if memBytes > 0 {
-			duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
-			const gb = 1024 * 1024 * 1024
-			const mb = 1024 * 1024
-			if duckdbBytes >= gb {
-				memLimit = fmt.Sprintf("%dGB", duckdbBytes/gb)
-			} else {
-				memLimit = fmt.Sprintf("%dMB", duckdbBytes/mb)
-			}
-		}
+		memLimit = duckdbMemoryLimitForPodMemory(parseK8sMemory(memReq))
 	}
 
 	if cpuReq != "" {
@@ -1357,6 +1713,46 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	return memLimit, threads
+}
+
+// duckdbMemoryLimitForPodMemory formats the DuckDB memory_limit for a worker
+// pod of the given memory size: 75% of the pod, leaving the remainder as
+// headroom for everything memory_limit does NOT govern (DuckDB C++ catalog
+// objects, postgres_scanner/libpq result buffers, the Go runtime, page cache).
+// Returns "" when memBytes is 0/unparseable (DuckDB then auto-detects).
+// Shared between session sizing (workerDuckDBLimits) and the spawn-time
+// DUCKGRES_MEMORY_LIMIT env so the two can never disagree.
+func duckdbMemoryLimitForPodMemory(memBytes uint64) string {
+	if memBytes == 0 {
+		return ""
+	}
+	duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
+	const gb = 1024 * 1024 * 1024
+	const mb = 1024 * 1024
+	if duckdbBytes >= gb {
+		return fmt.Sprintf("%dGB", duckdbBytes/gb)
+	}
+	return fmt.Sprintf("%dMB", duckdbBytes/mb)
+}
+
+// workerBillingSize returns the provisioned worker pod size for compute-usage
+// billing, in milli-units (millicores, MiB). It mirrors workerDuckDBLimits's
+// source-of-truth selection: a non-default profile sizes from the profile's pod
+// shape, falling back to the pool-global request. Returns (0, 0) when the size
+// is unconfigured (metering then skipped). NOTE: this is the *provisioned*
+// pod size (the full vCPU/GiB billed), NOT the 75%-of-RAM DuckDB memory_limit.
+func (cp *ControlPlane) workerBillingSize(profile *WorkerProfile) (millicores, mib int64) {
+	cpuReq := cp.cfg.K8s.WorkerCPURequest
+	memReq := cp.cfg.K8s.WorkerMemoryRequest
+	if profile != nil {
+		if profile.CPU != "" {
+			cpuReq = profile.CPU
+		}
+		if profile.Memory != "" {
+			memReq = profile.Memory
+		}
+	}
+	return parseK8sCPUMillicores(cpuReq), parseK8sMemoryMiB(memReq)
 }
 
 // parseK8sMemory parses a Kubernetes memory string (e.g., "360Gi", "8Gi", "512Mi", "4GB")
@@ -1410,6 +1806,40 @@ func parseK8sCPU(s string) int {
 		return 0
 	}
 	return cores
+}
+
+// parseK8sCPUMillicores parses a Kubernetes CPU string (e.g. "8", "8000m",
+// "500m") into millicores (1 core = 1000 millicores). Used by compute-usage
+// metering, which counts internally in millicore-seconds to avoid truncating a
+// fractional-core worker. Returns 0 on empty/unparseable input.
+func parseK8sCPUMillicores(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if strings.HasSuffix(s, "m") {
+		var millicores int64
+		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores); err != nil || millicores < 0 {
+			return 0
+		}
+		return millicores
+	}
+	var cores float64
+	if _, err := fmt.Sscanf(s, "%f", &cores); err != nil || cores < 0 {
+		return 0
+	}
+	return int64(cores * 1000)
+}
+
+// parseK8sMemoryMiB parses a Kubernetes memory string into whole mebibytes
+// (MiB = 1024*1024 bytes). Used by compute-usage metering, which counts
+// internally in MiB-seconds. Returns 0 on empty/unparseable input.
+func parseK8sMemoryMiB(s string) int64 {
+	bytes := parseK8sMemory(s)
+	if bytes == 0 {
+		return 0
+	}
+	return int64(bytes / (1024 * 1024))
 }
 
 // startupResult holds the parsed initial startup message.
@@ -1519,6 +1949,7 @@ func fullRead(conn net.Conn, buf []byte) (int, error) {
 
 func (cp *ControlPlane) shutdown() {
 	cp.stopAcceptingPGConnections()
+	cp.beginSessionDrain()
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
@@ -1531,18 +1962,30 @@ func (cp *ControlPlane) shutdown() {
 	slog.Info("Waiting for connections to drain...")
 	cp.wg.Wait()
 
+	// Final compute-usage flush: drained connections fired their end records
+	// into the in-process counter; land them in the durable buffer before exit
+	// (best-effort, nil-safe). See billing plan §5.3.
+	if cp.computeMeter != nil {
+		cp.computeMeter.Flush()
+	}
+
 	cp.shutdownRuntimeResources()
 }
 
 func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
-	// Stop spawning warm workers immediately so we don't create pods that
-	// outlive this CP instance and block scheduling for the replacement.
-	if cp.orgRouter != nil {
-		cp.orgRouter.SetWarmCapacityTarget(0)
-	}
 	cp.stopAcceptingPGConnections()
+	cp.beginSessionDrain()
 	if cp.flight != nil {
 		cp.flight.BeginDrain()
+	}
+	// Park idle (zero-session) Hot workers into hot_idle NOW, at drain start, so
+	// the hot-idle TTL reaper (or a peer-CP takeover) reclaims them during the
+	// drain wait below. Without this they linger for the entire — possibly
+	// unbounded — wait, because ShutdownAll (which cleans idle workers) runs only
+	// AFTER waitForDrain returns. No new sessions can land on them: PG accept is
+	// already closed and Flight is draining. Busy workers are untouched.
+	if cp.orgRouter != nil {
+		cp.orgRouter.ReleaseIdleHotWorkers()
 	}
 	if timeout > 0 {
 		slog.Info("Waiting for planned shutdown drain.", "timeout", timeout)
@@ -1558,6 +2001,11 @@ func (cp *ControlPlane) drainAndShutdown(timeout time.Duration) {
 		cp.flight.Shutdown()
 		cp.flight = nil
 	}
+	// Final compute-usage flush after connections have drained to their natural
+	// end (best-effort, nil-safe). See billing plan §5.3.
+	if cp.computeMeter != nil {
+		cp.computeMeter.Flush()
+	}
 	cp.shutdownRuntimeResources()
 }
 
@@ -1569,6 +2017,22 @@ func (cp *ControlPlane) stopAcceptingPGConnections() {
 	if cp.pgListener != nil {
 		_ = cp.pgListener.Close()
 	}
+}
+
+func (cp *ControlPlane) beginSessionDrain() {
+	cp.sessionDraining.Store(true)
+	cp.preReady.close()
+	if cp.orgRouter != nil {
+		cp.orgRouter.BeginDrain()
+		return
+	}
+	if cp.sessions != nil {
+		cp.sessions.BeginDrain()
+	}
+}
+
+func (cp *ControlPlane) beginPreReadyHandshake(ctx context.Context) (context.Context, func() bool, error) {
+	return cp.preReady.begin(ctx)
 }
 
 // waitForDrain blocks until both the pgwire and Flight server report
@@ -1646,7 +2110,7 @@ func (cp *ControlPlane) shutdownRuntimeResources() {
 }
 
 func (cp *ControlPlane) isDraining() bool {
-	return cp.runtimeTracker != nil && cp.runtimeTracker.Draining()
+	return cp.sessionDraining.Load() || cp.upgradeDraining.Load() || (cp.runtimeTracker != nil && cp.runtimeTracker.Draining())
 }
 
 func (cp *ControlPlane) healthReady() bool {
@@ -1663,8 +2127,16 @@ func (cp *ControlPlane) healthReady() bool {
 }
 
 func (cp *ControlPlane) stopQueryLogger() {
-	if cp.srv != nil && cp.srv.QueryLogger() != nil {
-		cp.srv.QueryLogger().Stop()
+	if cp.srv != nil {
+		timeout := cp.cfg.ShutdownTimeout
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := cp.srv.StopQueryLogging(ctx); err != nil {
+			slog.Warn("Query log shutdown deadline exceeded.", "error", err)
+		}
 	}
 }
 
@@ -1728,7 +2200,7 @@ func (cp *ControlPlane) handleUpgrade() {
 		if strings.Contains(err.Error(), "parent hasn't exited") && cp.killStuckParent() {
 			if retryErr := cp.upgrader.Upgrade(); retryErr == nil {
 				slog.Info("Upgrade succeeded after terminating stuck parent.")
-				cp.upgradeDraining.Store(true)
+				cp.beginUpgradeDrain()
 				cp.reloading.Store(false)
 				return
 			} else {
@@ -1746,7 +2218,7 @@ func (cp *ControlPlane) handleUpgrade() {
 	}
 
 	slog.Info("Upgrade succeeded, child process is ready. Draining connections.")
-	cp.upgradeDraining.Store(true)
+	cp.beginUpgradeDrain()
 	cp.reloading.Store(false)
 	// upg.Exit() channel closes now, triggering drainAfterUpgrade in the main goroutine.
 }
@@ -1788,22 +2260,26 @@ func (cp *ControlPlane) killStuckParent() bool {
 	}
 }
 
+func (cp *ControlPlane) beginUpgradeDrain() {
+	cp.upgradeDraining.Store(true)
+	cp.beginSessionDrain()
+}
+
 // drainAfterUpgrade is called after a successful tableflip upgrade. It stops
 // accepting new connections, waits for in-flight connections to finish, shuts
 // down workers, and exits.
 func (cp *ControlPlane) drainAfterUpgrade() {
-	// Shut down Flight ingress now that the new CP has started.
+	// Stop accepting new connections. The new CP has its own listener copy
+	// (inherited via tableflip), so closing ours doesn't affect it.
+	cp.stopAcceptingPGConnections()
+	cp.beginSessionDrain()
+
+	// Shut down Flight ingress only after the shared session-creation barrier is
+	// closed; Flight shutdown may block while existing RPCs unwind.
 	if cp.flight != nil {
 		cp.flight.Shutdown()
 		cp.flight = nil
 	}
-
-	// Stop accepting new connections. The new CP has its own listener copy
-	// (inherited via tableflip), so closing ours doesn't affect it.
-	cp.closeMu.Lock()
-	cp.closed = true
-	cp.closeMu.Unlock()
-	_ = cp.pgListener.Close()
 
 	// Wait for in-flight connections to finish (with timeout)
 	drainDone := make(chan struct{})
@@ -1930,6 +2406,24 @@ func (cp *ControlPlane) startFlightIngress() {
 		HandleIdleTTL:      cp.cfg.FlightHandleIdleTTL,
 		SessionTokenTTL:    cp.cfg.FlightSessionTokenTTL,
 		WorkerQueueTimeout: cp.cfg.WorkerQueueTimeout,
+		// Persistent-secret DDL is intercepted on the PG wire protocol only;
+		// over Flight it would execute, never persist, and be wiped at the
+		// next session — reject it up front instead.
+		RejectPersistentSecretDDL: cp.srv != nil && cp.srv.UserSecretManager() != nil,
+	}
+	// Reshard drain: parked reconnectable Flight sessions hold their
+	// connection lease for up to the token TTL and would stall a reshard's
+	// drain step forever. Mark sessions of resharding orgs drain-requested so
+	// the periodic reap destroys them once truly parked (no txn/stream/query
+	// — in-flight work still finishes). Each CP handles only its own parked
+	// sessions; the resharding state arrives via the config snapshot.
+	if orgProvider, ok := provider.(*orgRoutedSessionProvider); ok {
+		flightCfg.ForceDrainSession = func(pid int32) bool {
+			orgProvider.mu.RLock()
+			owned, ok := orgProvider.pidSession[pid]
+			orgProvider.mu.RUnlock()
+			return ok && orgProvider.orgResharding(owned.orgID)
+		}
 	}
 
 	var (
@@ -1947,6 +2441,13 @@ func (cp *ControlPlane) startFlightIngress() {
 	}
 
 	cp.flight = flightIngress
+	if router, ok := cp.orgRouter.(interface {
+		SetProjectScopedUserChangeHandler(func(orgID, username string))
+	}); ok {
+		router.SetProjectScopedUserChangeHandler(func(orgID, username string) {
+			flightIngress.DrainUserSessions(orgID, username)
+		})
+	}
 	cp.flight.Start()
 }
 

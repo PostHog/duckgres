@@ -3,7 +3,6 @@ package server
 import (
 	"database/sql"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -51,39 +50,6 @@ func TestPgDatabaseView(t *testing.T) {
 		}
 		if columns[i] != expected {
 			t.Errorf("Column %d: expected %q, got %q", i, expected, columns[i])
-		}
-	}
-}
-
-func TestInitInformationSchemaColumnsCompatFiltersIcebergDummyRows(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	if err := initInformationSchema(db, true); err != nil {
-		t.Fatalf("Failed to init information_schema: %v", err)
-	}
-
-	var viewSQL string
-	if err := db.QueryRow(`
-		SELECT sql
-		FROM duckdb_views()
-		WHERE database_name = 'memory'
-			AND schema_name = 'main'
-			AND view_name = 'information_schema_columns_compat'
-	`).Scan(&viewSQL); err != nil {
-		t.Fatalf("Failed to query compat view definition: %v", err)
-	}
-
-	for _, want := range []string{
-		"table_catalog = 'iceberg'",
-		"column_name = '__'",
-		"UNKNOWN",
-	} {
-		if !strings.Contains(viewSQL, want) {
-			t.Fatalf("columns compat view definition missing %q in:\n%s", want, viewSQL)
 		}
 	}
 }
@@ -340,6 +306,62 @@ func TestUptimeMacros(t *testing.T) {
 	}
 }
 
+func TestArrayLowerCompatibilityMacro(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := initPgCatalog(db, processStartTime, processStartTime, "dev", "dev"); err != nil {
+		t.Fatalf("Failed to init pg_catalog: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  sql.NullInt64
+	}{
+		{
+			name:  "one dimensional non-empty array",
+			query: "SELECT array_lower(ARRAY[1, 2, 3], 1)",
+			want:  sql.NullInt64{Int64: 1, Valid: true},
+		},
+		{
+			name:  "empty array",
+			query: "SELECT array_lower(ARRAY[]::INTEGER[], 1)",
+			want:  sql.NullInt64{},
+		},
+		{
+			name:  "null array",
+			query: "SELECT array_lower(NULL::INTEGER[], 1)",
+			want:  sql.NullInt64{},
+		},
+		{
+			name:  "unsupported dimension",
+			query: "SELECT array_lower(ARRAY[1, 2, 3], 2)",
+			want:  sql.NullInt64{},
+		},
+		{
+			name:  "null dimension",
+			query: "SELECT array_lower(ARRAY[1, 2, 3], NULL)",
+			want:  sql.NullInt64{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got sql.NullInt64
+			if err := db.QueryRow(tt.query).Scan(&got); err != nil {
+				t.Fatalf("%s failed: %v", tt.query, err)
+			}
+			if got.Valid != tt.want.Valid || got.Int64 != tt.want.Int64 {
+				t.Fatalf("array_lower result = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestUtilityMacrosWithoutPgCatalog(t *testing.T) {
 	// Verify that initUtilityMacros works independently of initPgCatalog,
 	// so passthrough users get uptime/version macros.
@@ -436,5 +458,74 @@ func TestInformationSchemaCompatViewsUseCurrentDatabaseForCatalogNames(t *testin
 	}
 	if schemaCatalog != "analytics" {
 		t.Fatalf("schemata catalog_name = %q, want %q", schemaCatalog, "analytics")
+	}
+}
+
+func TestInformationSchemaSequencesAndRoutinesCompatViews(t *testing.T) {
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := initInformationSchema(db, false); err != nil {
+		t.Fatalf("Failed to init information_schema: %v", err)
+	}
+
+	// sequences: one row per real sequence, none on a fresh DB.
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM memory.main.information_schema_sequences_compat`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query sequences compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("fresh DB: expected 0 sequences, got %d", count)
+	}
+
+	if _, err := db.Exec(`CREATE SEQUENCE s START 5 INCREMENT 2`); err != nil {
+		t.Fatalf("Failed to create sequence: %v", err)
+	}
+
+	var schema, name, dataType, startValue, increment, cycleOption string
+	if err := db.QueryRow(`
+		SELECT sequence_schema, sequence_name, data_type, start_value, increment, cycle_option
+		FROM memory.main.information_schema_sequences_compat
+	`).Scan(&schema, &name, &dataType, &startValue, &increment, &cycleOption); err != nil {
+		t.Fatalf("Failed to query sequences compat view after CREATE SEQUENCE: %v", err)
+	}
+	if schema != "public" || name != "s" || dataType != "bigint" ||
+		startValue != "5" || increment != "2" || cycleOption != "NO" {
+		t.Errorf("unexpected sequence row: schema=%q name=%q data_type=%q start=%q increment=%q cycle=%q",
+			schema, name, dataType, startValue, increment, cycleOption)
+	}
+
+	// routines: typed WHERE-false stub — empty, and column-filtered queries don't error.
+	if err := db.QueryRow(`
+		SELECT count(*) FROM memory.main.information_schema_routines_compat
+		WHERE routine_type = 'FUNCTION' AND routine_schema = 'public'
+	`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query routines compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("routines stub: expected 0 rows, got %d", count)
+	}
+
+	// Neither compat view may leak into the tables/views listings.
+	if err := db.QueryRow(`
+		SELECT count(*) FROM memory.main.information_schema_tables_compat
+		WHERE table_name IN ('information_schema_sequences_compat', 'information_schema_routines_compat')
+	`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query tables compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("compat views leaked into information_schema_tables_compat: %d rows", count)
+	}
+	if err := db.QueryRow(`
+		SELECT count(*) FROM memory.main.information_schema_views_compat
+		WHERE table_name IN ('information_schema_sequences_compat', 'information_schema_routines_compat')
+	`).Scan(&count); err != nil {
+		t.Fatalf("Failed to query views compat view: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("compat views leaked into information_schema_views_compat: %d rows", count)
 	}
 }

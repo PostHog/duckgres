@@ -21,8 +21,8 @@ import (
 	"github.com/posthog/duckgres/configresolve"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/crashhandler"
 	"github.com/posthog/duckgres/server"
-	"github.com/posthog/duckgres/server/lakekeeperbroker"
 )
 
 // Each duckgres binary owns its own package-main version/commit/date because
@@ -46,6 +46,13 @@ func main() {
 	// mid-query. Same rationale as the all-in-one binary.
 	signal.Ignore(syscall.SIGPIPE)
 
+	// The native crash handler self-installs from a C constructor (importing
+	// the package links it in): a SIGSEGV on a DuckDB-created thread must kill
+	// the worker with a native backtrace, not wedge it forever holding locks.
+	if !crashhandler.Installed() {
+		slog.Warn("Native crash handler NOT installed; fatal signals on native threads may wedge the process.")
+	}
+
 	// Worker-relevant flag subset. The all-in-one duckgres binary registers
 	// ~60 flags covering standalone / control-plane / duckdb-service. The
 	// worker only needs the bits that feed server.Config (DuckDB execution,
@@ -59,7 +66,7 @@ func main() {
 
 	// --mode is accepted but must be "duckdb-service". The K8s control
 	// plane spawns workers with `--mode duckdb-service` hardcoded
-	// (controlplane/k8s_pool.go), and the all-in-one duckgres binary
+	// (controlplane/k8s_pool_spawn.go), and the all-in-one duckgres binary
 	// uses --mode to route between standalone/control-plane/duckdb-service.
 	// This binary is duckdb-service by definition; we accept the flag so
 	// existing CP pod specs don't crash flag.Parse with "flag provided but
@@ -79,9 +86,6 @@ func main() {
 	duckLakeDeltaCatalogEnabled := flag.Bool("ducklake-delta-catalog-enabled", true, "Attach a Delta Lake catalog during DuckLake worker boot (default true; use --ducklake-delta-catalog-enabled=false to disable; env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED)")
 	duckLakeDeltaCatalogPath := flag.String("ducklake-delta-catalog-path", "", "Delta Lake catalog/table path to attach (env: DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH)")
 	duckLakeDefaultSpecVersion := flag.String("ducklake-default-spec-version", "", "Default DuckLake spec version for migration checks (env: DUCKGRES_DUCKLAKE_DEFAULT_SPEC_VERSION)")
-	icebergEnabled := flag.Bool("iceberg-enabled", false, "Attach a per-tenant Iceberg catalog (Lakekeeper REST) at session init (env: DUCKGRES_ICEBERG_ENABLED)")
-	icebergRegion := flag.String("iceberg-region", "", "AWS region for S3 object access by Iceberg (env: DUCKGRES_ICEBERG_REGION)")
-	icebergNamespace := flag.String("iceberg-namespace", "", "Default Iceberg namespace (env: DUCKGRES_ICEBERG_NAMESPACE)")
 
 	// Query log
 	queryLog := flag.Bool("query-log", true, "Enable/disable DuckLake query log (use --query-log=false to disable; env: DUCKGRES_QUERY_LOG_ENABLED)")
@@ -206,9 +210,6 @@ func main() {
 		DuckLakeDeltaCatalogEnabled: *duckLakeDeltaCatalogEnabled,
 		DuckLakeDeltaCatalogPath:    *duckLakeDeltaCatalogPath,
 		DuckLakeDefaultSpecVersion:  *duckLakeDefaultSpecVersion,
-		IcebergEnabled:              *icebergEnabled,
-		IcebergRegion:               *icebergRegion,
-		IcebergNamespace:            *icebergNamespace,
 		QueryLog:                    *queryLog,
 	}, os.Getenv, func(msg string) {
 		slog.Warn(msg)
@@ -248,23 +249,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Lakekeeper OIDC SA-token broker. Started when DUCKGRES_LAKEKEEPER_TOKEN_PATH
-	// is set (typically by the duckling pod spec, mounting a projected SA
-	// token volume at /var/run/secrets/lakekeeper/token). DuckDB's iceberg
-	// extension POSTs to OAUTH2_SERVER_URI=http://127.0.0.1:9876/token to
-	// fetch a bearer; the broker reads the projected file and hands it back.
-	// When the env var is unset, no broker is started — preserves the
-	// allowall + NetworkPolicy posture for clusters that haven't enabled
-	// OIDC on Lakekeeper yet.
-	if tokenPath := configloader.Env("DUCKGRES_LAKEKEEPER_TOKEN_PATH", ""); tokenPath != "" {
-		broker := lakekeeperbroker.New(tokenPath)
-		if err := broker.ListenAndServe(lakekeeperbroker.DefaultAddr); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to start lakekeeper broker on %s: %s\n", lakekeeperbroker.DefaultAddr, err)
-			os.Exit(1)
-		}
-		slog.Info("Lakekeeper OIDC broker started.", "addr", lakekeeperbroker.DefaultAddr, "token_path", tokenPath)
-	}
-
 	// No initMetrics() here. In control-plane mode all worker pods would
 	// fight over :9090; the control plane process owns the metrics
 	// endpoint. The duckdb-service exposes per-session metrics via its own
@@ -277,4 +261,3 @@ func main() {
 		MaxSessions:  maxSessions,
 	})
 }
-

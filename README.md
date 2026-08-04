@@ -13,12 +13,14 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - [Runbooks](#runbooks)
   - [Perf Runbook](docs/perf-harness-runbook.md)
   - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md)
+  - [Dev Scenario Runner](docs/runbooks/scenario-dev.md)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
   - [YAML Configuration](#yaml-configuration)
   - [Environment Variables](#environment-variables)
   - [CLI Flags](#cli-flags)
   - [PostHog Logging](#posthog-logging)
+  - [PostHog Product-Analytics Events](#posthog-product-analytics-events)
 - [DuckDB Extensions](#duckdb-extensions)
 - [DuckLake Integration](#ducklake-integration)
   - [Quick Start with Docker](#quick-start-with-docker)
@@ -42,7 +44,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 ## Features
 
-- **PostgreSQL Wire Protocol**: Full compatibility with PostgreSQL clients
+- **PostgreSQL Wire Protocol**: Compatibility with PostgreSQL clients for analytical workloads
 - **Two-Tier Query Processing**: Transparently handles both PostgreSQL and DuckDB-specific syntax
 - **TLS Encryption**: Required TLS connections with auto-generated self-signed certificates
 - **Per-User Databases**: Each authenticated user gets their own isolated DuckDB database file
@@ -61,19 +63,43 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is currently fixed at 9090 and cannot be changed via configuration.
 
+See [docs/metrics.md](docs/metrics.md) for exact request-path boundaries,
+labels, aggregation rules, PromQL examples, and admission metric migration.
+
 | Metric | Type | Description |
 |--------|------|-------------|
-| `duckgres_connections_open` | Gauge | Number of currently open client connections |
-| `duckgres_query_duration_seconds` | Histogram | Query execution duration (includes `_count`, `_sum`, `_bucket`) |
-| `duckgres_query_errors_total` | Counter | Total number of failed queries |
-| `duckgres_auth_failures_total` | Counter | Total number of authentication failures |
-| `duckgres_rate_limit_rejects_total` | Counter | Total number of connections rejected due to rate limiting |
+| `duckgres_connections_open` | Gauge | Process-wide number of currently open client connections, including native metadata-proxy sockets |
+| `duckgres_connection_duration_seconds{org}` | Histogram | Worker-backed Duckgres connection lifetime, accept→disconnect (includes `_count`, `_sum`, `_bucket`); excludes native metadata-proxy connections, which use their dedicated duration family |
+| `duckgres_metadata_proxy_connections_open{org}` | Gauge | Current admitted native metadata Postgres proxy connections; process-local, so sum across control-plane replicas |
+| `duckgres_metadata_proxy_connection_attempts_total{org,outcome}` | Counter | Metadata proxy attempts by bounded terminal outcome |
+| `duckgres_metadata_proxy_connection_duration_seconds{org}` | Histogram | Lifetime of admitted metadata proxy connections, including upstream bootstrap |
+| `duckgres_metadata_proxy_upstream_connect_duration_seconds{org,outcome}` | Histogram | Internal metadata Postgres connect/auth latency; outcome is `success` or `error` |
+| `duckgres_metadata_proxy_bytes_total{org,direction}` | Counter | Post-authentication pgwire bytes relayed in `client_to_upstream` or `upstream_to_client` direction |
+| `duckgres_metadata_proxy_cancel_requests_total{outcome}` | Counter | Raw metadata-proxy CancelRequests handled as `session_terminated` on the owning control-plane replica or `not_local` on another replica |
+| `duckgres_query_total{org,status,reason}` | Counter | Total non-empty query attempts. Valid status/reason pairs: `success/none`; `failure/user`, `failure/canceled`, `failure/conflict`; `error/metadata_connection_lost`, `error/system`. |
+| `duckgres_query_duration_seconds{org}` | Histogram | Simple/extended query execution latency (includes `_count`, `_sum`, `_bucket`); use `duckgres_query_total` for attempt totals |
+| `duckgres_auth_failures_total` | Counter | Process-wide authentication failures, including wrong-password metadata-proxy attempts; use `duckgres_metadata_proxy_connection_attempts_total{outcome="auth_failed"}` for the proxy-specific split |
+| `duckgres_rate_limit_rejects_total` | Counter | Process-wide pre-TLS connection rejections due to rate limiting; these cannot be attributed to the worker or metadata endpoint because SNI is not available yet |
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
 | `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
 | `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
 | `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
 | `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
 | `duckgres_control_plane_worker_spawn_seconds` | Histogram | Time spent spawning and health-checking a new worker |
+| `duckgres_session_admission_evaluation_duration_seconds{decision,reason}` | Histogram | Latency of one DB-backed admission poll for the polling request |
+| `duckgres_session_admission_evaluations_total{decision,reason}` | Counter | Admission request polls; repeated polls are distinct evaluations |
+| `duckgres_session_admission_wait_seconds{org,outcome,reason}` | Histogram | End-to-end wait for one successfully enqueued admission request |
+| `duckgres_session_admission_requests_total{org,outcome,reason}` | Counter | Exactly one terminal event per successfully enqueued admission request |
+| `duckgres_session_admission_queue_depth{org}` | Gauge | Local callers waiting after successful durable enqueue; sum across replicas |
+| `duckgres_session_admission_active_vcpus{org}` | Gauge | Requested vCPUs held by local live lease handles; cleanup-pending durable rows are excluded |
+| `duckgres_session_admission_limit_vcpus{org}` | Gauge | Config-reconciled effective org cap for active org stacks; zero means unlimited, max across replicas |
+| `duckgres_session_admission_reclaim_pending` | Gauge | Activated cleanup intents awaiting or executing exact database reclamation |
+| `duckgres_session_admission_reclaim_attempts_total{outcome}` | Counter | Exact cleanup attempts by `success` or `error` outcome |
+| `duckgres_session_admission_reclaim_reservations_in_use` | Gauge | Cleanup-ownership slots held before enqueue, while queued or live, and during pending cleanup |
+| `duckgres_session_admission_reclaim_reservation_capacity` | Gauge | Cleanup-ownership slot capacity for this control-plane process (4096 per reclaimer by default) |
+| `duckgres_session_admission_reclaim_reservation_rejections_total{reason}` | Counter | Reservations rejected because capacity was `full`, the reclaimer was `closed`, or the exact reference was a `duplicate` |
+| `duckgres_session_start_duration_seconds{org,protocol,outcome}` | Histogram | Authenticated PostgreSQL session bootstrap through flushed `ReadyForQuery` |
+| `duckgres_postgres_session_start_total{org,outcome,reason}` | Counter | Exactly one terminal result per authenticated PostgreSQL session start after server retries; `outcome` is `success\|failure` and bounded reasons distinguish operator-actionable failures from client/lifecycle noise |
 | `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
 | `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
 | `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
@@ -87,13 +113,131 @@ Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is curr
 - `scripts/perf_nightly.sh` - Nightly wrapper with lock/timeout guards and optional artifact publisher
 - `metrics-compose.yml` - Starts Prometheus and Grafana locally for metrics (Prometheus at http://localhost:9091, Grafana at http://localhost:3000)
 
+### Query Log
+
+When DuckLake uses a Postgres metadata store, Duckgres writes durable per-query
+history to the native Postgres table `querylog.query_log_entries`. The query
+log is queryable through `ducklake.system.query_log`, a live view over that
+native Postgres table. The view is not DuckLake snapshot data.
+
+Rows record SQL user (`user_name`), org, query text, duration, row counts,
+errors, trace/span IDs, and profiling-derived resource usage. `cpu_time_s` is
+DuckDB cumulative CPU/thread time in seconds, and `peak_buffer_memory_bytes` is
+DuckDB's `system_peak_buffer_memory` in bytes, not process RSS.
+
+`query_id` is a per-statement UUIDv7 minted when the query arrives. It is
+time-ordered, appears on the statement's OTEL span (`duckgres.query_id`) and its
+error logs, and is the key that correlates every query-log event for one
+statement. A batched simple query (`SELECT 1; SELECT 2`) runs each statement
+under its own `query_id`, with `parent_query_id` and `statement_index`
+identifying the Query message they arrived in.
+
+Statements produce a pair of events, using ClickHouse's `type` vocabulary
+(`QueryStart` = 1, `QueryFinish` = 2, `ExceptionBeforeStart` = 3,
+`ExceptionWhileProcessing` = 4):
+
+- `QueryStart` is emitted when the statement begins executing.
+- One terminal event follows: `QueryFinish`, or `ExceptionWhileProcessing` if it
+  failed after execution began, or `ExceptionBeforeStart` if it failed **before
+  execution began** — auth or policy denial, a transpile error, a failure to
+  obtain a worker, or an extended-protocol `Describe` whose prepare the engine
+  rejected. `ExceptionBeforeStart` events have no `QueryStart`, by definition.
+
+  The boundary is *execution began*, not *an engine saw it*: `Describe` hands
+  the statement to a worker to learn its result schema, so a binder error there
+  is an `ExceptionBeforeStart` even though the engine did see the SQL. This is
+  the same line ClickHouse draws — analysis-time failures are
+  `ExceptionBeforeStart`. In practice this is the largest source of them, so
+  when triaging, read `ExceptionBeforeStart` as "never ran", not as "never
+  reached a worker".
+
+**A `QueryStart` with no terminal event is a query that never came back** — a
+worker OOM-killed mid-statement, a pod evicted. That row is the only evidence
+such a query ever ran, so treat a sustained population of unpaired starts as an
+incident signal, allowing for queries still in flight.
+
+The `query_id` travels to the worker on every statement RPC
+(`x-duckgres-query-id`), and the worker stamps it on its own logs — notably the
+"Query appears stuck" warning. That is what closes the loop on an unpaired
+`QueryStart`: the statement's own log row cannot exist, but the pod's last words
+about it carry the same ID.
+
+`event_time` is the statement's **start** time on every event type, including
+terminal ones. This diverges from ClickHouse, where `event_time` is when the
+event was logged: pinning both rows of a pair to the same instant keeps them in
+one monthly partition and lets them join without a window function. A terminal
+row's finish time is `event_time + query_duration_ms`.
+
+`query_log.start_events` selects which statements get a `QueryStart`:
+
+- `data` (default) — statements that touch data or change schema. Transaction
+  control, `SET`/`RESET`/`SHOW`, and catalog introspection are skipped: they
+  never hang, and they are the noisiest statements a driver sends.
+- `all` — every statement.
+- `off` — no start events.
+
+Terminal events are always logged regardless of this setting, so nothing
+disappears from the log; cheap statements simply have no paired start row. Also
+settable via `DUCKGRES_QUERY_LOG_START_EVENTS`.
+
+Each event also records **what the statement touches**, extracted from its
+parse tree (`server/querymeta`):
+
+- `access_kinds` — the access classes the statement needs, comma-separated:
+  `read`, `write`, `ddl`, `config`, `admin`, `transaction`, `metadata`,
+  `unknown`. A statement can be several at once: `WITH x AS (INSERT …) SELECT`
+  is both a read and a write, which a classifier based on the command tag gets
+  wrong.
+- `query_metadata` — JSON with the resolved detail: `read_relations` and
+  `write_relations` (split, because grants are directional), `columns`,
+  `functions`, and `table_functions`.
+- `metadata_complete` — **false when extraction could not see the whole
+  statement.** DuckDB-native syntax (`ATTACH`, `CREATE SECRET`, `PIVOT`,
+  `SUMMARIZE`) is not parseable as PostgreSQL and falls back to a coarse
+  lexical classification.
+
+That last column is load-bearing. These signals exist to let an authorization
+policy be evaluated against real traffic before it denies anything, so
+"referenced no relations" and "we could not tell what it referenced" must never
+be the same answer: **a consumer that gates on `query_metadata` must treat
+`metadata_complete = false` as unknown, and deny.**
+
+`table_functions` is recorded alongside relations because `read_parquet('s3://…')`
+reaches data without naming a relation, so a policy built on relation names alone
+would not see it at all. Reading an external location is **supported usage** — a
+tenant pointing `read_parquet` at their own bucket is a feature, and it is
+classified as a plain `read`. The cross-tenant question is about the *target*,
+not the function: an entry marked `external` records enough of the path (scheme,
+host, path — credentials in a presigned URL's query string are stripped) for a
+policy to decide whether it resolves inside managed DuckLake storage. Moving data
+the other way, `COPY … TO 's3://…'`, keeps the `admin` class: egress is a
+different risk from reading a location in.
+
+Extraction runs on the **redacted** statement text, so credential material never
+reaches the parser. It costs one parse per distinct statement, memoized per
+process; disable with `query_log.metadata: false` or
+`DUCKGRES_QUERY_LOG_METADATA=false`.
+
+The column set has a single source of truth: `queryLogColumns` in
+`server/querylog_schema.go`. It generates the `CREATE TABLE` DDL, the
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migration that brings already
+provisioned tenants forward, the `INSERT` column list and argument order, the
+partition-repair copy list, and the `ducklake.system.query_log` view. Adding a
+column means appending one entry there; existing tenants pick it up on the next
+sink initialization, and a view whose columns have drifted is rebuilt with
+`CREATE OR REPLACE VIEW`. Append only — never reorder or remove an entry, and
+an appended column must be nullable or carry a `DEFAULT` (a bare `NOT NULL`
+column cannot be added to a populated table).
+
 ## Runbooks
 
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
+- [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
+- [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
-- [Lakekeeper Iceberg Catalog](docs/runbooks/lakekeeper-iceberg-catalog.md): Per-org Lakekeeper Iceberg REST catalog backend — architecture, the no-vending credential model, activation, and the `ACCESS_DELEGATION_MODE 'none'` gotcha.
+- [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
 
 ## Quick Start
 
@@ -154,6 +298,7 @@ flight_handle_idle_ttl: "15m"
 flight_session_token_ttl: "1h"
 data_dir: "./data"
 session_init_timeout: "10s"
+admission_reclaimer_max_reservations: 4096
 
 tls:
   cert: "./certs/server.crt"
@@ -189,6 +334,11 @@ rate_limit:
   failed_attempt_window: "5m"
   ban_duration: "15m"
   max_connections_per_ip: 100
+
+query_log:
+  enabled: true
+  flush_interval: "5s"
+  batch_size: 1000
 ```
 
 Run with config file:
@@ -218,22 +368,21 @@ Run with config file:
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
-| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org connection-limit queue admission; the managed K8s queue TTL uses this value | `60s` |
+| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
+| `DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS` | Max queued/live admission identities whose cleanup ownership one control plane may retain; new admissions are rejected before enqueue when full | `4096` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
 | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.us.postwh.com` | - |
-| `DUCKGRES_K8S_MAX_WORKERS` | Global cap for shared K8s workers (`0` means Duckgres does not impose a cap) | `0` |
-| `DUCKGRES_K8S_SHARED_WARM_TARGET` | Default-image neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm; subject to `DUCKGRES_K8S_MAX_WORKERS`) | `0` |
-| `DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED` | Enable configstore-driven dynamic warm-capacity target computation from recent no-idle misses | `true` |
-| `DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW` | Recent no-idle miss window used for dynamic warm-capacity demand | `2m` |
-| `DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER` | Recent misses required for one extra dynamic warm worker | `8` |
-| `DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL` | Retention TTL for warm-capacity miss buckets; clamped to at least the miss window | `15m` |
-| `DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING` | Max dynamic extra warm workers per image (`0` means unlimited) | `0` |
-| `DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING` | Max dynamic extra warm workers across images (`0` means unlimited) | `0` |
+| `DUCKGRES_METADATA_HOSTNAME_SUFFIXES` | Comma-separated SNI suffixes for the explicitly enabled native metadata Postgres proxy, such as `.md.dev.postwh.com`, `.md.us.postwh.com`, or `.md.eu.postwh.com` | - |
+| `DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG` | Maximum admitted metadata proxy sessions per org on each control-plane replica | `20` |
 | `DUCKGRES_DUCKLAKE_METADATA_STORE` | DuckLake metadata connection string | - |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_ENABLED` | Attach a Delta Lake catalog/table during worker boot/activation | `false` |
 | `DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH` | Delta Lake catalog/table path; defaults to sibling `delta/` prefix at the DuckLake object-store root when enabled | Derived |
-| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export | - |
+| `DUCKGRES_QUERY_LOG_ENABLED` | Enable per-query logging | `true` |
+| `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval for native Postgres writes | `5s` |
+| `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size for native Postgres inserts | `1000` |
+| `DUCKGRES_STORAGE_SAMPLE_INTERVAL` | Storage-billing sampling cadence (Go duration): how often the leader CP reads each warehouse's tracked DuckLake footprint and credits byte-seconds. Env-only. | `30m` |
+| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
 | `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` in PostHog logs (e.g., `duckgres-acme`); only used when `POSTHOG_API_KEY` is set | - |
@@ -257,6 +406,90 @@ export POSTHOG_HOST=eu.i.posthog.com
 ./duckgres
 ```
 
+### PostHog Product-Analytics Events
+
+The same `POSTHOG_API_KEY` (and `POSTHOG_HOST`) also enables product-analytics
+event capture via the PostHog capture API. This is separate from log export:
+logs go to PostHog Logs, these are discrete events you can build insights and
+dashboards on. When `POSTHOG_API_KEY` is unset, no events are sent.
+
+Events are attributed to an org using [PostHog group analytics](https://posthog.com/docs/product-analytics/group-analytics):
+the `distinct_id` is the org name and each event carries a group of type
+`organization`, so dashboards can break down and aggregate by org. In
+single-tenant standalone mode (no org) the `distinct_id` is `standalone` and no
+group is attached.
+
+The org name is duckgres-internal, so the query events additionally carry a
+`team_id` property — the PostHog `Team.id` for the connection (the connecting
+user's team, else the org's oldest team; 0 when unknown or standalone). This is
+the PostHog-native key that joins duckgres usage to the rest of PostHog (e.g.
+product-intent cohorts for managed-warehouse activation). It is a config-snapshot
+read stamped once per connection, and mirrors the informational team id the
+compute-usage meter records.
+
+Events never include SQL text, credentials, or secret values — only metadata.
+
+Provisioning and deprovisioning are asynchronous: the admin API returns `202
+Accepted` and the per-org provisioner controller drives the warehouse to its
+terminal state. The lifecycle is therefore split into a `_begin` event (the
+admin API accepted the request) and a terminal `_success` / `_failed` event (the
+controller observed the warehouse reach Ready / Failed, or finish / fail
+teardown), so you can build a provisioning funnel and alert on failures.
+
+| Event | Fires when | Properties |
+| --- | --- | --- |
+| `warehouse_provision_begin` | Provisioning accepted by the admin API (warehouse not usable yet) | `database_name`, `metadata_store`, `ducklake_enabled` |
+| `warehouse_provision_success` | Warehouse reaches Ready and is usable (provisioner controller) | `metadata_store`, `ducklake_enabled` |
+| `warehouse_provision_failed` | Warehouse reaches Failed (provisioner controller) | `metadata_store`, `ducklake_enabled`, `reason` (`provisioning_timeout`/`crossplane_sync_failure`) |
+| `warehouse_deprovision_begin` | Deprovisioning accepted by the admin API (teardown not finished yet) | — |
+| `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
+| `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
+| `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
+| `query_initiated` | An accepted, non-empty client query is received | `user`, `team_id`, `trace_id` |
+| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows` |
+| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
+
+> Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
+> are terminal and fire exactly once per warehouse (guarded on the state
+> transition). Deletion has no terminal Failed state — the controller retries
+> indefinitely — so `warehouse_deprovision_failed` represents a failed teardown
+> *attempt* and may fire once per reconcile pass until teardown succeeds.
+
+> The `_success` / `_failed` events are emitted by the Kubernetes provisioner
+> controller, so they only fire in the remote/multitenant backend (built with
+> `-tags kubernetes`). The `_begin` events fire wherever the admin provisioning
+> API runs.
+
+> Note: `query_initiated` fires once per accepted, non-empty simple-protocol
+> Query or extended-protocol Execute. Retries, rewrites, cursor helpers, and
+> generated COPY batches do not emit additional events. Capture is asynchronous
+> and batched, so it stays off the query latency path.
+
+> Note: `query_completed` fires on the terminal event of each *successfully*
+> executed statement, carrying that statement's resource cost (`duration_ms`,
+> `cpu_seconds`). Failures are covered by `query_failed` instead. It is emitted
+> at statement granularity, so a single logical client request can produce more
+> than one `query_completed` (e.g. cursor FETCHes or COPY batches) — unlike
+> `query_initiated`. Filter by `query_kind` to isolate real data queries from
+> utility statements. Emitted independently of the query-log configuration;
+> capture is asynchronous and batched, so it stays off the query latency path.
+
+### Query Logs
+
+Structured logs separate the SQL received from a client from the statements
+executed by a worker:
+
+| Event | Scope | Meaning |
+| --- | --- | --- |
+| `Client query received.` | `client` | Emitted once with the bounded/redacted client SQL and `protocol=simple` or `protocol=extended`. |
+| `Worker statement started.` | `worker` | A physical statement is about to run for the client operation. |
+| `Worker statement finished.` | `worker` | The physical statement completed, with duration, affected rows, and SQLSTATE when applicable. |
+
+Client-derived worker statements carry bounded/redacted executed SQL. Generated
+rewrite and COPY work instead carries a typed `origin`, stable `operation`, and
+compact metadata; generated SQL, placeholders, arguments, and values are not
+logged. Worker statements do not create additional durable query-log records.
+
 ### CLI Flags
 
 ```bash
@@ -278,7 +511,7 @@ Options:
   -threads int             DuckDB threads per session
   -process-isolation       Enable process isolation (spawn child process per connection)
   -idle-timeout string     Connection idle timeout (e.g., '30m', '1h', '-1' to disable)
-  -mode string             Run mode: standalone (default), control-plane, or duckdb-service
+  -mode string             Run mode: standalone (default), control-plane, duckdb-service, or reshard-runner
   -process-min-workers int Pre-warm process worker count at startup (control-plane mode, default 0)
   -process-max-workers int Max process workers, 0=auto-derived (control-plane mode)
   -process-retire-on-session-end
@@ -289,21 +522,6 @@ Options:
   -sni-routing-mode string Hostname routing: off, passthrough, or enforce
   -managed-hostname-suffixes string
                           Comma-separated managed tenant hostname suffixes
-  -k8s-max-workers int    Max K8s workers in the shared pool, 0=unbounded
-  -k8s-shared-warm-target int
-                          Neutral shared warm-worker target for K8s multi-tenant mode, 0=disabled
-  -k8s-dynamic-warm-capacity-enabled
-                          Enable configstore-driven dynamic warm-capacity target computation (default true)
-  -k8s-warm-capacity-miss-window string
-                          Recent no-idle miss window for dynamic warm-capacity demand (default 2m)
-  -k8s-warm-capacity-misses-per-worker int
-                          Recent misses required for one extra dynamic warm worker (default 8)
-  -k8s-warm-capacity-demand-ttl string
-                          Retention TTL for warm-capacity miss buckets (default 15m)
-  -k8s-warm-capacity-dynamic-image-ceiling int
-                          Max dynamic extra warm workers per image, 0=unlimited
-  -k8s-warm-capacity-dynamic-total-ceiling int
-                          Max dynamic extra warm workers across images, 0=unlimited
 ```
 
 ## DuckDB Extensions
@@ -534,7 +752,8 @@ cfg := server.Config{
 Built-in rate limiting protects against brute-force authentication attacks:
 
 - **Failed attempt tracking**: Bans IPs after too many failed auth attempts
-- **Connection limits**: Limits concurrent connections per IP and, when configured, total concurrent sessions. In K8s multi-tenant mode, org `max_connections` is enforced cluster-wide through runtime-store leases.
+- **Connection limits**: Limits concurrent connections per IP and, when configured, total concurrent sessions in standalone mode.
+- **K8s multi-tenant resource limits**: Org and user `max_vcpus` bound the sum of active worker pod vCPUs admitted through runtime-store leases. 0 means unlimited.
 - **Auto-cleanup**: Expired records are automatically cleaned up
 
 ```yaml
@@ -543,7 +762,7 @@ rate_limit:
   failed_attempt_window: "5m"   # Within 5 minutes
   ban_duration: "15m"           # Ban lasts 15 minutes
   max_connections_per_ip: 100   # Max concurrent connections
-  max_connections: 16           # Max total concurrent sessions (0 = unlimited)
+  max_connections: 16           # Standalone max total concurrent sessions (0 = unlimited)
 ```
 
 ## Usage Examples
@@ -573,7 +792,7 @@ GROUP BY name;
 
 ## Architecture
 
-Duckgres supports three run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), and **duckdb-service** (worker process mode used by the control plane).
+Duckgres supports three primary run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), and **duckdb-service** (worker process mode used by the control plane). A fourth utility mode, **reshard-runner**, is the entrypoint of the dedicated per-operation pods the multitenant control plane spawns to execute metadata-store reshards (see `docs/design/resharding.md`).
 
 ### Standalone Mode
 
@@ -674,11 +893,48 @@ kill -USR2 <control-plane-pid>
 
 ### Remote Worker Backend
 
-In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may reconnect with a durable session token if the worker survives and the token is still valid.
+In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may use a durable session token to create a fresh remote session on the surviving worker if the token is still valid.
 
 Managed-hostname routing is controlled by `--sni-routing-mode` and `--managed-hostname-suffixes`. For Postgres, an explicit startup `database`/`dbname` takes priority, but when SNI matches a managed suffix the hostname prefix and requested database must resolve to the same org. If the startup database is empty, the managed SNI prefix is used as the database fallback. Unknown `--sni-routing-mode` values behave like `off`.
 
-When a shared warm-worker target is configured (`--k8s-shared-warm-target`, default `0`), the pool keeps neutral workers ready at startup. On demand, a neutral worker is reserved for an org, activated over the worker control RPC, and becomes hot for that org. When its last session ends, the worker moves to `hot_idle` instead of being retired immediately: it keeps the org assignment and DuckLake attachment so any control-plane replica can reclaim it for the same org without full reactivation. Hot-idle reuse is image/version strict; a worker whose image no longer matches the org target is retired instead of reused. The janitor retires unreclaimed hot-idle workers after 5 minutes. The main lifecycle is: idle → reserved → activating → hot → hot_idle → retired. Workers can also move through `draining` during shutdown, rollout, or cleanup.
+The native metadata Postgres proxy is a separate, fail-closed SNI path selected
+by `DUCKGRES_METADATA_HOSTNAME_SUFFIXES`. It is available only when an org's
+warehouse explicitly has `metadata_proxy_enabled=true`, is ready, and uses a
+CNPG-shard metadata store. The client must connect as `root` with the org's
+existing Duckgres password and must send the exact non-empty
+`dbname=metadata`. Duckgres resolves and uses the real metadata role, password,
+database, and PgBouncer endpoint internally. The endpoint and password are
+never sent to the client; the upstream role and database may be visible
+through normal PostgreSQL introspection such as `current_user` and
+`current_database()`. Managed-warehouse deployments configure their own
+environment suffix (`.md.dev.postwh.com`, `.md.us.postwh.com`, or
+`.md.eu.postwh.com`); suffixes are never inferred from the ordinary Duckgres
+hostname. The per-org connection limit is enforced independently on every
+control-plane replica. Internal target resolution and
+connect/auth/synchronization have a fixed 10-second bootstrap deadline; the
+deadline does not apply after the relay is established. An admin/UI update that
+includes `metadata_proxy_enabled` reloads the local config snapshot and
+notifies peer replicas; established sessions close on their next five-second
+authorization recheck after the updated snapshot arrives.
+
+The initial rollout is restricted operationally to dedicated,
+single-customer CNPG shards. Do not enable `metadata_proxy_enabled` for an org
+on a shared shard until upstream database `CONNECT` ACLs and role hardening are
+in place: once the exact `metadata` database connection is established, the
+customer's `root` credential intentionally receives full access available to
+the internally resolved metadata role.
+
+Metadata-proxy cancellation is deliberately session-terminating: when a raw
+PostgreSQL `CancelRequest` reaches the control-plane replica that owns the
+synthetic backend key, Duckgres closes that exact frontend and upstream
+connection pair. PgBouncer cancellation keys are instance-local, so Duckgres
+does not redial the pooler Service. Like existing Duckgres cancellation, the
+raw follow-up TCP connection is control-plane-local behind the NLB; a request
+routed to another replica is counted as
+`duckgres_metadata_proxy_cancel_requests_total{outcome="not_local"}` and cannot
+terminate the owning session.
+
+Workers are spawned on demand: when an org opens a session with no reusable worker, the control plane creates a worker pod (sized from the connection's `duckgres.worker_cpu`/`worker_memory` request, or a default), activates it over the worker control RPC, and it becomes hot for that org. When its last session ends, the worker moves to `hot_idle` instead of being retired immediately: it keeps the org assignment and DuckLake attachment so any control-plane replica can reclaim it for the same org (by exact worker shape) without full reactivation, until its `duckgres.worker_ttl` expires. Hot-idle reuse is image/version strict. The janitor retires hot-idle workers at their TTL, but `default_worker_min_hot_idle` lets an org retain a minimum number of compatible default-profile hot-idle workers by skipping TTL retirement when the count is already at or below the floor. The default is `0` (disabled). The main lifecycle is: idle → reserved → activating → hot → hot_idle → retired. Workers can also move through `draining` during shutdown, rollout, or cleanup. (Spawn latency is hidden by the node-headroom controller, which keeps placeholder pods ready for real workers to preempt.)
 
 ```bash
 # Local multitenant K8s workflow
@@ -687,16 +943,21 @@ just run-multitenant-kind
 
 See [`k8s/README.md`](k8s/README.md) for the full architecture, configuration reference, manifest details, and the default local kind workflow via `just run-multitenant-kind`. The older OrbStack path remains available through `just run-multitenant-local` for manual macOS iteration.
 
-On the multi-tenant path, the config store now keeps per-team managed-warehouse metadata in addition to team/user auth and limits. That team-scoped contract is intended to become the source of truth for the tenant warehouse DB, the tenant DuckLake metadata store (which may live on shared Aurora or a dedicated RDS instance), object-store settings, worker identity, secret references, and provisioning state. The older config-store `DuckLakeConfig` singleton remains only as a legacy cluster-wide setting and should not be treated as authoritative for multi-tenant runtime wiring.
+On the multi-tenant path, the config store now keeps per-team managed-warehouse metadata in addition to team/user auth and limits. That team-scoped contract is the source of truth for the tenant warehouse DB, the tenant DuckLake metadata store (which may live on shared Aurora or a dedicated RDS instance), object-store settings, worker identity, secret references, and provisioning state. The older cluster-wide singleton config tables (global / ducklake / rate-limit / query-log) have been removed — they were never read at runtime; effective config comes from CLI flags/env and this per-team contract.
 
-The shared K8s pool keeps workers neutral at startup, reserves them per org, activates tenant runtime over the control-plane RPC channel, and keeps idle activated workers briefly available for same-org hot-idle reuse before janitor retirement.
+Config-store schema changes are applied from embedded, ordered SQL migrations at control-plane startup. See [`docs/runbooks/config-store-migrations.md`](docs/runbooks/config-store-migrations.md) for the local development flow, checksum behavior, and failure recovery steps.
+
+The shared K8s pool spawns workers on-demand, reserves them per org, activates tenant runtime over the control-plane RPC channel, and keeps idle activated workers briefly available for same-org hot-idle reuse before janitor retirement.
 
 Managed-warehouse contract notes:
 
 - At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
+- Each org has a `data_imports_table_naming_version`. Migration `000034` assigns `legacy_batch_v1` to orgs that already exist and changes the database default to `copy_v1` for orgs created afterward. `GET /api/v1/orgs/:id/teams` returns the org-level value alongside the team rows so every data-import reader and writer derives the same physical table name. Operators can change the policy in the admin console or with `PUT /api/v1/orgs/:id` using `{"data_imports_table_naming_version":"copy_v1"}`. Migrate existing tables before changing an org that has already written data.
 - The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
-- User rows support an optional `default_catalog` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. The default is empty, which preserves the standard DuckLake-first session behavior. Set `default_catalog` to `iceberg` for users whose sessions should resolve schema-qualified names and compatibility metadata through the Iceberg catalog by default; a client-supplied startup `search_path` still takes precedence.
-- The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared warm mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
+- Org rows support optional `max_vcpus` on `POST /api/v1/orgs` and `PUT /api/v1/orgs/:id`. In K8s multi-tenant mode, this caps the org's active admitted worker pod vCPUs; `0` means unlimited.
+- User rows support an optional `max_vcpus` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. `max_vcpus` limits the user's active admitted worker pod vCPUs in K8s multi-tenant mode; `0` means unlimited.
+- `PUT /api/v1/orgs/:id/teams/:team_id/project-reader` creates or rotates the generated SQL login for a PostHog project. The login can read every current and future table in the project's team, data-import, and modeled-data schemas, plus its legacy events/persons relations. Writes, unqualified application relations, external-reader and introspection functions, other projects' schemas, and their catalog metadata are denied by the PostgreSQL and Flight SQL query gateways. Flight tokens are revoked when the login or its project scope changes. The plaintext password is returned only by the rotation response.
+- The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared worker mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
 - Secret references only are stored in the config store. Secret material remains outside the database.
 - The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.
 - Those state fields are open strings. Canonical values are `pending`, `provisioning`, `ready`, `failed`, `deleting`, and `deleted`, but callers may persist other values while workflows evolve.
@@ -755,7 +1016,7 @@ The following DuckDB features work transparently through the fallback mechanism:
 ### PostgreSQL Compatibility
 - Extended query protocol (prepared statements)
 - Binary and text result formats
-- MD5 password authentication
+- Cleartext password authentication over TLS
 - Basic `pg_catalog` system tables for client compatibility
 - `\dt`, `\d`, and other psql meta-commands
 
@@ -782,101 +1043,9 @@ Since DuckDB's isolation is strictly stronger than PostgreSQL's default, applica
 
 ## SQL Client Compatibility
 
-Duckgres implements a subset of PostgreSQL's system catalog to satisfy introspection queries from common SQL clients, ORMs, and BI tools. The tables below document current coverage.
+Duckgres implements a subset of PostgreSQL's system catalog to satisfy introspection queries from common SQL clients, ORMs, and BI tools — enough for psql, pgAdmin, DBeaver, Metabase, Grafana, Superset, Tableau, Fivetran, Airbyte, dbt, and the standard drivers (psycopg, pgx, JDBC, node-postgres, tokio-postgres, SQLAlchemy) to connect and introspect.
 
-### pg_catalog Views
-
-| View | Status | Notes |
-|------|--------|-------|
-| `pg_class` | Implemented | `pg_class_full` wrapper adding `relforcerowsecurity`; DuckLake variant sources from `duckdb_tables()`/`duckdb_views()` |
-| `pg_namespace` | Implemented | Maps `main` → `public`; DuckLake variant derives from `duckdb_tables()`/`duckdb_views()` |
-| `pg_attribute` | Implemented | Maps DuckDB internal type OIDs to PG OIDs via `duckdb_columns()` JOIN; fixes `atttypmod` for NUMERIC |
-| `pg_type` | Implemented | Fixes NULLs + adds synthetic entries for missing OIDs (json, jsonb, bpchar, text, record, array types) |
-| `pg_database` | Implemented | Hardcoded: postgres, template0, template1, testdb |
-| `pg_stat_user_tables` | Implemented | Uses `reltuples` from pg_class; zeros for scan/tuple stats |
-| `pg_roles` | Stub (empty) | Single hardcoded `duckdb` superuser |
-| `pg_constraint` | Stub (empty) | |
-| `pg_enum` | Stub (empty) | |
-| `pg_collation` | Stub (empty) | |
-| `pg_policy` | Stub (empty) | |
-| `pg_inherits` | Stub (empty) | |
-| `pg_statistic_ext` | Stub (empty) | |
-| `pg_publication` | Stub (empty) | |
-| `pg_publication_rel` | Stub (empty) | |
-| `pg_publication_tables` | Stub (empty) | |
-| `pg_rules` | Stub (empty) | |
-| `pg_matviews` | Stub (empty) | |
-| `pg_partitioned_table` | Stub (empty) | |
-| `pg_stat_activity` | Stub (empty) | Intercepted at query time for live data |
-| `pg_statio_user_tables` | Stub (empty) | |
-| `pg_stat_statements` | Stub (empty) | |
-| `pg_indexes` | Stub (empty) | |
-| `pg_settings` | Missing | `current_setting()` macro handles `server_version` and `server_encoding` only |
-| `pg_proc` | Missing | DuckDB has native `pg_catalog.pg_proc` but no wrapper |
-| `pg_description` | Missing | Handled via `obj_description()`/`col_description()` macros returning NULL |
-| `pg_depend` | Missing | |
-| `pg_am` | Missing | |
-| `pg_attrdef` | Missing | |
-| `pg_tablespace` | Missing | |
-
-### information_schema Views
-
-| View | Status | Notes |
-|------|--------|-------|
-| `tables` | Implemented | Filters internal views, normalizes `main` → `public` |
-| `columns` | Implemented | DuckDB → PG type name normalization, optional metadata overlay |
-| `schemata` | Implemented | Adds synthetic entries for `pg_catalog`, `information_schema`, `pg_toast` |
-| `views` | Implemented | Filters internal views |
-| `key_column_usage` | Missing | Used by ORMs for relationship discovery |
-| `table_constraints` | Missing | Used by ORMs for relationship discovery |
-| `referential_constraints` | Missing | Used by ORMs for FK introspection |
-
-### Functions & Macros
-
-| Function | Status | Notes |
-|----------|--------|-------|
-| `format_type(oid, int)` | Implemented | Comprehensive OID → name mapping |
-| `pg_get_expr(text, oid)` | Implemented | Returns NULL |
-| `pg_get_indexdef(oid)` | Implemented | Returns empty string |
-| `pg_get_constraintdef(oid)` | Implemented | Returns empty string |
-| `pg_get_serial_sequence(text, text)` | Implemented | Returns NULL |
-| `pg_table_is_visible(oid)` | Implemented | Always true |
-| `pg_get_userbyid(oid)` | Implemented | Maps OID 10 → `postgres`, 6171 → `pg_database_owner` |
-| `obj_description(oid, text)` | Implemented | Returns NULL |
-| `col_description(oid, int)` | Implemented | Returns NULL |
-| `shobj_description(oid, text)` | Implemented | Returns NULL |
-| `has_table_privilege(text, text)` | Implemented | Always true |
-| `has_schema_privilege(text, text)` | Implemented | Always true |
-| `pg_encoding_to_char(int)` | Implemented | Always `UTF8` |
-| `version()` | Implemented | Returns PG 15.0 compatible string |
-| `current_setting(text)` | Implemented | Handles `server_version` and `server_encoding` |
-| `pg_is_in_recovery()` | Implemented | Always false |
-| `pg_backend_pid()` | Implemented | Returns 0 |
-| `pg_size_pretty(bigint)` | Implemented | Full human-readable formatting |
-| `pg_total_relation_size(oid)` | Implemented | Returns 0 |
-| `pg_relation_size(oid)` | Implemented | Returns 0 |
-| `pg_table_size(oid)` | Implemented | Returns 0 |
-| `pg_indexes_size(oid)` | Implemented | Returns 0 |
-| `pg_database_size(text)` | Implemented | Returns 0 |
-| `quote_ident(text)` | Implemented | |
-| `quote_literal(text)` | Implemented | |
-| `quote_nullable(text)` | Implemented | |
-| `txid_current()` | Implemented | Epoch-based pseudo ID |
-| `current_schema()` | Missing | |
-| `current_schemas(bool)` | Missing | |
-
-### Startup Parameters
-
-| Parameter | Value |
-|-----------|-------|
-| `server_version` | `15.0 (Duckgres)` |
-| `server_encoding` | `UTF8` |
-| `client_encoding` | `UTF8` |
-| `DateStyle` | `ISO, MDY` |
-| `TimeZone` | `UTC` |
-| `integer_datetimes` | `on` |
-| `standard_conforming_strings` | `on` |
-| `IntervalStyle` | Missing |
+The full, authoritative breakdown — every PostgreSQL feature with its support status and the specific test that proves it, plus the per-object `pg_catalog`/`information_schema`/function/startup-parameter reference — lives in **[docs/postgres-compatibility.md](docs/postgres-compatibility.md)**. That document is the single source of truth; update it in the same PR as any PostgreSQL-visible behavior change.
 
 ## Dependencies
 

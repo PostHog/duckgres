@@ -24,8 +24,8 @@ env:
 # To add a DuckDB version, add a row under matrix.duckdb. The
 # DUCKDB_GO_VERSION / DUCKDB_BINDINGS_VERSION pair maps to the
 # duckdb-go module versions; the encoding is `v0.<major><minor:02d><patch:02d>.0`,
-# so DuckDB 1.5.2 → v0.10502.0 / v2.10502.0 and 1.5.3 → v0.10503.0 /
-# v2.10503.0. See scripts/ducklake_version_matrix.sh for the same
+# so DuckDB 1.5.3 → v0.10503.0 / v2.10503.0 and 1.5.5 → v0.10505.0 /
+# v2.10505.0. See scripts/ducklake_version_matrix.sh for the same
 # mapping in test code.
 #
 # Each row must declare every field below — Dockerfile.worker asserts the
@@ -71,27 +71,35 @@ jobs:
                     - version: "1.5.3"
                       go: "v2.10503.0"
                       bindings: "v0.10503.0"
-                      httpfs: "v1.5.3-stoi-fix"
-                      ducklake: "v1.0-posthog.4"
+                      # cred-refresh-write-retry: mid-statement S3 credential
+                      # recovery on ExpiredToken read/write auth failures
+                      # (supersedes v1.5.3-cred-refresh, which it is based on).
+                      # Lets statements outlive their starting STS token as long
+                      # as the credential-refresh scheduler keeps rotating the
+                      # ducklake_s3 secret.
+                      httpfs: "v1.5.3-cred-refresh-write-retry"
+                      ducklake: "v1.0-posthog.6"
                       # Stable repo hosts postgres_scanner for 1.5.3; nightly
                       # does not. See scripts/ducklake_version_matrix.sh
                       # commit history for the rationale on each row.
                       pg_scanner_repo: "https://extensions.duckdb.org"
-                      default: true
-                    - version: "1.5.2"
-                      go: "v2.10502.0"
-                      bindings: "v0.10502.0"
-                      httpfs: "v1.5.2-stoi-fix"
-                      ducklake: "v1.0-posthog.2"
-                      # Nightly repo: preserves byte-identity with the
-                      # previously-published 1.5.2 worker image, which
-                      # bundled the nightly build for the DuckLake
-                      # metadata-pool reaper fix (PR #447). Stable v1.5.2
-                      # postgres_scanner exists too but the binary differs;
-                      # keep this row aligned with what was last shipped so
-                      # it remains a true rollback target.
-                      pg_scanner_repo: "http://nightly-extensions.duckdb.org"
+                      # Rollback row: publishes suffixed tags only. Operators
+                      # roll a tenant back by re-pointing its `image`
+                      # config-store column at a …-duckdb1.5.3 tag.
                       default: false
+                    - version: "1.5.5"
+                      go: "v2.10505.0"
+                      bindings: "v0.10505.0"
+                      # cred-refresh-write-retry rebuilt against DuckDB 1.5.5:
+                      # mid-statement S3 credential recovery on ExpiredToken
+                      # read/write auth failures (see the 1.5.3 row).
+                      httpfs: "v1.5.5-cred-refresh-write-retry"
+                      # First PostHog DuckLake release built for DuckDB 1.5.5.
+                      ducklake: "v1.0-posthog.7"
+                      pg_scanner_repo: "https://extensions.duckdb.org"
+                      # Fleet default: also publishes the unsuffixed tags and
+                      # dispatches Charts.
+                      default: true
                 platform:
                     - platform: linux/arm64
                       runner: ubuntu-24.04-arm
@@ -115,7 +123,7 @@ jobs:
             - name: Configure AWS credentials
               uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
               with:
-                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  role-to-assume: ${{ vars.AWS_ECR_PUBLISH_IAM_ROLE }}
                   aws-region: us-east-1
 
             - name: Login to Amazon ECR
@@ -263,9 +271,9 @@ jobs:
         name: Multi-arch manifest worker ${{ matrix.duckdb.version }}
         needs: build
         if: github.repository == 'PostHog/duckgres'
-        # Mirror the build job's tolerance: if the 1.5.2 manifest fails
-        # (e.g. because that row's build was continue-on-errored), the
-        # default 1.5.3 manifest still publishes and Charts dispatch
+        # Mirror the build job's tolerance: if a non-default row's manifest
+        # fails (e.g. because that row's build was continue-on-errored), the
+        # default row's manifest still publishes and Charts dispatch
         # proceeds.
         continue-on-error: ${{ !matrix.duckdb.default }}
         strategy:
@@ -273,9 +281,9 @@ jobs:
             matrix:
                 duckdb:
                     - version: "1.5.3"
-                      default: true
-                    - version: "1.5.2"
                       default: false
+                    - version: "1.5.5"
+                      default: true
         runs-on: ubuntu-24.04
         permissions:
             id-token: write
@@ -289,7 +297,7 @@ jobs:
             - name: Configure AWS credentials
               uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
               with:
-                  role-to-assume: ${{ secrets.AWS_ECR_PUBLISH_IAM_ROLE }}
+                  role-to-assume: ${{ vars.AWS_ECR_PUBLISH_IAM_ROLE }}
                   aws-region: us-east-1
 
             - name: Login to Amazon ECR

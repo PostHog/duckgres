@@ -26,7 +26,15 @@ func isTransientDuckLakeError(err error) bool {
 		strings.Contains(msg, "SSL connection has been closed unexpectedly") ||
 		strings.Contains(msg, "Current transaction is aborted") ||
 		strings.Contains(msg, "no route to host") ||
-		strings.Contains(msg, "network is unreachable")
+		strings.Contains(msg, "network is unreachable") ||
+		// Concurrent first ATTACHes for a fresh org race the DuckLake
+		// metadata-store schema init: both workers CREATE the ducklake_*
+		// tables, the loser hits a Postgres catalog unique constraint
+		// (e.g. pg_type_typname_nsp_index on ducklake_metadata), and a
+		// retry succeeds because the winner's schema now exists. Guarded
+		// on "ducklake" so user-data duplicate keys are never retried.
+		(strings.Contains(msg, "duplicate key value violates unique constraint") &&
+			strings.Contains(msg, "ducklake"))
 }
 
 const (

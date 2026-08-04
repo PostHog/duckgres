@@ -2,20 +2,28 @@ package flightclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"google.golang.org/protobuf/proto"
 )
 
 // CopyFromStdinDescriptorPath is the FlightDescriptor path that marks a
-// DoPut stream as a CSV-spool-and-COPY upload rather than a standard
+// DoPut stream as a spool-and-COPY upload rather than a standard
 // Flight SQL CommandStatementUpdate. The duckdbservice worker matches
 // on this path and routes to its CopyFromStdin handler.
 const CopyFromStdinDescriptorPath = "duckgres-copy-from-stdin"
+
+// CopyFromStdinPostgresBinaryPathVersion marks descriptor.Cmd as a structured,
+// versioned PostgreSQL binary COPY request. An older worker fails closed when
+// it receives the JSON request instead of executing scanner SQL without the
+// accompanying validation metadata.
+const CopyFromStdinPostgresBinaryPathVersion = "postgres-binary-v1"
 
 // CopyFromStdinPathPlaceholder is the substring inside the COPY SQL that
 // the worker replaces with the worker-local spool file path before
@@ -23,24 +31,30 @@ const CopyFromStdinDescriptorPath = "duckgres-copy-from-stdin"
 // BuildDuckDBCopyFromSQL using this token as the file path.
 const CopyFromStdinPathPlaceholder = "__DUCKGRES_COPY_PATH__"
 
+// CopyFromStdinSizePlaceholder is replaced by the worker with the exact
+// number of bytes in its completed spool file. The postgres binary table
+// function needs this because its COPY-function wrapper currently ignores
+// buffer_size and cannot read files larger than its 32 MiB default.
+const CopyFromStdinSizePlaceholder = "__DUCKGRES_COPY_SIZE__"
+
 // CopyFromStdinChunkSize is the byte size of each FlightData frame sent
 // from the control plane to the worker during a COPY upload. Large
 // enough to amortise per-frame overhead, small enough to keep memory
 // bounded if the worker is slow to drain.
 const CopyFromStdinChunkSize = 1 << 20 // 1 MiB
 
-// CopyFromStdin streams CSV bytes from r to a remote worker, then runs
-// copySQL on the worker against a worker-local spool file. copySQL must
-// contain CopyFromStdinPathPlaceholder where the file path should appear.
-// Returns the number of rows the worker reports COPY-affected.
+// CopyFromStdin streams COPY input bytes from r to a remote worker, then runs
+// request.SQLTemplate against a worker-local spool file. The SQL template must
+// contain CopyFromStdinPathPlaceholder where the file path should appear. It
+// returns the number of rows the worker reports COPY-affected.
 //
 // Wire layout:
 //
-//	frame 0: FlightDescriptor{Type=PATH, Path=[CopyFromStdinDescriptorPath], Cmd=copySQL}
-//	frame 1..N: DataBody=<chunk of CSV bytes>
+//	frame 0: FlightDescriptor{Type=PATH, Path=[CopyFromStdinDescriptorPath, optional version], Cmd=SQL or structured request}
+//	frame 1..N: DataBody=<chunk of COPY input bytes>
 //	(client closes send)
 //	server: PutResult{AppMetadata=DoPutUpdateResult{RecordCount=N}}
-func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io.Reader) (int64, error) {
+func (e *FlightExecutor) CopyFromStdin(ctx context.Context, request sqlcore.CopyFromStdinRequest, r io.Reader) (int64, error) {
 	if e.dead.Load() {
 		return 0, ErrWorkerDead
 	}
@@ -55,16 +69,25 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io
 	}
 
 	// Frame 0: descriptor + COPY SQL.
+	path := []string{CopyFromStdinDescriptorPath}
+	cmd := []byte(request.SQLTemplate)
+	if len(request.PostgresBinaryDatabaseTypeNames) > 0 {
+		path = append(path, CopyFromStdinPostgresBinaryPathVersion)
+		cmd, err = json.Marshal(request)
+		if err != nil {
+			return 0, fmt.Errorf("marshal binary COPY request: %w", err)
+		}
+	}
 	desc := &flight.FlightDescriptor{
 		Type: flight.DescriptorPATH,
-		Path: []string{CopyFromStdinDescriptorPath},
-		Cmd:  []byte(copySQL),
+		Path: path,
+		Cmd:  cmd,
 	}
 	if err := stream.Send(&flight.FlightData{FlightDescriptor: desc}); err != nil {
 		return 0, fmt.Errorf("flight doput send descriptor: %w", err)
 	}
 
-	// Frames 1..N: CSV byte chunks. We re-use one buffer; gRPC marshals the
+	// Frames 1..N: COPY input byte chunks. We re-use one buffer; gRPC marshals the
 	// proto synchronously inside Send, so reusing is safe across iterations.
 	//
 	// On a non-EOF read error we return immediately WITHOUT calling
@@ -84,7 +107,7 @@ func (e *FlightExecutor) CopyFromStdin(ctx context.Context, copySQL string, r io
 			break
 		}
 		if readErr != nil {
-			return 0, fmt.Errorf("read csv stream: %w", readErr)
+			return 0, fmt.Errorf("read COPY stream: %w", readErr)
 		}
 	}
 

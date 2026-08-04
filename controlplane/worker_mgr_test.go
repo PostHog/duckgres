@@ -96,3 +96,42 @@ func TestManagedWorkerOwnerEpochAccessorsRaceFree(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestManagedWorkerClaimSessionLocked pins the shared session-claim
+// bookkeeping used identically by FlightWorkerPool.AcquireWorker and
+// K8sWorkerPool.AcquireWorker after a worker is selected: each claim
+// increments activeSessions and advances the peakSessions high-water
+// mark, but peakSessions never regresses when sessions are later
+// released. This is a pure no-op for scheduling; it only updates the
+// worker's own counters (the caller holds the pool lock).
+func TestManagedWorkerClaimSessionLocked(t *testing.T) {
+	w := &ManagedWorker{}
+
+	w.claimSessionLocked()
+	if w.activeSessions != 1 || w.peakSessions != 1 {
+		t.Fatalf("after first claim: active=%d peak=%d, want 1/1", w.activeSessions, w.peakSessions)
+	}
+
+	w.claimSessionLocked()
+	if w.activeSessions != 2 || w.peakSessions != 2 {
+		t.Fatalf("after second claim: active=%d peak=%d, want 2/2", w.activeSessions, w.peakSessions)
+	}
+
+	// Simulate a release: peak must hold even though active drops.
+	w.activeSessions--
+	if w.activeSessions != 1 || w.peakSessions != 2 {
+		t.Fatalf("after release: active=%d peak=%d, want 1/2", w.activeSessions, w.peakSessions)
+	}
+
+	// Re-claiming below the prior peak must not regress peak.
+	w.claimSessionLocked()
+	if w.activeSessions != 2 || w.peakSessions != 2 {
+		t.Fatalf("after re-claim: active=%d peak=%d, want 2/2", w.activeSessions, w.peakSessions)
+	}
+
+	// A claim that exceeds the prior peak advances it.
+	w.claimSessionLocked()
+	if w.activeSessions != 3 || w.peakSessions != 3 {
+		t.Fatalf("after exceeding peak: active=%d peak=%d, want 3/3", w.activeSessions, w.peakSessions)
+	}
+}

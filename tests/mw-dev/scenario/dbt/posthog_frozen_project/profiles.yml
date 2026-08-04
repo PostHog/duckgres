@@ -1,0 +1,14 @@
+duckgres_scenario:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DUCKGRES_DBT_HOST') }}"
+      port: "{{ env_var('DUCKGRES_DBT_PORT') | int }}"
+      user: "{{ env_var('DUCKGRES_DBT_USER') }}"
+      pass: "{{ env_var('DBT_ENV_SECRET_DUCKGRES_PASSWORD') }}"
+      dbname: "{{ env_var('DUCKGRES_DBT_DBNAME') }}"
+      schema: "{{ env_var('DUCKGRES_DBT_SCHEMA') }}"
+      sslmode: "{{ env_var('DUCKGRES_DBT_SSLMODE', 'require') }}"
+      connect_timeout: "{{ env_var('DUCKGRES_DBT_CONNECT_TIMEOUT', '10') | int }}"
+      threads: 1

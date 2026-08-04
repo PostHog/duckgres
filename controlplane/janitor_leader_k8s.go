@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
-	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
 	"k8s.io/client-go/kubernetes"
+	coordinationv1client "k8s.io/client-go/kubernetes/typed/coordination/v1"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -24,11 +24,32 @@ type leaderElectorRunner interface {
 	Run(context.Context)
 }
 
+// defaultElectorRecontendBackoff is the pause between losing the janitor lease
+// and re-contending for it. Short enough that a lost leader rejoins the
+// election promptly (so reaping is never long without a leader), long enough
+// that a persistently failing Run() doesn't hot-loop the API server.
+const defaultElectorRecontendBackoff = 2 * time.Second
+
 type JanitorLeaderManager struct {
-	elector    leaderElectorRunner
-	leaderLoop *leaderOnlyLoop
-	mu         sync.Mutex
-	cancel     context.CancelFunc
+	elector          leaderElectorRunner
+	leaderLoop       *leaderOnlyLoop
+	extraLoops       []*leaderOnlyLoop // additional leader-only loops (e.g. compute-usage drain) started/stopped with the janitor lease
+	recontendBackoff time.Duration
+	mu               sync.Mutex
+	cancel           context.CancelFunc
+}
+
+// AttachLeaderLoop registers an additional run function to start when this CP
+// acquires the janitor lease and stop when it loses it. Used to co-locate
+// other leader-only loops (compute-usage drain) under the existing lease so
+// exactly one CP runs them. Must be called before Start.
+func (m *JanitorLeaderManager) AttachLeaderLoop(run func(context.Context)) {
+	if m == nil || run == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.extraLoops = append(m.extraLoops, newLeaderOnlyLoop(run))
 }
 
 func NewJanitorLeaderManager(namespace, identity string, janitor *ControlPlaneJanitor) (*JanitorLeaderManager, error) {
@@ -83,17 +104,25 @@ func newJanitorLeaderManagerFromClients(
 	}
 
 	leaderLoop := newLeaderOnlyLoop(janitor.Run)
+	mgr := &JanitorLeaderManager{
+		leaderLoop:       leaderLoop,
+		recontendBackoff: defaultElectorRecontendBackoff,
+	}
 	elector, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
-		Lock:          lock,
-		LeaseDuration: 20 * time.Second,
-		RenewDeadline: 15 * time.Second,
-		RetryPeriod:   5 * time.Second,
+		Lock:            lock,
+		LeaseDuration:   20 * time.Second,
+		RenewDeadline:   15 * time.Second,
+		RetryPeriod:     5 * time.Second,
 		ReleaseOnCancel: true,
-		Name:          "duckgres-janitor",
+		Name:            "duckgres-janitor",
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: leaderLoop.onStartedLeading,
+			OnStartedLeading: func(ctx context.Context) {
+				setJanitorIsLeader(true)
+				mgr.startLeaderLoops(ctx)
+			},
 			OnStoppedLeading: func() {
-				leaderLoop.onStoppedLeading()
+				setJanitorIsLeader(false)
+				mgr.stopLeaderLoops()
 				slog.Info("Lost janitor leadership.")
 			},
 			OnNewLeader: func(current string) {
@@ -104,11 +133,32 @@ func newJanitorLeaderManagerFromClients(
 	if err != nil {
 		return nil, fmt.Errorf("create leader elector: %w", err)
 	}
+	mgr.elector = elector
+	return mgr, nil
+}
 
-	return &JanitorLeaderManager{
-		elector:    elector,
-		leaderLoop: leaderLoop,
-	}, nil
+// startLeaderLoops starts the janitor loop plus any attached extra leader-only
+// loops (compute-usage drain) when this CP acquires the lease.
+func (m *JanitorLeaderManager) startLeaderLoops(ctx context.Context) {
+	m.leaderLoop.onStartedLeading(ctx)
+	m.mu.Lock()
+	loops := append([]*leaderOnlyLoop(nil), m.extraLoops...)
+	m.mu.Unlock()
+	for _, l := range loops {
+		l.onStartedLeading(ctx)
+	}
+}
+
+// stopLeaderLoops stops the janitor loop plus any attached extra leader-only
+// loops when this CP loses the lease.
+func (m *JanitorLeaderManager) stopLeaderLoops() {
+	m.leaderLoop.onStoppedLeading()
+	m.mu.Lock()
+	loops := append([]*leaderOnlyLoop(nil), m.extraLoops...)
+	m.mu.Unlock()
+	for _, l := range loops {
+		l.onStoppedLeading()
+	}
 }
 
 func (m *JanitorLeaderManager) Start(ctx context.Context) error {
@@ -121,8 +171,40 @@ func (m *JanitorLeaderManager) Start(ctx context.Context) error {
 		m.cancel()
 	}
 	m.cancel = cancel
+	backoff := m.recontendBackoff
 	m.mu.Unlock()
-	go m.elector.Run(runCtx)
+	if backoff <= 0 {
+		backoff = defaultElectorRecontendBackoff
+	}
+
+	// client-go's LeaderElector.Run returns as soon as this CP loses (or fails
+	// to renew) the lease — it does NOT re-contend on its own. Running it only
+	// once (the prior behavior) meant a single transient renewal failure
+	// (API-server blip > RenewDeadline, GC pause, network hiccup) permanently
+	// dropped this replica out of the election. Because every fleet-wide
+	// reclamation pass (hot-idle TTL reap, orphan/stuck sweeps, stranded-pod
+	// cleanup, headroom scale-down) is leader-gated, enough leadership churn
+	// would leave the lease stale with no contender and the reaper dark
+	// fleet-wide. Re-contend in a loop so a lost leader always rejoins; the
+	// elector is safe to Run again after it returns. The loop exits only when
+	// runCtx is cancelled (Stop or parent shutdown).
+	go func() {
+		for {
+			m.elector.Run(runCtx)
+			// Run returned: either runCtx was cancelled (Stop/shutdown → exit)
+			// or we lost the lease. Re-contend after a short backoff. Checking
+			// the error before the backoff means a cancelled ctx exits promptly
+			// without an extra Run call.
+			if runCtx.Err() != nil {
+				return
+			}
+			select {
+			case <-runCtx.Done():
+				return
+			case <-time.After(backoff):
+			}
+		}
+	}()
 	return nil
 }
 
@@ -140,5 +222,5 @@ func (m *JanitorLeaderManager) Stop() {
 	if m.leaderLoop == nil {
 		return
 	}
-	m.leaderLoop.onStoppedLeading()
+	m.stopLeaderLoops()
 }

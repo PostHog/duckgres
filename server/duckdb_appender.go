@@ -16,7 +16,7 @@ import (
 // The signature lives in the server package (rather than in duckdbservice)
 // because the COPY codepath in clientConn dispatches through it; the
 // duckdbservice package registers the actual implementation at init time
-// via RegisterDuckDBAppender, which keeps server/conn.go itself free of any
+// via RegisterDuckDBAppender, which keeps server/conn_copy.go itself free of any
 // duckdb-go imports.
 //
 // parts is the result of splitQualifiedName(tableName) — a 1, 2, or 3

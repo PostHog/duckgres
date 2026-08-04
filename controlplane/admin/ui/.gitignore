@@ -1,0 +1,11 @@
+# The built bundle is a build artifact, not committed. It is produced by
+# `just ui-build` and by the Docker node stages before `go build`. Only the
+# .gitkeep is tracked so //go:embed all:dist has a target and `go build`
+# compiles without a node toolchain.
+dist/*
+!dist/.gitkeep
+node_modules
+*.local
+.DS_Store
+npm-debug.log*
+*.tsbuildinfo

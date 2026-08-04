@@ -33,8 +33,18 @@ func (cs *ConfigStore) ListOrphanedWorkerSnapshots(before time.Time) ([]WorkerSn
 
 // ListExpiredHotIdleSnapshots is the snapshot-typed variant of
 // ListExpiredHotIdleWorkers used by the janitor's hot-idle TTL reaper.
-func (cs *ConfigStore) ListExpiredHotIdleSnapshots(before time.Time) ([]WorkerSnapshot, error) {
-	records, err := cs.ListExpiredHotIdleWorkers(before)
+func (cs *ConfigStore) ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]WorkerSnapshot, error) {
+	records, err := cs.ListExpiredHotIdleWorkers(now, defaultTTL)
+	if err != nil {
+		return nil, err
+	}
+	return workerSnapshotsFromRecords(records), nil
+}
+
+// ListExpiredHotIdleSnapshotsForCP is the snapshot-typed, owner-scoped variant
+// of ListExpiredHotIdleWorkers used by the per-CP fallback reaper.
+func (cs *ConfigStore) ListExpiredHotIdleSnapshotsForCP(ownerCPInstanceID string, now time.Time, defaultTTL time.Duration) ([]WorkerSnapshot, error) {
+	records, err := cs.ListExpiredHotIdleWorkersForCP(ownerCPInstanceID, now, defaultTTL)
 	if err != nil {
 		return nil, err
 	}

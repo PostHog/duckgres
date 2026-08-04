@@ -1,19 +1,22 @@
-INSERT INTO duckgres_orgs (name, database_name, max_workers, memory_budget, idle_timeout_s, created_at, updated_at)
-VALUES ('local', 'duckgres', 0, '', 0, NOW(), NOW())
+INSERT INTO duckgres_orgs (name, database_name, max_workers, created_at, updated_at)
+VALUES ('local', 'duckgres', 0, NOW(), NOW())
 ON CONFLICT (name) DO UPDATE
+SET updated_at = NOW();
+
+-- Every org must have at least one PostHog team (duckgres_org_teams row);
+-- team 1 is a placeholder for local dev.
+INSERT INTO duckgres_org_teams (org_id, team_id, schema_name, enabled, created_at, updated_at)
+VALUES ('local', 1, 'team_1', TRUE, NOW(), NOW())
+ON CONFLICT (org_id, team_id) DO UPDATE
 SET updated_at = NOW();
 
 INSERT INTO duckgres_managed_warehouses (
     org_id,
+    duckling_name,
     image,
-    warehouse_database_region,
     warehouse_database_endpoint,
     warehouse_database_port,
-    warehouse_database_database_name,
-    warehouse_database_username,
     metadata_store_kind,
-    metadata_store_engine,
-    metadata_store_region,
     metadata_store_endpoint,
     metadata_store_port,
     metadata_store_database_name,
@@ -26,7 +29,6 @@ INSERT INTO duckgres_managed_warehouses (
     s3_use_ssl,
     s3_url_style,
     worker_identity_namespace,
-    worker_identity_service_account_name,
     worker_identity_iam_role_arn,
     warehouse_database_credentials_namespace,
     warehouse_database_credentials_name,
@@ -42,16 +44,10 @@ INSERT INTO duckgres_managed_warehouses (
     runtime_config_key,
     state,
     status_message,
-    warehouse_database_state,
-    warehouse_database_status_message,
     metadata_store_state,
-    metadata_store_status_message,
     s3_state,
-    s3_status_message,
     identity_state,
-    identity_status_message,
     secrets_state,
-    secrets_status_message,
     ready_at,
     failed_at,
     created_at,
@@ -59,15 +55,11 @@ INSERT INTO duckgres_managed_warehouses (
 )
 VALUES (
     'local',
+    'local',
     '',
-    'kind-dev',
     'local-warehouse-db',
     5432,
-    'duckgres_local',
-    'duckgres',
     'dedicated_rds',
-    'postgres',
-    'kind-dev',
     'duckgres-local-ducklake-metadata',
     5432,
     'ducklake_metadata_local',
@@ -80,7 +72,6 @@ VALUES (
     false,
     'path',
     'duckgres',
-    'duckgres-local-worker',
     'arn:aws:iam::000000000000:role/duckgres-local-worker',
     'duckgres',
     'local-warehouse-db',
@@ -97,29 +88,18 @@ VALUES (
     'ready',
     'kind local warehouse metadata',
     'ready',
-    'kind local warehouse db metadata seeded',
     'ready',
-    'kind local metadata store seeded',
     'ready',
-    'kind local object store metadata seeded',
     'ready',
-    'kind local worker identity metadata seeded',
-    'ready',
-    'kind local secret refs seeded',
     NOW(),
     NULL,
     NOW(),
     NOW()
 )
 ON CONFLICT (org_id) DO UPDATE
-SET warehouse_database_region = EXCLUDED.warehouse_database_region,
-    warehouse_database_endpoint = EXCLUDED.warehouse_database_endpoint,
+SET warehouse_database_endpoint = EXCLUDED.warehouse_database_endpoint,
     warehouse_database_port = EXCLUDED.warehouse_database_port,
-    warehouse_database_database_name = EXCLUDED.warehouse_database_database_name,
-    warehouse_database_username = EXCLUDED.warehouse_database_username,
     metadata_store_kind = EXCLUDED.metadata_store_kind,
-    metadata_store_engine = EXCLUDED.metadata_store_engine,
-    metadata_store_region = EXCLUDED.metadata_store_region,
     metadata_store_endpoint = EXCLUDED.metadata_store_endpoint,
     metadata_store_port = EXCLUDED.metadata_store_port,
     metadata_store_database_name = EXCLUDED.metadata_store_database_name,
@@ -132,7 +112,6 @@ SET warehouse_database_region = EXCLUDED.warehouse_database_region,
     s3_use_ssl = EXCLUDED.s3_use_ssl,
     s3_url_style = EXCLUDED.s3_url_style,
     worker_identity_namespace = EXCLUDED.worker_identity_namespace,
-    worker_identity_service_account_name = EXCLUDED.worker_identity_service_account_name,
     worker_identity_iam_role_arn = EXCLUDED.worker_identity_iam_role_arn,
     warehouse_database_credentials_namespace = EXCLUDED.warehouse_database_credentials_namespace,
     warehouse_database_credentials_name = EXCLUDED.warehouse_database_credentials_name,
@@ -148,16 +127,10 @@ SET warehouse_database_region = EXCLUDED.warehouse_database_region,
     runtime_config_key = EXCLUDED.runtime_config_key,
     state = EXCLUDED.state,
     status_message = EXCLUDED.status_message,
-    warehouse_database_state = EXCLUDED.warehouse_database_state,
-    warehouse_database_status_message = EXCLUDED.warehouse_database_status_message,
     metadata_store_state = EXCLUDED.metadata_store_state,
-    metadata_store_status_message = EXCLUDED.metadata_store_status_message,
     s3_state = EXCLUDED.s3_state,
-    s3_status_message = EXCLUDED.s3_status_message,
     identity_state = EXCLUDED.identity_state,
-    identity_status_message = EXCLUDED.identity_status_message,
     secrets_state = EXCLUDED.secrets_state,
-    secrets_status_message = EXCLUDED.secrets_status_message,
     ready_at = EXCLUDED.ready_at,
     failed_at = EXCLUDED.failed_at,
     updated_at = NOW();

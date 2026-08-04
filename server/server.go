@@ -25,7 +25,6 @@ import (
 	"github.com/posthog/duckgres/server/auth"
 	"github.com/posthog/duckgres/server/chsql"
 	"github.com/posthog/duckgres/server/ducklake"
-	"github.com/posthog/duckgres/server/iceberg"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sysinfo"
 	"github.com/posthog/duckgres/server/wire"
@@ -38,11 +37,6 @@ import (
 // to compile after the migration code moved to server/ducklake. New code
 // should import server/ducklake and use ducklake.Config directly.
 type DuckLakeConfig = ducklake.Config
-
-// IcebergConfig is an alias for iceberg.Config so callers that already
-// import "github.com/posthog/duckgres/server" can reach it as
-// server.IcebergConfig without a second import.
-type IcebergConfig = iceberg.Config
 
 // DefaultDuckLakeSpecVersion is re-exported for callers that referenced the
 // constant under the server package before the migration code moved.
@@ -133,11 +127,6 @@ var queryDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_query_duration_seconds",
 	Help:    "Query execution duration in seconds",
 	Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 18000, 36000},
-}, []string{"org"})
-
-var queryErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "duckgres_query_errors_total",
-	Help: "Total number of failed queries",
 }, []string{"org"})
 
 var queryCancellationsCounter = promauto.NewCounter(prometheus.CounterOpts{
@@ -231,11 +220,6 @@ type Config struct {
 	// DuckLake configuration
 	DuckLake DuckLakeConfig
 
-	// Iceberg catalog (AWS S3 Tables) configuration. Per-tenant in
-	// multitenant mode (sourced from the configstore via shared_worker_activator);
-	// optional opt-in for standalone instances via --iceberg-* flags.
-	Iceberg IcebergConfig
-
 	// AlwaysDuckLake forces the SQL transpiler into DuckLake mode for every
 	// session even when the global DuckLake.MetadataStore is empty. The
 	// multitenant control plane sets this because metadata stores are
@@ -282,6 +266,12 @@ type Config struct {
 	// recycle wipe is how workers stay clean.
 	PinSecretDirectory bool
 
+	// UserSecrets persists per-user CREATE PERSISTENT SECRET statements
+	// across sessions and worker pods. Set by the multitenant control plane
+	// (remote backend, config-store-backed); nil everywhere else, in which
+	// case secret DDL passes through to DuckDB untouched.
+	UserSecrets UserSecretManager
+
 	// MemoryLimit is the DuckDB memory_limit per session (e.g., "4GB").
 	// If empty, auto-detected from system memory.
 	MemoryLimit string
@@ -305,17 +295,23 @@ type Config struct {
 	// Queries from these users go directly to DuckDB without any PostgreSQL compatibility layer.
 	PassthroughUsers map[string]bool
 
-	// QueryLog configures the DuckLake query log (system.query_log table).
+	// QueryLog configures query-log collection and flushing.
 	QueryLog QueryLogConfig
 }
 
 // QueryLogConfig configures the query log feature.
 type QueryLogConfig struct {
-	Enabled              bool
-	FlushInterval        time.Duration
-	BatchSize            int
-	CompactInterval      time.Duration
-	DataInliningRowLimit int
+	Enabled       bool
+	FlushInterval time.Duration
+	BatchSize     int
+	// StartEvents selects which statements emit a QueryStart event. Empty
+	// behaves as the default ("data") so a config that predates this field
+	// keeps working.
+	StartEvents QueryStartEvents
+	// Metadata enables per-statement extraction of the relations, columns,
+	// functions, and access classes a statement touches (server/querymeta).
+	// It costs one parse per distinct statement text, memoized.
+	Metadata bool
 }
 
 // fileDBEntry tracks a shared *sql.DB for file-persistence mode.
@@ -360,8 +356,16 @@ type Server struct {
 	connsMu sync.RWMutex
 	conns   map[int32]*clientConn
 
-	// Query logger for DuckLake system.query_log
+	// recentErrors is a bounded in-memory ring of the most recent (redacted)
+	// query errors, for the admin Errors page. Always on, independent of the
+	// query-log sink.
+	recentErrors *recentErrorRing
+
+	// Query logger kept for existing call sites that install or inspect the
+	// concrete batched logger.
 	queryLogger *QueryLogger
+	// Query-log sink used by query execution.
+	queryLogSink QueryLogSink
 
 	// Per-user shared DB pool for file persistence mode.
 	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
@@ -401,13 +405,11 @@ func New(cfg Config) (*Server, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
-	// Use default idle timeout if not specified (24 hours)
-	// Negative value means explicitly disabled (set to 0)
-	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 24 * time.Hour
-	} else if cfg.IdleTimeout < 0 {
-		cfg.IdleTimeout = 0
-	}
+	// Standalone defaults to a 24h connection idle timeout (an idle in-process
+	// connection costs little). The control plane overrides this with a much
+	// shorter default (see NormalizeIdleTimeout) because there an idle
+	// connection pins a scarce worker.
+	cfg.IdleTimeout = NormalizeIdleTimeout(cfg.IdleTimeout, 24*time.Hour)
 	if cfg.SessionInitTimeout == 0 {
 		cfg.SessionInitTimeout = DefaultSessionInitTimeout
 	}
@@ -426,6 +428,7 @@ func New(cfg Config) (*Server, error) {
 		duckLakeSem:   make(chan struct{}, 1),
 		conns:         make(map[int32]*clientConn),
 		fileDBs:       make(map[string]*fileDBEntry),
+		recentErrors:  newRecentErrorRing(0),
 	}
 
 	// Configure TLS: ACME DNS-01, ACME HTTP-01, or static certificate files
@@ -486,10 +489,13 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	// Initialize query logger (non-fatal on error)
-	if ql, err := NewQueryLogger(cfg); err != nil {
+	if sink, err := NewQueryLogSink(cfg); err != nil {
 		slog.Warn("Failed to initialize query log, continuing without it.", "error", err)
-	} else if ql != nil {
-		s.queryLogger = ql
+	} else if sink != nil {
+		s.queryLogSink = sink
+		if ql, ok := sink.(*QueryLogger); ok {
+			s.queryLogger = ql
+		}
 	}
 
 	// Initialize DuckLake checkpoint scheduler (non-fatal on error)
@@ -593,9 +599,15 @@ func (s *Server) Close() error {
 	}
 
 	// Stop query logger (drains remaining entries)
-	if s.queryLogger != nil {
-		s.queryLogger.Stop()
+	queryLogTimeout := s.cfg.ShutdownTimeout
+	if queryLogTimeout <= 0 {
+		queryLogTimeout = 30 * time.Second
 	}
+	queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogTimeout)
+	if err := s.StopQueryLogging(queryLogCtx); err != nil {
+		slog.Warn("Query log shutdown deadline exceeded.", "error", err)
+	}
+	queryLogCancel()
 
 	// Stop DuckLake checkpoint scheduler
 	if s.checkpointer != nil {
@@ -667,6 +679,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 
+	// Stop query logger (drains remaining entries)
+	if err := s.StopQueryLogging(ctx); err != nil {
+		slog.Warn("Query log shutdown deadline exceeded.", "error", err)
+	}
+
 	// Database connections are now closed by each clientConn when it terminates
 	slog.Info("Shutdown complete.")
 	return nil
@@ -703,7 +720,7 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 	if ok && cancel != nil {
 		cancel()
 		queryCancellationsCounter.Inc()
-		slog.Info("Query cancelled via cancel request.", "pid", key.Pid, "secret_key", key.SecretKey)
+		slog.Info("Query cancelled via cancel request.", "pid", key.Pid)
 		return true
 	}
 	return false
@@ -714,6 +731,9 @@ func (s *Server) CancelQuery(key BackendKey) bool {
 // named "clientConn" shadows the type name (e.g., in worker.go).
 func (s *Server) initConnsMap() {
 	s.conns = make(map[int32]*clientConn)
+	if s.recentErrors == nil {
+		s.recentErrors = newRecentErrorRing(0)
+	}
 }
 
 // registerConn adds a client connection to the registry for pg_stat_activity.
@@ -728,6 +748,47 @@ func (s *Server) unregisterConn(pid int32) {
 	s.connsMu.Lock()
 	delete(s.conns, pid)
 	s.connsMu.Unlock()
+}
+
+// DrainOrgConnections requests a clean close of every PostgreSQL connection
+// for orgID at its next idle protocol boundary. Connections already blocked
+// waiting for client input are woken immediately; executing queries are not
+// cancelled and close after their next ReadyForQuery.
+func (s *Server) DrainOrgConnections(orgID string) int {
+	return s.drainConnections(func(c *clientConn) bool {
+		return c.orgID == orgID
+	})
+}
+
+// DrainUserConnections requests a clean close of every PostgreSQL connection
+// for one org user. It is used when a project reader's credentials or access
+// policy changes so an established connection cannot retain stale access.
+func (s *Server) DrainUserConnections(orgID, username string) int {
+	return s.drainConnections(func(c *clientConn) bool {
+		return c.orgID == orgID && c.username == username
+	})
+}
+
+func (s *Server) drainConnections(matches func(*clientConn) bool) int {
+	s.connsMu.RLock()
+	conns := make([]*clientConn, 0)
+	for _, c := range s.conns {
+		if c != nil && matches(c) {
+			conns = append(conns, c)
+		}
+	}
+	s.connsMu.RUnlock()
+
+	for _, c := range conns {
+		c.drainRequested.Store(true)
+		if c.conn != nil && c.idleRead.Load() {
+			// Wake a message loop already blocked at an idle boundary. An active
+			// query (including COPY reading client data) is not marked idle and is
+			// therefore unaffected.
+			_ = c.conn.SetReadDeadline(time.Now())
+		}
+	}
+	return len(conns)
 }
 
 // listConns returns a snapshot of all registered client connections.
@@ -987,7 +1048,56 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 			slog.Debug("Set cache_httpfs cache directory.", "cache_directory", cacheDir)
 		}
 	}
+
 	return nil
+}
+
+// applyHTTPFSRetryBudget widens httpfs's retry budget for transient S3 throttling.
+//
+// S3 answers a sustained request burst with HTTP 503 SlowDown ("please reduce
+// your request rate"). That's pure throttling — transient and safe to retry —
+// and httpfs DOES retry 503 (RunRequestWithRetry → ShouldRetry in duckdb's
+// http_util.cpp includes ServiceUnavailable_503), but its defaults are tiny:
+// http_retries=3, http_retry_wait_ms=100, http_retry_backoff=4 → a cumulative
+// backoff of only ~0.5s. A throttle that outlasts ~0.5s exhausts all 3 attempts
+// and httpfs throws fatally; the error then surfaces all the way out as a fatal
+// XX000 (no upper layer reclassifies an HTTP 503 as retryable — classifyErrorCode
+// falls through to XX000), failing e.g. a DuckLake events DELETE that range-GETs
+// parquet data files.
+//
+// Raising the budget to retries=10, wait=500ms, backoff=2 widens the cumulative
+// backoff substantially. DuckDB's retry loop sleeps
+// retry_wait_ms * retry_backoff^(tries-2) ms before each retry from the 2nd
+// onward (the 1st is immediate): waits 0, 500, 1k, 2k, 4k, 8k, 16k, 32k, 64k,
+// 128k ms — ~255s (~4.3min) cumulative, ~128s on the final single wait. That rides
+// out a typical SlowDown burst (which clears in seconds to low minutes); the
+// tradeoff is a single throttled request can block ~2min on its last retry
+// (~4.3min worst case) — acceptable for a backfill, where retrying beats failing
+// the partition, and well under the 55m worker drain timeout / 3600s pod grace.
+//
+// This MUST run after the catalog ATTACH call (AttachDuckLake), not in
+// ConfigureMainDB. httpfs is auto-loaded by DuckLake's ATTACH on the first
+// S3 touch, so it is NOT in
+// cfg.Extensions — a gate on cfg.Extensions would never fire. By the time the
+// ATTACH calls return, httpfs is loaded and the extension-registered options
+// (http_retries/http_retry_wait_ms/http_retry_backoff in httpfs_extension.cpp)
+// are settable. Warn-only: a SET failure (e.g. httpfs not loaded because no
+// S3-backed catalog is configured) must not fail the connection; httpfs keeps
+// its defaults.
+//
+// SET GLOBAL because workers recycle connections between sessions (see
+// ProfilingSettings note in ConfigureMainDB / duckdbservice.evictConnFromPool)
+// — a session-scoped SET would not survive to the next session's connection.
+func applyHTTPFSRetryBudget(db *sql.DB) {
+	for _, stmt := range []string{
+		"SET GLOBAL http_retries = 10",
+		"SET GLOBAL http_retry_wait_ms = 500",
+		"SET GLOBAL http_retry_backoff = 2",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to set httpfs retry config.", "stmt", stmt, "error", err)
+		}
+	}
 }
 
 func seedBundledExtensions(srcRoot, dstRoot string) error {
@@ -1126,6 +1236,29 @@ func CreateDBConnection(cfg Config, duckLakeSem chan struct{}, username string, 
 	return db, nil
 }
 
+func tryEnsureDuckLakeQueryLogSurface(db *sql.DB, cfg Config, username string) {
+	queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogSurfaceInitTimeout)
+	defer queryLogCancel()
+	if err := ensureDuckLakeQueryLogSurface(queryLogCtx, db, cfg); err != nil {
+		slog.Warn("Failed to initialize DuckLake query-log view.", "user", username, "error", err)
+	}
+}
+
+func tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg Config) {
+	queryLogCtx, queryLogCancel := context.WithTimeout(context.Background(), queryLogSurfaceInitTimeout)
+	defer queryLogCancel()
+	// Runtime pre-attach DDL is a compatibility bridge for existing orgs that
+	// predate managed query-log storage. Remove it once org metadata
+	// provisioning/migrations create querylog.query_log_entries before any
+	// DuckLake attach, and all existing tenants have been migrated.
+	if ensurePostgresQueryLogStorageForDuckLakeAttach(queryLogCtx, cfg) != nil {
+		// Do not log or classify the error here: metadata-store connection
+		// errors can carry DSNs with credentials, and even derived log fields can
+		// be treated as sensitive by static analysis. The setup is best-effort.
+		slog.Warn("Failed to initialize native Postgres query-log storage before DuckLake attach.")
+	}
+}
+
 // ConfigureDBConnection initializes an existing DuckDB connection with pg_catalog,
 // information_schema, and DuckLake catalog attachment.
 func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string, serverStartTime time.Time, serverVersion string) error {
@@ -1142,6 +1275,7 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
+	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		// If DuckLake was explicitly configured, fail the connection.
 		// Silent fallback to local DB causes schema/table mismatches.
@@ -1152,6 +1286,8 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
 	} else if cfg.DuckLake.MetadataStore != "" {
 		duckLakeMode = true
+
+		tryEnsureDuckLakeQueryLogSurface(db, cfg, username)
 
 		// Recreate pg_class_full to source from DuckLake metadata instead of DuckDB's pg_catalog.
 		// This ensures consistent PostgreSQL-compatible OIDs across all pg_class queries.
@@ -1173,13 +1309,6 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		}
 		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
 	}
-	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
-		if cfg.Iceberg.Enabled {
-			return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
-		}
-		slog.Warn("Failed to attach Iceberg catalog.", "user", username, "error", err)
-	}
-
 	// Initialize information_schema compatibility views in memory.main
 	// Must be done AFTER attaching DuckLake (so views can reference ducklake.information_schema)
 	// but BEFORE setting DuckLake as default (so views are created in memory.main, not ducklake.main)
@@ -1195,57 +1324,46 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		}
 	}
 
+	// Widen httpfs's retry budget now that the ATTACH calls above have loaded
+	// httpfs (DuckLake auto-loads it on the first S3 touch). See
+	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
+	applyHTTPFSRetryBudget(db)
+
 	return nil
 }
 
 // ActivateDBConnection applies tenant-specific DuckLake runtime to an already
 // initialized generic DuckDB connection used by a shared warm worker.
 func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, username string) error {
-	// Iceberg-only activation (no DuckLake): used by cnpg-shard tenants, whose
-	// "metadata store" is the Lakekeeper Postgres backend, not a DuckLake
-	// catalog (and which the worker has no egress to reach). The control plane
-	// signals this by leaving DuckLake.MetadataStore empty while enabling
-	// Iceberg. External tenants keep DuckLake (+ optional Iceberg) and
-	// take the branch below unchanged.
-	icebergOnly := cfg.DuckLake.MetadataStore == ""
-	if icebergOnly && !cfg.Iceberg.Enabled {
-		return fmt.Errorf("tenant activation requires a ducklake metadata_store or an enabled iceberg catalog")
+	if cfg.DuckLake.MetadataStore == "" {
+		return fmt.Errorf("tenant activation requires a ducklake metadata_store")
 	}
 
-	if !icebergOnly {
-		if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
-			return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
-		}
-		if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
-			return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
-		}
+	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg)
+	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
+		return fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 	}
-	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
-		return fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
+	if err := AttachDeltaCatalog(db, cfg.DuckLake, duckLakeSem); err != nil {
+		return fmt.Errorf("delta catalog configured but attachment failed: %w", err)
 	}
 
-	// The pg_class/pg_namespace recreation and the duckLakeMode information_schema
-	// reflect the DuckLake catalog; skip the DuckLake-specific rewrites when
-	// there's no DuckLake attached.
-	if !icebergOnly {
-		if err := recreatePgClassForDuckLake(db); err != nil {
-			slog.Warn("Failed to recreate pg_class_full for DuckLake during activation.", "user", username, "error", err)
-		}
-		if err := recreatePgNamespaceForDuckLake(db); err != nil {
-			slog.Warn("Failed to recreate pg_namespace for DuckLake during activation.", "user", username, "error", err)
-		}
-	}
-	if err := initInformationSchema(db, !icebergOnly); err != nil {
+	tryEnsureDuckLakeQueryLogSurface(db, cfg, username)
+
+	// Catalog-scoped pg_class/pg_namespace/pg_attribute views are installed by
+	// sessionmeta.InitSessionDatabaseMetadata for each Postgres session. Do not
+	// install DuckLake-only global pg_catalog views here.
+	if err := initInformationSchema(db, true); err != nil {
 		slog.Warn("Failed to initialize information_schema during activation.", "user", username, "error", err)
 	}
 
-	if icebergOnly {
-		if err := setIcebergDefault(db); err != nil {
-			return fmt.Errorf("failed to set Iceberg as default: %w", err)
-		}
-	} else if err := setDuckLakeDefault(db); err != nil {
+	if err := setDuckLakeDefault(db); err != nil {
 		return fmt.Errorf("failed to set DuckLake as default: %w", err)
 	}
+
+	// Widen httpfs's retry budget now that the ATTACH calls above have loaded
+	// httpfs (DuckLake auto-loads it on the first S3 touch). See
+	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
+	applyHTTPFSRetryBudget(db)
 
 	return nil
 }
@@ -1267,6 +1385,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	chsql.InitMacros(db)
 
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
+	tryEnsurePostgresQueryLogStorageBeforeDuckLakeAttach(cfg)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		if cfg.DuckLake.MetadataStore != "" {
 			_ = db.Close()
@@ -1274,6 +1393,8 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 		}
 		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
 	} else if cfg.DuckLake.MetadataStore != "" {
+		tryEnsureDuckLakeQueryLogSurface(db, cfg, username)
+
 		if err := setDuckLakeDefault(db); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
@@ -1286,13 +1407,10 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 		}
 		slog.Warn("Failed to attach Delta catalog.", "user", username, "error", err)
 	}
-	if err := AttachIcebergCatalog(db, cfg.Iceberg, duckLakeSem, cfg.DuckLake.S3AccessKey, cfg.DuckLake.S3SecretKey, cfg.DuckLake.S3SessionToken); err != nil {
-		if cfg.Iceberg.Enabled {
-			_ = db.Close()
-			return nil, fmt.Errorf("iceberg catalog configured but attachment failed: %w", err)
-		}
-		slog.Warn("Failed to attach Iceberg catalog.", "user", username, "error", err)
-	}
+	// Widen httpfs's retry budget now that the ATTACH calls above have loaded
+	// httpfs (DuckLake auto-loads it on the first S3 touch). See
+	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
+	applyHTTPFSRetryBudget(db)
 
 	return db, nil
 }
@@ -1314,6 +1432,14 @@ func parseExtensionName(ext string) (name, installCmd string) {
 //
 // NOTE: Extension names come from trusted server config, not user input.
 func LoadExtensions(db *sql.DB, extensions []string) error {
+	return loadExtensionsWith(db, extensions)
+}
+
+// loadExtensionsWith is LoadExtensions over a duckLakeSQLExecer so the
+// catalog-attachment paths can run INSTALL/LOAD under per-step deadlines via
+// attachStepExecer (a hung extension LOAD is one of the documented activation
+// stalls — see shouldInstallExtension).
+func loadExtensionsWith(db duckLakeSQLExecer, extensions []string) error {
 	if len(extensions) == 0 {
 		return nil
 	}
@@ -1352,25 +1478,6 @@ func shouldInstallExtension(name string) bool {
 	// it as installed. That holds for the PostHog-fork extensions (httpfs,
 	// ducklake) and the stable ones we ship (json, postgres_scanner): LOAD
 	// against the seeded extension_directory file just works.
-	//
-	// Iceberg behaves differently. With the bundled binary in place but no
-	// prior INSTALL, db.Exec("LOAD iceberg") blocks indefinitely (observed on
-	// a worker in mw-dev: warm-up → activation hangs past the activate-tenant
-	// deadline at the LOAD with no progress and no Go log; the bundled binary
-	// is sitting in the cache the whole time). The CDN INSTALL — which the
-	// bundle (#645) was added specifically to avoid — turns into the same
-	// silent stall the bundle was meant to fix when LOAD is left to figure
-	// things out on its own.
-	//
-	// Running INSTALL when the binary is already in extension_directory is a
-	// cheap no-op (DuckDB sees the cached file and skips the CDN download), so
-	// special-casing iceberg keeps the bundle benefit (no first-load fetch
-	// from the CDN) and unblocks LOAD. The upstream-overwrite risk that
-	// motivates skipping INSTALL for the PostHog forks doesn't apply here: we
-	// bundle the same stock iceberg build the repository would serve.
-	if name == "iceberg" {
-		return true
-	}
 	return !hasBundledExtensionBinary(name)
 }
 
@@ -1502,16 +1609,22 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// "database with name '__ducklake_metadata_ducklake' already exists".
 	// Use a 30-second timeout to prevent connections from hanging indefinitely
 	// if attachment is slow (e.g., network latency to metadata store).
+	//
+	// Every statement below runs through ae so a hung network dependency
+	// (metadata Postgres, S3) fails fast at a per-step deadline instead of
+	// silently eating the activate-tenant budget; releaseSem keeps the sem
+	// held until any abandoned statement actually finishes.
+	ae := newAttachStepExecer(db)
 	select {
 	case sem <- struct{}{}:
-		defer func() { <-sem }()
+		defer ae.releaseSem(sem)
 	case <-time.After(30 * time.Second):
 		return fmt.Errorf("timeout waiting for DuckLake attachment lock")
 	}
 
 	// Check if DuckLake catalog is already attached
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'").Scan(&count)
+	err := ae.queryRowScan("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'ducklake'", &count)
 	if err == nil && count > 0 {
 		// Already attached
 		return nil
@@ -1529,7 +1642,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 			dlCfg.S3Profile != ""
 
 		if needsSecret {
-			if err := createS3Secret(db, dlCfg); err != nil {
+			if err := createS3SecretWith(ae, dlCfg); err != nil {
 				return fmt.Errorf("failed to create S3 secret: %w", err)
 			}
 		}
@@ -1560,7 +1673,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		// resolveS3SecretTransport now does whenever HTTPProxy is set —
 		// see buildConfigSecret / buildCredentialChainSecret /
 		// buildAWSSdkSecret.
-		if _, err := db.Exec(fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy)); err != nil {
+		if _, err := ae.Exec(fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy)); err != nil {
 			slog.Warn("Failed to set httpfs proxy config.", "stmt", "SET GLOBAL http_proxy", "error", err)
 		}
 		slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
@@ -1580,7 +1693,9 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 
 	// Build the ATTACH statement.
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
-	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
+	if err := applyDuckLakePreAttachSettingsWith(ae, func() error {
+		return loadExtensionsWith(ae, []string{"postgres_scanner"})
+	}, dlCfg); err != nil {
 		return err
 	}
 	migrate := dlCfg.Migrate || ducklake.MigrationNeeded(dlCfg.MetadataStore)
@@ -1605,9 +1720,18 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
+	// A migrating ATTACH rewrites metadata tables in the metadata store and
+	// can legitimately run for minutes on a large catalog; give it a far
+	// looser deadline than a normal ATTACH so per-step timeouts never break
+	// a spec migration mid-flight.
+	attachTimeout := attachStatementTimeout
+	if migrate {
+		attachTimeout = attachMigrateStatementTimeout
+	}
+
 	_, attachSpan := observe.Tracer().Start(context.Background(), "duckgres.ducklake_attach")
 	if err := retryOnTransientAttach(func() error {
-		_, err := db.Exec(attachStmt)
+		_, err := ae.execTimeout(attachTimeout, attachStmt)
 		return err
 	}); err != nil {
 		attachSpan.End()
@@ -1621,7 +1745,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// DuckLake uses optimistic concurrency - when multiple connections commit
 	// simultaneously, they may conflict on snapshot IDs. Default of 10 is too low
 	// for tools like Fivetran that open many concurrent connections.
-	if _, err := db.Exec("SET ducklake_max_retry_count = 100"); err != nil {
+	if _, err := ae.Exec("SET ducklake_max_retry_count = 100"); err != nil {
 		slog.Warn("Failed to set ducklake_max_retry_count.", "error", err)
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
@@ -1639,7 +1763,7 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 	// SET GLOBAL only affects pools created after it runs, so would be a no-op here.
 	// See: https://github.com/duckdb/ducklake/issues/1031 and
 	// https://github.com/duckdb/duckdb-postgres/pull/430
-	configureDuckLakeMetadataPool(db)
+	configureDuckLakeMetadataPool(ae)
 
 	// Ensure performance indexes exist on the DuckLake metadata tables.
 	// Run in a goroutine so it doesn't block the DuckLake semaphore or
@@ -1666,32 +1790,35 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 		return nil
 	}
 
+	// Per-step deadlines: Delta attach + probe hit S3 directly, so a
+	// blackholed object store fails fast instead of hanging activation.
+	ae := newAttachStepExecer(db)
 	select {
 	case sem <- struct{}{}:
-		defer func() { <-sem }()
+		defer ae.releaseSem(sem)
 	case <-time.After(30 * time.Second):
 		return fmt.Errorf("timeout waiting for Delta catalog attachment lock")
 	}
 
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'delta'").Scan(&count)
+	err := ae.queryRowScan("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = 'delta'", &count)
 	if err == nil && count > 0 {
 		return nil
 	}
 
-	if err := LoadExtensions(db, []string{"delta"}); err != nil {
+	if err := loadExtensionsWith(ae, []string{"delta"}); err != nil {
 		return fmt.Errorf("load delta extension: %w", err)
 	}
 
 	if deltaCatalogNeedsS3Secret(catalogPath, dlCfg) {
-		if err := createS3Secret(db, dlCfg); err != nil {
+		if err := createS3SecretWith(ae, dlCfg); err != nil {
 			return fmt.Errorf("failed to create S3 secret: %w", err)
 		}
 	}
 
 	attachStmt := ducklake.BuildDeltaAttachStmt(dlCfg)
 	slog.Info("Attaching Delta catalog.", "path", catalogPath)
-	if _, err := db.Exec(attachStmt); err != nil {
+	if _, err := ae.execTimeout(attachStatementTimeout, attachStmt); err != nil {
 		// Delta is enabled by default. A fresh DuckLake tenant won't have any
 		// Delta data at the sibling delta/ prefix yet, so DeltaKernel returns
 		// "No files in log segment". That's expected — the catalog will start
@@ -1710,9 +1837,9 @@ func AttachDeltaCatalog(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}) err
 	// Delta tries to read a missing _delta_log/. Probe immediately and detach
 	// if there's no Delta data here yet, so the catalog only sticks around
 	// once it's actually queryable.
-	if _, err := db.Exec("SHOW TABLES FROM delta"); err != nil {
+	if _, err := ae.execTimeout(attachStatementTimeout, "SHOW TABLES FROM delta"); err != nil {
 		if isDeltaCatalogEmptyError(err) {
-			if _, derr := db.Exec("DETACH delta"); derr != nil {
+			if _, derr := ae.Exec("DETACH delta"); derr != nil {
 				slog.Warn("Failed to detach empty Delta catalog after attach probe.", "error", derr)
 			}
 			slog.Info("Detached Delta catalog: no Delta data at path yet.", "path", catalogPath)
@@ -1733,169 +1860,6 @@ func isDeltaCatalogEmptyError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "No files in log segment")
-}
-
-// AttachIcebergCatalog attaches the per-tenant Iceberg catalog. Lakekeeper REST
-// is the only backend; the AWS S3 Tables path was removed when S3 Tables
-// stopped being a supported product. Idempotent if the catalog is already
-// attached; fail-soft for the "fresh tenant, no namespaces yet" case so a
-// worker activation isn't blocked.
-func AttachIcebergCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
-	if !ic.Enabled {
-		return nil
-	}
-	return attachLakekeeperCatalog(db, ic, sem, keyID, secret, sessionToken)
-}
-
-// attachLakekeeperCatalog attaches the per-tenant Lakekeeper REST catalog.
-// Skipped (returns nil) when LakekeeperEndpoint is empty — the provisioner
-// hasn't run yet for this org and the next activation will retry.
-func attachLakekeeperCatalog(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secret, sessionToken string) error {
-	if ic.LakekeeperEndpoint == "" || ic.LakekeeperWarehouse == "" {
-		// Provisioner hasn't populated the row yet. Don't fail the
-		// activation; subsequent activations after provisioning will
-		// reattach with a populated config.
-		return nil
-	}
-
-	select {
-	case sem <- struct{}{}:
-		defer func() { <-sem }()
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("timeout waiting for Iceberg catalog attachment lock")
-	}
-
-	// Step instrumentation: the calls below are CGO db.Exec/LoadExtensions that
-	// emit no Go log until they return, so a stall in any one of them is
-	// invisible in the worker logs (a tenant activation that exceeds the
-	// control-plane deadline just shows warm-up then silence). Log before each
-	// step with its elapsed-since-start so the *last* "step starting" line
-	// without a matching later step pinpoints the blocking call.
-	istart := time.Now()
-	istep := func(name string) {
-		slog.Info("Iceberg activation step starting.", "step", name, "warehouse", ic.LakekeeperWarehouse, "elapsed", time.Since(istart))
-	}
-
-	istep("count-catalogs")
-	var count int
-	err := db.QueryRow(
-		"SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = '" + iceberg.CatalogName + "'",
-	).Scan(&count)
-	if err == nil && count > 0 {
-		return nil
-	}
-
-	// httpfs + S3 data secret must be ready BEFORE LoadExtensions("iceberg").
-	// The DuckLake-attached (iceberg + DuckLake "both") path works because
-	// AttachDuckLake runs first: it auto-loads httpfs and creates a TYPE S3
-	// secret (ducklake_s3) before iceberg is ever touched. The iceberg-only
-	// path doesn't go through AttachDuckLake, so iceberg's LOAD-time init has
-	// no httpfs loaded and no S3 secret to find — and falls back to AWS-SDK
-	// credential discovery, which probes IMDS (169.254.169.254). The
-	// workers' cluster-wide network policy explicitly denies that range
-	// (defense-in-depth, see worker-network-policy.yaml), so the probe
-	// blocks until the activate-tenant deadline (~60s) with no Go-level log,
-	// taking the iceberg-only activation down with it.
-	//
-	// Mirror the DuckLake setup minimally: load httpfs (bundled, fast) and
-	// create the iceberg_sigv4 S3 secret BEFORE iceberg loads. With a TYPE S3
-	// secret already in place at LOAD time, the extension's init skips IMDS
-	// discovery and returns in milliseconds (matches the ~120ms observed in
-	// the "both" path on the same image).
-	istep("load-httpfs-extension")
-	if err := LoadExtensions(db, []string{"httpfs"}); err != nil {
-		return fmt.Errorf("load httpfs extension: %w", err)
-	}
-
-	// S3 data secret: Lakekeeper does NOT vend credentials (PackedPolicyTooLarge),
-	// so DuckDB needs its own creds to read/write the warehouse's S3 data. Reuse
-	// the duckling's brokered STS creds (same per-org role + bucket as DuckLake)
-	// to build the iceberg_sigv4 secret. Refreshed on STS expiry by
-	// RefreshIcebergSecret. Skipped if creds absent (e.g. local/dev).
-	if keyID != "" && secret != "" {
-		istep("create-s3-data-secret")
-		if _, err := db.Exec(iceberg.BuildIcebergSecretStmt(ic, keyID, secret, sessionToken)); err != nil {
-			return fmt.Errorf("create Lakekeeper S3 data secret: %w", err)
-		}
-	}
-
-	istep("load-iceberg-extension")
-	if err := LoadExtensions(db, []string{"iceberg"}); err != nil {
-		return fmt.Errorf("load iceberg extension: %w", err)
-	}
-
-	// Catalog auth secret: only when OAuth2 is configured. In allowall mode
-	// the ATTACH uses AUTHORIZATION_TYPE 'none' and no catalog secret.
-	if stmt := iceberg.BuildLakekeeperSecretStmt(ic); stmt != "" {
-		istep("create-catalog-auth-secret")
-		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("create Lakekeeper iceberg secret: %w", err)
-		}
-	}
-	istep("attach-catalog")
-
-	attachStmt := iceberg.BuildLakekeeperAttachStmt(ic)
-	slog.Info("Attaching Iceberg catalog.",
-		"backend", "lakekeeper",
-		"endpoint", ic.LakekeeperEndpoint,
-		"warehouse", ic.LakekeeperWarehouse,
-		"oauth2", ic.LakekeeperOAuth2ServerURI != "")
-	if _, err := db.Exec(attachStmt); err != nil {
-		if isIcebergCatalogEmptyError(err) {
-			slog.Info("Skipping Iceberg catalog attach: Lakekeeper warehouse has no namespaces yet.", "warehouse", ic.LakekeeperWarehouse)
-			return nil
-		}
-		return fmt.Errorf("failed to attach Lakekeeper iceberg catalog: %w", err)
-	}
-
-	// Guarantee a default schema in the Iceberg catalog. This serves two
-	// purposes: (1) it makes a freshly-provisioned warehouse non-empty so the
-	// catalog stays attached and immediately usable, replacing the old
-	// "probe SHOW TABLES, detach if empty" behavior; and (2) it gives a bare
-	// `USE iceberg` somewhere to land — rewriteDirectQuery rewrites that to
-	// `USE iceberg.<DefaultSchema>` because DuckDB shadows `main` on a REST
-	// catalog (see iceberg.DefaultSchema). Idempotent and best-effort: an
-	// attached catalog without it still works via explicit schema references,
-	// so a transient failure here must not fail activation.
-	istep("create-default-schema")
-	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS " + iceberg.CatalogName + "." + iceberg.DefaultSchema); err != nil {
-		slog.Warn("Failed to ensure default Iceberg schema; catalog attached without it.",
-			"schema", iceberg.DefaultSchema, "warehouse", ic.LakekeeperWarehouse, "error", err)
-	}
-	slog.Info("Attached Iceberg catalog successfully.", "backend", "lakekeeper", "warehouse", ic.LakekeeperWarehouse)
-	return nil
-}
-
-// isIcebergCatalogEmptyError reports whether err indicates the Iceberg
-// catalog is reachable but the table bucket contains no namespaces or
-// tables yet — the expected state for a freshly-provisioned per-tenant
-// table bucket. Pattern-matching on the surface error string is fragile,
-// so we cover the known signals from the DuckDB iceberg extension talking
-// to AWS S3 Tables.
-//
-// TODO(PR3): the patterns here were observed against S3 Tables. The
-// Lakekeeper REST catalog returns different error shapes on empty
-// namespace lists (the prototype confirmed `GET /v1/namespaces` returns
-// `{"namespaces":[]}` rather than an error, so SHOW TABLES on an
-// attached-but-empty Lakekeeper catalog likely returns 0 rows rather
-// than erroring). The probe-and-detach below handles the no-error path
-// already; the substring matches here are S3-Tables-specific until
-// proven otherwise. Add a real-DuckDB integration test against a live
-// Lakekeeper warehouse to confirm the empty-state behavior.
-func isIcebergCatalogEmptyError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, "no namespace"),
-		strings.Contains(msg, "no namespaces"),
-		strings.Contains(msg, "NamespaceNotFound"),
-		strings.Contains(msg, "NoSuchNamespace"),
-		strings.Contains(msg, "NoSuchTable"):
-		return true
-	}
-	return false
 }
 
 func deltaCatalogNeedsS3Secret(catalogPath string, dlCfg DuckLakeConfig) bool {
@@ -2067,28 +2031,6 @@ func setDuckLakeDefault(db *sql.DB) error {
 	return nil
 }
 
-// setIcebergDefault makes the Iceberg catalog the session default for
-// iceberg-only (cnpg-shard) tenants, so unqualified DDL/DML lands in Iceberg
-// rather than the ephemeral in-memory catalog — the analogue of
-// setDuckLakeDefault for the no-DuckLake path. Targets iceberg.<DefaultSchema>
-// (not a bare `USE iceberg`) because DuckDB shadows `main` on a REST catalog;
-// attachLakekeeperCatalog guarantees that schema exists.
-func setIcebergDefault(db *sql.DB) error {
-	stmt := fmt.Sprintf("USE %s.%s", iceberg.CatalogName, iceberg.DefaultSchema)
-	// Instrumented: this USE forces the iceberg-only path's first synchronous
-	// catalog resolution (DuckDB shadows `main` on a REST catalog). It's the
-	// sole iceberg-only-specific step after AttachIcebergCatalog, and a prime
-	// suspect for a silent stall during activation — log before+after so a hang
-	// here is distinguishable from one inside AttachIcebergCatalog.
-	t := time.Now()
-	slog.Info("Iceberg activation step starting.", "step", "set-default-catalog", "stmt", stmt)
-	if _, err := db.Exec(stmt); err != nil {
-		return fmt.Errorf("failed to set Iceberg as default catalog: %w", err)
-	}
-	slog.Info("Set Iceberg as default catalog.", "schema", iceberg.DefaultSchema, "duration", time.Since(t))
-	return nil
-}
-
 // createS3Secret creates a DuckDB secret for S3/MinIO access.
 // This is a standalone function so it can be reused by control plane workers.
 // Supports three providers:
@@ -2099,9 +2041,16 @@ func setIcebergDefault(db *sql.DB) error {
 // Note: Caller must hold duckLakeSem to avoid race conditions.
 // See: https://duckdb.org/docs/stable/core_extensions/httpfs/s3api
 func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
+	return createS3SecretWith(plainAttachRunner{db: db}, dlCfg)
+}
+
+// createS3SecretWith is createS3Secret over an attachSQLRunner so the
+// catalog-attachment paths can run the secret check + CREATE SECRET under
+// per-step deadlines via attachStepExecer.
+func createS3SecretWith(db attachSQLRunner, dlCfg DuckLakeConfig) error {
 	// Check if secret already exists to avoid unnecessary creation
 	var count int
-	err := db.QueryRow("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_s3'").Scan(&count)
+	err := db.queryRowScan("SELECT COUNT(*) FROM duckdb_secrets() WHERE name = 'ducklake_s3'", &count)
 	if err == nil && count > 0 {
 		return nil // Secret already exists
 	}
@@ -2114,8 +2063,12 @@ func createS3Secret(db *sql.DB, dlCfg DuckLakeConfig) error {
 	switch provider {
 	case "aws_sdk":
 		// Use Go AWS SDK to fetch credentials (supports EKS Pod Identity, IRSA, etc.)
+		// Bounded so a hung credential source (e.g. a blackholed IMDS/Pod
+		// Identity endpoint) fails fast instead of stalling the attach.
+		sdkCtx, sdkCancel := context.WithTimeout(context.Background(), attachStepTimeout)
+		defer sdkCancel()
 		var err error
-		secretStmt, err = buildAWSSdkSecret(context.Background(), dlCfg)
+		secretStmt, err = buildAWSSdkSecret(sdkCtx, dlCfg)
 		if err != nil {
 			return fmt.Errorf("aws_sdk credential fetch failed: %w", err)
 		}
@@ -2145,17 +2098,20 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 	if dlCfg.ObjectStore == "" {
 		return nil
 	}
+	ae := newAttachStepExecer(db)
 	if duckLakeSem != nil {
 		duckLakeSem <- struct{}{}
-		defer func() { <-duckLakeSem }()
+		defer ae.releaseSem(duckLakeSem)
 	}
 
 	provider := S3ProviderForConfig(dlCfg)
 	var secretStmt string
 	switch provider {
 	case "aws_sdk":
+		sdkCtx, sdkCancel := context.WithTimeout(context.Background(), attachStepTimeout)
+		defer sdkCancel()
 		var err error
-		secretStmt, err = buildAWSSdkSecret(context.Background(), dlCfg)
+		secretStmt, err = buildAWSSdkSecret(sdkCtx, dlCfg)
 		if err != nil {
 			return fmt.Errorf("refresh aws_sdk S3 secret: %w", err)
 		}
@@ -2168,68 +2124,44 @@ func RefreshS3Secret(db *sql.DB, dlCfg DuckLakeConfig, duckLakeSem chan struct{}
 	// If the previous session left the connection in DuckDB's "Current
 	// transaction is aborted" state, the exec will always fail. Issue a
 	// ROLLBACK to recover, matching the pattern in StartCredentialRefresh.
-	if _, err := db.Exec(secretStmt); err != nil {
+	if _, err := ae.Exec(secretStmt); err != nil {
 		if isTransactionAborted(err) {
-			_, _ = db.Exec("ROLLBACK")
-			if _, retryErr := db.Exec(secretStmt); retryErr != nil {
-				return fmt.Errorf("refresh S3 secret after rollback: %w", retryErr)
+			_, _ = ae.Exec("ROLLBACK")
+			if _, retryErr := ae.Exec(secretStmt); retryErr != nil {
+				return fmt.Errorf("refresh S3 secret after rollback: %s", redactSecretStatementError(retryErr.Error()))
 			}
 		} else {
-			return fmt.Errorf("refresh S3 secret: %w", err)
+			return fmt.Errorf("refresh S3 secret: %s", redactSecretStatementError(err.Error()))
 		}
 	}
 	slog.Debug("Refreshed S3 secret for hot-idle reuse.", "provider", provider)
 	return nil
 }
 
-// RefreshIcebergSecret replaces the DuckDB iceberg-extension S3 secret
-// (iceberg_sigv4) with updated credentials. Used when a hot-idle worker
-// is reclaimed and the STS credentials minted by the control plane have
-// rotated. Without this, iceberg queries on a long-lived worker would
-// start 403'ing after the first STS rotation (~1h) while DuckLake stays
-// fresh.
-//
-// Unlike AttachIcebergCatalog this does NOT short-circuit when the
-// iceberg catalog is already attached — the whole point is to overwrite
-// the existing secret in place. ATTACH state on the catalog itself is
-// unaffected; DuckDB resolves the secret at request time, so the new
-// credentials take effect for the next iceberg query without an
-// explicit reattach.
-//
-// Same auth model as AttachIcebergCatalog: explicit credentials are the
-// only supported path. A refresh with missing credentials is a config
-// bug (the activator failed to populate fresh STS credentials in the
-// payload) and surfaces as an explicit error rather than a silent
-// fallback to credential_chain.
-func RefreshIcebergSecret(db *sql.DB, ic IcebergConfig, sem chan struct{}, keyID, secretKey, sessionToken string) error {
-	if !ic.Enabled {
-		return nil
+// redactSecretStatementError reduces an engine error from a CREATE SECRET
+// statement to its error-class prefix ("Parser Error", "IO Error", ...) plus
+// a fixed placeholder. RefreshS3Secret errors flow beyond internal logs —
+// via the duckgres.s3_cache SET / session-create restore paths into
+// client-facing error messages, the query log, and the admin recent-errors
+// ring — so no engine detail may survive: DuckDB errors can echo the
+// offending SQL, and the echo is ELLIPSIZED for long lines ("LINE 1:
+// ...oken' ..."), so matching-and-replacing complete credential values is NOT
+// sufficient — a truncated echo carries credential FRAGMENTS no exact match
+// catches, and even the first line's `at or near "..."` token can hold
+// string-literal content. Dropping everything after the class prefix is the
+// only airtight shape (the repo precedent is usersecrets.RedactErrorForLog's
+// whole-message placeholder; keeping the class preserves triage value at zero
+// leak surface, and works regardless of where the credentials came from —
+// dlCfg or buildAWSSdkSecret's internally-fetched ones).
+func redactSecretStatementError(msg string) string {
+	const placeholder = "[details redacted: engine errors may echo secret SQL]"
+	// An error class is a short leading tag; a "prefix" long enough to carry
+	// echoed SQL means the message doesn't follow the class-colon shape — drop
+	// it entirely.
+	if idx := strings.Index(msg, ":"); idx > 0 && idx <= 64 && !strings.ContainsAny(msg[:idx], "'\"\n") {
+		return msg[:idx] + ": " + placeholder
 	}
-	// Both backends now use the worker's own brokered STS creds for S3 data
-	// (the iceberg_sigv4 secret) — Lakekeeper no longer vends — so both need
-	// the secret rotated on the worker's STS schedule. BuildIcebergSecretStmt
-	// produces the same iceberg_sigv4 secret regardless of backend.
-	if keyID == "" || secretKey == "" {
-		return fmt.Errorf("iceberg refresh: no AWS credentials in activation payload — control plane STS broker did not populate DuckLake S3 credentials")
-	}
-	if sem != nil {
-		sem <- struct{}{}
-		defer func() { <-sem }()
-	}
-
-	secretStmt := iceberg.BuildIcebergSecretStmt(ic, keyID, secretKey, sessionToken)
-	if _, err := db.Exec(secretStmt); err != nil {
-		if isTransactionAborted(err) {
-			_, _ = db.Exec("ROLLBACK")
-			if _, retryErr := db.Exec(secretStmt); retryErr != nil {
-				return fmt.Errorf("refresh iceberg secret after rollback: %w", retryErr)
-			}
-		} else {
-			return fmt.Errorf("refresh iceberg secret: %w", err)
-		}
-	}
-	slog.Debug("Refreshed iceberg secret for hot-idle reuse.", "warehouse", ic.LakekeeperWarehouse)
-	return nil
+	return placeholder
 }
 
 // resolveS3SecretTransport picks the URL_STYLE and USE_SSL values to embed in
@@ -2294,9 +2226,14 @@ func buildConfigSecret(dlCfg DuckLakeConfig) string {
 		secret += fmt.Sprintf(",\n\t\t\tENDPOINT '%s'", dlCfg.S3Endpoint)
 	}
 
-	if dlCfg.S3SessionToken != "" {
-		secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", dlCfg.S3SessionToken)
-	}
+	// SESSION_TOKEN is ALWAYS emitted, even when empty: httpfs copies a host
+	// AWS_SESSION_TOKEN env var into the global s3_session_token setting at
+	// extension load (AWSEnvironmentCredentialsProvider::SetAll), and a secret
+	// that omits the key falls back to that setting at request-signing time
+	// (S3KeyValueReader::TryGetSecretKeyOrSetting) — signing with a mismatched
+	// (key, token) pair. An explicit empty token pins "no token". (Verified
+	// against httpfs v1.5.3 source.)
+	secret += fmt.Sprintf(",\n\t\t\tSESSION_TOKEN '%s'", dlCfg.S3SessionToken)
 
 	secret += "\n\t\t)"
 	return secret
@@ -2606,10 +2543,20 @@ func (s *Server) handleConnectionInProcess(conn net.Conn, remoteAddr net.Addr) {
 		conn:   conn,
 	}
 
-	if err := c.serve(); err != nil {
-		slog.Error("Connection error.", "user", c.username, "remote_addr", remoteAddr, "error", err)
+	err := c.serve()
+	// backendStart is set early in serve() (after the startup message); if serve
+	// failed before that (e.g. TLS/startup error) it is zero — skip the histogram
+	// and report duration_ms=0 rather than a bogus since-epoch value.
+	var durMs int64
+	if !c.backendStart.IsZero() {
+		d := time.Since(c.backendStart)
+		durMs = d.Milliseconds()
+		observe.ObserveConnectionDuration(c.orgID, d.Seconds())
+	}
+	if err != nil {
+		slog.Error("Connection error.", "user", c.username, "remote_addr", remoteAddr, "duration_ms", durMs, "error", err)
 	} else {
-		slog.Info("Client disconnected.", "user", c.username, "remote_addr", remoteAddr)
+		slog.Info("Client disconnected.", "user", c.username, "remote_addr", remoteAddr, "duration_ms", durMs)
 	}
 }
 
@@ -2629,7 +2576,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// should be read by the child process after FD passing.
 	// The SSL request is a single, small message and the client waits for 'S'
 	// before sending the TLS ClientHello, so unbuffered reads are safe here.
-	params, err := wire.ReadStartupMessage(conn)
+	startup, err := wire.ReadStartupMessage(conn)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection before sending startup message.", "remote_addr", remoteAddr)
@@ -2644,7 +2591,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	// Handle GSSENCRequest - decline and re-read for SSLRequest.
 	// Loop to handle the unlikely case of multiple GSSENCRequests.
 	for range 3 {
-		if params["__gssenc_request"] != "true" {
+		if !startup.GSSENCRequest {
 			break
 		}
 		slog.Debug("GSSENCRequest received, declining.", "remote_addr", remoteAddr)
@@ -2655,7 +2602,7 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 			return
 		}
 		// Re-read: client will send SSLRequest next
-		params, err = wire.ReadStartupMessage(conn)
+		startup, err = wire.ReadStartupMessage(conn)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, io.EOF) {
 				slog.Debug("Client closed connection after GSSENC decline.", "remote_addr", remoteAddr)
@@ -2669,15 +2616,17 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 	}
 
 	// Handle cancel request in parent (no child spawn needed)
-	if params["__cancel_request"] == "true" {
-		s.handleCancelRequestIsolated(params)
+	if startup.CancelRequest {
+		if startup.CancelCredentialsPresent {
+			s.handleCancelRequestIsolated(BackendKey{Pid: startup.CancelPID, SecretKey: startup.CancelSecretKey})
+		}
 		s.rateLimiter.UnregisterConnection(remoteAddr)
 		_ = conn.Close()
 		return
 	}
 
 	// Handle SSL request: send 'S' then spawn child for TLS handshake
-	if params["__ssl_request"] == "true" {
+	if startup.SSLRequest {
 		if err := conn.SetReadDeadline(time.Time{}); err != nil {
 			slog.Error("Failed to clear startup deadline.", "remote_addr", remoteAddr, "error", err)
 			s.rateLimiter.UnregisterConnection(remoteAddr)
@@ -2730,22 +2679,6 @@ func (s *Server) handleConnectionIsolated(conn net.Conn, remoteAddr net.Addr) {
 }
 
 // handleCancelRequestIsolated handles a cancel request in process isolation mode.
-func (s *Server) handleCancelRequestIsolated(params map[string]string) {
-	pidStr := params["__cancel_pid"]
-	secretKeyStr := params["__cancel_secret_key"]
-
-	if pidStr == "" || secretKeyStr == "" {
-		return
-	}
-
-	var pid, secretKey int64
-	if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil {
-		return
-	}
-	if _, err := fmt.Sscanf(secretKeyStr, "%d", &secretKey); err != nil {
-		return
-	}
-
-	key := BackendKey{Pid: int32(pid), SecretKey: int32(secretKey)}
+func (s *Server) handleCancelRequestIsolated(key BackendKey) {
 	s.CancelQueryBySignal(key)
 }

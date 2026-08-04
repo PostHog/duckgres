@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -26,12 +27,16 @@ import (
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/sessionmeta"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
 var bootstrapBundledExtensions = server.BootstrapBundledExtensions
 var exitProcess = os.Exit
+
+var ErrWorkerDraining = errors.New("worker is draining")
+var errSessionClosed = errors.New("session closed")
 
 // DuckDBService is a standalone Arrow Flight SQL service backed by DuckDB.
 type DuckDBService struct {
@@ -51,6 +56,7 @@ type SessionPool struct {
 	startTime   time.Time
 	maxSessions int
 	stopCh      chan struct{}
+	stopOnce    sync.Once
 	warmupDB    *sql.DB       // Keep this open to keep shared cache alive
 	warmupDone  chan struct{} // Closed when Warmup() completes (success or failure)
 	dbInitOnce  sync.Once     // Serializes fallback CreateDBConnection when warmup fails
@@ -65,7 +71,10 @@ type SessionPool struct {
 	// controlDB is activePair.Control, surfaced for direct use by control-side
 	// ops (CREATE OR REPLACE SECRET on STS rotation). Always nil before
 	// activation; nil-check before use and fall back to the main DB.
-	controlDB *sql.DB
+	controlDB    *sql.DB
+	queryLogMu   sync.Mutex
+	queryLogInit sync.Mutex
+	queryLogSink server.QueryLogSink
 
 	sharedWarmMode       bool
 	activation           *activatedTenantRuntime
@@ -80,18 +89,40 @@ type SessionPool struct {
 	// inject a stub to verify the credential-refresh path is non-blocking
 	// (see TestReuseExistingActivationDoesNotBlockHealthChecks).
 	refreshS3Secret func(*sql.DB, server.DuckLakeConfig, chan struct{}) error
-	// refreshIcebergSecret is the sibling indirection for rotating the
-	// iceberg_sigv4 secret. Runs alongside refreshS3Secret on hot-idle
-	// reuse whenever the tenant has iceberg enabled — without it, iceberg
-	// queries on a long-lived worker would 403 after STS rotation while
-	// DuckLake stays fresh. Defaults to server.RefreshIcebergSecret;
-	// stubbed by tests the same way refreshS3Secret is.
-	refreshIcebergSecret func(*sql.DB, server.IcebergConfig, chan struct{}, string, string, string) error
+
+	// secretSwapMu serializes rebuilds of the tenant ducklake_s3 secret (the
+	// credential-refresh path in reuseExistingActivation vs the per-session
+	// duckgres.s3_cache toggle in SetS3CacheEnabled) so the last-applied
+	// transport always matches s3CacheBypassed. The refresh path holds it from
+	// before its rebuild until AFTER the rotated payload is committed, so a
+	// concurrent toggle can never rebuild from the stale pre-rotation payload.
+	// Lock order: secretSwapMu → p.mu (both paths); p.mu is never held while
+	// acquiring secretSwapMu. Held across the (slow) CREATE OR REPLACE SECRET,
+	// which p.mu must not be — health checks only need p.mu.RLock.
+	secretSwapMu sync.Mutex
+	// s3CacheBypassed is true while the tenant S3 secret carries the org's
+	// native HTTPS transport instead of the cache-proxy transport, i.e. the
+	// current session set `duckgres.s3_cache = off`. Flipped only under
+	// secretSwapMu (read under p.mu); the one exception is activateTenant's
+	// reset-to-false at first-activation commit, which cannot race a swap
+	// because SetS3CacheEnabled refuses to run before an activation exists
+	// (and taking secretSwapMu there would invert the secretSwapMu→p.mu lock
+	// order). CreateSession restores the proxy transport before a new session
+	// starts so a bypass can never leak into the org's next session.
+	s3CacheBypassed bool
+
+	drainMu       sync.Mutex
+	draining      bool
+	activeWork    int
+	drainZero     chan struct{}
+	drainZeroOpen bool
 }
 
 type trackedTx struct {
-	tx       *sql.Tx
-	lastUsed atomic.Int64 // unix nano
+	tx          *sql.Tx
+	finishDrain func()
+	lastUsed    atomic.Int64 // unix nano
+	activeWork  atomic.Int32
 }
 
 // Session represents a single DuckDB session.
@@ -103,10 +134,21 @@ type Session struct {
 	CreatedAt time.Time
 	lastUsed  atomic.Int64 // unix nano
 
+	// currentQueryID is the control plane's ID for the statement running on
+	// this session, or "" when idle. Held as an atomic because the progress
+	// monitor reads it from its own goroutine while the RPC path writes it.
+	currentQueryID atomic.Value // string
+
 	mu            sync.RWMutex
+	connMu        sync.Mutex // serializes operations on Conn and session-owned transactions
 	queries       map[string]*QueryHandle
 	txns          map[string]*trackedTx
 	txnOwner      map[string]string
+	closed        bool
+	operationOpen bool
+	operationIdle chan struct{}
+	connWork      int
+	connWorkDone  *sync.Cond
 	handleCounter atomic.Uint64
 
 	// sqlTxActive tracks whether a SQL-level transaction is in progress on this
@@ -116,17 +158,339 @@ type Session struct {
 	// retrying statements inside a user-managed transaction — a retry after a
 	// transient error would run in autocommit mode (the transaction is dead)
 	// and mask the failure from the client.
-	sqlTxActive atomic.Bool
+	sqlTxActive   atomic.Bool
+	sqlTxDrain    func()
+	sqlTxLastUsed atomic.Int64
 
 	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
 	progress   progressState    // stall detection state
 }
 
-// QueryHandle stores a prepared or ad-hoc query for later execution.
+// QueryHandle stores an ad-hoc query awaiting its DoGet.
 type QueryHandle struct {
-	Query  string
-	Schema *arrow.Schema
-	TxnID  string
+	Query     string
+	Schema    *arrow.Schema
+	TxnID     string
+	createdAt time.Time // when registered; the reaper drops a stale ad-hoc handle whose DoGet never arrived (guarded by Session.mu)
+	// finishOperation is the session operation token for an ad-hoc query
+	// awaiting its DoGet.
+	finishOperation func()
+	// finishDrain is the drain token of an ad-hoc query awaiting its DoGet.
+	finishDrain func()
+}
+
+func releaseDrainFunc(release func()) {
+	if release != nil {
+		release()
+	}
+}
+
+func (s *Session) hasTrackedTxDrain(txnKey string) bool {
+	if txnKey == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ttx := s.txns[txnKey]
+	return ttx != nil && ttx.finishDrain != nil
+}
+
+func (s *Session) hasSQLTransactionDrain() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sqlTxDrain != nil
+}
+
+func (s *Session) allowsDrainContinuation(txnKey string) bool {
+	if s.hasTrackedTxDrain(txnKey) {
+		return true
+	}
+	return s.sqlTxActive.Load() && s.hasSQLTransactionDrain()
+}
+
+func (t *trackedTx) beginWork() func() {
+	if t == nil {
+		return func() {}
+	}
+	t.activeWork.Add(1)
+	t.lastUsed.Store(time.Now().UnixNano())
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.lastUsed.Store(time.Now().UnixNano())
+			t.activeWork.Add(-1)
+		})
+	}
+}
+
+func (s *Session) setSQLTransactionDrain(release func()) bool {
+	if release == nil {
+		return true
+	}
+	var old func()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return false
+	}
+	old = s.sqlTxDrain
+	s.sqlTxDrain = release
+	s.sqlTxLastUsed.Store(time.Now().UnixNano())
+	s.mu.Unlock()
+	releaseDrainFunc(old)
+	return true
+}
+
+func (s *Session) releaseSQLTransactionDrain() {
+	var release func()
+	s.mu.Lock()
+	release = s.sqlTxDrain
+	s.sqlTxDrain = nil
+	s.sqlTxLastUsed.Store(0)
+	s.mu.Unlock()
+	releaseDrainFunc(release)
+}
+
+func (s *Session) beginOperation() (func(), bool) {
+	s.mu.Lock()
+	if s.closed || s.operationOpen {
+		s.mu.Unlock()
+		return nil, false
+	}
+	s.operationOpen = true
+	s.operationIdle = make(chan struct{})
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.operationOpen = false
+			if s.operationIdle != nil {
+				close(s.operationIdle)
+				s.operationIdle = nil
+			}
+			s.mu.Unlock()
+		})
+	}, true
+}
+
+func (s *Session) beginOperationForTransaction(txnKey string) (func(), bool, bool) {
+	s.mu.Lock()
+	if _, exists := s.txns[txnKey]; !exists {
+		s.mu.Unlock()
+		return nil, false, false
+	}
+	if s.closed || s.operationOpen {
+		s.mu.Unlock()
+		return nil, true, false
+	}
+	s.operationOpen = true
+	s.operationIdle = make(chan struct{})
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.operationOpen = false
+			if s.operationIdle != nil {
+				close(s.operationIdle)
+				s.operationIdle = nil
+			}
+			s.mu.Unlock()
+		})
+	}, true, true
+}
+
+func (s *Session) waitOperationIdle(ctx context.Context) error {
+	for {
+		s.mu.RLock()
+		if !s.operationOpen {
+			s.mu.RUnlock()
+			return nil
+		}
+		idle := s.operationIdle
+		s.mu.RUnlock()
+
+		if idle == nil {
+			return errors.New("session operation idle signal missing")
+		}
+		select {
+		case <-idle:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// beginConnWork fences any operation that uses the session connection while a
+// raw SQL transaction may be open. It intentionally does not mutate queryActive:
+// conn work includes COPY receive and metadata/planning work, while queryActive
+// is reserved for query progress and stall reporting.
+func (s *Session) beginConnWork() (func(), bool) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, false
+	}
+	s.connWork++
+	if s.sqlTxActive.Load() {
+		s.sqlTxLastUsed.Store(time.Now().UnixNano())
+	}
+	s.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			if s.connWork > 0 {
+				s.connWork--
+			}
+			if s.connWork == 0 && s.connWorkDone != nil {
+				s.connWorkDone.Broadcast()
+			}
+			if s.sqlTxActive.Load() {
+				s.sqlTxLastUsed.Store(time.Now().UnixNano())
+			}
+			s.mu.Unlock()
+		})
+	}, true
+}
+
+func (s *Session) waitConnWorkDoneLocked() {
+	if s.connWorkDone == nil {
+		s.connWorkDone = sync.NewCond(&s.mu)
+	}
+	for s.connWork > 0 {
+		s.connWorkDone.Wait()
+	}
+}
+
+func (s *Session) exec(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	if tx != nil {
+		s.connMu.Lock()
+		defer s.connMu.Unlock()
+		return tx.ExecContext(ctx, query, args...)
+	}
+	return s.execConn(ctx, query, args...)
+}
+
+func (s *Session) execConn(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, errSessionClosed
+	}
+	defer end()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.Conn == nil {
+		return nil, errSessionClosed
+	}
+	return s.Conn.ExecContext(ctx, query, args...)
+}
+
+func (s *Session) rollbackConn(ctx context.Context) error {
+	_, err := s.execConn(ctx, "ROLLBACK")
+	return err
+}
+
+func (s *Session) beginTx(ctx context.Context) (*sql.Tx, error) {
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, errSessionClosed
+	}
+	defer end()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.Conn == nil {
+		return nil, errSessionClosed
+	}
+	return s.Conn.BeginTx(ctx, nil)
+}
+
+func (s *Session) queryRows(ctx context.Context, tx *sql.Tx, query string, args ...any) (*sql.Rows, func() error, error) {
+	if tx != nil {
+		s.connMu.Lock()
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			s.connMu.Unlock()
+			return nil, nil, err
+		}
+		var once sync.Once
+		closeRows := func() error {
+			var closeErr error
+			once.Do(func() {
+				closeErr = rows.Close()
+				s.connMu.Unlock()
+			})
+			return closeErr
+		}
+		return rows, closeRows, nil
+	}
+	return s.queryConnRows(ctx, query, args...)
+}
+
+func (s *Session) queryConnRows(ctx context.Context, query string, args ...any) (*sql.Rows, func() error, error) {
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, nil, errSessionClosed
+	}
+	s.connMu.Lock()
+	if s.Conn == nil {
+		s.connMu.Unlock()
+		end()
+		return nil, nil, errSessionClosed
+	}
+	rows, err := s.Conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		s.connMu.Unlock()
+		end()
+		return nil, nil, err
+	}
+	var once sync.Once
+	closeRows := func() error {
+		var closeErr error
+		once.Do(func() {
+			closeErr = rows.Close()
+			s.connMu.Unlock()
+			end()
+		})
+		return closeErr
+	}
+	return rows, closeRows, nil
+}
+
+func (s *Session) getQuerySchema(ctx context.Context, query string, tx *sql.Tx) (*arrow.Schema, error) {
+	if tx != nil {
+		s.connMu.Lock()
+		defer s.connMu.Unlock()
+		return GetQuerySchema(ctx, nil, query, tx)
+	}
+	end, ok := s.beginConnWork()
+	if !ok {
+		return nil, errSessionClosed
+	}
+	defer end()
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.Conn == nil {
+		return nil, errSessionClosed
+	}
+	return GetQuerySchema(ctx, s.Conn, query, nil)
+}
+
+func (s *Session) commitTx(tx *sql.Tx) error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return tx.Commit()
+}
+
+func (s *Session) rollbackTx(tx *sql.Tx) error {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return tx.Rollback()
 }
 
 // NewDuckDBService creates a new DuckDB service with the given config.
@@ -144,11 +508,13 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		createDBPair:         CreateWorkerDBPair,
 		activateDBConnection: server.ActivateDBConnection,
 		refreshS3Secret:      server.RefreshS3Secret,
-		refreshIcebergSecret: server.RefreshIcebergSecret,
+		drainZero:            make(chan struct{}),
+		drainZeroOpen:        true,
 	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
 	go pool.metadataMetricsLoop()
+	go pool.commitStatsLoop()
 
 	return &DuckDBService{
 		cfg:  cfg,
@@ -190,6 +556,24 @@ func wipePersistedSecrets(cfg server.Config) {
 	}
 }
 
+// sizeMainForSessions matches the Main DB's connection capacity to the
+// worker's session admission. Every admitted session pins one *sql.Conn for
+// its whole lifetime (CreateSession), so a Main pool smaller than the session
+// cap starves the (cap+1)th concurrent session for the full conn-acquire
+// timeout — which the control plane classifies as a WEDGED worker
+// (isWorkerConnPoolTimeoutError) and answers by retiring the worker, killing
+// its co-resident live sessions. The process backend co-assigns sessions at
+// pool capacity (least-loaded worker) with the default unlimited admission,
+// so its Main pool must be unlimited too; maxSessions==0 maps to
+// database/sql's 0 == unlimited. The k8s shape (maxSessions==1) keeps the
+// single-conn isolation OpenDuckDBPair sets up.
+func (p *SessionPool) sizeMainForSessions(pair *DuckDBPair) {
+	if pair == nil || pair.Main == nil || p.maxSessions == 1 {
+		return
+	}
+	pair.Main.SetMaxOpenConns(p.maxSessions)
+}
+
 // Warmup performs one-time initialization of the shared DuckDB instance.
 // This loads extensions and attaches catalogs so that subsequent session
 // creations are nearly instantaneous.
@@ -228,6 +612,7 @@ func (p *SessionPool) Warmup() error {
 	if err != nil {
 		return fmt.Errorf("warmup failed after %v: %w", time.Since(start), err)
 	}
+	p.sizeMainForSessions(pair)
 
 	p.mu.Lock()
 	p.warmupDB = pair.Main
@@ -240,9 +625,17 @@ func (p *SessionPool) Warmup() error {
 }
 
 const (
-	txnIdleTimeout          = 10 * time.Minute
+	txnIdleTimeout = 10 * time.Minute
+	// handleIdleTimeout bounds how long a drain token may sit stranded on a query
+	// handle / metadata stream whose matching DoGet never arrived (client
+	// cancelled between GetFlightInfo and DoGet, session kept). Without reaping,
+	// such a token holds the worker's drain open until the full
+	// workerShutdownDrainTime, then a forced shutdown kills genuinely in-flight
+	// work. The real GetFlightInfo→DoGet gap is sub-second, so this is generous.
+	handleIdleTimeout       = 10 * time.Minute
 	reapInterval            = 1 * time.Minute
 	metadataMetricsInterval = 30 * time.Second
+	workerShutdownDrainTime = 55 * time.Minute
 )
 
 func (p *SessionPool) reapLoop() {
@@ -252,29 +645,107 @@ func (p *SessionPool) reapLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			p.mu.RLock()
-			sessions := make([]*Session, 0, len(p.sessions))
-			for _, s := range p.sessions {
-				sessions = append(sessions, s)
-			}
-			p.mu.RUnlock()
-
-			now := time.Now()
-			for _, s := range sessions {
-				s.mu.Lock()
-				for id, ttx := range s.txns {
-					last := time.Unix(0, ttx.lastUsed.Load())
-					if now.Sub(last) > txnIdleTimeout {
-						slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
-						_ = ttx.tx.Rollback()
-						delete(s.txns, id)
-						delete(s.txnOwner, id)
-					}
-				}
-				s.mu.Unlock()
-			}
+			p.reapIdle(time.Now())
 		case <-p.stopCh:
 			return
+		}
+	}
+}
+
+// reapIdle rolls back idle transactions and releases drain tokens stranded by a
+// GetFlightInfo whose matching DoGet never arrived. Both are bounded so a single
+// abandoned client RPC cannot hold the worker's drain open until the shutdown
+// timeout (and then force-kill genuinely in-flight work).
+func (p *SessionPool) reapIdle(now time.Time) {
+	p.mu.RLock()
+	sessions := make([]*Session, 0, len(p.sessions))
+	for _, s := range p.sessions {
+		sessions = append(sessions, s)
+	}
+	p.mu.RUnlock()
+
+	for _, s := range sessions {
+		var releaseDrains []func()
+		s.mu.Lock()
+		for id, ttx := range s.txns {
+			last := time.Unix(0, ttx.lastUsed.Load())
+			if now.Sub(last) > txnIdleTimeout {
+				if s.operationOpen {
+					continue
+				}
+				if ttx.activeWork.Load() > 0 {
+					continue
+				}
+				if !s.connMu.TryLock() {
+					continue
+				}
+				slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
+				if ttx.tx != nil {
+					_ = ttx.tx.Rollback()
+				}
+				s.connMu.Unlock()
+				if ttx.finishDrain != nil {
+					releaseDrains = append(releaseDrains, ttx.finishDrain)
+					ttx.finishDrain = nil
+				}
+				delete(s.txns, id)
+				delete(s.txnOwner, id)
+			}
+		}
+		if s.sqlTxActive.Load() && s.sqlTxDrain != nil {
+			lastNanos := s.sqlTxLastUsed.Load()
+			if lastNanos == 0 {
+				lastNanos = s.lastUsed.Load()
+			}
+			last := time.Unix(0, lastNanos)
+			if now.Sub(last) > txnIdleTimeout {
+				if s.operationOpen {
+					// A same-session operation is still logically in progress or
+					// awaiting its continuation. Leave the transaction drain active.
+				} else if s.connWork > 0 {
+					// The connection may be executing, streaming, or planning work inside
+					// this raw SQL transaction. Leave the transaction drain token active.
+				} else if s.Conn == nil {
+					slog.Warn("Skipping idle raw SQL transaction rollback without a session connection.", "user", s.Username)
+				} else if !s.connMu.TryLock() {
+					// A same-session operation is using the connection but has not reached
+					// a connWork-tracked path. Skip instead of blocking the reaper loop.
+				} else {
+					slog.Warn("Rolling back idle raw SQL transaction.", "user", s.Username)
+					rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), time.Second)
+					if _, err := s.Conn.ExecContext(rollbackCtx, "ROLLBACK"); err != nil {
+						slog.Warn("Idle raw SQL transaction rollback failed; keeping drain work active.", "user", s.Username, "error", err)
+					} else {
+						releaseDrains = append(releaseDrains, s.sqlTxDrain)
+						s.sqlTxDrain = nil
+						s.sqlTxActive.Store(false)
+						s.sqlTxLastUsed.Store(0)
+					}
+					rollbackCancel()
+					s.connMu.Unlock()
+				}
+			}
+		}
+		// Drain tokens stranded on ad-hoc query handles. An actively-streaming
+		// DoGet has already popped its handle out of this map, so anything still
+		// here past the TTL was abandoned mid-handshake.
+		for id, h := range s.queries {
+			if now.Sub(h.createdAt) > handleIdleTimeout {
+				if h.finishDrain != nil {
+					releaseDrains = append(releaseDrains, h.finishDrain)
+					h.finishDrain = nil
+				}
+				if h.finishOperation != nil {
+					releaseDrains = append(releaseDrains, h.finishOperation)
+					h.finishOperation = nil
+				}
+				slog.Warn("Reaping abandoned query handle (no DoGet).", "user", s.Username, "handle", id)
+				delete(s.queries, id)
+			}
+		}
+		s.mu.Unlock()
+		for _, release := range releaseDrains {
+			releaseDrainFunc(release)
 		}
 	}
 }
@@ -425,6 +896,16 @@ func Run(cfg ServiceConfig) {
 
 	go func() {
 		<-sigChan
+		slog.Info("Draining DuckDB service before shutdown...")
+		svc.BeginDrain()
+		ctx, cancel := context.WithTimeout(context.Background(), workerShutdownDrainTime)
+		if !svc.WaitForDrain(ctx) {
+			slog.Warn("DuckDB service drain timed out before shutdown.", "timeout", workerShutdownDrainTime)
+			cancel()
+			svc.CloseAll()
+			os.Exit(0)
+		}
+		cancel()
 		slog.Info("Shutting down DuckDB service...")
 		svc.Shutdown()
 		os.Exit(0)
@@ -481,17 +962,46 @@ func (svc *DuckDBService) Shutdown() {
 	if svc.flightSrv != nil {
 		svc.flightSrv.Shutdown()
 	}
-	svc.pool.CloseAll()
+	svc.CloseAll()
+}
+
+func (svc *DuckDBService) CloseAll() {
+	if svc.pool != nil {
+		svc.pool.CloseAll()
+	}
+}
+
+func (svc *DuckDBService) BeginDrain() {
+	if svc.pool != nil {
+		svc.pool.BeginDrain()
+	}
+}
+
+func (svc *DuckDBService) WaitForDrain(ctx context.Context) bool {
+	if svc.pool == nil {
+		return true
+	}
+	return svc.pool.WaitForDrain(ctx)
 }
 
 // CreateSession creates a new DuckDB session for the given username.
-func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (*Session, error) {
+// secretStatements are the user's persistent secrets to replay (shared-warm
+// mode only); replay failures come back as warnings — logged on the worker
+// and again by the control plane's session manager, never failing the
+// session — rather than errors.
+func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, secretStatements []string) (*Session, []string, error) {
 	start := time.Now()
+	finishDrain, drainErr := p.beginDrainWork(false)
+	if drainErr != nil {
+		return nil, nil, drainErr
+	}
+	defer finishDrain()
+
 	// Reserve a slot under the lock to prevent TOCTOU race on maxSessions.
 	p.mu.Lock()
 	if p.maxSessions > 0 && len(p.sessions)+p.reserved >= p.maxSessions {
 		p.mu.Unlock()
-		return nil, fmt.Errorf("max sessions reached (%d)", p.maxSessions)
+		return nil, nil, fmt.Errorf("max sessions reached (%d)", p.maxSessions)
 	}
 	p.reserved++
 	p.mu.Unlock()
@@ -527,7 +1037,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 			p.mu.Lock()
 			p.reserved--
 			p.mu.Unlock()
-			return nil, cfgErr
+			return nil, nil, cfgErr
 		}
 
 		// Fallback: create a shared DB if warmup failed or wasn't run.
@@ -540,6 +1050,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 				p.fallbackErr = err
 				return
 			}
+			p.sizeMainForSessions(pair)
 			p.fallbackDB = pair.Main
 			p.activePair = pair
 			p.controlDB = pair.Control
@@ -548,7 +1059,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 			p.mu.Lock()
 			p.reserved--
 			p.mu.Unlock()
-			return nil, fmt.Errorf("create session db: %w", p.fallbackErr)
+			return nil, nil, fmt.Errorf("create session db: %w", p.fallbackErr)
 		}
 		db = p.fallbackDB
 		slog.Info("Using fallback DB (warmup failed).", "duration", time.Since(fallbackStart))
@@ -566,11 +1077,43 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		p.mu.Lock()
 		p.reserved--
 		p.mu.Unlock()
-		return nil, fmt.Errorf("failed to obtain connection from pool (timeout after 30s): %w", err)
+		return nil, nil, fmt.Errorf("failed to obtain connection from pool (timeout after 30s): %w", err)
 	}
 	slog.Debug("Acquired DB connection from pool.", "user", username, "duration", time.Since(start))
 
-	// Initialize the session connection with username-specific state if needed.
+	sessionCfg, cfgErr := p.currentSessionConfig()
+	if cfgErr != nil {
+		_ = conn.Close()
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
+		return nil, nil, cfgErr
+	}
+
+	// Restore the cache-proxy S3 transport if the previous session's
+	// `duckgres.s3_cache = off` left the tenant secret bypassing the cache. A
+	// leaked bypass silently routes every subsequent session past the NVMe
+	// cache (the mw-prod-us 2026-07-17 failure mode), so this restore is a
+	// hard invariant: failure fails the session create — the control plane
+	// retries on a fresh worker — rather than starting a session in an
+	// unknown transport state. No-op unless a bypass is actually in effect.
+	if err := p.SetS3CacheEnabled(true); err != nil {
+		_ = conn.Close()
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
+		return nil, nil, fmt.Errorf("restore S3 cache transport before session start: %w", err)
+	}
+
+	if err := initAttachedDuckLakeSessionMetadata(conn, db, sessionCfg); err != nil {
+		_ = conn.Close()
+		p.mu.Lock()
+		p.reserved--
+		p.mu.Unlock()
+		return nil, nil, err
+	}
+	// Initialize the session connection with username-specific state after any
+	// catalog setup; DuckLake metadata init restores the default search_path.
 	// Since the DB is shared, we must set session-local parameters here.
 	initSearchPath(conn, username)
 
@@ -592,6 +1135,47 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf("SET threads = %d", threads)); err != nil {
 			slog.Warn("Failed to set initial threads.", "user", username, "error", err)
 		}
+	}
+
+	// User-secret hygiene + replay (shared-warm / k8s mode only). DuckDB
+	// secrets are instance-global, so a hot-idle worker reused by a different
+	// user of the same org would otherwise see the previous user's secrets —
+	// both persistent ones and non-persistent (plain/TEMPORARY CREATE SECRET)
+	// ones that pass through to the worker. Wipe ALL user secrets first
+	// (mandatory — this is the cross-user isolation step), then replay this
+	// user's secrets from the control plane. Replay failures degrade to
+	// warnings; a wipe failure fails the session because handing user A's
+	// secrets to user B is not acceptable.
+	var secretWarnings []string
+	switch {
+	case p.sharedWarmMode && p.maxSessions != 1:
+		// The wipe and replay below are only safe because exactly one session
+		// runs at a time (DuckDB secrets are instance-global; k8s workers are
+		// spawned with DUCKGRES_DUCKDB_MAX_SESSIONS=1). Assert that here, at
+		// the point of reliance, instead of trusting a flag set two layers
+		// away: with any other cap, wiping would delete a concurrent
+		// session's secrets mid-query. Skip hygiene entirely and scream.
+		slog.Error("User secret hygiene requires max_sessions=1 on shared-warm workers; skipping wipe+replay.",
+			"max_sessions", p.maxSessions, "user", username, "secrets", len(secretStatements))
+		if len(secretStatements) > 0 {
+			secretWarnings = []string{"persistent secrets were NOT restored: worker session cap is misconfigured (requires max_sessions=1)"}
+		}
+	case p.sharedWarmMode:
+		secretCtx, secretCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
+		wiped, wipeErr := wipeUserSecrets(secretCtx, conn)
+		if wipeErr != nil {
+			secretCancel()
+			_ = conn.Close()
+			p.mu.Lock()
+			p.reserved--
+			p.mu.Unlock()
+			return nil, nil, fmt.Errorf("wipe user secrets before session start: %w", wipeErr)
+		}
+		if len(wiped) > 0 {
+			slog.Info("Wiped user secrets left by previous session.", "user", username, "count", len(wiped))
+		}
+		secretWarnings = replayUserSecrets(secretCtx, conn, username, secretStatements)
+		secretCancel()
 	}
 
 	// Extract the raw DuckDB connection handle for progress polling.
@@ -618,15 +1202,6 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	}
 	session.lastUsed.Store(time.Now().UnixNano())
 
-	cfg, cfgErr := p.currentSessionConfig()
-	if cfgErr != nil {
-		_ = conn.Close()
-		p.mu.Lock()
-		p.reserved--
-		p.mu.Unlock()
-		return nil, cfgErr
-	}
-
 	// In shared-warm (multi-tenant) mode the control plane drives credential
 	// refresh by re-activating the worker with a freshly-brokered STS payload
 	// before the current creds expire (see controlplane/janitor scheduler +
@@ -647,7 +1222,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	if p.sharedWarmMode {
 		stop = func() {}
 	} else {
-		stop = server.StartCredentialRefresh(conn, cfg.DuckLake, func() bool {
+		stop = server.StartCredentialRefresh(conn, sessionCfg.DuckLake, func() bool {
 			session.mu.Lock()
 			defer session.mu.Unlock()
 			return len(session.txns) > 0
@@ -661,7 +1236,7 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int) (
 	p.mu.Unlock()
 
 	slog.Debug("Created DuckDB session", "user", username, "duration", time.Since(start))
-	return session, nil
+	return session, secretWarnings, nil
 }
 
 // GetSession returns a session by token.
@@ -687,19 +1262,54 @@ func (p *SessionPool) DestroySession(token string) error {
 		return fmt.Errorf("session not found")
 	}
 
+	var releaseDrains []func()
+	var rollbackTxs []*sql.Tx
+
 	// Roll back any open transactions
 	session.mu.Lock()
+	session.closed = true
+	for id, handle := range session.queries {
+		if handle.finishDrain != nil {
+			releaseDrains = append(releaseDrains, handle.finishDrain)
+			handle.finishDrain = nil
+		}
+		if handle.finishOperation != nil {
+			releaseDrains = append(releaseDrains, handle.finishOperation)
+			handle.finishOperation = nil
+		}
+		delete(session.queries, id)
+	}
+	if session.sqlTxDrain != nil {
+		releaseDrains = append(releaseDrains, session.sqlTxDrain)
+		session.sqlTxDrain = nil
+		session.sqlTxActive.Store(false)
+		session.sqlTxLastUsed.Store(0)
+	}
 	for id, ttx := range session.txns {
-		_ = ttx.tx.Rollback()
+		if ttx.tx != nil {
+			rollbackTxs = append(rollbackTxs, ttx.tx)
+		}
+		if ttx.finishDrain != nil {
+			releaseDrains = append(releaseDrains, ttx.finishDrain)
+			ttx.finishDrain = nil
+		}
 		delete(session.txns, id)
 		delete(session.txnOwner, id)
 	}
+	session.waitConnWorkDoneLocked()
 	session.mu.Unlock()
+	for _, tx := range rollbackTxs {
+		_ = session.rollbackTx(tx)
+	}
+	for _, release := range releaseDrains {
+		releaseDrainFunc(release)
+	}
 
 	if stop != nil {
 		stop()
 	}
 	if session.Conn != nil {
+		session.connMu.Lock()
 		// sql.Conn.Close() returns the underlying driver connection to sql.DB's
 		// pool rather than closing it. DuckDB temp tables, temp views, and
 		// temp macros are connection-scoped, so without intervention they'd
@@ -741,7 +1351,33 @@ func (p *SessionPool) DestroySession(token string) error {
 			"cleanup_duration", time.Since(cleanupStart),
 			"close_duration", time.Since(connCloseStart),
 			"evicted", evicted)
+		session.connMu.Unlock()
 	}
+
+	// Best-effort user-secret wipe (persistent + temporary) so user
+	// credentials don't sit on a hot-idle worker between sessions. The
+	// mandatory cross-user isolation wipe happens at the next CreateSession;
+	// this one just narrows the window. Only safe when this worker serves one
+	// session at a time (secrets are instance-global), which is how k8s
+	// workers are deployed (DUCKGRES_DUCKDB_MAX_SESSIONS=1).
+	if p.sharedWarmMode && p.maxSessions == 1 && session.DB != nil {
+		wipeCtx, wipeCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
+		if _, err := wipeUserSecrets(wipeCtx, session.DB); err != nil {
+			slog.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
+		}
+		wipeCancel()
+	}
+
+	// Best-effort restore of the cache-proxy S3 transport if this session
+	// disabled it (`duckgres.s3_cache = off`). The mandatory restore happens
+	// at the next CreateSession; this one just narrows the hot-idle window in
+	// which the worker's checkpointer would write past the cache proxy.
+	if p.sharedWarmMode {
+		if err := p.SetS3CacheEnabled(true); err != nil {
+			slog.Warn("Failed to restore S3 cache transport on session destroy.", "user", session.Username, "error", err)
+		}
+	}
+
 	// Do NOT close session.DB if it is a shared DB (warmup or fallback)
 	p.mu.RLock()
 	isShared := session.DB == p.warmupDB || session.DB == p.fallbackDB
@@ -764,9 +1400,93 @@ func (p *SessionPool) ActiveSessions() int {
 	return len(p.sessions)
 }
 
+func (p *SessionPool) BeginDrain() {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	p.ensureDrainChannelLocked()
+	p.draining = true
+	if p.activeWork == 0 && p.drainZeroOpen {
+		close(p.drainZero)
+		p.drainZeroOpen = false
+	}
+}
+
+func (p *SessionPool) IsDraining() bool {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	return p.draining
+}
+
+func (p *SessionPool) ActiveDrainWork() int {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	return p.activeWork
+}
+
+func (p *SessionPool) WaitForDrain(ctx context.Context) bool {
+	p.drainMu.Lock()
+	p.ensureDrainChannelLocked()
+	if p.activeWork == 0 {
+		p.drainMu.Unlock()
+		return true
+	}
+	ch := p.drainZero
+	p.drainMu.Unlock()
+
+	select {
+	case <-ch:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (p *SessionPool) beginDrainWork(allowWhenDraining bool) (func(), error) {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
+	p.ensureDrainChannelLocked()
+	if p.draining && !allowWhenDraining {
+		return nil, ErrWorkerDraining
+	}
+	if p.draining && !p.drainZeroOpen {
+		return nil, ErrWorkerDraining
+	}
+	// Invariant: drainZeroOpen only goes false while draining (BeginDrain / the
+	// release closure), and draining never clears, so reaching here means the
+	// channel is open — !draining implies drainZeroOpen, and draining implies it
+	// per the guard above. No reopen needed.
+	p.activeWork++
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.drainMu.Lock()
+			defer p.drainMu.Unlock()
+			if p.activeWork > 0 {
+				p.activeWork--
+			}
+			if p.draining && p.activeWork == 0 && p.drainZeroOpen {
+				close(p.drainZero)
+				p.drainZeroOpen = false
+			}
+		})
+	}, nil
+}
+
+func (p *SessionPool) ensureDrainChannelLocked() {
+	if p.drainZero == nil {
+		p.drainZero = make(chan struct{})
+		p.drainZeroOpen = true
+	}
+}
+
 // CloseAll closes all sessions.
 func (p *SessionPool) CloseAll() {
-	close(p.stopCh)
+	p.stopOnce.Do(func() {
+		if p.stopCh != nil {
+			close(p.stopCh)
+		}
+	})
 	p.mu.Lock()
 	sessions := make(map[string]*Session, len(p.sessions))
 	stops := make(map[string]func(), len(p.stopRefresh))
@@ -787,20 +1507,58 @@ func (p *SessionPool) CloseAll() {
 	}
 
 	for _, session := range sessions {
+		var releaseDrains []func()
+		var rollbackTxs []*sql.Tx
 		session.mu.Lock()
-		for id, ttx := range session.txns {
-			_ = ttx.tx.Rollback()
-			delete(session.txns, id)
+		session.closed = true
+		for id, handle := range session.queries {
+			if handle.finishDrain != nil {
+				releaseDrains = append(releaseDrains, handle.finishDrain)
+				handle.finishDrain = nil
+			}
+			if handle.finishOperation != nil {
+				releaseDrains = append(releaseDrains, handle.finishOperation)
+				handle.finishOperation = nil
+			}
+			delete(session.queries, id)
 		}
+		if session.sqlTxDrain != nil {
+			releaseDrains = append(releaseDrains, session.sqlTxDrain)
+			session.sqlTxDrain = nil
+			session.sqlTxActive.Store(false)
+			session.sqlTxLastUsed.Store(0)
+		}
+		for id, ttx := range session.txns {
+			if ttx.tx != nil {
+				rollbackTxs = append(rollbackTxs, ttx.tx)
+			}
+			if ttx.finishDrain != nil {
+				releaseDrains = append(releaseDrains, ttx.finishDrain)
+				ttx.finishDrain = nil
+			}
+			delete(session.txns, id)
+			delete(session.txnOwner, id)
+		}
+		session.waitConnWorkDoneLocked()
 		session.mu.Unlock()
+		for _, tx := range rollbackTxs {
+			_ = session.rollbackTx(tx)
+		}
+		for _, release := range releaseDrains {
+			releaseDrainFunc(release)
+		}
 
 		if session.Conn != nil {
+			session.connMu.Lock()
 			_ = session.Conn.Close()
+			session.connMu.Unlock()
 		}
 		if session.DB != nil && session.DB != p.warmupDB && session.DB != p.fallbackDB {
 			_ = session.DB.Close()
 		}
 	}
+
+	p.stopQueryLogSink(context.Background())
 
 	if p.warmupDB != nil {
 		cleanupWorkerCatalogs(p.warmupDB)
@@ -980,6 +1738,28 @@ func initSearchPath(conn *sql.Conn, username string) {
 	}
 }
 
+func initAttachedDuckLakeSessionMetadata(conn *sql.Conn, db *sql.DB, cfg server.Config) error {
+	initTimeout := cfg.SessionInitTimeout
+	if initTimeout == 0 {
+		initTimeout = server.DefaultSessionInitTimeout
+	}
+	initCtx, initCancel := context.WithTimeout(context.Background(), initTimeout)
+	defer initCancel()
+
+	executor := server.NewPinnedExecutor(conn, db)
+	duckLakeAttached, err := sessionmeta.HasAttachedCatalog(initCtx, executor, "ducklake")
+	if err != nil {
+		return fmt.Errorf("detect ducklake catalog attachment: %w", err)
+	}
+	if !duckLakeAttached {
+		return nil
+	}
+	if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, "ducklake"); err != nil {
+		return fmt.Errorf("initialize ducklake session metadata: %w", err)
+	}
+	return nil
+}
+
 func generateSessionToken() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -1006,6 +1786,14 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 		return s.handler.doDestroySession(cmd.Body, stream)
 	case "HealthCheck":
 		return s.handler.doHealthCheck(cmd.Body, stream)
+	case "WaitSessionIdle":
+		return s.handler.doWaitSessionIdle(cmd.Body, stream)
+	case "SetSessionS3Cache":
+		return s.handler.doSetSessionS3Cache(cmd.Body, stream)
+	case "ReleaseQueryHandle":
+		return s.handler.doReleaseQueryHandle(cmd.Body, stream)
+	case "LogQuery":
+		return s.handler.doLogQuery(cmd.Body, stream)
 	default:
 		// Fall through to standard flightsql action router (BeginTransaction, etc.)
 		return s.FlightServer.DoAction(cmd, stream)
@@ -1072,4 +1860,23 @@ func NewFlightSQLHandler(pool *SessionPool) *FlightSQLHandler {
 	}
 
 	return h
+}
+
+// setCurrentQueryID records the control plane's ID for the statement now
+// running on this session. Pass "" when the statement ends.
+func (s *Session) setCurrentQueryID(queryID string) {
+	if s == nil {
+		return
+	}
+	s.currentQueryID.Store(queryID)
+}
+
+// CurrentQueryID returns the control plane's ID for the statement running on
+// this session, or "" when idle.
+func (s *Session) CurrentQueryID() string {
+	if s == nil {
+		return ""
+	}
+	queryID, _ := s.currentQueryID.Load().(string)
+	return queryID
 }

@@ -82,6 +82,9 @@ func TestTypesDateTime(t *testing.T) {
 		// Date
 		{Name: "date_literal", Query: "SELECT DATE '2024-01-15'"},
 		{Name: "date_cast", Query: "SELECT '2024-01-15'::DATE"},
+		{Name: "date_far_future_sentinel", Query: "SELECT DATE '9999-12-31'"},
+		{Name: "date_positive_infinity", Query: "SELECT DATE 'infinity'"},
+		{Name: "date_negative_infinity", Query: "SELECT DATE '-infinity'"},
 		{Name: "current_date", Query: "SELECT CURRENT_DATE IS NOT NULL"},
 
 		// Time

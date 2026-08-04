@@ -16,11 +16,11 @@ import (
 	"path/filepath"
 
 	"github.com/posthog/duckgres/server/wire"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/posthog/duckgres/server/auth"
+	"github.com/posthog/duckgres/server/observe"
 )
 
 // Exit codes for child processes
@@ -127,6 +127,68 @@ func RunChildMode() {
 	os.Exit(exitCode)
 }
 
+// authenticateChildClient runs the cleartext-password handshake for a child
+// worker connection. The password is always requested before any credential
+// check, and validation is constant-time via auth.ValidateUserPassword, so an
+// unknown user and a wrong password are indistinguishable to the client in
+// both protocol flow and error shape. Returns ExitSuccess after sending
+// AuthOK, or the exit code to terminate with on failure.
+func authenticateChildClient(reader *bufio.Reader, writer *bufio.Writer, users map[string]string, username, remoteAddr string) int {
+	// Request password
+	if err := wire.WriteAuthCleartextPassword(writer); err != nil {
+		slog.Error("Failed to request password", "error", err)
+		return ExitError
+	}
+	if err := writer.Flush(); err != nil {
+		slog.Error("Failed to flush writer", "error", err)
+		return ExitError
+	}
+
+	// Read password response
+	msgType, body, err := wire.ReadMessage(reader)
+	if err != nil {
+		slog.Error("Failed to read password message", "error", err)
+		return ExitError
+	}
+
+	if msgType != wire.MsgPassword {
+		slog.Error("Expected password message", "got", string(msgType))
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
+		_ = writer.Flush()
+		return ExitError
+	}
+
+	// Password is null-terminated
+	password := string(bytes.TrimRight(body, "\x00"))
+
+	// Validate password (constant-time; does not leak whether the user exists)
+	if !auth.ValidateUserPassword(users, username, password) {
+		slog.Warn("Authentication failed", "user", username, "remote_addr", remoteAddr)
+		auth.AuthFailuresCounter.Inc()
+		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
+		_ = writer.Flush()
+		return ExitAuthFailure
+	}
+
+	// Send auth OK
+	if err := wire.WriteAuthOK(writer); err != nil {
+		slog.Error("Failed to send auth OK", "error", err)
+		return ExitError
+	}
+
+	return ExitSuccess
+}
+
+// notifyQueryCancel delivers one query-cancel request, coalescing bursts: if
+// a cancel is already pending (buffer full), the new one is dropped — the
+// pending token will cancel the same in-flight query.
+func notifyQueryCancel(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
 // runChildWorker handles a single client connection in a child process.
 // Returns the appropriate exit code.
 func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
@@ -138,10 +200,14 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
 	defer shutdownCancel()
 
-	// Create a channel to signal query cancellation (SIGUSR1)
-	// This is separate from shutdown so we can cancel queries without closing the connection
-	queryCancelCh := make(chan struct{})
-	var queryCancelOnce sync.Once
+	// Create a channel to signal query cancellation (SIGUSR1).
+	// This is separate from shutdown so we can cancel queries without closing
+	// the connection. Each SIGUSR1 delivers ONE cancel token (coalescing
+	// bursts) that the in-flight query's context goroutine consumes — the
+	// channel must never be closed: a closed channel is permanently readable,
+	// so a single cancel would instantly cancel every subsequent query on the
+	// connection (the session could never run another statement).
+	queryCancelCh := make(chan struct{}, 1)
 
 	// Handle signals in a goroutine
 	go func() {
@@ -152,10 +218,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 				shutdownCancel()
 			case syscall.SIGUSR1:
 				slog.Info("Received query cancel signal")
-				// Signal query cancellation (can be called multiple times safely)
-				queryCancelOnce.Do(func() {
-					close(queryCancelCh)
-				})
+				notifyQueryCancel(queryCancelCh)
 			}
 		}
 	}()
@@ -199,7 +262,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	writer := bufio.NewWriter(tlsConn)
 
 	// Read startup message (sent by client after TLS handshake)
-	params, err := wire.ReadStartupMessage(reader)
+	startup, err := wire.ReadStartupMessage(reader)
 	if err != nil {
 		if err == io.EOF || errors.Is(err, io.EOF) {
 			slog.Debug("Client closed connection after TLS handshake but before sending startup message.")
@@ -209,6 +272,7 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		return ExitError
 	}
 
+	params := startup.Params
 	username := params["user"]
 	database := params["database"]
 	applicationName := params["application_name"]
@@ -220,54 +284,8 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 		return ExitError
 	}
 
-	// Look up expected password for this user
-	expectedPassword, ok := cfg.Users[username]
-	if !ok {
-		slog.Warn("Unknown user", "user", username, "remote_addr", cfg.RemoteAddr)
-		auth.AuthFailuresCounter.Inc()
-		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
-		_ = writer.Flush()
-		return ExitAuthFailure
-	}
-
-	// Request password
-	if err := wire.WriteAuthCleartextPassword(writer); err != nil {
-		slog.Error("Failed to request password", "error", err)
-		return ExitError
-	}
-	if err := writer.Flush(); err != nil {
-		slog.Error("Failed to flush writer", "error", err)
-		return ExitError
-	}
-
-	// Read password response
-	msgType, body, err := wire.ReadMessage(reader)
-	if err != nil {
-		slog.Error("Failed to read password message", "error", err)
-		return ExitError
-	}
-
-	if msgType != wire.MsgPassword {
-		slog.Error("Expected password message", "got", string(msgType))
-		_ = wire.WriteErrorResponse(writer, "FATAL", "28000", "expected password message")
-		_ = writer.Flush()
-		return ExitError
-	}
-
-	// Password is null-terminated
-	password := string(bytes.TrimRight(body, "\x00"))
-	if password != expectedPassword {
-		slog.Warn("Authentication failed", "user", username, "remote_addr", cfg.RemoteAddr)
-		auth.AuthFailuresCounter.Inc()
-		_ = wire.WriteErrorResponse(writer, "FATAL", "28P01", "password authentication failed")
-		_ = writer.Flush()
-		return ExitAuthFailure
-	}
-
-	// Send auth OK
-	if err := wire.WriteAuthOK(writer); err != nil {
-		slog.Error("Failed to send auth OK", "error", err)
-		return ExitError
+	if exitCode := authenticateChildClient(reader, writer, cfg.Users, username, cfg.RemoteAddr); exitCode != ExitSuccess {
+		return exitCode
 	}
 
 	slog.Info("User authenticated", "user", username, "remote_addr", cfg.RemoteAddr)
@@ -353,6 +371,12 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 	// In process isolation mode each child only sees itself.
 	srv.registerConn(clientConn)
 
+	// Record the connection's full lifetime once on exit (orgID is empty in the
+	// single-host process-isolation backend; the histogram still aggregates).
+	defer func() {
+		observe.ObserveConnectionDuration(clientConn.orgID, time.Since(clientConn.backendStart).Seconds())
+	}()
+
 	// Ensure cleanup on exit
 	defer func() {
 		if clientConn.executor != nil {
@@ -388,7 +412,8 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 			slog.Error("Message loop error", "error", err)
 			return ExitError
 		}
-		slog.Info("Client disconnected cleanly", "user", username, "remote_addr", cfg.RemoteAddr)
+		slog.Info("Client disconnected cleanly", "user", username, "remote_addr", cfg.RemoteAddr,
+			"duration_ms", time.Since(clientConn.backendStart).Milliseconds())
 		return ExitSuccess
 
 	case <-shutdownCtx.Done():

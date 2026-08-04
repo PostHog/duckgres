@@ -1,58 +1,61 @@
 package controlplane
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
-// wpBoolPtr is a small helper for tier specs.
-func wpBoolPtr(b bool) *bool { return &b }
+// noOrgDefaults is the zero org default profile — single-tenant deployments
+// and orgs with no default_worker_* columns set.
+var noOrgDefaults = orgWorkerProfileDefaults{}
 
-// newProfileTestCP builds a ControlPlane whose K8s config enables the
-// connection-string worker-profile feature with the prod-shaped policy.
-func newProfileTestCP() *ControlPlane {
+// newSizingTestCP builds a ControlPlane whose K8s config enables client worker
+// sizing with a prod-shaped clamp policy and explicit defaults.
+func newSizingTestCP() *ControlPlane {
 	return &ControlPlane{cfg: ControlPlaneConfig{K8s: K8sConfig{
-		AllowClientWorkerProfile:     true,
-		AllowClientExclusiveNode:     false,
-		ColocatedWorkerCPURequest:    "4",
-		ColocatedWorkerMemoryRequest: "16Gi",
-		ColocatedWorkerNodeSelector:  `{"posthog.com/nodepool":"duckgres-workers-colocated"}`,
-		WorkerProfileMinCPU:          "1",
-		WorkerProfileMaxCPU:          "16",
-		WorkerProfileMinMemory:       "4Gi",
-		WorkerProfileMaxMemory:       "64Gi",
-		WorkerTiers: map[string]WorkerProfileSpec{
-			"backfill": {CPU: "4", Memory: "16Gi", Colocate: wpBoolPtr(true)},
-			"heavy":    {Colocate: wpBoolPtr(false)},
-		},
+		AllowClientWorkerProfile: true,
+		WorkerCPURequest:         "8",
+		WorkerMemoryRequest:      "16Gi",
+		WorkerProfileMinCPU:      "1",
+		WorkerProfileMaxCPU:      "16",
+		WorkerProfileMinMemory:   "4Gi",
+		WorkerProfileMaxMemory:   "64Gi",
+		WorkerMaxTTL:             time.Hour,
 	}}}
 }
 
-func TestResolveWorkerProfile(t *testing.T) {
+func TestResolveWorkerProfileSizing(t *testing.T) {
+	cp := newSizingTestCP()
 	tests := []struct {
 		name     string
 		opts     map[string]string
-		wantNil  bool // expect the default (nil) profile
-		wantKey  string
+		wantNil  bool   // expect the default (nil) profile — matches the neutral warm pool
+		wantKey  string // CPU|Memory (only when !wantNil)
+		wantTTL  time.Duration
 		wantErr  bool
 		wantWarn bool
 	}{
-		{name: "no opts -> default", opts: map[string]string{}, wantNil: true},
-		{name: "unrelated opts -> default", opts: map[string]string{"search_path": "iceberg.public"}, wantNil: true},
-		{name: "colocate true, no size -> defaults 4/16", opts: map[string]string{gucColocate: "true"}, wantKey: "4|16Gi|true"},
-		{name: "inline size colocated", opts: map[string]string{gucColocate: "true", gucWorkerCPU: "8", gucWorkerMemory: "48Gi"}, wantKey: "8|48Gi|true"},
-		{name: "tier alias backfill", opts: map[string]string{gucWorkerTier: "backfill"}, wantKey: "4|16Gi|true"},
-		{name: "unknown tier -> error", opts: map[string]string{gucWorkerTier: "nope"}, wantErr: true},
-		{name: "explicit colocate=false disallowed -> error", opts: map[string]string{gucColocate: "false"}, wantErr: true},
-		{name: "tier heavy (colocate=false) disallowed -> error", opts: map[string]string{gucWorkerTier: "heavy"}, wantErr: true},
-		{name: "invalid colocate -> error", opts: map[string]string{gucColocate: "maybe"}, wantErr: true},
-		{name: "cpu over max -> clamp+warn", opts: map[string]string{gucColocate: "true", gucWorkerCPU: "64", gucWorkerMemory: "16Gi"}, wantKey: "16|16Gi|true", wantWarn: true},
-		{name: "mem under min -> clamp+warn", opts: map[string]string{gucColocate: "true", gucWorkerCPU: "4", gucWorkerMemory: "1Gi"}, wantKey: "4|4Gi|true", wantWarn: true},
-		{name: "zero cpu -> error", opts: map[string]string{gucColocate: "true", gucWorkerCPU: "0", gucWorkerMemory: "16Gi"}, wantErr: true},
-		{name: "inline overrides tier", opts: map[string]string{gucWorkerTier: "backfill", gucWorkerCPU: "8", gucWorkerMemory: "48Gi"}, wantKey: "8|48Gi|true"},
+		{name: "no opts -> default (nil)", opts: map[string]string{}, wantNil: true},
+		{name: "unrelated opts -> default (nil)", opts: map[string]string{"search_path": "analytics.public"}, wantNil: true},
+		{name: "client cpu+mem", opts: map[string]string{gucWorkerCPU: "4", gucWorkerMemory: "32Gi"}, wantKey: "4|32Gi", wantTTL: defaultWorkerTTL},
+		{name: "client ttl only -> concrete w/ default size", opts: map[string]string{gucWorkerTTL: "5m"}, wantKey: "8|16Gi", wantTTL: 5 * time.Minute},
+		{name: "cpu over max -> clamp+warn", opts: map[string]string{gucWorkerCPU: "64"}, wantKey: "16|16Gi", wantTTL: defaultWorkerTTL, wantWarn: true},
+		{name: "mem under min -> clamp+warn", opts: map[string]string{gucWorkerMemory: "1Gi"}, wantKey: "8|4Gi", wantTTL: defaultWorkerTTL, wantWarn: true},
+		{name: "ttl over max -> clamp+warn", opts: map[string]string{gucWorkerTTL: "24h"}, wantKey: "8|16Gi", wantTTL: time.Hour, wantWarn: true},
+		{name: "cpu normalized", opts: map[string]string{gucWorkerCPU: "4000m"}, wantKey: "4|16Gi", wantTTL: defaultWorkerTTL},
+		{name: "zero cpu -> error", opts: map[string]string{gucWorkerCPU: "0"}, wantErr: true},
+		{name: "bad mem -> error", opts: map[string]string{gucWorkerMemory: "lots"}, wantErr: true},
+		{name: "bad ttl -> error", opts: map[string]string{gucWorkerTTL: "soon"}, wantErr: true},
+		{name: "negative ttl -> error", opts: map[string]string{gucWorkerTTL: "-5m"}, wantErr: true},
 	}
 
-	cp := newProfileTestCP()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, warns, err := cp.resolveWorkerProfile(tt.opts)
+			got, warns, orgApplied, err := cp.resolveWorkerProfile(tt.opts, noOrgDefaults)
+			if orgApplied {
+				t.Fatal("orgApplied must be false without org defaults")
+			}
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got profile=%v", got)
@@ -69,13 +72,16 @@ func TestResolveWorkerProfile(t *testing.T) {
 				return
 			}
 			if got == nil {
-				t.Fatalf("expected profile %q, got nil (default)", tt.wantKey)
+				t.Fatalf("expected concrete profile %q, got nil", tt.wantKey)
 			}
 			if got.MatchKey() != tt.wantKey {
 				t.Fatalf("MatchKey = %q, want %q", got.MatchKey(), tt.wantKey)
 			}
+			if got.TTL != tt.wantTTL {
+				t.Fatalf("TTL = %s, want %s", got.TTL, tt.wantTTL)
+			}
 			if tt.wantWarn && len(warns) == 0 {
-				t.Fatalf("expected a clamp warning, got none")
+				t.Fatal("expected a clamp warning, got none")
 			}
 			if !tt.wantWarn && len(warns) != 0 {
 				t.Fatalf("unexpected warnings: %v", warns)
@@ -84,78 +90,314 @@ func TestResolveWorkerProfile(t *testing.T) {
 	}
 }
 
-// Gate off: every GUC is ignored and the default profile is returned.
-func TestResolveWorkerProfile_GateOff(t *testing.T) {
-	cp := newProfileTestCP()
+// Gate off: every GUC is ignored and the default (nil) profile is returned (never
+// an error, even for garbage values) — preserving warm-pool reuse.
+func TestResolveWorkerProfileSizing_GateOff(t *testing.T) {
+	cp := newSizingTestCP()
 	cp.cfg.K8s.AllowClientWorkerProfile = false
-	got, _, err := cp.resolveWorkerProfile(map[string]string{gucColocate: "true", gucWorkerTier: "nope"})
+	got, warns, orgApplied, err := cp.resolveWorkerProfile(map[string]string{gucWorkerCPU: "garbage", gucWorkerTTL: "nope"}, noOrgDefaults)
 	if err != nil {
 		t.Fatalf("gate off must never error, got %v", err)
+	}
+	if len(warns) != 0 {
+		t.Fatalf("gate off must not warn, got %v", warns)
 	}
 	if got != nil {
 		t.Fatalf("gate off must return the default (nil) profile, got %s", got.MatchKey())
 	}
-}
-
-// Explicit colocate=false is honored when the deployment allows it, and a colocated
-// node selector is attached only to colocated profiles.
-func TestResolveWorkerProfile_ExclusiveAllowed(t *testing.T) {
-	cp := newProfileTestCP()
-	cp.cfg.K8s.AllowClientExclusiveNode = true
-
-	got, _, err := cp.resolveWorkerProfile(map[string]string{gucColocate: "false", gucWorkerCPU: "32", gucWorkerMemory: "256Gi"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got == nil || got.Colocate {
-		t.Fatalf("expected a non-colocated profile, got %v", got)
-	}
-	if got.MatchKey() != "32|256Gi|false" {
-		t.Fatalf("MatchKey = %q, want %q", got.MatchKey(), "32|256Gi|false")
+	if orgApplied {
+		t.Fatal("orgApplied must be false without org defaults")
 	}
 }
 
-// The tier alias and its inline equivalent must produce identical match keys so a
-// worker reserved one way is reusable the other way.
-func TestResolveWorkerProfile_TierEqualsInline(t *testing.T) {
-	cp := newProfileTestCP()
-	viaTier, _, err := cp.resolveWorkerProfile(map[string]string{gucWorkerTier: "backfill"})
+// A no-sizing request must return the nil default sentinel so it matches the
+// neutral warm pool (regression guard: returning a concrete-default profile here
+// broke worker acquisition on a warm-pool-enabled deploy).
+func TestResolveWorkerProfileSizing_NoSizingIsNil(t *testing.T) {
+	cp := newSizingTestCP()
+	got, _, _, err := cp.resolveWorkerProfile(map[string]string{}, noOrgDefaults)
 	if err != nil {
 		t.Fatal(err)
 	}
-	viaInline, _, err := cp.resolveWorkerProfile(map[string]string{gucColocate: "true", gucWorkerCPU: "4", gucWorkerMemory: "16Gi"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !viaTier.Equal(viaInline) {
-		t.Fatalf("tier %q != inline %q", viaTier.MatchKey(), viaInline.MatchKey())
+	if got != nil {
+		t.Fatalf("no-sizing request must return nil (default), got %s", got.MatchKey())
 	}
 }
 
-// Quantity normalization collapses equivalent spellings so they match.
-func TestResolveWorkerProfile_Normalization(t *testing.T) {
-	cp := newProfileTestCP()
-	a, _, err := cp.resolveWorkerProfile(map[string]string{gucColocate: "true", gucWorkerCPU: "4000m", gucWorkerMemory: "16Gi"})
-	if err != nil {
-		t.Fatal(err)
+func TestRequestedWorkerVCPUs(t *testing.T) {
+	tests := []struct {
+		name       string
+		profile    *WorkerProfile
+		defaultCPU string
+		want       int
+		wantErr    bool
+	}{
+		{name: "profile wins", profile: &WorkerProfile{CPU: "4"}, defaultCPU: "8", want: 4},
+		{name: "default cpu", defaultCPU: "8", want: 8},
+		{name: "built in default", want: 8},
+		{name: "millicpu rounds up", defaultCPU: "500m", want: 1},
+		{name: "profile millicpu rounds up", profile: &WorkerProfile{CPU: "1500m"}, defaultCPU: "8", want: 2},
+		{name: "bad cpu", defaultCPU: "a lot", wantErr: true},
+		{name: "zero cpu", defaultCPU: "0", wantErr: true},
 	}
-	if a.MatchKey() != "4|16Gi|true" {
-		t.Fatalf("MatchKey = %q, want %q (4000m should normalize to 4)", a.MatchKey(), "4|16Gi|true")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := requestedWorkerVCPUs(tt.profile, tt.defaultCPU)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("requestedWorkerVCPUs() = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
 
-// MatchKey/Equal must be nil-safe and treat nil as the default profile.
-func TestWorkerProfileMatchKeyNilSafe(t *testing.T) {
-	var nilProfile *WorkerProfile
-	if nilProfile.MatchKey() != "||false" {
-		t.Fatalf("nil MatchKey = %q, want %q", nilProfile.MatchKey(), "||false")
+// When the client DOES set sizing and no default size is configured, the built-in
+// 8/16Gi/20m applies for the omitted fields.
+func TestResolveWorkerProfileSizing_BuiltinDefaults(t *testing.T) {
+	cp := &ControlPlane{cfg: ControlPlaneConfig{K8s: K8sConfig{AllowClientWorkerProfile: true}}}
+	got, _, _, err := cp.resolveWorkerProfile(map[string]string{gucWorkerTTL: "1m"}, noOrgDefaults)
+	if err != nil {
+		t.Fatal(err)
 	}
-	def := &WorkerProfile{}
-	if !nilProfile.Equal(def) || !def.Equal(nilProfile) {
-		t.Fatalf("nil profile must equal the zero/default profile")
+	if got == nil || got.CPU != defaultWorkerCPU || got.Memory != defaultWorkerMemory || got.TTL != time.Minute {
+		t.Fatalf("built-in defaults = %v, want %s/%s/1m", got, defaultWorkerCPU, defaultWorkerMemory)
 	}
-	colo := &WorkerProfile{CPU: "4", Memory: "16Gi", Colocate: true}
-	if nilProfile.Equal(colo) {
-		t.Fatalf("nil (default) profile must not equal a colocated profile")
+}
+
+// Org default worker profile (operator-set via the admin API): when the client
+// sends no sizing GUCs, the org default produces a concrete profile; partially
+// set org defaults fall back per-field to the pool-global/built-in defaults;
+// client GUCs override per-field; an org default never errors.
+func TestResolveWorkerProfileOrgDefaults(t *testing.T) {
+	tests := []struct {
+		name           string
+		opts           map[string]string
+		org            orgWorkerProfileDefaults
+		wantNil        bool
+		wantKey        string
+		wantTTL        time.Duration
+		wantOrgApplied bool
+		wantWarn       string // substring expected in a warning, "" = no warnings expected
+	}{
+		{
+			name:           "org default all three fields",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{CPU: "2", Memory: "8Gi", TTL: "10m"},
+			wantKey:        "2|8Gi",
+			wantTTL:        10 * time.Minute,
+			wantOrgApplied: true,
+		},
+		{
+			name:           "org cpu only -> mem/ttl fall back to pool-global/built-in",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{CPU: "2"},
+			wantKey:        "2|16Gi",
+			wantTTL:        defaultWorkerTTL,
+			wantOrgApplied: true,
+		},
+		{
+			name:           "org ttl only -> size falls back to pool-global",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{TTL: "45m"},
+			wantKey:        "8|16Gi",
+			wantTTL:        45 * time.Minute,
+			wantOrgApplied: true,
+		},
+		{
+			name:           "org default normalized (4000m -> 4)",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{CPU: "4000m", Memory: "8192Mi"},
+			wantKey:        "4|8Gi",
+			wantTTL:        defaultWorkerTTL,
+			wantOrgApplied: true,
+		},
+		{
+			name: "org default NOT clamped to WorkerProfileMax (operator config)",
+			opts: map[string]string{},
+			// Above the client clamp band (max cpu 16 / max mem 64Gi).
+			org:            orgWorkerProfileDefaults{CPU: "46", Memory: "360Gi"},
+			wantKey:        "46|360Gi",
+			wantTTL:        defaultWorkerTTL,
+			wantOrgApplied: true,
+		},
+		{
+			name:           "org ttl clamped by WorkerMaxTTL",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{TTL: "24h"},
+			wantKey:        "8|16Gi",
+			wantTTL:        time.Hour, // WorkerMaxTTL in newSizingTestCP
+			wantOrgApplied: true,
+			wantWarn:       "clamped",
+		},
+		{
+			name:           "client cpu overrides org cpu; org mem+ttl survive",
+			opts:           map[string]string{gucWorkerCPU: "4"},
+			org:            orgWorkerProfileDefaults{CPU: "2", Memory: "8Gi", TTL: "10m"},
+			wantKey:        "4|8Gi",
+			wantTTL:        10 * time.Minute,
+			wantOrgApplied: true,
+		},
+		{
+			name:           "client sets all -> org default fully overridden",
+			opts:           map[string]string{gucWorkerCPU: "4", gucWorkerMemory: "32Gi", gucWorkerTTL: "5m"},
+			org:            orgWorkerProfileDefaults{CPU: "2", Memory: "8Gi", TTL: "10m"},
+			wantKey:        "4|32Gi",
+			wantTTL:        5 * time.Minute,
+			wantOrgApplied: false,
+		},
+		{
+			name:           "invalid org cpu ignored with warning -> nil profile",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{CPU: "lots"},
+			wantNil:        true,
+			wantOrgApplied: false,
+			wantWarn:       "org default worker cpu",
+		},
+		{
+			name:           "negative org ttl ignored with warning -> nil profile",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{TTL: "-5m"},
+			wantNil:        true,
+			wantOrgApplied: false,
+			wantWarn:       "org default worker ttl",
+		},
+		{
+			name:           "invalid org mem ignored, valid org cpu still applies",
+			opts:           map[string]string{},
+			org:            orgWorkerProfileDefaults{CPU: "2", Memory: "garbage"},
+			wantKey:        "2|16Gi",
+			wantTTL:        defaultWorkerTTL,
+			wantOrgApplied: true,
+			wantWarn:       "org default worker memory",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cp := newSizingTestCP()
+			got, warns, orgApplied, err := cp.resolveWorkerProfile(tt.opts, tt.org)
+			if err != nil {
+				t.Fatalf("org defaults must never error the connection, got %v", err)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("expected nil (default) profile, got %s", got.MatchKey())
+				}
+			} else {
+				if got == nil {
+					t.Fatalf("expected concrete profile %q, got nil", tt.wantKey)
+				}
+				if got.MatchKey() != tt.wantKey {
+					t.Fatalf("MatchKey = %q, want %q", got.MatchKey(), tt.wantKey)
+				}
+				if got.TTL != tt.wantTTL {
+					t.Fatalf("TTL = %s, want %s", got.TTL, tt.wantTTL)
+				}
+			}
+			if orgApplied != tt.wantOrgApplied {
+				t.Fatalf("orgApplied = %v, want %v", orgApplied, tt.wantOrgApplied)
+			}
+			if tt.wantWarn == "" {
+				if len(warns) != 0 {
+					t.Fatalf("unexpected warnings: %v", warns)
+				}
+			} else {
+				found := false
+				for _, w := range warns {
+					if strings.Contains(w, tt.wantWarn) {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("warnings %v missing %q", warns, tt.wantWarn)
+				}
+			}
+		})
+	}
+}
+
+// Org defaults apply even when AllowClientWorkerProfile is off: the gate is
+// about trusting client startup options, not operator config. Client GUCs are
+// still ignored (even garbage ones), so the org default is the whole profile.
+func TestResolveWorkerProfileOrgDefaults_GateOff(t *testing.T) {
+	cp := newSizingTestCP()
+	cp.cfg.K8s.AllowClientWorkerProfile = false
+	got, warns, orgApplied, err := cp.resolveWorkerProfile(
+		map[string]string{gucWorkerCPU: "4", gucWorkerTTL: "garbage"},
+		orgWorkerProfileDefaults{CPU: "2", Memory: "8Gi", TTL: "10m"},
+	)
+	if err != nil {
+		t.Fatalf("gate off must never error, got %v", err)
+	}
+	if len(warns) != 0 {
+		t.Fatalf("unexpected warnings: %v", warns)
+	}
+	if got == nil {
+		t.Fatal("org default must apply with the client gate off, got nil profile")
+	}
+	if got.MatchKey() != "2|8Gi" || got.TTL != 10*time.Minute {
+		t.Fatalf("profile = %s/%s, want 2|8Gi/10m (client GUCs must be ignored)", got.MatchKey(), got.TTL)
+	}
+	if !orgApplied {
+		t.Fatal("orgApplied must be true when the org default shaped the profile")
+	}
+}
+
+// An org default with no pool-global request configured falls back to the
+// built-in 8/16Gi for unset size fields (mirrors the client path).
+func TestResolveWorkerProfileOrgDefaults_BuiltinFallback(t *testing.T) {
+	cp := &ControlPlane{cfg: ControlPlaneConfig{K8s: K8sConfig{}}}
+	got, _, orgApplied, err := cp.resolveWorkerProfile(map[string]string{}, orgWorkerProfileDefaults{TTL: "30m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.CPU != defaultWorkerCPU || got.Memory != defaultWorkerMemory || got.TTL != 30*time.Minute {
+		t.Fatalf("profile = %v, want %s/%s/30m", got, defaultWorkerCPU, defaultWorkerMemory)
+	}
+	if !orgApplied {
+		t.Fatal("orgApplied must be true")
+	}
+}
+
+func TestResolveWorkerProfileSizedNoTTLUsesWorkerDefaultTTL(t *testing.T) {
+	// DUCKGRES_K8S_WORKER_DEFAULT_TTL is THE default TTL: a sized request that
+	// omits duckgres.worker_ttl gets the deployment default, not the built-in
+	// 20m. Precedence stays client GUC > org default > deployment default.
+	cp := newSizingTestCP()
+	cp.cfg.K8s.WorkerDefaultTTL = 70 * time.Minute
+
+	p, _, _, err := cp.resolveWorkerProfile(map[string]string{"duckgres.worker_cpu": "4"}, orgWorkerProfileDefaults{})
+	if err != nil || p == nil {
+		t.Fatalf("sized request failed: p=%v err=%v", p, err)
+	}
+	if p.TTL != 70*time.Minute {
+		t.Fatalf("sized-no-ttl TTL = %v, want 70m (deployment default)", p.TTL)
+	}
+
+	// Client GUC still wins over the deployment default.
+	p, _, _, err = cp.resolveWorkerProfile(map[string]string{"duckgres.worker_cpu": "4", "duckgres.worker_ttl": "10m"}, orgWorkerProfileDefaults{})
+	if err != nil || p == nil {
+		t.Fatalf("sized+ttl request failed: p=%v err=%v", p, err)
+	}
+	if p.TTL != 10*time.Minute {
+		t.Fatalf("client ttl = %v, want 10m (GUC beats deployment default)", p.TTL)
+	}
+
+	// Org default beats the deployment default too.
+	p, _, _, err = cp.resolveWorkerProfile(map[string]string{"duckgres.worker_cpu": "4"}, orgWorkerProfileDefaults{TTL: "30m"})
+	if err != nil || p == nil {
+		t.Fatalf("sized+orgttl request failed: p=%v err=%v", p, err)
+	}
+	if p.TTL != 30*time.Minute {
+		t.Fatalf("org ttl = %v, want 30m (org default beats deployment default)", p.TTL)
 	}
 }

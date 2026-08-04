@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-// OrgReservedPool presents one org's reserved slice of a shared K8s warm pool.
+// OrgReservedPool presents one org's reserved slice of a shared K8s pool.
 // It preserves the existing WorkerPool contract for SessionManager while ensuring
 // workers are reserved to a single org for their lifetime and retired after use.
 type OrgReservedPool struct {
@@ -19,49 +21,61 @@ type OrgReservedPool struct {
 	image                  string
 	stsBroker              *STSBroker
 	activateReservedWorker func(context.Context, *ManagedWorker) error
-	// Per-org colocated resource caps. A count-based maxWorkers is insufficient
-	// when colocated pods vary in size, so colocated CPU/memory is also bounded.
-	// 0 = unbounded on that axis. Only colocated workers count against these.
-	maxColocatedCPU      int
-	maxColocatedMemBytes uint64
+	// gate serializes the slow path's short DECISION section (re-check idle
+	// reuse → hot-idle claim → spawning-slot creation; see acquireDecision) in
+	// FIFO arrival order, so the next worker to become available goes to the
+	// earliest waiting connection and a later one cannot snatch it. The
+	// multi-minute spawn+activate runs OUTSIDE the gate, 1:1 bound to the
+	// waiter that owns the claim, so a cold burst ramps spawns in parallel.
+	gate *orgAcquireGate
 }
 
-func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker, maxColocatedCPU int, maxColocatedMemBytes uint64) *OrgReservedPool {
+func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, image string, stsBroker *STSBroker) *OrgReservedPool {
 	pool := &OrgReservedPool{
-		shared:               shared,
-		orgID:                orgID,
-		maxWorkers:           maxWorkers,
-		image:                image,
-		stsBroker:            stsBroker,
-		maxColocatedCPU:      maxColocatedCPU,
-		maxColocatedMemBytes: maxColocatedMemBytes,
+		shared:     shared,
+		orgID:      orgID,
+		maxWorkers: maxWorkers,
+		image:      image,
+		stsBroker:  stsBroker,
+		gate:       newOrgAcquireGate(),
 	}
 	pool.activateReservedWorker = pool.activateReservedWorkerDefault
 	return pool
 }
 
-// assignedColocatedResourcesLocked sums the CPU (cores) and memory (bytes) of
-// this org's currently-assigned colocated workers. Caller holds p.shared.mu.
-func (p *OrgReservedPool) assignedColocatedResourcesLocked() (cpu int, memBytes uint64) {
-	for _, w := range p.shared.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
+func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (worker *ManagedWorker, err error) {
+	// End-to-end acquire latency (fast path included), observed via a named-
+	// return defer so every exit — reuse, capacity error, ctx cancel — lands in
+	// the same histogram with an outcome label.
+	acquireStart := time.Now()
+	// source records HOW the worker was ultimately obtained (the allocation
+	// "phase" the user sees on the dashboard): idle reuse of this org's own Hot
+	// worker, a hot-idle claim from the shared pool, or a cold spawn. Set at each
+	// success path below; stays "none" when no worker is allocated (cap/cancel).
+	source := acquireSourceNone
+	defer func() {
+		observeAcquireTotal(time.Since(acquireStart), p.orgID, source, acquireTotalOutcome(err))
+		if worker != nil {
+			// Session assigned: veto voluntary disruption (consolidation/drift)
+			// of the worker's node until release. Freshly spawned pods are
+			// already born with the annotation; this covers hot-idle reuse and
+			// cross-CP claims. Synchronous so it cannot reorder after a later
+			// release's removal.
+			p.shared.markWorkerProtected(worker)
 		}
-		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
-			continue
-		}
-		if !p.workerBelongsToOrgLocked(w) || !w.profile.Colocate {
-			continue
-		}
-		cpu += parseK8sCPU(w.profile.CPU)
-		memBytes += parseK8sMemory(w.profile.Memory)
-	}
-	return cpu, memBytes
-}
+	}()
 
-func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (*ManagedWorker, error) {
+	// Fast path: reuse an already-assigned, idle (Hot) worker of the requested
+	// shape. Such a worker is already this org's and free, so reusing it
+	// concurrently is safe and needs no FIFO ordering — it is not a freshly
+	// spawned worker that a queued waiter is owed (those are claimed only
+	// via the gated slow path below).
+	if w := p.tryReuseIdleAssigned(profile); w != nil {
+		source = acquireSourceIdleReuse
+		return w, nil
+	}
+
+	// Slow path: no idle worker — claim a hot-idle worker or spawn one on demand.
 	for {
 		select {
 		case <-ctx.Done():
@@ -69,90 +83,250 @@ func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProf
 		default:
 		}
 
-		p.shared.mu.Lock()
-		if p.shared.shuttingDown {
-			p.shared.mu.Unlock()
-			return nil, fmt.Errorf("pool is shutting down")
+		claim, assignment, worker, err := p.acquireDecision(ctx, profile)
+		if err != nil {
+			return nil, err
+		}
+		if worker != nil {
+			source = acquireSourceIdleReuse
+			return worker, nil // reused an idle worker that freed while queued
+		}
+		// Bind source to the claim BEFORE completing it, so a spawn that fails
+		// still attributes its wait to source=spawn (outcome=error).
+		if claim.hotClaimed != nil {
+			source = acquireSourceHotIdleClaim
+		} else {
+			source = acquireSourceSpawn
 		}
 
-		p.shared.cleanDeadWorkersLocked()
-
-		if idle := p.findIdleAssignedWorkerLocked(profile); idle != nil {
-			idle.activeSessions++
-			if idle.activeSessions > idle.peakSessions {
-				idle.peakSessions = idle.activeSessions
-			}
-			p.shared.mu.Unlock()
-			return idle, nil
-		}
-
-		// The count cap bounds only exclusive workers (each pins a dedicated
-		// node). A colocated request bin-packs and is intentionally unbounded:
-		// never refuse it because the exclusive budget is full.
-		isColocated := profile != nil && profile.Colocate
-		assignedCount := p.assignedWorkerCountLocked()
-		if p.maxWorkers == 0 || isColocated || assignedCount < p.maxWorkers {
-			// Resource-aware quota for colocated workers: a new colocated worker
-			// must not push the org over its colocated CPU/memory budget. Reusing
-			// an idle worker (handled above) adds nothing, so this gates only the
-			// spawn of a new one.
-			if profile != nil && profile.Colocate && (p.maxColocatedCPU > 0 || p.maxColocatedMemBytes > 0) {
-				curCPU, curMem := p.assignedColocatedResourcesLocked()
-				reqCPU, reqMem := parseK8sCPU(profile.CPU), parseK8sMemory(profile.Memory)
-				if (p.maxColocatedCPU > 0 && curCPU+reqCPU > p.maxColocatedCPU) ||
-					(p.maxColocatedMemBytes > 0 && curMem+reqMem > p.maxColocatedMemBytes) {
-					p.shared.mu.Unlock()
-					observeOrgColocatedQuotaRejection(p.orgID)
-					return nil, ErrOrgResourceQuotaExceeded
-				}
-			}
-			maxWorkers := p.maxWorkers
-			image := p.image
-			p.shared.mu.Unlock()
-
-			worker, err := p.shared.ReserveSharedWorker(ctx, &WorkerAssignment{
-				OrgID:                p.orgID,
-				MaxWorkers:           maxWorkers,
-				Image:                image,
-				Profile:              profile,
-				MaxColocatedCPU:      p.maxColocatedCPU,
-				MaxColocatedMemBytes: p.maxColocatedMemBytes,
-			})
-			if err != nil {
-				return nil, err
-			}
-
-			if err := p.activateWorkerForOrg(ctx, worker); err != nil {
-				slog.Warn("Worker activation failed.", "worker", worker.ID, "org", p.orgID, "error", err)
-				observeActivationFailure(worker.image)
-				p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure, LifecycleOriginActivationFailure)
-				return nil, err
-			}
-
-			p.shared.mu.Lock()
-			if owned := p.workerBelongsToOrgLocked(worker); owned {
-				worker.activeSessions++
-				if worker.activeSessions > worker.peakSessions {
-					worker.peakSessions = worker.activeSessions
-				}
-				p.shared.mu.Unlock()
-				return worker, nil
-			}
-			p.shared.mu.Unlock()
+		// Execute the multi-minute spawn/adopt + activate OUTSIDE the gate (so a
+		// cold burst of N waiters ramps N spawns in parallel instead of
+		// sequentially) and DETACHED from the request ctx (so a requester that
+		// gives up doesn't kill an in-flight pod spawn).
+		out := p.completeAcquireBoundToRequester(ctx, claim, assignment)
+		if out.retry {
+			// Stale hot-idle claim or the worker stopped being ours mid-flight
+			// (raced with retirement/reclaim); re-run the gated decision.
 			continue
 		}
-
-		p.shared.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
+		if out.err != nil {
+			return nil, out.err
 		}
+		return out.worker, nil
 	}
+}
+
+// acquireDecision is the short, gate-held decision section of the slow path:
+// re-check idle reuse, then claim a hot-idle worker or create a spawning slot
+// (reserveSharedWorkerDecision). Returns exactly one of: an idle worker reused
+// while queued, or the claim this waiter now owns.
+//
+// The gate serializes per org in FIFO arrival order, but is held ONLY across
+// this decision — not across the multi-minute spawn+activate. The anti-snatch
+// invariant ("a worker the CP scaled up for an earlier waiter cannot be
+// snatched by a later connection") is preserved without holding the gate
+// longer: each slow-path waiter leaves the gate 1:1 bound to the specific
+// hot-idle claim or spawning slot it owns (the durable claim/slot row is
+// already assigned to it), and the spawned worker's session is pre-claimed
+// before it ever becomes visible as Hot (executeAcquire), so no later
+// connection can grab it. Freed/parked workers re-enter circulation only via
+// the idle-reuse re-check and the hot-idle claim inside this gated section,
+// which queued waiters reach in FIFO order — the earliest waiter still gets
+// the next available worker.
+func (p *OrgReservedPool) acquireDecision(ctx context.Context, profile *WorkerProfile) (*sharedWorkerClaim, *WorkerAssignment, *ManagedWorker, error) {
+	gateStart := time.Now()
+	if err := p.gate.acquire(ctx); err != nil {
+		observeAcquireGateWait(time.Since(gateStart), p.orgID, "canceled")
+		return nil, nil, nil, err
+	}
+	observeAcquireGateWait(time.Since(gateStart), p.orgID, "acquired")
+	defer p.gate.release()
+
+	// A worker may have freed while we waited for our FIFO turn.
+	if w := p.tryReuseIdleAssigned(profile); w != nil {
+		return nil, nil, w, nil
+	}
+
+	p.shared.mu.Lock()
+	if p.shared.shuttingDown {
+		p.shared.mu.Unlock()
+		return nil, nil, nil, fmt.Errorf("pool is shutting down")
+	}
+	maxWorkers := p.maxWorkers
+	image := p.image
+	p.shared.mu.Unlock()
+
+	// At the org's max concurrent workers with all busy → fail fast with the
+	// clear org-cap message; waiting cannot help (no new worker will spawn).
+	// This in-memory pre-check is the fast-fail; the authoritative cross-CP cap
+	// re-check happens transactionally in CreateSpawningWorkerSlot below.
+	if p.atOrgWorkerCap() {
+		return nil, nil, nil, NewWorkerCapacityExhaustedErrorForReason(
+			configstore.WorkerClaimMissReasonOrgCap, DefaultWorkerSpawnRetryAfter)
+	}
+
+	// Under cap: claim a hot-idle worker for this org, or create a spawning
+	// slot. reserveSharedWorkerDecision re-checks the org/global cap
+	// authoritatively (CreateSpawningWorkerSlot, cross-CP) and returns the
+	// reason-specific cap error; an org/global-cap or shutdown error won't
+	// resolve by waiting.
+	assignment := &WorkerAssignment{
+		OrgID:      p.orgID,
+		MaxWorkers: maxWorkers,
+		Image:      image,
+		Profile:    profile,
+	}
+	claim, err := p.shared.reserveSharedWorkerDecision(assignment)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return claim, assignment, nil, nil
+}
+
+// orgAcquireOutcome is the result of executing a slow-path claim. Exactly one
+// of worker / retry / err is meaningful: a Hot worker with this waiter's
+// session claimed, a request to re-run the gated decision, or a terminal error.
+type orgAcquireOutcome struct {
+	worker *ManagedWorker
+	retry  bool
+	err    error
+}
+
+// completeAcquireBoundToRequester runs the slow spawn/adopt + activation for
+// the claim this waiter owns. The work runs under a context DETACHED from the
+// request (context.WithoutCancel keeps trace/log values) with its own deadline
+// (workerSpawnActivateTimeout): a requester that gives up must not kill an
+// in-flight pod spawn — if node provisioning reliably exceeds the client's
+// budget, a requester-scoped spawn would be deleted on every timeout and the
+// org would never converge on a ready worker. The requester waits for the
+// result or its own ctx, whichever comes first. If the requester abandons:
+//   - eventual success → the worker (Hot, session pre-claimed by executeAcquire)
+//     is parked for the org via ReleaseWorker → TransitionToHotIdleIfNoSessions,
+//     persisting its hot_idle record, so the org's next connection reclaims it
+//     through the normal hot-idle claim path;
+//   - eventual failure → executeAcquire's failure paths have already retired it
+//     (spawn failure / activation failure), so nothing leaks in
+//     Reserved/Activating state.
+func (p *OrgReservedPool) completeAcquireBoundToRequester(ctx context.Context, claim *sharedWorkerClaim, assignment *WorkerAssignment) orgAcquireOutcome {
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workerSpawnActivateTimeout)
+	resultCh := make(chan orgAcquireOutcome, 1)
+	go func() {
+		defer cancel()
+		resultCh <- p.executeAcquire(bgCtx, claim, assignment)
+	}()
+
+	select {
+	case out := <-resultCh:
+		return out
+	case <-ctx.Done():
+		// Abandoned: let the spawn/activate finish in the background, then park
+		// the worker for org reuse (failure paths have already retired it).
+		go func() {
+			out := <-resultCh
+			if out.worker == nil {
+				return
+			}
+			slog.Info("Requester abandoned worker spawn/activate; parking worker hot-idle for org reuse.",
+				"worker", out.worker.ID, "org", p.orgID)
+			p.ReleaseWorker(out.worker.ID)
+		}()
+		return orgAcquireOutcome{err: ctx.Err()}
+	}
+}
+
+// executeAcquire completes the reservation (pod spawn or hot-idle adoption)
+// and activates the worker for the org. On success the returned worker is Hot
+// with this waiter's session already claimed: the session is pre-claimed while
+// the worker is still Reserved, before it ever becomes visible as Hot, so a
+// concurrently-arriving connection's idle-reuse fast path can never grab the
+// worker out from under the waiter that spawned it (the 1:1 waiter↔worker
+// binding behind the anti-snatch invariant).
+func (p *OrgReservedPool) executeAcquire(ctx context.Context, claim *sharedWorkerClaim, assignment *WorkerAssignment) orgAcquireOutcome {
+	worker, retry, err := p.shared.completeSharedWorkerReservation(ctx, claim, assignment)
+	if retry {
+		return orgAcquireOutcome{retry: true}
+	}
+	if err != nil {
+		return orgAcquireOutcome{err: err}
+	}
+
+	p.shared.mu.Lock()
+	worker.claimSessionLocked()
+	p.shared.mu.Unlock()
+
+	if err := p.activateWorkerForOrg(ctx, worker); err != nil {
+		slog.Warn("Worker activation failed.", "worker", worker.ID, "org", p.orgID, "error", err)
+		observeActivationFailure(worker.image)
+		p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure, LifecycleOriginActivationFailure)
+		return orgAcquireOutcome{err: err}
+	}
+
+	p.shared.mu.Lock()
+	owned := p.workerBelongsToOrgLocked(worker)
+	if !owned {
+		// Worker is no longer ours (raced with retirement/reclaim). Undo the
+		// pre-claim before re-deciding: if this CP still tracks the worker, a
+		// stranded activeSessions=1 would make findIdleAssignedWorkerLocked and
+		// TransitionToHotIdleIfNoSessions skip it forever (fail-safe direction,
+		// but the worker leaks until a TTL reaper retires it).
+		worker.activeSessions--
+	}
+	p.shared.mu.Unlock()
+	if !owned {
+		return orgAcquireOutcome{retry: true}
+	}
+	return orgAcquireOutcome{worker: worker}
+}
+
+// atOrgWorkerCap reports whether the org has reached its maximum concurrent
+// workers (count cap). Hot-idle workers are excluded (they don't consume the
+// count budget), so a true result means every counted worker is actively
+// assigned — a new worker cannot be added.
+func (p *OrgReservedPool) atOrgWorkerCap() bool {
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	return p.maxWorkers > 0 && p.assignedWorkerCountLocked() >= p.maxWorkers
+}
+
+// WorkerCount returns the number of workers this CP currently has assigned to
+// the org that count against MaxWorkers (hot-idle workers are excluded — they're
+// parked for reclaim and don't consume the cap budget, same as atOrgWorkerCap).
+// This is the per-CP local view; the admin layer sums it across replicas (a
+// worker is owned by exactly one CP) for the Overview per-org load bar.
+func (p *OrgReservedPool) WorkerCount() int {
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	return p.assignedWorkerCountLocked()
+}
+
+// tryReuseIdleAssigned returns an already-assigned, idle (Hot) worker of the
+// requested shape with its session count bumped, or nil if none is available.
+func (p *OrgReservedPool) tryReuseIdleAssigned(profile *WorkerProfile) *ManagedWorker {
+	p.shared.mu.Lock()
+	defer p.shared.mu.Unlock()
+	if p.shared.shuttingDown {
+		return nil
+	}
+	p.shared.cleanDeadWorkersLocked()
+	idle := p.findIdleAssignedWorkerLocked(profile)
+	if idle == nil {
+		return nil
+	}
+	idle.activeSessions++
+	if idle.activeSessions > idle.peakSessions {
+		idle.peakSessions = idle.activeSessions
+	}
+	return idle
 }
 
 func (p *OrgReservedPool) ReleaseWorker(id int) {
 	if p.shared.TransitionToHotIdleIfNoSessions(id) {
+		// Parked hot-idle: drop the do-not-disrupt veto so Karpenter may
+		// consolidate a node holding only idle workers/placeholders. The next
+		// acquire re-adds it before the session starts.
+		if w, ok := p.shared.Worker(id); ok {
+			p.shared.markWorkerDisruptable(w)
+		}
 		return
 	}
 	// TransitionToHotIdleIfNoSessions already decremented activeSessions.
@@ -227,8 +401,8 @@ func (p *OrgReservedPool) findIdleAssignedWorkerLocked(profile *WorkerProfile) *
 			continue
 		default:
 		}
-		// Only reuse a worker of the requested shape — a colocated request must
-		// not land on a default/exclusive worker (and vice versa).
+		// Only reuse a worker of the requested shape — a differently-sized
+		// request must not land on a worker of another shape (and vice versa).
 		if w.profile.MatchKey() != want {
 			continue
 		}
@@ -237,24 +411,6 @@ func (p *OrgReservedPool) findIdleAssignedWorkerLocked(profile *WorkerProfile) *
 		}
 	}
 	return nil
-}
-
-func (p *OrgReservedPool) leastLoadedAssignedWorkerLocked() *ManagedWorker {
-	var best *ManagedWorker
-	for _, w := range p.shared.workers {
-		select {
-		case <-w.done:
-			continue
-		default:
-		}
-		if !p.workerReadyForSchedulingLocked(w) {
-			continue
-		}
-		if best == nil || w.activeSessions < best.activeSessions {
-			best = w
-		}
-	}
-	return best
 }
 
 func (p *OrgReservedPool) assignedWorkerCountLocked() int {
@@ -270,11 +426,6 @@ func (p *OrgReservedPool) assignedWorkerCountLocked() int {
 		// against maxWorkers so AcquireWorker can reach ReserveSharedWorker
 		// and ClaimHotIdleWorker.
 		if w.SharedState().NormalizedLifecycle() == WorkerLifecycleHotIdle {
-			continue
-		}
-		// Colocated workers are unbounded and must not consume the exclusive
-		// worker budget that maxWorkers governs.
-		if w.profile.Colocate {
 			continue
 		}
 		if p.workerBelongsToOrgLocked(w) {
@@ -297,7 +448,14 @@ func (p *OrgReservedPool) workerReadyForSchedulingLocked(w *ManagedWorker) bool 
 	return lifecycle == WorkerLifecycleHot
 }
 
-func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) error {
+func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *ManagedWorker) (err error) {
+	activateStart := time.Now()
+	defer func() {
+		if worker != nil {
+			observeAcquirePhase("activate", p.orgID, time.Since(activateStart), err)
+		}
+	}()
+
 	p.shared.mu.Lock()
 	state := worker.SharedState().NormalizedLifecycle()
 	if state == WorkerLifecycleReserved {
@@ -343,6 +501,11 @@ func (p *OrgReservedPool) activateWorkerForOrg(ctx context.Context, worker *Mana
 }
 
 func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error) {
+	profile, err := p.ReconnectFlightWorkerProfile(ctx, workerID, ownerEpoch)
+	if err != nil {
+		return nil, fmt.Errorf("resolve reconnect worker profile %d: %w", workerID, err)
+	}
+
 	p.shared.mu.RLock()
 	maxWorkers := p.maxWorkers
 	image := p.image
@@ -352,15 +515,51 @@ func (p *OrgReservedPool) ReconnectFlightWorker(ctx context.Context, workerID in
 		OrgID:      p.orgID,
 		MaxWorkers: maxWorkers,
 		Image:      image,
+		Profile:    profile,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// Pre-claim the reconnected session while the worker is still Reserved,
+	// exactly like executeAcquire: a reconnected Flight session is a live
+	// session like any other. Without the claim the worker becomes Hot with
+	// activeSessions==0 — findIdleAssignedWorkerLocked then co-assigns the
+	// org's next connection onto it, the worker-side MaxSessions=1 cap
+	// rejects that, and the cap-drift recovery retires the worker out from
+	// under the live reconnected session (ShutdownAll's active-session
+	// preservation also wouldn't protect it).
+	p.shared.mu.Lock()
+	worker.claimSessionLocked()
+	p.shared.mu.Unlock()
+
 	if err := p.activateWorkerForOrg(ctx, worker); err != nil {
 		p.shared.retireWorkerWithReason(worker.ID, RetireReasonActivationFailure, LifecycleOriginActivationFailure)
 		return nil, err
 	}
 	return worker, nil
+}
+
+func (p *OrgReservedPool) ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if p == nil || p.shared == nil || p.shared.runtimeStore == nil {
+		return nil, nil
+	}
+	record, err := p.shared.runtimeStore.GetWorkerRecord(workerID)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil {
+		return nil, nil
+	}
+	if record.ProfileCPU == "" && record.ProfileMemory == "" {
+		return nil, nil
+	}
+	return &WorkerProfile{CPU: record.ProfileCPU, Memory: record.ProfileMemory}, nil
 }
 
 func (p *OrgReservedPool) activateReservedWorkerDefault(_ context.Context, _ *ManagedWorker) error {

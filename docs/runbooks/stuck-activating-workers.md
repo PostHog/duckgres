@@ -8,9 +8,9 @@
 
 ## Background
 
-When an org requests a session and no hot worker is available, the control plane reserves an idle warm worker and activates it (loads the org's DuckLake catalog, configures tenant settings, etc.). If activation fails or hangs, the worker stays in `reserved` or `activating` state indefinitely.
+When an org requests a session and no hot-idle worker is available for reuse, the control plane spawns a worker on demand and activates it (loads the org's DuckLake catalog, configures tenant settings, etc.). If activation fails or hangs, the worker stays in `reserved` or `activating` state indefinitely.
 
-The automatic stuck-worker reaper runs every minute and retires workers that have been in `reserved` or `activating` state for longer than 2 minutes. Reaped workers are replaced automatically if the pool is below `minWorkers`.
+The automatic stuck-worker reaper runs every minute and retires workers that have been in `reserved` or `activating` state for longer than 2 minutes. The reaped worker is not replaced; the next session for that org spawns a fresh one on demand.
 
 ## Metrics to watch
 
@@ -46,7 +46,7 @@ The automatic stuck-worker reaper runs every minute and retires workers that hav
    kubectl delete pod <pod-name> --grace-period=10
    ```
 
-4. **Verify recovery.** After stuck workers are cleaned up, check that `sum(duckgres_worker_lifecycle_count{state="idle",binding="neutral"})` replenishes to `minWorkers`.
+4. **Verify recovery.** After stuck workers are cleaned up, confirm new sessions activate successfully (no growth in `sum(duckgres_worker_lifecycle_count{state="activating"})`) and `duckgres_worker_spawn_failures_total` is flat.
 
 ## Prevention
 

@@ -86,6 +86,11 @@ func main() {
 
 	slog.Info("Cache-proxy build info.", "version", version, "commit", commit, "built", date)
 
+	// OTLP tracing (no-op unless an OTEL/DUCKGRES trace endpoint is set).
+	// Emits standalone cache-proxy traces; flushed on shutdown.
+	shutdownTracing := initTracing()
+	defer shutdownTracing()
+
 	cacheDir := envOrDefault("CACHE_DIR", "/cache")
 	maxPercent, _ := strconv.Atoi(envOrDefault("CACHE_MAX_PERCENT", "80"))
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")

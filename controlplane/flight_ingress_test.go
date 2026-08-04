@@ -2,9 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightsqlingress"
 )
@@ -14,18 +17,55 @@ type reconnectTestOrgRouter struct {
 	orgID           string
 }
 
+type flightSessionAccessConfigStore struct {
+	access func(orgID, username string) (*configstore.OrgUserQueryAccess, string, bool)
+}
+
+func (s *flightSessionAccessConfigStore) ResolveDatabase(string) string            { return "" }
+func (s *flightSessionAccessConfigStore) DatabaseNameForSNIPrefix(string) string   { return "" }
+func (s *flightSessionAccessConfigStore) ResolveSNIPrefix(string) (string, string) { return "", "" }
+func (s *flightSessionAccessConfigStore) ResolvePostgresConnection(string, string, bool, string, string) configstore.PostgresConnectionResolution {
+	return configstore.PostgresConnectionResolution{}
+}
+func (s *flightSessionAccessConfigStore) ValidateOrgUser(string, string, string) bool { return false }
+func (s *flightSessionAccessConfigStore) ValidateOrgUserAndGetPassthrough(string, string, string) (bool, bool) {
+	return false, false
+}
+func (s *flightSessionAccessConfigStore) OrgWarehouseStatus(string) (string, bool) { return "", false }
+func (s *flightSessionAccessConfigStore) OrgDefaultWorkerProfile(string) (string, string, string) {
+	return "", "", ""
+}
+func (s *flightSessionAccessConfigStore) OrgUsageTeamID(string, string) int64 {
+	return 0
+}
+func (s *flightSessionAccessConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
+	return nil
+}
+func (s *flightSessionAccessConfigStore) GetFlightSessionRecord(string) (*configstore.FlightSessionRecord, error) {
+	return nil, nil
+}
+func (s *flightSessionAccessConfigStore) TouchFlightSessionRecord(string, time.Time) error {
+	return nil
+}
+func (s *flightSessionAccessConfigStore) CloseFlightSessionRecord(string, time.Time) error {
+	return nil
+}
+func (s *flightSessionAccessConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(configstore.FlightSessionRecord, time.Time) (bool, error) {
+	return false, nil
+}
+func (s *flightSessionAccessConfigStore) OrgUserSessionQueryAccess(orgID, username string) (*configstore.OrgUserQueryAccess, string, bool) {
+	return s.access(orgID, username)
+}
+
 func (r *reconnectTestOrgRouter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	r.stackByOrgCalls++
 	return nil, nil, nil, false
 }
 
-func (r *reconnectTestOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig, bool) {
-	return server.IcebergConfig{}, false
-}
-
 func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false }
-func (r *reconnectTestOrgRouter) SetWarmCapacityTarget(_ int)     {}
+func (r *reconnectTestOrgRouter) BeginDrain()                     {}
 func (r *reconnectTestOrgRouter) ShutdownAll()                    {}
+func (r *reconnectTestOrgRouter) ReleaseIdleHotWorkers() int      { return 0 }
 
 // recordingOrgRouter records the orgIDs StackForOrg is asked for. It returns no
 // live stack, so CreateSession returns right after recording the routing org.
@@ -40,12 +80,10 @@ func (r *recordingOrgRouter) StackForOrg(orgID string) (WorkerPool, *SessionMana
 	r.mu.Unlock()
 	return nil, nil, nil, false
 }
-func (r *recordingOrgRouter) IcebergConfigForOrg(_ string) (server.IcebergConfig, bool) {
-	return server.IcebergConfig{}, false
-}
 func (r *recordingOrgRouter) IsMigratingForOrg(_ string) bool { return false }
-func (r *recordingOrgRouter) SetWarmCapacityTarget(_ int)     {}
+func (r *recordingOrgRouter) BeginDrain()                     {}
 func (r *recordingOrgRouter) ShutdownAll()                    {}
+func (r *recordingOrgRouter) ReleaseIdleHotWorkers() int      { return 0 }
 
 type testFlightOrgKey struct{}
 
@@ -125,8 +163,63 @@ func TestOrgRoutedSessionProviderReconnectSessionUsesDurableOrgID(t *testing.T) 
 	if pid != 0 {
 		t.Fatalf("expected pid 0 on failed reconnect, got %d", pid)
 	}
-	if router.stackByOrgCalls != 1 {
-		t.Fatalf("expected reconnect to use StackForOrg once, got %d", router.stackByOrgCalls)
+	if router.stackByOrgCalls != 0 {
+		t.Fatalf("expected reconnect to reject before routing without access state, got %d calls", router.stackByOrgCalls)
+	}
+}
+
+func TestOrgRoutedSessionProviderRejectsDurableReconnectWhenUserAccessChanged(t *testing.T) {
+	recordedPolicy := &server.QueryAccessPolicy{ReadOnly: true, AllowedSchemas: []string{"team_42"}}
+	tests := []struct {
+		name            string
+		currentAccess   *configstore.OrgUserQueryAccess
+		currentRevision string
+		valid           bool
+	}{
+		{name: "user deleted", valid: false},
+		{
+			name:            "project scope changed",
+			currentAccess:   &configstore.OrgUserQueryAccess{ReadOnly: true, AllowedSchemas: []string{"team_7"}},
+			currentRevision: "rev-1",
+			valid:           true,
+		},
+		{
+			name:            "password changed",
+			currentAccess:   &configstore.OrgUserQueryAccess{ReadOnly: true, AllowedSchemas: []string{"team_42"}},
+			currentRevision: "rev-2",
+			valid:           true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := &reconnectTestOrgRouter{orgID: "analytics"}
+			store := &flightSessionAccessConfigStore{access: func(orgID, username string) (*configstore.OrgUserQueryAccess, string, bool) {
+				if orgID != "analytics" || username != "alice" {
+					t.Fatalf("unexpected access lookup for %s/%s", orgID, username)
+				}
+				return tt.currentAccess, tt.currentRevision, tt.valid
+			}}
+			provider := &orgRoutedSessionProvider{
+				orgRouter:   router,
+				configStore: store,
+				pidSession:  make(map[int32]flightOwnedSession),
+			}
+
+			_, _, err := provider.ReconnectSession(context.Background(), flightsqlingress.DurableSessionRecord{
+				SessionToken:         "flight-token",
+				Username:             "alice",
+				OrgID:                "analytics",
+				AccessPolicyRecorded: true,
+				AccessRevision:       "rev-1",
+				QueryAccessPolicy:    recordedPolicy,
+			})
+			if !errors.Is(err, flightsqlingress.ErrDurableReconnectTerminal) {
+				t.Fatalf("expected terminal reconnect rejection, got %v", err)
+			}
+			if router.stackByOrgCalls != 0 {
+				t.Fatalf("expected access rejection before worker reconnect, got %d routing calls", router.stackByOrgCalls)
+			}
+		})
 	}
 }
 

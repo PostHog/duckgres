@@ -26,25 +26,27 @@ import (
 
 // ManagedWorker represents a duckdb-service worker process.
 type ManagedWorker struct {
-	ID                      int
-	podName                 string
-	nodeName                string //nolint:unused // only set in kubernetes warm-pool; drives cache-locality-aware scheduling
-	image                   string        //nolint:unused // only set in kubernetes warm-pool; carried through runtime store records
-	profile                 WorkerProfile //nolint:unused // only set in kubernetes warm-pool; pod-shape this worker was spawned with (zero = default exclusive)
-	cmd                     *exec.Cmd
-	socketPath              string
-	bearerToken             string
-	client                  *flightsql.Client
-	parentListener          net.Listener    // CP-side listener; lifecycle managed by releaseSocket
-	prebound                *preboundSocket // non-nil if using a pre-bound socket slot
-	releaseOnce             sync.Once       // ensures releaseWorkerSocket body runs exactly once
-	done                    chan struct{}   // closed when process exits
-	exitErr                 error
-	activeSessions          int       // Number of sessions currently assigned to this worker
-	lastUsed                time.Time // Last time a session was destroyed on this worker
-	sharedState             SharedWorkerState
-	reservedAt              time.Time //nolint:unused // only set in kubernetes warm-pool reservation path
-	peakSessions            int       // High-water mark of concurrent sessions (for retirement metrics)
+	ID                  int
+	podName             string
+	nodeName            string        //nolint:unused // only set in kubernetes remote backend; drives cache-locality-aware scheduling
+	image               string        //nolint:unused // only set in kubernetes remote backend; carried through runtime store records
+	profile             WorkerProfile //nolint:unused // only set in kubernetes remote backend; pod-shape this worker was spawned with (zero = default exclusive)
+	cmd                 *exec.Cmd
+	socketPath          string
+	bearerToken         string
+	client              *flightsql.Client
+	queryLogLimiterOnce sync.Once
+	queryLogLimiter     *flightclient.QueryLogLimiter
+	parentListener      net.Listener    // CP-side listener; lifecycle managed by releaseSocket
+	prebound            *preboundSocket // non-nil if using a pre-bound socket slot
+	releaseOnce         sync.Once       // ensures releaseWorkerSocket body runs exactly once
+	done                chan struct{}   // closed when process exits
+	exitErr             error
+	activeSessions      int       // Number of sessions currently assigned to this worker
+	lastUsed            time.Time // Last time a session was destroyed on this worker
+	sharedState         SharedWorkerState
+	reservedAt          time.Time //nolint:unused // only set in kubernetes remote backend reservation path
+	peakSessions        int       // High-water mark of concurrent sessions (for retirement metrics)
 	// ownerEpoch is guarded by epochMu so cred-refresh's
 	// "RefreshLease then SetOwnerEpoch" sequence appears atomic to
 	// concurrent readers (notably ShutdownAll's lease minting).
@@ -58,13 +60,26 @@ type ManagedWorker struct {
 	cachedActivationPayload any  //nolint:unused // *TenantActivationPayload, cached in kubernetes activation path
 }
 
-// SharedState returns the additive shared warm-worker lifecycle metadata for
+func (w *ManagedWorker) workerQueryLogLimiter() *flightclient.QueryLogLimiter {
+	w.queryLogLimiterOnce.Do(func() {
+		w.queryLogLimiter = flightclient.NewQueryLogLimiter()
+	})
+	return w.queryLogLimiter
+}
+
+// Profile returns the pod-shape profile this worker was spawned with (zero =
+// default exclusive profile). Exposes the unexported field for the admin API.
+func (w *ManagedWorker) Profile() WorkerProfile {
+	return w.profile
+}
+
+// SharedState returns the additive shared worker lifecycle metadata for
 // this worker. The zero value normalizes to an idle, unassigned worker.
 func (w *ManagedWorker) SharedState() SharedWorkerState {
 	return cloneSharedWorkerState(w.sharedState)
 }
 
-// SetSharedState updates the additive shared warm-worker lifecycle metadata
+// SetSharedState updates the additive shared worker lifecycle metadata
 // without changing existing session scheduling behavior.
 func (w *ManagedWorker) SetSharedState(state SharedWorkerState) error {
 	if err := state.Validate(); err != nil {
@@ -139,6 +154,20 @@ func (w *ManagedWorker) SetOwnerCPInstanceID(cpInstanceID string) {
 
 func (w *ManagedWorker) PodName() string {
 	return w.podName
+}
+
+// claimSessionLocked records one newly-assigned session on the worker: it
+// increments the active session count and advances the peak-sessions
+// high-water mark. The caller must hold the owning pool's lock (this is the
+// shared session-claim bookkeeping used identically by both
+// FlightWorkerPool.AcquireWorker and K8sWorkerPool.AcquireWorker after a
+// worker is selected). It does not make any scheduling decision — callers
+// remain responsible for choosing which worker to claim.
+func (w *ManagedWorker) claimSessionLocked() {
+	w.activeSessions++
+	if w.activeSessions > w.peakSessions {
+		w.peakSessions = w.activeSessions
+	}
 }
 
 // preboundSocket is a Unix socket pre-bound at startup while the socket
@@ -551,6 +580,8 @@ type sessionProgressJSON struct {
 // healthCheckResult is the parsed health check response from a worker.
 type healthCheckResult struct {
 	Healthy         bool                            `json:"healthy"`
+	Draining        bool                            `json:"draining"`
+	ActiveQueries   int                             `json:"active_queries"`
 	SessionProgress map[string]*sessionProgressJSON `json:"session_progress"`
 }
 
@@ -579,7 +610,9 @@ func doHealthCheck(ctx context.Context, client *flightsql.Client) (*healthCheckR
 	return doHealthCheckWithMetadata(ctx, client, server.WorkerHealthCheckPayload{})
 }
 
-func doHealthCheckWithMetadata(ctx context.Context, client *flightsql.Client, payload server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+var doHealthCheckWithMetadata = doHealthCheckWithMetadataImpl
+
+func doHealthCheckWithMetadataImpl(ctx context.Context, client *flightsql.Client, payload server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
 	body, _ := json.Marshal(payload)
 
 	// Use the underlying flight client for custom actions.
@@ -678,10 +711,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 	// 1. Try to claim an idle worker before spawning a new one.
 	idle := p.findIdleWorkerLocked()
 	if idle != nil {
-		idle.activeSessions++
-		if idle.activeSessions > idle.peakSessions {
-			idle.peakSessions = idle.activeSessions
-		}
+		idle.claimSessionLocked()
 		p.mu.Unlock()
 		return idle, nil
 	}
@@ -710,10 +740,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 		}
 
 		p.mu.Lock()
-		w.activeSessions++
-		if w.activeSessions > w.peakSessions {
-			w.peakSessions = w.activeSessions
-		}
+		w.claimSessionLocked()
 		p.mu.Unlock()
 		return w, nil
 	}
@@ -721,10 +748,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 	// 3. At capacity — assign to the least-loaded live worker.
 	w := p.leastLoadedWorkerLocked()
 	if w != nil {
-		w.activeSessions++
-		if w.activeSessions > w.peakSessions {
-			w.peakSessions = w.activeSessions
-		}
+		w.claimSessionLocked()
 		p.mu.Unlock()
 		return w, nil
 	}
@@ -760,10 +784,7 @@ func (p *FlightWorkerPool) AcquireWorker(ctx context.Context, _ *WorkerProfile) 
 	}
 
 	p.mu.Lock()
-	w.activeSessions++
-	if w.activeSessions > w.peakSessions {
-		w.peakSessions = w.activeSessions
-	}
+	w.claimSessionLocked()
 	p.mu.Unlock()
 	return w, nil
 }
@@ -1250,8 +1271,10 @@ func recoverWorkerPanic(err *error) {
 	}
 }
 
-// CreateSession creates a new session on the given worker.
-func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit string, threads int) (token string, err error) {
+// CreateSession creates a new session on the given worker. secretStatements
+// are the user's persistent secrets to replay on the worker before the
+// session serves queries; secretWarnings reports any that failed to apply.
+func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit string, threads int, secretStatements []string) (token string, secretWarnings []string, err error) {
 	defer recoverWorkerPanic(&err)
 
 	body, _ := json.Marshal(server.WorkerCreateSessionPayload{
@@ -1260,9 +1283,10 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 			OwnerEpoch:   w.OwnerEpoch(),
 			CPInstanceID: w.OwnerCPInstanceID(),
 		},
-		Username:    username,
-		MemoryLimit: memoryLimit,
-		Threads:     threads,
+		Username:         username,
+		MemoryLimit:      memoryLimit,
+		Threads:          threads,
+		SecretStatements: secretStatements,
 	})
 
 	stream, err := w.client.Client.DoAction(ctx, &flight.Action{
@@ -1270,22 +1294,38 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 		Body: body,
 	})
 	if err != nil {
-		return "", fmt.Errorf("create session: %w", err)
+		return "", nil, fmt.Errorf("create session: %w", err)
 	}
 
 	msg, err := stream.Recv()
 	if err != nil {
-		return "", fmt.Errorf("create session recv: %w", err)
+		return "", nil, fmt.Errorf("create session recv: %w", err)
 	}
 
 	var resp struct {
 		SessionToken string `json:"session_token"`
+		// Pointer so an old-image worker that omits the field entirely is
+		// distinguishable from a new worker reporting zero warnings.
+		SecretWarnings *[]string `json:"secret_warnings"`
 	}
 	if err := json.Unmarshal(msg.Body, &resp); err != nil {
-		return "", fmt.Errorf("create session unmarshal: %w", err)
+		return "", nil, fmt.Errorf("create session unmarshal: %w", err)
 	}
 
-	return resp.SessionToken, nil
+	if resp.SecretWarnings == nil {
+		if len(secretStatements) > 0 {
+			// Per-org image pinning means a worker can run an arbitrarily old
+			// image: one that predates secret replay ignores the payload
+			// field (no replay, no create-time wipe) without erroring.
+			// Surface it as a replay warning so it is logged per-session and
+			// can't silently masquerade as "secrets restored".
+			slog.Error("Worker did not acknowledge persistent secret replay; it likely runs an image without user-secret support.",
+				"worker", w.ID, "secrets", len(secretStatements))
+			return resp.SessionToken, []string{"persistent secrets were NOT restored: the assigned worker runs an image without user-secret support"}, nil
+		}
+		return resp.SessionToken, nil, nil
+	}
+	return resp.SessionToken, *resp.SecretWarnings, nil
 }
 
 // ActivateTenant delivers tenant runtime to a shared warm worker before it may serve sessions.
@@ -1335,10 +1375,12 @@ func (w *ManagedWorker) DestroySession(ctx context.Context, sessionToken string)
 	// Drain the stream
 	for {
 		if _, err := stream.Recv(); err != nil {
-			break
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("destroy session recv: %w", err)
 		}
 	}
-	return nil
 }
 
 // workerBearerCreds implements grpc.PerRPCCredentials for worker auth.

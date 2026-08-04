@@ -1,9 +1,16 @@
 package server
 
 import (
+	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
+	"unsafe"
+
+	"github.com/posthog/duckgres/server/observe"
+	"github.com/posthog/duckgres/server/usersecrets"
 )
 
 func TestClassifyQuery(t *testing.T) {
@@ -131,6 +138,24 @@ func TestTruncateQuery(t *testing.T) {
 	}
 }
 
+func TestBoundQueryLogTextClonesAtValidUTF8Boundary(t *testing.T) {
+	long := strings.Repeat("x", maxQueryLength-1) + "é-tail"
+	result := boundQueryLogText(long)
+	expected := strings.Repeat("x", maxQueryLength-1)
+	if result != expected {
+		t.Fatalf("bounded query log text = %q, want maximal valid prefix of length %d", result, len(expected))
+	}
+	if len(result) > maxQueryLength {
+		t.Fatalf("bounded length = %d, want <= %d", len(result), maxQueryLength)
+	}
+	if !utf8.ValidString(result) {
+		t.Fatalf("bounded query log text is not valid UTF-8: %q", result[len(result)-4:])
+	}
+	if unsafe.StringData(result) == unsafe.StringData(long) {
+		t.Fatal("bounded query log text still aliases the oversized backing string")
+	}
+}
+
 func TestQueryLogNonBlocking(t *testing.T) {
 	// Create a logger with a tiny channel to test non-blocking behavior
 	ql := &QueryLogger{
@@ -166,9 +191,8 @@ func TestQueryLoggerStopIsIdempotent(t *testing.T) {
 	ql := &QueryLogger{
 		db: db,
 		cfg: QueryLogConfig{
-			BatchSize:       1,
-			FlushInterval:   time.Hour,
-			CompactInterval: time.Hour,
+			BatchSize:     1,
+			FlushInterval: time.Hour,
 		},
 		ch:   make(chan QueryLogEntry, 1),
 		done: make(chan struct{}),
@@ -233,66 +257,6 @@ func TestHighBitHashRejectsUbigint(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error inserting negative int64 into UBIGINT, but insert succeeded")
 		return
-	}
-}
-
-// TestUbigintToBigintMigrationViaDrop simulates the migration path: an existing
-// table with a UBIGINT column is dropped and recreated as BIGINT, after which
-// negative int64 hash values insert successfully.
-func TestUbigintToBigintMigrationViaDrop(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	// Start with the old schema (UBIGINT)
-	_, err = db.Exec("CREATE TABLE query_log (normalized_query_hash UBIGINT)")
-	if err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-
-	// Verify negative int64 fails with UBIGINT (the bug)
-	var highBitHash int64 = -2949375574818077459
-	_, err = db.Exec("INSERT INTO query_log VALUES ($1)", highBitHash)
-	if err == nil {
-		t.Fatal("expected UBIGINT to reject negative int64")
-		return
-	}
-
-	// Check column type via information_schema (simulates the migration check)
-	var colType string
-	err = db.QueryRow("SELECT data_type FROM information_schema.columns WHERE table_name = 'query_log' AND column_name = 'normalized_query_hash'").Scan(&colType)
-	if err != nil {
-		t.Fatalf("query information_schema: %v", err)
-	}
-	if colType != "UBIGINT" {
-		t.Fatalf("expected UBIGINT, got %s", colType)
-	}
-
-	// Simulate migration: drop and recreate with BIGINT
-	_, err = db.Exec("DROP TABLE query_log")
-	if err != nil {
-		t.Fatalf("drop table: %v", err)
-	}
-	_, err = db.Exec("CREATE TABLE IF NOT EXISTS query_log (normalized_query_hash BIGINT)")
-	if err != nil {
-		t.Fatalf("recreate table: %v", err)
-	}
-
-	// Now the insert should succeed
-	_, err = db.Exec("INSERT INTO query_log VALUES ($1)", highBitHash)
-	if err != nil {
-		t.Fatalf("insert after migration failed: %v", err)
-	}
-
-	var stored int64
-	err = db.QueryRow("SELECT normalized_query_hash FROM query_log").Scan(&stored)
-	if err != nil {
-		t.Fatalf("query failed: %v", err)
-	}
-	if stored != highBitHash {
-		t.Errorf("round-trip mismatch: got %d, want %d", stored, highBitHash)
 	}
 }
 
@@ -362,14 +326,6 @@ func TestTruncateNullableQuery(t *testing.T) {
 	}
 }
 
-func TestEscapeSQLStringLiteral(t *testing.T) {
-	got := escapeSQLStringLiteral("postgres:host=localhost password=pa'ss")
-	want := "postgres:host=localhost password=pa''ss"
-	if got != want {
-		t.Fatalf("escapeSQLStringLiteral() = %q, want %q", got, want)
-	}
-}
-
 func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	db, err := sql.Open("duckdb", ":memory:")
 	if err != nil {
@@ -377,59 +333,35 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
-	_, err = db.Exec(`CREATE TABLE query_log (
-		event_time TIMESTAMPTZ,
-		query_duration_ms BIGINT,
-		type VARCHAR,
-		query VARCHAR,
-		transpiled_query VARCHAR,
-		query_kind VARCHAR,
-		normalized_query_hash BIGINT,
-		result_rows BIGINT,
-		written_rows BIGINT,
-		exception_code VARCHAR,
-		exception VARCHAR,
-		user_name VARCHAR,
-		org_id VARCHAR,
-		current_database VARCHAR,
-		client_address VARCHAR,
-		client_port INTEGER,
-		application_name VARCHAR,
-		pid INTEGER,
-		worker_id INTEGER,
-		is_transpiled BOOLEAN,
-		protocol VARCHAR,
-		trace_id VARCHAR,
-		span_id VARCHAR,
-		postgres_scan_ms BIGINT
-	)`)
-	if err != nil {
+	if _, err = db.Exec(duckDBQueryLogTableSQL("query_log", false)); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
 
 	ql := &QueryLogger{db: db}
 	ql.flushBatch([]QueryLogEntry{{
-		EventTime:       time.Unix(1700000000, 0).UTC(),
-		QueryDurationMs: 42,
-		Type:            "QueryFinish",
-		Query:           "SELECT 1",
-		QueryKind:       "Select",
-		NormalizedHash:  17,
-		ResultRows:      1,
-		UserName:        "alice",
-		OrgID:           "analytics",
-		CurrentDatabase: "analytics_db",
-		ClientAddress:   "127.0.0.1",
-		ClientPort:      5432,
-		ApplicationName: "psql",
-		PID:             99,
-		WorkerID:        7,
-		Protocol:        "simple",
-		PostgresScanMs:  123,
+		EventTime:             time.Unix(1700000000, 0).UTC(),
+		QueryDurationMs:       42,
+		Type:                  "QueryFinish",
+		Query:                 "SELECT 1",
+		QueryKind:             "Select",
+		NormalizedHash:        17,
+		ResultRows:            1,
+		UserName:              "alice",
+		OrgID:                 "analytics",
+		CurrentDatabase:       "analytics_db",
+		ClientAddress:         "127.0.0.1",
+		ClientPort:            5432,
+		ApplicationName:       "psql",
+		PID:                   99,
+		WorkerID:              7,
+		Protocol:              "simple",
+		PostgresScanMs:        123,
+		CPUTimeSeconds:        4.25,
+		PeakBufferMemoryBytes: 2048,
 	}})
 
 	var got string
-	err = db.QueryRow("SELECT org_id FROM query_log").Scan(&got)
+	err = db.QueryRow("SELECT org_id FROM query_log WHERE query = 'SELECT 1'").Scan(&got)
 	if err != nil {
 		t.Fatalf("query org_id: %v", err)
 	}
@@ -444,73 +376,277 @@ func TestQueryLoggerFlushBatchPersistsOrgID(t *testing.T) {
 	if pgScanMs != 123 {
 		t.Fatalf("expected postgres_scan_ms 123, got %d", pgScanMs)
 	}
+
+	var cpuTimeS float64
+	var peakBufferMemoryBytes int64
+	if err := db.QueryRow("SELECT cpu_time_s, peak_buffer_memory_bytes FROM query_log").Scan(&cpuTimeS, &peakBufferMemoryBytes); err != nil {
+		t.Fatalf("query resource usage columns: %v", err)
+	}
+	if cpuTimeS != 4.25 {
+		t.Fatalf("expected cpu_time_s 4.25, got %f", cpuTimeS)
+	}
+	if peakBufferMemoryBytes != 2048 {
+		t.Fatalf("expected peak_buffer_memory_bytes 2048, got %d", peakBufferMemoryBytes)
+	}
 }
 
-func TestEnsureQueryLogTableAddsOrgIDToExistingTable(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	_, err = db.Exec(`CREATE TABLE query_log (
-		event_time TIMESTAMPTZ,
-		query_duration_ms BIGINT,
-		type VARCHAR,
-		query VARCHAR,
-		transpiled_query VARCHAR,
-		query_kind VARCHAR,
-		normalized_query_hash BIGINT,
-		result_rows BIGINT,
-		written_rows BIGINT,
-		exception_code VARCHAR,
-		exception VARCHAR,
-		user_name VARCHAR,
-		current_database VARCHAR,
-		client_address VARCHAR,
-		client_port INTEGER,
-		application_name VARCHAR,
-		pid INTEGER,
-		worker_id INTEGER,
-		is_transpiled BOOLEAN,
-		protocol VARCHAR,
-		trace_id VARCHAR,
-		span_id VARCHAR
-	)`)
-	if err != nil {
-		t.Fatalf("create table: %v", err)
+func TestQueryLoggerFlushBatchStopsOnPrepareError(t *testing.T) {
+	prepareCalled := false
+	ql := &QueryLogger{
+		prepareBatch: func(ctx context.Context, db *sql.DB, batch []QueryLogEntry) error {
+			prepareCalled = true
+			return sql.ErrNoRows
+		},
 	}
 
-	if err := ensureQueryLogTable(db, "", "query_log", "query_log"); err != nil {
-		t.Fatalf("ensureQueryLogTable: %v", err)
-	}
-
-	ql := &QueryLogger{db: db}
 	ql.flushBatch([]QueryLogEntry{{
 		EventTime:       time.Unix(1700000000, 0).UTC(),
 		QueryDurationMs: 42,
 		Type:            "QueryFinish",
 		Query:           "SELECT 1",
-		QueryKind:       "Select",
-		NormalizedHash:  17,
-		ResultRows:      1,
 		UserName:        "alice",
-		OrgID:           "analytics",
-		CurrentDatabase: "analytics_db",
-		ClientAddress:   "127.0.0.1",
-		ClientPort:      5432,
-		ApplicationName: "psql",
-		PID:             99,
-		WorkerID:        7,
-		Protocol:        "simple",
 	}})
 
-	var got string
-	err = db.QueryRow("SELECT org_id FROM query_log").Scan(&got)
-	if err != nil {
-		t.Fatalf("query org_id: %v", err)
+	if !prepareCalled {
+		t.Fatal("expected prepareBatch to be called")
 	}
-	if got != "analytics" {
-		t.Fatalf("expected org_id analytics, got %q", got)
+}
+
+func TestLogQueryCopiesProfilingSummaryToQueryLogEntry(t *testing.T) {
+	c, ql, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+
+	c.lastProfilingSummary = observe.QueryProfilingSummary{
+		CPUTimeSeconds:        2.75,
+		PeakBufferMemoryBytes: 8192,
+		PostgresScanSeconds:   0.456,
+	}
+
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+
+	select {
+	case entry := <-ql.ch:
+		if entry.CPUTimeSeconds != 2.75 {
+			t.Fatalf("expected CPUTimeSeconds 2.75, got %f", entry.CPUTimeSeconds)
+		}
+		if entry.PeakBufferMemoryBytes != 8192 {
+			t.Fatalf("expected PeakBufferMemoryBytes 8192, got %d", entry.PeakBufferMemoryBytes)
+		}
+		if entry.PostgresScanMs != 456 {
+			t.Fatalf("expected PostgresScanMs 456, got %d", entry.PostgresScanMs)
+		}
+	default:
+		t.Fatal("expected query log entry")
+	}
+
+	if c.lastProfilingSummary != (observe.QueryProfilingSummary{}) {
+		t.Fatalf("expected profiling summary to be reset, got %#v", c.lastProfilingSummary)
+	}
+}
+
+type captureQueryLogExecutor struct {
+	feedbackExecutor
+	entries []QueryLogEntry
+}
+
+func (e *captureQueryLogExecutor) Log(entry QueryLogEntry) {
+	e.entries = append(e.entries, entry)
+}
+
+func TestLogQueryPrefersExecutorQueryLogSink(t *testing.T) {
+	c, ql, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected executor query-log sink to receive one entry, got %d", len(exec.entries))
+	}
+	if exec.entries[0].Query != "SELECT 1" {
+		t.Fatalf("unexpected forwarded query-log entry: %#v", exec.entries[0])
+	}
+	select {
+	case entry := <-ql.ch:
+		t.Fatalf("server query logger should not receive entry when executor sink is available: %#v", entry)
+	default:
+	}
+}
+
+// TestLogQueryStampsScopedQueryID pins the correlation contract: every event
+// logged for one statement carries that statement's ID, and a new statement
+// gets a new one. Reusing the previous statement's ID would silently merge two
+// statements in the query log.
+func TestLogQueryStampsScopedQueryID(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	first := c.beginQueryMetrics(time.Unix(1700000000, 0).UTC())
+	// Two events for one statement — e.g. a per-statement log inside a batch
+	// followed by the statement's terminal event.
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+	c.finishQueryMetrics(first)
+
+	second := c.beginQueryMetrics(time.Unix(1700000001, 0).UTC())
+	c.logQuery(time.Unix(1700000001, 0).UTC(), "SELECT 2", "", "SELECT", 1, 0, "", "", "simple")
+	c.finishQueryMetrics(second)
+
+	if len(exec.entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(exec.entries))
+	}
+	for i, entry := range exec.entries {
+		if entry.QueryID == "" {
+			t.Fatalf("entry %d has no query_id", i)
+		}
+	}
+	if exec.entries[0].QueryID != exec.entries[1].QueryID {
+		t.Fatalf("events for one statement must share a query_id: %q vs %q",
+			exec.entries[0].QueryID, exec.entries[1].QueryID)
+	}
+	if exec.entries[2].QueryID == exec.entries[0].QueryID {
+		t.Fatalf("a new statement must get a new query_id, got %q twice", exec.entries[2].QueryID)
+	}
+}
+
+// TestLogQueryWithoutScopeMintsFreshQueryID covers the paths that log without
+// opening a metrics scope: they must not inherit a stale ID.
+func TestLogQueryWithoutScopeMintsFreshQueryID(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	scope := c.beginQueryMetrics(time.Unix(1700000000, 0).UTC())
+	c.logQuery(time.Unix(1700000000, 0).UTC(), "SELECT 1", "", "SELECT", 1, 0, "", "", "simple")
+	c.finishQueryMetrics(scope)
+
+	// No active scope now.
+	c.logQuery(time.Unix(1700000002, 0).UTC(), "SELECT 3", "", "SELECT", 1, 0, "", "", "simple")
+
+	if len(exec.entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(exec.entries))
+	}
+	if exec.entries[1].QueryID == "" {
+		t.Fatal("scope-less entry must still carry a query_id")
+	}
+	if exec.entries[1].QueryID == exec.entries[0].QueryID {
+		t.Fatalf("scope-less entry must not inherit the previous statement's id %q", exec.entries[0].QueryID)
+	}
+}
+
+// TestNewQueryIDIsTimeOrdered pins the UUIDv7 choice: IDs minted in sequence
+// must sort in arrival order so they cluster in the query log's time-ordered
+// partitions instead of scattering writes like a random UUID.
+func TestNewQueryIDIsTimeOrdered(t *testing.T) {
+	previous := ""
+	for i := range 50 {
+		id := newQueryID()
+		if id == "" {
+			t.Fatalf("query id %d is empty", i)
+		}
+		if previous != "" && id <= previous {
+			t.Fatalf("query id %d (%q) does not sort after %q", i, id, previous)
+		}
+		previous = id
+	}
+}
+
+func TestLogQueryBoundsTextBeforeExecutorQueryLogSink(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	query := "SELECT " + strings.Repeat("q", maxQueryLength) + " query-tail-marker"
+	transpiled := "SELECT " + strings.Repeat("t", maxQueryLength) + " transpiled-tail-marker"
+	exception := "engine error: " + strings.Repeat("e", maxQueryLength) + " exception-tail-marker"
+	c.logQuery(
+		time.Unix(1700000000, 0).UTC(),
+		query,
+		transpiled,
+		"SELECT",
+		0,
+		0,
+		"XX000",
+		exception,
+		"simple",
+	)
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected executor query-log sink to receive one entry, got %d", len(exec.entries))
+	}
+	entry := exec.entries[0]
+	if want := query[:maxQueryLength]; entry.Query != want {
+		t.Errorf("bounded query length = %d, want exact prefix length %d", len(entry.Query), len(want))
+	}
+	if want := exception[:maxQueryLength]; entry.Exception != want {
+		t.Errorf("bounded exception length = %d, want exact prefix length %d", len(entry.Exception), len(want))
+	}
+	if entry.TranspiledQuery == nil {
+		t.Fatal("expected transpiled query")
+	}
+	if got, want := *entry.TranspiledQuery, transpiled[:maxQueryLength]; got != want {
+		t.Errorf("bounded transpiled query length = %d, want exact prefix length %d", len(got), len(want))
+	}
+	if want := normalizeQueryHash(entry.Query); entry.NormalizedHash != want {
+		t.Errorf("normalized hash = %d, want hash of bounded query %d", entry.NormalizedHash, want)
+	}
+}
+
+func TestLogQueryRedactsBeforeBounding(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	const credential = "query-log-secret-marker"
+	query := strings.Repeat("SELECT 1; ", maxQueryLength/4) +
+		"CREATE SECRET s (TYPE S3, SECRET '" + credential + "')"
+	exception := "Parser Error: " + query
+	c.logQuery(time.Unix(1700000000, 0).UTC(), query, "", "SELECT", 0, 0, "42601", exception, "simple")
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected one query-log entry, got %d", len(exec.entries))
+	}
+	entry := exec.entries[0]
+	if want := usersecrets.RedactForLog(query); entry.Query != want {
+		t.Errorf("query was not redacted before bounding: got %q, want %q", entry.Query, want)
+	}
+	if want := usersecrets.RedactErrorForLog(query, exception); entry.Exception != want {
+		t.Errorf("exception was not redacted before bounding: got %q, want %q", entry.Exception, want)
+	}
+	if strings.Contains(entry.Query, credential) || strings.Contains(entry.Exception, credential) {
+		t.Fatal("bounded query-log entry leaked a credential")
+	}
+}
+
+func TestLogQueryPreservesTranspiledFlagWhenOnlyBoundedSuffixDiffers(t *testing.T) {
+	c, _, cleanup := newFeedbackClientConn(t)
+	defer cleanup()
+	exec := &captureQueryLogExecutor{}
+	c.executor = exec
+	c.server.cfg.QueryLog.Enabled = true
+
+	prefix := strings.Repeat("q", maxQueryLength)
+	c.logQuery(time.Unix(1700000000, 0).UTC(), prefix+" original", prefix+" transpiled", "SELECT", 0, 0, "", "", "simple")
+
+	if len(exec.entries) != 1 {
+		t.Fatalf("expected one query-log entry, got %d", len(exec.entries))
+	}
+	entry := exec.entries[0]
+	if !entry.IsTranspiled || entry.TranspiledQuery == nil {
+		t.Fatal("expected transpiled identity to be preserved after bounding")
+	}
+	if entry.Query != *entry.TranspiledQuery {
+		t.Fatalf("test requires bounded texts to match, got lengths %d and %d", len(entry.Query), len(*entry.TranspiledQuery))
 	}
 }

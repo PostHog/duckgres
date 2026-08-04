@@ -13,9 +13,14 @@ port: 5432
 # flight_handle_idle_ttl: "15m"
 # flight_session_token_ttl: "1h"
 
-# Max time to wait for worker acquisition and per-org connection-limit queue admission.
+# Max time to wait for worker acquisition and per-org/per-user vCPU resource admission.
 # Default: 60s
 # worker_queue_timeout: "60s"
+
+# Max queued/live admission identities whose cleanup ownership one control
+# plane may retain. New admissions are rejected before enqueue when full.
+# Default: 4096
+# admission_reclaimer_max_reservations: 4096
 
 # Directory for DuckDB database files (one per user)
 data_dir: "./data"
@@ -117,22 +122,13 @@ ducklake:
 #   max_workers: 0
 #   retire_on_session_end: false
 
-# Kubernetes multi-tenant shared warm-pool settings
+# Kubernetes multi-tenant worker settings. Workers are spawned on demand per org
+# (no warm pool) and reused while hot-idle until their TTL; the node-headroom
+# controller hides spawn latency. Headroom and client-sizing knobs are env-only
+# (DUCKGRES_K8S_*), see the README.
 # k8s:
-#   # Global cap for shared K8s workers. 0 leaves Duckgres uncapped.
+#   # Global cap for K8s workers. 0 leaves Duckgres uncapped.
 #   max_workers: 0
-#   # Neutral shared warm-worker target for the default worker image. Separate
-#   # from per-org limits and process.min_workers. 0 disables shared prewarming.
-#   shared_warm_target: 0
-#   # Dynamic warm capacity uses shared configstore miss buckets to raise
-#   # image-specific warm targets after recent no-idle misses.
-#   dynamic_warm_capacity_enabled: true
-#   warm_capacity_miss_window: "2m"
-#   warm_capacity_misses_per_worker: 8
-#   # Retain miss buckets at least as long as the miss window.
-#   warm_capacity_demand_ttl: "15m"
-#   warm_capacity_dynamic_image_ceiling: 0
-#   warm_capacity_dynamic_total_ceiling: 0
 
 # Process isolation (default: true)
 # Each client connection spawns a separate OS process, so a DuckDB crash
@@ -155,5 +151,5 @@ rate_limit:
   ban_duration: "15m"
   # Max concurrent connections from a single IP (0 = unlimited)
   max_connections_per_ip: 100
-  # Max total concurrent connections (0 = unlimited, default: CPUs * 2)
+  # Standalone mode max total concurrent connections (0 = unlimited, default: CPUs * 2)
   # max_connections: 16

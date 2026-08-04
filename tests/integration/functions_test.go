@@ -272,7 +272,21 @@ func TestFunctionsJSON(t *testing.T) {
 
 		// JSONB modification
 		{Name: "jsonb_set", Query: "SELECT jsonb_set('{\"a\": 1}'::JSONB, '{a}', '2')"},
+		// jsonb || semantics matrix (regression for #716: the old
+		// json_merge_patch rewrite replaced arrays instead of concatenating
+		// and deleted null-valued keys instead of keeping them). Each case is
+		// compared against real PostgreSQL output (jsonEqual is key-order
+		// insensitive; Postgres sorts jsonb keys, DuckDB does not).
 		{Name: "jsonb_concat", Query: "SELECT '{\"a\": 1}'::JSONB || '{\"b\": 2}'::JSONB"},
+		{Name: "jsonb_concat_null_value_kept", Query: "SELECT '{\"a\": 1}'::JSONB || '{\"a\": null}'::JSONB"},
+		{Name: "jsonb_concat_shallow_merge", Query: "SELECT '{\"a\": {\"x\": 1}}'::JSONB || '{\"a\": {\"y\": 2}}'::JSONB"},
+		{Name: "jsonb_concat_arrays", Query: "SELECT '[1, 2]'::JSONB || '[3, 4]'::JSONB"},
+		{Name: "jsonb_concat_array_append", Query: "SELECT '[1, 2]'::JSONB || '3'::JSONB"},
+		{Name: "jsonb_concat_array_prepend", Query: "SELECT '3'::JSONB || '[1, 2]'::JSONB"},
+		{Name: "jsonb_concat_scalars", Query: "SELECT '1'::JSONB || '2'::JSONB"},
+		{Name: "jsonb_concat_object_array", Query: "SELECT '{\"a\": 1}'::JSONB || '[1]'::JSONB"},
+		{Name: "jsonb_concat_json_null_element", Query: "SELECT 'null'::JSONB || '[1]'::JSONB"},
+		{Name: "jsonb_concat_sql_null", Query: "SELECT (NULL::JSONB || '[1]'::JSONB) IS NULL"},
 		{Name: "jsonb_delete_key", Query: "SELECT '{\"a\": 1, \"b\": 2}'::JSONB - 'a'"},
 
 		// Expansion functions

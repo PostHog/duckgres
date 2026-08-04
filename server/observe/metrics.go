@@ -1,6 +1,9 @@
 package observe
 
 import (
+	"sync"
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -17,6 +20,116 @@ func IncrementOpenConnections() { connectionsGauge.Inc() }
 
 // DecrementOpenConnections decrements the open connections gauge.
 func DecrementOpenConnections() { connectionsGauge.Dec() }
+
+// connectionDurationHistogram observes the full lifetime of a client
+// connection (accept → disconnect) in seconds, labelled by org. It complements
+// the duckgres_connections_open gauge: integrating that gauge over time
+// approximates total connection-time, but a coarse scrape interval undercounts
+// connections shorter than the scrape window. This histogram records every
+// connection's true lifetime, so `_sum` gives exact total connection-seconds
+// (per org) with no scrape bias and the buckets give the lifetime distribution.
+// Org is empty for single-tenant/standalone connections. Buckets span 1s
+// (health probes / short clients) to 24h (long-lived pooled connections).
+var connectionDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "duckgres_connection_duration_seconds",
+	Help:    "Client connection lifetime in seconds (accept to disconnect)",
+	Buckets: []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 18000, 36000, 86400},
+}, []string{"org"})
+
+// ObserveConnectionDuration records one completed connection's lifetime.
+func ObserveConnectionDuration(org string, seconds float64) {
+	connectionDurationHistogram.WithLabelValues(org).Observe(seconds)
+}
+
+// PostgreSQL session-start reasons are intentionally bounded. Alerting may
+// allowlist operator-actionable reasons, while client, lifecycle, transport,
+// and unknown failures remain available for diagnosis without paging.
+const (
+	SessionStartReasonNone          = "none"
+	SessionStartReasonCapacity      = "capacity"
+	SessionStartReasonWorker        = "worker"
+	SessionStartReasonMetadataStore = "metadata_store"
+	SessionStartReasonControlPlane  = "control_plane"
+	SessionStartReasonClient        = "client"
+	SessionStartReasonLifecycle     = "lifecycle"
+	SessionStartReasonCanceled      = "canceled"
+	SessionStartReasonTransport     = "transport"
+	SessionStartReasonUnknown       = "unknown"
+)
+
+var postgresSessionStartCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_postgres_session_start_total",
+	Help: "Terminal outcomes for authenticated PostgreSQL session starts after all server-side retries.",
+}, []string{"org", "outcome", "reason"})
+
+var sessionStartDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "duckgres_session_start_duration_seconds",
+	Help:    "Authenticated session bootstrap time through protocol readiness, partitioned by org, protocol, and terminal outcome.",
+	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
+}, []string{"org", "protocol", "outcome"})
+
+// SessionStartScope records one logical protocol bootstrap. Finish is
+// idempotent so a default-error defer can coexist with an explicit result.
+type SessionStartScope struct {
+	started  time.Time
+	org      string
+	protocol string
+	once     sync.Once
+}
+
+func BeginSessionStart(org, protocol string) *SessionStartScope {
+	switch protocol {
+	case "postgres":
+	default:
+		protocol = "unknown"
+	}
+	return &SessionStartScope{started: time.Now(), org: org, protocol: protocol}
+}
+
+func (s *SessionStartScope) Finish(outcome, reason string) {
+	if s == nil {
+		return
+	}
+	switch outcome {
+	case "success", "timeout", "canceled", "capacity", "draining", "error":
+	default:
+		outcome = "error"
+	}
+	terminalOutcome, reason := normalizePostgresSessionStartResult(outcome, reason)
+	s.once.Do(func() {
+		duration := time.Since(s.started)
+		if duration < 0 {
+			duration = 0
+		}
+		sessionStartDurationHistogram.WithLabelValues(s.org, s.protocol, outcome).Observe(duration.Seconds())
+		if s.protocol == "postgres" {
+			postgresSessionStartCounter.WithLabelValues(s.org, terminalOutcome, reason).Inc()
+		}
+	})
+}
+
+func normalizePostgresSessionStartResult(outcome, reason string) (string, string) {
+	if outcome == "success" {
+		return "success", SessionStartReasonNone
+	}
+
+	switch reason {
+	case SessionStartReasonCapacity,
+		SessionStartReasonWorker,
+		SessionStartReasonMetadataStore,
+		SessionStartReasonControlPlane,
+		SessionStartReasonClient,
+		SessionStartReasonLifecycle,
+		SessionStartReasonCanceled,
+		SessionStartReasonTransport,
+		SessionStartReasonUnknown:
+		return "failure", reason
+	default:
+		// A failed session must never be reported with reason=none, and newly
+		// added unclassified paths must stay outside paging allowlists.
+		return "failure", SessionStartReasonUnknown
+	}
+}
 
 // S3BytesReadTotal counts bytes read from S3 by DuckDB, labeled by org.
 // Bumped from EnrichSpanWithProfiling when DuckDB reports total_bytes_read
@@ -63,3 +176,70 @@ var MetadataPoolMaxConnections = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_ducklake_metadata_pool_max_connections",
 	Help: "Configured postgres_scanner pool ceiling for DuckLake metadata (pg_pool_max_connections).",
 }, []string{"org"})
+
+var queryLogBufferedEntries = promauto.NewGauge(prometheus.GaugeOpts{
+	Name: "duckgres_query_log_buffered_entries",
+	Help: "Current number of query-log entries buffered in memory before storage flush.",
+})
+
+var queryLogEnqueuedEntriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_log_enqueued_entries_total",
+	Help: "Total number of query-log entries accepted into the in-memory buffer.",
+})
+
+var queryLogFlushedEntriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_log_flushed_entries_total",
+	Help: "Total number of query-log entries flushed successfully to durable storage.",
+})
+
+var queryLogDroppedEntriesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_query_log_dropped_entries_total",
+	Help: "Total number of query-log entries dropped before reaching durable storage.",
+}, []string{"reason"})
+
+var queryLogFlushErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_query_log_flush_errors_total",
+	Help: "Total number of failed query-log storage flush attempts.",
+})
+
+var queryLogFlushDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+	Name:    "duckgres_query_log_flush_duration_seconds",
+	Help:    "Duration of query-log storage flush attempts in seconds.",
+	Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10},
+})
+
+func SetQueryLogBufferedEntries(entries int) {
+	if entries < 0 {
+		entries = 0
+	}
+	queryLogBufferedEntries.Set(float64(entries))
+}
+
+func IncQueryLogEnqueuedEntries() {
+	queryLogEnqueuedEntriesTotal.Inc()
+}
+
+func AddQueryLogFlushedEntries(entries int) {
+	if entries <= 0 {
+		return
+	}
+	queryLogFlushedEntriesTotal.Add(float64(entries))
+}
+
+func AddQueryLogDroppedEntries(reason string, entries int) {
+	if entries <= 0 {
+		return
+	}
+	queryLogDroppedEntriesTotal.WithLabelValues(reason).Add(float64(entries))
+}
+
+func IncQueryLogFlushErrors() {
+	queryLogFlushErrorsTotal.Inc()
+}
+
+func ObserveQueryLogFlushDuration(duration time.Duration) {
+	if duration < 0 {
+		duration = 0
+	}
+	queryLogFlushDurationHistogram.Observe(duration.Seconds())
+}

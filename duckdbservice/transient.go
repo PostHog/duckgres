@@ -16,7 +16,7 @@ import (
 // "cannot commit - no transaction is active" error.
 // BEGIN is excluded because it carries no transaction state and is safe to retry.
 func isTransactionControlStmt(query string) bool {
-	q := strings.TrimSpace(query)
+	q := stripLeadingSQLComments(query)
 	if len(q) == 0 {
 		return false
 	}
@@ -26,19 +26,49 @@ func isTransactionControlStmt(query string) bool {
 		strings.HasPrefix(upper, "END")
 }
 
+func isTransactionStartStmt(query string) bool {
+	upper := strings.ToUpper(stripLeadingSQLComments(query))
+	return strings.HasPrefix(upper, "BEGIN") ||
+		strings.HasPrefix(upper, "START")
+}
+
 func trackSQLTransactionState(query string, execErr error, sqlTxActive *atomic.Bool) {
-	upper := strings.ToUpper(strings.TrimSpace(query))
+	upper := strings.ToUpper(stripLeadingSQLComments(query))
 	if len(upper) == 0 {
 		return
 	}
-	if strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START") {
+	if isTransactionStartStmt(upper) {
 		if execErr == nil {
 			sqlTxActive.Store(true)
 		}
 		return
 	}
 	if isTransactionControlStmt(upper) {
-		sqlTxActive.Store(false)
+		if execErr == nil {
+			sqlTxActive.Store(false)
+		}
+	}
+}
+
+func stripLeadingSQLComments(query string) string {
+	q := strings.TrimSpace(query)
+	for {
+		switch {
+		case strings.HasPrefix(q, "--"):
+			newline := strings.IndexByte(q, '\n')
+			if newline < 0 {
+				return ""
+			}
+			q = strings.TrimSpace(q[newline+1:])
+		case strings.HasPrefix(q, "/*"):
+			end := strings.Index(q[2:], "*/")
+			if end < 0 {
+				return q
+			}
+			q = strings.TrimSpace(q[end+4:])
+		default:
+			return q
+		}
 	}
 }
 
@@ -60,7 +90,15 @@ func isTransientDuckLakeError(err error) bool {
 		strings.Contains(msg, "SSL connection has been closed unexpectedly") ||
 		strings.Contains(msg, "Current transaction is aborted") ||
 		strings.Contains(msg, "no route to host") ||
-		strings.Contains(msg, "network is unreachable")
+		strings.Contains(msg, "network is unreachable") ||
+		// Concurrent first ATTACHes for a fresh org race the DuckLake
+		// metadata-store schema init: both workers CREATE the ducklake_*
+		// tables, the loser hits a Postgres catalog unique constraint
+		// (e.g. pg_type_typname_nsp_index on ducklake_metadata), and a
+		// retry succeeds because the winner's schema now exists. Guarded
+		// on "ducklake" so user-data duplicate keys are never retried.
+		(strings.Contains(msg, "duplicate key value violates unique constraint") &&
+			strings.Contains(msg, "ducklake"))
 }
 
 const (
@@ -141,6 +179,10 @@ func isDuckLakeTransactionConflict(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "Transaction conflict")
+}
+
+func shouldRetryDuckLakeConflict(err error, inTransaction bool) bool {
+	return !inTransaction && isDuckLakeTransactionConflict(err)
 }
 
 const (

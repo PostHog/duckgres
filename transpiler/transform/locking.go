@@ -20,20 +20,37 @@ func (t *LockingTransform) Name() string {
 func (t *LockingTransform) Transform(tree *pg_query.ParseResult, result *Result) (bool, error) {
 	changed := false
 
-	for _, stmt := range tree.Stmts {
-		if stmt.Stmt == nil {
-			continue
-		}
-
-		switch n := stmt.Stmt.Node.(type) {
-		case *pg_query.Node_SelectStmt:
-			if n.SelectStmt != nil && len(n.SelectStmt.LockingClause) > 0 {
-				// Strip the locking clause
-				n.SelectStmt.LockingClause = nil
+	// Locking clauses can appear at any depth (subquery, CTE, EXISTS sublink,
+	// set-operation arm), and DuckDB rejects them all.
+	WalkFunc(tree, func(node *pg_query.Node) bool {
+		if sel := node.GetSelectStmt(); sel != nil {
+			if stripLockingClauses(sel) {
 				changed = true
 			}
 		}
-	}
+		return true
+	})
 
 	return changed, nil
+}
+
+// stripLockingClauses clears the locking clause on sel and on its
+// set-operation arms. walkSelectStmt recurses into Larg/Rarg without invoking
+// the visitor on them, so the arms must be handled here.
+func stripLockingClauses(sel *pg_query.SelectStmt) bool {
+	if sel == nil {
+		return false
+	}
+	changed := false
+	if len(sel.LockingClause) > 0 {
+		sel.LockingClause = nil
+		changed = true
+	}
+	if stripLockingClauses(sel.Larg) {
+		changed = true
+	}
+	if stripLockingClauses(sel.Rarg) {
+		changed = true
+	}
+	return changed
 }

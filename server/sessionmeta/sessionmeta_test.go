@@ -2,13 +2,11 @@ package sessionmeta
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/posthog/duckgres/server/sqlcore"
 )
 
@@ -200,7 +198,6 @@ func TestBuildSessionMetadataSQLContainsAllExpectedStatements(t *testing.T) {
 
 	wants := []string{
 		"CREATE TABLE IF NOT EXISTS main.__duckgres_column_metadata",
-		"CREATE TABLE IF NOT EXISTS main.__duckgres_iceberg_column_metadata",
 		"CREATE OR REPLACE VIEW main.pg_database",
 		"CREATE OR REPLACE VIEW main.information_schema_columns_compat",
 		"CREATE OR REPLACE VIEW main.information_schema_tables_compat",
@@ -216,117 +213,5 @@ func TestBuildSessionMetadataSQLContainsAllExpectedStatements(t *testing.T) {
 	// Database literal should appear (used in pg_database view).
 	if !strings.Contains(got, "'analytics'") {
 		t.Errorf("buildSessionMetadataSQL did not interpolate database literal")
-	}
-}
-
-func TestInformationSchemaColumnsCompatUsesLoadedIcebergColumnsAndFiltersDummy(t *testing.T) {
-	got := buildSessionInformationSchemaColumnsViewSQL()
-
-	for _, want := range []string{
-		"WITH all_columns AS",
-		"FROM main.__duckgres_iceberg_column_metadata",
-		"c.table_catalog = 'iceberg'",
-		"c.column_name = '__'",
-		"UPPER(c.data_type) = 'UNKNOWN'",
-		"UNION ALL",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("columns compat SQL missing %q in:\n%s", want, got)
-		}
-	}
-	if count := strings.Count(got, " AS table_catalog"); count != 2 {
-		t.Fatalf("columns compat SQL should project table_catalog only for native and loaded CTE sources, got %d occurrences in:\n%s", count, got)
-	}
-}
-
-func TestInformationSchemaColumnsCompatLoadedIcebergColumnsKeepIcebergCatalog(t *testing.T) {
-	got := buildSessionInformationSchemaColumnsViewSQL()
-	if !strings.Contains(got, "'iceberg' AS table_catalog") {
-		t.Fatalf("loaded Iceberg columns should use the iceberg catalog in:\n%s", got)
-	}
-	if strings.Contains(got, "current_database() AS table_catalog,\n\t\t\t\ttable_schema") {
-		t.Fatalf("loaded Iceberg columns should not use current_database() as table_catalog in:\n%s", got)
-	}
-}
-
-func TestInformationSchemaColumnsCompatPrefersLoadedIcebergMetadata(t *testing.T) {
-	db, err := sql.Open("duckdb", ":memory:")
-	if err != nil {
-		t.Fatalf("open duckdb: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	stmts := []string{
-		`ATTACH ':memory:' AS iceberg`,
-		`CREATE OR REPLACE TEMP MACRO current_database() AS 'iceberg'`,
-		`CREATE SCHEMA iceberg.stripe`,
-		`CREATE TABLE iceberg.stripe.account (requirements_currently_due INTEGER)`,
-		sessionColumnMetadataTableSQL(),
-		sessionIcebergColumnMetadataTableSQL(),
-		`INSERT INTO main.__duckgres_iceberg_column_metadata (
-			table_schema,
-			table_name,
-			column_name,
-			ordinal_position,
-			is_nullable,
-			data_type,
-			character_maximum_length,
-			character_octet_length,
-			numeric_precision,
-			numeric_scale,
-			datetime_precision
-		) VALUES (
-			'stripe',
-			'account',
-			'requirements_currently_due',
-			1,
-			'YES',
-			'STRUCT(currently_due VARCHAR[])',
-			NULL,
-			NULL,
-			NULL,
-			NULL,
-			NULL
-		)`,
-		buildSessionInformationSchemaColumnsViewSQL(),
-	}
-	for _, stmt := range stmts {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("exec %q: %v", stmt, err)
-		}
-	}
-
-	var dataType string
-	err = db.QueryRow(`
-		SELECT data_type
-		FROM main.information_schema_columns_compat
-		WHERE table_catalog = 'iceberg'
-		AND table_schema = 'stripe'
-		AND table_name = 'account'
-		AND column_name = 'requirements_currently_due'
-	`).Scan(&dataType)
-	if err != nil {
-		t.Fatalf("query compat data_type: %v", err)
-	}
-	if dataType != "json" {
-		t.Fatalf("data_type = %q, want json from loaded Iceberg metadata", dataType)
-	}
-}
-
-func TestInformationSchemaColumnsCompatSuppressesNativeIcebergDuplicatesExplicitly(t *testing.T) {
-	got := buildSessionInformationSchemaColumnsViewSQL()
-	for _, want := range []string{
-		"AND NOT (",
-		"FROM main.__duckgres_iceberg_column_metadata im",
-		"WHERE im.table_schema = c.table_schema",
-		"AND im.table_name = c.table_name",
-		"AND im.column_name = c.column_name",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("columns compat SQL should explicitly suppress native Iceberg duplicates; missing %q in:\n%s", want, got)
-		}
-	}
-	if strings.Contains(got, "source_priority") {
-		t.Fatalf("columns compat SQL should not rely on hidden source_priority ranking in:\n%s", got)
 	}
 }

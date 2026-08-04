@@ -10,18 +10,23 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
 type fakeAPIStore struct {
-	orgs       map[string]*configstore.Org
-	users      map[string]*configstore.OrgUser
-	warehouses map[string]*configstore.ManagedWarehouse
+	orgs                map[string]*configstore.Org
+	users               map[string]*configstore.OrgUser
+	warehouses          map[string]*configstore.ManagedWarehouse
+	teams               map[string]map[int64]*configstore.OrgTeam
+	reloadSnapshotCalls int
+	reloadSnapshotErr   error
 }
 
 func newFakeAPIStore() *fakeAPIStore {
@@ -29,6 +34,7 @@ func newFakeAPIStore() *fakeAPIStore {
 		orgs:       make(map[string]*configstore.Org),
 		users:      make(map[string]*configstore.OrgUser),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
+		teams:      make(map[string]map[int64]*configstore.OrgTeam),
 	}
 }
 
@@ -40,13 +46,19 @@ func (s *fakeAPIStore) ListOrgs() ([]configstore.Org, error) {
 	return orgs, nil
 }
 
-func (s *fakeAPIStore) CreateOrg(org *configstore.Org) error {
+func (s *fakeAPIStore) CreateOrg(org *configstore.Org, teamID int64, schemaName string) error {
 	if _, ok := s.orgs[org.Name]; ok {
 		return errors.New("duplicate org")
+	}
+	for _, t := range s.teams[org.Name] {
+		if t.SchemaName == schemaName {
+			return configstore.ErrOrgTeamSchemaConflict
+		}
 	}
 	clone := copyOrg(org)
 	clone.Warehouse = nil
 	s.orgs[org.Name] = clone
+	s.seedTeam(configstore.OrgTeam{OrgID: org.Name, TeamID: teamID, SchemaName: schemaName, Enabled: true})
 	return nil
 }
 
@@ -64,14 +76,15 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		return nil, false, nil
 	}
 	org.MaxWorkers = updates.MaxWorkers
-	org.MemoryBudget = updates.MemoryBudget
-	org.IdleTimeoutS = updates.IdleTimeoutS
-	org.MaxConnections = updates.MaxConnections
-	if updates.WorkerCPURequest != "" {
-		org.WorkerCPURequest = updates.WorkerCPURequest
-	}
-	if updates.WorkerMemoryRequest != "" {
-		org.WorkerMemoryRequest = updates.WorkerMemoryRequest
+	org.MaxVCPUs = updates.MaxVCPUs
+	// Mirrors gormAPIStore: written unconditionally so "" clears (the handler
+	// presence-merge already preserved omitted fields).
+	org.DefaultWorkerCPU = updates.DefaultWorkerCPU
+	org.DefaultWorkerMemory = updates.DefaultWorkerMemory
+	org.DefaultWorkerTTL = updates.DefaultWorkerTTL
+	org.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
+	if updates.DataImportsTableNamingVersion != "" {
+		org.DataImportsTableNamingVersion = updates.DataImportsTableNamingVersion
 	}
 	if updates.HostnameAlias != nil {
 		if *updates.HostnameAlias == "" {
@@ -88,9 +101,91 @@ func (s *fakeAPIStore) DeleteOrg(name string) (bool, error) {
 	if _, ok := s.orgs[name]; !ok {
 		return false, nil
 	}
-	delete(s.orgs, name)
+	// Only a non-terminal warehouse row blocks deletion; a "deleted" row (infra
+	// torn down by the provisioner) is cascaded away so the name is released.
+	if wh, ok := s.warehouses[name]; ok && wh.State != configstore.ManagedWarehouseStateDeleted {
+		return false, errWarehouseStillExists
+	}
 	delete(s.warehouses, name)
+	delete(s.orgs, name)
 	return true, nil
+}
+
+func (s *fakeAPIStore) seedTeam(team configstore.OrgTeam) {
+	if s.teams[team.OrgID] == nil {
+		s.teams[team.OrgID] = make(map[int64]*configstore.OrgTeam)
+	}
+	clone := team
+	s.teams[team.OrgID][team.TeamID] = &clone
+}
+
+func (s *fakeAPIStore) ListAllOrgTeams() ([]configstore.OrgTeam, error) {
+	var out []configstore.OrgTeam
+	for _, orgTeams := range s.teams {
+		for _, t := range orgTeams {
+			out = append(out, *t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OrgID != out[j].OrgID {
+			return out[i].OrgID < out[j].OrgID
+		}
+		return out[i].TeamID < out[j].TeamID
+	})
+	return out, nil
+}
+
+func (s *fakeAPIStore) CreateOrgTeam(orgID string, team *configstore.OrgTeam) error {
+	if _, ok := s.orgs[orgID]; !ok {
+		return gorm.ErrRecordNotFound
+	}
+	if _, ok := s.teams[orgID][team.TeamID]; ok {
+		return errOrgTeamExists
+	}
+	for _, t := range s.teams[orgID] {
+		if t.SchemaName == team.SchemaName {
+			return configstore.ErrOrgTeamSchemaConflict
+		}
+	}
+	team.OrgID = orgID
+	s.seedTeam(*team)
+	return nil
+}
+
+func (s *fakeAPIStore) UpdateOrgTeam(orgID string, teamID int64, upd orgTeamUpdate) (*configstore.OrgTeam, *configstore.OrgTeam, error) {
+	team, ok := s.teams[orgID][teamID]
+	if !ok {
+		return nil, nil, configstore.ErrOrgTeamNotFound
+	}
+	prev := *team
+	if upd.SchemaName != nil && *upd.SchemaName != team.SchemaName {
+		for _, t := range s.teams[orgID] {
+			if t.TeamID != teamID && t.SchemaName == *upd.SchemaName {
+				return nil, nil, configstore.ErrOrgTeamSchemaConflict
+			}
+		}
+		team.SchemaName = *upd.SchemaName
+	}
+	if upd.Enabled != nil {
+		team.Enabled = *upd.Enabled
+	}
+	if upd.Backfill != nil {
+		team.BackfillEnabled = upd.Backfill
+	}
+	if upd.EventsTableNameSet {
+		team.EventsTableName = upd.EventsTableName
+	}
+	if upd.PersonsTableNameSet {
+		team.PersonsTableName = upd.PersonsTableName
+	}
+	if upd.SchemaDataImportsNameSet {
+		team.SchemaDataImportsName = upd.SchemaDataImportsName
+	}
+	if upd.EarliestEventDateSet {
+		team.EarliestEventDate = upd.EarliestEventDate
+	}
+	clone := *team
+	return &prev, &clone, nil
 }
 
 func (s *fakeAPIStore) ListUsers() ([]configstore.OrgUser, error) {
@@ -122,7 +217,7 @@ func (s *fakeAPIStore) GetUser(orgID, username string) (*configstore.OrgUser, er
 	return &clone, nil
 }
 
-func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, defaultCatalog *string) (*configstore.OrgUser, bool, error) {
+func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthrough *bool, maxVCPUs *int) (*configstore.OrgUser, bool, error) {
 	key := orgID + "/" + username
 	user, ok := s.users[key]
 	if !ok {
@@ -134,8 +229,8 @@ func (s *fakeAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	if passthrough != nil {
 		user.Passthrough = *passthrough
 	}
-	if defaultCatalog != nil {
-		user.DefaultCatalog = *defaultCatalog
+	if maxVCPUs != nil {
+		user.MaxVCPUs = *maxVCPUs
 	}
 	clone := *user
 	return &clone, true, nil
@@ -148,6 +243,35 @@ func (s *fakeAPIStore) DeleteUser(orgID, username string) (bool, error) {
 	}
 	delete(s.users, key)
 	return true, nil
+}
+
+func (s *fakeAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error) {
+	if !configstore.IsProjectScopedAccessMode(accessMode) {
+		return nil, fmt.Errorf("access mode %q is not project-scoped", accessMode)
+	}
+	team := s.teams[orgID][teamID]
+	if team == nil || !team.Enabled {
+		return nil, configstore.ErrProjectTeamUnavailable
+	}
+	boundTeamID := teamID
+	passwordHash, err := configstore.HashPassword(password)
+	if err != nil {
+		return nil, err
+	}
+	user := &configstore.OrgUser{
+		OrgID:      orgID,
+		Username:   username,
+		Password:   passwordHash,
+		AccessMode: accessMode,
+		TeamID:     &boundTeamID,
+	}
+	s.users[orgID+"/"+username] = user
+	return user, nil
+}
+
+func (s *fakeAPIStore) ReloadSnapshot() error {
+	s.reloadSnapshotCalls++
+	return s.reloadSnapshotErr
 }
 
 func (s *fakeAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -189,38 +313,6 @@ func (s *fakeAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configs
 	return copyWarehouse(clone), true, nil
 }
 
-func (s *fakeAPIStore) GetGlobalConfig() (configstore.GlobalConfig, error) {
-	return configstore.GlobalConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveGlobalConfig(cfg *configstore.GlobalConfig) error {
-	return nil
-}
-
-func (s *fakeAPIStore) GetDuckLakeConfig() (configstore.DuckLakeConfig, error) {
-	return configstore.DuckLakeConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveDuckLakeConfig(cfg *configstore.DuckLakeConfig) error {
-	return nil
-}
-
-func (s *fakeAPIStore) GetRateLimitConfig() (configstore.RateLimitConfig, error) {
-	return configstore.RateLimitConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveRateLimitConfig(cfg *configstore.RateLimitConfig) error {
-	return nil
-}
-
-func (s *fakeAPIStore) GetQueryLogConfig() (configstore.QueryLogConfig, error) {
-	return configstore.QueryLogConfig{}, nil
-}
-
-func (s *fakeAPIStore) SaveQueryLogConfig(cfg *configstore.QueryLogConfig) error {
-	return nil
-}
-
 func copyWarehouse(warehouse *configstore.ManagedWarehouse) *configstore.ManagedWarehouse {
 	if warehouse == nil {
 		return nil
@@ -247,24 +339,29 @@ func copyOrg(org *configstore.Org) *configstore.Org {
 func newTestAPIRouter(store apiStore) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	registerAPIWithStore(r.Group("/api/v1"), store, nil)
+	registerAPIWithStore(r.Group("/api/v1"), store, nil, nil)
+	return r
+}
+
+// newTestAPIRouterWithFetcher is newTestAPIRouter plus a PeerFetcher, for
+// tests asserting the create/update/delete user reload + peer fan-out.
+func newTestAPIRouterWithFetcher(store apiStore, fetcher PeerFetcher) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	registerAPIWithStore(r.Group("/api/v1"), store, nil, fetcher)
 	return r
 }
 
 func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	warehouse := &configstore.ManagedWarehouse{
-		OrgID: name,
+		OrgID:        name,
+		DucklingName: name,
 		WarehouseDatabase: configstore.ManagedWarehouseDatabase{
-			Region:       "us-east-1",
-			Endpoint:     fmt.Sprintf("%s.cluster.example", name),
-			Port:         5432,
-			DatabaseName: name + "_warehouse",
-			Username:     "warehouse_user",
+			Endpoint: fmt.Sprintf("%s.cluster.example", name),
+			Port:     5432,
 		},
 		MetadataStore: configstore.ManagedWarehouseMetadataStore{
 			Kind:         "dedicated_rds",
-			Engine:       "postgres",
-			Region:       "us-east-1",
 			Endpoint:     fmt.Sprintf("%s-metadata.cluster.example", name),
 			Port:         5432,
 			DatabaseName: name + "_metadata",
@@ -277,9 +374,8 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 			PathPrefix: name + "/ducklake/",
 		},
 		WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
-			Namespace:          "duckgres",
-			ServiceAccountName: name + "-worker",
-			IAMRoleARN:         "arn:aws:iam::123456789012:role/" + name + "-worker",
+			Namespace:  "duckgres",
+			IAMRoleARN: "arn:aws:iam::123456789012:role/" + name + "-worker",
 		},
 		WarehouseDatabaseCredentials: configstore.SecretRef{
 			Namespace: "duckgres",
@@ -301,12 +397,11 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 			Name:      name + "-runtime",
 			Key:       "duckgres.yaml",
 		},
-		State:                  configstore.ManagedWarehouseStateReady,
-		WarehouseDatabaseState: configstore.ManagedWarehouseStateReady,
-		MetadataStoreState:     configstore.ManagedWarehouseStateReady,
-		S3State:                configstore.ManagedWarehouseStateReady,
-		IdentityState:          configstore.ManagedWarehouseStateReady,
-		SecretsState:           configstore.ManagedWarehouseStateReady,
+		State:              configstore.ManagedWarehouseStateReady,
+		MetadataStoreState: configstore.ManagedWarehouseStateReady,
+		S3State:            configstore.ManagedWarehouseStateReady,
+		IdentityState:      configstore.ManagedWarehouseStateReady,
+		SecretsState:       configstore.ManagedWarehouseStateReady,
 	}
 	store.orgs[name] = &configstore.Org{
 		Name:      name,
@@ -315,13 +410,16 @@ func seedOrgWithWarehouse(store *fakeAPIStore, name string) {
 	store.warehouses[name] = warehouse
 }
 
-func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
+func TestCreateUserIgnoresRemovedDefaultCatalogField(t *testing.T) {
+	// default_catalog was removed with Iceberg support. The users endpoints do
+	// not reject unknown JSON fields, so a legacy body carrying it still
+	// creates the user — the field is just silently ignored.
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
 		"org_id": "analytics",
-		"username": "iceberg_reader",
+		"username": "reader",
 		"password": "secret",
 		"default_catalog": "iceberg"
 	}`)
@@ -333,32 +431,50 @@ func TestCreateUserAcceptsDefaultCatalog(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	user := store.users["analytics/iceberg_reader"]
-	if user == nil {
+	if store.users["analytics/reader"] == nil {
 		t.Fatal("expected user to be created")
 	}
-	if user.DefaultCatalog != "iceberg" {
-		t.Fatalf("DefaultCatalog = %q, want iceberg", user.DefaultCatalog)
-	}
-
-	var response configstore.OrgUser
-	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("unmarshal response: %v", err)
-	}
-	if response.DefaultCatalog != "iceberg" {
-		t.Fatalf("response DefaultCatalog = %q, want iceberg", response.DefaultCatalog)
+	if bytes.Contains(rec.Body.Bytes(), []byte("default_catalog")) {
+		t.Fatalf("response must not echo removed default_catalog field: %s", rec.Body.String())
 	}
 }
 
-func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
+func TestCreateUserAcceptsMaxVCPUs(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
 		"org_id": "analytics",
-		"username": "iceberg_reader",
+		"username": "analyst",
 		"password": "secret",
-		"default_catalog": "iceberg;DROP TABLE x"
+		"max_vcpus": 8
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	user := store.users["analytics/analyst"]
+	if user == nil {
+		t.Fatal("expected user to be created")
+	}
+	if user.MaxVCPUs != 8 {
+		t.Fatalf("MaxVCPUs = %d, want 8", user.MaxVCPUs)
+	}
+}
+
+func TestCreateUserRejectsNegativeMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{
+		"org_id": "analytics",
+		"username": "analyst",
+		"password": "secret",
+		"max_vcpus": -1
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -373,47 +489,478 @@ func TestCreateUserRejectsInvalidDefaultCatalog(t *testing.T) {
 	}
 }
 
-func TestUpdateUserDefaultCatalogPreserveSetAndClear(t *testing.T) {
+func TestUpdateUserMaxVCPUs(t *testing.T) {
 	store := newFakeAPIStore()
-	store.users["analytics/iceberg_reader"] = &configstore.OrgUser{
-		OrgID:          "analytics",
-		Username:       "iceberg_reader",
-		Password:       "hash",
-		DefaultCatalog: "iceberg",
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
 	}
 	router := newTestAPIRouter(store)
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"passthrough":true}`)))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":12}`)))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("preserve status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
-		t.Fatalf("preserved DefaultCatalog = %q, want iceberg", got)
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 12 {
+		t.Fatalf("MaxVCPUs = %d, want 12", got)
 	}
+}
 
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":"iceberg"}`)))
+func TestUpdateUserMaxVCPUsCanClearToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":0}`)))
 	req.Header.Set("Content-Type", "application/json")
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("set status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "iceberg" {
-		t.Fatalf("updated DefaultCatalog = %q, want iceberg", got)
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 0 {
+		t.Fatalf("MaxVCPUs = %d, want 0", got)
 	}
+}
 
-	req = httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/iceberg_reader", bytes.NewReader([]byte(`{"default_catalog":""}`)))
+func TestUpdateUserMaxVCPUsNullClearsToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":null}`)))
 	req.Header.Set("Content-Type", "application/json")
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("clear status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if got := store.users["analytics/iceberg_reader"].DefaultCatalog; got != "" {
-		t.Fatalf("cleared DefaultCatalog = %q, want empty", got)
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 0 {
+		t.Fatalf("MaxVCPUs = %d, want 0", got)
+	}
+}
+
+func TestUpdateUserOmittingMaxVCPUsPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"passthrough":true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 12 {
+		t.Fatalf("MaxVCPUs = %d, want preserved 12", got)
+	}
+}
+
+func TestUpdateUserRejectsNegativeMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	store.users["analytics/analyst"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "analyst",
+		Password: "hash",
+		MaxVCPUs: 12,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/analyst", bytes.NewReader([]byte(`{"max_vcpus":-1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := store.users["analytics/analyst"].MaxVCPUs; got != 12 {
+		t.Fatalf("MaxVCPUs changed to %d, want preserved 12", got)
+	}
+}
+
+// Passthrough bypasses the compat layer that enforces the project scope, so
+// neither scoped mode may take it — a project user especially, since it would
+// pair unscoped SQL with write authorization.
+func TestUpdateUserRejectsPassthroughForProjectScopedUsers(t *testing.T) {
+	for _, mode := range []string{
+		configstore.OrgUserAccessModeProjectReader,
+		configstore.OrgUserAccessModeProjectUser,
+	} {
+		t.Run(mode, func(t *testing.T) {
+			teamID := int64(42)
+			store := newFakeAPIStore()
+			store.users["analytics/scoped"] = &configstore.OrgUser{
+				OrgID:       "analytics",
+				Username:    "scoped",
+				Password:    "hash",
+				AccessMode:  mode,
+				TeamID:      &teamID,
+				Passthrough: false,
+			}
+			router := newTestAPIRouter(store)
+
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/scoped", bytes.NewReader([]byte(`{"passthrough":true}`)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if store.users["analytics/scoped"].Passthrough {
+				t.Fatalf("%s must remain non-passthrough", mode)
+			}
+		})
+	}
+}
+
+func TestUpdateUserIgnoresRemovedDefaultCatalogField(t *testing.T) {
+	// default_catalog was removed with Iceberg support: a legacy update body
+	// carrying it still succeeds (unknown fields are ignored on the users
+	// endpoints) and other fields in the same body are applied.
+	store := newFakeAPIStore()
+	store.users["analytics/reader"] = &configstore.OrgUser{
+		OrgID:    "analytics",
+		Username: "reader",
+		Password: "hash",
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/users/reader", bytes.NewReader([]byte(`{"default_catalog":"iceberg","passthrough":true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !store.users["analytics/reader"].Passthrough {
+		t.Fatal("expected passthrough=true to be applied alongside the ignored field")
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("default_catalog")) {
+		t.Fatalf("response must not echo removed default_catalog field: %s", rec.Body.String())
+	}
+}
+
+// TestUserCRUDReloadsSnapshotAndNotifiesPeers covers create/update/delete: each
+// must reload THIS replica's snapshot immediately (bypassing the poll
+// interval) and fan the same reload out to every other CP replica, mirroring
+// the disable/enable reload pattern — so a freshly created/updated/deleted
+// user is authable cluster-wide right away instead of on each replica's next
+// poll tick.
+func TestUserCRUDReloadsSnapshotAndNotifiesPeers(t *testing.T) {
+	const reloadPath = "/api/v1/internal/reload-snapshot"
+
+	cases := []struct {
+		name    string
+		method  string
+		path    string
+		body    string
+		preseed bool // seed an existing "analytics/reader" row before the request
+	}{
+		{"create", http.MethodPost, "/api/v1/users", `{"org_id":"analytics","username":"reader","password":"secret"}`, false},
+		{"update", http.MethodPut, "/api/v1/orgs/analytics/users/reader", `{"passthrough":true}`, true},
+		{"delete", http.MethodDelete, "/api/v1/orgs/analytics/users/reader", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			if tc.preseed {
+				store.users["analytics/reader"] = &configstore.OrgUser{OrgID: "analytics", Username: "reader", Password: "hash"}
+			}
+			fetcher := &fakePeerFetcher{}
+			router := newTestAPIRouterWithFetcher(store, fetcher)
+
+			var body *bytes.Reader
+			if tc.body != "" {
+				body = bytes.NewReader([]byte(tc.body))
+			} else {
+				body = bytes.NewReader(nil)
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code < 200 || rec.Code >= 300 {
+				t.Fatalf("status = %d, want 2xx: %s", rec.Code, rec.Body.String())
+			}
+			if store.reloadSnapshotCalls != 1 {
+				t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+			}
+			if got := fetcher.postCallCount(); got != 1 {
+				t.Fatalf("peer fan-out POSTs = %d, want 1", got)
+			}
+			fetcher.mu.Lock()
+			paths := append([]string(nil), fetcher.postPaths...)
+			fetcher.mu.Unlock()
+			if len(paths) != 1 || paths[0] != reloadPath {
+				t.Fatalf("peer fan-out path = %v, want [%s]", paths, reloadPath)
+			}
+		})
+	}
+}
+
+// TestUserCRUDSkipsPeerFanOutWithoutFetcher: a single-CP deployment (no
+// PeerFetcher wired) must still reload locally and must not panic.
+func TestUserCRUDSkipsPeerFanOutWithoutFetcher(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"org_id":"analytics","username":"reader","password":"secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+	}
+}
+
+// TestUserCRUDPeerFanOutIsBestEffort: the DB write must succeed even when no
+// peer answers the fan-out (PostPeers already degrades gracefully — this just
+// proves the handler doesn't treat an empty peer response as an error).
+func TestUserCRUDPeerFanOutIsBestEffort(t *testing.T) {
+	store := newFakeAPIStore()
+	fetcher := &fakePeerFetcher{} // no bodies configured for any path
+	router := newTestAPIRouterWithFetcher(store, fetcher)
+
+	body := []byte(`{"org_id":"analytics","username":"reader","password":"secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if store.users["analytics/reader"] == nil {
+		t.Fatal("expected user to be created despite no peer responding")
+	}
+}
+
+// TestUserCRUDReturnsErrorWhenLocalReloadFails: mirrors disable/enable — a
+// failed LOCAL reload surfaces as a request error even though the write
+// already landed (the caller needs to know the change may not be immediately
+// visible on this replica).
+func TestUserCRUDReturnsErrorWhenLocalReloadFails(t *testing.T) {
+	store := newFakeAPIStore()
+	store.reloadSnapshotErr = errors.New("reload failed")
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"org_id":"analytics","username":"reader","password":"secret"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/users", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+	if store.users["analytics/reader"] == nil {
+		t.Fatal("expected the user row to still be created even though the reload response errored")
+	}
+}
+
+// TestReloadSnapshotEndpoint covers the peer-fan-out target itself: it reloads
+// and returns 200, or surfaces a reload error as 500.
+func TestReloadSnapshotEndpoint(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/internal/reload-snapshot", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+	}
+
+	store.reloadSnapshotErr = errors.New("boom")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/internal/reload-snapshot", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+}
+
+func TestUpsertProjectReaderBindsEnabledTeamAndReloadsSnapshot(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/project-reader", nil)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["username"] != "posthog_team_42" || body["password"] == "" {
+		t.Fatalf("unexpected credentials response: %v", body)
+	}
+	user := store.users["acme/posthog_team_42"]
+	if user == nil || user.TeamID == nil || *user.TeamID != 42 || user.AccessMode != configstore.OrgUserAccessModeProjectReader {
+		t.Fatalf("project reader was not bound to team 42: %#v", user)
+	}
+	if user.Passthrough {
+		t.Fatal("project readers must never use passthrough mode")
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 1", store.reloadSnapshotCalls)
+	}
+}
+
+// The read/write login is a SEPARATE credential from the reader: a distinct
+// username, its own row, and no effect on the reader the SQL editor uses. A
+// team holding both at once is the expected steady state.
+func TestUpsertProjectUserMintsDistinctReadWriteLogin(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	for _, route := range []string{"project-reader", "project-user"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/"+route, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d: %s", route, rec.Code, http.StatusOK, rec.Body.String())
+		}
+	}
+
+	reader := store.users["acme/posthog_team_42"]
+	if reader == nil || reader.AccessMode != configstore.OrgUserAccessModeProjectReader {
+		t.Fatalf("reader row missing or re-moded: %#v", reader)
+	}
+	writer := store.users["acme/posthog_team_42_rw"]
+	if writer == nil || writer.AccessMode != configstore.OrgUserAccessModeProjectUser {
+		t.Fatalf("project user was not created as project_user: %#v", writer)
+	}
+	if writer.TeamID == nil || *writer.TeamID != 42 {
+		t.Fatalf("project user was not bound to team 42: %#v", writer)
+	}
+	if writer.Passthrough {
+		t.Fatal("project users must never use passthrough mode")
+	}
+	if reader.Password == writer.Password {
+		t.Fatal("reader and project user must not share a credential")
+	}
+}
+
+func TestUpsertProjectUserReportsAccessMode(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 7, SchemaName: "team_7", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/7/project-user", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["username"] != "posthog_team_7_rw" {
+		t.Fatalf("username = %v, want posthog_team_7_rw", body["username"])
+	}
+	if body["access_mode"] != configstore.OrgUserAccessModeProjectUser {
+		t.Fatalf("access_mode = %v, want %s", body["access_mode"], configstore.OrgUserAccessModeProjectUser)
+	}
+	if body["password"] == "" || body["password"] == nil {
+		t.Fatal("response carried no password")
+	}
+}
+
+func TestUpsertProjectUserRejectsDisabledTeam(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: false})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/project-user", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if len(store.users) != 0 {
+		t.Fatal("disabled team must not receive a project user")
+	}
+}
+
+func TestUpsertProjectReaderRejectsDisabledTeam(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: false})
+	router := newTestAPIRouter(store)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme/teams/42/project-reader", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if len(store.users) != 0 {
+		t.Fatal("disabled team must not receive a project reader")
+	}
+}
+
+func TestUpsertProjectReaderAcceptsCallerManagedPassword(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newTestAPIRouter(store)
+	password := "caller-managed-password-with-32-characters"
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(
+		http.MethodPut,
+		"/api/v1/orgs/acme/teams/42/project-reader",
+		strings.NewReader(`{"password":"`+password+`"}`),
+	)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["password"] != password {
+		t.Fatal("response did not return the caller-managed password")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(store.users["acme/posthog_team_42"].Password), []byte(password)); err != nil {
+		t.Fatal("stored hash does not authenticate the caller-managed password")
 	}
 }
 
@@ -437,8 +984,8 @@ func TestGetOrgIncludesWarehouse(t *testing.T) {
 	if org.Warehouse == nil {
 		t.Fatal("expected warehouse in org response")
 	}
-	if org.Warehouse.WarehouseDatabase.DatabaseName != "analytics_warehouse" {
-		t.Fatalf("expected analytics_warehouse, got %q", org.Warehouse.WarehouseDatabase.DatabaseName)
+	if org.Warehouse.MetadataStore.DatabaseName != "analytics_metadata" {
+		t.Fatalf("expected analytics_metadata, got %q", org.Warehouse.MetadataStore.DatabaseName)
 	}
 	if org.Warehouse.MetadataStore.Kind != "dedicated_rds" {
 		t.Fatalf("expected metadata store kind dedicated_rds, got %q", org.Warehouse.MetadataStore.Kind)
@@ -490,17 +1037,13 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"warehouse_database": {
-			"region": "us-east-1",
 			"endpoint": "analytics.cluster.example",
-			"port": 5432,
-			"database_name": "analytics_warehouse",
-			"username": "warehouse_user"
+			"port": 5432
 		},
 		"metadata_store": {
 			"kind": "dedicated_rds",
-			"engine": "postgres",
-			"region": "us-east-1",
 			"endpoint": "analytics-metadata.cluster.example",
 			"port": 5432,
 			"database_name": "ducklake_metadata",
@@ -517,7 +1060,6 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 		},
 		"worker_identity": {
 			"namespace": "duckgres",
-			"service_account_name": "analytics-worker",
 			"iam_role_arn": "arn:aws:iam::123456789012:role/analytics-worker"
 		},
 		"warehouse_database_credentials": {
@@ -542,7 +1084,6 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 		},
 		"state": "ready",
 		"status_message": "ready",
-		"warehouse_database_state": "ready",
 		"metadata_store_state": "ready",
 		"s3_state": "ready",
 		"identity_state": "ready",
@@ -638,7 +1179,67 @@ func TestPutWarehouseDisablesPgBouncerWhenSetToFalse(t *testing.T) {
 	}
 }
 
-func TestPutWarehouseEnablesIcebergWhenSetToTrue(t *testing.T) {
+func TestPutWarehouseTogglesMetadataProxy(t *testing.T) {
+	const reloadPath = "/api/v1/internal/reload-snapshot"
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	fetcher := &fakePeerFetcher{}
+	router := newTestAPIRouterWithFetcher(store, fetcher)
+
+	for i, enabled := range []bool{true, false} {
+		body := []byte(fmt.Sprintf(`{"metadata_proxy_enabled": %t}`, enabled))
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("enabled=%v: status = %d, want %d: %s", enabled, rec.Code, http.StatusOK, rec.Body.String())
+		}
+		if got := store.warehouses["analytics"].MetadataProxyEnabled; got != enabled {
+			t.Fatalf("enabled=%v: stored metadata_proxy_enabled = %v", enabled, got)
+		}
+		if got := store.reloadSnapshotCalls; got != i+1 {
+			t.Fatalf("enabled=%v: reloadSnapshotCalls = %d, want %d", enabled, got, i+1)
+		}
+		if got := fetcher.postCallCount(); got != int32(i+1) {
+			t.Fatalf("enabled=%v: peer fan-out POSTs = %d, want %d", enabled, got, i+1)
+		}
+		fetcher.mu.Lock()
+		lastPath := fetcher.postPaths[len(fetcher.postPaths)-1]
+		fetcher.mu.Unlock()
+		if lastPath != reloadPath {
+			t.Fatalf("enabled=%v: peer fan-out path = %q, want %q", enabled, lastPath, reloadPath)
+		}
+	}
+}
+
+func TestPutWarehouseWithoutMetadataProxyFieldDoesNotReloadSnapshots(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	fetcher := &fakePeerFetcher{}
+	router := newTestAPIRouterWithFetcher(store, fetcher)
+
+	body := []byte(`{"pgbouncer":{"enabled":true}}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics/warehouse", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.reloadSnapshotCalls; got != 0 {
+		t.Fatalf("reloadSnapshotCalls = %d, want 0 for unrelated warehouse PUT", got)
+	}
+	if got := fetcher.postCallCount(); got != 0 {
+		t.Fatalf("peer fan-out POSTs = %d, want 0 for unrelated warehouse PUT", got)
+	}
+}
+
+func TestPutWarehouseRejectsRemovedIcebergField(t *testing.T) {
+	// Iceberg support was removed: "iceberg" is no longer a whitelisted field
+	// on the warehouse PUT, so the strict decode rejects it as unknown.
 	store := newFakeAPIStore()
 	seedOrgWithWarehouse(store, "analytics")
 	router := newTestAPIRouter(store)
@@ -649,11 +1250,8 @@ func TestPutWarehouseEnablesIcebergWhenSetToTrue(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-	if !store.warehouses["analytics"].Iceberg.Enabled {
-		t.Fatal("expected iceberg.enabled=true after PUT")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
 	}
 }
 
@@ -681,17 +1279,11 @@ func TestPutWarehousePreservesNestedFieldsOnPartialUpdate(t *testing.T) {
 	if got.Endpoint != "analytics-metadata.cluster.example" {
 		t.Fatalf("endpoint = %q, want analytics-metadata.cluster.example (nested fields were wiped)", got.Endpoint)
 	}
-	if got.Region != "us-east-1" {
-		t.Fatalf("region = %q, want us-east-1", got.Region)
-	}
 	if got.Port != 5432 {
 		t.Fatalf("port = %d, want 5432", got.Port)
 	}
 	if got.Kind != "dedicated_rds" {
 		t.Fatalf("kind = %q, want dedicated_rds", got.Kind)
-	}
-	if got.Engine != "postgres" {
-		t.Fatalf("engine = %q, want postgres", got.Engine)
 	}
 	if got.Username != "metadata_user" {
 		t.Fatalf("username = %q, want metadata_user", got.Username)
@@ -725,16 +1317,13 @@ func TestPutWarehouseRejectsSecretRefsOutsideTenantScope(t *testing.T) {
 	body := []byte(`{
 		"metadata_store": {
 			"kind": "dedicated_rds",
-			"engine": "postgres",
-			"region": "us-east-1",
 			"endpoint": "analytics-metadata.cluster.example",
 			"port": 5432,
 			"database_name": "ducklake_metadata",
 			"username": "metadata_user"
 		},
 		"worker_identity": {
-			"namespace": "tenant-a",
-			"service_account_name": "analytics-worker"
+			"namespace": "tenant-a"
 		},
 		"metadata_store_credentials": {
 			"namespace": "tenant-b",
@@ -759,8 +1348,9 @@ func TestPutWarehouseRejectsSecretRefsWithoutWorkerNamespace(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
-			"service_account_name": "analytics-worker"
+			"iam_role_arn": "arn:aws:iam::123456789012:role/analytics-worker"
 		},
 		"metadata_store_credentials": {
 			"namespace": "tenant-b",
@@ -805,7 +1395,7 @@ func TestPutWarehouseRejectsServerManagedFields(t *testing.T) {
 		"org_id": "wrong-org",
 		"created_at": "2026-03-18T10:00:00Z",
 		"warehouse_database": {
-			"database_name": "analytics_warehouse"
+			"endpoint": "analytics.cluster.example"
 		}
 	}`)
 
@@ -825,8 +1415,8 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"state": "awaiting-human-approval",
-		"warehouse_database_state": "queued-for-bootstrap",
 		"metadata_store_state": "vendor-pending",
 		"s3_state": "bucket-handshake",
 		"identity_state": "iam-review",
@@ -850,9 +1440,6 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	if warehouse.State != "awaiting-human-approval" {
 		t.Fatalf("expected custom overall state, got %q", warehouse.State)
 	}
-	if warehouse.WarehouseDatabaseState != "queued-for-bootstrap" {
-		t.Fatalf("expected custom warehouse db state, got %q", warehouse.WarehouseDatabaseState)
-	}
 	if warehouse.MetadataStoreState != "vendor-pending" {
 		t.Fatalf("expected custom metadata state, got %q", warehouse.MetadataStoreState)
 	}
@@ -864,6 +1451,7 @@ func TestPutWarehouseRejectsCrossTenantSecretRefs(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-analytics"
 		},
@@ -893,6 +1481,7 @@ func TestPutWarehouseRejectsSecretRefWithoutExplicitNamespace(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-analytics"
 		},
@@ -979,6 +1568,7 @@ func TestPutWarehouseRejectsSecretReferenceWithoutOrgPrefix(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
+		"duckling_name": "analytics",
 		"worker_identity": {
 			"namespace": "tenant-a"
 		},
@@ -1052,6 +1642,70 @@ func TestUpdateOrgRejectsNestedWarehousePayload(t *testing.T) {
 	}
 }
 
+func TestDeleteOrgRejectsWhenWarehouseStillExists(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "deprovision") {
+		t.Fatalf("expected error to mention deprovision, got: %s", rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; !ok {
+		t.Fatal("expected org to survive a rejected delete")
+	}
+	if _, ok := store.warehouses["analytics"]; !ok {
+		t.Fatal("expected warehouse to survive a rejected delete")
+	}
+}
+
+func TestDeleteOrgSucceedsAfterWarehouseRemoved(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	delete(store.warehouses, "analytics")
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("expected org to be deleted once the warehouse is gone")
+	}
+}
+
+func TestDeleteOrgCascadesDeletedWarehouse(t *testing.T) {
+	store := newFakeAPIStore()
+	seedOrgWithWarehouse(store, "analytics")
+	// Simulate a completed deprovision: the provisioner leaves the warehouse
+	// row behind in the terminal "deleted" state rather than removing it.
+	store.warehouses["analytics"].State = configstore.ManagedWarehouseStateDeleted
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("expected org to be deleted once its warehouse is fully deprovisioned")
+	}
+	if _, ok := store.warehouses["analytics"]; ok {
+		t.Fatal("expected the deleted warehouse row to be cascaded away")
+	}
+}
+
 func TestGetOrgOmitsMinWorkers(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["analytics"] = &configstore.Org{
@@ -1072,6 +1726,25 @@ func TestGetOrgOmitsMinWorkers(t *testing.T) {
 	}
 }
 
+func TestGetOrgOmitsMaxConnections(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name: "analytics",
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/analytics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte(`"max_connections"`)) {
+		t.Fatalf("expected org response to omit max_connections, got %s", rec.Body.String())
+	}
+}
+
 func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	columns := managedWarehouseUpsertColumns()
 
@@ -1084,11 +1757,11 @@ func TestManagedWarehouseUpsertColumnsExcludeCreatedAt(t *testing.T) {
 	if !slices.Contains(columns, "updated_at") {
 		t.Fatal("expected updated_at to be included in managed warehouse upserts")
 	}
-	if !slices.Contains(columns, "warehouse_database_database_name") {
-		t.Fatal("expected warehouse_database_database_name to be included in managed warehouse upserts")
-	}
 	if !slices.Contains(columns, "metadata_store_database_name") {
 		t.Fatal("expected metadata_store_database_name to be included in managed warehouse upserts")
+	}
+	if !slices.Contains(columns, "metadata_proxy_enabled") {
+		t.Fatal("expected metadata_proxy_enabled to be included in managed warehouse upserts")
 	}
 	// Regression guards: image and duck_lake_version must be in the upsert
 	// column list so the per-tenant pinning patch endpoint actually
@@ -1261,7 +1934,7 @@ func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"portola-uuid","database_name":"portola","hostname_alias":"entirely-chief-wildcat"}`)
+	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant_alpha","hostname_alias":"entirely-chief-wildcat","team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1270,7 +1943,7 @@ func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	stored := store.orgs["portola-uuid"]
+	stored := store.orgs["tenant-alpha-id"]
 	if stored == nil {
 		t.Fatal("org not stored")
 	}
@@ -1283,7 +1956,7 @@ func TestCreateOrgEmptyHostnameAliasIsTreatedAsNone(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"plain","database_name":"plain","hostname_alias":""}`)
+	body := []byte(`{"name":"plain","database_name":"plain","hostname_alias":"","team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1304,15 +1977,15 @@ func TestCreateOrgEmptyHostnameAliasIsTreatedAsNone(t *testing.T) {
 func TestUpdateOrgClearsHostnameAliasWithEmptyString(t *testing.T) {
 	store := newFakeAPIStore()
 	alias := "entirely-chief-wildcat"
-	store.orgs["portola-uuid"] = &configstore.Org{
-		Name:          "portola-uuid",
-		DatabaseName:  "portola",
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:          "tenant-alpha-id",
+		DatabaseName:  "tenant_alpha",
 		HostnameAlias: &alias,
 	}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{"hostname_alias":""}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/portola-uuid", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1320,7 +1993,7 @@ func TestUpdateOrgClearsHostnameAliasWithEmptyString(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	stored := store.orgs["portola-uuid"]
+	stored := store.orgs["tenant-alpha-id"]
 	if stored.HostnameAlias != nil {
 		t.Errorf("HostnameAlias not cleared: %v", stored.HostnameAlias)
 	}
@@ -1368,7 +2041,7 @@ func TestCreateOrgAcceptsLongValidHostnameAlias(t *testing.T) {
 
 	// 63 chars exactly — at the RFC 1035 DNS label limit.
 	alias := strings.Repeat("a", 63)
-	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, alias))
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q,"team_id":12345}`, alias))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1384,7 +2057,7 @@ func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
 	router := newTestAPIRouter(store)
 
 	alias := strings.Repeat("a", 64) // one over the limit
-	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q}`, alias))
+	body := []byte(fmt.Sprintf(`{"name":"acme","database_name":"acme","hostname_alias":%q,"team_id":12345}`, alias))
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1398,15 +2071,15 @@ func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
 func TestUpdateOrgOmittingHostnameAliasPreservesIt(t *testing.T) {
 	store := newFakeAPIStore()
 	alias := "entirely-chief-wildcat"
-	store.orgs["portola-uuid"] = &configstore.Org{
-		Name:          "portola-uuid",
-		DatabaseName:  "portola",
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:          "tenant-alpha-id",
+		DatabaseName:  "tenant_alpha",
 		HostnameAlias: &alias,
 	}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{"max_workers":8}`)
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/portola-uuid", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -1414,9 +2087,117 @@ func TestUpdateOrgOmittingHostnameAliasPreservesIt(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	stored := store.orgs["portola-uuid"]
+	stored := store.orgs["tenant-alpha-id"]
 	if stored.HostnameAlias == nil || *stored.HostnameAlias != "entirely-chief-wildcat" {
 		t.Errorf("HostnameAlias not preserved: %v", stored.HostnameAlias)
+	}
+}
+
+// TestCreateOrgRequiresTeamID: the admin org create carries the same
+// contract as provisioning — an org cannot exist without a team, so a create
+// without team_id is a 400 naming the field and creates nothing. The legacy
+// default_team_id key is NOT an alias here (admin is our own surface): a body
+// carrying only it still fails the team_id requirement.
+func TestCreateOrgRequiresTeamID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"missing team_id", `{"name":"acme","database_name":"acme"}`},
+		{"zero team_id", `{"name":"acme","database_name":"acme","team_id":0}`},
+		{"negative team_id", `{"name":"acme","database_name":"acme","team_id":-4}`},
+		{"legacy default_team_id is not an alias", `{"name":"acme","database_name":"acme","default_team_id":42}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			router := newTestAPIRouter(store)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "team_id") {
+				t.Fatalf("rejection should name team_id: %s", rec.Body.String())
+			}
+			if _, ok := store.orgs["acme"]; ok {
+				t.Fatal("org should NOT have been created without a valid team_id")
+			}
+		})
+	}
+}
+
+// TestCreateOrgCreatesFirstTeamRow: a create with team_id lands the org AND
+// its first plain team row atomically; an omitted schema_name derives the
+// conventional "team_<id>", an explicit one is used verbatim.
+func TestCreateOrgCreatesFirstTeamRow(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"name":"acme","database_name":"acme","team_id":42424}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if _, ok := store.orgs["acme"]; !ok {
+		t.Fatal("org not created")
+	}
+	team := store.teams["acme"][42424]
+	if team == nil || team.SchemaName != "team_42424" || !team.Enabled {
+		t.Fatalf("first team row = %+v, want team 42424 with conventional schema", team)
+	}
+
+	body = []byte(`{"name":"beta","database_name":"beta","team_id":7,"schema_name":"custom_wh"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("explicit schema: status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if team := store.teams["beta"][7]; team == nil || team.SchemaName != "custom_wh" {
+		t.Fatalf("explicit schema team row = %+v, want custom_wh", team)
+	}
+
+	// An invalid schema name is rejected before anything is created.
+	body = []byte(`{"name":"gamma","database_name":"gamma","team_id":7,"schema_name":"Bad.Schema"}`)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("bad schema: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := store.orgs["gamma"]; ok {
+		t.Fatal("org must not be created with an invalid schema name")
+	}
+}
+
+// TestUpdateOrgIgnoresLegacyDefaultTeamID: same accept-and-ignore stance on
+// the PUT — the field neither errors nor mutates anything.
+func TestUpdateOrgIgnoresLegacyDefaultTeamID(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme", MaxWorkers: 3}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"default_team_id":67890}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["acme"].MaxWorkers != 3 {
+		t.Fatalf("unrelated field mutated: %+v", store.orgs["acme"])
 	}
 }
 
@@ -1446,19 +2227,17 @@ func TestIsValidDuckLakeSpecVersion(t *testing.T) {
 	}
 }
 
-func TestUpdateOrgMaxConnections(t *testing.T) {
+func TestUpdateOrgMaxVCPUs(t *testing.T) {
 	store := newFakeAPIStore()
 	store.orgs["analytics"] = &configstore.Org{
-		Name:           "analytics",
-		MaxWorkers:     2,
-		MaxConnections: 5,
-		MemoryBudget:   "8GB",
-		IdleTimeoutS:   30,
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   5,
 	}
 	router := newTestAPIRouter(store)
 
 	body := []byte(`{
-		"max_connections": 10
+		"max_vcpus": 10
 	}`)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader(body))
@@ -1469,16 +2248,801 @@ func TestUpdateOrgMaxConnections(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
 	}
-	if store.orgs["analytics"].MaxConnections != 10 {
-		t.Fatalf("expected org max_connections to be updated, got %d", store.orgs["analytics"].MaxConnections)
+	if store.orgs["analytics"].MaxVCPUs != 10 {
+		t.Fatalf("expected org max_vcpus to be updated, got %d", store.orgs["analytics"].MaxVCPUs)
 	}
 	if store.orgs["analytics"].MaxWorkers != 2 {
 		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
 	}
-	if store.orgs["analytics"].MemoryBudget != "8GB" {
-		t.Fatalf("expected memory_budget to be preserved, got %q", store.orgs["analytics"].MemoryBudget)
+}
+
+func TestUpdateOrgMaxVCPUsCanClearToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   10,
 	}
-	if store.orgs["analytics"].IdleTimeoutS != 30 {
-		t.Fatalf("expected idle_timeout_s to be preserved, got %d", store.orgs["analytics"].IdleTimeoutS)
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_vcpus":0}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 0 {
+		t.Fatalf("expected org max_vcpus to be cleared, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+	if store.orgs["analytics"].MaxWorkers != 2 {
+		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestUpdateOrgOmittingMaxVCPUsPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   10,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_workers":3}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 10 {
+		t.Fatalf("expected org max_vcpus to be preserved, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+	if store.orgs["analytics"].MaxWorkers != 3 {
+		t.Fatalf("expected max_workers to be updated, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestUpdateOrgMaxVCPUsNullClearsToZero(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:       "analytics",
+		MaxWorkers: 2,
+		MaxVCPUs:   10,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_vcpus":null}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 0 {
+		t.Fatalf("expected org max_vcpus to be cleared, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+	if store.orgs["analytics"].MaxWorkers != 2 {
+		t.Fatalf("expected max_workers to be preserved, got %d", store.orgs["analytics"].MaxWorkers)
+	}
+}
+
+func TestUpdateOrgRejectsNegativeMaxVCPUs(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name:     "analytics",
+		MaxVCPUs: 10,
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/analytics", bytes.NewReader([]byte(`{"max_vcpus":-1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if store.orgs["analytics"].MaxVCPUs != 10 {
+		t.Fatalf("expected org max_vcpus to be preserved, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+}
+
+func TestUpdateOrgDataImportsTableNamingVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		from string
+		to   string
+	}{
+		{"legacy_to_copy", configstore.DataImportsTableNamingVersionLegacyBatchV1, configstore.DataImportsTableNamingVersionCopyV1},
+		{"copy_to_legacy", configstore.DataImportsTableNamingVersionCopyV1, configstore.DataImportsTableNamingVersionLegacyBatchV1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{
+				Name:                          "analytics",
+				DataImportsTableNamingVersion: tc.from,
+			}
+
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			var detail string
+			router.Use(func(c *gin.Context) {
+				c.Next()
+				detail = c.GetString(ctxAuditDetailKey)
+			})
+			registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics",
+				fmt.Sprintf(`{"data_imports_table_naming_version":%q}`, tc.to))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var response configstore.Org
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.DataImportsTableNamingVersion != tc.to {
+				t.Fatalf("response naming version = %q, want %q", response.DataImportsTableNamingVersion, tc.to)
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != tc.to {
+				t.Fatalf("stored naming version = %q, want %q", got, tc.to)
+			}
+			wantDetail := fmt.Sprintf("data_imports_table_naming_version %s → %s", tc.from, tc.to)
+			if !strings.Contains(detail, wantDetail) {
+				t.Fatalf("audit detail = %q, want %q", detail, wantDetail)
+			}
+
+			rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics", `{"max_workers":3}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("unrelated update status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != tc.to {
+				t.Fatalf("unrelated update changed naming version to %q", got)
+			}
+		})
+	}
+}
+
+func TestUpdateOrgRejectsInvalidDataImportsTableNamingVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"empty", `""`},
+		{"null", `null`},
+		{"unknown", `"future_v1"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{
+				Name:                          "analytics",
+				DataImportsTableNamingVersion: configstore.DataImportsTableNamingVersionLegacyBatchV1,
+			}
+			router := newTestAPIRouter(store)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics",
+				fmt.Sprintf(`{"data_imports_table_naming_version":%s}`, tc.value))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != configstore.DataImportsTableNamingVersionLegacyBatchV1 {
+				t.Fatalf("invalid update changed naming version to %q", got)
+			}
+		})
+	}
+}
+
+func TestCreateOrgRejectsInvalidDataImportsTableNamingVersion(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/orgs",
+		`{"name":"analytics","database_name":"analytics","team_id":1,"data_imports_table_naming_version":"future_v1"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("org must not be created with an invalid naming version")
+	}
+}
+
+// --- Org default worker profile (default_worker_cpu/memory/ttl) ---
+
+func TestUpdateOrgSetsDefaultWorkerProfile(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"default_worker_cpu":"2","default_worker_memory":"8Gi","default_worker_ttl":"10m"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "2" || stored.DefaultWorkerMemory != "8Gi" || stored.DefaultWorkerTTL != "10m" {
+		t.Fatalf("stored default profile = %q/%q/%q, want 2/8Gi/10m",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+	// The fields must round-trip in the response JSON so operators can read
+	// back what they set (GET uses the same model serialization).
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["default_worker_cpu"] != "2" || resp["default_worker_memory"] != "8Gi" || resp["default_worker_ttl"] != "10m" {
+		t.Fatalf("response JSON missing default worker profile fields: %s", rec.Body.String())
+	}
+}
+
+func TestUpdateOrgClearsDefaultWorkerProfileWithEmptyStrings(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name: "acme", DatabaseName: "acme",
+		DefaultWorkerCPU: "2", DefaultWorkerMemory: "8Gi", DefaultWorkerTTL: "10m",
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"default_worker_cpu":"","default_worker_memory":"","default_worker_ttl":""}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "" || stored.DefaultWorkerMemory != "" || stored.DefaultWorkerTTL != "" {
+		t.Fatalf("default profile not cleared: %q/%q/%q",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+}
+
+func TestUpdateOrgOmittingDefaultWorkerProfilePreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name: "acme", DatabaseName: "acme",
+		DefaultWorkerCPU: "2", DefaultWorkerMemory: "8Gi", DefaultWorkerTTL: "10m",
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"max_workers":4}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "2" || stored.DefaultWorkerMemory != "8Gi" || stored.DefaultWorkerTTL != "10m" {
+		t.Fatalf("default profile not preserved: %q/%q/%q",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+}
+
+func TestUpdateOrgSetsDefaultWorkerMinHotIdle(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme"}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"default_worker_min_hot_idle":2}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerMinHotIdle != 2 {
+		t.Fatalf("stored default_worker_min_hot_idle = %d, want 2", stored.DefaultWorkerMinHotIdle)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["default_worker_min_hot_idle"] != float64(2) {
+		t.Fatalf("response JSON missing default_worker_min_hot_idle: %s", rec.Body.String())
+	}
+}
+
+func TestUpdateOrgOmittingDefaultWorkerMinHotIdlePreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name: "acme", DatabaseName: "acme", DefaultWorkerMinHotIdle: 2,
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"max_workers":4}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["acme"].DefaultWorkerMinHotIdle; got != 2 {
+		t.Fatalf("default_worker_min_hot_idle not preserved: got %d, want 2", got)
+	}
+}
+
+func TestUpdateOrgRejectsNegativeDefaultWorkerMinHotIdle(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme", DefaultWorkerMinHotIdle: 2}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(`{"default_worker_min_hot_idle":-1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := store.orgs["acme"].DefaultWorkerMinHotIdle; got != 2 {
+		t.Fatalf("invalid payload mutated default_worker_min_hot_idle: got %d", got)
+	}
+}
+
+func TestUpdateOrgRejectsInvalidDefaultWorkerProfile(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"garbage cpu quantity", `{"default_worker_cpu":"lots"}`},
+		{"zero cpu", `{"default_worker_cpu":"0"}`},
+		{"negative memory", `{"default_worker_memory":"-8Gi"}`},
+		{"garbage memory quantity", `{"default_worker_memory":"big"}`},
+		{"garbage ttl duration", `{"default_worker_ttl":"whenever"}`},
+		{"negative ttl", `{"default_worker_ttl":"-5m"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme", DefaultWorkerCPU: "2"}
+			router := newTestAPIRouter(store)
+
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if store.orgs["acme"].DefaultWorkerCPU != "2" {
+				t.Fatal("invalid payload must not mutate the stored org")
+			}
+		})
+	}
+}
+
+func TestCreateOrgAcceptsDefaultWorkerProfile(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_cpu":"2","default_worker_memory":"8Gi","default_worker_ttl":"75m","team_id":12345}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.DefaultWorkerCPU != "2" || stored.DefaultWorkerMemory != "8Gi" || stored.DefaultWorkerTTL != "75m" {
+		t.Fatalf("stored default profile = %q/%q/%q, want 2/8Gi/75m",
+			stored.DefaultWorkerCPU, stored.DefaultWorkerMemory, stored.DefaultWorkerTTL)
+	}
+}
+
+func TestCreateOrgAcceptsDefaultWorkerMinHotIdle(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_min_hot_idle":1,"team_id":12345}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if got := store.orgs["acme"].DefaultWorkerMinHotIdle; got != 1 {
+		t.Fatalf("stored default_worker_min_hot_idle = %d, want 1", got)
+	}
+}
+
+func TestCreateOrgRejectsInvalidDefaultWorkerTTL(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"name":"acme","database_name":"acme","default_worker_ttl":"10 minutes"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.orgs["acme"]; ok {
+		t.Fatal("org should NOT have been created")
+	}
+}
+
+// --- Org teams (admin surface) ---
+
+func adminJSON(t *testing.T, router *gin.Engine, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestAdminCreateOrgTeam(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"acme","team_id":5,"schema_name":"team_5","backfill_enabled":false}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.teams["acme"][5]
+	if stored == nil || stored.SchemaName != "team_5" || !stored.Enabled {
+		t.Fatalf("stored team = %+v, want schema team_5, enabled default", stored)
+	}
+	if stored.BackfillEnabled == nil || *stored.BackfillEnabled {
+		t.Fatalf("backfill_enabled = %v, want false", stored.BackfillEnabled)
+	}
+}
+
+func TestAdminCreateOrgTeamConflicts(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Existing (org, team) is a 409 — the admin surface never overwrites
+	// (that's the internal provisioning grandfather path).
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"acme","team_id":1,"schema_name":"other"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("existing team: status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if store.teams["acme"][1].SchemaName != "team_1" {
+		t.Fatal("admin create must never overwrite an existing row")
+	}
+
+	// Duplicate schema within the org is a 409 too.
+	rec = adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"acme","team_id":2,"schema_name":"team_1"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate schema: status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+
+	// Unknown org is a 404.
+	rec = adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"org_id":"nope","team_id":2,"schema_name":"team_2"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown org: status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+
+	// Missing org_id is a 400.
+	rec = adminJSON(t, router, http.MethodPost, "/api/v1/teams",
+		`{"team_id":2,"schema_name":"team_2"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing org_id: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminUpdateOrgTeamSchemaChange pins the operator break-glass: the admin
+// PUT may change schema_name (unlike user-facing flows), but only to a valid
+// identifier that no other team in the org holds.
+func TestAdminUpdateOrgTeamSchemaChange(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.orgs["other"] = &configstore.Org{Name: "other"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "other", TeamID: 9, SchemaName: "shared", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Happy path: the operator override renames the config row.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"repaired_wh"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("schema change: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if store.teams["acme"][1].SchemaName != "repaired_wh" {
+		t.Fatalf("schema_name = %q, want repaired_wh", store.teams["acme"][1].SchemaName)
+	}
+
+	// Conflict with another team in the SAME org is a 409.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"team_2"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("schema conflict: status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	if store.teams["acme"][1].SchemaName != "repaired_wh" {
+		t.Fatal("schema_name must not change on a refused conflict")
+	}
+
+	// The same schema in a DIFFERENT org is fine (uniqueness is per org).
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"shared"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cross-org schema reuse: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	// Clearing (explicit null) and invalid identifiers stay 400s.
+	for _, body := range []string{`{"schema_name":null}`, `{"schema_name":"Bad-Name"}`, `{"schema_name":""}`} {
+		rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400: %s", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// TestAdminUpdateOrgTeamLegacyNames pins the tri-state legacy table-name
+// semantics on the PUT: omitted = preserve, explicit null or "" = clear back
+// to NULL, a value sets.
+func TestAdminUpdateOrgTeamLegacyNames(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Set all three.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"events_table_name":"legacy_events","persons_table_name":"legacy_persons","schema_data_imports_name":"legacy_imports"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set legacy names: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.teams["acme"][1]
+	if stored.EventsTableName == nil || *stored.EventsTableName != "legacy_events" ||
+		stored.PersonsTableName == nil || *stored.PersonsTableName != "legacy_persons" ||
+		stored.SchemaDataImportsName == nil || *stored.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("legacy names not stored: %+v", stored)
+	}
+
+	// Omitted fields preserve; explicit null and "" both clear to NULL.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"events_table_name":null,"persons_table_name":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear legacy names: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored = store.teams["acme"][1]
+	if stored.EventsTableName != nil {
+		t.Fatalf("events_table_name = %v, want NULL after explicit null", *stored.EventsTableName)
+	}
+	if stored.PersonsTableName != nil {
+		t.Fatalf("persons_table_name = %v, want NULL after explicit empty", *stored.PersonsTableName)
+	}
+	if stored.SchemaDataImportsName == nil || *stored.SchemaDataImportsName != "legacy_imports" {
+		t.Fatalf("omitted schema_data_imports_name must be preserved, got %+v", stored)
+	}
+
+	// Oversized value is a 400, not a DB error.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		fmt.Sprintf(`{"events_table_name":%q}`, strings.Repeat("x", 256)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("oversized legacy name: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAdminUpdateOrgTeamAuditDetail asserts the team.update audit detail
+// captures which fields changed with their old → new values (the org-update
+// idiom), including the break-glass schema change.
+func TestAdminUpdateOrgTeamAuditDetail(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	var detail string
+	// Capture what AuditMiddleware would read after the handler returns.
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		detail = c.GetString(ctxAuditDetailKey)
+	})
+	registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"schema_name":"repaired_wh","enabled":false,"events_table_name":"legacy_events","earliest_event_date":"2023-04-17"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{
+		"team 1:",
+		"schema_name team_1 → repaired_wh",
+		"enabled true → false",
+		"events_table_name (unset) → legacy_events",
+		"earliest_event_date (unset) → 2023-04-17",
+	} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("audit detail %q missing %q", detail, want)
+		}
+	}
+	// A no-op PUT records no detail.
+	detail = ""
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no-op status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if detail != "" {
+		t.Fatalf("no-op update must not record changes, got %q", detail)
+	}
+}
+
+func TestAdminUpdateOrgTeamFields(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	backfill := true
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true, BackfillEnabled: &backfill})
+	router := newTestAPIRouter(store)
+
+	// backfill_enabled is NOT NULL (migration 000028): an explicit null is a
+	// 400 that names the field, and nothing changes.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":false,"backfill_enabled":null}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "backfill_enabled") {
+		t.Fatalf("explicit null: status = %d, body = %s, want 400 naming backfill_enabled", rec.Code, rec.Body.String())
+	}
+	if stored := store.teams["acme"][1]; !stored.Enabled || stored.BackfillEnabled == nil || !*stored.BackfillEnabled {
+		t.Fatalf("refused update must not change the row, got %+v", stored)
+	}
+
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":false,"backfill_enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.teams["acme"][1]
+	if stored.Enabled {
+		t.Fatal("enabled must be cleared")
+	}
+	if stored.BackfillEnabled == nil || *stored.BackfillEnabled {
+		t.Fatalf("backfill_enabled = %v, want false", stored.BackfillEnabled)
+	}
+}
+
+// TestAdminUpdateOrgTeamEarliestEventDate pins the tri-state handling of
+// PostHog's cached earliest-event date on the break-glass PUT: a value sets it
+// (400 when it doesn't parse), an absent key preserves it, an explicit null
+// clears it back to NULL (the PostHog sensor then re-resolves it).
+func TestAdminUpdateOrgTeamEarliestEventDate(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	// Invalid date is a 400 that names the field; nothing is stored.
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"earliest_event_date":"17-04-2023"}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "earliest_event_date") {
+		t.Fatalf("invalid date: status = %d, body = %s, want 400 naming the field", rec.Code, rec.Body.String())
+	}
+
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"earliest_event_date":"2023-04-17"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("set: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":"2023-04-17"`) {
+		t.Fatalf("response must carry the date as YYYY-MM-DD: %s", rec.Body.String())
+	}
+
+	// Omitted key preserves the stored value.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"enabled":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preserve: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][1].EarliestEventDate; got == nil || got.String() != "2023-04-17" {
+		t.Fatalf("omitted earliest_event_date must be preserved, got %v", got)
+	}
+
+	// Explicit null clears back to NULL.
+	rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"earliest_event_date":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.teams["acme"][1].EarliestEventDate; got != nil {
+		t.Fatalf("earliest_event_date = %v, want NULL after explicit null", got)
+	}
+	if !strings.Contains(rec.Body.String(), `"earliest_event_date":null`) {
+		t.Fatalf("cleared date must serialize as null: %s", rec.Body.String())
+	}
+}
+
+// TestAdminUpdateOrgTeamIgnoresLegacyBillingField: is_billing_team is gone
+// from the team PUT — a body still carrying it is accepted (unknown JSON key,
+// ignored), and nothing billing-shaped happens.
+func TestAdminUpdateOrgTeamIgnoresLegacyBillingField(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"is_billing_team":true,"enabled":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if store.teams["acme"][1].Enabled {
+		t.Fatal("the real field in the same body must still apply")
+	}
+}
+
+func TestAdminListOrgTeams(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.orgs["zeta"] = &configstore.Org{Name: "zeta"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 2, SchemaName: "team_2", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	store.seedTeam(configstore.OrgTeam{OrgID: "zeta", TeamID: 9, SchemaName: "team_9", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodGet, "/api/v1/teams", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("global list: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var global struct {
+		Teams []configstore.OrgTeam `json:"teams"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &global); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(global.Teams) != 3 {
+		t.Fatalf("global teams = %d rows, want 3", len(global.Teams))
+	}
+
+	if global.Teams[0].OrgID != "acme" || global.Teams[0].TeamID != 1 || global.Teams[2].OrgID != "zeta" {
+		t.Fatalf("global teams order = %+v, want acme[1,2] then zeta[9]", global.Teams)
+	}
+}
+
+func TestAdminUpdateOrgTeamRejectsQualifiedLegacyName(t *testing.T) {
+	// Bare-name contract on the admin surface: a schema-qualified override
+	// is a 400 (configstore.ValidateOrgTeamTableName), because a stored dot
+	// is silently ambiguous to every discovery consumer, and the stored
+	// value must stay untouched.
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 1, SchemaName: "team_1", Enabled: true})
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/acme/teams/1",
+		`{"events_table_name":"posthog.legacy_events"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("qualified events_table_name: status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if stored := store.teams["acme"][1]; stored.EventsTableName != nil {
+		t.Fatalf("rejected PUT must not store anything, got %+v", stored)
 	}
 }

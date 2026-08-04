@@ -9,7 +9,6 @@
 package configresolve
 
 import (
-	"encoding/json"
 	"strconv"
 	"strings"
 	"time"
@@ -28,129 +27,118 @@ import (
 type CLIInputs struct {
 	Set map[string]bool
 
-	Host                               string
-	Port                               int
-	FlightPort                         int
-	FlightSessionIdleTTL               string
-	FlightSessionReapInterval          string
-	FlightHandleIdleTTL                string
-	FlightSessionTokenTTL              string
-	DataDir                            string
-	CertFile                           string
-	KeyFile                            string
-	FilePersistence                    bool
-	ProcessIsolation                   bool
-	IdleTimeout                        string
-	SessionInitTimeout                 string
-	MemoryLimit                        string
-	Threads                            int
-	MemoryBudget                       string
-	MemoryRebalance                    bool
-	DuckLakeDeltaCatalogEnabled        bool
-	DuckLakeDeltaCatalogPath           string
-	DuckLakeDefaultSpecVersion         string
-	IcebergEnabled                     bool
-	IcebergRegion                      string
-	IcebergNamespace                   string
-	ProcessMinWorkers                  int
-	ProcessMaxWorkers                  int
-	ProcessRetireOnSessionEnd          bool
-	WorkerQueueTimeout                 string
-	WorkerIdleTimeout                  string
-	HandoverDrainTimeout               string
-	ACMEDomain                         string
-	ACMEEmail                          string
-	ACMECacheDir                       string
-	ACMEDNSProvider                    string
-	ACMEDNSZoneID                      string
-	MaxConnections                     int
-	ConfigStoreConn                    string
-	ConfigPollInterval                 string
-	InternalSecret                     string
-	SNIRoutingMode                     string
-	ManagedHostnameSuffixes            string
-	WorkerBackend                      string
-	K8sWorkerImage                     string
-	K8sWorkerNamespace                 string
-	K8sControlPlaneID                  string
-	K8sWorkerPort                      int
-	K8sWorkerSecret                    string
-	K8sWorkerConfigMap                 string
-	K8sWorkerImagePullPolicy           string
-	K8sWorkerServiceAccount            string
-	K8sMaxWorkers                      int
-	K8sSharedWarmTarget                int
-	K8sDynamicWarmCapacityEnabled      bool
-	K8sWarmCapacityMissWindow          string
-	K8sWarmCapacityMissesPerWorker     int
-	K8sWarmCapacityDemandTTL           string
-	K8sWarmCapacityDynamicImageCeiling int
-	K8sWarmCapacityDynamicTotalCeiling int
-	K8sWorkerCPURequest                string
-	K8sWorkerMemoryRequest             string
-	K8sWorkerNodeSelector              string
-	K8sWorkerTolerationKey             string
-	K8sWorkerTolerationValue           string
-	K8sWorkerExclusiveNode             bool
-	AWSRegion                          string
-	QueryLog                           bool
+	Host                        string
+	Port                        int
+	FlightPort                  int
+	FlightSessionIdleTTL        string
+	FlightSessionReapInterval   string
+	FlightHandleIdleTTL         string
+	FlightSessionTokenTTL       string
+	DataDir                     string
+	CertFile                    string
+	KeyFile                     string
+	FilePersistence             bool
+	ProcessIsolation            bool
+	IdleTimeout                 string
+	SessionInitTimeout          string
+	MemoryLimit                 string
+	Threads                     int
+	MemoryBudget                string
+	MemoryRebalance             bool
+	DuckLakeDeltaCatalogEnabled bool
+	DuckLakeDeltaCatalogPath    string
+	DuckLakeDefaultSpecVersion  string
+	ProcessMinWorkers           int
+	ProcessMaxWorkers           int
+	ProcessRetireOnSessionEnd   bool
+	WorkerQueueTimeout          string
+	WorkerIdleTimeout           string
+	HandoverDrainTimeout        string
+	ACMEDomain                  string
+	ACMEEmail                   string
+	ACMECacheDir                string
+	ACMEDNSProvider             string
+	ACMEDNSZoneID               string
+	MaxConnections              int
+	ConfigStoreConn             string
+	ConfigPollInterval          string
+	InternalSecret              string
+	InternalSecretFallbacks     string
+	ReadOnlySecret             string
+	ReadOnlySecretFallbacks    string
+	SNIRoutingMode              string
+	ManagedHostnameSuffixes     string
+	WorkerBackend               string
+	K8sWorkerImage              string
+	K8sWorkerNamespace          string
+	K8sControlPlaneID           string
+	K8sWorkerPort               int
+	K8sWorkerSecret             string
+	K8sWorkerConfigMap          string
+	K8sWorkerImagePullPolicy    string
+	K8sWorkerServiceAccount     string
+	K8sWorkerCPURequest         string
+	K8sWorkerMemoryRequest      string
+	K8sWorkerNodeSelector       string
+	K8sWorkerTolerationKey      string
+	K8sWorkerTolerationValue    string
+	AWSRegion                   string
+	QueryLog                    bool
+
+	AdmissionReclaimerMaxReservations int
 }
 
 type Resolved struct {
-	Server                             server.Config
-	ProcessMinWorkers                  int
-	ProcessMaxWorkers                  int
-	ProcessRetireOnSessionEnd          bool
-	SessionInitTimeout                 time.Duration
-	WorkerQueueTimeout                 time.Duration
-	WorkerIdleTimeout                  time.Duration
-	HandoverDrainTimeout               time.Duration
-	WorkerBackend                      string
-	K8sWorkerImage                     string
-	K8sWorkerNamespace                 string
-	K8sControlPlaneID                  string
-	K8sWorkerPort                      int
-	K8sWorkerSecret                    string
-	K8sWorkerConfigMap                 string
-	K8sWorkerImagePullPolicy           string
-	K8sWorkerServiceAccount            string
-	K8sMaxWorkers                      int
-	K8sSharedWarmTarget                int
-	K8sDynamicWarmCapacityEnabled      bool
-	K8sWarmCapacityMissWindow          time.Duration
-	K8sWarmCapacityMissesPerWorker     int
-	K8sWarmCapacityDemandTTL           time.Duration
-	K8sWarmCapacityDynamicImageCeiling int
-	K8sWarmCapacityDynamicTotalCeiling int
-	K8sWorkerCPURequest                string
-	K8sWorkerMemoryRequest             string
-	K8sWorkerNodeSelector              string
-	K8sWorkerTolerationKey             string
-	K8sWorkerTolerationValue           string
-	K8sWorkerExclusiveNode             bool
-	K8sAllowClientWorkerProfile        bool
-	K8sAllowClientExclusiveNode        bool
-	K8sColocatedWorkerCPURequest       string
-	K8sColocatedWorkerMemoryRequest    string
-	K8sColocatedWarmShapes             []controlplane.ColocatedWarmShape
-	K8sWorkerPriorityClassName         string
-	K8sWorkerTiers                     map[string]controlplane.WorkerProfileSpec
-	K8sColocatedWorkerNodeSelector     string
-	K8sColocatedWorkerTolerationKey    string
-	K8sColocatedWorkerTolerationValue  string
-	K8sWorkerProfileMinCPU             string
-	K8sWorkerProfileMaxCPU             string
-	K8sWorkerProfileMinMemory          string
-	K8sWorkerProfileMaxMemory          string
-	K8sOrgMaxColocatedCPU              int
-	K8sOrgMaxColocatedMemory           string
-	AWSRegion                          string
-	ConfigStoreConn                    string
-	ConfigPollInterval                 time.Duration
-	InternalSecret                     string
-	SNIRoutingMode                     string
-	ManagedHostnameSuffixes            []string
-	DuckLakeDefaultSpecVersion         string
+	Server                          server.Config
+	ProcessMinWorkers               int
+	ProcessMaxWorkers               int
+	ProcessRetireOnSessionEnd       bool
+	SessionInitTimeout              time.Duration
+	WorkerQueueTimeout              time.Duration
+	WorkerIdleTimeout               time.Duration
+	HandoverDrainTimeout            time.Duration
+	WorkerBackend                   string
+	K8sWorkerImage                  string
+	K8sWorkerNamespace              string
+	K8sControlPlaneID               string
+	K8sWorkerPort                   int
+	K8sWorkerSecret                 string
+	K8sWorkerConfigMap              string
+	K8sWorkerImagePullPolicy        string
+	K8sWorkerServiceAccount         string
+	K8sWorkerCPURequest             string
+	K8sWorkerMemoryRequest          string
+	K8sWorkerNodeSelector           string
+	K8sWorkerTolerationKey          string
+	K8sWorkerTolerationValue        string
+	K8sAllowClientWorkerProfile     bool
+	K8sWorkerPriorityClassName      string
+	K8sPlaceholderImage             string
+	K8sPlaceholderPriorityClassName string
+	K8sWorkerProfileMinCPU          string
+	K8sWorkerProfileMaxCPU          string
+	K8sWorkerProfileMinMemory       string
+	K8sWorkerProfileMaxMemory       string
+	K8sWorkerMaxTTL                 time.Duration
+	K8sWorkerDefaultTTL             time.Duration
+	K8sReshardPodCPU                string
+	K8sReshardPodMemory             string
+	AWSRegion                       string
+	ConfigStoreConn                 string
+	ConfigPollInterval              time.Duration
+	InternalSecret                  string
+	InternalSecretFallbacks         []string
+	ReadOnlySecret                 string
+	ReadOnlySecretFallbacks        []string
+	UserSecretKey                   string
+	SNIRoutingMode                  string
+	ManagedHostnameSuffixes         []string
+	MetadataHostnameSuffixes        []string
+	MetadataProxyMaxConns           int
+	DucklingBucketSuffix            string
+	DuckLakeDefaultSpecVersion      string
+
+	AdmissionReclaimerMaxReservations int
 }
 
 func intPtr(n int) *int    { return &n }
@@ -180,11 +168,11 @@ func DefaultServerConfig() server.Config {
 			DeltaCatalogEnabled:             true,
 		},
 		QueryLog: server.QueryLogConfig{
-			Enabled:              true,
-			FlushInterval:        5 * time.Second,
-			BatchSize:            1000,
-			CompactInterval:      10 * time.Minute,
-			DataInliningRowLimit: 1000,
+			Enabled:       true,
+			FlushInterval: 5 * time.Second,
+			BatchSize:     1000,
+			StartEvents:   server.QueryStartEventsData,
+			Metadata:      true,
 		},
 	}
 }
@@ -207,40 +195,38 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	cfg := DefaultServerConfig()
 	defaultQueryLog := cfg.QueryLog
 	workerQueueTimeout := 60 * time.Second
+	admissionReclaimerMaxReservations := controlplane.DefaultAdmissionReclaimerMaxReservations
 	var workerIdleTimeout time.Duration
 	var handoverDrainTimeout time.Duration
 	var processMinWorkers, processMaxWorkers int
 	var processRetireOnSessionEnd bool
 	var workerBackend string
-	// Connection-string worker-profile config (all default to off/empty).
-	var k8sAllowClientWorkerProfile, k8sAllowClientExclusiveNode bool
-	var k8sColocatedWorkerCPURequest, k8sColocatedWorkerMemoryRequest string
-	var k8sColocatedWarmShapes []controlplane.ColocatedWarmShape
-	var k8sColocatedWorkerNodeSelector, k8sColocatedWorkerTolerationKey, k8sColocatedWorkerTolerationValue string
+	// Connection-string worker-sizing config (all default to off/empty).
+	var k8sAllowClientWorkerProfile bool
 	var k8sWorkerProfileMinCPU, k8sWorkerProfileMaxCPU, k8sWorkerProfileMinMemory, k8sWorkerProfileMaxMemory string
-	var k8sOrgMaxColocatedCPU int
-	var k8sOrgMaxColocatedMemory string
+	var k8sWorkerMaxTTL, k8sWorkerDefaultTTL time.Duration
 	var k8sWorkerPriorityClassName string
-	var k8sWorkerTiers map[string]controlplane.WorkerProfileSpec
+	var k8sPlaceholderImage, k8sPlaceholderPriorityClassName string
 	var k8sWorkerImage, k8sWorkerNamespace, k8sControlPlaneID string
 	var k8sWorkerPort int
 	var k8sWorkerSecret, k8sWorkerConfigMap, k8sWorkerImagePullPolicy string
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
-	var k8sMaxWorkers, k8sSharedWarmTarget int
-	k8sDynamicWarmCapacityEnabled := true
-	k8sWarmCapacityMissWindow := controlplane.DefaultWarmCapacityMissWindow
-	k8sWarmCapacityMissesPerWorker := controlplane.DefaultWarmCapacityMissesPerWorker
-	k8sWarmCapacityDemandTTL := controlplane.DefaultWarmCapacityDemandTTL
-	var k8sWarmCapacityDynamicImageCeiling, k8sWarmCapacityDynamicTotalCeiling int
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
-	var k8sWorkerExclusiveNode bool
+	var k8sReshardPodCPU, k8sReshardPodMemory string
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
 	var internalSecret string
+	var internalSecretFallbacks []string
+	var readOnlySecret string
+	var readOnlySecretFallbacks []string
+	var userSecretKey string
 	var sniRoutingMode string
 	var managedHostnameSuffixes []string
+	var metadataHostnameSuffixes []string
+	metadataProxyMaxConnections := 20
+	var ducklingBucketSuffix string
 
 	if fileCfg != nil {
 		if fileCfg.Host != "" {
@@ -336,15 +322,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		if fileCfg.DuckLake.DeltaCatalogPath != "" {
 			cfg.DuckLake.DeltaCatalogPath = fileCfg.DuckLake.DeltaCatalogPath
 		}
-		if fileCfg.Iceberg.Enabled != nil {
-			cfg.Iceberg.Enabled = *fileCfg.Iceberg.Enabled
-		}
-		if fileCfg.Iceberg.Region != "" {
-			cfg.Iceberg.Region = fileCfg.Iceberg.Region
-		}
-		if fileCfg.Iceberg.Namespace != "" {
-			cfg.Iceberg.Namespace = fileCfg.Iceberg.Namespace
-		}
 		if fileCfg.DuckLake.DisableMetadataThreadLocalCache != nil {
 			cfg.DuckLake.DisableMetadataThreadLocalCache = boolPtr(*fileCfg.DuckLake.DisableMetadataThreadLocalCache)
 		}
@@ -432,6 +409,11 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 				warn("Invalid worker_queue_timeout duration: " + err.Error())
 			}
 		}
+		if fileCfg.AdmissionReclaimerMaxReservations > 0 {
+			admissionReclaimerMaxReservations = fileCfg.AdmissionReclaimerMaxReservations
+		} else if fileCfg.AdmissionReclaimerMaxReservations < 0 {
+			warn("admission_reclaimer_max_reservations must be > 0")
+		}
 		if fileCfg.WorkerIdleTimeout != "" {
 			if d, err := time.ParseDuration(fileCfg.WorkerIdleTimeout); err == nil {
 				workerIdleTimeout = d
@@ -464,18 +446,14 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 				warn("Invalid query_log.flush_interval duration: " + err.Error())
 			}
 		}
+		if fileCfg.QueryLog.Metadata != nil {
+			cfg.QueryLog.Metadata = *fileCfg.QueryLog.Metadata
+		}
+		if fileCfg.QueryLog.StartEvents != "" {
+			cfg.QueryLog.StartEvents = server.NormalizeQueryStartEvents(fileCfg.QueryLog.StartEvents)
+		}
 		if fileCfg.QueryLog.BatchSize > 0 {
 			cfg.QueryLog.BatchSize = fileCfg.QueryLog.BatchSize
-		}
-		if fileCfg.QueryLog.CompactInterval != "" {
-			if d, err := time.ParseDuration(fileCfg.QueryLog.CompactInterval); err == nil {
-				cfg.QueryLog.CompactInterval = d
-			} else {
-				warn("Invalid query_log.compact_interval duration: " + err.Error())
-			}
-		}
-		if fileCfg.QueryLog.DataInliningRowLimit > 0 {
-			cfg.QueryLog.DataInliningRowLimit = fileCfg.QueryLog.DataInliningRowLimit
 		}
 
 		if fileCfg.TLS.ACME.Domain != "" {
@@ -520,38 +498,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.K8s.WorkerServiceAccount != "" {
 			k8sWorkerServiceAccount = fileCfg.K8s.WorkerServiceAccount
-		}
-		if fileCfg.K8s.MaxWorkers != 0 {
-			k8sMaxWorkers = fileCfg.K8s.MaxWorkers
-		}
-		if fileCfg.K8s.SharedWarmTarget != 0 {
-			k8sSharedWarmTarget = fileCfg.K8s.SharedWarmTarget
-		}
-		if fileCfg.K8s.DynamicWarmCapacityEnabled != nil {
-			k8sDynamicWarmCapacityEnabled = *fileCfg.K8s.DynamicWarmCapacityEnabled
-		}
-		if fileCfg.K8s.WarmCapacityMissWindow != "" {
-			if d, err := time.ParseDuration(fileCfg.K8s.WarmCapacityMissWindow); err == nil {
-				k8sWarmCapacityMissWindow = d
-			} else {
-				warn("Invalid k8s.warm_capacity_miss_window duration: " + err.Error())
-			}
-		}
-		if fileCfg.K8s.WarmCapacityMissesPerWorker != 0 {
-			k8sWarmCapacityMissesPerWorker = fileCfg.K8s.WarmCapacityMissesPerWorker
-		}
-		if fileCfg.K8s.WarmCapacityDemandTTL != "" {
-			if d, err := time.ParseDuration(fileCfg.K8s.WarmCapacityDemandTTL); err == nil {
-				k8sWarmCapacityDemandTTL = d
-			} else {
-				warn("Invalid k8s.warm_capacity_demand_ttl duration: " + err.Error())
-			}
-		}
-		if fileCfg.K8s.WarmCapacityDynamicImageCeiling != 0 {
-			k8sWarmCapacityDynamicImageCeiling = fileCfg.K8s.WarmCapacityDynamicImageCeiling
-		}
-		if fileCfg.K8s.WarmCapacityDynamicTotalCeiling != 0 {
-			k8sWarmCapacityDynamicTotalCeiling = fileCfg.K8s.WarmCapacityDynamicTotalCeiling
 		}
 		if fileCfg.DuckLake.DefaultSpecVersion != "" {
 			cfg.DuckLake.SpecVersion = fileCfg.DuckLake.DefaultSpecVersion
@@ -625,19 +571,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_DELTA_CATALOG_PATH"); v != "" {
 		cfg.DuckLake.DeltaCatalogPath = v
-	}
-	if v := getenv("DUCKGRES_ICEBERG_ENABLED"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			cfg.Iceberg.Enabled = b
-		} else {
-			warn("Invalid DUCKGRES_ICEBERG_ENABLED: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_ICEBERG_REGION"); v != "" {
-		cfg.Iceberg.Region = v
-	}
-	if v := getenv("DUCKGRES_ICEBERG_NAMESPACE"); v != "" {
-		cfg.Iceberg.Namespace = v
 	}
 	if v := getenv("DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -779,6 +712,15 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_WORKER_QUEUE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			admissionReclaimerMaxReservations = n
+		} else if err != nil {
+			warn("Invalid DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS: " + err.Error())
+		} else {
+			warn("DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS must be > 0")
+		}
+	}
 	if v := getenv("DUCKGRES_WORKER_IDLE_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			workerIdleTimeout = d
@@ -828,11 +770,44 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_INTERNAL_SECRET"); v != "" {
 		internalSecret = v
 	}
+	if v := getenv("DUCKGRES_INTERNAL_SECRET_FALLBACKS"); v != "" {
+		internalSecretFallbacks = splitAndTrim(v, ",")
+	}
+	if v := getenv("DUCKGRES_READ_ONLY_SECRET"); v != "" {
+		readOnlySecret = v
+	}
+	if v := getenv("DUCKGRES_READ_ONLY_SECRET_FALLBACKS"); v != "" {
+		readOnlySecretFallbacks = splitAndTrim(v, ",")
+	}
+	// Env-only (no CLI flag, no YAML): the AES key for user persistent
+	// secrets should only arrive via a mounted K8s Secret.
+	if v := getenv("DUCKGRES_USER_SECRET_KEY"); v != "" {
+		userSecretKey = v
+	}
 	if v := getenv("DUCKGRES_SNI_ROUTING_MODE"); v != "" {
 		sniRoutingMode = v
 	}
 	if v := getenv("DUCKGRES_MANAGED_HOSTNAME_SUFFIXES"); v != "" {
 		managedHostnameSuffixes = splitAndTrim(v, ",")
+	}
+	if v := getenv("DUCKGRES_METADATA_HOSTNAME_SUFFIXES"); v != "" {
+		metadataHostnameSuffixes = splitAndTrim(v, ",")
+	}
+	if v := getenv("DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			metadataProxyMaxConnections = n
+		} else if err != nil {
+			warn("Invalid DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG: " + err.Error())
+		} else {
+			warn("DUCKGRES_METADATA_PROXY_MAX_CONNECTIONS_PER_ORG must be > 0")
+		}
+	}
+	// Env-only (set by the duckgres Helm chart per environment). The env suffix
+	// the control plane uses to name a type=s3bucket Duckling's per-org bucket:
+	// posthog-duckling-<compact-org>-<suffix>. Must equal crossplane-config's
+	// envSuffix. Empty ⇒ CP does not name buckets (composition derives).
+	if v := getenv("DUCKGRES_DUCKLING_BUCKET_SUFFIX"); v != "" {
+		ducklingBucketSuffix = v
 	}
 	if v := getenv("DUCKGRES_WORKER_BACKEND"); v != "" {
 		workerBackend = v
@@ -865,62 +840,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT"); v != "" {
 		k8sWorkerServiceAccount = v
 	}
-	if v := getenv("DUCKGRES_K8S_MAX_WORKERS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sMaxWorkers = n
-		} else {
-			warn("Invalid DUCKGRES_K8S_MAX_WORKERS: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_SHARED_WARM_TARGET"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sSharedWarmTarget = n
-		} else {
-			warn("Invalid DUCKGRES_K8S_SHARED_WARM_TARGET: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			k8sDynamicWarmCapacityEnabled = b
-		} else {
-			warn("Invalid DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			k8sWarmCapacityMissWindow = d
-		} else {
-			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW duration: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sWarmCapacityMissesPerWorker = n
-		} else {
-			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			k8sWarmCapacityDemandTTL = d
-		} else {
-			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL duration: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sWarmCapacityDynamicImageCeiling = n
-		} else {
-			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sWarmCapacityDynamicTotalCeiling = n
-		} else {
-			warn("Invalid DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING: " + err.Error())
-		}
-	}
 	if v := getenv("DUCKGRES_K8S_WORKER_CPU_REQUEST"); v != "" {
 		k8sWorkerCPURequest = v
 	}
@@ -936,10 +855,14 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_TOLERATION_VALUE"); v != "" {
 		k8sWorkerTolerationValue = v
 	}
-	if v := getenv("DUCKGRES_K8S_WORKER_EXCLUSIVE_NODE"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			k8sWorkerExclusiveNode = b
-		}
+	// Reshard runner pod shape (env-only, like the other pod-scheduling knobs):
+	// the dedicated duckgres-reshard-op-<id> pods' requests=limits. Empty →
+	// built-in defaults (2 CPU / 8Gi).
+	if v := getenv("DUCKGRES_RESHARD_POD_CPU"); v != "" {
+		k8sReshardPodCPU = v
+	}
+	if v := getenv("DUCKGRES_RESHARD_POD_MEMORY"); v != "" {
+		k8sReshardPodMemory = v
 	}
 
 	// Connection-string worker-profile config.
@@ -949,36 +872,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		} else {
 			warn("Invalid DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE: " + err.Error())
 		}
-	}
-	if v := getenv("DUCKGRES_K8S_ALLOW_CLIENT_EXCLUSIVE_NODE"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			k8sAllowClientExclusiveNode = b
-		} else {
-			warn("Invalid DUCKGRES_K8S_ALLOW_CLIENT_EXCLUSIVE_NODE: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_CPU_REQUEST"); v != "" {
-		k8sColocatedWorkerCPURequest = v
-	}
-	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_MEMORY_REQUEST"); v != "" {
-		k8sColocatedWorkerMemoryRequest = v
-	}
-	if v := getenv("DUCKGRES_K8S_COLOCATED_WARM_SHAPES"); v != "" {
-		var shapes []controlplane.ColocatedWarmShape
-		if err := json.Unmarshal([]byte(v), &shapes); err == nil {
-			k8sColocatedWarmShapes = shapes
-		} else {
-			warn("Invalid DUCKGRES_K8S_COLOCATED_WARM_SHAPES (want JSON [{\"cpu\":\"4\",\"memory\":\"16Gi\",\"target\":8}]): " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_NODE_SELECTOR"); v != "" {
-		k8sColocatedWorkerNodeSelector = v
-	}
-	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_TOLERATION_KEY"); v != "" {
-		k8sColocatedWorkerTolerationKey = v
-	}
-	if v := getenv("DUCKGRES_K8S_COLOCATED_WORKER_TOLERATION_VALUE"); v != "" {
-		k8sColocatedWorkerTolerationValue = v
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU"); v != "" {
 		k8sWorkerProfileMinCPU = v
@@ -992,26 +885,28 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY"); v != "" {
 		k8sWorkerProfileMaxMemory = v
 	}
-	if v := getenv("DUCKGRES_K8S_ORG_MAX_COLOCATED_CPU"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			k8sOrgMaxColocatedCPU = n
+	if v := getenv("DUCKGRES_K8S_WORKER_MAX_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			k8sWorkerMaxTTL = d
 		} else {
-			warn("Invalid DUCKGRES_K8S_ORG_MAX_COLOCATED_CPU: " + err.Error())
+			warn("Invalid DUCKGRES_K8S_WORKER_MAX_TTL: " + v)
 		}
 	}
-	if v := getenv("DUCKGRES_K8S_ORG_MAX_COLOCATED_MEMORY"); v != "" {
-		k8sOrgMaxColocatedMemory = v
+	if v := getenv("DUCKGRES_K8S_WORKER_DEFAULT_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			k8sWorkerDefaultTTL = d
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_DEFAULT_TTL: " + v)
+		}
 	}
 	if v := getenv("DUCKGRES_K8S_WORKER_PRIORITY_CLASS"); v != "" {
 		k8sWorkerPriorityClassName = v
 	}
-	if v := getenv("DUCKGRES_K8S_WORKER_TIERS"); v != "" {
-		var tiers map[string]controlplane.WorkerProfileSpec
-		if err := json.Unmarshal([]byte(v), &tiers); err == nil {
-			k8sWorkerTiers = tiers
-		} else {
-			warn("Invalid DUCKGRES_K8S_WORKER_TIERS (want JSON {\"backfill\":{\"cpu\":\"4\",\"memory\":\"16Gi\",\"colocate\":true}}): " + err.Error())
-		}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_IMAGE"); v != "" {
+		k8sPlaceholderImage = v
+	}
+	if v := getenv("DUCKGRES_K8S_PLACEHOLDER_PRIORITY_CLASS"); v != "" {
+		k8sPlaceholderPriorityClassName = v
 	}
 
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
@@ -1033,25 +928,21 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_QUERY_LOG_FLUSH_INTERVAL duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_QUERY_LOG_METADATA"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.QueryLog.Metadata = b
+		} else {
+			warn("Invalid DUCKGRES_QUERY_LOG_METADATA: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_QUERY_LOG_START_EVENTS"); v != "" {
+		cfg.QueryLog.StartEvents = server.NormalizeQueryStartEvents(v)
+	}
 	if v := getenv("DUCKGRES_QUERY_LOG_BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.QueryLog.BatchSize = n
 		} else {
 			warn("Invalid DUCKGRES_QUERY_LOG_BATCH_SIZE: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.QueryLog.CompactInterval = d
-		} else {
-			warn("Invalid DUCKGRES_QUERY_LOG_COMPACT_INTERVAL duration: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			cfg.QueryLog.DataInliningRowLimit = n
-		} else {
-			warn("Invalid DUCKGRES_QUERY_LOG_DATA_INLINING_ROW_LIMIT: " + err.Error())
 		}
 	}
 
@@ -1139,15 +1030,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cli.Set["ducklake-delta-catalog-path"] {
 		cfg.DuckLake.DeltaCatalogPath = cli.DuckLakeDeltaCatalogPath
 	}
-	if cli.Set["iceberg-enabled"] {
-		cfg.Iceberg.Enabled = cli.IcebergEnabled
-	}
-	if cli.Set["iceberg-region"] {
-		cfg.Iceberg.Region = cli.IcebergRegion
-	}
-	if cli.Set["iceberg-namespace"] {
-		cfg.Iceberg.Namespace = cli.IcebergNamespace
-	}
 	if cli.Set["ducklake-default-spec-version"] {
 		cfg.DuckLake.SpecVersion = cli.DuckLakeDefaultSpecVersion
 	}
@@ -1165,6 +1047,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			workerQueueTimeout = d
 		} else {
 			warn("Invalid --worker-queue-timeout duration: " + err.Error())
+		}
+	}
+	if cli.Set["admission-reclaimer-max-reservations"] {
+		if cli.AdmissionReclaimerMaxReservations > 0 {
+			admissionReclaimerMaxReservations = cli.AdmissionReclaimerMaxReservations
+		} else {
+			warn("--admission-reclaimer-max-reservations must be > 0")
 		}
 	}
 	if cli.Set["worker-idle-timeout"] {
@@ -1212,6 +1101,19 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if cli.Set["internal-secret"] {
 		internalSecret = cli.InternalSecret
 	}
+	if cli.Set["internal-secret-fallbacks"] {
+		// An explicitly-set empty flag clears env-provided fallbacks
+		// (splitAndTrim("") == nil), same semantics as posthog's
+		// JWT_SIGNING_KEY_FALLBACKS.
+		internalSecretFallbacks = splitAndTrim(cli.InternalSecretFallbacks, ",")
+	}
+	if cli.Set["read-only-secret"] {
+		readOnlySecret = cli.ReadOnlySecret
+	}
+	if cli.Set["read-only-secret-fallbacks"] {
+		// Same explicit-empty-clears semantics as internal-secret-fallbacks.
+		readOnlySecretFallbacks = splitAndTrim(cli.ReadOnlySecretFallbacks, ",")
+	}
 	if cli.Set["sni-routing-mode"] {
 		sniRoutingMode = cli.SNIRoutingMode
 	}
@@ -1251,38 +1153,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if cli.Set["k8s-worker-service-account"] {
 		k8sWorkerServiceAccount = cli.K8sWorkerServiceAccount
-	}
-	if cli.Set["k8s-max-workers"] {
-		k8sMaxWorkers = cli.K8sMaxWorkers
-	}
-	if cli.Set["k8s-shared-warm-target"] {
-		k8sSharedWarmTarget = cli.K8sSharedWarmTarget
-	}
-	if cli.Set["k8s-dynamic-warm-capacity-enabled"] {
-		k8sDynamicWarmCapacityEnabled = cli.K8sDynamicWarmCapacityEnabled
-	}
-	if cli.Set["k8s-warm-capacity-miss-window"] {
-		if d, err := time.ParseDuration(cli.K8sWarmCapacityMissWindow); err == nil {
-			k8sWarmCapacityMissWindow = d
-		} else {
-			warn("Invalid --k8s-warm-capacity-miss-window duration: " + err.Error())
-		}
-	}
-	if cli.Set["k8s-warm-capacity-misses-per-worker"] {
-		k8sWarmCapacityMissesPerWorker = cli.K8sWarmCapacityMissesPerWorker
-	}
-	if cli.Set["k8s-warm-capacity-demand-ttl"] {
-		if d, err := time.ParseDuration(cli.K8sWarmCapacityDemandTTL); err == nil {
-			k8sWarmCapacityDemandTTL = d
-		} else {
-			warn("Invalid --k8s-warm-capacity-demand-ttl duration: " + err.Error())
-		}
-	}
-	if cli.Set["k8s-warm-capacity-dynamic-image-ceiling"] {
-		k8sWarmCapacityDynamicImageCeiling = cli.K8sWarmCapacityDynamicImageCeiling
-	}
-	if cli.Set["k8s-warm-capacity-dynamic-total-ceiling"] {
-		k8sWarmCapacityDynamicTotalCeiling = cli.K8sWarmCapacityDynamicTotalCeiling
 	}
 	if cli.Set["aws-region"] {
 		awsRegion = cli.AWSRegion
@@ -1334,97 +1204,68 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		warn("DUCKGRES_QUERY_LOG_FLUSH_INTERVAL must be > 0; using default")
 		cfg.QueryLog.FlushInterval = defaultQueryLog.FlushInterval
 	}
+	// An empty value means the config predates start events; normalize rather
+	// than leaving a zero value that would read as "off".
+	cfg.QueryLog.StartEvents = server.NormalizeQueryStartEvents(string(cfg.QueryLog.StartEvents))
 	if cfg.QueryLog.BatchSize <= 0 {
 		warn("DUCKGRES_QUERY_LOG_BATCH_SIZE must be > 0; using default")
 		cfg.QueryLog.BatchSize = defaultQueryLog.BatchSize
 	}
-	if cfg.QueryLog.CompactInterval <= 0 {
-		warn("DUCKGRES_QUERY_LOG_COMPACT_INTERVAL must be > 0; using default")
-		cfg.QueryLog.CompactInterval = defaultQueryLog.CompactInterval
-	}
 	if cfg.DuckLake.DeltaCatalogEnabled && cfg.DuckLake.DeltaCatalogPath == "" {
 		cfg.DuckLake.DeltaCatalogPath = ducklake.DefaultDeltaCatalogPath(cfg.DuckLake)
 	}
-	if k8sWarmCapacityMissWindow <= 0 {
-		warn("k8s warm_capacity_miss_window must be > 0; using default")
-		k8sWarmCapacityMissWindow = controlplane.DefaultWarmCapacityMissWindow
-	}
-	if k8sWarmCapacityMissesPerWorker <= 0 {
-		warn("k8s warm_capacity_misses_per_worker must be > 0; using default")
-		k8sWarmCapacityMissesPerWorker = controlplane.DefaultWarmCapacityMissesPerWorker
-	}
-	if k8sWarmCapacityDemandTTL <= 0 {
-		warn("k8s warm_capacity_demand_ttl must be > 0; using default")
-		k8sWarmCapacityDemandTTL = controlplane.DefaultWarmCapacityDemandTTL
-	}
-	if k8sWarmCapacityDemandTTL < k8sWarmCapacityMissWindow {
-		warn("k8s warm_capacity_demand_ttl must be >= warm_capacity_miss_window; using warm_capacity_miss_window")
-		k8sWarmCapacityDemandTTL = k8sWarmCapacityMissWindow
-	}
-	if k8sWarmCapacityDynamicImageCeiling < 0 {
-		warn("k8s warm_capacity_dynamic_image_ceiling must be >= 0; disabling image ceiling")
-		k8sWarmCapacityDynamicImageCeiling = 0
-	}
-	if k8sWarmCapacityDynamicTotalCeiling < 0 {
-		warn("k8s warm_capacity_dynamic_total_ceiling must be >= 0; disabling total ceiling")
-		k8sWarmCapacityDynamicTotalCeiling = 0
-	}
 
 	return Resolved{
-		Server:                             cfg,
-		ProcessMinWorkers:                  processMinWorkers,
-		ProcessMaxWorkers:                  processMaxWorkers,
-		ProcessRetireOnSessionEnd:          processRetireOnSessionEnd,
-		SessionInitTimeout:                 cfg.SessionInitTimeout,
-		WorkerQueueTimeout:                 workerQueueTimeout,
-		WorkerIdleTimeout:                  workerIdleTimeout,
-		HandoverDrainTimeout:               handoverDrainTimeout,
-		WorkerBackend:                      workerBackend,
-		K8sWorkerImage:                     k8sWorkerImage,
-		K8sWorkerNamespace:                 k8sWorkerNamespace,
-		K8sControlPlaneID:                  k8sControlPlaneID,
-		K8sWorkerPort:                      k8sWorkerPort,
-		K8sWorkerSecret:                    k8sWorkerSecret,
-		K8sWorkerConfigMap:                 k8sWorkerConfigMap,
-		K8sWorkerImagePullPolicy:           k8sWorkerImagePullPolicy,
-		K8sWorkerServiceAccount:            k8sWorkerServiceAccount,
-		K8sMaxWorkers:                      k8sMaxWorkers,
-		K8sSharedWarmTarget:                k8sSharedWarmTarget,
-		K8sDynamicWarmCapacityEnabled:      k8sDynamicWarmCapacityEnabled,
-		K8sWarmCapacityMissWindow:          k8sWarmCapacityMissWindow,
-		K8sWarmCapacityMissesPerWorker:     k8sWarmCapacityMissesPerWorker,
-		K8sWarmCapacityDemandTTL:           k8sWarmCapacityDemandTTL,
-		K8sWarmCapacityDynamicImageCeiling: k8sWarmCapacityDynamicImageCeiling,
-		K8sWarmCapacityDynamicTotalCeiling: k8sWarmCapacityDynamicTotalCeiling,
-		K8sWorkerCPURequest:                k8sWorkerCPURequest,
-		K8sWorkerMemoryRequest:             k8sWorkerMemoryRequest,
-		K8sWorkerNodeSelector:              k8sWorkerNodeSelector,
-		K8sWorkerTolerationKey:             k8sWorkerTolerationKey,
-		K8sWorkerTolerationValue:           k8sWorkerTolerationValue,
-		K8sWorkerExclusiveNode:             k8sWorkerExclusiveNode,
-		K8sAllowClientWorkerProfile:        k8sAllowClientWorkerProfile,
-		K8sAllowClientExclusiveNode:        k8sAllowClientExclusiveNode,
-		K8sColocatedWorkerCPURequest:       k8sColocatedWorkerCPURequest,
-		K8sColocatedWorkerMemoryRequest:    k8sColocatedWorkerMemoryRequest,
-		K8sColocatedWarmShapes:             k8sColocatedWarmShapes,
-		K8sWorkerPriorityClassName:         k8sWorkerPriorityClassName,
-		K8sWorkerTiers:                     k8sWorkerTiers,
-		K8sColocatedWorkerNodeSelector:     k8sColocatedWorkerNodeSelector,
-		K8sColocatedWorkerTolerationKey:    k8sColocatedWorkerTolerationKey,
-		K8sColocatedWorkerTolerationValue:  k8sColocatedWorkerTolerationValue,
-		K8sWorkerProfileMinCPU:             k8sWorkerProfileMinCPU,
-		K8sWorkerProfileMaxCPU:             k8sWorkerProfileMaxCPU,
-		K8sWorkerProfileMinMemory:          k8sWorkerProfileMinMemory,
-		K8sWorkerProfileMaxMemory:          k8sWorkerProfileMaxMemory,
-		K8sOrgMaxColocatedCPU:              k8sOrgMaxColocatedCPU,
-		K8sOrgMaxColocatedMemory:           k8sOrgMaxColocatedMemory,
-		AWSRegion:                          awsRegion,
-		ConfigStoreConn:                    configStoreConn,
-		ConfigPollInterval:                 configPollInterval,
-		InternalSecret:                     internalSecret,
-		SNIRoutingMode:                     sniRoutingMode,
-		ManagedHostnameSuffixes:            managedHostnameSuffixes,
-		DuckLakeDefaultSpecVersion:         cfg.DuckLake.SpecVersion,
+		Server:                          cfg,
+		ProcessMinWorkers:               processMinWorkers,
+		ProcessMaxWorkers:               processMaxWorkers,
+		ProcessRetireOnSessionEnd:       processRetireOnSessionEnd,
+		SessionInitTimeout:              cfg.SessionInitTimeout,
+		WorkerQueueTimeout:              workerQueueTimeout,
+		WorkerIdleTimeout:               workerIdleTimeout,
+		HandoverDrainTimeout:            handoverDrainTimeout,
+		WorkerBackend:                   workerBackend,
+		K8sWorkerImage:                  k8sWorkerImage,
+		K8sWorkerNamespace:              k8sWorkerNamespace,
+		K8sControlPlaneID:               k8sControlPlaneID,
+		K8sWorkerPort:                   k8sWorkerPort,
+		K8sWorkerSecret:                 k8sWorkerSecret,
+		K8sWorkerConfigMap:              k8sWorkerConfigMap,
+		K8sWorkerImagePullPolicy:        k8sWorkerImagePullPolicy,
+		K8sWorkerServiceAccount:         k8sWorkerServiceAccount,
+		K8sWorkerCPURequest:             k8sWorkerCPURequest,
+		K8sWorkerMemoryRequest:          k8sWorkerMemoryRequest,
+		K8sWorkerNodeSelector:           k8sWorkerNodeSelector,
+		K8sWorkerTolerationKey:          k8sWorkerTolerationKey,
+		K8sWorkerTolerationValue:        k8sWorkerTolerationValue,
+		K8sAllowClientWorkerProfile:     k8sAllowClientWorkerProfile,
+		K8sWorkerPriorityClassName:      k8sWorkerPriorityClassName,
+		K8sPlaceholderImage:             k8sPlaceholderImage,
+		K8sPlaceholderPriorityClassName: k8sPlaceholderPriorityClassName,
+		K8sWorkerProfileMinCPU:          k8sWorkerProfileMinCPU,
+		K8sWorkerProfileMaxCPU:          k8sWorkerProfileMaxCPU,
+		K8sWorkerProfileMinMemory:       k8sWorkerProfileMinMemory,
+		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
+		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
+		K8sWorkerDefaultTTL:             k8sWorkerDefaultTTL,
+		K8sReshardPodCPU:                k8sReshardPodCPU,
+		K8sReshardPodMemory:             k8sReshardPodMemory,
+		AWSRegion:                       awsRegion,
+		ConfigStoreConn:                 configStoreConn,
+		ConfigPollInterval:              configPollInterval,
+		InternalSecret:                  internalSecret,
+		InternalSecretFallbacks:         internalSecretFallbacks,
+		ReadOnlySecret:                 readOnlySecret,
+		ReadOnlySecretFallbacks:        readOnlySecretFallbacks,
+		UserSecretKey:                   userSecretKey,
+		SNIRoutingMode:                  sniRoutingMode,
+		ManagedHostnameSuffixes:         managedHostnameSuffixes,
+		MetadataHostnameSuffixes:        metadataHostnameSuffixes,
+		MetadataProxyMaxConns:           metadataProxyMaxConnections,
+		DucklingBucketSuffix:            ducklingBucketSuffix,
+		DuckLakeDefaultSpecVersion:      cfg.DuckLake.SpecVersion,
+
+		AdmissionReclaimerMaxReservations: admissionReclaimerMaxReservations,
 	}
 }
 

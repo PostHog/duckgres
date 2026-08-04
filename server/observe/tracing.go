@@ -127,6 +127,12 @@ func collectOperatorTimings(ops []profilingOperator) (scanTime, scanRows float64
 // (e.g. query_log) use it to persist a few high-signal fields without
 // re-parsing the JSON.
 type QueryProfilingSummary struct {
+	// CPUTimeSeconds is DuckDB's cumulative query CPU/thread time in seconds.
+	// Zero means either no profiling output, or DuckDB reported no CPU time.
+	CPUTimeSeconds float64
+	// PeakBufferMemoryBytes is DuckDB's system_peak_buffer_memory value.
+	// It is DuckDB buffer memory, not process RSS or cgroup memory.
+	PeakBufferMemoryBytes int64
 	// PostgresScanSeconds is the thread-time spent inside postgres_scan
 	// operators — DuckLake metadata DB roundtrips. Zero means either no
 	// metadata access on this query, or no profiling output.
@@ -151,6 +157,7 @@ func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 
 	span.SetAttributes(
 		attribute.Float64("duckdb.latency_s", m.Latency),
+		attribute.Float64("duckdb.cpu_time_s", m.CPUTime),
 		attribute.Int64("duckdb.rows_returned", int64(m.RowsReturned)),
 		attribute.Int64("duckdb.result_set_size", int64(m.ResultSetSize)),
 		attribute.Int64("duckdb.total_memory_allocated", int64(m.TotalMemoryAllocated)),
@@ -228,7 +235,11 @@ func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		compSpan.End(trace.WithTimestamp(cursor))
 	}
 
-	return QueryProfilingSummary{PostgresScanSeconds: pgScanTime}
+	return QueryProfilingSummary{
+		CPUTimeSeconds:        m.CPUTime,
+		PeakBufferMemoryBytes: int64(m.PeakBufferMemory),
+		PostgresScanSeconds:   pgScanTime,
+	}
 }
 
 // TraceIDFromContext returns the hex trace ID from the span context, or "".

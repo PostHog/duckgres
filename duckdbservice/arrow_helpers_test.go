@@ -1021,6 +1021,167 @@ func TestNestedTypesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGetQuerySchemaExplainDoesNotExecute(t *testing.T) {
+	// Regression: GetQuerySchema used to execute EXPLAIN ANALYZE to learn its
+	// schema, which for a write mutates — and DoGet then executes it again,
+	// double-inserting. EXPLAIN must now yield a synthetic schema without running.
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		query   string
+		wantCol string
+	}{
+		{"explain select", "EXPLAIN SELECT 1", "physical_plan"},
+		{"explain analyze insert", "EXPLAIN ANALYZE INSERT INTO t VALUES (1)", "analyzed_plan"},
+		{"explain analyze parens", "EXPLAIN (ANALYZE) INSERT INTO t VALUES (2)", "analyzed_plan"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := GetQuerySchema(context.Background(), db, tc.query, nil)
+			if err != nil {
+				t.Fatalf("GetQuerySchema(%q) error: %v", tc.query, err)
+			}
+			if schema.NumFields() != 1 {
+				t.Fatalf("GetQuerySchema(%q) = %d fields, want 1", tc.query, schema.NumFields())
+			}
+			if got := schema.Field(0).Name; got != tc.wantCol {
+				t.Errorf("column name = %q, want %q", got, tc.wantCol)
+			}
+		})
+	}
+
+	// The schema probes above must NOT have inserted any rows.
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM t").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("EXPLAIN ANALYZE schema probe executed the write: %d rows, want 0", n)
+	}
+}
+
+func TestRowsToRecordExplainUsesPlanValueColumn(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("failed to open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	ctx := context.Background()
+	if _, err := conn.ExecContext(ctx, "PRAGMA explain_output='all'"); err != nil {
+		t.Fatalf("set explain output: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE explain_write_once (id INTEGER)"); err != nil {
+		t.Fatalf("create write table: %v", err)
+	}
+
+	cases := []struct {
+		name        string
+		query       string
+		wantCol     string
+		minPlanRows int
+		after       func(t *testing.T)
+	}{
+		{
+			name:        "explain",
+			query:       "EXPLAIN SELECT 1",
+			wantCol:     "physical_plan",
+			minPlanRows: 2,
+		},
+		{
+			name:        "explain analyze",
+			query:       "EXPLAIN ANALYZE INSERT INTO explain_write_once VALUES (1)",
+			wantCol:     "analyzed_plan",
+			minPlanRows: 1,
+			after: func(t *testing.T) {
+				t.Helper()
+				var n int
+				if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM explain_write_once").Scan(&n); err != nil {
+					t.Fatalf("count write table: %v", err)
+				}
+				if n != 1 {
+					t.Fatalf("EXPLAIN ANALYZE write count = %d, want 1", n)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := GetQuerySchema(ctx, conn, tc.query, nil)
+			if err != nil {
+				t.Fatalf("GetQuerySchema: %v", err)
+			}
+			if got := schema.NumFields(); got != 1 {
+				t.Fatalf("schema fields = %d, want 1", got)
+			}
+			if got := schema.Field(0).Name; got != tc.wantCol {
+				t.Fatalf("schema field = %q, want %s", got, tc.wantCol)
+			}
+
+			rows, err := conn.QueryContext(ctx, tc.query)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			defer func() { _ = rows.Close() }()
+
+			rec, err := RowsToRecord(memory.NewGoAllocator(), rows, schema, 1024)
+			if err != nil {
+				t.Fatalf("RowsToRecord: %v", err)
+			}
+			if rec == nil {
+				t.Fatal("RowsToRecord returned nil")
+			}
+			defer rec.Release()
+
+			plans := rec.Column(0).(*array.String)
+			if plans.Len() < tc.minPlanRows {
+				t.Fatalf("EXPLAIN returned %d plan rows, want at least %d", plans.Len(), tc.minPlanRows)
+			}
+			for i := 0; i < plans.Len(); i++ {
+				if got := plans.Value(i); got == "" || isExplainKey(got) {
+					t.Fatalf("plan row %d = %q, want rendered plan text", i, got)
+				}
+			}
+
+			next, err := RowsToRecord(memory.NewGoAllocator(), rows, schema, 1024)
+			if err != nil {
+				t.Fatalf("RowsToRecord at EOF: %v", err)
+			}
+			if next != nil {
+				defer next.Release()
+				t.Fatal("RowsToRecord at EOF returned a record, want nil")
+			}
+			if tc.after != nil {
+				tc.after(t)
+			}
+		})
+	}
+}
+
+func isExplainKey(value string) bool {
+	switch value {
+	case "logical_plan", "logical_opt", "physical_plan", "analyzed_plan":
+		return true
+	default:
+		return false
+	}
+}
+
 func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 	// Regression test: queries ending with ";" caused "syntax error at or near LIMIT"
 	// because GetQuerySchema appended " LIMIT 0" after the semicolon, producing "; LIMIT 0".
@@ -1059,3 +1220,164 @@ func TestGetQuerySchemaTrailingSemicolon(t *testing.T) {
 	}
 }
 
+func TestGetQuerySchemaPreservesExactDatabaseTypeNamesForRemoteCopyRouting(t *testing.T) {
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open DuckDB: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`
+		CREATE TABLE remote_copy_schema (
+			u UUID,
+			h HUGEINT,
+			id BIGINT,
+			score DOUBLE,
+			amount DECIMAL(18,4),
+			label VARCHAR,
+			enabled BOOLEAN,
+			usage_date DATE,
+			created_at TIMESTAMP,
+			observed_at TIMESTAMPTZ,
+			payload BLOB
+		)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	schema, err := GetQuerySchema(
+		context.Background(),
+		db,
+		"SELECT u, h, id, score, amount, label, enabled, usage_date, created_at, observed_at, payload FROM remote_copy_schema",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("GetQuerySchema: %v", err)
+	}
+
+	want := []string{
+		"UUID",
+		"HUGEINT",
+		"BIGINT",
+		"DOUBLE",
+		"DECIMAL(18,4)",
+		"VARCHAR",
+		"BOOLEAN",
+		"DATE",
+		"TIMESTAMP",
+		"TIMESTAMPTZ",
+		"BLOB",
+	}
+	if schema.NumFields() != len(want) {
+		t.Fatalf("schema fields = %d, want %d", schema.NumFields(), len(want))
+	}
+	for i, exactType := range want {
+		got, ok := schema.Field(i).Metadata.GetValue("duckgres.database_type_name")
+		if !ok {
+			t.Errorf("field %q has no exact database type metadata", schema.Field(i).Name)
+			continue
+		}
+		if got != exactType {
+			t.Errorf("field %q exact database type = %q, want %q", schema.Field(i).Name, got, exactType)
+		}
+	}
+}
+
+// TestRowsToRecordNoRowsLostAtBatchBoundary reproduces the production bug where
+// RowsToRecord silently dropped one row at every batch transition for unbounded
+// SELECTs. The driver-level cursor was being advanced by the loop condition
+// `rows.Next() && count < batchSize` even when the batch was already full, so
+// the row at index `batchSize`, `2*batchSize`, ... never reached a Scan call
+// and was lost when the caller asked for the next batch.
+//
+// Reported by Marce Coll on dbt_marce.credit_purchase_events
+// (12617 rows reported by COUNT(*), 12605 rows delivered by SELECT) and
+// dbt.usage_allocation (2,689,942 vs 2,687,758). Symptoms:
+//   - SELECT col FROM big_table delivers fewer rows than COUNT(*).
+//   - WHERE col = X still returns the missing row.
+//   - Number of lost rows scales linearly with table size.
+func TestRowsToRecordNoRowsLostAtBatchBoundary(t *testing.T) {
+	alloc := memory.NewGoAllocator()
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Pick row counts that exercise multiple batch transitions and a partial
+	// final batch. batchSize = 1024 matches the value used by DoGetStatement.
+	const batchSize = 1024
+	cases := []struct {
+		name string
+		rows int
+	}{
+		{"single batch exact", 1024},
+		{"one row over boundary", 1025},
+		{"two batches exact", 2048},
+		{"three batches + partial", 3500},
+		{"production case credit_purchase_events", 12617},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl := fmt.Sprintf("t_%d", tc.rows)
+			if _, err := db.Exec(fmt.Sprintf(
+				"CREATE TABLE %s AS SELECT i AS id FROM range(0, %d) t(i)", tbl, tc.rows,
+			)); err != nil {
+				t.Fatalf("create table: %v", err)
+			}
+
+			ctx := context.Background()
+			rows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s ORDER BY id", tbl))
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			defer func() { _ = rows.Close() }()
+
+			schema, err := GetQuerySchema(ctx, db, fmt.Sprintf("SELECT id FROM %s", tbl), nil)
+			if err != nil {
+				t.Fatalf("schema: %v", err)
+			}
+
+			seen := make([]bool, tc.rows)
+			delivered := 0
+			for {
+				rec, err := RowsToRecord(alloc, rows, schema, batchSize)
+				if err != nil {
+					t.Fatalf("RowsToRecord: %v", err)
+				}
+				if rec == nil {
+					break
+				}
+				col := rec.Column(0).(*array.Int64)
+				for i := 0; i < col.Len(); i++ {
+					id := col.Value(i)
+					if id < 0 || id >= int64(tc.rows) {
+						rec.Release()
+						t.Fatalf("delivered out-of-range id %d (expected 0..%d)", id, tc.rows-1)
+					}
+					if seen[id] {
+						rec.Release()
+						t.Fatalf("id %d delivered twice", id)
+					}
+					seen[id] = true
+					delivered++
+				}
+				rec.Release()
+			}
+
+			if delivered != tc.rows {
+				// Walk the seen set to point at the first dropped id; this
+				// matches the production symptom (deterministic missing rows).
+				firstDropped := -1
+				for i, ok := range seen {
+					if !ok {
+						firstDropped = i
+						break
+					}
+				}
+				t.Fatalf("delivered %d rows, expected %d (first dropped id = %d)",
+					delivered, tc.rows, firstDropped)
+			}
+		})
+	}
+}

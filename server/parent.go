@@ -300,7 +300,7 @@ func (s *Server) CancelQueryBySignal(key BackendKey) bool {
 
 	child := s.childTracker.FindByBackendKey(key)
 	if child == nil {
-		slog.Debug("No child process found for backend key", "pid", key.Pid, "secret_key", key.SecretKey)
+		slog.Debug("No child process found for backend key", "pid", key.Pid)
 		return false
 	}
 

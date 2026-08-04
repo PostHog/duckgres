@@ -3,9 +3,11 @@
 package controlplane
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +21,35 @@ type remoteAddrConn struct {
 
 func (c remoteAddrConn) RemoteAddr() net.Addr {
 	return c.remote
+}
+
+type fakeControlPlaneQueryLogSink struct {
+	stops atomic.Int32
+}
+
+func (s *fakeControlPlaneQueryLogSink) Log(server.QueryLogEntry) {}
+
+func (s *fakeControlPlaneQueryLogSink) Stop() {
+	s.stops.Add(1)
+}
+
+func (s *fakeControlPlaneQueryLogSink) StopContext(context.Context) error {
+	s.Stop()
+	return nil
+}
+
+func TestStopQueryLoggerStopsGenericQueryLogSink(t *testing.T) {
+	srv := &server.Server{}
+	server.InitMinimalServer(srv, server.Config{}, nil)
+	sink := &fakeControlPlaneQueryLogSink{}
+	server.SetQueryLogSink(srv, sink)
+
+	cp := &ControlPlane{srv: srv}
+	cp.stopQueryLogger()
+
+	if got := sink.stops.Load(); got != 1 {
+		t.Fatalf("expected generic query log sink to stop once, got %d", got)
+	}
 }
 
 func TestReadStartupFromRaw_SSLRequest(t *testing.T) {

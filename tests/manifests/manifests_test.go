@@ -2,7 +2,7 @@
 // k8s/ manifests — no cluster, no build tag, runs in the normal `go test ./...`
 // lane. These four asserts were rescued from the retired kind suite
 // (tests/k8s/setup_config_test.go) when its end-to-end coverage moved to the
-// real-cluster harness in tests/e2e-mw-dev/. They guard real shipped config
+// real-cluster harness in tests/mw-dev/. They guard real shipped config
 // (k8s/rbac.yaml, k8s/networkpolicy.yaml), so they keep earning their place;
 // the rest of that file tested the kind-harness loader and went with it.
 package manifests_test
@@ -39,7 +39,7 @@ func TestControlPlaneRBACIncludesSharedWorkerConfigMapRead(t *testing.T) {
 	}
 }
 
-func TestControlPlaneRBACDefinesNeutralWorkerServiceAccount(t *testing.T) {
+func TestControlPlaneRBACDefinesSharedWorkerServiceAccount(t *testing.T) {
 	content := readManifest(t, "k8s", "rbac.yaml")
 	for _, want := range []string{
 		"kind: ServiceAccount",
@@ -51,7 +51,19 @@ func TestControlPlaneRBACDefinesNeutralWorkerServiceAccount(t *testing.T) {
 		}
 	}
 	if strings.Contains(content, "subjects:\n  - kind: ServiceAccount\n    name: duckgres-worker") {
-		t.Fatal("expected neutral worker service account to have no RoleBinding in k8s/rbac.yaml")
+		t.Fatal("expected shared worker service account to have no RoleBinding in k8s/rbac.yaml")
+	}
+}
+
+func TestNamespaceManifestIncludesDucklingsNamespace(t *testing.T) {
+	content := readManifest(t, "k8s", "namespace.yaml")
+	for _, want := range []string{
+		"name: duckgres",
+		"name: ducklings",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("expected %q in k8s/namespace.yaml", want)
+		}
 	}
 }
 
@@ -78,6 +90,47 @@ func TestNetworkPolicyAllowsControlPlaneToReachWorkerGRPC(t *testing.T) {
 	}
 	if strings.Contains(controlPlaneDoc, "namespaceSelector: {}") {
 		t.Fatal("expected control-plane ingress to stay namespace-local in k8s/networkpolicy.yaml")
+	}
+}
+
+// TestNetworkPolicyCoversReshardRunnerPods pins the dedicated reshard runner
+// pod policy: selected by app=duckgres-reshard, egress to Postgres (5432,
+// config store + cnpg poolers + external RDS), S3/STS (443), the CP admin API
+// (8080, the ephemeral-password pull) and DNS — and NO ingress rules (the
+// runner only dials out).
+func TestNetworkPolicyCoversReshardRunnerPods(t *testing.T) {
+	manifest := readManifest(t, "k8s", "networkpolicy.yaml")
+
+	var reshardDoc string
+	for _, doc := range strings.Split(manifest, "---") {
+		if strings.Contains(doc, "name: duckgres-reshard-runner-boundaries") {
+			reshardDoc = doc
+			break
+		}
+	}
+	if reshardDoc == "" {
+		t.Fatal("could not find reshard runner network policy in k8s/networkpolicy.yaml")
+	}
+	for _, want := range []string{
+		"app: duckgres-reshard",
+		"- port: 5432",
+		"- port: 443",
+		"- port: 8080",
+		"- port: 53",
+	} {
+		if !strings.Contains(reshardDoc, want) {
+			t.Fatalf("expected %q in reshard runner network policy in k8s/networkpolicy.yaml", want)
+		}
+	}
+	if strings.Contains(reshardDoc, "ingress:") {
+		t.Fatal("reshard runner policy must define no ingress rules (deny-all ingress)")
+	}
+}
+
+func TestManifestTestsRunInUnitRecipe(t *testing.T) {
+	content := readManifest(t, "justfile")
+	if !strings.Contains(content, "./tests/manifests/...") {
+		t.Fatal("expected just test-unit to include ./tests/manifests/...")
 	}
 }
 

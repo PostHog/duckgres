@@ -91,6 +91,23 @@ func TestTranspile_PgCatalog(t *testing.T) {
 			excludes: "pg_catalog",
 		},
 		{
+			name:     "pg_catalog.pg_tables -> memory.main.pg_tables",
+			input:    "SELECT * FROM pg_catalog.pg_tables",
+			contains: "memory.main.pg_tables",
+			excludes: "pg_catalog",
+		},
+		{
+			name:     "unqualified pg_views -> memory.main.pg_views",
+			input:    "SELECT * FROM pg_views",
+			contains: "memory.main.pg_views",
+		},
+		{
+			name:     "pg_catalog.pg_sequences -> memory.main.pg_sequences",
+			input:    "SELECT * FROM pg_catalog.pg_sequences",
+			contains: "memory.main.pg_sequences",
+			excludes: "pg_catalog",
+		},
+		{
 			name:     "pg_catalog.pg_statio_user_tables -> memory.main.pg_statio_user_tables",
 			input:    "SELECT * FROM pg_catalog.pg_statio_user_tables",
 			contains: "memory.main.pg_statio_user_tables",
@@ -201,8 +218,8 @@ func TestTranspile_InformationSchema(t *testing.T) {
 		},
 		{
 			name:     "unmapped information_schema table passes through",
-			input:    "SELECT * FROM information_schema.routines",
-			contains: "information_schema.routines",
+			input:    "SELECT * FROM information_schema.key_column_usage",
+			contains: "information_schema.key_column_usage",
 		},
 	}
 
@@ -302,84 +319,6 @@ func TestTranspile_LogicalCatalogMapping_DuckLakeMode(t *testing.T) {
 	}
 }
 
-func TestTranspile_PublicSchema_Iceberg(t *testing.T) {
-	// Iceberg's physical schema is literally "public" (DuckDB shadows "main" on
-	// REST catalogs), so the public→main rewrite must be DISABLED for Iceberg.
-	// Iceberg sessions are wired with an empty LogicalDatabaseName (newTranspiler),
-	// so three-part references pass through untouched.
-	tests := []struct {
-		name     string
-		input    string
-		contains string
-		excludes string
-	}{
-		{
-			name:     "two-part public reference stays public (not rewritten to main)",
-			input:    "SELECT * FROM public.users",
-			contains: "public.users",
-			excludes: "main.users",
-		},
-		{
-			name:     "explicit iceberg catalog is preserved",
-			input:    "SELECT * FROM iceberg.public.users",
-			contains: "iceberg.public.users",
-			excludes: "iceberg.main.users",
-		},
-		{
-			name:     "arbitrary three-part reference is left untouched",
-			input:    "SELECT * FROM analytics.public.users",
-			contains: "analytics.public.users",
-			excludes: "analytics.main.users",
-		},
-	}
-
-	tr := New(Config{Backend: BackendIceberg})
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := tr.Transpile(tt.input)
-			if err != nil {
-				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
-			}
-			if !strings.Contains(result.SQL, tt.contains) {
-				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
-			}
-			if tt.excludes != "" && strings.Contains(result.SQL, tt.excludes) {
-				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
-			}
-		})
-	}
-}
-
-func TestTranspile_DDL_Iceberg(t *testing.T) {
-	// The Iceberg backend uses the same DDL policy as DuckLake: strip enforced
-	// constraints, rewrite SERIAL, no-op unsupported DDL.
-	tr := New(Config{Backend: BackendIceberg})
-
-	t.Run("strip PRIMARY KEY and convert SERIAL", func(t *testing.T) {
-		result, err := tr.Transpile("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)")
-		if err != nil {
-			t.Fatalf("Transpile error: %v", err)
-		}
-		if strings.Contains(strings.ToUpper(result.SQL), "PRIMARY KEY") {
-			t.Errorf("PRIMARY KEY not stripped: %q", result.SQL)
-		}
-		if strings.Contains(strings.ToUpper(result.SQL), "SERIAL") {
-			t.Errorf("SERIAL not converted: %q", result.SQL)
-		}
-	})
-
-	t.Run("CREATE INDEX is a no-op", func(t *testing.T) {
-		result, err := tr.Transpile("CREATE INDEX idx ON t (id)")
-		if err != nil {
-			t.Fatalf("Transpile error: %v", err)
-		}
-		if !result.IsNoOp || result.NoOpTag != "CREATE INDEX" {
-			t.Errorf("expected CREATE INDEX no-op, got IsNoOp=%v tag=%q", result.IsNoOp, result.NoOpTag)
-		}
-	})
-}
-
 func TestTranspile_FeatureNotSupported_Rejected(t *testing.T) {
 	assertFeatureNotSupported := func(t *testing.T, result *Result) {
 		t.Helper()
@@ -395,7 +334,7 @@ func TestTranspile_FeatureNotSupported_Rejected(t *testing.T) {
 		}
 	}
 
-	for _, backend := range []StorageBackend{BackendDuckLake, BackendIceberg} {
+	for _, backend := range []StorageBackend{BackendDuckLake} {
 		tr := New(Config{Backend: backend})
 
 		t.Run(string(backend)+"/ON CONFLICT ON CONSTRAINT", func(t *testing.T) {
@@ -433,7 +372,7 @@ func TestTranspile_CreateOrReplaceTable_LogicalCatalog(t *testing.T) {
 	// OR REPLACE for TABLE). Before the pre-parse interceptor this fell back
 	// to native and was forwarded raw, so the logical catalog name was never
 	// rewritten to the physical catalog — breaking multi-tenant dbt/SQLMesh
-	// table materializations with "Catalog \"portola\" does not exist".
+	// table materializations with "Catalog \"analytics\" does not exist".
 	tests := []struct {
 		name     string
 		input    string
@@ -442,37 +381,37 @@ func TestTranspile_CreateOrReplaceTable_LogicalCatalog(t *testing.T) {
 	}{
 		{
 			name:     "CTAS target and source both rewritten, OR REPLACE preserved",
-			input:    `CREATE OR REPLACE TABLE "portola"."core"."payment_events" AS SELECT * FROM "portola"."core"."raw_payments"`,
+			input:    `CREATE OR REPLACE TABLE "analytics"."core"."payment_events" AS SELECT * FROM "analytics"."core"."raw_payments"`,
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.payment_events", "ducklake.core.raw_payments"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 		{
 			name:     "public schema maps to main; OR REPLACE preserved",
-			input:    `CREATE OR REPLACE TABLE portola.public.t AS SELECT 1 AS x`,
+			input:    `CREATE OR REPLACE TABLE analytics.public.t AS SELECT 1 AS x`,
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.main.t"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 		{
 			name:     "multi-line AS SELECT body still rewritten",
-			input:    "CREATE OR REPLACE TABLE portola.core.t AS\nSELECT a\nFROM portola.core.src\nWHERE a > 0",
+			input:    "CREATE OR REPLACE TABLE analytics.core.t AS\nSELECT a\nFROM analytics.core.src\nWHERE a > 0",
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.t", "ducklake.core.src"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 		{
 			name:     "TEMP variant preserves OR REPLACE and TEMP",
-			input:    `CREATE OR REPLACE TEMP TABLE t AS SELECT * FROM portola.core.src`,
+			input:    `CREATE OR REPLACE TEMP TABLE t AS SELECT * FROM analytics.core.src`,
 			contains: []string{"OR REPLACE", "TEMP", "ducklake.core.src"},
-			excludes: "portola.core.src",
+			excludes: "analytics.core.src",
 		},
 		{
 			name:     "plain column-def form (no AS) rewrites target",
-			input:    `CREATE OR REPLACE TABLE portola.core.t (id INTEGER)`,
+			input:    `CREATE OR REPLACE TABLE analytics.core.t (id INTEGER)`,
 			contains: []string{"CREATE OR REPLACE TABLE", "ducklake.core.t"},
-			excludes: "portola",
+			excludes: "analytics",
 		},
 	}
 
-	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "portola", PhysicalCatalogName: "ducklake"})
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "analytics", PhysicalCatalogName: "ducklake"})
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -498,8 +437,8 @@ func TestTranspile_CreateOrReplaceTable_LogicalCatalog(t *testing.T) {
 // CREATE OR REPLACE VIEW is valid PostgreSQL and must NOT be touched by the
 // CREATE OR REPLACE TABLE interceptor.
 func TestTranspile_CreateOrReplaceView_Unaffected(t *testing.T) {
-	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "portola", PhysicalCatalogName: "ducklake"})
-	result, err := tr.Transpile(`CREATE OR REPLACE VIEW portola.core.v AS SELECT * FROM portola.core.t`)
+	tr := New(Config{DuckLakeMode: true, LogicalDatabaseName: "analytics", PhysicalCatalogName: "ducklake"})
+	result, err := tr.Transpile(`CREATE OR REPLACE VIEW analytics.core.v AS SELECT * FROM analytics.core.t`)
 	if err != nil {
 		t.Fatalf("Transpile error: %v", err)
 	}
@@ -509,8 +448,8 @@ func TestTranspile_CreateOrReplaceView_Unaffected(t *testing.T) {
 	if !strings.Contains(result.SQL, "ducklake.core.v") || !strings.Contains(result.SQL, "ducklake.core.t") {
 		t.Errorf("view logical catalog not rewritten: %q", result.SQL)
 	}
-	if strings.Contains(result.SQL, "portola") {
-		t.Errorf("portola should have been rewritten away: %q", result.SQL)
+	if strings.Contains(result.SQL, "analytics") {
+		t.Errorf("logical catalog should have been rewritten away: %q", result.SQL)
 	}
 }
 
@@ -1100,7 +1039,7 @@ func TestTranspile_DDL_DuckLakeMode(t *testing.T) {
 }
 
 func TestTranspile_AlterColumnTypeUsingRejected(t *testing.T) {
-	tr := New(ConfigForBackend(BackendIceberg))
+	tr := New(ConfigForBackend(BackendDuckLake))
 	result, err := tr.Transpile("ALTER TABLE public.users ALTER COLUMN id TYPE text USING id::text")
 	if err != nil {
 		t.Fatalf("Transpile returned error: %v", err)
@@ -3315,10 +3254,13 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 			excludes: []string{`"extract"(`},        // should NOT be quoted function call format
 		},
 		{
-			name:     "SUBSTRING preserves SQL syntax with FROM FOR keywords",
+			// Positional SUBSTRING gets the PG window clamp (functions_compat.go)
+			// and deparses as an explicit call; the quoted "substring"( form is
+			// verified to execute in DuckDB by TestCompatTransforms_BatchE.
+			name:     "SUBSTRING positional form gets the window clamp",
 			input:    "SELECT SUBSTRING('hello' FROM 2 FOR 3)",
-			contains: []string{"substring", " from ", " for "}, // SQL syntax uses FROM...FOR
-			excludes: []string{`"substring"(`},                 // should NOT be quoted function call
+			contains: []string{"substring", "greatest"},
+			excludes: []string{" from ", " for "},
 		},
 		{
 			name:     "EXTRACT with different field",
@@ -3335,10 +3277,12 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 			excludes: []string{`"position"(`},
 		},
 		{
-			name:     "OVERLAY preserves SQL syntax with PLACING FROM FOR keywords",
+			// DuckDB has no overlay(); the compat transform rewrites it to a
+			// substr(...) || repl || substr(...) expression (functions_compat.go).
+			name:     "OVERLAY rewritten to substr concatenation",
 			input:    "SELECT OVERLAY('hello' PLACING 'XX' FROM 2 FOR 3)",
-			contains: []string{"overlay", " placing ", " from "},
-			excludes: []string{`"overlay"(`},
+			contains: []string{"substr(", "||"},
+			excludes: []string{" placing ", "overlay"},
 		},
 
 		// Renamed SQL syntax functions - btrim->trim strips prefix, uses function call
@@ -3371,10 +3315,12 @@ func TestTranspile_SQLSyntaxFunctions(t *testing.T) {
 			excludes: []string{`"extract"(`},
 		},
 		{
+			// EXTRACT keeps its SQL keyword syntax; SUBSTRING's positional form
+			// gets the window clamp and becomes an explicit call.
 			name:     "Multiple SQL syntax functions",
 			input:    "SELECT EXTRACT(year FROM d), SUBSTRING(s FROM 1 FOR 5) FROM t",
-			contains: []string{"extract", "substring", " from d"},
-			excludes: []string{`"extract"(`, `"substring"(`},
+			contains: []string{"extract", "substring", " from d", "greatest"},
+			excludes: []string{`"extract"(`},
 		},
 	}
 
@@ -4318,6 +4264,36 @@ func TestTranspile_CustomMacros_DuckLakeMode(t *testing.T) {
 			input:    "SELECT pg_catalog.format_type(atttypid, atttypmod) FROM pg_attribute",
 			contains: "memory.main.format_type",
 		},
+		{
+			name:     "width_bucket gets memory.main prefix",
+			input:    "SELECT width_bucket(v, 0, 10, 5) FROM t",
+			contains: "memory.main.width_bucket",
+		},
+		{
+			name:     "uuid_generate_v4 gets memory.main prefix",
+			input:    "SELECT uuid_generate_v4()",
+			contains: "memory.main.uuid_generate_v4",
+		},
+		{
+			name:     "set_config gets memory.main prefix",
+			input:    "SELECT set_config('search_path', 'main', false)",
+			contains: "memory.main.set_config",
+		},
+		{
+			name:     "decode gets memory.main prefix",
+			input:    "SELECT decode('YWJj', 'base64')",
+			contains: "memory.main.decode",
+		},
+		{
+			name:     "json_array_elements (FROM-clause SRF) gets memory.main prefix",
+			input:    "SELECT value FROM json_array_elements('[1,2,3]'::json)",
+			contains: "memory.main.json_array_elements",
+		},
+		{
+			name:     "array_lower gets memory.main prefix",
+			input:    "SELECT array_lower(conkey, 1) FROM pg_constraint",
+			contains: "memory.main.array_lower",
+		},
 	}
 
 	tr := New(Config{DuckLakeMode: true})
@@ -4425,6 +4401,37 @@ func TestClassify_Direct(t *testing.T) {
 			cls := Classify(tt.input, cfg)
 			if !cls.Direct {
 				t.Errorf("Classify(%q) = {Direct: false, Flags: %d}, want Direct", tt.input, cls.Flags)
+			}
+		})
+	}
+}
+
+// Functions in functionNameMapping must each have a Classify token: a query
+// whose ONLY PG-ism is that function must still be rewritten. Regression for
+// the to_jsonb gap (mapped since long ago, but never fired when it was the
+// only classified token in the query — e.g. SELECT to_jsonb(metadata) FROM t).
+func TestTranspile_MappedFunctionsFireAlone(t *testing.T) {
+	tr := New(DefaultConfig())
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{"to_jsonb alone", "SELECT to_jsonb(metadata) AS m FROM stripe.customer", "to_json(", "to_jsonb("},
+		{"jsonb_array_length alone", "SELECT jsonb_array_length(data) FROM t", "json_array_length(", "jsonb_array_length("},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tr.Transpile(tt.input)
+			if err != nil {
+				t.Fatalf("Transpile(%q) error: %v", tt.input, err)
+			}
+			if !strings.Contains(result.SQL, tt.contains) {
+				t.Errorf("Transpile(%q) = %q, should contain %q", tt.input, result.SQL, tt.contains)
+			}
+			if strings.Contains(result.SQL, tt.excludes) {
+				t.Errorf("Transpile(%q) = %q, should NOT contain %q", tt.input, result.SQL, tt.excludes)
 			}
 		})
 	}

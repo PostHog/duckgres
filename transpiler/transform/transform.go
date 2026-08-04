@@ -23,6 +23,34 @@ type Result struct {
 	// IsIgnoredSet indicates a SET command for an unsupported parameter
 	IsIgnoredSet bool
 
+	// QuerySourceSet, when non-nil, indicates the statement is
+	// `SET duckgres.query_source = '<value>'` (a duckgres-namespaced custom GUC
+	// that must NOT be forwarded to DuckDB). The pointed-to string is the value
+	// to store on the session; the connection layer intercepts and acknowledges
+	// it as "SET" without executing anything against DuckDB. The value has been
+	// validated + normalized by NormalizeQuerySource ("standard", "endpoints",
+	// or "" = reset); an invalid value sets Error (22023) instead.
+	QuerySourceSet *string
+
+	// QuerySourceShow indicates the statement is `SHOW duckgres.query_source`.
+	// The connection layer answers it from session state (or "standard" if
+	// unset) rather than DuckDB.
+	QuerySourceShow bool
+
+	// S3CacheSet, when non-nil, indicates the statement is
+	// `SET duckgres.s3_cache = '<value>'` (a duckgres-namespaced custom GUC
+	// that must NOT be forwarded to DuckDB). The pointed-to string is the
+	// validated canonical value ("on", "off", or "" = reset to the default
+	// "on"; an invalid value sets Error with 22023 instead). The connection
+	// layer applies it by asking the session's worker to swap its S3 secret
+	// transport on or off the node-local cache proxy.
+	S3CacheSet *string
+
+	// S3CacheShow indicates the statement is `SHOW duckgres.s3_cache`. The
+	// connection layer answers it from session state (or "on" if unset)
+	// rather than DuckDB.
+	S3CacheShow bool
+
 	// Error is set when a transform detects an error that should be returned to the client
 	// (e.g., unrecognized configuration parameter in SHOW command)
 	Error error
@@ -308,6 +336,11 @@ func walkSelectStmt(stmt *pg_query.SelectStmt, fn func(*pg_query.Node) bool) {
 	}
 	for _, sort := range stmt.SortClause {
 		walkNode(sort, fn)
+	}
+	// VALUES rows (INSERT ... VALUES, bare VALUES, VALUES in set-ops/CTEs):
+	// each entry wraps a Node_List that walkNode recurses into.
+	for _, vl := range stmt.ValuesLists {
+		walkNode(vl, fn)
 	}
 	walkNode(stmt.LimitCount, fn)
 	walkNode(stmt.LimitOffset, fn)

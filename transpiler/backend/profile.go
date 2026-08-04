@@ -5,7 +5,6 @@ type Name string
 const (
 	Memory   Name = "memory"
 	DuckLake Name = "ducklake"
-	Iceberg  Name = "iceberg"
 )
 
 type ConstraintHandling string
@@ -86,9 +85,9 @@ func (p Profile) Metadata() MetadataPolicy {
 func ForName(name Name) Profile {
 	switch name {
 	case DuckLake:
+		// DuckLake keeps the historical silent-strip behavior (sqlmesh/dbt issue
+		// PK/serial/DEFAULT now() DDL and rely on it succeeding).
 		return lakeProfile(DuckLake, "ducklake", true)
-	case Iceberg:
-		return lakeProfile(Iceberg, "iceberg", false)
 	default:
 		return Profile{
 			name:    Memory,

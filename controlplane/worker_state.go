@@ -2,12 +2,11 @@ package controlplane
 
 import (
 	"fmt"
-	"strconv"
+	"time"
 )
 
-// WorkerLifecycleState models the shared warm-worker lifecycle introduced for
-// late tenant binding. The current production worker pools do not act on this
-// state yet; this is scaffolding for later shared-pool work.
+// WorkerLifecycleState models the shared worker lifecycle used for late
+// tenant binding (spawn → reserve → activate → hot → hot-idle → drain/retire).
 type WorkerLifecycleState string
 
 const (
@@ -21,35 +20,31 @@ const (
 )
 
 // WorkerProfile describes the pod shape a session asked for via connection-string
-// startup options (duckgres.colocate / worker_cpu / worker_memory / worker_tier).
+// startup options (duckgres.worker_cpu / worker_memory / worker_ttl).
 // It is a match dimension on WorkerAssignment, ORTHOGONAL to Image: a reserved or
-// warm worker may only be handed to a request whose profile Equal()s it.
+// hot-idle worker may only be handed to a request whose profile Equal()s it.
 //
-// The nil/zero profile is the DEFAULT exclusive profile — today's behavior:
-// empty CPU/Memory (the pool-global request applies) and Colocate=false (one pod
-// per node). Normalizing the default to empty strings (rather than the literal
-// 46/360 pool values) is what keeps legacy worker records claimable without a
+// The nil/zero profile is the DEFAULT profile: empty CPU/Memory (the pool-global
+// request applies). Normalizing the default to empty strings (rather than the
+// literal pool values) is what keeps legacy worker records claimable without a
 // data migration.
 //
-// Only these three fields are persisted (WorkerRecord) and matched. Pod
-// scheduling — nodeSelector, toleration, and the one-pod-per-node anti-affinity —
-// is DERIVED from Colocate plus the pool's config at spawn time, so the
-// reserved-spawn path can reconstruct everything it needs from the stored record.
+// Only CPU/Memory are persisted (WorkerRecord) and matched; TTL rides along on
+// the record but is not part of the match identity.
 type WorkerProfile struct {
-	CPU      string // normalized k8s quantity (e.g. "4"); "" => pool-global request
-	Memory   string // normalized k8s quantity (e.g. "16Gi"); "" => pool-global request
-	Colocate bool   // true => bin-pack (exclusiveNode=false); false => exclusive node
+	CPU    string        // normalized k8s quantity (e.g. "8"); the worker's CPU size
+	Memory string        // normalized k8s quantity (e.g. "16Gi"); the worker's memory size
+	TTL    time.Duration // how long the worker stays hot-idle after its last query (reset per query); not part of MatchKey
 }
 
 // MatchKey is the identity used to decide whether an existing worker can serve a
-// request. NodeSelector is excluded because it is derived from Colocate. A nil
-// profile shares the key of the zero/default profile, so legacy and default
-// requests match the same workers.
+// request. A nil profile shares the key of the zero/default profile, so legacy
+// and default requests match the same workers.
 func (wp *WorkerProfile) MatchKey() string {
 	if wp == nil {
-		return "||false"
+		return "|"
 	}
-	return wp.CPU + "|" + wp.Memory + "|" + strconv.FormatBool(wp.Colocate)
+	return wp.CPU + "|" + wp.Memory
 }
 
 // Equal reports whether two profiles match (nil == zero == default).
@@ -61,11 +56,11 @@ func (wp *WorkerProfile) Equal(other *WorkerProfile) bool {
 // to the default profile. Used to cross the controlplane→configstore package
 // boundary (which cannot reference the WorkerProfile type) without losing the
 // nil==default convention.
-func (wp *WorkerProfile) Parts() (cpu, memory string, colocate bool) {
+func (wp *WorkerProfile) Parts() (cpu, memory string) {
 	if wp == nil {
-		return "", "", false
+		return "", ""
 	}
-	return wp.CPU, wp.Memory, wp.Colocate
+	return wp.CPU, wp.Memory
 }
 
 // WorkerAssignment carries tenant-specific metadata once a shared worker has
@@ -78,16 +73,10 @@ type WorkerAssignment struct {
 	// profile (today's behavior). It is immutable for a reserved worker's life;
 	// enforcement is wired in alongside the scheduling changes (see design doc).
 	Profile *WorkerProfile
-	// MaxColocatedCPU / MaxColocatedMemBytes are the org's colocated resource
-	// budget, enforced authoritatively (cross-CP) inside the claim transaction.
-	// 0 = unbounded on that axis. Only colocated claims count against them.
-	MaxColocatedCPU      int
-	MaxColocatedMemBytes uint64
 }
 
 // SharedWorkerState holds the additive lifecycle/assignment model for shared
-// warm workers. Existing worker pools can keep using their current session
-// counters until later PRs wire this state into scheduling decisions.
+// workers.
 type SharedWorkerState struct {
 	Lifecycle  WorkerLifecycleState
 	Assignment *WorkerAssignment
@@ -111,12 +100,12 @@ func (s SharedWorkerState) Validate() error {
 			return fmt.Errorf("lifecycle %q cannot have an assignment", lifecycle)
 		}
 		return nil
-	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle, WorkerLifecycleDraining:
+	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle:
 		if err := validateWorkerAssignment(s.Assignment); err != nil {
 			return fmt.Errorf("lifecycle %q requires a valid assignment: %w", lifecycle, err)
 		}
 		return nil
-	case WorkerLifecycleRetired:
+	case WorkerLifecycleDraining, WorkerLifecycleRetired:
 		if s.Assignment == nil {
 			return nil
 		}
@@ -145,12 +134,20 @@ func (s SharedWorkerState) Transition(next WorkerLifecycleState, assignment *Wor
 	switch next {
 	case WorkerLifecycleIdle:
 		nextState.Assignment = nil
-	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle, WorkerLifecycleDraining:
+	case WorkerLifecycleReserved, WorkerLifecycleActivating, WorkerLifecycleHot, WorkerLifecycleHotIdle:
 		resolved, err := resolveWorkerAssignment(s.Assignment, assignment)
 		if err != nil {
 			return SharedWorkerState{}, err
 		}
 		nextState.Assignment = resolved
+	case WorkerLifecycleDraining:
+		if s.Assignment != nil || assignment != nil {
+			resolved, err := resolveWorkerAssignment(s.Assignment, assignment)
+			if err != nil {
+				return SharedWorkerState{}, err
+			}
+			nextState.Assignment = resolved
+		}
 	case WorkerLifecycleRetired:
 		if assignment != nil {
 			resolved, err := resolveWorkerAssignment(s.Assignment, assignment)
@@ -174,15 +171,15 @@ func (s SharedWorkerState) Transition(next WorkerLifecycleState, assignment *Wor
 func isAllowedWorkerLifecycleTransition(current, next WorkerLifecycleState) bool {
 	switch current {
 	case WorkerLifecycleIdle:
-		return next == WorkerLifecycleReserved || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleReserved || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleReserved:
-		return next == WorkerLifecycleActivating || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleActivating || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleActivating:
-		return next == WorkerLifecycleHot || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleHot || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleHot:
 		return next == WorkerLifecycleDraining || next == WorkerLifecycleRetired || next == WorkerLifecycleHotIdle
 	case WorkerLifecycleHotIdle:
-		return next == WorkerLifecycleReserved || next == WorkerLifecycleRetired
+		return next == WorkerLifecycleReserved || next == WorkerLifecycleDraining || next == WorkerLifecycleRetired
 	case WorkerLifecycleDraining:
 		return next == WorkerLifecycleRetired
 	case WorkerLifecycleRetired:

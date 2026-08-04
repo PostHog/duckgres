@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"sync"
@@ -57,28 +58,95 @@ func (p *acquireErrorPool) SetMaxWorkers(n int) {}
 
 func (p *acquireErrorPool) ShutdownAll() {}
 
-func TestCreateSessionObservesWarmCapacityExhaustion(t *testing.T) {
+func TestCreateSessionObservesWorkerCapacityExhaustion(t *testing.T) {
 	controlPlaneWorkerAcquireFailuresCounter.Reset()
 	sm := NewSessionManager(&acquireErrorPool{
-		err: NewWarmCapacityExhaustedError(30 * time.Second),
+		err: NewWorkerCapacityExhaustedError(30 * time.Second),
 	}, nil)
 
 	_, _, err := sm.CreateSession(context.Background(), "root", 1001, "", 0, nil)
-	var capacityErr *WarmCapacityExhaustedError
+	var capacityErr *WorkerCapacityExhaustedError
 	if !errors.As(err, &capacityErr) {
-		t.Fatalf("expected warm capacity error, got %v", err)
+		t.Fatalf("expected worker capacity error, got %v", err)
 	}
 
-	counter, counterErr := controlPlaneWorkerAcquireFailuresCounter.GetMetricWithLabelValues("warm_capacity_exhausted")
+	counter, counterErr := controlPlaneWorkerAcquireFailuresCounter.GetMetricWithLabelValues("worker_capacity_exhausted")
 	if counterErr != nil {
-		t.Fatalf("failed to read warm capacity counter: %v", counterErr)
+		t.Fatalf("failed to read worker capacity counter: %v", counterErr)
 	}
 	metric := &dto.Metric{}
 	if err := counter.Write(metric); err != nil {
-		t.Fatalf("failed to write warm capacity counter: %v", err)
+		t.Fatalf("failed to write worker capacity counter: %v", err)
 	}
 	if got := metric.GetCounter().GetValue(); got != 1 {
-		t.Fatalf("expected one warm capacity acquisition failure, got %v", got)
+		t.Fatalf("expected one worker capacity acquisition failure, got %v", got)
+	}
+}
+
+func TestIsWorkerSessionCapError(t *testing.T) {
+	// The worker maps a MaxSessions rejection to a gRPC ResourceExhausted error
+	// whose message contains "max sessions reached"; the CP wraps it twice on the
+	// way up. The classifier must see through that wrapping and ignore unrelated
+	// errors (otherwise the cap-drift recycle/retry would fire on the wrong thing).
+	capLike := fmt.Errorf("create session on worker 7: %w",
+		fmt.Errorf("create session recv: %w",
+			errors.New("rpc error: code = ResourceExhausted desc = create session: max sessions reached (1)")))
+	if !isWorkerSessionCapError(capLike) {
+		t.Fatalf("expected wrapped 'max sessions reached' error to be classified as a session-cap error")
+	}
+
+	for _, e := range []error{
+		nil,
+		errors.New("create session on worker 7: connection refused"),
+		NewWorkerCapacityExhaustedError(time.Second),
+		context.DeadlineExceeded,
+	} {
+		if isWorkerSessionCapError(e) {
+			t.Fatalf("did not expect %v to be classified as a session-cap error", e)
+		}
+	}
+}
+
+// TestReservePIDGloballyUniqueAcrossManagers is the regression for the conns-map
+// collision: backend pids must be unique across the whole CP process, not
+// per-org. Two managers (two org stacks) reserving pids must never hand out the
+// same value — otherwise their connections shadow each other in the single
+// server.conns map (keyed by pid), corrupting pg_stat_activity / cancel.
+func TestReservePIDGloballyUniqueAcrossManagers(t *testing.T) {
+	smA := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, nil)
+	smB := NewSessionManager(&FlightWorkerPool{workers: make(map[int]*ManagedWorker)}, nil)
+
+	seen := make(map[int32]string)
+	for i := 0; i < 100; i++ {
+		for who, sm := range map[string]*SessionManager{"A": smA, "B": smB} {
+			pid := sm.ReservePID()
+			if prev, dup := seen[pid]; dup {
+				t.Fatalf("pid %d handed out twice (manager %s then %s) — per-org collision regressed", pid, prev, who)
+			}
+			seen[pid] = who
+			if pid <= 1000 {
+				t.Fatalf("pid %d is not above the 1000 floor", pid)
+			}
+		}
+	}
+}
+
+// TestReservePIDSkipsZeroAtWrap covers the int32-wrap edge: when the counter
+// passes through 0 (only after ~2.1B connections), reservePID must skip it so a
+// real pid never looks "unset". Uses a LOCAL counter so it doesn't perturb the
+// process-global one other tests share.
+func TestReservePIDSkipsZeroAtWrap(t *testing.T) {
+	var c atomic.Int32
+	c.Store(-1) // next Add(1) lands exactly on 0
+	if p := reservePID(&c); p == 0 {
+		t.Fatalf("reservePID returned 0 at the wrap point; must skip it")
+	}
+	// Normal range: monotonic, never 0.
+	c.Store(1000)
+	for i := 0; i < 5; i++ {
+		if p := reservePID(&c); p == 0 {
+			t.Fatalf("reservePID returned 0 in the normal range")
+		}
 	}
 }
 
@@ -175,6 +243,55 @@ func TestOnWorkerCrash_MultipleSessions(t *testing.T) {
 	}
 	if sm.SessionCount() != 0 {
 		t.Fatalf("expected 0 sessions, got %d", sm.SessionCount())
+	}
+}
+
+// TestDestroySessionsForUser proves the per-user kill switch tears down only the
+// target user's sessions (cancelling their executors and closing their client
+// connections) and leaves other users' sessions untouched.
+func TestDestroySessionsForUser(t *testing.T) {
+	pool := &FlightWorkerPool{workers: make(map[int]*ManagedWorker)}
+	sm := NewSessionManager(pool, nil)
+
+	bobExec1 := &flightclient.FlightExecutor{}
+	bobExec2 := &flightclient.FlightExecutor{}
+	aliceExec := &flightclient.FlightExecutor{}
+	bobConn1 := &mockCloser{}
+	bobConn2 := &mockCloser{}
+	aliceConn := &mockCloser{}
+
+	sm.mu.Lock()
+	sm.sessions[1001] = &ManagedSession{PID: 1001, Username: "bob", WorkerID: 1, Executor: bobExec1, connCloser: bobConn1}
+	sm.sessions[1002] = &ManagedSession{PID: 1002, Username: "bob", WorkerID: 2, Executor: bobExec2, connCloser: bobConn2}
+	sm.sessions[1003] = &ManagedSession{PID: 1003, Username: "alice", WorkerID: 3, Executor: aliceExec, connCloser: aliceConn}
+	sm.byWorker[1] = []int32{1001}
+	sm.byWorker[2] = []int32{1002}
+	sm.byWorker[3] = []int32{1003}
+	sm.mu.Unlock()
+
+	n := sm.DestroySessionsForUser("bob")
+	if n != 2 {
+		t.Fatalf("DestroySessionsForUser returned %d, want 2", n)
+	}
+
+	// Bob's sessions are gone; their client connections were force-closed.
+	if !bobConn1.closed.Load() || !bobConn2.closed.Load() {
+		t.Fatal("expected bob's client connections to be closed")
+	}
+	// Alice is untouched.
+	if aliceConn.closed.Load() {
+		t.Fatal("alice's connection must not be closed by a kill scoped to bob")
+	}
+	if sm.SessionCount() != 1 {
+		t.Fatalf("expected 1 surviving session (alice), got %d", sm.SessionCount())
+	}
+	if _, ok := sm.sessions[1003]; !ok {
+		t.Fatal("alice's session (pid 1003) should survive")
+	}
+
+	// Killing a user with no sessions is a no-op returning 0.
+	if got := sm.DestroySessionsForUser("nobody"); got != 0 {
+		t.Fatalf("DestroySessionsForUser(nobody) = %d, want 0", got)
 	}
 }
 
@@ -612,5 +729,43 @@ func TestSessionManager_ConnectionLimits_WorkerCrashGrantsQueuedWaiter(t *testin
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for queued waiter after OnWorkerCrash")
+	}
+}
+
+func TestIsWorkerConnPoolTimeoutError(t *testing.T) {
+	// The exact wedged-worker signature observed live (e2e ci-pr-759, worker 26:
+	// 12 straight client retries deterministically reused the same hot-idle
+	// wedged worker). The CP must classify it for recycle-and-reacquire.
+	err := fmt.Errorf("create session: %w",
+		fmt.Errorf("create session on worker 26: create session recv: %w",
+			errors.New("rpc error: code = ResourceExhausted desc = create session: failed to obtain connection from pool (timeout after 30s): context deadline exceeded")))
+	if !isWorkerConnPoolTimeoutError(err) {
+		t.Fatal("wedged-worker pool-timeout error not classified for recycle")
+	}
+	// Cap errors and unrelated errors must not match.
+	if isWorkerConnPoolTimeoutError(errors.New("max sessions reached (1)")) {
+		t.Fatal("cap error misclassified as pool timeout")
+	}
+	if isWorkerConnPoolTimeoutError(nil) {
+		t.Fatal("nil misclassified")
+	}
+}
+
+func TestIsWorkerS3CacheRestoreError(t *testing.T) {
+	// The worker-side mandatory restore failure as it reaches the CP through
+	// the CreateSession RPC wrapping (duckdbservice doCreateSession maps it to
+	// ResourceExhausted). The CP must classify it for recycle-and-reacquire: a
+	// fresh worker's restore is a no-op, so the client's connect need not fail.
+	err := fmt.Errorf("create session: %w",
+		fmt.Errorf("create session on worker 31: create session recv: %w",
+			errors.New("rpc error: code = ResourceExhausted desc = create session: restore S3 cache transport before session start: swap S3 secret transport (s3_cache=true): refresh S3 secret: IO Error")))
+	if !isWorkerS3CacheRestoreError(err) {
+		t.Fatal("s3-cache restore failure not classified for recycle")
+	}
+	if isWorkerS3CacheRestoreError(errors.New("max sessions reached (1)")) {
+		t.Fatal("cap error misclassified as s3-cache restore failure")
+	}
+	if isWorkerS3CacheRestoreError(nil) {
+		t.Fatal("nil misclassified")
 	}
 }

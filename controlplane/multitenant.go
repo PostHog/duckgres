@@ -9,31 +9,109 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
-	"strings"
-	"sync"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
-	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
+
+// catalogCopierProber adapts provisioner.PGCatalogCopier's SELECT-1 probe to
+// the admin.ExternalTargetProber seam so the reshard start handler can
+// fail-fast a doomed cnpg→external target (unreachable endpoint / wrong
+// credentials / missing DB) BEFORE the destructive flip. It parses the
+// admin-supplied endpoint as host[:port] (default 5432), mirroring how the
+// reshard runner builds the external target CatalogEndpoint.
+type catalogCopierProber struct {
+	cluster kubernetes.Interface
+	probe   func(context.Context, provisioner.CatalogEndpoint) error
+}
+
+func (p catalogCopierProber) Probe(ctx context.Context, endpoint, user, database, password, sslMode string) error {
+	host, port := endpoint, 5432
+	if h, p, err := net.SplitHostPort(endpoint); err == nil {
+		host = h
+		if n, convErr := strconv.Atoi(p); convErr == nil {
+			port = n
+		}
+	}
+	target := provisioner.CatalogEndpoint{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Database: database,
+		Password: password,
+		SSLMode:  sslMode,
+	}
+	if p.probe != nil {
+		return p.probe(ctx, target)
+	}
+	return provisioner.PGCatalogCopier{}.Probe(ctx, target)
+}
+
+func (p catalogCopierProber) ProbeCNPG(ctx context.Context, shard string) error {
+	if p.cluster == nil {
+		return fmt.Errorf("kubernetes client unavailable")
+	}
+	secretName := "cnpg-" + shard + "-provisioner"
+	secret, err := p.cluster.CoreV1().Secrets("ducklings").Get(ctx, secretName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read shard provisioner credential %s: %w", secretName, err)
+	}
+	endpoint := string(secret.Data["endpoint"])
+	user := string(secret.Data["username"])
+	password := string(secret.Data["password"])
+	port := string(secret.Data["port"])
+	if endpoint == "" || user == "" || password == "" {
+		return fmt.Errorf("shard provisioner credential %s is missing endpoint, username, or password", secretName)
+	}
+	if port != "" {
+		endpoint = net.JoinHostPort(endpoint, port)
+	}
+	return p.Probe(ctx, endpoint, user, "postgres", password, "require")
+}
 
 // orgRouterAdapter wraps OrgRouter to implement both OrgRouterInterface
 // (for the control plane) and admin.OrgStackInfo (for the admin API).
 type orgRouterAdapter struct {
-	router *OrgRouter
+	router              *OrgRouter
+	metadataPostgresURL func(context.Context, string) (string, error)
+	metadataSessions    *metadataProxySessionRegistry
 }
 
-// defaultHotIdleTTL is how long a hot-idle worker retains its org assignment
-// before being retired. During this window, any CP pod can reclaim it for the
-// same org without re-activation.
-const defaultHotIdleTTL = 5 * time.Minute
+func (a *orgRouterAdapter) MetadataPostgresURL(ctx context.Context, orgID string) (string, error) {
+	if a.metadataPostgresURL == nil {
+		return "", fmt.Errorf("metadata Postgres resolver is not configured")
+	}
+	return a.metadataPostgresURL(ctx, orgID)
+}
+
+func (a *orgRouterAdapter) MetadataProxySessions() *metadataProxySessionRegistry {
+	return a.metadataSessions
+}
+
+// effectiveDefaultWorkerTTL resolves the janitor's hot-idle retention: the
+// operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
+// K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
+// defaultWorkerTTL (1m — the same fallback sized-but-no-ttl requests get at
+// profile resolution, so there is exactly ONE default TTL however a worker
+// came to have no explicit one). The full per-request precedence is:
+// client GUC > org default > deployment default TTL > built-in 1m.
+func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return defaultWorkerTTL
+}
 
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
@@ -43,23 +121,26 @@ func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManage
 	return stack.Pool, stack.Sessions, stack.Rebalancer, true
 }
 
-func (a *orgRouterAdapter) IcebergConfigForOrg(orgID string) (server.IcebergConfig, bool) {
-	return a.router.IcebergConfigForOrg(orgID)
-}
-
 func (a *orgRouterAdapter) IsMigratingForOrg(orgID string) bool {
 	return a.router.IsMigrating(orgID)
 }
 
-func (a *orgRouterAdapter) SetWarmCapacityTarget(n int) {
-	a.router.sharedPool.SetWarmCapacityTarget(n)
-	if n <= 0 {
-		a.router.sharedPool.SetPerImageWarmTargets(nil)
-	}
+func (a *orgRouterAdapter) BeginDrain() {
+	a.metadataSessions.KillAll()
+	a.router.BeginDrain()
 }
 
 func (a *orgRouterAdapter) ShutdownAll() {
+	a.metadataSessions.KillAll()
 	a.router.ShutdownAll()
+}
+
+func (a *orgRouterAdapter) SetProjectScopedUserChangeHandler(handler func(orgID, username string)) {
+	a.router.setProjectScopedUserChangeHandler(handler)
+}
+
+func (a *orgRouterAdapter) ReleaseIdleHotWorkers() int {
+	return a.router.ReleaseIdleHotWorkers()
 }
 
 func (a *orgRouterAdapter) AllOrgStats() []admin.OrgStatus {
@@ -67,12 +148,18 @@ func (a *orgRouterAdapter) AllOrgStats() []admin.OrgStatus {
 	stats := make([]admin.OrgStatus, 0, len(stacks))
 	for name, stack := range stacks {
 		sessionCount := stack.Sessions.SessionCount()
-		stats = append(stats, admin.OrgStatus{
+		st := admin.OrgStatus{
 			Name:           name,
 			ActiveSessions: sessionCount,
 			MaxWorkers:     stack.Config.MaxWorkers,
-			MemoryBudget:   stack.Config.MemoryBudget,
-		})
+		}
+		// Workers this CP has assigned to the org (cap-counting; excludes
+		// hot-idle). Per-CP local view — the admin /status fan-out sums it
+		// across replicas (mergeOrgStats) for a cluster-wide per-org count.
+		if rp, ok := stack.Pool.(*OrgReservedPool); ok {
+			st.Workers = rp.WorkerCount()
+		}
+		stats = append(stats, st)
 		// Emit per-org Prometheus metrics
 		observeOrgSessionsActive(name, sessionCount)
 	}
@@ -93,12 +180,20 @@ func (a *orgRouterAdapter) AllWorkerStatuses() []admin.WorkerStatus {
 			if count == 0 {
 				status = "idle"
 			}
-			result = append(result, admin.WorkerStatus{
+			ws := admin.WorkerStatus{
 				ID:             wID,
 				Org:            name,
 				ActiveSessions: count,
 				Status:         status,
-			})
+			}
+			// Pod-shape (cpu/memory/ttl) of the session-holding worker; empty/zero
+			// for the default profile or a worker no longer in the pool.
+			if profile, ok := stack.Sessions.WorkerProfile(wID); ok {
+				ws.CPU = profile.CPU
+				ws.Memory = profile.Memory
+				ws.TTLSeconds = int(profile.TTL.Seconds())
+			}
+			result = append(result, ws)
 		}
 	}
 	return result
@@ -113,6 +208,7 @@ func (a *orgRouterAdapter) AllSessionStatuses() []admin.SessionStatus {
 				PID:      s.PID,
 				WorkerID: s.WorkerID,
 				Org:      name,
+				User:     s.Username,
 				Protocol: s.Protocol,
 			})
 		}
@@ -131,9 +227,8 @@ func SetupMultiTenant(
 	cfg ControlPlaneConfig,
 	srv *server.Server,
 	memBudget uint64,
-	maxWorkers int,
 	isHealthy func() bool,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, *computeMeter, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -141,12 +236,30 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	// Identity info-metric for dashboards (org ↔ team ↔ duckling). Reads the
+	// snapshot at scrape time — registered here where the concrete store is
+	// in hand (the interface returned upward deliberately hides Snapshot).
+	registerOrgTeamsInfoMetric(store)
+
+	// Per-user persistent secret manager (CREATE PERSISTENT SECRET). With no
+	// key configured the manager still loads so DROP can clean up stale rows,
+	// but persistence is disabled with a clear client-facing error.
+	userSecrets, err := NewCPUserSecretManager(store, cfg.UserSecretKey)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	server.SetUserSecretManager(srv, userSecrets)
+	if cfg.UserSecretKey == "" {
+		slog.Info("User persistent secrets disabled (DUCKGRES_USER_SECRET_KEY not set).")
+	} else {
+		slog.Info("User persistent secrets enabled.")
 	}
 
 	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	cpID := cfg.K8s.ControlPlaneID
@@ -162,35 +275,31 @@ func SetupMultiTenant(
 	}
 	bootID := make([]byte, 16)
 	if _, err := rand.Read(bootID); err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
 	}
 	bootIDHex := hex.EncodeToString(bootID)
 	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
 
 	baseCfg := K8sWorkerPoolConfig{
-		Namespace:                namespace,
-		CPID:                     cpID,
-		CPInstanceID:             cpInstanceID,
-		WorkerImage:              cfg.K8s.WorkerImage,
-		WorkerPort:               cfg.K8s.WorkerPort,
-		SecretName:               cfg.K8s.WorkerSecret,
-		ConfigMap:                cfg.K8s.WorkerConfigMap,
-		MaxWorkers:               maxWorkers,
-		IdleTimeout:              cfg.WorkerIdleTimeout,
-		ConfigPath:               cfg.ConfigPath,
-		ImagePullPolicy:          cfg.K8s.ImagePullPolicy,
-		ServiceAccount:           cfg.K8s.ServiceAccount,
-		WorkerCPURequest:         cfg.K8s.WorkerCPURequest,
-		WorkerMemoryRequest:      cfg.K8s.WorkerMemoryRequest,
-		WorkerNodeSelector:       parseNodeSelector(cfg.K8s.WorkerNodeSelector),
-		WorkerTolerationKey:      cfg.K8s.WorkerTolerationKey,
-		WorkerTolerationValue:    cfg.K8s.WorkerTolerationValue,
-		WorkerExclusiveNode:      cfg.K8s.WorkerExclusiveNode,
-		WorkerPriorityClassName:  cfg.K8s.WorkerPriorityClassName,
-		ColocatedNodeSelector:    parseNodeSelector(cfg.K8s.ColocatedWorkerNodeSelector),
-		ColocatedTolerationKey:   cfg.K8s.ColocatedWorkerTolerationKey,
-		ColocatedTolerationValue: cfg.K8s.ColocatedWorkerTolerationValue,
-		ColocatedWarmShapes:      cfg.K8s.ColocatedWarmShapes,
+		Namespace:                    namespace,
+		CPID:                         cpID,
+		CPInstanceID:                 cpInstanceID,
+		WorkerImage:                  cfg.K8s.WorkerImage,
+		WorkerPort:                   cfg.K8s.WorkerPort,
+		SecretName:                   cfg.K8s.WorkerSecret,
+		ConfigMap:                    cfg.K8s.WorkerConfigMap,
+		IdleTimeout:                  cfg.WorkerIdleTimeout,
+		ConfigPath:                   cfg.ConfigPath,
+		ImagePullPolicy:              cfg.K8s.ImagePullPolicy,
+		ServiceAccount:               cfg.K8s.ServiceAccount,
+		WorkerCPURequest:             cfg.K8s.WorkerCPURequest,
+		WorkerMemoryRequest:          cfg.K8s.WorkerMemoryRequest,
+		WorkerNodeSelector:           parseNodeSelector(cfg.K8s.WorkerNodeSelector),
+		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
+		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,
+		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
+		PlaceholderImage:             cfg.K8s.PlaceholderImage,
+		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,
 		ResolveOrgConfig: func(orgID string) (*configstore.OrgConfig, error) {
 			snap := store.Snapshot()
 			if snap == nil {
@@ -221,28 +330,37 @@ func SetupMultiTenant(
 		slog.Warn("Duckling client unavailable, will use config store for infrastructure details.", "error", dcErr)
 	} else {
 		resolveDucklingStatus = func(ctx context.Context, orgID string) (*provisioner.DucklingStatus, error) {
-			return dc.Get(ctx, orgID)
+			// The CR name is the warehouse row's duckling_name (authoritative,
+			// never derived). The column is NOT NULL and backfilled; the org-ID
+			// fallback only covers legacy in-flight rows with an empty value.
+			warehouse, err := store.GetManagedWarehouse(orgID)
+			if err != nil {
+				return nil, fmt.Errorf("resolve duckling name for org %q: %w", orgID, err)
+			}
+			name := warehouse.DucklingName
+			if name == "" {
+				name = orgID
+			}
+			return dc.Get(ctx, name)
 		}
 	}
 
-	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, resolveDucklingStatus)
+	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, userSecrets, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
-	adpt := &orgRouterAdapter{router: router}
+	metadataSessions := newMetadataProxySessionRegistry(cfg.MetadataProxyMaxConns)
+	adpt := &orgRouterAdapter{router: router, metadataSessions: metadataSessions}
 	runtimeTracker := NewControlPlaneRuntimeTracker(
 		store,
 		cpInstanceID,
 		cpID,
-		podUID,
-		bootIDHex,
 		5*time.Second,
 	)
 	janitor := NewControlPlaneJanitor(store, 5*time.Second, 20*time.Second)
 	janitor.maxDrainTimeout = cfg.HandoverDrainTimeout
-	janitor.hotIdleTTL = defaultHotIdleTTL
-	janitor.warmCapacityMissBucketTTL = cfg.K8s.WarmCapacityDemandTTL
+	janitor.hotIdleTTL = effectiveDefaultWorkerTTL(cfg.K8s.WorkerDefaultTTL)
 	// Per-worker transitions (orphan retire, stuck reaper, hot-idle TTL)
 	// all flow through this lifecycle service. The legacy retireWorker /
 	// retireOrphanWorker / retireLocalWorker / deleteRetiredWorker
@@ -253,56 +371,19 @@ func SetupMultiTenant(
 	// being the leader, so stale per-image counts from this CP don't
 	// linger in Prometheus while a peer takes over.
 	janitor.onStop = resetLeaderOwnedClusterMetrics
-	lastWarmCapacityTargets := map[string]int{}
 	var lastWorkerLifecycleStats []configstore.WorkerLifecycleStats
-	var lastWorkerLifecycleTargetImages []string
-	lastWarmCapacityGlobalCapBlocked := false
-	janitor.reconcileWarmCapacity = func() {
-		snap := store.Snapshot()
-		if snap == nil {
+	// Refresh the per-image worker lifecycle gauges (Hot / HotIdle / Draining /
+	// … counts). Workers are spawned on demand and reused while hot-idle until
+	// their TTL — there is no warm pool to reconcile, so this is pure
+	// observability, leader-only.
+	janitor.observeWorkerLifecycle = func() {
+		stats, err := listWorkerLifecycleStats(store)
+		if err != nil {
+			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", err)
 			return
 		}
-		baseTargets := router.computeBaseWarmCapacityTargets(snap)
-		targetSnapshot, err := computeEffectiveWarmCapacityTargetSnapshot(
-			baseTargets,
-			store,
-			cfg.K8s,
-			janitor.now(),
-		)
-		if err != nil {
-			slog.Warn("Janitor failed to read dynamic warm-capacity demand; reconciling base warm targets only.", "error", err)
-		}
-		observeWarmCapacityTargets(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, cfg.K8s.MaxWorkers, lastWarmCapacityTargets)
-		targetImages := warmCapacityTargetImages(targetSnapshot.EffectiveTargets)
-		if stats, statsErr := listWorkerLifecycleStats(store); statsErr != nil {
-			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", statsErr)
-		} else {
-			observeWorkerLifecycleStatsForImages(stats, targetImages, lastWorkerLifecycleTargetImages, lastWorkerLifecycleStats)
-			lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
-			lastWorkerLifecycleTargetImages = cloneStringSlice(targetImages)
-		}
-		logWarmCapacityTargetChanges(lastWarmCapacityTargets, targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets)
-		lastWarmCapacityTargets = cloneWarmCapacityTargets(targetSnapshot.EffectiveTargets)
-
-		globalCapBlocked := warmCapacityGlobalCapBlocksDemand(targetSnapshot.BaseTargets, targetSnapshot.EffectiveTargets, targetSnapshot.RecentMisses, cfg.K8s)
-		if globalCapBlocked && !lastWarmCapacityGlobalCapBlocked {
-			slog.Info("Global worker cap prevents dynamic warm capacity.", "max_workers", cfg.K8s.MaxWorkers, "base_target_total", sumIntMap(targetSnapshot.BaseTargets), "effective_target_total", sumIntMap(targetSnapshot.EffectiveTargets))
-		}
-		lastWarmCapacityGlobalCapBlocked = globalCapBlocked
-
-		targets := targetSnapshot.EffectiveTargets
-		router.sharedPool.SetPerImageWarmTargets(targets)
-		reconcileWarmCapacityImageTargets(router.sharedPool, targets)
-
-		// Maintain the shape-aware colocated (bin-pack) warm pool alongside the
-		// default per-image pools, so every configured colocate=true shape (e.g.
-		// 4/16 and 8/48) bursts into a ready pod. Coupled to the master gate so we
-		// don't pre-warm colocated pods that no client can route to.
-		if cfg.K8s.AllowClientWorkerProfile && len(cfg.K8s.ColocatedWarmShapes) > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
-			router.sharedPool.reconcileColocatedWarm(ctx)
-			cancel()
-		}
+		observeWorkerLifecycleStats(stats, lastWorkerLifecycleStats)
+		lastWorkerLifecycleStats = cloneWorkerLifecycleStats(stats)
 	}
 	janitor.retireMismatchedVersionWorker = func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -329,6 +410,57 @@ func SetupMultiTenant(
 		}
 		secretCancel()
 	}
+	janitor.hotIdleFloor = func(snap configstore.WorkerSnapshot) int {
+		snapshot := store.Snapshot()
+		if snapshot == nil {
+			return 0
+		}
+		org, ok := snapshot.Orgs[snap.OrgID()]
+		if !ok || org == nil {
+			return 0
+		}
+		if snap.Image() != workerImageForOrg(org, baseCfg.WorkerImage) {
+			return 0
+		}
+		profile, _, err := resolveOrgDefaultWorkerProfile(cfg.K8s, org)
+		if err != nil {
+			return 0
+		}
+		profileCPU, profileMemory := profile.Parts()
+		if snap.ProfileCPU() != profileCPU || snap.ProfileMemory() != profileMemory {
+			return 0
+		}
+		return org.DefaultWorkerMinHotIdle
+	}
+	// Node-headroom controller: keep low-priority placeholder pods as warm,
+	// preemptible spare capacity so worker spawns schedule immediately.
+	// Leader-only (runs on the janitor tick). Always wired — reconcileHeadroom
+	// itself decides the target (dynamic, from the worker spawn log; disabled
+	// when no placeholder PriorityClass is configured). It must run even when
+	// disabled so a pool that had headroom turned off converges its
+	// placeholders to zero instead of stranding them.
+	janitor.reconcileHeadroom = func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		router.sharedPool.reconcileHeadroom(ctx)
+	}
+
+	// Per-CP fallback hot-idle reaper: runs on EVERY replica, independent of the
+	// janitor leader lease, retiring this replica's own expired hot-idle workers.
+	// Backstops the leader-only janitor reaper above so a wedged/absent leader
+	// can no longer let idle worker pods (and their r6gd nodes) accumulate
+	// fleet-wide. Reuses the same TTL, floor, lifecycle and store as the janitor;
+	// the fenced CAS makes concurrent leader/fallback retires safe.
+	fallbackReaper := &perCPHotIdleReaper{
+		store:        store,
+		lifecycle:    router.sharedPool.lifecycle,
+		cpInstanceID: cpInstanceID,
+		hotIdleTTL:   janitor.hotIdleTTL,
+		hotIdleFloor: janitor.hotIdleFloor,
+		orphanGrace:  janitor.orphanGrace, // same cutoff as the leader orphan sweep
+		interval:     time.Minute,
+	}
+	go fallbackReaper.Run(context.Background())
 
 	// Scheduler-side activator: a single SharedWorkerActivator instance
 	// that the credential-refresh tick uses to re-broker STS sessions for
@@ -352,14 +484,9 @@ func SetupMultiTenant(
 		},
 	)
 	if refreshActivator != nil {
+		adpt.metadataPostgresURL = refreshActivator.MetadataPostgresURL
 		refreshActivator.resolveDucklingStatus = resolveDucklingStatus
 	}
-
-	// Half the configured STS session duration: a worker due for refresh
-	// gets picked up well before its current session token actually goes
-	// stale, with a full half-life of slack to retry transient STS / RPC
-	// failures on subsequent ticks.
-	const credentialRefreshLookahead = stsSessionDuration / 2
 
 	// Per-CP scheduler — runs on every CP regardless of leader status, since
 	// each CP refreshes only the workers it owns (filtered by cpInstanceID in
@@ -379,71 +506,39 @@ func SetupMultiTenant(
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
-	var trinoBundleHandler *opa.Handler
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
-		// Without the controller, the Trino reconcile loop cannot run.
-		// If the operator asked for Trino explicitly (URL set), that's a
-		// fatal startup failure — same "Trino is binary" stance as the
-		// wiring-failure branch below. Without this check, the Trino
-		// branch would be silently skipped (it's nested in the else)
-		// and password/group/bundle projections would stop updating.
-		if trinoProvisionerEnabled() {
-			return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but provisioning controller unavailable: %w",
-				envTrinoCoordinatorURL, err)
-		}
 		slog.Warn("Provisioning controller unavailable.", "error", err)
 	} else {
-		// Opt-in: enable the per-org Lakekeeper provisioning branch. Off by
-		// default so existing deploys are unaffected. Best-effort — if the
-		// K8s client can't be built we log and leave the controller running
-		// without the Lakekeeper branch (S3-Tables warehouses still work).
-		if lakekeeperProvisionerEnabled() {
-			if k8sClient, lkErr := provisioner.NewLakekeeperK8sClient(); lkErr != nil {
-				slog.Warn("Lakekeeper provisioner enabled but K8s client unavailable; skipping.", "error", lkErr)
-			} else {
-				lkProv := provisioner.NewLakekeeperProvisioner(store, k8sClient)
-				provCtrl.WithLakekeeperProvisioner(lkProv, newLakekeeperInputsResolver(resolveDucklingStatus))
-				slog.Info("Lakekeeper provisioner enabled (allowall + NetworkPolicy mode).")
-			}
-		}
-		// Customer-Trino provisioner branch. Enablement is signaled by
-		// setting DUCKGRES_TRINO_COORDINATOR_URL (no separate boolean
-		// gate — the URL is the intent). When enabled, wiring failure
-		// is fatal: silently skipping would leave the customer-Trino
-		// OPA sidecar serving last-good bundle while password/group-
-		// file changes never propagate, which is worse than failing
-		// the rollout.
-		//
-		// Lakekeeper's branch above stays best-effort (log-and-skip)
-		// because its env shape was designed for opportunistic enable
-		// of S3-Tables-only deployments where Lakekeeper is optional.
-		// Trino is binary: if you asked for it, you need it.
-		if trinoProvisionerEnabled() {
-			kc, tkErr := newTrinoKubeClient()
-			if tkErr != nil {
-				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but K8s client unavailable: %w",
-					envTrinoCoordinatorURL, tkErr)
-			}
-			trinoWire, twErr := buildTrinoWiring(store, kc)
-			if twErr != nil {
-				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
-			}
-			if trinoWire == nil {
-				// buildTrinoWiring returns (nil, nil) only when the
-				// env gate is off — and the outer if guarded against
-				// that. So a nil here is a wiring bug.
-				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
-			}
-			provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
-			trinoBundleHandler = trinoWire.BundleHandler
-			slog.Info("Trino provisioner enabled.")
-		}
+		// Env suffix for CP-owned s3bucket naming: drives the backfill of
+		// spec.dataStore.bucketName onto existing ready ducklings. Empty leaves
+		// it disabled (composition keeps deriving).
+		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
 		go provCtrl.Run(context.Background())
+	}
+
+	// Reshard operations execute in DEDICATED per-op pods, never inside a CP
+	// process (a catalog pg_dump must not compete with live traffic for CP
+	// memory — a 20k-table dump OOM-killed a 512Mi CP pod). The CP's part is
+	// (a) the spawner (admin start handler creates the op + pod) and (b) the
+	// leader-only reconciler (respawn dead runner pods, reap finished ones).
+	var reshardSpawner *ReshardPodSpawner
+	if router.sharedPool != nil && router.sharedPool.clientset != nil {
+		selfPod := os.Getenv("POD_NAME")
+		if selfPod == "" {
+			selfPod = cpID
+		}
+		reshardSpawner = NewReshardPodSpawner(
+			router.sharedPool.clientset, namespace, selfPod,
+			cfg.K8s.ReshardPodCPU, cfg.K8s.ReshardPodMemory,
+		)
+		if janitorLeader != nil {
+			janitorLeader.AttachLeaderLoop(newReshardReconciler(store, reshardSpawner).Run)
+		}
 	}
 
 	// Register config change handler
@@ -457,10 +552,33 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret; set --internal-secret or DUCKGRES_INTERNAL_SECRET explicitly to avoid rotation on restart.")
+	}
+	adminTokens := admin.NewTokenSet(internalSecret, cfg.InternalSecretFallbacks)
+	if n := len(cfg.InternalSecretFallbacks); n > 0 {
+		// Count only — never log the secret values.
+		slog.Info("Internal secret rotation fallbacks active.", "fallback_count", n)
+	}
+	// Scoped read-only token for the discovery endpoints. Empty secret ⇒
+	// empty TokenSet ⇒ never validates; discovery then accepts only the
+	// internal secret (pre-rollout behavior). A discovery value colliding
+	// with the internal set would silently un-scope the credential, so
+	// that's a startup failure, not a warning.
+	if err := validateDistinctReadOnlySecret(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks, internalSecret, cfg.InternalSecretFallbacks); err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	readOnlyTokens := admin.NewTokenSet(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks)
+	if readOnlyTokens.Count() == 0 {
+		// Keyed off the TokenSet, not just cfg.ReadOnlySecret: fallbacks
+		// alone (mid-rotation) still validate, and saying otherwise here
+		// would mislead an operator debugging exactly that state.
+		slog.Info("Read-only secret not set; discovery endpoints accept only the internal secret. Set --read-only-secret or DUCKGRES_READ_ONLY_SECRET to give external writers a scoped credential.")
+	} else if n := len(cfg.ReadOnlySecretFallbacks); n > 0 {
+		// Count only — never log the secret values.
+		slog.Info("Discovery secret rotation fallbacks active.", "fallback_count", n)
 	}
 
 	// Set up API server (admin + provisioning + dashboard on :8080).
@@ -472,23 +590,134 @@ func SetupMultiTenant(
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
 
-	// Authenticated API
-	api := engine.Group("/api/v1", admin.APIAuthMiddleware(internalSecret))
-	admin.RegisterAPI(api, store, adpt)
-	provisioning.RegisterAPI(api, provisioning.NewGormStore(store))
-
-	// Customer-Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1
-	// admin group on purpose — it does its own bearer-token auth (the
-	// bundle exposes the customer roster; a separate shared secret
-	// between provisioner and the OPA sidecar). When the Trino
-	// provisioner is disabled (the default), trinoBundleHandler is nil
-	// and the route isn't registered.
-	if trinoBundleHandler != nil {
-		engine.Any("/bundles/trino", gin.WrapH(trinoBundleHandler))
+	// Admin UI dependencies. Prometheus URL is an env-only K8s knob (set by the
+	// chart); see config_resolution.go / CLAUDE.md. The admin role for an SSO
+	// caller is resolved per-request from the operators table (managed under
+	// Admin → Operators); the break-glass internal-secret path is independent.
+	//
+	// There is no bootstrap seed. The first SSO login auto-provisions a
+	// create-only VIEWER row for the caller (so an operator appears in the
+	// config store just by logging in), and the role is then read back. To make
+	// the first admin: log in over break-glass (internal-secret → admin) and
+	// patch your auto-provisioned row to admin under Admin → Operators.
+	resolve := func(email string) admin.Role {
+		role, err := store.OperatorRole(email)
+		if err != nil {
+			slog.Warn("admin: operator role lookup failed", "email", email, "error", err)
+		}
+		if role == "" {
+			// Auto-provision (create-only, never clobbers an existing role) so the
+			// caller has a row to be promoted from. Best-effort: a failure here
+			// must not block authentication — the caller simply stays viewer.
+			if err := store.SeedOperator(email, string(admin.RoleViewer)); err != nil {
+				slog.Warn("admin: operator auto-provision failed", "email", email, "error", err)
+			}
+		}
+		if role == "admin" {
+			return admin.RoleAdmin
+		}
+		return admin.RoleViewer
+	}
+	auditStore, err := admin.NewAuditStore(store.DB())
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
+	}
+	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
+	clusterInfo := &clusterInfoProvider{
+		router:           router,
+		store:            store,
+		srv:              srv,
+		selfCPID:         cpInstanceID,
+		metadataSessions: metadataSessions,
+	}
+	imp := &impersonator{router: router}
+	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
+	// memory, so a single replica only sees its own slice. The fetcher fans the
+	// read out to peer CP pods so the dashboard shows cluster-wide numbers.
+	var liveFetcher admin.PeerFetcher
+	if router.sharedPool != nil && router.sharedPool.clientset != nil {
+		liveFetcher = newClusterPeerFetcher(
+			router.sharedPool.clientset, router.sharedPool.namespace,
+			router.sharedPool.cpID, internalSecret, 8080,
+		)
 	}
 
-	// Dashboard
-	admin.RegisterDashboard(engine, internalSecret)
+	// Authenticated API. AuthMiddleware resolves the caller (internal-secret →
+	// admin, else ALB/Cognito SSO → viewer/admin). AuditMiddleware records every
+	// mutation. RoleGate enforces viewer/admin (mutations + the audit log read
+	// require admin).
+	// RoleGate blocks viewer mutations (method-based); the audit-log read
+	// self-gates via RequireAdmin at its route (no brittle path coupling here).
+	api := engine.Group("/api/v1",
+		admin.AuthMiddleware(adminTokens, resolve),
+		admin.AuditMiddleware(auditStore),
+		admin.RoleGate(),
+	)
+	admin.RegisterAPI(api, store, adpt, liveFetcher)
+	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// Discovery endpoints live in their OWN group (see discovery_group.go
+	// for the security rationale and the topology tripwire test).
+	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
+	// Pull-based compute-billing API (GET /billing/usage + POST /billing/ack).
+	// The billing service authenticates with the internal secret (→ admin);
+	// RequireAdmin keeps SSO viewers away from raw usage + the ack mutation.
+	registerBillingAPI(api, store, admin.RequireAdmin())
+	// Node-overview topology reads reuse the shared K8s pool's in-cluster
+	// clientset (nil when there's no shared pool — leaves those routes off).
+	var clusterClient kubernetes.Interface
+	if router.sharedPool != nil {
+		clusterClient = router.sharedPool.clientset
+	}
+	admin.RegisterExtras(api, admin.Extras{
+		Store:         store,
+		Live:          clusterInfo,
+		Users:         store,
+		Fetcher:       liveFetcher,
+		Impersonator:  imp,
+		Audit:         auditStore,
+		Metrics:       metricsProxy,
+		ClusterClient: clusterClient,
+	})
+
+	// Live Duckling drift finder. Reuse the in-cluster Duckling client built
+	// above (dc); pass nil when it's unavailable so the endpoint degrades to
+	// {"available": false} rather than 500ing. A typed-nil *DucklingClient must
+	// not be boxed into the interface, so only assign when dc is usable.
+	var ducklingChecker admin.DucklingChecker
+	if dcErr == nil && dc != nil {
+		ducklingChecker = dc
+	}
+	admin.RegisterDucklingsDrift(api, store, ducklingChecker)
+
+	// Live per-Duckling metadata-store assignment (which cnpg shard each
+	// tenant landed on) for the org overview/detail pages. Same nil-degrade
+	// contract as the drift finder.
+	var ducklingMetadata admin.DucklingMetadataLister
+	if dcErr == nil && dc != nil {
+		ducklingMetadata = ducklingMetadataAdapter{dc: dc}
+	}
+	admin.RegisterDucklingsMetadata(api, ducklingMetadata)
+
+	// Reshard operations (metadata-store migrations). The spawner may be nil
+	// (no k8s API) — reads still work, starts fail with a clear error.
+	var reshardSpawnerHandle admin.ReshardPodSpawner
+	if reshardSpawner != nil {
+		reshardSpawnerHandle = reshardSpawner
+	}
+	// Pre-flight prober for cnpg→external targets: reuses the catalog copier's
+	// SELECT-1 probe to fail-fast an unreachable/bad-credential target before
+	// the destructive flip. Always available in the k8s CP build; nil-degrades
+	// in tests / non-k8s (the runner's copy still catches a bad credential).
+	targetProber := catalogCopierProber{cluster: clusterClient}
+	admin.RegisterReshardAPI(api, store, ducklingMetadata, reshardSpawnerHandle, clusterClient, targetProber, targetProber)
+
+	// Break-glass internal-secret login (the SPA owns "/" and app routes).
+	admin.RegisterLogin(engine, adminTokens)
+
+	// Embedded React SPA (served unauthenticated; all data is under /api/v1).
+	if err := admin.RegisterUI(engine); err != nil {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
+	}
 
 	apiServer := &http.Server{
 		Addr:    ":8080",
@@ -501,54 +730,73 @@ func SetupMultiTenant(
 		}
 	}()
 
-	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
+	// Compute-usage metering (managed-warehouse billing, pull model — see
+	// docs/design/billing-pull-api.md). Always on for the remote backend: every
+	// CP pod meters connection-end usage and flushes it into the config-store
+	// buffer (cross-pod UPSERT-increment); billing pulls it via the
+	// GET/ack API registered above. Best-effort throughout — queries are NEVER
+	// failed on its account. The 30-day safety GC is leader-only, co-located
+	// under the janitor lease so exactly one CP pod sweeps.
+	meter := newComputeMeter(store, store.OrgUsageTeamID)
+	go meter.Run(context.Background())
+	if janitorLeader != nil {
+		janitorLeader.AttachLeaderLoop(func(ctx context.Context) { runComputeUsageGC(ctx, store) })
+	}
+	slog.Info("Managed-warehouse compute-usage metering enabled (pull API).")
+
+	// Storage-billing sampler (leader-only, so exactly one CP credits each
+	// interval): every ~30min it reads each Ready warehouse's tracked DuckLake
+	// footprint straight from the org's metadata Postgres (via the same
+	// cross-org resolution the credential refresher uses) and credits
+	// bytes × interval into the storage buffer; billing pulls it alongside
+	// compute. Best-effort — a failed sample under-bills one interval, never
+	// affects anything user-facing.
+	storageSamplerLoop := newStorageSampler(store, storageSampleIntervalFromEnv(),
+		func() []storageOrg {
+			snap := store.Snapshot()
+			if snap == nil {
+				return nil
+			}
+			var orgs []storageOrg
+			for _, org := range snap.Orgs {
+				if org.Warehouse != nil && org.Warehouse.State == configstore.ManagedWarehouseStateReady {
+					orgs = append(orgs, storageOrg{OrgID: org.Name, TeamID: org.OldestTeamID()})
+				}
+			}
+			return orgs
+		},
+		refreshActivator.MetadataPostgresURL,
+	)
+	if janitorLeader != nil {
+		janitorLeader.AttachLeaderLoop(storageSamplerLoop.Run)
+	}
+	slog.Info("Managed-warehouse storage-usage sampling enabled.", "interval", storageSamplerLoop.interval.String())
+
+	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
 }
 
-type warmCapacityMissAggregateLister interface {
-	ListWarmCapacityMissesSince(since time.Time, reasons ...configstore.WorkerClaimMissReason) ([]configstore.WarmCapacityMissAggregate, error)
+// ducklingMetadataAdapter converts provisioner.CRMetadataStore into the
+// admin package's DucklingMetadataStore so admin does not import provisioner
+// (same decoupling as DucklingChecker, which needs no adapter only because
+// its method signatures carry no provisioner types).
+type ducklingMetadataAdapter struct {
+	dc *provisioner.DucklingClient
+}
+
+func (a ducklingMetadataAdapter) CRMetadataStores(ctx context.Context) (map[string]admin.DucklingMetadataStore, error) {
+	stores, err := a.dc.CRMetadataStores(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]admin.DucklingMetadataStore, len(stores))
+	for name, ms := range stores {
+		out[name] = admin.DucklingMetadataStore{Kind: ms.Type, Endpoint: ms.Endpoint}
+	}
+	return out, nil
 }
 
 type workerLifecycleStatsLister interface {
 	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
-}
-
-type warmCapacityTargetSnapshot struct {
-	BaseTargets      map[string]int
-	EffectiveTargets map[string]int
-	RecentMisses     []configstore.WarmCapacityMissAggregate
-}
-
-func computeEffectiveWarmCapacityTargets(baseTargets map[string]int, lister warmCapacityMissAggregateLister, cfg K8sConfig, now time.Time) (map[string]int, error) {
-	snap, err := computeEffectiveWarmCapacityTargetSnapshot(baseTargets, lister, cfg, now)
-	return snap.EffectiveTargets, err
-}
-
-func computeEffectiveWarmCapacityTargetSnapshot(baseTargets map[string]int, lister warmCapacityMissAggregateLister, cfg K8sConfig, now time.Time) (warmCapacityTargetSnapshot, error) {
-	snap := warmCapacityTargetSnapshot{
-		BaseTargets:      sanitizeWarmCapacityTargets(baseTargets),
-		EffectiveTargets: sanitizeWarmCapacityTargets(baseTargets),
-	}
-	dynamicCfg := dynamicWarmCapacityConfigFromK8s(cfg)
-	if !dynamicCfg.Enabled {
-		return snap, nil
-	}
-	if lister == nil {
-		return snap, nil
-	}
-	window := cfg.WarmCapacityMissWindow
-	if window <= 0 {
-		window = DefaultWarmCapacityMissWindow
-	}
-	if now.IsZero() {
-		now = time.Now()
-	}
-	aggregates, err := lister.ListWarmCapacityMissesSince(now.Add(-window), configstore.WorkerClaimMissReasonNoIdle)
-	if err != nil {
-		return snap, err
-	}
-	snap.RecentMisses = aggregates
-	snap.EffectiveTargets = computeDynamicWarmCapacityTargets(snap.BaseTargets, aggregates, dynamicCfg)
-	return snap, nil
 }
 
 func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
@@ -558,37 +806,6 @@ func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.
 	return lister.ListWorkerLifecycleStats()
 }
 
-func logWarmCapacityTargetChanges(previous, baseTargets, effectiveTargets map[string]int) {
-	for _, image := range warmCapacityTargetImages(previous, baseTargets, effectiveTargets) {
-		effective := positiveMapValue(effectiveTargets, image)
-		if positiveMapValue(previous, image) == effective {
-			continue
-		}
-		base := positiveMapValue(baseTargets, image)
-		demand := effective - base
-		if demand < 0 {
-			demand = 0
-		}
-		slog.Info("Warm capacity target changed.",
-			"image", image,
-			"base_target", base,
-			"demand_target", demand,
-			"effective_target", effective,
-		)
-	}
-}
-
-func cloneWarmCapacityTargets(targets map[string]int) map[string]int {
-	out := make(map[string]int, len(targets))
-	for image, target := range targets {
-		if strings.TrimSpace(image) == "" || target <= 0 {
-			continue
-		}
-		out[image] = target
-	}
-	return out
-}
-
 func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {
 	if len(stats) == 0 {
 		return nil
@@ -596,54 +813,6 @@ func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []confi
 	out := make([]configstore.WorkerLifecycleStats, len(stats))
 	copy(out, stats)
 	return out
-}
-
-func cloneStringSlice(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]string, len(values))
-	copy(out, values)
-	return out
-}
-
-func warmCapacityGlobalCapBlocksDemand(baseTargets, effectiveTargets map[string]int, aggregates []configstore.WarmCapacityMissAggregate, cfg K8sConfig) bool {
-	if cfg.MaxWorkers <= 0 || len(aggregates) == 0 {
-		return false
-	}
-	effectiveTotal := sumIntMap(effectiveTargets)
-	if effectiveTotal < cfg.MaxWorkers {
-		return false
-	}
-	dynamicCfg := dynamicWarmCapacityConfigFromK8s(cfg)
-	if !dynamicCfg.Enabled {
-		return false
-	}
-	dynamicCfg.MaxWorkers = 0
-	uncappedTargets := computeDynamicWarmCapacityTargets(baseTargets, aggregates, dynamicCfg)
-	return sumIntMap(uncappedTargets) > effectiveTotal
-}
-
-func reconcileWarmCapacityImageTargets(pool *K8sWorkerPool, targets map[string]int) {
-	if pool == nil || len(targets) == 0 {
-		return
-	}
-	var wg sync.WaitGroup
-	for image, count := range targets {
-		if count <= 0 {
-			continue
-		}
-		wg.Add(1)
-		go func(image string, count int) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), warmSpawnReconcileTimeout)
-			defer cancel()
-			if err := pool.SpawnMinWorkersForImage(ctx, image, count); err != nil {
-				slog.Warn("Janitor failed to reconcile image warm capacity.", "image", image, "target", count, "error", err)
-			}
-		}(image, count)
-	}
-	wg.Wait()
 }
 
 func resolveK8sNamespace(namespace string) (string, error) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +23,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		t.Fatal("expected runtime schema to be configured")
 	}
 
-	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records", "warm_capacity_miss_buckets"} {
+	for _, table := range []string{"cp_instances", "worker_records", "flight_session_records", "org_connection_queue", "org_connection_leases"} {
 		var count int64
 		if err := store.DB().Raw(
 			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
@@ -36,13 +37,47 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		}
 	}
 
+	var obsoleteTableCount int64
+	if err := store.DB().Raw(
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+		runtimeSchema,
+		"org_connection_admission_protocol",
+	).Scan(&obsoleteTableCount).Error; err != nil {
+		t.Fatalf("lookup obsolete admission protocol table: %v", err)
+	}
+	if obsoleteTableCount != 0 {
+		t.Fatal("fresh runtime schema unexpectedly contains the retired admission protocol table")
+	}
+
+	for table, columns := range map[string][]string{
+		"cp_instances":         {"supports_admission_offers"},
+		"org_connection_queue": {"state", "offered_at", "offer_expires_at"},
+	} {
+		for _, column := range columns {
+			var count int64
+			if err := store.DB().Raw(
+				"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
+				runtimeSchema,
+				table,
+				column,
+			).Scan(&count).Error; err != nil {
+				t.Fatalf("lookup obsolete runtime column %s.%s: %v", table, column, err)
+			}
+			if count != 0 {
+				t.Fatalf("fresh runtime schema unexpectedly contains retired column %s.%s", table, column)
+			}
+		}
+	}
+	requireRuntimeIndexDefinition(t, store, "org_connection_queue", "idx_org_connection_queue_user_heads",
+		"(org_id, username, enqueued_at, request_id)", "WHERE (granted_at IS NULL)")
+	requireRuntimeIndexDefinition(t, store, "org_connection_leases", "idx_org_connection_leases_org_user",
+		"(org_id, username)")
+
 	startedAt := time.Date(2026, time.March, 26, 12, 0, 0, 0, time.UTC)
 	heartbeatAt := startedAt.Add(5 * time.Second)
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-1:boot-a",
 		PodName:         "duckgres-abc",
-		PodUID:          "pod-uid-1",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: heartbeatAt,
@@ -89,6 +124,7 @@ func TestRuntimeStorePostgres(t *testing.T) {
 		Username:     "postgres",
 		OrgID:        "analytics",
 		WorkerID:     42,
+		PID:          1234,
 		OwnerEpoch:   7,
 		State:        configstore.FlightSessionStateActive,
 		ExpiresAt:    sessionExpiry,
@@ -104,6 +140,9 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	if session.WorkerID != 42 {
 		t.Fatalf("expected worker id 42, got %d", session.WorkerID)
 	}
+	if session.PID != 1234 {
+		t.Fatalf("expected pid 1234, got %d", session.PID)
+	}
 	if session.Username != "postgres" {
 		t.Fatalf("expected username postgres, got %q", session.Username)
 	}
@@ -112,133 +151,27 @@ func TestRuntimeStorePostgres(t *testing.T) {
 	}
 }
 
-func TestRecordWarmCapacityMissAggregatesByBucketScopeAndReasonPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	other := newConfigStoreOnSameSchema(t, store)
+func requireRuntimeIndexDefinition(t *testing.T, store *configstore.ConfigStore, tableName, indexName string, wantSubstrings ...string) {
+	t.Helper()
 
-	now := time.Date(2026, time.March, 26, 14, 0, 5, 0, time.UTC)
-	for _, recorder := range []*configstore.ConfigStore{store, other} {
-		if err := recorder.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
-			t.Fatalf("RecordWarmCapacityMiss(default): %v", err)
+	var indexDef string
+	err := store.DB().Raw(
+		"SELECT indexdef FROM pg_indexes WHERE schemaname = ? AND tablename = ? AND indexname = ?",
+		store.RuntimeSchema(),
+		tableName,
+		indexName,
+	).Scan(&indexDef).Error
+	if err != nil {
+		t.Fatalf("lookup runtime index %s.%s: %v", tableName, indexName, err)
+	}
+	if indexDef == "" {
+		t.Fatalf("runtime index %s.%s is missing", tableName, indexName)
+	}
+	for _, want := range wantSubstrings {
+		if !strings.Contains(indexDef, want) {
+			t.Fatalf("runtime index %s.%s definition = %q, want substring %q", tableName, indexName, indexDef, want)
 		}
 	}
-	if err := store.RecordWarmCapacityMiss("image:duckgres:pinned", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(pinned): %v", err)
-	}
-	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonGlobalCap, now); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(default/global-cap): %v", err)
-	}
-
-	bucketStart := now.Truncate(configstore.WarmCapacityMissBucketSize)
-	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, bucketStart, 2)
-	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonGlobalCap, bucketStart, 1)
-	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:pinned", configstore.WorkerClaimMissReasonNoIdle, bucketStart, 1)
-}
-
-func TestRecordWarmCapacityMissConcurrentWritersPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	other := newConfigStoreOnSameSchema(t, store)
-
-	now := time.Date(2026, time.March, 26, 14, 5, 5, 0, time.UTC)
-	recorders := []*configstore.ConfigStore{store, other}
-	errs := make(chan error, 40)
-	var wg sync.WaitGroup
-	for i := 0; i < cap(errs); i++ {
-		wg.Add(1)
-		recorder := recorders[i%len(recorders)]
-		go func() {
-			defer wg.Done()
-			errs <- recorder.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now)
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("RecordWarmCapacityMiss concurrent writer: %v", err)
-		}
-	}
-
-	bucketStart := now.Truncate(configstore.WarmCapacityMissBucketSize)
-	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, bucketStart, 40)
-}
-
-func TestListWarmCapacityMissesSinceAggregatesByScopeAndReasonPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	other := newConfigStoreOnSameSchema(t, store)
-
-	now := time.Date(2026, time.March, 26, 14, 10, 5, 0, time.UTC)
-	old := now.Add(-5 * time.Minute)
-	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, old); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(old): %v", err)
-	}
-	for _, recorder := range []*configstore.ConfigStore{store, other} {
-		if err := recorder.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
-			t.Fatalf("RecordWarmCapacityMiss(default): %v", err)
-		}
-	}
-	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, now.Add(11*time.Second)); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(default next bucket): %v", err)
-	}
-	if err := store.RecordWarmCapacityMiss("image:duckgres:pinned", configstore.WorkerClaimMissReasonNoIdle, now); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(pinned): %v", err)
-	}
-	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonGlobalCap, now); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(global cap): %v", err)
-	}
-
-	aggregates, err := store.ListWarmCapacityMissesSince(now.Add(-time.Minute), configstore.WorkerClaimMissReasonNoIdle)
-	if err != nil {
-		t.Fatalf("ListWarmCapacityMissesSince: %v", err)
-	}
-	got := warmCapacityMissAggregateCounts(aggregates)
-	want := map[string]int64{
-		"image:duckgres:default|no_idle": 3,
-		"image:duckgres:pinned|no_idle":  1,
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected no-idle aggregates %v, got %v", want, got)
-	}
-
-	aggregates, err = store.ListWarmCapacityMissesSince(now.Add(-time.Minute))
-	if err != nil {
-		t.Fatalf("ListWarmCapacityMissesSince unfiltered: %v", err)
-	}
-	got = warmCapacityMissAggregateCounts(aggregates)
-	want = map[string]int64{
-		"image:duckgres:default|global_cap": 1,
-		"image:duckgres:default|no_idle":    3,
-		"image:duckgres:pinned|no_idle":     1,
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected unfiltered aggregates %v, got %v", want, got)
-	}
-}
-
-func TestPruneWarmCapacityMissBucketsPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	oldNow := time.Date(2026, time.March, 26, 14, 0, 5, 0, time.UTC)
-	newNow := oldNow.Add(15 * time.Minute)
-	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, oldNow); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(old): %v", err)
-	}
-	if err := store.RecordWarmCapacityMiss("image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newNow); err != nil {
-		t.Fatalf("RecordWarmCapacityMiss(new): %v", err)
-	}
-
-	pruned, err := store.PruneWarmCapacityMissBuckets(newNow.Add(-10 * time.Minute))
-	if err != nil {
-		t.Fatalf("PruneWarmCapacityMissBuckets: %v", err)
-	}
-	if pruned != 1 {
-		t.Fatalf("expected one old bucket pruned, got %d", pruned)
-	}
-
-	oldBucketStart := oldNow.Truncate(configstore.WarmCapacityMissBucketSize)
-	newBucketStart := newNow.Truncate(configstore.WarmCapacityMissBucketSize)
-	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, oldBucketStart, 0)
-	assertWarmCapacityMissBucketCount(t, store, "image:duckgres:default", configstore.WorkerClaimMissReasonNoIdle, newBucketStart, 1)
 }
 
 func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
@@ -331,419 +264,6 @@ func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 		t.Fatalf("expected worker lifecycle stats %v, got %v", want, got)
 	}
 }
-
-func warmCapacityMissAggregateCounts(aggregates []configstore.WarmCapacityMissAggregate) map[string]int64 {
-	out := make(map[string]int64, len(aggregates))
-	for _, aggregate := range aggregates {
-		out[fmt.Sprintf("%s|%s", aggregate.Scope, aggregate.Reason)] = aggregate.Count
-	}
-	return out
-}
-
-func TestClaimIdleWorkerPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	startedAt := time.Date(2026, time.March, 26, 13, 0, 0, 0, time.UTC)
-	heartbeatAt := startedAt.Add(5 * time.Second)
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          7,
-		PodName:           "duckgres-worker-7",
-		State:             configstore.WorkerStateIdle,
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        2,
-		LastHeartbeatAt:   heartbeatAt,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord: %v", err)
-	}
-
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 1, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed == nil {
-		t.Fatal("expected idle worker claim to succeed")
-		return
-	}
-	if missReason != configstore.WorkerClaimMissReasonNone {
-		t.Fatalf("expected no miss reason on successful claim, got %q", missReason)
-	}
-	if claimed.WorkerID != 7 {
-		t.Fatalf("expected worker id 7, got %d", claimed.WorkerID)
-	}
-	if claimed.State != configstore.WorkerStateReserved {
-		t.Fatalf("expected reserved state, got %q", claimed.State)
-	}
-	if claimed.OwnerCPInstanceID != "cp-new:boot-b" {
-		t.Fatalf("expected owner cp-instance cp-new:boot-b, got %q", claimed.OwnerCPInstanceID)
-	}
-	if claimed.OwnerEpoch != 3 {
-		t.Fatalf("expected owner epoch 3, got %d", claimed.OwnerEpoch)
-	}
-	if claimed.OrgID != "analytics" {
-		t.Fatalf("expected org analytics, got %q", claimed.OrgID)
-	}
-	persisted, err := store.GetWorkerRecord(7)
-	if err != nil {
-		t.Fatalf("GetWorkerRecord: %v", err)
-	}
-	if persisted.State != configstore.WorkerStateReserved {
-		t.Fatalf("expected persisted reserved state, got %q", persisted.State)
-	}
-	if persisted.OwnerEpoch != 3 {
-		t.Fatalf("expected persisted owner epoch 3, got %d", persisted.OwnerEpoch)
-	}
-}
-
-func TestClaimIdleWorkerReturnsNilWhenNoIdleWorkerExists(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected no claim, got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonNoIdle {
-		t.Fatalf("expected no-idle miss reason, got %q", missReason)
-	}
-}
-
-func TestClaimIdleWorkerReturnsGlobalCapWhenNoIdleAndGlobalCapReached(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	now := time.Date(2026, time.March, 26, 13, 15, 0, 0, time.UTC)
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          8,
-		PodName:           "duckgres-worker-8",
-		State:             configstore.WorkerStateHot,
-		OrgID:             "analytics",
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        4,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
-	}
-
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 1, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected no claim, got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonGlobalCap {
-		t.Fatalf("expected global-cap miss reason, got %q", missReason)
-	}
-}
-
-func TestClaimIdleWorkerReturnsNoIdleWhenBelowGlobalCap(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	now := time.Date(2026, time.March, 26, 13, 20, 0, 0, time.UTC)
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          8,
-		PodName:           "duckgres-worker-8",
-		State:             configstore.WorkerStateHot,
-		OrgID:             "analytics",
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        4,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
-	}
-
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "", "", "", false, 0, 2, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected no claim, got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonNoIdle {
-		t.Fatalf("expected no-idle miss reason below global cap, got %q", missReason)
-	}
-}
-
-func TestClaimIdleWorkerReturnsGlobalCapForImageMissAtGlobalCap(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	now := time.Date(2026, time.March, 26, 13, 25, 0, 0, time.UTC)
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          8,
-		PodName:           "duckgres-worker-v1",
-		State:             configstore.WorkerStateIdle,
-		Image:             "duckgres:v1",
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        4,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
-	}
-
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected no claim, got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonGlobalCap {
-		t.Fatalf("expected global-cap miss reason for image miss, got %q", missReason)
-	}
-}
-
-func TestClaimIdleWorkerClaimsMatchingIdleWorkerAtGlobalCap(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	now := time.Date(2026, time.March, 26, 13, 27, 0, 0, time.UTC)
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          9,
-		PodName:           "duckgres-worker-v2",
-		State:             configstore.WorkerStateIdle,
-		Image:             "duckgres:v2",
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        4,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
-	}
-
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "billing", "duckgres:v2", "", "", false, 0, 1, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed == nil {
-		t.Fatal("expected matching idle worker claim to succeed at global cap")
-		return
-	}
-	if missReason != configstore.WorkerClaimMissReasonNone {
-		t.Fatalf("expected no miss reason on successful claim, got %q", missReason)
-	}
-	if claimed.WorkerID != 9 {
-		t.Fatalf("expected worker id 9, got %d", claimed.WorkerID)
-	}
-	if claimed.State != configstore.WorkerStateReserved {
-		t.Fatalf("expected reserved state, got %q", claimed.State)
-	}
-	if claimed.OrgID != "billing" {
-		t.Fatalf("expected org billing, got %q", claimed.OrgID)
-	}
-	if claimed.Image != "duckgres:v2" {
-		t.Fatalf("expected image duckgres:v2, got %q", claimed.Image)
-	}
-}
-
-func TestClaimIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	now := time.Date(2026, time.March, 26, 13, 30, 0, 0, time.UTC)
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          7,
-		PodName:           "duckgres-worker-7",
-		State:             configstore.WorkerStateIdle,
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        2,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(idle): %v", err)
-	}
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          8,
-		PodName:           "duckgres-worker-8",
-		State:             configstore.WorkerStateHot,
-		OrgID:             "analytics",
-		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        4,
-		LastHeartbeatAt:   now,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(hot): %v", err)
-	}
-
-	claimed, missReason, err := store.ClaimIdleWorker("cp-new:boot-b", "analytics", "", "", "", false, 1, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected org cap to block claim, got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonOrgCap {
-		t.Fatalf("expected org-cap miss reason, got %q", missReason)
-	}
-
-	persisted, err := store.GetWorkerRecord(7)
-	if err != nil {
-		t.Fatalf("GetWorkerRecord: %v", err)
-	}
-	if persisted.State != configstore.WorkerStateIdle {
-		t.Fatalf("expected worker to remain idle, got %q", persisted.State)
-	}
-	if persisted.OrgID != "" {
-		t.Fatalf("expected idle worker org to remain empty, got %q", persisted.OrgID)
-	}
-}
-
-func TestClaimIdleWorkerRespectsImageAffinity(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID: 7,
-		PodName:  "duckgres-worker-v1",
-		State:    configstore.WorkerStateIdle,
-		Image:    "duckgres:v1",
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord: %v", err)
-	}
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID: 8,
-		PodName:  "duckgres-worker-v2",
-		State:    configstore.WorkerStateIdle,
-		Image:    "duckgres:v2",
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord: %v", err)
-	}
-
-	// Try claiming v2
-	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v2", "", "", false, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed == nil || claimed.WorkerID != 8 {
-		t.Fatalf("expected to claim worker 8 (v2), got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonNone {
-		t.Fatalf("expected no miss reason on successful image claim, got %q", missReason)
-	}
-
-	// Try claiming v3 (none exist)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "duckgres:v3", "", "", false, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected no claim for v3, got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonNoIdle {
-		t.Fatalf("expected no-idle miss reason for unmatched image, got %q", missReason)
-	}
-
-	// Neutral claim (no image filter) - should get v1 (lowest ID)
-	claimed, missReason, err = store.ClaimIdleWorker("cp-1", "org-1", "", "", "", false, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker: %v", err)
-	}
-	if claimed == nil || claimed.WorkerID != 7 {
-		t.Fatalf("expected to claim worker 7 (neutral), got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonNone {
-		t.Fatalf("expected no miss reason on successful neutral claim, got %q", missReason)
-	}
-}
-
-// TestClaimIdleWorkerRespectsProfileAffinity proves the worker-profile match
-// dimension against real Postgres: a request only claims an idle worker of its
-// own shape. The default request ("","",false) matches default/legacy rows; a
-// colocated request only matches colocated rows.
-func TestClaimIdleWorkerRespectsProfileAffinity(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	// A default-profile idle worker (also models a legacy row: empty profile).
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID: 11,
-		PodName:  "duckgres-worker-default",
-		State:    configstore.WorkerStateIdle,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(default): %v", err)
-	}
-	// A colocated idle worker.
-	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:        12,
-		PodName:         "duckgres-worker-colocated",
-		State:           configstore.WorkerStateIdle,
-		ProfileCPU:      "4",
-		ProfileMemory:   "16Gi",
-		ProfileColocate: true,
-	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(colocated): %v", err)
-	}
-
-	// A colocated request claims only the colocated worker (never the default).
-	claimed, _, err := store.ClaimIdleWorker("cp-1", "org-1", "", "4", "16Gi", true, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker(colocated): %v", err)
-	}
-	if claimed == nil || claimed.WorkerID != 12 {
-		t.Fatalf("expected to claim colocated worker 12, got %#v", claimed)
-	}
-
-	// A default request claims only the default worker (never the colocated one).
-	claimed, _, err = store.ClaimIdleWorker("cp-1", "org-1", "", "", "", false, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker(default): %v", err)
-	}
-	if claimed == nil || claimed.WorkerID != 11 {
-		t.Fatalf("expected to claim default worker 11, got %#v", claimed)
-	}
-
-	// With both workers now reserved, a colocated request that finds no matching
-	// idle worker misses (rather than crossing shapes onto a default worker).
-	claimed, missReason, err := store.ClaimIdleWorker("cp-1", "org-1", "", "8", "48Gi", true, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("ClaimIdleWorker(unmatched colocated): %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected no claim for an unmatched colocated profile, got %#v", claimed)
-	}
-	if missReason != configstore.WorkerClaimMissReasonNoIdle {
-		t.Fatalf("expected no-idle miss for unmatched profile, got %q", missReason)
-	}
-}
-
-// TestClaimIdleWorkerColocatedQuota proves the authoritative per-org colocated
-// CPU budget enforced inside the claim transaction (review M1): once an org's
-// summed colocated CPU would exceed the cap, the next colocated claim misses
-// with OrgCap rather than being granted.
-func TestClaimIdleWorkerColocatedQuota(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-
-	for id := 21; id <= 23; id++ {
-		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-			WorkerID:        id,
-			PodName:         fmt.Sprintf("duckgres-worker-colo-%d", id),
-			State:           configstore.WorkerStateIdle,
-			ProfileCPU:      "4",
-			ProfileMemory:   "16Gi",
-			ProfileColocate: true,
-		}); err != nil {
-			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
-		}
-	}
-
-	// Cap = 8 colocated CPU. The first two 4-CPU claims fit (4, then 8); the
-	// third (would be 12) is rejected with OrgCap.
-	const maxCPU = 8
-	for n := 1; n <= 2; n++ {
-		claimed, miss, err := store.ClaimIdleWorker("cp-1", "org-1", "", "4", "16Gi", true, 0, 0, maxCPU, 0)
-		if err != nil {
-			t.Fatalf("claim %d: %v", n, err)
-		}
-		if claimed == nil {
-			t.Fatalf("claim %d: expected a worker within the colocated quota, got miss %q", n, miss)
-		}
-	}
-
-	claimed, miss, err := store.ClaimIdleWorker("cp-1", "org-1", "", "4", "16Gi", true, 0, 0, maxCPU, 0)
-	if err != nil {
-		t.Fatalf("over-quota claim: %v", err)
-	}
-	if claimed != nil {
-		t.Fatalf("expected the over-quota colocated claim rejected, got worker %d", claimed.WorkerID)
-	}
-	if miss != configstore.WorkerClaimMissReasonOrgCap {
-		t.Fatalf("expected OrgCap miss for over-quota colocated claim, got %q", miss)
-	}
-}
-
 func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
@@ -773,7 +293,7 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(second): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "duckgres:v2", "", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -809,6 +329,252 @@ func TestClaimHotIdleWorkerPostgres(t *testing.T) {
 	}
 	if unclaimed.State != configstore.WorkerStateHotIdle {
 		t.Fatalf("expected later hot-idle worker to remain hot_idle, got %q", unclaimed.State)
+	}
+}
+
+func TestCountHotIdleWorkersPostgresFiltersCompatibleWorkers(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+
+	records := []configstore.WorkerRecord{
+		{WorkerID: 1, PodName: "duckgres-worker-1", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 2, PodName: "duckgres-worker-2", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 3, PodName: "duckgres-worker-3", State: configstore.WorkerStateReserved, OrgID: "analytics", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 4, PodName: "duckgres-worker-4", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:old", LastHeartbeatAt: now},
+		{WorkerID: 5, PodName: "duckgres-worker-5", State: configstore.WorkerStateHotIdle, OrgID: "billing", Image: "duckgres:v2", LastHeartbeatAt: now},
+		{WorkerID: 6, PodName: "duckgres-worker-6", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:v2", ProfileCPU: "4", ProfileMemory: "8Gi", LastHeartbeatAt: now},
+	}
+	for _, record := range records {
+		record.OwnerCPInstanceID = "cp-old:boot-a"
+		record.OwnerEpoch = 1
+		if err := store.UpsertWorkerRecord(&record); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", record.WorkerID, err)
+		}
+	}
+
+	defaultCount, err := store.CountHotIdleWorkers("analytics", "duckgres:v2", "", "")
+	if err != nil {
+		t.Fatalf("CountHotIdleWorkers(default): %v", err)
+	}
+	if defaultCount != 2 {
+		t.Fatalf("default-profile compatible hot-idle count = %d, want 2", defaultCount)
+	}
+
+	sizedCount, err := store.CountHotIdleWorkers("analytics", "duckgres:v2", "4", "8Gi")
+	if err != nil {
+		t.Fatalf("CountHotIdleWorkers(sized): %v", err)
+	}
+	if sizedCount != 1 {
+		t.Fatalf("sized compatible hot-idle count = %d, want 1", sizedCount)
+	}
+}
+
+func TestClaimHotIdleWorkerPostgresFiltersImage(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.June, 11, 12, 0, 0, 0, time.UTC)
+
+	for _, record := range []configstore.WorkerRecord{
+		{WorkerID: 1, PodName: "duckgres-worker-old", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:old", LastHeartbeatAt: now},
+		{WorkerID: 2, PodName: "duckgres-worker-new", State: configstore.WorkerStateHotIdle, OrgID: "analytics", Image: "duckgres:new", LastHeartbeatAt: now},
+	} {
+		record.OwnerCPInstanceID = "cp-old:boot-a"
+		record.OwnerEpoch = 1
+		if err := store.UpsertWorkerRecord(&record); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", record.WorkerID, err)
+		}
+	}
+
+	claimed, miss, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "duckgres:new", "", "", 0)
+	if err != nil {
+		t.Fatalf("ClaimHotIdleWorker: %v", err)
+	}
+	if miss != configstore.WorkerClaimMissReasonNone {
+		t.Fatalf("miss reason = %q, want none", miss)
+	}
+	if claimed == nil || claimed.WorkerID != 2 {
+		t.Fatalf("claimed worker = %#v, want worker 2", claimed)
+	}
+}
+
+// Per-worker TTL: ListExpiredHotIdleWorkers retires a hot-idle worker once its
+// own ttl_minutes has elapsed since updated_at (last became idle); ttl=0 falls
+// back to the deployment default; non-hot-idle workers are never returned.
+func TestListExpiredHotIdleWorkersPerWorkerTTL(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	mk := func(id, ttlMin int, state configstore.WorkerState) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-ttl-%d", id),
+			State:             state,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        ttlMin,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	mk(1, 0, configstore.WorkerStateHotIdle)   // uses default TTL
+	mk(2, 5, configstore.WorkerStateHotIdle)   // short per-worker TTL
+	mk(3, 120, configstore.WorkerStateHotIdle) // long per-worker TTL
+	mk(4, 1, configstore.WorkerStateHot)       // not hot-idle: never reaped
+
+	// As of base+30m with a 10m default: ttl=0 (default 10m) and ttl=5m have
+	// elapsed; ttl=120m has not; the hot (active) worker is excluded.
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	got := map[int]bool{}
+	for _, w := range expired {
+		got[w.WorkerID] = true
+	}
+	if !got[1] {
+		t.Error("ttl=0 worker should expire via the 10m default by base+30m")
+	}
+	if !got[2] {
+		t.Error("ttl=5m worker should expire by base+30m")
+	}
+	if got[3] {
+		t.Error("ttl=120m worker should NOT expire by base+30m")
+	}
+	if got[4] {
+		t.Error("non-hot-idle (hot) worker must never be returned")
+	}
+}
+
+// Regression: the hot-idle TTL reaper must NOT retire a hot-idle worker that
+// still backs a reclaimable (Active/Reconnecting) Flight session — the customer
+// is mid-reconnect by session token, and retiring the worker would kill their
+// in-flight query on reconnect. This mirrors the long-standing exclusion in
+// ListOrphanedWorkers. A worker with only a terminal (closed) Flight record, or
+// none at all, is still reaped once its TTL elapses.
+func TestListExpiredHotIdleWorkersSparesReclaimableFlightSessions(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	mkWorker := func(id int) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-flt-%d", id),
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        5, // all well past TTL at base+30m
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	mkSession := func(token string, workerID int, state configstore.FlightSessionState) {
+		if err := store.UpsertFlightSessionRecord(&configstore.FlightSessionRecord{
+			SessionToken: token,
+			Username:     "postgres",
+			OrgID:        "analytics",
+			WorkerID:     workerID,
+			OwnerEpoch:   1,
+			State:        state,
+			ExpiresAt:    base.Add(time.Hour),
+			LastSeenAt:   base,
+		}); err != nil {
+			t.Fatalf("UpsertFlightSessionRecord(%s): %v", token, err)
+		}
+	}
+
+	mkWorker(1) // no flight session         → reaped
+	mkWorker(2) // active flight session      → spared
+	mkWorker(3) // reconnecting flight session → spared
+	mkWorker(4) // closed flight session only → reaped
+	mkSession("tok-active", 2, configstore.FlightSessionStateActive)
+	mkSession("tok-reconnecting", 3, configstore.FlightSessionStateReconnecting)
+	mkSession("tok-closed", 4, configstore.FlightSessionStateClosed)
+
+	assertSpared := func(name string, expired []configstore.WorkerRecord) {
+		got := map[int]bool{}
+		for _, w := range expired {
+			got[w.WorkerID] = true
+		}
+		if !got[1] {
+			t.Errorf("%s: worker 1 (no flight session) should be reaped", name)
+		}
+		if got[2] {
+			t.Errorf("%s: worker 2 (active flight session) must be spared", name)
+		}
+		if got[3] {
+			t.Errorf("%s: worker 3 (reconnecting flight session) must be spared", name)
+		}
+		if !got[4] {
+			t.Errorf("%s: worker 4 (closed flight session only) should be reaped", name)
+		}
+	}
+
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	assertSpared("global", expired)
+
+	// The per-CP fallback reaper variant must spare them too.
+	expiredCP, err := store.ListExpiredHotIdleWorkersForCP("cp:boot", base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkersForCP: %v", err)
+	}
+	assertSpared("per-cp", expiredCP)
+}
+
+// Regression: UpsertWorkerRecord must update the profile (cpu/mem/colocate) and
+// ttl_minutes columns on conflict. CreateSpawningWorkerSlot inserts a sized
+// worker's row with an empty profile, and the reserve/hot-idle persists set it
+// via upsert — if the ON CONFLICT update omits these columns, a sized worker's
+// hot-idle row stays empty and ClaimHotIdleWorker can never match it (no reuse).
+func TestUpsertWorkerRecordPersistsProfileOnConflict(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Now()
+
+	// Row created with an empty profile (as CreateSpawningWorkerSlot does).
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7001,
+		PodName:           "duckgres-worker-7001",
+		State:             configstore.WorkerStateSpawning,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+	}); err != nil {
+		t.Fatalf("insert empty-profile row: %v", err)
+	}
+
+	// Later persist (reserve / hot-idle) sets the concrete size + ttl.
+	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+		WorkerID:          7001,
+		PodName:           "duckgres-worker-7001",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   now,
+		ProfileCPU:        "4",
+		ProfileMemory:     "8Gi",
+		TTLMinutes:        15,
+	}); err != nil {
+		t.Fatalf("upsert profile on conflict: %v", err)
+	}
+
+	got, err := store.GetWorkerRecord(7001)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if got.ProfileCPU != "4" || got.ProfileMemory != "8Gi" || got.TTLMinutes != 15 {
+		t.Fatalf("profile not persisted on conflict: cpu=%q mem=%q ttl=%d", got.ProfileCPU, got.ProfileMemory, got.TTLMinutes)
+	}
+	if got.State != configstore.WorkerStateHotIdle {
+		t.Fatalf("state = %q, want hot_idle", got.State)
 	}
 }
 
@@ -850,7 +616,7 @@ func TestClaimHotIdleWorkerReturnsNoIdleWhenNoHotIdleWorkerExists(t *testing.T) 
 		}
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -902,7 +668,7 @@ func TestClaimHotIdleWorkerRespectsOrgCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -941,7 +707,7 @@ func TestClaimHotIdleWorkerAllowsOnlyHotIdleAtCapPostgres(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord: %v", err)
 	}
 
-	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
+	claimed, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
@@ -975,7 +741,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		}
 	}
 
-	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 1)
+	first, missReason, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(first): %v", err)
 	}
@@ -986,7 +752,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 		t.Fatalf("expected first claim to have no miss reason, got %q", missReason)
 	}
 
-	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", "", "", false, 1)
+	second, missReason, err := store.ClaimHotIdleWorker("cp-other:boot-c", "analytics", "", "", "", 1)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker(second): %v", err)
 	}
@@ -1007,7 +773,7 @@ func TestClaimHotIdleWorkerSerializesOrgCapPostgres(t *testing.T) {
 }
 
 func TestGetWorkerRecordReturnsNilNilForMissingRow(t *testing.T) {
-	// cleanupOrphanedWorkerPods in k8s_pool.go treats (nil, nil) as "no DB
+	// cleanupOrphanedWorkerPods in k8s_pool_reconcile.go treats (nil, nil) as "no DB
 	// row — this pod is fully orphaned and safe to delete" and a non-nil
 	// error as "skip this tick and retry." If GetWorkerRecord wrapped
 	// gorm.ErrRecordNotFound as an error, the missing-row branch of the
@@ -1033,8 +799,6 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-stale:boot-a",
 		PodName:         "duckgres-stale",
-		PodUID:          "pod-stale",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: staleHeartbeat,
@@ -1044,8 +808,6 @@ func TestExpireControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-fresh:boot-b",
 		PodName:         "duckgres-fresh",
-		PodUID:          "pod-fresh",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: freshHeartbeat,
@@ -1092,8 +854,6 @@ func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-active:boot-a",
 		PodName:         "duckgres-active",
-		PodUID:          "pod-active",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now,
@@ -1105,8 +865,6 @@ func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-draining:boot-b",
 		PodName:         "duckgres-draining",
-		PodUID:          "pod-draining",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateDraining,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now.Add(-30 * time.Second),
@@ -1119,8 +877,6 @@ func TestListLiveControlPlaneInstanceIDsPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-expired:boot-c",
 		PodName:         "duckgres-expired",
-		PodUID:          "pod-expired",
-		BootID:          "boot-c",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now.Add(-5 * time.Minute),
@@ -1157,8 +913,6 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-draining-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateDraining,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: recentDrain,
@@ -1169,8 +923,6 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-draining-recent:boot-b",
 		PodName:         "duckgres-recent",
-		PodUID:          "pod-recent",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateDraining,
 		StartedAt:       startedAt,
 		LastHeartbeatAt: recentDrain,
@@ -1213,7 +965,7 @@ func TestExpireDrainingControlPlaneInstancesPostgres(t *testing.T) {
 func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 
-	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", 1, "duckgres-worker-test-cp", 3, 5)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 3)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
 	}
@@ -1239,6 +991,9 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	if slot.OrgID != "analytics" {
 		t.Fatalf("expected org analytics, got %q", slot.OrgID)
 	}
+	if slot.ProfileCPU != "" || slot.ProfileMemory != "" {
+		t.Fatalf("expected default profile on slot, got cpu=%q memory=%q", slot.ProfileCPU, slot.ProfileMemory)
+	}
 
 	persisted, err := store.GetWorkerRecord(slot.WorkerID)
 	if err != nil {
@@ -1249,7 +1004,63 @@ func TestCreateSpawningWorkerSlotPostgres(t *testing.T) {
 	}
 }
 
-func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
+// Regression: concurrent CreateSpawningWorkerSlot calls for DIFFERENT orgs must
+// never allocate the same worker_id. The old SELECT MAX(worker_id)+1 allocation
+// was serialized only by a per-org advisory lock, so cross-org concurrency read
+// the same MAX and collided on worker_records_pkey (SQLSTATE 23505) — the flake
+// that was failing the e2e res1/res2 lanes. nextval() off the global sequence
+// makes allocation atomic across orgs.
+func TestCreateSpawningWorkerSlotConcurrentCrossOrgUniqueIDs(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+
+	const n = 24
+	var wg sync.WaitGroup
+	ids := make([]int, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release all goroutines together to maximize contention
+			// A distinct org per goroutine → distinct per-org advisory locks →
+			// the allocation step runs concurrently (the colliding scenario).
+			slot, err := store.CreateSpawningWorkerSlot(
+				"cp:boot", fmt.Sprintf("org-%d", i), "duckgres:test", "", "", 1,
+				"duckgres-worker-test", 0 /* uncapped */)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			if slot == nil {
+				errs[i] = fmt.Errorf("goroutine %d: nil slot without cap", i)
+				return
+			}
+			ids[i] = slot.WorkerID
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	seen := map[int]int{} // worker_id -> goroutine that got it
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("goroutine %d: CreateSpawningWorkerSlot errored (pre-fix: pkey collision): %v", i, errs[i])
+		}
+		if ids[i] <= 0 {
+			t.Fatalf("goroutine %d: non-positive worker id %d", i, ids[i])
+		}
+		if prev, dup := seen[ids[i]]; dup {
+			t.Fatalf("worker_id %d allocated to both goroutine %d and %d — collision not prevented", ids[i], prev, i)
+		}
+		seen[ids[i]] = i
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d distinct worker ids, got %d", n, len(seen))
+	}
+}
+
+func TestCreateSpawningWorkerSlotRespectsOrgCap(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.March, 27, 13, 0, 0, 0, time.UTC)
 
@@ -1265,119 +1076,61 @@ func TestCreateSpawningWorkerSlotRespectsOrgAndGlobalCaps(t *testing.T) {
 		t.Fatalf("UpsertWorkerRecord(existing): %v", err)
 	}
 
-	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", 1, "duckgres-worker-test-cp", 1, 5)
+	orgLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:test", "", "", 1, "duckgres-worker-test-cp", 1)
 	if err != nil {
 		t.Fatalf("CreateSpawningWorkerSlot(org cap): %v", err)
 	}
 	if orgLimited != nil {
 		t.Fatalf("expected org cap to block spawning, got %#v", orgLimited)
 	}
-
-	globalLimited, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "sales", "duckgres:test", 1, "duckgres-worker-test-cp", 2, 1)
-	if err != nil {
-		t.Fatalf("CreateSpawningWorkerSlot(global cap): %v", err)
-	}
-	if globalLimited != nil {
-		t.Fatalf("expected global cap to block spawning, got %#v", globalLimited)
-	}
 }
 
-func TestCreateNeutralWarmWorkerSlotRespectsSharedWarmTarget(t *testing.T) {
+func TestCreateSpawningWorkerSlotIgnoresIncompatibleHotIdleForOrgCapPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
-	now := time.Date(2026, time.March, 27, 13, 30, 0, 0, time.UTC)
+	now := time.Date(2026, time.June, 11, 13, 0, 0, 0, time.UTC)
 
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          10,
-		PodName:           "duckgres-worker-existing-10",
-		State:             configstore.WorkerStateIdle,
-		OrgID:             "",
+		WorkerID:          19,
+		PodName:           "duckgres-worker-old-hot-idle",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:old",
 		OwnerCPInstanceID: "cp-old:boot-a",
-		OwnerEpoch:        0,
+		OwnerEpoch:        2,
 		LastHeartbeatAt:   now,
 	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(existing neutral): %v", err)
+		t.Fatalf("UpsertWorkerRecord(old hot-idle): %v", err)
 	}
 
-	blocked, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", "", "", false, 1, 5)
+	slot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "analytics", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1)
 	if err != nil {
-		t.Fatalf("CreateNeutralWarmWorkerSlot(shared target): %v", err)
-	}
-	if blocked != nil {
-		t.Fatalf("expected shared warm target to block spawning, got %#v", blocked)
-	}
-
-	slot, err := store.CreateNeutralWarmWorkerSlot("cp-new:boot-b", "duckgres-worker-test-cp", "duckgres:test", "", "", false, 2, 5)
-	if err != nil {
-		t.Fatalf("CreateNeutralWarmWorkerSlot(expand target): %v", err)
+		t.Fatalf("CreateSpawningWorkerSlot: %v", err)
 	}
 	if slot == nil {
-		t.Fatal("expected neutral warm slot to be created")
-		return
+		t.Fatal("expected incompatible hot-idle worker not to block org-cap spawn")
 	}
-	if slot.OrgID != "" {
-		t.Fatalf("expected neutral warm slot org to be empty, got %q", slot.OrgID)
-	}
-	if slot.State != configstore.WorkerStateSpawning {
-		t.Fatalf("expected spawning state, got %q", slot.State)
-	}
-}
 
-func TestCreateNeutralWarmWorkerSlotForImageEnforcesPerImageTarget(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	now := time.Date(2026, time.May, 7, 12, 0, 0, 0, time.UTC)
-
-	// One existing warm-idle worker on a DIFFERENT image: should not block
-	// spawning a fresh per-image slot for "duckgres:v1.5.1".
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
-		WorkerID:          20,
-		PodName:           "duckgres-worker-existing-20",
-		Image:             "duckgres:v1.4.0",
-		State:             configstore.WorkerStateIdle,
-		OrgID:             "",
-		OwnerCPInstanceID: "cp-a:boot-1",
-		OwnerEpoch:        0,
+		WorkerID:          21,
+		PodName:           "duckgres-worker-sized-hot-idle",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "marketing",
+		Image:             "duckgres:new",
+		ProfileCPU:        "4",
+		ProfileMemory:     "8Gi",
+		OwnerCPInstanceID: "cp-old:boot-a",
+		OwnerEpoch:        2,
 		LastHeartbeatAt:   now,
 	}); err != nil {
-		t.Fatalf("UpsertWorkerRecord(other-image): %v", err)
+		t.Fatalf("UpsertWorkerRecord(sized hot-idle): %v", err)
 	}
 
-	slot, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.5.1", 1, 5)
+	profileSlot, err := store.CreateSpawningWorkerSlot("cp-new:boot-b", "marketing", "duckgres:new", "", "", 1, "duckgres-worker-test-cp", 1)
 	if err != nil {
-		t.Fatalf("CreateNeutralWarmWorkerSlotForImage: %v", err)
+		t.Fatalf("CreateSpawningWorkerSlot(profile): %v", err)
 	}
-	if slot == nil {
-		t.Fatal("expected per-image slot to be created when no warm worker for that image exists")
-		return
-	}
-	if slot.Image != "duckgres:v1.5.1" {
-		t.Fatalf("expected slot image duckgres:v1.5.1, got %q", slot.Image)
-	}
-	if slot.State != configstore.WorkerStateSpawning {
-		t.Fatalf("expected spawning state, got %q", slot.State)
-	}
-	if slot.OrgID != "" {
-		t.Fatalf("expected neutral org, got %q", slot.OrgID)
-	}
-
-	// Second call with the same target=1 should be a no-op — the just-spawned
-	// row counts as a warm-or-spawning worker for this image.
-	again, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.5.1", 1, 5)
-	if err != nil {
-		t.Fatalf("CreateNeutralWarmWorkerSlotForImage(repeat): %v", err)
-	}
-	if again != nil {
-		t.Fatalf("expected per-image target to block second spawn, got %#v", again)
-	}
-
-	// Global cap still applies: with maxGlobalWorkers=2 and two existing rows
-	// (the v1.4.0 idle plus the v1.5.1 spawning), a third image's request
-	// must be blocked.
-	capped, err := store.CreateNeutralWarmWorkerSlotForImage("cp-b:boot-2", "duckgres-worker-test-cp", "duckgres:v1.6.0", 1, 2)
-	if err != nil {
-		t.Fatalf("CreateNeutralWarmWorkerSlotForImage(global cap): %v", err)
-	}
-	if capped != nil {
-		t.Fatalf("expected global cap to block third image spawn, got %#v", capped)
+	if profileSlot == nil {
+		t.Fatal("expected wrong-profile hot-idle worker not to block org-cap spawn")
 	}
 }
 
@@ -1388,8 +1141,6 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-expired:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now.Add(-time.Minute),
@@ -1404,8 +1155,6 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-live:boot-b",
 		PodName:         "duckgres-live",
-		PodUID:          "pod-live",
-		BootID:          "boot-b",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       now.Add(-time.Hour),
 		LastHeartbeatAt: now,
@@ -1486,11 +1235,10 @@ func TestListOrphanedAndStuckWorkersPostgres(t *testing.T) {
 }
 
 // TestListOrphanedWorkersIncludesOwnerlessIdleWorkers seeds a row that
-// reproduces the mw-dev incident: a neutral idle worker whose
+// reproduces the mw-dev incident: an unassigned idle worker whose
 // owner_cp_instance_id is the empty string. Today's INNER JOIN against
 // the cp_instances table excludes such rows, so the orphan janitor never
-// retires them, the warm-target check counts them as live capacity, and
-// no new warm workers ever spawn. The fix LEFT JOINs and adds an explicit
+// retires them. The fix LEFT JOINs and adds an explicit
 // "ownerless and stale" branch.
 func TestListOrphanedWorkersIncludesOwnerlessIdleWorkers(t *testing.T) {
 	store := newIsolatedConfigStore(t)
@@ -1839,12 +1587,12 @@ func TestListWorkersDueForCredentialRefreshSkipsReservedAndActivatingRows(t *tes
 	}
 }
 
-// TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral:
+// TestListWorkersDueForCredentialRefreshSkipsHealthyAndUnassigned:
 //   - Healthy row (expiry comfortably in the future): not returned.
-//   - Neutral warm row (org_id=”): not returned regardless of expiry.
+//   - Unassigned row (org_id=”): not returned regardless of expiry.
 //     A pre-activation worker has no STS creds to refresh.
 //   - Terminal row (retired): not returned.
-func TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral(t *testing.T) {
+func TestListWorkersDueForCredentialRefreshSkipsHealthyAndUnassigned(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 12, 0, 0, 0, time.UTC)
 	farFuture := now.Add(2 * time.Hour)
@@ -1882,7 +1630,7 @@ func TestListWorkersDueForCredentialRefreshSkipsHealthyAndNeutral(t *testing.T) 
 		t.Fatalf("ListWorkersDueForCredentialRefresh: %v", err)
 	}
 	if len(due) != 0 {
-		t.Fatalf("expected no rows returned (healthy / neutral / terminal), got %#v", due)
+		t.Fatalf("expected no rows returned (healthy / unassigned / terminal), got %#v", due)
 	}
 }
 
@@ -1994,9 +1742,10 @@ func TestMarkCredentialsRefreshedFailsOnOwnerMismatch(t *testing.T) {
 // worker whose owning CP has expired is normally an orphan-cleanup
 // candidate. But if a Flight client could still reconnect by session
 // token (record is in active or reconnecting state), the orphan retire
-// would kill an in-flight customer query the moment they reconnect. The
-// JOIN onto flight_session_records gives those workers a reprieve until
-// the session record itself is expired by ExpireFlightSessionRecords.
+// would remove the worker before the token holder can establish a fresh
+// remote session. The JOIN onto flight_session_records gives those
+// workers a reprieve until the session record itself is expired by
+// ExpireFlightSessionRecords.
 func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
@@ -2005,8 +1754,6 @@ func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-1 * time.Hour),
@@ -2056,9 +1803,9 @@ func TestListOrphanedWorkersExcludesWorkersWithActiveFlightSessions(t *testing.T
 }
 
 // TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions:
-// the reconnecting state means a customer is mid-handshake from a Flight
-// client picking the session back up. Same protection applies — kill the
-// worker and you kill the resumption.
+// the reconnecting state means a Flight client is mid-handshake for a
+// token-backed fresh remote session. Same protection applies — retire the
+// worker and that reconnect attempt cannot finish.
 func TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	now := time.Date(2026, time.April, 30, 14, 0, 0, 0, time.UTC)
@@ -2066,8 +1813,6 @@ func TestListOrphanedWorkersIncludesWorkersWithReconnectingFlightSessions(t *tes
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-1 * time.Hour),
@@ -2123,8 +1868,6 @@ func TestListOrphanedWorkersIncludesWorkersWithExpiredFlightSessions(t *testing.
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-old:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-1 * time.Hour),
@@ -2256,6 +1999,65 @@ func TestGetTouchAndCloseFlightSessionRecordPostgres(t *testing.T) {
 	}
 	if !record.LastSeenAt.Equal(closedAt) {
 		t.Fatalf("expected close timestamp %v, got %v", closedAt, record.LastSeenAt)
+	}
+}
+
+func TestCloseFlightSessionRecordIfReconnectTargetUnchangedPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	now := time.Date(2026, time.March, 27, 16, 30, 0, 0, time.UTC)
+	stale := configstore.FlightSessionRecord{
+		SessionToken: "flight-cas-close",
+		Username:     "postgres",
+		OrgID:        "analytics",
+		WorkerID:     42,
+		PID:          1001,
+		OwnerEpoch:   7,
+		CPInstanceID: "cp-old:boot-a",
+		State:        configstore.FlightSessionStateActive,
+		ExpiresAt:    now.Add(time.Hour),
+		LastSeenAt:   now,
+	}
+	if err := store.UpsertFlightSessionRecord(&stale); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord(stale): %v", err)
+	}
+
+	refreshed := stale
+	refreshed.PID = 2002
+	refreshed.OwnerEpoch = 8
+	refreshed.CPInstanceID = "cp-new:boot-b"
+	refreshed.LastSeenAt = now.Add(time.Minute)
+	if err := store.UpsertFlightSessionRecord(&refreshed); err != nil {
+		t.Fatalf("UpsertFlightSessionRecord(refreshed): %v", err)
+	}
+
+	closed, err := store.CloseFlightSessionRecordIfReconnectTargetUnchanged(stale, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("CloseFlightSessionRecordIfReconnectTargetUnchanged(stale): %v", err)
+	}
+	if closed {
+		t.Fatal("expected stale reconnect target not to close refreshed durable session")
+	}
+	record, err := store.GetFlightSessionRecord("flight-cas-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord: %v", err)
+	}
+	if record.State != configstore.FlightSessionStateActive || record.PID != 2002 || record.CPInstanceID != "cp-new:boot-b" {
+		t.Fatalf("expected refreshed durable record to remain active, got %#v", record)
+	}
+
+	closed, err = store.CloseFlightSessionRecordIfReconnectTargetUnchanged(refreshed, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("CloseFlightSessionRecordIfReconnectTargetUnchanged(refreshed): %v", err)
+	}
+	if !closed {
+		t.Fatal("expected current reconnect target to close")
+	}
+	record, err = store.GetFlightSessionRecord("flight-cas-close")
+	if err != nil {
+		t.Fatalf("GetFlightSessionRecord(closed): %v", err)
+	}
+	if record.State != configstore.FlightSessionStateClosed {
+		t.Fatalf("expected durable record to be closed, got %#v", record)
 	}
 }
 
@@ -2452,8 +2254,6 @@ func TestRetireOrphanWorkerRejectsRevivedOwnerControlPlanePostgres(t *testing.T)
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-revived:boot-a",
 		PodName:         "duckgres-old",
-		PodUID:          "pod-old",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateExpired,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now.Add(-time.Hour),
@@ -2484,8 +2284,6 @@ func TestRetireOrphanWorkerRejectsRevivedOwnerControlPlanePostgres(t *testing.T)
 	if err := store.UpsertControlPlaneInstance(&configstore.ControlPlaneInstance{
 		ID:              "cp-revived:boot-a",
 		PodName:         "duckgres-new",
-		PodUID:          "pod-new",
-		BootID:          "boot-a",
 		State:           configstore.ControlPlaneInstanceStateActive,
 		StartedAt:       now.Add(-2 * time.Hour),
 		LastHeartbeatAt: now,
@@ -2541,6 +2339,7 @@ func TestRetireOrphanWorkerRejectsStaleListSnapshotAfterTakeoverPostgres(t *test
 	}
 	if taken == nil {
 		t.Fatal("expected takeover to succeed")
+		return
 	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          3601,
@@ -2589,7 +2388,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour), time.Minute)
 	if err != nil {
 		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
 	}
@@ -2597,12 +2396,13 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterReclaimPostgres(t *test
 		t.Fatalf("expected worker 3602 hot-idle snapshot, got %#v", expired)
 	}
 
-	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", false, 0)
+	claimed, _, err := store.ClaimHotIdleWorker("cp-new:boot-b", "analytics", "", "", "", 0)
 	if err != nil {
 		t.Fatalf("ClaimHotIdleWorker: %v", err)
 	}
 	if claimed == nil {
 		t.Fatal("expected hot-idle reclaim to succeed")
+		return
 	}
 	if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
 		WorkerID:          3602,
@@ -2651,7 +2451,7 @@ func TestRetireHotIdleWorkerRejectsStaleListSnapshotAfterTouchPostgres(t *testin
 		t.Fatalf("UpsertWorkerRecord(hot-idle): %v", err)
 	}
 
-	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour))
+	expired, err := store.ListExpiredHotIdleWorkers(time.Now().Add(time.Hour), time.Minute)
 	if err != nil {
 		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
 	}
@@ -2769,6 +2569,7 @@ func assertWorkerStateAndReason(t *testing.T, store *configstore.ConfigStore, wo
 	}
 	if record == nil {
 		t.Fatalf("expected worker %d to exist", workerID)
+		return
 	}
 	if record.State != wantState || record.RetireReason != wantReason {
 		t.Fatalf("worker %d = state %q reason %q, want state %q reason %q", workerID, record.State, record.RetireReason, wantState, wantReason)
@@ -2847,6 +2648,133 @@ func TestTakeOverWorkerSkipsNonReclaimableStatesPostgres(t *testing.T) {
 			}
 			assertWorkerStateAndReason(t, store, workerID, tc.state, "original")
 		})
+	}
+}
+
+// Regression: the hot-idle reaper must measure idle age from hot_idle_since, not
+// updated_at. Lease and credential-refresh writes (BumpWorkerEpoch,
+// MarkCredentialsRefreshed) bump updated_at without changing idleness; keying the
+// reap clock off updated_at let a periodically-refreshed hot-idle worker reset its
+// own TTL forever and never get retired.
+func TestListExpiredHotIdleWorkersUsesHotIdleSinceNotUpdatedAt(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	base := time.Now()
+	tbl := store.RuntimeSchema() + ".worker_records"
+
+	mk := func(id int) {
+		if err := store.UpsertWorkerRecord(&configstore.WorkerRecord{
+			WorkerID:          id,
+			PodName:           fmt.Sprintf("duckgres-worker-his-%d", id),
+			State:             configstore.WorkerStateHotIdle,
+			OrgID:             "analytics",
+			Image:             "duckgres:v2",
+			OwnerCPInstanceID: "cp:boot",
+			OwnerEpoch:        1,
+			LastHeartbeatAt:   base,
+			TTLMinutes:        5,
+		}); err != nil {
+			t.Fatalf("UpsertWorkerRecord(%d): %v", id, err)
+		}
+	}
+	setTimestamps := func(id int, hotIdleSince, updatedAt time.Time) {
+		if err := store.DB().Exec(
+			fmt.Sprintf(`UPDATE %s SET hot_idle_since = ?, updated_at = ? WHERE worker_id = ?`, tbl),
+			hotIdleSince, updatedAt, id,
+		).Error; err != nil {
+			t.Fatalf("set worker %d timestamps: %v", id, err)
+		}
+	}
+
+	// Worker 1 became idle long ago (base) but a credential refresh bumped its
+	// updated_at recently (base+29m). It must still expire on its hot_idle_since.
+	mk(1)
+	setTimestamps(1, base, base.Add(29*time.Minute))
+	// Worker 2 genuinely became idle recently (base+29m); it must NOT expire,
+	// proving the reaper consults hot_idle_since rather than returning everything.
+	mk(2)
+	setTimestamps(2, base.Add(29*time.Minute), base.Add(29*time.Minute))
+
+	expired, err := store.ListExpiredHotIdleWorkers(base.Add(30*time.Minute), 10*time.Minute)
+	if err != nil {
+		t.Fatalf("ListExpiredHotIdleWorkers: %v", err)
+	}
+	got := map[int]bool{}
+	for _, w := range expired {
+		got[w.WorkerID] = true
+	}
+	if !got[1] {
+		t.Error("worker idle since base (ttl 5m) must expire despite a recent updated_at bump")
+	}
+	if got[2] {
+		t.Error("worker that became idle only 1m before the cutoff must not expire")
+	}
+}
+
+// hot_idle_since is stamped on entry into hot_idle and preserved across same-state
+// re-upserts (so a re-write of an already-hot-idle row cannot reset the reap
+// clock), but is re-stamped when a worker leaves and re-enters hot_idle.
+func TestUpsertWorkerRecordStampsAndPreservesHotIdleSince(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	tbl := store.RuntimeSchema() + ".worker_records"
+	rec := configstore.WorkerRecord{
+		WorkerID:          1,
+		PodName:           "duckgres-worker-his",
+		State:             configstore.WorkerStateHotIdle,
+		OrgID:             "analytics",
+		Image:             "duckgres:v2",
+		OwnerCPInstanceID: "cp:boot",
+		OwnerEpoch:        1,
+		LastHeartbeatAt:   time.Now(),
+	}
+	upsert := func() {
+		t.Helper()
+		rec.HotIdleSince = nil // caller does not carry it; the store stamps on entry
+		if err := store.UpsertWorkerRecord(&rec); err != nil {
+			t.Fatalf("UpsertWorkerRecord(epoch %d, state %s): %v", rec.OwnerEpoch, rec.State, err)
+		}
+	}
+
+	upsert()
+	first, err := store.GetWorkerRecord(1)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if first.HotIdleSince == nil {
+		t.Fatal("hot_idle_since must be stamped on entry into hot_idle")
+	}
+
+	// Backdate to a known past value so the re-stamp comparison is deterministic.
+	past := time.Now().Add(-time.Hour).UTC().Truncate(time.Microsecond)
+	if err := store.DB().Exec(
+		fmt.Sprintf(`UPDATE %s SET hot_idle_since = ? WHERE worker_id = ?`, tbl), past, 1,
+	).Error; err != nil {
+		t.Fatalf("backdate hot_idle_since: %v", err)
+	}
+
+	// Same-state re-upsert must preserve the existing hot_idle_since.
+	rec.OwnerEpoch = 2
+	upsert()
+	preserved, err := store.GetWorkerRecord(1)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if preserved.HotIdleSince == nil || !preserved.HotIdleSince.Equal(past) {
+		t.Errorf("hot_idle_since must be preserved across same-state upsert: got %v, want %v", preserved.HotIdleSince, past)
+	}
+
+	// Leaving hot_idle and re-entering must re-stamp to a fresh time.
+	rec.State = configstore.WorkerStateHot
+	rec.OwnerEpoch = 3
+	upsert()
+	rec.State = configstore.WorkerStateHotIdle
+	rec.OwnerEpoch = 4
+	upsert()
+	reentered, err := store.GetWorkerRecord(1)
+	if err != nil {
+		t.Fatalf("GetWorkerRecord: %v", err)
+	}
+	if reentered.HotIdleSince == nil || !reentered.HotIdleSince.After(past) {
+		t.Errorf("hot_idle_since must be re-stamped on re-entry into hot_idle: got %v, want after %v", reentered.HotIdleSince, past)
 	}
 }
 

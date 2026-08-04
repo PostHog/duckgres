@@ -1,0 +1,372 @@
+# Per-PR isolated duckgres stack for the mw-dev e2e harness. Rendered by
+# run.sh via envsubst with: NAMESPACE, PR_NUMBER, CONTROLPLANE_IMAGE,
+# WORKER_IMAGE, INTERNAL_SECRET, INTERNAL_SECRET_FALLBACK, USER_SECRET_KEY.
+#
+# Isolation model (decided with the design): a DEDICATED control plane +
+# throwaway config-store per PR, provisioning REAL ducklings (PR-prefixed org
+# IDs) through the SHARED Crossplane / cnpg-shards infra. The
+# shared infra is what kind can't model and where the bugs live.
+# Everything PR-specific lives in ${NAMESPACE} and is deleted on teardown; the
+# shared-infra footprint (ducklings, cnpg roles, S3) is removed by
+# deprovisioning the ci-pr ducklings before the namespace goes.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: e2e-mw-dev
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+---
+# Throwaway config-store. The namespace-scoped PVC is deleted on teardown, but
+# survives a config-store pod recreation during the e2e run; losing these rows
+# mid-harness makes the control plane forget already-provisioned orgs.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: duckgres-config-store
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-config-store
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: duckgres-config-store }
+  template:
+    metadata:
+      labels: { app: duckgres-config-store }
+      annotations:
+        # Same consolidation pinning as the control plane below: a mid-run
+        # config-store reschedule forces the CP through a pod restart + PVC
+        # reattach pause the harness has no retry budget for.
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      containers:
+        - name: postgres
+          image: public.ecr.aws/docker/library/postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: duckgres }
+            - { name: POSTGRES_PASSWORD, value: duckgres }
+            - { name: POSTGRES_DB, value: duckgres }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "duckgres"] }
+            periodSeconds: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: duckgres-config-store
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-config-store
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: duckgres-config-store }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-tokens
+  namespace: ${NAMESPACE}
+stringData:
+  internal-secret: "${INTERNAL_SECRET}"
+  # Rotation fallback the CP must ALSO accept (mirrors the prod chart's
+  # internal-secret-fallbacks key); asserted by internal_secret_fallback_auth.
+  internal-secret-fallbacks: "${INTERNAL_SECRET_FALLBACK}"
+  # AES key for the user persistent secret manager (CREATE PERSISTENT SECRET).
+  user-secret-key: "${USER_SECRET_KEY}"
+---
+# Worker mTLS bearer token (the CP mints per-worker secrets at runtime; this is
+# the shared seed the chart references via DUCKGRES_K8S_WORKER_SECRET).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-worker-token
+  namespace: ${NAMESPACE}
+stringData:
+  token: "${INTERNAL_SECRET}"
+---
+# Worker config. data_dir MUST be /data — the control plane's worker pod
+# factory mounts an emptyDir there; without this the worker defaults to ./data
+# (=/app/data, not writable for the non-root user) and dies at boot with
+# "mkdir data/extensions: permission denied". Mirrors the prod duckgres-config.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckgres-config
+  namespace: ${NAMESPACE}
+data:
+  duckgres.yaml: |
+    data_dir: "/data"
+    extensions:
+      - ducklake
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres
+  namespace: ${NAMESPACE}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres-worker
+  namespace: ${NAMESPACE}
+automountServiceAccountToken: false
+---
+# In-namespace CP permissions: spawn/patch worker pods, manage per-worker
+# secrets, read the worker configmap, hold the janitor lease. Mirrors the
+# chart's duckgres-control-plane Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # list/watch needed by the CP's stranded-secret reconciler (the prod chart
+    # Role grants them implicitly via the shared duckgres namespace; spelled
+    # out here for the isolated CI namespace).
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create", "get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+subjects:
+  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
+roleRef:
+  { kind: Role, name: duckgres-control-plane, apiGroup: rbac.authorization.k8s.io }
+---
+# Cross-namespace duckling provisioning. Reuses the cluster-scoped
+# `duckgres-duckling-reader` ClusterRole already installed by the duckgres
+# chart (verbs get/list/watch/create/delete/patch on ducklings.k8s.posthog.com).
+# Per-PR binding so the namespace SA can drive real duckling provisioning;
+# deleted on teardown with the namespace label sweep.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-duckling-reader
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+subjects:
+  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
+roleRef:
+  { kind: ClusterRole, name: duckgres-duckling-reader, apiGroup: rbac.authorization.k8s.io }
+# NOTE: the admin console "Nodes" view's cluster-scoped reads (nodes/pods/events
+# + karpenter nodepools) ALSO come through this same duckgres-duckling-reader
+# binding — the chart adds those rules to that ClusterRole. The CI deployer can
+# only bind to that pre-existing cluster role, not create new ClusterRoles, so
+# the grant must live on duckgres-duckling-reader (see charts repo,
+# charts/duckgres/templates/rbac.yaml) and be deployed to the cluster.
+---
+# Destination preflight uses the same two configured dev-shard provisioner
+# Secrets as the production chart. Keep this disposable grant by-name and
+# read-only; its ci-pr label lets teardown remove the cross-namespace objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-cnpg-provisioner-secret-reader
+  namespace: ducklings
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames:
+      - cnpg-shard-001-provisioner
+      - cnpg-shard-002-provisioner
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-cnpg-provisioner-secret-reader
+  namespace: ducklings
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+subjects:
+  - { kind: ServiceAccount, name: duckgres, namespace: ${NAMESPACE} }
+roleRef:
+  kind: Role
+  name: duckgres-ci-pr-${PR_NUMBER}-cnpg-provisioner-secret-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: duckgres-control-plane }
+  template:
+    metadata:
+      labels: { app: duckgres-control-plane }
+      annotations:
+        # The harness asserts against this single-replica CP for ~10 minutes.
+        # Worker churn from the cold-burst / sized-worker assertions empties
+        # nodes mid-run, and a Karpenter consolidation sweep that disrupts the
+        # CP's node kills the run at whatever assertion happens to be next
+        # (observed as "control plane is draining" / connection-refused at the
+        # sized-reuse step). Pin the pod for the run's lifetime.
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      serviceAccountName: duckgres
+      containers:
+        - name: controlplane
+          image: ${CONTROLPLANE_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args: ["--mode", "control-plane", "--worker-backend", "remote", "--flight-port", "8815"]
+          env:
+            # Pod identity for log stamping: the shared logging handler attaches
+            # pod=/node= to every line when these are set (workers get them via
+            # the Downward API at spawn; the CP needs them too so its log lines
+            # carry the control-plane identity for cross-CP correlation).
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: DUCKGRES_CONFIG_STORE
+              value: "postgres://duckgres:duckgres@duckgres-config-store.${NAMESPACE}.svc:5432/duckgres?sslmode=disable"
+            - { name: DUCKGRES_K8S_WORKER_IMAGE, value: "${WORKER_IMAGE}" }
+            - { name: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY, value: "IfNotPresent" }
+            # Spawn workers in THIS namespace so teardown is a single ns delete.
+            - { name: DUCKGRES_K8S_WORKER_NAMESPACE, value: "${NAMESPACE}" }
+            - { name: DUCKGRES_K8S_WORKER_SECRET, value: "duckgres-worker-token" }
+            - { name: DUCKGRES_K8S_WORKER_CONFIGMAP, value: "duckgres-config" }
+            - { name: DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT, value: "duckgres-worker" }
+            # Worker-TTL-pool model (docs/design/worker-ttl-pool.md): no warm pool.
+            # Workers are spawned on demand per request and kept hot-idle until their
+            # TTL; there is nothing to pre-warm or reconcile.
+            # Honor client-supplied worker shape/TTL startup options
+            # (duckgres.worker_cpu/worker_memory/worker_ttl), clamped to a sane band.
+            # The harness sized_worker assertion connects with these and verifies the
+            # spawned pod carries the requested CPU+memory.
+            - { name: DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE, value: "true" }
+            # Storage-billing sampler: production cadence is 30m, far beyond the
+            # Job's patience — sample every 60s so compute_usage_pull_api can
+            # assert the storage rows in-Job.
+            - { name: DUCKGRES_STORAGE_SAMPLE_INTERVAL, value: "60s" }
+            # Pool-default worker shape for connections that send no sizing GUCs.
+            # Workers are never BestEffort (no pod anti-affinity anymore — resource
+            # requests are the only node-overcommit guard); without this the binary
+            # falls back to its built-in 8/16Gi default, which does not fit the
+            # mw-dev c6gd.xlarge worker nodes and would force a cold bigger node on
+            # every default spawn. Sub-1-CPU so the value collides with no sized
+            # assertion (they count org workers BY CPU: sized tests use 1 and 2)
+            # and several default workers bin-pack onto one warm node — exercising
+            # the post-anti-affinity packing behavior.
+            - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "${DUCKGRES_K8S_WORKER_CPU_REQUEST}" }
+            - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "${DUCKGRES_K8S_WORKER_MEMORY_REQUEST}" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU, value: "1" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }
+            - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY, value: "16Gi" }
+            # Prod-logic parity (sizes differ, the knobs match prod-us):
+            # - workerQueueTimeout bounds how long a connection waits for its
+            #   on-demand cold spawn (binary default 60s is too tight for a
+            #   fresh Karpenter node — observed flaking the sized assertions).
+            # - an explicit worker cap, like prod's maxWorkers (unset = unbounded
+            #   for the k8s backend; the nodepool is the only ceiling).
+            # Deliberately NOT aligned with prod:
+            # - DUCKGRES_K8S_WORKER_PRIORITY_CLASS: e2e workers run on the
+            #   shared default nodepool — prod's 1000000 PriorityClass would let
+            #   per-PR worker bursts preempt unrelated workloads there.
+            # - DUCKGRES_CACHE_ENABLED: the cache-proxy DaemonSet only runs on
+            #   duckgres-workers nodes; default-pool workers would dial a
+            #   nonexistent hostPort proxy.
+            # - DUCKGRES_CERT/_KEY (wildcard TLS) and DUCKGRES_TRINO_*: need
+            #   cert-manager / a Trino cluster in the per-PR namespace; the CP
+            #   serves its self-signed cert and Trino is not under e2e. The
+            #   metadata-proxy check uses sslmode=require, so that self-signed
+            #   cert still exercises the real TLS/SNI branch without public DNS.
+            - { name: DUCKGRES_WORKER_QUEUE_TIMEOUT, value: "5m" }
+            # Fast config-store poll for CI only (default 30s). The harness has
+            # three waits bounded by this interval — the post-provision auth-cache
+            # settle and two org-default-profile propagation waits — which drop
+            # from 40s each to CONFIG_POLL_SETTLE (12s) on the back of it.
+            - { name: DUCKGRES_CONFIG_POLL_INTERVAL, value: "5s" }
+            - name: DUCKGRES_INTERNAL_SECRET
+              valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
+            # Previous internal secrets still accepted during rotation; the
+            # harness asserts the fallback authenticates (and garbage doesn't).
+            - name: DUCKGRES_INTERNAL_SECRET_FALLBACKS
+              valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret-fallbacks } }
+            # Enables the user persistent secret manager; the harness
+            # persistent_user_secret assertion exercises it end-to-end.
+            - name: DUCKGRES_USER_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: duckgres-tokens, key: user-secret-key } }
+            - { name: DUCKGRES_AWS_REGION, value: "us-east-1" }
+            # Land e2e workers on the DEFAULT (untainted) nodepool, NOT the real
+            # deployment's duckgres-workers pool: per-PR worker churn must not
+            # fight the dev deployment's headroom placeholders / Karpenter
+            # consolidation on the production-shaped pool, and the harness Job /
+            # per-PR CP / config-store already run on the default pool. The
+            # worker image is arm64-only and the default pool is mixed-arch, so
+            # pin the arch (no toleration needed — the default pool is untainted).
+            - { name: DUCKGRES_K8S_WORKER_NODE_SELECTOR, value: '{"kubernetes.io/arch":"arm64"}' }
+            # The harness provisions real cnpg-shard metadata-store orgs.
+            # Org identity is resolved from the TLS SNI hostname
+            # <org-id>.<managed-suffix> (the server rejects connections without
+            # it). The harness connects with libpq host=<org>.<suffix> (→ SNI)
+            # + hostaddr=<CP ClusterIP> (→ TCP target), and dbname selects the
+            # catalog. Suffix is CI-internal; it never needs to resolve in DNS.
+            - { name: DUCKGRES_MANAGED_HOSTNAME_SUFFIXES, value: ".ci.duckgres.local" }
+            # Separate native metadata-Postgres proxy SNI. Like the managed
+            # hostname above, libpq sends this as TLS SNI while hostaddr keeps
+            # the TCP destination on the in-cluster CP Service.
+            - { name: DUCKGRES_METADATA_HOSTNAME_SUFFIXES, value: ".md.ci.duckgres.local" }
+            - { name: DUCKGRES_SNI_ROUTING_MODE, value: "passthrough" }
+          ports:
+            - { name: pg, containerPort: 5432 }
+            - { name: api, containerPort: 8080 }
+            - { name: flight, containerPort: 8815 }
+          readinessProbe:
+            httpGet: { path: /health, port: api }
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-control-plane
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: duckgres-control-plane }
+  ports:
+    - { name: pg, port: 5432, targetPort: pg }
+    - { name: api, port: 8080, targetPort: api }
+    - { name: flight, port: 8815, targetPort: flight }

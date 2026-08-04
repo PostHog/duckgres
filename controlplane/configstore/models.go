@@ -10,23 +10,84 @@ import "time"
 // alias", multiple orgs can share the NULL state, but any non-NULL alias must
 // be unique across orgs (Postgres ignores NULL in UNIQUE).
 type Org struct {
-	Name                string                 `gorm:"primaryKey;size:255" json:"name"`
-	DatabaseName        string                 `gorm:"size:255;uniqueIndex" json:"database_name"`
-	HostnameAlias       *string                `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
-	MaxWorkers          int                    `gorm:"default:0" json:"max_workers"`
-	MaxConnections      int                    `gorm:"default:0" json:"max_connections"`
-	MemoryBudget        string                 `gorm:"size:32" json:"memory_budget"`
-	IdleTimeoutS        int                    `gorm:"default:0" json:"idle_timeout_s"`
-	WorkerCPURequest    string                 `gorm:"size:32" json:"worker_cpu_request"`
-	WorkerMemoryRequest string                 `gorm:"size:32" json:"worker_memory_request"`
-	Users               []OrgUser              `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse           *ManagedWarehouse      `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	Trino               *ManagedWarehouseTrino `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"trino,omitempty"`
-	CreatedAt           time.Time              `json:"created_at"`
-	UpdatedAt           time.Time              `json:"updated_at"`
+	Name          string  `gorm:"primaryKey;size:255" json:"name"`
+	DatabaseName  string  `gorm:"size:255;uniqueIndex" json:"database_name"`
+	HostnameAlias *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
+	MaxWorkers    int     `gorm:"default:0" json:"max_workers"`
+	MaxVCPUs      int     `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
+	// DefaultWorkerCPU/Memory/TTL are the org's operator-set default worker
+	// profile: the pod shape (k8s resource quantities, e.g. "2"/"8Gi") and
+	// hot-idle TTL (Go duration string, e.g. "75m" — stored as a string for
+	// human editability) applied to connections that don't size themselves via
+	// the duckgres.worker_* startup options. Empty = unset. Versioned SQL
+	// migrations add these columns.
+	DefaultWorkerCPU              string            `gorm:"size:32" json:"default_worker_cpu"`
+	DefaultWorkerMemory           string            `gorm:"size:32" json:"default_worker_memory"`
+	DefaultWorkerTTL              string            `gorm:"size:32" json:"default_worker_ttl"`
+	DefaultWorkerMinHotIdle       int               `gorm:"default:0" json:"default_worker_min_hot_idle"`
+	DataImportsTableNamingVersion string            `gorm:"size:32;not null;default:copy_v1" json:"data_imports_table_naming_version"`
+	Teams                         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
+	Users                         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse                     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	CreatedAt                     time.Time         `json:"created_at"`
+	// UpdatedAt doubles as an input to the discovery change marker
+	// (ConfigStore.LatestConfigChange): DeleteOrgTeamTx touches it so a
+	// team-row DELETE — which leaves no updated_at of its own behind —
+	// still advances the marker external pollers gate on.
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (Org) TableName() string { return "duckgres_orgs" }
+
+// OrgTeam maps one PostHog team to an org and the warehouse schema its data
+// lives in (conventionally "team_<id>"). An org can carry many teams; every
+// org must always have at least one (DeleteOrgTeamTx refuses to delete the
+// last team — a teamless org would be an unroutable warehouse). Two teams in
+// one org must never share a schema name (unique index on
+// (org_id, schema_name), migration 000025). BackfillEnabled mirrors a
+// Django BooleanField(default=True) on the PostHog side, so its column is NOT
+// NULL DEFAULT TRUE (migration 000028) — it stays *bool in Go only so an
+// explicit false survives gorm's zero-value-uses-column-default Create
+// behavior; a stored row always carries a value.
+//
+// The *TableName fields are legacy overrides. NULL — the value for every team
+// created going forward — means "derive from schema_name": events live at
+// <schema_name>.events, persons at <schema_name>.persons, and data imports
+// under the <schema_name>_data_imports schema. Non-NULL values are
+// grandfathered explicit names for pre-existing teams whose warehouse tables
+// predate the schema-per-team convention; the PostHog-side backfill sets them
+// via the provisioning team upsert.
+type OrgTeam struct {
+	OrgID string `gorm:"primaryKey;size:255;index:idx_duckgres_org_teams_org_schema,unique,priority:1" json:"org_id"`
+	// autoIncrement:false — int fields in a composite primary key default to
+	// auto-increment in gorm, which would make this a bigserial.
+	TeamID          int64  `gorm:"primaryKey;autoIncrement:false" json:"team_id"`
+	SchemaName      string `gorm:"size:255;not null;index:idx_duckgres_org_teams_org_schema,unique,priority:2" json:"schema_name"`
+	Enabled         bool   `gorm:"not null;default:true" json:"enabled"`
+	BackfillEnabled *bool  `gorm:"not null;default:true" json:"backfill_enabled"`
+	// The legacy overrides are BARE identifiers (never schema-qualified):
+	// events/persons are table names within SchemaName's schema, the
+	// data-imports override is a schema name. Enforced by
+	// ValidateOrgTeamTableName on every write surface; resolved for
+	// consumers in provisioning/discovery.go resolveTeamTables.
+	EventsTableName       *string `gorm:"size:255" json:"events_table_name,omitempty"`
+	PersonsTableName      *string `gorm:"size:255" json:"persons_table_name,omitempty"`
+	SchemaDataImportsName *string `gorm:"size:255" json:"schema_data_imports_name,omitempty"`
+	// EarliestEventDate is PostHog's cached "earliest event date" for the team:
+	// the historical-backfill floor its Dagster sensor computes from ClickHouse.
+	// NULL = not yet resolved (the sensor computes and sets it); the sentinel
+	// 9999-12-31 (PostHog's NO_HISTORY_SENTINEL) means "team has no event
+	// history", stored so the sensor never re-queries — a date in the far
+	// future cannot collide with a real minimum timestamp, unlike 1970-01-01.
+	// The value is a cache owned by PostHog — duckgres stores and
+	// serves it ("YYYY-MM-DD" or null on the wire) but never computes or
+	// interprets it.
+	EarliestEventDate *EventDate `gorm:"type:date" json:"earliest_event_date"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+func (OrgTeam) TableName() string { return "duckgres_org_teams" }
 
 // OrgUser maps a username to an org with credentials.
 //
@@ -36,16 +97,63 @@ func (Org) TableName() string { return "duckgres_orgs" }
 // (org_id, username) so the same login name can be passthrough in one tenant
 // and not in another.
 type OrgUser struct {
-	OrgID          string    `gorm:"primaryKey;size:255" json:"org_id"`
-	Username       string    `gorm:"primaryKey;size:255" json:"username"`
-	Password       string    `gorm:"size:255;not null" json:"-"`
-	Passthrough    bool      `gorm:"not null;default:false" json:"passthrough"`
-	DefaultCatalog string    `gorm:"size:255" json:"default_catalog,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	OrgID       string `gorm:"primaryKey;size:255;index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:1;index:idx_duckgres_org_users_project_user_team,unique,where:access_mode = 'project_user',priority:1" json:"org_id"`
+	Username    string `gorm:"primaryKey;size:255" json:"username"`
+	Password    string `gorm:"size:255;not null" json:"-"`
+	Passthrough bool   `gorm:"not null;default:false" json:"passthrough"`
+	// AccessMode is one of the OrgUserAccessMode* constants. The two
+	// project-scoped modes (project_reader, project_user) each get their own
+	// partial unique index on (org_id, team_id) so a team can hold at most one
+	// of each — a reader and a writer can coexist.
+	AccessMode string `gorm:"size:32;not null;default:unrestricted" json:"access_mode"`
+	TeamID     *int64 `gorm:"index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:2;index:idx_duckgres_org_users_project_user_team,unique,where:access_mode = 'project_user',priority:2" json:"team_id,omitempty"`
+	// Disabled is the per-user kill switch: when true the user is refused at
+	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
+	// user's live sessions (see admin disable endpoint).
+	Disabled  bool      `gorm:"not null;default:false" json:"disabled"`
+	MaxVCPUs  int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }
+
+// Operator is one admin-console operator and the role they resolve to. Rows
+// are authoritative access-control data (losing them locks every operator out),
+// not rebuildable runtime state — so they live in the goose-migrated config
+// schema (see migration 000006_create_operators.sql), alongside the other
+// duckgres_-prefixed config tables, and are managed via the admin API's
+// Admin → Operators section. AuthMiddleware resolves each SSO request's role
+// from this table per-request (see admin.RoleResolver); the break-glass
+// internal-secret path is independent and always grants admin.
+type Operator struct {
+	Email     string    `gorm:"primaryKey;size:255" json:"email"`
+	Role      string    `gorm:"size:16;not null" json:"role"` // "admin" | "viewer"
+	AddedBy   string    `gorm:"size:255" json:"added_by"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (Operator) TableName() string { return "duckgres_operators" }
+
+// OrgUserSecret is one customer-set persistent DuckDB secret, scoped to
+// (org, user) and replayed onto the user's worker at session creation. The
+// row stores the AES-GCM-sealed CREATE SECRET statement (see
+// server/usersecrets); the config store never sees plaintext credential
+// material. Rows are written/deleted inline when the control plane intercepts
+// CREATE/DROP PERSISTENT SECRET and read directly (not via the snapshot
+// poller) at session creation, so a secret set through one CP replica is
+// immediately visible to all replicas.
+type OrgUserSecret struct {
+	OrgID      string    `gorm:"primaryKey;size:255" json:"org_id"`
+	Username   string    `gorm:"primaryKey;size:255" json:"username"`
+	SecretName string    `gorm:"primaryKey;size:255" json:"secret_name"`
+	Ciphertext []byte    `gorm:"not null" json:"-"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+func (OrgUserSecret) TableName() string { return "duckgres_org_user_secrets" }
 
 // ManagedWarehouseProvisioningState is an open string used for warehouse lifecycle status.
 // The constants below are the canonical values used by current tooling, but callers may
@@ -59,6 +167,14 @@ const (
 	ManagedWarehouseStateFailed       ManagedWarehouseProvisioningState = "failed"
 	ManagedWarehouseStateDeleting     ManagedWarehouseProvisioningState = "deleting"
 	ManagedWarehouseStateDeleted      ManagedWarehouseProvisioningState = "deleted"
+	// Resharding: an operator-driven metadata-store migration is in flight
+	// (configstore/reshard.go + the provisioner reshard runner). New
+	// connections are refused with 57P03 and — load-bearing — the
+	// connection-lease GRANT path refuses grants for resharding orgs; the
+	// connect-time gate alone is unsound because a lease can be granted up to
+	// a queue-timeout after the gate ran. The org's stack stays up so
+	// in-flight sessions drain naturally.
+	ManagedWarehouseStateResharding ManagedWarehouseProvisioningState = "resharding"
 )
 
 // SecretRef identifies a secret key without storing secret material in the config store.
@@ -69,24 +185,23 @@ type SecretRef struct {
 }
 
 // ManagedWarehouseDatabase stores primary warehouse DB metadata for an org.
+// Only Endpoint/Port are consumed (the curated provision connection response);
+// the warehouse DB name/user/region are not part of any provisioning or worker
+// path and were dropped.
 type ManagedWarehouseDatabase struct {
-	Region       string `gorm:"size:64" json:"region"`
-	Endpoint     string `gorm:"size:512" json:"endpoint"`
-	Port         int    `json:"port"`
-	DatabaseName string `gorm:"size:255" json:"database_name"`
-	Username     string `gorm:"size:255" json:"username"`
+	Endpoint string `gorm:"size:512" json:"endpoint"`
+	Port     int    `json:"port"`
 }
 
 // Metadata-store kinds, stored verbatim in ManagedWarehouseMetadataStore.Kind
 // and mirrored onto the Duckling CR's spec.metadataStore.type. The control
 // plane provisions two of these:
 //
-//   - "cnpg-shard": the per-tenant Lakekeeper Iceberg catalog Postgres backend
-//     on the shared CloudNativePG shard (always paired with iceberg.enabled).
+//   - "cnpg-shard": the per-tenant Postgres backend on the shared
+//     CloudNativePG shard.
 //   - "external": a pre-existing Postgres (e.g. RDS/Aurora), referenced by
-//     endpoint + an AWS Secrets Manager secret for the password. Backs either a
-//     DuckLake catalog (iceberg disabled) or the Lakekeeper catalog (iceberg
-//     enabled).
+//     endpoint + an AWS Secrets Manager secret for the password. Backs a
+//     DuckLake catalog.
 const (
 	MetadataStoreKindCnpgShard = "cnpg-shard"
 	MetadataStoreKindExternal  = "external"
@@ -95,8 +210,6 @@ const (
 // ManagedWarehouseMetadataStore stores org-scoped DuckLake metadata DB info.
 type ManagedWarehouseMetadataStore struct {
 	Kind         string `gorm:"size:64" json:"kind"`
-	Engine       string `gorm:"size:64" json:"engine"`
-	Region       string `gorm:"size:64" json:"region"`
 	Endpoint     string `gorm:"size:512" json:"endpoint"`
 	Port         int    `json:"port"`
 	DatabaseName string `gorm:"size:255" json:"database_name"`
@@ -106,7 +219,7 @@ type ManagedWarehouseMetadataStore struct {
 	// metadata DB password. Only meaningful when Kind == "external": it's
 	// passed through to the Duckling CR's spec.metadataStore.external.
 	// passwordAwsSecret, where the composition resolves it (via ESO) into the
-	// status password the worker activator reads. Empty for cnpg-shard
+	// Kubernetes Secret referenced by Duckling status. Empty for cnpg-shard
 	// (which mints its own credentials).
 	PasswordAWSSecret string `gorm:"size:255" json:"password_aws_secret,omitempty"`
 }
@@ -133,7 +246,7 @@ type ManagedWarehouseDataStore struct {
 // is driven by status.metadataStore.pgbouncerEndpoint (populated by the
 // composition once the pooler Service is up).
 type ManagedWarehousePgBouncer struct {
-	Enabled bool `json:"enabled"`
+	Enabled bool `gorm:"default:false" json:"enabled"`
 }
 
 // ManagedWarehouseS3 stores object-store metadata for an org's warehouse.
@@ -143,185 +256,32 @@ type ManagedWarehouseS3 struct {
 	Bucket              string `gorm:"size:255" json:"bucket"`
 	PathPrefix          string `gorm:"size:1024" json:"path_prefix"`
 	Endpoint            string `gorm:"size:512" json:"endpoint"`
-	UseSSL              bool   `json:"use_ssl"`
+	UseSSL              bool   `gorm:"default:false" json:"use_ssl"`
 	URLStyle            string `gorm:"size:16" json:"url_style"`
 	DeltaCatalogEnabled bool   `gorm:"default:true" json:"delta_catalog_enabled"`
 	DeltaCatalogPath    string `gorm:"size:1024" json:"delta_catalog_path"`
 }
 
 // ManagedWarehouseWorkerIdentity stores org-scoped worker identity metadata.
+// The Namespace + IAM role ARN are consumed at activation; the worker
+// ServiceAccount name is computed (not read from config), so it was dropped.
 type ManagedWarehouseWorkerIdentity struct {
-	Namespace          string `gorm:"size:255" json:"namespace"`
-	ServiceAccountName string `gorm:"size:255" json:"service_account_name"`
-	IAMRoleARN         string `gorm:"size:512" json:"iam_role_arn"`
+	Namespace  string `gorm:"size:255" json:"namespace"`
+	IAMRoleARN string `gorm:"size:512" json:"iam_role_arn"`
 }
 
 // ManagedWarehouseDuckLake captures whether the org's DuckLake catalog is
-// enabled. Decoupled from the metadata-store type and from Iceberg: a duckling
-// may run DuckLake, Iceberg, or both, on any metadata backend (cnpg /
-// external). The DuckLake catalog lives in the metadata Postgres — the
-// per-tenant database for cnpg-shard, or the metadata database for external.
+// enabled. Decoupled from the metadata-store type: a duckling may run
+// DuckLake on any metadata backend (cnpg / external). The DuckLake catalog
+// lives in the metadata Postgres — the per-tenant database for cnpg-shard,
+// or the metadata database for external.
 //
 // For ducklings created before this field existed the column is absent/false;
 // the worker activator does NOT key off it directly — it reads the Duckling
 // CR's spec.ducklake.enabled (present/absent) so legacy ducklings keep their
 // implied behavior (external ⇒ DuckLake, cnpg ⇒ none).
 type ManagedWarehouseDuckLake struct {
-	Enabled bool `json:"enabled"`
-}
-
-// ManagedWarehouseIceberg captures per-org Iceberg catalog config. The
-// only supported backend is Lakekeeper: a per-org Lakekeeper instance
-// vends the Iceberg REST catalog. The provisioner creates the Lakekeeper
-// CR + a warehouse pointing at the org's existing S3 bucket (path
-// <s3.path-prefix>/lakekeeper/<orgid>/) and persists the endpoint +
-// OAuth2 client credentials back here. The worker activator reads these
-// and emits a (TYPE ICEBERG, CLIENT_ID/CLIENT_SECRET/OAUTH2_SERVER_URI)
-// DuckDB SECRET + ATTACH at session init.
-//
-// The Backend column is retained for forward-compat / observability; the
-// legacy "s3_tables" value is no longer honored anywhere in the code path.
-type ManagedWarehouseIceberg struct {
-	Enabled bool `json:"enabled"`
-
-	// Backend is retained for schema compat. Empty/unset is treated as
-	// "lakekeeper" by callers; any other value is also treated as
-	// "lakekeeper" since no other backend is implemented.
-	Backend string `gorm:"size:32;default:'lakekeeper'" json:"backend"`
-
-	// Namespace is the default Iceberg namespace inside the catalog.
-	Namespace string `gorm:"size:255" json:"namespace"`
-
-	// Region is the AWS region for the Lakekeeper warehouse storage profile.
-	Region string `gorm:"size:64" json:"region"`
-
-	// Lakekeeper fields. Populated by the provisioner after the per-org
-	// Lakekeeper is ready.
-	LakekeeperEndpoint string `gorm:"size:512" json:"lakekeeper_endpoint,omitempty"`
-
-	// LakekeeperWarehouse is the warehouse NAME (e.g. "org-acme"), not the
-	// UUID. Iceberg REST clients pass this as the `warehouse` parameter to
-	// /v1/config and the server returns the UUID as a prefix for subsequent
-	// calls. PR2's worker-side ATTACH SQL uses this value directly.
-	LakekeeperWarehouse string `gorm:"size:128" json:"lakekeeper_warehouse,omitempty"`
-	LakekeeperClientID  string `gorm:"size:128" json:"lakekeeper_client_id,omitempty"`
-
-	// LakekeeperOAuth2ServerURI is the OAuth2 token endpoint URI for the
-	// duckling-side CREATE SECRET. Empty during PR1 (allowall mode);
-	// populated by PR3 once OIDC SA-token auth is wired. PR2 worker code
-	// must guard against empty and either skip the OAuth2 fields on the
-	// CREATE SECRET statement or emit a different secret shape.
-	LakekeeperOAuth2ServerURI string `gorm:"size:512" json:"lakekeeper_oauth2_server_uri,omitempty"`
-
-	// LakekeeperClientCredentials holds the OAuth2 client_secret used by
-	// the duckling to authenticate to Lakekeeper. The control plane
-	// resolves this just before sending the activation payload.
-	LakekeeperClientCredentials SecretRef `gorm:"embedded;embeddedPrefix:lakekeeper_client_credentials_" json:"lakekeeper_client_credentials"`
-}
-
-// IcebergBackend constants — string-typed to keep the GORM tag happy.
-const (
-	IcebergBackendLakekeeper = "lakekeeper"
-)
-
-// ManagedWarehouseTrino captures per-org opt-in for the customer-facing Trino
-// cluster. Trino access is granted at the org level: when Enabled is true, the
-// provisioner extension (controlplane/provisioner/trino_provisioner.go)
-// projects the org's `root` OrgUser bcrypt hash into the Trino file
-// password authenticator, creates a per-org Iceberg catalog via the Trino
-// REST API, and rebuilds the OPA bundle + resource-groups config.
-//
-// v1 is intentionally minimal — Enabled gates the projection, Tier picks
-// resource-group limits. Per-user identity within an org is post-v1.
-//
-// FK'd by OrgID like the other sibling rows; consumed by the Trino
-// provisioner sub-component in controlplane/provisioner/trino_provisioner.go.
-type ManagedWarehouseTrino struct {
-	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
-
-	// Enabled gates inclusion in every projection the Trino provisioner owns
-	// (password file, group file, OPA bundle catalog map, resource-groups
-	// config, REST CREATE CATALOG). Defaults to false so existing
-	// configstore rows never start projecting after a schema migration.
-	Enabled bool `gorm:"not null;default:false" json:"enabled"`
-
-	// Tier picks the resource-group limits applied to the org. Empty string
-	// is treated as the default tier by the resource-groups generator.
-	// Kept as a free-form string for now; refining into an enum is
-	// post-v1 work once tier shape stabilizes.
-	Tier string `gorm:"size:64" json:"tier"`
-
-	// State / StatusMessage / ReadyAt / FailedAt mirror the
-	// ManagedWarehouse lifecycle fields so operators can see what the
-	// Trino reconcile loop is doing. The Trino reconcile is a single
-	// batched output per tick (catalog + auth + resource-groups +
-	// bundle); these fields summarize the most recent tick's outcome.
-	//
-	// State transitions:
-	//   - pending (default after EnableTrino, before first reconcile)
-	//   - provisioning (a reconcile tick is mid-flight or a previous
-	//     tick partially failed and is retrying)
-	//   - ready (the most recent tick succeeded across all four steps)
-	//   - failed (the most recent tick errored — StatusMessage carries
-	//     the per-step detail; ready_at is preserved, failed_at is set)
-	//
-	// On the next successful reconcile after a failed state, the row
-	// flips back to ready and failed_at is cleared. We don't model the
-	// plan's per-step sub-states (CatalogCreating, ProjectionReady,
-	// etc.) — for v1 the four-state summary plus StatusMessage detail
-	// is sufficient observability without growing the model.
-	State         ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
-	StatusMessage string                            `gorm:"size:1024" json:"status_message"`
-	ReadyAt       *time.Time                        `json:"ready_at,omitempty"`
-	FailedAt      *time.Time                        `json:"failed_at,omitempty"`
-
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_warehouse_trino" }
-
-// Customer-Trino CLUSTER-level credential lifecycle:
-//
-// The three cluster credentials (internal-communication shared secret,
-// __admin_provisioner password + bcrypt hash, OPA bundle bearer token)
-// are machine-generated and live ONLY as K8s Secrets in the
-// trino-customer namespace — the K8s Secret is the single source of
-// truth for each value (mirrors controlplane/worker_rpc_security.go).
-// The configstore deliberately stores NO credential bytes and NO
-// SecretRefs for them; the Secret names are a fixed naming contract
-// (constants in the provisioner), so there's nothing to persist except
-// a one-bit "have we ever bootstrapped" sentinel — see
-// TrinoClusterBootstrap in trino_cluster_secrets.go. Credential
-// rotation (version/history/grace-window) is a separate follow-up
-// rotation-API concern and adds its own state then.
-
-// TrinoEnabledOrg is the join shape returned by ListTrinoEnabledOrgs: org +
-// root-user bcrypt hash. The provisioner needs both at once — the password
-// file projection keys org_<team_id> by the password hash — so a single
-// query avoids an N+1 read pattern as the Trino-enabled org count grows.
-//
-// State is the row's CURRENT operational state at the time of the read,
-// so the reconcile loop can decide whether each per-tick write is a
-// transition (set ReadyAt / FailedAt) or a no-op preservation
-// (matches the surrounding ManagedWarehouse pattern in controller.go,
-// which only stamps ready_at on the first transition into ready).
-type TrinoEnabledOrg struct {
-	OrgID            string
-	DatabaseName     string
-	Tier             string
-	RootPasswordHash string                            // bcrypt hash from OrgUser row where Username = "root"
-	State            ManagedWarehouseProvisioningState // current state at read time
-}
-
-// ResolvedBackend returns Backend with the empty-string default applied.
-// Callers should prefer this over reading Backend directly so that rows
-// migrated from earlier schemas (no Backend column) behave correctly.
-func (i ManagedWarehouseIceberg) ResolvedBackend() string {
-	if i.Backend == "" {
-		return IcebergBackendLakekeeper
-	}
-	return i.Backend
+	Enabled bool `gorm:"default:false" json:"enabled"`
 }
 
 // ManagedWarehouse is the config-store source of truth for an org's managed warehouse metadata.
@@ -330,6 +290,16 @@ type ManagedWarehouse struct {
 
 	Image           string `gorm:"size:512" json:"image"`
 	DuckLakeVersion string `gorm:"size:32" json:"ducklake_version"`
+	// MetadataProxyEnabled explicitly opts this org into the customer-facing
+	// native Postgres metadata endpoint. It is never inferred from shard
+	// placement: moving an org must not silently publish its catalog database.
+	MetadataProxyEnabled bool `gorm:"not null;default:false" json:"metadata_proxy_enabled"`
+
+	// DucklingName is THE authoritative k8s Duckling CR name — nothing in the
+	// control plane derives or re-derives it. On warehouse create it defaults
+	// to the org ID verbatim (org IDs are validated as lowercase DNS-1123
+	// labels at the provisioning endpoint).
+	DucklingName string `gorm:"size:255;not null" json:"duckling_name"`
 
 	WarehouseDatabase ManagedWarehouseDatabase       `gorm:"embedded;embeddedPrefix:warehouse_database_" json:"warehouse_database"`
 	MetadataStore     ManagedWarehouseMetadataStore  `gorm:"embedded;embeddedPrefix:metadata_store_" json:"metadata_store"`
@@ -337,109 +307,50 @@ type ManagedWarehouse struct {
 	PgBouncer         ManagedWarehousePgBouncer      `gorm:"embedded;embeddedPrefix:pgbouncer_" json:"pgbouncer"`
 	S3                ManagedWarehouseS3             `gorm:"embedded;embeddedPrefix:s3_" json:"s3"`
 	DuckLake          ManagedWarehouseDuckLake       `gorm:"embedded;embeddedPrefix:ducklake_" json:"ducklake"`
-	Iceberg           ManagedWarehouseIceberg        `gorm:"embedded;embeddedPrefix:iceberg_" json:"iceberg"`
 	WorkerIdentity    ManagedWarehouseWorkerIdentity `gorm:"embedded;embeddedPrefix:worker_identity_" json:"worker_identity"`
+
+	// MetadataStoreSecretRef is the DISCOVERY-ONLY mirror of the Duckling
+	// CR's status.metadataStore.credentialSecretRef, written by the
+	// provisioner's ready-reconcile and served as password_secret_ref on
+	// GET /api/v1/warehouses. Deliberately separate from
+	// MetadataStoreCredentials below: that column set is a worker-activation
+	// input validated tenant-owned by ValidateManagedWarehouseSecretRefs —
+	// the composition-owned refs mirrored here (ducklings namespace,
+	// cnpg-tenant-<org>-password) fail that validation by design, and
+	// writing them there breaks every cold worker activation.
+	MetadataStoreSecretRef SecretRef `gorm:"embedded;embeddedPrefix:metadata_store_secret_ref_" json:"metadata_store_secret_ref"`
 
 	WarehouseDatabaseCredentials SecretRef `gorm:"embedded;embeddedPrefix:warehouse_database_credentials_" json:"warehouse_database_credentials"`
 	MetadataStoreCredentials     SecretRef `gorm:"embedded;embeddedPrefix:metadata_store_credentials_" json:"metadata_store_credentials"`
 	S3Credentials                SecretRef `gorm:"embedded;embeddedPrefix:s3_credentials_" json:"s3_credentials"`
 	RuntimeConfig                SecretRef `gorm:"embedded;embeddedPrefix:runtime_config_" json:"runtime_config"`
 
-	State                          ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
-	StatusMessage                  string                            `gorm:"size:1024" json:"status_message"`
-	WarehouseDatabaseState         ManagedWarehouseProvisioningState `gorm:"size:32" json:"warehouse_database_state"`
-	WarehouseDatabaseStatusMessage string                            `gorm:"size:1024" json:"warehouse_database_status_message"`
-	MetadataStoreState             ManagedWarehouseProvisioningState `gorm:"size:32" json:"metadata_store_state"`
-	MetadataStoreStatusMessage     string                            `gorm:"size:1024" json:"metadata_store_status_message"`
-	S3State                        ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
-	S3StatusMessage                string                            `gorm:"size:1024" json:"s3_status_message"`
-	IcebergState                   ManagedWarehouseProvisioningState `gorm:"size:32" json:"iceberg_state"`
-	IcebergStatusMessage           string                            `gorm:"size:1024" json:"iceberg_status_message"`
-	IdentityState                  ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
-	IdentityStatusMessage          string                            `gorm:"size:1024" json:"identity_status_message"`
-	SecretsState                   ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
-	SecretsStatusMessage           string                            `gorm:"size:1024" json:"secrets_status_message"`
-	ProvisioningStartedAt          *time.Time                        `json:"provisioning_started_at"`
-	ReadyAt                        *time.Time                        `json:"ready_at"`
-	FailedAt                       *time.Time                        `json:"failed_at"`
-	CreatedAt                      time.Time                         `json:"created_at"`
-	UpdatedAt                      time.Time                         `json:"updated_at"`
+	// Top-level State/StatusMessage are the rolled-up provisioning status; the
+	// per-component *State fields below drive readiness. The provisioner only
+	// ever writes the top-level status_message, so per-component status-message
+	// columns were dropped. warehouse_database has no provisioning sub-state, so
+	// its *State was dropped too.
+	State              ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
+	StatusMessage      string                            `gorm:"size:1024" json:"status_message"`
+	MetadataStoreState ManagedWarehouseProvisioningState `gorm:"size:32" json:"metadata_store_state"`
+	S3State            ManagedWarehouseProvisioningState `gorm:"size:32" json:"s3_state"`
+	IdentityState      ManagedWarehouseProvisioningState `gorm:"size:32" json:"identity_state"`
+	SecretsState       ManagedWarehouseProvisioningState `gorm:"size:32" json:"secrets_state"`
+
+	ProvisioningStartedAt *time.Time `json:"provisioning_started_at"`
+	ReadyAt               *time.Time `json:"ready_at"`
+	FailedAt              *time.Time `json:"failed_at"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
 }
 
 func (ManagedWarehouse) TableName() string { return "duckgres_managed_warehouses" }
 
-// GlobalConfig is a singleton row (ID=1) for cluster-wide settings.
-type GlobalConfig struct {
-	ID                  uint      `gorm:"primaryKey" json:"-"`
-	MemoryBudget        string    `gorm:"size:32" json:"memory_budget"`
-	MemoryRebalance     bool      `json:"memory_rebalance"`
-	MaxConnections      int       `json:"max_connections"`
-	IdleTimeoutS        int       `json:"idle_timeout_s"`
-	WorkerQueueTimeoutS int       `json:"worker_queue_timeout_s"`
-	WorkerIdleTimeoutS  int       `json:"worker_idle_timeout_s"`
-	Extensions          string    `gorm:"size:1024" json:"extensions"`
-	UpdatedAt           time.Time `json:"updated_at"`
-}
-
-func (GlobalConfig) TableName() string { return "duckgres_global_config" }
-
-// DuckLakeConfig is a singleton row (ID=1) for legacy cluster-wide DuckLake settings.
-// In multi-tenant mode, the managed-warehouse contract is the intended per-org source of truth.
-type DuckLakeConfig struct {
-	ID                  uint      `gorm:"primaryKey" json:"-"`
-	MetadataStore       string    `gorm:"size:1024" json:"metadata_store"`
-	ObjectStore         string    `gorm:"size:1024" json:"object_store"`
-	DataPath            string    `gorm:"size:1024" json:"data_path"`
-	S3Provider          string    `gorm:"size:64" json:"s3_provider"`
-	S3Endpoint          string    `gorm:"size:512" json:"s3_endpoint"`
-	S3AccessKey         string    `gorm:"size:255" json:"s3_access_key"`
-	S3SecretKey         string    `gorm:"size:255" json:"-"`
-	S3Region            string    `gorm:"size:64" json:"s3_region"`
-	S3UseSSL            bool      `json:"s3_use_ssl"`
-	S3URLStyle          string    `gorm:"size:16" json:"s3_url_style"`
-	S3Chain             string    `gorm:"size:255" json:"s3_chain"`
-	S3Profile           string    `gorm:"size:255" json:"s3_profile"`
-	DeltaCatalogEnabled bool      `gorm:"default:true" json:"delta_catalog_enabled"`
-	DeltaCatalogPath    string    `gorm:"size:1024" json:"delta_catalog_path"`
-	UpdatedAt           time.Time `json:"updated_at"`
-}
-
-func (DuckLakeConfig) TableName() string { return "duckgres_ducklake_config" }
-
-// RateLimitConfig is a singleton row (ID=1) for rate limiting.
-type RateLimitConfig struct {
-	ID                   uint      `gorm:"primaryKey" json:"-"`
-	MaxFailedAttempts    int       `json:"max_failed_attempts"`
-	FailedAttemptWindowS int       `json:"failed_attempt_window_s"`
-	BanDurationS         int       `json:"ban_duration_s"`
-	MaxConnectionsPerIP  int       `json:"max_connections_per_ip"`
-	UpdatedAt            time.Time `json:"updated_at"`
-}
-
-func (RateLimitConfig) TableName() string { return "duckgres_rate_limit_config" }
-
-// QueryLogConfig is a singleton row (ID=1) for query logging.
-type QueryLogConfig struct {
-	ID                   uint      `gorm:"primaryKey" json:"-"`
-	Enabled              bool      `json:"enabled"`
-	FlushIntervalS       int       `json:"flush_interval_s"`
-	BatchSize            int       `json:"batch_size"`
-	CompactIntervalS     int       `json:"compact_interval_s"`
-	DataInliningRowLimit int       `json:"data_inlining_row_limit"`
-	UpdatedAt            time.Time `json:"updated_at"`
-}
-
-func (QueryLogConfig) TableName() string { return "duckgres_query_log_config" }
-
-// SchemaMigration tracks one-shot data migrations that aren't expressible
-// through GORM's AutoMigrate (e.g., backfills of new column defaults onto
-// existing rows). One row per migration name, inserted exactly once.
-type SchemaMigration struct {
-	Name      string    `gorm:"primaryKey;size:128" json:"name"`
-	AppliedAt time.Time `json:"applied_at"`
-}
-
-func (SchemaMigration) TableName() string { return "duckgres_schema_migrations" }
+// NOTE: the cluster-wide singleton config tables (global_config,
+// ducklake_config, rate_limit_config, query_log_config) were removed — they
+// were seeded and served by the admin API but never read to drive runtime
+// behavior. Effective config comes from CLI flags/env (server.Config) and the
+// per-org ManagedWarehouse contract. See migration 000004.
 
 // ControlPlaneInstanceState describes the liveness state of a control-plane instance.
 type ControlPlaneInstanceState string
@@ -453,10 +364,10 @@ const (
 // ControlPlaneInstance is a runtime coordination record for one control-plane process.
 // These rows live in the runtime schema, not the snapshot-backed config tables.
 type ControlPlaneInstance struct {
-	ID              string                    `gorm:"primaryKey;size:255" json:"id"`
-	PodName         string                    `gorm:"size:255;not null" json:"pod_name"`
-	PodUID          string                    `gorm:"size:255;not null" json:"pod_uid"`
-	BootID          string                    `gorm:"size:255;not null" json:"boot_id"`
+	ID      string `gorm:"primaryKey;size:255" json:"id"`
+	PodName string `gorm:"size:255;not null" json:"pod_name"`
+	// pod_uid + boot_id were dropped: both are already encoded into the
+	// primary-key ID (<pod_uid>-<bootIDHex>) and were never read back.
 	State           ControlPlaneInstanceState `gorm:"size:32;not null" json:"state"`
 	StartedAt       time.Time                 `json:"started_at"`
 	LastHeartbeatAt time.Time                 `gorm:"index" json:"last_heartbeat_at"`
@@ -491,56 +402,38 @@ const (
 	WorkerClaimMissReasonNone         WorkerClaimMissReason = ""
 	WorkerClaimMissReasonNoIdle       WorkerClaimMissReason = "no_idle"
 	WorkerClaimMissReasonOrgCap       WorkerClaimMissReason = "org_cap"
-	WorkerClaimMissReasonGlobalCap    WorkerClaimMissReason = "global_cap"
 	WorkerClaimMissReasonShuttingDown WorkerClaimMissReason = "shutting_down"
 )
-
-const WarmCapacityMissBucketSize = 10 * time.Second
-
-// WarmCapacityMissBucket stores foreground warm-capacity misses in coarse time
-// buckets so every control-plane pod contributes to one shared demand signal.
-type WarmCapacityMissBucket struct {
-	Scope       string                `gorm:"primaryKey;type:text" json:"scope"`
-	Reason      WorkerClaimMissReason `gorm:"primaryKey;size:64" json:"reason"`
-	BucketStart time.Time             `gorm:"primaryKey;index" json:"bucket_start"`
-	Count       int64                 `gorm:"not null" json:"count"`
-	UpdatedAt   time.Time             `gorm:"not null;index" json:"updated_at"`
-}
-
-func (WarmCapacityMissBucket) TableName() string { return "warm_capacity_miss_buckets" }
-
-// WarmCapacityMissAggregate is the grouped demand signal read by warm-capacity
-// target computation.
-type WarmCapacityMissAggregate struct {
-	Scope  string                `json:"scope"`
-	Reason WorkerClaimMissReason `json:"reason"`
-	Count  int64                 `json:"count"`
-}
 
 // WorkerLifecycleStats is the grouped worker lifecycle state used for
 // cluster-wide worker observability.
 type WorkerLifecycleStats struct {
-	Image   string      `json:"image"`
-	State   WorkerState `json:"state"`
-	Binding string      `json:"binding"`
-	Count   int64       `json:"count"`
+	Image       string      `json:"image"`
+	State       WorkerState `json:"state"`
+	Binding     string      `json:"binding"`
+	Count       int64       `json:"count"`
+	CPUCores    float64     `json:"cpu_cores"`
+	MemoryBytes int64       `json:"memory_bytes"`
 }
 
 // WorkerRecord is the durable runtime coordination record for one worker pod.
 type WorkerRecord struct {
-	WorkerID            int         `gorm:"primaryKey" json:"worker_id"`
-	PodName             string      `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
-	PodUID              string      `gorm:"size:255" json:"pod_uid"`
-	Image               string      `gorm:"size:512;index" json:"image"`
+	WorkerID int    `gorm:"primaryKey" json:"worker_id"`
+	PodName  string `gorm:"size:255;not null;uniqueIndex" json:"pod_name"`
+	Image    string `gorm:"size:512;index" json:"image"`
 	// Worker pod-shape profile (connection-string-selected sizing). Empty
-	// CPU/Memory + Colocate=false is the default exclusive profile, so legacy
-	// rows (and warm/neutral workers) read back as the default and stay
-	// claimable by default requests. Matched alongside Image when a session
-	// reserves a worker. AutoMigrate adds these columns; no migration file.
-	ProfileCPU      string `gorm:"size:32;index:idx_worker_profile" json:"profile_cpu"`
-	ProfileMemory   string `gorm:"size:32;index:idx_worker_profile" json:"profile_memory"`
-	ProfileColocate bool   `gorm:"index:idx_worker_profile" json:"profile_colocate"`
-	State           WorkerState `gorm:"size:32;not null;index" json:"state"`
+	// CPU/Memory is the default profile, so legacy rows read back as the default
+	// and stay claimable by default requests. Matched alongside Image when a
+	// session reserves a worker. AutoMigrate adds these columns; no migration file.
+	ProfileCPU    string `gorm:"size:32;index:idx_worker_profile" json:"profile_cpu"`
+	ProfileMemory string `gorm:"size:32;index:idx_worker_profile" json:"profile_memory"`
+	// TTLMinutes is how long this worker stays hot-idle after its last query
+	// before the janitor retires it (client-selected duckgres.worker_ttl, rounded
+	// down to whole minutes). 0 = use the deployment's global hot-idle TTL
+	// (default/legacy workers and legacy rows). AutoMigrate adds this
+	// column; no migration file.
+	TTLMinutes          int         `gorm:"default:0" json:"ttl_minutes"`
+	State               WorkerState `gorm:"size:32;not null;index" json:"state"`
 	OrgID               string      `gorm:"size:255;index" json:"org_id"`
 	OwnerCPInstanceID   string      `gorm:"size:255;index" json:"owner_cp_instance_id"`
 	OwnerEpoch          int64       `gorm:"not null" json:"owner_epoch"`
@@ -552,12 +445,24 @@ type WorkerRecord struct {
 	// will expire. Stamped when the control plane mints creds (initial
 	// activation, takeover, scheduled refresh) and consulted by the
 	// credential refresh scheduler to pick workers nearing expiry. NULL on
-	// workers that haven't had creds issued yet (warm pool) and on legacy
+	// workers that haven't had creds issued yet and on legacy
 	// rows from before this column existed — both are treated as "due now"
 	// by the scheduler so they get refreshed eagerly.
 	S3CredentialsExpiresAt *time.Time `gorm:"index" json:"s3_credentials_expires_at,omitempty"`
-	CreatedAt              time.Time  `json:"created_at"`
-	UpdatedAt              time.Time  `json:"updated_at"`
+	// HotIdleSince is when the worker most recently entered the hot_idle state.
+	// The hot-idle TTL reaper measures idle age from this column instead of
+	// updated_at, because updated_at is legitimately bumped by lease and
+	// credential-refresh writes (BumpWorkerEpoch, MarkCredentialsRefreshed) that
+	// do not change a worker's idleness — keying the reap clock off it let a
+	// periodically-refreshed hot-idle worker reset its own TTL forever and never
+	// get retired. Stamped only on the transition into hot_idle and preserved
+	// across same-state upserts/refreshes. NULL on non-hot-idle rows and on
+	// legacy rows predating this column; the reaper falls back to updated_at when
+	// NULL so legacy hot-idle rows still expire. AutoMigrate adds this column; no
+	// migration file.
+	HotIdleSince *time.Time `gorm:"index" json:"hot_idle_since,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
 func (WorkerRecord) TableName() string { return "worker_records" }
@@ -574,35 +479,51 @@ const (
 
 // FlightSessionRecord is the durable reconnect record for Flight sessions.
 type FlightSessionRecord struct {
-	SessionToken string             `gorm:"primaryKey;size:255" json:"session_token"`
-	Username     string             `gorm:"size:255;not null" json:"username"`
-	OrgID        string             `gorm:"size:255;not null" json:"org_id"`
-	WorkerID     int                `gorm:"not null;index" json:"worker_id"`
-	OwnerEpoch   int64              `gorm:"not null" json:"owner_epoch"`
-	CPInstanceID string             `gorm:"size:255" json:"cp_instance_id"`
-	State        FlightSessionState `gorm:"size:32;not null" json:"state"`
-	ExpiresAt    time.Time          `gorm:"index" json:"expires_at"`
-	LastSeenAt   time.Time          `json:"last_seen_at"`
-	CreatedAt    time.Time          `json:"created_at"`
-	UpdatedAt    time.Time          `json:"updated_at"`
+	SessionToken         string             `gorm:"primaryKey;size:255" json:"session_token"`
+	Username             string             `gorm:"size:255;not null" json:"username"`
+	OrgID                string             `gorm:"size:255;not null" json:"org_id"`
+	WorkerID             int                `gorm:"not null;index" json:"worker_id"`
+	PID                  int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
+	OwnerEpoch           int64              `gorm:"not null" json:"owner_epoch"`
+	CPInstanceID         string             `gorm:"size:255" json:"cp_instance_id"`
+	State                FlightSessionState `gorm:"size:32;not null" json:"state"`
+	ExpiresAt            time.Time          `gorm:"index" json:"expires_at"`
+	LastSeenAt           time.Time          `json:"last_seen_at"`
+	AccessPolicyRecorded bool               `gorm:"not null;default:false" json:"access_policy_recorded"`
+	AccessRevision       string             `gorm:"size:64" json:"access_revision,omitempty"`
+	AccessReadOnly       bool               `gorm:"not null;default:false" json:"access_read_only"`
+	AllowedSchemas       []string           `gorm:"serializer:json;type:text" json:"allowed_schemas,omitempty"`
+	AllowedRelations     []string           `gorm:"serializer:json;type:text" json:"allowed_relations,omitempty"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
 }
 
 func (FlightSessionRecord) TableName() string { return "flight_session_records" }
 
+// OrgResourceLimits is the current resource-admission ceiling for an org and
+// the connecting user. 0 means unlimited for either dimension.
+type OrgResourceLimits struct {
+	OrgMaxVCPUs  int
+	UserMaxVCPUs int
+}
+
 // OrgConnectionQueueEntry is a cluster-wide FIFO admission request for one org
 // connection. Rows expire quickly; they coordinate fairness across CP replicas.
 type OrgConnectionQueueEntry struct {
-	RequestID    string     `gorm:"primaryKey;size:64" json:"request_id"`
-	OrgID        string     `gorm:"size:255;not null;index:idx_org_connection_queue_pending,priority:1" json:"org_id"`
-	CPInstanceID string     `gorm:"size:255;not null;index" json:"cp_instance_id"`
-	PID          int32      `gorm:"not null" json:"pid"`
-	Protocol     string     `gorm:"size:32;not null" json:"protocol"`
-	EnqueuedAt   time.Time  `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
-	ExpiresAt    time.Time  `gorm:"not null;index" json:"expires_at"`
-	GrantedAt    *time.Time `gorm:"index" json:"granted_at,omitempty"`
-	CanceledAt   *time.Time `gorm:"index" json:"canceled_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	RequestID      string     `gorm:"primaryKey;size:64" json:"request_id"`
+	OrgID          string     `gorm:"size:255;not null;index:idx_org_connection_queue_pending,priority:1" json:"org_id"`
+	Username       string     `gorm:"size:255;index" json:"username"`
+	CPInstanceID   string     `gorm:"size:255;not null;index" json:"cp_instance_id"`
+	PID            int32      `gorm:"not null" json:"pid"`
+	Protocol       string     `gorm:"size:32;not null" json:"protocol"`
+	RequestedVCPUs int        `gorm:"column:requested_vcpus;not null;default:1" json:"requested_vcpus"`
+	EnqueuedAt     time.Time  `gorm:"not null;index:idx_org_connection_queue_pending,priority:2" json:"enqueued_at"`
+	ExpiresAt      time.Time  `gorm:"not null;index" json:"expires_at"`
+	GrantedAt      *time.Time `gorm:"index" json:"granted_at,omitempty"`
+	// canceled_at was dropped: cancellation is a hard DELETE of the row, so the
+	// column was never set to a non-NULL value.
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (OrgConnectionQueueEntry) TableName() string { return "org_connection_queue" }
@@ -611,15 +532,17 @@ func (OrgConnectionQueueEntry) TableName() string { return "org_connection_queue
 // session. Capacity checks count active leases, ignoring owners whose CP row
 // has expired.
 type OrgConnectionLease struct {
-	LeaseID      string    `gorm:"primaryKey;size:64" json:"lease_id"`
-	RequestID    string    `gorm:"size:64;not null;uniqueIndex" json:"request_id"`
-	OrgID        string    `gorm:"size:255;not null;index" json:"org_id"`
-	CPInstanceID string    `gorm:"size:255;not null;index" json:"cp_instance_id"`
-	PID          int32     `gorm:"not null" json:"pid"`
-	Protocol     string    `gorm:"size:32;not null" json:"protocol"`
-	AcquiredAt   time.Time `gorm:"not null" json:"acquired_at"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	LeaseID        string    `gorm:"primaryKey;size:64" json:"lease_id"`
+	RequestID      string    `gorm:"size:64;not null;uniqueIndex" json:"request_id"`
+	OrgID          string    `gorm:"size:255;not null;index" json:"org_id"`
+	Username       string    `gorm:"size:255;index" json:"username"`
+	CPInstanceID   string    `gorm:"size:255;not null;index" json:"cp_instance_id"`
+	PID            int32     `gorm:"not null" json:"pid"`
+	Protocol       string    `gorm:"size:32;not null" json:"protocol"`
+	RequestedVCPUs int       `gorm:"column:requested_vcpus;not null;default:1" json:"requested_vcpus"`
+	AcquiredAt     time.Time `gorm:"not null" json:"acquired_at"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func (OrgConnectionLease) TableName() string { return "org_connection_leases" }
@@ -631,31 +554,84 @@ func (OrgConnectionLease) TableName() string { return "org_connection_leases" }
 // *string to drive sparse-unique semantics in the underlying table; that
 // pointer-ness is irrelevant once the data is loaded into the snapshot.
 type OrgConfig struct {
-	Name                string
-	DatabaseName        string
-	HostnameAlias       string // empty when no alias is configured
-	MaxWorkers          int
-	MaxConnections      int
-	MemoryBudget        string
-	IdleTimeoutS        int
-	WorkerCPURequest    string
-	WorkerMemoryRequest string
-	Users               map[string]string // username -> password
-	Warehouse           *ManagedWarehouseConfig
+	Name                    string
+	DatabaseName            string
+	HostnameAlias           string // empty when no alias is configured
+	MaxWorkers              int
+	MaxVCPUs                int
+	DefaultWorkerCPU        string            // org default worker profile: pod cpu quantity ("" = unset)
+	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
+	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
+	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
+	Teams                   []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams)
+	Users                   map[string]string // username -> password
+	Warehouse               *ManagedWarehouseConfig
+}
+
+// OrgTeamConfig is the in-memory snapshot view of one duckgres_org_teams row.
+// CreatedAt is carried so OldestTeamID can order rows deterministically.
+type OrgTeamConfig struct {
+	TeamID                int64
+	SchemaName            string
+	Enabled               bool
+	EventsTableName       *string
+	PersonsTableName      *string
+	SchemaDataImportsName *string
+	CreatedAt             time.Time
+}
+
+// OldestTeamID returns the org's oldest PostHog team id (min created_at,
+// ties broken by the smaller team_id) — in practice the provision-time first
+// team. It is the INFORMATIONAL team id stamped onto usage buckets: duckgres
+// no longer owns team-level billing attribution (that mapping lives in the
+// external billing service); the stamp just records "the org's oldest team at
+// record time". Returns 0 when the org has no team rows — defensive only
+// (stale snapshot / mid-provision): a committed org always has at least one
+// team (provision requires one, DeleteOrgTeamTx keeps the last).
+func (oc *OrgConfig) OldestTeamID() int64 {
+	best := oc.OldestTeam()
+	if best == nil {
+		return 0
+	}
+	return best.TeamID
+}
+
+// OldestTeam returns the org's oldest team row under OldestTeamID's exact
+// ordering (min created_at, ties broken by the smaller team_id), or nil when
+// the org has no team rows. Shared by the org-info metric so its per-org
+// representative team matches the id usage buckets already stamp.
+func (oc *OrgConfig) OldestTeam() *OrgTeamConfig {
+	var best *OrgTeamConfig
+	for i := range oc.Teams {
+		t := &oc.Teams[i]
+		if best == nil ||
+			t.CreatedAt.Before(best.CreatedAt) ||
+			(t.CreatedAt.Equal(best.CreatedAt) && t.TeamID < best.TeamID) {
+			best = t
+		}
+	}
+	return best
 }
 
 // ManagedWarehouseConfig is the in-memory snapshot view of an org's warehouse metadata.
 type ManagedWarehouseConfig struct {
 	OrgID string
 
-	Image           string
-	DuckLakeVersion string
+	// DucklingName is the k8s Duckling CR name (and therefore the prefix of
+	// every composed per-tenant resource, e.g. the <name>-compaction
+	// maintenance CronJob). NOT derivable from OrgID: legacy tenants
+	// stripped uuid hyphens, newer ones keep them. Carried in the snapshot
+	// as the org-teams info metric's join key.
+	DucklingName string
+
+	Image                string
+	DuckLakeVersion      string
+	MetadataProxyEnabled bool
 
 	WarehouseDatabase ManagedWarehouseDatabase
 	MetadataStore     ManagedWarehouseMetadataStore
 	PgBouncer         ManagedWarehousePgBouncer
 	S3                ManagedWarehouseS3
-	Iceberg           ManagedWarehouseIceberg
 	WorkerIdentity    ManagedWarehouseWorkerIdentity
 
 	WarehouseDatabaseCredentials SecretRef
@@ -663,22 +639,14 @@ type ManagedWarehouseConfig struct {
 	S3Credentials                SecretRef
 	RuntimeConfig                SecretRef
 
-	State                          ManagedWarehouseProvisioningState
-	StatusMessage                  string
-	WarehouseDatabaseState         ManagedWarehouseProvisioningState
-	WarehouseDatabaseStatusMessage string
-	MetadataStoreState             ManagedWarehouseProvisioningState
-	MetadataStoreStatusMessage     string
-	S3State                        ManagedWarehouseProvisioningState
-	S3StatusMessage                string
-	IcebergState                   ManagedWarehouseProvisioningState
-	IcebergStatusMessage           string
-	IdentityState                  ManagedWarehouseProvisioningState
-	IdentityStatusMessage          string
-	SecretsState                   ManagedWarehouseProvisioningState
-	SecretsStatusMessage           string
-	ReadyAt                        *time.Time
-	FailedAt                       *time.Time
+	State              ManagedWarehouseProvisioningState
+	StatusMessage      string
+	MetadataStoreState ManagedWarehouseProvisioningState
+	S3State            ManagedWarehouseProvisioningState
+	IdentityState      ManagedWarehouseProvisioningState
+	SecretsState       ManagedWarehouseProvisioningState
+	ReadyAt            *time.Time
+	FailedAt           *time.Time
 }
 
 func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseConfig {
@@ -687,33 +655,26 @@ func copyManagedWarehouseConfig(warehouse *ManagedWarehouse) *ManagedWarehouseCo
 	}
 
 	cfg := &ManagedWarehouseConfig{
-		OrgID:                          warehouse.OrgID,
-		Image:                          warehouse.Image,
-		DuckLakeVersion:                warehouse.DuckLakeVersion,
-		WarehouseDatabase:              warehouse.WarehouseDatabase,
-		MetadataStore:                  warehouse.MetadataStore,
-		PgBouncer:                      warehouse.PgBouncer,
-		S3:                             warehouse.S3,
-		Iceberg:                        warehouse.Iceberg,
-		WorkerIdentity:                 warehouse.WorkerIdentity,
-		WarehouseDatabaseCredentials:   warehouse.WarehouseDatabaseCredentials,
-		MetadataStoreCredentials:       warehouse.MetadataStoreCredentials,
-		S3Credentials:                  warehouse.S3Credentials,
-		RuntimeConfig:                  warehouse.RuntimeConfig,
-		State:                          warehouse.State,
-		StatusMessage:                  warehouse.StatusMessage,
-		WarehouseDatabaseState:         warehouse.WarehouseDatabaseState,
-		WarehouseDatabaseStatusMessage: warehouse.WarehouseDatabaseStatusMessage,
-		MetadataStoreState:             warehouse.MetadataStoreState,
-		MetadataStoreStatusMessage:     warehouse.MetadataStoreStatusMessage,
-		S3State:                        warehouse.S3State,
-		S3StatusMessage:                warehouse.S3StatusMessage,
-		IcebergState:                   warehouse.IcebergState,
-		IcebergStatusMessage:           warehouse.IcebergStatusMessage,
-		IdentityState:                  warehouse.IdentityState,
-		IdentityStatusMessage:          warehouse.IdentityStatusMessage,
-		SecretsState:                   warehouse.SecretsState,
-		SecretsStatusMessage:           warehouse.SecretsStatusMessage,
+		OrgID:                        warehouse.OrgID,
+		DucklingName:                 warehouse.DucklingName,
+		Image:                        warehouse.Image,
+		DuckLakeVersion:              warehouse.DuckLakeVersion,
+		MetadataProxyEnabled:         warehouse.MetadataProxyEnabled,
+		WarehouseDatabase:            warehouse.WarehouseDatabase,
+		MetadataStore:                warehouse.MetadataStore,
+		PgBouncer:                    warehouse.PgBouncer,
+		S3:                           warehouse.S3,
+		WorkerIdentity:               warehouse.WorkerIdentity,
+		WarehouseDatabaseCredentials: warehouse.WarehouseDatabaseCredentials,
+		MetadataStoreCredentials:     warehouse.MetadataStoreCredentials,
+		S3Credentials:                warehouse.S3Credentials,
+		RuntimeConfig:                warehouse.RuntimeConfig,
+		State:                        warehouse.State,
+		StatusMessage:                warehouse.StatusMessage,
+		MetadataStoreState:           warehouse.MetadataStoreState,
+		S3State:                      warehouse.S3State,
+		IdentityState:                warehouse.IdentityState,
+		SecretsState:                 warehouse.SecretsState,
 	}
 	if warehouse.ReadyAt != nil {
 		readyAt := *warehouse.ReadyAt

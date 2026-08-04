@@ -308,7 +308,17 @@ func (t *WritableCTETransform) rewriteWritableCTE(
 		quotedTempName := quoteIdentifier(tempName)
 
 		if cte.isWrite {
-			// WRITABLE CTE: capture RETURNING output, then execute DML
+			// WRITABLE CTE: capture RETURNING output, then execute DML.
+			// The RETURNING capture runs as a SELECT of the rows BEFORE the
+			// UPDATE, so it yields pre-update (OLD) values. That is correct only
+			// for columns the UPDATE does not modify (the common "RETURNING id"
+			// row-identification pattern). If RETURNING reads a modified column,
+			// the captured value would be stale — reject rather than return wrong
+			// data.
+			if u := cte.node.Ctequery.GetUpdateStmt(); u != nil && updateReturningReadsModifiedColumn(u) {
+				return nil, NewFeatureNotSupported(
+					"UPDATE ... RETURNING a modified column inside a writable CTE is not supported on this catalog: it would return the pre-update value; return only unmodified columns (e.g. the key) or run the UPDATE without wrapping it in a CTE")
+			}
 
 			// 2a. Generate SELECT that captures what RETURNING would produce
 			returningSelect, err := t.generateReturningSelect(cte.node, tempTableNames)
@@ -384,6 +394,53 @@ func (t *WritableCTETransform) generateReturningSelect(
 	default:
 		return "", fmt.Errorf("unexpected CTE query type: %T", query.Node)
 	}
+}
+
+// updateReturningReadsModifiedColumn reports whether an UPDATE's RETURNING list
+// references, by name, a column the UPDATE modifies (so the pre-update capture
+// would be stale). RETURNING * is exempt (see returningRefsColumn). Returns false
+// when there is no RETURNING list or it reads only unmodified columns.
+func updateReturningReadsModifiedColumn(u *pg_query.UpdateStmt) bool {
+	if u == nil || len(u.ReturningList) == 0 {
+		return false
+	}
+	setCols := map[string]bool{}
+	for _, tgt := range u.TargetList {
+		if rt := tgt.GetResTarget(); rt != nil && rt.Name != "" {
+			setCols[strings.ToLower(rt.Name)] = true
+		}
+	}
+	if len(setCols) == 0 {
+		return false
+	}
+	for _, ret := range u.ReturningList {
+		if returningRefsColumn(ret, setCols) {
+			return true
+		}
+	}
+	return false
+}
+
+// returningRefsColumn reports whether a RETURNING item references, by name, any
+// column in cols. RETURNING * is deliberately NOT treated as a hit: it is the
+// common row-identification idiom (callers typically consume only the key), and
+// rejecting it would break legitimate upsert patterns. The narrower risk that a
+// caller reads a modified column out of a RETURNING * is left as a documented
+// limitation.
+func returningRefsColumn(ret *pg_query.Node, cols map[string]bool) bool {
+	found := false
+	WalkFunc(&pg_query.ParseResult{Stmts: []*pg_query.RawStmt{{Stmt: ret}}}, func(n *pg_query.Node) bool {
+		if cr := n.GetColumnRef(); cr != nil {
+			for _, f := range cr.Fields {
+				if s := f.GetString_(); s != nil && cols[strings.ToLower(s.Sval)] {
+					found = true
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return found
 }
 
 // updateToSelect converts UPDATE...FROM...WHERE...RETURNING to equivalent SELECT

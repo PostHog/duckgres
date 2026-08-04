@@ -2,13 +2,13 @@ package backend
 
 import "testing"
 
-func TestIcebergProfilePolicies(t *testing.T) {
-	profile := ForName(Iceberg)
-	if profile.Catalog().PhysicalName != "iceberg" {
-		t.Fatalf("PhysicalName = %q, want iceberg", profile.Catalog().PhysicalName)
+func TestDuckLakeProfilePolicies(t *testing.T) {
+	profile := ForName(DuckLake)
+	if profile.Catalog().PhysicalName != "ducklake" {
+		t.Fatalf("PhysicalName = %q, want ducklake", profile.Catalog().PhysicalName)
 	}
-	if profile.Catalog().MapPublicToMain {
-		t.Fatal("Iceberg must not map public to main")
+	if !profile.Catalog().MapPublicToMain {
+		t.Fatal("DuckLake must map public to main")
 	}
 	if profile.DDL().ConstraintHandling != StripConstraints {
 		t.Fatalf("ConstraintHandling = %v, want StripConstraints", profile.DDL().ConstraintHandling)

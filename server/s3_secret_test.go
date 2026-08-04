@@ -100,6 +100,30 @@ func TestBuildConfigSecretEmitsHTTPWhenProxySet(t *testing.T) {
 	}
 }
 
+// Regression for the env-inheritance hazard: a PROVIDER config secret that
+// omits SESSION_TOKEN silently inherits a host AWS_SESSION_TOKEN env var
+// (httpfs copies it into the global s3_session_token setting at load, and
+// secret lookup falls back to settings for keys the secret omits) and signs
+// with a mismatched (key, token) pair. buildConfigSecret must always pin the
+// token explicitly — empty means "no token".
+func TestBuildConfigSecretAlwaysEmitsSessionToken(t *testing.T) {
+	noToken := buildConfigSecret(DuckLakeConfig{
+		S3AccessKey: "AKIA",
+		S3SecretKey: "sk",
+	})
+	if !strings.Contains(noToken, "SESSION_TOKEN ''") {
+		t.Errorf("config secret without a token must pin SESSION_TOKEN '':\n%s", noToken)
+	}
+	withToken := buildConfigSecret(DuckLakeConfig{
+		S3AccessKey:    "ASIA",
+		S3SecretKey:    "sk",
+		S3SessionToken: "tok",
+	})
+	if !strings.Contains(withToken, "SESSION_TOKEN 'tok'") {
+		t.Errorf("config secret must carry the explicit token:\n%s", withToken)
+	}
+}
+
 // TestBuildCredentialChainSecretEmitsHTTPWhenProxySet covers the
 // credential-chain branch, which previously only emitted USE_SSL /
 // URL_STYLE when an explicit endpoint was configured. With HTTPProxy set,

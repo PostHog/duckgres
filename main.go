@@ -17,6 +17,7 @@ import (
 	"github.com/posthog/duckgres/controlplane"
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/crashhandler"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -37,7 +38,6 @@ type (
 	ACMEConfig          = configloader.ACMEConfig
 	RateLimitFileConfig = configloader.RateLimitFileConfig
 	DuckLakeFileConfig  = configloader.DuckLakeFileConfig
-	IcebergFileConfig   = configloader.IcebergFileConfig
 )
 
 // loadConfigFile + env are thin wrappers around configloader for back-compat
@@ -48,12 +48,30 @@ var (
 	env            = configloader.Env
 )
 
+func validateRunMode(mode string) error {
+	switch mode {
+	case "standalone", "control-plane", "duckdb-service", "reshard-runner":
+		return nil
+	default:
+		return fmt.Errorf("unsupported --mode %q; supported modes: standalone, control-plane, duckdb-service, reshard-runner", mode)
+	}
+}
+
 func main() {
 	// Ignore SIGPIPE to prevent DuckDB's C++ code (and libraries like libpq
 	// inside DuckLake) from crashing the process when a network connection
 	// drops mid-query. Go already converts EPIPE to errors on Write; the
 	// default SIGPIPE handler is a legacy Unix footgun that kills the process.
 	signal.Ignore(syscall.SIGPIPE)
+
+	// The native crash handler self-installs from a C constructor (importing
+	// the package is what links it in). Without it, a SIGSEGV on a
+	// DuckDB-created thread can wedge the process forever instead of killing
+	// it — see the package doc. Surface its state early so a missing handler
+	// is visible in logs.
+	if !crashhandler.Installed() {
+		slog.Warn("Native crash handler NOT installed; fatal signals on native threads may wedge the process.")
+	}
 
 	// Set version on server package so catalog macros can expose it
 	server.SetProcessVersion(version)
@@ -86,7 +104,7 @@ func main() {
 	psql := flag.Bool("psql", false, "Launch psql connected to the local Duckgres server")
 	showVersion := flag.Bool("version", false, "Show version and exit")
 	showHelp := flag.Bool("help", false, "Show help message")
-	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
+	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, duckdb-service, or reshard-runner")
 	socketDir := flag.String("socket-dir", "/var/run/duckgres", "Unix socket directory (control-plane mode)")
 	duckdbListen := flag.String("duckdb-listen", "", "DuckDB service listen address (duckdb-service mode, env: DUCKGRES_DUCKDB_LISTEN)")
 	duckdbListenFD := flag.Int("duckdb-listen-fd", 0, "Inherit a pre-bound listener FD instead of creating a new socket (duckdb-service mode, set by control plane)")
@@ -135,15 +153,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_STORE       PostgreSQL connection string for config store (multi-tenant)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG_POLL_INTERVAL  Config store poll interval (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET    Shared secret for API authentication\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_MAX_WORKERS    Max K8s workers in the shared pool (0=unbounded)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_SHARED_WARM_TARGET  Neutral shared warm-worker target for K8s multi-tenant mode\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_DYNAMIC_WARM_CAPACITY_ENABLED  Enable dynamic warm-capacity targets (default: true)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_MISS_WINDOW  Recent no-idle miss window for dynamic targets (default: 2m)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_MISSES_PER_WORKER  Misses per extra warm worker (default: 8)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_DEMAND_TTL  Retention TTL for warm-capacity miss buckets (default: 15m)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_IMAGE_CEILING  Max dynamic extra warm workers per image (0=unlimited)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_K8S_WARM_CAPACITY_DYNAMIC_TOTAL_CEILING  Max dynamic extra warm workers across images (0=unlimited)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_INTERNAL_SECRET_FALLBACKS  Comma-separated previous internal secrets still accepted during rotation\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_AWS_REGION         AWS region for STS client\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_OP_ID      Reshard operation to execute (reshard-runner mode; set by the control plane)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_PASSWORD_URL  One-shot ephemeral password pull URL (reshard-runner mode, ext targets; set by the control plane)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_POD_CPU    Reshard runner pod CPU requests=limits (control-plane mode, default 2)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_RESHARD_POD_MEMORY Reshard runner pod memory requests=limits (control-plane mode, default 8Gi)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_LOG_LEVEL          Log level: debug, info, warn, error (default: info)\n")
 		fmt.Fprintf(os.Stderr, "\nPrecedence: CLI flags > environment variables > config file > defaults\n")
 	}
@@ -192,6 +207,9 @@ func main() {
 	loggingShutdown := cliboot.InitLogging()
 	defer loggingShutdown()
 
+	analyticsShutdown := cliboot.InitAnalytics()
+	defer analyticsShutdown()
+
 	tracingShutdown := cliboot.InitTracing()
 	defer tracingShutdown()
 
@@ -211,6 +229,9 @@ func main() {
 	if *showHelp {
 		flag.Usage()
 		os.Exit(0)
+	}
+	if err := validateRunMode(*mode); err != nil {
+		fatal(err.Error())
 	}
 
 	resolved := configresolve.ResolveEffective(fileCfg, harvestCLIInputs(), os.Getenv, func(msg string) {
@@ -299,6 +320,24 @@ func main() {
 		return
 	}
 
+	// Handle reshard-runner mode: the entrypoint of a dedicated per-operation
+	// pod (duckgres-reshard-op-<id>) the control plane spawns for each reshard.
+	// Claims ONE operation (DUCKGRES_RESHARD_OP_ID), executes the step machine
+	// to a terminal state, exits. The op row is the source of truth for the
+	// OUTCOME (a failed/rolled-back op still exits 0); only infrastructure
+	// errors (config store unreachable, claim lost/fenced) exit nonzero.
+	// Requires -tags kubernetes. No PG listener, no TLS, no metrics endpoint.
+	if *mode == "reshard-runner" {
+		if err := controlplane.RunReshardRunnerMode(controlplane.ReshardRunnerModeConfig{
+			ConfigStoreConn:    resolved.ConfigStoreConn,
+			ConfigPollInterval: resolved.ConfigPollInterval,
+			AWSRegion:          resolved.AWSRegion,
+		}); err != nil {
+			fatal("Reshard runner failed: " + err.Error())
+		}
+		return
+	}
+
 	// Handle REPL mode (interactive SQL shell, no TLS/metrics/server needed)
 	if *repl {
 		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
@@ -346,49 +385,45 @@ func main() {
 			ConfigStoreConn:            resolved.ConfigStoreConn,
 			ConfigPollInterval:         resolved.ConfigPollInterval,
 			InternalSecret:             resolved.InternalSecret,
+			InternalSecretFallbacks:    resolved.InternalSecretFallbacks,
+			ReadOnlySecret:             resolved.ReadOnlySecret,
+			ReadOnlySecretFallbacks:    resolved.ReadOnlySecretFallbacks,
+			UserSecretKey:              resolved.UserSecretKey,
 			SNIRoutingMode:             resolved.SNIRoutingMode,
 			ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
+			MetadataHostnameSuffixes:   resolved.MetadataHostnameSuffixes,
+			MetadataProxyMaxConns:      resolved.MetadataProxyMaxConns,
+			DucklingBucketSuffix:       resolved.DucklingBucketSuffix,
 			DuckLakeDefaultSpecVersion: resolved.DuckLakeDefaultSpecVersion,
+
+			AdmissionReclaimerMaxReservations: resolved.AdmissionReclaimerMaxReservations,
 			K8s: controlplane.K8sConfig{
-				WorkerImage:                     resolved.K8sWorkerImage,
-				WorkerNamespace:                 resolved.K8sWorkerNamespace,
-				ControlPlaneID:                  resolved.K8sControlPlaneID,
-				WorkerPort:                      resolved.K8sWorkerPort,
-				WorkerSecret:                    resolved.K8sWorkerSecret,
-				WorkerConfigMap:                 resolved.K8sWorkerConfigMap,
-				ImagePullPolicy:                 resolved.K8sWorkerImagePullPolicy,
-				ServiceAccount:                  resolved.K8sWorkerServiceAccount,
-				MaxWorkers:                      resolved.K8sMaxWorkers,
-				SharedWarmTarget:                resolved.K8sSharedWarmTarget,
-				DynamicWarmCapacityEnabled:      resolved.K8sDynamicWarmCapacityEnabled,
-				WarmCapacityMissWindow:          resolved.K8sWarmCapacityMissWindow,
-				WarmCapacityMissesPerWorker:     resolved.K8sWarmCapacityMissesPerWorker,
-				WarmCapacityDemandTTL:           resolved.K8sWarmCapacityDemandTTL,
-				WarmCapacityDynamicImageCeiling: resolved.K8sWarmCapacityDynamicImageCeiling,
-				WarmCapacityDynamicTotalCeiling: resolved.K8sWarmCapacityDynamicTotalCeiling,
-				WorkerCPURequest:                resolved.K8sWorkerCPURequest,
-				WorkerMemoryRequest:             resolved.K8sWorkerMemoryRequest,
-				WorkerNodeSelector:              resolved.K8sWorkerNodeSelector,
-				WorkerTolerationKey:             resolved.K8sWorkerTolerationKey,
-				WorkerTolerationValue:           resolved.K8sWorkerTolerationValue,
-				WorkerExclusiveNode:             resolved.K8sWorkerExclusiveNode,
-				AllowClientWorkerProfile:        resolved.K8sAllowClientWorkerProfile,
-				AllowClientExclusiveNode:        resolved.K8sAllowClientExclusiveNode,
-				ColocatedWorkerCPURequest:       resolved.K8sColocatedWorkerCPURequest,
-				ColocatedWorkerMemoryRequest:    resolved.K8sColocatedWorkerMemoryRequest,
-				ColocatedWarmShapes:             resolved.K8sColocatedWarmShapes,
-				WorkerPriorityClassName:         resolved.K8sWorkerPriorityClassName,
-				WorkerTiers:                     resolved.K8sWorkerTiers,
-				ColocatedWorkerNodeSelector:     resolved.K8sColocatedWorkerNodeSelector,
-				ColocatedWorkerTolerationKey:    resolved.K8sColocatedWorkerTolerationKey,
-				ColocatedWorkerTolerationValue:  resolved.K8sColocatedWorkerTolerationValue,
-				WorkerProfileMinCPU:             resolved.K8sWorkerProfileMinCPU,
-				WorkerProfileMaxCPU:             resolved.K8sWorkerProfileMaxCPU,
-				WorkerProfileMinMemory:          resolved.K8sWorkerProfileMinMemory,
-				WorkerProfileMaxMemory:          resolved.K8sWorkerProfileMaxMemory,
-				OrgMaxColocatedCPU:              resolved.K8sOrgMaxColocatedCPU,
-				OrgMaxColocatedMemory:           resolved.K8sOrgMaxColocatedMemory,
-				AWSRegion:                       resolved.AWSRegion,
+				WorkerImage:                  resolved.K8sWorkerImage,
+				WorkerNamespace:              resolved.K8sWorkerNamespace,
+				ControlPlaneID:               resolved.K8sControlPlaneID,
+				WorkerPort:                   resolved.K8sWorkerPort,
+				WorkerSecret:                 resolved.K8sWorkerSecret,
+				WorkerConfigMap:              resolved.K8sWorkerConfigMap,
+				ImagePullPolicy:              resolved.K8sWorkerImagePullPolicy,
+				ServiceAccount:               resolved.K8sWorkerServiceAccount,
+				WorkerCPURequest:             resolved.K8sWorkerCPURequest,
+				WorkerMemoryRequest:          resolved.K8sWorkerMemoryRequest,
+				WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
+				WorkerTolerationKey:          resolved.K8sWorkerTolerationKey,
+				WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
+				AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
+				WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
+				PlaceholderImage:             resolved.K8sPlaceholderImage,
+				PlaceholderPriorityClassName: resolved.K8sPlaceholderPriorityClassName,
+				WorkerProfileMinCPU:          resolved.K8sWorkerProfileMinCPU,
+				WorkerProfileMaxCPU:          resolved.K8sWorkerProfileMaxCPU,
+				WorkerProfileMinMemory:       resolved.K8sWorkerProfileMinMemory,
+				WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
+				WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
+				WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
+				ReshardPodCPU:                resolved.K8sReshardPodCPU,
+				ReshardPodMemory:             resolved.K8sReshardPodMemory,
+				AWSRegion:                    resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

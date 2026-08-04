@@ -79,3 +79,34 @@ spec:
           protocol: TCP
         - port: 8816
           protocol: TCP
+---
+# Dedicated per-operation reshard runner pods (duckgres-reshard-op-<id>,
+# spawned by the control plane, --mode reshard-runner). Egress mirrors the
+# control plane's data-plane needs: DNS, Postgres (config store / cnpg shard
+# poolers / external RDS on 5432), S3 (443, the streamed pre-flip catalog
+# backup + STS), and the CP admin API on 8080 (the one-shot ephemeral-password
+# pull). No ingress — the runner only dials out.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: duckgres-reshard-runner-boundaries
+  namespace: duckgres
+spec:
+  podSelector:
+    matchLabels:
+      app: duckgres-reshard
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+        - port: 5432
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
