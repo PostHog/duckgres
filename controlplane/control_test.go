@@ -285,3 +285,31 @@ func isWrappedEOF(err error) bool {
 	}
 	return false
 }
+
+func TestClientSuppliedWorkerGUCs(t *testing.T) {
+	on := K8sConfig{AllowClientWorkerProfile: true}
+	if !clientSuppliedWorkerGUCs(on, map[string]string{"duckgres.worker_cpu": "4"}) {
+		t.Fatal("cpu GUC must count")
+	}
+	if !clientSuppliedWorkerGUCs(on, map[string]string{"duckgres.worker_memory": "8Gi"}) {
+		t.Fatal("memory GUC must count")
+	}
+	if !clientSuppliedWorkerGUCs(on, map[string]string{"duckgres.worker_ttl": "5m"}) {
+		t.Fatal("ttl GUC must count")
+	}
+	if clientSuppliedWorkerGUCs(on, map[string]string{"search_path": "x"}) {
+		t.Fatal("unrelated options must not count")
+	}
+	if clientSuppliedWorkerGUCs(on, nil) {
+		t.Fatal("no options must not count")
+	}
+	if clientSuppliedWorkerGUCs(on, map[string]string{"duckgres.worker_cpu": "   "}) {
+		t.Fatal("blank GUC value must not count")
+	}
+	// Gate off: client GUCs are ignored everywhere, so they must not bypass
+	// the tier either.
+	off := K8sConfig{AllowClientWorkerProfile: false}
+	if clientSuppliedWorkerGUCs(off, map[string]string{"duckgres.worker_cpu": "4"}) {
+		t.Fatal("gated-off client GUCs must not count")
+	}
+}

@@ -260,6 +260,24 @@ func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int,
 	return int((millis + 999) / 1000), nil
 }
 
+// clientSuppliedWorkerGUCs reports whether the client's startup options carry
+// an explicit worker sizing (any duckgres.worker_* GUC, honored only when the
+// deployment trusts client sizing). Such connections bypass the exploratory
+// tier: the client asked for a specific shape, so give it that shape from the
+// first statement instead of starting small and escalating.
+//
+// Gated on AllowClientWorkerProfile for the same reason resolveWorkerProfile
+// is: with the gate off the GUCs are ignored everywhere, so they must not
+// silently steer tier selection either.
+func clientSuppliedWorkerGUCs(k K8sConfig, opts map[string]string) bool {
+	if !k.AllowClientWorkerProfile {
+		return false
+	}
+	return strings.TrimSpace(opts[gucWorkerCPU]) != "" ||
+		strings.TrimSpace(opts[gucWorkerMemory]) != "" ||
+		strings.TrimSpace(opts[gucWorkerTTL]) != ""
+}
+
 // defaultExploratoryWorkerTTL keeps an org's exploratory worker parked
 // hot-idle for two days after its last connection — the "warm pod for every
 // recently-active team" retention from the tier design.
