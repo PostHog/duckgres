@@ -352,6 +352,44 @@ func TestUseExploratoryTierExclusions(t *testing.T) {
 // assigns the concrete store to the interface.
 var _ ConfigStoreInterface = (*configstore.ConfigStore)(nil)
 
+// TestLazyActivationCatalogAssumption pins the invariant the lazy (deferred
+// worker acquisition) connect path leans on: with the DuckLake catalog
+// attached — the ONLY attachment a multitenant session can succeed with —
+// catalog resolution has exactly one successful outcome, the DuckLake catalog
+// itself. That is what lets the connect path stamp the transpiler's backend
+// profile and catalog USE rewriting before any worker exists, and refuse an
+// unavailable catalog at CONNECT instead of deferring it into a
+// first-statement fatal. If resolveEffectiveCatalog ever admits a second
+// successful outcome, the lazy path must probe a worker instead of assuming.
+func TestLazyActivationCatalogAssumption(t *testing.T) {
+	got, ok := resolveEffectiveCatalog("", true)
+	if !ok || got != physicalDuckLakeCatalog {
+		t.Fatalf("default catalog resolution = (%q, %v), want (%q, true)", got, ok, physicalDuckLakeCatalog)
+	}
+	got, ok = resolveEffectiveCatalog(physicalDuckLakeCatalog, true)
+	if !ok || got != physicalDuckLakeCatalog {
+		t.Fatalf("explicit catalog resolution = (%q, %v), want (%q, true)", got, ok, physicalDuckLakeCatalog)
+	}
+	for _, requested := range []string{"memory", "postgres", "ducklake2", "MAIN"} {
+		if got, ok := resolveEffectiveCatalog(requested, true); ok {
+			t.Fatalf("resolveEffectiveCatalog(%q, true) = (%q, true); the lazy connect path assumes only %q can succeed",
+				requested, got, physicalDuckLakeCatalog)
+		}
+	}
+}
+
+// TestWorkerProfileLogRendering covers the nil (pool-default shape) case of the
+// activation log helpers — a nil profile is the default shape, not an empty one.
+func TestWorkerProfileLogRendering(t *testing.T) {
+	if workerProfileCPU(nil) != "default" || workerProfileMemory(nil) != "default" {
+		t.Fatal("a nil worker profile must render as the default shape")
+	}
+	p := &WorkerProfile{CPU: "2", Memory: "8Gi"}
+	if workerProfileCPU(p) != "2" || workerProfileMemory(p) != "8Gi" {
+		t.Fatalf("profile rendering = %q/%q, want 2/8Gi", workerProfileCPU(p), workerProfileMemory(p))
+	}
+}
+
 // A user disabled during the switcher's destroy→create window is rejected by
 // the post-escalation re-check, and escalation failure is connection-fatal — so
 // the client sees this error text. Keep it identical to the connect-time 28000
