@@ -166,6 +166,18 @@ func hasErrorResponse(msgs []wireMsg, severity, code string, wantsInMessage ...s
 	return false
 }
 
+// hasSeverity reports whether ANY ErrorResponse carries this severity. Used
+// for negative assertions ("no FATAL was emitted"), where naming a SQLSTATE
+// would weaken the check.
+func hasSeverity(msgs []wireMsg, severity string) bool {
+	for _, f := range decodeErrorResponses(msgs) {
+		if f.severity == severity {
+			return true
+		}
+	}
+	return false
+}
+
 // describeErrorResponses renders the decoded ErrorResponses for failure output.
 func describeErrorResponses(msgs []wireMsg) string {
 	var b strings.Builder
@@ -343,6 +355,88 @@ func TestDeclareCursorPinsBeforeExecute(t *testing.T) {
 	}
 	if len(big.queryCalls) != 1 {
 		t.Fatalf("cursor was re-opened (%v); it must still be the original RowSet", big.queryCalls)
+	}
+}
+
+// TestBatchedDeclareCursorPins is the batched sibling of
+// TestDeclareCursorPinsBeforeExecute. executeSingleStatement's cursor switch
+// returns from its DECLARE case before reaching the batch classification hook,
+// so a single Q message carrying `DECLARE …; FETCH …` would otherwise open the
+// cursor's RowSet on the exploratory worker — exactly the stranding the
+// DECLARE pin exists to prevent.
+func TestBatchedDeclareCursorPins(t *testing.T) {
+	var order []string
+	small := &tierExecutor{name: "small", order: &order}
+	big := &tierExecutor{name: "big", order: &order, queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1, 2}}, nil
+	}}
+	c, out := newBufferedConn(small)
+	c.cursors = make(map[string]*cursorState)
+	c.onExploratoryWorker = true
+	var reasons []string
+	c.workerSwitcher = func(_ context.Context, reason string) (QueryExecutor, int, string, error) {
+		reasons = append(reasons, reason)
+		order = append(order, "switch")
+		return big, 9, "worker-9", nil
+	}
+
+	const batch = "DECLARE cur CURSOR FOR SELECT n FROM t; FETCH 1 FROM cur\x00"
+	if err := c.handleQuery([]byte(batch)); err != nil {
+		t.Fatalf("handleQuery(batch): %v", err)
+	}
+	if len(reasons) != 1 || reasons[0] != escalateReasonState {
+		t.Fatalf("batched DECLARE did not pin: switcher reasons = %v, want [%q]", reasons, escalateReasonState)
+	}
+	if len(small.queryCalls) != 0 {
+		t.Fatalf("cursor opened on the exploratory worker: %v", small.queryCalls)
+	}
+	if len(big.queryCalls) != 1 {
+		t.Fatalf("standard worker query calls = %v, want one (the cursor open)", big.queryCalls)
+	}
+	// The escalation must precede the cursor open, not merely coexist with it.
+	want := []string{"switch", "big:query"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("execution order = %v, want %v", order, want)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if countMsgs(msgs, 'E') != 0 {
+		t.Fatalf("unexpected ErrorResponse: %s", describeErrorResponses(msgs))
+	}
+}
+
+// TestBatchedDeclareCursorEscalationFailureIsConnectionFatal asserts the batch
+// path propagates a failed DECLARE escalation as connection-fatal:
+// executeSingleStatement returns (false, err), handleMultiStatementQuery
+// returns it WITHOUT writing ReadyForQuery, and handleQuery hands it to the
+// message loop.
+func TestBatchedDeclareCursorEscalationFailureIsConnectionFatal(t *testing.T) {
+	small := &tierExecutor{name: "small"}
+	c, out := newBufferedConn(small)
+	c.cursors = make(map[string]*cursorState)
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return nil, 0, "", errors.New("worker capacity exhausted for organization")
+	}
+
+	err := c.handleQuery([]byte("DECLARE cur CURSOR FOR SELECT n FROM t; FETCH 1 FROM cur\x00"))
+	if err == nil {
+		t.Fatal("handleQuery returned nil; a failed escalation must terminate the connection")
+	}
+	if !errors.Is(err, errConnectionFatal) {
+		t.Fatalf("batch error %v does not carry errConnectionFatal, so the message loop would resume", err)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if !hasErrorResponse(msgs, "FATAL", "53300") {
+		t.Fatalf("want FATAL 53300, got %s", describeErrorResponses(msgs))
+	}
+	if countMsgs(msgs, 'Z') != 0 {
+		t.Fatalf("ReadyForQuery sent after a connection-fatal failure: %s", describeMsgs(msgs))
+	}
+	if len(c.cursors) != 0 {
+		t.Fatalf("cursor registered despite the failed escalation: %v", c.cursors)
+	}
+	if len(small.queryCalls) != 0 {
+		t.Fatalf("batch continued on the dead exploratory session: %v", small.queryCalls)
 	}
 }
 
@@ -624,6 +718,9 @@ func TestSelectPrepareOOMOffTierSurfaces(t *testing.T) {
 	msgs := parseWireMsgs(t, out.Bytes())
 	if !hasErrorResponse(msgs, "ERROR", "XX000", "Out of Memory Error") {
 		t.Fatalf("want a non-fatal ERROR carrying the OOM: %s", describeErrorResponses(msgs))
+	}
+	if hasSeverity(msgs, "FATAL") {
+		t.Fatalf("off-tier OOM must not terminate the connection: %s", describeErrorResponses(msgs))
 	}
 	if countMsgs(msgs, 'Z') != 1 {
 		t.Fatalf("want one ReadyForQuery: %s", describeMsgs(msgs))

@@ -463,6 +463,15 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	if parseErr == nil && len(tree.Stmts) == 1 {
 		switch s := tree.Stmts[0].Stmt.Node.(type) {
 		case *pg_query.Node_DeclareCursorStmt:
+			// Same contract as the single-statement DECLARE in handleQuery:
+			// this case returns before the batch hook below, so without this
+			// a batched `DECLARE …; FETCH …` would open the cursor's RowSet on
+			// the exploratory worker and a later pinning statement would
+			// strand it. FETCH/CLOSE below need no hook — an open cursor
+			// proves its DECLARE already pinned the connection.
+			if err := c.escalateForPinningStatement(query); err != nil {
+				return false, err
+			}
 			innerSQL := deparseInnerQuery(s.DeclareCursorStmt.Query)
 			if innerSQL == "" {
 				c.sendError("ERROR", "42601", "could not deparse cursor query")
