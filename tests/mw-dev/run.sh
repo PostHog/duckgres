@@ -279,9 +279,13 @@ cmd_test_e2e() {
   # Ship harness.sh into the namespace as a ConfigMap and run it as a Job that
   # talks to the control-plane ClusterIP service. The Job SA is `duckgres`,
   # which can delete worker pods in-namespace (durability test).
+  # Server-side apply: harness.sh outgrew the 256KiB cap client-side apply
+  # hits when it stashes the whole object in the last-applied annotation
+  # (metadata.annotations: Too long). SSA stores field ownership instead and
+  # allows the full 1MiB ConfigMap payload.
   "${KUBECTL[@]}" -n "$NS" create configmap duckgres-harness \
     --from-file=harness.sh="$HERE/e2e/harness.sh" \
-    --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
+    --dry-run=client -o yaml | "${KUBECTL[@]}" apply --server-side --force-conflicts -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
   INTERNAL_SECRET_FALLBACK="$(cat "$internal_secret_fallback_file")"
