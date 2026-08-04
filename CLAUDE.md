@@ -351,10 +351,17 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   default — false pins are free, a missed pin loses state.
 - **Escalation is one-way and sticky.** `escalateWorker` destroys the small
   session BEFORE acquiring the standard one, so once it is entered there is no
-  session to fall back to. Reasons are a closed set:
-  `duckgres_exploratory_escalations_total{reason="state"|"oom"|"heuristic"}`
-  (v1 ships no heuristic tier; the constant marks the hook point).
-- **A failed acquisition — activation OR escalation — is CONNECTION-FATAL.**
+  session to fall back to. Both reason and outcome are closed sets:
+  `duckgres_exploratory_escalations_total{reason="state"|"oom"|"heuristic",
+  outcome="ok"|"canceled"|"capacity"|"draining"|"disabled"|"error"}` — every
+  ATTEMPT is counted, so a cluster that cannot escalate anything is
+  distinguishable from one nobody escalates on (v1 ships no heuristic tier; the
+  constant marks the hook point). The failure classes come from the CLASSIFIED
+  SQLSTATE via `server.AcquisitionFailureOutcome`, the same helper
+  `duckgres_session_activation_total{org,outcome}` uses — one helper, so the two
+  acquisition metrics can never drift into different or unbounded label sets.
+- **A failed acquisition — activation OR escalation — is CONNECTION-FATAL**
+  (the one exception is the post-escalation s3_cache re-apply, below).
   `failWorkerAcquisition` sends a FATAL ErrorResponse, suppresses
   ReadyForQuery, and unwinds the message loop; there is no session left to
   resynchronize to. SQLSTATE comes from `escalationErrorSQLState`: a
@@ -384,9 +391,17 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   still flip the session flag, the exact divergence `applyS3CacheSetting`
   exists to prevent. A failed apply fails the activation (XX000, fatal). On
   escalation the bypass is RE-APPLIED to the new worker
-  (`reapplyS3CacheAfterWorkerSwitch`); a failure resets the session flag to the
-  worker's real transport and fails the statement. **`SHOW` must never lie**:
-  it activates iff an option is still pending.
+  (`reapplyS3CacheAfterWorkerSwitch`); that failure is the ONE
+  non-connection-fatal escalation outcome, because the swap already succeeded:
+  the statement fails with a normal `ERROR` (XX000, naming the re-apply), the
+  session flag is reset to the worker's REAL transport (proxied — a fresh
+  session always starts on the cache proxy), the connection stays alive (a
+  ReadyForQuery on the simple protocol; Sync's on the extended one), and the
+  pin is deliberately NOT rolled back. `escalateWorker` tags it
+  `errS3CacheReapplyFailed` and `failEscalation` routes it — every call site
+  goes through that dispatcher so the two severities can never be confused at
+  one of them. **`SHOW` must never lie**: it activates iff an option is still
+  pending.
 - **Billing is largest-size-wins over the whole connection** (v1). The size is
   stamped at activation and re-stamped at escalation with the target profile;
   escalation only ever goes small→standard, so that stamp IS the maximum. The
@@ -395,11 +410,15 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   connection admission and the vCPU lease now happen at the FIRST STATEMENT,
   not at connect (the connect-time reshard/migration/draining gates are
   unchanged); a one-shot per-user `kill` landing inside the switcher's
-  destroy→create window is missed (`disable` is NOT — the switcher re-reads the
-  disabled state after init and fails the escalation); and a client that sends
-  TCP FIN mid-activation does not abort the in-flight spawn (the message loop
-  is blocked in the acquire) — the completed worker parks hot-idle for the
-  org's next connection.
+  destroy→create window is missed, and so is a `kill` against a connection that
+  authenticated but has never activated (no session for
+  `DestroySessionsForUser` to iterate and no registered conn-closer until the
+  first statement) — `disable` covers BOTH, because the activation/escalation
+  re-check refuses the session outright (28000); extending `kill` to
+  authed-but-unactivated connections is a named follow-up, not implemented; and
+  a client that sends TCP FIN mid-activation does not abort the in-flight spawn
+  (the message loop is blocked in the acquire) — the completed worker parks
+  hot-idle for the org's next connection.
 - Touching classification, the pin hooks, activation, escalation, the OOM
   retry, or the profile resolution → update `server/tier_classify_test.go`,
   `server/conn_tier_test.go`, `server/conn_tier_exec_test.go`,
@@ -601,7 +620,13 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
 - **Per-user kill switch** (`live.go` routes + `admin_providers.go` +
   `session_mgr.go::DestroySessionsForUser` + `configstore` `disabled` column):
   - `POST …/users/:username/kill` is a **one-shot** terminate — it tears down all
-    of a user's sessions + in-flight queries but does NOT block reconnects.
+    of a user's sessions + in-flight queries but does NOT block reconnects. It
+    reaches only connections that HAVE a session: on the exploratory worker tier
+    a connection that authenticated but has not yet run its first statement has
+    no session (and no registered conn-closer) for `DestroySessionsForUser` to
+    iterate, so `kill` misses it. Only `disable` covers that connection — its
+    first statement's activation re-check refuses the session with 28000.
+    Extending `kill` to authed-but-unactivated connections is a follow-up.
   - `POST …/users/:username/disable` is the **persistent block**: it sets the
     `duckgres_org_users.disabled` column (goose migration
     `000011_add_org_user_disabled.sql`), kills the user's live sessions, AND

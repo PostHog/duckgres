@@ -171,12 +171,30 @@ holds neither a session nor a registered conn-closer.
 - **A one-shot `kill` landing exactly inside the window is an accepted miss.**
   `kill` is documented best-effort (terminate now, no reconnect block), and the
   miss is bounded by one worker acquire + session init. The e2e kill assertions
-  run against steady-state connections, not mid-escalation ones.
+  run against steady-state connections, not mid-escalation ones. The same gap
+  covers a lazily-activated connection that has authenticated but never run a
+  statement — it has no session and no registered conn-closer, so `kill` cannot
+  see it at all (not just for a bounded window); `disable` still covers it, via
+  the activation-time re-check that refuses the session with 28000. Extending
+  `kill` to authed-but-unactivated connections is a follow-up.
 
 ### 6. Observability & tests
 
-- `duckgres_exploratory_escalations_total{reason="oom"|"state"|"heuristic"}`,
-  tier label on acquire metrics, tier tag in the query log.
+As shipped:
+
+- `duckgres_exploratory_escalations_total{reason="oom"|"state"|"heuristic",
+  outcome="ok"|"canceled"|"capacity"|"draining"|"disabled"|"error"}` — every
+  escalation ATTEMPT, so failures are visible and not just successes.
+- `duckgres_session_activation_total{org,outcome}` +
+  `duckgres_session_activation_duration_seconds{org}` for the lazy
+  first-statement acquisition, whose capacity/draining/admission failures no
+  longer land in the connect-time `duckgres_session_start_*` metrics. Its
+  failure labels come from the same `server.AcquisitionFailureOutcome` helper as
+  the escalation counter's, so the label sets cannot drift.
+- A `worker_tier` column in the query log (`exploratory` | `standard`),
+  rather than the tier label on acquire metrics this section originally
+  sketched: the acquire metrics are per-worker-pool, while the question asked in
+  practice ("which tier ran this statement?") is per-statement.
 - Unit: classification, escalation state machine, profile resolution.
 - e2e (`tests/mw-dev/e2e/harness.sh`): small-first claim; heavy-query
   escalation returns correct results; state-mutation pin; GUC bypass;

@@ -1755,7 +1755,7 @@ exploratory_state_pin() { # org password catalog target_cpu
 #    org; we count those lines in the window this assertion ran. (The :9090
 #    metrics port is NetworkPolicy-blocked from this in-cluster Job — see
 #    connection_duration_logged — so the CP log is the available signal for
-#    duckgres_exploratory_escalations_total{reason="oom"}.)
+#    duckgres_exploratory_escalations_total{reason="oom",outcome="ok"}.)
 #
 # Needs an escalation target with MORE memory than the small shape, which this
 # deployment's pool default (1536Mi < 2Gi) is not — so it sets the org default
