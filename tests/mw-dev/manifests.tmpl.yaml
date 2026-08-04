@@ -288,6 +288,26 @@ spec:
             # the post-anti-affinity packing behavior.
             - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "${DUCKGRES_K8S_WORKER_CPU_REQUEST}" }
             - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "${DUCKGRES_K8S_WORKER_MEMORY_REQUEST}" }
+            # Exploratory worker tier (small-first routing): a connection that
+            # sends no duckgres.worker_* sizing GUCs starts with NO worker and
+            # its first engine-touching statement lands on this small shape;
+            # state-mutating statements (and an engine OOM) escalate it to the
+            # ESCALATION TARGET — the org default when set, else the pool
+            # default above. The harness asserts both halves
+            # (exploratory_tier / exploratory_state_pin / exploratory_oom_escalation).
+            #
+            # NOTE (CI sizing artifact): 1/2Gi is LARGER than this deployment's
+            # deliberately sub-1-CPU pool default (750m/1536Mi), so on an org
+            # with no org default an escalation lands on a SMALLER pod here.
+            # That is fine mechanically (the target is just "the shape a
+            # non-tiered connection would have started on") and it keeps both
+            # shapes distinct for the pod assertions; it is not the production
+            # intent. The OOM assertion therefore sets a real org default
+            # (2/8Gi) so the escalation target genuinely has more memory.
+            - { name: DUCKGRES_EXPLORATORY_TIER_ENABLED, value: "true" }
+            - { name: DUCKGRES_EXPLORATORY_WORKER_CPU, value: "1" }
+            - { name: DUCKGRES_EXPLORATORY_WORKER_MEMORY, value: "2Gi" }
+            - { name: DUCKGRES_EXPLORATORY_WORKER_TTL, value: "10m" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU, value: "1" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }
