@@ -1124,6 +1124,72 @@ func TestExtendedDescribeProbePins(t *testing.T) {
 	}
 }
 
+// TestExtendedDescribePortalProbePins is the Describe-PORTAL sibling of
+// TestExtendedDescribeProbePins — the branch psycopg and JDBC drive after Bind
+// runs the same executing probe, so it carries the same hook.
+func TestExtendedDescribePortalProbePins(t *testing.T) {
+	var order []string
+	small := &tierExecutor{name: "small", order: &order}
+	big := &tierExecutor{name: "big", order: &order, queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1}}, nil
+	}}
+	c, _, reasons := newExtendedTierConn(small, big)
+
+	if err := extParse(c, "s1", "SELECT n INTO t2 FROM t"); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := extBind(c, "p1", "s1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := c.runExtendedQueryMessage(c.handleDescribe, append([]byte("Pp1"), 0)); err != nil {
+		t.Fatalf("Describe portal: %v", err)
+	}
+	if len(*reasons) != 1 || (*reasons)[0] != escalateReasonState {
+		t.Fatalf("portal Describe probe did not pin: switcher reasons = %v", *reasons)
+	}
+	if len(small.queryCalls) != 0 {
+		t.Fatalf("portal Describe probed the exploratory worker: %v", small.queryCalls)
+	}
+	want := []string{"switch", "big:query"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("escalation did not precede the probe: %v, want %v", order, want)
+	}
+}
+
+// TestExtendedDescribeEscalationFailureIsConnectionFatal asserts a Describe
+// whose escalation fails terminates the connection instead of falling through
+// to a probe on a session that no longer exists. Describe runs outside any
+// query-metrics scope, so this also covers the escalation's error reporting on
+// that path.
+func TestExtendedDescribeEscalationFailureIsConnectionFatal(t *testing.T) {
+	small := &tierExecutor{name: "small"}
+	c, out, _ := newExtendedTierConn(small, nil)
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return nil, 0, "", errors.New("worker capacity exhausted for organization")
+	}
+
+	if err := extParse(c, "s1", "SELECT n INTO t2 FROM t"); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	err := extDescribeStmt(c, "s1")
+	if err == nil {
+		t.Fatal("Describe returned nil; a failed escalation must terminate the connection")
+	}
+	if !errors.Is(err, errConnectionFatal) {
+		t.Fatalf("error %v does not carry errConnectionFatal", err)
+	}
+	if len(small.queryCalls) != 0 {
+		t.Fatalf("Describe probed the dead exploratory session: %v", small.queryCalls)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if !hasErrorResponse(msgs, "FATAL", "53300") {
+		t.Fatalf("want FATAL 53300, got %s", describeErrorResponses(msgs))
+	}
+	if countMsgs(msgs, 'Z') != 0 {
+		t.Fatalf("ReadyForQuery sent after a connection-fatal failure: %s", describeMsgs(msgs))
+	}
+}
+
 // TestExtendedDescribeProbeSmallOKDoesNotPin is the negative control for the
 // Describe hook: probing a plain read must stay on the exploratory worker.
 func TestExtendedDescribeProbeSmallOKDoesNotPin(t *testing.T) {
