@@ -77,6 +77,7 @@ var queryLogColumns = []queryLogColumn{
 	{Name: "access_kinds", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return e.AccessKinds }},
 	{Name: "metadata_complete", PGType: "BOOLEAN", Arg: func(e QueryLogEntry) any { return e.MetadataComplete }},
 	{Name: "query_metadata", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return truncateQueryMetadata(e.QueryMetadata) }},
+	{Name: "worker_tier", PGType: "TEXT", Arg: func(e QueryLogEntry) any { return e.WorkerTier }},
 }
 
 // The registry is static, so everything derived from it is built once at init.

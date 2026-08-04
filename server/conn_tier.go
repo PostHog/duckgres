@@ -151,6 +151,19 @@ func (c *clientConn) escalateForSecretDDL(query string) error {
 	return c.escalateForPinningTier(query, usersecrets.Classify(query).Kind != usersecrets.KindNone)
 }
 
+// currentWorkerTier reports which worker tier the connection is executing on
+// right now, for the query-log worker_tier column. logQueryStart reads it
+// before escalation can happen, so a start event may say "exploratory" for a
+// statement that goes on to escalate; logQuery reads it after execution, so
+// the terminal event always reflects the tier the statement ULTIMATELY ran
+// on. Both are correct for what each event represents.
+func (c *clientConn) currentWorkerTier() string {
+	if c.onExploratoryWorker {
+		return "exploratory"
+	}
+	return "standard"
+}
+
 // escalateForPinningTier is escalateForPinningStatement for callers that
 // already know the classification — the extended protocol classifies once, at
 // Parse (preparedStmt.pinsWorker), rather than re-parsing at every Describe and

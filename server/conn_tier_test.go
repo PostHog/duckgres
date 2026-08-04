@@ -54,3 +54,15 @@ func TestEscalateWorkerFailureKeepsState(t *testing.T) {
 		t.Fatal("failed escalation must not mark the connection pinned")
 	}
 }
+
+func TestCurrentWorkerTier(t *testing.T) {
+	exploratory := &clientConn{onExploratoryWorker: true}
+	if got := exploratory.currentWorkerTier(); got != "exploratory" {
+		t.Fatalf("currentWorkerTier() on exploratory worker = %q, want %q", got, "exploratory")
+	}
+
+	standard := &clientConn{onExploratoryWorker: false}
+	if got := standard.currentWorkerTier(); got != "standard" {
+		t.Fatalf("currentWorkerTier() off exploratory worker = %q, want %q", got, "standard")
+	}
+}

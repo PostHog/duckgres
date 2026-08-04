@@ -458,6 +458,7 @@ func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
 		QueryMetadata:    encodedMeta,
 		AccessKinds:      accessKinds,
 		MetadataComplete: metaComplete,
+		WorkerTier:       c.currentWorkerTier(),
 	})
 }
 
@@ -577,6 +578,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		QueryMetadata:         encodedMeta,
 		AccessKinds:           accessKinds,
 		MetadataComplete:      metaComplete,
+		WorkerTier:            c.currentWorkerTier(),
 	})
 }
 

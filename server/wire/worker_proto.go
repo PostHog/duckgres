@@ -139,6 +139,11 @@ type QueryLogEntry struct {
 	// statement. A consumer that gates on QueryMetadata must treat false as
 	// "unknown", never as "nothing touched".
 	MetadataComplete bool
+
+	// WorkerTier is which worker tier executed the statement: "exploratory"
+	// (the small warm worker) or "standard". Recorded at statement start; a
+	// statement that triggered escalation logs the tier it ULTIMATELY ran on.
+	WorkerTier string
 }
 
 // WorkerQueryLogPayload carries a batch of completed query-log entries to the

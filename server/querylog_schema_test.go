@@ -33,6 +33,22 @@ func TestQueryLogRegistryGeneratesEveryColumnSurface(t *testing.T) {
 		t.Fatalf("insert args = %d, entry columns = %d", len(args), len(entryColumns))
 	}
 
+	// worker_tier must round-trip through the registry's own argument order,
+	// not just exist as a struct field.
+	tierArgs := queryLogEntryInsertArgs(QueryLogEntry{WorkerTier: "exploratory"})
+	found := false
+	for i, column := range entryColumns {
+		if column.Name == "worker_tier" {
+			found = true
+			if tierArgs[i] != "exploratory" {
+				t.Fatalf("worker_tier insert arg = %v, want %q", tierArgs[i], "exploratory")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("worker_tier column missing from queryLogEntryColumns")
+	}
+
 	createSQL := postgresQueryLogCreateTableSQL()
 	viewSQL := duckLakeQueryLogViewSelectSQL()
 	repairList := postgresQueryLogColumns
