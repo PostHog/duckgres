@@ -1351,6 +1351,15 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		if parseErr == nil && len(tree.Stmts) == 1 {
 			switch s := tree.Stmts[0].Stmt.Node.(type) {
 			case *pg_query.Node_DeclareCursorStmt:
+				// DECLARE is session state: it opens a worker-side RowSet that
+				// lives across statements, so it must pin before the cursor is
+				// opened. Otherwise a later pinning statement destroys the
+				// session out from under the open cursor and strands it.
+				// FETCH/CLOSE need no hook — an open cursor proves its DECLARE
+				// already pinned this connection.
+				if err := c.escalateForPinningStatement(query); err != nil {
+					return err
+				}
 				return c.handleDeclareCursor(query, s.DeclareCursorStmt)
 			case *pg_query.Node_FetchStmt:
 				return c.handleFetchCursor(query, s.FetchStmt)
@@ -1410,13 +1419,10 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		// small worker exists to avoid. This is exactly what
 		// classifyStatementTier already says (a CopyStmt hits its pinning
 		// default), so escalate unconditionally rather than re-deriving a
-		// direction here; shouldHandleCopyBeforeTranspile matches by prefix and
-		// catches spellings pg_query cannot parse at all.
-		if c.onExploratoryWorker {
-			if err := c.escalateWorker(c.ctx, escalateReasonState); err != nil {
-				return c.failWorkerEscalation(query, err,
-					fmt.Sprintf("could not allocate a standard worker for this statement: %v", err))
-			}
+		// direction here; shouldHandleCopyBeforeTranspile matches by prefix, and
+		// a spelling pg_query cannot parse at all pins too.
+		if err := c.escalateForPinningStatement(query); err != nil {
+			return err
 		}
 		return c.handleCopy(query, upperQueryEarly)
 	}

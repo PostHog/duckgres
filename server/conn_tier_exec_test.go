@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -103,13 +103,79 @@ func countMsgs(msgs []wireMsg, typ byte) int {
 	return n
 }
 
-// fatalErrorResponseWith reports whether msgs carry a FATAL-severity
-// ErrorResponse containing all of wants. Severity is written both as the
-// localized ('M'/'S') fields; matching the literal "FATAL" byte-string in the
-// body is enough to distinguish it from "ERROR".
-func fatalErrorResponseWith(msgs []wireMsg, wants ...string) bool {
-	all := append([]string{"FATAL"}, wants...)
-	return errorResponseWith(msgs, all...)
+// errorFields is a decoded ErrorResponse: the wire body is a sequence of
+// (field-type byte, NUL-terminated value) pairs ending in a zero byte, so the
+// severity ('S'), SQLSTATE ('C') and message ('M') are read as FIELDS rather
+// than substring-matched against the whole body — otherwise a "FATAL" or a
+// SQLSTATE-looking token appearing in the error TEXT would satisfy the
+// assertion.
+type errorFields struct {
+	severity string
+	code     string
+	message  string
+}
+
+func decodeErrorResponses(msgs []wireMsg) []errorFields {
+	var out []errorFields
+	for _, m := range msgs {
+		if m.typ != 'E' {
+			continue
+		}
+		var f errorFields
+		for i := 0; i < len(m.body) && m.body[i] != 0; {
+			typ := m.body[i]
+			end := bytes.IndexByte(m.body[i+1:], 0)
+			if end < 0 {
+				break
+			}
+			value := string(m.body[i+1 : i+1+end])
+			switch typ {
+			case 'S':
+				f.severity = value
+			case 'C':
+				f.code = value
+			case 'M':
+				f.message = value
+			}
+			i += 1 + end + 1
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// hasErrorResponse reports whether msgs carry an ErrorResponse with exactly
+// this severity and SQLSTATE, whose message contains every wantsInMessage
+// substring.
+func hasErrorResponse(msgs []wireMsg, severity, code string, wantsInMessage ...string) bool {
+	for _, f := range decodeErrorResponses(msgs) {
+		if f.severity != severity || f.code != code {
+			continue
+		}
+		ok := true
+		for _, w := range wantsInMessage {
+			if !strings.Contains(f.message, w) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+// describeErrorResponses renders the decoded ErrorResponses for failure output.
+func describeErrorResponses(msgs []wireMsg) string {
+	var b strings.Builder
+	for _, f := range decodeErrorResponses(msgs) {
+		fmt.Fprintf(&b, "[%s %s %q]", f.severity, f.code, f.message)
+	}
+	if b.Len() == 0 {
+		return "<no ErrorResponse>"
+	}
+	return b.String()
 }
 
 // --- 1. pinning statements escalate BEFORE the executor sees them -------
@@ -219,6 +285,95 @@ func TestWritableCTEPinsBeforeExecute(t *testing.T) {
 	}
 }
 
+// TestDeclareCursorPinsBeforeExecute asserts DECLARE escalates at DECLARE
+// time. A cursor is session state whose worker-side RowSet outlives the
+// statement that opened it, so if DECLARE did not pin, a later pinning
+// statement would destroy the session out from under the open cursor and
+// strand it. FETCH/CLOSE need no hook of their own — this test proves it by
+// running a pinning statement BETWEEN two FETCHes and showing the switcher
+// fired exactly once, at DECLARE.
+func TestDeclareCursorPinsBeforeExecute(t *testing.T) {
+	var order []string
+	small := &tierExecutor{name: "small", order: &order}
+	big := &tierExecutor{name: "big", order: &order, queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1, 2}}, nil
+	}}
+	c, _ := newBufferedConn(small)
+	c.cursors = make(map[string]*cursorState)
+	c.onExploratoryWorker = true
+	var reasons []string
+	c.workerSwitcher = func(_ context.Context, reason string) (QueryExecutor, int, string, error) {
+		reasons = append(reasons, reason)
+		order = append(order, "switch")
+		return big, 9, "worker-9", nil
+	}
+
+	if err := c.handleQuery([]byte("DECLARE cur CURSOR FOR SELECT n FROM t\x00")); err != nil {
+		t.Fatalf("handleQuery(DECLARE): %v", err)
+	}
+	if len(reasons) != 1 || reasons[0] != escalateReasonState {
+		t.Fatalf("DECLARE did not pin: switcher reasons = %v, want [%q]", reasons, escalateReasonState)
+	}
+	if c.onExploratoryWorker {
+		t.Fatal("connection still on the exploratory tier after DECLARE")
+	}
+
+	// The cursor's RowSet opens lazily on the first FETCH — on the pinned
+	// worker, because DECLARE already escalated.
+	if err := c.handleQuery([]byte("FETCH 1 FROM cur\x00")); err != nil {
+		t.Fatalf("handleQuery(FETCH): %v", err)
+	}
+	if len(small.queryCalls) != 0 {
+		t.Fatalf("cursor opened on the exploratory worker: %v", small.queryCalls)
+	}
+	if len(big.queryCalls) != 1 {
+		t.Fatalf("standard worker query calls = %v, want one (the cursor open)", big.queryCalls)
+	}
+
+	// A pinning statement mid-cursor must not escalate again (the pin is
+	// sticky), so the session backing the open cursor survives.
+	if err := c.handleQuery([]byte("CREATE TEMP TABLE x (a INT)\x00")); err != nil {
+		t.Fatalf("handleQuery(CREATE TEMP TABLE): %v", err)
+	}
+	if len(reasons) != 1 {
+		t.Fatalf("switcher fired again after DECLARE (%v) — the cursor's session would have been destroyed", reasons)
+	}
+	if err := c.handleQuery([]byte("FETCH 1 FROM cur\x00")); err != nil {
+		t.Fatalf("handleQuery(second FETCH): %v", err)
+	}
+	if len(big.queryCalls) != 1 {
+		t.Fatalf("cursor was re-opened (%v); it must still be the original RowSet", big.queryCalls)
+	}
+}
+
+// TestDeclareCursorEscalationFailureIsConnectionFatal asserts a DECLARE whose
+// escalation fails terminates the connection instead of registering a cursor
+// against a session that no longer exists.
+func TestDeclareCursorEscalationFailureIsConnectionFatal(t *testing.T) {
+	small := &tierExecutor{name: "small"}
+	c, out := newBufferedConn(small)
+	c.cursors = make(map[string]*cursorState)
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return nil, 0, "", errors.New("worker capacity exhausted for organization")
+	}
+
+	err := c.handleQuery([]byte("DECLARE cur CURSOR FOR SELECT n FROM t\x00"))
+	if err == nil {
+		t.Fatal("handleQuery returned nil; a failed escalation must terminate the connection")
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if !hasErrorResponse(msgs, "FATAL", "53300") {
+		t.Fatalf("want FATAL 53300, got %s", describeErrorResponses(msgs))
+	}
+	if countMsgs(msgs, 'Z') != 0 {
+		t.Fatalf("ReadyForQuery sent after a connection-fatal failure: %s", describeMsgs(msgs))
+	}
+	if len(c.cursors) != 0 {
+		t.Fatalf("cursor registered despite the failed escalation: %v", c.cursors)
+	}
+}
+
 // TestCopyPinsBeforeExecute asserts COPY escalates before it is handled. COPY
 // is routed to handleCopy ABOVE the transpile-time classification hook, so
 // without a dedicated hook it would run on the exploratory worker unpinned.
@@ -289,8 +444,8 @@ func TestCopyEscalationFailureIsConnectionFatal(t *testing.T) {
 				t.Fatal("handleQuery returned nil; a failed escalation must terminate the connection")
 			}
 			msgs := parseWireMsgs(t, out.Bytes())
-			if !fatalErrorResponseWith(msgs, "53300") {
-				t.Fatalf("want FATAL 53300, got %s", describeMsgs(msgs))
+			if !hasErrorResponse(msgs, "FATAL", "53300") {
+				t.Fatalf("want FATAL 53300, got %s", describeErrorResponses(msgs))
 			}
 			if countMsgs(msgs, 'Z') != 0 {
 				t.Fatalf("ReadyForQuery sent after a connection-fatal failure: %s", describeMsgs(msgs))
@@ -332,8 +487,8 @@ func TestSimpleQueryEscalationFailureIsConnectionFatal(t *testing.T) {
 				t.Fatal("handleQuery returned nil; a failed escalation must terminate the connection")
 			}
 			msgs := parseWireMsgs(t, out.Bytes())
-			if !fatalErrorResponseWith(msgs, tc.wantCode) {
-				t.Fatalf("want FATAL ErrorResponse with %s, got %s", tc.wantCode, describeMsgs(msgs))
+			if !hasErrorResponse(msgs, "FATAL", tc.wantCode) {
+				t.Fatalf("want FATAL ErrorResponse with %s, got %s", tc.wantCode, describeErrorResponses(msgs))
 			}
 			if countMsgs(msgs, 'Z') != 0 {
 				t.Fatalf("ReadyForQuery sent after a connection-fatal escalation failure: %s", describeMsgs(msgs))
@@ -438,8 +593,8 @@ func TestSelectPrepareOOMEscalationFailureIsConnectionFatal(t *testing.T) {
 		t.Fatal("handleQuery returned nil; a failed OOM escalation must terminate the connection")
 	}
 	msgs := parseWireMsgs(t, out.Bytes())
-	if !fatalErrorResponseWith(msgs, "53300", "Out of Memory Error") {
-		t.Fatalf("want FATAL 53300 carrying the original OOM error, got %s", describeMsgs(msgs))
+	if !hasErrorResponse(msgs, "FATAL", "53300", "Out of Memory Error") {
+		t.Fatalf("want FATAL 53300 carrying the original OOM error, got %s", describeErrorResponses(msgs))
 	}
 	if countMsgs(msgs, 'Z') != 0 {
 		t.Fatalf("ReadyForQuery sent after a connection-fatal escalation failure: %s", describeMsgs(msgs))
@@ -467,8 +622,8 @@ func TestSelectPrepareOOMOffTierSurfaces(t *testing.T) {
 		t.Fatalf("off-tier connection escalated (%d switcher calls)", switched)
 	}
 	msgs := parseWireMsgs(t, out.Bytes())
-	if !errorResponseWith(msgs, "Out of Memory Error") || fatalErrorResponseWith(msgs) {
-		t.Fatalf("want a non-fatal ERROR carrying the OOM: %s", describeMsgs(msgs))
+	if !hasErrorResponse(msgs, "ERROR", "XX000", "Out of Memory Error") {
+		t.Fatalf("want a non-fatal ERROR carrying the OOM: %s", describeErrorResponses(msgs))
 	}
 	if countMsgs(msgs, 'Z') != 1 {
 		t.Fatalf("want one ReadyForQuery: %s", describeMsgs(msgs))
@@ -498,8 +653,8 @@ func TestSelectPrepareOOMInTransactionSurfaces(t *testing.T) {
 		t.Fatalf("in-transaction OOM escalated (%d switcher calls)", switched)
 	}
 	msgs := parseWireMsgs(t, out.Bytes())
-	if !errorResponseWith(msgs, "Out of Memory Error") {
-		t.Fatalf("want the OOM surfaced: %s", describeMsgs(msgs))
+	if !hasErrorResponse(msgs, "ERROR", "XX000", "Out of Memory Error") {
+		t.Fatalf("want the OOM surfaced: %s", describeErrorResponses(msgs))
 	}
 }
 
@@ -531,8 +686,8 @@ func TestSelectMidStreamOOMAfterRowsSurfaces(t *testing.T) {
 	if got := countMsgs(msgs, 'D'); got != 2 {
 		t.Fatalf("DataRow count = %d, want 2: %s", got, describeMsgs(msgs))
 	}
-	if !errorResponseWith(msgs, "42000", "Out of Memory Error") {
-		t.Fatalf("want ERROR 42000 carrying the OOM: %s", describeMsgs(msgs))
+	if !hasErrorResponse(msgs, "ERROR", "42000", "Out of Memory Error") {
+		t.Fatalf("want ERROR 42000 carrying the OOM: %s", describeErrorResponses(msgs))
 	}
 	if countMsgs(msgs, 'Z') != 1 {
 		t.Fatalf("want one ReadyForQuery: %s", describeMsgs(msgs))
