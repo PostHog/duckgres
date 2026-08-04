@@ -315,6 +315,37 @@ func TestClientSuppliedWorkerGUCs(t *testing.T) {
 	}
 }
 
+// TestUseExploratoryTierExclusions pins every condition that keeps a
+// connection off the exploratory tier. The passthrough exclusion is
+// load-bearing beyond efficiency: server's executeQueryDirect (the
+// passthrough-only execution path) carries no tier hooks, so a passthrough
+// connection must never start on the exploratory worker.
+func TestUseExploratoryTierExclusions(t *testing.T) {
+	profile := &WorkerProfile{CPU: "1", Memory: "2Gi"}
+	remote := &ControlPlane{
+		isRemoteBackend: true,
+		cfg:             ControlPlaneConfig{K8s: K8sConfig{AllowClientWorkerProfile: true}},
+	}
+
+	if !remote.useExploratoryTier(profile, false, nil) {
+		t.Fatal("a plain remote-backend connection must use the exploratory tier")
+	}
+	if remote.useExploratoryTier(profile, true, nil) {
+		t.Fatal("passthrough users must be excluded from the exploratory tier")
+	}
+	if remote.useExploratoryTier(nil, false, nil) {
+		t.Fatal("a nil exploratory profile (tier off/half-configured) must degrade to today's behavior")
+	}
+	if remote.useExploratoryTier(profile, false, map[string]string{"duckgres.worker_cpu": "4"}) {
+		t.Fatal("a client-supplied worker shape must bypass the exploratory tier")
+	}
+
+	local := &ControlPlane{isRemoteBackend: false, cfg: remote.cfg}
+	if local.useExploratoryTier(profile, false, nil) {
+		t.Fatal("non-remote backends have no worker pods to size")
+	}
+}
+
 // The real config store must satisfy ConfigStoreInterface, including the
 // OrgUserSessionQueryAccess accessor the exploratory switcher's post-escalation
 // disabled re-check calls. Asserted here because the !kubernetes build never

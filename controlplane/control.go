@@ -1185,8 +1185,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	for _, w := range explWarns {
 		clog.Warn("Exploratory tier config problem.", "detail", w)
 	}
-	useExploratory := cp.isRemoteBackend && explProfile != nil &&
-		!clientSuppliedWorkerGUCs(cp.cfg.K8s, startupOptions)
+	useExploratory := cp.useExploratoryTier(explProfile, passthroughUser, startupOptions)
 	initialProfile := workerProfile
 	// Log the shape the connection actually STARTS on, once, so support never
 	// sees two adjacent lines disagreeing about it. On the exploratory tier the

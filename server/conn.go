@@ -1403,6 +1403,21 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// c.reader directly, which would race with the disconnect monitor.
 	upperQueryEarly := strings.ToUpper(query)
 	if shouldHandleCopyBeforeTranspile(query) {
+		// COPY is routed above the classification hook below, so it must be
+		// classified here or it would run on the exploratory worker unpinned.
+		// EVERY COPY pins, in both directions: COPY FROM writes, and COPY TO
+		// STDOUT streams a whole relation through the worker — the shape the
+		// small worker exists to avoid. This is exactly what
+		// classifyStatementTier already says (a CopyStmt hits its pinning
+		// default), so escalate unconditionally rather than re-deriving a
+		// direction here; shouldHandleCopyBeforeTranspile matches by prefix and
+		// catches spellings pg_query cannot parse at all.
+		if c.onExploratoryWorker {
+			if err := c.escalateWorker(c.ctx, escalateReasonState); err != nil {
+				return c.failWorkerEscalation(query, err,
+					fmt.Sprintf("could not allocate a standard worker for this statement: %v", err))
+			}
+		}
 		return c.handleCopy(query, upperQueryEarly)
 	}
 

@@ -77,11 +77,11 @@ func (e *tierExecutor) ExecContext(_ context.Context, query string, _ ...any) (E
 	return &fakeExecResult{}, nil
 }
 
-func (e *tierExecutor) Query(string, ...any) (RowSet, error) {
-	return nil, errors.New("not implemented")
+func (e *tierExecutor) Query(query string, args ...any) (RowSet, error) {
+	return e.QueryContext(context.Background(), query, args...)
 }
-func (e *tierExecutor) Exec(string, ...any) (ExecResult, error) {
-	return nil, errors.New("not implemented")
+func (e *tierExecutor) Exec(query string, args ...any) (ExecResult, error) {
+	return e.ExecContext(context.Background(), query, args...)
 }
 func (e *tierExecutor) ConnContext(context.Context) (RawConn, error) {
 	return nil, errors.New("not implemented")
@@ -216,6 +216,89 @@ func TestWritableCTEPinsBeforeExecute(t *testing.T) {
 	}
 	if len(order) == 0 || order[0] != "switch" {
 		t.Fatalf("escalation did not precede execution: %v", order)
+	}
+}
+
+// TestCopyPinsBeforeExecute asserts COPY escalates before it is handled. COPY
+// is routed to handleCopy ABOVE the transpile-time classification hook, so
+// without a dedicated hook it would run on the exploratory worker unpinned.
+// Every COPY pins in BOTH directions — COPY FROM writes, and COPY TO STDOUT
+// streams a whole relation through the worker — matching classifyStatementTier.
+func TestCopyPinsBeforeExecute(t *testing.T) {
+	// A file COPY (neither TO STDOUT nor FROM STDIN) takes handleCopy's
+	// pass-through-to-DuckDB branch: one Exec, and crucially no reads from the
+	// client socket, so the assertion is deterministic in unit scope.
+	const fileCopy = "COPY t TO 's3://bucket/o.parquet' (FORMAT parquet)"
+
+	var order []string
+	small := &tierExecutor{name: "small", order: &order}
+	big := &tierExecutor{name: "big", order: &order}
+	c, out := newBufferedConn(small)
+	c.onExploratoryWorker = true
+	var reasons []string
+	c.workerSwitcher = func(_ context.Context, reason string) (QueryExecutor, int, string, error) {
+		reasons = append(reasons, reason)
+		order = append(order, "switch")
+		return big, 9, "worker-9", nil
+	}
+
+	if err := c.handleQuery([]byte(fileCopy + "\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+	if len(reasons) != 1 || reasons[0] != escalateReasonState {
+		t.Fatalf("switcher reasons = %v, want [%q]", reasons, escalateReasonState)
+	}
+	if len(small.execCalls) != 0 || len(small.queryCalls) != 0 {
+		t.Fatalf("exploratory worker saw the COPY: exec=%v query=%v", small.execCalls, small.queryCalls)
+	}
+	if len(big.execCalls) != 1 {
+		t.Fatalf("standard worker exec calls = %v, want exactly one", big.execCalls)
+	}
+	want := []string{"switch", "big:exec"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("execution order = %v, want %v", order, want)
+	}
+	if c.onExploratoryWorker {
+		t.Fatal("connection still on the exploratory tier after a COPY")
+	}
+	if msgs := parseWireMsgs(t, out.Bytes()); countMsgs(msgs, 'E') != 0 {
+		t.Fatalf("unexpected ErrorResponse: %s", describeMsgs(msgs))
+	}
+}
+
+// TestCopyEscalationFailureIsConnectionFatal asserts a COPY whose escalation
+// fails terminates the connection with a FATAL, and — for COPY FROM STDIN —
+// never enters handleCopy (which would otherwise start reading CopyData from a
+// client whose session is already gone).
+func TestCopyEscalationFailureIsConnectionFatal(t *testing.T) {
+	for _, q := range []string{
+		"COPY t FROM STDIN",
+		"COPY t TO STDOUT",
+		"COPY t TO 's3://bucket/o.parquet' (FORMAT parquet)",
+	} {
+		t.Run(q, func(t *testing.T) {
+			small := &tierExecutor{name: "small"}
+			c, out := newBufferedConn(small)
+			c.onExploratoryWorker = true
+			c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+				return nil, 0, "", errors.New("worker capacity exhausted for organization")
+			}
+
+			err := c.handleQuery([]byte(q + "\x00"))
+			if err == nil {
+				t.Fatal("handleQuery returned nil; a failed escalation must terminate the connection")
+			}
+			msgs := parseWireMsgs(t, out.Bytes())
+			if !fatalErrorResponseWith(msgs, "53300") {
+				t.Fatalf("want FATAL 53300, got %s", describeMsgs(msgs))
+			}
+			if countMsgs(msgs, 'Z') != 0 {
+				t.Fatalf("ReadyForQuery sent after a connection-fatal failure: %s", describeMsgs(msgs))
+			}
+			if len(small.execCalls) != 0 || len(small.queryCalls) != 0 {
+				t.Fatalf("COPY ran on the dead exploratory session: exec=%v query=%v", small.execCalls, small.queryCalls)
+			}
+		})
 	}
 }
 
