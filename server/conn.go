@@ -1207,19 +1207,22 @@ func (c *clientConn) messageLoop() error {
 			// resynchronizes the client.
 			c.ignoreTillSync = false
 			if err := c.handleQuery(body); err != nil {
+				// A connection-fatal error (today: a failed exploratory-tier
+				// escalation, whose switcher already destroyed the previous
+				// session) has sent a FATAL ErrorResponse and deliberately no
+				// ReadyForQuery. There is nothing left to resynchronize to, so
+				// unwind instead of reading the next message. Checked BEFORE
+				// isConnectionBroken: the cause is server-side even when its
+				// text mentions a refused/reset connection to a worker.
+				if errors.Is(err, errConnectionFatal) {
+					c.logger().Error("Query error.", "error", err)
+					return err
+				}
 				if isConnectionBroken(err) {
 					c.logger().Info("Client connection lost during query.", "error", err)
 					return nil
 				}
 				c.logger().Error("Query error.", "error", err)
-				// A connection-fatal error (today: a failed exploratory-tier
-				// escalation, whose switcher already destroyed the previous
-				// session) has sent a FATAL ErrorResponse and deliberately no
-				// ReadyForQuery. There is nothing left to resynchronize to, so
-				// unwind instead of reading the next message.
-				if errors.Is(err, errConnectionFatal) {
-					return err
-				}
 			}
 			if c.drainRequested.Load() {
 				return nil
