@@ -94,6 +94,14 @@ type preparedStmt struct {
 	cursorQuery       string   // Transpiled inner SELECT (for DECLARE)
 	fetchCount        int64    // FETCH row count
 	cursorIsMove      bool     // FETCH is a MOVE: advance position without returning rows
+
+	// pinsWorker is the exploratory-tier classification, computed ONCE at
+	// Parse (from the parse tree Parse already builds) instead of re-parsing
+	// on every Execute of the same statement. Describe and Execute escalate
+	// the connection off the exploratory small worker before a pinning
+	// statement reaches the executor — including Describe, whose LIMIT-0
+	// schema probe really executes the statement.
+	pinsWorker bool
 }
 
 type portal struct {
@@ -234,6 +242,16 @@ type clientConn struct {
 	// concurrently with executor use — so no locking.
 	onExploratoryWorker bool
 	workerSwitcher      WorkerSwitcher
+
+	// fatalErr parks a connection-terminating error raised inside an
+	// extended-query handler. Those handlers are void (the protocol reports
+	// their failures as ErrorResponse + skip-until-Sync), but a failed tier
+	// escalation has already destroyed the session, so there is nothing to
+	// resynchronize to: failWorkerEscalation records the error here and
+	// runExtendedQueryMessage hands it to the message loop, which returns.
+	// Set on the message-loop goroutine, read by it, and never cleared — the
+	// connection is on its way out.
+	fatalErr error
 
 	// teamID is the PostHog Team.id this connection is attributed to for product
 	// analytics (the connecting user's team, else the org's oldest team; 0 when
@@ -1229,21 +1247,35 @@ func (c *clientConn) messageLoop() error {
 			}
 			atReadyBoundary = true
 
+		// The extended-query handlers report their own errors to the client and
+		// arm skip-until-Sync; the error returned here is ONLY the
+		// connection-fatal kind (a failed exploratory-tier escalation, whose
+		// FATAL ErrorResponse is already flushed and whose session is gone), so
+		// it unwinds the loop with no ReadyForQuery — same contract as
+		// handleQuery's errConnectionFatal above.
 		case wire.MsgParse:
 			// Extended query protocol - Parse
-			c.runExtendedQueryMessage(c.handleParse, body)
+			if err := c.runExtendedQueryMessage(c.handleParse, body); err != nil {
+				return err
+			}
 
 		case wire.MsgBind:
 			// Extended query protocol - Bind
-			c.runExtendedQueryMessage(c.handleBind, body)
+			if err := c.runExtendedQueryMessage(c.handleBind, body); err != nil {
+				return err
+			}
 
 		case wire.MsgDescribe:
 			// Extended query protocol - Describe
-			c.runExtendedQueryMessage(c.handleDescribe, body)
+			if err := c.runExtendedQueryMessage(c.handleDescribe, body); err != nil {
+				return err
+			}
 
 		case wire.MsgExecute:
 			// Extended query protocol - Execute
-			c.runExtendedQueryMessage(c.handleExecute, body)
+			if err := c.runExtendedQueryMessage(c.handleExecute, body); err != nil {
+				return err
+			}
 
 		case wire.MsgSync:
 			// Extended query protocol - Sync: ends any skip-until-Sync error
@@ -1260,7 +1292,9 @@ func (c *clientConn) messageLoop() error {
 
 		case wire.MsgClose:
 			// Extended query protocol - Close
-			c.runExtendedQueryMessage(c.handleClose, body)
+			if err := c.runExtendedQueryMessage(c.handleClose, body); err != nil {
+				return err
+			}
 
 		case wire.MsgFlush:
 			// Discarded during skip-until-Sync error recovery, like real

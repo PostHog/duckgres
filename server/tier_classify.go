@@ -23,7 +23,16 @@ const (
 
 func classifyStatementTier(sql string) statementTier {
 	tree, err := pg_query.Parse(sql)
-	if err != nil {
+	return classifyParsedTier(tree, err)
+}
+
+// classifyParsedTier is classifyStatementTier over an ALREADY-parsed
+// statement, for callers that have the tree in hand (extended-protocol Parse
+// builds one for cursor detection) so the classification costs no second
+// pg_query.Parse. A parse failure — which is how DuckDB-only spellings arrive —
+// pins, same as classifyStatementTier.
+func classifyParsedTier(tree *pg_query.ParseResult, parseErr error) statementTier {
+	if parseErr != nil || tree == nil {
 		return tierPinning
 	}
 	for _, raw := range tree.Stmts {

@@ -95,13 +95,19 @@ func escalationErrorSQLState(err error) string {
 // clientMessage is what the client sees: the escalation failure itself for a
 // pinning statement, or the original query error for an OOM re-execute whose
 // escalation could not be completed.
+//
+// The error is BOTH returned and parked on c.fatalErr: the simple-query path
+// returns it up through handleQuery, while the extended-query handlers are void
+// and rely on runExtendedQueryMessage reading it back for the message loop.
 func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMessage string) error {
 	if !c.isCallerCancellation(escErr) {
 		c.logQueryError(query, escErr)
 	}
 	c.sendError("FATAL", escalationErrorSQLState(escErr), clientMessage)
 	_ = c.flushWriter()
-	return fmt.Errorf("%w: exploratory worker escalation failed: %w", errConnectionFatal, escErr)
+	err := fmt.Errorf("%w: exploratory worker escalation failed: %w", errConnectionFatal, escErr)
+	c.fatalErr = err
+	return err
 }
 
 // escalateForPinningStatement escalates the connection off the exploratory
@@ -110,7 +116,20 @@ func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMess
 // connection-terminating error when the escalation fails; nil otherwise
 // (including for every connection that is not on the exploratory tier).
 func (c *clientConn) escalateForPinningStatement(query string) error {
-	if !c.onExploratoryWorker || classifyStatementTier(query) != tierPinning {
+	// The classification is deliberately behind the tier check: an off-tier
+	// connection must not pay pg_query.Parse on every statement.
+	if !c.onExploratoryWorker {
+		return nil
+	}
+	return c.escalateForPinningTier(query, classifyStatementTier(query) == tierPinning)
+}
+
+// escalateForPinningTier is escalateForPinningStatement for callers that
+// already know the classification — the extended protocol classifies once, at
+// Parse (preparedStmt.pinsWorker), rather than re-parsing at every Describe and
+// Execute of the same prepared statement.
+func (c *clientConn) escalateForPinningTier(query string, pins bool) error {
+	if !c.onExploratoryWorker || !pins {
 		return nil
 	}
 	if err := c.escalateWorker(c.ctx, escalateReasonState); err != nil {

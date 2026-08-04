@@ -261,7 +261,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 		typeOIDs[i] = getTypeInfo(ct).OID
 	}
 
-	stream := c.streamSelectRows(rows, cols, colTypes, typeOIDs, true)
+	stream := c.streamSelectRows(rows, cols, colTypes, typeOIDs, true, nil, 0)
 
 	// Exploratory tier: an OOM raised before a SINGLE DataRow reached the
 	// client is still re-executable on a normal-size worker — all the client
@@ -281,7 +281,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 			stream.rowsErr = retryErr
 		} else {
 			defer func() { _ = retryRows.Close() }()
-			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false)
+			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false, nil, 0)
 		}
 	}
 
@@ -363,7 +363,13 @@ type selectStream struct {
 // of rows. Extracted from executeSelectQuery so the exploratory tier can retry
 // a zero-row OOM stream on the escalated worker WITHOUT resending
 // RowDescription — pass sendRowDesc=false on such a retry.
-func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []ColumnTyper, typeOIDs []int32, sendRowDesc bool) selectStream {
+//
+// formats are the Bind result-format codes (nil = all text, the simple-query
+// case). maxRows > 0 caps the DataRows sent, for the extended protocol's
+// Execute row limit; portal suspension is not implemented, so the row already
+// fetched when the cap is reached is dropped, and rows.Err() is still consulted
+// by the caller exactly as on a fully drained stream.
+func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []ColumnTyper, typeOIDs []int32, sendRowDesc bool, formats []int16, maxRows int32) selectStream {
 	if sendRowDesc {
 		if err := c.sendRowDescription(cols, colTypes); err != nil {
 			return selectStream{writeErr: err, writeStage: "sending row description"}
@@ -372,6 +378,10 @@ func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []Col
 
 	var out selectStream
 	for rows.Next() {
+		if maxRows > 0 && int32(out.rowsSent) >= maxRows {
+			break
+		}
+
 		values := make([]interface{}, len(cols))
 		valuePtrs := make([]interface{}, len(cols))
 		for i := range values {
@@ -383,7 +393,7 @@ func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []Col
 			return out
 		}
 
-		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
+		if err := c.sendDataRowWithFormats(values, formats, typeOIDs); err != nil {
 			out.writeErr = err
 			out.writeStage = "during result streaming"
 			return out

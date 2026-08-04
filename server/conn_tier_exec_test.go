@@ -845,6 +845,461 @@ func commandCompleteWith(msgs []wireMsg, tag string) bool {
 	return false
 }
 
+// --- 4. extended query protocol ---------------------------------------
+
+// newExtendedTierConn builds an exploratory-tier connection with the maps the
+// extended-protocol handlers need, plus a switcher that hands out `big` and
+// records the reasons it was called with.
+func newExtendedTierConn(small, big *tierExecutor) (c *clientConn, out *bytes.Buffer, reasons *[]string) {
+	c, out = newBufferedConn(small)
+	c.stmts = make(map[string]*preparedStmt)
+	c.portals = make(map[string]*portal)
+	c.cursors = make(map[string]*cursorState)
+	c.onExploratoryWorker = true
+	var seen []string
+	reasons = &seen
+	c.workerSwitcher = func(_ context.Context, reason string) (QueryExecutor, int, string, error) {
+		seen = append(seen, reason)
+		if big != nil && big.order != nil {
+			*big.order = append(*big.order, "switch")
+		}
+		return big, 9, "worker-9", nil
+	}
+	return c, out, reasons
+}
+
+// The three extended-query messages the tier tests drive, each through
+// runExtendedQueryMessage — the same dispatcher the message loop uses, so a
+// connection-fatal error propagates exactly as it would in production.
+func extParse(c *clientConn, name, query string) error {
+	return c.runExtendedQueryMessage(c.handleParse, append([]byte(name+"\x00"+query+"\x00"), 0, 0))
+}
+
+func extBind(c *clientConn, portalName, stmtName string) error {
+	return c.runExtendedQueryMessage(c.handleBind, append([]byte(portalName+"\x00"+stmtName+"\x00"), 0, 0, 0, 0, 0, 0))
+}
+
+func extExecute(c *clientConn, portalName string, maxRows int32) error {
+	body := append([]byte(portalName), 0)
+	body = append(body, byte(maxRows>>24), byte(maxRows>>16), byte(maxRows>>8), byte(maxRows))
+	return c.runExtendedQueryMessage(c.handleExecute, body)
+}
+
+func extDescribeStmt(c *clientConn, name string) error {
+	return c.runExtendedQueryMessage(c.handleDescribe, append([]byte("S"+name), 0))
+}
+
+// extRun drives Parse → Bind → Execute for one statement, failing the test on
+// any error that is not connection-fatal, and returning the fatal one.
+func extRun(t *testing.T, c *clientConn, name, query string) error {
+	t.Helper()
+	for _, step := range []struct {
+		what string
+		run  func() error
+	}{
+		{"Parse", func() error { return extParse(c, name, query) }},
+		{"Bind", func() error { return extBind(c, name, name) }},
+		{"Execute", func() error { return extExecute(c, name, 0) }},
+	} {
+		if err := step.run(); err != nil {
+			return fmt.Errorf("%s: %w", step.what, err)
+		}
+	}
+	return nil
+}
+
+// TestExtendedExecutePinsBeforeExecute is the extended-protocol sibling of
+// TestSimpleQueryPinsBeforeExecute: a statement classified as pinning at Parse
+// escalates at Execute BEFORE the executor sees it, so the exploratory worker
+// stays stateless.
+func TestExtendedExecutePinsBeforeExecute(t *testing.T) {
+	var order []string
+	small := &tierExecutor{name: "small", order: &order}
+	big := &tierExecutor{name: "big", order: &order}
+	c, out, reasons := newExtendedTierConn(small, big)
+
+	if err := extRun(t, c, "s1", "CREATE TEMP TABLE t (a INT)"); err != nil {
+		t.Fatalf("extended run: %v", err)
+	}
+
+	if !c.stmts["s1"].pinsWorker {
+		t.Fatal("Parse did not classify CREATE TEMP TABLE as pinning")
+	}
+	if len(*reasons) != 1 || (*reasons)[0] != escalateReasonState {
+		t.Fatalf("switcher reasons = %v, want [%q]", *reasons, escalateReasonState)
+	}
+	if len(small.execCalls) != 0 || len(small.queryCalls) != 0 {
+		t.Fatalf("exploratory worker saw the pinning statement: exec=%v query=%v", small.execCalls, small.queryCalls)
+	}
+	if len(big.execCalls) != 1 {
+		t.Fatalf("standard worker exec calls = %v, want exactly one", big.execCalls)
+	}
+	want := []string{"switch", "big:exec"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("execution order = %v, want %v", order, want)
+	}
+	if c.onExploratoryWorker {
+		t.Fatal("connection still on the exploratory tier after a pinning statement")
+	}
+	if msgs := parseWireMsgs(t, out.Bytes()); countMsgs(msgs, 'E') != 0 {
+		t.Fatalf("unexpected ErrorResponse: %s", describeErrorResponses(msgs))
+	}
+}
+
+// TestExtendedExecuteSmallOKDoesNotPin is the negative control: a plain read
+// executed through the extended protocol stays on the exploratory worker.
+func TestExtendedExecuteSmallOKDoesNotPin(t *testing.T) {
+	small := &tierExecutor{name: "small", queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1}}, nil
+	}}
+	c, _, reasons := newExtendedTierConn(small, &tierExecutor{name: "big"})
+
+	if err := extRun(t, c, "s1", "SELECT n FROM t"); err != nil {
+		t.Fatalf("extended run: %v", err)
+	}
+	if c.stmts["s1"].pinsWorker {
+		t.Fatal("plain SELECT classified as pinning at Parse")
+	}
+	if len(*reasons) != 0 {
+		t.Fatalf("plain SELECT escalated: %v", *reasons)
+	}
+	if !c.onExploratoryWorker {
+		t.Fatal("plain SELECT left the exploratory tier")
+	}
+	if len(small.queryCalls) != 1 {
+		t.Fatalf("exploratory worker query calls = %v, want one", small.queryCalls)
+	}
+}
+
+// TestExtendedExecuteEscalationFailureIsConnectionFatal asserts the extended
+// path enforces the same contract as the simple one: a failed escalation is
+// connection-fatal (the previous session is already destroyed), so the client
+// gets a FATAL with the mapped SQLSTATE and the dispatcher hands the message
+// loop an errConnectionFatal instead of resuming at the next Sync.
+func TestExtendedExecuteEscalationFailureIsConnectionFatal(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		wantCode string
+	}{
+		{"disabled", errors.New("this account is disabled; contact your administrator"), "28000"},
+		{"org cap", errors.New("worker capacity exhausted for organization"), "53300"},
+		{"other", errors.New("dial worker: connection refused"), "53400"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			small := &tierExecutor{name: "small"}
+			c, out, _ := newExtendedTierConn(small, nil)
+			c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+				return nil, 0, "", tc.err
+			}
+
+			err := extRun(t, c, "s1", "CREATE TEMP TABLE t (a INT)")
+			if err == nil {
+				t.Fatal("extended Execute returned nil; a failed escalation must terminate the connection")
+			}
+			if !errors.Is(err, errConnectionFatal) {
+				t.Fatalf("error %v does not carry errConnectionFatal, so the message loop would resume", err)
+			}
+			msgs := parseWireMsgs(t, out.Bytes())
+			if !hasErrorResponse(msgs, "FATAL", tc.wantCode) {
+				t.Fatalf("want FATAL %s, got %s", tc.wantCode, describeErrorResponses(msgs))
+			}
+			if countMsgs(msgs, 'Z') != 0 {
+				t.Fatalf("ReadyForQuery sent after a connection-fatal failure: %s", describeMsgs(msgs))
+			}
+			if len(small.execCalls) != 0 || len(small.queryCalls) != 0 {
+				t.Fatalf("statement ran on the dead exploratory session: exec=%v query=%v", small.execCalls, small.queryCalls)
+			}
+		})
+	}
+}
+
+// TestExtendedDeclareCursorPins is the extended sibling of
+// TestDeclareCursorPinsBeforeExecute. DECLARE is intercepted at Parse and
+// dispatched from handleExecute's cursor switch, above the general pin hook, so
+// without a hook of its own the cursor's worker-side RowSet would open on the
+// exploratory worker and a later pinning statement would strand it.
+func TestExtendedDeclareCursorPins(t *testing.T) {
+	var order []string
+	small := &tierExecutor{name: "small", order: &order}
+	big := &tierExecutor{name: "big", order: &order, queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1, 2}}, nil
+	}}
+	c, out, reasons := newExtendedTierConn(small, big)
+
+	if err := extRun(t, c, "d1", "DECLARE cur CURSOR FOR SELECT n FROM t"); err != nil {
+		t.Fatalf("extended DECLARE: %v", err)
+	}
+	if len(*reasons) != 1 || (*reasons)[0] != escalateReasonState {
+		t.Fatalf("extended DECLARE did not pin: switcher reasons = %v, want [%q]", *reasons, escalateReasonState)
+	}
+	if c.onExploratoryWorker {
+		t.Fatal("connection still on the exploratory tier after DECLARE")
+	}
+
+	// The cursor's RowSet opens lazily on the first FETCH — on the pinned
+	// worker, because DECLARE already escalated.
+	if err := extRun(t, c, "f1", "FETCH 1 FROM cur"); err != nil {
+		t.Fatalf("extended FETCH: %v", err)
+	}
+	if len(small.queryCalls) != 0 {
+		t.Fatalf("cursor opened on the exploratory worker: %v", small.queryCalls)
+	}
+	if len(big.queryCalls) != 1 {
+		t.Fatalf("standard worker query calls = %v, want one (the cursor open)", big.queryCalls)
+	}
+	want := []string{"switch", "big:query"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("execution order = %v, want %v", order, want)
+	}
+	if msgs := parseWireMsgs(t, out.Bytes()); countMsgs(msgs, 'E') != 0 {
+		t.Fatalf("unexpected ErrorResponse: %s", describeErrorResponses(msgs))
+	}
+}
+
+// TestExtendedDeclareCursorEscalationFailureIsConnectionFatal asserts a
+// DECLARE whose escalation fails terminates the connection instead of
+// registering a cursor against a session that no longer exists.
+func TestExtendedDeclareCursorEscalationFailureIsConnectionFatal(t *testing.T) {
+	small := &tierExecutor{name: "small"}
+	c, out, _ := newExtendedTierConn(small, nil)
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return nil, 0, "", errors.New("worker capacity exhausted for organization")
+	}
+
+	err := extRun(t, c, "d1", "DECLARE cur CURSOR FOR SELECT n FROM t")
+	if err == nil {
+		t.Fatal("extended DECLARE returned nil; a failed escalation must terminate the connection")
+	}
+	if !errors.Is(err, errConnectionFatal) {
+		t.Fatalf("error %v does not carry errConnectionFatal", err)
+	}
+	if len(c.cursors) != 0 {
+		t.Fatalf("cursor registered despite the failed escalation: %v", c.cursors)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if !hasErrorResponse(msgs, "FATAL", "53300") {
+		t.Fatalf("want FATAL 53300, got %s", describeErrorResponses(msgs))
+	}
+	if countMsgs(msgs, 'Z') != 0 {
+		t.Fatalf("ReadyForQuery sent after a connection-fatal failure: %s", describeMsgs(msgs))
+	}
+}
+
+// TestExtendedDescribeProbePins covers the Describe hazard unique to the
+// extended protocol: Describe answers a result-returning statement by EXECUTING
+// it (a LIMIT-0 probe). `SELECT … INTO` returns results by prefix and is not
+// DML-RETURNING, so it reaches the probe — and the probe creates a table. The
+// probe must therefore escalate first, exactly like Execute.
+func TestExtendedDescribeProbePins(t *testing.T) {
+	var order []string
+	small := &tierExecutor{name: "small", order: &order}
+	big := &tierExecutor{name: "big", order: &order, queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1}}, nil
+	}}
+	c, _, reasons := newExtendedTierConn(small, big)
+
+	if err := extParse(c, "s1", "SELECT n INTO t2 FROM t"); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !c.stmts["s1"].pinsWorker {
+		t.Fatal("SELECT INTO not classified as pinning at Parse")
+	}
+	if err := extDescribeStmt(c, "s1"); err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+	if len(*reasons) != 1 || (*reasons)[0] != escalateReasonState {
+		t.Fatalf("Describe probe did not pin: switcher reasons = %v, want [%q]", *reasons, escalateReasonState)
+	}
+	if len(small.queryCalls) != 0 || len(small.execCalls) != 0 {
+		t.Fatalf("Describe probed the exploratory worker: query=%v exec=%v", small.queryCalls, small.execCalls)
+	}
+	if len(big.queryCalls) != 1 {
+		t.Fatalf("standard worker probe calls = %v, want one (the probe really executes)", big.queryCalls)
+	}
+	want := []string{"switch", "big:query"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("escalation did not precede the probe: %v, want %v", order, want)
+	}
+}
+
+// TestExtendedDescribeProbeSmallOKDoesNotPin is the negative control for the
+// Describe hook: probing a plain read must stay on the exploratory worker.
+func TestExtendedDescribeProbeSmallOKDoesNotPin(t *testing.T) {
+	small := &tierExecutor{name: "small", queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{}, nil
+	}}
+	c, _, reasons := newExtendedTierConn(small, &tierExecutor{name: "big"})
+
+	if err := extParse(c, "s1", "SELECT n FROM t"); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := extDescribeStmt(c, "s1"); err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+	if len(*reasons) != 0 {
+		t.Fatalf("Describe of a plain read escalated: %v", *reasons)
+	}
+	if len(small.queryCalls) != 1 {
+		t.Fatalf("exploratory worker probe calls = %v, want one", small.queryCalls)
+	}
+}
+
+// TestExtendedExecuteReexecutesOnOOM asserts the prepare-phase retry on the
+// extended result path: a read that blew the small worker's memory_limit before
+// any bytes reached the client is re-executed on the escalated worker, and the
+// client sees only success.
+func TestExtendedExecuteReexecutesOnOOM(t *testing.T) {
+	small := &tierExecutor{name: "small", queryFn: func(int, string) (RowSet, error) {
+		return nil, errors.New(tierOOMError)
+	}}
+	big := &tierExecutor{name: "big", queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{7}}, nil
+	}}
+	c, out, reasons := newExtendedTierConn(small, big)
+
+	if err := extRun(t, c, "s1", "SELECT n FROM big"); err != nil {
+		t.Fatalf("extended run: %v", err)
+	}
+	if len(*reasons) != 1 || (*reasons)[0] != escalateReasonOOM {
+		t.Fatalf("switcher reasons = %v, want [%q]", *reasons, escalateReasonOOM)
+	}
+	if len(big.queryCalls) != 1 {
+		t.Fatalf("standard worker query calls = %v, want one (the re-execute)", big.queryCalls)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if countMsgs(msgs, 'E') != 0 {
+		t.Fatalf("client saw an error for a successfully re-executed query: %s", describeErrorResponses(msgs))
+	}
+	if got := countMsgs(msgs, 'T'); got != 1 {
+		t.Fatalf("RowDescription count = %d, want 1: %s", got, describeMsgs(msgs))
+	}
+	if got := countMsgs(msgs, 'D'); got != 1 {
+		t.Fatalf("DataRow count = %d, want 1: %s", got, describeMsgs(msgs))
+	}
+	if !commandCompleteWith(msgs, "SELECT 1") {
+		t.Fatalf("want CommandComplete 'SELECT 1': %s", describeMsgs(msgs))
+	}
+}
+
+// TestExtendedExecuteOOMEscalationFailureIsConnectionFatal asserts that when
+// the escalation itself fails after an OOM, the ORIGINAL query error reaches
+// the client as FATAL and the connection terminates.
+func TestExtendedExecuteOOMEscalationFailureIsConnectionFatal(t *testing.T) {
+	small := &tierExecutor{name: "small", queryFn: func(int, string) (RowSet, error) {
+		return nil, errors.New(tierOOMError)
+	}}
+	c, out, _ := newExtendedTierConn(small, nil)
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return nil, 0, "", errors.New("worker capacity exhausted for organization")
+	}
+
+	err := extRun(t, c, "s1", "SELECT n FROM big")
+	if err == nil {
+		t.Fatal("extended Execute returned nil; a failed OOM escalation must terminate the connection")
+	}
+	if !errors.Is(err, errConnectionFatal) {
+		t.Fatalf("error %v does not carry errConnectionFatal", err)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if !hasErrorResponse(msgs, "FATAL", "53300", "Out of Memory Error") {
+		t.Fatalf("want FATAL 53300 carrying the original OOM error, got %s", describeErrorResponses(msgs))
+	}
+}
+
+// TestExtendedExecuteZeroRowMidStreamOOMReexecutes asserts the mid-stream case
+// where NOTHING was streamed yet: re-execute on the escalated worker without
+// resending RowDescription, since the first attempt already sent one for the
+// identical schema.
+func TestExtendedExecuteZeroRowMidStreamOOMReexecutes(t *testing.T) {
+	first := &tierRowSet{err: errors.New(tierOOMError)}
+	small := &tierExecutor{name: "small", queryFn: func(int, string) (RowSet, error) {
+		return first, nil
+	}}
+	big := &tierExecutor{name: "big", queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{5, 6}}, nil
+	}}
+	c, out, reasons := newExtendedTierConn(small, big)
+
+	if err := extRun(t, c, "s1", "SELECT n FROM big"); err != nil {
+		t.Fatalf("extended run: %v", err)
+	}
+	if len(*reasons) != 1 || (*reasons)[0] != escalateReasonOOM {
+		t.Fatalf("switcher reasons = %v, want [%q]", *reasons, escalateReasonOOM)
+	}
+	if first.closed == 0 {
+		t.Fatal("the abandoned first RowSet was never closed")
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if countMsgs(msgs, 'E') != 0 {
+		t.Fatalf("client saw an error for a successfully re-executed query: %s", describeErrorResponses(msgs))
+	}
+	if got := countMsgs(msgs, 'T'); got != 1 {
+		t.Fatalf("RowDescription count = %d, want exactly 1 (never resent on retry): %s", got, describeMsgs(msgs))
+	}
+	if got := countMsgs(msgs, 'D'); got != 2 {
+		t.Fatalf("DataRow count = %d, want 2 from the retry: %s", got, describeMsgs(msgs))
+	}
+	if !commandCompleteWith(msgs, "SELECT 2") {
+		t.Fatalf("want CommandComplete 'SELECT 2': %s", describeMsgs(msgs))
+	}
+}
+
+// TestExtendedExecuteMidStreamOOMAfterRowsSurfaces is the negative control: an
+// OOM that lands after rows already reached the client is surfaced, never
+// re-executed — a retry cannot un-send them.
+func TestExtendedExecuteMidStreamOOMAfterRowsSurfaces(t *testing.T) {
+	small := &tierExecutor{name: "small", queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1, 2}, err: errors.New(tierOOMError)}, nil
+	}}
+	c, out, reasons := newExtendedTierConn(small, &tierExecutor{name: "big"})
+
+	if err := extRun(t, c, "s1", "SELECT n FROM big"); err != nil {
+		t.Fatalf("extended run: %v", err)
+	}
+	if len(*reasons) != 0 {
+		t.Fatalf("mid-stream OOM after rows escalated: %v", *reasons)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if got := countMsgs(msgs, 'D'); got != 2 {
+		t.Fatalf("DataRow count = %d, want 2: %s", got, describeMsgs(msgs))
+	}
+	if !hasErrorResponse(msgs, "ERROR", "42000", "Out of Memory Error") {
+		t.Fatalf("want ERROR 42000 carrying the OOM: %s", describeErrorResponses(msgs))
+	}
+}
+
+// TestExtendedExecuteMaxRowsUnchanged pins the non-tier behavior of the
+// Execute row loop through the shared streaming helper: maxRows still caps the
+// DataRows sent (portal suspension is not implemented — the surplus row is
+// fetched and dropped, as before).
+func TestExtendedExecuteMaxRowsUnchanged(t *testing.T) {
+	exec := &tierExecutor{name: "std", queryFn: func(int, string) (RowSet, error) {
+		return &tierRowSet{rows: []int64{1, 2, 3}}, nil
+	}}
+	c, out := newBufferedConn(exec)
+	c.stmts = make(map[string]*preparedStmt)
+	c.portals = make(map[string]*portal)
+
+	if err := extParse(c, "s1", "SELECT n FROM t"); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := extBind(c, "s1", "s1"); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	if err := extExecute(c, "s1", 2); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if got := countMsgs(msgs, 'D'); got != 2 {
+		t.Fatalf("DataRow count = %d, want 2 (maxRows): %s", got, describeMsgs(msgs))
+	}
+	if !commandCompleteWith(msgs, "SELECT 2") {
+		t.Fatalf("want CommandComplete 'SELECT 2': %s", describeMsgs(msgs))
+	}
+}
+
 // --- SQLSTATE mapping helper ------------------------------------------
 
 func TestEscalationErrorSQLState(t *testing.T) {
