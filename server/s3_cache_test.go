@@ -12,8 +12,9 @@ import (
 // S3CacheControl capability, recording the worker swap calls the conn issues.
 type s3CacheRecordingExecutor struct {
 	selectOneExecutor
-	calls []bool
-	err   error
+	calls     []bool
+	execCalls []string
+	err       error
 	// onSwap/onQuery let a test observe the ORDER of the worker swap relative
 	// to query execution (used by the lazy-activation ordering tests, where the
 	// swap must land before the first user query).
@@ -27,6 +28,13 @@ func (e *s3CacheRecordingExecutor) SetS3CacheEnabled(_ context.Context, enabled 
 		e.onSwap(enabled)
 	}
 	return e.err
+}
+
+// ExecContext records the non-result statements the connection sent, so a test
+// can assert that a statement whose escalation failed never reached the worker.
+func (e *s3CacheRecordingExecutor) ExecContext(ctx context.Context, query string, args ...any) (ExecResult, error) {
+	e.execCalls = append(e.execCalls, query)
+	return e.selectOneExecutor.ExecContext(ctx, query, args...)
 }
 
 func (e *s3CacheRecordingExecutor) QueryContext(ctx context.Context, query string, args ...any) (RowSet, error) {
@@ -430,7 +438,11 @@ func TestS3CacheReappliedOnWorkerEscalation(t *testing.T) {
 // TestS3CacheEscalationFailureDoesNotLieAboutTransport asserts that when the
 // bypass cannot be re-applied on the new worker, the statement fails AND the
 // session state is reset to match the transport the worker is actually in —
-// SHOW must never report a transport the worker isn't using.
+// SHOW must never report a transport the worker isn't using. It also pins the
+// SEVERITY of that failure: the ESCALATION succeeded (the connection has a
+// healthy session on the standard worker), so the error is tagged
+// errS3CacheReapplyFailed — the one escalateWorker failure that is NOT
+// connection-fatal — and the pin is deliberately not rolled back.
 func TestS3CacheEscalationFailureDoesNotLieAboutTransport(t *testing.T) {
 	small := &s3CacheRecordingExecutor{}
 	c, _ := newBufferedConn(small)
@@ -447,10 +459,19 @@ func TestS3CacheEscalationFailureDoesNotLieAboutTransport(t *testing.T) {
 	if err == nil {
 		t.Fatal("escalateWorker returned nil, want the re-apply failure")
 	}
+	if !errors.Is(err, errS3CacheReapplyFailed) {
+		t.Fatalf("error %v is not tagged errS3CacheReapplyFailed; callers would terminate the connection", err)
+	}
 	if !strings.Contains(err.Error(), "duckgres.s3_cache") {
 		t.Fatalf("error %q does not name the GUC", err)
 	}
 	if !c.S3CacheEnabled() {
 		t.Fatal("S3CacheEnabled() = false after a failed re-apply; state must match the worker's actual transport")
+	}
+	if c.onExploratoryWorker {
+		t.Fatal("onExploratoryWorker = true after a failed re-apply; the escalation itself SUCCEEDED and must not be rolled back")
+	}
+	if c.executor != QueryExecutor(big) {
+		t.Fatal("executor is not the escalated worker; the swap succeeded and must stand")
 	}
 }

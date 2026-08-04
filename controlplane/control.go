@@ -1587,6 +1587,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// to hot-idle before the org's worker cap is checked for the big
 			// one, so escalating can never deadlock against the org's own cap.
 			sessions.DestroySession(pid)
+			// The session is gone: keep the teardown guard honest for the
+			// window that follows. An escalation that fails from here on leaves
+			// the connection with NO session, and destroySessionOnExit
+			// destroying an unknown pid is exactly the spurious warn the flag
+			// exists to avoid. Re-armed the moment a replacement session exists.
+			sessionEverCreated = false
 			if orgID != "" {
 				observeOrgSessionsActive(orgID, sessions.SessionCount())
 			}
@@ -1601,6 +1607,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				// while draining) instead of a substring guess.
 				return nil, 0, "", fmt.Errorf("escalate to standard worker: %w", newSessionAcquireError(err))
 			}
+			sessionEverCreated = true
 			if orgID != "" {
 				observeOrgSessionsActive(orgID, sessions.SessionCount())
 			}
@@ -1625,12 +1632,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				meta:     escMeta,
 			})
 			if initErr != nil {
+				// finishSessionAcquisition already destroyed the session, so
+				// the teardown must not destroy it a second time.
+				sessionEverCreated = false
 				// Keep the init failure's own SQLSTATE (e.g. 3D000 for an
 				// unavailable catalog) rather than re-deriving one.
 				return nil, 0, "", fmt.Errorf("init session on standard worker: %w",
 					&server.SessionAcquireError{Code: initErr.code, Message: initErr.message, Err: initErr})
 			}
 			if gateErr != nil {
+				// Destroyed by finishSessionAcquisition, as above.
+				sessionEverCreated = false
 				return nil, 0, "", &server.SessionAcquireError{
 					Code: "28000", Message: disabledUserMessage, Err: gateErr,
 				}

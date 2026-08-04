@@ -28,10 +28,11 @@ type sessionActivationOutcome string
 
 const (
 	sessionActivationSuccess  sessionActivationOutcome = "success"
-	sessionActivationCanceled sessionActivationOutcome = "canceled"
-	sessionActivationCapacity sessionActivationOutcome = "capacity"
-	sessionActivationDraining sessionActivationOutcome = "draining"
-	sessionActivationError    sessionActivationOutcome = "error"
+	sessionActivationCanceled sessionActivationOutcome = server.AcquisitionOutcomeCanceled
+	sessionActivationCapacity sessionActivationOutcome = server.AcquisitionOutcomeCapacity
+	sessionActivationDraining sessionActivationOutcome = server.AcquisitionOutcomeDraining
+	sessionActivationDisabled sessionActivationOutcome = server.AcquisitionOutcomeDisabled
+	sessionActivationError    sessionActivationOutcome = server.AcquisitionOutcomeError
 )
 
 // Activation metrics. Before lazy acquisition, a capacity/draining/admission
@@ -47,7 +48,7 @@ const (
 var (
 	sessionActivationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "duckgres_session_activation_total",
-		Help: "Lazy first-statement worker acquisitions on the exploratory tier, partitioned by org and outcome (success|canceled|capacity|draining|error).",
+		Help: "Lazy first-statement worker acquisitions on the exploratory tier, partitioned by org and outcome (success|canceled|capacity|draining|disabled|error).",
 	}, []string{"org", "outcome"})
 
 	sessionActivationDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -61,21 +62,15 @@ var (
 )
 
 // activationOutcomeForCode maps a classified SQLSTATE to the metric label.
-// Draining is broken out from the generic error bucket deliberately: a control
-// plane rolling out looks identical to a broken one otherwise.
+// The failure classes come from server.AcquisitionFailureOutcome, the SAME
+// helper the tier's escalation counter uses, so the two acquisition metrics
+// can never drift into different (or unbounded) label sets. Only the success
+// label differs — this counter has always published "success".
 func activationOutcomeForCode(code string) sessionActivationOutcome {
-	switch code {
-	case "":
+	if code == "" {
 		return sessionActivationSuccess
-	case "57014":
-		return sessionActivationCanceled
-	case "53300":
-		return sessionActivationCapacity
-	case "57P03":
-		return sessionActivationDraining
-	default:
-		return sessionActivationError
 	}
+	return sessionActivationOutcome(server.AcquisitionFailureOutcome(code))
 }
 
 // newSessionAcquireError classifies a session-acquisition failure with the SAME

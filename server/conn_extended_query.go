@@ -899,7 +899,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		if escErr := c.escalateWorker(queryCtx, escalateReasonOOM); escErr != nil {
 			queryFinalErr = err
 			execSpan.End()
-			_ = c.failWorkerEscalation(convertedQuery, escErr, err.Error())
+			_ = c.failEscalation(convertedQuery, escErr, err.Error())
 			return
 		}
 		rows, err = runQuery()
@@ -967,7 +967,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		_ = rows.Close()
 		if escErr := c.escalateWorker(queryCtx, escalateReasonOOM); escErr != nil {
 			queryFinalErr = oomErr
-			_ = c.failWorkerEscalation(convertedQuery, escErr, oomErr.Error())
+			_ = c.failEscalation(convertedQuery, escErr, oomErr.Error())
 			return
 		}
 		retryRows, retryErr := runQuery()
@@ -1093,7 +1093,13 @@ func (c *clientConn) runExtendedQueryMessage(handler func([]byte), body []byte) 
 		return nil
 	}
 	before := c.errorResponsesSent
-	handler(body)
+	// Sync — not the handler — owns ReadyForQuery on this protocol; the shared
+	// statement-failure paths read this to know that.
+	c.inExtendedMessage = true
+	func() {
+		defer func() { c.inExtendedMessage = false }()
+		handler(body)
+	}()
 	if c.errorResponsesSent != before {
 		c.ignoreTillSync = true
 	}

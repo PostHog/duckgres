@@ -270,6 +270,23 @@ type clientConn struct {
 	// connection is on its way out.
 	fatalErr error
 
+	// postStartup is set once the connection enters the message loop, i.e.
+	// once startup + authentication completed on EVERY path (standalone,
+	// process worker, and the control plane, which writes the first
+	// ReadyForQuery itself and then calls RunConnectionMessageLoop). Read only
+	// by sendError, to keep duckgres_auth_failures_total an AUTHENTICATION
+	// metric: a class-28 error raised after this point is a post-connect
+	// authorization failure (the exploratory tier's disabled-user re-check),
+	// not a failed login.
+	postStartup bool
+
+	// inExtendedMessage is true while an extended-query message handler runs.
+	// It tells the shared statement-failure paths who owns ReadyForQuery: the
+	// simple protocol writes one per statement, while in the extended protocol
+	// Sync does — writing one from inside a handler would desync the client's
+	// response accounting.
+	inExtendedMessage bool
+
 	// teamID is the PostHog Team.id this connection is attributed to for product
 	// analytics (the connecting user's team, else the org's oldest team; 0 when
 	// unknown / non-multitenant). Stamped once at setup via SetConnectionTeamID
@@ -1196,6 +1213,9 @@ func (c *clientConn) armIdleReadDeadline() {
 }
 
 func (c *clientConn) messageLoop() error {
+	// Startup and authentication are behind us on every path that reaches
+	// here; see the postStartup field for why sendError cares.
+	c.postStartup = true
 	atReadyBoundary := true
 	for {
 		if atReadyBoundary && c.drainRequested.Load() {
@@ -1253,11 +1273,20 @@ func (c *clientConn) messageLoop() error {
 					c.logger().Error("Query error.", "error", err)
 					return err
 				}
-				if isConnectionBroken(err) {
+				// A statement-scoped abort (today: a post-escalation s3_cache
+				// re-apply failure) has already sent its ERROR and its
+				// ReadyForQuery and left a healthy session behind, so the
+				// connection resumes. Checked BEFORE isConnectionBroken for the
+				// same reason as errConnectionFatal: the cause is server-side
+				// even when its text mentions a refused/reset worker connection.
+				if errors.Is(err, errStatementAborted) {
+					c.logger().Warn("Statement aborted.", "error", err)
+				} else if isConnectionBroken(err) {
 					c.logger().Info("Client connection lost during query.", "error", err)
 					return nil
+				} else {
+					c.logger().Error("Query error.", "error", err)
 				}
-				c.logger().Error("Query error.", "error", err)
 			}
 			if c.drainRequested.Load() {
 				return nil

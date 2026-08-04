@@ -125,40 +125,104 @@ func (c *clientConn) activateForStatement(query string, pinned bool) error {
 	return nil
 }
 
+// Bounded outcome labels shared by the tier's two acquisition metrics —
+// duckgres_exploratory_escalations_total here and
+// duckgres_session_activation_total in the control plane. Every label is
+// derived from the CLASSIFIED SQLSTATE, never from the error text, so the label
+// set stays closed no matter what a worker or the K8s API says.
+const (
+	AcquisitionOutcomeOK       = "ok"
+	AcquisitionOutcomeCanceled = "canceled"
+	AcquisitionOutcomeCapacity = "capacity"
+	AcquisitionOutcomeDraining = "draining"
+	AcquisitionOutcomeDisabled = "disabled"
+	AcquisitionOutcomeError    = "error"
+)
+
+// AcquisitionFailureOutcome maps a classified SQLSTATE to the bounded failure
+// class label above. FAILURES only — each metric supplies its own success label
+// (this package's counter uses AcquisitionOutcomeOK, the control plane's
+// activation counter keeps its established "success"), because the two have
+// been published under different names and dashboards read both.
+//
+// Draining and disabled are broken out from the generic error bucket
+// deliberately: a control plane rolling out, and an operator disabling an
+// account, each look identical to a broken cluster otherwise.
+func AcquisitionFailureOutcome(code string) string {
+	switch code {
+	case "57014":
+		return AcquisitionOutcomeCanceled
+	case "53300":
+		return AcquisitionOutcomeCapacity
+	case "57P03":
+		return AcquisitionOutcomeDraining
+	case "28000":
+		return AcquisitionOutcomeDisabled
+	default:
+		return AcquisitionOutcomeError
+	}
+}
+
 var exploratoryEscalationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_exploratory_escalations_total",
-	Help: "Connections escalated off the exploratory small worker, by reason (state|oom|heuristic).",
-}, []string{"reason"})
+	Help: "Attempts to escalate a connection off the exploratory small worker, by reason (state|oom|heuristic) and outcome (ok|canceled|capacity|draining|disabled|error).",
+}, []string{"reason", "outcome"})
+
+// errS3CacheReapplyFailed marks the ONE escalateWorker failure that is NOT
+// connection-fatal: the worker swap itself succeeded (there is a healthy
+// session on the standard worker and the connection is pinned to it), only the
+// post-swap `duckgres.s3_cache` re-apply failed. See failS3CacheReapply.
+var errS3CacheReapplyFailed = errors.New("s3_cache re-apply after worker switch failed")
+
+// s3CacheReapplyError tags a re-apply failure with errS3CacheReapplyFailed
+// WITHOUT the sentinel's text landing in the client-visible message — the
+// wrapped error already names the GUC and the worker switch.
+type s3CacheReapplyError struct{ err error }
+
+func (e *s3CacheReapplyError) Error() string { return e.err.Error() }
+
+func (e *s3CacheReapplyError) Unwrap() error { return e.err }
+
+func (e *s3CacheReapplyError) Is(target error) bool { return target == errS3CacheReapplyFailed }
 
 // escalateWorker moves the connection from the exploratory small worker to a
-// normal-size worker. Sticky: once pinned, later calls are no-ops. On failure
-// the connection's previous session is already gone (the control-plane switcher
-// destroys it before acquiring the target worker), so callers MUST treat a
-// failed escalation as connection-fatal: surface the error to the client and
-// terminate the connection. The query-path integration implements that
-// termination.
+// normal-size worker. Sticky: once pinned, later calls are no-ops.
+//
+// Two failure shapes, and the difference is load-bearing:
+//
+//   - the SWITCHER failed: the connection's previous session is already gone
+//     (the control-plane switcher destroys it before acquiring the target
+//     worker), so there is nothing left to resynchronize to and callers MUST
+//     treat it as connection-fatal (failWorkerEscalation);
+//   - the post-swap s3_cache re-apply failed (errS3CacheReapplyFailed): the
+//     escalation SUCCEEDED — healthy session, pin stands — so only the
+//     statement fails (failS3CacheReapply). Callers route both through
+//     failEscalation, which picks the right one.
 func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	if !c.onExploratoryWorker || c.workerSwitcher == nil {
 		return nil
 	}
 	exec, workerID, workerPod, err := c.workerSwitcher(ctx, reason)
 	if err != nil {
+		exploratoryEscalationsTotal.WithLabelValues(reason, AcquisitionFailureOutcome(escalationErrorSQLState(err))).Inc()
 		return err
 	}
 	c.executor = exec
 	c.workerID = workerID
 	c.workerPod = workerPod
 	c.onExploratoryWorker = false
-	exploratoryEscalationsTotal.WithLabelValues(reason).Inc()
+	exploratoryEscalationsTotal.WithLabelValues(reason, AcquisitionOutcomeOK).Inc()
 	c.logger().Info("Escalated connection off exploratory worker.", "reason", reason, "worker", workerID, "worker_pod", workerPod)
 	// The `duckgres.s3_cache` bypass is worker-side state, and the new session
 	// starts on the cache proxy — re-assert it or the connection silently
 	// starts reading cached mid-flight. On failure the session state is reset
 	// to match the transport the worker is actually in (SHOW must never lie)
-	// and the statement fails, rather than a benchmark quietly going cached.
+	// and the STATEMENT fails; the escalation stands (outcome is already
+	// counted "ok" above — the swap happened), so the pin is deliberately NOT
+	// rolled back.
 	if err := c.reapplyS3CacheAfterWorkerSwitch(ctx); err != nil {
 		c.s3CacheOff = false
-		return err
+		return &s3CacheReapplyError{err: err}
 	}
 	return nil
 }
@@ -248,6 +312,53 @@ func acquisitionClientMessage(err error, fallback string) string {
 // and rely on runExtendedQueryMessage reading it back for the message loop.
 func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMessage string) error {
 	return c.failWorkerAcquisition(query, escErr, clientMessage, "exploratory worker escalation failed")
+}
+
+// failEscalation is the single entry point for an escalateWorker error: it
+// routes the connection-fatal shape (the switcher failed, previous session
+// gone) to failWorkerEscalation, and the statement-scoped shape (the swap
+// succeeded, only the s3_cache re-apply failed) to failS3CacheReapply. Every
+// call site uses it so the two can never be confused at one of them.
+func (c *clientConn) failEscalation(query string, escErr error, clientMessage string) error {
+	if errors.Is(escErr, errS3CacheReapplyFailed) {
+		return c.failS3CacheReapply(query, escErr)
+	}
+	return c.failWorkerEscalation(query, escErr, clientMessage)
+}
+
+// errStatementAborted marks a failure that has ALREADY been reported to the
+// client as a normal ERROR and must abort the current statement without
+// terminating the connection. Callers propagate it like any other error (they
+// must not execute the statement), and the message loop resumes reading — the
+// client has its ErrorResponse and, on the simple protocol, its ReadyForQuery.
+var errStatementAborted = errors.New("statement aborted")
+
+// failS3CacheReapply reports a post-escalation `duckgres.s3_cache` re-apply
+// failure. Unlike a failed escalation this is NOT connection-fatal: the
+// escalation succeeded, so the connection has a healthy session on the standard
+// worker and the pin stands (deliberately not rolled back — the swap really
+// happened). Only the transport could not be re-asserted, so:
+//
+//   - the statement fails with a normal ERROR (XX000) naming the re-apply,
+//     rather than a benchmark quietly continuing through the cache;
+//   - the session flag was already reset by escalateWorker to the worker's
+//     ACTUAL transport (proxied — a fresh session always starts on the cache
+//     proxy), so SHOW stays truthful and the client can retry
+//     `SET duckgres.s3_cache = off`;
+//   - the connection stays alive.
+//
+// ReadyForQuery is written only on the simple protocol; inside an
+// extended-query message Sync owns it, and writing one here would desync the
+// client's response accounting.
+func (c *clientConn) failS3CacheReapply(query string, err error) error {
+	c.logQueryError(query, err)
+	c.sendError("ERROR", "XX000", err.Error())
+	c.setTxError()
+	if !c.inExtendedMessage {
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+	}
+	return fmt.Errorf("%w: %w", errStatementAborted, err)
 }
 
 // failWorkerActivation terminates the connection after a failed LAZY session
@@ -365,7 +476,7 @@ func (c *clientConn) escalateForPinningTier(query string, pins bool) error {
 		return nil
 	}
 	if err := c.escalateWorker(c.ctx, escalateReasonState); err != nil {
-		return c.failWorkerEscalation(query, err,
+		return c.failEscalation(query, err,
 			acquisitionClientMessage(err,
 				fmt.Sprintf("could not allocate a standard worker for this statement: %v", err)))
 	}

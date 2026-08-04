@@ -200,7 +200,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 		if escErr := c.escalateWorker(ctx, escalateReasonOOM); escErr != nil {
 			queryFinalErr = err
 			execSpan.End()
-			return 0, "", "", c.failWorkerEscalation(query, escErr, err.Error())
+			return 0, "", "", c.failEscalation(query, escErr, err.Error())
 		}
 		rows, err = runQuery()
 	}
@@ -274,7 +274,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 		_ = rows.Close()
 		if escErr := c.escalateWorker(ctx, escalateReasonOOM); escErr != nil {
 			queryFinalErr = oomErr
-			return 0, "", "", c.failWorkerEscalation(query, escErr, oomErr.Error())
+			return 0, "", "", c.failEscalation(query, escErr, oomErr.Error())
 		}
 		retryRows, retryErr := runQuery()
 		if retryErr != nil {

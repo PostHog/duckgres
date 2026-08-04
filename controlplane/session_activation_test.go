@@ -374,6 +374,9 @@ func TestActivationOutcomeForCode(t *testing.T) {
 		"57014": sessionActivationCanceled,
 		"53300": sessionActivationCapacity,
 		"57P03": sessionActivationDraining,
+		// 28000 is the disabled-user re-check, broken out of the generic error
+		// bucket by the shared server.AcquisitionFailureOutcome helper.
+		"28000": sessionActivationDisabled,
 		"53400": sessionActivationError,
 		"3D000": sessionActivationError,
 		"58000": sessionActivationError,

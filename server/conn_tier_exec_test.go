@@ -1,12 +1,16 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/posthog/duckgres/server/auth"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // --- fakes -------------------------------------------------------------
@@ -1546,5 +1550,186 @@ func TestEscalationErrorSQLState(t *testing.T) {
 	}
 	if got := escalationErrorSQLState(nil); got != "53400" {
 		t.Fatalf("escalationErrorSQLState(nil) = %s, want 53400", got)
+	}
+}
+
+// --- post-escalation s3_cache re-apply: STATEMENT-scoped, not fatal ----
+
+// TestSimpleQueryS3CacheReapplyFailureIsStatementScoped pins the one
+// escalateWorker failure that is NOT connection-fatal. The switcher SUCCEEDED
+// (there is a healthy session on the standard worker and the pin stands); only
+// the post-swap `duckgres.s3_cache` re-apply failed. So the statement fails
+// with a normal ERROR naming the re-apply, the connection is resynchronized
+// with a ReadyForQuery instead of terminated, and the session flag is reset to
+// the transport the worker is ACTUALLY in (proxied — a fresh session always
+// starts on the cache proxy) so SHOW cannot lie.
+func TestSimpleQueryS3CacheReapplyFailureIsStatementScoped(t *testing.T) {
+	small := &s3CacheRecordingExecutor{}
+	c, out := newBufferedConn(small)
+	if err := c.handleQuery([]byte("SET duckgres.s3_cache = off\x00")); err != nil {
+		t.Fatalf("handleQuery(SET off): %v", err)
+	}
+	out.Reset()
+
+	big := &s3CacheRecordingExecutor{err: errors.New("secret swap failed")}
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return big, 7, "worker-7", nil
+	}
+
+	err := c.handleQuery([]byte("CREATE TEMP TABLE t (a INT)\x00"))
+	if !errors.Is(err, errStatementAborted) {
+		t.Fatalf("handleQuery error = %v, want errStatementAborted", err)
+	}
+	if errors.Is(err, errConnectionFatal) {
+		t.Fatalf("error %v is connection-fatal; the escalation succeeded and the session is healthy", err)
+	}
+	if c.fatalErr != nil {
+		t.Fatalf("fatalErr parked (%v); the message loop would terminate a healthy connection", c.fatalErr)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if hasSeverity(msgs, "FATAL") {
+		t.Fatalf("FATAL emitted for a statement-scoped failure: %s", describeErrorResponses(msgs))
+	}
+	if !hasErrorResponse(msgs, "ERROR", "XX000", "duckgres.s3_cache") {
+		t.Fatalf("want ERROR XX000 naming the GUC, got %s", describeErrorResponses(msgs))
+	}
+	if countMsgs(msgs, 'Z') != 1 {
+		t.Fatalf("want exactly one ReadyForQuery (connection stays alive): %s", describeMsgs(msgs))
+	}
+	if !c.S3CacheEnabled() {
+		t.Fatal("session still reports the bypass; SHOW would name a transport the worker isn't using")
+	}
+	if c.onExploratoryWorker {
+		t.Fatal("pin rolled back; the escalation itself succeeded and must stand")
+	}
+	if len(big.execCalls) != 0 || len(small.execCalls) != 0 {
+		t.Fatalf("statement executed anyway: small=%v big=%v", small.execCalls, big.execCalls)
+	}
+}
+
+// TestExtendedExecuteS3CacheReapplyFailureIsStatementScoped is the extended
+// sibling: same severity contract, except ReadyForQuery belongs to Sync, so the
+// handler must NOT write one — it reports the ERROR (arming skip-until-Sync)
+// and the dispatcher returns nil rather than a connection-fatal error.
+func TestExtendedExecuteS3CacheReapplyFailureIsStatementScoped(t *testing.T) {
+	small := &tierExecutor{name: "small"}
+	c, out := newBufferedConn(small)
+	c.stmts = make(map[string]*preparedStmt)
+	c.portals = make(map[string]*portal)
+	c.cursors = make(map[string]*cursorState)
+	if err := c.handleQuery([]byte("SET duckgres.s3_cache = off\x00")); err != nil {
+		t.Fatalf("handleQuery(SET off): %v", err)
+	}
+	out.Reset()
+
+	big := &s3CacheRecordingExecutor{err: errors.New("secret swap failed")}
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return big, 9, "worker-9", nil
+	}
+
+	if err := extRun(t, c, "s1", "CREATE TEMP TABLE t (a INT)"); err != nil {
+		t.Fatalf("extended run returned %v; the connection must not be terminated", err)
+	}
+	if c.fatalErr != nil {
+		t.Fatalf("fatalErr parked (%v) for a statement-scoped failure", c.fatalErr)
+	}
+	msgs := parseWireMsgs(t, out.Bytes())
+	if hasSeverity(msgs, "FATAL") {
+		t.Fatalf("FATAL emitted for a statement-scoped failure: %s", describeErrorResponses(msgs))
+	}
+	if !hasErrorResponse(msgs, "ERROR", "XX000", "duckgres.s3_cache") {
+		t.Fatalf("want ERROR XX000 naming the GUC, got %s", describeErrorResponses(msgs))
+	}
+	if countMsgs(msgs, 'Z') != 0 {
+		t.Fatalf("handler wrote ReadyForQuery; Sync owns it on the extended protocol: %s", describeMsgs(msgs))
+	}
+	if !c.ignoreTillSync {
+		t.Fatal("skip-until-Sync not armed after the ErrorResponse")
+	}
+	if !c.S3CacheEnabled() {
+		t.Fatal("session still reports the bypass after a failed re-apply")
+	}
+	if len(big.execCalls) != 0 || len(small.execCalls) != 0 {
+		t.Fatalf("statement executed anyway: small=%v big=%v", small.execCalls, big.execCalls)
+	}
+}
+
+// TestS3CacheReapplyFailureKeepsConnectionAlive drives the real message loop:
+// the statement that failed its re-apply must not close the connection, and the
+// NEXT statement must run normally on the escalated worker. The switcher's
+// failure text deliberately contains "connection refused" — the loop has to
+// classify errStatementAborted BEFORE isConnectionBroken, or a healthy
+// connection is dropped because a worker-side error mentioned a refused socket.
+func TestS3CacheReapplyFailureKeepsConnectionAlive(t *testing.T) {
+	small := &s3CacheRecordingExecutor{}
+	c, out := newPipelineConn(t, small)
+	big := &s3CacheRecordingExecutor{err: errors.New("swap secret: dial worker: connection refused")}
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return big, 7, "worker-7", nil
+	}
+
+	frames := runPipeline(t, c, out,
+		queryFrame("SET duckgres.s3_cache = off"),
+		queryFrame("CREATE TEMP TABLE t (a INT)"),
+		queryFrame("SELECT 1"),
+	)
+	types := frameTypes(frames)
+	if strings.Count(types, "Z") != 3 {
+		t.Fatalf("want a ReadyForQuery per statement, got frames %q", types)
+	}
+	if !strings.Contains(types, "E") {
+		t.Fatalf("no ErrorResponse for the failed re-apply: frames %q", types)
+	}
+	var sawReapplyError bool
+	for _, f := range frames {
+		if f.msgType == 'E' && bytes.Contains(f.body, []byte("XX000")) && bytes.Contains(f.body, []byte("duckgres.s3_cache")) {
+			sawReapplyError = true
+		}
+	}
+	if !sawReapplyError {
+		t.Fatalf("want an ERROR XX000 naming duckgres.s3_cache, got frames %q", types)
+	}
+	if big.queryCalls != 1 {
+		t.Fatalf("SELECT after the aborted statement ran %d times on the escalated worker, want 1", big.queryCalls)
+	}
+}
+
+// TestPostConnectAuthorizationErrorIsNotAnAuthFailure guards the security
+// metric: duckgres_auth_failures_total counts the AUTHENTICATION handshake, so
+// the tier's post-connect 28000 (a user disabled between connect and the
+// escalation's re-check) must not land in it — otherwise disabling an account
+// reads as a brute-force attempt. The second half is the control: the same
+// SQLSTATE sent during startup still counts.
+func TestPostConnectAuthorizationErrorIsNotAnAuthFailure(t *testing.T) {
+	small := &tierExecutor{name: "small"}
+	c, out := newPipelineConn(t, small)
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return nil, 0, "", errors.New("this account is disabled; contact your administrator")
+	}
+
+	before := testutil.ToFloat64(auth.AuthFailuresCounter)
+	c.reader = bufio.NewReader(bytes.NewReader(queryFrame("CREATE TEMP TABLE t (a INT)")))
+	err := c.messageLoop()
+	if !errors.Is(err, errConnectionFatal) {
+		t.Fatalf("messageLoop error = %v, want the connection-fatal escalation failure", err)
+	}
+	_ = c.writer.Flush()
+	if !bytes.Contains(out.Bytes(), []byte("28000")) {
+		t.Fatal("no 28000 was sent; the test is not exercising the guarded path")
+	}
+	if got := testutil.ToFloat64(auth.AuthFailuresCounter); got != before {
+		t.Fatalf("duckgres_auth_failures_total = %v after a post-connect 28000, want %v", got, before)
+	}
+
+	// Control: a class-28 error raised before the message loop (the real
+	// authentication phase) still increments.
+	startup, _ := newBufferedConn(small)
+	startup.sendError("FATAL", "28P01", "password authentication failed")
+	if got := testutil.ToFloat64(auth.AuthFailuresCounter); got != before+1 {
+		t.Fatalf("duckgres_auth_failures_total = %v after a startup-phase 28P01, want %v", got, before+1)
 	}
 }
