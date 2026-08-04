@@ -243,6 +243,15 @@ type clientConn struct {
 	onExploratoryWorker bool
 	workerSwitcher      WorkerSwitcher
 
+	// sessionActivator lazily acquires the connection's FIRST worker/session
+	// (exploratory tier only — see SessionActivator). Installed by the control
+	// plane instead of an executor when acquisition is deferred past connection
+	// startup; nil on every eager path (standalone, process backend, GUC-sized,
+	// tier-disabled), where executor is already bound. Like workerSwitcher it is
+	// touched only on the message-loop goroutine, so an activation can never race
+	// another activation or executor use.
+	sessionActivator SessionActivator
+
 	// fatalErr parks a connection-terminating error raised inside an
 	// extended-query handler. Those handlers are void (the protocol reports
 	// their failures as ErrorResponse + skip-until-Sync), but a failed tier
@@ -1432,6 +1441,15 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
 	if c.passthrough {
+		// Lazy activation: passthrough sessions carry no tier hooks at all
+		// (executeQueryDirect is hook-free), so acquire here. Defensive today —
+		// useExploratoryTier excludes passthrough users, so no passthrough
+		// connection is ever lazily activated — but it keeps this branch from
+		// dereferencing a nil executor if that exclusion is ever relaxed.
+		// Passthrough speaks raw DuckDB, which classifyStatementTier pins.
+		if err := c.activateForStatement(query, true); err != nil {
+			return err
+		}
 		upperQuery := strings.ToUpper(query)
 		cmdType := c.getCommandType(upperQuery)
 		if cmdType == "COPY" {
@@ -1491,6 +1509,15 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	// Handle fallback to native DuckDB: PostgreSQL parsing failed, try DuckDB directly
 	if result.FallbackToNative {
+		// Lazy activation: validateWithDuckDB runs `EXPLAIN <query>` on the
+		// engine, ABOVE the tier hook below, so a not-yet-acquired connection
+		// must acquire first. FallbackToNative means pg_query could not parse
+		// the statement, which classifyStatementTier defines as pinning — so
+		// this acquires the same profile the hook below would have escalated to,
+		// in one acquire. No-op on every eager connection.
+		if err := c.activateForStatement(query, true); err != nil {
+			return err
+		}
 		if err := c.validateWithDuckDB(query); err != nil {
 			// validateWithDuckDB runs `EXPLAIN <query>` on DuckDB, which fails for
 			// BOTH a genuinely-unparseable query AND a parseable query that hits a
@@ -1541,6 +1568,14 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// never forwarded to DuckDB. A failed worker swap fails the SET so the
 	// session state never diverges from the worker's actual transport.
 	if result.S3CacheSet != nil {
+		// Lazy activation: unlike the other duckgres GUCs this one is WORKER
+		// state (it rebuilds the worker's ducklake_s3 secret), so it must have a
+		// worker to apply to — otherwise SHOW would report a transport no worker
+		// is using, the exact divergence applyS3CacheSetting exists to prevent.
+		// Not a pinning statement, so it acquires the exploratory worker.
+		if err := c.activateForStatement(query, false); err != nil {
+			return err
+		}
 		if err := c.applyS3CacheSetting(*result.S3CacheSet); err != nil {
 			c.sendError("ERROR", "XX000", err.Error())
 		} else {

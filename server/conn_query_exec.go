@@ -626,6 +626,12 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	}
 
 	if result.FallbackToNative {
+		// Lazy activation before the engine-touching validate, same contract as
+		// the matching site in handleQuery: a parse failure classifies as
+		// pinning, so this is the single acquire for the statement.
+		if err := c.activateForStatement(query, true); err != nil {
+			return false, err
+		}
 		if err := c.validateWithDuckDB(query); err != nil {
 			// Not necessarily a syntax error: a parseable native query (e.g.
 			// `DESCRIBE x.y.z`) can fail validation with a real catalog/binder
@@ -660,6 +666,11 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	// applied via the worker transport swap. A failed swap aborts the rest of
 	// the batch — later statements may depend on the requested cache state.
 	if result.S3CacheSet != nil {
+		// Lazy activation: the swap needs a worker to apply to (see the matching
+		// site in handleQuery). Not pinning, so the exploratory tier is enough.
+		if err := c.activateForStatement(query, false); err != nil {
+			return false, err
+		}
 		if err := c.applyS3CacheSetting(*result.S3CacheSet); err != nil {
 			c.sendError("ERROR", "XX000", err.Error())
 			return true, nil

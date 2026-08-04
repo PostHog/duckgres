@@ -189,6 +189,14 @@ func (c *clientConn) handleParse(body []byte) {
 
 	// Handle fallback to native DuckDB: PostgreSQL parsing failed, try DuckDB directly
 	if result.FallbackToNative {
+		// Lazy activation: validateWithDuckDB EXPLAINs on the engine, and Parse
+		// runs above every tier hook. pinsWorker is true here by construction (a
+		// parse failure classifies as pinning), so this is the statement's single
+		// acquire. A failure is connection-fatal and rides out on c.fatalErr,
+		// since this handler cannot return one.
+		if err := c.activateForStatement(query, pinsWorker); err != nil {
+			return
+		}
 		if err := c.validateWithDuckDB(query); err != nil {
 			// Neither PostgreSQL nor DuckDB can parse this query
 			c.observeExtendedParseQueryError("42601", fmt.Sprintf("syntax error: %v", err))
@@ -697,6 +705,11 @@ func (c *clientConn) handleExecute(body []byte) {
 	// during Parse. A failed swap errors the Execute so the session state
 	// never diverges from the worker's actual transport.
 	if p.stmt.s3CacheSet != nil {
+		// Lazy activation: the swap needs a worker to apply to (see the matching
+		// site in handleQuery). Not pinning, so the exploratory tier is enough.
+		if err := c.activateForStatement(p.stmt.query, false); err != nil {
+			return
+		}
 		if err := c.applyS3CacheSetting(*p.stmt.s3CacheSet); err != nil {
 			c.sendError("ERROR", "XX000", err.Error())
 			return

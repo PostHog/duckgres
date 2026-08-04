@@ -218,6 +218,39 @@ func SetConnectionExploratory(cc *clientConn, switcher WorkerSwitcher) {
 	}
 }
 
+// SetSessionActivator installs the lazy first-acquisition hook on a
+// control-plane connection created WITHOUT a worker (exploratory tier only).
+// Call before RunMessageLoop; the activator runs on the message-loop goroutine.
+// The connection must have been built with a nil executor — SetSessionActivator
+// on a connection that already has one is inert by construction, since
+// ensureSessionActive never replaces a live executor. See SessionActivator.
+func SetSessionActivator(cc *clientConn, a SessionActivator) {
+	if cc != nil {
+		cc.sessionActivator = a
+	}
+}
+
+// MarkConnectionPinned takes a connection off the exploratory tier WITHOUT a
+// worker switch — used by the control-plane activator when the very first
+// statement is already a pinning one and it therefore acquired the standard
+// profile directly. Without this the connection would still believe it is on
+// the small worker and escalate (destroy + re-acquire) one statement later.
+func MarkConnectionPinned(cc *clientConn) {
+	if cc != nil {
+		cc.onExploratoryWorker = false
+	}
+}
+
+// SetConnectionDatabase updates the PostgreSQL-visible database name for a
+// control-plane connection after the fact. The eager connect path knows the
+// resolved catalog before it builds the connection; the lazily-activated path
+// learns it only when the session is created, so the activator restamps it.
+func SetConnectionDatabase(cc *clientConn, database string) {
+	if cc != nil {
+		cc.database = database
+	}
+}
+
 // SetConnectionTeamID records the PostHog Team.id this connection is attributed
 // to for product analytics (query_initiated / query_completed / query_failed),
 // giving those per-org events a PostHog-native key. Resolved from the config

@@ -16,11 +16,67 @@ import (
 // on a normal-size worker, returning the new executor + worker identity.
 type WorkerSwitcher func(ctx context.Context, reason string) (exec QueryExecutor, workerID int, workerPod string, err error)
 
+// SessionActivator lazily acquires the connection's first worker/session.
+// Installed by the control plane when the exploratory tier defers acquisition
+// past connection startup, so a connection that never issues an
+// engine-touching statement never spends a worker pod. Invoked on the
+// message-loop goroutine by the first statement that needs an engine — the
+// same goroutine that reads c.executor, so an activation can never race
+// executor use or another activation.
+//
+// pinned=true means the first statement is ALREADY a pinning one: the control
+// plane then acquires the escalation-target (standard) profile directly and
+// marks the connection off-tier (MarkConnectionPinned), instead of acquiring
+// the small worker only to escalate off it one statement later.
+type SessionActivator func(ctx context.Context, pinned bool) (exec QueryExecutor, workerID int, workerPod string, err error)
+
 const (
 	escalateReasonState     = "state"
 	escalateReasonOOM       = "oom"
 	escalateReasonHeuristic = "heuristic"
 )
+
+// needsActivation reports whether this connection defers worker acquisition and
+// has not acquired yet. False on every eager path, which is what keeps the
+// lazy plumbing inert (and byte-for-byte free) outside the exploratory tier.
+func (c *clientConn) needsActivation() bool {
+	return c.executor == nil && c.sessionActivator != nil
+}
+
+// ensureSessionActive acquires the backing session on first need. No-op when an
+// executor is already installed or no activator was configured (eager paths:
+// standalone, process backend, GUC-sized, tier-disabled). Never re-acquires:
+// moving an already-active connection to a bigger worker is escalateWorker's
+// job, so a later pinned=true call is a no-op here.
+func (c *clientConn) ensureSessionActive(ctx context.Context, pinned bool) error {
+	if c.executor != nil || c.sessionActivator == nil {
+		return nil
+	}
+	exec, workerID, workerPod, err := c.sessionActivator(ctx, pinned)
+	if err != nil {
+		// Leave the connection inactive: a half-installed executor would be
+		// dereferenced by the next statement.
+		return err
+	}
+	c.executor = exec
+	c.workerID = workerID
+	c.workerPod = workerPod
+	return nil
+}
+
+// activateForStatement is ensureSessionActive with the connection-fatal
+// failure handling every statement-path call site needs. A no-op (and free —
+// no classification, no call) on every connection that is not lazily
+// activated, which is what keeps the eager paths unchanged.
+func (c *clientConn) activateForStatement(query string, pinned bool) error {
+	if !c.needsActivation() {
+		return nil
+	}
+	if err := c.ensureSessionActive(c.ctx, pinned); err != nil {
+		return c.failWorkerActivation(query, err)
+	}
+	return nil
+}
 
 var exploratoryEscalationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_exploratory_escalations_total",
@@ -101,12 +157,30 @@ func escalationErrorSQLState(err error) string {
 // returns it up through handleQuery, while the extended-query handlers are void
 // and rely on runExtendedQueryMessage reading it back for the message loop.
 func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMessage string) error {
-	if !c.isCallerCancellation(escErr) {
-		c.logQueryError(query, escErr)
+	return c.failWorkerAcquisition(query, escErr, clientMessage, "exploratory worker escalation failed")
+}
+
+// failWorkerActivation terminates the connection after a failed LAZY session
+// activation. Same machinery and same contract as failWorkerEscalation: an
+// activation failure also leaves the connection with no usable session — there
+// was never one — so the client gets a FATAL ErrorResponse and NO
+// ReadyForQuery, and the error unwinds the message loop.
+func (c *clientConn) failWorkerActivation(query string, actErr error) error {
+	return c.failWorkerAcquisition(query, actErr,
+		fmt.Sprintf("could not allocate a worker for this connection: %v", actErr),
+		"worker session activation failed")
+}
+
+// failWorkerAcquisition is the shared body of failWorkerEscalation and
+// failWorkerActivation. Kept single so the two can never drift in SQLSTATE
+// mapping, redaction, ReadyForQuery suppression, or fatalErr parking.
+func (c *clientConn) failWorkerAcquisition(query string, acqErr error, clientMessage, logPhrase string) error {
+	if !c.isCallerCancellation(acqErr) {
+		c.logQueryError(query, acqErr)
 	}
-	c.sendError("FATAL", escalationErrorSQLState(escErr), clientMessage)
+	c.sendError("FATAL", escalationErrorSQLState(acqErr), clientMessage)
 	_ = c.flushWriter()
-	err := fmt.Errorf("%w: exploratory worker escalation failed: %w", errConnectionFatal, escErr)
+	err := fmt.Errorf("%w: %s: %w", errConnectionFatal, logPhrase, acqErr)
 	c.fatalErr = err
 	return err
 }
@@ -118,8 +192,10 @@ func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMess
 // (including for every connection that is not on the exploratory tier).
 func (c *clientConn) escalateForPinningStatement(query string) error {
 	// The classification is deliberately behind the tier check: an off-tier
-	// connection must not pay pg_query.Parse on every statement.
-	if !c.onExploratoryWorker {
+	// connection must not pay pg_query.Parse on every statement. A connection
+	// that has not acquired yet still needs it — the classification is what
+	// picks the profile the single lazy acquire lands on.
+	if !c.onExploratoryWorker && !c.needsActivation() {
 		return nil
 	}
 	return c.escalateForPinningTier(query, classifyStatementTier(query) == tierPinning)
@@ -145,10 +221,19 @@ func (c *clientConn) escalateForPinningStatement(query string) error {
 // default pins it at the general hook. Both ends of that chain pin; only the
 // timing differs.
 func (c *clientConn) escalateForSecretDDL(query string) error {
-	if !c.onExploratoryWorker {
+	if !c.onExploratoryWorker && !c.needsActivation() {
 		return nil
 	}
-	return c.escalateForPinningTier(query, usersecrets.Classify(query).Kind != usersecrets.KindNone)
+	pins := usersecrets.Classify(query).Kind != usersecrets.KindNone
+	if c.needsActivation() && !pins {
+		// Lazy activation: this hook sits ABOVE the interceptions the control
+		// plane answers itself, so it must only acquire for a statement the
+		// secret interception will actually execute. Anything else continues to
+		// the general hook below, which acquires on the right tier — or returns
+		// without acquiring at all if it turns out to be engine-free.
+		return nil
+	}
+	return c.escalateForPinningTier(query, pins)
 }
 
 // currentWorkerTier reports which worker tier the connection is executing on
@@ -169,6 +254,13 @@ func (c *clientConn) currentWorkerTier() string {
 // Parse (preparedStmt.pinsWorker), rather than re-parsing at every Describe and
 // Execute of the same prepared statement.
 func (c *clientConn) escalateForPinningTier(query string, pins bool) error {
+	// Lazy activation first, on the tier this statement needs: a pinning first
+	// statement acquires the standard profile in ONE acquire (the control-plane
+	// activator marks the connection off-tier), so the escalation below is then
+	// a no-op. Inert on every eager connection.
+	if err := c.activateForStatement(query, pins); err != nil {
+		return err
+	}
 	if !c.onExploratoryWorker || !pins {
 		return nil
 	}
