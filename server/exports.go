@@ -206,6 +206,16 @@ func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 	}
 }
 
+// SetConnectionExploratory marks a control-plane connection as starting on
+// the exploratory small worker and installs the switcher used to escalate it.
+// Call before RunMessageLoop; the switcher runs on the message-loop goroutine.
+func SetConnectionExploratory(cc *clientConn, switcher WorkerSwitcher) {
+	if cc != nil {
+		cc.onExploratoryWorker = true
+		cc.workerSwitcher = switcher
+	}
+}
+
 // SetConnectionTeamID records the PostHog Team.id this connection is attributed
 // to for product analytics (query_initiated / query_completed / query_failed),
 // giving those per-org events a PostHog-native key. Resolved from the config

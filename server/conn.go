@@ -224,6 +224,15 @@ type clientConn struct {
 	workerMillicores int64
 	workerMiB        int64
 
+	// Exploratory-tier state (remote backend only). onExploratoryWorker is
+	// true while the connection runs on the small exploratory worker;
+	// workerSwitcher (installed by the control plane) swaps the backing
+	// worker/session. Both are touched only on the connection's message-loop
+	// goroutine — swaps happen inline during statement handling, never
+	// concurrently with executor use — so no locking.
+	onExploratoryWorker bool
+	workerSwitcher      WorkerSwitcher
+
 	// teamID is the PostHog Team.id this connection is attributed to for product
 	// analytics (the connecting user's team, else the org's oldest team; 0 when
 	// unknown / non-multitenant). Stamped once at setup via SetConnectionTeamID
