@@ -367,6 +367,10 @@ Run with config file:
 | `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval for native Postgres writes | `5s` |
 | `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size for native Postgres inserts | `1000` |
 | `DUCKGRES_STORAGE_SAMPLE_INTERVAL` | Storage-billing sampling cadence (Go duration): how often the leader CP reads each warehouse's tracked DuckLake footprint and credits byte-seconds. Env-only. | `30m` |
+| `DUCKGRES_EXPLORATORY_TIER_ENABLED` | Exploratory worker tier (small-first routing, remote/K8s backend only): a connection that sends no `duckgres.worker_*` sizing options acquires NO worker at connect, and its first engine-touching statement lands on the small shape below; state-mutating statements and engine OOMs escalate it to the shape it would otherwise have started on. Env-only. | `false` |
+| `DUCKGRES_EXPLORATORY_WORKER_CPU` | CPU request/limit of the exploratory worker pod (e.g. `1`, `500m`). Required (with the memory knob) for the tier to activate; a missing or invalid value logs a warning and leaves the tier OFF. Env-only. | - |
+| `DUCKGRES_EXPLORATORY_WORKER_MEMORY` | Memory request/limit of the exploratory worker pod (e.g. `2Gi`). Same requirement as the CPU knob. Env-only. | - |
+| `DUCKGRES_EXPLORATORY_WORKER_TTL` | Hot-idle TTL of exploratory worker pods (Go duration) — how long one stays parked for the org's next connection after its last one ends. Env-only. | `48h` |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
 | `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
