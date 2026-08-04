@@ -59,14 +59,30 @@ func TestFilePersistenceStandaloneConnectionInitializesSession(t *testing.T) {
 		_ = db.Close()
 		t.Fatalf("query current_database(): %v", err)
 	}
-	if currentDB != "test" {
+	// file persistence opens <DataDir>/<username>.duckdb, so the backing catalog -- and
+	// therefore current_database() -- is the user, not the client's dbname
+	if currentDB != "testuser" {
 		_ = db.Close()
-		t.Fatalf("current_database() = %q, want %q", currentDB, "test")
+		t.Fatalf("current_database() = %q, want %q", currentDB, "testuser")
 	}
 
 	if _, err := db.Exec("CREATE TABLE fp_session_probe (id INTEGER)"); err != nil {
 		_ = db.Close()
 		t.Fatalf("create persisted table: %v", err)
+	}
+
+	// the metadata views filter on current_database(); if that names a catalog the user's
+	// tables do not live in, everything they create is invisible here
+	var visible int
+	if err := db.QueryRow(
+		"SELECT count(*) FROM information_schema.tables WHERE table_name = 'fp_session_probe'",
+	).Scan(&visible); err != nil {
+		_ = db.Close()
+		t.Fatalf("query information_schema.tables: %v", err)
+	}
+	if visible != 1 {
+		_ = db.Close()
+		t.Fatalf("information_schema.tables rows for fp_session_probe = %d, want 1", visible)
 	}
 	if _, err := db.Exec("INSERT INTO fp_session_probe VALUES (42)"); err != nil {
 		_ = db.Close()

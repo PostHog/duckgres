@@ -2,10 +2,13 @@ package sessionmeta
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	_ "github.com/duckdb/duckdb-go/v2"
 
 	"github.com/posthog/duckgres/server/sqlcore"
 )

@@ -927,25 +927,21 @@ func (c *clientConn) serve() error {
 		// the real attached catalog, not the client's connection database name.
 		// Standalone has a single backing catalog, so honor whatever is attached.
 		catalog := c.database
-		if duckLakeAttached {
+		switch {
+		case duckLakeAttached:
 			catalog = physicalDuckLakeCatalog
+		case c.server.cfg.FilePersistence && c.server.cfg.DataDir != "" && c.username != "":
+			// File persistence opens <DataDir>/<username>.duckdb, so DuckDB names the
+			// backing catalog after the user, not after c.database. Without this the
+			// metadata views filter on a catalog that holds nothing and the user's own
+			// tables are missing from pg_tables / information_schema.tables. An empty
+			// DataDir means DuckDBDSN fell back to :memory:, where no such catalog exists.
+			catalog = c.username
 		}
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
-		}
-		if c.server.cfg.FilePersistence && !duckLakeAttached && !icebergAttached {
-			if _, err := c.executor.ExecContext(initCtx, "USE "+sqlcore.QuoteIdentifier(c.username)); err != nil {
-				initCancel()
-				c.sendError("FATAL", "XX000", fmt.Sprintf("failed to select file-backed catalog: %v", err))
-				return err
-			}
-			if _, err := c.executor.ExecContext(initCtx, "SET search_path = 'main,memory.main'"); err != nil {
-				initCancel()
-				c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize file-backed search_path: %v", err))
-				return err
-			}
 		}
 		initCancel()
 		// Keep c.database aligned with the real catalog so observability surfaces
