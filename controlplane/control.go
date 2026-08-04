@@ -1716,7 +1716,17 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			server.SetConnectionWorkerSize(cc, millicores, mib)
 			res.clog.Info("Connection activated on worker.", "pinned", pinned,
 				"cpu", workerProfileCPU(res.profile), "memory", workerProfileMemory(res.profile))
-			return res.exec, res.workerID, res.workerPod, nil
+			// Same typed-nil guard the connect path uses (`var sessionExec
+			// server.QueryExecutor` above): res.exec is a *FlightExecutor, so
+			// returning a nil one directly would hand back a NON-nil interface
+			// holding a nil pointer, and needsActivation()/c.executor==nil checks
+			// would read the connection as active and dereference it. A successful
+			// create never returns nil here — this keeps that from being load-bearing.
+			var activatedExec server.QueryExecutor
+			if res.exec != nil {
+				activatedExec = res.exec
+			}
+			return activatedExec, res.workerID, res.workerPod, nil
 		})
 	}
 

@@ -70,7 +70,13 @@ func (c *clientConn) ensureSessionActive(ctx context.Context, pinned bool) error
 	// failure fails the activation, which is connection-fatal: a session that
 	// asked for s3_cache=off must never silently run cached.
 	if err := c.applyPendingS3CacheOption(); err != nil {
-		return err
+		// Classified like every other activation failure so the lazy path
+		// presents the SAME FATAL shape as the eager connect path, which rejects
+		// a bad/unappliable startup option with XX000. Without the wrap this
+		// leaked through escalationErrorSQLState's substring fallback as a
+		// generic 53400 (configuration_limit_exceeded) — a capacity-shaped
+		// SQLSTATE for a transport-swap failure.
+		return &SessionAcquireError{Code: "XX000", Message: err.Error(), Err: err}
 	}
 	return nil
 }
@@ -87,6 +93,22 @@ func (c *clientConn) applyPendingS3CacheOption() error {
 	c.hasPendingS3Cache = false
 	c.pendingS3Cache = ""
 	return c.applyStartupS3Cache(raw)
+}
+
+// activateForS3CacheShow activates a lazily-acquired connection before
+// answering `SHOW duckgres.s3_cache` — but ONLY when the answer would otherwise
+// be a lie. A connection carrying a not-yet-applied connect-time
+// `-c duckgres.s3_cache=off` still reports `on` until ensureSessionActive
+// applies it, so that case must acquire first. With no pending option the
+// session flag is already truthful (every SET path activates BEFORE flipping
+// it, and a worker always starts on the cache-proxy transport), so SHOW stays
+// engine-free: a client that only introspects never spends a worker pod, which
+// is the whole point of lazy acquisition.
+func (c *clientConn) activateForS3CacheShow(query string) error {
+	if !c.hasPendingS3Cache {
+		return nil
+	}
+	return c.activateForStatement(query, false)
 }
 
 // activateForStatement is ensureSessionActive with the connection-fatal

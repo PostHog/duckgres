@@ -679,8 +679,9 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return false, nil
 	}
 	if result.S3CacheShow {
-		// Lazy activation before answering: see the matching site in handleQuery.
-		if err := c.activateForStatement(query, false); err != nil {
+		// Lazy activation before answering, only if a connect-time option is
+		// still pending: see the matching site in handleQuery.
+		if err := c.activateForS3CacheShow(query); err != nil {
 			return false, err
 		}
 		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})

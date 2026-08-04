@@ -10,6 +10,7 @@ import (
 
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeActivationSessions is a scripted activationSessions recording the calls
@@ -192,7 +193,10 @@ func TestActivateConnectionSessionClassifiesFailures(t *testing.T) {
 				}
 			},
 			wantCode: "57014",
-			wantMsg:  "canceling authentication due to user request",
+			// NOT the connect path's "canceling authentication…": a lazy
+			// activation is cancelled against an in-flight STATEMENT, long after
+			// authentication finished.
+			wantMsg: "canceling statement due to user request",
 		},
 		{
 			name: "queue timeout",
@@ -322,6 +326,44 @@ func TestActivateConnectionSessionCancelAbortsAcquire(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("CancelRequest did not abort the acquire; a client cannot cancel a slow first statement")
+	}
+}
+
+// TestActivationCancelMessageDivergesFromConnectPath pins the deliberate
+// wording split: the eager connect path cancels during AUTHENTICATION, a lazy
+// activation cancels an in-flight STATEMENT. Same SQLSTATE, different truth —
+// re-unifying them would put "canceling authentication" in a client's log
+// minutes after it authenticated.
+func TestActivationCancelMessageDivergesFromConnectPath(t *testing.T) {
+	acq := newSessionAcquireError(context.Canceled)
+	if acq.Code != "57014" || acq.Message != "canceling statement due to user request" {
+		t.Fatalf("activation cancel = %q/%q, want 57014/canceling statement due to user request", acq.Code, acq.Message)
+	}
+	if _, connectMsg := sessionCreationErrorResponse(context.Canceled); connectMsg != "canceling authentication due to user request" {
+		t.Fatalf("connect-path cancel wording changed to %q; only the activation branch may be re-worded", connectMsg)
+	}
+	// Every other classification is passed through verbatim.
+	if got := newSessionAcquireError(ErrSessionManagerDraining); got.Message != "control plane is draining, retry shortly" {
+		t.Fatalf("draining message = %q, want the shared classification verbatim", got.Message)
+	}
+}
+
+// TestActivationMetricsCarryOrgLabel pins the org label added for per-tenant
+// slicing (which tenant is eating cold-spawn waits / hitting its cap).
+func TestActivationMetricsCarryOrgLabel(t *testing.T) {
+	sessions := &fakeActivationSessions{}
+	req := newActivationRequest(t, sessions)
+	req.orgID = "org-metric-label"
+
+	before := testutil.ToFloat64(sessionActivationTotal.WithLabelValues(req.orgID, string(sessionActivationSuccess)))
+	if _, err := activationTestCP().activateConnectionSession(context.Background(), req); err != nil {
+		t.Fatalf("activateConnectionSession: %v", err)
+	}
+	if got := testutil.ToFloat64(sessionActivationTotal.WithLabelValues(req.orgID, string(sessionActivationSuccess))); got != before+1 {
+		t.Fatalf("duckgres_session_activation_total{org=%q,outcome=success} = %v, want %v", req.orgID, got, before+1)
+	}
+	if got := testutil.CollectAndCount(sessionActivationDuration, "duckgres_session_activation_duration_seconds"); got == 0 {
+		t.Fatal("duckgres_session_activation_duration_seconds collected no series; the org-labelled histogram never observed")
 	}
 }
 

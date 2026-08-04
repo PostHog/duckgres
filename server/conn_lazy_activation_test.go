@@ -432,9 +432,39 @@ func TestLazyActivationShowS3CacheActivatesFirst(t *testing.T) {
 	}
 }
 
+// TestLazyActivationShowS3CacheWithoutPendingOptionDoesNotActivate is the other
+// half of the SHOW contract: with NO pending connect-time option the session
+// flag is already truthful, so introspecting the GUC must stay engine-free. A
+// client that only ever SHOWs must never spend a worker pod — that is the whole
+// point of lazy acquisition.
+func TestLazyActivationShowS3CacheWithoutPendingOptionDoesNotActivate(t *testing.T) {
+	l := newLazyS3CacheConn(t)
+
+	if err := l.c.handleQuery([]byte("SHOW duckgres.s3_cache\x00")); err != nil {
+		t.Fatalf("handleQuery(SHOW): %v", err)
+	}
+	if len(l.pinned) != 0 {
+		t.Fatalf("SHOW with no pending option activated a worker: %v", l.pinned)
+	}
+	if l.c.executor != nil {
+		t.Fatal("SHOW with no pending option installed an executor")
+	}
+	sawOn := false
+	for _, m := range parseWireMsgs(t, l.out.Bytes()) {
+		if m.typ == 'D' && bytes.Contains(m.body, []byte("on")) {
+			sawOn = true
+		}
+	}
+	if !sawOn {
+		t.Fatalf("SHOW duckgres.s3_cache did not report the default `on`: %s", describeMsgs(parseWireMsgs(t, l.out.Bytes())))
+	}
+}
+
 // TestLazyActivationPendingS3CacheFailureIsConnectionFatal asserts a worker
 // swap that fails at activation refuses the connection rather than letting a
-// session that asked for s3_cache=off silently run cached.
+// session that asked for s3_cache=off silently run cached — with the SAME
+// SQLSTATE the eager connect path uses for that failure (XX000), not the
+// generic 53400 the substring fallback would have guessed.
 func TestLazyActivationPendingS3CacheFailureIsConnectionFatal(t *testing.T) {
 	l := newLazyS3CacheConn(t)
 	l.exec.err = errors.New("secret swap rejected")
@@ -448,8 +478,8 @@ func TestLazyActivationPendingS3CacheFailureIsConnectionFatal(t *testing.T) {
 		t.Fatalf("error %v does not carry errConnectionFatal", err)
 	}
 	msgs := parseWireMsgs(t, l.out.Bytes())
-	if !hasSeverity(msgs, "FATAL") {
-		t.Fatalf("want a FATAL ErrorResponse: %s", describeErrorResponses(msgs))
+	if !hasErrorResponse(msgs, "FATAL", "XX000") {
+		t.Fatalf("want FATAL XX000 (the eager connect path's code for this failure), got %s", describeErrorResponses(msgs))
 	}
 	if countMsgs(msgs, 'Z') != 0 {
 		t.Fatalf("ReadyForQuery sent after a connection-fatal activation failure: %s", describeMsgs(msgs))
@@ -473,7 +503,7 @@ func TestLazyActivationTypedErrorSQLStateAndMessage(t *testing.T) {
 		{"capacity", "53300", "no idle worker available; retry in about 45s"},
 		{"vcpu admission", "53400", "requested worker requires 16 vCPUs, exceeding the organization limit of 8 vCPUs; request a smaller worker or raise the limit"},
 		{"draining", "57P03", "control plane is draining, retry shortly"},
-		{"cancel", "57014", "canceling authentication due to user request"},
+		{"cancel", "57014", "canceling statement due to user request"},
 		{"catalog", "3D000", `database "nope" does not exist`},
 	}
 	for _, tc := range cases {

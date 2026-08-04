@@ -1594,12 +1594,13 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		return nil
 	}
 	if result.S3CacheShow {
-		// Lazy activation: this GUC reports WORKER transport state, and a
-		// connection that asked for `off` at connect has not had that option
-		// applied yet (ensureSessionActive applies it). Answering before
-		// activating would report `on` for a session that is about to be
-		// bypassed. Correctness beats laziness for a niche benchmarking GUC.
-		if err := c.activateForStatement(query, false); err != nil {
+		// Lazy activation, but only when a connect-time option is still pending:
+		// this GUC reports WORKER transport state, and a connection that asked for
+		// `off` at connect has not had that option applied yet
+		// (ensureSessionActive applies it), so answering first would report `on`
+		// for a session that is about to be bypassed. Without a pending option the
+		// session flag is already truthful and SHOW stays engine-free.
+		if err := c.activateForS3CacheShow(query); err != nil {
 			return err
 		}
 		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})

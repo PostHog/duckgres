@@ -718,8 +718,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 	if p.stmt.s3CacheShow {
-		// Lazy activation before answering: see the matching site in handleQuery.
-		if err := c.activateForStatement(p.stmt.query, false); err != nil {
+		// Lazy activation before answering, only if a connect-time option is
+		// still pending: see the matching site in handleQuery.
+		if err := c.activateForS3CacheShow(p.stmt.query); err != nil {
 			return
 		}
 		if !p.described {
