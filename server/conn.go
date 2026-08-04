@@ -1212,6 +1212,14 @@ func (c *clientConn) messageLoop() error {
 					return nil
 				}
 				c.logger().Error("Query error.", "error", err)
+				// A connection-fatal error (today: a failed exploratory-tier
+				// escalation, whose switcher already destroyed the previous
+				// session) has sent a FATAL ErrorResponse and deliberately no
+				// ReadyForQuery. There is nothing left to resynchronize to, so
+				// unwind instead of reading the next message.
+				if errors.Is(err, errConnectionFatal) {
+					return err
+				}
 			}
 			if c.drainRequested.Load() {
 				return nil
@@ -1502,6 +1510,18 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
+	}
+
+	// Exploratory tier: a statement that writes or creates session state must
+	// run on (and pin) a normal-size worker. Escalate BEFORE execution so the
+	// small worker stays stateless by construction. Interpreted statements the
+	// CP already handled (cursor / pg_stat_activity / secret DDL / GUC / no-op
+	// intercepts) returned above and never reach this point. Deliberately above
+	// the writable-CTE rewrite branch: classifyStatementTier detects the
+	// embedded DML, and that branch runs it on the worker. A failed escalation
+	// is connection-fatal — the previous session is already gone.
+	if err := c.escalateForPinningStatement(query); err != nil {
+		return err
 	}
 
 	// Handle multi-statement results (writable CTE rewrites)

@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -52,6 +55,67 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	if err := c.reapplyS3CacheAfterWorkerSwitch(ctx); err != nil {
 		c.s3CacheOff = false
 		return err
+	}
+	return nil
+}
+
+// errConnectionFatal marks an error that must TERMINATE the connection rather
+// than be reported and resumed at the next ReadyForQuery. The message loop
+// checks for it and returns instead of continuing to read messages.
+var errConnectionFatal = errors.New("connection terminated")
+
+// escalationErrorSQLState maps a failed worker escalation to the SQLSTATE the
+// client sees. The control plane owns the actual sentinels
+// (errEscalationUserDisabled, *WorkerCapacityExhaustedError) but reaches this
+// package through a plain `error`, so this matches on the client-visible
+// message text — the same idiom as every classifier in conn_errors.go. Keep it
+// in sync with controlplane/worker_profile.go (disabledUserMessage) and
+// controlplane/capacity_policy.go (capacityMissPolicy.errorString).
+func escalationErrorSQLState(err error) string {
+	if err == nil {
+		return "53400"
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "account is disabled"):
+		return "28000" // invalid_authorization_specification
+	case strings.Contains(msg, "worker capacity"):
+		return "53300" // too_many_connections — the org/cluster is at its cap
+	default:
+		return "53400" // configuration_limit_exceeded
+	}
+}
+
+// failWorkerEscalation terminates the connection after a failed tier
+// escalation. By the time the switcher returns an error the connection's
+// previous session is ALREADY destroyed (see escalateWorker), so there is no
+// session left to resynchronize to: the client gets a FATAL ErrorResponse and
+// NO ReadyForQuery, and the returned error unwinds the message loop.
+//
+// clientMessage is what the client sees: the escalation failure itself for a
+// pinning statement, or the original query error for an OOM re-execute whose
+// escalation could not be completed.
+func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMessage string) error {
+	if !c.isCallerCancellation(escErr) {
+		c.logQueryError(query, escErr)
+	}
+	c.sendError("FATAL", escalationErrorSQLState(escErr), clientMessage)
+	_ = c.flushWriter()
+	return fmt.Errorf("%w: exploratory worker escalation failed: %w", errConnectionFatal, escErr)
+}
+
+// escalateForPinningStatement escalates the connection off the exploratory
+// worker before a statement that writes or creates session state executes, so
+// the small worker stays stateless by construction. Returns a
+// connection-terminating error when the escalation fails; nil otherwise
+// (including for every connection that is not on the exploratory tier).
+func (c *clientConn) escalateForPinningStatement(query string) error {
+	if !c.onExploratoryWorker || classifyStatementTier(query) != tierPinning {
+		return nil
+	}
+	if err := c.escalateWorker(c.ctx, escalateReasonState); err != nil {
+		return c.failWorkerEscalation(query, err,
+			fmt.Sprintf("could not allocate a standard worker for this statement: %v", err))
 	}
 	return nil
 }
