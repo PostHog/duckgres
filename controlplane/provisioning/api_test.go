@@ -77,7 +77,11 @@ func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if needed (mirrors production behavior)
 	if _, ok := s.orgs[orgID]; !ok {
-		s.orgs[orgID] = &configstore.Org{Name: orgID, DatabaseName: databaseName}
+		s.orgs[orgID] = &configstore.Org{
+			Name:         orgID,
+			DatabaseName: databaseName,
+			MaxVCPUs:     defaultProvisionedOrgMaxVCPUs,
+		}
 	}
 	existing, ok := s.warehouses[orgID]
 	if ok && existing.State != configstore.ManagedWarehouseStateFailed && existing.State != configstore.ManagedWarehouseStateDeleted {
@@ -229,7 +233,11 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 		if req.TeamID == 0 {
 			return ErrProvisionTeamRequired
 		}
-		s.orgs[req.OrgID] = &configstore.Org{Name: req.OrgID, DatabaseName: req.DatabaseName}
+		s.orgs[req.OrgID] = &configstore.Org{
+			Name:         req.OrgID,
+			DatabaseName: req.DatabaseName,
+			MaxVCPUs:     defaultProvisionedOrgMaxVCPUs,
+		}
 	}
 	if req.TeamID != 0 {
 		schema := req.SchemaName
@@ -421,6 +429,9 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	}
 	if _, ok := store.orgs["new-org"]; !ok {
 		t.Fatal("expected org to be auto-created")
+	}
+	if got := store.orgs["new-org"].MaxVCPUs; got != 64 {
+		t.Fatalf("auto-created org MaxVCPUs = %d, want 64", got)
 	}
 	if store.warehouses["new-org"] == nil {
 		t.Fatal("expected warehouse to be created")
