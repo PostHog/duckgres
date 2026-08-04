@@ -1365,6 +1365,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		disconnectWatcher  *preReadyDisconnectWatcher
 	)
 
+	// destroySessionOnExit tears the connection's session down on every exit
+	// path. Deferred at the SAME point on both paths — before the metadata init
+	// that can fail — so a failed init never leaks a worker; the
+	// sessionEverCreated guard makes it inert for a lazily activated connection
+	// that never ran a statement (destroying an unknown pid is a spurious warn).
+	destroySessionOnExit := func() {
+		if !sessionEverCreated {
+			return
+		}
+		sessions.DestroySession(pid)
+		if orgID != "" {
+			observeOrgSessionsActive(orgID, sessions.SessionCount())
+		}
+	}
+
 	// sessionMeta carries the connect-time constants every session
 	// initialization replays — at connect (eager), at lazy activation, and after
 	// a tier escalation. Its clog is replaced per acquisition with one stamped
@@ -1408,6 +1423,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 		duckLakeAttached = true
 		database = effectiveCatalog
+		defer destroySessionOnExit()
 		// No slow pre-ready acquisition to watch: ReadyForQuery follows the
 		// initial parameters immediately, so the disconnect watcher would only
 		// contend with a client that pipelines its first query.
@@ -1456,6 +1472,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		if orgID != "" {
 			observeOrgSessionsActive(orgID, sessions.SessionCount())
 		}
+		defer destroySessionOnExit()
 
 		// Probe which catalogs the worker actually attached for this session, then
 		// resolve the real catalog the session defaults to and initialize the
@@ -1480,16 +1497,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		// the message loop if the backing worker dies.
 		sessions.SetConnCloser(pid, tlsConn)
 	}
-
-	defer func() {
-		if !sessionEverCreated {
-			return
-		}
-		sessions.DestroySession(pid)
-		if orgID != "" {
-			observeOrgSessionsActive(orgID, sessions.SessionCount())
-		}
-	}()
 
 	// Create real clientConn with FlightExecutor and worker assignment. On the
 	// lazy path the executor argument must be an untyped nil: a typed-nil
