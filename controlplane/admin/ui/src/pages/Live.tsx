@@ -18,15 +18,32 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useCancelSession, useKillUserSessions, useQueries, useSessions } from "@/hooks/useApi";
-import { fmtAge, fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
+import { useCancelSession, useKillUserSessions, useOrgs, useQueries, useSessions } from "@/hooks/useApi";
+import { fmtAge, fmtDurationMs, fmtInt, fmtTime, orgLabel } from "@/lib/format";
 import { idleInTransaction, isIdleSession, sessionStateLabel } from "@/lib/session";
 import { compareByStarted, compareByWorker } from "@/lib/liveSort";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
+function OrgIdentity({ id, label }: { id: string; label?: string }) {
+  if (!label || label === id) {
+    return <span className="font-mono text-xs">{id}</span>;
+  }
+  return (
+    <span className="block min-w-0">
+      <span className="block truncate text-xs font-medium text-foreground" title={label}>
+        {label}
+      </span>
+      <span className="block truncate font-mono text-[11px] text-muted-foreground" title={id}>
+        {id}
+      </span>
+    </span>
+  );
+}
+
 export function Live() {
   const queries = useQueries();
   const sessions = useSessions();
+  const orgs = useOrgs();
   const cancel = useCancelSession();
   const killUser = useKillUserSessions();
   const [org, setOrg] = useState("");
@@ -36,6 +53,11 @@ export function Live() {
   // The kill endpoint targets an EXACT (org, user); the filter boxes are
   // substring matches, so only offer it once both are set, and pass them verbatim.
   const canKillUser = org.trim() !== "" && user.trim() !== "";
+
+  const orgLabels = useMemo(
+    () => new Map((orgs.data ?? []).map((o) => [o.name, orgLabel(o)])),
+    [orgs.data],
+  );
 
   const matchOrg = (o?: string) => !org || (o ?? "").toLowerCase().includes(org.toLowerCase());
   const matchUser = (u?: string) => !user || (u ?? "").toLowerCase().includes(user.toLowerCase());
@@ -164,7 +186,9 @@ export function Live() {
                         title="View query detail"
                       >
                         <TableCell className="font-mono text-xs">{q.pid}</TableCell>
-                        <TableCell className="font-mono text-xs">{q.org}</TableCell>
+                        <TableCell>
+                          <OrgIdentity id={q.org} label={orgLabels.get(q.org)} />
+                        </TableCell>
                         <TableCell className="font-mono text-xs">{q.user || "—"}</TableCell>
                         <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
                           <Tooltip>
@@ -263,7 +287,9 @@ export function Live() {
                   {liveSessions.map((s) => (
                     <TableRow key={`${s.pid}-${s.worker_id}`} className="[&>td]:py-1.5">
                       <TableCell className="font-mono text-xs">{s.pid}</TableCell>
-                      <TableCell className="font-mono text-xs">{s.org}</TableCell>
+                      <TableCell>
+                        <OrgIdentity id={s.org} label={orgLabels.get(s.org)} />
+                      </TableCell>
                       <TableCell className="font-mono text-xs">{s.user || "—"}</TableCell>
                       <TableCell className="font-mono text-xs">#{s.worker_id}</TableCell>
                       <TableCell>
