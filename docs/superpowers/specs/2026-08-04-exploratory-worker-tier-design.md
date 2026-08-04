@@ -57,6 +57,55 @@ a query is heavy or the session accumulates state.
 - GUC-sized connections (`duckgres.worker_*`) bypass the tier but also
   acquire lazily at first statement, for one consistent acquisition point.
 
+#### Implementation decisions (Task 9)
+
+**Scope narrowed from the bullet above.** Lazy acquisition applies ONLY when
+the exploratory tier is active for the connection (`useExploratory` AND a
+config store). GUC-sized, tier-disabled, passthrough, process-backend and
+standalone connections keep the eager connect-time acquire byte for byte —
+one consistent acquisition point was not worth re-validating every legacy
+path against. Revisit if the tier becomes the only mode.
+
+**ADMISSION-TIMING (accepted).** For tiered connections, everything that
+happens as part of acquiring a worker now happens at the FIRST STATEMENT
+rather than at connect: the org/user vCPU admission check, the org
+`max_connections` limit, and worker-capacity backpressure. A client can
+therefore complete a PostgreSQL handshake (auth OK, ParameterStatus,
+BackendKeyData, ReadyForQuery) and only then be told `53400`/`53300` on its
+first query, as a FATAL that terminates the connection. Accepted: the
+alternative is admitting at connect, which requires acquiring at connect and
+defeats the whole feature. Consequences to keep in mind:
+
+- Those failures are connection-fatal at first statement, not connect-time
+  rejections. Clients that distinguish "could not connect" from "query
+  failed" will see the latter.
+- The failure is classified control-plane side with the SAME logic the eager
+  path uses (`sessionCreationErrorResponse` → `server.SessionAcquireError`),
+  so the SQLSTATE and message are identical to what a connect-time rejection
+  would have carried — only the timing differs.
+- Admission-related counters that keyed off connect-time rejections will
+  under-count for tiered orgs; `duckgres_session_activation_total{outcome}`
+  (success | canceled | capacity | draining | error) plus
+  `duckgres_session_activation_duration_seconds` are the replacement signal,
+  since `duckgres_session_start_*` now only covers the handshake for these
+  connections.
+
+**Cancellation.** A first-statement acquire is registered for cancellation
+(`createSessionWithRegisteredCancel`), so a `CancelRequest` aborts a slow
+cold spawn exactly as it did at connect (surfaces as `57014`).
+
+**TCP-FIN during activation (accepted gap).** The eager path runs a
+pre-ready disconnect watcher so a client FIN during the slow acquire tears
+the session down. The lazy path does not start one: after ReadyForQuery the
+socket belongs to the message loop, which is blocked inside the statement
+that triggered the acquire, so a FIN is not observed until the acquire
+returns. A client that disconnects mid-activation therefore leaves the spawn
+running to completion. This is bounded and self-healing — the existing
+abandoned-spawn machinery parks the completed worker hot-idle for the org's
+next connection (`ReleaseWorker` / `TransitionToHotIdleIfNoSessions`), and
+the connection's own teardown destroys the session as soon as the acquire
+returns. Nothing leaks in Reserved/Activating.
+
 ### 3. Classification & escalation (CP-side, pg_query-based)
 
 Per statement, three outcomes:

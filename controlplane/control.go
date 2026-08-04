@@ -1337,9 +1337,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 
 	// Lazy acquisition: on the exploratory tier the worker is acquired by the
-	// FIRST statement that needs an engine, not at connect. An idle connection
-	// (a pooled client that connects and waits, a psql session left open) then
-	// holds no worker pod at all. Deliberately scoped to the tier flag, and to
+	// FIRST statement that needs an engine, not at connect, so a connection that
+	// has not issued a statement yet holds no worker pod. (The connection idle
+	// timeout still applies from ReadyForQuery and still closes such a
+	// connection; it simply has no worker to release when it does.)
+	// Deliberately scoped to the tier flag, and to
 	// the multitenant config-store path whose catalog resolution is knowable
 	// without a session (see the catalog block below) — every other connection
 	// keeps today's eager acquire byte for byte.
@@ -1593,8 +1595,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			defer cancel()
 			_, exec, err := sessions.CreateSession(createCtx, username, pid, escMemLimit, escThreads, workerProfile)
 			if err != nil {
-				// TODO(exploratory-tier): map WorkerCapacityExhaustedError through sessionCreationErrorResponse so the client sees 53300 + retry hint instead of a generic failure.
-				return nil, 0, "", fmt.Errorf("escalate to standard worker: %w", err)
+				// Classified with the same logic the eager connect path uses, so
+				// the client sees the real SQLSTATE + message (53300 with a retry
+				// hint at capacity, 53400 for a vCPU-admission rejection, 57P03
+				// while draining) instead of a substring guess.
+				return nil, 0, "", fmt.Errorf("escalate to standard worker: %w", newSessionAcquireError(err))
 			}
 			if orgID != "" {
 				observeOrgSessionsActive(orgID, sessions.SessionCount())
@@ -1620,10 +1625,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 				meta:     escMeta,
 			})
 			if initErr != nil {
-				return nil, 0, "", fmt.Errorf("init session on standard worker: %w", initErr)
+				// Keep the init failure's own SQLSTATE (e.g. 3D000 for an
+				// unavailable catalog) rather than re-deriving one.
+				return nil, 0, "", fmt.Errorf("init session on standard worker: %w",
+					&server.SessionAcquireError{Code: initErr.code, Message: initErr.message, Err: initErr})
 			}
 			if gateErr != nil {
-				return nil, 0, "", gateErr
+				return nil, 0, "", &server.SessionAcquireError{
+					Code: "28000", Message: disabledUserMessage, Err: gateErr,
+				}
 			}
 			// Apply the RE-DERIVED metadata: the standard worker attached its own
 			// catalogs, so the transpiler backend profile and catalog USE
@@ -1650,60 +1660,46 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// activator always runs first because the switcher is only reachable from a
 	// connection that already has an executor).
 	if lazyActivation {
+		// The connect-time `-c duckgres.s3_cache=...` option cannot be applied
+		// here (no worker to swap the S3 transport on) and MUST NOT be applied
+		// inside the activator either: the executor is installed by
+		// ensureSessionActive only after the activator returns, so an apply
+		// there would silently no-op the worker swap while flipping the session
+		// flag. Park it instead; ensureSessionActive applies it at the right
+		// moment and fails the activation if the swap fails.
+		if s3CacheRequested {
+			server.SetPendingS3CacheOption(cc, rawS3Cache)
+		}
 		server.SetSessionActivator(cc, func(ctx context.Context, pinned bool) (server.QueryExecutor, int, string, error) {
-			// pinned means the connection's FIRST statement already pins: take
-			// the escalation target (workerProfile) directly rather than
-			// acquiring the small worker and escalating off it one statement
-			// later — a wasted acquire, a wasted pod, and a wasted destroy.
-			profile := initialProfile
-			if pinned {
-				profile = workerProfile
-			}
-			actMemLimit, actThreads := cp.workerDuckDBLimits(profile)
-			createCtx, cancel := context.WithTimeout(ctx, cp.cfg.WorkerQueueTimeout)
-			defer cancel()
-			_, exec, err := sessions.CreateSession(createCtx, username, pid, actMemLimit, actThreads, profile)
-			// Set before the error check: a create that failed after committing
-			// (a raced cancel/drain) must still be torn down by the deferred
-			// DestroySession rather than leaking its worker.
-			sessionEverCreated = true
-			if err != nil {
-				// TODO(exploratory-tier): map WorkerCapacityExhaustedError through sessionCreationErrorResponse so the client sees 53300 + retry hint instead of a generic failure.
-				return nil, 0, "", fmt.Errorf("acquire worker for connection: %w", err)
-			}
-			if orgID != "" {
-				observeOrgSessionsActive(orgID, sessions.SessionCount())
-			}
-			newWorkerID := sessions.WorkerIDForPID(pid)
-			newWorkerPod := sessions.WorkerPodNameForPID(pid)
-			actClog := baseClog.With("worker", newWorkerID, "worker_pod", newWorkerPod)
-			actMeta := sessionMeta
-			actMeta.clog = actClog
-			// Deliberately NOT createCtx: WorkerQueueTimeout budgets the worker
-			// ACQUISITION, so reusing it here would leave init only whatever is
-			// left of it. Same reasoning as the switcher above.
-			actInitMeta, initErr, gateErr := cp.finishSessionAcquisition(ctx, sessionAcquisition{
-				sessions: sessions,
-				pid:      pid,
-				orgID:    orgID,
-				username: username,
-				tlsConn:  tlsConn,
-				exec:     exec,
-				meta:     actMeta,
+			res, err := cp.activateConnectionSession(ctx, sessionActivationRequest{
+				sessions:           sessions,
+				srv:                cp.srv,
+				backendKey:         server.BackendKey{Pid: pid, SecretKey: secretKey},
+				pid:                pid,
+				orgID:              orgID,
+				username:           username,
+				connCloser:         tlsConn,
+				pinned:             pinned,
+				exploratoryProfile: initialProfile,
+				standardProfile:    workerProfile,
+				meta:               sessionMeta,
+				baseClog:           baseClog,
+				finish:             cp.finishSessionAcquisition,
 			})
-			if initErr != nil {
-				return nil, 0, "", fmt.Errorf("init session on worker: %w", initErr)
-			}
-			if gateErr != nil {
-				return nil, 0, "", gateErr
+			// Report whether a session now exists for this pid, so the
+			// connection's teardown destroys it — and only then. Every failure
+			// path inside activateConnectionSession cleans up after itself.
+			sessionEverCreated = sessionEverCreated || res.sessionCreated
+			if err != nil {
+				return nil, 0, "", fmt.Errorf("acquire worker for connection: %w", err)
 			}
 			// The connect path assumed the DuckLake catalog (the only resolution
 			// the multitenant path admits); apply what the worker actually
 			// reported, so an unexpected answer changes the session rather than
 			// being silently ignored.
-			server.SetConnectionPhysicalCatalog(cc, actInitMeta.effectiveCatalog)
-			server.SetCatalogUseRewrite(cc, actInitMeta.duckLakeAttached && !passthroughUser)
-			server.SetConnectionDatabase(cc, actInitMeta.effectiveCatalog)
+			server.SetConnectionPhysicalCatalog(cc, res.meta.effectiveCatalog)
+			server.SetCatalogUseRewrite(cc, res.meta.duckLakeAttached && !passthroughUser)
+			server.SetConnectionDatabase(cc, res.meta.effectiveCatalog)
 			if pinned {
 				// Off the tier without a worker switch: the connection is
 				// already ON the escalation target, so escalating would destroy
@@ -1716,21 +1712,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// full lifetime, so the pre-activation idle prefix is billed at this
 			// size — the same v1 "largest size wins over the whole connection"
 			// approximation the switcher uses.
-			millicores, mib := cp.workerBillingSize(profile)
+			millicores, mib := cp.workerBillingSize(res.profile)
 			server.SetConnectionWorkerSize(cc, millicores, mib)
-			// The connect-time `-c duckgres.s3_cache=...` option could not be
-			// applied at connect (no worker); apply it against the worker this
-			// activation just acquired. A failure fails the activation, which is
-			// connection-fatal — a session that asked for s3_cache=off must
-			// never silently run through the cache.
-			if s3CacheRequested {
-				if err := server.ApplyConnectionS3CacheOption(cc, rawS3Cache); err != nil {
-					return nil, 0, "", fmt.Errorf("apply %s startup option: %w", server.S3CacheGUCName, err)
-				}
-			}
-			actClog.Info("Connection activated on worker.", "pinned", pinned,
-				"cpu", workerProfileCPU(profile), "memory", workerProfileMemory(profile))
-			return exec, newWorkerID, newWorkerPod, nil
+			res.clog.Info("Connection activated on worker.", "pinned", pinned,
+				"cpu", workerProfileCPU(res.profile), "memory", workerProfileMemory(res.profile))
+			return res.exec, res.workerID, res.workerPod, nil
 		})
 	}
 
@@ -1784,13 +1770,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 // shared post-CreateSession wiring needs about the session that was just
 // created for a connection.
 type sessionAcquisition struct {
-	sessions *SessionManager
+	sessions activationSessions
 	pid      int32
 	orgID    string
 	username string
 	// tlsConn is re-registered as the session's conn closer so OnWorkerCrash
 	// can still close the client socket.
-	tlsConn net.Conn
+	tlsConn io.Closer
 	// exec is the freshly created session's executor.
 	exec *flightclient.FlightExecutor
 	// meta carries the connect-time constants, with a clog stamped for the
