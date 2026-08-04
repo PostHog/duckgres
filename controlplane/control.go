@@ -1355,143 +1355,31 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}()
 
 	// Probe which catalogs the worker actually attached for this session, then
-	// resolve the real catalog the session defaults to. The startup `database`
-	// selected "ducklake"/"" (default); fail closed (3D000) if the
-	// requested catalog isn't attached.
-	attachCtx, attachCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
-	attachContextErr := attachCtx.Err()
-	attachCancel()
-	if probeErr != nil {
-		outcome, reason := controlPlaneSessionStartOperationResult(
-			probeErr,
-			attachContextErr,
-			cp.isDraining(),
-			observe.SessionStartReasonMetadataStore,
-		)
-		sessionStart.Finish(outcome, reason)
-		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
-		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
+	// resolve the real catalog the session defaults to and initialize the
+	// session's metadata + connect-time session default. Factored into
+	// initSessionMetadata so a tier escalation can re-run it verbatim against
+	// the new worker's (cold) session.
+	sessionMeta := sessionMetadataInput{
+		database:          database,
+		requestedCatalog:  requestedCatalog,
+		passthroughUser:   passthroughUser,
+		clientSearchPath:  clientSearchPath,
+		queryAccessPolicy: queryAccessPolicy,
+		clog:              clog,
+	}
+	meta, initErr := cp.initSessionMetadata(admissionCtx, executor, sessionMeta)
+	if initErr != nil {
+		sessionStart.Finish(initErr.outcome, initErr.reason)
+		_ = server.WriteErrorResponse(writer, "FATAL", initErr.code, initErr.message)
 		_ = writer.Flush()
 		return
 	}
-	var effectiveCatalog string
-	if cp.configStore != nil {
-		var ok bool
-		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, duckLakeAttached)
-		if !ok {
-			sessionStart.Finish("error", observe.SessionStartReasonMetadataStore)
-			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
-				"requested", requestedCatalog, "ducklake_attached", duckLakeAttached)
-			msg := "no catalog is available for this connection"
-			if requestedCatalog != "" {
-				msg = fmt.Sprintf("database %q does not exist", requestedCatalog)
-			}
-			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", msg)
-			_ = writer.Flush()
-			return
-		}
-	} else {
-		// Single-tenant (process backend / static users): de-mask to the real
-		// attached catalog when present; otherwise keep the client's database name
-		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
-		if duckLakeAttached {
-			effectiveCatalog = physicalDuckLakeCatalog
-		} else {
-			effectiveCatalog = database
-		}
-	}
+	duckLakeAttached := meta.duckLakeAttached
+	effectiveCatalog := meta.effectiveCatalog
 	// `database` now reflects the real catalog the session defaults to — this is
 	// what drives the current_database() macro/pg_database view and what logs and
 	// observability surface.
 	database = effectiveCatalog
-
-	// Passthrough users skip pg_catalog initialization and the catalog USE
-	// rewriting — they bypass the PG compatibility layer entirely. They still
-	// need their selected catalog as the session default, though: without one the
-	// worker session stays in DuckDB's empty in-memory catalog (see the
-	// passthrough branch below).
-	if !passthroughUser {
-		initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-		var metadataAccess *sessionmeta.MetadataAccessPolicy
-		if queryAccessPolicy != nil {
-			metadataAccess = &sessionmeta.MetadataAccessPolicy{
-				AllowedSchemas:   queryAccessPolicy.AllowedSchemas,
-				AllowedRelations: queryAccessPolicy.AllowedRelations,
-			}
-		}
-		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, executor, effectiveCatalog, metadataAccess); err != nil {
-			initContextErr := initCtx.Err()
-			initCancel()
-			outcome, reason := controlPlaneSessionStartOperationResult(
-				err,
-				initContextErr,
-				cp.isDraining(),
-				observe.SessionStartReasonMetadataStore,
-			)
-			sessionStart.Finish(outcome, reason)
-			clog.Error("Failed to initialize session database metadata.", "database", database, "error", err)
-			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
-			_ = writer.Flush()
-			return
-		}
-		initCancel()
-
-		// Apply the effective connect-time session default AFTER metadata init.
-		// It must run here, not on the worker at session create:
-		// InitSessionDatabaseMetadata's defer resets the catalog/search_path, so an
-		// earlier value would be clobbered. A client-supplied search_path is
-		// best-effort.
-		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
-			spCtx, spCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-			_, err := executor.ExecContext(spCtx, cmd)
-			spContextErr := spCtx.Err()
-			spCancel()
-			if err != nil {
-				if source == sessionDefaultSourceConfiguredCatalog {
-					outcome, reason := controlPlaneSessionStartOperationResult(
-						err,
-						spContextErr,
-						cp.isDraining(),
-						observe.SessionStartReasonMetadataStore,
-					)
-					sessionStart.Finish(outcome, reason)
-					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
-					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
-					_ = writer.Flush()
-					return
-				}
-				clog.Warn("Failed to apply client connect-time search_path; using default.", "search_path", clientSearchPath, "error", err)
-			}
-		}
-	} else {
-		// Passthrough: no pg_catalog views and no rewriting, but the session must
-		// still land in its selected catalog instead of the empty in-memory one.
-		// Standalone passthrough does this via server.setDuckLakeDefault;
-		// the remote-worker path issues the equivalent here.
-		if clientSearchPath != "" {
-			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", clientSearchPath)
-		}
-		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
-			initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-			_, err := executor.ExecContext(initCtx, cmd)
-			initContextErr := initCtx.Err()
-			initCancel()
-			if err != nil {
-				outcome, reason := controlPlaneSessionStartOperationResult(
-					err,
-					initContextErr,
-					cp.isDraining(),
-					observe.SessionStartReasonMetadataStore,
-				)
-				sessionStart.Finish(outcome, reason)
-				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
-				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
-				_ = writer.Flush()
-				return
-			}
-		}
-	}
 
 	// Register the TCP connection so OnWorkerCrash can close it to unblock
 	// the message loop if the backing worker dies.
@@ -1593,6 +1481,221 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog.Error("Message loop error.", "error", err)
 		return
 	}
+}
+
+// sessionMetadataInput carries everything initSessionMetadata reads that is
+// NOT derived from the worker session itself. Every field is a connect-time
+// constant for the connection (startup message + authenticated org/user
+// resolution), which is what makes the block safe to replay verbatim against a
+// new worker after a tier escalation. Grouped in a struct rather than passed
+// positionally because three of the fields are strings and two are bools —
+// positional callers would be trivially mis-ordered at the second call site.
+type sessionMetadataInput struct {
+	// database is the client's startup database name. Read only by the
+	// single-tenant (no config store) fallback that de-masks to the attached
+	// catalog; the multitenant path resolves from requestedCatalog.
+	database string
+	// requestedCatalog is the multitenant user resolution's effective catalog
+	// ("" = the connection's default).
+	requestedCatalog string
+	// passthroughUser skips pg_catalog init + catalog USE rewriting.
+	passthroughUser bool
+	// clientSearchPath is the connect-time `-c search_path=...` (already
+	// authorized/blanked for project-scoped users).
+	clientSearchPath string
+	// queryAccessPolicy scopes the generated metadata views for
+	// project-scoped logins; nil for unscoped users.
+	queryAccessPolicy *server.QueryAccessPolicy
+	// clog is the connection-scoped logger; the helper owns all logging for
+	// the block so log lines stay byte-identical to the inline version.
+	clog *slog.Logger
+}
+
+// sessionMetadataResult is what the connect path (and the escalation switcher)
+// needs from session metadata init in order to wire the clientConn.
+type sessionMetadataResult struct {
+	// duckLakeAttached reports whether the worker attached the DuckLake
+	// catalog for this session (drives catalog USE rewriting).
+	duckLakeAttached bool
+	// effectiveCatalog is the real catalog the session defaults to.
+	effectiveCatalog string
+}
+
+// sessionInitError is a session-metadata init failure. It has ALREADY been
+// logged by initSessionMetadata (the log lines carry per-site attributes); it
+// carries the session-start classification and the exact FATAL response the
+// connect path must send, so the extraction is byte-identical on the wire.
+// Returned as a concrete pointer type so callers cannot trip the typed-nil
+// interface trap on the success path.
+type sessionInitError struct {
+	outcome string
+	reason  string
+	code    string
+	message string
+	err     error
+}
+
+func (e *sessionInitError) Error() string {
+	if e.err != nil {
+		return fmt.Sprintf("%s: %v", e.message, e.err)
+	}
+	return e.message
+}
+
+func (e *sessionInitError) Unwrap() error { return e.err }
+
+// initSessionMetadata runs the post-create session setup against exec: the
+// attached-catalog probe, session database metadata init, and the connect-time
+// search_path / passthrough catalog application. Runs once at session create
+// and again after every worker switch (the new worker's session starts cold,
+// so all of this has to be redone there).
+func (cp *ControlPlane) initSessionMetadata(
+	ctx context.Context,
+	exec *flightclient.FlightExecutor,
+	in sessionMetadataInput,
+) (sessionMetadataResult, *sessionInitError) {
+	clog := in.clog
+	var res sessionMetadataResult
+
+	// Probe which catalogs the worker actually attached for this session, then
+	// resolve the real catalog the session defaults to. The startup `database`
+	// selected "ducklake"/"" (default); fail closed (3D000) if the
+	// requested catalog isn't attached.
+	attachCtx, attachCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, exec, physicalDuckLakeCatalog)
+	attachContextErr := attachCtx.Err()
+	attachCancel()
+	if probeErr != nil {
+		outcome, reason := controlPlaneSessionStartOperationResult(
+			probeErr,
+			attachContextErr,
+			cp.isDraining(),
+			observe.SessionStartReasonMetadataStore,
+		)
+		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
+		return res, &sessionInitError{
+			outcome: outcome, reason: reason,
+			code: "XX000", message: "failed to detect attached catalogs", err: probeErr,
+		}
+	}
+	res.duckLakeAttached = duckLakeAttached
+
+	var effectiveCatalog string
+	if cp.configStore != nil {
+		var ok bool
+		effectiveCatalog, ok = resolveEffectiveCatalog(in.requestedCatalog, duckLakeAttached)
+		if !ok {
+			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
+				"requested", in.requestedCatalog, "ducklake_attached", duckLakeAttached)
+			msg := "no catalog is available for this connection"
+			if in.requestedCatalog != "" {
+				msg = fmt.Sprintf("database %q does not exist", in.requestedCatalog)
+			}
+			return res, &sessionInitError{
+				outcome: "error", reason: observe.SessionStartReasonMetadataStore,
+				code: "3D000", message: msg,
+			}
+		}
+	} else {
+		// Single-tenant (process backend / static users): de-mask to the real
+		// attached catalog when present; otherwise keep the client's database name
+		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
+		if duckLakeAttached {
+			effectiveCatalog = physicalDuckLakeCatalog
+		} else {
+			effectiveCatalog = in.database
+		}
+	}
+	res.effectiveCatalog = effectiveCatalog
+
+	// Passthrough users skip pg_catalog initialization and the catalog USE
+	// rewriting — they bypass the PG compatibility layer entirely. They still
+	// need their selected catalog as the session default, though: without one the
+	// worker session stays in DuckDB's empty in-memory catalog (see the
+	// passthrough branch below).
+	if !in.passthroughUser {
+		initCtx, initCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+		var metadataAccess *sessionmeta.MetadataAccessPolicy
+		if in.queryAccessPolicy != nil {
+			metadataAccess = &sessionmeta.MetadataAccessPolicy{
+				AllowedSchemas:   in.queryAccessPolicy.AllowedSchemas,
+				AllowedRelations: in.queryAccessPolicy.AllowedRelations,
+			}
+		}
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, exec, effectiveCatalog, metadataAccess); err != nil {
+			initContextErr := initCtx.Err()
+			initCancel()
+			outcome, reason := controlPlaneSessionStartOperationResult(
+				err,
+				initContextErr,
+				cp.isDraining(),
+				observe.SessionStartReasonMetadataStore,
+			)
+			clog.Error("Failed to initialize session database metadata.", "database", effectiveCatalog, "error", err)
+			return res, &sessionInitError{
+				outcome: outcome, reason: reason,
+				code: "XX000", message: "failed to initialize session database metadata", err: err,
+			}
+		}
+		initCancel()
+
+		// Apply the effective connect-time session default AFTER metadata init.
+		// It must run here, not on the worker at session create:
+		// InitSessionDatabaseMetadata's defer resets the catalog/search_path, so an
+		// earlier value would be clobbered. A client-supplied search_path is
+		// best-effort.
+		if cmd, source := effectiveSessionDefaultCommand(in.clientSearchPath, effectiveCatalog); cmd != "" {
+			spCtx, spCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+			_, err := exec.ExecContext(spCtx, cmd)
+			spContextErr := spCtx.Err()
+			spCancel()
+			if err != nil {
+				if source == sessionDefaultSourceConfiguredCatalog {
+					outcome, reason := controlPlaneSessionStartOperationResult(
+						err,
+						spContextErr,
+						cp.isDraining(),
+						observe.SessionStartReasonMetadataStore,
+					)
+					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
+					return res, &sessionInitError{
+						outcome: outcome, reason: reason,
+						code: "XX000", message: "failed to apply default catalog", err: err,
+					}
+				}
+				clog.Warn("Failed to apply client connect-time search_path; using default.", "search_path", in.clientSearchPath, "error", err)
+			}
+		}
+	} else {
+		// Passthrough: no pg_catalog views and no rewriting, but the session must
+		// still land in its selected catalog instead of the empty in-memory one.
+		// Standalone passthrough does this via server.setDuckLakeDefault;
+		// the remote-worker path issues the equivalent here.
+		if in.clientSearchPath != "" {
+			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", in.clientSearchPath)
+		}
+		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
+			initCtx, initCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+			_, err := exec.ExecContext(initCtx, cmd)
+			initContextErr := initCtx.Err()
+			initCancel()
+			if err != nil {
+				outcome, reason := controlPlaneSessionStartOperationResult(
+					err,
+					initContextErr,
+					cp.isDraining(),
+					observe.SessionStartReasonMetadataStore,
+				)
+				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
+				return res, &sessionInitError{
+					outcome: outcome, reason: reason,
+					code: "XX000", message: "failed to apply default catalog", err: err,
+				}
+			}
+		}
+	}
+
+	return res, nil
 }
 
 func controlPlaneSessionStartResult(err error) (outcome, reason string) {
