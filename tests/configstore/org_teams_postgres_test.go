@@ -236,6 +236,65 @@ func TestUpsertOrgTeamSchemaConflictPostgres(t *testing.T) {
 	}
 }
 
+func TestProvisionedOrgMaxVCPUsPostgres(t *testing.T) {
+	tests := []struct {
+		name             string
+		existingMaxVCPUs *int
+		wantMaxVCPUs     int
+	}{
+		{name: "new org defaults to 64", wantMaxVCPUs: 64},
+		{name: "reprovision preserves unlimited", existingMaxVCPUs: intPtr(0), wantMaxVCPUs: 0},
+		{name: "reprovision preserves explicit limit", existingMaxVCPUs: intPtr(1024), wantMaxVCPUs: 1024},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			pstore := provisioning.NewGormStore(store)
+			const orgID = "provisioned-vcpu-org"
+
+			if tt.existingMaxVCPUs != nil {
+				if err := store.DB().Create(&configstore.Org{
+					Name:         orgID,
+					DatabaseName: "provisioned_vcpu_org",
+					MaxVCPUs:     *tt.existingMaxVCPUs,
+				}).Error; err != nil {
+					t.Fatalf("seed org: %v", err)
+				}
+			}
+
+			provision := func() {
+				t.Helper()
+				if err := pstore.Provision(provisioning.ProvisionRequest{
+					OrgID:        orgID,
+					DatabaseName: "provisioned_vcpu_org",
+					TeamID:       1,
+					Warehouse:    &configstore.ManagedWarehouse{DucklingName: orgID},
+					RootUserHash: "hash",
+				}); err != nil {
+					t.Fatalf("provision: %v", err)
+				}
+			}
+
+			provision()
+			if tt.existingMaxVCPUs != nil {
+				markWarehouseDeleted(t, store, orgID)
+				provision()
+			}
+
+			var org configstore.Org
+			if err := store.DB().First(&org, "name = ?", orgID).Error; err != nil {
+				t.Fatalf("read provisioned org: %v", err)
+			}
+			if org.MaxVCPUs != tt.wantMaxVCPUs {
+				t.Fatalf("MaxVCPUs = %d, want %d", org.MaxVCPUs, tt.wantMaxVCPUs)
+			}
+		})
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
 // TestDeleteOrgTeamPostgres covers the transactional delete rules: last-team
 // refusal (an org must always have at least one team), the project-reader
 // cleanup riding in the same transaction, and that a delete never touches

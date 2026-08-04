@@ -27,6 +27,8 @@ var ErrWarehouseNonTerminal = errors.New("warehouse already exists in non-termin
 // 400.
 var ErrProvisionTeamRequired = errors.New("team_id is required when provisioning a warehouse for a new org")
 
+const defaultProvisionedOrgMaxVCPUs = 64
+
 // ProvisionRequest is the all-or-nothing input the Provision endpoint
 // dispatches into a single configstore transaction. Warehouse + root
 // user are always written.
@@ -122,7 +124,11 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, teamID in
 		if teamID == 0 {
 			return ErrProvisionTeamRequired
 		}
-		org = configstore.Org{Name: orgID, DatabaseName: databaseName}
+		org = configstore.Org{
+			Name:         orgID,
+			DatabaseName: databaseName,
+			MaxVCPUs:     defaultProvisionedOrgMaxVCPUs,
+		}
 		if err := tx.Create(&org).Error; err != nil {
 			return err
 		}
