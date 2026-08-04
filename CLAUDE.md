@@ -325,11 +325,16 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
 - **Nothing is acquired until a statement needs an engine.** The connection
   reaches the message loop with `c.executor == nil` and a `SessionActivator`;
   `activateForStatement` acquires on first need. Statements the control plane
-  answers itself — intercepted `SET`/`SHOW` of the duckgres GUCs, ignored SETs,
-  no-ops, `pg_stat_activity`, the empty query — MUST NOT acquire. That is the
-  point of the whole feature; adding an acquire to an engine-free path silently
-  deletes the benefit. `SHOW duckgres.s3_cache` is the one exception, and only
-  when `c.hasPendingS3Cache` (see below).
+  answers itself — `SET`/`SHOW duckgres.query_source`, ignored SETs, no-ops,
+  `pg_stat_activity`, the empty query — MUST NOT acquire. That is the point of
+  the whole feature; adding an acquire to an engine-free path silently deletes
+  the benefit. The `duckgres.s3_cache` GUC is the exception, on all three
+  protocol paths, because unlike the other duckgres GUCs it is WORKER state (it
+  rebuilds the worker's `ducklake_s3` secret): **`SET` always acquires** — the
+  swap needs a worker to apply to — and **`SHOW` acquires only when
+  `c.hasPendingS3Cache`**, i.e. when a connect-time option has not been applied
+  yet and answering first would report a transport the session is about to
+  leave (see the s3_cache section below).
 - **A pinning FIRST statement acquires the standard profile directly** (one
   acquire, `pinned=true` → `MarkConnectionPinned`), never small-then-escalate.
 - **The pin set is the state boundary, and every member is load-bearing:** DML,

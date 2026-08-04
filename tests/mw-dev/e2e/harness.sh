@@ -1685,11 +1685,17 @@ exploratory_lazy_activation() { # org password catalog
   k delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --wait=false >/dev/null 2>&1 || true
   k wait --for=delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --timeout=300s >/dev/null 2>&1 || true
   before="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" --no-headers 2>/dev/null | grep -c . || true)"
+  # The zero-pod precondition is what gives the check its teeth: with a hot-idle
+  # pod still around, an acquisition would REUSE it and the count would not move
+  # — a lazy-acquisition regression would pass vacuously. Assert it, never
+  # assume it.
+  [ "$before" -eq 0 ] \
+    || fail "exploratory lazy activation: org $org still has $before worker pod(s) after the delete-wait — the zero-pod precondition did not hold, so a reused hot-idle worker would make this assertion vacuous"
 
-  printf '\\q\n' | PGPASSWORD="$pw" psql \
+  qout="$(printf '\\q\n' | PGPASSWORD="$pw" psql \
       "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=$cat" \
-      -qtA >/dev/null 2>&1 \
-    || fail "exploratory lazy activation: connect+quit failed on $org"
+      -qtA 2>&1)" \
+    || fail "exploratory lazy activation: connect+quit failed on $org: $(printf '%s' "$qout" | tr -d '\n' | tail -c 300)"
 
   # A spawn is asynchronous, so give one a chance to appear before concluding.
   sleep 20
@@ -1719,9 +1725,11 @@ exploratory_state_pin() { # org password catalog target_cpu
   # ONE session: create state, mutate it, read it back. The first statement
   # pins, so the CP acquires the escalation target directly (one acquire, no
   # small worker to destroy); the read must then see the state.
+  # 2>&1: _pg_exec prints a real failure to STDERR, so without it $out is empty
+  # and the fail message below says nothing.
   out="$(_pg_exec "$org" "$pw" "$cat" \
-      'CREATE TEMP TABLE _e2e_tier (i int); INSERT INTO _e2e_tier VALUES (7); SELECT i FROM _e2e_tier')" \
-    || fail "exploratory state pin: session failed on $org: $out"
+      'CREATE TEMP TABLE _e2e_tier (i int); INSERT INTO _e2e_tier VALUES (7); SELECT i FROM _e2e_tier' 2>&1)" \
+    || fail "exploratory state pin: session failed on $org: $(printf '%s' "$out" | tr -d '\n' | tail -c 300)"
   last="$(printf '%s' "$out" | tail -1)"
   [ "$last" = "7" ] \
     || fail "exploratory state pin: read-back returned '$last' want '7' (session state did not survive the pinned session)"
@@ -1765,14 +1773,21 @@ exploratory_oom_escalation() { # org password catalog
   # array_length(x, 1) is PG spelling; the transpiler rewrites it to DuckDB len().
   q="SELECT array_length(list(i), 1) FROM range(200000000) t(i)"
   oomrc=0
-  out="$(_pg_exec "$org" "$pw" "$cat" "$q")" || oomrc=1
+  # 2>&1 so the failure branch below can actually report why (_pg_exec prints a
+  # real error to stderr). On success the output is only the result row.
+  out="$(_pg_exec "$org" "$pw" "$cat" "$q" 2>&1)" || oomrc=1
   # Count the escalation lines BEFORE clearing the default, then always clear —
   # a failure below must not leave the org carrying a default the following
   # assertions do not expect.
   window=$(( $(date +%s) - started + 30 ))
   n=0
   for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
-    c="$(k logs "$p" --since="${window}s" 2>/dev/null \
+    # Same idiom as connection_duration_logged: a kubectl failure must FAIL the
+    # assertion, not be swallowed into a zero count that reads as "the tier
+    # never escalated".
+    logs="$(k logs "$p" --since="${window}s" 2>&1)" \
+      || fail "exploratory oom: kubectl logs failed for control-plane pod $p while checking for the escalation: $logs"
+    c="$(printf '%s\n' "$logs" \
           | grep 'Escalated connection off exploratory worker' \
           | grep "org=$org" \
           | grep -c 'reason=oom' || true)"
@@ -4314,7 +4329,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + native-metadata-proxy(explicit-opt-in/exact-db/real-cnpg-query/per-org-disable) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake, doubles as exploratory-tier GUC-bypass) + org-default-profile(cnpg) + exploratory-tier(small-first plain read) + exploratory-lazy-activation(connect+quit spends no pod) + exploratory-state-pin(escalation target + state survives) + exploratory-oom-escalation(transparent re-execute, reason=oom logged) + query-log-worker-tier+ persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty + CALL opaque-but-complete) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + native-metadata-proxy(explicit-opt-in/exact-db/real-cnpg-query/per-org-disable) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake, doubles as exploratory-tier GUC-bypass) + org-default-profile(cnpg) + exploratory-tier(small-first plain read) + exploratory-lazy-activation(connect+quit spends no pod) + exploratory-state-pin(escalation target + state survives) + exploratory-oom-escalation(transparent re-execute, reason=oom logged) + query-log-worker-tier + persistent-user-secrets(cnpg, cross-user isolation)+ user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty + CALL opaque-but-complete) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

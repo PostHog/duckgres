@@ -1649,7 +1649,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			millicores, mib := cp.workerBillingSize(workerProfile)
 			server.SetConnectionWorkerSize(cc, millicores, mib)
 			escClog.Info("Connection escalated to standard worker.", "reason", reason)
-			return exec, newWorkerID, newWorkerPod, nil
+			// Typed-nil guard, as on the connect and activation paths: exec is a
+			// *FlightExecutor, so returning a nil one directly would install a
+			// NON-nil interface holding a nil pointer on the connection.
+			var escalatedExec server.QueryExecutor
+			if exec != nil {
+				escalatedExec = exec
+			}
+			return escalatedExec, newWorkerID, newWorkerPod, nil
 		})
 	}
 
