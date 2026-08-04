@@ -1455,7 +1455,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 					createdPID = pid
 				}
 				sessions.DestroySession(createdPID)
-				executor = nil
 			}
 			outcome, reason := controlPlaneSessionStartResult(err)
 			sessionStart.Finish(outcome, reason)
