@@ -25,9 +25,10 @@ TEST_TIMEOUT="${DUCKLAKE_TEST_TIMEOUT:-300s}"
 # The encoding is v2.<major><minor:02d><patch:02d>.0, e.g.
 #   v2.10502.0 → DuckDB 1.5.2 (DuckLake 1.0)
 #   v2.10503.0 → DuckDB 1.5.3 (DuckLake 1.0)
-# Only shipping versions are benchmarked by default; older versions remain
-# testable on demand via DUCKLAKE_VERSIONS.
-DEFAULT_VERSIONS="v2.10503.0"
+#   v2.10505.0 → DuckDB 1.5.5 (DuckLake 1.0)
+# The current canary and rollback versions are benchmarked by default; older
+# versions remain testable on demand via DUCKLAKE_VERSIONS.
+DEFAULT_VERSIONS="v2.10505.0 v2.10503.0"
 VERSIONS="${DUCKLAKE_VERSIONS:-$DEFAULT_VERSIONS}"
 
 CURRENT_ONLY=false
@@ -44,7 +45,7 @@ log() { echo "=== $* ===" >&2; }
 ensure_infra() {
     log "Ensuring DuckLake infrastructure is running"
     if ! nc -z 127.0.0.1 35433 2>/dev/null || ! nc -z 127.0.0.1 39000 2>/dev/null; then
-        docker-compose -f "$COMPOSE_FILE" up -d ducklake-metadata minio minio-init
+        docker compose -f "$COMPOSE_FILE" up -d ducklake-metadata minio minio-init
         echo "Waiting for infrastructure..." >&2
         for i in $(seq 1 30); do
             if nc -z 127.0.0.1 35433 2>/dev/null && nc -z 127.0.0.1 39000 2>/dev/null; then
