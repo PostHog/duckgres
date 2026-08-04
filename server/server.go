@@ -1152,11 +1152,12 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 // metadata work) and ship updated binaries between DuckDB releases.
 // postgres_scanner is here because PR #447 originally bundled it from the
 // nightly repo to overwrite stale stable copies seeded on prior worker
-// upgrades; even now that we pull from stable, refreshing on every boot
-// keeps the on-disk extension cache in sync with whatever the running
-// image bundles. json is a stock DuckDB extension that we pull from the
-// stable repo for the engine's version — it doesn't ship intra-version
-// changes, so it's intentionally omitted.
+// upgrades. It can also carry checksum-pinned upstream fixes within one
+// DuckDB patch release, so refreshing on every boot keeps the on-disk
+// extension cache in sync with whatever the running image bundles. json is
+// a stock DuckDB extension that we pull from the stable repo for the engine's
+// version — it doesn't ship intra-version changes, so it's intentionally
+// omitted.
 func shouldRefreshBundledExtension(srcPath string) bool {
 	switch filepath.Base(srcPath) {
 	case "httpfs.duckdb_extension",
@@ -1456,7 +1457,7 @@ func shouldInstallExtension(name string) bool {
 	// The bundle-skip optimization assumes a bundled .duckdb_extension on disk
 	// is enough — LOAD finds the file via extension_directory and DuckDB treats
 	// it as installed. That holds for the PostHog-fork extensions (httpfs,
-	// ducklake) and the stable ones we ship (json, postgres_scanner): LOAD
+	// ducklake) and the upstream ones we ship (json, postgres_scanner): LOAD
 	// against the seeded extension_directory file just works.
 	return !hasBundledExtensionBinary(name)
 }

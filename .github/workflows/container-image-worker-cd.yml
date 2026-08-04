@@ -79,10 +79,11 @@ jobs:
                       # ducklake_s3 secret.
                       httpfs: "v1.5.3-cred-refresh-write-retry"
                       ducklake: "v1.0-posthog.6"
-                      # Stable repo hosts postgres_scanner for 1.5.3; nightly
-                      # does not. See scripts/ducklake_version_matrix.sh
-                      # commit history for the rationale on each row.
+                      # Keep the rollback row on the previously validated
+                      # stable scanner artifact.
                       pg_scanner_repo: "https://extensions.duckdb.org"
+                      pg_scanner_sha256_amd64: "42e9ba5c2a9f9f77f1415e4cd320295f9623d4c20e09b20687d384a06681e54c"
+                      pg_scanner_sha256_arm64: "39eb0d153a2454397963b26aa2c2ceba853c21033277e06968b51173a5965a2f"
                       # Rollback row: publishes suffixed tags only. Operators
                       # roll a tenant back by re-pointing its `image`
                       # config-store column at a …-duckdb1.5.3 tag.
@@ -96,7 +97,13 @@ jobs:
                       httpfs: "v1.5.5-cred-refresh-write-retry"
                       # First PostHog DuckLake release built for DuckDB 1.5.5.
                       ducklake: "v1.0-posthog.7"
-                      pg_scanner_repo: "https://extensions.duckdb.org"
+                      # The stable 1.5.5 scanner predates duckdb-postgres
+                      # 71b85668, which fixes inconsistent snapshots across
+                      # scan connections. These checksums content-pin the
+                      # nightly artifact built from descendant ab217c6.
+                      pg_scanner_repo: "https://nightly-extensions.duckdb.org"
+                      pg_scanner_sha256_amd64: "afc9a0f7ef0158e11235294929df7ea71995e168146c8b0a6409e9181b02766b"
+                      pg_scanner_sha256_arm64: "6ae9474e39f1b091e44104d8c4a3d7af45b290696edf87fca10bba13e78a61fd"
                       # Fleet default: also publishes the unsuffixed tags and
                       # dispatches Charts.
                       default: true
@@ -156,6 +163,8 @@ jobs:
                       HTTPFS_EXTENSION_TAG=${{ matrix.duckdb.httpfs }}
                       DUCKLAKE_EXTENSION_TAG=${{ matrix.duckdb.ducklake }}
                       POSTGRES_SCANNER_REPOSITORY=${{ matrix.duckdb.pg_scanner_repo }}
+                      POSTGRES_SCANNER_SHA256_AMD64=${{ matrix.duckdb.pg_scanner_sha256_amd64 }}
+                      POSTGRES_SCANNER_SHA256_ARM64=${{ matrix.duckdb.pg_scanner_sha256_arm64 }}
                   cache-from: type=gha,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                   cache-to: type=gha,mode=max,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
 
