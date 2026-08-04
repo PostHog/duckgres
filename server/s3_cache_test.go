@@ -14,11 +14,26 @@ type s3CacheRecordingExecutor struct {
 	selectOneExecutor
 	calls []bool
 	err   error
+	// onSwap/onQuery let a test observe the ORDER of the worker swap relative
+	// to query execution (used by the lazy-activation ordering tests, where the
+	// swap must land before the first user query).
+	onSwap  func(enabled bool)
+	onQuery func()
 }
 
 func (e *s3CacheRecordingExecutor) SetS3CacheEnabled(_ context.Context, enabled bool) error {
 	e.calls = append(e.calls, enabled)
+	if e.onSwap != nil {
+		e.onSwap(enabled)
+	}
 	return e.err
+}
+
+func (e *s3CacheRecordingExecutor) QueryContext(ctx context.Context, query string, args ...any) (RowSet, error) {
+	if e.onQuery != nil {
+		e.onQuery()
+	}
+	return e.selectOneExecutor.QueryContext(ctx, query, args...)
 }
 
 // TestS3CacheSimpleSetAppliesToExecutor asserts the core contract of the SET

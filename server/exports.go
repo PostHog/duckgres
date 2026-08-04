@@ -241,6 +241,23 @@ func MarkConnectionPinned(cc *clientConn) {
 	}
 }
 
+// SetPendingS3CacheOption parks a connect-time `-c duckgres.s3_cache=...`
+// startup option (already validated with ValidateS3CacheOption) on a lazily
+// activated connection. The option cannot be applied at connect — there is no
+// worker to swap the S3 transport on — so ensureSessionActive applies it right
+// after the activator installs the executor. A failure there fails the
+// activation, which is connection-fatal, matching the eager path's refusal.
+//
+// Do NOT reach for ApplyConnectionS3CacheOption from inside an activator: at
+// that point the executor is still nil, the worker swap silently no-ops, and
+// the session flag flips anyway.
+func SetPendingS3CacheOption(cc *clientConn, raw string) {
+	if cc != nil {
+		cc.pendingS3Cache = raw
+		cc.hasPendingS3Cache = true
+	}
+}
+
 // SetConnectionDatabase updates the PostgreSQL-visible database name for a
 // control-plane connection after the fact. The eager connect path knows the
 // resolved catalog before it builds the connection; the lazily-activated path

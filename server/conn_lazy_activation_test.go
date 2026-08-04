@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -332,6 +333,224 @@ func TestLazyActivationCopyPinsInOneAcquire(t *testing.T) {
 	}
 	if len(l.big.execCalls) != 1 {
 		t.Fatalf("standard worker exec calls = %v, want one", l.big.execCalls)
+	}
+}
+
+// --- deferred `-c duckgres.s3_cache=...` startup option -----------------
+
+// lazyS3CacheConn is a lazily-activated connection whose activator hands out an
+// executor with the S3CacheControl capability, recording (in order) when the
+// activator ran and when the worker swap was issued.
+type lazyS3CacheConn struct {
+	c      *clientConn
+	out    *bytes.Buffer
+	exec   *s3CacheRecordingExecutor
+	order  *[]string
+	pinned []bool
+}
+
+func newLazyS3CacheConn(t *testing.T) *lazyS3CacheConn {
+	t.Helper()
+	var order []string
+	l := &lazyS3CacheConn{exec: &s3CacheRecordingExecutor{}, order: &order}
+	c, out := newBufferedConn(nil)
+	l.c, l.out = c, out
+	c.stmts = make(map[string]*preparedStmt)
+	c.portals = make(map[string]*portal)
+	c.cursors = make(map[string]*cursorState)
+	c.onExploratoryWorker = true
+	c.sessionActivator = func(_ context.Context, pinned bool) (QueryExecutor, int, string, error) {
+		l.pinned = append(l.pinned, pinned)
+		order = append(order, "activate")
+		return l.exec, 3, "worker-3", nil
+	}
+	// The executor records its own swap calls; wire the shared order log so the
+	// activate→swap→query sequence is observable.
+	l.exec.onSwap = func(bool) { order = append(order, "swap") }
+	l.exec.onQuery = func() { order = append(order, "query") }
+	return l
+}
+
+// TestLazyActivationAppliesPendingS3CacheOptionAfterExecutorInstall is the
+// regression test for the ordering bug: the control plane cannot apply a
+// connect-time `-c duckgres.s3_cache=off` inside the activator, because the
+// executor is installed only after the activator RETURNS — the worker swap
+// would silently no-op while the session flag flipped, leaving SHOW reporting a
+// transport the worker is not using. The option is parked and applied by
+// ensureSessionActive, so the swap must land BEFORE the first user query runs.
+func TestLazyActivationAppliesPendingS3CacheOptionAfterExecutorInstall(t *testing.T) {
+	l := newLazyS3CacheConn(t)
+	SetPendingS3CacheOption(l.c, "off")
+
+	if err := l.c.handleQuery([]byte("SELECT 1\x00")); err != nil {
+		t.Fatalf("handleQuery: %v", err)
+	}
+	if len(l.exec.calls) != 1 || l.exec.calls[0] {
+		t.Fatalf("worker swap calls = %v, want exactly one with enabled=false", l.exec.calls)
+	}
+	if l.c.S3CacheEnabled() {
+		t.Fatal("session still reports the cache enabled after applying s3_cache=off")
+	}
+	want := []string{"activate", "swap", "query"}
+	if strings.Join(*l.order, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v, want %v — the bypass must be in effect before the first user query", *l.order, want)
+	}
+	// One-shot: a later statement must not re-apply it.
+	if err := l.c.handleQuery([]byte("SELECT 1\x00")); err != nil {
+		t.Fatalf("second handleQuery: %v", err)
+	}
+	if len(l.exec.calls) != 1 {
+		t.Fatalf("worker swap re-applied on a later statement: %v", l.exec.calls)
+	}
+}
+
+// TestLazyActivationShowS3CacheActivatesFirst asserts the SHOW half: a lazily
+// activated connection that asked for `off` must never answer `on` because it
+// has not acquired a worker yet. SHOW activates (which applies the pending
+// option) and then reports the truth.
+func TestLazyActivationShowS3CacheActivatesFirst(t *testing.T) {
+	l := newLazyS3CacheConn(t)
+	SetPendingS3CacheOption(l.c, "off")
+
+	if err := l.c.handleQuery([]byte("SHOW duckgres.s3_cache\x00")); err != nil {
+		t.Fatalf("handleQuery(SHOW): %v", err)
+	}
+	if len(l.pinned) != 1 {
+		t.Fatalf("SHOW did not activate the connection: activator calls = %v", l.pinned)
+	}
+	if len(l.exec.calls) != 1 || l.exec.calls[0] {
+		t.Fatalf("worker swap calls = %v, want one with enabled=false", l.exec.calls)
+	}
+	sawOff := false
+	for _, m := range parseWireMsgs(t, l.out.Bytes()) {
+		if m.typ == 'D' && bytes.Contains(m.body, []byte("off")) {
+			sawOff = true
+		}
+	}
+	if !sawOff {
+		t.Fatalf("SHOW duckgres.s3_cache reported the wrong transport: %s", describeMsgs(parseWireMsgs(t, l.out.Bytes())))
+	}
+}
+
+// TestLazyActivationPendingS3CacheFailureIsConnectionFatal asserts a worker
+// swap that fails at activation refuses the connection rather than letting a
+// session that asked for s3_cache=off silently run cached.
+func TestLazyActivationPendingS3CacheFailureIsConnectionFatal(t *testing.T) {
+	l := newLazyS3CacheConn(t)
+	l.exec.err = errors.New("secret swap rejected")
+	SetPendingS3CacheOption(l.c, "off")
+
+	err := l.c.handleQuery([]byte("SELECT 1\x00"))
+	if err == nil {
+		t.Fatal("handleQuery returned nil; a failed s3_cache apply must terminate the connection")
+	}
+	if !errors.Is(err, errConnectionFatal) {
+		t.Fatalf("error %v does not carry errConnectionFatal", err)
+	}
+	msgs := parseWireMsgs(t, l.out.Bytes())
+	if !hasSeverity(msgs, "FATAL") {
+		t.Fatalf("want a FATAL ErrorResponse: %s", describeErrorResponses(msgs))
+	}
+	if countMsgs(msgs, 'Z') != 0 {
+		t.Fatalf("ReadyForQuery sent after a connection-fatal activation failure: %s", describeMsgs(msgs))
+	}
+}
+
+// --- classified (typed) acquisition failures ---------------------------
+
+// TestLazyActivationTypedErrorSQLStateAndMessage asserts a control-plane
+// classified failure reaches the client with ITS OWN SQLSTATE and message, not
+// a substring guess and not the wrapped internal error chain. This is what
+// keeps a vCPU-admission rejection (53400 with an actionable message), a
+// draining control plane (57P03), a cancel (57014) and a catalog failure
+// (3D000) from all collapsing into a generic error.
+func TestLazyActivationTypedErrorSQLStateAndMessage(t *testing.T) {
+	cases := []struct {
+		name    string
+		code    string
+		message string
+	}{
+		{"capacity", "53300", "no idle worker available; retry in about 45s"},
+		{"vcpu admission", "53400", "requested worker requires 16 vCPUs, exceeding the organization limit of 8 vCPUs; request a smaller worker or raise the limit"},
+		{"draining", "57P03", "control plane is draining, retry shortly"},
+		{"cancel", "57014", "canceling authentication due to user request"},
+		{"catalog", "3D000", `database "nope" does not exist`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newLazyConn(t)
+			l.c.sessionActivator = func(context.Context, bool) (QueryExecutor, int, string, error) {
+				// Wrapped, exactly as the control plane wraps it for its own logs.
+				return nil, 0, "", fmt.Errorf("acquire worker for connection: %w",
+					&SessionAcquireError{Code: tc.code, Message: tc.message, Err: errors.New("inner detail")})
+			}
+
+			err := l.c.handleQuery([]byte("SELECT 1\x00"))
+			if err == nil {
+				t.Fatal("handleQuery returned nil")
+			}
+			msgs := parseWireMsgs(t, l.out.Bytes())
+			if !hasErrorResponse(msgs, "FATAL", tc.code, tc.message) {
+				t.Fatalf("want FATAL %s with the classified message, got %s", tc.code, describeErrorResponses(msgs))
+			}
+			for _, f := range decodeErrorResponses(msgs) {
+				if strings.Contains(f.message, "inner detail") || strings.Contains(f.message, "acquire worker for connection") {
+					t.Fatalf("client message leaked the internal error chain: %q", f.message)
+				}
+			}
+		})
+	}
+}
+
+// TestEscalationErrorSQLStateFallback asserts the substring fallback still
+// covers callers that return a plain error (it is the only classifier for the
+// switcher's own sentinels).
+func TestEscalationErrorSQLStateFallback(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{nil, "53400"},
+		{errors.New("this account is disabled; contact your administrator"), "28000"},
+		{errors.New("worker capacity exhausted for organization"), "53300"},
+		{errors.New("dial worker: connection refused"), "53400"},
+		{fmt.Errorf("wrapped: %w", &SessionAcquireError{Code: "57P03", Message: "draining"}), "57P03"},
+		// An empty Code must not shadow the fallback.
+		{&SessionAcquireError{Message: "worker capacity exhausted"}, "53300"},
+	} {
+		if got := escalationErrorSQLState(tc.err); got != tc.want {
+			t.Fatalf("escalationErrorSQLState(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
+// --- lazy activation through Describe ----------------------------------
+
+// TestLazyActivationExtendedDescribeActivates asserts the Describe LIMIT-0
+// probe — which really executes the statement — activates the connection. A
+// client that Parses and Describes without ever Executing still reaches the
+// engine.
+func TestLazyActivationExtendedDescribeActivates(t *testing.T) {
+	l := newLazyConn(t)
+	l.small.queryFn = func(int, string) (RowSet, error) { return &tierRowSet{rows: []int64{1}}, nil }
+
+	if err := extParse(l.c, "s1", "SELECT n FROM t"); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(l.pinned) != 0 {
+		t.Fatalf("Parse of a parseable statement activated: %v", l.pinned)
+	}
+	if err := extDescribeStmt(l.c, "s1"); err != nil {
+		t.Fatalf("Describe: %v", err)
+	}
+	if len(l.pinned) != 1 || l.pinned[0] {
+		t.Fatalf("Describe activator calls = %v, want one unpinned", l.pinned)
+	}
+	if len(l.small.queryCalls) != 1 {
+		t.Fatalf("Describe probe ran %d queries on the exploratory worker, want 1", len(l.small.queryCalls))
+	}
+	if len(l.switched) != 0 {
+		t.Fatalf("Describe of a plain SELECT escalated: %v", l.switched)
 	}
 }
 

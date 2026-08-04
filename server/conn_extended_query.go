@@ -718,6 +718,10 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 	if p.stmt.s3CacheShow {
+		// Lazy activation before answering: see the matching site in handleQuery.
+		if err := c.activateForStatement(p.stmt.query, false); err != nil {
+			return
+		}
 		if !p.described {
 			_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		}

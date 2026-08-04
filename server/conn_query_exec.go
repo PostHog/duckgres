@@ -679,6 +679,10 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return false, nil
 	}
 	if result.S3CacheShow {
+		// Lazy activation before answering: see the matching site in handleQuery.
+		if err := c.activateForStatement(query, false); err != nil {
+			return false, err
+		}
 		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
 		_ = c.writeCommandComplete("SHOW")

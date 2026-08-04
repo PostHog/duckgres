@@ -252,6 +252,14 @@ type clientConn struct {
 	// another activation or executor use.
 	sessionActivator SessionActivator
 
+	// pendingS3Cache holds a connect-time `-c duckgres.s3_cache=...` startup
+	// option that could not be applied at connect because the connection had no
+	// worker yet (lazy activation). Applied by ensureSessionActive AFTER the
+	// executor is installed — never earlier, or the worker swap silently no-ops
+	// while the session flag flips. Same goroutine as everything else here.
+	pendingS3Cache    string
+	hasPendingS3Cache bool
+
 	// fatalErr parks a connection-terminating error raised inside an
 	// extended-query handler. Those handlers are void (the protocol reports
 	// their failures as ErrorResponse + skip-until-Sync), but a failed tier
@@ -1586,6 +1594,14 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		return nil
 	}
 	if result.S3CacheShow {
+		// Lazy activation: this GUC reports WORKER transport state, and a
+		// connection that asked for `off` at connect has not had that option
+		// applied yet (ensureSessionActive applies it). Answering before
+		// activating would report `on` for a session that is about to be
+		// bypassed. Correctness beats laziness for a niche benchmarking GUC.
+		if err := c.activateForStatement(query, false); err != nil {
+			return err
+		}
 		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
 		_ = c.writeCommandComplete("SHOW")

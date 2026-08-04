@@ -61,7 +61,32 @@ func (c *clientConn) ensureSessionActive(ctx context.Context, pinned bool) error
 	c.executor = exec
 	c.workerID = workerID
 	c.workerPod = workerPod
+	// Deferred connect-time `-c duckgres.s3_cache=...`: it must be applied HERE,
+	// after the executor is installed, exactly like escalateWorker re-applies the
+	// bypass after a worker swap. Applying it inside the activator (before this
+	// assignment) would find a nil executor, silently skip the worker swap, and
+	// still flip the session flag — leaving SHOW reporting a transport the worker
+	// is not using, the divergence applyS3CacheSetting exists to prevent. A
+	// failure fails the activation, which is connection-fatal: a session that
+	// asked for s3_cache=off must never silently run cached.
+	if err := c.applyPendingS3CacheOption(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// applyPendingS3CacheOption applies (once) a connect-time `duckgres.s3_cache`
+// startup option that the control plane could not apply at connect because the
+// connection had no worker yet. Cleared before the apply so a failed activation
+// cannot re-run it against a second worker.
+func (c *clientConn) applyPendingS3CacheOption() error {
+	if !c.hasPendingS3Cache {
+		return nil
+	}
+	raw := c.pendingS3Cache
+	c.hasPendingS3Cache = false
+	c.pendingS3Cache = ""
+	return c.applyStartupS3Cache(raw)
 }
 
 // activateForStatement is ensureSessionActive with the connection-fatal
@@ -121,16 +146,46 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 // checks for it and returns instead of continuing to read messages.
 var errConnectionFatal = errors.New("connection terminated")
 
-// escalationErrorSQLState maps a failed worker escalation to the SQLSTATE the
-// client sees. The control plane owns the actual sentinels
-// (errEscalationUserDisabled, *WorkerCapacityExhaustedError) but reaches this
-// package through a plain `error`, so this matches on the client-visible
-// message text — the same idiom as every classifier in conn_errors.go. Keep it
-// in sync with controlplane/worker_profile.go (disabledUserMessage) and
+// SessionAcquireError carries an ALREADY-CLASSIFIED session-acquisition
+// failure from the control plane to the client. The control plane owns every
+// sentinel involved (*WorkerCapacityExhaustedError, the vCPU admission
+// rejection, draining, cancellation, catalog init) but reaches this package
+// through a plain `error`, so it classifies the failure with the same logic
+// the eager connect path uses (sessionCreationErrorResponse) and hands the
+// result across in this type. Code is the SQLSTATE and Message is exactly what
+// the client should see — NOT the wrapped internal error chain.
+type SessionAcquireError struct {
+	Code    string
+	Message string
+	Err     error
+}
+
+func (e *SessionAcquireError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %v", e.Message, e.Err)
+	}
+	return e.Message
+}
+
+func (e *SessionAcquireError) Unwrap() error { return e.Err }
+
+// escalationErrorSQLState maps a failed worker acquisition (lazy activation or
+// tier escalation) to the SQLSTATE the client sees.
+//
+// A *SessionAcquireError is authoritative: it was classified by the control
+// plane with the same logic the eager connect path uses, so it never has to be
+// guessed at. The substring fallback below stays for the paths that still
+// return a plain error (the switcher's own wrapped sentinels, and any future
+// caller that forgets to classify): keep it in sync with
+// controlplane/worker_profile.go (disabledUserMessage) and
 // controlplane/capacity_policy.go (capacityMissPolicy.errorString).
 func escalationErrorSQLState(err error) string {
 	if err == nil {
 		return "53400"
+	}
+	var acq *SessionAcquireError
+	if errors.As(err, &acq) && acq.Code != "" {
+		return acq.Code
 	}
 	msg := err.Error()
 	switch {
@@ -141,6 +196,19 @@ func escalationErrorSQLState(err error) string {
 	default:
 		return "53400" // configuration_limit_exceeded
 	}
+}
+
+// acquisitionClientMessage is the client-visible text for a failed worker
+// acquisition: the control plane's own classified message when it supplied one,
+// otherwise the caller's contextual fallback. This keeps a capacity/draining/
+// admission failure reading exactly as it does when it happens at connect,
+// instead of leaking the wrapped internal error chain.
+func acquisitionClientMessage(err error, fallback string) string {
+	var acq *SessionAcquireError
+	if errors.As(err, &acq) && acq.Message != "" {
+		return acq.Message
+	}
+	return fallback
 }
 
 // failWorkerEscalation terminates the connection after a failed tier
@@ -167,7 +235,8 @@ func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMess
 // ReadyForQuery, and the error unwinds the message loop.
 func (c *clientConn) failWorkerActivation(query string, actErr error) error {
 	return c.failWorkerAcquisition(query, actErr,
-		fmt.Sprintf("could not allocate a worker for this connection: %v", actErr),
+		acquisitionClientMessage(actErr,
+			fmt.Sprintf("could not allocate a worker for this connection: %v", actErr)),
 		"worker session activation failed")
 }
 
@@ -195,6 +264,12 @@ func (c *clientConn) escalateForPinningStatement(query string) error {
 	// connection must not pay pg_query.Parse on every statement. A connection
 	// that has not acquired yet still needs it — the classification is what
 	// picks the profile the single lazy acquire lands on.
+	//
+	// (The two conditions are not independent today: the control plane only
+	// installs an activator on a connection it also marks exploratory, so
+	// needsActivation implies onExploratoryWorker. The second check is
+	// vestigial defense — it keeps the hook correct if a future caller ever
+	// installs an activator without the tier flag.)
 	if !c.onExploratoryWorker && !c.needsActivation() {
 		return nil
 	}
@@ -221,6 +296,9 @@ func (c *clientConn) escalateForPinningStatement(query string) error {
 // default pins it at the general hook. Both ends of that chain pin; only the
 // timing differs.
 func (c *clientConn) escalateForSecretDDL(query string) error {
+	// needsActivation implies onExploratoryWorker today (the control plane sets
+	// both together); the second check is vestigial defense, as in
+	// escalateForPinningStatement.
 	if !c.onExploratoryWorker && !c.needsActivation() {
 		return nil
 	}
@@ -266,7 +344,8 @@ func (c *clientConn) escalateForPinningTier(query string, pins bool) error {
 	}
 	if err := c.escalateWorker(c.ctx, escalateReasonState); err != nil {
 		return c.failWorkerEscalation(query, err,
-			fmt.Sprintf("could not allocate a standard worker for this statement: %v", err))
+			acquisitionClientMessage(err,
+				fmt.Sprintf("could not allocate a standard worker for this statement: %v", err)))
 	}
 	return nil
 }
