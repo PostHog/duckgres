@@ -285,6 +285,12 @@ type ConfigStoreInterface interface {
 	// (the connecting user's team, else the org's oldest team; 0 when unknown).
 	// A config-snapshot read, no I/O — the same resolver the compute meter uses.
 	OrgUsageTeamID(orgID, username string) int64
+	// OrgUserSessionQueryAccess re-resolves a user mid-connection from the same
+	// in-memory snapshot the connect-time auth check reads. ok=false means the
+	// user is missing OR disabled (the per-user kill switch), which is what the
+	// tier-escalation re-check needs: a user disabled during the switcher's
+	// destroy→create window must not come back on the escalated worker.
+	OrgUserSessionQueryAccess(orgID, username string) (policy *configstore.OrgUserQueryAccess, revision string, ok bool)
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
@@ -1098,7 +1104,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// the user gets an actionable message; only reachable with valid creds,
 			// so it never leaks account existence to a password-guessing attacker.
 			clog.Warn("Postgres connection rejected: user is disabled.", "org", resolution.OrgID, "user", username)
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "this account is disabled; contact your administrator")
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", disabledUserMessage)
 			_ = writer.Flush()
 			return
 		}
@@ -1165,11 +1171,6 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	for _, w := range profileWarns {
 		clog.Warn("Adjusted worker profile.", "detail", w)
 	}
-	if orgProfileApplied && workerProfile != nil {
-		// Once per connection so support can see which shape a tenant got.
-		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
-	}
-
 	// Exploratory tier: a connection that did not ask for a specific worker
 	// shape starts on the small exploratory worker and escalates on demand
 	// (first state-mutating statement, an OOM, or a heuristic — see
@@ -1187,10 +1188,16 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	useExploratory := cp.isRemoteBackend && explProfile != nil &&
 		!clientSuppliedWorkerGUCs(cp.cfg.K8s, startupOptions)
 	initialProfile := workerProfile
+	// Log the shape the connection actually STARTS on, once, so support never
+	// sees two adjacent lines disagreeing about it. On the exploratory tier the
+	// org default is only the escalation target, so it is not "applied" yet.
 	if useExploratory {
 		initialProfile = explProfile
-		clog.Info("Starting connection on exploratory worker.",
+		clog.Info("Connection starting on exploratory worker profile.",
 			"cpu", explProfile.CPU, "memory", explProfile.Memory, "ttl", explProfile.TTL.String())
+	} else if orgProfileApplied && workerProfile != nil {
+		// Once per connection so support can see which shape a tenant got.
+		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
 
 	// Validate a `-c duckgres.s3_cache=...` startup option BEFORE acquiring a
@@ -1483,12 +1490,19 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// to hot-idle before the org's worker cap is checked for the big
 			// one, so escalating can never deadlock against the org's own cap.
 			sessions.DestroySession(pid)
+			if orgID != "" {
+				observeOrgSessionsActive(orgID, sessions.SessionCount())
+			}
 			escMemLimit, escThreads := cp.workerDuckDBLimits(workerProfile)
 			createCtx, cancel := context.WithTimeout(ctx, cp.cfg.WorkerQueueTimeout)
 			defer cancel()
 			_, exec, err := sessions.CreateSession(createCtx, username, pid, escMemLimit, escThreads, workerProfile)
 			if err != nil {
+				// TODO(exploratory-tier): map WorkerCapacityExhaustedError through sessionCreationErrorResponse so the client sees 53300 + retry hint instead of a generic failure.
 				return nil, 0, "", fmt.Errorf("escalate to standard worker: %w", err)
+			}
+			if orgID != "" {
+				observeOrgSessionsActive(orgID, sessions.SessionCount())
 			}
 			newWorkerID := sessions.WorkerIDForPID(pid)
 			newWorkerPod := sessions.WorkerPodNameForPID(pid)
@@ -1497,13 +1511,41 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// metadata init against it, with the identical connect-time inputs.
 			escMeta := sessionMeta
 			escMeta.clog = escClog
-			if _, initErr := cp.initSessionMetadata(createCtx, exec, escMeta); initErr != nil {
+			// Deliberately NOT createCtx: WorkerQueueTimeout budgets the worker
+			// ACQUISITION, so reusing it here would leave init only whatever is
+			// left of it. The switcher's own ctx gives each init step its full
+			// SessionInitTimeout, exactly like the eager connect path.
+			escInitMeta, initErr := cp.initSessionMetadata(ctx, exec, escMeta)
+			if initErr != nil {
 				sessions.DestroySession(pid)
+				if orgID != "" {
+					observeOrgSessionsActive(orgID, sessions.SessionCount())
+				}
 				return nil, 0, "", fmt.Errorf("init session on standard worker: %w", initErr)
 			}
 			// DestroySession dropped the registration; re-register so
 			// OnWorkerCrash can still close the client socket.
 			sessions.SetConnCloser(pid, tlsConn)
+			// Apply the RE-DERIVED metadata: the standard worker attached its own
+			// catalogs, so the transpiler backend profile and catalog USE
+			// rewriting must follow this session, not the exploratory one's.
+			server.SetConnectionPhysicalCatalog(cc, escInitMeta.effectiveCatalog)
+			server.SetCatalogUseRewrite(cc, escInitMeta.duckLakeAttached && !passthroughUser)
+			// The destroy→create window above is invisible to the per-user
+			// kill/disable fan-out (DestroySessionsForUser iterates sessions, and
+			// this connection has neither a session nor a registered conn-closer
+			// while it switches). Re-read the same snapshot disabled state the
+			// auth-time check reads, so a user disabled inside that window does
+			// not come back alive on a fresh worker. ok=false is "missing or
+			// disabled"; both fail closed here.
+			if cp.configStore != nil && orgID != "" {
+				if _, _, ok := cp.configStore.OrgUserSessionQueryAccess(orgID, username); !ok {
+					sessions.DestroySession(pid)
+					observeOrgSessionsActive(orgID, sessions.SessionCount())
+					escClog.Warn("Escalation aborted: user is disabled or no longer exists.")
+					return nil, 0, "", errEscalationUserDisabled
+				}
+			}
 			// Billing: the whole connection bills at the largest worker size it
 			// used (v1). Stamping the escalation target IS that maximum —
 			// escalation only ever goes exploratory→standard, and the

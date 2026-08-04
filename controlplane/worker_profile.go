@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -277,6 +278,18 @@ func clientSuppliedWorkerGUCs(k K8sConfig, opts map[string]string) bool {
 		strings.TrimSpace(opts[gucWorkerMemory]) != "" ||
 		strings.TrimSpace(opts[gucWorkerTTL]) != ""
 }
+
+// disabledUserMessage is the client-facing text for the per-user kill switch.
+// Shared by the connect-time 28000 rejection and the tier-escalation re-check
+// so a disabled user gets the same explanation whichever gate catches it.
+const disabledUserMessage = "this account is disabled; contact your administrator"
+
+// errEscalationUserDisabled aborts a tier escalation whose user was disabled
+// during the switcher's destroy→create window — the one window in which a
+// connection is invisible to the per-user disable fan-out (it holds neither a
+// session nor a registered conn-closer). Escalation failure is
+// connection-fatal, so this text reaches the client.
+var errEscalationUserDisabled = errors.New(disabledUserMessage)
 
 // defaultExploratoryWorkerTTL keeps an org's exploratory worker parked
 // hot-idle for two days after its last connection — the "warm pod for every

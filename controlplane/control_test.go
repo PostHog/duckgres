@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -311,5 +312,22 @@ func TestClientSuppliedWorkerGUCs(t *testing.T) {
 	off := K8sConfig{AllowClientWorkerProfile: false}
 	if clientSuppliedWorkerGUCs(off, map[string]string{"duckgres.worker_cpu": "4"}) {
 		t.Fatal("gated-off client GUCs must not count")
+	}
+}
+
+// The real config store must satisfy ConfigStoreInterface, including the
+// OrgUserSessionQueryAccess accessor the exploratory switcher's post-escalation
+// disabled re-check calls. Asserted here because the !kubernetes build never
+// assigns the concrete store to the interface.
+var _ ConfigStoreInterface = (*configstore.ConfigStore)(nil)
+
+// A user disabled during the switcher's destroy→create window is rejected by
+// the post-escalation re-check, and escalation failure is connection-fatal — so
+// the client sees this error text. Keep it identical to the connect-time 28000
+// message: whichever gate catches a disabled user, the explanation is the same.
+func TestEscalationDisabledErrorMatchesConnectTimeMessage(t *testing.T) {
+	if errEscalationUserDisabled.Error() != disabledUserMessage {
+		t.Fatalf("escalation disabled error %q must match the connect-time message %q",
+			errEscalationUserDisabled.Error(), disabledUserMessage)
 	}
 }

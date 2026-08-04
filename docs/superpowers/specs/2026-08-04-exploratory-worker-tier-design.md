@@ -107,6 +107,23 @@ Per statement, three outcomes:
   session state to the worker's actual transport (`SHOW` must never report a
   transport the worker isn't in).
 
+**Kill/disable interplay.** The switcher's destroy→create window is the one
+point where a connection is invisible to the per-user kill/disable fan-out:
+`DestroySessionsForUser` iterates sessions, and mid-escalation the connection
+holds neither a session nor a registered conn-closer.
+
+- **Disable (persistent block) is mitigated.** After the escalated session's
+  metadata init succeeds and the conn-closer is re-registered, the switcher
+  re-reads the user's disabled state from the same config snapshot the
+  connect-time auth check reads (`ConfigStore.OrgUserSessionQueryAccess`;
+  `ok=false` = missing or disabled). If it is set, the fresh session is
+  destroyed and the escalation fails — which is connection-fatal, so the
+  disabled user is dropped rather than resurrected on a bigger worker.
+- **A one-shot `kill` landing exactly inside the window is an accepted miss.**
+  `kill` is documented best-effort (terminate now, no reconnect block), and the
+  miss is bounded by one worker acquire + session init. The e2e kill assertions
+  run against steady-state connections, not mid-escalation ones.
+
 ### 6. Observability & tests
 
 - `duckgres_exploratory_escalations_total{reason="oom"|"state"|"heuristic"}`,

@@ -25,8 +25,11 @@ var exploratoryEscalationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 
 // escalateWorker moves the connection from the exploratory small worker to a
 // normal-size worker. Sticky: once pinned, later calls are no-ops. On failure
-// the connection stays on the small worker and the caller surfaces the error;
-// a later statement may retry.
+// the connection's previous session is already gone (the control-plane switcher
+// destroys it before acquiring the target worker), so callers MUST treat a
+// failed escalation as connection-fatal: surface the error to the client and
+// terminate the connection. The query-path integration implements that
+// termination.
 func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	if !c.onExploratoryWorker || c.workerSwitcher == nil {
 		return nil
