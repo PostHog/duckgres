@@ -80,7 +80,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 
 	cfg := p.cfg
 	cfg.DuckLake = payload.DuckLake
-	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
+	p.overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 	// Tag postgres_scanner libpq connections with an application_name that
 	// includes the org so Aurora's pg_stat_activity / Performance Insights
 	// can attribute metadata-DB load back to a duckgres tenant. Skipped if
@@ -223,7 +223,7 @@ func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
 		refreshFn = server.RefreshS3Secret
 	}
 	if enabled {
-		overrideS3EndpointForCacheProxy(&cfg)
+		p.overrideS3EndpointForCacheProxy(&cfg)
 	}
 	if err := refreshFn(refreshDB, cfg, sem); err != nil {
 		return fmt.Errorf("swap S3 secret transport (s3_cache=%v): %w", enabled, err)
@@ -350,7 +350,7 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 			p.mu.RUnlock()
 			refreshCfg := payload.DuckLake
 			if !bypassed {
-				overrideS3EndpointForCacheProxy(&refreshCfg)
+				p.overrideS3EndpointForCacheProxy(&refreshCfg)
 			}
 			if err := refreshFn(refreshDB, refreshCfg, sem); err != nil {
 				slog.Warn("Failed to refresh S3 credentials on hot-idle reuse.", "org", payload.OrgID, "error", err)
@@ -460,7 +460,7 @@ func (p *SessionPool) currentSessionConfig() (server.Config, error) {
 
 	cfg := p.cfg
 	cfg.DuckLake = p.activation.payload.DuckLake
-	overrideS3EndpointForCacheProxy(&cfg.DuckLake)
+	p.overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 	return cfg, nil
 }
 

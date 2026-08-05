@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -71,10 +72,14 @@ type SessionPool struct {
 	// controlDB is activePair.Control, surfaced for direct use by control-side
 	// ops (CREATE OR REPLACE SECRET on STS rotation). Always nil before
 	// activation; nil-check before use and fall back to the main DB.
-	controlDB    *sql.DB
-	queryLogMu   sync.Mutex
-	queryLogInit sync.Mutex
-	queryLogSink server.QueryLogSink
+	controlDB            *sql.DB
+	queryLogMu           sync.Mutex
+	queryLogInit         sync.Mutex
+	queryLogSink         server.QueryLogSink
+	cacheRouter          *cacheProxyRouter
+	cacheServer          *http.Server
+	cacheListener        net.Listener
+	cacheRouterAttempted bool
 
 	sharedWarmMode       bool
 	activation           *activatedTenantRuntime
@@ -511,6 +516,22 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		drainZero:            make(chan struct{}),
 		drainZeroOpen:        true,
 	}
+	if cacheEnabled() {
+		pool.cacheRouterAttempted = true
+		router, listener, err := startCacheProxyRouter(cacheProxyS3Addr())
+		if err != nil {
+			slog.Warn("Failed to start worker-local cache fallback router; bypassing local cache.", "error", err)
+		} else {
+			pool.cacheRouter = router
+			pool.cacheListener = listener
+			pool.cacheServer = &http.Server{Handler: router}
+			go func() {
+				if serveErr := pool.cacheServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+					slog.Warn("Worker-local cache fallback router stopped unexpectedly.", "error", serveErr)
+				}
+			}()
+		}
+	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
 	go pool.metadataMetricsLoop()
@@ -520,6 +541,28 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		cfg:  cfg,
 		pool: pool,
 	}
+}
+
+func startCacheProxyRouter(cacheAddr string) (*cacheProxyRouter, net.Listener, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, err
+	}
+	return newCacheProxyRouter(cacheAddr, true), listener, nil
+}
+
+func (p *SessionPool) overrideS3EndpointForCacheProxy(cfg *server.DuckLakeConfig) {
+	if p.cacheRouter == nil {
+		// Hand-constructed unit-test pools predate the router. Keep their
+		// transport assertions meaningful, while a production startup that
+		// attempted and failed to bind the router deliberately stays direct.
+		if !p.cacheRouterAttempted {
+			overrideS3EndpointForCacheProxy(cfg)
+		}
+		return
+	}
+	p.cacheRouter.setDirectUseTLS(cfg.S3UseSSL)
+	overrideS3EndpointForCacheProxyAddr(cfg, p.cacheListener.Addr().String())
 }
 
 // wipePersistedSecrets removes DuckDB's persistent-secret directories for this
@@ -602,11 +645,13 @@ func (p *SessionPool) Warmup() error {
 	start := time.Now()
 	slog.Info("Pre-warming worker DuckDB instance...")
 
-	// Wait for the local cache proxy to be ready before serving queries.
-	// When DUCKGRES_CACHE_PROXY_ADDR is set, DuckDB will route S3 traffic
-	// through it — worker startup must block until the proxy is healthy.
-	// Included in the pre-warm duration so slow proxy startup is visible.
-	waitForCacheProxy()
+	// The local router is always available to DuckDB. A bounded check decides
+	// whether it uses NVMe cache or direct S3, and a single supervisor recovers
+	// the cache later without gating worker readiness.
+	if p.cacheRouter != nil {
+		p.cacheRouter.setMode(waitForCacheProxy())
+		go p.cacheRouter.supervise(cacheProxyHealthURL(), p.stopCh)
+	}
 	// Use a system-level username for warmup
 	pair, err := p.createDBPair(p.sharedWarmupConfig(), p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 	if err != nil {
@@ -1487,6 +1532,9 @@ func (p *SessionPool) CloseAll() {
 			close(p.stopCh)
 		}
 	})
+	if p.cacheServer != nil {
+		_ = p.cacheServer.Close()
+	}
 	p.mu.Lock()
 	sessions := make(map[string]*Session, len(p.sessions))
 	stops := make(map[string]func(), len(p.stopRefresh))

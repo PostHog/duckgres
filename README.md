@@ -227,6 +227,7 @@ column cannot be added to a populated table).
 ## Runbooks
 
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
+- [Node-local Cache Proxy Bypass](docs/runbooks/cache-proxy-bypass.md): Fail-open cache behavior, detection, and recovery.
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
@@ -278,6 +279,22 @@ Duckgres supports three configuration methods (in order of precedence):
 2. Environment variables
 3. YAML config file
 4. Built-in defaults (lowest priority)
+
+### Node-local cache proxy
+
+Kubernetes workers can use the optional node-local NVMe cache proxy with
+`DUCKGRES_CACHE_ENABLED=true`. The worker waits at most
+`DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT` (default: `5s`) for its initial health
+check. It then starts normally: a worker-local forward router bypasses an
+unhealthy proxy and fetches signed objects from the authoritative S3 source.
+The router probes for recovery with capped exponential backoff and jitter, and
+re-enables the local cache after a healthy probe. This setting is an environment
+variable only; it is injected into worker pods alongside `NODE_IP`.
+
+Cache-proxy loss affects cache performance, not worker readiness or PostgreSQL
+session admission. A bypass does not hide HTTP/S3 responses from the proxy, and
+does not replay writes; only a GET/HEAD whose local-proxy connection failed
+before a response is received is retried against the authoritative source.
 
 ### YAML Configuration
 

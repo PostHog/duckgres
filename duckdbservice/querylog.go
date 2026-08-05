@@ -193,7 +193,7 @@ func (p *SessionPool) queryLogRuntime() (server.Config, bool) {
 			return server.Config{}, false
 		}
 		cfg.DuckLake = p.activation.payload.DuckLake
-		overrideS3EndpointForCacheProxy(&cfg.DuckLake)
+		p.overrideS3EndpointForCacheProxy(&cfg.DuckLake)
 		if cfg.DuckLake.ApplicationName == "" && p.activation.payload.OrgID != "" {
 			cfg.DuckLake.ApplicationName = "duckgres/" + p.activation.payload.OrgID
 		}

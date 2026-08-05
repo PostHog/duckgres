@@ -9,6 +9,27 @@ import (
 // These use the "duckgres_worker_" prefix to distinguish from standalone-mode
 // metrics defined in server/server.go (which use "duckgres_ducklake_").
 var (
+	cacheProxyModeGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "duckgres_worker_cache_proxy_mode",
+		Help: "Current node-local cache-proxy mode (one active mode has value 1)",
+	}, []string{"mode"})
+	cacheProxyBypassTransitionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_cache_proxy_bypass_transitions_total",
+		Help: "Total transitions into cache-proxy bypass mode",
+	}, []string{"reason"})
+	cacheProxyBypassedOperationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "duckgres_worker_cache_proxy_bypassed_operations_total",
+		Help: "Total operations routed around the node-local cache proxy",
+	}, []string{"reason"})
+	cacheProxyReconnectAttemptsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "duckgres_worker_cache_proxy_reconnect_attempts_total",
+		Help: "Total cache-proxy health probes while recovering or monitoring",
+	})
+	cacheProxyRecoveriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "duckgres_worker_cache_proxy_recoveries_total",
+		Help: "Total recoveries that re-enabled the node-local cache proxy",
+	})
+
 	ducklakeConflictTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "duckgres_worker_ducklake_conflict_total",
 		Help: "Total number of DuckLake transaction conflicts encountered (worker)",

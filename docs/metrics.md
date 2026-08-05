@@ -201,6 +201,19 @@ The older fleet-level `duckgres_control_plane_worker_*` metrics remain useful
 for process-wide worker counts, spawn time, and the approximate post-admission
 worker queue. They have no org label and are not admission saturation metrics.
 
+### Node-local cache proxy metrics
+
+These worker-local metrics have no tenant labels. Exactly one
+`duckgres_worker_cache_proxy_mode{mode}` series is `1`.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `duckgres_worker_cache_proxy_mode` | `mode` | Current cache mode: `cached`, `bypassed`, or `disabled`; the active mode is `1`. |
+| `duckgres_worker_cache_proxy_bypass_transitions_total` | `reason` | Entries into bypass mode: `startup_unavailable`, `runtime_unavailable`, or `upstream_unavailable`. |
+| `duckgres_worker_cache_proxy_bypassed_operations_total` | `reason` | Operations routed around the node-local cache. |
+| `duckgres_worker_cache_proxy_reconnect_attempts_total` | None | Health checks made by the recovery supervisor. |
+| `duckgres_worker_cache_proxy_recoveries_total` | None | Successful cache re-enablement events. |
+
 ## PromQL recipes
 
 Admission wait p95 by org and terminal result:

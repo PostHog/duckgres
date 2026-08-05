@@ -226,6 +226,12 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 				},
 			},
 		)
+		if timeout := os.Getenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT"); timeout != "" {
+			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+				Name:  "DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT",
+				Value: timeout,
+			})
+		}
 	}
 
 	// Add toleration if configured.
