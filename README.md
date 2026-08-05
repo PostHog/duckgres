@@ -284,7 +284,7 @@ Duckgres supports three configuration methods (in order of precedence):
 
 Kubernetes workers can use the optional node-local NVMe cache proxy with
 `DUCKGRES_CACHE_ENABLED=true`. The worker waits at most
-`DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT` (default: `5s`) for its initial health
+`DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT` (default: `5s`, maximum: `10s`) for its initial health
 check. It then starts normally: a worker-local forward router bypasses an
 unhealthy proxy and fetches signed objects from the authoritative S3 source.
 The router probes for recovery with capped exponential backoff and jitter, and

@@ -38,6 +38,7 @@ directly until their local proxy recovers.
 ## Startup behavior
 
 `DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT` bounds the initial health check and
-defaults to `5s`. After the timeout, the worker starts in bypass mode; increasing
-this value only delays a cache decision and should not be used as a substitute
-for fixing a repeatedly unhealthy cache proxy.
+defaults to `5s`; it is clamped to `10s` to preserve the worker-start budget.
+After the timeout, the worker starts in bypass mode; increasing this value only
+delays a cache decision and should not be used as a substitute for fixing a
+repeatedly unhealthy cache proxy.

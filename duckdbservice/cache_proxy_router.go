@@ -29,6 +29,13 @@ const (
 	cacheProxyReconnectInitial     = time.Second
 	cacheProxyReconnectMaximum     = 30 * time.Second
 	cacheProxyHealthyProbeInterval = 5 * time.Second
+
+	cacheProxyDialTimeout         = 5 * time.Second
+	cacheProxyTLSHandshakeTimeout = 5 * time.Second
+	// The cache daemon may materialize an origin response for up to 60s before
+	// sending headers, so leave a little coordination headroom here.
+	cacheProxyResponseHeaderTimeout = 70 * time.Second
+	cacheProxyIdleConnTimeout       = 90 * time.Second
 )
 
 // cacheProxyRouter is a stable, worker-local forward proxy. DuckDB always
@@ -53,6 +60,16 @@ type cacheProxySupervisorConfig struct {
 	jitter                func(time.Duration) time.Duration
 }
 
+// cacheProxyTransportConfig intentionally excludes a whole-request timeout.
+// The router may stream a large S3 range for longer than any sensible
+// connection/header deadline; cancelling that body would corrupt the read.
+type cacheProxyTransportConfig struct {
+	dialTimeout           time.Duration
+	tlsHandshakeTimeout   time.Duration
+	responseHeaderTimeout time.Duration
+	idleConnTimeout       time.Duration
+}
+
 func (r *cacheProxyRouter) setDirectUseTLS(useTLS bool) {
 	r.mu.Lock()
 	r.directUseTLS = useTLS
@@ -66,18 +83,50 @@ func (r *cacheProxyRouter) directUsesTLS() bool {
 }
 
 func newCacheProxyRouter(cacheAddr string, directUseTLS bool) *cacheProxyRouter {
+	return newCacheProxyRouterWithTransport(cacheAddr, directUseTLS, cacheProxyTransportConfig{})
+}
+
+func newCacheProxyRouterWithTransport(cacheAddr string, directUseTLS bool, cfg cacheProxyTransportConfig) *cacheProxyRouter {
+	cfg = normalizeCacheProxyTransportConfig(cfg)
 	cacheURL := &url.URL{Scheme: "http", Host: cacheAddr}
 	router := &cacheProxyRouter{
 		cacheURL:     cacheURL,
 		directUseTLS: directUseTLS,
-		cacheClient:  &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(cacheURL)}},
+		cacheClient:  &http.Client{Transport: newCacheProxyTransport(cacheURL, cfg)},
 		// Never inherit HTTP_PROXY here: bypass must not accidentally route back
 		// through another proxy when the node-local cache daemon is unhealthy.
-		directClient: &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{Proxy: nil}},
+		directClient: &http.Client{Transport: newCacheProxyTransport(nil, cfg)},
 		mode:         cacheProxyModeBypassed,
 	}
 	recordCacheProxyMode(router.mode)
 	return router
+}
+
+func normalizeCacheProxyTransportConfig(cfg cacheProxyTransportConfig) cacheProxyTransportConfig {
+	if cfg.dialTimeout == 0 {
+		cfg.dialTimeout = cacheProxyDialTimeout
+	}
+	if cfg.tlsHandshakeTimeout == 0 {
+		cfg.tlsHandshakeTimeout = cacheProxyTLSHandshakeTimeout
+	}
+	if cfg.responseHeaderTimeout == 0 {
+		cfg.responseHeaderTimeout = cacheProxyResponseHeaderTimeout
+	}
+	if cfg.idleConnTimeout == 0 {
+		cfg.idleConnTimeout = cacheProxyIdleConnTimeout
+	}
+	return cfg
+}
+
+func newCacheProxyTransport(proxyURL *url.URL, cfg cacheProxyTransportConfig) *http.Transport {
+	dialer := &net.Dialer{Timeout: cfg.dialTimeout}
+	return &http.Transport{
+		Proxy:                 http.ProxyURL(proxyURL),
+		DialContext:           dialer.DialContext,
+		TLSHandshakeTimeout:   cfg.tlsHandshakeTimeout,
+		ResponseHeaderTimeout: cfg.responseHeaderTimeout,
+		IdleConnTimeout:       cfg.idleConnTimeout,
+	}
 }
 
 func (r *cacheProxyRouter) Mode() cacheProxyMode {

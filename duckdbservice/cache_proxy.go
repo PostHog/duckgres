@@ -34,6 +34,9 @@ const (
 	// defaultCacheProxyConnectTimeout bounds worker startup when the optional
 	// node-local cache daemon is unavailable.
 	defaultCacheProxyConnectTimeout = 5 * time.Second
+	// maxCacheProxyConnectTimeout preserves enough worker-start budget for
+	// DuckDB warmup and the control-plane health RPC.
+	maxCacheProxyConnectTimeout = 10 * time.Second
 )
 
 // cacheEnabled returns true when the cache proxy integration should be used.
@@ -125,6 +128,11 @@ func cacheProxyConnectTimeout() time.Duration {
 		slog.Warn("Invalid DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT; using default.",
 			"value", value, "default", defaultCacheProxyConnectTimeout, "error", err)
 		return defaultCacheProxyConnectTimeout
+	}
+	if timeout > maxCacheProxyConnectTimeout {
+		slog.Warn("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT exceeds the safe maximum; clamping.",
+			"value", timeout, "maximum", maxCacheProxyConnectTimeout)
+		return maxCacheProxyConnectTimeout
 	}
 	return timeout
 }

@@ -76,6 +76,50 @@ func TestCacheProxyRouterFallsOpenToAuthoritativeSource(t *testing.T) {
 	}
 }
 
+// ResponseHeaderTimeout must bound an unavailable upstream without imposing a
+// whole-response deadline: S3 range bodies can legitimately outlive it.
+func TestCacheProxyRouterStreamsPastResponseHeaderTimeout(t *testing.T) {
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("response writer does not support flush")
+		}
+		_, _ = io.WriteString(w, "first-")
+		flusher.Flush()
+		time.Sleep(40 * time.Millisecond)
+		_, _ = io.WriteString(w, "last")
+	}))
+	defer source.Close()
+
+	router := newCacheProxyRouterWithTransport(closedLocalAddress(t), false, cacheProxyTransportConfig{
+		responseHeaderTimeout: 10 * time.Millisecond,
+	})
+	if router.directClient.Timeout != 0 || router.cacheClient.Timeout != 0 {
+		t.Fatalf("router clients must not impose a whole-response timeout: direct=%s cache=%s", router.directClient.Timeout, router.cacheClient.Timeout)
+	}
+	router.setMode(cacheProxyModeBypassed)
+	proxy := httptest.NewServer(router)
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := client.Get(source.URL + "/warehouse/large.parquet")
+	if err != nil {
+		t.Fatalf("GET through direct fallback: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read streamed fallback body: %v", err)
+	}
+	if got := string(body); got != "first-last" {
+		t.Fatalf("body = %q, want complete stream", got)
+	}
+}
+
 // A response received from the cache is authoritative for that request. In
 // particular, a 5xx must not be silently replaced with a direct source read:
 // it can carry a source/data-integrity failure that the query must see.

@@ -81,6 +81,12 @@ func TestCacheProxyConnectTimeout(t *testing.T) {
 			t.Fatalf("timeout = %s, want default %s", got, defaultCacheProxyConnectTimeout)
 		}
 	})
+	t.Run("clamps an excessive value to preserve worker startup budget", func(t *testing.T) {
+		t.Setenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT", "2m")
+		if got := cacheProxyConnectTimeout(); got != maxCacheProxyConnectTimeout {
+			t.Fatalf("timeout = %s, want capped maximum %s", got, maxCacheProxyConnectTimeout)
+		}
+	})
 }
 
 func TestCacheProxyHealthURL(t *testing.T) {
