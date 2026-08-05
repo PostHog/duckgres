@@ -1340,13 +1340,16 @@ func TestExtendedExecuteMidStreamOOMAfterRowsSurfaces(t *testing.T) {
 	}
 }
 
-// TestExtendedExecuteMaxRowsUnchanged pins the non-tier behavior of the
-// Execute row loop through the shared streaming helper: maxRows still caps the
-// DataRows sent (portal suspension is not implemented — the surplus row is
-// fetched and dropped, as before).
-func TestExtendedExecuteMaxRowsUnchanged(t *testing.T) {
+// TestExtendedExecuteMaxRowsSuspendsAndResumes pins the non-tier behavior of
+// the Execute row loop through the shared streaming helper: maxRows caps the
+// DataRows sent, but the capped Execute now reports PortalSuspended (never
+// CommandComplete) and leaves the portal's RowSet open so a later Execute on
+// the same portal resumes and delivers the rest — no row dropped at the
+// boundary, none duplicated on resume.
+func TestExtendedExecuteMaxRowsSuspendsAndResumes(t *testing.T) {
+	rows := &tierRowSet{rows: []int64{1, 2, 3}}
 	exec := &tierExecutor{name: "std", queryFn: func(int, string) (RowSet, error) {
-		return &tierRowSet{rows: []int64{1, 2, 3}}, nil
+		return rows, nil
 	}}
 	c, out := newBufferedConn(exec)
 	c.stmts = make(map[string]*preparedStmt)
@@ -1365,8 +1368,46 @@ func TestExtendedExecuteMaxRowsUnchanged(t *testing.T) {
 	if got := countMsgs(msgs, 'D'); got != 2 {
 		t.Fatalf("DataRow count = %d, want 2 (maxRows): %s", got, describeMsgs(msgs))
 	}
-	if !commandCompleteWith(msgs, "SELECT 2") {
-		t.Fatalf("want CommandComplete 'SELECT 2': %s", describeMsgs(msgs))
+	if got := countMsgs(msgs, 's'); got != 1 {
+		t.Fatalf("PortalSuspended count = %d, want 1: %s", got, describeMsgs(msgs))
+	}
+	if commandCompleteWith(msgs, "SELECT 2") || countMsgs(msgs, 'C') != 0 {
+		t.Fatalf("expected NO CommandComplete on a suspended Execute: %s", describeMsgs(msgs))
+	}
+	if len(exec.queryCalls) != 1 {
+		t.Fatalf("expected exactly one Query call, got %d", len(exec.queryCalls))
+	}
+	if rows.idx != 2 {
+		t.Fatalf("expected the RowSet positioned after exactly 2 rows (no dropped lookahead row), got idx=%d", rows.idx)
+	}
+	if rows.closed != 0 {
+		t.Fatalf("expected the RowSet to stay open across a suspended Execute, closed=%d", rows.closed)
+	}
+	if c.portals["s1"].openRows == nil {
+		t.Fatalf("expected the portal to retain the open RowSet for resumption")
+	}
+
+	// A second Execute on the same portal must resume, not restart: it should
+	// deliver only the remaining row and report the cumulative row count.
+	out.Reset()
+	if err := extExecute(c, "s1", 0); err != nil {
+		t.Fatalf("Execute (resume): %v", err)
+	}
+	msgs = parseWireMsgs(t, out.Bytes())
+	if got := countMsgs(msgs, 'D'); got != 1 {
+		t.Fatalf("resumed DataRow count = %d, want 1 (row 3, not re-sending 1-2): %s", got, describeMsgs(msgs))
+	}
+	if !commandCompleteWith(msgs, "SELECT 3") {
+		t.Fatalf("want cumulative CommandComplete 'SELECT 3': %s", describeMsgs(msgs))
+	}
+	if len(exec.queryCalls) != 1 {
+		t.Fatalf("expected the resumed Execute to reuse the existing RowSet, not re-run Query; got %d Query calls", len(exec.queryCalls))
+	}
+	if rows.closed != 1 {
+		t.Fatalf("expected the RowSet to be closed exactly once after draining, closed=%d", rows.closed)
+	}
+	if c.portals["s1"].openRows != nil {
+		t.Fatalf("expected the portal's openRows to be cleared once drained")
 	}
 }
 
