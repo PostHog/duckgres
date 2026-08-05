@@ -357,6 +357,12 @@ type selectStream struct {
 	// can reproduce the exact log wording.
 	writeErr   error
 	writeStage string
+	// limitReached is set when maxRows stopped the stream with the rowset not
+	// (yet) known to be exhausted — the extended protocol suspends the portal
+	// (PortalSuspended) and a later Execute resumes from the same rowset. All
+	// three errors are nil when it is set, and rows.Err() has deliberately
+	// NOT been consulted: the rowset is still live.
+	limitReached bool
 }
 
 // streamSelectRows sends (optionally) the RowDescription and then every DataRow
@@ -366,9 +372,11 @@ type selectStream struct {
 //
 // formats are the Bind result-format codes (nil = all text, the simple-query
 // case). maxRows > 0 caps the DataRows sent, for the extended protocol's
-// Execute row limit; portal suspension is not implemented, so the row already
-// fetched when the cap is reached is dropped, and rows.Err() is still consulted
-// by the caller exactly as on a fully drained stream.
+// Execute row limit (portal suspension): the limit is checked BEFORE advancing
+// the rowset, so a suspended stream never consumes — and loses — the first row
+// of the next page. Matching PostgreSQL, the cap suspends even when the rowset
+// happens to be exactly exhausted: knowing would mean consuming the next row,
+// so the client's follow-up Execute gets 0 rows and the completion instead.
 func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []ColumnTyper, typeOIDs []int32, sendRowDesc bool, formats []int16, maxRows int32) selectStream {
 	if sendRowDesc {
 		if err := c.sendRowDescription(cols, colTypes); err != nil {
@@ -377,8 +385,12 @@ func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []Col
 	}
 
 	var out selectStream
-	for rows.Next() {
+	for {
 		if maxRows > 0 && int32(out.rowsSent) >= maxRows {
+			out.limitReached = true
+			return out
+		}
+		if !rows.Next() {
 			break
 		}
 

@@ -206,6 +206,16 @@ normal `go test ./...` lane.
 
 ### Deliberately not covered here
 
+- **Portal suspension (extended-query Execute row limit)** — the harness
+  drives all SQL through psql, and libpq never sends a nonzero Execute row
+  limit, so a paging client (JDBC `setFetchSize`, Hex) cannot be simulated
+  in-Job. The behavior is deterministically covered against a real server by
+  `tests/integration/portal_suspension_test.go::TestPortalSuspensionPaging`
+  (raw pgproto3 frontend paging a 1000-row result set over TLS) and by the
+  server unit tests in `server/conn_portal_suspension_test.go`; the path is
+  identical on the remote backend (suspension lives entirely in the CP's
+  pgwire layer above the executor).
+
 - **Native metadata proxy denial for an external metadata-store org** — the
   live suite intentionally provisions only CNPG-backed orgs and has no RDS
   credential with which to create an external-store tenant. The backend-kind

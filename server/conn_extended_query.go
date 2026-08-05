@@ -586,6 +586,14 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	// Continuation of a suspended portal: resume streaming from the open
+	// rowset. The query must NOT re-run — the client is fetching the next
+	// page of the same result set.
+	if p.exec != nil {
+		c.resumeSuspendedPortal(p, maxRows)
+		return
+	}
+
 	// Redacted form for everything observable (pg_stat_activity, spans,
 	// logs): CREATE SECRET option lists carry credential material.
 	loggableQuery := usersecrets.RedactForLog(p.stmt.query)
@@ -920,7 +928,12 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 		return
 	}
-	defer func() { _ = rows.Close() }()
+	keepRowsOpen := false
+	defer func() {
+		if !keepRowsOpen {
+			_ = rows.Close()
+		}
+	}()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -952,8 +965,10 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Send rows with the format codes from Bind. Shared with the simple-query
 	// path so the exploratory tier's zero-row retry below behaves identically
-	// on both protocols; maxRows still caps the DataRows (portal suspension is
-	// not implemented) and the RowDescription was already handled above.
+	// on both protocols; the RowDescription was already handled above. maxRows
+	// caps the DataRows sent, and reaching it suspends the portal
+	// (stream.limitReached below) instead of completing it.
+	activeRows := rows
 	stream := c.streamSelectRows(rows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 
 	// Exploratory tier: an OOM raised before a SINGLE DataRow reached the
@@ -974,7 +989,14 @@ func (c *clientConn) handleExecute(body []byte) {
 		if retryErr != nil {
 			stream.rowsErr = retryErr
 		} else {
-			defer func() { _ = retryRows.Close() }()
+			// The retried rowset replaces the original everywhere below —
+			// including as the rowset a suspension keeps open.
+			activeRows = retryRows
+			defer func() {
+				if !keepRowsOpen {
+					_ = retryRows.Close()
+				}
+			}()
 			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 		}
 	}
@@ -1011,10 +1033,112 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	if stream.limitReached {
+		// The row limit was reached with the result set possibly unexhausted:
+		// keep the rowset open on the portal and tell the client to Execute
+		// again. CommandComplete here would silently truncate the result set
+		// to the client's page size (the Hex 1024-row bug). The query log
+		// entry is written by the leg that completes the portal.
+		keepRowsOpen = true
+		p.exec = &portalExec{
+			rows:           activeRows,
+			cols:           cols,
+			typeOIDs:       typeOIDs,
+			cmdType:        cmdType,
+			rowCount:       int64(rowCount),
+			originalQuery:  originalQuery,
+			convertedQuery: convertedQuery,
+			start:          start,
+		}
+		_ = wire.WritePortalSuspended(c.writer)
+		return
+	}
+
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = c.writeCommandComplete(tag)
 	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
+}
+
+// resumeSuspendedPortal continues streaming a portal previously suspended by
+// Execute hitting its row limit. The query is not re-executed — the portal's
+// open rowset picks up exactly where the previous Execute leg stopped. The
+// query log entry (spanning all legs, with the cumulative row count) is
+// written by whichever leg finishes the portal. There is deliberately no
+// exploratory-tier retry here: rows from earlier legs are already out the
+// door, so an error must surface (same rule as the mid-stream case above).
+func (c *clientConn) resumeSuspendedPortal(p *portal, maxRows int32) {
+	exec := p.exec
+
+	loggableQuery := usersecrets.RedactForLog(exec.originalQuery)
+	c.currentQuery.Store(loggableQuery)
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
+
+	// Each Execute leg is one protocol message, so it gets its own metrics
+	// scope, mirroring the fresh path — which also gives the leg the terminal
+	// wire flush (finishQueryMetrics) every Execute relies on.
+	queryMetrics := c.beginQueryMetrics(time.Now())
+	queryMetrics.queryText = loggableQuery
+	defer c.finishQueryMetrics(queryMetrics)
+
+	stream := c.streamSelectRows(exec.rows, exec.cols, nil, exec.typeOIDs, false, p.resultFormats, maxRows)
+	exec.rowCount += int64(stream.rowsSent)
+
+	if stream.scanErr != nil {
+		p.closeExec()
+		c.sendError("ERROR", "42000", stream.scanErr.Error())
+		c.setTxError()
+		c.logQuery(exec.start, exec.originalQuery, exec.convertedQuery, exec.cmdType, 0, 0, "42000", stream.scanErr.Error(), "extended")
+		return
+	}
+	if stream.writeErr != nil {
+		p.closeExec()
+		return
+	}
+	if err := stream.rowsErr; err != nil {
+		p.closeExec()
+		errCode := "42000"
+		errMsg := err.Error()
+		if c.isCallerCancellation(err) {
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
+		} else {
+			c.logger().Error("Row iteration error.", "error", err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
+		c.setTxError()
+		c.logQuery(exec.start, exec.originalQuery, exec.convertedQuery, exec.cmdType, 0, 0, errCode, errMsg, "extended")
+		return
+	}
+	if stream.limitReached {
+		_ = wire.WritePortalSuspended(c.writer)
+		return
+	}
+
+	p.closeExec()
+	c.updateTxStatus(exec.cmdType)
+	tag := buildCommandTagFromRowCount(exec.cmdType, exec.rowCount)
+	_ = c.writeCommandComplete(tag)
+	c.logQuery(exec.start, exec.originalQuery, exec.convertedQuery, exec.cmdType, exec.rowCount, 0, "", "", "extended")
+}
+
+// closeSuspendedPortals releases every suspended portal's open rowset and
+// destroys the portal, matching PostgreSQL (portals do not survive
+// transaction end). Destroying — not just releasing — matters: a suspended
+// portal whose rowset was closed but whose entry survived would re-run the
+// query from row 0 on the next Execute, silently replaying the first page as
+// a continuation. A 34000 "portal does not exist" is the honest answer.
+func (c *clientConn) closeSuspendedPortals() {
+	for name, p := range c.portals {
+		if p.exec != nil {
+			p.closeExec()
+			delete(c.portals, name)
+		}
+	}
 }
 
 func (c *clientConn) handleClose(body []byte) {
@@ -1034,6 +1158,9 @@ func (c *clientConn) handleClose(body []byte) {
 	case 'S':
 		delete(c.stmts, name)
 	case 'P':
+		if p, ok := c.portals[name]; ok {
+			p.closeExec()
+		}
 		delete(c.portals, name)
 	}
 
@@ -1220,8 +1347,12 @@ func (c *clientConn) handleBind(body []byte) {
 		}
 	}
 
-	// Close existing portal with same name
-	delete(c.portals, portalName)
+	// Close existing portal with same name — including the open rowset of a
+	// suspended portal being abandoned.
+	if old, ok := c.portals[portalName]; ok {
+		old.closeExec()
+		delete(c.portals, portalName)
+	}
 
 	c.portals[portalName] = &portal{
 		stmt:          ps,

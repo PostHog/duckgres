@@ -1340,11 +1340,13 @@ func TestExtendedExecuteMidStreamOOMAfterRowsSurfaces(t *testing.T) {
 	}
 }
 
-// TestExtendedExecuteMaxRowsUnchanged pins the non-tier behavior of the
-// Execute row loop through the shared streaming helper: maxRows still caps the
-// DataRows sent (portal suspension is not implemented — the surplus row is
-// fetched and dropped, as before).
-func TestExtendedExecuteMaxRowsUnchanged(t *testing.T) {
+// TestExtendedExecuteMaxRowsSuspends pins the non-tier behavior of the
+// Execute row loop through the shared streaming helper: maxRows caps the
+// DataRows sent and suspends the portal (PortalSuspended, no CommandComplete);
+// a follow-up Execute on the same portal streams the rest and completes with
+// the cumulative row count. Full sequence coverage lives in
+// conn_portal_suspension_test.go — this pins the tier harness's view of it.
+func TestExtendedExecuteMaxRowsSuspends(t *testing.T) {
 	exec := &tierExecutor{name: "std", queryFn: func(int, string) (RowSet, error) {
 		return &tierRowSet{rows: []int64{1, 2, 3}}, nil
 	}}
@@ -1365,8 +1367,22 @@ func TestExtendedExecuteMaxRowsUnchanged(t *testing.T) {
 	if got := countMsgs(msgs, 'D'); got != 2 {
 		t.Fatalf("DataRow count = %d, want 2 (maxRows): %s", got, describeMsgs(msgs))
 	}
-	if !commandCompleteWith(msgs, "SELECT 2") {
-		t.Fatalf("want CommandComplete 'SELECT 2': %s", describeMsgs(msgs))
+	if got := countMsgs(msgs, 's'); got != 1 {
+		t.Fatalf("want PortalSuspended after the capped page: %s", describeMsgs(msgs))
+	}
+	if commandCompleteWith(msgs, "SELECT 2") {
+		t.Fatalf("CommandComplete at the row cap would silently truncate: %s", describeMsgs(msgs))
+	}
+	out.Reset()
+	if err := extExecute(c, "s1", 2); err != nil {
+		t.Fatalf("resume Execute: %v", err)
+	}
+	msgs = parseWireMsgs(t, out.Bytes())
+	if got := countMsgs(msgs, 'D'); got != 1 {
+		t.Fatalf("resume DataRow count = %d, want the remaining 1: %s", got, describeMsgs(msgs))
+	}
+	if !commandCompleteWith(msgs, "SELECT 3") {
+		t.Fatalf("want cumulative CommandComplete 'SELECT 3': %s", describeMsgs(msgs))
 	}
 }
 
