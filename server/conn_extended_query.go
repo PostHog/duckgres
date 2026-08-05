@@ -865,95 +865,140 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	// Result-returning query: use Query with converted query
-	runQuery := func() (RowSet, error) {
-		return c.executor.Query(convertedQuery, args...)
+	// Result-returning query: resume a suspended portal's RowSet (from a
+	// previous Execute that hit max_rows), or run a fresh Query. Only a fresh
+	// (non-resumed) execution goes through the conflict-retry / OOM-retry /
+	// RowDescription machinery below — a resumed portal already has all of
+	// that settled from its first Execute.
+	resuming := p.openRows != nil
+
+	var rows RowSet
+	var cols []string
+	var colTypes []ColumnTyper
+	var typeOIDs []int32
+	if resuming {
+		rows = p.openRows
+		cols = p.openCols
+		colTypes = p.openColTypes
+		typeOIDs = p.openTypeOIDs
 	}
 
-	execStart := time.Now()
-	execCtx, execSpan := observe.Tracer().Start(queryCtx, "duckgres.execute")
-	rows, err := runQuery()
-	if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
-		ducklakeConflictTotal.Inc()
-		rows, err = retryOnConflict(runQuery)
-	}
-	if err != nil {
-		rows, err, _ = recoverAbortedTransaction(
-			err,
-			c.txStatus == txStatusIdle,
-			func() error {
-				_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
-				return rollbackErr
-			},
-			runQuery,
-		)
-	}
-	// Exploratory tier: a read that blew the small worker's memory_limit is
-	// transparently re-executed on a normal-size worker. Prepare phase only —
-	// nothing has been sent to the client yet, so the retry is invisible. Never
-	// inside a transaction: the new worker has none of its accumulated state.
-	// runQuery reads c.executor at call time, so it targets the new worker.
-	// Same contract as executeSelectQuery; a failed escalation surfaces the
-	// ORIGINAL query error as FATAL and terminates the connection.
-	if err != nil && c.onExploratoryWorker && isWorkerOutOfMemoryError(err) && c.txStatus == txStatusIdle {
-		if escErr := c.escalateWorker(queryCtx, escalateReasonOOM); escErr != nil {
-			queryFinalErr = err
-			execSpan.End()
-			_ = c.failEscalation(convertedQuery, escErr, err.Error())
+	// suspended is set below once streamSelectRows reports the max_rows cap
+	// was hit with more of the result set left. The deferred cleanup decides,
+	// on every exit path, whether to hand the still-open RowSet back to the
+	// portal for the next Execute (suspended) or close it (drained/errored) —
+	// this is what makes a suspended portal resumable instead of the old
+	// "close rows and hope the client never comes back for more" behavior.
+	var suspended bool
+	defer func() {
+		if suspended {
+			p.openRows = rows
+			p.openCols = cols
+			p.openColTypes = colTypes
+			p.openTypeOIDs = typeOIDs
 			return
 		}
+		if rows != nil {
+			_ = rows.Close()
+		}
+		p.openRows = nil
+	}()
+
+	if !resuming {
+		runQuery := func() (RowSet, error) {
+			return c.executor.Query(convertedQuery, args...)
+		}
+
+		execStart := time.Now()
+		execCtx, execSpan := observe.Tracer().Start(queryCtx, "duckgres.execute")
+		var err error
 		rows, err = runQuery()
-	}
-	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
-	execSpan.End()
-	if err != nil {
-		queryFinalErr = err
-		errCode := classifyErrorCode(err)
-		errMsg := err.Error()
-		if c.isCallerCancellation(err) {
-			errMsg = "canceling statement due to user request"
-		} else {
-			c.logQueryError(convertedQuery, err)
+		if err != nil && c.txStatus == txStatusIdle && isDuckLakeTransactionConflict(err) {
+			ducklakeConflictTotal.Inc()
+			rows, err = retryOnConflict(runQuery)
 		}
-		c.sendError("ERROR", errCode, errMsg)
-		c.setTxError()
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
-		return
-	}
-	defer func() { _ = rows.Close() }()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		queryFinalErr = err
-		c.logger().Error("Columns error.", "error", err)
-		c.sendError("ERROR", "42000", err.Error())
-		c.setTxError()
-		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
-		return
-	}
-
-	// Get column types for binary encoding
-	colTypes, _ := rows.ColumnTypes()
-	typeOIDs := make([]int32, len(cols))
-	for i, ct := range colTypes {
-		typeOIDs[i] = getTypeInfo(ct).OID
-	}
-
-	// Send RowDescription if Describe wasn't called before Execute.
-	// Some clients skip Describe and go straight to Execute, but still
-	// need the column metadata before receiving data rows.
-	// Skip if there are no columns - queries that return 0 columns (like
-	// DDL accidentally routed here) don't need RowDescription.
-	if !p.described && len(cols) > 0 {
-		if err := c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats); err != nil {
+		if err != nil {
+			rows, err, _ = recoverAbortedTransaction(
+				err,
+				c.txStatus == txStatusIdle,
+				func() error {
+					_, rollbackErr := c.executor.ExecContext(context.Background(), "ROLLBACK")
+					return rollbackErr
+				},
+				runQuery,
+			)
+		}
+		// Exploratory tier: a read that blew the small worker's memory_limit is
+		// transparently re-executed on a normal-size worker. Prepare phase only —
+		// nothing has been sent to the client yet, so the retry is invisible. Never
+		// inside a transaction: the new worker has none of its accumulated state.
+		// runQuery reads c.executor at call time, so it targets the new worker.
+		// Same contract as executeSelectQuery; a failed escalation surfaces the
+		// ORIGINAL query error as FATAL and terminates the connection.
+		if err != nil && c.onExploratoryWorker && isWorkerOutOfMemoryError(err) && c.txStatus == txStatusIdle {
+			if escErr := c.escalateWorker(queryCtx, escalateReasonOOM); escErr != nil {
+				queryFinalErr = err
+				execSpan.End()
+				_ = c.failEscalation(convertedQuery, escErr, err.Error())
+				return
+			}
+			rows, err = runQuery()
+		}
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
+		if err != nil {
+			queryFinalErr = err
+			errCode := classifyErrorCode(err)
+			errMsg := err.Error()
+			if c.isCallerCancellation(err) {
+				errMsg = "canceling statement due to user request"
+			} else {
+				c.logQueryError(convertedQuery, err)
+			}
+			c.sendError("ERROR", errCode, errMsg)
+			c.setTxError()
+			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 			return
 		}
+
+		cols, err = rows.Columns()
+		if err != nil {
+			queryFinalErr = err
+			c.logger().Error("Columns error.", "error", err)
+			c.sendError("ERROR", "42000", err.Error())
+			c.setTxError()
+			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+			return
+		}
+
+		// Get column types for binary encoding
+		colTypes, _ = rows.ColumnTypes()
+		typeOIDs = make([]int32, len(cols))
+		for i, ct := range colTypes {
+			typeOIDs[i] = getTypeInfo(ct).OID
+		}
+
+		// Send RowDescription if Describe wasn't called before Execute.
+		// Some clients skip Describe and go straight to Execute, but still
+		// need the column metadata before receiving data rows.
+		// Skip if there are no columns - queries that return 0 columns (like
+		// DDL accidentally routed here) don't need RowDescription.
+		if !p.described && len(cols) > 0 {
+			if err := c.sendRowDescriptionWithFormats(cols, colTypes, p.resultFormats); err != nil {
+				return
+			}
+		}
+		// A later Execute on this portal (resuming, or after a plain restart
+		// without Describe) must never resend RowDescription.
+		p.described = true
 	}
 
 	// Send rows with the format codes from Bind. Shared with the simple-query
 	// path so the exploratory tier's zero-row retry below behaves identically
-	// on both protocols; maxRows still caps the DataRows (portal suspension is
-	// not implemented) and the RowDescription was already handled above.
+	// on both protocols. maxRows caps the DataRows sent per Execute; if the
+	// cap is hit before the result set is exhausted, streamSelectRows leaves
+	// rows open and positioned to continue, and stream.suspended tells us to
+	// report PortalSuspended below instead of CommandComplete.
 	stream := c.streamSelectRows(rows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 
 	// Exploratory tier: an OOM raised before a SINGLE DataRow reached the
@@ -961,20 +1006,24 @@ func (c *clientConn) handleExecute(body []byte) {
 	// has seen is the RowDescription, which the identical query on the same
 	// engine reproduces exactly, so it is deliberately NOT resent. Once rows
 	// are out the door the error must surface: a retry cannot un-send them.
-	if stream.rowsErr != nil && stream.rowsSent == 0 &&
+	// Only applies to a fresh execution: a resumed portal has already sent
+	// rows from an earlier Execute, so the client has committed to this
+	// result set and a transparent restart would duplicate them.
+	if !resuming && stream.rowsErr != nil && stream.rowsSent == 0 &&
 		c.onExploratoryWorker && isWorkerOutOfMemoryError(stream.rowsErr) && c.txStatus == txStatusIdle {
 		oomErr := stream.rowsErr
 		_ = rows.Close()
+		rows = nil
 		if escErr := c.escalateWorker(queryCtx, escalateReasonOOM); escErr != nil {
 			queryFinalErr = oomErr
 			_ = c.failEscalation(convertedQuery, escErr, oomErr.Error())
 			return
 		}
-		retryRows, retryErr := runQuery()
+		retryRows, retryErr := c.executor.Query(convertedQuery, args...)
 		if retryErr != nil {
 			stream.rowsErr = retryErr
 		} else {
-			defer func() { _ = retryRows.Close() }()
+			rows = retryRows
 			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 		}
 	}
@@ -991,8 +1040,17 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
-	rowCount := stream.rowsSent
-	queryRowsAff = int64(rowCount)
+	if stream.suspended {
+		suspended = true
+		p.openRowsSent += int64(stream.rowsSent)
+		queryRowsAff = p.openRowsSent
+		_ = c.writePortalSuspended()
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, p.openRowsSent, 0, "", "", "extended")
+		return
+	}
+
+	rowCount := p.openRowsSent + int64(stream.rowsSent)
+	queryRowsAff = rowCount
 
 	if err := stream.rowsErr; err != nil {
 		queryFinalErr = err
@@ -1011,10 +1069,11 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	p.openRowsSent = 0
 	c.updateTxStatus(cmdType)
-	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
+	tag := buildCommandTagFromRowCount(cmdType, rowCount)
 	_ = c.writeCommandComplete(tag)
-	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
+	c.logQuery(start, originalQuery, convertedQuery, cmdType, rowCount, 0, "", "", "extended")
 }
 
 func (c *clientConn) handleClose(body []byte) {
@@ -1034,6 +1093,9 @@ func (c *clientConn) handleClose(body []byte) {
 	case 'S':
 		delete(c.stmts, name)
 	case 'P':
+		if p, ok := c.portals[name]; ok {
+			p.closeOpenRows()
+		}
 		delete(c.portals, name)
 	}
 
@@ -1220,7 +1282,10 @@ func (c *clientConn) handleBind(body []byte) {
 		}
 	}
 
-	// Close existing portal with same name
+	// Close existing portal with same name, releasing any suspended result set.
+	if old, ok := c.portals[portalName]; ok {
+		old.closeOpenRows()
+	}
 	delete(c.portals, portalName)
 
 	c.portals[portalName] = &portal{

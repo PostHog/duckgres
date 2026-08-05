@@ -36,6 +36,7 @@ const (
 	MsgBindComplete    = '2'
 	MsgCloseComplete   = '3'
 	MsgNoData          = 'n'
+	MsgPortalSuspended = 's'
 
 	// COPY messages (both directions)
 	MsgCopyData        = 'd' // Contains COPY data
@@ -338,6 +339,13 @@ func WriteCloseComplete(w io.Writer) error {
 // writeNoData sends no data response
 func WriteNoData(w io.Writer) error {
 	return WriteMessage(w, MsgNoData, nil)
+}
+
+// WritePortalSuspended tells the client that Execute's row limit was hit
+// before the result set was exhausted. The portal stays open — a later
+// Execute on the same portal resumes rather than restarting the query.
+func WritePortalSuspended(w io.Writer) error {
+	return WriteMessage(w, MsgPortalSuspended, nil)
 }
 
 // writeCopyOutResponse tells client we're about to send COPY data

@@ -357,18 +357,25 @@ type selectStream struct {
 	// can reproduce the exact log wording.
 	writeErr   error
 	writeStage string
+	// suspended is true when maxRows capped the stream before rows was
+	// exhausted. rows is left open and positioned so a later Next() continues
+	// exactly where this call stopped — the caller must NOT close it and
+	// must send PortalSuspended instead of CommandComplete.
+	suspended bool
 }
 
-// streamSelectRows sends (optionally) the RowDescription and then every DataRow
-// of rows. Extracted from executeSelectQuery so the exploratory tier can retry
-// a zero-row OOM stream on the escalated worker WITHOUT resending
-// RowDescription — pass sendRowDesc=false on such a retry.
+// streamSelectRows sends (optionally) the RowDescription and then DataRows of
+// rows, up to maxRows. Extracted from executeSelectQuery so the exploratory
+// tier can retry a zero-row OOM stream on the escalated worker WITHOUT
+// resending RowDescription — pass sendRowDesc=false on such a retry.
 //
 // formats are the Bind result-format codes (nil = all text, the simple-query
 // case). maxRows > 0 caps the DataRows sent, for the extended protocol's
-// Execute row limit; portal suspension is not implemented, so the row already
-// fetched when the cap is reached is dropped, and rows.Err() is still consulted
-// by the caller exactly as on a fully drained stream.
+// Execute row limit. The cap is checked BEFORE calling rows.Next() for the
+// next row, so a capped stream never advances past (and drops) a row it
+// didn't send — rows stays valid and resumable via a later Execute on the
+// same portal. rows.Err() is only meaningful once the stream actually
+// finished (not suspended), so it is left unset on a suspended stream.
 func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []ColumnTyper, typeOIDs []int32, sendRowDesc bool, formats []int16, maxRows int32) selectStream {
 	if sendRowDesc {
 		if err := c.sendRowDescription(cols, colTypes); err != nil {
@@ -377,8 +384,12 @@ func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []Col
 	}
 
 	var out selectStream
-	for rows.Next() {
+	for {
 		if maxRows > 0 && int32(out.rowsSent) >= maxRows {
+			out.suspended = true
+			break
+		}
+		if !rows.Next() {
 			break
 		}
 
@@ -400,7 +411,9 @@ func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []Col
 		}
 		out.rowsSent++
 	}
-	out.rowsErr = rows.Err()
+	if !out.suspended {
+		out.rowsErr = rows.Err()
+	}
 	return out
 }
 
