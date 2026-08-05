@@ -116,6 +116,10 @@ type Resolved struct {
 	K8sWorkerProfileMaxMemory       string
 	K8sWorkerMaxTTL                 time.Duration
 	K8sWorkerDefaultTTL             time.Duration
+	K8sExploratoryTierEnabled       bool
+	K8sExploratoryWorkerCPU         string
+	K8sExploratoryWorkerMemory      string
+	K8sExploratoryWorkerTTL         time.Duration
 	K8sReshardPodCPU                string
 	K8sReshardPodMemory             string
 	AWSRegion                       string
@@ -204,6 +208,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var k8sReshardPodCPU, k8sReshardPodMemory string
+	var k8sExploratoryTierEnabled bool
+	var k8sExploratoryWorkerCPU, k8sExploratoryWorkerMemory string
+	var k8sExploratoryWorkerTTL time.Duration
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -833,6 +840,29 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		k8sPlaceholderPriorityClassName = v
 	}
 
+	// Exploratory small-worker tier (env-only, like the other pod-shape knobs).
+	// See docs/superpowers/specs/2026-08-04-exploratory-worker-tier-design.md.
+	if v := getenv("DUCKGRES_EXPLORATORY_TIER_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sExploratoryTierEnabled = b
+		} else {
+			warn("Invalid DUCKGRES_EXPLORATORY_TIER_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_EXPLORATORY_WORKER_CPU"); v != "" {
+		k8sExploratoryWorkerCPU = v
+	}
+	if v := getenv("DUCKGRES_EXPLORATORY_WORKER_MEMORY"); v != "" {
+		k8sExploratoryWorkerMemory = v
+	}
+	if v := getenv("DUCKGRES_EXPLORATORY_WORKER_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			k8sExploratoryWorkerTTL = d
+		} else {
+			warn("Invalid DUCKGRES_EXPLORATORY_WORKER_TTL: " + v)
+		}
+	}
+
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
 	}
@@ -1141,6 +1171,10 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
 		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
 		K8sWorkerDefaultTTL:             k8sWorkerDefaultTTL,
+		K8sExploratoryTierEnabled:       k8sExploratoryTierEnabled,
+		K8sExploratoryWorkerCPU:         k8sExploratoryWorkerCPU,
+		K8sExploratoryWorkerMemory:      k8sExploratoryWorkerMemory,
+		K8sExploratoryWorkerTTL:         k8sExploratoryWorkerTTL,
 		K8sReshardPodCPU:                k8sReshardPodCPU,
 		K8sReshardPodMemory:             k8sReshardPodMemory,
 		AWSRegion:                       awsRegion,

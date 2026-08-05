@@ -201,6 +201,16 @@ type K8sConfig struct {
 	// hourly jobs) so scheduled workloads reuse hot-idle workers instead of
 	// cold-spawning every run — at the cost of idle worker nodes.
 	WorkerDefaultTTL time.Duration
+
+	// Exploratory small-worker tier (env-only DUCKGRES_EXPLORATORY_*): when
+	// enabled, connections without client duckgres.worker_* GUCs first land on
+	// a small worker of this shape and escalate to the org's normal profile on
+	// the first state-mutating statement or an out-of-memory read. CPU+Memory
+	// are both required for the tier to be usable; TTL 0 = built-in 48h.
+	ExploratoryTierEnabled  bool
+	ExploratoryWorkerCPU    string
+	ExploratoryWorkerMemory string
+	ExploratoryWorkerTTL    time.Duration
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
@@ -275,6 +285,12 @@ type ConfigStoreInterface interface {
 	// (the connecting user's team, else the org's oldest team; 0 when unknown).
 	// A config-snapshot read, no I/O — the same resolver the compute meter uses.
 	OrgUsageTeamID(orgID, username string) int64
+	// OrgUserSessionQueryAccess re-resolves a user mid-connection from the same
+	// in-memory snapshot the connect-time auth check reads. ok=false means the
+	// user is missing OR disabled (the per-user kill switch), which is what the
+	// tier-escalation re-check needs: a user disabled during the switcher's
+	// destroy→create window must not come back on the escalated worker.
+	OrgUserSessionQueryAccess(orgID, username string) (policy *configstore.OrgUserQueryAccess, revision string, ok bool)
 }
 
 // OrgRouterInterface abstracts the org router for the control plane.
@@ -1088,7 +1104,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// the user gets an actionable message; only reachable with valid creds,
 			// so it never leaks account existence to a password-guessing attacker.
 			clog.Warn("Postgres connection rejected: user is disabled.", "org", resolution.OrgID, "user", username)
-			_ = server.WriteErrorResponse(writer, "FATAL", "28000", "this account is disabled; contact your administrator")
+			_ = server.WriteErrorResponse(writer, "FATAL", "28000", disabledUserMessage)
 			_ = writer.Flush()
 			return
 		}
@@ -1155,7 +1171,30 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	for _, w := range profileWarns {
 		clog.Warn("Adjusted worker profile.", "detail", w)
 	}
-	if orgProfileApplied && workerProfile != nil {
+	// Exploratory tier: a connection that did not ask for a specific worker
+	// shape starts on the small exploratory worker and escalates on demand
+	// (first state-mutating statement, an OOM, or a heuristic — see
+	// server/conn_tier.go). workerProfile — the org default, else the pool
+	// default — stays the ESCALATION TARGET, so escalating lands exactly where
+	// the connection would have started without the tier.
+	//
+	// Remote backend only: the process backend and standalone have no per-org
+	// worker pods to size, and exploratoryWorkerProfile returns nil whenever
+	// the tier is off or half-configured, which degrades to today's behavior.
+	explProfile, explWarns := exploratoryWorkerProfile(cp.cfg.K8s)
+	for _, w := range explWarns {
+		clog.Warn("Exploratory tier config problem.", "detail", w)
+	}
+	useExploratory := cp.useExploratoryTier(explProfile, passthroughUser, startupOptions)
+	initialProfile := workerProfile
+	// Log the shape the connection actually STARTS on, once, so support never
+	// sees two adjacent lines disagreeing about it. On the exploratory tier the
+	// org default is only the escalation target, so it is not "applied" yet.
+	if useExploratory {
+		initialProfile = explProfile
+		clog.Info("Connection starting on exploratory worker profile.",
+			"cpu", explProfile.CPU, "memory", explProfile.Memory, "ttl", explProfile.TTL.String())
+	} else if orgProfileApplied && workerProfile != nil {
 		// Once per connection so support can see which shape a tenant got.
 		clog.Info("Applied org default worker profile.", "cpu", workerProfile.CPU, "memory", workerProfile.Memory, "ttl", workerProfile.TTL.String())
 	}
@@ -1291,204 +1330,184 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		threads  int
 	)
 	if cp.isRemoteBackend {
-		memLimit, threads = cp.workerDuckDBLimits(workerProfile)
+		memLimit, threads = cp.workerDuckDBLimits(initialProfile)
 	} else if rebalancer != nil {
 		memLimit = rebalancer.MemoryLimit()
 		threads = rebalancer.PerSessionThreads()
 	}
 
-	admissionCtx, disconnectWatcher := startPreReadyDisconnectWatcher(preReadyCtx, tlsConn, reader)
-	defer disconnectWatcher.Stop()
-	createdPID, executor, err := createSessionWithRegisteredCancel(
-		admissionCtx,
-		cp.srv,
-		cp.cfg.WorkerQueueTimeout,
-		server.BackendKey{Pid: pid, SecretKey: secretKey},
-		func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
-			return sessions.CreateSession(ctx, username, pid, memLimit, threads, workerProfile)
-		},
+	// Lazy acquisition: on the exploratory tier the worker is acquired by the
+	// FIRST statement that needs an engine, not at connect, so a connection that
+	// has not issued a statement yet holds no worker pod. (The connection idle
+	// timeout still applies from ReadyForQuery and still closes such a
+	// connection; it simply has no worker to release when it does.)
+	// Deliberately scoped to the tier flag, and to
+	// the multitenant config-store path whose catalog resolution is knowable
+	// without a session (see the catalog block below) — every other connection
+	// keeps today's eager acquire byte for byte.
+	lazyActivation := useExploratory && cp.configStore != nil
+
+	// baseClog keeps the pre-worker logger so a lazy activation or a tier
+	// escalation can re-derive a logger for the acquired worker instead of
+	// stamping a second, stale worker attribute.
+	baseClog := clog
+
+	var (
+		executor         *flightclient.FlightExecutor
+		workerID         = -1
+		workerPod        string
+		duckLakeAttached bool
+		effectiveCatalog string
+		// sessionEverCreated gates the teardown DestroySession: a lazily
+		// activated connection that never ran a statement has no session, and
+		// destroying an unknown pid is a spurious warn. Written by the activator
+		// and the switcher, both of which run on this goroutine (the message
+		// loop), which is also the goroutine that runs the deferred teardown.
+		sessionEverCreated bool
+		disconnectWatcher  *preReadyDisconnectWatcher
 	)
-	if cp.isDraining() {
-		err = ErrSessionManagerDraining
-	}
-	if err != nil {
-		// Session creation may have committed at the same instant a CancelRequest,
-		// client FIN/RST, or drain canceled its context. Never retain that raced
-		// session without a live client to own it.
-		if executor != nil {
-			if createdPID == 0 {
-				createdPID = pid
-			}
-			sessions.DestroySession(createdPID)
-			executor = nil
+
+	// destroySessionOnExit tears the connection's session down on every exit
+	// path. Deferred at the SAME point on both paths — before the metadata init
+	// that can fail — so a failed init never leaks a worker; the
+	// sessionEverCreated guard makes it inert for a lazily activated connection
+	// that never ran a statement (destroying an unknown pid is a spurious warn).
+	destroySessionOnExit := func() {
+		if !sessionEverCreated {
+			return
 		}
-		outcome, reason := controlPlaneSessionStartResult(err)
-		sessionStart.Finish(outcome, reason)
-		clog.Error("Failed to create session.", "error", err)
-		code, message := sessionCreationErrorResponse(err)
-		_ = server.WriteErrorResponse(writer, "FATAL", code, message)
-		_ = writer.Flush()
-		return
-	}
-	// Worker is now assigned — capture identity for log correlation.
-	workerID := sessions.WorkerIDForPID(pid)
-	workerPod := sessions.WorkerPodNameForPID(pid)
-	clog = clog.With("worker", workerID, "worker_pod", workerPod)
-	if orgID != "" {
-		observeOrgSessionsActive(orgID, sessions.SessionCount())
-	}
-	defer func() {
 		sessions.DestroySession(pid)
 		if orgID != "" {
 			observeOrgSessionsActive(orgID, sessions.SessionCount())
 		}
-	}()
-
-	// Probe which catalogs the worker actually attached for this session, then
-	// resolve the real catalog the session defaults to. The startup `database`
-	// selected "ducklake"/"" (default); fail closed (3D000) if the
-	// requested catalog isn't attached.
-	attachCtx, attachCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, executor, physicalDuckLakeCatalog)
-	attachContextErr := attachCtx.Err()
-	attachCancel()
-	if probeErr != nil {
-		outcome, reason := controlPlaneSessionStartOperationResult(
-			probeErr,
-			attachContextErr,
-			cp.isDraining(),
-			observe.SessionStartReasonMetadataStore,
-		)
-		sessionStart.Finish(outcome, reason)
-		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
-		_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to detect attached catalogs")
-		_ = writer.Flush()
-		return
 	}
-	var effectiveCatalog string
-	if cp.configStore != nil {
+
+	// sessionMeta carries the connect-time constants every session
+	// initialization replays — at connect (eager), at lazy activation, and after
+	// a tier escalation. Its clog is replaced per acquisition with one stamped
+	// for the worker that acquisition landed on.
+	sessionMeta := sessionMetadataInput{
+		database:          database,
+		requestedCatalog:  requestedCatalog,
+		passthroughUser:   passthroughUser,
+		clientSearchPath:  clientSearchPath,
+		queryAccessPolicy: queryAccessPolicy,
+		clog:              clog,
+	}
+
+	if lazyActivation {
+		// No worker, so no attach probe — but the catalog is not a guess. In the
+		// multitenant path resolveEffectiveCatalog has exactly one successful
+		// outcome (the DuckLake catalog, attached); every other resolution
+		// REJECTS the connection. Run that resolution here against the only
+		// attachment that can succeed, so a request for a catalog this
+		// connection cannot have is still refused at CONNECT with the same
+		// 3D000 the eager path sends — not deferred into a first-statement
+		// fatal. What survives is the transpiler backend profile and catalog USE
+		// rewriting, which is what lets statements the control plane answers
+		// itself be transpiled correctly without spending a worker. The
+		// activator re-derives both from the worker's real probe and re-applies
+		// them, so a worker that did not attach the catalog fails activation
+		// rather than running against the wrong profile.
 		var ok bool
-		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, duckLakeAttached)
+		effectiveCatalog, ok = resolveEffectiveCatalog(requestedCatalog, true)
 		if !ok {
-			sessionStart.Finish("error", observe.SessionStartReasonMetadataStore)
 			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
-				"requested", requestedCatalog, "ducklake_attached", duckLakeAttached)
+				"requested", requestedCatalog, "ducklake_attached", true)
 			msg := "no catalog is available for this connection"
 			if requestedCatalog != "" {
 				msg = fmt.Sprintf("database %q does not exist", requestedCatalog)
 			}
+			sessionStart.Finish("error", observe.SessionStartReasonMetadataStore)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000", msg)
 			_ = writer.Flush()
 			return
 		}
+		duckLakeAttached = true
+		database = effectiveCatalog
+		defer destroySessionOnExit()
+		// No slow pre-ready acquisition to watch: ReadyForQuery follows the
+		// initial parameters immediately, so the disconnect watcher would only
+		// contend with a client that pipelines its first query.
 	} else {
-		// Single-tenant (process backend / static users): de-mask to the real
-		// attached catalog when present; otherwise keep the client's database name
-		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
-		if duckLakeAttached {
-			effectiveCatalog = physicalDuckLakeCatalog
-		} else {
-			effectiveCatalog = database
+		var admissionCtx context.Context
+		admissionCtx, disconnectWatcher = startPreReadyDisconnectWatcher(preReadyCtx, tlsConn, reader)
+		defer disconnectWatcher.Stop()
+		createdPID, exec, err := createSessionWithRegisteredCancel(
+			admissionCtx,
+			cp.srv,
+			cp.cfg.WorkerQueueTimeout,
+			server.BackendKey{Pid: pid, SecretKey: secretKey},
+			func(ctx context.Context) (int32, *flightclient.FlightExecutor, error) {
+				return sessions.CreateSession(ctx, username, pid, memLimit, threads, initialProfile)
+			},
+		)
+		executor = exec
+		if cp.isDraining() {
+			err = ErrSessionManagerDraining
 		}
-	}
-	// `database` now reflects the real catalog the session defaults to — this is
-	// what drives the current_database() macro/pg_database view and what logs and
-	// observability surface.
-	database = effectiveCatalog
-
-	// Passthrough users skip pg_catalog initialization and the catalog USE
-	// rewriting — they bypass the PG compatibility layer entirely. They still
-	// need their selected catalog as the session default, though: without one the
-	// worker session stays in DuckDB's empty in-memory catalog (see the
-	// passthrough branch below).
-	if !passthroughUser {
-		initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-		var metadataAccess *sessionmeta.MetadataAccessPolicy
-		if queryAccessPolicy != nil {
-			metadataAccess = &sessionmeta.MetadataAccessPolicy{
-				AllowedSchemas:   queryAccessPolicy.AllowedSchemas,
-				AllowedRelations: queryAccessPolicy.AllowedRelations,
+		if err != nil {
+			// Session creation may have committed at the same instant a CancelRequest,
+			// client FIN/RST, or drain canceled its context. Never retain that raced
+			// session without a live client to own it.
+			if executor != nil {
+				if createdPID == 0 {
+					createdPID = pid
+				}
+				sessions.DestroySession(createdPID)
 			}
-		}
-		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, executor, effectiveCatalog, metadataAccess); err != nil {
-			initContextErr := initCtx.Err()
-			initCancel()
-			outcome, reason := controlPlaneSessionStartOperationResult(
-				err,
-				initContextErr,
-				cp.isDraining(),
-				observe.SessionStartReasonMetadataStore,
-			)
+			outcome, reason := controlPlaneSessionStartResult(err)
 			sessionStart.Finish(outcome, reason)
-			clog.Error("Failed to initialize session database metadata.", "database", database, "error", err)
-			_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to initialize session database metadata")
+			clog.Error("Failed to create session.", "error", err)
+			code, message := sessionCreationErrorResponse(err)
+			_ = server.WriteErrorResponse(writer, "FATAL", code, message)
 			_ = writer.Flush()
 			return
 		}
-		initCancel()
+		// Worker is now assigned — capture identity for log correlation.
+		sessionEverCreated = true
+		workerID = sessions.WorkerIDForPID(pid)
+		workerPod = sessions.WorkerPodNameForPID(pid)
+		clog = clog.With("worker", workerID, "worker_pod", workerPod)
+		sessionMeta.clog = clog
+		if orgID != "" {
+			observeOrgSessionsActive(orgID, sessions.SessionCount())
+		}
+		defer destroySessionOnExit()
 
-		// Apply the effective connect-time session default AFTER metadata init.
-		// It must run here, not on the worker at session create:
-		// InitSessionDatabaseMetadata's defer resets the catalog/search_path, so an
-		// earlier value would be clobbered. A client-supplied search_path is
-		// best-effort.
-		if cmd, source := effectiveSessionDefaultCommand(clientSearchPath, effectiveCatalog); cmd != "" {
-			spCtx, spCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-			_, err := executor.ExecContext(spCtx, cmd)
-			spContextErr := spCtx.Err()
-			spCancel()
-			if err != nil {
-				if source == sessionDefaultSourceConfiguredCatalog {
-					outcome, reason := controlPlaneSessionStartOperationResult(
-						err,
-						spContextErr,
-						cp.isDraining(),
-						observe.SessionStartReasonMetadataStore,
-					)
-					sessionStart.Finish(outcome, reason)
-					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
-					_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
-					_ = writer.Flush()
-					return
-				}
-				clog.Warn("Failed to apply client connect-time search_path; using default.", "search_path", clientSearchPath, "error", err)
-			}
+		// Probe which catalogs the worker actually attached for this session, then
+		// resolve the real catalog the session defaults to and initialize the
+		// session's metadata + connect-time session default. Factored into
+		// initSessionMetadata so a lazy activation or tier escalation can re-run
+		// it verbatim against the new worker's (cold) session.
+		meta, initErr := cp.initSessionMetadata(admissionCtx, executor, sessionMeta)
+		if initErr != nil {
+			sessionStart.Finish(initErr.outcome, initErr.reason)
+			_ = server.WriteErrorResponse(writer, "FATAL", initErr.code, initErr.message)
+			_ = writer.Flush()
+			return
 		}
-	} else {
-		// Passthrough: no pg_catalog views and no rewriting, but the session must
-		// still land in its selected catalog instead of the empty in-memory one.
-		// Standalone passthrough does this via server.setDuckLakeDefault;
-		// the remote-worker path issues the equivalent here.
-		if clientSearchPath != "" {
-			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", clientSearchPath)
-		}
-		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
-			initCtx, initCancel := context.WithTimeout(admissionCtx, cp.cfg.SessionInitTimeout)
-			_, err := executor.ExecContext(initCtx, cmd)
-			initContextErr := initCtx.Err()
-			initCancel()
-			if err != nil {
-				outcome, reason := controlPlaneSessionStartOperationResult(
-					err,
-					initContextErr,
-					cp.isDraining(),
-					observe.SessionStartReasonMetadataStore,
-				)
-				sessionStart.Finish(outcome, reason)
-				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
-				_ = server.WriteErrorResponse(writer, "FATAL", "XX000", "failed to apply default catalog")
-				_ = writer.Flush()
-				return
-			}
-		}
+		duckLakeAttached = meta.duckLakeAttached
+		effectiveCatalog = meta.effectiveCatalog
+		// `database` now reflects the real catalog the session defaults to — this is
+		// what drives the current_database() macro/pg_database view and what logs and
+		// observability surface.
+		database = effectiveCatalog
+
+		// Register the TCP connection so OnWorkerCrash can close it to unblock
+		// the message loop if the backing worker dies.
+		sessions.SetConnCloser(pid, tlsConn)
 	}
 
-	// Register the TCP connection so OnWorkerCrash can close it to unblock
-	// the message loop if the backing worker dies.
-	sessions.SetConnCloser(pid, tlsConn)
-
-	// Create real clientConn with FlightExecutor and worker assignment
-	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, executor, pid, secretKey, workerID, workerPod)
+	// Create real clientConn with FlightExecutor and worker assignment. On the
+	// lazy path the executor argument must be an untyped nil: a typed-nil
+	// *flightclient.FlightExecutor would make the QueryExecutor interface
+	// non-nil and the connection would never activate.
+	var sessionExec server.QueryExecutor
+	if executor != nil {
+		sessionExec = executor
+	}
+	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, sessionExec, pid, secretKey, workerID, workerPod)
 	// Stamp the PostHog team id (config-snapshot read, no I/O) so this
 	// connection's product-analytics events carry a PostHog-native key. Same
 	// resolution the compute meter uses: the connecting user's team, else the
@@ -1500,8 +1519,13 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// remote/k8s backend has a per-org worker pod with a known size; the process
 	// backend leaves it zero so metering is skipped. Constant for the
 	// connection's life (computed once at teardown over its full lifetime).
-	if cp.isRemoteBackend {
-		millicores, mib := cp.workerBillingSize(workerProfile)
+	//
+	// Deliberately NOT stamped on the lazy path: a connection that never
+	// acquires a worker consumed no compute, and a zero size means "skip
+	// metering". The activator stamps it (and the switcher raises it) at the
+	// moment a worker is actually acquired.
+	if cp.isRemoteBackend && !lazyActivation {
+		millicores, mib := cp.workerBillingSize(initialProfile)
 		server.SetConnectionWorkerSize(cc, millicores, mib)
 	}
 	// Record the connection's full lifetime exactly once, on every exit path
@@ -1536,8 +1560,11 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Apply the connect-time `-c duckgres.s3_cache=...` option (validated
 	// before worker acquisition, above) now that the session executor is
 	// bound. Failure refuses the connection: a session that asked for
-	// s3_cache=off must never silently run through the cache.
-	if s3CacheRequested {
+	// s3_cache=off must never silently run through the cache. On the lazy path
+	// there is no executor yet, so the activator applies it against the worker
+	// it just acquired instead (a failure there fails the activation, which is
+	// connection-fatal — the same refusal, one statement later).
+	if s3CacheRequested && !lazyActivation {
 		if err := server.ApplyConnectionS3CacheOption(cc, rawS3Cache); err != nil {
 			sessionStart.Finish("error", observe.SessionStartReasonWorker)
 			clog.Error("Failed to apply s3_cache startup option.", "error", err)
@@ -1546,11 +1573,193 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+	// Install the tier escalation switcher: the connection is running on the
+	// small exploratory worker and moves to a normal-size one (workerProfile —
+	// the org/pool default that a non-tiered connection would have started on)
+	// the first time it needs to. Invoked on the message-loop goroutine, so
+	// every field it touches is single-threaded with statement handling.
+	if useExploratory {
+		server.SetConnectionExploratory(cc, func(ctx context.Context, reason string) (server.QueryExecutor, int, string, error) {
+			// The exploratory session is stateless by construction (every
+			// state-mutating statement escalates BEFORE executing), so
+			// destroy-then-acquire is safe — and it releases the small worker
+			// to hot-idle before the org's worker cap is checked for the big
+			// one, so escalating can never deadlock against the org's own cap.
+			sessions.DestroySession(pid)
+			// The session is gone: keep the teardown guard honest for the
+			// window that follows. An escalation that fails from here on leaves
+			// the connection with NO session, and destroySessionOnExit
+			// destroying an unknown pid is exactly the spurious warn the flag
+			// exists to avoid. Re-armed the moment a replacement session exists.
+			sessionEverCreated = false
+			if orgID != "" {
+				observeOrgSessionsActive(orgID, sessions.SessionCount())
+			}
+			escMemLimit, escThreads := cp.workerDuckDBLimits(workerProfile)
+			createCtx, cancel := context.WithTimeout(ctx, cp.cfg.WorkerQueueTimeout)
+			defer cancel()
+			_, exec, err := sessions.CreateSession(createCtx, username, pid, escMemLimit, escThreads, workerProfile)
+			if err != nil {
+				// Classified with the same logic the eager connect path uses, so
+				// the client sees the real SQLSTATE + message (53300 with a retry
+				// hint at capacity, 53400 for a vCPU-admission rejection, 57P03
+				// while draining) instead of a substring guess.
+				return nil, 0, "", fmt.Errorf("escalate to standard worker: %w", newSessionAcquireError(err))
+			}
+			sessionEverCreated = true
+			if orgID != "" {
+				observeOrgSessionsActive(orgID, sessions.SessionCount())
+			}
+			newWorkerID := sessions.WorkerIDForPID(pid)
+			newWorkerPod := sessions.WorkerPodNameForPID(pid)
+			escClog := baseClog.With("worker", newWorkerID, "worker_pod", newWorkerPod)
+			// The new worker's session is cold: re-run the same connect-time
+			// metadata init against it, with the identical connect-time inputs.
+			escMeta := sessionMeta
+			escMeta.clog = escClog
+			// Deliberately NOT createCtx: WorkerQueueTimeout budgets the worker
+			// ACQUISITION, so reusing it here would leave init only whatever is
+			// left of it. The switcher's own ctx gives each init step its full
+			// SessionInitTimeout, exactly like the eager connect path.
+			escInitMeta, initErr, gateErr := cp.finishSessionAcquisition(ctx, sessionAcquisition{
+				sessions: sessions,
+				pid:      pid,
+				orgID:    orgID,
+				username: username,
+				tlsConn:  tlsConn,
+				exec:     exec,
+				meta:     escMeta,
+			})
+			if initErr != nil {
+				// finishSessionAcquisition already destroyed the session, so
+				// the teardown must not destroy it a second time.
+				sessionEverCreated = false
+				// Keep the init failure's own SQLSTATE (e.g. 3D000 for an
+				// unavailable catalog) rather than re-deriving one.
+				return nil, 0, "", fmt.Errorf("init session on standard worker: %w",
+					&server.SessionAcquireError{Code: initErr.code, Message: initErr.message, Err: initErr})
+			}
+			if gateErr != nil {
+				// Destroyed by finishSessionAcquisition, as above.
+				sessionEverCreated = false
+				return nil, 0, "", &server.SessionAcquireError{
+					Code: "28000", Message: disabledUserMessage, Err: gateErr,
+				}
+			}
+			// Apply the RE-DERIVED metadata: the standard worker attached its own
+			// catalogs, so the transpiler backend profile and catalog USE
+			// rewriting must follow this session, not the exploratory one's.
+			server.SetConnectionPhysicalCatalog(cc, escInitMeta.effectiveCatalog)
+			server.SetCatalogUseRewrite(cc, escInitMeta.duckLakeAttached && !passthroughUser)
+			// Billing: the whole connection bills at the largest worker size it
+			// used (v1). Stamping the escalation target IS that maximum —
+			// escalation only ever goes exploratory→standard, and the
+			// exploratory profile is the small tier by construction. Safe to
+			// write here because the switcher runs on the message-loop
+			// goroutine, the same one that computes the metric at teardown.
+			millicores, mib := cp.workerBillingSize(workerProfile)
+			server.SetConnectionWorkerSize(cc, millicores, mib)
+			escClog.Info("Connection escalated to standard worker.", "reason", reason)
+			// Typed-nil guard, as on the connect and activation paths: exec is a
+			// *FlightExecutor, so returning a nil one directly would install a
+			// NON-nil interface holding a nil pointer on the connection.
+			var escalatedExec server.QueryExecutor
+			if exec != nil {
+				escalatedExec = exec
+			}
+			return escalatedExec, newWorkerID, newWorkerPod, nil
+		})
+	}
+
+	// Install the lazy session activator: this connection has NO worker yet.
+	// The first statement that needs an engine calls this, on the message-loop
+	// goroutine (so it is single-threaded with statement handling and with the
+	// escalation switcher above — the two can never run concurrently, and the
+	// activator always runs first because the switcher is only reachable from a
+	// connection that already has an executor).
+	if lazyActivation {
+		// The connect-time `-c duckgres.s3_cache=...` option cannot be applied
+		// here (no worker to swap the S3 transport on) and MUST NOT be applied
+		// inside the activator either: the executor is installed by
+		// ensureSessionActive only after the activator returns, so an apply
+		// there would silently no-op the worker swap while flipping the session
+		// flag. Park it instead; ensureSessionActive applies it at the right
+		// moment and fails the activation if the swap fails.
+		if s3CacheRequested {
+			server.SetPendingS3CacheOption(cc, rawS3Cache)
+		}
+		server.SetSessionActivator(cc, func(ctx context.Context, pinned bool) (server.QueryExecutor, int, string, error) {
+			res, err := cp.activateConnectionSession(ctx, sessionActivationRequest{
+				sessions:           sessions,
+				srv:                cp.srv,
+				backendKey:         server.BackendKey{Pid: pid, SecretKey: secretKey},
+				pid:                pid,
+				orgID:              orgID,
+				username:           username,
+				connCloser:         tlsConn,
+				pinned:             pinned,
+				exploratoryProfile: initialProfile,
+				standardProfile:    workerProfile,
+				meta:               sessionMeta,
+				baseClog:           baseClog,
+				finish:             cp.finishSessionAcquisition,
+			})
+			// Report whether a session now exists for this pid, so the
+			// connection's teardown destroys it — and only then. Every failure
+			// path inside activateConnectionSession cleans up after itself.
+			sessionEverCreated = sessionEverCreated || res.sessionCreated
+			if err != nil {
+				return nil, 0, "", fmt.Errorf("acquire worker for connection: %w", err)
+			}
+			// The connect path assumed the DuckLake catalog (the only resolution
+			// the multitenant path admits); apply what the worker actually
+			// reported, so an unexpected answer changes the session rather than
+			// being silently ignored.
+			server.SetConnectionPhysicalCatalog(cc, res.meta.effectiveCatalog)
+			server.SetCatalogUseRewrite(cc, res.meta.duckLakeAttached && !passthroughUser)
+			server.SetConnectionDatabase(cc, res.meta.effectiveCatalog)
+			if pinned {
+				// Off the tier without a worker switch: the connection is
+				// already ON the escalation target, so escalating would destroy
+				// a perfectly good session.
+				server.MarkConnectionPinned(cc)
+			}
+			// Billing starts to count only once a worker exists. The size is the
+			// profile just acquired (the switcher raises it later if the
+			// connection escalates); the metric still covers the connection's
+			// full lifetime, so the pre-activation idle prefix is billed at this
+			// size — the same v1 "largest size wins over the whole connection"
+			// approximation the switcher uses.
+			millicores, mib := cp.workerBillingSize(res.profile)
+			server.SetConnectionWorkerSize(cc, millicores, mib)
+			res.clog.Info("Connection activated on worker.", "pinned", pinned,
+				"cpu", workerProfileCPU(res.profile), "memory", workerProfileMemory(res.profile))
+			// Same typed-nil guard the connect path uses (`var sessionExec
+			// server.QueryExecutor` above): res.exec is a *FlightExecutor, so
+			// returning a nil one directly would hand back a NON-nil interface
+			// holding a nil pointer, and needsActivation()/c.executor==nil checks
+			// would read the connection as active and dereference it. A successful
+			// create never returns nil here — this keeps that from being load-bearing.
+			var activatedExec server.QueryExecutor
+			if res.exec != nil {
+				activatedExec = res.exec
+			}
+			return activatedExec, res.workerID, res.workerPod, nil
+		})
+	}
+
 	// The normal PostgreSQL message loop is about to take ownership of reader.
 	// Join the disconnect watcher first; a FIN/RST at any point during session
 	// admission or metadata initialization tears down the session via the defer
-	// above instead of retaining its worker and vCPU lease.
-	disconnect := disconnectWatcher.Stop()
+	// above instead of retaining its worker and vCPU lease. The lazy path never
+	// started one — it holds no worker to release, and ReadyForQuery follows
+	// the initial parameters immediately, so there is no pre-ready window worth
+	// watching (and a client that pipelines its first query must not be read as
+	// a disconnect).
+	var disconnect preReadyDisconnectResult
+	if disconnectWatcher != nil {
+		disconnect = disconnectWatcher.Stop()
+	}
 	drained := finishPreReady()
 	if disconnect.ClientCanceled {
 		sessionStart.Finish("canceled", observe.SessionStartReasonCanceled)
@@ -1583,6 +1792,298 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog.Error("Message loop error.", "error", err)
 		return
 	}
+}
+
+// sessionAcquisition is the input to finishSessionAcquisition: everything the
+// shared post-CreateSession wiring needs about the session that was just
+// created for a connection.
+type sessionAcquisition struct {
+	sessions activationSessions
+	pid      int32
+	orgID    string
+	username string
+	// tlsConn is re-registered as the session's conn closer so OnWorkerCrash
+	// can still close the client socket.
+	tlsConn io.Closer
+	// exec is the freshly created session's executor.
+	exec *flightclient.FlightExecutor
+	// meta carries the connect-time constants, with a clog stamped for the
+	// worker this session landed on.
+	meta sessionMetadataInput
+}
+
+// finishSessionAcquisition runs the post-CreateSession wiring shared by the
+// LAZY session activator and the tier-escalation switcher: metadata init
+// against the (cold) new session, conn-closer re-registration, and the
+// disabled-user re-check. Both callers reach this with a live session and no
+// registered conn closer, so keeping it single is what stops the two paths
+// from drifting on any of those three.
+//
+// Returns (result, initErr, gateErr): initErr is a metadata-init failure the
+// caller wraps in its own wording, gateErr is errEscalationUserDisabled. On
+// either failure the session has already been destroyed here.
+//
+// The disabled re-check exists because the create window is invisible to the
+// per-user kill/disable fan-out (DestroySessionsForUser iterates sessions, and
+// the connection has neither a session nor a registered conn-closer until this
+// point). Re-read the same snapshot disabled state the auth-time check reads,
+// so a user disabled inside that window does not come back alive on a fresh
+// worker. ok=false is "missing or disabled"; both fail closed here.
+func (cp *ControlPlane) finishSessionAcquisition(
+	ctx context.Context,
+	in sessionAcquisition,
+) (sessionMetadataResult, *sessionInitError, error) {
+	destroy := func() {
+		in.sessions.DestroySession(in.pid)
+		if in.orgID != "" {
+			observeOrgSessionsActive(in.orgID, in.sessions.SessionCount())
+		}
+	}
+	meta, initErr := cp.initSessionMetadata(ctx, in.exec, in.meta)
+	if initErr != nil {
+		destroy()
+		return sessionMetadataResult{}, initErr, nil
+	}
+	in.sessions.SetConnCloser(in.pid, in.tlsConn)
+	if cp.configStore != nil && in.orgID != "" {
+		if _, _, ok := cp.configStore.OrgUserSessionQueryAccess(in.orgID, in.username); !ok {
+			destroy()
+			in.meta.clog.Warn("Session acquisition aborted: user is disabled or no longer exists.")
+			return sessionMetadataResult{}, nil, errEscalationUserDisabled
+		}
+	}
+	return meta, nil, nil
+}
+
+// workerProfileCPU / workerProfileMemory render a possibly-nil worker profile
+// for logging; nil is the pool default shape.
+func workerProfileCPU(p *WorkerProfile) string {
+	if p == nil {
+		return "default"
+	}
+	return p.CPU
+}
+
+func workerProfileMemory(p *WorkerProfile) string {
+	if p == nil {
+		return "default"
+	}
+	return p.Memory
+}
+
+// sessionMetadataInput carries everything initSessionMetadata reads that is
+// NOT derived from the worker session itself. Every field is a connect-time
+// constant for the connection (startup message + authenticated org/user
+// resolution), which is what makes the block safe to replay verbatim against a
+// new worker after a tier escalation. Grouped in a struct rather than passed
+// positionally because three of the fields are strings and two are bools —
+// positional callers would be trivially mis-ordered at the second call site.
+type sessionMetadataInput struct {
+	// database is the client's startup database name. Read only by the
+	// single-tenant (no config store) fallback that de-masks to the attached
+	// catalog; the multitenant path resolves from requestedCatalog.
+	database string
+	// requestedCatalog is the multitenant user resolution's effective catalog
+	// ("" = the connection's default).
+	requestedCatalog string
+	// passthroughUser skips pg_catalog init + catalog USE rewriting.
+	passthroughUser bool
+	// clientSearchPath is the connect-time `-c search_path=...` (already
+	// authorized/blanked for project-scoped users).
+	clientSearchPath string
+	// queryAccessPolicy scopes the generated metadata views for
+	// project-scoped logins; nil for unscoped users.
+	queryAccessPolicy *server.QueryAccessPolicy
+	// clog is the connection-scoped logger; the helper owns all logging for
+	// the block so log lines stay byte-identical to the inline version.
+	clog *slog.Logger
+}
+
+// sessionMetadataResult is what the connect path (and the escalation switcher)
+// needs from session metadata init in order to wire the clientConn.
+type sessionMetadataResult struct {
+	// duckLakeAttached reports whether the worker attached the DuckLake
+	// catalog for this session (drives catalog USE rewriting).
+	duckLakeAttached bool
+	// effectiveCatalog is the real catalog the session defaults to.
+	effectiveCatalog string
+}
+
+// sessionInitError is a session-metadata init failure. It has ALREADY been
+// logged by initSessionMetadata (the log lines carry per-site attributes); it
+// carries the session-start classification and the exact FATAL response the
+// connect path must send, so the extraction is byte-identical on the wire.
+// Returned as a concrete pointer type so callers cannot trip the typed-nil
+// interface trap on the success path.
+type sessionInitError struct {
+	outcome string
+	reason  string
+	code    string
+	message string
+	err     error
+}
+
+func (e *sessionInitError) Error() string {
+	if e.err != nil {
+		return fmt.Sprintf("%s: %v", e.message, e.err)
+	}
+	return e.message
+}
+
+func (e *sessionInitError) Unwrap() error { return e.err }
+
+// initSessionMetadata runs the post-create session setup against exec: the
+// attached-catalog probe, session database metadata init, and the connect-time
+// search_path / passthrough catalog application. Runs once at session create
+// and again after every worker switch (the new worker's session starts cold,
+// so all of this has to be redone there).
+func (cp *ControlPlane) initSessionMetadata(
+	ctx context.Context,
+	exec *flightclient.FlightExecutor,
+	in sessionMetadataInput,
+) (sessionMetadataResult, *sessionInitError) {
+	clog := in.clog
+	var res sessionMetadataResult
+
+	// Probe which catalogs the worker actually attached for this session, then
+	// resolve the real catalog the session defaults to. The startup `database`
+	// selected "ducklake"/"" (default); fail closed (3D000) if the
+	// requested catalog isn't attached.
+	attachCtx, attachCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+	duckLakeAttached, probeErr := sessionmeta.HasAttachedCatalog(attachCtx, exec, physicalDuckLakeCatalog)
+	attachContextErr := attachCtx.Err()
+	attachCancel()
+	if probeErr != nil {
+		outcome, reason := controlPlaneSessionStartOperationResult(
+			probeErr,
+			attachContextErr,
+			cp.isDraining(),
+			observe.SessionStartReasonMetadataStore,
+		)
+		clog.Error("Failed to detect attached catalogs.", "error", probeErr)
+		return res, &sessionInitError{
+			outcome: outcome, reason: reason,
+			code: "XX000", message: "failed to detect attached catalogs", err: probeErr,
+		}
+	}
+	res.duckLakeAttached = duckLakeAttached
+
+	var effectiveCatalog string
+	if cp.configStore != nil {
+		var ok bool
+		effectiveCatalog, ok = resolveEffectiveCatalog(in.requestedCatalog, duckLakeAttached)
+		if !ok {
+			clog.Warn("Postgres connection rejected: requested catalog is not available for this connection.",
+				"requested", in.requestedCatalog, "ducklake_attached", duckLakeAttached)
+			msg := "no catalog is available for this connection"
+			if in.requestedCatalog != "" {
+				msg = fmt.Sprintf("database %q does not exist", in.requestedCatalog)
+			}
+			return res, &sessionInitError{
+				outcome: "error", reason: observe.SessionStartReasonMetadataStore,
+				code: "3D000", message: msg,
+			}
+		}
+	} else {
+		// Single-tenant (process backend / static users): de-mask to the real
+		// attached catalog when present; otherwise keep the client's database name
+		// (plain DuckDB, no masking concern). No catalog-selection rejection here.
+		if duckLakeAttached {
+			effectiveCatalog = physicalDuckLakeCatalog
+		} else {
+			effectiveCatalog = in.database
+		}
+	}
+	res.effectiveCatalog = effectiveCatalog
+
+	// Passthrough users skip pg_catalog initialization and the catalog USE
+	// rewriting — they bypass the PG compatibility layer entirely. They still
+	// need their selected catalog as the session default, though: without one the
+	// worker session stays in DuckDB's empty in-memory catalog (see the
+	// passthrough branch below).
+	if !in.passthroughUser {
+		initCtx, initCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+		var metadataAccess *sessionmeta.MetadataAccessPolicy
+		if in.queryAccessPolicy != nil {
+			metadataAccess = &sessionmeta.MetadataAccessPolicy{
+				AllowedSchemas:   in.queryAccessPolicy.AllowedSchemas,
+				AllowedRelations: in.queryAccessPolicy.AllowedRelations,
+			}
+		}
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, exec, effectiveCatalog, metadataAccess); err != nil {
+			initContextErr := initCtx.Err()
+			initCancel()
+			outcome, reason := controlPlaneSessionStartOperationResult(
+				err,
+				initContextErr,
+				cp.isDraining(),
+				observe.SessionStartReasonMetadataStore,
+			)
+			clog.Error("Failed to initialize session database metadata.", "database", effectiveCatalog, "error", err)
+			return res, &sessionInitError{
+				outcome: outcome, reason: reason,
+				code: "XX000", message: "failed to initialize session database metadata", err: err,
+			}
+		}
+		initCancel()
+
+		// Apply the effective connect-time session default AFTER metadata init.
+		// It must run here, not on the worker at session create:
+		// InitSessionDatabaseMetadata's defer resets the catalog/search_path, so an
+		// earlier value would be clobbered. A client-supplied search_path is
+		// best-effort.
+		if cmd, source := effectiveSessionDefaultCommand(in.clientSearchPath, effectiveCatalog); cmd != "" {
+			spCtx, spCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+			_, err := exec.ExecContext(spCtx, cmd)
+			spContextErr := spCtx.Err()
+			spCancel()
+			if err != nil {
+				if source == sessionDefaultSourceConfiguredCatalog {
+					outcome, reason := controlPlaneSessionStartOperationResult(
+						err,
+						spContextErr,
+						cp.isDraining(),
+						observe.SessionStartReasonMetadataStore,
+					)
+					clog.Error("Failed to apply session default catalog.", "catalog", effectiveCatalog, "error", err)
+					return res, &sessionInitError{
+						outcome: outcome, reason: reason,
+						code: "XX000", message: "failed to apply default catalog", err: err,
+					}
+				}
+				clog.Warn("Failed to apply client connect-time search_path; using default.", "search_path", in.clientSearchPath, "error", err)
+			}
+		}
+	} else {
+		// Passthrough: no pg_catalog views and no rewriting, but the session must
+		// still land in its selected catalog instead of the empty in-memory one.
+		// Standalone passthrough does this via server.setDuckLakeDefault;
+		// the remote-worker path issues the equivalent here.
+		if in.clientSearchPath != "" {
+			clog.Warn("Ignoring client connect-time search_path for passthrough session.", "search_path", in.clientSearchPath)
+		}
+		if cmd := passthroughSessionDefaultCatalogCommand(effectiveCatalog); cmd != "" {
+			initCtx, initCancel := context.WithTimeout(ctx, cp.cfg.SessionInitTimeout)
+			_, err := exec.ExecContext(initCtx, cmd)
+			initContextErr := initCtx.Err()
+			initCancel()
+			if err != nil {
+				outcome, reason := controlPlaneSessionStartOperationResult(
+					err,
+					initContextErr,
+					cp.isDraining(),
+					observe.SessionStartReasonMetadataStore,
+				)
+				clog.Error("Failed to apply passthrough session default catalog.", "command", cmd, "error", err)
+				return res, &sessionInitError{
+					outcome: outcome, reason: reason,
+					code: "XX000", message: "failed to apply default catalog", err: err,
+				}
+			}
+		}
+	}
+
+	return res, nil
 }
 
 func controlPlaneSessionStartResult(err error) (outcome, reason string) {

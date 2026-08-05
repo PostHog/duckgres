@@ -94,6 +94,14 @@ type preparedStmt struct {
 	cursorQuery       string   // Transpiled inner SELECT (for DECLARE)
 	fetchCount        int64    // FETCH row count
 	cursorIsMove      bool     // FETCH is a MOVE: advance position without returning rows
+
+	// pinsWorker is the exploratory-tier classification, computed ONCE at
+	// Parse (from the parse tree Parse already builds) instead of re-parsing
+	// on every Execute of the same statement. Describe and Execute escalate
+	// the connection off the exploratory small worker before a pinning
+	// statement reaches the executor — including Describe, whose LIMIT-0
+	// schema probe really executes the statement.
+	pinsWorker bool
 }
 
 type portal struct {
@@ -219,10 +227,65 @@ type clientConn struct {
 	// only). Counted in milli-units to avoid truncating a fractional-core or
 	// sub-GiB worker. workerMillicores == 0 means "unknown size" (non-remote /
 	// standalone), in which case metering is skipped. Constant for the
-	// connection's life; the metric is computed once at teardown over
+	// connection's life, except that exploratory-tier escalation may raise it
+	// once (largest size wins) on the message-loop goroutine — the same
+	// goroutine that reads it; the metric is computed once at teardown over
 	// backendStart→now.
 	workerMillicores int64
 	workerMiB        int64
+
+	// Exploratory-tier state (remote backend only). onExploratoryWorker is
+	// true while the connection runs on the small exploratory worker;
+	// workerSwitcher (installed by the control plane) swaps the backing
+	// worker/session. Both are touched only on the connection's message-loop
+	// goroutine — swaps happen inline during statement handling, never
+	// concurrently with executor use — so no locking.
+	onExploratoryWorker bool
+	workerSwitcher      WorkerSwitcher
+
+	// sessionActivator lazily acquires the connection's FIRST worker/session
+	// (exploratory tier only — see SessionActivator). Installed by the control
+	// plane instead of an executor when acquisition is deferred past connection
+	// startup; nil on every eager path (standalone, process backend, GUC-sized,
+	// tier-disabled), where executor is already bound. Like workerSwitcher it is
+	// touched only on the message-loop goroutine, so an activation can never race
+	// another activation or executor use.
+	sessionActivator SessionActivator
+
+	// pendingS3Cache holds a connect-time `-c duckgres.s3_cache=...` startup
+	// option that could not be applied at connect because the connection had no
+	// worker yet (lazy activation). Applied by ensureSessionActive AFTER the
+	// executor is installed — never earlier, or the worker swap silently no-ops
+	// while the session flag flips. Same goroutine as everything else here.
+	pendingS3Cache    string
+	hasPendingS3Cache bool
+
+	// fatalErr parks a connection-terminating error raised inside an
+	// extended-query handler. Those handlers are void (the protocol reports
+	// their failures as ErrorResponse + skip-until-Sync), but a failed tier
+	// escalation has already destroyed the session, so there is nothing to
+	// resynchronize to: failWorkerEscalation records the error here and
+	// runExtendedQueryMessage hands it to the message loop, which returns.
+	// Set on the message-loop goroutine, read by it, and never cleared — the
+	// connection is on its way out.
+	fatalErr error
+
+	// postStartup is set once the connection enters the message loop, i.e.
+	// once startup + authentication completed on EVERY path (standalone,
+	// process worker, and the control plane, which writes the first
+	// ReadyForQuery itself and then calls RunConnectionMessageLoop). Read only
+	// by sendError, to keep duckgres_auth_failures_total an AUTHENTICATION
+	// metric: a class-28 error raised after this point is a post-connect
+	// authorization failure (the exploratory tier's disabled-user re-check),
+	// not a failed login.
+	postStartup bool
+
+	// inExtendedMessage is true while an extended-query message handler runs.
+	// It tells the shared statement-failure paths who owns ReadyForQuery: the
+	// simple protocol writes one per statement, while in the extended protocol
+	// Sync does — writing one from inside a handler would desync the client's
+	// response accounting.
+	inExtendedMessage bool
 
 	// teamID is the PostHog Team.id this connection is attributed to for product
 	// analytics (the connecting user's team, else the org's oldest team; 0 when
@@ -1150,6 +1213,9 @@ func (c *clientConn) armIdleReadDeadline() {
 }
 
 func (c *clientConn) messageLoop() error {
+	// Startup and authentication are behind us on every path that reaches
+	// here; see the postStartup field for why sendError cares.
+	c.postStartup = true
 	atReadyBoundary := true
 	for {
 		if atReadyBoundary && c.drainRequested.Load() {
@@ -1196,32 +1262,66 @@ func (c *clientConn) messageLoop() error {
 			// resynchronizes the client.
 			c.ignoreTillSync = false
 			if err := c.handleQuery(body); err != nil {
-				if isConnectionBroken(err) {
+				// A connection-fatal error (today: a failed exploratory-tier
+				// escalation, whose switcher already destroyed the previous
+				// session) has sent a FATAL ErrorResponse and deliberately no
+				// ReadyForQuery. There is nothing left to resynchronize to, so
+				// unwind instead of reading the next message. Checked BEFORE
+				// isConnectionBroken: the cause is server-side even when its
+				// text mentions a refused/reset connection to a worker.
+				if errors.Is(err, errConnectionFatal) {
+					c.logger().Error("Query error.", "error", err)
+					return err
+				}
+				// A statement-scoped abort (today: a post-escalation s3_cache
+				// re-apply failure) has already sent its ERROR and its
+				// ReadyForQuery and left a healthy session behind, so the
+				// connection resumes. Checked BEFORE isConnectionBroken for the
+				// same reason as errConnectionFatal: the cause is server-side
+				// even when its text mentions a refused/reset worker connection.
+				if errors.Is(err, errStatementAborted) {
+					c.logger().Warn("Statement aborted.", "error", err)
+				} else if isConnectionBroken(err) {
 					c.logger().Info("Client connection lost during query.", "error", err)
 					return nil
+				} else {
+					c.logger().Error("Query error.", "error", err)
 				}
-				c.logger().Error("Query error.", "error", err)
 			}
 			if c.drainRequested.Load() {
 				return nil
 			}
 			atReadyBoundary = true
 
+		// The extended-query handlers report their own errors to the client and
+		// arm skip-until-Sync; the error returned here is ONLY the
+		// connection-fatal kind (a failed exploratory-tier escalation, whose
+		// FATAL ErrorResponse is already flushed and whose session is gone), so
+		// it unwinds the loop with no ReadyForQuery — same contract as
+		// handleQuery's errConnectionFatal above.
 		case wire.MsgParse:
 			// Extended query protocol - Parse
-			c.runExtendedQueryMessage(c.handleParse, body)
+			if err := c.runExtendedQueryMessage(c.handleParse, body); err != nil {
+				return err
+			}
 
 		case wire.MsgBind:
 			// Extended query protocol - Bind
-			c.runExtendedQueryMessage(c.handleBind, body)
+			if err := c.runExtendedQueryMessage(c.handleBind, body); err != nil {
+				return err
+			}
 
 		case wire.MsgDescribe:
 			// Extended query protocol - Describe
-			c.runExtendedQueryMessage(c.handleDescribe, body)
+			if err := c.runExtendedQueryMessage(c.handleDescribe, body); err != nil {
+				return err
+			}
 
 		case wire.MsgExecute:
 			// Extended query protocol - Execute
-			c.runExtendedQueryMessage(c.handleExecute, body)
+			if err := c.runExtendedQueryMessage(c.handleExecute, body); err != nil {
+				return err
+			}
 
 		case wire.MsgSync:
 			// Extended query protocol - Sync: ends any skip-until-Sync error
@@ -1238,7 +1338,9 @@ func (c *clientConn) messageLoop() error {
 
 		case wire.MsgClose:
 			// Extended query protocol - Close
-			c.runExtendedQueryMessage(c.handleClose, body)
+			if err := c.runExtendedQueryMessage(c.handleClose, body); err != nil {
+				return err
+			}
 
 		case wire.MsgFlush:
 			// Discarded during skip-until-Sync error recovery, like real
@@ -1329,6 +1431,15 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		if parseErr == nil && len(tree.Stmts) == 1 {
 			switch s := tree.Stmts[0].Stmt.Node.(type) {
 			case *pg_query.Node_DeclareCursorStmt:
+				// DECLARE is session state: it opens a worker-side RowSet that
+				// lives across statements, so it must pin before the cursor is
+				// opened. Otherwise a later pinning statement destroys the
+				// session out from under the open cursor and strands it.
+				// FETCH/CLOSE need no hook — an open cursor proves its DECLARE
+				// already pinned this connection.
+				if err := c.escalateForPinningStatement(query); err != nil {
+					return err
+				}
 				return c.handleDeclareCursor(query, s.DeclareCursorStmt)
 			case *pg_query.Node_FetchStmt:
 				return c.handleFetchCursor(query, s.FetchStmt)
@@ -1349,6 +1460,13 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		return c.handlePgStatActivity()
 	}
 
+	// Secret DDL creates worker-side state, and the interception below both
+	// executes it and sits above the general pin hook, so the exploratory tier
+	// escalates here (connection-fatal on failure). See escalateForSecretDDL.
+	if err := c.escalateForSecretDDL(query); err != nil {
+		return err
+	}
+
 	// Intercept persistent-secret DDL (CREATE PERSISTENT SECRET / DROP
 	// SECRET) when a user secret manager is configured (multitenant remote
 	// backend), so customer secrets survive across sessions and worker pods.
@@ -1360,6 +1478,15 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	// Passthrough mode: skip all transpilation, send query directly to DuckDB
 	if c.passthrough {
+		// Lazy activation: passthrough sessions carry no tier hooks at all
+		// (executeQueryDirect is hook-free), so acquire here. Defensive today —
+		// useExploratoryTier excludes passthrough users, so no passthrough
+		// connection is ever lazily activated — but it keeps this branch from
+		// dereferencing a nil executor if that exclusion is ever relaxed.
+		// Passthrough speaks raw DuckDB, which classifyStatementTier pins.
+		if err := c.activateForStatement(query, true); err != nil {
+			return err
+		}
 		upperQuery := strings.ToUpper(query)
 		cmdType := c.getCommandType(upperQuery)
 		if cmdType == "COPY" {
@@ -1381,6 +1508,18 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// c.reader directly, which would race with the disconnect monitor.
 	upperQueryEarly := strings.ToUpper(query)
 	if shouldHandleCopyBeforeTranspile(query) {
+		// COPY is routed above the classification hook below, so it must be
+		// classified here or it would run on the exploratory worker unpinned.
+		// EVERY COPY pins, in both directions: COPY FROM writes, and COPY TO
+		// STDOUT streams a whole relation through the worker — the shape the
+		// small worker exists to avoid. This is exactly what
+		// classifyStatementTier already says (a CopyStmt hits its pinning
+		// default), so escalate unconditionally rather than re-deriving a
+		// direction here; shouldHandleCopyBeforeTranspile matches by prefix, and
+		// a spelling pg_query cannot parse at all pins too.
+		if err := c.escalateForPinningStatement(query); err != nil {
+			return err
+		}
 		return c.handleCopy(query, upperQueryEarly)
 	}
 
@@ -1407,6 +1546,15 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 
 	// Handle fallback to native DuckDB: PostgreSQL parsing failed, try DuckDB directly
 	if result.FallbackToNative {
+		// Lazy activation: validateWithDuckDB runs `EXPLAIN <query>` on the
+		// engine, ABOVE the tier hook below, so a not-yet-acquired connection
+		// must acquire first. FallbackToNative means pg_query could not parse
+		// the statement, which classifyStatementTier defines as pinning — so
+		// this acquires the same profile the hook below would have escalated to,
+		// in one acquire. No-op on every eager connection.
+		if err := c.activateForStatement(query, true); err != nil {
+			return err
+		}
 		if err := c.validateWithDuckDB(query); err != nil {
 			// validateWithDuckDB runs `EXPLAIN <query>` on DuckDB, which fails for
 			// BOTH a genuinely-unparseable query AND a parseable query that hits a
@@ -1457,6 +1605,14 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 	// never forwarded to DuckDB. A failed worker swap fails the SET so the
 	// session state never diverges from the worker's actual transport.
 	if result.S3CacheSet != nil {
+		// Lazy activation: unlike the other duckgres GUCs this one is WORKER
+		// state (it rebuilds the worker's ducklake_s3 secret), so it must have a
+		// worker to apply to — otherwise SHOW would report a transport no worker
+		// is using, the exact divergence applyS3CacheSetting exists to prevent.
+		// Not a pinning statement, so it acquires the exploratory worker.
+		if err := c.activateForStatement(query, false); err != nil {
+			return err
+		}
 		if err := c.applyS3CacheSetting(*result.S3CacheSet); err != nil {
 			c.sendError("ERROR", "XX000", err.Error())
 		} else {
@@ -1467,6 +1623,15 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		return nil
 	}
 	if result.S3CacheShow {
+		// Lazy activation, but only when a connect-time option is still pending:
+		// this GUC reports WORKER transport state, and a connection that asked for
+		// `off` at connect has not had that option applied yet
+		// (ensureSessionActive applies it), so answering first would report `on`
+		// for a session that is about to be bypassed. Without a pending option the
+		// session flag is already truthful and SHOW stays engine-free.
+		if err := c.activateForS3CacheShow(query); err != nil {
+			return err
+		}
 		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
 		_ = c.writeCommandComplete("SHOW")
@@ -1491,6 +1656,18 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
+	}
+
+	// Exploratory tier: a statement that writes or creates session state must
+	// run on (and pin) a normal-size worker. Escalate BEFORE execution so the
+	// small worker stays stateless by construction. Interpreted statements the
+	// CP already handled (cursor / pg_stat_activity / secret DDL / GUC / no-op
+	// intercepts) returned above and never reach this point. Deliberately above
+	// the writable-CTE rewrite branch: classifyStatementTier detects the
+	// embedded DML, and that branch runs it on the worker. A failed escalation
+	// is connection-fatal — the previous session is already gone.
+	if err := c.escalateForPinningStatement(query); err != nil {
+		return err
 	}
 
 	// Handle multi-statement results (writable CTE rewrites)

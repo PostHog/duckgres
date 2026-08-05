@@ -990,6 +990,13 @@ server_side_cursors() { # org password
 # query runs immediately on that same session; if the control plane reuses the
 # session before the worker has released its cancelled DoGet operation, this can
 # fail with "session already has an active operation".
+#
+# TIER AUDIT: the whole point is that the marker runs on the SAME session as the
+# cancelled query. With the exploratory tier on, the marker's CREATE TEMP TABLE
+# pins — so if the connection were still on the small worker it would ESCALATE
+# to a brand-new session and the assertion would silently stop testing cancel
+# cleanup. The client therefore pins the connection with a temp table BEFORE the
+# heavy query, so cancel and reuse both happen on one standard-worker session.
 cancel_then_reuse_same_session() { # org password
   log "cancel then immediate same-session reuse on $1"
   out="$(mktemp)"
@@ -1014,6 +1021,11 @@ conn = psycopg2.connect(
 conn.autocommit = True
 try:
     cur = conn.cursor()
+    # Pin this session off the exploratory tier BEFORE the heavy query (see the
+    # TIER AUDIT note above): the marker below is a pinning statement, and an
+    # escalation between the cancel and the marker would move it to a NEW
+    # session — exactly the reuse this test exists to exercise.
+    cur.execute("CREATE TEMP TABLE cancel_reuse_marker(v INT);")
     timer = threading.Timer(3.0, conn.cancel)
     timer.start()
     cancelled = False
@@ -1032,7 +1044,6 @@ try:
         raise SystemExit("heavy query did not get cancelled")
 
     cur.execute(
-        "CREATE TEMP TABLE cancel_reuse_marker(v INT); "
         "INSERT INTO cancel_reuse_marker VALUES (42); "
         "SELECT v FROM cancel_reuse_marker;"
     )
@@ -1370,27 +1381,42 @@ assert_worker_pod() { # org password
     fail "worker $pod mounts a kubernetes.io/serviceaccount token"
   fi
 
-  # Never-BestEffort: a DEFAULT-shape worker (no client sizing) must still carry
-  # the pool-default resource requests. With the exclusive-node pod anti-affinity
-  # removed, requests are the ONLY thing keeping co-scheduled workers from
-  # overcommitting a node — a BestEffort default worker is a regression.
+  # Never-BestEffort: an UNSIZED worker (no client duckgres.worker_* GUCs) must
+  # still carry deployment-configured resource requests. With the exclusive-node
+  # pod anti-affinity removed, requests are the ONLY thing keeping co-scheduled
+  # workers from overcommitting a node — a BestEffort worker is a regression.
+  #
+  # TIER AUDIT: with the exploratory tier on (manifests.tmpl.yaml), an unsized
+  # connection's plain reads land on the EXPLORATORY shape (1/2Gi) and only a
+  # pinning statement escalates it to the pool default (750m/1536Mi). This lane
+  # runs both kinds before we get here, and the pin may REUSE an older hot-idle
+  # pod, so "the newest running worker" is legitimately either shape. Accept
+  # both — but only those two, each with its own exactly-derived hygiene env, so
+  # the never-BestEffort guard and the derivation check both keep their teeth.
   dcpu="$worker_cpu"
   dmem="$worker_memory"
-  [ "$dcpu" = "750m" ] || fail "default worker $pod requests.cpu='$dcpu' want '750m' (pool default; BestEffort regression?)"
-  [ "$dmem" = "1536Mi" ] || fail "default worker $pod requests.memory='$dmem' want '1536Mi'"
+  case "$dcpu/$dmem" in
+    # Pool default (DUCKGRES_K8S_WORKER_{CPU,MEMORY}_REQUEST).
+    750m/1536Mi) want_gomem="192MiB" ;;
+    # Exploratory tier (DUCKGRES_EXPLORATORY_WORKER_{CPU,MEMORY}).
+    1/2Gi)        want_gomem="256MiB" ;;
+    *) fail "unsized worker $pod requests cpu='$dcpu' memory='$dmem' — neither the pool default (750m/1536Mi) nor the exploratory shape (1/2Gi); BestEffort regression?" ;;
+  esac
 
   # Pre-session memory hygiene env (workerMemoryHygieneEnv): the CP must stamp
   # a pod-derived DuckDB memory_limit, a Go soft memory ceiling, and the thread
   # count at spawn — otherwise the worker sizes its base DB off the NODE's
   # /proc/meminfo and all pre-session work (DuckLake ATTACH, activation) runs
-  # effectively unbounded. Values derive from the 750m/1536Mi pool default:
-  # 75% of 1536Mi floors to 1GB; GOMEMLIMIT is 1/8 pod = 192MiB; 750m -> 1.
+  # effectively unbounded. Both shapes above derive DUCKGRES_MEMORY_LIMIT=1GB
+  # (75% of 1536Mi and of 2Gi both GB-floor to 1) and DUCKGRES_THREADS=1 (750m
+  # and 1 both round up to 1); only GOMEMLIMIT (1/8 of the pod) distinguishes
+  # them, which is exactly what makes this a real derivation check.
   dml="$worker_memory_limit"
-  [ "$dml" = "1GB" ] || fail "default worker $pod DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of 1536Mi, GB-floored)"
+  [ "$dml" = "1GB" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of pod memory, GB-floored)"
   gml="$worker_go_memory_limit"
-  [ "$gml" = "192MiB" ] || fail "default worker $pod GOMEMLIMIT='$gml' want '192MiB' (1/8 of 1536Mi)"
+  [ "$gml" = "$want_gomem" ] || fail "unsized worker $pod ($dcpu/$dmem) GOMEMLIMIT='$gml' want '$want_gomem' (1/8 of pod memory)"
   thr="$worker_threads"
-  [ "$thr" = "1" ] || fail "default worker $pod DUCKGRES_THREADS='$thr' want '1' (750m rounds up)"
+  [ "$thr" = "1" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_THREADS='$thr' want '1' (sub-2-CPU rounds up to 1)"
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------
@@ -1405,6 +1431,14 @@ assert_worker_pod() { # org password
 # back a default or other-shape hot-idle worker — the newest worker pod for the
 # org is unambiguously ours. The connection's dbname forces that catalog's
 # activation at session-create, so this also exercises sizing × catalog together.
+#
+# TIER AUDIT: this is ALSO the exploratory tier's GUC-bypass assertion. A
+# connection that supplies duckgres.worker_* startup options is deliberately
+# excluded from small-first routing (clientSuppliedWorkerGUCs → useExploratoryTier
+# false): it acquires the requested shape EAGERLY at connect and never touches
+# the exploratory profile. So a pod carrying the requested cpu/memory here is
+# also proof the bypass held — if the tier ever swallowed sized connections,
+# this pod would come back 1/2Gi.
 WORKER_C='{.spec.containers[?(@.name=="duckdb-worker")]'
 sized_worker() { # org password catalog cpu memory ttl
   org="$1"; pw="$2"; cat="$3"; cpu="$4"; mem="$5"; ttl="$6"
@@ -1549,7 +1583,16 @@ org_default_profile() { # org password catalog
   sleep "${CONFIG_POLL_SETTLE:-12}"
 
   # PLAIN connection: no PGOPTIONS / duckgres.* startup options at all.
-  pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
+  #
+  # TIER AUDIT: with the exploratory tier on, a plain READ no longer lands on
+  # the org-default shape — it lands on the small exploratory worker, and the
+  # org default is the ESCALATION TARGET. Drive the connection with a PINNING
+  # statement (session state the small stateless worker must never hold) so the
+  # org default is what actually materializes. This is also the tier's
+  # "pinning statement acquires the standard profile in ONE acquire" path: the
+  # first statement pins, so the CP acquires the org-default shape directly
+  # instead of taking a small worker and escalating off it.
+  pg "$org" "$pw" "$cat" 'CREATE TEMP TABLE _e2e_pin (i int)' >/dev/null
   pod="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" \
         --sort-by=.metadata.creationTimestamp \
         -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)"
@@ -1558,26 +1601,28 @@ org_default_profile() { # org password catalog
   rmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
   lcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.cpu}")"
   lmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.limits.memory}")"
-  [ "$rcpu" = "$cpu" ] || fail "org default: $pod requests.cpu='$rcpu' want '$cpu' (org default not applied to a plain connection)"
+  [ "$rcpu" = "$cpu" ] || fail "org default: $pod requests.cpu='$rcpu' want '$cpu' (org default not applied to an unsized connection)"
   [ "$rmem" = "$mem" ] || fail "org default: $pod requests.memory='$rmem' want '$mem'"
   [ "$lcpu" = "$cpu" ] || fail "org default: $pod limits.cpu='$lcpu' want '$cpu'"
   [ "$lmem" = "$mem" ] || fail "org default: $pod limits.memory='$lmem' want '$mem'"
-  log "org default OK: plain connection got $pod cpu=$rcpu mem=$rmem"
+  log "org default OK: unsized pinning connection got $pod cpu=$rcpu mem=$rmem"
 
-  # Clear and assert a fresh plain connection is back on the deployment default
+  # Clear and assert a fresh unsized connection is back on the deployment default
   # shape: the count of org-default-shaped pods must not grow (a nil/default
   # profile can never exact-match the 2-CPU shape, so a regrow means the org
-  # default is still being applied).
+  # default is still being applied). Driven by a pinning statement for the same
+  # reason as above — a plain read would land on the exploratory shape and could
+  # not distinguish "org default cleared" from "never escalated".
   code="$(put_org "$org" '{"default_worker_cpu":"","default_worker_memory":"","default_worker_ttl":""}')"
   [ "$code" = "200" ] || fail "org default: clear PUT -> HTTP $code: $(cat /tmp/put_org_out)"
   got="$(get_org_default_profile "$org")"
   [ "$got" = "||" ] || fail "org default: not cleared on GET: '$got'"
   sleep "${CONFIG_POLL_SETTLE:-12}"
   before="$(count_org_workers_of_cpu "$org" "$cpu")"
-  pg "$org" "$pw" "$cat" 'SELECT 1' >/dev/null
+  pg "$org" "$pw" "$cat" 'CREATE TEMP TABLE _e2e_pin2 (i int)' >/dev/null
   after="$(count_org_workers_of_cpu "$org" "$cpu")"
   [ "$after" -le "$before" ] || fail "org default: cleared default still spawns $cpu-cpu workers ($before -> $after)"
-  log "org default OK: cleared; plain connection back on the deployment default shape"
+  log "org default OK: cleared; unsized connection back on the deployment default shape"
 
   # Audit readability: the org PUTs above must land a resource-specific
   # "org.update" row (not a generic "config.update") carrying a human "which
@@ -1588,6 +1633,176 @@ org_default_profile() { # org password catalog
     | jq -e --arg o "$org" '.entries | map(select(.action=="org.update" and .org==$o and (.detail | test("default_worker")))) | length >= 1' >/dev/null \
     || fail "org default: no org.update audit row with a field-change detail for $org"
   log "org default OK: audit shows org.update with field-change detail on $org"
+}
+
+# ---- exploratory worker tier (small-first routing) --------------------------
+# CLAUDE.md "Exploratory Worker Tier". A connection that supplies no
+# duckgres.worker_* sizing GUCs acquires NO worker at connect; its first
+# engine-touching statement classifies itself and lands on the small
+# exploratory shape (DUCKGRES_EXPLORATORY_WORKER_* in manifests.tmpl.yaml —
+# 1/2Gi here), and a state-mutating statement or an engine OOM escalates it to
+# the ESCALATION TARGET (the org default when set, else the pool default).
+# Four assertions, one per load-bearing half:
+#   exploratory_tier            — a plain read lands on the small shape
+#   exploratory_lazy_activation — connect + quit spends NO pod at all
+#   exploratory_state_pin       — a state mutation escalates and still works
+#   exploratory_oom_escalation  — an engine OOM re-executes transparently
+# The GUC-bypass half is asserted by sized_worker (see its header).
+EXPL_CPU=1
+EXPL_MEM=2Gi
+
+exploratory_tier() { # org password catalog
+  org="$1"; pw="$2"; cat="$3"
+  log "exploratory tier: a plain read lands on the ${EXPL_CPU}-CPU/${EXPL_MEM} small worker on $org"
+  # Start cold so the read cannot be answered by an older hot-idle pod of some
+  # other shape — the pod it spawns is unambiguously the one it was routed to.
+  k delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --wait=false >/dev/null 2>&1 || true
+  k wait --for=delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --timeout=300s >/dev/null 2>&1 || true
+
+  v="$(_pg_exec "$org" "$pw" "$cat" 'SELECT 42')" || fail "exploratory tier: plain read failed on $org"
+  [ "$v" = "42" ] || fail "exploratory tier: plain read returned '$v' want '42'"
+  pod="$(newest_running_org_worker "$org")"
+  [ -n "$pod" ] || fail "exploratory tier: no worker pod for $org after a plain read"
+  rcpu="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.cpu}")"
+  rmem="$(k get pod "$pod" -o jsonpath="${WORKER_C}.resources.requests.memory}")"
+  [ "$rcpu" = "$EXPL_CPU" ] \
+    || fail "exploratory tier: pod $pod requests.cpu='$rcpu' want '$EXPL_CPU' (small-first routing not applied — plain reads still take the standard profile)"
+  [ "$rmem" = "$EXPL_MEM" ] \
+    || fail "exploratory tier: pod $pod requests.memory='$rmem' want '$EXPL_MEM'"
+  log "exploratory tier OK: $pod cpu=$rcpu mem=$rmem"
+}
+
+# Lazy acquisition: a connection that issues NO statement must spend NO worker
+# pod. Made deterministic by starting from zero org pods — with no hot-idle pod
+# to reuse, ANY acquisition has to create one, so "still zero" is proof the
+# connect path acquired nothing. (Pre-tier, the CP acquired a worker during the
+# handshake, so this would have spawned a pod every time.) psql with only the
+# `\q` meta-command on stdin authenticates, reads ReadyForQuery and terminates
+# without ever sending a Query message.
+exploratory_lazy_activation() { # org password catalog
+  org="$1"; pw="$2"; cat="$3"
+  log "exploratory lazy activation: connect+quit spawns no worker on $org"
+  k delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --wait=false >/dev/null 2>&1 || true
+  k wait --for=delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --timeout=300s >/dev/null 2>&1 || true
+  before="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" --no-headers 2>/dev/null | grep -c . || true)"
+  # The zero-pod precondition is what gives the check its teeth: with a hot-idle
+  # pod still around, an acquisition would REUSE it and the count would not move
+  # — a lazy-acquisition regression would pass vacuously. Assert it, never
+  # assume it.
+  [ "$before" -eq 0 ] \
+    || fail "exploratory lazy activation: org $org still has $before worker pod(s) after the delete-wait — the zero-pod precondition did not hold, so a reused hot-idle worker would make this assertion vacuous"
+
+  qout="$(printf '\\q\n' | PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=$cat" \
+      -qtA 2>&1)" \
+    || fail "exploratory lazy activation: connect+quit failed on $org: $(printf '%s' "$qout" | tr -d '\n' | tail -c 300)"
+
+  # A spawn is asynchronous, so give one a chance to appear before concluding.
+  sleep 20
+  after="$(k get pods -l "app=duckgres-worker,duckgres/active-org=$org" --no-headers 2>/dev/null | grep -c . || true)"
+  [ "$after" -le "$before" ] \
+    || fail "exploratory lazy activation: org $org went from $before to $after worker pods for a connection that ran NO statement (acquisition is not deferred to the first statement)"
+  log "exploratory lazy activation OK: $before -> $after worker pods (no acquisition)"
+}
+
+# Pin-on-state: a statement that creates session state must never run on the
+# stateless small worker. Asserted by SHAPE (the escalation target's pod
+# appears) AND by RESULT (the state survives into the following read on the
+# escalated session — an escalation that lost the temp table would return
+# nothing). Runs with the org default CLEARED, so the escalation target is the
+# pool default (750m/1536Mi) — a shape no plain read on this org can produce,
+# which is what makes the shape check unambiguous.
+exploratory_state_pin() { # org password catalog target_cpu
+  org="$1"; pw="$2"; cat="$3"; want_cpu="$4"
+  log "exploratory state pin: session state escalates to the ${want_cpu}-CPU target on $org"
+  # Cold start for the same reason as exploratory_tier: with no reusable
+  # target-shaped hot-idle pod, "a pod of the target shape appeared" can only
+  # mean this session was routed to it. (Cheap: the preceding assertion leaves
+  # the org at zero pods.)
+  k delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --wait=false >/dev/null 2>&1 || true
+  k wait --for=delete pods -l "app=duckgres-worker,duckgres/active-org=$org" --timeout=300s >/dev/null 2>&1 || true
+  before="$(count_org_workers_of_cpu "$org" "$want_cpu")"
+  # ONE session: create state, mutate it, read it back. The first statement
+  # pins, so the CP acquires the escalation target directly (one acquire, no
+  # small worker to destroy); the read must then see the state.
+  # 2>&1: _pg_exec prints a real failure to STDERR, so without it $out is empty
+  # and the fail message below says nothing.
+  out="$(_pg_exec "$org" "$pw" "$cat" \
+      'CREATE TEMP TABLE _e2e_tier (i int); INSERT INTO _e2e_tier VALUES (7); SELECT i FROM _e2e_tier' 2>&1)" \
+    || fail "exploratory state pin: session failed on $org: $(printf '%s' "$out" | tr -d '\n' | tail -c 300)"
+  last="$(printf '%s' "$out" | tail -1)"
+  [ "$last" = "7" ] \
+    || fail "exploratory state pin: read-back returned '$last' want '7' (session state did not survive the pinned session)"
+  after="$(count_org_workers_of_cpu "$org" "$want_cpu")"
+  [ "$after" -gt "$before" ] \
+    || fail "exploratory state pin: org $org still has $after pod(s) of cpu=$want_cpu (was $before) — the state-mutating session never landed on the escalation target"
+  log "exploratory state pin OK: cpu=$want_cpu pods $before -> $after, state read back"
+}
+
+# OOM escalation: a read the small worker's DuckDB memory_limit cannot satisfy
+# must be re-executed TRANSPARENTLY on the escalation target — same connection,
+# same statement, correct result, no client-visible error.
+#
+# Determinism, both halves:
+#  * The failure is forced, not hoped for. `list()` accumulates ONE group's
+#    state in memory and cannot spill to the worker's temp_directory (unlike a
+#    hash aggregate or a sort, which DuckDB happily runs out-of-core), so a
+#    list of 200M BIGINTs (~1.6GB) is a hard "Out of Memory Error" against the
+#    small worker's 1GB memory_limit (75% of 2Gi, GB-floored) and comfortably
+#    fits the 6GB limit of the 2/8Gi escalation target.
+#  * The escalation is PROVEN, not inferred from the result. The CP logs
+#    `Escalated connection off exploratory worker.` with reason=oom and the
+#    org; we count those lines in the window this assertion ran. (The :9090
+#    metrics port is NetworkPolicy-blocked from this in-cluster Job — see
+#    connection_duration_logged — so the CP log is the available signal for
+#    duckgres_exploratory_escalations_total{reason="oom",outcome="ok"}.)
+#
+# Needs an escalation target with MORE memory than the small shape, which this
+# deployment's pool default (1536Mi < 2Gi) is not — so it sets the org default
+# to the same 2/8Gi/10m shape org_default_profile used (its hot-idle worker is
+# usually still reusable) and clears it again afterwards.
+exploratory_oom_escalation() { # org password catalog
+  org="$1"; pw="$2"; cat="$3"; cpu=2; mem=8Gi; ttl=10m
+  log "exploratory oom escalation: a memory-heavy read re-executes on the ${cpu}/${mem} target on $org"
+  code="$(put_org "$org" "{\"default_worker_cpu\":\"$cpu\",\"default_worker_memory\":\"$mem\",\"default_worker_ttl\":\"$ttl\"}")"
+  [ "$code" = "200" ] || fail "exploratory oom: PUT org default -> HTTP $code: $(cat /tmp/put_org_out)"
+  sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  started="$(date +%s)"
+  # ~1.6GB of list state: OOMs the 1GB small worker, fits the 6GB target.
+  # array_length(x, 1) is PG spelling; the transpiler rewrites it to DuckDB len().
+  q="SELECT array_length(list(i), 1) FROM range(200000000) t(i)"
+  oomrc=0
+  # 2>&1 so the failure branch below can actually report why (_pg_exec prints a
+  # real error to stderr). On success the output is only the result row.
+  out="$(_pg_exec "$org" "$pw" "$cat" "$q" 2>&1)" || oomrc=1
+  # Count the escalation lines BEFORE clearing the default, then always clear —
+  # a failure below must not leave the org carrying a default the following
+  # assertions do not expect.
+  window=$(( $(date +%s) - started + 30 ))
+  n=0
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    # Same idiom as connection_duration_logged: a kubectl failure must FAIL the
+    # assertion, not be swallowed into a zero count that reads as "the tier
+    # never escalated".
+    logs="$(k logs "$p" --since="${window}s" 2>&1)" \
+      || fail "exploratory oom: kubectl logs failed for control-plane pod $p while checking for the escalation: $logs"
+    c="$(printf '%s\n' "$logs" \
+          | grep 'Escalated connection off exploratory worker' \
+          | grep "org=$org" \
+          | grep -c 'reason=oom' || true)"
+    n=$(( n + c ))
+  done
+  put_org "$org" '{"default_worker_cpu":"","default_worker_memory":"","default_worker_ttl":""}' >/dev/null
+
+  [ "$oomrc" = 0 ] \
+    || fail "exploratory oom: memory-heavy read failed instead of being re-executed on a bigger worker: $(printf '%s' "$out" | tr -d '\n' | tail -c 300)"
+  got="$(printf '%s' "$out" | tail -1)"
+  [ "$got" = "200000000" ] \
+    || fail "exploratory oom: re-executed read returned '$got' want '200000000' (a re-execute that streams a partial or duplicated result is worse than an error)"
+  [ "$n" -ge 1 ] \
+    || fail "exploratory oom: the read returned correctly but no reason=oom escalation was logged for $org in the last ${window}s — the small worker absorbed a query it was supposed to OOM on (raise the list size), so this assertion proved nothing"
+  log "exploratory oom escalation OK: $n oom escalation(s) logged, result correct"
 }
 
 # ---- provision team contract (team_id mandatory on new orgs) ----------------
@@ -2647,6 +2862,16 @@ admin_per_org_workers() { # org password
 # tests (TestNormalizeIdleTimeout + TestMessageLoopIdleTimeoutClosesConnection)
 # are the deterministic gate for the mechanism; this proves the real default
 # fires end-to-end in-cluster.
+#
+# TIER AUDIT — the assertion's MEANING shifted, its mechanics did not. With
+# lazy acquisition an idle connection may hold NO session at all (nothing to
+# reap but the socket), so "idle connection pins a worker" is now specifically
+# about a connection that HAS acquired one. This test drives it with `BEGIN`,
+# which is a pinning statement: it acquires the standard worker and opens a
+# transaction, so the session is real, visible in /queries, and its reap is the
+# behavior under test. Do NOT "simplify" the driver to a connection that sends
+# nothing — it would hold no session, never appear in /queries, and the test
+# would fail at the appear-poll for the wrong reason.
 conn_idle_timeout_reaps_session() { # org password
   org="$1"; pw="$2"
   log "conn idle timeout: idle connection is reaped + worker freed on $org"
@@ -2721,7 +2946,12 @@ copy_active_and_survives_idle() { # org password
   # This test runs right after the idle-timeout test frees the org's worker, so a
   # bare COPY connection would cold-spawn a worker inside the stream's critical
   # path. Force activation up front so the streamed data never races a cold start.
+  # TIER AUDIT: the pre-warm has to be a PINNING statement. COPY (both
+  # directions) pins, so the streaming connection below acquires the STANDARD
+  # profile — a plain `SELECT 1` pre-warm would only leave an exploratory worker
+  # hot-idle and the COPY would still cold-spawn its own.
   wait_worker "$org" "$pw" ducklake
+  pg "$org" "$pw" ducklake 'CREATE TEMP TABLE _e2e_copy_pin (i int)' >/dev/null
   # 2000-char pad → each row line is ~2KB, so a 16-row chunk is ~32KB: bigger than
   # libpq's ~8KB output buffer, which forces a flush to the wire each interval.
   pad="$(printf '%02000d' 0)"
@@ -3754,6 +3984,18 @@ query_log_round_trip() { # org password
   [ "$kind" = "Select" ] || fail "query_log_round_trip: query_kind '$kind' (row: $row)"
   [ "$who" = "root" ] || fail "query_log_round_trip: user_name '$who' (row: $row)"
 
+  # worker_tier: the terminal event records the tier the statement ULTIMATELY
+  # ran on. The marker above is an unsized plain read, so with the exploratory
+  # tier on (manifests.tmpl.yaml) it ran on the small worker and must say
+  # "exploratory". Queried separately so a NULL/absent column fails HERE with a
+  # clear message instead of NULLing the concatenation above into an endless
+  # (and misleading) "no QueryFinish row" poll.
+  tier="$(pg "$1" "$2" ducklake \
+    "SELECT COALESCE(worker_tier, '<null>') FROM ducklake.system.query_log
+      WHERE query_id = '$qid' AND type = 'QueryFinish' LIMIT 1")"
+  [ "$tier" = "exploratory" ] \
+    || fail "query_log_round_trip: worker_tier '$tier' for an unsized plain read, want 'exploratory' (tier not recorded, or small-first routing not applied)"
+
   # The QueryStart row for the SAME query_id must be there too. This is the
   # ClickHouse event model end to end: the control plane emits QueryStart before
   # execution and the terminal event after, and they join on query_id. A
@@ -3908,11 +4150,23 @@ lane_res1() { # worker-kill resilience on its own org (heavy, churns workers)
 lane_res2() { # scheduling-shape resilience on its own org (heavy, cold spawns)
   # Both assertions tolerate a cold org: their connections spawn workers in
   # parallel and the heavy query holds each worker well past the others' spawn.
+  # (TIER AUDIT: both count PODS, not shapes — one-session-per-worker holds on
+  # the small tier exactly as it does on the standard one, so their plain reads
+  # simply land on exploratory pods and the peak-pod arithmetic is unchanged.)
   one_session_per_worker     "$RES2" "$res2_pw"
   cold_burst_parallel_spawns "$RES2" "$res2_pw"
+  # ---- exploratory worker tier (see the block above org_default_profile) ----
+  # ORDER IS LOAD-BEARING: exploratory_lazy_activation leaves the org at zero
+  # worker pods, which is the precondition exploratory_state_pin's shape count
+  # needs; and exploratory_oom_escalation runs AFTER org_default_profile so it
+  # can reuse that assertion's still-hot 2/8Gi worker as its escalation target.
+  exploratory_tier            "$RES2" "$res2_pw" ducklake
+  exploratory_lazy_activation "$RES2" "$res2_pw" ducklake
+  exploratory_state_pin       "$RES2" "$res2_pw" ducklake 750m
   # No client-sized assertions run on this org, so
   # the 2-CPU shape is unambiguously the org default's.
-  org_default_profile "$RES2" "$res2_pw" ducklake
+  org_default_profile        "$RES2" "$res2_pw" ducklake
+  exploratory_oom_escalation "$RES2" "$res2_pw" ducklake
 }
 
 main() {
@@ -4075,7 +4329,7 @@ main() {
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + native-metadata-proxy(explicit-opt-in/exact-db/real-cnpg-query/per-org-disable) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake) + org-default-profile(cnpg) + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty + CALL opaque-but-complete) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + native-metadata-proxy(explicit-opt-in/exact-db/real-cnpg-query/per-org-disable) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake, doubles as exploratory-tier GUC-bypass) + org-default-profile(cnpg) + exploratory-tier(small-first plain read) + exploratory-lazy-activation(connect+quit spends no pod) + exploratory-state-pin(escalation target + state survives) + exploratory-oom-escalation(transparent re-execute, reason=oom logged) + query-log-worker-tier + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty + CALL opaque-but-complete) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
 }
 
 main "$@"

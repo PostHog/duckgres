@@ -605,12 +605,18 @@ func (c *clientConn) flushWriter() error {
 }
 
 func (c *clientConn) sendError(severity, code, message string) {
-	// Class 28 = "Invalid Authorization Specification" (auth failures).
-	// All current FATAL errors use class 28, so this covers both auth
-	// failures and connection rejections (no SSL, no user, wrong password).
-	// NOTE: If one adds a FATAL error with a non-28 code, be sure to add
-	// a metric for it here.
-	if strings.HasPrefix(code, "28") {
+	// Class 28 = "Invalid Authorization Specification". duckgres_auth_failures_total
+	// is a metric about the AUTHENTICATION handshake, so only the startup phase
+	// feeds it: the class-28 rejections raised before the connection reaches the
+	// message loop (no SSL, no user specified, wrong password, failed database
+	// open). A class-28 error sent AFTER startup is a post-connect authorization
+	// failure on an established connection — today the exploratory tier's
+	// disabled-user re-check at lazy activation / escalation — and counting it
+	// here would make an operator disabling an account look like a brute-force
+	// attempt.
+	// NOTE: If one adds a STARTUP-phase FATAL error with a non-28 code, be sure
+	// to add a metric for it here.
+	if !c.postStartup && strings.HasPrefix(code, "28") {
 		auth.AuthFailuresCounter.Inc()
 	}
 	if severity != "" {

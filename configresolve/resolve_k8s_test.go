@@ -3,6 +3,7 @@ package configresolve
 import (
 	"slices"
 	"testing"
+	"time"
 )
 
 func TestResolveEffectiveDefaultsK8sWorkerServiceAccountToDefaultWorker(t *testing.T) {
@@ -92,5 +93,43 @@ func TestResolveEffectiveRejectsInvalidK8sWorkerDefaultTTL(t *testing.T) {
 	}
 	if len(warned) != 2 {
 		t.Fatalf("expected 2 warnings for invalid TTL values, got %d: %v", len(warned), warned)
+	}
+}
+
+func TestExploratoryTierEnvKnobs(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_EXPLORATORY_TIER_ENABLED":  "true",
+		"DUCKGRES_EXPLORATORY_WORKER_CPU":    "2",
+		"DUCKGRES_EXPLORATORY_WORKER_MEMORY": "4Gi",
+		"DUCKGRES_EXPLORATORY_WORKER_TTL":    "48h",
+	}
+	getenv := func(k string) string { return env[k] }
+	r := ResolveEffective(nil, CLIInputs{}, getenv, nil)
+	if !r.K8sExploratoryTierEnabled {
+		t.Fatal("expected exploratory tier enabled")
+	}
+	if r.K8sExploratoryWorkerCPU != "2" || r.K8sExploratoryWorkerMemory != "4Gi" {
+		t.Fatalf("cpu=%q mem=%q", r.K8sExploratoryWorkerCPU, r.K8sExploratoryWorkerMemory)
+	}
+	if r.K8sExploratoryWorkerTTL != 48*time.Hour {
+		t.Fatalf("ttl=%v", r.K8sExploratoryWorkerTTL)
+	}
+}
+
+func TestExploratoryTierEnvKnobsInvalid(t *testing.T) {
+	var warned []string
+	env := map[string]string{
+		"DUCKGRES_EXPLORATORY_TIER_ENABLED": "banana",
+		"DUCKGRES_EXPLORATORY_WORKER_TTL":   "-5m",
+	}
+	r := ResolveEffective(nil, CLIInputs{}, func(k string) string { return env[k] }, func(w string) { warned = append(warned, w) })
+	if r.K8sExploratoryTierEnabled {
+		t.Fatal("invalid bool must leave tier disabled")
+	}
+	if r.K8sExploratoryWorkerTTL != 0 {
+		t.Fatalf("invalid ttl must stay 0 (built-in default applied later), got %v", r.K8sExploratoryWorkerTTL)
+	}
+	if len(warned) != 2 {
+		t.Fatalf("want 2 warnings, got %v", warned)
 	}
 }

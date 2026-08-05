@@ -301,6 +301,137 @@ Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
 `duckdbservice/service_test.go`) AND the `one_session_per_worker` +
 `cold_burst_parallel_spawns` assertions in `tests/mw-dev/e2e/harness.sh`.
 
+## Exploratory Worker Tier (small-first routing) — LOAD-BEARING CONTRACT
+
+Design: `docs/superpowers/specs/2026-08-04-exploratory-worker-tier-design.md`.
+On the **remote/k8s backend only**, a connection that does not ask for a worker
+shape starts on a small "exploratory" pod and grows into a normal one only when
+it proves it needs to. Two mechanisms: **lazy acquisition** (no worker at
+connect) and **escalation** (small → standard, one-way). Env-only knobs:
+`DUCKGRES_EXPLORATORY_TIER_ENABLED` / `_WORKER_CPU` / `_WORKER_MEMORY` /
+`_WORKER_TTL` (default 48h), resolved by `exploratoryWorkerProfile`
+(`controlplane/worker_profile.go`). Server side lives in `server/conn_tier.go`
++ `tier_classify.go`; control-plane side in `controlplane/session_activation.go`
++ the activator/switcher closures in `control.go::handleConnection`.
+
+- **Eligibility is decided once, at connect** (`useExploratoryTier`): remote
+  backend AND a usable exploratory profile AND not a passthrough user AND no
+  client `duckgres.worker_*` startup option (`clientSuppliedWorkerGUCs`). A
+  half-configured tier (missing/invalid size) resolves to nil and degrades to
+  today's eager behavior — never to a BestEffort pod. **Passthrough users are
+  excluded** (they bypass the compat layer the classification is built on), and
+  a **GUC-sized connection bypasses the tier entirely** — it acquires the
+  requested shape eagerly at connect, as before.
+- **Nothing is acquired until a statement needs an engine.** The connection
+  reaches the message loop with `c.executor == nil` and a `SessionActivator`;
+  `activateForStatement` acquires on first need. Statements the control plane
+  answers itself — `SET`/`SHOW duckgres.query_source`, ignored SETs, no-ops,
+  `pg_stat_activity`, the empty query — MUST NOT acquire. That is the point of
+  the whole feature; adding an acquire to an engine-free path silently deletes
+  the benefit. The `duckgres.s3_cache` GUC is the exception, on all three
+  protocol paths, because unlike the other duckgres GUCs it is WORKER state (it
+  rebuilds the worker's `ducklake_s3` secret): **`SET` always acquires** — the
+  swap needs a worker to apply to — and **`SHOW` acquires only when
+  `c.hasPendingS3Cache`**, i.e. when a connect-time option has not been applied
+  yet and answering first would report a transport the session is about to
+  leave (see the s3_cache section below).
+- **A pinning FIRST statement acquires the standard profile directly** (one
+  acquire, `pinned=true` → `MarkConnectionPinned`), never small-then-escalate.
+- **The pin set is the state boundary, and every member is load-bearing:** DML,
+  DDL, `COPY` (BOTH directions — COPY TO can reference session state and is
+  routed above the transpile-time hook), `SET`, `BEGIN` (so an open transaction
+  can never exist on a worker that is about to be replaced), `DECLARE` (simple,
+  batched AND extended — `FETCH`/`CLOSE` are unhooked and rely entirely on the
+  DECLARE pin, because a cursor's worker-side RowSet must not open on a session
+  about to be destroyed), secret DDL **before** the user-secrets interception
+  (that interception owns its own execution and sits ABOVE the general hook, so
+  a plain/TEMPORARY `CREATE SECRET` would otherwise land on the small worker and
+  be silently dropped), and the extended-protocol **Describe probe** of a
+  pinning statement (Describe really executes it). A parse failure pins by
+  default — false pins are free, a missed pin loses state.
+- **Escalation is one-way and sticky.** `escalateWorker` destroys the small
+  session BEFORE acquiring the standard one, so once it is entered there is no
+  session to fall back to. Both reason and outcome are closed sets:
+  `duckgres_exploratory_escalations_total{reason="state"|"oom"|"heuristic",
+  outcome="ok"|"canceled"|"capacity"|"draining"|"disabled"|"error"}` — every
+  ATTEMPT is counted, so a cluster that cannot escalate anything is
+  distinguishable from one nobody escalates on (v1 ships no heuristic tier; the
+  constant marks the hook point). The failure classes come from the CLASSIFIED
+  SQLSTATE via `server.AcquisitionFailureOutcome`, the same helper
+  `duckgres_session_activation_total{org,outcome}` uses — one helper, so the two
+  acquisition metrics can never drift into different or unbounded label sets.
+- **A failed acquisition — activation OR escalation — is CONNECTION-FATAL**
+  (the one exception is the post-escalation s3_cache re-apply, below).
+  `failWorkerAcquisition` sends a FATAL ErrorResponse, suppresses
+  ReadyForQuery, and unwinds the message loop; there is no session left to
+  resynchronize to. SQLSTATE comes from `escalationErrorSQLState`: a
+  `*server.SessionAcquireError` (classified by the CP with the SAME logic the
+  eager connect path uses, `sessionCreationErrorResponse`) is authoritative —
+  28000 disabled / 53300 capacity / 57P03 draining / 57014 cancel / 3D000
+  catalog / XX000 s3_cache apply / 53400 other; the substring fallback covers
+  only the paths that still return a plain error. Keep the client message the
+  classified one, never the wrapped internal chain. Extended-protocol handlers
+  are void, so the error is ALSO parked on `c.fatalErr`, which
+  `runExtendedQueryMessage` hands to the message loop. **`fatalErr` is one-shot
+  by construction** — it is set on the way out and never cleared, because the
+  connection is terminating; do not add a path that sets it and then continues.
+- **OOM re-execute is transparent only under all three conditions:** the
+  statement is a READ, ZERO DataRows have been sent, and `txStatus` is idle. A
+  wire stream cannot be restarted, so a partial result must surface the error
+  instead. RowDescription is NOT resent on the retry (same query, same engine
+  version → identical schema), and the retry runs on the escalated worker only.
+  Detection is `isWorkerOutOfMemoryError` (`server/conn_errors.go`) — DuckDB's
+  engine OOM only; a pod-level OOMKill is `ErrWorkerDead` and is deliberately
+  never re-executed.
+- **`duckgres.s3_cache` interplay (both directions).** A connect-time
+  `-c duckgres.s3_cache=...` cannot be applied at connect on this path (no
+  worker), so the CP parks it (`SetPendingS3CacheOption`) and
+  `ensureSessionActive` applies it AFTER installing the executor — applying it
+  inside the activator would find a nil executor, no-op the worker swap, and
+  still flip the session flag, the exact divergence `applyS3CacheSetting`
+  exists to prevent. A failed apply fails the activation (XX000, fatal). On
+  escalation the bypass is RE-APPLIED to the new worker
+  (`reapplyS3CacheAfterWorkerSwitch`); that failure is the ONE
+  non-connection-fatal escalation outcome, because the swap already succeeded:
+  the statement fails with a normal `ERROR` (XX000, naming the re-apply), the
+  session flag is reset to the worker's REAL transport (proxied — a fresh
+  session always starts on the cache proxy), the connection stays alive (a
+  ReadyForQuery on the simple protocol; Sync's on the extended one), and the
+  pin is deliberately NOT rolled back. `escalateWorker` tags it
+  `errS3CacheReapplyFailed` and `failEscalation` routes it — every call site
+  goes through that dispatcher so the two severities can never be confused at
+  one of them. **`SHOW` must never lie**: it activates iff an option is still
+  pending.
+- **Billing is largest-size-wins over the whole connection** (v1). The size is
+  stamped at activation and re-stamped at escalation with the target profile;
+  escalation only ever goes small→standard, so that stamp IS the maximum. The
+  pre-activation idle prefix bills at the first acquired size.
+- **Accepted gaps (do not "fix" silently — they are decisions):** per-org
+  connection admission and the vCPU lease now happen at the FIRST STATEMENT,
+  not at connect (the connect-time reshard/migration/draining gates are
+  unchanged); a one-shot per-user `kill` landing inside the switcher's
+  destroy→create window is missed, and so is a `kill` against a connection that
+  authenticated but has never activated (no session for
+  `DestroySessionsForUser` to iterate and no registered conn-closer until the
+  first statement) — `disable` covers BOTH, because the activation/escalation
+  re-check refuses the session outright (28000); extending `kill` to
+  authed-but-unactivated connections is a named follow-up, not implemented; and
+  a client that sends TCP FIN mid-activation does not abort the in-flight spawn
+  (the message loop is blocked in the acquire) — the completed worker parks
+  hot-idle for the org's next connection.
+- Touching classification, the pin hooks, activation, escalation, the OOM
+  retry, or the profile resolution → update `server/tier_classify_test.go`,
+  `server/conn_tier_test.go`, `server/conn_tier_exec_test.go`,
+  `server/conn_lazy_activation_test.go`, `server/s3_cache_test.go`,
+  `controlplane/session_activation_test.go`,
+  `controlplane/worker_profile_test.go`, `controlplane/compute_size_test.go`,
+  AND the `exploratory_tier` / `exploratory_lazy_activation` /
+  `exploratory_state_pin` / `exploratory_oom_escalation` /
+  `org_default_profile` / `sized_worker` (GUC bypass) / `assert_worker_pod`
+  assertions in `tests/mw-dev/e2e/harness.sh`. The harness header above
+  `exploratory_tier` records which existing assertions the tier's connect
+  semantics changed and why — keep that audit current.
+
 ## Worker Drain Protocol (graceful shutdown, #690)
 
 Remote worker pods drain on SIGTERM (pod deletion): they reject new work, keep
@@ -345,6 +476,15 @@ worker = session-scoped in effect. Invariants:
   `secretSwapMu` so the last write always matches the flag. (Without this, an
   hourly STS rotation silently re-enables the cache mid-benchmark — the
   inverse of the 2026-07-17 incident.)
+- **On an exploratory-tier connection the startup option is applied at
+  ACTIVATION, not at connect** (there is no worker at connect). The CP parks it
+  (`SetPendingS3CacheOption`) and `ensureSessionActive` applies it right after
+  installing the executor — never inside the activator, where the executor is
+  still nil and the swap would silently no-op while the session flag flipped. A
+  failed apply is a fatal `XX000` activation failure, and a tier escalation
+  re-applies the bypass on the new worker. `SHOW` activates iff an option is
+  still pending, so it can neither lie nor spend a pod needlessly. See the
+  Exploratory Worker Tier section.
 - **Closed enum, validated on every set path** (`transform.NormalizeS3Cache`):
   PostgreSQL boolean spellings, normalized to on/off; anything else is `22023`
   (simple/batched SET, extended Parse, and the startup option — which the CP
@@ -480,7 +620,13 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
 - **Per-user kill switch** (`live.go` routes + `admin_providers.go` +
   `session_mgr.go::DestroySessionsForUser` + `configstore` `disabled` column):
   - `POST …/users/:username/kill` is a **one-shot** terminate — it tears down all
-    of a user's sessions + in-flight queries but does NOT block reconnects.
+    of a user's sessions + in-flight queries but does NOT block reconnects. It
+    reaches only connections that HAVE a session: on the exploratory worker tier
+    a connection that authenticated but has not yet run its first statement has
+    no session (and no registered conn-closer) for `DestroySessionsForUser` to
+    iterate, so `kill` misses it. Only `disable` covers that connection — its
+    first statement's activation re-check refuses the session with 28000.
+    Extending `kill` to authed-but-unactivated connections is a follow-up.
   - `POST …/users/:username/disable` is the **persistent block**: it sets the
     `duckgres_org_users.disabled` column (goose migration
     `000011_add_org_user_disabled.sql`), kills the user's live sessions, AND

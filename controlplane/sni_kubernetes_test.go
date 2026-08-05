@@ -186,6 +186,11 @@ func (f *fakeConfigStore) OrgUsageTeamID(string, string) int64 {
 	// SNI tests don't exercise analytics team attribution.
 	return 0
 }
+func (f *fakeConfigStore) OrgUserSessionQueryAccess(string, string) (*configstore.OrgUserQueryAccess, string, bool) {
+	// SNI tests don't exercise the exploratory-tier escalation re-check; ok=true
+	// (unrestricted, enabled) is the non-interfering answer.
+	return nil, "rev", true
+}
 func newSNIControlPlane(store *fakeConfigStore) *ControlPlane {
 	return &ControlPlane{
 		cfg: ControlPlaneConfig{

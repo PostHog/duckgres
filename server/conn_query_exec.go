@@ -191,6 +191,19 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 			},
 		)
 	}
+	// Exploratory tier: a read that blew the small worker's memory_limit is
+	// transparently re-executed on a normal-size worker. Prepare phase only —
+	// nothing has been sent to the client yet, so the retry is invisible. Never
+	// inside a transaction: the new worker has none of its accumulated state.
+	// runQuery reads c.executor at call time, so it targets the new worker.
+	if err != nil && c.onExploratoryWorker && isWorkerOutOfMemoryError(err) && c.txStatus == txStatusIdle {
+		if escErr := c.escalateWorker(ctx, escalateReasonOOM); escErr != nil {
+			queryFinalErr = err
+			execSpan.End()
+			return 0, "", "", c.failEscalation(query, escErr, err.Error())
+		}
+		rows, err = runQuery()
+	}
 	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 	execSpan.End()
 	if err != nil {
@@ -243,6 +256,35 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 	_, sendSpan := observe.Tracer().Start(ctx, "duckgres.send_results")
 	defer sendSpan.End()
 
+	typeOIDs := make([]int32, len(colTypes))
+	for i, ct := range colTypes {
+		typeOIDs[i] = getTypeInfo(ct).OID
+	}
+
+	stream := c.streamSelectRows(rows, cols, colTypes, typeOIDs, true, nil, 0)
+
+	// Exploratory tier: an OOM raised before a SINGLE DataRow reached the
+	// client is still re-executable on a normal-size worker — all the client
+	// has seen is the RowDescription, which the identical query on the same
+	// engine reproduces exactly, so it is deliberately NOT resent. Once rows
+	// are out the door the error must surface: a retry cannot un-send them.
+	if stream.rowsErr != nil && stream.rowsSent == 0 &&
+		c.onExploratoryWorker && isWorkerOutOfMemoryError(stream.rowsErr) && c.txStatus == txStatusIdle {
+		oomErr := stream.rowsErr
+		_ = rows.Close()
+		if escErr := c.escalateWorker(ctx, escalateReasonOOM); escErr != nil {
+			queryFinalErr = oomErr
+			return 0, "", "", c.failEscalation(query, escErr, oomErr.Error())
+		}
+		retryRows, retryErr := runQuery()
+		if retryErr != nil {
+			stream.rowsErr = retryErr
+		} else {
+			defer func() { _ = retryRows.Close() }()
+			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false, nil, 0)
+		}
+	}
+
 	// Mid-stream wire-write failures (sendRowDescription / sendDataRowWithFormats)
 	// surface a broken socket — typically the AWS NLB tearing down a stalled
 	// connection, or the kernel collapsing the socket after TCP_USER_TIMEOUT.
@@ -250,53 +292,32 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 	// router fires Error-level "Query execution errored." for alerts.
 	// Pre-fix the only signal was Info-level "Worker statement finished." from the
 	// deferred lifecycle log, which silently disappears below alerting.
-	if err := c.sendRowDescription(cols, colTypes); err != nil {
-		queryFinalErr = err
-		if !c.isCallerCancellation(err) {
-			c.logQueryError(query, fmt.Errorf("pgwire client write failed sending row description: %w", err))
+	if stream.writeErr != nil {
+		queryFinalErr = stream.writeErr
+		if !c.isCallerCancellation(stream.writeErr) {
+			c.logQueryError(query, fmt.Errorf("pgwire client write failed %s: %w", stream.writeStage, stream.writeErr))
 		}
-		return 0, "", "", err
+		return 0, "", "", stream.writeErr
 	}
 
-	typeOIDs := make([]int32, len(colTypes))
-	for i, ct := range colTypes {
-		typeOIDs[i] = getTypeInfo(ct).OID
+	if stream.scanErr != nil {
+		queryFinalErr = stream.scanErr
+		errCode := "42000"
+		errMsg := stream.scanErr.Error()
+		if !c.isCallerCancellation(stream.scanErr) {
+			c.logQueryError(query, stream.scanErr)
+		}
+		c.sendError("ERROR", errCode, errMsg)
+		c.setTxError()
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return 0, errCode, errMsg, nil
 	}
 
-	rowCount := 0
-	for rows.Next() {
-		values := make([]interface{}, len(cols))
-		valuePtrs := make([]interface{}, len(cols))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			queryFinalErr = err
-			errCode := "42000"
-			errMsg := err.Error()
-			if !c.isCallerCancellation(err) {
-				c.logQueryError(query, err)
-			}
-			c.sendError("ERROR", errCode, errMsg)
-			c.setTxError()
-			_ = c.writeReadyForQuery(c.txStatus)
-			_ = c.flushWriter()
-			return 0, errCode, errMsg, nil
-		}
-
-		if err := c.sendDataRowWithFormats(values, nil, typeOIDs); err != nil {
-			queryFinalErr = err
-			if !c.isCallerCancellation(err) {
-				c.logQueryError(query, fmt.Errorf("pgwire client write failed during result streaming: %w", err))
-			}
-			return 0, "", "", err
-		}
-		rowCount++
-	}
+	rowCount := stream.rowsSent
 	queryRowsAff = int64(rowCount)
 
-	if err := rows.Err(); err != nil {
+	if err := stream.rowsErr; err != nil {
 		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
@@ -319,6 +340,68 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 	_ = c.writeReadyForQuery(c.txStatus)
 	_ = c.flushWriter()
 	return int64(rowCount), "", "", nil
+}
+
+// selectStream is the outcome of streaming one result set to the client.
+// Exactly one of scanErr / rowsErr / writeErr is non-nil (or none of them, on
+// a clean stream): the three failure modes are kept apart because the caller
+// answers them differently — a Scan failure is always 42000 with rowCount
+// suppressed, a terminal RowSet error maps a caller cancellation to 57014, and
+// a client-write failure is a connection error with no ErrorResponse at all.
+type selectStream struct {
+	rowsSent int
+	scanErr  error
+	rowsErr  error
+	// writeErr is the RAW pgwire write error (returned to the caller
+	// unwrapped, as before); writeStage names where it happened so the caller
+	// can reproduce the exact log wording.
+	writeErr   error
+	writeStage string
+}
+
+// streamSelectRows sends (optionally) the RowDescription and then every DataRow
+// of rows. Extracted from executeSelectQuery so the exploratory tier can retry
+// a zero-row OOM stream on the escalated worker WITHOUT resending
+// RowDescription — pass sendRowDesc=false on such a retry.
+//
+// formats are the Bind result-format codes (nil = all text, the simple-query
+// case). maxRows > 0 caps the DataRows sent, for the extended protocol's
+// Execute row limit; portal suspension is not implemented, so the row already
+// fetched when the cap is reached is dropped, and rows.Err() is still consulted
+// by the caller exactly as on a fully drained stream.
+func (c *clientConn) streamSelectRows(rows RowSet, cols []string, colTypes []ColumnTyper, typeOIDs []int32, sendRowDesc bool, formats []int16, maxRows int32) selectStream {
+	if sendRowDesc {
+		if err := c.sendRowDescription(cols, colTypes); err != nil {
+			return selectStream{writeErr: err, writeStage: "sending row description"}
+		}
+	}
+
+	var out selectStream
+	for rows.Next() {
+		if maxRows > 0 && int32(out.rowsSent) >= maxRows {
+			break
+		}
+
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			out.scanErr = err
+			return out
+		}
+
+		if err := c.sendDataRowWithFormats(values, formats, typeOIDs); err != nil {
+			out.writeErr = err
+			out.writeStage = "during result streaming"
+			return out
+		}
+		out.rowsSent++
+	}
+	out.rowsErr = rows.Err()
+	return out
 }
 
 // handleMultiStatementQuery processes multiple semicolon-separated statements
@@ -390,6 +473,15 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	if parseErr == nil && len(tree.Stmts) == 1 {
 		switch s := tree.Stmts[0].Stmt.Node.(type) {
 		case *pg_query.Node_DeclareCursorStmt:
+			// Same contract as the single-statement DECLARE in handleQuery:
+			// this case returns before the batch hook below, so without this
+			// a batched `DECLARE …; FETCH …` would open the cursor's RowSet on
+			// the exploratory worker and a later pinning statement would
+			// strand it. FETCH/CLOSE below need no hook — an open cursor
+			// proves its DECLARE already pinned the connection.
+			if err := c.escalateForPinningStatement(query); err != nil {
+				return false, err
+			}
 			innerSQL := deparseInnerQuery(s.DeclareCursorStmt.Query)
 			if innerSQL == "" {
 				c.sendError("ERROR", "42601", "could not deparse cursor query")
@@ -534,6 +626,12 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	}
 
 	if result.FallbackToNative {
+		// Lazy activation before the engine-touching validate, same contract as
+		// the matching site in handleQuery: a parse failure classifies as
+		// pinning, so this is the single acquire for the statement.
+		if err := c.activateForStatement(query, true); err != nil {
+			return false, err
+		}
 		if err := c.validateWithDuckDB(query); err != nil {
 			// Not necessarily a syntax error: a parseable native query (e.g.
 			// `DESCRIBE x.y.z`) can fail validation with a real catalog/binder
@@ -568,6 +666,11 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	// applied via the worker transport swap. A failed swap aborts the rest of
 	// the batch — later statements may depend on the requested cache state.
 	if result.S3CacheSet != nil {
+		// Lazy activation: the swap needs a worker to apply to (see the matching
+		// site in handleQuery). Not pinning, so the exploratory tier is enough.
+		if err := c.activateForStatement(query, false); err != nil {
+			return false, err
+		}
 		if err := c.applyS3CacheSetting(*result.S3CacheSet); err != nil {
 			c.sendError("ERROR", "XX000", err.Error())
 			return true, nil
@@ -576,6 +679,11 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return false, nil
 	}
 	if result.S3CacheShow {
+		// Lazy activation before answering, only if a connect-time option is
+		// still pending: see the matching site in handleQuery.
+		if err := c.activateForS3CacheShow(query); err != nil {
+			return false, err
+		}
 		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
 		_ = c.writeCommandComplete("SHOW")
@@ -596,6 +704,14 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 	if len(result.Statements) > 0 {
 		c.sendError("ERROR", "0A000", "writable CTEs not supported in multi-statement queries")
 		return true, nil
+	}
+
+	// Exploratory tier: batches re-classify per statement, so a pinning
+	// statement anywhere in a batch escalates before it runs. Same contract as
+	// the single-statement path in handleQuery: a failed escalation is
+	// connection-fatal and aborts the rest of the batch.
+	if err := c.escalateForPinningStatement(query); err != nil {
+		return false, err
 	}
 
 	executedQuery := c.rewriteDirectQuery(result.SQL)
