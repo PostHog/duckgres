@@ -110,6 +110,37 @@ type portal struct {
 	paramFormats  []int16 // 0=text, 1=binary for each parameter
 	resultFormats []int16
 	described     bool // true if Describe was called on this portal
+
+	// openRows is the live result set of a SELECT portal that was suspended
+	// by a previous Execute's max_rows cap (PortalSuspended sent instead of
+	// CommandComplete). Non-nil means "resume this on the next Execute"
+	// rather than re-running the query, which would restart from row 0 and
+	// duplicate everything already sent. Cleared (and the RowSet closed) once
+	// the result set drains, errors, or the portal/statement is Closed.
+	openRows     RowSet
+	openCols     []string
+	openColTypes []ColumnTyper
+	openTypeOIDs []int32
+	// openRowsSent is the cumulative row count sent across all Executes of
+	// this portal, for the final CommandComplete tag.
+	openRowsSent int64
+}
+
+// closeOpenRows releases a suspended portal's live result set, if any. Safe
+// to call on a portal that was never suspended.
+func (p *portal) closeOpenRows() {
+	if p.openRows != nil {
+		_ = p.openRows.Close()
+		p.openRows = nil
+	}
+}
+
+// closeAllOpenPortalRows releases every suspended portal's live result set on
+// connection teardown, mirroring closeAllCursors.
+func (c *clientConn) closeAllOpenPortalRows() {
+	for _, p := range c.portals {
+		p.closeOpenRows()
+	}
 }
 
 // decodeParams converts raw parameter bytes to Go values based on format codes.
@@ -960,14 +991,16 @@ func (c *clientConn) serve() error {
 			stopRefresh = StartCredentialRefresh(db, c.server.cfg.DuckLake)
 		}
 	}
-	// Defers run LIFO: close cursors first (they hold open RowSets), then stop
-	// credential refresh, then clean up the database connection.
+	// Defers run LIFO: close cursors and suspended portals first (they hold
+	// open RowSets), then stop credential refresh, then clean up the database
+	// connection.
 	defer func() {
 		if c.executor != nil {
 			c.safeCleanupDB()
 		}
 	}()
 	defer c.closeAllCursors()
+	defer c.closeAllOpenPortalRows()
 	defer func() {
 		if stopRefresh != nil {
 			stopRefresh()

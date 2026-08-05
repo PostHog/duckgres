@@ -588,6 +588,17 @@ func (c *clientConn) writeCommandComplete(tag string) error {
 	return nil
 }
 
+func (c *clientConn) writePortalSuspended() error {
+	if err := wire.WritePortalSuspended(c.writer); err != nil {
+		c.markActiveQueryMetricsError(err)
+		return err
+	}
+	if c.activeQueryMetrics != nil {
+		return c.flushWriter()
+	}
+	return nil
+}
+
 func (c *clientConn) writeReadyForQuery(txStatus byte) error {
 	if err := wire.WriteReadyForQuery(c.writer, txStatus); err != nil {
 		c.markActiveQueryMetricsError(err)

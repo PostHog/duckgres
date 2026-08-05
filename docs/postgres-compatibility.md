@@ -164,6 +164,7 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 | Simple query | ✅ | `protocol_test.go::TestProtocolSimpleQuery` | |
 | Extended query (Parse/Bind/Describe/Execute/Sync) | ✅ | `protocol_test.go::TestProtocolExtendedQuery`; server `conn_bind_test.go`, `conn_describe_test.go` | |
 | Extended-query error recovery (skip-until-Sync, pipelining) | ✅ | server `conn_skip_until_sync_test.go`; clients `clients_test.go::TestExtendedQueryErrorHandling` | #718 |
+| Execute row limit (`max_rows`) / `PortalSuspended` | ✅ | server `conn_extended_query_portal_suspend_test.go::TestHandleExecutePortalSuspendedResumesWithoutLosingOrDuplicatingRows` | A client Execute with a non-zero `max_rows` (a BI tool / driver fetch size) sends `PortalSuspended` when the cap is hit before the result set is exhausted, and the portal's `RowSet` stays open so the next Execute resumes rather than restarting. Previously the server silently capped the stream and reported `CommandComplete`, truncating results with no error. |
 | Prepared statements (PREPARE/EXECUTE, reuse, NULL, 20+ params) | ✅ | `edge_cases_test.go::TestPreparedStatementEdgeCases`; clients `::TestPreparedStatements` | |
 | Binary vs text result format | ✅ | `protocol_test.go::TestProtocolDataTypes`; clients `::TestPgxBinaryFormatResults`; server `types_test.go` encode/decode | |
 | Row description metadata | ✅ | `protocol_test.go::TestProtocolRowDescription` | |
