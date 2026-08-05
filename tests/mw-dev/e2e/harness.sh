@@ -135,11 +135,15 @@ READY_TIMEOUT="${READY_TIMEOUT:-1200}"
 # without masking a genuinely missing worker forever.
 WORKER_INSPECTION_ATTEMPTS=30
 
-# The bundled extensions MUST be the PostHog forks. These are the short commit
-# SHAs duckdb_extensions() reports for the tags the image pins
+# The bundled engine and extensions MUST be the PostHog forks. The extension
+# SHAs are what duckdb_extensions() reports for the tags the image pins
 # (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7, HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry).
-# If the image accidentally ships upstream, the version differs and we fail.
+# The engine itself is the PostHog/duckdb patchline build: library_version
+# stays v1.5.5 (extension resolution), while source_id identifies the
+# patchline commit (posthog/v1.5.5 prefetch-accounting patch).
+# If the image accidentally ships upstream, the version/source differs and we fail.
 EXPECT_DUCKDB_VERSION="v1.5.5"
+EXPECT_DUCKDB_SOURCE_ID="911c1d6428"
 EXPECT_DUCKLAKE_SHA="6768849c"
 EXPECT_HTTPFS_SHA="575da0b"
 
@@ -1079,6 +1083,12 @@ assert_fork_extensions() { # org password
     "SELECT library_version FROM pragma_version()")"
   [ "$engine" = "$EXPECT_DUCKDB_VERSION" ] || \
     fail "DuckDB library version '$engine' != '$EXPECT_DUCKDB_VERSION'"
+  source_id="$(pg "$1" "$2" ducklake \
+    "SELECT source_id FROM pragma_version()")"
+  case "$source_id" in
+    "$EXPECT_DUCKDB_SOURCE_ID"*) ;;
+    *) fail "DuckDB source_id '$source_id' does not start with patchline commit '$EXPECT_DUCKDB_SOURCE_ID' (upstream engine?)" ;;
+  esac
   dl="$(pg "$1" "$2" ducklake \
     "SELECT extension_version FROM duckdb_extensions() WHERE extension_name='ducklake' AND loaded")"
   [ "$dl" = "$EXPECT_DUCKLAKE_SHA" ] || \

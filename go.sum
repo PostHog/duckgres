@@ -1,5 +1,9 @@
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
+github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.1 h1:tNEwT0I3opiyExELmRWDMqog4y8QMULw9Y4sfPRoV0w=
+github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.1/go.mod h1:si4fhkU5nVX82UqieuHih5FkAIzbHQaJCxJ6BITL4U8=
+github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.1 h1:vuaMkqfPSQ7RuSwtCOYKQVbK4F5L37qrzr1P3XGS02s=
+github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.1/go.mod h1:MSpni+1dJdPoTQjbn+H702kD1iVveoQ6qWDdshBn140=
 github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
 github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/apache/arrow-go/v18 v18.5.1 h1:yaQ6zxMGgf9YCYw4/oaeOU3AULySDlAYDOcnr4LdHdI=
@@ -73,10 +77,6 @@ github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.10505.0 h1:FrMqquFBQlMs
 github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.10505.0/go.mod h1:EnAvZh1kNJHp5yF+M1ZHNEvapnmt6anq1xXHVrAGqMo=
 github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10505.0 h1:lbRbpQwT1MmUhh/VTwukV9K8bxKByV3UghAP3MvsbBo=
 github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10505.0/go.mod h1:IGLSeEcFhNeZF16aVjQCULD7TsFZKG5G7SyKJAXKp5c=
-github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.10505.0 h1:nrsaVYj3XYCRbS2FpdOMD/KHE7egRMr+/NR1IHmjT84=
-github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.10505.0/go.mod h1:KAIynZ0GHCS7X5fRyuFnQMg/SZBPK/bS9OCOVojClxw=
-github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.10505.0 h1:qM6oGDgwXBILJGbTY4fCy6QOczLpucUA6yn6g3ORjh4=
-github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.10505.0/go.mod h1:81SGOYoEUs8qaAfSk1wRfM5oobrIJ5KI7AzYhK6/bvQ=
 github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.10505.0 h1:DjqZl9rYreHkSOqnqLmkrqH5T8UdQNcxZLJVZzGmXXA=
 github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.10505.0/go.mod h1:K25pJL26ARblGDeuAkrdblFvUen92+CwksLtPEHRqqQ=
 github.com/duckdb/duckdb-go/v2 v2.10505.0 h1:SWwvLn2Qx/RQSnQNupwgIF8VbnJ5A6OQU9lYb/mDETI=
