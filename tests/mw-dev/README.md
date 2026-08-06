@@ -348,6 +348,13 @@ normal `go test ./...` lane.
   events), `controlplane/provisioner/controller_analytics_test.go` (the
   terminal `_success`/`_failed` events the provisioner controller emits on the
   Ready/Failed/Deleted transitions), and `server/conn_analytics_test.go`.
+  The same applies to WHICH exporter a given key enables: `POSTHOG_API_KEY`
+  turns on analytics *and* the OTLP log export, while
+  `POSTHOG_ANALYTICS_API_KEY` turns on analytics alone (so query text is not
+  exported). Confirming that split end-to-end means reading both PostHog Logs
+  and the event stream back, which the Job cannot do for the reason above; the
+  key resolution is covered by `TestAnalyticsAPIKeyPrefersDedicatedKey` in
+  `internal/cliboot/analytics_test.go`.
 
 ## Isolation model
 
