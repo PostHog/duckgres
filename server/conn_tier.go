@@ -211,6 +211,11 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	c.workerID = workerID
 	c.workerPod = workerPod
 	c.onExploratoryWorker = false
+	// The switcher destroyed the previous session, so any suspended portal's
+	// open rowset died with it. Destroy those portals now: a later Execute on
+	// one gets an honest 34000 instead of a dangling rowset (or, worse, a
+	// silent from-row-0 re-run presented as a continuation).
+	c.closeSuspendedPortals()
 	exploratoryEscalationsTotal.WithLabelValues(reason, AcquisitionOutcomeOK).Inc()
 	c.logger().Info("Escalated connection off exploratory worker.", "reason", reason, "worker", workerID, "worker_pod", workerPod)
 	// The `duckgres.s3_cache` bypass is worker-side state, and the new session

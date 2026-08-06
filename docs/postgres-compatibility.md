@@ -163,6 +163,7 @@ Operational guidance: allow the import to complete, then manually deduplicate af
 |---------|--------|---------|-------|
 | Simple query | ✅ | `protocol_test.go::TestProtocolSimpleQuery` | |
 | Extended query (Parse/Bind/Describe/Execute/Sync) | ✅ | `protocol_test.go::TestProtocolExtendedQuery`; server `conn_bind_test.go`, `conn_describe_test.go` | |
+| Portal suspension (Execute row limit / PortalSuspended) | ✅ | `portal_suspension_test.go::TestPortalSuspensionPaging` (raw-frontend paging); server `conn_portal_suspension_test.go` | Paging clients (JDBC `setFetchSize`, Hex) resume with repeat Execute; the query runs once. Suspended portals are destroyed at transaction end (PostgreSQL parity + the same single-connection liveness rule as cursors). Pre-fix, the first page was answered with CommandComplete — silent truncation at the client's page size |
 | Extended-query error recovery (skip-until-Sync, pipelining) | ✅ | server `conn_skip_until_sync_test.go`; clients `clients_test.go::TestExtendedQueryErrorHandling` | #718 |
 | Prepared statements (PREPARE/EXECUTE, reuse, NULL, 20+ params) | ✅ | `edge_cases_test.go::TestPreparedStatementEdgeCases`; clients `::TestPreparedStatements` | |
 | Binary vs text result format | ✅ | `protocol_test.go::TestProtocolDataTypes`; clients `::TestPgxBinaryFormatResults`; server `types_test.go` encode/decode | |

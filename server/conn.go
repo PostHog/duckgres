@@ -110,6 +110,36 @@ type portal struct {
 	paramFormats  []int16 // 0=text, 1=binary for each parameter
 	resultFormats []int16
 	described     bool // true if Describe was called on this portal
+	// exec is set while the portal is suspended: Execute hit its row limit
+	// (PortalSuspended sent) with the result set unexhausted. The next
+	// Execute on this portal resumes streaming from exec.rows instead of
+	// re-running the query.
+	exec *portalExec
+}
+
+// portalExec is the streaming state of a suspended portal: the still-open
+// RowSet positioned after the last row sent, plus what the resuming Execute
+// and the completion query-log entry need.
+type portalExec struct {
+	rows           RowSet
+	cols           []string
+	typeOIDs       []int32
+	cmdType        string
+	rowCount       int64 // cumulative rows streamed across Execute legs
+	originalQuery  string
+	convertedQuery string
+	start          time.Time // first Execute leg's start, so the query log spans all legs
+}
+
+// closeExec releases a suspended portal's open rowset (if any). Must be
+// called before the portal is discarded or its query re-run: the open rowset
+// pins the session's single DuckDB connection (see closeCursorsAtTxEnd).
+func (p *portal) closeExec() {
+	if p.exec == nil {
+		return
+	}
+	_ = p.exec.rows.Close()
+	p.exec = nil
 }
 
 // decodeParams converts raw parameter bytes to Go values based on format codes.
@@ -968,6 +998,7 @@ func (c *clientConn) serve() error {
 		}
 	}()
 	defer c.closeAllCursors()
+	defer c.closeSuspendedPortals()
 	defer func() {
 		if stopRefresh != nil {
 			stopRefresh()
@@ -2447,6 +2478,7 @@ func (c *clientConn) updateTxStatus(cmdType string) {
 	case "COMMIT", "ROLLBACK":
 		c.txStatus = txStatusIdle
 		c.closeAllCursors()
+		c.closeSuspendedPortals()
 	}
 	// For other commands, keep the current status
 }
