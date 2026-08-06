@@ -234,6 +234,18 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 		}
 	}
 
+	// Worker pods get an explicitly-constructed env list (this function), not
+	// a copy of the CP's own env, so any flag the worker reads at startup
+	// (here: configresolve's DisableParquetPrefetching, applied in
+	// applyParquetPrefetchPolicy) must be mirrored through explicitly or
+	// setting it on the CP deployment silently does nothing on workers.
+	if os.Getenv("DUCKGRES_DISABLE_PARQUET_PREFETCHING") == "true" {
+		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
+			Name:  "DUCKGRES_DISABLE_PARQUET_PREFETCHING",
+			Value: "true",
+		})
+	}
+
 	// Add toleration if configured.
 	tolKey, tolValue := p.workerTolerationKey, p.workerTolerationValue
 	if tolKey != "" {
