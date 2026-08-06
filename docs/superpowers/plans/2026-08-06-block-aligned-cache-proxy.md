@@ -898,8 +898,9 @@ git commit -m "test(cache-proxy): peer round-trip covers block-format keys"
 
 ### Task 6: mw-dev rollout + drift validation
 
-**Files:**
-- Modify: `tests/mw-dev/manifests.tmpl.yaml` (cache-proxy DaemonSet env)
+**Correction (found during execution):** the cache-proxy DaemonSet is NOT defined in this repo — `tests/mw-dev/manifests.tmpl.yaml` only holds the per-PR e2e stack, and the DaemonSet deploys from the charts/cloud-infra repo for mw-dev and prod alike. Step 1's env change happens there; this repo ships only the image (`.github/workflows/container-image-cache-proxy-cd.yml`).
+
+**Files:** none here — Step 1 lands in the charts/cloud-infra repo.
 
 - [ ] **Step 1: Add env to the mw-dev cache-proxy DaemonSet spec**
 
