@@ -21,7 +21,7 @@ var (
 	blockFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cache_proxy_block_fallback_total",
 		Help: "Requests that fell back to the legacy exact-range path, by reason",
-	}, []string{"reason"}) // range_shape, entry_vanished, config
+	}, []string{"reason"}) // no_range, range_shape, entry_vanished, config
 	blockReadsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cache_proxy_block_reads_total",
 		Help: "Blocks resolved while assembling responses, by source",
@@ -68,6 +68,18 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 		return &originStatusError{status: resp.StatusCode, headers: resp.Header.Clone(), body: body}
 	}
 
+	// This function always sends a Range header, so anything other than 206
+	// means the origin ignored it and is sending the full object from byte 0
+	// (e.g. a proxy/CDN in front of origin stripping Range, or an origin that
+	// doesn't support it). Storing that body under this span's block keys
+	// would put object-offset-0 bytes into blocks tagged with firstIdx..lastIdx
+	// — every read of those blocks would silently return the wrong bytes, and
+	// since blocks are treated as immutable once cached, the corruption would
+	// never self-heal. Fail closed instead.
+	if resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("origin ignored Range (status %d): refusing to cache misaligned blocks", resp.StatusCode)
+	}
+
 	for idx := firstIdx; idx <= lastIdx; idx++ {
 		size, err := p.store.PutStream(BlockKey(r.URL.String(), idx, blockSize), io.LimitReader(resp.Body, blockSize))
 		if err != nil {
@@ -93,6 +105,10 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	// blockSpan or loop forever in flushRun's `lo += p.maxSpanBlocks`.
 	if p.blockSize <= 0 || p.maxSpanBlocks <= 0 {
 		blockFallbackTotal.WithLabelValues("config").Inc()
+		return false
+	}
+	if rangeHeader == "" {
+		blockFallbackTotal.WithLabelValues("no_range").Inc()
 		return false
 	}
 	start, end, ok := parseAbsoluteRange(rangeHeader)
@@ -238,6 +254,18 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		blockStart := idx * p.blockSize
 		skip := max(0, start-blockStart)
 		want := min(size-skip, end-blockStart+1-skip, total-served)
+		if want <= 0 {
+			// start lies past the end of this block (a short cached tail
+			// block whose object EOF falls before the requested start).
+			// io.CopyN silently no-ops on a non-positive n instead of erroring,
+			// so without this guard the loop would fall through the "n < want"
+			// short-body check below and produce a truncated 206 instead of
+			// failing closed.
+			_ = reader.Close()
+			slog.Warn("Computed zero-or-negative want for block; aborting response.",
+				"url", urlStr, "block", idx, "start", start, "block_start", blockStart, "size", size)
+			return true
+		}
 		if skip > 0 {
 			_, _ = io.CopyN(io.Discard, reader, skip)
 		}
