@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -218,5 +219,162 @@ func TestServeBlockAlignedSpansChunkedByMaxSpan(t *testing.T) {
 	doBlockRequest(t, p, origin.URL+"/bucket/f.parquet", "bytes=0-20479")
 	if len(originRanges) != 5 {
 		t.Fatalf("origin fetches: %d, want 5 (got %v)", len(originRanges), originRanges)
+	}
+}
+
+// TestServeBlockAlignedPeerFillCountsAsHit exercises the previously-untested
+// peer branch of Phase 1: a block resolvable from a peer must never touch
+// origin, must land under blockReadsTotal{peer} / cacheBytesServed{peer}, and
+// (having triggered zero origin fetches) must count as a cache hit, not a
+// miss — the same "hit" meaning the legacy path uses.
+func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 4*blockSize)
+	target := origin.URL + "/bucket/f.parquet"
+
+	blockData := make([]byte, blockSize)
+	for i := range blockData {
+		blockData[i] = byte(i % 251)
+	}
+	key := BlockKey(target, 0, blockSize)
+	var hasCalls, getCalls int32
+	peerAddr := newPeerServer(t, key, blockData, &hasCalls, &getCalls)
+
+	origin.Close() // the block is fully resolvable from the peer; origin must never be touched
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{peerAddr}), []string{})
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+
+	hitsBefore := counterValue(t, cacheHitsTotal)
+	missesBefore := counterValue(t, cacheMissesTotal)
+	peerReadsBefore := counterValue(t, blockReadsTotal.WithLabelValues("peer"))
+	peerBytesBefore := counterValue(t, cacheBytesServed.WithLabelValues("peer"))
+
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status %d, want 206", w.Code)
+	}
+	if got := w.Body.Bytes(); string(got) != string(blockData[:100]) {
+		t.Fatalf("body mismatch: got %d bytes", len(got))
+	}
+	if atomic.LoadInt32(&getCalls) != 1 {
+		t.Fatalf("peer /cache/get calls = %d, want 1", getCalls)
+	}
+
+	if got := counterValue(t, cacheHitsTotal); got != hitsBefore+1 {
+		t.Fatalf("cacheHitsTotal delta = %v, want 1 (peer fill with zero origin fetches must count as a hit)", got-hitsBefore)
+	}
+	if got := counterValue(t, cacheMissesTotal); got != missesBefore {
+		t.Fatalf("cacheMissesTotal delta = %v, want 0", got-missesBefore)
+	}
+	if got := counterValue(t, blockReadsTotal.WithLabelValues("peer")); got != peerReadsBefore+1 {
+		t.Fatalf("blockReadsTotal{peer} delta = %v, want 1", got-peerReadsBefore)
+	}
+	if got := counterValue(t, cacheBytesServed.WithLabelValues("peer")); got != peerBytesBefore+100 {
+		t.Fatalf("cacheBytesServed{peer} delta = %v, want 100 (sourceLabel must resolve to peer when no origin fetch happened)", got-peerBytesBefore)
+	}
+}
+
+// TestServeBlockAlignedFailsClosedWhenBlockStillMissingAfterReverify covers
+// the Phase 1.5 presence-verification backstop: Phase 1's coalesced origin
+// fetch can return success (nil error) while still leaving a trailing block
+// uncommitted — a real object-shorter-than-requested EOF is one legitimate
+// way this happens (see fetchOriginSpan's "clean EOF is not an error"
+// comment). The one direct re-fetch attempt of that residual block is made
+// to fail here too, so the block is still missing afterward; the request
+// must fail closed with a 502 before any header is written, not serve a
+// corrupt short body.
+func TestServeBlockAlignedFailsClosedWhenBlockStillMissingAfterReverify(t *testing.T) {
+	const blockSize = 1024
+	const objSize = int64(2*blockSize + 100) // true tail is block 2; block 3 doesn't exist
+	body := make([]byte, objSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+
+	var callCount int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&callCount, 1) == 1 {
+			// Phase 1's single coalesced fetch: origin honestly reports its
+			// true (short) length, like S3 clamping a range past EOF.
+			// fetchOriginSpan stores the short tail and returns success —
+			// leaving block 3 uncommitted even though this call "succeeded".
+			start, end, _ := parseAbsoluteRange(r.Header.Get("Range"))
+			if end >= objSize {
+				end = objSize - 1
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, objSize))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[start : end+1])
+			return
+		}
+		// Phase 1.5's direct re-fetch of the residual block: fail outright so
+		// the block is still missing after the one retry attempt.
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer origin.Close()
+
+	p, _ := newBlockProxy(t, origin, blockSize)
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
+		Header: http.Header{"Range": []string{"bytes=0-4095"}}}
+	req = req.WithContext(context.Background())
+	w := httptest.NewRecorder()
+
+	if !p.serveBlockAligned(w, req, "bytes=0-4095") {
+		t.Fatal("expected serveBlockAligned to handle the request (not fall back)")
+	}
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	if got := w.Header().Get("Content-Range"); got != "" {
+		t.Fatalf("Content-Range = %q, want unset: headers must not be committed before the 502", got)
+	}
+	if atomic.LoadInt32(&callCount) != 2 {
+		t.Fatalf("origin calls = %d, want 2 (phase 1 fetch + one phase 1.5 re-fetch attempt)", callCount)
+	}
+}
+
+// TestServeBlockAlignedRejectsDegenerateConfig guards the infinite-loop /
+// divide-by-zero hazard: if blockSize or maxSpanBlocks is left at its zero
+// value (e.g. Task 4's wiring is skipped), serveBlockAligned must fall back
+// to the legacy path rather than hang or panic.
+func TestServeBlockAlignedRejectsDegenerateConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		blockSize     int64
+		maxSpanBlocks int64
+	}{
+		{"zero block size", 0, 8},
+		{"negative block size", -1, 8},
+		{"zero max span blocks", 1024, 0},
+		{"negative max span blocks", 1024, -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origin := originServer(t, 4096)
+			defer origin.Close()
+			store, err := NewDiskCache(t.TempDir(), 80)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := NewCacheProxy(store, nil, []string{})
+			p.client = origin.Client()
+			p.blockSize = tt.blockSize
+			p.maxSpanBlocks = tt.maxSpanBlocks
+
+			u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+			req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
+				Header: http.Header{"Range": []string{"bytes=0-100"}}}
+			req = req.WithContext(context.Background())
+			if p.serveBlockAligned(httptest.NewRecorder(), req, "bytes=0-100") {
+				t.Fatal("expected false (legacy fallback) for degenerate config")
+			}
+		})
 	}
 }
