@@ -54,6 +54,14 @@ type CacheProxy struct {
 	// traffic worth caching. Requests whose Host doesn't contain any of these
 	// are passed through without caching.
 	cacheHostSuffixes []string
+
+	// blockMode, blockSize, and maxSpanBlocks configure the block-aligned
+	// serve path (serveBlockAligned): whether it's active, the fixed block
+	// size in bytes, and the max number of blocks coalesced into one origin
+	// fetch. Wired to HandleProxy in a later task.
+	blockMode     bool
+	blockSize     int64
+	maxSpanBlocks int64
 }
 
 // fetchResult describes a body that fetchDedup has materialized onto local

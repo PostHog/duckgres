@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -114,5 +115,108 @@ func TestFetchOriginSpanSendsBlockAlignedRange(t *testing.T) {
 	}
 	if strings.Contains(gotRange, "1500") {
 		t.Fatal("client range leaked to origin")
+	}
+}
+
+func newBlockProxy(t *testing.T, origin *httptest.Server, blockSize int64) (*CacheProxy, *DiskCache) {
+	t.Helper()
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, nil, []string{})
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	return p, store
+}
+
+func doBlockRequest(t *testing.T, p *CacheProxy, rawURL, rangeHeader string) *httptest.ResponseRecorder {
+	t.Helper()
+	u, _ := url.Parse(rawURL)
+	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
+		Header: http.Header{"Range": []string{rangeHeader}}}
+	req = req.WithContext(context.Background())
+	w := httptest.NewRecorder()
+	if !p.serveBlockAligned(w, req, rangeHeader) {
+		t.Fatalf("serveBlockAligned returned false for %q", rangeHeader)
+	}
+	return w
+}
+
+func TestServeBlockAlignedColdThenWarm(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 10*blockSize)
+	defer origin.Close()
+	p, store := newBlockProxy(t, origin, blockSize)
+	target := origin.URL + "/bucket/f.parquet"
+
+	// Cold: range crossing blocks 1-3.
+	w := doBlockRequest(t, p, target, "bytes=1500-3500")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status %d, want 206", w.Code)
+	}
+	body := w.Body.Bytes()
+	if int64(len(body)) != 2001 {
+		t.Fatalf("body length %d, want 2001", len(body))
+	}
+	for i, b := range body {
+		if want := byte((1500 + i) % 251); b != want {
+			t.Fatalf("byte %d: got %d, want %d", i, b, want)
+		}
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes 1500-3500/2001" {
+		t.Fatalf("Content-Range %q; want legacy served-size shape %q", got, "bytes 1500-3500/2001")
+	}
+
+	// Warm with a DIFFERENT range over the same bytes (the drift scenario):
+	// must be served entirely from stored blocks — origin must not be touched.
+	origin.Close() // any origin fetch now fails the request
+	w2 := doBlockRequest(t, p, target, "bytes=1400-3400")
+	if w2.Code != http.StatusPartialContent || w2.Body.Len() != 2001 {
+		t.Fatalf("drifted warm read failed: status %d len %d", w2.Code, w2.Body.Len())
+	}
+	_ = store
+}
+
+func TestServeBlockAlignedFallsBackOnRangeShape(t *testing.T) {
+	origin := originServer(t, 4096)
+	defer origin.Close()
+	p, _ := newBlockProxy(t, origin, 1024)
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
+		Header: http.Header{"Range": []string{"bytes=-500"}}}
+	req = req.WithContext(context.Background())
+	if p.serveBlockAligned(httptest.NewRecorder(), req, "bytes=-500") {
+		t.Fatal("suffix range must return false (legacy fallback)")
+	}
+}
+
+func TestServeBlockAlignedSpansChunkedByMaxSpan(t *testing.T) {
+	const blockSize = 1024
+	var originRanges []string
+	body := make([]byte, 32*blockSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originRanges = append(originRanges, r.Header.Get("Range"))
+		start, end, _ := parseAbsoluteRange(r.Header.Get("Range"))
+		if end >= int64(len(body)) {
+			end = int64(len(body)) - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[start : end+1])
+	}))
+	defer origin.Close()
+	p, _ := newBlockProxy(t, origin, blockSize)
+	p.maxSpanBlocks = 4
+
+	// 20 cold blocks with maxSpanBlocks=4 → 5 origin fetches, never more than
+	// 4 blocks per request.
+	doBlockRequest(t, p, origin.URL+"/bucket/f.parquet", "bytes=0-20479")
+	if len(originRanges) != 5 {
+		t.Fatalf("origin fetches: %d, want 5 (got %v)", len(originRanges), originRanges)
 	}
 }
