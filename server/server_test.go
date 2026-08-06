@@ -828,3 +828,14 @@ func TestFileDBPoolRefCounting(t *testing.T) {
 		t.Fatal("entry should be removed after last release")
 	}
 }
+
+func TestParquetPrefetchPolicyStatements(t *testing.T) {
+	if got := parquetPrefetchPolicyStatements(false); len(got) != 0 {
+		t.Fatalf("disabled policy must produce no statements, got %v", got)
+	}
+	got := parquetPrefetchPolicyStatements(true)
+	want := []string{"SET GLOBAL disable_parquet_prefetching = true"}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
