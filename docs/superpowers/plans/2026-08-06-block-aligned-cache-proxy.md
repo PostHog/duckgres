@@ -1035,6 +1035,14 @@ git commit -m "feat(server): env-gated disable_parquet_prefetching worker policy
   - Revert = flip this env back first (prefetch returns, block mode still on — that combination is strictly safe: deterministic prefetch ranges hit block cache fine).
 - [ ] **Step 3: Success snapshot.** Re-run the original benchmark on a real org table and record in the PR: month-bucket full-table aggregation, fresh standard worker — target cold ≤ ~4 min (from 13.7–65+ min) and warm repeat ≤ legacy warm, with run-2 origin bytes ≈ 0. Update `docs/metrics.md` if it enumerates proxy metrics, adding `cache_proxy_origin_bytes_total`, `cache_proxy_block_reads_total`, `cache_proxy_block_fallback_total`.
 
+#### Pre-flag-flip checklist (from final review)
+
+- [ ] `fetchOriginSpan` has no internal retry loop, unlike legacy `fetchOrigin`'s 4-attempt backoff. Accept as-is (httpfs itself retries up to 10x on the client side, and each retry makes progress because blocks already committed by an earlier attempt stay cached) or add retry to `fetchOriginSpan` before flipping the flag.
+- [ ] Origin fetch metrics (the `cache_proxy_origin_fetches_total` family) are not incremented on the block-mode path. Existing dashboard panels built on that metric will go dark as block-mode traffic comes to dominate — wire block-mode origin fetches into the same metric family, or annotate the affected dashboard panels, before flipping the flag.
+- [ ] Per-block sequential peer probing in Phase 1 can stall roughly 1 second per missing block when a peer is unresponsive (no per-peer timeout tuning yet). Consider probing peers per contiguous missing run instead of per block before flipping the flag, to bound worst-case stall time.
+- [ ] The block-aligned path emits no trace spans — the legacy `cache.get` span (and its child spans) simply vanish for block-mode traffic. Anyone correlating a duckgres query trace to proxy behavior loses that path once block mode is on; either add spans to `serveBlockAligned`/`fetchOriginSpan` or document the tracing gap for on-call before flipping the flag.
+- [ ] Reverting `DUCKGRES_DISABLE_PARQUET_PREFETCHING` only takes effect on newly-recycled workers: the setting is applied via `SET GLOBAL`, which persists on already-running workers until they recycle. A rollback of this env var does not immediately restore prefetching fleet-wide — factor that lag into rollback runbooks.
+
 ---
 
 ## Self-Review Notes
