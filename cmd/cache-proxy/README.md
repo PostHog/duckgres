@@ -61,6 +61,14 @@ everything else keeps behaving exactly as it does with block mode off:
 | Non-`GET` (`HEAD`, `PUT`, ...) | Passthrough (never cached), unchanged |
 | Non-bucket `GET` (`CACHE_HOST_SUFFIXES` doesn't match) | Passthrough, unchanged |
 | `CACHE_BLOCK_SIZE_BYTES` or `CACHE_BLOCK_MAX_SPAN_BLOCKS` misconfigured (≤ 0) | Legacy exact-range path |
+| Requested block span cannot fit in the configured cache capacity | Legacy exact-range path |
+
+Origin `206 Partial Content` responses are accepted only when their
+`Content-Range` exactly matches the requested block span (allowing the final
+span to end at the advertised object size). The validated object size is used
+to clamp ranges that cross EOF and return `416` for ranges that start at or
+beyond EOF. Before a `206` response is committed, every required cache block is
+opened so LRU eviction cannot truncate an in-progress assembled response.
 
 ## Tracing
 

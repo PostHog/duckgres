@@ -2809,6 +2809,63 @@ func TestK8sPool_SpawnWorkerCreatesCorrectPod(t *testing.T) {
 	}
 }
 
+func TestK8sPool_SpawnWorkerPropagatesDisableParquetPrefetching(t *testing.T) {
+	const key = "DUCKGRES_DISABLE_PARQUET_PREFETCHING"
+	tests := []struct {
+		name        string
+		value       string
+		wantEnabled bool
+	}{
+		{name: "canonical true", value: "true", wantEnabled: true},
+		{name: "uppercase true", value: "TRUE", wantEnabled: true},
+		{name: "numeric true", value: "1", wantEnabled: true},
+		{name: "false", value: "false", wantEnabled: false},
+		{name: "invalid", value: "banana", wantEnabled: false},
+		{name: "unset equivalent", value: "", wantEnabled: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(key, tt.value)
+			pool, cs := newTestK8sPool(t, 5)
+			var created *corev1.Pod
+			cs.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				createAction, ok := action.(k8stesting.CreateAction)
+				if !ok {
+					return false, nil, nil
+				}
+				pod, ok := createAction.GetObject().(*corev1.Pod)
+				if !ok || pod.Labels["app"] != "duckgres-worker" {
+					return false, nil, nil
+				}
+				created = pod.DeepCopy()
+				return true, nil, k8serrors.NewForbidden(
+					schema.GroupResource{Resource: "pods"}, pod.Name, errors.New("stop after capture"),
+				)
+			})
+
+			if err := pool.spawnWorker(context.Background(), 91, "duckgres:test", WorkerProfile{}, false); err == nil {
+				t.Fatal("spawnWorker unexpectedly succeeded")
+			}
+			if created == nil {
+				t.Fatal("worker Pod was not submitted")
+			}
+
+			env, present := envByName(created.Spec.Containers[0].Env)[key]
+			if tt.wantEnabled {
+				if !present {
+					t.Fatalf("%s=%q was not propagated", key, tt.value)
+				}
+				if env.Value != "true" || env.ValueFrom != nil {
+					t.Fatalf("spawned worker %s=%q ValueFrom=%v, want literal true", key, env.Value, env.ValueFrom)
+				}
+			} else if present {
+				t.Fatalf("spawned worker unexpectedly has %s=%q for parent value %q", key, env.Value, tt.value)
+			}
+		})
+	}
+}
+
 func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	t.Helper()
 

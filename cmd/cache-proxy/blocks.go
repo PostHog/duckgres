@@ -33,6 +33,50 @@ func parseAbsoluteRange(rangeHeader string) (start, end int64, ok bool) {
 	return start, end, true
 }
 
+// parsePartialContentRange parses the response form
+// "bytes start-end/completeLength". Block mode requires a known complete
+// length so it can distinguish a legitimate short tail from a truncated body.
+func parsePartialContentRange(header string) (start, end, completeLength int64, ok bool) {
+	spec, found := strings.CutPrefix(header, "bytes ")
+	if !found {
+		return 0, 0, 0, false
+	}
+	selected, total, found := strings.Cut(spec, "/")
+	if !found || total == "" || total == "*" {
+		return 0, 0, 0, false
+	}
+	lo, hi, found := strings.Cut(selected, "-")
+	if !found || lo == "" || hi == "" {
+		return 0, 0, 0, false
+	}
+	start, err := strconv.ParseInt(lo, 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, 0, false
+	}
+	end, err = strconv.ParseInt(hi, 10, 64)
+	if err != nil || end < start {
+		return 0, 0, 0, false
+	}
+	completeLength, err = strconv.ParseInt(total, 10, 64)
+	if err != nil || completeLength <= end {
+		return 0, 0, 0, false
+	}
+	return start, end, completeLength, true
+}
+
+// parseUnsatisfiedContentRange parses the 416 response form "bytes */N".
+func parseUnsatisfiedContentRange(header string) (completeLength int64, ok bool) {
+	total, found := strings.CutPrefix(header, "bytes */")
+	if !found || total == "" {
+		return 0, false
+	}
+	completeLength, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || completeLength < 0 {
+		return 0, false
+	}
+	return completeLength, true
+}
+
 // blockSpan returns the inclusive index range of blocks covering [start, end].
 func blockSpan(start, end, blockSize int64) (firstIdx, lastIdx int64) {
 	return start / blockSize, end / blockSize

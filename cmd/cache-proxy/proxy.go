@@ -62,6 +62,12 @@ type CacheProxy struct {
 	blockMode     bool
 	blockSize     int64
 	maxSpanBlocks int64
+
+	// objectSizes remembers validated complete lengths learned from origin
+	// Content-Range responses. Disk blocks remain the durable cache; this map
+	// lets subsequent requests in the same process emit precise range headers
+	// and reject starts beyond EOF without another origin request.
+	objectSizes sync.Map // map[string]int64, keyed by full object URL
 }
 
 // fetchResult describes a body that fetchDedup has materialized onto local

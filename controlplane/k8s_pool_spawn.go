@@ -239,7 +239,7 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	// (here: configresolve's DisableParquetPrefetching, applied in
 	// applyParquetPrefetchPolicy) must be mirrored through explicitly or
 	// setting it on the CP deployment silently does nothing on workers.
-	if os.Getenv("DUCKGRES_DISABLE_PARQUET_PREFETCHING") == "true" {
+	if disabled, err := strconv.ParseBool(os.Getenv("DUCKGRES_DISABLE_PARQUET_PREFETCHING")); err == nil && disabled {
 		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
 			Name:  "DUCKGRES_DISABLE_PARQUET_PREFETCHING",
 			Value: "true",

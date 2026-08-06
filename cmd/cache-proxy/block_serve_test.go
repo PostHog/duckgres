@@ -29,6 +29,11 @@ func originServer(t *testing.T, objSize int64) *httptest.Server {
 			_, _ = w.Write(body)
 			return
 		}
+		if start >= objSize {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", objSize))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
 		if end >= objSize {
 			end = objSize - 1 // S3 clamps to object end
 		}
@@ -131,6 +136,64 @@ func TestFetchOriginSpanRejects200(t *testing.T) {
 		if store.Has(BlockKey(u.String(), idx, blockSize)) {
 			t.Fatalf("block %d must not be committed when the origin ignored Range", idx)
 		}
+	}
+}
+
+func TestFetchOriginSpanRejectsMismatchedContentRange(t *testing.T) {
+	const blockSize = 1024
+	body := make([]byte, 2*blockSize)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The proxy asks for blocks 1..2, but a broken intermediary returns a
+		// different 206 range starting at byte zero.
+		w.Header().Set("Content-Range", "bytes 0-2047/4096")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	defer origin.Close()
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, nil, []string{})
+	p.client = origin.Client()
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{}}
+
+	if err := p.fetchOriginSpan(req, blockSize, 1, 2); err == nil {
+		t.Fatal("expected mismatched Content-Range to be rejected")
+	}
+	for idx := int64(1); idx <= 2; idx++ {
+		if store.Has(BlockKey(u.String(), idx, blockSize)) {
+			t.Fatalf("block %d committed from a mismatched Content-Range", idx)
+		}
+	}
+}
+
+func TestFetchOriginSpanRejectsCleanShortBody(t *testing.T) {
+	const blockSize = 1024
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 1024-3071/4096")
+		w.Header().Set("Transfer-Encoding", "chunked")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, blockSize)) // clean EOF one block too soon
+	}))
+	defer origin.Close()
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, nil, []string{})
+	p.client = origin.Client()
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{}}
+
+	if err := p.fetchOriginSpan(req, blockSize, 1, 2); err == nil {
+		t.Fatal("expected clean short 206 body to be rejected")
+	}
+	if store.Has(BlockKey(u.String(), 2, blockSize)) {
+		t.Fatal("truncated block committed from a short 206 body")
 	}
 }
 
@@ -251,8 +314,8 @@ func TestServeBlockAlignedColdThenWarm(t *testing.T) {
 			t.Fatalf("byte %d: got %d, want %d", i, b, want)
 		}
 	}
-	if got := w.Header().Get("Content-Range"); got != "bytes 1500-3500/2001" {
-		t.Fatalf("Content-Range %q; want legacy served-size shape %q", got, "bytes 1500-3500/2001")
+	if got := w.Header().Get("Content-Range"); got != "bytes 1500-3500/10240" {
+		t.Fatalf("Content-Range %q; want representation size %q", got, "bytes 1500-3500/10240")
 	}
 
 	// Warm with a DIFFERENT range over the same bytes (the drift scenario):
@@ -263,6 +326,54 @@ func TestServeBlockAlignedColdThenWarm(t *testing.T) {
 		t.Fatalf("drifted warm read failed: status %d len %d", w2.Code, w2.Body.Len())
 	}
 	_ = store
+}
+
+func TestServeBlockAlignedClampsColdRangeAtObjectEOF(t *testing.T) {
+	const blockSize = 1024
+	const objSize = int64(2*blockSize + 100)
+	origin := originServer(t, objSize)
+	defer origin.Close()
+	p, _ := newBlockProxy(t, origin, blockSize)
+
+	w := doBlockRequest(t, p, origin.URL+"/bucket/f.parquet", "bytes=2000-4095")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if got, want := w.Body.Len(), int(objSize-2000); got != want {
+		t.Fatalf("body length = %d, want %d", got, want)
+	}
+	if got := w.Header().Get("Content-Length"); got != "148" {
+		t.Fatalf("Content-Length = %q, want 148", got)
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes 2000-2147/2148" {
+		t.Fatalf("Content-Range = %q, want bytes 2000-2147/2148", got)
+	}
+}
+
+func TestServeBlockAlignedReturns416ForKnownPastEOFStart(t *testing.T) {
+	const blockSize = 1024
+	const objSize = int64(2*blockSize + 100)
+	origin := originServer(t, objSize)
+	defer origin.Close()
+	p, _ := newBlockProxy(t, origin, blockSize)
+	target := origin.URL + "/bucket/f.parquet"
+
+	// Learn and cache the representation size from a valid tail response.
+	first := doBlockRequest(t, p, target, "bytes=2000-2147")
+	if first.Code != http.StatusPartialContent {
+		t.Fatalf("setup status = %d, want 206", first.Code)
+	}
+
+	w := doBlockRequest(t, p, target, "bytes=2200-2500")
+	if w.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416", w.Code)
+	}
+	if got := w.Header().Get("Content-Range"); got != "bytes */2148" {
+		t.Fatalf("Content-Range = %q, want bytes */2148", got)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("416 body length = %d, want 0", w.Body.Len())
+	}
 }
 
 // TestServeBlockAlignedFallsBackOnRangeShape covers both non-block-servable
@@ -389,16 +500,12 @@ func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
 	}
 }
 
-// TestServeBlockAlignedFailsClosedWhenBlockStillMissingAfterReverify covers
-// the Phase 1.5 presence-verification backstop: Phase 1's coalesced origin
-// fetch can return success (nil error) while still leaving a trailing block
-// uncommitted — a real object-shorter-than-requested EOF is one legitimate
-// way this happens (see fetchOriginSpan's "clean EOF is not an error"
-// comment). The one direct re-fetch attempt of that residual block is made
-// to fail here too, so the block is still missing afterward; the request
-// must fail closed with a 502 before any header is written, not serve a
-// corrupt short body.
-func TestServeBlockAlignedFailsClosedWhenBlockStillMissingAfterReverify(t *testing.T) {
+// TestServeBlockAlignedDoesNotReverifyPastObjectEOF covers the cold-request
+// case where the requested end lies past the true object size. The validated
+// Content-Range must clamp the response and shrink the block span immediately,
+// rather than treating the nonexistent trailing block as a residual miss and
+// issuing a phase 1.5 re-fetch that can never fill it.
+func TestServeBlockAlignedDoesNotReverifyPastObjectEOF(t *testing.T) {
 	const blockSize = 1024
 	const objSize = int64(2*blockSize + 100) // true tail is block 2; block 3 doesn't exist
 	body := make([]byte, objSize)
@@ -422,8 +529,8 @@ func TestServeBlockAlignedFailsClosedWhenBlockStillMissingAfterReverify(t *testi
 			_, _ = w.Write(body[start : end+1])
 			return
 		}
-		// Phase 1.5's direct re-fetch of the residual block: fail outright so
-		// the block is still missing after the one retry attempt.
+		// Any second request indicates that the proxy still believes the
+		// nonexistent block after EOF must be fetched.
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer origin.Close()
@@ -438,23 +545,26 @@ func TestServeBlockAlignedFailsClosedWhenBlockStillMissingAfterReverify(t *testi
 	if !p.serveBlockAligned(w, req, "bytes=0-4095") {
 		t.Fatal("expected serveBlockAligned to handle the request (not fall back)")
 	}
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", w.Code)
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
 	}
-	if got := w.Header().Get("Content-Range"); got != "" {
-		t.Fatalf("Content-Range = %q, want unset: headers must not be committed before the 502", got)
+	if got := w.Header().Get("Content-Range"); got != "bytes 0-2147/2148" {
+		t.Fatalf("Content-Range = %q, want bytes 0-2147/2148", got)
 	}
-	if atomic.LoadInt32(&callCount) != 2 {
-		t.Fatalf("origin calls = %d, want 2 (phase 1 fetch + one phase 1.5 re-fetch attempt)", callCount)
+	if got := w.Body.Len(); got != int(objSize) {
+		t.Fatalf("body length = %d, want %d", got, objSize)
+	}
+	if atomic.LoadInt32(&callCount) != 1 {
+		t.Fatalf("origin calls = %d, want 1 (no impossible past-EOF re-fetch)", callCount)
 	}
 }
 
-// TestServeBlockAlignedAbortsOnDegenerateStart covers the phase-2 copy guard:
-// a request whose start lies past the actual (short) content of a cached
-// tail block must abort the response loop rather than let io.CopyN's
-// negative-length no-op fall through the "n < want" short-body check and
-// keep going as if nothing were wrong.
-func TestServeBlockAlignedAbortsOnDegenerateStart(t *testing.T) {
+// TestServeBlockAlignedReturns416ForColdPastEOFStart covers a past-EOF start
+// before the object size has been learned. The aligned origin fetch starts at
+// the beginning of the tail block, whose validated short Content-Range teaches
+// the proxy the true size. The client still receives a standards-compliant 416
+// instead of a zero-byte 206.
+func TestServeBlockAlignedReturns416ForColdPastEOFStart(t *testing.T) {
 	const blockSize = 1024
 	const objSize = int64(2*blockSize + 100) // tail block 2 has only 100 real bytes
 	origin := originServer(t, objSize)
@@ -474,17 +584,17 @@ func TestServeBlockAlignedAbortsOnDegenerateStart(t *testing.T) {
 	if !p.serveBlockAligned(w, req, "bytes=2200-3000") {
 		t.Fatal("expected serveBlockAligned to handle the request (not fall back)")
 	}
-	if !store.Has(BlockKey(target, 2, blockSize)) {
-		t.Fatal("test setup: tail block 2 should have been cached by phase 1")
+	if w.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416", w.Code)
 	}
-	// Headers are already committed by the time phase 2 discovers the
-	// degenerate want (mirrors the entry_vanished abort path), so the status
-	// stays 206; what must not happen is a body claiming bytes it can't send.
-	if w.Code != http.StatusPartialContent {
-		t.Fatalf("status = %d, want 206 (headers already sent before the abort)", w.Code)
+	if got := w.Header().Get("Content-Range"); got != "bytes */2148" {
+		t.Fatalf("Content-Range = %q, want bytes */2148", got)
 	}
 	if got := w.Body.Len(); got != 0 {
-		t.Fatalf("body length = %d, want 0: aborted before any bytes for this degenerate block were written", got)
+		t.Fatalf("body length = %d, want 0", got)
+	}
+	if !store.Has(BlockKey(target, 2, blockSize)) {
+		t.Fatal("validated tail block was not cached while learning object size")
 	}
 }
 
@@ -641,5 +751,97 @@ func TestServeBlockAlignedRejectsDegenerateConfig(t *testing.T) {
 				t.Fatal("expected false (legacy fallback) for degenerate config")
 			}
 		})
+	}
+}
+
+type writeHeaderHookRecorder struct {
+	*httptest.ResponseRecorder
+	hook func()
+}
+
+func (w *writeHeaderHookRecorder) WriteHeader(statusCode int) {
+	if w.hook != nil {
+		hook := w.hook
+		w.hook = nil
+		hook()
+	}
+	w.ResponseRecorder.WriteHeader(statusCode)
+}
+
+func TestServeBlockAlignedPinsBlocksBeforeHeaders(t *testing.T) {
+	const blockSize = int64(1024)
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.maxBytes = 2 * blockSize
+	target := "http://origin.test/bucket/f.parquet"
+
+	for idx := int64(0); idx < 2; idx++ {
+		data := make([]byte, blockSize)
+		for i := range data {
+			data[i] = byte((idx*blockSize + int64(i)) % 251)
+		}
+		if _, err := store.PutStream(BlockKey(target, idx, blockSize), strings.NewReader(string(data))); err != nil {
+			t.Fatalf("seed block %d: %v", idx, err)
+		}
+	}
+
+	p := NewCacheProxy(store, nil, []string{})
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	u, _ := url.Parse(target)
+	req := (&http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
+		Header: http.Header{"Range": []string{"bytes=0-2047"}}}).WithContext(context.Background())
+	w := &writeHeaderHookRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w.hook = func() {
+		// Force eviction precisely after headers are committed. Readers opened
+		// before this point remain valid on Unix even though their paths vanish.
+		if _, err := store.PutStream(strings.Repeat("f", 64), strings.NewReader(string(make([]byte, blockSize)))); err != nil {
+			t.Fatalf("trigger eviction: %v", err)
+		}
+	}
+
+	if !p.serveBlockAligned(w, req, "bytes=0-2047") {
+		t.Fatal("serveBlockAligned unexpectedly fell back")
+	}
+	if w.Code != http.StatusPartialContent || w.Body.Len() != 2*int(blockSize) {
+		t.Fatalf("response status=%d len=%d, want 206 and %d bytes", w.Code, w.Body.Len(), 2*blockSize)
+	}
+	for i, b := range w.Body.Bytes() {
+		if want := byte(int64(i) % 251); b != want {
+			t.Fatalf("byte %d = %d, want %d", i, b, want)
+		}
+	}
+}
+
+func TestHandleProxyOversizedBlockSpanFallsBackToLegacy(t *testing.T) {
+	const blockSize = int64(1024)
+	origin := originServer(t, 4*blockSize)
+	defer origin.Close()
+	p, store := newBlockProxy(t, origin, blockSize)
+	store.maxBytes = 2 * blockSize
+	p.blockMode = true
+	originURL, _ := url.Parse(origin.URL)
+	p.cacheHostSuffixes = []string{originURL.Host}
+	target := origin.URL + "/bucket/f.parquet"
+	u, _ := url.Parse(target)
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.URL = u
+	req.Header.Set("Range", "bytes=0-3071")
+	w := httptest.NewRecorder()
+
+	p.HandleProxy(w, req)
+
+	if w.Code != http.StatusPartialContent || w.Body.Len() != 3*int(blockSize) {
+		t.Fatalf("response status=%d len=%d, want legacy 206 and %d bytes", w.Code, w.Body.Len(), 3*blockSize)
+	}
+	if !store.Has(CacheKey(target, "bytes=0-3071")) {
+		t.Fatal("legacy exact-range entry was not written")
+	}
+	for idx := int64(0); idx < 3; idx++ {
+		if store.Has(BlockKey(target, idx, blockSize)) {
+			t.Fatalf("block %d was written before oversized-span fallback", idx)
+		}
 	}
 }

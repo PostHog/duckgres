@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -21,19 +22,63 @@ var (
 	blockFallbackTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cache_proxy_block_fallback_total",
 		Help: "Requests that fell back to the legacy exact-range path, by reason",
-	}, []string{"reason"}) // no_range, range_shape, entry_vanished, config
+	}, []string{"reason"}) // no_range, range_shape, entry_vanished, config, capacity
 	blockReadsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "cache_proxy_block_reads_total",
 		Help: "Blocks resolved while assembling responses, by source",
 	}, []string{"source"}) // local, peer, s3
 )
 
+type exactLengthReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (r *exactLengthReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= int64(n)
+	if err == io.EOF && r.remaining > 0 {
+		return n, io.ErrUnexpectedEOF
+	}
+	if err == io.EOF && r.remaining == 0 {
+		return n, nil
+	}
+	return n, err
+}
+
+func (p *CacheProxy) rememberObjectSize(url string, size int64) {
+	if size >= 0 {
+		p.objectSizes.Store(url, size)
+	}
+}
+
+func (p *CacheProxy) knownObjectSize(url string) (int64, bool) {
+	v, ok := p.objectSizes.Load(url)
+	if !ok {
+		return 0, false
+	}
+	size, ok := v.(int64)
+	return size, ok
+}
+
+func writeRangeNotSatisfiable(w http.ResponseWriter, objectSize int64) {
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", objectSize))
+	w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+}
+
 // fetchOriginSpan fetches blocks [firstIdx, lastIdx] of r.URL in ONE origin
 // range GET and commits each block to the store under its BlockKey. Rewriting
 // the Range header is legal: DuckDB httpfs signs only
 // host;x-amz-content-sha256;x-amz-date (see forwardUncached), so Range is not
-// covered by the SigV4 signature. The final block of an object is naturally
-// short — a clean EOF mid-span is success, not an error.
+// covered by the SigV4 signature. Content-Range is validated before any block
+// is committed, and each selected block must contain exactly the advertised
+// number of bytes.
 func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastIdx int64) error {
 	timeout := p.originTimeout
 	if timeout <= 0 {
@@ -55,7 +100,9 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 		}
 	}
 	req.Host = r.Host
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", firstIdx*blockSize, (lastIdx+1)*blockSize-1))
+	wantStart := firstIdx * blockSize
+	wantEnd := (lastIdx+1)*blockSize - 1
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", wantStart, wantEnd))
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -64,6 +111,11 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+			if objectSize, ok := parseUnsatisfiedContentRange(resp.Header.Get("Content-Range")); ok {
+				p.rememberObjectSize(r.URL.String(), objectSize)
+			}
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, originErrorBodyCap))
 		return &originStatusError{status: resp.StatusCode, headers: resp.Header.Clone(), body: body}
 	}
@@ -79,18 +131,40 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 	if resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("origin ignored Range (status %d): refusing to cache misaligned blocks", resp.StatusCode)
 	}
+	gotStart, gotEnd, objectSize, ok := parsePartialContentRange(resp.Header.Get("Content-Range"))
+	if !ok {
+		return fmt.Errorf("origin returned invalid Content-Range %q", resp.Header.Get("Content-Range"))
+	}
+	wantResponseEnd := min(wantEnd, objectSize-1)
+	if gotStart != wantStart || gotEnd != wantResponseEnd {
+		return fmt.Errorf("origin returned Content-Range bytes %d-%d/%d for requested bytes %d-%d",
+			gotStart, gotEnd, objectSize, wantStart, wantEnd)
+	}
+	expectedBodySize := gotEnd - gotStart + 1
+	if resp.ContentLength >= 0 && resp.ContentLength != expectedBodySize {
+		return fmt.Errorf("origin Content-Length %d does not match Content-Range length %d", resp.ContentLength, expectedBodySize)
+	}
 
-	for idx := firstIdx; idx <= lastIdx; idx++ {
-		size, err := p.store.PutStream(BlockKey(r.URL.String(), idx, blockSize), io.LimitReader(resp.Body, blockSize))
+	remaining := expectedBodySize
+	for idx := firstIdx; idx <= lastIdx && remaining > 0; idx++ {
+		blockBytes := min(blockSize, remaining)
+		size, err := p.store.PutStream(BlockKey(r.URL.String(), idx, blockSize), &exactLengthReader{
+			r:         resp.Body,
+			remaining: blockBytes,
+		})
 		if err != nil {
 			return fmt.Errorf("commit block %d: %w", idx, err)
 		}
-		cacheOriginBytesTotal.Add(float64(size))
-		if size < blockSize {
-			// Object ended inside this block — it is the tail. Done.
-			break
+		if size != blockBytes {
+			return fmt.Errorf("commit block %d: stored %d bytes, expected %d", idx, size, blockBytes)
 		}
+		cacheOriginBytesTotal.Add(float64(size))
+		remaining -= size
 	}
+	if remaining != 0 {
+		return fmt.Errorf("origin body ended with %d bytes still expected", remaining)
+	}
+	p.rememberObjectSize(r.URL.String(), objectSize)
 	return nil
 }
 
@@ -116,8 +190,20 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		blockFallbackTotal.WithLabelValues("range_shape").Inc()
 		return false
 	}
-	firstIdx, lastIdx := blockSpan(start, end, p.blockSize)
 	urlStr := r.URL.String()
+	if objectSize, known := p.knownObjectSize(urlStr); known {
+		if start >= objectSize {
+			writeRangeNotSatisfiable(w, objectSize)
+			return true
+		}
+		end = min(end, objectSize-1)
+	}
+	firstIdx, lastIdx := blockSpan(start, end, p.blockSize)
+	blockCount := lastIdx - firstIdx + 1
+	if p.store.maxBytes <= 0 || blockCount > p.store.maxBytes/p.blockSize {
+		blockFallbackTotal.WithLabelValues("capacity").Inc()
+		return false
+	}
 
 	// Phase 1: ensure every block is present locally. Track sources for the
 	// hit/miss accounting and the log line.
@@ -142,6 +228,14 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			if err != nil {
 				var oe *originStatusError
 				if errors.As(err, &oe) {
+					if oe.status == http.StatusRequestedRangeNotSatisfiable {
+						if objectSize, known := p.knownObjectSize(urlStr); known && start < objectSize {
+							end = min(end, objectSize-1)
+							lastIdx = end / p.blockSize
+							missRunStart = -1
+							return true
+						}
+					}
 					oe.writeTo(w)
 					return false
 				}
@@ -149,7 +243,18 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return false
 			}
-			nOrigin += hi - lo + 1
+			if objectSize, known := p.knownObjectSize(urlStr); known {
+				if start >= objectSize {
+					writeRangeNotSatisfiable(w, objectSize)
+					return false
+				}
+				end = min(end, objectSize-1)
+				lastIdx = end / p.blockSize
+			}
+			actualHi := min(hi, lastIdx)
+			if actualHi >= lo {
+				nOrigin += actualHi - lo + 1
+			}
 		}
 		missRunStart = -1
 		return true
@@ -160,6 +265,9 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			if !flushRun(idx - 1) {
 				return true // error already written
 			}
+			if idx > lastIdx {
+				break
+			}
 			nLocal++
 			continue
 		}
@@ -169,6 +277,9 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			}); ok {
 				if !flushRun(idx - 1) {
 					return true
+				}
+				if idx > lastIdx {
+					break
 				}
 				nPeer++
 				continue
@@ -184,11 +295,12 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 
 	// Phase 1.5: verify every block phase 1 believes is present is actually
 	// on disk before any response header is written. This is the backstop for
-	// the single-flight race above (and any other residual gap, e.g. a true
-	// object-EOF short span leaving trailing indices uncommitted): one direct
+	// the single-flight race above (and any other residual gap): one direct
 	// re-fetch of each residual missing run, bypassing the single-flight so it
-	// always runs. If blocks are still missing afterward we fail closed with a
-	// retryable 502 rather than risk assembling a corrupt short body.
+	// always runs. A validated short object tail shrinks lastIdx during phase 1
+	// and is therefore not considered a gap. If blocks are still missing after
+	// the re-fetch we fail closed with a retryable 502 rather than risk
+	// assembling a corrupt short body.
 	var reverifyStart int64 = -1
 	reverify := func(runEnd int64) {
 		if reverifyStart < 0 {
@@ -221,6 +333,80 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		}
 	}
 
+	// Phase 2: open every block before committing response headers. Open file
+	// descriptors keep their contents readable even if the LRU removes the
+	// directory entries while the response is being assembled. If an entry
+	// vanished before it could be opened, return false so HandleProxy can use
+	// the legacy exact-range path while the response is still untouched.
+	type openedBlock struct {
+		idx    int64
+		reader io.ReadCloser
+		size   int64
+		skip   int64
+		want   int64
+	}
+	opened := make([]openedBlock, 0, lastIdx-firstIdx+1)
+	closeOpened := func() {
+		for i := range opened {
+			_ = opened[i].reader.Close()
+		}
+	}
+	for idx := firstIdx; idx <= lastIdx; idx++ {
+		reader, size, ok := p.store.openFile(BlockKey(urlStr, idx, p.blockSize))
+		if !ok {
+			closeOpened()
+			blockFallbackTotal.WithLabelValues("entry_vanished").Inc()
+			slog.Warn("Block vanished before assembly; falling back.", "url", urlStr, "block", idx)
+			return false
+		}
+		if size <= 0 || size > p.blockSize {
+			_ = reader.Close()
+			closeOpened()
+			slog.Error("Cached block has invalid size; falling back.",
+				"url", urlStr, "block", idx, "size", size, "block_size", p.blockSize)
+			return false
+		}
+		if size < p.blockSize {
+			// A validated short block is the object's tail. Remembering its
+			// boundary also recovers exact range semantics after a process
+			// restart, when the in-memory object-size map starts empty.
+			objectSize := idx*p.blockSize + size
+			p.rememberObjectSize(urlStr, objectSize)
+			if start >= objectSize {
+				_ = reader.Close()
+				closeOpened()
+				writeRangeNotSatisfiable(w, objectSize)
+				return true
+			}
+			end = min(end, objectSize-1)
+			lastIdx = idx
+		}
+		opened = append(opened, openedBlock{idx: idx, reader: reader, size: size})
+	}
+
+	total := end - start + 1
+	planned := int64(0)
+	for i := range opened {
+		blockStart := opened[i].idx * p.blockSize
+		opened[i].skip = max(0, start-blockStart)
+		opened[i].want = min(opened[i].size-opened[i].skip, end-blockStart+1-opened[i].skip, total-planned)
+		if opened[i].want <= 0 {
+			closeOpened()
+			slog.Error("Cached block cannot satisfy requested range; falling back.",
+				"url", urlStr, "block", opened[i].idx, "start", start,
+				"block_start", blockStart, "size", opened[i].size)
+			return false
+		}
+		planned += opened[i].want
+	}
+	if planned != total {
+		closeOpened()
+		slog.Error("Opened blocks do not cover requested range; falling back.",
+			"url", urlStr, "planned", planned, "total", total)
+		return false
+	}
+	defer closeOpened()
+
 	blockReadsTotal.WithLabelValues("local").Add(float64(nLocal))
 	blockReadsTotal.WithLabelValues("peer").Add(float64(nPeer))
 	blockReadsTotal.WithLabelValues("s3").Add(float64(nOrigin))
@@ -233,46 +419,24 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		cacheMissesTotal.Inc()
 	}
 
-	// Phase 2: stream the assembled range. Mirrors serveStream's legacy
-	// response shape: 206 + Content-Range with served size after the slash.
-	total := end - start + 1
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", total))
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+	representationSize := "*"
+	if objectSize, known := p.knownObjectSize(urlStr); known {
+		representationSize = strconv.FormatInt(objectSize, 10)
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%s", start, end, representationSize))
 	w.WriteHeader(http.StatusPartialContent)
 
 	served := int64(0)
-	for idx := firstIdx; idx <= lastIdx; idx++ {
-		reader, size, ok := p.store.openFile(BlockKey(urlStr, idx, p.blockSize))
-		if !ok {
-			// Evicted in the window between phase 1 and here (or object
-			// shorter than the requested range). Nothing sane to send after
-			// headers are out; abort so httpfs sees a short body and retries.
-			blockFallbackTotal.WithLabelValues("entry_vanished").Inc()
-			slog.Warn("Block vanished during assembly.", "url", urlStr, "block", idx)
-			return true
+	for i := range opened {
+		if opened[i].skip > 0 {
+			if _, err := io.CopyN(io.Discard, opened[i].reader, opened[i].skip); err != nil {
+				return true
+			}
 		}
-		blockStart := idx * p.blockSize
-		skip := max(0, start-blockStart)
-		want := min(size-skip, end-blockStart+1-skip, total-served)
-		if want <= 0 {
-			// start lies past the end of this block (a short cached tail
-			// block whose object EOF falls before the requested start).
-			// io.CopyN silently no-ops on a non-positive n instead of erroring,
-			// so without this guard the loop would fall through the "n < want"
-			// short-body check below and produce a truncated 206 instead of
-			// failing closed.
-			_ = reader.Close()
-			slog.Warn("Computed zero-or-negative want for block; aborting response.",
-				"url", urlStr, "block", idx, "start", start, "block_start", blockStart, "size", size)
-			return true
-		}
-		if skip > 0 {
-			_, _ = io.CopyN(io.Discard, reader, skip)
-		}
-		n, _ := io.CopyN(w, reader, want)
+		n, _ := io.CopyN(w, opened[i].reader, opened[i].want)
 		served += n
-		_ = reader.Close()
-		if n < want {
+		if n < opened[i].want {
 			return true
 		}
 	}
