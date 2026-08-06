@@ -340,6 +340,57 @@ func TestServeBlockAlignedFailsClosedWhenBlockStillMissingAfterReverify(t *testi
 	}
 }
 
+func TestHandleProxyRoutesToBlockMode(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 4*blockSize)
+	defer origin.Close()
+	p, store := newBlockProxy(t, origin, blockSize)
+	p.blockMode = true
+	originURL, _ := url.Parse(origin.URL)
+	p.cacheHostSuffixes = []string{originURL.Host} // make shouldCache match the test origin
+
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	req := httptest.NewRequest(http.MethodGet, u.String(), nil)
+	req.URL = u
+	req.Header.Set("Range", "bytes=100-2100")
+	w := httptest.NewRecorder()
+	p.HandleProxy(w, req)
+
+	if w.Code != http.StatusPartialContent || w.Body.Len() != 2001 {
+		t.Fatalf("block-mode HandleProxy: status %d len %d", w.Code, w.Body.Len())
+	}
+	// Blocks 0-2 stored under block keys; the legacy exact-range key must NOT exist.
+	if store.Has(CacheKey(u.String(), "bytes=100-2100")) {
+		t.Fatal("legacy key written in block mode")
+	}
+	if !store.Has(BlockKey(u.String(), 0, blockSize)) {
+		t.Fatal("block 0 missing after block-mode request")
+	}
+}
+
+func TestHandleProxyBlockModeOffUsesLegacyPath(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 4*blockSize)
+	defer origin.Close()
+	p, store := newBlockProxy(t, origin, blockSize)
+	p.blockMode = false
+	originURL, _ := url.Parse(origin.URL)
+	p.cacheHostSuffixes = []string{originURL.Host}
+
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	req := httptest.NewRequest(http.MethodGet, u.String(), nil)
+	req.URL = u
+	req.Header.Set("Range", "bytes=100-2100")
+	p.HandleProxy(httptest.NewRecorder(), req)
+
+	if !store.Has(CacheKey(u.String(), "bytes=100-2100")) {
+		t.Fatal("legacy key missing with block mode off")
+	}
+	if store.Has(BlockKey(u.String(), 0, blockSize)) {
+		t.Fatal("block key written with block mode off")
+	}
+}
+
 // TestServeBlockAlignedRejectsDegenerateConfig guards the infinite-loop /
 // divide-by-zero hazard: if blockSize or maxSpanBlocks is left at its zero
 // value (e.g. Task 4's wiring is skipped), serveBlockAligned must fall back

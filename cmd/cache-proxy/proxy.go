@@ -290,6 +290,11 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rangeHeader := r.Header.Get("Range")
+
+	if p.blockMode && p.serveBlockAligned(w, r, rangeHeader) {
+		return
+	}
+	// Legacy exact-range path (also the fallback for non-absolute ranges).
 	cacheKey := CacheKey(r.URL.String(), rangeHeader)
 
 	// Root span for this cacheable GET. DuckDB httpfs sends no traceparent, so
