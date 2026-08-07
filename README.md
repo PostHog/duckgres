@@ -389,10 +389,11 @@ Run with config file:
 | `DUCKGRES_EXPLORATORY_WORKER_CPU` | CPU request/limit of the exploratory worker pod (e.g. `1`, `500m`). Required (with the memory knob) for the tier to activate; a missing or invalid value logs a warning and leaves the tier OFF. Env-only. | - |
 | `DUCKGRES_EXPLORATORY_WORKER_MEMORY` | Memory request/limit of the exploratory worker pod (e.g. `2Gi`). Same requirement as the CPU knob. Env-only. | - |
 | `DUCKGRES_EXPLORATORY_WORKER_TTL` | Hot-idle TTL of exploratory worker pods (Go duration) — how long one stays parked for the org's next connection after its last one ends. Env-only. | `48h` |
-| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
-| `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
+| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events**. Application logs carry query text — to get events without exporting SQL, leave this unset and use `POSTHOG_ANALYTICS_API_KEY` | - |
+| `POSTHOG_ANALYTICS_API_KEY` | PostHog project API key for product-analytics events **only**, leaving log export off. Takes precedence over `POSTHOG_API_KEY` for analytics | - |
+| `POSTHOG_HOST` | PostHog ingest host (shared by both exporters) | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
-| `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` in PostHog logs (e.g., `duckgres-acme`); only used when `POSTHOG_API_KEY` is set | - |
+| `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` (e.g., `duckgres-acme`). Applies to **both** the log export and the OTLP trace export — they share one resource — so setting it renames the service in traces too, not just logs | - |
 
 ### PostHog Logging
 
@@ -415,10 +416,34 @@ export POSTHOG_HOST=eu.i.posthog.com
 
 ### PostHog Product-Analytics Events
 
-The same `POSTHOG_API_KEY` (and `POSTHOG_HOST`) also enables product-analytics
-event capture via the PostHog capture API. This is separate from log export:
-logs go to PostHog Logs, these are discrete events you can build insights and
-dashboards on. When `POSTHOG_API_KEY` is unset, no events are sent.
+`POSTHOG_API_KEY` (and `POSTHOG_HOST`) also enables product-analytics event
+capture via the PostHog capture API. This is separate from log export: logs go
+to PostHog Logs, these are discrete events you can build insights and dashboards
+on.
+
+The two exporters can be enabled independently, and the distinction matters
+because they carry different data. These events are metadata only. Application
+logs are not: `logQuery` / `logQueryError` attach the statement, and
+`usersecrets.RedactForLog` only rewrites secret DDL, so ordinary SQL and its
+literals reach PostHog Logs.
+
+| Set | Analytics events | Log export |
+| --- | --- | --- |
+| `POSTHOG_ANALYTICS_API_KEY` | ✅ | ❌ |
+| `POSTHOG_API_KEY` | ✅ | ✅ |
+| both | ✅ (analytics key) | ✅ (`POSTHOG_API_KEY`) |
+| neither | ❌ | ❌ |
+
+So a deployment serving customer data — where SQL must not be exported — sets
+only `POSTHOG_ANALYTICS_API_KEY`:
+
+```bash
+export POSTHOG_ANALYTICS_API_KEY=phc_your_project_api_key
+./duckgres
+```
+
+Existing single-key deployments are unaffected: `POSTHOG_API_KEY` keeps both
+exporters on, exactly as before.
 
 Events are attributed to an org using [PostHog group analytics](https://posthog.com/docs/product-analytics/group-analytics):
 the `distinct_id` is the org name and each event carries a group of type
