@@ -366,6 +366,7 @@ Run with config file:
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
 | `DUCKGRES_MEMORY_LIMIT` | DuckDB memory_limit per session (e.g., `4GB`) | Auto-detected |
 | `DUCKGRES_THREADS` | DuckDB threads per session | `runtime.NumCPU()` |
+| `DUCKGRES_DISABLE_PARQUET_PREFETCHING` | Disable DuckDB Parquet prefetching for standalone/process workers and control-plane-spawned K8s workers. Boolean values use Go's accepted forms (`true`, `TRUE`, `1`, etc.). | `false` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |

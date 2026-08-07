@@ -145,3 +145,41 @@ func TestFetchFromPeersEmptyPeerList(t *testing.T) {
 		t.Error("expected miss when no peers are known")
 	}
 }
+
+func TestPeerServesBlockKeys(t *testing.T) {
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+
+	// Create a block key for a parquet block.
+	key := BlockKey("http://s3/bucket/f.parquet", 3, 8<<20)
+	blockContent := "block-content"
+
+	// Store the block.
+	if _, err := store.PutStream(key, strings.NewReader(blockContent)); err != nil {
+		t.Fatalf("PutStream: %v", err)
+	}
+
+	// Create a proxy with the store and no peer manager.
+	p := NewCacheProxy(store, nil, []string{})
+
+	// HandlePeerHas must recognize the block key and return 200.
+	hasReq := httptest.NewRequest(http.MethodGet, "/peer/has?key="+key, nil)
+	hasW := httptest.NewRecorder()
+	p.HandlePeerHas(hasW, hasReq)
+	if hasW.Code != http.StatusOK {
+		t.Fatalf("HandlePeerHas(%s) = %d, want 200", key, hasW.Code)
+	}
+
+	// HandlePeerGet must stream the content and return 200.
+	getReq := httptest.NewRequest(http.MethodGet, "/peer/get?key="+key, nil)
+	getW := httptest.NewRecorder()
+	p.HandlePeerGet(getW, getReq)
+	if getW.Code != http.StatusOK {
+		t.Fatalf("HandlePeerGet: %d, want 200", getW.Code)
+	}
+	if getW.Body.String() != blockContent {
+		t.Fatalf("HandlePeerGet body = %q, want %q", getW.Body.String(), blockContent)
+	}
+}

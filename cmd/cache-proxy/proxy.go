@@ -54,6 +54,20 @@ type CacheProxy struct {
 	// traffic worth caching. Requests whose Host doesn't contain any of these
 	// are passed through without caching.
 	cacheHostSuffixes []string
+
+	// blockMode, blockSize, and maxSpanBlocks configure the block-aligned
+	// serve path (serveBlockAligned): whether it's active, the fixed block
+	// size in bytes, and the max number of blocks coalesced into one origin
+	// fetch. Wired to HandleProxy in a later task.
+	blockMode     bool
+	blockSize     int64
+	maxSpanBlocks int64
+
+	// objectSizes remembers validated complete lengths learned from origin
+	// Content-Range responses. Disk blocks remain the durable cache; this map
+	// lets subsequent requests in the same process emit precise range headers
+	// and reject starts beyond EOF without another origin request.
+	objectSizes sync.Map // map[string]int64, keyed by full object URL
 }
 
 // fetchResult describes a body that fetchDedup has materialized onto local
@@ -282,6 +296,11 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rangeHeader := r.Header.Get("Range")
+
+	if p.blockMode && p.serveBlockAligned(w, r, rangeHeader) {
+		return
+	}
+	// Legacy exact-range path (also the fallback for non-absolute ranges).
 	cacheKey := CacheKey(r.URL.String(), rangeHeader)
 
 	// Root span for this cacheable GET. DuckDB httpfs sends no traceparent, so

@@ -277,6 +277,13 @@ type Config struct {
 
 	// QueryLog configures query-log collection and flushing.
 	QueryLog QueryLogConfig
+
+	// DisableParquetPrefetching turns off DuckDB's parquet prefetch, which
+	// coalesces reads across non-projected columns on remote files. Set for
+	// deployments whose cache proxy runs in block-aligned mode, where
+	// prefetch's coalesced reads cause byte amplification the proxy can't
+	// avoid. See applyParquetPrefetchPolicy / parquetPrefetchPolicyStatements.
+	DisableParquetPrefetching bool
 }
 
 // QueryLogConfig configures the query log feature.
@@ -1080,6 +1087,33 @@ func applyHTTPFSRetryBudget(db *sql.DB) {
 	}
 }
 
+// parquetPrefetchPolicyStatements returns the SET statements for the
+// deployment's parquet prefetch policy. Prefetch coalesces reads across
+// non-projected columns on remote files — measured at up to ~50x byte
+// amplification on narrow scans of wide tables — so deployments whose
+// cache proxy runs in block-aligned mode (which serves drifted lazy-read
+// ranges from cache) turn it off. SET GLOBAL for the same reason as
+// applyHTTPFSRetryBudget: workers recycle connections between sessions.
+func parquetPrefetchPolicyStatements(disablePrefetch bool) []string {
+	if !disablePrefetch {
+		return nil
+	}
+	return []string{"SET GLOBAL disable_parquet_prefetching = true"}
+}
+
+// applyParquetPrefetchPolicy applies the deployment's parquet prefetch
+// policy after the ATTACH calls, same call site as applyHTTPFSRetryBudget
+// and for the same reason: httpfs (and its settable options) only exist
+// once DuckLake's ATTACH has auto-loaded it. Warn-only: a SET failure must
+// not fail the connection.
+func applyParquetPrefetchPolicy(db *sql.DB, disablePrefetch bool) {
+	for _, stmt := range parquetPrefetchPolicyStatements(disablePrefetch) {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to set parquet prefetch policy.", "stmt", stmt, "error", err)
+		}
+	}
+}
+
 func seedBundledExtensions(srcRoot, dstRoot string) error {
 	srcRoot = filepath.Clean(srcRoot)
 	dstRoot = filepath.Clean(dstRoot)
@@ -1309,6 +1343,7 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	// httpfs (DuckLake auto-loads it on the first S3 touch). See
 	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
 	applyHTTPFSRetryBudget(db)
+	applyParquetPrefetchPolicy(db, cfg.DisableParquetPrefetching)
 
 	return nil
 }
@@ -1345,6 +1380,7 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 	// httpfs (DuckLake auto-loads it on the first S3 touch). See
 	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
 	applyHTTPFSRetryBudget(db)
+	applyParquetPrefetchPolicy(db, cfg.DisableParquetPrefetching)
 
 	return nil
 }
@@ -1392,6 +1428,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	// httpfs (DuckLake auto-loads it on the first S3 touch). See
 	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
 	applyHTTPFSRetryBudget(db)
+	applyParquetPrefetchPolicy(db, cfg.DisableParquetPrefetching)
 
 	return db, nil
 }

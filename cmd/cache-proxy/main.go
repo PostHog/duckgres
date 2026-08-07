@@ -119,6 +119,14 @@ func main() {
 		"cache_host_suffixes", cacheHostSuffixes,
 	)
 
+	// Block-aligned cache mode: fixed-size, content-addressed blocks instead of
+	// exact-range keys, so repeat reads over drifting ranges of the same object
+	// still hit cache. See README.md "Block-aligned mode".
+	blockMode := os.Getenv("CACHE_BLOCK_MODE") == "on"
+	blockSize := envInt64("CACHE_BLOCK_SIZE_BYTES", 8<<20)
+	maxSpanBlocks := envInt64("CACHE_BLOCK_MAX_SPAN_BLOCKS", 8)
+	slog.Info("Block mode configured.", "enabled", blockMode, "block_size", blockSize, "max_span_blocks", maxSpanBlocks)
+
 	// Initialize cache store
 	store, err := NewDiskCache(cacheDir, maxPercent)
 	if err != nil {
@@ -134,6 +142,9 @@ func main() {
 	}
 
 	proxy := NewCacheProxy(store, peers, cacheHostSuffixes)
+	proxy.blockMode = blockMode
+	proxy.blockSize = blockSize
+	proxy.maxSpanBlocks = maxSpanBlocks
 
 	// Forward HTTP proxy (DuckDB httpfs traffic). ServeMux can't match absolute
 	// URLs in forward-proxy requests, so use the handler directly.
@@ -192,4 +203,19 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envInt64 parses an integer env var, falling back to def (with a warning)
+// when the variable is unset or fails to parse.
+func envInt64(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		slog.Warn("Invalid integer env var; using default.", "key", key, "value", v, "default", def, "error", err)
+		return def
+	}
+	return n
 }

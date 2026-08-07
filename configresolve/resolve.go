@@ -615,6 +615,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_MEMORY_REBALANCE: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_DISABLE_PARQUET_PREFETCHING"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.DisableParquetPrefetching = b
+		} else {
+			warn("Invalid DUCKGRES_DISABLE_PARQUET_PREFETCHING: " + err.Error())
+		}
+	}
 	if v := getenv("DUCKGRES_PROCESS_MIN_WORKERS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			processMinWorkers = n
