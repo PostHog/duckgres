@@ -99,11 +99,33 @@ jobs:
                       ducklake: "v1.0-posthog.7"
                       # The stable 1.5.5 scanner predates duckdb-postgres
                       # 71b85668, which fixes inconsistent snapshots across
-                      # scan connections. These checksums content-pin the
-                      # nightly artifact built from descendant ab217c6.
+                      # scan connections, so we deliberately take the nightly
+                      # and content-pin it.
+                      #
+                      # WARNING: the nightly URL is a MOVING target — upstream
+                      # rebuilds it and the pinned hash then stops matching,
+                      # which hard-fails every build until someone re-pins
+                      # (2026-08-04 -> 2026-08-08 was one such break). These
+                      # hashes were re-pinned to the nightly served on
+                      # 2026-08-08; the previous pin named descendant ab217c6,
+                      # and the current artifact's upstream commit is not
+                      # identifiable from the artifact itself. It is still
+                      # necessarily a descendant of 71b85668 (it is newer than
+                      # ab217c6, which already was), so the reason for
+                      # preferring nightly over stable still holds — but the
+                      # exact scanner build we ship is no longer named here.
+                      # Mirroring the artifact we want, instead of pinning a
+                      # hash against a URL whose contents change, is the real
+                      # fix.
+                      #
+                      # These values are duplicated in e2e-mw-dev.yml,
+                      # scenario-dev.yml, Dockerfile and Dockerfile.worker.
+                      # The workflow build-args OVERRIDE the Dockerfile ARG
+                      # defaults, so updating only the Dockerfiles does
+                      # nothing for CI — change all five together.
                       pg_scanner_repo: "https://nightly-extensions.duckdb.org"
-                      pg_scanner_sha256_amd64: "afc9a0f7ef0158e11235294929df7ea71995e168146c8b0a6409e9181b02766b"
-                      pg_scanner_sha256_arm64: "6ae9474e39f1b091e44104d8c4a3d7af45b290696edf87fca10bba13e78a61fd"
+                      pg_scanner_sha256_amd64: "7ff4913fab203f7895eaa6a9a87a14a7ad659d400deff667f8bf16e58a28937f"
+                      pg_scanner_sha256_arm64: "9ea7d5a3610f2b460bd2a5075684c5f6dad55fa19745a377b5471f4994a8b460"
                       # Fleet default: also publishes the unsuffixed tags and
                       # dispatches Charts.
                       default: true
