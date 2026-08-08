@@ -430,7 +430,14 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	served := int64(0)
 	for i := range opened {
 		if opened[i].skip > 0 {
-			if _, err := io.CopyN(io.Discard, opened[i].reader, opened[i].skip); err != nil {
+			// Block readers are disk files, so jump to the slice instead of
+			// reading and discarding the prefix — the discard costs up to a
+			// full block of disk reads and copies per request.
+			if seeker, ok := opened[i].reader.(io.Seeker); ok {
+				if _, err := seeker.Seek(opened[i].skip, io.SeekStart); err != nil {
+					return true
+				}
+			} else if _, err := io.CopyN(io.Discard, opened[i].reader, opened[i].skip); err != nil {
 				return true
 			}
 		}
