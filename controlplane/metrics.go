@@ -90,6 +90,17 @@ var controlPlaneWorkerConnPoolWedgeCounter = promauto.NewCounter(prometheus.Coun
 	Help: "Sessions rejected by a wedged worker (DB connection pool timeout); the worker is recycled and the session retried on a fresh one.",
 })
 
+// workerInstanceInvalidatedTotal counts workers retired because their DuckDB
+// instance was invalidated by an Internal/Fatal engine error — the engine bug
+// class that poisons the whole instance (a DuckLake commit fatal is the known
+// source). The worker is retired instead of being reused, so a nonzero rate is
+// contained rather than an outage; it does mean a tenant's statement hit an
+// engine bug and lost its worker, so alert on it and chase the root cause.
+var workerInstanceInvalidatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_control_plane_worker_instance_invalidated_total",
+	Help: "Workers retired because their DuckDB instance was invalidated by an Internal/Fatal engine error.",
+})
+
 func observeWorkerSessionCapDrift() {
 	controlPlaneWorkerSessionCapDriftCounter.Inc()
 }

@@ -579,10 +579,21 @@ type sessionProgressJSON struct {
 
 // healthCheckResult is the parsed health check response from a worker.
 type healthCheckResult struct {
-	Healthy         bool                            `json:"healthy"`
-	Draining        bool                            `json:"draining"`
-	ActiveQueries   int                             `json:"active_queries"`
-	SessionProgress map[string]*sessionProgressJSON `json:"session_progress"`
+	Healthy       bool `json:"healthy"`
+	Draining      bool `json:"draining"`
+	ActiveQueries int  `json:"active_queries"`
+	// InstanceInvalidated reports that the worker's DuckDB instance was killed
+	// by an Internal/Fatal engine error (a DuckLake commit fatal is the known
+	// source). The process is still up and answering RPCs, so this is NOT a
+	// health-check failure and the consecutive-failure counter would never
+	// catch it — but every statement on that instance, including one from a
+	// brand new session, now fails with "database has been invalidated". The
+	// worker must be retired on the FIRST report, never reused.
+	InstanceInvalidated bool `json:"instance_invalidated"`
+	// InstanceInvalidReason carries the originating engine error so the retire
+	// log names the bug instead of just reporting "unhealthy".
+	InstanceInvalidReason string                          `json:"instance_invalid_reason"`
+	SessionProgress       map[string]*sessionProgressJSON `json:"session_progress"`
 }
 
 // toSessionProgress converts wire-format progress data to SessionProgress values.
@@ -1237,6 +1248,43 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 									}
 									p.releaseWorkerSocket(w)
 								}
+							}
+						} else if hcResult != nil && hcResult.InstanceInvalidated {
+							// The process answers RPCs but its DuckDB instance
+							// is poisoned by an Internal/Fatal engine error, so
+							// no failure counter will ever fire. Retire it now:
+							// every statement on that instance fails until the
+							// process restarts, including one from a fresh
+							// session on this (reusable) worker.
+							mu.Lock()
+							delete(failures, w.ID)
+							mu.Unlock()
+
+							workerInstanceInvalidatedTotal.Inc()
+							slog.Error("Worker DuckDB instance invalidated by a fatal engine error; retiring worker.",
+								"id", w.ID, "reason", hcResult.InstanceInvalidReason)
+
+							p.mu.Lock()
+							_, stillInPool := p.workers[w.ID]
+							if stillInPool {
+								delete(p.workers, w.ID)
+							}
+							workerCount := len(p.workers)
+							p.mu.Unlock()
+							observeControlPlaneWorkers(workerCount)
+
+							if stillInPool {
+								if onCrash != nil {
+									onCrash(w.ID)
+								}
+								if w.cmd.Process != nil {
+									_ = w.cmd.Process.Kill()
+								}
+								<-w.done
+								if w.client != nil {
+									_ = w.client.Close()
+								}
+								p.releaseWorkerSocket(w)
 							}
 						} else {
 							mu.Lock()

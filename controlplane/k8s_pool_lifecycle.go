@@ -452,28 +452,52 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						if stderrors.Is(healthErr, context.Canceled) {
 							return
 						}
+						// A worker whose DuckDB instance was invalidated by an
+						// Internal/Fatal engine error still answers RPCs
+						// perfectly, so healthErr is nil and the consecutive
+						// -failure counter never fires. Treat it as an
+						// immediate, uncounted retirement: the instance cannot
+						// recover without a process restart, so waiting only
+						// keeps a dead worker schedulable.
+						instanceDead := healthErr == nil && hcResult != nil && hcResult.InstanceInvalidated
+
 						if healthErr != nil {
 							observeHealthCheck(HealthCheckResultFail, lease.image)
 						} else {
 							observeHealthCheck(HealthCheckResultPass, lease.image)
 						}
 
-						if healthErr != nil {
-							if p.workerLeaseLocallyDraining(lease) {
+						// A draining worker is already on its way out; its pod
+						// exit is the cleanup path, so don't race it.
+						if instanceDead && p.workerLeaseLocallyDraining(lease) {
+							p.logw(lease.workerID).Warn("K8s worker DuckDB instance invalidated while worker is draining; waiting for pod exit.",
+								"reason", hcResult.InstanceInvalidReason)
+							return
+						}
+
+						if healthErr != nil || instanceDead {
+							if healthErr != nil && p.workerLeaseLocallyDraining(lease) {
 								if p.workerLeaseDurablyDrainingOrRepair(lease) {
 									p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining; waiting for pod exit.", "error", healthErr)
 									return
 								}
 								p.logw(lease.workerID).Warn("K8s worker health check failed while worker is locally draining but durable state is not draining; treating as health failure.", "error", healthErr)
 							}
-							mu.Lock()
-							failures[lease]++
-							count := failures[lease]
-							mu.Unlock()
+							var count int
+							if instanceDead {
+								workerInstanceInvalidatedTotal.Inc()
+								p.logw(lease.workerID).Error("K8s worker DuckDB instance invalidated by a fatal engine error; retiring worker.",
+									"reason", hcResult.InstanceInvalidReason)
+							} else {
+								mu.Lock()
+								failures[lease]++
+								count = failures[lease]
+								mu.Unlock()
 
-							p.logw(lease.workerID).Warn("K8s worker health check failed.", "error", healthErr, "consecutive_failures", count)
+								p.logw(lease.workerID).Warn("K8s worker health check failed.", "error", healthErr, "consecutive_failures", count)
+							}
 
-							if count >= maxConsecutiveHealthFailures {
+							if instanceDead || count >= maxConsecutiveHealthFailures {
 								lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginHealthCheckCrash)
 								if err != nil {
 									p.logw(lease.workerID).Error("K8s worker unresponsive but lease validation failed; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)

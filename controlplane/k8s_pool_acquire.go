@@ -694,6 +694,14 @@ func validateReservedWorkerHealth(result *healthCheckResult) error {
 	if result == nil {
 		return fmt.Errorf("worker health check returned no result")
 	}
+	// Checked before Healthy so the caller's error names the actual cause. This
+	// is the gate that stops a hot-idle worker with a poisoned DuckDB instance
+	// from being handed to the org's next connection — the reuse path is how a
+	// single bad statement used to look like "the whole warehouse is down until
+	// someone restarts it".
+	if result.InstanceInvalidated {
+		return fmt.Errorf("worker DuckDB instance is invalidated: %s", result.InstanceInvalidReason)
+	}
 	if !result.Healthy {
 		return fmt.Errorf("worker health check reported unhealthy")
 	}

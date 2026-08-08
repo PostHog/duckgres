@@ -46,6 +46,20 @@ var (
 		Name: "duckgres_worker_ducklake_conflict_retries_exhausted_total",
 		Help: "Total number of DuckLake transaction conflicts where all retries were exhausted (worker)",
 	})
+
+	// A DuckDB Internal/Fatal exception invalidates the whole instance. Both
+	// series are per-process and can only ever go 0 -> 1: the counter is what
+	// aggregates across the fleet (alert on any nonzero rate — it means a
+	// tenant lost a worker to an engine bug), the gauge is what identifies the
+	// specific poisoned pod while it is still being torn down.
+	instanceInvalidatedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "duckgres_worker_instance_invalidated_total",
+		Help: "Total number of times this worker's DuckDB instance was invalidated by an Internal/Fatal engine error",
+	})
+	instanceInvalidatedGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "duckgres_worker_instance_invalidated",
+		Help: "1 if this worker's DuckDB instance has been invalidated by an Internal/Fatal engine error",
+	})
 )
 
 // Commit-loop stats re-exported from the ducklake extension's

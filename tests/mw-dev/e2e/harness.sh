@@ -3044,6 +3044,58 @@ admin_rbac_viewer() { # org
   [ "$code" = "403" ] || fail "viewer PUT /orgs/$org returned $code, want 403 (mutations are admin-only)"
 }
 
+# ---- instance-invalidation guard: no spurious retirement --------------------
+# A DuckDB Internal/Fatal exception poisons the WHOLE instance, and duckgres
+# used to have no detection for it: the health check never executed SQL, so a
+# poisoned worker passed every check, stayed hot-idle, and was handed to the
+# org's next connection — one bad statement read as "the warehouse is down until
+# someone restarts it" (portola/team-50689, 2026-08-06/07). The worker now runs
+# a SELECT 1 liveness probe per health check, reports instance_invalidated, and
+# the CP retires it on the first report and refuses it for reuse.
+#
+# COVERAGE NOTE — the POSITIVE path is deliberately NOT asserted here, and this
+# is a real gap, not an oversight. Invalidating an instance on demand requires
+# triggering a DuckDB InternalException, i.e. an engine bug: the known trigger
+# is TransformGlobalStatsRow reading a NULL column_id from the
+# ducklake_table_stats LEFT JOIN ducklake_table_column_stats, which only fires
+# on a DuckLake extension older than v1.0-posthog.6 (this image pins a fixed
+# build via DUCKLAKE_EXTENSION_TAG, so the harness CANNOT reproduce it). The
+# retire/reuse-rejection logic is covered by
+# duckdbservice/instance_fatal_test.go + controlplane/instance_invalidated_test.go.
+# What IS asserted here is the regression that a live cluster can prove and that
+# the new probe could plausibly cause: the probe must not false-positive and
+# retire HEALTHY workers. If this ever fails, the classifier is too broad.
+instance_invalidation_guard() { # org password
+  org="$1"; pw="$2"
+  log "instance-invalidation: liveness probe does not retire healthy workers on $org"
+
+  # Drive several sequential connections so workers are reused from hot-idle —
+  # the exact path the reuse gate (validateReservedWorkerHealth) now guards, and
+  # the one that runs the most health-check probes per worker.
+  i=0
+  while [ "$i" -lt 5 ]; do
+    v="$(pg "$org" "$pw" ducklake "SELECT $i AS probe_round")"
+    [ "$v" = "$i" ] \
+      || fail "instance_invalidation_guard: round $i returned '$v' (healthy worker retired mid-flight?)"
+    i=$((i + 1))
+  done
+  sleep 3 # let a health-check cycle + any retire log flush
+
+  # The CP logs this line ONLY when a worker reported instance_invalidated. On a
+  # healthy cluster running a DuckLake build that guards the stats read, it must
+  # never appear — if it does, either the classifier is too broad (it would be
+  # retiring good workers) or a real engine bug landed and needs chasing.
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    logs="$(k logs "$p" --since=300s 2>&1)" \
+      || fail "instance_invalidation_guard: kubectl logs failed for control-plane pod $p: $logs"
+    if printf '%s\n' "$logs" | grep -q 'DuckDB instance invalidated by a fatal engine error'; then
+      printf '%s\n' "$logs" | grep 'DuckDB instance invalidated by a fatal engine error' | head -3
+      fail "instance_invalidation_guard: CP $p retired a worker as invalidated on a healthy cluster (classifier too broad, or a real engine bug — see the reason= attr above)"
+    fi
+  done
+  log "instance-invalidation guard OK (5 reused-worker rounds, no spurious retirement) on $org"
+}
+
 # ---- admin live-query detail (phase 1): per-pid expansion ------------------
 # The Live page can open one in-flight query to see its (redacted) SQL text +
 # connection metadata + live progress. Backed by GET /api/v1/queries/:pid, which
@@ -4282,6 +4334,9 @@ main() {
 
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
+
+  # ---- instance-invalidation detector must not retire healthy workers -------
+  instance_invalidation_guard "$CNPG" "$cnpg_pw"
 
   # ---- generated project reader: team-wide reads, no writes/cross-project ----
   project_reader_isolation "$CNPG" "$cnpg_pw" "$CNPG_TEAM_ID"
