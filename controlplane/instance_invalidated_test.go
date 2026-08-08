@@ -11,6 +11,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // The reuse gate is the load-bearing half of the fix: a worker whose DuckDB
@@ -116,6 +118,81 @@ func TestK8sPoolHealthCheckLoopRetiresInvalidatedInstanceImmediately(t *testing.
 		select {
 		case <-deadline:
 			t.Fatal("invalidated worker must be removed from the pool")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// The retirement path is shared with the unresponsive-worker case, but an
+// invalidated worker answers RPCs perfectly — only its engine is dead. Logging
+// it as "unresponsive" sends the operator chasing a network fault, so the cause
+// must be carried onto the pod-delete log.
+func TestK8sPoolInvalidatedRetirementLogsInstanceCause(t *testing.T) {
+	pool, cs := newTestK8sPool(t, 5)
+	logs := captureSlog(t)
+	store := &captureRuntimeWorkerStore{
+		preloadedRecords: map[int]*configstore.WorkerRecord{
+			8: {
+				WorkerID:          8,
+				PodName:           "adopted-worker-8",
+				State:             configstore.WorkerStateHot,
+				OwnerCPInstanceID: pool.cpInstanceID,
+				OwnerEpoch:        4,
+			},
+		},
+	}
+	pool.runtimeStore = store
+	pool.lifecycle = NewWorkerLifecycle(store, pool)
+
+	worker := &ManagedWorker{ID: 8, podName: "adopted-worker-8", done: make(chan struct{})}
+	worker.SetOwnerCPInstanceID(pool.cpInstanceID)
+	worker.SetOwnerEpoch(4)
+	pool.workers[worker.ID] = worker
+
+	if _, err := cs.CoreV1().Pods("default").Create(context.Background(), &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "adopted-worker-8", Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.8"},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create worker pod: %v", err)
+	}
+
+	origHealthCheck := doHealthCheckWithMetadata
+	doHealthCheckWithMetadata = func(context.Context, *flightsql.Client, server.WorkerHealthCheckPayload) (*healthCheckResult, error) {
+		return &healthCheckResult{
+			Healthy:               false,
+			InstanceInvalidated:   true,
+			InstanceInvalidReason: "INTERNAL Error: Calling GetValueInternal on a value that is NULL",
+		}, nil
+	}
+	t.Cleanup(func() { doHealthCheckWithMetadata = origHealthCheck })
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, time.Millisecond, func(workerID int) {
+		select {
+		case crashed <- workerID:
+		default:
+		}
+	}, nil)
+
+	select {
+	case <-crashed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the invalidated worker to be retired")
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		if deleteLog, ok := logs.findMessage("K8s worker retired, deleting pod."); ok {
+			if deleteLog.attrs["cause"] != "instance_invalidated" {
+				t.Fatalf("pod-delete log must name the real cause, got attrs %#v", deleteLog.attrs)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected a pod-delete log carrying the retirement cause")
 		case <-time.After(5 * time.Millisecond):
 		}
 	}

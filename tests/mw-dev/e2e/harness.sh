@@ -3080,29 +3080,34 @@ instance_invalidation_guard() { # org password
     i=$((i + 1))
   done
 
-  # Poll rather than sleeping a fixed interval: a spurious retirement is driven
-  # by the health-check loop, so a short fixed sleep can return BEFORE a cycle
-  # has run and pass vacuously. Keep querying (each round is another cycle's
-  # worth of probes) and check the logs each time, for a bounded window.
+  # Hold the window open with cheap keepalive queries rather than a fixed sleep:
+  # a spurious retirement is driven by the health-check loop, so a short sleep
+  # can return BEFORE a cycle has run and pass vacuously. Each round is another
+  # cycle's worth of probes against a reused worker.
+  a=0
+  while [ "$a" -lt 10 ]; do
+    v="$(pg "$org" "$pw" ducklake "SELECT $a AS keepalive")"
+    [ "$v" = "$a" ] \
+      || fail "instance_invalidation_guard: keepalive round $a returned '$v' (worker retired mid-window?)"
+    sleep 2; a=$((a + 1))
+  done
+
+  # ONE log sweep, after the window. The signal is durable — --since covers the
+  # whole window regardless of when a retirement happened — so polling the logs
+  # each round would just re-fetch minutes of verbose CP output per replica for
+  # nothing.
   #
   # The CP logs this line ONLY when a worker reported instance_invalidated. On a
   # healthy cluster running a DuckLake build that guards the stats read, it must
   # never appear — if it does, either the classifier is too broad (it would be
   # retiring good workers) or a real engine bug landed and needs chasing.
-  a=0
-  while [ "$a" -lt 12 ]; do
-    for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
-      logs="$(k logs "$p" --since=300s 2>&1)" \
-        || fail "instance_invalidation_guard: kubectl logs failed for control-plane pod $p: $logs"
-      if printf '%s\n' "$logs" | grep -q 'DuckDB instance invalidated by a fatal engine error'; then
-        printf '%s\n' "$logs" | grep 'DuckDB instance invalidated by a fatal engine error' | head -3
-        fail "instance_invalidation_guard: CP $p retired a worker as invalidated on a healthy cluster (classifier too broad, or a real engine bug — see the reason= attr above)"
-      fi
-    done
-    v="$(pg "$org" "$pw" ducklake "SELECT $a AS keepalive")"
-    [ "$v" = "$a" ] \
-      || fail "instance_invalidation_guard: keepalive round $a returned '$v' (worker retired mid-window?)"
-    sleep 2; a=$((a + 1))
+  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+    logs="$(k logs "$p" --since=300s 2>&1)" \
+      || fail "instance_invalidation_guard: kubectl logs failed for control-plane pod $p: $logs"
+    if printf '%s\n' "$logs" | grep -q 'DuckDB instance invalidated by a fatal engine error'; then
+      printf '%s\n' "$logs" | grep 'DuckDB instance invalidated by a fatal engine error' | head -3
+      fail "instance_invalidation_guard: CP $p retired a worker as invalidated on a healthy cluster (classifier too broad, or a real engine bug — see the reason= attr above)"
+    fi
   done
   log "instance-invalidation guard OK (5 reused-worker rounds, no spurious retirement) on $org"
 }
