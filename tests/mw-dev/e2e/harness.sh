@@ -3079,19 +3079,30 @@ instance_invalidation_guard() { # org password
       || fail "instance_invalidation_guard: round $i returned '$v' (healthy worker retired mid-flight?)"
     i=$((i + 1))
   done
-  sleep 3 # let a health-check cycle + any retire log flush
 
+  # Poll rather than sleeping a fixed interval: a spurious retirement is driven
+  # by the health-check loop, so a short fixed sleep can return BEFORE a cycle
+  # has run and pass vacuously. Keep querying (each round is another cycle's
+  # worth of probes) and check the logs each time, for a bounded window.
+  #
   # The CP logs this line ONLY when a worker reported instance_invalidated. On a
   # healthy cluster running a DuckLake build that guards the stats read, it must
   # never appear — if it does, either the classifier is too broad (it would be
   # retiring good workers) or a real engine bug landed and needs chasing.
-  for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
-    logs="$(k logs "$p" --since=300s 2>&1)" \
-      || fail "instance_invalidation_guard: kubectl logs failed for control-plane pod $p: $logs"
-    if printf '%s\n' "$logs" | grep -q 'DuckDB instance invalidated by a fatal engine error'; then
-      printf '%s\n' "$logs" | grep 'DuckDB instance invalidated by a fatal engine error' | head -3
-      fail "instance_invalidation_guard: CP $p retired a worker as invalidated on a healthy cluster (classifier too broad, or a real engine bug — see the reason= attr above)"
-    fi
+  a=0
+  while [ "$a" -lt 12 ]; do
+    for p in $(k get pods -l app=duckgres-control-plane -o jsonpath='{.items[*].metadata.name}'); do
+      logs="$(k logs "$p" --since=300s 2>&1)" \
+        || fail "instance_invalidation_guard: kubectl logs failed for control-plane pod $p: $logs"
+      if printf '%s\n' "$logs" | grep -q 'DuckDB instance invalidated by a fatal engine error'; then
+        printf '%s\n' "$logs" | grep 'DuckDB instance invalidated by a fatal engine error' | head -3
+        fail "instance_invalidation_guard: CP $p retired a worker as invalidated on a healthy cluster (classifier too broad, or a real engine bug — see the reason= attr above)"
+      fi
+    done
+    v="$(pg "$org" "$pw" ducklake "SELECT $a AS keepalive")"
+    [ "$v" = "$a" ] \
+      || fail "instance_invalidation_guard: keepalive round $a returned '$v' (worker retired mid-window?)"
+    sleep 2; a=$((a + 1))
   done
   log "instance-invalidation guard OK (5 reused-worker rounds, no spurious retirement) on $org"
 }

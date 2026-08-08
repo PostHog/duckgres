@@ -301,25 +301,40 @@ a heavy query killed by a co-resident one. Do not break the following:
   because of a previous fatal error" until the process restarts. DuckLake's
   commit path is a known source (an InternalException inside the commit retry
   loop is rethrown by `ErrorData::Throw` with its original type). Detection is
-  `isInstanceFatalError` (`duckdbservice/instance_fatal.go`): typed
-  `*duckdb.Error` of `ErrorTypeInternal`/`ErrorTypeFatal` first, with a string
-  fallback. It deliberately errs toward false positives — a false positive costs
-  one respawn, a false negative is a tenant-visible outage. **OOM and DuckLake
-  transaction conflicts are distinct error types and must never classify here**;
-  they retry in place. The flag is sticky (invalidation is permanent) and is
-  set from the statement paths, the `CreateSession` path, and an async
-  `SELECT 1` liveness probe kicked by each health check — the probe is what
-  catches a fatal thrown on a session that has since been destroyed. **The
-  probe must stay OFF the health check's critical path**: the CP's health-check
-  budget is 3s and already shared with progress polling, so a blocking probe
-  would get healthy workers killed for unresponsiveness. The worker reports
+  `isInstanceFatalError` (`duckdbservice/instance_fatal.go`). The **error TYPE
+  is authoritative**: a typed `*duckdb.Error` of
+  `ErrorTypeInternal`/`ErrorTypeFatal`. **Never add substring matches for
+  `"INTERNAL Error"` / `"FATAL Error"`** — DuckDB echoes the offending SQL back
+  in its error text (`LINE 1: <query>`), so those matched the USER'S OWN QUERY
+  and handed every tenant a one-statement worker kill via
+  `SELECT 'INTERNAL Error' + 1` (regression:
+  `TestInstanceFatalIgnoresEchoedQueryText`). The one string fallback is the
+  `database has been invalidated…` marker, for an error that arrives already
+  flattened. **OOM and DuckLake transaction conflicts are distinct error types
+  and must never classify here**; they retry in place. The flag is sticky
+  (invalidation is permanent) and is set from the statement paths, the
+  `CreateSession` path, and an async `SELECT 1` liveness probe kicked by each
+  health check — the probe is what catches a fatal thrown on a session that has
+  since been destroyed. **The stored reason MUST be redacted before it is kept**
+  (`usersecrets.RedactErrorForLog`, or `noteInstanceErrorOpaque` where no
+  statement is available to classify, as on the secret-replaying `CreateSession`
+  path): it is logged on the worker, shipped to the CP as
+  `instance_invalid_reason`, and logged again on retire, so an un-redacted
+  engine error leaks a failed `CREATE SECRET`'s credential into three sinks.
+  **The probe must stay OFF the health check's critical path**: the CP's
+  health-check budget is 3s and already shared with progress polling, so a
+  blocking probe would get healthy workers killed for unresponsiveness. It is
+  single-flight and a wedged CGO call can outlive its context, so a probe stuck
+  past the threshold raises `duckgres_worker_instance_probe_stuck` rather than
+  silently disabling detection. The worker reports
   `instance_invalidated` + `healthy:false`; the CP retires it on the FIRST
   report, bypassing `maxConsecutiveHealthFailures` (the process answers RPCs
   fine, so the failure counter would never fire) and rejects it for reuse in
   `validateReservedWorkerHealth` — the hot-idle reuse path is what previously
   turned one bad statement into "the warehouse is down until someone restarts
   it". `duckgres_control_plane_worker_instance_invalidated_total` and
-  `duckgres_worker_instance_invalidated{,_total}` are the signals; nonzero means
+  `duckgres_worker_instance_invalidated_total` /
+  `duckgres_worker_instance_invalidated_state` are the signals; nonzero means
   a tenant hit an engine bug and lost a worker — contained, but chase the root
   cause. This is blast-radius containment ONLY: it does not fix the engine bug,
   which is fixed by shipping a DuckLake extension build that guards the read

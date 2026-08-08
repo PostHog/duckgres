@@ -245,8 +245,10 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	// fatal on one session, then the CP handing the same worker a brand new
 	// session ~2 minutes later that dies initializing its database metadata.
 	// Flagging here retires the worker on that first rejected create instead of
-	// waiting for the liveness probe.
-	h.pool.noteInstanceError(err)
+	// waiting for the liveness probe. Opaque because this path replays the
+	// user's persistent CREATE SECRET statements: its error can echo a
+	// credential with no single statement to classify against.
+	h.pool.noteInstanceErrorOpaque(err)
 	if err != nil {
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}
@@ -690,8 +692,9 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		})
 	}
 	// An Internal/Fatal engine error here has already poisoned the whole
-	// instance; flag it so this worker is retired rather than reused.
-	h.pool.noteInstanceError(err)
+	// instance; flag it so this worker is retired rather than reused. The query
+	// is passed un-redacted so the reason can be classified for secret DDL.
+	h.pool.noteInstanceError(query, err)
 	if err != nil {
 		schema, err, _ = recoverAbortedTransaction(
 			err,
@@ -833,7 +836,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		}
 		// See the note in GetFlightInfoStatement: an Internal/Fatal error has
 		// killed the instance, so the worker must not be handed out again.
-		h.pool.noteInstanceError(qerr)
+		h.pool.noteInstanceError(handle.Query, qerr)
 		if qerr != nil {
 			rows, qerr, _ = recoverAbortedTransaction(
 				qerr,
@@ -970,7 +973,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	// See the note in GetFlightInfoStatement. This is the DML/DDL path, so it
 	// is where a DuckLake commit fatal (the known source of instance
 	// invalidation) actually lands.
-	h.pool.noteInstanceError(execErr)
+	h.pool.noteInstanceError(query, execErr)
 	// Track SQL-level transaction state for BEGIN/COMMIT/ROLLBACK sent as raw SQL.
 	trackSQLTransactionState(query, execErr, &session.sqlTxActive)
 	if tx == nil && isTransactionStartStmt(query) && execErr == nil {

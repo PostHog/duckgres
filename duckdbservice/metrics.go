@@ -56,9 +56,21 @@ var (
 		Name: "duckgres_worker_instance_invalidated_total",
 		Help: "Total number of times this worker's DuckDB instance was invalidated by an Internal/Fatal engine error",
 	})
-	instanceInvalidatedGauge = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "duckgres_worker_instance_invalidated",
-		Help: "1 if this worker's DuckDB instance has been invalidated by an Internal/Fatal engine error",
+	// Named _state rather than sharing the counter's base name: a gauge called
+	// duckgres_worker_instance_invalidated next to a counter called
+	// duckgres_worker_instance_invalidated_total reads like one metric family
+	// in a query and invites picking the wrong one.
+	instanceInvalidatedStateGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "duckgres_worker_instance_invalidated_state",
+		Help: "1 if this worker's DuckDB instance has been invalidated by an Internal/Fatal engine error, else 0",
+	})
+	// Probe detection is single-flight and a wedged CGO call can outlive its
+	// context, so this is how a silently-disabled prober becomes visible.
+	// Sustained 1 means only the statement/session-create taps are still
+	// flagging invalidation on this worker.
+	instanceProbeStuckGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "duckgres_worker_instance_probe_stuck",
+		Help: "1 while this worker's DuckDB liveness probe has been in flight longer than the stuck threshold, else 0",
 	})
 )
 
