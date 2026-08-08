@@ -240,6 +240,15 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
 		return drainErr
 	}
+	// Session create runs DDL against the instance, so it is where an ALREADY
+	// invalidated worker announces itself: the observed failure sequence is a
+	// fatal on one session, then the CP handing the same worker a brand new
+	// session ~2 minutes later that dies initializing its database metadata.
+	// Flagging here retires the worker on that first rejected create instead of
+	// waiting for the liveness probe. Opaque because this path replays the
+	// user's persistent CREATE SECRET statements: its error can echo a
+	// credential with no single statement to classify against.
+	h.pool.noteInstanceErrorOpaque(err)
 	if err != nil {
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}
@@ -324,6 +333,15 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 	// as soon as the gRPC server starts, and clients get routed to a worker
 	// that hasn't attached DuckLake yet.
 	<-h.pool.warmupDone
+
+	// Kick a SELECT 1 liveness probe. Before this, the health check never
+	// executed SQL — it only read progress counters — so a DuckDB instance
+	// invalidated by an Internal/Fatal engine error passed every check and
+	// stayed schedulable, and the org's next connection was handed the dead
+	// instance. The probe runs asynchronously and we report the flag it sets;
+	// see probeInstanceLivenessAsync for why it must not block this response.
+	h.pool.probeInstanceLivenessAsync()
+	instanceInvalidated := h.pool.InstanceInvalidated()
 
 	// Poll DuckDB query progress for each active session.
 	//
@@ -438,13 +456,19 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 		}
 	}
 
+	// An invalidated instance reports healthy=false as well as the specific
+	// flag: the flag is what the CP acts and alerts on, while healthy=false
+	// makes the generic reuse gate (validateReservedWorkerHealth) reject the
+	// worker even on a CP that predates the flag.
 	resp, _ := json.Marshal(map[string]interface{}{
-		"healthy":          true,
-		"draining":         h.pool.IsDraining(),
-		"sessions":         h.pool.ActiveSessions(),
-		"active_queries":   h.pool.ActiveDrainWork(),
-		"uptime_ns":        time.Since(h.pool.startTime).Nanoseconds(),
-		"session_progress": sessionProgress,
+		"healthy":                 !instanceInvalidated,
+		"draining":                h.pool.IsDraining(),
+		"sessions":                h.pool.ActiveSessions(),
+		"active_queries":          h.pool.ActiveDrainWork(),
+		"uptime_ns":               time.Since(h.pool.startTime).Nanoseconds(),
+		"session_progress":        sessionProgress,
+		"instance_invalidated":    instanceInvalidated,
+		"instance_invalid_reason": h.pool.InstanceInvalidReason(),
 	})
 	return sendActionResult(stream, &flight.Result{Body: resp})
 }
@@ -667,6 +691,10 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
+	// An Internal/Fatal engine error here has already poisoned the whole
+	// instance; flag it so this worker is retired rather than reused. The query
+	// is passed un-redacted so the reason can be classified for secret DDL.
+	h.pool.noteInstanceError(query, err)
 	if err != nil {
 		schema, err, _ = recoverAbortedTransaction(
 			err,
@@ -806,6 +834,9 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 				return queryFn()
 			})
 		}
+		// See the note in GetFlightInfoStatement: an Internal/Fatal error has
+		// killed the instance, so the worker must not be handed out again.
+		h.pool.noteInstanceError(handle.Query, qerr)
 		if qerr != nil {
 			rows, qerr, _ = recoverAbortedTransaction(
 				qerr,
@@ -939,6 +970,10 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 			},
 		)
 	}
+	// See the note in GetFlightInfoStatement. This is the DML/DDL path, so it
+	// is where a DuckLake commit fatal (the known source of instance
+	// invalidation) actually lands.
+	h.pool.noteInstanceError(query, execErr)
 	// Track SQL-level transaction state for BEGIN/COMMIT/ROLLBACK sent as raw SQL.
 	trackSQLTransactionState(query, execErr, &session.sqlTxActive)
 	if tx == nil && isTransactionStartStmt(query) && execErr == nil {

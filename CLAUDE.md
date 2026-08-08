@@ -294,12 +294,61 @@ a heavy query killed by a co-resident one. Do not break the following:
   message). A nonzero drift metric means the scheduling invariant is broken —
   fix the root cause, don't just lean on the retry.
 
+- **An invalidated DuckDB instance retires the worker; it is NEVER reused.**
+  A DuckDB Internal- or Fatal-class exception does not just fail one statement,
+  it poisons the whole instance: every later statement on ANY connection to it —
+  including a brand new session — fails with "database has been invalidated
+  because of a previous fatal error" until the process restarts. DuckLake's
+  commit path is a known source (an InternalException inside the commit retry
+  loop is rethrown by `ErrorData::Throw` with its original type). Detection is
+  `isInstanceFatalError` (`duckdbservice/instance_fatal.go`). The **error TYPE
+  is authoritative**: a typed `*duckdb.Error` of
+  `ErrorTypeInternal`/`ErrorTypeFatal`. **Never add substring matches for
+  `"INTERNAL Error"` / `"FATAL Error"`** — DuckDB echoes the offending SQL back
+  in its error text (`LINE 1: <query>`), so those matched the USER'S OWN QUERY
+  and handed every tenant a one-statement worker kill via
+  `SELECT 'INTERNAL Error' + 1` (regression:
+  `TestInstanceFatalIgnoresEchoedQueryText`). The one string fallback is the
+  `database has been invalidated…` marker, for an error that arrives already
+  flattened. **OOM and DuckLake transaction conflicts are distinct error types
+  and must never classify here**; they retry in place. The flag is sticky
+  (invalidation is permanent) and is set from the statement paths, the
+  `CreateSession` path, and an async `SELECT 1` liveness probe kicked by each
+  health check — the probe is what catches a fatal thrown on a session that has
+  since been destroyed. **The stored reason MUST be redacted before it is kept**
+  (`usersecrets.RedactErrorForLog`, or `noteInstanceErrorOpaque` where no
+  statement is available to classify, as on the secret-replaying `CreateSession`
+  path): it is logged on the worker, shipped to the CP as
+  `instance_invalid_reason`, and logged again on retire, so an un-redacted
+  engine error leaks a failed `CREATE SECRET`'s credential into three sinks.
+  **The probe must stay OFF the health check's critical path**: the CP's
+  health-check budget is 3s and already shared with progress polling, so a
+  blocking probe would get healthy workers killed for unresponsiveness. It is
+  single-flight and a wedged CGO call can outlive its context, so a probe stuck
+  past the threshold raises `duckgres_worker_instance_probe_stuck` rather than
+  silently disabling detection. The worker reports
+  `instance_invalidated` + `healthy:false`; the CP retires it on the FIRST
+  report, bypassing `maxConsecutiveHealthFailures` (the process answers RPCs
+  fine, so the failure counter would never fire) and rejects it for reuse in
+  `validateReservedWorkerHealth` — the hot-idle reuse path is what previously
+  turned one bad statement into "the warehouse is down until someone restarts
+  it". `duckgres_control_plane_worker_instance_invalidated_total` and
+  `duckgres_worker_instance_invalidated_total` /
+  `duckgres_worker_instance_invalidated_state` are the signals; nonzero means
+  a tenant hit an engine bug and lost a worker — contained, but chase the root
+  cause. This is blast-radius containment ONLY: it does not fix the engine bug,
+  which is fixed by shipping a DuckLake extension build that guards the read
+  (see `DUCKLAKE_EXTENSION_TAG` in `Dockerfile`/`Dockerfile.worker`).
+
 Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
-`k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`, or
+`k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`,
+`duckdbservice/instance_fatal.go`, or
 `duckdbservice` session counting → update the unit tests
 (`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
-`duckdbservice/service_test.go`) AND the `one_session_per_worker` +
-`cold_burst_parallel_spawns` assertions in `tests/mw-dev/e2e/harness.sh`.
+`duckdbservice/service_test.go`, `duckdbservice/instance_fatal_test.go`,
+`controlplane/instance_invalidated_test.go`) AND the
+`one_session_per_worker` + `cold_burst_parallel_spawns` assertions in
+`tests/mw-dev/e2e/harness.sh`.
 
 ## Exploratory Worker Tier (small-first routing) — LOAD-BEARING CONTRACT
 

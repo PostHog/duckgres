@@ -452,36 +452,71 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						if stderrors.Is(healthErr, context.Canceled) {
 							return
 						}
+						// A worker whose DuckDB instance was invalidated by an
+						// Internal/Fatal engine error still answers RPCs
+						// perfectly, so healthErr is nil and the consecutive
+						// -failure counter never fires. Treat it as an
+						// immediate, uncounted retirement: the instance cannot
+						// recover without a process restart, so waiting only
+						// keeps a dead worker schedulable.
+						instanceDead := healthErr == nil && hcResult != nil && hcResult.InstanceInvalidated
+
 						if healthErr != nil {
 							observeHealthCheck(HealthCheckResultFail, lease.image)
 						} else {
 							observeHealthCheck(HealthCheckResultPass, lease.image)
 						}
 
-						if healthErr != nil {
-							if p.workerLeaseLocallyDraining(lease) {
+						// A draining worker is already on its way out; its pod
+						// exit is the cleanup path, so don't race it.
+						if instanceDead && p.workerLeaseLocallyDraining(lease) {
+							p.logw(lease.workerID).Warn("K8s worker DuckDB instance invalidated while worker is draining; waiting for pod exit.",
+								"reason", hcResult.InstanceInvalidReason)
+							return
+						}
+
+						if healthErr != nil || instanceDead {
+							if healthErr != nil && p.workerLeaseLocallyDraining(lease) {
 								if p.workerLeaseDurablyDrainingOrRepair(lease) {
 									p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining; waiting for pod exit.", "error", healthErr)
 									return
 								}
 								p.logw(lease.workerID).Warn("K8s worker health check failed while worker is locally draining but durable state is not draining; treating as health failure.", "error", healthErr)
 							}
-							mu.Lock()
-							failures[lease]++
-							count := failures[lease]
-							mu.Unlock()
+							var count int
+							if instanceDead {
+								workerInstanceInvalidatedTotal.Inc()
+								p.logw(lease.workerID).Error("K8s worker DuckDB instance invalidated by a fatal engine error; retiring worker.",
+									"reason", hcResult.InstanceInvalidReason)
+							} else {
+								mu.Lock()
+								failures[lease]++
+								count = failures[lease]
+								mu.Unlock()
 
-							p.logw(lease.workerID).Warn("K8s worker health check failed.", "error", healthErr, "consecutive_failures", count)
+								p.logw(lease.workerID).Warn("K8s worker health check failed.", "error", healthErr, "consecutive_failures", count)
+							}
 
-							if count >= maxConsecutiveHealthFailures {
+							// The retirement path below is shared with the
+							// unresponsive-worker case, but an invalidated
+							// worker is answering RPCs fine — only its engine is
+							// dead. Carry the cause so the operator-facing logs
+							// do not tell two contradictory stories about the
+							// same deletion (and so consecutive_failures=0 reads
+							// as "not counter-driven", not as missing data).
+							cause := "unresponsive"
+							if instanceDead {
+								cause = "instance_invalidated"
+							}
+							if instanceDead || count >= maxConsecutiveHealthFailures {
 								lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginHealthCheckCrash)
 								if err != nil {
-									p.logw(lease.workerID).Error("K8s worker unresponsive but lease validation failed; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)
+									p.logw(lease.workerID).Error("K8s worker retirement blocked: lease validation failed; leaving cleanup to retry.", "cause", cause, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)
 									return
 								}
 
 								if lostDisposition == workerLostLeaseRetry {
-									p.logw(lease.workerID).Warn("K8s worker unresponsive while runtime lease is newer for this CP; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									p.logw(lease.workerID).Warn("K8s worker retirement deferred: runtime lease is newer for this CP; leaving cleanup to retry.", "cause", cause, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
 									return
 								}
 
@@ -497,7 +532,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 										return
 									}
 									observeControlPlaneWorkers(workerCount)
-									p.logw(lease.workerID).Warn("K8s worker unresponsive under stale lease; dropping local worker without crash notification or pod delete.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									p.logw(lease.workerID).Warn("K8s worker retired under stale lease; dropping local worker without crash notification or pod delete.", "cause", cause, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
 									if removedWorker.client != nil {
 										_ = removedWorker.client.Close()
 									}
@@ -519,7 +554,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 								// Snapshot pod/container state before the delete below removes
 								// the easiest source of OOMKilled/Evicted/exit-code evidence.
 								podName := p.workerPodName(removedWorker)
-								deleteAttrs := []any{"consecutive_failures", count}
+								deleteAttrs := []any{"cause", cause, "consecutive_failures", count}
 								if podName != "" && p.clientset != nil {
 									statusCtx, statusCancel := context.WithTimeout(ctx, 2*time.Second)
 									pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(statusCtx, podName, metav1.GetOptions{})
@@ -531,7 +566,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 									}
 								}
 								logger := slog.With(workerLogAttrs(removedWorker)...)
-								logger.Error("K8s worker unresponsive, deleting pod.", deleteAttrs...)
+								logger.Error("K8s worker retired, deleting pod.", deleteAttrs...)
 								deleteResultAttrs := append(append([]any{}, deleteAttrs...), "grace_period_seconds", 10)
 								if podName == "" || p.clientset == nil {
 									logger.Warn("K8s worker pod delete skipped.", append(deleteResultAttrs, "reason", "missing_pod_or_client")...)

@@ -1898,9 +1898,14 @@ func TestK8sPoolHealthCheckLoopCurrentLeaseDeletesPodAndNotifiesCrash(t *testing
 	if snapshotBeforeCrash.Load() {
 		t.Fatal("pod status snapshot must not run before crash notification")
 	}
-	deleteLog, ok := logs.findMessage("K8s worker unresponsive, deleting pod.")
+	deleteLog, ok := logs.findMessage("K8s worker retired, deleting pod.")
 	if !ok {
 		t.Fatal("expected health-check pod delete log")
+	}
+	// The retirement path is shared with the instance-invalidated case, so the
+	// cause must distinguish them: this one really is an unresponsive worker.
+	if deleteLog.attrs["cause"] != "unresponsive" {
+		t.Fatalf("expected cause=unresponsive on a health-check-failure delete, got attrs %#v", deleteLog.attrs)
 	}
 	if deleteLog.attrs["worker_pod"] != "adopted-worker-8" {
 		t.Fatalf("expected worker_pod attr on delete log, got attrs %#v", deleteLog.attrs)

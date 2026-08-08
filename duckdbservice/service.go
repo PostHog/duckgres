@@ -121,6 +121,12 @@ type SessionPool struct {
 	activeWork    int
 	drainZero     chan struct{}
 	drainZeroOpen bool
+
+	// instance tracks whether this process's DuckDB instance has been poisoned
+	// by an Internal/Fatal engine error. Sticky, and reported to the control
+	// plane on every health check so the worker is retired instead of being
+	// handed to the org's next connection (see instance_fatal.go).
+	instance instanceHealth
 }
 
 type trackedTx struct {
