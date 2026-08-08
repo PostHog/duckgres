@@ -58,8 +58,8 @@ ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # DuckDB 1.5.5 nightly artifact built from duckdb-postgres ab217c6; CI overrides
 # all three values together for rollback rows.
 ARG POSTGRES_SCANNER_REPOSITORY=https://nightly-extensions.duckdb.org
-ARG POSTGRES_SCANNER_SHA256_AMD64=afc9a0f7ef0158e11235294929df7ea71995e168146c8b0a6409e9181b02766b
-ARG POSTGRES_SCANNER_SHA256_ARM64=6ae9474e39f1b091e44104d8c4a3d7af45b290696edf87fca10bba13e78a61fd
+ARG POSTGRES_SCANNER_SHA256_AMD64=7ff4913fab203f7895eaa6a9a87a14a7ad659d400deff667f8bf16e58a28937f
+ARG POSTGRES_SCANNER_SHA256_ARM64=9ea7d5a3610f2b460bd2a5075684c5f6dad55fa19745a377b5471f4994a8b460
 
 # Cross-check that DUCKDB_EXTENSION_VERSION (which keys the bundled-extension
 # directory layout) matches the DuckDB version implied by DUCKDB_BINDINGS_VERSION.
