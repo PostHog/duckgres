@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -88,9 +89,16 @@ type discoveryTeam struct {
 	// schema_name + grandfathered overrides happens HERE, once, so no
 	// consumer reimplements (or mis-guesses the qualification of) the
 	// rule. See resolveTeamTables.
-	EventsTable       string `json:"events_table"`
-	PersonsTable      string `json:"persons_table"`
-	DataImportsSchema string `json:"data_imports_schema"`
+	EventsTable  string `json:"events_table"`
+	PersonsTable string `json:"persons_table"`
+	// PersonsDistinctIDsTable is where a streamed persons pipeline writes
+	// the team's distinct-id mapping rows (the person ↔ distinct_id join
+	// side). It follows the resolved persons name: a `persons` prefix is
+	// replaced with `persons_distinct_ids`, so a suffixed override
+	// (persons_ab12) maps to persons_distinct_ids_ab12; a persons override
+	// without the `persons` prefix gets `_distinct_ids` appended.
+	PersonsDistinctIDsTable string `json:"persons_distinct_ids_table"`
+	DataImportsSchema       string `json:"data_imports_schema"`
 }
 
 // resolveTeamTables derives the team's fully-qualified table locations.
@@ -100,7 +108,7 @@ type discoveryTeam struct {
 // repair repoints overrides too); absent overrides derive `events` /
 // `persons`. The data-imports override is a SCHEMA name and replaces the
 // `<schema>_data_imports` derivation wholesale.
-func resolveTeamTables(t *configstore.OrgTeam) (events, persons, dataImports string) {
+func resolveTeamTables(t *configstore.OrgTeam) (events, persons, personsDistinctIDs, dataImports string) {
 	eventsName := "events"
 	if t.EventsTableName != nil && *t.EventsTableName != "" {
 		eventsName = *t.EventsTableName
@@ -113,7 +121,19 @@ func resolveTeamTables(t *configstore.OrgTeam) (events, persons, dataImports str
 	if t.SchemaDataImportsName != nil && *t.SchemaDataImportsName != "" {
 		dataImports = *t.SchemaDataImportsName
 	}
-	return t.SchemaName + "." + eventsName, t.SchemaName + "." + personsName, dataImports
+	return t.SchemaName + "." + eventsName, t.SchemaName + "." + personsName,
+		t.SchemaName + "." + distinctIDsTableName(personsName), dataImports
+}
+
+// distinctIDsTableName derives the team's distinct-ids table from its
+// resolved persons table name. The persons suffix (if any) is the team's
+// disambiguator inside a shared schema, so the distinct-ids table must carry
+// the same suffix: persons_ab12 → persons_distinct_ids_ab12.
+func distinctIDsTableName(personsName string) string {
+	if rest, ok := strings.CutPrefix(personsName, "persons"); ok {
+		return "persons_distinct_ids" + rest
+	}
+	return personsName + "_distinct_ids"
 }
 
 type discoverySecretRef struct {
@@ -226,14 +246,15 @@ func (h *handler) assembleDiscovery() (*discoveryResponse, error) {
 		}
 		for ti := range rows {
 			t := &rows[ti]
-			events, persons, dataImports := resolveTeamTables(t)
+			events, persons, personsDistinctIDs, dataImports := resolveTeamTables(t)
 			teams = append(teams, discoveryTeam{
-				TeamID:            t.TeamID,
-				SchemaName:        t.SchemaName,
-				Enabled:           t.Enabled,
-				EventsTable:       events,
-				PersonsTable:      persons,
-				DataImportsSchema: dataImports,
+				TeamID:                  t.TeamID,
+				SchemaName:              t.SchemaName,
+				Enabled:                 t.Enabled,
+				EventsTable:             events,
+				PersonsTable:            persons,
+				PersonsDistinctIDsTable: personsDistinctIDs,
+				DataImportsSchema:       dataImports,
 			})
 			if owner, dup := teamOwners[t.TeamID]; dup {
 				// One team claimed by two orgs is a routing ambiguity — both
