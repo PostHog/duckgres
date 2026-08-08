@@ -1881,6 +1881,62 @@ provision_team_contract() { # org provisioned_team_id
   log "provision team OK: legacy default_team_id on the admin PUT is accepted and ignored"
 }
 
+# ---- admin-console provisioning parity -------------------------------------
+# Operators provision warehouses from the admin console
+# (ui/src/pages/ProvisionWarehouse.tsx). The console does NOT have its own
+# provisioning implementation: it POSTs the same body to the same
+# /api/v1/orgs/:id/provision route the PostHog backend uses, so a warehouse an
+# operator creates is identical to one a user creates. The SPA can't be driven
+# from this in-cluster Job (no browser), so this asserts the two backend facts
+# that make the parity real and would break silently if it regressed:
+#
+#   1. The body the console builds (buildProvisionBody: cnpg-shard metadata,
+#      s3bucket data store, ducklake enabled, team_id) reaches the real
+#      handler — replayed against the already-provisioned org it is refused
+#      with the warehouse-exists 409, NOT a 400 shape/validation error. A
+#      console-only request shape would 400 here.
+#   2. Provisioning is recorded in the admin audit log as
+#      "warehouse.provision" (the org's own provision, done at the top of this
+#      run through the very same route). Before the audit mapping existed,
+#      /provision, /deprovision and /reset-password all fell through to the
+#      generic "org.create" — indistinguishable from an org-config write in
+#      the console's audit view.
+#
+# Also pins the reason the console hard-codes ducklake.enabled=true: sending
+# false is a 400, so a toggle would only ever offer a guaranteed failure.
+admin_provision_parity() { # org team_id
+  org="$1"; team="$2"
+  log "admin console provisioning parity on $org"
+
+  # 1. The console's request body hits the shared handler (409 = warehouse
+  # exists, i.e. it passed validation and reached the store).
+  console_body='{"database_name":"'"$org"'","team_id":'"$team"',"metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":true}}'
+  code="$(curl -s -o /tmp/parity_out -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "$console_body" "$API/api/v1/orgs/$org/provision")"
+  [ "$code" = "409" ] \
+    || fail "provision parity: console body -> HTTP $code want 409 (existing warehouse): $(cat /tmp/parity_out)"
+  grep -q "non-terminal" /tmp/parity_out \
+    || fail "provision parity: 409 should name the non-terminal warehouse: $(cat /tmp/parity_out)"
+
+  # ducklake:false is rejected — why the console offers no toggle.
+  nodl='{"database_name":"'"$org"'","team_id":'"$team"',"metadata_store":{"type":"cnpg-shard"},"data_store":{"type":"s3bucket"},"ducklake":{"enabled":false}}'
+  code="$(curl -s -o /tmp/parity_nodl -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
+    -d "$nodl" "$API/api/v1/orgs/$org/provision")"
+  [ "$code" = "400" ] || fail "provision parity: ducklake.enabled=false -> HTTP $code want 400: $(cat /tmp/parity_nodl)"
+
+  # 2. The org's real provision is audited under the warehouse.provision action.
+  audit="$(curl -fsS -H "$H" "$API/api/v1/audit?org=$org&limit=500")" \
+    || fail "provision parity: GET /audit?org=$org failed"
+  echo "$audit" | jq -e --arg o "$org" \
+    'any(.entries[]?; .action=="warehouse.provision" and .method=="POST" and .org==$o and (.path | endswith("/provision")))' >/dev/null \
+    || fail "provision parity: no warehouse.provision audit entry for $org: $(echo "$audit" | jq -c '[.entries[]?|{action,method,path}]' | head -c 600)"
+  # Regression net for the old generic mapping: a /provision path must never be
+  # recorded as an org write.
+  echo "$audit" | jq -e 'any(.entries[]?; (.path | endswith("/provision")) and .action != "warehouse.provision") | not' >/dev/null \
+    || fail "provision parity: a /provision request was audited under a non-warehouse.provision action"
+  log "provision parity OK: shared endpoint + warehouse.provision audit on $org"
+}
+
 # ---- org teams CRUD (duckgres_org_teams via the provisioning API) -----------
 # The PostHog backend manages an org's team rows through
 # GET/POST /orgs/:id/teams + DELETE /orgs/:id/teams/:team_id. Contract asserted
@@ -3775,6 +3831,16 @@ lifecycle_teardown_cnpg() { # org
   fi
   [ "$(curl -fsS -H "$H" "$API/api/v1/database-name/check?name=$dbname" | jq -r '.available')" = "true" ] \
     || fail "database_name $dbname still squatted after org deletion"
+
+  # The console drives teardown through this same route, so the deprovision
+  # must read as a warehouse lifecycle action in the audit log rather than
+  # falling through to the generic org write (see admin_provision_parity).
+  # Filter by path, not org: the org row is gone by now, but audit rows are
+  # append-only and keep the org they were recorded against.
+  curl -fsS -H "$H" "$API/api/v1/audit?limit=500" \
+    | jq -e --arg p "/api/v1/orgs/$1/deprovision" \
+      'any(.entries[]?; .path==$p and .action=="warehouse.deprovision" and .method=="POST")' >/dev/null \
+    || fail "deprovision of $1 was not audited as warehouse.deprovision"
 }
 
 # ---- cnpg duckling: cnpg-shard metadata + DuckLake ------------------------
@@ -4345,6 +4411,7 @@ main() {
   # Provisioning/admin contracts are backend-independent; retain their live
   # coverage on the primary CNPG org.
   provision_team_contract "$CNPG" "$CNPG_TEAM_ID"
+  admin_provision_parity "$CNPG" "$CNPG_TEAM_ID"
   org_teams_crud "$CNPG" "$CNPG_TEAM_ID"
   discovery_endpoints "$CNPG" "$CNPG_TEAM_ID"
 

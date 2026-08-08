@@ -78,6 +78,44 @@ Added for the console:
 | `POST /api/v1/operators` | admin | add/update an operator (`{email, role}`; last-admin demotion → 409) |
 | `DELETE /api/v1/operators/:email` | admin | remove an operator (removing the last admin → 409) |
 
+### Warehouse provisioning — one implementation, two callers
+
+The console's **Provision warehouse** page (`ui/src/pages/ProvisionWarehouse.tsx`,
+route `/orgs/provision`) has **no provisioning backend of its own**. It posts to
+`POST /api/v1/orgs/:id/provision` — the route
+`controlplane/provisioning.RegisterAPI` mounts on *this* router group (see
+`multitenant.go`), i.e. the exact endpoint, handler, validation, transaction and
+analytics event the PostHog backend (Django) calls. A warehouse an operator
+creates from the console is therefore identical to one a user creates, by
+construction rather than by convention.
+
+Consequences to preserve:
+
+- **Never add an admin-local provisioning handler.** Two implementations would
+  drift, and the drift would only show up as differently-shaped tenants in
+  production. `provisioning.TestProvisioningAPIRouteTopology` pins the shared
+  route set and `admin.TestAdminAPIRegistersNoProvisioningRoutes` pins the
+  absence of an admin-side twin (gin only panics on an exactly-matching
+  duplicate, so a near-miss path would fork silently).
+- Because those routes live on the audited admin group, an operator's provision
+  and the PostHog backend's provision write the same audit action — they differ
+  only by actor (`internal-secret` vs the SSO email). The actions are
+  `warehouse.provision` / `warehouse.deprovision` / `warehouse.reset_password`
+  (`auditActionFor`; keep `ui/src/lib/audit.ts` labels in sync).
+- The client-side validation mirror (`ui/src/lib/provision.ts`) is a courtesy
+  only. Keeping it LOOSER than the server is safe (the error moves to submit
+  time); making it STRICTER blocks a body the PostHog backend may legitimately
+  send, which is exactly the divergence this surface exists to prevent.
+- The form hard-codes `ducklake.enabled=true` (the server rejects `false`) and
+  omits absent optional fields rather than sending empty strings, so the request
+  is byte-identical to the backend's for the same intent.
+
+The console also drives the sibling lifecycle endpoints on the same shared API:
+`GET /orgs/:id/warehouse/status` (the post-provision poll), `GET
+/database-name/check` (uniqueness pre-flight), `POST /orgs/:id/reset-password`
+(root rotation — the recovery path when a provision response is lost, since only
+the bcrypt hash is stored) and `POST /orgs/:id/deprovision`.
+
 ### Cross-CP live-state aggregation (`live_aggregate.go` + `controlplane/live_aggregator.go`)
 
 Live session/query state is **in-memory per CP** — each replica only knows the
@@ -147,9 +185,11 @@ embedded, under Vite, or under the Go devserver.
 
 **Backend:** `authz_test.go` (SSO role mapping, RoleGate, SQL classifier),
 `dashboard_test.go` (TokenSet / break-glass login / cookie), `api_test.go` +
-`api_postgres_test.go` (CRUD), `models_api_test.go` (redaction). e2e: the
-`admin_*` / `impersonation_*` / `models_explorer_api` assertions in
-`tests/e2e-mw-dev/harness.sh`.
+`api_postgres_test.go` (CRUD), `models_api_test.go` (redaction),
+`audit_test.go` (action mapping, incl. the warehouse lifecycle actions),
+`provision_parity_test.go` (no admin-side provisioning twin). e2e: the
+`admin_*` (incl. `admin_provision_parity`) / `impersonation_*` /
+`models_explorer_api` assertions in `tests/mw-dev/e2e/harness.sh`.
 
 **Frontend** (`ui/`, Vitest + Testing Library — `just ui-test`, CI job
 `ui-tests`): the dashboard's data-derivation logic has shipped wrong more than
@@ -160,3 +200,7 @@ of inline JSX. `src/lib/fleet.test.ts` pins the worker-fleet/load math
 `src/pages/Overview.test.tsx` renders the page with mocked hooks and asserts the
 Workers card + leak warning. New derivation/display logic on a page **must** get
 a `*.test.ts(x)` here — keep computed values out of the JSX so they're testable.
+The provisioning form follows the same rule for a stronger reason: the REQUEST it
+builds has to match the PostHog backend's, so the body construction and the
+validation mirror live in `src/lib/provision.ts` (`provision.test.ts`) and
+`src/pages/ProvisionWarehouse.test.tsx` asserts the page posts exactly that body.

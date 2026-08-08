@@ -107,7 +107,15 @@ for live views), TanStack Table (dense sortable tables), Recharts (trends). Page
 1. **Overview** — fleet vCPU/mem, worker counts by lifecycle state, hot-idle + queue depth,
    leader/replica health, cluster-wide query rate + error %.
 2. **Organizations** — list + detail; edit org config (max_workers, connections, default
-   worker cpu/mem/ttl, hot-idle floor, hostname alias); managed-warehouse view/edit.
+   worker cpu/mem/ttl, hot-idle floor, hostname alias); managed-warehouse view/edit;
+   **provision a warehouse** (`/orgs/provision`), deprovision, and rotate the root
+   password. The provisioning page is a form over the PUBLIC provisioning API — it posts
+   to `POST /api/v1/orgs/:id/provision`, the same route/handler/validation/transaction the
+   PostHog backend calls, so an operator-created warehouse is identical to a user-created
+   one. There is deliberately **no operator-only provisioning path**; the form even renders
+   the literal request it will send. See `controlplane/admin/README.md` ("Warehouse
+   provisioning — one implementation, two callers") for the invariants and the topology
+   tripwire tests that pin the absence of a second implementation.
 3. **Users** — per-org users CRUD; persistent secrets list/delete.
 4. **Live** — running queries / sessions / connections, sliced + filterable by org & user,
    with progress bars (SessionProgress), a running-query **Duration** column

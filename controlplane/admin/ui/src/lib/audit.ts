@@ -19,6 +19,11 @@ const ACTION_LABELS: Record<string, string> = {
   "warehouse.create": "Created warehouse config",
   "warehouse.update": "Updated warehouse config",
   "warehouse.delete": "Deleted warehouse config",
+  // Lifecycle actions on the shared provisioning API — real infrastructure,
+  // as opposed to the config-row edits above.
+  "warehouse.provision": "Provisioned warehouse",
+  "warehouse.deprovision": "Deprovisioned warehouse",
+  "warehouse.reset_password": "Reset warehouse root password",
 
   "team.create": "Created org team",
   "team.update": "Updated org team",

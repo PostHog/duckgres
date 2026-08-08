@@ -1,6 +1,18 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { AlertTriangle, ArrowLeft, Database, Layers, Pencil, Plus, Save, Trash2, Warehouse } from "lucide-react";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Database,
+  KeyRound,
+  Layers,
+  Pencil,
+  Plus,
+  Rocket,
+  Save,
+  Trash2,
+  Warehouse,
+} from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -32,10 +44,12 @@ import {
   useOrg,
   useOrgReshards,
   useOrgTeams,
+  useResetWarehousePassword,
   useUpdateOrg,
   useUpdateWarehouse,
   useWarehouse,
 } from "@/hooks/useApi";
+import { Copyable } from "@/components/Copyable";
 import {
   BackfillBadge,
   CreateTeamDialog,
@@ -505,9 +519,16 @@ function WarehousePanel({
         {loading ? (
           <LoadingState />
         ) : notFound || !data ? (
-          <p className="py-4 text-center text-sm text-muted-foreground">
-            No managed warehouse provisioned for this org.
-          </p>
+          <div className="space-y-3 py-4 text-center">
+            <p className="text-sm text-muted-foreground">No managed warehouse provisioned for this org.</p>
+            <AdminGate>
+              <Button size="sm" variant="outline" asChild>
+                <Link to="/orgs/provision">
+                  <Rocket className="h-4 w-4" /> Provision warehouse…
+                </Link>
+              </Button>
+            </AdminGate>
+          </div>
         ) : (
           <>
             {/* Read-only provisioning states */}
@@ -599,6 +620,10 @@ function WarehousePanel({
               </div>
             </div>
 
+            {/* Root credential rotation — the recovery path when a provision
+                response was lost. Same endpoint the PostHog backend calls. */}
+            {data.state === "ready" && <ResetRootPassword orgId={orgId} />}
+
             {/* Teardown + reshard */}
             {canDeprovision && (
               <div className="space-y-2 border-t border-border pt-3">
@@ -669,6 +694,77 @@ function WarehousePanel({
         </DialogContent>
       </Dialog>
     </Card>
+  );
+}
+
+// ResetRootPassword rotates the org's root login via POST
+// /orgs/:id/reset-password — the same endpoint the PostHog backend calls, and
+// the only way to recover from a lost provision response (duckgres stores only
+// the bcrypt hash). The new plaintext is returned once and rendered here; it is
+// never persisted client-side, so leaving the page loses it.
+function ResetRootPassword({ orgId }: { orgId: string }) {
+  const reset = useResetWarehousePassword(orgId);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [issued, setIssued] = useState<{ username: string; password: string } | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const run = async () => {
+    setErr(null);
+    try {
+      setIssued(await reset.mutateAsync());
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Reset failed");
+    }
+    setConfirmOpen(false);
+  };
+
+  return (
+    <div className="space-y-2 border-t border-border pt-3">
+      <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Root credentials</p>
+      <div className="flex items-center gap-3">
+        <AdminGate>
+          <Button variant="outline" size="sm" onClick={() => setConfirmOpen(true)}>
+            <KeyRound className="h-4 w-4" /> Reset root password
+          </Button>
+        </AdminGate>
+        <span className="text-xs text-muted-foreground">
+          Rotates the org's <span className="font-mono">root</span> login. Existing clients using the old
+          password stop authenticating.
+        </span>
+      </div>
+      {err && <p className="text-xs text-destructive">{err}</p>}
+      {issued && (
+        <div className="space-y-2 rounded-md border border-warning/40 bg-warning/5 p-3">
+          <p className="text-xs text-warning">
+            Shown once — duckgres stores only the bcrypt hash. Copy it now.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Copyable label="Username" value={issued.username} />
+            <Copyable label="Password" value={issued.password} />
+          </div>
+        </div>
+      )}
+
+      <Dialog open={confirmOpen} onOpenChange={(o) => setConfirmOpen(o)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Reset the root password for "{orgId}"?</DialogTitle>
+            <DialogDescription>
+              The current root password stops working immediately and cannot be recovered. Any client
+              still using it will fail to authenticate until it is updated.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setConfirmOpen(false)}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={run} disabled={reset.isPending}>
+              {reset.isPending ? "Resetting…" : "Reset password"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   );
 }
 
