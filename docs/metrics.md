@@ -214,6 +214,16 @@ These worker-local metrics have no tenant labels. Exactly one
 | `duckgres_worker_cache_proxy_reconnect_attempts_total` | None | Health checks made by the recovery supervisor. |
 | `duckgres_worker_cache_proxy_recoveries_total` | None | Successful cache re-enablement events. |
 
+### Cache proxy request-path metrics
+
+These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-proxy`), on its own `HEALTH_ADDR` `/metrics` endpoint — a separate process and port from the control plane's `:9090`. The `duckgres_worker_cache_proxy_*` family above is the worker-side client wrapper's view; these are the proxy's own view of the requests it served.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `cache_proxy_request_duration_seconds` | Histogram | `path`, `source` | End-to-end duration of a served request. `path` is `block` (block-aligned cache path) or `forward` (uncached forward-proxy path); `source` is `local`, `peer`, or `s3` for `block`, and always `origin` for `forward`. |
+| `cache_proxy_forward_requests_total` | Counter | `method` | Requests handled by the uncached forward-proxy path, by HTTP method. |
+| `cache_proxy_inflight_requests` | Gauge | None | Requests currently being handled by the proxy's request entry point; the queue-depth signal. |
+
 ## PromQL recipes
 
 Admission wait p95 by org and terminal result:

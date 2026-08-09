@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // originServer serves a synthetic object of objSize bytes where byte i has
@@ -812,6 +814,42 @@ func TestServeBlockAlignedPinsBlocksBeforeHeaders(t *testing.T) {
 		if want := byte(int64(i) % 251); b != want {
 			t.Fatalf("byte %d = %d, want %d", i, b, want)
 		}
+	}
+}
+
+// TestHandleProxyBlockModeRecordsInflightAndDuration guards the two
+// signals the phase-timing instrumentation exists to provide during an
+// investigation: the in-flight gauge must return to its pre-request value
+// once HandleProxy returns (so it reflects live queue depth, not a leak),
+// and a served block-mode request must land exactly one sample in the
+// request-duration histogram under its resolved source label.
+func TestHandleProxyBlockModeRecordsInflightAndDuration(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 4*blockSize)
+	defer origin.Close()
+	p, _ := newBlockProxy(t, origin, blockSize)
+	p.blockMode = true
+	originURL, _ := url.Parse(origin.URL)
+	p.cacheHostSuffixes = []string{originURL.Host}
+
+	inflightBefore := gaugeValue(t, inflightRequests)
+	countBefore := histogramSampleCount(t, requestDurationSeconds.WithLabelValues("block", "s3").(prometheus.Histogram))
+
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	req := httptest.NewRequest(http.MethodGet, u.String(), nil)
+	req.URL = u
+	req.Header.Set("Range", "bytes=100-2100")
+	w := httptest.NewRecorder()
+	p.HandleProxy(w, req)
+
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if got := gaugeValue(t, inflightRequests); got != inflightBefore {
+		t.Fatalf("inflightRequests after request = %v, want back to pre-request value %v", got, inflightBefore)
+	}
+	if got := histogramSampleCount(t, requestDurationSeconds.WithLabelValues("block", "s3").(prometheus.Histogram)); got != countBefore+1 {
+		t.Fatalf("requestDurationSeconds{block,s3} sample count delta = %v, want 1", got-countBefore)
 	}
 }
 

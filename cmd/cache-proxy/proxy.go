@@ -268,6 +268,9 @@ var hopByHop = map[string]bool{
 // HandleProxy handles forward HTTP proxy requests from DuckDB httpfs.
 // Expects absolute-form URIs (scheme + host + path in the request-line).
 func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	inflightRequests.Inc()
+	defer inflightRequests.Dec()
+
 	// HTTPS via CONNECT tunnel — we can't cache encrypted traffic, but we must
 	// still tunnel it so DuckDB can reach external HTTPS sources (e.g.
 	// read_parquet('https://datasets.clickhouse.com/...')) while
@@ -719,6 +722,8 @@ func (p *CacheProxy) serveStream(w http.ResponseWriter, r io.Reader, size int64,
 // S3 rejected it. The fix is to mirror ContentLength + TransferEncoding +
 // Trailer from the inbound request so the proxy is wire-shape-transparent.
 func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
+	forwardRequestsTotal.WithLabelValues(r.Method).Inc()
+	forwardStart := time.Now()
 	ctx, span := proxyTracer.Start(r.Context(), "cache.forward", trace.WithAttributes(requestSpanAttrs(r)...))
 	defer span.End()
 	r = r.WithContext(ctx)
@@ -775,9 +780,11 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(resp.StatusCode)
 		n, _ := io.Copy(w, resp.Body)
 		span.SetAttributes(attribute.Int64("duckgres.bytes", n))
+		dur := time.Since(forwardStart)
+		requestDurationSeconds.WithLabelValues("forward", "origin").Observe(dur.Seconds())
 		slog.Info("Forward-proxy served.",
 			"method", r.Method, "url", r.URL.String(),
-			"status", resp.StatusCode, "bytes", n)
+			"status", resp.StatusCode, "bytes", n, "dur_ms", dur.Milliseconds())
 		return
 	}
 
