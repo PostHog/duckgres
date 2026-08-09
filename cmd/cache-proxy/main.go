@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -163,6 +164,13 @@ func main() {
 		_, _ = fmt.Fprint(w, "OK")
 	})
 	healthMux.Handle("/metrics", promhttp.Handler())
+	// net/http/pprof's init() only registers on http.DefaultServeMux; since
+	// this server uses its own mux, the handlers must be added explicitly.
+	healthMux.HandleFunc("/debug/pprof/", pprof.Index)
+	healthMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	healthMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	healthMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	healthMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	healthServer := &http.Server{Addr: healthAddr, Handler: healthMux}
 
 	// Start servers

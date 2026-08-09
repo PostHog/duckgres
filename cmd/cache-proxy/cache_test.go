@@ -33,6 +33,15 @@ func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
 	return m.GetGauge().GetValue()
 }
 
+func histogramSampleCount(t *testing.T, h prometheus.Histogram) uint64 {
+	t.Helper()
+	var m dto.Metric
+	if err := h.Write(&m); err != nil {
+		t.Fatalf("read histogram: %v", err)
+	}
+	return m.GetHistogram().GetSampleCount()
+}
+
 // errAfterReader yields n bytes then returns a non-EOF error, simulating an
 // origin/peer connection dropping mid-body.
 type errAfterReader struct {

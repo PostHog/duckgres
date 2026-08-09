@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -27,6 +28,15 @@ var (
 		Name: "cache_proxy_block_reads_total",
 		Help: "Blocks resolved while assembling responses, by source",
 	}, []string{"source"}) // local, peer, s3
+	// requestDurationSeconds is shared between the block-serve path (this
+	// file) and the forward-proxy path (proxy.go); buckets start at 1ms
+	// because a local cache hit can be sub-millisecond and top out around 8s
+	// to cover multi-block cold-origin fetches.
+	requestDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "cache_proxy_request_duration_seconds",
+		Help:    "End-to-end proxy request duration by served path and byte source",
+		Buckets: prometheus.ExponentialBuckets(0.001, 2, 14),
+	}, []string{"path", "source"})
 )
 
 type exactLengthReader struct {
@@ -174,6 +184,9 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 // at maxSpanBlocks per origin request). Returns false when the request shape
 // is not block-servable; the caller then runs the legacy exact-range path.
 func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, rangeHeader string) bool {
+	requestStart := time.Now()
+	var peerDur, s3Dur, writeDur time.Duration
+
 	// A misconfigured or not-yet-wired proxy (blockSize/maxSpanBlocks left at
 	// their zero value) must fall back rather than divide by zero in
 	// blockSpan or loop forever in flushRun's `lo += p.maxSpanBlocks`.
@@ -223,7 +236,10 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			// covered — silently leaving trailing blocks unfetched.
 			flightKey := fmt.Sprintf("%s|%d", BlockKey(urlStr, lo, p.blockSize), hi)
 			_, err := p.flights.Do(flightKey, func() (fetchResult, error) {
-				return fetchResult{}, p.fetchOriginSpan(r, p.blockSize, lo, hi)
+				fetchStart := time.Now()
+				fetchErr := p.fetchOriginSpan(r, p.blockSize, lo, hi)
+				s3Dur += time.Since(fetchStart)
+				return fetchResult{}, fetchErr
 			})
 			if err != nil {
 				var oe *originStatusError
@@ -272,9 +288,12 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			continue
 		}
 		if p.peers != nil {
-			if _, _, ok := p.peers.FetchFromPeers(key, func(rd io.Reader) (int64, error) {
+			peerStart := time.Now()
+			_, _, ok := p.peers.FetchFromPeers(key, func(rd io.Reader) (int64, error) {
 				return p.store.PutStream(key, rd)
-			}); ok {
+			})
+			peerDur += time.Since(peerStart)
+			if ok {
 				if !flushRun(idx - 1) {
 					return true
 				}
@@ -308,7 +327,10 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		}
 		lo := reverifyStart
 		reverifyStart = -1
-		if err := p.fetchOriginSpan(r, p.blockSize, lo, runEnd); err != nil {
+		fetchStart := time.Now()
+		err := p.fetchOriginSpan(r, p.blockSize, lo, runEnd)
+		s3Dur += time.Since(fetchStart)
+		if err != nil {
 			slog.Warn("Presence re-fetch failed; failing closed below if blocks are still missing.",
 				"url", urlStr, "blocks", fmt.Sprintf("%d-%d", lo, runEnd), "error", err)
 			return
@@ -429,6 +451,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 
 	served := int64(0)
 	for i := range opened {
+		writeStart := time.Now()
 		if opened[i].skip > 0 {
 			// Block readers are disk files, so jump to the slice instead of
 			// reading and discarding the prefix — the discard costs up to a
@@ -442,14 +465,20 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			}
 		}
 		n, _ := io.CopyN(w, opened[i].reader, opened[i].want)
+		writeDur += time.Since(writeStart)
 		served += n
 		if n < opened[i].want {
 			return true
 		}
 	}
-	cacheBytesServed.WithLabelValues(sourceLabel(nPeer, nOrigin)).Add(float64(served))
+	source := sourceLabel(nPeer, nOrigin)
+	cacheBytesServed.WithLabelValues(source).Add(float64(served))
+	totalDur := time.Since(requestStart)
+	requestDurationSeconds.WithLabelValues("block", source).Observe(totalDur.Seconds())
 	slog.Info("Served.", "source", "blocks", "url", urlStr, "range", rangeHeader,
-		"bytes", served, "blocks_local", nLocal, "blocks_peer", nPeer, "blocks_s3", nOrigin)
+		"bytes", served, "blocks_local", nLocal, "blocks_peer", nPeer, "blocks_s3", nOrigin,
+		"dur_ms", totalDur.Milliseconds(), "peer_ms", peerDur.Milliseconds(),
+		"s3_ms", s3Dur.Milliseconds(), "write_ms", writeDur.Milliseconds())
 	return true
 }
 
