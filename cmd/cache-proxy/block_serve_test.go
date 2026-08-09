@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -499,6 +500,134 @@ func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
 	}
 	if got := counterValue(t, cacheBytesServed.WithLabelValues("peer")); got != peerBytesBefore+100 {
 		t.Fatalf("cacheBytesServed{peer} delta = %v, want 100 (sourceLabel must resolve to peer when no origin fetch happened)", got-peerBytesBefore)
+	}
+}
+
+// TestServeBlockAlignedPeerFillsRunConcurrently locks in the parallel peer
+// fill behavior: the peer's /cache/get handlers gate on all three of the
+// request's blocks being fetched at once, so a regression to one-at-a-time
+// fills can never open the gate — the request would hedge to a closed origin
+// and fail instead of assembling the response.
+func TestServeBlockAlignedPeerFillsRunConcurrently(t *testing.T) {
+	const blockSize = 1024
+	const nBlocks = 3
+	origin := originServer(t, nBlocks*blockSize)
+	target := origin.URL + "/bucket/f.parquet"
+
+	body := make([]byte, nBlocks*blockSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	keys := make(map[string]int64, nBlocks)
+	for idx := int64(0); idx < nBlocks; idx++ {
+		keys[BlockKey(target, idx, blockSize)] = idx
+	}
+
+	var arrivals int32
+	gate := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := keys[r.URL.Query().Get("key")]; ok {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		idx, ok := keys[r.URL.Query().Get("key")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if atomic.AddInt32(&arrivals, 1) == nBlocks {
+			close(gate)
+		}
+		<-gate
+		block := body[idx*blockSize : (idx+1)*blockSize]
+		w.Header().Set("Content-Length", strconv.Itoa(len(block)))
+		_, _ = w.Write(block)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	origin.Close() // all blocks must come from the peer; a hedge to origin fails loudly
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(srv.URL, "http://")}), []string{})
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+
+	w := doBlockRequest(t, p, target, fmt.Sprintf("bytes=0-%d", nBlocks*blockSize-1))
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status %d, want 206 (sequential fills would starve the gate and hedge into the closed origin)", w.Code)
+	}
+	if got := w.Body.Bytes(); string(got) != string(body) {
+		t.Fatalf("body mismatch: got %d bytes, want %d", len(got), len(body))
+	}
+	if got := atomic.LoadInt32(&arrivals); got != nBlocks {
+		t.Fatalf("peer /cache/get arrivals = %d, want %d", got, nBlocks)
+	}
+}
+
+// TestServeBlockAlignedHedgesSlowPeerToOrigin covers the wait budget: a peer
+// that claims the block but stalls the body transfer must not pin the request
+// for the full peer get timeout — after peerFillWaitBudget the block is
+// fetched from origin and the response completes.
+func TestServeBlockAlignedHedgesSlowPeerToOrigin(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 4*blockSize)
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/f.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") == key {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		<-release // stall the body transfer past the wait budget
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) }) // LIFO: unblock the handler before srv.Close waits on it
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(srv.URL, "http://")}), []string{})
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	p.peerFillWaitBudget = 50 * time.Millisecond
+
+	hedgedBefore := counterValue(t, peerFillHedgedTotal)
+	s3ReadsBefore := counterValue(t, blockReadsTotal.WithLabelValues("s3"))
+
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status %d, want 206", w.Code)
+	}
+	want := make([]byte, 100)
+	for i := range want {
+		want[i] = byte(i % 251)
+	}
+	if got := w.Body.Bytes(); string(got) != string(want) {
+		t.Fatalf("body mismatch: got %d bytes", len(got))
+	}
+	if got := counterValue(t, peerFillHedgedTotal); got != hedgedBefore+1 {
+		t.Fatalf("peerFillHedgedTotal delta = %v, want 1", got-hedgedBefore)
+	}
+	if got := counterValue(t, blockReadsTotal.WithLabelValues("s3")); got != s3ReadsBefore+1 {
+		t.Fatalf("blockReadsTotal{s3} delta = %v, want 1 (hedged block must be served from origin)", got-s3ReadsBefore)
 	}
 }
 

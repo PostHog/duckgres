@@ -223,6 +223,7 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_request_duration_seconds` | Histogram | `path`, `source` | End-to-end duration of a served request. `path` is `block` (block-aligned cache path) or `forward` (uncached forward-proxy path); `source` is `local`, `peer`, or `s3` for `block`, and always `origin` for `forward`. |
 | `cache_proxy_forward_requests_total` | Counter | `method` | Requests handled by the uncached forward-proxy path, by HTTP method. |
 | `cache_proxy_inflight_requests` | Gauge | None | Requests currently being handled by the proxy's request entry point; the queue-depth signal. |
+| `cache_proxy_peer_fill_hedged_total` | Counter | None | Blocks fetched from origin because their peer fill did not finish within the wait budget; the peer fetch continues in the background and still populates the cache. A high rate means peers are answering slower than the origin path. |
 
 ## PromQL recipes
 

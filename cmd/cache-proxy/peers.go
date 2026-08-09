@@ -31,8 +31,16 @@ var (
 // separate: sharing one 2s budget (as the original code did) meant a slow
 // has-race ate into the body-transfer time and large peer ranges timed out
 // mid-stream, silently downgrading the hit to a full S3 fetch.
+//
+// The has budget is deliberately tight: a healthy peer answers the probe in
+// single-digit ms even under load, while an origin block fetch costs roughly
+// 200ms — so once a probe has gone unanswered for ~150ms, waiting longer only
+// delays a faster origin fallback. FetchFromPeers waits for every peer's "no"
+// before giving up, which means the slowest peer in the fleet gates every
+// cold fill; with a 1s budget, production trails showed 16% of cold-scan
+// requests burning the full second on that drain.
 const (
-	peerHasTimeout = 1 * time.Second
+	peerHasTimeout = 150 * time.Millisecond
 	peerGetTimeout = 30 * time.Second
 )
 

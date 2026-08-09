@@ -28,6 +28,10 @@ var (
 		Name: "cache_proxy_block_reads_total",
 		Help: "Blocks resolved while assembling responses, by source",
 	}, []string{"source"}) // local, peer, s3
+	peerFillHedgedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_peer_fill_hedged_total",
+		Help: "Block fills sent to origin because the peer wait budget expired (the peer fetch continues in background)",
+	})
 	// requestDurationSeconds is shared between the block-serve path (this
 	// file) and the forward-proxy path (proxy.go); buckets start at 1ms
 	// because a local cache hit can be sub-millisecond and top out around 8s
@@ -178,6 +182,42 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 	return nil
 }
 
+// peerFillConcurrency bounds how many of one request's blocks are fetched
+// from peers at the same time. Requests typically span one or two blocks, so
+// this only matters for wide spans, where it keeps a single request from
+// monopolizing peer bandwidth.
+const peerFillConcurrency = 8
+
+// peerFill is the handle for one block's background peer fetch: done closes
+// when the fetch finishes, and ok reports whether a peer delivered the block.
+type peerFill struct {
+	done chan struct{}
+	ok   bool
+}
+
+// waitFill waits for a peer fill until deadline. filled reports whether the
+// block is now on local disk; hedged reports that the budget expired first —
+// the block should be fetched from origin while the fill keeps running in the
+// background (a late fill still populates the cache for future requests).
+func waitFill(f *peerFill, deadline time.Time) (filled, hedged bool) {
+	select {
+	case <-f.done:
+		return f.ok, false
+	default:
+	}
+	if wait := time.Until(deadline); wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-f.done:
+			return f.ok, false
+		case <-timer.C:
+		}
+	}
+	peerFillHedgedTotal.Inc()
+	return false, true
+}
+
 // serveBlockAligned serves a cacheable GET whose Range is an absolute
 // bytes=start-end pair from block-aligned cache entries: local disk, then
 // peers, then coalesced origin fetches for contiguous missing runs (chunked
@@ -218,9 +258,45 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		return false
 	}
 
+	// Launch peer fills for every block not already on local disk, in
+	// parallel — fetching them one at a time made a request's peer wait scale
+	// linearly with its block count. Phase 1 below consumes each block's
+	// result in order, so the miss-run coalescing and single-flight keys are
+	// unchanged. All waits share one absolute deadline: the fills started
+	// together, so time spent waiting on one block has also elapsed for the
+	// rest.
+	var fills map[int64]*peerFill
+	var fillDeadline time.Time
+	if p.peers != nil {
+		fills = make(map[int64]*peerFill, blockCount)
+		sem := make(chan struct{}, peerFillConcurrency)
+		for idx := firstIdx; idx <= lastIdx; idx++ {
+			key := BlockKey(urlStr, idx, p.blockSize)
+			if p.store.Has(key) {
+				continue
+			}
+			f := &peerFill{done: make(chan struct{})}
+			fills[idx] = f
+			go func() {
+				defer close(f.done)
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				_, _, ok := p.peers.FetchFromPeers(key, func(rd io.Reader) (int64, error) {
+					return p.store.PutStream(key, rd)
+				})
+				f.ok = ok
+			}()
+		}
+		budget := p.peerFillWaitBudget
+		if budget <= 0 {
+			budget = defaultPeerFillWaitBudget
+		}
+		fillDeadline = time.Now().Add(budget)
+	}
+
 	// Phase 1: ensure every block is present locally. Track sources for the
 	// hit/miss accounting and the log line.
-	var nLocal, nPeer, nOrigin int64
+	var nLocal, nPeer, nOrigin, nHedged int64
 	var missRunStart int64 = -1
 	flushRun := func(runEnd int64) bool {
 		if missRunStart < 0 {
@@ -277,25 +353,19 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	}
 	for idx := firstIdx; idx <= lastIdx; idx++ {
 		key := BlockKey(urlStr, idx, p.blockSize)
-		if p.store.Has(key) {
-			if !flushRun(idx - 1) {
-				return true // error already written
-			}
-			if idx > lastIdx {
-				break
-			}
-			nLocal++
-			continue
-		}
-		if p.peers != nil {
+		// The fill check must precede the Has check: a block our own prefetch
+		// has already landed would otherwise pass Has and be counted as a
+		// local hit, corrupting the local/peer split in the log and metrics.
+		if f := fills[idx]; f != nil {
 			peerStart := time.Now()
-			_, _, ok := p.peers.FetchFromPeers(key, func(rd io.Reader) (int64, error) {
-				return p.store.PutStream(key, rd)
-			})
+			filled, hedged := waitFill(f, fillDeadline)
 			peerDur += time.Since(peerStart)
-			if ok {
+			if hedged {
+				nHedged++
+			}
+			if filled {
 				if !flushRun(idx - 1) {
-					return true
+					return true // error already written
 				}
 				if idx > lastIdx {
 					break
@@ -303,6 +373,19 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 				nPeer++
 				continue
 			}
+			// Fall through: a concurrent request may have landed the block
+			// since the fill failed, so the Has check below can still rescue
+			// it from an origin fetch.
+		}
+		if p.store.Has(key) {
+			if !flushRun(idx - 1) {
+				return true
+			}
+			if idx > lastIdx {
+				break
+			}
+			nLocal++
+			continue
 		}
 		if missRunStart < 0 {
 			missRunStart = idx
@@ -477,6 +560,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	requestDurationSeconds.WithLabelValues("block", source).Observe(totalDur.Seconds())
 	slog.Info("Served.", "source", "blocks", "url", urlStr, "range", rangeHeader,
 		"bytes", served, "blocks_local", nLocal, "blocks_peer", nPeer, "blocks_s3", nOrigin,
+		"blocks_hedged", nHedged,
 		"dur_ms", totalDur.Milliseconds(), "peer_ms", peerDur.Milliseconds(),
 		"s3_ms", s3Dur.Milliseconds(), "write_ms", writeDur.Milliseconds())
 	return true

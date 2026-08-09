@@ -63,6 +63,12 @@ type CacheProxy struct {
 	blockSize     int64
 	maxSpanBlocks int64
 
+	// peerFillWaitBudget bounds how long a block request waits on its
+	// concurrent peer fills before falling back to a coalesced origin fetch.
+	// The fills keep running past the budget and still populate the cache;
+	// see serveBlockAligned.
+	peerFillWaitBudget time.Duration
+
 	// objectSizes remembers validated complete lengths learned from origin
 	// Content-Range responses. Disk blocks remain the durable cache; this map
 	// lets subsequent requests in the same process emit precise range headers
@@ -85,6 +91,12 @@ const (
 	defaultOriginRetryMaxAttempts    = 4
 	defaultOriginRetryInitialBackoff = 100 * time.Millisecond
 	defaultOriginRetryMaxBackoff     = 1 * time.Second
+
+	// defaultPeerFillWaitBudget caps a block request's wait on peer fills. It
+	// covers the 150ms has-round plus a healthy same-VPC 1MiB body transfer
+	// with slack; a holder that can't deliver within it is slower than the
+	// ~200ms origin path the request falls back to.
+	defaultPeerFillWaitBudget = 400 * time.Millisecond
 )
 
 type singleFlight struct {
@@ -133,6 +145,7 @@ func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []str
 		originRetryInitialBackoff: defaultOriginRetryInitialBackoff,
 		originRetryMaxBackoff:     defaultOriginRetryMaxBackoff,
 		cacheHostSuffixes:         cacheHostSuffixes,
+		peerFillWaitBudget:        defaultPeerFillWaitBudget,
 	}
 }
 
