@@ -279,6 +279,14 @@ func SetConnectionTeamID(cc *clientConn, teamID int64) {
 	}
 }
 
+// SetConnectionIdleTimeout applies a previously validated connect-time client
+// idle-timeout request. The control plane calls this before RunMessageLoop.
+func SetConnectionIdleTimeout(cc *clientConn, timeout time.Duration) {
+	if cc != nil && timeout > 0 {
+		cc.idleTimeout = timeout
+	}
+}
+
 // ConnectionBilling returns the data needed to meter one connection's
 // compute-usage at teardown: the org, the authenticated username (used to
 // resolve the informational team id stamped onto the bucket — the user's own

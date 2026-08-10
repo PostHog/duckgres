@@ -60,6 +60,40 @@ func TestResolveEffectiveParsesK8sWorkerMaxTTL(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveParsesClientIdleTimeoutMax(t *testing.T) {
+	var warned []string
+	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
+		switch key {
+		case "DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX":
+			return "15m"
+		default:
+			return ""
+		}
+	}, func(msg string) { warned = append(warned, msg) })
+	if resolved.Server.ClientIdleTimeoutMax != 15*time.Minute {
+		t.Fatalf("ClientIdleTimeoutMax = %s, want 15m", resolved.Server.ClientIdleTimeoutMax)
+	}
+	if len(warned) != 0 {
+		t.Fatalf("unexpected warnings: %v", warned)
+	}
+}
+
+func TestResolveEffectiveRejectsInvalidClientIdleTimeoutMax(t *testing.T) {
+	var warned []string
+	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
+		if key == "DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX" {
+			return "-1s"
+		}
+		return ""
+	}, func(msg string) { warned = append(warned, msg) })
+	if resolved.Server.ClientIdleTimeoutMax != 0 {
+		t.Fatalf("ClientIdleTimeoutMax = %s, want disabled", resolved.Server.ClientIdleTimeoutMax)
+	}
+	if len(warned) != 1 {
+		t.Fatalf("warnings = %v, want one invalid-duration warning", warned)
+	}
+}
+
 func TestResolveEffectiveParsesK8sWorkerDefaultTTL(t *testing.T) {
 	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
 		if key == "DUCKGRES_K8S_WORKER_DEFAULT_TTL" {

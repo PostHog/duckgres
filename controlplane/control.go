@@ -1148,6 +1148,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	sessionStart := observe.BeginSessionStart(orgID, "postgres")
 	defer sessionStart.Finish("error", observe.SessionStartReasonUnknown)
 
+	// Validate a client-requested idle timeout before acquiring a worker so a
+	// rejected request cannot consume worker or admission capacity.
+	var clientIdleTimeout time.Duration
+	if raw, ok := startupOptions[server.ClientIdleTimeoutGUCName]; ok {
+		var err error
+		clientIdleTimeout, err = server.ValidateClientIdleTimeoutOption(raw, cp.cfg.ClientIdleTimeoutMax)
+		if err != nil {
+			sessionStart.Finish("error", observe.SessionStartReasonClient)
+			clog.Warn("Rejected client idle-timeout request.", "error", err)
+			_ = server.WriteErrorResponse(writer, "FATAL", "22023", err.Error())
+			_ = writer.Flush()
+			return
+		}
+	}
+
 	// Resolve the requested worker shape from the connection-string startup
 	// options (duckgres.worker_cpu / worker_memory / worker_ttl), layered on
 	// top of the org's operator-set default profile (multi-tenant only).
@@ -1508,6 +1523,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		sessionExec = executor
 	}
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, sessionExec, pid, secretKey, workerID, workerPod)
+	server.SetConnectionIdleTimeout(cc, clientIdleTimeout)
 	// Stamp the PostHog team id (config-snapshot read, no I/O) so this
 	// connection's product-analytics events carry a PostHog-native key. Same
 	// resolution the compute meter uses: the connecting user's team, else the

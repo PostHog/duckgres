@@ -37,9 +37,10 @@ type ChildConfig struct {
 	RemoteAddr string `json:"remote_addr"`
 
 	// Server config
-	DataDir     string   `json:"data_dir"`
-	Extensions  []string `json:"extensions"`
-	IdleTimeout int64    `json:"idle_timeout"` // nanoseconds
+	DataDir              string   `json:"data_dir"`
+	Extensions           []string `json:"extensions"`
+	IdleTimeout          int64    `json:"idle_timeout"`            // nanoseconds
+	ClientIdleTimeoutMax int64    `json:"client_idle_timeout_max"` // nanoseconds
 
 	// TLS config
 	TLSCertFile string `json:"tls_cert_file"`
@@ -292,13 +293,14 @@ func runChildWorker(tcpConn *net.TCPConn, cfg *ChildConfig) int {
 
 	// Create a minimal server config for the worker
 	serverCfg := Config{
-		DataDir:     cfg.DataDir,
-		Extensions:  cfg.Extensions,
-		DuckLake:    cfg.DuckLake,
-		IdleTimeout: time.Duration(cfg.IdleTimeout),
-		TLSCertFile: cfg.TLSCertFile,
-		TLSKeyFile:  cfg.TLSKeyFile,
-		Users:       cfg.Users,
+		DataDir:              cfg.DataDir,
+		Extensions:           cfg.Extensions,
+		DuckLake:             cfg.DuckLake,
+		IdleTimeout:          time.Duration(cfg.IdleTimeout),
+		ClientIdleTimeoutMax: time.Duration(cfg.ClientIdleTimeoutMax),
+		TLSCertFile:          cfg.TLSCertFile,
+		TLSKeyFile:           cfg.TLSKeyFile,
+		Users:                cfg.Users,
 	}
 
 	// Reconstruct parent server start time for uptime() macro.
