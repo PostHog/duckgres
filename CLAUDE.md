@@ -94,7 +94,8 @@ In topologies 2 and 3, the control plane exposes only PostgreSQL wire protocol t
 
 ### Key Components
 
-- **main.go / config_resolution.go**: CLI flags; effective config resolution (CLI > env > YAML > defaults), including env-only K8s knobs.
+- **main.go / cmd/**: entry points. `main.go` is the all-in-one binary (all four modes); `cmd/duckgres-controlplane` is the production control plane, `cmd/duckgres-worker` the production worker.
+- **configresolve/**: CLI flags (`cliflags.go`) and effective config resolution (`resolve.go`; CLI > env > YAML > defaults), including env-only K8s knobs. `controlplane.go` is the SINGLE place a resolved config becomes a `controlplane.ControlPlaneConfig` — both control-plane entry points call it (see Configuration below).
 - **server/** — PG wire protocol server and DuckDB execution
   - Wire protocol & connections: `server.go`, `conn.go`, `conn_errors.go`, `conn_query_exec.go`, `conn_results.go`, `conn_copy.go`, `conn_extended_query.go`, `conn_pg_stat_activity.go`, `conn_cursor.go`, `protocol.go`, `exports.go`
   - Execution: `executor.go`, `flight_executor.go`, `chsql.go`, `transient.go`
@@ -140,7 +141,7 @@ Key CLI flags for control-plane mode:
   - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
   - Compute-usage billing needs no config: metering is always on for the remote backend and billing PULLS usage over the internal-secret-authed HTTP API (`GET /api/v1/billing/usage` + `POST /api/v1/billing/ack`). See `docs/design/billing-pull-api.md` and "Compute-Usage Billing" below.
-  - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
+  - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `configresolve/resolve.go`.
 
 Key CLI flags for duckdb-service mode:
 - `--duckdb-listen` (e.g., `unix:///...` or `:8816`)
@@ -150,13 +151,33 @@ Key CLI flags for duckdb-service mode:
 
 ## Configuration
 
-Configuration is resolved in `config_resolution.go` with the following precedence (highest to lowest):
+Configuration is resolved in `configresolve/resolve.go` with the following precedence (highest to lowest):
 1. CLI flags (`--port`, `--config`, etc.)
 2. Environment variables (`DUCKGRES_PORT`, etc.)
 3. YAML config file
 4. Built-in defaults
 
 Note: `--mode` is CLI-only (not loadable from YAML/env). A handful of K8s pod-scheduling knobs are env-only (no CLI flag).
+
+**A resolved knob only reaches the control plane through
+`configresolve.ControlPlaneConfig`** (`configresolve/controlplane.go`). That is
+the SINGLE assembly site for `controlplane.ControlPlaneConfig`, shared by both
+entry points — the all-in-one `duckgres --mode control-plane` (`main.go`) and the
+production `cmd/duckgres-controlplane` (`Dockerfile.controlplane`, its own CD
+pipeline). It exists because the two binaries previously each carried a
+hand-maintained ~56-field literal with nothing forcing them to agree, and two
+knobs had silently drifted out of the PRODUCTION one — `DUCKGRES_USER_SECRET_KEY`
+and every `DUCKGRES_TRINO_BENCHMARK_*` variable were resolved into memory and
+then dropped, so the features they configure were dead in production while the
+mw-dev scenario (which builds the all-in-one binary) passed. Add a knob to
+`Resolved` and wire it in that one function; never re-introduce a second literal.
+`configresolve/controlplane_test.go` is the tripwire, and it checks MAPPING
+COVERAGE in both directions rather than runtime values (zero is a legitimate
+value for an unset TTL, an empty PriorityClass, or a false feature gate): every
+destination field must be movable by some input, and every `Resolved` field must
+change the output. Its two exemption maps are structural facts with stated
+reasons, not a dumping ground. **When two Dockerfiles select different
+entrypoints, treat duplicated config assembly as a field-by-field review item.**
 
 ## Keep docs in sync with behavior
 
