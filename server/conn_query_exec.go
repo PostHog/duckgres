@@ -706,6 +706,31 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		return false, nil
 	}
 
+	// duckgres.worker_ttl custom GUC (SET / SHOW): intercepted session-side
+	// and applied via the bound worker's pool-side hot-idle TTL override. A
+	// failed apply aborts the rest of the batch — later statements may depend
+	// on the requested warm-retention state.
+	if result.WorkerTTLSet != nil {
+		// Lazy activation: the override needs a worker to apply to (see the
+		// matching site in handleQuery). Not pinning, so the exploratory tier
+		// is enough.
+		if err := c.activateForStatement(query, false); err != nil {
+			return false, err
+		}
+		if err := c.applyWorkerTTLSetting(*result.WorkerTTLSet); err != nil {
+			c.sendError("ERROR", workerTTLApplyErrorSQLState(err), err.Error())
+			return true, nil
+		}
+		_ = c.writeCommandComplete("SET")
+		return false, nil
+	}
+	if result.WorkerTTLShow {
+		_ = c.sendRowDescription([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		_ = c.sendDataRowWithFormats([]interface{}{c.workerTTLValue()}, nil, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return false, nil
+	}
+
 	if result.IsIgnoredSet {
 		_ = c.writeCommandComplete("SET")
 		return false, nil

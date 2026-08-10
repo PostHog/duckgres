@@ -175,6 +175,22 @@ var exploratoryEscalationsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 // post-swap `duckgres.s3_cache` re-apply failed. See failS3CacheReapply.
 var errS3CacheReapplyFailed = errors.New("s3_cache re-apply after worker switch failed")
 
+// errWorkerTTLReapplyFailed is the duckgres.worker_ttl twin of
+// errS3CacheReapplyFailed: the escalation succeeded, only the post-swap TTL
+// re-apply failed — also statement-scoped, never connection-fatal.
+var errWorkerTTLReapplyFailed = errors.New("worker_ttl re-apply after worker switch failed")
+
+// workerTTLReapplyError tags a worker_ttl re-apply failure with
+// errWorkerTTLReapplyFailed WITHOUT the sentinel's text landing in the
+// client-visible message (mirrors s3CacheReapplyError).
+type workerTTLReapplyError struct{ err error }
+
+func (e *workerTTLReapplyError) Error() string { return e.err.Error() }
+
+func (e *workerTTLReapplyError) Unwrap() error { return e.err }
+
+func (e *workerTTLReapplyError) Is(target error) bool { return target == errWorkerTTLReapplyFailed }
+
 // s3CacheReapplyError tags a re-apply failure with errS3CacheReapplyFailed
 // WITHOUT the sentinel's text landing in the client-visible message — the
 // wrapped error already names the GUC and the worker switch.
@@ -229,6 +245,15 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	if err := c.reapplyS3CacheAfterWorkerSwitch(ctx); err != nil {
 		c.s3CacheMode = transform.S3CacheOn
 		return &s3CacheReapplyError{err: err}
+	}
+	// Same re-assertion for a duckgres.worker_ttl override: it is pool-side
+	// per-worker state, and the new worker's profile carries the TTL resolved
+	// at connect time. On failure the session override is cleared (the new
+	// worker parks with its own baseline, so session state must match) and
+	// the STATEMENT fails; the escalation stands, as above.
+	if err := c.reapplyWorkerTTLAfterWorkerSwitch(ctx); err != nil {
+		c.workerTTLOverride = nil
+		return &workerTTLReapplyError{err: err}
 	}
 	return nil
 }
@@ -323,11 +348,12 @@ func (c *clientConn) failWorkerEscalation(query string, escErr error, clientMess
 // failEscalation is the single entry point for an escalateWorker error: it
 // routes the connection-fatal shape (the switcher failed, previous session
 // gone) to failWorkerEscalation, and the statement-scoped shape (the swap
-// succeeded, only the s3_cache re-apply failed) to failS3CacheReapply. Every
-// call site uses it so the two can never be confused at one of them.
+// succeeded, only a post-swap GUC re-apply failed) to
+// failReapplyAfterWorkerSwitch. Every call site uses it so the two can never
+// be confused at one of them.
 func (c *clientConn) failEscalation(query string, escErr error, clientMessage string) error {
-	if errors.Is(escErr, errS3CacheReapplyFailed) {
-		return c.failS3CacheReapply(query, escErr)
+	if errors.Is(escErr, errS3CacheReapplyFailed) || errors.Is(escErr, errWorkerTTLReapplyFailed) {
+		return c.failReapplyAfterWorkerSwitch(query, escErr)
 	}
 	return c.failWorkerEscalation(query, escErr, clientMessage)
 }
@@ -339,24 +365,23 @@ func (c *clientConn) failEscalation(query string, escErr error, clientMessage st
 // client has its ErrorResponse and, on the simple protocol, its ReadyForQuery.
 var errStatementAborted = errors.New("statement aborted")
 
-// failS3CacheReapply reports a post-escalation `duckgres.s3_cache` re-apply
-// failure. Unlike a failed escalation this is NOT connection-fatal: the
-// escalation succeeded, so the connection has a healthy session on the standard
-// worker and the pin stands (deliberately not rolled back — the swap really
-// happened). Only the transport could not be re-asserted, so:
+// failReapplyAfterWorkerSwitch reports a post-escalation session-GUC
+// re-apply failure (duckgres.s3_cache or duckgres.worker_ttl). Unlike a
+// failed escalation this is NOT connection-fatal: the escalation succeeded,
+// so the connection has a healthy session on the standard worker and the pin
+// stands (deliberately not rolled back — the swap really happened). Only the
+// worker-side state could not be re-asserted, so:
 //
 //   - the statement fails with a normal ERROR (XX000) naming the re-apply,
-//     rather than a benchmark quietly continuing through the cache;
-//   - the session flag was already reset by escalateWorker to the worker's
-//     ACTUAL transport (proxied — a fresh session always starts on the cache
-//     proxy), so SHOW stays truthful and the client can retry
-//     `SET duckgres.s3_cache = off`;
+//     rather than the connection quietly continuing with divergent state;
+//   - the session state was already reset by escalateWorker to the worker's
+//     ACTUAL state, so SHOW stays truthful and the client can retry the SET;
 //   - the connection stays alive.
 //
 // ReadyForQuery is written only on the simple protocol; inside an
 // extended-query message Sync owns it, and writing one here would desync the
 // client's response accounting.
-func (c *clientConn) failS3CacheReapply(query string, err error) error {
+func (c *clientConn) failReapplyAfterWorkerSwitch(query string, err error) error {
 	c.logQueryError(query, err)
 	c.sendError("ERROR", "XX000", err.Error())
 	c.setTxError()

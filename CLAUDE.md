@@ -378,13 +378,16 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   answers itself — `SET`/`SHOW duckgres.query_source`, ignored SETs, no-ops,
   `pg_stat_activity`, the empty query — MUST NOT acquire. That is the point of
   the whole feature; adding an acquire to an engine-free path silently deletes
-  the benefit. The `duckgres.s3_cache` GUC is the exception, on all three
-  protocol paths, because unlike the other duckgres GUCs it is WORKER state (it
-  rebuilds the worker's `ducklake_s3` secret): **`SET` always acquires** — the
-  swap needs a worker to apply to — and **`SHOW` acquires only when
+  the benefit. The `duckgres.s3_cache` and `duckgres.worker_ttl` GUCs are the
+  exception, on all three protocol paths, because unlike the other duckgres
+  GUCs they are WORKER state (the s3_cache secret swap; the worker_ttl
+  pool-side hot-idle TTL): **`SET` always acquires** — the apply needs a
+  worker to land on — and **`SHOW duckgres.s3_cache` acquires only when
   `c.hasPendingS3Cache`**, i.e. when a connect-time option has not been applied
   yet and answering first would report a transport the session is about to
-  leave (see the s3_cache section below).
+  leave (see the s3_cache section below). `SHOW duckgres.worker_ttl` never
+  acquires: until a worker exists, the connect-time baseline is the truthful
+  answer (there is no pending worker-side TTL state).
 - **A pinning FIRST statement acquires the standard profile directly** (one
   acquire, `pinned=true` → `MarkConnectionPinned`), never small-then-escalate.
 - **The pin set is the state boundary, and every member is load-bearing:** DML,

@@ -142,6 +142,36 @@ func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int, origin LifecycleOrigin)
 	go p.retireWorkerPod(id, w)
 }
 
+// SetWorkerTTL overrides the TTL stamped on the worker's record when it next
+// parks hot → hot_idle — the pool-side half of `SET duckgres.worker_ttl`.
+// In-memory only is sufficient: workerRecordFor re-reads profile.TTL on every
+// persist, the park write (commitHotIdleLocked) is what the expiry queries
+// consult, and ttl_minutes on a HOT row is never used for reaping. Returns
+// false when the worker is gone.
+func (p *K8sWorkerPool) SetWorkerTTL(id int, ttl time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w, ok := p.workers[id]
+	if !ok {
+		return false
+	}
+	w.profile.TTL = ttl
+	return true
+}
+
+// WorkerTTL reports the TTL the worker would park with if its last session
+// ended now (0 = the deployment default applies at reap time). ok=false when
+// the worker is gone.
+func (p *K8sWorkerPool) WorkerTTL(id int) (time.Duration, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	w, ok := p.workers[id]
+	if !ok {
+		return 0, false
+	}
+	return w.profile.TTL, true
+}
+
 // TransitionToHotIdleIfNoSessions decrements the worker's active session count
 // and transitions a hot worker to hot_idle when its last session ends. The worker
 // keeps its org assignment and DuckLake attachment so it can be quickly reclaimed

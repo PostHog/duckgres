@@ -117,6 +117,22 @@ type Result struct {
 	// answers it from session state (defaulting to "on").
 	S3CacheShow bool
 
+	// WorkerTTLSet, when non-nil, indicates a `SET duckgres.worker_ttl =
+	// '<value>'` on the duckgres-namespaced custom GUC. The connection layer
+	// applies the pointed-to value to the session's bound worker (overriding
+	// how long the worker stays hot-idle after the session ends) and
+	// acknowledges it as "SET" — it is NOT forwarded to DuckDB, which would
+	// reject the unknown setting. The value is pre-validated and canonical: a
+	// Go duration string ("20m0s", "0s") or "" (reset to the connect-time
+	// TTL) — an invalid value never reaches here (it surfaces as Error with
+	// SQLSTATE 22023 instead).
+	WorkerTTLSet *string
+
+	// WorkerTTLShow indicates a `SHOW duckgres.worker_ttl`; the connection
+	// layer answers it from session state (the TTL the session's worker will
+	// park with).
+	WorkerTTLShow bool
+
 	// Error is set when a transform detects an error that should be returned to the client
 	// (e.g., unrecognized configuration parameter in SHOW command)
 	Error error

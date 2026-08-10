@@ -258,6 +258,18 @@ func SetPendingS3CacheOption(cc *clientConn, raw string) {
 	}
 }
 
+// SetConnectionWorkerTTLControl installs the control-plane capability behind
+// the `duckgres.worker_ttl` session GUC on a remote/k8s connection. Call
+// before RunMessageLoop; the hooks run on the message-loop goroutine (the
+// same one that handles SET/SHOW and tier escalation), so they are
+// single-threaded with statement handling. Connections without it
+// (standalone, process backend) get session-state-only SET/SHOW.
+func SetConnectionWorkerTTLControl(cc *clientConn, ctl *WorkerTTLControl) {
+	if cc != nil {
+		cc.workerTTLCtl = ctl
+	}
+}
+
 // SetConnectionDatabase updates the PostgreSQL-visible database name for a
 // control-plane connection after the fact. The eager connect path knows the
 // resolved catalog before it builds the connection; the lazily-activated path
