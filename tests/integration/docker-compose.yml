@@ -70,6 +70,57 @@ services:
       /bin/sh -c "
       mc alias set minio http://minio:9000 minioadmin minioadmin;
       mc mb minio/ducklake --ignore-existing;
-      mc anonymous set download minio/ducklake;
+      mc admin policy create minio trino-ducklake-read /policies/trino-ducklake-read.json || true;
+      mc admin user add minio trino-reader trino-reader || true;
+      mc admin policy attach minio trino-ducklake-read --user trino-reader;
       echo 'Bucket ducklake created successfully';
       "
+    volumes:
+      - ./trino/trino-ducklake-read-policy.json:/policies/trino-ducklake-read.json:ro
+
+  # Re-run after the DuckDB fixture creates metadata tables so the Trino
+  # connector has read-only access to every DuckLake metadata relation.
+  trino-metadata-reader-init:
+    image: postgres:16-alpine
+    depends_on:
+      ducklake-metadata:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ducklake
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        psql -h ducklake-metadata -U ducklake -d ducklake -v ON_ERROR_STOP=1 \
+          -c "CREATE ROLE trino_reader LOGIN PASSWORD 'trino-reader'" 2>/dev/null || true
+        psql -h ducklake-metadata -U ducklake -d ducklake -v ON_ERROR_STOP=1 \
+          -c "GRANT CONNECT ON DATABASE ducklake TO trino_reader" \
+          -c "GRANT USAGE ON SCHEMA public TO trino_reader" \
+          -c "GRANT SELECT ON ALL TABLES IN SCHEMA public TO trino_reader" \
+          -c "ALTER DEFAULT PRIVILEGES FOR ROLE ducklake IN SCHEMA public GRANT SELECT ON TABLES TO trino_reader"
+    restart: "no"
+
+  # Single-node, read-only Trino verification of the DuckDB-created DuckLake.
+  # The test starts this service only after the Duckgres fixture has seeded it.
+  trino:
+    build:
+      context: .
+      dockerfile: trino/Dockerfile
+    container_name: duckgres-test-trino-ducklake
+    depends_on:
+      trino-metadata-reader-init:
+        condition: service_completed_successfully
+    environment:
+      TRINO_DUCKLAKE_DB_PASSWORD: trino-reader
+      TRINO_DUCKLAKE_S3_ACCESS_KEY: trino-reader
+      TRINO_DUCKLAKE_S3_SECRET_KEY: trino-reader
+    ports:
+      - "38080:8080"
+    volumes:
+      - ./trino/ducklake.properties:/etc/trino/catalog/ducklake.properties:ro
+    healthcheck:
+      test: ["CMD", "/usr/lib/trino/bin/health-check"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
