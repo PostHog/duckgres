@@ -223,6 +223,25 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_request_duration_seconds` | Histogram | `path`, `source` | End-to-end duration of a served request. `path` is `block` (block-aligned cache path) or `forward` (uncached forward-proxy path); `source` is `local`, `peer`, or `s3` for `block`, and always `origin` for `forward`. |
 | `cache_proxy_forward_requests_total` | Counter | `method` | Requests handled by the uncached forward-proxy path, by HTTP method. |
 | `cache_proxy_inflight_requests` | Gauge | None | Requests currently being handled by the proxy's request entry point; the queue-depth signal. |
+| `cache_proxy_origin_fetches_total` | Counter | `outcome` | Origin cache-fill outcomes across legacy and block-aligned paths. |
+| `cache_proxy_origin_fetches_in_flight` | Gauge | None | Actual origin cache fills currently running, including shared block-span producers (waiters are not double-counted). |
+| `cache_proxy_origin_fetch_retries_total` | Counter | `reason` | Legacy origin-fetch retries by failure reason; block-span hedges do not retry here. |
+| `cache_proxy_peer_hedges_total` | Counter | None | Coalesced origin spans started while all blocks in the span could still arrive from peers. |
+| `cache_proxy_peer_hedge_wins_total` | Counter | `winner` | Completed hedge races won by `peer` or `origin`. |
+| `cache_proxy_fetch_cancellations_total` | Counter | `side` | Losing `peer` or `origin` transfers canceled after the other side won. |
+| `cache_proxy_hedge_duplicate_bytes_total` | Counter | `side` | Bytes received from a losing `peer` or `origin` transfer before cancellation took effect. |
+| `cache_proxy_late_peer_successes_total` | Counter | None | Peer transfers that raced with an origin winner but nevertheless committed successfully. |
+| `cache_proxy_peer_breaker_transitions_total` | Counter | `state` | Circuit-breaker transitions to `open` or `closed`. |
+| `cache_proxy_peer_breaker_state` | Gauge | None | `1` while peer fetching is circuit-broken; `0` while closed. |
+| `cache_proxy_peer_fetches_in_flight` | Gauge | None | Peer lookup/body transfers holding a process-wide concurrency permit. |
+| `cache_proxy_peer_fetch_bytes_in_flight` | Gauge | None | Bytes reserved by admitted peer transfers. |
+| `cache_proxy_peer_fetch_shed_total` | Counter | `reason` | Peer work skipped before network I/O: `deadline`, `capacity`, `canceled`, `breaker`, `unbounded`, or `unconfigured`. |
+| `cache_proxy_peer_fetch_queue_duration_seconds` | Histogram | None | Time waiting for the global count and byte permits. |
+| `cache_proxy_peer_fetch_duration_seconds` | Histogram | `outcome` | Admitted peer lookup plus body-transfer duration for `hit`, `miss`, or `canceled`. |
+| `cache_proxy_origin_span_fetch_duration_seconds` | Histogram | `outcome` | Block-aligned coalesced origin fetch duration for `success`, `error`, or `canceled`. |
+| `cache_proxy_peer_hedge_head_start_seconds` | Gauge | None | Current rolling-p50 peer head start, clamped to 25–150 ms. |
+| `cache_proxy_peer_fetch_latency_ewma_seconds` | Gauge | None | EWMA of successful peer block fetch latency plus canceled lower bounds that already exceeded the 1.5× breaker threshold. |
+| `cache_proxy_origin_fetch_latency_ewma_seconds` | Gauge | None | EWMA of time through a validated, atomically committed first origin block, the peer-comparable breaker input from an otherwise coalesced span. |
 
 ## PromQL recipes
 

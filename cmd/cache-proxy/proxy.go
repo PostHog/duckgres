@@ -30,8 +30,19 @@ func requestSpanAttrs(r *http.Request) []attribute.KeyValue {
 		attribute.String("server.address", r.URL.Host),
 		attribute.String("url.path", r.URL.Path),
 		attribute.String("duckgres.s3.range", r.Header.Get("Range")),
-		attribute.String("client.address", r.RemoteAddr),
+		attribute.String("client.address", clientAddress(r.RemoteAddr)),
 	}
+}
+
+// clientAddress removes the ephemeral source port so Served. logs and traces
+// can be grouped by worker address. RemoteAddr is kernel-owned; unlike a
+// forwarded header it cannot be spoofed by the HTTP client.
+func clientAddress(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 // CacheProxy is a forward HTTP proxy that caches responses on local NVMe.
@@ -62,6 +73,8 @@ type CacheProxy struct {
 	blockMode     bool
 	blockSize     int64
 	maxSpanBlocks int64
+	peerPolicy    *peerFetchPolicy
+	blockFlights  originSpanFlights
 
 	// objectSizes remembers validated complete lengths learned from origin
 	// Content-Range responses. Disk blocks remain the durable cache; this map
@@ -133,6 +146,10 @@ func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []str
 		originRetryInitialBackoff: defaultOriginRetryInitialBackoff,
 		originRetryMaxBackoff:     defaultOriginRetryMaxBackoff,
 		cacheHostSuffixes:         cacheHostSuffixes,
+		peerPolicy: newPeerFetchPolicy(defaultPeerFetchPolicyConfig(
+			defaultPeerFetchMaxConcurrent,
+			defaultPeerFetchMaxBytes(defaultPeerFetchMaxConcurrent, 8<<20),
+		)),
 	}
 }
 
@@ -176,7 +193,7 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	target := r.Host
 	_, span := proxyTracer.Start(r.Context(), "cache.connect", trace.WithAttributes(
 		attribute.String("server.address", target),
-		attribute.String("client.address", r.RemoteAddr),
+		attribute.String("client.address", clientAddress(r.RemoteAddr)),
 	))
 	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
@@ -321,7 +338,8 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 			attribute.Bool("duckgres.cache.hit", true),
 			attribute.Int64("duckgres.bytes", size),
 		)
-		slog.Info("Served.", "source", "hit", "url", r.URL.String(), "range", rangeHeader, "bytes", size)
+		slog.Info("Served.", "source", "hit", "client", clientAddress(r.RemoteAddr),
+			"url", r.URL.String(), "range", rangeHeader, "bytes", size)
 		p.serveStream(w, reader, size, rangeHeader, "")
 		_ = reader.Close()
 		return
@@ -370,7 +388,8 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		attribute.String("duckgres.cache.source", res.source),
 		attribute.Int64("duckgres.bytes", size),
 	)
-	slog.Info("Served.", "source", res.source, "url", r.URL.String(), "range", rangeHeader, "bytes", size)
+	slog.Info("Served.", "source", res.source, "client", clientAddress(r.RemoteAddr),
+		"url", r.URL.String(), "range", rangeHeader, "bytes", size)
 	p.serveStream(w, reader, size, rangeHeader, res.contentType)
 }
 
@@ -380,18 +399,37 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) (fetchResult, error) {
 	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
-			_, peerSpan := proxyTracer.Start(r.Context(), "cache.peer_fetch")
-			_, n, ok := p.peers.FetchFromPeers(cacheKey, func(body io.Reader) (int64, error) {
-				return p.store.PutStream(cacheKey, body)
-			})
-			peerSpan.SetAttributes(attribute.Bool("duckgres.cache.peer_hit", ok))
-			if ok {
-				peerSpan.SetAttributes(attribute.Int64("duckgres.bytes", n))
-			}
-			peerSpan.End()
-			if ok {
-				cacheBytesServed.WithLabelValues("peer").Add(float64(n))
-				return fetchResult{size: n, source: "peer"}, nil
+			reservedBytes, bounded := absoluteRangeLength(rangeHeader)
+			if bounded {
+				_, peerSpan := proxyTracer.Start(r.Context(), "cache.peer_fetch")
+				deadline := time.Now()
+				if p.peerPolicy != nil {
+					deadline = deadline.Add(p.peerPolicy.headStart())
+				}
+				decision := peerFetchDecision{}
+				if p.peerPolicy != nil {
+					allowed, recoverySample := p.peerPolicy.allowPeer(false)
+					decision = peerFetchDecision{allowed: allowed, nonBlocking: recoverySample}
+				}
+				result := p.fetchFromPeers(r.Context(), deadline, reservedBytes, cacheKey, func(body io.Reader) (int64, error) {
+					return p.store.PutStream(cacheKey, io.LimitReader(body, reservedBytes))
+				}, decision, false, nil)
+				peerSpan.SetAttributes(
+					attribute.Bool("duckgres.cache.peer_started", result.started),
+					attribute.Bool("duckgres.cache.peer_hit", result.ok),
+				)
+				if result.ok {
+					peerSpan.SetAttributes(attribute.Int64("duckgres.bytes", result.bytes))
+				}
+				peerSpan.End()
+				if result.ok {
+					cacheBytesServed.WithLabelValues("peer").Add(float64(result.bytes))
+					return fetchResult{size: result.bytes, source: "peer"}, nil
+				}
+			} else {
+				// Suffix/open-ended/no-range requests have no trustworthy upper
+				// bound. Bypass peers rather than evade the process byte ceiling.
+				peerFetchShedTotal.WithLabelValues("unbounded").Inc()
 			}
 		}
 		originFetchInFlight.Inc()
@@ -405,6 +443,19 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 		cacheBytesServed.WithLabelValues("s3").Add(float64(size))
 		return fetchResult{size: size, contentType: ct, source: "miss"}, nil
 	})
+}
+
+func absoluteRangeLength(rangeHeader string) (int64, bool) {
+	start, end, ok := parseAbsoluteRange(rangeHeader)
+	if !ok {
+		return 0, false
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	lengthMinusOne := end - start
+	if lengthMinusOne == maxInt64 {
+		return 0, false
+	}
+	return lengthMinusOne + 1, true
 }
 
 // fetchOrigin forwards the request verbatim (headers, Host, signature) to the

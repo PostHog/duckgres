@@ -31,8 +31,16 @@ var (
 // separate: sharing one 2s budget (as the original code did) meant a slow
 // has-race ate into the body-transfer time and large peer ranges timed out
 // mid-stream, silently downgrading the hit to a full S3 fetch.
+//
+// The has budget is deliberately tight: a healthy peer answers the probe in
+// single-digit ms even under load, while an origin block fetch costs roughly
+// 200ms — so once a probe has gone unanswered for ~150ms, waiting longer only
+// delays a faster origin fallback. FetchFromPeers waits for every peer's "no"
+// before giving up, which means the slowest peer in the fleet gates every
+// cold fill; with a 1s budget, production trails showed 16% of cold-scan
+// requests burning the full second on that drain.
 const (
-	peerHasTimeout = 1 * time.Second
+	peerHasTimeout = 150 * time.Millisecond
 	peerGetTimeout = 30 * time.Second
 )
 
@@ -40,7 +48,7 @@ const (
 // via a Kubernetes headless Service.
 type PeerManager struct {
 	serviceName  string
-	peerPort     string // port for peer API (e.g. ":8081")
+	peerPort     string       // port for peer API (e.g. ":8081")
 	client       *http.Client // /cache/has probes (short timeout)
 	streamClient *http.Client // /cache/get body transfers (long timeout)
 
@@ -128,7 +136,7 @@ func (pm *PeerManager) resolve() {
 // ok is false if no peer has the key (or the chosen peer's body couldn't be
 // streamed). The body is never buffered here — sink (typically DiskCache.PutStream)
 // consumes it as it arrives, so a peer hit costs only sink's copy buffer.
-func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int64, error)) (string, int64, bool) {
+func (pm *PeerManager) FetchFromPeers(ctx context.Context, cacheKey string, sink func(io.Reader) (int64, error)) (string, int64, bool) {
 	pm.mu.RLock()
 	peers := make([]string, len(pm.peers))
 	copy(peers, pm.peers)
@@ -143,7 +151,7 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int
 	// Phase 1: ask every peer "do you have this?" in parallel (cheap, no body)
 	// and take the first that says yes. Its own short context bounds the probe
 	// so a slow/dead peer can't eat into the body-transfer budget below.
-	hasCtx, hasCancel := context.WithTimeout(context.Background(), peerHasTimeout)
+	hasCtx, hasCancel := context.WithTimeout(ctx, peerHasTimeout)
 	defer hasCancel()
 
 	holderCh := make(chan string, len(peers))
@@ -171,8 +179,15 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int
 
 	var holder string
 	for range peers {
-		if a := <-holderCh; a != "" {
-			holder = a
+		select {
+		case a := <-holderCh:
+			if a != "" {
+				holder = a
+			}
+		case <-hasCtx.Done():
+			return "", 0, false
+		}
+		if holder != "" {
 			break
 		}
 	}
@@ -186,7 +201,7 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int
 	// Phase 2: stream the body from the chosen holder straight into sink, with
 	// its own generous budget (a multi-MB Parquet range can take a while). Only
 	// the winner is fetched, so we never pull a body we won't use.
-	getCtx, getCancel := context.WithTimeout(context.Background(), peerGetTimeout)
+	getCtx, getCancel := context.WithTimeout(ctx, peerGetTimeout)
 	defer getCancel()
 
 	getURL := fmt.Sprintf("http://%s/cache/get?key=%s", holder, cacheKey)
@@ -203,12 +218,28 @@ func (pm *PeerManager) FetchFromPeers(cacheKey string, sink func(io.Reader) (int
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	n, err := sink(resp.Body)
+	counted := &countingReader{r: resp.Body}
+	n, err := sink(counted)
 	if err != nil {
-		return "", 0, false
+		return holder, counted.n, false
 	}
 	peerHitsTotal.Inc()
 	return holder, n, true
+}
+
+// countingReader preserves partial-transfer accounting when the caller
+// cancels while DiskCache.PutStream is copying. PutStream correctly returns
+// zero on a failed copy because it commits nothing, but the network bytes were
+// still spent and must be included in hedge-amplification metrics.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
 }
 
 func getLocalIPs() []string {

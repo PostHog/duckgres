@@ -155,6 +155,42 @@ func TestHandleProxyGETMissThenHit(t *testing.T) {
 	}
 }
 
+func TestClientAddressStripsEphemeralPort(t *testing.T) {
+	tests := map[string]string{
+		"10.0.0.7:54321":   "10.0.0.7",
+		"[2001:db8::7]:80": "2001:db8::7",
+		"worker-name":      "worker-name",
+	}
+	for remote, want := range tests {
+		if got := clientAddress(remote); got != want {
+			t.Errorf("clientAddress(%q) = %q, want %q", remote, got, want)
+		}
+	}
+}
+
+func TestServedLogIncludesClientAddressWithoutPort(t *testing.T) {
+	proxy := newTestProxy(t)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("body"))
+	})
+	logs, restore := captureSlog(t)
+	defer restore()
+
+	req := httptest.NewRequest(http.MethodGet, originURL+"/bucket/client.parquet", nil)
+	req.Host = req.URL.Host
+	req.RemoteAddr = "10.0.0.7:54321"
+	req.Header.Set("Range", "bytes=0-3")
+	proxy.HandleProxy(httptest.NewRecorder(), req)
+
+	got := logs.String()
+	if !strings.Contains(got, `msg=Served.`) || !strings.Contains(got, `client=10.0.0.7`) {
+		t.Fatalf("Served log missing stable client address: %s", got)
+	}
+	if strings.Contains(got, "54321") {
+		t.Fatalf("Served log retained ephemeral client port: %s", got)
+	}
+}
+
 func TestHandleProxyHEADForwardedUncached(t *testing.T) {
 	proxy := newTestProxy(t)
 
@@ -1379,5 +1415,64 @@ func TestForwardUncachedPreservesMethod(t *testing.T) {
 				t.Errorf("method mutated: got %q, want %q", gotMethod, method)
 			}
 		})
+	}
+}
+
+func TestLegacyPeerFetchUsesProcessWideCap(t *testing.T) {
+	const requests = 4
+	release := make(chan struct{})
+	var active, maxActive atomic.Int32
+	data := []byte("peer-data")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, _ *http.Request) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			prior := maxActive.Load()
+			if current <= prior || maxActive.CompareAndSwap(prior, current) {
+				break
+			}
+		}
+		<-release
+		_, _ = w.Write(data)
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	setTestPeerPolicy(p, 2, 2*int64(len(data)), 150*time.Millisecond)
+
+	results := make(chan error, requests)
+	for i := 0; i < requests; i++ {
+		go func(i int) {
+			rawURL := fmt.Sprintf("http://example.test/file-%d.parquet", i)
+			u, _ := url.Parse(rawURL)
+			req := (&http.Request{
+				Method: http.MethodGet,
+				URL:    u,
+				Host:   u.Host,
+				Header: http.Header{"Range": []string{"bytes=0-8"}},
+			}).WithContext(context.Background())
+			_, err := p.fetchDedup(CacheKey(rawURL, "bytes=0-8"), req, "bytes=0-8")
+			results <- err
+		}(i)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for i := 0; i < requests; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("fetchDedup: %v", err)
+		}
+	}
+	if got := maxActive.Load(); got > 2 {
+		t.Fatalf("legacy concurrent peer GETs = %d, want <= 2", got)
 	}
 }
