@@ -370,6 +370,7 @@ Run with config file:
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
+| `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` | Maximum client-requested `duckgres.idle_timeout`; unset disables client overrides | disabled |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
 | `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
 | `DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS` | Max queued/live admission identities whose cleanup ownership one control plane may retain; new admissions are rejected before enqueue when full | `4096` |
@@ -394,6 +395,21 @@ Run with config file:
 | `POSTHOG_HOST` | PostHog ingest host (shared by both exporters) | `us.i.posthog.com` |
 | `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
 | `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` (e.g., `duckgres-acme`). Applies to **both** the log export and the OTLP trace export — they share one resource — so setting it renames the service in traces too, not just logs | - |
+
+### Client-requested idle timeout
+
+The control plane closes inactive client sessions after its configured
+`DUCKGRES_IDLE_TIMEOUT` (60 seconds by default). To let clients request a
+longer, bounded timeout, set a positive `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` on
+the control plane. For example, with `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX=15m`:
+
+```bash
+PGOPTIONS='-c duckgres.idle_timeout=15m' psql "host=<host> dbname=ducklake sslmode=require"
+```
+
+Requests must be positive and no greater than the configured maximum. Leaving
+the maximum unset disables client overrides, and clients cannot request an
+unlimited timeout because idle sessions retain worker capacity.
 
 ### PostHog Logging
 

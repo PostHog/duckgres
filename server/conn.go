@@ -253,6 +253,11 @@ type clientConn struct {
 	// conn_s3_cache.go.
 	s3CacheOff bool
 
+	// idleTimeout is a validated, connect-time client override. Zero means use
+	// the server default. It is initialized before the message loop starts and
+	// never changes, so it needs no synchronization.
+	idleTimeout time.Duration
+
 	// Provisioned worker pod size for compute-usage billing (remote/k8s backend
 	// only). Counted in milli-units to avoid truncating a fractional-core or
 	// sub-GiB worker. workerMillicores == 0 means "unknown size" (non-remote /
@@ -1137,6 +1142,12 @@ func (c *clientConn) handleStartup() error {
 		// duckgres.s3_cache only records session state here; the worker-swap
 		// path is control-plane-only.)
 		if opts := ParseStartupOptions(params["options"]); len(opts) > 0 {
+			if v, ok := opts[ClientIdleTimeoutGUCName]; ok {
+				if err := c.applyStartupIdleTimeout(v); err != nil {
+					c.sendError("FATAL", "22023", err.Error())
+					return fmt.Errorf("invalid %s startup option", ClientIdleTimeoutGUCName)
+				}
+			}
 			if v, ok := opts[querySourceGUCName]; ok {
 				if err := c.applyStartupQuerySource(v); err != nil {
 					c.sendError("FATAL", "22023", err.Error())
@@ -1238,8 +1249,8 @@ func (c *clientConn) sendInitialParams() {
 // out, a stalled/abandoned one is reaped after the idle timeout. No-op when the
 // idle timeout is disabled (IdleTimeout <= 0), matching the message loop.
 func (c *clientConn) armIdleReadDeadline() {
-	if c.server.cfg.IdleTimeout > 0 {
-		_ = c.conn.SetReadDeadline(time.Now().Add(c.server.cfg.IdleTimeout))
+	if idleTimeout := c.effectiveIdleTimeout(); idleTimeout > 0 {
+		_ = c.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 	}
 }
 

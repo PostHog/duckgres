@@ -87,6 +87,45 @@ func TestMessageLoopIdleTimeoutClosesConnection(t *testing.T) {
 	}
 }
 
+func TestMessageLoopUsesClientIdleTimeoutOverride(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer func() { _ = clientSide.Close() }()
+	defer func() { _ = serverSide.Close() }()
+
+	s := &Server{}
+	InitMinimalServer(s, Config{IdleTimeout: 40 * time.Millisecond, ClientIdleTimeoutMax: time.Second}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cc := &clientConn{
+		server:      s,
+		conn:        serverSide,
+		reader:      bufio.NewReader(serverSide),
+		writer:      bufio.NewWriter(serverSide),
+		ctx:         ctx,
+		cancel:      cancel,
+		idleTimeout: 180 * time.Millisecond,
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cc.messageLoop() }()
+
+	// The server default expires at 40ms. The request must keep this session
+	// alive beyond it, then expire according to the bounded client value.
+	select {
+	case err := <-done:
+		t.Fatalf("message loop used the server default instead of client override: %v", err)
+	case <-time.After(90 * time.Millisecond):
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("expected nil on idle close, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("messageLoop did not close on client idle timeout")
+	}
+}
+
 func TestLateCopyFramesPreserveReadyBoundary(t *testing.T) {
 	for _, msgType := range []byte{wire.MsgCopyData, wire.MsgCopyDone, wire.MsgCopyFail} {
 		t.Run(string(msgType), func(t *testing.T) {

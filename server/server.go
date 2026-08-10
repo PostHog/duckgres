@@ -215,6 +215,12 @@ type Config struct {
 	// uncleanly. Default: 24 hours. Set to a negative value (e.g., -1) to disable.
 	IdleTimeout time.Duration
 
+	// ClientIdleTimeoutMax is the largest timeout a client may request through
+	// the connect-time duckgres.idle_timeout option. A non-positive value disables
+	// client overrides. This must remain bounded because idle control-plane
+	// sessions retain workers and admission capacity.
+	ClientIdleTimeoutMax time.Duration
+
 	// SessionInitTimeout bounds startup metadata initialization and catalog probes.
 	// Default: 10 seconds.
 	SessionInitTimeout time.Duration

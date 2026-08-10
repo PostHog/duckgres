@@ -588,6 +588,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_IDLE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.ClientIdleTimeoutMax = d
+		} else {
+			warn("Invalid DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX: must be a positive duration")
+		}
+	}
 	if v := getenv("DUCKGRES_SESSION_INIT_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.SessionInitTimeout = d
