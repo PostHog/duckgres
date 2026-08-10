@@ -1201,6 +1201,59 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   cnpg→ext positive path is unit-only (harness lacks the RDS password);
   cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
 
+## Trino Benchmark Lifecycle (dev-only, `kubernetes` tag) — LOAD-BEARING CONTRACT
+
+An opt-in, disposable side-by-side benchmark: one Duckgres worker over PGWire
+vs a multi-worker Trino cluster reading the SAME per-run DuckLake snapshot.
+Scenario: `tests/mw-dev/scenario/scenarios/posthog_frozen_trino_perf.yaml`;
+runbook: `docs/runbooks/scenario-runner.md`. Pieces: `controlplane/
+trino_benchmark_api.go` (untagged types + admin-authenticated routes),
+`trino_benchmark_manager.go` (k8s lifecycle), `trino_benchmark_reader.go` +
+`trino_benchmark_reader_k8s.go` (reader identity), `tests/mw-dev/scenario/trino/`
+(lifecycle steps + HTTP client), `tests/perf/drivers/trino/` (statement driver).
+
+- **Fail-closed, with NO writer-credential fallback.** Env-only knobs
+  (`DUCKGRES_TRINO_BENCHMARK_*`, `configresolve/resolve.go`) default the feature
+  OFF; enabling it without a pinned image leaves the lifecycle unbuilt; and a
+  built lifecycle still refuses to provision unless the charts-created reader
+  identity resolves in full. `buildTrinoReaderIdentity` additionally REJECTS a
+  configuration whose reader S3 role or reader database user equals the
+  warehouse writer identity. Never add a degrade path here.
+- **Credentials never cross the API boundary.** The lifecycle API returns only
+  cluster ID, state, endpoint, requested/ready worker counts, and the pinned
+  image. The metadata reader password exists in control-plane memory for exactly
+  one hop — read by exact `SecretReference` and written into the cluster-owned
+  short-lived Secret — and is never logged, returned, or stored on a struct.
+  Reader status is read through `DucklingClient.GetStatusWithoutCredentials`, so
+  resolving a reader never pulls the tenant WRITER password into memory.
+- **Ownership labels are the cleanup boundary.** Every object carries
+  `app.kubernetes.io/name=duckgres-trino-benchmark` +
+  `duckgres.posthog.com/trino-benchmark-cluster=<id>` +
+  `duckgres.posthog.com/org=<org>`; every delete lists by BOTH the app and
+  cluster labels. Cleanup is idempotent, safe after a partial provision, and
+  structurally unable to reach a worker pod, another benchmark cluster, or the
+  charts-created reader Secret.
+- **Readiness means the WHOLE requested topology**: coordinator ready AND
+  `ReadyWorkers >= RequestedWorkers`. A ready state with no endpoint stays a
+  polling state; `failed` is terminal and stops the poller. Provision is
+  idempotent for an identical request (200 vs 202) and 409s on a different org,
+  image, or worker count — never a silent adoption.
+- **S3 access is an assumed read-only role, never static keys.** The catalog
+  properties set `s3.iam-role`/`s3.role-session-name` (renewable credentials);
+  `s3.aws-access-key`/`s3.aws-secret-key` must never appear.
+- **UTC is pinned in both engines** (`-Duser.timezone=UTC` in jvm.config, the
+  driver's `X-Trino-Time-Zone`), or cross-engine TIMESTAMPTZ predicates diverge.
+- **Artifacts record what ran, not what was intended**: `summary.json`
+  `environments[]` carries engine/version, connector version, image reference,
+  requested/ready workers, catalog/schema, and UTC per protocol. No thresholds,
+  no CI gating.
+- Touching any of this → update `controlplane/trino_benchmark_api_test.go`,
+  `trino_benchmark_api_authz_test.go`, `trino_benchmark_manager_test.go`,
+  `trino_benchmark_reader_test.go`, `trino_benchmark_reader_k8s_test.go`,
+  `configresolve/resolve_trino_benchmark_test.go`,
+  `tests/mw-dev/scenario/trino/*_test.go`, `tests/mw-dev/run_sh_test.go`, and
+  the scenario DAG assertions in `tests/mw-dev/scenario/runner_test.go`.
+
 ## TODO Reference
 
 `TODO.md` is a lightweight backlog for ideas that do not yet have a better

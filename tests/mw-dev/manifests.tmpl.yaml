@@ -308,6 +308,15 @@ spec:
             - { name: DUCKGRES_EXPLORATORY_WORKER_CPU, value: "1" }
             - { name: DUCKGRES_EXPLORATORY_WORKER_MEMORY, value: "2Gi" }
             - { name: DUCKGRES_EXPLORATORY_WORKER_TTL, value: "10m" }
+            # Dev-only Trino benchmark lifecycle (the paired PGWire/Trino
+            # comparison scenario). Fail-closed twice over: it is disabled
+            # unless the run pins an image, and even when enabled the control
+            # plane refuses to provision until the companion charts release
+            # publishes the per-Duckling read-only reader identity. NO reader
+            # credential appears here — the control plane reads the
+            # charts-created Secret by exact reference at provision time.
+            - { name: DUCKGRES_TRINO_BENCHMARK_ENABLED, value: "${DUCKGRES_TRINO_BENCHMARK_ENABLED}" }
+            - { name: DUCKGRES_TRINO_BENCHMARK_IMAGE, value: "${DUCKGRES_TRINO_BENCHMARK_IMAGE}" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_CPU, value: "1" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }

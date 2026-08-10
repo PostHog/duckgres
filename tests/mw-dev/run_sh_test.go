@@ -1579,3 +1579,77 @@ func (f runSHFakes) calls(t *testing.T) string {
 	}
 	return string(b)
 }
+
+// The dev Trino benchmark lifecycle is OFF unless a run supplies a pinned
+// image. The harness passes the image and the enable flag; it never passes
+// reader credentials — those are charts-created Kubernetes resources the
+// control plane resolves for itself.
+func TestControlPlaneTrinoBenchmarkIsOptInAndCredentialFree(t *testing.T) {
+	raw, err := os.ReadFile("manifests.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+	rendered := strings.NewReplacer(
+		"${NAMESPACE}", "test-namespace",
+		"${PR_NUMBER}", "123",
+		"${CONTROLPLANE_IMAGE}", "example.invalid/duckgres:test",
+		"${WORKER_IMAGE}", "example.invalid/duckgres:test",
+		"${INTERNAL_SECRET}", "test-secret",
+		"${INTERNAL_SECRET_FALLBACK}", "test-secret-fallback",
+		"${USER_SECRET_KEY}", "test-user-secret-key",
+		"${DUCKGRES_K8S_WORKER_CPU_REQUEST}", "2",
+		"${DUCKGRES_K8S_WORKER_MEMORY_REQUEST}", "4Gi",
+		"${DUCKGRES_TRINO_BENCHMARK_ENABLED}", "true",
+		"${DUCKGRES_TRINO_BENCHMARK_IMAGE}", "example.invalid/trino-brikk@sha256:abc",
+	).Replace(string(raw))
+
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
+	for {
+		var manifest map[string]any
+		err := decoder.Decode(&manifest)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode manifests template: %v", err)
+		}
+		if manifest["kind"] != "Deployment" || manifestName(manifest) != "duckgres-control-plane" {
+			continue
+		}
+		env := deploymentContainerEnv(manifest, "controlplane")
+		if got := env["DUCKGRES_TRINO_BENCHMARK_ENABLED"]; got != "true" {
+			t.Fatalf("Trino benchmark enable flag = %q, want the rendered value", got)
+		}
+		if got := env["DUCKGRES_TRINO_BENCHMARK_IMAGE"]; got != "example.invalid/trino-brikk@sha256:abc" {
+			t.Fatalf("Trino benchmark image = %q, want the pinned image", got)
+		}
+		for name := range env {
+			if strings.HasPrefix(name, "DUCKGRES_TRINO_BENCHMARK_") &&
+				(strings.Contains(name, "PASSWORD") || strings.Contains(name, "SECRET") || strings.Contains(name, "KEY")) {
+				t.Fatalf("control plane env %s passes a Trino reader credential; those are charts-created resources", name)
+			}
+		}
+		return
+	}
+	t.Fatal("duckgres-control-plane Deployment missing from manifests template")
+}
+
+func TestRenderDefaultsTrinoBenchmarkToDisabled(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	for _, want := range []string{
+		`DUCKGRES_TRINO_BENCHMARK_IMAGE="${DUCKGRES_TRINO_BENCHMARK_IMAGE:-}"`,
+		`DUCKGRES_TRINO_BENCHMARK_ENABLED="${DUCKGRES_TRINO_BENCHMARK_ENABLED:-false}"`,
+		`$DUCKGRES_TRINO_BENCHMARK_ENABLED $DUCKGRES_TRINO_BENCHMARK_IMAGE`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("run.sh missing Trino benchmark render contract %q", want)
+		}
+	}
+	if strings.Contains(script, "TRINO_READER_PASSWORD") || strings.Contains(script, "TRINO_DUCKLAKE_DB_PASSWORD") {
+		t.Fatal("run.sh must never carry Trino reader credentials")
+	}
+}

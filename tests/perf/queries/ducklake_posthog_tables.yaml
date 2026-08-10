@@ -4,6 +4,7 @@ seed: 42
 dataset_scale: 1
 targets:
   - pgwire
+  - trino
 warmup_iterations: 1
 measure_iterations: 3
 queries:
@@ -20,6 +21,7 @@ queries:
     tags: [nightly, frozen, posthog, events, aggregate, paired, ducklake-table]
     params: {}
     pgwire_sql: SELECT COUNT(*) AS events FROM posthog.events
+    trino_sql: SELECT COUNT(*) AS events FROM ducklake.posthog.events
 
   - query_id: q_events_count_one_day__raw_view
     intent_id: intent_events_count_one_day
@@ -40,6 +42,11 @@ queries:
       FROM posthog.events
       WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'
         AND "timestamp" < TIMESTAMPTZ '2026-03-02 00:00:00+00'
+    trino_sql: >
+      SELECT COUNT(*) AS events
+      FROM ducklake.posthog.events
+      WHERE "timestamp" >= from_iso8601_timestamp('2026-03-01T00:00:00Z')
+        AND "timestamp" < from_iso8601_timestamp('2026-03-02T00:00:00Z')
 
   - query_id: q_events_by_name_march_2026__raw_view
     intent_id: intent_events_by_name_march_2026
@@ -52,6 +59,7 @@ queries:
     tags: [nightly, frozen, posthog, events, aggregate, analytics, paired, ducklake-table]
     params: {}
     pgwire_sql: SELECT event, COUNT(*) AS events FROM posthog.events WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+    trino_sql: SELECT event, COUNT(*) AS events FROM ducklake.posthog.events WHERE "timestamp" >= from_iso8601_timestamp('2026-03-01T00:00:00Z') AND "timestamp" < from_iso8601_timestamp('2026-03-18T00:00:00Z') GROUP BY event ORDER BY events DESC, event LIMIT 20
 
   - query_id: q_events_distinct_persons__raw_view
     intent_id: intent_events_distinct_persons
@@ -64,6 +72,7 @@ queries:
     tags: [nightly, frozen, posthog, events, aggregate, distinct, paired, ducklake-table]
     params: {}
     pgwire_sql: SELECT COUNT(DISTINCT person_id) AS distinct_persons FROM posthog.events WHERE person_id IS NOT NULL
+    trino_sql: SELECT COUNT(DISTINCT person_id) AS distinct_persons FROM ducklake.posthog.events WHERE person_id IS NOT NULL
 
   # Table-only probes track the DuckLake workload over time without a raw
   # Parquet control query.
@@ -72,15 +81,18 @@ queries:
     tags: [nightly, frozen, posthog, persons, aggregate, ducklake-table]
     params: {}
     pgwire_sql: SELECT COUNT(*) AS persons FROM posthog.persons
+    trino_sql: SELECT COUNT(*) AS persons FROM ducklake.posthog.persons
 
   - query_id: q_persons_daily_april_2026__ducklake_table
     intent_id: intent_persons_daily_april_2026
     tags: [nightly, frozen, posthog, persons, aggregate, time-series, ducklake-table]
     params: {}
     pgwire_sql: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM posthog.persons WHERE _timestamp >= TIMESTAMPTZ '2026-04-01 00:00:00+00' AND _timestamp < TIMESTAMPTZ '2026-05-01 00:00:00+00' GROUP BY 1 ORDER BY 1
+    trino_sql: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM ducklake.posthog.persons WHERE _timestamp >= from_iso8601_timestamp('2026-04-01T00:00:00Z') AND _timestamp < from_iso8601_timestamp('2026-05-01T00:00:00Z') GROUP BY 1 ORDER BY 1
 
   - query_id: q_events_daily_march_2026__ducklake_table
     intent_id: intent_events_daily_march_2026
     tags: [nightly, frozen, posthog, events, aggregate, time-series, ducklake-table]
     params: {}
     pgwire_sql: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM posthog.events WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY 1 ORDER BY 1
+    trino_sql: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM ducklake.posthog.events WHERE "timestamp" >= from_iso8601_timestamp('2026-03-01T00:00:00Z') AND "timestamp" < from_iso8601_timestamp('2026-03-18T00:00:00Z') GROUP BY 1 ORDER BY 1

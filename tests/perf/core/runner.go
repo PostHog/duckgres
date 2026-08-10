@@ -20,6 +20,14 @@ type ResultSink interface {
 	Close(summary RunSummary, serverMetrics string) error
 }
 
+// EnvironmentReporter is optionally implemented by a driver that can describe
+// the engine it is talking to. It is probed once per run, before any measured
+// query, and any error is ignored: comparison metadata must never fail a
+// benchmark.
+type EnvironmentReporter interface {
+	Environment(ctx context.Context) (ProtocolEnvironment, error)
+}
+
 type RunnerConfig struct {
 	RunID          string
 	Catalog        Catalog
@@ -29,6 +37,10 @@ type RunnerConfig struct {
 	OnSetup        func(context.Context) error
 	OnTeardown     func(context.Context) error
 	Now            func() time.Time
+	// Environments carries what the CALLER already knows about each protocol
+	// (the lifecycle-reported image and worker counts, the catalog/schema, the
+	// session time zone). Driver-probed detail fills the gaps.
+	Environments []ProtocolEnvironment
 }
 
 type QueryRunner struct {
@@ -78,6 +90,8 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 		}
 	}
 
+	summary.Environments = r.resolveEnvironments(ctx)
+
 	warmupIterations := r.cfg.Catalog.WarmupIterations
 	for i := 0; i < warmupIterations; i++ {
 		if err := r.executeIteration(ctx, false, 0, &summary); err != nil {
@@ -104,6 +118,29 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 	return summary, nil
 }
 
+// resolveEnvironments merges the caller-supplied comparison metadata with
+// whatever each driver can report about its engine, one entry per catalog
+// target in target order.
+func (r *QueryRunner) resolveEnvironments(ctx context.Context) []ProtocolEnvironment {
+	configured := make(map[Protocol]ProtocolEnvironment, len(r.cfg.Environments))
+	for _, env := range r.cfg.Environments {
+		configured[env.Protocol] = env
+	}
+	var environments []ProtocolEnvironment
+	for _, protocol := range r.cfg.Catalog.Targets {
+		env := configured[protocol]
+		env.Protocol = protocol
+		if reporter, ok := r.cfg.Drivers[protocol].(EnvironmentReporter); ok {
+			// Best-effort: a probe failure must never fail the benchmark.
+			if probed, err := reporter.Environment(ctx); err == nil {
+				env = env.Merge(probed)
+			}
+		}
+		environments = append(environments, env)
+	}
+	return environments
+}
+
 func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 	return r.metrics.Gatherer()
 }
@@ -112,6 +149,9 @@ func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measur
 	for _, query := range r.cfg.Catalog.Queries {
 		args := orderedParamValues(query.Params)
 		for _, protocol := range r.cfg.Catalog.Targets {
+			if !query.SupportsProtocol(protocol) {
+				continue
+			}
 			driver := r.cfg.Drivers[protocol]
 			started := r.cfg.Now()
 			result := QueryResult{

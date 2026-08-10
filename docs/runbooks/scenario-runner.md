@@ -49,7 +49,9 @@ export DUCKGRES_SCENARIO_FROZEN_S3_URI="s3://<dev-managed-bucket>/frozen_v1/"
 ```
 
 The full suite, fast suite, and targeted frozen perf scenarios exercise PGWire
-only. Frozen perf records per-query success and failure rows in
+only. `posthog_frozen_trino_perf.yaml` compares the same DuckLake tables over
+PGWire and Trino; its raw-Parquet-view control queries remain PGWire-only.
+Frozen perf records per-query success and failure rows in
 `query_results.csv`.
 Measured query errors fail the perf DAG step after its artifacts are written;
 independent sibling steps continue to run.
@@ -97,6 +99,18 @@ Run frozen perf queries:
 just scenario-frozen-perf
 ```
 
+Run the paired PGWire/Trino comparison:
+
+```bash
+just scenario-frozen-trino-perf
+```
+
+The scenario provisions a four-worker Trino cluster, waits for it to become
+ready, benchmarks both protocols, and always tears Trino down before the
+warehouse. It gets nothing from the control plane but a cluster ID, a lifecycle
+state, the in-cluster endpoint, the worker counts, and the pinned image
+reference — see "Trino benchmark lifecycle" below.
+
 This runs, in order: raw-view setup, source-column preflight, explicit PostHog
 table DDL, registration of the frozen Parquet files in DuckLake, then partition
 and file-metadata validation. Registration reads Parquet footers but does not
@@ -138,9 +152,97 @@ The targeted frozen metadata scenario uses:
 The frozen perf scenario uses:
 
 - `tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml`
-- `tests/perf/queries/ducklake_frozen.yaml`
+- `tests/perf/queries/ducklake_posthog_tables.yaml`
 
 Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `summary.json`, and `server_metrics.prom`.
+
+The paired Trino scenario uses
+`tests/mw-dev/scenario/scenarios/posthog_frozen_trino_perf.yaml` with the same
+table setup and query catalog. Its artifact contains a row per protocol, so
+`query_results.csv` directly compares the existing PGWire workload with Trino
+on the identical DuckLake snapshot. Its explicit lifecycle calls are the only
+place that may create or delete Trino; the scenario YAML and runner do not
+receive metadata or S3 credentials.
+
+### Trino benchmark lifecycle
+
+**This feature is disabled and fail-closed until the companion charts release
+is deployed.** Duckgres alone cannot run the paired scenario: it needs a
+per-Duckling read-only S3 role, a dedicated metadata-Postgres reader
+role/password Secret, and RBAC letting the control plane read that Secret by
+exact name. Until those exist, provisioning fails with a configuration error and
+the API answers `503`. There is deliberately no fallback to the tenant's writer
+credentials.
+
+**Configuration** (env-only on the control plane, resolved in
+`configresolve/resolve.go`):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DUCKGRES_TRINO_BENCHMARK_ENABLED` | `false` | Master gate. Enabled alone is not enough. |
+| `DUCKGRES_TRINO_BENCHMARK_IMAGE` | `""` | Pinned Trino+Brikk image; **required** when enabled. Prefer a digest reference — it is what the artifact records. |
+| `DUCKGRES_TRINO_BENCHMARK_IMAGE_PULL_POLICY` | `IfNotPresent` | Pull policy for coordinator and workers. |
+| `DUCKGRES_TRINO_BENCHMARK_SERVICE_ACCOUNT` | `""` | ServiceAccount whose IAM identity may assume the read-only S3 role. |
+| `DUCKGRES_TRINO_BENCHMARK_WORKERS` | `4` | Default worker replicas when a request omits `workers`. |
+| `DUCKGRES_TRINO_BENCHMARK_COORDINATOR_CPU` / `_COORDINATOR_MEMORY` | `2` / `8Gi` | Coordinator shape. |
+| `DUCKGRES_TRINO_BENCHMARK_WORKER_CPU` / `_WORKER_MEMORY` | `2` / `8Gi` | Per-worker shape. |
+
+Requests equal limits (Guaranteed QoS) for every benchmark pod, so Trino neither
+bursts into nor is throttled by the Duckgres worker it is being compared with.
+A request may ask for at most 16 workers.
+
+The mw-dev harness passes the image through
+`DUCKGRES_TRINO_BENCHMARK_IMAGE` and enables the lifecycle only when that image
+is set (`tests/mw-dev/run.sh`); the `scenario-dev` workflow exposes it as the
+optional `trino_benchmark_image` input. Neither ever carries a credential.
+
+**Lifecycle API** (internal, admin-authenticated, under the existing
+`/api/v1` router):
+
+| Route | Success | Notes |
+| --- | --- | --- |
+| `POST /api/v1/trino-benchmarks/orgs/:org_id/provision` | `202` created, `200` idempotent repeat | Body is optional `{"workers": N, "run_id": "..."}`; unknown fields are rejected. |
+| `GET /api/v1/trino-benchmarks/status/:cluster_id` | `200` | `state` is `pending`, `ready`, or `failed`. |
+| `POST /api/v1/trino-benchmarks/deprovision/:cluster_id` | `204` | Idempotent; an already-absent cluster is also `204`. |
+
+Errors: `400` invalid request, `404` unknown cluster, `409` a same-named cluster
+exists with different ownership or configuration, `503` the feature is disabled
+or the reader identity is not configured, `500` otherwise. Error bodies are
+fixed strings — infrastructure detail is logged on the control plane, never
+returned.
+
+Provisioning creates, in the control plane's namespace and all labelled with the
+cluster ID and owning org: a ClusterIP Service selecting only the coordinator,
+coordinator/worker/catalog ConfigMaps, a short-lived Secret holding only the
+charts-created metadata reader password, a one-replica coordinator Deployment,
+and a worker Deployment with exactly the requested replicas. Status is `ready`
+only when the coordinator is ready **and** every requested worker replica is
+ready. Cleanup deletes only objects carrying those ownership labels, so it is
+safe after a partial provision and cannot touch another cluster, a Duckgres
+worker, or the charts-created reader Secret.
+
+**Artifacts.** `summary.json` gains an `environments` array, one entry per
+protocol: engine and version (Trino's from the coordinator's own `/v1/info`),
+connector version, the pinned image reference, requested/ready worker counts,
+catalog and schema, and the `UTC` session time zone. `query_results.csv` carries
+a row per protocol per query, so the two engines are compared directly. No
+thresholds and no CI gating are attached to any of it.
+
+**Failure recovery.**
+
+- `503` from provision: the feature is off, no image is pinned, or the charts
+  reader resources are missing. Check the control-plane log for the named
+  missing field. Do not work around it with writer credentials.
+- `409` from provision: a cluster for that org already exists with a different
+  image or worker count — usually a leftover from an interrupted run. Deprovision
+  it (`POST .../deprovision/trino-bench-<org>`) and retry.
+- Readiness times out: the wait step reports the attempt count and last observed
+  state. Inspect the Deployments with
+  `kubectl get deploy -l duckgres.posthog.com/trino-benchmark-cluster=trino-bench-<org>`.
+  A `failed` state is terminal — the poller stops rather than burning the budget.
+- Leftover cluster after an aborted run: `deprovision_trino` is `always_run` and
+  precedes warehouse teardown, so this should be rare. Clean up manually with the
+  deprovision route, or by deleting the labelled objects.
 
 The frozen dbt scenario uses:
 

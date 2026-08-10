@@ -422,6 +422,7 @@ func main() {
 				ExploratoryWorkerTTL:         resolved.K8sExploratoryWorkerTTL,
 				ReshardPodCPU:                resolved.K8sReshardPodCPU,
 				ReshardPodMemory:             resolved.K8sReshardPodMemory,
+				TrinoBenchmark:               resolved.TrinoBenchmark,
 				AWSRegion:                    resolved.AWSRegion,
 			},
 		}

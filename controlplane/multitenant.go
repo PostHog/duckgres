@@ -664,6 +664,50 @@ func SetupMultiTenant(
 	if router.sharedPool != nil {
 		clusterClient = router.sharedPool.clientset
 	}
+	// Dev-only Trino benchmark lifecycle. Fail-closed by construction: the
+	// routes are always registered (so a caller gets a clear 503 rather than a
+	// 404), but a lifecycle is only built when the deployment opts in, pins an
+	// image, has a Kubernetes client, and can reach the Duckling client that
+	// resolves the charts-created read-only reader identity. Any missing piece
+	// leaves the lifecycle nil — there is no writer-credential fallback.
+	var trinoBenchmark TrinoBenchmarkLifecycle
+	if cfg.K8s.TrinoBenchmark.Enabled {
+		switch {
+		case clusterClient == nil:
+			slog.Warn("Trino benchmark lifecycle is enabled but no Kubernetes client is available; the API will report unavailable.")
+		case dcErr != nil || dc == nil:
+			slog.Warn("Trino benchmark lifecycle is enabled but the Duckling client is unavailable; the API will report unavailable.", "error", dcErr)
+		default:
+			resolver, err := newDucklingTrinoReaderResolver(store, dc)
+			if err != nil {
+				slog.Warn("Trino benchmark reader resolution is unavailable; the API will report unavailable.", "error", err)
+				break
+			}
+			manager, err := newTrinoBenchmarkManager(clusterClient, resolver, TrinoBenchmarkManagerConfig{
+				Namespace:         namespace,
+				Image:             cfg.K8s.TrinoBenchmark.Image,
+				ImagePullPolicy:   cfg.K8s.TrinoBenchmark.ImagePullPolicy,
+				ServiceAccount:    cfg.K8s.TrinoBenchmark.ServiceAccount,
+				DefaultWorkers:    cfg.K8s.TrinoBenchmark.Workers,
+				CoordinatorCPU:    cfg.K8s.TrinoBenchmark.CoordinatorCPU,
+				CoordinatorMemory: cfg.K8s.TrinoBenchmark.CoordinatorMemory,
+				WorkerCPU:         cfg.K8s.TrinoBenchmark.WorkerCPU,
+				WorkerMemory:      cfg.K8s.TrinoBenchmark.WorkerMemory,
+			})
+			if err != nil {
+				slog.Warn("Trino benchmark lifecycle is enabled but not configured; the API will report unavailable.", "error", err)
+				break
+			}
+			trinoBenchmark = manager
+			slog.Info("Trino benchmark lifecycle enabled.",
+				"namespace", namespace, "image", cfg.K8s.TrinoBenchmark.Image,
+				"default_workers", cfg.K8s.TrinoBenchmark.Workers)
+		}
+	}
+	// RequireAdmin: the scenario runner authenticates with the internal secret
+	// (⇒ admin); an SSO viewer must not reach these routes at all.
+	registerTrinoBenchmarkAPI(api, trinoBenchmark, admin.RequireAdmin())
+
 	admin.RegisterExtras(api, admin.Extras{
 		Store:         store,
 		Live:          clusterInfo,
