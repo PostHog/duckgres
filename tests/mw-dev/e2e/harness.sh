@@ -639,7 +639,7 @@ s3_cache_guc() { # org password
     fail "s3_cache: invalid value 'junk' was accepted: $out"
   fi
   case "$out" in
-    *'must be "on" or "off"'*) ;;
+    *'must be "on", "off", or "passthrough"'*) ;;
     *) fail "s3_cache: invalid-value rejection did not name the valid values: '$out'" ;;
   esac
   # Fresh-session default: a previous session's off must never leak into the
@@ -662,7 +662,7 @@ s3_cache_guc() { # org password
     fail "s3_cache: invalid startup option was accepted: $out"
   fi
   case "$out" in
-    *'must be "on" or "off"'*) ;;
+    *'must be "on", "off", or "passthrough"'*) ;;
     *) fail "s3_cache: invalid startup-option rejection did not name the valid values: '$out'" ;;
   esac
 }
