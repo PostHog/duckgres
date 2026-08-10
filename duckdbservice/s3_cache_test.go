@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/transpiler/transform"
 )
 
 // s3CacheTestPool builds a shared-warm pool with a synthetic activation and a
@@ -23,6 +24,7 @@ func s3CacheTestPool(t *testing.T, objectStore string) (*SessionPool, *[]server.
 		startTime:      time.Now(),
 		warmupDone:     make(chan struct{}),
 		sharedWarmMode: true,
+		s3CacheMode:    transform.S3CacheOn,
 		activation: &activatedTenantRuntime{payload: ActivationPayload{
 			OrgID: "analytics",
 			DuckLake: server.DuckLakeConfig{
@@ -75,10 +77,10 @@ func TestSetS3CacheEnabledSwapsTransportAndBack(t *testing.T) {
 			got.HTTPProxy, got.S3UseSSL, got.S3Endpoint)
 	}
 	pool.mu.RLock()
-	bypassed := pool.s3CacheBypassed
+	mode := pool.s3CacheMode
 	pool.mu.RUnlock()
-	if !bypassed {
-		t.Fatal("s3CacheBypassed = false after disable, want true")
+	if mode != transform.S3CacheOff {
+		t.Fatalf("s3CacheMode after disable = %q, want off", mode)
 	}
 
 	// Redundant disable: no secret touch.
@@ -101,10 +103,10 @@ func TestSetS3CacheEnabledSwapsTransportAndBack(t *testing.T) {
 			got.HTTPProxy, got.S3UseSSL, got.S3Endpoint)
 	}
 	pool.mu.RLock()
-	bypassed = pool.s3CacheBypassed
+	mode = pool.s3CacheMode
 	pool.mu.RUnlock()
-	if bypassed {
-		t.Fatal("s3CacheBypassed = true after enable, want false")
+	if mode != transform.S3CacheOn {
+		t.Fatalf("s3CacheMode after enable = %q, want on", mode)
 	}
 }
 
@@ -123,10 +125,10 @@ func TestSetS3CachePassthroughKeepsProxyTransport(t *testing.T) {
 		t.Fatalf("passthrough must retain the cache-proxy transport, got HTTPProxy=%q S3UseSSL=%v S3Endpoint=%q", got.HTTPProxy, got.S3UseSSL, got.S3Endpoint)
 	}
 	pool.mu.RLock()
-	passthrough := pool.s3CachePassthrough
+	mode := pool.s3CacheMode
 	pool.mu.RUnlock()
-	if !passthrough {
-		t.Fatal("s3CachePassthrough = false after passthrough mode, want true")
+	if mode != transform.S3CachePassthrough {
+		t.Fatalf("s3CacheMode after passthrough = %q, want passthrough", mode)
 	}
 }
 
@@ -198,10 +200,10 @@ func TestSetS3CacheEnabledFailurePreservesState(t *testing.T) {
 		t.Fatalf("SetS3CacheEnabled(false) with failing rebuild: err = %v, want boom", err)
 	}
 	pool.mu.RLock()
-	bypassed := pool.s3CacheBypassed
+	mode := pool.s3CacheMode
 	pool.mu.RUnlock()
-	if bypassed {
-		t.Fatal("failed rebuild still flipped s3CacheBypassed")
+	if mode != transform.S3CacheOn {
+		t.Fatalf("failed rebuild changed s3CacheMode to %q, want on", mode)
 	}
 
 	fail = false
@@ -540,7 +542,7 @@ func TestCreateSessionRestoresS3CacheTransport(t *testing.T) {
 					S3UseSSL:    true,
 				},
 			}, db: db},
-			s3CacheBypassed: true, // previous session left the cache off
+			s3CacheMode:     transform.S3CacheOff, // previous session left the cache off
 			refreshS3Secret: refresh,
 		}
 		close(pool.warmupDone)
@@ -567,10 +569,10 @@ func TestCreateSessionRestoresS3CacheTransport(t *testing.T) {
 			t.Fatalf("restore rebuild must carry the cache-proxy transport, got HTTPProxy=%q S3UseSSL=%v", got.HTTPProxy, got.S3UseSSL)
 		}
 		pool.mu.RLock()
-		bypassed := pool.s3CacheBypassed
+		mode := pool.s3CacheMode
 		pool.mu.RUnlock()
-		if bypassed {
-			t.Fatal("s3CacheBypassed still true after CreateSession restore")
+		if mode != transform.S3CacheOn {
+			t.Fatalf("s3CacheMode after CreateSession restore = %q, want on", mode)
 		}
 	})
 
@@ -657,9 +659,9 @@ func TestDestroySessionRestoresS3CacheTransport(t *testing.T) {
 		t.Fatalf("destroy restore must carry the cache-proxy transport, got HTTPProxy=%q S3UseSSL=%v", got.HTTPProxy, got.S3UseSSL)
 	}
 	pool.mu.RLock()
-	bypassed := pool.s3CacheBypassed
+	mode := pool.s3CacheMode
 	pool.mu.RUnlock()
-	if bypassed {
-		t.Fatal("s3CacheBypassed still true after DestroySession restore")
+	if mode != transform.S3CacheOn {
+		t.Fatalf("s3CacheMode after DestroySession restore = %q, want on", mode)
 	}
 }

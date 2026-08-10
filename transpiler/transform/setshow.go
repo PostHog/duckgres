@@ -64,6 +64,9 @@ func errInvalidQuerySource() *CodedError {
 // forwarded to DuckDB. See clientConn.S3CacheEnabled in server/.
 const s3CacheParam = "duckgres.s3_cache"
 
+// S3CacheMode is the closed state set for the duckgres.s3_cache GUC.
+type S3CacheMode string
+
 // Canonical values for the duckgres.s3_cache GUC.
 const (
 	S3CacheOn          = "on"

@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/posthog/duckgres/server"
+	"github.com/posthog/duckgres/transpiler/transform"
 )
 
 // ActivationPayload carries the tenant-specific runtime that is delivered to a
@@ -152,8 +153,7 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	}
 	// A fresh activation always attaches with the cache-proxy transport
 	// (overrideS3EndpointForCacheProxy above), so the bypass flag starts clean.
-	p.s3CacheBypassed = false
-	p.s3CachePassthrough = false
+	p.s3CacheMode = transform.S3CacheOn
 	if p.cacheRouter != nil {
 		p.cacheRouter.setPassthrough(false)
 	}
@@ -192,7 +192,8 @@ func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
 // retains the cache-proxy transport while instructing the worker-local router
 // to forward each request without cache reads or fills.
 func (p *SessionPool) SetS3CacheMode(mode string) error {
-	if mode != "on" && mode != "off" && mode != "passthrough" {
+	requested := transform.S3CacheMode(mode)
+	if requested != transform.S3CacheOn && requested != transform.S3CacheOff && requested != transform.S3CachePassthrough {
 		return fmt.Errorf("invalid s3 cache mode %q", mode)
 	}
 	if !p.sharedWarmMode || !cacheEnabled() {
@@ -218,8 +219,7 @@ func (p *SessionPool) SetS3CacheMode(mode string) error {
 		orgID = p.activation.payload.OrgID
 		actDB = p.activation.db
 	}
-	bypassed := p.s3CacheBypassed
-	passthrough := p.s3CachePassthrough
+	currentMode := p.currentS3CacheModeLocked()
 	refreshDB := p.controlDB
 	refreshFn := p.refreshS3Secret
 	sem := p.duckLakeSem
@@ -228,7 +228,7 @@ func (p *SessionPool) SetS3CacheMode(mode string) error {
 	if !activated {
 		return fmt.Errorf("worker is not activated")
 	}
-	if bypassed == (mode == "off") && passthrough == (mode == "passthrough") {
+	if currentMode == requested {
 		return nil
 	}
 	if cfg.ObjectStore == "" {
@@ -241,7 +241,7 @@ func (p *SessionPool) SetS3CacheMode(mode string) error {
 	if refreshFn == nil {
 		refreshFn = server.RefreshS3Secret
 	}
-	if mode != "off" {
+	if requested != transform.S3CacheOff {
 		p.overrideS3EndpointForCacheProxy(&cfg)
 	}
 	if err := refreshFn(refreshDB, cfg, sem); err != nil {
@@ -249,13 +249,12 @@ func (p *SessionPool) SetS3CacheMode(mode string) error {
 	}
 
 	p.mu.Lock()
-	p.s3CacheBypassed = mode == "off"
-	p.s3CachePassthrough = mode == "passthrough"
+	p.s3CacheMode = requested
 	if p.cacheRouter != nil {
-		p.cacheRouter.setPassthrough(mode == "passthrough")
+		p.cacheRouter.setPassthrough(requested == transform.S3CachePassthrough)
 	}
 	p.mu.Unlock()
-	slog.Info("Swapped tenant S3 secret transport.", "org", orgID, "s3_cache_mode", mode)
+	slog.Info("Swapped tenant S3 secret transport.", "org", orgID, "s3_cache_mode", requested)
 	return nil
 }
 
@@ -356,8 +355,8 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 			// off`): then the rebuild must keep the native HTTPS transport, or
 			// a mid-session credential rotation would silently re-route the
 			// session through the cache. secretSwapMu serializes this rebuild
-			// against SetS3CacheEnabled so the secret always matches
-			// s3CacheBypassed — and it is held (via defer) all the way through
+			// against SetS3CacheMode so the secret always matches s3CacheMode —
+			// and it is held (via defer) all the way through
 			// the Phase 3 payload commit below: released any earlier, a toggle
 			// could sneak in, read the not-yet-committed OLD payload, and
 			// last-write the secret with the OLD (soon-to-expire) STS creds
@@ -369,10 +368,10 @@ func (p *SessionPool) reuseExistingActivation(payload ActivationPayload) bool {
 			p.secretSwapMu.Lock()
 			defer p.secretSwapMu.Unlock()
 			p.mu.RLock()
-			bypassed := p.s3CacheBypassed
+			cacheMode := p.currentS3CacheModeLocked()
 			p.mu.RUnlock()
 			refreshCfg := payload.DuckLake
-			if !bypassed {
+			if cacheMode != transform.S3CacheOff {
 				p.overrideS3EndpointForCacheProxy(&refreshCfg)
 			}
 			if err := refreshFn(refreshDB, refreshCfg, sem); err != nil {

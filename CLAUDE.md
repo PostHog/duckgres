@@ -516,7 +516,7 @@ unreliable; secrets are consulted per request). Instance-global secret + one
 session per worker = session-scoped in effect. Invariants:
 
 - **State follows the worker, never leads it.** The session flag
-  (`clientConn.s3CacheOff` / `clientConn.s3CachePassthrough`) flips only after the worker swap succeeds; a
+  (`clientConn.s3CacheMode`) flips only after the worker swap succeeds; a
   failed swap fails the SET (`XX000`) / the batch / the connect (startup
   option), so `SHOW` can never report a transport the worker isn't using.
 - **A bypass must never leak into the org's next session.** `CreateSession`
@@ -525,7 +525,7 @@ session per worker = session-scoped in effect. Invariants:
   best-effort. Both no-op unless a bypass is actually in effect.
 - **Credential rotation respects the flag.** The hot-idle/mid-session refresh
   (`reuseExistingActivation`) rebuilds the secret with or without the proxy
-  transport according to `s3CacheBypassed`; all secret rebuilds serialize on
+  transport according to `s3CacheMode`; all secret rebuilds serialize on
   `secretSwapMu` so the last write always matches the flag. (Without this, an
   hourly STS rotation silently re-enables the cache mid-benchmark — the
   inverse of the 2026-07-17 incident.)

@@ -29,6 +29,7 @@ import (
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
+	"github.com/posthog/duckgres/transpiler/transform"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -97,26 +98,24 @@ type SessionPool struct {
 
 	// secretSwapMu serializes rebuilds of the tenant ducklake_s3 secret (the
 	// credential-refresh path in reuseExistingActivation vs the per-session
-	// duckgres.s3_cache toggle in SetS3CacheEnabled) so the last-applied
-	// transport always matches s3CacheBypassed. The refresh path holds it from
+	// duckgres.s3_cache toggle in SetS3CacheMode) so the last-applied transport
+	// always matches s3CacheMode. The refresh path holds it from
 	// before its rebuild until AFTER the rotated payload is committed, so a
 	// concurrent toggle can never rebuild from the stale pre-rotation payload.
 	// Lock order: secretSwapMu → p.mu (both paths); p.mu is never held while
 	// acquiring secretSwapMu. Held across the (slow) CREATE OR REPLACE SECRET,
 	// which p.mu must not be — health checks only need p.mu.RLock.
 	secretSwapMu sync.Mutex
-	// s3CacheBypassed is true while the tenant S3 secret carries the org's
-	// native HTTPS transport instead of the cache-proxy transport, i.e. the
-	// current session set `duckgres.s3_cache = off`. s3CachePassthrough keeps
-	// that transport but marks requests to skip cache reads and fills. Flipped only under
-	// secretSwapMu (read under p.mu); the one exception is activateTenant's
-	// reset-to-false at first-activation commit, which cannot race a swap
-	// because SetS3CacheEnabled refuses to run before an activation exists
-	// (and taking secretSwapMu there would invert the secretSwapMu→p.mu lock
-	// order). CreateSession restores the proxy transport before a new session
-	// starts so a bypass can never leak into the org's next session.
-	s3CacheBypassed    bool
-	s3CachePassthrough bool
+	// s3CacheMode is the tenant secret/router state selected by
+	// `duckgres.s3_cache`. It is changed only under secretSwapMu (read under
+	// p.mu). The enum prevents impossible combinations such as both bypass and
+	// passthrough being active. The one exception is activateTenant's reset to
+	// the default, which cannot race a swap because SetS3CacheMode refuses to
+	// run before an activation exists (and taking secretSwapMu there would
+	// invert the secretSwapMu→p.mu lock order). CreateSession restores the
+	// normal caching mode before a new session starts so an opt-out can never
+	// leak into the org's next session.
+	s3CacheMode transform.S3CacheMode
 
 	drainMu       sync.Mutex
 	draining      bool
@@ -129,6 +128,13 @@ type SessionPool struct {
 	// plane on every health check so the worker is retired instead of being
 	// handed to the org's next connection (see instance_fatal.go).
 	instance instanceHealth
+}
+
+func (p *SessionPool) currentS3CacheModeLocked() transform.S3CacheMode {
+	if p.s3CacheMode == "" {
+		return transform.S3CacheOn
+	}
+	return p.s3CacheMode
 }
 
 type trackedTx struct {

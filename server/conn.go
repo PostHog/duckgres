@@ -245,14 +245,12 @@ type clientConn struct {
 	// this only ever holds "", "standard", or "endpoints".
 	querySource string
 
-	// s3CacheOff and s3CachePassthrough hold the `duckgres.s3_cache` session
-	// GUC state (another duckgres-namespaced custom parameter, NOT forwarded to
-	// DuckDB). Passthrough retains the cache-proxy transport but skips its
-	// cache so the proxy still records individual request instrumentation.
-	// Both are flipped only AFTER the worker-side transport swap succeeds, so
-	// SHOW never reports a state the worker isn't in. See conn_s3_cache.go.
-	s3CacheOff         bool
-	s3CachePassthrough bool
+	// s3CacheMode holds the `duckgres.s3_cache` session GUC state (another
+	// duckgres-namespaced custom parameter, NOT forwarded to DuckDB). A single
+	// mode prevents impossible combinations such as both direct bypass and
+	// proxy passthrough. It changes only AFTER the worker-side transport swap
+	// succeeds, so SHOW never reports a state the worker isn't in.
+	s3CacheMode transform.S3CacheMode
 
 	// Provisioned worker pod size for compute-usage billing (remote/k8s backend
 	// only). Counted in milli-units to avoid truncating a fractional-core or
