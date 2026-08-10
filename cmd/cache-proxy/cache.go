@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"fmt"
 	"io"
@@ -70,14 +71,22 @@ func CacheKey(url, rangeHeader string) string {
 }
 
 // DiskCache manages cached S3 responses on local NVMe storage with LRU eviction.
+//
+// Every operation below holds the one mutex, and a production node tracks
+// hundreds of thousands of entries — so each critical section must be O(1).
+// The previous slice-based order ([]cacheEntry with linear scans and splices)
+// put ~half the proxy's CPU into LRU bookkeeping under this lock, serializing
+// all cache traffic behind it.
 type DiskCache struct {
 	dir         string
 	maxBytes    int64
 	currentSize int64
 
 	mu sync.Mutex
-	// access order: most recently used at the end
-	order []cacheEntry
+	// order is the access list: least recently used at the front, most recent
+	// at the back. index maps a key to its element for O(1) touch/drop.
+	order *list.List
+	index map[string]*list.Element
 }
 
 type cacheEntry struct {
@@ -121,6 +130,8 @@ func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
 	dc := &DiskCache{
 		dir:      dir,
 		maxBytes: maxBytes,
+		order:    list.New(),
+		index:    make(map[string]*list.Element),
 	}
 
 	// Scan existing cache entries
@@ -134,15 +145,13 @@ func (c *DiskCache) scanExisting() {
 	if err != nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	// Only count real cache entries — the .tmp dir's contents and any
+	// stray non-key files must not enter the LRU accounting.
+	var found []cacheEntry
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		// Only count real cache entries — the .tmp dir's contents and any
-		// stray non-key files must not enter the LRU accounting.
 		if !IsValidCacheKey(e.Name()) {
 			continue
 		}
@@ -150,12 +159,24 @@ func (c *DiskCache) scanExisting() {
 		if err != nil {
 			continue
 		}
-		c.order = append(c.order, cacheEntry{
+		found = append(found, cacheEntry{
 			key:        e.Name(),
 			size:       info.Size(),
 			lastAccess: info.ModTime(),
 		})
-		c.currentSize += info.Size()
+	}
+	// The access list must start in recency order (front = oldest) or the
+	// first evictions after a restart would remove arbitrary entries.
+	sort.Slice(found, func(i, j int) bool {
+		return found[i].lastAccess.Before(found[j].lastAccess)
+	})
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range found {
+		entry := found[i]
+		c.index[entry.key] = c.order.PushBack(&entry)
+		c.currentSize += entry.size
 	}
 	cacheSizeBytes.Set(float64(c.currentSize))
 }
@@ -198,7 +219,7 @@ func (c *DiskCache) Put(key string, data []byte) error {
 
 	c.mu.Lock()
 	// Evict until we have space
-	for c.currentSize+size > c.maxBytes && len(c.order) > 0 {
+	for c.currentSize+size > c.maxBytes && c.order.Len() > 0 {
 		c.evictOldest()
 	}
 	c.mu.Unlock()
@@ -209,13 +230,7 @@ func (c *DiskCache) Put(key string, data []byte) error {
 	}
 
 	c.mu.Lock()
-	c.order = append(c.order, cacheEntry{
-		key:        key,
-		size:       size,
-		lastAccess: time.Now(),
-	})
-	c.currentSize += size
-	cacheSizeBytes.Set(float64(c.currentSize))
+	c.addLocked(key, size)
 	c.mu.Unlock()
 
 	return nil
@@ -251,7 +266,7 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	// (the rename below overwrites it) and evict to make room.
 	c.mu.Lock()
 	c.dropLocked(key)
-	for c.currentSize+size > c.maxBytes && len(c.order) > 0 {
+	for c.currentSize+size > c.maxBytes && c.order.Len() > 0 {
 		c.evictOldest()
 	}
 	c.mu.Unlock()
@@ -263,19 +278,12 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	}
 
 	c.mu.Lock()
-	// dropLocked again before appending: in production singleFlight serializes
-	// writes per key so the earlier drop is enough, but guarding here keeps the
-	// "one entry per key" invariant (and currentSize) correct even if some
-	// future caller writes the same key concurrently — a duplicate entry would
-	// otherwise permanently inflate currentSize.
-	c.dropLocked(key)
-	c.order = append(c.order, cacheEntry{
-		key:        key,
-		size:       size,
-		lastAccess: time.Now(),
-	})
-	c.currentSize += size
-	cacheSizeBytes.Set(float64(c.currentSize))
+	// addLocked drops any existing entry first: in production singleFlight
+	// serializes writes per key so the earlier drop is enough, but the guard
+	// keeps the "one entry per key" invariant (and currentSize) correct even
+	// if some future caller writes the same key concurrently — a duplicate
+	// entry would otherwise permanently inflate currentSize.
+	c.addLocked(key, size)
 	c.mu.Unlock()
 
 	return size, nil
@@ -317,47 +325,58 @@ func (c *DiskCache) openFile(key string) (io.ReadCloser, int64, bool) {
 	return f, info.Size(), true
 }
 
+// touchLocked marks key as most recently used. No-op if the key isn't
+// tracked. Caller holds c.mu.
 func (c *DiskCache) touchLocked(key string) {
-	for i := range c.order {
-		if c.order[i].key == key {
-			c.order[i].lastAccess = time.Now()
-			// Move to end (most recent)
-			entry := c.order[i]
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			c.order = append(c.order, entry)
-			return
-		}
+	el, ok := c.index[key]
+	if !ok {
+		return
 	}
+	el.Value.(*cacheEntry).lastAccess = time.Now()
+	c.order.MoveToBack(el)
 }
 
 // dropLocked removes any accounting for key (used when an overwrite is about to
 // replace the file under it) so currentSize doesn't double-count. No-op if the
 // key isn't tracked. Caller holds c.mu.
 func (c *DiskCache) dropLocked(key string) {
-	for i := range c.order {
-		if c.order[i].key == key {
-			c.currentSize -= c.order[i].size
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			return
-		}
-	}
-}
-
-func (c *DiskCache) evictOldest() {
-	if len(c.order) == 0 {
+	el, ok := c.index[key]
+	if !ok {
 		return
 	}
+	c.currentSize -= el.Value.(*cacheEntry).size
+	c.order.Remove(el)
+	delete(c.index, key)
+}
 
-	// Sort by last access, evict the oldest
-	sort.Slice(c.order, func(i, j int) bool {
-		return c.order[i].lastAccess.Before(c.order[j].lastAccess)
+// addLocked records a freshly written entry as most recently used, replacing
+// any prior entry for the key so "one entry per key" (and currentSize) holds.
+// Caller holds c.mu.
+func (c *DiskCache) addLocked(key string, size int64) {
+	c.dropLocked(key)
+	c.index[key] = c.order.PushBack(&cacheEntry{
+		key:        key,
+		size:       size,
+		lastAccess: time.Now(),
 	})
+	c.currentSize += size
+	cacheSizeBytes.Set(float64(c.currentSize))
+}
 
-	oldest := c.order[0]
+// evictOldest removes the least recently used entry. The list front is the
+// LRU entry by construction: adds and touches always move entries to the
+// back, and scanExisting seeds the list in recency order.
+func (c *DiskCache) evictOldest() {
+	front := c.order.Front()
+	if front == nil {
+		return
+	}
+	oldest := front.Value.(*cacheEntry)
 	path := filepath.Join(c.dir, oldest.key)
 	_ = os.Remove(path)
 	c.currentSize -= oldest.size
-	c.order = c.order[1:]
+	c.order.Remove(front)
+	delete(c.index, oldest.key)
 	cacheEvictionsTotal.Inc()
 	cacheSizeBytes.Set(float64(c.currentSize))
 }
