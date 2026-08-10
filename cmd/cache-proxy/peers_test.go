@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // collectSink returns a sink that streams the peer body into buf, mirroring how
@@ -68,7 +70,7 @@ func TestFetchFromPeersHit(t *testing.T) {
 	pm := peerManagerWith([]string{addr})
 
 	var buf bytes.Buffer
-	from, n, ok := pm.FetchFromPeers(key, collectSink(&buf))
+	from, n, ok := pm.FetchFromPeers(context.Background(), key, collectSink(&buf))
 	if !ok {
 		t.Fatal("expected peer hit")
 	}
@@ -99,7 +101,7 @@ func TestFetchFromPeersMissFromAll(t *testing.T) {
 	pm := peerManagerWith([]string{addr})
 
 	var buf bytes.Buffer
-	_, _, ok := pm.FetchFromPeers(key, collectSink(&buf))
+	_, _, ok := pm.FetchFromPeers(context.Background(), key, collectSink(&buf))
 	if ok {
 		t.Fatalf("expected miss, got %q", buf.String())
 	}
@@ -124,7 +126,7 @@ func TestFetchFromPeersReturnsFirstHit(t *testing.T) {
 	pm := peerManagerWith([]string{addr1, addr2})
 
 	var buf bytes.Buffer
-	_, _, ok := pm.FetchFromPeers(key, collectSink(&buf))
+	_, _, ok := pm.FetchFromPeers(context.Background(), key, collectSink(&buf))
 	if !ok {
 		t.Fatal("expected peer hit from one of two peers")
 	}
@@ -141,8 +143,82 @@ func TestFetchFromPeersReturnsFirstHit(t *testing.T) {
 func TestFetchFromPeersEmptyPeerList(t *testing.T) {
 	pm := peerManagerWith(nil)
 	var buf bytes.Buffer
-	if _, _, ok := pm.FetchFromPeers(strings.Repeat("a", 64), collectSink(&buf)); ok {
+	if _, _, ok := pm.FetchFromPeers(context.Background(), strings.Repeat("a", 64), collectSink(&buf)); ok {
 		t.Error("expected miss when no peers are known")
+	}
+}
+
+func TestFetchFromPeersHonorsCallerCancellationDuringProbe(t *testing.T) {
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	pm := peerManagerWith([]string{strings.TrimPrefix(srv.URL, "http://")})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var buf bytes.Buffer
+		_, _, _ = pm.FetchFromPeers(ctx, strings.Repeat("d", 64), collectSink(&buf))
+	}()
+	<-started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("peer probe did not stop after caller cancellation")
+	}
+}
+
+func TestFetchFromPeersHonorsCallerCancellationDuringBodyAndReportsBytes(t *testing.T) {
+	key := strings.Repeat("e", 64)
+	bodyStarted := make(chan struct{})
+	sinkStarted := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("partial"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		close(bodyStarted)
+		<-r.Context().Done()
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	pm := peerManagerWith([]string{strings.TrimPrefix(srv.URL, "http://")})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int64, 1)
+	go func() {
+		_, n, _ := pm.FetchFromPeers(ctx, key, func(r io.Reader) (int64, error) {
+			buf := make([]byte, len("partial"))
+			first, err := io.ReadFull(r, buf)
+			close(sinkStarted)
+			if err != nil {
+				return int64(first), err
+			}
+			rest, err := io.Copy(io.Discard, r)
+			return int64(first) + rest, err
+		})
+		done <- n
+	}()
+	<-bodyStarted
+	<-sinkStarted
+	cancel()
+	select {
+	case n := <-done:
+		if n == 0 {
+			t.Fatal("canceled peer transfer lost its partial-byte accounting")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("peer body transfer did not stop after caller cancellation")
 	}
 }
 

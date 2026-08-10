@@ -97,6 +97,78 @@ func TestFetchOriginSpan(t *testing.T) {
 	}
 }
 
+func TestFetchOriginSpanReportsFirstBlockCommitBeforeSpanCompletion(t *testing.T) {
+	const blockSize = int64(1024)
+	body := make([]byte, 2*blockSize)
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSecond) }) }
+	defer release()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[:blockSize])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-releaseSecond
+		_, _ = w.Write(body[blockSize:])
+	}))
+	t.Cleanup(origin.Close)
+	t.Cleanup(release)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, nil, nil)
+	p.client = origin.Client()
+	u, _ := url.Parse(origin.URL + "/bucket/coalesced.parquet")
+	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{}}
+
+	type fetchResult struct {
+		bytesRead          int64
+		firstBlockDuration time.Duration
+		err                error
+	}
+	done := make(chan fetchResult, 1)
+	started := time.Now()
+	go func() {
+		bytesRead, firstBlockDuration, fetchErr := p.fetchOriginSpanContext(
+			context.Background(), req, blockSize, 0, 1, nil,
+		)
+		done <- fetchResult{bytesRead: bytesRead, firstBlockDuration: firstBlockDuration, err: fetchErr}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for !store.Has(BlockKey(u.String(), 0, blockSize)) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !store.Has(BlockKey(u.String(), 0, blockSize)) {
+		t.Fatal("first origin block was not committed while the span remained open")
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("span returned before the second block was released: %+v", result)
+	default:
+	}
+	time.Sleep(50 * time.Millisecond)
+	release()
+	result := <-done
+	totalDuration := time.Since(started)
+	if result.err != nil {
+		t.Fatalf("fetchOriginSpanContext: %v", result.err)
+	}
+	if result.bytesRead != int64(len(body)) {
+		t.Fatalf("bytes read = %d, want %d", result.bytesRead, len(body))
+	}
+	if result.firstBlockDuration <= 0 || totalDuration-result.firstBlockDuration < 40*time.Millisecond {
+		t.Fatalf("first-block duration = %v, total = %v; want the committed first block, not full span latency",
+			result.firstBlockDuration, totalDuration)
+	}
+}
+
 // TestFetchOriginSpanRejects200 guards the immutable-block-cache poisoning
 // hazard: fetchOriginSpan always sends a Range header, so an origin that
 // ignores it and returns 200 + the full body would otherwise be split from
@@ -281,6 +353,13 @@ func newBlockProxy(t *testing.T, origin *httptest.Server, blockSize int64) (*Cac
 	p.blockSize = blockSize
 	p.maxSpanBlocks = 8
 	return p, store
+}
+
+func setTestPeerPolicy(p *CacheProxy, maxConcurrent, maxBytes int64, headStart time.Duration) {
+	cfg := defaultPeerFetchPolicyConfig(maxConcurrent, maxBytes)
+	cfg.minHeadStart = headStart
+	cfg.maxHeadStart = headStart
+	p.peerPolicy = newPeerFetchPolicy(cfg)
 }
 
 func doBlockRequest(t *testing.T, p *CacheProxy, rawURL, rangeHeader string) *httptest.ResponseRecorder {
@@ -472,6 +551,10 @@ func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
 	p := NewCacheProxy(store, peerManagerWith([]string{peerAddr}), []string{})
 	p.blockSize = blockSize
 	p.maxSpanBlocks = 8
+	p.peerPolicy.mu.Lock()
+	p.peerPolicy.directBadStreak = p.peerPolicy.cfg.breakerOpenAfter - 1
+	p.peerPolicy.lastDirectBad = p.peerPolicy.cfg.now()
+	p.peerPolicy.mu.Unlock()
 
 	hitsBefore := counterValue(t, cacheHitsTotal)
 	missesBefore := counterValue(t, cacheMissesTotal)
@@ -500,6 +583,12 @@ func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
 	}
 	if got := counterValue(t, cacheBytesServed.WithLabelValues("peer")); got != peerBytesBefore+100 {
 		t.Fatalf("cacheBytesServed{peer} delta = %v, want 100 (sourceLabel must resolve to peer when no origin fetch happened)", got-peerBytesBefore)
+	}
+	p.peerPolicy.mu.Lock()
+	directBadStreak := p.peerPolicy.directBadStreak
+	p.peerPolicy.mu.Unlock()
+	if directBadStreak != 0 {
+		t.Fatalf("direct bad streak = %d after a pure peer win, want reset", directBadStreak)
 	}
 }
 
@@ -572,10 +661,10 @@ func TestServeBlockAlignedPeerFillsRunConcurrently(t *testing.T) {
 	}
 }
 
-// TestServeBlockAlignedHedgesSlowPeerToOrigin covers the wait budget: a peer
-// that claims the block but stalls the body transfer must not pin the request
-// for the full peer get timeout — after peerFillWaitBudget the block is
-// fetched from origin and the response completes.
+// TestServeBlockAlignedHedgesSlowPeerToOrigin covers the adaptive head start: a
+// peer that claims the block but stalls the body transfer must not pin the
+// request for the full peer get timeout. Origin starts while peer work is still
+// running, and the first successful side completes the response.
 func TestServeBlockAlignedHedgesSlowPeerToOrigin(t *testing.T) {
 	const blockSize = 1024
 	origin := originServer(t, 4*blockSize)
@@ -607,9 +696,12 @@ func TestServeBlockAlignedHedgesSlowPeerToOrigin(t *testing.T) {
 	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(srv.URL, "http://")}), []string{})
 	p.blockSize = blockSize
 	p.maxSpanBlocks = 8
-	p.peerFillWaitBudget = 50 * time.Millisecond
+	setTestPeerPolicy(p, 32, 32*blockSize, 50*time.Millisecond)
+	p.peerPolicy.cfg.breakerMinSamples = 1
+	p.peerPolicy.cfg.breakerOpenAfter = 1
 
-	hedgedBefore := counterValue(t, peerFillHedgedTotal)
+	hedgedBefore := counterValue(t, peerHedgesTotal)
+	originWinsBefore := counterValue(t, peerHedgeWinsTotal.WithLabelValues("origin"))
 	s3ReadsBefore := counterValue(t, blockReadsTotal.WithLabelValues("s3"))
 
 	w := doBlockRequest(t, p, target, "bytes=0-99")
@@ -623,11 +715,1041 @@ func TestServeBlockAlignedHedgesSlowPeerToOrigin(t *testing.T) {
 	if got := w.Body.Bytes(); string(got) != string(want) {
 		t.Fatalf("body mismatch: got %d bytes", len(got))
 	}
-	if got := counterValue(t, peerFillHedgedTotal); got != hedgedBefore+1 {
-		t.Fatalf("peerFillHedgedTotal delta = %v, want 1", got-hedgedBefore)
+	if got := counterValue(t, peerHedgesTotal); got != hedgedBefore+1 {
+		t.Fatalf("peerHedgesTotal delta = %v, want 1", got-hedgedBefore)
+	}
+	if got := counterValue(t, peerHedgeWinsTotal.WithLabelValues("origin")); got != originWinsBefore+1 {
+		t.Fatalf("origin hedge-win delta = %v, want 1", got-originWinsBefore)
 	}
 	if got := counterValue(t, blockReadsTotal.WithLabelValues("s3")); got != s3ReadsBefore+1 {
 		t.Fatalf("blockReadsTotal{s3} delta = %v, want 1 (hedged block must be served from origin)", got-s3ReadsBefore)
+	}
+	if !p.peerPolicy.breakerOpen() {
+		t.Fatal("threshold-qualified canceled peer lower bound did not open the breaker")
+	}
+}
+
+func TestAmbiguousOriginWinnerRunsBoundedBreakerMeasurement(t *testing.T) {
+	const blockSize = int64(1024)
+	body := make([]byte, blockSize)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", blockSize-1, blockSize))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/abrupt-slowdown.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	var peerGets, peerCancels atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != key {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		peerGets.Add(1)
+		<-r.Context().Done()
+		peerCancels.Add(1)
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	cfg := defaultPeerFetchPolicyConfig(32, 32*blockSize)
+	cfg.minHeadStart = 25 * time.Millisecond
+	cfg.maxHeadStart = 25 * time.Millisecond
+	cfg.breakerMinSamples = 1
+	cfg.breakerOpenAfter = 1
+	p.peerPolicy = newPeerFetchPolicy(cfg)
+
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !p.peerPolicy.breakerOpen() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !p.peerPolicy.breakerOpen() {
+		t.Fatal("breaker did not learn from a bounded measurement after an ambiguous canceled peer")
+	}
+	if got := peerGets.Load(); got != 2 {
+		t.Fatalf("peer GETs = %d, want normal hedge plus one sampled measurement", got)
+	}
+	deadline = time.Now().Add(time.Second)
+	for peerCancels.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := peerCancels.Load(); got != 2 {
+		t.Fatalf("peer cancellations = %d, want both losing transfers canceled", got)
+	}
+}
+
+func TestServeBlockAlignedOriginWinnerCancelsPeerAndCountsDuplicateBytes(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 4*blockSize)
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/cancel-peer.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	peerCanceled := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") == key {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write(make([]byte, 128))
+		if flusher != nil {
+			flusher.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+			close(peerCanceled)
+		case <-time.After(time.Second):
+		}
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), []string{})
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	setTestPeerPolicy(p, 32, 32*blockSize, 10*time.Millisecond)
+
+	cancelsBefore := counterValue(t, peerFetchCancellationsTotal.WithLabelValues("peer"))
+	duplicatesBefore := counterValue(t, peerHedgeDuplicateBytesTotal.WithLabelValues("peer"))
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	select {
+	case <-peerCanceled:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("origin won but the losing peer transfer was not canceled")
+	}
+	deadline := time.Now().Add(time.Second)
+	for counterValue(t, peerHedgeDuplicateBytesTotal.WithLabelValues("peer")) == duplicatesBefore && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := counterValue(t, peerFetchCancellationsTotal.WithLabelValues("peer")); got != cancelsBefore+1 {
+		t.Fatalf("peer cancellation delta = %v, want 1", got-cancelsBefore)
+	}
+	if got := counterValue(t, peerHedgeDuplicateBytesTotal.WithLabelValues("peer")); got <= duplicatesBefore {
+		t.Fatal("partial losing peer bytes were not recorded as duplicate traffic")
+	}
+}
+
+func TestServeBlockAlignedPeerWinnerCancelsOrigin(t *testing.T) {
+	const blockSize = 1024
+	originStarted := make(chan struct{})
+	originCanceled := make(chan struct{})
+	var startedOnce, canceledOnce sync.Once
+	origin := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		startedOnce.Do(func() { close(originStarted) })
+		<-r.Context().Done()
+		canceledOnce.Do(func() { close(originCanceled) })
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/cancel-origin.parquet"
+	key := BlockKey(target, 0, blockSize)
+	data := make([]byte, blockSize)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != key {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+		_, _ = w.Write(data)
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), []string{})
+	p.client = origin.Client()
+	p.originTimeout = 200 * time.Millisecond
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	setTestPeerPolicy(p, 32, 32*blockSize, 10*time.Millisecond)
+
+	cancelsBefore := counterValue(t, peerFetchCancellationsTotal.WithLabelValues("origin"))
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	select {
+	case <-originStarted:
+	default:
+		t.Fatal("adaptive head start never launched the origin hedge")
+	}
+	select {
+	case <-originCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("peer won but the losing origin transfer was not canceled")
+	}
+	if got := counterValue(t, peerFetchCancellationsTotal.WithLabelValues("origin")); got != cancelsBefore+1 {
+		t.Fatalf("origin cancellation delta = %v, want 1", got-cancelsBefore)
+	}
+}
+
+func TestServeBlockAlignedQueuedPeerShedsToOriginWithoutStartingLater(t *testing.T) {
+	const blockSize = 1024
+	origin := originServer(t, 4*blockSize)
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/queued.parquet"
+	key := BlockKey(target, 0, blockSize)
+	var peerCalls int32
+	peerAddr := newPeerServer(t, key, make([]byte, blockSize), &peerCalls, &peerCalls)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{peerAddr}), []string{})
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	setTestPeerPolicy(p, 1, blockSize, 20*time.Millisecond)
+
+	blocker, reason := p.peerPolicy.limiter.acquire(context.Background(), blockSize)
+	if blocker == nil || reason != "" {
+		t.Fatalf("occupy limiter = (%v, %q), want permit", blocker, reason)
+	}
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	blocker.release()
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if got := atomic.LoadInt32(&peerCalls); got != 0 {
+		t.Fatalf("queued peer issued %d network calls after its head-start expired", got)
+	}
+}
+
+func TestLaunchPeerFillsDoesNotStartLaterWorkerBatchesAfterHeadStart(t *testing.T) {
+	const (
+		blockSize  = int64(1024)
+		blockCount = int64(peerFillConcurrency + 4)
+	)
+	target := "http://origin.invalid/bucket/wide.parquet"
+
+	releaseFirstBatch := make(chan struct{})
+	var peerCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, _ *http.Request) {
+		call := peerCalls.Add(1)
+		if call <= peerFillConcurrency {
+			<-releaseFirstBatch
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(blockSize, 10))
+		_, _ = w.Write(make([]byte, blockSize))
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), []string{})
+	p.blockSize = blockSize
+	setTestPeerPolicy(p, peerFillConcurrency, peerFillConcurrency*blockSize, 20*time.Millisecond)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	_, allDone, deadline := p.launchPeerFills(ctx, target, 0, blockCount-1)
+	waitUntil := time.Now().Add(time.Second)
+	for peerCalls.Load() < peerFillConcurrency && time.Now().Before(waitUntil) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := peerCalls.Load(); got != peerFillConcurrency {
+		close(releaseFirstBatch)
+		t.Fatalf("first peer batch calls = %d, want %d", got, peerFillConcurrency)
+	}
+	if wait := time.Until(deadline) + 10*time.Millisecond; wait > 0 {
+		time.Sleep(wait)
+	}
+	close(releaseFirstBatch)
+
+	select {
+	case <-allDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer fill workers did not finish")
+	}
+	if got := peerCalls.Load(); got != peerFillConcurrency {
+		t.Fatalf("peer calls = %d, want only the first %d; later batches started after the head-start deadline", got, peerFillConcurrency)
+	}
+}
+
+func TestServeBlockAlignedGlobalPeerCapAcrossRequests(t *testing.T) {
+	const blockSize = 1024
+	const requests = 4
+	origin := originServer(t, 4*blockSize)
+	t.Cleanup(origin.Close)
+
+	release := make(chan struct{})
+	var active, maxActive atomic.Int32
+	data := make([]byte, blockSize)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, _ *http.Request) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			prior := maxActive.Load()
+			if current <= prior || maxActive.CompareAndSwap(prior, current) {
+				break
+			}
+		}
+		<-release
+		_, _ = w.Write(data)
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), []string{})
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	setTestPeerPolicy(p, 2, 2*blockSize, 150*time.Millisecond)
+
+	statuses := make(chan int, requests)
+	for i := 0; i < requests; i++ {
+		go func(i int) {
+			target := fmt.Sprintf("%s/bucket/file-%d.parquet", origin.URL, i)
+			u, _ := url.Parse(target)
+			req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
+				Header: http.Header{"Range": []string{"bytes=0-99"}}}
+			w := httptest.NewRecorder()
+			if !p.serveBlockAligned(w, req.WithContext(context.Background()), "bytes=0-99") {
+				statuses <- 0
+				return
+			}
+			statuses <- w.Code
+		}(i)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for i := 0; i < requests; i++ {
+		if status := <-statuses; status != http.StatusPartialContent {
+			t.Fatalf("request status = %d, want 206", status)
+		}
+	}
+	if got := maxActive.Load(); got > 2 {
+		t.Fatalf("global concurrent peer GETs = %d, want <= 2", got)
+	}
+}
+
+func TestServeBlockAlignedKeepsPerRequestPeerFairnessBound(t *testing.T) {
+	const blockSize = 128
+	const nBlocks = 20
+	body := make([]byte, nBlocks*blockSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	origin := originServer(t, int64(len(body)))
+	target := origin.URL + "/bucket/wide.parquet"
+
+	var active, maxActive atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			prior := maxActive.Load()
+			if current <= prior || maxActive.CompareAndSwap(prior, current) {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+		for idx := int64(0); idx < nBlocks; idx++ {
+			if r.URL.Query().Get("key") == BlockKey(target, idx, blockSize) {
+				_, _ = w.Write(body[idx*blockSize : (idx+1)*blockSize])
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+	origin.Close()
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.blockSize = blockSize
+	p.maxSpanBlocks = nBlocks
+	setTestPeerPolicy(p, 32, 32*blockSize, 150*time.Millisecond)
+
+	w := doBlockRequest(t, p, target, fmt.Sprintf("bytes=0-%d", len(body)-1))
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if got := maxActive.Load(); got > peerFillConcurrency {
+		t.Fatalf("one request used %d concurrent peer GETs, want <= %d", got, peerFillConcurrency)
+	}
+}
+
+func TestOnePeerBlockDoesNotCancelOriginNeededForRestOfSpan(t *testing.T) {
+	const blockSize = 1024
+	body := make([]byte, 2*blockSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	var originCalls atomic.Int32
+	var originCanceled atomic.Bool
+	var originRange atomic.Value
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originCalls.Add(1)
+		originRange.Store(r.Header.Get("Range"))
+		select {
+		case <-time.After(70 * time.Millisecond):
+		case <-r.Context().Done():
+			originCanceled.Store(true)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/span-race.parquet"
+
+	secondCanceled := make(chan struct{})
+	var secondCanceledOnce sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("key") {
+		case BlockKey(target, 0, blockSize):
+			time.Sleep(35 * time.Millisecond)
+			_, _ = w.Write(body[:blockSize])
+		case BlockKey(target, 1, blockSize):
+			<-r.Context().Done()
+			secondCanceledOnce.Do(func() { close(secondCanceled) })
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	setTestPeerPolicy(p, 32, 32*blockSize, 10*time.Millisecond)
+
+	w := doBlockRequest(t, p, target, fmt.Sprintf("bytes=0-%d", len(body)-1))
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if originCanceled.Load() {
+		t.Fatal("one completed peer block canceled the origin span still needed by another block")
+	}
+	if got := originCalls.Load(); got != 1 {
+		t.Fatalf("origin calls = %d, want one coalesced span", got)
+	}
+	if got, _ := originRange.Load().(string); got != "bytes=0-2047" {
+		t.Fatalf("origin Range = %q, want bytes=0-2047", got)
+	}
+	select {
+	case <-secondCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("origin won without canceling the remaining peer block")
+	}
+}
+
+func TestOriginCommitCancelsMatchingPeerBeforeWideSpanCompletes(t *testing.T) {
+	const blockSize = int64(1024)
+	body := make([]byte, 2*blockSize)
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSecond) }) }
+	defer release()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[:blockSize])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-releaseSecond
+		_, _ = w.Write(body[blockSize:])
+	}))
+	t.Cleanup(origin.Close)
+	t.Cleanup(release)
+	target := origin.URL + "/bucket/per-block-cancel.parquet"
+
+	peerCanceled := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	var canceledOnce [2]sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		for idx := range int64(2) {
+			if r.URL.Query().Get("key") != BlockKey(target, idx, blockSize) {
+				continue
+			}
+			<-r.Context().Done()
+			canceledOnce[idx].Do(func() { close(peerCanceled[idx]) })
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	setTestPeerPolicy(p, 32, 32*blockSize, 10*time.Millisecond)
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response <- doBlockRequest(t, p, target, fmt.Sprintf("bytes=0-%d", len(body)-1))
+	}()
+	select {
+	case <-peerCanceled[0]:
+	case <-time.After(time.Second):
+		t.Fatal("first peer was not canceled when origin committed its block")
+	}
+	select {
+	case <-peerCanceled[1]:
+		t.Fatal("second peer was canceled before origin committed the second block")
+	default:
+	}
+	select {
+	case <-response:
+		t.Fatal("request completed while the second origin block was still withheld")
+	default:
+	}
+	release()
+	if w := <-response; w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	select {
+	case <-peerCanceled[1]:
+	case <-time.After(time.Second):
+		t.Fatal("second peer was not canceled when origin committed its block")
+	}
+}
+
+func TestWideSpanRecoveryIsBoundedFromFirstOriginBlockCommit(t *testing.T) {
+	const blockSize = int64(1024)
+	body := make([]byte, 2*blockSize)
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseSecond) }) }
+	defer release()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(40 * time.Millisecond)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(body)-1, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[:blockSize])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-releaseSecond
+		_, _ = w.Write(body[blockSize:])
+	}))
+	t.Cleanup(origin.Close)
+	t.Cleanup(release)
+	target := origin.URL + "/bucket/wide-recovery.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	peerCanceled := make(chan struct{})
+	var peerCanceledOnce sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != key {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		<-r.Context().Done()
+		peerCanceledOnce.Do(func() { close(peerCanceled) })
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	now := time.Unix(1_000, 0)
+	cfg := defaultPeerFetchPolicyConfig(32, 32*blockSize)
+	cfg.now = func() time.Time { return now }
+	p.peerPolicy = newPeerFetchPolicy(cfg)
+	p.peerPolicy.mu.Lock()
+	p.peerPolicy.open = true
+	p.peerPolicy.nextProbe = now
+	p.peerPolicy.mu.Unlock()
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response <- doBlockRequest(t, p, target, fmt.Sprintf("bytes=0-%d", len(body)-1))
+	}()
+	select {
+	case <-peerCanceled:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("recovery peer outlived 1.5x first-block latency while the wider origin span was stalled")
+	}
+	select {
+	case <-response:
+		t.Fatal("request completed while the second origin block was still withheld")
+	default:
+	}
+	release()
+	if w := <-response; w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if !p.peerPolicy.breakerOpen() {
+		t.Fatal("unhealthy wide-span recovery sample closed the breaker")
+	}
+}
+
+func TestRecoveryIsBoundedWhenOriginStallsBeforeFirstBlock(t *testing.T) {
+	const blockSize = int64(1024)
+	body := make([]byte, blockSize)
+	releaseOrigin := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOrigin) }) }
+	defer release()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-releaseOrigin
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", blockSize-1, blockSize))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/pre-first-block-stall.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	peerCanceled := make(chan struct{})
+	var canceledOnce sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != key {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		<-r.Context().Done()
+		canceledOnce.Do(func() { close(peerCanceled) })
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	now := time.Unix(1_000, 0)
+	cfg := defaultPeerFetchPolicyConfig(32, 32*blockSize)
+	cfg.now = func() time.Time { return now }
+	p.peerPolicy = newPeerFetchPolicy(cfg)
+	p.peerPolicy.observeOriginFirstBlock(50 * time.Millisecond)
+	p.peerPolicy.mu.Lock()
+	p.peerPolicy.open = true
+	p.peerPolicy.nextProbe = now
+	p.peerPolicy.mu.Unlock()
+
+	response := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response <- doBlockRequest(t, p, target, "bytes=0-99")
+	}()
+	select {
+	case <-peerCanceled:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("recovery peer outlived the rolling-origin fallback while origin had no first byte")
+	}
+	select {
+	case <-response:
+		t.Fatal("request completed while origin was still withheld")
+	default:
+	}
+	release()
+	if w := <-response; w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if !p.peerPolicy.breakerOpen() {
+		t.Fatal("timed-out recovery sample closed the breaker")
+	}
+}
+
+func TestConcurrentIdenticalHedgesShareOriginSpan(t *testing.T) {
+	const blockSize = 1024
+	body := make([]byte, blockSize)
+	var originCalls atomic.Int32
+	bothPeersStarted := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originCalls.Add(1)
+		<-bothPeersStarted
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", blockSize-1, blockSize))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/shared-span.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	var peerArrivals atomic.Int32
+	normalPeerCanceled := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != key {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		arrival := peerArrivals.Add(1)
+		if arrival == 2 {
+			close(bothPeersStarted)
+		}
+		<-r.Context().Done()
+		if arrival <= int32(len(normalPeerCanceled)) {
+			close(normalPeerCanceled[arrival-1])
+		}
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	setTestPeerPolicy(p, 32, 32*blockSize, 10*time.Millisecond)
+
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			u, _ := url.Parse(target)
+			req := (&http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
+				Header: http.Header{"Range": []string{"bytes=0-99"}}}).WithContext(context.Background())
+			w := httptest.NewRecorder()
+			if !p.serveBlockAligned(w, req, "bytes=0-99") {
+				statuses <- 0
+				return
+			}
+			statuses <- w.Code
+		}()
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		if status := <-statuses; status != http.StatusPartialContent {
+			t.Fatalf("status = %d, want 206", status)
+		}
+	}
+	if got := originCalls.Load(); got != 1 {
+		t.Fatalf("identical concurrent hedges made %d origin calls, want 1", got)
+	}
+	for i, canceled := range normalPeerCanceled {
+		select {
+		case <-canceled:
+		case <-time.After(time.Second):
+			t.Fatalf("shared origin commit did not cancel peer fill for waiter %d", i+1)
+		}
+	}
+}
+
+func TestOpenBreakerRecoveryProbeDoesNotWaitOrGetCanceledByAdjacentBlocks(t *testing.T) {
+	const blockSize = 1024
+	body := make([]byte, 2*blockSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	originStarted := make(chan struct{})
+	var originOnce sync.Once
+	var originCalls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originCalls.Add(1)
+		originOnce.Do(func() { close(originStarted) })
+		time.Sleep(80 * time.Millisecond)
+		start, end, ok := parseAbsoluteRange(r.Header.Get("Range"))
+		if !ok {
+			t.Fatalf("origin Range = %q, want absolute range", r.Header.Get("Range"))
+		}
+		end = min(end, int64(len(body))-1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[start : end+1])
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/recovery.parquet"
+
+	var peerGets atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		peerGets.Add(1)
+		select {
+		case <-originStarted:
+		case <-time.After(20 * time.Millisecond):
+			t.Error("open-breaker request delayed origin for its recovery probe")
+		}
+		time.Sleep(20 * time.Millisecond)
+		for idx := int64(0); idx < 2; idx++ {
+			if r.URL.Query().Get("key") == BlockKey(target, idx, blockSize) {
+				_, _ = w.Write(body[idx*blockSize : (idx+1)*blockSize])
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	now := time.Unix(1_000, 0)
+	cfg := defaultPeerFetchPolicyConfig(32, 32*blockSize)
+	cfg.now = func() time.Time { return now }
+	cfg.breakerCloseAfter = 1
+	p.peerPolicy = newPeerFetchPolicy(cfg)
+	p.peerPolicy.mu.Lock()
+	p.peerPolicy.open = true
+	p.peerPolicy.nextProbe = now
+	p.peerPolicy.mu.Unlock()
+
+	w := doBlockRequest(t, p, target, fmt.Sprintf("bytes=0-%d", len(body)-1))
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	if got := peerGets.Load(); got != 1 {
+		t.Fatalf("recovery peer GETs = %d, want exactly one sampled block", got)
+	}
+	if got := originCalls.Load(); got != 1 {
+		t.Fatalf("origin calls = %d, want one coalesced span; recovery sampling must not serialize origin", got)
+	}
+	if p.peerPolicy.breakerOpen() {
+		t.Fatal("recovered peer beat origin but the breaker remained open")
+	}
+}
+
+func TestOpenBreakerRecoveryAcceptsPeerWithinLatencyRatioAfterOriginWins(t *testing.T) {
+	const blockSize = int64(1024)
+	body := make([]byte, blockSize)
+	originStarted := make(chan struct{})
+	var originOnce sync.Once
+	var originCalls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originCalls.Add(1)
+		originOnce.Do(func() { close(originStarted) })
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", blockSize-1, blockSize))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/marginal-recovery.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	peerFinished := make(chan struct{})
+	var peerFinishOnce sync.Once
+	var peerGets atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != key {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		peerGets.Add(1)
+		<-originStarted
+		time.Sleep(130 * time.Millisecond) // 1.3x origin: slower, but below the 1.5x breaker threshold.
+		w.Header().Set("Content-Length", strconv.FormatInt(blockSize, 10))
+		_, _ = w.Write(body)
+		peerFinishOnce.Do(func() { close(peerFinished) })
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	now := time.Unix(1_000, 0)
+	cfg := defaultPeerFetchPolicyConfig(32, 32*blockSize)
+	cfg.now = func() time.Time { return now }
+	cfg.breakerCloseAfter = 1
+	p.peerPolicy = newPeerFetchPolicy(cfg)
+	p.peerPolicy.mu.Lock()
+	p.peerPolicy.open = true
+	p.peerPolicy.nextProbe = now
+	p.peerPolicy.mu.Unlock()
+
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	select {
+	case <-peerFinished:
+		t.Fatal("open-breaker request waited for a slower diagnostic peer instead of returning origin")
+	default:
+	}
+	select {
+	case <-peerFinished:
+	case <-time.After(time.Second):
+		t.Fatal("recovery peer was canceled when origin won")
+	}
+	deadline := time.Now().Add(time.Second)
+	for p.peerPolicy.breakerOpen() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p.peerPolicy.breakerOpen() {
+		t.Fatal("breaker stayed open even though sampled peer latency was within 1.5x origin")
+	}
+	if got := originCalls.Load(); got != 1 {
+		t.Fatalf("origin calls = %d, want 1", got)
+	}
+	if got := peerGets.Load(); got != 1 {
+		t.Fatalf("recovery peer GETs = %d, want 1", got)
+	}
+}
+
+func TestOpenBreakerRecoveryCancelsPeerAtLatencyRatioBoundary(t *testing.T) {
+	const blockSize = int64(1024)
+	body := make([]byte, blockSize)
+	originStarted := make(chan struct{})
+	var originOnce sync.Once
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originOnce.Do(func() { close(originStarted) })
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", blockSize-1, blockSize))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(origin.Close)
+	target := origin.URL + "/bucket/slow-recovery.parquet"
+	key := BlockKey(target, 0, blockSize)
+
+	peerCanceled := make(chan struct{})
+	var canceledOnce sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/cache/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("key") != key {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		<-originStarted
+		<-r.Context().Done()
+		canceledOnce.Do(func() { close(peerCanceled) })
+	})
+	peer := httptest.NewServer(mux)
+	t.Cleanup(peer.Close)
+
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(store, peerManagerWith([]string{strings.TrimPrefix(peer.URL, "http://")}), nil)
+	p.client = origin.Client()
+	p.blockSize = blockSize
+	p.maxSpanBlocks = 8
+	now := time.Unix(1_000, 0)
+	cfg := defaultPeerFetchPolicyConfig(32, 32*blockSize)
+	cfg.now = func() time.Time { return now }
+	p.peerPolicy = newPeerFetchPolicy(cfg)
+	p.peerPolicy.mu.Lock()
+	p.peerPolicy.open = true
+	p.peerPolicy.nextProbe = now
+	p.peerPolicy.mu.Unlock()
+
+	cancellationsBefore := counterValue(t, peerFetchCancellationsTotal.WithLabelValues("peer"))
+	w := doBlockRequest(t, p, target, "bytes=0-99")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", w.Code)
+	}
+	select {
+	case <-peerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("recovery peer exceeded 1.5x origin without cancellation")
+	}
+	if !p.peerPolicy.breakerOpen() {
+		t.Fatal("unhealthy recovery sample closed the breaker")
+	}
+	if got := counterValue(t, peerFetchCancellationsTotal.WithLabelValues("peer")); got != cancellationsBefore+1 {
+		t.Fatalf("peer cancellation delta = %v, want 1", got-cancellationsBefore)
 	}
 }
 
@@ -979,6 +2101,53 @@ func TestHandleProxyBlockModeRecordsInflightAndDuration(t *testing.T) {
 	}
 	if got := histogramSampleCount(t, requestDurationSeconds.WithLabelValues("block", "s3").(prometheus.Histogram)); got != countBefore+1 {
 		t.Fatalf("requestDurationSeconds{block,s3} sample count delta = %v, want 1", got-countBefore)
+	}
+}
+
+func TestBlockOriginFetchUpdatesOriginInflightGauge(t *testing.T) {
+	const blockSize = 1024
+	started := make(chan struct{})
+	release := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		w.Header().Set("Content-Range", "bytes 0-1023/1024")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, blockSize))
+	}))
+	t.Cleanup(origin.Close)
+	p, _ := newBlockProxy(t, origin, blockSize)
+	p.blockMode = true
+	originURL, _ := url.Parse(origin.URL)
+	p.cacheHostSuffixes = []string{originURL.Host}
+
+	before := gaugeValue(t, originFetchInFlight)
+	done := make(chan int, 1)
+	go func() {
+		u, _ := url.Parse(origin.URL + "/bucket/inflight.parquet")
+		req := httptest.NewRequest(http.MethodGet, u.String(), nil)
+		req.URL = u
+		req.Header.Set("Range", "bytes=0-99")
+		w := httptest.NewRecorder()
+		p.HandleProxy(w, req)
+		done <- w.Code
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("block origin request did not start")
+	}
+	during := gaugeValue(t, originFetchInFlight)
+	close(release)
+	if status := <-done; status != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", status)
+	}
+	if during != before+1 {
+		t.Fatalf("originFetchInFlight during block fetch = %v, want %v", during, before+1)
+	}
+	if got := gaugeValue(t, originFetchInFlight); got != before {
+		t.Fatalf("originFetchInFlight after block fetch = %v, want %v", got, before)
 	}
 }
 

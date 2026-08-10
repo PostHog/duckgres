@@ -126,7 +126,15 @@ func main() {
 	blockMode := os.Getenv("CACHE_BLOCK_MODE") == "on"
 	blockSize := envInt64("CACHE_BLOCK_SIZE_BYTES", 8<<20)
 	maxSpanBlocks := envInt64("CACHE_BLOCK_MAX_SPAN_BLOCKS", 8)
-	slog.Info("Block mode configured.", "enabled", blockMode, "block_size", blockSize, "max_span_blocks", maxSpanBlocks)
+	peerFetchMaxConcurrency := envPositiveInt64("CACHE_PEER_FETCH_MAX_CONCURRENCY", defaultPeerFetchMaxConcurrent)
+	peerFetchMaxBytes := envPositiveInt64("CACHE_PEER_FETCH_MAX_BYTES", defaultPeerFetchMaxBytes(peerFetchMaxConcurrency, blockSize))
+	slog.Info("Block mode configured.",
+		"enabled", blockMode,
+		"block_size", blockSize,
+		"max_span_blocks", maxSpanBlocks,
+		"peer_fetch_max_concurrency", peerFetchMaxConcurrency,
+		"peer_fetch_max_bytes", peerFetchMaxBytes,
+	)
 
 	// Initialize cache store
 	store, err := NewDiskCache(cacheDir, maxPercent)
@@ -146,6 +154,7 @@ func main() {
 	proxy.blockMode = blockMode
 	proxy.blockSize = blockSize
 	proxy.maxSpanBlocks = maxSpanBlocks
+	proxy.peerPolicy = newPeerFetchPolicy(defaultPeerFetchPolicyConfig(peerFetchMaxConcurrency, peerFetchMaxBytes))
 
 	// Forward HTTP proxy (DuckDB httpfs traffic). ServeMux can't match absolute
 	// URLs in forward-proxy requests, so use the handler directly.
@@ -223,6 +232,18 @@ func envInt64(key string, def int64) int64 {
 	n, err := strconv.ParseInt(v, 10, 64)
 	if err != nil {
 		slog.Warn("Invalid integer env var; using default.", "key", key, "value", v, "default", def, "error", err)
+		return def
+	}
+	return n
+}
+
+// envPositiveInt64 is used for resource ceilings: zero or a negative value
+// would either deadlock all acquisitions or silently disable protection, so
+// invalid values fall back to the documented safe default.
+func envPositiveInt64(key string, def int64) int64 {
+	n := envInt64(key, def)
+	if n <= 0 {
+		slog.Warn("Non-positive integer env var; using default.", "key", key, "value", n, "default", def)
 		return def
 	}
 	return n
