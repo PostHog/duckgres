@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -276,8 +279,8 @@ func TestPutStreamErrorMidStream(t *testing.T) {
 	if c.currentSize != 0 {
 		t.Errorf("currentSize = %d after failed stream, want 0", c.currentSize)
 	}
-	if len(c.order) != 0 {
-		t.Errorf("order has %d entries after failed stream, want 0", len(c.order))
+	if c.order.Len() != 0 {
+		t.Errorf("order has %d entries after failed stream, want 0", c.order.Len())
 	}
 	if left := tmpDirEntries(t, c); left != 0 {
 		t.Errorf("temp dir has %d leftover files after failed stream, want 0", left)
@@ -301,13 +304,16 @@ func TestPutStreamOverwrite(t *testing.T) {
 		t.Errorf("currentSize = %d after overwrite, want 40 (not 140)", c.currentSize)
 	}
 	count := 0
-	for _, e := range c.order {
-		if e.key == key {
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		if el.Value.(*cacheEntry).key == key {
 			count++
 		}
 	}
 	if count != 1 {
 		t.Errorf("key appears %d times in order, want exactly 1", count)
+	}
+	if len(c.index) != c.order.Len() {
+		t.Errorf("index has %d entries, order has %d — must match", len(c.index), c.order.Len())
 	}
 	r, size, ok := c.Open(key)
 	if !ok || size != 40 {
@@ -367,5 +373,95 @@ func TestOpenCountsHitOpenFileDoesNot(t *testing.T) {
 	_ = r.Close()
 	if after := counterValue(t, cacheHitsTotal); after != before+1 {
 		t.Errorf("Open changed hit counter by %v, want 1", after-before)
+	}
+}
+
+// TestEvictionRespectsTouchRecency locks in true LRU semantics across the
+// rewrite: touching an old entry must move it out of eviction's path, so the
+// victim is the least recently *used* entry, not the least recently written.
+func TestEvictionRespectsTouchRecency(t *testing.T) {
+	c := newTestCache(t)
+	c.maxBytes = 100
+
+	a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	if err := c.Put(a, make([]byte, 45)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put(b, make([]byte, 45)); err != nil {
+		t.Fatal(err)
+	}
+	// Touch a so b becomes the LRU entry.
+	if _, ok := c.Get(a); !ok {
+		t.Fatal("Get(a) should hit")
+	}
+	if err := c.Put(strings.Repeat("d", 64), make([]byte, 45)); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Has(a) {
+		t.Error("recently touched entry was evicted; eviction must follow access recency")
+	}
+	if c.Has(b) {
+		t.Error("least recently used entry survived eviction")
+	}
+}
+
+// BenchmarkTouchLargeCache documents why the LRU must be O(1): a production
+// node tracks ~285k entries (285GB at 1MiB blocks), and every cache operation
+// touches under one mutex. The prior slice implementation scanned and spliced
+// the whole slice per touch, putting ~half the proxy's CPU into bookkeeping.
+func BenchmarkTouchLargeCache(b *testing.B) {
+	c := &DiskCache{order: list.New(), index: make(map[string]*list.Element)}
+	keys := make([]string, 285000)
+	for i := range keys {
+		keys[i] = CacheKey(fmt.Sprintf("http://bucket/f%d.parquet", i), "bytes=0-1")
+		c.addLocked(keys[i], 1)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.mu.Lock()
+		c.touchLocked(keys[i%len(keys)])
+		c.mu.Unlock()
+	}
+}
+
+// TestScanExistingSeedsRecencyOrder covers eviction correctness after a
+// restart: scanExisting must seed the access list in mtime order, because
+// evictOldest trusts the list front to be the LRU entry. If the seed order
+// were arbitrary, the first evictions after every proxy restart would remove
+// arbitrary entries instead of the oldest.
+func TestScanExistingSeedsRecencyOrder(t *testing.T) {
+	dir := t.TempDir()
+	old, mid, recent := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	now := time.Now()
+	// Write in an order unrelated to the mtimes we stamp.
+	for _, e := range []struct {
+		key string
+		age time.Duration
+	}{{mid, 2 * time.Hour}, {recent, time.Hour}, {old, 3 * time.Hour}} {
+		path := dir + "/" + e.key
+		if err := os.WriteFile(path, make([]byte, 45), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		ts := now.Add(-e.age)
+		if err := os.Chtimes(path, ts, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := NewDiskCache(dir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 135 bytes are resident; a fourth 45-byte entry against a 170-byte cap
+	// forces exactly one eviction — which must be the oldest-mtime entry.
+	c.maxBytes = 170
+
+	if err := c.Put(strings.Repeat("d", 64), make([]byte, 45)); err != nil {
+		t.Fatal(err)
+	}
+	if c.Has(old) {
+		t.Error("oldest-mtime entry survived post-restart eviction")
+	}
+	if !c.Has(recent) || !c.Has(mid) {
+		t.Error("newer entries were evicted before the oldest")
 	}
 }
