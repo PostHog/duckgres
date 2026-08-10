@@ -66,6 +66,9 @@ type WorkerWaitSessionIdlePayload struct {
 type WorkerSetS3CachePayload struct {
 	WorkerControlMetadata
 	Enabled bool `json:"enabled"`
+	// Mode is one of on, off, or passthrough. Empty retains the legacy Enabled
+	// behavior for requests from older control planes.
+	Mode string `json:"mode,omitempty"`
 }
 
 // WorkerReleaseQueryHandlePayload asks a worker to release a statement query

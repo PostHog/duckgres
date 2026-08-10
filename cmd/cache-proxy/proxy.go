@@ -265,6 +265,11 @@ var hopByHop = map[string]bool{
 	"upgrade":             true,
 }
 
+// cachePassthroughHeader is added only by duckgres's worker-local router.
+// It selects the proxy's observable-but-uncached request path and is stripped
+// before the origin request so it cannot affect S3 or a SigV4 request.
+const cachePassthroughHeader = "X-Duckgres-Cache-Passthrough"
+
 // HandleProxy handles forward HTTP proxy requests from DuckDB httpfs.
 // Expects absolute-form URIs (scheme + host + path in the request-line).
 func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
@@ -287,6 +292,10 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Non-GET (HEAD, etc.) is never cached — forward and return.
 	if r.Method != http.MethodGet {
+		p.forwardUncached(w, r)
+		return
+	}
+	if r.Header.Get(cachePassthroughHeader) == "true" {
 		p.forwardUncached(w, r)
 		return
 	}
@@ -726,6 +735,10 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	forwardStart := time.Now()
 	ctx, span := proxyTracer.Start(r.Context(), "cache.forward", trace.WithAttributes(requestSpanAttrs(r)...))
 	defer span.End()
+	passthrough := r.Header.Get(cachePassthroughHeader) == "true"
+	if passthrough {
+		span.SetAttributes(attribute.Bool("duckgres.cache.passthrough", true))
+	}
 	r = r.WithContext(ctx)
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
@@ -742,7 +755,7 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	req.TransferEncoding = r.TransferEncoding
 	req.Trailer = r.Trailer
 	for k, vv := range r.Header {
-		if hopByHop[strings.ToLower(k)] {
+		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, cachePassthroughHeader) {
 			continue
 		}
 		for _, v := range vv {

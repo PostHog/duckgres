@@ -153,6 +153,10 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 	// A fresh activation always attaches with the cache-proxy transport
 	// (overrideS3EndpointForCacheProxy above), so the bypass flag starts clean.
 	p.s3CacheBypassed = false
+	p.s3CachePassthrough = false
+	if p.cacheRouter != nil {
+		p.cacheRouter.setPassthrough(false)
+	}
 	p.ownerEpoch = payload.OwnerEpoch
 	p.ownerCPInstanceID = payload.CPInstanceID
 	p.workerID = payload.WorkerID
@@ -177,6 +181,20 @@ func (p *SessionPool) activateTenant(payload ActivationPayload) error {
 // not a shared-warm tenant worker (the proxy transport is applied only by
 // tenant activation).
 func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
+	mode := "off"
+	if enabled {
+		mode = "on"
+	}
+	return p.SetS3CacheMode(mode)
+}
+
+// SetS3CacheMode applies the cache mode for the active session. Passthrough
+// retains the cache-proxy transport while instructing the worker-local router
+// to forward each request without cache reads or fills.
+func (p *SessionPool) SetS3CacheMode(mode string) error {
+	if mode != "on" && mode != "off" && mode != "passthrough" {
+		return fmt.Errorf("invalid s3 cache mode %q", mode)
+	}
 	if !p.sharedWarmMode || !cacheEnabled() {
 		return nil
 	}
@@ -201,6 +219,7 @@ func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
 		actDB = p.activation.db
 	}
 	bypassed := p.s3CacheBypassed
+	passthrough := p.s3CachePassthrough
 	refreshDB := p.controlDB
 	refreshFn := p.refreshS3Secret
 	sem := p.duckLakeSem
@@ -209,7 +228,7 @@ func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
 	if !activated {
 		return fmt.Errorf("worker is not activated")
 	}
-	if bypassed == !enabled {
+	if bypassed == (mode == "off") && passthrough == (mode == "passthrough") {
 		return nil
 	}
 	if cfg.ObjectStore == "" {
@@ -222,17 +241,21 @@ func (p *SessionPool) SetS3CacheEnabled(enabled bool) error {
 	if refreshFn == nil {
 		refreshFn = server.RefreshS3Secret
 	}
-	if enabled {
+	if mode != "off" {
 		p.overrideS3EndpointForCacheProxy(&cfg)
 	}
 	if err := refreshFn(refreshDB, cfg, sem); err != nil {
-		return fmt.Errorf("swap S3 secret transport (s3_cache=%v): %w", enabled, err)
+		return fmt.Errorf("swap S3 secret transport (s3_cache=%s): %w", mode, err)
 	}
 
 	p.mu.Lock()
-	p.s3CacheBypassed = !enabled
+	p.s3CacheBypassed = mode == "off"
+	p.s3CachePassthrough = mode == "passthrough"
+	if p.cacheRouter != nil {
+		p.cacheRouter.setPassthrough(mode == "passthrough")
+	}
 	p.mu.Unlock()
-	slog.Info("Swapped tenant S3 secret transport.", "org", orgID, "s3_cache_enabled", enabled)
+	slog.Info("Swapped tenant S3 secret transport.", "org", orgID, "s3_cache_mode", mode)
 	return nil
 }
 

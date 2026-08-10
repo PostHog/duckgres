@@ -227,6 +227,7 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	// rolled back.
 	if err := c.reapplyS3CacheAfterWorkerSwitch(ctx); err != nil {
 		c.s3CacheOff = false
+		c.s3CachePassthrough = false
 		return &s3CacheReapplyError{err: err}
 	}
 	return nil

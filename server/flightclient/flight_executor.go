@@ -37,13 +37,14 @@ import (
 const MaxGRPCMessageSize = 1 << 30 // 1GB
 
 const (
-	waitSessionIdleAction    = "WaitSessionIdle"
-	releaseQueryHandleAction = "ReleaseQueryHandle"
-	logQueryAction           = "LogQuery"
-	setSessionS3CacheAction  = "SetSessionS3Cache"
-	queryCloseWaitTimeout    = 30 * time.Second
-	queryLogForwardTimeout   = 5 * time.Second
-	queryLogMaxInFlight      = 64
+	waitSessionIdleAction       = "WaitSessionIdle"
+	releaseQueryHandleAction    = "ReleaseQueryHandle"
+	logQueryAction              = "LogQuery"
+	setSessionS3CacheAction     = "SetSessionS3Cache"
+	setSessionS3CacheModeAction = "SetSessionS3CacheMode"
+	queryCloseWaitTimeout       = 30 * time.Second
+	queryLogForwardTimeout      = 5 * time.Second
+	queryLogMaxInFlight         = 64
 )
 
 // ErrWorkerDead is returned when the backing worker process has crashed.
@@ -636,6 +637,49 @@ func (e *FlightExecutor) SetS3CacheEnabled(ctx context.Context, enabled bool) (e
 	stream, err := e.client.Client.DoAction(
 		e.withSession(merged),
 		&flight.Action{Type: setSessionS3CacheAction, Body: payload},
+	)
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// SetS3CacheMode selects the cache transport mode on the session worker.
+func (e *FlightExecutor) SetS3CacheMode(ctx context.Context, mode string) (err error) {
+	if e.dead.Load() {
+		return ErrWorkerDead
+	}
+	if e.client == nil || e.client.Client == nil {
+		return ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
+	payload, err := json.Marshal(wire.WorkerSetS3CachePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Mode: mode,
+	})
+	if err != nil {
+		return err
+	}
+
+	merged, cancel := e.mergedContext(ctx)
+	defer cancel()
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(merged),
+		&flight.Action{Type: setSessionS3CacheModeAction, Body: payload},
 	)
 	if err != nil {
 		return err

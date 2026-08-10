@@ -107,14 +107,16 @@ type SessionPool struct {
 	secretSwapMu sync.Mutex
 	// s3CacheBypassed is true while the tenant S3 secret carries the org's
 	// native HTTPS transport instead of the cache-proxy transport, i.e. the
-	// current session set `duckgres.s3_cache = off`. Flipped only under
+	// current session set `duckgres.s3_cache = off`. s3CachePassthrough keeps
+	// that transport but marks requests to skip cache reads and fills. Flipped only under
 	// secretSwapMu (read under p.mu); the one exception is activateTenant's
 	// reset-to-false at first-activation commit, which cannot race a swap
 	// because SetS3CacheEnabled refuses to run before an activation exists
 	// (and taking secretSwapMu there would invert the secretSwapMu→p.mu lock
 	// order). CreateSession restores the proxy transport before a new session
 	// starts so a bypass can never leak into the org's next session.
-	s3CacheBypassed bool
+	s3CacheBypassed    bool
+	s3CachePassthrough bool
 
 	drainMu       sync.Mutex
 	draining      bool
@@ -1843,6 +1845,8 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 	case "WaitSessionIdle":
 		return s.handler.doWaitSessionIdle(cmd.Body, stream)
 	case "SetSessionS3Cache":
+		return s.handler.doSetSessionS3Cache(cmd.Body, stream)
+	case "SetSessionS3CacheMode":
 		return s.handler.doSetSessionS3Cache(cmd.Body, stream)
 	case "ReleaseQueryHandle":
 		return s.handler.doReleaseQueryHandle(cmd.Body, stream)

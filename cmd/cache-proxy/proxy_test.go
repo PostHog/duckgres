@@ -155,6 +155,34 @@ func TestHandleProxyGETMissThenHit(t *testing.T) {
 	}
 }
 
+func TestHandleProxyPassthroughGETSkipsCacheAndStripsMarker(t *testing.T) {
+	proxy := newTestProxy(t)
+	var originCalls atomic.Int32
+	var markerReachedOrigin atomic.Bool
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		originCalls.Add(1)
+		markerReachedOrigin.Store(r.Header.Get(cachePassthroughHeader) != "")
+		_, _ = w.Write([]byte("uncached"))
+	})
+
+	headers := http.Header{cachePassthroughHeader: []string{"true"}}
+	for range 2 {
+		rec := doForwardProxyRequest(proxy, http.MethodGet, originURL+"/bucket/file.parquet", headers)
+		if rec.Code != http.StatusOK || rec.Body.String() != "uncached" {
+			t.Fatalf("passthrough response = %d %q, want 200 uncached", rec.Code, rec.Body.String())
+		}
+	}
+	if got := originCalls.Load(); got != 2 {
+		t.Fatalf("origin calls = %d, want 2 because passthrough must not cache", got)
+	}
+	if markerReachedOrigin.Load() {
+		t.Fatal("passthrough marker reached origin")
+	}
+	if _, _, ok := proxy.store.Open(CacheKey(originURL+"/bucket/file.parquet", "")); ok {
+		t.Fatal("passthrough request populated the cache")
+	}
+}
+
 func TestHandleProxyHEADForwardedUncached(t *testing.T) {
 	proxy := newTestProxy(t)
 

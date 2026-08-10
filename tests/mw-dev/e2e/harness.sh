@@ -627,6 +627,7 @@ s3_cache_guc() { # org password
   # the worker RPC — a worker-side failure would error the SET).
   assert_compat   "$1" "$2" ducklake "SHOW duckgres.s3_cache" "on" "s3_cache_default"
   assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; SHOW duckgres.s3_cache" "off" "s3_cache_set_off"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = passthrough; SHOW duckgres.s3_cache" "passthrough" "s3_cache_set_passthrough"
   # DuckLake R/W still works inside a bypassed session (real S3 round-trip
   # over whatever transport the worker now carries).
   t="e2e_s3cache_$(echo "$1" | tr -c 'a-z0-9' _)"

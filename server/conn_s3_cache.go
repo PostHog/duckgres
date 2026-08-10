@@ -32,6 +32,14 @@ type S3CacheControl interface {
 	SetS3CacheEnabled(ctx context.Context, enabled bool) error
 }
 
+// S3CacheModeControl extends S3CacheControl for workers that can distinguish
+// the cache-on, cache-off, and proxy-passthrough transports. Passthrough keeps
+// cache-proxy on the request path while ensuring it neither reads nor fills
+// its cache.
+type S3CacheModeControl interface {
+	SetS3CacheMode(ctx context.Context, mode string) error
+}
+
 // S3CacheEnabled reports the session's `duckgres.s3_cache` state. Defaults to
 // true: the cache proxy serves all S3 traffic unless this session explicitly
 // opted out.
@@ -41,6 +49,9 @@ func (c *clientConn) S3CacheEnabled() bool {
 
 // s3CacheValue is the SHOW-facing rendering of the session state.
 func (c *clientConn) s3CacheValue() string {
+	if c.s3CachePassthrough {
+		return transform.S3CachePassthrough
+	}
 	if c.s3CacheOff {
 		return transform.S3CacheOff
 	}
@@ -48,7 +59,7 @@ func (c *clientConn) s3CacheValue() string {
 }
 
 // applyS3CacheSetting applies an already-normalized `duckgres.s3_cache` value
-// ("on", "off", or "" = reset to the default "on") to the session. When the
+// ("on", "off", "passthrough", or "" = reset to the default "on") to the session. When the
 // effective state changes and the session executor supports per-session S3
 // cache control, the worker swap RPC runs FIRST and the session state is only
 // updated on success — a SET that failed to take effect on the worker must
@@ -56,19 +67,32 @@ func (c *clientConn) s3CacheValue() string {
 // pass validated values only (transform.NormalizeS3Cache, rejecting anything
 // else with 22023 before this is reached).
 func (c *clientConn) applyS3CacheSetting(value string) error {
-	enabled := value != transform.S3CacheOff
-	if enabled != c.S3CacheEnabled() {
-		if ctrl, ok := c.executor.(S3CacheControl); ok {
+	effective := value
+	if effective == "" {
+		effective = transform.S3CacheOn
+	}
+	if effective != c.s3CacheValue() {
+		if effective == transform.S3CachePassthrough {
+			if ctrl, ok := c.executor.(S3CacheModeControl); ok {
+				c.ensureConnectionContext()
+				ctx, cancel := context.WithTimeout(c.ctx, s3CacheApplyTimeout)
+				defer cancel()
+				if err := ctrl.SetS3CacheMode(ctx, effective); err != nil {
+					return fmt.Errorf("failed to apply %s: %w", s3CacheGUCName, err)
+				}
+			}
+		} else if ctrl, ok := c.executor.(S3CacheControl); ok {
 			c.ensureConnectionContext()
 			ctx, cancel := context.WithTimeout(c.ctx, s3CacheApplyTimeout)
 			defer cancel()
-			if err := ctrl.SetS3CacheEnabled(ctx, enabled); err != nil {
+			if err := ctrl.SetS3CacheEnabled(ctx, effective == transform.S3CacheOn); err != nil {
 				return fmt.Errorf("failed to apply %s: %w", s3CacheGUCName, err)
 			}
 		}
-		c.logger().Info("Set duckgres.s3_cache.", "enabled", enabled)
+		c.logger().Info("Set duckgres.s3_cache.", "mode", effective)
 	}
-	c.s3CacheOff = !enabled
+	c.s3CacheOff = effective == transform.S3CacheOff
+	c.s3CachePassthrough = effective == transform.S3CachePassthrough
 	return nil
 }
 
@@ -87,8 +111,8 @@ func (c *clientConn) applyStartupS3Cache(raw string) error {
 }
 
 // reapplyS3CacheAfterWorkerSwitch re-asserts this session's `duckgres.s3_cache`
-// state on a freshly acquired worker after a tier escalation. The bypass lives
-// in the WORKER's `ducklake_s3` secret, not in session state, and a new session
+// state on a freshly acquired worker after a tier escalation. The bypass and
+// passthrough mode live in the WORKER, not in session state, and a new session
 // always starts on the cache-proxy transport (CreateSession restores it before
 // the session starts, so a bypass never leaks into the org's next session).
 // Without this re-apply, a connection that asked for `off` would silently start
@@ -98,7 +122,21 @@ func (c *clientConn) applyStartupS3Cache(raw string) error {
 // change. No-op when the session never bypassed the cache, or when the executor
 // has no cache to bypass.
 func (c *clientConn) reapplyS3CacheAfterWorkerSwitch(ctx context.Context) error {
-	if !c.s3CacheOff {
+	mode := c.s3CacheValue()
+	if mode == transform.S3CacheOn {
+		return nil
+	}
+	if mode == transform.S3CachePassthrough {
+		ctrl, ok := c.executor.(S3CacheModeControl)
+		if !ok {
+			return nil
+		}
+		applyCtx, cancel := context.WithTimeout(ctx, s3CacheApplyTimeout)
+		defer cancel()
+		if err := ctrl.SetS3CacheMode(applyCtx, mode); err != nil {
+			return fmt.Errorf("failed to re-apply %s on the new worker: %w", s3CacheGUCName, err)
+		}
+		c.logger().Info("Re-applied duckgres.s3_cache after worker switch.", "mode", mode)
 		return nil
 	}
 	ctrl, ok := c.executor.(S3CacheControl)
@@ -110,7 +148,7 @@ func (c *clientConn) reapplyS3CacheAfterWorkerSwitch(ctx context.Context) error 
 	if err := ctrl.SetS3CacheEnabled(applyCtx, false); err != nil {
 		return fmt.Errorf("failed to re-apply %s on the new worker: %w", s3CacheGUCName, err)
 	}
-	c.logger().Info("Re-applied duckgres.s3_cache after worker switch.", "enabled", false)
+	c.logger().Info("Re-applied duckgres.s3_cache after worker switch.", "mode", mode)
 	return nil
 }
 

@@ -108,6 +108,28 @@ func TestSetS3CacheEnabledSwapsTransportAndBack(t *testing.T) {
 	}
 }
 
+func TestSetS3CachePassthroughKeepsProxyTransport(t *testing.T) {
+	t.Setenv("DUCKGRES_CACHE_ENABLED", "true")
+	t.Setenv("NODE_IP", "10.0.0.9")
+	pool, calls := s3CacheTestPool(t, "s3://analytics/warehouse/")
+
+	if err := pool.SetS3CacheMode("passthrough"); err != nil {
+		t.Fatalf("SetS3CacheMode(passthrough): %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("passthrough: %d secret rebuilds, want 1", len(*calls))
+	}
+	if got := (*calls)[0]; got.HTTPProxy != "http://10.0.0.9:8080" || got.S3UseSSL || got.S3Endpoint != "s3.us-east-1.amazonaws.com" {
+		t.Fatalf("passthrough must retain the cache-proxy transport, got HTTPProxy=%q S3UseSSL=%v S3Endpoint=%q", got.HTTPProxy, got.S3UseSSL, got.S3Endpoint)
+	}
+	pool.mu.RLock()
+	passthrough := pool.s3CachePassthrough
+	pool.mu.RUnlock()
+	if !passthrough {
+		t.Fatal("s3CachePassthrough = false after passthrough mode, want true")
+	}
+}
+
 // TestSetS3CacheEnabledNoOpWithoutCacheProxy asserts the toggle degrades to a
 // silent no-op when the node runs no cache proxy (DUCKGRES_CACHE_ENABLED
 // unset): the org transport is already direct, there is nothing to bypass,

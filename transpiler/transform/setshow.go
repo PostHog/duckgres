@@ -66,8 +66,9 @@ const s3CacheParam = "duckgres.s3_cache"
 
 // Canonical values for the duckgres.s3_cache GUC.
 const (
-	S3CacheOn  = "on"
-	S3CacheOff = "off"
+	S3CacheOn          = "on"
+	S3CacheOff         = "off"
+	S3CachePassthrough = "passthrough"
 )
 
 // NormalizeS3Cache validates a client-supplied duckgres.s3_cache value. The
@@ -84,6 +85,8 @@ func NormalizeS3Cache(raw string) (string, error) {
 		return S3CacheOn, nil
 	case S3CacheOff, "false", "no", "0":
 		return S3CacheOff, nil
+	case S3CachePassthrough:
+		return S3CachePassthrough, nil
 	default:
 		return "", errInvalidS3Cache()
 	}
@@ -94,8 +97,8 @@ func NormalizeS3Cache(raw string) (string, error) {
 func errInvalidS3Cache() *CodedError {
 	return &CodedError{
 		Code: "22023", // invalid_parameter_value
-		Message: fmt.Sprintf("invalid value for %q: must be %q or %q",
-			s3CacheParam, S3CacheOn, S3CacheOff),
+		Message: fmt.Sprintf("invalid value for %q: must be %q, %q, or %q",
+			s3CacheParam, S3CacheOn, S3CacheOff, S3CachePassthrough),
 	}
 }
 

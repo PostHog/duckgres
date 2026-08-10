@@ -17,6 +17,7 @@ func TestTranspile_S3CacheSet(t *testing.T) {
 	}{
 		{"set off", "SET duckgres.s3_cache = 'off'", "off"},
 		{"set on", "SET duckgres.s3_cache = 'on'", "on"},
+		{"set passthrough", "SET duckgres.s3_cache = 'passthrough'", "passthrough"},
 		{"unquoted off", "SET duckgres.s3_cache = off", "off"},
 		{"unquoted boolean keyword", "SET duckgres.s3_cache = false", "off"},
 		{"true normalizes to on", "SET duckgres.s3_cache = 'true'", "on"},

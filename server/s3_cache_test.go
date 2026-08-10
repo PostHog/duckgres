@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -20,6 +21,19 @@ type s3CacheRecordingExecutor struct {
 	// swap must land before the first user query).
 	onSwap  func(enabled bool)
 	onQuery func()
+}
+
+// s3CacheModeRecordingExecutor also records the three-state cache mode RPC.
+// Production remote executors implement this capability so passthrough can
+// retain cache-proxy request instrumentation without using its cache.
+type s3CacheModeRecordingExecutor struct {
+	s3CacheRecordingExecutor
+	modeCalls []string
+}
+
+func (e *s3CacheModeRecordingExecutor) SetS3CacheMode(_ context.Context, mode string) error {
+	e.modeCalls = append(e.modeCalls, mode)
+	return e.err
 }
 
 func (e *s3CacheRecordingExecutor) SetS3CacheEnabled(_ context.Context, enabled bool) error {
@@ -99,6 +113,36 @@ func TestS3CacheSimpleSetAppliesToExecutor(t *testing.T) {
 	}
 	if !c.S3CacheEnabled() {
 		t.Fatalf("S3CacheEnabled() = false after RESET, want true")
+	}
+}
+
+func TestS3CachePassthroughAppliesModeAndReportsIt(t *testing.T) {
+	exec := &s3CacheModeRecordingExecutor{}
+	c, out := newBufferedConn(exec)
+
+	if err := c.handleQuery([]byte("SET duckgres.s3_cache = passthrough\x00")); err != nil {
+		t.Fatalf("handleQuery(SET passthrough): %v", err)
+	}
+	if got, want := exec.modeCalls, []string{"passthrough"}; !slices.Equal(got, want) {
+		t.Fatalf("mode calls = %v, want %v", got, want)
+	}
+
+	out.Reset()
+	if err := c.handleQuery([]byte("SHOW duckgres.s3_cache\x00")); err != nil {
+		t.Fatalf("handleQuery(SHOW): %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("passthrough")) {
+		t.Fatalf("SHOW duckgres.s3_cache did not report passthrough: %s", describeMsgs(parseWireMsgs(t, out.Bytes())))
+	}
+
+	if err := c.handleQuery([]byte("RESET duckgres.s3_cache\x00")); err != nil {
+		t.Fatalf("handleQuery(RESET): %v", err)
+	}
+	if got, want := exec.calls, []bool{true}; !slices.Equal(got, want) {
+		t.Fatalf("boolean calls after RESET = %v, want %v", got, want)
+	}
+	if got := c.s3CacheValue(); got != "on" {
+		t.Fatalf("s3CacheValue after RESET = %q, want on", got)
 	}
 }
 
