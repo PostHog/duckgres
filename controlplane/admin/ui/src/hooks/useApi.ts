@@ -19,6 +19,7 @@ import type {
   ClusterStatus,
   ClusterSummary,
   CreateUserBody,
+  DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
   ErrorEntry,
@@ -47,6 +48,7 @@ import type {
   SessionStatus,
   StartReshardBody,
   UpdateUserBody,
+  WarehouseStatusResult,
   WorkerStatus,
 } from "@/types/api";
 
@@ -171,6 +173,34 @@ export function useDeprovisionWarehouse(id: string) {
       qc.invalidateQueries({ queryKey: ["orgs", id, "warehouse"] });
       qc.invalidateQueries({ queryKey: ["orgs"] });
     },
+  });
+}
+
+// No useProvisionWarehouse mutation hook: the AddOrgDialog calls
+// api.provisionWarehouse directly so the 202 payload — which carries the
+// one-time root password — never sits in the TanStack Query cache.
+
+// GET /orgs/:id/warehouse/status — provisioning lifecycle watch. Pass a
+// refetchInterval to follow an in-flight provision.
+export function useWarehouseStatus(id: string | undefined, opts?: { refetchInterval?: number | false }) {
+  return useQuery<WarehouseStatusResult>({
+    queryKey: ["warehouse-status", id],
+    queryFn: () => api.warehouseStatus(id!),
+    enabled: !!id,
+    refetchInterval: opts?.refetchInterval ?? false,
+    retry: 1,
+  });
+}
+
+// GET /database-name/check — availability probe for the provision form.
+// Debounced/disabled by the caller via `enabled`.
+export function useDatabaseNameAvailable(name: string, enabled: boolean) {
+  return useQuery<DatabaseNameCheck>({
+    queryKey: ["database-name-check", name],
+    queryFn: () => api.checkDatabaseName(name),
+    enabled: enabled && name.trim() !== "",
+    retry: 1,
+    staleTime: 30_000,
   });
 }
 
