@@ -47,16 +47,6 @@ async function fillMinimal(user: ReturnType<typeof userEvent.setup>) {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  // jsdom lacks the pointer-capture APIs Radix Select touches on pointer
-  // events (same class of polyfill as OrgDetail.test.tsx's scrollIntoView).
-  if (!HTMLElement.prototype.hasPointerCapture) {
-    HTMLElement.prototype.hasPointerCapture = () => false;
-    HTMLElement.prototype.setPointerCapture = () => {};
-    HTMLElement.prototype.releasePointerCapture = () => {};
-  }
-  if (!HTMLElement.prototype.scrollIntoView) {
-    HTMLElement.prototype.scrollIntoView = () => {};
-  }
   client.checkDatabaseName.mockResolvedValue({ name: "", available: true });
   client.warehouseStatus.mockResolvedValue({
     org_id: OK_UUID,
@@ -118,8 +108,10 @@ describe("AddOrgDialog", () => {
     await user.click(screen.getByRole("button", { name: /provision organization/i }));
 
     await waitFor(() => expect(client.provisionWarehouse).toHaveBeenCalledTimes(1));
-    // The django payload shape, verbatim: metadata_store cnpg-shard, fresh
-    // s3bucket data store, ducklake enabled, team_id as a NUMBER.
+    // The django payload shape, verbatim — and NOTHING else: no schema
+    // override (the team's schema defaults to team_<id>), no enabled/backfill
+    // override (the team defaults to enabled, backing the "enabled
+    // immediately" promise), no external stores.
     expect(client.provisionWarehouse).toHaveBeenCalledWith(OK_UUID, {
       database_name: OK_UUID,
       team_id: 12345,
@@ -136,91 +128,17 @@ describe("AddOrgDialog", () => {
     await waitFor(() => expect(client.warehouseStatus).toHaveBeenCalledWith(OK_UUID));
   });
 
-  it("requires endpoint and secret for an external metadata store and sends them", async () => {
+  it("tells the operator the team lands at team_<id>, enabled immediately like django onboarding", async () => {
     const user = userEvent.setup();
-    client.provisionWarehouse.mockResolvedValue({
-      status: "provisioning started",
-      org: OK_UUID,
-      username: "root",
-      password: "p",
-    });
     renderDialog();
 
-    await fillMinimal(user);
-    await user.click(screen.getByRole("combobox"));
-    await user.click(screen.getByRole("option", { name: /external \(existing Postgres/i }));
-
-    const submit = screen.getByRole("button", { name: /provision organization/i });
-    expect(submit).toBeDisabled();
-
-    await user.type(screen.getByLabelText(/endpoint \(host\)/i), "db.example.rds.amazonaws.com");
-    expect(submit).toBeDisabled();
-    await user.type(screen.getByLabelText(/password aws secret name/i), "posthog-example-secret");
-    expect(submit).toBeEnabled();
-
-    await user.click(submit);
-    await waitFor(() => expect(client.provisionWarehouse).toHaveBeenCalledTimes(1));
-    expect(client.provisionWarehouse).toHaveBeenCalledWith(OK_UUID, {
-      database_name: OK_UUID,
-      team_id: 12345,
-      metadata_store: {
-        type: "external",
-        external: {
-          endpoint: "db.example.rds.amazonaws.com",
-          password_aws_secret: "posthog-example-secret",
-        },
-      },
-      data_store: { type: "s3bucket" },
-      ducklake: { enabled: true },
-    });
-  });
-
-  it("switches the data store to external when an existing bucket is named", async () => {
-    const user = userEvent.setup();
-    client.provisionWarehouse.mockResolvedValue({
-      status: "provisioning started",
-      org: OK_UUID,
-      username: "root",
-      password: "p",
-    });
-    renderDialog();
-
-    await fillMinimal(user);
-    await user.type(screen.getByPlaceholderText(/provision a fresh bucket/i), "my-existing-bucket");
-    await user.type(screen.getByPlaceholderText(/region \(optional\)/i), "us-east-1");
-    await user.click(screen.getByRole("button", { name: /provision organization/i }));
-
-    await waitFor(() => expect(client.provisionWarehouse).toHaveBeenCalledTimes(1));
-    expect(client.provisionWarehouse).toHaveBeenCalledWith(
-      OK_UUID,
-      expect.objectContaining({
-        data_store: { type: "external", bucket_name: "my-existing-bucket", region: "us-east-1" },
-      }),
-    );
-  });
-
-  it("states the team lands enabled immediately, matching PostHog-side onboarding", async () => {
-    const user = userEvent.setup();
-    client.provisionWarehouse.mockResolvedValue({
-      status: "provisioning started",
-      org: OK_UUID,
-      username: "root",
-      password: "p",
-    });
-    renderDialog();
-
-    // The difference from the raw API surface: manual onboarding enables the
-    // org's teams right away, and the form says so up front — there is no
-    // "enabled" toggle to leave off.
+    // The form promises the django-equivalent outcome up front (schema
+    // team_<id> + immediate enablement) instead of exposing either as a knob.
     expect(screen.getAllByText(/enabled immediately/i).length).toBeGreaterThan(0);
-    // The body carries no enabled override: the team's default on the
-    // provision path IS enabled (mirrors django's immediate enablement).
+
     await fillMinimal(user);
-    await user.click(screen.getByRole("button", { name: /provision organization/i }));
-    await waitFor(() => expect(client.provisionWarehouse).toHaveBeenCalledTimes(1));
-    const body = client.provisionWarehouse.mock.calls[0][1] as Record<string, unknown>;
-    expect(body).not.toHaveProperty("enabled");
-    expect(body).not.toHaveProperty("backfill_enabled");
+    // With a team id typed, the note shows the concrete schema it will get.
+    expect(screen.getByText(/team_12345/)).toBeInTheDocument();
   });
 
   it("surfaces the API error (e.g. 400 team_id required / 409 conflict) inline", async () => {

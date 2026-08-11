@@ -1,9 +1,16 @@
 // "Add organization" dialog — drives the EXACT warehouse-onboarding API the
 // PostHog backend (django) calls: POST /api/v1/orgs/:id/provision
 // (controlplane/provisioning/api.go::provisionWarehouse). Same body shape,
-// same 202 response. Use it to manually set up an org end to end: it creates
-// the org row, its first team row, the root login, and kicks off the async
-// warehouse provisioning (bucket + metadata store + DuckLake catalog).
+// same 202 response, same outcome: it creates the org row, its first team row
+// (schema team_<id>, enabled immediately — exactly as PostHog-side onboarding
+// lands them), the root login, and kicks off the async warehouse provisioning
+// (cnpg-shard metadata + fresh per-org bucket + DuckLake catalog).
+//
+// The form is deliberately just the two ids: every other field the API accepts
+// (schema override, external metadata store, existing bucket) is what the
+// normal onboarding flow itself does NOT set, so the dialog sends the defaults
+// verbatim — that is what makes the result identical to a django-provisioned
+// org. Special-case setups still go through the API directly.
 //
 // The response carries the generated root password in cleartext — that is the
 // ONLY time it is ever served (only the bcrypt hash is persisted), so the
@@ -15,13 +22,6 @@ import { AlertTriangle, Check, Copy, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -82,14 +82,6 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
   const [orgId, setOrgId] = useState("");
   const [databaseName, setDatabaseName] = useState("");
   const [teamId, setTeamId] = useState("");
-  const [schemaName, setSchemaName] = useState("");
-  const [metadataType, setMetadataType] = useState<"cnpg-shard" | "external">("cnpg-shard");
-  const [extEndpoint, setExtEndpoint] = useState("");
-  const [extSecret, setExtSecret] = useState("");
-  const [extUser, setExtUser] = useState("");
-  const [extDatabase, setExtDatabase] = useState("");
-  const [bucketName, setBucketName] = useState("");
-  const [bucketRegion, setBucketRegion] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<ProvisionWarehouseResult | null>(null);
@@ -114,8 +106,8 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
   const dbCheck = useDatabaseNameAvailable(trimmedDb, dbLookupEnabled);
   const dbTaken = dbCheck.data && !dbCheck.data.available;
 
-  // Optional post-submit watch of the asynchronous provisioning. Enabled by
-  // the "Watch progress" toggle; stops polling at a terminal state.
+  // Optional post-submit watch of the asynchronous provisioning; stops polling
+  // at a terminal state.
   const status = useWarehouseStatus(result?.org, {
     refetchInterval: watch ? 5_000 : false,
   });
@@ -129,14 +121,6 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
     setDatabaseName("");
     setDbTouched(false);
     setTeamId("");
-    setSchemaName("");
-    setMetadataType("cnpg-shard");
-    setExtEndpoint("");
-    setExtSecret("");
-    setExtUser("");
-    setExtDatabase("");
-    setBucketName("");
-    setBucketRegion("");
     setError(null);
     setPending(false);
     setResult(null);
@@ -153,39 +137,23 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
     if (pending || result) return false;
     if (trimmedOrg === "" || orgProblem) return false;
     if (trimmedDb === "" || dbTaken) return false;
-    if (!teamIdOk) return false;
-    if (metadataType === "external" && (extEndpoint.trim() === "" || extSecret.trim() === "")) {
-      return false;
-    }
-    return true;
-  }, [pending, result, trimmedOrg, orgProblem, trimmedDb, dbTaken, teamIdOk, metadataType, extEndpoint, extSecret]);
+    return teamIdOk;
+  }, [pending, result, trimmedOrg, orgProblem, trimmedDb, dbTaken, teamIdOk]);
 
   const submit = async () => {
     setError(null);
-    // Built EXACTLY as the PostHog backend's provision call builds it: fields
-    // the flow doesn't set are omitted (the server applies its defaults),
-    // ducklake is always enabled (a warehouse without a catalog is rejected).
+    // Built EXACTLY as the PostHog backend's provision call builds it: only
+    // the fields the normal flow sets — no schema override, no external
+    // stores. Everything else takes the server default, which is the whole
+    // point: the resulting org is indistinguishable from a django-onboarded
+    // one (team schema team_<id>, team enabled, cnpg-shard, fresh bucket).
     const body: ProvisionWarehouseBody = {
       database_name: trimmedDb,
       team_id: Number(teamId.trim()),
-      metadata_store: { type: metadataType },
+      metadata_store: { type: "cnpg-shard" },
       data_store: { type: "s3bucket" },
       ducklake: { enabled: true },
     };
-    const schema = schemaName.trim();
-    if (schema !== "") body.schema_name = schema;
-    if (metadataType === "external") {
-      body.metadata_store.external = {
-        endpoint: extEndpoint.trim(),
-        password_aws_secret: extSecret.trim(),
-      };
-      if (extUser.trim() !== "") body.metadata_store.external.user = extUser.trim();
-      if (extDatabase.trim() !== "") body.metadata_store.external.database = extDatabase.trim();
-    }
-    if (bucketName.trim() !== "") {
-      body.data_store = { type: "external", bucket_name: bucketName.trim() };
-      if (bucketRegion.trim() !== "") body.data_store.region = bucketRegion.trim();
-    }
     setPending(true);
     try {
       const resp = await api.provisionWarehouse(trimmedOrg, body);
@@ -221,10 +189,11 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
         <DialogHeader>
           <DialogTitle>Add organization</DialogTitle>
           <DialogDescription>
-            Provisions a warehouse through the same onboarding API the PostHog backend uses (
-            <span className="font-mono text-xs">POST /api/v1/orgs/:id/provision</span>). Creates the
-            org, its first team (enabled immediately, exactly as PostHog-side onboarding lands
-            them) and the root login, then starts asynchronous provisioning.
+            Provisions an org through the same onboarding API the PostHog backend uses (
+            <span className="font-mono text-xs">POST /api/v1/orgs/:id/provision</span>), with the
+            same defaults: cnpg-shard metadata, a fresh S3 bucket, and the team's warehouse schema
+            at <span className="font-mono text-xs">team_&lt;id&gt;</span>. The team lands enabled
+            immediately — exactly as PostHog-side onboarding enables them.
           </DialogDescription>
         </DialogHeader>
 
@@ -319,105 +288,19 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
                 The database name "{trimmedDb}" is already in use by another org.
               </p>
             )}
-            <div className="grid grid-cols-2 gap-3">
-              <FieldRow label="Team id" id="add-org-team-id">
-                <Input
-                  id="add-org-team-id"
-                  value={teamId}
-                  onChange={(e) => setTeamId(e.target.value)}
-                  placeholder="PostHog team id, e.g. 12345"
-                  className="font-mono text-xs"
-                />
-              </FieldRow>
-              <FieldRow label="Schema name (optional)" id="add-org-schema-name">
-                <Input
-                  id="add-org-schema-name"
-                  value={schemaName}
-                  onChange={(e) => setSchemaName(e.target.value)}
-                  placeholder={teamIdOk ? `team_${teamId.trim()} (default)` : "team_<id> (default)"}
-                  className="font-mono text-xs"
-                />
-              </FieldRow>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              The team's warehouse schema. Required because a warehouse cannot exist without a
-              team; the id becomes the org's first team row. The created team is{" "}
-              <span className="font-medium">enabled immediately</span> — the same outcome as the
-              PostHog-side onboarding, where an org's teams land enabled right away.
-            </p>
-            <FieldRow label="Metadata store">
-              <Select value={metadataType} onValueChange={(v) => setMetadataType(v as typeof metadataType)}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="cnpg-shard">cnpg-shard (composition picks the active shard)</SelectItem>
-                  <SelectItem value="external">external (existing Postgres / RDS)</SelectItem>
-                </SelectContent>
-              </Select>
-            </FieldRow>
-            {metadataType === "external" && (
-              <div className="space-y-3 rounded-md border border-border/60 p-3">
-                <FieldRow label="Endpoint (host)" id="add-org-ext-endpoint">
-                  <Input
-                    id="add-org-ext-endpoint"
-                    value={extEndpoint}
-                    onChange={(e) => setExtEndpoint(e.target.value)}
-                    placeholder="db.example.rds.amazonaws.com"
-                    className="font-mono text-xs"
-                  />
-                </FieldRow>
-                <FieldRow label="Password AWS secret name" id="add-org-ext-secret">
-                  <Input
-                    id="add-org-ext-secret"
-                    value={extSecret}
-                    onChange={(e) => setExtSecret(e.target.value)}
-                    placeholder="Secrets Manager secret holding the password"
-                    className="font-mono text-xs"
-                  />
-                </FieldRow>
-                <div className="grid grid-cols-2 gap-3">
-                  <FieldRow label="User (optional)" id="add-org-ext-user">
-                    <Input
-                      id="add-org-ext-user"
-                      value={extUser}
-                      onChange={(e) => setExtUser(e.target.value)}
-                      placeholder="postgres (default)"
-                      className="font-mono text-xs"
-                    />
-                  </FieldRow>
-                  <FieldRow label="Database (optional)" id="add-org-ext-database">
-                    <Input
-                      id="add-org-ext-database"
-                      value={extDatabase}
-                      onChange={(e) => setExtDatabase(e.target.value)}
-                      placeholder="postgres (default)"
-                      className="font-mono text-xs"
-                    />
-                  </FieldRow>
-                </div>
-              </div>
-            )}
-            <FieldRow label="Existing S3 bucket (optional)" id="add-org-bucket-name">
-              <div className="grid grid-cols-2 gap-3">
-                <Input
-                  id="add-org-bucket-name"
-                  value={bucketName}
-                  onChange={(e) => setBucketName(e.target.value)}
-                  placeholder="Provision a fresh bucket (default)"
-                  className="font-mono text-xs"
-                />
-                <Input
-                  value={bucketRegion}
-                  onChange={(e) => setBucketRegion(e.target.value)}
-                  placeholder="Region (optional)"
-                  className="font-mono text-xs"
-                  disabled={bucketName.trim() === ""}
-                />
-              </div>
+            <FieldRow label="Team id" id="add-org-team-id">
+              <Input
+                id="add-org-team-id"
+                value={teamId}
+                onChange={(e) => setTeamId(e.target.value)}
+                placeholder="PostHog team id, e.g. 12345"
+                className="font-mono text-xs"
+              />
             </FieldRow>
             <p className="text-xs text-muted-foreground">
-              DuckLake is always enabled — the API rejects a warehouse without a catalog.
+              A warehouse cannot exist without a team: the id becomes the org's first team row at
+              schema <span className="font-mono">team_{teamIdOk ? teamId.trim() : "<id>"}</span>,
+              enabled immediately — the same state django's landing flow produces.
             </p>
             {error && <p className="text-xs text-destructive">{error}</p>}
             <DialogFooter>
