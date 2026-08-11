@@ -650,7 +650,7 @@ func SetupMultiTenant(
 		admin.RoleGate(),
 	)
 	admin.RegisterAPI(api, store, adpt, liveFetcher)
-	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), store, cfg.DucklingBucketSuffix)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

@@ -802,6 +802,13 @@ Invariants:
 - **One of each per team**, via two SEPARATE partial unique indexes on
   `(org_id, team_id)` — deliberately not one index across both modes, so a
   reader and a writer coexist.
+- **Service credentials rotate the project's `project_user` hash, not a new
+  login.** `POST /api/v1/orgs/:id/teams/:team_id/service-credentials` is how a
+  PostHog backend job (dagster) fetches a short-lived credential. It reuses
+  the team's canonical `posthog_team_<id>_rw` login precisely so the session
+  binds exactly the namespaces above — there is no second ACL to audit or
+  drift. Expiry is enforced by ROTATION, not a checked timestamp — see
+  "Service Credentials" below for the full contract.
 - Touching any of this → update `server/query_access_test.go`,
   `controlplane/configstore/query_access_test.go`,
   `controlplane/admin/api_test.go`, `controlplane/org_router_test.go`,
@@ -809,6 +816,62 @@ Invariants:
   `migrations_postgres_test.go`, `docs/postgres-compatibility.md`, AND the
   `project_reader_isolation` / `project_user_isolation` assertions in
   `tests/mw-dev/e2e/harness.sh`.
+
+## Service Credentials (`POST /orgs/:id/teams/:team_id/service-credentials`) — LOAD-BEARING CONTRACT
+
+How PostHog backend jobs (dagster today) authenticate to duckgres WITHOUT a
+long-lived password living in Django. Replaces the org-root credential read
+from a `DuckgresServer` row with a per-team credential minted on demand by
+the CP.
+
+**Caller contract:**
+`POST /api/v1/orgs/:id/teams/:team_id/service-credentials` with
+`{team_id, principal, ttl_seconds?, force_rotate?}`. `principal` is audit
+attribution (`"dagster:events-backfill"`). `ttl_seconds` is clamped to
+[1 min, 1 h] (default 15 min, the RDS-IAM precedent). Response is
+`{username, password?, expires_at}`; password is **omitted** when the CP
+reused a live grant. The caller is the internal-secret-authed PostHog
+backend — the route sits next to the other provisioning routes for exactly
+that trust class, NOT on the admin/console side.
+
+**The load-bearing invariants:**
+- **The login IS the team's canonical `project_user` (`posthog_team_<id>_rw`).**
+  No parallel `svc_*` identity, no second policy to audit, no drift from the
+  admin console's "the team's writer login" model. Sessions minted here are
+  session-equal to a login the admin UI rotated.
+- **Expiry is enforced by ROTATION, not by a checked timestamp on the
+  credential.** The bcrypt hash on the `duckgres_org_users` row IS the
+  credential. A mint call for the same team within the TTL gets the grant
+  back untouched (hash and `updated_at` do not move — no spurious
+  config-generation wake-up for pollers, and a concurrent long-lived run's
+  steps don't have their working credential rotated out from under them
+  mid-flight). The FIRST mint call after the TTL has lapsed rotates the hash,
+  and from that moment the old credential fails auth for NEW connections.
+  Real leak window is `TTL + time-to-next-touch`. This deliberately dodges
+  the hard-SQLSTATE-expiry footgun: no job is ever killed mid-run because a
+  wall-clock timestamp ticked past its credential's `exp`.
+- **Established sessions are NEVER torn down on expiry.** Freshness is
+  enforced only at the pgwire handshake — the RDS-IAM / Cloud-SQL-IAM
+  contract. A long job's existing connection rides to completion; each NEW
+  connection mints afresh.
+- **`force_rotate` is how a job with nothing cached gets a plaintext.** The
+  reuse path returns NO password (it would be returning nothing the caller
+  can use); a job's first mint of a run passes `force_rotate: true`. This is
+  the resolution of the obvious timers race: without it, every run's first
+  mint would be the one rotating, which is exactly the concurrent-run
+  clobbering the reuse window exists to prevent.
+- **Concurrency**: the decide-then-mutate sequence runs under
+  `LockOrgConnectionAdmissionTx`, so two racing mints (two CP replicas, or a
+  run and a refresh) serialize on one hash — never double-rotate into
+  mutually-invalidating credentials.
+- **After the write, THIS replica's snapshot is reloaded immediately**
+  (`ReloadSnapshot`), then best-effort peer fan-out. Without it, the
+  credentials would routinely fail their first few auth attempts on up-to-one-
+  poll-interval-old snapshots.
+- Touching any of this → update `controlplane/provisioning/service_credential.go` +
+  `_test.go`, `controlplane/configstore/service_credential.go` +
+  `_postgres_test.go`, and the caller-side minter in the PostHog repo
+  (`products/managed_warehouse/backend/service_credentials.py`).
 
 ## Compute-Usage Billing (managed-warehouse, remote backend only)
 

@@ -106,7 +106,7 @@ type Store interface {
 // bucketSuffix is the env suffix used to compute the control-plane-owned
 // per-org s3bucket name at provision time (empty ⇒ the CP doesn't name buckets
 // and the composition derives).
-func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
+func RegisterAPI(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string) {
 	h := &handler{store: store, bucketSuffix: bucketSuffix}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
@@ -119,6 +119,15 @@ func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
 	r.GET("/orgs/:id/teams", h.listOrgTeams)
 	r.POST("/orgs/:id/teams", h.upsertOrgTeam)
 	r.DELETE("/orgs/:id/teams/:team_id", h.deleteOrgTeam)
+	// Short-lived service credentials: a PostHog backend job (dagster) mints a
+	// credential against one of its own team rows, gets the team's canonical
+	// project_user login scoped to that team's namespaces, and the CP rotates
+	// the underlying bcrypt hash when the previous grant is too close to
+	// expiry. The plaintext is returned only here; the store persists only the
+	// hash.
+	r.POST("/orgs/:id/teams/:team_id/service-credentials", func(c *gin.Context) {
+		h.issueServiceCredential(c, tenantStore)
+	})
 }
 
 // RegisterDiscoveryAPI registers the read-only discovery endpoints for
