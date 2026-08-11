@@ -518,7 +518,14 @@ func (h *FlightSQLHandler) doSetSessionS3Cache(body []byte, stream flight.Flight
 	if _, err := h.sessionFromContext(stream.Context()); err != nil {
 		return err
 	}
-	if err := h.pool.SetS3CacheEnabled(req.Enabled); err != nil {
+	mode := req.Mode
+	if mode == "" {
+		mode = "off"
+		if req.Enabled {
+			mode = "on"
+		}
+	}
+	if err := h.pool.SetS3CacheMode(mode); err != nil {
 		return status.Errorf(codes.Internal, "set session s3 cache: %v", err)
 	}
 

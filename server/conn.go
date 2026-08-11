@@ -245,13 +245,12 @@ type clientConn struct {
 	// this only ever holds "", "standard", or "endpoints".
 	querySource string
 
-	// s3CacheOff holds the `duckgres.s3_cache` session GUC state (another
-	// duckgres-namespaced custom parameter, NOT forwarded to DuckDB): true
-	// when this session asked to bypass the node-local S3 cache proxy. Only
-	// flipped by applyS3CacheSetting AFTER the worker-side transport swap
-	// succeeded, so SHOW never reports a state the worker isn't in. See
-	// conn_s3_cache.go.
-	s3CacheOff bool
+	// s3CacheMode holds the `duckgres.s3_cache` session GUC state (another
+	// duckgres-namespaced custom parameter, NOT forwarded to DuckDB). A single
+	// mode prevents impossible combinations such as both direct bypass and
+	// proxy passthrough. It changes only AFTER the worker-side transport swap
+	// succeeds, so SHOW never reports a state the worker isn't in.
+	s3CacheMode transform.S3CacheMode
 
 	// idleTimeout is a validated, connect-time client override. Zero means use
 	// the server default. It is initialized before the message loop starts and

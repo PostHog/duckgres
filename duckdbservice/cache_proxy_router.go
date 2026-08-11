@@ -50,6 +50,9 @@ type cacheProxyRouter struct {
 
 	mu   sync.RWMutex
 	mode cacheProxyMode
+	// passthrough marks daemon-bound requests so cache-proxy records and
+	// forwards them but never serves from or writes to its cache.
+	passthrough bool
 }
 
 type cacheProxySupervisorConfig struct {
@@ -154,6 +157,20 @@ func (r *cacheProxyRouter) setMode(mode cacheProxyMode) {
 	}
 }
 
+const cacheProxyPassthroughHeader = "X-Duckgres-Cache-Passthrough"
+
+func (r *cacheProxyRouter) setPassthrough(enabled bool) {
+	r.mu.Lock()
+	r.passthrough = enabled
+	r.mu.Unlock()
+}
+
+func (r *cacheProxyRouter) isPassthrough() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.passthrough
+}
+
 func recordCacheProxyMode(mode cacheProxyMode) {
 	for _, candidate := range []cacheProxyMode{cacheProxyModeDisabled, cacheProxyModeCached, cacheProxyModeBypassed} {
 		value := 0.0
@@ -170,7 +187,11 @@ func (r *cacheProxyRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	if r.Mode() == cacheProxyModeCached {
-		resp, err := r.cacheClient.Do(cloneProxyRequest(req, false))
+		cacheReq := cloneProxyRequest(req, false)
+		if r.isPassthrough() {
+			cacheReq.Header.Set(cacheProxyPassthroughHeader, "true")
+		}
+		resp, err := r.cacheClient.Do(cacheReq)
 		if err == nil {
 			defer func() { _ = resp.Body.Close() }()
 			copyProxyResponse(w, resp)

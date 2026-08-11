@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/posthog/duckgres/server/usersecrets"
+	"github.com/posthog/duckgres/transpiler/transform"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -226,7 +227,7 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	// counted "ok" above — the swap happened), so the pin is deliberately NOT
 	// rolled back.
 	if err := c.reapplyS3CacheAfterWorkerSwitch(ctx); err != nil {
-		c.s3CacheOff = false
+		c.s3CacheMode = transform.S3CacheOn
 		return &s3CacheReapplyError{err: err}
 	}
 	return nil

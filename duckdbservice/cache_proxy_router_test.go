@@ -76,6 +76,38 @@ func TestCacheProxyRouterFallsOpenToAuthoritativeSource(t *testing.T) {
 	}
 }
 
+func TestCacheProxyRouterMarksPassthroughRequests(t *testing.T) {
+	var marked atomic.Bool
+	cache := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		marked.Store(r.Header.Get(cacheProxyPassthroughHeader) == "true")
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer cache.Close()
+
+	router := newCacheProxyRouter(cache.Listener.Addr().String(), false)
+	router.setMode(cacheProxyModeCached)
+	router.setPassthrough(true)
+	proxy := httptest.NewServer(router)
+	defer proxy.Close()
+
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := client.Get("http://example.com/warehouse/file.parquet")
+	if err != nil {
+		t.Fatalf("GET through router: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !marked.Load() {
+		t.Fatal("cache-bound request was not marked as passthrough")
+	}
+}
+
 // ResponseHeaderTimeout must bound an unavailable upstream without imposing a
 // whole-response deadline: S3 range bodies can legitimately outlive it.
 func TestCacheProxyRouterStreamsPastResponseHeaderTimeout(t *testing.T) {

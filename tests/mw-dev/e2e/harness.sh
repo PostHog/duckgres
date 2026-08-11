@@ -627,6 +627,7 @@ s3_cache_guc() { # org password
   # the worker RPC — a worker-side failure would error the SET).
   assert_compat   "$1" "$2" ducklake "SHOW duckgres.s3_cache" "on" "s3_cache_default"
   assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = off; SHOW duckgres.s3_cache" "off" "s3_cache_set_off"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.s3_cache = passthrough; SHOW duckgres.s3_cache" "passthrough" "s3_cache_set_passthrough"
   # DuckLake R/W still works inside a bypassed session (real S3 round-trip
   # over whatever transport the worker now carries).
   t="e2e_s3cache_$(echo "$1" | tr -c 'a-z0-9' _)"
@@ -638,7 +639,7 @@ s3_cache_guc() { # org password
     fail "s3_cache: invalid value 'junk' was accepted: $out"
   fi
   case "$out" in
-    *'must be "on" or "off"'*) ;;
+    *'must be "on", "off", or "passthrough"'*) ;;
     *) fail "s3_cache: invalid-value rejection did not name the valid values: '$out'" ;;
   esac
   # Fresh-session default: a previous session's off must never leak into the
@@ -661,7 +662,7 @@ s3_cache_guc() { # org password
     fail "s3_cache: invalid startup option was accepted: $out"
   fi
   case "$out" in
-    *'must be "on" or "off"'*) ;;
+    *'must be "on", "off", or "passthrough"'*) ;;
     *) fail "s3_cache: invalid startup-option rejection did not name the valid values: '$out'" ;;
   esac
 }

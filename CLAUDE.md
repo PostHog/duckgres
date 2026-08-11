@@ -496,23 +496,27 @@ release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
 
 ## Per-Session S3 Cache Bypass (`duckgres.s3_cache`, remote backend)
 
-`SET duckgres.s3_cache = on|off` (default `on`; also a `-c` startup option)
-lets a session bypass the node-local S3 cache-proxy DaemonSet — for cold-read
-benchmarking and ruling the cache out of correctness/staleness questions.
+`SET duckgres.s3_cache = on|off|passthrough` (default `on`; also a `-c`
+startup option) controls the node-local S3 cache-proxy DaemonSet. `off`
+bypasses its cache transport for cold-read benchmarking; `passthrough` keeps
+requests flowing through cache-proxy while skipping its cache, so cache-off
+workloads retain per-request proxy instrumentation.
 Mechanism: the CP intercepts the duckgres-namespaced GUC (never forwarded to
 DuckDB) and, on every state flip, calls the worker's `SetSessionS3Cache`
-action (`flightclient.FlightExecutor.SetS3CacheEnabled` →
-`SessionPool.SetS3CacheEnabled`), which rebuilds the `ducklake_s3` secret:
+action (`flightclient.FlightExecutor.SetS3CacheMode` →
+`SessionPool.SetS3CacheMode`), which rebuilds the `ducklake_s3` secret:
 `off` = the org's native HTTPS transport, so httpfs CONNECT-tunnels through
 the proxy as opaque TLS (no cache reads/fills — the deliberate, reversible
-form of the mw-prod-us 2026-07-17 incident); `on` = the
-`overrideS3EndpointForCacheProxy` transport. Global `http_proxy` is never
-touched (post-attach propagation to DuckLake subcatalogs is unreliable;
-secrets are consulted per request). Instance-global secret + one session per
-worker = session-scoped in effect. Invariants:
+form of the mw-prod-us 2026-07-17 incident); `passthrough` = the same
+`overrideS3EndpointForCacheProxy` transport as `on`, with a worker-local
+marker that makes cache-proxy use `forwardUncached` and strips that marker
+before it reaches S3; `on` = the normal caching transport. Global `http_proxy`
+is never touched (post-attach propagation to DuckLake subcatalogs is
+unreliable; secrets are consulted per request). Instance-global secret + one
+session per worker = session-scoped in effect. Invariants:
 
 - **State follows the worker, never leads it.** The session flag
-  (`clientConn.s3CacheOff`) flips only after the worker swap succeeds; a
+  (`clientConn.s3CacheMode`) flips only after the worker swap succeeds; a
   failed swap fails the SET (`XX000`) / the batch / the connect (startup
   option), so `SHOW` can never report a transport the worker isn't using.
 - **A bypass must never leak into the org's next session.** `CreateSession`
@@ -521,7 +525,7 @@ worker = session-scoped in effect. Invariants:
   best-effort. Both no-op unless a bypass is actually in effect.
 - **Credential rotation respects the flag.** The hot-idle/mid-session refresh
   (`reuseExistingActivation`) rebuilds the secret with or without the proxy
-  transport according to `s3CacheBypassed`; all secret rebuilds serialize on
+  transport according to `s3CacheMode`; all secret rebuilds serialize on
   `secretSwapMu` so the last write always matches the flag. (Without this, an
   hourly STS rotation silently re-enables the cache mid-benchmark — the
   inverse of the 2026-07-17 incident.)
@@ -535,7 +539,7 @@ worker = session-scoped in effect. Invariants:
   still pending, so it can neither lie nor spend a pod needlessly. See the
   Exploratory Worker Tier section.
 - **Closed enum, validated on every set path** (`transform.NormalizeS3Cache`):
-  PostgreSQL boolean spellings, normalized to on/off; anything else is `22023`
+  PostgreSQL boolean spellings, normalized to on/off, plus `passthrough`; anything else is `22023`
   (simple/batched SET, extended Parse, and the startup option — which the CP
   validates BEFORE acquiring a worker). The rejection never echoes the value.
 - **Scope: remote/k8s shared-warm workers with a cache proxy.** Elsewhere
