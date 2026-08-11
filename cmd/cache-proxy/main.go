@@ -134,6 +134,16 @@ func main() {
 		slog.Error("Failed to initialize cache store.", "error", err)
 		os.Exit(1)
 	}
+	// Track the disk's free space: when something outside the cache consumes
+	// it, the cache's budget shrinks instead of evicting healthy entries for
+	// room it never actually had and then ENOSPC-ing the fill.
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			store.refreshCapacity(maxPercent)
+		}
+	}()
 
 	// Initialize peer manager
 	var peers *PeerManager

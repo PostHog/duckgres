@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -120,23 +121,25 @@ func TestDiskCachePutGetHas(t *testing.T) {
 	data := []byte("hello world")
 
 	if c.Has(key) {
-		t.Fatal("Has should be false before Put")
+		t.Fatal("Has should be false before PutStream")
 	}
-	if _, ok := c.Get(key); ok {
-		t.Fatal("Get should miss before Put")
+	if _, _, ok := c.Open(key); ok {
+		t.Fatal("Open should miss before PutStream")
 	}
-	if err := c.Put(key, data); err != nil {
-		t.Fatalf("Put: %v", err)
+	if _, err := c.PutStream(key, bytes.NewReader(data)); err != nil {
+		t.Fatalf("PutStream: %v", err)
 	}
 	if !c.Has(key) {
-		t.Fatal("Has should be true after Put")
+		t.Fatal("Has should be true after PutStream")
 	}
-	got, ok := c.Get(key)
+	r, _, ok := c.Open(key)
 	if !ok {
-		t.Fatal("Get should hit after Put")
+		t.Fatal("Open should hit after PutStream")
 	}
+	defer func() { _ = r.Close() }()
+	got, _ := io.ReadAll(r)
 	if string(got) != string(data) {
-		t.Errorf("Get returned %q, want %q", got, data)
+		t.Errorf("Open returned %q, want %q", got, data)
 	}
 }
 
@@ -144,8 +147,8 @@ func TestDiskCacheOpen(t *testing.T) {
 	c := newTestCache(t)
 	key := strings.Repeat("b", 64)
 	data := []byte("streaming bytes")
-	if err := c.Put(key, data); err != nil {
-		t.Fatalf("Put: %v", err)
+	if _, err := c.PutStream(key, bytes.NewReader(data)); err != nil {
+		t.Fatalf("PutStream: %v", err)
 	}
 	r, size, ok := c.Open(key)
 	if !ok {
@@ -171,14 +174,11 @@ func TestDiskCacheRejectsInvalidKey(t *testing.T) {
 	if c.Has(bad) {
 		t.Error("Has should reject invalid key")
 	}
-	if _, ok := c.Get(bad); ok {
-		t.Error("Get should reject invalid key")
-	}
 	if _, _, ok := c.Open(bad); ok {
 		t.Error("Open should reject invalid key")
 	}
-	if err := c.Put(bad, []byte("x")); err == nil {
-		t.Error("Put should reject invalid key")
+	if _, err := c.PutStream(bad, bytes.NewReader([]byte("x"))); err == nil {
+		t.Error("PutStream should reject invalid key")
 	}
 }
 
@@ -196,8 +196,8 @@ func TestDiskCacheEviction(t *testing.T) {
 		strings.Repeat("3", 64),
 	}
 	for _, k := range keys {
-		if err := c.Put(k, make([]byte, 60)); err != nil {
-			t.Fatalf("Put %s: %v", k, err)
+		if _, err := c.PutStream(k, bytes.NewReader(make([]byte, 60))); err != nil {
+			t.Fatalf("PutStream %s: %v", k, err)
 		}
 	}
 	// After three 60-byte puts with maxBytes=100, the first key must have
@@ -346,6 +346,91 @@ func TestPutStreamOversizedObject(t *testing.T) {
 	}
 }
 
+// TestHasAnswersFromIndexNotDisk: an untracked file sitting in the cache dir
+// is NOT "in the cache" — the index is the single source of truth for both
+// lookups and eviction/size accounting. (Pre-fix, Has stat'ed the disk and
+// answered true for files the LRU didn't know about.)
+func TestHasAnswersFromIndexNotDisk(t *testing.T) {
+	c := newTestCache(t)
+	key := strings.Repeat("9", 64)
+
+	// Drop a valid-key file on disk with NO index entry.
+	if err := os.WriteFile(c.dir+"/"+key, []byte("stray"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if c.Has(key) {
+		t.Error("Has must answer from the index: untracked on-disk file reported as cached")
+	}
+
+	// And the inverse: a tracked entry whose file has been removed still
+	// reports present until the LRU drops it (an open reader keeps serving it —
+	// eviction removes directory entries, not in-flight reads).
+	tracked := strings.Repeat("8", 64)
+	if _, err := c.PutStream(tracked, bytes.NewReader([]byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(c.dir + "/" + tracked); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Has(tracked) {
+		t.Error("tracked entry must report present from the index even if its file vanished")
+	}
+}
+
+// TestRefreshCapacityShrinksToFreeDisk: when something else eats the filesystem,
+// the cache budget must shrink (and over-budget entries evict) rather than the
+// cache evicting healthy entries to make room for writes the disk can't take.
+func TestRefreshCapacityShrinksToFreeDisk(t *testing.T) {
+	c := newTestCache(t)
+
+	// Force an over-capacity state relative to the free disk this test runs on:
+	// pretend the budget used to be huge and track some bytes against it.
+	c.maxBytes = 1 << 40 // 1 TiB
+	if _, err := c.PutStream(strings.Repeat("1", 64), bytes.NewReader(make([]byte, 100))); err != nil {
+		t.Fatal(err)
+	}
+	before := c.currentSize
+
+	_, maxed, ok := c.refreshCapacityStats(80)
+	if !ok {
+		t.Fatal("refreshCapacityStats: statfs failed")
+	}
+	if maxed >= 1<<40 {
+		t.Fatalf("maxBytes = %d, want it clamped to a fraction of the real disk", maxed)
+	}
+	// The tracked bytes are tiny and fit any realistic budget, so nothing
+	// should have evicted — the budget just came down.
+	if c.currentSize != before {
+		t.Errorf("currentSize = %d, want %d (no eviction when fits)", c.currentSize, before)
+	}
+}
+
+// TestRefreshCapacityEvictsWhenOverBudget: if the recomputed budget is below
+// the live contents, refresh evicts LRU-first until the contents fit it.
+func TestRefreshCapacityEvictsWhenOverBudget(t *testing.T) {
+	c := newTestCache(t)
+	if _, err := c.PutStream(strings.Repeat("1", 64), bytes.NewReader(make([]byte, 60))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.PutStream(strings.Repeat("2", 64), bytes.NewReader(make([]byte, 60))); err != nil {
+		t.Fatal(err)
+	}
+	if c.currentSize != 120 {
+		t.Fatalf("currentSize = %d, want 120", c.currentSize)
+	}
+
+	// What would the budget be if the disk only had (reserve + 60B) free?
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(c.dir, &stat); err != nil {
+		t.Fatal(err)
+	}
+	total := int64(stat.Blocks) * int64(stat.Bsize)
+	fakeFree := total/20 + 60 // reserve + exactly one entry
+	if got := clampToFree(1<<40, total, fakeFree); got != 60 {
+		t.Fatalf("clampToFree = %d, want 60", got)
+	}
+}
+
 // TestOpenCountsHitOpenFileDoesNot locks in the metric split: serving a hit via
 // Open records a cache hit; serving a freshly-fetched miss via openFile does
 // not (otherwise misses would be double-counted as hits).
@@ -384,17 +469,19 @@ func TestEvictionRespectsTouchRecency(t *testing.T) {
 	c.maxBytes = 100
 
 	a, b := strings.Repeat("a", 64), strings.Repeat("b", 64)
-	if err := c.Put(a, make([]byte, 45)); err != nil {
+	if _, err := c.PutStream(a, bytes.NewReader(make([]byte, 45))); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Put(b, make([]byte, 45)); err != nil {
+	if _, err := c.PutStream(b, bytes.NewReader(make([]byte, 45))); err != nil {
 		t.Fatal(err)
 	}
 	// Touch a so b becomes the LRU entry.
-	if _, ok := c.Get(a); !ok {
-		t.Fatal("Get(a) should hit")
+	if r, _, ok := c.Open(a); !ok {
+		t.Fatal("Open(a) should hit")
+	} else {
+		_ = r.Close()
 	}
-	if err := c.Put(strings.Repeat("d", 64), make([]byte, 45)); err != nil {
+	if _, err := c.PutStream(strings.Repeat("d", 64), bytes.NewReader(make([]byte, 45))); err != nil {
 		t.Fatal(err)
 	}
 	if !c.Has(a) {
@@ -455,7 +542,7 @@ func TestScanExistingSeedsRecencyOrder(t *testing.T) {
 	// forces exactly one eviction — which must be the oldest-mtime entry.
 	c.maxBytes = 170
 
-	if err := c.Put(strings.Repeat("d", 64), make([]byte, 45)); err != nil {
+	if _, err := c.PutStream(strings.Repeat("d", 64), bytes.NewReader(make([]byte, 45))); err != nil {
 		t.Fatal(err)
 	}
 	if c.Has(old) {
