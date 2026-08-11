@@ -1,6 +1,7 @@
 package duckdbservice
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -9,6 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 func waitForCacheProxyMode(t *testing.T, router *cacheProxyRouter, want cacheProxyMode) {
@@ -105,6 +110,54 @@ func TestCacheProxyRouterMarksPassthroughRequests(t *testing.T) {
 	}
 	if !marked.Load() {
 		t.Fatal("cache-bound request was not marked as passthrough")
+	}
+}
+
+func TestCacheProxyRouterInjectsActiveTraceContext(t *testing.T) {
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+
+	var gotTraceparent string
+	cache := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTraceparent = r.Header.Get("traceparent")
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer cache.Close()
+
+	router := newCacheProxyRouter(cache.Listener.Addr().String(), false)
+	router.setMode(cacheProxyModeCached)
+	tp := sdktrace.NewTracerProvider()
+	ctx, span := tp.Tracer("test").Start(context.Background(), "flight.doget")
+	defer span.End()
+	clear := router.setActiveContext(ctx)
+	defer clear()
+
+	proxy := httptest.NewServer(router)
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	resp, err := client.Get("http://example.com/warehouse/file.parquet")
+	if err != nil {
+		t.Fatalf("GET through router: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if gotTraceparent == "" {
+		t.Fatal("cache-bound request missing traceparent from active Flight context")
+	}
+
+	clear()
+	gotTraceparent = "sentinel"
+	resp, err = client.Get("http://example.com/warehouse/file.parquet")
+	if err != nil {
+		t.Fatalf("GET after clearing context: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if gotTraceparent != "" {
+		t.Fatalf("cache-bound request traceparent after context cleared = %q, want empty", gotTraceparent)
 	}
 }
 

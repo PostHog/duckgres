@@ -4,9 +4,12 @@ import (
 	"net/http"
 	"testing"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // withSpanRecorder installs an in-memory span recorder as proxyTracer for the
@@ -143,5 +146,38 @@ func TestTracingForwardUncached(t *testing.T) {
 	}
 	if v := mustAttr(t, fwd, "http.request.method"); v.AsString() != http.MethodHead {
 		t.Errorf("forward: method attr = %q, want HEAD", v.AsString())
+	}
+}
+
+func TestTracingExtractsRemoteParentAtIngress(t *testing.T) {
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+
+	sr := withSpanRecorder(t)
+	proxy := newTestProxy(t)
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("payload-bytes"))
+	})
+
+	parent := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1},
+		SpanID:     trace.SpanID{2},
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	})
+	rec := doForwardProxyRequest(proxy, http.MethodGet, originURL+"/obj", http.Header{
+		"traceparent": {"00-" + parent.TraceID().String() + "-" + parent.SpanID().String() + "-01"},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	getSpan := findSpan(t, sr, "cache.get")
+	if getSpan.SpanContext().TraceID() != parent.TraceID() {
+		t.Fatalf("cache.get trace = %s, want remote parent trace %s", getSpan.SpanContext().TraceID(), parent.TraceID())
+	}
+	if getSpan.Parent().SpanID() != parent.SpanID() {
+		t.Fatalf("cache.get parent = %s, want remote parent %s", getSpan.Parent().SpanID(), parent.SpanID())
 	}
 }

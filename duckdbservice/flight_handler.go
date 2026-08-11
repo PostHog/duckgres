@@ -676,6 +676,8 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	defer session.progress.queryActive.Store(false)
 	endTxnWork := ttx.beginWork()
 	defer endTxnWork()
+	clearCacheProxyContext := h.pool.setActiveCacheProxyContext(ctx)
+	defer clearCacheProxyContext()
 
 	// Only retry on transient errors for autocommit queries. Inside a
 	// transaction, a transient error invalidates the transaction — retrying
@@ -801,6 +803,8 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			releaseQueryHandleValue(handle)
 		}()
 		defer endConnWork()
+		clearCacheProxyContext := h.pool.setActiveCacheProxyContext(ctx)
+		defer clearCacheProxyContext()
 
 		// The query ID's lifetime mirrors queryActive exactly: the progress
 		// monitor reads both from its own goroutine, and a stuck-query warning

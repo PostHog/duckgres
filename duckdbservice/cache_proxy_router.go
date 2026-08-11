@@ -12,6 +12,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type cacheProxyMode string
@@ -53,6 +57,11 @@ type cacheProxyRouter struct {
 	// passthrough marks daemon-bound requests so cache-proxy records and
 	// forwards them but never serves from or writes to its cache.
 	passthrough bool
+	// activeContext is scoped to the current Flight schema probe or DoGet
+	// execution. Remote workers execute one query at a time, so this is a
+	// worker-local handoff to DuckDB's HTTP proxy requests.
+	activeContext   context.Context
+	activeContextID uint64
 }
 
 type cacheProxySupervisorConfig struct {
@@ -171,6 +180,35 @@ func (r *cacheProxyRouter) isPassthrough() bool {
 	return r.passthrough
 }
 
+// setActiveContext makes a Flight RPC context available while DuckDB performs
+// HTTP work. The returned cleanup only clears the context it installed, so an
+// older deferred cleanup cannot erase a newer execution's context.
+func (r *cacheProxyRouter) setActiveContext(ctx context.Context) func() {
+	r.mu.Lock()
+	r.activeContextID++
+	id := r.activeContextID
+	r.activeContext = ctx
+	r.mu.Unlock()
+
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.activeContextID == id {
+			r.activeContext = nil
+		}
+	}
+}
+
+func (r *cacheProxyRouter) injectActiveContext(req *http.Request) {
+	r.mu.RLock()
+	ctx := r.activeContext
+	r.mu.RUnlock()
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return
+	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+}
+
 func recordCacheProxyMode(mode cacheProxyMode) {
 	for _, candidate := range []cacheProxyMode{cacheProxyModeDisabled, cacheProxyModeCached, cacheProxyModeBypassed} {
 		value := 0.0
@@ -188,6 +226,7 @@ func (r *cacheProxyRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if r.Mode() == cacheProxyModeCached {
 		cacheReq := cloneProxyRequest(req, false)
+		r.injectActiveContext(cacheReq)
 		if r.isPassthrough() {
 			cacheReq.Header.Set(cacheProxyPassthroughHeader, "true")
 		}
