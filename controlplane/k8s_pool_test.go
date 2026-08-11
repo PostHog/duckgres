@@ -4309,7 +4309,7 @@ func TestShutdownAll_LeavesInDrainingWhenPodDeleteFails(t *testing.T) {
 	}
 }
 
-func TestShutdownAll_RetiresWorkersWithActiveSessions(t *testing.T) {
+func TestShutdownAll_SparesWorkersWithActiveSessions(t *testing.T) {
 	store := &captureRuntimeWorkerStore{}
 	pool, cs := shutdownTestPool(t, store)
 
@@ -4320,14 +4320,17 @@ func TestShutdownAll_RetiresWorkersWithActiveSessions(t *testing.T) {
 
 	pool.ShutdownAll()
 
-	if podExists(t, cs, "worker-1") {
-		t.Fatal("worker-1 has active sessions but no reconnectable client; ShutdownAll should delete its pod")
+	if !podExists(t, cs, "worker-1") {
+		t.Fatal("worker-1 has active sessions; ShutdownAll must not delete its pod")
 	}
-	if len(store.markDrainingCalledIDs) != 2 {
-		t.Fatalf("expected both workers to enter draining, got calls=%v", store.markDrainingCalledIDs)
+	if _, ok := pool.Worker(1); !ok {
+		t.Fatal("worker-1 has active sessions; ShutdownAll must retain its bookkeeping")
 	}
-	if len(store.retireDrainingCalledIDs) != 2 {
-		t.Fatalf("expected both workers to retire, got calls=%v", store.retireDrainingCalledIDs)
+	if len(store.markDrainingCalledIDs) != 1 || store.markDrainingCalledIDs[0] != 2 {
+		t.Fatalf("expected only the idle worker to enter draining, got calls=%v", store.markDrainingCalledIDs)
+	}
+	if len(store.retireDrainingCalledIDs) != 1 || store.retireDrainingCalledIDs[0] != 2 {
+		t.Fatalf("expected only the idle worker to retire, got calls=%v", store.retireDrainingCalledIDs)
 	}
 
 	if podExists(t, cs, "worker-2") {
