@@ -31,6 +31,15 @@ type fakeStore struct {
 	listWarehousesErr error // set non-nil to fail ListWarehousesByStates
 	listOrgTeamsErr   error // set non-nil to fail ListOrgTeamsByOrgIDs
 	latestChangeErr   error // set non-nil to fail LatestConfigChange
+
+	// ServiceCredential hooks. issueCreds records every call so tests can
+	// assert the handler threads (org, team, ttl, forceRotate) correctly and
+	// the reuse-vs-rotate branches respond with the right body shape.
+	issueCreds       []serviceCredentialRequest
+	issueCredsIssue  *configstore.ServiceCredentialIssue
+	issueCredsErr    error
+	reloadSnapshotN  int
+	reloadSnapshotEr error
 }
 
 func newFakeStore() *fakeStore {
@@ -374,6 +383,42 @@ func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore
 	return nil
 }
 
+// ServiceCredential fake methods: these satisfy the TenantStore half of
+// RegisterAPI. The fake records the request so tests can assert plumbing, and
+// returns a canned issue (or error).
+func (s *fakeStore) IssueProjectUserServiceCredential(
+	orgID string,
+	teamID int64,
+	principal string,
+	ttl time.Duration,
+	forceRotate bool,
+) (*configstore.ServiceCredentialIssue, error) {
+	s.issueCreds = append(s.issueCreds, serviceCredentialRequest{
+		TeamID:      teamID,
+		Principal:   principal,
+		TTLSeconds:  int(ttl / time.Second),
+		ForceRotate: forceRotate,
+	})
+	if s.issueCredsErr != nil {
+		return nil, s.issueCredsErr
+	}
+	if s.issueCredsIssue == nil {
+		// Default: a freshly rotated credential expiring in an hour.
+		return &configstore.ServiceCredentialIssue{
+			Rotated:   true,
+			Username:  fmt.Sprintf("posthog_team_%d_rw", teamID),
+			Plaintext: "fake-plaintext-32chars-aaaaaaaaaaaa",
+			ExpiresAt: time.Now().UTC().Add(time.Hour),
+		}, nil
+	}
+	return s.issueCredsIssue, nil
+}
+
+func (s *fakeStore) ReloadSnapshot() error {
+	s.reloadSnapshotN++
+	return s.reloadSnapshotEr
+}
+
 func newTestRouter(store Store) *gin.Engine {
 	return newTestRouterWithBucketSuffix(store, "")
 }
@@ -381,7 +426,8 @@ func newTestRouter(store Store) *gin.Engine {
 func newTestRouterWithBucketSuffix(store Store, bucketSuffix string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterAPI(r.Group("/api/v1"), store, bucketSuffix)
+	tenantStore, _ := store.(TenantStore)
+	RegisterAPI(r.Group("/api/v1"), store, tenantStore, bucketSuffix, nil)
 	// Mirror prod topology (multitenant.go): discovery is a separate group
 	// on the same base path, so both surfaces stay reachable in tests.
 	RegisterDiscoveryAPI(r.Group("/api/v1"), store)

@@ -527,6 +527,11 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
+		// Same contract as UpsertProjectLogin: installing a password the
+		// service-credential path didn't issue must clear the mint clock, so
+		// the next service mint rotates instead of trusting (and reporting the
+		// expiry of) a hash it did not issue.
+		updates["service_grant_expires_at"] = nil
 	}
 	if passthrough != nil {
 		updates["passthrough"] = *passthrough
@@ -634,13 +639,19 @@ func (s *gormAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, 
 		}
 		if err := tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "org_id"}, {Name: "username"}},
+			// Admin rotation overwrites the password, so any outstanding
+			// SERVICE-credential grant for this login is no longer the one the
+			// mint path issued: clear service_grant_expires_at so the next
+			// service mint rotates instead of trusting (or reporting the
+			// expiry of) a hash it did not issue.
 			DoUpdates: clause.Assignments(map[string]interface{}{
-				"password":    passwordHash,
-				"passthrough": false,
-				"access_mode": accessMode,
-				"team_id":     teamID,
-				"disabled":    false,
-				"updated_at":  time.Now().UTC(),
+				"password":                 passwordHash,
+				"passthrough":              false,
+				"access_mode":              accessMode,
+				"team_id":                  teamID,
+				"disabled":                 false,
+				"updated_at":               time.Now().UTC(),
+				"service_grant_expires_at": nil,
 			}),
 		}).Create(&user).Error; err != nil {
 			return err

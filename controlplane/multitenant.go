@@ -650,7 +650,13 @@ func SetupMultiTenant(
 		admin.RoleGate(),
 	)
 	admin.RegisterAPI(api, store, adpt, liveFetcher)
-	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// gormStore implements both provisioning.Store (HTTP-shape operations) and
+	// provisioning.TenantStore (service-credential mint + snapshot reload), so a
+	// single wrapper serves both RegisterAPI arguments. liveFetcher doubles as
+	// the mint's peer-reload fan-out (same aggregation plumbing, same nil-when-
+	// single-CP semantics).
+	gormStore := provisioning.NewGormStore(store)
+	provisioning.RegisterAPI(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

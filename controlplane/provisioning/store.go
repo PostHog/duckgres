@@ -64,8 +64,11 @@ type gormStore struct {
 	cs *configstore.ConfigStore
 }
 
-// NewGormStore creates a Store backed by the given ConfigStore.
-func NewGormStore(cs *configstore.ConfigStore) Store {
+// NewGormStore creates a Store backed by the given ConfigStore. It returns
+// the concrete *gormStore (not the Store interface) so callers that also need
+// the TenantStore half — RegisterAPI's service-credentials wiring — can rely
+// on it without a runtime type assertion.
+func NewGormStore(cs *configstore.ConfigStore) *gormStore {
 	return &gormStore{cs: cs}
 }
 
@@ -287,6 +290,20 @@ func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore
 
 // ListOrgTeams returns every duckgres_org_teams row for the org, or
 // gorm.ErrRecordNotFound when the org doesn't exist.
+func (s *gormStore) IssueProjectUserServiceCredential(
+	orgID string,
+	teamID int64,
+	principal string,
+	ttl time.Duration,
+	forceRotate bool,
+) (*configstore.ServiceCredentialIssue, error) {
+	return s.cs.IssueProjectUserServiceCredential(orgID, teamID, principal, ttl, forceRotate)
+}
+
+func (s *gormStore) ReloadSnapshot() error {
+	return s.cs.ReloadSnapshot()
+}
+
 func (s *gormStore) ListOrgTeams(orgID string) ([]configstore.OrgTeam, error) {
 	var count int64
 	if err := s.cs.DB().Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
