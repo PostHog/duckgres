@@ -460,7 +460,7 @@ func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
 	}
 	key := BlockKey(target, 0, blockSize)
 	var hasCalls, getCalls int32
-	peerAddr := newPeerServer(t, key, blockData, &hasCalls, &getCalls)
+	peerAddr := newPeerServer(t, key, blockData, http.StatusOK, &hasCalls, &getCalls)
 
 	origin.Close() // the block is fully resolvable from the peer; origin must never be touched
 

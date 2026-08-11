@@ -784,13 +784,43 @@ func TestHandleProxyNetworkErrorStill502(t *testing.T) {
 	}
 }
 
+// TestOriginStatusErrorWriteToClampsContentLength locks in the response-framing
+// fix: the captured error body is read capped (originErrorBodyCap), so writeTo
+// must never forward the origin's declared Content-Length — a misbehaving origin
+// that promises more than we captured would otherwise hang the client. (The
+// status line and non-length headers still pass through verbatim.)
+func TestOriginStatusErrorWriteToClampsContentLength(t *testing.T) {
+	oe := &originStatusError{
+		status: http.StatusForbidden,
+		headers: http.Header{
+			"Content-Length": []string{"104857600"}, // origin claimed 100MB
+			"Content-Type":   []string{"application/xml"},
+		},
+		body: []byte("<Error><Code>AccessDenied</Code></Error>"),
+	}
+	rec := httptest.NewRecorder()
+	oe.writeTo(rec)
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprintf("%d", len(oe.body)) {
+		t.Errorf("Content-Length = %q, want %d (the captured body length, not the origin's claim)", got, len(oe.body))
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/xml" {
+		t.Errorf("Content-Type = %q, want application/xml (still forwarded)", got)
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+	if rec.Body.String() != string(oe.body) {
+		t.Errorf("body = %q, want %q", rec.Body.String(), oe.body)
+	}
+}
+
 func TestHandlePeerHasAndGet(t *testing.T) {
 	proxy := newTestProxy(t)
 
 	key := strings.Repeat("c", 64)
 	body := []byte("peer-cached-payload")
-	if err := proxy.store.Put(key, body); err != nil {
-		t.Fatalf("seed Put: %v", err)
+	if _, err := proxy.store.PutStream(key, bytes.NewReader(body)); err != nil {
+		t.Fatalf("seed PutStream: %v", err)
 	}
 
 	// /cache/has → 200 for known key

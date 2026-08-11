@@ -78,7 +78,12 @@ func CacheKey(url, rangeHeader string) string {
 // put ~half the proxy's CPU into LRU bookkeeping under this lock, serializing
 // all cache traffic behind it.
 type DiskCache struct {
-	dir         string
+	dir string
+	// maxBytes is the eviction threshold. The constructor sets it to
+	// maxPercent of the filesystem's TOTAL bytes, and the background refresh
+	// loop (refreshCapacity) lowers it whenever FREE space shrinks so the
+	// cache can never grow into disk it doesn't own. currentSize is the sum
+	// of tracked entry sizes.
 	maxBytes    int64
 	currentSize int64
 
@@ -116,7 +121,12 @@ func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
 	}
 
 	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
-	maxBytes := totalBytes * int64(maxPercent) / 100
+	freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
+	// Start at the percent-of-total ceiling, immediately clamped to what is
+	// actually free (well, free minus a reserve): the cache must never treat
+	// space already consumed by anything else (container layers, other pods
+	// sharing the filesystem, the rootfs on a tiny test disk) as available.
+	maxBytes := clampToFree(totalBytes*int64(maxPercent)/100, totalBytes, freeBytes)
 
 	slog.Info("Cache initialized.",
 		"dir", dir,
@@ -138,6 +148,60 @@ func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
 	dc.scanExisting()
 
 	return dc, nil
+}
+
+// clampToFree bounds a capacity target by the space actually available on the
+// filesystem: the cache may not grow into bytes it doesn't own (free space
+// shrinks over time as other writers consume the disk), and it always leaves
+// a small reserve so a full cache doesn't take the filesystem to 100%.
+func clampToFree(target, totalBytes, freeBytes int64) int64 {
+	reserve := totalBytes / 20 // 5% of total, kept for everyone else
+	if avail := freeBytes - reserve; target > avail {
+		target = avail
+	}
+	if target < 0 {
+		target = 0
+	}
+	return target
+}
+
+// refreshCapacityStats recomputes maxBytes from the current statfs free space
+// and the percent-of-total ceiling. Returns (total, clamped max, ok). Only
+// ever LOWERS maxBytes: once another writer has eaten into the disk the cache
+// commits to the smaller budget, so later frees don't balloon it back up.
+func (c *DiskCache) refreshCapacityStats(maxPercent int) (int64, int64, bool) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(c.dir, &stat); err != nil {
+		return 0, 0, false
+	}
+	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
+	freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
+	target := clampToFree(totalBytes*int64(maxPercent)/100, totalBytes, freeBytes)
+
+	c.mu.Lock()
+	if target < c.maxBytes {
+		evicted := 0
+		for c.currentSize > target && c.order.Len() > 0 {
+			c.evictOldest()
+			evicted++
+		}
+		if target != c.maxBytes {
+			slog.Warn("Cache capacity lowered to fit free disk.",
+				"old_max", c.maxBytes, "new_max", target, "free", freeBytes, "evicted", evicted)
+			c.maxBytes = target
+			cacheCapacityBytes.Set(float64(target))
+		}
+	}
+	max := c.maxBytes
+	c.mu.Unlock()
+	return totalBytes, max, true
+}
+
+// refreshCapacity periodically re-derives maxBytes from live statfs data so a
+// disk that fills up from outside the cache shrinks the cache instead of the
+// cache ENOSPC-ing after evicting healthy entries for room it never had.
+func (c *DiskCache) refreshCapacity(maxPercent int) {
+	c.refreshCapacityStats(maxPercent)
 }
 
 func (c *DiskCache) scanExisting() {
@@ -181,59 +245,24 @@ func (c *DiskCache) scanExisting() {
 	cacheSizeBytes.Set(float64(c.currentSize))
 }
 
-// Has returns true if the cache contains the given key.
+// Has returns true if the key is a tracked cache entry. It answers from the
+// in-memory index under the mutex — not the filesystem — so "has it" always
+// agrees with what eviction and size accounting believe, and costs no syscall.
 func (c *DiskCache) Has(key string) bool {
-	if !IsValidCacheKey(key) {
-		return false
-	}
-	path := filepath.Join(c.dir, key)
-	_, err := os.Stat(path)
-	return err == nil
+	c.mu.Lock()
+	_, ok := c.index[key]
+	c.mu.Unlock()
+	return ok
 }
 
-// Get returns the cached data for the given key, or nil if not found.
-func (c *DiskCache) Get(key string) ([]byte, bool) {
-	if !IsValidCacheKey(key) {
-		return nil, false
-	}
-	path := filepath.Join(c.dir, key)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, false
-	}
-
+// Touch marks a key as most recently used without serving it. HandlePeerHas
+// uses it: a peer /cache/has probe counts as an access, so an entry that is
+// popular with peers is not evicted as "least recently used" while it is in
+// fact one of the busiest blocks on the node.
+func (c *DiskCache) Touch(key string) {
 	c.mu.Lock()
 	c.touchLocked(key)
 	c.mu.Unlock()
-
-	cacheHitsTotal.Inc()
-	return data, true
-}
-
-// Put stores data in the cache, evicting old entries if needed.
-func (c *DiskCache) Put(key string, data []byte) error {
-	if !IsValidCacheKey(key) {
-		return fmt.Errorf("invalid cache key")
-	}
-	size := int64(len(data))
-
-	c.mu.Lock()
-	// Evict until we have space
-	for c.currentSize+size > c.maxBytes && c.order.Len() > 0 {
-		c.evictOldest()
-	}
-	c.mu.Unlock()
-
-	path := filepath.Join(c.dir, key)
-	if err := os.WriteFile(path, data, 0640); err != nil {
-		return fmt.Errorf("write cache entry: %w", err)
-	}
-
-	c.mu.Lock()
-	c.addLocked(key, size)
-	c.mu.Unlock()
-
-	return nil
 }
 
 // PutStream stores data from r under key without buffering the whole body in

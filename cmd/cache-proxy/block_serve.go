@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -178,6 +180,21 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 	return nil
 }
 
+// blockPresent reports whether a block's bytes are on local disk. It checks
+// the tracked index first (the common case, and the one that drives LRU
+// recency) but also accepts a tracked-file-still-syncing entry: a concurrent
+// PutStream lands its file (rename) a moment before it lands the LRU
+// accounting (addLocked), so an index-only Has can race a just-filled block
+// and report it missing while its bytes are already servable. Neither peek
+// counts as an access — openFile (phase 2) does the touching.
+func (p *CacheProxy) blockPresent(key string) bool {
+	if p.store.Has(key) {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(p.store.dir, key))
+	return err == nil
+}
+
 // serveBlockAligned serves a cacheable GET whose Range is an absolute
 // bytes=start-end pair from block-aligned cache entries: local disk, then
 // peers, then coalesced origin fetches for contiguous missing runs (chunked
@@ -277,7 +294,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	}
 	for idx := firstIdx; idx <= lastIdx; idx++ {
 		key := BlockKey(urlStr, idx, p.blockSize)
-		if p.store.Has(key) {
+		if p.blockPresent(key) {
 			if !flushRun(idx - 1) {
 				return true // error already written
 			}
@@ -289,9 +306,12 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		}
 		if p.peers != nil {
 			peerStart := time.Now()
-			_, _, ok := p.peers.FetchFromPeers(key, func(rd io.Reader) (int64, error) {
-				return p.store.PutStream(key, rd)
-			})
+			ok := false
+			if holder, flight, found := p.peers.LocateKey(key); found {
+				_, ok = p.peers.FetchFromPeer(holder, key, flight, func(rd io.Reader) (int64, error) {
+					return p.store.PutStream(key, rd)
+				})
+			}
 			peerDur += time.Since(peerStart)
 			if ok {
 				if !flushRun(idx - 1) {
@@ -338,7 +358,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		nOrigin += runEnd - lo + 1
 	}
 	for idx := firstIdx; idx <= lastIdx; idx++ {
-		if p.store.Has(BlockKey(urlStr, idx, p.blockSize)) {
+		if p.blockPresent(BlockKey(urlStr, idx, p.blockSize)) {
 			reverify(idx - 1)
 			continue
 		}
@@ -348,8 +368,9 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	}
 	reverify(lastIdx)
 	for idx := firstIdx; idx <= lastIdx; idx++ {
-		if !p.store.Has(BlockKey(urlStr, idx, p.blockSize)) {
-			slog.Error("Block still missing after presence re-fetch; failing closed.", "url", urlStr, "block", idx)
+		if !p.blockPresent(BlockKey(urlStr, idx, p.blockSize)) {
+			slog.Error("Block still missing after presence re-fetch; failing closed.",
+				"url", urlStr, "block", idx)
 			http.Error(w, "block cache entry missing after re-fetch", http.StatusBadGateway)
 			return true
 		}

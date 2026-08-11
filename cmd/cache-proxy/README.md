@@ -9,7 +9,7 @@ available, and forwards cache misses to origin object storage.
 | Setting | Default | Notes |
 | --- | --- | --- |
 | `CACHE_DIR` | `/cache` | Local disk cache directory. |
-| `CACHE_MAX_PERCENT` | `80` | Maximum percent of the cache filesystem to use. |
+| `CACHE_MAX_PERCENT` | `80` | Ceiling for the cache's share of the cache filesystem, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute: when something outside the cache consumes disk, the budget only ever shrinks, so the cache never evicts healthy entries to make room for writes the disk can't take. |
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
@@ -19,6 +19,31 @@ available, and forwards cache misses to origin object storage.
 | `CACHE_BLOCK_MAX_SPAN_BLOCKS` | `8` | Max blocks coalesced into one origin range fetch. Ignored when block mode is off. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `DUCKGRES_TRACE_ENDPOINT` | empty | OTLP/HTTP trace endpoint. Unset → tracing is a no-op. |
 | `OTEL_EXPORTER_OTLP_TRACES_PATH` | empty | Overrides the OTLP path (e.g. VictoriaTraces' `/insert/opentelemetry/v1/traces`). Mirrors the main duckgres binary. |
+
+## Cluster-wide fetch dedup
+
+When several nodes want the same key at the same moment, only the first to
+start the fill should ever hit the origin. The peer API makes each node's
+in-flight fetches visible to the rest:
+
+- `GET /cache/has?key=…` — `200` the entry is cached (counts as an access for
+  LRU recency); `202` the entry isn't cached yet but a local fill is
+  mid-flight; `404` neither.
+- `GET /cache/get?key=…[&flight=1]` — streams the entry. With `flight=1` and
+  the entry not yet on disk, the peer blocks (bounded by `peerFillWait`,
+  10 s) for its in-flight fill to land and then serves those bytes, instead
+  of 404ing the requester back to the origin for the same bytes it is already
+  fetching.
+
+A missing key therefore resolves as: local index → peer that has it (`200`,
+first answer wins) → peer mid-flight on it (`202`, wait for that fill) →
+origin. Transfers from a peer have no whole-request timeout (a multi-MB body
+moving over a loaded link must not be killed for being large) — only a
+response-header deadline sized to cover the bounded flight wait.
+
+All lookup state comes from the in-memory index under the cache mutex, not
+from filesystem stats, so `/cache/has` and eviction/size accounting can never
+disagree about whether an entry exists.
 
 ## Block-aligned mode
 
