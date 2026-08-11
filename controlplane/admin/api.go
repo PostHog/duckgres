@@ -527,6 +527,11 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
+		// Same contract as UpsertProjectLogin: installing a password the
+		// service-credential path didn't issue must clear the mint clock, so
+		// the next service mint rotates instead of trusting (and reporting the
+		// expiry of) a hash it did not issue.
+		updates["service_grant_expires_at"] = nil
 	}
 	if passthrough != nil {
 		updates["passthrough"] = *passthrough

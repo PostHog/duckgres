@@ -778,8 +778,17 @@ func (cs *ConfigStore) CreateOrgUser(orgID, username, passwordHash string) error
 		Password: passwordHash,
 	}
 	return cs.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "org_id"}, {Name: "username"}},
-		DoUpdates: clause.AssignmentColumns([]string{"password", "updated_at"}),
+		Columns: []clause.Column{{Name: "org_id"}, {Name: "username"}},
+		// Overwriting a password here installs a credential the
+		// service-credential path didn't issue: the mint clock must clear
+		// along with the hash (see IssueProjectUserServiceCredential — its
+		// reuse decision depends on service_grant_expires_at tracking the
+		// credential this path is now invalidating).
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"password":                 passwordHash,
+			"updated_at":               time.Now().UTC(),
+			"service_grant_expires_at": nil,
+		}),
 	}).Create(&user).Error
 }
 
@@ -787,7 +796,10 @@ func (cs *ConfigStore) CreateOrgUser(orgID, username, passwordHash string) error
 func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
 	result := cs.db.Model(&OrgUser{}).
 		Where("org_id = ? AND username = ?", orgID, username).
-		Update("password", passwordHash)
+		Updates(map[string]interface{}{
+			"password":                 passwordHash,
+			"service_grant_expires_at": nil,
+		})
 	if result.Error != nil {
 		return result.Error
 	}
