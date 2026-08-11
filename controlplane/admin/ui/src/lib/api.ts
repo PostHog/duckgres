@@ -11,6 +11,7 @@ import type {
   ClusterSummary,
   CreateUserBody,
   CPInstance,
+  DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
   ErrorEntry,
@@ -32,6 +33,8 @@ import type {
   OrgUser,
   OrgUserSecret,
   PromRangeResponse,
+  ProvisionWarehouseBody,
+  ProvisionWarehouseResult,
   QueryDetail,
   QueryResult,
   ReshardLogEntry,
@@ -42,6 +45,7 @@ import type {
   StartReshardBody,
   UpdateUserBody,
   UserKillResult,
+  WarehouseStatusResult,
   WorkerStatus,
 } from "@/types/api";
 
@@ -141,6 +145,14 @@ export const api = {
   // warehouse state isn't ready/failed/provisioning.
   deprovisionWarehouse: (id: string) =>
     post<{ status: string; org: string }>(`/orgs/${enc(id)}/deprovision`, {}),
+  // The EXACT onboarding API the PostHog backend (django) calls to provision an
+  // org's warehouse (202 Accepted; response carries the root password — shown
+  // once, never retrievable again).
+  provisionWarehouse: (id: string, body: ProvisionWarehouseBody) =>
+    post<ProvisionWarehouseResult>(`/orgs/${enc(id)}/provision`, body),
+  warehouseStatus: (id: string) => get<WarehouseStatusResult>(`/orgs/${enc(id)}/warehouse/status`),
+  checkDatabaseName: (name: string) =>
+    get<DatabaseNameCheck>("/database-name/check", { name }),
 
   // org teams (duckgres_org_teams). Schema names are immutable after create
   // on this surface; delete removes config only (never warehouse data).

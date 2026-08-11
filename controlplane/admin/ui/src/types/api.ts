@@ -134,6 +134,70 @@ export interface OrgTeamDeleteResult {
   org: string;
 }
 
+// ---- Warehouse provisioning (the PostHog backend's onboarding API) ----
+
+// POST /api/v1/orgs/:id/provision — the EXACT endpoint + body the PostHog
+// backend calls to onboard an org's warehouse
+// (controlplane/provisioning/api.go::provisionWarehouse). The admin console's
+// "Add organization" dialog drives it as-is: same fields, same 202 response
+// with the root user's generated password (returned here only — only the
+// bcrypt hash is persisted).
+export interface ProvisionWarehouseBody {
+  database_name: string;
+  // Required when the provision creates a NEW org (a warehouse cannot exist
+  // without a team); optional on re-provision of an existing org.
+  team_id?: number;
+  // Optional warehouse-schema override for the first team row; requires
+  // team_id. Defaults to team_<id>.
+  schema_name?: string;
+  metadata_store: {
+    type: "cnpg-shard" | "external";
+    // Required when type is "external": a pre-existing Postgres endpoint + the
+    // AWS Secrets Manager secret NAME holding its password.
+    external?: {
+      endpoint: string;
+      password_aws_secret: string;
+      user?: string;
+      database?: string;
+    };
+  };
+  // Omitted (or type "s3bucket") provisions a fresh per-org bucket; "external"
+  // reuses an existing bucket and then requires bucket_name.
+  data_store?: {
+    type: "s3bucket" | "external";
+    bucket_name?: string;
+    region?: string;
+  };
+  ducklake: { enabled: boolean };
+}
+
+// 202 response. The plaintext root password is in this response ONLY.
+export interface ProvisionWarehouseResult {
+  status: string;
+  org: string;
+  username: string;
+  password: string;
+  bucket?: string;
+}
+
+// GET /api/v1/orgs/:id/warehouse/status — provisioning lifecycle state. The
+// `connection` block (no password) is present once state is "ready".
+export interface WarehouseStatusResult {
+  org_id: string;
+  state: WarehouseState;
+  status_message: string;
+  ready_at?: string;
+  failed_at?: string;
+  bucket?: string;
+  connection?: { host: string; port: number; database: string; username: string };
+}
+
+// GET /api/v1/database-name/check?name=… — database-name availability.
+export interface DatabaseNameCheck {
+  name: string;
+  available: boolean;
+}
+
 // ---- Users (confirmed) ----
 
 export interface OrgUser {
