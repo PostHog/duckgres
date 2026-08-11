@@ -32,6 +32,15 @@ func TestAuditActionFor(t *testing.T) {
 		{"org team update", http.MethodPut, "/api/v1/orgs/acme/teams/7", "team.update"},
 		{"org team delete", http.MethodDelete, "/api/v1/orgs/acme/teams/7", "team.delete"},
 		{"warehouse pinning patch", http.MethodPatch, "/api/v1/orgs/acme/warehouse/pinning", "warehouse.update"},
+		// The provisioning API's mutating routes are mounted on the SAME audited
+		// admin group, so an operator provisioning from the console and the
+		// PostHog backend provisioning over the internal secret write the same
+		// action code — distinguishable only by actor. Before these cases they
+		// all fell through to the generic "org.create".
+		{"warehouse provision", http.MethodPost, "/api/v1/orgs/acme/provision", "warehouse.provision"},
+		{"warehouse provision no prefix", http.MethodPost, "/orgs/:id/provision", "warehouse.provision"},
+		{"warehouse deprovision", http.MethodPost, "/api/v1/orgs/acme/deprovision", "warehouse.deprovision"},
+		{"warehouse reset password", http.MethodPost, "/api/v1/orgs/acme/reset-password", "warehouse.reset_password"},
 		{"org create", http.MethodPost, "/api/v1/orgs", "org.create"},
 		{"org update", http.MethodPut, "/api/v1/orgs/acme", "org.update"},
 		{"org delete", http.MethodDelete, "/api/v1/orgs/acme", "org.delete"},

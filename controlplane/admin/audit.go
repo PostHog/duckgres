@@ -198,6 +198,18 @@ func auditActionFor(method, path string) string {
 		case hasSeg(segs, "secrets"):
 			// /orgs/:id/users/:username/secrets/:name.
 			return "secret." + verb
+		case last == "provision":
+			// POST /orgs/:id/provision — the ONE warehouse-creation path,
+			// shared verbatim by the PostHog backend and the admin console
+			// (provisioning/api.go). Distinct from "warehouse.update" (a
+			// config-row edit) because it creates real infrastructure.
+			return "warehouse.provision"
+		case last == "deprovision":
+			// POST /orgs/:id/deprovision — asynchronous duckling teardown.
+			return "warehouse.deprovision"
+		case last == "reset-password":
+			// POST /orgs/:id/reset-password — rotates the org's root login.
+			return "warehouse.reset_password"
 		case hasSeg(segs, "warehouse"):
 			// PUT /warehouse and PATCH /warehouse/pinning both map here.
 			return "warehouse." + verb

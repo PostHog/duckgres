@@ -1,9 +1,11 @@
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { type ColumnDef } from "@tanstack/react-table";
-import { AlertTriangle, Building2, Search } from "lucide-react";
+import { AlertTriangle, Building2, Rocket, Search } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
+import { AdminGate } from "@/components/AdminOnly";
 import { DataTable } from "@/components/DataTable";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -135,14 +137,25 @@ export function Orgs() {
         title="Organizations"
         description="Tenants and their per-org limits. Click a row to edit config and warehouse."
         actions={
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter orgs…"
-              className="w-64 pl-8"
-            />
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="Filter orgs…"
+                className="w-64 pl-8"
+              />
+            </div>
+            {/* Provisioning goes through the same public API the PostHog
+                backend uses — see pages/ProvisionWarehouse.tsx. */}
+            <AdminGate>
+              <Button size="sm" asChild>
+                <Link to="/orgs/provision">
+                  <Rocket className="h-4 w-4" /> Provision warehouse
+                </Link>
+              </Button>
+            </AdminGate>
           </div>
         }
       />

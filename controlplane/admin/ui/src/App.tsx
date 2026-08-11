@@ -6,6 +6,7 @@ import { NotFound } from "@/pages/NotFound";
 import { Overview } from "@/pages/Overview";
 import { Orgs } from "@/pages/Orgs";
 import { OrgDetail } from "@/pages/OrgDetail";
+import { ProvisionWarehouse } from "@/pages/ProvisionWarehouse";
 import { OrgTeams } from "@/pages/OrgTeams";
 import { ReshardForm } from "@/pages/ReshardForm";
 import { Reshards } from "@/pages/Reshards";
@@ -34,6 +35,9 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Overview />} />
         <Route path="/orgs" element={<Orgs />} />
+        {/* Static segment before the :id route so "provision" is never read as
+            an org id. */}
+        <Route path="/orgs/provision" element={<ProvisionWarehouse />} />
         <Route path="/orgs/:id" element={<OrgDetail />} />
         <Route path="/orgs/:id/reshard" element={<ReshardForm />} />
         <Route path="/org-teams" element={<OrgTeams />} />

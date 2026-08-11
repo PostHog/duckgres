@@ -19,6 +19,7 @@ import type {
   ClusterStatus,
   ClusterSummary,
   CreateUserBody,
+  DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
   ErrorEntry,
@@ -39,6 +40,7 @@ import type {
   OrgUser,
   OrgUserSecret,
   PromRangeResponse,
+  ProvisionBody,
   QueryDetail,
   ReshardLogEntry,
   ReshardOperation,
@@ -47,6 +49,7 @@ import type {
   SessionStatus,
   StartReshardBody,
   UpdateUserBody,
+  WarehouseStatus,
   WorkerStatus,
 } from "@/types/api";
 
@@ -172,6 +175,66 @@ export function useDeprovisionWarehouse(id: string) {
       qc.invalidateQueries({ queryKey: ["orgs"] });
     },
   });
+}
+
+// ---- warehouse provisioning (the PostHog-backend endpoints) ----
+
+// POST /orgs/:id/provision — the SAME call the PostHog backend makes. Returns
+// 202 plus the root password, which is readable exactly once, so the caller
+// must surface it before navigating away.
+export function useProvisionWarehouse() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { org: string; body: ProvisionBody }) => api.provisionWarehouse(v.org, v.body),
+    onSuccess: (_res, v) => {
+      qc.invalidateQueries({ queryKey: ["orgs"] });
+      qc.invalidateQueries({ queryKey: ["orgs", v.org, "warehouse"] });
+      qc.invalidateQueries({ queryKey: ["org-teams"] });
+    },
+  });
+}
+
+// GET /orgs/:id/warehouse/status — the lifecycle view the PostHog backend
+// polls. 404 (no warehouse row yet) resolves to null rather than erroring.
+// `enabled` lets the provision page start polling only once it has submitted.
+export function useWarehouseStatus(id: string | undefined, enabled = true) {
+  return useQuery<WarehouseStatus | null>({
+    queryKey: ["orgs", id, "warehouse-status"],
+    queryFn: () => tolerate404<WarehouseStatus | null>(null)(api.getWarehouseStatus(id!)),
+    enabled: !!id && enabled,
+    refetchInterval: POLL.normal,
+  });
+}
+
+// GET /database-name/check — debounced global uniqueness pre-flight for the
+// provision form. The server is authoritative (it 409s a taken name at
+// provision time); this only gives the operator the answer before submit.
+export function useDatabaseNameAvailable(name: string) {
+  const debounced = useDebounced(name.trim(), 350);
+  return useQuery<DatabaseNameCheck | null>({
+    queryKey: ["database-name-check", debounced],
+    queryFn: () => tolerate404<DatabaseNameCheck | null>(null)(api.checkDatabaseName(debounced)),
+    enabled: debounced !== "",
+    staleTime: 10_000,
+  });
+}
+
+// POST /orgs/:id/reset-password — rotates the org's root login. The recovery
+// path when a provision response was lost; the new plaintext is returned once.
+export function useResetWarehousePassword(id: string) {
+  return useMutation({
+    mutationFn: () => api.resetWarehousePassword(id),
+  });
+}
+
+// useDebounced returns `value` after it has stopped changing for `ms`.
+function useDebounced<T>(value: T, ms: number): T {
+  const [settled, setSettled] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setSettled(value), ms);
+    return () => clearTimeout(t);
+  }, [value, ms]);
+  return settled;
 }
 
 // ---- org teams ----
