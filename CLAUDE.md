@@ -839,17 +839,24 @@ that trust class, NOT on the admin/console side.
   No parallel `svc_*` identity, no second policy to audit, no drift from the
   admin console's "the team's writer login" model. Sessions minted here are
   session-equal to a login the admin UI rotated.
-- **Expiry is enforced by ROTATION, not by a checked timestamp on the
-  credential.** The bcrypt hash on the `duckgres_org_users` row IS the
-  credential. A mint call for the same team within the TTL gets the grant
-  back untouched (hash and `updated_at` do not move — no spurious
-  config-generation wake-up for pollers, and a concurrent long-lived run's
-  steps don't have their working credential rotated out from under them
-  mid-flight). The FIRST mint call after the TTL has lapsed rotates the hash,
-  and from that moment the old credential fails auth for NEW connections.
-  Real leak window is `TTL + time-to-next-touch`. This deliberately dodges
-  the hard-SQLSTATE-expiry footgun: no job is ever killed mid-run because a
-  wall-clock timestamp ticked past its credential's `exp`.
+- **Expiry is enforced by ROTATION, and the rotation clock is
+  `duckgres_org_users.service_grant_expires_at` — NEVER `updated_at`.**
+  The bcrypt hash on the row IS the credential; a mint call within the TTL
+  leaves hash and grant clock untouched (no spurious config-generation
+  wake-up, no clobbering a concurrent run's working credential mid-flight),
+  and the first mint after lapse rotates the hash. `updated_at` is shared
+  mutable state: the admin project-login rotation also bumps it AND clears
+  `service_grant_expires_at` when it overwrites the password — so a service
+  mint can never trust (or report the expiry of) a hash it did not issue.
+  Real leak window is `TTL + time-to-next-touch`. Deliberately dodges the
+  hard-SQLSTATE-expiry footgun: no job is killed mid-run by a wall-clock tick.
+- **A disabled login is never silently re-enabled by a mint.** The kill
+  switch is an explicit operator action; the internal-secret-authed machine
+  caller must not undo it. Re-enable flows through the admin API.
+- **A mint re-establishes the project_user invariants on whatever row holds
+  the username** (`access_mode`, `team_id`, `passthrough=false`): an operator
+  flip of that row's mode cannot widen or void the scope a minted credential
+  binds.
 - **Established sessions are NEVER torn down on expiry.** Freshness is
   enforced only at the pgwire handshake — the RDS-IAM / Cloud-SQL-IAM
   contract. A long job's existing connection rides to completion; each NEW
@@ -865,9 +872,11 @@ that trust class, NOT on the admin/console side.
   run and a refresh) serialize on one hash — never double-rotate into
   mutually-invalidating credentials.
 - **After the write, THIS replica's snapshot is reloaded immediately**
-  (`ReloadSnapshot`), then best-effort peer fan-out. Without it, the
-  credentials would routinely fail their first few auth attempts on up-to-one-
-  poll-interval-old snapshots.
+  (`ReloadSnapshot`), then a best-effort `/api/v1/internal/reload-snapshot`
+  fan-out to peer replicas (`PeerFanout`, wired from the same
+  `clusterPeerFetcher` the admin kill-switch uses). Without both, a freshly
+  minted credential routinely fails its first auth on whichever replica the
+  pgwire connection lands on.
 - Touching any of this → update `controlplane/provisioning/service_credential.go` +
   `_test.go`, `controlplane/configstore/service_credential.go` +
   `_postgres_test.go`, and the caller-side minter in the PostHog repo

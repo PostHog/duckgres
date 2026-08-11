@@ -104,18 +104,39 @@ func (cs *ConfigStore) IssueProjectUserServiceCredential(
 		}
 
 		var user OrgUser
+		// Look up by PRIMARY KEY only (org_id, username) — never by
+		// access_mode. A row with this username but a different mode must be
+		// treated as "exists": otherwise the rotate-vs-create split below would
+		// take the create branch straight into a PK conflict, or (worse) the
+		// username/account an admin flipped would coexist with the row the mint
+		// created. The rotate branch re-establishes every project_user
+		// invariant (mode, team, passthrough, enabled) on whatever row it finds.
 		loadErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
-			&user, "org_id = ? AND username = ? AND access_mode = ?",
-			orgID, username, OrgUserAccessModeProjectUser,
+			&user, "org_id = ? AND username = ?", orgID, username,
 		).Error
 		userExists := loadErr == nil
 		if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
 			return fmt.Errorf("load project user (org=%s user=%s): %w", orgID, username, loadErr)
 		}
 
+		if userExists && user.Disabled {
+			// Never resurrect a disabled login — not by reusing its live grant
+			// and not by rotating it. The kill switch is an explicit operator
+			// action and a service mint (an internal-secret-authed machine
+			// caller) must not undo it. The operator re-enables via the admin
+			// API; then the next mint succeeds.
+			return fmt.Errorf("project login %s in org %s is disabled; refusing to mint a service credential against it (re-enable via the admin API)", username, orgID)
+		}
+
 		if userExists && !forceRotate {
-			age := now.Sub(user.UpdatedAt.UTC())
-			if remaining := ttl - age; remaining > rotationSafetyWindowHash {
+			// The reuse decision must be driven by service_grant_expires_at —
+			// mint-time state only THIS path writes — never by updated_at,
+			// which the admin project-login rotation also bumps (that would
+			// silently reset the TTL clock and hand a fresh fetcher an empty
+			// plaintext for a credential it never saw). NULL means the last
+			// password-setter wasn't us (admin rotation, legacy row), so the
+			// hash is untrusted: fall through and rotate.
+			if exp := user.ServiceGrantExpiresAt; exp != nil && exp.UTC().After(now.Add(rotationSafetyWindowHash)) {
 				// Still comfortably valid. Hand back NO new plaintext AND no new
 				// hash: the caller already holding the prior credential can keep
 				// using it, and a fresh fetcher with nothing gets nothing —
@@ -126,10 +147,9 @@ func (cs *ConfigStore) IssueProjectUserServiceCredential(
 					Rotated:   false,
 					Username:  username,
 					Plaintext: "",
-					// Report the TRUE expiry of the live grant (minted at
-					// UpdatedAt for exactly ttl), not the as-if-minted-now one,
-					// so a refresh-deciding caller compares against reality.
-					ExpiresAt: user.UpdatedAt.UTC().Add(ttl),
+					// Report the grant's stored expiry — minted with the TTL in
+					// effect at mint time, not this call's ttl.
+					ExpiresAt: exp.UTC(),
 				}
 				return nil
 			}
@@ -150,26 +170,35 @@ func (cs *ConfigStore) IssueProjectUserServiceCredential(
 		}
 
 		if userExists {
-			// Update in place, bumping updated_at so config-generation consumers
-			// see the rotation.
+			// Update in place: set the mint clock (service_grant_expires_at),
+			// bumped updated_at so config-generation consumers see the rotation,
+			// and RE-ESTABLISH every project_user invariant — an operator who
+			// (mistakenly or maliciously) flipped mode/team/passthrough on this
+			// username must not widen or void the login a minted credential binds.
 			if err := tx.Model(&OrgUser{}).
 				Where("org_id = ? AND username = ?", orgID, username).
 				Updates(map[string]interface{}{
-					"password":   string(hash),
-					"updated_at": now,
+					"password":                 string(hash),
+					"access_mode":              OrgUserAccessModeProjectUser,
+					"team_id":                  teamID,
+					"passthrough":              false,
+					"updated_at":               now,
+					"service_grant_expires_at": now.Add(ttl),
 				}).Error; err != nil {
 				return fmt.Errorf("rotate project user password (org=%s user=%s): %w", orgID, username, err)
 			}
 		} else {
+			expiresAt := now.Add(ttl)
 			user = OrgUser{
-				OrgID:       orgID,
-				Username:    username,
-				Password:    string(hash),
-				Passthrough: false,
-				AccessMode:  OrgUserAccessModeProjectUser,
-				TeamID:      &teamID,
-				Disabled:    false,
-				UpdatedAt:   now,
+				OrgID:                 orgID,
+				Username:              username,
+				Password:              string(hash),
+				Passthrough:           false,
+				AccessMode:            OrgUserAccessModeProjectUser,
+				TeamID:                &teamID,
+				Disabled:              false,
+				UpdatedAt:             now,
+				ServiceGrantExpiresAt: &expiresAt,
 			}
 			if err := tx.Create(&user).Error; err != nil {
 				return fmt.Errorf("create project user (org=%s user=%s): %w", orgID, username, err)

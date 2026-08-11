@@ -2,7 +2,9 @@ package provisioning
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -72,6 +74,13 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
 		return
 	}
+	// The route carries :team_id too; require the two to agree so a copy-paste
+	// bug in a caller surfaces as a 400 here instead of a credential minted
+	// against the WRONG team's namespaces.
+	if pathTeam, err := strconv.ParseInt(c.Param("team_id"), 10, 64); err != nil || pathTeam != req.TeamID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "path team_id must match body team_id"})
+		return
+	}
 	if req.Principal == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "principal is required (e.g. \"dagster:events-backfill\")"})
 		return
@@ -123,12 +132,29 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 	// The write landed in the shared config-store DB; make THIS replica's
 	// snapshot see the new hash immediately rather than waiting one poll
 	// interval (default 30s) — otherwise the freshly issued credential would
-	// routinely fail its first few auth attempts on this CP. Peer fan-out is
-	// the same fire-and-forget pattern the admin project-login endpoint uses.
+	// routinely fail its first few auth attempts on this CP.
 	if err := tenantStore.ReloadSnapshot(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "credential issued but snapshot reload failed: " + err.Error()})
 		return
 	}
+	// Fan the same reload out to PEER replicas: the client's pgwire
+	// connection can land on any CP behind the load balancer, so a credential
+	// minted on this replica must auth on whichever replica serves the
+	// connect. Best-effort (PostPeers already drops a slow/down peer without
+	// error) — a failed peer converges within one poll interval.
+	if h.peerFanout != nil {
+		h.peerFanout.PostPeers(c.Request.Context(), "/api/v1/internal/reload-snapshot")
+	}
+	// principal is required precisely so the rotation is attributable — log it
+	// (the admin audit log records the equivalent project-login rotations from
+	// operators; this path is machine-driven and its audit record is the CP's
+	// structured log).
+	slog.Info("service credential issued.",
+		"org", orgID, "team_id", req.TeamID,
+		"principal", req.Principal,
+		"rotated", issued.Rotated,
+		"expires_at", issued.ExpiresAt.UTC().Format(time.RFC3339),
+	)
 
 	resp := serviceCredentialResponse{
 		Username:  issued.Username,

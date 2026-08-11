@@ -1,6 +1,7 @@
 package provisioning
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -102,12 +103,22 @@ type Store interface {
 	LatestConfigChange() (time.Time, error)
 }
 
+// PeerFanout posts path+"?scope=local" to every OTHER control-plane replica.
+// Nil in single-CP/tests; mirrors admin.PeerFetcher.PostPeers without the
+// provisioning package depending on the admin package.
+type PeerFanout interface {
+	PostPeers(ctx context.Context, path string) ([][]byte, int)
+}
+
 // RegisterAPI registers provisioning endpoints on the given router group.
 // bucketSuffix is the env suffix used to compute the control-plane-owned
 // per-org s3bucket name at provision time (empty ⇒ the CP doesn't name buckets
-// and the composition derives).
-func RegisterAPI(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string) {
-	h := &handler{store: store, bucketSuffix: bucketSuffix}
+// and the composition derives). peerFanout may be nil; when set, the
+// service-credentials mint fans a snapshot reload out to peer replicas so a
+// freshly rotated credential auths on whichever CP the client's pgwire
+// connection actually lands on, not just the replica that served the mint.
+func RegisterAPI(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout) {
+	h := &handler{store: store, bucketSuffix: bucketSuffix, peerFanout: peerFanout}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
@@ -149,6 +160,10 @@ type handler struct {
 	// CP-owned s3bucket name; empty disables CP naming. See
 	// configstore.DucklingBucketName.
 	bucketSuffix string
+	// peerFanout may be nil (single-CP / tests). When set, the
+	// service-credentials mint uses it to fan a snapshot reload out to peer
+	// replicas after rotating a credential.
+	peerFanout PeerFanout
 }
 
 // warehouseStatusResponse is the public-facing view of warehouse state.

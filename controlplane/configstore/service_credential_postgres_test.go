@@ -164,3 +164,144 @@ func TestIssueProjectUserServiceCredentialPrincipalRequired(t *testing.T) {
 		t.Fatal("empty principal must fail (audit attribution depends on it)")
 	}
 }
+
+// The TTL clock is service_grant_expires_at, never updated_at: an ADMIN
+// project-login rotation (UpsertProjectLogin) overwrites the same row's
+// password and bumps updated_at. If the mint keyed on updated_at, the next
+// job fetch would (a) misdate the grant's real expiry and (b) take the reuse
+// branch and hand the job NO plaintext for a credential it never saw. This
+// test pins the adversarial-review invariant: after a third-party rotation
+// (simulated here by clearing the grant column exactly as the admin
+// OnConflict update does), the service mint must ROTATE and return a fresh
+// plaintext, not reuse.
+func TestIssueProjectUserServiceCredentialAdminRotationCollisionPostgres(t *testing.T) {
+	cs := newPostgresConfigStore(t)
+	db := cs.DB()
+
+	db.Create(&Org{Name: "svc-cred-org-3", DatabaseName: "svc_cred_org_3"})
+	db.Create(&OrgTeam{OrgID: "svc-cred-org-3", TeamID: 42, SchemaName: "team_42", Enabled: true})
+
+	first, err := cs.IssueProjectUserServiceCredential("svc-cred-org-3", 42, "d", 15*time.Minute, false)
+	if err != nil {
+		t.Fatalf("first issue: %v", err)
+	}
+
+	// Simulate the admin rotation: admin UpsertProjectLogin's OnConflict
+	// updates (among others) password + updated_at and clears
+	// service_grant_expires_at. The hash it installs is NOT one the mint path
+	// issued.
+	adminHash, err := HashPassword("admin-issued-credential-32-chars!!")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&OrgUser{}).
+		Where("org_id = ? AND username = ?", "svc-cred-org-3", first.Username).
+		Updates(map[string]interface{}{
+			"password":                 adminHash,
+			"updated_at":               time.Now().UTC(),
+			"service_grant_expires_at": nil,
+		}).Error; err != nil {
+		t.Fatalf("simulate admin rotation: %v", err)
+	}
+
+	second, err := cs.IssueProjectUserServiceCredential("svc-cred-org-3", 42, "d", 15*time.Minute, false)
+	if err != nil {
+		t.Fatalf("second issue after admin rotation: %v", err)
+	}
+	if !second.Rotated {
+		t.Fatal("after admin rotation the mint MUST rotate, not reuse — reusing would return no plaintext for a credential the job never saw")
+	}
+	if second.Plaintext == "" {
+		t.Fatal("after admin rotation the mint MUST return a fresh plaintext")
+	}
+	var reread OrgUser
+	if err := db.First(&reread, "org_id = ? AND username = ?", "svc-cred-org-3", first.Username).Error; err != nil {
+		t.Fatal(err)
+	}
+	if reread.Password == adminHash {
+		t.Fatal("rotation must replace the admin-installed hash")
+	}
+	if reread.ServiceGrantExpiresAt == nil {
+		t.Fatal("rotation must set service_grant_expires_at")
+	}
+}
+
+// An operator-disabled login must never be silently re-enabled by a service
+// mint: the kill switch means something, and the mint path (driven by the
+// internal secret, a machine credential) must not undo it.
+func TestIssueProjectUserServiceCredentialRefusesDisabledLoginPostgres(t *testing.T) {
+	cs := newPostgresConfigStore(t)
+	db := cs.DB()
+
+	db.Create(&Org{Name: "svc-cred-org-4", DatabaseName: "svc_cred_org_4"})
+	db.Create(&OrgTeam{OrgID: "svc-cred-org-4", TeamID: 42, SchemaName: "team_42", Enabled: true})
+
+	if _, err := cs.IssueProjectUserServiceCredential("svc-cred-org-4", 42, "d", 15*time.Minute, false); err != nil {
+		t.Fatalf("first issue: %v", err)
+	}
+	if err := db.Model(&OrgUser{}).
+		Where("org_id = ? AND username = ?", "svc-cred-org-4", "posthog_team_42_rw").
+		Update("disabled", true).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := cs.IssueProjectUserServiceCredential("svc-cred-org-4", 42, "d", 15*time.Minute, true); err == nil {
+		t.Fatal("mint against a disabled login must fail, even with force_rotate")
+	}
+	// Both branches refused: the row stays disabled and untouched.
+	var user OrgUser
+	if err := db.First(&user, "org_id = ? AND username = ?", "svc-cred-org-4", "posthog_team_42_rw").Error; err != nil {
+		t.Fatal(err)
+	}
+	if !user.Disabled {
+		t.Fatal("the login must remain disabled after a refused mint")
+	}
+
+	// A reuse-path call (no force) against the disabled login must fail too —
+	// the handshake would refuse it the same as auth would.
+	if _, err := cs.IssueProjectUserServiceCredential("svc-cred-org-4", 42, "d", 15*time.Minute, false); err == nil {
+		t.Fatal("reuse against a disabled login must fail")
+	}
+}
+
+// A row with the same username but a twisted access_mode/team (an operator
+// mistake, or a hand-hacked row) must be RE-ESTABLISHED to the project_user
+// invariants by the mint, not left granting the wrong scope and certainly
+// not colliding a plain CREATE into the primary key.
+func TestIssueProjectUserServiceCredentialReestablishesInvariantOnTwistedRowPostgres(t *testing.T) {
+	cs := newPostgresConfigStore(t)
+	db := cs.DB()
+
+	db.Create(&Org{Name: "svc-cred-org-5", DatabaseName: "svc_cred_org_5"})
+	db.Create(&OrgTeam{OrgID: "svc-cred-org-5", TeamID: 42, SchemaName: "team_42", Enabled: true})
+
+	// Hand-plant a row with the service username but access_mode=unrestricted
+	// and no team binding — the state a bad admin flip would leave.
+	if err := db.Exec(
+		"INSERT INTO duckgres_org_users (org_id, username, password, passthrough, access_mode, team_id, disabled, created_at, updated_at) VALUES (?, ?, ?, FALSE, 'unrestricted', NULL, FALSE, now(), now())",
+		"svc-cred-org-5", "posthog_team_42_rw", "$2a$10$Z2IMbWec4kIV53lYNMj4Ke1sA2FxSqavOSQXiOoEAosHLzpqdzpbe",
+	).Error; err != nil {
+		t.Fatalf("plant twisted row: %v", err)
+	}
+
+	issue, err := cs.IssueProjectUserServiceCredential("svc-cred-org-5", 42, "d", 15*time.Minute, true)
+	if err != nil {
+		t.Fatalf("mint against twisted row: %v", err)
+	}
+	if !issue.Rotated || issue.Plaintext == "" {
+		t.Fatal("a twisted row is an untrusted credential state: must rotate and return plaintext")
+	}
+	var user OrgUser
+	if err := db.First(&user, "org_id = ? AND username = ?", "svc-cred-org-5", "posthog_team_42_rw").Error; err != nil {
+		t.Fatal(err)
+	}
+	if user.AccessMode != OrgUserAccessModeProjectUser {
+		t.Fatalf("access_mode must be re-established to project_user, got %q", user.AccessMode)
+	}
+	if user.TeamID == nil || *user.TeamID != 42 {
+		t.Fatalf("team_id must be re-established to 42, got %+v", user.TeamID)
+	}
+	if user.Passthrough {
+		t.Fatal("passthrough must be cleared (project-scoped logins forbid it)")
+	}
+}

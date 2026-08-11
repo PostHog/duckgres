@@ -114,6 +114,14 @@ type OrgUser struct {
 	MaxVCPUs  int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// ServiceGrantExpiresAt is the expiry of the live SERVICE-CREDENTIAL
+	// grant for this user (see configstore.IssueProjectUserServiceCredential).
+	// NULL unless the most recent credential for this login was issued via
+	// that path: the admin project-login rotation clears it when it
+	// overwrites the password, so a service mint never reuses — nor reports
+	// an expiry against — a hash it did not issue. Never serialized (it's an
+	// internal mint clock, not a credential attribute).
+	ServiceGrantExpiresAt *time.Time `gorm:"column:service_grant_expires_at" json:"-"`
 }
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }
