@@ -27,7 +27,7 @@ var ErrWarehouseNonTerminal = errors.New("warehouse already exists in non-termin
 // 400.
 var ErrProvisionTeamRequired = errors.New("team_id is required when provisioning a warehouse for a new org")
 
-const defaultProvisionedOrgMaxVCPUs = 64
+const defaultProvisionedOrgMaxVCPUs = 150
 
 // ProvisionRequest is the all-or-nothing input the Provision endpoint
 // dispatches into a single configstore transaction. Warehouse + root
