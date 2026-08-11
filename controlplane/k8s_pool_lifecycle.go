@@ -613,8 +613,10 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 	}
 }
 
-// ShutdownAll stops all workers by deleting their pods. Per worker it runs a
-// 3-step CAS chain against the runtime store and K8s API:
+// ShutdownAll stops idle workers by deleting their pods. Workers with active
+// sessions are preserved so a shutdown path cannot cancel their live queries.
+// Per idle worker it runs a 3-step CAS chain against the runtime store and K8s
+// API:
 //
 //  1. MarkWorkerDraining — atomic SQL CAS from a non-terminal state to
 //     draining. Fences the worker against claims by other CPs: their claim
@@ -649,8 +651,19 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	close(p.stopInform)
 
 	ctx := context.Background()
+	preserved := make(map[int]*ManagedWorker)
 	for _, w := range workers {
 		podName := p.workerPodName(w)
+
+		// ShutdownAll normally follows the control-plane drain, but worker and
+		// connection drain accounting can race. Do not turn that race into an
+		// immediate cancellation of a live query: leave workers with active
+		// sessions running and keep their in-memory bookkeeping intact.
+		if w.activeSessions > 0 {
+			p.logw(w.ID).Info("ShutdownAll: worker has active sessions; leaving pod alive.", "worker_pod", podName, "active_sessions", w.activeSessions)
+			preserved[w.ID] = w
+			continue
+		}
 
 		p.logw(w.ID).Info("Shutting down K8s worker.", "worker_pod", podName)
 
@@ -748,9 +761,9 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	}
 
 	p.mu.Lock()
-	p.workers = make(map[int]*ManagedWorker)
+	p.workers = preserved
 	p.mu.Unlock()
-	observeControlPlaneWorkers(0)
+	observeControlPlaneWorkers(len(preserved))
 }
 
 // retireWorkerPod closes the gRPC client and deletes the worker pod.
