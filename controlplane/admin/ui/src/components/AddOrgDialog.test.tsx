@@ -199,6 +199,30 @@ describe("AddOrgDialog", () => {
     );
   });
 
+  it("states the team lands enabled immediately, matching PostHog-side onboarding", async () => {
+    const user = userEvent.setup();
+    client.provisionWarehouse.mockResolvedValue({
+      status: "provisioning started",
+      org: OK_UUID,
+      username: "root",
+      password: "p",
+    });
+    renderDialog();
+
+    // The difference from the raw API surface: manual onboarding enables the
+    // org's teams right away, and the form says so up front — there is no
+    // "enabled" toggle to leave off.
+    expect(screen.getAllByText(/enabled immediately/i).length).toBeGreaterThan(0);
+    // The body carries no enabled override: the team's default on the
+    // provision path IS enabled (mirrors django's immediate enablement).
+    await fillMinimal(user);
+    await user.click(screen.getByRole("button", { name: /provision organization/i }));
+    await waitFor(() => expect(client.provisionWarehouse).toHaveBeenCalledTimes(1));
+    const body = client.provisionWarehouse.mock.calls[0][1] as Record<string, unknown>;
+    expect(body).not.toHaveProperty("enabled");
+    expect(body).not.toHaveProperty("backfill_enabled");
+  });
+
   it("surfaces the API error (e.g. 400 team_id required / 409 conflict) inline", async () => {
     const user = userEvent.setup();
     client.provisionWarehouse.mockRejectedValue(new Error("provision conflicts with existing state"));

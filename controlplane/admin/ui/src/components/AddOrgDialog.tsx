@@ -223,7 +223,8 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
           <DialogDescription>
             Provisions a warehouse through the same onboarding API the PostHog backend uses (
             <span className="font-mono text-xs">POST /api/v1/orgs/:id/provision</span>). Creates the
-            org, its first team and the root login, then starts asynchronous provisioning.
+            org, its first team (enabled immediately, exactly as PostHog-side onboarding lands
+            them) and the root login, then starts asynchronous provisioning.
           </DialogDescription>
         </DialogHeader>
 
@@ -340,7 +341,9 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
             </div>
             <p className="text-xs text-muted-foreground">
               The team's warehouse schema. Required because a warehouse cannot exist without a
-              team; the id becomes the org's first team row.
+              team; the id becomes the org's first team row. The created team is{" "}
+              <span className="font-medium">enabled immediately</span> — the same outcome as the
+              PostHog-side onboarding, where an org's teams land enabled right away.
             </p>
             <FieldRow label="Metadata store">
               <Select value={metadataType} onValueChange={(v) => setMetadataType(v as typeof metadataType)}>
