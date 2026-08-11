@@ -13,14 +13,14 @@ import (
 // against the shared integration Postgres (tests/integration) and lock the
 // three invariants a job depends on:
 //
-//	1. First call CREATES the team's project_user login with the minted hash.
-//	2. Back-to-back calls REUSE the live grant — the hash and updated_at
-//	   do NOT move (a concurrent long-lived run's steps must not have their
-//	   working credential rotated out from under them mid-flight, and the
-//	   discovery change-marker must not wake on every job fetch).
-//	3. force_rotate ALWAYS rotates, even on a fresh grant — this is how a
-//	   job that has nothing cached gets a plaintext without waiting out the
-//	   safety window.
+//  1. First call CREATES the team's project_user login with the minted hash.
+//  2. Back-to-back calls REUSE the live grant — the hash and updated_at
+//     do NOT move (a concurrent long-lived run's steps must not have their
+//     working credential rotated out from under them mid-flight, and the
+//     discovery change-marker must not wake on every job fetch).
+//  3. force_rotate ALWAYS rotates, even on a fresh grant — this is how a
+//     job that has nothing cached gets a plaintext without waiting out the
+//     safety window.
 func TestIssueProjectUserServiceCredentialLifecyclePostgres(t *testing.T) {
 	cs := newPostgresConfigStore(t)
 	db := cs.DB()

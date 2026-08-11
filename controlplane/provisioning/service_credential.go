@@ -21,11 +21,6 @@ const (
 	// job mints a handful of credentials over its run, short enough that a
 	// leaked one is a 15-minute liability.
 	defaultCredentialTTL = 15 * time.Minute
-	// rotationSafetyWindow is subtracted from the remaining TTL when deciding
-	// whether the CURRENT credential is still safe to reuse: a job fetching a
-	// credential needs enough runway to finish its work before expiry, not
-	// just "not yet expired".
-	rotationSafetyWindow = time.Minute
 )
 
 type serviceCredentialRequest struct {

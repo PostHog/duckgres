@@ -394,9 +394,9 @@ func (s *fakeStore) IssueProjectUserServiceCredential(
 	forceRotate bool,
 ) (*configstore.ServiceCredentialIssue, error) {
 	s.issueCreds = append(s.issueCreds, serviceCredentialRequest{
-		TeamID:     teamID,
-		Principal:  principal,
-		TTLSeconds: int(ttl / time.Second),
+		TeamID:      teamID,
+		Principal:   principal,
+		TTLSeconds:  int(ttl / time.Second),
 		ForceRotate: forceRotate,
 	})
 	if s.issueCredsErr != nil {
