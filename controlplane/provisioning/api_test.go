@@ -430,8 +430,8 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	if _, ok := store.orgs["new-org"]; !ok {
 		t.Fatal("expected org to be auto-created")
 	}
-	if got := store.orgs["new-org"].MaxVCPUs; got != 64 {
-		t.Fatalf("auto-created org MaxVCPUs = %d, want 64", got)
+	if got := store.orgs["new-org"].MaxVCPUs; got != 150 {
+		t.Fatalf("auto-created org MaxVCPUs = %d, want 150", got)
 	}
 	if store.warehouses["new-org"] == nil {
 		t.Fatal("expected warehouse to be created")
