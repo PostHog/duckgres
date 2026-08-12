@@ -139,13 +139,14 @@ type QueryProfilingSummary struct {
 	PostgresScanSeconds float64
 }
 
-// EnrichSpanWithProfiling creates child spans from DuckDB profiling output
-// showing where execution time was spent: planning, scanning (I/O), and compute.
-// Also emits Prometheus metrics for baseline measurement.
+// EnrichSpanWithProfiling attaches DuckDB's completed profiling summary to the
+// execution span. Operator timings are cumulative thread time, so they are
+// recorded as aggregate attributes rather than fabricated sequential spans.
+// It also emits Prometheus metrics for baseline measurement.
 //
 // Returns a per-query rollup so callers (e.g. query log) can persist key
 // metrics without re-parsing the profiling JSON.
-func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart time.Time, executor sqlcore.QueryExecutor, orgID string) QueryProfilingSummary {
+func EnrichSpanWithProfiling(_ context.Context, span trace.Span, _ time.Time, executor sqlcore.QueryExecutor, orgID string) QueryProfilingSummary {
 	output := executor.LastProfilingOutput()
 	if output == "" {
 		return QueryProfilingSummary{}
@@ -165,75 +166,22 @@ func EnrichSpanWithProfiling(ctx context.Context, span trace.Span, execStart tim
 		attribute.Int64("duckdb.total_bytes_read", int64(m.TotalBytesRead)),
 	)
 
-	planningDur := m.Planner + m.PlannerBinding + m.CumulativeOptimizerTiming + m.PhysicalPlanner
 	scanTime, scanRows, computeTime, pgScanTime, pgScanRows := collectOperatorTimings(m.Children)
-
-	cursor := execStart
-
-	if planningDur > 0 {
-		_, planSpan := tracer.Start(ctx, "duckdb.planning", trace.WithTimestamp(cursor))
-		planSpan.SetAttributes(
-			attribute.Float64("duckdb.planner_s", m.Planner),
-			attribute.Float64("duckdb.optimizer_s", m.CumulativeOptimizerTiming),
-			attribute.Float64("duckdb.physical_planner_s", m.PhysicalPlanner),
-		)
-		cursor = cursor.Add(time.Duration(planningDur * float64(time.Second)))
-		planSpan.End(trace.WithTimestamp(cursor))
-	}
-
-	execWall := m.Latency - planningDur
-	totalOpTime := scanTime + computeTime
-	scanWall := execWall
-	computeWall := 0.0
-	if totalOpTime > 0 {
-		scanWall = execWall * (scanTime / totalOpTime)
-		computeWall = execWall * (computeTime / totalOpTime)
-	}
+	span.SetAttributes(
+		attribute.Float64("duckdb.planner_s", m.Planner),
+		attribute.Float64("duckdb.planner_binding_s", m.PlannerBinding),
+		attribute.Float64("duckdb.optimizer_s", m.CumulativeOptimizerTiming),
+		attribute.Float64("duckdb.physical_planner_s", m.PhysicalPlanner),
+		attribute.Float64("duckdb.scan_thread_s", scanTime),
+		attribute.Float64("duckdb.compute_thread_s", computeTime),
+		attribute.Float64("duckdb.postgres_scan_thread_s", pgScanTime),
+		attribute.Float64("duckdb.scan_rows_cumulative", scanRows),
+		attribute.Float64("duckdb.postgres_scan_rows_cumulative", pgScanRows),
+		attribute.String("duckdb.timing_kind", "cumulative_thread_time"),
+	)
 
 	S3BytesReadTotal.WithLabelValues(orgID).Add(float64(m.TotalBytesRead))
-	ScanWallSecondsHistogram.WithLabelValues(orgID).Observe(scanWall)
 	PostgresScanSecondsHistogram.WithLabelValues(orgID).Observe(pgScanTime)
-	scanRowsWallEstimate := scanRows
-	if m.CPUTime > 0 && m.Latency > 0 {
-		if p := m.CPUTime / m.Latency; p > 1 {
-			scanRowsWallEstimate = scanRows / p
-		}
-	}
-	if scanWall > 0 && scanRowsWallEstimate > 0 {
-		ScanRowsPerSecondHistogram.WithLabelValues(orgID).Observe(scanRowsWallEstimate / scanWall)
-	}
-
-	if scanTime > 0 {
-		scanRowsWall := scanRows
-		if m.CPUTime > 0 && m.Latency > 0 {
-			parallelism := m.CPUTime / m.Latency
-			if parallelism > 1 {
-				scanRowsWall = scanRows / parallelism
-			}
-		}
-		_, scanSpan := tracer.Start(ctx, "duckdb.scan", trace.WithTimestamp(cursor))
-		scanSpan.SetAttributes(
-			attribute.Float64("duckdb.scan_wall_s", scanWall),
-			attribute.Float64("duckdb.scan_thread_s", scanTime),
-			attribute.Float64("duckdb.scan_rows_wall", scanRowsWall),
-			attribute.Float64("duckdb.scan_rows_cumulative", scanRows),
-			attribute.Float64("duckdb.postgres_scan_thread_s", pgScanTime),
-			attribute.Float64("duckdb.postgres_scan_rows_cumulative", pgScanRows),
-			attribute.Int64("duckdb.total_bytes_read", int64(m.TotalBytesRead)),
-		)
-		cursor = cursor.Add(time.Duration(scanWall * float64(time.Second)))
-		scanSpan.End(trace.WithTimestamp(cursor))
-	}
-
-	if computeTime > 0 {
-		_, compSpan := tracer.Start(ctx, "duckdb.compute", trace.WithTimestamp(cursor))
-		compSpan.SetAttributes(
-			attribute.Float64("duckdb.compute_wall_s", computeWall),
-			attribute.Float64("duckdb.compute_thread_s", computeTime),
-		)
-		cursor = cursor.Add(time.Duration(computeWall * float64(time.Second)))
-		compSpan.End(trace.WithTimestamp(cursor))
-	}
 
 	return QueryProfilingSummary{
 		CPUTimeSeconds:        m.CPUTime,

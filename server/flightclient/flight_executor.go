@@ -243,6 +243,7 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 	// Return empty results for queries that are only semicolons, whitespace,
 	// and/or comments. These represent PostgreSQL client pings (e.g., pgx sends "-- ping").
 	if sqlcore.IsEmptyQuery(query) {
+		e.lastProfiling.Store("")
 		return &emptyRowSet{}, nil
 	}
 
@@ -288,7 +289,8 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return nil, err
 	}
 
-	reader, err := e.client.DoGet(reqCtx, ticket)
+	var doGetTrailer metadata.MD
+	reader, err := e.client.DoGet(reqCtx, ticket, grpc.Trailer(&doGetTrailer))
 	if err != nil {
 		// If cancellation lands after Execute has registered a worker-side
 		// handle but before DoGet returns a RowSet, there is no Close call to
@@ -313,6 +315,9 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		schema:        schema,
 		cancel:        cancel,
 		waitForClosed: e.waitForSessionIdle,
+		storeProfiling: func() {
+			e.storeProfilingFromTrailer(doGetTrailer)
+		},
 	}, nil
 }
 
@@ -781,14 +786,24 @@ type FlightRowSet struct {
 	schema *arrow.Schema
 
 	// Current batch state
-	currentBatch  arrow.RecordBatch
-	batchRow      int // current row index within currentBatch
-	done          bool
-	err           error
-	closeOnce     sync.Once
-	closeErr      error
-	cancel        context.CancelFunc
-	waitForClosed func() error
+	currentBatch   arrow.RecordBatch
+	batchRow       int // current row index within currentBatch
+	done           bool
+	err            error
+	closeOnce      sync.Once
+	closeErr       error
+	cancel         context.CancelFunc
+	waitForClosed  func() error
+	storeProfiling func()
+	profilingOnce  sync.Once
+}
+
+func (r *FlightRowSet) captureProfiling() {
+	r.profilingOnce.Do(func() {
+		if r.storeProfiling != nil {
+			r.storeProfiling()
+		}
+	})
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -838,6 +853,9 @@ func (r *FlightRowSet) Next() bool {
 
 	r.done = true
 	r.err = r.reader.Err()
+	if r.err == nil {
+		r.captureProfiling()
+	}
 	return false
 }
 
@@ -874,6 +892,9 @@ func (r *FlightRowSet) Close() error {
 			r.currentBatch = nil
 		}
 		r.reader.Release()
+		if r.done && r.err == nil {
+			r.captureProfiling()
+		}
 		if r.waitForClosed != nil && (!r.done || r.err != nil) {
 			r.closeErr = r.waitForClosed()
 		}

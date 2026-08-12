@@ -912,9 +912,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 		rows, err = runQuery()
 	}
-	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
-	execSpan.End()
 	if err != nil {
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
@@ -929,9 +929,19 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 	keepRowsOpen := false
+	profilingFinished := false
+	finishProfiling := func() {
+		if profilingFinished {
+			return
+		}
+		profilingFinished = true
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
+	}
 	defer func() {
 		if !keepRowsOpen {
 			_ = rows.Close()
+			finishProfiling()
 		}
 	}()
 
@@ -1041,14 +1051,15 @@ func (c *clientConn) handleExecute(body []byte) {
 		// entry is written by the leg that completes the portal.
 		keepRowsOpen = true
 		p.exec = &portalExec{
-			rows:           activeRows,
-			cols:           cols,
-			typeOIDs:       typeOIDs,
-			cmdType:        cmdType,
-			rowCount:       int64(rowCount),
-			originalQuery:  originalQuery,
-			convertedQuery: convertedQuery,
-			start:          start,
+			rows:            activeRows,
+			cols:            cols,
+			typeOIDs:        typeOIDs,
+			cmdType:         cmdType,
+			rowCount:        int64(rowCount),
+			originalQuery:   originalQuery,
+			convertedQuery:  convertedQuery,
+			start:           start,
+			finishProfiling: finishProfiling,
 		}
 		_ = wire.WritePortalSuspended(c.writer)
 		return

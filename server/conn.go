@@ -129,6 +129,9 @@ type portalExec struct {
 	originalQuery  string
 	convertedQuery string
 	start          time.Time // first Execute leg's start, so the query log spans all legs
+	// finishProfiling runs after rows.Close has allowed a Flight DoGet trailer
+	// to arrive. A suspended portal retains it until its terminal Execute.
+	finishProfiling func()
 }
 
 // closeExec releases a suspended portal's open rowset (if any). Must be
@@ -139,6 +142,9 @@ func (p *portal) closeExec() {
 		return
 	}
 	_ = p.exec.rows.Close()
+	if p.exec.finishProfiling != nil {
+		p.exec.finishProfiling()
+	}
 	p.exec = nil
 }
 
