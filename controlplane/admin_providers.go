@@ -265,8 +265,8 @@ func (im *impersonator) Impersonate(c *gin.Context, org, username, sql string, a
 	ctx := c.Request.Context()
 
 	pid := impersonationPIDSeq.Add(-1)
-	// Empty memoryLimit/threads + nil profile: the worker auto-sizes DuckDB to
-	// its own pod and the default org worker shape is acquired/reused.
+	// Empty memoryLimit/threads + nil profile: the default org worker shape is
+	// acquired/reused, and its DuckDB limits are derived by the org stack.
 	_, executor, err := stack.Sessions.CreateSessionWithProtocol(ctx, username, pid, "", 0, "admin", nil)
 	if err != nil {
 		return nil, fmt.Errorf("open session as %s@%s: %w", username, org, err)

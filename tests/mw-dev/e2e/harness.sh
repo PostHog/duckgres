@@ -1408,9 +1408,9 @@ assert_worker_pod() { # org password
   dmem="$worker_memory"
   case "$dcpu/$dmem" in
     # Pool default (DUCKGRES_K8S_WORKER_{CPU,MEMORY}_REQUEST).
-    750m/1536Mi) want_gomem="192MiB" ;;
+    750m/1536Mi) want_gomem="192MiB"; want_threads="2" ;;
     # Exploratory tier (DUCKGRES_EXPLORATORY_WORKER_{CPU,MEMORY}).
-    1/2Gi)        want_gomem="256MiB" ;;
+    1/2Gi)        want_gomem="256MiB"; want_threads="3" ;;
     *) fail "unsized worker $pod requests cpu='$dcpu' memory='$dmem' — neither the pool default (750m/1536Mi) nor the exploratory shape (1/2Gi); BestEffort regression?" ;;
   esac
 
@@ -1419,15 +1419,14 @@ assert_worker_pod() { # org password
   # count at spawn — otherwise the worker sizes its base DB off the NODE's
   # /proc/meminfo and all pre-session work (DuckLake ATTACH, activation) runs
   # effectively unbounded. Both shapes above derive DUCKGRES_MEMORY_LIMIT=1GB
-  # (75% of 1536Mi and of 2Gi both GB-floor to 1) and DUCKGRES_THREADS=1 (750m
-  # and 1 both round up to 1); only GOMEMLIMIT (1/8 of the pod) distinguishes
-  # them, which is exactly what makes this a real derivation check.
+  # (75% of 1536Mi and of 2Gi both GB-floor to 1). DUCKGRES_THREADS is 2.5x
+  # CPU, rounded up: 750m -> 2 and 1 CPU -> 3.
   dml="$worker_memory_limit"
   [ "$dml" = "1GB" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of pod memory, GB-floored)"
   gml="$worker_go_memory_limit"
   [ "$gml" = "$want_gomem" ] || fail "unsized worker $pod ($dcpu/$dmem) GOMEMLIMIT='$gml' want '$want_gomem' (1/8 of pod memory)"
   thr="$worker_threads"
-  [ "$thr" = "1" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_THREADS='$thr' want '1' (sub-2-CPU rounds up to 1)"
+  [ "$thr" = "$want_threads" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_THREADS='$thr' want '$want_threads' (2.5x CPU, rounded up)"
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------

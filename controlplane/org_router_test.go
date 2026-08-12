@@ -16,6 +16,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+func TestOrgRouterDefaultWorkerDuckDBThreads(t *testing.T) {
+	tests := []struct {
+		name       string
+		cpuRequest string
+		want       int
+	}{
+		{name: "production shape", cpuRequest: "15", want: 38},
+		{name: "fractional shape", cpuRequest: "750m", want: 2},
+		{name: "built-in worker shape", cpuRequest: "", want: 20},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := &OrgRouter{baseCfg: K8sWorkerPoolConfig{WorkerCPURequest: tt.cpuRequest}}
+			if got := router.defaultWorkerDuckDBThreads(); got != tt.want {
+				t.Fatalf("defaultWorkerDuckDBThreads() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 type recordingOrgRouterPool struct {
 	events        *[]string
 	shutdownCount *atomic.Int32

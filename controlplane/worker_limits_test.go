@@ -19,35 +19,35 @@ func TestWorkerDuckDBLimits_RemoteBackend(t *testing.T) {
 			cpuReq:     "46000m",
 			memReq:     "360Gi",
 			wantMem:    "270GB", // 75% of 360Gi (386547056640 bytes) = 270GB
-			wantThread: 46,
+			wantThread: 115,
 		},
 		{
 			name:       "whole core CPU notation",
 			cpuReq:     "46",
 			memReq:     "360Gi",
 			wantMem:    "270GB",
-			wantThread: 46,
+			wantThread: 115,
 		},
 		{
 			name:       "small worker",
 			cpuReq:     "4000m",
 			memReq:     "8Gi",
 			wantMem:    "6GB",
-			wantThread: 4,
+			wantThread: 10,
 		},
 		{
-			name:       "fractional CPU rounds down to zero",
+			name:       "fractional CPU rounds multiplied threads up",
 			cpuReq:     "500m",
 			memReq:     "1Gi",
 			wantMem:    "768MB",
-			wantThread: 0, // 500m < 1 core, rounds to 0
+			wantThread: 2,
 		},
 		{
 			name:       "1 core minimum",
 			cpuReq:     "1000m",
 			memReq:     "2Gi",
 			wantMem:    "1GB",
-			wantThread: 1,
+			wantThread: 3,
 		},
 		{
 			name:       "empty resources",
@@ -128,7 +128,7 @@ func TestSessionLimitsRouting(t *testing.T) {
 		if memLimit != "270GB" {
 			t.Errorf("remote mode should use worker memory, got %q", memLimit)
 		}
-		if threads != 46 {
+		if threads != 115 {
 			t.Errorf("remote mode should use worker CPU, got %d", threads)
 		}
 
@@ -199,23 +199,27 @@ func TestParseK8sMemory(t *testing.T) {
 	}
 }
 
-func TestParseK8sCPU(t *testing.T) {
+func TestDuckDBThreadsForK8sCPU(t *testing.T) {
 	tests := []struct {
 		input string
 		want  int
 	}{
-		{"46000m", 46},
-		{"46", 46},
-		{"500m", 0},
-		{"1000m", 1},
-		{"4", 4},
+		{"46000m", 115},
+		{"46", 115},
+		{"500m", 2},
+		{"750m", 2},
+		{"1000m", 3},
+		{"1500m", 4},
+		{"1.5", 4},
+		{"4", 10},
 		{"", 0},
+		{"garbage", 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := parseK8sCPU(tt.input)
+			got := duckDBThreadsForK8sCPU(tt.input)
 			if got != tt.want {
-				t.Errorf("parseK8sCPU(%q) = %d, want %d", tt.input, got, tt.want)
+				t.Errorf("duckDBThreadsForK8sCPU(%q) = %d, want %d", tt.input, got, tt.want)
 			}
 		})
 	}

@@ -2170,7 +2170,7 @@ func authorizedClientSearchPath(searchPath string, policy *server.QueryAccessPol
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
 // pod's K8s resource spec. Uses 75% of the worker's memory limit for DuckDB
-// and the full CPU request as thread count. Returns empty/zero if worker
+// and 2.5x the CPU request, rounded up, as the thread count. Returns empty/zero if worker
 // resources are not configured (DuckDB will then auto-detect on the worker).
 func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit string, threads int) {
 	// A non-default profile sizes DuckDB from the profile's pod shape, not the
@@ -2192,7 +2192,7 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	}
 
 	if cpuReq != "" {
-		threads = parseK8sCPU(cpuReq)
+		threads = duckDBThreadsForK8sCPU(cpuReq)
 	}
 
 	return memLimit, threads
@@ -2270,25 +2270,11 @@ func parseK8sMemory(s string) uint64 {
 	return server.ParseMemoryBytes(s)
 }
 
-// parseK8sCPU parses a Kubernetes CPU string (e.g., "46", "46000m", "500m")
-// into a whole thread count. Millicores below 1000 round down to 0.
-func parseK8sCPU(s string) int {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	if strings.HasSuffix(s, "m") {
-		var millicores int
-		if _, err := fmt.Sscanf(strings.TrimSuffix(s, "m"), "%d", &millicores); err != nil {
-			return 0
-		}
-		return millicores / 1000
-	}
-	var cores int
-	if _, err := fmt.Sscanf(s, "%d", &cores); err != nil {
-		return 0
-	}
-	return cores
+// duckDBThreadsForK8sCPU derives the default DuckDB thread count from a
+// Kubernetes CPU quantity. The shared helper keeps this per-session value in
+// sync with the worker's spawn-time DUCKGRES_THREADS value.
+func duckDBThreadsForK8sCPU(s string) int {
+	return server.DefaultDuckDBThreads(parseK8sCPUMillicores(s))
 }
 
 // parseK8sCPUMillicores parses a Kubernetes CPU string (e.g. "8", "8000m",

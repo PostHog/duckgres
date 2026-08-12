@@ -711,7 +711,7 @@ func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
 					map[string]any{"name": "NODE_NAME", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "spec.nodeName"}}},
 					map[string]any{"name": "DUCKGRES_MEMORY_LIMIT", "value": "1GB"},
 					map[string]any{"name": "GOMEMLIMIT", "value": "192MiB"},
-					map[string]any{"name": "DUCKGRES_THREADS", "value": "1"},
+					map[string]any{"name": "DUCKGRES_THREADS", "value": "2"},
 				},
 				"volumeMounts": []any{map[string]any{"mountPath": "/data"}},
 				"resources": map[string]any{
@@ -729,7 +729,7 @@ func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
 	if err := template.Execute(&got, pod); err != nil {
 		t.Fatalf("execute worker inspection JSONPath: %v", err)
 	}
-	const want = "|Running|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1"
+	const want = "|Running|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|2"
 	if got.String() != want {
 		t.Fatalf("worker inspection snapshot = %q, want %q", got.String(), want)
 	}
@@ -803,7 +803,7 @@ if [[ "$*" == *"get pod pending-worker"* && "$*" == *"-o jsonpath="* ]] || \
   if [[ "$*" == *".status.phase"* ]]; then
     printf '|%s' "$phase"
   fi
-  printf '%s' '|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1'
+  printf '%s' '|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|2'
   exit 0
 fi
 echo "unexpected kubectl invocation: $*" >&2
