@@ -155,7 +155,7 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
 	}
 	databaseName, _ := request["database_name"].(string)
-	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "scenario_smoke_") {
+	if databaseName == "scenario-smoke" || !strings.Contains(databaseName, "scenario-smoke-") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
 	}
 	requireScenarioTeamID(t, request)

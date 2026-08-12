@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,19 +18,13 @@ import (
 	"gorm.io/gorm"
 )
 
-// isUniqueViolation reports whether err comes from a Postgres
-// 23505 unique-constraint violation. The pgx/jackc driver surfaces
-// the SQLSTATE through a method on the returned error; we match
-// against that without importing pgconn directly (mirrors the
-// pattern in controlplane/provisioner/postgres_admin.go).
-//
-// Mapped to HTTP 409 by the provision handler so callers see a
-// clear "your input conflicts with existing state" rather than a
-// generic 500.
+// isUniqueViolation reports whether err comes from a Postgres 23505
+// unique-constraint violation (thin wrapper over the shared
+// configstore.IsUniqueViolationErr). Mapped to HTTP 409 by the provision
+// handler so callers see a clear "your input conflicts with existing state"
+// rather than a generic 500.
 func isUniqueViolation(err error) bool {
-	type sqlStater interface{ SQLState() string }
-	var s sqlStater
-	return errors.As(err, &s) && s.SQLState() == "23505"
+	return configstore.IsUniqueViolationErr(err)
 }
 
 const (
@@ -301,8 +296,24 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if req.DatabaseName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "database_name is required"})
+	// Trim around the caller's value so " acme" fails with the real problem
+	// instead of storing a name that differs from what the caller intended.
+	req.DatabaseName = strings.TrimSpace(req.DatabaseName)
+
+	// database_name becomes the org's managed hostname label
+	// (<database_name>.<managed-suffix>) and the dbname clients connect with,
+	// so a new or CHANGED name must be a routable single DNS label — a name
+	// with spaces or dots would store fine but leave the tenant reachable by
+	// no hostname. Grandfather exception: re-provisioning an existing org with
+	// its STORED name (the deprovision→re-provision recovery loop) sends a
+	// value that predates this rule — rejecting it would orphan a flow that
+	// worked until now and write nothing new anyway. The break-glass rename
+	// lives in the admin API (PUT /api/v1/orgs/:id).
+	if existing, err := h.store.GetOrg(orgID); err == nil && existing.DatabaseName == req.DatabaseName {
+		// Existing org re-provisioning with its stored (possibly
+		// pre-validation-rule) database name: nothing changes, allow it.
+	} else if err := configstore.ValidateDatabaseName(req.DatabaseName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -605,6 +616,15 @@ func (h *handler) checkDatabaseName(c *gin.Context) {
 	name := c.Query("name")
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name query parameter is required"})
+		return
+	}
+
+	// "available" must mean "provisionable", not just "untaken": a name the
+	// provision endpoint would 400 (not a valid DNS label) is reported
+	// available=false with the reason, so a pre-flight never green-lights a
+	// payload that fails one request later.
+	if err := configstore.ValidateDatabaseName(name); err != nil {
+		c.JSON(http.StatusOK, gin.H{"name": name, "available": false, "reason": err.Error()})
 		return
 	}
 

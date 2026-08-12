@@ -104,6 +104,63 @@ func TestAdminAdmissionConfigMutationsSerializePostgres(t *testing.T) {
 	}
 }
 
+// TestAdminUpdateOrgRenamesDatabaseNamePostgres exercises the gorm store's
+// database_name threading against real Postgres: a non-empty value renames
+// (the break-glass fix for unroutable stored names), an empty value preserves
+// (absent key semantics — the handler presence-merge makes "" impossible from
+// the API, but the store contract is pinned here).
+func TestAdminUpdateOrgRenamesDatabaseNamePostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	if err := store.DB().Create(&configstore.Org{
+		Name:         "rename-org",
+		DatabaseName: "ACME INC", // grandfathered broken row: not a routable hostname label
+	}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	// Empty = preserve.
+	preserved, found, err := apiStore.UpdateOrg("rename-org", configstore.Org{MaxWorkers: 1})
+	if err != nil || !found {
+		t.Fatalf("preserve update: found=%v err=%v", found, err)
+	}
+	if preserved.DatabaseName != "ACME INC" {
+		t.Fatalf("empty DatabaseName should preserve, got %q", preserved.DatabaseName)
+	}
+
+	// Non-empty = rename (and the unique index rejects squatters).
+	updated, found, err := apiStore.UpdateOrg("rename-org", configstore.Org{DatabaseName: "acme-inc"})
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if !found {
+		t.Fatal("renamed org was not found")
+	}
+	if updated.DatabaseName != "acme-inc" {
+		t.Fatalf("stored database_name = %q, want acme-inc", updated.DatabaseName)
+	}
+
+	// Rename onto a squatted name trips the unique index — the handler maps
+	// the 23505 to HTTP 409 (asserted here through the store error so the
+	// IsUniqueViolationErr classification is pinned against the real driver).
+	store2 := newPostgresConfigStore(t)
+	if err := store2.DB().Create(&configstore.Org{Name: "taken-a", DatabaseName: "taken-name"}).Error; err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := store2.DB().Create(&configstore.Org{Name: "taken-b", DatabaseName: "other-name"}).Error; err != nil {
+		t.Fatalf("seed renamer: %v", err)
+	}
+	_, _, err = newGormAPIStore(store2).(*gormAPIStore).
+		UpdateOrg("taken-b", configstore.Org{DatabaseName: "taken-name"})
+	if err == nil {
+		t.Fatal("rename onto taken database_name: want error")
+	}
+	if !configstore.IsUniqueViolationErr(err) {
+		t.Fatalf("rename onto taken database_name: err = %v, want a 23505 the handler maps to 409", err)
+	}
+}
+
 func TestAdminUpdateOrgPersistsDataImportsTableNamingVersionPostgres(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	if err := store.DB().Create(&configstore.Org{

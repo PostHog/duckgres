@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ManagedWarehouse, Org } from "@/types/api";
 
 const hooks = vi.hoisted(() => ({
+  useDatabaseNameAvailable: vi.fn(),
   useDeleteOrg: vi.fn(),
   useDeprovisionWarehouse: vi.fn(),
   useDucklingsMetadata: vi.fn(),
@@ -126,6 +127,7 @@ describe("Org detail", () => {
       me: { email: "admin@example.com", role: "admin", source: "sso" },
     });
     hooks.useOrg.mockReturnValue(ok(ORG));
+    hooks.useDatabaseNameAvailable.mockReturnValue({ data: null, isLoading: false });
     hooks.useUpdateOrg.mockReturnValue(mut(orgUpdate));
     hooks.useDeleteOrg.mockReturnValue(mut());
     hooks.useUpdateWarehouse.mockReturnValue(mut(warehouseUpdate));
@@ -151,6 +153,87 @@ describe("Org detail", () => {
 
     expect(warehouseUpdate).toHaveBeenCalledTimes(1);
     expect(warehouseUpdate).toHaveBeenCalledWith({ metadata_proxy_enabled: next });
+  });
+
+  it("sends database_name only when it changed", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    // Untouched: save carries no database_name (no spurious rename).
+    await user.click(screen.getByText("Save changes"));
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.not.objectContaining({ database_name: expect.anything() }));
+
+    orgUpdate.mockClear();
+
+    // Fixed a broken stored name: the rename rides the update.
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme-inc");
+    await user.click(screen.getByText("Save changes"));
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.objectContaining({ database_name: "acme-inc" }));
+  });
+
+  it("keeps every other setting editable for an org whose stored name predates the rule", async () => {
+    // The premise of the break-glass surface: grandfathered rows like
+    // "ACME INC" must NOT wedge the whole org-config card behind a forced
+    // rename. The server preserves database_name when the key is absent
+    // (Go test TestUpdateOrgWithoutDatabaseNameKeyPreservesIt).
+    const user = userEvent.setup();
+    hooks.useOrg.mockReturnValue(ok({ ...ORG, database_name: "ACME INC" }));
+    renderPage(false);
+
+    const save = screen.getByRole("button", { name: /save changes/i });
+    expect(save).toBeEnabled();
+    expect(screen.getByLabelText(/database name/i)).toHaveValue("ACME INC");
+
+    await user.click(save);
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.not.objectContaining({ database_name: expect.anything() }));
+
+    // Fixing the name unlocks the rename path.
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme-inc");
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(orgUpdate).toHaveBeenLastCalledWith(expect.objectContaining({ database_name: "acme-inc" }));
+  });
+
+  it("rejects a database name that is not a valid DNS label client-side", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme inc");
+
+    expect(screen.getByText(/single DNS label/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled();
+  });
+
+  it("disables save with an explanation when the database name is cleared", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+
+    expect(screen.getByText(/database name is required/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled();
+  });
+
+  it("blocks a rename onto a database name another org already owns", async () => {
+    const user = userEvent.setup();
+    hooks.useDatabaseNameAvailable.mockReturnValue(ok({ name: "taken-name", available: false }));
+    renderPage(false);
+
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "taken-name");
+
+    expect(await screen.findByText(/already in use by another org/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled();
   });
 
   it("saves a changed data import table naming version", async () => {
