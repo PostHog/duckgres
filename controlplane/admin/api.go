@@ -903,6 +903,9 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 	}
 	// database_name becomes the org's managed hostname label, so it must be a
 	// routable single DNS label at birth (same rule as the provisioning API).
+	// Trim the operator's value first so " acme" fails with the real problem
+	// instead of storing leading whitespace.
+	org.DatabaseName = strings.TrimSpace(org.DatabaseName)
 	if err := configstore.ValidateDatabaseName(org.DatabaseName); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -989,6 +992,10 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	// stored name predates the DNS-label rule and is therefore unroutable —
 	// rename and the hostname works the moment the snapshot reloads.
 	if _, ok := fields["database_name"]; ok {
+		// Trim whitespace around the operator's value before validating/
+		// storing so " acme" 400s with the real problem instead of storing a
+		// subtly different name than the operator typed and saw validated.
+		updates.DatabaseName = strings.TrimSpace(updates.DatabaseName)
 		if err := configstore.ValidateDatabaseName(updates.DatabaseName); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1045,12 +1052,28 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 
 	org, ok, err := h.store.UpdateOrg(name, merged)
 	if err != nil {
+		if configstore.IsUniqueViolationErr(err) {
+			// database_name or hostname_alias unique index — same 409 the
+			// create/provision surfaces map for the identical conflict.
+			c.JSON(http.StatusConflict, gin.H{"error": "database_name or hostname_alias is already in use by another org"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
+	}
+	// A database_name rename moves the org's managed hostname: without forcing
+	// a reload, every replica routes on its stale snapshot until the next poll
+	// (the new hostname 08006s while the API here already reported success).
+	// Same snapshot-convergence contract as user/team mutations.
+	if existing.DatabaseName != org.DatabaseName {
+		if err := h.notifyPeersOfChange(c); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("renamed, but failed to reload the local snapshot: %v", err)})
+			return
+		}
 	}
 	c.JSON(http.StatusOK, org)
 }

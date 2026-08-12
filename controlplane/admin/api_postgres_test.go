@@ -140,6 +140,25 @@ func TestAdminUpdateOrgRenamesDatabaseNamePostgres(t *testing.T) {
 	if updated.DatabaseName != "acme-inc" {
 		t.Fatalf("stored database_name = %q, want acme-inc", updated.DatabaseName)
 	}
+
+	// Rename onto a squatted name trips the unique index — the handler maps
+	// the 23505 to HTTP 409 (asserted here through the store error so the
+	// IsUniqueViolationErr classification is pinned against the real driver).
+	store2 := newPostgresConfigStore(t)
+	if err := store2.DB().Create(&configstore.Org{Name: "taken-a", DatabaseName: "taken-name"}).Error; err != nil {
+		t.Fatalf("seed squatter: %v", err)
+	}
+	if err := store2.DB().Create(&configstore.Org{Name: "taken-b", DatabaseName: "other-name"}).Error; err != nil {
+		t.Fatalf("seed renamer: %v", err)
+	}
+	_, _, err = newGormAPIStore(store2).(*gormAPIStore).
+		UpdateOrg("taken-b", configstore.Org{DatabaseName: "taken-name"})
+	if err == nil {
+		t.Fatal("rename onto taken database_name: want error")
+	}
+	if !configstore.IsUniqueViolationErr(err) {
+		t.Fatalf("rename onto taken database_name: err = %v, want a 23505 the handler maps to 409", err)
+	}
 }
 
 func TestAdminUpdateOrgPersistsDataImportsTableNamingVersionPostgres(t *testing.T) {

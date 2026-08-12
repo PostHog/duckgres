@@ -149,11 +149,9 @@ func (ReshardLogEntry) TableName() string { return "duckgres_reshard_operation_l
 var ErrReshardConflict = errors.New("org already has an active reshard operation")
 
 // isUniqueViolationErr reports a Postgres 23505 unique-constraint violation
-// (same SQLState-through-errors.As pattern as provisioning.isUniqueViolation).
+// (kept as a thin wrapper over the shared IsUniqueViolationErr in orgs.go).
 func isUniqueViolationErr(err error) bool {
-	type sqlStater interface{ SQLState() string }
-	var s sqlStater
-	return errors.As(err, &s) && s.SQLState() == "23505"
+	return IsUniqueViolationErr(err)
 }
 
 // ErrReshardFenced is returned by runner-fenced writes when the (runner,

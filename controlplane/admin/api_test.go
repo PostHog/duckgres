@@ -2173,6 +2173,61 @@ func TestUpdateOrgWithoutDatabaseNameKeyPreservesIt(t *testing.T) {
 	if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "ACME INC" {
 		t.Errorf("DatabaseName = %q, want preserved %q", got, "ACME INC")
 	}
+	if store.reloadSnapshotCalls != 0 {
+		t.Errorf("reloadSnapshotCalls = %d, want 0 (no rename, no reload)", store.reloadSnapshotCalls)
+	}
+}
+
+func TestUpdateOrgRenameDatabaseNameTrimsAndReloadsSnapshot(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "ACME INC",
+	}
+	router := newTestAPIRouter(store)
+
+	// The operator's whitespace is normalized, and the rename forces a local
+	// snapshot reload + peer fan-out — otherwise every replica keeps routing
+	// on the stale name until its next poll while the API already reported
+	// success.
+	body := []byte(`{"database_name":"  acme-inc  "}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "acme-inc" {
+		t.Errorf("DatabaseName = %q, want trimmed %q", got, "acme-inc")
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Errorf("reloadSnapshotCalls = %d, want 1 (rename must reload the routing snapshot)", store.reloadSnapshotCalls)
+	}
+}
+
+func TestUpdateOrgSameDatabaseNameDoesNotReload(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "tenant-alpha",
+	}
+	router := newTestAPIRouter(store)
+
+	// Resending the stored name is a no-op for routing: no reload fan-out.
+	body := []byte(`{"database_name":"tenant-alpha"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.reloadSnapshotCalls != 0 {
+		t.Errorf("reloadSnapshotCalls = %d, want 0 (name unchanged)", store.reloadSnapshotCalls)
+	}
 }
 
 func TestUpdateOrgOmittingHostnameAliasPreservesIt(t *testing.T) {

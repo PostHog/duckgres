@@ -27,6 +27,7 @@ import { databaseNameProblem } from "@/lib/databaseName";
 import { ducklingBroken, ducklingEntryFor, fmtTime } from "@/lib/format";
 import { ShardBadge } from "@/components/ShardBadge";
 import {
+  useDatabaseNameAvailable,
   useDeleteOrg,
   useDeprovisionWarehouse,
   useDucklingsMetadata,
@@ -101,6 +102,25 @@ export function OrgDetail() {
     if (org.data) setForm(orgToForm(org.data));
   }, [org.data]);
 
+  // Client-side mirror of the server's DNS-label rule (configstore
+  // .ValidateDatabaseName) so a typo is a red border, not a round-trip 400.
+  // Crucially the save gate only applies when the operator actually CHANGED
+  // the name: orgs whose stored value predates the rule (the premise of this
+  // break-glass surface) must keep every OTHER org setting editable without
+  // forcing a rename, and database_name is only sent when it differs (save()
+  // below), so an unchanged grandfathered value never blocks saving.
+  // (Derived BEFORE the early returns below: the availability hook must run
+  // on every render, unconditionally.)
+  const trimmedDb = form ? form.database_name.trim() : "";
+  const dbChanged = form !== null && trimmedDb !== org.data?.database_name;
+  const dbProblem =
+    form === null || !dbChanged ? null : trimmedDb === "" ? "Database name is required." : databaseNameProblem(trimmedDb);
+  // Availability probe for the rename target: renaming onto another org's
+  // name is the one failure an operator can hit at save time, so flag it
+  // before the round-trip (the server still 409s authoritatively).
+  const dbCheck = useDatabaseNameAvailable(trimmedDb, dbChanged && dbProblem === null);
+  const dbTaken = Boolean(dbChanged && dbProblem === null && dbCheck.data && !dbCheck.data.available);
+
   if (org.isLoading || !form) {
     return (
       <>
@@ -121,12 +141,6 @@ export function OrgDetail() {
   }
 
   const set = (k: keyof FormState, v: string) => setForm((f) => (f ? { ...f, [k]: v } : f));
-
-  // Client-side mirror of the server's DNS-label rule (configstore
-  // .ValidateDatabaseName) so a typo is a red border, not a round-trip 400.
-  const trimmedDb = form.database_name.trim();
-  const dbProblem = databaseNameProblem(trimmedDb);
-  const dbChanged = trimmedDb !== org.data?.database_name;
 
   const save = async () => {
     setMsg(null);
@@ -272,6 +286,10 @@ export function OrgDetail() {
               </Field>
               {dbProblem ? (
                 <p className="text-xs text-destructive">{dbProblem}</p>
+              ) : dbTaken ? (
+                <p className="text-xs text-destructive">
+                  The database name "{trimmedDb}" is already in use by another org.
+                </p>
               ) : (
                 dbChanged && (
                   <p className="flex items-start gap-2 text-xs text-warning">
@@ -324,7 +342,7 @@ export function OrgDetail() {
               )}
               <div className="flex items-center gap-3 pt-1">
                 <AdminGate>
-                  <Button size="sm" onClick={save} disabled={update.isPending || dbProblem !== null}>
+                  <Button size="sm" onClick={save} disabled={update.isPending || dbProblem !== null || dbTaken}>
                     <Save className="h-4 w-4" /> {update.isPending ? "Saving…" : "Save changes"}
                   </Button>
                 </AdminGate>

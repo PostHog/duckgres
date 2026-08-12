@@ -9,7 +9,7 @@ steps:
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       request:
-        database_name: scenario_full_suite_${run_id_token}
+        database_name: scenario-full-suite-${run_id_token}
         team_id: 1
         metadata_store:
           type: cnpg-shard

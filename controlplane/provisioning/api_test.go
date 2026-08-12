@@ -490,6 +490,95 @@ func TestProvisionRejectsInvalidDatabaseName(t *testing.T) {
 	}
 }
 
+// TestProvisionRejectsRenameToInvalidDatabaseName pins that the grandfather
+// carve-out only covers re-provisioning an existing org with its STORED name:
+// asking to rename it to an invalid value still 400s.
+func TestProvisionRejectsRenameToInvalidDatabaseName(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["existing"] = &configstore.Org{Name: "existing", DatabaseName: "tenant_alpha"} // grandfathered invalid
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "STILL BROKEN", "team_id": 1, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/existing/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := store.orgs["existing"].DatabaseName; got != "tenant_alpha" {
+		t.Errorf("DatabaseName = %q, want unchanged %q", got, "tenant_alpha")
+	}
+}
+
+// TestProvisionGrandfathersReprovisionWithStoredName pins the recovery loop:
+// an existing org whose stored database_name predates the DNS-label rule can
+// still deprovision→re-provision with that same name (the flow writes nothing
+// new to the column; rejecting it would orphan the org warehouse-less).
+func TestProvisionGrandfathersReprovisionWithStoredName(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["grandpa"] = &configstore.Org{Name: "grandpa", DatabaseName: "tenant_alpha"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "grandpa", TeamID: 7, SchemaName: "team_7", Enabled: true})
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "tenant_alpha", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/grandpa/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("re-provision with stored grandfathered name: status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if store.warehouses["grandpa"] == nil {
+		t.Fatal("expected warehouse to be created for grandfathered re-provision")
+	}
+}
+
+// TestCheckDatabaseNameReportsInvalidAsUnavailable: "available" must mean
+// "provisionable" — a name the provision endpoint would 400 reports
+// available=false with a reason, so pre-flights never green-light a 400.
+func TestCheckDatabaseNameReportsInvalidAsUnavailable(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/database-name/check?name=acme_inc", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body struct {
+		Available bool   `json:"available"`
+		Reason    string `json:"reason"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Available {
+		t.Error("available = true for a name provision would 400, want false")
+	}
+	if body.Reason == "" {
+		t.Error("reason empty, want the validation message")
+	}
+
+	// A valid, untaken name stays available.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/database-name/check?name=acme-inc", nil)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	var body2 struct {
+		Available bool `json:"available"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &body2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body2.Available {
+		t.Error("available = false for a valid untaken name, want true")
+	}
+}
+
 func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
