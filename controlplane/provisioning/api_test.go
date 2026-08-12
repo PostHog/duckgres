@@ -460,6 +460,36 @@ func TestProvisionRejectsAurora(t *testing.T) {
 	}
 }
 
+// TestProvisionRejectsInvalidDatabaseName locks in that database_name — the
+// org's managed hostname label, so an unroutable one leaves the tenant
+// reachable by no hostname — is rejected with 400 at the provisioning API
+// boundary, on every write surface.
+func TestProvisionRejectsInvalidDatabaseName(t *testing.T) {
+	cases := []string{"", "ACME INC", "acme.inc", "acme_inc", "Acme", "-acme"}
+	for _, db := range cases {
+		t.Run(db, func(t *testing.T) {
+			store := newFakeStore()
+			router := newTestRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"database_name": %q, "team_id": 1, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`, db))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("database_name %q: status = %d, want %d: %s", db, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if _, ok := store.orgs["new-org"]; ok {
+				t.Errorf("database_name %q: org should NOT have been created", db)
+			}
+			if store.warehouses["new-org"] != nil {
+				t.Errorf("database_name %q: warehouse should NOT have been created", db)
+			}
+		})
+	}
+}
+
 func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)

@@ -77,6 +77,10 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	}
 	org.MaxWorkers = updates.MaxWorkers
 	org.MaxVCPUs = updates.MaxVCPUs
+	// Mirrors gormAPIStore: "" = preserve, non-empty renames.
+	if updates.DatabaseName != "" {
+		org.DatabaseName = updates.DatabaseName
+	}
 	// Mirrors gormAPIStore: written unconditionally so "" clears (the handler
 	// presence-merge already preserved omitted fields).
 	org.DefaultWorkerCPU = updates.DefaultWorkerCPU
@@ -1934,7 +1938,7 @@ func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant_alpha","hostname_alias":"entirely-chief-wildcat","team_id":12345}`)
+	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant-alpha","hostname_alias":"entirely-chief-wildcat","team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -2065,6 +2069,109 @@ func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("64-char alias should be rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateOrgRejectsInvalidDatabaseName(t *testing.T) {
+	cases := []struct {
+		name string
+		db   string
+	}{
+		{"missing database_name", ""},
+		{"space", "acme inc"},
+		{"dot", "acme.inc"},
+		{"underscore", "acme_inc"},
+		{"uppercase", "Acme"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			router := newTestAPIRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"name":"acme","database_name":%q,"team_id":12345}`, tc.db))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("database_name %q: status = %d, want %d: %s", tc.db, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if _, ok := store.orgs["acme"]; ok {
+				t.Errorf("database_name %q: org should NOT have been created", tc.db)
+			}
+		})
+	}
+}
+
+func TestUpdateOrgRenamesDatabaseName(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "ACME INC", // pre-existing broken row: not a valid hostname label
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"database_name":"acme-inc"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "acme-inc" {
+		t.Errorf("DatabaseName = %q, want %q", got, "acme-inc")
+	}
+}
+
+func TestUpdateOrgRejectsInvalidDatabaseName(t *testing.T) {
+	cases := []string{"", "acme.inc", "acme inc", "Acme", "-acme"}
+	for _, db := range cases {
+		t.Run(db, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["tenant-alpha-id"] = &configstore.Org{
+				Name:         "tenant-alpha-id",
+				DatabaseName: "tenant-alpha",
+			}
+			router := newTestAPIRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"database_name":%q}`, db))
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("database_name %q: status = %d, want %d: %s", db, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "tenant-alpha" {
+				t.Errorf("database_name %q: DatabaseName = %q, want unchanged %q", db, got, "tenant-alpha")
+			}
+		})
+	}
+}
+
+func TestUpdateOrgWithoutDatabaseNameKeyPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "ACME INC", // broken pre-existing value: untouched edits must not force a rename
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"max_workers":4}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "ACME INC" {
+		t.Errorf("DatabaseName = %q, want preserved %q", got, "ACME INC")
 	}
 }
 

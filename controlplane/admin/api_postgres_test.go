@@ -104,6 +104,44 @@ func TestAdminAdmissionConfigMutationsSerializePostgres(t *testing.T) {
 	}
 }
 
+// TestAdminUpdateOrgRenamesDatabaseNamePostgres exercises the gorm store's
+// database_name threading against real Postgres: a non-empty value renames
+// (the break-glass fix for unroutable stored names), an empty value preserves
+// (absent key semantics — the handler presence-merge makes "" impossible from
+// the API, but the store contract is pinned here).
+func TestAdminUpdateOrgRenamesDatabaseNamePostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	if err := store.DB().Create(&configstore.Org{
+		Name:         "rename-org",
+		DatabaseName: "ACME INC", // grandfathered broken row: not a routable hostname label
+	}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+
+	// Empty = preserve.
+	preserved, found, err := apiStore.UpdateOrg("rename-org", configstore.Org{MaxWorkers: 1})
+	if err != nil || !found {
+		t.Fatalf("preserve update: found=%v err=%v", found, err)
+	}
+	if preserved.DatabaseName != "ACME INC" {
+		t.Fatalf("empty DatabaseName should preserve, got %q", preserved.DatabaseName)
+	}
+
+	// Non-empty = rename (and the unique index rejects squatters).
+	updated, found, err := apiStore.UpdateOrg("rename-org", configstore.Org{DatabaseName: "acme-inc"})
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if !found {
+		t.Fatal("renamed org was not found")
+	}
+	if updated.DatabaseName != "acme-inc" {
+		t.Fatalf("stored database_name = %q, want acme-inc", updated.DatabaseName)
+	}
+}
+
 func TestAdminUpdateOrgPersistsDataImportsTableNamingVersionPostgres(t *testing.T) {
 	store := newPostgresConfigStore(t)
 	if err := store.DB().Create(&configstore.Org{

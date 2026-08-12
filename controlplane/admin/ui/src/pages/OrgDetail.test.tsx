@@ -153,6 +153,38 @@ describe("Org detail", () => {
     expect(warehouseUpdate).toHaveBeenCalledWith({ metadata_proxy_enabled: next });
   });
 
+  it("sends database_name only when it changed", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    // Untouched: save carries no database_name (no spurious rename).
+    await user.click(screen.getByText("Save changes"));
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.not.objectContaining({ database_name: expect.anything() }));
+
+    orgUpdate.mockClear();
+
+    // Fixed a broken stored name: the rename rides the update.
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme-inc");
+    await user.click(screen.getByText("Save changes"));
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.objectContaining({ database_name: "acme-inc" }));
+  });
+
+  it("rejects a database name that is not a valid DNS label client-side", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme inc");
+
+    expect(screen.getByText(/single DNS label/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled();
+  });
+
   it("saves a changed data import table naming version", async () => {
     const user = userEvent.setup();
     HTMLElement.prototype.scrollIntoView = vi.fn();

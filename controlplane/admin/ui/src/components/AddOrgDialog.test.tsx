@@ -81,6 +81,20 @@ describe("AddOrgDialog", () => {
     expect(screen.getByRole("button", { name: /provision organization/i })).toBeDisabled();
   });
 
+  it("rejects a database name that is not a valid DNS label client-side", async () => {
+    const user = userEvent.setup();
+    renderDialog();
+
+    await user.type(screen.getByLabelText("Org id"), OK_UUID);
+    const dbInput = screen.getByLabelText("Database name");
+    await user.clear(dbInput);
+    await user.type(dbInput, "ACME INC");
+    await user.type(screen.getByLabelText("Team id"), "12345");
+
+    expect(screen.getByText(/single DNS label/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /provision organization/i })).toBeDisabled();
+  });
+
   it("blocks a database name that is already taken", async () => {
     const user = userEvent.setup();
     client.checkDatabaseName.mockResolvedValue({ name: OK_UUID, available: false });

@@ -62,6 +62,12 @@ export interface Org {
 
 // Editable subset of Org accepted by PUT /api/v1/orgs/:id.
 export interface OrgUpdate {
+  // database_name renames the org's database — and with it the managed
+  // hostname (<database_name>.<managed-suffix>) — which is exactly how an org
+  // whose stored name is not a routable DNS label gets fixed. Must be a valid
+  // single DNS label (server-enforced); the unique index still guards
+  // collisions.
+  database_name?: string;
   max_workers?: number;
   max_vcpus?: number;
   default_worker_cpu?: string;

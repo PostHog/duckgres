@@ -23,6 +23,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError } from "@/lib/api";
+import { databaseNameProblem } from "@/lib/databaseName";
 import { ducklingBroken, ducklingEntryFor, fmtTime } from "@/lib/format";
 import { ShardBadge } from "@/components/ShardBadge";
 import {
@@ -48,6 +49,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import type { DataImportsTableNamingVersion, ManagedWarehouse, OrgTeam, OrgUpdate } from "@/types/api";
 
 interface FormState {
+  database_name: string;
   max_workers: string;
   max_vcpus: string;
   default_worker_cpu: string;
@@ -59,6 +61,7 @@ interface FormState {
 }
 
 function orgToForm(o: {
+  database_name: string;
   max_workers: number;
   max_vcpus: number;
   default_worker_cpu: string;
@@ -69,6 +72,7 @@ function orgToForm(o: {
   data_imports_table_naming_version: DataImportsTableNamingVersion;
 }): FormState {
   return {
+    database_name: o.database_name,
     max_workers: String(o.max_workers),
     max_vcpus: String(o.max_vcpus),
     default_worker_cpu: o.default_worker_cpu,
@@ -118,8 +122,15 @@ export function OrgDetail() {
 
   const set = (k: keyof FormState, v: string) => setForm((f) => (f ? { ...f, [k]: v } : f));
 
+  // Client-side mirror of the server's DNS-label rule (configstore
+  // .ValidateDatabaseName) so a typo is a red border, not a round-trip 400.
+  const trimmedDb = form.database_name.trim();
+  const dbProblem = databaseNameProblem(trimmedDb);
+  const dbChanged = trimmedDb !== org.data?.database_name;
+
   const save = async () => {
     setMsg(null);
+    const trimmedDb = form.database_name.trim();
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
       max_vcpus: Number(form.max_vcpus) || 0,
@@ -130,6 +141,14 @@ export function OrgDetail() {
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
       data_imports_table_naming_version: form.data_imports_table_naming_version,
     };
+    // Only send database_name when it actually changed — renaming it also
+    // renames the org's managed hostname, so an untouched form never risks a
+    // spurious rename. The change reason: orgs whose stored name predates the
+    // DNS-label rule are unroutable (<name>.<suffix> isn't a valid hostname);
+    // this is the operator surface that fixes them without a SQL round-trip.
+    if (trimmedDb !== org.data?.database_name) {
+      body.database_name = trimmedDb;
+    }
     try {
       await update.mutateAsync(body);
       setMsg({ kind: "ok", text: "Saved." });
@@ -242,6 +261,31 @@ export function OrgDetail() {
                   />
                 </Field>
               </div>
+              <Field label="Database name (also the hostname label)">
+                <Input
+                  aria-label="Database name"
+                  value={form.database_name}
+                  placeholder="single DNS label, e.g. acme-prod"
+                  className={`font-mono text-xs ${dbProblem ? "border-destructive" : ""}`}
+                  onChange={(e) => set("database_name", e.target.value)}
+                />
+              </Field>
+              {dbProblem ? (
+                <p className="text-xs text-destructive">{dbProblem}</p>
+              ) : (
+                dbChanged && (
+                  <p className="flex items-start gap-2 text-xs text-warning">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      The database name is this org's hostname — clients reach it at
+                      <span className="font-mono"> {trimmedDb || "<name>"}.&lt;managed-suffix&gt;</span> and
+                      connect with dbname={trimmedDb || "<name>"}. Renaming moves the hostname and the
+                      dbname immediately; fix invalid stored names here, and coordinate the rename with
+                      the tenants' connection settings.
+                    </span>
+                  </p>
+                )
+              )}
               <Field label="Hostname alias (empty clears)">
                 <Input
                   value={form.hostname_alias}
@@ -280,7 +324,7 @@ export function OrgDetail() {
               )}
               <div className="flex items-center gap-3 pt-1">
                 <AdminGate>
-                  <Button size="sm" onClick={save} disabled={update.isPending}>
+                  <Button size="sm" onClick={save} disabled={update.isPending || dbProblem !== null}>
                     <Save className="h-4 w-4" /> {update.isPending ? "Saving…" : "Save changes"}
                   </Button>
                 </AdminGate>

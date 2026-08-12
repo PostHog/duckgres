@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/dialog";
 import { StateBadge } from "@/components/StateBadge";
 import { api } from "@/lib/api";
+import { databaseNameProblem } from "@/lib/databaseName";
 import { useDatabaseNameAvailable, useWarehouseStatus } from "@/hooks/useApi";
 import type { ProvisionWarehouseBody, ProvisionWarehouseResult } from "@/types/api";
 
@@ -91,6 +92,7 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
   const trimmedOrg = orgId.trim();
   const trimmedDb = databaseName.trim();
   const orgProblem = trimmedOrg === "" ? null : orgIdProblem(trimmedOrg);
+  const dbProblem = trimmedDb === "" ? null : databaseNameProblem(trimmedDb);
   const teamIdOk = /^\d+$/.test(teamId.trim()) && Number(teamId.trim()) > 0;
 
   // Prefill the database name with the org id (the django flow does the same)
@@ -136,9 +138,9 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
   const canSubmit = useMemo(() => {
     if (pending || result) return false;
     if (trimmedOrg === "" || orgProblem) return false;
-    if (trimmedDb === "" || dbTaken) return false;
+    if (trimmedDb === "" || dbProblem || dbTaken) return false;
     return teamIdOk;
-  }, [pending, result, trimmedOrg, orgProblem, trimmedDb, dbTaken, teamIdOk]);
+  }, [pending, result, trimmedOrg, orgProblem, trimmedDb, dbProblem, dbTaken, teamIdOk]);
 
   const submit = async () => {
     setError(null);
@@ -283,7 +285,8 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
                 className="font-mono text-xs"
               />
             </FieldRow>
-            {dbTaken && (
+            {dbProblem && <p className="text-xs text-destructive">{dbProblem}</p>}
+            {!dbProblem && dbTaken && (
               <p className="text-xs text-destructive">
                 The database name "{trimmedDb}" is already in use by another org.
               </p>

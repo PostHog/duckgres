@@ -283,8 +283,12 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if req.DatabaseName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "database_name is required"})
+	// database_name becomes the org's managed hostname label
+	// (<database_name>.<managed-suffix>) and the dbname clients connect with,
+	// so it must be a routable single DNS label at birth — a name with spaces
+	// or dots would store fine but leave the tenant reachable by no hostname.
+	if err := configstore.ValidateDatabaseName(req.DatabaseName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 

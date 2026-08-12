@@ -265,6 +265,16 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	if updates.DataImportsTableNamingVersion != "" {
 		fields["data_imports_table_naming_version"] = updates.DataImportsTableNamingVersion
 	}
+	// DatabaseName is "" = preserve (the column is NOT NULL and the handler's
+	// presence-merge has already preserved omitted fields, so a "" here can
+	// only mean "key absent"). A non-empty value renames the database — and
+	// with it the org's managed hostname (<database_name>.<managed-suffix>),
+	// which is exactly the operator surface for fixing orgs whose stored name
+	// is not a routable DNS label. The unique index still guards collisions;
+	// validation lives in the handler.
+	if updates.DatabaseName != "" {
+		fields["database_name"] = updates.DatabaseName
+	}
 	// HostnameAlias is *string: nil = preserve, "" = clear (NULL), "x" = set.
 	// NULL releases the unique-index slot so other orgs can take that alias.
 	if updates.HostnameAlias != nil {
@@ -891,6 +901,12 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	// database_name becomes the org's managed hostname label, so it must be a
+	// routable single DNS label at birth (same rule as the provisioning API).
+	if err := configstore.ValidateDatabaseName(org.DatabaseName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if req.TeamID <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id — every org must have at least one team)"})
 		return
@@ -967,6 +983,18 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		return
 	}
 	merged := *existing
+	// database_name is presence-aware like every other column: absent keeps the
+	// stored value; a present value must be a valid DNS label (it becomes the
+	// org's hostname). This is the break-glass edit surface for orgs whose
+	// stored name predates the DNS-label rule and is therefore unroutable —
+	// rename and the hostname works the moment the snapshot reloads.
+	if _, ok := fields["database_name"]; ok {
+		if err := configstore.ValidateDatabaseName(updates.DatabaseName); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		merged.DatabaseName = updates.DatabaseName
+	}
 	if _, ok := fields["max_workers"]; ok {
 		merged.MaxWorkers = updates.MaxWorkers
 	}
@@ -1002,6 +1030,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 			changes = append(changes, fmt.Sprintf("%s %v → %v", key, old, next))
 		}
 	}
+	addChange("database_name", existing.DatabaseName, merged.DatabaseName)
 	addChange("max_workers", existing.MaxWorkers, merged.MaxWorkers)
 	addChange("max_vcpus", existing.MaxVCPUs, merged.MaxVCPUs)
 	addChange("default_worker_cpu", orgStr(existing.DefaultWorkerCPU), orgStr(merged.DefaultWorkerCPU))
