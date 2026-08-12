@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -135,6 +135,19 @@ describe("Org detail", () => {
     hooks.useDucklingsMetadata.mockReturnValue(ok({ available: true, entries: [] }));
     hooks.useOrgReshards.mockReturnValue(ok([]));
     hooks.useOrgTeams.mockReturnValue(ok([]));
+  });
+
+  it("headline leads with the database name; the org id is a subline with a copy button", () => {
+    // The URL org id ("acme") is the subline; the readable database_name is
+    // the headline. (The headline falls back to the raw id while the org is
+    // still loading, covered by the loading branch of Header.)
+    hooks.useOrg.mockReturnValue(ok({ ...ORG, database_name: "posthog" }));
+    renderPage(false);
+
+    const headline = screen.getByRole("heading", { level: 1 });
+    expect(within(headline).getByText("posthog")).toBeInTheDocument();
+    expect(within(headline).getByText("acme")).toBeInTheDocument();
+    expect(within(headline).getByRole("button", { name: /copy acme/i })).toBeInTheDocument();
   });
 
   it.each([

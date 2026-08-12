@@ -11,6 +11,7 @@ import {
   type UseQueryOptions,
 } from "@tanstack/react-query";
 import { api, ApiError } from "@/lib/api";
+import { orgLabel } from "@/lib/format";
 import { POLL } from "@/lib/query";
 import { useRevealedCount } from "@/lib/logReplay";
 import { useIdentity } from "@/components/IdentityProvider";
@@ -126,6 +127,23 @@ export function useOrg(id: string | undefined) {
     queryFn: () => api.getOrg(id!),
     enabled: !!id,
   });
+}
+
+// useOrgLabels resolves an org id (org.name / team.org_id / worker.org / …)
+// to its human-readable label from orgLabel(): the database_name (preferred)
+// or hostname_alias. Returns a Map keyed by org id so a detail page where the
+// underlying list row only carries a bare org-id string can still render the
+// readable name. Falls back gracefully (no entry) when the org lookup 404s —
+// callers render the raw id in that case.
+export function useOrgLabels(): Map<string, string> {
+  const orgs = useOrgs();
+  return useMemo(() => {
+    const m = new Map<string, string>();
+    for (const o of orgs.data ?? []) {
+      m.set(o.name, orgLabel(o));
+    }
+    return m;
+  }, [orgs.data]);
 }
 
 export function useUpdateOrg(id: string) {

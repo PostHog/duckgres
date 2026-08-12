@@ -29,10 +29,12 @@ function Field({ label, value, mono }: { label: string; value: React.ReactNode; 
 // replica that owns the connection, so a 404 renders a clear notice.
 export function QueryDetailDialog({
   workerId,
+  orgLabels,
   onClose,
   onCancel,
 }: {
   workerId: number | null;
+  orgLabels?: Map<string, string>;
   onClose: () => void;
   onCancel: (workerId: number) => void;
 }) {
@@ -40,6 +42,7 @@ export function QueryDetailDialog({
   const d = detail.data;
   const notFound = detail.isError && (detail.error as { status?: number })?.status === 404;
   const pct = d && d.percentage > 0 ? d.percentage : undefined;
+  const orgLabel = d ? orgLabels?.get(d.org) : undefined;
 
   return (
     <Dialog open={workerId != null} onOpenChange={(o) => !o && onClose()}>
@@ -89,7 +92,7 @@ export function QueryDetailDialog({
             </div>
 
             <div className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3">
-              <Field label="Org" value={d.org} mono />
+              <Field label="Org" value={orgLabel && orgLabel !== d.org ? `${orgLabel} (${d.org})` : d.org} mono />
               <Field label="User" value={d.user || "—"} mono />
               <Field label="Protocol" value={d.protocol || "pg"} />
               <Field label="Worker" value={`#${d.worker_id}`} mono />

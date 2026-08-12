@@ -22,23 +22,12 @@ import { useCancelSession, useKillUserSessions, useOrgs, useQueries, useSessions
 import { fmtAge, fmtDurationMs, fmtInt, fmtTime, orgLabel } from "@/lib/format";
 import { idleInTransaction, isIdleSession, sessionStateLabel } from "@/lib/session";
 import { compareByStarted, compareByWorker } from "@/lib/liveSort";
+import { OrgRef } from "@/components/OrgRef";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
 
-function OrgIdentity({ id, label }: { id: string; label?: string }) {
-  if (!label || label === id) {
-    return <span className="font-mono text-xs">{id}</span>;
-  }
-  return (
-    <span className="block min-w-0">
-      <span className="block truncate text-xs font-medium text-foreground" title={label}>
-        {label}
-      </span>
-      <span className="block truncate font-mono text-[11px] text-muted-foreground" title={id}>
-        {id}
-      </span>
-    </span>
-  );
-}
+// OrgRef is the shared readable-org cell (components/OrgRef). The local copy
+// that used to live here ("OrgIdentity") was replaced so every page renders
+// an org reference the same way.
 
 export function Live() {
   const queries = useQueries();
@@ -187,7 +176,7 @@ export function Live() {
                       >
                         <TableCell className="font-mono text-xs">{q.pid}</TableCell>
                         <TableCell>
-                          <OrgIdentity id={q.org} label={orgLabels.get(q.org)} />
+                          <OrgRef id={q.org} label={orgLabels.get(q.org)} />
                         </TableCell>
                         <TableCell className="font-mono text-xs">{q.user || "—"}</TableCell>
                         <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
@@ -288,7 +277,7 @@ export function Live() {
                     <TableRow key={`${s.pid}-${s.worker_id}`} className="[&>td]:py-1.5">
                       <TableCell className="font-mono text-xs">{s.pid}</TableCell>
                       <TableCell>
-                        <OrgIdentity id={s.org} label={orgLabels.get(s.org)} />
+                        <OrgRef id={s.org} label={orgLabels.get(s.org)} />
                       </TableCell>
                       <TableCell className="font-mono text-xs">{s.user || "—"}</TableCell>
                       <TableCell className="font-mono text-xs">#{s.worker_id}</TableCell>
@@ -318,6 +307,7 @@ export function Live() {
       </PageBody>
       <QueryDetailDialog
         workerId={detailWid}
+        orgLabels={orgLabels}
         onClose={() => setDetailWid(null)}
         onCancel={(workerId) => cancel.mutate(workerId)}
       />

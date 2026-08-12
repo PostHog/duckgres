@@ -70,7 +70,14 @@ describe("Org teams page", () => {
     vi.clearAllMocks();
     identity.useIdentity.mockReturnValue({ isAdmin: true, me: { email: "a@posthog.com", role: "admin", source: "sso" } });
     hooks.useAllOrgTeams.mockReturnValue(ok(TEAMS));
-    hooks.useOrgs.mockReturnValue(ok([{ name: "acme" }, { name: "solo" }]));
+    // Orgs carry readable database_names; 'acme' id ≠ its db name 'posthog',
+    // 'solo' has no distinct readable name (falls back to the id).
+    hooks.useOrgs.mockReturnValue(
+      ok([
+        { name: "acme", database_name: "posthog", hostname_alias: null },
+        { name: "solo", database_name: "solo", hostname_alias: null },
+      ]),
+    );
     hooks.useCreateOrgTeam.mockReturnValue(mut());
     hooks.useUpdateOrgTeam.mockReturnValue(mut());
     hooks.useDeleteOrgTeam.mockReturnValue(mut());
@@ -79,7 +86,10 @@ describe("Org teams page", () => {
   it("lists every team with schema, enabled and backfill state", () => {
     renderPage();
 
-    expect(screen.getAllByText("acme")).toHaveLength(2);
+    // The Org column leads with the readable database name; the org id sits
+    // under it for orgs whose id differs from the db name.
+    expect(screen.getAllByText("posthog")).toHaveLength(2);
+    expect(screen.getAllByText("acme").length).toBeGreaterThan(0);
     expect(screen.getByText("solo")).toBeInTheDocument();
     expect(screen.getByText("team_1")).toBeInTheDocument();
     expect(screen.getByText("team_2")).toBeInTheDocument();
@@ -94,6 +104,17 @@ describe("Org teams page", () => {
     expect(screen.getByText("none")).toBeInTheDocument();
     // Admin affordance present.
     expect(screen.getByRole("button", { name: /add team/i })).toBeInTheDocument();
+  });
+
+  it("the Org cell is not a link and clicking a row opens the team", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    // Row click opens the team's edit dialog (the Org cell is deliberately
+    // not a link to the org page — the team's own dialog is the action).
+    await user.click(screen.getAllByText("posthog")[0]);
+    expect(await screen.findByText(/operator repair tool/i)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /posthog|acme|solo/i })).not.toBeInTheDocument();
   });
 
   it("refuses deleting an org's last team up front", async () => {

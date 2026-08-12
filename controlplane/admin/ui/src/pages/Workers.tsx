@@ -8,7 +8,8 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
-import { useFleet, useWorkers } from "@/hooks/useApi";
+import { useFleet, useOrgLabels, useWorkers } from "@/hooks/useApi";
+import { OrgRef } from "@/components/OrgRef";
 import { fmtBytes, fmtDuration, fmtInt } from "@/lib/format";
 import type { WorkerStatus } from "@/types/api";
 
@@ -18,6 +19,7 @@ const STATE_ORDER = ["spawning", "idle", "reserved", "activating", "hot", "hot_i
 export function Workers() {
   const fleet = useFleet();
   const workers = useWorkers();
+  const orgLabels = useOrgLabels();
   const [filter, setFilter] = useState("");
 
   const fleetRows = fleet.data ?? [];
@@ -49,7 +51,7 @@ export function Workers() {
       {
         accessorKey: "org",
         header: "Org",
-        cell: ({ getValue }) => <span className="font-mono text-xs">{String(getValue())}</span>,
+        cell: ({ row }) => <OrgRef id={row.original.org} label={orgLabels.get(row.original.org)} />,
       },
       {
         accessorKey: "status",
@@ -93,7 +95,7 @@ export function Workers() {
         },
       },
     ],
-    [],
+    [orgLabels],
   );
 
   return (

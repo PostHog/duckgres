@@ -24,7 +24,8 @@ import {
 } from "@/components/ui/dialog";
 import { ApiError } from "@/lib/api";
 import { databaseNameProblem } from "@/lib/databaseName";
-import { ducklingBroken, ducklingEntryFor, fmtTime } from "@/lib/format";
+import { ducklingBroken, ducklingEntryFor, fmtTime, orgLabel } from "@/lib/format";
+import { CopyButton } from "@/components/CopyButton";
 import { ShardBadge } from "@/components/ShardBadge";
 import {
   useDatabaseNameAvailable,
@@ -47,7 +48,7 @@ import {
   LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { DataImportsTableNamingVersion, ManagedWarehouse, OrgTeam, OrgUpdate } from "@/types/api";
+import type { DataImportsTableNamingVersion, ManagedWarehouse, Org, OrgTeam, OrgUpdate } from "@/types/api";
 
 interface FormState {
   database_name: string;
@@ -124,7 +125,7 @@ export function OrgDetail() {
   if (org.isLoading || !form) {
     return (
       <>
-        <Header id={id} />
+        <Header id={id} org={org.data} />
         <PageBody>{org.isError ? <ErrorState error={org.error} /> : <LoadingState />}</PageBody>
       </>
     );
@@ -132,7 +133,7 @@ export function OrgDetail() {
   if (org.isError) {
     return (
       <>
-        <Header id={id} />
+        <Header id={id} org={org.data} />
         <PageBody>
           <ErrorState error={org.error} onRetry={() => org.refetch()} />
         </PageBody>
@@ -199,6 +200,7 @@ export function OrgDetail() {
     <>
       <Header
         id={id}
+        org={org.data}
         actions={
           <AdminGate>
             {orgHasWarehouse ? (
@@ -406,7 +408,12 @@ export function OrgDetail() {
   );
 }
 
-function Header({ id, actions }: { id: string; actions?: React.ReactNode }) {
+function Header({ id, org, actions }: { id: string; org?: Org; actions?: React.ReactNode }) {
+  // Headline leads with the human-readable name (database_name, else alias)
+  // — that is what an operator recognizes at a glance ("Posthog") — and drops
+  // the opaque org id (a UUID for most tenants) to a subline with a copy
+  // button for when it is actually needed (config store, API, k8s labels).
+  const label = org ? orgLabel(org) : id;
   return (
     <PageHeader
       title={
@@ -414,7 +421,15 @@ function Header({ id, actions }: { id: string; actions?: React.ReactNode }) {
           <Link to="/orgs" className="text-muted-foreground hover:text-foreground">
             <ArrowLeft className="h-4 w-4" />
           </Link>
-          <span className="font-mono">{id}</span>
+          <span className="flex min-w-0 flex-col">
+            <span className="truncate font-medium">{label}</span>
+            <span className="flex items-center gap-1.5">
+              <span className="truncate font-mono text-xs font-normal text-muted-foreground" title={id}>
+                {id}
+              </span>
+              <CopyButton value={id} />
+            </span>
+          </span>
         </span>
       }
       description="Per-org configuration and managed warehouse."
@@ -771,6 +786,8 @@ function ReshardHistory({ orgId }: { orgId: string }) {
 // OrgTeamsCard lists the org's duckgres_org_teams rows with full CRUD.
 function OrgTeamsCard({ orgId }: { orgId: string }) {
   const teams = useOrgTeams(orgId);
+  const org = useOrg(orgId);
+  const orgName = org.data ? orgLabel(org.data) : undefined;
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<OrgTeam | null>(null);
   const [deleting, setDeleting] = useState<OrgTeam | null>(null);
@@ -867,10 +884,10 @@ function OrgTeamsCard({ orgId }: { orgId: string }) {
         )}
       </CardContent>
 
-      <CreateTeamDialog open={creating} onClose={() => setCreating(false)} org={orgId} />
-      {editing && <EditTeamDialog team={editing} onClose={() => setEditing(null)} />}
+      <CreateTeamDialog open={creating} onClose={() => setCreating(false)} org={orgId} orgLabel={orgName} />
+      {editing && <EditTeamDialog team={editing} orgLabel={orgName} onClose={() => setEditing(null)} />}
       {deleting && (
-        <DeleteTeamDialog team={deleting} teamCount={rows.length} onClose={() => setDeleting(null)} />
+        <DeleteTeamDialog team={deleting} teamCount={rows.length} orgLabel={orgName} onClose={() => setDeleting(null)} />
       )}
     </Card>
   );
