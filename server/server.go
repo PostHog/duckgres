@@ -263,7 +263,7 @@ type Config struct {
 	MemoryLimit string
 
 	// Threads is the DuckDB threads per session.
-	// If zero, defaults to runtime.NumCPU().
+	// If zero, defaults to 2.5x runtime.NumCPU(), rounded up.
 	Threads int
 
 	// MemoryBudget is the total memory available for all DuckDB sessions (e.g., "24GB").
@@ -951,7 +951,7 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	// Set DuckDB threads
 	threads := cfg.Threads
 	if threads == 0 {
-		threads = runtime.NumCPU() * 2
+		threads = DefaultDuckDBThreads(int64(runtime.NumCPU()) * 1000)
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET threads = %d", threads)); err != nil {
 		slog.Warn("Failed to set DuckDB threads.", "threads", threads, "error", err)

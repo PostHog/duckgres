@@ -243,8 +243,9 @@ DML with RETURNING is rejected at extended-query Describe time with SQLSTATE `0A
 In the **control-plane remote/k8s backend** a worker pod serves **exactly one
 client query session at a time**. This is deliberate: `workerDuckDBLimits`
 (`controlplane/control.go`) gives the single session ~75% of the *whole pod's*
-RAM + all CPU cores — it does NOT divide by session count. Two sessions on one
-pod would each believe they own 75% → ~150% overcommit → nondeterministic OOM /
+RAM plus 2.5 DuckDB threads per requested CPU, rounded up. It does NOT divide
+by session count. Two sessions on one pod would each believe they own 75% →
+~150% overcommit → nondeterministic OOM /
 a heavy query killed by a co-resident one. Do not break the following:
 
 - **One session per worker is enforced, not emergent.** The CP spawns remote

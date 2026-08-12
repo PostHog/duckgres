@@ -140,8 +140,9 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 						},
 						{
 							// One client query session per worker pod: the pod's full
-							// resources (workerDuckDBLimits gives the session ~75% of pod
-							// RAM + all cores) belong to a single query, so queries never
+							// resources (workerDuckDBLimits gives the session ~75% of pod RAM
+							// + 2.5 DuckDB threads per requested CPU) belong to a single query,
+							// so queries never
 							// contend and a heavy query can't be OOM'd by a co-resident
 							// one. The CP scheduler (OrgReservedPool) already never
 							// co-assigns; this is the hard worker-side guarantee — a 2nd
@@ -171,8 +172,8 @@ func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, p
 	// reads the NODE's /proc/meminfo — so all pre-session work (DuckLake
 	// ATTACH, activation, warmup, controlDB) runs with a memory_limit sized to
 	// the node, not the pod cgroup. Pass the pod-derived limit (same 75% the
-	// per-session SET uses, via duckdbMemoryLimitForPodMemory) and the pod's
-	// CPU count so the base DB is correctly bounded from process start.
+	// per-session SET uses, via duckdbMemoryLimitForPodMemory) and the CPU-derived
+	// thread count so the base DB is correctly bounded from process start.
 	// GOMEMLIMIT (read by the Go runtime directly) gives the Go side a soft
 	// ceiling at 1/8 of the pod so GC pushes back before the cgroup OOM-kills;
 	// DuckDB's buffer manager is unaffected (C allocations are untracked by Go).
@@ -675,9 +676,8 @@ func workerMemoryHygieneEnv(res corev1.ResourceRequirements) []corev1.EnvVar {
 		}
 	}
 	if cpu, ok := res.Requests[corev1.ResourceCPU]; ok {
-		// Value() rounds fractional cores up, so a "500m" worker gets 1 thread.
-		if threads := cpu.Value(); threads > 0 {
-			env = append(env, corev1.EnvVar{Name: "DUCKGRES_THREADS", Value: strconv.FormatInt(threads, 10)})
+		if threads := server.DefaultDuckDBThreads(cpu.MilliValue()); threads > 0 {
+			env = append(env, corev1.EnvVar{Name: "DUCKGRES_THREADS", Value: strconv.Itoa(threads)})
 		}
 	}
 	return env

@@ -155,9 +155,10 @@ func (tr *OrgRouter) createOrgStackWhileMutationHeld(tc *configstore.OrgConfig) 
 	activator.setMigrating = tr.SetMigrating
 	activator.clearMigrating = tr.ClearMigrating
 	pool.activateReservedWorker = activator.ActivateReservedWorker
-	// In K8s mode, DuckDB auto-detects memory from the container's cgroup limits.
-	// Pass 0/false to disable budget-based rebalancing.
-	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
+	// In K8s mode, normal client sessions supply pod-derived limits directly.
+	// Keep the default worker's thread count here as the fallback for internal
+	// sessions (such as admin impersonation) that do not carry a profile.
+	rebalancer := NewMemoryRebalancer(0, tr.defaultWorkerDuckDBThreads(), nil, false)
 	sessions := NewOrgSessionManager(pool, rebalancer, tc.Name)
 	if tr.userSecrets != nil {
 		sessions.SetUserSecretLoader(tr.userSecrets.SessionSecretLoader(tc.Name))
@@ -219,6 +220,11 @@ func (tr *OrgRouter) createOrgStackWhileMutationHeld(tc *configstore.OrgConfig) 
 
 	slog.Info("Org stack created.", "org", tc.Name, "max_workers", stack.Config.MaxWorkers)
 	return stack, nil
+}
+
+func (tr *OrgRouter) defaultWorkerDuckDBThreads() int {
+	cpuRequest := firstNonEmpty(tr.baseCfg.WorkerCPURequest, defaultWorkerCPU)
+	return duckDBThreadsForK8sCPU(cpuRequest)
 }
 
 // beginOrgStackOperation registers a create/destroy operation while holding the

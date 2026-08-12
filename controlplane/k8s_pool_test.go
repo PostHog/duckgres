@@ -2966,8 +2966,8 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	if got := envByName["DUCKGRES_MEMORY_LIMIT"]; got != "12GB" {
 		t.Fatalf("expected DUCKGRES_MEMORY_LIMIT=12GB (75%% of 16Gi pod), got %q", got)
 	}
-	if got := envByName["DUCKGRES_THREADS"]; got != "8" {
-		t.Fatalf("expected DUCKGRES_THREADS=8 (pod CPU request), got %q", got)
+	if got := envByName["DUCKGRES_THREADS"]; got != "20" {
+		t.Fatalf("expected DUCKGRES_THREADS=20 (2.5x the 8 CPU pod request), got %q", got)
 	}
 	if got := envByName["GOMEMLIMIT"]; got != "2048MiB" {
 		t.Fatalf("expected GOMEMLIMIT=2048MiB (1/8 of 16Gi pod), got %q", got)
@@ -4558,11 +4558,11 @@ func TestWorkerMemoryHygieneEnv(t *testing.T) {
 		expected map[string]string
 	}{
 		{"prod-like 15/120Gi", mk("15", "120Gi"), map[string]string{
-			"DUCKGRES_MEMORY_LIMIT": "90GB", "GOMEMLIMIT": "15360MiB", "DUCKGRES_THREADS": "15"}},
+			"DUCKGRES_MEMORY_LIMIT": "90GB", "GOMEMLIMIT": "15360MiB", "DUCKGRES_THREADS": "38"}},
 		{"dev 15/64Gi", mk("15", "64Gi"), map[string]string{
-			"DUCKGRES_MEMORY_LIMIT": "48GB", "GOMEMLIMIT": "8192MiB", "DUCKGRES_THREADS": "15"}},
+			"DUCKGRES_MEMORY_LIMIT": "48GB", "GOMEMLIMIT": "8192MiB", "DUCKGRES_THREADS": "38"}},
 		{"sub-GB pod formats MB", mk("500m", "512Mi"), map[string]string{
-			"DUCKGRES_MEMORY_LIMIT": "384MB", "GOMEMLIMIT": "64MiB", "DUCKGRES_THREADS": "1"}},
+			"DUCKGRES_MEMORY_LIMIT": "384MB", "GOMEMLIMIT": "64MiB", "DUCKGRES_THREADS": "2"}},
 		{"no requests -> no env", corev1.ResourceRequirements{}, map[string]string{}},
 	}
 	for _, tc := range cases {
