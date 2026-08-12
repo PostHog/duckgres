@@ -14,8 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -293,11 +295,16 @@ var hopByHop = map[string]bool{
 // before the origin request so it cannot affect S3 or a SigV4 request.
 const cachePassthroughHeader = "X-Duckgres-Cache-Passthrough"
 
+func isInternalPropagationHeader(header string) bool {
+	return strings.EqualFold(header, "traceparent") || strings.EqualFold(header, "tracestate")
+}
+
 // HandleProxy handles forward HTTP proxy requests from DuckDB httpfs.
 // Expects absolute-form URIs (scheme + host + path in the request-line).
 func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	inflightRequests.Inc()
 	defer inflightRequests.Dec()
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
 
 	// HTTPS via CONNECT tunnel — we can't cache encrypted traffic, but we must
 	// still tunnel it so DuckDB can reach external HTTPS sources (e.g.
@@ -338,9 +345,8 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Legacy exact-range path (also the fallback for non-absolute ranges).
 	cacheKey := CacheKey(r.URL.String(), rangeHeader)
 
-	// Root span for this cacheable GET. DuckDB httpfs sends no traceparent, so
-	// this starts a fresh trace (service.name=duckgres-cache-proxy). Thread its
-	// context into r so the origin/peer fetch spans nest underneath.
+	// Requests without a propagated parent still start a standalone trace.
+	// Thread the cache request span context into origin/peer work below.
 	ctx, span := proxyTracer.Start(r.Context(), "cache.get", trace.WithAttributes(requestSpanAttrs(r)...))
 	defer span.End()
 	span.SetAttributes(attribute.String("duckgres.cache.key", cacheKey))
@@ -552,7 +558,7 @@ func (p *CacheProxy) fetchOriginOnce(cacheKey string, r *http.Request) (int64, s
 		return 0, "", err
 	}
 	for k, vv := range r.Header {
-		if hopByHop[strings.ToLower(k)] {
+		if hopByHop[strings.ToLower(k)] || isInternalPropagationHeader(k) {
 			continue
 		}
 		for _, v := range vv {
@@ -800,7 +806,7 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	req.TransferEncoding = r.TransferEncoding
 	req.Trailer = r.Trailer
 	for k, vv := range r.Header {
-		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, cachePassthroughHeader) {
+		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, cachePassthroughHeader) || isInternalPropagationHeader(k) {
 			continue
 		}
 		for _, v := range vv {

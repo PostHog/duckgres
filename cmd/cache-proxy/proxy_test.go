@@ -126,15 +126,22 @@ func TestHandleProxyGETMissThenHit(t *testing.T) {
 	proxy := newTestProxy(t)
 
 	var originCalls int32
+	var traceHeadersReachedOrigin atomic.Bool
 	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&originCalls, 1)
+		traceHeadersReachedOrigin.Store(r.Header.Get("traceparent") != "" || r.Header.Get("tracestate") != "")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("hello-parquet-bytes"))
 	})
 
 	// First request: cache miss → origin fetch → cached.
-	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", http.Header{"Range": []string{"bytes=0-18"}})
+	headers := http.Header{
+		"Range":       []string{"bytes=0-18"},
+		"traceparent": []string{"00-00000000000000000000000000000001-0000000000000002-01"},
+		"tracestate":  []string{"vendor=value"},
+	}
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", headers)
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("miss: status = %d, want 206", rec.Code)
 	}
@@ -144,9 +151,12 @@ func TestHandleProxyGETMissThenHit(t *testing.T) {
 	if atomic.LoadInt32(&originCalls) != 1 {
 		t.Errorf("origin calls = %d, want 1 on miss", originCalls)
 	}
+	if traceHeadersReachedOrigin.Load() {
+		t.Fatal("trace propagation headers reached cached origin fetch")
+	}
 
 	// Second request for the same URL + Range: cache hit, no extra origin call.
-	rec = doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", http.Header{"Range": []string{"bytes=0-18"}})
+	rec = doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", headers)
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("hit: status = %d, want 206", rec.Code)
 	}
@@ -159,13 +169,19 @@ func TestHandleProxyPassthroughGETSkipsCacheAndStripsMarker(t *testing.T) {
 	proxy := newTestProxy(t)
 	var originCalls atomic.Int32
 	var markerReachedOrigin atomic.Bool
+	var traceHeadersReachedOrigin atomic.Bool
 	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		originCalls.Add(1)
 		markerReachedOrigin.Store(r.Header.Get(cachePassthroughHeader) != "")
+		traceHeadersReachedOrigin.Store(r.Header.Get("traceparent") != "" || r.Header.Get("tracestate") != "")
 		_, _ = w.Write([]byte("uncached"))
 	})
 
-	headers := http.Header{cachePassthroughHeader: []string{"true"}}
+	headers := http.Header{
+		cachePassthroughHeader: []string{"true"},
+		"traceparent":          []string{"00-00000000000000000000000000000001-0000000000000002-01"},
+		"tracestate":           []string{"vendor=value"},
+	}
 	for range 2 {
 		rec := doForwardProxyRequest(proxy, http.MethodGet, originURL+"/bucket/file.parquet", headers)
 		if rec.Code != http.StatusOK || rec.Body.String() != "uncached" {
@@ -177,6 +193,9 @@ func TestHandleProxyPassthroughGETSkipsCacheAndStripsMarker(t *testing.T) {
 	}
 	if markerReachedOrigin.Load() {
 		t.Fatal("passthrough marker reached origin")
+	}
+	if traceHeadersReachedOrigin.Load() {
+		t.Fatal("trace propagation headers reached origin")
 	}
 	if _, _, ok := proxy.store.Open(CacheKey(originURL+"/bucket/file.parquet", "")); ok {
 		t.Fatal("passthrough request populated the cache")

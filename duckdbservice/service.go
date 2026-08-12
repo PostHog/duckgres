@@ -130,6 +130,13 @@ type SessionPool struct {
 	instance instanceHealth
 }
 
+func (p *SessionPool) setActiveCacheProxyContext(ctx context.Context) func() {
+	if p.cacheRouter == nil {
+		return func() {}
+	}
+	return p.cacheRouter.setActiveContext(ctx)
+}
+
 func (p *SessionPool) currentS3CacheModeLocked() transform.S3CacheMode {
 	if p.s3CacheMode == "" {
 		return transform.S3CacheOn

@@ -104,7 +104,7 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 		return err
 	}
 	for k, vv := range r.Header {
-		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, "Range") {
+		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, "Range") || isInternalPropagationHeader(k) {
 			continue
 		}
 		for _, v := range vv {
