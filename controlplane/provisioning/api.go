@@ -118,7 +118,19 @@ type PeerFanout interface {
 // freshly rotated credential auths on whichever CP the client's pgwire
 // connection actually lands on, not just the replica that served the mint.
 func RegisterAPI(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout) {
-	h := &handler{store: store, bucketSuffix: bucketSuffix, peerFanout: peerFanout}
+	RegisterAPIWithIngressSuffix(r, store, tenantStore, bucketSuffix, peerFanout, "")
+}
+
+// RegisterAPIWithIngressSuffix is RegisterAPI plus an explicit managed tenant
+// ingress DNS suffix (leading dot, e.g. ".dw.us.postwh.com") used to build
+// connect.host in the service-credential response as <org-id><suffix>. The
+// caller must pass the CP's configured managed-ingress suffix — the same value
+// the pgwire TLS server_name pins (the wildcard cert is *<suffix> and the SNI
+// router resolves the single-label prefix as the org) — so the host the mint
+// response hands back is the ingress the credential authenticates against. An
+// empty ingressSuffix falls back to DefaultManagedIngressSuffix.
+func RegisterAPIWithIngressSuffix(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout, ingressSuffix string) {
+	h := &handler{store: store, bucketSuffix: bucketSuffix, peerFanout: peerFanout, ingressSuffix: ingressSuffix}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
@@ -164,6 +176,12 @@ type handler struct {
 	// service-credentials mint uses it to fan a snapshot reload out to peer
 	// replicas after rotating a credential.
 	peerFanout PeerFanout
+	// ingressSuffix is the managed tenant DNS suffix (leading dot) joined onto
+	// the org ID to build connect.host in the service-credential response. It
+	// must match the TLS server_name the CP pins for managed tenants so the
+	// host handed back is the ingress the credential auths against. Empty ⇒
+	// managedIngressSuffix() falls back to DefaultManagedIngressSuffix.
+	ingressSuffix string
 }
 
 // warehouseStatusResponse is the public-facing view of warehouse state.

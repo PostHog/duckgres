@@ -656,7 +656,17 @@ func SetupMultiTenant(
 	// the mint's peer-reload fan-out (same aggregation plumbing, same nil-when-
 	// single-CP semantics).
 	gormStore := provisioning.NewGormStore(store)
-	provisioning.RegisterAPI(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher)
+	// Wire the service-credential connect block's ingress host to the same
+	// managed hostname suffix the pgwire TLS server_name pins (the CP's first
+	// configured ManagedHostnameSuffixes entry), so the mint response tells the
+	// caller the exact ingress the credential authenticates against. When the
+	// CP has no managed suffix configured, provisioning falls back to its
+	// DefaultManagedIngressSuffix.
+	var ingressSuffix string
+	if len(cfg.ManagedHostnameSuffixes) > 0 {
+		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
+	}
+	provisioning.RegisterAPIWithIngressSuffix(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
