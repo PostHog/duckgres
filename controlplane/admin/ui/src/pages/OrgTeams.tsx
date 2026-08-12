@@ -1,7 +1,6 @@
 import { useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Layers, Pencil, Plus, Search, Trash2 } from "lucide-react";
-import { Link } from "react-router-dom";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { DataTable } from "@/components/DataTable";
 import { Card } from "@/components/ui/card";
@@ -18,8 +17,9 @@ import {
   LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
+import { OrgRef } from "@/components/OrgRef";
 import { useAllOrgTeams, useOrgs } from "@/hooks/useApi";
-import { fmtTime } from "@/lib/format";
+import { fmtTime, orgLabel } from "@/lib/format";
 import type { OrgTeam } from "@/types/api";
 
 export function OrgTeams() {
@@ -39,23 +39,26 @@ export function OrgTeams() {
     return m;
   }, [teams.data]);
 
+  // Readable org names keyed by org id. Shown instead of the raw id — an
+  // operator scans for "Posthog", not a UUID. The id stays visible under
+  // the label and via the copy button.
+  const orgLabels = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const o of orgs.data ?? []) {
+      m.set(o.name, orgLabel(o));
+    }
+    return m;
+  }, [orgs.data]);
+
   const columns = useMemo<ColumnDef<OrgTeam, any>[]>(
     () => [
       {
         accessorKey: "org_id",
         header: "Org",
-        cell: ({ getValue }) => {
-          const org = String(getValue());
-          return (
-            <Link
-              to={`/orgs/${encodeURIComponent(org)}`}
-              className="font-mono text-xs font-medium hover:underline"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {org}
-            </Link>
-          );
-        },
+        // Human-readable database name first; the org id sits under it.
+        // Deliberately NOT a link: click-through opens the team edit dialog
+        // (row click), matching the rest of this page's action model.
+        cell: ({ row }) => <OrgRef id={row.original.org_id} label={orgLabels.get(row.original.org_id)} />,
       },
       {
         accessorKey: "team_id",
@@ -99,7 +102,7 @@ export function OrgTeams() {
         header: "",
         enableSorting: false,
         cell: ({ row }) => (
-          <div className="-my-1 flex justify-end gap-1">
+          <div className="-my-1 flex justify-end gap-1" onClick={(e) => e.stopPropagation()}>
             <AdminGate>
               <Button
                 variant="ghost"
@@ -126,7 +129,7 @@ export function OrgTeams() {
         ),
       },
     ],
-    [],
+    [orgLabels],
   );
 
   return (
@@ -165,6 +168,9 @@ export function OrgTeams() {
               columns={columns}
               globalFilter={filter}
               onGlobalFilterChange={setFilter}
+              // Click anywhere on a team row opens it (the edit dialog) —
+              // the Org cell is deliberately not a link to the org page.
+              onRowClick={(team) => setEditing(team)}
               initialSorting={[
                 { id: "org_id", desc: false },
                 { id: "team_id", desc: false },
@@ -184,13 +190,20 @@ export function OrgTeams() {
       <CreateTeamDialog
         open={creating}
         onClose={() => setCreating(false)}
-        orgs={(orgs.data ?? []).map((o) => o.name)}
+        orgs={(orgs.data ?? []).map((o) => ({ name: o.name, label: orgLabel(o) }))}
       />
-      {editing && <EditTeamDialog team={editing} onClose={() => setEditing(null)} />}
+      {editing && (
+        <EditTeamDialog
+          team={editing}
+          orgLabel={orgLabels.get(editing.org_id)}
+          onClose={() => setEditing(null)}
+        />
+      )}
       {deleting && (
         <DeleteTeamDialog
           team={deleting}
           teamCount={countByOrg.get(deleting.org_id) ?? 1}
+          orgLabel={orgLabels.get(deleting.org_id)}
           onClose={() => setDeleting(null)}
         />
       )}

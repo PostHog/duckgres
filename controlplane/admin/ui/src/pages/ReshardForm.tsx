@@ -25,7 +25,8 @@ import {
 } from "@/components/ui/select";
 import { ducklingEntryFor } from "@/lib/format";
 import { classifySecretName } from "@/lib/reshard";
-import { useDucklingsMetadata, useReshardTargets, useStartReshard, useWarehouse } from "@/hooks/useApi";
+import { useDucklingsMetadata, useOrg, useReshardTargets, useStartReshard, useWarehouse } from "@/hooks/useApi";
+import { orgLabel } from "@/lib/format";
 import type { StartReshardBody } from "@/types/api";
 
 // Reshard start form: pick a target metadata store for the org, confirm, run.
@@ -37,6 +38,8 @@ export function ReshardForm() {
   const warehouse = useWarehouse(id);
   const metadata = useDucklingsMetadata();
   const start = useStartReshard(id);
+  const org = useOrg(id);
+  const displayName = org.data ? orgLabel(org.data) : id;
 
   const [targetType, setTargetType] = useState<"cnpg-shard" | "external">("cnpg-shard");
   const [shard, setShard] = useState("");
@@ -120,7 +123,7 @@ export function ReshardForm() {
   return (
     <>
       <PageHeader
-        title={`Reshard ${id}`}
+        title={`Reshard ${displayName}`}
         actions={
           <Button variant="outline" size="sm" asChild>
             <Link to={`/orgs/${encodeURIComponent(id)}`}>
@@ -374,7 +377,7 @@ export function ReshardForm() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>
-              Reshard "{id}": {sourceLabel} → {targetLabel}?
+              Reshard "{displayName}": {sourceLabel} → {targetLabel}?
             </DialogTitle>
             <DialogDescription>
               The org goes into maintenance mode: new connections are refused, existing sessions

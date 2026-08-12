@@ -18,7 +18,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { fmtBytes, fmtInt, fmtTime } from "@/lib/format";
-import { useCancelReshard, useReshard, useReshardLog } from "@/hooks/useApi";
+import { useCancelReshard, useOrgLabels, useReshard, useReshardLog } from "@/hooks/useApi";
+import { OrgRef } from "@/components/OrgRef";
 import type { ReshardOperation as ReshardOp } from "@/types/api";
 
 // Human labels for the runner's step machine.
@@ -57,6 +58,7 @@ export function ReshardOperation() {
   const op = useReshard(id);
   const entries = useReshardLog(id, op.data?.state);
   const cancel = useCancelReshard();
+  const orgLabels = useOrgLabels();
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [msg, setMsg] = useState<string | null>(null);
@@ -119,7 +121,7 @@ export function ReshardOperation() {
             )}
             <Button variant="outline" size="sm" asChild>
               <Link to={`/orgs/${encodeURIComponent(o.org_id)}`}>
-                <ArrowLeft className="h-4 w-4" /> {o.org_id}
+                <ArrowLeft className="h-4 w-4" /> {orgLabels.get(o.org_id) ?? o.org_id}
               </Link>
             </Button>
           </div>
@@ -131,7 +133,7 @@ export function ReshardOperation() {
             <CardHeader className="flex-row items-center justify-between">
               <CardTitle className="flex items-center gap-3">
                 <Link to={`/orgs/${encodeURIComponent(o.org_id)}`} className="hover:underline">
-                  {o.org_id}
+                  <OrgRef id={o.org_id} label={orgLabels.get(o.org_id)} />
                 </Link>
                 <span className="flex items-center gap-2 font-mono text-xs font-normal text-muted-foreground">
                   {describeStore(o.source_kind, o.from_shard, o.source_endpoint)}

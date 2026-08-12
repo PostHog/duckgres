@@ -14,7 +14,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { LoadingState } from "@/components/states";
 import { useMetricRange, useMetricsPanels, useOrgs } from "@/hooks/useApi";
-import { fmtMetricAxis, fmtMetricValue, promToSeries } from "@/lib/format";
+import { fmtMetricAxis, fmtMetricValue, orgLabel, promToSeries } from "@/lib/format";
 
 // Window selector. The backend caps the step at ~250 points per window.
 const WINDOWS = ["15m", "1h", "6h", "24h"];
@@ -62,7 +62,10 @@ export function Metrics() {
                 <SelectItem value="__all__">All orgs</SelectItem>
                 {(orgs.data ?? []).map((o) => (
                   <SelectItem key={o.name} value={o.name}>
-                    {o.name}
+                    <span className="font-medium">{orgLabel(o)}</span>
+                    {orgLabel(o) !== o.name && (
+                      <span className="ml-2 font-mono text-xs text-muted-foreground">{o.name}</span>
+                    )}
                   </SelectItem>
                 ))}
               </SelectContent>

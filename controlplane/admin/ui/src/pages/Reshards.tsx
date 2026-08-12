@@ -13,7 +13,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { fmtTime } from "@/lib/format";
-import { useAllReshards } from "@/hooks/useApi";
+import { useAllReshards, useOrgLabels } from "@/hooks/useApi";
+import { OrgRef } from "@/components/OrgRef";
 import type { ReshardOperation } from "@/types/api";
 
 function describeStore(kind: string, shard: string, endpoint: string): string {
@@ -38,6 +39,7 @@ function duration(from: string | null, to: string | null): string {
 // reshard lives on the org detail page — this page is the fleet overview.
 export function Reshards() {
   const reshards = useAllReshards();
+  const orgLabels = useOrgLabels();
   const ops = reshards.data ?? [];
 
   return (
@@ -81,11 +83,8 @@ export function Reshards() {
                         </Link>
                       </TableCell>
                       <TableCell>
-                        <Link
-                          to={`/orgs/${encodeURIComponent(op.org_id)}`}
-                          className="font-mono text-xs hover:underline"
-                        >
-                          {op.org_id}
+                        <Link to={`/orgs/${encodeURIComponent(op.org_id)}`} className="hover:underline">
+                          <OrgRef id={op.org_id} label={orgLabels.get(op.org_id)} />
                         </Link>
                       </TableCell>
                       <TableCell>
