@@ -829,10 +829,30 @@ the CP.
 `{team_id, principal, ttl_seconds?, force_rotate?}`. `principal` is audit
 attribution (`"dagster:events-backfill"`). `ttl_seconds` is clamped to
 [1 min, 1 h] (default 15 min, the RDS-IAM precedent). Response is
-`{username, password?, expires_at}`; password is **omitted** when the CP
-reused a live grant. The caller is the internal-secret-authed PostHog
+`{username, password?, expires_at, connect}`; password is **omitted** when the
+CP reused a live grant, but `connect` is **always present** (reuse and rotate
+alike). The caller is the internal-secret-authed PostHog
 backend — the route sits next to the other provisioning routes for exactly
 that trust class, NOT on the admin/console side.
+
+The `connect` block tells the caller WHERE to use the credential from the same
+authoritative CP response that issued it, so nothing downstream re-derives its
+own idea of the warehouse endpoint out of band (a Django `DuckgresServer` row
+is exactly the drift this kills). It is
+`{host, port: 5432, database: "ducklake", sslmode: "require"}`.
+**`connect.host` is ALWAYS the org's canonical ingress name
+`<org-id>` + the CP's configured managed-ingress suffix** (e.g.
+`<org-id>.dw.us.postwh.com`) — the very value the pgwire TLS `server_name`
+pins (the wildcard cert is `*<suffix>` and the SNI router resolves the
+single-label prefix as the org; see "Native metadata Postgres proxy" /
+`controlplane/sni_kubernetes.go`). It is one logical name handed back verbatim
+for every caller: NEVER a pod IP, NEVER a ClusterIP, NEVER resolved per caller
+network. How that name resolves for a given caller — public ingress vs an AWS
+PrivateLink endpoint for dagster workers — is the caller network's business,
+not the CP's. The CP wires the suffix from its first configured
+`ManagedHostnameSuffixes` entry (`DUCKGRES_MANAGED_HOSTNAME_SUFFIXES`) at the
+`RegisterAPI` site (`controlplane/multitenant.go`), falling back to
+`provisioning.DefaultManagedIngressSuffix` when unwired.
 
 **The load-bearing invariants:**
 - **The login IS the team's canonical `project_user` (`posthog_team_<id>_rw`).**

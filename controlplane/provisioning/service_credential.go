@@ -25,6 +25,17 @@ const (
 	defaultCredentialTTL = 15 * time.Minute
 )
 
+// DefaultManagedIngressSuffix is the fallback managed tenant ingress DNS
+// suffix used to build connect.host in the service-credential response
+// (<org-id><suffix>) when the CP wasn't wired with an explicit ingress suffix.
+// It matches the only managed production ingress today (*.dw.us.postwh.com,
+// same as DUCKGRES_MANAGED_HOSTNAME_SUFFIXES). Production wiring
+// (controlplane/multitenant.go) passes the CP's first configured
+// ManagedHostnameSuffixes entry — the exact TLS server_name value the pgwire
+// handshake pins — so this constant is only a safety net for unwired callers,
+// never the source of truth for a configured CP.
+const DefaultManagedIngressSuffix = ".dw.us.postwh.com"
+
 type serviceCredentialRequest struct {
 	TeamID     int64  `json:"team_id"`
 	Principal  string `json:"principal"`
@@ -39,6 +50,30 @@ type serviceCredentialRequest struct {
 	ForceRotate bool `json:"force_rotate"`
 }
 
+// connectDetails is the always-present `connect` block of the mint response:
+// it tells the caller WHERE to use the credential from the same authoritative
+// CP response that issued it, so nothing downstream re-derives its own idea of
+// the warehouse endpoint (out-of-band endpoint knowledge — a Django
+// `DuckgresServer` row — is exactly the drift this field exists to kill).
+//
+// Host is the org's canonical ingress hostname — orgID + the managed ingress
+// suffix the CP is configured with — i.e. the very value the pgwire TLS
+// server_name pins (the wildcard cert is *<suffix> and the SNI router resolves
+// the single-label prefix as the org; see controlplane/sni_kubernetes.go). It
+// is a single LOGICAL name returned verbatim for every caller: whether that
+// name resolves over the public ingress or a caller-network-specific path
+// (e.g. an AWS PrivateLink endpoint for dagster workers) is the caller
+// network's business — NEVER an IP, NEVER resolved per caller network.
+// Database/SslMode pin the pgwire handshake shape the CP enforces (managed
+// warehouses accept only the ducklake catalog database, and TLS is required on
+// the pgwire handshake).
+type connectDetails struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Database string `json:"database"`
+	SslMode  string `json:"sslmode"`
+}
+
 type serviceCredentialResponse struct {
 	Username string `json:"username"`
 	// Password is omitted (not empty-stringed) when the CP reused a live
@@ -46,6 +81,10 @@ type serviceCredentialResponse struct {
 	// echoing "" would risk clients treating "" as the credential itself.
 	Password  string    `json:"password,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
+	// Connect is unconditional (unlike Password): identical shape on reuse
+	// and rotate, so the client can always take its connection target from
+	// this same response instead of holding its own out-of-band copy.
+	Connect connectDetails `json:"connect"`
 }
 
 // TenantStore is the subset of the config store the service-credential
@@ -160,6 +199,27 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 		Username:  issued.Username,
 		Password:  issued.Plaintext,
 		ExpiresAt: issued.ExpiresAt,
+		Connect: connectDetails{
+			// The org's canonical ingress hostname — orgID + the CP's
+			// configured managed-ingress suffix — i.e. exactly the value the
+			// pgwire TLS server_name pins (never an IP, never resolved per
+			// caller network; see the connectDetails doc).
+			Host:     orgID + h.managedIngressSuffix(),
+			Port:     5432,
+			Database: "ducklake",
+			SslMode:  "require",
+		},
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// managedIngressSuffix returns the DNS suffix joined onto the org ID to build
+// connect.host. The wired value (the CP's configured managed hostname suffix)
+// wins; when unwired (unit tests that build a handler directly) it falls back
+// to DefaultManagedIngressSuffix.
+func (h *handler) managedIngressSuffix() string {
+	if h.ingressSuffix != "" {
+		return h.ingressSuffix
+	}
+	return DefaultManagedIngressSuffix
 }

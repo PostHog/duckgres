@@ -7,8 +7,45 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
+
+// newServiceCredentialRouter mounts the provisioning API with an explicit
+// managed tenant ingress suffix so tests can assert the exact connect.host the
+// handler derives from it (orgID + suffix).
+func newServiceCredentialRouter(store Store, ingressSuffix string) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	tenantStore, _ := store.(TenantStore)
+	RegisterAPIWithIngressSuffix(r.Group("/api/v1"), store, tenantStore, "", nil, ingressSuffix)
+	return r
+}
+
+// assertConnectBlock checks the always-present connect block's exact shape and
+// values against the org's canonical ingress hostname.
+func assertConnectBlock(t *testing.T, body map[string]any, wantHost string) {
+	t.Helper()
+	connect, ok := body["connect"].(map[string]any)
+	if !ok {
+		t.Fatalf("connect block must be an object, got top-level body: %v", body)
+	}
+	if len(connect) != 4 {
+		t.Fatalf("connect must have exactly 4 keys, got %v", connect)
+	}
+	if got := connect["host"]; got != wantHost {
+		t.Fatalf("connect.host = %v, want %v (the org's canonical ingress hostname)", got, wantHost)
+	}
+	if got := connect["port"]; got != float64(5432) {
+		t.Fatalf("connect.port = %v, want 5432", got)
+	}
+	if got := connect["database"]; got != "ducklake" {
+		t.Fatalf("connect.database = %v, want \"ducklake\"", got)
+	}
+	if got := connect["sslmode"]; got != "require" {
+		t.Fatalf("connect.sslmode = %v, want \"require\"", got)
+	}
+}
 
 // pinServiceCredentialUsername locks the CP-issued login name to the same
 // derivation the admin console uses for a team's read/write project login
@@ -40,6 +77,9 @@ func TestIssueServiceCredentialUsernameMatchesAdminProjectUser(t *testing.T) {
 	if body["expires_at"] == nil {
 		t.Fatal("expires_at must be present")
 	}
+	// newTestRouter wires no ingress suffix ⇒ the handler falls back to the
+	// default managed ingress suffix.
+	assertConnectBlock(t, body, "acme"+DefaultManagedIngressSuffix)
 }
 
 func TestIssueServiceCredentialRejectsBadInput(t *testing.T) {
@@ -154,4 +194,35 @@ func TestIssueServiceCredentialReuseOmitsPasswordWhenGrantStillValid(t *testing.
 	if body := rec.Body.String(); strings.Contains(body, `"password"`) {
 		t.Fatalf("reuse path must not echo a password, got: %s", body)
 	}
+	// ...but the connect block is unconditional: identical shape and values on
+	// the reuse path, so a caller can always take its connection target from
+	// the mint response even when it gets no plaintext back.
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	assertConnectBlock(t, body, "acme"+DefaultManagedIngressSuffix)
+}
+
+// TestIssueServiceCredentialConnectHostUsesWiredSuffix locks the wiring: the
+// connect block's host is orgID + the ingress suffix the CP was wired with —
+// the same DNS suffix the pgwire TLS server_name pins for managed tenants —
+// never an IP and never a caller-network-resolved address, so both a
+// public-ingress client and a PrivateLink client get the one logical name.
+func TestIssueServiceCredentialConnectHostUsesWiredSuffix(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newServiceCredentialRouter(store, ".dw.eu.postwh.com")
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
+		`{"team_id": 42, "principal": "dagster:events-backfill", "force_rotate": true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	assertConnectBlock(t, body, "acme.dw.eu.postwh.com")
 }
