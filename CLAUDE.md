@@ -803,13 +803,12 @@ Invariants:
 - **One of each per team**, via two SEPARATE partial unique indexes on
   `(org_id, team_id)` — deliberately not one index across both modes, so a
   reader and a writer coexist.
-- **Service credentials rotate the project's `project_user` hash, not a new
-  login.** `POST /api/v1/orgs/:id/teams/:team_id/service-credentials` is how a
-  PostHog backend job (dagster) fetches a short-lived credential. It reuses
-  the team's canonical `posthog_team_<id>_rw` login precisely so the session
-  binds exactly the namespaces above — there is no second ACL to audit or
-  drift. Expiry is enforced by ROTATION, not a checked timestamp — see
-  "Service Credentials" below for the full contract.
+- **Service credentials are NOT project-scoped and never touch
+  `duckgres_org_users`.** `POST /api/v1/orgs/:id/service-credentials` is how a
+  PostHog backend job (dagster) fetches a short-lived credential: a
+  per-credential grant row with its own `svc_` identity, root-shaped
+  (unrestricted) at the org level. See "Service Credentials" below for the
+  full contract.
 - Touching any of this → update `server/query_access_test.go`,
   `controlplane/configstore/query_access_test.go`,
   `controlplane/admin/api_test.go`, `controlplane/org_router_test.go`,
@@ -818,23 +817,33 @@ Invariants:
   `project_reader_isolation` / `project_user_isolation` assertions in
   `tests/mw-dev/e2e/harness.sh`.
 
-## Service Credentials (`POST /orgs/:id/teams/:team_id/service-credentials`) — LOAD-BEARING CONTRACT
+## Service Credentials (`POST /orgs/:id/service-credentials`) — LOAD-BEARING CONTRACT
 
 How PostHog backend jobs (dagster today) authenticate to duckgres WITHOUT a
 long-lived password living in Django. Replaces the org-root credential read
-from a `DuckgresServer` row with a per-team credential minted on demand by
-the CP.
+from a `DuckgresServer` row with a per-credential grant minted on demand by
+the CP — AWS AccessKey/Secret style: each minted credential is its own
+`duckgres_service_grants` row with its OWN identity (`credential_id`), its
+own TTL, and its own rotation clock. Storage NEVER touches
+`duckgres_org_users` — there is no shared login row for an operator rotation
+or password update to clobber mid-run, and service credentials are not
+project-scoped (root-shaped: unrestricted at the org level).
 
 **Caller contract:**
-`POST /api/v1/orgs/:id/teams/:team_id/service-credentials` with
-`{team_id, principal, ttl_seconds?, force_rotate?}`. `principal` is audit
-attribution (`"dagster:events-backfill"`). `ttl_seconds` is clamped to
-[1 min, 1 h] (default 15 min, the RDS-IAM precedent). Response is
-`{username, password?, expires_at, connect}`; password is **omitted** when the
-CP reused a live grant, but `connect` is **always present** (reuse and rotate
-alike). The caller is the internal-secret-authed PostHog
-backend — the route sits next to the other provisioning routes for exactly
-that trust class, NOT on the admin/console side.
+`POST /api/v1/orgs/:id/service-credentials` with
+`{principal, ttl_seconds?, force_rotate?}`. `principal` is audit attribution
+(`"dagster:events-backfill"`) AND the reuse key: one live grant per
+`(org_id, principal)`. `ttl_seconds` is clamped to [1 min, 1 h]
+(default 15 min, the RDS-IAM precedent). Response is
+`{credential_id, credential_secret?, expires_at, connect}`;
+`credential_secret` is **omitted** when the mint reused a live grant, but
+`credential_id`/`expires_at`/`connect` are **always present** (reuse and
+rotate alike). `POST /api/v1/orgs/:id/service-credentials/refresh` with
+`{credential_id, ttl_seconds?}` **ALWAYS rotates** the named grant's secret
+and returns `{credential_id, credential_secret, expires_at, connect}`.
+The caller is the internal-secret-authed PostHog backend — the routes sit
+next to the other provisioning routes for exactly that trust class, NOT on
+the admin/console side.
 
 The `connect` block tells the caller WHERE to use the credential from the same
 authoritative CP response that issued it, so nothing downstream re-derives its
@@ -856,42 +865,53 @@ not the CP's. The CP wires the suffix from its first configured
 `provisioning.DefaultManagedIngressSuffix` when unwired.
 
 **The load-bearing invariants:**
-- **The login IS the team's canonical `project_user` (`posthog_team_<id>_rw`).**
-  No parallel `svc_*` identity, no second policy to audit, no drift from the
-  admin console's "the team's writer login" model. Sessions minted here are
-  session-equal to a login the admin UI rotated.
-- **Expiry is enforced by ROTATION, and the rotation clock is
-  `duckgres_org_users.service_grant_expires_at` — NEVER `updated_at`.**
-  The bcrypt hash on the row IS the credential; a mint call within the TTL
-  leaves hash and grant clock untouched (no spurious config-generation
-  wake-up, no clobbering a concurrent run's working credential mid-flight),
-  and the first mint after lapse rotates the hash. `updated_at` is shared
-  mutable state: the admin project-login rotation also bumps it AND clears
-  `service_grant_expires_at` when it overwrites the password — so a service
-  mint can never trust (or report the expiry of) a hash it did not issue.
-  Real leak window is `TTL + time-to-next-touch`. Deliberately dodges the
-  hard-SQLSTATE-expiry footgun: no job is killed mid-run by a wall-clock tick.
-- **A disabled login is never silently re-enabled by a mint.** The kill
-  switch is an explicit operator action; the internal-secret-authed machine
-  caller must not undo it. Re-enable flows through the admin API.
-- **A mint re-establishes the project_user invariants on whatever row holds
-  the username** (`access_mode`, `team_id`, `passthrough=false`): an operator
-  flip of that row's mode cannot widen or void the scope a minted credential
-  binds.
-- **Established sessions are NEVER torn down on expiry.** Freshness is
-  enforced only at the pgwire handshake — the RDS-IAM / Cloud-SQL-IAM
-  contract. A long job's existing connection rides to completion; each NEW
-  connection mints afresh.
-- **`force_rotate` is how a job with nothing cached gets a plaintext.** The
-  reuse path returns NO password (it would be returning nothing the caller
-  can use); a job's first mint of a run passes `force_rotate: true`. This is
-  the resolution of the obvious timers race: without it, every run's first
-  mint would be the one rotating, which is exactly the concurrent-run
-  clobbering the reuse window exists to prevent.
+- **The credential IS its own grant row.** `credential_id` is
+  `svc_<24 random hex>`, generated server-side, never caller-supplied; the
+  client presents it as the pgwire username and the plaintext secret as the
+  password. The bcrypt hash lives on the `duckgres_service_grants` row —
+  `duckgres_org_users` holds NO service-credential material, so operator
+  writes to the org's users table can never invalidate (or be depended on by)
+  a minted credential.
+- **Auth resolves `svc_`-prefixed usernames against the grants snapshot map
+  ONLY** (`Snapshot.OrgServiceGrant`, loaded alongside `OrgUserPassword`).
+  Expiry and revocation are enforced at that lookup: unknown, revoked,
+  expired, and hash-blanked credentials all fail identically (with equalized
+  bcrypt time — which state a credential_id is in is not probeable). A live
+  grant is `revoked_at IS NULL AND expires_at > now()`.
+- **Reuse is keyed `(org_id, principal)`.** A mint while a live grant exists
+  returns the grant's identity and its REAL expiry with NO new plaintext (the
+  caller already holding the secret keeps using it; a caller with nothing
+  sets `force_rotate`). The secret is returned exactly once per binding —
+  when it is created (fresh grant), rotated (`force_rotate`), or refreshed
+  (`refresh`).
+- **`force_rotate` on mint re-binds the live grant's secret** (rotating the
+  bcrypt hash, bumping `last_rotated_at`, re-arming `expires_at` from the
+  request's TTL) and returns the new plaintext. This is the resolution of
+  the obvious timers race: without it, every run's first mint would be the
+  one rotating, which is exactly the concurrent-run clobbering the reuse
+  window exists to prevent.
+- **Refresh always rotates and never creates.** Unknown `credential_id` →
+  404; a REVOKED grant → 410 (revocation is terminal: refresh never
+  resurrects, and a later mint for the same principal creates a NEW
+  credential rather than touching the dead row). An EXPIRED (but unrevoked)
+  grant MAY be refreshed — expiry only refuses NEW handshakes, so refresh is
+  how a caller that missed the window recovers without minting a second
+  identity for the same principal.
+- **Established sessions are NEVER torn down** — not on expiry, not on
+  rotation, not on refresh (the mint plane is separate from connection
+  scheduling). Freshness is enforced only at the pgwire handshake — the
+  RDS-IAM / Cloud-SQL-IAM contract. A long job's existing connection rides
+  to completion; each NEW connection mints or refreshes afresh.
+- **Revoke keeps the row** (`DELETE /api/v1/orgs/:id/service-grants/:credential_id`):
+  `revoked_at` is stamped and the hash is BLANKED server-side, so a leaked
+  credential can never authenticate again and the provenance (principal,
+  mint/rotation times) survives for investigation. `GET
+  /api/v1/orgs/:id/service-grants` is the flat, all-statuses list — no
+  plaintext, no hashes (`PasswordHash` is `json:"-"`).
 - **Concurrency**: the decide-then-mutate sequence runs under
-  `LockOrgConnectionAdmissionTx`, so two racing mints (two CP replicas, or a
-  run and a refresh) serialize on one hash — never double-rotate into
-  mutually-invalidating credentials.
+  `LockOrgConnectionAdmissionTx`, so two racing mints/refreshes (two CP
+  replicas, or a run and a refresh) serialize on one hash — never
+  double-rotate into mutually-invalidating credentials.
 - **After the write, THIS replica's snapshot is reloaded immediately**
   (`ReloadSnapshot`), then a best-effort `/api/v1/internal/reload-snapshot`
   fan-out to peer replicas (`PeerFanout`, wired from the same
@@ -900,7 +920,8 @@ not the CP's. The CP wires the suffix from its first configured
   pgwire connection lands on.
 - Touching any of this → update `controlplane/provisioning/service_credential.go` +
   `_test.go`, `controlplane/configstore/service_credential.go` +
-  `_postgres_test.go`, and the caller-side minter in the PostHog repo
+  `_postgres_test.go`, `controlplane/admin/api.go` (list/revoke), and the
+  caller-side minter in the PostHog repo
   (`products/managed_warehouse/backend/service_credentials.py`).
 
 ## Compute-Usage Billing (managed-warehouse, remote backend only)

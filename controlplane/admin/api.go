@@ -138,6 +138,14 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	r.GET("/orgs/:id/users/:username", h.getUser)
 	r.PUT("/orgs/:id/users/:username", h.updateUser)
 	r.DELETE("/orgs/:id/users/:username", h.deleteUser)
+
+	// Service grants (duckgres_service_grants): every minted service
+	// credential, all statuses (live / expired / revoked). Read carries NO
+	// secret material (PasswordHash is json:"-"); revoke sets revoked_at and
+	// blanks the stored hash server-side. Both are ordinary admin-console
+	// routes behind the group middleware (valid admin session + audit).
+	r.GET("/orgs/:id/service-grants", h.listServiceGrants)
+	r.DELETE("/orgs/:id/service-grants/:credential_id", h.revokeServiceGrant)
 	// Peer-only fan-out target: see reloadSnapshot below.
 	r.POST("/internal/reload-snapshot", h.reloadSnapshot)
 
@@ -188,6 +196,15 @@ type apiStore interface {
 	// unique index keeps at most one of each per team. Returns
 	// configstore.ErrProjectTeamUnavailable when the team is missing/disabled.
 	UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error)
+
+	// ListServiceGrants returns every service-grant row for the org (all
+	// statuses); gorm.ErrRecordNotFound for a ghost org. RevokeServiceGrant
+	// terminally revokes one grant (sets revoked_at, blanks the hash);
+	// gorm.ErrRecordNotFound for a ghost org,
+	// configstore.ErrServiceCredentialNotFound for an unknown credential_id,
+	// idempotent on an already-revoked grant.
+	ListServiceGrants(orgID string) ([]configstore.ServiceGrant, error)
+	RevokeServiceGrant(orgID, credentialID string) error
 
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
@@ -537,11 +554,6 @@ func (s *gormAPIStore) UpdateUser(orgID, username, passwordHash string, passthro
 	updates := map[string]interface{}{}
 	if passwordHash != "" {
 		updates["password"] = passwordHash
-		// Same contract as UpsertProjectLogin: installing a password the
-		// service-credential path didn't issue must clear the mint clock, so
-		// the next service mint rotates instead of trusting (and reporting the
-		// expiry of) a hash it did not issue.
-		updates["service_grant_expires_at"] = nil
 	}
 	if passthrough != nil {
 		updates["passthrough"] = *passthrough
@@ -649,19 +661,13 @@ func (s *gormAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, 
 		}
 		if err := tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "org_id"}, {Name: "username"}},
-			// Admin rotation overwrites the password, so any outstanding
-			// SERVICE-credential grant for this login is no longer the one the
-			// mint path issued: clear service_grant_expires_at so the next
-			// service mint rotates instead of trusting (or reporting the
-			// expiry of) a hash it did not issue.
 			DoUpdates: clause.Assignments(map[string]interface{}{
-				"password":                 passwordHash,
-				"passthrough":              false,
-				"access_mode":              accessMode,
-				"team_id":                  teamID,
-				"disabled":                 false,
-				"updated_at":               time.Now().UTC(),
-				"service_grant_expires_at": nil,
+				"password":    passwordHash,
+				"passthrough": false,
+				"access_mode": accessMode,
+				"team_id":     teamID,
+				"disabled":    false,
+				"updated_at":  time.Now().UTC(),
 			}),
 		}).Create(&user).Error; err != nil {
 			return err
@@ -672,6 +678,14 @@ func (s *gormAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, 
 		return nil, err
 	}
 	return &stored, nil
+}
+
+func (s *gormAPIStore) ListServiceGrants(orgID string) ([]configstore.ServiceGrant, error) {
+	return s.store.ListServiceGrants(orgID)
+}
+
+func (s *gormAPIStore) RevokeServiceGrant(orgID, credentialID string) error {
+	return s.store.RevokeServiceGrant(orgID, credentialID)
 }
 
 func (s *gormAPIStore) ReloadSnapshot() error {
@@ -1946,6 +1960,52 @@ func (h *apiHandler) upsertProjectLogin(c *gin.Context, accessMode string, usern
 		"password":    password,
 		"access_mode": user.AccessMode,
 	})
+}
+
+// listServiceGrants returns the org's service credentials — every
+// duckgres_service_grants row, all statuses (live, expired, revoked), flat.
+// NO plaintext and no hashes: configstore.ServiceGrant.PasswordHash is
+// json:"-", so the serialized view is identity + lifecycle + audit
+// attribution only.
+func (h *apiHandler) listServiceGrants(c *gin.Context) {
+	orgID := c.Param("id")
+	grants, err := h.store.ListServiceGrants(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, grants)
+}
+
+// revokeServiceGrant terminally revokes one minted credential: revoked_at is
+// stamped and the bcrypt hash is blanked server-side, so a leaked credential
+// can never authenticate again. The row stays for provenance (the minted-by
+// principal remains queryable after a leak). Established sessions are NOT
+// torn down — revocation, like expiry, is enforced at the pgwire handshake.
+func (h *apiHandler) revokeServiceGrant(c *gin.Context) {
+	orgID := c.Param("id")
+	credentialID := c.Param("credential_id")
+	if err := h.store.RevokeServiceGrant(orgID, credentialID); err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		case errors.Is(err, configstore.ErrServiceCredentialNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	setAuditDetail(c, "revoked service credential "+credentialID)
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"revoked": credentialID})
 }
 
 // notifyPeersOfChange reloads THIS replica's config snapshot immediately

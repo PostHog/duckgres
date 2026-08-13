@@ -32,14 +32,18 @@ type fakeStore struct {
 	listOrgTeamsErr   error // set non-nil to fail ListOrgTeamsByOrgIDs
 	latestChangeErr   error // set non-nil to fail LatestConfigChange
 
-	// ServiceCredential hooks. issueCreds records every call so tests can
-	// assert the handler threads (org, team, ttl, forceRotate) correctly and
-	// the reuse-vs-rotate branches respond with the right body shape.
-	issueCreds       []serviceCredentialRequest
-	issueCredsIssue  *configstore.ServiceCredentialIssue
-	issueCredsErr    error
-	reloadSnapshotN  int
-	reloadSnapshotEr error
+	// ServiceCredential hooks. mintCreds/refreshCreds record every call so
+	// tests can assert the handler threads (org, principal, ttl, forceRotate)
+	// correctly and the reuse-vs-rotate branches respond with the right body
+	// shape.
+	mintCreds         []serviceCredentialRequest
+	refreshCreds      []serviceCredentialRefreshRequest
+	issueCredsIssue   *configstore.ServiceCredentialIssue
+	issueCredsErr     error
+	refreshCredsIssue *configstore.ServiceCredentialIssue
+	refreshCredsErr   error
+	reloadSnapshotN   int
+	reloadSnapshotEr  error
 }
 
 func newFakeStore() *fakeStore {
@@ -384,17 +388,20 @@ func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore
 }
 
 // ServiceCredential fake methods: these satisfy the TenantStore half of
-// RegisterAPI. The fake records the request so tests can assert plumbing, and
+// RegisterAPI. The fake records the calls so tests can assert plumbing, and
 // returns a canned issue (or error).
-func (s *fakeStore) IssueProjectUserServiceCredential(
+func (s *fakeStore) OrgExists(orgID string) (bool, error) {
+	_, ok := s.orgs[orgID]
+	return ok, nil
+}
+
+func (s *fakeStore) MintServiceCredential(
 	orgID string,
-	teamID int64,
 	principal string,
 	ttl time.Duration,
 	forceRotate bool,
 ) (*configstore.ServiceCredentialIssue, error) {
-	s.issueCreds = append(s.issueCreds, serviceCredentialRequest{
-		TeamID:      teamID,
+	s.mintCreds = append(s.mintCreds, serviceCredentialRequest{
 		Principal:   principal,
 		TTLSeconds:  int(ttl / time.Second),
 		ForceRotate: forceRotate,
@@ -405,13 +412,38 @@ func (s *fakeStore) IssueProjectUserServiceCredential(
 	if s.issueCredsIssue == nil {
 		// Default: a freshly rotated credential expiring in an hour.
 		return &configstore.ServiceCredentialIssue{
-			Rotated:   true,
-			Username:  fmt.Sprintf("posthog_team_%d_rw", teamID),
-			Plaintext: "fake-plaintext-32chars-aaaaaaaaaaaa",
-			ExpiresAt: time.Now().UTC().Add(time.Hour),
+			Rotated:      true,
+			CredentialID: "svc_0123456789abcdef01234567",
+			Principal:    principal,
+			Plaintext:    "fake-plaintext-32chars-aaaaaaaaaaaa",
+			ExpiresAt:    time.Now().UTC().Add(time.Hour),
 		}, nil
 	}
 	return s.issueCredsIssue, nil
+}
+
+func (s *fakeStore) RefreshServiceCredential(
+	orgID string,
+	credentialID string,
+	ttl time.Duration,
+) (*configstore.ServiceCredentialIssue, error) {
+	s.refreshCreds = append(s.refreshCreds, serviceCredentialRefreshRequest{
+		CredentialID: credentialID,
+		TTLSeconds:   int(ttl / time.Second),
+	})
+	if s.refreshCredsErr != nil {
+		return nil, s.refreshCredsErr
+	}
+	if s.refreshCredsIssue == nil {
+		return &configstore.ServiceCredentialIssue{
+			Rotated:      true,
+			CredentialID: credentialID,
+			Principal:    "dagster:refreshed",
+			Plaintext:    "fake-plaintext-32chars-bbbbbbbbbbbb",
+			ExpiresAt:    time.Now().UTC().Add(time.Hour),
+		}, nil
+	}
+	return s.refreshCredsIssue, nil
 }
 
 func (s *fakeStore) ReloadSnapshot() error {
