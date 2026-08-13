@@ -938,11 +938,15 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
 		execSpan.End()
 	}
-	defer func() {
-		if !keepRowsOpen {
-			_ = rows.Close()
-			finishProfiling()
+	finishRows := func() {
+		if keepRowsOpen {
+			return
 		}
+		_ = rows.Close()
+		finishProfiling()
+	}
+	defer func() {
+		finishRows()
 	}()
 
 	cols, err := rows.Columns()
@@ -951,6 +955,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.logger().Error("Columns error.", "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
 		return
 	}
@@ -1001,6 +1006,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		} else {
 			// The retried rowset replaces the original everywhere below —
 			// including as the rowset a suspension keeps open.
+			rows = retryRows
 			activeRows = retryRows
 			defer func() {
 				if !keepRowsOpen {
@@ -1015,6 +1021,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		queryFinalErr = stream.scanErr
 		c.sendError("ERROR", "42000", stream.scanErr.Error())
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", stream.scanErr.Error(), "extended")
 		return
 	}
@@ -1039,6 +1046,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 		return
 	}
@@ -1068,6 +1076,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = c.writeCommandComplete(tag)
+	finishRows()
 	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
 }
 
