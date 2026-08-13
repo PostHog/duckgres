@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -25,6 +26,8 @@ type fakeAPIStore struct {
 	users               map[string]*configstore.OrgUser
 	warehouses          map[string]*configstore.ManagedWarehouse
 	teams               map[string]map[int64]*configstore.OrgTeam
+	grants              map[string][]*configstore.ServiceGrant // orgID -> grants (insertion order)
+	revokedGrants       []string                               // credential_ids revoked through the store fake
 	reloadSnapshotCalls int
 	reloadSnapshotErr   error
 }
@@ -35,6 +38,7 @@ func newFakeAPIStore() *fakeAPIStore {
 		users:      make(map[string]*configstore.OrgUser),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
 		teams:      make(map[string]map[int64]*configstore.OrgTeam),
+		grants:     make(map[string][]*configstore.ServiceGrant),
 	}
 }
 
@@ -276,6 +280,35 @@ func (s *fakeAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, 
 func (s *fakeAPIStore) ReloadSnapshot() error {
 	s.reloadSnapshotCalls++
 	return s.reloadSnapshotErr
+}
+
+func (s *fakeAPIStore) ListServiceGrants(orgID string) ([]configstore.ServiceGrant, error) {
+	if _, ok := s.orgs[orgID]; !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var out []configstore.ServiceGrant
+	for _, g := range s.grants[orgID] {
+		out = append(out, *g)
+	}
+	return out, nil
+}
+
+func (s *fakeAPIStore) RevokeServiceGrant(orgID, credentialID string) error {
+	if _, ok := s.orgs[orgID]; !ok {
+		return gorm.ErrRecordNotFound
+	}
+	for _, g := range s.grants[orgID] {
+		if g.CredentialID == credentialID {
+			if g.RevokedAt == nil {
+				now := time.Now().UTC()
+				g.RevokedAt = &now
+				g.PasswordHash = ""
+			}
+			s.revokedGrants = append(s.revokedGrants, credentialID)
+			return nil
+		}
+	}
+	return configstore.ErrServiceCredentialNotFound
 }
 
 func (s *fakeAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -3206,5 +3239,137 @@ func TestAdminUpdateOrgTeamRejectsQualifiedLegacyName(t *testing.T) {
 	}
 	if stored := store.teams["acme"][1]; stored.EventsTableName != nil {
 		t.Fatalf("rejected PUT must not store anything, got %+v", stored)
+	}
+}
+
+func TestAdminListServiceGrants(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	now := time.Now().UTC()
+	revokedAt := now.Add(-time.Hour)
+	store.grants["acme"] = []*configstore.ServiceGrant{
+		{
+			OrgID:         "acme",
+			CredentialID:  "svc_aaaaaaaaaaaaaaaaaaaaaaaa",
+			Principal:     "dagster:live",
+			PasswordHash:  "$2a$10$hashhashhashhashhashhashhashhash", // must never serialize
+			MintedAt:      now.Add(-30 * time.Minute),
+			LastRotatedAt: now.Add(-30 * time.Minute),
+			ExpiresAt:     now.Add(15 * time.Minute),
+			CreatedAt:     now.Add(-30 * time.Minute),
+			UpdatedAt:     now.Add(-30 * time.Minute),
+		},
+		{
+			OrgID:         "acme",
+			CredentialID:  "svc_bbbbbbbbbbbbbbbbbbbbbbbb",
+			Principal:     "dagster:dead",
+			MintedAt:      now.Add(-2 * time.Hour),
+			LastRotatedAt: now.Add(-2 * time.Hour),
+			ExpiresAt:     now.Add(-time.Hour),
+			RevokedAt:     &revokedAt,
+			CreatedAt:     now.Add(-2 * time.Hour),
+			UpdatedAt:     revokedAt,
+		},
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/acme/service-grants", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hashhashhash") || strings.Contains(rec.Body.String(), "password_hash") {
+		t.Fatalf("grant listing must never serialize secret material, got: %s", rec.Body.String())
+	}
+	var body []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body) != 2 {
+		t.Fatalf("grants = %d, want 2 (all statuses, flat)", len(body))
+	}
+	if body[0]["credential_id"] != "svc_aaaaaaaaaaaaaaaaaaaaaaaa" || body[0]["principal"] != "dagster:live" {
+		t.Fatalf("first grant = %v", body[0])
+	}
+	if body[1]["revoked_at"] == nil {
+		t.Fatal("revoked grant must carry revoked_at")
+	}
+	for _, g := range body {
+		if _, ok := g["expires_at"]; !ok {
+			t.Fatalf("expires_at must always be present, got %v", g)
+		}
+	}
+}
+
+func TestAdminListServiceGrantsGhostOrg404(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/ghost/service-grants", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminRevokeServiceGrant(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	now := time.Now().UTC()
+	store.grants["acme"] = []*configstore.ServiceGrant{
+		{
+			OrgID:         "acme",
+			CredentialID:  "svc_aaaaaaaaaaaaaaaaaaaaaaaa",
+			Principal:     "dagster:live",
+			PasswordHash:  "$2a$10$somehash",
+			MintedAt:      now.Add(-30 * time.Minute),
+			LastRotatedAt: now.Add(-30 * time.Minute),
+			ExpiresAt:     now.Add(15 * time.Minute),
+		},
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/acme/service-grants/svc_aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.grants["acme"][0]
+	if stored.RevokedAt == nil {
+		t.Fatal("revoke must stamp revoked_at")
+	}
+	if stored.PasswordHash != "" {
+		t.Fatal("revoke must blank the password hash server-side")
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("ReloadSnapshot called %d times, want exactly 1 (revocation must take effect without waiting a poll)", store.reloadSnapshotCalls)
+	}
+
+	// Already-revoked is idempotent.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/acme/service-grants/svc_aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-revoke: status = %d, want 200 (idempotent): %s", rec.Code, rec.Body.String())
+	}
+
+	// Unknown credential → 404.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/acme/service-grants/svc_eeeeeeeeeeeeeeeeeeeeeeee", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown credential: status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+
+	// Ghost org → 404.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/ghost/service-grants/svc_aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("ghost org: status = %d, want 404: %s", rec.Code, rec.Body.String())
 	}
 }

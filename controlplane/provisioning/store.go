@@ -288,16 +288,36 @@ func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore
 	return nil
 }
 
-// ListOrgTeams returns every duckgres_org_teams row for the org, or
-// gorm.ErrRecordNotFound when the org doesn't exist.
-func (s *gormStore) IssueProjectUserServiceCredential(
+// MintServiceCredential delegates to the config store: mint-or-reuse the org's
+// live service grant for (orgID, principal) — see
+// configstore.MintServiceCredential for the full contract.
+func (s *gormStore) MintServiceCredential(
 	orgID string,
-	teamID int64,
 	principal string,
 	ttl time.Duration,
 	forceRotate bool,
 ) (*configstore.ServiceCredentialIssue, error) {
-	return s.cs.IssueProjectUserServiceCredential(orgID, teamID, principal, ttl, forceRotate)
+	return s.cs.MintServiceCredential(orgID, principal, ttl, forceRotate)
+}
+
+// RefreshServiceCredential delegates to the config store: always-rotate the
+// named grant's secret — see configstore.RefreshServiceCredential.
+func (s *gormStore) RefreshServiceCredential(
+	orgID string,
+	credentialID string,
+	ttl time.Duration,
+) (*configstore.ServiceCredentialIssue, error) {
+	return s.cs.RefreshServiceCredential(orgID, credentialID, ttl)
+}
+
+// OrgExists reports whether the org row exists (the service-credential
+// handlers 404 on a ghost org before minting against it).
+func (s *gormStore) OrgExists(orgID string) (bool, error) {
+	var count int64
+	if err := s.cs.DB().Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (s *gormStore) ReloadSnapshot() error {

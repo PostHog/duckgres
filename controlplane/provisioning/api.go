@@ -137,14 +137,18 @@ func RegisterAPIWithIngressSuffix(r *gin.RouterGroup, store Store, tenantStore T
 	r.GET("/orgs/:id/teams", h.listOrgTeams)
 	r.POST("/orgs/:id/teams", h.upsertOrgTeam)
 	r.DELETE("/orgs/:id/teams/:team_id", h.deleteOrgTeam)
-	// Short-lived service credentials: a PostHog backend job (dagster) mints a
-	// credential against one of its own team rows, gets the team's canonical
-	// project_user login scoped to that team's namespaces, and the CP rotates
-	// the underlying bcrypt hash when the previous grant is too close to
-	// expiry. The plaintext is returned only here; the store persists only the
-	// hash.
-	r.POST("/orgs/:id/teams/:team_id/service-credentials", func(c *gin.Context) {
+	// Short-lived service credentials (AWS AccessKey/Secret style): a PostHog
+	// backend job (dagster) mints a per-credential grant — its own
+	// duckgres_service_grants row, never a duckgres_org_users row — and
+	// connects with (credential_id, secret). The mint reuses the principal's
+	// live grant (plaintext only when freshly rotated via force_rotate);
+	// refresh ALWAYS rotates the named grant. The plaintext is returned only
+	// here; the store persists only the bcrypt hash.
+	r.POST("/orgs/:id/service-credentials", func(c *gin.Context) {
 		h.issueServiceCredential(c, tenantStore)
+	})
+	r.POST("/orgs/:id/service-credentials/refresh", func(c *gin.Context) {
+		h.refreshServiceCredential(c, tenantStore)
 	})
 }
 

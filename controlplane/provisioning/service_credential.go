@@ -4,7 +4,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,25 +35,42 @@ const (
 // never the source of truth for a configured CP.
 const DefaultManagedIngressSuffix = ".dw.us.postwh.com"
 
+// serviceCredentialRequest is the mint body
+// (POST /api/v1/orgs/:id/service-credentials). There is deliberately NO
+// team_id: service credentials are root-shaped org credentials, not
+// project-scoped logins.
 type serviceCredentialRequest struct {
-	TeamID     int64  `json:"team_id"`
+	// Principal is audit attribution ("dagster:events-backfill") — required,
+	// and it doubles as the reuse key: one live grant per (org, principal).
 	Principal  string `json:"principal"`
 	TTLSeconds int    `json:"ttl_seconds"`
-	// ForceRotate bypasses the reuse path: the CP rotates the project_user
-	// hash no matter how fresh the current grant is, and returns the new
-	// plaintext. A caller MUST set this on its first fetch of a run — it has
-	// nothing cached, and the reuse path deliberately returns no plaintext for
-	// a still-valid grant (so concurrent long-lived runs can't smash each
-	// other's credentials mid-flight). Omit/false means "reuse the live grant
-	// if it still has runway, and only tell me its expiry".
+	// ForceRotate bypasses the reuse path: when a live grant already exists
+	// for (org, principal) the CP rotates its secret no matter how fresh it
+	// is and returns the new plaintext. A caller MUST set this on its first
+	// fetch of a run — it has nothing cached, and the reuse path deliberately
+	// returns no plaintext for a still-valid grant (so concurrent long-lived
+	// runs can't smash each other's credentials mid-flight). Omit/false means
+	// "reuse the live grant if one exists, and only tell me its identity and
+	// expiry".
 	ForceRotate bool `json:"force_rotate"`
 }
 
-// connectDetails is the always-present `connect` block of the mint response:
-// it tells the caller WHERE to use the credential from the same authoritative
-// CP response that issued it, so nothing downstream re-derives its own idea of
-// the warehouse endpoint (out-of-band endpoint knowledge — a Django
-// `DuckgresServer` row — is exactly the drift this field exists to kill).
+// serviceCredentialRefreshRequest is the refresh body
+// (POST /api/v1/orgs/:id/service-credentials/refresh). Refresh ALWAYS rotates
+// the named grant's secret — it is how a caller that already holds a
+// credential_id extends its window (or recovers after an expiry) without
+// minting a second identity for the same principal.
+type serviceCredentialRefreshRequest struct {
+	CredentialID string `json:"credential_id"`
+	TTLSeconds   int    `json:"ttl_seconds"`
+}
+
+// connectDetails is the always-present `connect` block of the mint/refresh
+// response: it tells the caller WHERE to use the credential from the same
+// authoritative CP response that issued it, so nothing downstream re-derives
+// its own idea of the warehouse endpoint (out-of-band endpoint knowledge — a
+// Django `DuckgresServer` row — is exactly the drift this field exists to
+// kill).
 //
 // Host is the org's canonical ingress hostname — orgID + the managed ingress
 // suffix the CP is configured with — i.e. the very value the pgwire TLS
@@ -74,59 +90,40 @@ type connectDetails struct {
 	SslMode  string `json:"sslmode"`
 }
 
+// serviceCredentialResponse is the mint/refresh response. CredentialSecret is
+// present ONLY when the CP bound a fresh secret (a fresh mint, a
+// force_rotate, or any refresh); CredentialID/ExpiresAt/Connect are always
+// present so the caller can always take its connection target from this same
+// response.
 type serviceCredentialResponse struct {
-	Username string `json:"username"`
-	// Password is omitted (not empty-stringed) when the CP reused a live
-	// grant: a caller that already holds the credential keeps using it;
-	// echoing "" would risk clients treating "" as the credential itself.
-	Password  string    `json:"password,omitempty"`
-	ExpiresAt time.Time `json:"expires_at"`
-	// Connect is unconditional (unlike Password): identical shape on reuse
-	// and rotate, so the client can always take its connection target from
-	// this same response instead of holding its own out-of-band copy.
+	CredentialID string `json:"credential_id"`
+	// CredentialSecret is omitted (not empty-stringed) when the mint reused a
+	// live grant: a caller that already holds the secret keeps using it;
+	// echoing "" would risk clients treating "" as the secret itself.
+	CredentialSecret string    `json:"credential_secret,omitempty"`
+	ExpiresAt        time.Time `json:"expires_at"`
+	// Connect is unconditional (unlike CredentialSecret): identical shape on
+	// reuse and rotate, so the client can always take its connection target
+	// from this same response instead of holding its own out-of-band copy.
 	Connect connectDetails `json:"connect"`
 }
 
 // TenantStore is the subset of the config store the service-credential
-// handler needs. Satisfied by the live gorm store in production; faked in
+// handlers need. Satisfied by the live gorm store in production; faked in
 // tests.
 type TenantStore interface {
-	ListOrgTeams(orgID string) ([]configstore.OrgTeam, error)
-	IssueProjectUserServiceCredential(orgID string, teamID int64, principal string, ttl time.Duration, forceRotate bool) (*configstore.ServiceCredentialIssue, error)
+	OrgExists(orgID string) (bool, error)
+	MintServiceCredential(orgID, principal string, ttl time.Duration, forceRotate bool) (*configstore.ServiceCredentialIssue, error)
+	RefreshServiceCredential(orgID, credentialID string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error)
 	ReloadSnapshot() error
 }
 
-// registerServiceCredentialAPI adds the credential-mint route to the same
-// router group as the rest of the provisioning API (it's mounted by
-// RegisterAPI). Keeping it here — not in the admin package — because the
-// caller is PostHog's backend (internal-secret), the same trust class as the
-// other provisioning routes, not a human operator.
-func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore) {
-	orgID := c.Param("id")
-
-	var req serviceCredentialRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if req.TeamID <= 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id must be a positive integer"})
-		return
-	}
-	// The route carries :team_id too; require the two to agree so a copy-paste
-	// bug in a caller surfaces as a 400 here instead of a credential minted
-	// against the WRONG team's namespaces.
-	if pathTeam, err := strconv.ParseInt(c.Param("team_id"), 10, 64); err != nil || pathTeam != req.TeamID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "path team_id must match body team_id"})
-		return
-	}
-	if req.Principal == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "principal is required (e.g. \"dagster:events-backfill\")"})
-		return
-	}
+// clampCredentialTTL applies the mint's policy: default when unset, clamped
+// (never rejected) into [minCredentialTTL, maxCredentialTTL] when set.
+func clampCredentialTTL(ttlSeconds int) time.Duration {
 	ttl := defaultCredentialTTL
-	if req.TTLSeconds > 0 {
-		ttl = time.Duration(req.TTLSeconds) * time.Second
+	if ttlSeconds > 0 {
+		ttl = time.Duration(ttlSeconds) * time.Second
 	}
 	if ttl < minCredentialTTL {
 		ttl = minCredentialTTL
@@ -134,71 +131,29 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 	if ttl > maxCredentialTTL {
 		ttl = maxCredentialTTL
 	}
+	return ttl
+}
 
-	// Confirm the team exists and is enabled before doing any credential work:
-	// the minted login binds exactly that team's namespaces, so minting against
-	// a missing/disabled team would hand out a credential that resolves to a
-	// fail-closed empty scope — confusing to debug from the caller side. 409
-	// (not 404) to match the project-login admin endpoint's
-	// ErrProjectTeamUnavailable mapping: the org may exist while the team
-	// row is gone, which is a caller-visible state conflict, not "no org".
-	teams, err := tenantStore.ListOrgTeams(orgID)
-	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	teamEnabled := false
-	for _, t := range teams {
-		if t.TeamID == req.TeamID && t.Enabled {
-			teamEnabled = true
-			break
-		}
-	}
-	if !teamEnabled {
-		c.JSON(http.StatusConflict, gin.H{"error": configstore.ErrProjectTeamUnavailable.Error()})
-		return
-	}
-
-	issued, err := tenantStore.IssueProjectUserServiceCredential(orgID, req.TeamID, req.Principal, ttl, req.ForceRotate)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	// The write landed in the shared config-store DB; make THIS replica's
-	// snapshot see the new hash immediately rather than waiting one poll
-	// interval (default 30s) — otherwise the freshly issued credential would
-	// routinely fail its first few auth attempts on this CP.
+// afterCredentialWrite makes a landed grant write authable without waiting a
+// poll interval (default 30s): reload THIS replica's snapshot immediately,
+// then fan the same reload out to PEER replicas (best-effort — a slow/down
+// peer converges within one poll interval) because the client's pgwire
+// connection can land on any CP behind the load balancer.
+func (h *handler) afterCredentialWrite(c *gin.Context, tenantStore TenantStore) error {
 	if err := tenantStore.ReloadSnapshot(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "credential issued but snapshot reload failed: " + err.Error()})
-		return
+		return errors.New("credential written but snapshot reload failed: " + err.Error())
 	}
-	// Fan the same reload out to PEER replicas: the client's pgwire
-	// connection can land on any CP behind the load balancer, so a credential
-	// minted on this replica must auth on whichever replica serves the
-	// connect. Best-effort (PostPeers already drops a slow/down peer without
-	// error) — a failed peer converges within one poll interval.
 	if h.peerFanout != nil {
 		h.peerFanout.PostPeers(c.Request.Context(), "/api/v1/internal/reload-snapshot")
 	}
-	// principal is required precisely so the rotation is attributable — log it
-	// (the admin audit log records the equivalent project-login rotations from
-	// operators; this path is machine-driven and its audit record is the CP's
-	// structured log).
-	slog.Info("service credential issued.",
-		"org", orgID, "team_id", req.TeamID,
-		"principal", req.Principal,
-		"rotated", issued.Rotated,
-		"expires_at", issued.ExpiresAt.UTC().Format(time.RFC3339),
-	)
+	return nil
+}
 
-	resp := serviceCredentialResponse{
-		Username:  issued.Username,
-		Password:  issued.Plaintext,
-		ExpiresAt: issued.ExpiresAt,
+func (h *handler) credentialResponse(orgID string, issued *configstore.ServiceCredentialIssue) serviceCredentialResponse {
+	return serviceCredentialResponse{
+		CredentialID:     issued.CredentialID,
+		CredentialSecret: issued.Plaintext,
+		ExpiresAt:        issued.ExpiresAt,
 		Connect: connectDetails{
 			// The org's canonical ingress hostname — orgID + the CP's
 			// configured managed-ingress suffix — i.e. exactly the value the
@@ -210,7 +165,124 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 			SslMode:  "require",
 		},
 	}
-	c.JSON(http.StatusOK, resp)
+}
+
+// issueServiceCredential handles POST /api/v1/orgs/:id/service-credentials.
+// It sits next to the other provisioning routes (not the admin package)
+// because the caller is PostHog's backend (internal-secret), the same trust
+// class as the other provisioning routes, not a human operator.
+func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore) {
+	orgID := c.Param("id")
+
+	var req serviceCredentialRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Principal == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "principal is required (e.g. \"dagster:events-backfill\")"})
+		return
+	}
+	ttl := clampCredentialTTL(req.TTLSeconds)
+
+	// Confirm the org exists before doing any credential work: a minted
+	// credential authenticates against the org, so minting into a ghost org
+	// would hand out an unresolvable identity — confusing to debug from the
+	// caller side. 404: the path parameter names the org.
+	exists, err := tenantStore.OrgExists(orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		return
+	}
+
+	issued, err := tenantStore.MintServiceCredential(orgID, req.Principal, ttl, req.ForceRotate)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.afterCredentialWrite(c, tenantStore); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// principal is required precisely so the mint is attributable — log it
+	// (the admin audit log records operator actions; this path is
+	// machine-driven and its audit record is the CP's structured log plus the
+	// grant row itself).
+	slog.Info("service credential minted.",
+		"org", orgID,
+		"credential_id", issued.CredentialID,
+		"principal", issued.Principal,
+		"rotated", issued.Rotated,
+		"expires_at", issued.ExpiresAt.UTC().Format(time.RFC3339),
+	)
+
+	c.JSON(http.StatusOK, h.credentialResponse(orgID, issued))
+}
+
+// refreshServiceCredential handles
+// POST /api/v1/orgs/:id/service-credentials/refresh. Refresh ALWAYS rotates
+// the named grant's secret and returns the new plaintext — unlike mint, there
+// is no reuse branch: the caller named a specific credential, so "change
+// nothing" would be a lie either way.
+func (h *handler) refreshServiceCredential(c *gin.Context, tenantStore TenantStore) {
+	orgID := c.Param("id")
+
+	var req serviceCredentialRefreshRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.CredentialID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "credential_id is required"})
+		return
+	}
+	ttl := clampCredentialTTL(req.TTLSeconds)
+
+	exists, err := tenantStore.OrgExists(orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		return
+	}
+
+	issued, err := tenantStore.RefreshServiceCredential(orgID, req.CredentialID, ttl)
+	if err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrServiceCredentialNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, configstore.ErrServiceCredentialRevoked):
+			// 410 Gone: the credential existed and is terminally dead —
+			// distinguishable from a 404 (never existed) and from a rotation
+			// race.
+			c.JSON(http.StatusGone, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	if err := h.afterCredentialWrite(c, tenantStore); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	slog.Info("service credential refreshed.",
+		"org", orgID,
+		"credential_id", issued.CredentialID,
+		"principal", issued.Principal,
+		"expires_at", issued.ExpiresAt.UTC().Format(time.RFC3339),
+	)
+
+	c.JSON(http.StatusOK, h.credentialResponse(orgID, issued))
 }
 
 // managedIngressSuffix returns the DNS suffix joined onto the org ID to build

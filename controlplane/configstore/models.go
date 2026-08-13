@@ -114,14 +114,6 @@ type OrgUser struct {
 	MaxVCPUs  int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
-	// ServiceGrantExpiresAt is the expiry of the live SERVICE-CREDENTIAL
-	// grant for this user (see configstore.IssueProjectUserServiceCredential).
-	// NULL unless the most recent credential for this login was issued via
-	// that path: the admin project-login rotation clears it when it
-	// overwrites the password, so a service mint never reuses — nor reports
-	// an expiry against — a hash it did not issue. Never serialized (it's an
-	// internal mint clock, not a credential attribute).
-	ServiceGrantExpiresAt *time.Time `gorm:"column:service_grant_expires_at" json:"-"`
 }
 
 func (OrgUser) TableName() string { return "duckgres_org_users" }
@@ -162,6 +154,43 @@ type OrgUserSecret struct {
 }
 
 func (OrgUserSecret) TableName() string { return "duckgres_org_user_secrets" }
+
+// ServiceGrant is one minted service credential — the CP-owned pair of
+// (credential_id, secret-as-bcrypt-hash) every PostHog backend job (dagster,
+// today) authenticates with. Deliberately NOT a duckgres_org_users row: the
+// credential's lifecycle (its TTL, its rotation clock, its audit attribution)
+// is per-credential, and sharing a row with an operator-owned org user would
+// mean an admin rotation or a password update could clobber a minted
+// credential mid-run. The bcrypt hash lives here precisely so the
+// service-credential plane stops depending on ANYTHING in
+// duckgres_org_users for storage.
+//
+// A live grant is one where revoked_at IS NULL AND expires_at > now().
+// Established sessions are never torn down by expiry or rotation — freshness
+// is enforced only at the pgwire handshake (the RDS-IAM contract); each new
+// connection mints or refreshes and the old secret is only refused at auth.
+//
+// Revoke keeps the row (revoked_at set) so investigation can still see
+// provenance; the hash is blanked on revoke so a leaked grant can never come
+// back online.
+type ServiceGrant struct {
+	OrgID        string `gorm:"primaryKey;type:text;index:idx_duckgres_service_grants_org_principal,priority:1;index:idx_duckgres_service_grants_org_state,priority:1" json:"org_id"`
+	CredentialID string `gorm:"primaryKey;type:text" json:"credential_id"`
+	// Principal is audit attribution ("dagster:events-backfill") — required
+	// at mint so every invocation is attributable. Indexed per
+	// (org_id, principal) via migration 000036 so the mint path can find the
+	// reusable live grant for a caller.
+	Principal     string     `gorm:"type:text;not null;index:idx_duckgres_service_grants_org_principal,priority:2" json:"principal"`
+	PasswordHash  string     `gorm:"type:text;not null" json:"-"`
+	MintedAt      time.Time  `gorm:"not null;default:now()" json:"minted_at"`
+	LastRotatedAt time.Time  `gorm:"not null;default:now()" json:"last_rotated_at"`
+	ExpiresAt     time.Time  `gorm:"not null;index:idx_duckgres_service_grants_org_state,priority:2" json:"expires_at"`
+	RevokedAt     *time.Time `gorm:"index:idx_duckgres_service_grants_org_state,priority:3" json:"revoked_at,omitempty"`
+	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"not null;default:now()" json:"updated_at"`
+}
+
+func (ServiceGrant) TableName() string { return "duckgres_service_grants" }
 
 // ManagedWarehouseProvisioningState is an open string used for warehouse lifecycle status.
 // The constants below are the canonical values used by current tooling, but callers may

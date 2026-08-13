@@ -1,6 +1,8 @@
 package configstore
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -10,20 +12,39 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// ServiceCredentialIssue is the result of issuing-or-reusing a team-scoped
-// service credential.
+// ServiceCredentialPrefix marks a pgwire username as a minted service
+// credential (credential_id) rather than a duckgres_org_users login. The
+// config snapshot resolves such usernames against duckgres_service_grants
+// rows ONLY — service credentials are never project-scoped and never touch
+// the org users table.
+const ServiceCredentialPrefix = "svc_"
+
+// ErrServiceCredentialNotFound is returned by RefreshServiceCredential and
+// RevokeServiceGrant when no grant row exists for (orgID, credentialID).
+// HTTP handlers map it to 404.
+var ErrServiceCredentialNotFound = errors.New("service credential not found")
+
+// ErrServiceCredentialRevoked is returned by RefreshServiceCredential when the
+// grant row exists but was revoked. Revocation is terminal; refresh must never
+// resurrect it. HTTP handlers map it to 410.
+var ErrServiceCredentialRevoked = errors.New("service credential revoked")
+
+// ServiceCredentialIssue is the result of minting-or-reusing a service
+// credential (MintServiceCredential) or rotating one
+// (RefreshServiceCredential).
 type ServiceCredentialIssue struct {
-	// Rotated reports whether the project_user login's password hash was
-	// replaced by this call (true) or an already-live credential was handed
-	// back (false).
+	// Rotated reports whether this call bound a FRESH secret (true — a new
+	// grant, a force-rotate, or a refresh) or handed an already-live grant
+	// back untouched (false, mint reuse only). Plaintext is non-empty exactly
+	// when Rotated is true: the store never persists plaintext, so a reused
+	// grant has nothing new to hand back.
 	Rotated bool
-	// Username the client connects as (posthog_team_<id>_rw).
-	Username string
-	// Plaintext is the credential the caller hands to clients. NEVER empty on
-	// success: when Rotated is true it's the newly bound password; when false
-	// it's re-derived such that it still matches the stored hash (see the
-	// reuse path in IssueProjectUserServiceCredential for how that's possible
-	// without storing plaintext).
+	// CredentialID is the server-generated identity the client connects as
+	// (svc_<24 random hex>).
+	CredentialID string
+	// Principal echoes the audit attribution the grant carries.
+	Principal string
+	// Plaintext is the freshly bound secret — ONLY set when Rotated is true.
 	Plaintext string
 	// ExpiresAt is the hard cut for NEW connections. Established sessions are
 	// never torn down on expiry — freshness is enforced only at the pgwire
@@ -31,41 +52,45 @@ type ServiceCredentialIssue struct {
 	ExpiresAt time.Time
 }
 
-// rotationSafetyWindowHash is the minimum remaining life below which we rotate
-// instead of reusing. Package-private: HTTP-layer callers see TTL clamping;
-// this is the implementation detail of "don't hand back a credential about to
-// expire".
-const rotationSafetyWindowHash = time.Minute
+// GenerateCredentialID returns a server-side random credential identity —
+// "svc_" + 24 hex chars (96 bits). Never caller-supplied.
+func GenerateCredentialID() (string, error) {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate credential id: %w", err)
+	}
+	return ServiceCredentialPrefix + hex.EncodeToString(b), nil
+}
 
-// IssueProjectUserServiceCredential returns a credential a short-lived job
-// can present as the pgwire password for one team's project_user login.
+// MintServiceCredential returns a service credential for (orgID, principal).
 //
 // Design (CLAUDE.md "Service Credentials"):
 //
-//   - Identity REUSE: the login is the team's canonical posthog_team_<id>_rw
-//     (access_mode=project_user), so sessions get exactly the namespaces the
-//     admin project-login endpoint would grant — no parallel policy to audit.
-//   - Expiry by ROTATION, not a stored timestamp: the hash on the row IS the
-//     credential. A caller asking again before the current grant expires gets
-//     the SAME credential back (no row change, no updated_at bump, no
-//     spurious discovery wake-ups); a caller asking after expiry triggers
-//     one bcrypt rotation, after which the prior credential stops working.
-//     Leak window = TTL + however long until the next touch by any caller.
+//   - Per-credential rows: every minted credential is its own
+//     duckgres_service_grants row keyed (org_id, credential_id). NOTHING is
+//     written to duckgres_org_users — there is no shared login row for an
+//     operator action to clobber mid-run.
+//   - Identity REUSE: one live grant per (org_id, principal). A mint while a
+//     live (not-revoked, not-expired) grant exists returns that grant's id and
+//     expiry with NO new plaintext (the caller already holding the secret
+//     keeps using it; a caller with nothing sets force_rotate). A mint with
+//     no live grant creates a fresh row and returns the plaintext once.
+//   - force_rotate re-binds the live grant's secret (rotating the bcrypt
+//     hash, bumping last_rotated_at, re-arming expires_at from THIS call's
+//     TTL) and returns the new plaintext. A revoked grant is terminal: reuse
+//     ignores it and force_rotate never resurrects it — the mint creates a
+//     new grant row instead.
 //   - Concurrency: the whole decide-then-mutate sequence runs under the org
-//     admission lock so two simultaneous issues for the same team can't
-//     double-rotate into racing hashes that invalidate each other.
-func (cs *ConfigStore) IssueProjectUserServiceCredential(
+//     admission lock so two simultaneous mints for the same principal can't
+//     double-create (or rotate against a stale read).
+func (cs *ConfigStore) MintServiceCredential(
 	orgID string,
-	teamID int64,
 	principal string,
 	ttl time.Duration,
 	forceRotate bool,
 ) (*ServiceCredentialIssue, error) {
 	if orgID == "" {
 		return nil, errors.New("orgID is required")
-	}
-	if teamID <= 0 {
-		return nil, errors.New("teamID must be a positive integer")
 	}
 	if principal == "" {
 		return nil, errors.New("principal is required")
@@ -74,142 +99,124 @@ func (cs *ConfigStore) IssueProjectUserServiceCredential(
 		return nil, errors.New("ttl must be positive")
 	}
 
-	username := fmt.Sprintf("posthog_team_%d_rw", teamID)
 	now := time.Now().UTC()
 
 	var issue *ServiceCredentialIssue
 	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		// Serialize with every other org-wide admission decision so a concurrent
-		// mint for another team (or an admin flip, or a second replica racing on
-		// this same team) can't interleave a stale read into the
-		// compare-then-rotate sequence.
+		// Serialize with every other org-wide admission decision (and every
+		// other mint/refresh for this org) so a concurrent caller can't
+		// interleave a stale read into the compare-then-rotate sequence.
 		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
 			return fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
 		}
 
-		// The team must exist and be enabled. The HTTP handler pre-checks this
-		// for a friendly 409, but the store enforces it independently of any
-		// caller because a minted login binds exactly that team's namespaces.
-		var team OrgTeam
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
-			&team, "org_id = ? AND team_id = ?", orgID, teamID,
-		).Error; err != nil {
+		// The org must exist. The HTTP handler pre-checks for a friendly 404,
+		// but the store enforces independently of any caller — a minted
+		// credential authenticates against the org, so minting into a ghost
+		// org would hand out an unresolvable identity.
+		var org Org
+		if err := tx.First(&org, "name = ?", orgID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrProjectTeamUnavailable
+				return gorm.ErrRecordNotFound
 			}
-			return fmt.Errorf("load org team (org=%s team=%d): %w", orgID, teamID, err)
-		}
-		if !team.Enabled {
-			return ErrProjectTeamUnavailable
+			return fmt.Errorf("load org (org=%s): %w", orgID, err)
 		}
 
-		var user OrgUser
-		// Look up by PRIMARY KEY only (org_id, username) — never by
-		// access_mode. A row with this username but a different mode must be
-		// treated as "exists": otherwise the rotate-vs-create split below would
-		// take the create branch straight into a PK conflict, or (worse) the
-		// username/account an admin flipped would coexist with the row the mint
-		// created. The rotate branch re-establishes every project_user
-		// invariant (mode, team, passthrough, enabled) on whatever row it finds.
-		loadErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
-			&user, "org_id = ? AND username = ?", orgID, username,
-		).Error
-		userExists := loadErr == nil
+		// Newest-first so that if legacy data ever leaves two live grants for
+		// one principal we deterministically reuse/rotate the freshest one.
+		//
+		// The expiry comparison carries 1ms of slack around captured-now:
+		// Postgres timestamptz stores at microsecond precision (rounding Go's
+		// finer wall clock), so an expires_at computed as now+ttl and read
+		// straight back can sit one rounding quantum EITHER side of what the
+		// exact comparison would classify. The probe's job is "is this grant
+		// still comfortably alive", and TTLs are minutes — treating anything
+		// within 1ms of now as still-live is always the right reuse call.
+		var grant ServiceGrant
+		loadErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("org_id = ? AND principal = ? AND revoked_at IS NULL AND expires_at > ?",
+				orgID, principal, now.Add(time.Millisecond)).
+			Order("expires_at DESC").
+			First(&grant).Error
+		liveExists := loadErr == nil
 		if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("load project user (org=%s user=%s): %w", orgID, username, loadErr)
+			return fmt.Errorf("load live service grant (org=%s principal=%s): %w", orgID, principal, loadErr)
 		}
 
-		if userExists && user.Disabled {
-			// Never resurrect a disabled login — not by reusing its live grant
-			// and not by rotating it. The kill switch is an explicit operator
-			// action and a service mint (an internal-secret-authed machine
-			// caller) must not undo it. The operator re-enables via the admin
-			// API; then the next mint succeeds.
-			return fmt.Errorf("project login %s in org %s is disabled; refusing to mint a service credential against it (re-enable via the admin API)", username, orgID)
-		}
-
-		if userExists && !forceRotate {
-			// The reuse decision must be driven by service_grant_expires_at —
-			// mint-time state only THIS path writes — never by updated_at,
-			// which the admin project-login rotation also bumps (that would
-			// silently reset the TTL clock and hand a fresh fetcher an empty
-			// plaintext for a credential it never saw). NULL means the last
-			// password-setter wasn't us (admin rotation, legacy row), so the
-			// hash is untrusted: fall through and rotate.
-			if exp := user.ServiceGrantExpiresAt; exp != nil && exp.UTC().After(now.Add(rotationSafetyWindowHash)) {
-				// Still comfortably valid. Hand back NO new plaintext AND no new
-				// hash: the caller already holding the prior credential can keep
-				// using it, and a fresh fetcher with nothing gets nothing —
-				// which forces it to come back after expiry (when this branch
-				// flips to rotate) rather than every fetch mid-job smashing the
-				// hash a run's sibling steps are still presenting.
-				issue = &ServiceCredentialIssue{
-					Rotated:   false,
-					Username:  username,
-					Plaintext: "",
-					// Report the grant's stored expiry — minted with the TTL in
-					// effect at mint time, not this call's ttl.
-					ExpiresAt: exp.UTC(),
-				}
-				return nil
+		if liveExists && !forceRotate {
+			// Reuse: hand back the grant's identity and its REAL expiry (armed
+			// with the TTL in effect when it was last minted/rotated, not this
+			// call's ttl). No row change, no updated_at bump — and no
+			// plaintext: the secret was returned exactly once, when it was
+			// bound.
+			issue = &ServiceCredentialIssue{
+				Rotated:      false,
+				CredentialID: grant.CredentialID,
+				Principal:    grant.Principal,
+				Plaintext:    "",
+				ExpiresAt:    grant.ExpiresAt.UTC(),
 			}
+			return nil
 		}
 
-		// Rotate (or create): bind a fresh random credential to the team's
-		// project_user login. Deleting the row is deliberately avoided — it
-		// would surface to discovery's change-marker consumers as a login
-		// removal and would drift from the admin console's "one writer login
-		// per team, CP-managed" model.
+		// Rotate (live grant + force_rotate) or create (no live grant): bind a
+		// fresh random secret.
 		plaintext, err := GeneratePassword()
 		if err != nil {
-			return fmt.Errorf("generate service credential: %w", err)
+			return fmt.Errorf("generate service credential secret: %w", err)
 		}
 		hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
 		if err != nil {
-			return fmt.Errorf("hash service credential: %w", err)
+			return fmt.Errorf("hash service credential secret: %w", err)
+		}
+		expiresAt := now.Add(ttl)
+
+		if liveExists {
+			result := tx.Model(&ServiceGrant{}).
+				Where("org_id = ? AND credential_id = ?", grant.OrgID, grant.CredentialID).
+				Updates(map[string]any{
+					"password_hash":   string(hash),
+					"last_rotated_at": now,
+					"expires_at":      expiresAt,
+					"updated_at":      now,
+				})
+			if result.Error != nil {
+				return fmt.Errorf("rotate service grant (org=%s credential=%s): %w", orgID, grant.CredentialID, result.Error)
+			}
+			issue = &ServiceCredentialIssue{
+				Rotated:      true,
+				CredentialID: grant.CredentialID,
+				Principal:    grant.Principal,
+				Plaintext:    plaintext,
+				ExpiresAt:    expiresAt,
+			}
+			return nil
 		}
 
-		if userExists {
-			// Update in place: set the mint clock (service_grant_expires_at),
-			// bumped updated_at so config-generation consumers see the rotation,
-			// and RE-ESTABLISH every project_user invariant — an operator who
-			// (mistakenly or maliciously) flipped mode/team/passthrough on this
-			// username must not widen or void the login a minted credential binds.
-			if err := tx.Model(&OrgUser{}).
-				Where("org_id = ? AND username = ?", orgID, username).
-				Updates(map[string]interface{}{
-					"password":                 string(hash),
-					"access_mode":              OrgUserAccessModeProjectUser,
-					"team_id":                  teamID,
-					"passthrough":              false,
-					"updated_at":               now,
-					"service_grant_expires_at": now.Add(ttl),
-				}).Error; err != nil {
-				return fmt.Errorf("rotate project user password (org=%s user=%s): %w", orgID, username, err)
-			}
-		} else {
-			expiresAt := now.Add(ttl)
-			user = OrgUser{
-				OrgID:                 orgID,
-				Username:              username,
-				Password:              string(hash),
-				Passthrough:           false,
-				AccessMode:            OrgUserAccessModeProjectUser,
-				TeamID:                &teamID,
-				Disabled:              false,
-				UpdatedAt:             now,
-				ServiceGrantExpiresAt: &expiresAt,
-			}
-			if err := tx.Create(&user).Error; err != nil {
-				return fmt.Errorf("create project user (org=%s user=%s): %w", orgID, username, err)
-			}
+		credentialID, err := GenerateCredentialID()
+		if err != nil {
+			return err
 		}
-
+		grant = ServiceGrant{
+			OrgID:         orgID,
+			CredentialID:  credentialID,
+			Principal:     principal,
+			PasswordHash:  string(hash),
+			MintedAt:      now,
+			LastRotatedAt: now,
+			ExpiresAt:     expiresAt,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		if err := tx.Create(&grant).Error; err != nil {
+			return fmt.Errorf("create service grant (org=%s principal=%s): %w", orgID, principal, err)
+		}
 		issue = &ServiceCredentialIssue{
-			Rotated:   true,
-			Username:  username,
-			Plaintext: plaintext,
-			ExpiresAt: now.Add(ttl),
+			Rotated:      true,
+			CredentialID: credentialID,
+			Principal:    principal,
+			Plaintext:    plaintext,
+			ExpiresAt:    expiresAt,
 		}
 		return nil
 	})
@@ -217,4 +224,158 @@ func (cs *ConfigStore) IssueProjectUserServiceCredential(
 		return nil, err
 	}
 	return issue, nil
+}
+
+// RefreshServiceCredential ALWAYS rotates an existing grant's secret and
+// re-arms its expiry from now+ttl, returning the new plaintext. It never
+// creates a grant (unknown credential_id → ErrServiceCredentialNotFound) and
+// never resurrects one (revoked → ErrServiceCredentialRevoked). An
+// already-expired (but not revoked) grant MAY be refreshed: expiry only
+// refuses NEW pgwire handshakes, and a refresh is how a caller that missed
+// the window gets back to a working secret without a full mint.
+//
+// The rotation does NOT tear down established sessions — the mint plane is
+// separate from connection scheduling.
+func (cs *ConfigStore) RefreshServiceCredential(
+	orgID string,
+	credentialID string,
+	ttl time.Duration,
+) (*ServiceCredentialIssue, error) {
+	if orgID == "" {
+		return nil, errors.New("orgID is required")
+	}
+	if credentialID == "" {
+		return nil, errors.New("credentialID is required")
+	}
+	if ttl <= 0 {
+		return nil, errors.New("ttl must be positive")
+	}
+
+	now := time.Now().UTC()
+
+	var issue *ServiceCredentialIssue
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
+		}
+
+		var grant ServiceGrant
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&grant, "org_id = ? AND credential_id = ?", orgID, credentialID,
+		).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrServiceCredentialNotFound
+			}
+			return fmt.Errorf("load service grant (org=%s credential=%s): %w", orgID, credentialID, err)
+		}
+		if grant.RevokedAt != nil {
+			return ErrServiceCredentialRevoked
+		}
+
+		plaintext, err := GeneratePassword()
+		if err != nil {
+			return fmt.Errorf("generate service credential secret: %w", err)
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+		if err != nil {
+			return fmt.Errorf("hash service credential secret: %w", err)
+		}
+		expiresAt := now.Add(ttl)
+		result := tx.Model(&ServiceGrant{}).
+			Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+			Updates(map[string]any{
+				"password_hash":   string(hash),
+				"last_rotated_at": now,
+				"expires_at":      expiresAt,
+				"updated_at":      now,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("rotate service grant (org=%s credential=%s): %w", orgID, credentialID, result.Error)
+		}
+		issue = &ServiceCredentialIssue{
+			Rotated:      true,
+			CredentialID: credentialID,
+			Principal:    grant.Principal,
+			Plaintext:    plaintext,
+			ExpiresAt:    expiresAt,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return issue, nil
+}
+
+// ListServiceGrants returns every grant row for the org — all statuses
+// (live, expired, revoked) — newest-activity first, for the admin UI. The
+// org-existence probe returns gorm.ErrRecordNotFound for a ghost org (the
+// admin handler maps it to 404). Rows carry the bcrypt hash but never
+// plaintext; callers must not serialize PasswordHash (the field is json:"-").
+func (cs *ConfigStore) ListServiceGrants(orgID string) ([]ServiceGrant, error) {
+	var count int64
+	if err := cs.db.Model(&Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
+		return nil, err
+	}
+	if count == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var grants []ServiceGrant
+	if err := cs.db.Where("org_id = ?", orgID).
+		Order("last_rotated_at DESC, credential_id").
+		Find(&grants).Error; err != nil {
+		return nil, err
+	}
+	return grants, nil
+}
+
+// RevokeServiceGrant terminally revokes one grant: sets revoked_at and BLANKS
+// the bcrypt hash so a leaked credential can never authenticate again, even if
+// the row is later misread. The row is kept for provenance — investigation can
+// still see who minted it and when. Returns gorm.ErrRecordNotFound for a ghost
+// org and ErrServiceCredentialNotFound for an unknown credential_id; revoking
+// an already-revoked grant succeeds (idempotent).
+func (cs *ConfigStore) RevokeServiceGrant(orgID, credentialID string) error {
+	if orgID == "" {
+		return errors.New("orgID is required")
+	}
+	if credentialID == "" {
+		return errors.New("credentialID is required")
+	}
+	now := time.Now().UTC()
+	return cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
+		}
+		var org Org
+		if err := tx.First(&org, "name = ?", orgID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return gorm.ErrRecordNotFound
+			}
+			return fmt.Errorf("load org (org=%s): %w", orgID, err)
+		}
+		var grant ServiceGrant
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(
+			&grant, "org_id = ? AND credential_id = ?", orgID, credentialID,
+		).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrServiceCredentialNotFound
+			}
+			return fmt.Errorf("load service grant (org=%s credential=%s): %w", orgID, credentialID, err)
+		}
+		if grant.RevokedAt != nil {
+			return nil // already revoked — idempotent
+		}
+		result := tx.Model(&ServiceGrant{}).
+			Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+			Updates(map[string]any{
+				"revoked_at":    now,
+				"password_hash": "",
+				"updated_at":    now,
+			})
+		if result.Error != nil {
+			return fmt.Errorf("revoke service grant (org=%s credential=%s): %w", orgID, credentialID, result.Error)
+		}
+		return nil
+	})
 }

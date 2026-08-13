@@ -56,6 +56,19 @@ type OrgUserAccessConfig struct {
 	TeamID *int64
 }
 
+// ServiceGrantConfig is the snapshot view of one duckgres_service_grants row,
+// keyed (orgID, credentialID) exactly like an OrgUserKey so the pgwire
+// resolution can treat a minted credential as just another (org, username)
+// auth target — against a different table. ExpiresAt/RevokedAt are evaluated
+// at auth time (never earlier): an expired grant refuses only NEW handshakes,
+// and revocation refuses them all.
+type ServiceGrantConfig struct {
+	PasswordHash  string
+	ExpiresAt     time.Time
+	RevokedAt     *time.Time
+	LastRotatedAt time.Time
+}
+
 // OrgUserQueryAccess is the project policy returned to pgwire and internal
 // admin sessions. The namespace grant is identical for both scoped modes;
 // ReadOnly is what separates a project reader from a project user.
@@ -81,10 +94,15 @@ var ErrProjectTeamUnavailable = errors.New("project login requires an enabled or
 
 // Snapshot holds a point-in-time copy of all config data for fast lookups.
 type Snapshot struct {
-	Orgs               map[string]*OrgConfig
-	DatabaseOrg        map[string]string     // database name -> org ID
-	HostnameAliasOrg   map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
-	OrgUserPassword    map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	Orgs             map[string]*OrgConfig
+	DatabaseOrg      map[string]string     // database name -> org ID
+	HostnameAliasOrg map[string]string     // hostname alias -> org ID (sparse — only orgs with non-empty alias)
+	OrgUserPassword  map[OrgUserKey]string // (orgID, username) -> bcrypt hash
+	// OrgServiceGrant maps (orgID, credentialID) -> the grant's snapshot view
+	// for pgwire auth of svc_-prefixed usernames. Service credentials are
+	// resolved against THIS map only — never duckgres_org_users — and only
+	// live (not-revoked, not-expired) grants can authenticate.
+	OrgServiceGrant    map[OrgUserKey]ServiceGrantConfig
 	OrgUserRevision    map[OrgUserKey]string // (orgID, username) -> non-secret session credential revision
 	OrgUserPassthrough map[OrgUserKey]bool   // (orgID, username) -> passthrough flag
 	OrgUserDisabled    map[OrgUserKey]bool   // (orgID, username) -> disabled (kill switch); refused at connect time
@@ -228,17 +246,31 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	if err := cs.db.Preload("Users").Preload("Warehouse").Preload("Teams").Find(&orgs).Error; err != nil {
 		return nil, fmt.Errorf("load orgs: %w", err)
 	}
+	var serviceGrants []ServiceGrant
+	if err := cs.db.Find(&serviceGrants).Error; err != nil {
+		return nil, fmt.Errorf("load service grants: %w", err)
+	}
 
 	snap := &Snapshot{
 		Orgs:               make(map[string]*OrgConfig),
 		DatabaseOrg:        make(map[string]string),
 		HostnameAliasOrg:   make(map[string]string),
 		OrgUserPassword:    make(map[OrgUserKey]string),
+		OrgServiceGrant:    make(map[OrgUserKey]ServiceGrantConfig),
 		OrgUserRevision:    make(map[OrgUserKey]string),
 		OrgUserPassthrough: make(map[OrgUserKey]bool),
 		OrgUserDisabled:    make(map[OrgUserKey]bool),
 		OrgUserMaxVCPUs:    make(map[OrgUserKey]int),
 		OrgUserAccess:      make(map[OrgUserKey]OrgUserAccessConfig),
+	}
+
+	for _, g := range serviceGrants {
+		snap.OrgServiceGrant[OrgUserKey{OrgID: g.OrgID, Username: g.CredentialID}] = ServiceGrantConfig{
+			PasswordHash:  g.PasswordHash,
+			ExpiresAt:     g.ExpiresAt,
+			RevokedAt:     g.RevokedAt,
+			LastRotatedAt: g.LastRotatedAt,
+		}
 	}
 
 	for _, o := range orgs {
@@ -556,7 +588,14 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result.SNIOrgID = orgID
 	result.OrgID = orgID
 
-	// Authenticate the user within the resolved org.
+	// Authenticate the user within the resolved org. Minted service
+	// credentials (svc_-prefixed usernames) resolve against the grants
+	// snapshot map ONLY — the service plane shares no storage with
+	// duckgres_org_users, so a grant and an org user can never shadow each
+	// other.
+	if strings.HasPrefix(username, ServiceCredentialPrefix) {
+		return cs.resolveServiceGrantConnection(result, orgID, username, password)
+	}
 	key := OrgUserKey{OrgID: orgID, Username: username}
 	storedHash, ok := cs.snapshot.OrgUserPassword[key]
 	if !ok {
@@ -576,6 +615,32 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	if access, ok := orgUserQueryAccessFromSnapshot(cs.snapshot, orgID, username); ok {
 		result.QueryAccess = &access
 	}
+	return result
+}
+
+// resolveServiceGrantConnection authenticates a svc_-prefixed pgwire username
+// (a minted credential_id) against the snapshot's grant map. Expiry and
+// revocation are enforced HERE, at the handshake — never mid-session: an
+// expired grant refuses only NEW connections (a live session rides to
+// completion, the RDS-IAM contract), and a revoked one refuses them all.
+// Service credentials carry no project scope (root-shaped: unrestricted at
+// the org level), so QueryAccess stays nil/FALSE. The caller holds cs.mu.
+func (cs *ConfigStore) resolveServiceGrantConnection(
+	result PostgresConnectionResolution,
+	orgID, username, password string,
+) PostgresConnectionResolution {
+	grant, ok := cs.snapshot.OrgServiceGrant[OrgUserKey{OrgID: orgID, Username: username}]
+	if !ok || grant.RevokedAt != nil || !grant.ExpiresAt.After(time.Now()) || grant.PasswordHash == "" {
+		// Timing-leak guard: unknown, revoked, expired, and hash-blanked
+		// credentials all spend the same bcrypt time and all fail identically —
+		// which of those states a credential_id is in must not be probeable.
+		_ = bcrypt.CompareHashAndPassword([]byte(dummyBcryptHash), []byte(password))
+		return result
+	}
+	if bcrypt.CompareHashAndPassword([]byte(grant.PasswordHash), []byte(password)) != nil {
+		return result
+	}
+	result.Valid = true
 	return result
 }
 
@@ -779,15 +844,9 @@ func (cs *ConfigStore) CreateOrgUser(orgID, username, passwordHash string) error
 	}
 	return cs.db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "org_id"}, {Name: "username"}},
-		// Overwriting a password here installs a credential the
-		// service-credential path didn't issue: the mint clock must clear
-		// along with the hash (see IssueProjectUserServiceCredential — its
-		// reuse decision depends on service_grant_expires_at tracking the
-		// credential this path is now invalidating).
 		DoUpdates: clause.Assignments(map[string]interface{}{
-			"password":                 passwordHash,
-			"updated_at":               time.Now().UTC(),
-			"service_grant_expires_at": nil,
+			"password":   passwordHash,
+			"updated_at": time.Now().UTC(),
 		}),
 	}).Create(&user).Error
 }
@@ -797,8 +856,7 @@ func (cs *ConfigStore) UpdateOrgUserPassword(orgID, username, passwordHash strin
 	result := cs.db.Model(&OrgUser{}).
 		Where("org_id = ? AND username = ?", orgID, username).
 		Updates(map[string]interface{}{
-			"password":                 passwordHash,
-			"service_grant_expires_at": nil,
+			"password": passwordHash,
 		})
 	if result.Error != nil {
 		return result.Error

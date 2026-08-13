@@ -45,7 +45,7 @@ func newPostgresConfigStore(t *testing.T) *ConfigStore {
 
 func resetConfigStoreTestTables(t *testing.T, db *gorm.DB) {
 	t.Helper()
-	for _, model := range []any{&ManagedWarehouse{}, &OrgUser{}, &OrgTeam{}, &Org{}} {
+	for _, model := range []any{&ServiceGrant{}, &ManagedWarehouse{}, &OrgUser{}, &OrgTeam{}, &Org{}} {
 		if err := db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(model).Error; err != nil {
 			panic(fmt.Sprintf("delete %T: %v", model, err))
 		}

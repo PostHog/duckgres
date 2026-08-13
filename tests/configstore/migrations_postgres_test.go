@@ -54,7 +54,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 33)
 	requireGooseMigrationRecorded(t, db, 34)
 	requireGooseMigrationRecorded(t, db, 35)
-	requireGooseLatestVersion(t, db, 35)
+	requireGooseMigrationRecorded(t, db, 36)
+	requireGooseLatestVersion(t, db, 36)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -202,6 +203,31 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnAbsent(t, db, "duckgres_managed_warehouses", "iceberg_lakekeeper_endpoint")
 	requireColumnAbsent(t, db, "duckgres_managed_warehouses", "iceberg_state")
 	requireColumnAbsent(t, db, "duckgres_org_users", "default_catalog")
+
+	// Migration 000036 replaced the project_user-backed service-credential mint
+	// with per-credential grants: one duckgres_service_grants row per minted
+	// credential (AWS access-key style), and the per-USER mint clock
+	// (service_grant_expires_at, added by 000035 for the old mint) dropped.
+	requireTablePresent(t, db, "duckgres_service_grants")
+	for _, column := range []string{
+		"org_id",
+		"credential_id",
+		"principal",
+		"password_hash",
+		"minted_at",
+		"last_rotated_at",
+		"expires_at",
+		"revoked_at",
+		"created_at",
+		"updated_at",
+	} {
+		requireColumnPresent(t, db, "duckgres_service_grants", column)
+	}
+	requireColumnNullable(t, db, "duckgres_service_grants", "revoked_at")
+	requireColumnNotNull(t, db, "duckgres_service_grants", "principal")
+	requireColumnNotNull(t, db, "duckgres_service_grants", "password_hash")
+	requireColumnNotNull(t, db, "duckgres_service_grants", "expires_at")
+	requireColumnAbsent(t, db, "duckgres_org_users", "service_grant_expires_at")
 }
 
 func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
@@ -245,7 +271,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
+			DROP TABLE IF EXISTS duckgres_service_grants;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -294,7 +321,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 33)
 	requireGooseMigrationRecorded(t, upgradedDB, 34)
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
-	requireGooseLatestVersion(t, upgradedDB, 35)
+	requireGooseMigrationRecorded(t, upgradedDB, 36)
+	requireGooseLatestVersion(t, upgradedDB, 36)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -310,6 +338,13 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
 	requireColumnDefault(t, upgradedDB, "duckgres_managed_warehouses", "metadata_proxy_enabled", "false")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "default_catalog")
+	// Migration 000036 replays: the grants table exists and the old per-user
+	// mint clock (explicitly dropped in the downgrade fixture above) does not
+	// come back.
+	requireTablePresent(t, upgradedDB, "duckgres_service_grants")
+	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "credential_id")
+	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "password_hash")
+	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "service_grant_expires_at")
 
 }
 
@@ -329,7 +364,8 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		VALUES ('existing-naming-policy', 'existing-naming-policy', now(), now());
 		ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
 		ALTER TABLE duckgres_org_users DROP COLUMN IF EXISTS service_grant_expires_at;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35);
+		DROP TABLE IF EXISTS duckgres_service_grants;
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}
@@ -616,6 +652,7 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 		&cpconfigstore.OrgTeam{},
 		&cpconfigstore.OrgUserSecret{},
 		&cpconfigstore.Operator{},
+		&cpconfigstore.ServiceGrant{},
 	); err != nil {
 		t.Fatalf("auto-migrate gorm comparison schema: %v", err)
 	}
@@ -993,6 +1030,7 @@ func loadConfigStoreColumnMetadata(t *testing.T, db *sql.DB) map[string]columnMe
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -1051,6 +1089,7 @@ func loadConfigStorePrimaryKeys(t *testing.T, db *sql.DB) map[string]primaryKeyM
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -1104,6 +1143,7 @@ func loadConfigStoreIndexes(t *testing.T, db *sql.DB) map[string]indexMetadata {
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -1169,6 +1209,7 @@ func loadConfigStoreForeignKeys(t *testing.T, db *sql.DB) map[string]foreignKeyM
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',

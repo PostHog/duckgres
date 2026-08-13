@@ -47,20 +47,13 @@ func assertConnectBlock(t *testing.T, body map[string]any, wantHost string) {
 	}
 }
 
-// pinServiceCredentialUsername locks the CP-issued login name to the same
-// derivation the admin console uses for a team's read/write project login
-// (controlplane/admin/api.go projectUserUsername). If the admin side ever
-// changes its name mint, this test failing is the tripwire that says "the
-// service-credential path is now handing out credentials for a DIFFERENT
-// login than the console manages".
-func TestIssueServiceCredentialUsernameMatchesAdminProjectUser(t *testing.T) {
+func TestIssueServiceCredentialFreshMintShape(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
 	router := newTestRouter(store)
 
-	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "dagster:events-backfill", "force_rotate": true}`)
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
+		`{"principal": "dagster:events-backfill", "force_rotate": true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -68,14 +61,23 @@ func TestIssueServiceCredentialUsernameMatchesAdminProjectUser(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if got, want := body["username"], "posthog_team_42_rw"; got != want {
-		t.Fatalf("username = %v, want %v", got, want)
+	credID, _ := body["credential_id"].(string)
+	if !strings.HasPrefix(credID, "svc_") {
+		t.Fatalf("credential_id = %q, want svc_-prefixed", credID)
 	}
-	if pw, _ := body["password"].(string); pw == "" {
-		t.Fatal("password must be non-empty on rotate")
+	if pw, _ := body["credential_secret"].(string); pw == "" {
+		t.Fatal("credential_secret must be non-empty on a fresh mint")
 	}
 	if body["expires_at"] == nil {
 		t.Fatal("expires_at must be present")
+	}
+	// Exactly the contract keys — no username/password echo from the old shape.
+	for k := range body {
+		switch k {
+		case "credential_id", "credential_secret", "expires_at", "connect":
+		default:
+			t.Fatalf("unexpected key %q in mint response: %v", k, body)
+		}
 	}
 	// newTestRouter wires no ingress suffix ⇒ the handler falls back to the
 	// default managed ingress suffix.
@@ -90,13 +92,13 @@ func TestIssueServiceCredentialRejectsBadInput(t *testing.T) {
 	cases := []struct {
 		name, body string
 	}{
-		{"missing team_id", `{"principal":"dagster:x"}`},
-		{"negative team_id", `{"team_id":-1,"principal":"dagster:x"}`},
-		{"missing principal", `{"team_id":42}`},
+		{"missing principal", `{}`},
+		{"empty principal", `{"principal":""}`},
+		{"malformed json", `{"principal":`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials", tc.body)
+			rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials", tc.body)
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 			}
@@ -104,36 +106,36 @@ func TestIssueServiceCredentialRejectsBadInput(t *testing.T) {
 	}
 }
 
-func TestIssueServiceCredentialRejectsDisabledTeam(t *testing.T) {
+func TestIssueServiceCredentialGhostOrg404(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["acme"] = &configstore.Org{Name: "acme"}
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: false})
 	router := newTestRouter(store)
 
-	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "dagster:events-backfill", "force_rotate": true}`)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/ghost/service-credentials",
+		`{"principal": "dagster:x"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.mintCreds) != 0 {
+		t.Fatalf("mint must not be attempted against a ghost org, got %d calls", len(store.mintCreds))
 	}
 }
 
 func TestIssueServiceCredentialThreadsTTLAndForceRotate(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
 	router := newTestRouter(store)
 
-	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "dagster:events-backfill", "ttl_seconds": 900, "force_rotate": true}`)
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
+		`{"principal": "dagster:events-backfill", "ttl_seconds": 900, "force_rotate": true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
-	if len(store.issueCreds) != 1 {
-		t.Fatalf("issueCreds len = %d, want 1", len(store.issueCreds))
+	if len(store.mintCreds) != 1 {
+		t.Fatalf("mintCreds len = %d, want 1", len(store.mintCreds))
 	}
-	got := store.issueCreds[0]
-	if got.TeamID != 42 || got.Principal != "dagster:events-backfill" || got.TTLSeconds != 900 || !got.ForceRotate {
-		t.Fatalf("issueCreds[0] = %+v, want team 42 / principal dagster:events-backfill / ttl 900 / force_rotate true", got)
+	got := store.mintCreds[0]
+	if got.Principal != "dagster:events-backfill" || got.TTLSeconds != 900 || !got.ForceRotate {
+		t.Fatalf("mintCreds[0] = %+v, want principal dagster:events-backfill / ttl 900 / force_rotate true", got)
 	}
 	if store.reloadSnapshotN != 1 {
 		t.Fatalf("ReloadSnapshot called %d times, want exactly 1 (fresh credential must auth without waiting a poll)", store.reloadSnapshotN)
@@ -143,56 +145,66 @@ func TestIssueServiceCredentialThreadsTTLAndForceRotate(t *testing.T) {
 func TestIssueServiceCredentialClampsTTL(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
 	router := newTestRouter(store)
 
 	// Tiny ttl_seconds must be raised to the floor, not rejected — a caller
 	// never has to guess server policy to get a usable credential.
-	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "d", "ttl_seconds": 1, "force_rotate": true}`)
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
+		`{"principal": "d", "ttl_seconds": 1, "force_rotate": true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	if got := store.issueCreds[0].TTLSeconds; got != int(minCredentialTTL/time.Second) {
+	if got := store.mintCreds[0].TTLSeconds; got != int(minCredentialTTL/time.Second) {
 		t.Fatalf("clamped ttl_seconds = %d, want %d floor", got, int(minCredentialTTL/time.Second))
 	}
 
-	// Absent ttl_seconds → the default.
-	store.issueCreds = nil
-	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "d", "force_rotate": true}`)
+	// Huge ttl_seconds comes down to the ceiling.
+	store.mintCreds = nil
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
+		`{"principal": "d", "ttl_seconds": 999999, "force_rotate": true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	if got := store.issueCreds[0].TTLSeconds; got != int(defaultCredentialTTL/time.Second) {
+	if got := store.mintCreds[0].TTLSeconds; got != int(maxCredentialTTL/time.Second) {
+		t.Fatalf("clamped ttl_seconds = %d, want %d ceiling", got, int(maxCredentialTTL/time.Second))
+	}
+
+	// Absent ttl_seconds → the default.
+	store.mintCreds = nil
+	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
+		`{"principal": "d", "force_rotate": true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := store.mintCreds[0].TTLSeconds; got != int(defaultCredentialTTL/time.Second) {
 		t.Fatalf("default ttl_seconds = %d, want %d", got, int(defaultCredentialTTL/time.Second))
 	}
 }
 
-func TestIssueServiceCredentialReuseOmitsPasswordWhenGrantStillValid(t *testing.T) {
+func TestIssueServiceCredentialReuseOmitsSecretWhenGrantStillValid(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
 	router := newTestRouter(store)
 
 	// The store reports a still-valid live grant (Rotated=false ⇒ the CP did
-	// not touch the hash) ⇒ the handler surfaces an EMPTY password: the
+	// not touch the hash) ⇒ the handler surfaces NO credential_secret: the
 	// caller already holds it (or must force_rotate). The whole point of the
-	// reuse path is NOT to leak plaintext for a credential the CP didn't
-	// just mint.
+	// reuse path is NOT to leak plaintext for a credential the CP didn't just
+	// mint.
 	store.issueCredsIssue = &configstore.ServiceCredentialIssue{
-		Rotated:   false,
-		Username:  "posthog_team_42_rw",
-		Plaintext: "",
-		ExpiresAt: time.Now().UTC().Add(10 * time.Minute),
+		Rotated:      false,
+		CredentialID: "svc_0123456789abcdef01234567",
+		Principal:    "d",
+		Plaintext:    "",
+		ExpiresAt:    time.Now().UTC().Add(10 * time.Minute),
 	}
-	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "d"}`)
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
+		`{"principal": "d"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	if body := rec.Body.String(); strings.Contains(body, `"password"`) {
-		t.Fatalf("reuse path must not echo a password, got: %s", body)
+	if body := rec.Body.String(); strings.Contains(body, `"credential_secret"`) {
+		t.Fatalf("reuse path must not echo a credential_secret, got: %s", body)
 	}
 	// ...but the connect block is unconditional: identical shape and values on
 	// the reuse path, so a caller can always take its connection target from
@@ -212,11 +224,10 @@ func TestIssueServiceCredentialReuseOmitsPasswordWhenGrantStillValid(t *testing.
 func TestIssueServiceCredentialConnectHostUsesWiredSuffix(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
-	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
 	router := newServiceCredentialRouter(store, ".dw.eu.postwh.com")
 
-	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "dagster:events-backfill", "force_rotate": true}`)
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
+		`{"principal": "dagster:events-backfill", "force_rotate": true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -225,4 +236,110 @@ func TestIssueServiceCredentialConnectHostUsesWiredSuffix(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	assertConnectBlock(t, body, "acme.dw.eu.postwh.com")
+}
+
+// The team-scoped route is GONE: service credentials are not project-scoped,
+// so the old path must not resolve (gin has no such route).
+func TestTeamScopedServiceCredentialRouteRemoved(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "acme", TeamID: 42, SchemaName: "team_42", Enabled: true})
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
+		`{"team_id": 42, "principal": "dagster:x", "force_rotate": true}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (route removed): %s", rec.Code, rec.Body.String())
+	}
+	if len(store.mintCreds) != 0 {
+		t.Fatalf("no mint call expected on the removed route, got %d", len(store.mintCreds))
+	}
+}
+
+func TestRefreshServiceCredentialAlwaysReturnsSecret(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials/refresh",
+		`{"credential_id": "svc_0123456789abcdef01234567", "ttl_seconds": 300}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.refreshCreds) != 1 {
+		t.Fatalf("refreshCreds len = %d, want 1", len(store.refreshCreds))
+	}
+	got := store.refreshCreds[0]
+	if got.CredentialID != "svc_0123456789abcdef01234567" || got.TTLSeconds != 300 {
+		t.Fatalf("refreshCreds[0] = %+v, want the named credential at ttl 300", got)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["credential_id"] != "svc_0123456789abcdef01234567" {
+		t.Fatalf("credential_id = %v", body["credential_id"])
+	}
+	if pw, _ := body["credential_secret"].(string); pw == "" {
+		t.Fatal("refresh ALWAYS returns the freshly rotated credential_secret")
+	}
+	if body["expires_at"] == nil {
+		t.Fatal("expires_at must be present")
+	}
+	assertConnectBlock(t, body, "acme"+DefaultManagedIngressSuffix)
+	if store.reloadSnapshotN != 1 {
+		t.Fatalf("ReloadSnapshot called %d times, want exactly 1", store.reloadSnapshotN)
+	}
+}
+
+func TestRefreshServiceCredentialRejectsBadInput(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials/refresh",
+		`{}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (credential_id required): %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRefreshServiceCredentialGhostOrg404(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/ghost/service-credentials/refresh",
+		`{"credential_id": "svc_0123456789abcdef01234567"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+	if len(store.refreshCreds) != 0 {
+		t.Fatalf("refresh must not be attempted against a ghost org, got %d calls", len(store.refreshCreds))
+	}
+}
+
+func TestRefreshServiceCredentialUnknownCredential404(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.refreshCredsErr = configstore.ErrServiceCredentialNotFound
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials/refresh",
+		`{"credential_id": "svc_eeeeeeeeeeeeeeeeeeeeeeee"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRefreshServiceCredentialRevoked410(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.refreshCredsErr = configstore.ErrServiceCredentialRevoked
+	router := newTestRouter(store)
+
+	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials/refresh",
+		`{"credential_id": "svc_0123456789abcdef01234567"}`)
+	if rec.Code != http.StatusGone {
+		t.Fatalf("status = %d, want 410 (revoked is terminal): %s", rec.Code, rec.Body.String())
+	}
 }
