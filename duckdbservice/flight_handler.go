@@ -721,10 +721,6 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
 
-	// Send DuckDB profiling output as gRPC trailing metadata so the
-	// control plane can attach it to the trace span.
-	sendProfilingMetadata(ctx, session)
-
 	handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
 	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handleID))
 	if err != nil {
@@ -822,6 +818,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 
 		inTxn := tx != nil || session.sqlTxActive.Load()
 		var closeRows func() error
+		execStartedAt := clearProfilingOutput()
 		queryFn := func() (*sql.Rows, error) {
 			rows, closer, err := session.queryRows(ctx, tx, handle.Query)
 			if err != nil {
@@ -862,6 +859,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		}
 		defer func() {
 			_ = closeRows()
+			sendProfilingMetadataSince(ctx, execStartedAt)
 		}()
 
 		for {
@@ -937,6 +935,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	defer session.progress.queryActive.Store(false)
 	endTxnWork := ttx.beginWork()
 	defer endTxnWork()
+	execStartedAt := clearProfilingOutput()
 
 	execFn := func() (sql.Result, error) {
 		return session.exec(ctx, tx, query)
@@ -1003,7 +1002,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
 
-	sendProfilingMetadata(ctx, session)
+	sendProfilingMetadataSince(ctx, execStartedAt)
 
 	affected, err := result.RowsAffected()
 	if err != nil {

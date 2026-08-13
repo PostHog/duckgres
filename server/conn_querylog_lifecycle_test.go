@@ -349,3 +349,79 @@ func TestLifecyclePairFiresOnHandleExecuteQuery(t *testing.T) {
 	c.handleExecute(body)
 	assertLifecyclePair(t, buf, "handleExecute-Query")
 }
+
+func TestHandleExecuteLogsProfileAfterResultStreamCloses(t *testing.T) {
+	c, cleanup := newLifecycleClientConn(t)
+	defer cleanup()
+
+	profile := `{"cpu_time":2.5,"system_peak_buffer_memory":8192,"children":[]}`
+	exec := &closeProfileExecutor{profile: profile}
+	exec.rows = &closeProfileRowSet{onClose: func() { exec.ready = true }}
+	c.executor = exec
+	c.portals["p1"] = &portal{stmt: &preparedStmt{
+		query:          "SELECT 1",
+		convertedQuery: "SELECT 1",
+	}}
+
+	c.handleExecute(append([]byte("p1\x00"), 0, 0, 0, 0))
+
+	select {
+	case entry := <-c.server.queryLogger.ch:
+		if entry.CPUTimeSeconds != 2.5 {
+			t.Fatalf("CPUTimeSeconds = %f, want 2.5", entry.CPUTimeSeconds)
+		}
+		if entry.PeakBufferMemoryBytes != 8192 {
+			t.Fatalf("PeakBufferMemoryBytes = %d, want 8192", entry.PeakBufferMemoryBytes)
+		}
+	default:
+		t.Fatal("expected terminal query-log entry")
+	}
+}
+
+type closeProfileExecutor struct {
+	rows    RowSet
+	profile string
+	ready   bool
+}
+
+func (e *closeProfileExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
+	return e.rows, nil
+}
+func (e *closeProfileExecutor) ExecContext(context.Context, string, ...any) (ExecResult, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *closeProfileExecutor) Query(string, ...any) (RowSet, error) { return e.rows, nil }
+func (e *closeProfileExecutor) Exec(string, ...any) (ExecResult, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *closeProfileExecutor) ConnContext(context.Context) (RawConn, error) {
+	return nil, errors.New("not implemented")
+}
+func (e *closeProfileExecutor) PingContext(context.Context) error { return nil }
+func (e *closeProfileExecutor) Close() error                      { return nil }
+func (e *closeProfileExecutor) LastProfilingOutput() string {
+	if !e.ready {
+		return ""
+	}
+	return e.profile
+}
+
+type closeProfileRowSet struct {
+	closed  bool
+	onClose func()
+}
+
+func (*closeProfileRowSet) Columns() ([]string, error) { return []string{"x"}, nil }
+func (*closeProfileRowSet) ColumnTypes() ([]ColumnTyper, error) {
+	return []ColumnTyper{stringColumnTyper{}}, nil
+}
+func (*closeProfileRowSet) Next() bool        { return false }
+func (*closeProfileRowSet) Scan(...any) error { return nil }
+func (r *closeProfileRowSet) Close() error {
+	if !r.closed {
+		r.closed = true
+		r.onClose()
+	}
+	return nil
+}
+func (*closeProfileRowSet) Err() error { return nil }

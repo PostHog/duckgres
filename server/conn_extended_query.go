@@ -912,9 +912,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 		rows, err = runQuery()
 	}
-	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
-	execSpan.End()
 	if err != nil {
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
@@ -929,10 +929,26 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 	keepRowsOpen := false
-	defer func() {
-		if !keepRowsOpen {
-			_ = rows.Close()
+	rowsFinished := false
+	profilingFinished := false
+	finishProfiling := func() {
+		if profilingFinished {
+			return
 		}
+		profilingFinished = true
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
+	}
+	finishRows := func() {
+		if keepRowsOpen || rowsFinished {
+			return
+		}
+		rowsFinished = true
+		_ = rows.Close()
+		finishProfiling()
+	}
+	defer func() {
+		finishRows()
 	}()
 
 	cols, err := rows.Columns()
@@ -941,6 +957,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.logger().Error("Columns error.", "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
 		return
 	}
@@ -991,12 +1008,8 @@ func (c *clientConn) handleExecute(body []byte) {
 		} else {
 			// The retried rowset replaces the original everywhere below —
 			// including as the rowset a suspension keeps open.
+			rows = retryRows
 			activeRows = retryRows
-			defer func() {
-				if !keepRowsOpen {
-					_ = retryRows.Close()
-				}
-			}()
 			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 		}
 	}
@@ -1005,6 +1018,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		queryFinalErr = stream.scanErr
 		c.sendError("ERROR", "42000", stream.scanErr.Error())
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", stream.scanErr.Error(), "extended")
 		return
 	}
@@ -1029,6 +1043,7 @@ func (c *clientConn) handleExecute(body []byte) {
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 		return
 	}
@@ -1041,14 +1056,15 @@ func (c *clientConn) handleExecute(body []byte) {
 		// entry is written by the leg that completes the portal.
 		keepRowsOpen = true
 		p.exec = &portalExec{
-			rows:           activeRows,
-			cols:           cols,
-			typeOIDs:       typeOIDs,
-			cmdType:        cmdType,
-			rowCount:       int64(rowCount),
-			originalQuery:  originalQuery,
-			convertedQuery: convertedQuery,
-			start:          start,
+			rows:            activeRows,
+			cols:            cols,
+			typeOIDs:        typeOIDs,
+			cmdType:         cmdType,
+			rowCount:        int64(rowCount),
+			originalQuery:   originalQuery,
+			convertedQuery:  convertedQuery,
+			start:           start,
+			finishProfiling: finishProfiling,
 		}
 		_ = wire.WritePortalSuspended(c.writer)
 		return
@@ -1057,6 +1073,7 @@ func (c *clientConn) handleExecute(body []byte) {
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = c.writeCommandComplete(tag)
+	finishRows()
 	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
 }
 

@@ -204,9 +204,9 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 		}
 		rows, err = runQuery()
 	}
-	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
-	execSpan.End()
 	if err != nil {
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
@@ -221,7 +221,11 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 		_ = c.flushWriter()
 		return 0, errCode, errMsg, nil
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		_ = rows.Close()
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
+	}()
 
 	cols, err := rows.Columns()
 	if err != nil {

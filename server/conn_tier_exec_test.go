@@ -1284,11 +1284,12 @@ func TestExtendedExecuteOOMEscalationFailureIsConnectionFatal(t *testing.T) {
 // identical schema.
 func TestExtendedExecuteZeroRowMidStreamOOMReexecutes(t *testing.T) {
 	first := &tierRowSet{err: errors.New(tierOOMError)}
+	retry := &tierRowSet{rows: []int64{5, 6}}
 	small := &tierExecutor{name: "small", queryFn: func(int, string) (RowSet, error) {
 		return first, nil
 	}}
 	big := &tierExecutor{name: "big", queryFn: func(int, string) (RowSet, error) {
-		return &tierRowSet{rows: []int64{5, 6}}, nil
+		return retry, nil
 	}}
 	c, out, reasons := newExtendedTierConn(small, big)
 
@@ -1298,8 +1299,11 @@ func TestExtendedExecuteZeroRowMidStreamOOMReexecutes(t *testing.T) {
 	if len(*reasons) != 1 || (*reasons)[0] != escalateReasonOOM {
 		t.Fatalf("switcher reasons = %v, want [%q]", *reasons, escalateReasonOOM)
 	}
-	if first.closed == 0 {
-		t.Fatal("the abandoned first RowSet was never closed")
+	if first.closed != 1 {
+		t.Fatalf("abandoned first RowSet closed %d times, want once", first.closed)
+	}
+	if retry.closed != 1 {
+		t.Fatalf("retried RowSet closed %d times, want once", retry.closed)
 	}
 	msgs := parseWireMsgs(t, out.Bytes())
 	if countMsgs(msgs, 'E') != 0 {
