@@ -129,9 +129,12 @@ func TestSendProfilingMetadataSinceRejectsStaleOutput(t *testing.T) {
 	}
 
 	startedAt := clearProfilingOutput()
-	time.Sleep(time.Millisecond)
 	if err := os.WriteFile(profilingOutputPath, []byte(`{"latency":0.2}`), 0o600); err != nil {
 		t.Fatalf("write completed profile: %v", err)
+	}
+	freshAt := startedAt.Add(time.Second)
+	if err := os.Chtimes(profilingOutputPath, freshAt, freshAt); err != nil {
+		t.Fatalf("set completed profile mtime: %v", err)
 	}
 	if got := profilingMetadataSince(startedAt); got != `{"latency":0.2}` {
 		t.Fatalf("completed profile metadata = %q", got)
