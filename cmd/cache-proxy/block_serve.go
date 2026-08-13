@@ -307,8 +307,8 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		if p.peers != nil {
 			peerStart := time.Now()
 			ok := false
-			if holder, flight, found := p.peers.LocateKey(key); found {
-				_, ok = p.peers.FetchFromPeer(holder, key, flight, func(rd io.Reader) (int64, error) {
+			if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {
+				_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) {
 					return p.store.PutStream(key, rd)
 				})
 			}

@@ -419,7 +419,7 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) (fetchResult, error) {
 	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
-			if holder, flight, ok := p.peers.LocateKey(cacheKey); ok {
+			if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
 				res, ok := p.fetchFromPeer(holder, flight, cacheKey, r)
 				if ok {
 					return res, nil
@@ -444,21 +444,12 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 // briefly on its fill instead of 404ing, so we read the bytes the peer just
 // fetched rather than re-fetching them from the origin ourselves).
 func (p *CacheProxy) fetchFromPeer(holder string, flight bool, cacheKey string, r *http.Request) (fetchResult, bool) {
-	_, peerSpan := proxyTracer.Start(r.Context(), "cache.peer_fetch")
-	defer peerSpan.End()
-	peerSpan.SetAttributes(attribute.Bool("duckgres.cache.peer_flight", flight))
-
-	n, ok := p.peers.FetchFromPeer(holder, cacheKey, flight, func(body io.Reader) (int64, error) {
+	n, ok := p.peers.FetchFromPeer(r.Context(), holder, cacheKey, flight, func(body io.Reader) (int64, error) {
 		return p.store.PutStream(cacheKey, body)
 	})
 	if !ok {
-		peerSpan.SetAttributes(attribute.Bool("duckgres.cache.peer_hit", false))
 		return fetchResult{}, false
 	}
-	peerSpan.SetAttributes(
-		attribute.Bool("duckgres.cache.peer_hit", true),
-		attribute.Int64("duckgres.bytes", n),
-	)
 	cacheBytesServed.WithLabelValues("peer").Add(float64(n))
 	return fetchResult{size: n, source: "peer"}, true
 }
@@ -871,6 +862,7 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 //	      its own origin fetch for the same bytes
 //	404 — neither
 func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
 	key := r.URL.Query().Get("key")
 	if !IsValidCacheKey(key) {
 		http.Error(w, "invalid key", http.StatusBadRequest)
@@ -894,8 +886,17 @@ func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
 // waited for instead of a 404 that would send it to the origin for the same
 // bytes the peer is already fetching.
 func (p *CacheProxy) HandlePeerGet(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
+	ctx, span := proxyTracer.Start(r.Context(), "cache.peer_serve", trace.WithAttributes(
+		attribute.String("http.request.method", r.Method),
+		attribute.String("client.address", r.RemoteAddr),
+	))
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	key := r.URL.Query().Get("key")
 	if !IsValidCacheKey(key) {
+		span.SetAttributes(attribute.Int("http.response.status_code", http.StatusBadRequest))
 		http.Error(w, "invalid key", http.StatusBadRequest)
 		return
 	}
@@ -906,13 +907,18 @@ func (p *CacheProxy) HandlePeerGet(w http.ResponseWriter, r *http.Request) {
 
 	reader, size, ok := p.store.Open(key)
 	if !ok {
+		span.SetAttributes(attribute.Int("http.response.status_code", http.StatusNotFound))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	defer func() { _ = reader.Close() }()
 
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	_, _ = io.Copy(w, reader)
+	n, _ := io.Copy(w, reader)
+	span.SetAttributes(
+		attribute.Int("http.response.status_code", http.StatusOK),
+		attribute.Int64("duckgres.bytes", n),
+	)
 }
 
 // waitForLocalFill blocks (bounded) until key lands on local disk or the
