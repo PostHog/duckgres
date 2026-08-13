@@ -140,10 +140,10 @@ func RegisterAPIWithIngressSuffix(r *gin.RouterGroup, store Store, tenantStore T
 	// Short-lived service credentials (AWS AccessKey/Secret style): a PostHog
 	// backend job (dagster) mints a per-credential grant — its own
 	// duckgres_service_grants row, never a duckgres_org_users row — and
-	// connects with (credential_id, secret). The mint reuses the principal's
-	// live grant (plaintext only when freshly rotated via force_rotate);
-	// refresh ALWAYS rotates the named grant. The plaintext is returned only
-	// here; the store persists only the bcrypt hash.
+	// connects with (credential_id, secret). Every mint creates a fresh grant;
+	// principal is audit metadata only. Refresh ALWAYS rotates the explicitly
+	// named grant. Plaintext is returned only here; the store persists only
+	// the bcrypt hash.
 	r.POST("/orgs/:id/service-credentials", func(c *gin.Context) {
 		h.issueServiceCredential(c, tenantStore)
 	})

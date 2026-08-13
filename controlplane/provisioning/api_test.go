@@ -33,9 +33,8 @@ type fakeStore struct {
 	latestChangeErr   error // set non-nil to fail LatestConfigChange
 
 	// ServiceCredential hooks. mintCreds/refreshCreds record every call so
-	// tests can assert the handler threads (org, principal, ttl, forceRotate)
-	// correctly and the reuse-vs-rotate branches respond with the right body
-	// shape.
+	// tests can assert the handler threads (org, principal, ttl) correctly and
+	// mint/refresh return the right body shape.
 	mintCreds         []serviceCredentialRequest
 	refreshCreds      []serviceCredentialRefreshRequest
 	issueCredsIssue   *configstore.ServiceCredentialIssue
@@ -399,12 +398,10 @@ func (s *fakeStore) MintServiceCredential(
 	orgID string,
 	principal string,
 	ttl time.Duration,
-	forceRotate bool,
 ) (*configstore.ServiceCredentialIssue, error) {
 	s.mintCreds = append(s.mintCreds, serviceCredentialRequest{
-		Principal:   principal,
-		TTLSeconds:  int(ttl / time.Second),
-		ForceRotate: forceRotate,
+		Principal:  principal,
+		TTLSeconds: int(ttl / time.Second),
 	})
 	if s.issueCredsErr != nil {
 		return nil, s.issueCredsErr
@@ -412,7 +409,6 @@ func (s *fakeStore) MintServiceCredential(
 	if s.issueCredsIssue == nil {
 		// Default: a freshly rotated credential expiring in an hour.
 		return &configstore.ServiceCredentialIssue{
-			Rotated:      true,
 			CredentialID: "svc_0123456789abcdef01234567",
 			Principal:    principal,
 			Plaintext:    "fake-plaintext-32chars-aaaaaaaaaaaa",
@@ -436,7 +432,6 @@ func (s *fakeStore) RefreshServiceCredential(
 	}
 	if s.refreshCredsIssue == nil {
 		return &configstore.ServiceCredentialIssue{
-			Rotated:      true,
 			CredentialID: credentialID,
 			Principal:    "dagster:refreshed",
 			Plaintext:    "fake-plaintext-32chars-bbbbbbbbbbbb",

@@ -235,6 +235,22 @@ column cannot be added to a populated table).
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
 
+Managed-warehouse backend jobs mint service credentials with `POST
+/api/v1/orgs/:id/service-credentials`. Every mint creates a new
+`credential_id` and secret; `principal` is audit metadata only, so concurrent
+jobs may use the same value safely. `ttl_seconds` defaults to 900 seconds and
+is clamped to 60–3600 seconds. Refresh targets one credential explicitly with
+`POST /api/v1/orgs/:id/service-credentials/refresh` and a `credential_id`.
+Expiry and revocation block new pgwire handshakes but do not terminate an
+already-authenticated session. If a caller loses a secret, mint a new
+credential; Duckgres stores only bcrypt hashes and cannot recover plaintext.
+For a rolling contract change, deploy the always-create Duckgres version to
+the entire fleet before removing the caller's legacy `force_rotate`/reuse
+fallback. New servers ignore the old field, but a new caller reaching an old
+server could still receive a reused credential without plaintext. Org
+deletion permanently removes its service-grant rows so an old secret cannot
+become valid if that org name is created again.
+
 ## Quick Start
 
 The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes.

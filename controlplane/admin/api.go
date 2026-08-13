@@ -248,6 +248,21 @@ func (s *gormAPIStore) CreateOrg(org *configstore.Org, teamID int64, schemaName 
 	// One transaction: org row + its first team row (same contract as the
 	// provisioning path — an org cannot exist without a team).
 	return s.db().Transaction(func(tx *gorm.DB) error {
+		// Serialize name reuse with credential lifecycle operations. Grants do
+		// not have a foreign key, so clean up rows orphaned by older Duckgres
+		// versions before this name becomes an org again.
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, org.Name); err != nil {
+			return err
+		}
+		var existing int64
+		if err := tx.Model(&configstore.Org{}).Where("name = ?", org.Name).Count(&existing).Error; err != nil {
+			return err
+		}
+		if existing == 0 {
+			if err := tx.Where("org_id = ?", org.Name).Delete(&configstore.ServiceGrant{}).Error; err != nil {
+				return err
+			}
+		}
 		if err := tx.Omit("Warehouse", "Teams").Create(org).Error; err != nil {
 			return err
 		}
@@ -357,6 +372,12 @@ func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 			return err
 		}
 		if err := tx.Where("org_id = ?", name).Delete(&configstore.OrgUser{}).Error; err != nil {
+			return err
+		}
+		// Org deletion is the lifecycle boundary for otherwise durable grant
+		// audit rows. Retaining them could reactivate an old secret if this org
+		// name were created again.
+		if err := tx.Where("org_id = ?", name).Delete(&configstore.ServiceGrant{}).Error; err != nil {
 			return err
 		}
 		result := tx.Where("name = ?", name).Delete(&configstore.Org{})

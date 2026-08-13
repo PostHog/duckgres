@@ -247,7 +247,13 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 		return nil, fmt.Errorf("load orgs: %w", err)
 	}
 	var serviceGrants []ServiceGrant
-	if err := cs.db.Find(&serviceGrants).Error; err != nil {
+	// The grants table is durable audit history and grows on every mint. The
+	// auth snapshot only needs rows that can still pass a NEW handshake;
+	// expired/revoked rows remain queryable through the admin API and refresh
+	// reads the database directly by credential ID.
+	if err := cs.db.
+		Where("revoked_at IS NULL AND expires_at > ? AND password_hash <> ''", time.Now()).
+		Find(&serviceGrants).Error; err != nil {
 		return nil, fmt.Errorf("load service grants: %w", err)
 	}
 

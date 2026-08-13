@@ -831,14 +831,13 @@ project-scoped (root-shaped: unrestricted at the org level).
 
 **Caller contract:**
 `POST /api/v1/orgs/:id/service-credentials` with
-`{principal, ttl_seconds?, force_rotate?}`. `principal` is audit attribution
-(`"dagster:events-backfill"`) AND the reuse key: one live grant per
-`(org_id, principal)`. `ttl_seconds` is clamped to [1 min, 1 h]
+`{principal, ttl_seconds?}`. `principal` is audit attribution
+(`"dagster:events-backfill"`) only: every request creates an independent grant
+with a new `credential_id` and secret, even when principals are identical.
+`ttl_seconds` is clamped to [1 min, 1 h]
 (default 15 min, the RDS-IAM precedent). Response is
-`{credential_id, credential_secret?, expires_at, connect}`;
-`credential_secret` is **omitted** when the mint reused a live grant, but
-`credential_id`/`expires_at`/`connect` are **always present** (reuse and
-rotate alike). `POST /api/v1/orgs/:id/service-credentials/refresh` with
+`{credential_id, credential_secret, expires_at, connect}`; all fields are
+always present. `POST /api/v1/orgs/:id/service-credentials/refresh` with
 `{credential_id, ttl_seconds?}` **ALWAYS rotates** the named grant's secret
 and returns `{credential_id, credential_secret, expires_at, connect}`.
 The caller is the internal-secret-authed PostHog backend — the routes sit
@@ -878,22 +877,21 @@ not the CP's. The CP wires the suffix from its first configured
   expired, and hash-blanked credentials all fail identically (with equalized
   bcrypt time — which state a credential_id is in is not probeable). A live
   grant is `revoked_at IS NULL AND expires_at > now()`.
-- **Reuse is keyed `(org_id, principal)`.** A mint while a live grant exists
-  returns the grant's identity and its REAL expiry with NO new plaintext (the
-  caller already holding the secret keeps using it; a caller with nothing
-  sets `force_rotate`). The secret is returned exactly once per binding —
-  when it is created (fresh grant), rotated (`force_rotate`), or refreshed
-  (`refresh`).
-- **`force_rotate` on mint re-binds the live grant's secret** (rotating the
-  bcrypt hash, bumping `last_rotated_at`, re-arming `expires_at` from the
-  request's TTL) and returns the new plaintext. This is the resolution of
-  the obvious timers race: without it, every run's first mint would be the
-  one rotating, which is exactly the concurrent-run clobbering the reuse
-  window exists to prevent.
+- **Mint always creates.** `principal` is non-unique audit metadata, never an
+  identity or reuse key. Every mint inserts a new row, returns its new ID and
+  plaintext once, and leaves every same-principal credential untouched. This
+  lets concurrent jobs keep a stable principal without sharing secrets.
+- **Management is by `credential_id`.** A caller keeps the ID returned by its
+  mint and supplies it to refresh/revoke. Losing the plaintext means minting a
+  new credential; plaintext cannot be recovered from the stored bcrypt hash.
+  New Duckgres servers ignore the removed `force_rotate` JSON field so an old
+  caller can still reach the always-create endpoint, but that compatibility
+  is one-way: deploy the always-create Duckgres version to the whole fleet
+  BEFORE removing PostHog's `force_rotate`/reuse fallback. A new caller talking
+  to an old server could otherwise receive a reused ID without plaintext.
 - **Refresh always rotates and never creates.** Unknown `credential_id` →
   404; a REVOKED grant → 410 (revocation is terminal: refresh never
-  resurrects, and a later mint for the same principal creates a NEW
-  credential rather than touching the dead row). An EXPIRED (but unrevoked)
+  resurrects). An EXPIRED (but unrevoked)
   grant MAY be refreshed — expiry only refuses NEW handshakes, so refresh is
   how a caller that missed the window recovers without minting a second
   identity for the same principal.
@@ -907,11 +905,25 @@ not the CP's. The CP wires the suffix from its first configured
   credential can never authenticate again and the provenance (principal,
   mint/rotation times) survives for investigation. `GET
   /api/v1/orgs/:id/service-grants` is the flat, all-statuses list — no
-  plaintext, no hashes (`PasswordHash` is `json:"-"`).
-- **Concurrency**: the decide-then-mutate sequence runs under
-  `LockOrgConnectionAdmissionTx`, so two racing mints/refreshes (two CP
-  replicas, or a run and a refresh) serialize on one hash — never
-  double-rotate into mutually-invalidating credentials.
+  plaintext, no hashes (`PasswordHash` is `json:"-"`). Durable history is
+  intentional because expired, unrevoked IDs remain refreshable and audit
+  provenance must survive; do not add expiry deletion. If grant volume makes
+  the operator list expensive, add pagination/archival as a separate API
+  change rather than weakening lifecycle semantics.
+- **Org deletion deletes all of that org's grant rows.** This is the explicit
+  lifecycle boundary to the normal durable-history rule: leaving a grant
+  behind would let its old secret authenticate if the org name were reused.
+  Org creation takes the same advisory lock and clears pre-existing orphan
+  grants only when the locked lookup confirms no current org row; duplicate
+  creation and re-provisioning an existing org must preserve live grants.
+- **Concurrency**: each mint owns a new row. Mint/refresh/revoke still take
+  `LockOrgConnectionAdmissionTx` so org lifecycle changes cannot leave orphan
+  grants and management of a named ID remains serialized.
+- **Admission recognizes authenticated `svc_` identities as root-shaped.**
+  They consume the org vCPU budget but do not require an org-user row or carry
+  a normal per-user cap. Admission and post-acquisition worker switching do
+  not reapply expiry/revocation: those are handshake-only checks, so an
+  established session rides to completion.
 - **After the write, THIS replica's snapshot is reloaded immediately**
   (`ReloadSnapshot`), then a best-effort `/api/v1/internal/reload-snapshot`
   fan-out to peer replicas (`PeerFanout`, wired from the same
