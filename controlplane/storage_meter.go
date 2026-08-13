@@ -111,10 +111,14 @@ func newStorageSampler(store storageUsageStore, interval time.Duration, listOrgs
 // leader change (deploys, lease flaps), i.e. systematic over-billing. Waiting
 // one full interval for the first tick keeps failover in the documented
 // direction: a leadership change under-bills at most one interval.
+// Gauge labels are cleared on exit because Prometheus scrapes every CP, and a
+// former leader's last values would otherwise overlap the next leader's data.
 func (s *storageSampler) Run(ctx context.Context) {
 	if s == nil || s.store == nil || s.listOrgs == nil || s.resolveDSN == nil {
 		return
 	}
+	defer storageTrackedBytesGauge.Reset()
+	defer storagePendingDeleteFilesGauge.Reset()
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 	for {

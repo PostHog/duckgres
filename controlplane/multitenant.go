@@ -681,7 +681,13 @@ func SetupMultiTenant(
 		clusterClient = router.sharedPool.clientset
 	}
 	admin.RegisterExtras(api, admin.Extras{
-		Store:         store,
+		Store:      store,
+		Monitoring: store,
+		MonitoringWorkerDefaults: admin.MonitoringWorkerDefaults{
+			CPU:    firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU),
+			Memory: firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory),
+			TTL:    effectiveDefaultWorkerTTL(cfg.K8s.WorkerDefaultTTL),
+		},
 		Live:          clusterInfo,
 		Users:         store,
 		Fetcher:       liveFetcher,

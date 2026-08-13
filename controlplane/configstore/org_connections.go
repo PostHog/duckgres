@@ -70,6 +70,14 @@ func (e *OrgConnectionAdmissionRejectedError) Unwrap() error {
 	return ErrOrgConnectionAdmissionRejected
 }
 
+// OrgConnectionMonitoringStatus is the live connection picture exposed to
+// tenant monitoring. Unlike reshard drain state, it excludes expired queue
+// entries and leases whose control-plane owner is no longer live.
+type OrgConnectionMonitoringStatus struct {
+	ActiveLeases int64
+	QueuedConns  int64
+}
+
 // EnqueueOrgConnectionRequest inserts a pending cluster-wide connection
 // admission request. FIFO ordering is scoped to org_id and ordered by
 // enqueued_at, then request_id. RequestedVCPUs is charged against active
@@ -958,6 +966,35 @@ func (cs *ConfigStore) ActiveOrgConnectionLeaseCount(orgID string) (int64, error
 		return 0, fmt.Errorf("count active org connection leases: %w", err)
 	}
 	return count, nil
+}
+
+// OrgConnectionMonitoringState reads the org's effective live leases and
+// pending queue depth without mutating the runtime coordination tables.
+func (cs *ConfigStore) OrgConnectionMonitoringState(orgID string) (OrgConnectionMonitoringStatus, error) {
+	tables := cs.orgConnectionRuntimeTables()
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	var status OrgConnectionMonitoringStatus
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		now, err := cs.orgConnectionDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
+		if err := tx.Table(tables.lease+" AS l").
+			Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = l.cp_instance_id").
+			Where("l.org_id = ?", orgID).
+			Where("(cp.id IS NOT NULL AND cp.state <> ?) OR (cp.id IS NULL AND l.acquired_at > ?)",
+				ControlPlaneInstanceStateExpired, now.Add(-missingOwnerOrgConnectionLeaseGrace)).
+			Count(&status.ActiveLeases).Error; err != nil {
+			return err
+		}
+		return tx.Table(tables.queue).
+			Where("org_id = ? AND granted_at IS NULL AND expires_at > ?", orgID, now).
+			Count(&status.QueuedConns).Error
+	})
+	if err != nil {
+		return OrgConnectionMonitoringStatus{}, fmt.Errorf("org connection monitoring state: %w", err)
+	}
+	return status, nil
 }
 
 func (cs *ConfigStore) cleanupOrgConnectionRowsLocked(tx *gorm.DB, orgID string, now time.Time) error {

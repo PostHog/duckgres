@@ -71,6 +71,8 @@ Added for the console:
 | `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at pgwire connect), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
 | `POST /api/v1/orgs/:id/users/:username/enable` | admin | persist `disabled=false` + reload cluster-wide so the user can reconnect at once |
 | `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
+| `GET /api/v1/orgs/:id/monitoring/snapshot` | internal secret | Customer-safe org warehouse state, resource limits, workers, sessions, queue depth, and CP coverage. Omits user, pod, image, SQL, client, trace, and control-plane identifiers |
+| `GET /api/v1/orgs/:id/monitoring/series` | internal secret | Customer-safe, org-forced Prometheus range query. Requires an allow-listed `metric`; `window` is one of `1h`, `6h`, `24h` (default), `7d`, `30d` |
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
 | `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
 | `GET /api/v1/audit` | admin | admin action log |
@@ -123,6 +125,31 @@ the PromQL is built server-side from the allow-list (`rangePanels`). Forwards to
 `DUCKGRES_PROMETHEUS_URL` (the in-cluster VictoriaMetrics vmselect, Prometheus-
 compatible). Org-labelled panels (`duckgres_query_total{org,status,reason}` etc.) keep
 slicing enforced. Unset URL → 503 so the UI shows "metrics not configured".
+
+### Product monitoring API (`monitoring.go`)
+
+The PostHog backend reads `GET /api/v1/orgs/:id/monitoring/snapshot` and
+`/series` with the internal secret. These routes are not operator-dashboard
+shortcuts: they are a deliberately smaller customer-safe contract. The org is
+fixed by the path, every config-store query uses that org, and every Prometheus
+query includes an exact `org` label selector. SSO identities, including admin
+operators, receive 403.
+
+The snapshot combines durable worker records and connection leases/queue rows
+with the cross-CP live-session fan-out. It reports `cp_responders`, `cp_total`,
+and `partial` so a missing control plane never looks like zero activity. Worker
+limits use the current org defaults with deployment fallbacks. Empty worker
+profile and zero-TTL sentinels use deployment defaults because org-shaped
+workers persist explicit profiles. Query progress is `null` when DuckDB does not
+provide a percentage. It intentionally omits usernames, PIDs, pod/image names,
+control-plane ownership, SQL, client metadata, trace identifiers, and secrets.
+
+The series endpoint accepts only `query_rate`, `error_ratio`, `duration_p50`,
+`duration_p95`, `sessions_active`, `acquire_p95`,
+`acquire_by_source`, `storage_bytes`, and `worker_crash_rate`. It normalizes the
+Prometheus response and retains only the `status`, `reason`, or `source` labels needed by
+the corresponding chart. Unknown metrics and windows return 400; unknown orgs
+return 404 with `code: "managed_warehouse_not_found"` before Prometheus is called.
 
 ## Local UI development
 

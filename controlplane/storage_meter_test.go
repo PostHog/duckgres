@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type fakeStorageStore struct {
@@ -120,6 +122,51 @@ func TestStorageSamplerRunStopsOnCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("sampler did not stop on cancel")
+	}
+}
+
+func TestStorageSamplerClearsLeaderOwnedGaugesOnCancel(t *testing.T) {
+	storageTrackedBytesGauge.Reset()
+	storagePendingDeleteFilesGauge.Reset()
+	t.Cleanup(func() {
+		storageTrackedBytesGauge.Reset()
+		storagePendingDeleteFilesGauge.Reset()
+	})
+
+	store := &fakeStorageStore{}
+	s := newStorageSampler(store, 20*time.Millisecond,
+		func() []storageOrg { return []storageOrg{{OrgID: "orgA", TeamID: 42}} },
+		func(_ context.Context, orgID string) (string, error) { return "postgres://meta/" + orgID, nil },
+	)
+	s.queryFootprint = func(_ context.Context, _ string) (int64, int64, error) { return 2048, 3, nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+	if got := waitForSamples(store, 1, 2*time.Second); got < 1 {
+		cancel()
+		t.Fatal("ticker sample pass never ran")
+	}
+	if got := testutil.CollectAndCount(storageTrackedBytesGauge); got != 1 {
+		cancel()
+		t.Fatalf("tracked storage gauge series while leading = %d, want 1", got)
+	}
+	if got := testutil.CollectAndCount(storagePendingDeleteFilesGauge); got != 1 {
+		cancel()
+		t.Fatalf("pending-delete gauge series while leading = %d, want 1", got)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sampler did not stop on cancel")
+	}
+	if got := testutil.CollectAndCount(storageTrackedBytesGauge); got != 0 {
+		t.Fatalf("tracked storage gauge series after leadership loss = %d, want 0", got)
+	}
+	if got := testutil.CollectAndCount(storagePendingDeleteFilesGauge); got != 0 {
+		t.Fatalf("pending-delete gauge series after leadership loss = %d, want 0", got)
 	}
 }
 

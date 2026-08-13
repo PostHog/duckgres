@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestCPDeploymentPrefix(t *testing.T) {
@@ -58,10 +60,35 @@ func TestDiscoverPeerIPs(t *testing.T) {
 		selfIPs:      map[string]struct{}{"10.0.0.1": {}},
 		deployPrefix: "duckgres-control-plane",
 	}
-	got := f.discoverPeerIPs(context.Background())
+	got, err := f.discoverPeerIPs(context.Background())
+	if err != nil {
+		t.Fatalf("discoverPeerIPs: %v", err)
+	}
 	sort.Strings(got)
 	want := []string{"10.0.0.2", "10.0.0.3"}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("discoverPeerIPs = %v, want %v", got, want)
+	}
+}
+
+func TestFetchPeersReportsDiscoveryFailure(t *testing.T) {
+	clientset := fake.NewClientset()
+	clientset.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("kubernetes API unavailable")
+	})
+	f := &clusterPeerFetcher{
+		clientset:    clientset,
+		namespace:    "duckgres",
+		selfPod:      "duckgres-control-plane-rs1-self",
+		selfIPs:      map[string]struct{}{"10.0.0.1": {}},
+		deployPrefix: "duckgres-control-plane",
+	}
+
+	result := f.FetchPeers(context.Background(), "/api/v1/queries")
+	if result.DiscoveryComplete {
+		t.Fatalf("discovery complete = true, want false after Kubernetes list failure: %+v", result)
+	}
+	if len(result.Bodies) != 0 || result.Peers != 0 {
+		t.Fatalf("failed discovery result = %+v, want no known peers", result)
 	}
 }
