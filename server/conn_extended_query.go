@@ -929,6 +929,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 	keepRowsOpen := false
+	rowsFinished := false
 	profilingFinished := false
 	finishProfiling := func() {
 		if profilingFinished {
@@ -939,9 +940,10 @@ func (c *clientConn) handleExecute(body []byte) {
 		execSpan.End()
 	}
 	finishRows := func() {
-		if keepRowsOpen {
+		if keepRowsOpen || rowsFinished {
 			return
 		}
+		rowsFinished = true
 		_ = rows.Close()
 		finishProfiling()
 	}
@@ -1008,11 +1010,6 @@ func (c *clientConn) handleExecute(body []byte) {
 			// including as the rowset a suspension keeps open.
 			rows = retryRows
 			activeRows = retryRows
-			defer func() {
-				if !keepRowsOpen {
-					_ = retryRows.Close()
-				}
-			}()
 			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 		}
 	}
