@@ -348,6 +348,7 @@ func resetConfigStoreTables(t *testing.T, db *gorm.DB) {
 	t.Helper()
 
 	for _, model := range []any{
+		&configstore.ServiceGrant{},
 		&configstore.ManagedWarehouse{},
 		&configstore.OrgUser{},
 		&configstore.Org{},
@@ -485,6 +486,104 @@ func TestDeleteOrgCascadesDeletedWarehousePostgres(t *testing.T) {
 	// The database_name is now free for reuse (no unique-index squat).
 	if err := store.DB().Create(&configstore.Org{Name: "other", DatabaseName: "analytics_db"}).Error; err != nil {
 		t.Fatalf("expected database_name to be reusable after org deletion: %v", err)
+	}
+}
+
+func TestDeleteOrgRemovesServiceCredentialsBeforeNameReusePostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+	const orgID = "service-grant-delete"
+
+	if err := store.DB().Create(&configstore.Org{Name: orgID, DatabaseName: "service_grant_delete"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	issued, err := store.MintServiceCredential(orgID, "dagster:backfill", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("mint service credential: %v", err)
+	}
+	if err := store.ReloadSnapshot(); err != nil {
+		t.Fatalf("reload minted credential: %v", err)
+	}
+	if got := store.ResolvePostgresConnection("ducklake", orgID, true, issued.CredentialID, issued.Plaintext); !got.Valid {
+		t.Fatalf("minted credential did not authenticate before deletion: %#v", got)
+	}
+
+	deleted, err := apiStore.DeleteOrg(orgID)
+	if err != nil || !deleted {
+		t.Fatalf("delete org: deleted=%v err=%v", deleted, err)
+	}
+	if err := store.DB().Create(&configstore.Org{Name: orgID, DatabaseName: "service_grant_delete_recreated"}).Error; err != nil {
+		t.Fatalf("recreate org: %v", err)
+	}
+	if err := store.ReloadSnapshot(); err != nil {
+		t.Fatalf("reload recreated org: %v", err)
+	}
+
+	var grantCount int64
+	if err := store.DB().Model(&configstore.ServiceGrant{}).
+		Where("org_id = ? AND credential_id = ?", orgID, issued.CredentialID).
+		Count(&grantCount).Error; err != nil {
+		t.Fatalf("count deleted org's grant: %v", err)
+	}
+	if grantCount != 0 {
+		t.Fatalf("deleted org retained %d service grant rows", grantCount)
+	}
+	if got := store.ResolvePostgresConnection("ducklake", orgID, true, issued.CredentialID, issued.Plaintext); got.Valid {
+		t.Fatalf("old credential authenticated against recreated org: %#v", got)
+	}
+	if _, err := store.RefreshServiceCredential(orgID, issued.CredentialID, time.Minute); !errors.Is(err, configstore.ErrServiceCredentialNotFound) {
+		t.Fatalf("old credential refresh after org recreation = %v, want ErrServiceCredentialNotFound", err)
+	}
+}
+
+func TestCreateOrgPurgesPreExistingOrphanServiceCredentialsPostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	apiStore := newGormAPIStore(store).(*gormAPIStore)
+	const (
+		orgID        = "orphan-service-grant"
+		credentialID = "svc_0123456789abcdef01234567"
+		secret       = "old-orphan-secret"
+	)
+	hash, err := configstore.HashPassword(secret)
+	if err != nil {
+		t.Fatalf("hash orphan secret: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := store.DB().Create(&configstore.ServiceGrant{
+		OrgID: orgID, CredentialID: credentialID, Principal: "old:lifecycle",
+		PasswordHash: hash, MintedAt: now, LastRotatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("seed orphan grant: %v", err)
+	}
+
+	if err := apiStore.CreateOrg(&configstore.Org{Name: orgID, DatabaseName: "orphan_service_grant"}, 1, "team_1"); err != nil {
+		t.Fatalf("create org over orphan history: %v", err)
+	}
+	if err := store.ReloadSnapshot(); err != nil {
+		t.Fatalf("reload created org: %v", err)
+	}
+	if got := store.ResolvePostgresConnection("ducklake", orgID, true, credentialID, secret); got.Valid {
+		t.Fatalf("orphan credential authenticated after org creation: %#v", got)
+	}
+	if _, err := store.RefreshServiceCredential(orgID, credentialID, time.Minute); !errors.Is(err, configstore.ErrServiceCredentialNotFound) {
+		t.Fatalf("refresh orphan after org creation = %v, want ErrServiceCredentialNotFound", err)
+	}
+
+	live, err := store.MintServiceCredential(orgID, "dagster:live", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("mint live credential: %v", err)
+	}
+	if err := apiStore.CreateOrg(&configstore.Org{Name: orgID, DatabaseName: "duplicate"}, 2, "team_2"); err == nil {
+		t.Fatal("duplicate org create unexpectedly succeeded")
+	}
+	var liveCount int64
+	if err := store.DB().Model(&configstore.ServiceGrant{}).
+		Where("org_id = ? AND credential_id = ?", orgID, live.CredentialID).
+		Count(&liveCount).Error; err != nil {
+		t.Fatalf("count live grant after duplicate create: %v", err)
+	}
+	if liveCount != 1 {
+		t.Fatal("duplicate create purged the existing org's live service credential")
 	}
 }
 

@@ -352,6 +352,21 @@ func TestUseExploratoryTierExclusions(t *testing.T) {
 // assigns the concrete store to the interface.
 var _ ConfigStoreInterface = (*configstore.ConfigStore)(nil)
 
+func TestPostAcquisitionIdentityGateOnlyRechecksOrgUsers(t *testing.T) {
+	for _, tc := range []struct {
+		username string
+		want     bool
+	}{
+		{username: "root", want: true},
+		{username: "project-user", want: true},
+		{username: "svc_0123456789abcdef01234567", want: false},
+	} {
+		if got := requiresOrgUserSessionRecheck(tc.username); got != tc.want {
+			t.Fatalf("requiresOrgUserSessionRecheck(%q) = %v, want %v", tc.username, got, tc.want)
+		}
+	}
+}
+
 // TestLazyActivationCatalogAssumption pins the invariant the lazy (deferred
 // worker acquisition) connect path leans on: with the DuckLake catalog
 // attached — the ONLY attachment a multitenant session can succeed with —

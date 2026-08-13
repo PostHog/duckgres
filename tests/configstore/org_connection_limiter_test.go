@@ -1219,6 +1219,146 @@ func TestOrgConnectionAdmissionMetricsDoNotCountDisabledUserAsVCPULimit(t *testi
 	}
 }
 
+func TestOrgConnectionAdmissionRecognizesServiceCredentialIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state string
+	}{
+		{name: "live", state: "live"},
+		{name: "expired after handshake", state: "expired"},
+		{name: "revoked after handshake", state: "revoked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			upsertActiveCP(t, store, "cp-service")
+			const (
+				orgID        = "org-service-admission"
+				credentialID = "svc_0123456789abcdef01234567"
+				requestID    = "request-service"
+			)
+			seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, nil)
+			if err := store.DB().Create(&cpconfigstore.ServiceGrant{
+				OrgID: orgID, CredentialID: credentialID, Principal: "dagster:backfill",
+				PasswordHash: "test-password-hash", MintedAt: time.Now(), LastRotatedAt: time.Now(),
+				ExpiresAt: time.Now().Add(time.Hour),
+			}).Error; err != nil {
+				t.Fatalf("seed service grant: %v", err)
+			}
+
+			now := time.Now()
+			if err := store.EnqueueOrgConnectionRequest(&cpconfigstore.OrgConnectionQueueEntry{
+				RequestID: requestID, OrgID: orgID, Username: credentialID, CPInstanceID: "cp-service",
+				PID: 1001, Protocol: "postgres", RequestedVCPUs: 2,
+				EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+			}); err != nil {
+				t.Fatalf("enqueue service credential: %v", err)
+			}
+			// The request enters admission only after a successful handshake.
+			// Mutate lifecycle state after enqueue to prove expiry/revocation do
+			// not kill that established connection while it waits for a worker.
+			switch tc.state {
+			case "expired":
+				if err := store.DB().Model(&cpconfigstore.ServiceGrant{}).
+					Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+					Update("expires_at", time.Now().Add(-time.Hour)).Error; err != nil {
+					t.Fatalf("expire queued credential: %v", err)
+				}
+			case "revoked":
+				revokedAt := time.Now()
+				if err := store.DB().Model(&cpconfigstore.ServiceGrant{}).
+					Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+					Updates(map[string]any{"revoked_at": revokedAt, "password_hash": ""}).Error; err != nil {
+					t.Fatalf("revoke queued credential: %v", err)
+				}
+			}
+
+			ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requestID, OrgID: orgID, CPInstanceID: "cp-service"}
+			lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+			if err != nil {
+				t.Fatalf("admit service credential: %v", err)
+			}
+			if lease == nil {
+				t.Fatalf("service credential was not admitted: evaluation = %#v", evaluation)
+			}
+			if evaluation.Decision != "granted_current" || evaluation.Reason != "none" {
+				t.Fatalf("evaluation = %#v, want granted_current/none", evaluation)
+			}
+		})
+	}
+}
+
+func TestOrgConnectionAdmissionRejectsUnknownServiceCredentialIdentity(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-unknown-service")
+	const (
+		orgID        = "org-unknown-service"
+		credentialID = "svc_eeeeeeeeeeeeeeeeeeeeeeee"
+		requestID    = "request-unknown-service"
+	)
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, nil)
+	now := time.Now()
+	if err := store.EnqueueOrgConnectionRequest(&cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: requestID, OrgID: orgID, Username: credentialID, CPInstanceID: "cp-unknown-service",
+		PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
+		EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("enqueue unknown service credential: %v", err)
+	}
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requestID, OrgID: orgID, CPInstanceID: "cp-unknown-service"}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+	if err != nil {
+		t.Fatalf("evaluate unknown service credential: %v", err)
+	}
+	if lease != nil || evaluation.Decision != "blocked" || evaluation.Reason != "user_ineligible" {
+		t.Fatalf("unknown service credential = lease %#v, evaluation %#v; want blocked/user_ineligible", lease, evaluation)
+	}
+}
+
+func TestOrgConnectionAdmissionAppliesOnlyOrgLimitToServiceCredential(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-service-a")
+	upsertActiveCP(t, store, "cp-service-b")
+	const orgID = "org-service-limit"
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, map[string]int{
+		// A same-named org-user row must not define the service credential's
+		// per-user cap. Service identities are root-shaped and org-limited.
+		"svc_aaaaaaaaaaaaaaaaaaaaaaaa": 1,
+	})
+	for _, credentialID := range []string{"svc_aaaaaaaaaaaaaaaaaaaaaaaa", "svc_bbbbbbbbbbbbbbbbbbbbbbbb"} {
+		if err := store.DB().Create(&cpconfigstore.ServiceGrant{
+			OrgID: orgID, CredentialID: credentialID, Principal: "dagster:backfill",
+			PasswordHash: "test-password-hash", MintedAt: time.Now(), LastRotatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatalf("seed service grant %s: %v", credentialID, err)
+		}
+	}
+
+	now := time.Now()
+	requests := []*cpconfigstore.OrgConnectionQueueEntry{
+		{RequestID: "request-service-a", OrgID: orgID, Username: "svc_aaaaaaaaaaaaaaaaaaaaaaaa", CPInstanceID: "cp-service-a", PID: 1001, Protocol: "postgres", RequestedVCPUs: 2, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute)},
+		{RequestID: "request-service-b", OrgID: orgID, Username: "svc_bbbbbbbbbbbbbbbbbbbbbbbb", CPInstanceID: "cp-service-b", PID: 1002, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now.Add(time.Millisecond), ExpiresAt: now.Add(time.Minute)},
+	}
+	for _, request := range requests {
+		if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+			t.Fatalf("enqueue %s: %v", request.RequestID, err)
+		}
+	}
+
+	firstRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requests[0].RequestID, OrgID: orgID, CPInstanceID: requests[0].CPInstanceID}
+	first, _, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), firstRef)
+	if err != nil || first == nil {
+		t.Fatalf("service credential should ignore normal per-user max: lease = %#v, err = %v", first, err)
+	}
+	secondRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requests[1].RequestID, OrgID: orgID, CPInstanceID: requests[1].CPInstanceID}
+	second, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), secondRef)
+	if err != nil {
+		t.Fatalf("evaluate org-limited service credential: %v", err)
+	}
+	if second != nil || evaluation.Decision != "blocked" || evaluation.Reason != "org_vcpu" {
+		t.Fatalf("second service credential = lease %#v, evaluation %#v; want blocked/org_vcpu", second, evaluation)
+	}
+}
+
 func TestOrgConnectionAdmissionMetricsDoNotCountPermanentlyImpossibleForeignHeadAsSaturation(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-impossible-head")

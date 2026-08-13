@@ -5,6 +5,7 @@ package configstore
 import (
 	"errors"
 	"regexp"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,13 +20,12 @@ import (
 //  1. First mint CREATES a duckgres_service_grants row (NEVER an
 //     duckgres_org_users row) with a server-generated svc_ credential_id and
 //     returns a plaintext that auth-checks.
-//  2. Back-to-back mints for the same principal REUSE the live grant — same
-//     credential_id, salt-and-hash untouched, NO plaintext (a concurrent
-//     long-lived run's steps must not have their working credential rotated
-//     out from under them mid-flight).
-//  3. force_rotate ALWAYS rotates the live grant's secret, even on a fresh
-//     one — this is how a job that has nothing cached gets a plaintext.
-//  4. Refresh ALWAYS rotates the named grant (unknown → 404-mappable,
+//  2. Every mint creates a fresh identity and secret, even when another live
+//     grant has the same principal. Principal is audit metadata, never an
+//     identity/reuse key, so concurrent jobs cannot rotate each other.
+//  3. A third mint remains fresh too; HTTP accepts an old caller's removed
+//     force_rotate field after the always-create server has been deployed.
+//  4. Refresh ALWAYS rotates only the named grant (unknown → 404-mappable,
 //     revoked → never resurrected).
 var credentialIDShape = regexp.MustCompile(`^svc_[0-9a-f]{24}$`)
 
@@ -40,12 +40,9 @@ func TestMintServiceCredentialLifecyclePostgres(t *testing.T) {
 
 	// 1. First mint creates the grant row and returns a plaintext that
 	// auth-checks against the STORED hash.
-	mint1, err := cs.MintServiceCredential(org.Name, "dagster:lifecycle", 15*time.Minute, false)
+	mint1, err := cs.MintServiceCredential(org.Name, "dagster:lifecycle", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("first mint: %v", err)
-	}
-	if !mint1.Rotated {
-		t.Fatal("first mint must rotate (create)")
 	}
 	if !credentialIDShape.MatchString(mint1.CredentialID) {
 		t.Fatalf("credential_id = %q, want svc_<24 hex>", mint1.CredentialID)
@@ -79,83 +76,79 @@ func TestMintServiceCredentialLifecyclePostgres(t *testing.T) {
 		t.Fatalf("duckgres_org_users rows = %d, want 0 — service credentials are grant rows, not org users", userCount)
 	}
 
-	// 2. A back-to-back mint reuses: same credential_id, same hash, NO
-	// plaintext.
-	mint2, err := cs.MintServiceCredential(org.Name, "dagster:lifecycle", 15*time.Minute, false)
+	// 2. A back-to-back mint with the same audit principal creates an entirely
+	// independent credential and always returns its plaintext.
+	mint2, err := cs.MintServiceCredential(org.Name, "dagster:lifecycle", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("second mint: %v", err)
 	}
-	if mint2.Rotated {
-		t.Fatal("immediate re-mint must reuse the live grant, not rotate")
+	if mint2.CredentialID == mint1.CredentialID {
+		t.Fatalf("second mint reused credential_id %q; each invocation must own an independent identity", mint2.CredentialID)
 	}
-	if mint2.CredentialID != mint1.CredentialID {
-		t.Fatalf("reuse credential_id = %q, want %q (the live grant's identity)", mint2.CredentialID, mint1.CredentialID)
-	}
-	if mint2.Plaintext != "" {
-		t.Fatal("reuse must NOT echo a plaintext (caller already holds it, or must force_rotate)")
+	if mint2.Plaintext == "" {
+		t.Fatal("every mint must return the new credential's plaintext")
 	}
 	var reread ServiceGrant
 	if err := db.First(&reread, "org_id = ? AND credential_id = ?", org.Name, mint1.CredentialID).Error; err != nil {
 		t.Fatalf("re-read service grant: %v", err)
 	}
 	if reread.PasswordHash != stored.PasswordHash {
-		t.Fatal("reuse must not change the stored hash")
+		t.Fatal("a second mint must not change the first credential's hash")
 	}
-	// The reuse path reports the ORIGINAL mint's expiry, not now+TTL.
-	if !mint2.ExpiresAt.Equal(stored.ExpiresAt.UTC()) {
-		t.Fatalf("reuse expiry %v, want %v (the live grant's real expiry)", mint2.ExpiresAt, stored.ExpiresAt)
+	var stored2 ServiceGrant
+	if err := db.First(&stored2, "org_id = ? AND credential_id = ?", org.Name, mint2.CredentialID).Error; err != nil {
+		t.Fatalf("second service grant row not created: %v", err)
+	}
+	if bcrypt.CompareHashAndPassword([]byte(stored2.PasswordHash), []byte(mint2.Plaintext)) != nil {
+		t.Fatal("second stored hash does not match its plaintext")
+	}
+	if bcrypt.CompareHashAndPassword([]byte(stored.PasswordHash), []byte(mint2.Plaintext)) == nil {
+		t.Fatal("second plaintext unexpectedly authenticates as the first credential")
 	}
 	var grantCount int64
 	if err := db.Model(&ServiceGrant{}).Where("org_id = ?", org.Name).Count(&grantCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if grantCount != 1 {
-		t.Fatalf("service grant rows = %d, want exactly 1 (reuse is not a second credential)", grantCount)
+	if grantCount != 2 {
+		t.Fatalf("service grant rows = %d, want exactly 2 independent credentials", grantCount)
 	}
 
-	// 3. force_rotate replaces the secret on the SAME grant row even though
-	// the live grant is nowhere near expiry.
-	mint3, err := cs.MintServiceCredential(org.Name, "dagster:lifecycle", 15*time.Minute, true)
+	// 3. A third mint creates another independent credential.
+	mint3, err := cs.MintServiceCredential(org.Name, "dagster:lifecycle", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("force rotate: %v", err)
 	}
-	if !mint3.Rotated || mint3.Plaintext == "" {
-		t.Fatal("force_rotate must rotate and return a plaintext")
+	if mint3.Plaintext == "" {
+		t.Fatal("mint must return a plaintext")
 	}
-	if mint3.CredentialID != mint1.CredentialID {
-		t.Fatalf("force rotate keeps the grant's identity: got %q, want %q", mint3.CredentialID, mint1.CredentialID)
+	if mint3.CredentialID == mint1.CredentialID || mint3.CredentialID == mint2.CredentialID {
+		t.Fatalf("third mint reused an existing identity: got %q", mint3.CredentialID)
 	}
 	var rotated ServiceGrant
-	if err := db.First(&rotated, "org_id = ? AND credential_id = ?", org.Name, mint1.CredentialID).Error; err != nil {
-		t.Fatalf("re-read after rotate: %v", err)
-	}
-	if rotated.PasswordHash == stored.PasswordHash {
-		t.Fatal("force_rotate must replace the stored hash")
+	if err := db.First(&rotated, "org_id = ? AND credential_id = ?", org.Name, mint3.CredentialID).Error; err != nil {
+		t.Fatalf("read third fresh grant: %v", err)
 	}
 	if bcrypt.CompareHashAndPassword([]byte(rotated.PasswordHash), []byte(mint3.Plaintext)) != nil {
-		t.Fatal("rotated hash does not match the new plaintext")
+		t.Fatal("third hash does not match the new plaintext")
 	}
-	// The OLD secret no longer matches — proof the rotation actually
-	// invalidated it. (Existing sessions keep working: expiry is
-	// handshake-only, and nothing here touches live sessions.)
-	if bcrypt.CompareHashAndPassword([]byte(rotated.PasswordHash), []byte(mint1.Plaintext)) == nil {
-		t.Fatal("old plaintext must no longer match after rotation")
+	if bcrypt.CompareHashAndPassword([]byte(stored.PasswordHash), []byte(mint1.Plaintext)) != nil {
+		t.Fatal("third mint invalidated the first credential")
 	}
 }
 
-// A different principal gets its OWN credential — reuse is keyed
-// (org_id, principal), never org-wide.
+// A different principal also gets its own credential; principal remains
+// useful audit attribution without participating in identity.
 func TestMintServiceCredentialDistinctPrincipalsPostgres(t *testing.T) {
 	cs := newPostgresConfigStore(t)
 	db := cs.DB()
 
 	db.Create(&Org{Name: "svc-grant-org-multi", DatabaseName: "svc_grant_org_multi"})
 
-	a, err := cs.MintServiceCredential("svc-grant-org-multi", "dagster:a", 15*time.Minute, false)
+	a, err := cs.MintServiceCredential("svc-grant-org-multi", "dagster:a", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint a: %v", err)
 	}
-	b, err := cs.MintServiceCredential("svc-grant-org-multi", "dagster:b", 15*time.Minute, false)
+	b, err := cs.MintServiceCredential("svc-grant-org-multi", "dagster:b", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint b: %v", err)
 	}
@@ -172,13 +165,13 @@ func TestMintServiceCredentialDistinctPrincipalsPostgres(t *testing.T) {
 func TestMintServiceCredentialValidatesInputPostgres(t *testing.T) {
 	cs := newPostgresConfigStore(t)
 
-	if _, err := cs.MintServiceCredential("ghost", "d", time.Minute, false); !errors.Is(err, gorm.ErrRecordNotFound) {
+	if _, err := cs.MintServiceCredential("ghost", "d", time.Minute); !errors.Is(err, gorm.ErrRecordNotFound) {
 		t.Fatalf("unknown org must fail with gorm.ErrRecordNotFound, got %v", err)
 	}
-	if _, err := cs.MintServiceCredential("any", "", time.Minute, false); err == nil {
+	if _, err := cs.MintServiceCredential("any", "", time.Minute); err == nil {
 		t.Fatal("empty principal must fail (audit attribution depends on it)")
 	}
-	if _, err := cs.MintServiceCredential("any", "d", 0, false); err == nil {
+	if _, err := cs.MintServiceCredential("any", "d", 0); err == nil {
 		t.Fatal("non-positive ttl must fail")
 	}
 }
@@ -192,9 +185,17 @@ func TestRefreshServiceCredentialPostgres(t *testing.T) {
 		t.Fatalf("create org: %v", err)
 	}
 
-	mint, err := cs.MintServiceCredential(org.Name, "dagster:refresh", 15*time.Minute, false)
+	mint, err := cs.MintServiceCredential(org.Name, "dagster:refresh", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
+	}
+	sibling, err := cs.MintServiceCredential(org.Name, "dagster:refresh", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("mint same-principal sibling: %v", err)
+	}
+	var siblingBefore ServiceGrant
+	if err := db.First(&siblingBefore, "org_id = ? AND credential_id = ?", org.Name, sibling.CredentialID).Error; err != nil {
+		t.Fatalf("read same-principal sibling: %v", err)
 	}
 
 	// Refresh ALWAYS rotates: new plaintext, same credential_id, same row.
@@ -202,7 +203,7 @@ func TestRefreshServiceCredentialPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if !refresh.Rotated || refresh.Plaintext == "" {
+	if refresh.Plaintext == "" {
 		t.Fatal("refresh must always rotate and return the new plaintext")
 	}
 	if refresh.CredentialID != mint.CredentialID {
@@ -217,6 +218,16 @@ func TestRefreshServiceCredentialPostgres(t *testing.T) {
 	}
 	if bcrypt.CompareHashAndPassword([]byte(rotated.PasswordHash), []byte(mint.Plaintext)) == nil {
 		t.Fatal("the minted secret must no longer match after refresh")
+	}
+	var siblingAfter ServiceGrant
+	if err := db.First(&siblingAfter, "org_id = ? AND credential_id = ?", org.Name, sibling.CredentialID).Error; err != nil {
+		t.Fatalf("re-read same-principal sibling: %v", err)
+	}
+	if siblingAfter.PasswordHash != siblingBefore.PasswordHash || !siblingAfter.ExpiresAt.Equal(siblingBefore.ExpiresAt) {
+		t.Fatal("refresh by credential_id mutated a same-principal sibling")
+	}
+	if bcrypt.CompareHashAndPassword([]byte(siblingAfter.PasswordHash), []byte(sibling.Plaintext)) != nil {
+		t.Fatal("same-principal sibling stopped authenticating after refresh of another credential_id")
 	}
 	if got := time.Until(refresh.ExpiresAt); got < 29*time.Minute || got > 31*time.Minute {
 		t.Fatalf("refresh expires_in ≈ %v, want ~30m (the refresh TTL re-arms the clock)", got)
@@ -244,7 +255,7 @@ func TestServiceGrantRevokeIsTerminalPostgres(t *testing.T) {
 		t.Fatalf("create org: %v", err)
 	}
 
-	mint, err := cs.MintServiceCredential(org.Name, "dagster:revoke", 15*time.Minute, false)
+	mint, err := cs.MintServiceCredential(org.Name, "dagster:revoke", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -272,11 +283,11 @@ func TestServiceGrantRevokeIsTerminalPostgres(t *testing.T) {
 
 	// A new mint for the same principal ignores the revoked row and creates a
 	// NEW credential.
-	mint2, err := cs.MintServiceCredential(org.Name, "dagster:revoke", 15*time.Minute, false)
+	mint2, err := cs.MintServiceCredential(org.Name, "dagster:revoke", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint after revoke: %v", err)
 	}
-	if !mint2.Rotated || mint2.Plaintext == "" {
+	if mint2.Plaintext == "" {
 		t.Fatal("mint after revoke must create a fresh credential with a plaintext")
 	}
 	if mint2.CredentialID == mint.CredentialID {
@@ -305,7 +316,7 @@ func TestServiceGrantExpirySemanticsPostgres(t *testing.T) {
 		t.Fatalf("create org: %v", err)
 	}
 
-	mint, err := cs.MintServiceCredential(org.Name, "dagster:expiry", 15*time.Minute, false)
+	mint, err := cs.MintServiceCredential(org.Name, "dagster:expiry", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -317,11 +328,11 @@ func TestServiceGrantExpirySemanticsPostgres(t *testing.T) {
 	}
 
 	// Mint creates a NEW credential — the expired one is not "live".
-	mint2, err := cs.MintServiceCredential(org.Name, "dagster:expiry", 15*time.Minute, false)
+	mint2, err := cs.MintServiceCredential(org.Name, "dagster:expiry", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint after expiry: %v", err)
 	}
-	if !mint2.Rotated || mint2.CredentialID == mint.CredentialID {
+	if mint2.CredentialID == mint.CredentialID {
 		t.Fatalf("mint after expiry must create a fresh credential, got %+v", mint2)
 	}
 
@@ -331,7 +342,7 @@ func TestServiceGrantExpirySemanticsPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("refresh of expired grant: %v", err)
 	}
-	if !refresh.Rotated || refresh.Plaintext == "" || !refresh.ExpiresAt.After(time.Now().UTC()) {
+	if refresh.Plaintext == "" || !refresh.ExpiresAt.After(time.Now().UTC()) {
 		t.Fatalf("refresh of expired grant must rotate and re-arm expiry, got %+v", refresh)
 	}
 }
@@ -347,11 +358,11 @@ func TestListServiceGrantsPostgres(t *testing.T) {
 		t.Fatalf("create org: %v", err)
 	}
 
-	live, err := cs.MintServiceCredential(org.Name, "dagster:live", 15*time.Minute, false)
+	live, err := cs.MintServiceCredential(org.Name, "dagster:live", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint live: %v", err)
 	}
-	dead, err := cs.MintServiceCredential(org.Name, "dagster:dead", 15*time.Minute, false)
+	dead, err := cs.MintServiceCredential(org.Name, "dagster:dead", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint to-be-revoked: %v", err)
 	}
@@ -394,7 +405,7 @@ func TestServiceGrantSnapshotAuthPostgres(t *testing.T) {
 	if err := db.Create(&org).Error; err != nil {
 		t.Fatalf("create org: %v", err)
 	}
-	mint, err := cs.MintServiceCredential(org.Name, "dagster:auth", 15*time.Minute, false)
+	mint, err := cs.MintServiceCredential(org.Name, "dagster:auth", 15*time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -446,6 +457,9 @@ func TestServiceGrantSnapshotAuthPostgres(t *testing.T) {
 	if err := cs.ReloadSnapshot(); err != nil {
 		t.Fatal(err)
 	}
+	if _, loaded := cs.snapshot.OrgServiceGrant[OrgUserKey{OrgID: org.Name, Username: mint.CredentialID}]; loaded {
+		t.Fatal("expired grant remained in the hot auth snapshot; always-create must not grow replica memory with history")
+	}
 	if res := cs.ResolvePostgresConnection("ducklake", org.Name, true, mint.CredentialID, refresh.Plaintext); res.Valid {
 		t.Fatal("an expired grant must refuse new connections")
 	}
@@ -471,15 +485,7 @@ func TestServiceGrantSnapshotAuthPostgres(t *testing.T) {
 	}
 }
 
-// Regression pin for the Postgres µs-timestamptz rounding shape the reuse
-// probe must survive: the mint writes expires_at = captured-now + ttl with Go
-// wall-clock precision, but timestamptz rounds to the microsecond on
-// storage — so a live-grant probe comparing expires_at > captured-now can
-// misclassify a same-instant row. MintServiceCredential's probe therefore
-// compares against captured-now + one µs of slack. This test fails without
-// that slack whenever the rounding lands the stored expiry inside the probe
-// window boundary.
-func TestMintServiceCredentialMicrosecondRoundingRacePostgres(t *testing.T) {
+func TestMintServiceCredentialConcurrentSamePrincipalPostgres(t *testing.T) {
 	cs := newPostgresConfigStore(t)
 	db := cs.DB()
 
@@ -488,26 +494,98 @@ func TestMintServiceCredentialMicrosecondRoundingRacePostgres(t *testing.T) {
 		t.Fatalf("create org: %v", err)
 	}
 
-	// Two mints for the SAME principal back-to-back: the second MUST reuse the
-	// first's row even when the stored µs rounding makes expires_at look a
-	// hair NEWER than the reuse probe's wall clock.
-	first, err := cs.MintServiceCredential(org.Name, "dagster:us-race", 15*time.Minute, false)
-	if err != nil {
-		t.Fatalf("first mint: %v", err)
+	issues := make([]*ServiceCredentialIssue, 2)
+	errs := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := range issues {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			issues[i], errs[i] = cs.MintServiceCredential(org.Name, "dagster:same-principal", 15*time.Minute)
+		}(i)
 	}
-	second, err := cs.MintServiceCredential(org.Name, "dagster:us-race", 15*time.Minute, false)
-	if err != nil {
-		t.Fatalf("second mint: %v", err)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent mint %d: %v", i, err)
+		}
 	}
-	if second.Rotated {
-		t.Fatal("back-to-back mint must reuse even under timestamptz rounding")
+	if issues[0].CredentialID == issues[1].CredentialID {
+		t.Fatalf("concurrent same-principal mints shared credential %q", issues[0].CredentialID)
 	}
-	if second.CredentialID != first.CredentialID {
-		t.Fatalf("reuse returned %q, want the first mint's %q", second.CredentialID, first.CredentialID)
+	if issues[0].Plaintext == "" || issues[1].Plaintext == "" {
+		t.Fatal("both concurrent mints must return their own plaintext")
 	}
 	var count int64
 	db.Model(&ServiceGrant{}).Where("org_id = ?", org.Name).Count(&count)
-	if count != 1 {
-		t.Fatalf("grant rows = %d, want exactly 1", count)
+	if count != 2 {
+		t.Fatalf("grant rows = %d, want exactly 2", count)
 	}
+}
+
+func TestServiceCredentialTTLStartsAfterAdmissionLockPostgres(t *testing.T) {
+	cs := newPostgresConfigStore(t)
+	db := cs.DB()
+	const orgID = "svc-grant-org-lock-ttl"
+	if err := db.Create(&Org{Name: orgID, DatabaseName: "svc_grant_org_lock_ttl"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	seed, err := cs.MintServiceCredential(orgID, "dagster:refresh-lock", time.Minute)
+	if err != nil {
+		t.Fatalf("seed refresh credential: %v", err)
+	}
+
+	const ttl = 2 * time.Second
+	assertFreshTTL := func(t *testing.T, issue func() (*ServiceCredentialIssue, error)) {
+		t.Helper()
+		blocker := db.Begin()
+		if blocker.Error != nil {
+			t.Fatalf("begin blocker: %v", blocker.Error)
+		}
+		if err := LockOrgConnectionAdmissionTx(blocker, orgID); err != nil {
+			_ = blocker.Rollback()
+			t.Fatalf("lock admission: %v", err)
+		}
+
+		type result struct {
+			issue *ServiceCredentialIssue
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			got, err := issue()
+			done <- result{issue: got, err: err}
+		}()
+		// bcrypt completes well inside this window; the credential call should
+		// then remain blocked on the advisory lock. Capturing now before that
+		// wait consumes roughly half this deliberately short TTL.
+		time.Sleep(time.Second)
+		select {
+		case got := <-done:
+			_ = blocker.Rollback()
+			t.Fatalf("credential mutation bypassed org admission lock: %+v", got)
+		default:
+		}
+		if err := blocker.Commit().Error; err != nil {
+			t.Fatalf("release admission lock: %v", err)
+		}
+		got := <-done
+		if got.err != nil {
+			t.Fatalf("credential mutation: %v", got.err)
+		}
+		if remaining := time.Until(got.issue.ExpiresAt); remaining < 1500*time.Millisecond {
+			t.Fatalf("TTL remaining after lock wait = %v, want nearly the full %v", remaining, ttl)
+		}
+	}
+
+	t.Run("mint", func(t *testing.T) {
+		assertFreshTTL(t, func() (*ServiceCredentialIssue, error) {
+			return cs.MintServiceCredential(orgID, "dagster:mint-lock", ttl)
+		})
+	})
+	t.Run("refresh", func(t *testing.T) {
+		assertFreshTTL(t, func() (*ServiceCredentialIssue, error) {
+			return cs.RefreshServiceCredential(orgID, seed.CredentialID, ttl)
+		})
+	})
 }

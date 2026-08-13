@@ -40,19 +40,11 @@ const DefaultManagedIngressSuffix = ".dw.us.postwh.com"
 // team_id: service credentials are root-shaped org credentials, not
 // project-scoped logins.
 type serviceCredentialRequest struct {
-	// Principal is audit attribution ("dagster:events-backfill") — required,
-	// and it doubles as the reuse key: one live grant per (org, principal).
+	// Principal is required audit attribution ("dagster:events-backfill"). It
+	// is intentionally not an identity or reuse key: every mint creates a new
+	// credential ID and secret.
 	Principal  string `json:"principal"`
 	TTLSeconds int    `json:"ttl_seconds"`
-	// ForceRotate bypasses the reuse path: when a live grant already exists
-	// for (org, principal) the CP rotates its secret no matter how fresh it
-	// is and returns the new plaintext. A caller MUST set this on its first
-	// fetch of a run — it has nothing cached, and the reuse path deliberately
-	// returns no plaintext for a still-valid grant (so concurrent long-lived
-	// runs can't smash each other's credentials mid-flight). Omit/false means
-	// "reuse the live grant if one exists, and only tell me its identity and
-	// expiry".
-	ForceRotate bool `json:"force_rotate"`
 }
 
 // serviceCredentialRefreshRequest is the refresh body
@@ -90,20 +82,14 @@ type connectDetails struct {
 	SslMode  string `json:"sslmode"`
 }
 
-// serviceCredentialResponse is the mint/refresh response. CredentialSecret is
-// present ONLY when the CP bound a fresh secret (a fresh mint, a
-// force_rotate, or any refresh); CredentialID/ExpiresAt/Connect are always
-// present so the caller can always take its connection target from this same
-// response.
+// serviceCredentialResponse is the mint/refresh response. Both operations
+// always bind and return a fresh secret; the store persists only its hash.
 type serviceCredentialResponse struct {
-	CredentialID string `json:"credential_id"`
-	// CredentialSecret is omitted (not empty-stringed) when the mint reused a
-	// live grant: a caller that already holds the secret keeps using it;
-	// echoing "" would risk clients treating "" as the secret itself.
-	CredentialSecret string    `json:"credential_secret,omitempty"`
+	CredentialID     string    `json:"credential_id"`
+	CredentialSecret string    `json:"credential_secret"`
 	ExpiresAt        time.Time `json:"expires_at"`
-	// Connect is unconditional (unlike CredentialSecret): identical shape on
-	// reuse and rotate, so the client can always take its connection target
+	// Connect is unconditional: identical shape on mint and refresh, so the
+	// client can always take its connection target
 	// from this same response instead of holding its own out-of-band copy.
 	Connect connectDetails `json:"connect"`
 }
@@ -113,7 +99,7 @@ type serviceCredentialResponse struct {
 // tests.
 type TenantStore interface {
 	OrgExists(orgID string) (bool, error)
-	MintServiceCredential(orgID, principal string, ttl time.Duration, forceRotate bool) (*configstore.ServiceCredentialIssue, error)
+	MintServiceCredential(orgID, principal string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error)
 	RefreshServiceCredential(orgID, credentialID string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error)
 	ReloadSnapshot() error
 }
@@ -199,7 +185,7 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 		return
 	}
 
-	issued, err := tenantStore.MintServiceCredential(orgID, req.Principal, ttl, req.ForceRotate)
+	issued, err := tenantStore.MintServiceCredential(orgID, req.Principal, ttl)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
@@ -220,7 +206,6 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 		"org", orgID,
 		"credential_id", issued.CredentialID,
 		"principal", issued.Principal,
-		"rotated", issued.Rotated,
 		"expires_at", issued.ExpiresAt.UTC().Format(time.RFC3339),
 	)
 

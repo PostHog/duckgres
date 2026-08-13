@@ -503,6 +503,58 @@ func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 	}
 }
 
+func TestProvisionOrgCreationPurgesOrphanGrantsButReprovisionPreservesLiveGrants(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	pstore := provisioning.NewGormStore(store)
+	const (
+		orgID        = "provision-orphan-grant"
+		credentialID = "svc_0123456789abcdef01234567"
+	)
+	now := time.Now().UTC()
+	if err := store.DB().Create(&configstore.ServiceGrant{
+		OrgID: orgID, CredentialID: credentialID, Principal: "old:lifecycle",
+		PasswordHash: "old-hash", MintedAt: now, LastRotatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("seed orphan grant: %v", err)
+	}
+	provision := func() error {
+		return pstore.Provision(provisioning.ProvisionRequest{
+			OrgID: orgID, DatabaseName: "provision_orphan_grant", TeamID: 1,
+			Warehouse: &configstore.ManagedWarehouse{DucklingName: orgID}, RootUserHash: "root-hash",
+		})
+	}
+	if err := provision(); err != nil {
+		t.Fatalf("provision new org: %v", err)
+	}
+	var orphanCount int64
+	if err := store.DB().Model(&configstore.ServiceGrant{}).
+		Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+		Count(&orphanCount).Error; err != nil {
+		t.Fatalf("count orphan grant: %v", err)
+	}
+	if orphanCount != 0 {
+		t.Fatalf("new org inherited %d orphan grants", orphanCount)
+	}
+
+	live, err := store.MintServiceCredential(orgID, "dagster:live", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("mint live grant: %v", err)
+	}
+	markWarehouseDeleted(t, store, orgID)
+	if err := provision(); err != nil {
+		t.Fatalf("reprovision existing org: %v", err)
+	}
+	var liveCount int64
+	if err := store.DB().Model(&configstore.ServiceGrant{}).
+		Where("org_id = ? AND credential_id = ?", orgID, live.CredentialID).
+		Count(&liveCount).Error; err != nil {
+		t.Fatalf("count live grant after reprovision: %v", err)
+	}
+	if liveCount != 1 {
+		t.Fatal("reprovisioning an existing org purged its live service credential")
+	}
+}
+
 // markWarehouseDeleted parks the org's warehouse row in the terminal
 // "deleted" state so a re-provision is accepted (a non-terminal row is a
 // 409/ErrWarehouseNonTerminal).

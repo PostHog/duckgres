@@ -556,11 +556,18 @@ type authoritativeOrgConnectionUserLimit struct {
 }
 
 type authoritativeOrgConnectionLimitSet struct {
-	orgMaxVCPUs int64
-	users       map[string]authoritativeOrgConnectionUserLimit
+	orgMaxVCPUs       int64
+	users             map[string]authoritativeOrgConnectionUserLimit
+	serviceCredential map[string]struct{}
 }
 
 func (l authoritativeOrgConnectionLimitSet) lookup(username string) OrgResourceLimits {
+	if _, exists := l.serviceCredential[username]; exists {
+		// Service credentials are root-shaped org identities. They share the
+		// org budget but never inherit an ordinary user's per-user cap, even if
+		// a legacy/user row happens to have the same name.
+		return OrgResourceLimits{OrgMaxVCPUs: int(l.orgMaxVCPUs)}
+	}
 	user := l.users[username]
 	return OrgResourceLimits{
 		OrgMaxVCPUs:  int(l.orgMaxVCPUs),
@@ -569,6 +576,10 @@ func (l authoritativeOrgConnectionLimitSet) lookup(username string) OrgResourceL
 }
 
 func (l authoritativeOrgConnectionLimitSet) userAllowed(username string) bool {
+	if strings.HasPrefix(username, ServiceCredentialPrefix) {
+		_, exists := l.serviceCredential[username]
+		return exists
+	}
 	user, exists := l.users[username]
 	return exists && !user.disabled
 }
@@ -589,7 +600,8 @@ func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID strin
 	}
 
 	limits := authoritativeOrgConnectionLimitSet{
-		users: make(map[string]authoritativeOrgConnectionUserLimit),
+		users:             make(map[string]authoritativeOrgConnectionUserLimit),
+		serviceCredential: make(map[string]struct{}),
 	}
 	if orgRow.MaxVCPUs != nil {
 		limits.orgMaxVCPUs = *orgRow.MaxVCPUs
@@ -622,6 +634,32 @@ func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID strin
 			maxVCPUs: maxVCPUs,
 			disabled: row.Disabled,
 		}
+	}
+
+	// Admission happens after pgwire authentication. Include every persisted
+	// service identity, regardless of its current expiry/revocation state:
+	// those fields gate NEW handshakes only. A session authenticated before a
+	// grant expired or was revoked must still be able to wait in admission or
+	// lazily acquire/switch a worker without being killed mid-session.
+	type serviceCredentialRow struct {
+		CredentialID string `gorm:"column:credential_id"`
+	}
+	var serviceCredentials []serviceCredentialRow
+	// Restrict this authoritative lookup to identities currently queued. Grant
+	// rows are retained for audit after expiry/revocation, so loading the org's
+	// complete lifetime history on every admission poll would grow without
+	// bound.
+	queuedUsernames := tx.Table(cs.orgConnectionRuntimeTables().queue).
+		Select("username").
+		Where("org_id = ? AND granted_at IS NULL", orgID)
+	if err := tx.Model(&ServiceGrant{}).
+		Select("credential_id").
+		Where("org_id = ? AND credential_id IN (?)", orgID, queuedUsernames).
+		Scan(&serviceCredentials).Error; err != nil {
+		return authoritativeOrgConnectionLimitSet{}, false, err
+	}
+	for _, row := range serviceCredentials {
+		limits.serviceCredential[row.CredentialID] = struct{}{}
 	}
 	return limits, true, nil
 }

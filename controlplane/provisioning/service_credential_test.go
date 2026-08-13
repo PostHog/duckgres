@@ -53,7 +53,7 @@ func TestIssueServiceCredentialFreshMintShape(t *testing.T) {
 	router := newTestRouter(store)
 
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
-		`{"principal": "dagster:events-backfill", "force_rotate": true}`)
+		`{"principal": "dagster:events-backfill"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -120,13 +120,13 @@ func TestIssueServiceCredentialGhostOrg404(t *testing.T) {
 	}
 }
 
-func TestIssueServiceCredentialThreadsTTLAndForceRotate(t *testing.T) {
+func TestIssueServiceCredentialThreadsPrincipalAndTTL(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
 	router := newTestRouter(store)
 
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
-		`{"principal": "dagster:events-backfill", "ttl_seconds": 900, "force_rotate": true}`)
+		`{"principal": "dagster:events-backfill", "ttl_seconds": 900}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -134,8 +134,8 @@ func TestIssueServiceCredentialThreadsTTLAndForceRotate(t *testing.T) {
 		t.Fatalf("mintCreds len = %d, want 1", len(store.mintCreds))
 	}
 	got := store.mintCreds[0]
-	if got.Principal != "dagster:events-backfill" || got.TTLSeconds != 900 || !got.ForceRotate {
-		t.Fatalf("mintCreds[0] = %+v, want principal dagster:events-backfill / ttl 900 / force_rotate true", got)
+	if got.Principal != "dagster:events-backfill" || got.TTLSeconds != 900 {
+		t.Fatalf("mintCreds[0] = %+v, want principal dagster:events-backfill / ttl 900", got)
 	}
 	if store.reloadSnapshotN != 1 {
 		t.Fatalf("ReloadSnapshot called %d times, want exactly 1 (fresh credential must auth without waiting a poll)", store.reloadSnapshotN)
@@ -150,7 +150,7 @@ func TestIssueServiceCredentialClampsTTL(t *testing.T) {
 	// Tiny ttl_seconds must be raised to the floor, not rejected — a caller
 	// never has to guess server policy to get a usable credential.
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
-		`{"principal": "d", "ttl_seconds": 1, "force_rotate": true}`)
+		`{"principal": "d", "ttl_seconds": 1}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -161,7 +161,7 @@ func TestIssueServiceCredentialClampsTTL(t *testing.T) {
 	// Huge ttl_seconds comes down to the ceiling.
 	store.mintCreds = nil
 	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
-		`{"principal": "d", "ttl_seconds": 999999, "force_rotate": true}`)
+		`{"principal": "d", "ttl_seconds": 999999}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -172,7 +172,7 @@ func TestIssueServiceCredentialClampsTTL(t *testing.T) {
 	// Absent ttl_seconds → the default.
 	store.mintCreds = nil
 	rec = doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
-		`{"principal": "d", "force_rotate": true}`)
+		`{"principal": "d"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -181,39 +181,31 @@ func TestIssueServiceCredentialClampsTTL(t *testing.T) {
 	}
 }
 
-func TestIssueServiceCredentialReuseOmitsSecretWhenGrantStillValid(t *testing.T) {
+func TestIssueServiceCredentialLegacyForceRotateFieldIsIgnored(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["acme"] = &configstore.Org{Name: "acme"}
 	router := newTestRouter(store)
 
-	// The store reports a still-valid live grant (Rotated=false ⇒ the CP did
-	// not touch the hash) ⇒ the handler surfaces NO credential_secret: the
-	// caller already holds it (or must force_rotate). The whole point of the
-	// reuse path is NOT to leak plaintext for a credential the CP didn't just
-	// mint.
-	store.issueCredsIssue = &configstore.ServiceCredentialIssue{
-		Rotated:      false,
-		CredentialID: "svc_0123456789abcdef01234567",
-		Principal:    "d",
-		Plaintext:    "",
-		ExpiresAt:    time.Now().UTC().Add(10 * time.Minute),
-	}
+	// An older caller may still send force_rotate after the new server deploys.
+	// Gin ignores the removed field; the request remains a normal fresh mint.
+	// This is intentionally one-way compatibility: callers may drop their old
+	// reuse fallback only after every Duckgres server has always-create mint.
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
-		`{"principal": "d"}`)
+		`{"principal": "d", "force_rotate": true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
 	}
-	if body := rec.Body.String(); strings.Contains(body, `"credential_secret"`) {
-		t.Fatalf("reuse path must not echo a credential_secret, got: %s", body)
+	if len(store.mintCreds) != 1 || store.mintCreds[0].Principal != "d" {
+		t.Fatalf("legacy request did not produce a normal mint: %+v", store.mintCreds)
 	}
-	// ...but the connect block is unconditional: identical shape and values on
-	// the reuse path, so a caller can always take its connection target from
-	// the mint response even when it gets no plaintext back.
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	assertConnectBlock(t, body, "acme"+DefaultManagedIngressSuffix)
+	if secret, _ := body["credential_secret"].(string); secret == "" {
+		t.Fatalf("legacy force_rotate request must still return the fresh secret: %v", body)
+	}
 }
 
 // TestIssueServiceCredentialConnectHostUsesWiredSuffix locks the wiring: the
@@ -227,7 +219,7 @@ func TestIssueServiceCredentialConnectHostUsesWiredSuffix(t *testing.T) {
 	router := newServiceCredentialRouter(store, ".dw.eu.postwh.com")
 
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials",
-		`{"principal": "dagster:events-backfill", "force_rotate": true}`)
+		`{"principal": "dagster:events-backfill"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
@@ -247,7 +239,7 @@ func TestTeamScopedServiceCredentialRouteRemoved(t *testing.T) {
 	router := newTestRouter(store)
 
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams/42/service-credentials",
-		`{"team_id": 42, "principal": "dagster:x", "force_rotate": true}`)
+		`{"team_id": 42, "principal": "dagster:x"}`)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 (route removed): %s", rec.Code, rec.Body.String())
 	}

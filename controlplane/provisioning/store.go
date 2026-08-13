@@ -115,6 +115,11 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // exists in non-terminal state") so HTTP handlers can map to 409
 // without an extra error type.
 func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, teamID int64, schemaName string, warehouse *configstore.ManagedWarehouse) error {
+	// Serialize the existence decision and any name-reuse cleanup with
+	// credential lifecycle operations and admin org deletion.
+	if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+		return err
+	}
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
 	// creates everything). A NEW org MUST carry team_id — a warehouse cannot
 	// exist without a team; the id becomes the org's first
@@ -126,6 +131,11 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, teamID in
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		if teamID == 0 {
 			return ErrProvisionTeamRequired
+		}
+		// Purge grants orphaned by org deletions from older versions before
+		// reusing the org name. Existing-org reprovisioning preserves grants.
+		if err := tx.Where("org_id = ?", orgID).Delete(&configstore.ServiceGrant{}).Error; err != nil {
+			return err
 		}
 		org = configstore.Org{
 			Name:         orgID,
@@ -288,16 +298,14 @@ func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore
 	return nil
 }
 
-// MintServiceCredential delegates to the config store: mint-or-reuse the org's
-// live service grant for (orgID, principal) — see
-// configstore.MintServiceCredential for the full contract.
+// MintServiceCredential delegates to the config store: create a fresh
+// credential whose principal is audit attribution only.
 func (s *gormStore) MintServiceCredential(
 	orgID string,
 	principal string,
 	ttl time.Duration,
-	forceRotate bool,
 ) (*configstore.ServiceCredentialIssue, error) {
-	return s.cs.MintServiceCredential(orgID, principal, ttl, forceRotate)
+	return s.cs.MintServiceCredential(orgID, principal, ttl)
 }
 
 // RefreshServiceCredential delegates to the config store: always-rotate the

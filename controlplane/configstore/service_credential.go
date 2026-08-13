@@ -29,22 +29,15 @@ var ErrServiceCredentialNotFound = errors.New("service credential not found")
 // resurrect it. HTTP handlers map it to 410.
 var ErrServiceCredentialRevoked = errors.New("service credential revoked")
 
-// ServiceCredentialIssue is the result of minting-or-reusing a service
-// credential (MintServiceCredential) or rotating one
-// (RefreshServiceCredential).
+// ServiceCredentialIssue is the result of minting a service credential or
+// refreshing one by credential ID.
 type ServiceCredentialIssue struct {
-	// Rotated reports whether this call bound a FRESH secret (true — a new
-	// grant, a force-rotate, or a refresh) or handed an already-live grant
-	// back untouched (false, mint reuse only). Plaintext is non-empty exactly
-	// when Rotated is true: the store never persists plaintext, so a reused
-	// grant has nothing new to hand back.
-	Rotated bool
 	// CredentialID is the server-generated identity the client connects as
 	// (svc_<24 random hex>).
 	CredentialID string
 	// Principal echoes the audit attribution the grant carries.
 	Principal string
-	// Plaintext is the freshly bound secret — ONLY set when Rotated is true.
+	// Plaintext is the freshly bound secret returned once by mint or refresh.
 	Plaintext string
 	// ExpiresAt is the hard cut for NEW connections. Established sessions are
 	// never torn down on expiry — freshness is enforced only at the pgwire
@@ -62,7 +55,7 @@ func GenerateCredentialID() (string, error) {
 	return ServiceCredentialPrefix + hex.EncodeToString(b), nil
 }
 
-// MintServiceCredential returns a service credential for (orgID, principal).
+// MintServiceCredential creates a new service credential for orgID.
 //
 // Design (CLAUDE.md "Service Credentials"):
 //
@@ -70,24 +63,16 @@ func GenerateCredentialID() (string, error) {
 //     duckgres_service_grants row keyed (org_id, credential_id). NOTHING is
 //     written to duckgres_org_users — there is no shared login row for an
 //     operator action to clobber mid-run.
-//   - Identity REUSE: one live grant per (org_id, principal). A mint while a
-//     live (not-revoked, not-expired) grant exists returns that grant's id and
-//     expiry with NO new plaintext (the caller already holding the secret
-//     keeps using it; a caller with nothing sets force_rotate). A mint with
-//     no live grant creates a fresh row and returns the plaintext once.
-//   - force_rotate re-binds the live grant's secret (rotating the bcrypt
-//     hash, bumping last_rotated_at, re-arming expires_at from THIS call's
-//     TTL) and returns the new plaintext. A revoked grant is terminal: reuse
-//     ignores it and force_rotate never resurrects it — the mint creates a
-//     new grant row instead.
-//   - Concurrency: the whole decide-then-mutate sequence runs under the org
-//     admission lock so two simultaneous mints for the same principal can't
-//     double-create (or rotate against a stale read).
+//   - Every call creates a fresh identity and secret. Principal is required
+//     audit attribution, not an identity or reuse key. Two jobs may therefore
+//     use the same principal without sharing or invalidating credentials.
+//   - Plaintext is returned exactly once, on this call, and never stored.
+//     Subsequent management names this credential ID explicitly through
+//     RefreshServiceCredential or RevokeServiceGrant.
 func (cs *ConfigStore) MintServiceCredential(
 	orgID string,
 	principal string,
 	ttl time.Duration,
-	forceRotate bool,
 ) (*ServiceCredentialIssue, error) {
 	if orgID == "" {
 		return nil, errors.New("orgID is required")
@@ -99,17 +84,28 @@ func (cs *ConfigStore) MintServiceCredential(
 		return nil, errors.New("ttl must be positive")
 	}
 
-	now := time.Now().UTC()
+	plaintext, err := GeneratePassword()
+	if err != nil {
+		return nil, fmt.Errorf("generate service credential secret: %w", err)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash service credential secret: %w", err)
+	}
+	credentialID, err := GenerateCredentialID()
+	if err != nil {
+		return nil, err
+	}
+	var expiresAt time.Time
 
-	var issue *ServiceCredentialIssue
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
-		// Serialize with every other org-wide admission decision (and every
-		// other mint/refresh for this org) so a concurrent caller can't
-		// interleave a stale read into the compare-then-rotate sequence.
+	err = cs.db.Transaction(func(tx *gorm.DB) error {
+		// Serialize against org lifecycle/config mutations. Always-create no
+		// longer needs principal-based serialization, but without this lock a
+		// concurrent org deletion could commit between the existence check and
+		// insert (the grants table intentionally has no foreign key).
 		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
 			return fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
 		}
-
 		// The org must exist. The HTTP handler pre-checks for a friendly 404,
 		// but the store enforces independently of any caller — a minted
 		// credential authenticates against the org, so minting into a ghost
@@ -122,82 +118,12 @@ func (cs *ConfigStore) MintServiceCredential(
 			return fmt.Errorf("load org (org=%s): %w", orgID, err)
 		}
 
-		// Newest-first so that if legacy data ever leaves two live grants for
-		// one principal we deterministically reuse/rotate the freshest one.
-		//
-		// The expiry comparison carries 1ms of slack around captured-now:
-		// Postgres timestamptz stores at microsecond precision (rounding Go's
-		// finer wall clock), so an expires_at computed as now+ttl and read
-		// straight back can sit one rounding quantum EITHER side of what the
-		// exact comparison would classify. The probe's job is "is this grant
-		// still comfortably alive", and TTLs are minutes — treating anything
-		// within 1ms of now as still-live is always the right reuse call.
-		var grant ServiceGrant
-		loadErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("org_id = ? AND principal = ? AND revoked_at IS NULL AND expires_at > ?",
-				orgID, principal, now.Add(time.Millisecond)).
-			Order("expires_at DESC").
-			First(&grant).Error
-		liveExists := loadErr == nil
-		if loadErr != nil && !errors.Is(loadErr, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("load live service grant (org=%s principal=%s): %w", orgID, principal, loadErr)
-		}
-
-		if liveExists && !forceRotate {
-			// Reuse: hand back the grant's identity and its REAL expiry (armed
-			// with the TTL in effect when it was last minted/rotated, not this
-			// call's ttl). No row change, no updated_at bump — and no
-			// plaintext: the secret was returned exactly once, when it was
-			// bound.
-			issue = &ServiceCredentialIssue{
-				Rotated:      false,
-				CredentialID: grant.CredentialID,
-				Principal:    grant.Principal,
-				Plaintext:    "",
-				ExpiresAt:    grant.ExpiresAt.UTC(),
-			}
-			return nil
-		}
-
-		// Rotate (live grant + force_rotate) or create (no live grant): bind a
-		// fresh random secret.
-		plaintext, err := GeneratePassword()
-		if err != nil {
-			return fmt.Errorf("generate service credential secret: %w", err)
-		}
-		hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
-		if err != nil {
-			return fmt.Errorf("hash service credential secret: %w", err)
-		}
-		expiresAt := now.Add(ttl)
-
-		if liveExists {
-			result := tx.Model(&ServiceGrant{}).
-				Where("org_id = ? AND credential_id = ?", grant.OrgID, grant.CredentialID).
-				Updates(map[string]any{
-					"password_hash":   string(hash),
-					"last_rotated_at": now,
-					"expires_at":      expiresAt,
-					"updated_at":      now,
-				})
-			if result.Error != nil {
-				return fmt.Errorf("rotate service grant (org=%s credential=%s): %w", orgID, grant.CredentialID, result.Error)
-			}
-			issue = &ServiceCredentialIssue{
-				Rotated:      true,
-				CredentialID: grant.CredentialID,
-				Principal:    grant.Principal,
-				Plaintext:    plaintext,
-				ExpiresAt:    expiresAt,
-			}
-			return nil
-		}
-
-		credentialID, err := GenerateCredentialID()
-		if err != nil {
-			return err
-		}
-		grant = ServiceGrant{
+		// Start the TTL only after admission/lifecycle lock contention. Secret
+		// generation and bcrypt deliberately happen before the transaction so
+		// expensive hashing never lengthens this critical section.
+		now := time.Now().UTC()
+		expiresAt = now.Add(ttl)
+		grant := ServiceGrant{
 			OrgID:         orgID,
 			CredentialID:  credentialID,
 			Principal:     principal,
@@ -211,19 +137,17 @@ func (cs *ConfigStore) MintServiceCredential(
 		if err := tx.Create(&grant).Error; err != nil {
 			return fmt.Errorf("create service grant (org=%s principal=%s): %w", orgID, principal, err)
 		}
-		issue = &ServiceCredentialIssue{
-			Rotated:      true,
-			CredentialID: credentialID,
-			Principal:    principal,
-			Plaintext:    plaintext,
-			ExpiresAt:    expiresAt,
-		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return issue, nil
+	return &ServiceCredentialIssue{
+		CredentialID: credentialID,
+		Principal:    principal,
+		Plaintext:    plaintext,
+		ExpiresAt:    expiresAt,
+	}, nil
 }
 
 // RefreshServiceCredential ALWAYS rotates an existing grant's secret and
@@ -251,10 +175,20 @@ func (cs *ConfigStore) RefreshServiceCredential(
 		return nil, errors.New("ttl must be positive")
 	}
 
-	now := time.Now().UTC()
+	// Hash before taking the org lifecycle/admission lock. This may do a
+	// little wasted work for an unknown/revoked ID, but keeps bcrypt out of a
+	// lock shared with scheduling and org mutations.
+	plaintext, err := GeneratePassword()
+	if err != nil {
+		return nil, fmt.Errorf("generate service credential secret: %w", err)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash service credential secret: %w", err)
+	}
 
 	var issue *ServiceCredentialIssue
-	err := cs.db.Transaction(func(tx *gorm.DB) error {
+	err = cs.db.Transaction(func(tx *gorm.DB) error {
 		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
 			return fmt.Errorf("lock org connection admission (org=%s): %w", orgID, err)
 		}
@@ -272,14 +206,8 @@ func (cs *ConfigStore) RefreshServiceCredential(
 			return ErrServiceCredentialRevoked
 		}
 
-		plaintext, err := GeneratePassword()
-		if err != nil {
-			return fmt.Errorf("generate service credential secret: %w", err)
-		}
-		hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
-		if err != nil {
-			return fmt.Errorf("hash service credential secret: %w", err)
-		}
+		// Admission lock waits must not consume the newly issued TTL.
+		now := time.Now().UTC()
 		expiresAt := now.Add(ttl)
 		result := tx.Model(&ServiceGrant{}).
 			Where("org_id = ? AND credential_id = ?", orgID, credentialID).
@@ -293,7 +221,6 @@ func (cs *ConfigStore) RefreshServiceCredential(
 			return fmt.Errorf("rotate service grant (org=%s credential=%s): %w", orgID, credentialID, result.Error)
 		}
 		issue = &ServiceCredentialIssue{
-			Rotated:      true,
 			CredentialID: credentialID,
 			Principal:    grant.Principal,
 			Plaintext:    plaintext,

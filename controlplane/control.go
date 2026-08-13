@@ -1861,7 +1861,7 @@ func (cp *ControlPlane) finishSessionAcquisition(
 		return sessionMetadataResult{}, initErr, nil
 	}
 	in.sessions.SetConnCloser(in.pid, in.tlsConn)
-	if cp.configStore != nil && in.orgID != "" {
+	if cp.configStore != nil && in.orgID != "" && requiresOrgUserSessionRecheck(in.username) {
 		if _, _, ok := cp.configStore.OrgUserSessionQueryAccess(in.orgID, in.username); !ok {
 			destroy()
 			in.meta.clog.Warn("Session acquisition aborted: user is disabled or no longer exists.")
@@ -1869,6 +1869,16 @@ func (cp *ControlPlane) finishSessionAcquisition(
 		}
 	}
 	return meta, nil, nil
+}
+
+// requiresOrgUserSessionRecheck reports whether the post-acquisition race
+// gate must consult duckgres_org_users. Service credentials have already
+// authenticated against their own grant row, and expiry/revocation are
+// handshake-only: rechecking them here would kill an established connection
+// while it lazily acquires or switches workers. Normal users still fail closed
+// if disabled or deleted during the create window.
+func requiresOrgUserSessionRecheck(username string) bool {
+	return !strings.HasPrefix(username, configstore.ServiceCredentialPrefix)
 }
 
 // workerProfileCPU / workerProfileMemory render a possibly-nil worker profile

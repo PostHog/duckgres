@@ -177,9 +177,9 @@ type ServiceGrant struct {
 	OrgID        string `gorm:"primaryKey;type:text;index:idx_duckgres_service_grants_org_principal,priority:1;index:idx_duckgres_service_grants_org_state,priority:1" json:"org_id"`
 	CredentialID string `gorm:"primaryKey;type:text" json:"credential_id"`
 	// Principal is audit attribution ("dagster:events-backfill") — required
-	// at mint so every invocation is attributable. Indexed per
-	// (org_id, principal) via migration 000036 so the mint path can find the
-	// reusable live grant for a caller.
+	// at mint so every invocation is attributable. It is intentionally
+	// non-unique: each invocation gets a new credential ID, even when jobs use
+	// the same principal.
 	Principal     string     `gorm:"type:text;not null;index:idx_duckgres_service_grants_org_principal,priority:2" json:"principal"`
 	PasswordHash  string     `gorm:"type:text;not null" json:"-"`
 	MintedAt      time.Time  `gorm:"not null;default:now()" json:"minted_at"`
