@@ -609,9 +609,10 @@ func (c *clientConn) logClientQueryReceived(ctx context.Context, protocol, query
 		"trace_id", traceID,
 	)
 	analytics.Default().Capture("query_initiated", c.orgID, map[string]any{
-		"user":     c.username,
-		"team_id":  c.teamID,
-		"trace_id": traceID,
+		"user":             c.username,
+		"team_id":          c.teamID,
+		"trace_id":         traceID,
+		"application_name": c.applicationName,
 	})
 }
 
@@ -649,11 +650,12 @@ func (c *clientConn) logQueryError(query string, err error) {
 	// Per-org product analytics. No SQL text or secrets are sent — only the
 	// SQLSTATE and category — so this is unaffected by the redaction above.
 	analytics.Default().Capture("query_failed", c.orgID, map[string]any{
-		"user":           c.username,
-		"team_id":        c.teamID,
-		"trace_id":       traceID,
-		"error_code":     sqlState,
-		"error_category": category,
+		"user":             c.username,
+		"team_id":          c.teamID,
+		"trace_id":         traceID,
+		"error_code":       sqlState,
+		"error_category":   category,
+		"application_name": c.applicationName,
 	})
 
 	// Retain a redacted snapshot for the admin Errors page. Both Query and
