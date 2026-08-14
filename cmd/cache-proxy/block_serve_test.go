@@ -444,12 +444,11 @@ func TestServeBlockAlignedSpansChunkedByMaxSpan(t *testing.T) {
 	}
 }
 
-// TestServeBlockAlignedPeerFillCountsAsHit exercises the previously-untested
-// peer branch of Phase 1: a block resolvable from a peer must never touch
-// origin, must land under blockReadsTotal{peer} / cacheBytesServed{peer}, and
-// (having triggered zero origin fetches) must count as a cache hit, not a
-// miss — the same "hit" meaning the legacy path uses.
-func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
+// TestServeBlockAlignedPeerFillCountsAsLocalMiss exercises the peer branch of
+// Phase 1: a block resolved from another node must land under
+// blockReadsTotal{peer} / cacheBytesServed{peer}, while the request-level
+// hit/miss counters continue to mean whether the bytes were already local.
+func TestServeBlockAlignedPeerFillCountsAsLocalMiss(t *testing.T) {
 	const blockSize = 1024
 	origin := originServer(t, 4*blockSize)
 	target := origin.URL + "/bucket/f.parquet"
@@ -488,11 +487,11 @@ func TestServeBlockAlignedPeerFillCountsAsHit(t *testing.T) {
 		t.Fatalf("peer /cache/get calls = %d, want 1", getCalls)
 	}
 
-	if got := counterValue(t, cacheHitsTotal); got != hitsBefore+1 {
-		t.Fatalf("cacheHitsTotal delta = %v, want 1 (peer fill with zero origin fetches must count as a hit)", got-hitsBefore)
+	if got := counterValue(t, cacheHitsTotal); got != hitsBefore {
+		t.Fatalf("cacheHitsTotal delta = %v, want 0 (a peer fill was not already local)", got-hitsBefore)
 	}
-	if got := counterValue(t, cacheMissesTotal); got != missesBefore {
-		t.Fatalf("cacheMissesTotal delta = %v, want 0", got-missesBefore)
+	if got := counterValue(t, cacheMissesTotal); got != missesBefore+1 {
+		t.Fatalf("cacheMissesTotal delta = %v, want 1", got-missesBefore)
 	}
 	if got := counterValue(t, blockReadsTotal.WithLabelValues("peer")); got != peerReadsBefore+1 {
 		t.Fatalf("blockReadsTotal{peer} delta = %v, want 1", got-peerReadsBefore)

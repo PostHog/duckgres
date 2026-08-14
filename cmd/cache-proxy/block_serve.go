@@ -454,9 +454,10 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	blockReadsTotal.WithLabelValues("peer").Add(float64(nPeer))
 	blockReadsTotal.WithLabelValues("s3").Add(float64(nOrigin))
 
-	// Request-level hit/miss accounting mirrors the legacy meaning: a hit is
-	// "no origin traffic needed".
-	if nOrigin == 0 {
+	// Request-level hit/miss accounting mirrors the metric's documented
+	// meaning: a hit means every requested block was already on local NVMe.
+	// Fetching any block from a peer or origin is a local miss.
+	if nPeer == 0 && nOrigin == 0 {
 		cacheHitsTotal.Inc()
 	} else {
 		cacheMissesTotal.Inc()

@@ -329,9 +329,9 @@ func (c *DiskCache) Open(key string) (io.ReadCloser, int64, bool) {
 	return f, size, true
 }
 
-// openFile opens a cached entry WITHOUT recording a hit. Used to serve a body
-// that was just fetched on a miss — that path already counted a miss, so
-// counting it as a hit too would double-count.
+// openFile opens and touches a cached entry WITHOUT recording a worker-facing
+// hit. It serves bodies just fetched on a miss and peer API reads; neither is a
+// local hit for the requesting worker.
 func (c *DiskCache) openFile(key string) (io.ReadCloser, int64, bool) {
 	if !IsValidCacheKey(key) {
 		return nil, 0, false
