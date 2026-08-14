@@ -100,7 +100,9 @@ opened so LRU eviction cannot truncate an in-progress assembled response.
 When a trace endpoint is set the proxy exports OpenTelemetry spans under
 `service.name=duckgres-cache-proxy`. A cacheable request emits `cache.get`, with
 `cache.origin_fetch`, `cache.peer_lookup`, and `cache.peer_get` children as
-needed; peer transfers emit `cache.peer_serve` on the selected remote proxy.
+needed; block-aligned origin span fetches emit `cache.origin_span_fetch` (or
+`cache.origin_span_refetch` for the presence re-fetch backstop). Peer
+transfers emit `cache.peer_serve` on the selected remote proxy.
 `CONNECT` tunnels emit `cache.connect` and non-cached methods emit
 `cache.forward`.
 
@@ -121,7 +123,11 @@ per-request tenant identity.
 Origin `GET` misses are retried up to 4 total attempts for transient failures:
 HTTP `408`, `429`, `500`, `502`, `503`, `504`, request timeouts, and common
 transport resets. Retries start with a 100 ms backoff and cap at 1 second.
+This applies both to the legacy exact-range path and to block-aligned span
+fetches (including the presence re-fetch backstop), so a brief origin blip is
+absorbed by the proxy instead of surfacing to DuckDB as a `502`.
 
 Terminal origin responses such as `400`, `403`, `404`, and `416` are not retried
-and are forwarded back to DuckDB verbatim. Failed origin responses are never
-stored in the cache.
+and are forwarded back to DuckDB verbatim — as is the final status once the
+retry budget is exhausted. Failed origin responses are never stored in the
+cache.

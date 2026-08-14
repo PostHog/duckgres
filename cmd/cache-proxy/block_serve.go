@@ -254,7 +254,14 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			flightKey := fmt.Sprintf("%s|%d", BlockKey(urlStr, lo, p.blockSize), hi)
 			_, err := p.flights.Do(flightKey, func() (fetchResult, error) {
 				fetchStart := time.Now()
-				fetchErr := p.fetchOriginSpan(r, p.blockSize, lo, hi)
+				// Retry transient origin failures inside the flight so every
+				// waiter on this key benefits, and a brief origin blip is
+				// absorbed here instead of reaching DuckDB as a 502.
+				_, fetchSpan := proxyTracer.Start(r.Context(), "cache.origin_span_fetch")
+				fetchErr := p.retryOriginFetch(r, fetchSpan, func() error {
+					return p.fetchOriginSpan(r, p.blockSize, lo, hi)
+				})
+				fetchSpan.End()
 				s3Dur += time.Since(fetchStart)
 				return fetchResult{}, fetchErr
 			})
@@ -348,7 +355,11 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		lo := reverifyStart
 		reverifyStart = -1
 		fetchStart := time.Now()
-		err := p.fetchOriginSpan(r, p.blockSize, lo, runEnd)
+		_, fetchSpan := proxyTracer.Start(r.Context(), "cache.origin_span_refetch")
+		err := p.retryOriginFetch(r, fetchSpan, func() error {
+			return p.fetchOriginSpan(r, p.blockSize, lo, runEnd)
+		})
+		fetchSpan.End()
 		s3Dur += time.Since(fetchStart)
 		if err != nil {
 			slog.Warn("Presence re-fetch failed; failing closed below if blocks are still missing.",

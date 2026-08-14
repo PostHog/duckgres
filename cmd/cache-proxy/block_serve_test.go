@@ -16,6 +16,30 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// serveSyntheticRanged serves body honoring absolute Range headers like S3:
+// 206 with Content-Range for in-range requests, 416 for starts past the end,
+// clamping the end at the object boundary.
+func serveSyntheticRanged(w http.ResponseWriter, r *http.Request, body []byte) {
+	objSize := int64(len(body))
+	start, end, ok := parseAbsoluteRange(r.Header.Get("Range"))
+	if !ok {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return
+	}
+	if start >= objSize {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", objSize))
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	if end >= objSize {
+		end = objSize - 1 // S3 clamps to object end
+	}
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, objSize))
+	w.WriteHeader(http.StatusPartialContent)
+	_, _ = w.Write(body[start : end+1])
+}
+
 // originServer serves a synthetic object of objSize bytes where byte i has
 // value byte(i % 251), honoring absolute Range headers like S3.
 func originServer(t *testing.T, objSize int64) *httptest.Server {
@@ -25,23 +49,7 @@ func originServer(t *testing.T, objSize int64) *httptest.Server {
 		body[i] = byte(i % 251)
 	}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start, end, ok := parseAbsoluteRange(r.Header.Get("Range"))
-		if !ok {
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(body)
-			return
-		}
-		if start >= objSize {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", objSize))
-			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-		if end >= objSize {
-			end = objSize - 1 // S3 clamps to object end
-		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, objSize))
-		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write(body[start : end+1])
+		serveSyntheticRanged(w, r, body)
 	}))
 }
 
@@ -235,6 +243,146 @@ func TestServeBlockAlignedFailsClosedOn200Origin(t *testing.T) {
 		if store.Has(BlockKey(u.String(), idx, blockSize)) {
 			t.Fatalf("block %d must not be committed when the origin ignored Range", idx)
 		}
+	}
+}
+
+// TestServeBlockAlignedRetriesTransientOriginStatus: a cold block-mode
+// request whose origin answers with a retriable 5xx must be retried inside
+// the proxy — a transient S3 503 blip should not reach DuckDB as a failure.
+func TestServeBlockAlignedRetriesTransientOriginStatus(t *testing.T) {
+	const blockSize = 1024
+	const objSize = 4 * blockSize
+	body := make([]byte, objSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	var calls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		serveSyntheticRanged(w, r, body)
+	}))
+	defer origin.Close()
+
+	p, _ := newBlockProxy(t, origin, blockSize)
+	w := doBlockRequest(t, p, origin.URL+"/bucket/f.parquet", "bytes=1500-2500")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206 (body: %s)", w.Code, w.Body.String())
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("origin calls = %d, want 3 (2 transient failures + 1 success)", got)
+	}
+	if w.Body.Len() != 1001 {
+		t.Fatalf("body len = %d, want 1001", w.Body.Len())
+	}
+	for i, b := range w.Body.Bytes() {
+		if want := body[1500+i]; b != want {
+			t.Fatalf("byte %d: got %d, want %d", i, b, want)
+		}
+	}
+}
+
+// TestServeBlockAlignedRetriesTruncatedOriginBody: a mid-body connection drop
+// while committing blocks (unexpected EOF) is retriable — the proxy must
+// re-fetch the span rather than 502ing back to DuckDB.
+func TestServeBlockAlignedRetriesTruncatedOriginBody(t *testing.T) {
+	const blockSize = 1024
+	const objSize = 4 * blockSize
+	body := make([]byte, objSize)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	var calls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			// Send a valid 206 header, then sever the connection mid-body so
+			// the client hits an unexpected EOF while committing blocks.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("hijacking not supported")
+				return
+			}
+			conn, rw, err := hj.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			start, end, _ := parseAbsoluteRange(r.Header.Get("Range"))
+			_, _ = fmt.Fprintf(rw, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes %d-%d/%d\r\nContent-Length: %d\r\n\r\n", start, end, objSize, end-start+1)
+			_, _ = rw.Write(make([]byte, 100)) // truncated: less than Content-Length
+			_ = rw.Flush()
+			return
+		}
+		serveSyntheticRanged(w, r, body)
+	}))
+	defer origin.Close()
+
+	p, store := newBlockProxy(t, origin, blockSize)
+	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
+	w := doBlockRequest(t, p, u.String(), "bytes=1500-2500")
+	if w.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206 (body: %s)", w.Code, w.Body.String())
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("origin calls = %d, want 2 (1 truncated + 1 success)", got)
+	}
+	// The truncated first attempt must not have left partial blocks behind:
+	// blocks 1 and 2 must be complete.
+	for idx := int64(1); idx <= 2; idx++ {
+		_, size, ok := store.Open(BlockKey(u.String(), idx, blockSize))
+		if !ok || size != blockSize {
+			t.Fatalf("block %d: present=%v size=%d, want present size %d", idx, ok, size, blockSize)
+		}
+	}
+}
+
+// TestServeBlockAlignedDoesNotRetryTerminalOriginStatus: a 4xx like 400 is
+// terminal — forward it verbatim after a single attempt, no retries.
+func TestServeBlockAlignedDoesNotRetryTerminalOriginStatus(t *testing.T) {
+	const blockSize = 1024
+	var calls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("<Error><Code>BadRequest</Code></Error>"))
+	}))
+	defer origin.Close()
+
+	p, _ := newBlockProxy(t, origin, blockSize)
+	w := doBlockRequest(t, p, origin.URL+"/bucket/f.parquet", "bytes=1500-2500")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 forwarded verbatim", w.Code)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("origin calls = %d, want 1 (terminal status must not be retried)", got)
+	}
+	if got := w.Body.String(); got != "<Error><Code>BadRequest</Code></Error>" {
+		t.Fatalf("body = %q, want verbatim origin error body", got)
+	}
+}
+
+// TestServeBlockAlignedRetriesExhausted: when the origin never recovers, the
+// proxy gives up after the configured attempts and forwards the last origin
+// status verbatim.
+func TestServeBlockAlignedRetriesExhausted(t *testing.T) {
+	const blockSize = 1024
+	var calls atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer origin.Close()
+
+	p, _ := newBlockProxy(t, origin, blockSize)
+	w := doBlockRequest(t, p, origin.URL+"/bucket/f.parquet", "bytes=1500-2500")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 forwarded verbatim after retries are exhausted", w.Code)
+	}
+	if got, want := calls.Load(), int32(defaultOriginRetryMaxAttempts); got != want {
+		t.Fatalf("origin calls = %d, want %d (retry budget exhausted)", got, want)
 	}
 }
 
