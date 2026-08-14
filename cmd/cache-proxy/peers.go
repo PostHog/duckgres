@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,6 +24,10 @@ var (
 		Name: "cache_proxy_peer_hits_total",
 		Help: "Total successful peer cache hits",
 	})
+	peerProbesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cache_proxy_peer_probes_total",
+		Help: "Physical peer availability probe attempts, by outcome",
+	}, []string{"outcome"}) // hit, miss, timeout, canceled, error
 )
 
 // Peer timeouts. The /cache/has probe is a tiny HEAD-like check, so it gets a
@@ -159,12 +164,21 @@ func (pm *PeerManager) LocateKey(cacheKey string) (holder string, flight, ok boo
 		go func(addr string) {
 			res := probeResult{addr: addr, status: -1}
 			hasURL := fmt.Sprintf("http://%s/cache/has?key=%s", addr, cacheKey)
-			if req, err := http.NewRequestWithContext(ctx, "GET", hasURL, nil); err == nil {
-				if resp, err := pm.client.Do(req); err == nil {
-					res.status = resp.StatusCode
-					_ = resp.Body.Close()
-				}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, hasURL, nil)
+			if err != nil {
+				peerProbesTotal.WithLabelValues("error").Inc()
+				resCh <- res
+				return
 			}
+			resp, err := pm.client.Do(req)
+			if err != nil {
+				peerProbesTotal.WithLabelValues(peerProbeErrorOutcome(err)).Inc()
+				resCh <- res
+				return
+			}
+			res.status = resp.StatusCode
+			_ = resp.Body.Close()
+			peerProbesTotal.WithLabelValues(peerProbeStatusOutcome(resp.StatusCode)).Inc()
 			resCh <- res
 		}(addr)
 	}
@@ -186,6 +200,32 @@ func (pm *PeerManager) LocateKey(cacheKey string) (holder string, flight, ok boo
 		return firstFlight, true, true
 	}
 	return "", false, false
+}
+
+func peerProbeStatusOutcome(status int) string {
+	switch status {
+	case http.StatusOK, http.StatusAccepted:
+		return "hit"
+	case http.StatusNotFound:
+		return "miss"
+	default:
+		return "error"
+	}
+}
+
+func peerProbeErrorOutcome(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return "timeout"
+		}
+		return "error"
+	}
 }
 
 // FetchFromPeer streams cacheKey's body from one peer into sink. flight=true

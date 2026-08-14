@@ -223,6 +223,68 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_request_duration_seconds` | Histogram | `path`, `source` | End-to-end duration of a served request. `path` is `block` (block-aligned cache path) or `forward` (uncached forward-proxy path); `source` is `local`, `peer`, or `s3` for `block`, and always `origin` for `forward`. |
 | `cache_proxy_forward_requests_total` | Counter | `method` | Requests handled by the uncached forward-proxy path, by HTTP method. |
 | `cache_proxy_inflight_requests` | Gauge | None | Requests currently being handled by the proxy's request entry point; the queue-depth signal. |
+| `cache_proxy_hits_total` | Counter | None | Worker-facing cacheable requests served entirely from data already present on local NVMe. Peer API reads and requests that first fetch any block from a peer are excluded. |
+| `cache_proxy_misses_total` | Counter | None | Worker-facing cacheable requests that require a peer or origin fill before they can be served. |
+| `cache_proxy_bytes_served_total` | Counter | `source` | Directional byte mix by `local`, `peer`, or `s3`. Block mode counts assembled response bytes under the slowest source used; the legacy exact-range path counts the local read or deduplicated fill once, so this is not an exact client-egress counter. |
+| `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups. One lookup can issue multiple physical `/cache/has` probes. |
+| `cache_proxy_peer_hits_total` | Counter | None | Logical peer lookups followed by a successful peer body transfer. |
+| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical peer availability probe attempts, classified as `hit`, `miss`, `timeout`, `canceled`, or `error`. Both a present entry (`200`) and an in-flight claim (`202`) are `hit`; `canceled` normally means a losing probe was released after another peer answered and is not itself a failure. |
+
+Cache-proxy metrics deliberately have no org label. Use the existing per-org
+Duckgres query and worker-acquisition metrics for customer-facing rollout
+guardrails, and use these proxy metrics for cache locality and amplification.
+
+Local cache hit ratio:
+
+```promql
+sum(rate(cache_proxy_hits_total[5m]))
+/
+clamp_min(
+  sum(rate(cache_proxy_hits_total[5m]))
+    + sum(rate(cache_proxy_misses_total[5m])),
+  1e-9
+)
+```
+
+Average physical peer fanout per logical lookup:
+
+```promql
+sum(rate(cache_proxy_peer_probes_total[5m]))
+/
+clamp_min(sum(rate(cache_proxy_peer_fetches_total[5m])), 1e-9)
+```
+
+Peer lookup yield:
+
+```promql
+sum(rate(cache_proxy_peer_hits_total[5m]))
+/
+clamp_min(sum(rate(cache_proxy_peer_fetches_total[5m])), 1e-9)
+```
+
+For an org-affinity canary, pair those signals with the existing per-org
+customer failure and worker-acquisition guardrails:
+
+```promql
+sum by (org) (
+  rate(duckgres_query_total{status="error"}[5m])
+)
+/
+clamp_min(
+  sum by (org) (rate(duckgres_query_total[5m])),
+  1e-9
+)
+
+sum by (org, outcome) (
+  rate(duckgres_worker_acquire_total_seconds_count{outcome=~"capacity|error|canceled"}[5m])
+)
+/
+on (org) group_left
+clamp_min(
+  sum by (org) (rate(duckgres_worker_acquire_total_seconds_count[5m])),
+  1e-9
+)
+```
 
 ## PromQL recipes
 
