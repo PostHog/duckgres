@@ -77,12 +77,36 @@ func waitForRecorder(t *testing.T, ch <-chan *httptest.ResponseRecorder, msg str
 // and returns the buffer + a restore function. Used by the forward-uncached
 // logging tests to assert presence of the request/response log lines that
 // were missing pre-PR (every PUT/POST through the proxy was a black hole).
-func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
+//
+// The buffer must be concurrency-safe: proxy handlers log from goroutines
+// that outlive the request (e.g. the CONNECT close logger fires after both
+// tunnel legs finish), so test-goroutine String reads would race an
+// unsynchronized bytes.Buffer.
+func captureSlog(t *testing.T) (*syncBuffer, func()) {
 	t.Helper()
 	prev := slog.Default()
-	var buf bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	return &buf, func() { slog.SetDefault(prev) }
+	buf := &syncBuffer{}
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return buf, func() { slog.SetDefault(prev) }
+}
+
+// syncBuffer serializes slog-handler Write calls from proxy goroutines
+// against String reads from the test goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // newTestProxy wires a CacheProxy with no peers and a tempdir-backed store.
