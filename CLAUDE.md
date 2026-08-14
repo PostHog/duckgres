@@ -652,6 +652,14 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   panel KEY, PromQL is built server-side from `rangePanels` (never an open PromQL
   relay) and forwarded to `DUCKGRES_PROMETHEUS_URL`. Org-labelled panels keep
   slicing enforced.
+- **Product monitoring API is tenant-safe** (`monitoring.go`):
+  `GET /api/v1/orgs/:id/monitoring/{snapshot,series}` is internal-secret-only
+  for the PostHog backend. It fixes tenant identity from the path, uses only
+  org-scoped runtime-store reads and Prometheus selectors, returns CP coverage
+  for partial live-state fan-out, and strips usernames, PIDs, pod/image names,
+  CP ownership, SQL, client/trace data, and secrets. The series metric and
+  window are closed enums; never turn it into arbitrary PromQL or reuse the
+  operator payloads wholesale.
 - **Env-only knobs**: `DUCKGRES_PROMETHEUS_URL` (read in
   `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit` is
   AutoMigrated at startup (operational state, not goose-migrated tenant config).

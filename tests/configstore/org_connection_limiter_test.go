@@ -1952,6 +1952,56 @@ func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
 	}
 }
 
+func TestOrgConnectionMonitoringStateExcludesExpiredRuntimeRows(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-active")
+
+	now := time.Now().UTC()
+	expiredAt := now.Add(-time.Minute)
+	if err := store.UpsertControlPlaneInstance(&cpconfigstore.ControlPlaneInstance{
+		ID:              "cp-expired",
+		PodName:         "cp-expired",
+		State:           cpconfigstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now.Add(-10 * time.Minute),
+		ExpiredAt:       &expiredAt,
+	}); err != nil {
+		t.Fatalf("upsert expired control plane: %v", err)
+	}
+
+	leaseTable := store.RuntimeSchema() + ".org_connection_leases"
+	leases := []*cpconfigstore.OrgConnectionLease{
+		{LeaseID: "active", RequestID: "request-active", OrgID: "org-monitoring", Username: "alice", CPInstanceID: "cp-active", PID: 1, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+		{LeaseID: "expired-owner", RequestID: "request-expired-owner", OrgID: "org-monitoring", Username: "bob", CPInstanceID: "cp-expired", PID: 2, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+		{LeaseID: "recent-missing-owner", RequestID: "request-recent-missing-owner", OrgID: "org-monitoring", Username: "carol", CPInstanceID: "cp-missing", PID: 3, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+		{LeaseID: "stale-missing-owner", RequestID: "request-stale-missing-owner", OrgID: "org-monitoring", Username: "dave", CPInstanceID: "cp-stale", PID: 4, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now.Add(-10 * time.Minute)},
+		{LeaseID: "other-org", RequestID: "request-other-org", OrgID: "org-other", Username: "eve", CPInstanceID: "cp-active", PID: 5, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+	}
+	if err := store.DB().Table(leaseTable).Create(leases).Error; err != nil {
+		t.Fatalf("insert monitoring leases: %v", err)
+	}
+
+	grantedAt := now
+	queueTable := store.RuntimeSchema() + ".org_connection_queue"
+	queue := []*cpconfigstore.OrgConnectionQueueEntry{
+		{RequestID: "pending", OrgID: "org-monitoring", Username: "alice", CPInstanceID: "cp-active", PID: 11, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute)},
+		{RequestID: "expired", OrgID: "org-monitoring", Username: "bob", CPInstanceID: "cp-active", PID: 12, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now.Add(-2 * time.Minute), ExpiresAt: now.Add(-time.Minute)},
+		{RequestID: "granted", OrgID: "org-monitoring", Username: "carol", CPInstanceID: "cp-active", PID: 13, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute), GrantedAt: &grantedAt},
+		{RequestID: "other-org-pending", OrgID: "org-other", Username: "eve", CPInstanceID: "cp-active", PID: 14, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute)},
+	}
+	if err := store.DB().Table(queueTable).Create(queue).Error; err != nil {
+		t.Fatalf("insert monitoring queue: %v", err)
+	}
+
+	status, err := store.OrgConnectionMonitoringState("org-monitoring")
+	if err != nil {
+		t.Fatalf("monitoring state: %v", err)
+	}
+	if status.ActiveLeases != 2 || status.QueuedConns != 1 {
+		t.Fatalf("monitoring state = %+v, want 2 active leases / 1 queued connection", status)
+	}
+}
+
 func TestTryAcquireOrgConnectionLeasePrunesStaleMissingControlPlaneOwner(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")

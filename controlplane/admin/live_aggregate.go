@@ -19,10 +19,16 @@ import (
 // FetchPeers GETs path+"?scope=local" from each peer (the scope param makes the
 // peer return ONLY its own in-memory view, never re-fanning out — that's the
 // recursion guard). It returns each peer's raw response body plus the total
-// number of peers attempted, so a handler can report "N of M CPs responded"
-// and degrade gracefully when a peer is slow/down.
+// number of peers attempted and whether discovery completed, so a handler can
+// distinguish a healthy single-CP deployment from a failed Kubernetes lookup.
+type PeerFetchResult struct {
+	Bodies            [][]byte
+	Peers             int
+	DiscoveryComplete bool
+}
+
 type PeerFetcher interface {
-	FetchPeers(ctx context.Context, path string) (bodies [][]byte, peers int)
+	FetchPeers(ctx context.Context, path string) PeerFetchResult
 	// PostPeers is FetchPeers for a mutating action: it POSTs path+"?scope=local"
 	// to every OTHER replica and returns each peer's raw 200 body plus the number
 	// of peers attempted. Cluster-wide actions (the per-user kill switch) use it so
@@ -36,6 +42,16 @@ type PeerFetcher interface {
 type aggMeta struct {
 	Responders int `json:"cp_responders"`
 	Total      int `json:"cp_total"`
+}
+
+func peerReadCoverage(result PeerFetchResult, peerResponders int) aggMeta {
+	total := 1 + result.Peers
+	if !result.DiscoveryComplete {
+		// Discovery failure makes the peer count unknown, so reserve one missing
+		// responder instead of presenting the local slice as complete coverage.
+		total++
+	}
+	return aggMeta{Responders: 1 + peerResponders, Total: total}
 }
 
 // localScope reports whether this request is a peer-to-peer fan-out call that

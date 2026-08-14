@@ -2766,6 +2766,31 @@ admin_console_api() {
     echo "$panels" | jq -e --arg p "$p" '.panels | index($p)' >/dev/null \
       || fail "/metrics/panels missing '$p'"
   done
+
+  # Product monitoring is an internal-secret-only tenant surface, distinct
+  # from the operator endpoints. The snapshot is sourced from the org-scoped
+  # durable runtime store plus live CP state and must retain its sanitized
+  # envelope even when the org is idle. The series request may be 503 in this
+  # environment when Prometheus is intentionally unset, but an unknown metric
+  # must be rejected by the allow-list before any upstream call.
+  curl -fsS -H "$H" "$API/api/v1/orgs/$CNPG/monitoring/snapshot" \
+    | jq -e --arg o "$CNPG" '
+        .schema_version == 1 and .org_id == $o and
+        (.warehouse.state | type) == "string" and
+        (.workers | type) == "array" and
+        (.coverage.cp_total >= 1) and
+        ([.workers[]? | has("pod_name") or has("image") or has("owner_cp_instance_id") or has("user") or has("pid")] | any | not)
+      ' >/dev/null \
+    || fail "/orgs/$CNPG/monitoring/snapshot envelope or redaction wrong"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" \
+    "$API/api/v1/orgs/$CNPG/monitoring/series?metric=worker_states&window=1h")"
+  [ "$code" = "400" ] || fail "monitoring series unknown metric returned $code, want 400"
+  body="$(curl -sS -H "$H" "$API/api/v1/orgs/__missing_monitoring_org__/monitoring/snapshot")"
+  echo "$body" | jq -e '.code == "managed_warehouse_not_found"' >/dev/null \
+    || fail "monitoring snapshot missing warehouse returned an unstable error: $body"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" \
+    "$API/api/v1/orgs/__missing_monitoring_org__/monitoring/snapshot")"
+  [ "$code" = "404" ] || fail "monitoring snapshot missing warehouse returned $code, want 404"
 }
 
 # ---- admin: operators CRUD (console access list) ---------------------------

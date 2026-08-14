@@ -2071,8 +2071,8 @@ func (h *apiHandler) listWorkers(c *gin.Context) {
 	}
 	// A worker is owned by exactly one CP (disjoint union); dedup makes it idempotent.
 	if !localScope(c) && h.fetcher != nil {
-		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
-		mergePeer(&workers, bodies, func(e []WorkerStatus) []WorkerStatus { return e })
+		peerResult := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
+		mergePeer(&workers, peerResult.Bodies, func(e []WorkerStatus) []WorkerStatus { return e })
 		workers = dedupeBy(workers, func(w WorkerStatus) int { return w.ID })
 	}
 	c.JSON(http.StatusOK, workers)
@@ -2087,8 +2087,8 @@ func (h *apiHandler) listSessions(c *gin.Context) {
 	}
 	// A session lives on exactly one CP (disjoint union); dedup makes it idempotent.
 	if !localScope(c) && h.fetcher != nil {
-		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
-		mergePeer(&sessions, bodies, func(e []SessionStatus) []SessionStatus { return e })
+		peerResult := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
+		mergePeer(&sessions, peerResult.Bodies, func(e []SessionStatus) []SessionStatus { return e })
 		sessions = dedupeBy(sessions, func(s SessionStatus) int { return s.WorkerID })
 	}
 	c.JSON(http.StatusOK, sessions)
@@ -2104,8 +2104,8 @@ func (h *apiHandler) getClusterStatus(c *gin.Context) {
 	// Per-org active-session counts are per-CP; merge every CP's slice so the
 	// Overview cards reflect the whole cluster instead of one replica's view.
 	if !localScope(c) && h.fetcher != nil {
-		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/status")
-		orgStats = mergeOrgStats(orgStats, bodies)
+		peerResult := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/status")
+		orgStats = mergeOrgStats(orgStats, peerResult.Bodies)
 	}
 
 	totalWorkers := 0
