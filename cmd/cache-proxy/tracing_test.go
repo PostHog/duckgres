@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -179,5 +184,105 @@ func TestTracingExtractsRemoteParentAtIngress(t *testing.T) {
 	}
 	if getSpan.Parent().SpanID() != parent.SpanID() {
 		t.Fatalf("cache.get parent = %s, want remote parent %s", getSpan.Parent().SpanID(), parent.SpanID())
+	}
+}
+
+func TestPeerTransferPropagatesContextAndRecordsLookup(t *testing.T) {
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+
+	sr := withSpanRecorder(t)
+	key := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	store, err := NewDiskCache(t.TempDir(), 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := NewCacheProxy(store, nil, nil)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cache/has", peer.HandlePeerHas)
+	mux.HandleFunc("/cache/get", peer.HandlePeerGet)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	if _, err := store.PutStream(key, strings.NewReader("peer-data")); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: trace.TraceID{1}, SpanID: trace.SpanID{2},
+		TraceFlags: trace.FlagsSampled, Remote: true,
+	})
+	ctx := trace.ContextWithRemoteSpanContext(context.Background(), parent)
+	pm := peerManagerWith([]string{strings.TrimPrefix(server.URL, "http://")})
+	holder, flight, ok := pm.LocateKey(ctx, key)
+	if !ok || flight {
+		t.Fatalf("LocateKey = (%q, flight=%v, ok=%v), want present peer", holder, flight, ok)
+	}
+	if _, ok := pm.FetchFromPeer(ctx, holder, key, false, func(r io.Reader) (int64, error) {
+		return io.Copy(io.Discard, r)
+	}); !ok {
+		t.Fatal("FetchFromPeer failed")
+	}
+
+	lookup := findSpan(t, sr, "cache.peer_lookup")
+	if lookup.SpanContext().TraceID() != parent.TraceID() || lookup.Parent().SpanID() != parent.SpanID() {
+		t.Fatalf("lookup is not parented to the original query context")
+	}
+	if len(lookup.Events()) != 1 || lookup.Events()[0].Name != "cache.peer_probe" {
+		t.Fatalf("lookup events = %#v, want one cache.peer_probe event", lookup.Events())
+	}
+	probe := lookup.Events()[0]
+	var outcome string
+	var hasDuration bool
+	for _, attr := range probe.Attributes {
+		switch string(attr.Key) {
+		case "duckgres.cache.peer.outcome":
+			outcome = attr.Value.AsString()
+		case "duckgres.cache.peer.duration_ms":
+			hasDuration = true
+		}
+	}
+	if outcome != "present" || !hasDuration {
+		t.Fatalf("lookup probe attributes = %v, want present outcome and duration", probe.Attributes)
+	}
+	get := findSpan(t, sr, "cache.peer_get")
+	serve := findSpan(t, sr, "cache.peer_serve")
+	if get.SpanContext().TraceID() != parent.TraceID() {
+		t.Fatalf("peer get trace = %s, want %s", get.SpanContext().TraceID(), parent.TraceID())
+	}
+	if serve.Parent().SpanID() != get.SpanContext().SpanID() {
+		t.Fatalf("peer serve parent = %s, want peer get %s", serve.Parent().SpanID(), get.SpanContext().SpanID())
+	}
+}
+
+func TestPeerTransferCancellationStopsPeerWork(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(canceled)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pm := peerManagerWith(nil)
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := pm.FetchFromPeer(ctx, strings.TrimPrefix(server.URL, "http://"), strings.Repeat("a", 64), false, func(io.Reader) (int64, error) {
+			return 0, nil
+		})
+		done <- ok
+	}()
+	<-started
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("peer handler did not receive request cancellation")
+	}
+	if ok := <-done; ok {
+		t.Fatal("canceled peer transfer succeeded")
 	}
 }

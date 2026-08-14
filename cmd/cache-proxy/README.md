@@ -98,16 +98,21 @@ opened so LRU eviction cannot truncate an in-progress assembled response.
 ## Tracing
 
 When a trace endpoint is set the proxy exports OpenTelemetry spans under
-`service.name=duckgres-cache-proxy`. Each cacheable request is its own root span
-(`cache.get`, with `cache.origin_fetch` / `cache.peer_fetch` children); `CONNECT`
-tunnels emit `cache.connect` and non-cached methods emit `cache.forward`.
+`service.name=duckgres-cache-proxy`. A cacheable request emits `cache.get`, with
+`cache.origin_fetch`, `cache.peer_lookup`, and `cache.peer_get` children as
+needed; peer transfers emit `cache.peer_serve` on the selected remote proxy.
+`CONNECT` tunnels emit `cache.connect` and non-cached methods emit
+`cache.forward`.
 
-These are **standalone traces** — DuckDB `httpfs` sends no `traceparent`, so they
-are deliberately **not** stitched into the duckgres query trace. Correlate to a
-query by hand on the shared attributes: `client.address` (the worker pod IP, →
-org/session via Kubernetes), the S3 object (`server.address` + `url.path` +
-`duckgres.s3.range`), span timestamp, and `cache.source` (`hit`/`peer`/`miss`).
-`org_id` is intentionally absent — the proxy has no per-request tenant identity.
+The proxy extracts W3C context at its forward-proxy ingress. Requests from a
+Duckgres worker therefore join the existing query trace; requests without a
+`traceparent` retain the prior standalone-root behavior. Peer lookup and
+transfer requests also propagate W3C context. A lookup is one
+`cache.peer_lookup` span with bounded `cache.peer_probe` events carrying each
+observed peer outcome (`present`, `in_flight`, `negative`, `timeout`,
+`transport_error`, or `canceled`) and duration; the proxy intentionally does not create a
+span for every probe. `org_id` is intentionally absent — the proxy has no
+per-request tenant identity.
 
 > The cache proxy is not deployed in the `tests/e2e-mw-dev` environment
 > (`DUCKGRES_CACHE_ENABLED` is off there), so this behavior is gated by the unit

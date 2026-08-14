@@ -13,6 +13,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -133,8 +138,10 @@ func (pm *PeerManager) resolve() {
 
 // probeResult is one peer's answer to a /cache/has probe.
 type probeResult struct {
-	addr   string
-	status int // 200 has it · 202 mid-flight filling it · anything else: no
+	addr     string
+	status   int // 200 has it · 202 mid-flight filling it · anything else: no
+	err      error
+	duration time.Duration
 }
 
 // LocateKey asks every peer in parallel whether it has cacheKey (200) or is
@@ -144,7 +151,7 @@ type probeResult struct {
 // caller should go to the origin. Cluster-wide this is what stops a cold key
 // bursting into one duplicate origin fetch per node: the first node's
 // in-flight fetch answers 202, so every other node waits for that fill.
-func (pm *PeerManager) LocateKey(cacheKey string) (holder string, flight, ok bool) {
+func (pm *PeerManager) LocateKey(ctx context.Context, cacheKey string) (holder string, flight, ok bool) {
 	pm.mu.RLock()
 	peers := make([]string, len(pm.peers))
 	copy(peers, pm.peers)
@@ -155,40 +162,62 @@ func (pm *PeerManager) LocateKey(cacheKey string) (holder string, flight, ok boo
 	}
 
 	peerFetchesTotal.Inc()
+	ctx, span := proxyTracer.Start(ctx, "cache.peer_lookup", trace.WithAttributes(
+		attribute.Int("duckgres.cache.peer_count", len(peers)),
+	))
 
-	ctx, cancel := context.WithTimeout(context.Background(), peerHasTimeout)
+	ctx, cancel := context.WithTimeout(ctx, peerHasTimeout)
 	defer cancel()
 
 	resCh := make(chan probeResult, len(peers))
 	for _, addr := range peers {
 		go func(addr string) {
+			startedAt := time.Now()
 			res := probeResult{addr: addr, status: -1}
 			hasURL := fmt.Sprintf("http://%s/cache/has?key=%s", addr, cacheKey)
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, hasURL, nil)
 			if err != nil {
+				res.err = err
 				peerProbesTotal.WithLabelValues("error").Inc()
-				resCh <- res
-				return
+			} else {
+				otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+				resp, err := pm.client.Do(req)
+				if err != nil {
+					res.err = err
+					peerProbesTotal.WithLabelValues(peerProbeErrorOutcome(err)).Inc()
+				} else {
+					res.status = resp.StatusCode
+					_ = resp.Body.Close()
+					peerProbesTotal.WithLabelValues(peerProbeStatusOutcome(resp.StatusCode)).Inc()
+				}
 			}
-			resp, err := pm.client.Do(req)
-			if err != nil {
-				peerProbesTotal.WithLabelValues(peerProbeErrorOutcome(err)).Inc()
-				resCh <- res
-				return
-			}
-			res.status = resp.StatusCode
-			_ = resp.Body.Close()
-			peerProbesTotal.WithLabelValues(peerProbeStatusOutcome(resp.StatusCode)).Inc()
+			res.duration = time.Since(startedAt)
 			resCh <- res
 		}(addr)
 	}
 
+	recordProbe := func(res probeResult) {
+		span.AddEvent("cache.peer_probe", trace.WithAttributes(
+			attribute.String("duckgres.cache.peer.address", res.addr),
+			attribute.String("duckgres.cache.peer.outcome", probeOutcome(res)),
+			attribute.Int64("duckgres.cache.peer.duration_ms", res.duration.Milliseconds()),
+		))
+	}
 	firstFlight := ""
-	for range peers {
+	for i := 0; i < len(peers); i++ {
 		res := <-resCh
+		recordProbe(res)
 		switch res.status {
 		case http.StatusOK:
 			cancel() // release the losing probes
+			// Preserve the first-present response latency while the lookup span
+			// records the canceled peers' bounded outcomes in the background.
+			go func(remaining int) {
+				defer span.End()
+				for range remaining {
+					recordProbe(<-resCh)
+				}
+			}(len(peers) - i - 1)
 			return res.addr, false, true
 		case http.StatusAccepted:
 			if firstFlight == "" {
@@ -196,10 +225,34 @@ func (pm *PeerManager) LocateKey(cacheKey string) (holder string, flight, ok boo
 			}
 		}
 	}
+	span.End()
 	if firstFlight != "" {
 		return firstFlight, true, true
 	}
 	return "", false, false
+}
+
+func probeOutcome(res probeResult) string {
+	if res.err != nil {
+		switch peerProbeErrorOutcome(res.err) {
+		case "timeout":
+			return "timeout"
+		case "canceled":
+			return "canceled"
+		default:
+			return "transport_error"
+		}
+	}
+	switch res.status {
+	case http.StatusOK:
+		return "present"
+	case http.StatusAccepted:
+		return "in_flight"
+	case http.StatusNotFound:
+		return "negative"
+	default:
+		return "negative"
+	}
 }
 
 func peerProbeStatusOutcome(status int) string {
@@ -232,19 +285,35 @@ func peerProbeErrorOutcome(err error) string {
 // tells the peer the key is expected from its in-flight fill: it waits
 // (bounded) for the fill instead of 404ing. ok is false if the peer couldn't
 // deliver the body — the caller then falls back to the origin.
-func (pm *PeerManager) FetchFromPeer(holder, cacheKey string, flight bool, sink func(io.Reader) (int64, error)) (int64, bool) {
+func (pm *PeerManager) FetchFromPeer(ctx context.Context, holder, cacheKey string, flight bool, sink func(io.Reader) (int64, error)) (int64, bool) {
+	ctx, span := proxyTracer.Start(ctx, "cache.peer_get", trace.WithAttributes(
+		attribute.String("server.address", holder),
+		attribute.Bool("duckgres.cache.peer_flight", flight),
+	))
+	defer span.End()
+
 	getURL := fmt.Sprintf("http://%s/cache/get?key=%s", holder, cacheKey)
 	if flight {
 		getURL += "&flight=1"
 	}
-	req, err := http.NewRequest(http.MethodGet, getURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, getURL, nil)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return 0, false
 	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 	resp, err := pm.streamClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
+			span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
 			_ = resp.Body.Close()
+		}
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else {
+			span.SetStatus(codes.Error, fmt.Sprintf("peer status %d", resp.StatusCode))
 		}
 		return 0, false
 	}
@@ -252,8 +321,11 @@ func (pm *PeerManager) FetchFromPeer(holder, cacheKey string, flight bool, sink 
 
 	n, err := sink(resp.Body)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return 0, false
 	}
+	span.SetAttributes(attribute.Int64("duckgres.bytes", n))
 	peerHitsTotal.Inc()
 	return n, true
 }

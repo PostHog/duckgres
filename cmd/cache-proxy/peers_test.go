@@ -72,7 +72,7 @@ func TestPeerRoundTripHit(t *testing.T) {
 	addr := newPeerServer(t, key, data, http.StatusOK, &hasCalls, &getCalls)
 	pm := peerManagerWith([]string{addr})
 
-	holder, flight, ok := pm.LocateKey(key)
+	holder, flight, ok := pm.LocateKey(context.Background(), key)
 	if !ok {
 		t.Fatal("expected peer claim")
 	}
@@ -84,7 +84,7 @@ func TestPeerRoundTripHit(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	n, ok := pm.FetchFromPeer(holder, key, flight, collectSink(&buf))
+	n, ok := pm.FetchFromPeer(context.Background(), holder, key, flight, collectSink(&buf))
 	if !ok {
 		t.Fatal("expected peer fetch to succeed")
 	}
@@ -111,7 +111,7 @@ func TestLocateKeyMissFromAll(t *testing.T) {
 	addr := newPeerServer(t, other, []byte("not-ours"), http.StatusOK, &hasCalls, &getCalls)
 	pm := peerManagerWith([]string{addr})
 
-	if _, _, ok := pm.LocateKey(key); ok {
+	if _, _, ok := pm.LocateKey(context.Background(), key); ok {
 		t.Fatal("expected miss from every peer")
 	}
 	if atomic.LoadInt32(&hasCalls) != 1 {
@@ -134,7 +134,7 @@ func TestLocateKeyCountsEveryPhysicalProbe(t *testing.T) {
 
 	lookupsBefore := counterValue(t, peerFetchesTotal)
 	missesBefore := counterValue(t, peerProbesTotal.WithLabelValues("miss"))
-	if _, _, ok := pm.LocateKey(key); ok {
+	if _, _, ok := pm.LocateKey(context.Background(), key); ok {
 		t.Fatal("expected every peer probe to miss")
 	}
 
@@ -153,7 +153,7 @@ func TestLocateKeyClassifiesUsefulProbeAsHit(t *testing.T) {
 			pm := peerManagerWith([]string{newPeerServer(t, key, nil, status, nil, nil)})
 			hitsBefore := counterValue(t, peerProbesTotal.WithLabelValues("hit"))
 
-			if _, _, ok := pm.LocateKey(key); !ok {
+			if _, _, ok := pm.LocateKey(context.Background(), key); !ok {
 				t.Fatalf("status %d should be a useful peer claim", status)
 			}
 			if got := counterValue(t, peerProbesTotal.WithLabelValues("hit")); got != hitsBefore+1 {
@@ -227,7 +227,7 @@ func TestLocateKeyCountsCanceledLosingProbes(t *testing.T) {
 	canceledBefore := counterValue(t, peerProbesTotal.WithLabelValues("canceled"))
 	lookupDone := make(chan bool, 1)
 	go func() {
-		_, _, ok := pm.LocateKey(strings.Repeat("4", 64))
+		_, _, ok := pm.LocateKey(context.Background(), strings.Repeat("4", 64))
 		lookupDone <- ok
 	}()
 
@@ -262,7 +262,7 @@ func TestLocateKeyInFlightClaim(t *testing.T) {
 	addr := newPeerServer(t, key, []byte("filling"), http.StatusAccepted, &hasCalls, &getCalls)
 	pm := peerManagerWith([]string{addr})
 
-	holder, flight, ok := pm.LocateKey(key)
+	holder, flight, ok := pm.LocateKey(context.Background(), key)
 	if !ok {
 		t.Fatal("a 202 peer is still a claim")
 	}
@@ -285,7 +285,7 @@ func TestLocateKeyPrefersPresentEntryOverInFlight(t *testing.T) {
 	filling := newPeerServer(t, key, []byte("filling"), http.StatusAccepted, &h202, &g202)
 	pm := peerManagerWith([]string{filling, present})
 
-	holder, flight, ok := pm.LocateKey(key)
+	holder, flight, ok := pm.LocateKey(context.Background(), key)
 	if !ok {
 		t.Fatal("expected a claim")
 	}
@@ -305,7 +305,7 @@ func TestLocateKeyReturnsFirstHit(t *testing.T) {
 	addr2 := newPeerServer(t, key, data, http.StatusOK, &has2, &get2)
 	pm := peerManagerWith([]string{addr1, addr2})
 
-	holder, flight, ok := pm.LocateKey(key)
+	holder, flight, ok := pm.LocateKey(context.Background(), key)
 	if !ok {
 		t.Fatal("expected peer claim from one of two peers")
 	}
@@ -323,7 +323,7 @@ func TestLocateKeyReturnsFirstHit(t *testing.T) {
 
 func TestFetchFromPeerEmptyPeerList(t *testing.T) {
 	pm := peerManagerWith(nil)
-	if _, _, ok := pm.LocateKey(strings.Repeat("a", 64)); ok {
+	if _, _, ok := pm.LocateKey(context.Background(), strings.Repeat("a", 64)); ok {
 		t.Error("expected miss when no peers are known")
 	}
 }
@@ -356,7 +356,7 @@ func TestFetchFromPeerLargeBodyHasNoClockTimeout(t *testing.T) {
 	pm := peerManagerWith([]string{strings.TrimPrefix(srv.URL, "http://")})
 
 	var buf bytes.Buffer
-	n, ok := pm.FetchFromPeer(strings.TrimPrefix(srv.URL, "http://"), key, false, collectSink(&buf))
+	n, ok := pm.FetchFromPeer(context.Background(), strings.TrimPrefix(srv.URL, "http://"), key, false, collectSink(&buf))
 	if !ok {
 		t.Fatal("large slow body must complete — no whole-request timeout")
 	}
