@@ -485,14 +485,15 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	// this usage signal does not depend on query-log configuration.
 	if errCode == "" {
 		analytics.Default().Capture("query_completed", c.orgID, map[string]any{
-			"user":        c.username,
-			"team_id":     c.teamID,
-			"trace_id":    observe.TraceIDFromContext(c.ctx),
-			"protocol":    protocol,
-			"query_kind":  classifyQuery(cmdType),
-			"duration_ms": time.Since(start).Milliseconds(),
-			"cpu_seconds": profilingSummary.CPUTimeSeconds,
-			"result_rows": resultRows,
+			"user":             c.username,
+			"team_id":          c.teamID,
+			"trace_id":         observe.TraceIDFromContext(c.ctx),
+			"protocol":         protocol,
+			"query_kind":       classifyQuery(cmdType),
+			"duration_ms":      time.Since(start).Milliseconds(),
+			"cpu_seconds":      profilingSummary.CPUTimeSeconds,
+			"result_rows":      resultRows,
+			"application_name": c.applicationName,
 		})
 	}
 

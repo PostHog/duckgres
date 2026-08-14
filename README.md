@@ -509,9 +509,9 @@ teardown), so you can build a provisioning funnel and alert on failures.
 | `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
 | `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
-| `query_initiated` | An accepted, non-empty client query is received | `user`, `team_id`, `trace_id` |
-| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows` |
-| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
+| `query_initiated` | An accepted, non-empty client query is received | `user`, `team_id`, `trace_id`, `application_name` |
+| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows`, `application_name` |
+| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`), `application_name` |
 
 > Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
 > are terminal and fire exactly once per warehouse (guarded on the state
@@ -537,6 +537,12 @@ teardown), so you can build a provisioning funnel and alert on failures.
 > `query_initiated`. Filter by `query_kind` to isolate real data queries from
 > utility statements. Emitted independently of the query-log configuration;
 > capture is asynchronous and batched, so it stays off the query latency path.
+
+> Note: `application_name` is the client-supplied `application_name` startup
+> parameter (also shown in the admin live view), letting you distinguish
+> PostHog-side callers (e.g. the register workflow, Dagster, the SQL editor)
+> from customer `psql` connections. It is an empty string when the client
+> didn't set one.
 
 ### Query Logs
 
