@@ -465,18 +465,40 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 	_, originSpan := proxyTracer.Start(r.Context(), "cache.origin_fetch")
 	defer originSpan.End()
 
+	var size int64
+	var contentType string
+	err := p.retryOriginFetch(r, originSpan, func() error {
+		var attemptErr error
+		size, contentType, attemptErr = p.fetchOriginOnce(cacheKey, r)
+		return attemptErr
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	originSpan.SetAttributes(attribute.Int64("duckgres.bytes", size))
+	return size, contentType, nil
+}
+
+// retryOriginFetch runs attempt (one origin fetch) up to
+// originRetryMaxAttempts times with jittered exponential backoff, while the
+// error is retriable (isRetriableOriginFetchError) and the request context is
+// alive. Shared by the legacy exact-range path (fetchOrigin) and the
+// block-aligned path (fetchOriginSpan) so a transient origin 5xx or transport
+// blip is absorbed by the cache layer instead of surfacing to DuckDB as a
+// 502. Terminal origin statuses (4xx) and poisoned-response guards fail on
+// the first attempt.
+func (p *CacheProxy) retryOriginFetch(r *http.Request, originSpan trace.Span, attempt func() error) error {
 	attempts := p.originRetryMaxAttempts
 	if attempts < 1 {
 		attempts = 1
 	}
 	backoff := p.originRetryInitialBackoff
 	var lastErr error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		size, contentType, err := p.fetchOriginOnce(cacheKey, r)
-		originSpan.SetAttributes(attribute.Int("duckgres.origin.attempts", attempt))
+	for i := 1; i <= attempts; i++ {
+		err := attempt()
+		originSpan.SetAttributes(attribute.Int("duckgres.origin.attempts", i))
 		if err == nil {
-			originSpan.SetAttributes(attribute.Int64("duckgres.bytes", size))
-			return size, contentType, nil
+			return nil
 		}
 		lastErr = err
 		var oe *originStatusError
@@ -485,18 +507,18 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 		}
 		if err := r.Context().Err(); err != nil {
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
-		if attempt == attempts || !isRetriableOriginFetchError(err) {
+		if i == attempts || !isRetriableOriginFetchError(err) {
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
 
 		delay := jitteredOriginRetryDelay(backoff, p.originRetryMaxBackoff)
 		slog.Warn("Origin fetch failed with retriable error, retrying.",
 			"url", r.URL.String(),
 			"range", r.Header.Get("Range"),
-			"attempt", attempt,
+			"attempt", i,
 			"max_attempts", attempts,
 			"backoff", delay,
 			"error", err)
@@ -506,11 +528,11 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 				err = context.Canceled
 			}
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
 		if err := r.Context().Err(); err != nil {
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
 		originFetchRetriesTotal.WithLabelValues(originRetryReason(err)).Inc()
 		if backoff > 0 {
@@ -523,7 +545,7 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 	if lastErr != nil {
 		originSpan.SetStatus(codes.Error, lastErr.Error())
 	}
-	return 0, "", lastErr
+	return lastErr
 }
 
 func jitteredOriginRetryDelay(backoff, maxBackoff time.Duration) time.Duration {
