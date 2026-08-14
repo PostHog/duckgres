@@ -140,10 +140,10 @@ WORKER_INSPECTION_ATTEMPTS=30
 # (DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7, HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry).
 # The engine itself is the PostHog/duckdb patchline build: library_version
 # stays v1.5.5 (extension resolution), while source_id identifies the
-# patchline commit (posthog/v1.5.5 prefetch-accounting patch).
+# patchline commit (PostHog/duckdb v1.5.5-posthog.5, gcc-toolset-12).
 # If the image accidentally ships upstream, the version/source differs and we fail.
 EXPECT_DUCKDB_VERSION="v1.5.5"
-EXPECT_DUCKDB_SOURCE_ID="911c1d6428"
+EXPECT_DUCKDB_SOURCE_ID="697fa6fb44"
 EXPECT_DUCKLAKE_SHA="6768849c"
 EXPECT_HTTPFS_SHA="575da0b"
 
