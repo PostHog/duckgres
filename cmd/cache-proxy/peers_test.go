@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -119,6 +120,138 @@ func TestLocateKeyMissFromAll(t *testing.T) {
 	// On miss, /cache/get should NOT be called.
 	if atomic.LoadInt32(&getCalls) != 0 {
 		t.Errorf("peer /cache/get calls = %d, want 0 on miss", getCalls)
+	}
+}
+
+func TestLocateKeyCountsEveryPhysicalProbe(t *testing.T) {
+	key := strings.Repeat("1", 64)
+	other := strings.Repeat("2", 64)
+	peers := make([]string, 0, 3)
+	for range 3 {
+		peers = append(peers, newPeerServer(t, other, nil, http.StatusOK, nil, nil))
+	}
+	pm := peerManagerWith(peers)
+
+	lookupsBefore := counterValue(t, peerFetchesTotal)
+	missesBefore := counterValue(t, peerProbesTotal.WithLabelValues("miss"))
+	if _, _, ok := pm.LocateKey(context.Background(), key); ok {
+		t.Fatal("expected every peer probe to miss")
+	}
+
+	if got := counterValue(t, peerFetchesTotal); got != lookupsBefore+1 {
+		t.Fatalf("logical peer lookups = %v, want %v", got, lookupsBefore+1)
+	}
+	if got := counterValue(t, peerProbesTotal.WithLabelValues("miss")); got != missesBefore+3 {
+		t.Fatalf("physical miss probes = %v, want %v", got, missesBefore+3)
+	}
+}
+
+func TestLocateKeyClassifiesUsefulProbeAsHit(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusAccepted} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			key := strings.Repeat("3", 64)
+			pm := peerManagerWith([]string{newPeerServer(t, key, nil, status, nil, nil)})
+			hitsBefore := counterValue(t, peerProbesTotal.WithLabelValues("hit"))
+
+			if _, _, ok := pm.LocateKey(context.Background(), key); !ok {
+				t.Fatalf("status %d should be a useful peer claim", status)
+			}
+			if got := counterValue(t, peerProbesTotal.WithLabelValues("hit")); got != hitsBefore+1 {
+				t.Fatalf("physical hit probes = %v, want %v", got, hitsBefore+1)
+			}
+		})
+	}
+}
+
+func TestPeerProbeOutcomeLabels(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{name: "present", status: http.StatusOK, want: "hit"},
+		{name: "in flight", status: http.StatusAccepted, want: "hit"},
+		{name: "absent", status: http.StatusNotFound, want: "miss"},
+		{name: "unexpected response", status: http.StatusInternalServerError, want: "error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := peerProbeStatusOutcome(tt.status); got != tt.want {
+				t.Fatalf("peerProbeStatusOutcome(%d) = %q, want %q", tt.status, got, tt.want)
+			}
+		})
+	}
+
+	for _, tt := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "canceled", err: context.Canceled, want: "canceled"},
+		{name: "timeout", err: context.DeadlineExceeded, want: "timeout"},
+		{name: "transport", err: errors.New("connection refused"), want: "error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := peerProbeErrorOutcome(tt.err); got != tt.want {
+				t.Fatalf("peerProbeErrorOutcome(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLocateKeyCountsCanceledLosingProbes(t *testing.T) {
+	pm := peerManagerWith([]string{"winner:8081", "loser-a:8081", "loser-b:8081"})
+	started := make(chan string, len(pm.peers))
+	releaseWinner := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseWinner:
+		default:
+			close(releaseWinner)
+		}
+	}()
+	pm.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		started <- req.URL.Host
+		if req.URL.Host == "winner:8081" {
+			<-releaseWinner
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Header:     make(http.Header),
+			}, nil
+		}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+
+	hitsBefore := counterValue(t, peerProbesTotal.WithLabelValues("hit"))
+	canceledBefore := counterValue(t, peerProbesTotal.WithLabelValues("canceled"))
+	lookupDone := make(chan bool, 1)
+	go func() {
+		_, _, ok := pm.LocateKey(context.Background(), strings.Repeat("4", 64))
+		lookupDone <- ok
+	}()
+
+	for range pm.peers {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for every physical probe to start")
+		}
+	}
+	close(releaseWinner)
+	if ok := <-lookupDone; !ok {
+		t.Fatal("expected the released peer to win the lookup")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for counterValue(t, peerProbesTotal.WithLabelValues("canceled")) != canceledBefore+2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := counterValue(t, peerProbesTotal.WithLabelValues("hit")); got != hitsBefore+1 {
+		t.Fatalf("physical hit probes = %v, want %v", got, hitsBefore+1)
+	}
+	if got := counterValue(t, peerProbesTotal.WithLabelValues("canceled")); got != canceledBefore+2 {
+		t.Fatalf("physical canceled probes = %v, want %v", got, canceledBefore+2)
 	}
 }
 

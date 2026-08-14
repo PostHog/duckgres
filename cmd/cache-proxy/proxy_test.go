@@ -871,6 +871,31 @@ func TestHandlePeerHasAndGet(t *testing.T) {
 	}
 }
 
+func TestHandlePeerGetDoesNotCountWorkerCacheHit(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	key := strings.Repeat("e", 64)
+	body := []byte("peer-cached-payload")
+	if _, err := proxy.store.PutStream(key, bytes.NewReader(body)); err != nil {
+		t.Fatalf("seed PutStream: %v", err)
+	}
+
+	hitsBefore := counterValue(t, cacheHitsTotal)
+	req := httptest.NewRequest(http.MethodGet, "/cache/get?key="+key, nil)
+	rec := httptest.NewRecorder()
+	proxy.HandlePeerGet(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HandlePeerGet status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != string(body) {
+		t.Fatalf("HandlePeerGet body = %q, want %q", rec.Body.String(), body)
+	}
+	if hitsAfter := counterValue(t, cacheHitsTotal); hitsAfter != hitsBefore {
+		t.Fatalf("cacheHitsTotal changed from %v to %v for peer traffic; only worker-facing local hits should count", hitsBefore, hitsAfter)
+	}
+}
+
 func TestHandlePeerRejectsInvalidKey(t *testing.T) {
 	proxy := newTestProxy(t)
 	for _, key := range []string{"", "../../etc/passwd", "deadbeef"} {

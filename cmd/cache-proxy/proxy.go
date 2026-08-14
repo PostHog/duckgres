@@ -905,7 +905,9 @@ func (p *CacheProxy) HandlePeerGet(w http.ResponseWriter, r *http.Request) {
 		p.waitForLocalFill(r, key)
 	}
 
-	reader, size, ok := p.store.Open(key)
+	// Peer traffic keeps the entry warm but must not inflate the worker-facing
+	// local-hit counter. openFile touches LRU recency without recording a hit.
+	reader, size, ok := p.store.openFile(key)
 	if !ok {
 		span.SetAttributes(attribute.Int("http.response.status_code", http.StatusNotFound))
 		w.WriteHeader(http.StatusNotFound)

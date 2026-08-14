@@ -29,6 +29,10 @@ var (
 		Name: "cache_proxy_peer_hits_total",
 		Help: "Total successful peer cache hits",
 	})
+	peerProbesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cache_proxy_peer_probes_total",
+		Help: "Physical peer availability probe attempts, by outcome",
+	}, []string{"outcome"}) // hit, miss, timeout, canceled, error
 )
 
 // Peer timeouts. The /cache/has probe is a tiny HEAD-like check, so it gets a
@@ -171,16 +175,21 @@ func (pm *PeerManager) LocateKey(ctx context.Context, cacheKey string) (holder s
 			startedAt := time.Now()
 			res := probeResult{addr: addr, status: -1}
 			hasURL := fmt.Sprintf("http://%s/cache/has?key=%s", addr, cacheKey)
-			if req, err := http.NewRequestWithContext(ctx, "GET", hasURL, nil); err == nil {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, hasURL, nil)
+			if err != nil {
+				res.err = err
+				peerProbesTotal.WithLabelValues("error").Inc()
+			} else {
 				otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
-				if resp, err := pm.client.Do(req); err == nil {
+				resp, err := pm.client.Do(req)
+				if err != nil {
+					res.err = err
+					peerProbesTotal.WithLabelValues(peerProbeErrorOutcome(err)).Inc()
+				} else {
 					res.status = resp.StatusCode
 					_ = resp.Body.Close()
-				} else {
-					res.err = err
+					peerProbesTotal.WithLabelValues(peerProbeStatusOutcome(resp.StatusCode)).Inc()
 				}
-			} else {
-				res.err = err
 			}
 			res.duration = time.Since(startedAt)
 			resCh <- res
@@ -225,13 +234,14 @@ func (pm *PeerManager) LocateKey(ctx context.Context, cacheKey string) (holder s
 
 func probeOutcome(res probeResult) string {
 	if res.err != nil {
-		if errors.Is(res.err, context.DeadlineExceeded) {
+		switch peerProbeErrorOutcome(res.err) {
+		case "timeout":
 			return "timeout"
-		}
-		if errors.Is(res.err, context.Canceled) {
+		case "canceled":
 			return "canceled"
+		default:
+			return "transport_error"
 		}
-		return "transport_error"
 	}
 	switch res.status {
 	case http.StatusOK:
@@ -242,6 +252,32 @@ func probeOutcome(res probeResult) string {
 		return "negative"
 	default:
 		return "negative"
+	}
+}
+
+func peerProbeStatusOutcome(status int) string {
+	switch status {
+	case http.StatusOK, http.StatusAccepted:
+		return "hit"
+	case http.StatusNotFound:
+		return "miss"
+	default:
+		return "error"
+	}
+}
+
+func peerProbeErrorOutcome(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return "timeout"
+		}
+		return "error"
 	}
 }
 
