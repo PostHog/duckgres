@@ -1322,7 +1322,7 @@ func recoverWorkerPanic(err *error) {
 // CreateSession creates a new session on the given worker. secretStatements
 // are the user's persistent secrets to replay on the worker before the
 // session serves queries; secretWarnings reports any that failed to apply.
-func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit string, threads int, secretStatements []string) (token string, secretWarnings []string, err error) {
+func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit string, threads int, secretStatements []string, pid int32) (token string, secretWarnings []string, err error) {
 	defer recoverWorkerPanic(&err)
 
 	body, _ := json.Marshal(server.WorkerCreateSessionPayload{
@@ -1335,6 +1335,7 @@ func (w *ManagedWorker) CreateSession(ctx context.Context, username, memoryLimit
 		MemoryLimit:      memoryLimit,
 		Threads:          threads,
 		SecretStatements: secretStatements,
+		PID:              pid,
 	})
 
 	stream, err := w.client.Client.DoAction(ctx, &flight.Action{

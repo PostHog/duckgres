@@ -593,6 +593,9 @@ func (c *clientConn) logger() *slog.Logger {
 	if c.workerPod != "" {
 		attrs = append(attrs, "worker_pod", c.workerPod)
 	}
+	if c.pid != 0 {
+		attrs = append(attrs, "pid", c.pid)
+	}
 	return slog.With(attrs...)
 }
 
