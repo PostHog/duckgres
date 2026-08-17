@@ -107,6 +107,8 @@ type K8sWorkerPoolConfig struct {
 	WorkerNodeSelector           map[string]string                            // Node selector for worker pods. Nil = no selector.
 	WorkerTolerationKey          string                                       // Taint key for worker pod NoSchedule toleration. Empty = no toleration.
 	WorkerTolerationValue        string                                       // Taint value for worker pod NoSchedule toleration.
+	WorkerOrgAffinityEnabled     bool                                         // Prefer same-org workers on the same hostname. False preserves existing scheduling.
+	WorkerOrgAffinityWeight      int                                          // Preferred same-org pod-affinity weight, validated in [1,100].
 	WorkerPriorityClassName      string                                       // PriorityClass for worker pods (so they preempt overprovision pause pods). Empty = none.
 	PlaceholderImage             string                                       // Image for headroom placeholder pods (a pause image).
 	PlaceholderPriorityClassName string                                       // PriorityClass for placeholder pods — MUST be below WorkerPriorityClassName so workers preempt them.

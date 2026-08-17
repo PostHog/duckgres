@@ -222,6 +222,10 @@ func (p *K8sWorkerPool) cleanupOrphanedWorkerPods(ctx context.Context, minAge ti
 		outcome := StrandedOutcomeDeletedMissingRow
 		if rec != nil {
 			if rec.State != configstore.WorkerStateRetired && rec.State != configstore.WorkerStateLost {
+				// The durable record is the only trusted source for this metadata.
+				// Reconciliation must not infer an org from active-org, whose
+				// authorization semantics are intentionally separate.
+				stampWorkerPlacementOrgLabel(ctx, p.clientset, p.namespace, pod.Name, rec.OrgID, pod.Labels)
 				// Pod is still claimed by an active runtime row — not
 				// stranded. Record it under "kept" so dashboards can
 				// see reconciler saturation (large kept counts =

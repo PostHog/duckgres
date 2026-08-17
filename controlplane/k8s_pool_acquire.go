@@ -568,6 +568,10 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	if err != nil {
 		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
 	}
+	// Claimed worker records are durable trusted assignment state. Backfill the
+	// scheduling-only label before reusing a pre-existing worker; do not infer
+	// the org from active-org or any other pod label.
+	stampWorkerPlacementOrgLabel(ctx, p.clientset, p.namespace, claimed.PodName, claimed.OrgID, pod.Labels)
 
 	// For hot-idle workers, skip the epoch-validated health check. The worker's
 	// epoch and CP instance ID are from the previous owner, and ClaimHotIdleWorker

@@ -73,6 +73,8 @@ type K8sWorkerPool struct {
 	workerNodeSelector      map[string]string // node selector for worker pods
 	workerTolerationKey     string            // taint key for NoSchedule toleration
 	workerTolerationValue   string            // taint value for NoSchedule toleration
+	workerOrgAffinityEnabled bool             // add soft same-org pod affinity to trusted org-bound workers
+	workerOrgAffinityWeight  int              // preferred same-org pod-affinity weight, validated at control-plane startup
 	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
 	// Headroom controller holds preemptible low-priority placeholder pods so a
@@ -195,6 +197,8 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workerNodeSelector:      cfg.WorkerNodeSelector,
 		workerTolerationKey:     cfg.WorkerTolerationKey,
 		workerTolerationValue:   cfg.WorkerTolerationValue,
+		workerOrgAffinityEnabled: cfg.WorkerOrgAffinityEnabled,
+		workerOrgAffinityWeight:  cfg.WorkerOrgAffinityWeight,
 		workerPriorityClassName: cfg.WorkerPriorityClassName,
 
 		placeholderImage:             cfg.PlaceholderImage,

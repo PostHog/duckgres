@@ -48,3 +48,11 @@ func validateWorkerBackendConfig(cfg ControlPlaneConfig) error {
 	}
 	return nil
 }
+
+func validateK8sWorkerOrgAffinityConfig(cfg ControlPlaneConfig) error {
+	weight := cfg.K8s.WorkerOrgAffinityWeight
+	if weight < 1 || weight > 100 {
+		return fmt.Errorf("k8s worker org affinity weight must be within [1,100], got %d", weight)
+	}
+	return nil
+}

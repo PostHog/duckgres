@@ -106,6 +106,8 @@ type Resolved struct {
 	K8sWorkerNodeSelector           string
 	K8sWorkerTolerationKey          string
 	K8sWorkerTolerationValue        string
+	K8sWorkerOrgAffinityEnabled     bool
+	K8sWorkerOrgAffinityWeight      int
 	K8sAllowClientWorkerProfile     bool
 	K8sWorkerPriorityClassName      string
 	K8sPlaceholderImage             string
@@ -207,6 +209,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	k8sWorkerServiceAccount := controlplane.DefaultK8sWorkerServiceAccount
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
+	var k8sWorkerOrgAffinityEnabled bool
+	k8sWorkerOrgAffinityWeight := 100
 	var k8sReshardPodCPU, k8sReshardPodMemory string
 	var k8sExploratoryTierEnabled bool
 	var k8sExploratoryWorkerCPU, k8sExploratoryWorkerMemory string
@@ -800,6 +804,24 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	if v := getenv("DUCKGRES_K8S_WORKER_TOLERATION_VALUE"); v != "" {
 		k8sWorkerTolerationValue = v
 	}
+	// Env-only and deployment-wide: this is not an org-scoped feature flag.
+	if v := getenv("DUCKGRES_K8S_WORKER_ORG_AFFINITY_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sWorkerOrgAffinityEnabled = b
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_ORG_AFFINITY_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_K8S_WORKER_ORG_AFFINITY_WEIGHT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			// Preserve invalid numeric values so startup validation rejects the
+			// deployment instead of silently changing scheduling behavior.
+			k8sWorkerOrgAffinityWeight = n
+		} else {
+			warn("Invalid DUCKGRES_K8S_WORKER_ORG_AFFINITY_WEIGHT: " + err.Error())
+			k8sWorkerOrgAffinityWeight = 0
+		}
+	}
 	// Reshard runner pod shape (env-only, like the other pod-scheduling knobs):
 	// the dedicated duckgres-reshard-op-<id> pods' requests=limits. Empty →
 	// built-in defaults (2 CPU / 8Gi).
@@ -1175,6 +1197,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerNodeSelector:           k8sWorkerNodeSelector,
 		K8sWorkerTolerationKey:          k8sWorkerTolerationKey,
 		K8sWorkerTolerationValue:        k8sWorkerTolerationValue,
+		K8sWorkerOrgAffinityEnabled:     k8sWorkerOrgAffinityEnabled,
+		K8sWorkerOrgAffinityWeight:      k8sWorkerOrgAffinityWeight,
 		K8sAllowClientWorkerProfile:     k8sAllowClientWorkerProfile,
 		K8sWorkerPriorityClassName:      k8sWorkerPriorityClassName,
 		K8sPlaceholderImage:             k8sPlaceholderImage,
