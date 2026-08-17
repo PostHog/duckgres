@@ -79,9 +79,11 @@ func main() {
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
 		// Use the same logging/tracing setup as parent for consistent format
-		loggingShutdown := cliboot.InitLogging()
+		_ = os.Setenv("DUCKGRES_MODE", "duckdb-service")
+		bi := buildInfo()
+		loggingShutdown := cliboot.InitLogging(bi)
 		defer loggingShutdown()
-		tracingShutdown := cliboot.InitTracing()
+		tracingShutdown := cliboot.InitTracing(bi)
 		defer tracingShutdown()
 		duckdbservice.LogCacheProxyStatus()
 		server.RunChildMode()
@@ -200,13 +202,15 @@ func main() {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
-	loggingShutdown := cliboot.InitLogging()
+	_ = os.Setenv("DUCKGRES_MODE", *mode)
+	bi := buildInfo()
+	loggingShutdown := cliboot.InitLogging(bi)
 	defer loggingShutdown()
 
 	analyticsShutdown := cliboot.InitAnalytics()
 	defer analyticsShutdown()
 
-	tracingShutdown := cliboot.InitTracing()
+	tracingShutdown := cliboot.InitTracing(bi)
 	defer tracingShutdown()
 
 	buildInfo().Log(*mode)
@@ -407,8 +411,6 @@ func main() {
 				WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
 				WorkerTolerationKey:          resolved.K8sWorkerTolerationKey,
 				WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
-				WorkerOrgAffinityEnabled:     resolved.K8sWorkerOrgAffinityEnabled,
-				WorkerOrgAffinityWeight:      resolved.K8sWorkerOrgAffinityWeight,
 				AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
 				WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
 				PlaceholderImage:             resolved.K8sPlaceholderImage,
