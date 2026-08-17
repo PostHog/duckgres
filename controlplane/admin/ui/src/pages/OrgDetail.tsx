@@ -494,7 +494,7 @@ function WarehousePanel({
     : missing
       ? "No duckling provisioned for this org"
       : broken
-        ? `Duckling unhealthy (state: ${data?.state})`
+        ? `Managed warehouse not ready (state: ${data?.state})`
         : null;
 
   const ducklingNameEmpty = ducklingNameInput.trim() === "";
@@ -600,12 +600,37 @@ function WarehousePanel({
                   </div>
                 ))}
               </div>
-              {data.status_message && (
+              {data.state === "failed" ? (
+                <div
+                  role="alert"
+                  className="mt-3 flex gap-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-warning"
+                >
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <div className="space-y-1 text-xs">
+                    <p className="font-medium">Warehouse is not operationally ready</p>
+                    <p>
+                      <span className="font-medium">Current blocker</span>
+                    </p>
+                    <p className="font-mono text-foreground">
+                      {data.status_message || "No current blocker detail is available yet."}
+                    </p>
+                    <p className="text-muted-foreground">
+                      Component badges reflect Duckling infrastructure. Overall readiness also requires a successful
+                      end-to-end metadata-store connection check. Recovery is checked automatically; this page updates
+                      when dependencies recover.
+                    </p>
+                  </div>
+                </div>
+              ) : data.status_message ? (
                 <p className="mt-2 font-mono text-xs text-muted-foreground">{data.status_message}</p>
-              )}
+              ) : null}
               <div className="mt-2 flex gap-4 text-[11px] text-muted-foreground">
-                <span>ready: {data.ready_at ? fmtTime(data.ready_at) : "—"}</span>
-                <span>failed: {data.failed_at ? fmtTime(data.failed_at) : "—"}</span>
+                <span>
+                  <span className="font-medium">Last ready</span>: {data.ready_at ? fmtTime(data.ready_at) : "—"}
+                </span>
+                <span>
+                  <span className="font-medium">Last failed</span>: {data.failed_at ? fmtTime(data.failed_at) : "—"}
+                </span>
               </div>
             </div>
 

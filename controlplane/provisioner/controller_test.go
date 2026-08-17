@@ -25,6 +25,14 @@ type fakeStore struct {
 	warehouses map[string]*configstore.ManagedWarehouse
 }
 
+type testSQLStateError struct {
+	code    string
+	message string
+}
+
+func (e testSQLStateError) Error() string    { return e.message }
+func (e testSQLStateError) SQLState() string { return e.code }
+
 func newFakeStore() *fakeStore {
 	return &fakeStore{warehouses: make(map[string]*configstore.ManagedWarehouse)}
 }
@@ -84,8 +92,12 @@ func (s *fakeStore) UpdateWarehouseState(orgID string, expectedState configstore
 			t := v.(time.Time)
 			w.ReadyAt = &t
 		case "failed_at":
-			t := v.(time.Time)
-			w.FailedAt = &t
+			if v == nil {
+				w.FailedAt = nil
+			} else {
+				t := v.(time.Time)
+				w.FailedAt = &t
+			}
 		case "provisioning_started_at":
 			t := v.(time.Time)
 			w.ProvisioningStartedAt = &t
@@ -597,6 +609,158 @@ func TestReconcileProvisioningAllReady(t *testing.T) {
 	}
 }
 
+// TestReconcileFailedRecoversWhenDucklingBecomesReady is the regression for a
+// repaired Duckling remaining permanently failed in the config store. Failed
+// warehouses must stay in the controller's working set and re-run the same
+// readiness + end-to-end checks as provisioning warehouses. The historical
+// provisioning timestamp is deliberately stale: recovery must not immediately
+// trip the original 30-minute provisioning timeout again.
+func TestReconcileFailedRecoversWhenDucklingBecomesReady(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	startedAt := time.Now().Add(-time.Hour)
+	failedAt := time.Now().Add(-20 * time.Minute)
+	fs.warehouses["org-recovered"] = &configstore.ManagedWarehouse{
+		OrgID:                 "org-recovered",
+		DucklingName:          "org-recovered",
+		State:                 configstore.ManagedWarehouseStateFailed,
+		S3State:               configstore.ManagedWarehouseStateProvisioning,
+		MetadataStoreState:    configstore.ManagedWarehouseStateProvisioning,
+		IdentityState:         configstore.ManagedWarehouseStateProvisioning,
+		SecretsState:          configstore.ManagedWarehouseStateProvisioning,
+		CreatedAt:             startedAt,
+		ProvisioningStartedAt: &startedAt,
+		FailedAt:              &failedAt,
+	}
+
+	cr := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "k8s.posthog.com/v1alpha1",
+		"kind":       "Duckling",
+		"metadata": map[string]interface{}{
+			"name":      "org-recovered",
+			"namespace": ducklingNamespace,
+		},
+		"status": map[string]interface{}{
+			"metadataStore": map[string]interface{}{
+				"type":                "external",
+				"endpoint":            "org-recovered.cluster.example.internal",
+				"credentialSecretRef": testCredentialSecretRef("org-recovered"),
+				"user":                "postgres",
+				"database":            "postgres",
+			},
+			"dataStore": map[string]interface{}{
+				"type":       "s3bucket",
+				"bucketName": "org-recovered-bucket",
+			},
+			"iamRoleArn": "arn:aws:iam::123456789012:role/duckling-org-recovered",
+			"conditions": []interface{}{
+				map[string]interface{}{"type": "Ready", "status": "True"},
+				map[string]interface{}{"type": "Synced", "status": "True"},
+			},
+		},
+	}}
+
+	ctx := context.Background()
+	if _, err := fakeK8s.Resource(ducklingGVR).Namespace(ducklingNamespace).Create(ctx, cr, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create recovered Duckling: %v", err)
+	}
+
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error {
+		return testSQLStateError{
+			code:    "28P01",
+			message: "password authentication failed; password=must-not-reach-status",
+		}
+	})
+	ctrl.reconcile(ctx)
+	w := fs.warehouses["org-recovered"]
+	if got := w.State; got != configstore.ManagedWarehouseStateFailed {
+		t.Fatalf("state = %q while the end-to-end probe still fails, want failed", got)
+	}
+	if w.ReadyAt != nil {
+		t.Fatalf("ready_at = %v while the end-to-end probe still fails, want nil", w.ReadyAt)
+	}
+	if w.S3State != configstore.ManagedWarehouseStateReady ||
+		w.MetadataStoreState != configstore.ManagedWarehouseStateReady ||
+		w.SecretsState != configstore.ManagedWarehouseStateReady ||
+		w.IdentityState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("component states = s3:%q metadata:%q secrets:%q identity:%q, want live Duckling components ready",
+			w.S3State, w.MetadataStoreState, w.SecretsState, w.IdentityState)
+	}
+	wantBlocker := "Infrastructure is ready, but metadata-store authentication failed; the PostgreSQL role password may not match its credential Secret. Waiting for recovery."
+	if w.StatusMessage != wantBlocker {
+		t.Fatalf("status_message = %q, want %q", w.StatusMessage, wantBlocker)
+	}
+	if strings.Contains(w.StatusMessage, "must-not-reach-status") {
+		t.Fatalf("status_message leaked probe details: %q", w.StatusMessage)
+	}
+
+	ctrl.SetProbe(func(context.Context, string, string, string, string, string) error { return nil })
+	ctrl.reconcile(ctx)
+
+	w = fs.warehouses["org-recovered"]
+	if w.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("state = %q, want ready after the Duckling and end-to-end probe recovered", w.State)
+	}
+	if w.S3State != configstore.ManagedWarehouseStateReady ||
+		w.MetadataStoreState != configstore.ManagedWarehouseStateReady ||
+		w.SecretsState != configstore.ManagedWarehouseStateReady ||
+		w.IdentityState != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("component states = s3:%q metadata:%q secrets:%q identity:%q, want all ready",
+			w.S3State, w.MetadataStoreState, w.SecretsState, w.IdentityState)
+	}
+	if w.ReadyAt == nil {
+		t.Fatal("ready_at was not set on recovery")
+	}
+	if w.FailedAt != nil {
+		t.Fatalf("failed_at = %v, want cleared after recovery", w.FailedAt)
+	}
+	if w.StatusMessage != "Infrastructure ready" {
+		t.Fatalf("status_message = %q, want Infrastructure ready", w.StatusMessage)
+	}
+}
+
+func TestMetadataProbeStatusMessageNeverExposesRawProbeDetails(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "authentication",
+			err:  testSQLStateError{code: "28P01", message: "password authentication failed; password=top-secret"},
+			want: "Infrastructure is ready, but metadata-store authentication failed; the PostgreSQL role password may not match its credential Secret. Waiting for recovery.",
+		},
+		{
+			name: "timeout",
+			err:  context.DeadlineExceeded,
+			want: "Infrastructure is ready, but the metadata-store connection check timed out. Waiting for recovery.",
+		},
+		{
+			name: "dns",
+			err:  errors.New("dial tcp: lookup example.invalid: no such host"),
+			want: "Infrastructure is ready, but the metadata-store endpoint could not be resolved. Waiting for recovery.",
+		},
+		{
+			name: "unknown",
+			err:  errors.New("postgres://user:top-secret@example.invalid/db"),
+			want: "Infrastructure is ready, but the metadata-store connection check is still failing. Waiting for recovery.",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := metadataProbeStatusMessage(tc.err)
+			if got != tc.want {
+				t.Fatalf("metadataProbeStatusMessage() = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, "top-secret") || strings.Contains(got, "postgres://") {
+				t.Fatalf("metadataProbeStatusMessage() leaked raw probe details: %q", got)
+			}
+		})
+	}
+}
+
 // TestReconcileProvisioningProbeFailsKeepsProvisioning verifies the controller
 // stays in the Provisioning state when the metadata-store probe fails — the
 // case our load test surfaced where the RDS reports Available but its DNS
@@ -674,8 +838,9 @@ func TestReconcileProvisioningProbeFailsKeepsProvisioning(t *testing.T) {
 	if w.MetadataStoreState != configstore.ManagedWarehouseStateReady {
 		t.Fatalf("expected metadata_store_state ready, got %q", w.MetadataStoreState)
 	}
-	if w.StatusMessage != "Provisioning in progress..." {
-		t.Fatalf("expected status_message to stay %q, got %q", "Provisioning in progress...", w.StatusMessage)
+	wantMessage := "Infrastructure is ready, but the metadata-store endpoint could not be resolved. Waiting for recovery."
+	if w.StatusMessage != wantMessage {
+		t.Fatalf("expected status_message %q, got %q", wantMessage, w.StatusMessage)
 	}
 	if w.ReadyAt != nil {
 		t.Fatalf("expected ready_at to remain unset, got %v", w.ReadyAt)

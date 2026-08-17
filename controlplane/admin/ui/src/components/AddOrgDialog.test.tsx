@@ -138,7 +138,8 @@ describe("AddOrgDialog", () => {
     expect(await screen.findByDisplayValue("s3cret-once")).toBeInTheDocument();
     expect(screen.getByDisplayValue("root")).toBeInTheDocument();
     expect(screen.getByText(/never shown or retrievable again/i)).toBeInTheDocument();
-    // The in-flight warehouse status is watched until ready/failed.
+    // The in-flight warehouse status is watched until ready. Failed remains
+    // observable because external dependency repair can recover it.
     await waitFor(() => expect(client.warehouseStatus).toHaveBeenCalledWith(OK_UUID));
   });
 
