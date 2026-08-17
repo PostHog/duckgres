@@ -65,9 +65,10 @@ type orgTeamsSnapshotter interface {
 }
 
 type orgTeamsInfoCollector struct {
-	store    orgTeamsSnapshotter
-	teamDesc *prometheus.Desc
-	orgDesc  *prometheus.Desc
+	store         orgTeamsSnapshotter
+	teamDesc      *prometheus.Desc
+	orgDesc       *prometheus.Desc
+	warehouseDesc *prometheus.Desc
 }
 
 func newOrgTeamsInfoCollector(store orgTeamsSnapshotter) *orgTeamsInfoCollector {
@@ -84,12 +85,18 @@ func newOrgTeamsInfoCollector(store orgTeamsSnapshotter) *orgTeamsInfoCollector 
 			"Org/duckling identity mapping, one series per org with the oldest team as representative (constant 1). Safe one-side for group_left joins",
 			labels, nil,
 		),
+		warehouseDesc: prometheus.NewDesc(
+			"duckgres_managed_warehouse_state",
+			"Managed warehouse lifecycle state, one series per live warehouse (constant 1)",
+			[]string{"org", "duckling", "state"}, nil,
+		),
 	}
 }
 
 func (c *orgTeamsInfoCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.teamDesc
 	ch <- c.orgDesc
+	ch <- c.warehouseDesc
 }
 
 func (c *orgTeamsInfoCollector) Collect(ch chan<- prometheus.Metric) {
@@ -100,6 +107,12 @@ func (c *orgTeamsInfoCollector) Collect(ch chan<- prometheus.Metric) {
 	for orgID, org := range snap.Orgs {
 		if org == nil {
 			continue
+		}
+		if org.Warehouse != nil && org.Warehouse.State != configstore.ManagedWarehouseStateDeleted {
+			ch <- prometheus.MustNewConstMetric(
+				c.warehouseDesc, prometheus.GaugeValue, 1,
+				orgID, org.Warehouse.DucklingName, managedWarehouseMetricState(org.Warehouse.State),
+			)
 		}
 		duckling := ""
 		if org.Warehouse != nil && org.Warehouse.State != configstore.ManagedWarehouseStateDeleted {
@@ -117,6 +130,20 @@ func (c *orgTeamsInfoCollector) Collect(ch chan<- prometheus.Metric) {
 				orgID, duckling, strconv.FormatInt(oldest.TeamID, 10), oldest.SchemaName,
 			)
 		}
+	}
+}
+
+func managedWarehouseMetricState(state configstore.ManagedWarehouseProvisioningState) string {
+	switch state {
+	case configstore.ManagedWarehouseStatePending,
+		configstore.ManagedWarehouseStateProvisioning,
+		configstore.ManagedWarehouseStateReady,
+		configstore.ManagedWarehouseStateFailed,
+		configstore.ManagedWarehouseStateDeleting,
+		configstore.ManagedWarehouseStateResharding:
+		return string(state)
+	default:
+		return "unknown"
 	}
 }
 

@@ -27,6 +27,18 @@ The request path uses these label terms consistently:
 
 Histograms expose the usual `_bucket`, `_count`, and `_sum` series.
 
+## Managed warehouse state
+
+`duckgres_managed_warehouse_state{org,duckling,state}` is a Kubernetes-only
+gauge with value `1` for each warehouse that has not finished deletion. The
+state label is one of `pending`, `provisioning`, `ready`, `failed`, `deleting`,
+`resharding`, or `unknown`. Unexpected stored values map to `unknown` to keep
+metric cardinality bounded.
+
+Each control-plane replica emits the same snapshot-backed series. Use `max by`
+instead of `sum by` when evaluating warehouse state across replicas. A deleted
+warehouse disappears from the metric on the next snapshot refresh.
+
 ## Request path boundaries
 
 | Stage | Metrics | Boundary |
