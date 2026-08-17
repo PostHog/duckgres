@@ -293,8 +293,6 @@ func SetupMultiTenant(
 		WorkerNodeSelector:           parseNodeSelector(cfg.K8s.WorkerNodeSelector),
 		WorkerTolerationKey:          cfg.K8s.WorkerTolerationKey,
 		WorkerTolerationValue:        cfg.K8s.WorkerTolerationValue,
-		WorkerOrgAffinityEnabled:     cfg.K8s.WorkerOrgAffinityEnabled,
-		WorkerOrgAffinityWeight:      cfg.K8s.WorkerOrgAffinityWeight,
 		WorkerPriorityClassName:      cfg.K8s.WorkerPriorityClassName,
 		PlaceholderImage:             cfg.K8s.PlaceholderImage,
 		PlaceholderPriorityClassName: cfg.K8s.PlaceholderPriorityClassName,

@@ -60,48 +60,6 @@ func TestResolveEffectiveParsesK8sWorkerMaxTTL(t *testing.T) {
 	}
 }
 
-func TestResolveEffectiveK8sWorkerOrgAffinityDefaultsAndValidatesWeight(t *testing.T) {
-	resolved := ResolveEffective(nil, CLIInputs{}, func(string) string { return "" }, nil)
-	if resolved.K8sWorkerOrgAffinityEnabled {
-		t.Fatal("org affinity must default to disabled")
-	}
-	if resolved.K8sWorkerOrgAffinityWeight != 100 {
-		t.Fatalf("default org affinity weight = %d, want 100", resolved.K8sWorkerOrgAffinityWeight)
-	}
-
-	var warned []string
-	resolved = ResolveEffective(nil, CLIInputs{}, func(key string) string {
-		switch key {
-		case "DUCKGRES_K8S_WORKER_ORG_AFFINITY_ENABLED":
-			return "true"
-		case "DUCKGRES_K8S_WORKER_ORG_AFFINITY_WEIGHT":
-			return "73"
-		default:
-			return ""
-		}
-	}, func(message string) { warned = append(warned, message) })
-	if !resolved.K8sWorkerOrgAffinityEnabled || resolved.K8sWorkerOrgAffinityWeight != 73 {
-		t.Fatalf("enabled org affinity = enabled:%v weight:%d", resolved.K8sWorkerOrgAffinityEnabled, resolved.K8sWorkerOrgAffinityWeight)
-	}
-	if len(warned) != 0 {
-		t.Fatalf("unexpected configuration warnings: %v", warned)
-	}
-
-	warned = nil
-	resolved = ResolveEffective(nil, CLIInputs{}, func(key string) string {
-		if key == "DUCKGRES_K8S_WORKER_ORG_AFFINITY_WEIGHT" {
-			return "101"
-		}
-		return ""
-	}, func(message string) { warned = append(warned, message) })
-	if resolved.K8sWorkerOrgAffinityWeight != 101 {
-		t.Fatalf("invalid configured weight must reach startup validation, got %d", resolved.K8sWorkerOrgAffinityWeight)
-	}
-	if len(warned) != 0 {
-		t.Fatalf("out-of-range weight should be rejected by startup validation, not silently reset: %v", warned)
-	}
-}
-
 func TestResolveEffectiveParsesClientIdleTimeoutMax(t *testing.T) {
 	var warned []string
 	resolved := ResolveEffective(nil, CLIInputs{}, func(key string) string {
