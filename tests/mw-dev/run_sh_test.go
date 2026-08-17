@@ -853,6 +853,63 @@ exit 1
 	}
 }
 
+func TestE2EHarnessColdBurstAcceptsStaggeredWorkerReadiness(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+
+	harness := strings.Replace(string(raw), "\nstart_kubectl_download\nk() {", "\nKUBECTL=\"${TEST_KUBECTL:?}\"\nk() {", 1)
+	harness = strings.Replace(harness, "\nmain \"$@\"\n", "\nkill() { return 1; }\ncold_burst_parallel_spawns test-org test-password\n", 1)
+	if harness == string(raw) {
+		t.Fatal("could not prepare cold-burst harness fixture")
+	}
+
+	dir := t.TempDir()
+	harnessPath := filepath.Join(dir, "harness.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o755); err != nil {
+		t.Fatalf("write harness fixture: %v", err)
+	}
+
+	kubectlPath := filepath.Join(dir, "kubectl")
+	writeFake(t, dir, "kubectl", `#!/usr/bin/env bash
+case "$*" in
+  *"delete pods -l app=duckgres-worker,duckgres/active-org=test-org"*|*"wait --for=delete pods -l app=duckgres-worker,duckgres/active-org=test-org"*)
+    exit 0
+    ;;
+  *"get pods -l app=duckgres-worker,duckgres/active-org=test-org"*"-o jsonpath="*)
+    printf '%s' '2024-01-01T00:00:00Z 2024-01-01T00:00:01Z 2024-01-01T00:00:02Z'
+    exit 0
+    ;;
+esac
+echo "unexpected kubectl invocation: $*" >&2
+exit 1
+`)
+	writeFake(t, dir, "psql", "#!/usr/bin/env sh\nprintf 1500000000\n")
+	writeFake(t, dir, "date", `#!/usr/bin/env sh
+case "$*" in
+  *"2024-01-01T00:00:00Z"*) printf 100 ;;
+  *"2024-01-01T00:00:02Z"*) printf 102 ;;
+  *) exit 1 ;;
+esac
+`)
+
+	cmd := exec.Command("sh", harnessPath)
+	cmd.Env = append(os.Environ(),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TEST_KUBECTL="+kubectlPath,
+		"CP_API=http://test.invalid",
+		"CP_PG_HOST=control-plane.test",
+		"INTERNAL_SECRET=test-secret",
+		"NAMESPACE=test-namespace",
+		"PR_NUMBER=123",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cold burst rejected three distinct parallel-created workers after their clients exited: %v\n%s", err, out)
+	}
+}
+
 func TestE2EHarnessCoversRemoteBinaryCopy(t *testing.T) {
 	harnessRaw, err := os.ReadFile("e2e/harness.sh")
 	if err != nil {
