@@ -191,6 +191,10 @@ type Session struct {
 
 	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
 	progress   progressState    // stall detection state
+
+	// logger carries user+pid for in-session WARN/ERROR. Discarded on
+	// DestroySession so a hot-idle reuse cannot leak the previous user.
+	logger *slog.Logger
 }
 
 // QueryHandle stores an ad-hoc query awaiting its DoGet.
@@ -746,7 +750,7 @@ func (p *SessionPool) reapIdle(now time.Time) {
 				if !s.connMu.TryLock() {
 					continue
 				}
-				slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
+				s.Logger().Warn("Rolling back idle transaction.", "txn", id)
 				if ttx.tx != nil {
 					_ = ttx.tx.Rollback()
 				}
@@ -773,15 +777,15 @@ func (p *SessionPool) reapIdle(now time.Time) {
 					// The connection may be executing, streaming, or planning work inside
 					// this raw SQL transaction. Leave the transaction drain token active.
 				} else if s.Conn == nil {
-					slog.Warn("Skipping idle raw SQL transaction rollback without a session connection.", "user", s.Username)
+					s.Logger().Warn("Skipping idle raw SQL transaction rollback without a session connection.")
 				} else if !s.connMu.TryLock() {
 					// A same-session operation is using the connection but has not reached
 					// a connWork-tracked path. Skip instead of blocking the reaper loop.
 				} else {
-					slog.Warn("Rolling back idle raw SQL transaction.", "user", s.Username)
+					s.Logger().Warn("Rolling back idle raw SQL transaction.")
 					rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), time.Second)
 					if _, err := s.Conn.ExecContext(rollbackCtx, "ROLLBACK"); err != nil {
-						slog.Warn("Idle raw SQL transaction rollback failed; keeping drain work active.", "user", s.Username, "error", err)
+						s.Logger().Warn("Idle raw SQL transaction rollback failed; keeping drain work active.", "error", err)
 					} else {
 						releaseDrains = append(releaseDrains, s.sqlTxDrain)
 						s.sqlTxDrain = nil
@@ -806,7 +810,7 @@ func (p *SessionPool) reapIdle(now time.Time) {
 					releaseDrains = append(releaseDrains, h.finishOperation)
 					h.finishOperation = nil
 				}
-				slog.Warn("Reaping abandoned query handle (no DoGet).", "user", s.Username, "handle", id)
+				s.Logger().Warn("Reaping abandoned query handle (no DoGet).", "handle", id)
 				delete(s.queries, id)
 			}
 		}
@@ -1324,6 +1328,7 @@ func (p *SessionPool) DestroySession(token string) error {
 	if ok {
 		delete(p.sessions, token)
 		delete(p.stopRefresh, token)
+		clearSessionLog(session)
 	}
 	p.mu.Unlock()
 

@@ -1327,6 +1327,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Feed initial parameters and backend key data to the client IMMEDIATELY.
 	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
 	pid := sessions.ReservePID()
+	clog = clog.With("pid", pid)
 	secretKey := server.GenerateSecretKey()
 
 	// Use a temporary clientConn just to send initial params

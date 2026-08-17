@@ -540,7 +540,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		}
 	}
 
-	sessionToken, secretWarnings, err := worker.CreateSession(ctx, username, memoryLimit, threads, secretStatements)
+	sessionToken, secretWarnings, err := worker.CreateSession(ctx, username, memoryLimit, threads, secretStatements, pid)
 	if err != nil {
 		sm.log.Warn("Failed to create session on worker.",
 			"pid", pid,

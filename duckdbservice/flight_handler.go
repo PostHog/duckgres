@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -237,6 +236,7 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	}
 
 	session, secretWarnings, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads, req.SecretStatements)
+	attachSessionLog(session, req.Username, req.PID)
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
 		return drainErr
 	}
@@ -373,6 +373,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 
 	type sessionSnapshot struct {
 		key      string
+		session  *Session
 		conn     duckdbConnHandle
 		progress *progressState
 		queryID  string
@@ -390,6 +391,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 		}
 		snapshots = append(snapshots, sessionSnapshot{
 			key:      key,
+			session:  session,
 			conn:     session.duckdbConn,
 			progress: &session.progress,
 			queryID:  session.CurrentQueryID(),
@@ -437,7 +439,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 						// is exactly the case whose query-log row may never get
 						// a terminal event, and this is what ties the two
 						// together.
-						slog.Warn("Query appears stuck — no progress detected.",
+						logStuckQuery(snap.session,
 							withQueryIDAttr([]any{
 								"session", snap.key, "rows_processed", pr.rows, "total_rows", pr.total,
 								"stalled_checks", stallCheckThreshold,
