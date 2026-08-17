@@ -969,8 +969,8 @@ func Run(cfg ServiceConfig) {
 		if !svc.WaitForDrain(ctx) {
 			slog.Warn("DuckDB service drain timed out before shutdown.", "timeout", workerShutdownDrainTime)
 			cancel()
-			cliboot.FlushLogging()
 			svc.CloseAll()
+			cliboot.FlushLogging()
 			os.Exit(0)
 		}
 		cancel()

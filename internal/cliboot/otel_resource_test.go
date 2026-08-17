@@ -31,13 +31,15 @@ func TestOTelServiceNameFromMode(t *testing.T) {
 				t.Fatalf("resolveServiceName() = %q, want %q", got, tt.want)
 			}
 			res := otelResource(BuildInfo{Version: "1.2.3"})
-			var gotName, gotDeploy, gotVersion string
+			var gotName, gotDeploy, gotVersion, gotMode string
 			for _, a := range res.Attributes() {
 				switch a.Key {
 				case semconv.ServiceNameKey:
 					gotName = a.Value.AsString()
 				case "duckgres.deployment":
 					gotDeploy = a.Value.AsString()
+				case "duckgres.mode":
+					gotMode = a.Value.AsString()
 				case semconv.ServiceVersionKey:
 					gotVersion = a.Value.AsString()
 				}
@@ -47,6 +49,12 @@ func TestOTelServiceNameFromMode(t *testing.T) {
 			}
 			if tt.identifier != "" && gotDeploy != tt.identifier {
 				t.Fatalf("duckgres.deployment = %q, want %q", gotDeploy, tt.identifier)
+			}
+			if tt.mode != "" && gotMode != tt.mode {
+				t.Fatalf("duckgres.mode = %q, want %q", gotMode, tt.mode)
+			}
+			if tt.mode == "" && gotMode != "" {
+				t.Fatalf("duckgres.mode = %q, want unset", gotMode)
 			}
 			if gotVersion != "1.2.3" {
 				t.Fatalf("service.version = %q, want 1.2.3", gotVersion)

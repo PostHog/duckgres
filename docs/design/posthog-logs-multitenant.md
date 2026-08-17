@@ -549,7 +549,7 @@ There are **no** existing `k8s_pool_spawn` env unit tests. The PR that first rea
 | Site | File | Why |
 | --- | --- | --- |
 | Worker drain **success** | `duckdbservice/service.go` ~975, before `os.Exit(0)` after `Shutdown()` | last shutdown INFO |
-| Worker drain **timeout** | `service.go` ~972, `CloseAll(); os.Exit(0)` — **no** `Shutdown()` today | same; call flush **before** `CloseAll`/`os.Exit` |
+| Worker drain **timeout** | `service.go` ~972, `CloseAll(); FlushLogging(); os.Exit(0)` — **no** `Shutdown()` today | same; flush **after** `CloseAll` so teardown logs still export |
 | CP SIGTERM after `drainAndShutdown` / `shutdown` | `control.go` ~683, before `os.Exit(0)` | last drain lines |
 | `drainAfterUpgrade` | `control.go` ~2748, before `os.Exit(0)` | `Old control plane exiting after upgrade.` |
 

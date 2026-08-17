@@ -465,9 +465,12 @@ on.
 
 The two exporters can be enabled independently, and the distinction matters
 because they carry different data. These events are metadata only. Application
-logs are not: `logQuery` / `logQueryError` attach the statement, and
+logs are not: OTLP keeps `RedactForLog`+4096 SQL only on exported WARN/ERROR.
+User-class `Query execution failed.` stays Info and does **not** export at the
+default WARN — those statements stay on stderr/`query_log` unless the PostHog
+level is raised. `logQuery` / `logQueryError` attach the statement, and
 `usersecrets.RedactForLog` only rewrites secret DDL, so ordinary SQL and its
-literals reach PostHog Logs.
+literals reach PostHog Logs only when that record is actually exported.
 
 | Set | Analytics events | Log export |
 | --- | --- | --- |

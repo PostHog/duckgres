@@ -306,7 +306,8 @@ func FlushLogging() {
 // POSTHOG_API_KEY is set. Additional PostHog projects can be targeted by
 // setting ADDITIONAL_POSTHOG_API_KEYS to a comma-separated list of API keys.
 // Logs always go to stderr; PostHog is additive.
-// The log level is controlled by DUCKGRES_LOG_LEVEL (debug, info, warn, error).
+// Stderr level is DUCKGRES_LOG_LEVEL (debug, info, warn, error; default info).
+// PostHog is independently DUCKGRES_POSTHOG_LOG_LEVEL (default warn).
 // Returns a shutdown function that flushes all OTLP batch processors.
 func InitLogging(bi BuildInfo) func() {
 	level := parseLogLevel()

@@ -11,6 +11,10 @@ import (
 
 const dropStartingMetricsServer = "Starting metrics server"
 
+// infoSampleRand is the INFO keep-draw. Tests replace it to assert a single
+// draw per record; production uses rand.Float64.
+var infoSampleRand = rand.Float64
+
 // newPostHogBranch is the OTLP-only stack: level → INFO sample → drop → strip.
 func newPostHogBranch(inner slog.Handler, level slog.Level, infoSample float64, queryText string) slog.Handler {
 	return &posthogLevelHandler{
@@ -58,24 +62,23 @@ type infoSampleHandler struct {
 }
 
 func (h *infoSampleHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	if l >= slog.LevelWarn {
+	if l >= slog.LevelWarn || l < slog.LevelInfo {
 		return h.inner.Enabled(ctx, l)
 	}
-	if l < slog.LevelInfo {
-		return h.inner.Enabled(ctx, l)
-	}
-	if h.sample <= 0 {
-		return false
-	}
-	if h.sample >= 1 {
-		return h.inner.Enabled(ctx, l)
-	}
-	return rand.Float64() < h.sample && h.inner.Enabled(ctx, l)
+	// INFO: config gate only. The keep-draw lives in Handle so the
+	// stack's Enabled re-checks (multiHandler, level wrapper, here)
+	// cannot cube the sample fraction.
+	return h.sample > 0 && h.inner.Enabled(ctx, l)
 }
 
 func (h *infoSampleHandler) Handle(ctx context.Context, r slog.Record) error {
 	if !h.Enabled(ctx, r.Level) {
 		return nil
+	}
+	if r.Level >= slog.LevelInfo && r.Level < slog.LevelWarn && h.sample < 1 {
+		if infoSampleRand() >= h.sample {
+			return nil
+		}
 	}
 	return h.inner.Handle(ctx, r)
 }

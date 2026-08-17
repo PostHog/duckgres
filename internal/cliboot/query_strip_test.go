@@ -213,6 +213,54 @@ func TestPostHogLevelIndependentOfStderr(t *testing.T) {
 	}
 }
 
+func TestPostHogInfoSampleIsNotCubed(t *testing.T) {
+	var draws int
+	seq := []float64{0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
+	orig := infoSampleRand
+	infoSampleRand = func() float64 {
+		v := seq[draws%len(seq)]
+		draws++
+		return v
+	}
+	t.Cleanup(func() { infoSampleRand = orig })
+
+	const sample = 0.5
+	const n = 200
+	cap := newCapture(slog.LevelDebug)
+	var stderr bytes.Buffer
+	logger := slog.New(&multiHandler{handlers: []slog.Handler{
+		NewStampedHandler(&stderr, slog.LevelInfo),
+		newPostHogBranch(cap, slog.LevelInfo, sample, queryTextRedacted),
+	}})
+	for i := 0; i < n; i++ {
+		logger.Info("sampled info")
+	}
+	if draws != n {
+		t.Fatalf("INFO sample drew %d times for %d logs; want 1 draw per log (Enabled re-roll cubes the keep-fraction)", draws, n)
+	}
+	wantKeep := 0
+	for i := 0; i < n; i++ {
+		if seq[i%len(seq)] < sample {
+			wantKeep++
+		}
+	}
+	if got := len(cap.all()); got != wantKeep {
+		t.Fatalf("kept %d/%d INFO, want %d (sample=%.1f, one draw per log)", got, n, wantKeep, sample)
+	}
+
+	cap0 := newCapture(slog.LevelDebug)
+	slog.New(newPostHogBranch(cap0, slog.LevelInfo, 0, queryTextRedacted)).Info("dropped at sample=0")
+	if len(cap0.all()) != 0 {
+		t.Fatal("sample=0 kept INFO")
+	}
+
+	capW := newCapture(slog.LevelDebug)
+	slog.New(newPostHogBranch(capW, slog.LevelWarn, sample, queryTextRedacted)).Info("dropped at warn")
+	if len(capW.all()) != 0 {
+		t.Fatal("default warn level kept INFO")
+	}
+}
+
 func TestPostHogInfoSampleKeepsErrors(t *testing.T) {
 	cap := newCapture(slog.LevelDebug)
 	logger := slog.New(newPostHogBranch(cap, slog.LevelInfo, 0, queryTextRedacted))
