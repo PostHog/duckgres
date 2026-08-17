@@ -841,7 +841,7 @@ exit 1
 	if got := strings.Count(callLog, "get pods -l app=duckgres-worker,duckgres/active-org=test-org"); got != 3 {
 		t.Fatalf("worker selections = %d, want 3 (stale, terminal, then replacement); calls:\n%s", got, callLog)
 	}
-	if got := strings.Count(callLog, "--field-selector=status.phase=Running"); got != 3 {
+	if got := strings.Count(callLog, "app=duckgres-worker,duckgres/active-org=test-org --field-selector=status.phase=Running"); got != 3 {
 		t.Fatalf("running-worker selections = %d, want 3; calls:\n%s", got, callLog)
 	}
 	if !strings.Contains(callLog, "get pod stale-worker") {
