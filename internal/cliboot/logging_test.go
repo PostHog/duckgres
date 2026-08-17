@@ -147,3 +147,40 @@ func TestRedactingHandler(t *testing.T) {
 		})
 	}
 }
+
+func TestFlushLoggingIdempotent(t *testing.T) {
+	t.Run("disabled export does not panic", func(t *testing.T) {
+		t.Setenv("POSTHOG_API_KEY", "")
+		shutdown := InitLogging()
+		FlushLogging()
+		FlushLogging()
+		shutdown()
+		FlushLogging()
+	})
+
+	t.Run("never initialized does not panic", func(t *testing.T) {
+		installLoggingFlusher(nil)
+		FlushLogging()
+		FlushLogging()
+	})
+
+	t.Run("second call is a no-op", func(t *testing.T) {
+		var calls int
+		installLoggingFlusher(func() { calls++ })
+		FlushLogging()
+		FlushLogging()
+		if calls != 1 {
+			t.Fatalf("FlushLogging ran %d times, want 1", calls)
+		}
+	})
+
+	t.Run("shutdown closure shares Once with FlushLogging", func(t *testing.T) {
+		var calls int
+		shutdown := installLoggingFlusher(func() { calls++ })
+		shutdown()
+		FlushLogging()
+		if calls != 1 {
+			t.Fatalf("shared flush ran %d times, want 1", calls)
+		}
+	})
+}

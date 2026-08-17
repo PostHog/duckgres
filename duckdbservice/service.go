@@ -25,6 +25,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
@@ -969,11 +970,13 @@ func Run(cfg ServiceConfig) {
 			slog.Warn("DuckDB service drain timed out before shutdown.", "timeout", workerShutdownDrainTime)
 			cancel()
 			svc.CloseAll()
+			cliboot.FlushLogging()
 			os.Exit(0)
 		}
 		cancel()
 		slog.Info("Shutting down DuckDB service...")
 		svc.Shutdown()
+		cliboot.FlushLogging()
 		os.Exit(0)
 	}()
 
