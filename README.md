@@ -407,8 +407,6 @@ Run with config file:
 | `DUCKGRES_EXPLORATORY_WORKER_CPU` | CPU request/limit of the exploratory worker pod (e.g. `1`, `500m`). Required (with the memory knob) for the tier to activate; a missing or invalid value logs a warning and leaves the tier OFF. Env-only. | - |
 | `DUCKGRES_EXPLORATORY_WORKER_MEMORY` | Memory request/limit of the exploratory worker pod (e.g. `2Gi`). Same requirement as the CPU knob. Env-only. | - |
 | `DUCKGRES_EXPLORATORY_WORKER_TTL` | Hot-idle TTL of exploratory worker pods (Go duration) — how long one stays parked for the org's next connection after its last one ends. Env-only. | `48h` |
-| `DUCKGRES_K8S_WORKER_ORG_AFFINITY_ENABLED` | Deployment-wide static preference for new trusted org-bound workers to land on a hostname already running a worker for that org. It never creates a required scheduling constraint. Env-only. | `false` |
-| `DUCKGRES_K8S_WORKER_ORG_AFFINITY_WEIGHT` | Weight for the preferred same-org worker pod-affinity term. Must be within `[1,100]`. Env-only. | `100` |
 | `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events**. Application logs carry query text — to get events without exporting SQL, leave this unset and use `POSTHOG_ANALYTICS_API_KEY` | - |
 | `POSTHOG_ANALYTICS_API_KEY` | PostHog project API key for product-analytics events **only**, leaving log export off. Takes precedence over `POSTHOG_API_KEY` for analytics | - |
 | `POSTHOG_HOST` | PostHog ingest host (shared by both exporters) | `us.i.posthog.com` |

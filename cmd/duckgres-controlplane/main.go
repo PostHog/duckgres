@@ -266,8 +266,6 @@ func main() {
 			WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
 			WorkerTolerationKey:          resolved.K8sWorkerTolerationKey,
 			WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
-			WorkerOrgAffinityEnabled:     resolved.K8sWorkerOrgAffinityEnabled,
-			WorkerOrgAffinityWeight:      resolved.K8sWorkerOrgAffinityWeight,
 			AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
 			WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
 			PlaceholderImage:             resolved.K8sPlaceholderImage,

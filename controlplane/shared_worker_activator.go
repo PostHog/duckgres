@@ -183,7 +183,6 @@ func (a *SharedWorkerActivator) ActivateReservedWorker(ctx context.Context, work
 	// See also docs on activeOrgLabelKey.
 	if err == nil {
 		a.stampActiveOrgLabel(ctx, worker.PodName(), payload.OrgID)
-		a.stampPlacementOrgLabel(ctx, worker.PodName(), payload.OrgID)
 	}
 
 	// Clear the migration lock after the worker finishes activation
@@ -237,37 +236,6 @@ func (a *SharedWorkerActivator) stampActiveOrgLabel(ctx context.Context, podName
 		metav1.PatchOptions{},
 	); err != nil {
 		slog.Warn("Failed to stamp active-org label on worker pod.",
-			"pod", podName, "org", orgID, "error", err)
-	}
-}
-
-// stampPlacementOrgLabel makes an already-existing org-bound worker usable as
-// a soft scheduler target. Unlike active-org, this label is scheduling metadata
-// only; it is never read for authorization or network-policy decisions.
-func (a *SharedWorkerActivator) stampPlacementOrgLabel(ctx context.Context, podName, orgID string) {
-	stampWorkerPlacementOrgLabel(ctx, a.clientset, a.defaultNamespace, podName, orgID, nil)
-}
-
-// stampWorkerPlacementOrgLabel applies the placement label from trusted
-// assignment state. currentLabels avoids an unnecessary patch during adoption
-// and reconciliation when the caller already fetched the pod.
-func stampWorkerPlacementOrgLabel(ctx context.Context, clientset kubernetes.Interface, namespace, podName, orgID string, currentLabels map[string]string) {
-	if clientset == nil || podName == "" || orgID == "" {
-		return
-	}
-	labelValue := placementOrgLabelValue(orgID)
-	if currentLabels != nil && currentLabels[placementOrgLabelKey] == labelValue {
-		return
-	}
-	patch := fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, placementOrgLabelKey, labelValue)
-	if _, err := clientset.CoreV1().Pods(namespace).Patch(
-		ctx,
-		podName,
-		types.StrategicMergePatchType,
-		[]byte(patch),
-		metav1.PatchOptions{},
-	); err != nil {
-		slog.Warn("Failed to stamp placement-org label on worker pod.",
 			"pod", podName, "org", orgID, "error", err)
 	}
 }

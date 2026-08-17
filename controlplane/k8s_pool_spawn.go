@@ -35,13 +35,6 @@ func (p *K8sWorkerPool) SpawnWorker(ctx context.Context, id int, image string) e
 }
 
 func (p *K8sWorkerPool) spawnWorker(ctx context.Context, id int, image string, profile WorkerProfile, publishIdle bool) error {
-	return p.spawnWorkerForOrg(ctx, id, image, profile, publishIdle, "")
-}
-
-// spawnWorkerForOrg creates a worker pod for a trusted assignment org. Callers
-// without assignment state must pass an empty org ID; the placement label is
-// scheduler metadata only and is never inferred from pod labels.
-func (p *K8sWorkerPool) spawnWorkerForOrg(ctx context.Context, id int, image string, profile WorkerProfile, publishIdle bool, orgID string) error {
 	// Test seam: lets unit tests stub pod creation (register the worker in
 	// p.workers themselves) without a real K8s spawn / pod-ready wait.
 	if p.spawnWorkerFunc != nil {
@@ -79,9 +72,6 @@ func (p *K8sWorkerPool) spawnWorkerForOrg(ctx context.Context, id int, image str
 	}
 	if p.orgID != "" {
 		podLabels["duckgres/org"] = p.orgID
-	}
-	if orgID != "" {
-		podLabels[placementOrgLabelKey] = placementOrgLabelValue(orgID)
 	}
 
 	// Resolve the pod's resource shape once: the container Resources AND the
@@ -176,7 +166,6 @@ func (p *K8sWorkerPool) spawnWorkerForOrg(ctx context.Context, id int, image str
 		Name:  "DUCKGRES_SHARED_WARM_WORKER",
 		Value: "true",
 	})
-	p.addWorkerOrgPlacementAffinity(pod, orgID)
 
 	// Pre-session memory hygiene. Without an explicit DUCKGRES_MEMORY_LIMIT the
 	// worker's ConfigureMainDB falls back to sysinfo.AutoMemoryLimit(), which
@@ -447,46 +436,6 @@ func controlPlaneIDLabelValue(cpInstanceID string) string {
 	return prefix + "-" + suffix
 }
 
-// placementOrgLabelKey is scheduling metadata for org-bound workers. It must
-// never be used as authorization data; duckgres/active-org remains the
-// activation-time network-policy label.
-const placementOrgLabelKey = "duckgres/placement-org"
-
-// placementOrgLabelValue uses the same Kubernetes label-value safety rules as
-// control-plane identity labels. The same canonical value is used both on the
-// pod and in its affinity selector.
-func placementOrgLabelValue(orgID string) string {
-	return controlPlaneIDLabelValue(orgID)
-}
-
-// addWorkerOrgPlacementAffinity appends one soft same-org preference without
-// replacing any affinity fields the pod already has. An empty org means there
-// is no trusted placement identity, so scheduling is left unchanged.
-func (p *K8sWorkerPool) addWorkerOrgPlacementAffinity(pod *corev1.Pod, orgID string) {
-	if pod == nil || !p.workerOrgAffinityEnabled || orgID == "" {
-		return
-	}
-	if pod.Spec.Affinity == nil {
-		pod.Spec.Affinity = &corev1.Affinity{}
-	}
-	if pod.Spec.Affinity.PodAffinity == nil {
-		pod.Spec.Affinity.PodAffinity = &corev1.PodAffinity{}
-	}
-	pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
-		pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution,
-		corev1.WeightedPodAffinityTerm{
-			Weight: int32(p.workerOrgAffinityWeight),
-			PodAffinityTerm: corev1.PodAffinityTerm{
-				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-					placementOrgLabelKey: placementOrgLabelValue(orgID),
-				}},
-				Namespaces:  []string{p.namespace},
-				TopologyKey: "kubernetes.io/hostname",
-			},
-		},
-	)
-}
-
 // createPodWithBackoff creates a pod, retrying transient K8s API errors
 // with exponential backoff (500ms, 1s, 2s, 4s).
 func (p *K8sWorkerPool) createPodWithBackoff(ctx context.Context, pod *corev1.Pod) error {
@@ -667,7 +616,7 @@ func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, 
 	}
 	p.spawning++
 	p.mu.Unlock()
-	err = p.spawnWorkerForOrg(ctx, id, assignment.Image, profile, false, assignment.OrgID)
+	err = p.spawnWorker(ctx, id, assignment.Image, profile, false)
 	p.mu.Lock()
 	p.spawning--
 	p.mu.Unlock()

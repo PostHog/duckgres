@@ -161,8 +161,6 @@ type K8sConfig struct {
 	WorkerNodeSelector      string // JSON map for worker pod nodeSelector (e.g., '{"posthog.com/nodepool":"workers"}')
 	WorkerTolerationKey     string // Taint key for worker pod NoSchedule toleration
 	WorkerTolerationValue   string // Taint value for worker pod NoSchedule toleration
-	WorkerOrgAffinityEnabled bool // Prefer same-org workers on the same hostname. Deployment-wide; default false.
-	WorkerOrgAffinityWeight  int  // Preferred same-org pod-affinity weight, validated in [1,100].
 	WorkerPriorityClassName string // PriorityClass for worker pods, so they preempt overprovision headroom pause pods (empty = none)
 	AWSRegion               string // AWS region for STS client
 
@@ -348,12 +346,6 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 	if err := validateWorkerBackendConfig(cfg); err != nil {
 		slog.Error("Invalid worker backend configuration.", "error", err)
 		os.Exit(1)
-	}
-	if cfg.WorkerBackend == "remote" {
-		if err := validateK8sWorkerOrgAffinityConfig(cfg); err != nil {
-			slog.Error("Invalid Kubernetes worker placement configuration.", "error", err)
-			os.Exit(1)
-		}
 	}
 
 	isK8s := cfg.WorkerBackend == "remote"
