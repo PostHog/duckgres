@@ -58,24 +58,23 @@ type infoSampleHandler struct {
 }
 
 func (h *infoSampleHandler) Enabled(ctx context.Context, l slog.Level) bool {
-	if l >= slog.LevelWarn {
-		return h.inner.Enabled(ctx, l)
-	}
-	if l < slog.LevelInfo {
-		return h.inner.Enabled(ctx, l)
-	}
-	if h.sample <= 0 {
+	// Deterministic: a mid-range sample must not roll here. slog, the
+	// level wrapper, and Handle all consult Enabled; a rand draw in each
+	// would cube the keep-fraction.
+	if l >= slog.LevelInfo && l < slog.LevelWarn && h.sample <= 0 {
 		return false
 	}
-	if h.sample >= 1 {
-		return h.inner.Enabled(ctx, l)
-	}
-	return rand.Float64() < h.sample && h.inner.Enabled(ctx, l)
+	return h.inner.Enabled(ctx, l)
 }
 
 func (h *infoSampleHandler) Handle(ctx context.Context, r slog.Record) error {
-	if !h.Enabled(ctx, r.Level) {
-		return nil
+	if r.Level >= slog.LevelInfo && r.Level < slog.LevelWarn {
+		if h.sample <= 0 {
+			return nil
+		}
+		if h.sample < 1 && rand.Float64() >= h.sample {
+			return nil
+		}
 	}
 	return h.inner.Handle(ctx, r)
 }

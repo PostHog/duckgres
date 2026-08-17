@@ -689,7 +689,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	if inTransaction {
 		schema, err = session.getQuerySchema(ctx, query, tx)
 	} else {
-		schema, err = retryOnTransient(func() (*arrow.Schema, error) {
+		schema, err = retryOnTransient(session.Logger(), func() (*arrow.Schema, error) {
 			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
@@ -698,7 +698,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	// conflict retry — acceptable since the error patterns are distinct in practice.
 	if shouldRetryDuckLakeConflict(err, inTransaction) {
 		ducklakeConflictTotal.Inc()
-		schema, err = retryOnConflict(func() (*arrow.Schema, error) {
+		schema, err = retryOnConflict(session.Logger(), func() (*arrow.Schema, error) {
 			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
@@ -708,6 +708,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	h.pool.noteInstanceError(query, err)
 	if err != nil {
 		schema, err, _ = recoverAbortedTransaction(
+			session.Logger(),
 			err,
 			!inTransaction,
 			func() error { return session.rollbackConn(context.Background()) },
@@ -835,12 +836,12 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		if inTxn {
 			rows, qerr = queryFn()
 		} else {
-			rows, qerr = retryOnTransient(queryFn)
+			rows, qerr = retryOnTransient(session.Logger(), queryFn)
 		}
 		// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 		if shouldRetryDuckLakeConflict(qerr, inTxn) {
 			ducklakeConflictTotal.Inc()
-			rows, qerr = retryOnConflict(func() (*sql.Rows, error) {
+			rows, qerr = retryOnConflict(session.Logger(), func() (*sql.Rows, error) {
 				return queryFn()
 			})
 		}
@@ -849,6 +850,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		h.pool.noteInstanceError(handle.Query, qerr)
 		if qerr != nil {
 			rows, qerr, _ = recoverAbortedTransaction(
+				session.Logger(),
 				qerr,
 				!inTxn,
 				func() error { return session.rollbackConn(context.Background()) },
@@ -962,18 +964,19 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if inTransaction || isTxControl {
 		result, execErr = execFn()
 	} else {
-		result, execErr = retryOnTransient(execFn)
+		result, execErr = retryOnTransient(session.Logger(), execFn)
 	}
 
 	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 	if shouldRetryDuckLakeConflict(execErr, inTransaction) {
 		ducklakeConflictTotal.Inc()
-		result, execErr = retryOnConflict(func() (sql.Result, error) {
+		result, execErr = retryOnConflict(session.Logger(), func() (sql.Result, error) {
 			return session.execConn(ctx, query)
 		})
 	}
 	if execErr != nil {
 		result, execErr, _ = recoverAbortedTransaction(
+			session.Logger(),
 			execErr,
 			!inTransaction,
 			func() error { return session.rollbackConn(context.Background()) },

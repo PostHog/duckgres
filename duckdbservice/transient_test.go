@@ -1,7 +1,9 @@
 package duckdbservice
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -79,7 +81,7 @@ func TestIsTransientDuckLakeError(t *testing.T) {
 
 func TestRetryOnTransientSucceedsAfterRetry(t *testing.T) {
 	calls := 0
-	result, err := retryOnTransient(func() (string, error) {
+	result, err := retryOnTransient(nil, func() (string, error) {
 		calls++
 		if calls < 3 {
 			return "", errors.New("could not translate host name: Temporary failure in name resolution")
@@ -100,7 +102,7 @@ func TestRetryOnTransientSucceedsAfterRetry(t *testing.T) {
 
 func TestRetryOnTransientNoRetryForNonTransient(t *testing.T) {
 	calls := 0
-	_, err := retryOnTransient(func() (string, error) {
+	_, err := retryOnTransient(nil, func() (string, error) {
 		calls++
 		return "", errors.New("syntax error at position 42")
 	})
@@ -139,7 +141,7 @@ func TestIsDuckLakeTransactionConflict(t *testing.T) {
 
 func TestRetryOnConflictSucceedsAfterRetry(t *testing.T) {
 	calls := 0
-	result, err := retryOnConflict(func() (string, error) {
+	result, err := retryOnConflict(nil, func() (string, error) {
 		calls++
 		if calls <= 2 {
 			return "", errors.New(`Transaction conflict - attempting to insert into table with index "29784"`)
@@ -162,7 +164,7 @@ func TestRetryOnConflictSucceedsAfterRetry(t *testing.T) {
 
 func TestRetryOnConflictExhaustsRetries(t *testing.T) {
 	calls := 0
-	_, err := retryOnConflict(func() (string, error) {
+	_, err := retryOnConflict(nil, func() (string, error) {
 		calls++
 		return "", errors.New("Transaction conflict on commit")
 	})
@@ -181,7 +183,7 @@ func TestRetryOnConflictExhaustsRetries(t *testing.T) {
 
 func TestRetryOnConflictStopsOnNonConflictError(t *testing.T) {
 	calls := 0
-	_, err := retryOnConflict(func() (string, error) {
+	_, err := retryOnConflict(nil, func() (string, error) {
 		calls++
 		return "", errors.New("syntax error at position 42")
 	})
@@ -215,6 +217,7 @@ func TestRecoverAbortedTransactionRetriesAfterRollbackInAutocommit(t *testing.T)
 	retryCalls := 0
 
 	result, err, recovered := recoverAbortedTransaction(
+		nil,
 		errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)"),
 		true,
 		func() error {
@@ -250,6 +253,7 @@ func TestRecoverAbortedTransactionSkipsRecoveryInsideUserTransaction(t *testing.
 	origErr := errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
 
 	_, err, recovered := recoverAbortedTransaction(
+		nil,
 		origErr,
 		false,
 		func() error {
@@ -281,6 +285,7 @@ func TestRecoverAbortedTransactionReturnsRollbackFailure(t *testing.T) {
 	retryCalls := 0
 
 	_, err, recovered := recoverAbortedTransaction(
+		nil,
 		errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)"),
 		true,
 		func() error {
@@ -383,7 +388,7 @@ func TestSQLTxActiveSkipsRetry(t *testing.T) {
 	if inTransaction || isTxControl {
 		_, err = execFn()
 	} else {
-		_, err = retryOnTransient(execFn)
+		_, err = retryOnTransient(nil, execFn)
 	}
 
 	if err == nil {
@@ -420,7 +425,7 @@ func TestSQLTxActiveAllowsRetryOutsideTransaction(t *testing.T) {
 	if inTransaction || isTxControl {
 		result, err = execFn()
 	} else {
-		result, err = retryOnTransient(execFn)
+		result, err = retryOnTransient(nil, execFn)
 	}
 
 	if err != nil {
@@ -445,5 +450,37 @@ func TestStartTransactionTracking(t *testing.T) {
 	trackSQLTransactionState("ROLLBACK", nil, &flag)
 	if flag.Load() {
 		t.Fatal("sqlTxActive should be false after ROLLBACK")
+	}
+}
+
+func TestRetryWarnCarriesSessionIdentity(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+
+	s := &Session{Username: "alice"}
+	attachSessionLog(s, "alice", 42)
+
+	_, err, recovered := recoverAbortedTransaction(
+		s.Logger(),
+		errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)"),
+		true,
+		func() error { return nil },
+		func() (string, error) { return "", errors.New("still aborted") },
+	)
+	if !recovered {
+		t.Fatal("expected recovery attempt")
+	}
+	if err == nil {
+		t.Fatal("expected retry error")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "DuckLake connection hit aborted transaction state") &&
+		!strings.Contains(out, "DuckLake aborted transaction recovery retry failed.") {
+		t.Fatalf("missing retry WARN: %s", out)
+	}
+	if !strings.Contains(out, "user=alice") || !strings.Contains(out, "pid=42") {
+		t.Fatalf("retry WARN missing session identity: %s", out)
 	}
 }
