@@ -22,6 +22,7 @@ import (
 
 	"github.com/cloudflare/tableflip"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/internal/netkeepalive"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/ducklake"
@@ -659,6 +660,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		if cp.upgradeDraining.Load() {
 			slog.Info("Received shutdown signal during upgrade drain, exiting immediately.", "signal", s)
 			cp.pool.ShutdownAll()
+			cliboot.FlushLogging()
 			os.Exit(0)
 		}
 		slog.Info("Received shutdown signal.", "signal", s)
@@ -680,6 +682,7 @@ func RunControlPlane(cfg ControlPlaneConfig) {
 		} else {
 			cp.shutdown()
 		}
+		cliboot.FlushLogging()
 		os.Exit(0)
 	}()
 
@@ -1324,6 +1327,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// Feed initial parameters and backend key data to the client IMMEDIATELY.
 	// This keeps JDBC drivers happy while we perform the slow worker acquisition.
 	pid := sessions.ReservePID()
+	clog = clog.With("pid", pid)
 	secretKey := server.GenerateSecretKey()
 
 	// Use a temporary clientConn just to send initial params
@@ -2745,6 +2749,7 @@ func (cp *ControlPlane) drainAfterUpgrade() {
 	}
 
 	slog.Info("Old control plane exiting after upgrade.")
+	cliboot.FlushLogging()
 	os.Exit(0)
 }
 

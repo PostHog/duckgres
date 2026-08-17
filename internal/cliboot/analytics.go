@@ -12,11 +12,10 @@ import (
 // POSTHOG_ANALYTICS_API_KEY enables analytics WITHOUT enabling the OTLP log
 // export, which stays gated on POSTHOG_API_KEY alone (see InitLogging). The
 // two exporters carry very different data: analytics events are metadata only
-// (see the events table in README.md), while application logs include query
-// text — `logQuery`/`logQueryError` attach the statement, and
-// usersecrets.RedactForLog only rewrites secret DDL, so arbitrary SQL and its
-// literals reach PostHog Logs. A deployment that must not ship customer SQL
-// therefore sets ONLY POSTHOG_ANALYTICS_API_KEY.
+// (see the events table in README.md), while application logs on the OTLP
+// path keep RedactForLog+4096 query text at WARN/ERROR (secret DDL is a
+// placeholder; ordinary SELECT text still leaves). A deployment that must
+// not ship customer SQL therefore sets ONLY POSTHOG_ANALYTICS_API_KEY.
 //
 // POSTHOG_API_KEY remains a fallback so existing single-key deployments keep
 // both exporters with no config change. POSTHOG_HOST is shared by both and is

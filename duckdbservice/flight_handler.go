@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -237,6 +236,7 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	}
 
 	session, secretWarnings, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads, req.SecretStatements)
+	attachSessionLog(session, req.Username, req.PID)
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
 		return drainErr
 	}
@@ -373,6 +373,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 
 	type sessionSnapshot struct {
 		key      string
+		session  *Session
 		conn     duckdbConnHandle
 		progress *progressState
 		queryID  string
@@ -390,6 +391,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 		}
 		snapshots = append(snapshots, sessionSnapshot{
 			key:      key,
+			session:  session,
 			conn:     session.duckdbConn,
 			progress: &session.progress,
 			queryID:  session.CurrentQueryID(),
@@ -437,7 +439,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 						// is exactly the case whose query-log row may never get
 						// a terminal event, and this is what ties the two
 						// together.
-						slog.Warn("Query appears stuck — no progress detected.",
+						logStuckQuery(snap.session,
 							withQueryIDAttr([]any{
 								"session", snap.key, "rows_processed", pr.rows, "total_rows", pr.total,
 								"stalled_checks", stallCheckThreshold,
@@ -687,7 +689,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	if inTransaction {
 		schema, err = session.getQuerySchema(ctx, query, tx)
 	} else {
-		schema, err = retryOnTransient(func() (*arrow.Schema, error) {
+		schema, err = retryOnTransient(session.Logger(), func() (*arrow.Schema, error) {
 			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
@@ -696,7 +698,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	// conflict retry — acceptable since the error patterns are distinct in practice.
 	if shouldRetryDuckLakeConflict(err, inTransaction) {
 		ducklakeConflictTotal.Inc()
-		schema, err = retryOnConflict(func() (*arrow.Schema, error) {
+		schema, err = retryOnConflict(session.Logger(), func() (*arrow.Schema, error) {
 			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
@@ -706,6 +708,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	h.pool.noteInstanceError(query, err)
 	if err != nil {
 		schema, err, _ = recoverAbortedTransaction(
+			session.Logger(),
 			err,
 			!inTransaction,
 			func() error { return session.rollbackConn(context.Background()) },
@@ -833,12 +836,12 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		if inTxn {
 			rows, qerr = queryFn()
 		} else {
-			rows, qerr = retryOnTransient(queryFn)
+			rows, qerr = retryOnTransient(session.Logger(), queryFn)
 		}
 		// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 		if shouldRetryDuckLakeConflict(qerr, inTxn) {
 			ducklakeConflictTotal.Inc()
-			rows, qerr = retryOnConflict(func() (*sql.Rows, error) {
+			rows, qerr = retryOnConflict(session.Logger(), func() (*sql.Rows, error) {
 				return queryFn()
 			})
 		}
@@ -847,6 +850,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		h.pool.noteInstanceError(handle.Query, qerr)
 		if qerr != nil {
 			rows, qerr, _ = recoverAbortedTransaction(
+				session.Logger(),
 				qerr,
 				!inTxn,
 				func() error { return session.rollbackConn(context.Background()) },
@@ -960,18 +964,19 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if inTransaction || isTxControl {
 		result, execErr = execFn()
 	} else {
-		result, execErr = retryOnTransient(execFn)
+		result, execErr = retryOnTransient(session.Logger(), execFn)
 	}
 
 	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 	if shouldRetryDuckLakeConflict(execErr, inTransaction) {
 		ducklakeConflictTotal.Inc()
-		result, execErr = retryOnConflict(func() (sql.Result, error) {
+		result, execErr = retryOnConflict(session.Logger(), func() (sql.Result, error) {
 			return session.execConn(ctx, query)
 		})
 	}
 	if execErr != nil {
 		result, execErr, _ = recoverAbortedTransaction(
+			session.Logger(),
 			execErr,
 			!inTransaction,
 			func() error { return session.rollbackConn(context.Background()) },

@@ -267,15 +267,20 @@ var workerLogIdentityOnce sync.Once
 // logger, so EVERY worker log line — session create/destroy, query execution,
 // drain — carries org= and worker= alongside the pod=/node= stamps, matching
 // the control plane's per-connection identity attrs.
+func workerIdentityAttrs(orgID string, workerID int) []any {
+	attrs := make([]any, 0, 4)
+	if orgID != "" {
+		attrs = append(attrs, "org", orgID)
+	}
+	if workerID > 0 {
+		attrs = append(attrs, "worker", workerID)
+	}
+	return attrs
+}
+
 func stampWorkerLogIdentity(orgID string, workerID int) {
 	workerLogIdentityOnce.Do(func() {
-		attrs := make([]any, 0, 4)
-		if orgID != "" {
-			attrs = append(attrs, "org", orgID)
-		}
-		if workerID > 0 {
-			attrs = append(attrs, "worker", workerID)
-		}
+		attrs := workerIdentityAttrs(orgID, workerID)
 		if len(attrs) > 0 {
 			slog.SetDefault(slog.Default().With(attrs...))
 		}

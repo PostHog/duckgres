@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -147,7 +148,14 @@ func (h *RedactingHandler) WithGroup(name string) slog.Handler {
 // would otherwise pass through verbatim. Defense-in-depth on top of callers that
 // should already be logging a fingerprint instead of the raw token.
 var redactedKeys = map[string]bool{
-	"token": true,
+	"token":                 true,
+	"password":              true,
+	"credential_secret":     true,
+	"secret":                true,
+	"secret_statements":     true,
+	"authorization":         true,
+	"aws_secret_access_key": true,
+	"session_token":         true,
 }
 
 func redactAttr(a slog.Attr) slog.Attr {
@@ -260,13 +268,48 @@ func parseLogLevel() slog.Level {
 	}
 }
 
+// loggingFlusher is the process-wide OTLP flush hook. InitLogging installs
+// one; FlushLogging and the returned shutdown closure share its Once so
+// os.Exit drain paths and defer loggingShutdown() cannot double-Shutdown.
+type loggingFlusher struct {
+	once sync.Once
+	fn   func()
+}
+
+var currentFlusher atomic.Pointer[loggingFlusher]
+
+// installLoggingFlusher replaces the process flush hook. Tests use it to
+// inject a counter; InitLogging uses it for the real provider.Shutdown.
+func installLoggingFlusher(fn func()) func() {
+	currentFlusher.Store(&loggingFlusher{fn: fn})
+	return FlushLogging
+}
+
+// FlushLogging flushes the OTLP batch processor (5s timeout). It is
+// idempotent and a no-op when export was never enabled. Call only from
+// the listed drain os.Exit paths — BatchProcessor already exports ~1s, so
+// this is tail-of-process insurance for the last shutdown line.
+func FlushLogging() {
+	f := currentFlusher.Load()
+	if f == nil {
+		return
+	}
+	f.once.Do(func() {
+		if f.fn == nil {
+			return
+		}
+		f.fn()
+	})
+}
+
 // InitLogging configures slog to send logs to PostHog via OTLP when
 // POSTHOG_API_KEY is set. Additional PostHog projects can be targeted by
 // setting ADDITIONAL_POSTHOG_API_KEYS to a comma-separated list of API keys.
 // Logs always go to stderr; PostHog is additive.
-// The log level is controlled by DUCKGRES_LOG_LEVEL (debug, info, warn, error).
+// Stderr level is DUCKGRES_LOG_LEVEL (debug, info, warn, error; default info).
+// PostHog is independently DUCKGRES_POSTHOG_LOG_LEVEL (default warn).
 // Returns a shutdown function that flushes all OTLP batch processors.
-func InitLogging() func() {
+func InitLogging(bi BuildInfo) func() {
 	level := parseLogLevel()
 
 	apiKey := os.Getenv("POSTHOG_API_KEY")
@@ -276,7 +319,7 @@ func InitLogging() func() {
 		}
 		slog.SetDefault(slog.New(&RedactingHandler{Inner: newStderrStampedHandler(level)}))
 		fmt.Fprintln(os.Stderr, "PostHog logging disabled (POSTHOG_API_KEY not set)")
-		return func() {}
+		return installLoggingFlusher(nil)
 	}
 	fmt.Fprintln(os.Stderr, "PostHog logging enabled, configuring OTLP exporter...")
 
@@ -310,7 +353,7 @@ func InitLogging() func() {
 	if primaryExp == nil {
 		slog.SetDefault(slog.New(&RedactingHandler{Inner: newStderrStampedHandler(level)}))
 		fmt.Fprintln(os.Stderr, "Primary PostHog exporter failed to initialize, continuing with stderr only")
-		return func() {}
+		return installLoggingFlusher(nil)
 	}
 	processors := []sdklog.LoggerProviderOption{
 		sdklog.WithProcessor(sdklog.NewBatchProcessor(primaryExp)),
@@ -323,25 +366,25 @@ func InitLogging() func() {
 		processors = append(processors, sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)))
 	}
 
-	res := otelResource()
+	res := otelResource(bi)
 
 	opts := append(processors, sdklog.WithResource(res))
 	provider := sdklog.NewLoggerProvider(opts...)
 
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
+	posthog := newPostHogBranch(otelHandler, parsePostHogLogLevel(), parsePostHogInfoSample(), parsePostHogQueryText())
 
 	slog.SetDefault(slog.New(&RedactingHandler{Inner: &multiHandler{
-		handlers: []slog.Handler{newStderrStampedHandler(level), otelHandler},
+		handlers: []slog.Handler{newStderrStampedHandler(level), posthog},
 	}}))
 
 	slog.Info("PostHog logging enabled.", "host", host, "exporters", len(processors))
 
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = provider.Shutdown(ctx)
-		})
-	}
+	return installLoggingFlusher(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := provider.Shutdown(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to flush PostHog logs: %v\n", err)
+		}
+	})
 }
