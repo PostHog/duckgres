@@ -239,6 +239,12 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	// hit/miss accounting and the log line.
 	var nLocal, nPeer, nOrigin int64
 	var missRunStart int64 = -1
+	// Summary mode bounds direct peer I/O across the entire block request, not
+	// merely per block. Remaining block misses safely coalesce to origin.
+	summaryGetsLeft := 2
+	summaryLookupRecorded := false
+	summaryCtx, cancelSummary := context.WithTimeout(r.Context(), peerHasTimeout)
+	defer cancelSummary()
 	flushRun := func(runEnd int64) bool {
 		if missRunStart < 0 {
 			return true
@@ -314,7 +320,26 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		if p.peers != nil {
 			peerStart := time.Now()
 			ok := false
-			if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {
+			if p.peers.lookupMode == peerLookupSummary {
+				if !summaryLookupRecorded {
+					peerFetchesTotal.Inc()
+					summaryLookupRecorded = true
+				}
+				for _, holder := range p.peers.SummaryCandidates(key, time.Now()) {
+					if summaryGetsLeft == 0 || summaryCtx.Err() != nil {
+						break
+					}
+					summaryGetsLeft--
+					_, ok = p.peers.FetchFromPeer(summaryCtx, holder, key, false, func(rd io.Reader) (int64, error) {
+						return p.store.PutStream(key, rd)
+					})
+					if ok {
+						peerDirectGetsTotal.WithLabelValues("success").Inc()
+						break
+					}
+					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
+				}
+			} else if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {
 				_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) {
 					return p.store.PutStream(key, rd)
 				})

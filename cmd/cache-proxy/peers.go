@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -54,6 +55,16 @@ type PeerManager struct {
 	peerPort     string       // port for peer API (e.g. ":8081")
 	client       *http.Client // /cache/has probes (short whole-request timeout)
 	streamClient *http.Client // /cache/get transfers (header deadline, no body timeout)
+	lookupMode   peerLookupMode
+	identity     string
+
+	summaries       summaryStore
+	summaryMu       sync.Mutex // protects current local summary and generation
+	localSummary    []byte
+	generation      uint64
+	publisherCancel context.CancelFunc
+	pushPermits     chan struct{}
+	backgroundCtx   context.Context
 
 	mu    sync.RWMutex
 	peers []string // peer addresses (ip:port)
@@ -77,7 +88,15 @@ func NewPeerManager(serviceName, peerPort string) *PeerManager {
 				ResponseHeaderTimeout: peerGetResponseHeaderLimit,
 			},
 		},
+		lookupMode:  peerLookupProbe,
+		summaries:   summaryStore{records: make(map[string]summaryRecord)},
+		pushPermits: make(chan struct{}, maxSummaryPushes),
 	}
+}
+
+func (pm *PeerManager) ConfigureSummary(mode peerLookupMode, identity string) {
+	pm.lookupMode = mode
+	pm.identity = identity
 }
 
 // WatchEndpoints periodically resolves the headless Service DNS to
@@ -128,11 +147,223 @@ func (pm *PeerManager) resolve() {
 	}
 
 	pm.mu.Lock()
+	old := make(map[string]struct{}, len(pm.peers))
+	for _, peer := range pm.peers {
+		old[peer] = struct{}{}
+	}
 	pm.peers = peers
 	pm.mu.Unlock()
+	pm.summaries.removeNonMembers(pm.isMember, time.Now())
+	pm.updateSummaryGauges()
+	if pm.lookupMode == peerLookupSummary && len(pm.localSummaryCopy()) > 0 {
+		for _, peer := range peers {
+			if _, existed := old[peer]; !existed {
+				pm.schedulePush(peer, pm.localSummaryCopy())
+			}
+		}
+	}
 
 	if len(peers) > 0 {
 		slog.Debug("Discovered peers.", "count", len(peers), "peers", peers)
+	}
+}
+
+func (pm *PeerManager) isMember(peer string) bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for _, p := range pm.peers {
+		if p == peer {
+			return true
+		}
+	}
+	return false
+}
+
+func (pm *PeerManager) memberForRemoteAddr(remote string) (string, bool) {
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		return "", false
+	}
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	for _, peer := range pm.peers {
+		peerHost, _, err := net.SplitHostPort(peer)
+		if err == nil && peerHost == host {
+			return peer, true
+		}
+	}
+	return "", false
+}
+
+func (pm *PeerManager) localSummaryCopy() []byte {
+	pm.summaryMu.Lock()
+	defer pm.summaryMu.Unlock()
+	return append([]byte(nil), pm.localSummary...)
+}
+
+// ReceiveSummary validates an untrusted peer payload before atomically
+// replacing that peer's prior hint. It intentionally logs neither body nor
+// cache keys.
+func (pm *PeerManager) ReceiveSummary(sender string, body []byte, now time.Time) error {
+	err := pm.summaries.receive(sender, body, now, pm.isMember)
+	if err != nil {
+		summaryReceiptsTotal.WithLabelValues("rejected").Inc()
+		return err
+	}
+	summaryReceiptsTotal.WithLabelValues("accepted").Inc()
+	pm.updateSummaryGauges()
+	return nil
+}
+
+func (pm *PeerManager) summaryCount() int {
+	pm.summaries.mu.RLock()
+	defer pm.summaries.mu.RUnlock()
+	return len(pm.summaries.records)
+}
+func (pm *PeerManager) updateSummaryGauges() {
+	pm.summaries.mu.RLock()
+	n, b := len(pm.summaries.records), pm.summaries.bytes
+	pm.summaries.mu.RUnlock()
+	summaryResidentCount.Set(float64(n))
+	summaryResidentBytes.Set(float64(b))
+}
+
+// SummaryCandidates is strictly local: it does no /cache/has I/O. It returns
+// deterministic positive peers, at most two of which a caller may contact.
+func (pm *PeerManager) SummaryCandidates(cacheKey string, now time.Time) []string {
+	pm.summaries.removeNonMembers(pm.isMember, now)
+	pm.updateSummaryGauges()
+	pm.summaries.mu.RLock()
+	n := len(pm.summaries.records)
+	pm.summaries.mu.RUnlock()
+	if n == 0 {
+		summaryLookupTotal.WithLabelValues("no_valid_summary").Inc()
+		return nil
+	}
+	peers := pm.summaries.candidates(cacheKey, now)
+	if len(peers) == 0 {
+		summaryLookupTotal.WithLabelValues("no_positive").Inc()
+		return nil
+	}
+	summaryLookupTotal.WithLabelValues("positive_candidate").Inc()
+	if len(peers) > 2 {
+		peers = peers[:2]
+	}
+	return peers
+}
+
+// StartSummaryPublisher owns a cancellable background publisher. Publication
+// work is bounded and never runs on a request goroutine.
+func (pm *PeerManager) StartSummaryPublisher(ctx context.Context, store *DiskCache) {
+	if pm.lookupMode != peerLookupSummary {
+		return
+	}
+	ctx, pm.publisherCancel = context.WithCancel(ctx)
+	pm.backgroundCtx = ctx
+	go func() {
+		pm.publish(ctx, store)
+		for {
+			// Deterministic jitter avoids a fleet-wide synchronized burst.
+			delay := defaultSummaryInterval + time.Duration(time.Now().UnixNano()%int64(defaultSummaryInterval/5))
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+				pm.publish(ctx, store)
+			}
+		}
+	}()
+}
+
+func (pm *PeerManager) StopSummaryPublisher() {
+	if pm.publisherCancel != nil {
+		pm.publisherCancel()
+	}
+}
+
+func (pm *PeerManager) publish(ctx context.Context, store *DiskCache) {
+	keys, ok := store.SnapshotKeys(maxSummaryItems)
+	if !ok {
+		summaryPushesTotal.WithLabelValues("snapshot_too_large").Inc()
+		return
+	}
+	pm.summaryMu.Lock()
+	pm.generation++
+	generation := pm.generation
+	pm.summaryMu.Unlock()
+	s, err := newCacheSummary(pm.identity, generation, keys, time.Now(), defaultSummaryTTL)
+	if err != nil {
+		summaryPushesTotal.WithLabelValues("build_error").Inc()
+		return
+	}
+	body, err := s.MarshalBinary()
+	if err != nil {
+		summaryPushesTotal.WithLabelValues("build_error").Inc()
+		return
+	}
+	pm.summaryMu.Lock()
+	pm.localSummary = append(pm.localSummary[:0], body...)
+	pm.summaryMu.Unlock()
+	pm.mu.RLock()
+	peers := append([]string(nil), pm.peers...)
+	pm.mu.RUnlock()
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+			select {
+			case pm.pushPermits <- struct{}{}:
+				defer func() { <-pm.pushPermits }()
+			case <-ctx.Done():
+				return
+			}
+			pm.pushSummary(ctx, peer, body)
+		}(peer)
+	}
+	wg.Wait()
+}
+
+func (pm *PeerManager) pushSummary(ctx context.Context, peer string, body []byte) {
+	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, peerHasTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+peer+"/cache/summary", bytes.NewReader(body))
+	if err != nil {
+		summaryPushesTotal.WithLabelValues("error").Inc()
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Cache-Proxy-ID", pm.identity)
+	resp, err := pm.client.Do(req)
+	if err != nil {
+		summaryPushesTotal.WithLabelValues(peerProbeErrorOutcome(err)).Inc()
+		return
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		summaryPushesTotal.WithLabelValues("success").Inc()
+	} else {
+		summaryPushesTotal.WithLabelValues("rejected").Inc()
+	}
+}
+
+// schedulePush is deliberately lossy when all permits are busy. There is no
+// retry queue; the next periodic generation retries delivery.
+func (pm *PeerManager) schedulePush(peer string, body []byte) {
+	select {
+	case pm.pushPermits <- struct{}{}:
+		ctx := pm.backgroundCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		go func() { defer func() { <-pm.pushPermits }(); pm.pushSummary(ctx, peer, body) }()
+	default:
+		summaryPushesTotal.WithLabelValues("concurrency_limited").Inc()
 	}
 }
 

@@ -98,6 +98,16 @@ func main() {
 	peerAddr := envOrDefault("PEER_ADDR", ":8081")
 	healthAddr := envOrDefault("HEALTH_ADDR", ":8082")
 	peerService := os.Getenv("PEER_SERVICE") // headless K8s service for peer discovery
+	lookupMode, err := parsePeerLookupMode(os.Getenv("CACHE_PEER_LOOKUP_MODE"))
+	if err != nil {
+		slog.Error("Invalid cache peer lookup mode.", "error", err)
+		return
+	}
+	hostname, _ := os.Hostname()
+	identity := envOrDefault("CACHE_PROXY_ID", envOrDefault("POD_NAME", envOrDefault("NODE_NAME", hostname)))
+	if identity == "" {
+		identity = peerAddr
+	}
 
 	// Comma-separated Host substrings we should cache. Anything else is tunneled
 	// or forwarded without caching. Empty means "cache everything" (legacy).
@@ -117,6 +127,7 @@ func main() {
 		"peer_listen", peerAddr,
 		"health", healthAddr,
 		"peer_service", peerService,
+		"peer_lookup_mode", lookupMode,
 		"cache_host_suffixes", cacheHostSuffixes,
 	)
 
@@ -146,10 +157,14 @@ func main() {
 	}()
 
 	// Initialize peer manager
+	rootCtx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
 	var peers *PeerManager
 	if peerService != "" {
 		peers = NewPeerManager(peerService, peerAddr)
-		go peers.WatchEndpoints(context.Background())
+		peers.ConfigureSummary(lookupMode, identity)
+		peers.StartSummaryPublisher(rootCtx, store)
+		go peers.WatchEndpoints(rootCtx)
 	}
 
 	proxy := NewCacheProxy(store, peers, cacheHostSuffixes)
@@ -165,6 +180,7 @@ func main() {
 	peerMux := http.NewServeMux()
 	peerMux.HandleFunc("/cache/has", proxy.HandlePeerHas)
 	peerMux.HandleFunc("/cache/get", proxy.HandlePeerGet)
+	peerMux.HandleFunc("/cache/summary", proxy.HandlePeerSummary)
 	peerServer := &http.Server{Addr: peerAddr, Handler: peerMux}
 
 	// Health + metrics
@@ -209,6 +225,10 @@ func main() {
 	<-sigCh
 
 	slog.Info("Shutting down...")
+	stopBackground()
+	if peers != nil {
+		peers.StopSummaryPublisher()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = s3Server.Shutdown(ctx)

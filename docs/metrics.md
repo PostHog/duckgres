@@ -238,9 +238,15 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_hits_total` | Counter | None | Worker-facing cacheable requests served entirely from data already present on local NVMe. Peer API reads and requests that first fetch any block from a peer are excluded. |
 | `cache_proxy_misses_total` | Counter | None | Worker-facing cacheable requests that require a peer or origin fill before they can be served. |
 | `cache_proxy_bytes_served_total` | Counter | `source` | Directional byte mix by `local`, `peer`, or `s3`. Block mode counts assembled response bytes under the slowest source used; the legacy exact-range path counts the local read or deduplicated fill once, so this is not an exact client-egress counter. |
-| `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups. One lookup can issue multiple physical `/cache/has` probes. |
+| `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups in either mode. |
 | `cache_proxy_peer_hits_total` | Counter | None | Logical peer lookups followed by a successful peer body transfer. |
-| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical peer availability probe attempts, classified as `hit`, `miss`, `timeout`, `canceled`, or `error`. Both a present entry (`200`) and an in-flight claim (`202`) are `hit`; `canceled` normally means a losing probe was released after another peer answered and is not itself a failure. |
+| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical `/cache/has` attempts only. It stays zero for pushed-summary lookups. |
+| `cache_proxy_summary_pushes_total` | Counter | `outcome` | Bounded summary publication outcomes. |
+| `cache_proxy_summary_receipts_total` | Counter | `outcome` | Accepted or rejected peer summary bodies. |
+| `cache_proxy_summary_resident_count` / `cache_proxy_summary_resident_bytes` | Gauge | None | Current bounded peer-summary state. |
+| `cache_proxy_summary_age_seconds` | Histogram | None | Age of summaries used in local Bloom lookups. |
+| `cache_proxy_summary_lookups_total` | Counter | `outcome` | `no_valid_summary`, `no_positive`, or `positive_candidate`. |
+| `cache_proxy_peer_direct_gets_total` | Counter | `outcome` | Bounded direct peer GET outcomes in summary mode. |
 
 Cache-proxy metrics deliberately have no org label. Use the existing per-org
 Duckgres query and worker-acquisition metrics for customer-facing rollout

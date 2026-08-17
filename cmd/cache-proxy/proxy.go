@@ -419,7 +419,24 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) (fetchResult, error) {
 	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
-			if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
+			if p.peers.lookupMode == peerLookupSummary {
+				// One logical lookup consists entirely of local Bloom tests and
+				// at most two direct GETs under a shared deadline.
+				peerFetchesTotal.Inc()
+				peerCtx, cancel := context.WithTimeout(r.Context(), peerHasTimeout)
+				defer cancel()
+				for _, holder := range p.peers.SummaryCandidates(cacheKey, time.Now()) {
+					res, ok := p.fetchFromPeer(holder, false, cacheKey, r.WithContext(peerCtx))
+					if ok {
+						peerDirectGetsTotal.WithLabelValues("success").Inc()
+						return res, nil
+					}
+					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
+					if peerCtx.Err() != nil {
+						break
+					}
+				}
+			} else if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
 				res, ok := p.fetchFromPeer(holder, flight, cacheKey, r)
 				if ok {
 					return res, nil
@@ -900,6 +917,29 @@ func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNotFound)
+}
+
+// HandlePeerSummary receives best-effort Bloom hints over the existing peer
+// transport. That transport is currently unauthenticated; membership checks
+// merely avoid retaining unsolicited state and are not an auth boundary.
+func (p *CacheProxy) HandlePeerSummary(w http.ResponseWriter, r *http.Request) {
+	if p.peers == nil || p.peers.lookupMode != peerLookupSummary || r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return
+	}
+	defer func() { _ = r.Body.Close() }()
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSummaryBodyBytes))
+	if err != nil {
+		summaryReceiptsTotal.WithLabelValues("rejected").Inc()
+		http.Error(w, "summary too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	peer, ok := p.peers.memberForRemoteAddr(r.RemoteAddr)
+	if !ok || p.peers.ReceiveSummary(peer, body, time.Now()) != nil {
+		http.Error(w, "invalid summary", http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // HandlePeerGet returns cached data to a peer. With flight=1 and the key not

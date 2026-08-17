@@ -255,6 +255,25 @@ func (c *DiskCache) Has(key string) bool {
 	return ok
 }
 
+// SnapshotKeys returns a bounded, point-in-time copy of opaque cache keys.
+// It never exposes URLs or paths and holds the request-path mutex for at most
+// maxItems map iterations; the Bloom filter is built after the lock is gone.
+func (c *DiskCache) SnapshotKeys(maxItems int) ([]string, bool) {
+	if maxItems <= 0 {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.index) > maxItems {
+		return nil, false
+	}
+	keys := make([]string, 0, len(c.index))
+	for key := range c.index {
+		keys = append(keys, key)
+	}
+	return keys, true
+}
+
 // Touch marks a key as most recently used without serving it. HandlePeerHas
 // uses it: a peer /cache/has probe counts as an access, so an entry that is
 // popular with peers is not evicted as "least recently used" while it is in

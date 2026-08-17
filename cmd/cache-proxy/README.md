@@ -12,6 +12,8 @@ available, and forwards cache misses to origin object storage.
 | `CACHE_MAX_PERCENT` | `80` | Ceiling for the cache's share of the cache filesystem, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute: when something outside the cache consumes disk, the budget only ever shrinks, so the cache never evicts healthy entries to make room for writes the disk can't take. |
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
+| `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` preserves the existing `/cache/has` fanout. `summary` uses periodically pushed Bloom-filter hints and performs at most two direct peer GETs per request; any other value causes startup to fail. |
+| `CACHE_PROXY_ID` | pod name, node name, then hostname | Stable opaque proxy identity carried in summary metadata; it must not be a customer or object identifier. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
 | `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. |
 | `CACHE_BLOCK_MODE` | `off` | `on` enables block-aligned caching; any other value (including unset) keeps the legacy exact-range path. See [Block-aligned mode](#block-aligned-mode). |
@@ -21,6 +23,33 @@ available, and forwards cache misses to origin object storage.
 | `OTEL_EXPORTER_OTLP_TRACES_PATH` | empty | Overrides the OTLP path (e.g. VictoriaTraces' `/insert/opentelemetry/v1/traces`). Mirrors the main duckgres binary. |
 
 ## Cluster-wide fetch dedup
+
+### Pushed-summary lookup mode
+
+Set `CACHE_PEER_LOOKUP_MODE=summary` only after deploying an image containing
+the summary endpoint to every cache-proxy pod. Each proxy snapshots at most
+1,000,000 opaque SHA-256 cache locators, builds a versioned Bloom filter at a
+1% target false-positive rate, and publishes it with a 45-second TTL about
+every 20 seconds (with jitter). The uncompressed summary body is capped at
+16 MiB; an oversized snapshot is skipped rather than truncated, so published
+filters never have false negatives for their source snapshot. At 1%, filters
+are about 1.20 bytes per entry: roughly 117 KiB for 100k entries and 1.14 MiB
+for 1m entries, plus small metadata and wire encoding overhead.
+
+On a local miss the requester tests received, non-expired filters locally. No
+positive hint goes straight to origin. Positive hints are ranked by the opaque
+locator and stable proxy identity, then at most two peers receive a direct
+`/cache/get`; 404s, timeouts, stale hints, incompatible peers, and missing
+summaries all safely fall back to origin. There is no cache-body replication.
+The peer transport is the existing internal HTTP boundary and does not itself
+provide authentication; membership validation only bounds retained hints.
+
+Roll out in non-production first. During a rolling enablement, missing
+summaries reduce peer hits but remain safe. Validate that peer probes per
+logical lookup approach zero, direct peer GET attempts stay at or below two,
+peer bytes remain useful, origin latency/bytes do not regress excessively,
+and summary memory/publication traffic remain bounded. Recover by restoring
+`CACHE_PEER_LOOKUP_MODE=probe`; do not delete cache contents.
 
 When several nodes want the same key at the same moment, only the first to
 start the fill should ever hit the origin. The peer API makes each node's
