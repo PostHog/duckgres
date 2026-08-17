@@ -79,6 +79,38 @@ func TestStampActiveOrgLabelIdempotent(t *testing.T) {
 	}
 }
 
+func TestStampPlacementOrgLabelPreservesActiveOrgAuthorization(t *testing.T) {
+	const (
+		ns      = "duckgres"
+		podName = "duckgres-cp-worker-8"
+		orgID   = "tenant-alpha"
+	)
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name:      podName,
+		Namespace: ns,
+		Labels: map[string]string{
+			activeOrgLabelKey: "network-policy-org",
+		},
+	}}
+	cs := fake.NewSimpleClientset(pod)
+	a := &SharedWorkerActivator{clientset: cs, defaultNamespace: ns}
+
+	// Activation and credential refresh both run this best-effort stamp.
+	a.stampPlacementOrgLabel(context.Background(), podName, orgID)
+	a.stampPlacementOrgLabel(context.Background(), podName, orgID)
+
+	got, err := cs.CoreV1().Pods(ns).Get(context.Background(), podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get pod: %v", err)
+	}
+	if got.Labels[placementOrgLabelKey] != orgID {
+		t.Fatalf("placement label = %q, want %q", got.Labels[placementOrgLabelKey], orgID)
+	}
+	if got.Labels[activeOrgLabelKey] != "network-policy-org" {
+		t.Fatalf("placement stamp changed active-org authorization label: %#v", got.Labels)
+	}
+}
+
 // TestStampActiveOrgLabelSwallowsErrors verifies the patch is best-effort:
 // a Patch failure (e.g. pod was just retired and 404s) must not panic or
 // surface back to the activation caller.

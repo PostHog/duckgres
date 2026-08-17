@@ -150,6 +150,26 @@ func TestValidateWorkerBackendConfig(t *testing.T) {
 	}
 }
 
+func TestValidateK8sWorkerOrgAffinityConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		weight  int
+		wantErr bool
+	}{
+		{name: "minimum", weight: 1},
+		{name: "maximum", weight: 100},
+		{name: "zero", weight: 0, wantErr: true},
+		{name: "too large", weight: 101, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateK8sWorkerOrgAffinityConfig(ControlPlaneConfig{K8s: K8sConfig{WorkerOrgAffinityWeight: tt.weight}})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validateK8sWorkerOrgAffinityConfig(weight=%d) error = %v, wantErr %v", tt.weight, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCheckSocketDirWritable(t *testing.T) {
 	// Happy path: writable directory
 	tmpDir := t.TempDir()
