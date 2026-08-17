@@ -1427,6 +1427,25 @@ assert_worker_pod() { # org password
   [ "$gml" = "$want_gomem" ] || fail "unsized worker $pod ($dcpu/$dmem) GOMEMLIMIT='$gml' want '$want_gomem' (1/8 of pod memory)"
   thr="$worker_threads"
   [ "$thr" = "$want_threads" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_THREADS='$thr' want '$want_threads' (2.5x CPU, rounded up)"
+
+  # PostHog Logs plumbing — not ingest. The Job cannot read PostHog (same
+  # reason as product-analytics events). A plaintext POSTHOG_API_KEY value:
+  # on the worker is always a regression. secretKeyRef copy is asserted only
+  # when the CP named env already has one (charts follow-up); until then this
+  # branch is skipped and the plaintext assert still runs.
+  worker_ph_val="$(k get pod "$pod" -o jsonpath='{range .spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="POSTHOG_API_KEY")]}{.value}{end}' 2>/dev/null || true)"
+  [ -z "$worker_ph_val" ] || fail "worker $pod has plaintext POSTHOG_API_KEY value (must be secretKeyRef or omitted)"
+  cp_pod="$(k get pod -l app=duckgres-control-plane --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [ -n "$cp_pod" ]; then
+    cp_ph_name="$(k get pod "$cp_pod" -o jsonpath='{range .spec.containers[*].env[?(@.name=="POSTHOG_API_KEY")]}{.valueFrom.secretKeyRef.name}{end}' 2>/dev/null || true)"
+    cp_ph_key="$(k get pod "$cp_pod" -o jsonpath='{range .spec.containers[*].env[?(@.name=="POSTHOG_API_KEY")]}{.valueFrom.secretKeyRef.key}{end}' 2>/dev/null || true)"
+    if [ -n "$cp_ph_name" ] && [ -n "$cp_ph_key" ]; then
+      w_ph_name="$(k get pod "$pod" -o jsonpath='{range .spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="POSTHOG_API_KEY")]}{.valueFrom.secretKeyRef.name}{end}' 2>/dev/null || true)"
+      w_ph_key="$(k get pod "$pod" -o jsonpath='{range .spec.containers[?(@.name=="duckdb-worker")].env[?(@.name=="POSTHOG_API_KEY")]}{.valueFrom.secretKeyRef.key}{end}' 2>/dev/null || true)"
+      [ "$w_ph_name" = "$cp_ph_name" ] && [ "$w_ph_key" = "$cp_ph_key" ] \
+        || fail "worker $pod POSTHOG_API_KEY secretKeyRef '$w_ph_name/$w_ph_key' != CP $cp_pod '$cp_ph_name/$cp_ph_key'"
+    fi
+  fi
 }
 
 # ---- worker sizing (TTL-pool model) ---------------------------------------
