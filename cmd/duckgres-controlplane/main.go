@@ -142,11 +142,13 @@ func main() {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
-	loggingShutdown := cliboot.InitLogging()
+	_ = os.Setenv("DUCKGRES_MODE", *mode)
+	bi := buildInfo()
+	loggingShutdown := cliboot.InitLogging(bi)
 	defer loggingShutdown()
 	analyticsShutdown := cliboot.InitAnalytics()
 	defer analyticsShutdown()
-	tracingShutdown := cliboot.InitTracing()
+	tracingShutdown := cliboot.InitTracing(bi)
 	defer tracingShutdown()
 
 	buildInfo().Log(*mode)
@@ -242,8 +244,8 @@ func main() {
 		ConfigPollInterval:         resolved.ConfigPollInterval,
 		InternalSecret:             resolved.InternalSecret,
 		InternalSecretFallbacks:    resolved.InternalSecretFallbacks,
-		ReadOnlySecret:            resolved.ReadOnlySecret,
-		ReadOnlySecretFallbacks:   resolved.ReadOnlySecretFallbacks,
+		ReadOnlySecret:             resolved.ReadOnlySecret,
+		ReadOnlySecretFallbacks:    resolved.ReadOnlySecretFallbacks,
 		SNIRoutingMode:             resolved.SNIRoutingMode,
 		ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 		MetadataHostnameSuffixes:   resolved.MetadataHostnameSuffixes,
@@ -266,8 +268,6 @@ func main() {
 			WorkerNodeSelector:           resolved.K8sWorkerNodeSelector,
 			WorkerTolerationKey:          resolved.K8sWorkerTolerationKey,
 			WorkerTolerationValue:        resolved.K8sWorkerTolerationValue,
-			WorkerOrgAffinityEnabled:     resolved.K8sWorkerOrgAffinityEnabled,
-			WorkerOrgAffinityWeight:      resolved.K8sWorkerOrgAffinityWeight,
 			AllowClientWorkerProfile:     resolved.K8sAllowClientWorkerProfile,
 			WorkerPriorityClassName:      resolved.K8sWorkerPriorityClassName,
 			PlaceholderImage:             resolved.K8sPlaceholderImage,

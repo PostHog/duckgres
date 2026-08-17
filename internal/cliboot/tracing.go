@@ -18,7 +18,7 @@ import (
 // When no endpoint is configured, the global TracerProvider remains the
 // default no-op, adding zero overhead.
 // Returns a shutdown function that flushes the batch span processor.
-func InitTracing() func() {
+func InitTracing(bi BuildInfo) func() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
 	if endpoint == "" {
 		endpoint = os.Getenv("DUCKGRES_TRACE_ENDPOINT")
@@ -44,7 +44,7 @@ func InitTracing() func() {
 		return func() {}
 	}
 
-	res := otelResource()
+	res := otelResource(bi)
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),

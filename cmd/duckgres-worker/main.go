@@ -178,9 +178,10 @@ func main() {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
-	loggingShutdown := cliboot.InitLogging()
+	bi := buildInfo()
+	loggingShutdown := cliboot.InitLogging(bi)
 	defer loggingShutdown()
-	tracingShutdown := cliboot.InitTracing()
+	tracingShutdown := cliboot.InitTracing(bi)
 	defer tracingShutdown()
 
 	// Surface the running build identity for kubectl-logs triage. "worker"
