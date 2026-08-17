@@ -787,6 +787,11 @@ if [[ "$*" == *"get pods -l app=duckgres-worker,duckgres/active-org=test-org"* ]
   esac
   exit 0
 fi
+if [[ "$*" == *"POSTHOG_API_KEY"* ]]; then
+  # Fixture workers have no PostHog env. Empty output is the success case
+  # for the plaintext-forbidden assert (and skips the secretKeyRef copy).
+  exit 0
+fi
 if [[ "$*" == *"get pod stale-worker"* ]]; then
   echo 'Error from server (NotFound): pods "stale-worker" not found' >&2
   exit 1
