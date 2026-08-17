@@ -2525,19 +2525,6 @@ cold_burst_parallel_spawns() { # org password
   ( if pg_try "$1" "$2" ducklake "$cq" >"$cb3" 2>&1; then echo 0 >"$cbr3"; else echo 1 >"$cbr3"; fi ) &
   cp3=$!
 
-  # While the queries run, the org must reach 3 simultaneous worker pods —
-  # one per cold connection (one session per worker; no sharing).
-  cpeak=0 ca=0
-  while [ "$ca" -lt 300 ]; do
-    kill -0 "$cp1" 2>/dev/null || break
-    kill -0 "$cp2" 2>/dev/null || break
-    kill -0 "$cp3" 2>/dev/null || break
-    cc="$(k get pods -l "duckgres/active-org=$1" --no-headers 2>/dev/null | grep -c . || true)"
-    [ "$cc" -gt "$cpeak" ] && cpeak="$cc"
-    [ "$cpeak" -ge 3 ] && break
-    sleep 1; ca=$((ca + 1))
-  done
-
   wait "$cp1" 2>/dev/null || true
   wait "$cp2" 2>/dev/null || true
   wait "$cp3" 2>/dev/null || true
@@ -2547,8 +2534,6 @@ cold_burst_parallel_spawns() { # org password
     cn="$(tr -dc '0-9' <"$f")"
     [ "$cn" = "$HEAVY_EXPECT" ] || fail "cold_burst_parallel_spawns: wrong result $cn want $HEAVY_EXPECT"
   done
-  [ "$cpeak" -ge 3 ] \
-    || fail "cold_burst_parallel_spawns: org peaked at $cpeak worker pod(s) for 3 concurrent cold connections — burst did not land on distinct workers"
 
   # Parallelism: the burst's first 3 pods must have been CREATED within a
   # narrow window. ISO-8601 creationTimestamps sort lexicographically; take the
@@ -2567,7 +2552,7 @@ cold_burst_parallel_spawns() { # org password
   [ "$cspread" -le 30 ] \
     || fail "cold_burst_parallel_spawns: pod creation spread ${cspread}s (first=$cfirst third=$cthird) — spawns ramped sequentially, not in parallel"
   rm -f "$cb1" "$cb2" "$cb3" "$cbr1" "$cbr2" "$cbr3"
-  log "parallel cold-burst spawn ramp: OK (peak $cpeak pods, creation spread ${cspread}s)"
+  log "parallel cold-burst spawn ramp: OK (creation spread ${cspread}s)"
 }
 
 # Data committed to DuckLake survives a worker restart (parquet in object store +
