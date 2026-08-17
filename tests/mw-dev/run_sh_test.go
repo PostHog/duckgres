@@ -853,8 +853,11 @@ exit 1
 	if got := strings.Count(callLog, "get pod transitioned-worker"); got != 1 {
 		t.Fatalf("terminal transition inspections = %d, want 1; calls:\n%s", got, callLog)
 	}
-	if got := strings.Count(callLog, "get pod replacement-worker"); got != 1 {
-		t.Fatalf("replacement inspection reads = %d, want 1 atomic snapshot; calls:\n%s", got, callLog)
+	if got := strings.Count(callLog, "get pod replacement-worker -o jsonpath={.metadata.deletionTimestamp"); got != 1 {
+		t.Fatalf("replacement inspection snapshots = %d, want 1; calls:\n%s", got, callLog)
+	}
+	if !strings.Contains(callLog, "get pod replacement-worker -o jsonpath={range .spec.containers") {
+		t.Fatalf("did not run plaintext POSTHOG_API_KEY check on replacement; calls:\n%s", callLog)
 	}
 }
 
