@@ -14,6 +14,7 @@ import { api, ApiError } from "@/lib/api";
 import { orgLabel } from "@/lib/format";
 import { POLL } from "@/lib/query";
 import { useRevealedCount } from "@/lib/logReplay";
+import { warehouseNeedsPolling } from "@/lib/warehouseLifecycle";
 import { useIdentity } from "@/components/IdentityProvider";
 import type {
   AuditEntry,
@@ -118,6 +119,8 @@ export function useOrgs() {
   return useQuery<Org[]>({
     queryKey: ["orgs"],
     queryFn: () => tolerate404<Org[]>([])(api.listOrgs()),
+    refetchInterval: (q) =>
+      q.state.data?.some((org) => warehouseNeedsPolling(org.warehouse?.state)) ? POLL.normal : false,
   });
 }
 
@@ -169,6 +172,7 @@ export function useWarehouse(id: string | undefined) {
     queryKey: ["orgs", id, "warehouse"],
     queryFn: () => tolerate404<ManagedWarehouse | null>(null)(api.getWarehouse(id!)),
     enabled: !!id,
+    refetchInterval: (q) => (warehouseNeedsPolling(q.state.data?.state) ? POLL.normal : false),
   });
 }
 

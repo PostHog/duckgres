@@ -106,8 +106,8 @@ function warehouse(metadataProxyEnabled: boolean): ManagedWarehouse {
   } as ManagedWarehouse;
 }
 
-function renderPage(metadataProxyEnabled: boolean) {
-  hooks.useWarehouse.mockReturnValue(ok(warehouse(metadataProxyEnabled)));
+function renderPage(metadataProxyEnabled: boolean, warehouseOverrides: Partial<ManagedWarehouse> = {}) {
+  hooks.useWarehouse.mockReturnValue(ok({ ...warehouse(metadataProxyEnabled), ...warehouseOverrides }));
   render(
     <MemoryRouter initialEntries={["/orgs/acme"]}>
       <TooltipProvider>
@@ -148,6 +148,33 @@ describe("Org detail", () => {
     expect(within(headline).getByText("posthog")).toBeInTheDocument();
     expect(within(headline).getByText("acme")).toBeInTheDocument();
     expect(within(headline).getByRole("button", { name: /copy acme/i })).toBeInTheDocument();
+  });
+
+  it("distinguishes ready infrastructure components from an operational readiness blocker", () => {
+    const blocker =
+      "Infrastructure is ready, but metadata-store authentication failed; the PostgreSQL role password may not match its credential Secret. Waiting for recovery.";
+    renderPage(false, {
+      state: "failed",
+      metadata_store_state: "ready",
+      s3_state: "ready",
+      identity_state: "ready",
+      secrets_state: "ready",
+      status_message: blocker,
+      failed_at: "2026-08-14T10:18:09Z",
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(within(alert).getByText("Warehouse is not operationally ready")).toBeInTheDocument();
+    expect(within(alert).getByText("Current blocker")).toBeInTheDocument();
+    expect(within(alert).getByText(blocker)).toBeInTheDocument();
+    expect(within(alert).getByText(/component badges reflect Duckling infrastructure/i)).toBeInTheDocument();
+    expect(within(alert).getByText(/recovery is checked automatically/i)).toBeInTheDocument();
+    expect(screen.getByText("Metadata store").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("S3").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("Identity").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("Secrets").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("Last ready")).toBeInTheDocument();
+    expect(screen.getByText("Last failed")).toBeInTheDocument();
   });
 
   it.each([

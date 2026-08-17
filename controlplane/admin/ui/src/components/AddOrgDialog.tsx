@@ -33,6 +33,7 @@ import {
 import { StateBadge } from "@/components/StateBadge";
 import { api } from "@/lib/api";
 import { databaseNameProblem } from "@/lib/databaseName";
+import { warehouseNeedsPolling } from "@/lib/warehouseLifecycle";
 import { useDatabaseNameAvailable, useWarehouseStatus } from "@/hooks/useApi";
 import type { ProvisionWarehouseBody, ProvisionWarehouseResult } from "@/types/api";
 
@@ -108,14 +109,15 @@ export function AddOrgDialog({ open, onClose }: { open: boolean; onClose: () => 
   const dbCheck = useDatabaseNameAvailable(trimmedDb, dbLookupEnabled);
   const dbTaken = dbCheck.data && !dbCheck.data.available;
 
-  // Optional post-submit watch of the asynchronous provisioning; stops polling
-  // at a terminal state.
+  // Optional post-submit watch of asynchronous provisioning. Failed is an
+  // observed state, not terminal: the backend can return to Ready after an
+  // externally repaired Duckling recovers, so keep polling it.
   const status = useWarehouseStatus(result?.org, {
     refetchInterval: watch ? 5_000 : false,
   });
   useEffect(() => {
     const s = status.data?.state;
-    if (s === "ready" || s === "failed") setWatch(false);
+    if (s && !warehouseNeedsPolling(s)) setWatch(false);
   }, [status.data?.state]);
 
   const reset = () => {

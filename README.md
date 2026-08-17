@@ -232,6 +232,7 @@ column cannot be added to a populated table).
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
+- [Managed Warehouse Provisioning Recovery](docs/runbooks/managed-warehouse-provisioning-recovery.md): Diagnose a failed warehouse whose Duckling dependencies were repaired and verify automatic convergence back to ready.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
 
@@ -1020,6 +1021,7 @@ Managed-warehouse contract notes:
 - The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared worker mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
 - Secret references only are stored in the config store. Secret material remains outside the database.
 - The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.
+- The Kubernetes provisioner polls every 10 seconds. A `failed` warehouse remains in its observation set: it stays failed while the Duckling, required status outputs, or worker-shaped metadata-store probe are unhealthy, and returns directly to `ready` after every readiness gate passes. The admin UI polls `pending`, `provisioning`, `failed`, and `deleting` warehouse rows every 5 seconds while they are visible.
 - Those state fields are open strings. Canonical values are `pending`, `provisioning`, `ready`, `failed`, `deleting`, and `deleted`, but callers may persist other values while workflows evolve.
 
 ## Two-Tier Query Processing
