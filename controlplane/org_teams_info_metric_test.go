@@ -20,6 +20,45 @@ func TestOrgTeamsInfoCollector(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	snap := &configstore.Snapshot{
 		Orgs: map[string]*configstore.OrgConfig{
+			"org-deleting": {
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					DucklingName: "org-deleting",
+					State:        configstore.ManagedWarehouseStateDeleting,
+				},
+			},
+			"org-failed": {
+				Teams: []configstore.OrgTeamConfig{
+					{TeamID: 12, SchemaName: "team_12", CreatedAt: t0},
+				},
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					DucklingName: "org-failed",
+					State:        configstore.ManagedWarehouseStateFailed,
+				},
+			},
+			"org-pending": {
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					DucklingName: "org-pending",
+					State:        configstore.ManagedWarehouseStatePending,
+				},
+			},
+			"org-provisioning": {
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					DucklingName: "org-provisioning",
+					State:        configstore.ManagedWarehouseStateProvisioning,
+				},
+			},
+			"org-resharding": {
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					DucklingName: "org-resharding",
+					State:        configstore.ManagedWarehouseStateResharding,
+				},
+			},
+			"org-unknown": {
+				Warehouse: &configstore.ManagedWarehouseConfig{
+					DucklingName: "org-unknown",
+					State:        configstore.ManagedWarehouseProvisioningState("unexpected"),
+				},
+			},
 			// Legacy tenant: duckling name is the org id with hyphens
 			// stripped — the case that makes the label non-derivable.
 			"4dc8564d-bd82-1065-2f40-97f7c50f67cf": {
@@ -69,14 +108,26 @@ func TestOrgTeamsInfoCollector(t *testing.T) {
 duckgres_org_info{duckling="",org="org-deleted",schema_name="team_9",team_id="9"} 1
 duckgres_org_info{duckling="",org="org-legacy",schema_name="team_7",team_id="7"} 1
 duckgres_org_info{duckling="4dc8564dbd8210652f4097f7c50f67cf",org="4dc8564d-bd82-1065-2f40-97f7c50f67cf",schema_name="team_2",team_id="2"} 1
+duckgres_org_info{duckling="org-failed",org="org-failed",schema_name="team_12",team_id="12"} 1
 duckgres_org_info{duckling="org-multi",org="org-multi",schema_name="team_11",team_id="11"} 1
 # HELP duckgres_org_teams_info Org/team/duckling identity mapping, one series per team (constant 1). Join key material for dashboards — see org_teams_info_metric.go for the safe join shapes
 # TYPE duckgres_org_teams_info gauge
 duckgres_org_teams_info{duckling="",org="org-deleted",schema_name="team_9",team_id="9"} 1
 duckgres_org_teams_info{duckling="",org="org-legacy",schema_name="team_7",team_id="7"} 1
 duckgres_org_teams_info{duckling="4dc8564dbd8210652f4097f7c50f67cf",org="4dc8564d-bd82-1065-2f40-97f7c50f67cf",schema_name="team_2",team_id="2"} 1
+duckgres_org_teams_info{duckling="org-failed",org="org-failed",schema_name="team_12",team_id="12"} 1
 duckgres_org_teams_info{duckling="org-multi",org="org-multi",schema_name="team_10",team_id="10"} 1
 duckgres_org_teams_info{duckling="org-multi",org="org-multi",schema_name="team_11",team_id="11"} 1
+# HELP duckgres_managed_warehouse_state Managed warehouse lifecycle state, one series per live warehouse (constant 1)
+# TYPE duckgres_managed_warehouse_state gauge
+duckgres_managed_warehouse_state{duckling="4dc8564dbd8210652f4097f7c50f67cf",org="4dc8564d-bd82-1065-2f40-97f7c50f67cf",state="ready"} 1
+duckgres_managed_warehouse_state{duckling="org-deleting",org="org-deleting",state="deleting"} 1
+duckgres_managed_warehouse_state{duckling="org-failed",org="org-failed",state="failed"} 1
+duckgres_managed_warehouse_state{duckling="org-multi",org="org-multi",state="ready"} 1
+duckgres_managed_warehouse_state{duckling="org-pending",org="org-pending",state="pending"} 1
+duckgres_managed_warehouse_state{duckling="org-provisioning",org="org-provisioning",state="provisioning"} 1
+duckgres_managed_warehouse_state{duckling="org-resharding",org="org-resharding",state="resharding"} 1
+duckgres_managed_warehouse_state{duckling="org-unknown",org="org-unknown",state="unknown"} 1
 `
 	c := newOrgTeamsInfoCollector(&stubSnapshotter{snap: snap})
 	if err := testutil.CollectAndCompare(c, strings.NewReader(want)); err != nil {
