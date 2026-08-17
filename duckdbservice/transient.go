@@ -106,9 +106,18 @@ const (
 	transientInitialBackoff = 250 * time.Millisecond
 )
 
+// retryLog is the session logger when one exists; slog.Default() otherwise.
+func retryLog(logger *slog.Logger) *slog.Logger {
+	if logger == nil {
+		return slog.Default()
+	}
+	return logger
+}
+
 // retryOnTransient calls fn up to transientMaxRetries additional times when it
 // returns a transient DuckLake error, using exponential backoff.
-func retryOnTransient[T any](fn func() (T, error)) (T, error) {
+func retryOnTransient[T any](logger *slog.Logger, fn func() (T, error)) (T, error) {
+	log := retryLog(logger)
 	result, err := fn()
 	if err == nil || !isTransientDuckLakeError(err) {
 		return result, err
@@ -116,7 +125,7 @@ func retryOnTransient[T any](fn func() (T, error)) (T, error) {
 
 	backoff := transientInitialBackoff
 	for attempt := 1; attempt <= transientMaxRetries; attempt++ {
-		slog.Warn("Transient DuckLake error, retrying.",
+		log.Warn("Transient DuckLake error, retrying.",
 			"attempt", attempt, "max_retries", transientMaxRetries,
 			"backoff", backoff, "error", err)
 
@@ -126,13 +135,13 @@ func retryOnTransient[T any](fn func() (T, error)) (T, error) {
 		result, err = fn()
 		if err == nil || !isTransientDuckLakeError(err) {
 			if err == nil {
-				slog.Info("DuckLake retry succeeded.", "attempt", attempt)
+				log.Info("DuckLake retry succeeded.", "attempt", attempt)
 			}
 			return result, err
 		}
 	}
 
-	slog.Error("DuckLake retries exhausted.", "attempts", transientMaxRetries+1, "error", err)
+	log.Error("DuckLake retries exhausted.", "attempts", transientMaxRetries+1, "error", err)
 	return result, err
 }
 
@@ -146,6 +155,7 @@ func isTransactionAborted(err error) bool {
 // user transaction). Callers should pass canRollback=false for explicit user
 // transactions so the original error is surfaced unchanged.
 func recoverAbortedTransaction[T any](
+	logger *slog.Logger,
 	err error,
 	canRollback bool,
 	rollback func() error,
@@ -156,16 +166,17 @@ func recoverAbortedTransaction[T any](
 		return zero, err, false
 	}
 
-	slog.Warn("DuckLake connection hit aborted transaction state; issuing ROLLBACK before retry.", "error", err)
+	log := retryLog(logger)
+	log.Warn("DuckLake connection hit aborted transaction state; issuing ROLLBACK before retry.", "error", err)
 	if rollbackErr := rollback(); rollbackErr != nil {
 		return zero, fmt.Errorf("DuckLake aborted transaction recovery rollback failed: %w (original error: %v)", rollbackErr, err), true
 	}
 
 	result, retryErr := retry()
 	if retryErr == nil {
-		slog.Info("DuckLake aborted transaction recovery succeeded.")
+		log.Info("DuckLake aborted transaction recovery succeeded.")
 	} else {
-		slog.Warn("DuckLake aborted transaction recovery retry failed.", "error", retryErr)
+		log.Warn("DuckLake aborted transaction recovery retry failed.", "error", retryErr)
 	}
 	return result, retryErr, true
 }
@@ -195,7 +206,8 @@ const (
 // exponential backoff and jitter (50-100% of backoff interval).
 // Only used for autocommit queries — user-managed transactions propagate
 // the error since the entire transaction is invalid after a conflict.
-func retryOnConflict[T any](fn func() (T, error)) (T, error) {
+func retryOnConflict[T any](logger *slog.Logger, fn func() (T, error)) (T, error) {
+	log := retryLog(logger)
 	var lastErr error
 	backoff := conflictInitialBackoff
 	for attempt := 1; attempt <= conflictMaxRetries; attempt++ {
@@ -203,7 +215,7 @@ func retryOnConflict[T any](fn func() (T, error)) (T, error) {
 
 		// Jitter: 50-100% of backoff to decorrelate retry storms.
 		jittered := time.Duration(float64(backoff) * (0.5 + rand.Float64()*0.5))
-		slog.Warn("DuckLake transaction conflict, retrying.",
+		log.Warn("DuckLake transaction conflict, retrying.",
 			"attempt", attempt, "max_retries", conflictMaxRetries,
 			"backoff", jittered)
 
@@ -212,7 +224,7 @@ func retryOnConflict[T any](fn func() (T, error)) (T, error) {
 		result, err := fn()
 		if err == nil {
 			ducklakeConflictRetrySuccessesTotal.Inc()
-			slog.Info("DuckLake conflict retry succeeded.", "attempt", attempt)
+			log.Info("DuckLake conflict retry succeeded.", "attempt", attempt)
 			return result, nil
 		}
 		lastErr = err
@@ -228,6 +240,6 @@ func retryOnConflict[T any](fn func() (T, error)) (T, error) {
 
 	ducklakeConflictRetriesExhaustedTotal.Inc()
 	var zero T
-	slog.Error("DuckLake conflict retries exhausted.", "attempts", conflictMaxRetries, "error", lastErr)
+	log.Error("DuckLake conflict retries exhausted.", "attempts", conflictMaxRetries, "error", lastErr)
 	return zero, fmt.Errorf("DuckLake transaction conflict: retries exhausted after %d attempts: %w", conflictMaxRetries, lastErr)
 }

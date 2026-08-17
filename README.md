@@ -473,9 +473,10 @@ on.
 
 The two exporters can be enabled independently, and the distinction matters
 because they carry different data. These events are metadata only. Application
-logs are not: `logQuery` / `logQueryError` attach the statement, and
-`usersecrets.RedactForLog` only rewrites secret DDL, so ordinary SQL and its
-literals reach PostHog Logs.
+logs are not: only **exported WARN/ERROR** records attach the statement after
+`usersecrets.RedactForLog` + a 4096-byte cap (secret DDL is a placeholder;
+ordinary SELECT text still leaves). Default `DUCKGRES_POSTHOG_LOG_LEVEL=warn`
+does not export user-class `Query execution failed.` Info lines.
 
 | Set | Analytics events | Log export |
 | --- | --- | --- |

@@ -213,6 +213,41 @@ func TestPostHogLevelIndependentOfStderr(t *testing.T) {
 	}
 }
 
+func TestInfoSampleEnabledDeterministic(t *testing.T) {
+	cap := newCapture(slog.LevelDebug)
+	h := &infoSampleHandler{sample: 0.5, inner: cap}
+	for i := 0; i < 200; i++ {
+		if !h.Enabled(context.Background(), slog.LevelInfo) {
+			t.Fatalf("Enabled(INFO) at sample=0.5 must be deterministic true (draw %d)", i)
+		}
+	}
+	if !h.Enabled(context.Background(), slog.LevelWarn) {
+		t.Fatal("WARN must stay enabled")
+	}
+	if h.Enabled(context.Background(), slog.LevelInfo) != cap.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("Enabled at sample=0.5 must match inner, not a random draw")
+	}
+}
+
+func TestInfoSampleNotCubed(t *testing.T) {
+	cap := newCapture(slog.LevelDebug)
+	logger := slog.New(newPostHogBranch(cap, slog.LevelInfo, 0.5, queryTextRedacted))
+	const n = 2000
+	for i := 0; i < n; i++ {
+		logger.Info("sampled info")
+	}
+	kept := 0
+	for _, rec := range cap.all() {
+		if rec.msg == "sampled info" {
+			kept++
+		}
+	}
+	// One draw of p=0.5 → ~1000. Cubed (Enabled+Handle+wrapper, p=0.125) → ~250.
+	if kept < 700 || kept > 1300 {
+		t.Fatalf("INFO keep at sample=0.5 = %d/%d (cubed would be ~250)", kept, n)
+	}
+}
+
 func TestPostHogInfoSampleKeepsErrors(t *testing.T) {
 	cap := newCapture(slog.LevelDebug)
 	logger := slog.New(newPostHogBranch(cap, slog.LevelInfo, 0, queryTextRedacted))

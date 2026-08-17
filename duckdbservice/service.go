@@ -973,8 +973,9 @@ func Run(cfg ServiceConfig) {
 		if !svc.WaitForDrain(ctx) {
 			slog.Warn("DuckDB service drain timed out before shutdown.", "timeout", workerShutdownDrainTime)
 			cancel()
-			cliboot.FlushLogging()
+			// Close first so teardown WARNs land in the batch, then flush.
 			svc.CloseAll()
+			cliboot.FlushLogging()
 			os.Exit(0)
 		}
 		cancel()
@@ -1325,7 +1326,11 @@ func (p *SessionPool) DestroySession(token string) error {
 	p.mu.Lock()
 	session, ok := p.sessions[token]
 	stop := p.stopRefresh[token]
+	var log *slog.Logger
 	if ok {
+		// Snapshot before clear so destroy-path WARNs keep user+pid
+		// without leaving the field set for a later Logger() leak.
+		log = session.Logger()
 		delete(p.sessions, token)
 		delete(p.stopRefresh, token)
 		clearSessionLog(session)
@@ -1437,7 +1442,7 @@ func (p *SessionPool) DestroySession(token string) error {
 	if p.sharedWarmMode && p.maxSessions == 1 && session.DB != nil {
 		wipeCtx, wipeCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
 		if _, err := wipeUserSecrets(wipeCtx, session.DB); err != nil {
-			slog.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
+			log.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
 		}
 		wipeCancel()
 	}
@@ -1448,7 +1453,7 @@ func (p *SessionPool) DestroySession(token string) error {
 	// which the worker's checkpointer would write past the cache proxy.
 	if p.sharedWarmMode {
 		if err := p.SetS3CacheEnabled(true); err != nil {
-			slog.Warn("Failed to restore S3 cache transport on session destroy.", "user", session.Username, "error", err)
+			log.Warn("Failed to restore S3 cache transport on session destroy.", "user", session.Username, "error", err)
 		}
 	}
 
