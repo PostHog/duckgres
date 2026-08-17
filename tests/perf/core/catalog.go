@@ -42,7 +42,7 @@ func validateCatalog(c Catalog) error {
 	}
 	seenTargets := map[Protocol]struct{}{}
 	for _, target := range c.Targets {
-		if target != ProtocolPGWire {
+		if !supportedProtocol(target) {
 			return fmt.Errorf("unsupported target protocol %q", target)
 		}
 		if _, ok := seenTargets[target]; ok {
@@ -65,8 +65,15 @@ func validateCatalog(c Catalog) error {
 		if q.IntentID == "" {
 			return fmt.Errorf("query %s missing intent_id", q.QueryID)
 		}
-		if q.PGWireSQL == "" {
-			return fmt.Errorf("query %s missing pgwire_sql", q.QueryID)
+		applicable := false
+		for _, target := range c.Targets {
+			if q.SupportsProtocol(target) {
+				applicable = true
+				break
+			}
+		}
+		if !applicable {
+			return fmt.Errorf("query %s has no SQL for any catalog target", q.QueryID)
 		}
 	}
 	return nil
@@ -74,11 +81,31 @@ func validateCatalog(c Catalog) error {
 
 func ValidateReadOnlyCatalog(c Catalog) error {
 	for _, q := range c.Queries {
-		if err := validateSelectOnlySQL("pgwire_sql", q.QueryID, q.PGWireSQL); err != nil {
-			return err
+		for _, sql := range []struct {
+			field string
+			text  string
+		}{
+			{field: "pgwire_sql", text: q.PGWireSQL},
+			{field: "trino_sql", text: q.TrinoSQL},
+		} {
+			if strings.TrimSpace(sql.text) == "" {
+				continue
+			}
+			if err := validateSelectOnlySQL(sql.field, q.QueryID, sql.text); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func supportedProtocol(protocol Protocol) bool {
+	switch protocol {
+	case ProtocolPGWire, ProtocolTrino:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateSelectOnlySQL(field, queryID, sql string) error {

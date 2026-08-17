@@ -451,6 +451,12 @@ scenario-frozen-metadata:
 scenario-frozen-perf:
     ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml
 
+# Compare the frozen DuckLake PostHog tables over PGWire and a separately
+# deployed, read-only multi-worker Trino service.
+[group('test')]
+scenario-frozen-trino-perf:
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_trino_perf.yaml
+
 # Run the dev frozen dataset dbt scenario
 [group('test')]
 scenario-frozen-dbt:

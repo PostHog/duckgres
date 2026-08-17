@@ -1,0 +1,106 @@
+name: posthog-frozen-trino-perf
+run_id_prefix: scenario-frozen-trino-perf
+required_env:
+  - DUCKGRES_SCENARIO_ORG_ID
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      request:
+        database_name: scenario_frozen_trino_perf_${run_id_token}
+        team_id: 1
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: setup_frozen_views
+    type: sql
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/setup_frozen_views.sql
+      max_attempts: 12
+      retry_interval: 10s
+
+  - id: setup_posthog_tables
+    type: sql
+    depends_on: [setup_frozen_views]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/setup_posthog_tables.sql
+      max_attempts: 3
+      retry_interval: 10s
+
+  - id: validate_posthog_tables
+    type: sql
+    depends_on: [setup_posthog_tables]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/validate_posthog_tables.sql
+      max_attempts: 3
+      retry_interval: 10s
+
+  - id: provision_trino
+    type: provision_trino
+    depends_on: [validate_posthog_tables]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      request:
+        workers: 4
+
+  - id: wait_trino_ready
+    type: wait_trino_ready
+    depends_on: [provision_trino]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: perf_queries
+    type: perf_queries
+    depends_on: [wait_trino_ready]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      catalog_file: ../../../perf/queries/ducklake_posthog_tables.yaml
+      targets: [pgwire, trino]
+      trino_catalog: ducklake
+      trino_schema: posthog
+      # Recorded verbatim in summary.json alongside the image reference the
+      # control plane reports. Set it when the Trino+Brikk image is pinned; the
+      # image digest is the authoritative record either way.
+      # trino_connector_version: "483-0.2.0"
+      run_id: ${run_id}
+      dataset_version: posthog-file-views-v1
+      fail_on_query_errors: true
+
+  - id: deprovision_trino
+    type: deprovision_trino
+    depends_on: [perf_queries]
+    always_run: true
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [deprovision_trino]
+    always_run: true
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s

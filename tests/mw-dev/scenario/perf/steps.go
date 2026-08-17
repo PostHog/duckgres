@@ -11,19 +11,39 @@ import (
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
+	scenariotrino "github.com/posthog/duckgres/tests/mw-dev/scenario/trino"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
 	pgdriver "github.com/posthog/duckgres/tests/perf/drivers/pgwire"
+	trinodriver "github.com/posthog/duckgres/tests/perf/drivers/trino"
 )
 
 const StepTypePerfQueries = "perf_queries"
 
+// perfTimeZone is the session time zone every perf protocol runs in. Comparing
+// TIMESTAMPTZ predicates across engines is only meaningful when both interpret
+// them identically, and the artifact records it so a reader can check.
+const perfTimeZone = "UTC"
+
 type DriverFactory interface {
 	NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error)
+	NewTrino(connection TrinoConnection) (perfcore.ProtocolDriver, error)
+}
+
+// TrinoConnection contains only the non-secret settings required by the Trino
+// HTTP statement driver. Credentials remain owned by the provisioned cluster.
+type TrinoConnection struct {
+	Endpoint string
+	User     string
+	Catalog  string
+	Schema   string
+	TimeZone string
 }
 
 type ExecutorConfig struct {
 	ProvisionState *provision.State
 	Connection     scenariosql.ConnectionConfig
+	TrinoEndpoint  string
+	TrinoState     *scenariotrino.State
 	OutputDir      string
 	DriverFactory  DriverFactory
 	State          *State
@@ -33,6 +53,8 @@ type ExecutorConfig struct {
 type Executor struct {
 	provisionState *provision.State
 	connection     scenariosql.ConnectionConfig
+	trinoEndpoint  string
+	trinoState     *scenariotrino.State
 	outputDir      string
 	driverFactory  DriverFactory
 	state          *State
@@ -59,6 +81,11 @@ type stepSpec struct {
 	RunID             string
 	DatasetVersion    string
 	Database          string
+	TrinoEndpoint     string
+	TrinoUser         string
+	TrinoCatalog      string
+	TrinoSchema       string
+	TrinoConnector    string
 	OutputSubdir      string
 	ReadOnly          bool
 	FailOnQueryErrors bool
@@ -82,6 +109,8 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 	return &Executor{
 		provisionState: cfg.ProvisionState,
 		connection:     cfg.Connection,
+		trinoEndpoint:  cfg.TrinoEndpoint,
+		trinoState:     cfg.TrinoState,
 		outputDir:      cfg.OutputDir,
 		driverFactory:  factory,
 		state:          state,
@@ -162,6 +191,7 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		Drivers:        drivers,
 		Sink:           closingSink{sink: sink, closeFunc: closeSink},
 		Now:            e.now,
+		Environments:   e.environments(catalog, spec),
 	})
 	summary, err := runner.Run(ctx)
 	if err != nil {
@@ -216,7 +246,7 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 
 	username := stringFromWith(step, "username", "root")
 	password := stringFromWith(step, "password", "")
-	if password == "" {
+	if (len(targets) == 0 || containsTarget(targets, perfcore.ProtocolPGWire)) && password == "" {
 		if e.provisionState == nil {
 			return stepSpec{}, classified(ErrorClassConfig, fmt.Errorf("provision state is required when with.password is omitted"))
 		}
@@ -239,6 +269,11 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		RunID:             runID,
 		DatasetVersion:    stringFromWith(step, "dataset_version", ""),
 		Database:          stringFromWith(step, "catalog", "ducklake"),
+		TrinoEndpoint:     stringFromWith(step, "trino_endpoint", e.trinoEndpoint),
+		TrinoUser:         stringFromWith(step, "trino_user", "duckgres-perf"),
+		TrinoCatalog:      stringFromWith(step, "trino_catalog", stringFromWith(step, "catalog", "ducklake")),
+		TrinoSchema:       stringFromWith(step, "trino_schema", "posthog"),
+		TrinoConnector:    stringFromWith(step, "trino_connector_version", ""),
 		OutputSubdir:      stringFromWith(step, "output_subdir", "perf"),
 		ReadOnly:          boolFromWith(step, "read_only", true),
 		FailOnQueryErrors: boolFromWith(step, "fail_on_query_errors", true),
@@ -264,7 +299,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolTrino:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -318,12 +353,85 @@ func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (m
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
 			drivers[target] = driver
+		case perfcore.ProtocolTrino:
+			connection, err := e.trinoConnection(spec)
+			if err != nil {
+				return nil, err
+			}
+			driver, err := e.driverFactory.NewTrino(connection)
+			if err != nil {
+				return nil, classified(ErrorClassConfig, fmt.Errorf("create Trino perf driver: %w", err))
+			}
+			drivers[target] = driver
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("unsupported perf target protocol %q", target))
 		}
 	}
 	success = true
 	return drivers, nil
+}
+
+// environments records the non-secret comparison metadata for each protocol in
+// the run's summary.json. For Trino it reports what the control plane actually
+// provisioned — the pinned image and the requested/ready worker counts — so a
+// reader can tell whether the topology the benchmark claims is the topology
+// that ran. Credentials are structurally absent: the lifecycle state carries
+// none.
+func (e *Executor) environments(catalog perfcore.Catalog, spec stepSpec) []perfcore.ProtocolEnvironment {
+	environments := make([]perfcore.ProtocolEnvironment, 0, len(catalog.Targets))
+	for _, target := range catalog.Targets {
+		switch target {
+		case perfcore.ProtocolPGWire:
+			environments = append(environments, perfcore.ProtocolEnvironment{
+				Protocol: perfcore.ProtocolPGWire,
+				Engine:   "duckgres",
+				Catalog:  spec.Database,
+				TimeZone: perfTimeZone,
+			})
+		case perfcore.ProtocolTrino:
+			env := perfcore.ProtocolEnvironment{
+				Protocol:         perfcore.ProtocolTrino,
+				Engine:           "trino",
+				ConnectorVersion: spec.TrinoConnector,
+				Catalog:          spec.TrinoCatalog,
+				Schema:           spec.TrinoSchema,
+				TimeZone:         perfTimeZone,
+			}
+			if cluster, ok := e.trinoCluster(spec.OrgID); ok {
+				env.Image = cluster.Image
+				env.RequestedWorkers = cluster.RequestedWorkers
+				env.ReadyWorkers = cluster.ReadyWorkers
+			}
+			environments = append(environments, env)
+		}
+	}
+	return environments
+}
+
+func (e *Executor) trinoCluster(orgID string) (scenariotrino.Cluster, bool) {
+	if e.trinoState == nil {
+		return scenariotrino.Cluster{}, false
+	}
+	return e.trinoState.Cluster(orgID)
+}
+
+func (e *Executor) trinoConnection(spec stepSpec) (TrinoConnection, error) {
+	endpoint := spec.TrinoEndpoint
+	if endpoint == "" {
+		if cluster, ok := e.trinoCluster(spec.OrgID); ok {
+			endpoint = cluster.Endpoint
+		}
+	}
+	if endpoint == "" {
+		return TrinoConnection{}, classified(ErrorClassConfig, fmt.Errorf("trino endpoint is required when target includes trino"))
+	}
+	return TrinoConnection{
+		Endpoint: endpoint,
+		User:     spec.TrinoUser,
+		Catalog:  spec.TrinoCatalog,
+		Schema:   spec.TrinoSchema,
+		TimeZone: perfTimeZone,
+	}, nil
 }
 
 func (e *Executor) pgwireConnection(spec stepSpec) (scenariosql.PGWireConnection, error) {
@@ -351,6 +459,25 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (
 		return nil, err
 	}
 	return pgdriver.NewWithDB(db), nil
+}
+
+func (defaultDriverFactory) NewTrino(connection TrinoConnection) (perfcore.ProtocolDriver, error) {
+	return trinodriver.New(trinodriver.Config{
+		Endpoint: connection.Endpoint,
+		User:     connection.User,
+		Catalog:  connection.Catalog,
+		Schema:   connection.Schema,
+		TimeZone: connection.TimeZone,
+	})
+}
+
+func containsTarget(targets []perfcore.Protocol, target perfcore.Protocol) bool {
+	for _, candidate := range targets {
+		if candidate == target {
+			return true
+		}
+	}
+	return false
 }
 
 func requiredString(step core.Step, key string) (string, error) {

@@ -2,6 +2,7 @@ package perf
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
+	scenariotrino "github.com/posthog/duckgres/tests/mw-dev/scenario/trino"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
 )
 
@@ -139,6 +141,98 @@ func TestExecutorRestrictsCatalogToStepTargets(t *testing.T) {
 	}
 	if !strings.Contains(string(csvBytes), ",pgwire,") {
 		t.Fatalf("query_results.csv does not contain pgwire result: %q", string(csvBytes))
+	}
+}
+
+func TestExecutorRunsTrinoTargetFromConfiguredEndpoint(t *testing.T) {
+	catalogPath := writeTrinoPerfCatalog(t)
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		OutputDir:     t.TempDir(),
+		TrinoEndpoint: "http://trino.scenario.svc:8080",
+		DriverFactory: factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":       "scenario-org",
+			"catalog_file": catalogPath,
+			"run_id":       "scenario-run-1",
+			"targets":      []any{"trino"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if factory.trinoConnection.Endpoint != "http://trino.scenario.svc:8080" {
+		t.Fatalf("Trino endpoint = %q", factory.trinoConnection.Endpoint)
+	}
+	result, ok := executor.State().Result("perf_queries")
+	if !ok || result.Summary.TotalQueries != 1 || result.Summary.TotalErrors != 0 {
+		t.Fatalf("summary = %+v", result.Summary)
+	}
+}
+
+func TestExecutorUsesReadyTrinoLifecycleEndpoint(t *testing.T) {
+	catalogPath := writeTrinoPerfCatalog(t)
+	trinoState := scenariotrino.NewState()
+	trinoState.StoreCluster("scenario-org", scenariotrino.Cluster{ID: "trino-run-1", Endpoint: "http://trino.scenario.svc:8080"})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		OutputDir:     t.TempDir(),
+		TrinoState:    trinoState,
+		DriverFactory: factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID: "perf_queries", Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id": "scenario-org", "catalog_file": catalogPath, "run_id": "scenario-run-1", "targets": []any{"trino"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if factory.trinoConnection.Endpoint != "http://trino.scenario.svc:8080" {
+		t.Fatalf("Trino endpoint = %q, want lifecycle endpoint", factory.trinoConnection.Endpoint)
+	}
+}
+
+func TestExecutorSkipsQueriesWithoutSQLForTarget(t *testing.T) {
+	catalogPath := writeTargetSpecificPerfCatalog(t)
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{Username: "root", Password: "root-password"})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			DialHost: "10.0.0.10", SNISuffix: ".dev.example", SSLMode: "require",
+		},
+		OutputDir:     t.TempDir(),
+		TrinoEndpoint: "http://trino.scenario.svc:8080",
+		DriverFactory: factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID: "perf_queries", Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id": "scenario-org", "catalog_file": catalogPath, "run_id": "scenario-run-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	if factory.pgwireDriver.calls != 2 {
+		t.Fatalf("pgwire calls = %d, want two queries", factory.pgwireDriver.calls)
+	}
+	if factory.trinoDriver.calls != 1 {
+		t.Fatalf("Trino calls = %d, want only the shared query", factory.trinoDriver.calls)
+	}
+	result, ok := executor.State().Result("perf_queries")
+	if !ok || result.Summary.TotalQueries != 3 {
+		t.Fatalf("summary = %+v, want three target-applicable queries", result.Summary)
 	}
 }
 
@@ -333,10 +427,63 @@ func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 	return path
 }
 
+func writeTrinoPerfCatalog(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "trino_perf_catalog.yaml")
+	body := "name: scenario-trino-perf\n" +
+		"description: trino perf adapter test\n" +
+		"seed: 42\n" +
+		"dataset_scale: 1\n" +
+		"targets: [trino]\n" +
+		"warmup_iterations: 0\n" +
+		"measure_iterations: 1\n" +
+		"queries:\n" +
+		"  - query_id: q1\n" +
+		"    intent_id: i1\n" +
+		"    tags: [test]\n" +
+		"    params: {}\n" +
+		"    trino_sql: SELECT 1\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write Trino perf catalog: %v", err)
+	}
+	return path
+}
+
+func writeTargetSpecificPerfCatalog(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "target_specific_perf_catalog.yaml")
+	body := "name: target-specific-perf\n" +
+		"description: target-specific perf adapter test\n" +
+		"seed: 42\n" +
+		"dataset_scale: 1\n" +
+		"targets: [pgwire, trino]\n" +
+		"warmup_iterations: 0\n" +
+		"measure_iterations: 1\n" +
+		"queries:\n" +
+		"  - query_id: pgwire_only\n" +
+		"    intent_id: i1\n" +
+		"    tags: [test]\n" +
+		"    params: {}\n" +
+		"    pgwire_sql: SELECT 1\n" +
+		"  - query_id: shared\n" +
+		"    intent_id: i2\n" +
+		"    tags: [test]\n" +
+		"    params: {}\n" +
+		"    pgwire_sql: SELECT 2\n" +
+		"    trino_sql: SELECT 2\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write target-specific perf catalog: %v", err)
+	}
+	return path
+}
+
 type fakeDriverFactory struct {
 	pgwireConnection scenariosql.PGWireConnection
 	pgwireErr        error
 	pgwireDriver     *fakeProtocolDriver
+	trinoConnection  TrinoConnection
+	trinoErr         error
+	trinoDriver      *fakeProtocolDriver
 }
 
 func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
@@ -345,19 +492,117 @@ func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (
 	return f.pgwireDriver, nil
 }
 
+func (f *fakeDriverFactory) NewTrino(connection TrinoConnection) (perfcore.ProtocolDriver, error) {
+	f.trinoConnection = connection
+	f.trinoDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolTrino, err: f.trinoErr}
+	return f.trinoDriver, nil
+}
+
 type fakeProtocolDriver struct {
 	protocol perfcore.Protocol
 	err      error
 	closed   bool
+	calls    int
 }
 
 func (d *fakeProtocolDriver) Protocol() perfcore.Protocol { return d.protocol }
 
 func (d *fakeProtocolDriver) Execute(context.Context, perfcore.Query, []any) (perfcore.ExecutionResult, error) {
+	d.calls++
 	return perfcore.ExecutionResult{Rows: 1, Duration: time.Millisecond}, d.err
 }
 
 func (d *fakeProtocolDriver) Close() error {
 	d.closed = true
 	return nil
+}
+
+// The perf artifact must state WHAT ran on each side of the comparison, taken
+// from the lifecycle state rather than assumed — and must contain nothing
+// credential-shaped.
+func TestExecutorRecordsTrinoComparisonMetadataInArtifacts(t *testing.T) {
+	catalogPath := writeTargetSpecificPerfCatalog(t)
+	trinoState := scenariotrino.NewState()
+	trinoState.StoreCluster("scenario-org", scenariotrino.Cluster{
+		ID:               "trino-bench-scenario-org",
+		State:            scenariotrino.StateReady,
+		Endpoint:         "http://trino.scenario.svc:8080",
+		RequestedWorkers: 4,
+		ReadyWorkers:     4,
+		Image:            "registry.example/trino-brikk@sha256:abc",
+	})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{Username: "root", Password: "root-password"})
+	outputDir := t.TempDir()
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		Connection: scenariosql.ConnectionConfig{
+			DialHost: "10.0.0.10", SNISuffix: ".dev.example", SSLMode: "require",
+		},
+		OutputDir:     outputDir,
+		TrinoState:    trinoState,
+		DriverFactory: &fakeDriverFactory{},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID: "perf_queries", Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id": "scenario-org", "catalog_file": catalogPath, "run_id": "scenario-run-1",
+			"trino_catalog": "ducklake", "trino_schema": "posthog",
+			"trino_connector_version": "483-0.2.0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(outputDir, "perf", "summary.json"))
+	if err != nil {
+		t.Fatalf("read summary: %v", err)
+	}
+	var summary perfcore.RunSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	environments := map[perfcore.Protocol]perfcore.ProtocolEnvironment{}
+	for _, env := range summary.Environments {
+		environments[env.Protocol] = env
+	}
+	pgwire, ok := environments[perfcore.ProtocolPGWire]
+	if !ok || pgwire.Engine != "duckgres" || pgwire.TimeZone != "UTC" {
+		t.Fatalf("pgwire environment = %+v", pgwire)
+	}
+	trino, ok := environments[perfcore.ProtocolTrino]
+	if !ok {
+		t.Fatalf("summary environments = %+v, want a trino entry", summary.Environments)
+	}
+	if trino.Image != "registry.example/trino-brikk@sha256:abc" {
+		t.Fatalf("trino image = %q, want the lifecycle-reported pinned image", trino.Image)
+	}
+	if trino.RequestedWorkers != 4 || trino.ReadyWorkers != 4 {
+		t.Fatalf("trino worker counts = %d/%d", trino.RequestedWorkers, trino.ReadyWorkers)
+	}
+	if trino.Catalog != "ducklake" || trino.Schema != "posthog" || trino.TimeZone != "UTC" {
+		t.Fatalf("trino catalog identity = %+v", trino)
+	}
+	if trino.ConnectorVersion != "483-0.2.0" {
+		t.Fatalf("trino connector version = %q", trino.ConnectorVersion)
+	}
+
+	// Nothing credential-shaped may reach any artifact in the run directory.
+	entries, err := os.ReadDir(filepath.Join(outputDir, "perf"))
+	if err != nil {
+		t.Fatalf("read artifacts: %v", err)
+	}
+	for _, entry := range entries {
+		body, err := os.ReadFile(filepath.Join(outputDir, "perf", entry.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		for _, banned := range []string{"root-password", "arn:aws", "password="} {
+			if strings.Contains(string(body), banned) {
+				t.Fatalf("artifact %s contains %q", entry.Name(), banned)
+			}
+		}
+	}
 }

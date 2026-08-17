@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -23,8 +24,8 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadCatalog(%s): %v", path, err)
 			}
-			if len(catalog.Targets) != 1 || catalog.Targets[0] != ProtocolPGWire {
-				t.Fatalf("catalog targets = %v, want [pgwire]", catalog.Targets)
+			if !slices.Contains(catalog.Targets, ProtocolPGWire) {
+				t.Fatalf("catalog targets = %v, want pgwire", catalog.Targets)
 			}
 
 			raw, err := os.ReadFile(path)
@@ -67,6 +68,58 @@ queries:
 	}
 	if catalog.Queries[0].QueryID != "q1" || catalog.Queries[0].IntentID != "i1" {
 		t.Fatalf("unexpected query identity: %+v", catalog.Queries[0])
+	}
+}
+
+func TestParseCatalogAllowsTargetSpecificSQL(t *testing.T) {
+	raw := `
+name: target-specific
+description: target-specific suite
+seed: 7
+dataset_scale: 1
+targets: [pgwire, trino]
+warmup_iterations: 0
+measure_iterations: 1
+queries:
+  - query_id: pgwire_only
+    intent_id: i1
+    pgwire_sql: SELECT 1
+  - query_id: shared
+    intent_id: i2
+    pgwire_sql: SELECT 2
+    trino_sql: SELECT 2
+`
+	catalog, err := ParseCatalog([]byte(raw))
+	if err != nil {
+		t.Fatalf("ParseCatalog returned error: %v", err)
+	}
+	if !catalog.Queries[0].SupportsProtocol(ProtocolPGWire) {
+		t.Fatal("expected first query to support pgwire")
+	}
+	if catalog.Queries[0].SupportsProtocol(ProtocolTrino) {
+		t.Fatal("expected first query not to support trino")
+	}
+	if !catalog.Queries[1].SupportsProtocol(ProtocolTrino) {
+		t.Fatal("expected second query to support trino")
+	}
+}
+
+func TestPostHogDuckLakeCatalogKeepsRawViewsPGWireOnly(t *testing.T) {
+	catalog, err := LoadCatalog(filepath.Join("..", "queries", "ducklake_posthog_tables.yaml"))
+	if err != nil {
+		t.Fatalf("LoadCatalog: %v", err)
+	}
+	if got, want := catalog.Targets, []Protocol{ProtocolPGWire, ProtocolTrino}; !slices.Equal(got, want) {
+		t.Fatalf("catalog targets = %v, want %v", got, want)
+	}
+	for _, query := range catalog.Queries {
+		isRawView := strings.Contains(query.QueryID, "__raw_view")
+		if isRawView && query.SupportsProtocol(ProtocolTrino) {
+			t.Fatalf("raw-view query %s must remain pgwire-only", query.QueryID)
+		}
+		if !isRawView && !query.SupportsProtocol(ProtocolTrino) {
+			t.Fatalf("DuckLake table query %s must have Trino SQL", query.QueryID)
+		}
 	}
 }
 

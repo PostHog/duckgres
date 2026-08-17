@@ -13,6 +13,15 @@ on:
         required: false
         default: ""
         type: string
+      trino_benchmark_image:
+        description: >-
+          Pinned Trino+Brikk image for the posthog_frozen_trino_perf scenario.
+          Empty (the default) leaves the Trino benchmark lifecycle disabled.
+          Never pass credentials here — the metadata reader password and the
+          read-only S3 role are charts-created cluster resources.
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "17 8 * * *"
 
@@ -73,6 +82,9 @@ jobs:
       PR_NUMBER: ${{ github.run_id }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
+      # Opt-in only: with no pinned image the control plane keeps the Trino
+      # benchmark lifecycle disabled and its API answers 503.
+      DUCKGRES_TRINO_BENCHMARK_IMAGE: ${{ inputs.trino_benchmark_image || '' }}
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
       # Add process headroom for repeated full-dataset pgwire aggregates.
       DUCKGRES_K8S_WORKER_CPU_REQUEST: "2"

@@ -94,7 +94,8 @@ In topologies 2 and 3, the control plane exposes only PostgreSQL wire protocol t
 
 ### Key Components
 
-- **main.go / config_resolution.go**: CLI flags; effective config resolution (CLI > env > YAML > defaults), including env-only K8s knobs.
+- **main.go / cmd/**: entry points. `main.go` is the all-in-one binary (all four modes); `cmd/duckgres-controlplane` is the production control plane, `cmd/duckgres-worker` the production worker.
+- **configresolve/**: CLI flags (`cliflags.go`) and effective config resolution (`resolve.go`; CLI > env > YAML > defaults), including env-only K8s knobs. `controlplane.go` is the SINGLE place a resolved config becomes a `controlplane.ControlPlaneConfig` — both control-plane entry points call it (see Configuration below).
 - **server/** — PG wire protocol server and DuckDB execution
   - Wire protocol & connections: `server.go`, `conn.go`, `conn_errors.go`, `conn_query_exec.go`, `conn_results.go`, `conn_copy.go`, `conn_extended_query.go`, `conn_pg_stat_activity.go`, `conn_cursor.go`, `protocol.go`, `exports.go`
   - Execution: `executor.go`, `flight_executor.go`, `chsql.go`, `transient.go`
@@ -140,7 +141,7 @@ Key CLI flags for control-plane mode:
   - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
   - Compute-usage billing needs no config: metering is always on for the remote backend and billing PULLS usage over the internal-secret-authed HTTP API (`GET /api/v1/billing/usage` + `POST /api/v1/billing/ack`). See `docs/design/billing-pull-api.md` and "Compute-Usage Billing" below.
-  - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
+  - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `configresolve/resolve.go`.
 
 Key CLI flags for duckdb-service mode:
 - `--duckdb-listen` (e.g., `unix:///...` or `:8816`)
@@ -150,13 +151,33 @@ Key CLI flags for duckdb-service mode:
 
 ## Configuration
 
-Configuration is resolved in `config_resolution.go` with the following precedence (highest to lowest):
+Configuration is resolved in `configresolve/resolve.go` with the following precedence (highest to lowest):
 1. CLI flags (`--port`, `--config`, etc.)
 2. Environment variables (`DUCKGRES_PORT`, etc.)
 3. YAML config file
 4. Built-in defaults
 
 Note: `--mode` is CLI-only (not loadable from YAML/env). A handful of K8s pod-scheduling knobs are env-only (no CLI flag).
+
+**A resolved knob only reaches the control plane through
+`configresolve.ControlPlaneConfig`** (`configresolve/controlplane.go`). That is
+the SINGLE assembly site for `controlplane.ControlPlaneConfig`, shared by both
+entry points — the all-in-one `duckgres --mode control-plane` (`main.go`) and the
+production `cmd/duckgres-controlplane` (`Dockerfile.controlplane`, its own CD
+pipeline). It exists because the two binaries previously each carried a
+hand-maintained ~56-field literal with nothing forcing them to agree, and two
+knobs had silently drifted out of the PRODUCTION one — `DUCKGRES_USER_SECRET_KEY`
+and every `DUCKGRES_TRINO_BENCHMARK_*` variable were resolved into memory and
+then dropped, so the features they configure were dead in production while the
+mw-dev scenario (which builds the all-in-one binary) passed. Add a knob to
+`Resolved` and wire it in that one function; never re-introduce a second literal.
+`configresolve/controlplane_test.go` is the tripwire, and it checks MAPPING
+COVERAGE in both directions rather than runtime values (zero is a legitimate
+value for an unset TTL, an empty PriorityClass, or a false feature gate): every
+destination field must be movable by some input, and every `Resolved` field must
+change the output. Its two exemption maps are structural facts with stated
+reasons, not a dumping ground. **When two Dockerfiles select different
+entrypoints, treat duplicated config assembly as a field-by-field review item.**
 
 ## Keep docs in sync with behavior
 
@@ -1338,6 +1359,59 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh`.
   cnpg→ext positive path is unit-only (harness lacks the RDS password);
   cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
+
+## Trino Benchmark Lifecycle (dev-only, `kubernetes` tag) — LOAD-BEARING CONTRACT
+
+An opt-in, disposable side-by-side benchmark: one Duckgres worker over PGWire
+vs a multi-worker Trino cluster reading the SAME per-run DuckLake snapshot.
+Scenario: `tests/mw-dev/scenario/scenarios/posthog_frozen_trino_perf.yaml`;
+runbook: `docs/runbooks/scenario-runner.md`. Pieces: `controlplane/
+trino_benchmark_api.go` (untagged types + admin-authenticated routes),
+`trino_benchmark_manager.go` (k8s lifecycle), `trino_benchmark_reader.go` +
+`trino_benchmark_reader_k8s.go` (reader identity), `tests/mw-dev/scenario/trino/`
+(lifecycle steps + HTTP client), `tests/perf/drivers/trino/` (statement driver).
+
+- **Fail-closed, with NO writer-credential fallback.** Env-only knobs
+  (`DUCKGRES_TRINO_BENCHMARK_*`, `configresolve/resolve.go`) default the feature
+  OFF; enabling it without a pinned image leaves the lifecycle unbuilt; and a
+  built lifecycle still refuses to provision unless the charts-created reader
+  identity resolves in full. `buildTrinoReaderIdentity` additionally REJECTS a
+  configuration whose reader S3 role or reader database user equals the
+  warehouse writer identity. Never add a degrade path here.
+- **Credentials never cross the API boundary.** The lifecycle API returns only
+  cluster ID, state, endpoint, requested/ready worker counts, and the pinned
+  image. The metadata reader password exists in control-plane memory for exactly
+  one hop — read by exact `SecretReference` and written into the cluster-owned
+  short-lived Secret — and is never logged, returned, or stored on a struct.
+  Reader status is read through `DucklingClient.GetStatusWithoutCredentials`, so
+  resolving a reader never pulls the tenant WRITER password into memory.
+- **Ownership labels are the cleanup boundary.** Every object carries
+  `app.kubernetes.io/name=duckgres-trino-benchmark` +
+  `duckgres.posthog.com/trino-benchmark-cluster=<id>` +
+  `duckgres.posthog.com/org=<org>`; every delete lists by BOTH the app and
+  cluster labels. Cleanup is idempotent, safe after a partial provision, and
+  structurally unable to reach a worker pod, another benchmark cluster, or the
+  charts-created reader Secret.
+- **Readiness means the WHOLE requested topology**: coordinator ready AND
+  `ReadyWorkers >= RequestedWorkers`. A ready state with no endpoint stays a
+  polling state; `failed` is terminal and stops the poller. Provision is
+  idempotent for an identical request (200 vs 202) and 409s on a different org,
+  image, or worker count — never a silent adoption.
+- **S3 access is an assumed read-only role, never static keys.** The catalog
+  properties set `s3.iam-role`/`s3.role-session-name` (renewable credentials);
+  `s3.aws-access-key`/`s3.aws-secret-key` must never appear.
+- **UTC is pinned in both engines** (`-Duser.timezone=UTC` in jvm.config, the
+  driver's `X-Trino-Time-Zone`), or cross-engine TIMESTAMPTZ predicates diverge.
+- **Artifacts record what ran, not what was intended**: `summary.json`
+  `environments[]` carries engine/version, connector version, image reference,
+  requested/ready workers, catalog/schema, and UTC per protocol. No thresholds,
+  no CI gating.
+- Touching any of this → update `controlplane/trino_benchmark_api_test.go`,
+  `trino_benchmark_api_authz_test.go`, `trino_benchmark_manager_test.go`,
+  `trino_benchmark_reader_test.go`, `trino_benchmark_reader_k8s_test.go`,
+  `configresolve/resolve_trino_benchmark_test.go`,
+  `tests/mw-dev/scenario/trino/*_test.go`, `tests/mw-dev/run_sh_test.go`, and
+  the scenario DAG assertions in `tests/mw-dev/scenario/runner_test.go`.
 
 ## TODO Reference
 

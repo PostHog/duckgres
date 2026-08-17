@@ -53,7 +53,12 @@ type DucklingStatus struct {
 	}
 	ReshardMaintenance          ReshardMaintenanceStatus
 	MetadataCredentialSecretRef SecretReference
-	DataStore                   struct {
+	// BenchmarkReader is the charts-published, strictly read-only identity a
+	// benchmark Trino cluster uses (status.benchmarkReader). It is absent on
+	// every Duckling until the companion charts release is deployed, which is
+	// what keeps the Trino benchmark feature fail-closed.
+	BenchmarkReader DucklingBenchmarkReader
+	DataStore       struct {
 		Type       string
 		BucketName string
 		S3Region   string
@@ -108,6 +113,16 @@ type ReshardMaintenanceStatus struct {
 	TenantNoLogin       bool
 	MaintenanceLogin    bool
 	MaintenanceNoLogin  bool
+}
+
+// DucklingBenchmarkReader carries NO credential value — only the reader's
+// database role name, the exact Secret reference holding its password, and the
+// read-only S3 role the Trino pods may assume. The tenant WRITER identity is
+// deliberately not part of this block.
+type DucklingBenchmarkReader struct {
+	MetadataUser        string
+	CredentialSecretRef SecretReference
+	S3ReadOnlyRoleARN   string
 }
 
 // SecretReference identifies one key in a namespaced Kubernetes Secret. The
@@ -412,6 +427,19 @@ func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus,
 		status.ReshardMaintenance.Password = password
 	}
 	return status, nil
+}
+
+// GetStatusWithoutCredentials parses a Duckling CR's status WITHOUT resolving
+// any Secret value. Get() deliberately resolves the tenant metadata password
+// because activation needs it; callers that only need non-secret status — most
+// importantly the Trino benchmark reader resolver — must use this instead, so
+// a writer credential is never pulled into memory on their behalf.
+func (d *DucklingClient) GetStatusWithoutCredentials(ctx context.Context, name string) (*DucklingStatus, error) {
+	cr, err := d.getCR(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("get duckling CR %q: %w", name, err)
+	}
+	return parseDucklingStatus(cr)
 }
 
 // SetReshardMaintenance prepares, fences, or removes the transient CNPG
@@ -1363,6 +1391,19 @@ func parseDucklingStatus(cr *unstructured.Unstructured) (*DucklingStatus, error)
 					Namespace: getNestedString(ref, "namespace"),
 					Key:       getNestedString(ref, "key"),
 				}
+			}
+		}
+	}
+
+	// Parse status.benchmarkReader (charts-created Trino reader identity).
+	if reader, ok := status["benchmarkReader"].(map[string]interface{}); ok {
+		ds.BenchmarkReader.MetadataUser = getNestedString(reader, "metadataUser")
+		ds.BenchmarkReader.S3ReadOnlyRoleARN = getNestedString(reader, "s3ReadOnlyRoleArn")
+		if ref, ok := reader["credentialSecretRef"].(map[string]interface{}); ok {
+			ds.BenchmarkReader.CredentialSecretRef = SecretReference{
+				Name:      getNestedString(ref, "name"),
+				Namespace: getNestedString(ref, "namespace"),
+				Key:       getNestedString(ref, "key"),
 			}
 		}
 	}

@@ -219,3 +219,36 @@ func TestScenarioWorkflowsUseNode24Actions(t *testing.T) {
 		}
 	}
 }
+
+// The dev scenario workflow can hand the control plane a PINNED Trino+Brikk
+// image so the paired comparison scenario has a lifecycle to call. It must
+// never hand it reader credentials: the metadata reader password and the
+// read-only S3 role are charts-created cluster resources the control plane
+// resolves for itself.
+func TestDevScenarioWorkflowPassesOnlyThePinnedTrinoImage(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml"))
+	if err != nil {
+		t.Fatalf("read dev scenario workflow: %v", err)
+	}
+	workflow := string(raw)
+
+	for _, required := range []string{
+		"trino_benchmark_image:",
+		"DUCKGRES_TRINO_BENCHMARK_IMAGE: ${{ inputs.trino_benchmark_image || '' }}",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("workflow missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"DUCKGRES_TRINO_BENCHMARK_ENABLED: true",
+		"TRINO_DUCKLAKE_DB_PASSWORD",
+		"TRINO_READER_PASSWORD",
+		"trino_reader_password",
+		"s3.aws-secret-key",
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("workflow contains Trino credential or unconditional enable %q", forbidden)
+		}
+	}
+}

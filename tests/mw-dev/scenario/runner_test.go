@@ -17,6 +17,7 @@ import (
 	scenarioperf "github.com/posthog/duckgres/tests/mw-dev/scenario/perf"
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
+	scenariotrino "github.com/posthog/duckgres/tests/mw-dev/scenario/trino"
 )
 
 var (
@@ -58,6 +59,13 @@ func TestScenarioRunner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create provision client: %v", err)
 	}
+	trinoClient, err := scenariotrino.NewClient(scenariotrino.ClientConfig{
+		BaseURL:        mustEnv(t, "DUCKGRES_SCENARIO_API_BASE"),
+		InternalSecret: mustEnv(t, "DUCKGRES_SCENARIO_INTERNAL_SECRET"),
+	})
+	if err != nil {
+		t.Fatalf("create Trino lifecycle client: %v", err)
+	}
 	provisionState := provision.NewState()
 	provisionExecutor := provision.NewExecutor(provision.ExecutorConfig{
 		Client: provisionClient,
@@ -80,6 +88,7 @@ func TestScenarioRunner(t *testing.T) {
 		},
 	})
 	scenarioOutputDir := filepath.Join(*scenarioOutputBase, runID)
+	trinoState := scenariotrino.NewState()
 	perfExecutor := scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{
 		ProvisionState: provisionState,
 		Connection: scenariosql.ConnectionConfig{
@@ -90,7 +99,8 @@ func TestScenarioRunner(t *testing.T) {
 			ConnectTimeout:  intEnv(t, "DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT", 10),
 			ApplicationName: "duckgres-scenario-runner",
 		},
-		OutputDir: scenarioOutputDir,
+		OutputDir:  scenarioOutputDir,
+		TrinoState: trinoState,
 	})
 	dbtExecutor := scenariodbt.NewExecutor(scenariodbt.ExecutorConfig{
 		ProvisionState: provisionState,
@@ -105,13 +115,14 @@ func TestScenarioRunner(t *testing.T) {
 		OutputDir: scenarioOutputDir,
 		DBTBinary: envOrDefault("DUCKGRES_SCENARIO_DBT_BIN", "dbt"),
 	})
+	trinoExecutor := scenariotrino.NewExecutor(scenariotrino.ExecutorConfig{Lifecycle: trinoClient, State: trinoState})
 
 	ctx, cancel := context.WithTimeout(context.Background(), *scenarioMaxRuntime)
 	defer cancel()
 	runner := core.NewRunner(core.RunnerConfig{
 		RunID:          runID,
 		Scenario:       loaded,
-		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor, dbt: dbtExecutor},
+		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor, dbt: dbtExecutor, trino: trinoExecutor},
 		OutputDir:      scenarioOutputDir,
 		WriteFiles:     true,
 		CleanupTimeout: 15 * time.Minute,
@@ -163,10 +174,12 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 	const scenarioOrgID = "ci-pr-123-cnpg"
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 
 	for _, scenarioFile := range []string{
 		"posthog_frozen_metadata.yaml",
 		"posthog_frozen_perf.yaml",
+		"posthog_frozen_trino_perf.yaml",
 		"posthog_frozen_dbt.yaml",
 		"fast-suite.yaml",
 		"full-suite.yaml",
@@ -206,6 +219,18 @@ func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDispatchSupportsTrinoLifecycleSteps(t *testing.T) {
+	for _, stepType := range []string{
+		scenariotrino.StepTypeProvisionTrino,
+		scenariotrino.StepTypeWaitTrinoReady,
+		scenariotrino.StepTypeDeprovisionTrino,
+	} {
+		if !dispatchSupports(stepType) {
+			t.Fatalf("dispatch does not support Trino lifecycle step %q", stepType)
+		}
 	}
 }
 
@@ -445,6 +470,9 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 	}
 }
 
+// The PGWire-only frozen perf scenario is UNCHANGED by the Trino work: the
+// paired comparison lives in its own scenario file. These two cases are the
+// tripwire for that — Trino must never be silently enabled here.
 func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
@@ -462,6 +490,10 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	for _, step := range resolved.Steps {
 		if !dispatchSupports(step.Type) {
 			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		switch step.Type {
+		case scenariotrino.StepTypeProvisionTrino, scenariotrino.StepTypeWaitTrinoReady, scenariotrino.StepTypeDeprovisionTrino:
+			t.Fatalf("PGWire-only frozen perf scenario must not contain Trino lifecycle step %s", step.ID)
 		}
 		if containsTemplate(step.With) {
 			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
@@ -508,6 +540,91 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 	for _, step := range resolved.Steps {
 		steps[step.ID] = step
 	}
+	if got := steps["setup_posthog_tables"].DependsOn; len(got) != 1 || got[0] != "setup_frozen_views" {
+		t.Fatalf("posthog setup dependencies = %#v, want [setup_frozen_views]", got)
+	}
+	if got := steps["validate_posthog_tables"].DependsOn; len(got) != 1 || got[0] != "setup_posthog_tables" {
+		t.Fatalf("posthog validation dependencies = %#v, want [validate_posthog_tables]", got)
+	}
+	if got := steps["perf_queries"].DependsOn; len(got) != 1 || got[0] != "validate_posthog_tables" {
+		t.Fatalf("perf dependencies = %#v, want [validate_posthog_tables]", got)
+	}
+}
+
+func TestFrozenTrinoPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_trino_perf.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen perf scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-trino-perf-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	foundPerf := false
+	for _, step := range resolved.Steps {
+		if !dispatchSupports(step.Type) {
+			t.Fatalf("step %s has unsupported type %q", step.ID, step.Type)
+		}
+		if containsTemplate(step.With) {
+			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
+		}
+		if step.Type != scenarioperf.StepTypePerfQueries {
+			continue
+		}
+		foundPerf = true
+		catalogFile, ok := step.With["catalog_file"].(string)
+		if !ok || !filepath.IsAbs(catalogFile) {
+			t.Fatalf("perf catalog_file = %#v, want absolute path", step.With["catalog_file"])
+		}
+		if _, err := os.Stat(catalogFile); err != nil {
+			t.Fatalf("perf catalog file %q should exist: %v", catalogFile, err)
+		}
+		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-trino-perf-20260102t030405z" {
+			t.Fatalf("perf run_id = %q, want scenario run id", runID)
+		}
+		if _, ok := step.With["flight_addr"]; ok {
+			t.Fatal("frozen perf scenario should not configure the deprecated Flight endpoint")
+		}
+		assertPerfQueryErrorsFailStep(t, step)
+		assertFrozenPerfTargets(t, step)
+		if _, ok := step.With["trino_endpoint"]; ok {
+			t.Fatal("frozen perf scenario must obtain the Trino endpoint from the lifecycle state, not YAML")
+		}
+	}
+	if !foundPerf {
+		t.Fatal("expected frozen perf scenario to include a perf_queries step")
+	}
+}
+
+func assertFrozenPerfTargets(t *testing.T, step core.Step) {
+	t.Helper()
+	targets, ok := step.With["targets"].([]any)
+	if !ok || len(targets) != 2 || targets[0] != "pgwire" || targets[1] != "trino" {
+		t.Fatalf("perf targets = %#v, want [pgwire trino]", step.With["targets"])
+	}
+}
+
+func TestFrozenTrinoPerfScenarioOrdersTrinoLifecycleAroundThePerfStep(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
+
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_trino_perf.yaml"))
+	if err != nil {
+		t.Fatalf("load frozen perf scenario: %v", err)
+	}
+	resolved, err := resolveRunTemplates(scenario, "scenario-frozen-trino-perf-20260102t030405z")
+	if err != nil {
+		t.Fatalf("resolve templates: %v", err)
+	}
+
+	steps := make(map[string]core.Step, len(resolved.Steps))
+	for _, step := range resolved.Steps {
+		steps[step.ID] = step
+	}
 	setup, ok := steps["setup_posthog_tables"]
 	if !ok {
 		t.Fatal("expected posthog table setup step")
@@ -529,8 +646,29 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 	if got := validation.DependsOn; len(got) != 1 || got[0] != "setup_posthog_tables" {
 		t.Fatalf("posthog validation dependencies = %#v, want [setup_posthog_tables]", got)
 	}
-	if got := steps["perf_queries"].DependsOn; len(got) != 1 || got[0] != "validate_posthog_tables" {
-		t.Fatalf("perf dependencies = %#v, want [validate_posthog_tables]", got)
+	provisionTrino, ok := steps["provision_trino"]
+	if !ok || provisionTrino.Type != scenariotrino.StepTypeProvisionTrino {
+		t.Fatal("expected Trino provisioning step")
+	}
+	if got := provisionTrino.DependsOn; len(got) != 1 || got[0] != "validate_posthog_tables" {
+		t.Fatalf("Trino provisioning dependencies = %#v, want [validate_posthog_tables]", got)
+	}
+	request, _ := provisionTrino.With["request"].(map[string]any)
+	if workers, ok := request["workers"].(int); !ok || workers != 4 {
+		t.Fatalf("Trino workers = %#v, want 4", request["workers"])
+	}
+	if got := steps["wait_trino_ready"].DependsOn; len(got) != 1 || got[0] != "provision_trino" {
+		t.Fatalf("Trino readiness dependencies = %#v, want [provision_trino]", got)
+	}
+	if got := steps["perf_queries"].DependsOn; len(got) != 1 || got[0] != "wait_trino_ready" {
+		t.Fatalf("perf dependencies = %#v, want [wait_trino_ready]", got)
+	}
+	teardownTrino, ok := steps["deprovision_trino"]
+	if !ok || !teardownTrino.AlwaysRun {
+		t.Fatal("expected always-run Trino teardown")
+	}
+	if got := steps["deprovision"].DependsOn; len(got) != 1 || got[0] != "deprovision_trino" {
+		t.Fatalf("warehouse teardown dependencies = %#v, want [deprovision_trino]", got)
 	}
 }
 
@@ -853,6 +991,7 @@ type dispatchExecutor struct {
 	sql       *scenariosql.Executor
 	perf      *scenarioperf.Executor
 	dbt       *scenariodbt.Executor
+	trino     *scenariotrino.Executor
 }
 
 func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error {
@@ -865,6 +1004,8 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 		return e.perf.ExecuteStep(ctx, step)
 	case scenariodbt.StepTypeDBTRun:
 		return e.dbt.ExecuteStep(ctx, step)
+	case scenariotrino.StepTypeProvisionTrino, scenariotrino.StepTypeWaitTrinoReady, scenariotrino.StepTypeDeprovisionTrino:
+		return e.trino.ExecuteStep(ctx, step)
 	default:
 		return fmt.Errorf("unsupported scenario step type %q", step.Type)
 	}
@@ -886,6 +1027,8 @@ func dispatchSupports(stepType string) bool {
 	case scenarioperf.StepTypePerfQueries:
 		return true
 	case scenariodbt.StepTypeDBTRun:
+		return true
+	case scenariotrino.StepTypeProvisionTrino, scenariotrino.StepTypeWaitTrinoReady, scenariotrino.StepTypeDeprovisionTrino:
 		return true
 	default:
 		return false

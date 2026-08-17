@@ -122,6 +122,7 @@ type Resolved struct {
 	K8sExploratoryWorkerTTL         time.Duration
 	K8sReshardPodCPU                string
 	K8sReshardPodMemory             string
+	TrinoBenchmark                  controlplane.TrinoBenchmarkSettings
 	AWSRegion                       string
 	ConfigStoreConn                 string
 	ConfigPollInterval              time.Duration
@@ -810,6 +811,54 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		k8sReshardPodMemory = v
 	}
 
+	// Dev-only Trino benchmark lifecycle (env-only, like the other pod-shape
+	// knobs). Defaults keep it OFF with no image: a deployment must opt in AND
+	// pin an image, and the charts-created reader identity must resolve, before
+	// any benchmark cluster can exist. See controlplane.TrinoBenchmarkSettings.
+	trinoBenchmark := controlplane.TrinoBenchmarkSettings{
+		Workers:           4,
+		ImagePullPolicy:   "IfNotPresent",
+		CoordinatorCPU:    "2",
+		CoordinatorMemory: "8Gi",
+		WorkerCPU:         "2",
+		WorkerMemory:      "8Gi",
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			trinoBenchmark.Enabled = b
+		} else {
+			warn("Invalid DUCKGRES_TRINO_BENCHMARK_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_IMAGE"); v != "" {
+		trinoBenchmark.Image = v
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_IMAGE_PULL_POLICY"); v != "" {
+		trinoBenchmark.ImagePullPolicy = v
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_SERVICE_ACCOUNT"); v != "" {
+		trinoBenchmark.ServiceAccount = v
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			trinoBenchmark.Workers = n
+		} else {
+			warn("Invalid DUCKGRES_TRINO_BENCHMARK_WORKERS: " + v)
+		}
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_COORDINATOR_CPU"); v != "" {
+		trinoBenchmark.CoordinatorCPU = v
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_COORDINATOR_MEMORY"); v != "" {
+		trinoBenchmark.CoordinatorMemory = v
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_WORKER_CPU"); v != "" {
+		trinoBenchmark.WorkerCPU = v
+	}
+	if v := getenv("DUCKGRES_TRINO_BENCHMARK_WORKER_MEMORY"); v != "" {
+		trinoBenchmark.WorkerMemory = v
+	}
+
 	// Connection-string worker-profile config.
 	if v := getenv("DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
@@ -1191,6 +1240,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sExploratoryWorkerTTL:         k8sExploratoryWorkerTTL,
 		K8sReshardPodCPU:                k8sReshardPodCPU,
 		K8sReshardPodMemory:             k8sReshardPodMemory,
+		TrinoBenchmark:                  trinoBenchmark,
 		AWSRegion:                       awsRegion,
 		ConfigStoreConn:                 configStoreConn,
 		ConfigPollInterval:              configPollInterval,

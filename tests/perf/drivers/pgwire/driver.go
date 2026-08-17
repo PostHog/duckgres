@@ -55,6 +55,31 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	}, err
 }
 
+// scalarExecutor is OPTIONALLY implemented by an Executor that can return a
+// single string value. Keeping it separate from Executor means existing fakes
+// (and the perf harness's own) need no change: a driver whose executor does not
+// implement it simply reports the engine without a version.
+type scalarExecutor interface {
+	Scalar(ctx context.Context, query string) (string, error)
+}
+
+// Environment reports the non-secret comparison metadata recorded in the perf
+// artifact for this protocol.
+func (d *Driver) Environment(ctx context.Context) (core.ProtocolEnvironment, error) {
+	env := core.ProtocolEnvironment{Protocol: core.ProtocolPGWire, Engine: "duckgres"}
+	scalar, ok := d.exec.(scalarExecutor)
+	if !ok {
+		return env, nil
+	}
+	version, err := scalar.Scalar(ctx, "SELECT version()")
+	if err != nil {
+		// Best-effort metadata: never fail a benchmark over it.
+		return env, err
+	}
+	env.Version = version
+	return env, nil
+}
+
 func (d *Driver) Close() error {
 	if d.exec == nil {
 		return nil
@@ -103,6 +128,15 @@ func (e *sqlExecutor) Execute(ctx context.Context, query string, args []any) (in
 		return 0, nil
 	}
 	return affected, nil
+}
+
+// Scalar runs a single-value query for engine-version reporting.
+func (e *sqlExecutor) Scalar(ctx context.Context, query string) (string, error) {
+	var value string
+	if err := e.db.QueryRowContext(ctx, query).Scan(&value); err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func (e *sqlExecutor) Close() error {

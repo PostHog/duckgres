@@ -211,6 +211,11 @@ type K8sConfig struct {
 	ExploratoryWorkerCPU    string
 	ExploratoryWorkerMemory string
 	ExploratoryWorkerTTL    time.Duration
+
+	// TrinoBenchmark configures the dev-only, opt-in Trino benchmark
+	// lifecycle (env-only; see TrinoBenchmarkSettings). Disabled by default:
+	// the API then answers 503 and no benchmark cluster can be created.
+	TrinoBenchmark TrinoBenchmarkSettings
 }
 
 // ControlPlane manages the TCP listener and routes connections to Flight SQL workers.
