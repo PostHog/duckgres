@@ -279,6 +279,12 @@ func truncateQuery(q string) string {
 	return q
 }
 
+// BoundQueryLogText is the shared 4096-byte UTF-8-safe cap used by the
+// durable query log and the PostHog OTLP query-text handler.
+func BoundQueryLogText(text string) string {
+	return boundQueryLogText(text)
+}
+
 // boundQueryLogText caps control-plane query-log text before it reaches logs,
 // in-memory queues, normalization, or RPC serialization. Clone the retained
 // text so a bounded entry cannot keep a much larger query allocation alive.

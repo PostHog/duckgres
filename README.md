@@ -407,11 +407,14 @@ Run with config file:
 | `DUCKGRES_EXPLORATORY_WORKER_CPU` | CPU request/limit of the exploratory worker pod (e.g. `1`, `500m`). Required (with the memory knob) for the tier to activate; a missing or invalid value logs a warning and leaves the tier OFF. Env-only. | - |
 | `DUCKGRES_EXPLORATORY_WORKER_MEMORY` | Memory request/limit of the exploratory worker pod (e.g. `2Gi`). Same requirement as the CPU knob. Env-only. | - |
 | `DUCKGRES_EXPLORATORY_WORKER_TTL` | Hot-idle TTL of exploratory worker pods (Go duration) — how long one stays parked for the org's next connection after its last one ends. Env-only. | `48h` |
-| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events**. Application logs carry query text — to get events without exporting SQL, leave this unset and use `POSTHOG_ANALYTICS_API_KEY` | - |
-| `POSTHOG_ANALYTICS_API_KEY` | PostHog project API key for product-analytics events **only**, leaving log export off. Takes precedence over `POSTHOG_API_KEY` for analytics | - |
+| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events**. Exported WARN/ERROR logs carry `RedactForLog`+4096 SQL (secret DDL is a placeholder). To get events without exporting SQL, leave this unset and use `POSTHOG_ANALYTICS_API_KEY` | - |
+| `POSTHOG_ANALYTICS_API_KEY` | PostHog project API key for product-analytics events **only**, leaving log export off. Takes precedence over `POSTHOG_API_KEY` for analytics. Never copied to worker pods | - |
 | `POSTHOG_HOST` | PostHog ingest host (shared by both exporters) | `us.i.posthog.com` |
-| `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
-| `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` (e.g., `duckgres-acme`). Applies to **both** the log export and the OTLP trace export — they share one resource — so setting it renames the service in traces too, not just logs | - |
+| `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated extra PostHog API keys for log export. Requires `POSTHOG_API_KEY`. CP-only; not forwarded to workers | - |
+| `DUCKGRES_POSTHOG_LOG_LEVEL` | Minimum level exported to PostHog Logs (`debug`/`info`/`warn`/`error`). Stderr stays at `DUCKGRES_LOG_LEVEL`. User-class `Query execution failed.` is Info and does **not** export at the default | `warn` |
+| `DUCKGRES_POSTHOG_LOG_INFO_SAMPLE` | Fraction of INFO records to keep on the PostHog branch (`0`–`1`). WARN/ERROR are never sampled | `0` |
+| `DUCKGRES_POSTHOG_LOG_QUERY_TEXT` | How query attrs are exported: `off` (drop), `redacted` (`RedactForLog`+4096; ordinary SELECT text still leaves), `on` (stderr-equivalent) | `redacted` |
+| `DUCKGRES_IDENTIFIER` | Resource attr `duckgres.deployment` (and `deployment.environment` when the value is exactly `dev`/`staging`/`production`). **Does not** suffix `service.name`. Shared by logs and traces | - |
 
 ### Client-requested idle timeout
 
@@ -430,9 +433,13 @@ unlimited timeout because idle sessions retain worker capacity.
 
 ### PostHog Logging
 
-Duckgres can optionally export structured logs to [PostHog Logs](https://posthog.com/docs/logs) via the OpenTelemetry Protocol (OTLP). Logs are always written to stderr regardless of this setting.
+Duckgres can optionally export structured logs to [PostHog Logs](https://posthog.com/docs/logs) via the OpenTelemetry Protocol (OTLP). Logs are always written to stderr regardless of this setting. PostHog export defaults to **WARN+ERROR**; stderr stays at `DUCKGRES_LOG_LEVEL`.
 
-To enable, set your PostHog project API key:
+`service.name` is the process role (`duckgres-control-plane`, `duckgres-worker`, `duckgres-reshard`, or `duckgres` for standalone). Traces share that resource — existing VictoriaTraces / dashboards that filtered `service.name=duckgres` or `duckgres-<identifier>` need to follow the new names. `DUCKGRES_IDENTIFIER` is now `duckgres.deployment`, not a service-name suffix.
+
+Exported WARN/ERROR records keep query text after `usersecrets.RedactForLog` + a 4096-byte cap (`DUCKGRES_POSTHOG_LOG_QUERY_TEXT=redacted`). Secret DDL becomes a placeholder; ordinary SELECT text and its literals **do** leave the cluster. Anyone who can read the destination PostHog project can see `org`, `user` (including `svc_` service credentials), client IPs, and that redacted SQL.
+
+To enable, set your PostHog project API key (same project as product-analytics events in managed-warehouse):
 
 ```bash
 export POSTHOG_API_KEY=phc_your_project_api_key
@@ -446,6 +453,8 @@ export POSTHOG_API_KEY=phc_your_project_api_key
 export POSTHOG_HOST=eu.i.posthog.com
 ./duckgres
 ```
+
+Remote worker pods do **not** inherit `POSTHOG_*` from the control-plane Deployment automatically — spawn builds an explicit env list. Until worker Secret-ref plumbing is in place, only processes that already have `POSTHOG_API_KEY` in their own env (control plane, process-backend children) export.
 
 ### PostHog Product-Analytics Events
 

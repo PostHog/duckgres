@@ -79,9 +79,11 @@ func main() {
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
 		// Use the same logging/tracing setup as parent for consistent format
-		loggingShutdown := cliboot.InitLogging()
+		_ = os.Setenv("DUCKGRES_MODE", "duckdb-service")
+		bi := buildInfo()
+		loggingShutdown := cliboot.InitLogging(bi)
 		defer loggingShutdown()
-		tracingShutdown := cliboot.InitTracing()
+		tracingShutdown := cliboot.InitTracing(bi)
 		defer tracingShutdown()
 		duckdbservice.LogCacheProxyStatus()
 		server.RunChildMode()
@@ -200,13 +202,15 @@ func main() {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
-	loggingShutdown := cliboot.InitLogging()
+	_ = os.Setenv("DUCKGRES_MODE", *mode)
+	bi := buildInfo()
+	loggingShutdown := cliboot.InitLogging(bi)
 	defer loggingShutdown()
 
 	analyticsShutdown := cliboot.InitAnalytics()
 	defer analyticsShutdown()
 
-	tracingShutdown := cliboot.InitTracing()
+	tracingShutdown := cliboot.InitTracing(bi)
 	defer tracingShutdown()
 
 	buildInfo().Log(*mode)

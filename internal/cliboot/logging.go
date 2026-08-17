@@ -148,7 +148,14 @@ func (h *RedactingHandler) WithGroup(name string) slog.Handler {
 // would otherwise pass through verbatim. Defense-in-depth on top of callers that
 // should already be logging a fingerprint instead of the raw token.
 var redactedKeys = map[string]bool{
-	"token": true,
+	"token":                 true,
+	"password":              true,
+	"credential_secret":     true,
+	"secret":                true,
+	"secret_statements":     true,
+	"authorization":         true,
+	"aws_secret_access_key": true,
+	"session_token":         true,
 }
 
 func redactAttr(a slog.Attr) slog.Attr {
@@ -301,7 +308,7 @@ func FlushLogging() {
 // Logs always go to stderr; PostHog is additive.
 // The log level is controlled by DUCKGRES_LOG_LEVEL (debug, info, warn, error).
 // Returns a shutdown function that flushes all OTLP batch processors.
-func InitLogging() func() {
+func InitLogging(bi BuildInfo) func() {
 	level := parseLogLevel()
 
 	apiKey := os.Getenv("POSTHOG_API_KEY")
@@ -358,15 +365,16 @@ func InitLogging() func() {
 		processors = append(processors, sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)))
 	}
 
-	res := otelResource()
+	res := otelResource(bi)
 
 	opts := append(processors, sdklog.WithResource(res))
 	provider := sdklog.NewLoggerProvider(opts...)
 
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
+	posthog := newPostHogBranch(otelHandler, parsePostHogLogLevel(), parsePostHogInfoSample(), parsePostHogQueryText())
 
 	slog.SetDefault(slog.New(&RedactingHandler{Inner: &multiHandler{
-		handlers: []slog.Handler{newStderrStampedHandler(level), otelHandler},
+		handlers: []slog.Handler{newStderrStampedHandler(level), posthog},
 	}}))
 
 	slog.Info("PostHog logging enabled.", "host", host, "exporters", len(processors))
