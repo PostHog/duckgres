@@ -34,6 +34,9 @@ func otelResource(bi BuildInfo) *resource.Resource {
 	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
 		attrs = append(attrs, semconv.K8SNamespaceName(ns))
 	}
+	if mode := os.Getenv("DUCKGRES_MODE"); mode != "" {
+		attrs = append(attrs, attribute.String("duckgres.mode", mode))
+	}
 	return resource.NewWithAttributes(semconv.SchemaURL, attrs...)
 }
 

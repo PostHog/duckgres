@@ -596,9 +596,6 @@ func (c *clientConn) logger() *slog.Logger {
 	if c.pid != 0 {
 		attrs = append(attrs, "pid", c.pid)
 	}
-	if qs := c.QuerySource(); qs != "" && qs != "standard" {
-		attrs = append(attrs, "query_source", qs)
-	}
 	return slog.With(attrs...)
 }
 
