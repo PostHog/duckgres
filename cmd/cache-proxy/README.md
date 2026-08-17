@@ -117,8 +117,27 @@ span for every probe. `org_id` is intentionally absent — the proxy has no
 per-request tenant identity.
 
 > The cache proxy is not deployed in the `tests/e2e-mw-dev` environment
-> (`DUCKGRES_CACHE_ENABLED` is off there), so this behavior is gated by the unit
-> test `cmd/cache-proxy/tracing_test.go`, not an e2e harness assertion.
+> (`DUCKGRES_CACHE_ENABLED` is off there). Unit tests in
+> `cmd/cache-proxy/tracing_test.go` cover propagation behavior; validate the
+> complete trace in a cache-enabled dev deployment.
+
+### Looking up a query trace
+
+Run the query to validate, then obtain its terminal `trace_id` from
+`ducklake.system.query_log`. In Grafana, open **Explore**, select the
+**VictoriaTraces** datasource, choose **TraceID**, and paste that value.
+
+A cache-enabled query should include both `duckgres` and
+`duckgres-cache-proxy`, with Flight `DoGet` and its related cache spans. A peer
+hit also includes `cache.peer_lookup` plus `cache.peer_get` and
+`cache.peer_serve`. A comparison using `s3_cache=passthrough` instead shows
+`cache.forward` and origin work, without cache-hit or peer spans.
+
+Do not use Grafana Traces Drilldown for this lookup: the VictoriaTraces
+datasource is configured through the Jaeger plugin, so its `Datasource was not
+found` message does not indicate missing trace data. Treat trace IDs as
+diagnostic identifiers; do not add them to Prometheus labels or shared
+artifacts.
 
 Origin `GET` misses are retried up to 4 total attempts for transient failures:
 HTTP `408`, `429`, `500`, `502`, `503`, `504`, request timeouts, and common
