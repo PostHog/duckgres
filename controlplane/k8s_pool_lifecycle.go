@@ -41,6 +41,7 @@ func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string, origin Lif
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
+	forgetWorkerOTLPExport(id)
 
 	go p.retireWorkerPod(id, w)
 	return true
@@ -70,6 +71,7 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 		workerCount := len(p.workers)
 		p.mu.Unlock()
 		observeControlPlaneWorkers(workerCount)
+		forgetWorkerOTLPExport(id)
 		go p.retireWorkerPod(id, w)
 		return true
 	}
@@ -136,6 +138,7 @@ func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int, origin LifecycleOrigin)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
+	forgetWorkerOTLPExport(id)
 	go p.retireWorkerPod(id, w)
 }
 
@@ -437,6 +440,9 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForLease(lease))
 							cancel()
 						}()
+						if hcResult != nil {
+							observeWorkerOTLPExportFromHealth(lease.workerID, hcResult)
+						}
 						// Skip both metric emission AND failure-counter
 						// increment when the parent loop ctx was canceled
 						// (CP shutting down). Without this guard:

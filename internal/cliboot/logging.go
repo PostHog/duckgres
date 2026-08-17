@@ -369,6 +369,7 @@ func InitLogging(bi BuildInfo) func() {
 
 	opts := append(processors, sdklog.WithResource(res))
 	provider := sdklog.NewLoggerProvider(opts...)
+	markOTLPExportEnabled()
 
 	otelHandler := otelslog.NewHandler("duckgres", otelslog.WithLoggerProvider(provider))
 	posthog := newPostHogBranch(otelHandler, parsePostHogLogLevel(), parsePostHogInfoSample(), parsePostHogQueryText())

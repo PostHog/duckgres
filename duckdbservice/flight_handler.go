@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	bindings "github.com/duckdb/duckdb-go-bindings"
+	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -471,6 +472,8 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 		"session_progress":        sessionProgress,
 		"instance_invalidated":    instanceInvalidated,
 		"instance_invalid_reason": h.pool.InstanceInvalidReason(),
+		"otlp_export_enabled":     cliboot.OTLPExportEnabled(),
+		"otlp_export_failures":    cliboot.OTLPExportFailures(),
 	})
 	return sendActionResult(stream, &flight.Result{Body: resp})
 }
