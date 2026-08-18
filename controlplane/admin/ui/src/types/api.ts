@@ -703,3 +703,24 @@ export interface MonthlyUsageResponse {
   watermark_low: string | null;
   rows: MonthlyUsageRow[];
 }
+
+// GET /api/v1/orgs/:id/usage/daily — the org detail page's usage charts.
+// One row per (UTC date, team), compute + storage merged, over the retained
+// billing buffer (same retention as the monthly view: acked buckets are
+// deleted, >30d buckets GC'd — watermark_low marks where billed data went).
+export interface DailyUsageRow {
+  date: string; // "YYYY-MM-DD" UTC
+  team_id: number;
+  schema_name: string | null;
+  cpu_seconds: number;
+  memory_seconds: number;
+  gib_seconds: number;
+}
+
+export interface DailyUsageResponse {
+  org_id: string;
+  days: number;
+  from: string;
+  watermark_low: string | null;
+  rows: DailyUsageRow[];
+}

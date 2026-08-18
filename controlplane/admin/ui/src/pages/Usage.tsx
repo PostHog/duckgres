@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Coins, Cpu, Database, MemoryStick, ShieldAlert } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
@@ -10,13 +11,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useMonthlyUsage, useOrgLabels } from "@/hooks/useApi";
-import { fmtTime } from "@/lib/format";
+import { fmtTime, fmtUnits } from "@/lib/format";
 import type { MonthlyUsageRow } from "@/types/api";
-
-// Whole-unit-friendly: 120 stays "120", 1.5 stays "1.5", thousands group.
-function fmtUnits(n: number): string {
-  return n.toLocaleString(undefined, { maximumFractionDigits: 1 });
-}
 
 const cpuMinutes = (r: MonthlyUsageRow) => r.cpu_seconds / 60;
 const memGiBMinutes = (r: MonthlyUsageRow) => r.memory_seconds / 60;
@@ -29,6 +25,7 @@ function currentMonth(): string {
 
 export function Usage() {
   const { isAdmin } = useIdentity();
+  const navigate = useNavigate();
   const [months, setMonths] = useState(6);
   const usage = useMonthlyUsage(months);
   const orgLabels = useOrgLabels();
@@ -197,6 +194,9 @@ export function Usage() {
                   data={monthRows}
                   columns={columns}
                   initialSorting={[{ id: "cpu_minutes", desc: true }]}
+                  // Click through to the org's daily usage charts.
+                  onRowClick={(r) => navigate(`/orgs/${encodeURIComponent(r.org_id)}`)}
+                  rowClassName={() => "cursor-pointer"}
                 />
               </Card>
             )}

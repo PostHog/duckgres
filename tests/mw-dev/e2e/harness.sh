@@ -758,9 +758,10 @@ connection_duration_logged() { # org password
 # ends (60s width + 30s grace) plus ≤15s flush, so the poll allows ~4
 # minutes. The SAME buffer backs the admin console's Usage page, asserted here
 # too (before the ack deletes it): GET /api/v1/usage/monthly must show the
-# generated compute + storage under the current UTC month per team. This e2e
-# stack has its own config store, so acking here cannot eat
-# production usage.
+# generated compute + storage under the current UTC month per team, and the
+# org detail page's daily series (GET /api/v1/orgs/:id/usage/daily) must show
+# it org-scoped under the current UTC day. This e2e stack has its own config
+# store, so acking here cannot eat production usage.
 compute_usage_pull_api() { # org password
   org="$1"; pw="$2"
   log "compute-usage pull API round-trip on $org"
@@ -796,6 +797,18 @@ compute_usage_pull_api() { # org password
         .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .cpu_seconds>0 and .memory_seconds>0)) | length >= 1' >/dev/null \
     || fail "usage-monthly: no compute row for $org team=$CNPG_TEAM_ID month=$cur_month: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
   log "usage-monthly OK: compute row for $org visible in month $cur_month"
+
+  # The org detail page's usage charts read the same buffer, org-scoped and
+  # day-grained: today's UTC date must carry this org's compute, and the
+  # response must contain ONLY this org (the handler derives the org scope
+  # from the path — a wrong scope is the cross-account leak).
+  cur_day="$(date -u +%F)"
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg d "$cur_day" '
+        .org_id == $o and
+        (.rows | map(select(.team_id==$t and .date==$d and .cpu_seconds>0)) | length >= 1)' >/dev/null \
+    || fail "usage-daily: no compute row for $org team=$CNPG_TEAM_ID date=$cur_day: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" | head -c 600)"
+  log "usage-daily OK: compute row for $org visible on $cur_day"
 
   # Ack the served watermark; the cursor must advance and acked buckets die.
   ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
@@ -843,6 +856,14 @@ compute_usage_pull_api() { # org password
         .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .gib_seconds>0)) | length >= 1' >/dev/null \
     || fail "usage-monthly: no storage row for $org team=$CNPG_TEAM_ID: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
   log "usage-monthly OK: storage row for $org visible"
+
+  # Same for the org-scoped daily series (storage family).
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg d "$(date -u +%F)" '
+        .org_id == $o and
+        (.rows | map(select(.team_id==$t and .date==$d and .gib_seconds>0)) | length >= 1)' >/dev/null \
+    || fail "usage-daily: no storage row for $org team=$CNPG_TEAM_ID: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" | head -c 600)"
+  log "usage-daily OK: storage row for $org visible"
 
   # The shared ack must clear storage buckets too: ack the served watermark,
   # then the next GET's storage array must not contain rows ≤ it for this org
@@ -2749,6 +2770,8 @@ admin_console_api() {
   # internal secret, which is admin.
   code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/usage/monthly")"
   [ "$code" = "401" ] || fail "GET /usage/monthly with no auth returned $code, want 401"
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/orgs/$CNPG/usage/daily")"
+  [ "$code" = "401" ] || fail "GET /orgs/$CNPG/usage/daily with no auth returned $code, want 401"
   # Live read endpoints return their documented envelopes.
   # /queries aggregates each CP's in-memory view and reports coverage. The CI CP
   # runs a SINGLE replica, so this only asserts the envelope (cp_total==cp_responders,
@@ -2791,6 +2814,14 @@ admin_console_api() {
     || fail "/usage/monthly did not return its envelope"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/usage/monthly?months=0")"
   [ "$code" = "400" ] || fail "/usage/monthly?months=0 returned $code, want 400"
+  # The per-org daily series (org detail page's usage charts): same envelope
+  # + validation, org-scoped. Populated rows are asserted in
+  # compute_usage_pull_api; here the org may simply have no usage yet.
+  curl -fsS -H "$H" "$API/api/v1/orgs/$CNPG/usage/daily?days=7" \
+    | jq -e --arg o "$CNPG" '.org_id == $o and has("rows") and (.rows | type == "array") and has("days") and has("watermark_low")' >/dev/null \
+    || fail "/orgs/$CNPG/usage/daily did not return its envelope"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs/$CNPG/usage/daily?days=99")"
+  [ "$code" = "400" ] || fail "/orgs/$CNPG/usage/daily?days=99 returned $code, want 400"
 
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
   # Includes the per-org/per-source worker-acquire-latency panels. (The raw

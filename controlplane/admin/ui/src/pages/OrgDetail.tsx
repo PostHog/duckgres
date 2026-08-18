@@ -27,6 +27,7 @@ import { databaseNameProblem } from "@/lib/databaseName";
 import { ducklingBroken, ducklingEntryFor, fmtTime, orgLabel } from "@/lib/format";
 import { CopyButton } from "@/components/CopyButton";
 import { ShardBadge } from "@/components/ShardBadge";
+import { OrgUsageSection } from "@/pages/OrgUsage";
 import {
   useDatabaseNameAvailable,
   useDeleteOrg,
@@ -359,6 +360,7 @@ export function OrgDetail() {
 
           <WarehousePanel orgId={id} data={warehouse.data ?? null} loading={warehouse.isLoading} error={warehouse.error} />
         </div>
+        <OrgUsageSection orgId={id} />
         <OrgTeamsCard orgId={id} />
       </PageBody>
 

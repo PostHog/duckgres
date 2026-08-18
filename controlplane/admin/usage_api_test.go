@@ -13,13 +13,18 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-// fakeMonthlyUsageStore is an in-memory monthlyUsageStore for handler tests.
+// fakeMonthlyUsageStore is an in-memory usageStore for handler tests.
 type fakeMonthlyUsageStore struct {
 	compute   []configstore.MonthlyComputeUsageRow
 	storage   []configstore.MonthlyStorageUsageRow
 	cursor    time.Time
 	hasCursor bool
 	err       error
+
+	dailyCompute  []configstore.DailyComputeUsageRow
+	dailyStorage  []configstore.DailyStorageUsageRow
+	lastDailyOrg  string
+	lastDailyFrom time.Time
 }
 
 func (s *fakeMonthlyUsageStore) AggregateComputeUsageMonthly(from time.Time) ([]configstore.MonthlyComputeUsageRow, error) {
@@ -36,7 +41,7 @@ func (s *fakeMonthlyUsageStore) ComputeBillingCursor() (time.Time, bool, error) 
 // (registerUsageAPI, which self-gates with RequireAdmin), with an injected
 // identity standing in for AuthMiddleware. role="" simulates an
 // unauthenticated caller (no identity in context).
-func setupUsageRouter(store monthlyUsageStore, role Role) *gin.Engine {
+func setupUsageRouter(store usageStore, role Role) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	if role != "" {
@@ -50,7 +55,7 @@ func setupUsageRouter(store monthlyUsageStore, role Role) *gin.Engine {
 
 // setupUsageRouterAt mounts the route with a controllable clock (window
 // tests); caller is an admin.
-func setupUsageRouterAt(store monthlyUsageStore, now func() time.Time) *gin.Engine {
+func setupUsageRouterAt(store usageStore, now func() time.Time) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(func(c *gin.Context) {
@@ -58,6 +63,7 @@ func setupUsageRouterAt(store monthlyUsageStore, now func() time.Time) *gin.Engi
 	})
 	h := &usageAPIHandler{store: store, now: now}
 	r.GET("/api/v1/usage/monthly", RequireAdmin(), h.getMonthlyUsage)
+	r.GET("/api/v1/orgs/:id/usage/daily", RequireAdmin(), h.getDailyUsage)
 	return r
 }
 
@@ -227,3 +233,113 @@ var errFakeUsageStore = errFakeUsageStoreT{}
 type errFakeUsageStoreT struct{}
 
 func (errFakeUsageStoreT) Error() string { return "fake store error" }
+
+// ---- daily per-org usage (org detail page charts) ----
+
+func (s *fakeMonthlyUsageStore) AggregateComputeUsageDaily(orgID string, from time.Time) ([]configstore.DailyComputeUsageRow, error) {
+	s.lastDailyOrg = orgID
+	s.lastDailyFrom = from
+	return s.dailyCompute, s.err
+}
+func (s *fakeMonthlyUsageStore) AggregateStorageUsageDaily(orgID string, from time.Time) ([]configstore.DailyStorageUsageRow, error) {
+	return s.dailyStorage, s.err
+}
+
+// The daily handler merges both families per (date, team) and passes the
+// :id path segment through as the org scope — the SQL is what keeps one
+// org's usage away from another's, so pin that the handler never swaps it.
+func TestDailyUsageScopesToOrgAndMergesFamilies(t *testing.T) {
+	store := &fakeMonthlyUsageStore{
+		dailyCompute: []configstore.DailyComputeUsageRow{
+			{Date: "2026-08-13", TeamID: 5, SchemaName: strptr("team_5"), CPUSeconds: 600, MemorySeconds: 1200},
+			{Date: "2026-08-13", TeamID: 6, CPUSeconds: 60, MemorySeconds: 60},
+		},
+		dailyStorage: []configstore.DailyStorageUsageRow{
+			{Date: "2026-08-13", TeamID: 5, SchemaName: strptr("team_5"), GiBSeconds: "3600"},
+			{Date: "2026-08-14", TeamID: 5, SchemaName: strptr("team_5"), GiBSeconds: "7200"},
+		},
+	}
+	r := setupUsageRouter(store, RoleAdmin)
+
+	code, body := usageRequest(t, r, "/api/v1/orgs/acme/usage/daily?days=7")
+	if code != http.StatusOK {
+		t.Fatalf("status %d: %v", code, body)
+	}
+	if store.lastDailyOrg != "acme" {
+		t.Fatalf("handler queried org %q, want acme — org scope must come from the path", store.lastDailyOrg)
+	}
+	if body["org_id"] != "acme" {
+		t.Fatalf("org_id echo wrong: %v", body)
+	}
+	rows, ok := body["rows"].([]interface{})
+	if !ok || len(rows) != 3 {
+		t.Fatalf("want 3 merged rows, got %v", body["rows"])
+	}
+	// The 2026-08-13 team_5 row carries both families.
+	var d13 map[string]interface{}
+	for _, ri := range rows {
+		m := ri.(map[string]interface{})
+		if m["date"] == "2026-08-13" && m["team_id"].(float64) == 5 {
+			d13 = m
+		}
+	}
+	if d13 == nil || d13["cpu_seconds"].(float64) != 600 || d13["gib_seconds"].(float64) != 3600 {
+		t.Fatalf("merged 08-13/team5 row wrong: %v", d13)
+	}
+	// Storage-only day still appears.
+	var d14 map[string]interface{}
+	for _, ri := range rows {
+		m := ri.(map[string]interface{})
+		if m["date"] == "2026-08-14" {
+			d14 = m
+		}
+	}
+	if d14 == nil || d14["cpu_seconds"].(float64) != 0 || d14["gib_seconds"].(float64) != 7200 {
+		t.Fatalf("storage-only day row wrong: %v", d14)
+	}
+	// Retention transparency travels on this endpoint too.
+	if _, ok := body["watermark_low"]; !ok {
+		t.Fatalf("watermark_low missing: %v", body)
+	}
+}
+
+func TestDailyUsageWindowAndValidation(t *testing.T) {
+	now := func() time.Time { return time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC) }
+	store := &fakeMonthlyUsageStore{}
+	r := setupUsageRouterAt(store, now)
+
+	// days=7 from mid-Aug-15 → window opens 2026-08-09 (7 x 24h back), not at a
+	// month boundary — day granularity means partial days at both edges.
+	code, _ := usageRequest(t, r, "/api/v1/orgs/acme/usage/daily?days=7")
+	if code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	if want := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC); !store.lastDailyFrom.Equal(want) {
+		t.Fatalf("from = %s, want %s", store.lastDailyFrom, want)
+	}
+
+	for _, bad := range []string{"0", "-1", "abc", "32"} {
+		code, _ := usageRequest(t, r, "/api/v1/orgs/acme/usage/daily?days="+bad)
+		if code != http.StatusBadRequest {
+			t.Fatalf("days=%s: status %d, want 400", bad, code)
+		}
+	}
+}
+
+func TestDailyUsageRequiresAdmin(t *testing.T) {
+	store := &fakeMonthlyUsageStore{}
+	for _, tc := range []struct {
+		role Role
+		want int
+	}{
+		{"", http.StatusUnauthorized},
+		{RoleViewer, http.StatusForbidden},
+		{RoleAdmin, http.StatusOK},
+	} {
+		r := setupUsageRouter(store, tc.role)
+		code, _ := usageRequest(t, r, "/api/v1/orgs/acme/usage/daily")
+		if code != tc.want {
+			t.Fatalf("role %q: status %d, want %d", tc.role, code, tc.want)
+		}
+	}
+}
