@@ -27,14 +27,20 @@ available, and forwards cache misses to origin object storage.
 ### Pushed-summary lookup mode
 
 Set `CACHE_PEER_LOOKUP_MODE=summary` only after deploying an image containing
-the summary endpoint to every cache-proxy pod. Each proxy snapshots at most
-1,000,000 opaque SHA-256 cache locators, builds a versioned Bloom filter at a
-1% target false-positive rate, and publishes it with a 45-second TTL about
-every 20 seconds (with jitter). The uncompressed summary body is capped at
-2 MiB and resident peer summaries at 512 MiB; an oversized snapshot is skipped rather than truncated, so published
-filters never have false negatives for their source snapshot. At 1%, filters
-are about 1.20 bytes per entry: roughly 117 KiB for 100k entries and 1.14 MiB
-for 1m entries, plus small metadata and wire encoding overhead.
+the summary endpoint to every cache-proxy pod. Each proxy maintains a bounded,
+versioned counting Bloom filter incrementally as cache entries are committed
+and evicted, then publishes an immutable bit snapshot with a 45-second TTL
+about every 20 seconds (with jitter). Publication therefore does not scan or
+rehash the cache index. The filter is sized for 1,000,000 opaque SHA-256 cache
+locators at a 1% target false-positive rate (1.14 MiB bits plus 18.3 MiB local
+16-bit counters); the JSON wire body is bounded to 2 MiB and resident peer
+summaries to 512 MiB.
+
+The filter continues accepting entries above 1,000,000 rather than ceasing
+publication. Its false-positive rate then rises smoothly; monitor
+`cache_proxy_summary_bloom_false_positive_ratio` and
+`cache_proxy_summary_bloom_saturated`. Counter overflow is deliberately
+sticky, which can add false positives but cannot create false negatives.
 
 On a local miss the requester tests received, non-expired filters locally. No
 positive hint goes straight to origin once every discovered peer has supplied a
@@ -50,8 +56,9 @@ provide authentication; membership validation only bounds retained hints.
 Roll out in non-production first. During a rolling enablement, missing
 summaries reduce peer hits but remain safe. Validate that peer probes per
 logical lookup approach zero after peer-summary coverage converges, direct peer GET attempts stay at or below two,
-peer bytes remain useful, origin latency/bytes do not regress excessively,
-and summary memory/publication traffic remain bounded. Recover by restoring
+peer bytes remain useful, Bloom false-positive rate stays within the rollout
+budget, origin latency/bytes do not regress excessively, and summary
+memory/publication traffic remain bounded. Recover by restoring
 `CACHE_PEER_LOOKUP_MODE=probe`; do not delete cache contents.
 
 When several nodes want the same key at the same moment, only the first to

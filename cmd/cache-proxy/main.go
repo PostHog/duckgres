@@ -140,7 +140,7 @@ func main() {
 	slog.Info("Block mode configured.", "enabled", blockMode, "block_size", blockSize, "max_span_blocks", maxSpanBlocks)
 
 	// Initialize cache store
-	store, err := NewDiskCache(cacheDir, maxPercent)
+	store, err := NewDiskCache(cacheDir, maxPercent, lookupMode == peerLookupSummary && peerService != "")
 	if err != nil {
 		slog.Error("Failed to initialize cache store.", "error", err)
 		os.Exit(1)

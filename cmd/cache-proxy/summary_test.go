@@ -372,3 +372,95 @@ func TestDepartedPeerIsNeverSelectedFromAStaleSummary(t *testing.T) {
 		t.Fatalf("has=%d get=%d origin=%d", hasCalls, getCalls, originCalls)
 	}
 }
+
+func TestIncrementalSummaryIndexTracksInsertionsAndEvictions(t *testing.T) {
+	index := newSummaryIndexWithParams(128, 3, 2)
+	keys := []string{strings.Repeat("8", 64), strings.Repeat("9", 64), strings.Repeat("a", 64)}
+	for _, key := range keys {
+		index.Add(key)
+	}
+	count, bits := index.Snapshot()
+	if count != len(keys) {
+		t.Fatalf("entry count = %d, want %d", count, len(keys))
+	}
+	s := summaryFromIncrementalBits("peer-a", 1, count, 128, 3, bits, time.Now(), time.Minute)
+	for _, key := range keys {
+		if !s.Contains(key) {
+			t.Fatalf("incremental filter omitted inserted key %q", key)
+		}
+	}
+	index.Remove(keys[1])
+	count, bits = index.Snapshot()
+	if count != 2 {
+		t.Fatalf("entry count after eviction = %d, want 2", count)
+	}
+	s = summaryFromIncrementalBits("peer-a", 2, count, 128, 3, bits, time.Now(), time.Minute)
+	if !s.Contains(keys[0]) || !s.Contains(keys[2]) {
+		t.Fatal("eviction cleared a bit shared by a remaining key")
+	}
+}
+
+func TestIncrementalSummaryIndexContinuesPastCapacityAndReportsFPR(t *testing.T) {
+	index := newSummaryIndexWithParams(256, 4, 2)
+	for _, key := range []string{strings.Repeat("b", 64), strings.Repeat("c", 64), strings.Repeat("d", 64)} {
+		index.Add(key)
+	}
+	count, _ := index.Snapshot()
+	if count != 3 {
+		t.Fatalf("entry count = %d, want entries beyond capacity retained", count)
+	}
+	if fpr := index.FalsePositiveRate(); fpr <= 0 {
+		t.Fatalf("FPR = %v, want positive value", fpr)
+	}
+	if !index.Saturated() {
+		t.Fatal("index should report saturation after capacity is exceeded")
+	}
+}
+
+func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.T) {
+	cache, err := NewDiskCache(t.TempDir(), 100, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.maxBytes = 8
+	first, second := strings.Repeat("e", 64), strings.Repeat("f", 64)
+	if _, err := cache.PutStream(first, strings.NewReader("12345")); err != nil {
+		t.Fatal(err)
+	}
+	items, bits, ok := cache.SummarySnapshot()
+	if !ok || items != 1 {
+		t.Fatalf("summary snapshot available=%t items=%d, want true/1", ok, items)
+	}
+	s := summaryFromIncrementalBits("peer-a", 1, items, summaryBloomBits, summaryBloomHashes, bits, time.Now(), time.Minute)
+	if !s.Contains(first) {
+		t.Fatal("published Bloom omitted committed cache entry")
+	}
+	if _, err := cache.PutStream(second, strings.NewReader("67890")); err != nil {
+		t.Fatal(err)
+	}
+	items, _, ok = cache.SummarySnapshot()
+	if !ok || items != 1 || cache.Has(first) || !cache.Has(second) {
+		t.Fatalf("post-eviction summary/cache state: available=%t items=%d first=%t second=%t", ok, items, cache.Has(first), cache.Has(second))
+	}
+}
+
+func TestPublisherContinuesPastBloomTargetCapacity(t *testing.T) {
+	cache, err := NewDiskCache(t.TempDir(), 100, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.summary.mu.Lock()
+	cache.summary.itemCount = summaryBloomTargetItems + 1
+	cache.summary.mu.Unlock()
+	pm := peerManagerWith(nil)
+	pm.ConfigureSummary(peerLookupSummary, "publisher")
+	pm.publish(context.Background(), cache)
+	body := pm.localSummaryCopy()
+	got, err := parseCacheSummary(body, time.Now())
+	if err != nil {
+		t.Fatalf("publisher skipped an over-target summary: %v", err)
+	}
+	if got.ItemCount != summaryBloomTargetItems+1 || got.MBits != summaryBloomBits || got.Hashes != summaryBloomHashes {
+		t.Fatalf("published summary = items=%d bits=%d hashes=%d", got.ItemCount, got.MBits, got.Hashes)
+	}
+}

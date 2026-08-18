@@ -247,6 +247,14 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_summary_age_seconds` | Histogram | None | Age of summaries used in local Bloom lookups. |
 | `cache_proxy_summary_lookups_total` | Counter | `outcome` | `no_valid_summary`, `no_positive`, or `positive_candidate`. |
 | `cache_proxy_peer_direct_gets_total` | Counter | `outcome` | Bounded direct peer GET outcomes in summary mode. |
+| `cache_proxy_summary_bloom_items` | Gauge | None | Local live cache keys represented by the incrementally maintained counting Bloom filter. |
+| `cache_proxy_summary_bloom_bits` / `cache_proxy_summary_bloom_hashes` | Gauge | None | Fixed Bloom-filter layout, sized for 1m keys at a 1% target false-positive rate. |
+| `cache_proxy_summary_bloom_false_positive_ratio` | Gauge | None | Predicted per-peer false-positive ratio from live item count and filter layout. This rises smoothly after 1m keys; use fleet size to interpret aggregate request cost. |
+| `cache_proxy_summary_bloom_saturated` | Gauge | None | `1` when the local live key count exceeds the 1m target capacity; publication continues. |
+| `cache_proxy_summary_bloom_bit_occupancy_ratio` | Gauge | None | Fraction of local Bloom bits set; a direct saturation signal independent of the FPR estimate. |
+| `cache_proxy_summary_bloom_additions_total` / `cache_proxy_summary_bloom_removals_total` | Counter | None | Cache commits and evictions applied incrementally to the local Bloom index. |
+| `cache_proxy_summary_bloom_counter_saturations_total` | Counter | None | Counting-Bloom cells that reached `uint16` saturation and were made sticky to avoid false negatives. |
+| `cache_proxy_summary_bloom_snapshots_total` / `cache_proxy_summary_bloom_snapshot_bytes` | Counter / Gauge | None | Immutable local Bloom snapshots prepared for periodic publication and their bounded size. |
 
 Cache-proxy metrics deliberately have no org label. Use the existing per-org
 Duckgres query and worker-acquisition metrics for customer-facing rollout

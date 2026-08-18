@@ -21,15 +21,15 @@ import (
 // Summary data deliberately contains only opaque cache-key digests. It is a
 // best-effort hint: rejecting it or losing it must only reduce peer hits.
 const (
-	summaryFormatVersion   = 1
-	cacheLayoutVersion     = 1
-	defaultSummaryTTL      = 45 * time.Second
-	defaultSummaryInterval = 20 * time.Second
-	summaryTargetFPR       = 0.01
+	summaryFormatVersion    = 2
+	cacheLayoutVersion      = 1
+	defaultSummaryTTL       = 45 * time.Second
+	defaultSummaryInterval  = 20 * time.Second
+	summaryTargetFPR        = 0.01
+	summaryBloomTargetItems = 1_000_000
 	// A 1m-entry filter at 1% false-positive rate is ~1.15 MiB before JSON
 	// base64 encoding. Two MiB is a hard wire cap with modest headroom.
 	maxSummaryBodyBytes     = 2 << 20
-	maxSummaryItems         = 1_000_000
 	maxSummaryPeers         = 256
 	maxSummaryPushes        = 4
 	maxSummaryReceives      = 4
@@ -38,13 +38,28 @@ const (
 )
 
 var (
-	summaryPushesTotal   = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_pushes_total", Help: "Summary publications by outcome"}, []string{"outcome"})
-	summaryReceiptsTotal = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_receipts_total", Help: "Peer summary receipts by outcome"}, []string{"outcome"})
-	summaryResidentCount = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_count", Help: "Current valid peer summaries"})
-	summaryResidentBytes = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_bytes", Help: "Current valid peer summary bytes"})
-	summaryAgeSeconds    = promauto.NewHistogram(prometheus.HistogramOpts{Name: "cache_proxy_summary_age_seconds", Help: "Age of a summary used during lookup", Buckets: prometheus.ExponentialBuckets(0.1, 2, 10)})
-	summaryLookupTotal   = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_lookups_total", Help: "Summary lookup decisions"}, []string{"outcome"})
-	peerDirectGetsTotal  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_peer_direct_gets_total", Help: "Direct peer GET attempts in summary mode"}, []string{"outcome"})
+	summaryBloomBits, summaryBloomHashes = bloomParams(summaryBloomTargetItems)
+)
+
+var (
+	summaryPushesTotal                  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_pushes_total", Help: "Summary publications by outcome"}, []string{"outcome"})
+	summaryReceiptsTotal                = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_receipts_total", Help: "Peer summary receipts by outcome"}, []string{"outcome"})
+	summaryResidentCount                = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_count", Help: "Current valid peer summaries"})
+	summaryResidentBytes                = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_bytes", Help: "Current valid peer summary bytes"})
+	summaryAgeSeconds                   = promauto.NewHistogram(prometheus.HistogramOpts{Name: "cache_proxy_summary_age_seconds", Help: "Age of a summary used during lookup", Buckets: prometheus.ExponentialBuckets(0.1, 2, 10)})
+	summaryLookupTotal                  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_lookups_total", Help: "Summary lookup decisions"}, []string{"outcome"})
+	peerDirectGetsTotal                 = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_peer_direct_gets_total", Help: "Direct peer GET attempts in summary mode"}, []string{"outcome"})
+	summaryBloomItems                   = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_items", Help: "Current local cache keys represented by the incremental Bloom filter"})
+	summaryBloomBitsGauge               = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_bits", Help: "Allocated bits in the local incremental Bloom filter"})
+	summaryBloomHashesGauge             = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_hashes", Help: "Hash functions in the local incremental Bloom filter"})
+	summaryBloomFPR                     = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_false_positive_ratio", Help: "Predicted local Bloom false-positive ratio"})
+	summaryBloomSaturated               = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_saturated", Help: "Whether local Bloom entries exceed its 1 percent target capacity"})
+	summaryBloomOccupancy               = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_bit_occupancy_ratio", Help: "Fraction of local Bloom bits currently set"})
+	summaryBloomAddsTotal               = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_additions_total", Help: "Cache insertions applied to the incremental Bloom filter"})
+	summaryBloomRemovalsTotal           = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_removals_total", Help: "Cache evictions applied to the incremental Bloom filter"})
+	summaryBloomCounterSaturationsTotal = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_counter_saturations_total", Help: "Counting Bloom cells that reached uint16 saturation"})
+	summaryBloomSnapshotsTotal          = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_snapshots_total", Help: "Immutable Bloom snapshots prepared for publication"})
+	summaryBloomSnapshotBytes           = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_snapshot_bytes", Help: "Bytes in the most recent local Bloom snapshot"})
 )
 
 type peerLookupMode string
@@ -80,7 +95,7 @@ type cacheSummary struct {
 }
 
 func newCacheSummary(sender string, generation uint64, keys []string, now time.Time, ttl time.Duration) (*cacheSummary, error) {
-	if sender == "" || generation == 0 || ttl <= 0 || len(keys) > maxSummaryItems {
+	if sender == "" || generation == 0 || ttl <= 0 || len(keys) > summaryBloomTargetItems {
 		return nil, errors.New("invalid summary inputs")
 	}
 	m, k := bloomParams(len(keys))
@@ -95,6 +110,125 @@ func newCacheSummary(sender string, generation uint64, keys []string, now time.T
 		s.add(key)
 	}
 	return s, nil
+}
+
+// summaryIndex is a bounded counting Bloom filter. Counters make eviction
+// safe: a bit is cleared only when no remaining key uses it. A saturated
+// counter is intentionally never cleared, which can only add false positives.
+type summaryIndex struct {
+	mu          sync.RWMutex
+	bits        []byte
+	counters    []uint16
+	bitCount    uint64
+	hashes      uint8
+	targetItems int
+	itemCount   int
+	setBits     uint64
+}
+
+func newSummaryIndex() *summaryIndex {
+	return newSummaryIndexWithParams(summaryBloomBits, summaryBloomHashes, summaryBloomTargetItems)
+}
+
+func newSummaryIndexWithParams(bitCount uint64, hashes uint8, targetItems int) *summaryIndex {
+	if bitCount < 8 || bitCount%8 != 0 || hashes == 0 || targetItems <= 0 {
+		panic("invalid incremental Bloom parameters")
+	}
+	i := &summaryIndex{
+		bits:        make([]byte, bitCount/8),
+		counters:    make([]uint16, bitCount),
+		bitCount:    bitCount,
+		hashes:      hashes,
+		targetItems: targetItems,
+	}
+	return i
+}
+
+func (i *summaryIndex) Add(key string) {
+	if !IsValidCacheKey(key) {
+		return
+	}
+	i.mu.Lock()
+	bloomHashes(key, i.bitCount, i.hashes, func(bit uint64) {
+		if i.counters[bit] < ^uint16(0) {
+			if i.counters[bit] == ^uint16(0)-1 {
+				summaryBloomCounterSaturationsTotal.Inc()
+			}
+			i.counters[bit]++
+		}
+		if i.bits[bit/8]&(1<<(bit%8)) == 0 {
+			i.setBits++
+		}
+		i.bits[bit/8] |= 1 << (bit % 8)
+	})
+	i.itemCount++
+	summaryBloomAddsTotal.Inc()
+	i.mu.Unlock()
+}
+
+func (i *summaryIndex) Remove(key string) {
+	if !IsValidCacheKey(key) {
+		return
+	}
+	i.mu.Lock()
+	bloomHashes(key, i.bitCount, i.hashes, func(bit uint64) {
+		// Saturated counters stay set. Clearing them could cause a false
+		// negative after more than MaxUint16 colliding additions.
+		if i.counters[bit] > 0 && i.counters[bit] < ^uint16(0) {
+			i.counters[bit]--
+			if i.counters[bit] == 0 {
+				i.bits[bit/8] &^= 1 << (bit % 8)
+				i.setBits--
+			}
+		}
+	})
+	if i.itemCount > 0 {
+		i.itemCount--
+	}
+	summaryBloomRemovalsTotal.Inc()
+	i.mu.Unlock()
+}
+
+func (i *summaryIndex) Snapshot() (int, []byte) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	i.updateMetricsLocked()
+	summaryBloomSnapshotsTotal.Inc()
+	summaryBloomSnapshotBytes.Set(float64(len(i.bits)))
+	return i.itemCount, append([]byte(nil), i.bits...)
+}
+
+func (i *summaryIndex) FalsePositiveRate() float64 {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return bloomFalsePositiveRate(i.itemCount, i.bitCount, i.hashes)
+}
+
+func (i *summaryIndex) Saturated() bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.itemCount > i.targetItems
+}
+
+func (i *summaryIndex) updateMetricsLocked() {
+	summaryBloomItems.Set(float64(i.itemCount))
+	summaryBloomBitsGauge.Set(float64(i.bitCount))
+	summaryBloomHashesGauge.Set(float64(i.hashes))
+	summaryBloomFPR.Set(bloomFalsePositiveRate(i.itemCount, i.bitCount, i.hashes))
+	summaryBloomOccupancy.Set(float64(i.setBits) / float64(i.bitCount))
+	if i.itemCount > i.targetItems {
+		summaryBloomSaturated.Set(1)
+	} else {
+		summaryBloomSaturated.Set(0)
+	}
+}
+
+func bloomFalsePositiveRate(items int, bitCount uint64, hashes uint8) float64 {
+	if items <= 0 || bitCount == 0 || hashes == 0 {
+		return 0
+	}
+	set := -math.Expm1(-float64(hashes) * float64(items) / float64(bitCount))
+	return math.Pow(set, float64(hashes))
 }
 
 func bloomParams(items int) (uint64, uint8) {
@@ -114,10 +248,14 @@ func bloomParams(items int) (uint64, uint8) {
 }
 
 func (s *cacheSummary) hashes(key string, fn func(uint64)) {
+	bloomHashes(key, s.MBits, s.Hashes, fn)
+}
+
+func bloomHashes(key string, bits uint64, hashes uint8, fn func(uint64)) {
 	d := sha256.Sum256([]byte(key))
 	h1, h2 := binary.LittleEndian.Uint64(d[:8]), binary.LittleEndian.Uint64(d[8:16])
-	for i := uint8(0); i < s.Hashes; i++ {
-		fn((h1 + uint64(i)*h2) % s.MBits)
+	for i := uint8(0); i < hashes; i++ {
+		fn((h1 + uint64(i)*h2) % bits)
 	}
 }
 
@@ -146,6 +284,17 @@ func (s *cacheSummary) MarshalBinary() ([]byte, error) {
 	}
 	return b, nil
 }
+
+func summaryFromIncrementalBits(sender string, generation uint64, itemCount int, bitCount uint64, hashes uint8, bits []byte, now time.Time, ttl time.Duration) *cacheSummary {
+	return &cacheSummary{Version: summaryFormatVersion, Layout: cacheLayoutVersion, Sender: sender, Generation: generation, CreatedNS: now.UnixNano(), ExpiresNS: now.Add(ttl).UnixNano(), ItemCount: itemCount, MBits: bitCount, Hashes: hashes, Bits: bits}
+}
+
+func newIncrementalCacheSummary(sender string, generation uint64, itemCount int, bits []byte, now time.Time, ttl time.Duration) (*cacheSummary, error) {
+	if sender == "" || generation == 0 || ttl <= 0 || itemCount < 0 || len(bits) != int(summaryBloomBits/8) {
+		return nil, errors.New("invalid incremental summary inputs")
+	}
+	return summaryFromIncrementalBits(sender, generation, itemCount, summaryBloomBits, summaryBloomHashes, bits, now, ttl), nil
+}
 func parseCacheSummary(body []byte, now time.Time) (*cacheSummary, error) {
 	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
 		return nil, errors.New("invalid summary body size")
@@ -159,11 +308,13 @@ func parseCacheSummary(body []byte, now time.Time) (*cacheSummary, error) {
 	if s.Version != summaryFormatVersion || s.Layout != cacheLayoutVersion || s.Sender == "" || len(s.Sender) > 253 || strings.ContainsAny(s.Sender, "\r\n") || s.Generation == 0 {
 		return nil, errors.New("incompatible summary")
 	}
-	if s.ItemCount < 0 || s.ItemCount > maxSummaryItems {
+	if s.ItemCount < 0 {
 		return nil, errors.New("invalid bloom parameters")
 	}
 	wantBits, wantHashes := bloomParams(s.ItemCount)
-	if s.MBits != wantBits || s.Hashes != wantHashes || s.MBits/8 > maxSummaryBodyBytes || len(s.Bits) != int(s.MBits/8) {
+	dynamicParams := s.MBits == wantBits && s.Hashes == wantHashes
+	incrementalParams := s.MBits == summaryBloomBits && s.Hashes == summaryBloomHashes
+	if (!dynamicParams && !incrementalParams) || s.MBits/8 > maxSummaryBodyBytes || len(s.Bits) != int(s.MBits/8) {
 		return nil, errors.New("invalid bloom parameters")
 	}
 	created, expires := time.Unix(0, s.CreatedNS), time.Unix(0, s.ExpiresNS)

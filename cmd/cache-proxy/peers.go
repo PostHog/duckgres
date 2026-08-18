@@ -294,16 +294,16 @@ func (pm *PeerManager) StopSummaryPublisher() {
 func (pm *PeerManager) publish(ctx context.Context, store *DiskCache) {
 	pm.summaries.removeNonMembers(pm.isMember, time.Now())
 	pm.updateSummaryGauges()
-	keys, ok := store.SnapshotKeys(maxSummaryItems)
+	items, bits, ok := store.SummarySnapshot()
 	if !ok {
-		summaryPushesTotal.WithLabelValues("snapshot_too_large").Inc()
+		summaryPushesTotal.WithLabelValues("summary_index_unavailable").Inc()
 		return
 	}
 	pm.summaryMu.Lock()
 	pm.generation++
 	generation := pm.generation
 	pm.summaryMu.Unlock()
-	s, err := newCacheSummary(pm.identity, generation, keys, time.Now(), defaultSummaryTTL)
+	s, err := newIncrementalCacheSummary(pm.identity, generation, items, bits, time.Now(), defaultSummaryTTL)
 	if err != nil {
 		summaryPushesTotal.WithLabelValues("build_error").Inc()
 		return

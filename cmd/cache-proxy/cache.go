@@ -92,6 +92,9 @@ type DiskCache struct {
 	// at the back. index maps a key to its element for O(1) touch/drop.
 	order *list.List
 	index map[string]*list.Element
+	// summary is enabled only in pushed-summary mode. It mirrors index
+	// mutations incrementally, so publishing never scans the cache index.
+	summary *summaryIndex
 }
 
 type cacheEntry struct {
@@ -102,7 +105,7 @@ type cacheEntry struct {
 
 // NewDiskCache creates a cache backed by the given directory.
 // maxPercent is the percentage of filesystem capacity to use (e.g. 80).
-func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
+func NewDiskCache(dir string, maxPercent int, incrementalSummary ...bool) (*DiskCache, error) {
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
@@ -142,6 +145,9 @@ func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
 		maxBytes: maxBytes,
 		order:    list.New(),
 		index:    make(map[string]*list.Element),
+	}
+	if len(incrementalSummary) > 0 && incrementalSummary[0] {
+		dc.summary = newSummaryIndex()
 	}
 
 	// Scan existing cache entries
@@ -241,8 +247,21 @@ func (c *DiskCache) scanExisting() {
 		entry := found[i]
 		c.index[entry.key] = c.order.PushBack(&entry)
 		c.currentSize += entry.size
+		if c.summary != nil {
+			c.summary.Add(entry.key)
+		}
 	}
 	cacheSizeBytes.Set(float64(c.currentSize))
+}
+
+// SummarySnapshot returns an immutable bounded copy of the locally maintained
+// Bloom bits. It does not scan or lock the cache index.
+func (c *DiskCache) SummarySnapshot() (items int, bits []byte, ok bool) {
+	if c.summary == nil {
+		return 0, nil, false
+	}
+	items, bits = c.summary.Snapshot()
+	return items, bits, true
 }
 
 // Has returns true if the key is a tracked cache entry. It answers from the
@@ -253,25 +272,6 @@ func (c *DiskCache) Has(key string) bool {
 	_, ok := c.index[key]
 	c.mu.Unlock()
 	return ok
-}
-
-// SnapshotKeys returns a bounded, point-in-time copy of opaque cache keys.
-// It never exposes URLs or paths and holds the request-path mutex for at most
-// maxItems map iterations; the Bloom filter is built after the lock is gone.
-func (c *DiskCache) SnapshotKeys(maxItems int) ([]string, bool) {
-	if maxItems <= 0 {
-		return nil, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.index) > maxItems {
-		return nil, false
-	}
-	keys := make([]string, 0, len(c.index))
-	for key := range c.index {
-		keys = append(keys, key)
-	}
-	return keys, true
 }
 
 // Touch marks a key as most recently used without serving it. HandlePeerHas
@@ -395,6 +395,9 @@ func (c *DiskCache) dropLocked(key string) {
 	c.currentSize -= el.Value.(*cacheEntry).size
 	c.order.Remove(el)
 	delete(c.index, key)
+	if c.summary != nil {
+		c.summary.Remove(key)
+	}
 }
 
 // addLocked records a freshly written entry as most recently used, replacing
@@ -408,6 +411,9 @@ func (c *DiskCache) addLocked(key string, size int64) {
 		lastAccess: time.Now(),
 	})
 	c.currentSize += size
+	if c.summary != nil {
+		c.summary.Add(key)
+	}
 	cacheSizeBytes.Set(float64(c.currentSize))
 }
 
@@ -425,6 +431,9 @@ func (c *DiskCache) evictOldest() {
 	c.currentSize -= oldest.size
 	c.order.Remove(front)
 	delete(c.index, oldest.key)
+	if c.summary != nil {
+		c.summary.Remove(oldest.key)
+	}
 	cacheEvictionsTotal.Inc()
 	cacheSizeBytes.Set(float64(c.currentSize))
 }
