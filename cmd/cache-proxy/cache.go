@@ -1,6 +1,7 @@
 package main
 
 import (
+	"container/heap"
 	"container/list"
 	"crypto/sha256"
 	"fmt"
@@ -85,6 +86,7 @@ type DiskCache struct {
 	// cache can never grow into disk it doesn't own. currentSize is the sum
 	// of tracked entry sizes.
 	maxBytes    int64
+	maxEntries  int
 	currentSize int64
 
 	mu sync.Mutex
@@ -92,7 +94,14 @@ type DiskCache struct {
 	// at the back. index maps a key to its element for O(1) touch/drop.
 	order *list.List
 	index map[string]*list.Element
+	// summary is enabled only in summary lookup mode. It mirrors index
+	// mutations incrementally, so snapshot serving never scans the cache index.
+	summary *summaryIndex
+	// renameFile is os.Rename in production and a per-cache failure seam in tests.
+	renameFile func(string, string) error
 }
+
+const defaultCacheMaxEntries = 1_000_000
 
 type cacheEntry struct {
 	key        string
@@ -100,9 +109,23 @@ type cacheEntry struct {
 	lastAccess time.Time
 }
 
+type oldestEntries []cacheEntry
+
+func (h oldestEntries) Len() int           { return len(h) }
+func (h oldestEntries) Less(i, j int) bool { return h[i].lastAccess.Before(h[j].lastAccess) }
+func (h oldestEntries) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *oldestEntries) Push(x any)        { *h = append(*h, x.(cacheEntry)) }
+func (h *oldestEntries) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
 // NewDiskCache creates a cache backed by the given directory.
 // maxPercent is the percentage of filesystem capacity to use (e.g. 80).
-func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
+func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*DiskCache, error) {
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
@@ -138,16 +161,31 @@ func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
 	cacheCapacityBytes.Set(float64(maxBytes))
 
 	dc := &DiskCache{
-		dir:      dir,
-		maxBytes: maxBytes,
-		order:    list.New(),
-		index:    make(map[string]*list.Element),
+		dir:        dir,
+		maxBytes:   maxBytes,
+		maxEntries: defaultCacheMaxEntries,
+		order:      list.New(),
+		index:      make(map[string]*list.Element),
+		renameFile: os.Rename,
+	}
+	if len(options) > 0 {
+		if options[0].MaxEntries > 0 {
+			dc.maxEntries = options[0].MaxEntries
+		}
+		if options[0].IncrementalSummary {
+			dc.summary = newSummaryIndex()
+		}
 	}
 
 	// Scan existing cache entries
 	dc.scanExisting()
 
 	return dc, nil
+}
+
+type DiskCacheOptions struct {
+	IncrementalSummary bool
+	MaxEntries         int
 }
 
 // clampToFree bounds a capacity target by the space actually available on the
@@ -205,29 +243,45 @@ func (c *DiskCache) refreshCapacity(maxPercent int) {
 }
 
 func (c *DiskCache) scanExisting() {
-	entries, err := os.ReadDir(c.dir)
+	dir, err := os.Open(c.dir)
 	if err != nil {
 		return
 	}
+	defer func() { _ = dir.Close() }()
 	// Only count real cache entries — the .tmp dir's contents and any
 	// stray non-key files must not enter the LRU accounting.
-	var found []cacheEntry
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	// Do not reserve a million cacheEntry structs for an empty/new cache. The
+	// heap remains bounded by maxEntries but grows with actual disk contents.
+	found := make(oldestEntries, 0, min(c.maxEntries, 1024))
+	for {
+		entries, readErr := dir.ReadDir(1024)
+		for _, e := range entries {
+			if e.IsDir() || !IsValidCacheKey(e.Name()) {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			entry := cacheEntry{key: e.Name(), size: info.Size(), lastAccess: info.ModTime()}
+			if found.Len() < c.maxEntries {
+				heap.Push(&found, entry)
+				continue
+			}
+			if !entry.lastAccess.After(found[0].lastAccess) {
+				_ = os.Remove(filepath.Join(c.dir, entry.key))
+				continue
+			}
+			dropped := heap.Pop(&found).(cacheEntry)
+			_ = os.Remove(filepath.Join(c.dir, dropped.key))
+			heap.Push(&found, entry)
 		}
-		if !IsValidCacheKey(e.Name()) {
-			continue
+		if readErr == io.EOF {
+			break
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
+		if readErr != nil {
+			return
 		}
-		found = append(found, cacheEntry{
-			key:        e.Name(),
-			size:       info.Size(),
-			lastAccess: info.ModTime(),
-		})
 	}
 	// The access list must start in recency order (front = oldest) or the
 	// first evictions after a restart would remove arbitrary entries.
@@ -241,8 +295,24 @@ func (c *DiskCache) scanExisting() {
 		entry := found[i]
 		c.index[entry.key] = c.order.PushBack(&entry)
 		c.currentSize += entry.size
+		if c.summary != nil {
+			c.summary.Add(entry.key)
+		}
+	}
+	for (c.order.Len() > c.maxEntries || c.currentSize > c.maxBytes) && c.order.Len() > 0 {
+		c.evictOldest()
 	}
 	cacheSizeBytes.Set(float64(c.currentSize))
+}
+
+// SummarySnapshot returns an immutable bounded copy of the locally maintained
+// Bloom bits. It does not scan or lock the cache index.
+func (c *DiskCache) SummarySnapshot() (items int, bits []byte, ok bool) {
+	if c.summary == nil {
+		return 0, nil, false
+	}
+	items, bits = c.summary.Snapshot()
+	return items, bits, true
 }
 
 // Has returns true if the key is a tracked cache entry. It answers from the
@@ -291,28 +361,42 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 		return 0, closeErr
 	}
 
-	// Now that the actual size is known, drop any prior accounting for this key
-	// (the rename below overwrites it) and evict to make room.
-	c.mu.Lock()
-	c.dropLocked(key)
-	for c.currentSize+size > c.maxBytes && c.order.Len() > 0 {
-		c.evictOldest()
-	}
-	c.mu.Unlock()
-
 	path := filepath.Join(c.dir, key)
-	if err := os.Rename(tmpPath, path); err != nil {
+	renameFile := c.renameFile
+	if renameFile == nil {
+		renameFile = os.Rename
+	}
+	// Make the local metadata rename and its index/Bloom bookkeeping one atomic
+	// commit. Streaming happened above without this lock; only the short rename
+	// syscall is serialized so eviction cannot delete the replacement in between.
+	c.mu.Lock()
+	if err := renameFile(tmpPath, path); err != nil {
+		c.mu.Unlock()
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("commit cache entry: %w", err)
 	}
 
-	c.mu.Lock()
-	// addLocked drops any existing entry first: in production singleFlight
-	// serializes writes per key so the earlier drop is enough, but the guard
-	// keeps the "one entry per key" invariant (and currentSize) correct even
-	// if some future caller writes the same key concurrently — a duplicate
-	// entry would otherwise permanently inflate currentSize.
-	c.addLocked(key, size)
+	if el, replacing := c.index[key]; replacing {
+		// The key remained represented throughout the filesystem commit. Update
+		// its accounting in place so a concurrent Bloom snapshot can never see a
+		// transient negative for an already committed entry.
+		entry := el.Value.(*cacheEntry)
+		c.currentSize += size - entry.size
+		entry.size = size
+		entry.lastAccess = time.Now()
+		c.order.MoveToBack(el)
+		// Keep the replacement itself even when it exceeds maxBytes; this matches
+		// the existing oversized-object behavior. Evict older entries first.
+		for (c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries) && c.order.Len() > 1 {
+			c.evictOldest()
+		}
+		cacheSizeBytes.Set(float64(c.currentSize))
+	} else {
+		for (c.currentSize+size > c.maxBytes || c.order.Len() >= c.maxEntries) && c.order.Len() > 0 {
+			c.evictOldest()
+		}
+		c.addLocked(key, size)
+	}
 	c.mu.Unlock()
 
 	return size, nil
@@ -376,6 +460,9 @@ func (c *DiskCache) dropLocked(key string) {
 	c.currentSize -= el.Value.(*cacheEntry).size
 	c.order.Remove(el)
 	delete(c.index, key)
+	if c.summary != nil {
+		c.summary.Remove(key)
+	}
 }
 
 // addLocked records a freshly written entry as most recently used, replacing
@@ -389,6 +476,9 @@ func (c *DiskCache) addLocked(key string, size int64) {
 		lastAccess: time.Now(),
 	})
 	c.currentSize += size
+	if c.summary != nil {
+		c.summary.Add(key)
+	}
 	cacheSizeBytes.Set(float64(c.currentSize))
 }
 
@@ -406,6 +496,9 @@ func (c *DiskCache) evictOldest() {
 	c.currentSize -= oldest.size
 	c.order.Remove(front)
 	delete(c.index, oldest.key)
+	if c.summary != nil {
+		c.summary.Remove(oldest.key)
+	}
 	cacheEvictionsTotal.Inc()
 	cacheSizeBytes.Set(float64(c.currentSize))
 }

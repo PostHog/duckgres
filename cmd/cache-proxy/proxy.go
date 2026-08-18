@@ -419,7 +419,20 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) (fetchResult, error) {
 	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
-			if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
+			if p.peers.lookupMode == peerLookupSummary {
+				// One logical lookup uses local Bloom tests first. Peers without a
+				// valid summary remain on the legacy probe path only while this
+				// proxy is converging after startup or membership changes.
+				peerFetchesTotal.Inc()
+				positive, uncovered := p.peers.SummaryLookup(cacheKey, time.Now())
+				if holder, flight, ok, _ := p.peers.LocateSummaryKey(r.Context(), cacheKey, positive, uncovered, p.peers.peerMaxProbes); ok {
+					if res, ok := p.fetchFromPeer(holder, flight, cacheKey, r); ok {
+						summaryConfirmedGetsTotal.WithLabelValues("success").Inc()
+						return res, nil
+					}
+					summaryConfirmedGetsTotal.WithLabelValues("miss_or_error").Inc()
+				}
+			} else if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
 				res, ok := p.fetchFromPeer(holder, flight, cacheKey, r)
 				if ok {
 					return res, nil
@@ -900,6 +913,39 @@ func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNotFound)
+}
+
+// HandlePeerSummary serves the current immutable Bloom snapshot over the
+// existing unauthenticated peer transport. Receivers decide whether this peer
+// belongs in their bounded retained subset before pulling the body.
+func (p *CacheProxy) HandlePeerSummary(w http.ResponseWriter, r *http.Request) {
+	if p.peers == nil || p.peers.lookupMode != peerLookupSummary || r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	body, etag := p.peers.localSummarySnapshot()
+	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
+		summaryServesTotal.WithLabelValues("unavailable").Inc()
+		http.Error(w, "summary unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	// The peer server intentionally has no server-wide WriteTimeout because
+	// /cache/get streams large bodies. Bound only this small snapshot response.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(summaryServeTimeout))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	if r.Header.Get("If-None-Match") == etag {
+		summaryServesTotal.WithLabelValues("not_modified").Inc()
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		summaryServesTotal.WithLabelValues("write_error").Inc()
+		return
+	}
+	summaryServesTotal.WithLabelValues("success").Inc()
 }
 
 // HandlePeerGet returns cached data to a peer. With flight=1 and the key not

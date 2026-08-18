@@ -9,9 +9,15 @@ available, and forwards cache misses to origin object storage.
 | Setting | Default | Notes |
 | --- | --- | --- |
 | `CACHE_DIR` | `/cache` | Local disk cache directory. |
-| `CACHE_MAX_PERCENT` | `80` | Ceiling for the cache's share of the cache filesystem, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute: when something outside the cache consumes disk, the budget only ever shrinks, so the cache never evicts healthy entries to make room for writes the disk can't take. |
+| `CACHE_MAX_PERCENT` | `80` | Target for tracked cache bytes, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute; the target only shrinks. Completed commits evict to this target, except that one entry larger than the target is retained. Concurrent temporary files are outside tracked-byte accounting. |
+| `CACHE_MAX_ENTRIES` | `1000000` | Strict maximum tracked LRU entries after each serialized final commit. Bounds local cache-index memory. |
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
+| `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` preserves the existing fleet-wide `/cache/has` behavior. `summary` pulls Bloom-filter hints and uses them to eliminate definite-negative peers before bounded `/cache/has` confirmation; any other value causes startup to fail. |
+| `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Total local Bloom-state budget: counting filter, snapshot and pull-work reserve, and a deterministic receiver-selected subset of remote peer summaries. Peers that do not fit remain uncovered. |
+| `CACHE_PEER_MAX_PROBES` | `5` | In summary mode, maximum parallel `/cache/has` confirmations per client request across all missing blocks. |
+| `CACHE_MAX_PEER_PROBES_IN_FLIGHT` | `64` | Per-pod non-blocking cap on active summary-mode `/cache/has` HTTP requests and sockets. It is not a process goroutine limit. When exhausted, confirmations are skipped and the request fetches origin. |
+| `CACHE_PROXY_ID` | pod name, node name, then hostname | Stable opaque receiver identity used for deterministic peer-summary selection; it must not be a customer or object identifier. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
 | `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. |
 | `CACHE_BLOCK_MODE` | `off` | `on` enables block-aligned caching; any other value (including unset) keeps the legacy exact-range path. See [Block-aligned mode](#block-aligned-mode). |
@@ -20,11 +26,50 @@ available, and forwards cache misses to origin object storage.
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `DUCKGRES_TRACE_ENDPOINT` | empty | OTLP/HTTP trace endpoint. Unset → tracing is a no-op. |
 | `OTEL_EXPORTER_OTLP_TRACES_PATH` | empty | Overrides the OTLP path (e.g. VictoriaTraces' `/insert/opentelemetry/v1/traces`). Mirrors the main duckgres binary. |
 
+Cache bodies stream concurrently into temporary files. Only the short final
+rename plus exact-index, LRU, byte-count, and counting-Bloom update is serialized.
+That commit evicts before returning, so completed commits cannot exceed
+`CACHE_MAX_ENTRIES`, and tracked bytes do not exceed the current disk target
+unless a single retained entry is itself larger than that target. Concurrent
+temporary files consume real disk but are not yet tracked cache entries.
+
 ## Cluster-wide fetch dedup
 
-When several nodes want the same key at the same moment, only the first to
-start the fill should ever hit the origin. The peer API makes each node's
-in-flight fetches visible to the rest:
+### Pulled-summary lookup mode
+
+Set `CACHE_PEER_LOOKUP_MODE=summary` only after deploying an image containing
+the summary endpoint to every cache-proxy pod. Each proxy incrementally tracks
+its local entries in a fixed counting Bloom filter and periodically exposes an
+immutable snapshot through `GET /cache/summary`. Receivers pull only the
+deterministic peer subset that fits `CACHE_SUMMARY_MEMORY_LIMIT_BYTES`.
+Probe-mode pods do not build or serve summaries, so a canary starts with
+partial coverage and uses the bounded fallback while snapshots converge.
+
+Bloom filters are used only to eliminate definite negatives. Bloom-positive
+and not-yet-covered peers remain candidates and must pass an exact, bounded
+`/cache/has` confirmation before the requester sends one `/cache/get` to the
+confirmed holder. The per-request and pod-wide settings above bound candidate
+selection and active confirmation HTTP work; skipped or failed peer work falls
+back to origin.
+
+DNS membership is refreshed every 10 seconds. Newly selected peers receive a
+priority pull and remain uncovered until a valid snapshot arrives; departed
+peer summaries are removed at the next successful refresh. A fully covered
+Bloom-negative miss goes directly to origin, so summaries can trade some
+cold-key fleet-wide deduplication for bounded request-time work.
+
+Roll out in non-production, monitor summary coverage and memory, confirmation
+amplification, confirmed GET usefulness, and origin latency/bytes, then enable
+gradually. Roll back by restoring `CACHE_PEER_LOOKUP_MODE=probe`; cache contents
+do not need deletion. The authoritative protocol, sizing model, failure table,
+rollout procedure, and runbook are in
+[the pulled-summary design](../../docs/design/cache-proxy-pulled-summary-lookup.md).
+
+In `probe` mode, when several nodes want the same key at the same moment, the
+fleet-wide lookup lets later requesters observe the first node's in-flight
+fill. Summary mode preserves the `202` mechanism among its bounded confirmation
+candidates, but a fully covered Bloom-negative lookup goes directly to origin
+as described above. The peer API exposes cached and in-flight state:
 
 - `GET /cache/has?key=…` — `200` the entry is cached (counts as an access for
   LRU recency); `202` the entry isn't cached yet but a local fill is
@@ -35,11 +80,12 @@ in-flight fetches visible to the rest:
   of 404ing the requester back to the origin for the same bytes it is already
   fetching.
 
-A missing key therefore resolves as: local index → peer that has it (`200`,
-first answer wins) → peer mid-flight on it (`202`, wait for that fill) →
-origin. Transfers from a peer have no whole-request timeout (a multi-MB body
-moving over a loaded link must not be killed for being large) — only a
-response-header deadline sized to cover the bounded flight wait.
+A probe-mode missing key therefore resolves as: local index → peer that has
+it (`200`, first answer wins) → peer mid-flight on it (`202`, wait for that
+fill) → origin. Summary mode inserts local Bloom elimination before a bounded
+version of that confirmation step. Transfers from a peer have no whole-request
+timeout (a multi-MB body moving over a loaded link must not be killed for being
+large) — only a response-header deadline sized to cover the bounded flight wait.
 
 All lookup state comes from the in-memory index under the cache mutex, not
 from filesystem stats, so `/cache/has` and eviction/size accounting can never

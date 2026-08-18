@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -211,6 +212,48 @@ func TestDiskCacheEviction(t *testing.T) {
 	}
 }
 
+func TestDiskCacheEntryLimitEvictsOldest(t *testing.T) {
+	c := newTestCache(t)
+	c.maxEntries = 2
+	keys := []string{strings.Repeat("4", 64), strings.Repeat("5", 64), strings.Repeat("6", 64)}
+	for _, key := range keys {
+		if _, err := c.PutStream(key, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c.order.Len() != 2 || c.Has(keys[0]) || !c.Has(keys[1]) || !c.Has(keys[2]) {
+		t.Fatalf("entry-limited cache retained unexpected keys: len=%d first=%t second=%t third=%t", c.order.Len(), c.Has(keys[0]), c.Has(keys[1]), c.Has(keys[2]))
+	}
+}
+
+func TestDiskCacheEntryLimitAppliesDuringStartupScan(t *testing.T) {
+	dir := t.TempDir()
+	entries := []struct {
+		key  string
+		when time.Time
+	}{
+		{strings.Repeat("7", 64), time.Now().Add(-2 * time.Hour)},
+		{strings.Repeat("8", 64), time.Now().Add(-time.Hour)},
+		{strings.Repeat("9", 64), time.Now()},
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.key)
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, entry.when, entry.when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := NewDiskCache(dir, 100, DiskCacheOptions{MaxEntries: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.order.Len() != 2 || c.Has(entries[0].key) || !c.Has(entries[1].key) || !c.Has(entries[2].key) {
+		t.Fatalf("startup scan did not retain newest two entries")
+	}
+}
+
 // tmpDirEntries counts the files left behind in the cache's .tmp subdir, so
 // tests can assert PutStream never leaks a temp file.
 func tmpDirEntries(t *testing.T, c *DiskCache) int {
@@ -320,6 +363,133 @@ func TestPutStreamOverwrite(t *testing.T) {
 		t.Fatalf("Open after overwrite: ok=%v size=%d, want ok size=40", ok, size)
 	}
 	_ = r.Close()
+}
+
+func TestPutStreamFailedOverwritePreservesExistingEntryAndSummary(t *testing.T) {
+	c, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("d", 64)
+	oldBody := []byte("previously-committed-body")
+	if _, err := c.PutStream(key, bytes.NewReader(oldBody)); err != nil {
+		t.Fatalf("seed PutStream: %v", err)
+	}
+
+	c.renameFile = func(string, string) error { return errors.New("forced rename failure") }
+	if _, err := c.PutStream(key, strings.NewReader("replacement")); err == nil {
+		t.Fatal("overwrite should report the forced rename failure")
+	}
+
+	if !c.Has(key) {
+		t.Fatal("failed overwrite removed the existing exact-index entry")
+	}
+	if c.currentSize != int64(len(oldBody)) {
+		t.Fatalf("currentSize=%d, want preserved size %d", c.currentSize, len(oldBody))
+	}
+	r, size, ok := c.Open(key)
+	if !ok {
+		t.Fatal("failed overwrite made the existing body unservable")
+	}
+	got, readErr := io.ReadAll(r)
+	_ = r.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if size != int64(len(oldBody)) || !bytes.Equal(got, oldBody) {
+		t.Fatalf("preserved body size/data=%d/%q, want %d/%q", size, got, len(oldBody), oldBody)
+	}
+	items, bits, ok := c.SummarySnapshot()
+	if !ok {
+		t.Fatal("incremental summary unavailable")
+	}
+	summary, err := newIncrementalCacheSummary(bits, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items != 1 || !summary.Contains(key) {
+		t.Fatalf("failed overwrite removed key from Bloom summary: items=%d contains=%v", items, summary.Contains(key))
+	}
+	if left := tmpDirEntries(t, c); left != 0 {
+		t.Fatalf("temp dir has %d leftover files after failed overwrite", left)
+	}
+}
+
+func TestPutStreamConcurrentSameKeyCommitsKeepBodyAndAccountingConsistent(t *testing.T) {
+	c, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := strings.Repeat("e", 64)
+	if _, err := c.PutStream(key, strings.NewReader("old")); err != nil {
+		t.Fatalf("seed PutStream: %v", err)
+	}
+
+	firstBody := bytes.Repeat([]byte("a"), 100)
+	secondBody := bytes.Repeat([]byte("b"), 40)
+	firstRenamed := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	c.renameFile = func(oldPath, newPath string) error {
+		body, err := os.ReadFile(oldPath)
+		if err != nil {
+			return err
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			return err
+		}
+		if len(body) == len(firstBody) {
+			close(firstRenamed)
+			<-releaseFirst
+		}
+		return nil
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := c.PutStream(key, bytes.NewReader(firstBody))
+		firstDone <- err
+	}()
+	<-firstRenamed
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := c.PutStream(key, bytes.NewReader(secondBody))
+		secondDone <- err
+	}()
+
+	// Before commits were serialized, the second writer could finish its rename
+	// and accounting while the first writer was paused between those two steps.
+	// Give that interleaving a chance, then let the first commit finish.
+	var secondErr error
+	secondFinishedEarly := false
+	select {
+	case secondErr = <-secondDone:
+		secondFinishedEarly = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first overwrite: %v", err)
+	}
+	if !secondFinishedEarly {
+		secondErr = <-secondDone
+	}
+	if secondErr != nil {
+		t.Fatalf("second overwrite: %v", secondErr)
+	}
+
+	r, size, ok := c.Open(key)
+	if !ok {
+		t.Fatal("final same-key commit is missing")
+	}
+	got, readErr := io.ReadAll(r)
+	_ = r.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if size != int64(len(secondBody)) || c.currentSize != int64(len(secondBody)) || !bytes.Equal(got, secondBody) {
+		t.Fatalf("final size/accounting/body=%d/%d/%q, want %d/%d/%q", size, c.currentSize, got, len(secondBody), len(secondBody), secondBody)
+	}
 }
 
 // TestPutStreamOversizedObject documents that an object larger than maxBytes is
@@ -550,5 +720,36 @@ func TestScanExistingSeedsRecencyOrder(t *testing.T) {
 	}
 	if !c.Has(recent) || !c.Has(mid) {
 		t.Error("newer entries were evicted before the oldest")
+	}
+}
+
+func TestScanExistingEnforcesByteAndEntryCeilings(t *testing.T) {
+	dir := t.TempDir()
+	keys := []string{strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64)}
+	base := time.Now().Add(-time.Hour)
+	for i, key := range keys {
+		path := filepath.Join(dir, key)
+		if err := os.WriteFile(path, []byte(strings.Repeat("x", 10)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		when := base.Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := &DiskCache{
+		dir:        dir,
+		maxBytes:   15,
+		maxEntries: 2,
+		order:      list.New(),
+		index:      make(map[string]*list.Element),
+	}
+	c.scanExisting()
+	if c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries {
+		t.Fatalf("startup cache exceeds ceilings: bytes=%d/%d entries=%d/%d", c.currentSize, c.maxBytes, c.order.Len(), c.maxEntries)
+	}
+	if !c.Has(keys[2]) {
+		t.Fatal("startup pruning did not retain the newest entry")
 	}
 }

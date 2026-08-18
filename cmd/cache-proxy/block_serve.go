@@ -7,8 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+const maxSummaryBlockPeerGetsPerRequest = 2
 
 var (
 	cacheOriginBytesTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -180,19 +180,11 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 	return nil
 }
 
-// blockPresent reports whether a block's bytes are on local disk. It checks
-// the tracked index first (the common case, and the one that drives LRU
-// recency) but also accepts a tracked-file-still-syncing entry: a concurrent
-// PutStream lands its file (rename) a moment before it lands the LRU
-// accounting (addLocked), so an index-only Has can race a just-filled block
-// and report it missing while its bytes are already servable. Neither peek
-// counts as an access — openFile (phase 2) does the touching.
+// blockPresent reports whether a block is a committed, tracked cache entry.
+// PutStream makes rename and index accounting one atomic commit under the
+// cache mutex, so an untracked file is never authoritative.
 func (p *CacheProxy) blockPresent(key string) bool {
-	if p.store.Has(key) {
-		return true
-	}
-	_, err := os.Stat(filepath.Join(p.store.dir, key))
-	return err == nil
+	return p.store.Has(key)
 }
 
 // serveBlockAligned serves a cacheable GET whose Range is an absolute
@@ -239,6 +231,14 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	// hit/miss accounting and the log line.
 	var nLocal, nPeer, nOrigin int64
 	var missRunStart int64 = -1
+	// Summary mode bounds direct peer I/O across the entire block request, not
+	// merely per block. Remaining block misses safely coalesce to origin.
+	summaryGetsLeft := maxSummaryBlockPeerGetsPerRequest
+	summaryLookupRecorded := false
+	summaryProbesLeft := 0
+	if p.peers != nil {
+		summaryProbesLeft = p.peers.peerMaxProbes
+	}
 	flushRun := func(runEnd int64) bool {
 		if missRunStart < 0 {
 			return true
@@ -314,7 +314,26 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		if p.peers != nil {
 			peerStart := time.Now()
 			ok := false
-			if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {
+			if p.peers.lookupMode == peerLookupSummary {
+				if summaryGetsLeft > 0 && summaryProbesLeft > 0 {
+					if !summaryLookupRecorded {
+						peerFetchesTotal.Inc()
+						summaryLookupRecorded = true
+					}
+					positive, uncovered := p.peers.SummaryLookup(key, time.Now())
+					holder, flight, found, selected := p.peers.LocateSummaryKey(r.Context(), key, positive, uncovered, summaryProbesLeft)
+					summaryProbesLeft -= selected
+					if found {
+						summaryGetsLeft--
+						_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) { return p.store.PutStream(key, rd) })
+						if ok {
+							summaryConfirmedGetsTotal.WithLabelValues("success").Inc()
+						} else {
+							summaryConfirmedGetsTotal.WithLabelValues("miss_or_error").Inc()
+						}
+					}
+				}
+			} else if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {
 				_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) {
 					return p.store.PutStream(key, rd)
 				})

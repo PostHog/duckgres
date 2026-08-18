@@ -94,10 +94,45 @@ func main() {
 
 	cacheDir := envOrDefault("CACHE_DIR", "/cache")
 	maxPercent, _ := strconv.Atoi(envOrDefault("CACHE_MAX_PERCENT", "80"))
+	maxEntries, err := positiveEnvInt("CACHE_MAX_ENTRIES", defaultCacheMaxEntries)
+	if err != nil {
+		slog.Error("Invalid cache entry limit.", "error", err)
+		return
+	}
+	summaryMemoryLimit := envInt64("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", defaultSummaryMemoryLimitBytes)
+	peerMaxProbes, err := positiveEnvInt("CACHE_PEER_MAX_PROBES", defaultPeerMaxProbes)
+	if err != nil {
+		slog.Error("Invalid peer probe limit.", "error", err)
+		return
+	}
+	maxPeerProbesInFlight, err := positiveEnvInt("CACHE_MAX_PEER_PROBES_IN_FLIGHT", defaultMaxPeerProbesInFlight)
+	if err != nil {
+		slog.Error("Invalid global peer probe limit.", "error", err)
+		return
+	}
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
 	peerAddr := envOrDefault("PEER_ADDR", ":8081")
 	healthAddr := envOrDefault("HEALTH_ADDR", ":8082")
 	peerService := os.Getenv("PEER_SERVICE") // headless K8s service for peer discovery
+	lookupMode, err := parsePeerLookupMode(os.Getenv("CACHE_PEER_LOOKUP_MODE"))
+	if err != nil {
+		slog.Error("Invalid cache peer lookup mode.", "error", err)
+		return
+	}
+	if lookupMode == peerLookupSummary {
+		summaryMemoryLimitBytes.Set(float64(summaryMemoryLimit))
+		if err := validateSummaryMemoryLimit(summaryMemoryLimit); err != nil {
+			slog.Error("Invalid summary memory limit.", "error", err)
+			return
+		}
+	} else {
+		summaryMemoryLimitBytes.Set(0)
+	}
+	hostname, _ := os.Hostname()
+	identity := envOrDefault("CACHE_PROXY_ID", envOrDefault("POD_NAME", envOrDefault("NODE_NAME", hostname)))
+	if identity == "" {
+		identity = peerAddr
+	}
 
 	// Comma-separated Host substrings we should cache. Anything else is tunneled
 	// or forwarded without caching. Empty means "cache everything" (legacy).
@@ -113,10 +148,15 @@ func main() {
 	slog.Info("Starting cache-proxy.",
 		"cache_dir", cacheDir,
 		"max_percent", maxPercent,
+		"max_entries", maxEntries,
+		"summary_memory_limit", summaryMemoryLimit,
+		"peer_max_probes", peerMaxProbes,
+		"max_peer_probes_in_flight", maxPeerProbesInFlight,
 		"listen", listenAddr,
 		"peer_listen", peerAddr,
 		"health", healthAddr,
 		"peer_service", peerService,
+		"peer_lookup_mode", lookupMode,
 		"cache_host_suffixes", cacheHostSuffixes,
 	)
 
@@ -129,7 +169,10 @@ func main() {
 	slog.Info("Block mode configured.", "enabled", blockMode, "block_size", blockSize, "max_span_blocks", maxSpanBlocks)
 
 	// Initialize cache store
-	store, err := NewDiskCache(cacheDir, maxPercent)
+	store, err := NewDiskCache(cacheDir, maxPercent, DiskCacheOptions{
+		IncrementalSummary: lookupMode == peerLookupSummary && peerService != "",
+		MaxEntries:         maxEntries,
+	})
 	if err != nil {
 		slog.Error("Failed to initialize cache store.", "error", err)
 		os.Exit(1)
@@ -146,10 +189,18 @@ func main() {
 	}()
 
 	// Initialize peer manager
+	rootCtx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
 	var peers *PeerManager
 	if peerService != "" {
 		peers = NewPeerManager(peerService, peerAddr)
-		go peers.WatchEndpoints(context.Background())
+		peers.ConfigureSummary(lookupMode, identity, SummaryConfig{
+			PeerMaxProbes:         peerMaxProbes,
+			MaxPeerProbesInFlight: maxPeerProbesInFlight,
+			MemoryLimitBytes:      summaryMemoryLimit,
+		})
+		peers.StartSummarySynchronizer(rootCtx, store)
+		go peers.WatchEndpoints(rootCtx)
 	}
 
 	proxy := NewCacheProxy(store, peers, cacheHostSuffixes)
@@ -165,6 +216,7 @@ func main() {
 	peerMux := http.NewServeMux()
 	peerMux.HandleFunc("/cache/has", proxy.HandlePeerHas)
 	peerMux.HandleFunc("/cache/get", proxy.HandlePeerGet)
+	peerMux.HandleFunc("/cache/summary", proxy.HandlePeerSummary)
 	peerServer := &http.Server{Addr: peerAddr, Handler: peerMux}
 
 	// Health + metrics
@@ -209,6 +261,10 @@ func main() {
 	<-sigCh
 
 	slog.Info("Shutting down...")
+	stopBackground()
+	if peers != nil {
+		peers.StopSummarySynchronizer()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = s3Server.Shutdown(ctx)
@@ -221,6 +277,21 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func positiveEnvInt(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a positive integer: %w", key, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s must be positive", key)
+	}
+	return n, nil
 }
 
 // envInt64 parses an integer env var, falling back to def (with a warning)
