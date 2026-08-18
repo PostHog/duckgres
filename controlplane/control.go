@@ -30,6 +30,7 @@ import (
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // DefaultAdmissionReclaimerMaxReservations bounds cleanup ownership retained by
@@ -795,6 +796,11 @@ func sessionCreationErrorResponse(err error) (code string, message string) {
 	case errors.As(err, &capacityErr):
 		return "53300", capacityMissPolicyForReason(capacityErr.missReason()).sqlMessage(capacityErr.RetryAfter)
 	case errors.As(err, &rejection):
+		if rejection.Reason == configstore.OrgConnectionAdmissionRejectedOrgMemory {
+			requested := resource.NewQuantity(rejection.RequestedMemoryBytes, resource.BinarySI)
+			maximum := resource.NewQuantity(rejection.MaximumMemoryBytes, resource.BinarySI)
+			return "53400", fmt.Sprintf("requested worker requires %s memory, exceeding the organization limit of %s; request a smaller worker or raise the limit", requested.String(), maximum.String())
+		}
 		scope := "organization"
 		if rejection.Reason == configstore.OrgConnectionAdmissionRejectedUserVCPU {
 			scope = "user"
@@ -1622,7 +1628,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			if err != nil {
 				// Classified with the same logic the eager connect path uses, so
 				// the client sees the real SQLSTATE + message (53300 with a retry
-				// hint at capacity, 53400 for a vCPU-admission rejection, 57P03
+				// hint at capacity, 53400 for a resource-admission rejection, 57P03
 				// while draining) instead of a substring guess.
 				return nil, 0, "", fmt.Errorf("escalate to standard worker: %w", newSessionAcquireError(err))
 			}

@@ -148,6 +148,21 @@ func TestSessionCreationErrorResponse(t *testing.T) {
 		}
 	})
 
+	t.Run("request exceeds org memory limit", func(t *testing.T) {
+		code, message := sessionCreationErrorResponse(&configstore.OrgConnectionAdmissionRejectedError{
+			Reason:               configstore.OrgConnectionAdmissionRejectedOrgMemory,
+			RequestedMemoryBytes: 120 * 1024 * 1024 * 1024,
+			MaximumMemoryBytes:   60 * 1024 * 1024 * 1024,
+		})
+		if code != "53400" {
+			t.Fatalf("code = %q, want 53400", code)
+		}
+		want := "requested worker requires 120Gi memory, exceeding the organization limit of 60Gi; request a smaller worker or raise the limit"
+		if message != want {
+			t.Fatalf("message = %q, want %q", message, want)
+		}
+	})
+
 	t.Run("worker capacity exhausted", func(t *testing.T) {
 		code, message := sessionCreationErrorResponse(NewWorkerCapacityExhaustedError(45 * time.Second))
 		if code != "53300" {

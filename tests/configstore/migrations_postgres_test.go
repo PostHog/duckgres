@@ -55,7 +55,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 34)
 	requireGooseMigrationRecorded(t, db, 35)
 	requireGooseMigrationRecorded(t, db, 36)
-	requireGooseLatestVersion(t, db, 36)
+	requireGooseMigrationRecorded(t, db, 37)
+	requireGooseLatestVersion(t, db, 37)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -193,6 +194,9 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 		t.Fatalf("default_worker_min_hot_idle column count = %d, want 1", columnCount)
 	}
 	requireColumnDefault(t, db, "duckgres_orgs", "max_vcpus", "0")
+	requireColumnType(t, db, "duckgres_orgs", "max_memory", "character varying")
+	requireColumnNotNull(t, db, "duckgres_orgs", "max_memory")
+	requireColumnDefault(t, db, "duckgres_orgs", "max_memory", "''::character varying")
 	requireColumnDefault(t, db, "duckgres_org_users", "max_vcpus", "0")
 	// Migration 000011 added the per-user kill-switch column.
 	requireColumnDefault(t, db, "duckgres_org_users", "disabled", "false")
@@ -230,6 +234,34 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnAbsent(t, db, "duckgres_org_users", "service_grant_expires_at")
 }
 
+func TestConfigStoreSnapshotParsesOrgMaxMemory(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	if err := store.DB().Create(&cpconfigstore.Org{
+		Name: "memory-limited", DatabaseName: "memory-limited", MaxMemory: "120Gi",
+	}).Error; err != nil {
+		t.Fatalf("create memory-limited org: %v", err)
+	}
+	if err := store.Reload(); err != nil {
+		t.Fatalf("reload memory-limited org: %v", err)
+	}
+	const wantBytes = int64(120 * 1024 * 1024 * 1024)
+	if got := store.Snapshot().Orgs["memory-limited"].MaxMemoryBytes; got != wantBytes {
+		t.Fatalf("snapshot max memory bytes = %d, want %d", got, wantBytes)
+	}
+
+	if err := store.DB().Model(&cpconfigstore.Org{}).
+		Where("name = ?", "memory-limited").
+		Update("max_memory", "invalid").Error; err != nil {
+		t.Fatalf("seed invalid max_memory: %v", err)
+	}
+	if err := store.Reload(); err == nil || !strings.Contains(err.Error(), "max_memory") {
+		t.Fatalf("reload invalid max_memory error = %v, want max_memory validation failure", err)
+	}
+	if got := store.Snapshot().Orgs["memory-limited"].MaxMemoryBytes; got != wantBytes {
+		t.Fatalf("failed reload replaced last good snapshot: max memory bytes = %d, want %d", got, wantBytes)
+	}
+}
+
 func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	_, connStr := newIsolatedConfigStoreSchema(t)
 	store, err := cpconfigStoreNew(connStr)
@@ -243,6 +275,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	if err := store.DB().Exec(`
 			ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
 			ALTER TABLE duckgres_orgs DROP COLUMN max_vcpus;
+			ALTER TABLE duckgres_orgs DROP COLUMN max_memory;
 			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
 			ALTER TABLE duckgres_orgs ADD COLUMN IF NOT EXISTS max_connections BIGINT DEFAULT 0;
@@ -272,7 +305,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
 			DROP TABLE IF EXISTS duckgres_service_grants;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -322,10 +355,12 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 34)
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
-	requireGooseLatestVersion(t, upgradedDB, 36)
+	requireGooseMigrationRecorded(t, upgradedDB, 37)
+	requireGooseLatestVersion(t, upgradedDB, 37)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
+	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_memory", "''::character varying")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "max_vcpus", "0")
 	requireColumnDefault(t, upgradedDB, "duckgres_org_users", "disabled", "false")
 	requireColumnAbsent(t, upgradedDB, "duckgres_orgs", "default_team_id")
@@ -365,7 +400,8 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
 		ALTER TABLE duckgres_org_users DROP COLUMN IF EXISTS service_grant_expires_at;
 		DROP TABLE IF EXISTS duckgres_service_grants;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36);
+		ALTER TABLE duckgres_orgs DROP COLUMN max_memory;
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}

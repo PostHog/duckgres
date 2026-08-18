@@ -167,6 +167,9 @@ func (tr *OrgRouter) createOrgStackWhileMutationHeld(tc *configstore.OrgConfig) 
 	sessions.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
 		return requestedWorkerVCPUs(profile, tr.baseCfg.WorkerCPURequest)
 	})
+	sessions.SetRequestedMemoryBytesResolver(func(profile *WorkerProfile) (int64, error) {
+		return requestedWorkerMemoryBytes(profile, tr.baseCfg.WorkerMemoryRequest)
+	})
 	sessions.SetConnectionLimiter(NewRuntimeOrgConnectionLimiter(
 		tr.configStore,
 		tc.Name,
@@ -383,10 +386,12 @@ func (tr *OrgRouter) publishOrgStack(orgID string, stack *OrgStack) orgStackPubl
 	tr.orgs[orgID] = stack
 	if stack != nil && stack.Config != nil {
 		sessionAdmissionLimitVCPUsGauge.WithLabelValues(orgID).Set(float64(stack.Config.MaxVCPUs))
+		sessionAdmissionLimitMemoryBytesGauge.WithLabelValues(orgID).Set(float64(stack.Config.MaxMemoryBytes))
 	} else {
 		// Minimal stacks are valid in lifecycle and concurrency paths. Without a
 		// config there is no authoritative limit value to publish.
 		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
+		sessionAdmissionLimitMemoryBytesGauge.DeleteLabelValues(orgID)
 	}
 	tr.mu.Unlock()
 	return orgStackPublishAccepted
@@ -401,6 +406,7 @@ func (tr *OrgRouter) resourceLimitsForOrg(orgID string) func(username string) co
 		limits := configstore.OrgResourceLimits{}
 		if org, ok := snap.Orgs[orgID]; ok && org != nil {
 			limits.OrgMaxVCPUs = org.MaxVCPUs
+			limits.OrgMaxMemoryBytes = org.MaxMemoryBytes
 		}
 		limits.UserMaxVCPUs = snap.OrgUserMaxVCPUs[configstore.OrgUserKey{OrgID: orgID, Username: username}]
 		return limits
@@ -504,10 +510,11 @@ func (tr *OrgRouter) refreshOrgStackWhileMutationHeld(orgID string, stack *OrgSt
 	oldTC := stack.Config
 	stack.Config = tc
 	sessionAdmissionLimitVCPUsGauge.WithLabelValues(orgID).Set(float64(tc.MaxVCPUs))
+	sessionAdmissionLimitMemoryBytesGauge.WithLabelValues(orgID).Set(float64(tc.MaxMemoryBytes))
 	tr.mu.Unlock()
 
 	limitsChanged := oldTC == nil || oldTC.MaxWorkers != tc.MaxWorkers
-	resourceLimitChanged := oldTC == nil || oldTC.MaxVCPUs != tc.MaxVCPUs
+	resourceLimitChanged := oldTC == nil || oldTC.MaxVCPUs != tc.MaxVCPUs || oldTC.MaxMemoryBytes != tc.MaxMemoryBytes
 	floorChanged := oldTC == nil || oldTC.DefaultWorkerMinHotIdle != tc.DefaultWorkerMinHotIdle
 	oldImage := tr.baseCfg.WorkerImage
 	if oldTC != nil {
@@ -518,11 +525,14 @@ func (tr *OrgRouter) refreshOrgStackWhileMutationHeld(orgID string, stack *OrgSt
 
 	if resourceLimitChanged {
 		oldMaxVCPUs := 0
+		var oldMaxMemoryBytes int64
 		if oldTC != nil {
 			oldMaxVCPUs = oldTC.MaxVCPUs
+			oldMaxMemoryBytes = oldTC.MaxMemoryBytes
 		}
 		slog.Info("Org resource limit changed.", "org", orgID,
-			"old_max_vcpus", oldMaxVCPUs, "new_max_vcpus", tc.MaxVCPUs)
+			"old_max_vcpus", oldMaxVCPUs, "new_max_vcpus", tc.MaxVCPUs,
+			"old_max_memory_bytes", oldMaxMemoryBytes, "new_max_memory_bytes", tc.MaxMemoryBytes)
 	}
 	if limitsChanged && stack.Pool != nil {
 		oldMaxWorkers := 0
@@ -556,6 +566,7 @@ func (tr *OrgRouter) removeOrgStackWhileMutationHeld(orgID string, expected *Org
 	stack, ok := tr.orgs[orgID]
 	if !ok {
 		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
+		sessionAdmissionLimitMemoryBytesGauge.DeleteLabelValues(orgID)
 		tr.mu.Unlock()
 		return
 	}
@@ -565,6 +576,7 @@ func (tr *OrgRouter) removeOrgStackWhileMutationHeld(orgID string, expected *Org
 	}
 	delete(tr.orgs, orgID)
 	sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(orgID)
+	sessionAdmissionLimitMemoryBytesGauge.DeleteLabelValues(orgID)
 	tr.mu.Unlock()
 
 	slog.Info("Destroying org stack.", "org", orgID)
@@ -811,6 +823,7 @@ func (tr *OrgRouter) shutdownAll() {
 	for k, v := range tr.orgs {
 		orgs[k] = v
 		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(k)
+		sessionAdmissionLimitMemoryBytesGauge.DeleteLabelValues(k)
 	}
 	tr.orgs = make(map[string]*OrgStack)
 	tr.mu.Unlock()

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -240,6 +241,51 @@ func (cs *ConfigStore) Start(ctx context.Context) {
 	}()
 }
 
+// ParseOrgMaxMemoryBytes parses an org max_memory Kubernetes resource
+// quantity into the byte count used by admission and monitoring. Empty and
+// zero quantities mean unlimited. Negative quantities are never meaningful
+// for a ceiling and are rejected rather than silently treated as unlimited.
+func ParseOrgMaxMemoryBytes(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	quantity, err := resource.ParseQuantity(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory quantity %q: %w", raw, err)
+	}
+	if quantity.Sign() < 0 {
+		return 0, fmt.Errorf("memory quantity %q must be >= 0", raw)
+	}
+	max := resource.NewQuantity(math.MaxInt64, resource.DecimalSI)
+	// DecimalSI values can remain larger than int64 and wrap in Value().
+	// ParseQuantity instead caps overflowing BinarySI values (for example 8Ei)
+	// at MaxInt64; no exact positive BinarySI quantity can equal that sentinel.
+	if quantity.Cmp(*max) > 0 || (quantity.Format == resource.BinarySI && quantity.Value() == math.MaxInt64) {
+		return 0, fmt.Errorf("memory quantity %q exceeds %d bytes", raw, int64(math.MaxInt64))
+	}
+	return quantity.Value(), nil
+}
+
+// NormalizeOrgMaxMemory validates max_memory and returns its canonical
+// Kubernetes quantity spelling. Empty and every valid zero quantity normalize
+// to the single persisted unlimited representation: an empty string.
+func NormalizeOrgMaxMemory(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	bytes, err := ParseOrgMaxMemoryBytes(raw)
+	if err != nil {
+		return "", err
+	}
+	if bytes == 0 {
+		return "", nil
+	}
+	quantity, err := resource.ParseQuantity(raw)
+	if err != nil {
+		return "", err // ParseOrgMaxMemoryBytes already validated this input.
+	}
+	return quantity.String(), nil
+}
+
 // load fetches all config from the database and builds a Snapshot.
 func (cs *ConfigStore) load() (*Snapshot, error) {
 	var orgs []Org
@@ -280,6 +326,10 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 	}
 
 	for _, o := range orgs {
+		maxMemoryBytes, err := ParseOrgMaxMemoryBytes(o.MaxMemory)
+		if err != nil {
+			return nil, fmt.Errorf("load org %q max_memory: %w", o.Name, err)
+		}
 		alias := ""
 		if o.HostnameAlias != nil {
 			alias = *o.HostnameAlias
@@ -302,6 +352,7 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			HostnameAlias:           alias,
 			MaxWorkers:              o.MaxWorkers,
 			MaxVCPUs:                o.MaxVCPUs,
+			MaxMemoryBytes:          maxMemoryBytes,
 			DefaultWorkerCPU:        o.DefaultWorkerCPU,
 			DefaultWorkerMemory:     o.DefaultWorkerMemory,
 			DefaultWorkerTTL:        o.DefaultWorkerTTL,

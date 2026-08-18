@@ -49,6 +49,8 @@ export interface Org {
   teams?: OrgTeam[];
   max_workers: number;
   max_vcpus: number;
+  // Kubernetes memory quantity; empty means unlimited.
+  max_memory: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -70,6 +72,7 @@ export interface OrgUpdate {
   database_name?: string;
   max_workers?: number;
   max_vcpus?: number;
+  max_memory?: string;
   default_worker_cpu?: string;
   default_worker_memory?: string;
   default_worker_ttl?: string;

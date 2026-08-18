@@ -92,6 +92,8 @@ labels, aggregation rules, PromQL examples, and admission metric migration.
 | `duckgres_session_admission_queue_depth{org}` | Gauge | Local callers waiting after successful durable enqueue; sum across replicas |
 | `duckgres_session_admission_active_vcpus{org}` | Gauge | Requested vCPUs held by local live lease handles; cleanup-pending durable rows are excluded |
 | `duckgres_session_admission_limit_vcpus{org}` | Gauge | Config-reconciled effective org cap for active org stacks; zero means unlimited, max across replicas |
+| `duckgres_session_admission_active_memory_bytes{org}` | Gauge | Requested memory bytes held by local live lease handles; cleanup-pending durable rows are excluded |
+| `duckgres_session_admission_limit_memory_bytes{org}` | Gauge | Config-reconciled effective org memory cap for active org stacks; zero means unlimited, max across replicas |
 | `duckgres_session_admission_reclaim_pending` | Gauge | Activated cleanup intents awaiting or executing exact database reclamation |
 | `duckgres_session_admission_reclaim_attempts_total{outcome}` | Counter | Exact cleanup attempts by `success` or `error` outcome |
 | `duckgres_session_admission_reclaim_reservations_in_use` | Gauge | Cleanup-ownership slots held before enqueue, while queued or live, and during pending cleanup |
@@ -231,7 +233,7 @@ column cannot be added to a populated table).
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
-- [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
+- [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global CPU/memory admission, exact cleanup ownership, failure recovery, and operational metrics.
 - [Managed Warehouse Provisioning Recovery](docs/runbooks/managed-warehouse-provisioning-recovery.md): Diagnose a failed warehouse whose Duckling dependencies were repaired and verify automatic convergence back to ready.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
@@ -389,7 +391,7 @@ Run with config file:
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` | Maximum client-requested `duckgres.idle_timeout`; unset disables client overrides | disabled |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
-| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
+| `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and org memory/vCPU or user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
 | `DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS` | Max queued/live admission identities whose cleanup ownership one control plane may retain; new admissions are rejected before enqueue when full | `4096` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_SNI_ROUTING_MODE` | Multi-tenant managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses the requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty. | `off` |
@@ -839,7 +841,7 @@ Built-in rate limiting protects against brute-force authentication attacks:
 
 - **Failed attempt tracking**: Bans IPs after too many failed auth attempts
 - **Connection limits**: Limits concurrent connections per IP and, when configured, total concurrent sessions in standalone mode.
-- **K8s multi-tenant resource limits**: Org and user `max_vcpus` bound the sum of active worker pod vCPUs admitted through runtime-store leases. 0 means unlimited.
+- **K8s multi-tenant resource limits**: Org and user `max_vcpus` bound active admitted worker pod vCPUs, while org `max_memory` independently bounds active admitted worker pod memory. Zero means unlimited.
 - **Auto-cleanup**: Expired records are automatically cleaned up
 
 ```yaml
@@ -1034,8 +1036,8 @@ Managed-warehouse contract notes:
 - At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
 - Each org has a `data_imports_table_naming_version`. Migration `000034` assigns `legacy_batch_v1` to orgs that already exist and changes the database default to `copy_v1` for orgs created afterward. `GET /api/v1/orgs/:id/teams` returns the org-level value alongside the team rows so every data-import reader and writer derives the same physical table name. Operators can change the policy in the admin console or with `PUT /api/v1/orgs/:id` using `{"data_imports_table_naming_version":"copy_v1"}`. Migrate existing tables before changing an org that has already written data.
 - The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
-- Org rows support optional `max_vcpus` on `POST /api/v1/orgs` and `PUT /api/v1/orgs/:id`. In K8s multi-tenant mode, this caps the org's active admitted worker pod vCPUs; `0` means unlimited.
-- Orgs automatically created during warehouse provisioning start with `max_vcpus=150`; `0` remains the explicit unlimited sentinel.
+- Org rows support optional `max_vcpus` and `max_memory` on `POST /api/v1/orgs` and `PUT /api/v1/orgs/:id`. In K8s multi-tenant mode these independently cap the org's active admitted worker pod vCPUs and memory. `max_memory` is a Kubernetes quantity such as `240Gi`; empty or `0` means unlimited.
+- Orgs automatically created during warehouse provisioning start with `max_vcpus=150` and unlimited memory. `0` remains the explicit unlimited sentinel.
 - User rows support an optional `max_vcpus` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. `max_vcpus` limits the user's active admitted worker pod vCPUs in K8s multi-tenant mode; `0` means unlimited.
 - `PUT /api/v1/orgs/:id/teams/:team_id/project-reader` creates or rotates the generated SQL login for a PostHog project. The login can read every current and future table in the project's team, data-import, and modeled-data schemas, plus its legacy events/persons relations. Writes, unqualified application relations, external-reader and introspection functions, other projects' schemas, and their catalog metadata are denied by the PostgreSQL query gateway. The plaintext password is returned only by the rotation response.
 - The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared worker mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.

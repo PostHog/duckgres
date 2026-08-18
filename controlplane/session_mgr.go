@@ -87,12 +87,13 @@ type SessionManager struct {
 	// org stack) so every session/worker lifecycle line is org-filterable.
 	log *slog.Logger
 
-	maxConnections int
-	activeSlots    int
-	waiters        []*connectionWaiter
-	limiter        connectionLimiter
-	resourceLimits func(username string) configstore.OrgResourceLimits
-	requestedVCPUs func(profile *WorkerProfile) (int, error)
+	maxConnections       int
+	activeSlots          int
+	waiters              []*connectionWaiter
+	limiter              connectionLimiter
+	resourceLimits       func(username string) configstore.OrgResourceLimits
+	requestedVCPUs       func(profile *WorkerProfile) (int, error)
+	requestedMemoryBytes func(profile *WorkerProfile) (int64, error)
 
 	// userSecretLoader returns the user's persistent CREATE SECRET statements
 	// (decrypted) to replay on a worker at session creation. nil outside the
@@ -169,6 +170,16 @@ func (sm *SessionManager) SetRequestedVCPUsResolver(fn func(profile *WorkerProfi
 	sm.requestedVCPUs = fn
 }
 
+// SetRequestedMemoryBytesResolver installs the worker-profile-to-memory-byte
+// resolver used for resource admission. nil uses the effective profile memory
+// with the built-in default, which keeps every durable request positive even
+// for compatibility callers that do not install a deployment-aware resolver.
+func (sm *SessionManager) SetRequestedMemoryBytesResolver(fn func(profile *WorkerProfile) (int64, error)) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.requestedMemoryBytes = fn
+}
+
 // ReservePID generates a new unique PID for a session.
 func (sm *SessionManager) ReservePID() int32 {
 	return reservePID(globalNextPID)
@@ -188,6 +199,7 @@ func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, 
 	limiter := sm.limiter
 	resourceLimits := sm.resourceLimits
 	requestedVCPUs := sm.requestedVCPUs
+	requestedMemoryBytes := sm.requestedMemoryBytes
 	sm.mu.Unlock()
 	if limiter != nil {
 		vcpus := 1
@@ -201,6 +213,16 @@ func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, 
 		if vcpus <= 0 {
 			return nil, fmt.Errorf("requested vcpus must be positive, got %d", vcpus)
 		}
+		memoryBytes, err := requestedWorkerMemoryBytes(profile, "")
+		if requestedMemoryBytes != nil {
+			memoryBytes, err = requestedMemoryBytes(profile)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if memoryBytes <= 0 {
+			return nil, fmt.Errorf("requested memory bytes must be positive, got %d", memoryBytes)
+		}
 		limits := func(user string) configstore.OrgResourceLimits {
 			if resourceLimits == nil {
 				return configstore.OrgResourceLimits{}
@@ -208,10 +230,11 @@ func (sm *SessionManager) acquireConnectionSlot(ctx context.Context, pid int32, 
 			return resourceLimits(user)
 		}
 		lease, err := limiter.Acquire(ctx, connectionAdmissionRequest{
-			PID:            pid,
-			Username:       username,
-			Protocol:       protocol,
-			RequestedVCPUs: vcpus,
+			PID:                  pid,
+			Username:             username,
+			Protocol:             protocol,
+			RequestedVCPUs:       vcpus,
+			RequestedMemoryBytes: memoryBytes,
 		}, limits)
 		if err != nil {
 			return nil, err

@@ -11,9 +11,11 @@ const (
 	orgConnectionAdmissionOutcomeGranted            = "granted"
 	orgConnectionAdmissionOutcomeAlreadyGranted     = "already_granted"
 	orgConnectionAdmissionOutcomeBlockedOrgVCPU     = "blocked_org_vcpu"
+	orgConnectionAdmissionOutcomeBlockedOrgMemory   = "blocked_org_memory"
 	orgConnectionAdmissionOutcomeBlockedUserVCPU    = "blocked_user_vcpu"
 	orgConnectionAdmissionOutcomeBlockedOrgUserVCPU = "blocked_org_user_vcpu"
 	orgConnectionAdmissionOutcomeRejectedOrgVCPU    = "rejected_org_vcpu"
+	orgConnectionAdmissionOutcomeRejectedOrgMemory  = "rejected_org_memory"
 	orgConnectionAdmissionOutcomeRejectedUserVCPU   = "rejected_user_vcpu"
 	orgConnectionAdmissionOutcomeIneligibleUser     = "ineligible_user"
 	orgConnectionAdmissionOutcomeInactive           = "inactive_request"
@@ -62,12 +64,16 @@ func orgConnectionAdmissionEvaluationForOutcome(outcome string) OrgConnectionAdm
 		return OrgConnectionAdmissionEvaluation{Decision: "already_granted", Reason: "none"}
 	case orgConnectionAdmissionOutcomeBlockedOrgVCPU:
 		return OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "org_vcpu"}
+	case orgConnectionAdmissionOutcomeBlockedOrgMemory:
+		return OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "org_memory"}
 	case orgConnectionAdmissionOutcomeBlockedUserVCPU:
 		return OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "user_vcpu"}
 	case orgConnectionAdmissionOutcomeBlockedOrgUserVCPU:
 		return OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "org_user_vcpu"}
 	case orgConnectionAdmissionOutcomeRejectedOrgVCPU:
 		return OrgConnectionAdmissionEvaluation{Decision: "rejected", Reason: "org_vcpu"}
+	case orgConnectionAdmissionOutcomeRejectedOrgMemory:
+		return OrgConnectionAdmissionEvaluation{Decision: "rejected", Reason: "org_memory"}
 	case orgConnectionAdmissionOutcomeRejectedUserVCPU:
 		return OrgConnectionAdmissionEvaluation{Decision: "rejected", Reason: "user_vcpu"}
 	case orgConnectionAdmissionOutcomeIneligibleUser:

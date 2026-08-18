@@ -24,8 +24,10 @@ workers)`) and the size following the largest worker shape spawned in the last
 7 days — both derived from the worker spawn log, no config knobs; a real worker
 spawn preempts a placeholder and schedules immediately. So "low capacity" now means one of: spawns
 are failing, the cluster can't schedule pods, headroom is exhausted, or an org
-has hit its per-org worker cap (`Org.MaxWorkers`; 0 = unbounded). There is no
-global/cluster worker cap — the node pool / autoscaler is the only shared ceiling.
+has hit its per-org worker cap (`Org.MaxWorkers`; 0 = unbounded). Session
+admission also enforces independent per-org vCPU and memory ceilings before
+worker acquisition. There is no global/cluster worker cap — the node pool /
+autoscaler is the only shared ceiling.
 
 ## Metrics to watch
 
@@ -34,6 +36,8 @@ global/cluster worker cap — the node pool / autoscaler is the only shared ceil
 | `sum(duckgres_worker_lifecycle_count{state="spawning"})` sustained > 0 | Spawns are slow/stuck (image pull, Pending pods, cold nodes) |
 | `sum by (reason)(rate(duckgres_worker_spawn_failures_total[5m]))` | Pod spawn errors by stage |
 | `duckgres_control_plane_worker_acquire_seconds` (if present) | Session acquire latency |
+| `sum by (org) (duckgres_session_admission_active_memory_bytes)` | Memory requested by local live admission leases; sum across replicas |
+| `max by (org) (duckgres_session_admission_limit_memory_bytes)` | Effective org memory ceiling; 0 means unlimited |
 | Crash-rate query (procedure step 1) | Workers crashing → repeated respawns |
 
 Note: `binding="neutral"` lifecycle series are legacy (no worker is spawned
@@ -88,12 +92,18 @@ unassigned anymore); production capacity lives in `binding="org_bound"`.
      binds in steady state, revisit the constants in `controlplane/headroom.go`.
 
 4. **Check the cap.** If you hit `worker capacity exhausted for organization`,
-   the request is at a real cap, not a scheduling problem:
+   a `53400` resource-limit error, or an admission timeout, the request may be
+   at a real cap rather than a scheduling problem:
    - Per-org: the org reached its configured max concurrent workers
      (`Org.MaxWorkers`) and all are busy — expected backpressure; the client
      should retry as queries finish. Raise the org's `max_workers` (or set it to
      0 = unbounded) if it is legitimately undersized; otherwise scale the worker
      node pool. There is no global worker cap to raise.
+   - Resource admission: compare the active and limit vCPU/memory gauges and
+     inspect durable leases. A worker shape larger than the hard ceiling is
+     rejected immediately; temporary aggregate saturation queues. Follow the
+     [org connection admission runbook](org-connection-admission.md) before
+     changing a limit or reclaiming a stale lease.
 
 5. **Verify recovery.** New sessions stop getting capacity errors;
    `duckgres_worker_lifecycle_count{state="spawning"}` settles back toward 0.

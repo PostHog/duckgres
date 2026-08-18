@@ -21,10 +21,11 @@ type connectionLease interface {
 }
 
 type connectionAdmissionRequest struct {
-	PID            int32
-	Username       string
-	Protocol       string
-	RequestedVCPUs int
+	PID                  int32
+	Username             string
+	Protocol             string
+	RequestedVCPUs       int
+	RequestedMemoryBytes int64
 }
 
 type connectionLimiter interface {
@@ -75,7 +76,7 @@ type runtimeOrgConnectionLimiter struct {
 	newID        func() (string, error)
 }
 
-// NewRuntimeOrgConnectionLimiter builds the runtime vCPU admission gate. The
+// NewRuntimeOrgConnectionLimiter builds the runtime resource-admission gate. The
 // optional form preserves source compatibility for older callers, but Acquire
 // deliberately fails closed unless the control-plane-wide reclaimer is
 // supplied; durable admission must never start without reserved cleanup
@@ -119,15 +120,16 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, request conne
 	enqueuedAt := l.now()
 	expiresAt := enqueuedAt.Add(l.queueTTL)
 	entry := &configstore.OrgConnectionQueueEntry{
-		RequestID:      requestID,
-		OrgID:          l.orgID,
-		Username:       request.Username,
-		CPInstanceID:   l.cpInstanceID,
-		PID:            request.PID,
-		Protocol:       request.Protocol,
-		RequestedVCPUs: request.RequestedVCPUs,
-		EnqueuedAt:     enqueuedAt,
-		ExpiresAt:      expiresAt,
+		RequestID:            requestID,
+		OrgID:                l.orgID,
+		Username:             request.Username,
+		CPInstanceID:         l.cpInstanceID,
+		PID:                  request.PID,
+		Protocol:             request.Protocol,
+		RequestedVCPUs:       request.RequestedVCPUs,
+		RequestedMemoryBytes: request.RequestedMemoryBytes,
+		EnqueuedAt:           enqueuedAt,
+		ExpiresAt:            expiresAt,
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, runtimeAdmissionContextError(err)
@@ -228,11 +230,13 @@ func (l *runtimeOrgConnectionLimiter) Acquire(ctx context.Context, request conne
 		if lease != nil {
 			outcome = "granted"
 			sessionAdmissionActiveVCPUsGauge.WithLabelValues(l.orgID).Add(float64(request.RequestedVCPUs))
+			sessionAdmissionActiveMemoryBytesGauge.WithLabelValues(l.orgID).Add(float64(request.RequestedMemoryBytes))
 			cleanupArmed = false
 			return &runtimeOrgConnectionLease{
-				reservation:    reservation,
-				orgID:          l.orgID,
-				requestedVCPUs: request.RequestedVCPUs,
+				reservation:          reservation,
+				orgID:                l.orgID,
+				requestedVCPUs:       request.RequestedVCPUs,
+				requestedMemoryBytes: request.RequestedMemoryBytes,
 			}, nil
 		}
 
@@ -279,6 +283,8 @@ func sessionAdmissionRejectionReason(rejection *configstore.OrgConnectionAdmissi
 	switch rejection.Reason {
 	case configstore.OrgConnectionAdmissionRejectedOrgVCPU:
 		return "org_vcpu"
+	case configstore.OrgConnectionAdmissionRejectedOrgMemory:
+		return "org_memory"
 	case configstore.OrgConnectionAdmissionRejectedUserVCPU:
 		return "user_vcpu"
 	default:
@@ -294,10 +300,11 @@ func runtimeAdmissionContextError(err error) error {
 }
 
 type runtimeOrgConnectionLease struct {
-	reservation    AdmissionReclaimReservation
-	orgID          string
-	requestedVCPUs int
-	released       sync.Once
+	reservation          AdmissionReclaimReservation
+	orgID                string
+	requestedVCPUs       int
+	requestedMemoryBytes int64
+	released             sync.Once
 }
 
 func (l *runtimeOrgConnectionLease) Release(context.Context) error {
@@ -307,6 +314,7 @@ func (l *runtimeOrgConnectionLease) Release(context.Context) error {
 	l.released.Do(func() {
 		l.reservation.Reclaim(admissionReclaimCauseLeaseRelease)
 		sessionAdmissionActiveVCPUsGauge.WithLabelValues(l.orgID).Sub(float64(l.requestedVCPUs))
+		sessionAdmissionActiveMemoryBytesGauge.WithLabelValues(l.orgID).Sub(float64(l.requestedMemoryBytes))
 	})
 	return nil
 }

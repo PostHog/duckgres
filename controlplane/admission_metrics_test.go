@@ -16,6 +16,8 @@ func TestSessionAdmissionReasonsValue(t *testing.T) {
 		{name: "user vCPU takes precedence", reasons: []string{"fifo", "user_vcpu", "store_error"}, want: "user_vcpu"},
 		{name: "both vCPU limits", reasons: []string{"org_vcpu", "fifo", "user_vcpu"}, want: "org_user_vcpu"},
 		{name: "both vCPU limits in reverse order", reasons: []string{"user_vcpu", "resharding", "org_vcpu"}, want: "org_user_vcpu"},
+		{name: "org memory takes precedence over queue reason", reasons: []string{"fifo", "org_memory"}, want: "org_memory"},
+		{name: "memory and vCPU blockers are resource mixed", reasons: []string{"org_memory", "org_vcpu"}, want: "resource_mixed"},
 		{name: "unknown reason is bounded", reasons: []string{"future_dynamic_reason"}, want: "store_error"},
 	}
 
@@ -29,5 +31,11 @@ func TestSessionAdmissionReasonsValue(t *testing.T) {
 				t.Fatalf("value() = %q, want %q", value, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizedSessionAdmissionReasonKeepsResourceMixed(t *testing.T) {
+	if got := normalizedSessionAdmissionReason("resource_mixed"); got != "resource_mixed" {
+		t.Fatalf("normalized reason = %q, want resource_mixed", got)
 	}
 }

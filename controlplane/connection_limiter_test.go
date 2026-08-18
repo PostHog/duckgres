@@ -581,10 +581,14 @@ func resetSessionAdmissionMetricGauges(t *testing.T, org string) {
 	sessionAdmissionQueueDepthGauge.DeleteLabelValues(org)
 	sessionAdmissionActiveVCPUsGauge.DeleteLabelValues(org)
 	sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+	sessionAdmissionActiveMemoryBytesGauge.DeleteLabelValues(org)
+	sessionAdmissionLimitMemoryBytesGauge.DeleteLabelValues(org)
 	t.Cleanup(func() {
 		sessionAdmissionQueueDepthGauge.DeleteLabelValues(org)
 		sessionAdmissionActiveVCPUsGauge.DeleteLabelValues(org)
 		sessionAdmissionLimitVCPUsGauge.DeleteLabelValues(org)
+		sessionAdmissionActiveMemoryBytesGauge.DeleteLabelValues(org)
+		sessionAdmissionLimitMemoryBytesGauge.DeleteLabelValues(org)
 	})
 }
 
@@ -592,6 +596,7 @@ func TestRuntimeOrgConnectionLimiterObservesGrantedRequestLifecycle(t *testing.T
 	const org = "org-admission-metrics-granted"
 	resetSessionAdmissionMetricGauges(t, org)
 	sessionAdmissionLimitVCPUsGauge.WithLabelValues(org).Set(7)
+	sessionAdmissionLimitMemoryBytesGauge.WithLabelValues(org).Set(240 << 30)
 	store := &admissionMetricsScheduleStore{results: []admissionMetricsScheduleResult{
 		{evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "blocked", Reason: "org_vcpu"}},
 		{evaluation: configstore.OrgConnectionAdmissionEvaluation{Decision: "granted_current", Reason: "none"}},
@@ -602,7 +607,7 @@ func TestRuntimeOrgConnectionLimiterObservesGrantedRequestLifecycle(t *testing.T
 	requestsBefore := counterVecLabelValue(t, sessionAdmissionRequestsCounter, org, "granted", "org_vcpu")
 	waitsBefore := histogramVecLabelSampleCount(t, sessionAdmissionWaitHistogram, org, "granted", "org_vcpu")
 	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
-		PID: 1001, Username: "alice", Protocol: "postgres", RequestedVCPUs: 2,
+		PID: 1001, Username: "alice", Protocol: "postgres", RequestedVCPUs: 2, RequestedMemoryBytes: 120 << 30,
 	}, func(string) configstore.OrgResourceLimits { return configstore.OrgResourceLimits{} })
 	if err != nil || lease == nil {
 		t.Fatalf("Acquire = (%v, %v), want lease", lease, err)
@@ -619,8 +624,14 @@ func TestRuntimeOrgConnectionLimiterObservesGrantedRequestLifecycle(t *testing.T
 	if got := gaugeVecLabelValue(t, sessionAdmissionActiveVCPUsGauge, org); got != 2 {
 		t.Fatalf("active vCPUs = %v, want 2", got)
 	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionActiveMemoryBytesGauge, org); got != 120<<30 {
+		t.Fatalf("active memory bytes = %v, want %d", got, int64(120<<30))
+	}
 	if got := gaugeVecLabelValue(t, sessionAdmissionLimitVCPUsGauge, org); got != 7 {
 		t.Fatalf("limit vCPUs = %v, want config-reconciled value 7", got)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionLimitMemoryBytesGauge, org); got != 240<<30 {
+		t.Fatalf("limit memory bytes = %v, want %d", got, int64(240<<30))
 	}
 
 	if err := lease.Release(context.Background()); err != nil {
@@ -631,6 +642,9 @@ func TestRuntimeOrgConnectionLimiterObservesGrantedRequestLifecycle(t *testing.T
 	}
 	if got := gaugeVecLabelValue(t, sessionAdmissionActiveVCPUsGauge, org); got != 0 {
 		t.Fatalf("active vCPUs after repeated release = %v, want 0", got)
+	}
+	if got := gaugeVecLabelValue(t, sessionAdmissionActiveMemoryBytesGauge, org); got != 0 {
+		t.Fatalf("active memory bytes after repeated release = %v, want 0", got)
 	}
 	submissions, _ := reclaimer.snapshot()
 	if len(submissions) != 1 || submissions[0].cause != admissionReclaimCauseLeaseRelease {

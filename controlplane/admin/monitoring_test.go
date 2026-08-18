@@ -57,6 +57,7 @@ func TestMonitoringSnapshotIsOrgScopedSanitizedAndReportsPartialCoverage(t *test
 				Name:                    "org-a",
 				MaxWorkers:              4,
 				MaxVCPUs:                8,
+				MaxMemoryBytes:          16 * 1024 * 1024 * 1024,
 				DefaultWorkerCPU:        "1",
 				DefaultWorkerMemory:     "2Gi",
 				DefaultWorkerTTL:        "30m",
@@ -130,6 +131,9 @@ func TestMonitoringSnapshotIsOrgScopedSanitizedAndReportsPartialCoverage(t *test
 	}
 	if got.Limits.DefaultWorkerCPU != "1" || got.Limits.DefaultWorkerMemory != "2Gi" || got.Limits.DefaultWorkerTTLSeconds != 1800 {
 		t.Fatalf("configured defaults = %+v, want current org defaults", got.Limits)
+	}
+	if got.Limits.MaxMemoryBytes != 16*1024*1024*1024 {
+		t.Fatalf("max memory bytes = %d, want 16Gi", got.Limits.MaxMemoryBytes)
 	}
 	if got.Totals.Workers != 2 || got.Totals.AllocatedCPUCores != 2.75 || got.Totals.AllocatedMemoryBytes != 7*1024*1024*1024 {
 		t.Fatalf("worker totals = %+v, want 2 workers / 2.75 cores / 7Gi", got.Totals)

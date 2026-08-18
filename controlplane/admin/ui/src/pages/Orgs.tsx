@@ -74,6 +74,14 @@ export function Orgs() {
         },
       },
       {
+        accessorKey: "max_memory",
+        header: "Max memory",
+        cell: ({ getValue }) => {
+          const v = getValue() as string;
+          return <span className="font-mono text-xs">{v === "" ? "∞" : v}</span>;
+        },
+      },
+      {
         id: "users",
         header: "Users",
         accessorFn: (o) => o.users?.length ?? 0,
@@ -164,7 +172,7 @@ export function Orgs() {
         )}
         <Card className="overflow-hidden">
           {orgs.isLoading ? (
-            <TableSkeleton cols={9} />
+            <TableSkeleton cols={10} />
           ) : orgs.isError ? (
             <ErrorState error={orgs.error} onRetry={() => orgs.refetch()} />
           ) : (

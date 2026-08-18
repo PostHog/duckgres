@@ -33,6 +33,16 @@ var sessionAdmissionLimitVCPUsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Help: "Effective org session-admission vCPU limit for active org stacks, reconciled from this control-plane process's current config snapshot; zero means unlimited and max by org collapses replica duplication.",
 }, []string{"org"})
 
+var sessionAdmissionActiveMemoryBytesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_session_admission_active_memory_bytes",
+	Help: "Requested memory bytes held by live local admission lease handles; cleanup-pending durable rows are excluded.",
+}, []string{"org"})
+
+var sessionAdmissionLimitMemoryBytesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_session_admission_limit_memory_bytes",
+	Help: "Effective org session-admission memory limit in bytes for active org stacks, reconciled from this control-plane process's current config snapshot; zero means unlimited and max by org collapses replica duplication.",
+}, []string{"org"})
+
 func observeSessionAdmissionTerminal(org, outcome, reason string, wait time.Duration) {
 	if wait < 0 {
 		wait = 0
@@ -56,7 +66,7 @@ func normalizedSessionAdmissionReason(reason string) string {
 	switch reason {
 	case "", "none":
 		return "none"
-	case "org_vcpu", "user_vcpu", "org_user_vcpu", "user_ineligible", "resharding", "fifo", "store_error", "mixed":
+	case "org_vcpu", "user_vcpu", "org_user_vcpu", "org_memory", "resource_mixed", "user_ineligible", "resharding", "fifo", "store_error", "mixed":
 		return reason
 	default:
 		return "store_error"
@@ -64,10 +74,11 @@ func normalizedSessionAdmissionReason(reason string) string {
 }
 
 type sessionAdmissionReasons struct {
-	firstNonVCPU string
-	mixedNonVCPU bool
-	orgVCPU      bool
-	userVCPU     bool
+	firstNonResource string
+	mixedNonResource bool
+	orgVCPU          bool
+	userVCPU         bool
+	orgMemory        bool
 }
 
 func (r *sessionAdmissionReasons) add(reason string) {
@@ -86,17 +97,26 @@ func (r *sessionAdmissionReasons) add(reason string) {
 		r.orgVCPU = true
 		r.userVCPU = true
 		return
-	}
-	if r.firstNonVCPU == "" {
-		r.firstNonVCPU = reason
+	case "org_memory":
+		r.orgMemory = true
 		return
 	}
-	if r.firstNonVCPU != reason {
-		r.mixedNonVCPU = true
+	if r.firstNonResource == "" {
+		r.firstNonResource = reason
+		return
+	}
+	if r.firstNonResource != reason {
+		r.mixedNonResource = true
 	}
 }
 
 func (r sessionAdmissionReasons) value() string {
+	if r.orgMemory && (r.orgVCPU || r.userVCPU) {
+		return "resource_mixed"
+	}
+	if r.orgMemory {
+		return "org_memory"
+	}
 	if r.orgVCPU && r.userVCPU {
 		return "org_user_vcpu"
 	}
@@ -106,11 +126,11 @@ func (r sessionAdmissionReasons) value() string {
 	if r.userVCPU {
 		return "user_vcpu"
 	}
-	if r.mixedNonVCPU {
+	if r.mixedNonResource {
 		return "mixed"
 	}
-	if r.firstNonVCPU == "" {
+	if r.firstNonResource == "" {
 		return "none"
 	}
-	return r.firstNonVCPU
+	return r.firstNonResource
 }

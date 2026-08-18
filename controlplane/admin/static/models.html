@@ -366,6 +366,7 @@
       database_name: "Database name clients connect with (dbname=). Unique across orgs.",
       max_workers: "Maximum concurrent worker pods this org may run. 0 means use the deployment default.",
       max_vcpus: "Maximum active worker pod vCPUs this org may have admitted. 0 means unlimited.",
+      max_memory: "Maximum active worker pod memory this org may have admitted, as a Kubernetes quantity. Empty means unlimited.",
       default_worker_cpu: "Operator-set default worker pod CPU (k8s quantity, e.g. 2). Empty means unset. Applied when a connection does not size itself via duckgres.worker_* options.",
       default_worker_memory: "Operator-set default worker pod memory (k8s quantity, e.g. 8Gi). Empty means unset.",
       default_worker_ttl: "Operator-set default hot-idle TTL for workers (Go duration string, e.g. 75m). Empty means unset.",
@@ -453,6 +454,7 @@
       pid: "Client backend PID associated with the request.",
       protocol: "Session interface for the request (postgres or admin).",
       requested_vcpus: "Worker pod vCPUs requested by this admission entry.",
+      requested_memory_bytes: "Worker pod memory bytes requested by this admission entry.",
       enqueued_at: "When the request joined the FIFO queue; orders fairness.",
       expires_at: "When this queue entry expires and is reclaimed.",
       granted_at: "When admission was granted, if applicable.",
@@ -468,7 +470,8 @@
       pid: "Client backend PID holding the lease.",
       protocol: "Session interface for the lease (postgres or admin).",
       requested_vcpus: "Worker pod vCPUs charged to the org and user budgets.",
-      acquired_at: "When the lease was acquired; counts toward active vCPU resource budgets.",
+      requested_memory_bytes: "Worker pod memory bytes charged to the org budget.",
+      acquired_at: "When the lease was acquired; counts toward active vCPU and memory resource budgets.",
       created_at: "When this lease record was created.",
       updated_at: "When this lease record was last modified.",
     },
@@ -483,8 +486,8 @@
     "managed-warehouses": "The config-store source of truth for an org's managed warehouse: image, metadata/object stores, catalogs, identity, and provisioning status.",
     "cp-instances": "A runtime coordination record for one control-plane process, with liveness state and heartbeat.",
     "worker-records": "A durable runtime record for one worker pod: lifecycle state, owner, profile, TTL, and credential expiry.",
-    "org-connection-queue": "A cluster-wide FIFO resource admission request for one org/user session; rows expire quickly and coordinate fairness across CP replicas.",
-    "org-connection-leases": "A durable cluster-wide resource admission lease for a live session; active leases count toward org and user vCPU budgets.",
+    "org-connection-queue": "A cluster-wide FIFO CPU and memory admission request for one org/user session; rows expire quickly and coordinate fairness across CP replicas.",
+    "org-connection-leases": "A durable cluster-wide resource admission lease for a live session; active leases count toward org memory and org/user vCPU budgets.",
   };
 
   // Per-org aux data computed client-side: the live /models/orgs listing does
@@ -715,6 +718,7 @@
   const ORG_EDIT_FIELDS = {
     max_workers: "int",
     max_vcpus: "int",
+    max_memory: "text",
     default_worker_cpu: "text",
     default_worker_memory: "text",
     default_worker_ttl: "text",

@@ -54,6 +54,7 @@ const ORG: Org = {
   hostname_alias: null,
   max_workers: 1,
   max_vcpus: 2,
+  max_memory: "120Gi",
   default_worker_cpu: "2",
   default_worker_memory: "8Gi",
   default_worker_ttl: "75m",
@@ -213,6 +214,19 @@ describe("Org detail", () => {
     await user.click(screen.getByText("Save changes"));
     expect(orgUpdate).toHaveBeenCalledTimes(1);
     expect(orgUpdate).toHaveBeenCalledWith(expect.objectContaining({ database_name: "acme-inc" }));
+  });
+
+  it("shows and saves the org memory limit", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const input = screen.getByLabelText(/max memory/i);
+    expect(input).toHaveValue("120Gi");
+    await user.clear(input);
+    await user.type(input, "240Gi");
+    await user.click(screen.getByText("Save changes"));
+
+    expect(orgUpdate).toHaveBeenCalledWith(expect.objectContaining({ max_memory: "240Gi" }));
   });
 
   it("keeps every other setting editable for an org whose stored name predates the rule", async () => {

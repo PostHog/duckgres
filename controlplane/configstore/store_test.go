@@ -16,6 +16,42 @@ func mustHash(t *testing.T, password string) string {
 	return hash
 }
 
+func TestParseOrgMaxMemoryBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		{name: "unset", raw: "", want: 0},
+		{name: "zero", raw: "0", want: 0},
+		{name: "zero quantity", raw: "0Gi", want: 0},
+		{name: "binary quantity", raw: "120Gi", want: 120 * 1024 * 1024 * 1024},
+		{name: "trimmed", raw: " 1500Mi ", want: 1500 * 1024 * 1024},
+		{name: "invalid", raw: "lots", wantErr: true},
+		{name: "negative", raw: "-1Gi", wantErr: true},
+		{name: "decimal overflow", raw: "10000000000000000000", wantErr: true},
+		{name: "binary overflow capped by quantity parser", raw: "8Ei", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseOrgMaxMemoryBytes(tt.raw)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseOrgMaxMemoryBytes(%q) = %d, nil; want error", tt.raw, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseOrgMaxMemoryBytes(%q): %v", tt.raw, err)
+			}
+			if got != tt.want {
+				t.Fatalf("ParseOrgMaxMemoryBytes(%q) = %d, want %d", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSnapshotBuild(t *testing.T) {
 	// Verify OrgConfig construction from models
 	hash1 := mustHash(t, "secret1")

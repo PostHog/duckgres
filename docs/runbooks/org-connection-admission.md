@@ -1,8 +1,18 @@
 # Org Connection Admission
 
-The multitenant control plane admits each connection by its requested worker
-vCPUs. `duckgres_orgs.max_vcpus` is the org ceiling and
-`duckgres_org_users.max_vcpus` is the user ceiling; `0` means unlimited.
+The multitenant control plane admits each connection by its resolved worker
+vCPUs and memory. `duckgres_orgs.max_vcpus` and `duckgres_orgs.max_memory` are
+the org ceilings, while `duckgres_org_users.max_vcpus` is the user vCPU
+ceiling. CPU and memory are independent: neither limit derives the other.
+`max_memory` is a Kubernetes quantity such as `240Gi`; empty or `0` means
+unlimited. Newly provisioned orgs default to unlimited memory.
+
+Admission charges the worker shape resolved from client options, org defaults,
+deployment defaults, or built-in defaults. Only live session leases count.
+Hot-idle workers do not count, just as they do not count toward `max_vcpus`.
+For example, two simultaneous `15` vCPU / `120Gi` sessions require ceilings of
+at least `30` vCPUs and `240Gi`; setting either ceiling lower blocks the second
+session.
 
 ## Admission invariants
 
@@ -16,9 +26,12 @@ vCPUs. `duckgres_orgs.max_vcpus` is the org ceiling and
 - Admission selection can create only the caller's lease and reject only the
   caller's request. Serialized housekeeping may prune expired or inactive
   foreign rows, but never grants or reserves capacity for them.
-- A request larger than its hard org or user ceiling is rejected. Temporary
+- A request larger than its hard org memory/vCPU or user vCPU ceiling is rejected. Temporary
   saturation remains queued until capacity becomes available or the request
   times out.
+- Lowering a limit below current usage does not terminate existing sessions.
+  Existing leases remain active and new requests wait until usage falls within
+  both ceilings.
 - Resharding takes the same org lock. No lease can be granted after the
   ready-to-resharding transition commits.
 
@@ -28,12 +41,23 @@ that head is the polling request. Otherwise the caller remains queued and the
 head's owner admits itself on its next poll.
 
 During a rolling deployment from the previous admission implementation, old
-replicas may
-still grant a foreign queue head and evaluate limits from their local config
-snapshot. Capacity remains protected by the shared org lock, but the strict
-request-owned and authoritative-limit invariants begin only after every old
-replica has exited. Avoid changing vCPU limits during that overlap when an
-exact change boundary matters.
+replicas may still grant a foreign queue head, evaluate limits from their local
+config snapshot, and grant leases without recording requested memory. Capacity
+remains protected by the shared org lock for limits every replica understands,
+but the strict request-owned, authoritative-limit, and memory-limit invariants
+begin only after every old replica has exited. Keep `max_memory` unlimited until
+all control-plane replicas run the new version and all legacy active leases
+whose `requested_memory_bytes` is zero have drained. A new replica deliberately
+fails closed on such an unknown active lease when a non-zero memory limit is
+enabled. Avoid changing vCPU limits during the overlap when an exact change
+boundary matters.
+
+After any org has a non-zero `max_memory`, do not roll an old control-plane
+binary back into the fleet: it does not enforce the cap and writes leases with
+unknown memory. Prefer roll-forward. If rollback is unavoidable, first clear
+every `max_memory` cap, complete the rollback, and leave the caps unlimited.
+After rolling forward again, wait until every replica is upgraded and every
+zero-memory active lease has drained before re-enabling the caps.
 
 The connection queue timeout is configured by
 `DUCKGRES_WORKER_QUEUE_TIMEOUT` (default `60s`). Owners poll every `100ms` while
@@ -71,8 +95,8 @@ admission reclaimer.
 - A committed lease is authoritative. Its queue row is only a lifecycle mirror
   and is removed with the lease when the session ends.
 - If admission is blocked, inspect active leases and unexpired queue rows for
-  the org. Confirm the owning control-plane instance is active before removing
-  any row manually.
+  the org, including `requested_vcpus` and `requested_memory_bytes`. Confirm the
+  owning control-plane instance is active before removing any row manually.
 - Do not delete a lease for a live session. If an owner is gone, expire its
   control-plane runtime record and let the serialized cleanup path reclaim its
   admission rows.
@@ -90,11 +114,15 @@ non-zero pending count can be healthy during steady connection churn. Reclaim
 logs include the request, org, retry count, and age; the metrics deliberately
 omit request and org labels.
 
-The org-labeled admission queue and active-vCPU gauges are logical local
-contributions, not exact durable row counts. Active vCPUs drop when cleanup is
+The org-labeled admission queue and active-resource gauges are logical local
+contributions, not exact durable row counts. Active resources drop when cleanup is
 transferred to the reclaimer, before the durable lease row is necessarily
 deleted. Use the reclaim backlog and attempt metrics above when that distinction
 matters; [the metrics reference](../metrics.md) documents aggregation rules.
+
+Monitor `duckgres_session_admission_active_memory_bytes` with `sum by (org)`
+across replicas and `duckgres_session_admission_limit_memory_bytes` with
+`max by (org)`. The corresponding vCPU gauges use the same aggregation rules.
 
 For local verification, run `just test-configstore-integration`; it exercises
 cross-replica ordering, cancellation races, eventual live-owner reclamation,

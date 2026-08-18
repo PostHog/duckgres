@@ -18,6 +18,7 @@ import (
 	"github.com/posthog/duckgres/server/flightclient"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -568,6 +569,14 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	if err != nil {
 		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
 	}
+	profile := WorkerProfile{
+		CPU:    claimed.ProfileCPU,
+		Memory: claimed.ProfileMemory,
+		TTL:    time.Duration(claimed.TTLMinutes) * time.Minute,
+	}
+	if err := p.validateClaimedWorkerPodShape(pod, profile); err != nil {
+		return nil, err
+	}
 
 	// For hot-idle workers, skip the epoch-validated health check. The worker's
 	// epoch and CP instance ID are from the previous owner, and ClaimHotIdleWorker
@@ -595,16 +604,50 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 		// worker keeps its shape. Without this, re-adopting a sized worker reset its
 		// profile to the default and the next hot-idle persist dropped its
 		// cpu/mem/ttl, so a same-size request could no longer reuse it.
-		profile: WorkerProfile{
-			CPU:    claimed.ProfileCPU,
-			Memory: claimed.ProfileMemory,
-			TTL:    time.Duration(claimed.TTLMinutes) * time.Minute,
-		},
-		done: make(chan struct{}),
+		profile: profile,
+		done:    make(chan struct{}),
 	}
 	worker.SetOwnerCPInstanceID(claimed.OwnerCPInstanceID)
 	worker.SetOwnerEpoch(claimed.OwnerEpoch)
 	return worker, nil
+}
+
+// validateClaimedWorkerPodShape prevents a control plane from adopting a pod
+// whose concrete resource requests differ from the shape admission will charge.
+// This matters most for default-profile runtime rows: they intentionally persist
+// empty CPU/memory fields, so a pod created before a rolling default change can
+// otherwise be mistaken for the new (larger or smaller) default shape.
+func (p *K8sWorkerPool) validateClaimedWorkerPodShape(pod *corev1.Pod, profile WorkerProfile) error {
+	if pod == nil {
+		return fmt.Errorf("claimed worker pod is missing")
+	}
+
+	var workerContainer *corev1.Container
+	for i := range pod.Spec.Containers {
+		if pod.Spec.Containers[i].Name == "duckdb-worker" {
+			workerContainer = &pod.Spec.Containers[i]
+			break
+		}
+	}
+	if workerContainer == nil {
+		return fmt.Errorf("claimed worker pod %s has no duckdb-worker container", pod.Name)
+	}
+
+	expected := p.workerResourcesForProfile(profile).Requests
+	for _, resourceName := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		actual, ok := workerContainer.Resources.Requests[resourceName]
+		if !ok {
+			return fmt.Errorf("claimed worker pod %s duckdb-worker container is missing %s request", pod.Name, resourceName)
+		}
+		if actual.Sign() <= 0 {
+			return fmt.Errorf("claimed worker pod %s duckdb-worker container has invalid %s request %q", pod.Name, resourceName, actual.String())
+		}
+		want := expected[resourceName]
+		if actual.Cmp(want) != 0 {
+			return fmt.Errorf("claimed worker pod %s duckdb-worker container %s request %q does not match effective request %q", pod.Name, resourceName, actual.String(), want.String())
+		}
+	}
+	return nil
 }
 
 func (p *K8sWorkerPool) connectWorker(ctx context.Context, podName, podIP, bearerToken string) (*flightsql.Client, error) {

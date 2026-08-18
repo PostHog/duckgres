@@ -77,7 +77,7 @@ func activationOutcomeForCode(code string) sessionActivationOutcome {
 // logic the eager connect path uses (sessionCreationErrorResponse) and packages
 // the result for the server package, which cannot see the control plane's
 // sentinels. Without this the server had to guess the SQLSTATE from the error
-// text, which silently degraded a vCPU-admission rejection or a draining
+// text, which silently degraded a resource-admission rejection or a draining
 // control plane into a generic 53400.
 func newSessionAcquireError(err error) *server.SessionAcquireError {
 	code, message := sessionCreationErrorResponse(err)

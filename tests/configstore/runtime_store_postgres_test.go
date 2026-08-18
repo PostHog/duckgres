@@ -68,6 +68,19 @@ func TestRuntimeStorePostgres(t *testing.T) {
 			}
 		}
 	}
+	for _, table := range []string{"org_connection_queue", "org_connection_leases"} {
+		var nullable, defaultValue string
+		if err := store.DB().Raw(
+			"SELECT is_nullable, column_default FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = 'requested_memory_bytes'",
+			runtimeSchema,
+			table,
+		).Row().Scan(&nullable, &defaultValue); err != nil {
+			t.Fatalf("lookup runtime memory column %s.requested_memory_bytes: %v", table, err)
+		}
+		if nullable != "NO" || defaultValue != "0" {
+			t.Fatalf("%s.requested_memory_bytes metadata = nullable %q default %q, want NO/0", table, nullable, defaultValue)
+		}
+	}
 	requireRuntimeIndexDefinition(t, store, "org_connection_queue", "idx_org_connection_queue_user_heads",
 		"(org_id, username, enqueued_at, request_id)", "WHERE (granted_at IS NULL)")
 	requireRuntimeIndexDefinition(t, store, "org_connection_leases", "idx_org_connection_leases_org_user",

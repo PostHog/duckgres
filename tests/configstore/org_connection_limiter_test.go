@@ -165,6 +165,48 @@ func seedAuthoritativeOrgConnectionLimits(t *testing.T, store *cpconfigstore.Con
 	}
 }
 
+func seedAuthoritativeOrgConnectionMemoryLimit(t *testing.T, store *cpconfigstore.ConfigStore, orgID, orgMaxMemory string, usernames ...string) {
+	t.Helper()
+
+	if err := store.DB().Create(&cpconfigstore.Org{
+		Name:         orgID,
+		DatabaseName: orgID,
+		MaxMemory:    orgMaxMemory,
+	}).Error; err != nil {
+		t.Fatalf("seed org %q memory limit: %v", orgID, err)
+	}
+	for _, username := range usernames {
+		if err := store.DB().Create(&cpconfigstore.OrgUser{
+			OrgID:    orgID,
+			Username: username,
+			Password: "test-password-hash",
+		}).Error; err != nil {
+			t.Fatalf("seed user %s/%s: %v", orgID, username, err)
+		}
+	}
+}
+
+func enqueueOrgConnectionMemoryRequest(t *testing.T, store *cpconfigstore.ConfigStore, requestID, orgID, username, cpInstanceID string, pid int32, requestedMemoryBytes int64, enqueuedAt time.Time) *cpconfigstore.OrgConnectionQueueEntry {
+	t.Helper()
+
+	request := &cpconfigstore.OrgConnectionQueueEntry{
+		RequestID:            requestID,
+		OrgID:                orgID,
+		Username:             username,
+		CPInstanceID:         cpInstanceID,
+		PID:                  pid,
+		Protocol:             "postgres",
+		RequestedVCPUs:       1,
+		RequestedMemoryBytes: requestedMemoryBytes,
+		EnqueuedAt:           enqueuedAt,
+		ExpiresAt:            enqueuedAt.Add(time.Minute),
+	}
+	if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+		t.Fatalf("enqueue %s: %v", requestID, err)
+	}
+	return request
+}
+
 func TestOrgConnectionLeasesEnforceOrgVCPUBudget(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-a")
@@ -227,6 +269,326 @@ func TestOrgConnectionLeasesEnforceOrgVCPUBudget(t *testing.T) {
 	if lease == nil {
 		t.Fatal("expected second request to acquire after vCPUs are released")
 	}
+}
+
+func TestOrgConnectionLeasesEnforceOrgMemoryBudget(t *testing.T) {
+	t.Run("exact boundary succeeds", func(t *testing.T) {
+		store := newIsolatedConfigStore(t)
+		upsertActiveCP(t, store, "cp-a")
+		upsertActiveCP(t, store, "cp-b")
+
+		now := time.Now()
+		first := enqueueOrgConnectionMemoryRequest(t, store, "request-a", "org-memory", "alice", "cp-a", 1001, 80, now)
+		second := enqueueOrgConnectionMemoryRequest(t, store, "request-b", "org-memory", "bob", "cp-b", 1002, 40, now.Add(time.Millisecond))
+		limits := cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 120}
+
+		firstLease, err := store.TryAcquireOrgConnectionLease(first.RequestID, limits, now)
+		if err != nil || firstLease == nil {
+			t.Fatalf("acquire first lease = %#v, err %v", firstLease, err)
+		}
+		if firstLease.RequestedMemoryBytes != first.RequestedMemoryBytes {
+			t.Fatalf("first lease requested memory = %d, want %d", firstLease.RequestedMemoryBytes, first.RequestedMemoryBytes)
+		}
+		secondLease, err := store.TryAcquireOrgConnectionLease(second.RequestID, limits, now)
+		if err != nil || secondLease == nil {
+			t.Fatalf("acquire exact-boundary second lease = %#v, err %v", secondLease, err)
+		}
+	})
+
+	t.Run("one byte over blocks until release", func(t *testing.T) {
+		store := newIsolatedConfigStore(t)
+		upsertActiveCP(t, store, "cp-a")
+		upsertActiveCP(t, store, "cp-b")
+
+		now := time.Now()
+		first := enqueueOrgConnectionMemoryRequest(t, store, "request-a", "org-memory", "alice", "cp-a", 1001, 80, now)
+		second := enqueueOrgConnectionMemoryRequest(t, store, "request-b", "org-memory", "bob", "cp-b", 1002, 41, now.Add(time.Millisecond))
+		limits := cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 120}
+
+		firstLease, err := store.TryAcquireOrgConnectionLease(first.RequestID, limits, now)
+		if err != nil || firstLease == nil {
+			t.Fatalf("acquire first lease = %#v, err %v", firstLease, err)
+		}
+		blocked, err := store.TryAcquireOrgConnectionLease(second.RequestID, limits, now)
+		if err != nil {
+			t.Fatalf("acquire one-byte-over request: %v", err)
+		}
+		if blocked != nil {
+			t.Fatalf("one-byte-over request acquired lease %#v", blocked)
+		}
+		assertOrgConnectionRequestPending(t, store, second.RequestID)
+
+		if err := store.ReleaseOrgConnectionLease(firstLease.LeaseID); err != nil {
+			t.Fatalf("release first lease: %v", err)
+		}
+		secondLease, err := store.TryAcquireOrgConnectionLease(second.RequestID, limits, now)
+		if err != nil || secondLease == nil {
+			t.Fatalf("acquire second lease after release = %#v, err %v", secondLease, err)
+		}
+	})
+
+	t.Run("zero is unlimited", func(t *testing.T) {
+		store := newIsolatedConfigStore(t)
+		upsertActiveCP(t, store, "cp-a")
+
+		now := time.Now()
+		request := enqueueOrgConnectionMemoryRequest(t, store, "request-a", "org-memory", "alice", "cp-a", 1001, 1<<50, now)
+		lease, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{}, now)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire with unlimited memory = %#v, err %v", lease, err)
+		}
+	})
+}
+
+func TestOrgConnectionLeasesMemoryBudgetIgnoresExpiredOwner(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+
+	now := time.Now()
+	first := enqueueOrgConnectionMemoryRequest(t, store, "request-a", "org-memory-expired", "alice", "cp-a", 1001, 120, now)
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 120}
+	if lease, err := store.TryAcquireOrgConnectionLease(first.RequestID, limits, now); err != nil || lease == nil {
+		t.Fatalf("acquire first lease = %#v, err %v", lease, err)
+	}
+
+	expiredAt := now.Add(time.Second)
+	if err := store.UpsertControlPlaneInstance(&cpconfigstore.ControlPlaneInstance{
+		ID:              "cp-a",
+		PodName:         "cp-a",
+		State:           cpconfigstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now,
+		LastHeartbeatAt: now,
+		ExpiredAt:       &expiredAt,
+	}); err != nil {
+		t.Fatalf("expire cp-a: %v", err)
+	}
+
+	second := enqueueOrgConnectionMemoryRequest(t, store, "request-b", "org-memory-expired", "bob", "cp-b", 1002, 120, now.Add(time.Millisecond))
+	lease, err := store.TryAcquireOrgConnectionLease(second.RequestID, limits, now)
+	if err != nil || lease == nil {
+		t.Fatalf("acquire after owner expiry = %#v, err %v", lease, err)
+	}
+}
+
+func TestOrgConnectionLeasesMemoryBudgetFailsClosedForLegacyUnknownMemory(t *testing.T) {
+	t.Run("active lease", func(t *testing.T) {
+		store := newIsolatedConfigStore(t)
+		upsertActiveCP(t, store, "cp-a")
+		upsertActiveCP(t, store, "cp-b")
+
+		now := time.Now()
+		if err := store.DB().Exec(
+			"INSERT INTO "+store.RuntimeSchema()+".org_connection_leases (lease_id, request_id, org_id, username, cp_instance_id, p_id, protocol, requested_vcpus, requested_memory_bytes, acquired_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"legacy-lease", "legacy-request", "org-legacy-memory", "alice", "cp-a", 1001, "postgres", 1, 0, now, now, now,
+		).Error; err != nil {
+			t.Fatalf("insert legacy lease: %v", err)
+		}
+
+		request := enqueueOrgConnectionMemoryRequest(t, store, "request-b", "org-legacy-memory", "bob", "cp-b", 1002, 1, now.Add(time.Millisecond))
+		blocked, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 120}, now)
+		if err != nil {
+			t.Fatalf("acquire with unknown active usage: %v", err)
+		}
+		if blocked != nil {
+			t.Fatalf("request acquired despite unknown active memory: %#v", blocked)
+		}
+		assertOrgConnectionRequestPending(t, store, request.RequestID)
+
+		lease, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{}, now)
+		if err != nil || lease == nil {
+			t.Fatalf("acquire with unlimited memory = %#v, err %v", lease, err)
+		}
+	})
+
+	for _, requestedMemoryBytes := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("queued request %d", requestedMemoryBytes), func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			upsertActiveCP(t, store, "cp-a")
+
+			now := time.Now()
+			request := enqueueOrgConnectionMemoryRequest(t, store, "legacy-request", "org-legacy-memory", "alice", "cp-a", 1001, requestedMemoryBytes, now)
+			blocked, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 120}, now)
+			if err != nil {
+				t.Fatalf("acquire request with unknown memory: %v", err)
+			}
+			if blocked != nil {
+				t.Fatalf("request with unknown memory acquired lease %#v", blocked)
+			}
+			assertOrgConnectionRequestPending(t, store, request.RequestID)
+		})
+	}
+}
+
+func TestOrgConnectionLeasesMemoryBudgetPreservesFIFO(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	for _, cpID := range []string{"cp-active", "cp-oldest", "cp-later"} {
+		upsertActiveCP(t, store, cpID)
+	}
+
+	now := time.Now()
+	active := enqueueOrgConnectionMemoryRequest(t, store, "request-active", "org-memory-fifo", "carol", "cp-active", 1001, 60, now)
+	limits := cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 100}
+	activeLease, err := store.TryAcquireOrgConnectionLease(active.RequestID, limits, now)
+	if err != nil || activeLease == nil {
+		t.Fatalf("acquire active lease = %#v, err %v", activeLease, err)
+	}
+
+	oldest := enqueueOrgConnectionMemoryRequest(t, store, "request-oldest", active.OrgID, "alice", "cp-oldest", 1002, 50, now.Add(time.Millisecond))
+	later := enqueueOrgConnectionMemoryRequest(t, store, "request-later", active.OrgID, "bob", "cp-later", 1003, 40, now.Add(2*time.Millisecond))
+	lease, err := store.TryAcquireOrgConnectionLease(later.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("poll later request: %v", err)
+	}
+	if lease != nil {
+		t.Fatalf("later smaller request bypassed memory-blocked FIFO head: %#v", lease)
+	}
+	assertOrgConnectionRequestPending(t, store, oldest.RequestID)
+	assertOrgConnectionRequestPending(t, store, later.RequestID)
+
+	if err := store.ReleaseOrgConnectionLease(activeLease.LeaseID); err != nil {
+		t.Fatalf("release active lease: %v", err)
+	}
+	lease, err = store.TryAcquireOrgConnectionLease(later.RequestID, limits, now)
+	if err != nil {
+		t.Fatalf("poll later request after release: %v", err)
+	}
+	if lease != nil {
+		t.Fatalf("later request bypassed now-runnable FIFO head: %#v", lease)
+	}
+	oldestLease, err := store.TryAcquireOrgConnectionLease(oldest.RequestID, limits, now)
+	if err != nil || oldestLease == nil {
+		t.Fatalf("acquire oldest request = %#v, err %v", oldestLease, err)
+	}
+	laterLease, err := store.TryAcquireOrgConnectionLease(later.RequestID, limits, now)
+	if err != nil || laterLease == nil {
+		t.Fatalf("acquire later request = %#v, err %v", laterLease, err)
+	}
+}
+
+func TestOrgConnectionLeasesMemoryBudgetHandlesForeignUnserviceableHead(t *testing.T) {
+	t.Run("permanently oversized head is skipped", func(t *testing.T) {
+		store := newIsolatedConfigStore(t)
+		upsertActiveCP(t, store, "cp-oldest")
+		upsertActiveCP(t, store, "cp-later")
+
+		now := time.Now()
+		oldest := enqueueOrgConnectionMemoryRequest(t, store, "request-oldest", "org-memory-head", "alice", "cp-oldest", 1001, 121, now)
+		later := enqueueOrgConnectionMemoryRequest(t, store, "request-later", oldest.OrgID, "bob", "cp-later", 1002, 1, now.Add(time.Millisecond))
+		limits := cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 120}
+
+		lease, err := store.TryAcquireOrgConnectionLease(later.RequestID, limits, now)
+		if err != nil || lease == nil || lease.RequestID != later.RequestID {
+			t.Fatalf("acquire behind permanently oversized head = %#v, err %v", lease, err)
+		}
+		assertOrgConnectionRequestPending(t, store, oldest.RequestID)
+
+		lease, err = store.TryAcquireOrgConnectionLease(oldest.RequestID, limits, now)
+		if lease != nil || !errors.Is(err, cpconfigstore.ErrOrgConnectionAdmissionRejected) {
+			t.Fatalf("oversized head rejection = lease %#v, err %v", lease, err)
+		}
+		assertOrgConnectionRequestAbsent(t, store, oldest.RequestID)
+	})
+
+	t.Run("unknown head fails closed", func(t *testing.T) {
+		store := newIsolatedConfigStore(t)
+		upsertActiveCP(t, store, "cp-oldest")
+		upsertActiveCP(t, store, "cp-later")
+
+		now := time.Now()
+		oldest := enqueueOrgConnectionMemoryRequest(t, store, "request-oldest", "org-memory-head", "alice", "cp-oldest", 1001, 0, now)
+		later := enqueueOrgConnectionMemoryRequest(t, store, "request-later", oldest.OrgID, "bob", "cp-later", 1002, 1, now.Add(time.Millisecond))
+
+		lease, err := store.TryAcquireOrgConnectionLease(later.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: 120}, now)
+		if err != nil {
+			t.Fatalf("poll behind unknown-memory head: %v", err)
+		}
+		if lease != nil {
+			t.Fatalf("later request bypassed unknown-memory head: %#v", lease)
+		}
+		assertOrgConnectionRequestPending(t, store, oldest.RequestID)
+		assertOrgConnectionRequestPending(t, store, later.RequestID)
+	})
+}
+
+func TestOrgConnectionLeasesMemoryBudgetFailsClosedWhenActiveSumExceedsInt64(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	for _, cpID := range []string{"cp-a", "cp-b", "cp-c"} {
+		upsertActiveCP(t, store, cpID)
+	}
+
+	now := time.Now()
+	const maxMemoryBytes int64 = 1<<63 - 1
+	leases := []*cpconfigstore.OrgConnectionLease{
+		{LeaseID: "lease-a", RequestID: "active-a", OrgID: "org-memory-overflow", Username: "alice", CPInstanceID: "cp-a", PID: 1001, Protocol: "postgres", RequestedVCPUs: 1, RequestedMemoryBytes: maxMemoryBytes, AcquiredAt: now},
+		{LeaseID: "lease-b", RequestID: "active-b", OrgID: "org-memory-overflow", Username: "bob", CPInstanceID: "cp-b", PID: 1002, Protocol: "postgres", RequestedVCPUs: 1, RequestedMemoryBytes: 1, AcquiredAt: now},
+	}
+	if err := store.DB().Table(store.RuntimeSchema() + ".org_connection_leases").Create(leases).Error; err != nil {
+		t.Fatalf("seed overflowing active memory sum: %v", err)
+	}
+	request := enqueueOrgConnectionMemoryRequest(t, store, "request-c", "org-memory-overflow", "carol", "cp-c", 1003, 1, now)
+
+	lease, err := store.TryAcquireOrgConnectionLease(request.RequestID, cpconfigstore.OrgResourceLimits{OrgMaxMemoryBytes: maxMemoryBytes}, now)
+	if err != nil {
+		t.Fatalf("evaluate overflowing active memory sum: %v", err)
+	}
+	if lease != nil {
+		t.Fatalf("request acquired over overflowing memory usage: %#v", lease)
+	}
+	assertOrgConnectionRequestPending(t, store, request.RequestID)
+}
+
+func TestOrgConnectionAdmissionUsesAuthoritativeOrgMemoryLimit(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	upsertActiveCP(t, store, "cp-b")
+	const orgID = "org-authoritative-memory"
+	seedAuthoritativeOrgConnectionMemoryLimit(t, store, orgID, "120Gi", "alice", "bob")
+
+	now := time.Now()
+	const gibibyte = int64(1024 * 1024 * 1024)
+	active := enqueueOrgConnectionMemoryRequest(t, store, "request-active", orgID, "alice", "cp-a", 1001, 80*gibibyte, now)
+	activeRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: active.RequestID, OrgID: orgID, CPInstanceID: active.CPInstanceID}
+	if lease, _, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), activeRef); err != nil || lease == nil {
+		t.Fatalf("grant active request = %#v, err %v", lease, err)
+	}
+
+	blocked := enqueueOrgConnectionMemoryRequest(t, store, "request-blocked", orgID, "bob", "cp-b", 1002, 40*gibibyte+1, now.Add(time.Millisecond))
+	blockedRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: blocked.RequestID, OrgID: orgID, CPInstanceID: blocked.CPInstanceID}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), blockedRef)
+	if err != nil || lease != nil {
+		t.Fatalf("evaluate blocked request = lease %#v, err %v", lease, err)
+	}
+	if evaluation.Decision != "blocked" || evaluation.Reason != "org_memory" {
+		t.Fatalf("evaluation = %#v, want blocked/org_memory", evaluation)
+	}
+}
+
+func TestOrgConnectionAdmissionRejectsRequestLargerThanOrgMemoryLimit(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-a")
+	const orgID = "org-rejected-memory"
+	seedAuthoritativeOrgConnectionMemoryLimit(t, store, orgID, "120Gi", "alice")
+
+	now := time.Now()
+	const gibibyte = int64(1024 * 1024 * 1024)
+	request := enqueueOrgConnectionMemoryRequest(t, store, "request-rejected", orgID, "alice", "cp-a", 1001, 120*gibibyte+1, now)
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: request.RequestID, OrgID: orgID, CPInstanceID: request.CPInstanceID}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+	if lease != nil || !errors.Is(err, cpconfigstore.ErrOrgConnectionAdmissionRejected) {
+		t.Fatalf("hard rejection = lease %#v, err %v", lease, err)
+	}
+	var rejection *cpconfigstore.OrgConnectionAdmissionRejectedError
+	if !errors.As(err, &rejection) {
+		t.Fatalf("hard rejection error %T, want *OrgConnectionAdmissionRejectedError", err)
+	}
+	if rejection.Reason != cpconfigstore.OrgConnectionAdmissionRejectedOrgMemory || rejection.RequestedMemoryBytes != request.RequestedMemoryBytes || rejection.MaximumMemoryBytes != 120*gibibyte {
+		t.Fatalf("hard rejection = %#v", rejection)
+	}
+	if evaluation.Decision != "rejected" || evaluation.Reason != "org_memory" {
+		t.Fatalf("hard-rejection evaluation = %#v, want rejected/org_memory", evaluation)
+	}
+	assertOrgConnectionRequestAbsent(t, store, request.RequestID)
 }
 
 func TestOrgConnectionLeasesEnforceUserVCPUBudget(t *testing.T) {
