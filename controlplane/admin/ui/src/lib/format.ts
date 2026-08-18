@@ -36,6 +36,13 @@ export function fmtInt(n: number | null | undefined): string {
   return n.toLocaleString("en-US");
 }
 
+// fmtUnits formats a derived unit count (CPU-minutes, GiB·hours, …): grouped
+// thousands, at most one fraction digit (120 → "120", 1.5 → "1.5").
+export function fmtUnits(n: number | null | undefined): string {
+  if (n == null || Number.isNaN(n)) return "—";
+  return n.toLocaleString("en-US", { maximumFractionDigits: 1 });
+}
+
 export function fmtPercent(n: number | null | undefined, digits = 1): string {
   if (n == null || Number.isNaN(n)) return "—";
   return `${n.toFixed(digits)}%`;

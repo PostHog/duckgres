@@ -6,7 +6,7 @@ import { EmptyState, ErrorState, LoadingState } from "@/components/states";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useOrgDailyUsage } from "@/hooks/useApi";
 import { hashColor } from "@/lib/colors";
-import { fmtTime } from "@/lib/format";
+import { fmtTime, fmtUnits } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import type { DailyUsageRow } from "@/types/api";
 
@@ -25,10 +25,6 @@ const METRICS: Metric[] = [
   { key: "mem", title: "Memory GiB·minutes", value: (r) => r.memory_seconds / 60, unit: "GiB·min" },
   { key: "storage", title: "S3 GiB·hours", value: (r) => Number(r.gib_seconds) / 3600, unit: "GiB·h" },
 ];
-
-function fmtUnits(n: number): string {
-  return n.toLocaleString(undefined, { maximumFractionDigits: 1 });
-}
 
 function teamLabel(r: DailyUsageRow): string {
   return r.schema_name ?? `team ${r.team_id}`;

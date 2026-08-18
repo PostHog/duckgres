@@ -11,13 +11,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useMonthlyUsage, useOrgLabels } from "@/hooks/useApi";
-import { fmtTime } from "@/lib/format";
+import { fmtTime, fmtUnits } from "@/lib/format";
 import type { MonthlyUsageRow } from "@/types/api";
-
-// Whole-unit-friendly: 120 stays "120", 1.5 stays "1.5", thousands group.
-function fmtUnits(n: number): string {
-  return n.toLocaleString(undefined, { maximumFractionDigits: 1 });
-}
 
 const cpuMinutes = (r: MonthlyUsageRow) => r.cpu_seconds / 60;
 const memGiBMinutes = (r: MonthlyUsageRow) => r.memory_seconds / 60;
