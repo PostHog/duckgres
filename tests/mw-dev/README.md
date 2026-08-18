@@ -355,6 +355,16 @@ normal `go test ./...` lane.
   and the event stream back, which the Job cannot do for the reason above; the
   key resolution is covered by `TestAnalyticsAPIKeyPrefersDedicatedKey` in
   `internal/cliboot/analytics_test.go`.
+- **PostHog Logs (OTLP)** — `assert_worker_pod` checks plumbing only: the
+  worker must not carry a plaintext `POSTHOG_API_KEY` `value:`, and when the
+  CP container's *named* env has a `secretKeyRef` the worker must copy the
+  same secret name+key. Until charts set that named env the copy branch is
+  skipped; the plaintext assert still runs. **Ingest cannot be asserted
+  in-Job** for the same reason as analytics: the Job holds no PostHog
+  query-API creds and cannot read the destination project. Do not require a
+  successful export. The first mw-dev `service.name=duckgres-worker` record
+  in the **analytics** project is the human egress proof; in-repo
+  NetworkPolicy 443 is not production Cilium.
 
 ## Isolation model
 

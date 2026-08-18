@@ -787,6 +787,11 @@ if [[ "$*" == *"get pods -l app=duckgres-worker,duckgres/active-org=test-org"* ]
   esac
   exit 0
 fi
+if [[ "$*" == *"POSTHOG_API_KEY"* ]]; then
+  # Fixture workers have no PostHog env. Empty output is the success case
+  # for the plaintext-forbidden assert (and skips the secretKeyRef copy).
+  exit 0
+fi
 if [[ "$*" == *"get pod stale-worker"* ]]; then
   echo 'Error from server (NotFound): pods "stale-worker" not found' >&2
   exit 1
@@ -836,7 +841,7 @@ exit 1
 	if got := strings.Count(callLog, "get pods -l app=duckgres-worker,duckgres/active-org=test-org"); got != 3 {
 		t.Fatalf("worker selections = %d, want 3 (stale, terminal, then replacement); calls:\n%s", got, callLog)
 	}
-	if got := strings.Count(callLog, "--field-selector=status.phase=Running"); got != 3 {
+	if got := strings.Count(callLog, "app=duckgres-worker,duckgres/active-org=test-org --field-selector=status.phase=Running"); got != 3 {
 		t.Fatalf("running-worker selections = %d, want 3; calls:\n%s", got, callLog)
 	}
 	if !strings.Contains(callLog, "get pod stale-worker") {
@@ -848,8 +853,11 @@ exit 1
 	if got := strings.Count(callLog, "get pod transitioned-worker"); got != 1 {
 		t.Fatalf("terminal transition inspections = %d, want 1; calls:\n%s", got, callLog)
 	}
-	if got := strings.Count(callLog, "get pod replacement-worker"); got != 1 {
-		t.Fatalf("replacement inspection reads = %d, want 1 atomic snapshot; calls:\n%s", got, callLog)
+	if got := strings.Count(callLog, "get pod replacement-worker -o jsonpath={.metadata.deletionTimestamp"); got != 1 {
+		t.Fatalf("replacement inspection snapshots = %d, want 1; calls:\n%s", got, callLog)
+	}
+	if !strings.Contains(callLog, "get pod replacement-worker -o jsonpath={range .spec.containers") {
+		t.Fatalf("did not run plaintext POSTHOG_API_KEY check on replacement; calls:\n%s", callLog)
 	}
 }
 

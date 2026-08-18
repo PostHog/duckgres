@@ -127,6 +127,33 @@ func TestNetworkPolicyCoversReshardRunnerPods(t *testing.T) {
 	}
 }
 
+// TestNetworkPolicyAllowsHTTPSEgressOnControlPlaneWorkerAndReshard pins 443
+// egress on all three process roles that may export PostHog Logs. This is
+// the in-repo kind/manifest contract only — not proof production Cilium
+// allows worker → *.i.posthog.com.
+func TestNetworkPolicyAllowsHTTPSEgressOnControlPlaneWorkerAndReshard(t *testing.T) {
+	manifest := readManifest(t, "k8s", "networkpolicy.yaml")
+	for _, name := range []string{
+		"duckgres-worker-ingress",
+		"duckgres-control-plane-boundaries",
+		"duckgres-reshard-runner-boundaries",
+	} {
+		var doc string
+		for _, candidate := range strings.Split(manifest, "---") {
+			if strings.Contains(candidate, "name: "+name) {
+				doc = candidate
+				break
+			}
+		}
+		if doc == "" {
+			t.Fatalf("could not find %s in k8s/networkpolicy.yaml", name)
+		}
+		if !strings.Contains(doc, "- port: 443") {
+			t.Fatalf("expected 443 egress in %s", name)
+		}
+	}
+}
+
 func TestManifestTestsRunInUnitRecipe(t *testing.T) {
 	content := readManifest(t, "justfile")
 	if !strings.Contains(content, "./tests/manifests/...") {

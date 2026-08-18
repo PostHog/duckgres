@@ -454,7 +454,15 @@ export POSTHOG_HOST=eu.i.posthog.com
 ./duckgres
 ```
 
-Remote worker pods do **not** inherit `POSTHOG_*` from the control-plane Deployment automatically — spawn builds an explicit env list. Until worker Secret-ref plumbing is in place, only processes that already have `POSTHOG_API_KEY` in their own env (control plane, process-backend children) export.
+Remote worker pods do **not** inherit the CP process env. Spawn copies a closed allowlist of **named** `env:` entries from the CP pod spec (`Get(namespace, POD_NAME)` once at pool start):
+
+- `POSTHOG_API_KEY` is copied only as `valueFrom.secretKeyRef`. A literal `value:` is refused. `envFrom` is insufficient (those keys do not appear on a Pod GET) and is not invented-around as `os.Getenv` → `value:`.
+- `POSTHOG_HOST`, `DUCKGRES_POSTHOG_LOG_LEVEL`, `DUCKGRES_POSTHOG_LOG_INFO_SAMPLE`, `DUCKGRES_POSTHOG_LOG_QUERY_TEXT`, and `DUCKGRES_IDENTIFIER` may be a value or a `valueFrom`.
+- `ADDITIONAL_POSTHOG_API_KEYS` and `POSTHOG_ANALYTICS_API_KEY` stay CP-only and are never forwarded.
+
+Charts must put `POSTHOG_API_KEY` on the CP container as a first-class named `env:` `secretKeyRef` (not `envFrom`). If `POD_NAME` is empty, the Get fails, or the named env is missing, the CP logs one WARN (`PostHog log env not found on CP pod spec; workers will not export.`) and **omits** the vars — a logging-config miss must never fail a worker spawn. Reshard runner pods use the same allowlist copy.
+
+The first operational slice is CP-only export. Worker records in PostHog (`service.name=duckgres-worker`) appear only after the charts Secret exists **and** the worker can reach `*.i.posthog.com:443`. In-repo NetworkPolicy 443 is not proof of production Cilium egress. The first mw-dev `duckgres-worker` line in the **analytics** project is the egress proof.
 
 ### PostHog Product-Analytics Events
 
