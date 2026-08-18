@@ -69,23 +69,28 @@ type PeerManager struct {
 	peerPort                  string       // port for peer API (e.g. ":8081")
 	client                    *http.Client // /cache/has probes (short whole-request timeout)
 	streamClient              *http.Client // /cache/get transfers (header deadline, no body timeout)
+	summaryClient             *http.Client // bounded /cache/summary pulls
+	summaryPullCycleTimeout   time.Duration
 	lookupMode                peerLookupMode
 	identity                  string
 	peerMaxProbes             int
 	probePermits              chan struct{}
 	summaryRemoteMemoryBudget int
 
-	summaries       summaryStore
-	summaryMu       sync.Mutex // protects current local summary and generation
-	localSummary    []byte
-	generation      uint64
-	publisherCancel context.CancelFunc
-	pushPermits     chan struct{}
-	receivePermits  chan struct{}
-	backgroundCtx   context.Context
+	summaries         summaryStore
+	summaryMu         sync.Mutex // protects current local summary, ETag, and generation
+	localSummary      []byte
+	localSummaryETag  string
+	generation        uint64
+	syncCancel        context.CancelFunc
+	syncDone          chan struct{}
+	membershipChanged chan struct{}
+	pullOrderMu       sync.Mutex
+	nextPullOffset    int
 
-	mu    sync.RWMutex
-	peers []string // peer addresses (ip:port)
+	mu           sync.RWMutex
+	peers        []string // all discovered peer addresses (ip:port)
+	summaryPeers []string // deterministic receiver-selected subset to pull
 }
 
 func NewPeerManager(serviceName, peerPort string) *PeerManager {
@@ -106,13 +111,24 @@ func NewPeerManager(serviceName, peerPort string) *PeerManager {
 				ResponseHeaderTimeout: peerGetResponseHeaderLimit,
 			},
 		},
+		summaryClient: &http.Client{
+			Timeout: summaryPullTimeout,
+			Transport: &http.Transport{
+				DialContext:            (&net.Dialer{Timeout: 200 * time.Millisecond, KeepAlive: 30 * time.Second}).DialContext,
+				MaxIdleConnsPerHost:    maxSummaryPulls,
+				IdleConnTimeout:        30 * time.Second,
+				ResponseHeaderTimeout:  500 * time.Millisecond,
+				MaxResponseHeaderBytes: maxSummaryResponseHeaderBytes,
+			},
+		},
+		summaryPullCycleTimeout:   defaultSummaryPullCycleTimeout,
 		lookupMode:                peerLookupProbe,
 		peerMaxProbes:             defaultPeerMaxProbes,
 		probePermits:              make(chan struct{}, defaultMaxPeerProbesInFlight),
 		summaryRemoteMemoryBudget: summaryRemoteMemoryBudget(defaultSummaryMemoryLimitBytes),
 		summaries:                 summaryStore{records: make(map[string]summaryRecord)},
-		pushPermits:               make(chan struct{}, maxSummaryPushes),
-		receivePermits:            make(chan struct{}, maxSummaryReceives),
+		generation:                uint64(time.Now().UnixNano()),
+		membershipChanged:         make(chan struct{}, 1),
 	}
 }
 
@@ -174,32 +190,100 @@ func (pm *PeerManager) resolve() {
 	}
 
 	var peers []string
+	seen := make(map[string]struct{}, len(ips))
 	for _, ip := range ips {
 		if mySet[ip] {
 			continue // skip self
 		}
-		peers = append(peers, fmt.Sprintf("%s:%s", ip, port))
+		peer := net.JoinHostPort(ip, port)
+		if _, exists := seen[peer]; exists {
+			continue
+		}
+		seen[peer] = struct{}{}
+		peers = append(peers, peer)
 	}
+	sort.Strings(peers)
+	selected := pm.selectSummaryPeers(peers)
 
 	pm.mu.Lock()
-	old := make(map[string]struct{}, len(pm.peers))
-	for _, peer := range pm.peers {
-		old[peer] = struct{}{}
-	}
+	selectionChanged := !stringSlicesEqual(pm.summaryPeers, selected)
 	pm.peers = peers
+	pm.summaryPeers = selected
 	pm.mu.Unlock()
-	pm.summaries.removeNonMembers(pm.isMember, time.Now())
+	pm.summaries.retainPeers(stringSet(selected), time.Now())
 	pm.updateSummaryGauges()
-	if pm.lookupMode == peerLookupSummary && len(pm.localSummaryCopy()) > 0 {
-		for _, peer := range peers {
-			if _, existed := old[peer]; !existed {
-				pm.schedulePush(peer, pm.localSummaryCopy())
-			}
-		}
+	if pm.lookupMode == peerLookupSummary && selectionChanged {
+		pm.signalMembershipChanged()
 	}
 
 	if len(peers) > 0 {
 		slog.Debug("Discovered peers.", "count", len(peers), "peers", peers)
+	}
+}
+
+func stringSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (pm *PeerManager) selectSummaryPeers(peers []string) []string {
+	if pm.lookupMode != peerLookupSummary || pm.summaryRemoteMemoryBudget <= 0 {
+		return nil
+	}
+	maxPeers := pm.summaryRemoteMemoryBudget / int(summaryBloomBits/8)
+	if maxPeers <= 0 {
+		return nil
+	}
+	type rankedPeer struct {
+		addr string
+		rank [sha256.Size]byte
+	}
+	ranked := make([]rankedPeer, 0, len(peers))
+	for _, peer := range peers {
+		ranked = append(ranked, rankedPeer{addr: peer, rank: sha256.Sum256([]byte(pm.identity + "\x00" + peer))})
+	}
+	sort.Slice(ranked, func(i, j int) bool { return bytes.Compare(ranked[i].rank[:], ranked[j].rank[:]) < 0 })
+	if maxPeers > len(ranked) {
+		maxPeers = len(ranked)
+	}
+	selected := make([]string, maxPeers)
+	for i := range selected {
+		selected[i] = ranked[i].addr
+	}
+	return selected
+}
+
+func (pm *PeerManager) refreshSummarySelection() {
+	pm.mu.RLock()
+	peers := append([]string(nil), pm.peers...)
+	pm.mu.RUnlock()
+	selected := pm.selectSummaryPeers(peers)
+	pm.mu.Lock()
+	pm.summaryPeers = selected
+	pm.mu.Unlock()
+	pm.summaries.retainPeers(stringSet(selected), time.Now())
+	pm.updateSummaryGauges()
+}
+
+func (pm *PeerManager) signalMembershipChanged() {
+	select {
+	case pm.membershipChanged <- struct{}{}:
+	default:
 	}
 }
 
@@ -214,20 +298,15 @@ func (pm *PeerManager) isMember(peer string) bool {
 	return false
 }
 
-func (pm *PeerManager) memberForRemoteAddr(remote string) (string, bool) {
-	host, _, err := net.SplitHostPort(remote)
-	if err != nil {
-		return "", false
-	}
+func (pm *PeerManager) isSummaryPeer(peer string) bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	for _, peer := range pm.peers {
-		peerHost, _, err := net.SplitHostPort(peer)
-		if err == nil && peerHost == host {
-			return peer, true
+	for _, selected := range pm.summaryPeers {
+		if selected == peer {
+			return true
 		}
 	}
-	return "", false
+	return false
 }
 
 func (pm *PeerManager) localSummaryCopy() []byte {
@@ -236,14 +315,36 @@ func (pm *PeerManager) localSummaryCopy() []byte {
 	return append([]byte(nil), pm.localSummary...)
 }
 
+func (pm *PeerManager) localSummarySnapshot() ([]byte, string) {
+	pm.summaryMu.Lock()
+	defer pm.summaryMu.Unlock()
+	return pm.localSummary, pm.localSummaryETag
+}
+
 // ReceiveSummary validates an untrusted peer payload before atomically
 // replacing that peer's prior hint. It intentionally logs neither body nor
 // cache keys.
 func (pm *PeerManager) ReceiveSummary(sender string, body []byte, now time.Time) error {
-	err := pm.summaries.receive(sender, body, now, pm.isMember, pm.summaryRemoteMemoryBudget, pm.identity)
+	return pm.receiveSummary(sender, body, "", now, pm.isMember)
+}
+
+func (pm *PeerManager) receivePulledSummary(sender string, body []byte, etag string, now time.Time) error {
+	return pm.receiveSummary(sender, body, etag, now, pm.isSummaryPeer)
+}
+
+func (pm *PeerManager) receiveSummary(sender string, body []byte, etag string, now time.Time, eligible func(string) bool) error {
+	err := pm.summaries.receive(sender, body, etag, now, eligible, pm.summaryRemoteMemoryBudget, pm.identity)
 	if err != nil {
 		summaryReceiptsTotal.WithLabelValues("rejected").Inc()
 		return err
+	}
+	// Membership may change after the initial admission check but before the
+	// store replacement. Revalidate and undo that replacement immediately.
+	if !eligible(sender) {
+		pm.summaries.removePeer(sender)
+		pm.updateSummaryGauges()
+		summaryReceiptsTotal.WithLabelValues("rejected").Inc()
+		return errors.New("summary sender no longer selected")
 	}
 	summaryReceiptsTotal.WithLabelValues("accepted").Inc()
 	pm.updateSummaryGauges()
@@ -281,9 +382,6 @@ func (pm *PeerManager) SummaryLookup(cacheKey string, now time.Time) (positive, 
 		summaryLookupTotal.WithLabelValues("no_positive").Inc()
 	} else {
 		summaryLookupTotal.WithLabelValues("positive_candidate").Inc()
-		if len(positive) > 2 {
-			positive = positive[:2]
-		}
 	}
 	return positive, uncovered
 }
@@ -293,43 +391,69 @@ func (pm *PeerManager) SummaryCandidates(cacheKey string, now time.Time) []strin
 	return positive
 }
 
-// StartSummaryPublisher owns a cancellable background publisher. Publication
-// work is bounded and never runs on a request goroutine.
-func (pm *PeerManager) StartSummaryPublisher(ctx context.Context, store *DiskCache) {
+// StartSummarySynchronizer builds the local immutable summary and owns bounded,
+// receiver-driven pulls of the peer summaries selected by this pod's memory
+// budget. A buffered membership signal coalesces changes instead of queuing
+// unbounded sync work.
+func (pm *PeerManager) StartSummarySynchronizer(ctx context.Context, store *DiskCache) {
 	if pm.lookupMode != peerLookupSummary {
 		return
 	}
-	ctx, pm.publisherCancel = context.WithCancel(ctx)
-	pm.backgroundCtx = ctx
+	ctx, pm.syncCancel = context.WithCancel(ctx)
+	pm.syncDone = make(chan struct{})
+	pm.refreshSummarySelection()
 	go func() {
-		pm.publish(ctx, store)
+		defer close(pm.syncDone)
+		cycleStarted := time.Now()
+		cycleInterval := jitteredSummaryInterval(cycleStarted)
+		pm.buildLocalSummary(store)
+		pm.pullSummaries(ctx, pm.summaryPeerSnapshot())
 		for {
-			// Deterministic jitter avoids a fleet-wide synchronized burst.
-			delay := defaultSummaryInterval + time.Duration(time.Now().UnixNano()%int64(defaultSummaryInterval/5))
+			delay := remainingSummaryCycleDelay(cycleStarted, time.Now(), cycleInterval)
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
+			case <-pm.membershipChanged:
+				timer.Stop()
+				pm.pullSummaries(ctx, pm.summaryPeerSnapshot())
 			case <-timer.C:
-				pm.publish(ctx, store)
+				cycleStarted = time.Now()
+				cycleInterval = jitteredSummaryInterval(cycleStarted)
+				pm.buildLocalSummary(store)
+				pm.pullSummaries(ctx, pm.summaryPeerSnapshot())
 			}
 		}
 	}()
 }
 
-func (pm *PeerManager) StopSummaryPublisher() {
-	if pm.publisherCancel != nil {
-		pm.publisherCancel()
+func jitteredSummaryInterval(now time.Time) time.Duration {
+	// Per-process jitter avoids a fleet-wide synchronized pull burst.
+	return defaultSummaryInterval + time.Duration(now.UnixNano()%int64(defaultSummaryInterval/5))
+}
+
+func remainingSummaryCycleDelay(started, now time.Time, interval time.Duration) time.Duration {
+	remaining := interval - now.Sub(started)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (pm *PeerManager) StopSummarySynchronizer() {
+	if pm.syncCancel != nil {
+		pm.syncCancel()
+	}
+	if pm.syncDone != nil {
+		<-pm.syncDone
 	}
 }
 
-func (pm *PeerManager) publish(ctx context.Context, store *DiskCache) {
-	pm.summaries.removeNonMembers(pm.isMember, time.Now())
-	pm.updateSummaryGauges()
+func (pm *PeerManager) buildLocalSummary(store *DiskCache) {
 	items, bits, ok := store.SummarySnapshot()
 	if !ok {
-		summaryPushesTotal.WithLabelValues("summary_index_unavailable").Inc()
+		summaryServesTotal.WithLabelValues("summary_index_unavailable").Inc()
 		return
 	}
 	pm.summaryMu.Lock()
@@ -338,89 +462,127 @@ func (pm *PeerManager) publish(ctx context.Context, store *DiskCache) {
 	pm.summaryMu.Unlock()
 	s, err := newIncrementalCacheSummary(pm.identity, generation, items, bits, time.Now(), defaultSummaryTTL)
 	if err != nil {
-		summaryPushesTotal.WithLabelValues("build_error").Inc()
+		summaryServesTotal.WithLabelValues("build_error").Inc()
 		return
 	}
 	body, err := s.MarshalBinary()
 	if err != nil {
-		summaryPushesTotal.WithLabelValues("build_error").Inc()
+		summaryServesTotal.WithLabelValues("build_error").Inc()
 		return
 	}
+	digest := sha256.Sum256(body)
+	etag := fmt.Sprintf("\"%x\"", digest[:16])
 	pm.summaryMu.Lock()
-	pm.localSummary = append(pm.localSummary[:0], body...)
+	// Assign a fresh immutable backing slice. GET handlers can safely retain the
+	// old slice after releasing summaryMu while the next generation is built.
+	pm.localSummary = body
+	pm.localSummaryETag = etag
 	pm.summaryMu.Unlock()
+}
+
+func (pm *PeerManager) summaryPeerSnapshot() []string {
 	pm.mu.RLock()
-	peers := append([]string(nil), pm.peers...)
-	pm.mu.RUnlock()
+	defer pm.mu.RUnlock()
+	return append([]string(nil), pm.summaryPeers...)
+}
+
+func (pm *PeerManager) pullSummaries(ctx context.Context, peers []string) {
+	if len(peers) == 0 {
+		return
+	}
+	pm.pullOrderMu.Lock()
+	start := pm.nextPullOffset % len(peers)
+	pm.pullOrderMu.Unlock()
+	ordered := make([]string, len(peers))
+	for i := range peers {
+		ordered[i] = peers[(start+i)%len(peers)]
+	}
+	ctx, cancel := context.WithTimeout(ctx, pm.summaryPullCycleTimeout)
+	defer cancel()
 	jobs := make(chan string)
 	var workers sync.WaitGroup
-	for range maxSummaryPushes {
+	workerCount := min(maxSummaryPulls, len(peers))
+	for range workerCount {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for peer := range jobs {
-				select {
-				case pm.pushPermits <- struct{}{}:
-				case <-ctx.Done():
-					return
-				}
-				pm.pushSummary(ctx, peer, body)
-				<-pm.pushPermits
+				pm.pullSummary(ctx, peer)
 			}
 		}()
 	}
-	for _, peer := range peers {
+	submitted := 0
+	for _, peer := range ordered {
 		select {
 		case jobs <- peer:
+			submitted++
 		case <-ctx.Done():
 			close(jobs)
 			workers.Wait()
+			pm.advancePullOffset(start, submitted, len(peers))
 			return
 		}
 	}
 	close(jobs)
 	workers.Wait()
+	pm.advancePullOffset(start, submitted, len(peers))
 }
 
-func (pm *PeerManager) pushSummary(ctx context.Context, peer string, body []byte) {
-	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
+func (pm *PeerManager) advancePullOffset(start, submitted, peerCount int) {
+	if peerCount == 0 {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, summaryPushTimeout)
+	if submitted == 0 {
+		submitted = 1
+	}
+	pm.pullOrderMu.Lock()
+	pm.nextPullOffset = (start + submitted) % peerCount
+	pm.pullOrderMu.Unlock()
+}
+
+func (pm *PeerManager) pullSummary(ctx context.Context, peer string) {
+	ctx, cancel := context.WithTimeout(ctx, summaryPullTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+peer+"/cache/summary", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+peer+"/cache/summary", nil)
 	if err != nil {
-		summaryPushesTotal.WithLabelValues("error").Inc()
+		summaryPullsTotal.WithLabelValues("error").Inc()
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Cache-Proxy-ID", pm.identity)
-	resp, err := pm.client.Do(req)
+	if etag := pm.summaries.etag(peer, time.Now()); etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	resp, err := pm.summaryClient.Do(req)
 	if err != nil {
-		summaryPushesTotal.WithLabelValues(peerProbeErrorOutcome(err)).Inc()
+		summaryPullsTotal.WithLabelValues(peerProbeErrorOutcome(err)).Inc()
 		return
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode/100 == 2 {
-		summaryPushesTotal.WithLabelValues("success").Inc()
-	} else {
-		summaryPushesTotal.WithLabelValues("rejected").Inc()
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusNotModified {
+		summaryPullsTotal.WithLabelValues("not_modified").Inc()
+		return
 	}
-}
-
-// schedulePush is deliberately lossy when all permits are busy. There is no
-// retry queue; the next periodic generation retries delivery.
-func (pm *PeerManager) schedulePush(peer string, body []byte) {
-	select {
-	case pm.pushPermits <- struct{}{}:
-		ctx := pm.backgroundCtx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		go func() { defer func() { <-pm.pushPermits }(); pm.pushSummary(ctx, peer, body) }()
-	default:
-		summaryPushesTotal.WithLabelValues("concurrency_limited").Inc()
+	if resp.StatusCode != http.StatusOK {
+		summaryPullsTotal.WithLabelValues("status_error").Inc()
+		return
 	}
+	if resp.ContentLength > maxSummaryBodyBytes {
+		summaryPullsTotal.WithLabelValues("oversized").Inc()
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSummaryBodyBytes+1))
+	if err != nil {
+		summaryPullsTotal.WithLabelValues("read_error").Inc()
+		return
+	}
+	if len(body) > maxSummaryBodyBytes {
+		summaryPullsTotal.WithLabelValues("oversized").Inc()
+		return
+	}
+	if err := pm.receivePulledSummary(peer, body, resp.Header.Get("ETag"), time.Now()); err != nil {
+		summaryPullsTotal.WithLabelValues("rejected").Inc()
+		return
+	}
+	summaryPullsTotal.WithLabelValues("success").Inc()
 }
 
 // probeResult is one peer's answer to a /cache/has probe.
@@ -439,23 +601,55 @@ type probeResult struct {
 // bursting into one duplicate origin fetch per node: the first node's
 // in-flight fetch answers 202, so every other node waits for that fill.
 func (pm *PeerManager) LocateKey(ctx context.Context, cacheKey string) (holder string, flight, ok bool) {
-	return pm.locateKey(ctx, cacheKey, pm.peerSnapshot(), true, false)
+	return pm.locateKey(ctx, cacheKey, pm.peerSnapshot(), true, false, false)
 }
 
 // LocateKeyAmong retains probe-mode behavior for only the peers that have not
 // delivered a valid summary. The caller already counted its logical lookup.
 func (pm *PeerManager) LocateKeyAmong(ctx context.Context, cacheKey string, peers []string, maxProbes int) (holder string, flight, ok bool, selected int) {
 	peers = selectProbePeers(cacheKey, peers, maxProbes)
-	holder, flight, ok = pm.locateKey(ctx, cacheKey, peers, false, true)
+	holder, flight, ok = pm.locateKey(ctx, cacheKey, peers, false, true, false)
 	return holder, flight, ok, len(peers)
+}
+
+// LocateSummaryKey uses Bloom filters only to eliminate definite negatives.
+// It confirms a bounded mix of positive and uncovered peers in parallel, then
+// returns the first exact 200/202 claim for one subsequent body GET.
+func (pm *PeerManager) LocateSummaryKey(ctx context.Context, cacheKey string, positive, uncovered []string, maxProbes int) (holder string, flight, ok bool, selected int) {
+	peers := selectSummaryProbePeers(cacheKey, positive, uncovered, maxProbes)
+	holder, flight, ok = pm.locateKey(ctx, cacheKey, peers, false, true, true)
+	return holder, flight, ok, len(peers)
+}
+
+func selectSummaryProbePeers(cacheKey string, positive, uncovered []string, maxProbes int) []string {
+	if maxProbes <= 0 {
+		return nil
+	}
+	if maxProbes == 1 && len(positive) > 0 && len(uncovered) > 0 {
+		combined := make([]string, 0, len(positive)+len(uncovered))
+		combined = append(combined, positive...)
+		combined = append(combined, uncovered...)
+		return selectProbePeers(cacheKey, combined, 1)
+	}
+	rankedPositive := selectProbePeers(cacheKey, positive, len(positive))
+	rankedUncovered := selectProbePeers(cacheKey, uncovered, len(uncovered))
+	positiveLimit := min(len(rankedPositive), maxProbes)
+	if len(rankedPositive) > 0 && len(rankedUncovered) > 0 && maxProbes > 1 {
+		positiveLimit = min(positiveLimit, maxProbes-1)
+	}
+	selected := append([]string(nil), rankedPositive[:positiveLimit]...)
+	uncoveredLimit := min(len(rankedUncovered), maxProbes-len(selected))
+	selected = append(selected, rankedUncovered[:uncoveredLimit]...)
+	if len(selected) < maxProbes && positiveLimit < len(rankedPositive) {
+		remaining := min(len(rankedPositive)-positiveLimit, maxProbes-len(selected))
+		selected = append(selected, rankedPositive[positiveLimit:positiveLimit+remaining]...)
+	}
+	return selected
 }
 
 func selectProbePeers(cacheKey string, peers []string, maxProbes int) []string {
 	if maxProbes <= 0 || len(peers) == 0 {
 		return nil
-	}
-	if len(peers) <= maxProbes {
-		return append([]string(nil), peers...)
 	}
 	type rankedPeer struct {
 		addr string
@@ -466,6 +660,9 @@ func selectProbePeers(cacheKey string, peers []string, maxProbes int) []string {
 		ranked = append(ranked, rankedPeer{addr: peer, rank: sha256.Sum256([]byte(cacheKey + "\x00" + peer))})
 	}
 	sort.Slice(ranked, func(i, j int) bool { return bytes.Compare(ranked[i].rank[:], ranked[j].rank[:]) < 0 })
+	if maxProbes > len(ranked) {
+		maxProbes = len(ranked)
+	}
 	selected := make([]string, maxProbes)
 	for i := range selected {
 		selected[i] = ranked[i].addr
@@ -473,7 +670,7 @@ func selectProbePeers(cacheKey string, peers []string, maxProbes int) []string {
 	return selected
 }
 
-func (pm *PeerManager) locateKey(ctx context.Context, cacheKey string, peers []string, countLogical, useProbePermits bool) (holder string, flight, ok bool) {
+func (pm *PeerManager) locateKey(ctx context.Context, cacheKey string, peers []string, countLogical, useProbePermits, firstUseful bool) (holder string, flight, ok bool) {
 	if len(peers) == 0 {
 		return "", false, false
 	}
@@ -548,6 +745,16 @@ func (pm *PeerManager) locateKey(ctx context.Context, cacheKey string, peers []s
 			}(len(peers) - i - 1)
 			return res.addr, false, true
 		case http.StatusAccepted:
+			if firstUseful {
+				cancel()
+				go func(remaining int) {
+					defer span.End()
+					for range remaining {
+						recordProbe(<-resCh)
+					}
+				}(len(peers) - i - 1)
+				return res.addr, true, true
+			}
 			if firstFlight == "" {
 				firstFlight = res.addr
 			}

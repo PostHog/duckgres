@@ -595,3 +595,34 @@ func TestScanExistingSeedsRecencyOrder(t *testing.T) {
 		t.Error("newer entries were evicted before the oldest")
 	}
 }
+
+func TestScanExistingEnforcesByteAndEntryCeilings(t *testing.T) {
+	dir := t.TempDir()
+	keys := []string{strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64)}
+	base := time.Now().Add(-time.Hour)
+	for i, key := range keys {
+		path := filepath.Join(dir, key)
+		if err := os.WriteFile(path, []byte(strings.Repeat("x", 10)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		when := base.Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := &DiskCache{
+		dir:        dir,
+		maxBytes:   15,
+		maxEntries: 2,
+		order:      list.New(),
+		index:      make(map[string]*list.Element),
+	}
+	c.scanExisting()
+	if c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries {
+		t.Fatalf("startup cache exceeds ceilings: bytes=%d/%d entries=%d/%d", c.currentSize, c.maxBytes, c.order.Len(), c.maxEntries)
+	}
+	if !c.Has(keys[2]) {
+		t.Fatal("startup pruning did not retain the newest entry")
+	}
+}

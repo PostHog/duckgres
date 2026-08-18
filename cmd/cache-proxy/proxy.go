@@ -425,20 +425,12 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 				// proxy is converging after startup or membership changes.
 				peerFetchesTotal.Inc()
 				positive, uncovered := p.peers.SummaryLookup(cacheKey, time.Now())
-				for _, holder := range positive {
-					res, ok := p.fetchFromPeer(holder, false, cacheKey, r)
-					if ok {
+				if holder, flight, ok, _ := p.peers.LocateSummaryKey(r.Context(), cacheKey, positive, uncovered, p.peers.peerMaxProbes); ok {
+					if res, ok := p.fetchFromPeer(holder, flight, cacheKey, r); ok {
 						peerDirectGetsTotal.WithLabelValues("success").Inc()
 						return res, nil
 					}
 					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
-				}
-				if len(positive) == 0 {
-					if holder, flight, ok, _ := p.peers.LocateKeyAmong(r.Context(), cacheKey, uncovered, p.peers.peerMaxProbes); ok {
-						if res, ok := p.fetchFromPeer(holder, flight, cacheKey, r); ok {
-							return res, nil
-						}
-					}
 				}
 			} else if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
 				res, ok := p.fetchFromPeer(holder, flight, cacheKey, r)
@@ -923,35 +915,37 @@ func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotFound)
 }
 
-// HandlePeerSummary receives best-effort Bloom hints over the existing peer
-// transport. That transport is currently unauthenticated; membership checks
-// merely avoid retaining unsolicited state and are not an auth boundary.
+// HandlePeerSummary serves the current immutable Bloom snapshot over the
+// existing unauthenticated peer transport. Receivers decide whether this peer
+// belongs in their bounded retained subset before pulling the body.
 func (p *CacheProxy) HandlePeerSummary(w http.ResponseWriter, r *http.Request) {
-	if p.peers == nil || p.peers.lookupMode != peerLookupSummary || r.Method != http.MethodPost {
+	if p.peers == nil || p.peers.lookupMode != peerLookupSummary || r.Method != http.MethodGet {
 		http.NotFound(w, r)
 		return
 	}
-	select {
-	case p.peers.receivePermits <- struct{}{}:
-		defer func() { <-p.peers.receivePermits }()
-	default:
-		summaryReceiptsTotal.WithLabelValues("busy").Inc()
-		http.Error(w, "summary receiver busy", http.StatusServiceUnavailable)
+	body, etag := p.peers.localSummarySnapshot()
+	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
+		summaryServesTotal.WithLabelValues("unavailable").Inc()
+		http.Error(w, "summary unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	defer func() { _ = r.Body.Close() }()
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSummaryBodyBytes))
-	if err != nil {
-		summaryReceiptsTotal.WithLabelValues("rejected").Inc()
-		http.Error(w, "summary too large", http.StatusRequestEntityTooLarge)
+	// The peer server intentionally has no server-wide WriteTimeout because
+	// /cache/get streams large bodies. Bound only this small snapshot response.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(summaryServeTimeout))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	if r.Header.Get("If-None-Match") == etag {
+		summaryServesTotal.WithLabelValues("not_modified").Inc()
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	peer, ok := p.peers.memberForRemoteAddr(r.RemoteAddr)
-	if !ok || p.peers.ReceiveSummary(peer, body, time.Now()) != nil {
-		http.Error(w, "invalid summary", http.StatusBadRequest)
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		summaryServesTotal.WithLabelValues("write_error").Inc()
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	summaryServesTotal.WithLabelValues("success").Inc()
 }
 
 // HandlePeerGet returns cached data to a peer. With flight=1 and the key not

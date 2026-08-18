@@ -17,6 +17,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+const maxSummaryBlockPeerGetsPerRequest = 2
+
 var (
 	cacheOriginBytesTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "cache_proxy_origin_bytes_total",
@@ -241,7 +243,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	var missRunStart int64 = -1
 	// Summary mode bounds direct peer I/O across the entire block request, not
 	// merely per block. Remaining block misses safely coalesce to origin.
-	summaryGetsLeft := 2
+	summaryGetsLeft := maxSummaryBlockPeerGetsPerRequest
 	summaryLookupRecorded := false
 	summaryProbesLeft := 0
 	if p.peers != nil {
@@ -323,31 +325,22 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			peerStart := time.Now()
 			ok := false
 			if p.peers.lookupMode == peerLookupSummary {
-				if !summaryLookupRecorded {
-					peerFetchesTotal.Inc()
-					summaryLookupRecorded = true
-				}
-				positive, uncovered := p.peers.SummaryLookup(key, time.Now())
-				for _, holder := range positive {
-					if summaryGetsLeft == 0 {
-						break
+				if summaryGetsLeft > 0 && summaryProbesLeft > 0 {
+					if !summaryLookupRecorded {
+						peerFetchesTotal.Inc()
+						summaryLookupRecorded = true
 					}
-					summaryGetsLeft--
-					_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, false, func(rd io.Reader) (int64, error) {
-						return p.store.PutStream(key, rd)
-					})
-					if ok {
-						peerDirectGetsTotal.WithLabelValues("success").Inc()
-						break
-					}
-					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
-				}
-				if len(positive) == 0 && summaryProbesLeft > 0 {
-					if holder, flight, found, selected := p.peers.LocateKeyAmong(r.Context(), key, uncovered, summaryProbesLeft); found {
-						summaryProbesLeft -= selected
+					positive, uncovered := p.peers.SummaryLookup(key, time.Now())
+					holder, flight, found, selected := p.peers.LocateSummaryKey(r.Context(), key, positive, uncovered, summaryProbesLeft)
+					summaryProbesLeft -= selected
+					if found {
+						summaryGetsLeft--
 						_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) { return p.store.PutStream(key, rd) })
-					} else {
-						summaryProbesLeft -= selected
+						if ok {
+							peerDirectGetsTotal.WithLabelValues("success").Inc()
+						} else {
+							peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
+						}
 					}
 				}
 			} else if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {

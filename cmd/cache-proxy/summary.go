@@ -30,18 +30,40 @@ const (
 	// A 1m-entry filter at 1% false-positive rate is ~1.15 MiB before JSON
 	// base64 encoding. Two MiB is a hard wire cap with modest headroom.
 	maxSummaryBodyBytes            = 2 << 20
-	maxSummaryPushes               = 4
-	maxSummaryReceives             = 4
+	maxSummaryResponseHeaderBytes  = 16 << 10
+	maxSummaryPulls                = 4
 	defaultSummaryMemoryLimitBytes = 512 << 20
-	summaryPushTimeout             = 200 * time.Millisecond
+	summaryPullTimeout             = 2 * time.Second
+	summaryServeTimeout            = 2 * time.Second
+	defaultSummaryPullCycleTimeout = 15 * time.Second
 )
 
+func summaryMemoryReserveBytes() int64 {
+	rawBits := int64(summaryBloomBits / 8)
+	localIndex := rawBits + int64(summaryBloomBits)*2
+	// Keep room for both the currently served and next encoded bodies, the
+	// temporary raw-bit snapshot used to build the next body, and each pull
+	// worker's encoded body plus decoded bits.
+	transient := 2*int64(maxSummaryBodyBytes) + rawBits + int64(maxSummaryPulls)*(int64(maxSummaryBodyBytes)+rawBits+maxSummaryResponseHeaderBytes)
+	return localIndex + transient
+}
+
+func validateSummaryMemoryLimit(total int64) error {
+	minimum := summaryMemoryReserveBytes() + int64(summaryBloomBits/8)
+	if total < minimum {
+		return fmt.Errorf("CACHE_SUMMARY_MEMORY_LIMIT_BYTES must be at least %d", minimum)
+	}
+	return nil
+}
+
 func summaryRemoteMemoryBudget(total int64) int {
-	localIndex := int64(summaryBloomBits/8) + int64(summaryBloomBits)*2
-	transient := int64(maxSummaryBodyBytes * (maxSummaryReceives + 1))
-	budget := total - localIndex - transient
+	budget := total - summaryMemoryReserveBytes()
 	if budget < 0 {
 		return 0
+	}
+	maxInt := int64(^uint(0) >> 1)
+	if budget > maxInt {
+		return int(maxInt)
 	}
 	return int(budget)
 }
@@ -51,7 +73,8 @@ var (
 )
 
 var (
-	summaryPushesTotal                  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_pushes_total", Help: "Summary publications by outcome"}, []string{"outcome"})
+	summaryPullsTotal                   = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_pulls_total", Help: "Peer summary pulls by outcome"}, []string{"outcome"})
+	summaryServesTotal                  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_serves_total", Help: "Local summary endpoint responses by outcome"}, []string{"outcome"})
 	summaryReceiptsTotal                = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_receipts_total", Help: "Peer summary receipts by outcome"}, []string{"outcome"})
 	summaryResidentCount                = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_count", Help: "Current valid peer summaries"})
 	summaryResidentBytes                = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_bytes", Help: "Current valid peer summary bytes"})
@@ -336,6 +359,16 @@ func parseCacheSummary(body []byte, now time.Time) (*cacheSummary, error) {
 type summaryRecord struct {
 	summary *cacheSummary
 	bytes   int
+	etag    string
+}
+
+func boundedSummaryETag(etag string) string {
+	// ETags are optional synchronization metadata. Never let a peer-controlled
+	// response header become unbounded resident state.
+	if len(etag) < 2 || len(etag) > 128 || etag[0] != '"' || etag[len(etag)-1] != '"' || strings.ContainsAny(etag, "\r\n") {
+		return ""
+	}
+	return etag
 }
 
 // summaryStore owns bounded peer hints. The small lock is only held to replace
@@ -346,7 +379,7 @@ type summaryStore struct {
 	bytes   int
 }
 
-func (st *summaryStore) receive(peer string, body []byte, now time.Time, member func(string) bool, remoteBudget int, identity string) error {
+func (st *summaryStore) receive(peer string, body []byte, etag string, now time.Time, member func(string) bool, remoteBudget int, identity string) error {
 	s, err := parseCacheSummary(body, now)
 	if err != nil {
 		return err
@@ -367,7 +400,7 @@ func (st *summaryStore) receive(peer string, body []byte, now time.Time, member 
 	for addr, rec := range st.records {
 		candidates[addr] = rec
 	}
-	candidates[peer] = summaryRecord{summary: s, bytes: residentBytes}
+	candidates[peer] = summaryRecord{summary: s, bytes: residentBytes, etag: boundedSummaryETag(etag)}
 	type candidate struct {
 		addr string
 		rec  summaryRecord
@@ -393,6 +426,38 @@ func (st *summaryStore) receive(peer string, body []byte, now time.Time, member 
 	st.records, st.bytes = kept, used
 	return nil
 }
+
+func (st *summaryStore) etag(peer string, now time.Time) string {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	rec, ok := st.records[peer]
+	if !ok || !time.Unix(0, rec.summary.ExpiresNS).After(now) {
+		return ""
+	}
+	return rec.etag
+}
+
+func (st *summaryStore) retainPeers(peers map[string]struct{}, now time.Time) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for peer, rec := range st.records {
+		_, retained := peers[peer]
+		if !retained || !time.Unix(0, rec.summary.ExpiresNS).After(now) {
+			delete(st.records, peer)
+			st.bytes -= rec.bytes
+		}
+	}
+}
+
+func (st *summaryStore) removePeer(peer string) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if rec, ok := st.records[peer]; ok {
+		delete(st.records, peer)
+		st.bytes -= rec.bytes
+	}
+}
+
 func (st *summaryStore) removeNonMembers(member func(string) bool, now time.Time) {
 	st.mu.Lock()
 	defer st.mu.Unlock()

@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -91,6 +90,31 @@ func TestSummaryReplacementExpiryAndMembershipCleanup(t *testing.T) {
 	}
 }
 
+func TestSummaryReceiptRevalidatesSelectionAfterCommit(t *testing.T) {
+	peer := "peer-a:8081"
+	s, err := newCacheSummary("peer-a", 1, nil, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := s.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm := NewPeerManager("test.svc", ":8081")
+	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	checks := 0
+	eligible := func(string) bool {
+		checks++
+		return checks == 1
+	}
+	if err := pm.receiveSummary(peer, body, "", time.Now(), eligible); err == nil {
+		t.Fatal("receipt succeeded after the sender became deselected during commit")
+	}
+	if pm.summaryCount() != 0 {
+		t.Fatal("deselected peer was reinserted after membership cleanup")
+	}
+}
+
 func TestParsePeerLookupMode(t *testing.T) {
 	for _, tt := range []struct {
 		in   string
@@ -106,7 +130,73 @@ func TestParsePeerLookupMode(t *testing.T) {
 	}
 }
 
-func TestSummaryLookupUsesAtMostTwoDirectGetsAndNoProbes(t *testing.T) {
+func TestPositiveEnvIntRejectsInvalidAndOverflowingValues(t *testing.T) {
+	t.Setenv("TEST_POSITIVE_INT", "")
+	if got, err := positiveEnvInt("TEST_POSITIVE_INT", 7); err != nil || got != 7 {
+		t.Fatalf("unset setting = %d, %v; want default 7", got, err)
+	}
+
+	for _, value := range []string{"0", "-1", "not-a-number", "999999999999999999999999999999"} {
+		t.Setenv("TEST_POSITIVE_INT", value)
+		if _, err := positiveEnvInt("TEST_POSITIVE_INT", 7); err == nil {
+			t.Fatalf("value %q unexpectedly accepted", value)
+		}
+	}
+
+	t.Setenv("TEST_POSITIVE_INT", "11")
+	if got, err := positiveEnvInt("TEST_POSITIVE_INT", 7); err != nil || got != 11 {
+		t.Fatalf("valid setting = %d, %v; want 11", got, err)
+	}
+}
+
+func TestValidateSummaryMemoryLimit(t *testing.T) {
+	minimum := summaryMemoryReserveBytes()
+	if err := validateSummaryMemoryLimit(minimum); err == nil {
+		t.Fatal("memory limit equal to the fixed reserve was accepted")
+	}
+	if err := validateSummaryMemoryLimit(minimum + int64(summaryBloomBits/8)); err != nil {
+		t.Fatalf("memory limit with room for one peer summary rejected: %v", err)
+	}
+}
+
+func TestSummaryPullCycleHasTotalDeadline(t *testing.T) {
+	release := make(chan struct{})
+	peers := make([]string, 0, 12)
+	for range 12 {
+		remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-release:
+				w.WriteHeader(http.StatusServiceUnavailable)
+			case <-r.Context().Done():
+			}
+		}))
+		t.Cleanup(remote.Close)
+		peers = append(peers, strings.TrimPrefix(remote.URL, "http://"))
+	}
+
+	pm := peerManagerWith(peers)
+	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.summaryPullCycleTimeout = 50 * time.Millisecond
+	started := time.Now()
+	pm.pullSummaries(context.Background(), peers)
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		close(release)
+		t.Fatalf("bounded pull cycle took %s", elapsed)
+	}
+	close(release)
+}
+
+func TestSummaryCycleCadenceIncludesPullWork(t *testing.T) {
+	started := time.Unix(100, 0)
+	if got := remainingSummaryCycleDelay(started, started.Add(15*time.Second), 20*time.Second); got != 5*time.Second {
+		t.Fatalf("remaining delay=%s, want 5s after 15s of a 20s cycle", got)
+	}
+	if got := remainingSummaryCycleDelay(started, started.Add(25*time.Second), 20*time.Second); got != 0 {
+		t.Fatalf("overdue cycle delay=%s, want immediate", got)
+	}
+}
+
+func TestSummaryCandidatesAreComputedLocallyWithoutPeerRPC(t *testing.T) {
 	key := strings.Repeat("c", 64)
 	var hasCalls, getCalls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -135,16 +225,12 @@ func TestSummaryLookupUsesAtMostTwoDirectGetsAndNoProbes(t *testing.T) {
 	if len(candidates) != 1 {
 		t.Fatalf("candidates=%v, want one", candidates)
 	}
-	_, ok := pm.FetchFromPeer(context.Background(), candidates[0], key, false, func(r io.Reader) (int64, error) { return 0, nil })
-	if ok {
-		t.Fatal("404 peer GET succeeded")
-	}
-	if hasCalls != 0 || getCalls != 1 {
-		t.Fatalf("has=%d get=%d, want 0 and 1", hasCalls, getCalls)
+	if hasCalls != 0 || getCalls != 0 {
+		t.Fatalf("has=%d get=%d, want no RPC during local Bloom lookup", hasCalls, getCalls)
 	}
 }
 
-func TestFetchDedupSummaryHitPreservesPeerSourceAndAvoidsProbes(t *testing.T) {
+func TestFetchDedupSummaryHitPreservesPeerSourceAfterConfirmation(t *testing.T) {
 	key := strings.Repeat("d", 64)
 	data := []byte("peer body")
 	var hasCalls, getCalls, originCalls int32
@@ -179,7 +265,7 @@ func TestFetchDedupSummaryHitPreservesPeerSourceAndAvoidsProbes(t *testing.T) {
 	if err != nil || got.source != "peer" || got.size != int64(len(data)) {
 		t.Fatalf("fetch=%+v err=%v", got, err)
 	}
-	if hasCalls != 0 || getCalls != 1 || originCalls != 0 {
+	if hasCalls != 1 || getCalls != 1 || originCalls != 0 {
 		t.Fatalf("has=%d get=%d origin=%d", hasCalls, getCalls, originCalls)
 	}
 	if delta := counterValue(t, peerFetchesTotal) - before; delta != 1 {
@@ -224,6 +310,10 @@ func TestSummaryRejectsBloomParametersNotDerivedFromItemCount(t *testing.T) {
 func TestSummaryFetchDoesNotCancelHealthyBodyAfterProbeTimeout(t *testing.T) {
 	key := strings.Repeat("9", 64)
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cache/has" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.URL.Path != "/cache/get" {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -433,7 +523,7 @@ func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.
 	}
 	s := summaryFromIncrementalBits("peer-a", 1, items, summaryBloomBits, summaryBloomHashes, bits, time.Now(), time.Minute)
 	if !s.Contains(first) {
-		t.Fatal("published Bloom omitted committed cache entry")
+		t.Fatal("served Bloom snapshot omitted committed cache entry")
 	}
 	if _, err := cache.PutStream(second, strings.NewReader("67890")); err != nil {
 		t.Fatal(err)
@@ -444,7 +534,7 @@ func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.
 	}
 }
 
-func TestPublisherContinuesPastBloomTargetCapacity(t *testing.T) {
+func TestSnapshotServingContinuesPastBloomTargetCapacity(t *testing.T) {
 	cache, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
 	if err != nil {
 		t.Fatal(err)
@@ -453,15 +543,15 @@ func TestPublisherContinuesPastBloomTargetCapacity(t *testing.T) {
 	cache.summary.itemCount = summaryBloomTargetItems + 1
 	cache.summary.mu.Unlock()
 	pm := peerManagerWith(nil)
-	pm.ConfigureSummary(peerLookupSummary, "publisher")
-	pm.publish(context.Background(), cache)
+	pm.ConfigureSummary(peerLookupSummary, "snapshot-server")
+	pm.buildLocalSummary(cache)
 	body := pm.localSummaryCopy()
 	got, err := parseCacheSummary(body, time.Now())
 	if err != nil {
-		t.Fatalf("publisher skipped an over-target summary: %v", err)
+		t.Fatalf("snapshot server skipped an over-target summary: %v", err)
 	}
 	if got.ItemCount != summaryBloomTargetItems+1 || got.MBits != summaryBloomBits || got.Hashes != summaryBloomHashes {
-		t.Fatalf("published summary = items=%d bits=%d hashes=%d", got.ItemCount, got.MBits, got.Hashes)
+		t.Fatalf("served summary = items=%d bits=%d hashes=%d", got.ItemCount, got.MBits, got.Hashes)
 	}
 }
 
@@ -501,7 +591,10 @@ func TestSummaryFallbackSkipsWhenProbeCapacityIsExhausted(t *testing.T) {
 func TestSummaryMemoryBudgetRetainsOnlyPeersThatFit(t *testing.T) {
 	peers := []string{"peer-a:8081", "peer-b:8081"}
 	bits := make([]byte, summaryBloomBits/8)
-	reserve := int64(summaryBloomBits/8) + int64(summaryBloomBits)*2 + int64(maxSummaryBodyBytes*(maxSummaryReceives+1))
+	rawBits := int64(summaryBloomBits / 8)
+	// During a rebuild, both the currently served and next encoded bodies are
+	// live alongside the copied raw bits.
+	reserve := rawBits + int64(summaryBloomBits)*2 + 2*int64(maxSummaryBodyBytes) + rawBits + int64(maxSummaryPulls)*(int64(maxSummaryBodyBytes)+rawBits+maxSummaryResponseHeaderBytes)
 	pm := peerManagerWith(peers)
 	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{MemoryLimitBytes: reserve + int64(len(bits))})
 	for i, peer := range peers {

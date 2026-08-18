@@ -94,8 +94,8 @@ type DiskCache struct {
 	// at the back. index maps a key to its element for O(1) touch/drop.
 	order *list.List
 	index map[string]*list.Element
-	// summary is enabled only in pushed-summary mode. It mirrors index
-	// mutations incrementally, so publishing never scans the cache index.
+	// summary is enabled only in summary lookup mode. It mirrors index
+	// mutations incrementally, so snapshot serving never scans the cache index.
 	summary *summaryIndex
 }
 
@@ -247,7 +247,9 @@ func (c *DiskCache) scanExisting() {
 	defer func() { _ = dir.Close() }()
 	// Only count real cache entries — the .tmp dir's contents and any
 	// stray non-key files must not enter the LRU accounting.
-	found := make(oldestEntries, 0, c.maxEntries)
+	// Do not reserve a million cacheEntry structs for an empty/new cache. The
+	// heap remains bounded by maxEntries but grows with actual disk contents.
+	found := make(oldestEntries, 0, min(c.maxEntries, 1024))
 	for {
 		entries, readErr := dir.ReadDir(1024)
 		for _, e := range entries {
@@ -294,7 +296,7 @@ func (c *DiskCache) scanExisting() {
 			c.summary.Add(entry.key)
 		}
 	}
-	for c.order.Len() > c.maxEntries {
+	for (c.order.Len() > c.maxEntries || c.currentSize > c.maxBytes) && c.order.Len() > 0 {
 		c.evictOldest()
 	}
 	cacheSizeBytes.Set(float64(c.currentSize))
