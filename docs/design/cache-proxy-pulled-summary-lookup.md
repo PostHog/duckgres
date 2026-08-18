@@ -26,19 +26,20 @@ origin fills. Summaries contain only opaque cache-locator membership hints.
 | Setting | Default | Bound |
 | --- | --- | --- |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` or `summary`; unknown values fail startup. |
-| `CACHE_MAX_ENTRIES` | `1000000` | Convergent local cache-index target. |
-| `CACHE_MAX_PERCENT` | `80` | Convergent cache-disk target. |
+| `CACHE_MAX_ENTRIES` | `1000000` | Strict maximum tracked entries after each final commit. |
+| `CACHE_MAX_PERCENT` | `80` | Target for tracked cache bytes; one entry larger than the target is retained. |
 | `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Local counting Bloom, snapshot and pull reserve, and retained remote Bloom bits. |
 | `CACHE_PEER_MAX_PROBES` | `5` | Maximum summary-mode `/cache/has` confirmations per client request, shared across block misses. |
-| `CACHE_MAX_PEER_PROBES_IN_FLIGHT` | `64` | Pod-wide, non-blocking confirmation semaphore. |
+| `CACHE_MAX_PEER_PROBES_IN_FLIGHT` | `64` | Pod-wide, non-blocking cap on active confirmation HTTP requests and sockets. |
 
-The entry and disk ceilings are soft, convergent targets. Concurrent fills
-make admission decisions from the state visible before their commits, so the
-cache can briefly exceed either target. Entry overshoot is bounded by the
-number of concurrently committing distinct entries; byte overshoot is bounded
-by the aggregate size of concurrent commits. Later insertions evict LRU entries
-back toward both targets. This avoids serializing body and filesystem I/O on a
-global commit lock.
+Body copies remain concurrent: each fill streams into a temporary file without
+holding the cache-index lock. The short final commit is serialized across the
+rename, LRU eviction, exact-index and byte accounting, and counting-Bloom
+update. A completed commit therefore cannot exceed `CACHE_MAX_ENTRIES`.
+Tracked bytes are evicted to the current disk target before the commit returns,
+except that a single entry larger than the target is retained rather than
+silently discarded. Concurrent temporary files consume real disk but are not
+yet tracked cache entries.
 
 The process-level backstop remains the pod memory limit and Go memory policy.
 The settings above bound the largest cache-proxy-owned contributors, but do not
@@ -56,7 +57,7 @@ key represented by that filter.
 The filter is designed for 1,000,000 entries at a 1% per-peer false-positive
 rate:
 
-- 9,585,064 published bits, approximately 1.14 MiB;
+- 9,585,064 snapshot bits, approximately 1.14 MiB;
 - approximately 18.3 MiB of local 16-bit counters;
 - hash count derived from the target item count and false-positive rate.
 
@@ -67,13 +68,12 @@ a metric. The filter is a hint and never authorizes a body transfer.
 
 About every 20 seconds, with per-process jitter, the proxy copies the current
 bitset into an immutable, versioned wire snapshot. It does not rescan or rehash
-the cache index. Each snapshot has a 45-second advertised TTL and a strict
+the cache index. Each snapshot has a 60-second advertised TTL and a strict
 2 MiB encoded-body limit. It contains only:
 
 - summary and cache-layout versions;
-- stable proxy identity and generation;
 - creation and expiration timestamps;
-- item count, Bloom parameters, and Bloom bits.
+- fixed Bloom parameters and Bloom bits.
 
 Raw URLs, signed query strings, ranges, object paths, organization identifiers,
 and cache locators are never serialized or logged.
@@ -97,7 +97,7 @@ memory budget.
 The selected peers are pulled through `GET /cache/summary`:
 
 - the endpoint serves the current immutable snapshot;
-- `ETag` and `If-None-Match` avoid transferring an unchanged generation;
+- `ETag` and `If-None-Match` support conditional pulls between rebuilds;
 - retained ETags are syntax-checked and capped at 128 bytes;
 - pull response headers are capped at 16 KiB;
 - the summary response has a two-second handler-local write deadline;
@@ -107,15 +107,16 @@ The selected peers are pulled through `GET /cache/summary`:
 - a whole pull cycle is capped at 15 seconds and rotates its starting peer by
   the work submitted, so slow early peers cannot starve the same suffix;
 - declared and actual bodies above 2 MiB are rejected;
-- cancellation closes requests, bodies, workers, timers, and the coordinator;
-- there is no retry queue.
+- cancellation closes requests, bodies, workers, timers, and the coordinator.
 
 The receiver validates the version, cache layout, declared Bloom parameters,
 timestamps, body size, and current selection before atomically replacing the
 last record for that peer. A failed or invalid pull leaves the previous valid
 record in place until its advertised expiration. `304 Not Modified` retains
-the record but does not extend it beyond that expiration. The next periodic or
-membership-triggered cycle is the retry.
+the record but does not extend it beyond that expiration. Failures do not create
+an independent retry queue; the next periodic or membership-triggered cycle is
+the retry. Newly selected peers that have not yet started their priority pull
+remain in the bounded pending-membership set.
 
 ### Membership transitions
 
@@ -157,7 +158,10 @@ Summary mode performs the following steps for a local cache miss:
 The semaphore is deliberately non-blocking. If all
 `CACHE_MAX_PEER_PROBES_IN_FLIGHT` permits are occupied, excess confirmations
 are skipped instead of queued, and those requests use origin. This bounds
-goroutines, sockets, and aggregate peer work during a miss storm.
+active `/cache/has` HTTP requests, sockets, and aggregate peer work during a
+miss storm. It does not bound total process goroutines: each client request has
+its own handler and may briefly create up to its
+`CACHE_PEER_MAX_PROBES` candidate-coordination goroutines.
 
 Block-aligned requests can contain several distinct cache keys. They share one
 `CACHE_PEER_MAX_PROBES` budget across their missing blocks, so the request does
@@ -192,11 +196,53 @@ sampling, fill ownership, or a separate in-flight protocol. Those mechanisms
 either restore request-time work or expand this design's scope, so they are not
 included here.
 
+## Known limitations and follow-up work
+
+The initial production target is the current fleet size of approximately
+10–20 cache-proxy nodes. The request-time probe and memory bounds remain hard
+outside that range, but some synchronization and observability properties need
+more work before treating the documented 100-node examples or the 415-peer
+memory maximum as a sustained operating target:
+
+- Pull throughput, not only memory, must eventually cap the selected peer set.
+  Four workers, two-second per-peer timeouts, and a 15-second cycle budget can
+  refresh the current fleet within the 60-second TTL. A much larger set of
+  consistently slow peers can require several rotations, allowing records to
+  expire before their next refresh. Before scaling materially beyond the
+  current fleet, derive the selection cap from worst-case refresh throughput or
+  redesign scheduling so a full rotation fits within the TTL.
+- The periodically rebuilt body contains new creation and expiration times, so
+  its ETag changes even when the Bloom bits do not. Conditional GETs therefore
+  help only for repeated pulls between rebuilds; they do not currently remove
+  the regular full-snapshot transfer. A future lease/ETag design can separate
+  unchanged filter content from freshness renewal.
+- `cache_proxy_summary_resident_count` counts retained records and can include
+  an expired record until the next successful membership refresh prunes it.
+  There is no discovered/selected-peer denominator, and the age histogram is
+  observed only for Bloom-positive records. Pull outcomes, probe amplification,
+  and origin traffic expose degradation, but they cannot prove full summary
+  convergence. Add discovered, selected, and valid-unexpired gauges before
+  making readiness or autoscaling depend on summary coverage.
+- Lookup currently scans current membership and tests retained filters under a
+  shared read lock, then ranks candidates. This is acceptable at 10–20 nodes
+  but request CPU, allocations, and writer-lock contention scale with fleet
+  size. Use bounded top-K selection and immutable lookup snapshots before large
+  fleets.
+- `cache_proxy_peer_hits_total` counts successful peer body transfers, while
+  `cache_proxy_peer_fetches_total` counts logical lookups. A block request can
+  transfer two peer blocks after one logical lookup, so their ratio is a
+  transfers-per-lookup measure and can exceed one; it is not a percentage.
+
+Probe mode does not allocate, build, or serve Bloom summaries. It returns 404
+from `/cache/summary`. Enabling summary mode on a canary therefore starts with
+partial coverage and uses the bounded uncovered-peer/origin fallback while the
+canary and compatible peers build and pull their first snapshots.
+
 ## Memory model
 
 The default 512 MiB summary budget is divided conservatively:
 
-- local published bitset and 16-bit counters: approximately 19.4 MiB;
+- local snapshot bitset and 16-bit counters: approximately 19.4 MiB;
 - current and next immutable encoded snapshots plus a temporary raw snapshot;
 - four simultaneous pulls, each reserving a 2 MiB encoded body plus decoded
   bits;
@@ -244,27 +290,36 @@ worker identity labels. The primary rollout signals are:
 - `cache_proxy_peer_probes_total / cache_proxy_peer_fetches_total`: physical
   confirmation amplification; it should remain below the configured cap and
   near the fleet-aware false-positive expectation when coverage is complete;
-- `cache_proxy_peer_direct_gets_total`: confirmed peer body transfers;
+- `cache_proxy_summary_confirmed_gets_total`: confirmed peer body transfers;
 - peer and origin bytes and latency: useful locality versus fallback cost;
 - `cache_proxy_summary_pulls_total` and
   `cache_proxy_summary_serves_total`: synchronization health;
-- resident summary count/bytes and summary age: coverage and memory;
+- `cache_proxy_summary_resident_count` and summary age: retained-summary health,
+  subject to the coverage limitations above;
+- `cache_proxy_summary_resident_bytes` versus
+  `cache_proxy_summary_memory_limit_bytes`: conservative Bloom-state accounting
+  versus its configured ceiling. Resident bytes include the fixed local filter,
+  maximum transient reserve, and retained remote bits; they are not process RSS;
 - predicted Bloom false-positive rate, saturation, and bit occupancy.
 
 Rollout procedure:
 
-1. Deploy an image containing the GET summary endpoint to every cache-proxy
-   pod while leaving `CACHE_PEER_LOOKUP_MODE=probe`.
-2. Enable `summary` mode in non-production first.
+1. Deploy the compatible image to every cache-proxy pod while leaving
+   `CACHE_PEER_LOOKUP_MODE=probe`. Probe-mode pods contain the endpoint code but
+   return 404 and do not prebuild summaries.
+2. Enable `summary` mode in non-production first. Expect partial coverage while
+   the restarted/canary pods build and pull their initial snapshots.
 3. Confirm summaries converge after startup and membership changes, pull work
    remains bounded, and request-time probes never exceed the configured cap.
 4. Compare peer usefulness, origin bytes, and origin latency with probe mode.
-5. Confirm resident Bloom bytes remain under the configured budget and process
-   RSS remains below the pod memory limit with sufficient headroom.
+5. Confirm `cache_proxy_summary_resident_bytes` remains below
+   `cache_proxy_summary_memory_limit_bytes`, and process RSS remains below the
+   pod memory limit with sufficient headroom.
 6. Roll out gradually to production.
 
-Mixed summary implementations fail safely: a pull sent to a POST-only endpoint
-or a push sent to a GET-only endpoint is rejected, leaving that peer uncovered.
+During a rolling deployment, a peer without the compatible GET summary endpoint
+remains uncovered; bounded confirmation or origin fallback is used until the
+endpoint is available.
 
 Rollback by restoring `CACHE_PEER_LOOKUP_MODE=probe`. Cache keys and on-disk
 layout are unchanged, so do not delete cache contents.
