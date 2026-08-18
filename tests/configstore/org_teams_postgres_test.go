@@ -242,7 +242,7 @@ func TestProvisionedOrgMaxVCPUsPostgres(t *testing.T) {
 		existingMaxVCPUs *int
 		wantMaxVCPUs     int
 	}{
-		{name: "new org defaults to 150", wantMaxVCPUs: 150},
+		{name: "new org defaults to 60", wantMaxVCPUs: 60},
 		{name: "reprovision preserves unlimited", existingMaxVCPUs: intPtr(0), wantMaxVCPUs: 0},
 		{name: "reprovision preserves explicit limit", existingMaxVCPUs: intPtr(1024), wantMaxVCPUs: 1024},
 	}
