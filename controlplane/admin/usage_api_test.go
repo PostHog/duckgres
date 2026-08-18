@@ -308,14 +308,26 @@ func TestDailyUsageWindowAndValidation(t *testing.T) {
 	store := &fakeMonthlyUsageStore{}
 	r := setupUsageRouterAt(store, now)
 
-	// days=7 from mid-Aug-15 → window opens 2026-08-09 (7 x 24h back), not at a
-	// month boundary — day granularity means partial days at both edges.
+	// days=7 on Aug-15 (any time of day) → window opens at the START of the
+	// UTC day 6 days back, 2026-08-09T00:00Z. Truncating to the day boundary
+	// is load-bearing: without it, days=1 opens the window at the current
+	// SECOND and excludes every bucket written earlier today (the mw-dev e2e
+	// caught exactly that against the real stack).
 	code, _ := usageRequest(t, r, "/api/v1/orgs/acme/usage/daily?days=7")
 	if code != http.StatusOK {
 		t.Fatalf("status %d", code)
 	}
-	if want := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC); !store.lastDailyFrom.Equal(want) {
-		t.Fatalf("from = %s, want %s", store.lastDailyFrom, want)
+	if want := time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC); !store.lastDailyFrom.Equal(want) {
+		t.Fatalf("from = %s, want %s (start of UTC day)", store.lastDailyFrom, want)
+	}
+
+	// days=1 must cover ALL of today, not just the current second.
+	code, _ = usageRequest(t, r, "/api/v1/orgs/acme/usage/daily?days=1")
+	if code != http.StatusOK {
+		t.Fatalf("status %d", code)
+	}
+	if want := time.Date(2026, 8, 15, 0, 0, 0, 0, time.UTC); !store.lastDailyFrom.Equal(want) {
+		t.Fatalf("days=1: from = %s, want %s (start of today UTC)", store.lastDailyFrom, want)
 	}
 
 	for _, bad := range []string{"0", "-1", "abc", "32"} {

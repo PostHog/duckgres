@@ -185,7 +185,12 @@ func (h *usageAPIHandler) getDailyUsage(c *gin.Context) {
 		}
 		days = n
 	}
-	from := h.now().UTC().AddDate(0, 0, -(days - 1)) // today plus (days-1) prior days
+	// The window opens at the START of the UTC day (days-1) days before today —
+	// the rows are day-grained, so a mid-day cutoff would silently drop the
+	// morning of the leftmost day, and for days=1 would open the window at the
+	// current second and show nothing at all (mw-dev e2e regression).
+	now := h.now().UTC()
+	from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -(days - 1))
 
 	compute, err := h.store.AggregateComputeUsageDaily(orgID, from)
 	if err != nil {
