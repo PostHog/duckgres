@@ -186,3 +186,189 @@ func TestFetchDedupSummaryHitPreservesPeerSourceAndAvoidsProbes(t *testing.T) {
 		t.Fatalf("logical peer lookups=%v, want 1", delta)
 	}
 }
+
+func TestSummaryLookupReportsOnlyUncoveredPeersForWarmupProbes(t *testing.T) {
+	covered, uncovered := "covered:8081", "uncovered:8081"
+	pm := peerManagerWith([]string{covered, uncovered})
+	key := strings.Repeat("e", 64)
+	s, err := newCacheSummary("node-covered", 1, []string{strings.Repeat("f", 64)}, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := s.MarshalBinary()
+	if err := pm.ReceiveSummary(covered, body, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	positive, missing := pm.SummaryLookup(key, time.Now())
+	if len(positive) != 0 {
+		t.Fatalf("positive peers = %v, want none", positive)
+	}
+	if len(missing) != 1 || missing[0] != uncovered {
+		t.Fatalf("uncovered peers = %v, want %q", missing, uncovered)
+	}
+}
+
+func TestSummaryRejectsBloomParametersNotDerivedFromItemCount(t *testing.T) {
+	s, err := newCacheSummary("peer-a", 1, []string{strings.Repeat("a", 64)}, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.MBits += 8
+	s.Bits = append(s.Bits, 0)
+	body, _ := s.MarshalBinary()
+	if _, err := parseCacheSummary(body, time.Now()); err == nil {
+		t.Fatal("accepted a Bloom filter larger than the declared item count requires")
+	}
+}
+
+func TestSummaryFetchDoesNotCancelHealthyBodyAfterProbeTimeout(t *testing.T) {
+	key := strings.Repeat("9", 64)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cache/get" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte("first"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(peerHasTimeout + 100*time.Millisecond)
+		_, _ = w.Write([]byte("second"))
+	}))
+	defer peer.Close()
+	addr := strings.TrimPrefix(peer.URL, "http://")
+	pm := peerManagerWith([]string{addr})
+	pm.lookupMode = peerLookupSummary
+	s, _ := newCacheSummary("node-a", 1, []string{key}, time.Now(), time.Minute)
+	body, _ := s.MarshalBinary()
+	if err := pm.ReceiveSummary(addr, body, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(newTestCache(t), pm, nil)
+	r := httptest.NewRequest(http.MethodGet, "http://origin.test/object", nil)
+	got, err := p.fetchDedup(key, r, "")
+	if err != nil || got.source != "peer" || got.size != int64(len("firstsecond")) {
+		t.Fatalf("fetch=%+v err=%v", got, err)
+	}
+}
+
+func TestSummaryWarmupProbesOnlyPeersWithoutSummaries(t *testing.T) {
+	key, other := strings.Repeat("1", 64), strings.Repeat("2", 64)
+	var coveredHas, coveredGet, uncoveredHas, uncoveredGet, originCalls int32
+	covered := newPeerServer(t, other, []byte("other"), http.StatusOK, &coveredHas, &coveredGet)
+	uncovered := newPeerServer(t, key, []byte("peer"), http.StatusOK, &uncoveredHas, &uncoveredGet)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&originCalls, 1)
+		_, _ = w.Write([]byte("origin"))
+	}))
+	defer origin.Close()
+	pm := peerManagerWith([]string{covered, uncovered})
+	pm.lookupMode = peerLookupSummary
+	s, _ := newCacheSummary("covered", 1, []string{other}, time.Now(), time.Minute)
+	body, _ := s.MarshalBinary()
+	if err := pm.ReceiveSummary(covered, body, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(newTestCache(t), pm, nil)
+	p.client = origin.Client()
+	r := httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil)
+	got, err := p.fetchDedup(key, r, "")
+	if err != nil || got.source != "peer" {
+		t.Fatalf("fetch=%+v err=%v", got, err)
+	}
+	if coveredHas != 0 || coveredGet != 0 || uncoveredHas != 1 || uncoveredGet != 1 || originCalls != 0 {
+		t.Fatalf("covered has/get=%d/%d, uncovered has/get=%d/%d, origin=%d", coveredHas, coveredGet, uncoveredHas, uncoveredGet, originCalls)
+	}
+}
+
+func TestFullyCoveredSummaryNegativeGoesDirectlyToOrigin(t *testing.T) {
+	key, other := strings.Repeat("3", 64), strings.Repeat("4", 64)
+	var hasCalls, getCalls, originCalls int32
+	peer := newPeerServer(t, other, []byte("other"), http.StatusOK, &hasCalls, &getCalls)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&originCalls, 1)
+		_, _ = w.Write([]byte("origin"))
+	}))
+	defer origin.Close()
+	pm := peerManagerWith([]string{peer})
+	pm.lookupMode = peerLookupSummary
+	s, _ := newCacheSummary("peer", 1, []string{other}, time.Now(), time.Minute)
+	body, _ := s.MarshalBinary()
+	if err := pm.ReceiveSummary(peer, body, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p := NewCacheProxy(newTestCache(t), pm, nil)
+	p.client = origin.Client()
+	r := httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil)
+	got, err := p.fetchDedup(key, r, "")
+	if err != nil || got.source != "miss" {
+		t.Fatalf("fetch=%+v err=%v", got, err)
+	}
+	if hasCalls != 0 || getCalls != 0 || originCalls != 1 {
+		t.Fatalf("has=%d get=%d origin=%d", hasCalls, getCalls, originCalls)
+	}
+}
+
+func TestJoiningPeerIsProbedUntilItsSummaryArrives(t *testing.T) {
+	key, other := strings.Repeat("5", 64), strings.Repeat("6", 64)
+	var coveredHas, coveredGet, joiningHas, joiningGet, originCalls int32
+	covered := newPeerServer(t, other, []byte("other"), http.StatusOK, &coveredHas, &coveredGet)
+	joining := newPeerServer(t, key, []byte("joining-peer"), http.StatusOK, &joiningHas, &joiningGet)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&originCalls, 1)
+		_, _ = w.Write([]byte("origin"))
+	}))
+	defer origin.Close()
+	pm := peerManagerWith([]string{covered})
+	pm.lookupMode = peerLookupSummary
+	s, _ := newCacheSummary("covered", 1, []string{other}, time.Now(), time.Minute)
+	body, _ := s.MarshalBinary()
+	if err := pm.ReceiveSummary(covered, body, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// DNS membership changes before this proxy has received the new peer's
+	// summary. That peer is intentionally the only one left on probe fallback.
+	pm.mu.Lock()
+	pm.peers = append(pm.peers, joining)
+	pm.mu.Unlock()
+	p := NewCacheProxy(newTestCache(t), pm, nil)
+	p.client = origin.Client()
+	got, err := p.fetchDedup(key, httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil), "")
+	if err != nil || got.source != "peer" {
+		t.Fatalf("fetch=%+v err=%v", got, err)
+	}
+	if coveredHas != 0 || coveredGet != 0 || joiningHas != 1 || joiningGet != 1 || originCalls != 0 {
+		t.Fatalf("covered has/get=%d/%d joining has/get=%d/%d origin=%d", coveredHas, coveredGet, joiningHas, joiningGet, originCalls)
+	}
+}
+
+func TestDepartedPeerIsNeverSelectedFromAStaleSummary(t *testing.T) {
+	key := strings.Repeat("7", 64)
+	var hasCalls, getCalls, originCalls int32
+	peer := newPeerServer(t, key, []byte("peer"), http.StatusOK, &hasCalls, &getCalls)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&originCalls, 1)
+		_, _ = w.Write([]byte("origin"))
+	}))
+	defer origin.Close()
+	pm := peerManagerWith([]string{peer})
+	pm.lookupMode = peerLookupSummary
+	s, _ := newCacheSummary("departed", 1, []string{key}, time.Now(), time.Minute)
+	body, _ := s.MarshalBinary()
+	if err := pm.ReceiveSummary(peer, body, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	pm.mu.Lock()
+	pm.peers = nil
+	pm.mu.Unlock()
+	p := NewCacheProxy(newTestCache(t), pm, nil)
+	p.client = origin.Client()
+	got, err := p.fetchDedup(key, httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil), "")
+	if err != nil || got.source != "miss" {
+		t.Fatalf("fetch=%+v err=%v", got, err)
+	}
+	if hasCalls != 0 || getCalls != 0 || originCalls != 1 {
+		t.Fatalf("has=%d get=%d origin=%d", hasCalls, getCalls, originCalls)
+	}
+}

@@ -26,10 +26,15 @@ const (
 	defaultSummaryTTL      = 45 * time.Second
 	defaultSummaryInterval = 20 * time.Second
 	summaryTargetFPR       = 0.01
-	maxSummaryBodyBytes    = 16 << 20
-	maxSummaryItems        = 1_000_000
-	maxSummaryPeers        = 256
-	maxSummaryPushes       = 4
+	// A 1m-entry filter at 1% false-positive rate is ~1.15 MiB before JSON
+	// base64 encoding. Two MiB is a hard wire cap with modest headroom.
+	maxSummaryBodyBytes     = 2 << 20
+	maxSummaryItems         = 1_000_000
+	maxSummaryPeers         = 256
+	maxSummaryPushes        = 4
+	maxSummaryReceives      = 4
+	maxSummaryResidentBytes = 512 << 20
+	summaryPushTimeout      = 200 * time.Millisecond
 )
 
 var (
@@ -78,22 +83,9 @@ func newCacheSummary(sender string, generation uint64, keys []string, now time.T
 	if sender == "" || generation == 0 || ttl <= 0 || len(keys) > maxSummaryItems {
 		return nil, errors.New("invalid summary inputs")
 	}
-	// m = -n ln(p)/(ln(2)^2), k = round(m/n ln(2)). Do not cap m by
-	// silently dropping entries: that would create false negatives.
-	m := uint64(math.Ceil(-float64(len(keys)) * math.Log(summaryTargetFPR) / (math.Ln2 * math.Ln2)))
-	if m < 8 {
-		m = 8
-	}
-	m = (m + 7) &^ 7
+	m, k := bloomParams(len(keys))
 	if m/8 > maxSummaryBodyBytes {
 		return nil, fmt.Errorf("summary bloom exceeds %d-byte limit", maxSummaryBodyBytes)
-	}
-	k := uint8(math.Round(float64(m) / math.Max(float64(len(keys)), 1) * math.Ln2))
-	if k == 0 {
-		k = 1
-	}
-	if k > 32 {
-		k = 32
 	}
 	s := &cacheSummary{Version: summaryFormatVersion, Layout: cacheLayoutVersion, Sender: sender, Generation: generation, CreatedNS: now.UnixNano(), ExpiresNS: now.Add(ttl).UnixNano(), ItemCount: len(keys), MBits: m, Hashes: k, Bits: make([]byte, m/8)}
 	for _, key := range keys {
@@ -103,6 +95,22 @@ func newCacheSummary(sender string, generation uint64, keys []string, now time.T
 		s.add(key)
 	}
 	return s, nil
+}
+
+func bloomParams(items int) (uint64, uint8) {
+	m := uint64(math.Ceil(-float64(items) * math.Log(summaryTargetFPR) / (math.Ln2 * math.Ln2)))
+	if m < 8 {
+		m = 8
+	}
+	m = (m + 7) &^ 7
+	k := uint8(math.Round(float64(m) / math.Max(float64(items), 1) * math.Ln2))
+	if k == 0 {
+		k = 1
+	}
+	if k > 32 {
+		k = 32
+	}
+	return m, k
 }
 
 func (s *cacheSummary) hashes(key string, fn func(uint64)) {
@@ -151,7 +159,11 @@ func parseCacheSummary(body []byte, now time.Time) (*cacheSummary, error) {
 	if s.Version != summaryFormatVersion || s.Layout != cacheLayoutVersion || s.Sender == "" || len(s.Sender) > 253 || strings.ContainsAny(s.Sender, "\r\n") || s.Generation == 0 {
 		return nil, errors.New("incompatible summary")
 	}
-	if s.ItemCount < 0 || s.ItemCount > maxSummaryItems || s.MBits < 8 || s.MBits%8 != 0 || s.MBits/8 > maxSummaryBodyBytes || len(s.Bits) != int(s.MBits/8) || s.Hashes == 0 || s.Hashes > 32 {
+	if s.ItemCount < 0 || s.ItemCount > maxSummaryItems {
+		return nil, errors.New("invalid bloom parameters")
+	}
+	wantBits, wantHashes := bloomParams(s.ItemCount)
+	if s.MBits != wantBits || s.Hashes != wantHashes || s.MBits/8 > maxSummaryBodyBytes || len(s.Bits) != int(s.MBits/8) {
 		return nil, errors.New("invalid bloom parameters")
 	}
 	created, expires := time.Unix(0, s.CreatedNS), time.Unix(0, s.ExpiresNS)
@@ -192,11 +204,19 @@ func (st *summaryStore) receive(peer string, body []byte, now time.Time, member 
 			return errors.New("summary peer limit")
 		}
 	}
+	residentBytes := len(s.Bits)
+	oldBytes := 0
 	if old, ok := st.records[peer]; ok {
-		st.bytes -= old.bytes
+		oldBytes = old.bytes
 	}
-	st.records[peer] = summaryRecord{summary: s, bytes: len(body)}
-	st.bytes += len(body)
+	if st.bytes-oldBytes+residentBytes > maxSummaryResidentBytes {
+		return errors.New("summary resident byte limit")
+	}
+	if oldBytes > 0 {
+		st.bytes -= oldBytes
+	}
+	st.records[peer] = summaryRecord{summary: s, bytes: residentBytes}
+	st.bytes += residentBytes
 	return nil
 }
 func (st *summaryStore) removeNonMembers(member func(string) bool, now time.Time) {
@@ -209,24 +229,33 @@ func (st *summaryStore) removeNonMembers(member func(string) bool, now time.Time
 		}
 	}
 }
-func (st *summaryStore) candidates(key string, now time.Time) []string {
+func (st *summaryStore) candidates(key string, members []string, now time.Time) (positive, uncovered []string) {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
 	type candidate struct{ addr, identity string }
 	var cs []candidate
-	for peer, rec := range st.records {
-		if time.Unix(0, rec.summary.ExpiresNS).After(now) && rec.summary.Contains(key) {
+	for _, peer := range members {
+		rec, covered := st.records[peer]
+		if !covered || !time.Unix(0, rec.summary.ExpiresNS).After(now) {
+			uncovered = append(uncovered, peer)
+			continue
+		}
+		if rec.summary.Contains(key) {
 			summaryAgeSeconds.Observe(now.Sub(time.Unix(0, rec.summary.CreatedNS)).Seconds())
 			cs = append(cs, candidate{peer, rec.summary.Sender})
 		}
 	}
 	sort.Slice(cs, func(i, j int) bool {
-		a, b := sha256.Sum256([]byte(key+cs[i].identity)), sha256.Sum256([]byte(key+cs[j].identity))
-		return string(a[:]) < string(b[:])
+		a, b := rankPeer(key, cs[i].identity, cs[i].addr), rankPeer(key, cs[j].identity, cs[j].addr)
+		return bytes.Compare(a[:], b[:]) < 0
 	})
-	peers := make([]string, len(cs))
+	positive = make([]string, len(cs))
 	for i := range cs {
-		peers[i] = cs[i].addr
+		positive[i] = cs[i].addr
 	}
-	return peers
+	return positive, uncovered
+}
+
+func rankPeer(key, identity, addr string) [sha256.Size]byte {
+	return sha256.Sum256([]byte(key + "\x00" + identity + "\x00" + addr))
 }

@@ -31,13 +31,16 @@ the summary endpoint to every cache-proxy pod. Each proxy snapshots at most
 1,000,000 opaque SHA-256 cache locators, builds a versioned Bloom filter at a
 1% target false-positive rate, and publishes it with a 45-second TTL about
 every 20 seconds (with jitter). The uncompressed summary body is capped at
-16 MiB; an oversized snapshot is skipped rather than truncated, so published
+2 MiB and resident peer summaries at 512 MiB; an oversized snapshot is skipped rather than truncated, so published
 filters never have false negatives for their source snapshot. At 1%, filters
 are about 1.20 bytes per entry: roughly 117 KiB for 100k entries and 1.14 MiB
 for 1m entries, plus small metadata and wire encoding overhead.
 
 On a local miss the requester tests received, non-expired filters locally. No
-positive hint goes straight to origin. Positive hints are ranked by the opaque
+positive hint goes straight to origin once every discovered peer has supplied a
+valid summary. During startup or after a peer joins, only peers that have not
+yet supplied a valid summary retain the legacy probe fallback; this preserves
+cold-start peer-hit behavior while summaries converge. Positive hints are ranked by the opaque
 locator and stable proxy identity, then at most two peers receive a direct
 `/cache/get`; 404s, timeouts, stale hints, incompatible peers, and missing
 summaries all safely fall back to origin. There is no cache-body replication.
@@ -46,7 +49,7 @@ provide authentication; membership validation only bounds retained hints.
 
 Roll out in non-production first. During a rolling enablement, missing
 summaries reduce peer hits but remain safe. Validate that peer probes per
-logical lookup approach zero, direct peer GET attempts stay at or below two,
+logical lookup approach zero after peer-summary coverage converges, direct peer GET attempts stay at or below two,
 peer bytes remain useful, origin latency/bytes do not regress excessively,
 and summary memory/publication traffic remain bounded. Recover by restoring
 `CACHE_PEER_LOOKUP_MODE=probe`; do not delete cache contents.

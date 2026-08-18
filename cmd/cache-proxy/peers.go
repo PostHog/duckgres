@@ -64,6 +64,7 @@ type PeerManager struct {
 	generation      uint64
 	publisherCancel context.CancelFunc
 	pushPermits     chan struct{}
+	receivePermits  chan struct{}
 	backgroundCtx   context.Context
 
 	mu    sync.RWMutex
@@ -88,9 +89,10 @@ func NewPeerManager(serviceName, peerPort string) *PeerManager {
 				ResponseHeaderTimeout: peerGetResponseHeaderLimit,
 			},
 		},
-		lookupMode:  peerLookupProbe,
-		summaries:   summaryStore{records: make(map[string]summaryRecord)},
-		pushPermits: make(chan struct{}, maxSummaryPushes),
+		lookupMode:     peerLookupProbe,
+		summaries:      summaryStore{records: make(map[string]summaryRecord)},
+		pushPermits:    make(chan struct{}, maxSummaryPushes),
+		receivePermits: make(chan struct{}, maxSummaryReceives),
 	}
 }
 
@@ -228,28 +230,34 @@ func (pm *PeerManager) updateSummaryGauges() {
 	summaryResidentBytes.Set(float64(b))
 }
 
-// SummaryCandidates is strictly local: it does no /cache/has I/O. It returns
-// deterministic positive peers, at most two of which a caller may contact.
-func (pm *PeerManager) SummaryCandidates(cacheKey string, now time.Time) []string {
-	pm.summaries.removeNonMembers(pm.isMember, now)
-	pm.updateSummaryGauges()
-	pm.summaries.mu.RLock()
-	n := len(pm.summaries.records)
-	pm.summaries.mu.RUnlock()
-	if n == 0 {
+func (pm *PeerManager) peerSnapshot() []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return append([]string(nil), pm.peers...)
+}
+
+// SummaryLookup is local-only. Positive peers have valid summaries; uncovered
+// peers have not yet supplied one and retain legacy probe behavior during
+// convergence. A fully covered negative lookup never issues /cache/has.
+func (pm *PeerManager) SummaryLookup(cacheKey string, now time.Time) (positive, uncovered []string) {
+	members := pm.peerSnapshot()
+	positive, uncovered = pm.summaries.candidates(cacheKey, members, now)
+	if len(positive) == 0 && len(uncovered) == len(members) {
 		summaryLookupTotal.WithLabelValues("no_valid_summary").Inc()
-		return nil
-	}
-	peers := pm.summaries.candidates(cacheKey, now)
-	if len(peers) == 0 {
+	} else if len(positive) == 0 {
 		summaryLookupTotal.WithLabelValues("no_positive").Inc()
-		return nil
+	} else {
+		summaryLookupTotal.WithLabelValues("positive_candidate").Inc()
+		if len(positive) > 2 {
+			positive = positive[:2]
+		}
 	}
-	summaryLookupTotal.WithLabelValues("positive_candidate").Inc()
-	if len(peers) > 2 {
-		peers = peers[:2]
-	}
-	return peers
+	return positive, uncovered
+}
+
+func (pm *PeerManager) SummaryCandidates(cacheKey string, now time.Time) []string {
+	positive, _ := pm.SummaryLookup(cacheKey, now)
+	return positive
 }
 
 // StartSummaryPublisher owns a cancellable background publisher. Publication
@@ -284,6 +292,8 @@ func (pm *PeerManager) StopSummaryPublisher() {
 }
 
 func (pm *PeerManager) publish(ctx context.Context, store *DiskCache) {
+	pm.summaries.removeNonMembers(pm.isMember, time.Now())
+	pm.updateSummaryGauges()
 	keys, ok := store.SnapshotKeys(maxSummaryItems)
 	if !ok {
 		summaryPushesTotal.WithLabelValues("snapshot_too_large").Inc()
@@ -309,28 +319,41 @@ func (pm *PeerManager) publish(ctx context.Context, store *DiskCache) {
 	pm.mu.RLock()
 	peers := append([]string(nil), pm.peers...)
 	pm.mu.RUnlock()
-	var wg sync.WaitGroup
-	for _, peer := range peers {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
-			select {
-			case pm.pushPermits <- struct{}{}:
-				defer func() { <-pm.pushPermits }()
-			case <-ctx.Done():
-				return
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	for range maxSummaryPushes {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for peer := range jobs {
+				select {
+				case pm.pushPermits <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				pm.pushSummary(ctx, peer, body)
+				<-pm.pushPermits
 			}
-			pm.pushSummary(ctx, peer, body)
-		}(peer)
+		}()
 	}
-	wg.Wait()
+	for _, peer := range peers {
+		select {
+		case jobs <- peer:
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return
+		}
+	}
+	close(jobs)
+	workers.Wait()
 }
 
 func (pm *PeerManager) pushSummary(ctx context.Context, peer string, body []byte) {
 	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, peerHasTimeout)
+	ctx, cancel := context.WithTimeout(ctx, summaryPushTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+peer+"/cache/summary", bytes.NewReader(body))
 	if err != nil {
@@ -383,16 +406,22 @@ type probeResult struct {
 // bursting into one duplicate origin fetch per node: the first node's
 // in-flight fetch answers 202, so every other node waits for that fill.
 func (pm *PeerManager) LocateKey(ctx context.Context, cacheKey string) (holder string, flight, ok bool) {
-	pm.mu.RLock()
-	peers := make([]string, len(pm.peers))
-	copy(peers, pm.peers)
-	pm.mu.RUnlock()
+	return pm.locateKey(ctx, cacheKey, pm.peerSnapshot(), true)
+}
 
+// LocateKeyAmong retains probe-mode behavior for only the peers that have not
+// delivered a valid summary. The caller already counted its logical lookup.
+func (pm *PeerManager) LocateKeyAmong(ctx context.Context, cacheKey string, peers []string) (holder string, flight, ok bool) {
+	return pm.locateKey(ctx, cacheKey, peers, false)
+}
+
+func (pm *PeerManager) locateKey(ctx context.Context, cacheKey string, peers []string, countLogical bool) (holder string, flight, ok bool) {
 	if len(peers) == 0 {
 		return "", false, false
 	}
-
-	peerFetchesTotal.Inc()
+	if countLogical {
+		peerFetchesTotal.Inc()
+	}
 	ctx, span := proxyTracer.Start(ctx, "cache.peer_lookup", trace.WithAttributes(
 		attribute.Int("duckgres.cache.peer_count", len(peers)),
 	))

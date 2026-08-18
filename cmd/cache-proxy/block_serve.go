@@ -243,8 +243,6 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	// merely per block. Remaining block misses safely coalesce to origin.
 	summaryGetsLeft := 2
 	summaryLookupRecorded := false
-	summaryCtx, cancelSummary := context.WithTimeout(r.Context(), peerHasTimeout)
-	defer cancelSummary()
 	flushRun := func(runEnd int64) bool {
 		if missRunStart < 0 {
 			return true
@@ -325,12 +323,13 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 					peerFetchesTotal.Inc()
 					summaryLookupRecorded = true
 				}
-				for _, holder := range p.peers.SummaryCandidates(key, time.Now()) {
-					if summaryGetsLeft == 0 || summaryCtx.Err() != nil {
+				positive, uncovered := p.peers.SummaryLookup(key, time.Now())
+				for _, holder := range positive {
+					if summaryGetsLeft == 0 {
 						break
 					}
 					summaryGetsLeft--
-					_, ok = p.peers.FetchFromPeer(summaryCtx, holder, key, false, func(rd io.Reader) (int64, error) {
+					_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, false, func(rd io.Reader) (int64, error) {
 						return p.store.PutStream(key, rd)
 					})
 					if ok {
@@ -338,6 +337,11 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 						break
 					}
 					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
+				}
+				if len(positive) == 0 {
+					if holder, flight, found := p.peers.LocateKeyAmong(r.Context(), key, uncovered); found {
+						_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) { return p.store.PutStream(key, rd) })
+					}
 				}
 			} else if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {
 				_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) {

@@ -240,7 +240,7 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_bytes_served_total` | Counter | `source` | Directional byte mix by `local`, `peer`, or `s3`. Block mode counts assembled response bytes under the slowest source used; the legacy exact-range path counts the local read or deduplicated fill once, so this is not an exact client-egress counter. |
 | `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups in either mode. |
 | `cache_proxy_peer_hits_total` | Counter | None | Logical peer lookups followed by a successful peer body transfer. |
-| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical `/cache/has` attempts only. It stays zero for pushed-summary lookups. |
+| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical `/cache/has` attempts only. In pushed-summary mode it approaches zero once every discovered peer has supplied a valid summary; uncovered joining peers temporarily retain probe fallback. |
 | `cache_proxy_summary_pushes_total` | Counter | `outcome` | Bounded summary publication outcomes. |
 | `cache_proxy_summary_receipts_total` | Counter | `outcome` | Accepted or rejected peer summary bodies. |
 | `cache_proxy_summary_resident_count` / `cache_proxy_summary_resident_bytes` | Gauge | None | Current bounded peer-summary state. |

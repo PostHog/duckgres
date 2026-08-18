@@ -420,20 +420,24 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
 			if p.peers.lookupMode == peerLookupSummary {
-				// One logical lookup consists entirely of local Bloom tests and
-				// at most two direct GETs under a shared deadline.
+				// One logical lookup uses local Bloom tests first. Peers without a
+				// valid summary remain on the legacy probe path only while this
+				// proxy is converging after startup or membership changes.
 				peerFetchesTotal.Inc()
-				peerCtx, cancel := context.WithTimeout(r.Context(), peerHasTimeout)
-				defer cancel()
-				for _, holder := range p.peers.SummaryCandidates(cacheKey, time.Now()) {
-					res, ok := p.fetchFromPeer(holder, false, cacheKey, r.WithContext(peerCtx))
+				positive, uncovered := p.peers.SummaryLookup(cacheKey, time.Now())
+				for _, holder := range positive {
+					res, ok := p.fetchFromPeer(holder, false, cacheKey, r)
 					if ok {
 						peerDirectGetsTotal.WithLabelValues("success").Inc()
 						return res, nil
 					}
 					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
-					if peerCtx.Err() != nil {
-						break
+				}
+				if len(positive) == 0 {
+					if holder, flight, ok := p.peers.LocateKeyAmong(r.Context(), cacheKey, uncovered); ok {
+						if res, ok := p.fetchFromPeer(holder, flight, cacheKey, r); ok {
+							return res, nil
+						}
 					}
 				}
 			} else if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
@@ -925,6 +929,14 @@ func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
 func (p *CacheProxy) HandlePeerSummary(w http.ResponseWriter, r *http.Request) {
 	if p.peers == nil || p.peers.lookupMode != peerLookupSummary || r.Method != http.MethodPost {
 		http.NotFound(w, r)
+		return
+	}
+	select {
+	case p.peers.receivePermits <- struct{}{}:
+		defer func() { <-p.peers.receivePermits }()
+	default:
+		summaryReceiptsTotal.WithLabelValues("busy").Inc()
+		http.Error(w, "summary receiver busy", http.StatusServiceUnavailable)
 		return
 	}
 	defer func() { _ = r.Body.Close() }()
