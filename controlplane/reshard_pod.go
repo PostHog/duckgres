@@ -63,6 +63,12 @@ var reshardPodEnvAllowlist = []string{
 	"DUCKGRES_RESHARD_FLIP_TIMEOUT",
 	"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
 	"OTEL_EXPORTER_OTLP_TRACES_PATH",
+	"POSTHOG_API_KEY",
+	"POSTHOG_HOST",
+	"DUCKGRES_POSTHOG_LOG_LEVEL",
+	"DUCKGRES_POSTHOG_LOG_INFO_SAMPLE",
+	"DUCKGRES_POSTHOG_LOG_QUERY_TEXT",
+	"DUCKGRES_IDENTIFIER",
 }
 
 // ReshardPodName is the deterministic per-operation pod name.
@@ -172,30 +178,10 @@ func (s *ReshardPodSpawner) SpawnReshardPod(ctx context.Context, op *configstore
 
 	// Inherit the allowlisted env VERBATIM — a secretKeyRef stays a
 	// secretKeyRef; nothing secret is copied by value into the pod spec.
-	var env []corev1.EnvVar
-	for _, name := range reshardPodEnvAllowlist {
-		for i := range cpContainer.Env {
-			if cpContainer.Env[i].Name == name {
-				env = append(env, *cpContainer.Env[i].DeepCopy())
-				break
-			}
-		}
-	}
-	env = append(env,
-		corev1.EnvVar{Name: "DUCKGRES_RESHARD_OP_ID", Value: strconv.FormatInt(op.ID, 10)},
-		corev1.EnvVar{
-			Name: "POD_NAME",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-			},
-		},
-		corev1.EnvVar{
-			Name: "NODE_NAME",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
-			},
-		},
-	)
+	// POSTHOG_API_KEY is copied only as a secretKeyRef (see copyAllowlistedEnv).
+	env := copyAllowlistedEnv(cpContainer.Env, reshardPodEnvAllowlist)
+	env = append(env, corev1.EnvVar{Name: "DUCKGRES_RESHARD_OP_ID", Value: strconv.FormatInt(op.ID, 10)})
+	env = append(env, downwardAPIIdentityEnv()...)
 	// The password pull URL (ext targets only; the URL is on the op row so a
 	// reconciler respawn re-wires the same handoff).
 	if op.PasswordURL != "" {

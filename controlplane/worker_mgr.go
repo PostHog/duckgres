@@ -594,6 +594,10 @@ type healthCheckResult struct {
 	// log names the bug instead of just reporting "unhealthy".
 	InstanceInvalidReason string                          `json:"instance_invalid_reason"`
 	SessionProgress       map[string]*sessionProgressJSON `json:"session_progress"`
+	// OTLPExportEnabled / OTLPExportFailures are optional (old workers omit
+	// them). Failures is process-lifetime monotonic. Pointers so omit ≠ 0.
+	OTLPExportEnabled  *bool  `json:"otlp_export_enabled"`
+	OTLPExportFailures *int64 `json:"otlp_export_failures"`
 }
 
 // toSessionProgress converts wire-format progress data to SessionProgress values.
@@ -969,6 +973,7 @@ func (p *FlightWorkerPool) RetireWorker(id int) {
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
+	forgetWorkerOTLPExport(id)
 
 	// Run the actual process cleanup asynchronously so DestroySession
 	// doesn't block the connection handler goroutine for up to 3s+.
@@ -997,6 +1002,7 @@ func (p *FlightWorkerPool) RetireWorkerIfNoSessions(id int) bool {
 		workerCount := len(p.workers)
 		p.mu.Unlock()
 		observeControlPlaneWorkers(workerCount)
+		forgetWorkerOTLPExport(id)
 		go p.retireWorkerProcess(w)
 		return true
 	}
@@ -1207,6 +1213,9 @@ func (p *FlightWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Du
 							hcResult, healthErr = doHealthCheck(hctx, w.client)
 							cancel()
 						}()
+						if hcResult != nil {
+							observeWorkerOTLPExportFromHealth(w.ID, hcResult)
+						}
 						err := healthErr
 
 						if err != nil {
