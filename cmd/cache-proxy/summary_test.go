@@ -129,6 +129,35 @@ func TestPositiveEnvIntRejectsInvalidAndOverflowingValues(t *testing.T) {
 	}
 }
 
+func TestPositiveEnvIntWithDeprecatedAlias(t *testing.T) {
+	const canonical = "TEST_PROBES_PER_REQUEST"
+	const deprecated = "TEST_PROBES_OLD"
+	t.Setenv(canonical, "")
+	t.Setenv(deprecated, "")
+
+	got, usedDeprecated, err := positiveEnvIntWithDeprecatedAlias(canonical, deprecated, 5)
+	if err != nil || got != 5 || usedDeprecated {
+		t.Fatalf("unset settings = (%d, %t, %v); want (5, false, nil)", got, usedDeprecated, err)
+	}
+
+	t.Setenv(deprecated, "7")
+	got, usedDeprecated, err = positiveEnvIntWithDeprecatedAlias(canonical, deprecated, 5)
+	if err != nil || got != 7 || !usedDeprecated {
+		t.Fatalf("deprecated setting = (%d, %t, %v); want (7, true, nil)", got, usedDeprecated, err)
+	}
+
+	t.Setenv(canonical, "9")
+	got, usedDeprecated, err = positiveEnvIntWithDeprecatedAlias(canonical, deprecated, 5)
+	if err != nil || got != 9 || usedDeprecated {
+		t.Fatalf("canonical setting = (%d, %t, %v); want (9, false, nil)", got, usedDeprecated, err)
+	}
+
+	t.Setenv(canonical, "invalid")
+	if _, _, err := positiveEnvIntWithDeprecatedAlias(canonical, deprecated, 5); err == nil {
+		t.Fatal("invalid canonical setting unexpectedly accepted")
+	}
+}
+
 func TestValidateSummaryMemoryLimit(t *testing.T) {
 	minimum := summaryMemoryReserveBytes()
 	if err := validateSummaryMemoryLimit(minimum); err == nil {

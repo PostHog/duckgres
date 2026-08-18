@@ -100,15 +100,21 @@ func main() {
 		return
 	}
 	summaryMemoryLimit := envInt64("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", defaultSummaryMemoryLimitBytes)
-	peerMaxProbes, err := positiveEnvInt("CACHE_PEER_MAX_PROBES", defaultPeerMaxProbes)
+	peerMaxProbes, usedDeprecatedPeerMaxProbes, err := positiveEnvIntWithDeprecatedAlias("CACHE_PEER_MAX_PROBES_PER_REQUEST", "CACHE_PEER_MAX_PROBES", defaultPeerMaxProbes)
 	if err != nil {
-		slog.Error("Invalid peer probe limit.", "error", err)
+		slog.Error("Invalid per-request peer probe limit.", "error", err)
 		return
 	}
-	maxPeerProbesInFlight, err := positiveEnvInt("CACHE_MAX_PEER_PROBES_IN_FLIGHT", defaultMaxPeerProbesInFlight)
+	if usedDeprecatedPeerMaxProbes {
+		slog.Warn("Deprecated cache-proxy setting in use; rename it before the next release.", "deprecated", "CACHE_PEER_MAX_PROBES", "replacement", "CACHE_PEER_MAX_PROBES_PER_REQUEST")
+	}
+	maxPeerProbesInFlight, usedDeprecatedMaxPeerProbesInFlight, err := positiveEnvIntWithDeprecatedAlias("CACHE_MAX_CONCURRENT_PEER_PROBES", "CACHE_MAX_PEER_PROBES_IN_FLIGHT", defaultMaxPeerProbesInFlight)
 	if err != nil {
-		slog.Error("Invalid global peer probe limit.", "error", err)
+		slog.Error("Invalid concurrent peer probe limit.", "error", err)
 		return
+	}
+	if usedDeprecatedMaxPeerProbesInFlight {
+		slog.Warn("Deprecated cache-proxy setting in use; rename it before the next release.", "deprecated", "CACHE_MAX_PEER_PROBES_IN_FLIGHT", "replacement", "CACHE_MAX_CONCURRENT_PEER_PROBES")
 	}
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
 	peerAddr := envOrDefault("PEER_ADDR", ":8081")
@@ -292,6 +298,21 @@ func positiveEnvInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("%s must be positive", key)
 	}
 	return n, nil
+}
+
+// positiveEnvIntWithDeprecatedAlias reads canonicalKey first and falls back to
+// deprecatedKey only while the old setting remains supported. The canonical
+// setting always wins when both are supplied.
+func positiveEnvIntWithDeprecatedAlias(canonicalKey, deprecatedKey string, def int) (value int, usedDeprecated bool, err error) {
+	if os.Getenv(canonicalKey) != "" {
+		value, err = positiveEnvInt(canonicalKey, def)
+		return value, false, err
+	}
+	if os.Getenv(deprecatedKey) != "" {
+		value, err = positiveEnvInt(deprecatedKey, def)
+		return value, true, err
+	}
+	return def, false, nil
 }
 
 // envInt64 parses an integer env var, falling back to def (with a warning)
