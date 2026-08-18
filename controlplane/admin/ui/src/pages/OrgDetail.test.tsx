@@ -31,6 +31,13 @@ vi.mock("@/components/OrgTeamDialogs", () => ({
   LegacyNamesBadge: () => null,
 }));
 
+// The usage charts section is independently tested in OrgUsage.test.tsx; here
+// it would need the useApi mock to grow a useOrgDailyUsage entry it never
+// asserts on.
+vi.mock("@/pages/OrgUsage", () => ({
+  OrgUsageSection: () => null,
+}));
+
 import { OrgDetail } from "./OrgDetail";
 
 const warehouseUpdate = vi.fn();

@@ -1102,18 +1102,23 @@ touching this path:
   disable, direct RDS → require). Drift gauges:
   `duckgres_org_storage_pending_delete_files` (alert on sustained nonzero) +
   `duckgres_org_storage_tracked_bytes`.
-- **The admin console "Usage" page reads the SAME buffer** —
-  `GET /api/v1/usage/monthly` (`controlplane/admin/usage_api.go`, backed by
-  `configstore.Aggregate{Compute,Storage}UsageMonthly`) sums retained buckets
-  per UTC month per (org, team), merging the compute and storage families and
-  joining the team schema name for display. It self-gates with `RequireAdmin`
-  (per-team cost data across all orgs is as sensitive as the raw billing
-  families — viewers get 403, and the UI hides the nav item / fires no query
-  for them) and it is an operations view, NOT an invoice: acked buckets are
-  already deleted and >30d buckets are
-  GC'd, so the response carries the ack cursor as `watermark_low` and the UI
-  shows the retention caveat instead of implying all-time totals. It adds NO
-  second accounting pipeline — keep it a pure read over the buffer.
+- **The admin console usage views read the SAME buffer** —
+  `GET /api/v1/usage/monthly` (the **Usage** page) and
+  `GET /api/v1/orgs/:id/usage/daily` (the org detail page's **Usage** charts)
+  in `controlplane/admin/usage_api.go`, backed by
+  `configstore.Aggregate{Compute,Storage}Usage{Monthly,Daily}`, sum retained
+  buckets per UTC month / per UTC day per (org, team), merging the compute and
+  storage families and joining the team schema name for display. Both
+  self-gate with `RequireAdmin` (per-team cost data across all orgs is as
+  sensitive as the raw billing families — viewers get 403, and the UI hides
+  the nav item / fires no query for them). The daily endpoint's org scope is
+  the `:id` path segment flowing into the queries' WHERE clause — one org's
+  usage must never leak into another org's page (the e2e asserts
+  `.org_id == $o` on the response). These are operations views, NOT invoices:
+  acked buckets are already deleted and >30d buckets are
+  GC'd, so responses carry the ack cursor as `watermark_low` and the UI
+  shows the retention caveat instead of implying all-time totals. They add NO
+  second accounting pipeline — keep them pure reads over the buffer.
 - Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
   the storage sampler, or the bucket keys → update
   `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,
@@ -1122,11 +1127,12 @@ touching this path:
   `tests/configstore/migrations_postgres_test.go`, and the
   `compute_usage_pull_api` assertion (compute + storage, incl. the
   `usage-monthly` checks) in
-  `tests/mw-dev/e2e/harness.sh`. Touching the monthly aggregation or the
-  Usage page → update `controlplane/admin/usage_api_test.go`,
-  `tests/configstore/usage_monthly_postgres_test.go`,
-  `ui/src/pages/Usage.test.tsx`, and those same `usage-monthly` harness
-  checks.
+  `tests/mw-dev/e2e/harness.sh`. Touching the monthly/daily aggregation or
+  the usage views → update `controlplane/admin/usage_api_test.go`,
+  `tests/configstore/usage_monthly_postgres_test.go` +
+  `usage_daily_postgres_test.go`,
+  `ui/src/pages/Usage.test.tsx` + `OrgUsage.test.tsx`, and the
+  `usage-monthly` / `usage-daily` harness checks.
 
 ## Discovery Endpoints (external-writer tenant listing)
 

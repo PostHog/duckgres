@@ -21,6 +21,7 @@ import type {
   ClusterStatus,
   ClusterSummary,
   CreateUserBody,
+  DailyUsageResponse,
   DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
@@ -585,6 +586,17 @@ export function useMonthlyUsage(months: number) {
   return useQuery<MonthlyUsageResponse>({
     queryKey: ["usage", "monthly", months],
     queryFn: () => api.monthlyUsage(months),
+    enabled: isAdmin,
+  });
+}
+
+// One org's daily per-team usage series for the org detail page's charts.
+// RequireAdmin like the monthly endpoint — fires for admins only.
+export function useOrgDailyUsage(orgId: string, days: number) {
+  const { isAdmin } = useIdentity();
+  return useQuery<DailyUsageResponse>({
+    queryKey: ["usage", "daily", orgId, days],
+    queryFn: () => api.orgDailyUsage(orgId, days),
     enabled: isAdmin,
   });
 }

@@ -6,6 +6,7 @@
 // 401 (not authorized page) vs 403 (disabled action) vs 404 (empty state).
 
 import type {
+  DailyUsageResponse,
   AuditEntry,
   ClusterStatus,
   ClusterSummary,
@@ -251,8 +252,11 @@ export const api = {
   audit: (params?: { actor?: string; org?: string; limit?: number }) =>
     get<{ entries: AuditEntry[] }>("/audit", params).then((r) => r.entries ?? []),
 
-  // monthly per-team usage (the Usage page; read-only, viewer-allowed)
+  // monthly per-team usage (the Usage page) + per-org daily series (the org
+  // detail page's usage charts). Both RequireAdmin — per-team cost data.
   monthlyUsage: (months: number) => get<MonthlyUsageResponse>("/usage/monthly", { months }),
+  orgDailyUsage: (org: string, days: number) =>
+    get<DailyUsageResponse>(`/orgs/${enc(org)}/usage/daily`, { days }),
 
   // reshard operations (metadata-store migrations; POSTs are admin-only)
   startReshard: (org: string, body: StartReshardBody) =>

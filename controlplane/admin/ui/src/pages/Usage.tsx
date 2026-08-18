@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Coins, Cpu, Database, MemoryStick, ShieldAlert } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
@@ -29,6 +30,7 @@ function currentMonth(): string {
 
 export function Usage() {
   const { isAdmin } = useIdentity();
+  const navigate = useNavigate();
   const [months, setMonths] = useState(6);
   const usage = useMonthlyUsage(months);
   const orgLabels = useOrgLabels();
@@ -197,6 +199,9 @@ export function Usage() {
                   data={monthRows}
                   columns={columns}
                   initialSorting={[{ id: "cpu_minutes", desc: true }]}
+                  // Click through to the org's daily usage charts.
+                  onRowClick={(r) => navigate(`/orgs/${encodeURIComponent(r.org_id)}`)}
+                  rowClassName={() => "cursor-pointer"}
                 />
               </Card>
             )}
