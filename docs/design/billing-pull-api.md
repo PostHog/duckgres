@@ -272,5 +272,9 @@ part of the meter.
   precision with no float-equality issues.
 - Single billing consumer assumed → one server-side `last_acked` cursor shared
   by both metric families. (If a second independent consumer is ever needed,
-  give each its own named cursor.)
+  give each its own named cursor.) The admin console's **Usage** page
+  (`GET /api/v1/usage/monthly`) is NOT a second consumer: it is a read-only
+  monthly per-team aggregation over the same retained buffer, and its response
+  surfaces the ack cursor so the UI can caveat that billed/GC'd months are
+  gone.
 - Storage sampling every 30 minutes; each sample credits exactly one interval.

@@ -33,6 +33,7 @@ import type {
   MetricsPanels,
   ModelListing,
   ModelSummary,
+  MonthlyUsageResponse,
   Operator,
   Org,
   OrgTeam,
@@ -571,6 +572,20 @@ export function useAudit(params: { actor?: string; org?: string }) {
     queryKey: ["audit", params.actor ?? "", params.org ?? ""],
     queryFn: () =>
       tolerate404<AuditEntry[]>([])(api.audit({ actor: params.actor, org: params.org, limit: 500 })),
+  });
+}
+
+// ---- monthly usage (the Usage page) ----
+
+// Monthly per-team usage over the retained billing buffer. The endpoint is
+// RequireAdmin (per-team cost data), so the query only fires for admins —
+// viewers never spend a 403 round-trip.
+export function useMonthlyUsage(months: number) {
+  const { isAdmin } = useIdentity();
+  return useQuery<MonthlyUsageResponse>({
+    queryKey: ["usage", "monthly", months],
+    queryFn: () => api.monthlyUsage(months),
+    enabled: isAdmin,
   });
 }
 

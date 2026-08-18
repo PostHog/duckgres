@@ -95,6 +95,9 @@ func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgSta
 	// Admin-only Operators management (the admin-console access list). Each
 	// route self-gates with RequireAdmin; mutations are audited via the group.
 	registerOperatorsAPI(r, store)
+	// Monthly per-team usage for the "Usage" page — a read-only view over the
+	// billing buffer (see usage_api.go).
+	registerUsageAPI(r, store)
 }
 
 func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo, fetcher PeerFetcher) {
