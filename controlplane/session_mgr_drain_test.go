@@ -217,9 +217,13 @@ type observingConnectionLimiter struct {
 	firstRead  chan configstore.OrgResourceLimits
 	readAgain  chan struct{}
 	secondRead chan configstore.OrgResourceLimits
+	request    chan connectionAdmissionRequest
 }
 
 func (l *observingConnectionLimiter) Acquire(ctx context.Context, request connectionAdmissionRequest, limits func(string) configstore.OrgResourceLimits) (connectionLease, error) {
+	if l.request != nil {
+		l.request <- request
+	}
 	first := limits(request.Username)
 	l.firstRead <- first
 
@@ -1203,21 +1207,28 @@ func countEvents(events []string, want string) int {
 func TestSessionManager_RuntimeLimiterObservesDynamicResourceLimitWhileQueued(t *testing.T) {
 	sm := NewSessionManager(nil, nil)
 	var orgMaxVCPUs atomic.Int32
+	var orgMaxMemoryBytes atomic.Int64
 	orgMaxVCPUs.Store(4)
+	orgMaxMemoryBytes.Store(120 << 30)
 	sm.SetResourceLimitsProvider(func(username string) configstore.OrgResourceLimits {
 		return configstore.OrgResourceLimits{
-			OrgMaxVCPUs:  int(orgMaxVCPUs.Load()),
-			UserMaxVCPUs: 2,
+			OrgMaxVCPUs:       int(orgMaxVCPUs.Load()),
+			OrgMaxMemoryBytes: orgMaxMemoryBytes.Load(),
+			UserMaxVCPUs:      2,
 		}
 	})
 	sm.SetRequestedVCPUsResolver(func(profile *WorkerProfile) (int, error) {
 		return 2, nil
+	})
+	sm.SetRequestedMemoryBytesResolver(func(profile *WorkerProfile) (int64, error) {
+		return 60 << 30, nil
 	})
 
 	limiter := &observingConnectionLimiter{
 		firstRead:  make(chan configstore.OrgResourceLimits, 1),
 		readAgain:  make(chan struct{}),
 		secondRead: make(chan configstore.OrgResourceLimits, 1),
+		request:    make(chan connectionAdmissionRequest, 1),
 	}
 	sm.SetConnectionLimiter(limiter)
 
@@ -1229,20 +1240,30 @@ func TestSessionManager_RuntimeLimiterObservesDynamicResourceLimitWhileQueued(t 
 
 	select {
 	case got := <-limiter.firstRead:
-		if got.OrgMaxVCPUs != 4 || got.UserMaxVCPUs != 2 {
-			t.Fatalf("expected first limits org=4/user=2, got %#v", got)
+		if got.OrgMaxVCPUs != 4 || got.OrgMaxMemoryBytes != 120<<30 || got.UserMaxVCPUs != 2 {
+			t.Fatalf("expected first limits org_cpu=4/org_memory=120Gi/user_cpu=2, got %#v", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for first limit read")
 	}
 
+	select {
+	case got := <-limiter.request:
+		if got.RequestedVCPUs != 2 || got.RequestedMemoryBytes != 60<<30 {
+			t.Fatalf("admission request resources = %#v, want 2 vCPUs/60Gi", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for admission request")
+	}
+
 	orgMaxVCPUs.Store(8)
+	orgMaxMemoryBytes.Store(240 << 30)
 	close(limiter.readAgain)
 
 	select {
 	case got := <-limiter.secondRead:
-		if got.OrgMaxVCPUs != 8 || got.UserMaxVCPUs != 2 {
-			t.Fatalf("expected queued limiter read to observe updated org limit 8, got %#v", got)
+		if got.OrgMaxVCPUs != 8 || got.OrgMaxMemoryBytes != 240<<30 || got.UserMaxVCPUs != 2 {
+			t.Fatalf("expected queued limiter read to observe updated org limits 8 vCPU/240Gi, got %#v", got)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for second limit read")
@@ -1255,6 +1276,59 @@ func TestSessionManager_RuntimeLimiterObservesDynamicResourceLimitWhileQueued(t 
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for acquire")
+	}
+}
+
+func TestSessionManager_PropagatesWorkerResourcesForEverySessionProtocol(t *testing.T) {
+	for _, protocol := range []string{"postgres", "flight"} {
+		t.Run(protocol, func(t *testing.T) {
+			profile := &WorkerProfile{CPU: "4", Memory: "60Gi"}
+			sm := NewSessionManager(nil, nil)
+			sm.SetRequestedVCPUsResolver(func(got *WorkerProfile) (int, error) {
+				if got != profile {
+					t.Fatalf("vCPU resolver profile = %p, want %p", got, profile)
+				}
+				return 4, nil
+			})
+			sm.SetRequestedMemoryBytesResolver(func(got *WorkerProfile) (int64, error) {
+				if got != profile {
+					t.Fatalf("memory resolver profile = %p, want %p", got, profile)
+				}
+				return 60 << 30, nil
+			})
+			limiter := &observingConnectionLimiter{
+				firstRead:  make(chan configstore.OrgResourceLimits, 1),
+				readAgain:  make(chan struct{}),
+				secondRead: make(chan configstore.OrgResourceLimits, 1),
+				request:    make(chan connectionAdmissionRequest, 1),
+			}
+			close(limiter.readAgain)
+			sm.SetConnectionLimiter(limiter)
+
+			if _, err := sm.acquireConnectionSlot(context.Background(), 1001, "alice", protocol, profile); err != nil {
+				t.Fatalf("acquireConnectionSlot: %v", err)
+			}
+			got := <-limiter.request
+			if got.Protocol != protocol || got.RequestedVCPUs != 4 || got.RequestedMemoryBytes != 60<<30 {
+				t.Fatalf("admission request = %#v, want protocol %q with 4 vCPU/60Gi", got, protocol)
+			}
+		})
+	}
+}
+
+func TestSessionManager_RejectsMemoryOverflowBeforeAdmissionEnqueue(t *testing.T) {
+	sm := NewSessionManager(nil, nil)
+	requests := make(chan connectionAdmissionRequest, 1)
+	sm.SetConnectionLimiter(&observingConnectionLimiter{request: requests})
+	sm.SetRequestedMemoryBytesResolver(func(profile *WorkerProfile) (int64, error) {
+		return requestedWorkerMemoryBytes(profile, "8Ei")
+	})
+
+	if _, err := sm.acquireConnectionSlot(context.Background(), 1001, "alice", "postgres", nil); err == nil {
+		t.Fatal("expected overflowing worker memory to be rejected")
+	}
+	if len(requests) != 0 {
+		t.Fatalf("overflowing memory reached admission limiter: %#v", <-requests)
 	}
 }
 
@@ -1357,12 +1431,13 @@ func TestRuntimeOrgConnectionLimiterUsesQueue(t *testing.T) {
 	}
 
 	lease, err := limiter.Acquire(context.Background(), connectionAdmissionRequest{
-		PID:            2002,
-		Username:       "alice",
-		Protocol:       "postgres",
-		RequestedVCPUs: 4,
+		PID:                  2002,
+		Username:             "alice",
+		Protocol:             "postgres",
+		RequestedVCPUs:       4,
+		RequestedMemoryBytes: 120 << 30,
 	}, func(username string) configstore.OrgResourceLimits {
-		return configstore.OrgResourceLimits{OrgMaxVCPUs: 4, UserMaxVCPUs: 4}
+		return configstore.OrgResourceLimits{OrgMaxVCPUs: 4, OrgMaxMemoryBytes: 120 << 30, UserMaxVCPUs: 4}
 	})
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
@@ -1380,7 +1455,7 @@ func TestRuntimeOrgConnectionLimiterUsesQueue(t *testing.T) {
 	if store.entry == nil {
 		t.Fatal("expected reconnect admission to enqueue a request")
 	}
-	if store.entry.Username != "alice" || store.entry.Protocol != "postgres" || store.entry.RequestedVCPUs != 4 || store.entry.PID != 2002 {
+	if store.entry.Username != "alice" || store.entry.Protocol != "postgres" || store.entry.RequestedVCPUs != 4 || store.entry.RequestedMemoryBytes != 120<<30 || store.entry.PID != 2002 {
 		t.Fatalf("unexpected queued request: %#v", store.entry)
 	}
 	if err := lease.Release(context.Background()); err != nil {

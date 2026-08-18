@@ -5,6 +5,7 @@ package admin
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -47,5 +48,21 @@ func TestRegisterUIServesSPA(t *testing.T) {
 				t.Fatalf("content-type = %q, want %q", rec.Header().Get("Content-Type"), tc.wantCType)
 			}
 		})
+	}
+}
+
+func TestModelsUIExplainsAndEditsOrgMaxMemory(t *testing.T) {
+	raw, err := os.ReadFile("static/models.html")
+	if err != nil {
+		t.Fatalf("read models UI: %v", err)
+	}
+	body := string(raw)
+	for _, want := range []string{
+		`max_memory: "Maximum active worker pod memory`,
+		`max_memory: "text"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("models UI missing %q", want)
+		}
 	}
 }

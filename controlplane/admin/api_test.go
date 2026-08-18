@@ -81,6 +81,7 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	}
 	org.MaxWorkers = updates.MaxWorkers
 	org.MaxVCPUs = updates.MaxVCPUs
+	org.MaxMemory = updates.MaxMemory
 	// Mirrors gormAPIStore: "" = preserve, non-empty renames.
 	if updates.DatabaseName != "" {
 		org.DatabaseName = updates.DatabaseName
@@ -2544,6 +2545,124 @@ func TestUpdateOrgRejectsNegativeMaxVCPUs(t *testing.T) {
 	}
 	if store.orgs["analytics"].MaxVCPUs != 10 {
 		t.Fatalf("expected org max_vcpus to be preserved, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+}
+
+func TestCreateOrgAcceptsMaxMemory(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/orgs",
+		`{"name":"analytics","database_name":"analytics","team_id":1,"max_memory":"120Gi"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if got := store.orgs["analytics"].MaxMemory; got != "120Gi" {
+		t.Fatalf("stored max_memory = %q, want 120Gi", got)
+	}
+	var response configstore.Org
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.MaxMemory != "120Gi" {
+		t.Fatalf("response max_memory = %q, want 120Gi", response.MaxMemory)
+	}
+}
+
+func TestUpdateOrgMaxMemoryPersistsAndAudits(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name: "analytics", MaxWorkers: 2, MaxMemory: "120Gi",
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	var detail string
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		detail = c.GetString(ctxAuditDetailKey)
+	})
+	registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics", `{"max_memory":"240Gi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["analytics"].MaxMemory; got != "240Gi" {
+		t.Fatalf("stored max_memory = %q, want 240Gi", got)
+	}
+	if got := store.orgs["analytics"].MaxWorkers; got != 2 {
+		t.Fatalf("max_workers = %d, want preserved 2", got)
+	}
+	if !strings.Contains(detail, "max_memory 120Gi → 240Gi") {
+		t.Fatalf("audit detail = %q, want max_memory change", detail)
+	}
+}
+
+func TestUpdateOrgOmittingMaxMemoryPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["analytics"] = &configstore.Org{
+		Name: "analytics", MaxWorkers: 2, MaxMemory: "120Gi",
+	}
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics", `{"max_workers":3}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["analytics"].MaxMemory; got != "120Gi" {
+		t.Fatalf("max_memory = %q, want preserved 120Gi", got)
+	}
+}
+
+func TestUpdateOrgMaxMemoryCanBeCleared(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "empty string", body: `{"max_memory":""}`},
+		{name: "null", body: `{"max_memory":null}`},
+		{name: "zero quantity", body: `{"max_memory":"0"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{Name: "analytics", MaxMemory: "120Gi"}
+			router := newTestAPIRouter(store)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics", tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].MaxMemory; got != "" {
+				t.Fatalf("max_memory = %q, want cleared", got)
+			}
+		})
+	}
+}
+
+func TestOrgMutationRejectsInvalidMaxMemory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "invalid quantity", body: `{"max_memory":"lots"}`},
+		{name: "negative quantity", body: `{"max_memory":"-1Gi"}`},
+		{name: "decimal overflow", body: `{"max_memory":"10000000000000000000"}`},
+		{name: "binary overflow", body: `{"max_memory":"8Ei"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{Name: "analytics", MaxMemory: "120Gi"}
+			router := newTestAPIRouter(store)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics", tc.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].MaxMemory; got != "120Gi" {
+				t.Fatalf("invalid update changed max_memory to %q", got)
+			}
+		})
 	}
 }
 

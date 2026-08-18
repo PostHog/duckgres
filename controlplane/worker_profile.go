@@ -3,6 +3,7 @@ package controlplane
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -243,13 +244,11 @@ func firstNonEmpty(a, b string) string {
 }
 
 func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int, error) {
-	cpu := strings.TrimSpace(workerCPURequest)
-	if profile != nil && strings.TrimSpace(profile.CPU) != "" {
-		cpu = strings.TrimSpace(profile.CPU)
+	profileCPU := ""
+	if profile != nil {
+		profileCPU = profile.CPU
 	}
-	if cpu == "" {
-		cpu = defaultWorkerCPU
-	}
+	cpu := effectiveWorkerResourceRequest(profileCPU, workerCPURequest, defaultWorkerCPU)
 	q, err := resource.ParseQuantity(cpu)
 	if err != nil {
 		return 0, fmt.Errorf("invalid worker cpu quantity %q: %w", cpu, err)
@@ -259,6 +258,52 @@ func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int,
 		return 0, fmt.Errorf("worker cpu quantity %q must be positive", cpu)
 	}
 	return int((millis + 999) / 1000), nil
+}
+
+// requestedWorkerMemoryBytes returns the exact pod memory request charged to
+// session admission. Its precedence mirrors workerResourcesForProfile: an
+// effective profile value, then the deployment-wide worker request, then the
+// built-in default. Kubernetes quantities round positive sub-byte values up to
+// one byte; values that cannot be represented by the durable int64 accounting
+// columns are rejected before a queue entry can be written.
+func requestedWorkerMemoryBytes(profile *WorkerProfile, workerMemoryRequest string) (int64, error) {
+	profileMemory := ""
+	if profile != nil {
+		profileMemory = profile.Memory
+	}
+	memory := effectiveWorkerResourceRequest(profileMemory, workerMemoryRequest, defaultWorkerMemory)
+	q, err := resource.ParseQuantity(memory)
+	if err != nil {
+		return 0, fmt.Errorf("invalid worker memory quantity %q: %w", memory, err)
+	}
+	if q.Sign() <= 0 {
+		return 0, fmt.Errorf("worker memory quantity %q must be positive", memory)
+	}
+	max := resource.NewQuantity(math.MaxInt64, resource.DecimalSI)
+	// ParseQuantity caps overflowing BinarySI values (for example 8Ei) at
+	// MaxInt64. No exact positive BinarySI quantity can equal MaxInt64 because
+	// binary suffixes are powers of two, so that sentinel also means overflow.
+	if q.Cmp(*max) > 0 || (q.Format == resource.BinarySI && q.Value() == math.MaxInt64) {
+		return 0, fmt.Errorf("worker memory quantity %q exceeds %d bytes", memory, int64(math.MaxInt64))
+	}
+	bytes := q.Value()
+	if bytes <= 0 {
+		return 0, fmt.Errorf("worker memory quantity %q must resolve to a positive int64 byte count", memory)
+	}
+	return bytes, nil
+}
+
+// effectiveWorkerResourceRequest is the shared profile/deployment/built-in
+// precedence used by resource admission. Keep this aligned with pod resource
+// construction in workerResourcesForProfile.
+func effectiveWorkerResourceRequest(profileValue, deploymentValue, builtIn string) string {
+	if value := strings.TrimSpace(profileValue); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(deploymentValue); value != "" {
+		return value
+	}
+	return builtIn
 }
 
 // useExploratoryTier decides whether a connection starts on the small

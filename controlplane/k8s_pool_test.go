@@ -1401,6 +1401,95 @@ func TestK8sPoolReserveClaimedWorkerRejectsStaleInMemoryEpoch(t *testing.T) {
 	}
 }
 
+// A default-profile runtime row does not record the concrete pod shape. During
+// a rolling config change, the pod may therefore have been spawned with the old
+// defaults while a new control plane would charge admission using the new
+// defaults. Adoption must compare the live pod requests with the effective
+// shape before handing the worker to a session.
+func TestK8sPoolAdoptClaimedWorkerValidatesEffectivePodShape(t *testing.T) {
+	tests := []struct {
+		name          string
+		profileCPU    string
+		profileMemory string
+		podCPU        string
+		podMemory     string
+		includeWorker bool
+		wantErr       bool
+	}{
+		{name: "default cpu changed", podCPU: "8", podMemory: "120Gi", includeWorker: true, wantErr: true},
+		{name: "default memory changed", podCPU: "15", podMemory: "16Gi", includeWorker: true, wantErr: true},
+		{name: "cpu request missing", podMemory: "120Gi", includeWorker: true, wantErr: true},
+		{name: "memory request missing", podCPU: "15", includeWorker: true, wantErr: true},
+		{name: "zero request is invalid", podCPU: "0", podMemory: "120Gi", includeWorker: true, wantErr: true},
+		{name: "worker container missing", podCPU: "15", podMemory: "120Gi", wantErr: true},
+		{name: "default matches current config", podCPU: "15", podMemory: "120Gi", includeWorker: true},
+		{name: "explicit profile ignores changed defaults", profileCPU: "8", profileMemory: "16Gi", podCPU: "8", podMemory: "16Gi", includeWorker: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool, cs := newTestK8sPool(t, 5)
+			pool.workerCPURequest = "15"
+			pool.workerMemoryRequest = "120Gi"
+			podName := "duckgres-worker-test-cp-41"
+			if _, err := pool.ensureWorkerRPCSecret(context.Background(), podName); err != nil {
+				t.Fatalf("ensure worker RPC secret: %v", err)
+			}
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: pool.namespace},
+				Status:     corev1.PodStatus{PodIP: "10.0.0.41"},
+			}
+			if tt.includeWorker {
+				requests := corev1.ResourceList{}
+				if tt.podCPU != "" {
+					requests[corev1.ResourceCPU] = resource.MustParse(tt.podCPU)
+				}
+				if tt.podMemory != "" {
+					requests[corev1.ResourceMemory] = resource.MustParse(tt.podMemory)
+				}
+				pod.Spec.Containers = []corev1.Container{{
+					Name:      "duckdb-worker",
+					Resources: corev1.ResourceRequirements{Requests: requests},
+				}}
+			} else {
+				pod.Spec.Containers = []corev1.Container{{Name: "sidecar"}}
+			}
+			if _, err := cs.CoreV1().Pods(pool.namespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("create claimed worker pod: %v", err)
+			}
+
+			connectCalled := false
+			pool.connectWorkerFunc = func(context.Context, string, string, string) (*flightsql.Client, error) {
+				connectCalled = true
+				return nil, nil
+			}
+			_, err := pool.adoptClaimedWorker(context.Background(), &configstore.WorkerRecord{
+				WorkerID:      41,
+				PodName:       podName,
+				ProfileCPU:    tt.profileCPU,
+				ProfileMemory: tt.profileMemory,
+				OwnerEpoch:    2,
+			})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("adoptClaimedWorker succeeded for an incompatible pod shape")
+				}
+				if connectCalled {
+					t.Fatal("adoptClaimedWorker connected before validating the pod shape")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("adoptClaimedWorker: %v", err)
+			}
+			if !connectCalled {
+				t.Fatal("adoptClaimedWorker did not connect after validating the pod shape")
+			}
+		})
+	}
+}
+
 func TestK8sPoolReserveSharedWorkerReturnsOrgCapFromHotIdleClaim(t *testing.T) {
 	pool, _ := newTestK8sPool(t, 5)
 	store := &captureRuntimeWorkerStore{

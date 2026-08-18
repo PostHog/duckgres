@@ -54,6 +54,7 @@ interface FormState {
   database_name: string;
   max_workers: string;
   max_vcpus: string;
+  max_memory: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -66,6 +67,7 @@ function orgToForm(o: {
   database_name: string;
   max_workers: number;
   max_vcpus: number;
+  max_memory: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -77,6 +79,7 @@ function orgToForm(o: {
     database_name: o.database_name,
     max_workers: String(o.max_workers),
     max_vcpus: String(o.max_vcpus),
+    max_memory: o.max_memory,
     default_worker_cpu: o.default_worker_cpu,
     default_worker_memory: o.default_worker_memory,
     default_worker_ttl: o.default_worker_ttl,
@@ -149,6 +152,7 @@ export function OrgDetail() {
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
       max_vcpus: Number(form.max_vcpus) || 0,
+      max_memory: form.max_memory,
       default_worker_cpu: form.default_worker_cpu,
       default_worker_memory: form.default_worker_memory,
       default_worker_ttl: form.default_worker_ttl,
@@ -246,6 +250,14 @@ export function OrgDetail() {
                     min={0}
                     value={form.max_vcpus}
                     onChange={(e) => set("max_vcpus", e.target.value)}
+                  />
+                </Field>
+                <Field label="Max memory (empty = unbounded)">
+                  <Input
+                    aria-label="Max memory"
+                    value={form.max_memory}
+                    placeholder='e.g. "240Gi"'
+                    onChange={(e) => set("max_memory", e.target.value)}
                   />
                 </Field>
                 <Field label="Default worker CPU">

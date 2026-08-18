@@ -14,11 +14,13 @@ import (
 const (
 	missingOwnerOrgConnectionLeaseGrace = 5 * time.Minute
 	legacyOrgConnectionRequestedVCPUs   = 1
+	maximumOrgConnectionMemoryBytes     = int64(^uint64(0) >> 1)
 )
 
 // ErrOrgConnectionAdmissionRejected identifies a request that can never fit
-// under its configured hard vCPU ceiling. Temporary saturation does not wrap
-// this sentinel; those requests stay queued until capacity becomes available.
+// under its configured hard resource ceilings. Temporary saturation does not
+// wrap this sentinel; those requests stay queued until capacity becomes
+// available.
 var ErrOrgConnectionAdmissionRejected = errors.New("org connection admission rejected")
 
 // OrgConnectionAdmissionRef is the immutable identity of one connection
@@ -47,21 +49,27 @@ func (r OrgConnectionAdmissionRef) validate() error {
 type OrgConnectionAdmissionRejectionReason string
 
 const (
-	OrgConnectionAdmissionRejectedOrgVCPU  OrgConnectionAdmissionRejectionReason = "org_vcpu"
-	OrgConnectionAdmissionRejectedUserVCPU OrgConnectionAdmissionRejectionReason = "user_vcpu"
+	OrgConnectionAdmissionRejectedOrgVCPU   OrgConnectionAdmissionRejectionReason = "org_vcpu"
+	OrgConnectionAdmissionRejectedOrgMemory OrgConnectionAdmissionRejectionReason = "org_memory"
+	OrgConnectionAdmissionRejectedUserVCPU  OrgConnectionAdmissionRejectionReason = "user_vcpu"
 )
 
 // OrgConnectionAdmissionRejectedError carries the stable reason and values
 // needed to return an actionable PostgreSQL configuration-limit error.
 type OrgConnectionAdmissionRejectedError struct {
-	Reason         OrgConnectionAdmissionRejectionReason
-	RequestedVCPUs int
-	MaximumVCPUs   int
+	Reason               OrgConnectionAdmissionRejectionReason
+	RequestedVCPUs       int
+	MaximumVCPUs         int
+	RequestedMemoryBytes int64
+	MaximumMemoryBytes   int64
 }
 
 func (e *OrgConnectionAdmissionRejectedError) Error() string {
 	if e == nil {
 		return ErrOrgConnectionAdmissionRejected.Error()
+	}
+	if e.Reason == OrgConnectionAdmissionRejectedOrgMemory {
+		return fmt.Sprintf("%s: requested %d memory bytes exceeds %s maximum of %d memory bytes", ErrOrgConnectionAdmissionRejected, e.RequestedMemoryBytes, e.Reason, e.MaximumMemoryBytes)
 	}
 	return fmt.Sprintf("%s: requested %d vCPUs exceeds %s maximum of %d vCPUs", ErrOrgConnectionAdmissionRejected, e.RequestedVCPUs, e.Reason, e.MaximumVCPUs)
 }
@@ -80,8 +88,8 @@ type OrgConnectionMonitoringStatus struct {
 
 // EnqueueOrgConnectionRequest inserts a pending cluster-wide connection
 // admission request. FIFO ordering is scoped to org_id and ordered by
-// enqueued_at, then request_id. RequestedVCPUs is charged against active
-// resource leases when the request is granted.
+// enqueued_at, then request_id. RequestedVCPUs and RequestedMemoryBytes are
+// charged against active resource leases when the request is granted.
 func (cs *ConfigStore) EnqueueOrgConnectionRequest(entry *OrgConnectionQueueEntry) error {
 	return cs.EnqueueOrgConnectionRequestContext(context.Background(), entry)
 }
@@ -136,10 +144,10 @@ func (cs *ConfigStore) EnqueueOrgConnectionRequestContext(ctx context.Context, e
 }
 
 // TryAcquireOrgConnectionLease attempts to grant one queued request under
-// cluster-wide per-org and per-user vCPU budgets. It is retained for callers
-// that do not yet pass their control-plane identity explicitly. New runtime
-// callers use ScheduleAndClaimOrgConnectionLeaseForRef so owner validation is
-// part of the claim transaction.
+// cluster-wide per-org resource budgets and per-user vCPU budgets. It is
+// retained for callers that do not yet pass their control-plane identity
+// explicitly. New runtime callers use ScheduleAndClaimOrgConnectionLeaseForRef
+// so owner validation is part of the claim transaction.
 //
 // Legacy compatibility: This ID-only adapter assumes randomly generated
 // request IDs are globally unique and never reused. New callers use
@@ -408,6 +416,13 @@ func (cs *ConfigStore) scheduleAndClaimOrgConnectionLeaseOnce(ctx context.Contex
 				MaximumVCPUs:   requestLimits.OrgMaxVCPUs,
 			}
 			outcome = orgConnectionAdmissionOutcomeRejectedOrgVCPU
+		case requestLimits.OrgMaxMemoryBytes > 0 && request.RequestedMemoryBytes > requestLimits.OrgMaxMemoryBytes:
+			rejection = &OrgConnectionAdmissionRejectedError{
+				Reason:               OrgConnectionAdmissionRejectedOrgMemory,
+				RequestedMemoryBytes: request.RequestedMemoryBytes,
+				MaximumMemoryBytes:   requestLimits.OrgMaxMemoryBytes,
+			}
+			outcome = orgConnectionAdmissionOutcomeRejectedOrgMemory
 		case requestLimits.UserMaxVCPUs > 0 && request.RequestedVCPUs > requestLimits.UserMaxVCPUs:
 			rejection = &OrgConnectionAdmissionRejectedError{
 				Reason:         OrgConnectionAdmissionRejectedUserVCPU,
@@ -565,6 +580,7 @@ type authoritativeOrgConnectionUserLimit struct {
 
 type authoritativeOrgConnectionLimitSet struct {
 	orgMaxVCPUs       int64
+	orgMaxMemoryBytes int64
 	users             map[string]authoritativeOrgConnectionUserLimit
 	serviceCredential map[string]struct{}
 }
@@ -574,12 +590,16 @@ func (l authoritativeOrgConnectionLimitSet) lookup(username string) OrgResourceL
 		// Service credentials are root-shaped org identities. They share the
 		// org budget but never inherit an ordinary user's per-user cap, even if
 		// a legacy/user row happens to have the same name.
-		return OrgResourceLimits{OrgMaxVCPUs: int(l.orgMaxVCPUs)}
+		return OrgResourceLimits{
+			OrgMaxVCPUs:       int(l.orgMaxVCPUs),
+			OrgMaxMemoryBytes: l.orgMaxMemoryBytes,
+		}
 	}
 	user := l.users[username]
 	return OrgResourceLimits{
-		OrgMaxVCPUs:  int(l.orgMaxVCPUs),
-		UserMaxVCPUs: int(user.maxVCPUs),
+		OrgMaxVCPUs:       int(l.orgMaxVCPUs),
+		OrgMaxMemoryBytes: l.orgMaxMemoryBytes,
+		UserMaxVCPUs:      int(user.maxVCPUs),
 	}
 }
 
@@ -594,11 +614,12 @@ func (l authoritativeOrgConnectionLimitSet) userAllowed(username string) bool {
 
 func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID string) (authoritativeOrgConnectionLimitSet, bool, error) {
 	type orgLimitRow struct {
-		MaxVCPUs *int64 `gorm:"column:max_vcpus"`
+		MaxVCPUs  *int64 `gorm:"column:max_vcpus"`
+		MaxMemory string `gorm:"column:max_memory"`
 	}
 	var orgRow orgLimitRow
 	if err := tx.Model(&Org{}).
-		Select("max_vcpus").
+		Select("max_vcpus, max_memory").
 		Where("name = ?", orgID).
 		Take(&orgRow).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -617,6 +638,11 @@ func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID strin
 	if limits.orgMaxVCPUs < 0 {
 		return authoritativeOrgConnectionLimitSet{}, false, fmt.Errorf("org %q has invalid negative max_vcpus", orgID)
 	}
+	maxMemoryBytes, err := ParseOrgMaxMemoryBytes(orgRow.MaxMemory)
+	if err != nil {
+		return authoritativeOrgConnectionLimitSet{}, false, fmt.Errorf("org %q has invalid max_memory: %w", orgID, err)
+	}
+	limits.orgMaxMemoryBytes = maxMemoryBytes
 
 	type userLimitRow struct {
 		Username string `gorm:"column:username"`
@@ -724,6 +750,7 @@ func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, table
 			limits = targetLimits
 		}
 		requested := int64(head.RequestedVCPUs)
+		requestedMemoryBytes := head.RequestedMemoryBytes
 		// A permanently impossible foreign head must not block unrelated
 		// requests. Only that request's owner deletes and receives the typed
 		// rejection; other evaluators simply skip it.
@@ -731,6 +758,9 @@ func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, table
 			continue
 		}
 		if limits.OrgMaxVCPUs > 0 && requested > int64(limits.OrgMaxVCPUs) {
+			continue
+		}
+		if limits.OrgMaxMemoryBytes > 0 && requestedMemoryBytes > limits.OrgMaxMemoryBytes {
 			continue
 		}
 		if limits.UserMaxVCPUs > 0 {
@@ -742,6 +772,15 @@ func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, table
 		if limits.OrgMaxVCPUs > 0 && orgUsed+requested > int64(limits.OrgMaxVCPUs) {
 			return nil, orgConnectionAdmissionOutcomeBlockedOrgVCPU, nil
 		}
+		if limits.OrgMaxMemoryBytes > 0 {
+			orgMemoryUsed, orgMemoryUsageKnown, err := cs.activeOrgConnectionLeaseMemoryUsage(tx, target.OrgID)
+			if err != nil {
+				return nil, orgConnectionAdmissionOutcomeError, err
+			}
+			if orgConnectionMemoryLimitExceeded(limits.OrgMaxMemoryBytes, orgMemoryUsed, orgMemoryUsageKnown, requestedMemoryBytes) {
+				return nil, orgConnectionAdmissionOutcomeBlockedOrgMemory, nil
+			}
+		}
 
 		if sameOrgConnectionAdmissionRequest(head, target) {
 			return head, orgConnectionAdmissionOutcomeGranted, nil
@@ -750,6 +789,16 @@ func (cs *ConfigStore) nextEligibleOrgConnectionRequestLocked(tx *gorm.DB, table
 	}
 
 	return nil, orgConnectionAdmissionOutcomeWaiting, nil
+}
+
+func orgConnectionMemoryLimitExceeded(limit, used int64, usageKnown bool, requested int64) bool {
+	if limit <= 0 {
+		return false
+	}
+	if !usageKnown || requested <= 0 || used >= limit {
+		return true
+	}
+	return requested > limit-used
 }
 
 func sameOrgConnectionAdmissionRequest(a, b *OrgConnectionQueueEntry) bool {
@@ -809,18 +858,42 @@ func (cs *ConfigStore) activeOrgConnectionLeaseVCPUUsage(tx *gorm.DB, orgID stri
 	return orgUsed, userUsed, legacyUserUsed, nil
 }
 
+func (cs *ConfigStore) activeOrgConnectionLeaseMemoryUsage(tx *gorm.DB, orgID string) (int64, bool, error) {
+	type memoryUsageRow struct {
+		MemoryBytes  int64 `gorm:"column:memory_bytes"`
+		UnknownCount int64 `gorm:"column:unknown_count"`
+	}
+	var usage memoryUsageRow
+	leaseTable := cs.runtimeTable((&OrgConnectionLease{}).TableName())
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	// PostgreSQL promotes SUM(bigint) to numeric, so a corrupt or extreme set
+	// of rows can exceed int64 even though each requested value cannot. Clamp
+	// before scanning; the capped value is at least every representable limit,
+	// which keeps admission fail-closed without an overflowing Go addition.
+	if err := tx.Table(leaseTable+" AS l").
+		Select("LEAST(COALESCE(SUM(CASE WHEN l.requested_memory_bytes > 0 THEN l.requested_memory_bytes ELSE 0 END), 0), ?)::bigint AS memory_bytes, COUNT(*) FILTER (WHERE l.requested_memory_bytes <= 0) AS unknown_count", maximumOrgConnectionMemoryBytes).
+		Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = l.cp_instance_id").
+		Where("l.org_id = ?", orgID).
+		Where("cp.id IS NULL OR cp.state <> ?", ControlPlaneInstanceStateExpired).
+		Scan(&usage).Error; err != nil {
+		return 0, false, err
+	}
+	return usage.MemoryBytes, usage.UnknownCount == 0, nil
+}
+
 func (cs *ConfigStore) createOrgConnectionLease(tx *gorm.DB, request *OrgConnectionQueueEntry, now time.Time) (*OrgConnectionLease, error) {
 	granted := now
 	created := &OrgConnectionLease{
-		LeaseID:        request.RequestID,
-		RequestID:      request.RequestID,
-		OrgID:          request.OrgID,
-		Username:       request.Username,
-		CPInstanceID:   request.CPInstanceID,
-		PID:            request.PID,
-		Protocol:       request.Protocol,
-		RequestedVCPUs: request.RequestedVCPUs,
-		AcquiredAt:     now,
+		LeaseID:              request.RequestID,
+		RequestID:            request.RequestID,
+		OrgID:                request.OrgID,
+		Username:             request.Username,
+		CPInstanceID:         request.CPInstanceID,
+		PID:                  request.PID,
+		Protocol:             request.Protocol,
+		RequestedVCPUs:       request.RequestedVCPUs,
+		RequestedMemoryBytes: request.RequestedMemoryBytes,
+		AcquiredAt:           now,
 	}
 	if err := tx.Table(cs.runtimeTable(created.TableName())).Create(created).Error; err != nil {
 		return nil, err

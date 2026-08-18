@@ -45,6 +45,7 @@ type monitoringWarehouse struct {
 type monitoringLimits struct {
 	MaxWorkers              int    `json:"max_workers"`
 	MaxVCPUs                int    `json:"max_vcpus"`
+	MaxMemoryBytes          int64  `json:"max_memory_bytes"`
 	DefaultWorkerCPU        string `json:"default_worker_cpu"`
 	DefaultWorkerMemory     string `json:"default_worker_memory"`
 	DefaultWorkerTTLSeconds int    `json:"default_worker_ttl_seconds"`
@@ -292,6 +293,7 @@ func (h *monitoringHandler) snapshot(c *gin.Context) {
 		Limits: monitoringLimits{
 			MaxWorkers:              org.MaxWorkers,
 			MaxVCPUs:                org.MaxVCPUs,
+			MaxMemoryBytes:          org.MaxMemoryBytes,
 			DefaultWorkerCPU:        configuredDefaults.CPU,
 			DefaultWorkerMemory:     configuredDefaults.Memory,
 			DefaultWorkerTTLSeconds: int(configuredDefaults.TTL / time.Second),

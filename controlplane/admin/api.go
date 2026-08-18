@@ -286,6 +286,7 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	fields := map[string]interface{}{
 		"max_workers": updates.MaxWorkers,
 		"max_vcpus":   updates.MaxVCPUs,
+		"max_memory":  updates.MaxMemory,
 		// Org default worker profile: written unconditionally so an explicit
 		// empty string CLEARS the default (the handler's presence-merge keeps
 		// omitted fields at their stored values before this runs).
@@ -1043,6 +1044,9 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["max_vcpus"]; ok {
 		merged.MaxVCPUs = updates.MaxVCPUs
 	}
+	if _, ok := fields["max_memory"]; ok {
+		merged.MaxMemory = updates.MaxMemory
+	}
 	// Org default worker profile: present-in-payload wins, including an
 	// explicit "" which clears the default.
 	if _, ok := fields["default_worker_cpu"]; ok {
@@ -1075,6 +1079,7 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	addChange("database_name", existing.DatabaseName, merged.DatabaseName)
 	addChange("max_workers", existing.MaxWorkers, merged.MaxWorkers)
 	addChange("max_vcpus", existing.MaxVCPUs, merged.MaxVCPUs)
+	addChange("max_memory", orgStr(existing.MaxMemory), orgStr(merged.MaxMemory))
 	addChange("default_worker_cpu", orgStr(existing.DefaultWorkerCPU), orgStr(merged.DefaultWorkerCPU))
 	addChange("default_worker_memory", orgStr(existing.DefaultWorkerMemory), orgStr(merged.DefaultWorkerMemory))
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
@@ -1432,6 +1437,11 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	if org.MaxVCPUs < 0 {
 		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
 	}
+	maxMemory, err := configstore.NormalizeOrgMaxMemory(org.MaxMemory)
+	if err != nil {
+		return fmt.Errorf("max_memory: %w", err)
+	}
+	org.MaxMemory = maxMemory
 	return nil
 }
 

@@ -45,7 +45,7 @@ warehouse disappears from the metric on the next snapshot refresh.
 |---|---|---|
 | Admission evaluation | `duckgres_session_admission_evaluation_*` | One request-owned DB admission poll, including its serialized transaction and lock wait. |
 | Admission queue | `duckgres_session_admission_wait_seconds`, `duckgres_session_admission_requests_total` | After a request is successfully enqueued until grant, hard rejection, timeout, cancellation, or evaluation error. Enqueue failures are excluded. |
-| Admission state | `duckgres_session_admission_queue_depth`, `duckgres_session_admission_active_vcpus`, `duckgres_session_admission_limit_vcpus` | Local waiting callers, live local lease handles, and the effective org cap reconciled for active org stacks from each control-plane process's current config snapshot. |
+| Admission state | `duckgres_session_admission_queue_depth`, `duckgres_session_admission_active_vcpus`, `duckgres_session_admission_limit_vcpus`, `duckgres_session_admission_active_memory_bytes`, `duckgres_session_admission_limit_memory_bytes` | Local waiting callers, resources held by live local lease handles, and effective org caps reconciled for active org stacks from each control-plane process's current config snapshot. |
 | Worker acquisition | `duckgres_worker_acquire_*` | After admission grants until an existing, hot-idle, or newly spawned worker is allocated. |
 | Session start | `duckgres_session_start_duration_seconds`, `duckgres_postgres_session_start_total` | After successful PostgreSQL authentication until `ReadyForQuery` is flushed or session bootstrap terminates. The counter records exactly one terminal result after server-side retries. |
 | Query | `duckgres_query_total`, `duckgres_query_duration_seconds` | One non-empty query attempt and its execution duration. |
@@ -135,12 +135,14 @@ counted with `outcome="not_local"`; the owning session remains active.
 | `duckgres_session_admission_queue_depth` | Gauge | `org` | In-process callers still waiting after successful durable enqueue. It is not a count of durable queue rows. |
 | `duckgres_session_admission_active_vcpus` | Gauge | `org` | Requested vCPUs held by live local lease handles. It is admitted capacity, not measured CPU usage or the exact durable lease-row total. |
 | `duckgres_session_admission_limit_vcpus` | Gauge | `org` | Effective org cap for an active org stack, reconciled from this process's current config snapshot. `0` means unlimited. |
+| `duckgres_session_admission_active_memory_bytes` | Gauge | `org` | Requested memory bytes held by live local lease handles. It is admitted capacity, not measured memory usage or the exact durable lease-row total. |
+| `duckgres_session_admission_limit_memory_bytes` | Gauge | `org` | Effective org memory cap in bytes for an active org stack, reconciled from this process's current config snapshot. `0` means unlimited. |
 | `duckgres_session_start_duration_seconds` | Histogram | `org`, `protocol`, `outcome` | Authenticated PostgreSQL create-to-ready latency. |
 | `duckgres_postgres_session_start_total` | Counter | `org`, `outcome`, `reason` | Exactly one terminal authenticated PostgreSQL session-start result after server-side retries. |
 
 Admission request outcomes are `granted`, `rejected`, `timeout`, `canceled`,
 and `error`. `rejected` means the requested worker shape can never fit its hard
-organization or user vCPU ceiling.
+organization memory/vCPU ceiling or user vCPU ceiling.
 Session-start outcomes are `success`, `timeout`, `canceled`, `capacity`,
 `draining`, and `error`.
 
@@ -152,26 +154,27 @@ operator can usually alleviate. The remaining reasons let alerts exclude bad
 client input, planned lifecycle transitions, client disconnects, wire errors,
 and newly added paths that have not yet been classified. `capacity` covers
 runtime worker exhaustion and admission
-timeouts; requests that exceed a configured hard org or user vCPU limit are
+timeouts; requests that exceed a configured hard org resource or user vCPU limit are
 reported with reason `client`.
 
 Evaluation decisions are `granted_current`, `already_granted`, `rejected`,
 `blocked`, `waiting`, `inactive`, `missing`, `canceled`, `timeout`, and `error`.
 Each evaluation describes only the polling request. Evaluation reasons are
-`none`, `org_vcpu`, `user_vcpu`, `org_user_vcpu`, `user_ineligible`,
+`none`, `org_vcpu`, `org_memory`, `user_vcpu`, `org_user_vcpu`, `user_ineligible`,
 `resharding`, `fifo`, and `store_error`.
 
-A terminal request retains vCPU-cap attribution across every admission poll.
-No blocking poll produces `reason="none"`. If the request encountered an org
-cap, a user cap, or both, its terminal reason is `org_vcpu`, `user_vcpu`, or
-`org_user_vcpu`, respectively, even when it also encountered another reason.
-Without a vCPU-cap reason, one distinct reason is kept as-is and multiple
+A terminal request retains resource-cap attribution across every admission
+poll. No blocking poll produces `reason="none"`. A single observed cap is
+reported as `org_vcpu`, `org_memory`, or `user_vcpu`; observing both vCPU caps
+produces `org_user_vcpu`, while observing memory and a vCPU cap produces
+`resource_mixed`. Resource-cap reasons take precedence over unrelated blocking reasons.
+Without a resource-cap reason, one distinct reason is kept as-is and multiple
 distinct reasons become `mixed`. An admission store failure contributes
 `store_error`; interruption by the caller is classified as cancellation or
 timeout instead.
 
-Queue depth and active vCPUs are process-local logical contributions. Use
-`sum by (org)` across control-plane replicas. Active vCPUs drop when a live
+Queue depth and active resource gauges are process-local logical contributions.
+Use `sum by (org)` across control-plane replicas. Active resources drop when a live
 lease handle transfers cleanup ownership to the reclaimer; durable rows still
 awaiting cleanup are excluded, so database-enforced usage can temporarily be
 higher. Each replica reconciles the limit when it creates, updates, or removes
@@ -311,19 +314,24 @@ histogram_quantile(
 )
 ```
 
-Terminal requests affected by an org or user vCPU cap:
+Terminal requests affected by an org memory/vCPU or user vCPU cap:
 
 ```promql
 sum by (org, reason) (
-  rate(duckgres_session_admission_requests_total{reason=~"org_vcpu|user_vcpu|org_user_vcpu"}[5m])
+  rate(duckgres_session_admission_requests_total{reason=~"org_vcpu|org_memory|user_vcpu|org_user_vcpu|resource_mixed"}[5m])
 )
 ```
 
-Current queue depth and admitted vCPUs:
+`resource_mixed` means the request encountered both a memory cap and a vCPU
+cap. The separate `mixed` reason remains reserved for multiple unrelated
+non-resource blockers, so this query has no ambiguity.
+
+Current queue depth and admitted resources:
 
 ```promql
 sum by (org) (duckgres_session_admission_queue_depth)
 sum by (org) (duckgres_session_admission_active_vcpus)
+sum by (org) (duckgres_session_admission_active_memory_bytes)
 ```
 
 Live admitted-session utilization for capped orgs (`limit=0` is deliberately
@@ -333,6 +341,14 @@ filtered out):
 sum by (org) (duckgres_session_admission_active_vcpus)
   / on (org)
 (max by (org) (duckgres_session_admission_limit_vcpus) > 0)
+```
+
+The equivalent memory utilization ratio is:
+
+```promql
+sum by (org) (duckgres_session_admission_active_memory_bytes)
+  / on (org)
+(max by (org) (duckgres_session_admission_limit_memory_bytes) > 0)
 ```
 
 Authenticated session-start p95:

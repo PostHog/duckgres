@@ -160,6 +160,45 @@ func TestRequestedWorkerVCPUs(t *testing.T) {
 	}
 }
 
+func TestRequestedWorkerMemoryBytes(t *testing.T) {
+	tests := []struct {
+		name          string
+		profile       *WorkerProfile
+		defaultMemory string
+		want          int64
+		wantErr       bool
+	}{
+		{name: "profile wins", profile: &WorkerProfile{Memory: "32Gi"}, defaultMemory: "120Gi", want: 32 << 30},
+		{name: "deployment default", defaultMemory: "120Gi", want: 120 << 30},
+		{name: "built in default", want: 16 << 30},
+		{name: "binary quantity", defaultMemory: "1536Mi", want: 1536 << 20},
+		{name: "sub-byte quantity rounds to Kubernetes byte request", defaultMemory: "500m", want: 1},
+		{name: "bad memory", defaultMemory: "a lot", wantErr: true},
+		{name: "zero memory", defaultMemory: "0", wantErr: true},
+		{name: "negative memory", defaultMemory: "-1Gi", wantErr: true},
+		{name: "decimal overflow", defaultMemory: "9223372036854775808", wantErr: true},
+		{name: "binary overflow capped by quantity parser", defaultMemory: "8Ei", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := requestedWorkerMemoryBytes(tt.profile, tt.defaultMemory)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("requestedWorkerMemoryBytes() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 // When the client DOES set sizing and no default size is configured, the built-in
 // 8/16Gi/20m applies for the omitted fields.
 func TestResolveWorkerProfileSizing_BuiltinDefaults(t *testing.T) {
