@@ -56,26 +56,26 @@ type K8sWorkerPool struct {
 	shuttingDown bool
 	shutdownCh   chan struct{}
 
-	clientset               kubernetes.Interface
-	namespace               string
-	cpID                    string
-	cpInstanceID            string
-	cpUID                   types.UID
-	workerImage             string
-	workerPort              int
-	secretName              string
-	configMap               string
-	configPath              string
-	imagePullPolicy         corev1.PullPolicy
-	serviceAccount          string
-	workerCPURequest        string            // CPU request for worker pods (e.g., "500m")
-	workerMemoryRequest     string            // memory request for worker pods (e.g., "1Gi")
-	workerNodeSelector      map[string]string // node selector for worker pods
-	workerTolerationKey     string            // taint key for NoSchedule toleration
-	workerTolerationValue   string            // taint value for NoSchedule toleration
-	workerOrgAffinityEnabled bool             // add soft same-org pod affinity to trusted org-bound workers
-	workerOrgAffinityWeight  int              // preferred same-org pod-affinity weight, validated at control-plane startup
-	workerPriorityClassName string            // PriorityClass for worker pods (preempts overprovision pause pods)
+	clientset                kubernetes.Interface
+	namespace                string
+	cpID                     string
+	cpInstanceID             string
+	cpUID                    types.UID
+	workerImage              string
+	workerPort               int
+	secretName               string
+	configMap                string
+	configPath               string
+	imagePullPolicy          corev1.PullPolicy
+	serviceAccount           string
+	workerCPURequest         string            // CPU request for worker pods (e.g., "500m")
+	workerMemoryRequest      string            // memory request for worker pods (e.g., "1Gi")
+	workerNodeSelector       map[string]string // node selector for worker pods
+	workerTolerationKey      string            // taint key for NoSchedule toleration
+	workerTolerationValue    string            // taint value for NoSchedule toleration
+	workerOrgAffinityEnabled bool              // add soft same-org pod affinity to trusted org-bound workers
+	workerOrgAffinityWeight  int               // preferred same-org pod-affinity weight, validated at control-plane startup
+	workerPriorityClassName  string            // PriorityClass for worker pods (preempts overprovision pause pods)
 
 	// Headroom controller holds preemptible low-priority placeholder pods so a
 	// worker spawn schedules immediately (preempting a placeholder) instead of
@@ -119,6 +119,11 @@ type K8sWorkerPool struct {
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 
+	// posthogEnv is the allowlisted PostHog log EnvVars copied from this
+	// CP pod's named env at pool start. SecretKeyRef is live when the
+	// worker pod starts — no refresh loop. Empty if POD_NAME is unset,
+	// Get fails, or the named env is missing.
+	posthogEnv []corev1.EnvVar
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -178,28 +183,28 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		workers: make(map[int]*ManagedWorker),
 		// maxWorkers defaults to 0 (unbounded); there is no global cluster cap.
 		// Per-org caps are applied by OrgReservedPool, not the shared pool.
-		idleTimeout:             cfg.IdleTimeout,
-		shutdownCh:              make(chan struct{}),
-		stopInform:              make(chan struct{}),
-		clientset:               clientset,
-		namespace:               cfg.Namespace,
-		cpID:                    cfg.CPID,
-		cpInstanceID:            cfg.CPInstanceID,
-		workerImage:             cfg.WorkerImage,
-		workerPort:              cfg.WorkerPort,
-		secretName:              cfg.SecretName,
-		configMap:               cfg.ConfigMap,
-		configPath:              cfg.ConfigPath,
-		imagePullPolicy:         corev1.PullPolicy(cfg.ImagePullPolicy),
-		serviceAccount:          cfg.ServiceAccount,
-		workerCPURequest:        cfg.WorkerCPURequest,
-		workerMemoryRequest:     cfg.WorkerMemoryRequest,
-		workerNodeSelector:      cfg.WorkerNodeSelector,
-		workerTolerationKey:     cfg.WorkerTolerationKey,
-		workerTolerationValue:   cfg.WorkerTolerationValue,
+		idleTimeout:              cfg.IdleTimeout,
+		shutdownCh:               make(chan struct{}),
+		stopInform:               make(chan struct{}),
+		clientset:                clientset,
+		namespace:                cfg.Namespace,
+		cpID:                     cfg.CPID,
+		cpInstanceID:             cfg.CPInstanceID,
+		workerImage:              cfg.WorkerImage,
+		workerPort:               cfg.WorkerPort,
+		secretName:               cfg.SecretName,
+		configMap:                cfg.ConfigMap,
+		configPath:               cfg.ConfigPath,
+		imagePullPolicy:          corev1.PullPolicy(cfg.ImagePullPolicy),
+		serviceAccount:           cfg.ServiceAccount,
+		workerCPURequest:         cfg.WorkerCPURequest,
+		workerMemoryRequest:      cfg.WorkerMemoryRequest,
+		workerNodeSelector:       cfg.WorkerNodeSelector,
+		workerTolerationKey:      cfg.WorkerTolerationKey,
+		workerTolerationValue:    cfg.WorkerTolerationValue,
 		workerOrgAffinityEnabled: cfg.WorkerOrgAffinityEnabled,
 		workerOrgAffinityWeight:  cfg.WorkerOrgAffinityWeight,
-		workerPriorityClassName: cfg.WorkerPriorityClassName,
+		workerPriorityClassName:  cfg.WorkerPriorityClassName,
 
 		placeholderImage:             cfg.PlaceholderImage,
 		placeholderPriorityClassName: cfg.PlaceholderPriorityClassName,
@@ -228,6 +233,10 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		}
 	}
 
+	// Cache PostHog log env from this CP pod's named env. Missing
+	// logging config must never fail pool start or later spawn.
+	pool.loadPostHogLogEnv(context.Background())
+
 	// Resolve CP pod UID for owner references
 	if err := pool.resolveCPUID(context.Background()); err != nil {
 		slog.Warn("Could not resolve CP pod UID for owner references. Worker pods will not be garbage-collected if CP is deleted.", "error", err)
@@ -252,6 +261,38 @@ func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
 	}
 	p.cpUID = pod.UID
 	return nil
+}
+
+// loadPostHogLogEnv reads this CP pod's named env (Get(namespace, POD_NAME))
+// and caches the allowlisted PostHog log vars. POD_NAME empty, Get fail, or
+// a missing named POSTHOG_API_KEY → one WARN and empty cache. Never errors.
+func (p *K8sWorkerPool) loadPostHogLogEnv(ctx context.Context) {
+	if p == nil {
+		return
+	}
+	podName := strings.TrimSpace(os.Getenv("POD_NAME"))
+	if podName == "" || p.clientset == nil {
+		slog.Warn("PostHog log env not found on CP pod spec; workers will not export.")
+		p.posthogEnv = nil
+		return
+	}
+	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil || pod == nil || len(pod.Spec.Containers) == 0 {
+		slog.Warn("PostHog log env not found on CP pod spec; workers will not export.", "error", err)
+		p.posthogEnv = nil
+		return
+	}
+	copied := filterPostHogLogEnv(pod.Spec.Containers[0].Env)
+	p.posthogEnv = copied
+	if envHasName(copied, "POSTHOG_API_KEY") {
+		return
+	}
+	// A literal value: already WARNs "refusing to materialize"; do not
+	// also claim the named env was missing.
+	if present, secretRef := namedPostHogAPIKey(pod.Spec.Containers[0].Env); present && !secretRef {
+		return
+	}
+	slog.Warn("PostHog log env not found on CP pod spec; workers will not export.")
 }
 
 func (p *K8sWorkerPool) workerServiceAccountName() string {

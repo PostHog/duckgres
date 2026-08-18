@@ -126,44 +126,7 @@ func (p *K8sWorkerPool) spawnWorkerForOrg(ctx context.Context, id int, image str
 							Protocol:      corev1.ProtocolTCP,
 						},
 					},
-					Env: []corev1.EnvVar{
-						{
-							Name: "DUCKGRES_DUCKDB_TOKEN",
-							ValueFrom: &corev1.EnvVarSource{
-								SecretKeyRef: &corev1.SecretKeySelector{
-									LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
-									Key:                  "bearer-token",
-								},
-							},
-						},
-						{
-							Name:  "DUCKGRES_MODE",
-							Value: "duckdb-service",
-						},
-						{
-							Name:  "DUCKGRES_CERT",
-							Value: workerRPCMountDir + "/" + workerRPCCertKey,
-						},
-						{
-							Name:  "DUCKGRES_KEY",
-							Value: workerRPCMountDir + "/" + workerRPCKeyKey,
-						},
-						{
-							// One client query session per worker pod: the pod's full
-							// resources (workerDuckDBLimits gives the session ~75% of pod RAM
-							// + 2.5 DuckDB threads per requested CPU) belong to a single query,
-							// so queries never
-							// contend and a heavy query can't be OOM'd by a co-resident
-							// one. The CP scheduler (OrgReservedPool) already never
-							// co-assigns; this is the hard worker-side guarantee — a 2nd
-							// CreateSession is rejected rather than silently overcommitting.
-							// Internal control/maintenance work runs on the worker's side
-							// connections (controlDB/warmupDB), which are NOT counted
-							// sessions, so this does not starve them.
-							Name:  "DUCKGRES_DUCKDB_MAX_SESSIONS",
-							Value: "1",
-						},
-					},
+					Env: p.workerPodEnv(secretName, workerResources),
 					SecurityContext: &corev1.SecurityContext{
 						AllowPrivilegeEscalation: boolPtr(false),
 					},
@@ -172,91 +135,7 @@ func (p *K8sWorkerPool) spawnWorkerForOrg(ctx context.Context, id int, image str
 			},
 		},
 	}
-	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-		Name:  "DUCKGRES_SHARED_WARM_WORKER",
-		Value: "true",
-	})
 	p.addWorkerOrgPlacementAffinity(pod, orgID)
-
-	// Pre-session memory hygiene. Without an explicit DUCKGRES_MEMORY_LIMIT the
-	// worker's ConfigureMainDB falls back to sysinfo.AutoMemoryLimit(), which
-	// reads the NODE's /proc/meminfo — so all pre-session work (DuckLake
-	// ATTACH, activation, warmup, controlDB) runs with a memory_limit sized to
-	// the node, not the pod cgroup. Pass the pod-derived limit (same 75% the
-	// per-session SET uses, via duckdbMemoryLimitForPodMemory) and the CPU-derived
-	// thread count so the base DB is correctly bounded from process start.
-	// GOMEMLIMIT (read by the Go runtime directly) gives the Go side a soft
-	// ceiling at 1/8 of the pod so GC pushes back before the cgroup OOM-kills;
-	// DuckDB's buffer manager is unaffected (C allocations are untracked by Go).
-	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, workerMemoryHygieneEnv(workerResources)...)
-
-	// Stamp every log line with pod and node identifiers via the Downward API.
-	pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
-		corev1.EnvVar{
-			Name: "POD_NAME",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
-			},
-		},
-		corev1.EnvVar{
-			Name: "NODE_NAME",
-			ValueFrom: &corev1.EnvVarSource{
-				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
-			},
-		},
-	)
-
-	// Pass OTEL trace config to worker pods.
-	for _, envName := range []string{
-		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-		"OTEL_EXPORTER_OTLP_TRACES_PATH",
-	} {
-		if v := os.Getenv(envName); v != "" {
-			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-				Name:  envName,
-				Value: v,
-			})
-		}
-	}
-
-	// Cache proxy integration: when enabled, workers need to reach the
-	// DaemonSet proxy on the same node via the node IP + fixed hostPort.
-	// Inject NODE_IP via the Downward API so the worker process can resolve
-	// the proxy address at runtime.
-	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" {
-		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env,
-			corev1.EnvVar{
-				Name:  "DUCKGRES_CACHE_ENABLED",
-				Value: "true",
-			},
-			corev1.EnvVar{
-				Name: "NODE_IP",
-				ValueFrom: &corev1.EnvVarSource{
-					FieldRef: &corev1.ObjectFieldSelector{
-						FieldPath: "status.hostIP",
-					},
-				},
-			},
-		)
-		if timeout := os.Getenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT"); timeout != "" {
-			pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-				Name:  "DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT",
-				Value: timeout,
-			})
-		}
-	}
-
-	// Worker pods get an explicitly-constructed env list (this function), not
-	// a copy of the CP's own env, so any flag the worker reads at startup
-	// (here: configresolve's DisableParquetPrefetching, applied in
-	// applyParquetPrefetchPolicy) must be mirrored through explicitly or
-	// setting it on the CP deployment silently does nothing on workers.
-	if disabled, err := strconv.ParseBool(os.Getenv("DUCKGRES_DISABLE_PARQUET_PREFETCHING")); err == nil && disabled {
-		pod.Spec.Containers[0].Env = append(pod.Spec.Containers[0].Env, corev1.EnvVar{
-			Name:  "DUCKGRES_DISABLE_PARQUET_PREFETCHING",
-			Value: "true",
-		})
-	}
 
 	// Add toleration if configured.
 	tolKey, tolValue := p.workerTolerationKey, p.workerTolerationValue
@@ -710,6 +589,115 @@ func (p *K8sWorkerPool) spawnReservedWorkerForSlot(ctx context.Context, id int, 
 // When set, limits are equal to requests (Guaranteed QoS).
 func (p *K8sWorkerPool) workerResources() corev1.ResourceRequirements {
 	return p.workerResourcesForProfile(WorkerProfile{})
+}
+
+// workerPodEnv builds the explicit worker container env list. Worker pods do
+// not inherit the CP process env — every startup flag must be mirrored here.
+func (p *K8sWorkerPool) workerPodEnv(secretName string, workerResources corev1.ResourceRequirements) []corev1.EnvVar {
+	env := []corev1.EnvVar{
+		{
+			Name: "DUCKGRES_DUCKDB_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					Key:                  "bearer-token",
+				},
+			},
+		},
+		{
+			Name:  "DUCKGRES_MODE",
+			Value: "duckdb-service",
+		},
+		{
+			Name:  "DUCKGRES_CERT",
+			Value: workerRPCMountDir + "/" + workerRPCCertKey,
+		},
+		{
+			Name:  "DUCKGRES_KEY",
+			Value: workerRPCMountDir + "/" + workerRPCKeyKey,
+		},
+		{
+			// One client query session per worker pod: the pod's full
+			// resources (workerDuckDBLimits gives the session ~75% of pod RAM
+			// + 2.5 DuckDB threads per requested CPU) belong to a single query,
+			// so queries never
+			// contend and a heavy query can't be OOM'd by a co-resident
+			// one. The CP scheduler (OrgReservedPool) already never
+			// co-assigns; this is the hard worker-side guarantee — a 2nd
+			// CreateSession is rejected rather than silently overcommitting.
+			// Internal control/maintenance work runs on the worker's side
+			// connections (controlDB/warmupDB), which are NOT counted
+			// sessions, so this does not starve them.
+			Name:  "DUCKGRES_DUCKDB_MAX_SESSIONS",
+			Value: "1",
+		},
+		{
+			Name:  "DUCKGRES_SHARED_WARM_WORKER",
+			Value: "true",
+		},
+	}
+	// Pre-session memory hygiene. Without an explicit DUCKGRES_MEMORY_LIMIT the
+	// worker's ConfigureMainDB falls back to sysinfo.AutoMemoryLimit(), which
+	// reads the NODE's /proc/meminfo — so all pre-session work (DuckLake
+	// ATTACH, activation, warmup, controlDB) runs with a memory_limit sized to
+	// the node, not the pod cgroup. Pass the pod-derived limit (same 75% the
+	// per-session SET uses, via duckdbMemoryLimitForPodMemory) and the CPU-derived
+	// thread count so the base DB is correctly bounded from process start.
+	// GOMEMLIMIT (read by the Go runtime directly) gives the Go side a soft
+	// ceiling at 1/8 of the pod so GC pushes back before the cgroup OOM-kills;
+	// DuckDB's buffer manager is unaffected (C allocations are untracked by Go).
+	env = append(env, workerMemoryHygieneEnv(workerResources)...)
+	env = append(env, downwardAPIIdentityEnv()...)
+
+	// Pass OTEL trace config to worker pods (collector URL, not a token).
+	for _, envName := range []string{
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_TRACES_PATH",
+	} {
+		if v := os.Getenv(envName); v != "" {
+			env = append(env, corev1.EnvVar{Name: envName, Value: v})
+		}
+	}
+
+	// Cache proxy integration: when enabled, workers need to reach the
+	// DaemonSet proxy on the same node via the node IP + fixed hostPort.
+	// Inject NODE_IP via the Downward API so the worker process can resolve
+	// the proxy address at runtime.
+	if os.Getenv("DUCKGRES_CACHE_ENABLED") == "true" {
+		env = append(env,
+			corev1.EnvVar{Name: "DUCKGRES_CACHE_ENABLED", Value: "true"},
+			corev1.EnvVar{
+				Name: "NODE_IP",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.hostIP"},
+				},
+			},
+		)
+		if timeout := os.Getenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT"); timeout != "" {
+			env = append(env, corev1.EnvVar{
+				Name:  "DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT",
+				Value: timeout,
+			})
+		}
+	}
+
+	// Any flag the worker reads at startup must be mirrored through explicitly
+	// or setting it on the CP deployment silently does nothing on workers.
+	if disabled, err := strconv.ParseBool(os.Getenv("DUCKGRES_DISABLE_PARQUET_PREFETCHING")); err == nil && disabled {
+		env = append(env, corev1.EnvVar{
+			Name:  "DUCKGRES_DISABLE_PARQUET_PREFETCHING",
+			Value: "true",
+		})
+	}
+
+	// Cached named PostHog log env from the CP pod spec (secretKeyRef stays
+	// a ref). Empty when POD_NAME/Get/named env missed — never fail spawn.
+	if p != nil && len(p.posthogEnv) > 0 {
+		for i := range p.posthogEnv {
+			env = append(env, *p.posthogEnv[i].DeepCopy())
+		}
+	}
+	return env
 }
 
 // workerMemoryHygieneEnv derives the memory/thread env vars for a worker pod
