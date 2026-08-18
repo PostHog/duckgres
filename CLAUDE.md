@@ -495,6 +495,43 @@ release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
 `GetFlightInfo` whose `DoGet` never arrived. `terminationGracePeriodSeconds=3600`
 (`k8s_pool.go`) must stay above `workerShutdownDrainTime` (55m).
 
+## PostHog Logs (OTLP) — LOAD-BEARING CONTRACT
+
+Process-level slog → PostHog Logs via OTLP (`internal/cliboot.InitLogging`).
+This is **not** a replacement for `ducklake.system.query_log`. Product-analytics
+events (`POSTHOG_ANALYTICS_API_KEY`) stay on the capture API.
+
+- **`service.name` is the process role**, not `duckgres-<identifier>`:
+  `duckgres-control-plane` / `duckgres-worker` / `duckgres-reshard` /
+  `duckgres` (standalone). `DUCKGRES_IDENTIFIER` is resource attr
+  `duckgres.deployment`. Logs and traces share `otelResource(bi)`.
+- **Default PostHog level is WARN** (`DUCKGRES_POSTHOG_LOG_LEVEL`); stderr
+  stays at `DUCKGRES_LOG_LEVEL`. User-class `Query execution failed.` stays
+  Info and does not export at the default.
+- **Query text default is `redacted`** (`RedactForLog`+4096). Secret DDL is a
+  placeholder; ordinary SELECT text still leaves. Never redact on `LINE 1:`.
+- **Public connection key is `pid`**, not `connection_id`. Org/worker are
+  process-scoped on workers (`stampWorkerLogIdentity`); `user`/`pid` live on
+  the session logger and must never be `SetDefault`'d.
+- **Worker `POSTHOG_API_KEY` is a named `env:` `secretKeyRef`** copied from
+  the CP pod spec (`controlplane/pod_env.go`, `k8s_pool_spawn.go`). Never
+  `envFrom`. Never `os.Getenv` → `value:`. If Get/`POD_NAME`/named env misses:
+  one WARN and omit — **never fail spawn**. Do not forward
+  `ADDITIONAL_POSTHOG_API_KEYS` or `POSTHOG_ANALYTICS_API_KEY`.
+- **`FlushLogging()`** only on the listed drain `os.Exit` sites (worker
+  success/timeout; CP SIGTERM after drain; `drainAfterUpgrade`). Do not wrap
+  every startup `os.Exit(1)`.
+- **Exporter health** is scraped on the CP:
+  `duckgres_otlp_log_export_failures_total{source,reason}` (no `{org}`).
+  Workers report `otlp_export_enabled` / `otlp_export_failures` on the
+  health-check JSON; the CP `Add`s last-seen **deltas** only. Workers do not
+  call `InitMetrics`.
+- Touching spawn env, health JSON, or the handler stack → update
+  `controlplane/k8s_pool_spawn_test.go`, `controlplane/otlp_export_test.go`,
+  `internal/cliboot/*_test.go`, AND `assert_worker_pod` in
+  `tests/mw-dev/e2e/harness.sh` (plaintext-key assert; secretKeyRef copy when
+  the CP named env has one).
+
 ## Per-Session S3 Cache Bypass (`duckgres.s3_cache`, remote backend)
 
 `SET duckgres.s3_cache = on|off|passthrough` (default `on`; also a `-c`
