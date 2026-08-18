@@ -681,3 +681,25 @@ export interface ExternalMetadataStoreInfo {
   user: string;
   database: string;
 }
+
+// GET /api/v1/usage/monthly — the Usage page. Rows are per (UTC month, org,
+// team), merged across the compute + storage billing families over the
+// RETAINED billing buffer (acked buckets are deleted; >30d buckets GC'd) —
+// watermark_low is the billing ack cursor that bounds how far back data can
+// exist. gib_seconds is the exact-decimal GiB-seconds JSON number.
+export interface MonthlyUsageRow {
+  month: string; // "YYYY-MM" UTC
+  org_id: string;
+  team_id: number;
+  schema_name: string | null;
+  cpu_seconds: number;
+  memory_seconds: number;
+  gib_seconds: number;
+}
+
+export interface MonthlyUsageResponse {
+  from: string;
+  months: number;
+  watermark_low: string | null;
+  rows: MonthlyUsageRow[];
+}

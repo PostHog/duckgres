@@ -1102,14 +1102,28 @@ touching this path:
   disable, direct RDS → require). Drift gauges:
   `duckgres_org_storage_pending_delete_files` (alert on sustained nonzero) +
   `duckgres_org_storage_tracked_bytes`.
+- **The admin console "Usage" page reads the SAME buffer** —
+  `GET /api/v1/usage/monthly` (`controlplane/admin/usage_api.go`, backed by
+  `configstore.Aggregate{Compute,Storage}UsageMonthly`) sums retained buckets
+  per UTC month per (org, team), merging the compute and storage families and
+  joining the team schema name for display. It is a viewer-allowed operations
+  view, NOT an invoice: acked buckets are already deleted and >30d buckets are
+  GC'd, so the response carries the ack cursor as `watermark_low` and the UI
+  shows the retention caveat instead of implying all-time totals. It adds NO
+  second accounting pipeline — keep it a pure read over the buffer.
 - Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
   the storage sampler, or the bucket keys → update
   `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,
   `compute_size_test.go`, `storage_meter_test.go`,
   `configstore/storage_usage_test.go`, the migration assertion in
   `tests/configstore/migrations_postgres_test.go`, and the
-  `compute_usage_pull_api` assertion (compute + storage) in
-  `tests/mw-dev/e2e/harness.sh`.
+  `compute_usage_pull_api` assertion (compute + storage, incl. the
+  `usage-monthly` checks) in
+  `tests/mw-dev/e2e/harness.sh`. Touching the monthly aggregation or the
+  Usage page → update `controlplane/admin/usage_api_test.go`,
+  `tests/configstore/usage_monthly_postgres_test.go`,
+  `ui/src/pages/Usage.test.tsx`, and those same `usage-monthly` harness
+  checks.
 
 ## Discovery Endpoints (external-writer tenant listing)
 

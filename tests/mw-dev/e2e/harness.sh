@@ -756,7 +756,10 @@ connection_duration_logged() { # org password
 # here) must serve a storage row with gib_seconds > 0 for the org, and the
 # shared ack must advance past it. A bucket closes ~90s after the connection
 # ends (60s width + 30s grace) plus ≤15s flush, so the poll allows ~4
-# minutes. This e2e stack has its own config store, so acking here cannot eat
+# minutes. The SAME buffer backs the admin console's Usage page, asserted here
+# too (before the ack deletes it): GET /api/v1/usage/monthly must show the
+# generated compute + storage under the current UTC month per team. This e2e
+# stack has its own config store, so acking here cannot eat
 # production usage.
 compute_usage_pull_api() { # org password
   org="$1"; pw="$2"
@@ -783,6 +786,16 @@ compute_usage_pull_api() { # org password
   wl="$(echo "$body" | jq -r '.watermark_low')"
   wh="$(echo "$body" | jq -r '.watermark_high')"
   log "compute-usage OK: usage served (low=$wl high=$wh)"
+
+  # The admin "Usage" page reads the SAME buffer: before the ack deletes it,
+  # the just-generated usage must show up under the current UTC month on
+  # GET /api/v1/usage/monthly, attributed to the org's oldest team.
+  cur_month="$(date -u +%Y-%m)"
+  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg m "$cur_month" '
+        .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .cpu_seconds>0 and .memory_seconds>0)) | length >= 1' >/dev/null \
+    || fail "usage-monthly: no compute row for $org team=$CNPG_TEAM_ID month=$cur_month: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
+  log "usage-monthly OK: compute row for $org visible in month $cur_month"
 
   # Ack the served watermark; the cursor must advance and acked buckets die.
   ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
@@ -823,6 +836,13 @@ compute_usage_pull_api() { # org password
   gib="$(echo "$body" | jq -r --arg o "$org" '[.storage[] | select(.org_id==$o)][0].gib_seconds')"
   wh2="$(echo "$body" | jq -r '.watermark_high')"
   log "storage-usage OK: $org gib_seconds=$gib served"
+
+  # The monthly Usage view must carry the storage family too (same buffer).
+  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg m "$(date -u +%Y-%m)" '
+        .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .gib_seconds>0)) | length >= 1' >/dev/null \
+    || fail "usage-monthly: no storage row for $org team=$CNPG_TEAM_ID: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
+  log "usage-monthly OK: storage row for $org visible"
 
   # The shared ack must clear storage buckets too: ack the served watermark,
   # then the next GET's storage array must not contain rows ≤ it for this org
@@ -2757,6 +2777,15 @@ admin_console_api() {
   curl -fsS -H "$H" "$API/api/v1/cluster/summary" \
     | jq -e '(.nodes|type=="number") and (.workers|type=="number") and (.worker_cpu_cores|type=="number") and (.worker_mem_gib|type=="number") and (.placeholders|type=="number") and (.pending|type=="number")' >/dev/null \
     || fail "/cluster/summary missing numeric totals (nodes/workers/cpu/mem/placeholders/pending)"
+  # The monthly per-team usage read backing the admin "Usage" page: envelope
+  # only here (rows may be empty before any usage lands); the populated path
+  # is asserted in compute_usage_pull_api against real generated usage.
+  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
+    | jq -e 'has("rows") and (.rows | type == "array") and has("months") and has("from") and has("watermark_low")' >/dev/null \
+    || fail "/usage/monthly did not return its envelope"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/usage/monthly?months=0")"
+  [ "$code" = "400" ] || fail "/usage/monthly?months=0 returned $code, want 400"
+
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
   # Includes the per-org/per-source worker-acquire-latency panels. (The raw
   # histogram emission — org+source labels on duckgres_worker_acquire_total_seconds

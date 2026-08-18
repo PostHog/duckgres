@@ -19,6 +19,7 @@ import type {
   FleetStat,
   ImpersonateBody,
   Me,
+  MonthlyUsageResponse,
   ManagedWarehouse,
   MetricsPanels,
   ModelListing,
@@ -249,6 +250,9 @@ export const api = {
   // audit
   audit: (params?: { actor?: string; org?: string; limit?: number }) =>
     get<{ entries: AuditEntry[] }>("/audit", params).then((r) => r.entries ?? []),
+
+  // monthly per-team usage (the Usage page; read-only, viewer-allowed)
+  monthlyUsage: (months: number) => get<MonthlyUsageResponse>("/usage/monthly", { months }),
 
   // reshard operations (metadata-store migrations; POSTs are admin-only)
   startReshard: (org: string, body: StartReshardBody) =>

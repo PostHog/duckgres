@@ -33,6 +33,7 @@ import type {
   MetricsPanels,
   ModelListing,
   ModelSummary,
+  MonthlyUsageResponse,
   Operator,
   Org,
   OrgTeam,
@@ -571,6 +572,17 @@ export function useAudit(params: { actor?: string; org?: string }) {
     queryKey: ["audit", params.actor ?? "", params.org ?? ""],
     queryFn: () =>
       tolerate404<AuditEntry[]>([])(api.audit({ actor: params.actor, org: params.org, limit: 500 })),
+  });
+}
+
+// ---- monthly usage (the Usage page) ----
+
+// Monthly per-team usage over the retained billing buffer. Not 404-tolerated:
+// the endpoint is part of the same binary as the console.
+export function useMonthlyUsage(months: number) {
+  return useQuery<MonthlyUsageResponse>({
+    queryKey: ["usage", "monthly", months],
+    queryFn: () => api.monthlyUsage(months),
   });
 }
 
