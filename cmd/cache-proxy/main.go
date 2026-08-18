@@ -120,10 +120,13 @@ func main() {
 		return
 	}
 	if lookupMode == peerLookupSummary {
+		summaryMemoryLimitBytes.Set(float64(summaryMemoryLimit))
 		if err := validateSummaryMemoryLimit(summaryMemoryLimit); err != nil {
 			slog.Error("Invalid summary memory limit.", "error", err)
 			return
 		}
+	} else {
+		summaryMemoryLimitBytes.Set(0)
 	}
 	hostname, _ := os.Hostname()
 	identity := envOrDefault("CACHE_PROXY_ID", envOrDefault("POD_NAME", envOrDefault("NODE_NAME", hostname)))

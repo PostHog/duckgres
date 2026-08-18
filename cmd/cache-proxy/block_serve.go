@@ -7,8 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -182,19 +180,11 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 	return nil
 }
 
-// blockPresent reports whether a block's bytes are on local disk. It checks
-// the tracked index first (the common case, and the one that drives LRU
-// recency) but also accepts a tracked-file-still-syncing entry: a concurrent
-// PutStream lands its file (rename) a moment before it lands the LRU
-// accounting (addLocked), so an index-only Has can race a just-filled block
-// and report it missing while its bytes are already servable. Neither peek
-// counts as an access — openFile (phase 2) does the touching.
+// blockPresent reports whether a block is a committed, tracked cache entry.
+// PutStream makes rename and index accounting one atomic commit under the
+// cache mutex, so an untracked file is never authoritative.
 func (p *CacheProxy) blockPresent(key string) bool {
-	if p.store.Has(key) {
-		return true
-	}
-	_, err := os.Stat(filepath.Join(p.store.dir, key))
-	return err == nil
+	return p.store.Has(key)
 }
 
 // serveBlockAligned serves a cacheable GET whose Range is an absolute
@@ -337,9 +327,9 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 						summaryGetsLeft--
 						_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) { return p.store.PutStream(key, rd) })
 						if ok {
-							peerDirectGetsTotal.WithLabelValues("success").Inc()
+							summaryConfirmedGetsTotal.WithLabelValues("success").Inc()
 						} else {
-							peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
+							summaryConfirmedGetsTotal.WithLabelValues("miss_or_error").Inc()
 						}
 					}
 				}

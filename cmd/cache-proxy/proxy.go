@@ -427,10 +427,10 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 				positive, uncovered := p.peers.SummaryLookup(cacheKey, time.Now())
 				if holder, flight, ok, _ := p.peers.LocateSummaryKey(r.Context(), cacheKey, positive, uncovered, p.peers.peerMaxProbes); ok {
 					if res, ok := p.fetchFromPeer(holder, flight, cacheKey, r); ok {
-						peerDirectGetsTotal.WithLabelValues("success").Inc()
+						summaryConfirmedGetsTotal.WithLabelValues("success").Inc()
 						return res, nil
 					}
-					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
+					summaryConfirmedGetsTotal.WithLabelValues("miss_or_error").Inc()
 				}
 			} else if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
 				res, ok := p.fetchFromPeer(holder, flight, cacheKey, r)

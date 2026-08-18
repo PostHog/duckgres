@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,23 +20,49 @@ import (
 // confirmation contract. Bloom summaries only eliminate definite negatives;
 // they never authorize a body GET without an exact /cache/has confirmation.
 
-func TestSummarySyncImmediatelyPullsNewPeerWithGET(t *testing.T) {
+func TestSummaryParserRejectsLegacyDynamicBloomLayout(t *testing.T) {
 	key := strings.Repeat("a", 64)
-	summary, err := newCacheSummary("remote", 1, []string{key}, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
+	bits, hashes := bloomParams(1)
+	payload := make([]byte, bits/8)
+	bloomHashes(key, bits, hashes, func(bit uint64) {
+		payload[bit/8] |= 1 << (bit % 8)
+	})
+	summary := summaryFromIncrementalBits(bits, hashes, payload, time.Now(), time.Minute)
 	body, err := summary.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := parseCacheSummary(body, time.Now()); err == nil {
+		t.Fatal("accepted legacy dynamically sized Bloom layout; want fixed incremental layout only")
+	}
+}
+
+func TestBlockPresentRejectsUntrackedDiskFile(t *testing.T) {
+	store, err := NewDiskCache(t.TempDir(), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := BlockKey("https://example.invalid/object", 0, 1024)
+	if err := os.WriteFile(filepath.Join(store.dir, key), []byte("stray"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	proxy := NewCacheProxy(store, peerManagerWith(nil), nil)
+	if proxy.blockPresent(key) {
+		t.Fatal("untracked on-disk file reported as a present block")
+	}
+}
+
+func TestSummarySyncImmediatelyPullsNewPeerWithGET(t *testing.T) {
+	key := strings.Repeat("a", 64)
+	summary := fixedCacheSummaryForKeys(t, []string{key}, time.Now(), time.Minute)
+	body := marshalCacheSummaryForTest(t, summary)
 
 	var gets, posts int32
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			atomic.AddInt32(&gets, 1)
-			w.Header().Set("ETag", `"generation-1"`)
+			w.Header().Set("ETag", `"snapshot-1"`)
 			_, _ = w.Write(body)
 		case http.MethodPost:
 			atomic.AddInt32(&posts, 1)
@@ -45,7 +75,7 @@ func TestSummarySyncImmediatelyPullsNewPeerWithGET(t *testing.T) {
 
 	peer := strings.TrimPrefix(remote.URL, "http://")
 	pm := peerManagerWith([]string{peer})
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	store, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
 	if err != nil {
 		t.Fatal(err)
@@ -56,7 +86,7 @@ func TestSummarySyncImmediatelyPullsNewPeerWithGET(t *testing.T) {
 	defer pm.StopSummarySynchronizer()
 
 	eventually(t, time.Second, func() bool {
-		return len(pm.SummaryCandidates(key, time.Now())) == 1
+		return len(summaryPositivesForTest(pm, key, time.Now())) == 1
 	})
 	if got := atomic.LoadInt32(&gets); got != 1 {
 		t.Fatalf("initial summary GETs=%d, want 1", got)
@@ -76,12 +106,12 @@ func TestPeerSummaryGETServesSnapshotAndSupportsETag(t *testing.T) {
 		t.Fatal(err)
 	}
 	pm := peerManagerWith(nil)
-	pm.ConfigureSummary(peerLookupSummary, "snapshot-server")
+	pm.ConfigureSummary(peerLookupSummary, "snapshot-server", SummaryConfig{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pm.StartSummarySynchronizer(ctx, store)
 	defer pm.StopSummarySynchronizer()
-	eventually(t, time.Second, func() bool { return len(pm.localSummaryCopy()) > 0 })
+	eventually(t, time.Second, func() bool { return len(localSummaryBodyForTest(pm)) > 0 })
 
 	proxy := NewCacheProxy(store, pm, nil)
 	first := httptest.NewRecorder()
@@ -122,7 +152,7 @@ func TestPeerSummaryGETSetsHandlerLocalWriteDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	pm := peerManagerWith(nil)
-	pm.ConfigureSummary(peerLookupSummary, "snapshot-server")
+	pm.ConfigureSummary(peerLookupSummary, "snapshot-server", SummaryConfig{})
 	pm.buildLocalSummary(store)
 	proxy := NewCacheProxy(store, pm, nil)
 	w := &deadlineResponseWriter{header: make(http.Header)}
@@ -171,7 +201,7 @@ func TestSummarySelectionIsDeterministicAndFitsRemoteMemoryBudget(t *testing.T) 
 	second := NewPeerManager("test.svc", ":8081")
 	second.ConfigureSummary(peerLookupSummary, "receiver-a", SummaryConfig{MemoryLimitBytes: memoryLimit})
 	secondSelection := second.selectSummaryPeers(reversed)
-	if !stringSlicesEqual(firstSelection, secondSelection) {
+	if !slices.Equal(firstSelection, secondSelection) {
 		t.Fatalf("selection depends on DNS order: first=%v reversed=%v", firstSelection, secondSelection)
 	}
 	if used := len(firstSelection) * filterBytes; used > first.summaryRemoteMemoryBudget || used+filterBytes <= first.summaryRemoteMemoryBudget {
@@ -232,15 +262,9 @@ func TestSummarySyncPullsOnlyReceiverSelectedSubset(t *testing.T) {
 func TestConditionalSummaryPullPreservesRecordOnNotModified(t *testing.T) {
 	key := strings.Repeat("1", 64)
 	now := time.Now()
-	summary, err := newCacheSummary("remote", 1, []string{key}, now, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := summary.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	const etag = `"remote-generation-1"`
+	summary := fixedCacheSummaryForKeys(t, []string{key}, now, time.Minute)
+	body := marshalCacheSummaryForTest(t, summary)
+	const etag = `"remote-snapshot-1"`
 	var calls int32
 	var conditional atomic.Bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -260,14 +284,14 @@ func TestConditionalSummaryPullPreservesRecordOnNotModified(t *testing.T) {
 
 	peer := strings.TrimPrefix(remote.URL, "http://")
 	pm := peerManagerWith([]string{peer})
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	pm.refreshSummarySelection()
 	pm.pullSummary(context.Background(), peer)
 	pm.pullSummary(context.Background(), peer)
 	if !conditional.Load() {
 		t.Fatal("second summary pull omitted If-None-Match for the retained ETag")
 	}
-	if candidates := pm.SummaryCandidates(key, time.Now()); len(candidates) != 1 || candidates[0] != peer {
+	if candidates := summaryPositivesForTest(pm, key, time.Now()); len(candidates) != 1 || candidates[0] != peer {
 		t.Fatalf("304 discarded the last valid summary: candidates=%v", candidates)
 	}
 }
@@ -275,28 +299,22 @@ func TestConditionalSummaryPullPreservesRecordOnNotModified(t *testing.T) {
 func TestFailedSummaryPullRetainsHintUntilTTLThenBecomesUncovered(t *testing.T) {
 	key := strings.Repeat("2", 64)
 	created := time.Now()
-	summary, err := newCacheSummary("remote", 1, []string{key}, created, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := summary.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
+	summary := fixedCacheSummaryForKeys(t, []string{key}, created, 5*time.Second)
+	body := marshalCacheSummaryForTest(t, summary)
 	var fail atomic.Bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if fail.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		w.Header().Set("ETag", `"remote-generation-1"`)
+		w.Header().Set("ETag", `"remote-snapshot-1"`)
 		_, _ = w.Write(body)
 	}))
 	defer remote.Close()
 
 	peer := strings.TrimPrefix(remote.URL, "http://")
 	pm := peerManagerWith([]string{peer})
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	pm.refreshSummarySelection()
 	pm.pullSummary(context.Background(), peer)
 	fail.Store(true)
@@ -313,23 +331,11 @@ func TestFailedSummaryPullRetainsHintUntilTTLThenBecomesUncovered(t *testing.T) 
 
 func TestExpiredSummaryETagDoesNotPreventUnconditionalRecoveryPull(t *testing.T) {
 	oldKey, newKey := strings.Repeat("5", 64), strings.Repeat("6", 64)
-	first, err := newCacheSummary("remote", 1, []string{oldKey}, time.Now(), 200*time.Millisecond)
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstBody, err := first.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := newCacheSummary("remote", 2, []string{newKey}, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondBody, err := second.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	const firstETag = `"remote-generation-1"`
+	first := fixedCacheSummaryForKeys(t, []string{oldKey}, time.Now(), 200*time.Millisecond)
+	firstBody := marshalCacheSummaryForTest(t, first)
+	second := fixedCacheSummaryForKeys(t, []string{newKey}, time.Now(), time.Minute)
+	secondBody := marshalCacheSummaryForTest(t, second)
+	const firstETag = `"remote-snapshot-1"`
 	var calls int32
 	var staleConditional atomic.Bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -341,14 +347,14 @@ func TestExpiredSummaryETagDoesNotPreventUnconditionalRecoveryPull(t *testing.T)
 		if r.Header.Get("If-None-Match") != "" {
 			staleConditional.Store(true)
 		}
-		w.Header().Set("ETag", `"remote-generation-2"`)
+		w.Header().Set("ETag", `"remote-snapshot-2"`)
 		_, _ = w.Write(secondBody)
 	}))
 	defer remote.Close()
 
 	peer := strings.TrimPrefix(remote.URL, "http://")
 	pm := peerManagerWith([]string{peer})
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	pm.refreshSummarySelection()
 	pm.pullSummary(context.Background(), peer)
 	time.Sleep(250 * time.Millisecond)
@@ -356,7 +362,7 @@ func TestExpiredSummaryETagDoesNotPreventUnconditionalRecoveryPull(t *testing.T)
 	if staleConditional.Load() {
 		t.Fatal("pull sent If-None-Match for an expired summary")
 	}
-	if candidates := pm.SummaryCandidates(newKey, time.Now()); len(candidates) != 1 || candidates[0] != peer {
+	if candidates := summaryPositivesForTest(pm, newKey, time.Now()); len(candidates) != 1 || candidates[0] != peer {
 		t.Fatalf("unconditional recovery pull did not install new summary: candidates=%v", candidates)
 	}
 }
@@ -364,46 +370,34 @@ func TestExpiredSummaryETagDoesNotPreventUnconditionalRecoveryPull(t *testing.T)
 func TestRejectedSummaryPullDoesNotReplaceLastValidHint(t *testing.T) {
 	oldKey, newKey := strings.Repeat("3", 64), strings.Repeat("4", 64)
 	now := time.Now()
-	valid, err := newCacheSummary("remote", 1, []string{oldKey}, now, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	validBody, err := valid.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalid, err := newCacheSummary("remote", 2, []string{newKey}, now, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalidBody, err := invalid.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
+	valid := fixedCacheSummaryForKeys(t, []string{oldKey}, now, time.Minute)
+	validBody := marshalCacheSummaryForTest(t, valid)
+	invalid := fixedCacheSummaryForKeys(t, []string{newKey}, now, time.Minute)
+	invalidBody := marshalCacheSummaryForTest(t, invalid)
 	invalidBody[0] ^= 0xff
 	var serveInvalid atomic.Bool
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if serveInvalid.Load() {
-			w.Header().Set("ETag", `"remote-generation-2"`)
+			w.Header().Set("ETag", `"remote-snapshot-2"`)
 			_, _ = w.Write(invalidBody)
 			return
 		}
-		w.Header().Set("ETag", `"remote-generation-1"`)
+		w.Header().Set("ETag", `"remote-snapshot-1"`)
 		_, _ = w.Write(validBody)
 	}))
 	defer remote.Close()
 
 	peer := strings.TrimPrefix(remote.URL, "http://")
 	pm := peerManagerWith([]string{peer})
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	pm.refreshSummarySelection()
 	pm.pullSummary(context.Background(), peer)
 	serveInvalid.Store(true)
 	pm.pullSummary(context.Background(), peer)
-	if candidates := pm.SummaryCandidates(oldKey, time.Now()); len(candidates) != 1 || candidates[0] != peer {
+	if candidates := summaryPositivesForTest(pm, oldKey, time.Now()); len(candidates) != 1 || candidates[0] != peer {
 		t.Fatalf("invalid refresh replaced last valid hint: candidates=%v", candidates)
 	}
-	if candidates := pm.SummaryCandidates(newKey, time.Now()); len(candidates) != 0 {
+	if candidates := summaryPositivesForTest(pm, newKey, time.Now()); len(candidates) != 0 {
 		t.Fatalf("invalid refresh installed new key: candidates=%v", candidates)
 	}
 }
@@ -412,18 +406,12 @@ func TestOversizedPeerETagIsNotRetainedWithValidSummary(t *testing.T) {
 	peer := "peer-a:8081"
 	oldKey, newKey := strings.Repeat("7", 64), strings.Repeat("8", 64)
 	pm := peerManagerWith([]string{peer})
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	pm.refreshSummarySelection()
 
-	first, err := newCacheSummary("remote", 1, []string{oldKey}, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstBody, err := first.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	const ordinaryETag = `"generation-1"`
+	first := fixedCacheSummaryForKeys(t, []string{oldKey}, time.Now(), time.Minute)
+	firstBody := marshalCacheSummaryForTest(t, first)
+	const ordinaryETag = `"snapshot-1"`
 	if err := pm.receivePulledSummary(peer, firstBody, ordinaryETag, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -431,19 +419,13 @@ func TestOversizedPeerETagIsNotRetainedWithValidSummary(t *testing.T) {
 		t.Fatalf("ordinary ETag=%q, want %q", got, ordinaryETag)
 	}
 
-	second, err := newCacheSummary("remote", 2, []string{newKey}, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondBody, err := second.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
+	second := fixedCacheSummaryForKeys(t, []string{newKey}, time.Now(), time.Minute)
+	secondBody := marshalCacheSummaryForTest(t, second)
 	oversizedETag := `"` + strings.Repeat("x", 1<<20) + `"`
 	if err := pm.receivePulledSummary(peer, secondBody, oversizedETag, time.Now()); err != nil {
 		t.Fatalf("valid summary was rejected solely because its optional ETag was oversized: %v", err)
 	}
-	if candidates := pm.SummaryCandidates(newKey, time.Now()); len(candidates) != 1 || candidates[0] != peer {
+	if candidates := summaryPositivesForTest(pm, newKey, time.Now()); len(candidates) != 1 || candidates[0] != peer {
 		t.Fatalf("valid newer summary was not installed: candidates=%v", candidates)
 	}
 	if got := pm.summaries.etag(peer, time.Now()); got != "" {
@@ -452,13 +434,20 @@ func TestOversizedPeerETagIsNotRetainedWithValidSummary(t *testing.T) {
 }
 
 func TestSummaryClientBoundsResponseHeaders(t *testing.T) {
-	pm := NewPeerManager("test.svc", ":8081")
-	transport, ok := pm.summaryClient.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("summary transport type=%T, want *http.Transport", pm.summaryClient.Transport)
-	}
-	if transport.MaxResponseHeaderBytes != maxSummaryResponseHeaderBytes {
-		t.Fatalf("summary response-header cap=%d, want %d", transport.MaxResponseHeaderBytes, maxSummaryResponseHeaderBytes)
+	key := strings.Repeat("9", 64)
+	body := marshalCacheSummaryForTest(t, fixedCacheSummaryForKeys(t, []string{key}, time.Now(), time.Minute))
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Oversized", strings.Repeat("x", maxSummaryResponseHeaderBytes+1))
+		_, _ = w.Write(body)
+	}))
+	defer remote.Close()
+	peer := strings.TrimPrefix(remote.URL, "http://")
+	pm := peerManagerWith([]string{peer})
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	pm.refreshSummarySelection()
+	pm.pullSummary(context.Background(), peer)
+	if positive := summaryPositivesForTest(pm, key, time.Now()); len(positive) != 0 {
+		t.Fatalf("summary behind oversized response headers was retained: %v", positive)
 	}
 }
 
@@ -470,7 +459,7 @@ func TestShortSummaryPullCyclesRotateAcrossSelectedPeers(t *testing.T) {
 	var mu sync.Mutex
 	attempted := make(map[string]int, len(peers))
 	pm := peerManagerWith(peers)
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	pm.summaryPullCycleTimeout = 10 * time.Millisecond
 	pm.summaryClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		mu.Lock()
@@ -493,6 +482,31 @@ func TestShortSummaryPullCyclesRotateAcrossSelectedPeers(t *testing.T) {
 		if attempted[peer] == 0 {
 			t.Fatalf("later selected peer %q was starved across repeated deadline-limited cycles; attempts=%v", peer, attempted)
 		}
+	}
+}
+
+func TestMembershipPullPrioritizesNewlySelectedPeer(t *testing.T) {
+	oldPeers := []string{"peer-a:8081", "peer-b:8081", "peer-c:8081", "peer-d:8081"}
+	newPeer := "peer-e:8081"
+	pm := peerManagerWith(oldPeers)
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	pm.refreshSummarySelection()
+	pm.updateResolvedPeers(append(append([]string(nil), oldPeers...), newPeer), time.Now())
+
+	var mu sync.Mutex
+	var attempted []string
+	pm.summaryClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		attempted = append(attempted, req.URL.Host)
+		mu.Unlock()
+		return nil, errors.New("test pull failure")
+	})}
+	pm.pullPendingSummaryPeers(context.Background())
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attempted) != 1 || attempted[0] != newPeer {
+		t.Fatalf("membership pull attempts=%v, want only newly selected peer %q", attempted, newPeer)
 	}
 }
 
@@ -546,7 +560,7 @@ func TestSummaryPullConcurrencyIsBoundedAndCancellationStopsWork(t *testing.T) {
 	}
 
 	pm := peerManagerWith(peers)
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	store, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
 	if err != nil {
 		t.Fatal(err)
@@ -774,17 +788,7 @@ func installPositiveSummary(t *testing.T, pm *PeerManager, peer, key string) {
 
 func installPositiveSummaryForKeys(t *testing.T, pm *PeerManager, peer string, keys []string) {
 	t.Helper()
-	summary, err := newCacheSummary(peer, 1, keys, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := summary.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := pm.ReceiveSummary(peer, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	installPulledSummaryForTest(t, pm, peer, fixedCacheSummaryForKeys(t, keys, time.Now(), time.Minute), time.Now())
 }
 
 func confirmationPeer(t *testing.T, key string, hasStatus, getStatus int, data []byte, hasDelay time.Duration, hasCalls, getCalls *int32, flightSeen *atomic.Bool) string {

@@ -97,6 +97,8 @@ type DiskCache struct {
 	// summary is enabled only in summary lookup mode. It mirrors index
 	// mutations incrementally, so snapshot serving never scans the cache index.
 	summary *summaryIndex
+	// renameFile is os.Rename in production and a per-cache failure seam in tests.
+	renameFile func(string, string) error
 }
 
 const defaultCacheMaxEntries = 1_000_000
@@ -164,6 +166,7 @@ func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*Dis
 		maxEntries: defaultCacheMaxEntries,
 		order:      list.New(),
 		index:      make(map[string]*list.Element),
+		renameFile: os.Rename,
 	}
 	if len(options) > 0 {
 		if options[0].MaxEntries > 0 {
@@ -358,28 +361,42 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 		return 0, closeErr
 	}
 
-	// Now that the actual size is known, drop any prior accounting for this key
-	// (the rename below overwrites it) and evict to make room.
-	c.mu.Lock()
-	c.dropLocked(key)
-	for (c.currentSize+size > c.maxBytes || c.order.Len() >= c.maxEntries) && c.order.Len() > 0 {
-		c.evictOldest()
-	}
-	c.mu.Unlock()
-
 	path := filepath.Join(c.dir, key)
-	if err := os.Rename(tmpPath, path); err != nil {
+	renameFile := c.renameFile
+	if renameFile == nil {
+		renameFile = os.Rename
+	}
+	// Make the local metadata rename and its index/Bloom bookkeeping one atomic
+	// commit. Streaming happened above without this lock; only the short rename
+	// syscall is serialized so eviction cannot delete the replacement in between.
+	c.mu.Lock()
+	if err := renameFile(tmpPath, path); err != nil {
+		c.mu.Unlock()
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("commit cache entry: %w", err)
 	}
 
-	c.mu.Lock()
-	// addLocked drops any existing entry first: in production singleFlight
-	// serializes writes per key so the earlier drop is enough, but the guard
-	// keeps the "one entry per key" invariant (and currentSize) correct even
-	// if some future caller writes the same key concurrently — a duplicate
-	// entry would otherwise permanently inflate currentSize.
-	c.addLocked(key, size)
+	if el, replacing := c.index[key]; replacing {
+		// The key remained represented throughout the filesystem commit. Update
+		// its accounting in place so a concurrent Bloom snapshot can never see a
+		// transient negative for an already committed entry.
+		entry := el.Value.(*cacheEntry)
+		c.currentSize += size - entry.size
+		entry.size = size
+		entry.lastAccess = time.Now()
+		c.order.MoveToBack(el)
+		// Keep the replacement itself even when it exceeds maxBytes; this matches
+		// the existing oversized-object behavior. Evict older entries first.
+		for (c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries) && c.order.Len() > 1 {
+			c.evictOldest()
+		}
+		cacheSizeBytes.Set(float64(c.currentSize))
+	} else {
+		for (c.currentSize+size > c.maxBytes || c.order.Len() >= c.maxEntries) && c.order.Len() > 0 {
+			c.evictOldest()
+		}
+		c.addLocked(key, size)
+	}
 	c.mu.Unlock()
 
 	return size, nil

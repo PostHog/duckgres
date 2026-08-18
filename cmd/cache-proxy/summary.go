@@ -23,7 +23,7 @@ import (
 const (
 	summaryFormatVersion    = 2
 	cacheLayoutVersion      = 1
-	defaultSummaryTTL       = 45 * time.Second
+	defaultSummaryTTL       = 60 * time.Second
 	defaultSummaryInterval  = 20 * time.Second
 	summaryTargetFPR        = 0.01
 	summaryBloomTargetItems = 1_000_000
@@ -75,12 +75,12 @@ var (
 var (
 	summaryPullsTotal                   = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_pulls_total", Help: "Peer summary pulls by outcome"}, []string{"outcome"})
 	summaryServesTotal                  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_serves_total", Help: "Local summary endpoint responses by outcome"}, []string{"outcome"})
-	summaryReceiptsTotal                = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_receipts_total", Help: "Peer summary receipts by outcome"}, []string{"outcome"})
 	summaryResidentCount                = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_count", Help: "Current valid peer summaries"})
-	summaryResidentBytes                = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_bytes", Help: "Current valid peer summary bytes"})
+	summaryResidentBytes                = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_resident_bytes", Help: "Conservative Bloom-state memory accounting: fixed local index, transient reserve, and retained peer summaries"})
+	summaryMemoryLimitBytes             = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_memory_limit_bytes", Help: "Effective configured ceiling for total Bloom-state memory accounting"})
 	summaryAgeSeconds                   = promauto.NewHistogram(prometheus.HistogramOpts{Name: "cache_proxy_summary_age_seconds", Help: "Age of a summary used during lookup", Buckets: prometheus.ExponentialBuckets(0.1, 2, 10)})
 	summaryLookupTotal                  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_lookups_total", Help: "Summary lookup decisions"}, []string{"outcome"})
-	peerDirectGetsTotal                 = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_peer_direct_gets_total", Help: "Direct peer GET attempts in summary mode"}, []string{"outcome"})
+	summaryConfirmedGetsTotal           = promauto.NewCounterVec(prometheus.CounterOpts{Name: "cache_proxy_summary_confirmed_gets_total", Help: "Peer body GET attempts after exact summary-mode confirmation"}, []string{"outcome"})
 	summaryBloomItems                   = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_items", Help: "Current local cache keys represented by the incremental Bloom filter"})
 	summaryBloomBitsGauge               = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_bits", Help: "Allocated bits in the local incremental Bloom filter"})
 	summaryBloomHashesGauge             = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_hashes", Help: "Hash functions in the local incremental Bloom filter"})
@@ -90,7 +90,7 @@ var (
 	summaryBloomAddsTotal               = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_additions_total", Help: "Cache insertions applied to the incremental Bloom filter"})
 	summaryBloomRemovalsTotal           = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_removals_total", Help: "Cache evictions applied to the incremental Bloom filter"})
 	summaryBloomCounterSaturationsTotal = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_counter_saturations_total", Help: "Counting Bloom cells that reached uint16 saturation"})
-	summaryBloomSnapshotsTotal          = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_snapshots_total", Help: "Immutable Bloom snapshots prepared for publication"})
+	summaryBloomSnapshotsTotal          = promauto.NewCounter(prometheus.CounterOpts{Name: "cache_proxy_summary_bloom_snapshots_total", Help: "Immutable Bloom snapshots prepared for serving"})
 	summaryBloomSnapshotBytes           = promauto.NewGauge(prometheus.GaugeOpts{Name: "cache_proxy_summary_bloom_snapshot_bytes", Help: "Bytes in the most recent local Bloom snapshot"})
 )
 
@@ -114,34 +114,13 @@ func parsePeerLookupMode(value string) (peerLookupMode, error) {
 // cacheSummary is the complete versioned wire payload. []byte is base64 in
 // JSON; no raw cache locator can be recovered from the Bloom bits.
 type cacheSummary struct {
-	Version    int    `json:"v"`
-	Layout     int    `json:"l"`
-	Sender     string `json:"s"`
-	Generation uint64 `json:"g"`
-	CreatedNS  int64  `json:"c"`
-	ExpiresNS  int64  `json:"e"`
-	ItemCount  int    `json:"n"`
-	MBits      uint64 `json:"m"`
-	Hashes     uint8  `json:"k"`
-	Bits       []byte `json:"b"`
-}
-
-func newCacheSummary(sender string, generation uint64, keys []string, now time.Time, ttl time.Duration) (*cacheSummary, error) {
-	if sender == "" || generation == 0 || ttl <= 0 || len(keys) > summaryBloomTargetItems {
-		return nil, errors.New("invalid summary inputs")
-	}
-	m, k := bloomParams(len(keys))
-	if m/8 > maxSummaryBodyBytes {
-		return nil, fmt.Errorf("summary bloom exceeds %d-byte limit", maxSummaryBodyBytes)
-	}
-	s := &cacheSummary{Version: summaryFormatVersion, Layout: cacheLayoutVersion, Sender: sender, Generation: generation, CreatedNS: now.UnixNano(), ExpiresNS: now.Add(ttl).UnixNano(), ItemCount: len(keys), MBits: m, Hashes: k, Bits: make([]byte, m/8)}
-	for _, key := range keys {
-		if !IsValidCacheKey(key) {
-			return nil, errors.New("invalid cache key in summary snapshot")
-		}
-		s.add(key)
-	}
-	return s, nil
+	Version   int    `json:"v"`
+	Layout    int    `json:"l"`
+	CreatedNS int64  `json:"c"`
+	ExpiresNS int64  `json:"e"`
+	MBits     uint64 `json:"m"`
+	Hashes    uint8  `json:"k"`
+	Bits      []byte `json:"b"`
 }
 
 // summaryIndex is a bounded counting Bloom filter. Counters make eviction
@@ -230,18 +209,6 @@ func (i *summaryIndex) Snapshot() (int, []byte) {
 	return i.itemCount, append([]byte(nil), i.bits...)
 }
 
-func (i *summaryIndex) FalsePositiveRate() float64 {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return bloomFalsePositiveRate(i.itemCount, i.bitCount, i.hashes)
-}
-
-func (i *summaryIndex) Saturated() bool {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	return i.itemCount > i.targetItems
-}
-
 func (i *summaryIndex) updateMetricsLocked() {
 	summaryBloomItems.Set(float64(i.itemCount))
 	summaryBloomBitsGauge.Set(float64(i.bitCount))
@@ -291,9 +258,6 @@ func bloomHashes(key string, bits uint64, hashes uint8, fn func(uint64)) {
 	}
 }
 
-func (s *cacheSummary) add(key string) {
-	s.hashes(key, func(bit uint64) { s.Bits[bit/8] |= 1 << (bit % 8) })
-}
 func (s *cacheSummary) Contains(key string) bool {
 	if !IsValidCacheKey(key) || s.MBits == 0 || len(s.Bits) != int(s.MBits/8) {
 		return false
@@ -317,15 +281,15 @@ func (s *cacheSummary) MarshalBinary() ([]byte, error) {
 	return b, nil
 }
 
-func summaryFromIncrementalBits(sender string, generation uint64, itemCount int, bitCount uint64, hashes uint8, bits []byte, now time.Time, ttl time.Duration) *cacheSummary {
-	return &cacheSummary{Version: summaryFormatVersion, Layout: cacheLayoutVersion, Sender: sender, Generation: generation, CreatedNS: now.UnixNano(), ExpiresNS: now.Add(ttl).UnixNano(), ItemCount: itemCount, MBits: bitCount, Hashes: hashes, Bits: bits}
+func summaryFromIncrementalBits(bitCount uint64, hashes uint8, bits []byte, now time.Time, ttl time.Duration) *cacheSummary {
+	return &cacheSummary{Version: summaryFormatVersion, Layout: cacheLayoutVersion, CreatedNS: now.UnixNano(), ExpiresNS: now.Add(ttl).UnixNano(), MBits: bitCount, Hashes: hashes, Bits: bits}
 }
 
-func newIncrementalCacheSummary(sender string, generation uint64, itemCount int, bits []byte, now time.Time, ttl time.Duration) (*cacheSummary, error) {
-	if sender == "" || generation == 0 || ttl <= 0 || itemCount < 0 || len(bits) != int(summaryBloomBits/8) {
+func newIncrementalCacheSummary(bits []byte, now time.Time, ttl time.Duration) (*cacheSummary, error) {
+	if ttl <= 0 || len(bits) != int(summaryBloomBits/8) {
 		return nil, errors.New("invalid incremental summary inputs")
 	}
-	return summaryFromIncrementalBits(sender, generation, itemCount, summaryBloomBits, summaryBloomHashes, bits, now, ttl), nil
+	return summaryFromIncrementalBits(summaryBloomBits, summaryBloomHashes, bits, now, ttl), nil
 }
 func parseCacheSummary(body []byte, now time.Time) (*cacheSummary, error) {
 	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
@@ -337,16 +301,10 @@ func parseCacheSummary(body []byte, now time.Time) (*cacheSummary, error) {
 	if err := decoder.Decode(&s); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return nil, errors.New("invalid summary encoding")
 	}
-	if s.Version != summaryFormatVersion || s.Layout != cacheLayoutVersion || s.Sender == "" || len(s.Sender) > 253 || strings.ContainsAny(s.Sender, "\r\n") || s.Generation == 0 {
+	if s.Version != summaryFormatVersion || s.Layout != cacheLayoutVersion {
 		return nil, errors.New("incompatible summary")
 	}
-	if s.ItemCount < 0 {
-		return nil, errors.New("invalid bloom parameters")
-	}
-	wantBits, wantHashes := bloomParams(s.ItemCount)
-	dynamicParams := s.MBits == wantBits && s.Hashes == wantHashes
-	incrementalParams := s.MBits == summaryBloomBits && s.Hashes == summaryBloomHashes
-	if (!dynamicParams && !incrementalParams) || s.MBits/8 > maxSummaryBodyBytes || len(s.Bits) != int(s.MBits/8) {
+	if s.MBits != summaryBloomBits || s.Hashes != summaryBloomHashes || len(s.Bits) != int(summaryBloomBits/8) {
 		return nil, errors.New("invalid bloom parameters")
 	}
 	created, expires := time.Unix(0, s.CreatedNS), time.Unix(0, s.ExpiresNS)
@@ -379,7 +337,7 @@ type summaryStore struct {
 	bytes   int
 }
 
-func (st *summaryStore) receive(peer string, body []byte, etag string, now time.Time, member func(string) bool, remoteBudget int, identity string) error {
+func (st *summaryStore) receive(peer string, body []byte, etag string, now time.Time, member func(string) bool, remoteBudget int) error {
 	s, err := parseCacheSummary(body, now)
 	if err != nil {
 		return err
@@ -389,41 +347,20 @@ func (st *summaryStore) receive(peer string, body []byte, etag string, now time.
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if old, ok := st.records[peer]; ok && old.summary.Generation >= s.Generation {
-		return errors.New("stale summary generation")
-	}
 	residentBytes := len(s.Bits)
 	if residentBytes > remoteBudget {
 		return errors.New("summary exceeds remote memory budget")
 	}
-	candidates := make(map[string]summaryRecord, len(st.records)+1)
-	for addr, rec := range st.records {
-		candidates[addr] = rec
+	oldBytes := 0
+	if old, ok := st.records[peer]; ok {
+		oldBytes = old.bytes
 	}
-	candidates[peer] = summaryRecord{summary: s, bytes: residentBytes, etag: boundedSummaryETag(etag)}
-	type candidate struct {
-		addr string
-		rec  summaryRecord
-		rank [sha256.Size]byte
-	}
-	ranked := make([]candidate, 0, len(candidates))
-	for addr, rec := range candidates {
-		ranked = append(ranked, candidate{addr: addr, rec: rec, rank: sha256.Sum256([]byte(identity + "\x00" + addr))})
-	}
-	sort.Slice(ranked, func(i, j int) bool { return bytes.Compare(ranked[i].rank[:], ranked[j].rank[:]) < 0 })
-	kept := make(map[string]summaryRecord, len(ranked))
-	used := 0
-	for _, candidate := range ranked {
-		if used+candidate.rec.bytes > remoteBudget {
-			continue
-		}
-		kept[candidate.addr] = candidate.rec
-		used += candidate.rec.bytes
-	}
-	if _, keptIncoming := kept[peer]; !keptIncoming {
+	used := st.bytes - oldBytes + residentBytes
+	if used > remoteBudget {
 		return errors.New("summary remote memory budget exhausted")
 	}
-	st.records, st.bytes = kept, used
+	st.records[peer] = summaryRecord{summary: s, bytes: residentBytes, etag: boundedSummaryETag(etag)}
+	st.bytes = used
 	return nil
 }
 
@@ -458,21 +395,10 @@ func (st *summaryStore) removePeer(peer string) {
 	}
 }
 
-func (st *summaryStore) removeNonMembers(member func(string) bool, now time.Time) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	for peer, rec := range st.records {
-		if !member(peer) || time.Unix(0, rec.summary.ExpiresNS).Before(now) {
-			delete(st.records, peer)
-			st.bytes -= rec.bytes
-		}
-	}
-}
 func (st *summaryStore) candidates(key string, members []string, now time.Time) (positive, uncovered []string) {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
-	type candidate struct{ addr, identity string }
-	var cs []candidate
+	var candidates []string
 	for _, peer := range members {
 		rec, covered := st.records[peer]
 		if !covered || !time.Unix(0, rec.summary.ExpiresNS).After(now) {
@@ -481,20 +407,16 @@ func (st *summaryStore) candidates(key string, members []string, now time.Time) 
 		}
 		if rec.summary.Contains(key) {
 			summaryAgeSeconds.Observe(now.Sub(time.Unix(0, rec.summary.CreatedNS)).Seconds())
-			cs = append(cs, candidate{peer, rec.summary.Sender})
+			candidates = append(candidates, peer)
 		}
 	}
-	sort.Slice(cs, func(i, j int) bool {
-		a, b := rankPeer(key, cs[i].identity, cs[i].addr), rankPeer(key, cs[j].identity, cs[j].addr)
+	sort.Slice(candidates, func(i, j int) bool {
+		a, b := rankPeer(key, candidates[i]), rankPeer(key, candidates[j])
 		return bytes.Compare(a[:], b[:]) < 0
 	})
-	positive = make([]string, len(cs))
-	for i := range cs {
-		positive[i] = cs[i].addr
-	}
-	return positive, uncovered
+	return candidates, uncovered
 }
 
-func rankPeer(key, identity, addr string) [sha256.Size]byte {
-	return sha256.Sum256([]byte(key + "\x00" + identity + "\x00" + addr))
+func rankPeer(key, addr string) [sha256.Size]byte {
+	return sha256.Sum256([]byte(key + "\x00" + addr))
 }

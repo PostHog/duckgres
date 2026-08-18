@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,21 +12,68 @@ import (
 	"time"
 )
 
-func TestCacheSummaryContainsSnapshotKeysButNotRawKeys(t *testing.T) {
-	keys := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
-	s, err := newCacheSummary("peer-a", 1, keys, time.Now(), defaultSummaryTTL)
+func fixedCacheSummaryForKeys(t testing.TB, keys []string, now time.Time, ttl time.Duration) *cacheSummary {
+	t.Helper()
+	bits := make([]byte, summaryBloomBits/8)
+	for _, key := range keys {
+		if !IsValidCacheKey(key) {
+			t.Fatalf("invalid test cache key %q", key)
+		}
+		bloomHashes(key, summaryBloomBits, summaryBloomHashes, func(bit uint64) {
+			bits[bit/8] |= 1 << (bit % 8)
+		})
+	}
+	summary, err := newIncrementalCacheSummary(bits, now, ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return summary
+}
+
+func marshalCacheSummaryForTest(t testing.TB, summary *cacheSummary) []byte {
+	t.Helper()
+	body, err := summary.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func installPulledSummaryForTest(t testing.TB, pm *PeerManager, peer string, summary *cacheSummary, now time.Time) {
+	t.Helper()
+	pm.refreshSummarySelection()
+	if err := pm.receivePulledSummary(peer, marshalCacheSummaryForTest(t, summary), "", now); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func summaryPositivesForTest(pm *PeerManager, key string, now time.Time) []string {
+	positive, _ := pm.SummaryLookup(key, now)
+	return positive
+}
+
+func localSummaryBodyForTest(pm *PeerManager) []byte {
+	body, _ := pm.localSummarySnapshot()
+	return append([]byte(nil), body...)
+}
+
+func TestSummaryTTLCoversTwoWorstCaseSyncIntervals(t *testing.T) {
+	maxSyncInterval := defaultSummaryInterval + defaultSummaryInterval/5
+	minimumTTL := 2*maxSyncInterval + summaryPullTimeout
+	if defaultSummaryTTL < minimumTTL {
+		t.Fatalf("summary TTL %s is shorter than two worst-case sync intervals plus pull margin %s", defaultSummaryTTL, minimumTTL)
+	}
+}
+
+func TestCacheSummaryContainsSnapshotKeysButNotRawKeys(t *testing.T) {
+	keys := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	s := fixedCacheSummaryForKeys(t, keys, time.Now(), defaultSummaryTTL)
 	for _, key := range keys {
 		if !s.Contains(key) {
 			t.Fatalf("summary omitted source key %q", key)
 		}
 	}
-	body, err := s.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
+	body := marshalCacheSummaryForTest(t, s)
 	for _, secret := range append(keys, "https://bucket.example/object?X-Amz-Signature=secret") {
 		if bytes.Contains(body, []byte(secret)) {
 			t.Fatalf("wire summary leaked raw cache locator %q", secret)
@@ -33,85 +81,17 @@ func TestCacheSummaryContainsSnapshotKeysButNotRawKeys(t *testing.T) {
 	}
 }
 
-func TestReceiveSummaryRejectsInvalidWithoutReplacingLastValid(t *testing.T) {
-	pm := peerManagerWith([]string{"peer-a:8081"})
-	now := time.Now()
-	valid, err := newCacheSummary("peer-a:8081", 1, []string{strings.Repeat("a", 64)}, now, time.Minute)
-	if err != nil {
+func TestCacheSummaryWireOmitsPushEraMetadata(t *testing.T) {
+	s := fixedCacheSummaryForKeys(t, nil, time.Now(), defaultSummaryTTL)
+	body := marshalCacheSummaryForTest(t, s)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
 		t.Fatal(err)
 	}
-	body, _ := valid.MarshalBinary()
-	if err := pm.ReceiveSummary("peer-a:8081", body, now); err != nil {
-		t.Fatalf("receive valid summary: %v", err)
-	}
-	bad := append([]byte(nil), body...)
-	bad[0] ^= 0xff
-	if err := pm.ReceiveSummary("peer-a:8081", bad, now); err == nil {
-		t.Fatal("malformed summary accepted")
-	}
-	if got := pm.summaryCount(); got != 1 {
-		t.Fatalf("invalid summary replaced last valid one; count=%d", got)
-	}
-}
-
-func TestSummaryReplacementExpiryAndMembershipCleanup(t *testing.T) {
-	peer := "peer-a:8081"
-	pm := peerManagerWith([]string{peer})
-	now := time.Now()
-	old, _ := newCacheSummary("node-a", 1, []string{strings.Repeat("a", 64)}, now, time.Minute)
-	oldBody, _ := old.MarshalBinary()
-	if err := pm.ReceiveSummary(peer, oldBody, now); err != nil {
-		t.Fatal(err)
-	}
-	newer, _ := newCacheSummary("node-a", 2, []string{strings.Repeat("b", 64)}, now, time.Minute)
-	newerBody, _ := newer.MarshalBinary()
-	if err := pm.ReceiveSummary(peer, newerBody, now); err != nil {
-		t.Fatal(err)
-	}
-	if got := pm.SummaryCandidates(strings.Repeat("a", 64), now); len(got) != 0 {
-		t.Fatalf("old generation remained selectable: %v", got)
-	}
-	if got := pm.SummaryCandidates(strings.Repeat("b", 64), now); len(got) != 1 {
-		t.Fatalf("new generation was not installed: %v", got)
-	}
-	pm.summaries.removeNonMembers(pm.isMember, now.Add(2*time.Minute))
-	if pm.summaryCount() != 0 {
-		t.Fatal("expired summary remained resident")
-	}
-	if err := pm.ReceiveSummary(peer, newerBody, now); err != nil {
-		t.Fatal(err)
-	}
-	pm.mu.Lock()
-	pm.peers = nil
-	pm.mu.Unlock()
-	pm.summaries.removeNonMembers(pm.isMember, now)
-	if pm.summaryCount() != 0 {
-		t.Fatal("departed peer summary remained resident")
-	}
-}
-
-func TestSummaryReceiptRevalidatesSelectionAfterCommit(t *testing.T) {
-	peer := "peer-a:8081"
-	s, err := newCacheSummary("peer-a", 1, nil, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := s.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pm := NewPeerManager("test.svc", ":8081")
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
-	checks := 0
-	eligible := func(string) bool {
-		checks++
-		return checks == 1
-	}
-	if err := pm.receiveSummary(peer, body, "", time.Now(), eligible); err == nil {
-		t.Fatal("receipt succeeded after the sender became deselected during commit")
-	}
-	if pm.summaryCount() != 0 {
-		t.Fatal("deselected peer was reinserted after membership cleanup")
+	for _, field := range []string{"s", "g", "n"} {
+		if _, ok := fields[field]; ok {
+			t.Fatalf("pull summary retained obsolete wire field %q", field)
+		}
 	}
 }
 
@@ -175,7 +155,7 @@ func TestSummaryPullCycleHasTotalDeadline(t *testing.T) {
 	}
 
 	pm := peerManagerWith(peers)
-	pm.ConfigureSummary(peerLookupSummary, "receiver")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	pm.summaryPullCycleTimeout = 50 * time.Millisecond
 	started := time.Now()
 	pm.pullSummaries(context.Background(), peers)
@@ -193,40 +173,6 @@ func TestSummaryCycleCadenceIncludesPullWork(t *testing.T) {
 	}
 	if got := remainingSummaryCycleDelay(started, started.Add(25*time.Second), 20*time.Second); got != 0 {
 		t.Fatalf("overdue cycle delay=%s, want immediate", got)
-	}
-}
-
-func TestSummaryCandidatesAreComputedLocallyWithoutPeerRPC(t *testing.T) {
-	key := strings.Repeat("c", 64)
-	var hasCalls, getCalls int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/cache/has":
-			hasCalls++
-			w.WriteHeader(http.StatusOK)
-		case "/cache/get":
-			getCalls++
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-	addr := strings.TrimPrefix(server.URL, "http://")
-	pm := peerManagerWith([]string{addr})
-	pm.lookupMode = peerLookupSummary
-	s, err := newCacheSummary(addr, 1, []string{key}, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(addr, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	candidates := pm.SummaryCandidates(key, time.Now())
-	if len(candidates) != 1 {
-		t.Fatalf("candidates=%v, want one", candidates)
-	}
-	if hasCalls != 0 || getCalls != 0 {
-		t.Fatalf("has=%d get=%d, want no RPC during local Bloom lookup", hasCalls, getCalls)
 	}
 }
 
@@ -251,12 +197,8 @@ func TestFetchDedupSummaryHitPreservesPeerSourceAfterConfirmation(t *testing.T) 
 	defer origin.Close()
 	addr := strings.TrimPrefix(peer.URL, "http://")
 	pm := peerManagerWith([]string{addr})
-	pm.lookupMode = peerLookupSummary
-	s, _ := newCacheSummary("node-a", 1, []string{key}, time.Now(), time.Minute)
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(addr, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	installPulledSummaryForTest(t, pm, addr, fixedCacheSummaryForKeys(t, []string{key}, time.Now(), time.Minute), time.Now())
 	p := NewCacheProxy(newTestCache(t), pm, nil)
 	p.client = origin.Client()
 	r := httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil)
@@ -276,34 +218,15 @@ func TestFetchDedupSummaryHitPreservesPeerSourceAfterConfirmation(t *testing.T) 
 func TestSummaryLookupReportsOnlyUncoveredPeersForWarmupProbes(t *testing.T) {
 	covered, uncovered := "covered:8081", "uncovered:8081"
 	pm := peerManagerWith([]string{covered, uncovered})
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
 	key := strings.Repeat("e", 64)
-	s, err := newCacheSummary("node-covered", 1, []string{strings.Repeat("f", 64)}, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(covered, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	installPulledSummaryForTest(t, pm, covered, fixedCacheSummaryForKeys(t, []string{strings.Repeat("f", 64)}, time.Now(), time.Minute), time.Now())
 	positive, missing := pm.SummaryLookup(key, time.Now())
 	if len(positive) != 0 {
 		t.Fatalf("positive peers = %v, want none", positive)
 	}
 	if len(missing) != 1 || missing[0] != uncovered {
 		t.Fatalf("uncovered peers = %v, want %q", missing, uncovered)
-	}
-}
-
-func TestSummaryRejectsBloomParametersNotDerivedFromItemCount(t *testing.T) {
-	s, err := newCacheSummary("peer-a", 1, []string{strings.Repeat("a", 64)}, time.Now(), time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.MBits += 8
-	s.Bits = append(s.Bits, 0)
-	body, _ := s.MarshalBinary()
-	if _, err := parseCacheSummary(body, time.Now()); err == nil {
-		t.Fatal("accepted a Bloom filter larger than the declared item count requires")
 	}
 }
 
@@ -328,12 +251,8 @@ func TestSummaryFetchDoesNotCancelHealthyBodyAfterProbeTimeout(t *testing.T) {
 	defer peer.Close()
 	addr := strings.TrimPrefix(peer.URL, "http://")
 	pm := peerManagerWith([]string{addr})
-	pm.lookupMode = peerLookupSummary
-	s, _ := newCacheSummary("node-a", 1, []string{key}, time.Now(), time.Minute)
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(addr, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	installPulledSummaryForTest(t, pm, addr, fixedCacheSummaryForKeys(t, []string{key}, time.Now(), time.Minute), time.Now())
 	p := NewCacheProxy(newTestCache(t), pm, nil)
 	r := httptest.NewRequest(http.MethodGet, "http://origin.test/object", nil)
 	got, err := p.fetchDedup(key, r, "")
@@ -353,12 +272,8 @@ func TestSummaryWarmupProbesOnlyPeersWithoutSummaries(t *testing.T) {
 	}))
 	defer origin.Close()
 	pm := peerManagerWith([]string{covered, uncovered})
-	pm.lookupMode = peerLookupSummary
-	s, _ := newCacheSummary("covered", 1, []string{other}, time.Now(), time.Minute)
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(covered, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	installPulledSummaryForTest(t, pm, covered, fixedCacheSummaryForKeys(t, []string{other}, time.Now(), time.Minute), time.Now())
 	p := NewCacheProxy(newTestCache(t), pm, nil)
 	p.client = origin.Client()
 	r := httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil)
@@ -381,12 +296,8 @@ func TestFullyCoveredSummaryNegativeGoesDirectlyToOrigin(t *testing.T) {
 	}))
 	defer origin.Close()
 	pm := peerManagerWith([]string{peer})
-	pm.lookupMode = peerLookupSummary
-	s, _ := newCacheSummary("peer", 1, []string{other}, time.Now(), time.Minute)
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(peer, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	installPulledSummaryForTest(t, pm, peer, fixedCacheSummaryForKeys(t, []string{other}, time.Now(), time.Minute), time.Now())
 	p := NewCacheProxy(newTestCache(t), pm, nil)
 	p.client = origin.Client()
 	r := httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil)
@@ -410,18 +321,12 @@ func TestJoiningPeerIsProbedUntilItsSummaryArrives(t *testing.T) {
 	}))
 	defer origin.Close()
 	pm := peerManagerWith([]string{covered})
-	pm.lookupMode = peerLookupSummary
-	s, _ := newCacheSummary("covered", 1, []string{other}, time.Now(), time.Minute)
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(covered, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	installPulledSummaryForTest(t, pm, covered, fixedCacheSummaryForKeys(t, []string{other}, time.Now(), time.Minute), time.Now())
 
 	// DNS membership changes before this proxy has received the new peer's
 	// summary. That peer is intentionally the only one left on probe fallback.
-	pm.mu.Lock()
-	pm.peers = append(pm.peers, joining)
-	pm.mu.Unlock()
+	pm.updateResolvedPeers([]string{covered, joining}, time.Now())
 	p := NewCacheProxy(newTestCache(t), pm, nil)
 	p.client = origin.Client()
 	got, err := p.fetchDedup(key, httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil), "")
@@ -443,15 +348,9 @@ func TestDepartedPeerIsNeverSelectedFromAStaleSummary(t *testing.T) {
 	}))
 	defer origin.Close()
 	pm := peerManagerWith([]string{peer})
-	pm.lookupMode = peerLookupSummary
-	s, _ := newCacheSummary("departed", 1, []string{key}, time.Now(), time.Minute)
-	body, _ := s.MarshalBinary()
-	if err := pm.ReceiveSummary(peer, body, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	pm.mu.Lock()
-	pm.peers = nil
-	pm.mu.Unlock()
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	installPulledSummaryForTest(t, pm, peer, fixedCacheSummaryForKeys(t, []string{key}, time.Now(), time.Minute), time.Now())
+	pm.updateResolvedPeers(nil, time.Now())
 	p := NewCacheProxy(newTestCache(t), pm, nil)
 	p.client = origin.Client()
 	got, err := p.fetchDedup(key, httptest.NewRequest(http.MethodGet, origin.URL+"/object", nil), "")
@@ -473,7 +372,7 @@ func TestIncrementalSummaryIndexTracksInsertionsAndEvictions(t *testing.T) {
 	if count != len(keys) {
 		t.Fatalf("entry count = %d, want %d", count, len(keys))
 	}
-	s := summaryFromIncrementalBits("peer-a", 1, count, 128, 3, bits, time.Now(), time.Minute)
+	s := summaryFromIncrementalBits(128, 3, bits, time.Now(), time.Minute)
 	for _, key := range keys {
 		if !s.Contains(key) {
 			t.Fatalf("incremental filter omitted inserted key %q", key)
@@ -484,7 +383,7 @@ func TestIncrementalSummaryIndexTracksInsertionsAndEvictions(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("entry count after eviction = %d, want 2", count)
 	}
-	s = summaryFromIncrementalBits("peer-a", 2, count, 128, 3, bits, time.Now(), time.Minute)
+	s = summaryFromIncrementalBits(128, 3, bits, time.Now(), time.Minute)
 	if !s.Contains(keys[0]) || !s.Contains(keys[2]) {
 		t.Fatal("eviction cleared a bit shared by a remaining key")
 	}
@@ -499,15 +398,15 @@ func TestIncrementalSummaryIndexContinuesPastCapacityAndReportsFPR(t *testing.T)
 	if count != 3 {
 		t.Fatalf("entry count = %d, want entries beyond capacity retained", count)
 	}
-	if fpr := index.FalsePositiveRate(); fpr <= 0 {
+	if fpr := bloomFalsePositiveRate(count, index.bitCount, index.hashes); fpr <= 0 {
 		t.Fatalf("FPR = %v, want positive value", fpr)
 	}
-	if !index.Saturated() {
+	if count <= index.targetItems {
 		t.Fatal("index should report saturation after capacity is exceeded")
 	}
 }
 
-func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.T) {
+func TestDiskCacheIncrementallyUpdatesSummaryBloomOnPutAndEviction(t *testing.T) {
 	cache, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
 	if err != nil {
 		t.Fatal(err)
@@ -521,7 +420,7 @@ func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.
 	if !ok || items != 1 {
 		t.Fatalf("summary snapshot available=%t items=%d, want true/1", ok, items)
 	}
-	s := summaryFromIncrementalBits("peer-a", 1, items, summaryBloomBits, summaryBloomHashes, bits, time.Now(), time.Minute)
+	s := summaryFromIncrementalBits(summaryBloomBits, summaryBloomHashes, bits, time.Now(), time.Minute)
 	if !s.Contains(first) {
 		t.Fatal("served Bloom snapshot omitted committed cache entry")
 	}
@@ -534,84 +433,49 @@ func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.
 	}
 }
 
-func TestSnapshotServingContinuesPastBloomTargetCapacity(t *testing.T) {
-	cache, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
+func TestSummaryMemoryMetricsIncludeLocalTransientAndRemoteState(t *testing.T) {
+	peer := "peer-a:8081"
+	bits := make([]byte, summaryBloomBits/8)
+	limit := summaryMemoryReserveBytes() + int64(len(bits))
+	pm := peerManagerWith([]string{peer})
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{MemoryLimitBytes: limit})
+	pm.refreshSummarySelection()
+
+	if got := int64(gaugeValue(t, summaryMemoryLimitBytes)); got != limit {
+		t.Fatalf("summary memory limit metric=%d, want %d", got, limit)
+	}
+	if got := int64(gaugeValue(t, summaryResidentBytes)); got != summaryMemoryReserveBytes() {
+		t.Fatalf("summary resident bytes before remote receipt=%d, want fixed/transient reserve %d", got, summaryMemoryReserveBytes())
+	}
+
+	s, err := newIncrementalCacheSummary(bits, time.Now(), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cache.summary.mu.Lock()
-	cache.summary.itemCount = summaryBloomTargetItems + 1
-	cache.summary.mu.Unlock()
-	pm := peerManagerWith(nil)
-	pm.ConfigureSummary(peerLookupSummary, "snapshot-server")
-	pm.buildLocalSummary(cache)
-	body := pm.localSummaryCopy()
-	got, err := parseCacheSummary(body, time.Now())
-	if err != nil {
-		t.Fatalf("snapshot server skipped an over-target summary: %v", err)
+	if err := pm.receivePulledSummary(peer, marshalCacheSummaryForTest(t, s), "", time.Now()); err != nil {
+		t.Fatal(err)
 	}
-	if got.ItemCount != summaryBloomTargetItems+1 || got.MBits != summaryBloomBits || got.Hashes != summaryBloomHashes {
-		t.Fatalf("served summary = items=%d bits=%d hashes=%d", got.ItemCount, got.MBits, got.Hashes)
+	wantResident := summaryMemoryReserveBytes() + int64(len(bits))
+	if got := int64(gaugeValue(t, summaryResidentBytes)); got != wantResident {
+		t.Fatalf("summary resident bytes after remote receipt=%d, want %d", got, wantResident)
 	}
 }
 
-func TestSummaryFallbackProbesAreBounded(t *testing.T) {
-	key := strings.Repeat("b", 64)
-	var hasCalls int32
-	peers := make([]string, 0, 8)
-	for range 8 {
-		peers = append(peers, newPeerServer(t, key, nil, http.StatusNotFound, &hasCalls, nil))
+func TestSummaryMemoryMetricsAreZeroOutsideSummaryMode(t *testing.T) {
+	pm := NewPeerManager("test.svc", ":8081")
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	if got := int64(gaugeValue(t, summaryMemoryLimitBytes)); got != defaultSummaryMemoryLimitBytes {
+		t.Fatalf("default summary memory limit metric=%d, want %d", got, defaultSummaryMemoryLimitBytes)
 	}
-	pm := peerManagerWith(peers)
-	pm.ConfigureSummary(peerLookupSummary, "requester", SummaryConfig{PeerMaxProbes: 5, MaxPeerProbesInFlight: 5})
-	if _, _, found, selected := pm.LocateKeyAmong(context.Background(), key, peers, pm.peerMaxProbes); found || selected != 5 {
-		t.Fatalf("found=%t selected=%d, want false/5", found, selected)
+	if got := int64(gaugeValue(t, summaryResidentBytes)); got != summaryMemoryReserveBytes() {
+		t.Fatalf("default summary resident metric=%d, want reserve %d", got, summaryMemoryReserveBytes())
 	}
-	if got := atomic.LoadInt32(&hasCalls); got != 5 {
-		t.Fatalf("physical probes=%d, want 5", got)
-	}
-}
 
-func TestSummaryFallbackSkipsWhenProbeCapacityIsExhausted(t *testing.T) {
-	key := strings.Repeat("c", 64)
-	var hasCalls int32
-	peer := newPeerServer(t, key, nil, http.StatusNotFound, &hasCalls, nil)
-	pm := peerManagerWith([]string{peer})
-	pm.ConfigureSummary(peerLookupSummary, "requester", SummaryConfig{PeerMaxProbes: 5, MaxPeerProbesInFlight: 1})
-	pm.probePermits <- struct{}{}
-	defer func() { <-pm.probePermits }()
-	if _, _, found, _ := pm.LocateKeyAmong(context.Background(), key, []string{peer}, pm.peerMaxProbes); found {
-		t.Fatal("probe found a peer despite exhausted permit capacity")
+	pm.ConfigureSummary(peerLookupProbe, "receiver", SummaryConfig{})
+	if got := gaugeValue(t, summaryMemoryLimitBytes); got != 0 {
+		t.Fatalf("probe-mode summary memory limit metric=%v, want 0", got)
 	}
-	if got := atomic.LoadInt32(&hasCalls); got != 0 {
-		t.Fatalf("physical probes=%d, want 0 when capacity is exhausted", got)
-	}
-}
-
-func TestSummaryMemoryBudgetRetainsOnlyPeersThatFit(t *testing.T) {
-	peers := []string{"peer-a:8081", "peer-b:8081"}
-	bits := make([]byte, summaryBloomBits/8)
-	rawBits := int64(summaryBloomBits / 8)
-	// During a rebuild, both the currently served and next encoded bodies are
-	// live alongside the copied raw bits.
-	reserve := rawBits + int64(summaryBloomBits)*2 + 2*int64(maxSummaryBodyBytes) + rawBits + int64(maxSummaryPulls)*(int64(maxSummaryBodyBytes)+rawBits+maxSummaryResponseHeaderBytes)
-	pm := peerManagerWith(peers)
-	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{MemoryLimitBytes: reserve + int64(len(bits))})
-	for i, peer := range peers {
-		s, err := newIncrementalCacheSummary(peer, uint64(i+1), 0, append([]byte(nil), bits...), time.Now(), time.Minute)
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, _ := s.MarshalBinary()
-		_ = pm.ReceiveSummary(peer, body, time.Now())
-	}
-	if got := pm.summaryCount(); got != 1 {
-		t.Fatalf("retained summary count=%d, want one within the configured budget", got)
-	}
-	pm.summaries.mu.RLock()
-	used := pm.summaries.bytes
-	pm.summaries.mu.RUnlock()
-	if used > len(bits) {
-		t.Fatalf("retained bytes=%d exceed one-summary budget=%d", used, len(bits))
+	if got := gaugeValue(t, summaryResidentBytes); got != 0 {
+		t.Fatalf("probe-mode summary resident metric=%v, want 0", got)
 	}
 }
