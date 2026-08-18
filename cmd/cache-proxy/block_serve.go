@@ -243,6 +243,10 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	// merely per block. Remaining block misses safely coalesce to origin.
 	summaryGetsLeft := 2
 	summaryLookupRecorded := false
+	summaryProbesLeft := 0
+	if p.peers != nil {
+		summaryProbesLeft = p.peers.peerMaxProbes
+	}
 	flushRun := func(runEnd int64) bool {
 		if missRunStart < 0 {
 			return true
@@ -338,9 +342,12 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 					}
 					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
 				}
-				if len(positive) == 0 {
-					if holder, flight, found := p.peers.LocateKeyAmong(r.Context(), key, uncovered); found {
+				if len(positive) == 0 && summaryProbesLeft > 0 {
+					if holder, flight, found, selected := p.peers.LocateKeyAmong(r.Context(), key, uncovered, summaryProbesLeft); found {
+						summaryProbesLeft -= selected
 						_, ok = p.peers.FetchFromPeer(r.Context(), holder, key, flight, func(rd io.Reader) (int64, error) { return p.store.PutStream(key, rd) })
+					} else {
+						summaryProbesLeft -= selected
 					}
 				}
 			} else if holder, flight, found := p.peers.LocateKey(r.Context(), key); found {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -208,6 +209,48 @@ func TestDiskCacheEviction(t *testing.T) {
 	// The most recent must still be present.
 	if !c.Has(keys[2]) {
 		t.Error("newest entry should still be cached")
+	}
+}
+
+func TestDiskCacheEntryLimitEvictsOldest(t *testing.T) {
+	c := newTestCache(t)
+	c.maxEntries = 2
+	keys := []string{strings.Repeat("4", 64), strings.Repeat("5", 64), strings.Repeat("6", 64)}
+	for _, key := range keys {
+		if _, err := c.PutStream(key, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c.order.Len() != 2 || c.Has(keys[0]) || !c.Has(keys[1]) || !c.Has(keys[2]) {
+		t.Fatalf("entry-limited cache retained unexpected keys: len=%d first=%t second=%t third=%t", c.order.Len(), c.Has(keys[0]), c.Has(keys[1]), c.Has(keys[2]))
+	}
+}
+
+func TestDiskCacheEntryLimitAppliesDuringStartupScan(t *testing.T) {
+	dir := t.TempDir()
+	entries := []struct {
+		key  string
+		when time.Time
+	}{
+		{strings.Repeat("7", 64), time.Now().Add(-2 * time.Hour)},
+		{strings.Repeat("8", 64), time.Now().Add(-time.Hour)},
+		{strings.Repeat("9", 64), time.Now()},
+	}
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.key)
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, entry.when, entry.when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, err := NewDiskCache(dir, 100, DiskCacheOptions{MaxEntries: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.order.Len() != 2 || c.Has(entries[0].key) || !c.Has(entries[1].key) || !c.Has(entries[2].key) {
+		t.Fatalf("startup scan did not retain newest two entries")
 	}
 }
 

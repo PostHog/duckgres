@@ -241,6 +241,7 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups in either mode. |
 | `cache_proxy_peer_hits_total` | Counter | None | Logical peer lookups followed by a successful peer body transfer. |
 | `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical `/cache/has` attempts only. In pushed-summary mode it approaches zero once every discovered peer has supplied a valid summary; uncovered joining peers temporarily retain probe fallback. |
+| `cache_proxy_peer_probes_skipped_total` | Counter | None | Summary-mode fallback probes skipped because the pod's in-flight probe budget was exhausted; those requests fall back to origin. |
 | `cache_proxy_summary_pushes_total` | Counter | `outcome` | Bounded summary publication outcomes. |
 | `cache_proxy_summary_receipts_total` | Counter | `outcome` | Accepted or rejected peer summary bodies. |
 | `cache_proxy_summary_resident_count` / `cache_proxy_summary_resident_bytes` | Gauge | None | Current bounded peer-summary state. |

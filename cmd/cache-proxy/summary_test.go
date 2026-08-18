@@ -418,7 +418,7 @@ func TestIncrementalSummaryIndexContinuesPastCapacityAndReportsFPR(t *testing.T)
 }
 
 func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.T) {
-	cache, err := NewDiskCache(t.TempDir(), 100, true)
+	cache, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestDiskCacheIncrementallyUpdatesPublishedBloomOnPutAndEviction(t *testing.
 }
 
 func TestPublisherContinuesPastBloomTargetCapacity(t *testing.T) {
-	cache, err := NewDiskCache(t.TempDir(), 100, true)
+	cache, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,5 +462,63 @@ func TestPublisherContinuesPastBloomTargetCapacity(t *testing.T) {
 	}
 	if got.ItemCount != summaryBloomTargetItems+1 || got.MBits != summaryBloomBits || got.Hashes != summaryBloomHashes {
 		t.Fatalf("published summary = items=%d bits=%d hashes=%d", got.ItemCount, got.MBits, got.Hashes)
+	}
+}
+
+func TestSummaryFallbackProbesAreBounded(t *testing.T) {
+	key := strings.Repeat("b", 64)
+	var hasCalls int32
+	peers := make([]string, 0, 8)
+	for range 8 {
+		peers = append(peers, newPeerServer(t, key, nil, http.StatusNotFound, &hasCalls, nil))
+	}
+	pm := peerManagerWith(peers)
+	pm.ConfigureSummary(peerLookupSummary, "requester", SummaryConfig{PeerMaxProbes: 5, MaxPeerProbesInFlight: 5})
+	if _, _, found, selected := pm.LocateKeyAmong(context.Background(), key, peers, pm.peerMaxProbes); found || selected != 5 {
+		t.Fatalf("found=%t selected=%d, want false/5", found, selected)
+	}
+	if got := atomic.LoadInt32(&hasCalls); got != 5 {
+		t.Fatalf("physical probes=%d, want 5", got)
+	}
+}
+
+func TestSummaryFallbackSkipsWhenProbeCapacityIsExhausted(t *testing.T) {
+	key := strings.Repeat("c", 64)
+	var hasCalls int32
+	peer := newPeerServer(t, key, nil, http.StatusNotFound, &hasCalls, nil)
+	pm := peerManagerWith([]string{peer})
+	pm.ConfigureSummary(peerLookupSummary, "requester", SummaryConfig{PeerMaxProbes: 5, MaxPeerProbesInFlight: 1})
+	pm.probePermits <- struct{}{}
+	defer func() { <-pm.probePermits }()
+	if _, _, found, _ := pm.LocateKeyAmong(context.Background(), key, []string{peer}, pm.peerMaxProbes); found {
+		t.Fatal("probe found a peer despite exhausted permit capacity")
+	}
+	if got := atomic.LoadInt32(&hasCalls); got != 0 {
+		t.Fatalf("physical probes=%d, want 0 when capacity is exhausted", got)
+	}
+}
+
+func TestSummaryMemoryBudgetRetainsOnlyPeersThatFit(t *testing.T) {
+	peers := []string{"peer-a:8081", "peer-b:8081"}
+	bits := make([]byte, summaryBloomBits/8)
+	reserve := int64(summaryBloomBits/8) + int64(summaryBloomBits)*2 + int64(maxSummaryBodyBytes*(maxSummaryReceives+1))
+	pm := peerManagerWith(peers)
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{MemoryLimitBytes: reserve + int64(len(bits))})
+	for i, peer := range peers {
+		s, err := newIncrementalCacheSummary(peer, uint64(i+1), 0, append([]byte(nil), bits...), time.Now(), time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := s.MarshalBinary()
+		_ = pm.ReceiveSummary(peer, body, time.Now())
+	}
+	if got := pm.summaryCount(); got != 1 {
+		t.Fatalf("retained summary count=%d, want one within the configured budget", got)
+	}
+	pm.summaries.mu.RLock()
+	used := pm.summaries.bytes
+	pm.summaries.mu.RUnlock()
+	if used > len(bits) {
+		t.Fatalf("retained bytes=%d exceed one-summary budget=%d", used, len(bits))
 	}
 }

@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -34,6 +36,10 @@ var (
 		Name: "cache_proxy_peer_probes_total",
 		Help: "Physical peer availability probe attempts, by outcome",
 	}, []string{"outcome"}) // hit, miss, timeout, canceled, error
+	peerProbeSkippedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_peer_probes_skipped_total",
+		Help: "Summary-mode fallback probes skipped because the per-pod budget is exhausted",
+	})
 )
 
 // Peer timeouts. The /cache/has probe is a tiny HEAD-like check, so it gets a
@@ -44,19 +50,30 @@ var (
 // guard is a response-header deadline long enough to also cover the bounded
 // wait a peer does when we ask about its in-flight fill.
 const (
-	peerHasTimeout             = 1 * time.Second
-	peerGetResponseHeaderLimit = peerFillWait + 2*time.Second
+	peerHasTimeout               = 1 * time.Second
+	peerGetResponseHeaderLimit   = peerFillWait + 2*time.Second
+	defaultPeerMaxProbes         = 5
+	defaultMaxPeerProbesInFlight = 64
 )
+
+type SummaryConfig struct {
+	PeerMaxProbes         int
+	MaxPeerProbesInFlight int
+	MemoryLimitBytes      int64
+}
 
 // PeerManager discovers and communicates with cache proxy peers
 // via a Kubernetes headless Service.
 type PeerManager struct {
-	serviceName  string
-	peerPort     string       // port for peer API (e.g. ":8081")
-	client       *http.Client // /cache/has probes (short whole-request timeout)
-	streamClient *http.Client // /cache/get transfers (header deadline, no body timeout)
-	lookupMode   peerLookupMode
-	identity     string
+	serviceName               string
+	peerPort                  string       // port for peer API (e.g. ":8081")
+	client                    *http.Client // /cache/has probes (short whole-request timeout)
+	streamClient              *http.Client // /cache/get transfers (header deadline, no body timeout)
+	lookupMode                peerLookupMode
+	identity                  string
+	peerMaxProbes             int
+	probePermits              chan struct{}
+	summaryRemoteMemoryBudget int
 
 	summaries       summaryStore
 	summaryMu       sync.Mutex // protects current local summary and generation
@@ -89,16 +106,32 @@ func NewPeerManager(serviceName, peerPort string) *PeerManager {
 				ResponseHeaderTimeout: peerGetResponseHeaderLimit,
 			},
 		},
-		lookupMode:     peerLookupProbe,
-		summaries:      summaryStore{records: make(map[string]summaryRecord)},
-		pushPermits:    make(chan struct{}, maxSummaryPushes),
-		receivePermits: make(chan struct{}, maxSummaryReceives),
+		lookupMode:                peerLookupProbe,
+		peerMaxProbes:             defaultPeerMaxProbes,
+		probePermits:              make(chan struct{}, defaultMaxPeerProbesInFlight),
+		summaryRemoteMemoryBudget: summaryRemoteMemoryBudget(defaultSummaryMemoryLimitBytes),
+		summaries:                 summaryStore{records: make(map[string]summaryRecord)},
+		pushPermits:               make(chan struct{}, maxSummaryPushes),
+		receivePermits:            make(chan struct{}, maxSummaryReceives),
 	}
 }
 
-func (pm *PeerManager) ConfigureSummary(mode peerLookupMode, identity string) {
+func (pm *PeerManager) ConfigureSummary(mode peerLookupMode, identity string, configs ...SummaryConfig) {
 	pm.lookupMode = mode
 	pm.identity = identity
+	if len(configs) == 0 {
+		return
+	}
+	config := configs[0]
+	if config.PeerMaxProbes > 0 {
+		pm.peerMaxProbes = config.PeerMaxProbes
+	}
+	if config.MaxPeerProbesInFlight > 0 {
+		pm.probePermits = make(chan struct{}, config.MaxPeerProbesInFlight)
+	}
+	if config.MemoryLimitBytes > 0 {
+		pm.summaryRemoteMemoryBudget = summaryRemoteMemoryBudget(config.MemoryLimitBytes)
+	}
 }
 
 // WatchEndpoints periodically resolves the headless Service DNS to
@@ -207,7 +240,7 @@ func (pm *PeerManager) localSummaryCopy() []byte {
 // replacing that peer's prior hint. It intentionally logs neither body nor
 // cache keys.
 func (pm *PeerManager) ReceiveSummary(sender string, body []byte, now time.Time) error {
-	err := pm.summaries.receive(sender, body, now, pm.isMember)
+	err := pm.summaries.receive(sender, body, now, pm.isMember, pm.summaryRemoteMemoryBudget, pm.identity)
 	if err != nil {
 		summaryReceiptsTotal.WithLabelValues("rejected").Inc()
 		return err
@@ -406,16 +439,41 @@ type probeResult struct {
 // bursting into one duplicate origin fetch per node: the first node's
 // in-flight fetch answers 202, so every other node waits for that fill.
 func (pm *PeerManager) LocateKey(ctx context.Context, cacheKey string) (holder string, flight, ok bool) {
-	return pm.locateKey(ctx, cacheKey, pm.peerSnapshot(), true)
+	return pm.locateKey(ctx, cacheKey, pm.peerSnapshot(), true, false)
 }
 
 // LocateKeyAmong retains probe-mode behavior for only the peers that have not
 // delivered a valid summary. The caller already counted its logical lookup.
-func (pm *PeerManager) LocateKeyAmong(ctx context.Context, cacheKey string, peers []string) (holder string, flight, ok bool) {
-	return pm.locateKey(ctx, cacheKey, peers, false)
+func (pm *PeerManager) LocateKeyAmong(ctx context.Context, cacheKey string, peers []string, maxProbes int) (holder string, flight, ok bool, selected int) {
+	peers = selectProbePeers(cacheKey, peers, maxProbes)
+	holder, flight, ok = pm.locateKey(ctx, cacheKey, peers, false, true)
+	return holder, flight, ok, len(peers)
 }
 
-func (pm *PeerManager) locateKey(ctx context.Context, cacheKey string, peers []string, countLogical bool) (holder string, flight, ok bool) {
+func selectProbePeers(cacheKey string, peers []string, maxProbes int) []string {
+	if maxProbes <= 0 || len(peers) == 0 {
+		return nil
+	}
+	if len(peers) <= maxProbes {
+		return append([]string(nil), peers...)
+	}
+	type rankedPeer struct {
+		addr string
+		rank [sha256.Size]byte
+	}
+	ranked := make([]rankedPeer, 0, len(peers))
+	for _, peer := range peers {
+		ranked = append(ranked, rankedPeer{addr: peer, rank: sha256.Sum256([]byte(cacheKey + "\x00" + peer))})
+	}
+	sort.Slice(ranked, func(i, j int) bool { return bytes.Compare(ranked[i].rank[:], ranked[j].rank[:]) < 0 })
+	selected := make([]string, maxProbes)
+	for i := range selected {
+		selected[i] = ranked[i].addr
+	}
+	return selected
+}
+
+func (pm *PeerManager) locateKey(ctx context.Context, cacheKey string, peers []string, countLogical, useProbePermits bool) (holder string, flight, ok bool) {
 	if len(peers) == 0 {
 		return "", false, false
 	}
@@ -432,6 +490,16 @@ func (pm *PeerManager) locateKey(ctx context.Context, cacheKey string, peers []s
 	resCh := make(chan probeResult, len(peers))
 	for _, addr := range peers {
 		go func(addr string) {
+			if useProbePermits {
+				select {
+				case pm.probePermits <- struct{}{}:
+					defer func() { <-pm.probePermits }()
+				default:
+					peerProbeSkippedTotal.Inc()
+					resCh <- probeResult{addr: addr, status: -1}
+					return
+				}
+			}
 			startedAt := time.Now()
 			res := probeResult{addr: addr, status: -1}
 			hasURL := fmt.Sprintf("http://%s/cache/has?key=%s", addr, cacheKey)

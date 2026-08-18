@@ -29,13 +29,22 @@ const (
 	summaryBloomTargetItems = 1_000_000
 	// A 1m-entry filter at 1% false-positive rate is ~1.15 MiB before JSON
 	// base64 encoding. Two MiB is a hard wire cap with modest headroom.
-	maxSummaryBodyBytes     = 2 << 20
-	maxSummaryPeers         = 256
-	maxSummaryPushes        = 4
-	maxSummaryReceives      = 4
-	maxSummaryResidentBytes = 512 << 20
-	summaryPushTimeout      = 200 * time.Millisecond
+	maxSummaryBodyBytes            = 2 << 20
+	maxSummaryPushes               = 4
+	maxSummaryReceives             = 4
+	defaultSummaryMemoryLimitBytes = 512 << 20
+	summaryPushTimeout             = 200 * time.Millisecond
 )
+
+func summaryRemoteMemoryBudget(total int64) int {
+	localIndex := int64(summaryBloomBits/8) + int64(summaryBloomBits)*2
+	transient := int64(maxSummaryBodyBytes * (maxSummaryReceives + 1))
+	budget := total - localIndex - transient
+	if budget < 0 {
+		return 0
+	}
+	return int(budget)
+}
 
 var (
 	summaryBloomBits, summaryBloomHashes = bloomParams(summaryBloomTargetItems)
@@ -337,7 +346,7 @@ type summaryStore struct {
 	bytes   int
 }
 
-func (st *summaryStore) receive(peer string, body []byte, now time.Time, member func(string) bool) error {
+func (st *summaryStore) receive(peer string, body []byte, now time.Time, member func(string) bool, remoteBudget int, identity string) error {
 	s, err := parseCacheSummary(body, now)
 	if err != nil {
 		return err
@@ -350,24 +359,38 @@ func (st *summaryStore) receive(peer string, body []byte, now time.Time, member 
 	if old, ok := st.records[peer]; ok && old.summary.Generation >= s.Generation {
 		return errors.New("stale summary generation")
 	}
-	if len(st.records) >= maxSummaryPeers {
-		if _, exists := st.records[peer]; !exists {
-			return errors.New("summary peer limit")
-		}
-	}
 	residentBytes := len(s.Bits)
-	oldBytes := 0
-	if old, ok := st.records[peer]; ok {
-		oldBytes = old.bytes
+	if residentBytes > remoteBudget {
+		return errors.New("summary exceeds remote memory budget")
 	}
-	if st.bytes-oldBytes+residentBytes > maxSummaryResidentBytes {
-		return errors.New("summary resident byte limit")
+	candidates := make(map[string]summaryRecord, len(st.records)+1)
+	for addr, rec := range st.records {
+		candidates[addr] = rec
 	}
-	if oldBytes > 0 {
-		st.bytes -= oldBytes
+	candidates[peer] = summaryRecord{summary: s, bytes: residentBytes}
+	type candidate struct {
+		addr string
+		rec  summaryRecord
+		rank [sha256.Size]byte
 	}
-	st.records[peer] = summaryRecord{summary: s, bytes: residentBytes}
-	st.bytes += residentBytes
+	ranked := make([]candidate, 0, len(candidates))
+	for addr, rec := range candidates {
+		ranked = append(ranked, candidate{addr: addr, rec: rec, rank: sha256.Sum256([]byte(identity + "\x00" + addr))})
+	}
+	sort.Slice(ranked, func(i, j int) bool { return bytes.Compare(ranked[i].rank[:], ranked[j].rank[:]) < 0 })
+	kept := make(map[string]summaryRecord, len(ranked))
+	used := 0
+	for _, candidate := range ranked {
+		if used+candidate.rec.bytes > remoteBudget {
+			continue
+		}
+		kept[candidate.addr] = candidate.rec
+		used += candidate.rec.bytes
+	}
+	if _, keptIncoming := kept[peer]; !keptIncoming {
+		return errors.New("summary remote memory budget exhausted")
+	}
+	st.records, st.bytes = kept, used
 	return nil
 }
 func (st *summaryStore) removeNonMembers(member func(string) bool, now time.Time) {

@@ -434,7 +434,7 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 					peerDirectGetsTotal.WithLabelValues("miss_or_error").Inc()
 				}
 				if len(positive) == 0 {
-					if holder, flight, ok := p.peers.LocateKeyAmong(r.Context(), cacheKey, uncovered); ok {
+					if holder, flight, ok, _ := p.peers.LocateKeyAmong(r.Context(), cacheKey, uncovered, p.peers.peerMaxProbes); ok {
 						if res, ok := p.fetchFromPeer(holder, flight, cacheKey, r); ok {
 							return res, nil
 						}

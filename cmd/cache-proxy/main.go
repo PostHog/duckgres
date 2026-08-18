@@ -94,6 +94,10 @@ func main() {
 
 	cacheDir := envOrDefault("CACHE_DIR", "/cache")
 	maxPercent, _ := strconv.Atoi(envOrDefault("CACHE_MAX_PERCENT", "80"))
+	maxEntries := int(envInt64("CACHE_MAX_ENTRIES", defaultCacheMaxEntries))
+	summaryMemoryLimit := envInt64("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", defaultSummaryMemoryLimitBytes)
+	peerMaxProbes := int(envInt64("CACHE_PEER_MAX_PROBES", defaultPeerMaxProbes))
+	maxPeerProbesInFlight := int(envInt64("CACHE_MAX_PEER_PROBES_IN_FLIGHT", defaultMaxPeerProbesInFlight))
 	listenAddr := envOrDefault("LISTEN_ADDR", ":8080")
 	peerAddr := envOrDefault("PEER_ADDR", ":8081")
 	healthAddr := envOrDefault("HEALTH_ADDR", ":8082")
@@ -123,6 +127,10 @@ func main() {
 	slog.Info("Starting cache-proxy.",
 		"cache_dir", cacheDir,
 		"max_percent", maxPercent,
+		"max_entries", maxEntries,
+		"summary_memory_limit", summaryMemoryLimit,
+		"peer_max_probes", peerMaxProbes,
+		"max_peer_probes_in_flight", maxPeerProbesInFlight,
 		"listen", listenAddr,
 		"peer_listen", peerAddr,
 		"health", healthAddr,
@@ -140,7 +148,10 @@ func main() {
 	slog.Info("Block mode configured.", "enabled", blockMode, "block_size", blockSize, "max_span_blocks", maxSpanBlocks)
 
 	// Initialize cache store
-	store, err := NewDiskCache(cacheDir, maxPercent, lookupMode == peerLookupSummary && peerService != "")
+	store, err := NewDiskCache(cacheDir, maxPercent, DiskCacheOptions{
+		IncrementalSummary: lookupMode == peerLookupSummary && peerService != "",
+		MaxEntries:         maxEntries,
+	})
 	if err != nil {
 		slog.Error("Failed to initialize cache store.", "error", err)
 		os.Exit(1)
@@ -162,7 +173,11 @@ func main() {
 	var peers *PeerManager
 	if peerService != "" {
 		peers = NewPeerManager(peerService, peerAddr)
-		peers.ConfigureSummary(lookupMode, identity)
+		peers.ConfigureSummary(lookupMode, identity, SummaryConfig{
+			PeerMaxProbes:         peerMaxProbes,
+			MaxPeerProbesInFlight: maxPeerProbesInFlight,
+			MemoryLimitBytes:      summaryMemoryLimit,
+		})
 		peers.StartSummaryPublisher(rootCtx, store)
 		go peers.WatchEndpoints(rootCtx)
 	}

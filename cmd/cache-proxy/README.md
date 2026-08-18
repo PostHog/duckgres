@@ -10,9 +10,13 @@ available, and forwards cache misses to origin object storage.
 | --- | --- | --- |
 | `CACHE_DIR` | `/cache` | Local disk cache directory. |
 | `CACHE_MAX_PERCENT` | `80` | Ceiling for the cache's share of the cache filesystem, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute: when something outside the cache consumes disk, the budget only ever shrinks, so the cache never evicts healthy entries to make room for writes the disk can't take. |
+| `CACHE_MAX_ENTRIES` | `1000000` | Hard LRU entry-count ceiling, enforced alongside the disk-byte ceiling. Bounds local cache-index memory. |
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` preserves the existing `/cache/has` fanout. `summary` uses periodically pushed Bloom-filter hints and performs at most two direct peer GETs per request; any other value causes startup to fail. |
+| `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Total local Bloom-state budget: counting filter, publication/receipt reserve, and dynamically retained remote peer summaries. Peers that do not fit remain uncovered. |
+| `CACHE_PEER_MAX_PROBES` | `5` | In summary mode, maximum fallback `/cache/has` probes per client request across all missing blocks. |
+| `CACHE_MAX_PEER_PROBES_IN_FLIGHT` | `64` | Per-pod non-blocking cap on concurrent summary-mode fallback probes. When exhausted, the request skips probes and fetches origin. |
 | `CACHE_PROXY_ID` | pod name, node name, then hostname | Stable opaque proxy identity carried in summary metadata; it must not be a customer or object identifier. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
 | `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. |
@@ -36,11 +40,18 @@ locators at a 1% target false-positive rate (1.14 MiB bits plus 18.3 MiB local
 16-bit counters); the JSON wire body is bounded to 2 MiB and resident peer
 summaries to 512 MiB.
 
-The filter continues accepting entries above 1,000,000 rather than ceasing
-publication. Its false-positive rate then rises smoothly; monitor
+The default local cache entry limit keeps this filter at its 1,000,000-key,
+1% design point. If an operator raises that limit, the filter continues
+accepting entries and its false-positive rate rises smoothly; monitor
 `cache_proxy_summary_bloom_false_positive_ratio` and
 `cache_proxy_summary_bloom_saturated`. Counter overflow is deliberately
 sticky, which can add false positives but cannot create false negatives.
+
+The aggregate Bloom budget retains a deterministic subset of remote peer
+summaries when the cluster is too large to fit them all. Unretained peers are
+explicitly uncovered. A request probes at most `CACHE_PEER_MAX_PROBES` of
+those peers, and the per-pod in-flight probe limit is non-blocking: an
+exhausted budget goes straight to origin instead of queuing work.
 
 On a local miss the requester tests received, non-expired filters locally. No
 positive hint goes straight to origin once every discovered peer has supplied a
