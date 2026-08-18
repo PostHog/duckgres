@@ -15,8 +15,8 @@ available, and forwards cache misses to origin object storage.
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` preserves the existing fleet-wide `/cache/has` behavior. `summary` pulls Bloom-filter hints and uses them to eliminate definite-negative peers before bounded `/cache/has` confirmation; any other value causes startup to fail. |
 | `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Total local Bloom-state budget: counting filter, snapshot and pull-work reserve, and a deterministic receiver-selected subset of remote peer summaries. Peers that do not fit remain uncovered. |
-| `CACHE_PEER_MAX_PROBES` | `5` | In summary mode, maximum parallel `/cache/has` confirmations per client request across all missing blocks. |
-| `CACHE_MAX_PEER_PROBES_IN_FLIGHT` | `64` | Per-pod non-blocking cap on active summary-mode `/cache/has` HTTP requests and sockets. It is not a process goroutine limit. When exhausted, confirmations are skipped and the request fetches origin. |
+| `CACHE_PEER_MAX_PROBES_PER_REQUEST` | `5` | In summary mode, maximum parallel `/cache/has` confirmations per client request across all missing blocks. `CACHE_PEER_MAX_PROBES` is a deprecated alias. |
+| `CACHE_MAX_CONCURRENT_PEER_PROBES` | `64` | Per-pod non-blocking cap on active summary-mode `/cache/has` HTTP requests and sockets. It is not a process goroutine limit. When exhausted, confirmations are skipped and the request fetches origin. `CACHE_MAX_PEER_PROBES_IN_FLIGHT` is a deprecated alias. |
 | `CACHE_PROXY_ID` | pod name, node name, then hostname | Stable opaque receiver identity used for deterministic peer-summary selection; it must not be a customer or object identifier. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
 | `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. |

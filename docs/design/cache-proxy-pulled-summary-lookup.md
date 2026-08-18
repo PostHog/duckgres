@@ -29,8 +29,8 @@ origin fills. Summaries contain only opaque cache-locator membership hints.
 | `CACHE_MAX_ENTRIES` | `1000000` | Strict maximum tracked entries after each final commit. |
 | `CACHE_MAX_PERCENT` | `80` | Target for tracked cache bytes; one entry larger than the target is retained. |
 | `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Local counting Bloom, snapshot and pull reserve, and retained remote Bloom bits. |
-| `CACHE_PEER_MAX_PROBES` | `5` | Maximum summary-mode `/cache/has` confirmations per client request, shared across block misses. |
-| `CACHE_MAX_PEER_PROBES_IN_FLIGHT` | `64` | Pod-wide, non-blocking cap on active confirmation HTTP requests and sockets. |
+| `CACHE_PEER_MAX_PROBES_PER_REQUEST` | `5` | Maximum summary-mode `/cache/has` confirmations per client request, shared across block misses. `CACHE_PEER_MAX_PROBES` is a deprecated alias. |
+| `CACHE_MAX_CONCURRENT_PEER_PROBES` | `64` | Pod-wide, non-blocking cap on active confirmation HTTP requests and sockets. `CACHE_MAX_PEER_PROBES_IN_FLIGHT` is a deprecated alias. |
 
 Body copies remain concurrent: each fill streams into a temporary file without
 holding the cache-index lock. The short final commit is serialized across the
@@ -144,7 +144,7 @@ Summary mode performs the following steps for a local cache miss:
 1. Test every current, compatible, non-expired retained summary locally.
 2. Eliminate covered peers whose Bloom filter is negative.
 3. Treat positive and uncovered peers as candidates, not holders.
-4. Deterministically choose at most `CACHE_PEER_MAX_PROBES` candidates. With a
+4. Deterministically choose at most `CACHE_PEER_MAX_PROBES_PER_REQUEST` candidates. With a
    budget of at least two and both classes present, reserve at least one slot
    for an uncovered peer so false positives cannot entirely suppress
    convergence. A one-slot override ranks both classes together.
@@ -156,15 +156,15 @@ Summary mode performs the following steps for a local cache miss:
 8. If no confirmation succeeds, fetch from origin.
 
 The semaphore is deliberately non-blocking. If all
-`CACHE_MAX_PEER_PROBES_IN_FLIGHT` permits are occupied, excess confirmations
+`CACHE_MAX_CONCURRENT_PEER_PROBES` permits are occupied, excess confirmations
 are skipped instead of queued, and those requests use origin. This bounds
 active `/cache/has` HTTP requests, sockets, and aggregate peer work during a
 miss storm. It does not bound total process goroutines: each client request has
 its own handler and may briefly create up to its
-`CACHE_PEER_MAX_PROBES` candidate-coordination goroutines.
+`CACHE_PEER_MAX_PROBES_PER_REQUEST` candidate-coordination goroutines.
 
 Block-aligned requests can contain several distinct cache keys. They share one
-`CACHE_PEER_MAX_PROBES` budget across their missing blocks, so the request does
+`CACHE_PEER_MAX_PROBES_PER_REQUEST` budget across their missing blocks, so the request does
 not multiply confirmation work by its block count. Each successful block
 confirmation can lead to one peer body transfer, capped at two peer block GETs
 for the entire client request.
@@ -333,7 +333,7 @@ If origin traffic or latency regresses:
 2. Check Bloom FPR, saturation, and cache entry count. Lower
    `CACHE_MAX_ENTRIES` if filters are materially beyond their design point.
 3. Check skipped probes. If the pod has memory and socket headroom, adjust
-   `CACHE_MAX_PEER_PROBES_IN_FLIGHT`; otherwise retain the non-blocking fallback.
+   `CACHE_MAX_CONCURRENT_PEER_PROBES`; otherwise retain the non-blocking fallback.
 4. Restore `CACHE_PEER_LOOKUP_MODE=probe` if locality is unacceptable while
    investigating.
 
@@ -343,7 +343,7 @@ If process memory approaches the pod limit:
    selected automatically and request-time work remains capped.
 2. Reduce `CACHE_MAX_ENTRIES` to lower exact-index memory and return the Bloom
    filter toward its target FPR.
-3. Reduce `CACHE_MAX_PEER_PROBES_IN_FLIGHT` if concurrent HTTP work contributes
+3. Reduce `CACHE_MAX_CONCURRENT_PEER_PROBES` if concurrent HTTP work contributes
    to the peak.
 4. Verify the pod memory limit and Go memory policy leave headroom for native,
    kernel, and request buffers.
