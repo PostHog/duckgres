@@ -41,6 +41,19 @@ func fakeCPPod() *corev1.Pod {
 						{Name: "DUCKGRES_CONFIG_POLL_INTERVAL", Value: "5s"},
 						{Name: "DUCKGRES_K8S_WORKER_IMAGE", Value: "must-not-leak"},
 						{Name: "DUCKGRES_USER_SECRET_KEY", Value: "must-not-leak"},
+						{
+							Name: "POSTHOG_API_KEY",
+							ValueFrom: &corev1.EnvVarSource{
+								SecretKeyRef: &corev1.SecretKeySelector{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "duckgres-posthog"},
+									Key:                  "api-key",
+								},
+							},
+						},
+						{Name: "POSTHOG_HOST", Value: "us.i.posthog.com"},
+						{Name: "DUCKGRES_POSTHOG_LOG_LEVEL", Value: "warn"},
+						{Name: "ADDITIONAL_POSTHOG_API_KEYS", Value: "phc_must_not_copy"},
+						{Name: "POSTHOG_ANALYTICS_API_KEY", Value: "phc_analytics_only"},
 					},
 				},
 			},
@@ -120,6 +133,10 @@ func TestSpawnReshardPodSpec(t *testing.T) {
 			t.Fatalf("non-allowlisted CP env %s leaked into the runner pod", name)
 		}
 	}
+	ns := env["POD_NAMESPACE"]
+	if ns.ValueFrom == nil || ns.ValueFrom.FieldRef == nil || ns.ValueFrom.FieldRef.FieldPath != "metadata.namespace" {
+		t.Fatalf("POD_NAMESPACE downward API = %+v", ns)
+	}
 
 	// Default resource shape 2 CPU / 8Gi, requests=limits.
 	cpu := c.Resources.Requests[corev1.ResourceCPU]
@@ -171,6 +188,38 @@ func TestSpawnReshardPodRejectsInvalidResourceKnobsWithoutPanicking(t *testing.T
 	err := s.SpawnReshardPod(context.Background(), &configstore.ReshardOperation{ID: 8})
 	if err == nil || !strings.Contains(err.Error(), "invalid reshard pod") {
 		t.Fatalf("error = %v, want invalid reshard pod resource error", err)
+	}
+}
+
+// TestReshardAllowlistIncludesPostHog pins the PostHog log env names on the
+// runner allowlist: secretKeyRef is copied as a ref, extra analytics keys are
+// not forwarded.
+func TestReshardAllowlistIncludesPostHog(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset(fakeCPPod())
+	s := NewReshardPodSpawner(cs, "duckgres", "duckgres-control-plane-abc-xyz", "", "")
+	if err := s.SpawnReshardPod(context.Background(), &configstore.ReshardOperation{ID: 11}); err != nil {
+		t.Fatalf("SpawnReshardPod: %v", err)
+	}
+	pod, err := cs.CoreV1().Pods("duckgres").Get(context.Background(), "duckgres-reshard-op-11", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	env := envByName(pod.Spec.Containers[0].Env)
+	key := env["POSTHOG_API_KEY"]
+	if key.Value != "" || key.ValueFrom == nil || key.ValueFrom.SecretKeyRef == nil ||
+		key.ValueFrom.SecretKeyRef.Name != "duckgres-posthog" || key.ValueFrom.SecretKeyRef.Key != "api-key" {
+		t.Fatalf("POSTHOG_API_KEY not copied as secretKeyRef: %+v", key)
+	}
+	if env["POSTHOG_HOST"].Value != "us.i.posthog.com" {
+		t.Fatalf("POSTHOG_HOST = %+v", env["POSTHOG_HOST"])
+	}
+	if env["DUCKGRES_POSTHOG_LOG_LEVEL"].Value != "warn" {
+		t.Fatalf("DUCKGRES_POSTHOG_LOG_LEVEL = %+v", env["DUCKGRES_POSTHOG_LOG_LEVEL"])
+	}
+	for _, name := range []string{"ADDITIONAL_POSTHOG_API_KEYS", "POSTHOG_ANALYTICS_API_KEY"} {
+		if _, leaked := env[name]; leaked {
+			t.Fatalf("%s must not be on the reshard allowlist", name)
+		}
 	}
 }
 

@@ -117,6 +117,11 @@ type K8sWorkerPool struct {
 
 	activatingTimeout time.Duration // max time a worker can stay in reserved/activating before being reaped
 
+	// posthogEnv is the allowlisted PostHog log EnvVars copied from this
+	// CP pod's named env at pool start. SecretKeyRef is live when the
+	// worker pod starts — no refresh loop. Empty if POD_NAME is unset,
+	// Get fails, or the named env is missing.
+	posthogEnv []corev1.EnvVar
 }
 
 // NewK8sWorkerPool creates a K8sWorkerPool using in-cluster credentials.
@@ -224,6 +229,10 @@ func newK8sWorkerPool(cfg K8sWorkerPoolConfig, clientset kubernetes.Interface) (
 		}
 	}
 
+	// Cache PostHog log env from this CP pod's named env. Missing
+	// logging config must never fail pool start or later spawn.
+	pool.loadPostHogLogEnv(context.Background())
+
 	// Resolve CP pod UID for owner references
 	if err := pool.resolveCPUID(context.Background()); err != nil {
 		slog.Warn("Could not resolve CP pod UID for owner references. Worker pods will not be garbage-collected if CP is deleted.", "error", err)
@@ -248,6 +257,38 @@ func (p *K8sWorkerPool) resolveCPUID(ctx context.Context) error {
 	}
 	p.cpUID = pod.UID
 	return nil
+}
+
+// loadPostHogLogEnv reads this CP pod's named env (Get(namespace, POD_NAME))
+// and caches the allowlisted PostHog log vars. POD_NAME empty, Get fail, or
+// a missing named POSTHOG_API_KEY → one WARN and empty cache. Never errors.
+func (p *K8sWorkerPool) loadPostHogLogEnv(ctx context.Context) {
+	if p == nil {
+		return
+	}
+	podName := strings.TrimSpace(os.Getenv("POD_NAME"))
+	if podName == "" || p.clientset == nil {
+		slog.Warn("PostHog log env not found on CP pod spec; workers will not export.")
+		p.posthogEnv = nil
+		return
+	}
+	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil || pod == nil || len(pod.Spec.Containers) == 0 {
+		slog.Warn("PostHog log env not found on CP pod spec; workers will not export.", "error", err)
+		p.posthogEnv = nil
+		return
+	}
+	copied := filterPostHogLogEnv(pod.Spec.Containers[0].Env)
+	p.posthogEnv = copied
+	if envHasName(copied, "POSTHOG_API_KEY") {
+		return
+	}
+	// A literal value: already WARNs "refusing to materialize"; do not
+	// also claim the named env was missing.
+	if present, secretRef := namedPostHogAPIKey(pod.Spec.Containers[0].Env); present && !secretRef {
+		return
+	}
+	slog.Warn("PostHog log env not found on CP pod spec; workers will not export.")
 }
 
 func (p *K8sWorkerPool) workerServiceAccountName() string {
