@@ -9,8 +9,8 @@ available, and forwards cache misses to origin object storage.
 | Setting | Default | Notes |
 | --- | --- | --- |
 | `CACHE_DIR` | `/cache` | Local disk cache directory. |
-| `CACHE_MAX_PERCENT` | `80` | Ceiling for the cache's share of the cache filesystem, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute: when something outside the cache consumes disk, the budget only ever shrinks, so the cache never evicts healthy entries to make room for writes the disk can't take. |
-| `CACHE_MAX_ENTRIES` | `1000000` | Hard LRU entry-count ceiling, enforced alongside the disk-byte ceiling. Bounds local cache-index memory. |
+| `CACHE_MAX_PERCENT` | `80` | Convergent target for the cache's share of the cache filesystem, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute: when something outside the cache consumes disk, the budget only ever shrinks, so the cache never evicts healthy entries to make room for writes the disk can't take. |
+| `CACHE_MAX_ENTRIES` | `1000000` | Convergent LRU entry-count target, enforced alongside the disk-byte target. Bounds steady-state local cache-index memory. |
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` preserves the existing `/cache/has` fanout. `summary` uses periodically pushed Bloom-filter hints and performs at most two direct peer GETs per request; any other value causes startup to fail. |
@@ -25,6 +25,15 @@ available, and forwards cache misses to origin object storage.
 | `CACHE_BLOCK_MAX_SPAN_BLOCKS` | `8` | Max blocks coalesced into one origin range fetch. Ignored when block mode is off. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `DUCKGRES_TRACE_ENDPOINT` | empty | OTLP/HTTP trace endpoint. Unset → tracing is a no-op. |
 | `OTEL_EXPORTER_OTLP_TRACES_PATH` | empty | Overrides the OTLP path (e.g. VictoriaTraces' `/insert/opentelemetry/v1/traces`). Mirrors the main duckgres binary. |
+
+The byte and entry-count limits are convergent rather than strict admission
+limits. Cache fills write concurrently and make room using the cache state
+visible before they commit, so several fills completing together may leave the
+cache temporarily above either target. Entry-count overshoot is bounded by the
+number of concurrently committing distinct entries; byte overshoot is bounded
+by the aggregate size of those concurrent commits. A subsequent cache insertion
+evicts least-recently-used entries back toward both targets. This keeps body and
+filesystem I/O concurrent instead of serializing it behind the cache-index lock.
 
 ## Cluster-wide fetch dedup
 
