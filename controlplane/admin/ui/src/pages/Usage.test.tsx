@@ -11,6 +11,9 @@ const hooks = vi.hoisted(() => ({
 }));
 vi.mock("@/hooks/useApi", () => hooks);
 
+const identity = vi.hoisted(() => ({ useIdentity: vi.fn() }));
+vi.mock("@/components/IdentityProvider", () => identity);
+
 import { Usage } from "./Usage";
 
 const ok = <T,>(data: T) => ({ data, isSuccess: true, isLoading: false, isError: false, refetch: vi.fn() });
@@ -39,6 +42,15 @@ describe("Usage page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     hooks.useOrgLabels.mockReturnValue(new Map());
+    identity.useIdentity.mockReturnValue({ isAdmin: true, me: { email: "op@posthog.com", role: "admin", source: "sso" } });
+  });
+
+  it("shows an admin-only notice to viewers and never exposes the data", () => {
+    hooks.useMonthlyUsage.mockReturnValue(ok(RESPONSE));
+    identity.useIdentity.mockReturnValue({ isAdmin: false, me: { email: "v@posthog.com", role: "viewer", source: "sso" } });
+    renderPage();
+    expect(screen.getByText(/admin only/i)).toBeInTheDocument();
+    expect(screen.queryByText("team_5")).not.toBeInTheDocument();
   });
 
   it("defaults to the latest month and shows per-team rows with derived units", () => {

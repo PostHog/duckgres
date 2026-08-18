@@ -577,12 +577,15 @@ export function useAudit(params: { actor?: string; org?: string }) {
 
 // ---- monthly usage (the Usage page) ----
 
-// Monthly per-team usage over the retained billing buffer. Not 404-tolerated:
-// the endpoint is part of the same binary as the console.
+// Monthly per-team usage over the retained billing buffer. The endpoint is
+// RequireAdmin (per-team cost data), so the query only fires for admins —
+// viewers never spend a 403 round-trip.
 export function useMonthlyUsage(months: number) {
+  const { isAdmin } = useIdentity();
   return useQuery<MonthlyUsageResponse>({
     queryKey: ["usage", "monthly", months],
     queryFn: () => api.monthlyUsage(months),
+    enabled: isAdmin,
   });
 }
 

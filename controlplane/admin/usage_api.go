@@ -51,12 +51,15 @@ type monthlyUsageResponseRow struct {
 	GiBSeconds    json.Number `json:"gib_seconds"`
 }
 
-// registerUsageAPI mounts the monthly-usage read on the admin API group. It
-// is a plain GET, so RoleGate admits viewers — the payload is org/team
-// aggregates only (no SQL, users, or credentials).
+// registerUsageAPI mounts the monthly-usage read on the admin API group.
+// Although it is a GET (RoleGate would admit viewers), it self-gates with
+// RequireAdmin: this is per-team COST data for every org — the billing pull
+// API gates the raw families behind RequireAdmin for exactly that reason, and
+// the monthly aggregate is no less sensitive. The gate travels with the route
+// (not RoleGate's path list), so renaming the route cannot downgrade it.
 func registerUsageAPI(r gin.IRouter, store monthlyUsageStore) {
 	h := &usageAPIHandler{store: store, now: time.Now}
-	r.GET("/usage/monthly", h.getMonthlyUsage)
+	r.GET("/usage/monthly", RequireAdmin(), h.getMonthlyUsage)
 }
 
 func (h *usageAPIHandler) getMonthlyUsage(c *gin.Context) {

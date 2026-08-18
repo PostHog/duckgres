@@ -32,12 +32,59 @@ func (s *fakeMonthlyUsageStore) ComputeBillingCursor() (time.Time, bool, error) 
 	return s.cursor, s.hasCursor, nil
 }
 
-func setupUsageRouter(store monthlyUsageStore, now func() time.Time) *gin.Engine {
+// setupUsageRouter mounts the monthly-usage route exactly as production does
+// (registerUsageAPI, which self-gates with RequireAdmin), with an injected
+// identity standing in for AuthMiddleware. role="" simulates an
+// unauthenticated caller (no identity in context).
+func setupUsageRouter(store monthlyUsageStore, role Role) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := &usageAPIHandler{store: store, now: now}
-	r.GET("/api/v1/usage/monthly", h.getMonthlyUsage)
+	if role != "" {
+		r.Use(func(c *gin.Context) {
+			c.Set(ctxIdentityKey, &Identity{Email: "op@posthog.com", Role: role, Source: "sso"})
+		})
+	}
+	registerUsageAPI(r.Group("/api/v1"), store)
 	return r
+}
+
+// setupUsageRouterAt mounts the route with a controllable clock (window
+// tests); caller is an admin.
+func setupUsageRouterAt(store monthlyUsageStore, now func() time.Time) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set(ctxIdentityKey, &Identity{Email: "op@posthog.com", Role: RoleAdmin, Source: "sso"})
+	})
+	h := &usageAPIHandler{store: store, now: now}
+	r.GET("/api/v1/usage/monthly", RequireAdmin(), h.getMonthlyUsage)
+	return r
+}
+
+// Usage data is cost data: the billing pull API gates the raw families behind
+// RequireAdmin, and this monthly aggregate is no less sensitive — it exposes
+// every org's per-team spend. Viewers (any @posthog.com SSO login) must NOT
+// read it; unauthenticated callers get 401.
+func TestMonthlyUsageRequiresAdmin(t *testing.T) {
+	store := &fakeMonthlyUsageStore{}
+
+	r := setupUsageRouter(store, RoleViewer)
+	code, _ := usageRequest(t, r, "/api/v1/usage/monthly")
+	if code != http.StatusForbidden {
+		t.Fatalf("viewer GET /usage/monthly = %d, want 403", code)
+	}
+
+	r = setupUsageRouter(store, "")
+	code, _ = usageRequest(t, r, "/api/v1/usage/monthly")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /usage/monthly = %d, want 401", code)
+	}
+
+	r = setupUsageRouter(store, RoleAdmin)
+	code, _ = usageRequest(t, r, "/api/v1/usage/monthly")
+	if code != http.StatusOK {
+		t.Fatalf("admin GET /usage/monthly = %d, want 200", code)
+	}
 }
 
 func usageRequest(t *testing.T, r *gin.Engine, path string) (int, map[string]interface{}) {
@@ -60,7 +107,6 @@ func strptr(s string) *string { return &s }
 // a key present in both lands in ONE row with both metric sets; a key in only
 // one family still appears with the other zeroed.
 func TestMonthlyUsageMergesFamilies(t *testing.T) {
-	now := func() time.Time { return time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC) }
 	store := &fakeMonthlyUsageStore{
 		compute: []configstore.MonthlyComputeUsageRow{
 			{Month: "2026-08", OrgID: "acme", TeamID: 5, SchemaName: strptr("team_5"), CPUSeconds: 120, MemorySeconds: 240},
@@ -73,7 +119,7 @@ func TestMonthlyUsageMergesFamilies(t *testing.T) {
 		cursor:    time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
 		hasCursor: true,
 	}
-	r := setupUsageRouter(store, now)
+	r := setupUsageRouter(store, RoleAdmin)
 
 	code, body := usageRequest(t, r, "/api/v1/usage/monthly")
 	if code != http.StatusOK {
@@ -134,7 +180,7 @@ func TestMonthlyUsageWindowFromMonthsParam(t *testing.T) {
 
 	var gotFrom time.Time
 	spy := &spyUsageStore{fakeMonthlyUsageStore: store, onFrom: func(f time.Time) { gotFrom = f }}
-	r := setupUsageRouter(spy, now)
+	r := setupUsageRouterAt(spy, now)
 
 	// months=3 starting mid-August → window opens 2026-06-01.
 	code, _ := usageRequest(t, r, "/api/v1/usage/monthly?months=3")
@@ -158,7 +204,7 @@ func (s *spyUsageStore) AggregateComputeUsageMonthly(from time.Time) ([]configst
 
 func TestMonthlyUsageRejectsBadMonthsParam(t *testing.T) {
 	now := func() time.Time { return time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC) }
-	r := setupUsageRouter(&fakeMonthlyUsageStore{}, now)
+	r := setupUsageRouterAt(&fakeMonthlyUsageStore{}, now)
 	for _, bad := range []string{"0", "-2", "abc", "999"} {
 		code, body := usageRequest(t, r, "/api/v1/usage/monthly?months="+bad)
 		if code != http.StatusBadRequest {
@@ -169,7 +215,7 @@ func TestMonthlyUsageRejectsBadMonthsParam(t *testing.T) {
 
 func TestMonthlyUsageStoreErrorIs500(t *testing.T) {
 	now := func() time.Time { return time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC) }
-	r := setupUsageRouter(&fakeMonthlyUsageStore{err: errFakeUsageStore}, now)
+	r := setupUsageRouterAt(&fakeMonthlyUsageStore{err: errFakeUsageStore}, now)
 	code, _ := usageRequest(t, r, "/api/v1/usage/monthly")
 	if code != http.StatusInternalServerError {
 		t.Fatalf("status %d, want 500", code)

@@ -36,7 +36,7 @@ export const NAV: NavItem[] = [
   { to: "/nodes", label: "Nodes", icon: Network },
   { to: "/workers", label: "Workers", icon: Server },
   { to: "/metrics", label: "Metrics", icon: LineChart },
-  { to: "/usage", label: "Usage", icon: Coins },
+  { to: "/usage", label: "Usage", icon: Coins, adminOnly: true },
   { to: "/reshards", label: "Reshards", icon: ArrowLeftRight },
   { to: "/configstore", label: "Config Store", icon: Database },
   { to: "/impersonate", label: "Impersonate", icon: TerminalSquare, adminOnly: true },

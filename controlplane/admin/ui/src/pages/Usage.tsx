@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
-import { Coins, Cpu, Database, MemoryStick } from "lucide-react";
+import { Coins, Cpu, Database, MemoryStick, ShieldAlert } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { DataTable } from "@/components/DataTable";
 import { OrgRef } from "@/components/OrgRef";
@@ -8,6 +8,7 @@ import { StatCard } from "@/components/StatCard";
 import { Card } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
+import { useIdentity } from "@/components/IdentityProvider";
 import { useMonthlyUsage, useOrgLabels } from "@/hooks/useApi";
 import { fmtTime } from "@/lib/format";
 import type { MonthlyUsageRow } from "@/types/api";
@@ -27,6 +28,7 @@ function currentMonth(): string {
 }
 
 export function Usage() {
+  const { isAdmin } = useIdentity();
   const [months, setMonths] = useState(6);
   const usage = useMonthlyUsage(months);
   const orgLabels = useOrgLabels();
@@ -102,6 +104,23 @@ export function Usage() {
     ],
     [orgLabels],
   );
+
+  // Per-team cost data is admin-only (the API enforces RequireAdmin; this is
+  // just the friendly notice, matching the Operators page).
+  if (!isAdmin) {
+    return (
+      <>
+        <PageHeader title="Usage" description="Monthly per-team compute and storage usage." />
+        <PageBody>
+          <EmptyState
+            icon={<ShieldAlert className="h-6 w-6 text-warning" />}
+            title="Admin only"
+            description="Per-team usage and cost data requires the admin role."
+          />
+        </PageBody>
+      </>
+    );
+  }
 
   return (
     <>

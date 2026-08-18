@@ -1106,8 +1106,11 @@ touching this path:
   `GET /api/v1/usage/monthly` (`controlplane/admin/usage_api.go`, backed by
   `configstore.Aggregate{Compute,Storage}UsageMonthly`) sums retained buckets
   per UTC month per (org, team), merging the compute and storage families and
-  joining the team schema name for display. It is a viewer-allowed operations
-  view, NOT an invoice: acked buckets are already deleted and >30d buckets are
+  joining the team schema name for display. It self-gates with `RequireAdmin`
+  (per-team cost data across all orgs is as sensitive as the raw billing
+  families — viewers get 403, and the UI hides the nav item / fires no query
+  for them) and it is an operations view, NOT an invoice: acked buckets are
+  already deleted and >30d buckets are
   GC'd, so the response carries the ack cursor as `watermark_low` and the UI
   shows the retention caveat instead of implying all-time totals. It adds NO
   second accounting pipeline — keep it a pure read over the buffer.

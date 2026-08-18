@@ -2743,6 +2743,12 @@ admin_console_api() {
   # No auth → 401 (the accept-list stays closed for SSO-less callers).
   code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/me")"
   [ "$code" = "401" ] || fail "GET /me with no auth returned $code, want 401"
+  # The monthly per-team usage read (cost data across every org) is behind the
+  # same auth gate — unauthenticated callers get 401. The viewer→403 split is
+  # unit-tested (TestMonthlyUsageRequiresAdmin); this e2e only holds the
+  # internal secret, which is admin.
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/usage/monthly")"
+  [ "$code" = "401" ] || fail "GET /usage/monthly with no auth returned $code, want 401"
   # Live read endpoints return their documented envelopes.
   # /queries aggregates each CP's in-memory view and reports coverage. The CI CP
   # runs a SINGLE replica, so this only asserts the envelope (cp_total==cp_responders,
