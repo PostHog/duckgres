@@ -896,6 +896,11 @@ hot_idle_reporting_and_cap() { # org
   [ "${count:-0}" -ge 1 ] || fail "hot-idle: $org never showed a parked worker in /workers/hot-idle: $(echo "$body" | head -c 400)"
   echo "$body" | jq -e --arg o "$org" '.orgs[] | select(.org_id==$o) | has("cpu_cores") and has("memory_bytes") and has("oldest_hot_idle_since") and has("cap_workers") and has("cap_cpu") and has("cap_memory")' >/dev/null \
     || fail "hot-idle: $org row missing shape/cap fields: $(echo "$body" | head -c 400)"
+  # Shape resolution must reach the CP-global default worker shape for an
+  # unsized worker on a default-less org — a zero here is the reporting bug
+  # where such workers silently contributed no cpu/memory.
+  echo "$body" | jq -e --arg o "$org" '.orgs[] | select(.org_id==$o) | .cpu_cores > 0 and .memory_bytes > 0' >/dev/null \
+    || fail "hot-idle: $org row reports zero cpu/memory (shape fallback broken): $(echo "$body" | head -c 400)"
   log "hot-idle OK: $org holds $count parked worker(s) with shape + cap fields"
 
   # Cap the pool at 1: the sweep must retire the excess down to <= 1.

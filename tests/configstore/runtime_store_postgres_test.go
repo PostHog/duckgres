@@ -213,7 +213,7 @@ func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 		}
 	}
 
-	stats, err := store.ListWorkerLifecycleStats()
+	stats, err := store.ListWorkerLifecycleStats("8", "16Gi")
 	if err != nil {
 		t.Fatalf("ListWorkerLifecycleStats: %v", err)
 	}

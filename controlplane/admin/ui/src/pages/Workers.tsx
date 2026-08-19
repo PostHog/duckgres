@@ -9,11 +9,10 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useFleet, useHotIdle, useOrgLabels, useWorkers } from "@/hooks/useApi";
 import { OrgRef } from "@/components/OrgRef";
 import { fmtAge, fmtBytes, fmtDuration, fmtInt, fmtUnits } from "@/lib/format";
-import type { WorkerStatus } from "@/types/api";
+import type { HotIdleOrg, WorkerStatus } from "@/types/api";
 
 // Canonical lifecycle-state order for the rollup chips.
 const STATE_ORDER = ["spawning", "idle", "reserved", "activating", "hot", "hot_idle", "draining"];
@@ -44,6 +43,67 @@ export function Workers() {
   const totalFleet = useMemo(() => fleetRows.reduce((n, f) => n + f.count, 0), [fleetRows]);
   const totalCpu = useMemo(() => fleetRows.reduce((n, f) => n + (f.cpu_cores ?? 0), 0), [fleetRows]);
   const totalMem = useMemo(() => fleetRows.reduce((n, f) => n + (f.memory_bytes ?? 0), 0), [fleetRows]);
+
+  const hotIdleColumns = useMemo<ColumnDef<HotIdleOrg, any>[]>(
+    () => [
+      {
+        accessorKey: "org_id",
+        header: "Org",
+        cell: ({ row }) => (
+          <Link to={`/orgs/${encodeURIComponent(row.original.org_id)}`} className="block hover:underline">
+            <OrgRef id={row.original.org_id} label={orgLabels.get(row.original.org_id)} copyable={false} />
+          </Link>
+        ),
+      },
+      {
+        accessorKey: "count",
+        header: "Workers",
+        cell: ({ row }) => {
+          const o = row.original;
+          return (
+            <span className="font-mono text-xs">
+              {fmtInt(o.count)}
+              {o.cap_workers > 0 && (
+                <span className={o.count > o.cap_workers ? "text-destructive" : "text-muted-foreground"}>
+                  {" "}/ {o.cap_workers}
+                </span>
+              )}
+            </span>
+          );
+        },
+      },
+      {
+        accessorKey: "cpu_cores",
+        header: "vCPU",
+        cell: ({ getValue }) => <span className="font-mono text-xs">{fmtUnits(getValue() as number)}</span>,
+      },
+      {
+        accessorKey: "memory_bytes",
+        header: "Memory",
+        cell: ({ getValue }) => <span className="font-mono text-xs">{fmtBytes(getValue() as number)}</span>,
+      },
+      {
+        accessorKey: "oldest_hot_idle_since",
+        header: "Longest idle",
+        cell: ({ getValue }) => {
+          const v = getValue() as string | null;
+          return <span className="text-xs text-muted-foreground">{v ? fmtAge(v) : "—"}</span>;
+        },
+      },
+      {
+        id: "cap",
+        header: "Cap",
+        accessorFn: (o: HotIdleOrg) =>
+          o.cap_workers > 0 || o.cap_cpu || o.cap_memory
+            ? [o.cap_workers > 0 ? `${o.cap_workers} workers` : null, o.cap_cpu || null, o.cap_memory || null]
+                .filter(Boolean)
+                .join(" · ")
+            : "—",
+        cell: ({ getValue }) => <span className="text-xs text-muted-foreground">{String(getValue())}</span>,
+      },
+    ],
+    [orgLabels],
+  );
 
   const columns = useMemo<ColumnDef<WorkerStatus, any>[]>(
     () => [
@@ -186,53 +246,14 @@ export function Workers() {
             ) : hotIdleRows.length === 0 ? (
               <p className="py-4 text-center text-sm text-muted-foreground">No workers are parked hot-idle.</p>
             ) : (
-              <Table>
-                <TableHeader>
-                  <TableRow className="hover:bg-transparent">
-                    <TableHead>Org</TableHead>
-                    <TableHead>Workers</TableHead>
-                    <TableHead>vCPU</TableHead>
-                    <TableHead>Memory</TableHead>
-                    <TableHead>Longest idle</TableHead>
-                    <TableHead>Cap</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {hotIdleRows.map((o) => (
-                    <TableRow key={o.org_id}>
-                      <TableCell>
-                        <Link to={`/orgs/${encodeURIComponent(o.org_id)}`} className="block hover:underline">
-                          <OrgRef id={o.org_id} label={orgLabels.get(o.org_id)} copyable={false} />
-                        </Link>
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {fmtInt(o.count)}
-                        {o.cap_workers > 0 && (
-                          <span className={o.count > o.cap_workers ? "text-destructive" : "text-muted-foreground"}>
-                            {" "}/ {o.cap_workers}
-                          </span>
-                        )}
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">{fmtUnits(o.cpu_cores)}</TableCell>
-                      <TableCell className="font-mono text-xs">{fmtBytes(o.memory_bytes)}</TableCell>
-                      <TableCell className="text-xs text-muted-foreground">
-                        {o.oldest_hot_idle_since ? fmtAge(o.oldest_hot_idle_since) : "—"}
-                      </TableCell>
-                      <TableCell className="text-xs text-muted-foreground">
-                        {o.cap_workers > 0 || o.cap_cpu || o.cap_memory
-                          ? [
-                              o.cap_workers > 0 ? `${o.cap_workers} workers` : null,
-                              o.cap_cpu || null,
-                              o.cap_memory || null,
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")
-                          : "—"}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+              <DataTable
+                data={hotIdleRows}
+                columns={hotIdleColumns}
+                // Default: most memory pinned first — that's the resource that
+                // pins nodes. Workers/vCPU/memory headers are clickable to
+                // re-sort.
+                initialSorting={[{ id: "memory_bytes", desc: true }]}
+              />
             )}
           </CardContent>
         </Card>

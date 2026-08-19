@@ -69,6 +69,17 @@ describe("Workers page hot-idle card", () => {
     expect(screen.getByText("globex")).toBeInTheDocument();
   });
 
+  it("sorts the list by memory pinned, largest first", () => {
+    renderPage();
+    // acme pins 32Gi, globex 8Gi — acme's row must come first in document
+    // order regardless of API ordering.
+    const acmeRow = screen.getByText("Acme Inc").closest("tr")!;
+    const globexRow = screen.getByText("globex").closest("tr")!;
+    expect(
+      acmeRow.compareDocumentPosition(globexRow) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("renders an empty state when nothing is parked", () => {
     hooks.useHotIdle.mockReturnValue(ok([]));
     renderPage();
