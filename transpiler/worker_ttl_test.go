@@ -96,8 +96,8 @@ func TestTranspile_WorkerTTLSetInvalidRejected(t *testing.T) {
 				t.Errorf("Transpile(%.80q): Error SQLSTATE = %v, want 22023", in, result.Error)
 			}
 			msg := result.Error.Error()
-			if !strings.Contains(msg, "duration") {
-				t.Errorf("error message must describe the expected duration shape, got %q", msg)
+			if !strings.Contains(msg, "whole minutes") {
+				t.Errorf("error message must name the whole-minute granularity, got %q", msg)
 			}
 			if strings.Contains(msg, "garbage") || strings.Contains(msg, longJunk[:64]) {
 				t.Errorf("error message must not echo the offending value, got %.120q", msg)

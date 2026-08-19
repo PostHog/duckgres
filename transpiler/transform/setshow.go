@@ -141,7 +141,7 @@ func NormalizeWorkerTTL(raw string) (string, error) {
 func errInvalidWorkerTTL() *CodedError {
 	return &CodedError{
 		Code: "22023", // invalid_parameter_value
-		Message: fmt.Sprintf("invalid value for %q: must be a non-negative Go duration (e.g. \"20m\")",
+		Message: fmt.Sprintf("invalid value for %q: must be a Go duration of at least 1m in whole minutes (e.g. \"20m\")",
 			workerTTLParam),
 	}
 }
