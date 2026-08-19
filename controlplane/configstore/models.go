@@ -448,6 +448,7 @@ type WorkerLifecycleStats struct {
 	Image       string      `json:"image"`
 	State       WorkerState `json:"state"`
 	Binding     string      `json:"binding"`
+	Org         string      `json:"org"`
 	Count       int64       `json:"count"`
 	CPUCores    float64     `json:"cpu_cores"`
 	MemoryBytes int64       `json:"memory_bytes"`
