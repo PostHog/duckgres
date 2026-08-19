@@ -491,10 +491,15 @@ no session):
 - **Reporting**: `configstore.ListHotIdleByOrg` aggregates `hot_idle` rows
   per org (count, summed vCPU/memory, oldest park) and
   `GET /api/v1/workers/hot-idle` (`controlplane/admin/live.go`) joins each
-  org's configured caps. Backs the Workers page "Hot idle by org" card.
-  Worker shape resolution mirrors the fleet rollup: the worker's explicit
-  profile wins, else the org's default worker profile; unparseable
-  quantities contribute 0.
+  org's configured caps. Backs the Workers page "Hot idle by org" card
+  (sortable, default memory-pinned desc). **Worker shape resolution is a
+  three-step chain, everywhere**: the worker's explicit profile wins, else
+  the org's default worker profile, else the CP-global default worker shape
+  (`cfg.K8s.WorkerCPURequest`/`MemoryRequest`, else the 8/16Gi constants) —
+  an unsized worker on a default-less org must never report zero cpu/memory
+  (it pins real pod requests). The same chain backs the fleet rollup
+  (`ListWorkerLifecycleStats`) and the cap sweep's shape math
+  (`orgHotIdleLimitsFromSnapshot`); unparseable quantities still contribute 0.
 - **Caps**: `max_hot_idle_workers` (count), `max_hot_idle_cpu` and
   `max_hot_idle_memory` (k8s quantity strings, e.g. `"16"` / `"64Gi"`) on
   `duckgres_orgs` (migration 000037; 0/"" = unlimited). Editable via the
@@ -520,7 +525,8 @@ no session):
     — a cap is a hard ceiling, not a freshness rule.
 - Touching any of this → update `tests/configstore/hot_idle_reporting_postgres_test.go`
   (+ the migration asserts in `migrations_postgres_test.go`),
-  `controlplane/janitor_test.go` (the cap sweep cases),
+  `controlplane/janitor_test.go` (the cap sweep cases +
+  `TestOrgHotIdleLimitsFromSnapshot` glue test),
   `controlplane/admin/api_test.go` (`TestUpdateOrgHotIdleCaps*`) +
   `live_test.go` (`TestHotIdleRoute`), `ui/src/pages/Workers.test.tsx` +
   `OrgDetail.test.tsx`, AND the `/workers/hot-idle` envelope +

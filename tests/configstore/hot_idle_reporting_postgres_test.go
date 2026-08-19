@@ -17,6 +17,7 @@ func TestHotIdleReportingPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	seedOrg(t, store, "acme")
 	seedOrg(t, store, "globex")
+	seedOrg(t, store, "initech")
 	if err := store.DB().Exec(`UPDATE duckgres_orgs SET default_worker_cpu = '2', default_worker_memory = '8Gi' WHERE name = 'acme'`).Error; err != nil {
 		t.Fatalf("set acme default profile: %v", err)
 	}
@@ -33,6 +34,10 @@ func TestHotIdleReportingPostgres(t *testing.T) {
 		{WorkerID: 2104, PodName: "w-acme-4", Image: "img", State: configstore.WorkerStateHot, OrgID: "acme", OwnerCPInstanceID: "cp-a", LastHeartbeatAt: now},
 		// globex: one hot-idle worker.
 		{WorkerID: 2105, PodName: "w-globex-1", Image: "img", State: configstore.WorkerStateHotIdle, OrgID: "globex", OwnerCPInstanceID: "cp-a", HotIdleSince: ago(30 * time.Minute), ProfileCPU: "1", ProfileMemory: "4Gi", LastHeartbeatAt: now},
+		// initech: NO org default profile and the worker carries NO explicit
+		// profile — its shape must resolve to the CP-global default passed by
+		// the caller (this was the zero-shape bug: it used to contribute 0).
+		{WorkerID: 2106, PodName: "w-initech-1", Image: "img", State: configstore.WorkerStateHotIdle, OrgID: "initech", OwnerCPInstanceID: "cp-a", HotIdleSince: ago(10 * time.Minute), LastHeartbeatAt: now},
 	}
 	for _, r := range records {
 		r := r
@@ -42,12 +47,12 @@ func TestHotIdleReportingPostgres(t *testing.T) {
 	}
 
 	// ---- per-org reporting ----
-	stats, err := store.ListHotIdleByOrg()
+	stats, err := store.ListHotIdleByOrg("8", "16Gi")
 	if err != nil {
 		t.Fatalf("ListHotIdleByOrg: %v", err)
 	}
-	if len(stats) != 2 {
-		t.Fatalf("want 2 orgs with hot-idle workers, got %d: %+v", len(stats), stats)
+	if len(stats) != 3 {
+		t.Fatalf("want 3 orgs with hot-idle workers, got %d: %+v", len(stats), stats)
 	}
 	byOrg := map[string]configstore.HotIdleOrgStat{}
 	for _, s := range stats {
@@ -70,6 +75,12 @@ func TestHotIdleReportingPostgres(t *testing.T) {
 	globex, ok := byOrg["globex"]
 	if !ok || globex.Count != 1 || globex.CPUCores != 1 {
 		t.Fatalf("globex stat wrong: %+v", globex)
+	}
+	// The no-profile, no-org-default worker resolves to the passed CP-global
+	// default — never silently zero.
+	initech, ok := byOrg["initech"]
+	if !ok || initech.Count != 1 || initech.CPUCores != 8 || initech.MemoryBytes != 16*1024*1024*1024 {
+		t.Fatalf("initech stat wrong (global-default fallback): %+v", initech)
 	}
 
 	// ---- cap sweep listing: one org, oldest first ----

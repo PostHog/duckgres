@@ -32,6 +32,32 @@ func (l orgHotIdleLimit) unlimited() bool {
 	return l.Workers <= 0 && l.CPU == "" && l.Memory == ""
 }
 
+// orgHotIdleLimitsFromSnapshot builds the janitor's per-org hot-idle pool
+// ceilings from the config snapshot. Only orgs with at least one limit set
+// appear. Each org's shape fallback (DefaultCPU/DefaultMemory — used to price
+// a parked worker that carries no explicit profile) resolves to the CP-global
+// default worker shape when the org has no default of its own, so an unsized
+// worker is priced at the pod shape it actually runs — never zero.
+func orgHotIdleLimitsFromSnapshot(snap *configstore.Snapshot, globalCPU, globalMemory string) map[string]orgHotIdleLimit {
+	if snap == nil {
+		return nil
+	}
+	caps := make(map[string]orgHotIdleLimit)
+	for name, org := range snap.Orgs {
+		if org == nil || (org.MaxHotIdleWorkers <= 0 && org.MaxHotIdleCPU == "" && org.MaxHotIdleMemory == "") {
+			continue
+		}
+		caps[name] = orgHotIdleLimit{
+			Workers:       org.MaxHotIdleWorkers,
+			CPU:           org.MaxHotIdleCPU,
+			Memory:        org.MaxHotIdleMemory,
+			DefaultCPU:    firstNonEmpty(org.DefaultWorkerCPU, globalCPU),
+			DefaultMemory: firstNonEmpty(org.DefaultWorkerMemory, globalMemory),
+		}
+	}
+	return caps
+}
+
 type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
 	ExpireDrainingControlPlaneInstances(before time.Time) (int64, error)

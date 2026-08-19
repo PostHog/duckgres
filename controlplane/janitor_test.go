@@ -628,3 +628,31 @@ func TestControlPlaneJanitorHotIdleCapSweepDisabledWhenUnwired(t *testing.T) {
 		t.Fatalf("unwired caps must retire nothing, got %#v", lifecycleStore.terminalTransitions)
 	}
 }
+
+// The multitenant.go wiring builds the caps map from the config snapshot via
+// orgHotIdleLimitsFromSnapshot — pin the glue: orgs without limits drop out,
+// an org's own default profile wins, and a default-less org falls back to the
+// CP-global shape (the zero-shape bug's fix).
+func TestOrgHotIdleLimitsFromSnapshot(t *testing.T) {
+	if got := orgHotIdleLimitsFromSnapshot(nil, "15", "120Gi"); got != nil {
+		t.Fatalf("nil snapshot must yield nil, got %v", got)
+	}
+	snap := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{
+		"acme":     {MaxHotIdleWorkers: 2, DefaultWorkerCPU: "4", DefaultWorkerMemory: "16Gi"},
+		"globex":   {MaxHotIdleCPU: "8"}, // no org default profile at all
+		"uncapped": {},
+		"nilorg":   nil,
+	}}
+	caps := orgHotIdleLimitsFromSnapshot(snap, "15", "120Gi")
+	if len(caps) != 2 {
+		t.Fatalf("want only the two capped orgs, got %v", caps)
+	}
+	acme := caps["acme"]
+	if acme.Workers != 2 || acme.DefaultCPU != "4" || acme.DefaultMemory != "16Gi" {
+		t.Fatalf("acme: org default profile must win: %+v", acme)
+	}
+	globex := caps["globex"]
+	if globex.CPU != "8" || globex.DefaultCPU != "15" || globex.DefaultMemory != "120Gi" {
+		t.Fatalf("globex: shape fallback must reach the CP-global default: %+v", globex)
+	}
+}

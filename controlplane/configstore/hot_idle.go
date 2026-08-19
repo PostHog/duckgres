@@ -22,11 +22,13 @@ type HotIdleOrgStat struct {
 }
 
 // ListHotIdleByOrg aggregates hot_idle worker rows per org for the admin
-// dashboard. Worker shape resolution mirrors ListWorkerLifecycleStats: the
-// worker's explicit profile wins, else the org's default worker profile;
-// unparseable/empty quantities contribute 0. Orgs with no hot-idle workers
-// do not appear.
-func (cs *ConfigStore) ListHotIdleByOrg() ([]HotIdleOrgStat, error) {
+// dashboard. Worker shape resolution: the worker's explicit profile wins,
+// else the org's default worker profile, else the CP-global default worker
+// shape passed by the caller (defaultCPU/defaultMemory — the pod requests the
+// worker was actually spawned with; pass "" to keep the legacy
+// zero-contribution). Unparseable quantities contribute 0. Orgs with no
+// hot-idle workers do not appear.
+func (cs *ConfigStore) ListHotIdleByOrg(defaultCPU, defaultMemory string) ([]HotIdleOrgStat, error) {
 	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
 	orgTable := (&Org{}).TableName()
 	type workerRow struct {
@@ -36,11 +38,12 @@ func (cs *ConfigStore) ListHotIdleByOrg() ([]HotIdleOrgStat, error) {
 		HotIdleSince *time.Time
 	}
 	var rows []workerRow
-	err := cs.db.Table(workerTable + " AS w").
+	err := cs.db.Table(workerTable+" AS w").
 		Select("w.org_id AS org_id, "+
-			"COALESCE(NULLIF(w.profile_cpu, ''), o.default_worker_cpu, '') AS cpu, "+
-			"COALESCE(NULLIF(w.profile_memory, ''), o.default_worker_memory, '') AS memory, "+
-			"w.hot_idle_since AS hot_idle_since").
+			"COALESCE(NULLIF(w.profile_cpu, ''), NULLIF(o.default_worker_cpu, ''), ?) AS cpu, "+
+			"COALESCE(NULLIF(w.profile_memory, ''), NULLIF(o.default_worker_memory, ''), ?) AS memory, "+
+			"w.hot_idle_since AS hot_idle_since",
+			defaultCPU, defaultMemory).
 		Joins("LEFT JOIN " + orgTable + " AS o ON o.name = w.org_id").
 		Where("w.state = ? AND w.org_id <> ''", WorkerStateHotIdle).
 		Order("w.org_id ASC").

@@ -23,6 +23,12 @@ type clusterInfoProvider struct {
 	srv              *server.Server
 	selfCPID         string
 	metadataSessions *metadataProxySessionRegistry
+	// defaultWorkerCPU/Memory are the CP-global default worker shape (the pod
+	// requests unsized workers are actually spawned with) — the final
+	// fallback in shape resolution for fleet/hot-idle reporting so an unsized
+	// worker on a default-less org doesn't report zero cpu/memory.
+	defaultWorkerCPU    string
+	defaultWorkerMemory string
 }
 
 var _ admin.LiveInfo = (*clusterInfoProvider)(nil)
@@ -135,7 +141,7 @@ func (p *clusterInfoProvider) QueryDetailForWorkerID(workerID int) (admin.QueryD
 // durable runtime store — the only source that sees hot-idle/spawning/draining
 // workers that hold no session.
 func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
-	stats, err := p.store.ListWorkerLifecycleStats()
+	stats, err := p.store.ListWorkerLifecycleStats(p.defaultWorkerCPU, p.defaultWorkerMemory)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +162,7 @@ func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
 // HotIdleByOrg returns each org's hot-idle pool footprint (durable runtime
 // store) joined with its configured max_hot_idle_* caps (config orgs table).
 func (p *clusterInfoProvider) HotIdleByOrg() ([]admin.HotIdleOrg, error) {
-	stats, err := p.store.ListHotIdleByOrg()
+	stats, err := p.store.ListHotIdleByOrg(p.defaultWorkerCPU, p.defaultWorkerMemory)
 	if err != nil {
 		return nil, err
 	}
