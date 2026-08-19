@@ -1119,6 +1119,14 @@ touching this path:
   GC'd, so responses carry the ack cursor as `watermark_low` and the UI
   shows the retention caveat instead of implying all-time totals. They add NO
   second accounting pipeline — keep them pure reads over the buffer.
+  The Usage page also carries a **client-side pricing-sensitivity calculator**
+  (`ui/src/pages/UsagePricing.tsx` + `lib/pricing.ts`): named unit-price
+  scenarios ($/CPU-min, $/GiB·min, $/GiB·h) priced against each org's month
+  totals. It is pure browser math over the monthly rows — no endpoint, no
+  persistence beyond the operator's own localStorage — so it inherits the
+  page's admin-only gate and needs no server-side access control of its own
+  (a PM gets it by holding the console admin role; a lighter pricing-viewer
+  role is a named follow-up, not implemented).
 - Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
   the storage sampler, or the bucket keys → update
   `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,

@@ -6,6 +6,7 @@ import { PageBody, PageHeader } from "@/components/AppShell";
 import { DataTable } from "@/components/DataTable";
 import { OrgRef } from "@/components/OrgRef";
 import { StatCard } from "@/components/StatCard";
+import { UsagePricing } from "@/pages/UsagePricing";
 import { Card } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
@@ -200,6 +201,7 @@ export function Usage() {
                 />
               </Card>
             )}
+            <UsagePricing rows={monthRows} />
           </>
         )}
       </PageBody>
