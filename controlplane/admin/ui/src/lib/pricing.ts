@@ -46,6 +46,15 @@ export function scenarioCost(t: OrgUsageTotals, s: PriceScenario): number {
   return t.cpuMinutes * s.cpuPerMin + t.memGiBMinutes * s.memPerGiBMin + t.storageGiBHours * s.storagePerGiBH;
 }
 
+// Grounded defaults for a fresh scenario, so the calculator is useful on
+// first open — roughly EC2 on-demand m6i/r6gd-class economics (≈$0.024/vCPU·h
+// and ≈$0.006/GiB·h RAM, i.e. half the instance price attributed to each)
+// plus S3 standard storage (≈$0.023/GiB·mo ≈ $0.00003/GiB·h). These are
+// editable starting points for sensitivity analysis, not PostHog pricing.
+export const DEFAULT_CPU_PER_MIN = 0.0004;
+export const DEFAULT_MEM_PER_GIB_MIN = 0.0001;
+export const DEFAULT_STORAGE_PER_GIB_H = 0.00003;
+
 // parsePrice reads a price input: non-negative finite numbers pass through,
 // anything else (empty, NaN, negative) is 0 — a half-typed input must never
 // make a cost cell NaN.

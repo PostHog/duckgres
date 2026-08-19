@@ -15,10 +15,15 @@ const ROWS: MonthlyUsageRow[] = [
   { month: "2026-08", org_id: "globex", team_id: 9, schema_name: "team_9", cpu_seconds: 1200, memory_seconds: 0, gib_seconds: 0 },
 ];
 
+const LABELS = new Map([
+  ["acme", "Acme Inc"],
+  ["globex", "Globex Corp"],
+]);
+
 function renderPricing(rows = ROWS) {
   return render(
     <MemoryRouter>
-      <UsagePricing rows={rows} />
+      <UsagePricing rows={rows} labels={LABELS} />
     </MemoryRouter>,
   );
 }
@@ -28,14 +33,28 @@ describe("UsagePricing", () => {
     localStorage.clear();
   });
 
-  it("starts with one baseline scenario and zero costs", () => {
+  it("starts with a baseline scenario prefilled with grounded default prices", () => {
     renderPricing();
-    // One scenario editor.
     expect(screen.getByDisplayValue("Baseline")).toBeInTheDocument();
-    // acme + globex rows and the all-orgs total, each $0.00.
-    expect(screen.getByText("acme")).toBeInTheDocument();
-    expect(screen.getByText("globex")).toBeInTheDocument();
-    expect(screen.getAllByText("$0.00")).toHaveLength(3);
+    // Defaults ≈ EC2 on-demand m6i-class economics + S3 standard storage:
+    // $0.0004/CPU-min ($0.024/vCPU·h), $0.0001/GiB·min ($0.006/GiB·h RAM),
+    // $0.00003/GiB·h (~$0.022/GiB·mo S3).
+    expect(screen.getByLabelText("Baseline $/CPU-min")).toHaveValue(0.0004);
+    expect(screen.getByLabelText("Baseline $/GiB·min")).toHaveValue(0.0001);
+    expect(screen.getByLabelText("Baseline $/GiB·h")).toHaveValue(0.00003);
+    // The defaults already price the orgs — the calculator is useful on open:
+    // acme: 130×0.0004 + 70×0.0001 + 3×0.00003 = $0.0590 → $0.06;
+    // globex: 20×0.0004 = $0.008 → $0.01; total $0.067 → $0.07.
+    expect(screen.getByText("$0.06")).toBeInTheDocument();
+    expect(screen.getByText("$0.01")).toBeInTheDocument();
+    expect(screen.getByText("$0.07")).toBeInTheDocument();
+  });
+
+  it("shows the org's friendly name with its ID, linked to the org page", () => {
+    renderPricing();
+    expect(screen.getByText("Acme Inc")).toBeInTheDocument();
+    expect(screen.getByText("Globex Corp")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /acme inc/i })).toHaveAttribute("href", "/orgs/acme");
   });
 
   it("prices each org and the grand total from the entered prices", () => {
@@ -52,15 +71,15 @@ describe("UsagePricing", () => {
   it("adds a scenario column for side-by-side sensitivity", () => {
     renderPricing();
     fireEvent.click(screen.getByRole("button", { name: /add scenario/i }));
-    // Two scenario editors now: Baseline + Scenario B.
+    // Two scenario editors now: Baseline + Scenario B (also prefilled).
     expect(screen.getByDisplayValue("Baseline")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Scenario B")).toBeInTheDocument();
-    // Price only B: acme = 130 × 0.5 = $65.00 under B, still $0.00 under Baseline.
+    // Price only B's CPU: acme = 130×0.5 + 70×0.0001 + 3×0.00003 = $65.00709
+    // → $65.01 under B; Baseline keeps its default-priced $0.06.
     fireEvent.change(screen.getByLabelText("Scenario B $/CPU-min"), { target: { value: "0.5" } });
-    expect(screen.getByText("$65.00")).toBeInTheDocument();
-    // acme's Baseline cell stays $0.00 while B prices at $65.00.
-    const acmeRow = screen.getByText("acme").closest("tr")!;
-    expect(within(acmeRow).getByText("$0.00")).toBeInTheDocument();
+    expect(screen.getByText("$65.01")).toBeInTheDocument();
+    const acmeRow = screen.getByText("Acme Inc").closest("tr")!;
+    expect(within(acmeRow).getByText("$0.06")).toBeInTheDocument();
   });
 
   it("persists scenarios to localStorage across remounts", () => {
@@ -68,7 +87,8 @@ describe("UsagePricing", () => {
     fireEvent.change(screen.getByLabelText("Baseline $/CPU-min"), { target: { value: "0.1" } });
     unmount();
     renderPricing();
-    expect(screen.getByText("$13.00")).toBeInTheDocument(); // acme 130 × 0.1
+    // acme 130×0.1 + 70×0.0001 + 3×0.00003 = $13.00709 → $13.01
+    expect(screen.getByText("$13.01")).toBeInTheDocument();
   });
 
   it("renders a friendly empty state without usage rows", () => {
