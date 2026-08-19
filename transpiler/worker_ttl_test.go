@@ -19,7 +19,6 @@ func TestTranspile_WorkerTTLSet(t *testing.T) {
 		{"set minutes", "SET duckgres.worker_ttl = '20m'", "20m0s"},
 		{"set hours", "SET duckgres.worker_ttl = '24h'", "24h0m0s"},
 		{"compound duration", "SET duckgres.worker_ttl = '1h30m'", "1h30m0s"},
-		{"zero disables warm retention", "SET duckgres.worker_ttl = '0s'", "0s"},
 		{"set local", "SET LOCAL duckgres.worker_ttl = '20m'", "20m0s"},
 		{"case-insensitive name", "SET DUCKGRES.WORKER_TTL = '20m'", "20m0s"},
 		{"whitespace trimmed", "SET duckgres.worker_ttl = ' 20m '", "20m0s"},
@@ -67,6 +66,13 @@ func TestTranspile_WorkerTTLSetInvalidRejected(t *testing.T) {
 		"garbage":           "SET duckgres.worker_ttl = 'garbage'",
 		"missing unit":      "SET duckgres.worker_ttl = '20'",
 		"negative duration": "SET duckgres.worker_ttl = '-5m'",
+		// Zero and sub-minute values are rejected: the parked TTL is
+		// persisted in whole minutes, where 0 means "deployment default" —
+		// accepting them would park the worker for the default while SHOW
+		// reports the shorter value (SHOW must never lie).
+		"zero":                  "SET duckgres.worker_ttl = '0s'",
+		"sub-minute":            "SET duckgres.worker_ttl = '30s'",
+		"non-whole-minute":      "SET duckgres.worker_ttl = '90s'",
 		"10KB string":       "SET duckgres.worker_ttl = '" + longJunk + "'",
 		"integer constant":  "SET duckgres.worker_ttl = 2",
 		"multiple values":   "SET duckgres.worker_ttl = '20m', '30m'",

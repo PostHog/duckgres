@@ -443,7 +443,7 @@ PGOPTIONS='-c duckgres.worker_ttl=20m' psql "host=<host> dbname=ducklake sslmode
 ```
 
 ```sql
-SET duckgres.worker_ttl = '20m';   -- Go duration; 0s retires the worker at session end
+SET duckgres.worker_ttl = '20m';   -- Go duration, whole minutes, minimum 1m
 SHOW duckgres.worker_ttl;          -- the TTL this session's worker will park with
 RESET duckgres.worker_ttl;         -- back to the connect-time value
 ```
@@ -453,8 +453,11 @@ takes effect on the bound worker immediately and governs the park when the
 session ends. Both forms are gated on
 `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE` (a mid-session `SET` is rejected
 with 22023 when the gate is off) and clamped to
-`DUCKGRES_K8S_WORKER_MAX_TTL`. The TTL is stamped with whole-minute precision,
-so sub-minute overrides round down. On the standalone/process backends there is
+`DUCKGRES_K8S_WORKER_MAX_TTL`. The TTL is stamped with whole-minute precision
+(`ttl_minutes`, where 0 means "deployment default"), so a mid-session `SET`
+rejects zero and sub-minute values with 22023 rather than parking the worker
+for a TTL `SHOW` would misreport. (A sub-minute startup option still truncates
+to whole minutes at park — pre-existing.) On the standalone/process backends there is
 no hot-idle TTL to override; `SET`/`SHOW` are accepted as session state only.
 
 ### PostHog Logging

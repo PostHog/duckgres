@@ -446,3 +446,88 @@ func TestWorkerTTLEscalationReapplyFailureResetsState(t *testing.T) {
 		t.Fatal("onExploratoryWorker = true after a failed re-apply; the escalation itself SUCCEEDED and must not be rolled back")
 	}
 }
+
+// TestWorkerTTLDescribeShow covers BOTH Describe variants for
+// `SHOW duckgres.worker_ttl`: statement ('S') AND portal ('P'). The portal
+// case is the regression guard for a gap where Describe(P) fell through to
+// the generic path — returning NoData (wrong metadata for describing
+// drivers) and, on a lazily-activated exploratory connection, acquiring a
+// worker to probe DuckDB with a GUC it does not know.
+func TestWorkerTTLDescribeShow(t *testing.T) {
+	c, out := newWorkerTTLConn(&selectOneExecutor{}, &recordingWorkerTTLControl{baseline: time.Minute})
+	c.stmts = make(map[string]*preparedStmt)
+	c.portals = make(map[string]*portal)
+
+	// Parse + Bind a SHOW.
+	c.handleParse(append([]byte("s1\x00SHOW duckgres.worker_ttl\x00"), 0, 0))
+	bindBody := append([]byte("\x00s1\x00"), 0, 0, 0, 0, 0, 0)
+	c.handleBind(bindBody)
+
+	// Describe(S): RowDescription with the GUC column.
+	out.Reset()
+	c.handleDescribe([]byte("Ss1\x00"))
+	_ = c.flushWriter()
+	msgs := parseWireMsgs(t, out.Bytes())
+	if !rowDescriptionNamed(msgs, WorkerTTLGUCName) {
+		t.Fatalf("Describe(S) of SHOW %s did not return a RowDescription naming the GUC; msgs=%s", WorkerTTLGUCName, describeMsgs(msgs))
+	}
+
+	// Describe(P): same — RowDescription, not NoData, and no engine probe.
+	out.Reset()
+	c.handleDescribe([]byte("P\x00"))
+	_ = c.flushWriter()
+	msgs = parseWireMsgs(t, out.Bytes())
+	if !rowDescriptionNamed(msgs, WorkerTTLGUCName) {
+		t.Fatalf("Describe(P) of SHOW %s did not return a RowDescription naming the GUC; msgs=%s", WorkerTTLGUCName, describeMsgs(msgs))
+	}
+}
+
+// rowDescriptionNamed reports whether msgs contains a RowDescription ('T')
+// whose text names col.
+func rowDescriptionNamed(msgs []wireMsg, col string) bool {
+	for _, m := range msgs {
+		if m.typ == 'T' && bytes.Contains(m.body, []byte(col)) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEscalationReapplyRunsBothOverrides asserts that when BOTH session
+// worker-state GUCs are set (s3_cache bypass + worker_ttl override) and the
+// s3_cache re-apply FAILS on the escalated worker, the worker_ttl re-apply
+// still runs: an early return there previously left the override set while
+// the new worker parked at its baseline TTL — SHOW would then lie about the
+// exact state this path exists to keep truthful. The s3 session state resets
+// to the worker's actual transport; the TTL override survives its own
+// successful re-apply.
+func TestEscalationReapplyRunsBothOverrides(t *testing.T) {
+	ttlRec := &recordingWorkerTTLControl{baseline: 48 * time.Hour}
+	c, _ := newWorkerTTLConn(&selectOneExecutor{}, ttlRec)
+	if err := c.handleQuery([]byte("SET duckgres.worker_ttl = '20m'\x00")); err != nil {
+		t.Fatalf("handleQuery(SET 20m): %v", err)
+	}
+	c.s3CacheMode = transform.S3CacheOff // session bypass active
+
+	s3Exec := &s3CacheRecordingExecutor{err: errors.New("worker: secret swap failed")}
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return s3Exec, 8, "worker-8", nil
+	}
+	err := c.escalateWorker(context.Background(), escalateReasonState)
+	if err == nil || !errors.Is(err, errS3CacheReapplyFailed) {
+		t.Fatalf("escalateWorker error = %v, want tagged errS3CacheReapplyFailed", err)
+	}
+	// The TTL re-apply RAN despite the s3 failure (SET + re-apply = 2 calls).
+	if len(ttlRec.applied) != 2 || ttlRec.applied[1] != 20*time.Minute {
+		t.Fatalf("worker_ttl re-apply after the s3 failure: applied = %v, want the override re-applied", ttlRec.applied)
+	}
+	// s3 session state was reset to the worker's actual transport (proxied).
+	if c.s3CacheMode != transform.S3CacheOn {
+		t.Fatalf("s3CacheMode = %q after failed re-apply, want %q (worker's real transport)", c.s3CacheMode, transform.S3CacheOn)
+	}
+	// The TTL override survived its own successful re-apply.
+	if got := c.workerTTLValue(); got != "20m0s" {
+		t.Fatalf("workerTTLValue() = %q, want %q (override preserved)", got, "20m0s")
+	}
+}

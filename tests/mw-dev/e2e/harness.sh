@@ -621,6 +621,26 @@ query_source_guc() { # org password
 # startup options, and the fresh-session default. The actual secret-transport
 # swap and its restore/rotation invariants are unit-covered
 # (duckdbservice/s3_cache_test.go).
+worker_ttl_guc() { # org password
+  log "duckgres.worker_ttl session GUC on $1"
+  # Mid-session SET drives the control-plane apply hook (the bound worker's
+  # pool-side hot-idle TTL), SHOW reports the applied value, and RESET
+  # restores the connect-time baseline (the built-in 1m — the e2e CP sets no
+  # DUCKGRES_K8S_WORKER_DEFAULT_TTL).
+  assert_lastline "$1" "$2" ducklake "SET duckgres.worker_ttl = '5m'; SHOW duckgres.worker_ttl" "5m0s" "worker_ttl_set"
+  assert_lastline "$1" "$2" ducklake "SET duckgres.worker_ttl = '5m'; RESET duckgres.worker_ttl; SHOW duckgres.worker_ttl" "1m0s" "worker_ttl_reset"
+  # Whole-minute persistence: zero/sub-minute values are rejected with 22023
+  # (ttl_minutes=0 means "deployment default" at reap time, so accepting them
+  # would park the worker for the default while SHOW reported the short TTL).
+  if out="$(pg_try "$1" "$2" ducklake "SET duckgres.worker_ttl = '30s'")"; then
+    fail "worker_ttl: sub-minute value '30s' was accepted: $out"
+  fi
+  case "$out" in
+    *"whole minutes"*) ;;
+    *) fail "worker_ttl: sub-minute rejection did not name the granularity: '$out'" ;;
+  esac
+}
+
 s3_cache_guc() { # org password
   log "duckgres.s3_cache session GUC on $1"
   # Default is on; SET off round-trips within the session (this flip drives
@@ -4137,6 +4157,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   pg_compat_functions    "$CNPG" "$cnpg_pw"
   query_source_guc       "$CNPG" "$cnpg_pw"
   s3_cache_guc           "$CNPG" "$cnpg_pw"
+  worker_ttl_guc         "$CNPG" "$cnpg_pw"
   malformed_startup_resilience "$CNPG" "$cnpg_pw"
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold

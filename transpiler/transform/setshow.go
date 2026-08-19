@@ -114,11 +114,14 @@ func errInvalidS3Cache() *CodedError {
 const workerTTLParam = "duckgres.worker_ttl"
 
 // NormalizeWorkerTTL validates a client-supplied duckgres.worker_ttl value: a
-// non-negative Go duration ("20m", "1h30m", "0s" — zero retires the worker as
-// soon as the session ends, matching the startup option). Matching ignores
+// Go duration of at least one minute ("20m", "1h30m"). Matching ignores
 // surrounding whitespace; the returned value is the canonical duration string.
 // Empty is valid and means "reset to default" (the session then parks with the
-// TTL resolved at connect time). An invalid value returns a 22023
+// TTL resolved at connect time). Zero and sub-minute values are REJECTED:
+// the parked TTL is persisted with whole-minute precision (ttl_minutes), where
+// 0 means "reaper applies the deployment default" — accepting 30s/0s would
+// silently park the worker for the deployment default instead, with SHOW
+// reporting a TTL the reapers never honor. An invalid value returns a 22023
 // (invalid_parameter_value) CodedError that, like NormalizeQuerySource, does
 // not echo the offending client input.
 func NormalizeWorkerTTL(raw string) (string, error) {
@@ -127,7 +130,7 @@ func NormalizeWorkerTTL(raw string) (string, error) {
 		return "", nil
 	}
 	d, err := time.ParseDuration(v)
-	if err != nil || d < 0 {
+	if err != nil || d < time.Minute || d%time.Minute != 0 {
 		return "", errInvalidWorkerTTL()
 	}
 	return d.String(), nil

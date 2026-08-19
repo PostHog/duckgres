@@ -242,9 +242,17 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	// and the STATEMENT fails; the escalation stands (outcome is already
 	// counted "ok" above — the swap happened), so the pin is deliberately NOT
 	// rolled back.
+	// BOTH re-assertions run unconditionally: returning early on an s3_cache
+	// failure would leave a worker_ttl override set while the new worker parks
+	// at its baseline TTL — SHOW would then lie about the very state this
+	// block exists to keep truthful. Each failure resets its own session state
+	// to match the worker's ACTUAL state; a joined error reports every failed
+	// re-apply in one statement error (failEscalation routes either sentinel
+	// to the same non-fatal handler).
+	var reapplyErr error
 	if err := c.reapplyS3CacheAfterWorkerSwitch(ctx); err != nil {
 		c.s3CacheMode = transform.S3CacheOn
-		return &s3CacheReapplyError{err: err}
+		reapplyErr = errors.Join(reapplyErr, &s3CacheReapplyError{err: err})
 	}
 	// Same re-assertion for a duckgres.worker_ttl override: it is pool-side
 	// per-worker state, and the new worker's profile carries the TTL resolved
@@ -253,9 +261,9 @@ func (c *clientConn) escalateWorker(ctx context.Context, reason string) error {
 	// the STATEMENT fails; the escalation stands, as above.
 	if err := c.reapplyWorkerTTLAfterWorkerSwitch(ctx); err != nil {
 		c.workerTTLOverride = nil
-		return &workerTTLReapplyError{err: err}
+		reapplyErr = errors.Join(reapplyErr, &workerTTLReapplyError{err: err})
 	}
-	return nil
+	return reapplyErr
 }
 
 // errConnectionFatal marks an error that must TERMINATE the connection rather

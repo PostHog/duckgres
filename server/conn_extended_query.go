@@ -470,11 +470,13 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// duckgres-namespaced custom GUCs (query_source, s3_cache): answered
-		// from session state, never probed against DuckDB (which does not know
-		// these settings — the LIMIT-0 probe below would just fail and degrade
-		// to NoData). SET returns no rows; SHOW returns a single text column.
-		if p.stmt.querySourceSet != nil || p.stmt.s3CacheSet != nil {
+		// duckgres-namespaced custom GUCs (query_source, s3_cache, worker_ttl):
+		// answered from session state, never probed against DuckDB (which does
+		// not know these settings — the LIMIT-0 probe below would just fail and
+		// degrade to NoData, and on the exploratory tier it would acquire a
+		// worker to do it). SET returns no rows; SHOW returns a single text
+		// column.
+		if p.stmt.querySourceSet != nil || p.stmt.s3CacheSet != nil || p.stmt.workerTTLSet != nil {
 			_ = wire.WriteNoData(c.writer)
 			return
 		}
@@ -485,6 +487,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		if p.stmt.s3CacheShow {
 			_ = c.sendRowDescriptionWithFormats([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
+			p.described = true
+			return
+		}
+		if p.stmt.workerTTLShow {
+			_ = c.sendRowDescriptionWithFormats([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
 			p.described = true
 			return
 		}
