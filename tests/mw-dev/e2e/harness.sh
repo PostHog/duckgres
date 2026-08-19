@@ -625,10 +625,15 @@ worker_ttl_guc() { # org password
   log "duckgres.worker_ttl session GUC on $1"
   # Mid-session SET drives the control-plane apply hook (the bound worker's
   # pool-side hot-idle TTL), SHOW reports the applied value, and RESET
-  # restores the connect-time baseline (the built-in 1m — the e2e CP sets no
-  # DUCKGRES_K8S_WORKER_DEFAULT_TTL).
+  # restores the connect-time baseline (here the exploratory tier's 10m —
+  # these are plain connections, and the e2e CP sets
+  # DUCKGRES_EXPLORATORY_WORKER_TTL=10m).
   assert_lastline "$1" "$2" ducklake "SET duckgres.worker_ttl = '5m'; SHOW duckgres.worker_ttl" "5m0s" "worker_ttl_set"
-  assert_lastline "$1" "$2" ducklake "SET duckgres.worker_ttl = '5m'; RESET duckgres.worker_ttl; SHOW duckgres.worker_ttl" "1m0s" "worker_ttl_reset"
+  # RESET restores the CONNECT-TIME baseline — for a plain connection on this
+  # e2e CP that is the exploratory tier's TTL (manifests.tmpl.yaml sets
+  # DUCKGRES_EXPLORATORY_WORKER_TTL=10m), NOT the built-in 1m: the SET bound
+  # an exploratory worker and the baseline is that profile's TTL.
+  assert_lastline "$1" "$2" ducklake "SET duckgres.worker_ttl = '5m'; RESET duckgres.worker_ttl; SHOW duckgres.worker_ttl" "10m0s" "worker_ttl_reset"
   # Whole-minute persistence: zero/sub-minute values are rejected with 22023
   # (ttl_minutes=0 means "deployment default" at reap time, so accepting them
   # would park the worker for the default while SHOW reported the short TTL).
