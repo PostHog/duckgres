@@ -2808,7 +2808,10 @@ admin_console_api() {
     || fail "/cluster/summary missing numeric totals (nodes/workers/cpu/mem/placeholders/pending)"
   # The monthly per-team usage read backing the admin "Usage" page: envelope
   # only here (rows may be empty before any usage lands); the populated path
-  # is asserted in compute_usage_pull_api against real generated usage.
+  # is asserted in compute_usage_pull_api against real generated usage. (The
+  # page's pricing-sensitivity calculator has no e2e assertion BY DESIGN: it
+  # is pure client-side math over this endpoint's rows — no backend surface —
+  # covered by ui/src/pages/UsagePricing.test.tsx + lib/pricing.test.ts.)
   curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
     | jq -e 'has("rows") and (.rows | type == "array") and has("months") and has("from") and has("watermark_low")' >/dev/null \
     || fail "/usage/monthly did not return its envelope"

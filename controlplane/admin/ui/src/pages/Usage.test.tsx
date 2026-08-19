@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { MonthlyUsageResponse } from "@/types/api";
 
@@ -72,8 +72,9 @@ describe("Usage page", () => {
     hooks.useMonthlyUsage.mockReturnValue(ok(RESPONSE));
     renderPage();
 
-    // August total CPU-minutes = 120 + 1 = 121.
-    expect(screen.getByText("121")).toBeInTheDocument();
+    // August total CPU-minutes = 120 + 1 = 121 (scoped to the stat card — the
+    // pricing table shows the same org sum).
+    expect(within(screen.getByTestId("stat-CPU-min")).getByText("121")).toBeInTheDocument();
   });
 
   it("renders the retention caveat when billing has acked a watermark", () => {
