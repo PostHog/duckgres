@@ -7,12 +7,30 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 const (
 	janitorRetireReasonOrphaned        = "orphaned"
 	janitorRetireReasonStuckActivating = "stuck_activating"
+	janitorRetireReasonHotIdleCap      = "hot_idle_cap_exceeded"
 )
+
+// orgHotIdleLimit is one org's configured hot-idle pool ceiling. Zero/empty
+// fields are unlimited. DefaultCPU/DefaultMemory are the org's default worker
+// profile, used to resolve the shape of a parked worker that carries no
+// explicit profile (same fallback as the fleet/hot-idle reporting).
+type orgHotIdleLimit struct {
+	Workers       int
+	CPU           string
+	Memory        string
+	DefaultCPU    string
+	DefaultMemory string
+}
+
+func (l orgHotIdleLimit) unlimited() bool {
+	return l.Workers <= 0 && l.CPU == "" && l.Memory == ""
+}
 
 type controlPlaneExpiryStore interface {
 	ExpireControlPlaneInstances(cutoff time.Time) (int64, error)
@@ -21,6 +39,7 @@ type controlPlaneExpiryStore interface {
 	ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]configstore.WorkerSnapshot, error)
 	ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
 	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
+	ListOrgHotIdleSnapshots(orgID string) ([]configstore.WorkerSnapshot, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -41,6 +60,11 @@ type ControlPlaneJanitor struct {
 	cleanupOrphanedWorkerPods     func() // deletes K8s worker pods whose DB row is terminal (retired/lost) or missing (leader-only)
 	reconcileHeadroom             func() // maintains low-priority placeholder pods at the dynamic headroom target (spawn-log-derived count/size; leader-only)
 	hotIdleFloor                  func(configstore.WorkerSnapshot) int
+	// hotIdleCaps returns every org's configured hot-idle pool ceiling (orgs
+	// with no limit set may be omitted). nil disables the cap sweep. Wired
+	// from the config snapshot in multitenant.go, so a cap edit takes effect
+	// on the next tick after the poll reload.
+	hotIdleCaps func() map[string]orgHotIdleLimit
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -195,6 +219,8 @@ func (j *ControlPlaneJanitor) runOnce() {
 				observeHotIdleReapRun(j.now())
 			}
 		}
+
+		j.reapHotIdleCaps()
 	}
 
 	// Gradual rolling replacement of workers whose Deployment version
@@ -221,4 +247,108 @@ func (j *ControlPlaneJanitor) runOnce() {
 		j.reconcileHeadroom()
 	}
 
+}
+
+// reapHotIdleCaps retires each capped org's OLDEST hot-idle workers until the
+// org's parked pool is within ALL of its configured limits (count, total
+// vCPU, total memory). It is deliberately a convergent sweep on the janitor
+// tick — not a park-time check — so it uniformly covers every park path
+// (session release, drain sweep, takeover) AND cap decreases: lower the cap
+// in the admin console and the excess drains on the next ticks. The fenced
+// RetireFromSnapshot CAS makes concurrent leader/fallback/janitor retires
+// safe; the leader janitor runs this, and a wedged leader is already caught
+// by the TTL reaper's last-reap gauge. On conflict with the warm-pool floor
+// (DefaultWorkerMinHotIdle) the CAP wins — it is the explicit operator
+// intent; the floor only guards the TTL reaper. Disabled when hotIdleCaps is
+// nil. Runs even when hotIdleTTL is 0 (the TTL reaper is off) — a cap is a
+// hard ceiling, not a freshness rule.
+func (j *ControlPlaneJanitor) reapHotIdleCaps() {
+	if j.hotIdleCaps == nil {
+		return
+	}
+	caps := j.hotIdleCaps()
+	if len(caps) == 0 {
+		return
+	}
+	for org, lim := range caps {
+		if lim.unlimited() {
+			continue
+		}
+		snaps, err := j.store.ListOrgHotIdleSnapshots(org)
+		if err != nil {
+			slog.Warn("Janitor failed to list org hot-idle workers for cap sweep.", "org", org, "error", err)
+			continue
+		}
+		cpuCap := quantityCores(lim.CPU)    // 0 = unlimited
+		memCap := quantityBytes(lim.Memory) // 0 = unlimited
+
+		// Resolve each parked worker's shape (explicit profile, else the org
+		// default — same fallback as the reporting) and total the pool.
+		type shape struct {
+			cpu float64
+			mem int64
+		}
+		shapes := make([]shape, len(snaps))
+		var totalCPU float64
+		var totalMem int64
+		for i, s := range snaps {
+			cpu, mem := s.ProfileCPU(), s.ProfileMemory()
+			if cpu == "" {
+				cpu = lim.DefaultCPU
+			}
+			if mem == "" {
+				mem = lim.DefaultMemory
+			}
+			shapes[i] = shape{cpu: quantityCores(cpu), mem: quantityBytes(mem)}
+			totalCPU += shapes[i].cpu
+			totalMem += shapes[i].mem
+		}
+
+		// Retire the oldest-first prefix until within ALL limits. On a retire
+		// error, STOP this org (rather than marching on and over-reaping on a
+		// transient failure) — the next tick retries.
+		remaining := len(snaps)
+		for i, s := range snaps {
+			overCount := lim.Workers > 0 && remaining > lim.Workers
+			overCPU := cpuCap > 0 && totalCPU > cpuCap
+			overMem := memCap > 0 && totalMem > memCap
+			if !overCount && !overCPU && !overMem {
+				break
+			}
+			if _, err := j.lifecycle.RetireFromSnapshot(s, configstore.WorkerStateRetired, janitorRetireReasonHotIdleCap, LifecycleOriginJanitorHotIdleCap); err != nil {
+				slog.Warn("Janitor failed to retire hot-idle worker over cap.", "worker", s.WorkerID(), "worker_pod", s.PodName(), "org", org, "error", err)
+				break
+			}
+			slog.Info("Janitor retired hot-idle worker over the org's cap.", "worker", s.WorkerID(), "worker_pod", s.PodName(), "org", org)
+			remaining--
+			totalCPU -= shapes[i].cpu
+			totalMem -= shapes[i].mem
+		}
+	}
+}
+
+// quantityCores/quantityBytes parse k8s quantity strings ("4", "500m",
+// "16Gi") for cap accounting. Unparseable or empty input is 0 — for CAPS
+// that means unlimited, for worker shapes it means the worker contributes
+// nothing (consistent with the fleet/hot-idle reporting's resolution).
+func quantityCores(s string) float64 {
+	if s == "" {
+		return 0
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0
+	}
+	return q.AsApproximateFloat64()
+}
+
+func quantityBytes(s string) int64 {
+	if s == "" {
+		return 0
+	}
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		return 0
+	}
+	return q.Value()
 }

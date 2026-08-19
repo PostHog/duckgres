@@ -91,6 +91,9 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.DefaultWorkerMemory = updates.DefaultWorkerMemory
 	org.DefaultWorkerTTL = updates.DefaultWorkerTTL
 	org.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
+	org.MaxHotIdleWorkers = updates.MaxHotIdleWorkers
+	org.MaxHotIdleCPU = updates.MaxHotIdleCPU
+	org.MaxHotIdleMemory = updates.MaxHotIdleMemory
 	if updates.DataImportsTableNamingVersion != "" {
 		org.DataImportsTableNamingVersion = updates.DataImportsTableNamingVersion
 	}
@@ -3371,5 +3374,70 @@ func TestAdminRevokeServiceGrant(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("ghost org: status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The hot-idle pool caps merge presence-aware like every other org column:
+// present wins (including 0/"" clearing back to unlimited), absent preserves.
+func TestUpdateOrgHotIdleCaps(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name:              "acme",
+		DatabaseName:      "acme_db",
+		MaxHotIdleWorkers: 9,
+		MaxHotIdleCPU:     "4",
+	}
+	router := newTestAPIRouter(store)
+
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Set all three; the stored row must carry them.
+	rec := put(`{"max_hot_idle_workers":5,"max_hot_idle_cpu":"16","max_hot_idle_memory":"64Gi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.MaxHotIdleWorkers != 5 || stored.MaxHotIdleCPU != "16" || stored.MaxHotIdleMemory != "64Gi" {
+		t.Fatalf("caps not stored: %+v", stored)
+	}
+
+	// Absent fields preserve; an explicit 0/"" clears back to unlimited.
+	rec = put(`{"max_hot_idle_workers":0,"max_hot_idle_memory":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	stored = store.orgs["acme"]
+	if stored.MaxHotIdleWorkers != 0 || stored.MaxHotIdleMemory != "" || stored.MaxHotIdleCPU != "16" {
+		t.Fatalf("presence-aware merge wrong: %+v", stored)
+	}
+}
+
+// A cap quantity that won't parse (or is zero) must 400: the sweep reads
+// those as UNLIMITED, so accepting them would silently mean "no cap".
+func TestUpdateOrgHotIdleCapsRejectBadQuantities(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme_db"}
+	router := newTestAPIRouter(store)
+
+	for _, body := range []string{
+		`{"max_hot_idle_cpu":"sixteen"}`,
+		`{"max_hot_idle_cpu":"0"}`,
+		`{"max_hot_idle_memory":"lots"}`,
+		`{"max_hot_idle_memory":"-4Gi"}`,
+		`{"max_hot_idle_workers":-1}`,
+	} {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", body, rec.Code)
+		}
 	}
 }

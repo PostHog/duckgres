@@ -64,6 +64,7 @@ Added for the console:
 | `GET /api/v1/errors` | viewer | recent redacted query errors (live-triage ring, newest-first), `?org=&user=&sqlstate=&category=&limit=` slicing. Fans out + merges across CPs (each error belongs to one CP — disjoint, no dedup). `query`/`message` redacted server-side |
 | `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
 | `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
+| `GET /api/v1/workers/hot-idle` | viewer | per-org hot-idle pool reporting (count, vCPU, memory, oldest park) + each org's configured `max_hot_idle_*` caps; backs the Workers page "Hot idle by org" card |
 | `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |
 | `POST /api/v1/sessions/:pid/cancel` | admin | tear down a session by pid — LOCAL only (pid is per-CP); prefer the worker-id form |
 | `POST /api/v1/sessions/by-worker/:wid/cancel` | admin | tear down the session on a cluster-unique worker id; fans out to whichever CP owns it (pid can't be fanned out — it collides across CPs). Returns `{killed, cp_responders, cp_total}` |

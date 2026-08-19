@@ -482,6 +482,50 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   `exploratory_tier` records which existing assertions the tier's connect
   semantics changed and why — keep that audit current.
 
+## Hot-Idle Pool Reporting + Per-Org Caps (remote backend)
+
+Two operator surfaces for the hot-idle pool, both over the durable runtime
+store (`worker_records`, the only source that sees parked workers — they hold
+no session):
+
+- **Reporting**: `configstore.ListHotIdleByOrg` aggregates `hot_idle` rows
+  per org (count, summed vCPU/memory, oldest park) and
+  `GET /api/v1/workers/hot-idle` (`controlplane/admin/live.go`) joins each
+  org's configured caps. Backs the Workers page "Hot idle by org" card.
+  Worker shape resolution mirrors the fleet rollup: the worker's explicit
+  profile wins, else the org's default worker profile; unparseable
+  quantities contribute 0.
+- **Caps**: `max_hot_idle_workers` (count), `max_hot_idle_cpu` and
+  `max_hot_idle_memory` (k8s quantity strings, e.g. `"16"` / `"64Gi"`) on
+  `duckgres_orgs` (migration 000037; 0/"" = unlimited). Editable via the
+  admin org PUT + the org detail form. Invariants:
+  - **Enforcement is a convergent janitor sweep** (`reapHotIdleCaps`), NOT a
+    park-time check: on each tick it retires the OLDEST parked workers
+    (oldest-first listing) until the org is within ALL configured limits.
+    This uniformly covers every park path AND cap decreases — lowering a cap
+    drains the excess on the next ticks (config-poll reload, then the 5s
+    janitor tick). Retires go through the fenced `RetireFromSnapshot` CAS
+    with origin `janitor_hot_idle_cap` (a distinct metric origin — a nonzero
+    rate means an operator's cost ceiling is biting, not stale capacity).
+    On a retire error the sweep STOPS that org for the tick (never marches
+    on and over-reaps on a transient failure).
+  - **Cap wins over the floor** (`DefaultWorkerMinHotIdle`): the floor only
+    guards the TTL reaper; the cap is the explicit operator intent. An org
+    with floor > cap is a contradictory config that resolves to the cap.
+  - **Validation is fail-closed on the write path**: a cap quantity that
+    doesn't parse (or is zero/negative) is 400'd by the admin org PUT,
+    because the sweep reads those as UNLIMITED — accepting them would
+    silently mean "no cap".
+  - The sweep runs even when the TTL reaper is disabled (`hotIdleTTL == 0`)
+    — a cap is a hard ceiling, not a freshness rule.
+- Touching any of this → update `tests/configstore/hot_idle_reporting_postgres_test.go`
+  (+ the migration asserts in `migrations_postgres_test.go`),
+  `controlplane/janitor_test.go` (the cap sweep cases),
+  `controlplane/admin/api_test.go` (`TestUpdateOrgHotIdleCaps*`) +
+  `live_test.go` (`TestHotIdleRoute`), `ui/src/pages/Workers.test.tsx` +
+  `OrgDetail.test.tsx`, AND the `/workers/hot-idle` envelope +
+  `hot_idle_reporting_and_cap` assertions in `tests/mw-dev/e2e/harness.sh`.
+
 ## Worker Drain Protocol (graceful shutdown, #690)
 
 Remote worker pods drain on SIGTERM (pod deletion): they reject new work, keep

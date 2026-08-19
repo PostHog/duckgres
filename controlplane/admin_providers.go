@@ -153,6 +153,42 @@ func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
 	return out, nil
 }
 
+// HotIdleByOrg returns each org's hot-idle pool footprint (durable runtime
+// store) joined with its configured max_hot_idle_* caps (config orgs table).
+func (p *clusterInfoProvider) HotIdleByOrg() ([]admin.HotIdleOrg, error) {
+	stats, err := p.store.ListHotIdleByOrg()
+	if err != nil {
+		return nil, err
+	}
+	var orgs []configstore.Org
+	if err := p.store.DB().
+		Select("name", "max_hot_idle_workers", "max_hot_idle_cpu", "max_hot_idle_memory").
+		Find(&orgs).Error; err != nil {
+		return nil, err
+	}
+	caps := make(map[string]configstore.Org, len(orgs))
+	for _, o := range orgs {
+		caps[o.Name] = o
+	}
+	out := make([]admin.HotIdleOrg, 0, len(stats))
+	for _, s := range stats {
+		row := admin.HotIdleOrg{
+			OrgID:              s.OrgID,
+			Count:              s.Count,
+			CPUCores:           s.CPUCores,
+			MemoryBytes:        s.MemoryBytes,
+			OldestHotIdleSince: s.OldestHotIdleSince,
+		}
+		if org, ok := caps[s.OrgID]; ok {
+			row.CapWorkers = org.MaxHotIdleWorkers
+			row.CapCPU = org.MaxHotIdleCPU
+			row.CapMemory = org.MaxHotIdleMemory
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 // ControlPlaneInstances returns the live CP replicas, flagging this one.
 func (p *clusterInfoProvider) ControlPlaneInstances() ([]admin.CPInstance, error) {
 	ids, err := p.store.ListLiveControlPlaneInstanceIDs()

@@ -49,6 +49,9 @@ export interface Org {
   teams?: OrgTeam[];
   max_workers: number;
   max_vcpus: number;
+  max_hot_idle_workers: number;
+  max_hot_idle_cpu: string;
+  max_hot_idle_memory: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -69,6 +72,9 @@ export interface OrgUpdate {
   // collisions.
   database_name?: string;
   max_workers?: number;
+  max_hot_idle_workers?: number;
+  max_hot_idle_cpu?: string;
+  max_hot_idle_memory?: string;
   max_vcpus?: number;
   default_worker_cpu?: string;
   default_worker_memory?: string;
@@ -723,4 +729,18 @@ export interface DailyUsageResponse {
   from: string;
   watermark_low: string | null;
   rows: DailyUsageRow[];
+}
+
+// GET /api/v1/workers/hot-idle — one org's hot-idle pool footprint + its
+// configured pool caps (0/"" = unlimited), for the Workers page's hot-idle
+// reporting card.
+export interface HotIdleOrg {
+  org_id: string;
+  count: number;
+  cpu_cores: number;
+  memory_bytes: number;
+  oldest_hot_idle_since: string | null;
+  cap_workers: number;
+  cap_cpu: string;
+  cap_memory: string;
 }

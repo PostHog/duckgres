@@ -24,6 +24,9 @@ type captureControlPlaneExpiryStore struct {
 	expiredHotIdleWorkers []configstore.WorkerRecord
 	hotIdleCounts         map[string]int
 	hotIdleCountCalls     []string
+	// orgHotIdle fixtures the cap sweep's per-org listing (oldest-first, as
+	// the store guarantees).
+	orgHotIdle map[string][]configstore.WorkerRecord
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
@@ -96,6 +99,19 @@ func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(now time.Ti
 		out = append(out, configstore.NewWorkerSnapshot(rec))
 	}
 	return out, nil
+}
+
+// ListOrgHotIdleSnapshots serves the orgHotIdle fixture (already ordered
+// oldest-first, as the real query guarantees) for the cap sweep.
+func (s *captureControlPlaneExpiryStore) ListOrgHotIdleSnapshots(orgID string) ([]configstore.WorkerSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records := s.orgHotIdle[orgID]
+	snaps := make([]configstore.WorkerSnapshot, len(records))
+	for i, r := range records {
+		snaps[i] = configstore.NewWorkerSnapshot(r)
+	}
+	return snaps, nil
 }
 
 func (s *captureControlPlaneExpiryStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {
@@ -512,5 +528,103 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	defer mu.Unlock()
 	if lifecycleObserved != 1 {
 		t.Fatalf("expected worker lifecycle observation despite expiry error, got %d", lifecycleObserved)
+	}
+}
+
+// The hot-idle cap sweep retires ONLY the oldest parked workers past a
+// capped org's limits — by count, by total vCPU, and by total memory —
+// leaving orgs within their limits alone. The store returns oldest-first; the
+// sweep must retire exactly the prefix needed to get within ALL limits — the
+// longest-parked excess goes first, fresh warm capacity stays.
+func TestControlPlaneJanitorHotIdleCapSweep(t *testing.T) {
+	since := time.Now().Add(-time.Hour)
+	hotIdle := func(id int, pod, org, cpu, mem string) configstore.WorkerRecord {
+		return configstore.WorkerRecord{
+			WorkerID: id, PodName: pod, State: configstore.WorkerStateHotIdle, OrgID: org,
+			OwnerCPInstanceID: "cp-a", OwnerEpoch: 1, HotIdleSince: &since,
+			ProfileCPU: cpu, ProfileMemory: mem,
+		}
+	}
+	store := &captureControlPlaneExpiryStore{
+		orgHotIdle: map[string][]configstore.WorkerRecord{
+			// Count cap 2 with 3 parked → retire exactly the oldest.
+			"acme": {
+				hotIdle(11, "w-acme-old", "acme", "2", "8Gi"),
+				hotIdle(12, "w-acme-mid", "acme", "2", "8Gi"),
+				hotIdle(13, "w-acme-new", "acme", "2", "8Gi"),
+			},
+			// CPU cap "6" with 2×4 cores parked → retire the oldest (4 ≤ 6).
+			// Second worker carries no profile → resolves via the org default.
+			"globex": {
+				hotIdle(21, "w-globex-old", "globex", "4", "16Gi"),
+				hotIdle(22, "w-globex-new", "globex", "", ""),
+			},
+			// Memory cap "20Gi" with 2×16Gi parked → retire the oldest (16 ≤ 20).
+			"initech": {
+				hotIdle(31, "w-initech-old", "initech", "4", "16Gi"),
+				hotIdle(32, "w-initech-new", "initech", "4", "16Gi"),
+			},
+			// Under all its limits — left alone.
+			"under": {
+				hotIdle(41, "w-under-1", "under", "2", "8Gi"),
+			},
+		},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC) }
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+	janitor.hotIdleCaps = func() map[string]orgHotIdleLimit {
+		return map[string]orgHotIdleLimit{
+			"acme":    {Workers: 2},
+			"globex":  {CPU: "6", DefaultCPU: "4", DefaultMemory: "16Gi"},
+			"initech": {Memory: "20Gi"},
+			"under":   {Workers: 5, CPU: "16", Memory: "64Gi"},
+		}
+	}
+
+	janitor.runOnce()
+
+	var retired []int
+	for _, tr := range lifecycleStore.terminalTransitions {
+		if tr.target != configstore.WorkerStateRetired || tr.reason != janitorRetireReasonHotIdleCap {
+			t.Fatalf("unexpected transition: %#v", tr)
+		}
+		retired = append(retired, tr.workerID)
+	}
+	want := []int{11, 21, 31} // exactly the oldest excess of each over-limit org
+	if len(retired) != len(want) {
+		t.Fatalf("retired %v, want %v", retired, want)
+	}
+	seen := map[int]bool{}
+	for _, id := range retired {
+		seen[id] = true
+	}
+	for _, id := range want {
+		if !seen[id] {
+			t.Fatalf("worker %d not retired: %v", id, retired)
+		}
+	}
+}
+
+// A nil hotIdleCaps function (unwired) must disable the sweep entirely — no
+// store calls, no retires.
+func TestControlPlaneJanitorHotIdleCapSweepDisabledWhenUnwired(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{
+		orgHotIdle: map[string][]configstore.WorkerRecord{
+			"acme": {
+				{WorkerID: 11, PodName: "w-acme-1", State: configstore.WorkerStateHotIdle, OrgID: "acme", OwnerCPInstanceID: "cp-a", OwnerEpoch: 1},
+			},
+		},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, &fakePhysicalCleanup{})
+
+	janitor.runOnce()
+
+	if len(lifecycleStore.terminalTransitions) != 0 {
+		t.Fatalf("unwired caps must retire nothing, got %#v", lifecycleStore.terminalTransitions)
 	}
 }

@@ -18,6 +18,7 @@ import type {
   ErrorEntry,
   ErrorFilters,
   FleetStat,
+  HotIdleOrg,
   ImpersonateBody,
   Me,
   MonthlyUsageResponse,
@@ -188,6 +189,7 @@ export const api = {
   // workers / sessions / live
   listWorkers: () => get<WorkerStatus[]>("/workers"),
   fleet: () => get<{ fleet: FleetStat[] }>("/workers/fleet").then((r) => r.fleet ?? []),
+  hotIdle: () => get<{ orgs: HotIdleOrg[] }>("/workers/hot-idle").then((r) => r.orgs ?? []),
   instances: () =>
     get<{ instances: CPInstance[] }>("/cluster/instances").then((r) => r.instances ?? []),
   listSessions: () => get<SessionStatus[]>("/sessions"),
