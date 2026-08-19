@@ -281,14 +281,14 @@ func (c *clientConn) sendDataRowWithFormats(values []interface{}, formatCodes []
 			// Binary encoding
 			encoded := encodeBinary(v, typeOIDs[i])
 			if encoded == nil {
-				// Fallback to text if binary encoding fails
-				str := formatValue(v)
-				_ = binary.Write(&buf, binary.BigEndian, int32(len(str)))
-				buf.WriteString(str)
-			} else {
-				_ = binary.Write(&buf, binary.BigEndian, int32(len(encoded)))
-				buf.Write(encoded)
+				// The client requested binary results for this column but we
+				// have no binary encoding for the value. Writing text bytes
+				// under a binary format code would corrupt the field, so fail
+				// the row instead of shipping garbage.
+				return fmt.Errorf("cannot binary-encode column %d (OID %d, Go type %T)", i, typeOIDs[i], v)
 			}
+			_ = binary.Write(&buf, binary.BigEndian, int32(len(encoded)))
+			buf.Write(encoded)
 		} else {
 			// Text encoding must use the column OID for types whose PostgreSQL
 			// representation cannot be inferred from the scanned Go value alone.
