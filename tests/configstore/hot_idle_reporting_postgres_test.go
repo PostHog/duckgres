@@ -90,3 +90,29 @@ func TestHotIdleReportingPostgres(t *testing.T) {
 		t.Fatalf("unknown org: snaps=%d err=%v", len(snaps), err)
 	}
 }
+
+// The janitor's cap sweep reads org caps from the in-memory SNAPSHOT
+// (OrgConfig), not the Org row directly — verify the full plumbing leg the
+// unit tests can't reach: DB column → gorm load → ReloadSnapshot →
+// Snapshot().Orgs[...].MaxHotIdle*.
+func TestHotIdleCapsVisibleInSnapshotPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedOrg(t, store, "acme")
+	if err := store.DB().Exec(`UPDATE duckgres_orgs SET max_hot_idle_workers = 3, max_hot_idle_cpu = '16', max_hot_idle_memory = '64Gi' WHERE name = 'acme'`).Error; err != nil {
+		t.Fatalf("set caps: %v", err)
+	}
+	if err := store.ReloadSnapshot(); err != nil {
+		t.Fatalf("reload snapshot: %v", err)
+	}
+	snap := store.Snapshot()
+	if snap == nil {
+		t.Fatal("nil snapshot")
+	}
+	oc, ok := snap.Orgs["acme"]
+	if !ok || oc == nil {
+		t.Fatalf("acme missing from snapshot: %v", snap.Orgs)
+	}
+	if oc.MaxHotIdleWorkers != 3 || oc.MaxHotIdleCPU != "16" || oc.MaxHotIdleMemory != "64Gi" {
+		t.Fatalf("snapshot caps = %d/%q/%q, want 3/16/64Gi", oc.MaxHotIdleWorkers, oc.MaxHotIdleCPU, oc.MaxHotIdleMemory)
+	}
+}
