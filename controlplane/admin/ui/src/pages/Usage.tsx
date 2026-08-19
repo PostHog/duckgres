@@ -201,7 +201,7 @@ export function Usage() {
                 />
               </Card>
             )}
-            <UsagePricing rows={monthRows} />
+            <UsagePricing rows={monthRows} labels={orgLabels} />
           </>
         )}
       </PageBody>

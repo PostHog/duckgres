@@ -1,12 +1,23 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { Plus, X } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { EmptyState } from "@/components/states";
+import { OrgRef } from "@/components/OrgRef";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { fmtUnits } from "@/lib/format";
-import { fmtMoney, orgTotals, parsePrice, scenarioCost, type PriceScenario } from "@/lib/pricing";
+import {
+  DEFAULT_CPU_PER_MIN,
+  DEFAULT_MEM_PER_GIB_MIN,
+  DEFAULT_STORAGE_PER_GIB_H,
+  fmtMoney,
+  orgTotals,
+  parsePrice,
+  scenarioCost,
+  type PriceScenario,
+} from "@/lib/pricing";
 import type { MonthlyUsageRow } from "@/types/api";
 
 // Pricing sensitivity: enter unit-price scenarios and see each org's monthly
@@ -17,13 +28,16 @@ import type { MonthlyUsageRow } from "@/types/api";
 
 const STORAGE_KEY = "duckgres-usage-pricing-scenarios-v1";
 
+// A fresh scenario starts from the grounded defaults (EC2-on-demand-ish
+// compute + S3 standard storage — see lib/pricing.ts) so the calculator
+// prices orgs sensibly on first open; every price is editable.
 function newScenario(n: number): PriceScenario {
   return {
     id: `s${Date.now()}-${n}`,
     name: n === 1 ? "Baseline" : `Scenario ${String.fromCharCode(64 + n)}`,
-    cpuPerMin: 0,
-    memPerGiBMin: 0,
-    storagePerGiBH: 0,
+    cpuPerMin: DEFAULT_CPU_PER_MIN,
+    memPerGiBMin: DEFAULT_MEM_PER_GIB_MIN,
+    storagePerGiBH: DEFAULT_STORAGE_PER_GIB_H,
   };
 }
 
@@ -42,7 +56,7 @@ function loadScenarios(): PriceScenario[] {
   return [newScenario(1)];
 }
 
-export function UsagePricing({ rows }: { rows: MonthlyUsageRow[] }) {
+export function UsagePricing({ rows, labels }: { rows: MonthlyUsageRow[]; labels?: Map<string, string> }) {
   const [scenarios, setScenarios] = useState<PriceScenario[]>(loadScenarios);
   useEffect(() => {
     try {
@@ -74,8 +88,8 @@ export function UsagePricing({ rows }: { rows: MonthlyUsageRow[] }) {
         <div>
           <CardTitle>Pricing sensitivity</CardTitle>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Enter unit prices to see each org's fee for the selected month under each scenario. Prices stay in your
-            browser.
+            Enter unit prices to see each org's fee for the selected month under each scenario. Baseline starts
+            from EC2-on-demand-ish unit costs + S3 standard storage — edit freely. Prices stay in your browser.
           </p>
         </div>
         <Button size="sm" variant="outline" onClick={add}>
@@ -151,7 +165,11 @@ export function UsagePricing({ rows }: { rows: MonthlyUsageRow[] }) {
             <TableBody>
               {totals.map((t) => (
                 <TableRow key={t.orgId}>
-                  <TableCell className="font-mono text-xs">{t.orgId}</TableCell>
+                  <TableCell>
+                    <Link to={`/orgs/${encodeURIComponent(t.orgId)}`} className="block hover:underline">
+                      <OrgRef id={t.orgId} label={labels?.get(t.orgId)} copyable={false} />
+                    </Link>
+                  </TableCell>
                   <TableCell className="font-mono text-xs">{fmtUnits(t.cpuMinutes)}</TableCell>
                   <TableCell className="font-mono text-xs">{fmtUnits(t.memGiBMinutes)}</TableCell>
                   <TableCell className="font-mono text-xs">{fmtUnits(t.storageGiBHours)}</TableCell>
