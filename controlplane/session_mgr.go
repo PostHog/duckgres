@@ -945,6 +945,49 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 	return -1
 }
 
+// SetWorkerTTLForPID overrides the hot-idle TTL of the worker bound to pid's
+// session — the apply half of the `duckgres.worker_ttl` session GUC. It is a
+// no-op success when the pool has no per-worker TTL (the process backend:
+// its idle reaping is pool-global, and the GUC hook is only installed for the
+// remote backend anyway). An error means the override did NOT take effect
+// (the session or its worker is gone), so the caller must not update its
+// session state.
+func (sm *SessionManager) SetWorkerTTLForPID(pid int32, ttl time.Duration) error {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("no session for pid %d", pid)
+	}
+	pool, ok := sm.pool.(workerTTLPool)
+	if !ok {
+		return nil
+	}
+	if !pool.SetWorkerTTL(s.WorkerID, ttl) {
+		return fmt.Errorf("worker %d is no longer in the pool", s.WorkerID)
+	}
+	return nil
+}
+
+// WorkerTTLForPID reports the hot-idle TTL the worker bound to pid's session
+// would park with right now — the SHOW half of the `duckgres.worker_ttl`
+// session GUC. ok=false when there is no session, no worker, or the pool has
+// no per-worker TTL. A zero TTL with ok=true means the deployment default
+// applies at reap time (the caller resolves it).
+func (sm *SessionManager) WorkerTTLForPID(pid int32) (time.Duration, bool) {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return 0, false
+	}
+	pool, ok := sm.pool.(workerTTLPool)
+	if !ok {
+		return 0, false
+	}
+	return pool.WorkerTTL(s.WorkerID)
+}
+
 // SessionForWorker returns the session bound to the given cluster-unique worker
 // id, or ok=false if this stack has none. One session per worker, so the first
 // (only) pid in the worker's index is authoritative. Used by the admin

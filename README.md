@@ -431,6 +431,35 @@ Requests must be positive and no greater than the configured maximum. Leaving
 the maximum unset disables client overrides, and clients cannot request an
 unlimited timeout because idle sessions retain worker capacity.
 
+### Per-session worker TTL
+
+On the remote/K8s backend, a worker whose last session ends is parked
+`hot_idle` (warm, quickly reusable by the same org) and retired once its TTL
+expires — 1 minute by default. Clients can override that TTL per connection,
+either at connect time or mid-session:
+
+```bash
+PGOPTIONS='-c duckgres.worker_ttl=20m' psql "host=<host> dbname=ducklake sslmode=require"
+```
+
+```sql
+SET duckgres.worker_ttl = '20m';   -- Go duration, whole minutes, minimum 1m
+SHOW duckgres.worker_ttl;          -- the TTL this session's worker will park with
+RESET duckgres.worker_ttl;         -- back to the connect-time value
+```
+
+The mid-session form exists for clients that cannot set startup options; it
+takes effect on the bound worker immediately and governs the park when the
+session ends. Both forms are gated on
+`DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE` (a mid-session `SET` is rejected
+with 22023 when the gate is off) and clamped to
+`DUCKGRES_K8S_WORKER_MAX_TTL`. The TTL is stamped with whole-minute precision
+(`ttl_minutes`, where 0 means "deployment default"), so a mid-session `SET`
+rejects zero and sub-minute values with 22023 rather than parking the worker
+for a TTL `SHOW` would misreport. (A sub-minute startup option still truncates
+to whole minutes at park — pre-existing.) On the standalone/process backends there is
+no hot-idle TTL to override; `SET`/`SHOW` are accepted as session state only.
+
 ### PostHog Logging
 
 Duckgres can optionally export structured logs to [PostHog Logs](https://posthog.com/docs/logs) via the OpenTelemetry Protocol (OTLP). Logs are always written to stderr regardless of this setting. PostHog export defaults to **WARN+ERROR**; stderr stays at `DUCKGRES_LOG_LEVEL`.

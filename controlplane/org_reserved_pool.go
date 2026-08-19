@@ -43,6 +43,17 @@ func NewOrgReservedPool(shared *K8sWorkerPool, orgID string, maxWorkers int, ima
 	return pool
 }
 
+// SetWorkerTTL delegates the duckgres.worker_ttl session-GUC override to the
+// shared pool (the org's workers live in shared.workers).
+func (p *OrgReservedPool) SetWorkerTTL(id int, ttl time.Duration) bool {
+	return p.shared.SetWorkerTTL(id, ttl)
+}
+
+// WorkerTTL delegates to the shared pool; see K8sWorkerPool.WorkerTTL.
+func (p *OrgReservedPool) WorkerTTL(id int) (time.Duration, bool) {
+	return p.shared.WorkerTTL(id)
+}
+
 func (p *OrgReservedPool) AcquireWorker(ctx context.Context, profile *WorkerProfile) (worker *ManagedWorker, err error) {
 	// End-to-end acquire latency (fast path included), observed via a named-
 	// return defer so every exit — reuse, capacity error, ctx cancel — lands in

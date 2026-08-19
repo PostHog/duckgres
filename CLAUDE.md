@@ -378,13 +378,16 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   answers itself — `SET`/`SHOW duckgres.query_source`, ignored SETs, no-ops,
   `pg_stat_activity`, the empty query — MUST NOT acquire. That is the point of
   the whole feature; adding an acquire to an engine-free path silently deletes
-  the benefit. The `duckgres.s3_cache` GUC is the exception, on all three
-  protocol paths, because unlike the other duckgres GUCs it is WORKER state (it
-  rebuilds the worker's `ducklake_s3` secret): **`SET` always acquires** — the
-  swap needs a worker to apply to — and **`SHOW` acquires only when
+  the benefit. The `duckgres.s3_cache` and `duckgres.worker_ttl` GUCs are the
+  exception, on all three protocol paths, because unlike the other duckgres
+  GUCs they are WORKER state (the s3_cache secret swap; the worker_ttl
+  pool-side hot-idle TTL): **`SET` always acquires** — the apply needs a
+  worker to land on — and **`SHOW duckgres.s3_cache` acquires only when
   `c.hasPendingS3Cache`**, i.e. when a connect-time option has not been applied
   yet and answering first would report a transport the session is about to
-  leave (see the s3_cache section below).
+  leave (see the s3_cache section below). `SHOW duckgres.worker_ttl` never
+  acquires: until a worker exists, the connect-time baseline is the truthful
+  answer (there is no pending worker-side TTL state).
 - **A pinning FIRST statement acquires the standard profile directly** (one
   acquire, `pinned=true` → `MarkConnectionPinned`), never small-then-escalate.
 - **The pin set is the state boundary, and every member is load-bearing:** DML,
@@ -640,6 +643,50 @@ session per worker = session-scoped in effect. Invariants:
   `tests/mw-dev/e2e/harness.sh` (mw-dev has no cache proxy, so the e2e covers
   the client-visible plumbing incl. the worker action round-trip; the swap
   itself is unit-only — see the harness header note).
+
+## Mid-Session Worker TTL (`duckgres.worker_ttl`, remote backend)
+
+`SET duckgres.worker_ttl = '20m'` / `SHOW` / `RESET` let a client that cannot
+set startup options change its bound worker's pool-side hot-idle TTL
+mid-session (transpiler interception in `transform/setshow.go`, connection
+apply in `server/conn_worker_ttl.go`, control-plane hook
+`controlplane/worker_ttl.go::workerTTLControlFor` → pool
+`SetWorkerTTLForPID`). Full design: `docs/design/worker-ttl-pool.md`.
+Invariants:
+
+- **Same trust boundary as the `duckgres.worker_*` startup options**: gated
+  on `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE` (SET rejected 22023 when off)
+  and clamped to `DUCKGRES_K8S_WORKER_MAX_TTL`; a clamped value is stored
+  clamped.
+- **State follows the worker, never leads it** (same rule as s3_cache): the
+  session override flips only after the apply hook succeeds, and SHOW falls
+  back to the bound worker's CURRENT pool TTL (`Current`), so SHOW never
+  reports a TTL the worker won't park with.
+- **Whole-minute granularity, enforced at validation.** The parked TTL is
+  persisted as `ttl_minutes` (integer; 0 = "reaper applies the deployment
+  default"), so `NormalizeWorkerTTL` REJECTS zero and sub-minute values with
+  22023 — accepting them would park the worker for the deployment default
+  while SHOW reported the shorter value. (Sub-minute STARTUP options still
+  truncate at park — pre-existing.)
+- **Both reapers read the persisted override** (`ttl_minutes` stamped at the
+  hot→hot_idle park): the leader janitor's expiry query and the per-CP
+  fallback.
+- **Exploratory tier**: SET on a lazily-activated connection acquires a
+  worker first (the TTL is pool-side per-worker state — there is nothing to
+  apply to otherwise); SHOW never acquires (the connect-time baseline is the
+  truthful answer pre-worker). Escalation re-applies the override on the new
+  worker; on failure the override is RESET (statement error, not
+  connection-fatal) — and BOTH session-worker-state re-applies (s3_cache +
+  worker_ttl) always run (an s3 failure must not skip the TTL re-apply).
+- **Describe must cover BOTH 'S' and 'P'** for the intercepted SET/SHOW — a
+  portal-Describe miss returns NoData and probes DuckDB (acquiring a worker
+  on lazy connections) for a GUC it does not know.
+- **Standalone/process backends** accept SET/SHOW as session state only (no
+  per-worker hot-idle TTL exists there).
+- Touching the interception, apply hook, park persistence, or the reapers →
+  update `transpiler/worker_ttl_test.go`, `server/worker_ttl_test.go`,
+  `controlplane/worker_ttl_test.go` + `k8s_pool_worker_ttl_test.go`, AND the
+  `worker_ttl_guc` assertion in `tests/mw-dev/e2e/harness.sh`.
 
 ## User Persistent Secrets (multitenant remote backend)
 
