@@ -428,6 +428,30 @@ func SetupMultiTenant(
 		}
 		return org.DefaultWorkerMinHotIdle
 	}
+	// Hot-idle pool caps (max_hot_idle_*): the sweep reads the same config
+	// snapshot as the floor, so an admin-console cap edit takes effect on the
+	// next tick after the config poll reloads. Only orgs with at least one
+	// limit set appear (the sweep skips unlimited orgs anyway).
+	janitor.hotIdleCaps = func() map[string]orgHotIdleLimit {
+		snapshot := store.Snapshot()
+		if snapshot == nil {
+			return nil
+		}
+		caps := make(map[string]orgHotIdleLimit)
+		for name, org := range snapshot.Orgs {
+			if org == nil || (org.MaxHotIdleWorkers <= 0 && org.MaxHotIdleCPU == "" && org.MaxHotIdleMemory == "") {
+				continue
+			}
+			caps[name] = orgHotIdleLimit{
+				Workers:       org.MaxHotIdleWorkers,
+				CPU:           org.MaxHotIdleCPU,
+				Memory:        org.MaxHotIdleMemory,
+				DefaultCPU:    org.DefaultWorkerCPU,
+				DefaultMemory: org.DefaultWorkerMemory,
+			}
+		}
+		return caps
+	}
 	// Node-headroom controller: keep low-priority placeholder pods as warm,
 	// preemptible spare capacity so worker spawns schedule immediately.
 	// Leader-only (runs on the janitor tick). Always wired — reconcileHeadroom

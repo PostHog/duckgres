@@ -113,6 +113,22 @@ type CPInstance struct {
 	Self bool   `json:"self"`
 }
 
+// HotIdleOrg is one org's hot-idle pool footprint plus its configured pool
+// ceiling, for the admin dashboard's hot-idle reporting: who is holding
+// parked workers, how much resource that pins, the longest park, and the
+// org's max_hot_idle_* caps (0/"" = unlimited) so the operator can see both
+// the load and the knob in one place.
+type HotIdleOrg struct {
+	OrgID              string     `json:"org_id"`
+	Count              int64      `json:"count"`
+	CPUCores           float64    `json:"cpu_cores"`
+	MemoryBytes        int64      `json:"memory_bytes"`
+	OldestHotIdleSince *time.Time `json:"oldest_hot_idle_since"`
+	CapWorkers         int        `json:"cap_workers"`
+	CapCPU             string     `json:"cap_cpu"`
+	CapMemory          string     `json:"cap_memory"`
+}
+
 // LiveInfo surfaces live cluster state beyond the basic OrgStackInfo summary.
 // Implemented by the controlplane adapter.
 type LiveInfo interface {
@@ -127,6 +143,10 @@ type LiveInfo interface {
 	QueryDetailForWorkerID(workerID int) (QueryDetail, bool)
 	// WorkerFleet returns worker counts by lifecycle state across the cluster.
 	WorkerFleet() ([]FleetStat, error)
+	// HotIdleByOrg returns each org's hot-idle pool footprint + configured
+	// pool caps, from the durable runtime store (the only source that sees
+	// parked workers — they hold no session).
+	HotIdleByOrg() ([]HotIdleOrg, error)
 	// ControlPlaneInstances returns the live CP replicas.
 	ControlPlaneInstances() ([]CPInstance, error)
 	// KillSession tears down the session (and its exclusive worker) for pid.
@@ -323,6 +343,18 @@ func registerLiveAPI(r *gin.RouterGroup, live LiveInfo, fetcher PeerFetcher, use
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"fleet": stats})
+	})
+
+	// Hot-idle pool reporting: which orgs are holding parked workers, how much
+	// resource that pins, and each org's configured pool caps. Read-only
+	// operational fleet state (like /workers/fleet) — viewer-allowed.
+	r.GET("/workers/hot-idle", func(c *gin.Context) {
+		orgs, err := live.HotIdleByOrg()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"orgs": orgs})
 	})
 
 	r.GET("/cluster/instances", func(c *gin.Context) {

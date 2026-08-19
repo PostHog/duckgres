@@ -296,6 +296,11 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		"default_worker_memory":       updates.DefaultWorkerMemory,
 		"default_worker_ttl":          updates.DefaultWorkerTTL,
 		"default_worker_min_hot_idle": updates.DefaultWorkerMinHotIdle,
+		// Hot-idle pool caps: written unconditionally for the same reason —
+		// 0 / "" clears the cap back to unlimited after the presence-merge.
+		"max_hot_idle_workers": updates.MaxHotIdleWorkers,
+		"max_hot_idle_cpu":     updates.MaxHotIdleCPU,
+		"max_hot_idle_memory":  updates.MaxHotIdleMemory,
 	}
 	if updates.DataImportsTableNamingVersion != "" {
 		fields["data_imports_table_naming_version"] = updates.DataImportsTableNamingVersion
@@ -1060,6 +1065,17 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["default_worker_min_hot_idle"]; ok {
 		merged.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
 	}
+	// Hot-idle pool caps: present-in-payload wins, including an explicit
+	// 0 / "" which clears the cap back to unlimited.
+	if _, ok := fields["max_hot_idle_workers"]; ok {
+		merged.MaxHotIdleWorkers = updates.MaxHotIdleWorkers
+	}
+	if _, ok := fields["max_hot_idle_cpu"]; ok {
+		merged.MaxHotIdleCPU = updates.MaxHotIdleCPU
+	}
+	if _, ok := fields["max_hot_idle_memory"]; ok {
+		merged.MaxHotIdleMemory = updates.MaxHotIdleMemory
+	}
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
 	}
@@ -1082,6 +1098,9 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	addChange("default_worker_memory", orgStr(existing.DefaultWorkerMemory), orgStr(merged.DefaultWorkerMemory))
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
 	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
+	addChange("max_hot_idle_workers", existing.MaxHotIdleWorkers, merged.MaxHotIdleWorkers)
+	addChange("max_hot_idle_cpu", orgStr(existing.MaxHotIdleCPU), orgStr(merged.MaxHotIdleCPU))
+	addChange("max_hot_idle_memory", orgStr(existing.MaxHotIdleMemory), orgStr(merged.MaxHotIdleMemory))
 	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
 	addChange("data_imports_table_naming_version", existing.DataImportsTableNamingVersion, merged.DataImportsTableNamingVersion)
 	if len(changes) > 0 {
@@ -1434,6 +1453,27 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	}
 	if org.MaxVCPUs < 0 {
 		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
+	}
+	if org.MaxHotIdleWorkers < 0 {
+		return fmt.Errorf("max_hot_idle_workers: value %d must be >= 0", org.MaxHotIdleWorkers)
+	}
+	// The cap quantities must be positive when set: an unparseable or zero
+	// value would silently mean UNLIMITED in the sweep — fail closed here so
+	// an operator typo can never read as "no cap".
+	for _, f := range []struct{ name, raw string }{
+		{"max_hot_idle_cpu", org.MaxHotIdleCPU},
+		{"max_hot_idle_memory", org.MaxHotIdleMemory},
+	} {
+		if f.raw == "" {
+			continue
+		}
+		q, err := resource.ParseQuantity(f.raw)
+		if err != nil {
+			return fmt.Errorf("%s: invalid quantity %q", f.name, f.raw)
+		}
+		if q.Sign() <= 0 {
+			return fmt.Errorf("%s: quantity %q must be positive (clear the field for unlimited)", f.name, f.raw)
+		}
 	}
 	return nil
 }

@@ -28,6 +28,7 @@ import type {
   ErrorEntry,
   ErrorFilters,
   FleetStat,
+  HotIdleOrg,
   ImpersonateBody,
   ManagedWarehouse,
   Me,
@@ -470,6 +471,15 @@ export function useFleet() {
   return useQuery<FleetStat[]>({
     queryKey: ["fleet"],
     queryFn: () => tolerate404<FleetStat[]>([])(api.fleet()),
+    refetchInterval: POLL.normal,
+  });
+}
+
+// Hot-idle pool reporting: which orgs hold parked workers + their caps.
+export function useHotIdle() {
+  return useQuery<HotIdleOrg[]>({
+    queryKey: ["hot-idle"],
+    queryFn: () => tolerate404<HotIdleOrg[]>([])(api.hotIdle()),
     refetchInterval: POLL.normal,
   });
 }

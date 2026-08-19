@@ -51,6 +51,17 @@ func (cs *ConfigStore) ListExpiredHotIdleSnapshotsForCP(ownerCPInstanceID string
 	return workerSnapshotsFromRecords(records), nil
 }
 
+// ListOrgHotIdleSnapshots is the snapshot-typed variant of
+// ListOrgHotIdleWorkers used by the janitor's hot-idle cap sweep. Each
+// snapshot binds the observation to the subsequent retire CAS, oldest-first.
+func (cs *ConfigStore) ListOrgHotIdleSnapshots(orgID string) ([]WorkerSnapshot, error) {
+	records, err := cs.ListOrgHotIdleWorkers(orgID)
+	if err != nil {
+		return nil, err
+	}
+	return workerSnapshotsFromRecords(records), nil
+}
+
 // ListStuckWorkerSnapshots is the snapshot-typed variant of
 // ListStuckWorkers used by the janitor's stuck-spawn/activate reaper.
 func (cs *ConfigStore) ListStuckWorkerSnapshots(spawningBefore, activatingBefore time.Time) ([]WorkerSnapshot, error) {

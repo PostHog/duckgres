@@ -59,6 +59,9 @@ interface FormState {
   default_worker_memory: string;
   default_worker_ttl: string;
   default_worker_min_hot_idle: string;
+  max_hot_idle_workers: string;
+  max_hot_idle_cpu: string;
+  max_hot_idle_memory: string;
   hostname_alias: string;
   data_imports_table_naming_version: DataImportsTableNamingVersion;
 }
@@ -71,6 +74,9 @@ function orgToForm(o: {
   default_worker_memory: string;
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
+  max_hot_idle_workers: number;
+  max_hot_idle_cpu: string;
+  max_hot_idle_memory: string;
   hostname_alias: string | null;
   data_imports_table_naming_version: DataImportsTableNamingVersion;
 }): FormState {
@@ -82,6 +88,9 @@ function orgToForm(o: {
     default_worker_memory: o.default_worker_memory,
     default_worker_ttl: o.default_worker_ttl,
     default_worker_min_hot_idle: String(o.default_worker_min_hot_idle),
+    max_hot_idle_workers: String(o.max_hot_idle_workers),
+    max_hot_idle_cpu: o.max_hot_idle_cpu,
+    max_hot_idle_memory: o.max_hot_idle_memory,
     hostname_alias: o.hostname_alias ?? "",
     data_imports_table_naming_version: o.data_imports_table_naming_version,
   };
@@ -154,6 +163,9 @@ export function OrgDetail() {
       default_worker_memory: form.default_worker_memory,
       default_worker_ttl: form.default_worker_ttl,
       default_worker_min_hot_idle: Number(form.default_worker_min_hot_idle) || 0,
+      max_hot_idle_workers: Number(form.max_hot_idle_workers) || 0,
+      max_hot_idle_cpu: form.max_hot_idle_cpu,
+      max_hot_idle_memory: form.max_hot_idle_memory,
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
       data_imports_table_naming_version: form.data_imports_table_naming_version,
     };
@@ -275,6 +287,31 @@ export function OrgDetail() {
                     type="number"
                     value={form.default_worker_min_hot_idle}
                     onChange={(e) => set("default_worker_min_hot_idle", e.target.value)}
+                  />
+                </Field>
+                <Field label="Max hot-idle workers (0 = unlimited)">
+                  <Input
+                    type="number"
+                    min={0}
+                    aria-label="Max hot-idle workers"
+                    value={form.max_hot_idle_workers}
+                    onChange={(e) => set("max_hot_idle_workers", e.target.value)}
+                  />
+                </Field>
+                <Field label="Max hot-idle vCPU (empty = unlimited)">
+                  <Input
+                    aria-label="Max hot-idle vCPU"
+                    value={form.max_hot_idle_cpu}
+                    placeholder='e.g. "16"'
+                    onChange={(e) => set("max_hot_idle_cpu", e.target.value)}
+                  />
+                </Field>
+                <Field label="Max hot-idle memory (empty = unlimited)">
+                  <Input
+                    aria-label="Max hot-idle memory"
+                    value={form.max_hot_idle_memory}
+                    placeholder='e.g. "64Gi"'
+                    onChange={(e) => set("max_hot_idle_memory", e.target.value)}
                   />
                 </Field>
               </div>

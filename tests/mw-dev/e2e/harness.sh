@@ -874,6 +874,50 @@ compute_usage_pull_api() { # org password
   log "storage-usage OK: shared ack advanced the cursor past storage buckets"
 }
 
+# Hot-idle pool reporting + the per-org cap sweep. compute_usage_pull_api
+# just closed its connections, so this org holds >=1 parked hot-idle worker
+# that must be visible in GET /api/v1/workers/hot-idle (per-org count, vCPU,
+# memory, oldest-park, configured caps). Setting the org's
+# max_hot_idle_workers below its parked count must converge the pool DOWN via
+# the janitor's cap sweep (5s tick + config-poll snapshot reload — the poll
+# below covers both), retiring the OLDEST excess; restoring 0 (unlimited)
+# afterwards leaves the remaining parked worker alone.
+hot_idle_reporting_and_cap() { # org
+  org="$1"
+  log "hot-idle reporting + cap sweep on $org"
+
+  a=0 count=0 body=""
+  while [ "$a" -lt 12 ]; do
+    body="$(curl -fsS -H "$H" "$API/api/v1/workers/hot-idle")" || body=""
+    count="$(echo "$body" | jq -r --arg o "$org" '[.orgs[] | select(.org_id==$o)][0].count // 0')"
+    [ "${count:-0}" -ge 1 ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "${count:-0}" -ge 1 ] || fail "hot-idle: $org never showed a parked worker in /workers/hot-idle: $(echo "$body" | head -c 400)"
+  echo "$body" | jq -e --arg o "$org" '.orgs[] | select(.org_id==$o) | has("cpu_cores") and has("memory_bytes") and has("oldest_hot_idle_since") and has("cap_workers") and has("cap_cpu") and has("cap_memory")' >/dev/null \
+    || fail "hot-idle: $org row missing shape/cap fields: $(echo "$body" | head -c 400)"
+  log "hot-idle OK: $org holds $count parked worker(s) with shape + cap fields"
+
+  # Cap the pool at 1: the sweep must retire the excess down to <= 1.
+  curl -fsS -X PUT -H "$H" -H 'Content-Type: application/json' \
+    -d '{"max_hot_idle_workers":1}' "$API/api/v1/orgs/$org" >/dev/null \
+    || fail "hot-idle: PUT max_hot_idle_workers=1 failed"
+  a=0 after=999
+  while [ "$a" -lt 12 ]; do
+    after="$(curl -fsS -H "$H" "$API/api/v1/workers/hot-idle" | jq -r --arg o "$org" '[.orgs[] | select(.org_id==$o)][0].count // 0')"
+    [ "${after:-999}" -le 1 ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "${after:-999}" -le 1 ] || fail "hot-idle: cap=1 never converged for $org (count=$after after 2m)"
+  log "hot-idle OK: cap=1 converged $org (count=$after)"
+
+  # Restore unlimited so the rest of the lane sees default behavior.
+  curl -fsS -X PUT -H "$H" -H 'Content-Type: application/json' \
+    -d '{"max_hot_idle_workers":0}' "$API/api/v1/orgs/$org" >/dev/null \
+    || fail "hot-idle: PUT restore max_hot_idle_workers=0 failed"
+  log "hot-idle OK: cap restored to unlimited"
+}
+
 # jsonb || must keep Postgres concatenation semantics through the full CP
 # transpile → worker DuckDB execute path (regression for #716: the transpiler
 # used to rewrite it to json_merge_patch, which REPLACED arrays instead of
@@ -2825,6 +2869,12 @@ admin_console_api() {
     || fail "/orgs/$CNPG/usage/daily did not return its envelope"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs/$CNPG/usage/daily?days=99")"
   [ "$code" = "400" ] || fail "/orgs/$CNPG/usage/daily?days=99 returned $code, want 400"
+  # Hot-idle pool reporting (Workers page "Hot idle by org" card): envelope
+  # only here; the populated path + cap convergence are asserted in
+  # hot_idle_reporting_and_cap against real parked workers.
+  curl -fsS -H "$H" "$API/api/v1/workers/hot-idle" \
+    | jq -e 'has("orgs") and (.orgs | type == "array")' >/dev/null \
+    || fail "/workers/hot-idle did not return its {orgs:[...]} envelope"
 
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
   # Includes the per-org/per-source worker-acquire-latency panels. (The raw
@@ -4495,6 +4545,9 @@ main() {
 
   # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
+
+  # ---- hot-idle pool reporting + per-org cap sweep ----
+  hot_idle_reporting_and_cap "$CNPG"
 
   # ---- cross-tenant isolation between independent CNPG-backed orgs ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$RES1" "$res1_pw"
