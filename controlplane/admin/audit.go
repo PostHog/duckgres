@@ -210,6 +210,20 @@ func auditActionFor(method, path string) string {
 		case last == "reshard":
 			// POST /orgs/:id/reshard.
 			return "reshard.create"
+		case hasSeg(segs, "service-credentials"):
+			// /orgs/:id/service-credentials and .../refresh. Routine job
+			// traffic — every backfill run mints one — so it must not fall
+			// through to org.create and read as an org-lifecycle change.
+			if last == "refresh" {
+				return "credential.refresh"
+			}
+			return "credential." + verb
+		case last == "provision":
+			return "warehouse.provision"
+		case last == "deprovision":
+			return "warehouse.deprovision"
+		case last == "reset-password":
+			return "warehouse.reset_password"
 		case hasSeg(segs, "users"):
 			return "user." + verb
 		}
