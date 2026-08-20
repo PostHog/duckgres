@@ -145,8 +145,29 @@ func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
 	if err != nil {
 		return nil, err
 	}
+	return aggregateWorkerFleet(stats), nil
+}
+
+// aggregateWorkerFleet preserves the org-agnostic admin API contract now that
+// the underlying lifecycle stats include org for Prometheus. Rows retain their
+// first-seen order from the store's deterministic query.
+func aggregateWorkerFleet(stats []configstore.WorkerLifecycleStats) []admin.FleetStat {
+	type fleetKey struct {
+		image   string
+		state   string
+		binding string
+	}
 	out := make([]admin.FleetStat, 0, len(stats))
+	indexes := make(map[fleetKey]int)
 	for _, s := range stats {
+		key := fleetKey{image: s.Image, state: string(s.State), binding: s.Binding}
+		if i, ok := indexes[key]; ok {
+			out[i].Count += s.Count
+			out[i].CPUCores += s.CPUCores
+			out[i].MemoryBytes += s.MemoryBytes
+			continue
+		}
+		indexes[key] = len(out)
 		out = append(out, admin.FleetStat{
 			Image:       s.Image,
 			State:       string(s.State),
@@ -156,7 +177,7 @@ func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
 			MemoryBytes: s.MemoryBytes,
 		})
 	}
-	return out, nil
+	return out
 }
 
 // HotIdleByOrg returns each org's hot-idle pool footprint (durable runtime

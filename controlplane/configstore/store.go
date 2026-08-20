@@ -1132,8 +1132,8 @@ func (cs *ConfigStore) runtimeTable(base string) string {
 }
 
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
-// state by image and tenant binding for Prometheus observability, with summed
-// cpu cores and memory bytes per group.
+// state by image, tenant binding, and org for Prometheus observability, with
+// summed cpu cores and memory bytes per group.
 func (cs *ConfigStore) ListWorkerLifecycleStats(defaultCPU, defaultMemory string) ([]WorkerLifecycleStats, error) {
 	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
 	// now; the branch only matches pre-existing/legacy rows or single-tenant mode.
@@ -1148,17 +1148,18 @@ func (cs *ConfigStore) ListWorkerLifecycleStats(defaultCPU, defaultMemory string
 
 	// k8s quantity strings can't be summed in SQL, so pull the raw filtered rows
 	// (cpu/mem resolved to the org default when the worker carries none) and
-	// aggregate per (image,state,binding) group in Go below.
+	// aggregate per (image,state,binding,org) group in Go below.
 	type workerRow struct {
 		Image   string
 		State   WorkerState
 		Binding string
+		Org     string
 		CPU     string
 		Memory  string
 	}
 	var rows []workerRow
 	err := cs.db.Table(workerTable+" AS w").
-		Select("w.image AS image, w.state AS state, "+bindingExpr+" AS binding, "+
+		Select("w.image AS image, w.state AS state, "+bindingExpr+" AS binding, w.org_id AS org, "+
 			"COALESCE(NULLIF(w.profile_cpu, ''), NULLIF(o.default_worker_cpu, ''), ?) AS cpu, "+
 			"COALESCE(NULLIF(w.profile_memory, ''), NULLIF(o.default_worker_memory, ''), ?) AS memory",
 			defaultCPU, defaultMemory).
@@ -1173,7 +1174,7 @@ func (cs *ConfigStore) ListWorkerLifecycleStats(defaultCPU, defaultMemory string
 			WorkerStateHotIdle,
 			WorkerStateDraining,
 		}).
-		Order("w.image ASC, w.state ASC, " + bindingExpr + " ASC").
+		Order("w.image ASC, w.state ASC, " + bindingExpr + " ASC, w.org_id ASC").
 		Scan(&rows).Error
 	if err != nil {
 		return nil, fmt.Errorf("list worker lifecycle stats: %w", err)
@@ -1185,16 +1186,17 @@ func (cs *ConfigStore) ListWorkerLifecycleStats(defaultCPU, defaultMemory string
 		image   string
 		state   WorkerState
 		binding string
+		org     string
 	}
 	index := make(map[groupKey]int)
 	var out []WorkerLifecycleStats
 	for _, r := range rows {
-		k := groupKey{r.Image, r.State, r.Binding}
+		k := groupKey{r.Image, r.State, r.Binding, r.Org}
 		i, ok := index[k]
 		if !ok {
 			i = len(out)
 			index[k] = i
-			out = append(out, WorkerLifecycleStats{Image: r.Image, State: r.State, Binding: r.Binding})
+			out = append(out, WorkerLifecycleStats{Image: r.Image, State: r.State, Binding: r.Binding, Org: r.Org})
 		}
 		out[i].Count++
 		// Unparseable/empty quantities (e.g. default profile with no org default)

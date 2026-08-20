@@ -206,6 +206,15 @@ func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 			OwnerCPInstanceID: "cp-a",
 			LastHeartbeatAt:   now,
 		},
+		{
+			WorkerID:          1108,
+			PodName:           "duckgres-worker-test-cp-1108",
+			Image:             "duckgres:default",
+			State:             configstore.WorkerStateHot,
+			OrgID:             "science",
+			OwnerCPInstanceID: "cp-b",
+			LastHeartbeatAt:   now,
+		},
 	}
 	for _, record := range records {
 		if err := store.UpsertWorkerRecord(&record); err != nil {
@@ -220,14 +229,15 @@ func TestListWorkerLifecycleStatsPostgres(t *testing.T) {
 
 	got := map[string]int64{}
 	for _, stat := range stats {
-		got[fmt.Sprintf("%s|%s|%s", stat.Image, stat.State, stat.Binding)] = stat.Count
+		got[fmt.Sprintf("%s|%s|%s|%s", stat.Image, stat.State, stat.Binding, stat.Org)] = stat.Count
 	}
 	want := map[string]int64{
-		"duckgres:default|idle|neutral":       1,
-		"duckgres:default|spawning|neutral":   1,
-		"duckgres:default|hot|org_bound":      1,
-		"duckgres:default|hot_idle|org_bound": 1,
-		"duckgres:pinned|draining|org_bound":  1,
+		"duckgres:default|idle|neutral|":                1,
+		"duckgres:default|spawning|neutral|":            1,
+		"duckgres:default|hot|org_bound|analytics":      1,
+		"duckgres:default|hot|org_bound|science":        1,
+		"duckgres:default|hot_idle|org_bound|analytics": 1,
+		"duckgres:pinned|draining|org_bound|science":    1,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("expected worker lifecycle stats %v, got %v", want, got)
