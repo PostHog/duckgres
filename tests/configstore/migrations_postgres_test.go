@@ -55,7 +55,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 34)
 	requireGooseMigrationRecorded(t, db, 35)
 	requireGooseMigrationRecorded(t, db, 36)
-	requireGooseLatestVersion(t, db, 36)
+	requireGooseMigrationRecorded(t, db, 37)
+	requireGooseLatestVersion(t, db, 37)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -169,6 +170,13 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnType(t, db, "duckgres_org_storage_usage", "team_id", "bigint")
 	requireColumnType(t, db, "duckgres_org_storage_usage", "byte_seconds", "numeric")
 
+	// Migration 000037 added the per-org hot-idle pool caps: count (0 =
+	// unlimited) plus vCPU / memory totals as k8s quantity strings ('' =
+	// unlimited).
+	requireColumnType(t, db, "duckgres_orgs", "max_hot_idle_workers", "bigint")
+	requireColumnPresent(t, db, "duckgres_orgs", "max_hot_idle_cpu")
+	requireColumnPresent(t, db, "duckgres_orgs", "max_hot_idle_memory")
+
 	// Migration 000008 added the explicit Duckling CR name column on
 	// managed warehouses, backfilled from lower(org_id).
 	requireColumnPresent(t, db, "duckgres_managed_warehouses", "duckling_name")
@@ -242,6 +250,9 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	})
 	if err := store.DB().Exec(`
 			ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
+			ALTER TABLE duckgres_orgs DROP COLUMN max_hot_idle_workers;
+			ALTER TABLE duckgres_orgs DROP COLUMN max_hot_idle_cpu;
+			ALTER TABLE duckgres_orgs DROP COLUMN max_hot_idle_memory;
 			ALTER TABLE duckgres_orgs DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
@@ -272,7 +283,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
 			DROP TABLE IF EXISTS duckgres_service_grants;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -322,7 +333,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 34)
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
-	requireGooseLatestVersion(t, upgradedDB, 36)
+	requireGooseMigrationRecorded(t, upgradedDB, 37)
+	requireGooseLatestVersion(t, upgradedDB, 37)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -365,7 +377,7 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
 		ALTER TABLE duckgres_org_users DROP COLUMN IF EXISTS service_grant_expires_at;
 		DROP TABLE IF EXISTS duckgres_service_grants;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36);
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}

@@ -17,6 +17,7 @@ import { Errors } from "@/pages/Errors";
 import { Nodes } from "@/pages/Nodes";
 import { Workers } from "@/pages/Workers";
 import { Metrics } from "@/pages/Metrics";
+import { Usage } from "@/pages/Usage";
 import { ConfigStore } from "@/pages/ConfigStore";
 import { Impersonate } from "@/pages/Impersonate";
 import { Audit } from "@/pages/Audit";
@@ -46,6 +47,7 @@ export default function App() {
         <Route path="/nodes" element={<Nodes />} />
         <Route path="/workers" element={<Workers />} />
         <Route path="/metrics" element={<Metrics />} />
+        <Route path="/usage" element={<Usage />} />
         <Route path="/configstore" element={<ConfigStore />} />
         <Route path="/impersonate" element={<Impersonate />} />
         <Route path="/audit" element={<Audit />} />

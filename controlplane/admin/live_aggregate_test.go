@@ -18,6 +18,7 @@ import (
 
 // fakeLiveInfo returns a fixed local view.
 type fakeLiveInfo struct {
+	hotIdle []HotIdleOrg
 	queries  []QueryStatus
 	sessions []SessionStatus
 	orgStats []OrgStatus
@@ -42,6 +43,7 @@ func (f *fakeLiveInfo) QueryDetailForWorkerID(wid int) (QueryDetail, bool) {
 	return QueryDetail{}, false
 }
 func (f *fakeLiveInfo) WorkerFleet() ([]FleetStat, error)            { return nil, nil }
+func (f *fakeLiveInfo) HotIdleByOrg() ([]HotIdleOrg, error)          { return f.hotIdle, nil }
 func (f *fakeLiveInfo) ControlPlaneInstances() ([]CPInstance, error) { return nil, nil }
 func (f *fakeLiveInfo) KillSession(int32) error                      { return nil }
 func (f *fakeLiveInfo) KillSessionByWorkerID(wid int) int {

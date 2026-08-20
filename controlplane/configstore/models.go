@@ -15,6 +15,18 @@ type Org struct {
 	HostnameAlias *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
 	MaxWorkers    int     `gorm:"default:0" json:"max_workers"`
 	MaxVCPUs      int     `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
+	// MaxHotIdleWorkers/MaxHotIdleCPU/MaxHotIdleMemory cap what the org may
+	// hold in the hot-idle pool at once — by count, total vCPU, and total
+	// memory (k8s quantity strings like DefaultWorkerCPU/Memory, e.g. "8" /
+	// "64Gi"). 0 / "" = unlimited (the defaults). Enforced by the janitor's
+	// hot-idle cap sweep, which retires the OLDEST parked workers until the
+	// org is within ALL configured limits — convergent (handles cap decreases
+	// and every park path uniformly) rather than park-time. These are the
+	// cost-control counterpart of DefaultWorkerMinHotIdle (the warm-pool
+	// floor); on conflict the caps win — they are the explicit operator intent.
+	MaxHotIdleWorkers int    `gorm:"default:0" json:"max_hot_idle_workers"`
+	MaxHotIdleCPU     string `gorm:"size:32;not null;default:''" json:"max_hot_idle_cpu"`
+	MaxHotIdleMemory  string `gorm:"size:32;not null;default:''" json:"max_hot_idle_memory"`
 	// DefaultWorkerCPU/Memory/TTL are the org's operator-set default worker
 	// profile: the pod shape (k8s resource quantities, e.g. "2"/"8Gi") and
 	// hot-idle TTL (Go duration string, e.g. "75m" — stored as a string for
@@ -564,13 +576,19 @@ type OrgConfig struct {
 	HostnameAlias           string // empty when no alias is configured
 	MaxWorkers              int
 	MaxVCPUs                int
-	DefaultWorkerCPU        string            // org default worker profile: pod cpu quantity ("" = unset)
-	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
-	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
-	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
-	Teams                   []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams)
-	Users                   map[string]string // username -> password
-	Warehouse               *ManagedWarehouseConfig
+	DefaultWorkerCPU        string // org default worker profile: pod cpu quantity ("" = unset)
+	DefaultWorkerMemory     string // org default worker profile: pod memory quantity ("" = unset)
+	DefaultWorkerTTL        string // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
+	DefaultWorkerMinHotIdle int    // minimum default-profile hot-idle workers to retain for this org
+	// The org's hot-idle pool ceilings (the caps counterpart of
+	// DefaultWorkerMinHotIdle): 0/"" = unlimited. Enforced by the janitor's
+	// hot-idle cap sweep.
+	MaxHotIdleWorkers int
+	MaxHotIdleCPU     string
+	MaxHotIdleMemory  string
+	Teams             []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams)
+	Users             map[string]string // username -> password
+	Warehouse         *ManagedWarehouseConfig
 }
 
 // OrgTeamConfig is the in-memory snapshot view of one duckgres_org_teams row.

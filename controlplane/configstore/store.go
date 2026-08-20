@@ -306,6 +306,9 @@ func (cs *ConfigStore) load() (*Snapshot, error) {
 			DefaultWorkerMemory:     o.DefaultWorkerMemory,
 			DefaultWorkerTTL:        o.DefaultWorkerTTL,
 			DefaultWorkerMinHotIdle: o.DefaultWorkerMinHotIdle,
+			MaxHotIdleWorkers:       o.MaxHotIdleWorkers,
+			MaxHotIdleCPU:           o.MaxHotIdleCPU,
+			MaxHotIdleMemory:        o.MaxHotIdleMemory,
 			Teams:                   teams,
 			Users:                   make(map[string]string),
 			Warehouse:               copyManagedWarehouseConfig(o.Warehouse),
@@ -1131,13 +1134,16 @@ func (cs *ConfigStore) runtimeTable(base string) string {
 // ListWorkerLifecycleStats returns grouped cluster-wide active worker lifecycle
 // state by image, tenant binding, and org for Prometheus observability, with
 // summed cpu cores and memory bytes per group.
-func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error) {
+func (cs *ConfigStore) ListWorkerLifecycleStats(defaultCPU, defaultMemory string) ([]WorkerLifecycleStats, error) {
 	// "neutral" (empty org_id) is legacy — every worker is org-bound from spawn
 	// now; the branch only matches pre-existing/legacy rows or single-tenant mode.
 	const bindingExpr = "CASE WHEN NULLIF(w.org_id, '') IS NULL THEN 'neutral' ELSE 'org_bound' END"
 	workerTable := cs.runtimeTable((&WorkerRecord{}).TableName())
 	// Org is a config table (not runtime-qualified); its default worker profile
-	// supplies the cpu/mem for workers that carry no explicit profile.
+	// supplies the cpu/mem for workers that carry no explicit profile, and the
+	// CP-global default worker shape (the caller's pod-request defaults)
+	// backstops workers whose org has no default either — otherwise an unsized
+	// worker on a default-less org silently contributes zero shape.
 	orgTable := (&Org{}).TableName()
 
 	// k8s quantity strings can't be summed in SQL, so pull the raw filtered rows
@@ -1154,8 +1160,9 @@ func (cs *ConfigStore) ListWorkerLifecycleStats() ([]WorkerLifecycleStats, error
 	var rows []workerRow
 	err := cs.db.Table(workerTable+" AS w").
 		Select("w.image AS image, w.state AS state, "+bindingExpr+" AS binding, w.org_id AS org, "+
-			"COALESCE(NULLIF(w.profile_cpu, ''), o.default_worker_cpu, '') AS cpu, "+
-			"COALESCE(NULLIF(w.profile_memory, ''), o.default_worker_memory, '') AS memory").
+			"COALESCE(NULLIF(w.profile_cpu, ''), NULLIF(o.default_worker_cpu, ''), ?) AS cpu, "+
+			"COALESCE(NULLIF(w.profile_memory, ''), NULLIF(o.default_worker_memory, ''), ?) AS memory",
+			defaultCPU, defaultMemory).
 		Joins("LEFT JOIN "+orgTable+" AS o ON o.name = w.org_id").
 		Where("w.image <> ''").
 		Where("w.state IN ?", []WorkerState{

@@ -89,6 +89,22 @@ type WorkerPool interface {
 	ShutdownAll()
 }
 
+// workerTTLPool is the optional WorkerPool capability behind the
+// `duckgres.worker_ttl` session GUC: reading and overriding the hot-idle TTL
+// a worker parks with when its last session ends. K8sWorkerPool implements it
+// (and OrgReservedPool delegates to the shared pool); the process-backend
+// FlightWorkerPool deliberately does not — its idle reaping is pool-global
+// (WorkerIdleTimeout), not per-worker, so there is nothing to override.
+type workerTTLPool interface {
+	// SetWorkerTTL overrides the hot-idle TTL stamped on the worker's record
+	// when it next parks hot → hot_idle. false when the worker is gone.
+	SetWorkerTTL(id int, ttl time.Duration) bool
+	// WorkerTTL reports the worker's current hot-idle TTL (0 = the
+	// deployment default applies at reap time). ok=false when the worker is
+	// gone.
+	WorkerTTL(id int) (time.Duration, bool)
+}
+
 // K8sWorkerPoolConfig holds the configuration for creating a K8sWorkerPool.
 type K8sWorkerPoolConfig struct {
 	Namespace                    string

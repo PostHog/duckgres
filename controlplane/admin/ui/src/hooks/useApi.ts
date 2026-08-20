@@ -21,18 +21,21 @@ import type {
   ClusterStatus,
   ClusterSummary,
   CreateUserBody,
+  DailyUsageResponse,
   DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
   ErrorEntry,
   ErrorFilters,
   FleetStat,
+  HotIdleOrg,
   ImpersonateBody,
   ManagedWarehouse,
   Me,
   MetricsPanels,
   ModelListing,
   ModelSummary,
+  MonthlyUsageResponse,
   Operator,
   Org,
   OrgTeam,
@@ -472,6 +475,15 @@ export function useFleet() {
   });
 }
 
+// Hot-idle pool reporting: which orgs hold parked workers + their caps.
+export function useHotIdle() {
+  return useQuery<HotIdleOrg[]>({
+    queryKey: ["hot-idle"],
+    queryFn: () => tolerate404<HotIdleOrg[]>([])(api.hotIdle()),
+    refetchInterval: POLL.normal,
+  });
+}
+
 // ---- metrics ----
 
 export function useMetricsPanels() {
@@ -571,6 +583,31 @@ export function useAudit(params: { actor?: string; org?: string }) {
     queryKey: ["audit", params.actor ?? "", params.org ?? ""],
     queryFn: () =>
       tolerate404<AuditEntry[]>([])(api.audit({ actor: params.actor, org: params.org, limit: 500 })),
+  });
+}
+
+// ---- monthly usage (the Usage page) ----
+
+// Monthly per-team usage over the retained billing buffer. The endpoint is
+// RequireAdmin (per-team cost data), so the query only fires for admins —
+// viewers never spend a 403 round-trip.
+export function useMonthlyUsage(months: number) {
+  const { isAdmin } = useIdentity();
+  return useQuery<MonthlyUsageResponse>({
+    queryKey: ["usage", "monthly", months],
+    queryFn: () => api.monthlyUsage(months),
+    enabled: isAdmin,
+  });
+}
+
+// One org's daily per-team usage series for the org detail page's charts.
+// RequireAdmin like the monthly endpoint — fires for admins only.
+export function useOrgDailyUsage(orgId: string, days: number) {
+  const { isAdmin } = useIdentity();
+  return useQuery<DailyUsageResponse>({
+    queryKey: ["usage", "daily", orgId, days],
+    queryFn: () => api.orgDailyUsage(orgId, days),
+    enabled: isAdmin,
   });
 }
 

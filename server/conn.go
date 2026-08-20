@@ -86,6 +86,8 @@ type preparedStmt struct {
 	querySourceShow   bool     // True if this is SHOW duckgres.query_source (answered from session state)
 	s3CacheSet        *string  // non-nil: SET duckgres.s3_cache; pointed-to value to apply to session
 	s3CacheShow       bool     // True if this is SHOW duckgres.s3_cache (answered from session state)
+	workerTTLSet      *string  // non-nil: SET duckgres.worker_ttl; pointed-to value to apply to session
+	workerTTLShow     bool     // True if this is SHOW duckgres.worker_ttl (answered from session state)
 	described         bool     // True if Describe(S) was called on this statement
 	statements        []string // Multi-statement rewrite (e.g., writable CTE)
 	cleanupStatements []string // Cleanup statements for multi-statement (DROP temp tables, COMMIT)
@@ -299,6 +301,17 @@ type clientConn struct {
 	// while the session flag flips. Same goroutine as everything else here.
 	pendingS3Cache    string
 	hasPendingS3Cache bool
+
+	// workerTTLOverride holds the `duckgres.worker_ttl` session GUC state
+	// (another duckgres-namespaced custom parameter, NOT forwarded to
+	// DuckDB): non-nil when this session overrode how long its worker stays
+	// hot-idle after the session ends. Only flipped by applyWorkerTTLSetting
+	// AFTER the control plane stamped the value on the bound worker, so SHOW
+	// never reports a TTL the worker won't park with. workerTTLCtl is the
+	// control-plane capability behind the GUC (nil outside the remote/k8s
+	// backend, where SET/SHOW are session-state-only). See conn_worker_ttl.go.
+	workerTTLOverride *time.Duration
+	workerTTLCtl      *WorkerTTLControl
 
 	// fatalErr parks a connection-terminating error raised inside an
 	// extended-query handler. Those handlers are void (the protocol reports
@@ -1686,6 +1699,40 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 		}
 		_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, nil, nil)
+		_ = c.writeCommandComplete("SHOW")
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
+
+	// Handle the duckgres.worker_ttl custom GUC (SET / SHOW). Intercepted
+	// session-side; applied by overriding the bound worker's pool-side
+	// hot-idle TTL, never forwarded to DuckDB. A failed apply fails the SET
+	// so the session state never diverges from the TTL the worker will
+	// actually park with.
+	if result.WorkerTTLSet != nil {
+		// Lazy activation: like duckgres.s3_cache this is WORKER state (the
+		// control plane's pool record for the bound worker), so it must have
+		// a worker to apply to. Not a pinning statement, so it acquires the
+		// exploratory worker.
+		if err := c.activateForStatement(query, false); err != nil {
+			return err
+		}
+		if err := c.applyWorkerTTLSetting(*result.WorkerTTLSet); err != nil {
+			c.sendError("ERROR", workerTTLApplyErrorSQLState(err), err.Error())
+		} else {
+			_ = c.writeCommandComplete("SET")
+		}
+		_ = c.writeReadyForQuery(c.txStatus)
+		_ = c.flushWriter()
+		return nil
+	}
+	if result.WorkerTTLShow {
+		// No lazy activation: the connect-time baseline (or the built-in
+		// default) is the truthful answer until a worker exists — there is no
+		// pending worker-side state the way a connect-time s3_cache=off is.
+		_ = c.sendRowDescription([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		_ = c.sendDataRowWithFormats([]interface{}{c.workerTTLValue()}, nil, nil)
 		_ = c.writeCommandComplete("SHOW")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()

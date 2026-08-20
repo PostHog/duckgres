@@ -19,6 +19,12 @@ const ACTION_LABELS: Record<string, string> = {
   "warehouse.create": "Created warehouse config",
   "warehouse.update": "Updated warehouse config",
   "warehouse.delete": "Deleted warehouse config",
+  "warehouse.provision": "Provisioned warehouse",
+  "warehouse.deprovision": "Deprovisioned warehouse",
+  "warehouse.reset_password": "Reset warehouse root password",
+
+  "credential.create": "Minted service credential",
+  "credential.refresh": "Refreshed service credential",
 
   "team.create": "Created org team",
   "team.update": "Updated org team",

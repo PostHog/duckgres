@@ -49,6 +49,9 @@ export interface Org {
   teams?: OrgTeam[];
   max_workers: number;
   max_vcpus: number;
+  max_hot_idle_workers: number;
+  max_hot_idle_cpu: string;
+  max_hot_idle_memory: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
@@ -69,6 +72,9 @@ export interface OrgUpdate {
   // collisions.
   database_name?: string;
   max_workers?: number;
+  max_hot_idle_workers?: number;
+  max_hot_idle_cpu?: string;
+  max_hot_idle_memory?: string;
   max_vcpus?: number;
   default_worker_cpu?: string;
   default_worker_memory?: string;
@@ -680,4 +686,61 @@ export interface ExternalMetadataStoreInfo {
   password_aws_secret: string;
   user: string;
   database: string;
+}
+
+// GET /api/v1/usage/monthly — the Usage page. Rows are per (UTC month, org,
+// team), merged across the compute + storage billing families over the
+// RETAINED billing buffer (acked buckets are deleted; >30d buckets GC'd) —
+// watermark_low is the billing ack cursor that bounds how far back data can
+// exist. gib_seconds is the exact-decimal GiB-seconds JSON number.
+export interface MonthlyUsageRow {
+  month: string; // "YYYY-MM" UTC
+  org_id: string;
+  team_id: number;
+  schema_name: string | null;
+  cpu_seconds: number;
+  memory_seconds: number;
+  gib_seconds: number;
+}
+
+export interface MonthlyUsageResponse {
+  from: string;
+  months: number;
+  watermark_low: string | null;
+  rows: MonthlyUsageRow[];
+}
+
+// GET /api/v1/orgs/:id/usage/daily — the org detail page's usage charts.
+// One row per (UTC date, team), compute + storage merged, over the retained
+// billing buffer (same retention as the monthly view: acked buckets are
+// deleted, >30d buckets GC'd — watermark_low marks where billed data went).
+export interface DailyUsageRow {
+  date: string; // "YYYY-MM-DD" UTC
+  team_id: number;
+  schema_name: string | null;
+  cpu_seconds: number;
+  memory_seconds: number;
+  gib_seconds: number;
+}
+
+export interface DailyUsageResponse {
+  org_id: string;
+  days: number;
+  from: string;
+  watermark_low: string | null;
+  rows: DailyUsageRow[];
+}
+
+// GET /api/v1/workers/hot-idle — one org's hot-idle pool footprint + its
+// configured pool caps (0/"" = unlimited), for the Workers page's hot-idle
+// reporting card.
+export interface HotIdleOrg {
+  org_id: string;
+  count: number;
+  cpu_cores: number;
+  memory_bytes: number;
+  oldest_hot_idle_since: string | null;
+  cap_workers: number;
+  cap_cpu: string;
+  cap_memory: string;
 }

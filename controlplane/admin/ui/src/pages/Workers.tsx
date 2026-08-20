@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { type ColumnDef } from "@tanstack/react-table";
 import { Search, Server } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
@@ -8,10 +9,10 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
-import { useFleet, useOrgLabels, useWorkers } from "@/hooks/useApi";
+import { useFleet, useHotIdle, useOrgLabels, useWorkers } from "@/hooks/useApi";
 import { OrgRef } from "@/components/OrgRef";
-import { fmtBytes, fmtDuration, fmtInt } from "@/lib/format";
-import type { WorkerStatus } from "@/types/api";
+import { fmtAge, fmtBytes, fmtDuration, fmtInt, fmtUnits } from "@/lib/format";
+import type { HotIdleOrg, WorkerStatus } from "@/types/api";
 
 // Canonical lifecycle-state order for the rollup chips.
 const STATE_ORDER = ["spawning", "idle", "reserved", "activating", "hot", "hot_idle", "draining"];
@@ -19,11 +20,13 @@ const STATE_ORDER = ["spawning", "idle", "reserved", "activating", "hot", "hot_i
 export function Workers() {
   const fleet = useFleet();
   const workers = useWorkers();
+  const hotIdle = useHotIdle();
   const orgLabels = useOrgLabels();
   const [filter, setFilter] = useState("");
 
   const fleetRows = fleet.data ?? [];
   const workerRows = workers.data ?? [];
+  const hotIdleRows = hotIdle.data ?? [];
 
   // Per-state rollup: sum the durable runtime-store counts grouped by lifecycle
   // state (a state may span several image/binding rows).
@@ -40,6 +43,67 @@ export function Workers() {
   const totalFleet = useMemo(() => fleetRows.reduce((n, f) => n + f.count, 0), [fleetRows]);
   const totalCpu = useMemo(() => fleetRows.reduce((n, f) => n + (f.cpu_cores ?? 0), 0), [fleetRows]);
   const totalMem = useMemo(() => fleetRows.reduce((n, f) => n + (f.memory_bytes ?? 0), 0), [fleetRows]);
+
+  const hotIdleColumns = useMemo<ColumnDef<HotIdleOrg, any>[]>(
+    () => [
+      {
+        accessorKey: "org_id",
+        header: "Org",
+        cell: ({ row }) => (
+          <Link to={`/orgs/${encodeURIComponent(row.original.org_id)}`} className="block hover:underline">
+            <OrgRef id={row.original.org_id} label={orgLabels.get(row.original.org_id)} copyable={false} />
+          </Link>
+        ),
+      },
+      {
+        accessorKey: "count",
+        header: "Workers",
+        cell: ({ row }) => {
+          const o = row.original;
+          return (
+            <span className="font-mono text-xs">
+              {fmtInt(o.count)}
+              {o.cap_workers > 0 && (
+                <span className={o.count > o.cap_workers ? "text-destructive" : "text-muted-foreground"}>
+                  {" "}/ {o.cap_workers}
+                </span>
+              )}
+            </span>
+          );
+        },
+      },
+      {
+        accessorKey: "cpu_cores",
+        header: "vCPU",
+        cell: ({ getValue }) => <span className="font-mono text-xs">{fmtUnits(getValue() as number)}</span>,
+      },
+      {
+        accessorKey: "memory_bytes",
+        header: "Memory",
+        cell: ({ getValue }) => <span className="font-mono text-xs">{fmtBytes(getValue() as number)}</span>,
+      },
+      {
+        accessorKey: "oldest_hot_idle_since",
+        header: "Longest idle",
+        cell: ({ getValue }) => {
+          const v = getValue() as string | null;
+          return <span className="text-xs text-muted-foreground">{v ? fmtAge(v) : "—"}</span>;
+        },
+      },
+      {
+        id: "cap",
+        header: "Cap",
+        accessorFn: (o: HotIdleOrg) =>
+          o.cap_workers > 0 || o.cap_cpu || o.cap_memory
+            ? [o.cap_workers > 0 ? `${o.cap_workers} workers` : null, o.cap_cpu || null, o.cap_memory || null]
+                .filter(Boolean)
+                .join(" · ")
+            : "—",
+        cell: ({ getValue }) => <span className="text-xs text-muted-foreground">{String(getValue())}</span>,
+      },
+    ],
+    [orgLabels],
+  );
 
   const columns = useMemo<ColumnDef<WorkerStatus, any>[]>(
     () => [
@@ -102,7 +166,7 @@ export function Workers() {
     <>
       <PageHeader
         title="Workers"
-        description="Fleet rollup by lifecycle state (GET /api/v1/workers/fleet) plus session-holding workers (GET /api/v1/workers)."
+        description="Fleet rollup by lifecycle state (GET /api/v1/workers/fleet), per-org hot-idle pools (GET /api/v1/workers/hot-idle), plus session-holding workers (GET /api/v1/workers)."
         actions={
           <div className="relative">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -165,6 +229,34 @@ export function Workers() {
             </CardContent>
           </Card>
         </div>
+
+        <Card className="mb-4">
+          <CardHeader className="flex-row items-center justify-between">
+            <div>
+              <CardTitle>Hot idle by org</CardTitle>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Parked (hot-idle) workers held per org and each org's configured pool cap — the janitor retires the
+                oldest excess past it. Caps are edited on the org page.
+              </p>
+            </div>
+          </CardHeader>
+          <CardContent>
+            {hotIdle.isError ? (
+              <p className="py-4 text-center text-sm text-destructive">Hot-idle endpoint error.</p>
+            ) : hotIdleRows.length === 0 ? (
+              <p className="py-4 text-center text-sm text-muted-foreground">No workers are parked hot-idle.</p>
+            ) : (
+              <DataTable
+                data={hotIdleRows}
+                columns={hotIdleColumns}
+                // Default: most memory pinned first — that's the resource that
+                // pins nodes. Workers/vCPU/memory headers are clickable to
+                // re-sort.
+                initialSorting={[{ id: "memory_bytes", desc: true }]}
+              />
+            )}
+          </CardContent>
+        </Card>
 
         <Card className="overflow-hidden">
           <CardHeader>

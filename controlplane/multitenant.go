@@ -99,19 +99,9 @@ func (a *orgRouterAdapter) MetadataProxySessions() *metadataProxySessionRegistry
 	return a.metadataSessions
 }
 
-// effectiveDefaultWorkerTTL resolves the janitor's hot-idle retention: the
-// operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
-// K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
-// defaultWorkerTTL (1m — the same fallback sized-but-no-ttl requests get at
-// profile resolution, so there is exactly ONE default TTL however a worker
-// came to have no explicit one). The full per-request precedence is:
-// client GUC > org default > deployment default TTL > built-in 1m.
-func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
-	if configured > 0 {
-		return configured
-	}
-	return defaultWorkerTTL
-}
+// effectiveDefaultWorkerTTL moved to worker_profile.go (untagged) so the
+// duckgres.worker_ttl session-GUC hook can resolve the same default in every
+// build flavor.
 
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
@@ -373,7 +363,7 @@ func SetupMultiTenant(
 	// their TTL — there is no warm pool to reconcile, so this is pure
 	// observability, leader-only.
 	janitor.observeWorkerLifecycle = func() {
-		stats, err := listWorkerLifecycleStats(store)
+		stats, err := listWorkerLifecycleStats(store, firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU), firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory))
 		if err != nil {
 			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", err)
 			return
@@ -427,6 +417,15 @@ func SetupMultiTenant(
 			return 0
 		}
 		return org.DefaultWorkerMinHotIdle
+	}
+	// Hot-idle pool caps (max_hot_idle_*): the sweep reads the same config
+	// snapshot as the floor, so an admin-console cap edit takes effect on the
+	// next tick after the config poll reloads. Shape fallback resolves to the
+	// CP-global default worker shape (orgHotIdleLimitsFromSnapshot).
+	janitor.hotIdleCaps = func() map[string]orgHotIdleLimit {
+		return orgHotIdleLimitsFromSnapshot(store.Snapshot(),
+			firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU),
+			firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory))
 	}
 	// Node-headroom controller: keep low-priority placeholder pods as warm,
 	// preemptible spare capacity so worker spawns schedule immediately.
@@ -620,11 +619,13 @@ func SetupMultiTenant(
 	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
 	clusterInfo := &clusterInfoProvider{
-		router:           router,
-		store:            store,
-		srv:              srv,
-		selfCPID:         cpInstanceID,
-		metadataSessions: metadataSessions,
+		router:              router,
+		store:               store,
+		srv:                 srv,
+		selfCPID:            cpInstanceID,
+		metadataSessions:    metadataSessions,
+		defaultWorkerCPU:    firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU),
+		defaultWorkerMemory: firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory),
 	}
 	imp := &impersonator{router: router}
 	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
@@ -814,14 +815,14 @@ func (a ducklingMetadataAdapter) CRMetadataStores(ctx context.Context) (map[stri
 }
 
 type workerLifecycleStatsLister interface {
-	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
+	ListWorkerLifecycleStats(defaultCPU, defaultMemory string) ([]configstore.WorkerLifecycleStats, error)
 }
 
-func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
+func listWorkerLifecycleStats(lister workerLifecycleStatsLister, defaultCPU, defaultMemory string) ([]configstore.WorkerLifecycleStats, error) {
 	if lister == nil {
 		return nil, nil
 	}
-	return lister.ListWorkerLifecycleStats()
+	return lister.ListWorkerLifecycleStats(defaultCPU, defaultMemory)
 }
 
 func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {

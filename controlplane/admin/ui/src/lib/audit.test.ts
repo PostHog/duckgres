@@ -23,6 +23,11 @@ describe("actionLabel", () => {
     expect(actionLabel("operators.delete")).toBe("Removed operator");
     expect(actionLabel("org.update")).toBe("Updated org config");
     expect(actionLabel("warehouse.update")).toBe("Updated warehouse config");
+    expect(actionLabel("warehouse.provision")).toBe("Provisioned warehouse");
+    expect(actionLabel("warehouse.deprovision")).toBe("Deprovisioned warehouse");
+    expect(actionLabel("warehouse.reset_password")).toBe("Reset warehouse root password");
+    expect(actionLabel("credential.create")).toBe("Minted service credential");
+    expect(actionLabel("credential.refresh")).toBe("Refreshed service credential");
     expect(actionLabel("user.kill")).toBe("Killed user sessions");
     expect(actionLabel("user.disable")).toBe("Disabled user");
     expect(actionLabel("secret.delete")).toBe("Deleted user secret");

@@ -1916,6 +1916,12 @@ type duckLakeMetadataIndex struct {
 // duckLakeMetadataIndexes lists indexes that improve DuckDB postgres scanner
 // performance. The scanner uses COPY with ctid batches and pushes down filters,
 // but without indexes each batch requires a sequential scan.
+//
+// Keep in sync with the catalog-maintenance side of the house: the same index
+// set (under ducklake_*_idx names) is applied to shared/standalone catalogs by
+// the DuckLake maintenance tooling (PostHog/millpond, tools/ducklake_maintenance.py
+// CATALOG_INDEXES). The two never overlap here because workers attach per-tenant
+// catalogs, not the shared one.
 var duckLakeMetadataIndexes = []duckLakeMetadataIndex{
 	// Critical: ducklake_file_column_stats is often the largest table (millions of rows).
 	// Filter pushdown CTEs query by (table_id, column_id) on every query.
@@ -1944,6 +1950,39 @@ var duckLakeMetadataIndexes = []duckLakeMetadataIndex{
 	{
 		name: "idx_ducklake_data_file_tbl_snap",
 		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_tbl_snap ON ducklake_data_file (table_id, begin_snapshot, end_snapshot)",
+	},
+	// Per-file and table-scoped per-file reads of the stats/partition side
+	// tables. Those tables have no index at all in the stock DuckLake schema,
+	// so per-snapshot file listings seq-scan them once they grow (measured:
+	// minutes per listing on a shared catalog with ~10^8 stats rows). The
+	// (table_id, data_file_id) composites serve `WHERE table_id = ? AND
+	// data_file_id IN (...)` fetches; the solo data_file_id indexes serve
+	// per-file lookups.
+	{
+		name: "idx_ducklake_file_col_stats_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_file ON ducklake_file_column_stats (data_file_id)",
+	},
+	{
+		name: "idx_ducklake_file_col_stats_tbl_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_tbl_file ON ducklake_file_column_stats (table_id, data_file_id)",
+	},
+	{
+		name: "idx_ducklake_file_part_val_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_part_val_file ON ducklake_file_partition_value (data_file_id)",
+	},
+	{
+		name: "idx_ducklake_file_part_val_tbl_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_part_val_tbl_file ON ducklake_file_partition_value (table_id, data_file_id)",
+	},
+	// Live-file scans ordered by size (compaction / metrics): partial on
+	// end_snapshot IS NULL so expired files never bloat the index.
+	{
+		name: "idx_ducklake_data_file_compaction",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_compaction ON ducklake_data_file (table_id, end_snapshot, file_size_bytes) WHERE end_snapshot IS NULL",
+	},
+	{
+		name: "idx_ducklake_delete_file_compaction",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_delete_file_compaction ON ducklake_delete_file (table_id, end_snapshot, file_size_bytes) WHERE end_snapshot IS NULL",
 	},
 	{
 		name: "idx_ducklake_delete_file_tbl_snap",

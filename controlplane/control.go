@@ -1528,6 +1528,14 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	}
 	cc := server.NewClientConn(cp.srv, tlsConn, reader, writer, username, orgID, database, applicationName, sessionExec, pid, secretKey, workerID, workerPod)
 	server.SetConnectionIdleTimeout(cc, clientIdleTimeout)
+	// Install the mid-session `SET duckgres.worker_ttl` capability
+	// (remote/k8s only — the process backend and standalone have no per-worker
+	// hot-idle TTL to override, so there SET/SHOW are session-state-only).
+	// Apply/Current resolve the session's worker by pid at call time, so they
+	// follow the worker across lazy activation and tier escalation.
+	if cp.isRemoteBackend {
+		server.SetConnectionWorkerTTLControl(cc, cp.workerTTLControlFor(sessions, pid, initialProfile, clog))
+	}
 	// Stamp the PostHog team id (config-snapshot read, no I/O) so this
 	// connection's product-analytics events carry a PostHog-native key. Same
 	// resolution the compute meter uses: the connecting user's team, else the

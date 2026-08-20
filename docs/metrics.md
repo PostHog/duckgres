@@ -238,9 +238,26 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_hits_total` | Counter | None | Worker-facing cacheable requests served entirely from data already present on local NVMe. Peer API reads and requests that first fetch any block from a peer are excluded. |
 | `cache_proxy_misses_total` | Counter | None | Worker-facing cacheable requests that require a peer or origin fill before they can be served. |
 | `cache_proxy_bytes_served_total` | Counter | `source` | Directional byte mix by `local`, `peer`, or `s3`. Block mode counts assembled response bytes under the slowest source used; the legacy exact-range path counts the local read or deduplicated fill once, so this is not an exact client-egress counter. |
-| `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups. One lookup can issue multiple physical `/cache/has` probes. |
-| `cache_proxy_peer_hits_total` | Counter | None | Logical peer lookups followed by a successful peer body transfer. |
-| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical peer availability probe attempts, classified as `hit`, `miss`, `timeout`, `canceled`, or `error`. Both a present entry (`200`) and an in-flight claim (`202`) are `hit`; `canceled` normally means a losing probe was released after another peer answered and is not itself a failure. |
+| `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups in either mode. |
+| `cache_proxy_peer_hits_total` | Counter | None | Successful peer body transfers. A block-mode request can record up to two transfers for one logical lookup. |
+| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical `/cache/has` attempts only. In summary mode these are bounded confirmations of Bloom-positive or uncovered peers, never fleet-wide fanout. The per-request maximum is `CACHE_PEER_MAX_PROBES_PER_REQUEST`. |
+| `cache_proxy_peer_probes_skipped_total` | Counter | None | Summary-mode confirmations skipped because the pod-wide active `/cache/has` HTTP-request/socket budget was exhausted; those requests fall back to origin without queuing. This budget does not count total process goroutines. |
+| `cache_proxy_summary_pulls_total` | Counter | `outcome` | Receiver-driven `GET /cache/summary` attempts by outcome, including success, not-modified, timeout, rejection, and size/read failures. |
+| `cache_proxy_summary_serves_total` | Counter | `outcome` | Local summary endpoint and snapshot-build outcomes. |
+| `cache_proxy_summary_resident_count` | Gauge | None | Current retained peer summaries. |
+| `cache_proxy_summary_resident_bytes` | Gauge | None | Conservative total Bloom-state accounting: the fixed local counting filter, maximum snapshot/pull transient reserve, and retained remote summary bits. This is reserved/accounted memory, not measured process RSS. It is `0` outside summary mode. |
+| `cache_proxy_summary_memory_limit_bytes` | Gauge | None | Effective `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` ceiling used for the total Bloom-state accounting above. It is `0` outside summary mode. Alert when resident bytes approach this value. |
+| `cache_proxy_summary_age_seconds` | Histogram | None | Age of summaries used in local Bloom lookups. |
+| `cache_proxy_summary_lookups_total` | Counter | `outcome` | `no_valid_summary`, `no_positive`, or `positive_candidate`. |
+| `cache_proxy_summary_confirmed_gets_total` | Counter | `outcome` | Peer body GET outcomes in summary mode. A GET is attempted only after an exact bounded `/cache/has` confirmation. |
+| `cache_proxy_summary_bloom_items` | Gauge | None | Local live cache keys represented by the incrementally maintained counting Bloom filter. |
+| `cache_proxy_summary_bloom_bits` / `cache_proxy_summary_bloom_hashes` | Gauge | None | Fixed Bloom-filter layout, sized for 1m keys at a 1% target false-positive rate. |
+| `cache_proxy_summary_bloom_false_positive_ratio` | Gauge | None | Predicted per-peer false-positive ratio from live item count and filter layout. This rises smoothly after 1m keys; use fleet size to interpret aggregate request cost. |
+| `cache_proxy_summary_bloom_saturated` | Gauge | None | `1` when the local live key count exceeds the 1m target capacity; snapshot refresh and serving continue. |
+| `cache_proxy_summary_bloom_bit_occupancy_ratio` | Gauge | None | Fraction of local Bloom bits set; a direct saturation signal independent of the FPR estimate. |
+| `cache_proxy_summary_bloom_additions_total` / `cache_proxy_summary_bloom_removals_total` | Counter | None | Cache commits and evictions applied incrementally to the local Bloom index. |
+| `cache_proxy_summary_bloom_counter_saturations_total` | Counter | None | Counting-Bloom cells that reached `uint16` saturation and were made sticky to avoid false negatives. |
+| `cache_proxy_summary_bloom_snapshots_total` / `cache_proxy_summary_bloom_snapshot_bytes` | Counter / Gauge | None | Immutable local Bloom snapshots prepared for the pull endpoint and their bounded raw-bit size. |
 
 Cache-proxy metrics deliberately have no org label. Use the existing per-org
 Duckgres query and worker-acquisition metrics for customer-facing rollout
@@ -266,7 +283,8 @@ sum(rate(cache_proxy_peer_probes_total[5m]))
 clamp_min(sum(rate(cache_proxy_peer_fetches_total[5m])), 1e-9)
 ```
 
-Peer lookup yield:
+Successful peer body transfers per logical lookup (this can exceed `1` for a
+multi-block request):
 
 ```promql
 sum(rate(cache_proxy_peer_hits_total[5m]))

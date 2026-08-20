@@ -31,6 +31,13 @@ vi.mock("@/components/OrgTeamDialogs", () => ({
   LegacyNamesBadge: () => null,
 }));
 
+// The usage charts section is independently tested in OrgUsage.test.tsx; here
+// it would need the useApi mock to grow a useOrgDailyUsage entry it never
+// asserts on.
+vi.mock("@/pages/OrgUsage", () => ({
+  OrgUsageSection: () => null,
+}));
+
 import { OrgDetail } from "./OrgDetail";
 
 const warehouseUpdate = vi.fn();
@@ -58,6 +65,9 @@ const ORG: Org = {
   default_worker_memory: "8Gi",
   default_worker_ttl: "75m",
   default_worker_min_hot_idle: 0,
+  max_hot_idle_workers: 0,
+  max_hot_idle_cpu: "",
+  max_hot_idle_memory: "",
   data_imports_table_naming_version: "legacy_batch_v1",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
@@ -291,6 +301,30 @@ describe("Org detail", () => {
     expect(orgUpdate).toHaveBeenCalledTimes(1);
     expect(orgUpdate).toHaveBeenCalledWith(
       expect.objectContaining({ data_imports_table_naming_version: "copy_v1" }),
+    );
+  });
+
+  it("saves the hot-idle pool caps with the org form", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const workers = await screen.findByLabelText(/max hot-idle workers/i);
+    await user.clear(workers);
+    await user.type(workers, "5");
+    const cpu = screen.getByLabelText(/max hot-idle vcpu/i);
+    await user.clear(cpu);
+    await user.type(cpu, "16");
+    const mem = screen.getByLabelText(/max hot-idle memory/i);
+    await user.clear(mem);
+    await user.type(mem, "64Gi");
+    await user.click(screen.getByText("Save changes"));
+
+    expect(orgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        max_hot_idle_workers: 5,
+        max_hot_idle_cpu: "16",
+        max_hot_idle_memory: "64Gi",
+      }),
     );
   });
 });

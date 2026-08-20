@@ -242,6 +242,20 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// effectiveDefaultWorkerTTL resolves the hot-idle retention floor: the
+// operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
+// K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
+// defaultWorkerTTL (1m — the same fallback sized-but-no-ttl requests get at
+// profile resolution, so there is exactly ONE default TTL however a worker
+// came to have no explicit one). The full per-request precedence is:
+// client GUC > org default > deployment default TTL > built-in 1m.
+func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return defaultWorkerTTL
+}
+
 func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int, error) {
 	cpu := strings.TrimSpace(workerCPURequest)
 	if profile != nil && strings.TrimSpace(profile.CPU) != "" {

@@ -378,13 +378,16 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   answers itself — `SET`/`SHOW duckgres.query_source`, ignored SETs, no-ops,
   `pg_stat_activity`, the empty query — MUST NOT acquire. That is the point of
   the whole feature; adding an acquire to an engine-free path silently deletes
-  the benefit. The `duckgres.s3_cache` GUC is the exception, on all three
-  protocol paths, because unlike the other duckgres GUCs it is WORKER state (it
-  rebuilds the worker's `ducklake_s3` secret): **`SET` always acquires** — the
-  swap needs a worker to apply to — and **`SHOW` acquires only when
+  the benefit. The `duckgres.s3_cache` and `duckgres.worker_ttl` GUCs are the
+  exception, on all three protocol paths, because unlike the other duckgres
+  GUCs they are WORKER state (the s3_cache secret swap; the worker_ttl
+  pool-side hot-idle TTL): **`SET` always acquires** — the apply needs a
+  worker to land on — and **`SHOW duckgres.s3_cache` acquires only when
   `c.hasPendingS3Cache`**, i.e. when a connect-time option has not been applied
   yet and answering first would report a transport the session is about to
-  leave (see the s3_cache section below).
+  leave (see the s3_cache section below). `SHOW duckgres.worker_ttl` never
+  acquires: until a worker exists, the connect-time baseline is the truthful
+  answer (there is no pending worker-side TTL state).
 - **A pinning FIRST statement acquires the standard profile directly** (one
   acquire, `pinned=true` → `MarkConnectionPinned`), never small-then-escalate.
 - **The pin set is the state boundary, and every member is load-bearing:** DML,
@@ -481,6 +484,56 @@ connect) and **escalation** (small → standard, one-way). Env-only knobs:
   assertions in `tests/mw-dev/e2e/harness.sh`. The harness header above
   `exploratory_tier` records which existing assertions the tier's connect
   semantics changed and why — keep that audit current.
+
+## Hot-Idle Pool Reporting + Per-Org Caps (remote backend)
+
+Two operator surfaces for the hot-idle pool, both over the durable runtime
+store (`worker_records`, the only source that sees parked workers — they hold
+no session):
+
+- **Reporting**: `configstore.ListHotIdleByOrg` aggregates `hot_idle` rows
+  per org (count, summed vCPU/memory, oldest park) and
+  `GET /api/v1/workers/hot-idle` (`controlplane/admin/live.go`) joins each
+  org's configured caps. Backs the Workers page "Hot idle by org" card
+  (sortable, default memory-pinned desc). **Worker shape resolution is a
+  three-step chain, everywhere**: the worker's explicit profile wins, else
+  the org's default worker profile, else the CP-global default worker shape
+  (`cfg.K8s.WorkerCPURequest`/`MemoryRequest`, else the 8/16Gi constants) —
+  an unsized worker on a default-less org must never report zero cpu/memory
+  (it pins real pod requests). The same chain backs the fleet rollup
+  (`ListWorkerLifecycleStats`) and the cap sweep's shape math
+  (`orgHotIdleLimitsFromSnapshot`); unparseable quantities still contribute 0.
+- **Caps**: `max_hot_idle_workers` (count), `max_hot_idle_cpu` and
+  `max_hot_idle_memory` (k8s quantity strings, e.g. `"16"` / `"64Gi"`) on
+  `duckgres_orgs` (migration 000037; 0/"" = unlimited). Editable via the
+  admin org PUT + the org detail form. Invariants:
+  - **Enforcement is a convergent janitor sweep** (`reapHotIdleCaps`), NOT a
+    park-time check: on each tick it retires the OLDEST parked workers
+    (oldest-first listing) until the org is within ALL configured limits.
+    This uniformly covers every park path AND cap decreases — lowering a cap
+    drains the excess on the next ticks (config-poll reload, then the 5s
+    janitor tick). Retires go through the fenced `RetireFromSnapshot` CAS
+    with origin `janitor_hot_idle_cap` (a distinct metric origin — a nonzero
+    rate means an operator's cost ceiling is biting, not stale capacity).
+    On a retire error the sweep STOPS that org for the tick (never marches
+    on and over-reaps on a transient failure).
+  - **Cap wins over the floor** (`DefaultWorkerMinHotIdle`): the floor only
+    guards the TTL reaper; the cap is the explicit operator intent. An org
+    with floor > cap is a contradictory config that resolves to the cap.
+  - **Validation is fail-closed on the write path**: a cap quantity that
+    doesn't parse (or is zero/negative) is 400'd by the admin org PUT,
+    because the sweep reads those as UNLIMITED — accepting them would
+    silently mean "no cap".
+  - The sweep runs even when the TTL reaper is disabled (`hotIdleTTL == 0`)
+    — a cap is a hard ceiling, not a freshness rule.
+- Touching any of this → update `tests/configstore/hot_idle_reporting_postgres_test.go`
+  (+ the migration asserts in `migrations_postgres_test.go`),
+  `controlplane/janitor_test.go` (the cap sweep cases +
+  `TestOrgHotIdleLimitsFromSnapshot` glue test),
+  `controlplane/admin/api_test.go` (`TestUpdateOrgHotIdleCaps*`) +
+  `live_test.go` (`TestHotIdleRoute`), `ui/src/pages/Workers.test.tsx` +
+  `OrgDetail.test.tsx`, AND the `/workers/hot-idle` envelope +
+  `hot_idle_reporting_and_cap` assertions in `tests/mw-dev/e2e/harness.sh`.
 
 ## Worker Drain Protocol (graceful shutdown, #690)
 
@@ -590,6 +643,50 @@ session per worker = session-scoped in effect. Invariants:
   `tests/mw-dev/e2e/harness.sh` (mw-dev has no cache proxy, so the e2e covers
   the client-visible plumbing incl. the worker action round-trip; the swap
   itself is unit-only — see the harness header note).
+
+## Mid-Session Worker TTL (`duckgres.worker_ttl`, remote backend)
+
+`SET duckgres.worker_ttl = '20m'` / `SHOW` / `RESET` let a client that cannot
+set startup options change its bound worker's pool-side hot-idle TTL
+mid-session (transpiler interception in `transform/setshow.go`, connection
+apply in `server/conn_worker_ttl.go`, control-plane hook
+`controlplane/worker_ttl.go::workerTTLControlFor` → pool
+`SetWorkerTTLForPID`). Full design: `docs/design/worker-ttl-pool.md`.
+Invariants:
+
+- **Same trust boundary as the `duckgres.worker_*` startup options**: gated
+  on `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE` (SET rejected 22023 when off)
+  and clamped to `DUCKGRES_K8S_WORKER_MAX_TTL`; a clamped value is stored
+  clamped.
+- **State follows the worker, never leads it** (same rule as s3_cache): the
+  session override flips only after the apply hook succeeds, and SHOW falls
+  back to the bound worker's CURRENT pool TTL (`Current`), so SHOW never
+  reports a TTL the worker won't park with.
+- **Whole-minute granularity, enforced at validation.** The parked TTL is
+  persisted as `ttl_minutes` (integer; 0 = "reaper applies the deployment
+  default"), so `NormalizeWorkerTTL` REJECTS zero and sub-minute values with
+  22023 — accepting them would park the worker for the deployment default
+  while SHOW reported the shorter value. (Sub-minute STARTUP options still
+  truncate at park — pre-existing.)
+- **Both reapers read the persisted override** (`ttl_minutes` stamped at the
+  hot→hot_idle park): the leader janitor's expiry query and the per-CP
+  fallback.
+- **Exploratory tier**: SET on a lazily-activated connection acquires a
+  worker first (the TTL is pool-side per-worker state — there is nothing to
+  apply to otherwise); SHOW never acquires (the connect-time baseline is the
+  truthful answer pre-worker). Escalation re-applies the override on the new
+  worker; on failure the override is RESET (statement error, not
+  connection-fatal) — and BOTH session-worker-state re-applies (s3_cache +
+  worker_ttl) always run (an s3 failure must not skip the TTL re-apply).
+- **Describe must cover BOTH 'S' and 'P'** for the intercepted SET/SHOW — a
+  portal-Describe miss returns NoData and probes DuckDB (acquiring a worker
+  on lazy connections) for a GUC it does not know.
+- **Standalone/process backends** accept SET/SHOW as session state only (no
+  per-worker hot-idle TTL exists there).
+- Touching the interception, apply hook, park persistence, or the reapers →
+  update `transpiler/worker_ttl_test.go`, `server/worker_ttl_test.go`,
+  `controlplane/worker_ttl_test.go` + `k8s_pool_worker_ttl_test.go`, AND the
+  `worker_ttl_guc` assertion in `tests/mw-dev/e2e/harness.sh`.
 
 ## User Persistent Secrets (multitenant remote backend)
 
@@ -1102,14 +1199,45 @@ touching this path:
   disable, direct RDS → require). Drift gauges:
   `duckgres_org_storage_pending_delete_files` (alert on sustained nonzero) +
   `duckgres_org_storage_tracked_bytes`.
+- **The admin console usage views read the SAME buffer** —
+  `GET /api/v1/usage/monthly` (the **Usage** page) and
+  `GET /api/v1/orgs/:id/usage/daily` (the org detail page's **Usage** charts)
+  in `controlplane/admin/usage_api.go`, backed by
+  `configstore.Aggregate{Compute,Storage}Usage{Monthly,Daily}`, sum retained
+  buckets per UTC month / per UTC day per (org, team), merging the compute and
+  storage families and joining the team schema name for display. Both
+  self-gate with `RequireAdmin` (per-team cost data across all orgs is as
+  sensitive as the raw billing families — viewers get 403, and the UI hides
+  the nav item / fires no query for them). The daily endpoint's org scope is
+  the `:id` path segment flowing into the queries' WHERE clause — one org's
+  usage must never leak into another org's page (the e2e asserts
+  `.org_id == $o` on the response). These are operations views, NOT invoices:
+  acked buckets are already deleted and >30d buckets are
+  GC'd, so responses carry the ack cursor as `watermark_low` and the UI
+  shows the retention caveat instead of implying all-time totals. They add NO
+  second accounting pipeline — keep them pure reads over the buffer.
+  The Usage page also carries a **client-side pricing-sensitivity calculator**
+  (`ui/src/pages/UsagePricing.tsx` + `lib/pricing.ts`): named unit-price
+  scenarios ($/CPU-min, $/GiB·min, $/GiB·h) priced against each org's month
+  totals. It is pure browser math over the monthly rows — no endpoint, no
+  persistence beyond the operator's own localStorage — so it inherits the
+  page's admin-only gate and needs no server-side access control of its own
+  (a PM gets it by holding the console admin role; a lighter pricing-viewer
+  role is a named follow-up, not implemented).
 - Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
   the storage sampler, or the bucket keys → update
   `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,
   `compute_size_test.go`, `storage_meter_test.go`,
   `configstore/storage_usage_test.go`, the migration assertion in
   `tests/configstore/migrations_postgres_test.go`, and the
-  `compute_usage_pull_api` assertion (compute + storage) in
-  `tests/mw-dev/e2e/harness.sh`.
+  `compute_usage_pull_api` assertion (compute + storage, incl. the
+  `usage-monthly` checks) in
+  `tests/mw-dev/e2e/harness.sh`. Touching the monthly/daily aggregation or
+  the usage views → update `controlplane/admin/usage_api_test.go`,
+  `tests/configstore/usage_monthly_postgres_test.go` +
+  `usage_daily_postgres_test.go`,
+  `ui/src/pages/Usage.test.tsx` + `OrgUsage.test.tsx`, and the
+  `usage-monthly` / `usage-daily` harness checks.
 
 ## Discovery Endpoints (external-writer tenant listing)
 

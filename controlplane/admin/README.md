@@ -64,6 +64,7 @@ Added for the console:
 | `GET /api/v1/errors` | viewer | recent redacted query errors (live-triage ring, newest-first), `?org=&user=&sqlstate=&category=&limit=` slicing. Fans out + merges across CPs (each error belongs to one CP — disjoint, no dedup). `query`/`message` redacted server-side |
 | `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
 | `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
+| `GET /api/v1/workers/hot-idle` | viewer | per-org hot-idle pool reporting (count, vCPU, memory, oldest park) + each org's configured `max_hot_idle_*` caps; backs the Workers page "Hot idle by org" card |
 | `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |
 | `POST /api/v1/sessions/:pid/cancel` | admin | tear down a session by pid — LOCAL only (pid is per-CP); prefer the worker-id form |
 | `POST /api/v1/sessions/by-worker/:wid/cancel` | admin | tear down the session on a cluster-unique worker id; fans out to whichever CP owns it (pid can't be fanned out — it collides across CPs). Returns `{killed, cp_responders, cp_total}` |
@@ -71,6 +72,8 @@ Added for the console:
 | `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at pgwire connect), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
 | `POST /api/v1/orgs/:id/users/:username/enable` | admin | persist `disabled=false` + reload cluster-wide so the user can reconnect at once |
 | `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
+| `GET /api/v1/usage/monthly` | admin | cumulative per-team usage per UTC month (CPU-seconds, memory GiB-seconds, S3 GiB-seconds), backing the **Usage** page. Self-gates with `RequireAdmin` (not just RoleGate's method check) because per-team cost data across all orgs is as sensitive as the raw billing families. Reads the SAME billing buffer as `GET /billing/usage`, so retention is the buffer's: acked buckets are deleted, >30d buckets GC'd — `watermark_low` in the response marks where billed data was removed. `?months=N` (default 6, max 36) sets the window |
+| `GET /api/v1/orgs/:id/usage/daily` | admin | one org's daily per-team usage series (same families), backing the org detail page's **Usage** charts. Same RequireAdmin gate and buffer-retention semantics; the org scope is the `:id` path segment flowing into the queries' WHERE clause. `?days=N` (default 14, max 31 — the buffer's 30d GC bounds useful range) |
 | `GET /api/v1/orgs/:id/monitoring/snapshot` | internal secret | Customer-safe org warehouse state, resource limits, workers, sessions, queue depth, and CP coverage. Omits user, pod, image, SQL, client, trace, and control-plane identifiers |
 | `GET /api/v1/orgs/:id/monitoring/series` | internal secret | Customer-safe, org-forced Prometheus range query. Requires an allow-listed `metric`; `window` is one of `1h`, `6h`, `24h` (default), `7d`, `30d` |
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |

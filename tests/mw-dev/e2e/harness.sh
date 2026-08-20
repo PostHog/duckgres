@@ -621,6 +621,31 @@ query_source_guc() { # org password
 # startup options, and the fresh-session default. The actual secret-transport
 # swap and its restore/rotation invariants are unit-covered
 # (duckdbservice/s3_cache_test.go).
+worker_ttl_guc() { # org password
+  log "duckgres.worker_ttl session GUC on $1"
+  # Mid-session SET drives the control-plane apply hook (the bound worker's
+  # pool-side hot-idle TTL), SHOW reports the applied value, and RESET
+  # restores the connect-time baseline (here the exploratory tier's 10m —
+  # these are plain connections, and the e2e CP sets
+  # DUCKGRES_EXPLORATORY_WORKER_TTL=10m).
+  assert_lastline "$1" "$2" ducklake "SET duckgres.worker_ttl = '5m'; SHOW duckgres.worker_ttl" "5m0s" "worker_ttl_set"
+  # RESET restores the CONNECT-TIME baseline — for a plain connection on this
+  # e2e CP that is the exploratory tier's TTL (manifests.tmpl.yaml sets
+  # DUCKGRES_EXPLORATORY_WORKER_TTL=10m), NOT the built-in 1m: the SET bound
+  # an exploratory worker and the baseline is that profile's TTL.
+  assert_lastline "$1" "$2" ducklake "SET duckgres.worker_ttl = '5m'; RESET duckgres.worker_ttl; SHOW duckgres.worker_ttl" "10m0s" "worker_ttl_reset"
+  # Whole-minute persistence: zero/sub-minute values are rejected with 22023
+  # (ttl_minutes=0 means "deployment default" at reap time, so accepting them
+  # would park the worker for the default while SHOW reported the short TTL).
+  if out="$(pg_try "$1" "$2" ducklake "SET duckgres.worker_ttl = '30s'")"; then
+    fail "worker_ttl: sub-minute value '30s' was accepted: $out"
+  fi
+  case "$out" in
+    *"whole minutes"*) ;;
+    *) fail "worker_ttl: sub-minute rejection did not name the granularity: '$out'" ;;
+  esac
+}
+
 s3_cache_guc() { # org password
   log "duckgres.s3_cache session GUC on $1"
   # Default is on; SET off round-trips within the session (this flip drives
@@ -756,8 +781,12 @@ connection_duration_logged() { # org password
 # here) must serve a storage row with gib_seconds > 0 for the org, and the
 # shared ack must advance past it. A bucket closes ~90s after the connection
 # ends (60s width + 30s grace) plus ≤15s flush, so the poll allows ~4
-# minutes. This e2e stack has its own config store, so acking here cannot eat
-# production usage.
+# minutes. The SAME buffer backs the admin console's Usage page, asserted here
+# too (before the ack deletes it): GET /api/v1/usage/monthly must show the
+# generated compute + storage under the current UTC month per team, and the
+# org detail page's daily series (GET /api/v1/orgs/:id/usage/daily) must show
+# it org-scoped under the current UTC day. This e2e stack has its own config
+# store, so acking here cannot eat production usage.
 compute_usage_pull_api() { # org password
   org="$1"; pw="$2"
   log "compute-usage pull API round-trip on $org"
@@ -783,6 +812,28 @@ compute_usage_pull_api() { # org password
   wl="$(echo "$body" | jq -r '.watermark_low')"
   wh="$(echo "$body" | jq -r '.watermark_high')"
   log "compute-usage OK: usage served (low=$wl high=$wh)"
+
+  # The admin "Usage" page reads the SAME buffer: before the ack deletes it,
+  # the just-generated usage must show up under the current UTC month on
+  # GET /api/v1/usage/monthly, attributed to the org's oldest team.
+  cur_month="$(date -u +%Y-%m)"
+  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg m "$cur_month" '
+        .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .cpu_seconds>0 and .memory_seconds>0)) | length >= 1' >/dev/null \
+    || fail "usage-monthly: no compute row for $org team=$CNPG_TEAM_ID month=$cur_month: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
+  log "usage-monthly OK: compute row for $org visible in month $cur_month"
+
+  # The org detail page's usage charts read the same buffer, org-scoped and
+  # day-grained: today's UTC date must carry this org's compute, and the
+  # response must contain ONLY this org (the handler derives the org scope
+  # from the path — a wrong scope is the cross-account leak).
+  cur_day="$(date -u +%F)"
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg d "$cur_day" '
+        .org_id == $o and
+        (.rows | map(select(.team_id==$t and .date==$d and .cpu_seconds>0)) | length >= 1)' >/dev/null \
+    || fail "usage-daily: no compute row for $org team=$CNPG_TEAM_ID date=$cur_day: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" | head -c 600)"
+  log "usage-daily OK: compute row for $org visible on $cur_day"
 
   # Ack the served watermark; the cursor must advance and acked buckets die.
   ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
@@ -824,6 +875,21 @@ compute_usage_pull_api() { # org password
   wh2="$(echo "$body" | jq -r '.watermark_high')"
   log "storage-usage OK: $org gib_seconds=$gib served"
 
+  # The monthly Usage view must carry the storage family too (same buffer).
+  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg m "$(date -u +%Y-%m)" '
+        .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .gib_seconds>0)) | length >= 1' >/dev/null \
+    || fail "usage-monthly: no storage row for $org team=$CNPG_TEAM_ID: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
+  log "usage-monthly OK: storage row for $org visible"
+
+  # Same for the org-scoped daily series (storage family).
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" \
+    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg d "$(date -u +%F)" '
+        .org_id == $o and
+        (.rows | map(select(.team_id==$t and .date==$d and .gib_seconds>0)) | length >= 1)' >/dev/null \
+    || fail "usage-daily: no storage row for $org team=$CNPG_TEAM_ID: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" | head -c 600)"
+  log "usage-daily OK: storage row for $org visible"
+
   # The shared ack must clear storage buckets too: ack the served watermark,
   # then the next GET's storage array must not contain rows ≤ it for this org
   # (watermark_low advanced past them; new samples land in newer buckets).
@@ -831,6 +897,55 @@ compute_usage_pull_api() { # org password
   low3="$(curl -fsS -H "$H" "$API/api/v1/billing/usage" | jq -r '.watermark_low')"
   [ "$low3" = "$wh2" ] || fail "storage-usage: after ack, watermark_low='$low3' want '$wh2'"
   log "storage-usage OK: shared ack advanced the cursor past storage buckets"
+}
+
+# Hot-idle pool reporting + the per-org cap sweep. compute_usage_pull_api
+# just closed its connections, so this org holds >=1 parked hot-idle worker
+# that must be visible in GET /api/v1/workers/hot-idle (per-org count, vCPU,
+# memory, oldest-park, configured caps). Setting the org's
+# max_hot_idle_workers below its parked count must converge the pool DOWN via
+# the janitor's cap sweep (5s tick + config-poll snapshot reload — the poll
+# below covers both), retiring the OLDEST excess; restoring 0 (unlimited)
+# afterwards leaves the remaining parked worker alone.
+hot_idle_reporting_and_cap() { # org
+  org="$1"
+  log "hot-idle reporting + cap sweep on $org"
+
+  a=0 count=0 body=""
+  while [ "$a" -lt 12 ]; do
+    body="$(curl -fsS -H "$H" "$API/api/v1/workers/hot-idle")" || body=""
+    count="$(echo "$body" | jq -r --arg o "$org" '[.orgs[] | select(.org_id==$o)][0].count // 0')"
+    [ "${count:-0}" -ge 1 ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "${count:-0}" -ge 1 ] || fail "hot-idle: $org never showed a parked worker in /workers/hot-idle: $(echo "$body" | head -c 400)"
+  echo "$body" | jq -e --arg o "$org" '.orgs[] | select(.org_id==$o) | has("cpu_cores") and has("memory_bytes") and has("oldest_hot_idle_since") and has("cap_workers") and has("cap_cpu") and has("cap_memory")' >/dev/null \
+    || fail "hot-idle: $org row missing shape/cap fields: $(echo "$body" | head -c 400)"
+  # Shape resolution must reach the CP-global default worker shape for an
+  # unsized worker on a default-less org — a zero here is the reporting bug
+  # where such workers silently contributed no cpu/memory.
+  echo "$body" | jq -e --arg o "$org" '.orgs[] | select(.org_id==$o) | .cpu_cores > 0 and .memory_bytes > 0' >/dev/null \
+    || fail "hot-idle: $org row reports zero cpu/memory (shape fallback broken): $(echo "$body" | head -c 400)"
+  log "hot-idle OK: $org holds $count parked worker(s) with shape + cap fields"
+
+  # Cap the pool at 1: the sweep must retire the excess down to <= 1.
+  curl -fsS -X PUT -H "$H" -H 'Content-Type: application/json' \
+    -d '{"max_hot_idle_workers":1}' "$API/api/v1/orgs/$org" >/dev/null \
+    || fail "hot-idle: PUT max_hot_idle_workers=1 failed"
+  a=0 after=999
+  while [ "$a" -lt 12 ]; do
+    after="$(curl -fsS -H "$H" "$API/api/v1/workers/hot-idle" | jq -r --arg o "$org" '[.orgs[] | select(.org_id==$o)][0].count // 0')"
+    [ "${after:-999}" -le 1 ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "${after:-999}" -le 1 ] || fail "hot-idle: cap=1 never converged for $org (count=$after after 2m)"
+  log "hot-idle OK: cap=1 converged $org (count=$after)"
+
+  # Restore unlimited so the rest of the lane sees default behavior.
+  curl -fsS -X PUT -H "$H" -H 'Content-Type: application/json' \
+    -d '{"max_hot_idle_workers":0}' "$API/api/v1/orgs/$org" >/dev/null \
+    || fail "hot-idle: PUT restore max_hot_idle_workers=0 failed"
+  log "hot-idle OK: cap restored to unlimited"
 }
 
 # jsonb || must keep Postgres concatenation semantics through the full CP
@@ -2723,6 +2838,14 @@ admin_console_api() {
   # No auth → 401 (the accept-list stays closed for SSO-less callers).
   code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/me")"
   [ "$code" = "401" ] || fail "GET /me with no auth returned $code, want 401"
+  # The monthly per-team usage read (cost data across every org) is behind the
+  # same auth gate — unauthenticated callers get 401. The viewer→403 split is
+  # unit-tested (TestMonthlyUsageRequiresAdmin); this e2e only holds the
+  # internal secret, which is admin.
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/usage/monthly")"
+  [ "$code" = "401" ] || fail "GET /usage/monthly with no auth returned $code, want 401"
+  code="$(curl -s -o /dev/null -w '%{http_code}' "$API/api/v1/orgs/$CNPG/usage/daily")"
+  [ "$code" = "401" ] || fail "GET /orgs/$CNPG/usage/daily with no auth returned $code, want 401"
   # Live read endpoints return their documented envelopes.
   # /queries aggregates each CP's in-memory view and reports coverage. The CI CP
   # runs a SINGLE replica, so this only asserts the envelope (cp_total==cp_responders,
@@ -2757,6 +2880,32 @@ admin_console_api() {
   curl -fsS -H "$H" "$API/api/v1/cluster/summary" \
     | jq -e '(.nodes|type=="number") and (.workers|type=="number") and (.worker_cpu_cores|type=="number") and (.worker_mem_gib|type=="number") and (.placeholders|type=="number") and (.pending|type=="number")' >/dev/null \
     || fail "/cluster/summary missing numeric totals (nodes/workers/cpu/mem/placeholders/pending)"
+  # The monthly per-team usage read backing the admin "Usage" page: envelope
+  # only here (rows may be empty before any usage lands); the populated path
+  # is asserted in compute_usage_pull_api against real generated usage. (The
+  # page's pricing-sensitivity calculator has no e2e assertion BY DESIGN: it
+  # is pure client-side math over this endpoint's rows — no backend surface —
+  # covered by ui/src/pages/UsagePricing.test.tsx + lib/pricing.test.ts.)
+  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
+    | jq -e 'has("rows") and (.rows | type == "array") and has("months") and has("from") and has("watermark_low")' >/dev/null \
+    || fail "/usage/monthly did not return its envelope"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/usage/monthly?months=0")"
+  [ "$code" = "400" ] || fail "/usage/monthly?months=0 returned $code, want 400"
+  # The per-org daily series (org detail page's usage charts): same envelope
+  # + validation, org-scoped. Populated rows are asserted in
+  # compute_usage_pull_api; here the org may simply have no usage yet.
+  curl -fsS -H "$H" "$API/api/v1/orgs/$CNPG/usage/daily?days=7" \
+    | jq -e --arg o "$CNPG" '.org_id == $o and has("rows") and (.rows | type == "array") and has("days") and has("watermark_low")' >/dev/null \
+    || fail "/orgs/$CNPG/usage/daily did not return its envelope"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs/$CNPG/usage/daily?days=99")"
+  [ "$code" = "400" ] || fail "/orgs/$CNPG/usage/daily?days=99 returned $code, want 400"
+  # Hot-idle pool reporting (Workers page "Hot idle by org" card): envelope
+  # only here; the populated path + cap convergence are asserted in
+  # hot_idle_reporting_and_cap against real parked workers.
+  curl -fsS -H "$H" "$API/api/v1/workers/hot-idle" \
+    | jq -e 'has("orgs") and (.orgs | type == "array")' >/dev/null \
+    || fail "/workers/hot-idle did not return its {orgs:[...]} envelope"
+
   # The metrics proxy advertises its allow-listed panels (not an open PromQL relay).
   # Includes the per-org/per-source worker-acquire-latency panels. (The raw
   # histogram emission — org+source labels on duckgres_worker_acquire_total_seconds
@@ -4018,6 +4167,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   pg_compat_functions    "$CNPG" "$cnpg_pw"
   query_source_guc       "$CNPG" "$cnpg_pw"
   s3_cache_guc           "$CNPG" "$cnpg_pw"
+  worker_ttl_guc         "$CNPG" "$cnpg_pw"
   malformed_startup_resilience "$CNPG" "$cnpg_pw"
   jsonb_concat_semantics "$CNPG" "$cnpg_pw"
   cold_burst_absorption  "$CNPG" "$cnpg_pw"   # early, while this org is mostly cold
@@ -4426,6 +4576,9 @@ main() {
 
   # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
+
+  # ---- hot-idle pool reporting + per-org cap sweep ----
+  hot_idle_reporting_and_cap "$CNPG"
 
   # ---- cross-tenant isolation between independent CNPG-backed orgs ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$RES1" "$res1_pw"

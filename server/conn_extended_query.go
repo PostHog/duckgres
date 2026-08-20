@@ -221,6 +221,8 @@ func (c *clientConn) handleParse(body []byte) {
 		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
 		s3CacheSet:        result.S3CacheSet,        // SET duckgres.s3_cache (custom GUC)
 		s3CacheShow:       result.S3CacheShow,       // SHOW duckgres.s3_cache
+		workerTTLSet:      result.WorkerTTLSet,      // SET duckgres.worker_ttl (custom GUC)
+		workerTTLShow:     result.WorkerTTLShow,     // SHOW duckgres.worker_ttl
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
 		pinsWorker:        pinsWorker,               // Exploratory tier: escalate before Describe/Execute
@@ -321,6 +323,17 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		if ps.s3CacheShow {
 			_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+			ps.described = true
+			return
+		}
+
+		// duckgres.worker_ttl custom GUC: same shape as query_source above.
+		if ps.workerTTLSet != nil {
+			_ = wire.WriteNoData(c.writer)
+			return
+		}
+		if ps.workerTTLShow {
+			_ = c.sendRowDescription([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 			ps.described = true
 			return
 		}
@@ -457,11 +470,13 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// duckgres-namespaced custom GUCs (query_source, s3_cache): answered
-		// from session state, never probed against DuckDB (which does not know
-		// these settings — the LIMIT-0 probe below would just fail and degrade
-		// to NoData). SET returns no rows; SHOW returns a single text column.
-		if p.stmt.querySourceSet != nil || p.stmt.s3CacheSet != nil {
+		// duckgres-namespaced custom GUCs (query_source, s3_cache, worker_ttl):
+		// answered from session state, never probed against DuckDB (which does
+		// not know these settings — the LIMIT-0 probe below would just fail and
+		// degrade to NoData, and on the exploratory tier it would acquire a
+		// worker to do it). SET returns no rows; SHOW returns a single text
+		// column.
+		if p.stmt.querySourceSet != nil || p.stmt.s3CacheSet != nil || p.stmt.workerTTLSet != nil {
 			_ = wire.WriteNoData(c.writer)
 			return
 		}
@@ -472,6 +487,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		if p.stmt.s3CacheShow {
 			_ = c.sendRowDescriptionWithFormats([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
+			p.described = true
+			return
+		}
+		if p.stmt.workerTTLShow {
+			_ = c.sendRowDescriptionWithFormats([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
 			p.described = true
 			return
 		}
@@ -735,6 +755,34 @@ func (c *clientConn) handleExecute(body []byte) {
 			_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		}
 		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, p.resultFormats, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return
+	}
+
+	// duckgres.worker_ttl custom GUC (SET / SHOW): intercepted session-side,
+	// applied via the bound worker's pool-side hot-idle TTL override.
+	// Determined by the transpiler during Parse. A failed apply errors the
+	// Execute so the session state never diverges from the TTL the worker
+	// will actually park with.
+	if p.stmt.workerTTLSet != nil {
+		// Lazy activation: the override needs a worker to apply to (see the
+		// matching site in handleQuery). Not pinning, so the exploratory tier
+		// is enough.
+		if err := c.activateForStatement(p.stmt.query, false); err != nil {
+			return
+		}
+		if err := c.applyWorkerTTLSetting(*p.stmt.workerTTLSet); err != nil {
+			c.sendError("ERROR", workerTTLApplyErrorSQLState(err), err.Error())
+			return
+		}
+		_ = c.writeCommandComplete("SET")
+		return
+	}
+	if p.stmt.workerTTLShow {
+		if !p.described {
+			_ = c.sendRowDescription([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		}
+		_ = c.sendDataRowWithFormats([]interface{}{c.workerTTLValue()}, p.resultFormats, nil)
 		_ = c.writeCommandComplete("SHOW")
 		return
 	}
