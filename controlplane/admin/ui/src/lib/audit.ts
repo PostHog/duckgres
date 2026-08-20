@@ -83,7 +83,15 @@ export function auditSubject(e: AuditEntry): string {
 // and detail render in their own cells, so this stays short — e.g.
 // "Set operator role bob@posthog.com".
 export function auditSummary(e: AuditEntry): string {
-  const label = actionLabel(e.action);
+  // credential.create is an attempted route, not proof that a grant landed.
+  // A 2xx is an ordinary success; credential_minted preserves the success
+  // when the durable write landed but later work (for example snapshot reload)
+  // made the HTTP response fail.
+  const credentialMintSucceeded =
+    e.action !== "credential.create" ||
+    (e.status >= 200 && e.status < 300) ||
+    e.outcome === "credential_minted";
+  const label = credentialMintSucceeded ? actionLabel(e.action) : "Failed to mint service credential";
   const subject = e.target_user ?? "";
   return subject ? `${label} ${subject}` : label;
 }

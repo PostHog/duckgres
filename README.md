@@ -245,6 +245,11 @@ is clamped to 60–3600 seconds. Refresh targets one credential explicitly with
 Expiry and revocation block new pgwire handshakes but do not terminate an
 already-authenticated session. If a caller loses a secret, mint a new
 credential; Duckgres stores only bcrypt hashes and cannot recover plaintext.
+Successful mints put `principal: <submitted-principal>` in the admin audit
+entry's detail column; credential IDs and secrets are never included there. A
+machine-readable `credential_minted` audit outcome records that the grant row
+landed, so a later snapshot-reload failure is still shown as a successful mint
+while requests that fail before the durable write are shown as failed.
 For a rolling contract change, deploy the always-create Duckgres version to
 the entire fleet before removing the caller's legacy `force_rotate`/reuse
 fallback. New servers ignore the old field, but a new caller reaching an old

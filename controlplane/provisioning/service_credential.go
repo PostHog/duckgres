@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/requestaudit"
 	"gorm.io/gorm"
 )
 
@@ -194,6 +195,11 @@ func (h *handler) issueServiceCredential(c *gin.Context, tenantStore TenantStore
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	// The request body is deliberately unavailable to AuditMiddleware because
+	// provisioning bodies may contain secrets. Pass only the non-sensitive
+	// principal across the shared request context after a mint succeeds.
+	requestaudit.SetDetail(c, "principal: "+req.Principal)
+	requestaudit.SetOutcome(c, requestaudit.OutcomeCredentialMinted)
 	if err := h.afterCredentialWrite(c, tenantStore); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

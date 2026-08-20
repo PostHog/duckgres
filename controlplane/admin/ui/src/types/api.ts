@@ -604,6 +604,10 @@ export interface AuditEntry {
   // Optional non-sensitive human context recorded by the handler, e.g.
   // "role viewer → admin" or "max_workers 4 → 10".
   detail?: string;
+  // Optional machine-readable durable result. This disambiguates a mutation
+  // that landed before later response-path work failed from a pre-mutation
+  // failure without parsing the human detail string.
+  outcome?: string;
   status: number;
   remote_addr?: string;
 }
