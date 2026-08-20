@@ -155,6 +155,6 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 => github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.1
+replace github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 => github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.3
 
-replace github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 => github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.1
+replace github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 => github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.3

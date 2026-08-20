@@ -1,9 +1,9 @@
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
-github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.1 h1:tNEwT0I3opiyExELmRWDMqog4y8QMULw9Y4sfPRoV0w=
-github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.1/go.mod h1:si4fhkU5nVX82UqieuHih5FkAIzbHQaJCxJ6BITL4U8=
-github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.1 h1:vuaMkqfPSQ7RuSwtCOYKQVbK4F5L37qrzr1P3XGS02s=
-github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.1/go.mod h1:MSpni+1dJdPoTQjbn+H702kD1iVveoQ6qWDdshBn140=
+github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.3 h1:imLksCd041JuUbdg4FUx2/VgUfLXpXlHmiIUkiLmRUM=
+github.com/PostHog/duckdb-go-bindings/lib/linux-amd64 v0.10505.0-posthog.3/go.mod h1:si4fhkU5nVX82UqieuHih5FkAIzbHQaJCxJ6BITL4U8=
+github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.3 h1:F/IIs7AU5iR/qe2pjRVVXIYLywkAPDgjogxs9RkZ3MI=
+github.com/PostHog/duckdb-go-bindings/lib/linux-arm64 v0.10505.0-posthog.3/go.mod h1:MSpni+1dJdPoTQjbn+H702kD1iVveoQ6qWDdshBn140=
 github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
 github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/apache/arrow-go/v18 v18.5.1 h1:yaQ6zxMGgf9YCYw4/oaeOU3AULySDlAYDOcnr4LdHdI=
