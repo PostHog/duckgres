@@ -2,13 +2,16 @@ package provisioning
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/requestaudit"
 )
 
 // newServiceCredentialRouter mounts the provisioning API with an explicit
@@ -140,6 +143,91 @@ func TestIssueServiceCredentialThreadsPrincipalAndTTL(t *testing.T) {
 	if store.reloadSnapshotN != 1 {
 		t.Fatalf("ReloadSnapshot called %d times, want exactly 1 (fresh credential must auth without waiting a poll)", store.reloadSnapshotN)
 	}
+}
+
+func issueServiceCredentialWithAuditContext(t *testing.T, store *fakeStore, body string) (*httptest.ResponseRecorder, string, string) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	var detail, outcome string
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		detail = requestaudit.Detail(c)
+		outcome = requestaudit.GetOutcome(c)
+	})
+	RegisterAPI(router.Group("/api/v1"), store, store, "", nil)
+	return doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/service-credentials", body), detail, outcome
+}
+
+func TestIssueServiceCredentialAddsPrincipalAndDurableOutcomeToAudit(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+
+	const principal = "posthog:sql-editor:team:42:user:314"
+	rec, detail, outcome := issueServiceCredentialWithAuditContext(t, store, `{"principal":"`+principal+`"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if want := "principal: " + principal; detail != want {
+		t.Fatalf("audit detail = %q, want %q", detail, want)
+	}
+	if strings.Contains(detail, "fake-plaintext") {
+		t.Fatalf("audit detail exposed credential secret: %q", detail)
+	}
+	if outcome != "credential_minted" {
+		t.Fatalf("audit outcome = %q, want credential_minted", outcome)
+	}
+	if strings.Contains(detail, "svc_") {
+		t.Fatalf("audit detail exposed credential ID: %q", detail)
+	}
+}
+
+func TestIssueServiceCredentialAuditContextDistinguishesPreAndPostMintFailures(t *testing.T) {
+	const principal = "posthog:sql-editor:team:42:user:314"
+
+	t.Run("invalid request has no principal or durable outcome", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		rec, detail, outcome := issueServiceCredentialWithAuditContext(t, store, `{}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		}
+		if detail != "" || outcome != "" {
+			t.Fatalf("pre-mint audit context = detail %q, outcome %q; want both empty", detail, outcome)
+		}
+	})
+
+	t.Run("store failure has no principal or durable outcome", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		store.issueCredsErr = errors.New("synthetic mint failure")
+		rec, detail, outcome := issueServiceCredentialWithAuditContext(t, store, `{"principal":"`+principal+`"}`)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+		}
+		if detail != "" || outcome != "" {
+			t.Fatalf("pre-mint audit context = detail %q, outcome %q; want both empty", detail, outcome)
+		}
+	})
+
+	t.Run("reload failure retains successful durable mint", func(t *testing.T) {
+		store := newFakeStore()
+		store.orgs["acme"] = &configstore.Org{Name: "acme"}
+		store.reloadSnapshotEr = errors.New("synthetic reload failure")
+		rec, detail, outcome := issueServiceCredentialWithAuditContext(t, store, `{"principal":"`+principal+`"}`)
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500: %s", rec.Code, rec.Body.String())
+		}
+		if detail != "principal: "+principal || outcome != "credential_minted" {
+			t.Fatalf("post-mint audit context = detail %q, outcome %q", detail, outcome)
+		}
+		if strings.Contains(detail, "svc_") || strings.Contains(detail, "fake-plaintext") {
+			t.Fatalf("post-mint audit detail exposed credential material: %q", detail)
+		}
+		if strings.Contains(rec.Body.String(), "svc_") || strings.Contains(rec.Body.String(), "fake-plaintext") {
+			t.Fatalf("reload-failure response exposed credential material: %s", rec.Body.String())
+		}
+	})
 }
 
 func TestIssueServiceCredentialClampsTTL(t *testing.T) {

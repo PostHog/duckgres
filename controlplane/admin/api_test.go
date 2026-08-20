@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/requestaudit"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
@@ -2571,7 +2572,7 @@ func TestUpdateOrgDataImportsTableNamingVersion(t *testing.T) {
 			var detail string
 			router.Use(func(c *gin.Context) {
 				c.Next()
-				detail = c.GetString(ctxAuditDetailKey)
+				detail = requestaudit.Detail(c)
 			})
 			registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
 
@@ -3064,7 +3065,7 @@ func TestAdminUpdateOrgTeamAuditDetail(t *testing.T) {
 	// Capture what AuditMiddleware would read after the handler returns.
 	router.Use(func(c *gin.Context) {
 		c.Next()
-		detail = c.GetString(ctxAuditDetailKey)
+		detail = requestaudit.Detail(c)
 	})
 	registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
 

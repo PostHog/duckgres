@@ -52,4 +52,21 @@ describe("auditSummary", () => {
   it("falls back to the bare label when there is no target", () => {
     expect(auditSummary(entry({ action: "org.create", target_user: "" }))).toBe("Created org");
   });
+
+  it("renders a pre-mint credential failure as failed", () => {
+    expect(auditSummary(entry({ action: "credential.create", status: 500 }))).toBe(
+      "Failed to mint service credential",
+    );
+  });
+
+  it("renders a 2xx credential mint as successful", () => {
+    expect(auditSummary(entry({ action: "credential.create", status: 201 }))).toBe("Minted service credential");
+  });
+
+  it("renders a durable mint as successful even when post-mint work returns 500", () => {
+    const durableMint = entry({ action: "credential.create", status: 500 });
+    Object.assign(durableMint, { outcome: "credential_minted" });
+
+    expect(auditSummary(durableMint)).toBe("Minted service credential");
+  });
 });
