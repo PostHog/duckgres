@@ -1203,7 +1203,21 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	for _, w := range explWarns {
 		clog.Warn("Exploratory tier config problem.", "detail", w)
 	}
-	useExploratory := cp.useExploratoryTier(explProfile, passthroughUser, startupOptions)
+	// A `-c duckgres.session_affinity=true` connection opts out of the
+	// exploratory tier: it acquires its standard worker eagerly and keeps it for
+	// the whole session, so an ad-hoc ATTACH catalog or an exported transaction
+	// snapshot — worker-side state the tier does not replay onto a new worker —
+	// cannot be lost to a mid-session migration. A non-boolean value is rejected
+	// before a worker is spawned, like the other duckgres.* startup options.
+	sessionAffinity, affinityErr := server.ParseSessionAffinityOption(startupOptions[server.SessionAffinityGUCName])
+	if affinityErr != nil {
+		sessionStart.Finish("error", observe.SessionStartReasonClient)
+		clog.Warn("Rejected session_affinity startup option.", "error", affinityErr)
+		_ = server.WriteErrorResponse(writer, "FATAL", "22023", affinityErr.Error())
+		_ = writer.Flush()
+		return
+	}
+	useExploratory := cp.useExploratoryTier(explProfile, passthroughUser, sessionAffinity, startupOptions)
 	initialProfile := workerProfile
 	// Log the shape the connection actually STARTS on, once, so support never
 	// sees two adjacent lines disagreeing about it. On the exploratory tier the

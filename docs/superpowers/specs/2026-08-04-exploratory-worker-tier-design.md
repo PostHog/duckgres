@@ -211,3 +211,10 @@ As shipped:
   GUCs are their escape hatch.
 - Escalation storms degrade to today's behavior (every connection on a
   normal worker) — an acceptable floor.
+- A session that builds worker-side state the tier does not replay — an
+  ad-hoc `ATTACH ... (TYPE postgres)` catalog, an exported transaction
+  snapshot — must not migrate mid-session. `-c duckgres.session_affinity=true`
+  is its escape hatch: the connection skips the tier, acquires its standard
+  worker eagerly, and keeps it for the whole session (needs no size GUC and no
+  `AllowClientWorkerProfile` gate, since it only reproduces the pre-tier
+  default).
