@@ -236,6 +236,37 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnNotNull(t, db, "duckgres_service_grants", "password_hash")
 	requireColumnNotNull(t, db, "duckgres_service_grants", "expires_at")
 	requireColumnAbsent(t, db, "duckgres_org_users", "service_grant_expires_at")
+
+	// Migration 000037 re-introduced the Trino subsystem's two config
+	// tables. They existed once before and were dropped by 000002; this is
+	// the DuckLake-era shape, whose only new column is trino_cell_id (the
+	// Trino cell that owns the org — empty means unassigned, and the first
+	// reconciling provisioner claims it).
+	requireTablePresent(t, db, "duckgres_managed_warehouse_trino")
+	for _, column := range []string{
+		"org_id",
+		"enabled",
+		"tier",
+		"trino_cell_id",
+		"state",
+		"status_message",
+		"ready_at",
+		"failed_at",
+		"created_at",
+		"updated_at",
+	} {
+		requireColumnPresent(t, db, "duckgres_managed_warehouse_trino", column)
+	}
+	requireColumnNotNull(t, db, "duckgres_managed_warehouse_trino", "enabled")
+	requireColumnNotNull(t, db, "duckgres_managed_warehouse_trino", "trino_cell_id")
+	requireColumnNullable(t, db, "duckgres_managed_warehouse_trino", "ready_at")
+	requireColumnNullable(t, db, "duckgres_managed_warehouse_trino", "failed_at")
+	// The bootstrap sentinel stores ONE BIT per namespace and no
+	// credential material: the K8s Secrets are the source of truth for the
+	// values. A column here holding a credential would be a bug.
+	requireTablePresent(t, db, "duckgres_trino_cluster_bootstrap")
+	requireColumnPresent(t, db, "duckgres_trino_cluster_bootstrap", "namespace")
+	requireColumnPresent(t, db, "duckgres_trino_cluster_bootstrap", "bootstrapped_at")
 }
 
 func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
@@ -283,6 +314,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
 			DROP TABLE IF EXISTS duckgres_service_grants;
+			DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
+			DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
 			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
@@ -357,7 +390,11 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "credential_id")
 	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "password_hash")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "service_grant_expires_at")
-
+	// Migration 000037 replays: the Trino tables come back on a schema that
+	// never had them (000002 dropped the pre-revert versions).
+	requireTablePresent(t, upgradedDB, "duckgres_managed_warehouse_trino")
+	requireColumnPresent(t, upgradedDB, "duckgres_managed_warehouse_trino", "trino_cell_id")
+	requireTablePresent(t, upgradedDB, "duckgres_trino_cluster_bootstrap")
 }
 
 func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
@@ -377,6 +414,8 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
 		ALTER TABLE duckgres_org_users DROP COLUMN IF EXISTS service_grant_expires_at;
 		DROP TABLE IF EXISTS duckgres_service_grants;
+		DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
+		DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
 		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
