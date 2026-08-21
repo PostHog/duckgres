@@ -167,8 +167,15 @@ func trinoSanitize(orgName string) string {
 // TrinoCatalogName returns the catalog identifier for an org.
 // Format: org_<sanitized>. The sanitization maps Org.Name to Trino
 // identifier rules ([a-z0-9_]); any other characters collapse to
-// underscores. Catalog name uniqueness across orgs depends on
-// database_name's global unique index holding post-sanitization.
+// underscores.
+//
+// For principals that satisfy ValidateDatabaseName the mapping is injective
+// — that grammar allows only lowercase alphanumerics and hyphens, so the
+// hyphen is the only character rewritten and no valid principal contains the
+// underscore it becomes — which, with database_name's global unique index,
+// makes distinct orgs' catalog names distinct by construction. Grandfathered
+// rows predate the validation and can still converge; rejectPrincipalCollisions
+// holds those orgs back rather than letting one read the other's catalog.
 //
 // The name carried an `_iceberg` suffix while the backing table format was
 // Iceberg behind Lakekeeper. Warehouses are DuckLake now (migration 000014
@@ -487,13 +494,20 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	// regardless of how the DB driver returned the rows.
 	sort.Slice(orgs, func(i, j int) bool { return orgs[i].OrgID < orgs[j].OrgID })
 
+	// Orgs whose principals collide are held back from EVERY projection
+	// below. This has to happen before the five steps, not inside the
+	// catalog step: if a colliding org still reached the OPA bundle, its
+	// group would be granted the shared catalog name and it could read the
+	// other tenant's data through the catalog that org legitimately owns.
+	projectable, collisions := rejectPrincipalCollisions(orgs)
+
 	var errs []error
 
 	// 1. Auth file projection (K8s Secret). Atomic Secret update.
 	//    Runs BEFORE catalogs so the admin lines exist in password.db
 	//    + group.db when the catalog client's first request reaches
 	//    the coordinator on a cold-start tick.
-	authErr := p.reconcileAuthSecret(ctx, orgs)
+	authErr := p.reconcileAuthSecret(ctx, projectable)
 	if authErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile auth secret: %w", authErr))
 	}
@@ -502,7 +516,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	//    tier; rebuilt every tick. Also runs before catalogs so the
 	//    coordinator's resource-groups manager has a valid file when
 	//    catalog creation kicks off queries on tier-specific groups.
-	rgErr := p.reconcileResourceGroups(ctx, orgs)
+	rgErr := p.reconcileResourceGroups(ctx, projectable)
 	if rgErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile resource groups: %w", rgErr))
 	}
@@ -511,7 +525,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	//    the in-memory store the bundle HTTP handler serves. Pre-
 	//    catalog so the OPA sidecar's authorization decisions for the
 	//    catalog reconcile's own queries see the up-to-date roster.
-	opaErr := p.reconcileOPABundle(ctx, orgs)
+	opaErr := p.reconcileOPABundle(ctx, projectable)
 	if opaErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile opa bundle: %w", opaErr))
 	}
@@ -529,7 +543,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	//    therefore still fail its first connection; that surfaces as a
 	//    per-org catalog error and the next tick retries against a Secret
 	//    that has since landed.
-	tenants, tenantErr := p.reconcileTenantSecrets(ctx, orgs)
+	tenants, tenantErr := p.reconcileTenantSecrets(ctx, projectable)
 	if tenantErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile tenant secrets: %w", tenantErr))
 	}
@@ -559,7 +573,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	var catalogOutcomes map[string]catalogOutcome
 	if globalErr == nil {
 		var catErr error
-		catalogOutcomes, catErr = p.reconcileCatalogs(ctx, orgs, tenants)
+		catalogOutcomes, catErr = p.reconcileCatalogs(ctx, projectable, tenants)
 		if catErr != nil {
 			errs = append(errs, fmt.Errorf("reconcile catalogs: %w", catErr))
 		}
@@ -573,12 +587,93 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	// since each is a single K8s API write — wrap them once. Per-org
 	// variance lives at the catalog step, which folds in the per-org
 	// tenant-password outcomes.
+	if len(collisions) > 0 {
+		if catalogOutcomes == nil {
+			catalogOutcomes = make(map[string]catalogOutcome, len(collisions))
+		}
+		for orgID, err := range collisions {
+			// out.Err is checked before globalErr in writePerOrgStates,
+			// so the collision is what the operator sees.
+			catalogOutcomes[orgID] = catalogOutcome{Err: err}
+			errs = append(errs, fmt.Errorf("org %s: %w", orgID, err))
+		}
+	}
 	p.writePerOrgStates(orgs, catalogOutcomes, globalErr)
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// rejectPrincipalCollisions splits orgs into those safe to project and
+// those whose Trino catalog name is not unique to them.
+//
+// Every Trino-facing name is trinoSanitize(principal), and sanitization is
+// injective over principals that satisfy ValidateDatabaseName — that grammar
+// is lowercase alphanumerics and hyphens, so the hyphen is the only
+// character sanitization rewrites, and no valid principal contains the
+// underscore it rewrites to. Grandfathered rows predate that validation
+// though (see configstore.ValidateDatabaseName), so a stored name may hold
+// an underscore or uppercase, and then "Acme_Corp" and "acme-corp" both
+// derive catalog org_acme_corp.
+//
+// Left alone that is a cross-tenant read: the first org creates the catalog
+// against its own metadata store, the second finds the name already present,
+// is recorded as Existed, and is granted that catalog by the OPA bundle —
+// so it queries the first org's data. Both orgs are therefore held back and
+// reported Failed. Refusing to provision either is the only safe resolution:
+// picking a winner by sort order would silently hand one tenant a catalog
+// the other also believes it owns.
+func rejectPrincipalCollisions(orgs []configstore.TrinoEnabledOrg) (projectable []configstore.TrinoEnabledOrg, collisions map[string]error) {
+	byCatalog := make(map[string][]string, len(orgs))
+	for _, o := range orgs {
+		principal := o.TrinoPrincipal()
+		if principal == "" {
+			// No principal is a separate condition, reported by the
+			// catalog step; it is not a collision.
+			continue
+		}
+		name := TrinoCatalogName(principal)
+		byCatalog[name] = append(byCatalog[name], o.OrgID)
+	}
+
+	contested := make(map[string]string, 0) // orgID -> catalog name
+	for name, ids := range byCatalog {
+		if len(ids) < 2 {
+			continue
+		}
+		for _, id := range ids {
+			contested[id] = name
+		}
+	}
+	if len(contested) == 0 {
+		return orgs, nil
+	}
+
+	collisions = make(map[string]error, len(contested))
+	projectable = make([]configstore.TrinoEnabledOrg, 0, len(orgs)-len(contested))
+	for _, o := range orgs {
+		name, bad := contested[o.OrgID]
+		if !bad {
+			projectable = append(projectable, o)
+			continue
+		}
+		others := make([]string, 0, len(byCatalog[name])-1)
+		for _, id := range byCatalog[name] {
+			if id != o.OrgID {
+				others = append(others, id)
+			}
+		}
+		sort.Strings(others)
+		collisions[o.OrgID] = fmt.Errorf(
+			"database_name %q derives catalog %s, which is also derived by org(s) %s; "+
+				"refusing to provision either — rename one so the catalog names differ",
+			o.TrinoPrincipal(), name, strings.Join(others, ", "))
+		slog.Error("Trino reconcile: refusing to provision orgs whose catalog names collide.",
+			"org", o.OrgID, "database_name", o.TrinoPrincipal(), "catalog", name, "colliding_with", others)
+	}
+	return projectable, collisions
 }
 
 // claimCellOrgs filters the fleet-wide Trino-enabled listing down to the

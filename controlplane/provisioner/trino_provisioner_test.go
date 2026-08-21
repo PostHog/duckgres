@@ -255,6 +255,52 @@ func TestBuildTrinoAuthFiles_SkipsOrgWithoutDatabaseName(t *testing.T) {
 	}
 }
 
+// Two orgs whose principals sanitize to the same catalog name must BOTH be
+// held back. Letting the sort winner take the catalog would hand the loser a
+// grant to the winner's data through the OPA bundle.
+func TestRejectPrincipalCollisions(t *testing.T) {
+	// Only reachable via grandfathered rows: ValidateDatabaseName forbids
+	// the underscore and the uppercase that make these two converge.
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "1", DatabaseName: "Acme_Corp"},
+		{OrgID: "2", DatabaseName: "acme-corp"},
+		{OrgID: "3", DatabaseName: "beta"},
+	}
+
+	projectable, collisions := rejectPrincipalCollisions(orgs)
+
+	if len(projectable) != 1 || projectable[0].OrgID != "3" {
+		t.Fatalf("only the uncontested org may be projected, got %+v", projectable)
+	}
+	for _, id := range []string{"1", "2"} {
+		err, ok := collisions[id]
+		if !ok {
+			t.Fatalf("org %s must be reported as colliding", id)
+		}
+		if !strings.Contains(err.Error(), "org_acme_corp") {
+			t.Errorf("org %s error should name the contested catalog: %v", id, err)
+		}
+	}
+	if _, ok := collisions["3"]; ok {
+		t.Error("the uncontested org must not be reported as colliding")
+	}
+}
+
+// The common case allocates nothing and passes the slice straight through.
+func TestRejectPrincipalCollisions_NoneWhenDistinct(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "1", DatabaseName: "acme-corp"},
+		{OrgID: "2", DatabaseName: "beta"},
+	}
+	projectable, collisions := rejectPrincipalCollisions(orgs)
+	if len(collisions) != 0 {
+		t.Fatalf("expected no collisions, got %v", collisions)
+	}
+	if len(projectable) != 2 {
+		t.Fatalf("expected both orgs projectable, got %+v", projectable)
+	}
+}
+
 func TestBuildTrinoAuthFiles_DeterministicOrder(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
 		{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$a"},
