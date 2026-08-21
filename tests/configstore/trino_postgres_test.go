@@ -29,7 +29,7 @@ func trinoRow(t *testing.T, store *configstore.ConfigStore, orgID string) *confi
 }
 
 func TestTrinoTablesAreMigratedPostgres(t *testing.T) {
-	// The tables are goose-migrated (000037), not AutoMigrated — the
+	// The tables are goose-migrated (000038), not AutoMigrated — the
 	// config schema has no AutoMigrate pass. If the migration stops being
 	// applied, every Trino store call fails at runtime instead of here.
 	store := newIsolatedConfigStore(t)

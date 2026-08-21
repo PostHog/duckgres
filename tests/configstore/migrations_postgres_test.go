@@ -55,8 +55,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 34)
 	requireGooseMigrationRecorded(t, db, 35)
 	requireGooseMigrationRecorded(t, db, 36)
-	requireGooseMigrationRecorded(t, db, 37)
-	requireGooseLatestVersion(t, db, 37)
+	requireGooseMigrationRecorded(t, db, 38)
+	requireGooseLatestVersion(t, db, 38)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -237,7 +237,7 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnNotNull(t, db, "duckgres_service_grants", "expires_at")
 	requireColumnAbsent(t, db, "duckgres_org_users", "service_grant_expires_at")
 
-	// Migration 000037 re-introduced the Trino subsystem's two config
+	// Migration 000038 re-introduced the Trino subsystem's two config
 	// tables. They existed once before and were dropped by 000002; this is
 	// the DuckLake-era shape, whose only new column is trino_cell_id (the
 	// Trino cell that owns the org — empty means unassigned, and the first
@@ -316,7 +316,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_service_grants;
 			DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 			DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -366,8 +366,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 34)
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
-	requireGooseMigrationRecorded(t, upgradedDB, 37)
-	requireGooseLatestVersion(t, upgradedDB, 37)
+	requireGooseMigrationRecorded(t, upgradedDB, 38)
+	requireGooseLatestVersion(t, upgradedDB, 38)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -390,7 +390,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "credential_id")
 	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "password_hash")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "service_grant_expires_at")
-	// Migration 000037 replays: the Trino tables come back on a schema that
+	// Migration 000038 replays: the Trino tables come back on a schema that
 	// never had them (000002 dropped the pre-revert versions).
 	requireTablePresent(t, upgradedDB, "duckgres_managed_warehouse_trino")
 	requireColumnPresent(t, upgradedDB, "duckgres_managed_warehouse_trino", "trino_cell_id")
@@ -416,7 +416,7 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		DROP TABLE IF EXISTS duckgres_service_grants;
 		DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 		DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37);
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}
