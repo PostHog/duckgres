@@ -184,11 +184,12 @@ type trinoWiring struct {
 // builds it from rest.InClusterConfig(); in dev/test the caller can pass
 // a fake.
 //
-// tenantPasswords resolves one org's DuckLake metadata-store password. The
-// caller passes the SAME Duckling-CR read the worker activation path uses
-// (see ducklingTenantPasswordResolver), so there is one definition of "the
-// tenant's metadata password" in the control plane, and a duckling that has
-// not published a credential yet reads as "wait" on both paths.
+// ducklings resolves one org's Duckling CR status — the metadata-store
+// password plus the object-store inputs a catalog needs. The caller passes
+// the SAME Duckling-CR read the worker activation path uses, so there is one
+// definition of "the tenant's metadata password" in the control plane, and a
+// duckling that has not published a credential yet reads as "wait" on both
+// paths.
 //
 // The cluster-level credentials (Trino internal-communication shared
 // secret, admin password + bcrypt hash, OPA bundle bearer token) are
@@ -204,7 +205,7 @@ type trinoWiring struct {
 func buildTrinoWiring(
 	store *configstore.ConfigStore,
 	kc kubernetes.Interface,
-	tenantPasswords provisioner.TrinoTenantPasswordResolver,
+	ducklings provisioner.TrinoDucklingResolver,
 ) (*trinoWiring, error) {
 	if !trinoProvisionerEnabled() {
 		return nil, nil
@@ -215,11 +216,11 @@ func buildTrinoWiring(
 		return nil, err
 	}
 
-	if tenantPasswords == nil {
+	if ducklings == nil {
 		// Without it every catalog sits pending forever waiting on a
-		// password that nothing resolves — a silent, permanent
+		// duckling status that nothing resolves — a silent, permanent
 		// half-provisioned cell. Fail the rollout instead.
-		return nil, fmt.Errorf("trino provisioner requires a tenant metadata-store password resolver (the Duckling CR client is unavailable)")
+		return nil, fmt.Errorf("trino provisioner requires a duckling status resolver (the Duckling CR client is unavailable)")
 	}
 
 	// Catalog client with empty credentials — Bootstrap (below) calls
@@ -236,7 +237,7 @@ func buildTrinoWiring(
 		Store:                 store,
 		BootstrapSentinel:     store,
 		Warehouses:            store,
-		TenantPasswords:       tenantPasswords,
+		Ducklings:             ducklings,
 		Kubernetes:            kc,
 		Namespace:             strings.TrimSpace(os.Getenv(envTrinoNamespace)),
 		CellID:                cell.ID,
@@ -276,8 +277,8 @@ func buildTrinoWiring(
 	}, nil
 }
 
-// ducklingTenantPasswordResolver adapts the control plane's existing
-// Duckling CR reader into the provisioner's password resolver.
+// The provisioner reads a tenant's duckling status through the control
+// plane's existing Duckling CR reader, passed in by the caller.
 //
 // This is deliberately the SAME read the worker activation path performs
 // (SharedWorkerActivator.buildDuckLakeConfigFromDuckling reaches the
@@ -286,26 +287,19 @@ func buildTrinoWiring(
 // parallel implementation, so Trino and the DuckDB workers can never end up
 // authenticating a tenant's metadata store with two different credentials.
 //
-// A duckling with no metadata store published yet returns ("", nil) — a
-// WAIT, which leaves the org provisioning until the composition catches up.
-// Only a genuine read failure is an error.
-func ducklingTenantPasswordResolver(
-	resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error),
-) provisioner.TrinoTenantPasswordResolver {
-	if resolveDucklingStatus == nil {
-		return nil
-	}
-	return func(ctx context.Context, orgID string) (string, error) {
-		status, err := resolveDucklingStatus(ctx, orgID)
-		if err != nil {
-			return "", err
-		}
-		if status == nil {
-			return "", nil
-		}
-		return status.MetadataStore.Password, nil
-	}
-}
+// A duckling with no status published yet returns (nil, nil) — a WAIT, which
+// leaves the org provisioning until the composition catches up. Only a genuine
+// read failure is an error.
+//
+// The provisioner takes the whole status rather than just the password because
+// the catalog needs the object-store inputs too — bucket, region and the
+// per-org IAM role — and those live ONLY here. The config store's
+// ManagedWarehouse carries s3.* and worker_identity.* columns, but nothing
+// populates them for a DuckLake warehouse: the bucket lands on
+// data_store.bucket_name and the role is a Crossplane composition output
+// published to the Duckling CR's status. Reading them from the same status the
+// password comes from also keeps Trino and the DuckDB workers pointed at the
+// same bucket under the same identity, which is the property that matters.
 
 // envInt reads a non-negative integer env var, returning 0 for unset,
 // blank, or unparseable values so the caller's own default applies.

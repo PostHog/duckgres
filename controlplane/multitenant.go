@@ -541,7 +541,7 @@ func SetupMultiTenant(
 			// Same Duckling CR read the worker activation path uses; nil
 			// when the Duckling client couldn't be built, which
 			// buildTrinoWiring rejects rather than half-wiring.
-			trinoWire, twErr := buildTrinoWiring(store, kc, ducklingTenantPasswordResolver(resolveDucklingStatus))
+			trinoWire, twErr := buildTrinoWiring(store, kc, resolveDucklingStatus)
 			if twErr != nil {
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
 			}

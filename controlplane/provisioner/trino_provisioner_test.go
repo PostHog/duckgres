@@ -106,14 +106,24 @@ func readyWarehouse(orgID string) *configstore.ManagedWarehouse {
 			DatabaseName: "mdstore_" + orgID,
 			Username:     "mdstore_" + orgID,
 		},
-		S3: configstore.ManagedWarehouseS3{
-			Bucket: "posthog-duckling-" + orgID + "-mw-dev",
-			Region: "us-east-1",
-		},
-		WorkerIdentity: configstore.ManagedWarehouseWorkerIdentity{
-			IAMRoleARN: "arn:aws:iam::123456789012:role/duckling-" + orgID,
-		},
+		// S3 and WorkerIdentity are deliberately left zero: nothing
+		// populates those columns for a DuckLake warehouse in
+		// production. The bucket, region and role come off the Duckling
+		// CR status instead (see readyDuckling).
 	}
+}
+
+// readyDuckling is the Duckling CR status a fully composed warehouse
+// publishes: the metadata password plus the object-store inputs a catalog
+// needs. This, not the ManagedWarehouse row, is where a catalog's bucket,
+// region and per-org IAM role actually come from.
+func readyDuckling(orgID string) *DucklingStatus {
+	d := &DucklingStatus{}
+	d.MetadataStore.Password = "pw-" + orgID
+	d.DataStore.BucketName = "posthog-duckling-" + orgID + "-mw-dev"
+	d.DataStore.S3Region = "us-east-1"
+	d.IAMRoleARN = "arn:aws:iam::123456789012:role/duckling-" + orgID
+	return d
 }
 
 type fakeCatalogClient struct {
@@ -593,60 +603,107 @@ func TestDuckLakeMetadataJDBCURL_SSLModeFollowsStoreKind(t *testing.T) {
 
 func TestDuckLakeDataPath(t *testing.T) {
 	cases := []struct {
-		name string
-		s3   configstore.ManagedWarehouseS3
-		want string
+		name   string
+		bucket string
+		prefix string
+		want   string
 	}{
-		{"no prefix", configstore.ManagedWarehouseS3{Bucket: "b"}, "s3://b/"},
-		{"prefix", configstore.ManagedWarehouseS3{Bucket: "b", PathPrefix: "data"}, "s3://b/data/"},
-		{"prefix with slashes", configstore.ManagedWarehouseS3{Bucket: "b", PathPrefix: "/data/"}, "s3://b/data/"},
-		{"nested prefix", configstore.ManagedWarehouseS3{Bucket: "b", PathPrefix: "a/b"}, "s3://b/a/b/"},
+		{"no prefix", "b", "", "s3://b/"},
+		{"prefix", "b", "data", "s3://b/data/"},
+		{"prefix with slashes", "b", "/data/", "s3://b/data/"},
+		{"nested prefix", "b", "a/b", "s3://b/a/b/"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ducklakeDataPath(tc.s3); got != tc.want {
+			if got := ducklakeDataPath(tc.bucket, tc.prefix); got != tc.want {
 				t.Errorf("ducklakeDataPath = %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
+// The object-store half of a catalog comes from the Duckling CR status, not
+// from the ManagedWarehouse row. Nothing populates the row's s3.* or
+// worker_identity.* columns for a DuckLake warehouse in production — the
+// bucket lands on data_store.bucket_name and the IAM role is a Crossplane
+// output on the CR status — so reading them from the row yielded an empty
+// bucket and an empty role for every org, and the catalog step waited
+// forever. Fixtures that filled those columns hid it.
+func TestCatalogPropertiesComeFromTheDucklingStatus(t *testing.T) {
+	w := readyWarehouse("42")
+	if w.S3.Bucket != "" || w.S3.Region != "" || w.WorkerIdentity.IAMRoleARN != "" {
+		t.Fatal("fixture regression: the warehouse row must leave the object-store columns empty, as production does")
+	}
+
+	d := readyDuckling("42")
+	d.DataStore.BucketName = "bucket-from-duckling"
+	d.DataStore.S3Region = "eu-west-2"
+	d.IAMRoleARN = "arn:aws:iam::123456789012:role/duckling-from-status"
+
+	p := &TrinoProvisioner{tenantSecretMountPath: "/etc/trino/tenant-secrets", s3MaxConnections: 50}
+	props := p.buildCatalogProperties("42", w, d)
+
+	for prop, want := range map[string]string{
+		"ducklake.data-path": "s3://bucket-from-duckling/",
+		"s3.region":          "eu-west-2",
+		"s3.iam-role":        "arn:aws:iam::123456789012:role/duckling-from-status",
+	} {
+		if props[prop] != want {
+			t.Errorf("%s = %q, want %q", prop, props[prop], want)
+		}
+	}
+}
+
 func TestMissingCatalogInputs(t *testing.T) {
-	full := readyWarehouse("42")
-	if got := missingCatalogInputs(full, ""); len(got) != 0 {
-		t.Fatalf("a ready warehouse must have no missing inputs, got %v", got)
+	if got := missingCatalogInputs(readyWarehouse("42"), readyDuckling("42"), ""); len(got) != 0 {
+		t.Fatalf("a ready warehouse + duckling must have no missing inputs, got %v", got)
 	}
 
 	cases := []struct {
 		name     string
-		mutate   func(*configstore.ManagedWarehouse)
+		mutateW  func(*configstore.ManagedWarehouse)
+		mutateD  func(*DucklingStatus)
 		fallback string
 		want     string
 	}{
-		{"endpoint", func(w *configstore.ManagedWarehouse) { w.MetadataStore.Endpoint = "" }, "", "metadata_store_endpoint"},
-		{"database", func(w *configstore.ManagedWarehouse) { w.MetadataStore.DatabaseName = "" }, "", "metadata_store_database_name"},
-		{"username", func(w *configstore.ManagedWarehouse) { w.MetadataStore.Username = "" }, "", "metadata_store_username"},
-		{"bucket", func(w *configstore.ManagedWarehouse) { w.S3.Bucket = "" }, "", "s3_bucket"},
-		{"region", func(w *configstore.ManagedWarehouse) { w.S3.Region = "" }, "", "s3_region"},
-		{"iam role", func(w *configstore.ManagedWarehouse) { w.WorkerIdentity.IAMRoleARN = "" }, "", "worker_identity_iam_role_arn"},
+		{"endpoint", func(w *configstore.ManagedWarehouse) { w.MetadataStore.Endpoint = "" }, nil, "", "metadata_store_endpoint"},
+		{"database", func(w *configstore.ManagedWarehouse) { w.MetadataStore.DatabaseName = "" }, nil, "", "metadata_store_database_name"},
+		{"username", func(w *configstore.ManagedWarehouse) { w.MetadataStore.Username = "" }, nil, "", "metadata_store_username"},
+		{"bucket", nil, func(d *DucklingStatus) { d.DataStore.BucketName = "" }, "", "data_store_bucket_name"},
+		{"region", nil, func(d *DucklingStatus) { d.DataStore.S3Region = "" }, "", "data_store_s3_region"},
+		{"iam role", nil, func(d *DucklingStatus) { d.IAMRoleARN = "" }, "", "iam_role_arn"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w := readyWarehouse("42")
-			tc.mutate(w)
-			got := missingCatalogInputs(w, tc.fallback)
+			w, d := readyWarehouse("42"), readyDuckling("42")
+			if tc.mutateW != nil {
+				tc.mutateW(w)
+			}
+			if tc.mutateD != nil {
+				tc.mutateD(d)
+			}
+			got := missingCatalogInputs(w, d, tc.fallback)
 			if len(got) != 1 || got[0] != tc.want {
 				t.Fatalf("missingCatalogInputs = %v, want exactly [%s]", got, tc.want)
 			}
 		})
 	}
 
-	// The env-configured region covers a row that predates s3_region
-	// being populated; nothing else has a fallback.
+	// A warehouse whose duckling has published nothing yet is a WAIT, not a
+	// list of individually-missing object-store fields.
+	t.Run("no duckling status", func(t *testing.T) {
+		got := missingCatalogInputs(readyWarehouse("42"), nil, "")
+		if len(got) != 1 || got[0] != "duckling_status" {
+			t.Fatalf("missingCatalogInputs = %v, want exactly [duckling_status]", got)
+		}
+	})
+
+	// The env-configured region covers a duckling that has not published one;
+	// nothing else has a fallback.
 	t.Run("region falls back to the provisioner's configured region", func(t *testing.T) {
-		w := readyWarehouse("42")
-		w.S3.Region = ""
-		if got := missingCatalogInputs(w, "eu-central-1"); len(got) != 0 {
+		d := readyDuckling("42")
+		d.DataStore.S3Region = ""
+		if got := missingCatalogInputs(readyWarehouse("42"), d, "eu-central-1"); len(got) != 0 {
 			t.Fatalf("expected no missing inputs with a fallback region, got %v", got)
 		}
 	})
@@ -661,9 +718,9 @@ type testProvisionerHarness struct {
 	bundles     *opa.BundleStore
 	store       *fakeTrinoStore
 	warehouses  *fakeWarehouseStore
-	// passwords is the fake tenant password source: org id -> password.
+	// ducklings is the fake Duckling CR status source: org id -> status.
 	// A missing entry resolves to ("", nil) — the duckling-not-ready wait.
-	passwords map[string]string
+	ducklings map[string]*DucklingStatus
 	// passwordErr, when non-nil for an org, fails that org's resolution.
 	passwordErr map[string]error
 }
@@ -678,23 +735,23 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 		bundles:     &opa.BundleStore{},
 		store:       &fakeTrinoStore{orgs: orgs},
 		warehouses:  &fakeWarehouseStore{rows: warehouses},
-		passwords:   map[string]string{},
+		ducklings:   map[string]*DucklingStatus{},
 		passwordErr: map[string]error{},
 	}
 	// Every org in the fixture gets a password unless the test removes
 	// it — the interesting cases are the exceptions, not the norm.
 	for _, o := range orgs {
-		h.passwords[o.OrgID] = "pw-" + o.OrgID
+		h.ducklings[o.OrgID] = readyDuckling(o.OrgID)
 	}
 	p, err := NewTrinoProvisioner(TrinoProvisionerOpts{
 		Store:             h.store,
 		BootstrapSentinel: newFakeSentinel(),
 		Warehouses:        h.warehouses,
-		TenantPasswords: func(_ context.Context, orgID string) (string, error) {
+		Ducklings: func(_ context.Context, orgID string) (*DucklingStatus, error) {
 			if err := h.passwordErr[orgID]; err != nil {
-				return "", err
+				return nil, err
 			}
-			return h.passwords[orgID], nil
+			return h.ducklings[orgID], nil
 		},
 		Kubernetes:    h.kube,
 		Namespace:     TrinoCustomerNamespace,
@@ -841,7 +898,7 @@ func TestReconcile_CatalogPropertiesCarryNoSecret(t *testing.T) {
 		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.passwords["42"] = "super-secret-metadata-password"
+	h.ducklings["42"].MetadataStore.Password = "super-secret-metadata-password"
 
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -918,7 +975,7 @@ func TestReconcile_SkipsCatalogWhenTenantPasswordNotReady(t *testing.T) {
 		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$hash"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	delete(h.passwords, "42")
+	delete(h.ducklings, "42")
 
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1059,7 +1116,7 @@ func TestReconcile_PendingOrgKeepsItsExistingCatalog(t *testing.T) {
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 	h.catalog.existing = []string{TrinoCatalogName("db42")}
-	delete(h.passwords, "42")
+	delete(h.ducklings, "42")
 
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1397,7 +1454,7 @@ func baseTestOpts() TrinoProvisionerOpts {
 		Store:             &fakeTrinoStore{},
 		BootstrapSentinel: newFakeSentinel(),
 		Warehouses:        &fakeWarehouseStore{},
-		TenantPasswords:   func(context.Context, string) (string, error) { return "", nil },
+		Ducklings:         func(context.Context, string) (*DucklingStatus, error) { return nil, nil },
 		Kubernetes:        kubefake.NewClientset(),
 		Catalog:           &fakeCatalogClient{},
 		BundleStore:       &opa.BundleStore{},
@@ -1415,7 +1472,7 @@ func TestNewTrinoProvisioner_RequiresAllDeps(t *testing.T) {
 		func(o *TrinoProvisionerOpts) { o.Store = nil },
 		func(o *TrinoProvisionerOpts) { o.BootstrapSentinel = nil },
 		func(o *TrinoProvisionerOpts) { o.Warehouses = nil },
-		func(o *TrinoProvisionerOpts) { o.TenantPasswords = nil },
+		func(o *TrinoProvisionerOpts) { o.Ducklings = nil },
 		func(o *TrinoProvisionerOpts) { o.Kubernetes = nil },
 		func(o *TrinoProvisionerOpts) { o.Catalog = nil },
 		func(o *TrinoProvisionerOpts) { o.BundleStore = nil },

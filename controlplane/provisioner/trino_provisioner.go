@@ -249,7 +249,7 @@ type TrinoProvisionerOpts struct {
 	// there is exactly ONE definition of "the tenant's metadata password"
 	// in the control plane. Required: without it the tenant Secret cannot
 	// be projected and every catalog would sit pending forever.
-	TenantPasswords TrinoTenantPasswordResolver
+	Ducklings TrinoDucklingResolver
 
 	// Kubernetes is used for the auth Secret, tenant-password Secret and
 	// resource-groups ConfigMap projections in the Trino namespace.
@@ -354,7 +354,7 @@ type TrinoWarehouseStore interface {
 // The plaintext is handled in exactly two places: this call, and the write
 // into TrinoTenantSecretName. It is never logged, never put in a catalog
 // property, and never persisted in the config store.
-type TrinoTenantPasswordResolver func(ctx context.Context, orgID string) (string, error)
+type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingStatus, error)
 
 // TrinoProvisioner owns the customer Trino cluster's projected state:
 // cluster-level Secrets (internal-communication shared secret, auth
@@ -371,7 +371,7 @@ type TrinoProvisioner struct {
 	store                 TrinoStore
 	bootstrapSentinel     TrinoBootstrapSentinelStore
 	warehouses            TrinoWarehouseStore
-	tenantPasswords       TrinoTenantPasswordResolver
+	ducklings             TrinoDucklingResolver
 	kubernetes            kubernetes.Interface
 	namespace             string
 	cellID                string
@@ -401,8 +401,8 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if opts.Warehouses == nil {
 		return nil, errors.New("TrinoProvisioner: Warehouses is required")
 	}
-	if opts.TenantPasswords == nil {
-		return nil, errors.New("TrinoProvisioner: TenantPasswords is required")
+	if opts.Ducklings == nil {
+		return nil, errors.New("TrinoProvisioner: Ducklings is required")
 	}
 	if opts.Kubernetes == nil {
 		return nil, errors.New("TrinoProvisioner: Kubernetes client is required")
@@ -436,7 +436,7 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		store:                 opts.Store,
 		bootstrapSentinel:     opts.BootstrapSentinel,
 		warehouses:            opts.Warehouses,
-		tenantPasswords:       opts.TenantPasswords,
+		ducklings:             opts.Ducklings,
 		kubernetes:            opts.Kubernetes,
 		namespace:             ns,
 		cellID:                cell,
@@ -1179,6 +1179,11 @@ type tenantSecretProjection struct {
 	pending map[string]string
 	// failed holds orgs whose password could not be resolved at all.
 	failed map[string]error
+	// statuses holds the duckling status each password came from, so the
+	// catalog step can build a catalog from the SAME live composition
+	// rather than re-reading it (or, worse, reading object-store fields
+	// off the config store, where they are never populated).
+	statuses map[string]*DucklingStatus
 }
 
 // reconcileTenantSecrets resolves every enabled org's DuckLake
@@ -1200,6 +1205,7 @@ func (p *TrinoProvisioner) reconcileTenantSecrets(ctx context.Context, orgs []co
 		projected: make(map[string]bool, len(orgs)),
 		pending:   make(map[string]string),
 		failed:    make(map[string]error),
+		statuses:  make(map[string]*DucklingStatus, len(orgs)),
 	}
 	data := make(map[string][]byte, len(orgs))
 	for _, o := range orgs {
@@ -1211,7 +1217,7 @@ func (p *TrinoProvisioner) reconcileTenantSecrets(ctx context.Context, orgs []co
 				"org id %q is not a valid Kubernetes Secret data key ([-._a-zA-Z0-9]+); its metadata-store password cannot be projected", o.OrgID)
 			continue
 		}
-		password, err := p.tenantPasswords(ctx, o.OrgID)
+		status, err := p.ducklings(ctx, o.OrgID)
 		if err != nil {
 			// Deliberately not wrapped with the org's infrastructure
 			// detail beyond what the resolver said — this string ends up
@@ -1219,12 +1225,13 @@ func (p *TrinoProvisioner) reconcileTenantSecrets(ctx context.Context, orgs []co
 			proj.failed[o.OrgID] = fmt.Errorf("resolve metadata-store password: %w", err)
 			continue
 		}
-		if password == "" {
+		if status == nil || status.MetadataStore.Password == "" {
 			proj.pending[o.OrgID] = "waiting for the duckling to publish a metadata-store credential"
 			continue
 		}
-		data[o.OrgID] = []byte(password)
+		data[o.OrgID] = []byte(status.MetadataStore.Password)
 		proj.projected[o.OrgID] = true
+		proj.statuses[o.OrgID] = status
 	}
 
 	if err := p.replaceSecret(ctx, TrinoTenantSecretName, data); err != nil {
@@ -1330,7 +1337,8 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 			}
 			continue
 		}
-		if missing := missingCatalogInputs(warehouse, p.awsRegion); len(missing) > 0 {
+		duckling := tenants.statuses[o.OrgID]
+		if missing := missingCatalogInputs(warehouse, duckling, p.awsRegion); len(missing) > 0 {
 			// The org opted into Trino but its warehouse hasn't finished
 			// provisioning (or a reshard blanked the connection block).
 			// Rendering a catalog with an empty endpoint or bucket makes
@@ -1343,7 +1351,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 			}
 			continue
 		}
-		props := p.buildCatalogProperties(o.OrgID, warehouse)
+		props := p.buildCatalogProperties(o.OrgID, warehouse, duckling)
 		if err := p.catalog.CreateCatalog(ctx, name, props); err != nil {
 			perOrgErr := fmt.Errorf("create catalog %s: %w", name, err)
 			errs = append(errs, perOrgErr)
@@ -1381,7 +1389,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 //
 // fallbackRegion is the provisioner's configured AWS region, consulted only
 // when the row has no s3_region of its own.
-func missingCatalogInputs(w *configstore.ManagedWarehouse, fallbackRegion string) []string {
+func missingCatalogInputs(w *configstore.ManagedWarehouse, d *DucklingStatus, fallbackRegion string) []string {
 	var missing []string
 	if w.MetadataStore.Endpoint == "" {
 		missing = append(missing, "metadata_store_endpoint")
@@ -1392,18 +1400,21 @@ func missingCatalogInputs(w *configstore.ManagedWarehouse, fallbackRegion string
 	if w.MetadataStore.Username == "" {
 		missing = append(missing, "metadata_store_username")
 	}
-	if w.S3.Bucket == "" {
-		missing = append(missing, "s3_bucket")
+	if d == nil {
+		return append(missing, "duckling_status")
 	}
-	if w.S3.Region == "" && fallbackRegion == "" {
-		missing = append(missing, "s3_region")
+	if d.DataStore.BucketName == "" {
+		missing = append(missing, "data_store_bucket_name")
 	}
-	if w.WorkerIdentity.IAMRoleARN == "" {
+	if d.DataStore.S3Region == "" && fallbackRegion == "" {
+		missing = append(missing, "data_store_s3_region")
+	}
+	if d.IAMRoleARN == "" {
 		// Without the per-org role every catalog would fall back to the
 		// Trino pod's ambient identity, which can assume EVERY tenant
 		// role — that collapses the per-tenant S3 boundary entirely.
 		// Waiting is the only safe answer.
-		missing = append(missing, "worker_identity_iam_role_arn")
+		missing = append(missing, "iam_role_arn")
 	}
 	return missing
 }
@@ -1444,8 +1455,8 @@ func missingCatalogInputs(w *configstore.ManagedWarehouse, fallbackRegion string
 // every worker; a password here would be readable by anyone who can see a
 // query listing. If you add a property, ask whether it is safe in a log
 // line before adding it.
-func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.ManagedWarehouse) map[string]string {
-	region := w.S3.Region
+func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.ManagedWarehouse, d *DucklingStatus) map[string]string {
+	region := d.DataStore.S3Region
 	if region == "" {
 		region = p.awsRegion
 	}
@@ -1454,11 +1465,11 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.M
 		"ducklake.metadata.connection-url":           ducklakeMetadataJDBCURL(w),
 		"ducklake.metadata.connection-user":          w.MetadataStore.Username,
 		"ducklake.metadata.connection-password-file": p.tenantPasswordFilePath(orgID),
-		"ducklake.data-path":                         ducklakeDataPath(w.S3),
+		"ducklake.data-path":                         ducklakeDataPath(d.DataStore.BucketName, w.S3.PathPrefix),
 		"fs.s3.enabled":                              "true",
 		"s3.region":                                  region,
 		"s3.auth-type":                               "IAM_ROLE",
-		"s3.iam-role":                                w.WorkerIdentity.IAMRoleARN,
+		"s3.iam-role":                                d.IAMRoleARN,
 		"s3.max-connections":                         strconv.Itoa(p.s3MaxConnections),
 	}
 }
@@ -1497,12 +1508,12 @@ func ducklakeMetadataJDBCURL(w *configstore.ManagedWarehouse) string {
 // address exactly the same DuckLake data files. It is duplicated rather
 // than shared because the controlplane package imports this one, not the
 // other way round; if the two ever disagree, THIS one is wrong.
-func ducklakeDataPath(s3 configstore.ManagedWarehouseS3) string {
-	prefix := strings.Trim(s3.PathPrefix, "/")
+func ducklakeDataPath(bucket, pathPrefix string) string {
+	prefix := strings.Trim(pathPrefix, "/")
 	if prefix == "" {
-		return fmt.Sprintf("s3://%s/", s3.Bucket)
+		return fmt.Sprintf("s3://%s/", bucket)
 	}
-	return fmt.Sprintf("s3://%s/%s/", s3.Bucket, prefix)
+	return fmt.Sprintf("s3://%s/%s/", bucket, prefix)
 }
 
 // reconcileAuthSecret rebuilds password.db + group.db and atomically
