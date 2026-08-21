@@ -16,10 +16,20 @@ import (
 // Flight wall-time visibility in traces.
 func OTELGRPCClientHandler() grpc.DialOption {
 	return grpc.WithStatsHandler(otelgrpc.NewClientHandler(
-		otelgrpc.WithFilter(func(info *stats.RPCTagInfo) bool {
-			return strings.Contains(info.FullMethodName, "GetFlightInfo") ||
-				strings.Contains(info.FullMethodName, "DoGet") ||
-				strings.Contains(info.FullMethodName, "DoPut")
-		}),
+		otelgrpc.WithFilter(isQueryFlightRPC),
 	))
+}
+
+// OTELGRPCServerHandler returns a gRPC StatsHandler that extracts trace
+// context and creates server spans for query-related Flight SQL RPCs.
+func OTELGRPCServerHandler() grpc.ServerOption {
+	return grpc.StatsHandler(otelgrpc.NewServerHandler(
+		otelgrpc.WithFilter(isQueryFlightRPC),
+	))
+}
+
+func isQueryFlightRPC(info *stats.RPCTagInfo) bool {
+	return strings.Contains(info.FullMethodName, "GetFlightInfo") ||
+		strings.Contains(info.FullMethodName, "DoGet") ||
+		strings.Contains(info.FullMethodName, "DoPut")
 }

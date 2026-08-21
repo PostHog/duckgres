@@ -30,6 +30,7 @@ import (
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
+	"github.com/posthog/duckgres/server/sqlcore"
 	"github.com/posthog/duckgres/transpiler/transform"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -995,27 +996,9 @@ func Run(cfg ServiceConfig) {
 func (svc *DuckDBService) Serve(listener net.Listener) error {
 	handler := NewFlightSQLHandler(svc.pool)
 
-	var opts []grpc.ServerOption
-	opts = append(opts,
-		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
-		grpc.MaxSendMsgSize(flightclient.MaxGRPCMessageSize),
-	)
-	if svc.cfg.BearerToken != "" {
-		opts = append(opts,
-			grpc.ChainUnaryInterceptor(BearerTokenUnaryInterceptor(svc.cfg.BearerToken)),
-			grpc.ChainStreamInterceptor(BearerTokenStreamInterceptor(svc.cfg.BearerToken)),
-		)
-	}
-	if listener.Addr() != nil && listener.Addr().Network() == "tcp" &&
-		svc.cfg.ServerConfig.TLSCertFile != "" && svc.cfg.ServerConfig.TLSKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(svc.cfg.ServerConfig.TLSCertFile, svc.cfg.ServerConfig.TLSKeyFile)
-		if err != nil {
-			return fmt.Errorf("load worker RPC TLS certificates: %w", err)
-		}
-		opts = append(opts, grpc.Creds(credentials.NewTLS(&tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		})))
+	opts, err := flightServerOptions(svc.cfg, listener)
+	if err != nil {
+		return err
 	}
 
 	// Wrap the flightsql server with custom action handling.
@@ -1029,6 +1012,32 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 	svc.flightSrv.RegisterFlightService(customSrv)
 	svc.flightSrv.InitListener(listener)
 	return svc.flightSrv.Serve()
+}
+
+func flightServerOptions(cfg ServiceConfig, listener net.Listener) ([]grpc.ServerOption, error) {
+	opts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(flightclient.MaxGRPCMessageSize),
+		sqlcore.OTELGRPCServerHandler(),
+	}
+	if cfg.BearerToken != "" {
+		opts = append(opts,
+			grpc.ChainUnaryInterceptor(BearerTokenUnaryInterceptor(cfg.BearerToken)),
+			grpc.ChainStreamInterceptor(BearerTokenStreamInterceptor(cfg.BearerToken)),
+		)
+	}
+	if listener != nil && listener.Addr() != nil && listener.Addr().Network() == "tcp" &&
+		cfg.ServerConfig.TLSCertFile != "" && cfg.ServerConfig.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.ServerConfig.TLSCertFile, cfg.ServerConfig.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load worker RPC TLS certificates: %w", err)
+		}
+		opts = append(opts, grpc.Creds(credentials.NewTLS(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})))
+	}
+	return opts, nil
 }
 
 // Shutdown gracefully stops the service.
