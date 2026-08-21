@@ -138,6 +138,49 @@ func sessionPropertyResource(name string) map[string]interface{} {
 	}
 }
 
+// queryOwnerResource builds the `resource.user` shape the Trino OPA plugin
+// sends for the three query-ownership operations. Verified against the
+// plugin's own tests in the vendored Trino fork:
+//
+//	plugin/trino-opa/src/test/java/io/trino/plugin/opa/
+//	  TestOpaAccessControl.java::testIdentityResourceActions
+//	    -> {"resource": {"user": {"user": "dummy-user",
+//	                              "groups": ["some-group"]}}}
+//	  TestOpaAccessControlFiltering.java::testFilterViewQueryOwnedBy
+//	    -> the same shape, with "groups": [], and it asserts the plugin
+//	       reads back "/input/action/resource/user/user".
+//
+// OpaAccessControl.checkCanViewQueryOwnedBy / filterViewQueryOwnedBy /
+// checkCanKillQueryOwnedBy all build the resource as
+// `.user(new TrinoUser(queryOwner))` with an *Identity* argument, so
+// TrinoUser.identity is @JsonUnwrapped and the owner's user+groups land
+// directly under resource.user. (ImpersonateUser uses the String-form
+// TrinoUser and emits no "groups" key -- deliberately a different shape.)
+func queryOwnerResource(owner string, groups []string) map[string]interface{} {
+	u := map[string]interface{}{"user": owner}
+	if groups != nil {
+		u["groups"] = groups
+	}
+	return map[string]interface{}{"user": u}
+}
+
+// ownerOf builds the query-owner resource for a customer principal,
+// mirroring the provisioner's projection (username == org name, group ==
+// org_<org>) the same way groupsFor does for the requester side.
+func ownerOf(user string) map[string]interface{} {
+	return queryOwnerResource(user, groupsFor(user))
+}
+
+// queryVisibilityOps are the operation strings the Trino OPA plugin sends
+// for query ownership. These are the plugin's names, NOT the SPI method
+// names: the filter op is `FilterViewQueryOwnedBy` (the SPI method is
+// filterViewQueryOwnedBy), not `FilterViewQuery`.
+var queryVisibilityOps = []string{
+	"ViewQueryOwnedBy",
+	"FilterViewQueryOwnedBy",
+	"KillQueryOwnedBy",
+}
+
 // --------------------------------------------------------------------------
 // AccessCatalog and FilterCatalogs: the load-bearing catalog-scope decisions.
 // --------------------------------------------------------------------------
@@ -354,12 +397,21 @@ func TestExecuteQueryAllowed(t *testing.T) {
 // --------------------------------------------------------------------------
 // Default deny: any operation we don't recognize must be denied.
 //
-// Note on coverage: in Trino 476, several of these (WriteSystemInformation,
-// KillQueryOwnedBy, ViewQueryOwnedBy, GRANT-related ops) are NOT actually
-// queried through OPA -- they're gated at the plugin level by
-// `opa.allow-permission-management-operations`. Keeping them here is
-// forward-compat: if a future Trino version starts routing them to OPA,
-// they remain default-deny rather than silently allowing.
+// Note on coverage: the GRANT-related ops here are gated at the plugin
+// level by `opa.allow-permission-management-operations` and are not
+// actually queried through OPA in Trino 476; keeping them is forward-compat
+// so a future Trino version routing them to OPA stays default-deny.
+//
+// KillQueryOwnedBy / ViewQueryOwnedBy are DIFFERENT: that config knob does
+// not gate them (it gates only the grant/deny/revoke/set-authorization
+// family, via enforcePermissionManagementOperation in
+// OpaAccessControl.java), so the coordinator really does send them, and
+// they are modelled by the query-visibility rules further down. They stay
+// in this list because the input built here carries a *table* resource and
+// no resource.user -- so this case is the fail-closed guard for a
+// query-ownership decision whose owner field is missing. See
+// TestQueryVisibilityFailsClosed for the full absent/blank/wrong-shape
+// matrix, and TestQueryVisibilitySameOrg for the allow path.
 // --------------------------------------------------------------------------
 
 func TestDefaultDeny(t *testing.T) {
@@ -752,6 +804,285 @@ func TestPolicyRegoContainsManagedNamePattern(t *testing.T) {
 			"the exported ManagedCatalogPattern constant. Update either the constant\n"+
 			"in opa/types.go or the regex literal in opa/policy.rego so they agree.",
 			ManagedCatalogPattern)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Query visibility: same-org only.
+//
+// A query's SQL text is tenant data -- it embeds table names, filter
+// literals, customer identifiers and business logic. Trino exposes it to
+// anyone allowed to view the query, via `SELECT * FROM
+// system.runtime.queries` and the coordinator web UI, and lets them KILL
+// it. These tests are the cross-tenant-leak guard for that surface.
+// --------------------------------------------------------------------------
+
+// TestQueryVisibilitySameOrg is the core matrix: every principal sees and
+// kills exactly their own org's queries, and nothing else.
+func TestQueryVisibilitySameOrg(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	cases := []struct {
+		name      string
+		requester string
+		owner     string
+		want      bool
+	}{
+		{"42 views own query", "42", "42", true},
+		{"43 views own query", "43", "43", true},
+		{"42 views 43's query -- cross-tenant SQL-text leak", "42", "43", false},
+		{"43 views 42's query -- cross-tenant SQL-text leak", "43", "42", false},
+		{"unknown org views 42's query", "99", "42", false},
+		{"42 views an unknown org's query", "42", "99", false},
+	}
+
+	for _, op := range queryVisibilityOps {
+		for _, tc := range cases {
+			t.Run(op+"/"+tc.name, func(t *testing.T) {
+				got := evalAllow(t, q, buildInput(tc.requester, op, ownerOf(tc.owner)))
+				if got != tc.want {
+					t.Fatalf("%s requester=%q owner=%q: want %v, got %v",
+						op, tc.requester, tc.owner, tc.want, got)
+				}
+			})
+		}
+	}
+}
+
+// TestFilterViewQueryReturnsOnlySameOrg models what the coordinator
+// actually does: filterViewQueryOwnedBy issues ONE decision per candidate
+// owner (parallelFilterFromOpa), and the surviving set is what the tenant
+// sees in system.runtime.queries / the web UI. Asserting the filtered set
+// -- not just individual decisions -- is what pins the user-visible
+// behaviour.
+func TestFilterViewQueryReturnsOnlySameOrg(t *testing.T) {
+	gc := GroupCatalogs{
+		"org_42": {"org_42": true},
+		"org_43": {"org_43": true},
+		"org_44": {"org_44": true},
+		AdminGroup: {
+			"org_42": true,
+			"org_43": true,
+			"org_44": true,
+		},
+	}
+	q := preparedPolicy(t, gc)
+
+	// Candidate query owners on a shared cell: three tenants plus the
+	// provisioner's own reconcile DDL.
+	candidates := []string{"42", "43", "44", AdminPrincipal}
+
+	for _, requester := range []string{"42", "43", "44", AdminPrincipal} {
+		t.Run("requester="+requester, func(t *testing.T) {
+			var visible []string
+			for _, owner := range candidates {
+				in := buildInput(requester, "FilterViewQueryOwnedBy", ownerOf(owner))
+				if evalAllow(t, q, in) {
+					visible = append(visible, owner)
+				}
+			}
+			// Every principal (tenant or admin) sees exactly itself.
+			want := []string{requester}
+			if len(visible) != len(want) || visible[0] != want[0] {
+				t.Fatalf("FilterViewQueryOwnedBy requester=%q: visible owners = %v, want %v",
+					requester, visible, want)
+			}
+		})
+	}
+}
+
+// TestQueryVisibilityAdminPrincipal pins the admin decision.
+//
+// DECISION: the admin principal gets NO cross-tenant query visibility.
+// The reconcile loop's Trino client (trino_provisioner.go) runs only
+// SHOW CATALOGS / CREATE CATALOG / DROP CATALOG -- it never selects from
+// system.runtime.queries and never kills a query -- so there is nothing
+// for the grant to enable, and granting it would hand every tenant's SQL
+// text to a credential that has no use for it. Admin retains visibility
+// of its OWN queries (which Trino short-circuits before OPA anyway).
+//
+// The load-bearing part: the bundle DOES place every managed catalog
+// under data.group_catalogs[AdminGroup] so admin can smoke-test catalog
+// reads. This test proves that entry cannot be levered into query
+// visibility.
+func TestQueryVisibilityAdminPrincipal(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	for _, op := range queryVisibilityOps {
+		t.Run(op+"/admin sees own query", func(t *testing.T) {
+			in := buildInput(AdminPrincipal, op, ownerOf(AdminPrincipal))
+			if !evalAllow(t, q, in) {
+				t.Errorf("%s: admin must retain visibility of its own queries", op)
+			}
+		})
+		for _, owner := range []string{"42", "43"} {
+			t.Run(op+"/admin vs tenant "+owner, func(t *testing.T) {
+				in := buildInput(AdminPrincipal, op, ownerOf(owner))
+				if evalAllow(t, q, in) {
+					t.Errorf("%s: admin must NOT see or kill tenant %s's queries -- "+
+						"the reconcile loop never reads system.runtime.queries, so this "+
+						"would be tenant SQL text handed to a credential with no use for it",
+						op, owner)
+				}
+			})
+		}
+		t.Run(op+"/tenant vs admin", func(t *testing.T) {
+			in := buildInput("42", op, ownerOf(AdminPrincipal))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s: tenant must NOT see the provisioner's queries", op)
+			}
+		})
+	}
+}
+
+// TestQueryVisibilityFailsClosed covers every way the owner field can be
+// missing, blank, or the wrong shape. All of them must deny: a rule keyed
+// on a field the plugin never sends would look like a working policy while
+// silently denying (or, combined with another allow, silently permitting).
+func TestQueryVisibilityFailsClosed(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	cases := []struct {
+		name     string
+		resource map[string]interface{}
+	}{
+		{"no resource at all", nil},
+		{"resource without user", tableResource("org_42", "public", "events")},
+		{"user object is empty", map[string]interface{}{"user": map[string]interface{}{}}},
+		{"owner name absent, groups present", map[string]interface{}{
+			"user": map[string]interface{}{"groups": []string{"org_99"}},
+		}},
+		// The ImpersonateUser shape: String-form TrinoUser, no groups key.
+		// A cross-org owner here must still deny.
+		{"string-form TrinoUser for another org", queryOwnerResource("43", nil)},
+		{"owner name empty string", queryOwnerResource("", nil)},
+		{"owner name empty string with empty groups", queryOwnerResource("", []string{})},
+		{"owner has no groups", queryOwnerResource("43", []string{})},
+		{"owner groups is not a list", map[string]interface{}{
+			"user": map[string]interface{}{"user": "43", "groups": "org_43"},
+		}},
+		{"owner in a group the bundle never projected", queryOwnerResource("99", []string{"org_99"})},
+	}
+
+	for _, op := range queryVisibilityOps {
+		for _, tc := range cases {
+			t.Run(op+"/"+tc.name, func(t *testing.T) {
+				if evalAllow(t, q, buildInput("42", op, tc.resource)) {
+					t.Fatalf("%s with %s must fail closed", op, tc.name)
+				}
+			})
+		}
+	}
+}
+
+// TestQueryVisibilityIgnoresForgedGroups: the same-org match is bound to
+// the bundle's group roster, so a group label the provisioner never
+// projected grants nothing even when BOTH sides carry it. Also pins that
+// a shared admin-group claim can never be the matching group.
+func TestQueryVisibilityIgnoresForgedGroups(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	for _, op := range queryVisibilityOps {
+		t.Run(op+"/shared unknown group", func(t *testing.T) {
+			in := buildInputWithGroups("42", []string{"org_not_in_bundle"}, op,
+				queryOwnerResource("43", []string{"org_not_in_bundle"}))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s: a group absent from data.group_catalogs must grant nothing", op)
+			}
+		})
+		t.Run(op+"/shared admin group", func(t *testing.T) {
+			in := buildInputWithGroups("42", []string{AdminGroup}, op,
+				queryOwnerResource("43", []string{AdminGroup}))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s: a bare admin-group claim must never be the matching group", op)
+			}
+		})
+		t.Run(op+"/tenant claiming an org group it does not own", func(t *testing.T) {
+			// Requester 42 forges membership of org_43 (a real bundle
+			// group). This is the group-provider-compromise case: the
+			// policy CANNOT stop it, and that is by design -- group
+			// membership is the identity assertion. Documented here so
+			// the boundary is explicit rather than assumed.
+			in := buildInputWithGroups("42", []string{"org_43"}, op, ownerOf("43"))
+			if !evalAllow(t, q, in) {
+				t.Errorf("%s: sanity -- a forged org_43 claim DOES match; "+
+					"group membership is the identity assertion and the file group "+
+					"provider is the thing that must be trustworthy", op)
+			}
+		})
+	}
+}
+
+// TestQueryVisibilityAllOrgsFixture runs the same-org matrix against a
+// group with no catalogs, confirming the bundle-membership check treats
+// "known group, owns nothing" as a real org rather than an unknown label.
+// A tenant mid-provision (group projected, catalog not yet created) must
+// still be able to see its own queries.
+func TestQueryVisibilityGroupWithNoCatalogs(t *testing.T) {
+	gc := twoOrgFixture()
+	gc["org_pending"] = map[string]bool{}
+	q := preparedPolicy(t, gc)
+
+	for _, op := range queryVisibilityOps {
+		if !evalAllow(t, q, buildInput("pending", op, ownerOf("pending"))) {
+			t.Errorf("%s: an org whose group is projected but owns no catalog yet "+
+				"must still see its own queries", op)
+		}
+		if evalAllow(t, q, buildInput("pending", op, ownerOf("42"))) {
+			t.Errorf("%s: org_pending must not see org 42's queries", op)
+		}
+	}
+}
+
+// TestQueryVisibilityBatchedInputDeniesByDefault extends the batched-shape
+// regression guard to the query-ownership ops. Under
+// `opa.policy.batched-uri`, FilterViewQueryOwnedBy candidates arrive under
+// action.filterResources (plural) and action.resource is absent, so the
+// rules fail their body and fall through to default-deny. Fail-closed is
+// the floor; enabling batched mode still requires extending the policy.
+func TestQueryVisibilityBatchedInputDeniesByDefault(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	batched := map[string]interface{}{
+		"context": map[string]interface{}{
+			"identity": map[string]interface{}{
+				"user":   "42",
+				"groups": []string{"org_42"},
+			},
+			"softwareStack": map[string]interface{}{"trinoVersion": "476"},
+		},
+		"action": map[string]interface{}{
+			"operation": "FilterViewQueryOwnedBy",
+			"filterResources": []map[string]interface{}{
+				{"user": map[string]interface{}{"user": "42", "groups": []string{"org_42"}}},
+				{"user": map[string]interface{}{"user": "43", "groups": []string{"org_43"}}},
+			},
+		},
+	}
+	if evalAllow(t, q, batched) {
+		t.Error("FilterViewQueryOwnedBy under the batched input shape must NOT allow -- " +
+			"the policy is the non-batched contract")
+	}
+}
+
+// TestQueryVisibilityOperationNames pins the plugin's operation strings
+// into the policy source. The filter op is `FilterViewQueryOwnedBy`, NOT
+// `FilterViewQuery`: a rule keyed on a name the plugin never sends is
+// dead code that denies everything while reading like a working policy.
+// The names come from OpaAccessControl.java and are asserted verbatim by
+// the plugin's own tests (see queryOwnerResource's doc comment).
+func TestQueryVisibilityOperationNames(t *testing.T) {
+	src := string(policyRego)
+	for _, op := range queryVisibilityOps {
+		if !strings.Contains(src, `"`+op+`"`) {
+			t.Errorf("policy.rego does not mention operation %q -- "+
+				"the query-visibility rules must key on the plugin's exact "+
+				"operation strings from OpaAccessControl.java", op)
+		}
+	}
+	if strings.Contains(stripRegoComments(src), `"FilterViewQuery"`) {
+		t.Error(`policy.rego keys on "FilterViewQuery"; the Trino OPA plugin sends ` +
+			`"FilterViewQueryOwnedBy". A rule on the wrong name never matches.`)
 	}
 }
 

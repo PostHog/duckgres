@@ -29,6 +29,33 @@
 #   input.action.resource.schema.catalogName / .schemaName
 #   input.action.resource.table.catalogName / .schemaName / .tableName
 #   input.action.resource.systemSessionProperty.name
+#   input.action.resource.user.user    -- on the query-ownership operations
+#                                         (ViewQueryOwnedBy /
+#                                         FilterViewQueryOwnedBy /
+#                                         KillQueryOwnedBy) this is the QUERY
+#                                         OWNER's Trino username, NOT the
+#                                         requester's. The requester is
+#                                         always input.context.identity.
+#   input.action.resource.user.groups  -- the query OWNER's group
+#                                         memberships, stamped by the same
+#                                         file group provider that fills
+#                                         input.context.identity.groups.
+#
+#   Shape note, verified against the plugin AND its tests: for the three
+#   query-ownership ops OpaAccessControl.java builds the resource as
+#   `.user(new TrinoUser(queryOwner))` with an *Identity* argument, so
+#   TrinoUser.user is null and TrinoUser.identity (a TrinoIdentity of
+#   {user, groups}) is `@JsonUnwrapped` -- the owner's `user` and `groups`
+#   land DIRECTLY under resource.user. TestOpaAccessControl
+#   .testIdentityResourceActions pins
+#   `{"resource": {"user": {"user": "dummy-user", "groups": ["some-group"]}}}`
+#   for ViewQueryOwnedBy / KillQueryOwnedBy, and
+#   TestOpaAccessControlFiltering.testFilterViewQueryOwnedBy pins the same
+#   shape (with `"groups": []`) for FilterViewQueryOwnedBy. ImpersonateUser
+#   uses the OTHER TrinoUser constructor (a bare String), which emits
+#   `{"user": {"user": "<name>"}}` with NO groups key -- the two shapes are
+#   NOT interchangeable, and a rule keyed on the wrong one fails closed
+#   while looking like a working policy.
 #
 # Data (mounted via the bundle's data.json under group_catalogs):
 #
@@ -42,18 +69,22 @@
 #
 # Defaults: deny everything not explicitly allowed below.
 #
-# TODO(trino-cells): same-org QUERY VISIBILITY is not modelled yet. Today
-# every principal of an org is one Trino user (the org's `root`), so
-# "who may see whose queries" has no intra-org shape to express. When
-# per-user identity within an org lands, this policy needs rules for the
-# query-ownership operations the Trino OPA plugin sends —
-# ViewQueryOwnedBy / FilterViewQuery / KillQueryOwnedBy / ExecuteQuery
-# (see OpaAccessControl.java) — so a member of org A can see and kill
-# their org's queries and NOTHING from org B. Until then those
-# operations fall through to `default allow := false` except
-# ExecuteQuery, which is explicitly allowed below; that is fail-closed
-# but means the Trino UI's query list is empty for customers. Deliberate
-# scope boundary, not an oversight.
+# QUERY VISIBILITY is modelled below (see "Query visibility"). A query's
+# SQL text routinely embeds table names, filter literals, customer
+# identifiers and business logic, and Trino exposes it to any principal
+# allowed to view the query -- through `SELECT * FROM
+# system.runtime.queries` and through the coordinator's web UI. So the
+# three query-ownership operations the plugin sends (ViewQueryOwnedBy,
+# FilterViewQueryOwnedBy, KillQueryOwnedBy) are same-org-only, derived
+# from the SAME group/catalog ownership map every other decision uses.
+# ExecuteQuery stays unconditionally allowed -- resource groups, not OPA,
+# bound concurrency.
+#
+# Post-v1 note: today every principal of an org is a single Trino user
+# (its Trino username IS the sanitized org name), so "same org" and
+# "same user" coincide. The rules are written on the GROUP axis anyway,
+# so when per-user identity within an org lands (OIDC), org-mates keep
+# seeing each other's queries with no policy change.
 #
 # !!! Cross-component invariant: this policy is the NON-BATCHED OPA
 # contract. Trino 476's batched access control (OpaBatchAccessControl,
@@ -303,6 +334,83 @@ allow if {
 }
 
 # ---------------------------------------------------------------------------
+# Query visibility: same-org only.
+#
+# Threat: a query's SQL text is tenant data. Without these rules org A can
+# read org B's SQL -- table names, filter literals, customer identifiers,
+# business logic -- via `SELECT * FROM system.runtime.queries` or the
+# coordinator web UI, and can KILL org B's running queries. ExecuteQuery
+# being allowed unconditionally is exactly what makes those surfaces
+# reachable, so this section is not optional hardening.
+#
+# The requester is input.context.identity, as everywhere else. The query
+# OWNER arrives as input.action.resource.user -- see the shape note in the
+# header: `.user` is the owner's username, `.groups` the owner's group
+# memberships.
+#
+# Ownership is derived from the SAME source of truth as every other
+# decision in this file: the bundle's group -> catalog map. A group only
+# counts if the bundle knows it (`data.group_catalogs[g]`), so a group
+# provider that starts emitting labels the provisioner never projected
+# grants nothing. Object-indexed, O(1) in org count; the only iteration is
+# over the requester's 1-2 group memberships and the owner's, exactly like
+# tenant_owns_catalog.
+#
+# The admin principal (__admin_provisioner) gets NOTHING here beyond its
+# own queries. The reconcile loop's Trino client issues only SHOW CATALOGS
+# / CREATE CATALOG / DROP CATALOG (trino_provisioner.go); it never reads
+# system.runtime.queries and never kills a query, so granting it
+# cross-tenant query visibility would hand every tenant's SQL text to a
+# credential with no use for it. admin_group is excluded from the same-org
+# match on the requester side, so the bundle's
+# data.group_catalogs[admin_group] entry -- which exists so admin can
+# smoke-test catalog reads -- cannot be levered into query visibility.
+# ---------------------------------------------------------------------------
+
+query_visibility_ops := {
+	"ViewQueryOwnedBy",
+	"FilterViewQueryOwnedBy",
+	"KillQueryOwnedBy",
+}
+
+# The query owner's group memberships. Undefined when the plugin sent no
+# resource.user (or the String-form TrinoUser, as ImpersonateUser does),
+# which fails same_org_query_owner closed.
+query_owner_groups := input.action.resource.user.groups
+
+# same_org_query_owner: requester and owner share at least one org group
+# that the bundle actually knows about. admin_group is excluded so an
+# admin-group claim can never be the shared group.
+same_org_query_owner if {
+	some g in input.context.identity.groups
+	g != admin_group
+	data.group_catalogs[g]
+	g in query_owner_groups
+}
+
+# self_owned_query: the owner IS the requesting principal. Trino's own
+# AccessControlUtil short-circuits this case before it reaches OPA
+# (identity.getUser().equals(queryOwner.getUser()) -> return), so the rule
+# is belt-and-braces: it keeps "my own query" visible even if the group
+# provider has not stamped groups onto the owner identity, and it cannot
+# widen anything, because an identical username IS an identical principal.
+# The non-empty guard stops two absent/blank usernames from matching.
+self_owned_query if {
+	owner := input.action.resource.user.user
+	owner != ""
+	owner == user
+}
+
+visible_query_owner if same_org_query_owner
+
+visible_query_owner if self_owned_query
+
+allow if {
+	input.action.operation in query_visibility_ops
+	visible_query_owner
+}
+
+# ---------------------------------------------------------------------------
 # Hard denies for customer principals.
 #
 # These are listed explicitly even though `default allow := false` already
@@ -312,10 +420,16 @@ allow if {
 #
 # - ImpersonateUser: NEVER allowed. There is no carve-out, not even for
 #   the admin principal -- the provisioner has no need to impersonate.
-# - WriteSystemInformation, KillQueryOwnedBy, ViewQueryOwnedBy: in Trino
-#   476 these are gated by the `opa.allow-permission-management-operations`
-#   config knob and not actually sent to OPA, so the unit tests covering
-#   them are forward-compat only. They remain default-deny here regardless.
+# - WriteSystemInformation / ReadSystemInformation: never allowed. Note
+#   that `opa.allow-permission-management-operations` does NOT gate these
+#   -- it gates only the grant/deny/revoke/set-authorization family, via
+#   enforcePermissionManagementOperation in OpaAccessControl.java -- so
+#   they really are sent to OPA, and really are denied here.
+# - KillQueryOwnedBy / ViewQueryOwnedBy / FilterViewQueryOwnedBy: NOT
+#   default-deny any more; see "Query visibility" above. They are allowed
+#   for a same-org query owner and denied for everyone else, including
+#   the admin principal. An input that omits resource.user, or its
+#   `user` / `groups` fields, still falls through to default-deny.
 # - GRANT-related ops, view/function creation, table mutation: not part of
 #   v1's per-org Iceberg-catalog model.
 #

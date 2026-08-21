@@ -1566,9 +1566,24 @@ password/tenant/catalog changes never propagate.
 - **The Rego policy is the tenant-isolation boundary.** The cell can assume
   every per-org duckling role, so nothing below OPA stops org A reading org
   B's catalog. Treat `provisioner/opa/policy.rego` as security review.
-  Same-org query visibility is NOT modelled yet (a TODO in the policy);
-  `opa.policy.batched-uri` must NOT be enabled without extending the policy —
-  the batched input shape fails every filter rule closed.
+  **Query visibility is same-org only**: `ViewQueryOwnedBy`,
+  `FilterViewQueryOwnedBy` and `KillQueryOwnedBy` (the plugin's exact
+  operation strings — the filter one is NOT `FilterViewQuery`) are allowed
+  only when the requester and the query OWNER share a bundle-known
+  `org_<sanitized>` group, derived from the same `data.group_catalogs`
+  ownership map every other decision uses. This matters because
+  `ExecuteQuery` is unconditionally allowed, so without it org A reads org
+  B's SQL text — table names, filter literals, customer identifiers — via
+  `system.runtime.queries` and the web UI, and can kill B's queries. The
+  owner arrives as `input.action.resource.user.{user,groups}` (an
+  `@JsonUnwrapped` `TrinoIdentity`); `ImpersonateUser` uses a different,
+  groups-less shape for the same field — do not conflate them. **The admin
+  principal deliberately gets NO cross-tenant query visibility** (only its
+  own queries): the reconcile loop issues only `SHOW`/`CREATE`/`DROP
+  CATALOG` and never reads `system.runtime.queries`, so the grant would buy
+  nothing and leak every tenant's SQL. `opa.policy.batched-uri` must NOT be
+  enabled without extending the policy — the batched input shape fails every
+  filter rule closed.
 - **Resource groups must keep the `root.admin.__admin_provisioner` selector.**
   Trino rejects a query matching no resource group, so dropping it silently
   breaks every reconcile tick's own DDL.

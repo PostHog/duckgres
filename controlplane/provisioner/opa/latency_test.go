@@ -177,6 +177,51 @@ func TestNegativeDecisionLatency(t *testing.T) {
 	}
 }
 
+// TestQueryVisibilityLatency: the same-org query-visibility rules must be
+// O(1) in org count too. This path is hotter than it looks --
+// filterViewQueryOwnedBy issues ONE decision per candidate query owner
+// (parallelFilterFromOpa), so a busy cell renders its query list at
+// O(distinct owners) decisions per page load, and every one of them is a
+// deny for all but the caller's own org. Measure the DENY side, which is
+// the overwhelming majority.
+func TestQueryVisibilityLatency(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping latency benchmark in -short mode")
+	}
+	q := preparedLargeBundle(t, 1000)
+	// Requester 777 evaluating a query owned by org 42 -- should deny.
+	input := buildInput("777", "FilterViewQueryOwnedBy", ownerOf("42"))
+	ctx := context.Background()
+
+	for i := 0; i < 50; i++ {
+		if _, err := q.Eval(ctx, rego.EvalInput(input)); err != nil {
+			t.Fatalf("warmup: %v", err)
+		}
+	}
+
+	const iters = 200
+	durations := make([]time.Duration, iters)
+	for i := 0; i < iters; i++ {
+		start := time.Now()
+		rs, err := q.Eval(ctx, rego.EvalInput(input))
+		durations[i] = time.Since(start)
+		if err != nil {
+			t.Fatalf("eval %d: %v", i, err)
+		}
+		if len(rs) > 0 && len(rs[0].Expressions) > 0 {
+			if v, _ := rs[0].Expressions[0].Value.(bool); v {
+				t.Fatalf("eval %d: cross-org query visibility must deny", i)
+			}
+		}
+	}
+	p50 := percentile(durations, 50)
+	t.Logf("FilterViewQueryOwnedBy (cross-org deny) @1000 orgs: p50=%s", p50)
+	if p50 > LatencyBudget {
+		t.Fatalf("FilterViewQueryOwnedBy deny p50=%s exceeds budget %s -- the "+
+			"same-org rules are likely scanning group_catalogs", p50, LatencyBudget)
+	}
+}
+
 // percentile returns the p-th percentile of d (0 < p < 100). Uses
 // nearest-rank for simplicity; not exact but consistent across runs.
 func percentile(d []time.Duration, p int) time.Duration {
