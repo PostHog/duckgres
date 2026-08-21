@@ -27,7 +27,7 @@ func newClusterSecretsTestProvisioner(t *testing.T) (*TrinoProvisioner, *kubefak
 		Store:             &fakeTrinoStore{},
 		BootstrapSentinel: sentinel,
 		Warehouses:        &fakeWarehouseStore{},
-		TenantPasswords:   func(context.Context, string) (string, error) { return "", nil },
+		Ducklings:         func(context.Context, string) (*DucklingStatus, error) { return nil, nil },
 		Kubernetes:        kc,
 		Namespace:         TrinoCustomerNamespace,
 		Catalog:           &fakeCatalogClient{},
@@ -275,7 +275,7 @@ func TestBootstrap_ConcurrentReplicasConverge(t *testing.T) {
 			Store:             &fakeTrinoStore{},
 			BootstrapSentinel: sentinel,
 			Warehouses:        &fakeWarehouseStore{},
-			TenantPasswords:   func(context.Context, string) (string, error) { return "", nil },
+			Ducklings:         func(context.Context, string) (*DucklingStatus, error) { return nil, nil },
 			Kubernetes:        kc, // shared
 			Namespace:         TrinoCustomerNamespace,
 			Catalog:           &fakeCatalogClient{},
