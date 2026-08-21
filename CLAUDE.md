@@ -1504,6 +1504,112 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   cnpg→ext positive path is unit-only (harness lacks the RDS password);
   cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
 
+## Trino Cells (customer-facing SQL over DuckLake, `kubernetes` tag)
+
+An org enabled for Trino gets a catalog, a login, authorization and resource
+limits on a shared multi-tenant Trino cluster called a **cell**. The control
+plane is the only writer of that state: `provisioner/trino_provisioner.go`
+projects it every controller tick from `duckgres_managed_warehouse_trino` +
+the org's warehouse row + its Duckling CR. Enablement is env-inferred —
+`DUCKGRES_TRINO_COORDINATOR_URL` set means on (`controlplane/trino_inputs.go`);
+unset means the branch never wires and nothing changes. **Trino is binary: if
+you asked for it, a wiring failure is fatal at startup**, because silently
+skipping leaves the cell's OPA sidecar serving a last-good bundle while
+password/tenant/catalog changes never propagate.
+
+- **The catalog is DuckLake and carries NO secret.** Per org:
+  `connector.name=ducklake`, `ducklake.metadata.connection-url` (a JDBC URL
+  whose `sslmode` follows the store kind — `disable` for in-cluster
+  `cnpg-shard`, `require` for `external` and any future kind),
+  `ducklake.metadata.connection-user`,
+  **`ducklake.metadata.connection-password-file`**, `ducklake.data-path`,
+  `fs.s3.enabled` (NOT `fs.native-s3.enabled` — that spelling was rejected at
+  CREATE CATALOG and cost a release), `s3.region`, `s3.auth-type=IAM_ROLE`,
+  `s3.iam-role` (the per-org duckling role: the tenant S3 boundary), and a
+  small `s3.max-connections`. Every value comes from the `ManagedWarehouse`
+  row's `metadata_store_*` / `s3_*` / `worker_identity_*` blocks. **Trino logs
+  the full `CREATE CATALOG` statement, renders catalog properties in its web
+  UI, and ships them to workers — a password in a property is readable by
+  anyone who can see a query listing.** Hence the file indirection; never add
+  `ducklake.metadata.connection-password`.
+- **Tenant passwords live in one Secret, keyed by org id**
+  (`TrinoTenantSecretName`, mounted at `TenantSecretMountPath`). The value is
+  read from the org's Duckling CR status (`credentialSecretRef`) through the
+  SAME resolver the worker activation path uses, so Trino and the DuckDB
+  workers can never authenticate a tenant's metadata store with two different
+  credentials. The projection is AUTHORITATIVE, not additive: a disabled org's
+  key is removed on the next tick.
+- **`Reconcile` order is load-bearing**: cluster secrets → auth files →
+  resource groups → OPA bundle → tenant passwords → catalogs, and the
+  `globalErr` gate SKIPS the catalog step if any projection failed. A
+  coordinator that just lost its `password.db` keys 401s every catalog REST
+  call, which would surface as a misleading "catalog reconcile failed" masking
+  the real problem.
+- **`ensureClusterSecrets` is write-once with a sentinel.** The K8s Secret is
+  the source of truth for each cluster credential; the configstore holds only
+  a one-bit `duckgres_trino_cluster_bootstrap` row per namespace. Missing
+  Secret + not bootstrapped ⇒ generate; missing Secret + already bootstrapped
+  ⇒ **fail loud**, because regenerating the env-projected
+  internal-communication shared secret would split-brain a running cluster.
+  The admin password/hash pair is the deliberate exception (no external
+  consumer ⇒ regenerate-if-missing self-heals).
+- **Catalog reconcile is `SHOW CATALOGS` first**: create only what's missing,
+  drop only names matching `opa.ManagedCatalogPattern` that aren't wanted, so
+  `system`, `jmx` and hand-made catalogs survive. An org whose password is
+  momentarily unresolvable keeps its existing catalog (never dropped) but is
+  NOT reported ready.
+- **Catalog naming is a THREE-way contract**: `TrinoCatalogName` (`org_` +
+  sanitized org id, no `_iceberg` suffix — warehouses are DuckLake),
+  `opa.ManagedCatalogPattern`, and the regex literal inside `policy.rego`.
+  `TestTrinoCatalogNameMatchesManagedNamePattern` +
+  `TestPolicyRegoContainsManagedNamePattern` fail if any one moves alone.
+- **The Rego policy is the tenant-isolation boundary.** The cell can assume
+  every per-org duckling role, so nothing below OPA stops org A reading org
+  B's catalog. Treat `provisioner/opa/policy.rego` as security review.
+  **Query visibility is same-org only**: `ViewQueryOwnedBy`,
+  `FilterViewQueryOwnedBy` and `KillQueryOwnedBy` (the plugin's exact
+  operation strings — the filter one is NOT `FilterViewQuery`) are allowed
+  only when the requester and the query OWNER share a bundle-known
+  `org_<sanitized>` group, derived from the same `data.group_catalogs`
+  ownership map every other decision uses. This matters because
+  `ExecuteQuery` is unconditionally allowed, so without it org A reads org
+  B's SQL text — table names, filter literals, customer identifiers — via
+  `system.runtime.queries` and the web UI, and can kill B's queries. The
+  owner arrives as `input.action.resource.user.{user,groups}` (an
+  `@JsonUnwrapped` `TrinoIdentity`); `ImpersonateUser` uses a different,
+  groups-less shape for the same field — do not conflate them. **The admin
+  principal deliberately gets NO cross-tenant query visibility** (only its
+  own queries): the reconcile loop issues only `SHOW`/`CREATE`/`DROP
+  CATALOG` and never reads `system.runtime.queries`, so the grant would buy
+  nothing and leak every tenant's SQL. `opa.policy.batched-uri` must NOT be
+  enabled without extending the policy — the batched input shape fails every
+  filter rule closed.
+- **Resource groups must keep the `root.admin.__admin_provisioner` selector.**
+  Trino rejects a query matching no resource group, so dropping it silently
+  breaks every reconcile tick's own DDL.
+- **Cells, minimally**: `trino_cell_id` on the row names the owning cell
+  (`DUCKGRES_TRINO_CELL_ID`, default `configstore.DefaultTrinoCellID`). A
+  provisioner claims unassigned orgs (`AssignTrinoCell`, conditional in SQL so
+  no cell can steal another's tenant), reconciles its own, and ignores the
+  rest — including writing NO state for them. There is exactly ONE cell today
+  and deliberately no assignment policy, capacity model, rebalancer or cell
+  drain; `resolveTrinoCell` becoming `resolveTrinoCells` is the whole shape of
+  adding a second.
+- **The bundle endpoint is mounted OUTSIDE `/api/v1`** (`/bundles/trino`) with
+  its own bearer auth, and `buildTrinoWiring` bootstraps SYNCHRONOUSLY so the
+  handler is constructed with the real token — there is no window where it
+  serves under a placeholder.
+- Touching any of this → update `provisioner/trino_provisioner_test.go`,
+  `provisioner/trino_cluster_secrets_test.go`, `provisioner/opa/*_test.go`,
+  `provisioning/api_test.go`, `tests/configstore/trino_postgres_test.go` +
+  `trino_cluster_secrets_test.go`, and the migration asserts in
+  `tests/configstore/migrations_postgres_test.go`. **There is no
+  `tests/mw-dev/e2e/harness.sh` coverage yet**, and that is a stated gap, not
+  an oversight: mw-dev runs no Trino cell, so there is nothing for the
+  in-cluster Job to talk to. The harness assertion (enable an org, poll the
+  row to `ready`, query the catalog as the org's `root`) lands with the chart
+  that deploys the cell.
+
 ## TODO Reference
 
 `TODO.md` is a lightweight backlog for ideas that do not yet have a better

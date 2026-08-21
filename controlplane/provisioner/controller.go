@@ -76,6 +76,12 @@ type Controller struct {
 	// the composition keeps deriving the name.
 	bucketSuffix string
 
+	// Trino-side reconcile dependency. Optional: if nil (the default in
+	// deployments without a Trino cell, or in tests that don't exercise
+	// the Trino path), the Trino reconcile step is skipped silently.
+	// See WithTrinoProvisioner.
+	trinoProvisioner *TrinoProvisioner
+
 	// cnpgShardFieldUnsupported latches when a cnpg-shard backfill read-back
 	// shows the API server pruned spec.metadataStore.cnpgShard — i.e. the
 	// cluster's Duckling XRD predates the field. Cluster-wide condition, so
@@ -127,6 +133,22 @@ func (c *Controller) DucklingClient() *DucklingClient {
 // chaining.
 func (c *Controller) WithBucketSuffix(suffix string) *Controller {
 	c.bucketSuffix = suffix
+	return c
+}
+
+// WithTrinoProvisioner enables the Trino reconcile branch. The Trino
+// reconcile runs once per controller tick — it doesn't iterate per-warehouse
+// like the warehouse branches do, because the Trino projection is a single
+// batched output (a handful of Secrets + one ConfigMap + one OPA bundle for
+// the whole cell).
+//
+// Skipped entirely if p is nil so deployments without a Trino cell don't
+// need to know about it.
+func (c *Controller) WithTrinoProvisioner(p *TrinoProvisioner) *Controller {
+	if p == nil {
+		panic("WithTrinoProvisioner: provisioner is nil; call NewTrinoProvisioner first")
+	}
+	c.trinoProvisioner = p
 	return c
 }
 
@@ -186,6 +208,16 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.reconcileFailed(ctx, &w)
 		case configstore.ManagedWarehouseStateDeleting:
 			c.reconcileDeleting(ctx, &w)
+		}
+	}
+
+	// Trino reconcile runs once per tick (not per warehouse) — the
+	// projection is a single batched output for the cell. Errors are
+	// logged but don't block other reconcile branches; the next tick
+	// re-runs everything.
+	if c.trinoProvisioner != nil && ctx.Err() == nil {
+		if err := c.trinoProvisioner.Reconcile(ctx); err != nil {
+			slog.Warn("Trino provisioner reconcile failed.", "error", err)
 		}
 	}
 }
