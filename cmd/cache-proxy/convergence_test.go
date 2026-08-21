@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -177,5 +179,218 @@ func TestAdmissionStillEnforcesHardByteCapacityAcrossSmallVictims(t *testing.T) 
 	}
 	if cache.currentSize > cache.maxBytes {
 		t.Fatalf("accepted cache entry left bytes above capacity: %d > %d", cache.currentSize, cache.maxBytes)
+	}
+}
+
+func TestConvergenceBlockedUnlinkDoesNotBlockCacheOrCanceledClose(t *testing.T) {
+	victim := strings.Repeat("1", 64)
+	recent := strings.Repeat("2", 64)
+	cache, permits := newSoftConvergenceCache(t, 1, []string{victim, recent})
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseDelete := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseDelete)
+	cache.removeFile = func(path string) error {
+		if filepath.Base(path) != victim {
+			return os.Remove(path)
+		}
+		started <- struct{}{}
+		<-release
+		return os.Remove(path)
+	}
+
+	beforeEvictions := counterValue(t, cacheEvictionsTotal)
+	beforeByReason := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonEntry)
+	allowConvergence(t, permits)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("convergence did not reach the blocked removal")
+	}
+
+	hasReturned := make(chan bool, 1)
+	go func() { hasReturned <- cache.Has(recent) }()
+	closeCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	closeReturned := make(chan error, 1)
+	go func() { closeReturned <- cache.Close(closeCtx) }()
+
+	select {
+	case hasRecent := <-hasReturned:
+		if !hasRecent {
+			t.Error("unrelated cache operation lost its resident entry during a blocked unlink")
+		}
+	case <-time.After(time.Second):
+		t.Error("cache operation blocked behind convergence unlink")
+	}
+	select {
+	case err := <-closeReturned:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Close with canceled context = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Error("Close with canceled context blocked behind convergence unlink")
+	}
+
+	releaseDelete()
+	select {
+	case <-cache.convergenceDone:
+	case <-time.After(time.Second):
+		t.Error("convergence worker did not finish after unlink release")
+	}
+	if cache.Has(victim) {
+		t.Error("successful in-flight convergence deletion left the victim indexed")
+	}
+	if got := counterValue(t, cacheEvictionsTotal) - beforeEvictions; got != 1 {
+		t.Errorf("successful blocked convergence evictions = %v, want 1", got)
+	}
+	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonEntry) - beforeByReason; got != 1 {
+		t.Errorf("successful blocked convergence entry evictions = %v, want 1", got)
+	}
+}
+
+func TestConvergenceInFlightVictimAdmissionDoesNotRaceUnlink(t *testing.T) {
+	victim := strings.Repeat("3", 64)
+	recent := strings.Repeat("4", 64)
+	cache, permits := newSoftConvergenceCache(t, 1, []string{victim, recent})
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	removed := make(chan error, 1)
+	var releaseOnce sync.Once
+	releaseDelete := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseDelete)
+	cache.removeFile = func(path string) error {
+		if filepath.Base(path) != victim {
+			return os.Remove(path)
+		}
+		started <- struct{}{}
+		<-release
+		err := os.Remove(path)
+		removed <- err
+		return err
+	}
+
+	allowConvergence(t, permits)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("convergence did not reach the blocked removal")
+	}
+
+	admission := make(chan error, 1)
+	go func() {
+		_, err := cache.PutStream(victim, strings.NewReader("replacement"))
+		admission <- err
+	}()
+	var admissionErr error
+	admissionReturned := false
+	select {
+	case admissionErr = <-admission:
+		admissionReturned = true
+	case <-time.After(time.Second):
+		t.Error("replacement/new admission blocked behind in-flight victim unlink")
+	}
+	if admissionReturned {
+		body, err := os.ReadFile(filepath.Join(cache.dir, victim))
+		if err != nil {
+			t.Errorf("in-flight admission changed victim path before unlink release: %v", err)
+		} else if admissionErr == nil && string(body) != "replacement" {
+			t.Errorf("accepted in-flight replacement body = %q, want replacement", body)
+		} else if admissionErr != nil && string(body) != "x" {
+			t.Errorf("rejected in-flight replacement changed body to %q, want original", body)
+		}
+	}
+
+	releaseDelete()
+	select {
+	case err := <-removed:
+		if err != nil {
+			t.Fatalf("release blocked convergence unlink: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked convergence unlink did not finish")
+	}
+	if !admissionReturned {
+		admissionErr = <-admission
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := cache.Close(ctx); err != nil {
+		t.Fatalf("stop convergence after unlink release: %v", err)
+	}
+	if admissionErr == nil {
+		body, err := os.ReadFile(filepath.Join(cache.dir, victim))
+		if err != nil || string(body) != "replacement" || !cache.Has(victim) {
+			t.Fatalf("accepted replacement raced with old unlink: body=%q err=%v indexed=%t", body, err, cache.Has(victim))
+		}
+	}
+}
+
+func TestConvergenceHardFailureKeepsVictimIndexedAndRetryable(t *testing.T) {
+	victim := strings.Repeat("5", 64)
+	recent := strings.Repeat("6", 64)
+	cache, permits := newSoftConvergenceCache(t, 1, []string{victim, recent})
+
+	firstStarted := make(chan struct{}, 1)
+	firstRelease := make(chan struct{})
+	firstReturned := make(chan struct{}, 1)
+	secondStarted := make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	releaseFirst := func() { releaseOnce.Do(func() { close(firstRelease) }) }
+	t.Cleanup(releaseFirst)
+	forcedFailure := errors.New("forced convergence removal failure")
+	attempt := 0
+	cache.removeFile = func(path string) error {
+		if filepath.Base(path) != victim {
+			return errors.New("convergence selected an unexpected victim")
+		}
+		attempt++
+		if attempt == 1 {
+			firstStarted <- struct{}{}
+			<-firstRelease
+			firstReturned <- struct{}{}
+			return forcedFailure
+		}
+		secondStarted <- struct{}{}
+		return os.Remove(path)
+	}
+
+	beforeFailures := counterValue(t, cacheConvergenceEvictionFailuresTotal)
+	allowConvergence(t, permits)
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("convergence did not reach the first blocked removal")
+	}
+	releaseFirst()
+	select {
+	case <-firstReturned:
+	case <-time.After(time.Second):
+		t.Fatal("blocked convergence removal did not return its forced failure")
+	}
+	if !cache.Has(victim) {
+		t.Fatal("failed in-flight deletion removed the victim from the index")
+	}
+	if _, err := os.Stat(filepath.Join(cache.dir, victim)); err != nil {
+		t.Fatalf("failed in-flight deletion removed the original body: %v", err)
+	}
+
+	// The second permit can be received only once the first convergence attempt
+	// has finalized. Its successful retry proves a failed reservation was cleared.
+	allowConvergence(t, permits)
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("hard failure left the victim permanently in flight")
+	}
+	waitForCacheEntryCount(t, cache, 1)
+	if cache.Has(victim) {
+		t.Fatal("successful retry did not remove the formerly failed victim")
+	}
+	if got := counterValue(t, cacheConvergenceEvictionFailuresTotal) - beforeFailures; got != 1 {
+		t.Fatalf("convergence failures = %v, want 1", got)
 	}
 }

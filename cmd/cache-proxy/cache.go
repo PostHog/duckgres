@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -187,11 +188,15 @@ type DiskCache struct {
 	recency         *recencyWriter
 	recencyNow      func() time.Time
 	recencyInterval time.Duration
+	// commitMu linearizes the short final rename/accounting/recency commit with
+	// shutdown without coupling lifecycle progress to a potentially blocking
+	// pressure-driven unlink under mu.
+	commitMu sync.Mutex
 
 	convergenceCancel context.CancelFunc
 	convergenceDone   chan struct{}
 	convergenceWake   chan struct{}
-	closing           bool
+	closing           atomic.Bool
 }
 
 const defaultCacheMaxEntries = 1_000_000
@@ -226,6 +231,7 @@ type cacheEntry struct {
 	size                 int64
 	lastAccess           time.Time
 	lastPersistedRecency time.Time
+	evictionInFlight     bool
 }
 
 // NewDiskCache creates a cache backed by the given directory.
@@ -353,16 +359,19 @@ type DiskCacheOptions struct {
 // Close stops background convergence and drains accepted durable-recency work
 // until ctx expires. It is safe to call more than once.
 func (c *DiskCache) Close(ctx context.Context) error {
+	c.closing.Store(true)
 	if c.convergenceCancel != nil {
 		c.convergenceCancel()
 	}
-	c.mu.Lock()
-	c.closing = true
+	// A commit that already passed its closing check publishes its recency intent
+	// before writer admission closes. Eviction syscalls never hold this gate, so
+	// shutdown is not trapped behind a stalled unlink.
+	c.commitMu.Lock()
 	var recencyDone <-chan struct{}
 	if c.recency != nil {
 		recencyDone = c.recency.beginClose()
 	}
-	c.mu.Unlock()
+	c.commitMu.Unlock()
 	if c.convergenceDone != nil {
 		select {
 		case <-c.convergenceDone:
@@ -569,39 +578,36 @@ func removeTemporaryTreeWith(ctx context.Context, path string, openDir openCache
 		return 1, nil
 	}
 
-	dir, err := openDir(path)
-	if err != nil {
-		return 0, err
-	}
 	removed := 0
 	for {
 		if err := ctx.Err(); err != nil {
-			_ = dir.Close()
+			return 0, err
+		}
+		dir, err := openDir(path)
+		if err != nil {
 			return 0, err
 		}
 		entries, readErr := dir.ReadDir(startupScanChunkSize)
+		closeErr := dir.Close()
 		if err := ctx.Err(); err != nil {
-			_ = dir.Close()
 			return 0, err
+		}
+		if closeErr != nil {
+			return 0, closeErr
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return 0, readErr
+		}
+		if len(entries) == 0 {
+			break
 		}
 		for _, entry := range entries {
 			count, err := removeTemporaryTreeWith(ctx, filepath.Join(path, entry.Name()), openDir)
 			if err != nil {
-				_ = dir.Close()
 				return 0, err
 			}
 			removed += count
 		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			_ = dir.Close()
-			return 0, readErr
-		}
-	}
-	if err := dir.Close(); err != nil {
-		return 0, err
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -651,10 +657,7 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	if !IsValidCacheKey(key) {
 		return 0, fmt.Errorf("invalid cache key")
 	}
-	c.mu.Lock()
-	closing := c.closing
-	c.mu.Unlock()
-	if closing {
+	if c.closing.Load() {
 		return 0, errors.New("cache is closed for writes")
 	}
 	tmp, err := os.CreateTemp(filepath.Join(c.dir, tmpSubdir), key+"-*")
@@ -682,7 +685,7 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	// commit. Streaming happened above without this lock; only the short rename
 	// syscall is serialized so eviction cannot delete the replacement in between.
 	c.mu.Lock()
-	if c.closing {
+	if c.closing.Load() {
 		c.mu.Unlock()
 		_ = os.Remove(tmpPath)
 		return 0, errors.New("cache is closed for writes")
@@ -701,7 +704,15 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 			return 0, errors.New("admit cache entry: required eviction failed")
 		}
 	}
+	c.commitMu.Lock()
+	if c.closing.Load() {
+		c.commitMu.Unlock()
+		c.mu.Unlock()
+		_ = os.Remove(tmpPath)
+		return 0, errors.New("cache is closed for writes")
+	}
 	if err := renameFile(tmpPath, path); err != nil {
+		c.commitMu.Unlock()
 		c.mu.Unlock()
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("commit cache entry: %w", err)
@@ -722,6 +733,7 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	} else {
 		c.addLocked(key, size)
 	}
+	c.commitMu.Unlock()
 	c.mu.Unlock()
 
 	return size, nil
@@ -848,23 +860,37 @@ func (c *DiskCache) addLocked(key string, size int64) {
 // LRU entry by construction: adds and touches always move entries to the
 // back, and scanExisting seeds the list in recency order.
 func (c *DiskCache) evictOldest(phase cacheEvictionPhase, reason cacheEvictionReason) error {
-	front := c.order.Front()
+	front := c.oldestEvictableLocked()
 	if front == nil {
-		return nil
+		return errors.New("no cache entry available for eviction")
 	}
 	oldest := front.Value.(*cacheEntry)
 	path := filepath.Join(c.dir, oldest.key)
 	if _, err := c.removeCommittedFile(path, phase, reason); err != nil {
 		return err
 	}
-	c.currentSize -= oldest.size
-	c.order.Remove(front)
-	delete(c.index, oldest.key)
+	c.forgetEntryLocked(front)
+	return nil
+}
+
+func (c *DiskCache) oldestEvictableLocked() *list.Element {
+	for candidate := c.order.Front(); candidate != nil; candidate = candidate.Next() {
+		if !candidate.Value.(*cacheEntry).evictionInFlight {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func (c *DiskCache) forgetEntryLocked(element *list.Element) {
+	entry := element.Value.(*cacheEntry)
+	c.currentSize -= entry.size
+	c.order.Remove(element)
+	delete(c.index, entry.key)
 	if c.summary != nil {
-		c.summary.Remove(oldest.key)
+		c.summary.Remove(entry.key)
 	}
 	c.updateStateMetricsLocked()
-	return nil
 }
 
 func (c *DiskCache) makeRoomForNewEntryLocked(size int64, phase cacheEvictionPhase) bool {
@@ -891,6 +917,9 @@ func (c *DiskCache) makeRoomForNewEntryLocked(size int64, phase cacheEvictionPha
 
 func (c *DiskCache) makeRoomForReplacementLocked(replacement *list.Element, size int64, phase cacheEvictionPhase) bool {
 	entry := replacement.Value.(*cacheEntry)
+	if entry.evictionInFlight {
+		return false
+	}
 	// Protect the entry being replaced from eviction. If reservation or rename
 	// fails, its old committed body and accounting remain usable.
 	c.order.MoveToBack(replacement)

@@ -392,6 +392,71 @@ func TestTemporaryCleanupChecksCancellationBetweenDirectoryChunks(t *testing.T) 
 	}
 }
 
+// oneBatchTemporaryDirectory models the unstable directory offset that can
+// result after entries returned by ReadDir are removed. Reusing the handle
+// appears exhausted, while reopening the directory exposes the next batch.
+type oneBatchTemporaryDirectory struct {
+	entries []os.DirEntry
+	read    bool
+}
+
+func (d *oneBatchTemporaryDirectory) ReadDir(int) ([]os.DirEntry, error) {
+	if d.read || len(d.entries) == 0 {
+		return nil, io.EOF
+	}
+	d.read = true
+	return d.entries, nil
+}
+
+func (d *oneBatchTemporaryDirectory) Close() error { return nil }
+
+func TestTemporaryCleanupReopensAfterDeletingFullChunk(t *testing.T) {
+	tmpDir := filepath.Join(t.TempDir(), tmpSubdir)
+	if err := os.Mkdir(tmpDir, 0o750); err != nil {
+		t.Fatalf("create cache temp directory: %v", err)
+	}
+	for i := 0; i < startupScanChunkSize+1; i++ {
+		path := filepath.Join(tmpDir, fmt.Sprintf("interrupted-%04d", i))
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatalf("write temporary file %d: %v", i, err)
+		}
+	}
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("read temporary fixtures: %v", err)
+	}
+
+	opens := 0
+	open := func(path string) (cacheDirectory, error) {
+		if path != tmpDir {
+			return nil, fmt.Errorf("unexpected directory open %q", path)
+		}
+		opens++
+		switch opens {
+		case 1:
+			return &oneBatchTemporaryDirectory{entries: entries[:startupScanChunkSize]}, nil
+		case 2:
+			return &oneBatchTemporaryDirectory{entries: entries[startupScanChunkSize:]}, nil
+		default:
+			return &oneBatchTemporaryDirectory{}, nil
+		}
+	}
+
+	removed, err := removeTemporaryTreeWith(context.Background(), tmpDir, open)
+	if err != nil {
+		t.Fatalf("cleanup with invalidated directory offset: %v (directory opens: %d)", err, opens)
+	}
+	if removed != len(entries) {
+		t.Fatalf("temporary files removed = %d, want %d", removed, len(entries))
+	}
+	if opens < 2 {
+		t.Fatalf("temporary cleanup opened directory %d time, want a reopen after the first full batch", opens)
+	}
+	if _, err := os.Stat(tmpDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary directory remains after cleanup: %v", err)
+	}
+}
+
 func TestStartupLargeSparseDirectoryKeepsBoundedNewestSet(t *testing.T) {
 	if testing.Short() {
 		t.Skip("large sparse-directory restart coverage")

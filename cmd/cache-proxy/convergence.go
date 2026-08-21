@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -95,11 +97,35 @@ func (c *DiskCache) convergeOne() (bool, bool) {
 		c.mu.Unlock()
 		return false, true
 	}
+	victimElement := c.oldestEvictableLocked()
+	if victimElement == nil {
+		c.updateConvergenceMetricsLocked()
+		c.mu.Unlock()
+		return true, false
+	}
+	victim := victimElement.Value.(*cacheEntry)
+	victim.evictionInFlight = true
+	victimPath := filepath.Join(c.dir, victim.key)
 	cacheConvergenceEvictionAttemptsTotal.Inc()
-	succeeded := true
-	if err := c.evictOldest(cacheEvictionPhaseBackground, reason); err != nil {
+	c.mu.Unlock()
+
+	_, removeErr := c.removeCommittedFile(victimPath, cacheEvictionPhaseBackground, reason)
+
+	c.mu.Lock()
+	currentElement, stillIndexed := c.index[victim.key]
+	sameEntry := stillIndexed && currentElement == victimElement
+	succeeded := removeErr == nil && sameEntry
+	switch {
+	case removeErr != nil:
+		if sameEntry {
+			victim.evictionInFlight = false
+		}
 		cacheConvergenceEvictionFailuresTotal.Inc()
-		succeeded = false
+	case !sameEntry:
+		cacheConvergenceEvictionFailuresTotal.Inc()
+		slog.Error("Cache convergence victim changed during deletion.", "key", victim.key)
+	default:
+		c.forgetEntryLocked(victimElement)
 	}
 	c.updateConvergenceMetricsLocked()
 	_, stillOver := c.overLimitReasonLocked()
