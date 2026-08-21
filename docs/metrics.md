@@ -268,16 +268,19 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_peer_probes_skipped_total` | Counter | None | Summary-mode confirmations skipped because the pod-wide active `/cache/has` HTTP-request/socket budget was exhausted; those requests fall back to origin without queuing. This budget does not count total process goroutines. |
 | `cache_proxy_summary_pulls_total` | Counter | `outcome` | Receiver-driven `GET /cache/summary` attempts by outcome, including success, not-modified, timeout, rejection, and size/read failures. |
 | `cache_proxy_summary_serves_total` | Counter | `outcome` | Local summary endpoint and snapshot-build outcomes. |
-| `cache_proxy_summary_resident_count` | Gauge | None | Current retained peer summaries. |
-| `cache_proxy_summary_resident_bytes` | Gauge | None | Conservative total Bloom-state accounting: the fixed local counting filter, maximum snapshot/pull transient reserve, and retained remote summary bits. This is reserved/accounted memory, not measured process RSS. It is `0` outside summary mode. |
-| `cache_proxy_summary_memory_limit_bytes` | Gauge | None | Effective `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` ceiling used for the total Bloom-state accounting above. It is `0` outside summary mode. Alert when resident bytes approach this value. |
+| `cache_proxy_summary_selected_peers` | Gauge | None | Deterministic peer prefix selected for summary pulls after conservatively charging each peer at the largest accepted dynamic bitset. |
+| `cache_proxy_summary_resident_count` | Gauge | None | Current retained peer summary records, including expired records awaiting membership-refresh pruning. |
+| `cache_proxy_summary_valid_resident_peers` | Gauge | None | Retained peer summaries whose advertised TTL has not expired. Compare with selected peers to measure current usable coverage. |
+| `cache_proxy_summary_resident_bytes` | Gauge | None | Conservative total Bloom-state accounting: the current fixed or dynamic local counting filter, maximum v3 snapshot/pull transient reserve, and actual retained remote summary bits. This is reserved/accounted memory, not measured process RSS. It is `0` outside summary mode. |
+| `cache_proxy_summary_memory_limit_bytes` | Gauge | None | Effective `min(1 GiB, 20% of GOMEMLIMIT, optional explicit emergency ceiling)` used for total Bloom-state accounting. It is `0` outside summary mode. Alert when resident bytes approach this value. |
 | `cache_proxy_summary_age_seconds` | Histogram | None | Age of summaries used in local Bloom lookups. |
 | `cache_proxy_summary_lookups_total` | Counter | `outcome` | `no_valid_summary`, `no_positive`, or `positive_candidate`. |
 | `cache_proxy_summary_confirmed_gets_total` | Counter | `outcome` | Peer body GET outcomes in summary mode. A GET is attempted only after an exact bounded `/cache/has` confirmation. |
 | `cache_proxy_summary_bloom_items` | Gauge | None | Local live cache keys represented by the incrementally maintained counting Bloom filter. |
-| `cache_proxy_summary_bloom_bits` / `cache_proxy_summary_bloom_hashes` | Gauge | None | Fixed Bloom-filter layout, sized for 1m keys at a 1% target false-positive rate. |
-| `cache_proxy_summary_bloom_false_positive_ratio` | Gauge | None | Predicted per-peer false-positive ratio from live item count and filter layout. This rises smoothly after 1m keys; use fleet size to interpret aggregate request cost. |
-| `cache_proxy_summary_bloom_saturated` | Gauge | None | `1` when the local live key count exceeds the 1m target capacity; snapshot refresh and serving continue. |
+| `cache_proxy_summary_bloom_design_items` | Gauge | None | Entry count used to derive the current local Bloom dimensions at the 1% target FPR: 1m in fixed mode or disk-derived in dynamic mode. |
+| `cache_proxy_summary_bloom_bits` / `cache_proxy_summary_bloom_hashes` | Gauge | None | Current fixed or disk-derived Bloom-filter layout. |
+| `cache_proxy_summary_bloom_false_positive_ratio` | Gauge | None | Predicted per-peer false-positive ratio from live item count and the current filter layout. Use fleet size to interpret aggregate request cost. |
+| `cache_proxy_summary_bloom_saturated` | Gauge | None | `1` when the local live key count exceeds the current design-item count; snapshot refresh and serving continue. |
 | `cache_proxy_summary_bloom_bit_occupancy_ratio` | Gauge | None | Fraction of local Bloom bits set; a direct saturation signal independent of the FPR estimate. |
 | `cache_proxy_summary_bloom_additions_total` / `cache_proxy_summary_bloom_removals_total` | Counter | None | Cache commits and evictions applied incrementally to the local Bloom index. |
 | `cache_proxy_summary_bloom_counter_saturations_total` | Counter | None | Counting-Bloom cells that reached `uint16` saturation and were made sticky to avoid false negatives. |

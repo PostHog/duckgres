@@ -60,6 +60,8 @@ type SummaryConfig struct {
 	PeerMaxProbes         int
 	MaxPeerProbesInFlight int
 	MemoryLimitBytes      int64
+	PublishFormat         summaryPublishFormat
+	LocalBloom            bloomCapacity
 }
 
 // PeerManager discovers and communicates with cache proxy peers
@@ -77,6 +79,12 @@ type PeerManager struct {
 	probePermits              chan struct{}
 	summaryMemoryLimitBytes   int64
 	summaryRemoteMemoryBudget int
+	summaryMemoryReserveBytes int64
+	summarySelectionBytes     int
+	summaryPublishFormat      summaryPublishFormat
+	localBloomCapacity        bloomCapacity
+	summaryGaugeMu            sync.Mutex
+	summaryGaugeSnapshotHook  func()
 
 	summaries         summaryStore
 	summaryMu         sync.Mutex // protects the current local summary and ETag
@@ -97,6 +105,7 @@ type PeerManager struct {
 }
 
 func NewPeerManager(serviceName, peerPort string) *PeerManager {
+	localBloom := fixedSummaryBloomCapacity()
 	return &PeerManager{
 		serviceName: serviceName,
 		peerPort:    peerPort,
@@ -129,7 +138,11 @@ func NewPeerManager(serviceName, peerPort string) *PeerManager {
 		peerMaxProbes:             defaultPeerMaxProbes,
 		probePermits:              make(chan struct{}, defaultMaxPeerProbesInFlight),
 		summaryMemoryLimitBytes:   defaultSummaryMemoryLimitBytes,
-		summaryRemoteMemoryBudget: summaryRemoteMemoryBudget(defaultSummaryMemoryLimitBytes),
+		summaryRemoteMemoryBudget: summaryRemoteMemoryBudget(defaultSummaryMemoryLimitBytes, localBloom),
+		summaryMemoryReserveBytes: summaryMemoryReserveBytes(localBloom),
+		summarySelectionBytes:     int(maxAcceptedSummaryBloomCapacity().BitCount / 8),
+		summaryPublishFormat:      summaryPublishFixed,
+		localBloomCapacity:        localBloom,
 		summaries:                 summaryStore{records: make(map[string]summaryRecord)},
 		membershipChanged:         make(chan struct{}, 1),
 	}
@@ -138,6 +151,16 @@ func NewPeerManager(serviceName, peerPort string) *PeerManager {
 func (pm *PeerManager) ConfigureSummary(mode peerLookupMode, identity string, config SummaryConfig) {
 	pm.lookupMode = mode
 	pm.identity = identity
+	if config.PublishFormat == summaryPublishDynamic {
+		pm.summaryPublishFormat = summaryPublishDynamic
+	} else {
+		pm.summaryPublishFormat = summaryPublishFixed
+	}
+	if validSummaryBloomCapacity(config.LocalBloom) {
+		pm.localBloomCapacity = config.LocalBloom
+	} else {
+		pm.localBloomCapacity = fixedSummaryBloomCapacity()
+	}
 	if config.PeerMaxProbes > 0 {
 		pm.peerMaxProbes = config.PeerMaxProbes
 	}
@@ -146,8 +169,9 @@ func (pm *PeerManager) ConfigureSummary(mode peerLookupMode, identity string, co
 	}
 	if config.MemoryLimitBytes > 0 {
 		pm.summaryMemoryLimitBytes = config.MemoryLimitBytes
-		pm.summaryRemoteMemoryBudget = summaryRemoteMemoryBudget(config.MemoryLimitBytes)
 	}
+	pm.summaryMemoryReserveBytes = summaryMemoryReserveBytes(pm.localBloomCapacity)
+	pm.summaryRemoteMemoryBudget = summaryRemoteMemoryBudget(pm.summaryMemoryLimitBytes, pm.localBloomCapacity)
 	pm.updateSummaryGauges()
 }
 
@@ -258,7 +282,7 @@ func (pm *PeerManager) selectSummaryPeers(peers []string) []string {
 	if pm.lookupMode != peerLookupSummary || pm.summaryRemoteMemoryBudget <= 0 {
 		return nil
 	}
-	maxPeers := pm.summaryRemoteMemoryBudget / int(summaryBloomBits/8)
+	maxPeers := pm.summaryRemoteMemoryBudget / pm.summarySelectionBytes
 	if maxPeers <= 0 {
 		return nil
 	}
@@ -334,21 +358,44 @@ func (pm *PeerManager) receivePulledSummary(sender string, body []byte, etag str
 }
 
 func (pm *PeerManager) updateSummaryGauges() {
+	// Pull workers complete concurrently. Serialize snapshot-through-publication
+	// so an older snapshot cannot overwrite a newer one.
+	pm.summaryGaugeMu.Lock()
+	defer pm.summaryGaugeMu.Unlock()
 	pm.summaries.mu.RLock()
 	n, b := len(pm.summaries.records), pm.summaries.bytes
+	valid := 0
+	now := time.Now()
+	for _, record := range pm.summaries.records {
+		if time.Unix(0, record.summary.ExpiresNS).After(now) {
+			valid++
+		}
+	}
 	pm.summaries.mu.RUnlock()
 	accountedBytes := int64(0)
 	effectiveLimit := int64(0)
 	if pm.lookupMode == peerLookupSummary {
-		// The ceiling reserves the fixed local counting Bloom plus the maximum
+		// The ceiling reserves the current local counting Bloom plus the maximum
 		// concurrent snapshot/pull working set before admitting remote summaries.
 		// Report that same conservative accounting so resident/limit is alertable.
-		accountedBytes = summaryMemoryReserveBytes() + int64(b)
+		accountedBytes = pm.summaryMemoryReserveBytes + int64(b)
 		effectiveLimit = pm.summaryMemoryLimitBytes
 	} else {
 		n = 0
+		valid = 0
 	}
+	pm.mu.RLock()
+	selected := len(pm.summaryPeers)
+	pm.mu.RUnlock()
+	if pm.lookupMode != peerLookupSummary {
+		selected = 0
+	}
+	if pm.summaryGaugeSnapshotHook != nil {
+		pm.summaryGaugeSnapshotHook()
+	}
+	summarySelectedPeers.Set(float64(selected))
 	summaryResidentCount.Set(float64(n))
+	summaryValidResidentPeers.Set(float64(valid))
 	summaryResidentBytes.Set(float64(accountedBytes))
 	summaryMemoryLimitBytes.Set(float64(effectiveLimit))
 }
@@ -435,12 +482,30 @@ func (pm *PeerManager) StopSummarySynchronizer() {
 }
 
 func (pm *PeerManager) buildLocalSummary(store *DiskCache) {
-	_, bits, ok := store.SummarySnapshot()
+	items, bits, ok := store.SummarySnapshot()
 	if !ok {
 		summaryServesTotal.WithLabelValues("summary_index_unavailable").Inc()
 		return
 	}
-	s, err := newIncrementalCacheSummary(bits, time.Now(), defaultSummaryTTL)
+	capacity := store.SummaryBloomCapacity()
+	var s *cacheSummary
+	var err error
+	switch pm.summaryPublishFormat {
+	case summaryPublishFixed:
+		if capacity != fixedSummaryBloomCapacity() {
+			err = errors.New("fixed summary publisher requires the fixed local Bloom layout")
+		} else {
+			s, err = newIncrementalCacheSummary(bits, time.Now(), defaultSummaryTTL)
+		}
+	case summaryPublishDynamic:
+		if capacity != pm.localBloomCapacity {
+			err = errors.New("dynamic summary publisher local Bloom layout mismatch")
+		} else {
+			s, err = newDynamicCacheSummary(items, capacity, bits, time.Now(), defaultSummaryTTL)
+		}
+	default:
+		err = errors.New("invalid summary publisher format")
+	}
 	if err != nil {
 		summaryServesTotal.WithLabelValues("build_error").Inc()
 		return
@@ -569,6 +634,10 @@ func (pm *PeerManager) advancePullOffset(start, submitted, peerCount int) {
 }
 
 func (pm *PeerManager) pullSummary(ctx context.Context, peer string) {
+	// Valid-resident coverage depends on wall time even when every pull fails.
+	// Refresh it on every completion so transport/DNS degradation cannot leave
+	// an expired summary reported as valid indefinitely.
+	defer pm.updateSummaryGauges()
 	ctx, cancel := context.WithTimeout(ctx, summaryPullTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+peer+"/cache/summary", nil)

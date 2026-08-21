@@ -14,14 +14,15 @@ available, and forwards cache misses to origin object storage.
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` preserves the existing fleet-wide `/cache/has` behavior. `summary` pulls Bloom-filter hints and uses them to eliminate definite-negative peers before bounded `/cache/has` confirmation; any other value causes startup to fail. |
-| `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Total local Bloom-state budget: counting filter, snapshot and pull-work reserve, and a deterministic receiver-selected subset of remote peer summaries. Peers that do not fit remain uncovered. |
+| `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | unset | Optional emergency ceiling for total Bloom state. The effective default is `min(1 GiB, 20% of GOMEMLIMIT)`; an explicit value can lower, but never raise, that derived ceiling. It includes the local counting filter, snapshot/pull reserves, and retained remote summaries. |
+| `CACHE_SUMMARY_PUBLISH_FORMAT` | `fixed` | `fixed` publishes the legacy v2 1M-entry layout during receiver rollout. `dynamic` atomically selects a disk-derived local counting layout and publishes self-describing v3 summaries. Unknown values fail startup. Change only after every receiver is dual-format compatible. |
 | `CACHE_PEER_MAX_PROBES_PER_REQUEST` | `5` | In summary mode, maximum parallel `/cache/has` confirmations per client request across all missing blocks. `CACHE_PEER_MAX_PROBES` is a deprecated alias. |
 | `CACHE_MAX_CONCURRENT_PEER_PROBES` | `64` | Per-pod non-blocking cap on active summary-mode `/cache/has` HTTP requests and sockets. It is not a process goroutine limit. When exhausted, confirmations are skipped and the request fetches origin. `CACHE_MAX_PEER_PROBES_IN_FLIGHT` is a deprecated alias. |
 | `CACHE_PROXY_ID` | pod name, node name, then hostname | Stable opaque receiver identity used for deterministic peer-summary selection; it must not be a customer or object identifier. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
 | `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. |
 | `CACHE_BLOCK_MODE` | `off` | `on` enables block-aligned caching; any other value (including unset) keeps the legacy exact-range path. See [Block-aligned mode](#block-aligned-mode). |
-| `CACHE_BLOCK_SIZE_BYTES` | `8388608` (8 MiB) | Fixed block size for block-aligned mode. Ignored when block mode is off. |
+| `CACHE_BLOCK_SIZE_BYTES` | `8388608` (8 MiB) | Fixed block size for block-aligned mode. When block mode is off, it remains the planning estimate used to derive dynamic Bloom capacity. |
 | `CACHE_BLOCK_MAX_SPAN_BLOCKS` | `8` | Max blocks coalesced into one origin range fetch. Ignored when block mode is off. |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `DUCKGRES_TRACE_ENDPOINT` | empty | OTLP/HTTP trace endpoint. Unset → tracing is a no-op. |
 | `OTEL_EXPORTER_OTLP_TRACES_PATH` | empty | Overrides the OTLP path (e.g. VictoriaTraces' `/insert/opentelemetry/v1/traces`). Mirrors the main duckgres binary. |
@@ -109,11 +110,22 @@ later rollout that can grow caches beyond the compatibility soft target.
 
 Set `CACHE_PEER_LOOKUP_MODE=summary` only after deploying an image containing
 the summary endpoint to every cache-proxy pod. Each proxy incrementally tracks
-its local entries in a fixed counting Bloom filter and periodically exposes an
-immutable snapshot through `GET /cache/summary`. Receivers pull only the
-deterministic peer subset that fits `CACHE_SUMMARY_MEMORY_LIMIT_BYTES`.
+its local entries in a counting Bloom filter and periodically exposes an
+immutable snapshot through `GET /cache/summary`. Receivers accept both the
+legacy fixed v2 wire representation and the self-describing dynamic v3
+representation. Before pulling, each receiver chooses a deterministic peer
+prefix charged conservatively at the largest accepted v3 bitset; actual
+decoded bitsets are admitted against the remaining memory budget.
 Probe-mode pods do not build or serve summaries, so a canary starts with
 partial coverage and uses the bounded fallback while snapshots converge.
+
+The publisher remains `fixed` by default. First deploy dual-format receivers
+everywhere with that default. After the cache-proxy memory/GOMEMLIMIT rollout
+is complete, set `CACHE_SUMMARY_PUBLISH_FORMAT=dynamic`; the same setting
+selects the disk-derived local counting layout and v3 publisher together, so a
+dynamic index can never be mislabeled as v2. A restart rebuilds the selected
+layout from the bounded exact cache index without deleting cache bodies.
+Rollback the publisher by restoring `fixed`; receivers remain dual-format.
 
 Bloom filters are used only to eliminate definite negatives. Bloom-positive
 and not-yet-covered peers remain candidates and must pass an exact, bounded
@@ -130,9 +142,10 @@ cold-key fleet-wide deduplication for bounded request-time work.
 
 Roll out in non-production, monitor summary coverage and memory, confirmation
 amplification, confirmed GET usefulness, and origin latency/bytes, then enable
-gradually. Roll back by restoring `CACHE_PEER_LOOKUP_MODE=probe`; cache contents
-do not need deletion. The authoritative protocol, sizing model, failure table,
-rollout procedure, and runbook are in
+gradually. Roll back lookup independently by restoring
+`CACHE_PEER_LOOKUP_MODE=probe`; cache contents do not need deletion. The
+authoritative protocol, sizing model, failure table, rollout procedure, and
+runbook are in
 [the pulled-summary design](../../docs/design/cache-proxy-pulled-summary-lookup.md).
 
 In `probe` mode, when several nodes want the same key at the same moment, the

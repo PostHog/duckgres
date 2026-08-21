@@ -21,6 +21,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -100,7 +101,16 @@ func main() {
 		slog.Error("Invalid cache entry limit.", "error", err)
 		return
 	}
-	summaryMemoryLimit := envInt64("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", defaultSummaryMemoryLimitBytes)
+	summaryMemoryLimit, err := configuredSummaryMemoryLimit(debug.SetMemoryLimit(-1))
+	if err != nil {
+		slog.Error("Invalid summary memory limit.", "error", err)
+		return
+	}
+	summaryPublishFormat, err := parseSummaryPublishFormat(os.Getenv("CACHE_SUMMARY_PUBLISH_FORMAT"))
+	if err != nil {
+		slog.Error("Invalid summary publish format.", "error", err)
+		return
+	}
 	peerMaxProbes, usedDeprecatedPeerMaxProbes, err := positiveEnvIntWithDeprecatedAlias("CACHE_PEER_MAX_PROBES_PER_REQUEST", "CACHE_PEER_MAX_PROBES", defaultPeerMaxProbes)
 	if err != nil {
 		slog.Error("Invalid per-request peer probe limit.", "error", err)
@@ -128,7 +138,7 @@ func main() {
 	}
 	if lookupMode == peerLookupSummary {
 		summaryMemoryLimitBytes.Set(float64(summaryMemoryLimit))
-		if err := validateSummaryMemoryLimit(summaryMemoryLimit); err != nil {
+		if err := validateSummaryMemoryLimitBeforeCache(summaryPublishFormat, summaryMemoryLimit); err != nil {
 			slog.Error("Invalid summary memory limit.", "error", err)
 			return
 		}
@@ -157,6 +167,7 @@ func main() {
 		"max_percent", maxPercent,
 		"max_entries", maxEntries,
 		"summary_memory_limit", summaryMemoryLimit,
+		"summary_publish_format", summaryPublishFormat,
 		"peer_max_probes", peerMaxProbes,
 		"max_peer_probes_in_flight", maxPeerProbesInFlight,
 		"listen", listenAddr,
@@ -182,12 +193,14 @@ func main() {
 
 	// Initialize cache store
 	store, err := NewDiskCache(cacheDir, maxPercent, DiskCacheOptions{
-		IncrementalSummary:    lookupMode == peerLookupSummary && peerService != "",
-		DurableRecency:        true,
-		BackgroundConvergence: true,
-		MaxEntries:            maxEntries,
-		BlockSizeBytes:        blockSize,
-		startupContext:        rootCtx,
+		IncrementalSummary:      lookupMode == peerLookupSummary && peerService != "",
+		DynamicSummary:          summaryPublishFormat == summaryPublishDynamic,
+		SummaryMemoryLimitBytes: summaryMemoryLimit,
+		DurableRecency:          true,
+		BackgroundConvergence:   true,
+		MaxEntries:              maxEntries,
+		BlockSizeBytes:          blockSize,
+		startupContext:          rootCtx,
 	})
 	if err != nil {
 		slog.Error("Failed to initialize cache store.", "error", err)
@@ -220,6 +233,8 @@ func main() {
 			PeerMaxProbes:         peerMaxProbes,
 			MaxPeerProbesInFlight: maxPeerProbesInFlight,
 			MemoryLimitBytes:      summaryMemoryLimit,
+			PublishFormat:         summaryPublishFormat,
+			LocalBloom:            store.SummaryBloomCapacity(),
 		})
 		peers.StartSummarySynchronizer(rootCtx, store)
 		go peers.WatchEndpoints(rootCtx)
@@ -330,6 +345,33 @@ func positiveEnvIntWithDeprecatedAlias(canonicalKey, deprecatedKey string, def i
 		return value, true, err
 	}
 	return def, false, nil
+}
+
+func configuredSummaryMemoryLimit(goMemoryLimit int64) (int64, error) {
+	derived := deriveSummaryMemoryLimit(goMemoryLimit)
+	if derived <= 0 {
+		return 0, errors.New("runtime GOMEMLIMIT must produce a positive summary memory ceiling")
+	}
+	value := os.Getenv("CACHE_SUMMARY_MEMORY_LIMIT_BYTES")
+	if value == "" {
+		return derived, nil
+	}
+	override, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || override <= 0 {
+		return 0, fmt.Errorf("CACHE_SUMMARY_MEMORY_LIMIT_BYTES must be a positive integer")
+	}
+	return min(derived, override), nil
+}
+
+func validateSummaryMemoryLimitBeforeCache(format summaryPublishFormat, limit int64) error {
+	// Fixed publishing has a known layout and can fail before the cache scan.
+	// Dynamic publishing must wait for statfs because its actual local reserve
+	// can be smaller than the fixed-layout reserve; NewDiskCache validates it as
+	// soon as the disk-derived layout is known.
+	if format == summaryPublishDynamic {
+		return nil
+	}
+	return validateSummaryMemoryLimit(limit)
 }
 
 // envInt64 parses an integer env var, falling back to def (with a warning)
