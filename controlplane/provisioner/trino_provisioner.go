@@ -167,8 +167,8 @@ func trinoSanitize(orgName string) string {
 // TrinoCatalogName returns the catalog identifier for an org.
 // Format: org_<sanitized>. The sanitization maps Org.Name to Trino
 // identifier rules ([a-z0-9_]); any other characters collapse to
-// underscores. Catalog name uniqueness across orgs depends on Org.Name
-// uniqueness post-sanitization.
+// underscores. Catalog name uniqueness across orgs depends on
+// database_name's global unique index holding post-sanitization.
 //
 // The name carried an `_iceberg` suffix while the backing table format was
 // Iceberg behind Lakekeeper. Warehouses are DuckLake now (migration 000014
@@ -176,15 +176,16 @@ func trinoSanitize(orgName string) string {
 // pinned from three sides — this function, opa.ManagedCatalogPattern, and
 // the regex literal inside policy.rego — and the pair of tests named in
 // ManagedCatalogPattern's doc comment fails if any one of them moves alone.
-func TrinoCatalogName(orgName string) string {
-	return "org_" + trinoSanitize(orgName)
+func TrinoCatalogName(principal string) string {
+	return "org_" + trinoSanitize(principal)
 }
 
-// TrinoGroupName returns the file-group-provider group label for an org.
+// TrinoGroupName returns the file-group-provider group label for an org,
+// derived from its Trino principal.
 // Format: org_<sanitized>. Matches the OPA `input.context.identity.groups`
 // the customer Trino sends with each decision request.
-func TrinoGroupName(orgName string) string {
-	return "org_" + trinoSanitize(orgName)
+func TrinoGroupName(principal string) string {
+	return "org_" + trinoSanitize(principal)
 }
 
 // TrinoResourceGroupName returns the resource-group selector key for
@@ -192,10 +193,10 @@ func TrinoGroupName(orgName string) string {
 // get re-interpreted as a hierarchy separator in Trino's resource-
 // group path (and so the selector + subgroup names stay aligned across
 // the catalog, group, and resource-group projections). Customer
-// principals' Trino username == orgName (a DNS-1123 label), and we
+// principals' Trino username == the principal (a DNS-1123 label), and we
 // sanitize defensively so a non-identifier char can't reshape the path.
-func TrinoResourceGroupName(orgName string) string {
-	return "root.tenants." + trinoSanitize(orgName)
+func TrinoResourceGroupName(principal string) string {
+	return "root.tenants." + trinoSanitize(principal)
 }
 
 // TrinoCatalogClient is the REST surface the provisioner needs against
@@ -1173,12 +1174,24 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	// tenant's running queries.
 	wanted := make(map[string]bool, len(orgs))
 	for _, o := range orgs {
-		wanted[TrinoCatalogName(o.OrgID)] = true
+		if o.TrinoPrincipal() == "" {
+			continue
+		}
+		wanted[TrinoCatalogName(o.TrinoPrincipal())] = true
 	}
 
 	var errs []error
 	for _, o := range orgs {
-		name := TrinoCatalogName(o.OrgID)
+		// No principal means no derivable catalog name. The listing query
+		// already excludes these, so this is defensive: creating `org_`
+		// would collide across every such org.
+		if o.TrinoPrincipal() == "" {
+			err := errors.New("org has no database_name, which is its Trino principal")
+			errs = append(errs, fmt.Errorf("org %s: %w", o.OrgID, err))
+			outcomes[o.OrgID] = catalogOutcome{Err: err}
+			continue
+		}
+		name := TrinoCatalogName(o.TrinoPrincipal())
 
 		// The password gate comes FIRST, before the already-exists
 		// shortcut: a catalog whose password file is missing is a broken
@@ -1420,18 +1433,23 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 //
 // Format conventions:
 //
-//	password.db: <org_name>:<bcrypt hash from OrgUser.Password>
-//	             One line per org (org_name is the DNS-1123 Org.Name, the
-//	             customer principal's Trino username). Hash is copied
-//	             through unchanged — it's already bcrypt in the configstore.
+//	password.db: <principal>:<bcrypt hash from OrgUser.Password>
+//	             One line per org. The principal is the org's
+//	             database_name (see TrinoEnabledOrg.TrinoPrincipal), so the
+//	             tenant's Trino username is the same name it uses for its
+//	             DuckDB warehouse rather than a bare org UUID. Hash is
+//	             copied through unchanged — it's already bcrypt in the
+//	             configstore, and it is the SAME hash the DuckDB warehouse
+//	             authenticates with, so one password works for both.
 //	group.db:    <group_name>:<comma-separated users>
 //	             NOTE: this is the opposite direction from password.db.
 //	             For v1 (one user per org) the value is the single
-//	             org_name. Easy to get backwards, hence this comment.
+//	             principal. Easy to get backwards, hence this comment.
 //
-// Orgs without a RootPasswordHash are skipped silently (the listing
-// query already filters to (org, root-user) pairs, so this is just
-// defensive against future changes).
+// Orgs without a RootPasswordHash or a principal are skipped silently
+// (the listing query already filters to (org, root-user) pairs with a
+// non-blank database_name, so this is just defensive against future
+// changes).
 //
 // adminPasswordHash is the bcrypt for opa.AdminPrincipal — the
 // provisioner's own catalog-management identity. When non-empty, the
@@ -1451,13 +1469,14 @@ func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, adminPasswordHash s
 		grpLines = append(grpLines, fmt.Sprintf("%s:%s", opa.AdminGroup, opa.AdminPrincipal))
 	}
 	for _, o := range orgs {
-		if o.RootPasswordHash == "" || o.OrgID == "" {
+		principal := o.TrinoPrincipal()
+		if o.RootPasswordHash == "" || principal == "" {
 			continue
 		}
-		pwLines = append(pwLines, fmt.Sprintf("%s:%s", o.OrgID, o.RootPasswordHash))
+		pwLines = append(pwLines, fmt.Sprintf("%s:%s", principal, o.RootPasswordHash))
 		// group_name first, comma-separated users second. For v1 this
-		// is one user per group (the org name only).
-		grpLines = append(grpLines, fmt.Sprintf("%s:%s", TrinoGroupName(o.OrgID), o.OrgID))
+		// is one user per group (the principal only).
+		grpLines = append(grpLines, fmt.Sprintf("%s:%s", TrinoGroupName(principal), principal))
 	}
 	// Trailing newline so a file with one entry round-trips through
 	// `cat password.db | head` cleanly; matters mostly for ops.
@@ -1586,19 +1605,23 @@ func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error
 		Group: "root.admin." + opa.AdminPrincipal,
 	}}
 	for _, o := range orgs {
-		if o.OrgID == "" {
+		principal := o.TrinoPrincipal()
+		if principal == "" {
 			continue
 		}
 		sg := tierLimits(o.Tier)
 		// Subgroup name is sanitized to match TrinoResourceGroupName's
 		// final path component. The selector's User field stays raw —
 		// it matches against Trino's `current_user`, which is the
-		// auth-time username (raw orgID).
-		sg.Name = trinoSanitize(o.OrgID)
+		// auth-time username, i.e. the unsanitized principal. The two
+		// differ whenever database_name contains a hyphen, which is
+		// exactly why the selector and the subgroup name are derived
+		// separately here.
+		sg.Name = trinoSanitize(principal)
 		subgroups = append(subgroups, sg)
 		selectors = append(selectors, resourceGroupSelector{
-			User:  o.OrgID,
-			Group: TrinoResourceGroupName(o.OrgID),
+			User:  principal,
+			Group: TrinoResourceGroupName(principal),
 		})
 	}
 
@@ -1666,11 +1689,12 @@ func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configst
 	gc := make(opa.GroupCatalogs, len(orgs)+1)
 	adminCatalogs := make(map[string]bool, len(orgs))
 	for _, o := range orgs {
-		if o.OrgID == "" {
+		principal := o.TrinoPrincipal()
+		if principal == "" {
 			continue
 		}
-		catalog := TrinoCatalogName(o.OrgID)
-		gc[TrinoGroupName(o.OrgID)] = map[string]bool{catalog: true}
+		catalog := TrinoCatalogName(principal)
+		gc[TrinoGroupName(principal)] = map[string]bool{catalog: true}
 		adminCatalogs[catalog] = true
 	}
 	if len(adminCatalogs) > 0 {

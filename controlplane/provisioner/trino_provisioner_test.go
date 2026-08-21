@@ -176,29 +176,89 @@ func (c *fakeCatalogClient) DropCatalog(ctx context.Context, name string) error 
 
 func TestBuildTrinoAuthFiles_OneUserPerOrg(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", RootPasswordHash: "$2a$10$hash42"},
-		{OrgID: "43", RootPasswordHash: "$2a$10$hash43"},
+		{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$2a$10$hash42"},
+		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$2a$10$hash43"},
 	}
 	// Empty admin hash so the test focuses on the per-org projection;
 	// admin-line projection is exercised in its own test below.
 	pw, grp := BuildTrinoAuthFiles(orgs, "")
 
-	wantPW := "42:$2a$10$hash42\n43:$2a$10$hash43\n"
+	// Usernames are the orgs' database_names, NOT their org ids — the
+	// tenant authenticates to Trino as the same name it uses for its
+	// DuckDB warehouse.
+	wantPW := "db42:$2a$10$hash42\ndb43:$2a$10$hash43\n"
 	if pw != wantPW {
 		t.Errorf("password.db =\n%q\nwant\n%q", pw, wantPW)
 	}
 	// group.db is group-first: <group>:<comma-separated users>. Easy to
 	// get backwards, hence the explicit assertion.
-	wantGrp := "org_42:42\norg_43:43\n"
+	wantGrp := "org_db42:db42\norg_db43:db43\n"
 	if grp != wantGrp {
 		t.Errorf("group.db =\n%q\nwant\n%q", grp, wantGrp)
 	}
 }
 
+// The tenant's Trino identity is its database_name, never its org id.
+// database_name is what the customer already uses for its DuckDB warehouse
+// (the SNI hostname label and the dbname), whereas org_id may be a bare
+// UUID — which would put a hex string in the connection string and in every
+// fully-qualified table reference.
+func TestTrinoIdentityIsDatabaseNameNotOrgID(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:            "0d8f2c1e4b7a4d9e8f3c2b1a0e9d8c7b",
+		DatabaseName:     "acme-analytics",
+		RootPasswordHash: "$2a$10$hash",
+	}}
+
+	pw, grp := BuildTrinoAuthFiles(orgs, "")
+	if strings.Contains(pw, orgs[0].OrgID) || strings.Contains(grp, orgs[0].OrgID) {
+		t.Errorf("auth files leak the org id:\npassword.db=%q\ngroup.db=%q", pw, grp)
+	}
+	if want := "acme-analytics:$2a$10$hash\n"; pw != want {
+		t.Errorf("password.db = %q, want %q", pw, want)
+	}
+	// The group label is sanitized (hyphen → underscore) while the user
+	// stays raw, because the user is matched against Trino's current_user.
+	if want := "org_acme_analytics:acme-analytics\n"; grp != want {
+		t.Errorf("group.db = %q, want %q", grp, want)
+	}
+
+	if got, want := TrinoCatalogName(orgs[0].TrinoPrincipal()), "org_acme_analytics"; got != want {
+		t.Errorf("catalog = %q, want %q", got, want)
+	}
+
+	rg, err := BuildTrinoResourceGroups(orgs)
+	if err != nil {
+		t.Fatalf("BuildTrinoResourceGroups: %v", err)
+	}
+	if strings.Contains(string(rg), orgs[0].OrgID) {
+		t.Errorf("resource-groups.json leaks the org id: %s", rg)
+	}
+	if !strings.Contains(string(rg), `"user": "acme-analytics"`) {
+		t.Errorf("resource-groups.json selector should match the raw principal: %s", rg)
+	}
+}
+
+// An org with no database_name has no derivable Trino identity, so it must
+// be skipped rather than collapsed into a shared `org_` name.
+func TestBuildTrinoAuthFiles_SkipsOrgWithoutDatabaseName(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "", RootPasswordHash: "$2a$10$hash42"},
+		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$2a$10$hash43"},
+	}
+	pw, grp := BuildTrinoAuthFiles(orgs, "")
+	if want := "db43:$2a$10$hash43\n"; pw != want {
+		t.Errorf("password.db = %q, want %q", pw, want)
+	}
+	if want := "org_db43:db43\n"; grp != want {
+		t.Errorf("group.db = %q, want %q", grp, want)
+	}
+}
+
 func TestBuildTrinoAuthFiles_DeterministicOrder(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", RootPasswordHash: "$a"},
-		{OrgID: "43", RootPasswordHash: "$b"},
+		{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$a"},
+		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$b"},
 	}
 	pw1, grp1 := BuildTrinoAuthFiles(orgs, "")
 	pw2, grp2 := BuildTrinoAuthFiles(orgs, "")
@@ -209,8 +269,8 @@ func TestBuildTrinoAuthFiles_DeterministicOrder(t *testing.T) {
 
 func TestBuildTrinoAuthFiles_SkipsEmptyHashes(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", RootPasswordHash: ""},
-		{OrgID: "43", RootPasswordHash: "$2a$10$hash43"},
+		{OrgID: "42", DatabaseName: "db42", RootPasswordHash: ""},
+		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$2a$10$hash43"},
 		{OrgID: "", RootPasswordHash: "$2a$10$orphan"},
 	}
 	pw, grp := BuildTrinoAuthFiles(orgs, "")
@@ -236,7 +296,7 @@ func TestBuildTrinoAuthFiles_IncludesAdminWhenHashProvided(t *testing.T) {
 	// The OPA policy's is_admin is a CONJUNCTION of username and group
 	// membership, so the admin has to appear in BOTH files or the
 	// provisioner cannot manage catalogs at all.
-	orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", RootPasswordHash: "$2a$10$hash42"}}
+	orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$2a$10$hash42"}}
 	pw, grp := BuildTrinoAuthFiles(orgs, "$2a$10$adminhash")
 
 	if !strings.HasPrefix(pw, opa.AdminPrincipal+":$2a$10$adminhash\n") {
@@ -347,10 +407,10 @@ func TestTrinoCatalogNameMatchesManagedNamePattern(t *testing.T) {
 
 func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", Tier: "free"},
-		{OrgID: "43", Tier: "growth"},
-		{OrgID: "44", Tier: "scale"},
-		{OrgID: "45", Tier: ""},
+		{OrgID: "42", DatabaseName: "db42", Tier: "free"},
+		{OrgID: "43", DatabaseName: "db43", Tier: "growth"},
+		{OrgID: "44", DatabaseName: "db44", Tier: "scale"},
+		{OrgID: "45", DatabaseName: "db45", Tier: ""},
 	}
 	raw, err := BuildTrinoResourceGroups(orgs)
 	if err != nil {
@@ -392,11 +452,11 @@ func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 		t.Fatalf("expected 4 org subgroups under tenants, got %d", len(subs))
 	}
 	// Selector + subgroup name == org name; verify the join.
-	wantByName := map[string]int{ // hardConcurrencyLimit per tier
-		"42": 3,  // free
-		"43": 10, // growth
-		"44": 25, // scale
-		"45": 3,  // empty → default ("free")
+	wantByName := map[string]int{ // hardConcurrencyLimit per tier, keyed by principal
+		"db42": 3,  // free
+		"db43": 10, // growth
+		"db44": 25, // scale
+		"db45": 3,  // empty → default ("free")
 	}
 	for _, sg := range subs {
 		want, ok := wantByName[sg.Name]
@@ -409,16 +469,16 @@ func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 		}
 	}
 	// Selectors: admin + one per org. Admin maps to root.admin.<admin>,
-	// each tenant maps to root.tenants.<org_name>. Without the admin
+	// each tenant maps to root.tenants.<principal>. Without the admin
 	// selector the provisioner's own queries get rejected by Trino's
 	// resource-group manager before reaching OPA — which would silently
 	// break EVERY reconcile tick, not just one query.
 	wantSel := map[string]string{
 		opa.AdminPrincipal: "root.admin." + opa.AdminPrincipal,
-		"42":               "root.tenants.42",
-		"43":               "root.tenants.43",
-		"44":               "root.tenants.44",
-		"45":               "root.tenants.45",
+		"db42":             "root.tenants.db42",
+		"db43":             "root.tenants.db43",
+		"db44":             "root.tenants.db44",
+		"db45":             "root.tenants.db45",
 	}
 	if len(parsed.Selectors) != len(wantSel) {
 		t.Fatalf("expected %d selectors (admin + %d orgs), got %d", len(wantSel), len(orgs), len(parsed.Selectors))
@@ -647,7 +707,7 @@ func (f *fakeSentinel) MarkTrinoClusterBootstrapped(_ context.Context, namespace
 
 func TestReconcile_CreatesCatalogProjectsSecretsAndConfigMap(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", Tier: "free", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
+		{OrgID: "42", DatabaseName: "db42", Tier: "free", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 
@@ -656,9 +716,9 @@ func TestReconcile_CreatesCatalogProjectsSecretsAndConfigMap(t *testing.T) {
 	}
 
 	// Catalog issued via REST, with the DuckLake property set.
-	props, ok := h.catalog.created[TrinoCatalogName("42")]
+	props, ok := h.catalog.created[TrinoCatalogName("db42")]
 	if !ok {
-		t.Fatalf("expected CREATE CATALOG for %s, got %+v", TrinoCatalogName("42"), h.catalog.created)
+		t.Fatalf("expected CREATE CATALOG for %s, got %+v", TrinoCatalogName("db42"), h.catalog.created)
 	}
 	want := map[string]string{
 		"connector.name":                             "ducklake",
@@ -701,8 +761,8 @@ func TestReconcile_CreatesCatalogProjectsSecretsAndConfigMap(t *testing.T) {
 	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyPasswordDB]), "42:$2a$10$hash42") {
 		t.Errorf("password.db missing 42 entry: %q", sec.Data[TrinoAuthSecretKeyPasswordDB])
 	}
-	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyGroupDB]), "org_42:42") {
-		t.Errorf("group.db missing org_42 entry: %q", sec.Data[TrinoAuthSecretKeyGroupDB])
+	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyGroupDB]), "org_db42:db42") {
+		t.Errorf("group.db missing org_db42 entry: %q", sec.Data[TrinoAuthSecretKeyGroupDB])
 	}
 
 	// ConfigMap.
@@ -710,8 +770,8 @@ func TestReconcile_CreatesCatalogProjectsSecretsAndConfigMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get resource-groups configmap: %v", err)
 	}
-	if !strings.Contains(cm.Data[TrinoResourceGroupsConfigMapKey], "root.tenants.42") {
-		t.Errorf("resource-groups.json missing root.tenants.42 selector: %q", cm.Data[TrinoResourceGroupsConfigMapKey])
+	if !strings.Contains(cm.Data[TrinoResourceGroupsConfigMapKey], "root.tenants.db42") {
+		t.Errorf("resource-groups.json missing root.tenants.db42 selector: %q", cm.Data[TrinoResourceGroupsConfigMapKey])
 	}
 
 	// OPA bundle Set into the store with a non-empty ETag.
@@ -732,7 +792,7 @@ func TestReconcile_CreatesCatalogProjectsSecretsAndConfigMap(t *testing.T) {
 // and ships them to every worker.
 func TestReconcile_CatalogPropertiesCarryNoSecret(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 	h.passwords["42"] = "super-secret-metadata-password"
@@ -740,7 +800,7 @@ func TestReconcile_CatalogPropertiesCarryNoSecret(t *testing.T) {
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	props := h.catalog.created[TrinoCatalogName("42")]
+	props := h.catalog.created[TrinoCatalogName("db42")]
 	if len(props) == 0 {
 		t.Fatal("expected the catalog to be created")
 	}
@@ -767,8 +827,8 @@ func TestReconcile_CatalogPropertiesCarryNoSecret(t *testing.T) {
 // password must stop being mounted into the Trino pods.
 func TestReconcile_TenantSecretDropsDisabledOrgs(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
-		{OrgID: "43", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "43", DatabaseName: "db43", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{
 		"42": readyWarehouse("42"),
@@ -798,8 +858,8 @@ func TestReconcile_TenantSecretDropsDisabledOrgs(t *testing.T) {
 		t.Errorf("still-enabled org 42 must keep its password, got %q", data["42"])
 	}
 	// And its catalog is dropped.
-	if !contains(h.catalog.dropped, TrinoCatalogName("43")) {
-		t.Errorf("expected %s to be dropped, got %v", TrinoCatalogName("43"), h.catalog.dropped)
+	if !contains(h.catalog.dropped, TrinoCatalogName("db43")) {
+		t.Errorf("expected %s to be dropped, got %v", TrinoCatalogName("db43"), h.catalog.dropped)
 	}
 }
 
@@ -809,7 +869,7 @@ func TestReconcile_SkipsCatalogWhenTenantPasswordNotReady(t *testing.T) {
 	// auth files are still projected so the password file stays
 	// consistent regardless of catalog readiness.
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$hash"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$hash"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 	delete(h.passwords, "42")
@@ -864,7 +924,7 @@ func TestReconcile_SkipsCatalogWhenWarehouseNotReady(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"}}
+			orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"}}
 			h := newTestTrinoProvisioner(t, orgs, tc.warehouses)
 
 			if err := h.provisioner.Reconcile(context.Background()); err != nil {
@@ -886,8 +946,8 @@ func TestReconcile_SkipsCatalogWhenWarehouseNotReady(t *testing.T) {
 
 func TestReconcile_TenantPasswordErrorFailsOnlyThatOrg(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
-		{OrgID: "43", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "43", DatabaseName: "db43", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{
 		"42": readyWarehouse("42"),
@@ -900,10 +960,10 @@ func TestReconcile_TenantPasswordErrorFailsOnlyThatOrg(t *testing.T) {
 	if err := h.provisioner.Reconcile(context.Background()); err == nil {
 		t.Fatal("expected Reconcile to surface the per-org password failure")
 	}
-	if _, ok := h.catalog.created[TrinoCatalogName("43")]; !ok {
+	if _, ok := h.catalog.created[TrinoCatalogName("db43")]; !ok {
 		t.Errorf("healthy org 43 must still get its catalog, got %+v", h.catalog.created)
 	}
-	if _, ok := h.catalog.created[TrinoCatalogName("42")]; ok {
+	if _, ok := h.catalog.created[TrinoCatalogName("db42")]; ok {
 		t.Errorf("failing org 42 must not get a catalog")
 	}
 	if st, _ := h.store.lastState("42"); st.State != configstore.ManagedWarehouseStateFailed {
@@ -927,7 +987,7 @@ func TestReconcile_DropsStaleCatalogs(t *testing.T) {
 	// org_99 exists in Trino but is not in the enabled list → should get
 	// DROP. system, jmx, and a hand-made catalog survive.
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 	h.catalog.existing = []string{"system", "jmx", "maintenance_ducklake", "org_99"}
@@ -949,10 +1009,10 @@ func TestReconcile_DropsStaleCatalogs(t *testing.T) {
 // out from under a tenant's running queries.
 func TestReconcile_PendingOrgKeepsItsExistingCatalog(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.catalog.existing = []string{TrinoCatalogName("42")}
+	h.catalog.existing = []string{TrinoCatalogName("db42")}
 	delete(h.passwords, "42")
 
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
@@ -970,16 +1030,16 @@ func TestReconcile_PendingOrgKeepsItsExistingCatalog(t *testing.T) {
 
 func TestReconcile_IsIdempotentWhenCatalogExists(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 	// Pretend the catalog already exists.
-	h.catalog.existing = []string{TrinoCatalogName("42")}
+	h.catalog.existing = []string{TrinoCatalogName("db42")}
 
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if _, ok := h.catalog.created[TrinoCatalogName("42")]; ok {
+	if _, ok := h.catalog.created[TrinoCatalogName("db42")]; ok {
 		t.Errorf("expected no CREATE CATALOG when catalog already exists, got %+v", h.catalog.created)
 	}
 	if st, _ := h.store.lastState("42"); st.State != configstore.ManagedWarehouseStateReady {
@@ -989,7 +1049,7 @@ func TestReconcile_IsIdempotentWhenCatalogExists(t *testing.T) {
 
 func TestReconcile_SecretUpdateIsIdempotent(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 
@@ -1055,7 +1115,7 @@ func TestReconcile_ProjectionFailureSkipsCatalogStep(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			orgs := []configstore.TrinoEnabledOrg{
-				{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+				{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
 			}
 			h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 			// Bootstrap first so the cluster-secret step (which also
@@ -1102,9 +1162,9 @@ func TestReconcile_StateTransitions(t *testing.T) {
 	//   43: provisioning  (no warehouse row yet)
 	//   44: failed        (catalog create errors)
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
-		{OrgID: "43", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
-		{OrgID: "44", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
+		{OrgID: "43", DatabaseName: "db43", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
+		{OrgID: "44", DatabaseName: "db44", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{
 		"42": readyWarehouse("42"),
@@ -1166,7 +1226,7 @@ func TestReconcile_StateTransitions(t *testing.T) {
 
 func TestReconcile_ClaimsUnassignedOrgsIntoThisCell(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: "", RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: "", RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 
@@ -1176,7 +1236,7 @@ func TestReconcile_ClaimsUnassignedOrgsIntoThisCell(t *testing.T) {
 	if got := h.store.cells["42"]; got != testCellID {
 		t.Errorf("expected org 42 claimed into %q, got %q", testCellID, got)
 	}
-	if _, ok := h.catalog.created[TrinoCatalogName("42")]; !ok {
+	if _, ok := h.catalog.created[TrinoCatalogName("db42")]; !ok {
 		t.Errorf("a newly claimed org must be reconciled in the same tick, got %+v", h.catalog.created)
 	}
 
@@ -1192,8 +1252,8 @@ func TestReconcile_ClaimsUnassignedOrgsIntoThisCell(t *testing.T) {
 
 func TestReconcile_IgnoresOrgsOwnedByAnotherCell(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
-		{OrgID: "99", CellID: "cell-elsewhere", RootPasswordHash: "$2a$10$hash99"},
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
+		{OrgID: "99", DatabaseName: "db99", CellID: "cell-elsewhere", RootPasswordHash: "$2a$10$hash99"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{
 		"42": readyWarehouse("42"),
@@ -1222,7 +1282,7 @@ func TestReconcile_IgnoresOrgsOwnedByAnotherCell(t *testing.T) {
 		t.Errorf("password.db leaked another cell's org: %q", sec.Data[TrinoAuthSecretKeyPasswordDB])
 	}
 	// And our own org is unaffected.
-	if _, ok := h.catalog.created[TrinoCatalogName("42")]; !ok {
+	if _, ok := h.catalog.created[TrinoCatalogName("db42")]; !ok {
 		t.Errorf("this cell's org must still be provisioned, got %+v", h.catalog.created)
 	}
 }
@@ -1231,7 +1291,7 @@ func TestReconcile_FailedClaimDefersTheOrg(t *testing.T) {
 	// A claim that doesn't land means ownership is unrecorded; projecting
 	// the tenant anyway risks two cells serving it.
 	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", CellID: "", RootPasswordHash: "$2a$10$h"},
+		{OrgID: "42", DatabaseName: "db42", CellID: "", RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
 	h.store.cellErr = errors.New("db unavailable")

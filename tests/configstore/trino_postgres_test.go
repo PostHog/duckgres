@@ -273,6 +273,49 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 
 // Deleting the Org row must take its Trino opt-in with it — otherwise a
 // re-created org would inherit a stranded row.
+// database_name is the org's Trino principal — the username it authenticates
+// as and the stem of its catalog name — so an org without one has no
+// derivable Trino identity and must be dropped by the listing, exactly as a
+// root-less org is. Returning it would project a catalog literally named
+// `org_`, which every such org would collide on.
+func TestListTrinoEnabledOrgsRequiresADatabaseName(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "acme")
+
+	// An org with a root user but no database_name.
+	if err := store.DB().Create(&configstore.Org{Name: "nameless", DatabaseName: ""}).Error; err != nil {
+		t.Fatalf("create nameless org: %v", err)
+	}
+	if err := store.CreateOrgUser("nameless", "root", "$2a$10$hash-nameless"); err != nil {
+		t.Fatalf("create root user for nameless: %v", err)
+	}
+
+	for _, org := range []string{"acme", "nameless"} {
+		if err := store.EnableTrino(org, configstore.TrinoSettings{Tier: "free"}); err != nil {
+			t.Fatalf("EnableTrino(%s): %v", org, err)
+		}
+	}
+
+	got, err := store.ListTrinoEnabledOrgs()
+	if err != nil {
+		t.Fatalf("ListTrinoEnabledOrgs: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected only acme (nameless dropped for having no database_name), got %+v", got)
+	}
+	if got[0].OrgID != "acme" {
+		t.Fatalf("expected acme, got %+v", got[0])
+	}
+	// And the principal is carried through, since every Trino-facing name
+	// is derived from it.
+	if got[0].DatabaseName != "acmedb" {
+		t.Errorf("DatabaseName = %q, want acmedb", got[0].DatabaseName)
+	}
+	if got[0].TrinoPrincipal() != "acmedb" {
+		t.Errorf("TrinoPrincipal() = %q, want acmedb", got[0].TrinoPrincipal())
+	}
+}
+
 func TestTrinoRowCascadesOnOrgDeletePostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	seedTrinoOrg(t, store, "acme")
