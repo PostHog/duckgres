@@ -238,6 +238,15 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_hits_total` | Counter | None | Worker-facing cacheable requests served entirely from data already present on local NVMe. Peer API reads and requests that first fetch any block from a peer are excluded. |
 | `cache_proxy_misses_total` | Counter | None | Worker-facing cacheable requests that require a peer or origin fill before they can be served. |
 | `cache_proxy_bytes_served_total` | Counter | `source` | Directional byte mix by `local`, `peer`, or `s3`. Block mode counts assembled response bytes under the slowest source used; the legacy exact-range path counts the local read or deduplicated fill once, so this is not an exact client-egress counter. |
+| `cache_proxy_cache_entries` / `cache_proxy_cache_entry_limit` | Gauge | None | Current exact-index entries and the configured legacy admission limit (`CACHE_MAX_ENTRIES`, default 1,000,000). |
+| `cache_proxy_cache_owned_bytes` / `cache_proxy_cache_capacity_bytes` | Gauge | None | Bytes in committed cache entries and the current capacity ceiling. Committed bytes are reclaimable in capacity calculation after restart. |
+| `cache_proxy_cache_disk_target_bytes` / `cache_proxy_cache_disk_reserve_bytes` | Gauge | None | The configured percentage-of-disk target and the fixed 5%-of-total-disk reserve. |
+| `cache_proxy_cache_entry_limit_reason` | Gauge | `reason` | Future derived-entry bottleneck. Exactly one `reason` (`disk` or `metadata`) is 1; this anticipates the later derived-entry rollout without replacing the configured legacy admission limit. |
+| `cache_proxy_cache_startup_scan_duration_seconds` | Histogram | None | Cache directory startup-scan duration. |
+| `cache_proxy_cache_startup_scan_files_inspected_total` / `cache_proxy_cache_startup_invalid_files_total` | Counter | None | Root-directory entries scanned and entries excluded from committed cache ownership because they are invalid or unrelated. |
+| `cache_proxy_cache_temporary_files_removed_total` | Counter | None | Interrupted temporary files removed from `.tmp` on startup. They are never counted as cache evictions. |
+| `cache_proxy_evictions_total` | Counter | None | Aggregate successful removal of committed cache entries under entry or byte pressure. |
+| `cache_proxy_evictions_by_phase_reason_total` | Counter | `phase`, `reason` | The same evictions by bounded `phase` (`startup`, `background`, or `request`) and pressure `reason` (`entry` or `byte`). Failed or already-absent files are not reported as successful evictions. |
 | `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups in either mode. |
 | `cache_proxy_peer_hits_total` | Counter | None | Successful peer body transfers. A block-mode request can record up to two transfers for one logical lookup. |
 | `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical `/cache/has` attempts only. In summary mode these are bounded confirmations of Bloom-positive or uncovered peers, never fleet-wide fanout. The per-request maximum is `CACHE_PEER_MAX_PROBES_PER_REQUEST`. |

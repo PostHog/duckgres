@@ -29,6 +29,11 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 	return m.GetCounter().GetValue()
 }
 
+func counterVecValue(t *testing.T, c *prometheus.CounterVec, labels ...string) float64 {
+	t.Helper()
+	return counterValue(t, c.WithLabelValues(labels...))
+}
+
 func gaugeValue(t *testing.T, g prometheus.Gauge) float64 {
 	t.Helper()
 	var m dto.Metric
@@ -62,6 +67,22 @@ func (e *errAfterReader) Read(p []byte) (int, error) {
 	e.pos += n
 	return n, nil
 }
+
+type scriptedCacheDirectory struct {
+	entries []os.DirEntry
+	err     error
+	read    bool
+}
+
+func (d *scriptedCacheDirectory) ReadDir(int) ([]os.DirEntry, error) {
+	if !d.read {
+		d.read = true
+		return d.entries, nil
+	}
+	return nil, d.err
+}
+
+func (d *scriptedCacheDirectory) Close() error { return nil }
 
 func TestIsValidCacheKey(t *testing.T) {
 	cases := []struct {
@@ -251,6 +272,415 @@ func TestDiskCacheEntryLimitAppliesDuringStartupScan(t *testing.T) {
 	}
 	if c.order.Len() != 2 || c.Has(entries[0].key) || !c.Has(entries[1].key) || !c.Has(entries[2].key) {
 		t.Fatalf("startup scan did not retain newest two entries")
+	}
+}
+
+func TestDiskCacheStartupCountsCommittedBytesAsReclaimable(t *testing.T) {
+	dir := t.TempDir()
+	keys := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	for _, key := range keys {
+		if err := os.WriteFile(filepath.Join(dir, key), make([]byte, 400), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c, err := NewDiskCache(dir, 80, DiskCacheOptions{
+		MaxEntries: 2,
+		CapacityProvider: func(string) (diskSpace, error) {
+			// The disk is 80% full only because of the two committed cache files.
+			return diskSpace{TotalBytes: 1000, FreeBytes: 200}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.currentSize != 800 || c.maxBytes != 800 {
+		t.Fatalf("startup cache size/capacity = %d/%d, want 800/800; committed entries must not be mistaken for external disk use", c.currentSize, c.maxBytes)
+	}
+	for _, key := range keys {
+		if !c.Has(key) {
+			t.Fatalf("startup pruned committed cache key %s", key)
+		}
+	}
+}
+
+func TestDiskCacheScanSeparatesTemporaryInvalidAndCommittedFiles(t *testing.T) {
+	dir := t.TempDir()
+	key := strings.Repeat("c", 64)
+	if err := os.WriteFile(filepath.Join(dir, key), []byte("committed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, tmpSubdir), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, tmpSubdir, "interrupted"), []byte("temporary"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	invalid := filepath.Join(dir, "not-a-cache-key")
+	if err := os.WriteFile(invalid, []byte("external"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeTemporary := counterValue(t, cacheTemporaryFilesRemovedTotal)
+	beforeInvalid := counterValue(t, cacheStartupInvalidFilesTotal)
+	c, err := NewDiskCache(dir, 80, DiskCacheOptions{CapacityProvider: func(string) (diskSpace, error) {
+		return diskSpace{TotalBytes: 1000, FreeBytes: 990}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Has(key) {
+		t.Fatal("committed cache entry was not loaded")
+	}
+	if _, err := os.Stat(filepath.Join(dir, tmpSubdir, "interrupted")); !os.IsNotExist(err) {
+		t.Fatalf("temporary file still exists after startup: %v", err)
+	}
+	if _, err := os.Stat(invalid); err != nil {
+		t.Fatalf("unrelated file should remain external disk use: %v", err)
+	}
+	if got := counterValue(t, cacheTemporaryFilesRemovedTotal) - beforeTemporary; got != 1 {
+		t.Fatalf("temporary cleanup count = %v, want 1", got)
+	}
+	if got := counterValue(t, cacheStartupInvalidFilesTotal) - beforeInvalid; got != 1 {
+		t.Fatalf("invalid file count = %v, want 1", got)
+	}
+}
+
+func TestNewDiskCacheFailsWhenStartupScanCannotOpenDirectory(t *testing.T) {
+	scanErr := errors.New("forced startup scan open failure")
+	c, err := NewDiskCache(t.TempDir(), 80, DiskCacheOptions{
+		openScanDirectory: func(string) (cacheDirectory, error) {
+			return nil, scanErr
+		},
+	})
+	if c != nil {
+		t.Fatal("NewDiskCache returned a cache after its startup scan failed")
+	}
+	if !errors.Is(err, scanErr) {
+		t.Fatalf("NewDiskCache error = %v, want wrapped scan error", err)
+	}
+}
+
+func TestNewDiskCacheFailsWhenStartupScanStopsBeforeDirectoryIsExhausted(t *testing.T) {
+	dir := t.TempDir()
+	key := strings.Repeat("d", 64)
+	path := filepath.Join(dir, key)
+	if err := os.WriteFile(path, []byte("committed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanErr := errors.New("forced startup scan read failure")
+	c, err := NewDiskCache(dir, 80, DiskCacheOptions{
+		openScanDirectory: func(string) (cacheDirectory, error) {
+			return &scriptedCacheDirectory{entries: entries, err: scanErr}, nil
+		},
+	})
+	if c != nil {
+		t.Fatal("NewDiskCache returned a partially scanned cache")
+	}
+	if !errors.Is(err, scanErr) {
+		t.Fatalf("NewDiskCache error = %v, want wrapped mid-scan error", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("committed file changed after non-pressure scan failure: %v", err)
+	}
+}
+
+func TestNewDiskCacheFailsWhenStartupPruneCannotRemoveVictim(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		firstAge   time.Duration
+		secondAge  time.Duration
+		wantVictim string
+	}{
+		{name: "incoming entry is older", firstAge: time.Hour, secondAge: 2 * time.Hour, wantVictim: strings.Repeat("b", 64)},
+		{name: "existing survivor is older", firstAge: 2 * time.Hour, secondAge: time.Hour, wantVictim: strings.Repeat("a", 64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			first := strings.Repeat("a", 64)
+			second := strings.Repeat("b", 64)
+			now := time.Now()
+			for _, entry := range []struct {
+				key string
+				age time.Duration
+			}{{first, tc.firstAge}, {second, tc.secondAge}} {
+				path := filepath.Join(dir, entry.key)
+				if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				when := now.Add(-entry.age)
+				if err := os.Chtimes(path, when, when); err != nil {
+					t.Fatal(err)
+				}
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			removeErr := errors.New("forced startup prune removal failure")
+			var attemptedVictim string
+			beforeAggregate := counterValue(t, cacheEvictionsTotal)
+			beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry)
+			c, err := NewDiskCache(dir, 100, DiskCacheOptions{
+				MaxEntries: 1,
+				openScanDirectory: func(string) (cacheDirectory, error) {
+					return &scriptedCacheDirectory{entries: entries, err: io.EOF}, nil
+				},
+				removeFile: func(path string) error {
+					attemptedVictim = filepath.Base(path)
+					return removeErr
+				},
+			})
+			if c != nil {
+				t.Fatal("NewDiskCache returned a cache after startup pruning failed")
+			}
+			if !errors.Is(err, removeErr) {
+				t.Fatalf("NewDiskCache error = %v, want wrapped removal error", err)
+			}
+			if attemptedVictim != tc.wantVictim {
+				t.Fatalf("startup prune attempted victim %q, want %q", attemptedVictim, tc.wantVictim)
+			}
+			for _, key := range []string{first, second} {
+				if _, err := os.Stat(filepath.Join(dir, key)); err != nil {
+					t.Fatalf("committed file %s changed after failed prune: %v", key, err)
+				}
+			}
+			if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 0 {
+				t.Fatalf("aggregate evictions after failed startup removal = %v, want 0", got)
+			}
+			if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry) - beforeLabel; got != 0 {
+				t.Fatalf("labelled evictions after failed startup removal = %v, want 0", got)
+			}
+		})
+	}
+}
+
+func TestNewDiskCacheTreatsStartupPruneENOENTAsSuccessfulCleanup(t *testing.T) {
+	dir := t.TempDir()
+	oldest := strings.Repeat("a", 64)
+	newest := strings.Repeat("b", 64)
+	now := time.Now()
+	for _, entry := range []struct {
+		key string
+		age time.Duration
+	}{{oldest, 2 * time.Hour}, {newest, time.Hour}} {
+		path := filepath.Join(dir, entry.key)
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		when := now.Add(-entry.age)
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	beforeAggregate := counterValue(t, cacheEvictionsTotal)
+	beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry)
+	c, err := NewDiskCache(dir, 100, DiskCacheOptions{
+		MaxEntries: 1,
+		openScanDirectory: func(string) (cacheDirectory, error) {
+			return &scriptedCacheDirectory{entries: entries, err: io.EOF}, nil
+		},
+		removeFile: func(path string) error {
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+			return &os.PathError{Op: "remove", Path: path, Err: syscall.ENOENT}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDiskCache rejected an ENOENT startup-prune race: %v", err)
+	}
+	if c.order.Len() != 1 || c.Has(oldest) || !c.Has(newest) {
+		t.Fatalf("startup survivors after ENOENT race = entries:%d oldest:%t newest:%t, want 1/false/true", c.order.Len(), c.Has(oldest), c.Has(newest))
+	}
+	if _, err := os.Stat(filepath.Join(dir, oldest)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("externally removed victim still exists: %v", err)
+	}
+	if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 0 {
+		t.Fatalf("aggregate evictions after ENOENT startup race = %v, want 0", got)
+	}
+	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry) - beforeLabel; got != 0 {
+		t.Fatalf("labelled evictions after ENOENT startup race = %v, want 0", got)
+	}
+}
+
+func TestNewDiskCacheFailsWhenInitialBytePruneCannotRemoveVictim(t *testing.T) {
+	dir := t.TempDir()
+	for _, key := range []string{strings.Repeat("c", 64), strings.Repeat("d", 64)} {
+		if err := os.WriteFile(filepath.Join(dir, key), make([]byte, 60), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removeErr := errors.New("forced startup byte-prune removal failure")
+	beforeAggregate := counterValue(t, cacheEvictionsTotal)
+	beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonByte)
+	c, err := NewDiskCache(dir, 80, DiskCacheOptions{
+		CapacityProvider: func(string) (diskSpace, error) {
+			// owned=120, reserve=50, free=0 => byte ceiling=70.
+			return diskSpace{TotalBytes: 1000, FreeBytes: 0}, nil
+		},
+		removeFile: func(string) error { return removeErr },
+	})
+	if c != nil {
+		t.Fatal("NewDiskCache returned an over-capacity cache after initial byte pruning failed")
+	}
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("NewDiskCache error = %v, want wrapped byte-prune removal error", err)
+	}
+	if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 0 {
+		t.Fatalf("aggregate evictions after failed startup byte removal = %v, want 0", got)
+	}
+	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonByte) - beforeLabel; got != 0 {
+		t.Fatalf("labelled evictions after failed startup byte removal = %v, want 0", got)
+	}
+}
+
+func TestCachePressureEvictionsHaveBoundedPhaseAndReason(t *testing.T) {
+	t.Run("startup entry pressure", func(t *testing.T) {
+		dir := t.TempDir()
+		for _, key := range []string{strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64)} {
+			if err := os.WriteFile(filepath.Join(dir, key), []byte("x"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry)
+		beforeAggregate := counterValue(t, cacheEvictionsTotal)
+		c, err := NewDiskCache(dir, 80, DiskCacheOptions{
+			MaxEntries: 2,
+			CapacityProvider: func(string) (diskSpace, error) {
+				return diskSpace{TotalBytes: 1000, FreeBytes: 990}, nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.order.Len() != 2 {
+			t.Fatalf("startup entry limit retained %d entries, want 2", c.order.Len())
+		}
+		if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry) - before; got != 1 {
+			t.Fatalf("startup entry evictions = %v, want 1", got)
+		}
+		if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 1 {
+			t.Fatalf("aggregate startup evictions = %v, want 1", got)
+		}
+	})
+
+	t.Run("request byte pressure", func(t *testing.T) {
+		c := newTestCache(t)
+		c.maxBytes = 100
+		before := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseRequest, cacheEvictionReasonByte)
+		if _, err := c.PutStream(strings.Repeat("4", 64), bytes.NewReader(make([]byte, 60))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.PutStream(strings.Repeat("5", 64), bytes.NewReader(make([]byte, 60))); err != nil {
+			t.Fatal(err)
+		}
+		if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseRequest, cacheEvictionReasonByte) - before; got != 1 {
+			t.Fatalf("request byte evictions = %v, want 1", got)
+		}
+	})
+}
+
+func TestRefreshCapacityShrinksImmediatelyAndRecoversAfterHysteresis(t *testing.T) {
+	space := diskSpace{TotalBytes: 1000, FreeBytes: 200}
+	c, err := NewDiskCache(t.TempDir(), 80, DiskCacheOptions{CapacityProvider: func(string) (diskSpace, error) {
+		return space, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The provider is synthetic, so make the seeded in-memory cache and free
+	// space agree with a cache that has reached its 80%-of-disk target.
+	c.maxBytes = 800
+	for _, key := range []string{strings.Repeat("6", 64), strings.Repeat("7", 64)} {
+		if _, err := c.PutStream(key, bytes.NewReader(make([]byte, 400))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonByte)
+	space.FreeBytes = 10
+	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 760 {
+		t.Fatalf("shrunk capacity = %d (ok=%v), want 760", got, ok)
+	}
+	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonByte) - before; got != 1 {
+		t.Fatalf("background byte evictions = %v, want 1", got)
+	}
+
+	space.FreeBytes = 600
+	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 760 {
+		t.Fatalf("first recovery refresh = %d (ok=%v), want hysteresis to hold 760", got, ok)
+	}
+	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 800 {
+		t.Fatalf("second recovery refresh = %d (ok=%v), want 800", got, ok)
+	}
+}
+
+func TestRefreshCapacityRetriesEvictionAtUnchangedCeiling(t *testing.T) {
+	space := diskSpace{TotalBytes: 1000, FreeBytes: 1000}
+	c, err := NewDiskCache(t.TempDir(), 80, DiskCacheOptions{CapacityProvider: func(string) (diskSpace, error) {
+		return space, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, key := range []string{strings.Repeat("8", 64), strings.Repeat("9", 64)} {
+		if _, err := c.PutStream(key, bytes.NewReader(make([]byte, 400))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removeAttempts := 0
+	c.removeFile = func(path string) error {
+		removeAttempts++
+		if removeAttempts == 1 {
+			return errors.New("transient background removal failure")
+		}
+		return os.Remove(path)
+	}
+	beforeAggregate := counterValue(t, cacheEvictionsTotal)
+	beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonByte)
+
+	// free + owned - reserve = 10 + 800 - 50 = 760. The first refresh
+	// lowers the ceiling, but its one required eviction fails transiently.
+	space.FreeBytes = 10
+	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 760 {
+		t.Fatalf("first refresh capacity = %d (ok=%v), want 760", got, ok)
+	}
+	if removeAttempts != 1 || c.currentSize != 800 || c.order.Len() != 2 {
+		t.Fatalf("cache after failed convergence = attempts:%d bytes:%d entries:%d, want 1/800/2", removeAttempts, c.currentSize, c.order.Len())
+	}
+	if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 0 {
+		t.Fatalf("aggregate evictions after failed convergence = %v, want 0", got)
+	}
+	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonByte) - beforeLabel; got != 0 {
+		t.Fatalf("labelled evictions after failed convergence = %v, want 0", got)
+	}
+
+	// The byte ceiling is unchanged, but the cache is still over it, so the
+	// next refresh must retry and converge after the transient error clears.
+	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 760 {
+		t.Fatalf("second refresh capacity = %d (ok=%v), want 760", got, ok)
+	}
+	if removeAttempts != 2 || c.currentSize != 400 || c.order.Len() != 1 {
+		t.Fatalf("cache after retried convergence = attempts:%d bytes:%d entries:%d, want 2/400/1", removeAttempts, c.currentSize, c.order.Len())
+	}
+	if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 1 {
+		t.Fatalf("aggregate evictions after convergence = %v, want 1", got)
+	}
+	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonByte) - beforeLabel; got != 1 {
+		t.Fatalf("labelled evictions after convergence = %v, want 1", got)
 	}
 }
 
@@ -516,6 +946,135 @@ func TestPutStreamOversizedObject(t *testing.T) {
 	}
 }
 
+func TestPutStreamRejectsNewEntryWhenRequiredEvictionFails(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		maxBytes   int64
+		maxEntries int
+		reason     cacheEvictionReason
+	}{
+		{name: "byte pressure", maxBytes: 100, maxEntries: 10, reason: cacheEvictionReasonByte},
+		{name: "entry pressure", maxBytes: 1000, maxEntries: 1, reason: cacheEvictionReasonEntry},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.maxBytes = tc.maxBytes
+			c.maxEntries = tc.maxEntries
+
+			incumbent := strings.Repeat("1", 64)
+			candidate := strings.Repeat("2", 64)
+			body := bytes.Repeat([]byte("x"), 60)
+			if _, err := c.PutStream(incumbent, bytes.NewReader(body)); err != nil {
+				t.Fatalf("seed PutStream: %v", err)
+			}
+
+			removeErr := errors.New("forced committed-file removal failure")
+			incumbentPath := filepath.Join(c.dir, incumbent)
+			c.removeFile = func(path string) error {
+				if path == incumbentPath {
+					return removeErr
+				}
+				return os.Remove(path)
+			}
+			beforeAggregate := counterValue(t, cacheEvictionsTotal)
+			beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseRequest, tc.reason)
+
+			if _, err := c.PutStream(candidate, bytes.NewReader(body)); err == nil {
+				t.Fatal("PutStream admitted a new entry after required eviction failed")
+			}
+			if !c.Has(incumbent) || c.Has(candidate) {
+				t.Fatalf("index membership incumbent/candidate = %t/%t, want true/false", c.Has(incumbent), c.Has(candidate))
+			}
+			if c.currentSize != int64(len(body)) || c.order.Len() != 1 {
+				t.Fatalf("cache accounting after rejected admission = %d bytes/%d entries, want %d/1", c.currentSize, c.order.Len(), len(body))
+			}
+			got, err := os.ReadFile(incumbentPath)
+			if err != nil || !bytes.Equal(got, body) {
+				t.Fatalf("incumbent body after rejected admission = %q, %v", got, err)
+			}
+			if _, err := os.Stat(filepath.Join(c.dir, candidate)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("candidate committed after rejected admission: %v", err)
+			}
+			if tmpDirEntries(t, c) != 0 {
+				t.Fatal("rejected admission leaked a temporary file")
+			}
+			items, bits, ok := c.SummarySnapshot()
+			if !ok || items != 1 {
+				t.Fatalf("summary after rejected admission = ok:%t items:%d, want true/1", ok, items)
+			}
+			summary := &cacheSummary{MBits: summaryBloomBits, Hashes: summaryBloomHashes, Bits: bits}
+			if !summary.Contains(incumbent) {
+				t.Fatal("rejected admission removed incumbent from the Bloom summary")
+			}
+			if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 0 {
+				t.Fatalf("aggregate evictions after failed removal = %v, want 0", got)
+			}
+			if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseRequest, tc.reason) - beforeLabel; got != 0 {
+				t.Fatalf("labelled evictions after failed removal = %v, want 0", got)
+			}
+		})
+	}
+}
+
+func TestPutStreamPreservesOldBodyWhenReplacementEvictionFails(t *testing.T) {
+	c, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.maxBytes = 100
+	replacementKey := strings.Repeat("3", 64)
+	victimKey := strings.Repeat("4", 64)
+	oldBody := bytes.Repeat([]byte("o"), 20)
+	victimBody := bytes.Repeat([]byte("v"), 60)
+	if _, err := c.PutStream(replacementKey, bytes.NewReader(oldBody)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.PutStream(victimKey, bytes.NewReader(victimBody)); err != nil {
+		t.Fatal(err)
+	}
+
+	victimPath := filepath.Join(c.dir, victimKey)
+	removeErr := errors.New("forced replacement-victim removal failure")
+	c.removeFile = func(path string) error {
+		if path == victimPath {
+			return removeErr
+		}
+		return os.Remove(path)
+	}
+	beforeAggregate := counterValue(t, cacheEvictionsTotal)
+	beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseRequest, cacheEvictionReasonByte)
+
+	if _, err := c.PutStream(replacementKey, bytes.NewReader(bytes.Repeat([]byte("n"), 60))); err == nil {
+		t.Fatal("PutStream committed an over-budget replacement after required eviction failed")
+	}
+	if c.currentSize != int64(len(oldBody)+len(victimBody)) || c.order.Len() != 2 {
+		t.Fatalf("cache accounting after rejected replacement = %d bytes/%d entries, want %d/2", c.currentSize, c.order.Len(), len(oldBody)+len(victimBody))
+	}
+	got, err := os.ReadFile(filepath.Join(c.dir, replacementKey))
+	if err != nil || !bytes.Equal(got, oldBody) {
+		t.Fatalf("replacement body after rejected overwrite = %q, %v; want old body", got, err)
+	}
+	if got, err := os.ReadFile(victimPath); err != nil || !bytes.Equal(got, victimBody) {
+		t.Fatalf("victim body after rejected overwrite = %q, %v", got, err)
+	}
+	if tmpDirEntries(t, c) != 0 {
+		t.Fatal("rejected replacement leaked a temporary file")
+	}
+	items, _, ok := c.SummarySnapshot()
+	if !ok || items != 2 {
+		t.Fatalf("summary after rejected replacement = ok:%t items:%d, want true/2", ok, items)
+	}
+	if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 0 {
+		t.Fatalf("aggregate evictions after failed replacement removal = %v, want 0", got)
+	}
+	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseRequest, cacheEvictionReasonByte) - beforeLabel; got != 0 {
+		t.Fatalf("labelled evictions after failed replacement removal = %v, want 0", got)
+	}
+}
+
 // TestHasAnswersFromIndexNotDisk: an untracked file sitting in the cache dir
 // is NOT "in the cache" — the index is the single source of truth for both
 // lookups and eviction/size accounting. (Pre-fix, Has stat'ed the disk and
@@ -745,7 +1304,9 @@ func TestScanExistingEnforcesByteAndEntryCeilings(t *testing.T) {
 		order:      list.New(),
 		index:      make(map[string]*list.Element),
 	}
-	c.scanExisting()
+	if _, err := c.scanExisting(); err != nil {
+		t.Fatal(err)
+	}
 	if c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries {
 		t.Fatalf("startup cache exceeds ceilings: bytes=%d/%d entries=%d/%d", c.currentSize, c.maxBytes, c.order.Len(), c.maxEntries)
 	}

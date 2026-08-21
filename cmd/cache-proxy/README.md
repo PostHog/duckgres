@@ -9,7 +9,7 @@ available, and forwards cache misses to origin object storage.
 | Setting | Default | Notes |
 | --- | --- | --- |
 | `CACHE_DIR` | `/cache` | Local disk cache directory. |
-| `CACHE_MAX_PERCENT` | `80` | Target for tracked cache bytes, clamped to what is actually free (minus a 5%-of-total reserve). Recomputed every minute; the target only shrinks. Completed commits evict to this target, except that one entry larger than the target is retained. Concurrent temporary files are outside tracked-byte accounting. |
+| `CACHE_MAX_PERCENT` | `80` | Target for committed cache bytes. The proxy retains a 5%-of-total-disk reserve and accounts for its own committed files as reclaimable, so a restart of an 80%-full cache does not mistake the cache itself for external disk use. Capacity is refreshed every minute; reductions apply immediately and recovery requires two consecutive healthy samples. |
 | `CACHE_MAX_ENTRIES` | `1000000` | Strict maximum tracked LRU entries after each serialized final commit. Bounds local cache-index memory. |
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
@@ -29,9 +29,41 @@ available, and forwards cache misses to origin object storage.
 Cache bodies stream concurrently into temporary files. Only the short final
 rename plus exact-index, LRU, byte-count, and counting-Bloom update is serialized.
 That commit evicts before returning, so completed commits cannot exceed
-`CACHE_MAX_ENTRIES`, and tracked bytes do not exceed the current disk target
-unless a single retained entry is itself larger than that target. Concurrent
-temporary files consume real disk but are not yet tracked cache entries.
+`CACHE_MAX_ENTRIES`, and tracked bytes do not exceed the current cache byte
+capacity unless a single retained entry is itself larger than that capacity.
+Concurrent temporary files consume real disk but are not yet tracked cache
+entries.
+
+## Capacity startup, recovery, and failures
+
+The cache capacity calculation is:
+
+```text
+diskTarget = CACHE_MAX_PERCENT / 100 * totalDiskBytes
+reserve = 5% * totalDiskBytes
+reclaimable = max(0, freeBytes + committedCacheBytes - reserve)
+cacheCapacity = min(diskTarget, reclaimable)
+```
+
+Only successfully committed files whose names are valid cache keys contribute
+to `committedCacheBytes`. Interrupted files in `.tmp` are removed during
+startup and are never cached or counted as evictions. Invalid or unrelated
+root-directory entries are left in place and remain external disk usage.
+
+When another writer consumes local disk, the cache lowers its capacity and
+evicts least-recently-used committed entries as needed to preserve the reserve.
+When that pressure disappears, it expands only after two consecutive refreshes
+confirm recovery; no deleted entries are recreated automatically. If the proxy
+cannot inspect the filesystem or prune an over-limit committed entry at startup,
+it exits rather than serving with an unknown or unenforceable disk budget. Once
+running, a failed pressure-driven deletion leaves the entry indexed and is
+logged, then is retried on later refreshes while the cache remains over its
+limit. Failed and already-absent deletions are never reported as evictions.
+
+This compatibility release continues to use the configured
+`CACHE_MAX_ENTRIES` as the active admission ceiling; its default is 1,000,000.
+The derived disk/entry/Bloom sizing calculations prepare the later
+derived-entry rollout but do not replace that configured limit.
 
 ## Cluster-wide fetch dedup
 
