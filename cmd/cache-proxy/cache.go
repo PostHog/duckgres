@@ -4,9 +4,11 @@ import (
 	"container/heap"
 	"container/list"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -52,14 +54,73 @@ var (
 		Name: "cache_proxy_cache_size_bytes",
 		Help: "Current cache size on disk",
 	})
+	cacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_entries",
+		Help: "Current committed cache entries represented by the exact index",
+	})
+	cacheEntryLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_entry_limit",
+		Help: "Active committed cache entry limit",
+	})
+	cacheOwnedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_owned_bytes",
+		Help: "Committed cache bytes owned and reclaimable by the cache",
+	})
 	cacheCapacityBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "cache_proxy_cache_capacity_bytes",
 		Help: "Maximum cache capacity",
 	})
+	cacheDiskTargetBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_disk_target_bytes",
+		Help: "Configured percentage-of-disk cache target before free-space clamping",
+	})
+	cacheDiskReserveBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_disk_reserve_bytes",
+		Help: "Whole-filesystem reserve excluded from cache capacity",
+	})
+	cacheEntryLimitReason = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_entry_limit_reason",
+		Help: "Future derived entry-limit bottleneck; exactly one of disk or metadata is 1",
+	}, []string{"reason"})
 	cacheEvictionsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "cache_proxy_evictions_total",
 		Help: "Number of LRU cache evictions",
 	})
+	cacheEvictionsByPhaseReasonTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cache_proxy_evictions_by_phase_reason_total",
+		Help: "Committed cache-entry evictions by bounded phase and pressure reason",
+	}, []string{"phase", "reason"})
+	cacheStartupScanDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "cache_proxy_cache_startup_scan_duration_seconds",
+		Help: "Duration of cache startup scans",
+	})
+	cacheStartupScanFilesInspectedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_cache_startup_scan_files_inspected_total",
+		Help: "Directory entries inspected during cache startup scans",
+	})
+	cacheStartupInvalidFilesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_cache_startup_invalid_files_total",
+		Help: "Invalid or unrelated root-directory entries excluded from cache ownership during startup scans",
+	})
+	cacheTemporaryFilesRemovedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_cache_temporary_files_removed_total",
+		Help: "Incomplete temporary cache files removed during startup cleanup",
+	})
+)
+
+type cacheEvictionPhase = string
+
+const (
+	cacheEvictionPhaseStartup    cacheEvictionPhase = "startup"
+	cacheEvictionPhaseBackground cacheEvictionPhase = "background"
+	cacheEvictionPhaseRequest    cacheEvictionPhase = "request"
+)
+
+type cacheEvictionReason = string
+
+const (
+	cacheEvictionReasonEntry cacheEvictionReason = "entry"
+	cacheEvictionReasonByte  cacheEvictionReason = "byte"
 )
 
 // CacheKey computes a deterministic cache key from a full URL and byte range.
@@ -88,6 +149,14 @@ type DiskCache struct {
 	maxBytes    int64
 	maxEntries  int
 	currentSize int64
+	maxPercent  int
+	blockSize   int64
+	space       capacityProvider
+
+	// Consecutive above-current samples are required before raising capacity.
+	// Reductions apply immediately to restore the filesystem reserve.
+	recoveryCandidate int64
+	recoverySamples   int
 
 	mu sync.Mutex
 	// order is the access list: least recently used at the front, most recent
@@ -99,9 +168,37 @@ type DiskCache struct {
 	summary *summaryIndex
 	// renameFile is os.Rename in production and a per-cache failure seam in tests.
 	renameFile func(string, string) error
+	// removeFile is os.Remove in production and a per-cache failure seam in tests.
+	removeFile func(string) error
+	// openScanDirectory is os.Open in production and lets constructor tests
+	// inject directory-open and mid-scan failures deterministically.
+	openScanDirectory openCacheDirectory
 }
 
 const defaultCacheMaxEntries = 1_000_000
+
+const (
+	defaultCacheBlockSizeBytes      int64 = 8 << 20
+	capacityRecoveryRequiredSamples       = 2
+)
+
+type diskSpace struct {
+	TotalBytes int64
+	FreeBytes  int64
+}
+
+type capacityProvider func(string) (diskSpace, error)
+
+type cacheDirectory interface {
+	ReadDir(int) ([]os.DirEntry, error)
+	Close() error
+}
+
+type openCacheDirectory func(string) (cacheDirectory, error)
+
+func openDirectory(path string) (cacheDirectory, error) {
+	return os.Open(path)
+}
 
 type cacheEntry struct {
 	key        string
@@ -130,43 +227,20 @@ func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*Dis
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 
-	// Recreate the temp dir from scratch so any half-written streams left by a
-	// crash don't linger and leak disk.
-	tmpDir := filepath.Join(dir, tmpSubdir)
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0750); err != nil {
-		return nil, fmt.Errorf("create cache temp dir: %w", err)
-	}
-
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(dir, &stat); err != nil {
-		return nil, fmt.Errorf("statfs %s: %w", dir, err)
-	}
-
-	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
-	freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
-	// Start at the percent-of-total ceiling, immediately clamped to what is
-	// actually free (well, free minus a reserve): the cache must never treat
-	// space already consumed by anything else (container layers, other pods
-	// sharing the filesystem, the rootfs on a tiny test disk) as available.
-	maxBytes := clampToFree(totalBytes*int64(maxPercent)/100, totalBytes, freeBytes)
-
-	slog.Info("Cache initialized.",
-		"dir", dir,
-		"total_disk", totalBytes,
-		"max_cache", maxBytes,
-		"max_percent", maxPercent,
-	)
-
-	cacheCapacityBytes.Set(float64(maxBytes))
-
 	dc := &DiskCache{
-		dir:        dir,
-		maxBytes:   maxBytes,
-		maxEntries: defaultCacheMaxEntries,
-		order:      list.New(),
-		index:      make(map[string]*list.Element),
-		renameFile: os.Rename,
+		dir: dir,
+		// Startup must account for committed files before applying a byte
+		// ceiling, so scans initially load without byte pruning.
+		maxBytes:          math.MaxInt64,
+		maxEntries:        defaultCacheMaxEntries,
+		maxPercent:        maxPercent,
+		blockSize:         defaultCacheBlockSizeBytes,
+		space:             statfsDiskSpace,
+		order:             list.New(),
+		index:             make(map[string]*list.Element),
+		renameFile:        os.Rename,
+		removeFile:        os.Remove,
+		openScanDirectory: openDirectory,
 	}
 	if len(options) > 0 {
 		if options[0].MaxEntries > 0 {
@@ -175,10 +249,54 @@ func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*Dis
 		if options[0].IncrementalSummary {
 			dc.summary = newSummaryIndex()
 		}
+		if options[0].BlockSizeBytes > 0 {
+			dc.blockSize = options[0].BlockSizeBytes
+		}
+		if options[0].CapacityProvider != nil {
+			dc.space = options[0].CapacityProvider
+		}
+		if options[0].openScanDirectory != nil {
+			dc.openScanDirectory = options[0].openScanDirectory
+		}
+		if options[0].removeFile != nil {
+			dc.removeFile = options[0].removeFile
+		}
 	}
 
-	// Scan existing cache entries
-	dc.scanExisting()
+	removedTemporaryFiles, err := resetTemporaryDirectory(filepath.Join(dir, tmpSubdir))
+	if err != nil {
+		return nil, fmt.Errorf("reset cache temp dir: %w", err)
+	}
+	if removedTemporaryFiles > 0 {
+		cacheTemporaryFilesRemovedTotal.Add(float64(removedTemporaryFiles))
+	}
+
+	// Sample free space before the scan can apply the legacy entry ceiling.
+	// Together with the scan's owned-byte total, this is a consistent restart
+	// view: if the scan deletes entry-limit victims before statfs runs, adding
+	// their former bytes to the newer free sample would double count them.
+	startupSpace, err := dc.diskSpace()
+	if err != nil {
+		return nil, fmt.Errorf("statfs %s: %w", dir, err)
+	}
+
+	// Scan existing cache entries before capacity is derived. The scan's owned
+	// byte total includes every valid committed file, even ones later discarded
+	// by the legacy entry ceiling, so a restart never mistakes the cache itself
+	// for external disk pressure.
+	ownedBytes, err := dc.scanExisting()
+	if err != nil {
+		return nil, fmt.Errorf("scan existing cache entries: %w", err)
+	}
+	if err := dc.initializeCapacity(ownedBytes, startupSpace); err != nil {
+		return nil, fmt.Errorf("apply startup cache limits: %w", err)
+	}
+
+	slog.Info("Cache initialized.",
+		"dir", dir,
+		"max_cache", dc.maxBytes,
+		"max_percent", maxPercent,
+	)
 
 	return dc, nil
 }
@@ -186,14 +304,16 @@ func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*Dis
 type DiskCacheOptions struct {
 	IncrementalSummary bool
 	MaxEntries         int
+	BlockSizeBytes     int64
+	CapacityProvider   capacityProvider
+	openScanDirectory  openCacheDirectory
+	removeFile         func(string) error
 }
 
-// clampToFree bounds a capacity target by the space actually available on the
-// filesystem: the cache may not grow into bytes it doesn't own (free space
-// shrinks over time as other writers consume the disk), and it always leaves
-// a small reserve so a full cache doesn't take the filesystem to 100%.
+// clampToFree remains a narrow compatibility helper for callers that have no
+// owned-cache total. DiskCache itself always uses deriveDiskCapacity instead.
 func clampToFree(target, totalBytes, freeBytes int64) int64 {
-	reserve := totalBytes / 20 // 5% of total, kept for everyone else
+	reserve := percentageOf(nonNegative(totalBytes), cacheDiskReservePercent)
 	if avail := freeBytes - reserve; target > avail {
 		target = avail
 	}
@@ -203,36 +323,23 @@ func clampToFree(target, totalBytes, freeBytes int64) int64 {
 	return target
 }
 
-// refreshCapacityStats recomputes maxBytes from the current statfs free space
-// and the percent-of-total ceiling. Returns (total, clamped max, ok). Only
-// ever LOWERS maxBytes: once another writer has eaten into the disk the cache
-// commits to the smaller budget, so later frees don't balloon it back up.
+// refreshCapacityStats recomputes maxBytes from live disk state. Valid
+// committed files are reclaimable cache-owned bytes, unlike invalid and
+// unrelated files. Capacity reductions are immediate to restore the 5%
+// reserve; capacity recovery requires two consecutive healthy samples to keep
+// short-lived external writers from flapping the advertised ceiling.
 func (c *DiskCache) refreshCapacityStats(maxPercent int) (int64, int64, bool) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(c.dir, &stat); err != nil {
+	space, err := c.diskSpace()
+	if err != nil {
 		return 0, 0, false
 	}
-	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
-	freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
-	target := clampToFree(totalBytes*int64(maxPercent)/100, totalBytes, freeBytes)
 
 	c.mu.Lock()
-	if target < c.maxBytes {
-		evicted := 0
-		for c.currentSize > target && c.order.Len() > 0 {
-			c.evictOldest()
-			evicted++
-		}
-		if target != c.maxBytes {
-			slog.Warn("Cache capacity lowered to fit free disk.",
-				"old_max", c.maxBytes, "new_max", target, "free", freeBytes, "evicted", evicted)
-			c.maxBytes = target
-			cacheCapacityBytes.Set(float64(target))
-		}
-	}
+	capacity := deriveDiskCapacity(space.TotalBytes, space.FreeBytes, c.currentSize, maxPercent)
+	c.applyCapacityLocked(capacity, cacheEvictionPhaseBackground)
 	max := c.maxBytes
 	c.mu.Unlock()
-	return totalBytes, max, true
+	return space.TotalBytes, max, true
 }
 
 // refreshCapacity periodically re-derives maxBytes from live statfs data so a
@@ -242,45 +349,208 @@ func (c *DiskCache) refreshCapacity(maxPercent int) {
 	c.refreshCapacityStats(maxPercent)
 }
 
-func (c *DiskCache) scanExisting() {
-	dir, err := os.Open(c.dir)
-	if err != nil {
-		return
+func (c *DiskCache) initializeCapacity(ownedBytes int64, space diskSpace) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	capacity := deriveDiskCapacity(space.TotalBytes, space.FreeBytes, ownedBytes, c.maxPercent)
+	c.maxBytes = capacity.ByteCeiling
+	c.recoveryCandidate = 0
+	c.recoverySamples = 0
+	c.updateCapacityMetricsLocked(capacity)
+	if err := c.evictToLimitsLocked(cacheEvictionPhaseStartup); err != nil {
+		c.updateStateMetricsLocked()
+		return err
 	}
-	defer func() { _ = dir.Close() }()
-	// Only count real cache entries — the .tmp dir's contents and any
-	// stray non-key files must not enter the LRU accounting.
+	c.updateStateMetricsLocked()
+	return nil
+}
+
+func (c *DiskCache) applyCapacityLocked(capacity diskCapacity, phase cacheEvictionPhase) {
+	oldMax := c.maxBytes
+	newMax := capacity.ByteCeiling
+	switch {
+	case newMax < oldMax:
+		c.maxBytes = newMax
+		c.recoveryCandidate = 0
+		c.recoverySamples = 0
+		slog.Warn("Cache capacity lowered to fit live disk pressure.",
+			"old_max", oldMax, "new_max", newMax, "owned_bytes", c.currentSize)
+	case newMax > oldMax:
+		if newMax >= c.recoveryCandidate {
+			c.recoveryCandidate = newMax
+			c.recoverySamples++
+		} else {
+			c.recoveryCandidate = newMax
+			c.recoverySamples = 1
+		}
+		if c.recoverySamples >= capacityRecoveryRequiredSamples {
+			c.maxBytes = newMax
+			c.recoveryCandidate = 0
+			c.recoverySamples = 0
+			slog.Info("Cache capacity recovered after stable disk samples.", "old_max", oldMax, "new_max", newMax)
+		}
+	default:
+		c.recoveryCandidate = 0
+		c.recoverySamples = 0
+	}
+	// Background convergence remains best effort: a hard deletion failure is
+	// logged by removeCommittedFile and leaves the entry indexed rather than
+	// taking the running proxy down. Retry on every refresh while over either
+	// active limit, including when the derived byte ceiling is unchanged.
+	if c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries {
+		_ = c.evictToLimitsLocked(phase)
+	}
+	c.updateCapacityMetricsLocked(capacity)
+	c.updateStateMetricsLocked()
+}
+
+func (c *DiskCache) updateCapacityMetricsLocked(capacity diskCapacity) {
+	cacheCapacityBytes.Set(float64(c.maxBytes))
+	cacheDiskTargetBytes.Set(float64(capacity.DiskTargetBytes))
+	cacheDiskReserveBytes.Set(float64(capacity.ReserveBytes))
+
+	// The active admission ceiling remains the compatibility 1M value in PR 1.
+	// These two reason series describe which guardrail would limit the future
+	// disk-derived ceiling, keeping the rollout observable before enabling it.
+	if deriveCacheEntryCeiling(capacity.ByteCeiling, c.blockSize) >= cacheMetadataEntryLimit {
+		cacheEntryLimitReason.WithLabelValues("disk").Set(0)
+		cacheEntryLimitReason.WithLabelValues("metadata").Set(1)
+	} else {
+		cacheEntryLimitReason.WithLabelValues("disk").Set(1)
+		cacheEntryLimitReason.WithLabelValues("metadata").Set(0)
+	}
+}
+
+func (c *DiskCache) updateStateMetricsLocked() {
+	cacheSizeBytes.Set(float64(c.currentSize))
+	cacheOwnedBytes.Set(float64(c.currentSize))
+	cacheEntries.Set(float64(c.order.Len()))
+	cacheEntryLimit.Set(float64(c.maxEntries))
+}
+
+func (c *DiskCache) diskSpace() (diskSpace, error) {
+	if c.space == nil {
+		return diskSpace{}, errors.New("no disk capacity provider")
+	}
+	return c.space(c.dir)
+}
+
+func statfsDiskSpace(dir string) (diskSpace, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(dir, &stat); err != nil {
+		return diskSpace{}, err
+	}
+	blockSize := uint64(stat.Bsize)
+	return diskSpace{
+		TotalBytes: filesystemBytes(stat.Blocks, blockSize),
+		FreeBytes:  filesystemBytes(stat.Bavail, blockSize),
+	}, nil
+}
+
+func filesystemBytes(blocks, blockSize uint64) int64 {
+	if blocks == 0 || blockSize == 0 {
+		return 0
+	}
+	if blocks > uint64(math.MaxInt64)/blockSize {
+		return math.MaxInt64
+	}
+	return int64(blocks * blockSize)
+}
+
+func resetTemporaryDirectory(tmpDir string) (int, error) {
+	removed := 0
+	if _, err := os.Lstat(tmpDir); err == nil {
+		err = filepath.WalkDir(tmpDir, func(_ string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if !entry.IsDir() {
+				removed++
+			}
+			return nil
+		})
+		if err != nil {
+			return 0, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, err
+	}
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(tmpDir, 0750); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+func (c *DiskCache) scanExisting() (ownedBytes int64, scanErr error) {
+	started := time.Now()
+	defer func() { cacheStartupScanDuration.Observe(time.Since(started).Seconds()) }()
+
+	openScanDirectory := c.openScanDirectory
+	if openScanDirectory == nil {
+		openScanDirectory = openDirectory
+	}
+	dir, err := openScanDirectory(c.dir)
+	if err != nil {
+		return 0, fmt.Errorf("open cache directory %s: %w", c.dir, err)
+	}
+	defer func() {
+		if err := dir.Close(); err != nil && scanErr == nil {
+			scanErr = fmt.Errorf("close cache directory %s: %w", c.dir, err)
+		}
+	}()
+	// Only count real, committed cache entries. Temporary files were removed
+	// before this scan; invalid and unrelated root entries stay on disk as
+	// external usage and never enter the exact index or owned-byte accounting.
 	// Do not reserve a million cacheEntry structs for an empty/new cache. The
 	// heap remains bounded by maxEntries but grows with actual disk contents.
 	found := make(oldestEntries, 0, min(c.maxEntries, 1024))
 	for {
 		entries, readErr := dir.ReadDir(1024)
 		for _, e := range entries {
-			if e.IsDir() || !IsValidCacheKey(e.Name()) {
+			cacheStartupScanFilesInspectedTotal.Inc()
+			if e.Name() == tmpSubdir {
+				continue
+			}
+			if !IsValidCacheKey(e.Name()) {
+				cacheStartupInvalidFilesTotal.Inc()
 				continue
 			}
 			info, err := e.Info()
 			if err != nil {
+				return 0, fmt.Errorf("inspect cache entry %s: %w", filepath.Join(c.dir, e.Name()), err)
+			}
+			if !info.Mode().IsRegular() {
+				cacheStartupInvalidFilesTotal.Inc()
 				continue
 			}
 			entry := cacheEntry{key: e.Name(), size: info.Size(), lastAccess: info.ModTime()}
+			ownedBytes = saturatingAdd(ownedBytes, entry.size)
 			if found.Len() < c.maxEntries {
 				heap.Push(&found, entry)
 				continue
 			}
 			if !entry.lastAccess.After(found[0].lastAccess) {
-				_ = os.Remove(filepath.Join(c.dir, entry.key))
+				path := filepath.Join(c.dir, entry.key)
+				if err := c.removeCommittedFile(path, cacheEvictionPhaseStartup, cacheEvictionReasonEntry); err != nil {
+					return 0, fmt.Errorf("prune startup cache entry %s: %w", path, err)
+				}
 				continue
 			}
 			dropped := heap.Pop(&found).(cacheEntry)
-			_ = os.Remove(filepath.Join(c.dir, dropped.key))
+			path := filepath.Join(c.dir, dropped.key)
+			if err := c.removeCommittedFile(path, cacheEvictionPhaseStartup, cacheEvictionReasonEntry); err != nil {
+				return 0, fmt.Errorf("prune startup cache entry %s: %w", path, err)
+			}
 			heap.Push(&found, entry)
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			return
+			return 0, fmt.Errorf("read cache directory %s: %w", c.dir, readErr)
 		}
 	}
 	// The access list must start in recency order (front = oldest) or the
@@ -290,7 +560,6 @@ func (c *DiskCache) scanExisting() {
 	})
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for i := range found {
 		entry := found[i]
 		c.index[entry.key] = c.order.PushBack(&entry)
@@ -299,10 +568,19 @@ func (c *DiskCache) scanExisting() {
 			c.summary.Add(entry.key)
 		}
 	}
-	for (c.order.Len() > c.maxEntries || c.currentSize > c.maxBytes) && c.order.Len() > 0 {
-		c.evictOldest()
+	// Direct callers that construct a DiskCache by hand retain the historical
+	// scan behavior. NewDiskCache defers byte pruning until its owned-byte
+	// capacity calculation is complete.
+	if c.space == nil {
+		if err := c.evictToLimitsLocked(cacheEvictionPhaseStartup); err != nil {
+			c.updateStateMetricsLocked()
+			c.mu.Unlock()
+			return 0, fmt.Errorf("apply startup cache limits: %w", err)
+		}
 	}
-	cacheSizeBytes.Set(float64(c.currentSize))
+	c.updateStateMetricsLocked()
+	c.mu.Unlock()
+	return ownedBytes, nil
 }
 
 // SummarySnapshot returns an immutable bounded copy of the locally maintained
@@ -370,13 +648,27 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	// commit. Streaming happened above without this lock; only the short rename
 	// syscall is serialized so eviction cannot delete the replacement in between.
 	c.mu.Lock()
+	el, replacing := c.index[key]
+	if replacing {
+		if !c.makeRoomForReplacementLocked(el, size, cacheEvictionPhaseRequest) {
+			c.mu.Unlock()
+			_ = os.Remove(tmpPath)
+			return 0, errors.New("admit cache replacement: required eviction failed")
+		}
+	} else {
+		if !c.makeRoomForNewEntryLocked(size, cacheEvictionPhaseRequest) {
+			c.mu.Unlock()
+			_ = os.Remove(tmpPath)
+			return 0, errors.New("admit cache entry: required eviction failed")
+		}
+	}
 	if err := renameFile(tmpPath, path); err != nil {
 		c.mu.Unlock()
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("commit cache entry: %w", err)
 	}
 
-	if el, replacing := c.index[key]; replacing {
+	if replacing {
 		// The key remained represented throughout the filesystem commit. Update
 		// its accounting in place so a concurrent Bloom snapshot can never see a
 		// transient negative for an already committed entry.
@@ -385,16 +677,8 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 		entry.size = size
 		entry.lastAccess = time.Now()
 		c.order.MoveToBack(el)
-		// Keep the replacement itself even when it exceeds maxBytes; this matches
-		// the existing oversized-object behavior. Evict older entries first.
-		for (c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries) && c.order.Len() > 1 {
-			c.evictOldest()
-		}
-		cacheSizeBytes.Set(float64(c.currentSize))
+		c.updateStateMetricsLocked()
 	} else {
-		for (c.currentSize+size > c.maxBytes || c.order.Len() >= c.maxEntries) && c.order.Len() > 0 {
-			c.evictOldest()
-		}
 		c.addLocked(key, size)
 	}
 	c.mu.Unlock()
@@ -479,26 +763,97 @@ func (c *DiskCache) addLocked(key string, size int64) {
 	if c.summary != nil {
 		c.summary.Add(key)
 	}
-	cacheSizeBytes.Set(float64(c.currentSize))
+	c.updateStateMetricsLocked()
 }
 
 // evictOldest removes the least recently used entry. The list front is the
 // LRU entry by construction: adds and touches always move entries to the
 // back, and scanExisting seeds the list in recency order.
-func (c *DiskCache) evictOldest() {
+func (c *DiskCache) evictOldest(phase cacheEvictionPhase, reason cacheEvictionReason) error {
 	front := c.order.Front()
 	if front == nil {
-		return
+		return nil
 	}
 	oldest := front.Value.(*cacheEntry)
 	path := filepath.Join(c.dir, oldest.key)
-	_ = os.Remove(path)
+	if err := c.removeCommittedFile(path, phase, reason); err != nil {
+		return err
+	}
 	c.currentSize -= oldest.size
 	c.order.Remove(front)
 	delete(c.index, oldest.key)
 	if c.summary != nil {
 		c.summary.Remove(oldest.key)
 	}
-	cacheEvictionsTotal.Inc()
-	cacheSizeBytes.Set(float64(c.currentSize))
+	c.updateStateMetricsLocked()
+	return nil
+}
+
+func (c *DiskCache) makeRoomForNewEntryLocked(size int64, phase cacheEvictionPhase) bool {
+	for c.order.Len() >= c.maxEntries && c.order.Len() > 0 {
+		if c.evictOldest(phase, cacheEvictionReasonEntry) != nil {
+			return false
+		}
+	}
+	for c.currentSize+size > c.maxBytes && c.order.Len() > 0 {
+		if c.evictOldest(phase, cacheEvictionReasonByte) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *DiskCache) makeRoomForReplacementLocked(replacement *list.Element, size int64, phase cacheEvictionPhase) bool {
+	entry := replacement.Value.(*cacheEntry)
+	// Protect the entry being replaced from eviction. If reservation or rename
+	// fails, its old committed body and accounting remain usable.
+	c.order.MoveToBack(replacement)
+	for c.order.Len() > c.maxEntries && c.order.Len() > 1 {
+		if c.evictOldest(phase, cacheEvictionReasonEntry) != nil {
+			return false
+		}
+	}
+	for c.currentSize-entry.size+size > c.maxBytes && c.order.Len() > 1 {
+		if c.evictOldest(phase, cacheEvictionReasonByte) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *DiskCache) evictToLimitsLocked(phase cacheEvictionPhase) error {
+	for c.order.Len() > c.maxEntries && c.order.Len() > 0 {
+		if err := c.evictOldest(phase, cacheEvictionReasonEntry); err != nil {
+			return err
+		}
+	}
+	for c.currentSize > c.maxBytes && c.order.Len() > 0 {
+		if err := c.evictOldest(phase, cacheEvictionReasonByte); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeCommittedFile is the one filesystem deletion path for valid cache
+// files under pressure. A successful unlink is always visible in both the
+// aggregate eviction counter and its bounded phase/reason breakdown. A file
+// already removed by an external actor is forgotten without claiming an
+// eviction; a hard unlink failure preserves its index accounting.
+func (c *DiskCache) removeCommittedFile(path string, phase cacheEvictionPhase, reason cacheEvictionReason) error {
+	removeFile := c.removeFile
+	if removeFile == nil {
+		removeFile = os.Remove
+	}
+	err := removeFile(path)
+	if err == nil {
+		cacheEvictionsTotal.Inc()
+		cacheEvictionsByPhaseReasonTotal.WithLabelValues(string(phase), string(reason)).Inc()
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	slog.Warn("Unable to evict committed cache file.", "path", path, "phase", phase, "reason", reason, "error", err)
+	return err
 }

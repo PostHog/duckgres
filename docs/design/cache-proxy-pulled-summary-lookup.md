@@ -26,8 +26,8 @@ origin fills. Summaries contain only opaque cache-locator membership hints.
 | Setting | Default | Bound |
 | --- | --- | --- |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` or `summary`; unknown values fail startup. |
-| `CACHE_MAX_ENTRIES` | `1000000` | Strict maximum tracked entries after each final commit. |
-| `CACHE_MAX_PERCENT` | `80` | Target for tracked cache bytes; one entry larger than the target is retained. |
+| `CACHE_MAX_ENTRIES` | `1000000` | Configured legacy admission limit and strict maximum tracked entries after each final commit. |
+| `CACHE_MAX_PERCENT` | `80` | Percentage-of-total-disk target for committed cache bytes. The active capacity also accounts for reclaimable cache-owned files while retaining a 5%-of-total-disk reserve. |
 | `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Local counting Bloom, snapshot and pull reserve, and retained remote Bloom bits. |
 | `CACHE_PEER_MAX_PROBES_PER_REQUEST` | `5` | Maximum summary-mode `/cache/has` confirmations per client request, shared across block misses. `CACHE_PEER_MAX_PROBES` is a deprecated alias. |
 | `CACHE_MAX_CONCURRENT_PEER_PROBES` | `64` | Pod-wide, non-blocking cap on active confirmation HTTP requests and sockets. `CACHE_MAX_PEER_PROBES_IN_FLIGHT` is a deprecated alias. |
@@ -36,10 +36,42 @@ Body copies remain concurrent: each fill streams into a temporary file without
 holding the cache-index lock. The short final commit is serialized across the
 rename, LRU eviction, exact-index and byte accounting, and counting-Bloom
 update. A completed commit therefore cannot exceed `CACHE_MAX_ENTRIES`.
-Tracked bytes are evicted to the current disk target before the commit returns,
-except that a single entry larger than the target is retained rather than
-silently discarded. Concurrent temporary files consume real disk but are not
-yet tracked cache entries.
+Tracked bytes are evicted to the current cache byte capacity before the commit
+returns, except that a single entry larger than the capacity is retained rather
+than silently discarded. Concurrent temporary files consume real disk but are
+not yet tracked cache entries.
+
+### Disk capacity and startup ownership
+
+The cache derives its active byte capacity from each filesystem sample:
+
+```text
+diskTarget = CACHE_MAX_PERCENT / 100 * totalDiskBytes
+reserve = 5% * totalDiskBytes
+reclaimable = max(0, freeBytes + committedCacheBytes - reserve)
+cacheCapacity = min(diskTarget, reclaimable)
+```
+
+`committedCacheBytes` contains only regular files whose names are valid cache
+keys. These files are cache-owned and reclaimable through eviction, so a
+restart does not mistake a full cache for external disk pressure. Interrupted
+temporary files are removed before the startup scan. Invalid or unrelated
+root-directory entries remain on disk and count only through reduced free
+space.
+
+Startup scans existing entries before applying byte capacity, retains the
+newest entries within the configured legacy entry limit, and then evicts
+least-recently-used entries until both limits are satisfied. If temporary-file
+cleanup, filesystem sampling, directory scanning, entry inspection, or
+required startup eviction fails, initialization fails and the proxy does not
+begin serving with an unknown or unenforceable disk budget.
+
+Capacity is refreshed every minute. A lower ceiling is applied immediately and
+least-recently-used entries are evicted as needed to restore the reserve. An
+increase requires two consecutive healthy samples before it is applied, which
+prevents short-lived external disk usage from flapping the ceiling. Runtime
+deletion failures leave the entry indexed, are not counted as successful
+evictions, and are retried during later over-limit refreshes.
 
 The process-level backstop remains the pod memory limit and Go memory policy.
 The settings above bound the largest cache-proxy-owned contributors, but do not

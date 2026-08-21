@@ -178,6 +178,7 @@ func main() {
 	store, err := NewDiskCache(cacheDir, maxPercent, DiskCacheOptions{
 		IncrementalSummary: lookupMode == peerLookupSummary && peerService != "",
 		MaxEntries:         maxEntries,
+		BlockSizeBytes:     blockSize,
 	})
 	if err != nil {
 		slog.Error("Failed to initialize cache store.", "error", err)
