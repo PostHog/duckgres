@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -20,20 +22,229 @@ import (
 // confirmation contract. Bloom summaries only eliminate definite negatives;
 // they never authorize a body GET without an exact /cache/has confirmation.
 
-func TestSummaryParserRejectsLegacyDynamicBloomLayout(t *testing.T) {
-	key := strings.Repeat("a", 64)
-	bits, hashes := bloomParams(1)
+type dynamicSummaryWireFixture struct {
+	Version     int    `json:"v"`
+	Layout      int    `json:"l"`
+	CreatedNS   int64  `json:"c"`
+	ExpiresNS   int64  `json:"e"`
+	ItemCount   int    `json:"n"`
+	DesignItems int    `json:"d"`
+	MBits       uint64 `json:"m"`
+	Hashes      uint8  `json:"k"`
+	Bits        []byte `json:"b"`
+}
+
+func dynamicSummaryWireForKeys(t testing.TB, designItems, itemCount int, keys []string, now time.Time) dynamicSummaryWireFixture {
+	t.Helper()
+	bits, hashes := bloomParams(designItems)
 	payload := make([]byte, bits/8)
-	bloomHashes(key, bits, hashes, func(bit uint64) {
-		payload[bit/8] |= 1 << (bit % 8)
-	})
-	summary := summaryFromIncrementalBits(bits, hashes, payload, time.Now(), time.Minute)
-	body, err := summary.MarshalBinary()
+	for _, key := range keys {
+		if !IsValidCacheKey(key) {
+			t.Fatalf("invalid test cache key %q", key)
+		}
+		bloomHashes(key, bits, hashes, func(bit uint64) {
+			payload[bit/8] |= 1 << (bit % 8)
+		})
+	}
+	return dynamicSummaryWireFixture{
+		Version:     3,
+		Layout:      cacheLayoutVersion,
+		CreatedNS:   now.UnixNano(),
+		ExpiresNS:   now.Add(time.Minute).UnixNano(),
+		ItemCount:   itemCount,
+		DesignItems: designItems,
+		MBits:       bits,
+		Hashes:      hashes,
+		Bits:        payload,
+	}
+}
+
+func marshalDynamicSummaryWireForTest(t testing.TB, summary dynamicSummaryWireFixture) []byte {
+	t.Helper()
+	body, err := json.Marshal(summary)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := parseCacheSummary(body, time.Now()); err == nil {
-		t.Fatal("accepted legacy dynamically sized Bloom layout; want fixed incremental layout only")
+	return body
+}
+
+func TestSummaryParserReadsLegacyAndDynamicBloomWireFormats(t *testing.T) {
+	now := time.Now()
+	legacyKey, dynamicKey := strings.Repeat("a", 64), strings.Repeat("b", 64)
+
+	legacy := fixedCacheSummaryForKeys(t, []string{legacyKey}, now, time.Minute)
+	legacy.Version = 2
+	parsedLegacy, err := parseCacheSummary(marshalCacheSummaryForTest(t, legacy), now)
+	if err != nil {
+		t.Fatalf("parse legacy v2 summary: %v", err)
+	}
+	if !parsedLegacy.Contains(legacyKey) {
+		t.Fatal("parsed legacy v2 summary omitted its cached key")
+	}
+
+	dynamicWire := dynamicSummaryWireForKeys(t, 128, 1, []string{dynamicKey}, now)
+	if dynamicWire.MBits == summaryBloomBits {
+		t.Fatal("dynamic test fixture unexpectedly uses the legacy fixed Bloom layout")
+	}
+	legacyDynamic := summaryFromIncrementalBits(dynamicWire.MBits, dynamicWire.Hashes, dynamicWire.Bits, now, time.Minute)
+	legacyDynamic.Version = 2
+	if _, err := parseCacheSummary(marshalCacheSummaryForTest(t, legacyDynamic), now); err == nil {
+		t.Fatal("legacy v2 summary accepted non-legacy Bloom dimensions")
+	}
+	parsedDynamic, err := parseCacheSummary(marshalDynamicSummaryWireForTest(t, dynamicWire), now)
+	if err != nil {
+		t.Fatalf("parse self-describing v3 summary: %v", err)
+	}
+	if !parsedDynamic.Contains(dynamicKey) {
+		t.Fatal("parsed self-describing v3 summary omitted its cached key")
+	}
+
+	roundTrip, err := parsedDynamic.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal parsed v3 summary: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(roundTrip, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"n", "d"} {
+		if _, ok := fields[field]; !ok {
+			t.Fatalf("marshaled v3 summary omitted self-describing field %q", field)
+		}
+	}
+}
+
+func TestLargeDynamicSummaryFitsWireCapAndRoundTripsParameters(t *testing.T) {
+	const (
+		designItems = 9_700_000
+		itemCount   = 9_800_000 // Saturation degrades FPR but does not invalidate the hint.
+	)
+	now := time.Now()
+	key := strings.Repeat("e", 64)
+	wire := dynamicSummaryWireForKeys(t, designItems, itemCount, []string{key}, now)
+	if len(wire.Bits) < 11<<20 {
+		t.Fatalf("large-layout fixture has only %d raw Bloom bytes, want a realistic >11 MiB payload", len(wire.Bits))
+	}
+
+	parsed, err := parseCacheSummary(marshalDynamicSummaryWireForTest(t, wire), now)
+	if err != nil {
+		t.Fatalf("parse large v3 summary: %v", err)
+	}
+	body, err := parsed.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal large v3 summary: %v", err)
+	}
+	if len(body) > maxSummaryBodyBytes {
+		t.Fatalf("large v3 wire body is %d bytes, cap is %d", len(body), maxSummaryBodyBytes)
+	}
+
+	roundTrip, err := parseCacheSummary(body, now)
+	if err != nil {
+		t.Fatalf("parse round-tripped large v3 summary: %v", err)
+	}
+	if roundTrip.ItemCount != itemCount || roundTrip.DesignItems != designItems || roundTrip.MBits != wire.MBits || roundTrip.Hashes != wire.Hashes {
+		t.Fatalf("large v3 parameters changed after round trip: got n/d/m/k=%d/%d/%d/%d, want %d/%d/%d/%d",
+			roundTrip.ItemCount, roundTrip.DesignItems, roundTrip.MBits, roundTrip.Hashes,
+			itemCount, designItems, wire.MBits, wire.Hashes)
+	}
+	if !roundTrip.Contains(key) {
+		t.Fatal("round-tripped large v3 summary omitted its cached key")
+	}
+}
+
+func TestMalformedMaximumDynamicLayoutIsRejectedDuringMetadataPreflight(t *testing.T) {
+	now := time.Now()
+	wire := dynamicSummaryWireForKeys(t, int(cacheMetadataEntryLimit), 0, nil, now)
+	wire.DesignItems++
+	body := marshalDynamicSummaryWireForTest(t, wire)
+	if len(body) > maxSummaryBodyBytes {
+		t.Fatalf("maximum-layout malformed fixture=%d exceeds protocol cap=%d", len(body), maxSummaryBodyBytes)
+	}
+	if _, err := parseCacheSummary(body, now); err == nil || !strings.Contains(err.Error(), "bloom parameters") {
+		t.Fatalf("malformed maximum dynamic layout error=%v, want metadata preflight rejection", err)
+	}
+}
+
+func TestDynamicSummaryParserValidatesEverySelfDescribingDimension(t *testing.T) {
+	now := time.Now()
+	valid := dynamicSummaryWireForKeys(t, 128, 1, []string{strings.Repeat("f", 64)}, now)
+	mutateJSON := func(t testing.TB, mutate func(map[string]json.RawMessage)) []byte {
+		t.Helper()
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(marshalDynamicSummaryWireForTest(t, valid), &fields); err != nil {
+			t.Fatal(err)
+		}
+		mutate(fields)
+		body, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	for _, tt := range []struct {
+		name string
+		body func(testing.TB) []byte
+	}{
+		{name: "missing current item count", body: func(t testing.TB) []byte {
+			return mutateJSON(t, func(fields map[string]json.RawMessage) { delete(fields, "n") })
+		}},
+		{name: "missing design item count", body: func(t testing.TB) []byte {
+			return mutateJSON(t, func(fields map[string]json.RawMessage) { delete(fields, "d") })
+		}},
+		{name: "design exceeds metadata guardrail", body: func(t testing.TB) []byte {
+			wire := valid
+			wire.DesignItems = int(cacheMetadataEntryLimit + 1)
+			return marshalDynamicSummaryWireForTest(t, wire)
+		}},
+		{name: "current items exceed metadata guardrail", body: func(t testing.TB) []byte {
+			wire := valid
+			wire.ItemCount = int(cacheMetadataEntryLimit + 1)
+			return marshalDynamicSummaryWireForTest(t, wire)
+		}},
+		{name: "hash count does not match design", body: func(t testing.TB) []byte {
+			wire := valid
+			wire.Hashes++
+			return marshalDynamicSummaryWireForTest(t, wire)
+		}},
+		{name: "decoded bit length does not match dimensions", body: func(t testing.TB) []byte {
+			wire := valid
+			wire.Bits = wire.Bits[:len(wire.Bits)-1]
+			return marshalDynamicSummaryWireForTest(t, wire)
+		}},
+		{name: "unknown field", body: func(t testing.TB) []byte {
+			return mutateJSON(t, func(fields map[string]json.RawMessage) { fields["unknown"] = json.RawMessage(`true`) })
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseCacheSummary(tt.body(t), now); err == nil {
+				t.Fatal("invalid v3 summary unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func TestSummaryStoreCoexistsWithLegacyAndDynamicPeers(t *testing.T) {
+	now := time.Now()
+	legacyPeer, dynamicPeer := "legacy:8081", "dynamic:8081"
+	legacyKey, dynamicKey := strings.Repeat("1", 64), strings.Repeat("2", 64)
+	store := summaryStore{records: make(map[string]summaryRecord)}
+	members := map[string]struct{}{legacyPeer: {}, dynamicPeer: {}}
+	member := func(peer string) bool { _, ok := members[peer]; return ok }
+	budget := int(maxAcceptedSummaryBloomCapacity().BitCount / 8 * 2)
+	if err := store.receive(legacyPeer, marshalCacheSummaryForTest(t, fixedCacheSummaryForKeys(t, []string{legacyKey}, now, time.Minute)), "", now, member, budget); err != nil {
+		t.Fatalf("receive legacy peer: %v", err)
+	}
+	dynamic := dynamicSummaryWireForKeys(t, 256, 1, []string{dynamicKey}, now)
+	if err := store.receive(dynamicPeer, marshalDynamicSummaryWireForTest(t, dynamic), "", now, member, budget); err != nil {
+		t.Fatalf("receive dynamic peer: %v", err)
+	}
+	positive, uncovered := store.candidates(legacyKey, []string{legacyPeer, dynamicPeer}, now)
+	if !slices.Equal(positive, []string{legacyPeer}) || len(uncovered) != 0 {
+		t.Fatalf("legacy lookup in mixed store positive/uncovered=%v/%v", positive, uncovered)
+	}
+	positive, uncovered = store.candidates(dynamicKey, []string{legacyPeer, dynamicPeer}, now)
+	if !slices.Equal(positive, []string{dynamicPeer}) || len(uncovered) != 0 {
+		t.Fatalf("dynamic lookup in mixed store positive/uncovered=%v/%v", positive, uncovered)
 	}
 }
 
@@ -146,6 +357,82 @@ func TestPeerSummaryGETServesSnapshotAndSupportsETag(t *testing.T) {
 	}
 }
 
+func TestSummaryPublisherRolloutDefaultsLegacyAndRequiresDynamicOptIn(t *testing.T) {
+	t.Run("default remains legacy v2", func(t *testing.T) {
+		store, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pm := peerManagerWith(nil)
+		pm.ConfigureSummary(peerLookupSummary, "snapshot-server", SummaryConfig{})
+		pm.buildLocalSummary(store)
+
+		body := localSummaryBodyForTest(pm)
+		var wire dynamicSummaryWireFixture
+		if err := json.Unmarshal(body, &wire); err != nil {
+			t.Fatalf("decode default published summary: %v", err)
+		}
+		if wire.Version != 2 {
+			t.Fatalf("default published summary version=%d, want legacy v2 during rollout", wire.Version)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"n", "d"} {
+			if _, ok := fields[field]; ok {
+				t.Fatalf("default legacy publisher unexpectedly emitted v3 field %q", field)
+			}
+		}
+	})
+
+	t.Run("explicit opt-in publishes derived v3 layout", func(t *testing.T) {
+		const (
+			totalBytes = int64(1000)
+			blockBytes = int64(10)
+			maxPercent = 80
+		)
+		store, err := NewDiskCache(t.TempDir(), maxPercent, DiskCacheOptions{
+			IncrementalSummary: true,
+			DynamicSummary:     true,
+			BlockSizeBytes:     blockBytes,
+			CapacityProvider: func(string) (diskSpace, error) {
+				return diskSpace{TotalBytes: totalBytes, FreeBytes: totalBytes}, nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pm := peerManagerWith(nil)
+		pm.ConfigureSummary(peerLookupSummary, "snapshot-server", SummaryConfig{
+			PublishFormat: summaryPublishDynamic,
+			LocalBloom:    store.SummaryBloomCapacity(),
+		})
+		pm.buildLocalSummary(store)
+
+		body := localSummaryBodyForTest(pm)
+		var wire dynamicSummaryWireFixture
+		if err := json.Unmarshal(body, &wire); err != nil {
+			t.Fatalf("decode opt-in dynamic summary: %v", err)
+		}
+		expected := deriveBloomCapacity(totalBytes*maxPercent/100, blockBytes)
+		if wire.Version != 3 || wire.DesignItems != int(expected.DesignEntries) || wire.MBits != expected.BitCount || wire.Hashes != expected.Hashes || len(wire.Bits) != int(expected.BitCount/8) {
+			t.Fatalf("opt-in dynamic wire v/d/m/k/bytes=%d/%d/%d/%d/%d, want 3/%d/%d/%d/%d",
+				wire.Version, wire.DesignItems, wire.MBits, wire.Hashes, len(wire.Bits),
+				expected.DesignEntries, expected.BitCount, expected.Hashes, expected.BitCount/8)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for _, field := range []string{"n", "d"} {
+			if _, ok := fields[field]; !ok {
+				t.Fatalf("opt-in dynamic publisher omitted v3 field %q", field)
+			}
+		}
+	})
+}
+
 func TestPeerSummaryGETSetsHandlerLocalWriteDeadline(t *testing.T) {
 	store, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{IncrementalSummary: true})
 	if err != nil {
@@ -184,7 +471,7 @@ func (w *deadlineResponseWriter) SetWriteDeadline(deadline time.Time) error {
 
 func TestSummarySelectionIsDeterministicAndFitsRemoteMemoryBudget(t *testing.T) {
 	peers := []string{"peer-e:8081", "peer-b:8081", "peer-d:8081", "peer-a:8081", "peer-c:8081"}
-	filterBytes := int(summaryBloomBits / 8)
+	filterBytes := int(maxAcceptedSummaryBloomCapacity().BitCount / 8)
 	memoryLimit := summaryMemoryLimitForRemoteBytes(int64(2*filterBytes + filterBytes/2))
 
 	first := NewPeerManager("test.svc", ":8081")
@@ -210,7 +497,7 @@ func TestSummarySelectionIsDeterministicAndFitsRemoteMemoryBudget(t *testing.T) 
 }
 
 func TestSummarySyncPullsOnlyReceiverSelectedSubset(t *testing.T) {
-	filterBytes := int64(summaryBloomBits / 8)
+	filterBytes := int64(maxAcceptedSummaryBloomCapacity().BitCount / 8)
 	var totalGets int32
 	peers := make([]string, 0, 6)
 	peerGets := make(map[string]*int32, 6)
@@ -399,6 +686,72 @@ func TestRejectedSummaryPullDoesNotReplaceLastValidHint(t *testing.T) {
 	}
 	if candidates := summaryPositivesForTest(pm, newKey, time.Now()); len(candidates) != 0 {
 		t.Fatalf("invalid refresh installed new key: candidates=%v", candidates)
+	}
+}
+
+func TestRejectedDynamicSummaryDoesNotReplaceLastValidRecord(t *testing.T) {
+	const retainedETag = `"dynamic-snapshot-1"`
+	peer := "peer-a:8081"
+	oldKey, newKey := strings.Repeat("c", 64), strings.Repeat("d", 64)
+
+	tests := []struct {
+		name string
+		body func(testing.TB, dynamicSummaryWireFixture) []byte
+	}{
+		{
+			name: "malformed declared layout",
+			body: func(t testing.TB, summary dynamicSummaryWireFixture) []byte {
+				summary.MBits += 8
+				return marshalDynamicSummaryWireForTest(t, summary)
+			},
+		},
+		{
+			name: "nonzero item count with empty filter",
+			body: func(t testing.TB, summary dynamicSummaryWireFixture) []byte {
+				clear(summary.Bits)
+				return marshalDynamicSummaryWireForTest(t, summary)
+			},
+		},
+		{
+			name: "oversized body",
+			body: func(t testing.TB, summary dynamicSummaryWireFixture) []byte {
+				body := marshalDynamicSummaryWireForTest(t, summary)
+				if len(body) >= maxSummaryBodyBytes {
+					t.Fatalf("ordinary dynamic fixture is already %d bytes, wire cap is %d", len(body), maxSummaryBodyBytes)
+				}
+				// JSON permits trailing whitespace, so this remains a valid dynamic
+				// representation except for exceeding the explicit wire bound.
+				return append(body, bytes.Repeat([]byte(" "), maxSummaryBodyBytes-len(body)+1)...)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now()
+			pm := peerManagerWith([]string{peer})
+			pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+			pm.refreshSummarySelection()
+
+			valid := dynamicSummaryWireForKeys(t, 128, 1, []string{oldKey}, now)
+			if err := pm.receivePulledSummary(peer, marshalDynamicSummaryWireForTest(t, valid), retainedETag, now); err != nil {
+				t.Fatalf("install valid dynamic summary: %v", err)
+			}
+			invalid := dynamicSummaryWireForKeys(t, 128, 1, []string{newKey}, now)
+			if err := pm.receivePulledSummary(peer, tt.body(t, invalid), `"dynamic-snapshot-2"`, now); err == nil {
+				t.Fatal("invalid dynamic summary unexpectedly replaced the retained record")
+			}
+
+			if candidates := summaryPositivesForTest(pm, oldKey, now); len(candidates) != 1 || candidates[0] != peer {
+				t.Fatalf("rejected dynamic refresh discarded last valid hint: candidates=%v", candidates)
+			}
+			if candidates := summaryPositivesForTest(pm, newKey, now); len(candidates) != 0 {
+				t.Fatalf("rejected dynamic refresh installed its key: candidates=%v", candidates)
+			}
+			if got := pm.summaries.etag(peer, now); got != retainedETag {
+				t.Fatalf("rejected dynamic refresh changed retained ETag to %q, want %q", got, retainedETag)
+			}
+		})
 	}
 }
 

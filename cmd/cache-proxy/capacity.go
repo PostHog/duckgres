@@ -6,9 +6,9 @@ const (
 	cacheDiskReservePercent int64 = 5
 	cacheEntryFillPercent   int64 = 90
 
-	// cacheMetadataEntryLimit is the hard metadata guardrail for a future
-	// derived entry limit. PR 1 intentionally continues to use the existing
-	// one-million-entry compatibility limit for admission.
+	// cacheMetadataEntryLimit is the hard metadata guardrail for dynamic Bloom
+	// sizing and the future derived entry-admission limit. Entry admission still
+	// uses the one-million-entry compatibility target until PR 4.
 	cacheMetadataEntryLimit int64 = 10_000_000
 
 	maxSummaryMemoryBytes int64 = 1 << 30
@@ -24,8 +24,7 @@ type diskCapacity struct {
 	ByteCeiling      int64
 }
 
-// bloomCapacity describes the eventual dynamic Bloom-filter layout. The
-// current fixed layout remains in use until the wire-format migration.
+// bloomCapacity describes a validated fixed or dynamic Bloom-filter layout.
 type bloomCapacity struct {
 	DesignEntries int64
 	BitCount      uint64
@@ -80,9 +79,9 @@ func effectiveCacheEntryBytes(blockSizeBytes int64) int64 {
 	return effective
 }
 
-// deriveCacheEntryCeiling returns the future disk-derived metadata target,
-// capped by the hard guardrail. It does not change the active 1M admission cap
-// in this compatibility release.
+// deriveCacheEntryCeiling returns the disk-derived metadata target capped by
+// the hard guardrail. It sizes dynamic summaries now, but does not change the
+// active 1M entry-admission cap until PR 4.
 func deriveCacheEntryCeiling(cacheByteCeiling, blockSizeBytes int64) int64 {
 	effectiveEntryBytes := effectiveCacheEntryBytes(blockSizeBytes)
 	if cacheByteCeiling <= 0 || effectiveEntryBytes <= 0 {
@@ -91,9 +90,9 @@ func deriveCacheEntryCeiling(cacheByteCeiling, blockSizeBytes int64) int64 {
 	return min(ceilDiv(cacheByteCeiling, effectiveEntryBytes), cacheMetadataEntryLimit)
 }
 
-// deriveBloomCapacity sizes the future dynamic local Bloom filter from stable
-// disk target capacity, not currently-free capacity, so temporary external
-// disk pressure does not resize the filter.
+// deriveBloomCapacity sizes a dynamic local Bloom filter from stable disk
+// target capacity, not currently-free capacity, so temporary external disk
+// pressure does not resize the filter.
 func deriveBloomCapacity(diskTargetBytes, blockSizeBytes int64) bloomCapacity {
 	designEntries := deriveCacheEntryCeiling(diskTargetBytes, blockSizeBytes)
 	if designEntries == 0 {
@@ -103,8 +102,8 @@ func deriveBloomCapacity(diskTargetBytes, blockSizeBytes int64) bloomCapacity {
 	return bloomCapacity{DesignEntries: designEntries, BitCount: bits, Hashes: hashes}
 }
 
-// deriveSummaryMemoryLimit is the fixed platform guardrail for future dynamic
-// summary admission: no more than one GiB or twenty percent of GOMEMLIMIT.
+// deriveSummaryMemoryLimit is the fixed platform guardrail for summary
+// admission: no more than one GiB or twenty percent of GOMEMLIMIT.
 func deriveSummaryMemoryLimit(goMemLimitBytes int64) int64 {
 	if goMemLimitBytes <= 0 {
 		return 0

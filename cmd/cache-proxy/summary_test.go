@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,6 +98,73 @@ func TestCacheSummaryWireOmitsPushEraMetadata(t *testing.T) {
 	}
 }
 
+func TestSummaryPublishFormatRequiresExplicitDynamicOptIn(t *testing.T) {
+	for _, tt := range []struct {
+		value string
+		want  summaryPublishFormat
+		ok    bool
+	}{
+		{value: "", want: summaryPublishFixed, ok: true},
+		{value: "fixed", want: summaryPublishFixed, ok: true},
+		{value: "dynamic", want: summaryPublishDynamic, ok: true},
+		{value: "v3", ok: false},
+	} {
+		got, err := parseSummaryPublishFormat(tt.value)
+		if (err == nil) != tt.ok || got != tt.want {
+			t.Errorf("parseSummaryPublishFormat(%q) = (%q, %v), want (%q, ok=%t)", tt.value, got, err, tt.want, tt.ok)
+		}
+	}
+}
+
+func TestConfiguredSummaryMemoryLimitUsesDerivedCeilingAndLowerOverride(t *testing.T) {
+	const fiveGiB = int64(5 << 30)
+	t.Setenv("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", "")
+	if got, err := configuredSummaryMemoryLimit(fiveGiB); err != nil || got != 1<<30 {
+		t.Fatalf("derived summary memory limit = (%d, %v), want 1 GiB", got, err)
+	}
+	t.Setenv("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", "536870912")
+	if got, err := configuredSummaryMemoryLimit(fiveGiB); err != nil || got != 512<<20 {
+		t.Fatalf("lower summary override = (%d, %v), want 512 MiB", got, err)
+	}
+	t.Setenv("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", "2147483648")
+	if got, err := configuredSummaryMemoryLimit(fiveGiB); err != nil || got != 1<<30 {
+		t.Fatalf("oversized summary override = (%d, %v), want derived 1 GiB ceiling", got, err)
+	}
+	t.Setenv("CACHE_SUMMARY_MEMORY_LIMIT_BYTES", "invalid")
+	if _, err := configuredSummaryMemoryLimit(fiveGiB); err == nil {
+		t.Fatal("invalid summary memory override unexpectedly accepted")
+	}
+}
+
+func TestDynamicSummaryMemoryValidationWaitsForDerivedLocalLayout(t *testing.T) {
+	smallLocal := bloomCapacityForItemsForTest(1)
+	limit := summaryMemoryReserveBytes(smallLocal) + int64(maxAcceptedSummaryBloomCapacity().BitCount/8)
+	if err := validateSummaryMemoryLimit(limit); err == nil {
+		t.Fatal("test ceiling unexpectedly fits the larger fixed local layout")
+	}
+	if err := validateSummaryMemoryLimitBeforeCache(summaryPublishDynamic, limit); err != nil {
+		t.Fatalf("dynamic pre-scan validation rejected ceiling for a potentially smaller derived layout: %v", err)
+	}
+	if err := validateSummaryMemoryLimitBeforeCache(summaryPublishFixed, limit); err == nil {
+		t.Fatal("fixed pre-scan validation accepted undersized fixed-layout ceiling")
+	}
+	cache, err := NewDiskCache(t.TempDir(), 100, DiskCacheOptions{
+		IncrementalSummary:      true,
+		DynamicSummary:          true,
+		SummaryMemoryLimitBytes: limit,
+		BlockSizeBytes:          1 << 20,
+		CapacityProvider: func(string) (diskSpace, error) {
+			return diskSpace{TotalBytes: 1, FreeBytes: 1}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("dynamic constructor rejected ceiling sized for its actual local layout: %v", err)
+	}
+	if got := cache.SummaryBloomCapacity(); got != smallLocal {
+		t.Fatalf("dynamic local layout=%+v, want %+v", got, smallLocal)
+	}
+}
+
 func TestParsePeerLookupMode(t *testing.T) {
 	for _, tt := range []struct {
 		in   string
@@ -163,7 +233,7 @@ func TestValidateSummaryMemoryLimit(t *testing.T) {
 	if err := validateSummaryMemoryLimit(minimum); err == nil {
 		t.Fatal("memory limit equal to the fixed reserve was accepted")
 	}
-	if err := validateSummaryMemoryLimit(minimum + int64(summaryBloomBits/8)); err != nil {
+	if err := validateSummaryMemoryLimit(minimum + int64(maxAcceptedSummaryBloomCapacity().BitCount/8)); err != nil {
 		t.Fatalf("memory limit with room for one peer summary rejected: %v", err)
 	}
 }
@@ -462,10 +532,278 @@ func TestDiskCacheIncrementallyUpdatesSummaryBloomOnPutAndEviction(t *testing.T)
 	}
 }
 
+func TestDynamicSummaryStaysConsistentThroughConcurrentAdmissionEvictionAndSnapshots(t *testing.T) {
+	cache, err := NewDiskCache(t.TempDir(), 80, DiskCacheOptions{
+		IncrementalSummary: true,
+		DynamicSummary:     true,
+		MaxEntries:         20,
+		BlockSizeBytes:     10,
+		CapacityProvider: func(string) (diskSpace, error) {
+			return diskSpace{TotalBytes: 1 << 20, FreeBytes: 1 << 20}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity := cache.SummaryBloomCapacity()
+	done := make(chan struct{})
+	snapshotDone := make(chan struct{})
+	snapshotErr := make(chan error, 1)
+	go func() {
+		defer close(snapshotDone)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				items, bits, ok := cache.SummarySnapshot()
+				if !ok || items < 0 || len(bits) != int(capacity.BitCount/8) {
+					select {
+					case snapshotErr <- fmt.Errorf("invalid concurrent snapshot: ok=%t items=%d bytes=%d", ok, items, len(bits)):
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+
+	var writers sync.WaitGroup
+	for worker := range 4 {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for item := range 25 {
+				key := fmt.Sprintf("%064x", worker*25+item)
+				if _, err := cache.PutStream(key, strings.NewReader("body")); err != nil {
+					select {
+					case snapshotErr <- err:
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+	writers.Wait()
+	cache.mu.Lock()
+	resident := make([]string, 0, len(cache.index))
+	for key := range cache.index {
+		resident = append(resident, key)
+	}
+	cache.mu.Unlock()
+	for _, key := range resident {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			if _, err := cache.PutStream(key, strings.NewReader("replacement")); err != nil {
+				select {
+				case snapshotErr <- err:
+				default:
+				}
+			}
+		}()
+	}
+	writers.Wait()
+	close(done)
+	<-snapshotDone
+	select {
+	case err := <-snapshotErr:
+		t.Fatal(err)
+	default:
+	}
+
+	cache.mu.Lock()
+	resident = resident[:0]
+	for key := range cache.index {
+		resident = append(resident, key)
+	}
+	cache.mu.Unlock()
+	items, bits, ok := cache.SummarySnapshot()
+	if !ok || items != len(resident) || items != 20 {
+		t.Fatalf("final dynamic snapshot ok/items/resident=%t/%d/%d, want true/20/20", ok, items, len(resident))
+	}
+	summary, err := newDynamicCacheSummary(items, capacity, bits, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range resident {
+		if !summary.Contains(key) {
+			t.Fatalf("final dynamic summary omitted resident key %q", key)
+		}
+	}
+}
+
+func TestDynamicSummaryMetricsReflectDerivedLayoutAndSaturation(t *testing.T) {
+	capacity := bloomCapacityForItemsForTest(100)
+	index := newSummaryIndexWithParams(capacity.BitCount, capacity.Hashes, int(capacity.DesignEntries))
+	for item := range 50 {
+		index.Add(fmt.Sprintf("%064x", item))
+	}
+	index.Snapshot()
+	if got := gaugeValue(t, summaryBloomDesignItems); got != float64(capacity.DesignEntries) {
+		t.Fatalf("dynamic design items metric=%v, want %d", got, capacity.DesignEntries)
+	}
+	if got := gaugeValue(t, summaryBloomBitsGauge); got != float64(capacity.BitCount) {
+		t.Fatalf("dynamic bits metric=%v, want %d", got, capacity.BitCount)
+	}
+	if got := gaugeValue(t, summaryBloomHashesGauge); got != float64(capacity.Hashes) {
+		t.Fatalf("dynamic hashes metric=%v, want %d", got, capacity.Hashes)
+	}
+	wantFPR := bloomFalsePositiveRate(50, capacity.BitCount, capacity.Hashes)
+	if got := gaugeValue(t, summaryBloomFPR); math.Abs(got-wantFPR) > 1e-12 {
+		t.Fatalf("dynamic FPR metric=%v, want %v", got, wantFPR)
+	}
+	if got := gaugeValue(t, summaryBloomOccupancy); got <= 0 || got >= 1 {
+		t.Fatalf("dynamic occupancy metric=%v, want within (0,1)", got)
+	}
+	if got := gaugeValue(t, summaryBloomSaturated); got != 0 {
+		t.Fatalf("dynamic saturation metric=%v below design capacity, want 0", got)
+	}
+	for item := 50; item <= 100; item++ {
+		index.Add(fmt.Sprintf("%064x", item))
+	}
+	index.Snapshot()
+	if got := gaugeValue(t, summaryBloomSaturated); got != 1 {
+		t.Fatalf("dynamic saturation metric=%v above design capacity, want 1", got)
+	}
+}
+
+func bloomCapacityForItemsForTest(items int64) bloomCapacity {
+	bits, hashes := bloomParams(int(items))
+	return bloomCapacity{DesignEntries: items, BitCount: bits, Hashes: hashes}
+}
+
+func dynamicCacheSummaryForTest(t testing.TB, capacity bloomCapacity, keys []string, now time.Time) *cacheSummary {
+	t.Helper()
+	bits := make([]byte, capacity.BitCount/8)
+	for _, key := range keys {
+		if !IsValidCacheKey(key) {
+			t.Fatalf("invalid test cache key %q", key)
+		}
+		bloomHashes(key, capacity.BitCount, capacity.Hashes, func(bit uint64) {
+			bits[bit/8] |= 1 << (bit % 8)
+		})
+	}
+	summary, err := newDynamicCacheSummary(len(keys), capacity, bits, now, time.Minute)
+	if err != nil {
+		t.Fatalf("build dynamic summary fixture: %v", err)
+	}
+	return summary
+}
+
+func expectedDynamicSummaryMemoryReserveForTest(local bloomCapacity) int64 {
+	localRawBytes := int64(local.BitCount / 8)
+	maxRemoteBits, _ := bloomParams(int(cacheMetadataEntryLimit))
+	maxRemoteRawBytes := int64(maxRemoteBits / 8)
+	localIndexBytes := localRawBytes + int64(local.BitCount)*2
+	transientBytes := 3*int64(maxSummaryBodyBytes) + localRawBytes +
+		int64(maxSummaryPulls)*(3*int64(maxSummaryBodyBytes)+maxRemoteRawBytes+maxSummaryResponseHeaderBytes)
+	return localIndexBytes + transientBytes
+}
+
+func TestSummaryMemoryAccountingUsesCurrentLocalBloomCapacity(t *testing.T) {
+	const limit = int64(512 << 20)
+	smallLocal := bloomCapacityForItemsForTest(1_000_000)
+	largeLocal := bloomCapacityForItemsForTest(4_000_000)
+
+	small := NewPeerManager("test.svc", ":8081")
+	small.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{
+		MemoryLimitBytes: limit,
+		LocalBloom:       smallLocal,
+	})
+	smallReserved := int64(gaugeValue(t, summaryResidentBytes))
+	wantSmallReserved := expectedDynamicSummaryMemoryReserveForTest(smallLocal)
+	if smallReserved != wantSmallReserved {
+		t.Fatalf("small local Bloom reserve=%d, want %d", smallReserved, wantSmallReserved)
+	}
+	if got := smallReserved + int64(small.summaryRemoteMemoryBudget); got != limit {
+		t.Fatalf("small local reserve + remote budget=%d, want configured limit %d", got, limit)
+	}
+
+	large := NewPeerManager("test.svc", ":8081")
+	large.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{
+		MemoryLimitBytes: limit,
+		LocalBloom:       largeLocal,
+	})
+	largeReserved := int64(gaugeValue(t, summaryResidentBytes))
+	wantLargeReserved := expectedDynamicSummaryMemoryReserveForTest(largeLocal)
+	if largeReserved != wantLargeReserved {
+		t.Fatalf("large local Bloom reserve=%d, want %d", largeReserved, wantLargeReserved)
+	}
+	if got := largeReserved + int64(large.summaryRemoteMemoryBudget); got != limit {
+		t.Fatalf("large local reserve + remote budget=%d, want configured limit %d", got, limit)
+	}
+	if largeReserved <= smallReserved || large.summaryRemoteMemoryBudget >= small.summaryRemoteMemoryBudget {
+		t.Fatalf("larger local Bloom did not trade remote budget for local reservation: small=%d/%d large=%d/%d",
+			smallReserved, small.summaryRemoteMemoryBudget, largeReserved, large.summaryRemoteMemoryBudget)
+	}
+}
+
+func TestDynamicPeerSummaryThatDoesNotFitCurrentMemoryBudgetIsRejected(t *testing.T) {
+	peer := "peer-a:8081"
+	local := bloomCapacityForItemsForTest(2_000_000)
+	remote := bloomCapacityForItemsForTest(2_000)
+	now := time.Now()
+	summary := dynamicCacheSummaryForTest(t, remote, []string{strings.Repeat("a", 64)}, now)
+	reserved := expectedDynamicSummaryMemoryReserveForTest(local)
+	limit := reserved + int64(len(summary.Bits)) - 1
+	pm := peerManagerWith([]string{peer})
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{
+		MemoryLimitBytes: limit,
+		LocalBloom:       local,
+	})
+	// Exercise receive-side admission directly. Selection separately reserves
+	// for the largest accepted peer layout, but admission remains the final
+	// defense against a stale selection or a future caller bypassing it.
+	pm.mu.Lock()
+	pm.summaryPeers = []string{peer}
+	pm.mu.Unlock()
+	err := pm.receivePulledSummary(peer, marshalCacheSummaryForTest(t, summary), `"too-large"`, now)
+	if err == nil || !strings.Contains(err.Error(), "memory budget") {
+		t.Fatalf("peer summary admission error=%v, want memory-budget rejection", err)
+	}
+	if got := int64(gaugeValue(t, summaryResidentBytes)); got != reserved {
+		t.Fatalf("resident bytes after rejected peer=%d, want local/transient reserve %d", got, reserved)
+	}
+	if len(pm.summaries.records) != 0 || pm.summaries.bytes != 0 {
+		t.Fatalf("rejected peer summary became resident: records=%d bytes=%d", len(pm.summaries.records), pm.summaries.bytes)
+	}
+}
+
+func TestOversizedDynamicReplacementRetainsLastValidSummary(t *testing.T) {
+	const peer = "peer-a:8081"
+	now := time.Now()
+	oldKey := strings.Repeat("b", 64)
+	oldSummary := dynamicCacheSummaryForTest(t, bloomCapacityForItemsForTest(1_000), []string{oldKey}, now)
+	newSummary := dynamicCacheSummaryForTest(t, bloomCapacityForItemsForTest(2_000), []string{strings.Repeat("c", 64)}, now.Add(time.Second))
+	store := summaryStore{records: make(map[string]summaryRecord)}
+	member := func(candidate string) bool { return candidate == peer }
+	remoteBudget := len(oldSummary.Bits)
+
+	if err := store.receive(peer, marshalCacheSummaryForTest(t, oldSummary), `"last-valid"`, now, member, remoteBudget); err != nil {
+		t.Fatalf("install last valid summary: %v", err)
+	}
+	err := store.receive(peer, marshalCacheSummaryForTest(t, newSummary), `"rejected"`, now.Add(time.Second), member, remoteBudget)
+	if err == nil || !strings.Contains(err.Error(), "memory budget") {
+		t.Fatalf("replacement error=%v, want memory-budget rejection", err)
+	}
+	record, ok := store.records[peer]
+	if !ok {
+		t.Fatal("rejected replacement removed the last valid record")
+	}
+	if record.summary.CreatedNS != oldSummary.CreatedNS || record.etag != `"last-valid"` || record.bytes != len(oldSummary.Bits) {
+		t.Fatalf("rejected replacement mutated last valid record: %+v", record)
+	}
+	if store.bytes != len(oldSummary.Bits) || !record.summary.Contains(oldKey) {
+		t.Fatalf("last valid record/accounting not retained: bytes=%d contains_old=%t", store.bytes, record.summary.Contains(oldKey))
+	}
+}
+
 func TestSummaryMemoryMetricsIncludeLocalTransientAndRemoteState(t *testing.T) {
 	peer := "peer-a:8081"
 	bits := make([]byte, summaryBloomBits/8)
-	limit := summaryMemoryReserveBytes() + int64(len(bits))
+	limit := summaryMemoryReserveBytes() + int64(maxAcceptedSummaryBloomCapacity().BitCount/8)
 	pm := peerManagerWith([]string{peer})
 	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{MemoryLimitBytes: limit})
 	pm.refreshSummarySelection()
@@ -506,5 +844,84 @@ func TestSummaryMemoryMetricsAreZeroOutsideSummaryMode(t *testing.T) {
 	}
 	if got := gaugeValue(t, summaryResidentBytes); got != 0 {
 		t.Fatalf("probe-mode summary resident metric=%v, want 0", got)
+	}
+}
+
+func TestSummaryValidResidentMetricExcludesRetainedExpiredRecords(t *testing.T) {
+	peer := "peer-a:8081"
+	now := time.Now()
+	pm := peerManagerWith([]string{peer})
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	pm.mu.Lock()
+	pm.summaryPeers = []string{peer}
+	pm.mu.Unlock()
+	summary := fixedCacheSummaryForKeys(t, nil, now, 200*time.Millisecond)
+	if err := pm.receivePulledSummary(peer, marshalCacheSummaryForTest(t, summary), "", now); err != nil {
+		t.Fatal(err)
+	}
+	if got := gaugeValue(t, summaryValidResidentPeers); got != 1 {
+		t.Fatalf("valid resident peers before expiry=%v, want 1", got)
+	}
+	time.Sleep(250 * time.Millisecond)
+	pm.summaryClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Body:       http.NoBody,
+			Header:     make(http.Header),
+		}, nil
+	})}
+	pm.pullSummary(context.Background(), peer)
+	if got := gaugeValue(t, summaryResidentCount); got != 1 {
+		t.Fatalf("retained resident records after expiry=%v, want 1", got)
+	}
+	if got := gaugeValue(t, summaryValidResidentPeers); got != 0 {
+		t.Fatalf("valid resident peers after expiry=%v, want 0", got)
+	}
+}
+
+func TestConcurrentSummaryGaugeRefreshCannotPublishOlderSnapshotLast(t *testing.T) {
+	peer := "peer-a:8081"
+	now := time.Now()
+	pm := peerManagerWith([]string{peer})
+	pm.ConfigureSummary(peerLookupSummary, "receiver", SummaryConfig{})
+	pm.mu.Lock()
+	pm.summaryPeers = []string{peer}
+	pm.mu.Unlock()
+
+	firstSnapshot := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var hookCalls atomic.Int32
+	pm.summaryGaugeSnapshotHook = func() {
+		if hookCalls.Add(1) == 1 {
+			close(firstSnapshot)
+			<-releaseFirst
+		}
+	}
+	firstDone := make(chan struct{})
+	go func() {
+		pm.updateSummaryGauges()
+		close(firstDone)
+	}()
+	<-firstSnapshot
+
+	summary := fixedCacheSummaryForKeys(t, nil, now, time.Minute)
+	if err := pm.summaries.receive(peer, marshalCacheSummaryForTest(t, summary), "", now, func(string) bool { return true }, pm.summaryRemoteMemoryBudget); err != nil {
+		t.Fatal(err)
+	}
+	secondDone := make(chan struct{})
+	go func() {
+		pm.updateSummaryGauges()
+		close(secondDone)
+	}()
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
+	pm.summaryGaugeSnapshotHook = nil
+
+	if got := gaugeValue(t, summaryResidentCount); got != 1 {
+		t.Fatalf("resident count after ordered concurrent refreshes=%v, want latest snapshot 1", got)
+	}
+	if got := gaugeValue(t, summaryValidResidentPeers); got != 1 {
+		t.Fatalf("valid resident count after ordered concurrent refreshes=%v, want latest snapshot 1", got)
 	}
 }

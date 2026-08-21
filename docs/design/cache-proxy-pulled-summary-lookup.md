@@ -28,7 +28,8 @@ origin fills. Summaries contain only opaque cache-locator membership hints.
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` or `summary`; unknown values fail startup. |
 | `CACHE_MAX_ENTRIES` | `1000000` | Configured compatibility admission/convergence target. Startup may retain inspectable entries above it, up to the fixed 10,000,000-entry metadata guardrail. |
 | `CACHE_MAX_PERCENT` | `80` | Percentage-of-total-disk target for committed cache bytes. The active capacity also accounts for reclaimable cache-owned files while retaining a 5%-of-total-disk reserve. |
-| `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Local counting Bloom, snapshot and pull reserve, and retained remote Bloom bits. |
+| `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | unset | Optional emergency ceiling. Effective summary memory is `min(1 GiB, 20% of GOMEMLIMIT, explicit override when set)`. It includes the local counting Bloom, snapshot/pull reserve, and retained remote bits. |
+| `CACHE_SUMMARY_PUBLISH_FORMAT` | `fixed` | `fixed` builds the legacy 1M-entry counting layout and publishes v2. `dynamic` builds the disk-derived layout and publishes self-describing v3. Unknown values fail startup. |
 | `CACHE_PEER_MAX_PROBES_PER_REQUEST` | `5` | Maximum summary-mode `/cache/has` confirmations per client request, shared across block misses. `CACHE_PEER_MAX_PROBES` is a deprecated alias. |
 | `CACHE_MAX_CONCURRENT_PEER_PROBES` | `64` | Pod-wide, non-blocking cap on active confirmation HTTP requests and sockets. `CACHE_MAX_PEER_PROBES_IN_FLIGHT` is a deprecated alias. |
 
@@ -107,14 +108,14 @@ kernel memory.
 
 ## Local counting Bloom filter
 
-Each cache proxy owns one fixed-layout counting Bloom filter. Cache commits add
-the opaque SHA-256 cache locator and evictions remove it. Sixteen-bit counters
+Each cache proxy owns one counting Bloom filter. Cache commits add the opaque
+SHA-256 cache locator and evictions remove it. Sixteen-bit counters
 allow incremental deletion. A counter that reaches `uint16` saturation becomes
 sticky: this may add false positives but cannot create a false negative for a
 key represented by that filter.
 
-The filter is designed for 1,000,000 entries at a 1% per-peer false-positive
-rate:
+With `CACHE_SUMMARY_PUBLISH_FORMAT=fixed`, the filter remains designed for
+1,000,000 entries at a 1% per-peer false-positive rate:
 
 - 9,585,064 snapshot bits, approximately 1.14 MiB;
 - approximately 18.3 MiB of local 16-bit counters;
@@ -125,14 +126,29 @@ operator raises the entry target, additions continue rather than disabling
 summaries; the predicted false-positive rate rises smoothly and is exported as
 a metric. The filter is a hint and never authorizes a body transfer.
 
+With `CACHE_SUMMARY_PUBLISH_FORMAT=dynamic`, the design entry count is derived
+from stable physical disk target capacity and configured block size, capped by
+the 10,000,000-entry metadata guardrail. A 9.7M-entry design uses about 11 MiB
+of snapshot bits and 180–190 MiB of 16-bit counters. The publish-format setting
+chooses both the local counting layout and the wire version; they cannot be
+configured independently. Startup derives the layout after the bounded scan
+and statfs sample, then rehashes the bounded exact index once so existing cache
+keys are represented before any snapshot is served.
+
 About every 20 seconds, with per-process jitter, the proxy copies the current
 bitset into an immutable, versioned wire snapshot. It does not rescan or rehash
 the cache index. Each snapshot has a 60-second advertised TTL and a strict
-2 MiB encoded-body limit. It contains only:
+16 MiB encoded-body limit. Receivers accept:
 
-- summary and cache-layout versions;
-- creation and expiration timestamps;
-- fixed Bloom parameters and Bloom bits.
+- legacy v2: summary/cache-layout versions, timestamps, the exact fixed Bloom
+  parameters, and Bloom bits;
+- dynamic v3: those fields plus current item count, design item count, and
+  dimensions derived from the declared design count.
+
+V3 dimensions, counts, encoded length, decoded length, unknown fields, and
+timestamps are validated before the decoded bitset is admitted. V2 remains
+strictly fixed and rejects dynamic dimensions, allowing old and new summaries
+to coexist without silently reinterpreting a legacy payload.
 
 Raw URLs, signed query strings, ranges, object paths, organization identifiers,
 and cache locators are never serialized or logged.
@@ -151,7 +167,12 @@ identity and peer address. Before any summary RPC, it selects only as many
 peers as fit the remote-summary portion of
 `CACHE_SUMMARY_MEMORY_LIMIT_BYTES`. Different receivers can select different
 subsets, distributing degraded coverage when a fleet is larger than the
-memory budget.
+memory budget. Because a receiver does not know a peer's v2/v3 dimensions
+before pulling it, deterministic selection charges every peer at the largest
+accepted 10M-entry raw bitset. Receive-side admission then charges the actual
+decoded bitset and atomically preserves an older valid record when a
+replacement does not fit. This deliberately favors a safe deterministic prefix
+over arrival-order-dependent overcommit.
 
 The selected peers are pulled through `GET /cache/summary`:
 
@@ -165,13 +186,14 @@ The selected peers are pulled through `GET /cache/summary`:
   and a 500 ms response-header deadline;
 - a whole pull cycle is capped at 15 seconds and rotates its starting peer by
   the work submitted, so slow early peers cannot starve the same suffix;
-- declared and actual bodies above 2 MiB are rejected;
+- declared and actual bodies above 16 MiB are rejected;
 - cancellation closes requests, bodies, workers, timers, and the coordinator.
 
-The receiver validates the version, cache layout, declared Bloom parameters,
-timestamps, body size, and current selection before atomically replacing the
-last record for that peer. A failed or invalid pull leaves the previous valid
-record in place until its advertised expiration. `304 Not Modified` retains
+The receiver validates current selection before expensive decoding, then
+validates the version, cache layout, declared Bloom parameters, counts,
+timestamps, and body size before atomically replacing the last record for that
+peer. A failed or invalid pull leaves the previous valid record in place until
+its advertised expiration. `304 Not Modified` retains
 the record but does not extend it beyond that expiration. Failures do not create
 an independent retry queue; the next periodic or membership-triggered cycle is
 the retry. Newly selected peers that have not yet started their priority pull
@@ -277,11 +299,11 @@ memory maximum as a sustained operating target:
   unchanged filter content from freshness renewal.
 - `cache_proxy_summary_resident_count` counts retained records and can include
   an expired record until the next successful membership refresh prunes it.
-  There is no discovered/selected-peer denominator, and the age histogram is
-  observed only for Bloom-positive records. Pull outcomes, probe amplification,
-  and origin traffic expose degradation, but they cannot prove full summary
-  convergence. Add discovered, selected, and valid-unexpired gauges before
-  making readiness or autoscaling depend on summary coverage.
+  `cache_proxy_summary_valid_resident_peers` excludes expired records, and
+  `cache_proxy_summary_selected_peers` supplies its selected denominator.
+  There is still no discovered-peer gauge, and the age histogram is observed
+  only for Bloom-positive records. Add discovered-peer coverage before making
+  readiness or autoscaling depend on fleet-wide summary convergence.
 - Lookup currently scans current membership and tests retained filters under a
   shared read lock, then ranks candidates. This is acceptable at 10–20 nodes
   but request CPU, allocations, and writer-lock contention scale with fleet
@@ -299,24 +321,30 @@ canary and compatible peers build and pull their first snapshots.
 
 ## Memory model
 
-The default 512 MiB summary budget is divided conservatively:
+The effective summary ceiling is the smaller of 1 GiB, 20% of the runtime
+`GOMEMLIMIT`, and the optional explicit emergency ceiling. It is divided
+conservatively into:
 
-- local snapshot bitset and 16-bit counters: approximately 19.4 MiB;
-- current and next immutable encoded snapshots plus a temporary raw snapshot;
-- four simultaneous pulls, each reserving a 2 MiB encoded body plus decoded
-  bits;
-- retained remote raw bitsets with the remaining approximately 474.8 MiB.
+- the actual local raw bitset plus its 16-bit counting cells;
+- the currently served maximum 16 MiB body, the JSON encoder's bounded buffer
+  and returned clone, plus one actual local raw snapshot;
+- four simultaneous pulls, each reserving the response body, the JSON decoder
+  buffer, the bounded encoded-bit-field copy, a maximum decoded 10M-entry
+  bitset, and bounded response headers;
+- retained remote raw bitsets with everything left over.
 
-One remote fixed-layout bitset is approximately 1.14 MiB, so the default fits
-up to 415 remote summaries after reserves. Representative steady-state
-Bloom-state estimates are:
+The pull reserve uses v3 maxima even while the pod publishes fixed v2, because
+dual-format receivers can encounter a dynamic peer during rollout. Peer
+selection also charges each selected peer at the maximum raw v3 bitset; actual
+resident accounting uses each decoded bitset's length. Consequently:
 
-| Fleet nodes | Remote summaries per pod | Approximate Bloom state per pod |
-| ---: | ---: | ---: |
-| 10 | 9 | 47.5 MiB |
-| 30 | 29 | 70.3 MiB |
-| 100 | 99 | 150.3 MiB |
-| At default ceiling | 415 | Up to 512 MiB |
+- a fixed local layout reserves roughly 300–310 MiB before remote summaries;
+- a 9.7M-entry dynamic layout reserves roughly 480–490 MiB before remote
+  summaries;
+- a 1 GiB ceiling retains the current 10–20-node fleet comfortably even at
+  the largest supported layout;
+- a smaller explicit ceiling is rejected at startup if it cannot hold the
+  local/transient reserve plus one maximum peer summary.
 
 These numbers deliberately exclude the exact local cache index. Its key-count
 growth is independently bounded toward `CACHE_MAX_ENTRIES`; the disk target
@@ -353,35 +381,44 @@ worker identity labels. The primary rollout signals are:
 - peer and origin bytes and latency: useful locality versus fallback cost;
 - `cache_proxy_summary_pulls_total` and
   `cache_proxy_summary_serves_total`: synchronization health;
-- `cache_proxy_summary_resident_count` and summary age: retained-summary health,
-  subject to the coverage limitations above;
+- `cache_proxy_summary_selected_peers`, `cache_proxy_summary_resident_count`,
+  `cache_proxy_summary_valid_resident_peers`, and summary age: selected,
+  retained, and usable-summary health, subject to the coverage limitations
+  above;
 - `cache_proxy_summary_resident_bytes` versus
   `cache_proxy_summary_memory_limit_bytes`: conservative Bloom-state accounting
-  versus its configured ceiling. Resident bytes include the fixed local filter,
-  maximum transient reserve, and retained remote bits; they are not process RSS;
+  versus its derived/effective ceiling. Resident bytes include the current
+  local filter, maximum transient reserve, and retained remote bits; they are
+  not process RSS;
 - predicted Bloom false-positive rate, saturation, and bit occupancy.
 
 Rollout procedure:
 
-1. Deploy the compatible image to every cache-proxy pod while leaving
-   `CACHE_PEER_LOOKUP_MODE=probe`. Probe-mode pods contain the endpoint code but
-   return 404 and do not prebuild summaries.
+1. Deploy dual-format receivers to every cache-proxy pod with
+   `CACHE_SUMMARY_PUBLISH_FORMAT=fixed`. Existing v2 publishing is unchanged.
 2. Enable `summary` mode in non-production first. Expect partial coverage while
    the restarted/canary pods build and pull their initial snapshots.
 3. Confirm summaries converge after startup and membership changes, pull work
    remains bounded, and request-time probes never exceed the configured cap.
-4. Compare peer usefulness, origin bytes, and origin latency with probe mode.
-5. Confirm `cache_proxy_summary_resident_bytes` remains below
-   `cache_proxy_summary_memory_limit_bytes`, and process RSS remains below the
-   pod memory limit with sufficient headroom.
-6. Roll out gradually to production.
+4. Apply the cache-proxy memory limit and `GOMEMLIMIT` resource rollout, then
+   verify every pod completed it with stable memory.
+5. Set `CACHE_SUMMARY_PUBLISH_FORMAT=dynamic` in non-production. Mixed v2/v3
+   peers are expected during the rolling restart.
+6. Confirm `cache_proxy_summary_resident_bytes` remains below
+   `cache_proxy_summary_memory_limit_bytes`, Bloom dimensions match each disk
+   tier, and process RSS retains sufficient pod-limit headroom.
+7. Compare peer usefulness, origin bytes, and origin latency with fixed mode,
+   then roll dynamic publishing gradually through production.
 
 During a rolling deployment, a peer without the compatible GET summary endpoint
 remains uncovered; bounded confirmation or origin fallback is used until the
 endpoint is available.
 
-Rollback by restoring `CACHE_PEER_LOOKUP_MODE=probe`. Cache keys and on-disk
-layout are unchanged, so do not delete cache contents.
+Rollback dynamic publishing by restoring
+`CACHE_SUMMARY_PUBLISH_FORMAT=fixed`, which rebuilds the fixed local filter on
+restart. Roll back lookup independently by restoring
+`CACHE_PEER_LOOKUP_MODE=probe`. Cache keys and on-disk layout are unchanged, so
+do not delete cache contents.
 
 ## Operator runbook
 

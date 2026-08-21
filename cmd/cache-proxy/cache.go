@@ -265,9 +265,6 @@ func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*Dis
 		if option.MaxEntries > 0 {
 			dc.maxEntries = option.MaxEntries
 		}
-		if option.IncrementalSummary {
-			dc.summary = newSummaryIndex()
-		}
 		if option.BlockSizeBytes > 0 {
 			dc.blockSize = option.BlockSizeBytes
 		}
@@ -319,6 +316,38 @@ func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*Dis
 	if err := dc.initializeCapacity(ownedBytes, startupSpace); err != nil {
 		return nil, fmt.Errorf("apply startup cache limits: %w", err)
 	}
+	if option.IncrementalSummary {
+		summaryCapacity := fixedSummaryBloomCapacity()
+		if option.DynamicSummary {
+			diskTarget := deriveDiskCapacity(startupSpace.TotalBytes, startupSpace.FreeBytes, ownedBytes, dc.maxPercent).DiskTargetBytes
+			summaryCapacity = deriveBloomCapacity(diskTarget, dc.blockSize)
+			if !validSummaryBloomCapacity(summaryCapacity) {
+				return nil, errors.New("derive dynamic Bloom capacity: cache disk target and block size must produce a non-zero layout")
+			}
+		}
+		if option.SummaryMemoryLimitBytes > 0 {
+			if err := validateSummaryMemoryLimit(option.SummaryMemoryLimitBytes, summaryCapacity); err != nil {
+				return nil, err
+			}
+		}
+		dc.summary = newSummaryIndexWithParams(summaryCapacity.BitCount, summaryCapacity.Hashes, int(summaryCapacity.DesignEntries))
+		// The disk target is not known until after the bounded startup scan and
+		// statfs sample. Rehash the already bounded exact index once into the
+		// selected fixed or dynamic layout so restart snapshots cannot omit keys.
+		rehashed := 0
+		for element := dc.order.Front(); element != nil; element = element.Next() {
+			if rehashed%startupScanChunkSize == 0 {
+				if option.summaryRehashHook != nil {
+					option.summaryRehashHook(rehashed)
+				}
+				if err := startupContext.Err(); err != nil {
+					return nil, fmt.Errorf("rebuild startup Bloom summary: %w", err)
+				}
+			}
+			dc.summary.Add(element.Value.(*cacheEntry).key)
+			rehashed++
+		}
+	}
 
 	if option.DurableRecency {
 		dc.recency = newRecencyWriter(dir, option.recencyQueueCapacity, option.recencyWorkerCount, option.recencyChtimes)
@@ -337,23 +366,26 @@ func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*Dis
 }
 
 type DiskCacheOptions struct {
-	IncrementalSummary    bool
-	DurableRecency        bool
-	BackgroundConvergence bool
-	MaxEntries            int
-	BlockSizeBytes        int64
-	CapacityProvider      capacityProvider
-	openScanDirectory     openCacheDirectory
-	removeFile            func(string) error
-	hardMaxEntries        int
-	startupContext        context.Context
-	recencyNow            func() time.Time
-	recencyChtimes        recencyPersistence
-	recencyInterval       time.Duration
-	recencyQueueCapacity  int
-	recencyWorkerCount    int
-	convergencePermits    <-chan struct{}
-	convergenceInterval   time.Duration
+	IncrementalSummary      bool
+	DynamicSummary          bool
+	SummaryMemoryLimitBytes int64
+	DurableRecency          bool
+	BackgroundConvergence   bool
+	MaxEntries              int
+	BlockSizeBytes          int64
+	CapacityProvider        capacityProvider
+	openScanDirectory       openCacheDirectory
+	removeFile              func(string) error
+	hardMaxEntries          int
+	startupContext          context.Context
+	summaryRehashHook       func(int)
+	recencyNow              func() time.Time
+	recencyChtimes          recencyPersistence
+	recencyInterval         time.Duration
+	recencyQueueCapacity    int
+	recencyWorkerCount      int
+	convergencePermits      <-chan struct{}
+	convergenceInterval     time.Duration
 }
 
 // Close stops background convergence and drains accepted durable-recency work
@@ -626,6 +658,19 @@ func (c *DiskCache) SummarySnapshot() (items int, bits []byte, ok bool) {
 	}
 	items, bits = c.summary.Snapshot()
 	return items, bits, true
+}
+
+func (c *DiskCache) SummaryBloomCapacity() bloomCapacity {
+	if c.summary == nil {
+		return bloomCapacity{}
+	}
+	c.summary.mu.RLock()
+	defer c.summary.mu.RUnlock()
+	return bloomCapacity{
+		DesignEntries: int64(c.summary.targetItems),
+		BitCount:      c.summary.bitCount,
+		Hashes:        c.summary.hashes,
+	}
 }
 
 // Has returns true if the key is a tracked cache entry. It answers from the

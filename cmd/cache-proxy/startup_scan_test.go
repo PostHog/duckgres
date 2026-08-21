@@ -511,6 +511,86 @@ func TestStartupLargeSparseDirectoryKeepsBoundedNewestSet(t *testing.T) {
 	}
 }
 
+func TestStartupRehashesExistingEntriesIntoDerivedDynamicBloom(t *testing.T) {
+	dir := t.TempDir()
+	key := strings.Repeat("d", 64)
+	if err := os.WriteFile(filepath.Join(dir, key), []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		totalBytes = int64(1000)
+		blockBytes = int64(10)
+		maxPercent = 80
+	)
+	cache, err := NewDiskCache(dir, maxPercent, DiskCacheOptions{
+		IncrementalSummary: true,
+		DynamicSummary:     true,
+		BlockSizeBytes:     blockBytes,
+		CapacityProvider: func(string) (diskSpace, error) {
+			return diskSpace{TotalBytes: totalBytes, FreeBytes: totalBytes - int64(len("cached"))}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCapacity := deriveBloomCapacity(totalBytes*maxPercent/100, blockBytes)
+	if got := cache.SummaryBloomCapacity(); got != wantCapacity {
+		t.Fatalf("dynamic restart Bloom capacity=%+v, want %+v", got, wantCapacity)
+	}
+	items, bits, ok := cache.SummarySnapshot()
+	if !ok || items != 1 {
+		t.Fatalf("dynamic restart snapshot available/items=%t/%d, want true/1", ok, items)
+	}
+	summary, err := newDynamicCacheSummary(items, wantCapacity, bits, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Contains(key) {
+		t.Fatal("dynamic restart summary omitted a pre-existing committed cache key")
+	}
+	newKey := strings.Repeat("e", 64)
+	if _, err := cache.PutStream(newKey, strings.NewReader("new")); err != nil {
+		t.Fatal(err)
+	}
+	items, bits, ok = cache.SummarySnapshot()
+	summary, err = newDynamicCacheSummary(items, wantCapacity, bits, time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || items != 2 || !summary.Contains(key) || !summary.Contains(newKey) {
+		t.Fatalf("dynamic summary after admission available/items/old/new=%t/%d/%t/%t", ok, items, summary.Contains(key), summary.Contains(newKey))
+	}
+}
+
+func TestDynamicSummaryRehashHonorsStartupCancellation(t *testing.T) {
+	dir := t.TempDir()
+	key := strings.Repeat("e", 64)
+	if err := os.WriteFile(filepath.Join(dir, key), []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cache, err := NewDiskCache(dir, 80, DiskCacheOptions{
+		IncrementalSummary: true,
+		DynamicSummary:     true,
+		BlockSizeBytes:     10,
+		CapacityProvider:   testStartupCapacityProvider,
+		startupContext:     ctx,
+		summaryRehashHook: func(rehashed int) {
+			if rehashed != 0 {
+				t.Fatalf("first dynamic rehash cancellation hook received count %d, want 0", rehashed)
+			}
+			cancel()
+		},
+	})
+	if cache != nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "rebuild startup Bloom summary") {
+		t.Fatalf("dynamic rehash cancellation: cache=%v err=%v, want nil/wrapped context.Canceled", cache, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, key)); err != nil {
+		t.Fatalf("dynamic rehash cancellation removed committed cache file: %v", err)
+	}
+}
+
 func TestStartupTenMillionGuardrailEstimateFitsEightGiBEnvelope(t *testing.T) {
 	// The final metric estimate includes the key, entry object, list node, and
 	// map overhead. Startup adds only the bounded survivor pointer heap because

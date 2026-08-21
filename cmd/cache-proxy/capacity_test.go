@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 func TestDeriveDiskCapacityAccountsForOwnedCacheBytes(t *testing.T) {
@@ -125,5 +126,27 @@ func TestDerivedSummaryMemoryLimit(t *testing.T) {
 		if got := deriveSummaryMemoryLimit(tt.goMemLimit); got != tt.want {
 			t.Errorf("deriveSummaryMemoryLimit(%d) = %d, want %d", tt.goMemLimit, got, tt.want)
 		}
+	}
+}
+
+func TestMaximumDynamicBloomLayoutFitsSummaryWireCap(t *testing.T) {
+	capacity := maxAcceptedSummaryBloomCapacity()
+	if capacity.DesignEntries != cacheMetadataEntryLimit {
+		t.Fatalf("maximum dynamic design entries=%d, want %d", capacity.DesignEntries, cacheMetadataEntryLimit)
+	}
+	rawBytes := int(capacity.BitCount / 8)
+	if rawBytes < 11<<20 || rawBytes > 12<<20 {
+		t.Fatalf("maximum dynamic Bloom raw bytes=%d, want approximately 11-12 MiB", rawBytes)
+	}
+	summary, err := newDynamicCacheSummary(0, capacity, make([]byte, rawBytes), time.Now(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := summary.MarshalBinary()
+	if err != nil {
+		t.Fatalf("maximum dynamic summary exceeds wire cap: %v", err)
+	}
+	if len(body) > maxSummaryBodyBytes {
+		t.Fatalf("maximum dynamic body=%d exceeds cap=%d", len(body), maxSummaryBodyBytes)
 	}
 }
