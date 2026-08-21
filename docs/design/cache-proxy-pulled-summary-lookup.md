@@ -26,7 +26,7 @@ origin fills. Summaries contain only opaque cache-locator membership hints.
 | Setting | Default | Bound |
 | --- | --- | --- |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` or `summary`; unknown values fail startup. |
-| `CACHE_MAX_ENTRIES` | `1000000` | Configured legacy admission limit and strict maximum tracked entries after each final commit. |
+| `CACHE_MAX_ENTRIES` | `1000000` | Configured compatibility admission/convergence target. Startup may retain inspectable entries above it, up to the fixed 10,000,000-entry metadata guardrail. |
 | `CACHE_MAX_PERCENT` | `80` | Percentage-of-total-disk target for committed cache bytes. The active capacity also accounts for reclaimable cache-owned files while retaining a 5%-of-total-disk reserve. |
 | `CACHE_SUMMARY_MEMORY_LIMIT_BYTES` | `536870912` (512 MiB) | Local counting Bloom, snapshot and pull reserve, and retained remote Bloom bits. |
 | `CACHE_PEER_MAX_PROBES_PER_REQUEST` | `5` | Maximum summary-mode `/cache/has` confirmations per client request, shared across block misses. `CACHE_PEER_MAX_PROBES` is a deprecated alias. |
@@ -35,11 +35,13 @@ origin fills. Summaries contain only opaque cache-locator membership hints.
 Body copies remain concurrent: each fill streams into a temporary file without
 holding the cache-index lock. The short final commit is serialized across the
 rename, LRU eviction, exact-index and byte accounting, and counting-Bloom
-update. A completed commit therefore cannot exceed `CACHE_MAX_ENTRIES`.
-Tracked bytes are evicted to the current cache byte capacity before the commit
-returns, except that a single entry larger than the capacity is retained rather
-than silently discarded. Concurrent temporary files consume real disk but are
-not yet tracked cache entries.
+update. At or above the soft entry target, a new-key commit performs one LRU
+swap and cannot increase the tracked entry count. Byte capacity remains strict:
+a commit removes enough older entries to preserve the reserve, except for the
+existing compatibility behavior that retains one object larger than the
+ceiling after draining other entries. A rate-limited
+background worker handles pre-existing restart and capacity overage. Concurrent
+temporary files consume real disk but are not yet tracked cache entries.
 
 ### Disk capacity and startup ownership
 
@@ -59,19 +61,44 @@ temporary files are removed before the startup scan. Invalid or unrelated
 root-directory entries remain on disk and count only through reduced free
 space.
 
-Startup scans existing entries before applying byte capacity, retains the
-newest entries within the configured legacy entry limit, and then evicts
-least-recently-used entries until both limits are satisfied. If temporary-file
-cleanup, filesystem sampling, directory scanning, entry inspection, or
-required startup eviction fails, initialization fails and the proxy does not
-begin serving with an unknown or unenforceable disk budget.
+Startup scans in 1,024-entry chunks and computes inspectable owned bytes before
+capacity decisions. The configured entry target is soft: every inspectable
+entry is loaded when the directory remains within the fixed 10,000,000-entry
+hard guardrail. Any soft entry or byte overage converges after startup through
+one background deletion at a time, capped at 1,000 successful deletions per
+second. A valid-looking file whose metadata cannot be inspected is preserved,
+excluded from the index and owned-byte total, and therefore remains external
+disk usage.
 
-Capacity is refreshed every minute. A lower ceiling is applied immediately and
-least-recently-used entries are evicted as needed to restore the reserve. An
+Only a directory above the hard guardrail selects startup survivors. The
+scanner retains the newest bounded set by persisted coarse access mtime and
+opaque-key tie-break, while spooling known non-survivors under `.tmp`. It does
+not delete committed files until enumeration and spool closure both succeed.
+The exceptional prune is sequential, observable, cancellation-aware, and uses
+the centralized eviction metrics. If temporary cleanup, filesystem sampling,
+directory enumeration, or a required hard-prune unlink fails, initialization
+fails rather than serving from a partial or policy-violating index. An
+already-absent unlink race is benign and is not an eviction.
+
+Capacity is refreshed every minute. A lower ceiling is published immediately
+and the convergence worker evicts least-recently-used entries to restore the reserve. An
 increase requires two consecutive healthy samples before it is applied, which
 prevents short-lived external disk usage from flapping the ceiling. Runtime
 deletion failures leave the entry indexed, are not counted as successful
-evictions, and are retried during later over-limit refreshes.
+evictions, and are retried with backoff while the cache remains over target.
+
+### Durable access recency
+
+Successful body reads and explicit peer accesses always move the in-memory LRU
+synchronously. Once per minute bucket per key, a nonblocking asynchronous path
+persists the access time in that committed file's mtime. The work queue holds at
+most 65,536 waiting opaque keys, one metadata worker is active, and repeated
+touches coalesce. Queue overflow or metadata failure degrades only restart
+ordering. File write mtime is the fallback when a key has no persisted read
+history; source URLs and request metadata are never written. Accepted work
+drains within the process shutdown deadline. Cache shutdown is terminal for
+mutations but does not invalidate existing readers, so replacement commits
+cannot race a recency writer that has stopped accepting work.
 
 The process-level backstop remains the pod memory limit and Go memory policy.
 The settings above bound the largest cache-proxy-owned contributors, but do not

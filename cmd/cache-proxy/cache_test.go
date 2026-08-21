@@ -247,7 +247,7 @@ func TestDiskCacheEntryLimitEvictsOldest(t *testing.T) {
 	}
 }
 
-func TestDiskCacheEntryLimitAppliesDuringStartupScan(t *testing.T) {
+func TestDiskCacheHardEntryLimitAppliesDuringStartupScan(t *testing.T) {
 	dir := t.TempDir()
 	entries := []struct {
 		key  string
@@ -266,7 +266,7 @@ func TestDiskCacheEntryLimitAppliesDuringStartupScan(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	c, err := NewDiskCache(dir, 100, DiskCacheOptions{MaxEntries: 2})
+	c, err := NewDiskCache(dir, 100, DiskCacheOptions{MaxEntries: 3, hardMaxEntries: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,7 +389,7 @@ func TestNewDiskCacheFailsWhenStartupScanStopsBeforeDirectoryIsExhausted(t *test
 	}
 }
 
-func TestNewDiskCacheFailsWhenStartupPruneCannotRemoveVictim(t *testing.T) {
+func TestNewDiskCacheFailsWhenHardPruneCannotRemoveVictim(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		firstAge   time.Duration
@@ -427,7 +427,8 @@ func TestNewDiskCacheFailsWhenStartupPruneCannotRemoveVictim(t *testing.T) {
 			beforeAggregate := counterValue(t, cacheEvictionsTotal)
 			beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry)
 			c, err := NewDiskCache(dir, 100, DiskCacheOptions{
-				MaxEntries: 1,
+				MaxEntries:     2,
+				hardMaxEntries: 1,
 				openScanDirectory: func(string) (cacheDirectory, error) {
 					return &scriptedCacheDirectory{entries: entries, err: io.EOF}, nil
 				},
@@ -436,11 +437,8 @@ func TestNewDiskCacheFailsWhenStartupPruneCannotRemoveVictim(t *testing.T) {
 					return removeErr
 				},
 			})
-			if c != nil {
-				t.Fatal("NewDiskCache returned a cache after startup pruning failed")
-			}
-			if !errors.Is(err, removeErr) {
-				t.Fatalf("NewDiskCache error = %v, want wrapped removal error", err)
+			if c != nil || !errors.Is(err, removeErr) {
+				t.Fatalf("NewDiskCache after failed hard-prune removal: cache=%v err=%v, want nil/wrapped failure", c, err)
 			}
 			if attemptedVictim != tc.wantVictim {
 				t.Fatalf("startup prune attempted victim %q, want %q", attemptedVictim, tc.wantVictim)
@@ -486,7 +484,8 @@ func TestNewDiskCacheTreatsStartupPruneENOENTAsSuccessfulCleanup(t *testing.T) {
 	beforeAggregate := counterValue(t, cacheEvictionsTotal)
 	beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry)
 	c, err := NewDiskCache(dir, 100, DiskCacheOptions{
-		MaxEntries: 1,
+		MaxEntries:     2,
+		hardMaxEntries: 1,
 		openScanDirectory: func(string) (cacheDirectory, error) {
 			return &scriptedCacheDirectory{entries: entries, err: io.EOF}, nil
 		},
@@ -514,7 +513,7 @@ func TestNewDiskCacheTreatsStartupPruneENOENTAsSuccessfulCleanup(t *testing.T) {
 	}
 }
 
-func TestNewDiskCacheFailsWhenInitialBytePruneCannotRemoveVictim(t *testing.T) {
+func TestNewDiskCacheDefersInitialByteConvergence(t *testing.T) {
 	dir := t.TempDir()
 	for _, key := range []string{strings.Repeat("c", 64), strings.Repeat("d", 64)} {
 		if err := os.WriteFile(filepath.Join(dir, key), make([]byte, 60), 0600); err != nil {
@@ -524,18 +523,22 @@ func TestNewDiskCacheFailsWhenInitialBytePruneCannotRemoveVictim(t *testing.T) {
 	removeErr := errors.New("forced startup byte-prune removal failure")
 	beforeAggregate := counterValue(t, cacheEvictionsTotal)
 	beforeLabel := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonByte)
+	removeAttempts := 0
 	c, err := NewDiskCache(dir, 80, DiskCacheOptions{
 		CapacityProvider: func(string) (diskSpace, error) {
 			// owned=120, reserve=50, free=0 => byte ceiling=70.
 			return diskSpace{TotalBytes: 1000, FreeBytes: 0}, nil
 		},
-		removeFile: func(string) error { return removeErr },
+		removeFile: func(string) error {
+			removeAttempts++
+			return removeErr
+		},
 	})
-	if c != nil {
-		t.Fatal("NewDiskCache returned an over-capacity cache after initial byte pruning failed")
+	if err != nil || c == nil {
+		t.Fatalf("NewDiskCache must load inspectable entries before rate-limited byte convergence: cache=%v err=%v", c, err)
 	}
-	if !errors.Is(err, removeErr) {
-		t.Fatalf("NewDiskCache error = %v, want wrapped byte-prune removal error", err)
+	if c.currentSize != 120 || c.maxBytes != 70 || removeAttempts != 0 {
+		t.Fatalf("startup state bytes/capacity/removals = %d/%d/%d, want 120/70/0", c.currentSize, c.maxBytes, removeAttempts)
 	}
 	if got := counterValue(t, cacheEvictionsTotal) - beforeAggregate; got != 0 {
 		t.Fatalf("aggregate evictions after failed startup byte removal = %v, want 0", got)
@@ -556,7 +559,8 @@ func TestCachePressureEvictionsHaveBoundedPhaseAndReason(t *testing.T) {
 		before := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseStartup, cacheEvictionReasonEntry)
 		beforeAggregate := counterValue(t, cacheEvictionsTotal)
 		c, err := NewDiskCache(dir, 80, DiskCacheOptions{
-			MaxEntries: 2,
+			MaxEntries:     3,
+			hardMaxEntries: 2,
 			CapacityProvider: func(string) (diskSpace, error) {
 				return diskSpace{TotalBytes: 1000, FreeBytes: 990}, nil
 			},
@@ -613,6 +617,7 @@ func TestRefreshCapacityShrinksImmediatelyAndRecoversAfterHysteresis(t *testing.
 	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 760 {
 		t.Fatalf("shrunk capacity = %d (ok=%v), want 760", got, ok)
 	}
+	c.convergeOne()
 	if got := counterVecValue(t, cacheEvictionsByPhaseReasonTotal, cacheEvictionPhaseBackground, cacheEvictionReasonByte) - before; got != 1 {
 		t.Fatalf("background byte evictions = %v, want 1", got)
 	}
@@ -658,6 +663,7 @@ func TestRefreshCapacityRetriesEvictionAtUnchangedCeiling(t *testing.T) {
 	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 760 {
 		t.Fatalf("first refresh capacity = %d (ok=%v), want 760", got, ok)
 	}
+	c.convergeOne()
 	if removeAttempts != 1 || c.currentSize != 800 || c.order.Len() != 2 {
 		t.Fatalf("cache after failed convergence = attempts:%d bytes:%d entries:%d, want 1/800/2", removeAttempts, c.currentSize, c.order.Len())
 	}
@@ -673,6 +679,7 @@ func TestRefreshCapacityRetriesEvictionAtUnchangedCeiling(t *testing.T) {
 	if _, got, ok := c.refreshCapacityStats(80); !ok || got != 760 {
 		t.Fatalf("second refresh capacity = %d (ok=%v), want 760", got, ok)
 	}
+	c.convergeOne()
 	if removeAttempts != 2 || c.currentSize != 400 || c.order.Len() != 1 {
 		t.Fatalf("cache after retried convergence = attempts:%d bytes:%d entries:%d, want 2/400/1", removeAttempts, c.currentSize, c.order.Len())
 	}
@@ -1282,7 +1289,7 @@ func TestScanExistingSeedsRecencyOrder(t *testing.T) {
 	}
 }
 
-func TestScanExistingEnforcesByteAndEntryCeilings(t *testing.T) {
+func TestScanExistingLoadsAboveSoftByteAndEntryTargets(t *testing.T) {
 	dir := t.TempDir()
 	keys := []string{strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64)}
 	base := time.Now().Add(-time.Hour)
@@ -1307,10 +1314,12 @@ func TestScanExistingEnforcesByteAndEntryCeilings(t *testing.T) {
 	if _, err := c.scanExisting(); err != nil {
 		t.Fatal(err)
 	}
-	if c.currentSize > c.maxBytes || c.order.Len() > c.maxEntries {
-		t.Fatalf("startup cache exceeds ceilings: bytes=%d/%d entries=%d/%d", c.currentSize, c.maxBytes, c.order.Len(), c.maxEntries)
+	if c.currentSize != 30 || c.order.Len() != 3 {
+		t.Fatalf("startup cache bytes/entries = %d/%d, want all 30/3 before convergence", c.currentSize, c.order.Len())
 	}
-	if !c.Has(keys[2]) {
-		t.Fatal("startup pruning did not retain the newest entry")
+	for _, key := range keys {
+		if !c.Has(key) {
+			t.Fatalf("startup omitted soft-over-target key %s", key)
+		}
 	}
 }

@@ -10,7 +10,7 @@ available, and forwards cache misses to origin object storage.
 | --- | --- | --- |
 | `CACHE_DIR` | `/cache` | Local disk cache directory. |
 | `CACHE_MAX_PERCENT` | `80` | Target for committed cache bytes. The proxy retains a 5%-of-total-disk reserve and accounts for its own committed files as reclaimable, so a restart of an 80%-full cache does not mistake the cache itself for external disk use. Capacity is refreshed every minute; reductions apply immediately and recovery requires two consecutive healthy samples. |
-| `CACHE_MAX_ENTRIES` | `1000000` | Strict maximum tracked LRU entries after each serialized final commit. Bounds local cache-index memory. |
+| `CACHE_MAX_ENTRIES` | `1000000` | Soft admission and convergence target for tracked LRU entries. Startup loads inspectable committed entries up to the independent 10,000,000-entry hard safety guardrail; values above that guardrail are clamped. |
 | `LISTEN_ADDR` | `:8080` | Forward proxy listener. |
 | `PEER_ADDR` | `:8081` | Peer cache API listener. |
 | `CACHE_PEER_LOOKUP_MODE` | `probe` | `probe` preserves the existing fleet-wide `/cache/has` behavior. `summary` pulls Bloom-filter hints and uses them to eliminate definite-negative peers before bounded `/cache/has` confirmation; any other value causes startup to fail. |
@@ -28,9 +28,15 @@ available, and forwards cache misses to origin object storage.
 
 Cache bodies stream concurrently into temporary files. Only the short final
 rename plus exact-index, LRU, byte-count, and counting-Bloom update is serialized.
-That commit evicts before returning, so completed commits cannot exceed
-`CACHE_MAX_ENTRIES`, and tracked bytes do not exceed the current cache byte
-capacity unless a single retained entry is itself larger than that capacity.
+At or above the soft entry target, a new-key commit performs one LRU swap and
+therefore cannot increase the tracked entry count. Byte capacity remains a
+strict request-path bound: a commit removes enough older entries to preserve
+the filesystem reserve. The existing compatibility exception retains a single
+object that is itself larger than the byte ceiling after draining other
+entries. A single background worker converges any restart or
+capacity overage at no more than 1,000 successful deletions per second.
+Replacements do not add entries, though a larger replacement can evict older
+entries to stay within the byte ceiling.
 Concurrent temporary files consume real disk but are not yet tracked cache
 entries.
 
@@ -50,20 +56,52 @@ to `committedCacheBytes`. Interrupted files in `.tmp` are removed during
 startup and are never cached or counted as evictions. Invalid or unrelated
 root-directory entries are left in place and remain external disk usage.
 
-When another writer consumes local disk, the cache lowers its capacity and
-evicts least-recently-used committed entries as needed to preserve the reserve.
+When another writer consumes local disk, the cache lowers its capacity and a
+rate-limited worker evicts least-recently-used committed entries to preserve
+the reserve.
 When that pressure disappears, it expands only after two consecutive refreshes
 confirm recovery; no deleted entries are recreated automatically. If the proxy
-cannot inspect the filesystem or prune an over-limit committed entry at startup,
-it exits rather than serving with an unknown or unenforceable disk budget. Once
-running, a failed pressure-driven deletion leaves the entry indexed and is
-logged, then is retried on later refreshes while the cache remains over its
-limit. Failed and already-absent deletions are never reported as evictions.
+cannot enumerate the cache directory completely at startup, it exits rather
+than serving from a partial index. An individual valid-looking file whose
+metadata cannot be inspected is preserved, excluded from cache ownership, and
+treated conservatively as external disk usage. Once running, a failed
+pressure-driven deletion leaves the entry indexed and is logged, then is
+retried with backoff while the cache remains over its limit. Failed and
+already-absent deletions are never reported as evictions.
 
-This compatibility release continues to use the configured
-`CACHE_MAX_ENTRIES` as the active admission ceiling; its default is 1,000,000.
-The derived disk/entry/Bloom sizing calculations prepare the later
-derived-entry rollout but do not replace that configured limit.
+This compatibility release continues to use configured `CACHE_MAX_ENTRIES`
+(default 1,000,000) as the soft target. It is no longer a startup survivor
+limit: a restart loads every inspectable entry up to the fixed 10,000,000-entry
+hard metadata guardrail, then converges gradually. Only an exceptional cache
+above the hard guardrail is pruned during startup. The scanner enumerates in
+1,024-entry chunks, selects the newest hard-limit set with bounded memory, and
+spools non-survivors under `.tmp`; it does not remove a committed file until a
+complete successful enumeration. Hard-guardrail removals are sequential,
+cancellation-aware, and use the same metered eviction path as runtime pressure.
+An unexpected hard-prune unlink failure aborts startup; an already-absent race
+is benign and is not counted as an eviction. Persisted coarse read recency,
+with file write time as the fallback, determines
+the survivor order. Equal timestamps use the opaque cache key as a deterministic
+tie-breaker.
+
+## Durable restart recency
+
+Every successful local body read and peer access updates the exact in-memory
+LRU synchronously. At most once per minute per resident key, the proxy also
+queues the opaque 64-hex cache key and coarse timestamp for an asynchronous
+mtime update. The bounded queue holds 65,536 waiting keys, one worker performs
+filesystem metadata writes, and repeated touches of the same key coalesce. A
+full queue or metadata failure affects only restart survivor accuracy; request
+handlers never wait for it and cached bodies remain usable. No source URL,
+query string, object path, or organization identifier is persisted.
+
+On graceful shutdown the HTTP servers stop accepting work first, then accepted
+recency updates drain within the shared 10-second shutdown deadline. Once cache
+shutdown begins, new cache mutations are rejected while existing bodies remain
+readable, preventing a commit from racing the closed recency writer. A startup
+SIGTERM cancels directory enumeration or hard pruning promptly. Deploy this
+recency-writing release for a representative access window before enabling a
+later rollout that can grow caches beyond the compatibility soft target.
 
 ## Cluster-wide fetch dedup
 

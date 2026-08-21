@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -174,14 +175,25 @@ func main() {
 	maxSpanBlocks := envInt64("CACHE_BLOCK_MAX_SPAN_BLOCKS", 8)
 	slog.Info("Block mode configured.", "enabled", blockMode, "block_size", blockSize, "max_span_blocks", maxSpanBlocks)
 
+	// Install cancellation before the potentially long bounded startup scan so
+	// Kubernetes termination never has to wait for enumeration or hard pruning.
+	rootCtx, stopBackground := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopBackground()
+
 	// Initialize cache store
 	store, err := NewDiskCache(cacheDir, maxPercent, DiskCacheOptions{
-		IncrementalSummary: lookupMode == peerLookupSummary && peerService != "",
-		MaxEntries:         maxEntries,
-		BlockSizeBytes:     blockSize,
+		IncrementalSummary:    lookupMode == peerLookupSummary && peerService != "",
+		DurableRecency:        true,
+		BackgroundConvergence: true,
+		MaxEntries:            maxEntries,
+		BlockSizeBytes:        blockSize,
+		startupContext:        rootCtx,
 	})
 	if err != nil {
 		slog.Error("Failed to initialize cache store.", "error", err)
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		os.Exit(1)
 	}
 	// Track the disk's free space: when something outside the cache consumes
@@ -190,14 +202,17 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
-		for range ticker.C {
-			store.refreshCapacity(maxPercent)
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-ticker.C:
+				store.refreshCapacity(maxPercent)
+			}
 		}
 	}()
 
 	// Initialize peer manager
-	rootCtx, stopBackground := context.WithCancel(context.Background())
-	defer stopBackground()
 	var peers *PeerManager
 	if peerService != "" {
 		peers = NewPeerManager(peerService, peerAddr)
@@ -262,10 +277,8 @@ func main() {
 		}
 	}()
 
-	// Wait for shutdown signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
-	<-sigCh
+	// Wait for shutdown signal.
+	<-rootCtx.Done()
 
 	slog.Info("Shutting down...")
 	stopBackground()
@@ -277,6 +290,9 @@ func main() {
 	_ = s3Server.Shutdown(ctx)
 	_ = peerServer.Shutdown(ctx)
 	_ = healthServer.Shutdown(ctx)
+	if err := store.Close(ctx); err != nil {
+		slog.Warn("Cache background work did not fully drain before shutdown.", "error", err)
+	}
 }
 
 func envOrDefault(key, def string) string {
