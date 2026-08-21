@@ -238,13 +238,28 @@ These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-prox
 | `cache_proxy_hits_total` | Counter | None | Worker-facing cacheable requests served entirely from data already present on local NVMe. Peer API reads and requests that first fetch any block from a peer are excluded. |
 | `cache_proxy_misses_total` | Counter | None | Worker-facing cacheable requests that require a peer or origin fill before they can be served. |
 | `cache_proxy_bytes_served_total` | Counter | `source` | Directional byte mix by `local`, `peer`, or `s3`. Block mode counts assembled response bytes under the slowest source used; the legacy exact-range path counts the local read or deduplicated fill once, so this is not an exact client-egress counter. |
-| `cache_proxy_cache_entries` / `cache_proxy_cache_entry_limit` | Gauge | None | Current exact-index entries and the configured legacy admission limit (`CACHE_MAX_ENTRIES`, default 1,000,000). |
+| `cache_proxy_cache_entries` / `cache_proxy_cache_entry_limit` | Gauge | None | Current exact-index entries and the configured compatibility soft target (`CACHE_MAX_ENTRIES`, default 1,000,000). |
+| `cache_proxy_cache_hard_entry_limit` | Gauge | None | Fixed exact-index startup/admission safety guardrail (10,000,000). Configured soft targets are clamped to it. |
+| `cache_proxy_cache_exact_index_estimated_bytes` | Gauge | None | Conservative exact-index metadata estimate (256 bytes per tracked entry); use process/cgroup metrics for authoritative memory usage. |
 | `cache_proxy_cache_owned_bytes` / `cache_proxy_cache_capacity_bytes` | Gauge | None | Bytes in committed cache entries and the current capacity ceiling. Committed bytes are reclaimable in capacity calculation after restart. |
 | `cache_proxy_cache_disk_target_bytes` / `cache_proxy_cache_disk_reserve_bytes` | Gauge | None | The configured percentage-of-disk target and the fixed 5%-of-total-disk reserve. |
 | `cache_proxy_cache_entry_limit_reason` | Gauge | `reason` | Future derived-entry bottleneck. Exactly one `reason` (`disk` or `metadata`) is 1; this anticipates the later derived-entry rollout without replacing the configured legacy admission limit. |
 | `cache_proxy_cache_startup_scan_duration_seconds` | Histogram | None | Cache directory startup-scan duration. |
 | `cache_proxy_cache_startup_scan_files_inspected_total` / `cache_proxy_cache_startup_invalid_files_total` | Counter | None | Root-directory entries scanned and entries excluded from committed cache ownership because they are invalid or unrelated. |
+| `cache_proxy_cache_startup_uninspectable_files_total` | Counter | None | Valid-looking files preserved but excluded from ownership because their metadata could not be inspected. |
+| `cache_proxy_cache_startup_discovered_owned_bytes` | Gauge | None | Inspectable committed bytes discovered before exceptional hard-guardrail survivor pruning. |
+| `cache_proxy_cache_startup_selected_entries` / `cache_proxy_cache_startup_selected_bytes` | Gauge | None | Entries and logical bytes selected for the bounded exact index during the most recent startup. |
+| `cache_proxy_cache_startup_phase` | Gauge | `phase` | Active bounded startup phase (`enumerate`, `hard_prune`, or `index`); all series are zero after startup. |
+| `cache_proxy_cache_startup_hard_prune_candidates_total` / `cache_proxy_cache_startup_hard_prune_completed_total` / `cache_proxy_cache_startup_hard_prune_failures_total` / `cache_proxy_cache_startup_hard_prune_preserved_total` | Counter | None | Exceptional above-10M survivor-selection progress and outcomes. Successful committed deletion remains authoritative in `cache_proxy_evictions_total`. |
+| `cache_proxy_cache_startup_cancellations_total` | Counter | None | Startup scans or hard-prune passes canceled by process shutdown. |
 | `cache_proxy_cache_temporary_files_removed_total` | Counter | None | Interrupted temporary files removed from `.tmp` on startup. They are never counted as cache evictions. |
+| `cache_proxy_cache_recency_touch_attempts_total` / `cache_proxy_cache_recency_touch_successes_total` / `cache_proxy_cache_recency_touch_failures_total` | Counter | None | Coarse durable-recency access attempts and filesystem persistence outcomes. Missing files raced by eviction are benign and excluded from failures. |
+| `cache_proxy_cache_recency_touch_coalesced_total` / `cache_proxy_cache_recency_touch_dropped_total` | Counter | None | Same-key or same-minute recency updates coalesced, and nonblocking updates dropped because bounded work was full or closed. |
+| `cache_proxy_cache_recency_queue_depth` | Gauge | None | Unique opaque keys with queued or in-flight recency persistence work. |
+| `cache_proxy_cache_recency_last_successful_persistence_timestamp_seconds` | Gauge | None | Unix timestamp of the last successful coarse mtime update. |
+| `cache_proxy_cache_convergence_active` | Gauge | None | `1` while tracked entries or bytes exceed the current soft target. |
+| `cache_proxy_cache_convergence_excess_entries` / `cache_proxy_cache_convergence_excess_bytes` | Gauge | None | Current overage awaiting bounded background convergence. |
+| `cache_proxy_cache_convergence_eviction_attempts_total` / `cache_proxy_cache_convergence_eviction_failures_total` | Counter | None | One-at-a-time background convergence deletion attempts and hard failures. Successful deletions also increment the aggregate and phase/reason eviction metrics. |
 | `cache_proxy_evictions_total` | Counter | None | Aggregate successful removal of committed cache entries under entry or byte pressure. |
 | `cache_proxy_evictions_by_phase_reason_total` | Counter | `phase`, `reason` | The same evictions by bounded `phase` (`startup`, `background`, or `request`) and pressure `reason` (`entry` or `byte`). Failed or already-absent files are not reported as successful evictions. |
 | `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups in either mode. |
