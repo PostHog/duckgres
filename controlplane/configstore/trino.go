@@ -197,25 +197,33 @@ func (cs *ConfigStore) DisableTrino(orgID string) error {
 // runs in the same handler that toggles Enabled), and silently skipping is
 // safer than projecting a half-built password file.
 //
+// Orgs with no duckgres_orgs row, or a blank database_name, are skipped for
+// the same reason: database_name is the org's Trino principal (see
+// TrinoEnabledOrg.TrinoPrincipal), so without it there is no username to put
+// in password.db and no stem to build a catalog name from. Skipping leaves
+// the org Pending rather than projecting a catalog called `org_`.
+//
 // Every cell's rows are returned, unassigned ones included; the caller
 // filters by cell (see TrinoEnabledOrg.CellID for why the filter is not in
 // the SQL).
 func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 	var out []TrinoEnabledOrg
 	// Inner join with duckgres_org_users on (org_id, username='root') so a
-	// missing OrgUser row drops the org from the result. Then left join with
-	// duckgres_orgs to pick up database_name.
+	// missing OrgUser row drops the org from the result. Inner join with
+	// duckgres_orgs for database_name, which is the org's Trino principal —
+	// a missing or blank one drops the org for the same reason.
 	err := cs.db.Table("duckgres_managed_warehouse_trino AS t").
 		Select(`t.org_id AS org_id,
-		         COALESCE(o.database_name, '') AS database_name,
+		         o.database_name AS database_name,
 		         t.tier AS tier,
 		         COALESCE(t.trino_cell_id, '') AS cell_id,
 		         u.password AS root_password_hash,
 		         t.state AS state`).
 		Joins(`INNER JOIN duckgres_org_users AS u
 		        ON u.org_id = t.org_id AND u.username = 'root'`).
-		Joins(`LEFT JOIN duckgres_orgs AS o ON o.name = t.org_id`).
+		Joins(`INNER JOIN duckgres_orgs AS o ON o.name = t.org_id`).
 		Where("t.enabled = ?", true).
+		Where("o.database_name <> ''").
 		Order("t.org_id ASC").
 		Scan(&out).Error
 	if err != nil {

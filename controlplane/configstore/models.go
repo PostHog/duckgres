@@ -524,6 +524,26 @@ type TrinoEnabledOrg struct {
 	State            ManagedWarehouseProvisioningState // current state at read time
 }
 
+// TrinoPrincipal is the tenant's customer-facing identity in Trino: the
+// username it authenticates as, and the stem every derived name is built
+// from (catalog, group, resource group).
+//
+// It is DatabaseName, not OrgID, so a tenant is known by the same name in
+// Trino as in its DuckDB warehouse — where database_name is already the
+// public socket identity (the SNI hostname label and the dbname clients
+// connect with). OrgID may be a bare UUID, which would put a hex string in
+// the customer's connection string and in every fully-qualified table
+// reference.
+//
+// Safe as a catalog stem because duckgres_orgs.database_name carries a
+// global unique index, so two tenants cannot derive the same catalog name.
+// OrgID remains the primary key and keys all internal plumbing (config
+// store rows, the tenant-password Secret); only names the customer types
+// are derived from this.
+func (o TrinoEnabledOrg) TrinoPrincipal() string {
+	return o.DatabaseName
+}
+
 // NOTE: the cluster-wide singleton config tables (global_config,
 // ducklake_config, rate_limit_config, query_log_config) were removed — they
 // were seeded and served by the admin API but never read to drive runtime
