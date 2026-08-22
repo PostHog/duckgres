@@ -298,6 +298,11 @@ allow if {
 
 batch contains i if {
 	some i
+	# FilterColumns indexes into the candidate's `columns` array, not into
+	# filterResources, and is answered by the rule below. Excluding it here
+	# keeps one rule per shape: left in, this rule also contributes index 0
+	# for a table carrying NO columns, which is an out-of-bounds answer.
+	input.action.operation != "FilterColumns"
 	resource := input.action.filterResources[i]
 	allow with input.action.resource as resource
 }

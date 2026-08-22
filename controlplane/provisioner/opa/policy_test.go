@@ -878,6 +878,30 @@ func TestBatchedFilterColumns(t *testing.T) {
 	if len(other) != 0 {
 		t.Errorf("no column of another org's table may be visible, got %v", other)
 	}
+
+	// A readable table carrying NO columns must yield no indices. The generic
+	// batch rule excludes FilterColumns precisely so it cannot answer 0 here —
+	// an index into an empty array.
+	empty := evalBatch(t, batchQ, map[string]interface{}{
+		"context": map[string]interface{}{
+			"identity":      map[string]interface{}{"user": "42", "groups": []string{"org_42"}},
+			"softwareStack": map[string]interface{}{"trinoVersion": "476"},
+		},
+		"action": map[string]interface{}{
+			"operation": "FilterColumns",
+			"filterResources": []map[string]interface{}{{
+				"table": map[string]interface{}{
+					"catalogName": "org_42",
+					"schemaName":  "main",
+					"tableName":   "events",
+					"columns":     []string{},
+				},
+			}},
+		},
+	})
+	if len(empty) != 0 {
+		t.Errorf("a table with no columns must yield no indices, got %v", empty)
+	}
 }
 
 // --------------------------------------------------------------------------
