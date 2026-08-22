@@ -86,20 +86,26 @@
 # so when per-user identity within an org lands (OIDC), org-mates keep
 # seeing each other's queries with no policy change.
 #
-# !!! Cross-component invariant: this policy is the NON-BATCHED OPA
-# contract. Trino 476's batched access control (OpaBatchAccessControl,
-# enabled via `opa.policy.batched-uri` on the trino-opa plugin) sends
-# candidates under `input.action.filterResources` (plural) instead of
-# `input.action.resource` (singular). Every filter rule below reads
-# `input.action.resource.*`, so under the batched shape they all fail
-# their body and fall through to `default allow := false`. That is
-# fail-closed — safe by the threat model — but operationally it means
-# enabling batched mode in the chart silently denies every filter
-# query, which looks like a tenant-isolation bug from the outside.
-# DO NOT set `opa.policy.batched-uri` in the customer-Trino chart
-# without first extending this policy to handle the batched shape (and
-# the bundle generator's tests). TestBatchedInputDeniesByDefault below
-# locks the fail-closed behaviour as a regression guard.
+# !!! Cross-component invariant: this policy serves BOTH OPA shapes.
+# `allow` answers the non-batched contract, where the candidate sits at
+# `input.action.resource` (singular). `batch` answers Trino's
+# OpaBatchAccessControl (`opa.policy.batched-uri`), where candidates
+# arrive as a list at `input.action.filterResources` (plural) and the
+# response is the list of allowed INDICES into it.
+#
+# The two are not independent: `batch` is defined by re-evaluating
+# `allow` with each candidate substituted in at `input.action.resource`,
+# so any rule added to `allow` is honoured in batched mode automatically
+# and the shapes cannot drift. Do NOT hand-write a parallel set of
+# batched rules.
+#
+# Both are wired deliberately. A coordinator with only `opa.policy.uri`
+# set issues ONE request per candidate object, and filtering a catalog
+# with more than ~1024 tables overruns the HTTP client's per-destination
+# queue ("Max requests queued per destination 1024 exceeded"), which
+# reaches the user as "Failed to query OPA backend" on any
+# information_schema listing. TestBatchedFilteringMatchesNonBatched
+# locks the two shapes to identical answers.
 
 package trino
 
@@ -278,6 +284,40 @@ allow if {
 allow if {
 	input.action.operation == "FilterColumns"
 	readable_catalog(input.action.resource.table.catalogName)
+}
+
+# ---------------------------------------------------------------------------
+# Batched filtering.
+#
+# Trino's OpaBatchAccessControl POSTs one request carrying every candidate
+# under `input.action.filterResources` and expects `{"result": [<indices>]}`
+# naming the entries the caller may see. Each candidate is evaluated by
+# substituting it at `input.action.resource` and re-running `allow`, so
+# batched and non-batched decisions are the same decision by construction.
+# ---------------------------------------------------------------------------
+
+batch contains i if {
+	some i
+	resource := input.action.filterResources[i]
+	allow with input.action.resource as resource
+}
+
+# FilterColumns is the one operation whose batched shape is not simply a
+# list of the non-batched resource: Trino sends a SINGLE table candidate
+# carrying a `columns` array and expects indices into THAT array rather
+# than into filterResources. Fan the columns out into one table resource
+# each so the same `allow` rules answer for them.
+batch contains i if {
+	some i
+	input.action.operation == "FilterColumns"
+	count(input.action.filterResources) == 1
+	resource := input.action.filterResources[0]
+	count(resource.table.columns) > 0
+	columns := [
+		object.union(resource, {"table": {"column": name}}) |
+		some name in resource.table.columns
+	]
+	allow with input.action.resource as columns[i]
 }
 
 # ---------------------------------------------------------------------------

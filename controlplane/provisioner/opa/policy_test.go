@@ -2,6 +2,7 @@ package opa
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -715,39 +716,167 @@ func TestIsolationMatrix(t *testing.T) {
 // safety). Default-deny is the floor.
 // --------------------------------------------------------------------------
 
-func TestBatchedInputDeniesByDefault(t *testing.T) {
-	q := preparedPolicy(t, twoOrgFixture())
+// preparedBatch compiles the policy for the batched entrypoint.
+func preparedBatch(t *testing.T, gc GroupCatalogs) rego.PreparedEvalQuery {
+	t.Helper()
+	data, err := buildDataDocument(gc)
+	if err != nil {
+		t.Fatalf("buildDataDocument: %v", err)
+	}
+	q, err := rego.New(
+		rego.Query("data.trino.batch"),
+		rego.Module("policy.rego", string(policyRego)),
+		rego.Data(data),
+	).PrepareForEval(context.Background())
+	if err != nil {
+		t.Fatalf("PrepareForEval: %v", err)
+	}
+	return q
+}
 
-	// Construct a batched-shape input the way Trino 476's
-	// OpaBatchAccessControl does: `action.filterResources` is a list of
-	// resource objects. The non-batched `action.resource` is absent.
-	for _, op := range []string{
-		"FilterCatalogs",
-		"FilterSchemas",
-		"FilterTables",
-		"FilterColumns",
-	} {
-		batched := map[string]interface{}{
+// evalBatch returns the set of allowed indices the batched entrypoint names.
+func evalBatch(t *testing.T, q rego.PreparedEvalQuery, input map[string]interface{}) map[int]bool {
+	t.Helper()
+	rs, err := q.Eval(context.Background(), rego.EvalInput(input))
+	if err != nil {
+		t.Fatalf("Eval: %v", err)
+	}
+	out := map[int]bool{}
+	if len(rs) == 0 || len(rs[0].Expressions) == 0 {
+		return out
+	}
+	items, ok := rs[0].Expressions[0].Value.([]interface{})
+	if !ok {
+		t.Fatalf("expected a list of indices, got %T (%v)", rs[0].Expressions[0].Value, rs[0].Expressions[0].Value)
+	}
+	for _, it := range items {
+		n, ok := it.(json.Number)
+		if !ok {
+			t.Fatalf("expected numeric index, got %T (%v)", it, it)
+		}
+		i, err := n.Int64()
+		if err != nil {
+			t.Fatalf("index %v: %v", n, err)
+		}
+		out[int(i)] = true
+	}
+	return out
+}
+
+// The batched entrypoint must return exactly the candidates the non-batched
+// entrypoint allows. Enabling opa.policy.batched-uri is what stops a
+// coordinator issuing one OPA request per table — filtering a catalog with
+// more than ~1024 tables otherwise overruns the client's queue — so this is
+// the rule that carries tenant isolation for every information_schema
+// listing, and it must not diverge from `allow`.
+func TestBatchedFilteringMatchesNonBatched(t *testing.T) {
+	allowQ := preparedPolicy(t, twoOrgFixture())
+	batchQ := preparedBatch(t, twoOrgFixture())
+
+	identity := map[string]interface{}{
+		"user":   "42",
+		"groups": []string{"org_42"},
+	}
+	ctx := map[string]interface{}{
+		"identity":      identity,
+		"softwareStack": map[string]interface{}{"trinoVersion": "476"},
+	}
+
+	cases := []struct {
+		op        string
+		resources []map[string]interface{}
+		want      map[int]bool
+	}{
+		{
+			op: "FilterCatalogs",
+			resources: []map[string]interface{}{
+				{"catalog": map[string]interface{}{"name": "org_42"}},
+				{"catalog": map[string]interface{}{"name": "org_43"}},
+			},
+			want: map[int]bool{0: true},
+		},
+		{
+			op: "FilterSchemas",
+			resources: []map[string]interface{}{
+				{"schema": map[string]interface{}{"catalogName": "org_43", "schemaName": "main"}},
+				{"schema": map[string]interface{}{"catalogName": "org_42", "schemaName": "main"}},
+			},
+			want: map[int]bool{1: true},
+		},
+		{
+			op: "FilterTables",
+			resources: []map[string]interface{}{
+				{"table": map[string]interface{}{"catalogName": "org_42", "schemaName": "main", "tableName": "events"}},
+				{"table": map[string]interface{}{"catalogName": "org_43", "schemaName": "main", "tableName": "events"}},
+				{"table": map[string]interface{}{"catalogName": "org_42", "schemaName": "main", "tableName": "persons"}},
+			},
+			want: map[int]bool{0: true, 2: true},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.op, func(t *testing.T) {
+			got := evalBatch(t, batchQ, map[string]interface{}{
+				"context": ctx,
+				"action": map[string]interface{}{
+					"operation":       tc.op,
+					"filterResources": tc.resources,
+				},
+			})
+			if len(got) != len(tc.want) {
+				t.Fatalf("batch = %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if !got[i] {
+					t.Errorf("index %d missing from batch result %v", i, got)
+				}
+			}
+
+			// Same verdict, candidate by candidate, through `allow`.
+			for i, res := range tc.resources {
+				action := map[string]interface{}{"operation": tc.op, "resource": res}
+				allowed := evalAllow(t, allowQ, map[string]interface{}{"context": ctx, "action": action})
+				if allowed != tc.want[i] {
+					t.Errorf("candidate %d: allow=%v but batch expects %v — the two shapes disagree", i, allowed, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// FilterColumns is the shape-shifter: ONE table candidate carrying a columns
+// array, with indices pointing into that array rather than filterResources.
+func TestBatchedFilterColumns(t *testing.T) {
+	batchQ := preparedBatch(t, twoOrgFixture())
+
+	mk := func(catalog string) map[string]interface{} {
+		return map[string]interface{}{
 			"context": map[string]interface{}{
-				"identity": map[string]interface{}{
-					"user":   "42",
-					"groups": []string{"org_42"},
-				},
-				"softwareStack": map[string]interface{}{
-					"trinoVersion": "476",
-				},
+				"identity":      map[string]interface{}{"user": "42", "groups": []string{"org_42"}},
+				"softwareStack": map[string]interface{}{"trinoVersion": "476"},
 			},
 			"action": map[string]interface{}{
-				"operation": op,
-				"filterResources": []map[string]interface{}{
-					{"catalog": map[string]interface{}{"name": "org_42"}},
-					{"catalog": map[string]interface{}{"name": "org_43"}},
-				},
+				"operation": "FilterColumns",
+				"filterResources": []map[string]interface{}{{
+					"table": map[string]interface{}{
+						"catalogName": catalog,
+						"schemaName":  "main",
+						"tableName":   "events",
+						"columns":     []string{"uuid", "timestamp", "properties"},
+					},
+				}},
 			},
 		}
-		if evalAllow(t, q, batched) {
-			t.Errorf("%s under batched input shape must NOT allow -- the policy is the non-batched contract; enabling opa.policy.batched-uri without updating the policy would otherwise be a cross-tenant exposure", op)
-		}
+	}
+
+	own := evalBatch(t, batchQ, mk("org_42"))
+	if len(own) != 3 || !own[0] || !own[1] || !own[2] {
+		t.Errorf("every column of the caller's own table must be visible, got %v", own)
+	}
+
+	other := evalBatch(t, batchQ, mk("org_43"))
+	if len(other) != 0 {
+		t.Errorf("no column of another org's table may be visible, got %v", other)
 	}
 }
 
