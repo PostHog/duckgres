@@ -296,33 +296,51 @@ allow if {
 # batched and non-batched decisions are the same decision by construction.
 # ---------------------------------------------------------------------------
 
+# Each rule dispatches on the operation and applies the SAME predicate its
+# `allow` counterpart uses, reading the candidate straight out of
+# filterResources.
+#
+# The obvious formulation — `allow with input.action.resource as candidate` —
+# is quadratic and unusable here. `with` copies the whole input document per
+# candidate, and the input holds every candidate, so evaluating one batch of n
+# costs O(n^2): measured at 17ms for n=100, 1.0s for n=1,000, 17s for n=5,000
+# and 4m for n=20,000. A catalog-wide table listing on this cell exceeded
+# OPA's 60s request budget and returned 500. Reading the candidate directly is
+# linear.
+#
+# The cost is that the operation dispatch is written twice, here and in
+# `allow`. The authorization predicate itself is NOT duplicated — both call
+# the same readable_catalog / listable_catalog helpers, so a change to who may
+# see what lands in one place. TestBatchedFilteringMatchesNonBatched pins the
+# two shapes to identical answers candidate by candidate, which is what
+# catches dispatch drift.
+
 batch contains i if {
 	some i
-	# FilterColumns indexes into the candidate's `columns` array, not into
-	# filterResources, and is answered by the rule below. Excluding it here
-	# keeps one rule per shape: left in, this rule also contributes index 0
-	# for a table carrying NO columns, which is an out-of-bounds answer.
-	input.action.operation != "FilterColumns"
-	resource := input.action.filterResources[i]
-	allow with input.action.resource as resource
+	input.action.operation == "FilterCatalogs"
+	listable_catalog(input.action.filterResources[i].catalog.name)
 }
 
-# FilterColumns is the one operation whose batched shape is not simply a
-# list of the non-batched resource: Trino sends a SINGLE table candidate
-# carrying a `columns` array and expects indices into THAT array rather
-# than into filterResources. Fan the columns out into one table resource
-# each so the same `allow` rules answer for them.
 batch contains i if {
 	some i
+	input.action.operation == "FilterSchemas"
+	readable_catalog(input.action.filterResources[i].schema.catalogName)
+}
+
+batch contains i if {
+	some i
+	input.action.operation == "FilterTables"
+	readable_catalog(input.action.filterResources[i].table.catalogName)
+}
+
+# FilterColumns is the one operation whose indices point into the candidate's
+# `columns` array rather than into filterResources: Trino sends a SINGLE table
+# candidate carrying the columns.
+batch contains i if {
 	input.action.operation == "FilterColumns"
 	count(input.action.filterResources) == 1
-	resource := input.action.filterResources[0]
-	count(resource.table.columns) > 0
-	columns := [
-		object.union(resource, {"table": {"column": name}}) |
-		some name in resource.table.columns
-	]
-	allow with input.action.resource as columns[i]
+	readable_catalog(input.action.filterResources[0].table.catalogName)
+	some i, _ in input.action.filterResources[0].table.columns
 }
 
 # ---------------------------------------------------------------------------

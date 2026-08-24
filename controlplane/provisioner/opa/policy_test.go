@@ -3,8 +3,10 @@ package opa
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/open-policy-agent/opa/v1/rego"
 )
@@ -902,6 +904,61 @@ func TestBatchedFilterColumns(t *testing.T) {
 	if len(empty) != 0 {
 		t.Errorf("a table with no columns must yield no indices, got %v", empty)
 	}
+}
+
+// Batch evaluation must stay LINEAR in the number of candidates. The natural
+// formulation — `allow with input.action.resource as candidate` — is
+// quadratic, because `with` copies the whole input (which holds every
+// candidate) once per candidate. That shipped, and a catalog-wide table
+// listing blew OPA's 60s request budget: 17ms at n=100 but 17s at n=5,000
+// and 4 minutes at n=20,000.
+//
+// 20,000 candidates run in ~120ms linear. The 20s bound is loose enough for a
+// loaded CI runner and still ~200x under what the quadratic form needed, so
+// this fails loudly on a regression rather than flaking.
+func TestBatchFilteringIsLinearInCandidateCount(t *testing.T) {
+	q := preparedBatch(t, twoOrgFixture())
+
+	const n = 20000
+	resources := make([]map[string]interface{}, 0, n)
+	for i := range n {
+		catalog := "org_42"
+		if i%2 == 1 {
+			catalog = "org_43" // the other org's table: must be filtered out
+		}
+		resources = append(resources, map[string]interface{}{
+			"table": map[string]interface{}{
+				"catalogName": catalog,
+				"schemaName":  "main",
+				"tableName":   fmt.Sprintf("t%d", i),
+			},
+		})
+	}
+
+	start := time.Now()
+	got := evalBatch(t, q, map[string]interface{}{
+		"context": map[string]interface{}{
+			"identity":      map[string]interface{}{"user": "42", "groups": []string{"org_42"}},
+			"softwareStack": map[string]interface{}{"trinoVersion": "476"},
+		},
+		"action": map[string]interface{}{
+			"operation":       "FilterTables",
+			"filterResources": resources,
+		},
+	})
+	elapsed := time.Since(start)
+
+	if len(got) != n/2 {
+		t.Fatalf("allowed %d of %d candidates, want %d (every org_42 table and no other)", len(got), n, n/2)
+	}
+	// Spot-check the partition rather than trusting the count alone.
+	if !got[0] || got[1] {
+		t.Errorf("wrong candidates allowed: index 0 (org_42) = %v, index 1 (org_43) = %v", got[0], got[1])
+	}
+	if elapsed > 20*time.Second {
+		t.Errorf("batch of %d took %v — that is the quadratic shape, not a slow runner", n, elapsed)
+	}
+	t.Logf("n=%d evaluated in %v", n, elapsed)
 }
 
 // --------------------------------------------------------------------------
