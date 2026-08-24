@@ -99,14 +99,8 @@ func (s *fakeWarehouseStore) GetManagedWarehouseForTrino(orgID string) (*configs
 func readyWarehouse(orgID string) *configstore.ManagedWarehouse {
 	return &configstore.ManagedWarehouse{
 		OrgID: orgID,
-		MetadataStore: configstore.ManagedWarehouseMetadataStore{
-			Kind:         configstore.MetadataStoreKindCnpgShard,
-			Endpoint:     "shard-001-pooler.cnpg-shards.svc.cluster.local",
-			Port:         5432,
-			DatabaseName: "mdstore_" + orgID,
-			Username:     "mdstore_" + orgID,
-		},
-		// S3 and WorkerIdentity are deliberately left zero: nothing
+		// MetadataStore, S3 and WorkerIdentity are deliberately left zero:
+		// nothing
 		// populates those columns for a DuckLake warehouse in
 		// production. The bucket, region and role come off the Duckling
 		// CR status instead (see readyDuckling).
@@ -119,6 +113,10 @@ func readyWarehouse(orgID string) *configstore.ManagedWarehouse {
 // region and per-org IAM role actually come from.
 func readyDuckling(orgID string) *DucklingStatus {
 	d := &DucklingStatus{}
+	d.MetadataStore.Type = string(configstore.MetadataStoreKindCnpgShard)
+	d.MetadataStore.Endpoint = "shard-001-pooler.cnpg-shards.svc.cluster.local"
+	d.MetadataStore.Database = "mdstore_" + orgID
+	d.MetadataStore.User = "mdstore_" + orgID
 	d.MetadataStore.Password = "pw-" + orgID
 	d.DataStore.BucketName = "posthog-duckling-" + orgID + "-mw-dev"
 	d.DataStore.S3Region = "us-east-1"
@@ -548,109 +546,90 @@ func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
 
 func TestDuckLakeMetadataJDBCURL_SSLModeFollowsStoreKind(t *testing.T) {
 	cases := []struct {
-		name string
-		kind string
-		port int
-		want string
+		name      string
+		kind      string
+		endpoint  string
+		pgBouncer string
+		want      string
 	}{
 		{
-			name: "cnpg-shard is in-cluster plaintext",
-			kind: configstore.MetadataStoreKindCnpgShard,
-			port: 5432,
-			want: "jdbc:postgresql://pg.example:5432/mdstore?sslmode=disable",
+			name:     "cnpg-shard is in-cluster plaintext",
+			kind:     string(configstore.MetadataStoreKindCnpgShard),
+			endpoint: "pg.example",
+			want:     "jdbc:postgresql://pg.example:5432/mdstore?sslmode=disable",
 		},
 		{
-			name: "external requires TLS",
-			kind: configstore.MetadataStoreKindExternal,
-			port: 5432,
-			want: "jdbc:postgresql://pg.example:5432/mdstore?sslmode=require",
+			name:     "external requires TLS",
+			kind:     string(configstore.MetadataStoreKindExternal),
+			endpoint: "pg.example",
+			want:     "jdbc:postgresql://pg.example:5432/mdstore?sslmode=require",
 		},
 		{
-			name: "unknown kind fails safe to TLS",
-			kind: "some-future-backend",
-			port: 5432,
-			want: "jdbc:postgresql://pg.example:5432/mdstore?sslmode=require",
+			name:     "unknown kind fails safe to TLS",
+			kind:     "some-future-backend",
+			endpoint: "pg.example",
+			want:     "jdbc:postgresql://pg.example:5432/mdstore?sslmode=require",
 		},
 		{
-			name: "zero port defaults to 5432",
-			kind: configstore.MetadataStoreKindCnpgShard,
-			port: 0,
-			want: "jdbc:postgresql://pg.example:5432/mdstore?sslmode=disable",
+			// A per-Duckling pooler carries its own host:port and wins over
+			// the direct endpoint, matching the worker activation path.
+			name:      "pgbouncer endpoint wins and carries its port",
+			kind:      string(configstore.MetadataStoreKindExternal),
+			endpoint:  "pg.example",
+			pgBouncer: "pgb.example:6432",
+			want:      "jdbc:postgresql://pgb.example:6432/mdstore?sslmode=require",
 		},
 		{
-			name: "explicit non-default port is preserved",
-			kind: configstore.MetadataStoreKindExternal,
-			port: 6432,
-			want: "jdbc:postgresql://pg.example:6432/mdstore?sslmode=require",
+			// Garbage in the pooler field must not produce a malformed DSN;
+			// fall back to the direct endpoint.
+			name:      "unparseable pgbouncer endpoint falls back",
+			kind:      string(configstore.MetadataStoreKindCnpgShard),
+			endpoint:  "pg.example",
+			pgBouncer: "not-a-host-port",
+			want:      "jdbc:postgresql://pg.example:5432/mdstore?sslmode=disable",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w := &configstore.ManagedWarehouse{
-				MetadataStore: configstore.ManagedWarehouseMetadataStore{
-					Kind:         tc.kind,
-					Endpoint:     "pg.example",
-					Port:         tc.port,
-					DatabaseName: "mdstore",
-				},
-			}
-			if got := ducklakeMetadataJDBCURL(w); got != tc.want {
+			d := &DucklingStatus{}
+			d.MetadataStore.Type = tc.kind
+			d.MetadataStore.Endpoint = tc.endpoint
+			d.MetadataStore.PgBouncerEndpoint = tc.pgBouncer
+			d.MetadataStore.Database = "mdstore"
+			if got := ducklakeMetadataJDBCURL(d); got != tc.want {
 				t.Errorf("ducklakeMetadataJDBCURL = %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestDuckLakeDataPath(t *testing.T) {
-	cases := []struct {
-		name   string
-		bucket string
-		prefix string
-		want   string
-	}{
-		{"no prefix", "b", "", "s3://b/"},
-		{"prefix", "b", "data", "s3://b/data/"},
-		{"prefix with slashes", "b", "/data/", "s3://b/data/"},
-		{"nested prefix", "b", "a/b", "s3://b/a/b/"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := ducklakeDataPath(tc.bucket, tc.prefix); got != tc.want {
-				t.Errorf("ducklakeDataPath = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// The object-store half of a catalog comes from the Duckling CR status, not
-// from the ManagedWarehouse row. Nothing populates the row's s3.* or
-// worker_identity.* columns for a DuckLake warehouse in production — the
-// bucket lands on data_store.bucket_name and the IAM role is a Crossplane
-// output on the CR status — so reading them from the row yielded an empty
-// bucket and an empty role for every org, and the catalog step waited
-// forever. Fixtures that filled those columns hid it.
-func TestCatalogPropertiesComeFromTheDucklingStatus(t *testing.T) {
-	w := readyWarehouse("42")
-	if w.S3.Bucket != "" || w.S3.Region != "" || w.WorkerIdentity.IAMRoleARN != "" {
-		t.Fatal("fixture regression: the warehouse row must leave the object-store columns empty, as production does")
-	}
+// Every catalog input now comes from the live composition status, none from
+// the config store's warehouse row. That row's metadata_store and s3 columns
+// are empty for orgs whose warehouse predates them being populated, and
+// reading them left those tenants unprovisionable while the Duckling CR held
+// every value.
+func TestCatalogInputsIgnoreAnEmptyWarehouseRow(t *testing.T) {
+	// A warehouse row exactly as an older org carries it: Ready, but with no
+	// metadata-store or object-store columns at all.
+	w := &configstore.ManagedWarehouse{OrgID: "42", State: configstore.ManagedWarehouseStateReady}
 
 	d := readyDuckling("42")
-	d.DataStore.BucketName = "bucket-from-duckling"
-	d.DataStore.S3Region = "eu-west-2"
-	d.IAMRoleARN = "arn:aws:iam::123456789012:role/duckling-from-status"
+	d.MetadataStore.Type = string(configstore.MetadataStoreKindExternal)
+	d.MetadataStore.Endpoint = "tenant.rds.amazonaws.com"
+	d.MetadataStore.Database = "mdstore_42"
+	d.MetadataStore.User = "mdstore_42"
+
+	if missing := missingCatalogInputs(w, d, ""); len(missing) != 0 {
+		t.Fatalf("an empty warehouse row must not block a fully-composed duckling, got %v", missing)
+	}
 
 	p := &TrinoProvisioner{tenantSecretMountPath: "/etc/trino/tenant-secrets", s3MaxConnections: 50}
 	props := p.buildCatalogProperties("42", w, d)
-
-	for prop, want := range map[string]string{
-		"ducklake.data-path": "s3://bucket-from-duckling/",
-		"s3.region":          "eu-west-2",
-		"s3.iam-role":        "arn:aws:iam::123456789012:role/duckling-from-status",
-	} {
-		if props[prop] != want {
-			t.Errorf("%s = %q, want %q", prop, props[prop], want)
-		}
+	if got, want := props["ducklake.metadata.connection-url"], "jdbc:postgresql://tenant.rds.amazonaws.com:5432/mdstore_42?sslmode=require"; got != want {
+		t.Errorf("connection-url = %q, want %q", got, want)
+	}
+	if got := props["ducklake.metadata.connection-user"]; got != "mdstore_42" {
+		t.Errorf("connection-user = %q, want mdstore_42", got)
 	}
 }
 
@@ -666,9 +645,9 @@ func TestMissingCatalogInputs(t *testing.T) {
 		fallback string
 		want     string
 	}{
-		{"endpoint", func(w *configstore.ManagedWarehouse) { w.MetadataStore.Endpoint = "" }, nil, "", "metadata_store_endpoint"},
-		{"database", func(w *configstore.ManagedWarehouse) { w.MetadataStore.DatabaseName = "" }, nil, "", "metadata_store_database_name"},
-		{"username", func(w *configstore.ManagedWarehouse) { w.MetadataStore.Username = "" }, nil, "", "metadata_store_username"},
+		{"endpoint", nil, func(d *DucklingStatus) { d.MetadataStore.Endpoint = "" }, "", "metadata_store_endpoint"},
+		{"database", nil, func(d *DucklingStatus) { d.MetadataStore.Database = "" }, "", "metadata_store_database"},
+		{"user", nil, func(d *DucklingStatus) { d.MetadataStore.User = "" }, "", "metadata_store_user"},
 		{"bucket", nil, func(d *DucklingStatus) { d.DataStore.BucketName = "" }, "", "data_store_bucket_name"},
 		{"region", nil, func(d *DucklingStatus) { d.DataStore.S3Region = "" }, "", "data_store_s3_region"},
 		{"iam role", nil, func(d *DucklingStatus) { d.IAMRoleARN = "" }, "", "iam_role_arn"},
@@ -1007,7 +986,10 @@ func TestReconcile_SkipsCatalogWhenWarehouseNotReady(t *testing.T) {
 	cases := []struct {
 		name       string
 		warehouses map[string]*configstore.ManagedWarehouse
-		wantMsg    string
+		// mutateDuckling blanks part of the live composition status, which is
+		// where every catalog input now comes from.
+		mutateDuckling func(*DucklingStatus)
+		wantMsg        string
 	}{
 		{
 			name:       "no warehouse row",
@@ -1015,20 +997,25 @@ func TestReconcile_SkipsCatalogWhenWarehouseNotReady(t *testing.T) {
 			wantMsg:    "no managed warehouse row",
 		},
 		{
-			name: "incomplete connection block",
-			warehouses: func() map[string]*configstore.ManagedWarehouse {
-				w := readyWarehouse("42")
-				w.MetadataStore.Endpoint = ""
-				w.S3.Bucket = ""
-				return map[string]*configstore.ManagedWarehouse{"42": w}
-			}(),
-			wantMsg: "metadata_store_endpoint",
+			name:           "incomplete connection block",
+			warehouses:     map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")},
+			mutateDuckling: func(d *DucklingStatus) { d.MetadataStore.Endpoint = "" },
+			wantMsg:        "metadata_store_endpoint",
+		},
+		{
+			name:           "composition has not published the bucket",
+			warehouses:     map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")},
+			mutateDuckling: func(d *DucklingStatus) { d.DataStore.BucketName = "" },
+			wantMsg:        "data_store_bucket_name",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"}}
 			h := newTestTrinoProvisioner(t, orgs, tc.warehouses)
+			if tc.mutateDuckling != nil {
+				tc.mutateDuckling(h.ducklings["42"])
+			}
 
 			if err := h.provisioner.Reconcile(context.Background()); err != nil {
 				t.Fatalf("Reconcile: %v", err)

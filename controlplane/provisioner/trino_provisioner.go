@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"sort"
@@ -1391,17 +1392,17 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 // when the row has no s3_region of its own.
 func missingCatalogInputs(w *configstore.ManagedWarehouse, d *DucklingStatus, fallbackRegion string) []string {
 	var missing []string
-	if w.MetadataStore.Endpoint == "" {
-		missing = append(missing, "metadata_store_endpoint")
-	}
-	if w.MetadataStore.DatabaseName == "" {
-		missing = append(missing, "metadata_store_database_name")
-	}
-	if w.MetadataStore.Username == "" {
-		missing = append(missing, "metadata_store_username")
-	}
 	if d == nil {
 		return append(missing, "duckling_status")
+	}
+	if d.MetadataStore.Endpoint == "" && d.MetadataStore.PgBouncerEndpoint == "" {
+		missing = append(missing, "metadata_store_endpoint")
+	}
+	if d.MetadataStore.Database == "" {
+		missing = append(missing, "metadata_store_database")
+	}
+	if d.MetadataStore.User == "" {
+		missing = append(missing, "metadata_store_user")
 	}
 	if d.DataStore.BucketName == "" {
 		missing = append(missing, "data_store_bucket_name")
@@ -1462,8 +1463,8 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.M
 	}
 	return map[string]string{
 		"connector.name":                             "ducklake",
-		"ducklake.metadata.connection-url":           ducklakeMetadataJDBCURL(w),
-		"ducklake.metadata.connection-user":          w.MetadataStore.Username,
+		"ducklake.metadata.connection-url":           ducklakeMetadataJDBCURL(d),
+		"ducklake.metadata.connection-user":          d.MetadataStore.User,
 		"ducklake.metadata.connection-password-file": p.tenantPasswordFilePath(orgID),
 		"ducklake.data-path":                         ducklakeDataPath(d.DataStore.BucketName, w.S3.PathPrefix),
 		"fs.s3.enabled":                              "true",
@@ -1480,8 +1481,14 @@ func (p *TrinoProvisioner) tenantPasswordFilePath(orgID string) string {
 	return p.tenantSecretMountPath + "/" + orgID
 }
 
-// ducklakeMetadataJDBCURL renders the org's metadata Postgres as a JDBC
-// URL. sslmode is derived from the store kind, never from the caller:
+// ducklakeMetadataJDBCURL renders the org's metadata Postgres as a JDBC URL,
+// reading the address off the Duckling status so Trino dials exactly what the
+// DuckDB workers dial. The config store's metadata_store columns are NOT the
+// source: they are empty for orgs whose warehouse predates them being
+// populated, which left those tenants permanently unprovisionable even though
+// the live composition had every value.
+//
+// sslmode is derived from the store kind, never from the caller:
 //
 //   - cnpg-shard: `disable`. The pooler is reached over in-cluster
 //     networking and serves no server certificate; requiring TLS makes
@@ -1489,17 +1496,31 @@ func (p *TrinoProvisioner) tenantPasswordFilePath(orgID string) string {
 //   - anything else (external RDS/Aurora, and any future kind): `require`.
 //     Fail SAFE on an unknown kind — an unnecessary TLS handshake costs a
 //     round trip, an omitted one puts a tenant credential on the wire.
-func ducklakeMetadataJDBCURL(w *configstore.ManagedWarehouse) string {
-	port := w.MetadataStore.Port
-	if port == 0 {
-		port = metadataStoreDefaultPort
-	}
+func ducklakeMetadataJDBCURL(d *DucklingStatus) string {
+	host, port := ducklingMetadataAddress(d)
 	sslMode := "require"
-	if w.MetadataStore.Kind == configstore.MetadataStoreKindCnpgShard {
+	if d.MetadataStore.Type == string(configstore.MetadataStoreKindCnpgShard) {
 		sslMode = "disable"
 	}
 	return fmt.Sprintf("jdbc:postgresql://%s:%d/%s?sslmode=%s",
-		w.MetadataStore.Endpoint, port, w.MetadataStore.DatabaseName, sslMode)
+		host, port, d.MetadataStore.Database, sslMode)
+}
+
+// ducklingMetadataAddress mirrors ducklingMetadataStoreAddress in the
+// controlplane package: prefer the per-Duckling PgBouncer when the
+// composition provisioned one, else the direct endpoint on the default port.
+// It is duplicated rather than shared because controlplane imports this
+// package, not the other way round; if the two ever disagree, THIS one is
+// wrong.
+func ducklingMetadataAddress(d *DucklingStatus) (string, int) {
+	if pgb := d.MetadataStore.PgBouncerEndpoint; pgb != "" {
+		if host, portStr, err := net.SplitHostPort(pgb); err == nil {
+			if port, err := strconv.Atoi(portStr); err == nil {
+				return host, port
+			}
+		}
+	}
+	return d.MetadataStore.Endpoint, metadataStoreDefaultPort
 }
 
 // ducklakeDataPath renders the org's object-store root. Mirrors the worker
