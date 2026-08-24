@@ -78,15 +78,6 @@ func (s *fakeStore) GetOrgUser(orgID, username string) (*configstore.OrgUser, er
 	return &configstore.OrgUser{OrgID: orgID, Username: username, Password: hash}, nil
 }
 
-func (s *fakeStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
-	key := configstore.OrgUserKey{OrgID: orgID, Username: username}
-	if _, exists := s.users[key]; !exists {
-		return fmt.Errorf("user %q not found in org %q", username, orgID)
-	}
-	s.users[key] = passwordHash
-	return nil
-}
-
 func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
 	w, ok := s.warehouses[orgID]
 	if !ok {

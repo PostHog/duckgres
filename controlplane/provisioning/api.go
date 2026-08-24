@@ -83,7 +83,6 @@ type Store interface {
 	// with no `root` user cannot be projected into a cell, and the reconcile
 	// loop skips it silently, so the API rejects it up front instead.
 	GetOrgUser(orgID, username string) (*configstore.OrgUser, error)
-	UpdateOrgUserPassword(orgID, username, passwordHash string) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 	IsDatabaseNameAvailable(name string) (bool, error)
 

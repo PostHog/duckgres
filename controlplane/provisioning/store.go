@@ -95,10 +95,6 @@ func (s *gormStore) GetOrgUser(orgID, username string) (*configstore.OrgUser, er
 	return &user, nil
 }
 
-func (s *gormStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
-	return s.cs.UpdateOrgUserPassword(orgID, username, passwordHash)
-}
-
 func (s *gormStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
 	var warehouse configstore.ManagedWarehouse
 	if err := s.cs.DB().First(&warehouse, "org_id = ?", orgID).Error; err != nil {

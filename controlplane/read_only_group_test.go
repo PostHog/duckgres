@@ -33,7 +33,6 @@ func (stubProvisioningStore) CreateOrgUser(string, string, string) error { retur
 func (stubProvisioningStore) GetOrgUser(string, string) (*configstore.OrgUser, error) {
 	return nil, gorm.ErrRecordNotFound
 }
-func (stubProvisioningStore) UpdateOrgUserPassword(string, string, string) error { return nil }
 func (stubProvisioningStore) SetWarehouseDeleting(string, configstore.ManagedWarehouseProvisioningState) error {
 	return nil
 }
