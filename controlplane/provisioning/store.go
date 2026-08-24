@@ -87,8 +87,12 @@ func (s *gormStore) CreateOrgUser(orgID, username, passwordHash string) error {
 	return s.cs.CreateOrgUser(orgID, username, passwordHash)
 }
 
-func (s *gormStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
-	return s.cs.UpdateOrgUserPassword(orgID, username, passwordHash)
+func (s *gormStore) GetOrgUser(orgID, username string) (*configstore.OrgUser, error) {
+	var user configstore.OrgUser
+	if err := s.cs.DB().First(&user, "org_id = ? AND username = ?", orgID, username).Error; err != nil {
+		return nil, err
+	}
+	return &user, nil
 }
 
 func (s *gormStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
