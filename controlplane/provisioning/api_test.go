@@ -70,6 +70,14 @@ func (s *fakeStore) CreateOrgUser(orgID, username, passwordHash string) error {
 	return nil
 }
 
+func (s *fakeStore) GetOrgUser(orgID, username string) (*configstore.OrgUser, error) {
+	hash, ok := s.users[configstore.OrgUserKey{OrgID: orgID, Username: username}]
+	if !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	return &configstore.OrgUser{OrgID: orgID, Username: username, Password: hash}, nil
+}
+
 func (s *fakeStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
 	key := configstore.OrgUserKey{OrgID: orgID, Username: username}
 	if _, exists := s.users[key]; !exists {
@@ -1072,6 +1080,8 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	// numeric team_id — opts into Trino via the standalone endpoint.
 	store := newFakeStore()
 	store.orgs["ben-ducklake-cnpg"] = &configstore.Org{Name: "ben-ducklake-cnpg"}
+	// The org's root login is its Trino principal; the endpoint preflights it.
+	store.users[configstore.OrgUserKey{OrgID: "ben-ducklake-cnpg", Username: "root"}] = "hash"
 	router := newTestRouter(store)
 
 	body := []byte(`{"enabled": true, "tier": "growth"}`)
@@ -1086,6 +1096,64 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	row := store.trino["ben-ducklake-cnpg"]
 	if row == nil || !row.Enabled || row.Tier != "growth" {
 		t.Fatalf("expected trino row enabled with tier growth; got %+v", row)
+	}
+}
+
+// An org with no `root` login cannot be projected into a cell:
+// ListTrinoEnabledOrgs inner-joins on it, so the reconcile loop drops the org
+// and never says why. Orgs provisioned before the root-user convention are
+// exactly this shape. Reject at the API instead of queueing a row that can
+// never provision.
+func TestEnableTrinoRejectsOrgWithoutRootUser(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["legacy-org"] = &configstore.Org{Name: "legacy-org", DatabaseName: "legacy"}
+	// Its primary login predates the convention.
+	store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "duckgres"}] = "hash"
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/legacy-org/trino", bytes.NewReader([]byte(`{"enabled": true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "reset-password") {
+		t.Errorf("the error should point at the remedy, got %s", rec.Body.String())
+	}
+	if store.trino["legacy-org"] != nil {
+		t.Error("no trino row may be written for an org that cannot be provisioned")
+	}
+}
+
+// reset-password must CREATE the root login when it is absent, not 404.
+// /provision refuses to touch a warehouse that is not Failed or Deleted, so
+// without this there is no supported way to give a live legacy org the root
+// user every other surface assumes.
+func TestResetPasswordCreatesMissingRootUser(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["legacy-org"] = &configstore.Org{Name: "legacy-org"}
+	store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "duckgres"}] = "old"
+	store.warehouses["legacy-org"] = &configstore.ManagedWarehouse{
+		OrgID: "legacy-org",
+		State: configstore.ManagedWarehouseStateReady,
+	}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/legacy-org/reset-password", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if _, ok := store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "root"}]; !ok {
+		t.Fatal("root user was not created")
+	}
+	// The pre-existing legacy login is left alone.
+	if store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "duckgres"}] != "old" {
+		t.Error("the org's existing login must not be touched")
 	}
 }
 

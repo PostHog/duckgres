@@ -79,6 +79,10 @@ type Store interface {
 	Provision(req ProvisionRequest) error
 	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
 	CreateOrgUser(orgID, username, passwordHash string) error
+	// GetOrgUser reads one login. Used to preflight the Trino opt-in: an org
+	// with no `root` user cannot be projected into a cell, and the reconcile
+	// loop skips it silently, so the API rejects it up front instead.
+	GetOrgUser(orgID, username string) (*configstore.OrgUser, error)
 	UpdateOrgUserPassword(orgID, username, passwordHash string) error
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 	IsDatabaseNameAvailable(name string) (bool, error)
@@ -602,6 +606,24 @@ func (h *handler) enableTrino(c *gin.Context) {
 		return
 	}
 
+	// Preflight: the org's `root` login is the tenant's Trino principal —
+	// ListTrinoEnabledOrgs inner-joins on it, so an org without one is
+	// dropped from every projection and the reconcile loop never reports
+	// why. Orgs provisioned before the root-user convention are exactly
+	// this shape. Reject here so the caller learns immediately instead of
+	// watching the org sit at Pending forever; POST /orgs/:id/reset-password
+	// creates the missing login on a Ready warehouse.
+	if _, err := h.store.GetOrgUser(orgID, "root"); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "org has no root user, so it cannot be projected into a Trino cell; POST /orgs/" + orgID + "/reset-password to create one",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
 	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -755,8 +777,18 @@ func (h *handler) resetPassword(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
 		return
 	}
-	if err := h.store.UpdateOrgUserPassword(orgID, "root", hash); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "root user not found"})
+	// Upsert, not update. Orgs provisioned before the root-user convention
+	// have no `root` row at all — their primary login was named `duckgres` —
+	// and an update-only reset left them permanently unfixable: /provision
+	// refuses to touch a warehouse that is not Failed or Deleted
+	// (ErrWarehouseNonTerminal), so there was no supported path to give a
+	// live legacy org the root user every other surface assumes.
+	//
+	// Creating it here is gated on the same Ready check above, so this never
+	// mints a credential for a half-built warehouse, and CreateOrgUser's
+	// OnConflict makes the normal reset path behave exactly as before.
+	if err := h.store.CreateOrgUser(orgID, "root", hash); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
