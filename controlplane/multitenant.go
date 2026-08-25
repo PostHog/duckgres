@@ -12,7 +12,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -555,7 +557,25 @@ func SetupMultiTenant(
 			trinoBundleHandler = trinoWire.BundleHandler
 			slog.Info("Trino provisioner enabled.", "cell", trinoWire.Cell.ID, "coordinator", trinoWire.Cell.CoordinatorURL)
 		}
-		go provCtrl.Run(context.Background())
+		// SIGTERM stops the reconcile loop immediately, rather than letting a
+		// replaced replica ride out the drain.
+		//
+		// The control plane's terminationGracePeriodSeconds is 24h so live
+		// pgwire sessions finish, and the pod keeps running that whole time.
+		// The provisioner, though, writes CLUSTER-WIDE state — password.db,
+		// group.db, resource-groups.json, and CREATE/DROP CATALOG against the
+		// coordinator — so a draining replica is a second writer, and during
+		// a rollout it is a second writer running the OLD binary.
+		//
+		// That is not hypothetical: after a change to how catalogs are named,
+		// draining replicas repeatedly DROPped the catalog the new replicas
+		// had just created, because the old code computed a different name
+		// and treated the new one as stale. The tenant's catalog flapped
+		// every ~20s until the old pods were force-deleted.
+		//
+		// Only the reconcile loop stops here; the pgwire drain is untouched.
+		provCtx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		go provCtrl.Run(provCtx)
 	}
 
 	// Reshard operations execute in DEDICATED per-op pods, never inside a CP
