@@ -495,6 +495,20 @@ func TestBuildTrinoResourceGroups_IsStaticAndTemplated(t *testing.T) {
 		t.Errorf("tiers = %v, want %v", tierNames, want)
 	}
 
+	// Every tier's leaf must opt into JMX export. Trino defaults jmxExport to
+	// false, so without this the only resource-group metric in existence is
+	// InternalResourceGroupManager's cluster-wide aggregate — per-tenant
+	// queue depth is unobservable, which rules out per-customer dashboards
+	// and noisy-neighbour alerting.
+	for _, tier := range tenants.SubGroups {
+		if !tier.SubGroups[0].JmxExport {
+			t.Errorf("tier %q leaf must set jmxExport so per-tenant metrics exist", tier.Name)
+		}
+		if tier.JmxExport {
+			t.Errorf("tier %q itself should not be exported; its totals are the sum of its leaves", tier.Name)
+		}
+	}
+
 	// Limits still differ per tier — that is what the userGroup indirection
 	// buys over a single flat template.
 	byName := map[string]resourceGroupSubGroup{}
