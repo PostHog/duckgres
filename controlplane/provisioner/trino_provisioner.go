@@ -517,7 +517,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	//    tier; rebuilt every tick. Also runs before catalogs so the
 	//    coordinator's resource-groups manager has a valid file when
 	//    catalog creation kicks off queries on tier-specific groups.
-	rgErr := p.reconcileResourceGroups(ctx, projectable)
+	rgErr := p.reconcileResourceGroups(ctx)
 	if rgErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile resource groups: %w", rgErr))
 	}
@@ -1589,6 +1589,7 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 // a fake; never acceptable in production — see NewTrinoProvisioner).
 func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, adminPasswordHash string) (passwordDB, groupDB string) {
 	var pwLines, grpLines []string
+	tierMembers := map[string][]string{}
 	if adminPasswordHash != "" {
 		// Prepend so the admin is always present even if every org row
 		// is filtered out (empty cluster bootstrap).
@@ -1604,6 +1605,21 @@ func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, adminPasswordHash s
 		// group_name first, comma-separated users second. For v1 this
 		// is one user per group (the principal only).
 		grpLines = append(grpLines, fmt.Sprintf("%s:%s", TrinoGroupName(principal), principal))
+		tierMembers[normalizeTier(o.Tier)] = append(tierMembers[normalizeTier(o.Tier)], principal)
+	}
+	// Tier claims. These carry a tenant's tier to the resource-group
+	// selectors, which match on userGroup — that is what keeps
+	// resource-groups.json free of tenant names and therefore static. This
+	// file IS reloaded (file.refresh-period on the group provider), so a
+	// retier takes effect without a restart. Emitted in a fixed tier order
+	// so the file is byte-stable across ticks.
+	for _, tier := range []string{tierScale, tierGrowth, tierFree} {
+		members := tierMembers[tier]
+		if len(members) == 0 {
+			continue
+		}
+		sort.Strings(members)
+		grpLines = append(grpLines, fmt.Sprintf("%s:%s", TrinoTierGroupName(tier), strings.Join(members, ",")))
 	}
 	// Trailing newline so a file with one entry round-trips through
 	// `cat password.db | head` cleanly; matters mostly for ops.
@@ -1616,13 +1632,19 @@ func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, adminPasswordHash s
 	return strings.Join(pwLines, "\n"), strings.Join(grpLines, "\n")
 }
 
-// reconcileResourceGroups builds resource-groups.json and projects it
-// into the trino-resource-groups ConfigMap. The Trino coordinator
-// reads the file via the mounted ConfigMap; Trino's resource-groups
-// plugin picks up file changes (no reload needed when only data
-// changes).
-func (p *TrinoProvisioner) reconcileResourceGroups(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
-	bytes, err := BuildTrinoResourceGroups(orgs)
+// reconcileResourceGroups projects resource-groups.json into the
+// trino-resource-groups ConfigMap.
+//
+// The content does NOT depend on the org list — see BuildTrinoResourceGroups
+// — so this writes identical bytes every tick and the ConfigMap stops
+// changing when a tenant is added. That is deliberate: Trino's file-backed
+// manager parses the file once at injection and never reloads it, so a file
+// that changed per tenant needed a coordinator restart to take effect. The
+// projection stays in the reconcile loop rather than moving to the chart so
+// the provisioner keeps sole ownership of the ConfigMap; two writers would
+// fight over it.
+func (p *TrinoProvisioner) reconcileResourceGroups(ctx context.Context) error {
+	bytes, err := BuildTrinoResourceGroups()
 	if err != nil {
 		return fmt.Errorf("build resource-groups.json: %w", err)
 	}
@@ -1641,6 +1663,9 @@ type resourceGroupSubGroup struct {
 	MaxQueued            int    `json:"maxQueued"`
 	SchedulingPolicy     string `json:"schedulingPolicy,omitempty"`
 	SchedulingWeight     int    `json:"schedulingWeight,omitempty"`
+	// Recursive: a tier group holds one templated ${org} child, so a tenant
+	// lands at root.tenants.<tier>.<org> without being named in this file.
+	SubGroups []resourceGroupSubGroup `json:"subGroups,omitempty"`
 }
 
 type resourceGroupTier struct {
@@ -1660,8 +1685,12 @@ type resourceGroupRoot struct {
 }
 
 type resourceGroupSelector struct {
-	User  string `json:"user"`
-	Group string `json:"group"`
+	// UserGroup matches against the caller's groups from the file group
+	// provider, which is how a tenant's TIER reaches the selector without the
+	// tenant appearing in this file by name.
+	UserGroup string `json:"userGroup,omitempty"`
+	User      string `json:"user"`
+	Group     string `json:"group"`
 }
 
 type resourceGroupsFile struct {
@@ -1674,6 +1703,44 @@ type resourceGroupsFile struct {
 //
 // Empty tier (default for orgs that didn't specify one) gets the
 // "free" limits — the most conservative.
+// Tier names. These are the tier column's values, the resource-group node
+// names, and (via TrinoTierGroupName) the group.db claims that select them.
+const (
+	tierFree   = "free"
+	tierGrowth = "growth"
+	tierScale  = "scale"
+)
+
+// orgTemplateVariable is the resource-group name Trino expands from the
+// selector's named capture; orgCaptureRegex is the capture that fills it.
+// Together they let one templated node serve every tenant, which is what
+// keeps this file free of tenant names — see BuildTrinoResourceGroups.
+const (
+	orgTemplateVariable = "${org}"
+	orgCaptureRegex     = "(?<org>.*)"
+)
+
+// TrinoTierGroupName is the group.db claim that puts an org in a tier lane.
+// Prefixed so it cannot collide with TrinoGroupName's org_<principal> claims,
+// which the OPA bundle keys on — a tier group is deliberately absent from the
+// bundle's group_catalogs, so it grants no catalog access.
+func TrinoTierGroupName(tier string) string {
+	return "tier_" + tier
+}
+
+// normalizeTier maps a stored tier value onto the three lanes. An unknown or
+// empty tier becomes free — the smallest lane — so a bad value degrades a
+// tenant's throughput rather than leaving it matching no selector at all,
+// which Trino rejects outright.
+func normalizeTier(tier string) string {
+	switch tier {
+	case tierGrowth, tierScale:
+		return tier
+	default:
+		return tierFree
+	}
+}
+
 func tierLimits(tier string) resourceGroupSubGroup {
 	switch tier {
 	case "growth":
@@ -1697,60 +1764,71 @@ func tierLimits(tier string) resourceGroupSubGroup {
 	}
 }
 
-// BuildTrinoResourceGroups deterministically renders the
-// resource-groups.json file from a list of Trino-enabled orgs. Pure
-// function for unit testing.
+// BuildTrinoResourceGroups renders resource-groups.json. Pure function for
+// unit testing.
+//
+// The file is STATIC — it does not mention a single tenant, and its bytes do
+// not change when one is added, removed or retiered. That is the whole point:
+// Trino's file-backed resource-group manager parses this file once, at
+// injection, and never reloads it (FileResourceGroupConfig has exactly one
+// property, the path). A file naming tenants therefore meant every new tenant
+// was rejected with "No matching resource group found with the configured
+// selection rules" until the coordinator restarted — which would have undone
+// the whole point of provisioning catalogs without one.
 //
 // Tree shape:
 //
 //	root
+//	  ├─ admin
+//	  │    └─ __admin_provisioner
 //	  └─ tenants
-//	       ├─ acme              (org name; sanitize is a no-op)
-//	       ├─ ben_iceberg_cnpg  (= trinoSanitize("ben-iceberg-cnpg"))
-//	       └─ ...
+//	       ├─ scale  └─ ${org}
+//	       ├─ growth └─ ${org}
+//	       └─ free   └─ ${org}
 //
-// The tenant node name is trinoSanitize(org name), so a hyphenated org
-// like ben-iceberg-cnpg lands at root.tenants.ben_iceberg_cnpg. The
-// selector matches the Trino username (the raw org name, == auth-time
-// current_user) and maps it to that sanitized root.tenants.<sanitized>
-// group. The admin principal lives under a
-// sibling root.admin.<admin_user> path so its catalog-DDL traffic is
-// isolated from tenant traffic and so it matches a selector at all
-// (without an admin selector, Trino's resource-group manager rejects
-// the admin's SHOW/CREATE/DROP CATALOG queries with "Query is not
-// associated with any resource group" — which would silently break
-// every reconcile tick).
-func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error) {
-	subgroups := make([]resourceGroupSubGroup, 0, len(orgs))
-	// Admin selector first so its match wins fast on the reconcile-DDL
-	// path; tenant selectors follow. (Selector order is first-match-
-	// wins in Trino's file-backed manager. With disjoint usernames the
-	// order is functionally irrelevant, but keeping admin first
-	// documents the intent and makes the file readable.)
+// ${org} is expanded by Trino from the named capture in the selector's user
+// regex, so each tenant still gets its OWN leaf group — per-tenant fairness
+// survives, it is just allocated at match time instead of written ahead.
+//
+// A tenant's tier reaches the selector through userGroup rather than through
+// this file: the provisioner puts each org in a tier_<tier> group in group.db,
+// which the file group provider DOES reload (file.refresh-period=60s), so a
+// retier takes effect within a minute and still needs no restart.
+//
+// Selector order is first-match-wins. Admin is first so its catalog DDL never
+// falls into a tenant lane, then the explicit tiers, then free as the
+// catch-all — an org with an unknown or empty tier lands in the smallest lane
+// rather than matching nothing, which would reject its queries outright.
+func BuildTrinoResourceGroups() ([]byte, error) {
+	// The templated leaf every tier shares.
+	leaf := func(tier string) []resourceGroupSubGroup {
+		l := tierLimits(tier)
+		l.Name = orgTemplateVariable
+		return []resourceGroupSubGroup{l}
+	}
+	tenantTier := func(tier string) resourceGroupSubGroup {
+		l := tierLimits(tier)
+		l.Name = tier
+		l.SubGroups = leaf(tier)
+		return l
+	}
+
 	selectors := []resourceGroupSelector{{
 		User:  opa.AdminPrincipal,
 		Group: "root.admin." + opa.AdminPrincipal,
 	}}
-	for _, o := range orgs {
-		principal := o.TrinoPrincipal()
-		if principal == "" {
-			continue
-		}
-		sg := tierLimits(o.Tier)
-		// Subgroup name is sanitized to match TrinoResourceGroupName's
-		// final path component. The selector's User field stays raw —
-		// it matches against Trino's `current_user`, which is the
-		// auth-time username, i.e. the unsanitized principal. The two
-		// differ whenever database_name contains a hyphen, which is
-		// exactly why the selector and the subgroup name are derived
-		// separately here.
-		sg.Name = trinoSanitize(principal)
-		subgroups = append(subgroups, sg)
+	for _, tier := range []string{tierScale, tierGrowth} {
 		selectors = append(selectors, resourceGroupSelector{
-			User:  principal,
-			Group: TrinoResourceGroupName(principal),
+			UserGroup: TrinoTierGroupName(tier),
+			User:      orgCaptureRegex,
+			Group:     "root.tenants." + tier + "." + orgTemplateVariable,
 		})
 	}
+	// Catch-all: no tier group claimed, so the smallest lane.
+	selectors = append(selectors, resourceGroupSelector{
+		User:  orgCaptureRegex,
+		Group: "root.tenants." + tierFree + "." + orgTemplateVariable,
+	})
 
 	// Admin tier limits are deliberately small. The provisioner only
 	// issues DDL (SHOW / CREATE / DROP / ALTER CATALOG) which finishes
@@ -1782,7 +1860,11 @@ func BuildTrinoResourceGroups(orgs []configstore.TrinoEnabledOrg) ([]byte, error
 					SoftMemoryLimit:      "80%",
 					HardConcurrencyLimit: 100,
 					MaxQueued:            500,
-					SubGroups:            subgroups,
+					SubGroups: []resourceGroupSubGroup{
+						tenantTier(tierScale),
+						tenantTier(tierGrowth),
+						tenantTier(tierFree),
+					},
 				},
 			},
 		}},

@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -200,7 +202,8 @@ func TestBuildTrinoAuthFiles_OneUserPerOrg(t *testing.T) {
 	}
 	// group.db is group-first: <group>:<comma-separated users>. Easy to
 	// get backwards, hence the explicit assertion.
-	wantGrp := "org_db42:db42\norg_db43:db43\n"
+	// Per-org claim, then the tier claim that selects its resource group.
+	wantGrp := "org_db42:db42\norg_db43:db43\ntier_free:db42,db43\n"
 	if grp != wantGrp {
 		t.Errorf("group.db =\n%q\nwant\n%q", grp, wantGrp)
 	}
@@ -227,7 +230,7 @@ func TestTrinoIdentityIsDatabaseNameNotOrgID(t *testing.T) {
 	}
 	// The group label is sanitized (hyphen → underscore) while the user
 	// stays raw, because the user is matched against Trino's current_user.
-	if want := "org_acme_analytics:acme-analytics\n"; grp != want {
+	if want := "org_acme_analytics:acme-analytics\ntier_free:acme-analytics\n"; grp != want {
 		t.Errorf("group.db = %q, want %q", grp, want)
 	}
 
@@ -235,15 +238,15 @@ func TestTrinoIdentityIsDatabaseNameNotOrgID(t *testing.T) {
 		t.Errorf("catalog = %q, want %q", got, want)
 	}
 
-	rg, err := BuildTrinoResourceGroups(orgs)
-	if err != nil {
-		t.Fatalf("BuildTrinoResourceGroups: %v", err)
+	// The tier claim in group.db is what routes this org to a resource group;
+	// resource-groups.json itself names no tenant (see
+	// TestBuildTrinoResourceGroups_IsStaticAndTemplated), so the org id
+	// cannot leak there either.
+	if !strings.Contains(grp, "tier_free:acme-analytics") {
+		t.Errorf("group.db should carry the tier claim, got %q", grp)
 	}
-	if strings.Contains(string(rg), orgs[0].OrgID) {
-		t.Errorf("resource-groups.json leaks the org id: %s", rg)
-	}
-	if !strings.Contains(string(rg), `"user": "acme-analytics"`) {
-		t.Errorf("resource-groups.json selector should match the raw principal: %s", rg)
+	if strings.Contains(grp, orgs[0].OrgID) {
+		t.Errorf("group.db leaks the org id: %q", grp)
 	}
 }
 
@@ -258,7 +261,7 @@ func TestBuildTrinoAuthFiles_SkipsOrgWithoutDatabaseName(t *testing.T) {
 	if want := "db43:$2a$10$hash43\n"; pw != want {
 		t.Errorf("password.db = %q, want %q", pw, want)
 	}
-	if want := "org_db43:db43\n"; grp != want {
+	if want := "org_db43:db43\ntier_free:db43\n"; grp != want {
 		t.Errorf("group.db = %q, want %q", grp, want)
 	}
 }
@@ -459,89 +462,80 @@ func TestTrinoCatalogNameMatchesManagedNamePattern(t *testing.T) {
 	}
 }
 
-func TestBuildTrinoResourceGroups_StructureAndTiers(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", Tier: "free"},
-		{OrgID: "43", DatabaseName: "db43", Tier: "growth"},
-		{OrgID: "44", DatabaseName: "db44", Tier: "scale"},
-		{OrgID: "45", DatabaseName: "db45", Tier: ""},
-	}
-	raw, err := BuildTrinoResourceGroups(orgs)
+func TestBuildTrinoResourceGroups_IsStaticAndTemplated(t *testing.T) {
+	raw, err := BuildTrinoResourceGroups()
 	if err != nil {
 		t.Fatalf("BuildTrinoResourceGroups: %v", err)
 	}
+
+	// The file must name no tenant. That is what lets it stay static, which
+	// is what removes the coordinator restart when a tenant is added: Trino
+	// parses this file once at injection and never reloads it.
+	for _, tenant := range []string{"db42", "acme", "portola", "posthog"} {
+		if strings.Contains(string(raw), tenant) {
+			t.Fatalf("resource-groups.json must not name any tenant, found %q in:\n%s", tenant, raw)
+		}
+	}
+
 	var parsed resourceGroupsFile
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(parsed.RootGroups) != 1 || parsed.RootGroups[0].Name != "root" {
-		t.Fatalf("expected single root group named 'root', got %+v", parsed.RootGroups)
+
+	tenants := findSubGroup(t, parsed.RootGroups[0].SubGroups, "tenants")
+	var tierNames []string
+	for _, tier := range tenants.SubGroups {
+		tierNames = append(tierNames, tier.Name)
+		if len(tier.SubGroups) != 1 || tier.SubGroups[0].Name != "${org}" {
+			t.Errorf("tier %q must hold exactly one templated ${org} child, got %+v", tier.Name, tier.SubGroups)
+		}
 	}
-	tiers := parsed.RootGroups[0].SubGroups
-	// Expect two sibling tiers: "admin" (for catalog DDL) and
-	// "tenants" (for customer queries). Without the admin tier,
-	// the provisioner's reconcile-path queries hit Trino's
-	// "Query is not associated with any resource group" rejection.
-	if len(tiers) != 2 {
-		t.Fatalf("expected 2 tiers (admin + tenants), got %d: %+v", len(tiers), tiers)
-	}
-	tiersByName := map[string]resourceGroupTier{}
-	for _, tier := range tiers {
-		tiersByName[tier.Name] = tier
-	}
-	adminTier, hasAdmin := tiersByName["admin"]
-	if !hasAdmin {
-		t.Fatalf("expected admin tier under root, got tiers=%+v", tiers)
-	}
-	if len(adminTier.SubGroups) != 1 || adminTier.SubGroups[0].Name != opa.AdminPrincipal {
-		t.Errorf("expected single admin subgroup named %q, got %+v", opa.AdminPrincipal, adminTier.SubGroups)
+	sort.Strings(tierNames)
+	if want := []string{"free", "growth", "scale"}; !reflect.DeepEqual(tierNames, want) {
+		t.Errorf("tiers = %v, want %v", tierNames, want)
 	}
 
-	tenantsTier, hasTenants := tiersByName["tenants"]
-	if !hasTenants {
-		t.Fatalf("expected tenants tier under root, got tiers=%+v", tiers)
+	// Limits still differ per tier — that is what the userGroup indirection
+	// buys over a single flat template.
+	byName := map[string]resourceGroupSubGroup{}
+	for _, tier := range tenants.SubGroups {
+		byName[tier.Name] = tier.SubGroups[0]
 	}
-	subs := tenantsTier.SubGroups
-	if len(subs) != 4 {
-		t.Fatalf("expected 4 org subgroups under tenants, got %d", len(subs))
-	}
-	// Selector + subgroup name == org name; verify the join.
-	wantByName := map[string]int{ // hardConcurrencyLimit per tier, keyed by principal
-		"db42": 3,  // free
-		"db43": 10, // growth
-		"db44": 25, // scale
-		"db45": 3,  // empty → default ("free")
-	}
-	for _, sg := range subs {
-		want, ok := wantByName[sg.Name]
-		if !ok {
-			t.Errorf("unexpected subgroup name %q", sg.Name)
-			continue
-		}
-		if sg.HardConcurrencyLimit != want {
-			t.Errorf("subgroup %s: HardConcurrencyLimit = %d, want %d", sg.Name, sg.HardConcurrencyLimit, want)
+	for tier, wantConcurrency := range map[string]int{"free": 3, "growth": 10, "scale": 25} {
+		if got := byName[tier].HardConcurrencyLimit; got != wantConcurrency {
+			t.Errorf("%s leaf HardConcurrencyLimit = %d, want %d", tier, got, wantConcurrency)
 		}
 	}
-	// Selectors: admin + one per org. Admin maps to root.admin.<admin>,
-	// each tenant maps to root.tenants.<principal>. Without the admin
-	// selector the provisioner's own queries get rejected by Trino's
-	// resource-group manager before reaching OPA — which would silently
-	// break EVERY reconcile tick, not just one query.
-	wantSel := map[string]string{
-		opa.AdminPrincipal: "root.admin." + opa.AdminPrincipal,
-		"db42":             "root.tenants.db42",
-		"db43":             "root.tenants.db43",
-		"db44":             "root.tenants.db44",
-		"db45":             "root.tenants.db45",
+
+	// Selector order is first-match-wins: admin, then the explicit tiers,
+	// then free as the catch-all so an unknown tier still matches something.
+	if len(parsed.Selectors) != 4 {
+		t.Fatalf("expected 4 selectors (admin + scale + growth + catch-all), got %+v", parsed.Selectors)
 	}
-	if len(parsed.Selectors) != len(wantSel) {
-		t.Fatalf("expected %d selectors (admin + %d orgs), got %d", len(wantSel), len(orgs), len(parsed.Selectors))
+	if parsed.Selectors[0].User != opa.AdminPrincipal {
+		t.Errorf("admin selector must be first, got %+v", parsed.Selectors[0])
 	}
-	for _, sel := range parsed.Selectors {
-		if want, ok := wantSel[sel.User]; !ok || sel.Group != want {
-			t.Errorf("selector %+v unexpected (want user→%q)", sel, wantSel[sel.User])
+	last := parsed.Selectors[len(parsed.Selectors)-1]
+	if last.UserGroup != "" || last.Group != "root.tenants.free.${org}" {
+		t.Errorf("last selector must be the untiered catch-all into free, got %+v", last)
+	}
+	for _, sel := range parsed.Selectors[1:3] {
+		if sel.UserGroup == "" {
+			t.Errorf("tier selector must match on userGroup, got %+v", sel)
 		}
 	}
+}
+
+// findSubGroup fails the test rather than panicking on a missing node.
+func findSubGroup(t *testing.T, groups []resourceGroupTier, name string) resourceGroupTier {
+	t.Helper()
+	for _, g := range groups {
+		if g.Name == name {
+			return g
+		}
+	}
+	t.Fatalf("no %q group in %+v", name, groups)
+	return resourceGroupTier{}
 }
 
 func TestDuckLakeMetadataJDBCURL_SSLModeFollowsStoreKind(t *testing.T) {
@@ -852,8 +846,21 @@ func TestReconcile_CreatesCatalogProjectsSecretsAndConfigMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get resource-groups configmap: %v", err)
 	}
-	if !strings.Contains(cm.Data[TrinoResourceGroupsConfigMapKey], "root.tenants.db42") {
-		t.Errorf("resource-groups.json missing root.tenants.db42 selector: %q", cm.Data[TrinoResourceGroupsConfigMapKey])
+	// The projected file is static and names no tenant; the org reaches its
+	// lane through the tier claim in group.db instead.
+	rgJSON := cm.Data[TrinoResourceGroupsConfigMapKey]
+	if !strings.Contains(rgJSON, "root.tenants.free.${org}") {
+		t.Errorf("resource-groups.json missing the templated free lane: %q", rgJSON)
+	}
+	if strings.Contains(rgJSON, "db42") {
+		t.Errorf("resource-groups.json must not name a tenant: %q", rgJSON)
+	}
+	sec, secErr := h.kube.CoreV1().Secrets(TrinoCustomerNamespace).Get(context.Background(), TrinoAuthSecretName, metav1.GetOptions{})
+	if secErr != nil {
+		t.Fatalf("get auth secret: %v", secErr)
+	}
+	if !strings.Contains(string(sec.Data[TrinoAuthSecretKeyGroupDB]), "tier_free:db42") {
+		t.Errorf("group.db missing the tier claim that selects the lane: %q", sec.Data[TrinoAuthSecretKeyGroupDB])
 	}
 
 	// OPA bundle Set into the store with a non-empty ETag.
