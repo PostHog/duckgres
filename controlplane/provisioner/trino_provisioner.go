@@ -1663,6 +1663,10 @@ type resourceGroupSubGroup struct {
 	MaxQueued            int    `json:"maxQueued"`
 	SchedulingPolicy     string `json:"schedulingPolicy,omitempty"`
 	SchedulingWeight     int    `json:"schedulingWeight,omitempty"`
+	// JmxExport asks Trino to export this group's MBeans. It defaults to
+	// FALSE in Trino, so per-group queue depth is invisible unless a group
+	// opts in — the manager-level aggregate is all you otherwise get.
+	JmxExport bool `json:"jmxExport,omitempty"`
 	// Recursive: a tier group holds one templated ${org} child, so a tenant
 	// lands at root.tenants.<tier>.<org> without being named in this file.
 	SubGroups []resourceGroupSubGroup `json:"subGroups,omitempty"`
@@ -1804,6 +1808,15 @@ func BuildTrinoResourceGroups() ([]byte, error) {
 	leaf := func(tier string) []resourceGroupSubGroup {
 		l := tierLimits(tier)
 		l.Name = orgTemplateVariable
+		// Export the LEAF, which is the per-tenant group: Trino names the
+		// MBean after the expanded group id (root.tenants.<tier>.<org>), so
+		// this is what makes one tenant's queue depth, running count and
+		// memory usage separable from another's. Without it only
+		// InternalResourceGroupManager's cluster-wide aggregate exists, which
+		// cannot answer "which tenant is queueing" or drive per-tenant
+		// alerting. The tier groups above stay unexported — their totals are
+		// derivable by summing the leaves.
+		l.JmxExport = true
 		return []resourceGroupSubGroup{l}
 	}
 	tenantTier := func(tier string) resourceGroupSubGroup {
