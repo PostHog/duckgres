@@ -883,8 +883,22 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   the projection/endpoints or the view → update `controlplane/admin/cluster_test.go`
   and the `/cluster/{nodes,pods,events,nodepools}` checks in `admin_console_api`
   (`tests/mw-dev/e2e/harness.sh`).
+- **Trino cell views** (`trino.go` + `trino_client.go`, UI
+  `pages/Trino{Cluster,Queries}.tsx` + `pages/OrgTrinoCard.tsx`, derivations
+  in `lib/trino.ts`): live queries with an admin-only, audited kill; the
+  cell's coordinator/node health; per-org Trino provisioning state (the
+  `duckgres_managed_warehouse_trino` state/status_message/ready_at/failed_at
+  columns, which were surfaced nowhere before, so a failed Trino provision
+  was silent). Read as the OBSERVER principal, never the provisioner's
+  admin — see the Trino Cells section and `admin/README.md`. Payloads are
+  redacted (SQL) and projected (never `TrinoEnabledOrg.RootPasswordHash`).
+  Every read is cached + timeout-bounded and degrades to `available:false`
+  plus a reason rather than erroring the page: the console must render
+  during exactly the incident it exists for. Unset
+  `DUCKGRES_TRINO_COORDINATOR_URL` leaves the routes unregistered.
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
-  `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`),
+  `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`,
+  `trino_test.go`, `trino_client_test.go`),
   `controlplane/session_mgr_test.go`
   (`TestDestroySessionsForUser`), `controlplane/configstore/store_test.go`
   (`TestDisabledUserEnforcement`), the `Operators`/`Org Users` UI pages +
@@ -1581,9 +1595,30 @@ password/tenant/catalog changes never propagate.
   principal deliberately gets NO cross-tenant query visibility** (only its
   own queries): the reconcile loop issues only `SHOW`/`CREATE`/`DROP
   CATALOG` and never reads `system.runtime.queries`, so the grant would buy
-  nothing and leak every tenant's SQL. `opa.policy.batched-uri` must NOT be
-  enabled without extending the policy — the batched input shape fails every
-  filter rule closed.
+  nothing and leak every tenant's SQL. **Every filter op needs a `batch`
+  rule as well as an `allow` rule.** `opa.policy.batched-uri` is enabled
+  (without it, filtering a catalog with >1024 tables overruns the OPA
+  client's queue), and `filterViewQueryOwnedBy` goes through it like the
+  catalog filters do. A missing `batch` rule fails closed, which for query
+  visibility looked like "org-mates' queries are missing" rather than an
+  error — Trino short-circuits self-ownership before OPA, so each tenant
+  still saw its own query. `TestBatchedQueryFilteringMatchesNonBatched`
+  pins the two shapes to the same decision.
+- **The observer principal (`__duckgres_observer`) is the admin console's
+  read-only identity**, and is deliberately NOT the provisioner's admin.
+  Split authority: admin does CREATE/DROP CATALOG and sees only its own
+  queries; the observer gets cluster-wide `ViewQueryOwnedBy` /
+  `FilterViewQueryOwnedBy` / `KillQueryOwnedBy` plus `ReadSystemInformation`
+  (for `/v1/node` + `/v1/resourceGroupState`, both MANAGEMENT_READ) and
+  holds NO catalog — no `data.group_catalogs` entry, and the observer group
+  is excluded from `tenant_owns_catalog` and from the same-org query match,
+  so even a mistaken bundle entry grants no data access. `is_observer` is
+  the same username-AND-group conjunction as `is_admin`. Its credential is
+  a second regenerate-if-missing pair on `trino-auth`
+  (`ensureCredentialPair`), projected into password.db/group.db and read by
+  the console through `TrinoProvisioner.ObserverCredential` on every call
+  (never captured — a self-heal would otherwise 401 forever). Console reads
+  redact SQL before it leaves the CP. See `controlplane/admin/README.md`.
 - **Resource groups must keep the `root.admin.__admin_provisioner` selector.**
   Trino rejects a query matching no resource group, so dropping it silently
   breaks every reconcile tick's own DDL.
@@ -1602,8 +1637,10 @@ password/tenant/catalog changes never propagate.
 - Touching any of this → update `provisioner/trino_provisioner_test.go`,
   `provisioner/trino_cluster_secrets_test.go`, `provisioner/opa/*_test.go`,
   `provisioning/api_test.go`, `tests/configstore/trino_postgres_test.go` +
-  `trino_cluster_secrets_test.go`, and the migration asserts in
-  `tests/configstore/migrations_postgres_test.go`. **There is no
+  `trino_cluster_secrets_test.go`, the migration asserts in
+  `tests/configstore/migrations_postgres_test.go`, and — for anything the
+  admin console reads — `controlplane/admin/trino{,_client}_test.go` plus
+  the `ui/src/lib/trino.test.ts` derivations. **There is no
   `tests/mw-dev/e2e/harness.sh` coverage yet**, and that is a stated gap, not
   an oversight: mw-dev runs no Trino cell, so there is nothing for the
   in-cluster Job to talk to. The harness assertion (enable an org, poll the

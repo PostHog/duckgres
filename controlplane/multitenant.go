@@ -509,6 +509,12 @@ func SetupMultiTenant(
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	var trinoBundleHandler *opa.Handler
+	// trinoConsole carries what the admin console needs from the Trino
+	// branch (cell identity + an observer-credentialed coordinator client).
+	// Nil unless the branch wires, so a deployment without a cell simply
+	// has no /trino routes. Held rather than turned into a TrinoAPI here
+	// because that also needs the audit store, which is built later.
+	var trinoConsole *trinoConsoleWiring
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		// Without the controller, the Trino reconcile loop cannot run.
@@ -555,6 +561,7 @@ func SetupMultiTenant(
 			}
 			provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
 			trinoBundleHandler = trinoWire.BundleHandler
+			trinoConsole = trinoWire.Console
 			slog.Info("Trino provisioner enabled.", "cell", trinoWire.Cell.ID, "coordinator", trinoWire.Cell.CoordinatorURL)
 		}
 		// SIGTERM stops the reconcile loop immediately, rather than letting a
@@ -758,6 +765,7 @@ func SetupMultiTenant(
 		Audit:         auditStore,
 		Metrics:       metricsProxy,
 		ClusterClient: clusterClient,
+		Trino:         newTrinoAdminAPI(trinoConsole, store, auditStore),
 	})
 
 	// Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1 admin group on

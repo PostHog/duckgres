@@ -46,6 +46,13 @@ import type {
   RunningQuery,
   SessionStatus,
   StartReshardBody,
+  TrinoKillResult,
+  TrinoNodesResponse,
+  TrinoOrgDetail,
+  TrinoOrgsResponse,
+  TrinoQueriesResponse,
+  TrinoQuery,
+  TrinoStatus,
   UpdateUserBody,
   UserKillResult,
   WarehouseStatusResult,
@@ -284,4 +291,24 @@ export const api = {
   // Destination discovery for the reshard form: all cnpg shards (incl. empty
   // ones) + known external stores.
   getReshardTargets: () => get<ReshardTargetsResponse>("/reshards/targets"),
+
+  // trino cell (absent entirely on a deployment with no cell — these 404,
+  // which the *Optional hooks turn into an empty state)
+  trinoStatus: () => get<TrinoStatus>("/trino/status"),
+  // active=1 keeps the live view to the states an operator can still act on;
+  // the server also serves recently-finished queries without it.
+  trinoQueries: (filters: { org?: string; state?: string; active?: boolean }) =>
+    get<TrinoQueriesResponse>("/trino/queries", {
+      org: filters.org,
+      state: filters.state,
+      active: filters.active ? 1 : undefined,
+    }),
+  trinoQuery: (id: string) => get<TrinoQuery>(`/trino/queries/${enc(id)}`),
+  // The reason reaches the TENANT as their query's failure message, so they
+  // learn why it died rather than seeing an unexplained cancellation.
+  killTrinoQuery: (id: string, reason: string) =>
+    post<TrinoKillResult>(`/trino/queries/${enc(id)}/kill`, { reason }),
+  trinoNodes: () => get<TrinoNodesResponse>("/trino/nodes"),
+  trinoOrgs: () => get<TrinoOrgsResponse>("/trino/orgs"),
+  orgTrino: (org: string) => get<TrinoOrgDetail>(`/orgs/${enc(org)}/trino`),
 };
