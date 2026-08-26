@@ -22,7 +22,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useErrors } from "@/hooks/useApi";
+import { useErrors, useOrgLabels } from "@/hooks/useApi";
+import { OrgRef } from "@/components/OrgRef";
 import { fmtAge, fmtInt, fmtTime } from "@/lib/format";
 import { categoryLabel, categoryVariant, isSystemError } from "@/lib/errors";
 import type { ErrorEntry } from "@/types/api";
@@ -73,7 +74,15 @@ function CopyableField({ label, value }: { label: string; value: string }) {
 // detail, so this reads the passed row directly — no extra fetch. query +
 // message are redacted server-side (a CREATE SECRET error never carries the
 // credential), so it is safe to render both verbatim here.
-function ErrorDetailDialog({ error, onClose }: { error: ErrorEntry | null; onClose: () => void }) {
+function ErrorDetailDialog({
+  error,
+  orgLabel,
+  onClose,
+}: {
+  error: ErrorEntry | null;
+  orgLabel?: string;
+  onClose: () => void;
+}) {
   return (
     <Dialog open={error != null} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="max-w-2xl">
@@ -89,7 +98,7 @@ function ErrorDetailDialog({ error, onClose }: { error: ErrorEntry | null; onClo
           <div className="min-w-0 space-y-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               <Field label="Time" value={fmtTime(error.time)} mono />
-              <Field label="Org" value={error.org} mono />
+              <Field label="Org" value={orgLabel && orgLabel !== error.org ? `${orgLabel} (${error.org})` : error.org} mono />
               <Field label="User" value={error.user || "—"} mono />
               <Field label="PID" value={error.pid} mono />
               <Field label="Worker" value={`#${error.worker_id}`} mono />
@@ -122,6 +131,7 @@ export function Errors() {
   const [sqlstate, setSqlstate] = useState("");
   const [category, setCategory] = useState<string>("any");
   const [detail, setDetail] = useState<ErrorEntry | null>(null);
+  const orgLabels = useOrgLabels();
 
   // Filters are applied server-side (after the cross-CP merge). Trim so a stray
   // space doesn't over-filter; empty string → omitted by the api layer.
@@ -238,7 +248,9 @@ export function Errors() {
                           <TooltipContent>{fmtTime(e.time)}</TooltipContent>
                         </Tooltip>
                       </TableCell>
-                      <TableCell className="font-mono text-xs">{e.org}</TableCell>
+                      <TableCell>
+                        <OrgRef id={e.org} label={orgLabels.get(e.org)} />
+                      </TableCell>
                       <TableCell className="font-mono text-xs">{e.user || "—"}</TableCell>
                       <TableCell className="font-mono text-xs">{e.sqlstate || "—"}</TableCell>
                       <TableCell>
@@ -256,7 +268,11 @@ export function Errors() {
           </CardContent>
         </Card>
       </PageBody>
-      <ErrorDetailDialog error={detail} onClose={() => setDetail(null)} />
+      <ErrorDetailDialog
+        error={detail}
+        orgLabel={detail ? orgLabels.get(detail.org) : undefined}
+        onClose={() => setDetail(null)}
+      />
     </>
   );
 }

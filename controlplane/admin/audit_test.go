@@ -4,8 +4,55 @@ package admin
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/posthog/duckgres/controlplane/requestaudit"
 )
+
+type recordingAuditStore struct {
+	entries []*AdminAuditEntry
+}
+
+func (s *recordingAuditStore) Record(entry *AdminAuditEntry) error {
+	s.entries = append(s.entries, entry)
+	return nil
+}
+
+func TestAuditMiddlewarePersistsDurableMintOutcome(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &recordingAuditStore{}
+	router := gin.New()
+	api := router.Group("/api/v1", AuditMiddleware(store))
+	api.POST("/orgs/:id/service-credentials", func(c *gin.Context) {
+		requestaudit.SetDetail(c, "principal: posthog:sql-editor:team:42:user:314")
+		requestaudit.SetOutcome(c, requestaudit.OutcomeCredentialMinted)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "synthetic reload failure"})
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/acme/service-credentials", nil)
+	router.ServeHTTP(rec, req)
+
+	if len(store.entries) != 1 {
+		t.Fatalf("audit rows = %d, want 1", len(store.entries))
+	}
+	entry := store.entries[0]
+	if entry.Action != "credential.create" || entry.Status != http.StatusInternalServerError {
+		t.Fatalf("audit action/status = %q/%d, want credential.create/500", entry.Action, entry.Status)
+	}
+	if entry.Detail != "principal: posthog:sql-editor:team:42:user:314" {
+		t.Fatalf("audit detail = %q", entry.Detail)
+	}
+	if entry.Outcome != string(requestaudit.OutcomeCredentialMinted) {
+		t.Fatalf("audit outcome = %q, want credential_minted", entry.Outcome)
+	}
+	if strings.Contains(entry.Detail, "svc_") || strings.Contains(entry.Detail, "secret") {
+		t.Fatalf("audit detail exposed credential material: %q", entry.Detail)
+	}
+}
 
 // TestAuditActionFor pins the resource-specific Action derivation: operators,
 // org-warehouse, and org-user mutations each get their own prefix, and anything
@@ -33,6 +80,11 @@ func TestAuditActionFor(t *testing.T) {
 		{"org team delete", http.MethodDelete, "/api/v1/orgs/acme/teams/7", "team.delete"},
 		{"warehouse pinning patch", http.MethodPatch, "/api/v1/orgs/acme/warehouse/pinning", "warehouse.update"},
 		{"org create", http.MethodPost, "/api/v1/orgs", "org.create"},
+		{"warehouse provision", http.MethodPost, "/api/v1/orgs/acme/provision", "warehouse.provision"},
+		{"warehouse deprovision", http.MethodPost, "/api/v1/orgs/acme/deprovision", "warehouse.deprovision"},
+		{"warehouse reset password", http.MethodPost, "/api/v1/orgs/acme/reset-password", "warehouse.reset_password"},
+		{"service credential mint", http.MethodPost, "/api/v1/orgs/acme/service-credentials", "credential.create"},
+		{"service credential refresh", http.MethodPost, "/api/v1/orgs/acme/service-credentials/refresh", "credential.refresh"},
 		{"org update", http.MethodPut, "/api/v1/orgs/acme", "org.update"},
 		{"org delete", http.MethodDelete, "/api/v1/orgs/acme", "org.delete"},
 		{"top-level users create", http.MethodPost, "/api/v1/users", "user.create"},

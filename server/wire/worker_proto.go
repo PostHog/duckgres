@@ -35,6 +35,9 @@ type WorkerCreateSessionPayload struct {
 	// ephemeral, so this is the only way a user secret survives across
 	// sessions. Carries credential material: never log this payload.
 	SecretStatements []string `json:"secret_statements,omitempty"`
+	// PID is the control-plane backend-key pid. Optional so older CPs
+	// and tests can omit it; zero means "not stamped on the session logger".
+	PID int32 `json:"pid,omitempty"`
 }
 
 // WorkerDestroySessionPayload is the control plane request body for
@@ -66,6 +69,9 @@ type WorkerWaitSessionIdlePayload struct {
 type WorkerSetS3CachePayload struct {
 	WorkerControlMetadata
 	Enabled bool `json:"enabled"`
+	// Mode is one of on, off, or passthrough. Empty retains the legacy Enabled
+	// behavior for requests from older control planes.
+	Mode string `json:"mode,omitempty"`
 }
 
 // WorkerReleaseQueryHandlePayload asks a worker to release a statement query
@@ -139,6 +145,11 @@ type QueryLogEntry struct {
 	// statement. A consumer that gates on QueryMetadata must treat false as
 	// "unknown", never as "nothing touched".
 	MetadataComplete bool
+
+	// WorkerTier is which worker tier executed the statement: "exploratory"
+	// (the small warm worker) or "standard". Recorded at statement start; a
+	// statement that triggered escalation logs the tier it ULTIMATELY ran on.
+	WorkerTier string
 }
 
 // WorkerQueryLogPayload carries a batch of completed query-log entries to the

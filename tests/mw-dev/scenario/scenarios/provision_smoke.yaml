@@ -8,7 +8,7 @@ steps:
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       request:
-        database_name: scenario_smoke_${run_id_token}
+        database_name: scenario-smoke-${run_id_token}
         team_id: 1
         metadata_store:
           type: cnpg-shard

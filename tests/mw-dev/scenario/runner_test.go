@@ -90,9 +90,7 @@ func TestScenarioRunner(t *testing.T) {
 			ConnectTimeout:  intEnv(t, "DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT", 10),
 			ApplicationName: "duckgres-scenario-runner",
 		},
-		OutputDir:                scenarioOutputDir,
-		FlightAddr:               os.Getenv("DUCKGRES_SCENARIO_FLIGHT_ADDR"),
-		FlightInsecureSkipVerify: boolEnv(t, "DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY", true),
+		OutputDir: scenarioOutputDir,
 	})
 	dbtExecutor := scenariodbt.NewExecutor(scenariodbt.ExecutorConfig{
 		ProvisionState: provisionState,
@@ -157,7 +155,7 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 		t.Fatalf("provision request = %#v, want map", provisionStep.With["request"])
 	}
 	databaseName, _ := request["database_name"].(string)
-	if databaseName == "scenario_smoke" || !strings.Contains(databaseName, "scenario_smoke_") {
+	if databaseName == "scenario-smoke" || !strings.Contains(databaseName, "scenario-smoke-") {
 		t.Fatalf("database_name = %q, want run-unique templated database", databaseName)
 	}
 	requireScenarioTeamID(t, request)
@@ -487,9 +485,6 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		}
 		assertPerfQueryErrorsFailStep(t, step)
 		assertPerfTargetsOnlyPGWire(t, step)
-		if _, ok := step.With["flight_insecure_skip_verify"]; ok {
-			t.Fatal("perf scenario should use DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY default instead of hardcoding TLS behavior")
-		}
 	}
 	if !foundPerf {
 		t.Fatal("expected frozen perf scenario to include a perf_queries step")
@@ -564,12 +559,14 @@ func TestPostHogTableSetupIsExplicitAndRerunnable(t *testing.T) {
 	sql := string(raw)
 	for _, want := range []string{
 		"CREATE SCHEMA IF NOT EXISTS posthog",
-		"CREATE TABLE IF NOT EXISTS posthog.events (",
-		"CREATE TABLE IF NOT EXISTS posthog.persons (",
-		"DELETE FROM posthog.events",
-		"DELETE FROM posthog.persons",
-		"INSERT INTO posthog.events (",
-		"INSERT INTO posthog.persons (",
+		"DROP TABLE IF EXISTS posthog.events",
+		"DROP TABLE IF EXISTS posthog.persons",
+		"CREATE TABLE posthog.events (",
+		"CREATE TABLE posthog.persons (",
+		"CALL ducklake_add_data_files(",
+		"${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}events/*.parquet",
+		"${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet",
+		"allow_missing => true",
 		"SET PARTITIONED BY (year(timestamp), month(timestamp), day(timestamp))",
 		"SET PARTITIONED BY (year(_timestamp), month(_timestamp))",
 	} {
@@ -577,8 +574,14 @@ func TestPostHogTableSetupIsExplicitAndRerunnable(t *testing.T) {
 			t.Fatalf("posthog setup missing %q", want)
 		}
 	}
-	if strings.Contains(sql, "CREATE TABLE AS") || strings.Contains(sql, "SELECT *") {
-		t.Fatal("posthog setup must use explicit table and select column lists")
+	for _, unwanted := range []string{
+		"INSERT INTO posthog.events",
+		"INSERT INTO posthog.persons",
+		"SET preserve_insertion_order",
+	} {
+		if strings.Contains(sql, unwanted) {
+			t.Fatalf("posthog setup must register files, not contain %q", unwanted)
+		}
 	}
 }
 
@@ -589,46 +592,40 @@ func TestPostHogTableSetupValidatesRequiredSourceColumnsAndMappings(t *testing.T
 	}
 	sql := string(raw)
 	for _, want := range []string{
-		"056583335dc739b9e025efede811c9b4f5e153f5",
-		"frozen_v1.events_file_view",
-		"frozen_v1.persons_file_view",
+		"table_schema = 'frozen_v1'",
+		"table_name = 'events_file_view'",
+		"table_name = 'persons_file_view'",
 		"information_schema.columns",
 		"missing required source columns",
-		"CAST(properties AS VARCHAR)",
-		"CAST(person_properties AS VARCHAR)",
-		"CAST(team_id AS BIGINT) AS project_id",
-		"CAST(person_version AS UBIGINT)",
-		"CAST(historical_migration AS BOOLEAN)",
-		"CAST(\"timestamp\" AS TIMESTAMPTZ)",
-		"CAST(_timestamp AS TIMESTAMPTZ)",
+		"('project_id')",
 	} {
 		if !strings.Contains(sql, want) {
-			t.Fatalf("posthog setup missing explicit source mapping or diagnostic %q", want)
+			t.Fatalf("posthog setup missing registration diagnostic %q", want)
 		}
 	}
 }
 
-func TestPostHogTableValidationFailsOnParityMismatchWithUsefulDiagnostics(t *testing.T) {
+func TestPostHogTableValidationChecksRegisteredFixtureMetadata(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("sql", "validate_posthog_tables.sql"))
 	if err != nil {
 		t.Fatalf("read posthog table validation: %v", err)
 	}
 	sql := string(raw)
 	for _, want := range []string{
-		"EXCEPT ALL",
 		"ordinal_position",
-		"posthog events parity mismatch",
-		"posthog persons parity mismatch",
-		"posthog.events row-count mismatch",
-		"posthog.persons row-count mismatch",
-		"posthog.events timestamp range mismatch",
-		"posthog.persons timestamp range mismatch",
+		"ducklake_list_files",
+		"glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}events/*.parquet')",
+		"glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet')",
+		"posthog frozen-file registration mismatch",
 		"DESCRIBE posthog.events",
 		"DESCRIBE posthog.persons",
 	} {
 		if !strings.Contains(sql, want) {
-			t.Fatalf("posthog setup missing parity validation %q", want)
+			t.Fatalf("posthog setup missing registration validation %q", want)
 		}
+	}
+	if strings.Contains(sql, "FROM posthog.events") || strings.Contains(sql, "FROM posthog.persons") {
+		t.Fatal("posthog registration validation must not scan table rows before perf")
 	}
 }
 
@@ -934,19 +931,6 @@ func intEnv(t *testing.T, key string, fallback int) int {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		t.Fatalf("%s must be an integer: %v", key, err)
-	}
-	return parsed
-}
-
-func boolEnv(t *testing.T, key string, fallback bool) bool {
-	t.Helper()
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		t.Fatalf("%s must be a boolean: %v", key, err)
 	}
 	return parsed
 }

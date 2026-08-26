@@ -77,12 +77,36 @@ func waitForRecorder(t *testing.T, ch <-chan *httptest.ResponseRecorder, msg str
 // and returns the buffer + a restore function. Used by the forward-uncached
 // logging tests to assert presence of the request/response log lines that
 // were missing pre-PR (every PUT/POST through the proxy was a black hole).
-func captureSlog(t *testing.T) (*bytes.Buffer, func()) {
+//
+// The buffer must be concurrency-safe: proxy handlers log from goroutines
+// that outlive the request (e.g. the CONNECT close logger fires after both
+// tunnel legs finish), so test-goroutine String reads would race an
+// unsynchronized bytes.Buffer.
+func captureSlog(t *testing.T) (*syncBuffer, func()) {
 	t.Helper()
 	prev := slog.Default()
-	var buf bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	return &buf, func() { slog.SetDefault(prev) }
+	buf := &syncBuffer{}
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	return buf, func() { slog.SetDefault(prev) }
+}
+
+// syncBuffer serializes slog-handler Write calls from proxy goroutines
+// against String reads from the test goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // newTestProxy wires a CacheProxy with no peers and a tempdir-backed store.
@@ -126,15 +150,22 @@ func TestHandleProxyGETMissThenHit(t *testing.T) {
 	proxy := newTestProxy(t)
 
 	var originCalls int32
+	var traceHeadersReachedOrigin atomic.Bool
 	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&originCalls, 1)
+		traceHeadersReachedOrigin.Store(r.Header.Get("traceparent") != "" || r.Header.Get("tracestate") != "")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("hello-parquet-bytes"))
 	})
 
 	// First request: cache miss → origin fetch → cached.
-	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", http.Header{"Range": []string{"bytes=0-18"}})
+	headers := http.Header{
+		"Range":       []string{"bytes=0-18"},
+		"traceparent": []string{"00-00000000000000000000000000000001-0000000000000002-01"},
+		"tracestate":  []string{"vendor=value"},
+	}
+	rec := doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", headers)
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("miss: status = %d, want 206", rec.Code)
 	}
@@ -144,14 +175,54 @@ func TestHandleProxyGETMissThenHit(t *testing.T) {
 	if atomic.LoadInt32(&originCalls) != 1 {
 		t.Errorf("origin calls = %d, want 1 on miss", originCalls)
 	}
+	if traceHeadersReachedOrigin.Load() {
+		t.Fatal("trace propagation headers reached cached origin fetch")
+	}
 
 	// Second request for the same URL + Range: cache hit, no extra origin call.
-	rec = doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", http.Header{"Range": []string{"bytes=0-18"}})
+	rec = doForwardProxyRequest(proxy, "GET", originURL+"/bucket/file.parquet", headers)
 	if rec.Code != http.StatusPartialContent {
 		t.Fatalf("hit: status = %d, want 206", rec.Code)
 	}
 	if atomic.LoadInt32(&originCalls) != 1 {
 		t.Errorf("origin calls = %d after hit, want 1", originCalls)
+	}
+}
+
+func TestHandleProxyPassthroughGETSkipsCacheAndStripsMarker(t *testing.T) {
+	proxy := newTestProxy(t)
+	var originCalls atomic.Int32
+	var markerReachedOrigin atomic.Bool
+	var traceHeadersReachedOrigin atomic.Bool
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		originCalls.Add(1)
+		markerReachedOrigin.Store(r.Header.Get(cachePassthroughHeader) != "")
+		traceHeadersReachedOrigin.Store(r.Header.Get("traceparent") != "" || r.Header.Get("tracestate") != "")
+		_, _ = w.Write([]byte("uncached"))
+	})
+
+	headers := http.Header{
+		cachePassthroughHeader: []string{"true"},
+		"traceparent":          []string{"00-00000000000000000000000000000001-0000000000000002-01"},
+		"tracestate":           []string{"vendor=value"},
+	}
+	for range 2 {
+		rec := doForwardProxyRequest(proxy, http.MethodGet, originURL+"/bucket/file.parquet", headers)
+		if rec.Code != http.StatusOK || rec.Body.String() != "uncached" {
+			t.Fatalf("passthrough response = %d %q, want 200 uncached", rec.Code, rec.Body.String())
+		}
+	}
+	if got := originCalls.Load(); got != 2 {
+		t.Fatalf("origin calls = %d, want 2 because passthrough must not cache", got)
+	}
+	if markerReachedOrigin.Load() {
+		t.Fatal("passthrough marker reached origin")
+	}
+	if traceHeadersReachedOrigin.Load() {
+		t.Fatal("trace propagation headers reached origin")
+	}
+	if _, _, ok := proxy.store.Open(CacheKey(originURL+"/bucket/file.parquet", "")); ok {
+		t.Fatal("passthrough request populated the cache")
 	}
 }
 
@@ -756,13 +827,43 @@ func TestHandleProxyNetworkErrorStill502(t *testing.T) {
 	}
 }
 
+// TestOriginStatusErrorWriteToClampsContentLength locks in the response-framing
+// fix: the captured error body is read capped (originErrorBodyCap), so writeTo
+// must never forward the origin's declared Content-Length — a misbehaving origin
+// that promises more than we captured would otherwise hang the client. (The
+// status line and non-length headers still pass through verbatim.)
+func TestOriginStatusErrorWriteToClampsContentLength(t *testing.T) {
+	oe := &originStatusError{
+		status: http.StatusForbidden,
+		headers: http.Header{
+			"Content-Length": []string{"104857600"}, // origin claimed 100MB
+			"Content-Type":   []string{"application/xml"},
+		},
+		body: []byte("<Error><Code>AccessDenied</Code></Error>"),
+	}
+	rec := httptest.NewRecorder()
+	oe.writeTo(rec)
+	if got := rec.Header().Get("Content-Length"); got != fmt.Sprintf("%d", len(oe.body)) {
+		t.Errorf("Content-Length = %q, want %d (the captured body length, not the origin's claim)", got, len(oe.body))
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/xml" {
+		t.Errorf("Content-Type = %q, want application/xml (still forwarded)", got)
+	}
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+	if rec.Body.String() != string(oe.body) {
+		t.Errorf("body = %q, want %q", rec.Body.String(), oe.body)
+	}
+}
+
 func TestHandlePeerHasAndGet(t *testing.T) {
 	proxy := newTestProxy(t)
 
 	key := strings.Repeat("c", 64)
 	body := []byte("peer-cached-payload")
-	if err := proxy.store.Put(key, body); err != nil {
-		t.Fatalf("seed Put: %v", err)
+	if _, err := proxy.store.PutStream(key, bytes.NewReader(body)); err != nil {
+		t.Fatalf("seed PutStream: %v", err)
 	}
 
 	// /cache/has → 200 for known key
@@ -791,6 +892,31 @@ func TestHandlePeerHasAndGet(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != string(body) {
 		t.Errorf("HandlePeerGet body = %q, want %q", got, body)
+	}
+}
+
+func TestHandlePeerGetDoesNotCountWorkerCacheHit(t *testing.T) {
+	proxy := newTestProxy(t)
+
+	key := strings.Repeat("e", 64)
+	body := []byte("peer-cached-payload")
+	if _, err := proxy.store.PutStream(key, bytes.NewReader(body)); err != nil {
+		t.Fatalf("seed PutStream: %v", err)
+	}
+
+	hitsBefore := counterValue(t, cacheHitsTotal)
+	req := httptest.NewRequest(http.MethodGet, "/cache/get?key="+key, nil)
+	rec := httptest.NewRecorder()
+	proxy.HandlePeerGet(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HandlePeerGet status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != string(body) {
+		t.Fatalf("HandlePeerGet body = %q, want %q", rec.Body.String(), body)
+	}
+	if hitsAfter := counterValue(t, cacheHitsTotal); hitsAfter != hitsBefore {
+		t.Fatalf("cacheHitsTotal changed from %v to %v for peer traffic; only worker-facing local hits should count", hitsBefore, hitsAfter)
 	}
 }
 

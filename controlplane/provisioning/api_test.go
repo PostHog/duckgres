@@ -21,6 +21,7 @@ type fakeStore struct {
 	orgs                  map[string]*configstore.Org
 	users                 map[configstore.OrgUserKey]string
 	warehouses            map[string]*configstore.ManagedWarehouse
+	trino                 map[string]*configstore.ManagedWarehouseTrino
 	teams                 map[string]map[int64]*configstore.OrgTeam
 	provisionUserFailHook error // set non-nil to simulate user-step failure inside Provision
 	// lastProvision records the ProvisionRequest the handler dispatched, so
@@ -31,6 +32,18 @@ type fakeStore struct {
 	listWarehousesErr error // set non-nil to fail ListWarehousesByStates
 	listOrgTeamsErr   error // set non-nil to fail ListOrgTeamsByOrgIDs
 	latestChangeErr   error // set non-nil to fail LatestConfigChange
+
+	// ServiceCredential hooks. mintCreds/refreshCreds record every call so
+	// tests can assert the handler threads (org, principal, ttl) correctly and
+	// mint/refresh return the right body shape.
+	mintCreds         []serviceCredentialRequest
+	refreshCreds      []serviceCredentialRefreshRequest
+	issueCredsIssue   *configstore.ServiceCredentialIssue
+	issueCredsErr     error
+	refreshCredsIssue *configstore.ServiceCredentialIssue
+	refreshCredsErr   error
+	reloadSnapshotN   int
+	reloadSnapshotEr  error
 }
 
 func newFakeStore() *fakeStore {
@@ -38,6 +51,7 @@ func newFakeStore() *fakeStore {
 		orgs:       make(map[string]*configstore.Org),
 		users:      make(map[configstore.OrgUserKey]string),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
+		trino:      make(map[string]*configstore.ManagedWarehouseTrino),
 		teams:      make(map[string]map[int64]*configstore.OrgTeam),
 	}
 }
@@ -56,13 +70,12 @@ func (s *fakeStore) CreateOrgUser(orgID, username, passwordHash string) error {
 	return nil
 }
 
-func (s *fakeStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
-	key := configstore.OrgUserKey{OrgID: orgID, Username: username}
-	if _, exists := s.users[key]; !exists {
-		return fmt.Errorf("user %q not found in org %q", username, orgID)
+func (s *fakeStore) GetOrgUser(orgID, username string) (*configstore.OrgUser, error) {
+	hash, ok := s.users[configstore.OrgUserKey{OrgID: orgID, Username: username}]
+	if !ok {
+		return nil, gorm.ErrRecordNotFound
 	}
-	s.users[key] = passwordHash
-	return nil
+	return &configstore.OrgUser{OrgID: orgID, Username: username, Password: hash}, nil
 }
 
 func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -77,7 +90,11 @@ func (s *fakeStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWareh
 func (s *fakeStore) CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error {
 	// Auto-create org if needed (mirrors production behavior)
 	if _, ok := s.orgs[orgID]; !ok {
-		s.orgs[orgID] = &configstore.Org{Name: orgID, DatabaseName: databaseName}
+		s.orgs[orgID] = &configstore.Org{
+			Name:         orgID,
+			DatabaseName: databaseName,
+			MaxVCPUs:     defaultProvisionedOrgMaxVCPUs,
+		}
 	}
 	existing, ok := s.warehouses[orgID]
 	if ok && existing.State != configstore.ManagedWarehouseStateFailed && existing.State != configstore.ManagedWarehouseStateDeleted {
@@ -221,6 +238,7 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	shadowOrg := s.orgs[req.OrgID]
 	shadowWarehouse := s.warehouses[req.OrgID]
 	shadowUserHash, hadUser := s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}]
+	shadowTrino, hadTrino := s.trino[req.OrgID]
 
 	// 1. Warehouse + Org. Mirrors createPendingWarehouseTx: a NEW org
 	// requires team_id (rejected before any write); an existing org keeps
@@ -229,7 +247,11 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 		if req.TeamID == 0 {
 			return ErrProvisionTeamRequired
 		}
-		s.orgs[req.OrgID] = &configstore.Org{Name: req.OrgID, DatabaseName: req.DatabaseName}
+		s.orgs[req.OrgID] = &configstore.Org{
+			Name:         req.OrgID,
+			DatabaseName: req.DatabaseName,
+			MaxVCPUs:     defaultProvisionedOrgMaxVCPUs,
+		}
 	}
 	if req.TeamID != 0 {
 		schema := req.SchemaName
@@ -270,9 +292,35 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 	}
 	s.users[configstore.OrgUserKey{OrgID: req.OrgID, Username: "root"}] = req.RootUserHash
 
+	// 3. Optional Trino
+	if req.Trino != nil {
+		s.trino[req.OrgID] = &configstore.ManagedWarehouseTrino{
+			OrgID:   req.OrgID,
+			Enabled: true,
+			Tier:    req.Trino.Tier,
+			State:   configstore.ManagedWarehouseStatePending,
+		}
+	}
+
 	// Reference the shadow vars so the linter doesn't complain about
 	// declared-and-unused on the success path.
-	_, _ = shadowUserHash, hadUser
+	_, _, _, _ = shadowUserHash, hadUser, shadowTrino, hadTrino
+	return nil
+}
+
+func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
+	s.trino[orgID] = &configstore.ManagedWarehouseTrino{
+		OrgID:   orgID,
+		Enabled: true,
+		Tier:    settings.Tier,
+	}
+	return nil
+}
+
+func (s *fakeStore) DisableTrino(orgID string) error {
+	if row, ok := s.trino[orgID]; ok {
+		row.Enabled = false
+	}
 	return nil
 }
 
@@ -366,6 +414,66 @@ func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore
 	return nil
 }
 
+// ServiceCredential fake methods: these satisfy the TenantStore half of
+// RegisterAPI. The fake records the calls so tests can assert plumbing, and
+// returns a canned issue (or error).
+func (s *fakeStore) OrgExists(orgID string) (bool, error) {
+	_, ok := s.orgs[orgID]
+	return ok, nil
+}
+
+func (s *fakeStore) MintServiceCredential(
+	orgID string,
+	principal string,
+	ttl time.Duration,
+) (*configstore.ServiceCredentialIssue, error) {
+	s.mintCreds = append(s.mintCreds, serviceCredentialRequest{
+		Principal:  principal,
+		TTLSeconds: int(ttl / time.Second),
+	})
+	if s.issueCredsErr != nil {
+		return nil, s.issueCredsErr
+	}
+	if s.issueCredsIssue == nil {
+		// Default: a freshly rotated credential expiring in an hour.
+		return &configstore.ServiceCredentialIssue{
+			CredentialID: "svc_0123456789abcdef01234567",
+			Principal:    principal,
+			Plaintext:    "fake-plaintext-32chars-aaaaaaaaaaaa",
+			ExpiresAt:    time.Now().UTC().Add(time.Hour),
+		}, nil
+	}
+	return s.issueCredsIssue, nil
+}
+
+func (s *fakeStore) RefreshServiceCredential(
+	orgID string,
+	credentialID string,
+	ttl time.Duration,
+) (*configstore.ServiceCredentialIssue, error) {
+	s.refreshCreds = append(s.refreshCreds, serviceCredentialRefreshRequest{
+		CredentialID: credentialID,
+		TTLSeconds:   int(ttl / time.Second),
+	})
+	if s.refreshCredsErr != nil {
+		return nil, s.refreshCredsErr
+	}
+	if s.refreshCredsIssue == nil {
+		return &configstore.ServiceCredentialIssue{
+			CredentialID: credentialID,
+			Principal:    "dagster:refreshed",
+			Plaintext:    "fake-plaintext-32chars-bbbbbbbbbbbb",
+			ExpiresAt:    time.Now().UTC().Add(time.Hour),
+		}, nil
+	}
+	return s.refreshCredsIssue, nil
+}
+
+func (s *fakeStore) ReloadSnapshot() error {
+	s.reloadSnapshotN++
+	return s.reloadSnapshotEr
+}
+
 func newTestRouter(store Store) *gin.Engine {
 	return newTestRouterWithBucketSuffix(store, "")
 }
@@ -373,7 +481,8 @@ func newTestRouter(store Store) *gin.Engine {
 func newTestRouterWithBucketSuffix(store Store, bucketSuffix string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	RegisterAPI(r.Group("/api/v1"), store, bucketSuffix)
+	tenantStore, _ := store.(TenantStore)
+	RegisterAPI(r.Group("/api/v1"), store, tenantStore, bucketSuffix, nil)
 	// Mirror prod topology (multitenant.go): discovery is a separate group
 	// on the same base path, so both surfaces stay reachable in tests.
 	RegisterDiscoveryAPI(r.Group("/api/v1"), store)
@@ -406,6 +515,125 @@ func TestProvisionRejectsAurora(t *testing.T) {
 	}
 }
 
+// TestProvisionRejectsInvalidDatabaseName locks in that database_name — the
+// org's managed hostname label, so an unroutable one leaves the tenant
+// reachable by no hostname — is rejected with 400 at the provisioning API
+// boundary, on every write surface.
+func TestProvisionRejectsInvalidDatabaseName(t *testing.T) {
+	cases := []string{"", "ACME INC", "acme.inc", "acme_inc", "Acme", "-acme"}
+	for _, db := range cases {
+		t.Run(db, func(t *testing.T) {
+			store := newFakeStore()
+			router := newTestRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"database_name": %q, "team_id": 1, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`, db))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/new-org/provision", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("database_name %q: status = %d, want %d: %s", db, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if _, ok := store.orgs["new-org"]; ok {
+				t.Errorf("database_name %q: org should NOT have been created", db)
+			}
+			if store.warehouses["new-org"] != nil {
+				t.Errorf("database_name %q: warehouse should NOT have been created", db)
+			}
+		})
+	}
+}
+
+// TestProvisionRejectsRenameToInvalidDatabaseName pins that the grandfather
+// carve-out only covers re-provisioning an existing org with its STORED name:
+// asking to rename it to an invalid value still 400s.
+func TestProvisionRejectsRenameToInvalidDatabaseName(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["existing"] = &configstore.Org{Name: "existing", DatabaseName: "tenant_alpha"} // grandfathered invalid
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "STILL BROKEN", "team_id": 1, "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/existing/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := store.orgs["existing"].DatabaseName; got != "tenant_alpha" {
+		t.Errorf("DatabaseName = %q, want unchanged %q", got, "tenant_alpha")
+	}
+}
+
+// TestProvisionGrandfathersReprovisionWithStoredName pins the recovery loop:
+// an existing org whose stored database_name predates the DNS-label rule can
+// still deprovision→re-provision with that same name (the flow writes nothing
+// new to the column; rejecting it would orphan the org warehouse-less).
+func TestProvisionGrandfathersReprovisionWithStoredName(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["grandpa"] = &configstore.Org{Name: "grandpa", DatabaseName: "tenant_alpha"}
+	store.seedTeam(configstore.OrgTeam{OrgID: "grandpa", TeamID: 7, SchemaName: "team_7", Enabled: true})
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "tenant_alpha", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/grandpa/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("re-provision with stored grandfathered name: status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if store.warehouses["grandpa"] == nil {
+		t.Fatal("expected warehouse to be created for grandfathered re-provision")
+	}
+}
+
+// TestCheckDatabaseNameReportsInvalidAsUnavailable: "available" must mean
+// "provisionable" — a name the provision endpoint would 400 reports
+// available=false with a reason, so pre-flights never green-light a 400.
+func TestCheckDatabaseNameReportsInvalidAsUnavailable(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/database-name/check?name=acme_inc", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var body struct {
+		Available bool   `json:"available"`
+		Reason    string `json:"reason"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Available {
+		t.Error("available = true for a name provision would 400, want false")
+	}
+	if body.Reason == "" {
+		t.Error("reason empty, want the validation message")
+	}
+
+	// A valid, untaken name stays available.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/database-name/check?name=acme-inc", nil)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	var body2 struct {
+		Available bool `json:"available"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &body2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !body2.Available {
+		t.Error("available = false for a valid untaken name, want true")
+	}
+}
+
 func TestProvisionAutoCreatesOrg(t *testing.T) {
 	store := newFakeStore()
 	router := newTestRouter(store)
@@ -421,6 +649,9 @@ func TestProvisionAutoCreatesOrg(t *testing.T) {
 	}
 	if _, ok := store.orgs["new-org"]; !ok {
 		t.Fatal("expected org to be auto-created")
+	}
+	if got := store.orgs["new-org"].MaxVCPUs; got != 60 {
+		t.Fatalf("auto-created org MaxVCPUs = %d, want 60", got)
 	}
 	if store.warehouses["new-org"] == nil {
 		t.Fatal("expected warehouse to be created")
@@ -733,6 +964,300 @@ func TestGetWarehouseNotFound(t *testing.T) {
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestProvisionEnablesTrinoWhenRequested(t *testing.T) {
+	store := newFakeStore()
+	// Org.Name is a DNS-1123 label; "42" is one valid (numeric) shape.
+	store.orgs["42"] = &configstore.Org{Name: "42"}
+	router := newTestRouter(store)
+
+	body := []byte(`{
+		"database_name": "team-42-db",
+		"metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true},
+		"trino": {"enabled": true, "tier": "free"}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/42/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	row := store.trino["42"]
+	if row == nil || !row.Enabled || row.Tier != "free" {
+		t.Fatalf("expected trino row with Enabled=true, Tier=free; got %+v", row)
+	}
+	// The cell is claimed by the reconciling provisioner, never by the
+	// HTTP surface — a row written here must not carry one.
+	if row.TrinoCellID != "" {
+		t.Fatalf("provision must not assign a Trino cell; got %q", row.TrinoCellID)
+	}
+}
+
+func TestProvisionEnablesTrinoWithNonNumericOrgID(t *testing.T) {
+	// Org names are DNS-1123 labels (e.g. "analytics", "ben-ducklake-cnpg"),
+	// not numeric team_ids. Trino opt-in must accept them — the catalog name
+	// is derived via injective sanitization (org_<sanitize(Name)>), not
+	// assumed numeric.
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestRouter(store)
+
+	body := []byte(`{
+		"database_name": "analytics-db",
+		"metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true},
+		"trino": {"enabled": true}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d for non-numeric org id: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if row := store.trino["analytics"]; row == nil || !row.Enabled {
+		t.Fatalf("expected trino row Enabled=true for analytics; got %+v", row)
+	}
+}
+
+func TestProvisionWithoutTrinoLeavesTrinoRowUnset(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if _, ok := store.trino["analytics"]; ok {
+		t.Fatalf("expected no trino row when request omits trino block")
+	}
+}
+
+func TestProvisionWithTrinoDisabledLeavesTrinoRowUnset(t *testing.T) {
+	// `{"enabled": false}` is a NO-OP, not a disable: the provision
+	// endpoint is retried by callers that don't track Trino state, and a
+	// retry must never silently tear down a tenant's catalog.
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true, Tier: "growth"}
+	router := newTestRouter(store)
+
+	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}, "trino": {"enabled": false}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if row := store.trino["analytics"]; row == nil || !row.Enabled || row.Tier != "growth" {
+		t.Fatalf("trino:{enabled:false} must leave the existing row untouched; got %+v", row)
+	}
+}
+
+func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
+	// A DNS-1123-named org (the real shape, e.g. "ben-ducklake-cnpg") — not a
+	// numeric team_id — opts into Trino via the standalone endpoint.
+	store := newFakeStore()
+	store.orgs["ben-ducklake-cnpg"] = &configstore.Org{Name: "ben-ducklake-cnpg"}
+	// The org's root login is its Trino principal; the endpoint preflights it.
+	store.users[configstore.OrgUserKey{OrgID: "ben-ducklake-cnpg", Username: "root"}] = "hash"
+	router := newTestRouter(store)
+
+	body := []byte(`{"enabled": true, "tier": "growth"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/ben-ducklake-cnpg/trino", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	row := store.trino["ben-ducklake-cnpg"]
+	if row == nil || !row.Enabled || row.Tier != "growth" {
+		t.Fatalf("expected trino row enabled with tier growth; got %+v", row)
+	}
+}
+
+// An org with no `root` login cannot be projected into a cell:
+// ListTrinoEnabledOrgs inner-joins on it, so the reconcile loop drops the org
+// and never says why. Orgs provisioned before the root-user convention are
+// exactly this shape. Reject at the API instead of queueing a row that can
+// never provision.
+func TestEnableTrinoRejectsOrgWithoutRootUser(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["legacy-org"] = &configstore.Org{Name: "legacy-org", DatabaseName: "legacy"}
+	// Its primary login predates the convention.
+	store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "duckgres"}] = "hash"
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/legacy-org/trino", bytes.NewReader([]byte(`{"enabled": true}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "reset-password") {
+		t.Errorf("the error should point at the remedy, got %s", rec.Body.String())
+	}
+	if store.trino["legacy-org"] != nil {
+		t.Error("no trino row may be written for an org that cannot be provisioned")
+	}
+}
+
+// reset-password must CREATE the root login when it is absent, not 404.
+// /provision refuses to touch a warehouse that is not Failed or Deleted, so
+// without this there is no supported way to give a live legacy org the root
+// user every other surface assumes.
+func TestResetPasswordCreatesMissingRootUser(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["legacy-org"] = &configstore.Org{Name: "legacy-org"}
+	store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "duckgres"}] = "old"
+	store.warehouses["legacy-org"] = &configstore.ManagedWarehouse{
+		OrgID: "legacy-org",
+		State: configstore.ManagedWarehouseStateReady,
+	}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/legacy-org/reset-password", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if _, ok := store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "root"}]; !ok {
+		t.Fatal("root user was not created")
+	}
+	// The pre-existing legacy login is left alone.
+	if store.users[configstore.OrgUserKey{OrgID: "legacy-org", Username: "duckgres"}] != "old" {
+		t.Error("the org's existing login must not be touched")
+	}
+}
+
+func TestEnableTrinoOnUnknownOrgIs404(t *testing.T) {
+	// The FK to duckgres_orgs would otherwise surface as a raw Postgres
+	// error in a 500. The preflight turns it into the honest shape.
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"enabled": true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/nosuchorg/trino", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown org: %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := store.trino["nosuchorg"]; ok {
+		t.Fatal("a 404 must not have written a trino row")
+	}
+}
+
+func TestEnableTrinoRejectsInvalidOrgID(t *testing.T) {
+	// A non-numeric name is fine (DNS-1123); a name that is NOT a valid
+	// DNS-1123 label (uppercase, underscore, punctuation) is rejected — the
+	// catalog/group sanitization's collision-freeness AND the tenant
+	// Secret's data-key grammar both depend on the DNS-1123 charset.
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"enabled": true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/Bad_Org/trino", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for invalid (non-DNS-1123) org id: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestEnableTrinoRejectsEnabledFalse(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	body := []byte(`{"enabled": false}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/trino", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestDisableTrinoEndpoint(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true, Tier: "free"}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics/trino", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	row := store.trino["analytics"]
+	if row == nil || row.Enabled {
+		t.Fatalf("expected trino row to be present but disabled; got %+v", row)
+	}
+}
+
+func TestDisableTrinoOnMissingRowIsNoOp(t *testing.T) {
+	store := newFakeStore()
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/unknown/trino", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+}
+
+// Deprovisioning a warehouse must also stop projecting the org into Trino.
+// The FK CASCADE only fires when the Org row itself is deleted, and
+// deprovision does not delete it — so without this the cell would keep the
+// tenant's catalog, password-file line and mounted metadata password alive
+// forever.
+func TestDeprovisionDisablesTrino(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
+	store.warehouses["analytics"] = &configstore.ManagedWarehouse{
+		OrgID: "analytics",
+		State: configstore.ManagedWarehouseStateReady,
+	}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true}
+	router := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/deprovision", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	}
+	if row := store.trino["analytics"]; row == nil || row.Enabled {
+		t.Fatalf("deprovision must disable the org's trino row; got %+v", row)
 	}
 }
 
@@ -1174,7 +1699,10 @@ func TestOrgTeamUpsertValidation(t *testing.T) {
 
 func TestOrgTeamUpsertCreatesAndLists(t *testing.T) {
 	store := newFakeStore()
-	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	store.orgs["acme"] = &configstore.Org{
+		Name:                          "acme",
+		DataImportsTableNamingVersion: configstore.DataImportsTableNamingVersionCopyV1,
+	}
 	router := newTestRouter(store)
 
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/acme/teams",
@@ -1198,13 +1726,17 @@ func TestOrgTeamUpsertCreatesAndLists(t *testing.T) {
 		t.Fatalf("list status = %d, want 200: %s", rec.Code, rec.Body.String())
 	}
 	var listing struct {
-		Teams []configstore.OrgTeam `json:"teams"`
+		Teams                         []configstore.OrgTeam `json:"teams"`
+		DataImportsTableNamingVersion string                `json:"data_imports_table_naming_version"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &listing); err != nil {
 		t.Fatalf("decode listing: %v", err)
 	}
 	if len(listing.Teams) != 1 || listing.Teams[0].TeamID != 7 {
 		t.Fatalf("listing = %+v, want the created team", listing.Teams)
+	}
+	if listing.DataImportsTableNamingVersion != configstore.DataImportsTableNamingVersionCopyV1 {
+		t.Fatalf("data imports naming version = %q, want copy_v1", listing.DataImportsTableNamingVersion)
 	}
 }
 

@@ -52,7 +52,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 31)
 	requireGooseMigrationRecorded(t, db, 32)
 	requireGooseMigrationRecorded(t, db, 33)
-	requireGooseLatestVersion(t, db, 33)
+	requireGooseMigrationRecorded(t, db, 34)
+	requireGooseMigrationRecorded(t, db, 35)
+	requireGooseMigrationRecorded(t, db, 36)
+	requireGooseMigrationRecorded(t, db, 38)
+	requireGooseLatestVersion(t, db, 38)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -120,6 +124,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnNullable(t, db, "duckgres_org_teams", "schema_data_imports_name")
 	requireUniqueIndex(t, db, "duckgres_org_teams", "org_id,schema_name")
 
+	// Migration 000034 preserves the table naming used by existing orgs while
+	// selecting the copy workflow naming for orgs created after deployment.
+	requireColumnNotNull(t, db, "duckgres_orgs", "data_imports_table_naming_version")
+	requireColumnDefault(t, db, "duckgres_orgs", "data_imports_table_naming_version", "'copy_v1'::character varying")
+
 	// Migration 000026 added PostHog's cached earliest-event date (nullable
 	// DATE — NULL until the PostHog sensor resolves it).
 	requireColumnNullable(t, db, "duckgres_org_teams", "earliest_event_date")
@@ -161,6 +170,13 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnType(t, db, "duckgres_org_storage_usage", "team_id", "bigint")
 	requireColumnType(t, db, "duckgres_org_storage_usage", "byte_seconds", "numeric")
 
+	// Migration 000037 added the per-org hot-idle pool caps: count (0 =
+	// unlimited) plus vCPU / memory totals as k8s quantity strings ('' =
+	// unlimited).
+	requireColumnType(t, db, "duckgres_orgs", "max_hot_idle_workers", "bigint")
+	requireColumnPresent(t, db, "duckgres_orgs", "max_hot_idle_cpu")
+	requireColumnPresent(t, db, "duckgres_orgs", "max_hot_idle_memory")
+
 	// Migration 000008 added the explicit Duckling CR name column on
 	// managed warehouses, backfilled from lower(org_id).
 	requireColumnPresent(t, db, "duckgres_managed_warehouses", "duckling_name")
@@ -195,6 +211,62 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnAbsent(t, db, "duckgres_managed_warehouses", "iceberg_lakekeeper_endpoint")
 	requireColumnAbsent(t, db, "duckgres_managed_warehouses", "iceberg_state")
 	requireColumnAbsent(t, db, "duckgres_org_users", "default_catalog")
+
+	// Migration 000036 replaced the project_user-backed service-credential mint
+	// with per-credential grants: one duckgres_service_grants row per minted
+	// credential (AWS access-key style), and the per-USER mint clock
+	// (service_grant_expires_at, added by 000035 for the old mint) dropped.
+	requireTablePresent(t, db, "duckgres_service_grants")
+	for _, column := range []string{
+		"org_id",
+		"credential_id",
+		"principal",
+		"password_hash",
+		"minted_at",
+		"last_rotated_at",
+		"expires_at",
+		"revoked_at",
+		"created_at",
+		"updated_at",
+	} {
+		requireColumnPresent(t, db, "duckgres_service_grants", column)
+	}
+	requireColumnNullable(t, db, "duckgres_service_grants", "revoked_at")
+	requireColumnNotNull(t, db, "duckgres_service_grants", "principal")
+	requireColumnNotNull(t, db, "duckgres_service_grants", "password_hash")
+	requireColumnNotNull(t, db, "duckgres_service_grants", "expires_at")
+	requireColumnAbsent(t, db, "duckgres_org_users", "service_grant_expires_at")
+
+	// Migration 000038 re-introduced the Trino subsystem's two config
+	// tables. They existed once before and were dropped by 000002; this is
+	// the DuckLake-era shape, whose only new column is trino_cell_id (the
+	// Trino cell that owns the org — empty means unassigned, and the first
+	// reconciling provisioner claims it).
+	requireTablePresent(t, db, "duckgres_managed_warehouse_trino")
+	for _, column := range []string{
+		"org_id",
+		"enabled",
+		"tier",
+		"trino_cell_id",
+		"state",
+		"status_message",
+		"ready_at",
+		"failed_at",
+		"created_at",
+		"updated_at",
+	} {
+		requireColumnPresent(t, db, "duckgres_managed_warehouse_trino", column)
+	}
+	requireColumnNotNull(t, db, "duckgres_managed_warehouse_trino", "enabled")
+	requireColumnNotNull(t, db, "duckgres_managed_warehouse_trino", "trino_cell_id")
+	requireColumnNullable(t, db, "duckgres_managed_warehouse_trino", "ready_at")
+	requireColumnNullable(t, db, "duckgres_managed_warehouse_trino", "failed_at")
+	// The bootstrap sentinel stores ONE BIT per namespace and no
+	// credential material: the K8s Secrets are the source of truth for the
+	// values. A column here holding a credential would be a bug.
+	requireTablePresent(t, db, "duckgres_trino_cluster_bootstrap")
+	requireColumnPresent(t, db, "duckgres_trino_cluster_bootstrap", "namespace")
+	requireColumnPresent(t, db, "duckgres_trino_cluster_bootstrap", "bootstrapped_at")
 }
 
 func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
@@ -207,8 +279,11 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	t.Cleanup(func() {
 		_ = baselineDB.Close()
 	})
-
 	if err := store.DB().Exec(`
+			ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
+			ALTER TABLE duckgres_orgs DROP COLUMN max_hot_idle_workers;
+			ALTER TABLE duckgres_orgs DROP COLUMN max_hot_idle_cpu;
+			ALTER TABLE duckgres_orgs DROP COLUMN max_hot_idle_memory;
 			ALTER TABLE duckgres_orgs DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN max_vcpus;
 			ALTER TABLE duckgres_org_users DROP COLUMN disabled;
@@ -216,6 +291,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			ALTER TABLE duckgres_managed_warehouses ALTER COLUMN duckling_name DROP NOT NULL;
 			ALTER TABLE duckgres_org_users DROP CONSTRAINT IF EXISTS duckgres_org_users_team_fk;
 			ALTER TABLE duckgres_org_users DROP COLUMN IF EXISTS team_id, DROP COLUMN IF EXISTS access_mode;
+			ALTER TABLE duckgres_org_users DROP COLUMN IF EXISTS service_grant_expires_at;
 			DROP TABLE IF EXISTS duckgres_org_teams;
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_enabled BOOLEAN DEFAULT false;
 			ALTER TABLE duckgres_managed_warehouses ADD COLUMN IF NOT EXISTS iceberg_state VARCHAR(32);
@@ -237,7 +313,10 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			);
 			DROP TABLE IF EXISTS duckgres_reshard_operation_log;
 			DROP TABLE IF EXISTS duckgres_reshard_operations;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33);
+			DROP TABLE IF EXISTS duckgres_service_grants;
+			DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
+			DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -284,7 +363,11 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 31)
 	requireGooseMigrationRecorded(t, upgradedDB, 32)
 	requireGooseMigrationRecorded(t, upgradedDB, 33)
-	requireGooseLatestVersion(t, upgradedDB, 33)
+	requireGooseMigrationRecorded(t, upgradedDB, 34)
+	requireGooseMigrationRecorded(t, upgradedDB, 35)
+	requireGooseMigrationRecorded(t, upgradedDB, 36)
+	requireGooseMigrationRecorded(t, upgradedDB, 38)
+	requireGooseLatestVersion(t, upgradedDB, 38)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -300,6 +383,83 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireColumnAbsent(t, upgradedDB, "duckgres_managed_warehouses", "iceberg_enabled")
 	requireColumnDefault(t, upgradedDB, "duckgres_managed_warehouses", "metadata_proxy_enabled", "false")
 	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "default_catalog")
+	// Migration 000036 replays: the grants table exists and the old per-user
+	// mint clock (explicitly dropped in the downgrade fixture above) does not
+	// come back.
+	requireTablePresent(t, upgradedDB, "duckgres_service_grants")
+	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "credential_id")
+	requireColumnPresent(t, upgradedDB, "duckgres_service_grants", "password_hash")
+	requireColumnAbsent(t, upgradedDB, "duckgres_org_users", "service_grant_expires_at")
+	// Migration 000038 replays: the Trino tables come back on a schema that
+	// never had them (000002 dropped the pre-revert versions).
+	requireTablePresent(t, upgradedDB, "duckgres_managed_warehouse_trino")
+	requireColumnPresent(t, upgradedDB, "duckgres_managed_warehouse_trino", "trino_cell_id")
+	requireTablePresent(t, upgradedDB, "duckgres_trino_cluster_bootstrap")
+}
+
+func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
+	_, connStr := newIsolatedConfigStoreSchema(t)
+	store, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("create baseline config store: %v", err)
+	}
+	baselineDB := storeDB(t, store)
+	t.Cleanup(func() {
+		_ = baselineDB.Close()
+	})
+
+	if err := store.DB().Exec(`
+		INSERT INTO duckgres_orgs (name, database_name, created_at, updated_at)
+		VALUES ('existing-naming-policy', 'existing-naming-policy', now(), now());
+		ALTER TABLE duckgres_orgs DROP COLUMN data_imports_table_naming_version;
+		ALTER TABLE duckgres_org_users DROP COLUMN IF EXISTS service_grant_expires_at;
+		DROP TABLE IF EXISTS duckgres_service_grants;
+		DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
+		DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38);
+	`).Error; err != nil {
+		t.Fatalf("restore pre-migration-34 schema: %v", err)
+	}
+	requireGooseLatestVersion(t, baselineDB, 33)
+
+	upgradedStore, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatalf("apply migration 34: %v", err)
+	}
+	upgradedDB := storeDB(t, upgradedStore)
+	t.Cleanup(func() {
+		_ = upgradedDB.Close()
+	})
+
+	var existingNamingVersion string
+	if err := upgradedStore.DB().Raw(`
+		SELECT data_imports_table_naming_version
+		FROM duckgres_orgs
+		WHERE name = 'existing-naming-policy'
+	`).Scan(&existingNamingVersion).Error; err != nil {
+		t.Fatalf("read existing org naming version: %v", err)
+	}
+	if existingNamingVersion != cpconfigstore.DataImportsTableNamingVersionLegacyBatchV1 {
+		t.Fatalf("existing org naming version = %q, want legacy_batch_v1", existingNamingVersion)
+	}
+
+	if err := upgradedStore.DB().Exec(`
+		INSERT INTO duckgres_orgs (name, database_name, created_at, updated_at)
+		VALUES ('new-naming-policy', 'new-naming-policy', now(), now())
+	`).Error; err != nil {
+		t.Fatalf("create org after naming migration: %v", err)
+	}
+	var newNamingVersion string
+	if err := upgradedStore.DB().Raw(`
+		SELECT data_imports_table_naming_version
+		FROM duckgres_orgs
+		WHERE name = 'new-naming-policy'
+	`).Scan(&newNamingVersion).Error; err != nil {
+		t.Fatalf("read new org naming version: %v", err)
+	}
+	if newNamingVersion != cpconfigstore.DataImportsTableNamingVersionCopyV1 {
+		t.Fatalf("new org naming version = %q, want copy_v1", newNamingVersion)
+	}
 }
 
 func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
@@ -368,6 +528,17 @@ func TestConfigStoreSQLMigrationsUpgradeOldOrgSchema(t *testing.T) {
 	}
 	requireColumnAbsent(t, sqlDB, "duckgres_orgs", "max_connections")
 	requireGooseMigrationRecorded(t, sqlDB, 3)
+	var namingVersion string
+	if err := store.DB().Raw(`
+		SELECT data_imports_table_naming_version
+		FROM duckgres_orgs
+		WHERE name = 'old-org'
+	`).Scan(&namingVersion).Error; err != nil {
+		t.Fatalf("read migrated data imports naming version: %v", err)
+	}
+	if namingVersion != cpconfigstore.DataImportsTableNamingVersionLegacyBatchV1 {
+		t.Fatalf("migrated data imports naming version = %q, want legacy_batch_v1", namingVersion)
+	}
 
 	// Migration 000024 backfilled the legacy default_team_id value into the
 	// org's team row and dropped the column.
@@ -532,6 +703,7 @@ func TestConfigStoreSQLMigrationsMatchGORMModelMetadata(t *testing.T) {
 		&cpconfigstore.OrgTeam{},
 		&cpconfigstore.OrgUserSecret{},
 		&cpconfigstore.Operator{},
+		&cpconfigstore.ServiceGrant{},
 	); err != nil {
 		t.Fatalf("auto-migrate gorm comparison schema: %v", err)
 	}
@@ -909,6 +1081,7 @@ func loadConfigStoreColumnMetadata(t *testing.T, db *sql.DB) map[string]columnMe
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -967,6 +1140,7 @@ func loadConfigStorePrimaryKeys(t *testing.T, db *sql.DB) map[string]primaryKeyM
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -1020,6 +1194,7 @@ func loadConfigStoreIndexes(t *testing.T, db *sql.DB) map[string]indexMetadata {
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',
@@ -1085,6 +1260,7 @@ func loadConfigStoreForeignKeys(t *testing.T, db *sql.DB) map[string]foreignKeyM
 			'duckgres_org_user_secrets',
 			'duckgres_managed_warehouses',
 			'duckgres_operators',
+			'duckgres_service_grants',
 			'duckgres_global_config',
 			'duckgres_ducklake_config',
 			'duckgres_rate_limit_config',

@@ -27,10 +27,12 @@ import {
   useDisableUser,
   useEnableUser,
   useKillUserSessions,
+  useOrgLabels,
   useUpdateUser,
   useUserSecrets,
   useUsers,
 } from "@/hooks/useApi";
+import { OrgRef } from "@/components/OrgRef";
 import { fmtInt, fmtTime } from "@/lib/format";
 import type { OrgUser } from "@/types/api";
 
@@ -48,13 +50,14 @@ export function UsersPage() {
   const killUser = useKillUserSessions();
   const disableUser = useDisableUser();
   const enableUser = useEnableUser();
+  const orgLabels = useOrgLabels();
 
   const columns = useMemo<ColumnDef<OrgUser, any>[]>(
     () => [
       {
         accessorKey: "org_id",
         header: "Org",
-        cell: ({ getValue }) => <span className="font-mono text-xs">{String(getValue())}</span>,
+        cell: ({ row }) => <OrgRef id={row.original.org_id} label={orgLabels.get(row.original.org_id)} />,
       },
       {
         accessorKey: "username",
@@ -154,14 +157,14 @@ export function UsersPage() {
         ),
       },
     ],
-    [enableUser],
+    [enableUser, orgLabels],
   );
 
   return (
     <>
       <PageHeader
         title="Org Users"
-        description="Per-org database login accounts your customers use to connect to their warehouse (PG wire / Flight SQL) — not console operators."
+        description="Per-org database login accounts your customers use to connect to their warehouse over pgwire — not console operators."
         actions={
           <div className="flex items-center gap-2">
             <div className="relative">
@@ -211,8 +214,16 @@ export function UsersPage() {
       </PageBody>
 
       {creating && <CreateUserDialog onClose={() => setCreating(false)} />}
-      {editing && <EditUserDialog user={editing} onClose={() => setEditing(null)} />}
-      {secretsFor && <SecretsDialog user={secretsFor} onClose={() => setSecretsFor(null)} />}
+      {editing && (
+        <EditUserDialog user={editing} orgLabel={orgLabels.get(editing.org_id)} onClose={() => setEditing(null)} />
+      )}
+      {secretsFor && (
+        <SecretsDialog
+          user={secretsFor}
+          orgLabel={orgLabels.get(secretsFor.org_id)}
+          onClose={() => setSecretsFor(null)}
+        />
+      )}
 
       <Dialog open={!!killing} onOpenChange={(o) => !o && setKilling(null)}>
         <DialogContent>
@@ -221,8 +232,10 @@ export function UsersPage() {
             <DialogDescription>
               Immediately terminates every active session and in-flight query for{" "}
               <span className="font-mono">{killing?.username}</span> @{" "}
-              <span className="font-mono">{killing?.org_id}</span> across all control-plane replicas. The
-              user can reconnect right away — use Disable to also block new connections.
+              <span className="font-medium">{killing && (orgLabels.get(killing.org_id) ?? killing.org_id)}</span>{" "}
+              <span className="font-mono text-xs text-muted-foreground">({killing?.org_id})</span> across all
+              control-plane replicas. The user can reconnect right away — use Disable to also block new
+              connections.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -251,8 +264,9 @@ export function UsersPage() {
             <DialogTitle>Disable "{disabling?.username}"?</DialogTitle>
             <DialogDescription>
               Blocks all new connections for <span className="font-mono">{disabling?.username}</span> @{" "}
-              <span className="font-mono">{disabling?.org_id}</span> (PG wire + Flight SQL) and kills their
-              live sessions now. Reverse it any time with Enable.
+              <span className="font-medium">{disabling && (orgLabels.get(disabling.org_id) ?? disabling.org_id)}</span>{" "}
+              <span className="font-mono text-xs text-muted-foreground">({disabling?.org_id})</span> over pgwire
+              and kills their live sessions now. Reverse it any time with Enable.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -281,7 +295,9 @@ export function UsersPage() {
             <DialogTitle>Delete user "{deleting?.username}"?</DialogTitle>
             <DialogDescription>
               Removes <span className="font-mono">{deleting?.username}</span> from org{" "}
-              <span className="font-mono">{deleting?.org_id}</span>. This cannot be undone.
+              <span className="font-medium">{deleting && (orgLabels.get(deleting.org_id) ?? deleting.org_id)}</span>{" "}
+              <span className="font-mono text-xs text-muted-foreground">({deleting?.org_id})</span>. This cannot
+              be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -378,7 +394,7 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
   );
 }
 
-function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void }) {
+function EditUserDialog({ user, orgLabel, onClose }: { user: OrgUser; orgLabel?: string; onClose: () => void }) {
   const update = useUpdateUser();
   const [password, setPassword] = useState("");
   const [passthrough, setPassthrough] = useState(user.passthrough);
@@ -411,7 +427,9 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
             Edit <span className="font-mono">{user.username}</span>
           </DialogTitle>
           <DialogDescription>
-            Org <span className="font-mono">{user.org_id}</span>. Leave password blank to keep it unchanged.
+            Org <span className="font-medium">{orgLabel ?? user.org_id}</span>{" "}
+            {orgLabel && <span className="font-mono text-xs text-muted-foreground">({user.org_id})</span>} Leave
+            password blank to keep it unchanged.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
@@ -443,7 +461,7 @@ function EditUserDialog({ user, onClose }: { user: OrgUser; onClose: () => void 
   );
 }
 
-function SecretsDialog({ user, onClose }: { user: OrgUser; onClose: () => void }) {
+function SecretsDialog({ user, orgLabel, onClose }: { user: OrgUser; orgLabel?: string; onClose: () => void }) {
   const secrets = useUserSecrets(user.org_id, user.username);
   const del = useDeleteUserSecret();
 
@@ -455,8 +473,10 @@ function SecretsDialog({ user, onClose }: { user: OrgUser; onClose: () => void }
             <KeyRound className="h-4 w-4" /> Persistent secrets
           </DialogTitle>
           <DialogDescription>
-            <span className="font-mono">{user.username}</span> @ <span className="font-mono">{user.org_id}</span>.
-            Secret material is never exposed — only names and timestamps.
+            <span className="font-mono">{user.username}</span> @{" "}
+            <span className="font-medium">{orgLabel ?? user.org_id}</span>{" "}
+            {orgLabel && <span className="font-mono text-xs text-muted-foreground">({user.org_id})</span>}. Secret
+            material is never exposed — only names and timestamps.
           </DialogDescription>
         </DialogHeader>
         <div className="max-h-80 overflow-y-auto">

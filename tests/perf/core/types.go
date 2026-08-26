@@ -6,7 +6,6 @@ type Protocol string
 
 const (
 	ProtocolPGWire Protocol = "pgwire"
-	ProtocolFlight Protocol = "flight"
 )
 
 // StorageTarget identifies the physical relation family selected for a paired
@@ -15,8 +14,8 @@ const (
 type StorageTarget string
 
 const (
-	StorageTargetRawView      StorageTarget = "raw_view"
-	StorageTargetManagedTable StorageTarget = "managed_table"
+	StorageTargetRawView       StorageTarget = "raw_view"
+	StorageTargetDuckLakeTable StorageTarget = "ducklake_table"
 )
 
 type Catalog struct {
@@ -36,7 +35,6 @@ type Query struct {
 	Tags          []string       `yaml:"tags"`
 	Params        map[string]any `yaml:"params"`
 	PGWireSQL     string         `yaml:"pgwire_sql"`
-	DuckhogSQL    string         `yaml:"duckhog_sql"`
 	StorageTarget StorageTarget  `yaml:"-" json:"-"`
 }
 

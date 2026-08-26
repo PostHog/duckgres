@@ -9,13 +9,10 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/server"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
 )
 
 func TestExtractOrgFromSNI(t *testing.T) {
@@ -141,13 +138,11 @@ type fakeConfigStore struct {
 	databaseNameForSNIPrefix  func(string) string
 	resolveSNIPrefix          func(string) (string, string)
 	resolvePostgresConnection func(startupDatabase, sniPrefix string, useManagedSNI bool, username, password string) configstore.PostgresConnectionResolution
-	validateOrgUser           func(orgID, user, pass string) bool
 
 	resolveDatabaseCalls           int
 	databaseNameForSNIPrefixCalls  int
 	resolveSNIPrefixCalls          int
 	resolvePostgresConnectionCalls int
-	validateOrgUserCalls           int
 }
 
 func (f *fakeConfigStore) ResolveDatabase(database string) string {
@@ -178,24 +173,6 @@ func (f *fakeConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix s
 	}
 	return f.resolvePostgresConnection(startupDatabase, sniPrefix, useManagedSNI, username, password)
 }
-func (f *fakeConfigStore) ValidateOrgUser(orgID, user, pass string) bool {
-	f.validateOrgUserCalls++
-	if f.validateOrgUser == nil {
-		return false
-	}
-	return f.validateOrgUser(orgID, user, pass)
-}
-func (f *fakeConfigStore) IsOrgUserPassthrough(string, string) bool {
-	// SNI tests don't exercise passthrough; the real flag lookup is covered
-	// elsewhere. Returning false keeps the existing assertions intact.
-	return false
-}
-func (f *fakeConfigStore) ValidateOrgUserAndGetPassthrough(orgID, user, pass string) (bool, bool) {
-	// SNI tests drive Flight SQL, not the PG auth path that uses the
-	// combined call. Forward to ValidateOrgUser so the test fakes that set
-	// validateOrgUser still work unchanged.
-	return f.ValidateOrgUser(orgID, user, pass), false
-}
 func (f *fakeConfigStore) OrgWarehouseStatus(string) (string, bool) {
 	// SNI tests don't exercise the warehouse-status connection-error path.
 	return "", false
@@ -209,34 +186,11 @@ func (f *fakeConfigStore) OrgUsageTeamID(string, string) int64 {
 	// SNI tests don't exercise analytics team attribution.
 	return 0
 }
-func (f *fakeConfigStore) UpsertFlightSessionRecord(*configstore.FlightSessionRecord) error {
-	panic("UpsertFlightSessionRecord should not be called from SNI tests")
+func (f *fakeConfigStore) OrgUserSessionQueryAccess(string, string) (*configstore.OrgUserQueryAccess, string, bool) {
+	// SNI tests don't exercise the exploratory-tier escalation re-check; ok=true
+	// (unrestricted, enabled) is the non-interfering answer.
+	return nil, "rev", true
 }
-func (f *fakeConfigStore) GetFlightSessionRecord(string) (*configstore.FlightSessionRecord, error) {
-	panic("GetFlightSessionRecord should not be called from SNI tests")
-}
-func (f *fakeConfigStore) TouchFlightSessionRecord(string, time.Time) error {
-	panic("TouchFlightSessionRecord should not be called from SNI tests")
-}
-func (f *fakeConfigStore) CloseFlightSessionRecord(string, time.Time) error {
-	panic("CloseFlightSessionRecord should not be called from SNI tests")
-}
-func (f *fakeConfigStore) CloseFlightSessionRecordIfReconnectTargetUnchanged(configstore.FlightSessionRecord, time.Time) (bool, error) {
-	panic("CloseFlightSessionRecordIfReconnectTargetUnchanged should not be called from SNI tests")
-}
-
-func newFlightValidator(t *testing.T, mode string, store *fakeConfigStore) *cpFlightCredentialValidator {
-	t.Helper()
-	cp := &ControlPlane{
-		cfg: ControlPlaneConfig{
-			SNIRoutingMode:          mode,
-			ManagedHostnameSuffixes: []string{".dw.us.postwh.com"},
-		},
-		configStore: store,
-	}
-	return &cpFlightCredentialValidator{cp: cp}
-}
-
 func newSNIControlPlane(store *fakeConfigStore) *ControlPlane {
 	return &ControlPlane{
 		cfg: ControlPlaneConfig{
@@ -374,113 +328,4 @@ func testControlPlaneTLSConfig(t *testing.T) *tls.Config {
 		t.Fatalf("LoadX509KeyPair: %v", err)
 	}
 	return &tls.Config{Certificates: []tls.Certificate{cert}}
-}
-
-// Flight identity is now SNI-only in every mode: the org is resolved from the
-// managed hostname via ResolveSNIPrefix and the user is authenticated within
-// that org. There is no username-scan fallback (a username can collide across
-// orgs), so a non-managed hostname always fails.
-
-// TestFlightValidatorMatchedSNI: SNI matches, so we resolve via ResolveSNIPrefix
-// and validate against that single org. The validator only authenticates — it
-// stores no username→org routing state (session routing re-derives the org from
-// the connection SNI; see flight_ingress_test.go).
-func TestFlightValidatorMatchedSNI(t *testing.T) {
-	store := &fakeConfigStore{
-		resolveSNIPrefix: func(prefix string) (string, string) {
-			if prefix == "acme" {
-				return "org-acme", "acme_db"
-			}
-			return "", ""
-		},
-		validateOrgUser: func(orgID, user, pass string) bool {
-			return orgID == "org-acme" && user == "alice" && pass == "secret"
-		},
-	}
-	v := newFlightValidator(t, SNIRoutingEnforce, store)
-
-	if !v.ValidateCredentialsForSNI("acme.dw.us.postwh.com", "alice", "secret") {
-		t.Fatalf("expected SNI-resolved org with valid creds to pass")
-	}
-	if store.resolveSNIPrefixCalls != 1 || store.validateOrgUserCalls != 1 {
-		t.Fatalf("expected one ResolveSNIPrefix + one ValidateOrgUser; got %d / %d",
-			store.resolveSNIPrefixCalls, store.validateOrgUserCalls)
-	}
-}
-
-// flightCtxWithSNI builds a gRPC context carrying a TLS ServerName, exactly as
-// the real Flight ingress sees it, so we exercise the real SNIFromContext →
-// extractOrgFromSNI → ResolveSNIPrefix chain that routes a session to its org.
-func flightCtxWithSNI(sni string) context.Context {
-	return peer.NewContext(context.Background(), &peer.Peer{
-		AuthInfo: credentials.TLSInfo{State: tls.ConnectionState{ServerName: sni}},
-	})
-}
-
-// TestFlightOrgFromContextResolvesViaSNI verifies that session routing derives
-// the org from the connection's TLS SNI (the load-bearing path the no-collision
-// fix relies on), and fails closed for unmanaged or missing hostnames.
-func TestFlightOrgFromContextResolvesViaSNI(t *testing.T) {
-	store := &fakeConfigStore{
-		resolveSNIPrefix: func(prefix string) (string, string) {
-			if prefix == "acme" {
-				return "org-acme", "acme_db"
-			}
-			return "", ""
-		},
-	}
-	cp := &ControlPlane{
-		cfg:         ControlPlaneConfig{ManagedHostnameSuffixes: []string{".dw.us.postwh.com"}},
-		configStore: store,
-	}
-
-	if org, ok := cp.flightOrgFromContext(flightCtxWithSNI("acme.dw.us.postwh.com")); !ok || org != "org-acme" {
-		t.Fatalf("managed SNI should resolve org-acme; got (%q, %v)", org, ok)
-	}
-	if org, ok := cp.flightOrgFromContext(flightCtxWithSNI("ghost.dw.us.postwh.com")); ok || org != "" {
-		t.Fatalf("unknown managed prefix must fail closed; got (%q, %v)", org, ok)
-	}
-	if _, ok := cp.flightOrgFromContext(flightCtxWithSNI("evil.example.com")); ok {
-		t.Fatalf("unmanaged hostname must fail closed")
-	}
-	if _, ok := cp.flightOrgFromContext(context.Background()); ok {
-		t.Fatalf("missing peer/SNI must fail closed")
-	}
-}
-
-// TestFlightValidatorUnknownOrg: SNI matches the suffix, but the prefix
-// resolves to no org. Must return false.
-func TestFlightValidatorUnknownOrg(t *testing.T) {
-	store := &fakeConfigStore{
-		resolveSNIPrefix: func(string) (string, string) { return "", "" }, // unknown
-		validateOrgUser: func(string, string, string) bool {
-			t.Fatalf("ValidateOrgUser must not be called for unknown SNI org")
-			return false
-		},
-	}
-	v := newFlightValidator(t, SNIRoutingEnforce, store)
-
-	if v.ValidateCredentialsForSNI("ghostorg.dw.us.postwh.com", "alice", "secret") {
-		t.Fatalf("unknown SNI org must not authenticate")
-	}
-}
-
-// TestFlightValidatorRejectsUnmanagedHostname: a non-managed hostname (or empty
-// SNI) has no org and must fail — there is no username-scan fallback.
-func TestFlightValidatorRejectsUnmanagedHostname(t *testing.T) {
-	store := &fakeConfigStore{
-		resolveSNIPrefix: func(string) (string, string) {
-			t.Fatalf("ResolveSNIPrefix must not be called for unmanaged hostnames")
-			return "", ""
-		},
-	}
-	for _, mode := range []string{SNIRoutingEnforce, SNIRoutingPassthrough, SNIRoutingOff} {
-		v := newFlightValidator(t, mode, store)
-		if v.ValidateCredentialsForSNI("", "alice", "secret") {
-			t.Fatalf("mode %q must reject empty SNI", mode)
-		}
-		if v.ValidateCredentialsForSNI("duckgres-db.internal.ec2.us-east-1.dev.posthog.dev", "alice", "secret") {
-			t.Fatalf("mode %q must reject legacy hostname", mode)
-		}
-	}
 }

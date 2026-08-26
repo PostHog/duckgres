@@ -78,7 +78,7 @@ var credentialRefreshLookahead = stsSessionDuration / 2
 // but DuckLake and S3-glob scans pre-populate file
 // size/etag/last-modified so opens skip the HEAD entirely and the first auth
 // failure surfaces on a range GET, which is not retried (verified against
-// httpfs v1.5.3 / ducklake sources; pinned by
+// httpfs v1.5.5 / ducklake sources; pinned by
 // TestInFlightScanDiesOnCredentialRotation in tests/integration). A
 // statement on stock httpfs therefore lives or dies on its starting runway:
 // this margin guarantees every statement at least lookahead+5m of token
@@ -86,7 +86,7 @@ var credentialRefreshLookahead = stsSessionDuration / 2
 // ExpiredToken.
 //
 // The PostHog httpfs fork (PostHog/duckdb-httpfs,
-// v1.5.3-cred-refresh-write-retry) FIXES this: on an ExpiredToken auth failure
+// v1.5.5-cred-refresh-write-retry) FIXES this: on an ExpiredToken auth failure
 // in S3 read/write request paths it re-resolves the latest committed secret —
 // picking up this scheduler's rotation pushes — and retries (proven by
 // TestInFlightScanSurvivesRotationWithPatchedHTTPFS in tests/integration).

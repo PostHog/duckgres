@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -24,10 +25,13 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/server"
 	"github.com/posthog/duckgres/server/flightclient"
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
+	"github.com/posthog/duckgres/server/sqlcore"
+	"github.com/posthog/duckgres/transpiler/transform"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -71,10 +75,14 @@ type SessionPool struct {
 	// controlDB is activePair.Control, surfaced for direct use by control-side
 	// ops (CREATE OR REPLACE SECRET on STS rotation). Always nil before
 	// activation; nil-check before use and fall back to the main DB.
-	controlDB    *sql.DB
-	queryLogMu   sync.Mutex
-	queryLogInit sync.Mutex
-	queryLogSink server.QueryLogSink
+	controlDB            *sql.DB
+	queryLogMu           sync.Mutex
+	queryLogInit         sync.Mutex
+	queryLogSink         server.QueryLogSink
+	cacheRouter          *cacheProxyRouter
+	cacheServer          *http.Server
+	cacheListener        net.Listener
+	cacheRouterAttempted bool
 
 	sharedWarmMode       bool
 	activation           *activatedTenantRuntime
@@ -92,30 +100,50 @@ type SessionPool struct {
 
 	// secretSwapMu serializes rebuilds of the tenant ducklake_s3 secret (the
 	// credential-refresh path in reuseExistingActivation vs the per-session
-	// duckgres.s3_cache toggle in SetS3CacheEnabled) so the last-applied
-	// transport always matches s3CacheBypassed. The refresh path holds it from
+	// duckgres.s3_cache toggle in SetS3CacheMode) so the last-applied transport
+	// always matches s3CacheMode. The refresh path holds it from
 	// before its rebuild until AFTER the rotated payload is committed, so a
 	// concurrent toggle can never rebuild from the stale pre-rotation payload.
 	// Lock order: secretSwapMu → p.mu (both paths); p.mu is never held while
 	// acquiring secretSwapMu. Held across the (slow) CREATE OR REPLACE SECRET,
 	// which p.mu must not be — health checks only need p.mu.RLock.
 	secretSwapMu sync.Mutex
-	// s3CacheBypassed is true while the tenant S3 secret carries the org's
-	// native HTTPS transport instead of the cache-proxy transport, i.e. the
-	// current session set `duckgres.s3_cache = off`. Flipped only under
-	// secretSwapMu (read under p.mu); the one exception is activateTenant's
-	// reset-to-false at first-activation commit, which cannot race a swap
-	// because SetS3CacheEnabled refuses to run before an activation exists
-	// (and taking secretSwapMu there would invert the secretSwapMu→p.mu lock
-	// order). CreateSession restores the proxy transport before a new session
-	// starts so a bypass can never leak into the org's next session.
-	s3CacheBypassed bool
+	// s3CacheMode is the tenant secret/router state selected by
+	// `duckgres.s3_cache`. It is changed only under secretSwapMu (read under
+	// p.mu). The enum prevents impossible combinations such as both bypass and
+	// passthrough being active. The one exception is activateTenant's reset to
+	// the default, which cannot race a swap because SetS3CacheMode refuses to
+	// run before an activation exists (and taking secretSwapMu there would
+	// invert the secretSwapMu→p.mu lock order). CreateSession restores the
+	// normal caching mode before a new session starts so an opt-out can never
+	// leak into the org's next session.
+	s3CacheMode transform.S3CacheMode
 
 	drainMu       sync.Mutex
 	draining      bool
 	activeWork    int
 	drainZero     chan struct{}
 	drainZeroOpen bool
+
+	// instance tracks whether this process's DuckDB instance has been poisoned
+	// by an Internal/Fatal engine error. Sticky, and reported to the control
+	// plane on every health check so the worker is retired instead of being
+	// handed to the org's next connection (see instance_fatal.go).
+	instance instanceHealth
+}
+
+func (p *SessionPool) setActiveCacheProxyContext(ctx context.Context) func() {
+	if p.cacheRouter == nil {
+		return func() {}
+	}
+	return p.cacheRouter.setActiveContext(ctx)
+}
+
+func (p *SessionPool) currentS3CacheModeLocked() transform.S3CacheMode {
+	if p.s3CacheMode == "" {
+		return transform.S3CacheOn
+	}
+	return p.s3CacheMode
 }
 
 type trackedTx struct {
@@ -164,6 +192,10 @@ type Session struct {
 
 	duckdbConn duckdbConnHandle // raw handle for progress polling (zero if extraction failed)
 	progress   progressState    // stall detection state
+
+	// logger carries user+pid for in-session WARN/ERROR. Discarded on
+	// DestroySession so a hot-idle reuse cannot leak the previous user.
+	logger *slog.Logger
 }
 
 // QueryHandle stores an ad-hoc query awaiting its DoGet.
@@ -511,6 +543,22 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		drainZero:            make(chan struct{}),
 		drainZeroOpen:        true,
 	}
+	if cacheEnabled() {
+		pool.cacheRouterAttempted = true
+		router, listener, err := startCacheProxyRouter(cacheProxyS3Addr())
+		if err != nil {
+			slog.Warn("Failed to start worker-local cache fallback router; bypassing local cache.", "error", err)
+		} else {
+			pool.cacheRouter = router
+			pool.cacheListener = listener
+			pool.cacheServer = &http.Server{Handler: router}
+			go func() {
+				if serveErr := pool.cacheServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+					slog.Warn("Worker-local cache fallback router stopped unexpectedly.", "error", serveErr)
+				}
+			}()
+		}
+	}
 	pool.activateTenantFunc = pool.activateTenant
 	go pool.reapLoop()
 	go pool.metadataMetricsLoop()
@@ -520,6 +568,28 @@ func NewDuckDBService(cfg ServiceConfig) *DuckDBService {
 		cfg:  cfg,
 		pool: pool,
 	}
+}
+
+func startCacheProxyRouter(cacheAddr string) (*cacheProxyRouter, net.Listener, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, err
+	}
+	return newCacheProxyRouter(cacheAddr, true), listener, nil
+}
+
+func (p *SessionPool) overrideS3EndpointForCacheProxy(cfg *server.DuckLakeConfig) {
+	if p.cacheRouter == nil {
+		// Hand-constructed unit-test pools predate the router. Keep their
+		// transport assertions meaningful, while a production startup that
+		// attempted and failed to bind the router deliberately stays direct.
+		if !p.cacheRouterAttempted {
+			overrideS3EndpointForCacheProxy(cfg)
+		}
+		return
+	}
+	p.cacheRouter.setDirectUseTLS(cfg.S3UseSSL)
+	overrideS3EndpointForCacheProxyAddr(cfg, p.cacheListener.Addr().String())
 }
 
 // wipePersistedSecrets removes DuckDB's persistent-secret directories for this
@@ -602,11 +672,13 @@ func (p *SessionPool) Warmup() error {
 	start := time.Now()
 	slog.Info("Pre-warming worker DuckDB instance...")
 
-	// Wait for the local cache proxy to be ready before serving queries.
-	// When DUCKGRES_CACHE_PROXY_ADDR is set, DuckDB will route S3 traffic
-	// through it — worker startup must block until the proxy is healthy.
-	// Included in the pre-warm duration so slow proxy startup is visible.
-	waitForCacheProxy()
+	// The local router is always available to DuckDB. A bounded check decides
+	// whether it uses NVMe cache or direct S3, and a single supervisor recovers
+	// the cache later without gating worker readiness.
+	if p.cacheRouter != nil {
+		p.cacheRouter.setMode(waitForCacheProxy())
+		go p.cacheRouter.supervise(cacheProxyHealthURL(), p.stopCh)
+	}
 	// Use a system-level username for warmup
 	pair, err := p.createDBPair(p.sharedWarmupConfig(), p.duckLakeSem, "duckgres", p.startTime, server.ProcessVersion())
 	if err != nil {
@@ -679,7 +751,7 @@ func (p *SessionPool) reapIdle(now time.Time) {
 				if !s.connMu.TryLock() {
 					continue
 				}
-				slog.Warn("Rolling back idle transaction.", "user", s.Username, "txn", id)
+				s.Logger().Warn("Rolling back idle transaction.", "txn", id)
 				if ttx.tx != nil {
 					_ = ttx.tx.Rollback()
 				}
@@ -706,15 +778,15 @@ func (p *SessionPool) reapIdle(now time.Time) {
 					// The connection may be executing, streaming, or planning work inside
 					// this raw SQL transaction. Leave the transaction drain token active.
 				} else if s.Conn == nil {
-					slog.Warn("Skipping idle raw SQL transaction rollback without a session connection.", "user", s.Username)
+					s.Logger().Warn("Skipping idle raw SQL transaction rollback without a session connection.")
 				} else if !s.connMu.TryLock() {
 					// A same-session operation is using the connection but has not reached
 					// a connWork-tracked path. Skip instead of blocking the reaper loop.
 				} else {
-					slog.Warn("Rolling back idle raw SQL transaction.", "user", s.Username)
+					s.Logger().Warn("Rolling back idle raw SQL transaction.")
 					rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), time.Second)
 					if _, err := s.Conn.ExecContext(rollbackCtx, "ROLLBACK"); err != nil {
-						slog.Warn("Idle raw SQL transaction rollback failed; keeping drain work active.", "user", s.Username, "error", err)
+						s.Logger().Warn("Idle raw SQL transaction rollback failed; keeping drain work active.", "error", err)
 					} else {
 						releaseDrains = append(releaseDrains, s.sqlTxDrain)
 						s.sqlTxDrain = nil
@@ -739,7 +811,7 @@ func (p *SessionPool) reapIdle(now time.Time) {
 					releaseDrains = append(releaseDrains, h.finishOperation)
 					h.finishOperation = nil
 				}
-				slog.Warn("Reaping abandoned query handle (no DoGet).", "user", s.Username, "handle", id)
+				s.Logger().Warn("Reaping abandoned query handle (no DoGet).", "handle", id)
 				delete(s.queries, id)
 			}
 		}
@@ -902,12 +974,15 @@ func Run(cfg ServiceConfig) {
 		if !svc.WaitForDrain(ctx) {
 			slog.Warn("DuckDB service drain timed out before shutdown.", "timeout", workerShutdownDrainTime)
 			cancel()
+			// Close first so teardown WARNs land in the batch, then flush.
 			svc.CloseAll()
+			cliboot.FlushLogging()
 			os.Exit(0)
 		}
 		cancel()
 		slog.Info("Shutting down DuckDB service...")
 		svc.Shutdown()
+		cliboot.FlushLogging()
 		os.Exit(0)
 	}()
 
@@ -921,27 +996,9 @@ func Run(cfg ServiceConfig) {
 func (svc *DuckDBService) Serve(listener net.Listener) error {
 	handler := NewFlightSQLHandler(svc.pool)
 
-	var opts []grpc.ServerOption
-	opts = append(opts,
-		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
-		grpc.MaxSendMsgSize(flightclient.MaxGRPCMessageSize),
-	)
-	if svc.cfg.BearerToken != "" {
-		opts = append(opts,
-			grpc.ChainUnaryInterceptor(BearerTokenUnaryInterceptor(svc.cfg.BearerToken)),
-			grpc.ChainStreamInterceptor(BearerTokenStreamInterceptor(svc.cfg.BearerToken)),
-		)
-	}
-	if listener.Addr() != nil && listener.Addr().Network() == "tcp" &&
-		svc.cfg.ServerConfig.TLSCertFile != "" && svc.cfg.ServerConfig.TLSKeyFile != "" {
-		cert, err := tls.LoadX509KeyPair(svc.cfg.ServerConfig.TLSCertFile, svc.cfg.ServerConfig.TLSKeyFile)
-		if err != nil {
-			return fmt.Errorf("load worker RPC TLS certificates: %w", err)
-		}
-		opts = append(opts, grpc.Creds(credentials.NewTLS(&tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-		})))
+	opts, err := flightServerOptions(svc.cfg, listener)
+	if err != nil {
+		return err
 	}
 
 	// Wrap the flightsql server with custom action handling.
@@ -955,6 +1012,32 @@ func (svc *DuckDBService) Serve(listener net.Listener) error {
 	svc.flightSrv.RegisterFlightService(customSrv)
 	svc.flightSrv.InitListener(listener)
 	return svc.flightSrv.Serve()
+}
+
+func flightServerOptions(cfg ServiceConfig, listener net.Listener) ([]grpc.ServerOption, error) {
+	opts := []grpc.ServerOption{
+		grpc.MaxRecvMsgSize(flightclient.MaxGRPCMessageSize),
+		grpc.MaxSendMsgSize(flightclient.MaxGRPCMessageSize),
+		sqlcore.OTELGRPCServerHandler(),
+	}
+	if cfg.BearerToken != "" {
+		opts = append(opts,
+			grpc.ChainUnaryInterceptor(BearerTokenUnaryInterceptor(cfg.BearerToken)),
+			grpc.ChainStreamInterceptor(BearerTokenStreamInterceptor(cfg.BearerToken)),
+		)
+	}
+	if listener != nil && listener.Addr() != nil && listener.Addr().Network() == "tcp" &&
+		cfg.ServerConfig.TLSCertFile != "" && cfg.ServerConfig.TLSKeyFile != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.ServerConfig.TLSCertFile, cfg.ServerConfig.TLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load worker RPC TLS certificates: %w", err)
+		}
+		opts = append(opts, grpc.Creds(credentials.NewTLS(&tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})))
+	}
+	return opts, nil
 }
 
 // Shutdown gracefully stops the service.
@@ -1252,9 +1335,14 @@ func (p *SessionPool) DestroySession(token string) error {
 	p.mu.Lock()
 	session, ok := p.sessions[token]
 	stop := p.stopRefresh[token]
+	var log *slog.Logger
 	if ok {
+		// Snapshot before clear so destroy-path WARNs keep user+pid
+		// without leaving the field set for a later Logger() leak.
+		log = session.Logger()
 		delete(p.sessions, token)
 		delete(p.stopRefresh, token)
+		clearSessionLog(session)
 	}
 	p.mu.Unlock()
 
@@ -1363,7 +1451,7 @@ func (p *SessionPool) DestroySession(token string) error {
 	if p.sharedWarmMode && p.maxSessions == 1 && session.DB != nil {
 		wipeCtx, wipeCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
 		if _, err := wipeUserSecrets(wipeCtx, session.DB); err != nil {
-			slog.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
+			log.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
 		}
 		wipeCancel()
 	}
@@ -1374,7 +1462,7 @@ func (p *SessionPool) DestroySession(token string) error {
 	// which the worker's checkpointer would write past the cache proxy.
 	if p.sharedWarmMode {
 		if err := p.SetS3CacheEnabled(true); err != nil {
-			slog.Warn("Failed to restore S3 cache transport on session destroy.", "user", session.Username, "error", err)
+			log.Warn("Failed to restore S3 cache transport on session destroy.", "user", session.Username, "error", err)
 		}
 	}
 
@@ -1487,6 +1575,9 @@ func (p *SessionPool) CloseAll() {
 			close(p.stopCh)
 		}
 	})
+	if p.cacheServer != nil {
+		_ = p.cacheServer.Close()
+	}
 	p.mu.Lock()
 	sessions := make(map[string]*Session, len(p.sessions))
 	stops := make(map[string]func(), len(p.stopRefresh))
@@ -1789,6 +1880,8 @@ func (s *customActionServer) DoAction(cmd *flight.Action, stream flight.FlightSe
 	case "WaitSessionIdle":
 		return s.handler.doWaitSessionIdle(cmd.Body, stream)
 	case "SetSessionS3Cache":
+		return s.handler.doSetSessionS3Cache(cmd.Body, stream)
+	case "SetSessionS3CacheMode":
 		return s.handler.doSetSessionS3Cache(cmd.Body, stream)
 	case "ReleaseQueryHandle":
 		return s.handler.doReleaseQueryHandle(cmd.Body, stream)

@@ -1,6 +1,7 @@
 package provisioning
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,19 +18,13 @@ import (
 	"gorm.io/gorm"
 )
 
-// isUniqueViolation reports whether err comes from a Postgres
-// 23505 unique-constraint violation. The pgx/jackc driver surfaces
-// the SQLSTATE through a method on the returned error; we match
-// against that without importing pgconn directly (mirrors the
-// pattern in controlplane/provisioner/postgres_admin.go).
-//
-// Mapped to HTTP 409 by the provision handler so callers see a
-// clear "your input conflicts with existing state" rather than a
-// generic 500.
+// isUniqueViolation reports whether err comes from a Postgres 23505
+// unique-constraint violation (thin wrapper over the shared
+// configstore.IsUniqueViolationErr). Mapped to HTTP 409 by the provision
+// handler so callers see a clear "your input conflicts with existing state"
+// rather than a generic 500.
 func isUniqueViolation(err error) bool {
-	type sqlStater interface{ SQLState() string }
-	var s sqlStater
-	return errors.As(err, &s) && s.SQLState() == "23505"
+	return configstore.IsUniqueViolationErr(err)
 }
 
 const (
@@ -75,16 +71,28 @@ type Store interface {
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	GetOrg(orgID string) (*configstore.Org, error)
 	// Provision is the all-or-nothing entrypoint for POST /provision —
-	// wraps warehouse + root-user writes in a single configstore
-	// transaction so partial failure rolls back cleanly. Use this for the
-	// public provision endpoint; the older per-step methods below are kept
-	// for the standalone surfaces (reset-password).
+	// wraps warehouse + root-user + optional Trino-opt-in writes in a
+	// single configstore transaction so partial failure rolls back
+	// cleanly. Use this for the public provision endpoint; the older
+	// per-step methods below are kept for the standalone surfaces
+	// (reset-password, enable/disable trino on an existing org).
 	Provision(req ProvisionRequest) error
 	CreatePendingWarehouse(orgID, databaseName string, warehouse *configstore.ManagedWarehouse) error
 	CreateOrgUser(orgID, username, passwordHash string) error
-	UpdateOrgUserPassword(orgID, username, passwordHash string) error
+	// GetOrgUser reads one login. Used to preflight the Trino opt-in: an org
+	// with no `root` user cannot be projected into a cell, and the reconcile
+	// loop skips it silently, so the API rejects it up front instead.
+	GetOrgUser(orgID, username string) (*configstore.OrgUser, error)
 	SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error
 	IsDatabaseNameAvailable(name string) (bool, error)
+
+	// Trino lifecycle. EnableTrino is idempotent — re-enabling updates
+	// settings without flipping through a disabled state. DisableTrino
+	// leaves the row in place so the provisioner observes the transition
+	// and cleans up the catalog, the tenant Secret key and the password
+	// file entry on next reconcile.
+	EnableTrino(orgID string, settings configstore.TrinoSettings) error
+	DisableTrino(orgID string) error
 	// Team CRUD for the PostHog backend (duckgres_org_teams rows — config
 	// only, never warehouse data). ListOrgTeams returns
 	// gorm.ErrRecordNotFound for an unknown org. UpsertOrgTeam is the
@@ -102,16 +110,40 @@ type Store interface {
 	LatestConfigChange() (time.Time, error)
 }
 
+// PeerFanout posts path+"?scope=local" to every OTHER control-plane replica.
+// Nil in single-CP/tests; mirrors admin.PeerFetcher.PostPeers without the
+// provisioning package depending on the admin package.
+type PeerFanout interface {
+	PostPeers(ctx context.Context, path string) ([][]byte, int)
+}
+
 // RegisterAPI registers provisioning endpoints on the given router group.
 // bucketSuffix is the env suffix used to compute the control-plane-owned
 // per-org s3bucket name at provision time (empty ⇒ the CP doesn't name buckets
-// and the composition derives).
-func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
-	h := &handler{store: store, bucketSuffix: bucketSuffix}
+// and the composition derives). peerFanout may be nil; when set, the
+// service-credentials mint fans a snapshot reload out to peer replicas so a
+// freshly rotated credential auths on whichever CP the client's pgwire
+// connection actually lands on, not just the replica that served the mint.
+func RegisterAPI(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout) {
+	RegisterAPIWithIngressSuffix(r, store, tenantStore, bucketSuffix, peerFanout, "")
+}
+
+// RegisterAPIWithIngressSuffix is RegisterAPI plus an explicit managed tenant
+// ingress DNS suffix (leading dot, e.g. ".dw.us.postwh.com") used to build
+// connect.host in the service-credential response as <org-id><suffix>. The
+// caller must pass the CP's configured managed-ingress suffix — the same value
+// the pgwire TLS server_name pins (the wildcard cert is *<suffix> and the SNI
+// router resolves the single-label prefix as the org) — so the host the mint
+// response hands back is the ingress the credential authenticates against. An
+// empty ingressSuffix falls back to DefaultManagedIngressSuffix.
+func RegisterAPIWithIngressSuffix(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout, ingressSuffix string) {
+	h := &handler{store: store, bucketSuffix: bucketSuffix, peerFanout: peerFanout, ingressSuffix: ingressSuffix}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
 	r.POST("/orgs/:id/reset-password", h.resetPassword)
+	r.POST("/orgs/:id/trino", h.enableTrino)
+	r.DELETE("/orgs/:id/trino", h.disableTrino)
 	r.GET("/database-name/check", h.checkDatabaseName)
 	// Team CRUD: the PostHog backend manages the org's duckgres_org_teams
 	// rows through these (config only — deleting a team never touches
@@ -119,6 +151,19 @@ func RegisterAPI(r *gin.RouterGroup, store Store, bucketSuffix string) {
 	r.GET("/orgs/:id/teams", h.listOrgTeams)
 	r.POST("/orgs/:id/teams", h.upsertOrgTeam)
 	r.DELETE("/orgs/:id/teams/:team_id", h.deleteOrgTeam)
+	// Short-lived service credentials (AWS AccessKey/Secret style): a PostHog
+	// backend job (dagster) mints a per-credential grant — its own
+	// duckgres_service_grants row, never a duckgres_org_users row — and
+	// connects with (credential_id, secret). Every mint creates a fresh grant;
+	// principal is audit metadata only. Refresh ALWAYS rotates the explicitly
+	// named grant. Plaintext is returned only here; the store persists only
+	// the bcrypt hash.
+	r.POST("/orgs/:id/service-credentials", func(c *gin.Context) {
+		h.issueServiceCredential(c, tenantStore)
+	})
+	r.POST("/orgs/:id/service-credentials/refresh", func(c *gin.Context) {
+		h.refreshServiceCredential(c, tenantStore)
+	})
 }
 
 // RegisterDiscoveryAPI registers the read-only discovery endpoints for
@@ -140,6 +185,16 @@ type handler struct {
 	// CP-owned s3bucket name; empty disables CP naming. See
 	// configstore.DucklingBucketName.
 	bucketSuffix string
+	// peerFanout may be nil (single-CP / tests). When set, the
+	// service-credentials mint uses it to fan a snapshot reload out to peer
+	// replicas after rotating a credential.
+	peerFanout PeerFanout
+	// ingressSuffix is the managed tenant DNS suffix (leading dot) joined onto
+	// the org ID to build connect.host in the service-credential response. It
+	// must match the TLS server_name the CP pins for managed tenants so the
+	// host handed back is the ingress the credential auths against. Empty ⇒
+	// managedIngressSuffix() falls back to DefaultManagedIngressSuffix.
+	ingressSuffix string
 }
 
 // warehouseStatusResponse is the public-facing view of warehouse state.
@@ -189,6 +244,36 @@ type provisionRequest struct {
 	MetadataStore *provisionMetadataReq  `json:"metadata_store,omitempty"`
 	DataStore     *provisionDataStoreReq `json:"data_store,omitempty"`
 	DuckLake      *provisionDuckLakeReq  `json:"ducklake,omitempty"`
+
+	// Trino is the opt-in flag for the shared Trino cell. Optional — when
+	// nil, the warehouse is provisioned with the existing PG-only
+	// behavior. When non-nil and Enabled=true, the provisioning handler
+	// additionally writes a ManagedWarehouseTrino row so the provisioner
+	// picks it up on the next reconcile.
+	Trino *provisionTrinoReq `json:"trino,omitempty"`
+}
+
+// provisionTrinoReq is the per-request Trino opt-in. Mirrored by the
+// standalone POST /orgs/:id/trino body (trinoRequest below) so both
+// surfaces accept the same shape.
+type provisionTrinoReq struct {
+	// Enabled flips Trino on for this org. False (or omitted) is a no-op:
+	// existing rows are not affected, so the provision endpoint can be
+	// retried with Trino={Enabled:false} without disabling a previously
+	// enabled org.
+	Enabled bool `json:"enabled"`
+
+	// Tier picks the resource-group limits applied to the org. Empty
+	// string is the default tier.
+	Tier string `json:"tier,omitempty"`
+}
+
+// trinoRequest is the body shape for POST /orgs/:id/trino (standalone
+// enable on an existing org). Mirrors provisionTrinoReq so callers can
+// use one schema for both surfaces.
+type trinoRequest struct {
+	Enabled bool   `json:"enabled"`
+	Tier    string `json:"tier,omitempty"`
 }
 
 type provisionMetadataReq struct {
@@ -259,8 +344,24 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if req.DatabaseName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "database_name is required"})
+	// Trim around the caller's value so " acme" fails with the real problem
+	// instead of storing a name that differs from what the caller intended.
+	req.DatabaseName = strings.TrimSpace(req.DatabaseName)
+
+	// database_name becomes the org's managed hostname label
+	// (<database_name>.<managed-suffix>) and the dbname clients connect with,
+	// so a new or CHANGED name must be a routable single DNS label — a name
+	// with spaces or dots would store fine but leave the tenant reachable by
+	// no hostname. Grandfather exception: re-provisioning an existing org with
+	// its STORED name (the deprovision→re-provision recovery loop) sends a
+	// value that predates this rule — rejecting it would orphan a flow that
+	// worked until now and write nothing new anyway. The break-glass rename
+	// lives in the admin API (PUT /api/v1/orgs/:id).
+	if existing, err := h.store.GetOrg(orgID); err == nil && existing.DatabaseName == req.DatabaseName {
+		// Existing org re-provisioning with its stored (possibly
+		// pre-validation-rule) database name: nothing changes, allow it.
+	} else if err := configstore.ValidateDatabaseName(req.DatabaseName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -374,9 +475,21 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	// One transaction wraps warehouse + root user. Failure of any
-	// sub-step rolls the others back so the caller's retry sees the same
-	// starting state (no half-provisioned row blocking re-creation).
+	// orgID was already validated as a DNS-1123 label at the top of the
+	// handler (validateDucklingOrgID) — that's all the Trino catalog/group
+	// naming needs, since TrinoCatalogName sanitizes it injectively
+	// (org_<sanitize(Name)>). It also makes the org id a legal Kubernetes
+	// Secret data key, which the tenant-password projection requires. No
+	// extra per-Trino constraint.
+	var trinoSettings *configstore.TrinoSettings
+	if req.Trino != nil && req.Trino.Enabled {
+		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier}
+	}
+
+	// One transaction wraps warehouse + root user + optional Trino opt-in.
+	// Failure of any sub-step rolls the others back so the caller's retry
+	// sees the same starting state (no half-provisioned row blocking
+	// re-creation).
 	if err := h.store.Provision(ProvisionRequest{
 		OrgID:        orgID,
 		DatabaseName: req.DatabaseName,
@@ -384,6 +497,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		SchemaName:   req.SchemaName,
 		Warehouse:    warehouse,
 		RootUserHash: hash,
+		Trino:        trinoSettings,
 	}); err != nil {
 		// The warehouse-already-exists conflict is the only error
 		// shape that maps to 409. Everything else (DB write failure,
@@ -445,6 +559,102 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	c.JSON(http.StatusAccepted, resp)
 }
 
+// enableTrino handles POST /orgs/:id/trino — opting an existing org
+// (provisioned previously without Trino) into the shared Trino cell.
+// Idempotent: re-enabling updates the tier without flipping through a
+// disabled state.
+//
+// Note this does NOT require the org's ManagedWarehouse to be ready — the
+// Trino provisioner gates on its own readiness signals (a warehouse row
+// with a complete connection block, and a duckling-published metadata
+// password), and reports the org as provisioning until they land.
+func (h *handler) enableTrino(c *gin.Context) {
+	orgID := c.Param("id")
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
+		return
+	}
+	if err := validateDucklingOrgID(orgID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var req trinoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !req.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true; use DELETE to disable"})
+		return
+	}
+
+	// Preflight: the FK on ManagedWarehouseTrino requires the Org row
+	// to exist. Without this check, EnableTrino's INSERT hits a
+	// foreign-key violation and we'd return a 500 with the raw Postgres
+	// error. 404 is the right shape: "the resource you're trying to
+	// modify doesn't exist." Callers that need to /provision first
+	// see the clear 404 here rather than parsing an FK error string.
+	if _, err := h.store.GetOrg(orgID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found; call /provision first"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Preflight: the org's `root` login is the tenant's Trino principal —
+	// ListTrinoEnabledOrgs inner-joins on it, so an org without one is
+	// dropped from every projection and the reconcile loop never reports
+	// why. Orgs provisioned before the root-user convention are exactly
+	// this shape. Reject here so the caller learns immediately instead of
+	// watching the org sit at Pending forever; POST /orgs/:id/reset-password
+	// creates the missing login on a Ready warehouse.
+	if _, err := h.store.GetOrgUser(orgID, "root"); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "org has no root user, so it cannot be projected into a Trino cell; POST /orgs/" + orgID + "/reset-password to create one",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"status": "trino enable queued",
+		"org":    orgID,
+		"tier":   req.Tier,
+	})
+}
+
+// disableTrino handles DELETE /orgs/:id/trino — opting the org out of
+// the Trino cell. The row is kept (with Enabled=false) so the provisioner
+// observes the transition and removes the catalog, the org's key on the
+// tenant Secret and its password-file entry on its next reconcile tick.
+// Idempotent.
+func (h *handler) disableTrino(c *gin.Context) {
+	orgID := c.Param("id")
+	if orgID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "org id is required"})
+		return
+	}
+	if err := h.store.DisableTrino(orgID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"status": "trino disable queued",
+		"org":    orgID,
+	})
+}
+
 func (h *handler) deprovisionWarehouse(c *gin.Context) {
 	orgID := c.Param("id")
 
@@ -464,6 +674,28 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 			// are emitted by the async provisioner controller as it deletes the
 			// underlying resources.
 			analytics.Default().Capture("warehouse_deprovision_begin", orgID, nil)
+
+			// Also disable Trino so the reconcile loop tears down the
+			// cell's projections (catalog, password/group file entries,
+			// tenant Secret key, OPA bundle ownership, resource group).
+			// Without this, deprovisioning a warehouse leaves the Trino
+			// row enabled forever — the CASCADE only fires when the Org
+			// row itself is deleted, and reconcileDeleting doesn't touch
+			// the Org row. We'd otherwise keep projecting the
+			// deprovisioned org's credentials into Trino indefinitely.
+			//
+			// Best-effort: failure to disable Trino doesn't abort the
+			// warehouse deprovision (the warehouse state has already
+			// moved to Deleting). The operator can retry by calling
+			// DELETE /orgs/:id/trino directly.
+			if disableErr := h.store.DisableTrino(orgID); disableErr != nil {
+				c.JSON(http.StatusAccepted, gin.H{
+					"status":  "deprovisioning started",
+					"org":     orgID,
+					"warning": "failed to disable trino in the same call; retry DELETE /orgs/:id/trino: " + disableErr.Error(),
+				})
+				return
+			}
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}
@@ -544,8 +776,18 @@ func (h *handler) resetPassword(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
 		return
 	}
-	if err := h.store.UpdateOrgUserPassword(orgID, "root", hash); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "root user not found"})
+	// Upsert, not update. Orgs provisioned before the root-user convention
+	// have no `root` row at all — their primary login was named `duckgres` —
+	// and an update-only reset left them permanently unfixable: /provision
+	// refuses to touch a warehouse that is not Failed or Deleted
+	// (ErrWarehouseNonTerminal), so there was no supported path to give a
+	// live legacy org the root user every other surface assumes.
+	//
+	// Creating it here is gated on the same Ready check above, so this never
+	// mints a credential for a half-built warehouse, and CreateOrgUser's
+	// OnConflict makes the normal reset path behave exactly as before.
+	if err := h.store.CreateOrgUser(orgID, "root", hash); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -563,6 +805,15 @@ func (h *handler) checkDatabaseName(c *gin.Context) {
 	name := c.Query("name")
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name query parameter is required"})
+		return
+	}
+
+	// "available" must mean "provisionable", not just "untaken": a name the
+	// provision endpoint would 400 (not a valid DNS label) is reported
+	// available=false with the reason, so a pre-flight never green-lights a
+	// payload that fails one request later.
+	if err := configstore.ValidateDatabaseName(name); err != nil {
+		c.JSON(http.StatusOK, gin.H{"name": name, "available": false, "reason": err.Error()})
 		return
 	}
 
@@ -602,6 +853,15 @@ type orgTeamUpsertRequest struct {
 
 func (h *handler) listOrgTeams(c *gin.Context) {
 	orgID := c.Param("id")
+	org, err := h.store.GetOrg(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	teams, err := h.store.ListOrgTeams(orgID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -611,7 +871,10 @@ func (h *handler) listOrgTeams(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"teams": teams})
+	c.JSON(http.StatusOK, gin.H{
+		"teams":                             teams,
+		"data_imports_table_naming_version": org.DataImportsTableNamingVersion,
+	})
 }
 
 // upsertOrgTeam creates or overwrites one (org, team) row. This endpoint IS

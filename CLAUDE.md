@@ -90,7 +90,7 @@ existing cancellation locality: a synthetic-key miss on another replica is
 absorbed and counted by
 `duckgres_metadata_proxy_cancel_requests_total{outcome="not_local"}`.
 
-In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingress (`--flight-port`) for clients that prefer Flight over the PG wire protocol.
+In topologies 2 and 3, the control plane exposes only PostgreSQL wire protocol to clients. Arrow Flight SQL is internal transport between the control plane and workers.
 
 ### Key Components
 
@@ -103,10 +103,8 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
   - DuckLake: `ducklake_migration.go`, `checkpoint.go`
   - Observability: `querylog.go`, `tracing.go`
   - ProcessIsolation child workers: `parent.go`, `worker.go`, `worker_activation.go`, `worker_control.go`
-  - Flight SQL ingress (shared with control plane): `flightsqlingress/`
 - **controlplane/** — Multi-process / multi-tenant control plane
   - Core: `control.go`, `session_mgr.go`, `worker_mgr.go`, `worker_pool.go` (process/k8s abstraction), `validation.go`, `sdnotify.go`
-  - Flight SQL ingress adapter: `flight_ingress.go`
   - Runtime loops: `janitor.go`, `leader_loop.go`, `memory_rebalancer.go`, `runtime_tracker.go`
   - K8s / multitenant under build tag `kubernetes` (including: `multitenant.go`, `k8s_pool.go`, `k8s_pool_acquire.go`, `k8s_pool_spawn.go`, `k8s_pool_lifecycle.go`, `k8s_pool_reconcile.go`, `k8s_pool_helpers.go`, `k8s_factory.go`, `org_router.go`, `org_reserved_pool.go`, `sts_broker.go`, `shared_worker_activator.go`, `worker_rpc_security.go`, `janitor_leader_k8s.go`)
   - Subpackages: `admin/` (HTTP admin API + dashboard, `kubernetes` tag; includes the models explorer UI `static/models.html` + `models_api.go`, and `devserver/` for local UI dev against a port-forwarded CP — see `admin/README.md`), `provisioner/` (k8s controller, `kubernetes` tag), `provisioning/` (HTTP API), `configstore/` (Postgres-backed config)
@@ -120,7 +118,7 @@ In topologies 2 and 3, the control plane also exposes an Arrow Flight SQL ingres
 ## Run Modes
 
 - **standalone** (default): Single process, handles everything including TLS, auth, PG protocol, and DuckDB execution.
-- **control-plane**: Multi-process. Owns client connections end-to-end (TLS, auth, PG wire protocol, SQL transpilation, optional Flight SQL ingress) and routes queries to a worker pool.
+- **control-plane**: Multi-process. Owns pgwire client connections end-to-end (TLS, auth, protocol handling, SQL transpilation) and routes queries to a worker pool.
   - **Process backend** (default, `--worker-backend process`): local Flight SQL workers over Unix sockets.
   - **Remote backend** (`--worker-backend remote`): per-org Kubernetes worker pods over TCP+TLS. Multitenant; requires `-tags kubernetes` and a Postgres-backed config store. Adds config store, org router, runtime tracker, janitor/leader election, and a provisioning/admin HTTP API.
 - **duckdb-service**: Thin DuckDB execution engine exposed via Arrow Flight SQL. Spawned automatically by the control plane as worker processes, or run standalone for testing.
@@ -136,7 +134,6 @@ Key CLI flags for control-plane mode:
 - `--memory-budget SIZE` (default 75% RAM) / `--memory-rebalance`
 - `--socket-dir /path` (process backend)
 - `--handover-drain-timeout DURATION` (default `24h` process; **remote default is `0` = unbounded** — the CP waits for active sessions for as long as it takes and the pod's k8s `terminationGracePeriodSeconds` is the only hard wall. cloudflare/tableflip FD passing applies to process/standalone single-host upgrades, not k8s pod replacement.)
-- `--flight-port N` (Arrow Flight SQL ingress) plus `--flight-session-idle-ttl`, `--flight-session-reap-interval`, `--flight-handle-idle-ttl`, `--flight-session-token-ttl`
 - `--ducklake-delta-catalog-enabled` / `--ducklake-delta-catalog-path`
 - Remote backend (requires `--config-store`; `-tags kubernetes` for K8s pool):
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
@@ -246,8 +243,9 @@ DML with RETURNING is rejected at extended-query Describe time with SQLSTATE `0A
 In the **control-plane remote/k8s backend** a worker pod serves **exactly one
 client query session at a time**. This is deliberate: `workerDuckDBLimits`
 (`controlplane/control.go`) gives the single session ~75% of the *whole pod's*
-RAM + all CPU cores — it does NOT divide by session count. Two sessions on one
-pod would each believe they own 75% → ~150% overcommit → nondeterministic OOM /
+RAM plus 2.5 DuckDB threads per requested CPU, rounded up. It does NOT divide
+by session count. Two sessions on one pod would each believe they own 75% →
+~150% overcommit → nondeterministic OOM /
 a heavy query killed by a co-resident one. Do not break the following:
 
 - **One session per worker is enforced, not emergent.** The CP spawns remote
@@ -297,12 +295,245 @@ a heavy query killed by a co-resident one. Do not break the following:
   message). A nonzero drift metric means the scheduling invariant is broken —
   fix the root cause, don't just lean on the retry.
 
+- **An invalidated DuckDB instance retires the worker; it is NEVER reused.**
+  A DuckDB Internal- or Fatal-class exception does not just fail one statement,
+  it poisons the whole instance: every later statement on ANY connection to it —
+  including a brand new session — fails with "database has been invalidated
+  because of a previous fatal error" until the process restarts. DuckLake's
+  commit path is a known source (an InternalException inside the commit retry
+  loop is rethrown by `ErrorData::Throw` with its original type). Detection is
+  `isInstanceFatalError` (`duckdbservice/instance_fatal.go`). The **error TYPE
+  is authoritative**: a typed `*duckdb.Error` of
+  `ErrorTypeInternal`/`ErrorTypeFatal`. **Never add substring matches for
+  `"INTERNAL Error"` / `"FATAL Error"`** — DuckDB echoes the offending SQL back
+  in its error text (`LINE 1: <query>`), so those matched the USER'S OWN QUERY
+  and handed every tenant a one-statement worker kill via
+  `SELECT 'INTERNAL Error' + 1` (regression:
+  `TestInstanceFatalIgnoresEchoedQueryText`). The one string fallback is the
+  `database has been invalidated…` marker, for an error that arrives already
+  flattened. **OOM and DuckLake transaction conflicts are distinct error types
+  and must never classify here**; they retry in place. The flag is sticky
+  (invalidation is permanent) and is set from the statement paths, the
+  `CreateSession` path, and an async `SELECT 1` liveness probe kicked by each
+  health check — the probe is what catches a fatal thrown on a session that has
+  since been destroyed. **The stored reason MUST be redacted before it is kept**
+  (`usersecrets.RedactErrorForLog`, or `noteInstanceErrorOpaque` where no
+  statement is available to classify, as on the secret-replaying `CreateSession`
+  path): it is logged on the worker, shipped to the CP as
+  `instance_invalid_reason`, and logged again on retire, so an un-redacted
+  engine error leaks a failed `CREATE SECRET`'s credential into three sinks.
+  **The probe must stay OFF the health check's critical path**: the CP's
+  health-check budget is 3s and already shared with progress polling, so a
+  blocking probe would get healthy workers killed for unresponsiveness. It is
+  single-flight and a wedged CGO call can outlive its context, so a probe stuck
+  past the threshold raises `duckgres_worker_instance_probe_stuck` rather than
+  silently disabling detection. The worker reports
+  `instance_invalidated` + `healthy:false`; the CP retires it on the FIRST
+  report, bypassing `maxConsecutiveHealthFailures` (the process answers RPCs
+  fine, so the failure counter would never fire) and rejects it for reuse in
+  `validateReservedWorkerHealth` — the hot-idle reuse path is what previously
+  turned one bad statement into "the warehouse is down until someone restarts
+  it". `duckgres_control_plane_worker_instance_invalidated_total` and
+  `duckgres_worker_instance_invalidated_total` /
+  `duckgres_worker_instance_invalidated_state` are the signals; nonzero means
+  a tenant hit an engine bug and lost a worker — contained, but chase the root
+  cause. This is blast-radius containment ONLY: it does not fix the engine bug,
+  which is fixed by shipping a DuckLake extension build that guards the read
+  (see `DUCKLAKE_EXTENSION_TAG` in `Dockerfile`/`Dockerfile.worker`).
+
 Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
-`k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`, or
+`k8s_pool.go::spawnWorker`/`AcquireWorker`, `control.go::workerDuckDBLimits`,
+`duckdbservice/instance_fatal.go`, or
 `duckdbservice` session counting → update the unit tests
 (`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
-`duckdbservice/service_test.go`) AND the `one_session_per_worker` +
-`cold_burst_parallel_spawns` assertions in `tests/mw-dev/e2e/harness.sh`.
+`duckdbservice/service_test.go`, `duckdbservice/instance_fatal_test.go`,
+`controlplane/instance_invalidated_test.go`) AND the
+`one_session_per_worker` + `cold_burst_parallel_spawns` assertions in
+`tests/mw-dev/e2e/harness.sh`.
+
+## Exploratory Worker Tier (small-first routing) — LOAD-BEARING CONTRACT
+
+Design: `docs/superpowers/specs/2026-08-04-exploratory-worker-tier-design.md`.
+On the **remote/k8s backend only**, a connection that does not ask for a worker
+shape starts on a small "exploratory" pod and grows into a normal one only when
+it proves it needs to. Two mechanisms: **lazy acquisition** (no worker at
+connect) and **escalation** (small → standard, one-way). Env-only knobs:
+`DUCKGRES_EXPLORATORY_TIER_ENABLED` / `_WORKER_CPU` / `_WORKER_MEMORY` /
+`_WORKER_TTL` (default 48h), resolved by `exploratoryWorkerProfile`
+(`controlplane/worker_profile.go`). Server side lives in `server/conn_tier.go`
++ `tier_classify.go`; control-plane side in `controlplane/session_activation.go`
++ the activator/switcher closures in `control.go::handleConnection`.
+
+- **Eligibility is decided once, at connect** (`useExploratoryTier`): remote
+  backend AND a usable exploratory profile AND not a passthrough user AND no
+  client `duckgres.worker_*` startup option (`clientSuppliedWorkerGUCs`). A
+  half-configured tier (missing/invalid size) resolves to nil and degrades to
+  today's eager behavior — never to a BestEffort pod. **Passthrough users are
+  excluded** (they bypass the compat layer the classification is built on), and
+  a **GUC-sized connection bypasses the tier entirely** — it acquires the
+  requested shape eagerly at connect, as before.
+- **Nothing is acquired until a statement needs an engine.** The connection
+  reaches the message loop with `c.executor == nil` and a `SessionActivator`;
+  `activateForStatement` acquires on first need. Statements the control plane
+  answers itself — `SET`/`SHOW duckgres.query_source`, ignored SETs, no-ops,
+  `pg_stat_activity`, the empty query — MUST NOT acquire. That is the point of
+  the whole feature; adding an acquire to an engine-free path silently deletes
+  the benefit. The `duckgres.s3_cache` and `duckgres.worker_ttl` GUCs are the
+  exception, on all three protocol paths, because unlike the other duckgres
+  GUCs they are WORKER state (the s3_cache secret swap; the worker_ttl
+  pool-side hot-idle TTL): **`SET` always acquires** — the apply needs a
+  worker to land on — and **`SHOW duckgres.s3_cache` acquires only when
+  `c.hasPendingS3Cache`**, i.e. when a connect-time option has not been applied
+  yet and answering first would report a transport the session is about to
+  leave (see the s3_cache section below). `SHOW duckgres.worker_ttl` never
+  acquires: until a worker exists, the connect-time baseline is the truthful
+  answer (there is no pending worker-side TTL state).
+- **A pinning FIRST statement acquires the standard profile directly** (one
+  acquire, `pinned=true` → `MarkConnectionPinned`), never small-then-escalate.
+- **The pin set is the state boundary, and every member is load-bearing:** DML,
+  DDL, `COPY` (BOTH directions — COPY TO can reference session state and is
+  routed above the transpile-time hook), `SET`, `BEGIN` (so an open transaction
+  can never exist on a worker that is about to be replaced), `DECLARE` (simple,
+  batched AND extended — `FETCH`/`CLOSE` are unhooked and rely entirely on the
+  DECLARE pin, because a cursor's worker-side RowSet must not open on a session
+  about to be destroyed), secret DDL **before** the user-secrets interception
+  (that interception owns its own execution and sits ABOVE the general hook, so
+  a plain/TEMPORARY `CREATE SECRET` would otherwise land on the small worker and
+  be silently dropped), and the extended-protocol **Describe probe** of a
+  pinning statement (Describe really executes it). A parse failure pins by
+  default — false pins are free, a missed pin loses state.
+- **Escalation is one-way and sticky.** `escalateWorker` destroys the small
+  session BEFORE acquiring the standard one, so once it is entered there is no
+  session to fall back to. Both reason and outcome are closed sets:
+  `duckgres_exploratory_escalations_total{reason="state"|"oom"|"heuristic",
+  outcome="ok"|"canceled"|"capacity"|"draining"|"disabled"|"error"}` — every
+  ATTEMPT is counted, so a cluster that cannot escalate anything is
+  distinguishable from one nobody escalates on (v1 ships no heuristic tier; the
+  constant marks the hook point). The failure classes come from the CLASSIFIED
+  SQLSTATE via `server.AcquisitionFailureOutcome`, the same helper
+  `duckgres_session_activation_total{org,outcome}` uses — one helper, so the two
+  acquisition metrics can never drift into different or unbounded label sets.
+- **A failed acquisition — activation OR escalation — is CONNECTION-FATAL**
+  (the one exception is the post-escalation s3_cache re-apply, below).
+  `failWorkerAcquisition` sends a FATAL ErrorResponse, suppresses
+  ReadyForQuery, and unwinds the message loop; there is no session left to
+  resynchronize to. SQLSTATE comes from `escalationErrorSQLState`: a
+  `*server.SessionAcquireError` (classified by the CP with the SAME logic the
+  eager connect path uses, `sessionCreationErrorResponse`) is authoritative —
+  28000 disabled / 53300 capacity / 57P03 draining / 57014 cancel / 3D000
+  catalog / XX000 s3_cache apply / 53400 other; the substring fallback covers
+  only the paths that still return a plain error. Keep the client message the
+  classified one, never the wrapped internal chain. Extended-protocol handlers
+  are void, so the error is ALSO parked on `c.fatalErr`, which
+  `runExtendedQueryMessage` hands to the message loop. **`fatalErr` is one-shot
+  by construction** — it is set on the way out and never cleared, because the
+  connection is terminating; do not add a path that sets it and then continues.
+- **OOM re-execute is transparent only under all three conditions:** the
+  statement is a READ, ZERO DataRows have been sent, and `txStatus` is idle. A
+  wire stream cannot be restarted, so a partial result must surface the error
+  instead. RowDescription is NOT resent on the retry (same query, same engine
+  version → identical schema), and the retry runs on the escalated worker only.
+  Detection is `isWorkerOutOfMemoryError` (`server/conn_errors.go`) — DuckDB's
+  engine OOM only; a pod-level OOMKill is `ErrWorkerDead` and is deliberately
+  never re-executed.
+- **`duckgres.s3_cache` interplay (both directions).** A connect-time
+  `-c duckgres.s3_cache=...` cannot be applied at connect on this path (no
+  worker), so the CP parks it (`SetPendingS3CacheOption`) and
+  `ensureSessionActive` applies it AFTER installing the executor — applying it
+  inside the activator would find a nil executor, no-op the worker swap, and
+  still flip the session flag, the exact divergence `applyS3CacheSetting`
+  exists to prevent. A failed apply fails the activation (XX000, fatal). On
+  escalation the bypass is RE-APPLIED to the new worker
+  (`reapplyS3CacheAfterWorkerSwitch`); that failure is the ONE
+  non-connection-fatal escalation outcome, because the swap already succeeded:
+  the statement fails with a normal `ERROR` (XX000, naming the re-apply), the
+  session flag is reset to the worker's REAL transport (proxied — a fresh
+  session always starts on the cache proxy), the connection stays alive (a
+  ReadyForQuery on the simple protocol; Sync's on the extended one), and the
+  pin is deliberately NOT rolled back. `escalateWorker` tags it
+  `errS3CacheReapplyFailed` and `failEscalation` routes it — every call site
+  goes through that dispatcher so the two severities can never be confused at
+  one of them. **`SHOW` must never lie**: it activates iff an option is still
+  pending.
+- **Billing is largest-size-wins over the whole connection** (v1). The size is
+  stamped at activation and re-stamped at escalation with the target profile;
+  escalation only ever goes small→standard, so that stamp IS the maximum. The
+  pre-activation idle prefix bills at the first acquired size.
+- **Accepted gaps (do not "fix" silently — they are decisions):** per-org
+  connection admission and the vCPU lease now happen at the FIRST STATEMENT,
+  not at connect (the connect-time reshard/migration/draining gates are
+  unchanged); a one-shot per-user `kill` landing inside the switcher's
+  destroy→create window is missed, and so is a `kill` against a connection that
+  authenticated but has never activated (no session for
+  `DestroySessionsForUser` to iterate and no registered conn-closer until the
+  first statement) — `disable` covers BOTH, because the activation/escalation
+  re-check refuses the session outright (28000); extending `kill` to
+  authed-but-unactivated connections is a named follow-up, not implemented; and
+  a client that sends TCP FIN mid-activation does not abort the in-flight spawn
+  (the message loop is blocked in the acquire) — the completed worker parks
+  hot-idle for the org's next connection.
+- Touching classification, the pin hooks, activation, escalation, the OOM
+  retry, or the profile resolution → update `server/tier_classify_test.go`,
+  `server/conn_tier_test.go`, `server/conn_tier_exec_test.go`,
+  `server/conn_lazy_activation_test.go`, `server/s3_cache_test.go`,
+  `controlplane/session_activation_test.go`,
+  `controlplane/worker_profile_test.go`, `controlplane/compute_size_test.go`,
+  AND the `exploratory_tier` / `exploratory_lazy_activation` /
+  `exploratory_state_pin` / `exploratory_oom_escalation` /
+  `org_default_profile` / `sized_worker` (GUC bypass) / `assert_worker_pod`
+  assertions in `tests/mw-dev/e2e/harness.sh`. The harness header above
+  `exploratory_tier` records which existing assertions the tier's connect
+  semantics changed and why — keep that audit current.
+
+## Hot-Idle Pool Reporting + Per-Org Caps (remote backend)
+
+Two operator surfaces for the hot-idle pool, both over the durable runtime
+store (`worker_records`, the only source that sees parked workers — they hold
+no session):
+
+- **Reporting**: `configstore.ListHotIdleByOrg` aggregates `hot_idle` rows
+  per org (count, summed vCPU/memory, oldest park) and
+  `GET /api/v1/workers/hot-idle` (`controlplane/admin/live.go`) joins each
+  org's configured caps. Backs the Workers page "Hot idle by org" card
+  (sortable, default memory-pinned desc). **Worker shape resolution is a
+  three-step chain, everywhere**: the worker's explicit profile wins, else
+  the org's default worker profile, else the CP-global default worker shape
+  (`cfg.K8s.WorkerCPURequest`/`MemoryRequest`, else the 8/16Gi constants) —
+  an unsized worker on a default-less org must never report zero cpu/memory
+  (it pins real pod requests). The same chain backs the fleet rollup
+  (`ListWorkerLifecycleStats`) and the cap sweep's shape math
+  (`orgHotIdleLimitsFromSnapshot`); unparseable quantities still contribute 0.
+- **Caps**: `max_hot_idle_workers` (count), `max_hot_idle_cpu` and
+  `max_hot_idle_memory` (k8s quantity strings, e.g. `"16"` / `"64Gi"`) on
+  `duckgres_orgs` (migration 000037; 0/"" = unlimited). Editable via the
+  admin org PUT + the org detail form. Invariants:
+  - **Enforcement is a convergent janitor sweep** (`reapHotIdleCaps`), NOT a
+    park-time check: on each tick it retires the OLDEST parked workers
+    (oldest-first listing) until the org is within ALL configured limits.
+    This uniformly covers every park path AND cap decreases — lowering a cap
+    drains the excess on the next ticks (config-poll reload, then the 5s
+    janitor tick). Retires go through the fenced `RetireFromSnapshot` CAS
+    with origin `janitor_hot_idle_cap` (a distinct metric origin — a nonzero
+    rate means an operator's cost ceiling is biting, not stale capacity).
+    On a retire error the sweep STOPS that org for the tick (never marches
+    on and over-reaps on a transient failure).
+  - **Cap wins over the floor** (`DefaultWorkerMinHotIdle`): the floor only
+    guards the TTL reaper; the cap is the explicit operator intent. An org
+    with floor > cap is a contradictory config that resolves to the cap.
+  - **Validation is fail-closed on the write path**: a cap quantity that
+    doesn't parse (or is zero/negative) is 400'd by the admin org PUT,
+    because the sweep reads those as UNLIMITED — accepting them would
+    silently mean "no cap".
+  - The sweep runs even when the TTL reaper is disabled (`hotIdleTTL == 0`)
+    — a cap is a hard ceiling, not a freshness rule.
+- Touching any of this → update `tests/configstore/hot_idle_reporting_postgres_test.go`
+  (+ the migration asserts in `migrations_postgres_test.go`),
+  `controlplane/janitor_test.go` (the cap sweep cases +
+  `TestOrgHotIdleLimitsFromSnapshot` glue test),
+  `controlplane/admin/api_test.go` (`TestUpdateOrgHotIdleCaps*`) +
+  `live_test.go` (`TestHotIdleRoute`), `ui/src/pages/Workers.test.tsx` +
+  `OrgDetail.test.tsx`, AND the `/workers/hot-idle` envelope +
+  `hot_idle_reporting_and_cap` assertions in `tests/mw-dev/e2e/harness.sh`.
 
 ## Worker Drain Protocol (graceful shutdown, #690)
 
@@ -317,25 +548,66 @@ release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
 `GetFlightInfo` whose `DoGet` never arrived. `terminationGracePeriodSeconds=3600`
 (`k8s_pool.go`) must stay above `workerShutdownDrainTime` (55m).
 
+## PostHog Logs (OTLP) — LOAD-BEARING CONTRACT
+
+Process-level slog → PostHog Logs via OTLP (`internal/cliboot.InitLogging`).
+This is **not** a replacement for `ducklake.system.query_log`. Product-analytics
+events (`POSTHOG_ANALYTICS_API_KEY`) stay on the capture API.
+
+- **`service.name` is the process role**, not `duckgres-<identifier>`:
+  `duckgres-control-plane` / `duckgres-worker` / `duckgres-reshard` /
+  `duckgres` (standalone). `DUCKGRES_IDENTIFIER` is resource attr
+  `duckgres.deployment`. Logs and traces share `otelResource(bi)`.
+- **Default PostHog level is WARN** (`DUCKGRES_POSTHOG_LOG_LEVEL`); stderr
+  stays at `DUCKGRES_LOG_LEVEL`. User-class `Query execution failed.` stays
+  Info and does not export at the default.
+- **Query text default is `redacted`** (`RedactForLog`+4096). Secret DDL is a
+  placeholder; ordinary SELECT text still leaves. Never redact on `LINE 1:`.
+- **Public connection key is `pid`**, not `connection_id`. Org/worker are
+  process-scoped on workers (`stampWorkerLogIdentity`); `user`/`pid` live on
+  the session logger and must never be `SetDefault`'d.
+- **Worker `POSTHOG_API_KEY` is a named `env:` `secretKeyRef`** copied from
+  the CP pod spec (`controlplane/pod_env.go`, `k8s_pool_spawn.go`). Never
+  `envFrom`. Never `os.Getenv` → `value:`. If Get/`POD_NAME`/named env misses:
+  one WARN and omit — **never fail spawn**. Do not forward
+  `ADDITIONAL_POSTHOG_API_KEYS` or `POSTHOG_ANALYTICS_API_KEY`.
+- **`FlushLogging()`** only on the listed drain `os.Exit` sites (worker
+  success/timeout; CP SIGTERM after drain; `drainAfterUpgrade`). Do not wrap
+  every startup `os.Exit(1)`.
+- **Exporter health** is scraped on the CP:
+  `duckgres_otlp_log_export_failures_total{source,reason}` (no `{org}`).
+  Workers report `otlp_export_enabled` / `otlp_export_failures` on the
+  health-check JSON; the CP `Add`s last-seen **deltas** only. Workers do not
+  call `InitMetrics`.
+- Touching spawn env, health JSON, or the handler stack → update
+  `controlplane/k8s_pool_spawn_test.go`, `controlplane/otlp_export_test.go`,
+  `internal/cliboot/*_test.go`, AND `assert_worker_pod` in
+  `tests/mw-dev/e2e/harness.sh` (plaintext-key assert; secretKeyRef copy when
+  the CP named env has one).
+
 ## Per-Session S3 Cache Bypass (`duckgres.s3_cache`, remote backend)
 
-`SET duckgres.s3_cache = on|off` (default `on`; also a `-c` startup option)
-lets a session bypass the node-local S3 cache-proxy DaemonSet — for cold-read
-benchmarking and ruling the cache out of correctness/staleness questions.
+`SET duckgres.s3_cache = on|off|passthrough` (default `on`; also a `-c`
+startup option) controls the node-local S3 cache-proxy DaemonSet. `off`
+bypasses its cache transport for cold-read benchmarking; `passthrough` keeps
+requests flowing through cache-proxy while skipping its cache, so cache-off
+workloads retain per-request proxy instrumentation.
 Mechanism: the CP intercepts the duckgres-namespaced GUC (never forwarded to
 DuckDB) and, on every state flip, calls the worker's `SetSessionS3Cache`
-action (`flightclient.FlightExecutor.SetS3CacheEnabled` →
-`SessionPool.SetS3CacheEnabled`), which rebuilds the `ducklake_s3` secret:
+action (`flightclient.FlightExecutor.SetS3CacheMode` →
+`SessionPool.SetS3CacheMode`), which rebuilds the `ducklake_s3` secret:
 `off` = the org's native HTTPS transport, so httpfs CONNECT-tunnels through
 the proxy as opaque TLS (no cache reads/fills — the deliberate, reversible
-form of the mw-prod-us 2026-07-17 incident); `on` = the
-`overrideS3EndpointForCacheProxy` transport. Global `http_proxy` is never
-touched (post-attach propagation to DuckLake subcatalogs is unreliable;
-secrets are consulted per request). Instance-global secret + one session per
-worker = session-scoped in effect. Invariants:
+form of the mw-prod-us 2026-07-17 incident); `passthrough` = the same
+`overrideS3EndpointForCacheProxy` transport as `on`, with a worker-local
+marker that makes cache-proxy use `forwardUncached` and strips that marker
+before it reaches S3; `on` = the normal caching transport. Global `http_proxy`
+is never touched (post-attach propagation to DuckLake subcatalogs is
+unreliable; secrets are consulted per request). Instance-global secret + one
+session per worker = session-scoped in effect. Invariants:
 
 - **State follows the worker, never leads it.** The session flag
-  (`clientConn.s3CacheOff`) flips only after the worker swap succeeds; a
+  (`clientConn.s3CacheMode`) flips only after the worker swap succeeds; a
   failed swap fails the SET (`XX000`) / the batch / the connect (startup
   option), so `SHOW` can never report a transport the worker isn't using.
 - **A bypass must never leak into the org's next session.** `CreateSession`
@@ -344,12 +616,21 @@ worker = session-scoped in effect. Invariants:
   best-effort. Both no-op unless a bypass is actually in effect.
 - **Credential rotation respects the flag.** The hot-idle/mid-session refresh
   (`reuseExistingActivation`) rebuilds the secret with or without the proxy
-  transport according to `s3CacheBypassed`; all secret rebuilds serialize on
+  transport according to `s3CacheMode`; all secret rebuilds serialize on
   `secretSwapMu` so the last write always matches the flag. (Without this, an
   hourly STS rotation silently re-enables the cache mid-benchmark — the
   inverse of the 2026-07-17 incident.)
+- **On an exploratory-tier connection the startup option is applied at
+  ACTIVATION, not at connect** (there is no worker at connect). The CP parks it
+  (`SetPendingS3CacheOption`) and `ensureSessionActive` applies it right after
+  installing the executor — never inside the activator, where the executor is
+  still nil and the swap would silently no-op while the session flag flipped. A
+  failed apply is a fatal `XX000` activation failure, and a tier escalation
+  re-applies the bypass on the new worker. `SHOW` activates iff an option is
+  still pending, so it can neither lie nor spend a pod needlessly. See the
+  Exploratory Worker Tier section.
 - **Closed enum, validated on every set path** (`transform.NormalizeS3Cache`):
-  PostgreSQL boolean spellings, normalized to on/off; anything else is `22023`
+  PostgreSQL boolean spellings, normalized to on/off, plus `passthrough`; anything else is `22023`
   (simple/batched SET, extended Parse, and the startup option — which the CP
   validates BEFORE acquiring a worker). The rejection never echoes the value.
 - **Scope: remote/k8s shared-warm workers with a cache proxy.** Elsewhere
@@ -362,6 +643,50 @@ worker = session-scoped in effect. Invariants:
   `tests/mw-dev/e2e/harness.sh` (mw-dev has no cache proxy, so the e2e covers
   the client-visible plumbing incl. the worker action round-trip; the swap
   itself is unit-only — see the harness header note).
+
+## Mid-Session Worker TTL (`duckgres.worker_ttl`, remote backend)
+
+`SET duckgres.worker_ttl = '20m'` / `SHOW` / `RESET` let a client that cannot
+set startup options change its bound worker's pool-side hot-idle TTL
+mid-session (transpiler interception in `transform/setshow.go`, connection
+apply in `server/conn_worker_ttl.go`, control-plane hook
+`controlplane/worker_ttl.go::workerTTLControlFor` → pool
+`SetWorkerTTLForPID`). Full design: `docs/design/worker-ttl-pool.md`.
+Invariants:
+
+- **Same trust boundary as the `duckgres.worker_*` startup options**: gated
+  on `DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE` (SET rejected 22023 when off)
+  and clamped to `DUCKGRES_K8S_WORKER_MAX_TTL`; a clamped value is stored
+  clamped.
+- **State follows the worker, never leads it** (same rule as s3_cache): the
+  session override flips only after the apply hook succeeds, and SHOW falls
+  back to the bound worker's CURRENT pool TTL (`Current`), so SHOW never
+  reports a TTL the worker won't park with.
+- **Whole-minute granularity, enforced at validation.** The parked TTL is
+  persisted as `ttl_minutes` (integer; 0 = "reaper applies the deployment
+  default"), so `NormalizeWorkerTTL` REJECTS zero and sub-minute values with
+  22023 — accepting them would park the worker for the deployment default
+  while SHOW reported the shorter value. (Sub-minute STARTUP options still
+  truncate at park — pre-existing.)
+- **Both reapers read the persisted override** (`ttl_minutes` stamped at the
+  hot→hot_idle park): the leader janitor's expiry query and the per-CP
+  fallback.
+- **Exploratory tier**: SET on a lazily-activated connection acquires a
+  worker first (the TTL is pool-side per-worker state — there is nothing to
+  apply to otherwise); SHOW never acquires (the connect-time baseline is the
+  truthful answer pre-worker). Escalation re-applies the override on the new
+  worker; on failure the override is RESET (statement error, not
+  connection-fatal) — and BOTH session-worker-state re-applies (s3_cache +
+  worker_ttl) always run (an s3 failure must not skip the TTL re-apply).
+- **Describe must cover BOTH 'S' and 'P'** for the intercepted SET/SHOW — a
+  portal-Describe miss returns NoData and probes DuckDB (acquiring a worker
+  on lazy connections) for a GUC it does not know.
+- **Standalone/process backends** accept SET/SHOW as session state only (no
+  per-worker hot-idle TTL exists there).
+- Touching the interception, apply hook, park persistence, or the reapers →
+  update `transpiler/worker_ttl_test.go`, `server/worker_ttl_test.go`,
+  `controlplane/worker_ttl_test.go` + `k8s_pool_worker_ttl_test.go`, AND the
+  `worker_ttl_guc` assertion in `tests/mw-dev/e2e/harness.sh`.
 
 ## User Persistent Secrets (multitenant remote backend)
 
@@ -391,10 +716,9 @@ Invariants for anyone touching this path:
   secret will NOT survive the session. Replay failures at session create are
   warnings, never connection refusals.
 - **No silent non-persistence.** Any path where persistent-secret DDL would
-  execute but not persist must REJECT instead: multi-statement batches and
-  parameterized statements (CP interception), and the Flight SQL ingress
-  (`flightsqlingress.Config.RejectPersistentSecretDDL`). Otherwise the secret
-  works for one session and is silently deleted by the next session's wipe.
+  execute but not persist must REJECT instead, including multi-statement batches
+  and parameterized statements in the control-plane interception path. Otherwise
+  the secret works for one session and is silently deleted by the next session's wipe.
 - **DROP's store-fallback is gated on DuckDB's not-found error only**
   (`isSecretNotFoundError`). Any other exec failure (cancel, RPC error,
   ambiguity, aborted txn) must surface and leave the store untouched — a
@@ -462,6 +786,14 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   panel KEY, PromQL is built server-side from `rangePanels` (never an open PromQL
   relay) and forwarded to `DUCKGRES_PROMETHEUS_URL`. Org-labelled panels keep
   slicing enforced.
+- **Product monitoring API is tenant-safe** (`monitoring.go`):
+  `GET /api/v1/orgs/:id/monitoring/{snapshot,series}` is internal-secret-only
+  for the PostHog backend. It fixes tenant identity from the path, uses only
+  org-scoped runtime-store reads and Prometheus selectors, returns CP coverage
+  for partial live-state fan-out, and strips usernames, PIDs, pod/image names,
+  CP ownership, SQL, client/trace data, and secrets. The series metric and
+  window are closed enums; never turn it into arbitrary PromQL or reuse the
+  operator payloads wholesale.
 - **Env-only knobs**: `DUCKGRES_PROMETHEUS_URL` (read in
   `multitenant.go`; set by the chart). The audit table `duckgres_admin_audit` is
   AutoMigrated at startup (operational state, not goose-migrated tenant config).
@@ -484,15 +816,20 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
 - **Per-user kill switch** (`live.go` routes + `admin_providers.go` +
   `session_mgr.go::DestroySessionsForUser` + `configstore` `disabled` column):
   - `POST …/users/:username/kill` is a **one-shot** terminate — it tears down all
-    of a user's sessions + in-flight queries but does NOT block reconnects.
+    of a user's sessions + in-flight queries but does NOT block reconnects. It
+    reaches only connections that HAVE a session: on the exploratory worker tier
+    a connection that authenticated but has not yet run its first statement has
+    no session (and no registered conn-closer) for `DestroySessionsForUser` to
+    iterate, so `kill` misses it. Only `disable` covers that connection — its
+    first statement's activation re-check refuses the session with 28000.
+    Extending `kill` to authed-but-unactivated connections is a follow-up.
   - `POST …/users/:username/disable` is the **persistent block**: it sets the
     `duckgres_org_users.disabled` column (goose migration
     `000011_add_org_user_disabled.sql`), kills the user's live sessions, AND
-    refuses the user's NEW connections at auth time on BOTH front-ends — PG wire
-    (`control.go`, distinct `28000` "account is disabled" error, emitted only
-    after the password checks out so it never leaks account existence) and Flight
-    (`ConfigStore.ValidateOrgUser` / `ValidateOrgUserAndGetPassthrough` return
-    false). `enable` reverses it. The disabled state is read from the in-memory
+    refuses the user's NEW pgwire connections at auth time (`control.go`,
+    distinct `28000` "account is disabled" error, emitted only after the
+    password checks out so it never leaks account existence). `enable` reverses
+    it. The disabled state is read from the in-memory
     snapshot, so disable/enable call `ConfigStore.ReloadSnapshot()` to make the
     flip effective immediately instead of one config-poll later.
   - These are **cluster-wide**: a user's sessions live on whichever CP replica
@@ -577,7 +914,7 @@ Invariants:
   missing or disabled gets an empty, `ReadOnly` policy — a project user is
   DOWNGRADED, never left writing into a scope nothing can confirm.
 - **`QueryAccessPolicy.Authorize` (`server/query_access.go`) is the single tap**,
-  called on simple query, extended Parse, and both Flight paths. It is
+  called on simple query and extended Parse. It is
   default-deny: the parser is the authorization boundary, so anything
   `pg_query` cannot describe is rejected (this is why DuckDB-only spellings
   fail). `CREATE SCHEMA` / `ALTER … SET SCHEMA` stay denied: the schema set IS
@@ -608,6 +945,12 @@ Invariants:
 - **One of each per team**, via two SEPARATE partial unique indexes on
   `(org_id, team_id)` — deliberately not one index across both modes, so a
   reader and a writer coexist.
+- **Service credentials are NOT project-scoped and never touch
+  `duckgres_org_users`.** `POST /api/v1/orgs/:id/service-credentials` is how a
+  PostHog backend job (dagster) fetches a short-lived credential: a
+  per-credential grant row with its own `svc_` identity, root-shaped
+  (unrestricted) at the org level. See "Service Credentials" below for the
+  full contract.
 - Touching any of this → update `server/query_access_test.go`,
   `controlplane/configstore/query_access_test.go`,
   `controlplane/admin/api_test.go`, `controlplane/org_router_test.go`,
@@ -615,6 +958,125 @@ Invariants:
   `migrations_postgres_test.go`, `docs/postgres-compatibility.md`, AND the
   `project_reader_isolation` / `project_user_isolation` assertions in
   `tests/mw-dev/e2e/harness.sh`.
+
+## Service Credentials (`POST /orgs/:id/service-credentials`) — LOAD-BEARING CONTRACT
+
+How PostHog backend jobs (dagster today) authenticate to duckgres WITHOUT a
+long-lived password living in Django. Replaces the org-root credential read
+from a `DuckgresServer` row with a per-credential grant minted on demand by
+the CP — AWS AccessKey/Secret style: each minted credential is its own
+`duckgres_service_grants` row with its OWN identity (`credential_id`), its
+own TTL, and its own rotation clock. Storage NEVER touches
+`duckgres_org_users` — there is no shared login row for an operator rotation
+or password update to clobber mid-run, and service credentials are not
+project-scoped (root-shaped: unrestricted at the org level).
+
+**Caller contract:**
+`POST /api/v1/orgs/:id/service-credentials` with
+`{principal, ttl_seconds?}`. `principal` is audit attribution
+(`"dagster:events-backfill"`) only: every request creates an independent grant
+with a new `credential_id` and secret, even when principals are identical.
+`ttl_seconds` is clamped to [1 min, 1 h]
+(default 15 min, the RDS-IAM precedent). Response is
+`{credential_id, credential_secret, expires_at, connect}`; all fields are
+always present. `POST /api/v1/orgs/:id/service-credentials/refresh` with
+`{credential_id, ttl_seconds?}` **ALWAYS rotates** the named grant's secret
+and returns `{credential_id, credential_secret, expires_at, connect}`.
+The caller is the internal-secret-authed PostHog backend — the routes sit
+next to the other provisioning routes for exactly that trust class, NOT on
+the admin/console side.
+
+The `connect` block tells the caller WHERE to use the credential from the same
+authoritative CP response that issued it, so nothing downstream re-derives its
+own idea of the warehouse endpoint out of band (a Django `DuckgresServer` row
+is exactly the drift this kills). It is
+`{host, port: 5432, database: "ducklake", sslmode: "require"}`.
+**`connect.host` is ALWAYS the org's canonical ingress name
+`<org-id>` + the CP's configured managed-ingress suffix** (e.g.
+`<org-id>.dw.us.postwh.com`) — the very value the pgwire TLS `server_name`
+pins (the wildcard cert is `*<suffix>` and the SNI router resolves the
+single-label prefix as the org; see "Native metadata Postgres proxy" /
+`controlplane/sni_kubernetes.go`). It is one logical name handed back verbatim
+for every caller: NEVER a pod IP, NEVER a ClusterIP, NEVER resolved per caller
+network. How that name resolves for a given caller — public ingress vs an AWS
+PrivateLink endpoint for dagster workers — is the caller network's business,
+not the CP's. The CP wires the suffix from its first configured
+`ManagedHostnameSuffixes` entry (`DUCKGRES_MANAGED_HOSTNAME_SUFFIXES`) at the
+`RegisterAPI` site (`controlplane/multitenant.go`), falling back to
+`provisioning.DefaultManagedIngressSuffix` when unwired.
+
+**The load-bearing invariants:**
+- **The credential IS its own grant row.** `credential_id` is
+  `svc_<24 random hex>`, generated server-side, never caller-supplied; the
+  client presents it as the pgwire username and the plaintext secret as the
+  password. The bcrypt hash lives on the `duckgres_service_grants` row —
+  `duckgres_org_users` holds NO service-credential material, so operator
+  writes to the org's users table can never invalidate (or be depended on by)
+  a minted credential.
+- **Auth resolves `svc_`-prefixed usernames against the grants snapshot map
+  ONLY** (`Snapshot.OrgServiceGrant`, loaded alongside `OrgUserPassword`).
+  Expiry and revocation are enforced at that lookup: unknown, revoked,
+  expired, and hash-blanked credentials all fail identically (with equalized
+  bcrypt time — which state a credential_id is in is not probeable). A live
+  grant is `revoked_at IS NULL AND expires_at > now()`.
+- **Mint always creates.** `principal` is non-unique audit metadata, never an
+  identity or reuse key. Every mint inserts a new row, returns its new ID and
+  plaintext once, and leaves every same-principal credential untouched. This
+  lets concurrent jobs keep a stable principal without sharing secrets.
+- **Management is by `credential_id`.** A caller keeps the ID returned by its
+  mint and supplies it to refresh/revoke. Losing the plaintext means minting a
+  new credential; plaintext cannot be recovered from the stored bcrypt hash.
+  New Duckgres servers ignore the removed `force_rotate` JSON field so an old
+  caller can still reach the always-create endpoint, but that compatibility
+  is one-way: deploy the always-create Duckgres version to the whole fleet
+  BEFORE removing PostHog's `force_rotate`/reuse fallback. A new caller talking
+  to an old server could otherwise receive a reused ID without plaintext.
+- **Refresh always rotates and never creates.** Unknown `credential_id` →
+  404; a REVOKED grant → 410 (revocation is terminal: refresh never
+  resurrects). An EXPIRED (but unrevoked)
+  grant MAY be refreshed — expiry only refuses NEW handshakes, so refresh is
+  how a caller that missed the window recovers without minting a second
+  identity for the same principal.
+- **Established sessions are NEVER torn down** — not on expiry, not on
+  rotation, not on refresh (the mint plane is separate from connection
+  scheduling). Freshness is enforced only at the pgwire handshake — the
+  RDS-IAM / Cloud-SQL-IAM contract. A long job's existing connection rides
+  to completion; each NEW connection mints or refreshes afresh.
+- **Revoke keeps the row** (`DELETE /api/v1/orgs/:id/service-grants/:credential_id`):
+  `revoked_at` is stamped and the hash is BLANKED server-side, so a leaked
+  credential can never authenticate again and the provenance (principal,
+  mint/rotation times) survives for investigation. `GET
+  /api/v1/orgs/:id/service-grants` is the flat, all-statuses list — no
+  plaintext, no hashes (`PasswordHash` is `json:"-"`). Durable history is
+  intentional because expired, unrevoked IDs remain refreshable and audit
+  provenance must survive; do not add expiry deletion. If grant volume makes
+  the operator list expensive, add pagination/archival as a separate API
+  change rather than weakening lifecycle semantics.
+- **Org deletion deletes all of that org's grant rows.** This is the explicit
+  lifecycle boundary to the normal durable-history rule: leaving a grant
+  behind would let its old secret authenticate if the org name were reused.
+  Org creation takes the same advisory lock and clears pre-existing orphan
+  grants only when the locked lookup confirms no current org row; duplicate
+  creation and re-provisioning an existing org must preserve live grants.
+- **Concurrency**: each mint owns a new row. Mint/refresh/revoke still take
+  `LockOrgConnectionAdmissionTx` so org lifecycle changes cannot leave orphan
+  grants and management of a named ID remains serialized.
+- **Admission recognizes authenticated `svc_` identities as root-shaped.**
+  They consume the org vCPU budget but do not require an org-user row or carry
+  a normal per-user cap. Admission and post-acquisition worker switching do
+  not reapply expiry/revocation: those are handshake-only checks, so an
+  established session rides to completion.
+- **After the write, THIS replica's snapshot is reloaded immediately**
+  (`ReloadSnapshot`), then a best-effort `/api/v1/internal/reload-snapshot`
+  fan-out to peer replicas (`PeerFanout`, wired from the same
+  `clusterPeerFetcher` the admin kill-switch uses). Without both, a freshly
+  minted credential routinely fails its first auth on whichever replica the
+  pgwire connection lands on.
+- Touching any of this → update `controlplane/provisioning/service_credential.go` +
+  `_test.go`, `controlplane/configstore/service_credential.go` +
+  `_postgres_test.go`, `controlplane/admin/api.go` (list/revoke), and the
+  caller-side minter in the PostHog repo
+  (`products/managed_warehouse/backend/service_credentials.py`).
 
 ## Compute-Usage Billing (managed-warehouse, remote backend only)
 
@@ -737,14 +1199,45 @@ touching this path:
   disable, direct RDS → require). Drift gauges:
   `duckgres_org_storage_pending_delete_files` (alert on sustained nonzero) +
   `duckgres_org_storage_tracked_bytes`.
+- **The admin console usage views read the SAME buffer** —
+  `GET /api/v1/usage/monthly` (the **Usage** page) and
+  `GET /api/v1/orgs/:id/usage/daily` (the org detail page's **Usage** charts)
+  in `controlplane/admin/usage_api.go`, backed by
+  `configstore.Aggregate{Compute,Storage}Usage{Monthly,Daily}`, sum retained
+  buckets per UTC month / per UTC day per (org, team), merging the compute and
+  storage families and joining the team schema name for display. Both
+  self-gate with `RequireAdmin` (per-team cost data across all orgs is as
+  sensitive as the raw billing families — viewers get 403, and the UI hides
+  the nav item / fires no query for them). The daily endpoint's org scope is
+  the `:id` path segment flowing into the queries' WHERE clause — one org's
+  usage must never leak into another org's page (the e2e asserts
+  `.org_id == $o` on the response). These are operations views, NOT invoices:
+  acked buckets are already deleted and >30d buckets are
+  GC'd, so responses carry the ack cursor as `watermark_low` and the UI
+  shows the retention caveat instead of implying all-time totals. They add NO
+  second accounting pipeline — keep them pure reads over the buffer.
+  The Usage page also carries a **client-side pricing-sensitivity calculator**
+  (`ui/src/pages/UsagePricing.tsx` + `lib/pricing.ts`): named unit-price
+  scenarios ($/CPU-min, $/GiB·min, $/GiB·h) priced against each org's month
+  totals. It is pure browser math over the monthly rows — no endpoint, no
+  persistence beyond the operator's own localStorage — so it inherits the
+  page's admin-only gate and needs no server-side access control of its own
+  (a PM gets it by holding the console admin role; a lighter pricing-viewer
+  role is a named follow-up, not implemented).
 - Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
   the storage sampler, or the bucket keys → update
   `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,
   `compute_size_test.go`, `storage_meter_test.go`,
   `configstore/storage_usage_test.go`, the migration assertion in
   `tests/configstore/migrations_postgres_test.go`, and the
-  `compute_usage_pull_api` assertion (compute + storage) in
-  `tests/mw-dev/e2e/harness.sh`.
+  `compute_usage_pull_api` assertion (compute + storage, incl. the
+  `usage-monthly` checks) in
+  `tests/mw-dev/e2e/harness.sh`. Touching the monthly/daily aggregation or
+  the usage views → update `controlplane/admin/usage_api_test.go`,
+  `tests/configstore/usage_monthly_postgres_test.go` +
+  `usage_daily_postgres_test.go`,
+  `ui/src/pages/Usage.test.tsx` + `OrgUsage.test.tsx`, and the
+  `usage-monthly` / `usage-daily` harness checks.
 
 ## Discovery Endpoints (external-writer tenant listing)
 
@@ -852,8 +1345,7 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
 - **Drain, never kill**: live queries always finish. Drain = leases==0 AND
   queue==0 (one tx) AND zero live org workers (each runs a catalog-writing
   `DuckLakeCheckpointer`). Lingering hot-idle workers are retired via the
-  standard CAS retire path only — never raw pod deletes. Parked reconnectable
-  Flight sessions are destroyed locally per CP (they'd hold leases ~1h).
+  standard CAS retire path only — never raw pod deletes.
 - **Flip semantics differ by direction**: a `cnpgShard` change re-points
   role/DB in place (source ORPHANED — explicit cleanup after verify); a TYPE
   flip to external un-renders the cnpg MRs, and whether Crossplane then DELETES
@@ -1011,6 +1503,112 @@ entrypoint), `controlplane/reshard_pod.go` (spawner) +
   `charts/charts/crossplane-config/tests/composition_retain_cnpg_test.sh`.
   cnpg→ext positive path is unit-only (harness lacks the RDS password);
   cnpg→cnpg positive path needs a second mw-dev shard (follow-up).
+
+## Trino Cells (customer-facing SQL over DuckLake, `kubernetes` tag)
+
+An org enabled for Trino gets a catalog, a login, authorization and resource
+limits on a shared multi-tenant Trino cluster called a **cell**. The control
+plane is the only writer of that state: `provisioner/trino_provisioner.go`
+projects it every controller tick from `duckgres_managed_warehouse_trino` +
+the org's warehouse row + its Duckling CR. Enablement is env-inferred —
+`DUCKGRES_TRINO_COORDINATOR_URL` set means on (`controlplane/trino_inputs.go`);
+unset means the branch never wires and nothing changes. **Trino is binary: if
+you asked for it, a wiring failure is fatal at startup**, because silently
+skipping leaves the cell's OPA sidecar serving a last-good bundle while
+password/tenant/catalog changes never propagate.
+
+- **The catalog is DuckLake and carries NO secret.** Per org:
+  `connector.name=ducklake`, `ducklake.metadata.connection-url` (a JDBC URL
+  whose `sslmode` follows the store kind — `disable` for in-cluster
+  `cnpg-shard`, `require` for `external` and any future kind),
+  `ducklake.metadata.connection-user`,
+  **`ducklake.metadata.connection-password-file`**, `ducklake.data-path`,
+  `fs.s3.enabled` (NOT `fs.native-s3.enabled` — that spelling was rejected at
+  CREATE CATALOG and cost a release), `s3.region`, `s3.auth-type=IAM_ROLE`,
+  `s3.iam-role` (the per-org duckling role: the tenant S3 boundary), and a
+  small `s3.max-connections`. Every value comes from the `ManagedWarehouse`
+  row's `metadata_store_*` / `s3_*` / `worker_identity_*` blocks. **Trino logs
+  the full `CREATE CATALOG` statement, renders catalog properties in its web
+  UI, and ships them to workers — a password in a property is readable by
+  anyone who can see a query listing.** Hence the file indirection; never add
+  `ducklake.metadata.connection-password`.
+- **Tenant passwords live in one Secret, keyed by org id**
+  (`TrinoTenantSecretName`, mounted at `TenantSecretMountPath`). The value is
+  read from the org's Duckling CR status (`credentialSecretRef`) through the
+  SAME resolver the worker activation path uses, so Trino and the DuckDB
+  workers can never authenticate a tenant's metadata store with two different
+  credentials. The projection is AUTHORITATIVE, not additive: a disabled org's
+  key is removed on the next tick.
+- **`Reconcile` order is load-bearing**: cluster secrets → auth files →
+  resource groups → OPA bundle → tenant passwords → catalogs, and the
+  `globalErr` gate SKIPS the catalog step if any projection failed. A
+  coordinator that just lost its `password.db` keys 401s every catalog REST
+  call, which would surface as a misleading "catalog reconcile failed" masking
+  the real problem.
+- **`ensureClusterSecrets` is write-once with a sentinel.** The K8s Secret is
+  the source of truth for each cluster credential; the configstore holds only
+  a one-bit `duckgres_trino_cluster_bootstrap` row per namespace. Missing
+  Secret + not bootstrapped ⇒ generate; missing Secret + already bootstrapped
+  ⇒ **fail loud**, because regenerating the env-projected
+  internal-communication shared secret would split-brain a running cluster.
+  The admin password/hash pair is the deliberate exception (no external
+  consumer ⇒ regenerate-if-missing self-heals).
+- **Catalog reconcile is `SHOW CATALOGS` first**: create only what's missing,
+  drop only names matching `opa.ManagedCatalogPattern` that aren't wanted, so
+  `system`, `jmx` and hand-made catalogs survive. An org whose password is
+  momentarily unresolvable keeps its existing catalog (never dropped) but is
+  NOT reported ready.
+- **Catalog naming is a THREE-way contract**: `TrinoCatalogName` (`org_` +
+  sanitized org id, no `_iceberg` suffix — warehouses are DuckLake),
+  `opa.ManagedCatalogPattern`, and the regex literal inside `policy.rego`.
+  `TestTrinoCatalogNameMatchesManagedNamePattern` +
+  `TestPolicyRegoContainsManagedNamePattern` fail if any one moves alone.
+- **The Rego policy is the tenant-isolation boundary.** The cell can assume
+  every per-org duckling role, so nothing below OPA stops org A reading org
+  B's catalog. Treat `provisioner/opa/policy.rego` as security review.
+  **Query visibility is same-org only**: `ViewQueryOwnedBy`,
+  `FilterViewQueryOwnedBy` and `KillQueryOwnedBy` (the plugin's exact
+  operation strings — the filter one is NOT `FilterViewQuery`) are allowed
+  only when the requester and the query OWNER share a bundle-known
+  `org_<sanitized>` group, derived from the same `data.group_catalogs`
+  ownership map every other decision uses. This matters because
+  `ExecuteQuery` is unconditionally allowed, so without it org A reads org
+  B's SQL text — table names, filter literals, customer identifiers — via
+  `system.runtime.queries` and the web UI, and can kill B's queries. The
+  owner arrives as `input.action.resource.user.{user,groups}` (an
+  `@JsonUnwrapped` `TrinoIdentity`); `ImpersonateUser` uses a different,
+  groups-less shape for the same field — do not conflate them. **The admin
+  principal deliberately gets NO cross-tenant query visibility** (only its
+  own queries): the reconcile loop issues only `SHOW`/`CREATE`/`DROP
+  CATALOG` and never reads `system.runtime.queries`, so the grant would buy
+  nothing and leak every tenant's SQL. `opa.policy.batched-uri` must NOT be
+  enabled without extending the policy — the batched input shape fails every
+  filter rule closed.
+- **Resource groups must keep the `root.admin.__admin_provisioner` selector.**
+  Trino rejects a query matching no resource group, so dropping it silently
+  breaks every reconcile tick's own DDL.
+- **Cells, minimally**: `trino_cell_id` on the row names the owning cell
+  (`DUCKGRES_TRINO_CELL_ID`, default `configstore.DefaultTrinoCellID`). A
+  provisioner claims unassigned orgs (`AssignTrinoCell`, conditional in SQL so
+  no cell can steal another's tenant), reconciles its own, and ignores the
+  rest — including writing NO state for them. There is exactly ONE cell today
+  and deliberately no assignment policy, capacity model, rebalancer or cell
+  drain; `resolveTrinoCell` becoming `resolveTrinoCells` is the whole shape of
+  adding a second.
+- **The bundle endpoint is mounted OUTSIDE `/api/v1`** (`/bundles/trino`) with
+  its own bearer auth, and `buildTrinoWiring` bootstraps SYNCHRONOUSLY so the
+  handler is constructed with the real token — there is no window where it
+  serves under a placeholder.
+- Touching any of this → update `provisioner/trino_provisioner_test.go`,
+  `provisioner/trino_cluster_secrets_test.go`, `provisioner/opa/*_test.go`,
+  `provisioning/api_test.go`, `tests/configstore/trino_postgres_test.go` +
+  `trino_cluster_secrets_test.go`, and the migration asserts in
+  `tests/configstore/migrations_postgres_test.go`. **There is no
+  `tests/mw-dev/e2e/harness.sh` coverage yet**, and that is a stated gap, not
+  an oversight: mw-dev runs no Trino cell, so there is nothing for the
+  in-cluster Job to talk to. The harness assertion (enable an org, poll the
+  row to `ready`, query the catalog as the org's `root`) lands with the chart
+  that deploys the cell.
 
 ## TODO Reference
 

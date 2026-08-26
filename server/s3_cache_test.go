@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -12,13 +13,49 @@ import (
 // S3CacheControl capability, recording the worker swap calls the conn issues.
 type s3CacheRecordingExecutor struct {
 	selectOneExecutor
-	calls []bool
-	err   error
+	calls     []bool
+	execCalls []string
+	err       error
+	// onSwap/onQuery let a test observe the ORDER of the worker swap relative
+	// to query execution (used by the lazy-activation ordering tests, where the
+	// swap must land before the first user query).
+	onSwap  func(enabled bool)
+	onQuery func()
+}
+
+// s3CacheModeRecordingExecutor also records the three-state cache mode RPC.
+// Production remote executors implement this capability so passthrough can
+// retain cache-proxy request instrumentation without using its cache.
+type s3CacheModeRecordingExecutor struct {
+	s3CacheRecordingExecutor
+	modeCalls []string
+}
+
+func (e *s3CacheModeRecordingExecutor) SetS3CacheMode(_ context.Context, mode string) error {
+	e.modeCalls = append(e.modeCalls, mode)
+	return e.err
 }
 
 func (e *s3CacheRecordingExecutor) SetS3CacheEnabled(_ context.Context, enabled bool) error {
 	e.calls = append(e.calls, enabled)
+	if e.onSwap != nil {
+		e.onSwap(enabled)
+	}
 	return e.err
+}
+
+// ExecContext records the non-result statements the connection sent, so a test
+// can assert that a statement whose escalation failed never reached the worker.
+func (e *s3CacheRecordingExecutor) ExecContext(ctx context.Context, query string, args ...any) (ExecResult, error) {
+	e.execCalls = append(e.execCalls, query)
+	return e.selectOneExecutor.ExecContext(ctx, query, args...)
+}
+
+func (e *s3CacheRecordingExecutor) QueryContext(ctx context.Context, query string, args ...any) (RowSet, error) {
+	if e.onQuery != nil {
+		e.onQuery()
+	}
+	return e.selectOneExecutor.QueryContext(ctx, query, args...)
 }
 
 // TestS3CacheSimpleSetAppliesToExecutor asserts the core contract of the SET
@@ -76,6 +113,36 @@ func TestS3CacheSimpleSetAppliesToExecutor(t *testing.T) {
 	}
 	if !c.S3CacheEnabled() {
 		t.Fatalf("S3CacheEnabled() = false after RESET, want true")
+	}
+}
+
+func TestS3CachePassthroughAppliesModeAndReportsIt(t *testing.T) {
+	exec := &s3CacheModeRecordingExecutor{}
+	c, out := newBufferedConn(exec)
+
+	if err := c.handleQuery([]byte("SET duckgres.s3_cache = passthrough\x00")); err != nil {
+		t.Fatalf("handleQuery(SET passthrough): %v", err)
+	}
+	if got, want := exec.modeCalls, []string{"passthrough"}; !slices.Equal(got, want) {
+		t.Fatalf("mode calls = %v, want %v", got, want)
+	}
+
+	out.Reset()
+	if err := c.handleQuery([]byte("SHOW duckgres.s3_cache\x00")); err != nil {
+		t.Fatalf("handleQuery(SHOW): %v", err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("passthrough")) {
+		t.Fatalf("SHOW duckgres.s3_cache did not report passthrough: %s", describeMsgs(parseWireMsgs(t, out.Bytes())))
+	}
+
+	if err := c.handleQuery([]byte("RESET duckgres.s3_cache\x00")); err != nil {
+		t.Fatalf("handleQuery(RESET): %v", err)
+	}
+	if got, want := exec.calls, []bool{true}; !slices.Equal(got, want) {
+		t.Fatalf("boolean calls after RESET = %v, want %v", got, want)
+	}
+	if got := c.s3CacheValue(); got != "on" {
+		t.Fatalf("s3CacheValue after RESET = %q, want on", got)
 	}
 }
 
@@ -381,5 +448,74 @@ func TestS3CacheExtendedParse(t *testing.T) {
 	}
 	if c.S3CacheEnabled() {
 		t.Fatalf("S3CacheEnabled() = true after extended SET off, want false")
+	}
+}
+
+// TestS3CacheReappliedOnWorkerEscalation asserts that a session that bypassed
+// the cache carries the bypass onto the worker it escalates to. The bypass is
+// worker-side state and the new session starts on the cache proxy, so without
+// the re-apply an `s3_cache=off` connection would silently start reading
+// cached the moment it escalated off the exploratory worker.
+func TestS3CacheReappliedOnWorkerEscalation(t *testing.T) {
+	small := &s3CacheRecordingExecutor{}
+	c, _ := newBufferedConn(small)
+	if err := c.handleQuery([]byte("SET duckgres.s3_cache = off\x00")); err != nil {
+		t.Fatalf("handleQuery(SET off): %v", err)
+	}
+
+	big := &s3CacheRecordingExecutor{}
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return big, 7, "worker-7", nil
+	}
+	if err := c.escalateWorker(context.Background(), escalateReasonState); err != nil {
+		t.Fatalf("escalateWorker: %v", err)
+	}
+	if len(big.calls) != 1 || big.calls[0] != false {
+		t.Fatalf("new worker swap calls = %v, want [false]", big.calls)
+	}
+	if c.S3CacheEnabled() {
+		t.Fatalf("S3CacheEnabled() = true after escalation, want false (bypass preserved)")
+	}
+}
+
+// TestS3CacheEscalationFailureDoesNotLieAboutTransport asserts that when the
+// bypass cannot be re-applied on the new worker, the statement fails AND the
+// session state is reset to match the transport the worker is actually in —
+// SHOW must never report a transport the worker isn't using. It also pins the
+// SEVERITY of that failure: the ESCALATION succeeded (the connection has a
+// healthy session on the standard worker), so the error is tagged
+// errS3CacheReapplyFailed — the one escalateWorker failure that is NOT
+// connection-fatal — and the pin is deliberately not rolled back.
+func TestS3CacheEscalationFailureDoesNotLieAboutTransport(t *testing.T) {
+	small := &s3CacheRecordingExecutor{}
+	c, _ := newBufferedConn(small)
+	if err := c.handleQuery([]byte("SET duckgres.s3_cache = off\x00")); err != nil {
+		t.Fatalf("handleQuery(SET off): %v", err)
+	}
+
+	big := &s3CacheRecordingExecutor{err: errors.New("secret swap failed")}
+	c.onExploratoryWorker = true
+	c.workerSwitcher = func(context.Context, string) (QueryExecutor, int, string, error) {
+		return big, 7, "worker-7", nil
+	}
+	err := c.escalateWorker(context.Background(), escalateReasonState)
+	if err == nil {
+		t.Fatal("escalateWorker returned nil, want the re-apply failure")
+	}
+	if !errors.Is(err, errS3CacheReapplyFailed) {
+		t.Fatalf("error %v is not tagged errS3CacheReapplyFailed; callers would terminate the connection", err)
+	}
+	if !strings.Contains(err.Error(), "duckgres.s3_cache") {
+		t.Fatalf("error %q does not name the GUC", err)
+	}
+	if !c.S3CacheEnabled() {
+		t.Fatal("S3CacheEnabled() = false after a failed re-apply; state must match the worker's actual transport")
+	}
+	if c.onExploratoryWorker {
+		t.Fatal("onExploratoryWorker = true after a failed re-apply; the escalation itself SUCCEEDED and must not be rolled back")
+	}
+	if c.executor != QueryExecutor(big) {
+		t.Fatal("executor is not the escalated worker; the swap succeeded and must stand")
 	}
 }

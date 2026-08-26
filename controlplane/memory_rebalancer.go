@@ -55,7 +55,7 @@ type MemoryRebalancer struct {
 
 // NewMemoryRebalancer creates a rebalancer with the given budgets.
 // If memoryBudget is 0, it defaults to 75% of system RAM.
-// If threadBudget is 0, it defaults to runtime.NumCPU().
+// If threadBudget is 0, it defaults to 2.5x runtime.NumCPU(), rounded up.
 // If enabled is false, RequestRebalance is a no-op and sessions only get
 // their limits set once at creation time.
 func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions SessionLister, enabled bool) *MemoryRebalancer {
@@ -68,7 +68,7 @@ func NewMemoryRebalancer(memoryBudget uint64, threadBudget int, sessions Session
 		}
 	}
 	if threadBudget == 0 {
-		threadBudget = runtime.NumCPU()
+		threadBudget = server.DefaultDuckDBThreads(int64(runtime.NumCPU()) * 1000)
 	}
 
 	r := &MemoryRebalancer{

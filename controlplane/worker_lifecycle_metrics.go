@@ -47,6 +47,12 @@ const (
 	LifecycleOriginJanitorOrphan           LifecycleOrigin = "janitor_orphan"
 	LifecycleOriginJanitorHotIdleTTL       LifecycleOrigin = "janitor_hot_idle_ttl"
 	LifecycleOriginJanitorStuckActivating  LifecycleOrigin = "janitor_stuck_activating"
+	// LifecycleOriginJanitorHotIdleCap marks the janitor's hot-idle cap sweep
+	// (reapHotIdleCaps) retiring the oldest parked workers of an org past its
+	// configured max_hot_idle_* limits. Distinct from the TTL reaper: a
+	// nonzero rate here means an operator's cost ceiling is biting, not that
+	// warm capacity went stale.
+	LifecycleOriginJanitorHotIdleCap LifecycleOrigin = "janitor_hot_idle_cap"
 	LifecycleOriginMismatchedVersionReaper LifecycleOrigin = "mismatched_version_reaper"
 	LifecycleOriginShutdownAll             LifecycleOrigin = "shutdown_all"
 	// LifecycleOriginDrainReleaseIdle marks the hot -> hot_idle park performed
@@ -73,7 +79,7 @@ const (
 	LifecycleOriginPublicAPI LifecycleOrigin = "public_api"
 	// LifecycleOriginActivationFailure marks retire paths fired after a
 	// worker activation returned an error (org pool's
-	// activateWorkerForOrg / ReconnectFlightWorker).
+	// activateWorkerForOrg).
 	LifecycleOriginActivationFailure LifecycleOrigin = "activation_failure"
 	// LifecycleOriginCrashGeneric marks retire paths driven by a generic
 	// "worker died" signal that isn't covered by a more specific origin

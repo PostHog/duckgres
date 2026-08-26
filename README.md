@@ -81,7 +81,6 @@ labels, aggregation rules, PromQL examples, and admission metric migration.
 | `duckgres_auth_failures_total` | Counter | Process-wide authentication failures, including wrong-password metadata-proxy attempts; use `duckgres_metadata_proxy_connection_attempts_total{outcome="auth_failed"}` for the proxy-specific split |
 | `duckgres_rate_limit_rejects_total` | Counter | Process-wide pre-TLS connection rejections due to rate limiting; these cannot be attributed to the worker or metadata endpoint because SNI is not available yet |
 | `duckgres_rate_limited_ips` | Gauge | Number of currently rate-limited IP addresses |
-| `duckgres_flight_auth_sessions_active` | Gauge | Number of active Flight auth sessions on the control plane |
 | `duckgres_control_plane_workers_active` | Gauge | Number of active control-plane worker processes |
 | `duckgres_control_plane_worker_acquire_seconds` | Histogram | Time spent acquiring a worker for a new session |
 | `duckgres_control_plane_worker_queue_depth` | Gauge | Approximate number of session requests waiting on worker acquisition |
@@ -100,10 +99,6 @@ labels, aggregation rules, PromQL examples, and admission metric migration.
 | `duckgres_session_admission_reclaim_reservation_rejections_total{reason}` | Counter | Reservations rejected because capacity was `full`, the reclaimer was `closed`, or the exact reference was a `duplicate` |
 | `duckgres_session_start_duration_seconds{org,protocol,outcome}` | Histogram | Authenticated PostgreSQL session bootstrap through flushed `ReadyForQuery` |
 | `duckgres_postgres_session_start_total{org,outcome,reason}` | Counter | Exactly one terminal result per authenticated PostgreSQL session start after server retries; `outcome` is `success\|failure` and bounded reasons distinguish operator-actionable failures from client/lifecycle noise |
-| `duckgres_flight_rpc_duration_seconds{method}` | Histogram | Flight ingress RPC duration by method |
-| `duckgres_flight_ingress_sessions_total{outcome}` | Counter | Flight ingress session outcomes (`created|reused|auth_failed|rate_limited|create_failed|token_invalid`) |
-| `duckgres_flight_sessions_reaped_total{trigger}` | Counter | Number of Flight auth sessions reaped (`trigger=periodic|forced`) |
-| `duckgres_flight_max_workers_retry_total{outcome}` | Counter | Max-worker retry outcomes for Flight session creation (`outcome=attempted|succeeded|failed`) |
 
 ### Testing Metrics
 
@@ -232,12 +227,35 @@ column cannot be added to a populated table).
 ## Runbooks
 
 - [Worker Upgrades & Canaries](docs/runbooks/worker-upgrades.md): Process for upgrading DuckDB/DuckLake versions, canarying builds for a subset of tenants, and global version management.
+- [Node-local Cache Proxy Bypass](docs/runbooks/cache-proxy-bypass.md): Fail-open cache behavior, detection, and recovery.
 - [Performance Harness](docs/perf-harness-runbook.md): Local smoke and nightly operations for performance testing.
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
+- [Managed Warehouse Provisioning Recovery](docs/runbooks/managed-warehouse-provisioning-recovery.md): Diagnose a failed warehouse whose Duckling dependencies were repaired and verify automatic convergence back to ready.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
+
+Managed-warehouse backend jobs mint service credentials with `POST
+/api/v1/orgs/:id/service-credentials`. Every mint creates a new
+`credential_id` and secret; `principal` is audit metadata only, so concurrent
+jobs may use the same value safely. `ttl_seconds` defaults to 900 seconds and
+is clamped to 60–3600 seconds. Refresh targets one credential explicitly with
+`POST /api/v1/orgs/:id/service-credentials/refresh` and a `credential_id`.
+Expiry and revocation block new pgwire handshakes but do not terminate an
+already-authenticated session. If a caller loses a secret, mint a new
+credential; Duckgres stores only bcrypt hashes and cannot recover plaintext.
+Successful mints put `principal: <submitted-principal>` in the admin audit
+entry's detail column; credential IDs and secrets are never included there. A
+machine-readable `credential_minted` audit outcome records that the grant row
+landed, so a later snapshot-reload failure is still shown as a successful mint
+while requests that fail before the durable write are shown as failed.
+For a rolling contract change, deploy the always-create Duckgres version to
+the entire fleet before removing the caller's legacy `force_rotate`/reuse
+fallback. New servers ignore the old field, but a new caller reaching an old
+server could still receive a reused credential without plaintext. Org
+deletion permanently removes its service-grant rows so an old secret cannot
+become valid if that org name is created again.
 
 ## Quick Start
 
@@ -284,6 +302,22 @@ Duckgres supports three configuration methods (in order of precedence):
 3. YAML config file
 4. Built-in defaults (lowest priority)
 
+### Node-local cache proxy
+
+Kubernetes workers can use the optional node-local NVMe cache proxy with
+`DUCKGRES_CACHE_ENABLED=true`. The worker waits at most
+`DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT` (default: `5s`, maximum: `10s`) for its initial health
+check. It then starts normally: a worker-local forward router bypasses an
+unhealthy proxy and fetches signed objects from the authoritative S3 source.
+The router probes for recovery with capped exponential backoff and jitter, and
+re-enables the local cache after a healthy probe. This setting is an environment
+variable only; it is injected into worker pods alongside `NODE_IP`.
+
+Cache-proxy loss affects cache performance, not worker readiness or PostgreSQL
+session admission. A bypass does not hide HTTP/S3 responses from the proxy, and
+does not replay writes; only a GET/HEAD whose local-proxy connection failed
+before a response is received is retried against the authoritative source.
+
 ### YAML Configuration
 
 Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete example):
@@ -291,11 +325,6 @@ Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete exampl
 ```yaml
 host: "0.0.0.0"
 port: 5432
-flight_port: 8815
-flight_session_idle_ttl: "10m"
-flight_session_reap_interval: "1m"
-flight_handle_idle_ttl: "15m"
-flight_session_token_ttl: "1h"
 data_dir: "./data"
 session_init_timeout: "10s"
 admission_reclaimer_max_reservations: 4096
@@ -354,19 +383,16 @@ Run with config file:
 | `DUCKGRES_CONFIG` | Path to YAML config file | - |
 | `DUCKGRES_HOST` | Host to bind to | `0.0.0.0` |
 | `DUCKGRES_PORT` | Port to listen on | `5432` |
-| `DUCKGRES_FLIGHT_PORT` | Control-plane Flight SQL ingress port (`0` disables) | `0` |
-| `DUCKGRES_FLIGHT_SESSION_IDLE_TTL` | Flight auth session idle TTL | `10m` |
-| `DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL` | Flight auth session reap interval | `1m` |
-| `DUCKGRES_FLIGHT_HANDLE_IDLE_TTL` | Flight prepared/query handle idle TTL | `15m` |
-| `DUCKGRES_FLIGHT_SESSION_TOKEN_TTL` | Flight issued session token absolute TTL | `1h` |
 | `DUCKGRES_DATA_DIR` | Directory for DuckDB files | `./data` |
 | `DUCKGRES_CERT` | TLS certificate file | `./certs/server.crt` |
 | `DUCKGRES_KEY` | TLS private key file | `./certs/server.key` |
 | `DUCKGRES_MEMORY_LIMIT` | DuckDB memory_limit per session (e.g., `4GB`) | Auto-detected |
-| `DUCKGRES_THREADS` | DuckDB threads per session | `runtime.NumCPU()` |
+| `DUCKGRES_THREADS` | DuckDB threads per session | `2.5 × runtime.NumCPU()`, rounded up |
+| `DUCKGRES_DISABLE_PARQUET_PREFETCHING` | Disable DuckDB Parquet prefetching for standalone/process workers and control-plane-spawned K8s workers. Boolean values use Go's accepted forms (`true`, `TRUE`, `1`, etc.). | `false` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
+| `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` | Maximum client-requested `duckgres.idle_timeout`; unset disables client overrides | disabled |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
 | `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
 | `DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS` | Max queued/live admission identities whose cleanup ownership one control plane may retain; new admissions are rejected before enqueue when full | `4096` |
@@ -382,16 +408,72 @@ Run with config file:
 | `DUCKGRES_QUERY_LOG_FLUSH_INTERVAL` | Query-log flush interval for native Postgres writes | `5s` |
 | `DUCKGRES_QUERY_LOG_BATCH_SIZE` | Query-log batch size for native Postgres inserts | `1000` |
 | `DUCKGRES_STORAGE_SAMPLE_INTERVAL` | Storage-billing sampling cadence (Go duration): how often the leader CP reads each warehouse's tracked DuckLake footprint and credits byte-seconds. Env-only. | `30m` |
-| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events** | - |
-| `POSTHOG_HOST` | PostHog ingest host | `us.i.posthog.com` |
-| `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated list of additional PostHog API keys to publish logs to. Requires `POSTHOG_API_KEY` to be set. | - |
-| `DUCKGRES_IDENTIFIER` | Suffix appended to the OTel `service.name` in PostHog logs (e.g., `duckgres-acme`); only used when `POSTHOG_API_KEY` is set | - |
+| `DUCKGRES_EXPLORATORY_TIER_ENABLED` | Exploratory worker tier (small-first routing, remote/K8s backend only): a connection that sends no `duckgres.worker_*` sizing options acquires NO worker at connect, and its first engine-touching statement lands on the small shape below; state-mutating statements and engine OOMs escalate it to the shape it would otherwise have started on. Env-only. | `false` |
+| `DUCKGRES_EXPLORATORY_WORKER_CPU` | CPU request/limit of the exploratory worker pod (e.g. `1`, `500m`). Required (with the memory knob) for the tier to activate; a missing or invalid value logs a warning and leaves the tier OFF. Env-only. | - |
+| `DUCKGRES_EXPLORATORY_WORKER_MEMORY` | Memory request/limit of the exploratory worker pod (e.g. `2Gi`). Same requirement as the CPU knob. Env-only. | - |
+| `DUCKGRES_EXPLORATORY_WORKER_TTL` | Hot-idle TTL of exploratory worker pods (Go duration) — how long one stays parked for the org's next connection after its last one ends. Env-only. | `48h` |
+| `POSTHOG_API_KEY` | PostHog project API key (`phc_...`); enables log export **and product-analytics events**. Exported WARN/ERROR logs carry `RedactForLog`+4096 SQL (secret DDL is a placeholder). To get events without exporting SQL, leave this unset and use `POSTHOG_ANALYTICS_API_KEY` | - |
+| `POSTHOG_ANALYTICS_API_KEY` | PostHog project API key for product-analytics events **only**, leaving log export off. Takes precedence over `POSTHOG_API_KEY` for analytics. Never copied to worker pods | - |
+| `POSTHOG_HOST` | PostHog ingest host (shared by both exporters) | `us.i.posthog.com` |
+| `ADDITIONAL_POSTHOG_API_KEYS` | **(Experimental)** Comma-separated extra PostHog API keys for log export. Requires `POSTHOG_API_KEY`. CP-only; not forwarded to workers | - |
+| `DUCKGRES_POSTHOG_LOG_LEVEL` | Minimum level exported to PostHog Logs (`debug`/`info`/`warn`/`error`). Stderr stays at `DUCKGRES_LOG_LEVEL`. User-class `Query execution failed.` is Info and does **not** export at the default | `warn` |
+| `DUCKGRES_POSTHOG_LOG_INFO_SAMPLE` | Fraction of INFO records to keep on the PostHog branch (`0`–`1`). WARN/ERROR are never sampled | `0` |
+| `DUCKGRES_POSTHOG_LOG_QUERY_TEXT` | How query attrs are exported: `off` (drop), `redacted` (`RedactForLog`+4096; ordinary SELECT text still leaves), `on` (stderr-equivalent) | `redacted` |
+| `DUCKGRES_IDENTIFIER` | Resource attr `duckgres.deployment` (and `deployment.environment` when the value is exactly `dev`/`staging`/`production`). **Does not** suffix `service.name`. Shared by logs and traces | - |
+
+### Client-requested idle timeout
+
+The control plane closes inactive client sessions after its configured
+`DUCKGRES_IDLE_TIMEOUT` (60 seconds by default). To let clients request a
+longer, bounded timeout, set a positive `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` on
+the control plane. For example, with `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX=15m`:
+
+```bash
+PGOPTIONS='-c duckgres.idle_timeout=15m' psql "host=<host> dbname=ducklake sslmode=require"
+```
+
+Requests must be positive and no greater than the configured maximum. Leaving
+the maximum unset disables client overrides, and clients cannot request an
+unlimited timeout because idle sessions retain worker capacity.
+
+### Per-session worker TTL
+
+On the remote/K8s backend, a worker whose last session ends is parked
+`hot_idle` (warm, quickly reusable by the same org) and retired once its TTL
+expires — 1 minute by default. Clients can override that TTL per connection,
+either at connect time or mid-session:
+
+```bash
+PGOPTIONS='-c duckgres.worker_ttl=20m' psql "host=<host> dbname=ducklake sslmode=require"
+```
+
+```sql
+SET duckgres.worker_ttl = '20m';   -- Go duration, whole minutes, minimum 1m
+SHOW duckgres.worker_ttl;          -- the TTL this session's worker will park with
+RESET duckgres.worker_ttl;         -- back to the connect-time value
+```
+
+The mid-session form exists for clients that cannot set startup options; it
+takes effect on the bound worker immediately and governs the park when the
+session ends. Both forms are gated on
+`DUCKGRES_K8S_ALLOW_CLIENT_WORKER_PROFILE` (a mid-session `SET` is rejected
+with 22023 when the gate is off) and clamped to
+`DUCKGRES_K8S_WORKER_MAX_TTL`. The TTL is stamped with whole-minute precision
+(`ttl_minutes`, where 0 means "deployment default"), so a mid-session `SET`
+rejects zero and sub-minute values with 22023 rather than parking the worker
+for a TTL `SHOW` would misreport. (A sub-minute startup option still truncates
+to whole minutes at park — pre-existing.) On the standalone/process backends there is
+no hot-idle TTL to override; `SET`/`SHOW` are accepted as session state only.
 
 ### PostHog Logging
 
-Duckgres can optionally export structured logs to [PostHog Logs](https://posthog.com/docs/logs) via the OpenTelemetry Protocol (OTLP). Logs are always written to stderr regardless of this setting.
+Duckgres can optionally export structured logs to [PostHog Logs](https://posthog.com/docs/logs) via the OpenTelemetry Protocol (OTLP). Logs are always written to stderr regardless of this setting. PostHog export defaults to **WARN+ERROR**; stderr stays at `DUCKGRES_LOG_LEVEL`.
 
-To enable, set your PostHog project API key:
+`service.name` is the process role (`duckgres-control-plane`, `duckgres-worker`, `duckgres-reshard`, or `duckgres` for standalone). Traces share that resource — existing VictoriaTraces / dashboards that filtered `service.name=duckgres` or `duckgres-<identifier>` need to follow the new names. `DUCKGRES_IDENTIFIER` is now `duckgres.deployment`, not a service-name suffix.
+
+Exported WARN/ERROR records keep query text after `usersecrets.RedactForLog` + a 4096-byte cap (`DUCKGRES_POSTHOG_LOG_QUERY_TEXT=redacted`). Secret DDL becomes a placeholder; ordinary SELECT text and its literals **do** leave the cluster. Anyone who can read the destination PostHog project can see `org`, `user` (including `svc_` service credentials), client IPs, and that redacted SQL.
+
+To enable, set your PostHog project API key (same project as product-analytics events in managed-warehouse):
 
 ```bash
 export POSTHOG_API_KEY=phc_your_project_api_key
@@ -406,12 +488,49 @@ export POSTHOG_HOST=eu.i.posthog.com
 ./duckgres
 ```
 
+Remote worker pods do **not** inherit the CP process env. Spawn copies a closed allowlist of **named** `env:` entries from the CP pod spec (`Get(namespace, POD_NAME)` once at pool start):
+
+- `POSTHOG_API_KEY` is copied only as `valueFrom.secretKeyRef`. A literal `value:` is refused. `envFrom` is insufficient (those keys do not appear on a Pod GET) and is not invented-around as `os.Getenv` → `value:`.
+- `POSTHOG_HOST`, `DUCKGRES_POSTHOG_LOG_LEVEL`, `DUCKGRES_POSTHOG_LOG_INFO_SAMPLE`, `DUCKGRES_POSTHOG_LOG_QUERY_TEXT`, and `DUCKGRES_IDENTIFIER` may be a value or a `valueFrom`.
+- `ADDITIONAL_POSTHOG_API_KEYS` and `POSTHOG_ANALYTICS_API_KEY` stay CP-only and are never forwarded.
+
+Charts must put `POSTHOG_API_KEY` on the CP container as a first-class named `env:` `secretKeyRef` (not `envFrom`). If `POD_NAME` is empty, the Get fails, or the named env is missing, the CP logs one WARN (`PostHog log env not found on CP pod spec; workers will not export.`) and **omits** the vars — a logging-config miss must never fail a worker spawn. Reshard runner pods use the same allowlist copy.
+
+The first operational slice is CP-only export. Worker records in PostHog (`service.name=duckgres-worker`) appear only after the charts Secret exists **and** the worker can reach `*.i.posthog.com:443`. In-repo NetworkPolicy 443 is not proof of production Cilium egress. The first mw-dev `duckgres-worker` line in the **analytics** project is the egress proof.
+
 ### PostHog Product-Analytics Events
 
-The same `POSTHOG_API_KEY` (and `POSTHOG_HOST`) also enables product-analytics
-event capture via the PostHog capture API. This is separate from log export:
-logs go to PostHog Logs, these are discrete events you can build insights and
-dashboards on. When `POSTHOG_API_KEY` is unset, no events are sent.
+`POSTHOG_API_KEY` (and `POSTHOG_HOST`) also enables product-analytics event
+capture via the PostHog capture API. This is separate from log export: logs go
+to PostHog Logs, these are discrete events you can build insights and dashboards
+on.
+
+The two exporters can be enabled independently, and the distinction matters
+because they carry different data. These events are metadata only. Application
+logs are not: OTLP keeps `RedactForLog`+4096 SQL only on exported WARN/ERROR.
+User-class `Query execution failed.` stays Info and does **not** export at the
+default WARN — those statements stay on stderr/`query_log` unless the PostHog
+level is raised. `logQuery` / `logQueryError` attach the statement, and
+`usersecrets.RedactForLog` only rewrites secret DDL, so ordinary SQL and its
+literals reach PostHog Logs only when that record is actually exported.
+
+| Set | Analytics events | Log export |
+| --- | --- | --- |
+| `POSTHOG_ANALYTICS_API_KEY` | ✅ | ❌ |
+| `POSTHOG_API_KEY` | ✅ | ✅ |
+| both | ✅ (analytics key) | ✅ (`POSTHOG_API_KEY`) |
+| neither | ❌ | ❌ |
+
+So a deployment serving customer data — where SQL must not be exported — sets
+only `POSTHOG_ANALYTICS_API_KEY`:
+
+```bash
+export POSTHOG_ANALYTICS_API_KEY=phc_your_project_api_key
+./duckgres
+```
+
+Existing single-key deployments are unaffected: `POSTHOG_API_KEY` keeps both
+exporters on, exactly as before.
 
 Events are attributed to an org using [PostHog group analytics](https://posthog.com/docs/product-analytics/group-analytics):
 the `distinct_id` is the org name and each event carries a group of type
@@ -445,9 +564,9 @@ teardown), so you can build a provisioning funnel and alert on failures.
 | `warehouse_deprovision_success` | All underlying resources deleted (provisioner controller) | — |
 | `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
-| `query_initiated` | An accepted, non-empty client query is received | `user`, `team_id`, `trace_id` |
-| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows` |
-| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`) |
+| `query_initiated` | An accepted, non-empty client query is received | `user`, `team_id`, `trace_id`, `application_name` |
+| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows`, `application_name` |
+| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`), `application_name` |
 
 > Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
 > are terminal and fire exactly once per warehouse (guarded on the state
@@ -474,6 +593,12 @@ teardown), so you can build a provisioning funnel and alert on failures.
 > utility statements. Emitted independently of the query-log configuration;
 > capture is asynchronous and batched, so it stays off the query latency path.
 
+> Note: `application_name` is the client-supplied `application_name` startup
+> parameter (also shown in the admin live view), letting you distinguish
+> PostHog-side callers (e.g. the register workflow, Dagster, the SQL editor)
+> from customer `psql` connections. It is an empty string when the client
+> didn't set one.
+
 ### Query Logs
 
 Structured logs separate the SQL received from a client from the statements
@@ -499,11 +624,6 @@ Options:
   -config string           Path to YAML config file
   -host string             Host to bind to
   -port int                Port to listen on
-  -flight-port int         Control-plane Arrow Flight SQL ingress port, 0=disabled
-  -flight-session-idle-ttl string      Flight auth session idle TTL (e.g., '10m')
-  -flight-session-reap-interval string Flight auth session reap interval (e.g., '1m')
-  -flight-handle-idle-ttl string       Flight prepared/query handle idle TTL (e.g., '15m')
-  -flight-session-token-ttl string     Flight issued session token absolute TTL (e.g., '1h')
   -data-dir string         Directory for DuckDB files
   -cert string             TLS certificate file
   -key string              TLS private key file
@@ -821,13 +941,12 @@ The default mode runs everything in a single process:
 
 ### Control Plane Mode
 
-For production deployments, control-plane mode splits the server into a **control plane** and a pool of long-lived **worker processes**. The control plane owns client connections end-to-end (TLS, authentication, PostgreSQL wire protocol, SQL transpilation), while workers are thin DuckDB execution engines reachable via Arrow Flight SQL over Unix sockets. Optional control-plane Flight ingress (`flight_port`) also exposes Arrow Flight SQL directly with HTTP Basic auth (`Authorization: Basic ...`), compatible with Duckhog clients.
+For production deployments, control-plane mode splits the server into a **control plane** and a pool of long-lived **worker processes**. The control plane exposes PostgreSQL wire protocol to clients and owns those connections end-to-end (TLS, authentication, SQL transpilation), while workers are thin DuckDB execution engines reachable internally via Arrow Flight SQL over Unix sockets.
 
 ```
                     CONTROL PLANE (duckgres --mode control-plane)
                     ┌──────────────────────────────────────────────┐
   PG Client ──TLS──>│ PG TCP Listener                              │
- Flight SQL Client ─>│ Flight SQL TCP Listener (Basic Auth)         │
                     │ TLS Termination + Password Auth              │
                     │ PostgreSQL Wire Protocol                     │
                     │ SQL Transpilation (PG → DuckDB)              │
@@ -859,17 +978,12 @@ Start in control-plane mode:
 # Start in control-plane mode (workers spawn on demand, 1 per connection)
 ./duckgres --mode control-plane --port 5432
 
-# Enable Flight SQL ingress for Duckhog-compatible clients
-./duckgres --mode control-plane --port 5432 --flight-port 8815
-
 # Pre-warm 2 process workers and cap at 10
 ./duckgres --mode control-plane --port 5432 --process-min-workers 2 --process-max-workers 10
 
 # Connect with psql (identical to standalone mode)
 PGPASSWORD=postgres psql "host=localhost port=5432 user=postgres sslmode=require"
 
-# Flight SQL clients use Basic auth headers (user/password)
-# Example endpoint: grpc+tls://localhost:8815
 ```
 
 **Zero-downtime deployment** using the handover protocol:
@@ -893,7 +1007,7 @@ kill -USR2 <control-plane-pid>
 
 ### Remote Worker Backend
 
-In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure still drops live pgwire connections; Flight may use a durable session token to create a fresh remote session on the surviving worker if the token is still valid.
+In Kubernetes environments, `--worker-backend remote` is the multitenant path. It requires `--config-store`. Control-plane replicas coordinate through durable runtime rows in the config-store Postgres DB, spawn worker pods via the Kubernetes API, and communicate with them over gRPC (Arrow Flight SQL). Planned rolling deploys mark old replicas draining, fail readiness, and wait up to `handover_drain_timeout` before forcing shutdown. Unplanned control-plane failure drops live pgwire connections; clients reconnect through pgwire and receive a new worker session.
 
 Managed-hostname routing is controlled by `--sni-routing-mode` and `--managed-hostname-suffixes`. For Postgres, an explicit startup `database`/`dbname` takes priority, but when SNI matches a managed suffix the hostname prefix and requested database must resolve to the same org. If the startup database is empty, the managed SNI prefix is used as the database fallback. Unknown `--sni-routing-mode` values behave like `off`.
 
@@ -952,13 +1066,16 @@ The shared K8s pool spawns workers on-demand, reserves them per org, activates t
 Managed-warehouse contract notes:
 
 - At most one managed-warehouse row exists per team. The row may be absent before first provisioning or after cleanup, but there is never more than one active warehouse contract for a team.
+- Each org has a `data_imports_table_naming_version`. Migration `000034` assigns `legacy_batch_v1` to orgs that already exist and changes the database default to `copy_v1` for orgs created afterward. `GET /api/v1/orgs/:id/teams` returns the org-level value alongside the team rows so every data-import reader and writer derives the same physical table name. Operators can change the policy in the admin console or with `PUT /api/v1/orgs/:id` using `{"data_imports_table_naming_version":"copy_v1"}`. Migrate existing tables before changing an org that has already written data.
 - The admin API exposes that contract at `GET /api/v1/teams/:name/warehouse` and `PUT /api/v1/teams/:name/warehouse`. Team list/get responses also include a nested `warehouse` object when present.
 - Org rows support optional `max_vcpus` on `POST /api/v1/orgs` and `PUT /api/v1/orgs/:id`. In K8s multi-tenant mode, this caps the org's active admitted worker pod vCPUs; `0` means unlimited.
+- Orgs automatically created during warehouse provisioning start with `max_vcpus=60`; `0` remains the explicit unlimited sentinel.
 - User rows support an optional `max_vcpus` field on `POST /api/v1/users` and `PUT /api/v1/orgs/:id/users/:username`. `max_vcpus` limits the user's active admitted worker pod vCPUs in K8s multi-tenant mode; `0` means unlimited.
-- `PUT /api/v1/orgs/:id/teams/:team_id/project-reader` creates or rotates the generated SQL login for a PostHog project. The login can read every current and future table in the project's team, data-import, and modeled-data schemas, plus its legacy events/persons relations. Writes, unqualified application relations, external-reader and introspection functions, other projects' schemas, and their catalog metadata are denied by the PostgreSQL and Flight SQL query gateways. Flight tokens are revoked when the login or its project scope changes. The plaintext password is returned only by the rotation response.
+- `PUT /api/v1/orgs/:id/teams/:team_id/project-reader` creates or rotates the generated SQL login for a PostHog project. The login can read every current and future table in the project's team, data-import, and modeled-data schemas, plus its legacy events/persons relations. Writes, unqualified application relations, external-reader and introspection functions, other projects' schemas, and their catalog metadata are denied by the PostgreSQL query gateway. The plaintext password is returned only by the rotation response.
 - The typed sections are `warehouse_database`, `metadata_store`, `s3`, `worker_identity`, and structured secret refs for `warehouse_database_credentials`, `metadata_store_credentials`, `s3_credentials`, and `runtime_config`. In shared worker mode, every non-empty secret ref must store an explicit `namespace`, and it must match `worker_identity.namespace`.
 - Secret references only are stored in the config store. Secret material remains outside the database.
 - The provisioning fields are stored directly on the warehouse row as overall `state` / `status_message`, per-resource `*_state` / `*_status_message`, plus `ready_at` and `failed_at`.
+- The Kubernetes provisioner polls every 10 seconds. A `failed` warehouse remains in its observation set: it stays failed while the Duckling, required status outputs, or worker-shaped metadata-store probe are unhealthy, and returns directly to `ready` after every readiness gate passes. The admin UI polls `pending`, `provisioning`, `failed`, and `deleting` warehouse rows every 5 seconds while they are visible.
 - Those state fields are open strings. Canonical values are `pending`, `provisioning`, `ready`, `failed`, `deleting`, and `deleted`, but callers may persist other values while workflows evolve.
 
 ## Two-Tier Query Processing

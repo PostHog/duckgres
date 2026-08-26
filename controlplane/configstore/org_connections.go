@@ -70,6 +70,14 @@ func (e *OrgConnectionAdmissionRejectedError) Unwrap() error {
 	return ErrOrgConnectionAdmissionRejected
 }
 
+// OrgConnectionMonitoringStatus is the live connection picture exposed to
+// tenant monitoring. Unlike reshard drain state, it excludes expired queue
+// entries and leases whose control-plane owner is no longer live.
+type OrgConnectionMonitoringStatus struct {
+	ActiveLeases int64
+	QueuedConns  int64
+}
+
 // EnqueueOrgConnectionRequest inserts a pending cluster-wide connection
 // admission request. FIFO ordering is scoped to org_id and ordered by
 // enqueued_at, then request_id. RequestedVCPUs is charged against active
@@ -556,11 +564,18 @@ type authoritativeOrgConnectionUserLimit struct {
 }
 
 type authoritativeOrgConnectionLimitSet struct {
-	orgMaxVCPUs int64
-	users       map[string]authoritativeOrgConnectionUserLimit
+	orgMaxVCPUs       int64
+	users             map[string]authoritativeOrgConnectionUserLimit
+	serviceCredential map[string]struct{}
 }
 
 func (l authoritativeOrgConnectionLimitSet) lookup(username string) OrgResourceLimits {
+	if _, exists := l.serviceCredential[username]; exists {
+		// Service credentials are root-shaped org identities. They share the
+		// org budget but never inherit an ordinary user's per-user cap, even if
+		// a legacy/user row happens to have the same name.
+		return OrgResourceLimits{OrgMaxVCPUs: int(l.orgMaxVCPUs)}
+	}
 	user := l.users[username]
 	return OrgResourceLimits{
 		OrgMaxVCPUs:  int(l.orgMaxVCPUs),
@@ -569,6 +584,10 @@ func (l authoritativeOrgConnectionLimitSet) lookup(username string) OrgResourceL
 }
 
 func (l authoritativeOrgConnectionLimitSet) userAllowed(username string) bool {
+	if strings.HasPrefix(username, ServiceCredentialPrefix) {
+		_, exists := l.serviceCredential[username]
+		return exists
+	}
 	user, exists := l.users[username]
 	return exists && !user.disabled
 }
@@ -589,7 +608,8 @@ func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID strin
 	}
 
 	limits := authoritativeOrgConnectionLimitSet{
-		users: make(map[string]authoritativeOrgConnectionUserLimit),
+		users:             make(map[string]authoritativeOrgConnectionUserLimit),
+		serviceCredential: make(map[string]struct{}),
 	}
 	if orgRow.MaxVCPUs != nil {
 		limits.orgMaxVCPUs = *orgRow.MaxVCPUs
@@ -622,6 +642,32 @@ func (cs *ConfigStore) authoritativeOrgConnectionLimits(tx *gorm.DB, orgID strin
 			maxVCPUs: maxVCPUs,
 			disabled: row.Disabled,
 		}
+	}
+
+	// Admission happens after pgwire authentication. Include every persisted
+	// service identity, regardless of its current expiry/revocation state:
+	// those fields gate NEW handshakes only. A session authenticated before a
+	// grant expired or was revoked must still be able to wait in admission or
+	// lazily acquire/switch a worker without being killed mid-session.
+	type serviceCredentialRow struct {
+		CredentialID string `gorm:"column:credential_id"`
+	}
+	var serviceCredentials []serviceCredentialRow
+	// Restrict this authoritative lookup to identities currently queued. Grant
+	// rows are retained for audit after expiry/revocation, so loading the org's
+	// complete lifetime history on every admission poll would grow without
+	// bound.
+	queuedUsernames := tx.Table(cs.orgConnectionRuntimeTables().queue).
+		Select("username").
+		Where("org_id = ? AND granted_at IS NULL", orgID)
+	if err := tx.Model(&ServiceGrant{}).
+		Select("credential_id").
+		Where("org_id = ? AND credential_id IN (?)", orgID, queuedUsernames).
+		Scan(&serviceCredentials).Error; err != nil {
+		return authoritativeOrgConnectionLimitSet{}, false, err
+	}
+	for _, row := range serviceCredentials {
+		limits.serviceCredential[row.CredentialID] = struct{}{}
 	}
 	return limits, true, nil
 }
@@ -920,6 +966,35 @@ func (cs *ConfigStore) ActiveOrgConnectionLeaseCount(orgID string) (int64, error
 		return 0, fmt.Errorf("count active org connection leases: %w", err)
 	}
 	return count, nil
+}
+
+// OrgConnectionMonitoringState reads the org's effective live leases and
+// pending queue depth without mutating the runtime coordination tables.
+func (cs *ConfigStore) OrgConnectionMonitoringState(orgID string) (OrgConnectionMonitoringStatus, error) {
+	tables := cs.orgConnectionRuntimeTables()
+	cpTable := cs.runtimeTable((&ControlPlaneInstance{}).TableName())
+	var status OrgConnectionMonitoringStatus
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		now, err := cs.orgConnectionDatabaseNow(tx)
+		if err != nil {
+			return err
+		}
+		if err := tx.Table(tables.lease+" AS l").
+			Joins("LEFT JOIN "+cpTable+" AS cp ON cp.id = l.cp_instance_id").
+			Where("l.org_id = ?", orgID).
+			Where("(cp.id IS NOT NULL AND cp.state <> ?) OR (cp.id IS NULL AND l.acquired_at > ?)",
+				ControlPlaneInstanceStateExpired, now.Add(-missingOwnerOrgConnectionLeaseGrace)).
+			Count(&status.ActiveLeases).Error; err != nil {
+			return err
+		}
+		return tx.Table(tables.queue).
+			Where("org_id = ? AND granted_at IS NULL AND expires_at > ?", orgID, now).
+			Count(&status.QueuedConns).Error
+	})
+	if err != nil {
+		return OrgConnectionMonitoringStatus{}, fmt.Errorf("org connection monitoring state: %w", err)
+	}
+	return status, nil
 }
 
 func (cs *ConfigStore) cleanupOrgConnectionRowsLocked(tx *gorm.DB, orgID string, now time.Time) error {

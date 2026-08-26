@@ -30,11 +30,6 @@ func fieldNameToFlagName(name string) string {
 		{"DuckLakeDeltaCatalogEnabled", "ducklake-delta-catalog-enabled"},
 		{"DuckLakeDeltaCatalogPath", "ducklake-delta-catalog-path"},
 		{"DuckLakeDefaultSpecVersion", "ducklake-default-spec-version"},
-		{"FlightSessionIdleTTL", "flight-session-idle-ttl"},
-		{"FlightSessionReapInterval", "flight-session-reap-interval"},
-		{"FlightHandleIdleTTL", "flight-handle-idle-ttl"},
-		{"FlightSessionTokenTTL", "flight-session-token-ttl"},
-		{"FlightPort", "flight-port"},
 		{"K8sWorkerImagePullPolicy", "k8s-worker-image-pull-policy"},
 		{"K8sWorkerServiceAccount", "k8s-worker-service-account"},
 		{"K8sControlPlaneID", "k8s-control-plane-id"},
@@ -145,6 +140,17 @@ func TestRegisterCLIInputsFlagsCoversEveryCLIBackedField(t *testing.T) {
 	if len(cli.Set) != 0 {
 		t.Errorf("harvested CLIInputs.Set should be empty after no-arg parse; got %v", cli.Set)
 	}
+}
+
+func TestRegisterCLIInputsFlagsDoesNotExposeFlightIngress(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	RegisterCLIInputsFlags(fs)
+
+	fs.VisitAll(func(f *flag.Flag) {
+		if strings.HasPrefix(f.Name, "flight-") {
+			t.Errorf("control plane must be pgwire-only; found obsolete --%s flag", f.Name)
+		}
+	})
 }
 
 // TestRegisterCLIInputsFlagsHarvestPropagatesValuesAndSet exercises the

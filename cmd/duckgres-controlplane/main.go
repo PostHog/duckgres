@@ -79,7 +79,7 @@ func main() {
 	mode := flag.String("mode", "control-plane", "Run mode: control-plane (default) or reshard-runner (dedicated per-operation reshard pod)")
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Duckgres control plane %s — PostgreSQL wire protocol + Flight ingress\n\n", version)
+		fmt.Fprintf(os.Stderr, "Duckgres control plane %s — PostgreSQL wire protocol\n\n", version)
 		fmt.Fprintln(os.Stderr, "Control-plane-only duckgres binary. Does NOT link libduckdb.")
 		fmt.Fprintln(os.Stderr, "Routes all SQL execution to remote duckdb-service worker pods")
 		fmt.Fprintln(os.Stderr, "via Arrow Flight SQL.")
@@ -142,11 +142,13 @@ func main() {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
-	loggingShutdown := cliboot.InitLogging()
+	_ = os.Setenv("DUCKGRES_MODE", *mode)
+	bi := buildInfo()
+	loggingShutdown := cliboot.InitLogging(bi)
 	defer loggingShutdown()
 	analyticsShutdown := cliboot.InitAnalytics()
 	defer analyticsShutdown()
-	tracingShutdown := cliboot.InitTracing()
+	tracingShutdown := cliboot.InitTracing(bi)
 	defer tracingShutdown()
 
 	buildInfo().Log(*mode)
@@ -242,8 +244,8 @@ func main() {
 		ConfigPollInterval:         resolved.ConfigPollInterval,
 		InternalSecret:             resolved.InternalSecret,
 		InternalSecretFallbacks:    resolved.InternalSecretFallbacks,
-		ReadOnlySecret:            resolved.ReadOnlySecret,
-		ReadOnlySecretFallbacks:   resolved.ReadOnlySecretFallbacks,
+		ReadOnlySecret:             resolved.ReadOnlySecret,
+		ReadOnlySecretFallbacks:    resolved.ReadOnlySecretFallbacks,
 		SNIRoutingMode:             resolved.SNIRoutingMode,
 		ManagedHostnameSuffixes:    resolved.ManagedHostnameSuffixes,
 		MetadataHostnameSuffixes:   resolved.MetadataHostnameSuffixes,
@@ -276,6 +278,10 @@ func main() {
 			WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
 			WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
 			WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
+			ExploratoryTierEnabled:       resolved.K8sExploratoryTierEnabled,
+			ExploratoryWorkerCPU:         resolved.K8sExploratoryWorkerCPU,
+			ExploratoryWorkerMemory:      resolved.K8sExploratoryWorkerMemory,
+			ExploratoryWorkerTTL:         resolved.K8sExploratoryWorkerTTL,
 			ReshardPodCPU:                resolved.K8sReshardPodCPU,
 			ReshardPodMemory:             resolved.K8sReshardPodMemory,
 			AWSRegion:                    resolved.AWSRegion,

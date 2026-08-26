@@ -15,20 +15,38 @@ type Org struct {
 	HostnameAlias *string `gorm:"size:255;uniqueIndex" json:"hostname_alias"`
 	MaxWorkers    int     `gorm:"default:0" json:"max_workers"`
 	MaxVCPUs      int     `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
+	// MaxHotIdleWorkers/MaxHotIdleCPU/MaxHotIdleMemory cap what the org may
+	// hold in the hot-idle pool at once — by count, total vCPU, and total
+	// memory (k8s quantity strings like DefaultWorkerCPU/Memory, e.g. "8" /
+	// "64Gi"). 0 / "" = unlimited (the defaults). Enforced by the janitor's
+	// hot-idle cap sweep, which retires the OLDEST parked workers until the
+	// org is within ALL configured limits — convergent (handles cap decreases
+	// and every park path uniformly) rather than park-time. These are the
+	// cost-control counterpart of DefaultWorkerMinHotIdle (the warm-pool
+	// floor); on conflict the caps win — they are the explicit operator intent.
+	MaxHotIdleWorkers int    `gorm:"default:0" json:"max_hot_idle_workers"`
+	MaxHotIdleCPU     string `gorm:"size:32;not null;default:''" json:"max_hot_idle_cpu"`
+	MaxHotIdleMemory  string `gorm:"size:32;not null;default:''" json:"max_hot_idle_memory"`
 	// DefaultWorkerCPU/Memory/TTL are the org's operator-set default worker
 	// profile: the pod shape (k8s resource quantities, e.g. "2"/"8Gi") and
 	// hot-idle TTL (Go duration string, e.g. "75m" — stored as a string for
 	// human editability) applied to connections that don't size themselves via
 	// the duckgres.worker_* startup options. Empty = unset. Versioned SQL
 	// migrations add these columns.
-	DefaultWorkerCPU        string `gorm:"size:32" json:"default_worker_cpu"`
-	DefaultWorkerMemory     string `gorm:"size:32" json:"default_worker_memory"`
-	DefaultWorkerTTL        string `gorm:"size:32" json:"default_worker_ttl"`
-	DefaultWorkerMinHotIdle int    `gorm:"default:0" json:"default_worker_min_hot_idle"`
-	Teams         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
-	Users         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
-	Warehouse     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
-	CreatedAt     time.Time         `json:"created_at"`
+	DefaultWorkerCPU              string            `gorm:"size:32" json:"default_worker_cpu"`
+	DefaultWorkerMemory           string            `gorm:"size:32" json:"default_worker_memory"`
+	DefaultWorkerTTL              string            `gorm:"size:32" json:"default_worker_ttl"`
+	DefaultWorkerMinHotIdle       int               `gorm:"default:0" json:"default_worker_min_hot_idle"`
+	DataImportsTableNamingVersion string            `gorm:"size:32;not null;default:copy_v1" json:"data_imports_table_naming_version"`
+	Teams                         []OrgTeam         `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"teams,omitempty"`
+	Users                         []OrgUser         `gorm:"foreignKey:OrgID;references:Name" json:"users,omitempty"`
+	Warehouse                     *ManagedWarehouse `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"warehouse,omitempty"`
+	// Trino is the org's opt-in row for the shared multi-tenant Trino
+	// cell. nil == never opted in. Not preloaded by the snapshot loader
+	// (the pgwire hot path has no use for it); the Trino reconcile loop
+	// reads it through ListTrinoEnabledOrgs / GetManagedWarehouseTrino.
+	Trino     *ManagedWarehouseTrino `gorm:"foreignKey:OrgID;references:Name;constraint:OnDelete:CASCADE" json:"trino,omitempty"`
+	CreatedAt time.Time              `json:"created_at"`
 	// UpdatedAt doubles as an input to the discovery change marker
 	// (ConfigStore.LatestConfigChange): DeleteOrgTeamTx touches it so a
 	// team-row DELETE — which leaves no updated_at of its own behind —
@@ -107,7 +125,7 @@ type OrgUser struct {
 	AccessMode string `gorm:"size:32;not null;default:unrestricted" json:"access_mode"`
 	TeamID     *int64 `gorm:"index:idx_duckgres_org_users_project_reader_team,unique,where:access_mode = 'project_reader',priority:2;index:idx_duckgres_org_users_project_user_team,unique,where:access_mode = 'project_user',priority:2" json:"team_id,omitempty"`
 	// Disabled is the per-user kill switch: when true the user is refused at
-	// connect time (PG wire + Flight SQL). Toggling it on also tears down the
+	// pgwire connect time. Toggling it on also tears down the
 	// user's live sessions (see admin disable endpoint).
 	Disabled  bool      `gorm:"not null;default:false" json:"disabled"`
 	MaxVCPUs  int       `gorm:"column:max_vcpus;default:0" json:"max_vcpus"`
@@ -153,6 +171,43 @@ type OrgUserSecret struct {
 }
 
 func (OrgUserSecret) TableName() string { return "duckgres_org_user_secrets" }
+
+// ServiceGrant is one minted service credential — the CP-owned pair of
+// (credential_id, secret-as-bcrypt-hash) every PostHog backend job (dagster,
+// today) authenticates with. Deliberately NOT a duckgres_org_users row: the
+// credential's lifecycle (its TTL, its rotation clock, its audit attribution)
+// is per-credential, and sharing a row with an operator-owned org user would
+// mean an admin rotation or a password update could clobber a minted
+// credential mid-run. The bcrypt hash lives here precisely so the
+// service-credential plane stops depending on ANYTHING in
+// duckgres_org_users for storage.
+//
+// A live grant is one where revoked_at IS NULL AND expires_at > now().
+// Established sessions are never torn down by expiry or rotation — freshness
+// is enforced only at the pgwire handshake (the RDS-IAM contract); each new
+// connection mints or refreshes and the old secret is only refused at auth.
+//
+// Revoke keeps the row (revoked_at set) so investigation can still see
+// provenance; the hash is blanked on revoke so a leaked grant can never come
+// back online.
+type ServiceGrant struct {
+	OrgID        string `gorm:"primaryKey;type:text;index:idx_duckgres_service_grants_org_principal,priority:1;index:idx_duckgres_service_grants_org_state,priority:1" json:"org_id"`
+	CredentialID string `gorm:"primaryKey;type:text" json:"credential_id"`
+	// Principal is audit attribution ("dagster:events-backfill") — required
+	// at mint so every invocation is attributable. It is intentionally
+	// non-unique: each invocation gets a new credential ID, even when jobs use
+	// the same principal.
+	Principal     string     `gorm:"type:text;not null;index:idx_duckgres_service_grants_org_principal,priority:2" json:"principal"`
+	PasswordHash  string     `gorm:"type:text;not null" json:"-"`
+	MintedAt      time.Time  `gorm:"not null;default:now()" json:"minted_at"`
+	LastRotatedAt time.Time  `gorm:"not null;default:now()" json:"last_rotated_at"`
+	ExpiresAt     time.Time  `gorm:"not null;index:idx_duckgres_service_grants_org_state,priority:2" json:"expires_at"`
+	RevokedAt     *time.Time `gorm:"index:idx_duckgres_service_grants_org_state,priority:3" json:"revoked_at,omitempty"`
+	CreatedAt     time.Time  `gorm:"not null;default:now()" json:"created_at"`
+	UpdatedAt     time.Time  `gorm:"not null;default:now()" json:"updated_at"`
+}
+
+func (ServiceGrant) TableName() string { return "duckgres_service_grants" }
 
 // ManagedWarehouseProvisioningState is an open string used for warehouse lifecycle status.
 // The constants below are the canonical values used by current tooling, but callers may
@@ -345,6 +400,150 @@ type ManagedWarehouse struct {
 
 func (ManagedWarehouse) TableName() string { return "duckgres_managed_warehouses" }
 
+// DefaultTrinoCellID is the cell every Trino-enabled org lands on until a
+// second cell exists. Cells are the unit a shared Trino cluster is scaled
+// in: one coordinator + worker fleet + one OPA sidecar per cell, with the
+// orgs assigned to it. Today there is exactly ONE, named by
+// DUCKGRES_TRINO_CELL_ID; the column exists so adding a second cell is a
+// data change plus a per-cell coordinator lookup, not a schema migration
+// mid-incident. There is deliberately NO assignment policy, rebalancer, or
+// fleet manager — an org lands on the cell whose provisioner claims it
+// first, and today only one provisioner runs.
+const DefaultTrinoCellID = "cell-001"
+
+// ManagedWarehouseTrino captures per-org opt-in for the shared, multi-tenant
+// Trino cell. Trino access is granted at the org level: when Enabled is true,
+// the provisioner extension (controlplane/provisioner/trino_provisioner.go)
+// projects the org's `root` OrgUser bcrypt hash into the Trino file password
+// authenticator, writes the org's metadata-store password into the tenant
+// Secret, creates a per-org DuckLake catalog via the Trino REST API, and
+// rebuilds the OPA bundle + resource-groups config.
+//
+// v1 is intentionally minimal — Enabled gates the projection, Tier picks
+// resource-group limits, TrinoCellID says which cell owns the org. Per-user
+// identity within an org is post-v1.
+//
+// FK'd by OrgID like the other sibling rows; consumed by the Trino
+// provisioner sub-component in controlplane/provisioner/trino_provisioner.go.
+type ManagedWarehouseTrino struct {
+	OrgID string `gorm:"primaryKey;size:255" json:"org_id"`
+
+	// Enabled gates inclusion in every projection the Trino provisioner owns
+	// (password file, group file, tenant password Secret, OPA bundle catalog
+	// map, resource-groups config, REST CREATE CATALOG). Defaults to false so
+	// existing configstore rows never start projecting after a schema
+	// migration.
+	Enabled bool `gorm:"not null;default:false" json:"enabled"`
+
+	// Tier picks the resource-group limits applied to the org. Empty string
+	// is treated as the default tier by the resource-groups generator.
+	// Kept as a free-form string for now; refining into an enum is
+	// post-v1 work once tier shape stabilizes.
+	Tier string `gorm:"size:64" json:"tier"`
+
+	// TrinoCellID names the Trino cell that owns this org. Empty means
+	// UNASSIGNED: the first reconciling provisioner claims the org into its
+	// own cell (AssignTrinoCell) and every later tick sees the stamp. A
+	// provisioner NEVER touches an org stamped with a different cell — that
+	// is what keeps two cells from both projecting the same tenant.
+	TrinoCellID string `gorm:"column:trino_cell_id;size:64" json:"trino_cell_id"`
+
+	// State / StatusMessage / ReadyAt / FailedAt mirror the
+	// ManagedWarehouse lifecycle fields so operators can see what the
+	// Trino reconcile loop is doing. The Trino reconcile is a single
+	// batched output per tick (catalog + auth + tenant secret +
+	// resource-groups + bundle); these fields summarize the most recent
+	// tick's outcome.
+	//
+	// State transitions:
+	//   - pending (default after EnableTrino, before first reconcile)
+	//   - provisioning (a reconcile tick is mid-flight or a previous
+	//     tick partially failed and is retrying)
+	//   - ready (the most recent tick succeeded across all steps)
+	//   - failed (the most recent tick errored — StatusMessage carries
+	//     the per-step detail; ready_at is preserved, failed_at is set)
+	//
+	// On the next successful reconcile after a failed state, the row
+	// flips back to ready and failed_at is cleared. We don't model
+	// per-step sub-states — for v1 the four-state summary plus
+	// StatusMessage detail is sufficient observability without growing
+	// the model.
+	State         ManagedWarehouseProvisioningState `gorm:"size:32" json:"state"`
+	StatusMessage string                            `gorm:"size:1024" json:"status_message"`
+	ReadyAt       *time.Time                        `json:"ready_at,omitempty"`
+	FailedAt      *time.Time                        `json:"failed_at,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_warehouse_trino" }
+
+// Trino CLUSTER-level credential lifecycle:
+//
+// The three cluster credentials (internal-communication shared secret,
+// __admin_provisioner password + bcrypt hash, OPA bundle bearer token)
+// are machine-generated and live ONLY as K8s Secrets in the Trino
+// namespace — the K8s Secret is the single source of truth for each
+// value (mirrors controlplane/worker_rpc_security.go). The configstore
+// deliberately stores NO credential bytes and NO SecretRefs for them;
+// the Secret names are a fixed naming contract (constants in the
+// provisioner), so there's nothing to persist except a one-bit "have we
+// ever bootstrapped" sentinel — see TrinoClusterBootstrap in
+// trino_cluster_secrets.go. Credential rotation
+// (version/history/grace-window) is a separate follow-up rotation-API
+// concern and adds its own state then.
+//
+// The PER-TENANT metadata-store passwords are different again: they are
+// not duckgres-owned secrets at all. They belong to the org's Duckling
+// CR (status.metadataStore.credentialSecretRef) and are re-read from
+// there on every reconcile tick, then projected into one Trino-namespace
+// Secret. Nothing about them is persisted here either.
+
+// TrinoEnabledOrg is the join shape returned by ListTrinoEnabledOrgs: org +
+// root-user bcrypt hash. The provisioner needs both at once — the password
+// file projection keys org_<org_id> by the password hash — so a single
+// query avoids an N+1 read pattern as the Trino-enabled org count grows.
+//
+// State is the row's CURRENT operational state at the time of the read,
+// so the reconcile loop can decide whether each per-tick write is a
+// transition (set ReadyAt / FailedAt) or a no-op preservation
+// (matches the surrounding ManagedWarehouse pattern in controller.go,
+// which only stamps ready_at on the first transition into ready).
+//
+// CellID is the row's trino_cell_id; empty means unassigned. The
+// provisioner filters on it in Go rather than in SQL so that unassigned
+// rows are still returned and can be claimed — a WHERE trino_cell_id = ?
+// would make a freshly enabled org invisible to every cell forever.
+type TrinoEnabledOrg struct {
+	OrgID            string
+	DatabaseName     string
+	Tier             string
+	CellID           string
+	RootPasswordHash string                            // bcrypt hash from OrgUser row where Username = "root"
+	State            ManagedWarehouseProvisioningState // current state at read time
+}
+
+// TrinoPrincipal is the tenant's customer-facing identity in Trino: the
+// username it authenticates as, and the stem every derived name is built
+// from (catalog, group, resource group).
+//
+// It is DatabaseName, not OrgID, so a tenant is known by the same name in
+// Trino as in its DuckDB warehouse — where database_name is already the
+// public socket identity (the SNI hostname label and the dbname clients
+// connect with). OrgID may be a bare UUID, which would put a hex string in
+// the customer's connection string and in every fully-qualified table
+// reference.
+//
+// Safe as a catalog stem because duckgres_orgs.database_name carries a
+// global unique index, so two tenants cannot derive the same catalog name.
+// OrgID remains the primary key and keys all internal plumbing (config
+// store rows, the tenant-password Secret); only names the customer types
+// are derived from this.
+func (o TrinoEnabledOrg) TrinoPrincipal() string {
+	return o.DatabaseName
+}
+
 // NOTE: the cluster-wide singleton config tables (global_config,
 // ducklake_config, rate_limit_config, query_log_config) were removed — they
 // were seeded and served by the admin API but never read to drive runtime
@@ -410,6 +609,7 @@ type WorkerLifecycleStats struct {
 	Image       string      `json:"image"`
 	State       WorkerState `json:"state"`
 	Binding     string      `json:"binding"`
+	Org         string      `json:"org"`
 	Count       int64       `json:"count"`
 	CPUCores    float64     `json:"cpu_cores"`
 	MemoryBytes int64       `json:"memory_bytes"`
@@ -465,39 +665,6 @@ type WorkerRecord struct {
 }
 
 func (WorkerRecord) TableName() string { return "worker_records" }
-
-// FlightSessionState is the durable reconnect state for Flight-only sessions.
-type FlightSessionState string
-
-const (
-	FlightSessionStateActive       FlightSessionState = "active"
-	FlightSessionStateReconnecting FlightSessionState = "reconnecting"
-	FlightSessionStateExpired      FlightSessionState = "expired"
-	FlightSessionStateClosed       FlightSessionState = "closed"
-)
-
-// FlightSessionRecord is the durable reconnect record for Flight sessions.
-type FlightSessionRecord struct {
-	SessionToken         string             `gorm:"primaryKey;size:255" json:"session_token"`
-	Username             string             `gorm:"size:255;not null" json:"username"`
-	OrgID                string             `gorm:"size:255;not null" json:"org_id"`
-	WorkerID             int                `gorm:"not null;index" json:"worker_id"`
-	PID                  int32              `gorm:"column:p_id;not null;default:0" json:"pid"`
-	OwnerEpoch           int64              `gorm:"not null" json:"owner_epoch"`
-	CPInstanceID         string             `gorm:"size:255" json:"cp_instance_id"`
-	State                FlightSessionState `gorm:"size:32;not null" json:"state"`
-	ExpiresAt            time.Time          `gorm:"index" json:"expires_at"`
-	LastSeenAt           time.Time          `json:"last_seen_at"`
-	AccessPolicyRecorded bool               `gorm:"not null;default:false" json:"access_policy_recorded"`
-	AccessRevision       string             `gorm:"size:64" json:"access_revision,omitempty"`
-	AccessReadOnly       bool               `gorm:"not null;default:false" json:"access_read_only"`
-	AllowedSchemas       []string           `gorm:"serializer:json;type:text" json:"allowed_schemas,omitempty"`
-	AllowedRelations     []string           `gorm:"serializer:json;type:text" json:"allowed_relations,omitempty"`
-	CreatedAt            time.Time          `json:"created_at"`
-	UpdatedAt            time.Time          `json:"updated_at"`
-}
-
-func (FlightSessionRecord) TableName() string { return "flight_session_records" }
 
 // OrgResourceLimits is the current resource-admission ceiling for an org and
 // the connecting user. 0 means unlimited for either dimension.
@@ -558,13 +725,19 @@ type OrgConfig struct {
 	HostnameAlias           string // empty when no alias is configured
 	MaxWorkers              int
 	MaxVCPUs                int
-	DefaultWorkerCPU        string            // org default worker profile: pod cpu quantity ("" = unset)
-	DefaultWorkerMemory     string            // org default worker profile: pod memory quantity ("" = unset)
-	DefaultWorkerTTL        string            // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
-	DefaultWorkerMinHotIdle int               // minimum default-profile hot-idle workers to retain for this org
-	Teams                   []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams)
-	Users                   map[string]string // username -> password
-	Warehouse               *ManagedWarehouseConfig
+	DefaultWorkerCPU        string // org default worker profile: pod cpu quantity ("" = unset)
+	DefaultWorkerMemory     string // org default worker profile: pod memory quantity ("" = unset)
+	DefaultWorkerTTL        string // org default worker profile: hot-idle TTL, Go duration string ("" = unset)
+	DefaultWorkerMinHotIdle int    // minimum default-profile hot-idle workers to retain for this org
+	// The org's hot-idle pool ceilings (the caps counterpart of
+	// DefaultWorkerMinHotIdle): 0/"" = unlimited. Enforced by the janitor's
+	// hot-idle cap sweep.
+	MaxHotIdleWorkers int
+	MaxHotIdleCPU     string
+	MaxHotIdleMemory  string
+	Teams             []OrgTeamConfig   // the org's PostHog teams (duckgres_org_teams)
+	Users             map[string]string // username -> password
+	Warehouse         *ManagedWarehouseConfig
 }
 
 // OrgTeamConfig is the in-memory snapshot view of one duckgres_org_teams row.

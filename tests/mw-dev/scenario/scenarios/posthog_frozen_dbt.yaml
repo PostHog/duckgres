@@ -9,7 +9,7 @@ steps:
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       request:
-        database_name: scenario_frozen_dbt_${run_id_token}
+        database_name: scenario-frozen-dbt-${run_id_token}
         team_id: 1
         metadata_store:
           type: cnpg-shard

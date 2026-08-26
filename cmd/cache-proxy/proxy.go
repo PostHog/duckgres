@@ -9,12 +9,15 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -54,6 +57,20 @@ type CacheProxy struct {
 	// traffic worth caching. Requests whose Host doesn't contain any of these
 	// are passed through without caching.
 	cacheHostSuffixes []string
+
+	// blockMode, blockSize, and maxSpanBlocks configure the block-aligned
+	// serve path (serveBlockAligned): whether it's active, the fixed block
+	// size in bytes, and the max number of blocks coalesced into one origin
+	// fetch. Wired to HandleProxy in a later task.
+	blockMode     bool
+	blockSize     int64
+	maxSpanBlocks int64
+
+	// objectSizes remembers validated complete lengths learned from origin
+	// Content-Range responses. Disk blocks remain the durable cache; this map
+	// lets subsequent requests in the same process emit precise range headers
+	// and reject starts beyond EOF without another origin request.
+	objectSizes sync.Map // map[string]int64, keyed by full object URL
 }
 
 // fetchResult describes a body that fetchDedup has materialized onto local
@@ -79,9 +96,10 @@ type singleFlight struct {
 }
 
 type call struct {
-	wg  sync.WaitGroup
-	res fetchResult
-	err error
+	wg    sync.WaitGroup
+	start time.Time
+	res   fetchResult
+	err   error
 }
 
 func (sf *singleFlight) Do(key string, fn func() (fetchResult, error)) (fetchResult, error) {
@@ -94,7 +112,7 @@ func (sf *singleFlight) Do(key string, fn func() (fetchResult, error)) (fetchRes
 		c.wg.Wait()
 		return c.res, c.err
 	}
-	c := &call{}
+	c := &call{start: time.Now()}
 	c.wg.Add(1)
 	sf.m[key] = c
 	sf.mu.Unlock()
@@ -109,6 +127,21 @@ func (sf *singleFlight) Do(key string, fn func() (fetchResult, error)) (fetchRes
 	return c.res, c.err
 }
 
+// InFlight reports whether a fill for key is currently executing, and how
+// long ago it started. HandlePeerHas consults it to answer 202, telling a
+// peer that missed the index we are ALREADY fetching the key — so that peer
+// waits for our fill instead of firing its own origin request for the same
+// bytes.
+func (sf *singleFlight) InFlight(key string) (time.Duration, bool) {
+	sf.mu.Lock()
+	defer sf.mu.Unlock()
+	c, ok := sf.m[key]
+	if !ok {
+		return 0, false
+	}
+	return time.Since(c.start), true
+}
+
 func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []string) *CacheProxy {
 	return &CacheProxy{
 		store:                     store,
@@ -121,6 +154,12 @@ func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []str
 		cacheHostSuffixes:         cacheHostSuffixes,
 	}
 }
+
+// How long a peer's /cache/get (or a local wait on a peer's in-flight fill)
+// may block waiting for that peer's fill to land before giving up to origin.
+// Long enough for a healthy multi-block fill, short enough that a wedged peer
+// can't hold request latency hostage once the origin would have answered.
+const peerFillWait = 10 * time.Second
 
 // shouldCache returns true if the request targets a host we want to cache.
 // When no suffixes are configured, all GETs are cached (legacy behavior).
@@ -251,9 +290,22 @@ var hopByHop = map[string]bool{
 	"upgrade":             true,
 }
 
+// cachePassthroughHeader is added only by duckgres's worker-local router.
+// It selects the proxy's observable-but-uncached request path and is stripped
+// before the origin request so it cannot affect S3 or a SigV4 request.
+const cachePassthroughHeader = "X-Duckgres-Cache-Passthrough"
+
+func isInternalPropagationHeader(header string) bool {
+	return strings.EqualFold(header, "traceparent") || strings.EqualFold(header, "tracestate")
+}
+
 // HandleProxy handles forward HTTP proxy requests from DuckDB httpfs.
 // Expects absolute-form URIs (scheme + host + path in the request-line).
 func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	inflightRequests.Inc()
+	defer inflightRequests.Dec()
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
+
 	// HTTPS via CONNECT tunnel — we can't cache encrypted traffic, but we must
 	// still tunnel it so DuckDB can reach external HTTPS sources (e.g.
 	// read_parquet('https://datasets.clickhouse.com/...')) while
@@ -273,6 +325,10 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		p.forwardUncached(w, r)
 		return
 	}
+	if r.Header.Get(cachePassthroughHeader) == "true" {
+		p.forwardUncached(w, r)
+		return
+	}
 
 	// Only cache URLs that look like DuckLake bucket traffic. Anything else
 	// (non-bucket HTTP) is a passthrough.
@@ -282,11 +338,15 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rangeHeader := r.Header.Get("Range")
+
+	if p.blockMode && p.serveBlockAligned(w, r, rangeHeader) {
+		return
+	}
+	// Legacy exact-range path (also the fallback for non-absolute ranges).
 	cacheKey := CacheKey(r.URL.String(), rangeHeader)
 
-	// Root span for this cacheable GET. DuckDB httpfs sends no traceparent, so
-	// this starts a fresh trace (service.name=duckgres-cache-proxy). Thread its
-	// context into r so the origin/peer fetch spans nest underneath.
+	// Requests without a propagated parent still start a standalone trace.
+	// Thread the cache request span context into origin/peer work below.
 	ctx, span := proxyTracer.Start(r.Context(), "cache.get", trace.WithAttributes(requestSpanAttrs(r)...))
 	defer span.End()
 	span.SetAttributes(attribute.String("duckgres.cache.key", cacheKey))
@@ -352,24 +412,31 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	p.serveStream(w, reader, size, rangeHeader, res.contentType)
 }
 
-// fetchDedup tries peers then origin, deduplicating concurrent fetches. On
-// success the body has been committed to local disk under cacheKey; the caller
-// serves it by streaming from the file. Nothing here holds the body in memory.
+// fetchDedup resolves a local miss to on-disk bytes with as little origin
+// traffic as the cluster state allows. On success the body has been committed
+// to local disk under cacheKey; the caller serves it by streaming from the
+// file. Nothing here holds the body in memory.
 func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader string) (fetchResult, error) {
 	return p.flights.Do(cacheKey, func() (fetchResult, error) {
 		if p.peers != nil {
-			_, peerSpan := proxyTracer.Start(r.Context(), "cache.peer_fetch")
-			_, n, ok := p.peers.FetchFromPeers(cacheKey, func(body io.Reader) (int64, error) {
-				return p.store.PutStream(cacheKey, body)
-			})
-			peerSpan.SetAttributes(attribute.Bool("duckgres.cache.peer_hit", ok))
-			if ok {
-				peerSpan.SetAttributes(attribute.Int64("duckgres.bytes", n))
-			}
-			peerSpan.End()
-			if ok {
-				cacheBytesServed.WithLabelValues("peer").Add(float64(n))
-				return fetchResult{size: n, source: "peer"}, nil
+			if p.peers.lookupMode == peerLookupSummary {
+				// One logical lookup uses local Bloom tests first. Peers without a
+				// valid summary remain on the legacy probe path only while this
+				// proxy is converging after startup or membership changes.
+				peerFetchesTotal.Inc()
+				positive, uncovered := p.peers.SummaryLookup(cacheKey, time.Now())
+				if holder, flight, ok, _ := p.peers.LocateSummaryKey(r.Context(), cacheKey, positive, uncovered, p.peers.peerMaxProbes); ok {
+					if res, ok := p.fetchFromPeer(holder, flight, cacheKey, r); ok {
+						summaryConfirmedGetsTotal.WithLabelValues("success").Inc()
+						return res, nil
+					}
+					summaryConfirmedGetsTotal.WithLabelValues("miss_or_error").Inc()
+				}
+			} else if holder, flight, ok := p.peers.LocateKey(r.Context(), cacheKey); ok {
+				res, ok := p.fetchFromPeer(holder, flight, cacheKey, r)
+				if ok {
+					return res, nil
+				}
 			}
 		}
 		originFetchInFlight.Inc()
@@ -385,6 +452,21 @@ func (p *CacheProxy) fetchDedup(cacheKey string, r *http.Request, rangeHeader st
 	})
 }
 
+// fetchFromPeer pulls cacheKey's body from a peer that has it (flight=false)
+// or is mid-flight filling it (flight=true; the peer's /cache/get then blocks
+// briefly on its fill instead of 404ing, so we read the bytes the peer just
+// fetched rather than re-fetching them from the origin ourselves).
+func (p *CacheProxy) fetchFromPeer(holder string, flight bool, cacheKey string, r *http.Request) (fetchResult, bool) {
+	n, ok := p.peers.FetchFromPeer(r.Context(), holder, cacheKey, flight, func(body io.Reader) (int64, error) {
+		return p.store.PutStream(cacheKey, body)
+	})
+	if !ok {
+		return fetchResult{}, false
+	}
+	cacheBytesServed.WithLabelValues("peer").Add(float64(n))
+	return fetchResult{size: n, source: "peer"}, true
+}
+
 // fetchOrigin forwards the request verbatim (headers, Host, signature) to the
 // real origin and streams a successful body straight to the on-disk cache,
 // returning the stored size and Content-Type. The SigV4 signature remains valid
@@ -396,18 +478,40 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 	_, originSpan := proxyTracer.Start(r.Context(), "cache.origin_fetch")
 	defer originSpan.End()
 
+	var size int64
+	var contentType string
+	err := p.retryOriginFetch(r, originSpan, func() error {
+		var attemptErr error
+		size, contentType, attemptErr = p.fetchOriginOnce(cacheKey, r)
+		return attemptErr
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	originSpan.SetAttributes(attribute.Int64("duckgres.bytes", size))
+	return size, contentType, nil
+}
+
+// retryOriginFetch runs attempt (one origin fetch) up to
+// originRetryMaxAttempts times with jittered exponential backoff, while the
+// error is retriable (isRetriableOriginFetchError) and the request context is
+// alive. Shared by the legacy exact-range path (fetchOrigin) and the
+// block-aligned path (fetchOriginSpan) so a transient origin 5xx or transport
+// blip is absorbed by the cache layer instead of surfacing to DuckDB as a
+// 502. Terminal origin statuses (4xx) and poisoned-response guards fail on
+// the first attempt.
+func (p *CacheProxy) retryOriginFetch(r *http.Request, originSpan trace.Span, attempt func() error) error {
 	attempts := p.originRetryMaxAttempts
 	if attempts < 1 {
 		attempts = 1
 	}
 	backoff := p.originRetryInitialBackoff
 	var lastErr error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		size, contentType, err := p.fetchOriginOnce(cacheKey, r)
-		originSpan.SetAttributes(attribute.Int("duckgres.origin.attempts", attempt))
+	for i := 1; i <= attempts; i++ {
+		err := attempt()
+		originSpan.SetAttributes(attribute.Int("duckgres.origin.attempts", i))
 		if err == nil {
-			originSpan.SetAttributes(attribute.Int64("duckgres.bytes", size))
-			return size, contentType, nil
+			return nil
 		}
 		lastErr = err
 		var oe *originStatusError
@@ -416,18 +520,18 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 		}
 		if err := r.Context().Err(); err != nil {
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
-		if attempt == attempts || !isRetriableOriginFetchError(err) {
+		if i == attempts || !isRetriableOriginFetchError(err) {
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
 
 		delay := jitteredOriginRetryDelay(backoff, p.originRetryMaxBackoff)
 		slog.Warn("Origin fetch failed with retriable error, retrying.",
 			"url", r.URL.String(),
 			"range", r.Header.Get("Range"),
-			"attempt", attempt,
+			"attempt", i,
 			"max_attempts", attempts,
 			"backoff", delay,
 			"error", err)
@@ -437,11 +541,11 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 				err = context.Canceled
 			}
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
 		if err := r.Context().Err(); err != nil {
 			originSpan.SetStatus(codes.Error, err.Error())
-			return 0, "", err
+			return err
 		}
 		originFetchRetriesTotal.WithLabelValues(originRetryReason(err)).Inc()
 		if backoff > 0 {
@@ -454,7 +558,7 @@ func (p *CacheProxy) fetchOrigin(cacheKey string, r *http.Request) (int64, strin
 	if lastErr != nil {
 		originSpan.SetStatus(codes.Error, lastErr.Error())
 	}
-	return 0, "", lastErr
+	return lastErr
 }
 
 func jitteredOriginRetryDelay(backoff, maxBackoff time.Duration) time.Duration {
@@ -480,7 +584,7 @@ func (p *CacheProxy) fetchOriginOnce(cacheKey string, r *http.Request) (int64, s
 		return 0, "", err
 	}
 	for k, vv := range r.Header {
-		if hopByHop[strings.ToLower(k)] {
+		if hopByHop[strings.ToLower(k)] || isInternalPropagationHeader(k) {
 			continue
 		}
 		for _, v := range vv {
@@ -631,18 +735,22 @@ func (e *originStatusError) Error() string {
 	return fmt.Sprintf("origin %d: %s", e.status, strings.TrimSpace(string(e.body)))
 }
 
-// writeTo replays the captured origin response onto w. Any header the
-// origin set that isn't a hop-by-hop is forwarded; status code and body
-// follow.
+// writeTo replays the captured origin response onto w. Any header the origin
+// set that isn't a hop-by-hop is forwarded — except Content-Length, which is
+// always rewritten to the length of the body we ACTUALLY captured. The error
+// body is read capped (originErrorBodyCap) precisely because we don't trust
+// the origin to stop; forwarding the origin's declared length for bytes we
+// never received would hang the client waiting for the remainder.
 func (e *originStatusError) writeTo(w http.ResponseWriter) {
 	for k, vv := range e.headers {
-		if hopByHop[strings.ToLower(k)] {
+		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, "Content-Length") {
 			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(e.body)))
 	w.WriteHeader(e.status)
 	_, _ = w.Write(e.body)
 }
@@ -700,8 +808,14 @@ func (p *CacheProxy) serveStream(w http.ResponseWriter, r io.Reader, size int64,
 // S3 rejected it. The fix is to mirror ContentLength + TransferEncoding +
 // Trailer from the inbound request so the proxy is wire-shape-transparent.
 func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
+	forwardRequestsTotal.WithLabelValues(r.Method).Inc()
+	forwardStart := time.Now()
 	ctx, span := proxyTracer.Start(r.Context(), "cache.forward", trace.WithAttributes(requestSpanAttrs(r)...))
 	defer span.End()
+	passthrough := r.Header.Get(cachePassthroughHeader) == "true"
+	if passthrough {
+		span.SetAttributes(attribute.Bool("duckgres.cache.passthrough", true))
+	}
 	r = r.WithContext(ctx)
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
@@ -718,7 +832,7 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	req.TransferEncoding = r.TransferEncoding
 	req.Trailer = r.Trailer
 	for k, vv := range r.Header {
-		if hopByHop[strings.ToLower(k)] {
+		if hopByHop[strings.ToLower(k)] || strings.EqualFold(k, cachePassthroughHeader) || isInternalPropagationHeader(k) {
 			continue
 		}
 		for _, v := range vv {
@@ -756,9 +870,11 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(resp.StatusCode)
 		n, _ := io.Copy(w, resp.Body)
 		span.SetAttributes(attribute.Int64("duckgres.bytes", n))
+		dur := time.Since(forwardStart)
+		requestDurationSeconds.WithLabelValues("forward", "origin").Observe(dur.Seconds())
 		slog.Info("Forward-proxy served.",
 			"method", r.Method, "url", r.URL.String(),
-			"status", resp.StatusCode, "bytes", n)
+			"status", resp.StatusCode, "bytes", n, "dur_ms", dur.Milliseconds())
 		return
 	}
 
@@ -771,35 +887,128 @@ func (p *CacheProxy) forwardUncached(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// HandlePeerHas responds to "do you have this cache key?" from peers.
+// HandlePeerHas answers "do you have this cache key?" from peers:
+//
+//	200 — tracked in the local index (probe counts as an access, so a block
+//	      that is hot with peers is not evicted as least-recently-used while
+//	      it is in fact one of the busiest entries on the node)
+//	202 — not here yet, but a local fill is mid-flight; the requester should
+//	      call /cache/get?flight=1 and wait for that fill instead of issuing
+//	      its own origin fetch for the same bytes
+//	404 — neither
 func (p *CacheProxy) HandlePeerHas(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
 	key := r.URL.Query().Get("key")
 	if !IsValidCacheKey(key) {
 		http.Error(w, "invalid key", http.StatusBadRequest)
 		return
 	}
 	if p.store.Has(key) {
+		p.store.Touch(key)
 		w.WriteHeader(http.StatusOK)
-	} else {
-		w.WriteHeader(http.StatusNotFound)
+		return
 	}
+	if _, ok := p.flights.InFlight(key); ok {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	w.WriteHeader(http.StatusNotFound)
 }
 
-// HandlePeerGet returns cached data to a peer.
+// HandlePeerSummary serves the current immutable Bloom snapshot over the
+// existing unauthenticated peer transport. Receivers decide whether this peer
+// belongs in their bounded retained subset before pulling the body.
+func (p *CacheProxy) HandlePeerSummary(w http.ResponseWriter, r *http.Request) {
+	if p.peers == nil || p.peers.lookupMode != peerLookupSummary || r.Method != http.MethodGet {
+		http.NotFound(w, r)
+		return
+	}
+	body, etag := p.peers.localSummarySnapshot()
+	if len(body) == 0 || len(body) > maxSummaryBodyBytes {
+		summaryServesTotal.WithLabelValues("unavailable").Inc()
+		http.Error(w, "summary unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	// The peer server intentionally has no server-wide WriteTimeout because
+	// /cache/get streams large bodies. Bound only this small snapshot response.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(summaryServeTimeout))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	if r.Header.Get("If-None-Match") == etag {
+		summaryServesTotal.WithLabelValues("not_modified").Inc()
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(body); err != nil {
+		summaryServesTotal.WithLabelValues("write_error").Inc()
+		return
+	}
+	summaryServesTotal.WithLabelValues("success").Inc()
+}
+
+// HandlePeerGet returns cached data to a peer. With flight=1 and the key not
+// yet on disk, it blocks (bounded by peerFillWait) for the local in-flight
+// fill to land and then serves those bytes — the requester gets the fill it
+// waited for instead of a 404 that would send it to the origin for the same
+// bytes the peer is already fetching.
 func (p *CacheProxy) HandlePeerGet(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header)))
+	ctx, span := proxyTracer.Start(r.Context(), "cache.peer_serve", trace.WithAttributes(
+		attribute.String("http.request.method", r.Method),
+		attribute.String("client.address", r.RemoteAddr),
+	))
+	defer span.End()
+	r = r.WithContext(ctx)
+
 	key := r.URL.Query().Get("key")
 	if !IsValidCacheKey(key) {
+		span.SetAttributes(attribute.Int("http.response.status_code", http.StatusBadRequest))
 		http.Error(w, "invalid key", http.StatusBadRequest)
 		return
 	}
 
-	reader, size, ok := p.store.Open(key)
+	if r.URL.Query().Get("flight") == "1" && !p.store.Has(key) {
+		p.waitForLocalFill(r, key)
+	}
+
+	// Peer traffic keeps the entry warm but must not inflate the worker-facing
+	// local-hit counter. openFile touches LRU recency without recording a hit.
+	reader, size, ok := p.store.openFile(key)
 	if !ok {
+		span.SetAttributes(attribute.Int("http.response.status_code", http.StatusNotFound))
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	defer func() { _ = reader.Close() }()
 
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-	_, _ = io.Copy(w, reader)
+	n, _ := io.Copy(w, reader)
+	span.SetAttributes(
+		attribute.Int("http.response.status_code", http.StatusOK),
+		attribute.Int64("duckgres.bytes", n),
+	)
+}
+
+// waitForLocalFill blocks (bounded) until key lands on local disk or the
+// in-flight fill for it finishes. Best-effort: a timeout just means the
+// caller gets a 404 and falls back to the origin, same as before.
+func (p *CacheProxy) waitForLocalFill(r *http.Request, key string) {
+	deadline := time.Now().Add(peerFillWait)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if p.store.Has(key) {
+			return
+		}
+		if _, ok := p.flights.InFlight(key); !ok || time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }

@@ -88,12 +88,19 @@ export function CreateTeamDialog({
   open,
   onClose,
   org,
+  orgLabel,
   orgs,
 }: {
   open: boolean;
   onClose: () => void;
+  // org: the fixed target org id when the dialog is scoped to one org
+  // (org-detail page). orgLabel is its readable name for display.
   org?: string;
-  orgs?: string[];
+  orgLabel?: string;
+  // orgs: the picker choices when not org-scoped (the /org-teams global "Add
+  // team" flow) — carries the readable label alongside the id so the picker
+  // shows a name a human recognises, not a bare UUID.
+  orgs?: { name: string; label: string }[];
 }) {
   const create = useCreateOrgTeam();
   const [orgChoice, setOrgChoice] = useState(org ?? "");
@@ -138,8 +145,18 @@ export function CreateTeamDialog({
         <DialogHeader>
           <DialogTitle>Add team</DialogTitle>
           <DialogDescription>
-            Map a PostHog team to {org ? <span className="font-mono">{org}</span> : "an org"} and the
-            warehouse schema its data lives in.
+            Map a PostHog team to{" "}
+            {org ? (
+              <span>
+                <span className="font-medium">{orgLabel ?? org}</span>{" "}
+                {orgLabel && orgLabel !== org && (
+                  <span className="font-mono text-xs text-muted-foreground">({org})</span>
+                )}
+              </span>
+            ) : (
+              "an org"
+            )}{" "}
+            and the warehouse schema its data lives in.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
@@ -151,8 +168,11 @@ export function CreateTeamDialog({
                 </SelectTrigger>
                 <SelectContent>
                   {(orgs ?? []).map((o) => (
-                    <SelectItem key={o} value={o}>
-                      {o}
+                    <SelectItem key={o.name} value={o.name}>
+                      <span className="font-medium">{o.label}</span>
+                      {o.label !== o.name && (
+                        <span className="ml-2 font-mono text-xs text-muted-foreground">{o.name}</span>
+                      )}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -220,7 +240,15 @@ function legacyNameBody(edited: string, current: string | null | undefined): str
 
 // EditTeamDialog: the operator break-glass — every setting is editable,
 // including the schema name and the legacy table-name overrides.
-export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () => void }) {
+export function EditTeamDialog({
+  team,
+  orgLabel,
+  onClose,
+}: {
+  team: OrgTeam;
+  orgLabel?: string;
+  onClose: () => void;
+}) {
   const update = useUpdateOrgTeam();
   const [schemaName, setSchemaName] = useState(team.schema_name);
   const [enabled, setEnabled] = useState(team.enabled);
@@ -268,7 +296,10 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
-            Edit team {team.team_id} in "{team.org_id}"
+            Edit team {team.team_id} in {orgLabel ?? team.org_id}
+            {orgLabel && orgLabel !== team.org_id && (
+              <span className="ml-1 font-mono text-xs font-normal text-muted-foreground">({team.org_id})</span>
+            )}
           </DialogTitle>
           <DialogDescription>
             Operator repair tool: every setting is editable here, including the schema name.
@@ -361,12 +392,14 @@ export function EditTeamDialog({ team, onClose }: { team: OrgTeam; onClose: () =
 export function DeleteTeamDialog({
   team,
   teamCount,
+  orgLabel,
   onClose,
 }: {
   team: OrgTeam;
   // How many teams the org currently has, so the last-team refusal shows
   // before the request instead of as a raw 409.
   teamCount: number;
+  orgLabel?: string;
   onClose: () => void;
 }) {
   const del = useDeleteOrgTeam();
@@ -388,7 +421,11 @@ export function DeleteTeamDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
-            Delete team {team.team_id} from "{team.org_id}"?
+            Delete team {team.team_id} from {orgLabel ?? team.org_id}
+            {orgLabel && orgLabel !== team.org_id && (
+              <span className="ml-1 font-mono text-xs font-normal text-muted-foreground">({team.org_id})</span>
+            )}
+            ?
           </DialogTitle>
           <DialogDescription>
             Removes only the team's config row. The warehouse schema{" "}

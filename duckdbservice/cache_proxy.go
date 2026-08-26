@@ -1,6 +1,8 @@
 package duckdbservice
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -13,11 +15,10 @@ import (
 //
 //	DUCKGRES_CACHE_ENABLED=true
 //
-// When enabled, duckgres assumes a cache proxy DaemonSet is running on the
-// same node and:
-//   - waits for its health endpoint before serving queries (prevents early
-//     S3 traffic from bypassing the cache)
-//   - routes DuckLake S3 requests through it (S3 endpoint override)
+// When enabled, duckgres starts a stable worker-local router. The router uses
+// the node-local DaemonSet when healthy and directly fetches from the signed
+// authoritative S3 source when it is not, so cache availability never gates
+// workers or PostgreSQL sessions.
 //
 // The proxy is reached via the node IP + fixed hostPorts. The NODE_IP env
 // var is injected into worker pods via the Kubernetes Downward API; control
@@ -29,6 +30,13 @@ const (
 
 	// NODE_IP is populated via fieldRef: status.hostIP on each pod.
 	nodeIPEnvVar = "NODE_IP"
+
+	// defaultCacheProxyConnectTimeout bounds worker startup when the optional
+	// node-local cache daemon is unavailable.
+	defaultCacheProxyConnectTimeout = 5 * time.Second
+	// maxCacheProxyConnectTimeout preserves enough worker-start budget for
+	// DuckDB warmup and the control-plane health RPC.
+	maxCacheProxyConnectTimeout = 10 * time.Second
 )
 
 // cacheEnabled returns true when the cache proxy integration should be used.
@@ -88,7 +96,10 @@ func LogCacheProxyStatus() {
 // secret (otherwise it defaults to HTTPS regardless), so we pin the real S3
 // endpoint for the configured region.
 func overrideS3EndpointForCacheProxy(cfg *server.DuckLakeConfig) {
-	addr := cacheProxyS3Addr()
+	overrideS3EndpointForCacheProxyAddr(cfg, cacheProxyS3Addr())
+}
+
+func overrideS3EndpointForCacheProxyAddr(cfg *server.DuckLakeConfig, addr string) {
 	if addr == "" {
 		return
 	}
@@ -104,30 +115,56 @@ func overrideS3EndpointForCacheProxy(cfg *server.DuckLakeConfig) {
 	cfg.S3UseSSL = false
 }
 
-// waitForCacheProxy blocks until the local cache proxy responds healthy.
-// When the cache is disabled, returns immediately (no-op).
-//
-// If the worker starts before the proxy is ready, DuckDB's first S3 requests
-// would fail. Block startup until the proxy is up.
-func waitForCacheProxy() {
+// cacheProxyConnectTimeout is deliberately configurable because a node may
+// need a little time to mount NVMe after a restart. It is always bounded: the
+// cache is an optimization, not a worker-startup dependency.
+func cacheProxyConnectTimeout() time.Duration {
+	value := os.Getenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT")
+	if value == "" {
+		return defaultCacheProxyConnectTimeout
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		slog.Warn("Invalid DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT; using default.",
+			"value", value, "default", defaultCacheProxyConnectTimeout, "error", err)
+		return defaultCacheProxyConnectTimeout
+	}
+	if timeout > maxCacheProxyConnectTimeout {
+		slog.Warn("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT exceeds the safe maximum; clamping.",
+			"value", timeout, "maximum", maxCacheProxyConnectTimeout)
+		return maxCacheProxyConnectTimeout
+	}
+	return timeout
+}
+
+// waitForCacheProxy performs one bounded startup health check. It never gates
+// readiness: a failure puts the worker-local router into direct-source bypass
+// mode, where it fetches from the authoritative S3 path.
+func waitForCacheProxy() cacheProxyMode {
 	url := cacheProxyHealthURL()
 	if url == "" {
-		return
+		return cacheProxyModeDisabled
 	}
 
-	client := &http.Client{Timeout: 2 * time.Second}
-
+	timeout := cacheProxyConnectTimeout()
+	client := &http.Client{Timeout: timeout}
 	start := time.Now()
-	slog.Info("Waiting for cache proxy to be ready.", "url", url)
-	for {
-		resp, err := client.Get(url)
-		if err == nil {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err == nil {
+		resp, requestErr := client.Do(req)
+		if requestErr == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				slog.Info("Cache proxy is ready.", "wait_duration", time.Since(start))
-				return
+				return cacheProxyModeCached
 			}
+			err = fmt.Errorf("health endpoint returned status %d", resp.StatusCode)
+		} else {
+			err = requestErr
 		}
-		time.Sleep(1 * time.Second)
 	}
+	cacheProxyBypassTransitionsTotal.WithLabelValues(cacheProxyBypassReasonStartupUnavailable).Inc()
+	slog.Warn("Cache proxy unavailable at worker startup; bypassing local NVMe cache.",
+		"url", url, "timeout", timeout, "wait_duration", time.Since(start), "error", err)
+	return cacheProxyModeBypassed
 }

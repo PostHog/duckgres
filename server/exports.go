@@ -198,11 +198,85 @@ func (s *Server) ConnSummariesByWorkerID() map[int]ConnLiveSummary {
 // SetConnectionWorkerSize records the provisioned worker pod size (in
 // milli-units) on a control-plane connection for compute-usage billing.
 // millicores == 0 means the size is unknown (non-remote / standalone) and
-// metering is skipped. Constant for the connection's life.
+// metering is skipped. Constant for the connection's life, except that tier
+// escalation may raise it once (largest size wins) from the message-loop
+// goroutine — the same goroutine that reads it at teardown.
 func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 	if cc != nil {
 		cc.workerMillicores = millicores
 		cc.workerMiB = mib
+	}
+}
+
+// SetConnectionExploratory marks a control-plane connection as starting on
+// the exploratory small worker and installs the switcher used to escalate it.
+// Call before RunMessageLoop; the switcher runs on the message-loop goroutine.
+func SetConnectionExploratory(cc *clientConn, switcher WorkerSwitcher) {
+	if cc != nil {
+		cc.onExploratoryWorker = true
+		cc.workerSwitcher = switcher
+	}
+}
+
+// SetSessionActivator installs the lazy first-acquisition hook on a
+// control-plane connection created WITHOUT a worker (exploratory tier only).
+// Call before RunMessageLoop; the activator runs on the message-loop goroutine.
+// The connection must have been built with a nil executor — SetSessionActivator
+// on a connection that already has one is inert by construction, since
+// ensureSessionActive never replaces a live executor. See SessionActivator.
+func SetSessionActivator(cc *clientConn, a SessionActivator) {
+	if cc != nil {
+		cc.sessionActivator = a
+	}
+}
+
+// MarkConnectionPinned takes a connection off the exploratory tier WITHOUT a
+// worker switch — used by the control-plane activator when the very first
+// statement is already a pinning one and it therefore acquired the standard
+// profile directly. Without this the connection would still believe it is on
+// the small worker and escalate (destroy + re-acquire) one statement later.
+func MarkConnectionPinned(cc *clientConn) {
+	if cc != nil {
+		cc.onExploratoryWorker = false
+	}
+}
+
+// SetPendingS3CacheOption parks a connect-time `-c duckgres.s3_cache=...`
+// startup option (already validated with ValidateS3CacheOption) on a lazily
+// activated connection. The option cannot be applied at connect — there is no
+// worker to swap the S3 transport on — so ensureSessionActive applies it right
+// after the activator installs the executor. A failure there fails the
+// activation, which is connection-fatal, matching the eager path's refusal.
+//
+// Do NOT reach for ApplyConnectionS3CacheOption from inside an activator: at
+// that point the executor is still nil, the worker swap silently no-ops, and
+// the session flag flips anyway.
+func SetPendingS3CacheOption(cc *clientConn, raw string) {
+	if cc != nil {
+		cc.pendingS3Cache = raw
+		cc.hasPendingS3Cache = true
+	}
+}
+
+// SetConnectionWorkerTTLControl installs the control-plane capability behind
+// the `duckgres.worker_ttl` session GUC on a remote/k8s connection. Call
+// before RunMessageLoop; the hooks run on the message-loop goroutine (the
+// same one that handles SET/SHOW and tier escalation), so they are
+// single-threaded with statement handling. Connections without it
+// (standalone, process backend) get session-state-only SET/SHOW.
+func SetConnectionWorkerTTLControl(cc *clientConn, ctl *WorkerTTLControl) {
+	if cc != nil {
+		cc.workerTTLCtl = ctl
+	}
+}
+
+// SetConnectionDatabase updates the PostgreSQL-visible database name for a
+// control-plane connection after the fact. The eager connect path knows the
+// resolved catalog before it builds the connection; the lazily-activated path
+// learns it only when the session is created, so the activator restamps it.
+func SetConnectionDatabase(cc *clientConn, database string) {
+	if cc != nil {
+		cc.database = database
 	}
 }
 
@@ -214,6 +288,14 @@ func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
 func SetConnectionTeamID(cc *clientConn, teamID int64) {
 	if cc != nil {
 		cc.teamID = teamID
+	}
+}
+
+// SetConnectionIdleTimeout applies a previously validated connect-time client
+// idle-timeout request. The control plane calls this before RunMessageLoop.
+func SetConnectionIdleTimeout(cc *clientConn, timeout time.Duration) {
+	if cc != nil && timeout > 0 {
+		cc.idleTimeout = timeout
 	}
 }
 

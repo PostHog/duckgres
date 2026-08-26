@@ -3,6 +3,7 @@
 package controlplane
 
 import (
+	"runtime"
 	"testing"
 )
 
@@ -75,6 +76,10 @@ func TestNewMemoryRebalancerDefaults(t *testing.T) {
 	}
 	if r.threadBudget == 0 {
 		t.Error("expected non-zero thread budget")
+	}
+	wantThreads := (runtime.NumCPU()*5 + 1) / 2
+	if r.threadBudget != wantThreads {
+		t.Errorf("thread budget = %d, want ceil(2.5 * %d CPUs) = %d", r.threadBudget, runtime.NumCPU(), wantThreads)
 	}
 }
 

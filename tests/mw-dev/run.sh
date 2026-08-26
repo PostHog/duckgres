@@ -279,9 +279,13 @@ cmd_test_e2e() {
   # Ship harness.sh into the namespace as a ConfigMap and run it as a Job that
   # talks to the control-plane ClusterIP service. The Job SA is `duckgres`,
   # which can delete worker pods in-namespace (durability test).
+  # Server-side apply: harness.sh outgrew the 256KiB cap client-side apply
+  # hits when it stashes the whole object in the last-applied annotation
+  # (metadata.annotations: Too long). SSA stores field ownership instead and
+  # allows the full 1MiB ConfigMap payload.
   "${KUBECTL[@]}" -n "$NS" create configmap duckgres-harness \
     --from-file=harness.sh="$HERE/e2e/harness.sh" \
-    --dry-run=client -o yaml | "${KUBECTL[@]}" apply -f -
+    --dry-run=client -o yaml | "${KUBECTL[@]}" apply --server-side --force-conflicts -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
   INTERNAL_SECRET_FALLBACK="$(cat "$internal_secret_fallback_file")"
@@ -402,10 +406,9 @@ cmd_test_scenario() {
 }
 
 run_scenario() {
-  local scenario_name="$1" scenario_file="$2" job pod api_base pg flight suffix internal_secret artifact_rc=0 container_rc=0 container_exit_code scenario_rc=0
+  local scenario_name="$1" scenario_file="$2" job pod api_base pg suffix internal_secret artifact_rc=0 container_rc=0 container_exit_code scenario_rc=0
   api_base="http://duckgres-control-plane.$NS.svc:8080"
   pg="$("${KUBECTL[@]}" -n "$NS" get svc duckgres-control-plane -o jsonpath='{.spec.clusterIP}')"
-  flight="duckgres-control-plane.$NS.svc:8815"
   suffix=".ci.duckgres.local"
   internal_secret="$(cat "$internal_secret_file")"
   job="$(scenario_job_name "$scenario_name")"
@@ -440,8 +443,6 @@ spec:
             - { name: DUCKGRES_SCENARIO_PG_HOST, value: "$pg" }
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
-            - { name: DUCKGRES_SCENARIO_FLIGHT_ADDR, value: "$flight" }
-            - { name: DUCKGRES_SCENARIO_FLIGHT_INSECURE_SKIP_VERIFY, value: "true" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
             # The Crossplane composition grants this isolated service account
             # exact-name access to only the matching CNPG credential Secret.

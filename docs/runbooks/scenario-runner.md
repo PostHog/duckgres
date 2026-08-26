@@ -55,10 +55,7 @@ Measured query errors fail the perf DAG step after its artifacts are written;
 independent sibling steps continue to run.
 
 A `perf_queries` step can set `with.targets` to a non-empty subset of the
-catalog's targets. If omitted, every target declared by the catalog runs. The
-frozen scenarios set `targets: [pgwire]` so they do not call the deprecated
-DuckHog Flight endpoint while the shared catalog remains usable by legacy perf
-jobs during the deprecation period.
+catalog's targets. Duckgres perf catalogs and scenarios are pgwire-only.
 
 Do not commit concrete dev endpoints, secrets, org IDs, or private bucket names.
 
@@ -101,12 +98,12 @@ just scenario-frozen-perf
 ```
 
 This runs, in order: raw-view setup, source-column preflight, explicit PostHog
-table DDL and partition setup, deterministic rewritten inserts, then schema,
-partition, count, timestamp-range, key-null-count, and bidirectional parity
-validation. The setup records the pinned revision, `rewritten_insert`, partition
-specifications, and source/destination row counts in
-`main.posthog_table_setup_manifest`. Neither `fast-suite` nor `full-suite` enables
-these tables yet.
+table DDL, registration of the frozen Parquet files in DuckLake, then partition
+and file-metadata validation. Registration reads Parquet footers but does not
+rewrite the fixture rows, so the raw-view and DuckLake-table queries use the
+same frozen S3 objects. Validation checks the declared schema and partition
+metadata plus exact source/registered file-list equality. Neither `fast-suite`
+nor `full-suite` enables these tables yet.
 
 Run frozen dbt lifecycle:
 

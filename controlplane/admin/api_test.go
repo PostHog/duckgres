@@ -13,9 +13,11 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/requestaudit"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
@@ -25,6 +27,8 @@ type fakeAPIStore struct {
 	users               map[string]*configstore.OrgUser
 	warehouses          map[string]*configstore.ManagedWarehouse
 	teams               map[string]map[int64]*configstore.OrgTeam
+	grants              map[string][]*configstore.ServiceGrant // orgID -> grants (insertion order)
+	revokedGrants       []string                               // credential_ids revoked through the store fake
 	reloadSnapshotCalls int
 	reloadSnapshotErr   error
 }
@@ -35,6 +39,7 @@ func newFakeAPIStore() *fakeAPIStore {
 		users:      make(map[string]*configstore.OrgUser),
 		warehouses: make(map[string]*configstore.ManagedWarehouse),
 		teams:      make(map[string]map[int64]*configstore.OrgTeam),
+		grants:     make(map[string][]*configstore.ServiceGrant),
 	}
 }
 
@@ -77,12 +82,22 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	}
 	org.MaxWorkers = updates.MaxWorkers
 	org.MaxVCPUs = updates.MaxVCPUs
+	// Mirrors gormAPIStore: "" = preserve, non-empty renames.
+	if updates.DatabaseName != "" {
+		org.DatabaseName = updates.DatabaseName
+	}
 	// Mirrors gormAPIStore: written unconditionally so "" clears (the handler
 	// presence-merge already preserved omitted fields).
 	org.DefaultWorkerCPU = updates.DefaultWorkerCPU
 	org.DefaultWorkerMemory = updates.DefaultWorkerMemory
 	org.DefaultWorkerTTL = updates.DefaultWorkerTTL
 	org.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
+	org.MaxHotIdleWorkers = updates.MaxHotIdleWorkers
+	org.MaxHotIdleCPU = updates.MaxHotIdleCPU
+	org.MaxHotIdleMemory = updates.MaxHotIdleMemory
+	if updates.DataImportsTableNamingVersion != "" {
+		org.DataImportsTableNamingVersion = updates.DataImportsTableNamingVersion
+	}
 	if updates.HostnameAlias != nil {
 		if *updates.HostnameAlias == "" {
 			org.HostnameAlias = nil
@@ -269,6 +284,35 @@ func (s *fakeAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, 
 func (s *fakeAPIStore) ReloadSnapshot() error {
 	s.reloadSnapshotCalls++
 	return s.reloadSnapshotErr
+}
+
+func (s *fakeAPIStore) ListServiceGrants(orgID string) ([]configstore.ServiceGrant, error) {
+	if _, ok := s.orgs[orgID]; !ok {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var out []configstore.ServiceGrant
+	for _, g := range s.grants[orgID] {
+		out = append(out, *g)
+	}
+	return out, nil
+}
+
+func (s *fakeAPIStore) RevokeServiceGrant(orgID, credentialID string) error {
+	if _, ok := s.orgs[orgID]; !ok {
+		return gorm.ErrRecordNotFound
+	}
+	for _, g := range s.grants[orgID] {
+		if g.CredentialID == credentialID {
+			if g.RevokedAt == nil {
+				now := time.Now().UTC()
+				g.RevokedAt = &now
+				g.PasswordHash = ""
+			}
+			s.revokedGrants = append(s.revokedGrants, credentialID)
+			return nil
+		}
+	}
+	return configstore.ErrServiceCredentialNotFound
 }
 
 func (s *fakeAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -1931,7 +1975,7 @@ func TestCreateOrgPersistsHostnameAlias(t *testing.T) {
 	store := newFakeAPIStore()
 	router := newTestAPIRouter(store)
 
-	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant_alpha","hostname_alias":"entirely-chief-wildcat","team_id":12345}`)
+	body := []byte(`{"name":"tenant-alpha-id","database_name":"tenant-alpha","hostname_alias":"entirely-chief-wildcat","team_id":12345}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -2062,6 +2106,164 @@ func TestCreateOrgRejectsHostnameAliasOver63Chars(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("64-char alias should be rejected: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateOrgRejectsInvalidDatabaseName(t *testing.T) {
+	cases := []struct {
+		name string
+		db   string
+	}{
+		{"missing database_name", ""},
+		{"space", "acme inc"},
+		{"dot", "acme.inc"},
+		{"underscore", "acme_inc"},
+		{"uppercase", "Acme"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			router := newTestAPIRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"name":"acme","database_name":%q,"team_id":12345}`, tc.db))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("database_name %q: status = %d, want %d: %s", tc.db, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if _, ok := store.orgs["acme"]; ok {
+				t.Errorf("database_name %q: org should NOT have been created", tc.db)
+			}
+		})
+	}
+}
+
+func TestUpdateOrgRenamesDatabaseName(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "ACME INC", // pre-existing broken row: not a valid hostname label
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"database_name":"acme-inc"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "acme-inc" {
+		t.Errorf("DatabaseName = %q, want %q", got, "acme-inc")
+	}
+}
+
+func TestUpdateOrgRejectsInvalidDatabaseName(t *testing.T) {
+	cases := []string{"", "acme.inc", "acme inc", "Acme", "-acme"}
+	for _, db := range cases {
+		t.Run(db, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["tenant-alpha-id"] = &configstore.Org{
+				Name:         "tenant-alpha-id",
+				DatabaseName: "tenant-alpha",
+			}
+			router := newTestAPIRouter(store)
+
+			body := []byte(fmt.Sprintf(`{"database_name":%q}`, db))
+			req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("database_name %q: status = %d, want %d: %s", db, rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "tenant-alpha" {
+				t.Errorf("database_name %q: DatabaseName = %q, want unchanged %q", db, got, "tenant-alpha")
+			}
+		})
+	}
+}
+
+func TestUpdateOrgWithoutDatabaseNameKeyPreservesIt(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "ACME INC", // broken pre-existing value: untouched edits must not force a rename
+	}
+	router := newTestAPIRouter(store)
+
+	body := []byte(`{"max_workers":4}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "ACME INC" {
+		t.Errorf("DatabaseName = %q, want preserved %q", got, "ACME INC")
+	}
+	if store.reloadSnapshotCalls != 0 {
+		t.Errorf("reloadSnapshotCalls = %d, want 0 (no rename, no reload)", store.reloadSnapshotCalls)
+	}
+}
+
+func TestUpdateOrgRenameDatabaseNameTrimsAndReloadsSnapshot(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "ACME INC",
+	}
+	router := newTestAPIRouter(store)
+
+	// The operator's whitespace is normalized, and the rename forces a local
+	// snapshot reload + peer fan-out — otherwise every replica keeps routing
+	// on the stale name until its next poll while the API already reported
+	// success.
+	body := []byte(`{"database_name":"  acme-inc  "}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := store.orgs["tenant-alpha-id"].DatabaseName; got != "acme-inc" {
+		t.Errorf("DatabaseName = %q, want trimmed %q", got, "acme-inc")
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Errorf("reloadSnapshotCalls = %d, want 1 (rename must reload the routing snapshot)", store.reloadSnapshotCalls)
+	}
+}
+
+func TestUpdateOrgSameDatabaseNameDoesNotReload(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["tenant-alpha-id"] = &configstore.Org{
+		Name:         "tenant-alpha-id",
+		DatabaseName: "tenant-alpha",
+	}
+	router := newTestAPIRouter(store)
+
+	// Resending the stored name is a no-op for routing: no reload fan-out.
+	body := []byte(`{"database_name":"tenant-alpha"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/tenant-alpha-id", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if store.reloadSnapshotCalls != 0 {
+		t.Errorf("reloadSnapshotCalls = %d, want 0 (name unchanged)", store.reloadSnapshotCalls)
 	}
 }
 
@@ -2346,6 +2548,105 @@ func TestUpdateOrgRejectsNegativeMaxVCPUs(t *testing.T) {
 	}
 	if store.orgs["analytics"].MaxVCPUs != 10 {
 		t.Fatalf("expected org max_vcpus to be preserved, got %d", store.orgs["analytics"].MaxVCPUs)
+	}
+}
+
+func TestUpdateOrgDataImportsTableNamingVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		from string
+		to   string
+	}{
+		{"legacy_to_copy", configstore.DataImportsTableNamingVersionLegacyBatchV1, configstore.DataImportsTableNamingVersionCopyV1},
+		{"copy_to_legacy", configstore.DataImportsTableNamingVersionCopyV1, configstore.DataImportsTableNamingVersionLegacyBatchV1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{
+				Name:                          "analytics",
+				DataImportsTableNamingVersion: tc.from,
+			}
+
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			var detail string
+			router.Use(func(c *gin.Context) {
+				c.Next()
+				detail = requestaudit.Detail(c)
+			})
+			registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics",
+				fmt.Sprintf(`{"data_imports_table_naming_version":%q}`, tc.to))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			var response configstore.Org
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if response.DataImportsTableNamingVersion != tc.to {
+				t.Fatalf("response naming version = %q, want %q", response.DataImportsTableNamingVersion, tc.to)
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != tc.to {
+				t.Fatalf("stored naming version = %q, want %q", got, tc.to)
+			}
+			wantDetail := fmt.Sprintf("data_imports_table_naming_version %s → %s", tc.from, tc.to)
+			if !strings.Contains(detail, wantDetail) {
+				t.Fatalf("audit detail = %q, want %q", detail, wantDetail)
+			}
+
+			rec = adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics", `{"max_workers":3}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("unrelated update status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != tc.to {
+				t.Fatalf("unrelated update changed naming version to %q", got)
+			}
+		})
+	}
+}
+
+func TestUpdateOrgRejectsInvalidDataImportsTableNamingVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"empty", `""`},
+		{"null", `null`},
+		{"unknown", `"future_v1"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeAPIStore()
+			store.orgs["analytics"] = &configstore.Org{
+				Name:                          "analytics",
+				DataImportsTableNamingVersion: configstore.DataImportsTableNamingVersionLegacyBatchV1,
+			}
+			router := newTestAPIRouter(store)
+
+			rec := adminJSON(t, router, http.MethodPut, "/api/v1/orgs/analytics",
+				fmt.Sprintf(`{"data_imports_table_naming_version":%s}`, tc.value))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if got := store.orgs["analytics"].DataImportsTableNamingVersion; got != configstore.DataImportsTableNamingVersionLegacyBatchV1 {
+				t.Fatalf("invalid update changed naming version to %q", got)
+			}
+		})
+	}
+}
+
+func TestCreateOrgRejectsInvalidDataImportsTableNamingVersion(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	rec := adminJSON(t, router, http.MethodPost, "/api/v1/orgs",
+		`{"name":"analytics","database_name":"analytics","team_id":1,"data_imports_table_naming_version":"future_v1"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if _, ok := store.orgs["analytics"]; ok {
+		t.Fatal("org must not be created with an invalid naming version")
 	}
 }
 
@@ -2764,7 +3065,7 @@ func TestAdminUpdateOrgTeamAuditDetail(t *testing.T) {
 	// Capture what AuditMiddleware would read after the handler returns.
 	router.Use(func(c *gin.Context) {
 		c.Next()
-		detail = c.GetString(ctxAuditDetailKey)
+		detail = requestaudit.Detail(c)
 	})
 	registerAPIWithStore(router.Group("/api/v1"), store, nil, nil)
 
@@ -2942,5 +3243,202 @@ func TestAdminUpdateOrgTeamRejectsQualifiedLegacyName(t *testing.T) {
 	}
 	if stored := store.teams["acme"][1]; stored.EventsTableName != nil {
 		t.Fatalf("rejected PUT must not store anything, got %+v", stored)
+	}
+}
+
+func TestAdminListServiceGrants(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	now := time.Now().UTC()
+	revokedAt := now.Add(-time.Hour)
+	store.grants["acme"] = []*configstore.ServiceGrant{
+		{
+			OrgID:         "acme",
+			CredentialID:  "svc_aaaaaaaaaaaaaaaaaaaaaaaa",
+			Principal:     "dagster:live",
+			PasswordHash:  "$2a$10$hashhashhashhashhashhashhashhash", // must never serialize
+			MintedAt:      now.Add(-30 * time.Minute),
+			LastRotatedAt: now.Add(-30 * time.Minute),
+			ExpiresAt:     now.Add(15 * time.Minute),
+			CreatedAt:     now.Add(-30 * time.Minute),
+			UpdatedAt:     now.Add(-30 * time.Minute),
+		},
+		{
+			OrgID:         "acme",
+			CredentialID:  "svc_bbbbbbbbbbbbbbbbbbbbbbbb",
+			Principal:     "dagster:dead",
+			MintedAt:      now.Add(-2 * time.Hour),
+			LastRotatedAt: now.Add(-2 * time.Hour),
+			ExpiresAt:     now.Add(-time.Hour),
+			RevokedAt:     &revokedAt,
+			CreatedAt:     now.Add(-2 * time.Hour),
+			UpdatedAt:     revokedAt,
+		},
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/acme/service-grants", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hashhashhash") || strings.Contains(rec.Body.String(), "password_hash") {
+		t.Fatalf("grant listing must never serialize secret material, got: %s", rec.Body.String())
+	}
+	var body []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body) != 2 {
+		t.Fatalf("grants = %d, want 2 (all statuses, flat)", len(body))
+	}
+	if body[0]["credential_id"] != "svc_aaaaaaaaaaaaaaaaaaaaaaaa" || body[0]["principal"] != "dagster:live" {
+		t.Fatalf("first grant = %v", body[0])
+	}
+	if body[1]["revoked_at"] == nil {
+		t.Fatal("revoked grant must carry revoked_at")
+	}
+	for _, g := range body {
+		if _, ok := g["expires_at"]; !ok {
+			t.Fatalf("expires_at must always be present, got %v", g)
+		}
+	}
+}
+
+func TestAdminListServiceGrantsGhostOrg404(t *testing.T) {
+	store := newFakeAPIStore()
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orgs/ghost/service-grants", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminRevokeServiceGrant(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme"}
+	now := time.Now().UTC()
+	store.grants["acme"] = []*configstore.ServiceGrant{
+		{
+			OrgID:         "acme",
+			CredentialID:  "svc_aaaaaaaaaaaaaaaaaaaaaaaa",
+			Principal:     "dagster:live",
+			PasswordHash:  "$2a$10$somehash",
+			MintedAt:      now.Add(-30 * time.Minute),
+			LastRotatedAt: now.Add(-30 * time.Minute),
+			ExpiresAt:     now.Add(15 * time.Minute),
+		},
+	}
+	router := newTestAPIRouter(store)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/acme/service-grants/svc_aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.grants["acme"][0]
+	if stored.RevokedAt == nil {
+		t.Fatal("revoke must stamp revoked_at")
+	}
+	if stored.PasswordHash != "" {
+		t.Fatal("revoke must blank the password hash server-side")
+	}
+	if store.reloadSnapshotCalls != 1 {
+		t.Fatalf("ReloadSnapshot called %d times, want exactly 1 (revocation must take effect without waiting a poll)", store.reloadSnapshotCalls)
+	}
+
+	// Already-revoked is idempotent.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/acme/service-grants/svc_aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("re-revoke: status = %d, want 200 (idempotent): %s", rec.Code, rec.Body.String())
+	}
+
+	// Unknown credential → 404.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/acme/service-grants/svc_eeeeeeeeeeeeeeeeeeeeeeee", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown credential: status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+
+	// Ghost org → 404.
+	req = httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/ghost/service-grants/svc_aaaaaaaaaaaaaaaaaaaaaaaa", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("ghost org: status = %d, want 404: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The hot-idle pool caps merge presence-aware like every other org column:
+// present wins (including 0/"" clearing back to unlimited), absent preserves.
+func TestUpdateOrgHotIdleCaps(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{
+		Name:              "acme",
+		DatabaseName:      "acme_db",
+		MaxHotIdleWorkers: 9,
+		MaxHotIdleCPU:     "4",
+	}
+	router := newTestAPIRouter(store)
+
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Set all three; the stored row must carry them.
+	rec := put(`{"max_hot_idle_workers":5,"max_hot_idle_cpu":"16","max_hot_idle_memory":"64Gi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	stored := store.orgs["acme"]
+	if stored.MaxHotIdleWorkers != 5 || stored.MaxHotIdleCPU != "16" || stored.MaxHotIdleMemory != "64Gi" {
+		t.Fatalf("caps not stored: %+v", stored)
+	}
+
+	// Absent fields preserve; an explicit 0/"" clears back to unlimited.
+	rec = put(`{"max_hot_idle_workers":0,"max_hot_idle_memory":""}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	stored = store.orgs["acme"]
+	if stored.MaxHotIdleWorkers != 0 || stored.MaxHotIdleMemory != "" || stored.MaxHotIdleCPU != "16" {
+		t.Fatalf("presence-aware merge wrong: %+v", stored)
+	}
+}
+
+// A cap quantity that won't parse (or is zero) must 400: the sweep reads
+// those as UNLIMITED, so accepting them would silently mean "no cap".
+func TestUpdateOrgHotIdleCapsRejectBadQuantities(t *testing.T) {
+	store := newFakeAPIStore()
+	store.orgs["acme"] = &configstore.Org{Name: "acme", DatabaseName: "acme_db"}
+	router := newTestAPIRouter(store)
+
+	for _, body := range []string{
+		`{"max_hot_idle_cpu":"sixteen"}`,
+		`{"max_hot_idle_cpu":"0"}`,
+		`{"max_hot_idle_memory":"lots"}`,
+		`{"max_hot_idle_memory":"-4Gi"}`,
+		`{"max_hot_idle_workers":-1}`,
+	} {
+		req := httptest.NewRequest(http.MethodPut, "/api/v1/orgs/acme", bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", body, rec.Code)
+		}
 	}
 }

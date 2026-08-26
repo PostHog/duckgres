@@ -109,6 +109,9 @@ func (c *clientConn) closeCursorsAtTxEnd(cmdType string) {
 		return
 	}
 	c.closeAllCursors()
+	// Suspended portals hold an open rowset for the same liveness reason
+	// cursors do, and PostgreSQL destroys portals at transaction end anyway.
+	c.closeSuspendedPortals()
 }
 
 // getCursorSchema opens the cursor if needed to retrieve column metadata,

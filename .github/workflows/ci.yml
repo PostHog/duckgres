@@ -131,7 +131,7 @@ jobs:
     services:
       # PostgreSQL for comparison tests
       postgres:
-        image: public.ecr.aws/docker/library/postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -146,7 +146,7 @@ jobs:
 
       # DuckLake metadata store
       ducklake-metadata:
-        image: public.ecr.aws/docker/library/postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_USER: ducklake
           POSTGRES_PASSWORD: ducklake
@@ -222,7 +222,7 @@ jobs:
 
     services:
       postgres:
-        image: public.ecr.aws/docker/library/postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -255,7 +255,7 @@ jobs:
 
     services:
       postgres:
-        image: public.ecr.aws/docker/library/postgres:16-alpine
+        image: public.ecr.aws/docker/library/postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres

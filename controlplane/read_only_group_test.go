@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -28,12 +29,16 @@ func (stubProvisioningStore) Provision(provisioning.ProvisionRequest) error { re
 func (stubProvisioningStore) CreatePendingWarehouse(string, string, *configstore.ManagedWarehouse) error {
 	return nil
 }
-func (stubProvisioningStore) CreateOrgUser(string, string, string) error         { return nil }
-func (stubProvisioningStore) UpdateOrgUserPassword(string, string, string) error { return nil }
+func (stubProvisioningStore) CreateOrgUser(string, string, string) error { return nil }
+func (stubProvisioningStore) GetOrgUser(string, string) (*configstore.OrgUser, error) {
+	return nil, gorm.ErrRecordNotFound
+}
 func (stubProvisioningStore) SetWarehouseDeleting(string, configstore.ManagedWarehouseProvisioningState) error {
 	return nil
 }
-func (stubProvisioningStore) IsDatabaseNameAvailable(string) (bool, error) { return true, nil }
+func (stubProvisioningStore) IsDatabaseNameAvailable(string) (bool, error)        { return true, nil }
+func (stubProvisioningStore) EnableTrino(string, configstore.TrinoSettings) error { return nil }
+func (stubProvisioningStore) DisableTrino(string) error                           { return nil }
 func (stubProvisioningStore) ListOrgTeams(string) ([]configstore.OrgTeam, error) {
 	return nil, nil
 }

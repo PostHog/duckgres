@@ -34,6 +34,8 @@ export interface Operator {
 
 // ---- Orgs (confirmed) ----
 
+export type DataImportsTableNamingVersion = "legacy_batch_v1" | "copy_v1";
+
 export interface SecretRef {
   namespace: string;
   name: string;
@@ -47,10 +49,14 @@ export interface Org {
   teams?: OrgTeam[];
   max_workers: number;
   max_vcpus: number;
+  max_hot_idle_workers: number;
+  max_hot_idle_cpu: string;
+  max_hot_idle_memory: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
+  data_imports_table_naming_version: DataImportsTableNamingVersion;
   users?: OrgUser[];
   warehouse?: ManagedWarehouse | null;
   created_at: string;
@@ -59,13 +65,23 @@ export interface Org {
 
 // Editable subset of Org accepted by PUT /api/v1/orgs/:id.
 export interface OrgUpdate {
+  // database_name renames the org's database — and with it the managed
+  // hostname (<database_name>.<managed-suffix>) — which is exactly how an org
+  // whose stored name is not a routable DNS label gets fixed. Must be a valid
+  // single DNS label (server-enforced); the unique index still guards
+  // collisions.
+  database_name?: string;
   max_workers?: number;
+  max_hot_idle_workers?: number;
+  max_hot_idle_cpu?: string;
+  max_hot_idle_memory?: string;
   max_vcpus?: number;
   default_worker_cpu?: string;
   default_worker_memory?: string;
   default_worker_ttl?: string;
   default_worker_min_hot_idle?: number;
   hostname_alias?: string | null;
+  data_imports_table_naming_version?: DataImportsTableNamingVersion;
 }
 
 // One duckgres_org_teams row: a PostHog team mapped to this org and the
@@ -128,6 +144,70 @@ export interface OrgTeamUpdateBody {
 export interface OrgTeamDeleteResult {
   deleted: number;
   org: string;
+}
+
+// ---- Warehouse provisioning (the PostHog backend's onboarding API) ----
+
+// POST /api/v1/orgs/:id/provision — the EXACT endpoint + body the PostHog
+// backend calls to onboard an org's warehouse
+// (controlplane/provisioning/api.go::provisionWarehouse). The admin console's
+// "Add organization" dialog drives it as-is: same fields, same 202 response
+// with the root user's generated password (returned here only — only the
+// bcrypt hash is persisted).
+export interface ProvisionWarehouseBody {
+  database_name: string;
+  // Required when the provision creates a NEW org (a warehouse cannot exist
+  // without a team); optional on re-provision of an existing org.
+  team_id?: number;
+  // Optional warehouse-schema override for the first team row; requires
+  // team_id. Defaults to team_<id>.
+  schema_name?: string;
+  metadata_store: {
+    type: "cnpg-shard" | "external";
+    // Required when type is "external": a pre-existing Postgres endpoint + the
+    // AWS Secrets Manager secret NAME holding its password.
+    external?: {
+      endpoint: string;
+      password_aws_secret: string;
+      user?: string;
+      database?: string;
+    };
+  };
+  // Omitted (or type "s3bucket") provisions a fresh per-org bucket; "external"
+  // reuses an existing bucket and then requires bucket_name.
+  data_store?: {
+    type: "s3bucket" | "external";
+    bucket_name?: string;
+    region?: string;
+  };
+  ducklake: { enabled: boolean };
+}
+
+// 202 response. The plaintext root password is in this response ONLY.
+export interface ProvisionWarehouseResult {
+  status: string;
+  org: string;
+  username: string;
+  password: string;
+  bucket?: string;
+}
+
+// GET /api/v1/orgs/:id/warehouse/status — provisioning lifecycle state. The
+// `connection` block (no password) is present once state is "ready".
+export interface WarehouseStatusResult {
+  org_id: string;
+  state: WarehouseState;
+  status_message: string;
+  ready_at?: string;
+  failed_at?: string;
+  bucket?: string;
+  connection?: { host: string; port: number; database: string; username: string };
+}
+
+// GET /api/v1/database-name/check?name=… — database-name availability.
+export interface DatabaseNameCheck {
+  name: string;
+  available: boolean;
 }
 
 // ---- Users (confirmed) ----
@@ -524,6 +604,10 @@ export interface AuditEntry {
   // Optional non-sensitive human context recorded by the handler, e.g.
   // "role viewer → admin" or "max_workers 4 → 10".
   detail?: string;
+  // Optional machine-readable durable result. This disambiguates a mutation
+  // that landed before later response-path work failed from a pre-mutation
+  // failure without parsing the human detail string.
+  outcome?: string;
   status: number;
   remote_addr?: string;
 }
@@ -606,4 +690,61 @@ export interface ExternalMetadataStoreInfo {
   password_aws_secret: string;
   user: string;
   database: string;
+}
+
+// GET /api/v1/usage/monthly — the Usage page. Rows are per (UTC month, org,
+// team), merged across the compute + storage billing families over the
+// RETAINED billing buffer (acked buckets are deleted; >30d buckets GC'd) —
+// watermark_low is the billing ack cursor that bounds how far back data can
+// exist. gib_seconds is the exact-decimal GiB-seconds JSON number.
+export interface MonthlyUsageRow {
+  month: string; // "YYYY-MM" UTC
+  org_id: string;
+  team_id: number;
+  schema_name: string | null;
+  cpu_seconds: number;
+  memory_seconds: number;
+  gib_seconds: number;
+}
+
+export interface MonthlyUsageResponse {
+  from: string;
+  months: number;
+  watermark_low: string | null;
+  rows: MonthlyUsageRow[];
+}
+
+// GET /api/v1/orgs/:id/usage/daily — the org detail page's usage charts.
+// One row per (UTC date, team), compute + storage merged, over the retained
+// billing buffer (same retention as the monthly view: acked buckets are
+// deleted, >30d buckets GC'd — watermark_low marks where billed data went).
+export interface DailyUsageRow {
+  date: string; // "YYYY-MM-DD" UTC
+  team_id: number;
+  schema_name: string | null;
+  cpu_seconds: number;
+  memory_seconds: number;
+  gib_seconds: number;
+}
+
+export interface DailyUsageResponse {
+  org_id: string;
+  days: number;
+  from: string;
+  watermark_low: string | null;
+  rows: DailyUsageRow[];
+}
+
+// GET /api/v1/workers/hot-idle — one org's hot-idle pool footprint + its
+// configured pool caps (0/"" = unlimited), for the Workers page's hot-idle
+// reporting card.
+export interface HotIdleOrg {
+  org_id: string;
+  count: number;
+  cpu_cores: number;
+  memory_bytes: number;
+  oldest_hot_idle_since: string | null;
+  cap_workers: number;
+  cap_cpu: string;
+  cap_memory: string;
 }

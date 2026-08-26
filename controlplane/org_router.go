@@ -39,7 +39,6 @@ type OrgRouter struct {
 	nextWorkerID          atomic.Int32
 	draining              atomic.Bool
 	sharedCancel          context.CancelFunc
-	projectScopedUserChange   func(orgID, username string)
 	admissionReclaimer    admissionReclaimer
 	terminal              bool // protected by mu; no stack operation may start after this is set
 	stackOps              sync.WaitGroup
@@ -156,9 +155,10 @@ func (tr *OrgRouter) createOrgStackWhileMutationHeld(tc *configstore.OrgConfig) 
 	activator.setMigrating = tr.SetMigrating
 	activator.clearMigrating = tr.ClearMigrating
 	pool.activateReservedWorker = activator.ActivateReservedWorker
-	// In K8s mode, DuckDB auto-detects memory from the container's cgroup limits.
-	// Pass 0/false to disable budget-based rebalancing.
-	rebalancer := NewMemoryRebalancer(0, 0, nil, false)
+	// In K8s mode, normal client sessions supply pod-derived limits directly.
+	// Keep the default worker's thread count here as the fallback for internal
+	// sessions (such as admin impersonation) that do not carry a profile.
+	rebalancer := NewMemoryRebalancer(0, tr.defaultWorkerDuckDBThreads(), nil, false)
 	sessions := NewOrgSessionManager(pool, rebalancer, tc.Name)
 	if tr.userSecrets != nil {
 		sessions.SetUserSecretLoader(tr.userSecrets.SessionSecretLoader(tc.Name))
@@ -220,6 +220,11 @@ func (tr *OrgRouter) createOrgStackWhileMutationHeld(tc *configstore.OrgConfig) 
 
 	slog.Info("Org stack created.", "org", tc.Name, "max_workers", stack.Config.MaxWorkers)
 	return stack, nil
+}
+
+func (tr *OrgRouter) defaultWorkerDuckDBThreads() int {
+	cpuRequest := firstNonEmpty(tr.baseCfg.WorkerCPURequest, defaultWorkerCPU)
+	return duckDBThreadsForK8sCPU(cpuRequest)
 }
 
 // beginOrgStackOperation registers a create/destroy operation while holding the
@@ -647,12 +652,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			tr.srv.DrainUserConnections(key.OrgID, key.Username)
 		}
 		tr.mu.RLock()
-		onProjectScopedUserChange := tr.projectScopedUserChange
-		tr.mu.RUnlock()
-		if onProjectScopedUserChange != nil {
-			onProjectScopedUserChange(key.OrgID, key.Username)
-		}
-		tr.mu.RLock()
 		stack := tr.orgs[key.OrgID]
 		tr.mu.RUnlock()
 		if stack != nil && stack.Sessions != nil {
@@ -683,12 +682,6 @@ func (tr *OrgRouter) HandleConfigChange(old, new *configstore.Snapshot) {
 			slog.Error("Failed to reconcile org stack on config change.", "org", name, "error", err)
 		}
 	}
-}
-
-func (tr *OrgRouter) setProjectScopedUserChangeHandler(handler func(orgID, username string)) {
-	tr.mu.Lock()
-	defer tr.mu.Unlock()
-	tr.projectScopedUserChange = handler
 }
 
 // changedProjectScopedUsers reports the project-scoped logins (reader OR user)

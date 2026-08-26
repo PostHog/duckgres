@@ -100,14 +100,12 @@ func (sb *syncBuffer) String() string {
 type cpHarness struct {
 	cmd        *exec.Cmd
 	port       int
-	flightPort int
 	socketDir  string
 	configFile string
 	logBuf     *syncBuffer
 }
 
 type cpOpts struct {
-	flightPort           int
 	maxWorkers           int
 	duckLake             bool
 	duckLakeMetadataPort int
@@ -122,7 +120,6 @@ func startControlPlane(t *testing.T, opts cpOpts) *cpHarness {
 	t.Helper()
 
 	port := freePort(t)
-	flightPort := opts.flightPort
 
 	tmpDir := t.TempDir()
 	dataDir := filepath.Join(tmpDir, "data")
@@ -149,9 +146,6 @@ tls:
 users:
   testuser: testpass
 `, port, dataDir, certFile, keyFile)
-	if flightPort > 0 {
-		configContent += fmt.Sprintf("flight_port: %d\n", flightPort)
-	}
 	if opts.maxWorkers > 0 {
 		configContent += fmt.Sprintf("process:\n  max_workers: %d\n", opts.maxWorkers)
 	}
@@ -198,7 +192,6 @@ users:
 	h := &cpHarness{
 		cmd:        cmd,
 		port:       port,
-		flightPort: flightPort,
 		socketDir:  socketDir,
 		configFile: configFile,
 		logBuf:     logBuf,
@@ -243,17 +236,6 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("log %q not found after %v", substr, timeout)
-}
-
-func (h *cpHarness) waitForLogCount(substr string, want int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if strings.Count(h.logBuf.String(), substr) >= want {
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return fmt.Errorf("log %q not found %d times after %v", substr, want, timeout)
 }
 
 func (h *cpHarness) cleanup(t *testing.T) {

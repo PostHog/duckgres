@@ -67,8 +67,6 @@ spec:
             - "/certs/server.crt"
             - "--key"
             - "/certs/server.key"
-            - "--flight-port"
-            - "8815"
             - "--sni-routing-mode"
             - "enforce"
             - "--managed-hostname-suffixes"
@@ -78,9 +76,6 @@ spec:
           ports:
             - name: pg
               containerPort: 5432
-              protocol: TCP
-            - name: flight
-              containerPort: 8815
               protocol: TCP
             - name: api
               containerPort: 8080
@@ -131,10 +126,6 @@ spec:
     - name: pg
       port: 5432
       targetPort: pg
-      protocol: TCP
-    - name: flight
-      port: 8815
-      targetPort: flight
       protocol: TCP
     - name: api
       port: 8080

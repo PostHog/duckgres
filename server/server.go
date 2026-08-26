@@ -171,30 +171,10 @@ func redactConnectionString(connStr string) string {
 }
 
 type Config struct {
-	Host string
-	Port int
-	// FlightPort enables Arrow Flight SQL ingress on the control plane.
-	// 0 disables Flight ingress.
-	FlightPort int
-
-	// FlightSessionIdleTTL controls how long an idle Flight auth session is kept
-	// before being reaped.
-	FlightSessionIdleTTL time.Duration
-
-	// FlightSessionReapInterval controls how frequently idle Flight auth sessions
-	// are scanned and reaped.
-	FlightSessionReapInterval time.Duration
-
-	// FlightHandleIdleTTL controls stale prepared/query handle cleanup inside a
-	// Flight auth session.
-	FlightHandleIdleTTL time.Duration
-
-	// FlightSessionTokenTTL controls the absolute lifetime of issued
-	// x-duckgres-session tokens. Expired tokens are rejected and require
-	// a fresh bootstrap request.
-	FlightSessionTokenTTL time.Duration
-	DataDir               string
-	Users                 map[string]string // username -> password
+	Host    string
+	Port    int
+	DataDir string
+	Users   map[string]string // username -> password
 
 	// TLS configuration (required unless ACME is configured)
 	TLSCertFile string // Path to TLS certificate file
@@ -234,6 +214,12 @@ type Config struct {
 	// This prevents accumulation of zombie connections from clients that disconnect
 	// uncleanly. Default: 24 hours. Set to a negative value (e.g., -1) to disable.
 	IdleTimeout time.Duration
+
+	// ClientIdleTimeoutMax is the largest timeout a client may request through
+	// the connect-time duckgres.idle_timeout option. A non-positive value disables
+	// client overrides. This must remain bounded because idle control-plane
+	// sessions retain workers and admission capacity.
+	ClientIdleTimeoutMax time.Duration
 
 	// SessionInitTimeout bounds startup metadata initialization and catalog probes.
 	// Default: 10 seconds.
@@ -277,7 +263,7 @@ type Config struct {
 	MemoryLimit string
 
 	// Threads is the DuckDB threads per session.
-	// If zero, defaults to runtime.NumCPU().
+	// If zero, defaults to 2.5x runtime.NumCPU(), rounded up.
 	Threads int
 
 	// MemoryBudget is the total memory available for all DuckDB sessions (e.g., "24GB").
@@ -297,6 +283,13 @@ type Config struct {
 
 	// QueryLog configures query-log collection and flushing.
 	QueryLog QueryLogConfig
+
+	// DisableParquetPrefetching turns off DuckDB's parquet prefetch, which
+	// coalesces reads across non-projected columns on remote files. Set for
+	// deployments whose cache proxy runs in block-aligned mode, where
+	// prefetch's coalesced reads cause byte amplification the proxy can't
+	// avoid. See applyParquetPrefetchPolicy / parquetPrefetchPolicyStatements.
+	DisableParquetPrefetching bool
 }
 
 // QueryLogConfig configures the query log feature.
@@ -958,7 +951,7 @@ func ConfigureMainDB(db *sql.DB, cfg Config, username string) error {
 	// Set DuckDB threads
 	threads := cfg.Threads
 	if threads == 0 {
-		threads = runtime.NumCPU() * 2
+		threads = DefaultDuckDBThreads(int64(runtime.NumCPU()) * 1000)
 	}
 	if _, err := db.Exec(fmt.Sprintf("SET threads = %d", threads)); err != nil {
 		slog.Warn("Failed to set DuckDB threads.", "threads", threads, "error", err)
@@ -1100,6 +1093,33 @@ func applyHTTPFSRetryBudget(db *sql.DB) {
 	}
 }
 
+// parquetPrefetchPolicyStatements returns the SET statements for the
+// deployment's parquet prefetch policy. Prefetch coalesces reads across
+// non-projected columns on remote files — measured at up to ~50x byte
+// amplification on narrow scans of wide tables — so deployments whose
+// cache proxy runs in block-aligned mode (which serves drifted lazy-read
+// ranges from cache) turn it off. SET GLOBAL for the same reason as
+// applyHTTPFSRetryBudget: workers recycle connections between sessions.
+func parquetPrefetchPolicyStatements(disablePrefetch bool) []string {
+	if !disablePrefetch {
+		return nil
+	}
+	return []string{"SET GLOBAL disable_parquet_prefetching = true"}
+}
+
+// applyParquetPrefetchPolicy applies the deployment's parquet prefetch
+// policy after the ATTACH calls, same call site as applyHTTPFSRetryBudget
+// and for the same reason: httpfs (and its settable options) only exist
+// once DuckLake's ATTACH has auto-loaded it. Warn-only: a SET failure must
+// not fail the connection.
+func applyParquetPrefetchPolicy(db *sql.DB, disablePrefetch bool) {
+	for _, stmt := range parquetPrefetchPolicyStatements(disablePrefetch) {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to set parquet prefetch policy.", "stmt", stmt, "error", err)
+		}
+	}
+}
+
 func seedBundledExtensions(srcRoot, dstRoot string) error {
 	srcRoot = filepath.Clean(srcRoot)
 	dstRoot = filepath.Clean(dstRoot)
@@ -1172,11 +1192,12 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 // metadata work) and ship updated binaries between DuckDB releases.
 // postgres_scanner is here because PR #447 originally bundled it from the
 // nightly repo to overwrite stale stable copies seeded on prior worker
-// upgrades; even now that we pull from stable, refreshing on every boot
-// keeps the on-disk extension cache in sync with whatever the running
-// image bundles. json is a stock DuckDB extension that we pull from the
-// stable repo for the engine's version — it doesn't ship intra-version
-// changes, so it's intentionally omitted.
+// upgrades. It can also carry checksum-pinned upstream fixes within one
+// DuckDB patch release, so refreshing on every boot keeps the on-disk
+// extension cache in sync with whatever the running image bundles. json is
+// a stock DuckDB extension that we pull from the stable repo for the engine's
+// version — it doesn't ship intra-version changes, so it's intentionally
+// omitted.
 func shouldRefreshBundledExtension(srcPath string) bool {
 	switch filepath.Base(srcPath) {
 	case "httpfs.duckdb_extension",
@@ -1328,6 +1349,7 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	// httpfs (DuckLake auto-loads it on the first S3 touch). See
 	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
 	applyHTTPFSRetryBudget(db)
+	applyParquetPrefetchPolicy(db, cfg.DisableParquetPrefetching)
 
 	return nil
 }
@@ -1364,6 +1386,7 @@ func ActivateDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, use
 	// httpfs (DuckLake auto-loads it on the first S3 touch). See
 	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
 	applyHTTPFSRetryBudget(db)
+	applyParquetPrefetchPolicy(db, cfg.DisableParquetPrefetching)
 
 	return nil
 }
@@ -1411,6 +1434,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	// httpfs (DuckLake auto-loads it on the first S3 touch). See
 	// applyHTTPFSRetryBudget for why this can't run in ConfigureMainDB.
 	applyHTTPFSRetryBudget(db)
+	applyParquetPrefetchPolicy(db, cfg.DisableParquetPrefetching)
 
 	return db, nil
 }
@@ -1476,7 +1500,7 @@ func shouldInstallExtension(name string) bool {
 	// The bundle-skip optimization assumes a bundled .duckdb_extension on disk
 	// is enough — LOAD finds the file via extension_directory and DuckDB treats
 	// it as installed. That holds for the PostHog-fork extensions (httpfs,
-	// ducklake) and the stable ones we ship (json, postgres_scanner): LOAD
+	// ducklake) and the upstream ones we ship (json, postgres_scanner): LOAD
 	// against the seeded extension_directory file just works.
 	return !hasBundledExtensionBinary(name)
 }
@@ -1892,6 +1916,12 @@ type duckLakeMetadataIndex struct {
 // duckLakeMetadataIndexes lists indexes that improve DuckDB postgres scanner
 // performance. The scanner uses COPY with ctid batches and pushes down filters,
 // but without indexes each batch requires a sequential scan.
+//
+// Keep in sync with the catalog-maintenance side of the house: the same index
+// set (under ducklake_*_idx names) is applied to shared/standalone catalogs by
+// the DuckLake maintenance tooling (PostHog/millpond, tools/ducklake_maintenance.py
+// CATALOG_INDEXES). The two never overlap here because workers attach per-tenant
+// catalogs, not the shared one.
 var duckLakeMetadataIndexes = []duckLakeMetadataIndex{
 	// Critical: ducklake_file_column_stats is often the largest table (millions of rows).
 	// Filter pushdown CTEs query by (table_id, column_id) on every query.
@@ -1920,6 +1950,39 @@ var duckLakeMetadataIndexes = []duckLakeMetadataIndex{
 	{
 		name: "idx_ducklake_data_file_tbl_snap",
 		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_tbl_snap ON ducklake_data_file (table_id, begin_snapshot, end_snapshot)",
+	},
+	// Per-file and table-scoped per-file reads of the stats/partition side
+	// tables. Those tables have no index at all in the stock DuckLake schema,
+	// so per-snapshot file listings seq-scan them once they grow (measured:
+	// minutes per listing on a shared catalog with ~10^8 stats rows). The
+	// (table_id, data_file_id) composites serve `WHERE table_id = ? AND
+	// data_file_id IN (...)` fetches; the solo data_file_id indexes serve
+	// per-file lookups.
+	{
+		name: "idx_ducklake_file_col_stats_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_file ON ducklake_file_column_stats (data_file_id)",
+	},
+	{
+		name: "idx_ducklake_file_col_stats_tbl_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_col_stats_tbl_file ON ducklake_file_column_stats (table_id, data_file_id)",
+	},
+	{
+		name: "idx_ducklake_file_part_val_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_part_val_file ON ducklake_file_partition_value (data_file_id)",
+	},
+	{
+		name: "idx_ducklake_file_part_val_tbl_file",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_file_part_val_tbl_file ON ducklake_file_partition_value (table_id, data_file_id)",
+	},
+	// Live-file scans ordered by size (compaction / metrics): partial on
+	// end_snapshot IS NULL so expired files never bloat the index.
+	{
+		name: "idx_ducklake_data_file_compaction",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_data_file_compaction ON ducklake_data_file (table_id, end_snapshot, file_size_bytes) WHERE end_snapshot IS NULL",
+	},
+	{
+		name: "idx_ducklake_delete_file_compaction",
+		stmt: "CREATE INDEX IF NOT EXISTS idx_ducklake_delete_file_compaction ON ducklake_delete_file (table_id, end_snapshot, file_size_bytes) WHERE end_snapshot IS NULL",
 	},
 	{
 		name: "idx_ducklake_delete_file_tbl_snap",

@@ -279,6 +279,12 @@ func truncateQuery(q string) string {
 	return q
 }
 
+// BoundQueryLogText is the shared 4096-byte UTF-8-safe cap used by the
+// durable query log and the PostHog OTLP query-text handler.
+func BoundQueryLogText(text string) string {
+	return boundQueryLogText(text)
+}
+
 // boundQueryLogText caps control-plane query-log text before it reaches logs,
 // in-memory queues, normalization, or RPC serialization. Clone the retained
 // text so a bounded entry cannot keep a much larger query allocation alive.
@@ -458,6 +464,7 @@ func (c *clientConn) logQueryStart(scope *queryMetricsScope) {
 		QueryMetadata:    encodedMeta,
 		AccessKinds:      accessKinds,
 		MetadataComplete: metaComplete,
+		WorkerTier:       c.currentWorkerTier(),
 	})
 }
 
@@ -484,14 +491,15 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 	// this usage signal does not depend on query-log configuration.
 	if errCode == "" {
 		analytics.Default().Capture("query_completed", c.orgID, map[string]any{
-			"user":        c.username,
-			"team_id":     c.teamID,
-			"trace_id":    observe.TraceIDFromContext(c.ctx),
-			"protocol":    protocol,
-			"query_kind":  classifyQuery(cmdType),
-			"duration_ms": time.Since(start).Milliseconds(),
-			"cpu_seconds": profilingSummary.CPUTimeSeconds,
-			"result_rows": resultRows,
+			"user":             c.username,
+			"team_id":          c.teamID,
+			"trace_id":         observe.TraceIDFromContext(c.ctx),
+			"protocol":         protocol,
+			"query_kind":       classifyQuery(cmdType),
+			"duration_ms":      time.Since(start).Milliseconds(),
+			"cpu_seconds":      profilingSummary.CPUTimeSeconds,
+			"result_rows":      resultRows,
+			"application_name": c.applicationName,
 		})
 	}
 
@@ -577,6 +585,7 @@ func (c *clientConn) logQuery(start time.Time, query, transpiledQuery, cmdType s
 		QueryMetadata:         encodedMeta,
 		AccessKinds:           accessKinds,
 		MetadataComplete:      metaComplete,
+		WorkerTier:            c.currentWorkerTier(),
 	})
 }
 

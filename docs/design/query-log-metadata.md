@@ -97,14 +97,11 @@ changes is who *originates* records, not who writes them.
 1. **No `query_id`** — nothing correlates rows, traces, or a support ticket.
 2. **A query that never finishes leaves no row at all.** Worker OOM-kill or pod
    eviction mid-query produces zero evidence. Worst gap for incident triage.
-3. **Flight SQL ingress writes nothing** — `server/flightsqlingress/` never calls
-   `logQuery`. Flight traffic is invisible. For an audit trail this is
-   disqualifying: the log must not have a bypass.
-4. **`normalized_query_hash` is a regex+FNV approximation** while `pg_query_go`
+3. **`normalized_query_hash` is a regex+FNV approximation** while `pg_query_go`
    — already a dependency — exposes `FingerprintToUInt64` / `Normalize`.
-5. **No relation-level metadata** — no `tables`, `schemas`, `columns`,
+4. **No relation-level metadata** — no `tables`, `schemas`, `columns`,
    `used_functions`.
-6. **Three independent parses for scoped users**: `Authorize`
+5. **Three independent parses for scoped users**: `Authorize`
    (`query_access.go`), `rewriteScopedMetadataQuery`
    (`ingress.go:1281`), and the transpiler each call `pg_query.Parse`.
 7. **No retention.** Partitions are created and never dropped.
@@ -166,10 +163,8 @@ CP: mint query_id (UUIDv7)
 
 **Why the engine owns the terminal**, rather than keeping it CP-side:
 
-- It is the **only bypass-free choke point**. PG wire, Flight SQL ingress, admin
-  impersonation, and internal maintenance SQL all converge on the worker. Anchor
-  the audit record there and gap #3 closes structurally instead of by
-  remembering to add a call site.
+- It is the **only bypass-free choke point**. PG wire, admin impersonation, and
+  internal maintenance SQL all converge on the worker.
 - It has the profiling JSON **locally**, including for failed queries, where the
   CP's trailer-based capture is unreliable.
 - It survives CP-side abandonment: client disconnect mid-query, CP pod eviction.
@@ -232,10 +227,9 @@ ctx = querylog.WithQueryID(ctx, obs.queryID)   // at the CP choke point
 // withSession reads it back and appends the header
 ```
 
-Context-sourced propagation means the Flight SQL ingress path gets it for free —
-both front-ends funnel into the same `FlightExecutor.QueryContext` /
-`ExecContext`. Implementation requirement: paths that currently pass the
-*connection* context to execution need a per-query derived context.
+The pgwire front end funnels into `FlightExecutor.QueryContext` / `ExecContext`.
+Implementation requirement: paths that currently pass the *connection* context
+to execution need a per-query derived context.
 
 The engine also needs the small set of per-query dimensions it cannot infer:
 `query_source` (billing key, changeable mid-session via SET) and `protocol`.
@@ -293,8 +287,6 @@ choke points:
 | --- | --- |
 | `server/conn.go:1243` | PG wire, simple query |
 | `server/conn_extended_query.go:42` | PG wire, extended query |
-| `server/flightsqlingress/ingress.go:1250` | Flight ingress, query |
-| `server/flightsqlingress/ingress.go:1268` | Flight ingress, exec |
 
 **The RBAC hook already exists; it is just currently gated on
 `policy != nil`.** The plan is not to build a parallel mechanism but to:
@@ -492,7 +484,7 @@ Deliberately skipped (CH-engine-specific or unknowable here): `partitions`,
 | column | CH analog | rows | source |
 | --- | --- | --- | --- |
 | `user_name`, `org_id`, `current_database`, `client_address`, `client_port`, `application_name`, `pid`, `protocol` (exist) | `user`, —, `current_database`, `address`, `port`, `client_name` | B | |
-| `interface` | `interface` | B | **[new]** `pg` \| `flight` \| `admin` |
+| `interface` | `interface` | B | **[new]** `pg` \| `admin` |
 | `is_secure`, `tls_version`, `tls_cipher` | `is_secure` | S | **[session]** from `*tls.Conn` handshake state |
 | `auth_method`, `access_scope` | — | S | **[session]** password/passthrough/internal; root vs project-scoped |
 | `query_source` | — | B | **[session]** the `duckgres.query_source` GUC — already a billing dimension, currently unjoinable to the log |
@@ -670,7 +662,5 @@ Per `CLAUDE.md`, each phase ships with:
     statement yields `ExceptionBeforeStart` and no terminal.
   - `query_log_orphan` — a query whose worker is killed mid-flight leaves a
     `QueryStart` with no `QueryFinish`.
-  - `query_log_flight` — a Flight SQL ingress query is logged with
-    `interface='flight'`.
 - **Docs**: `README.md` §Query Log (column list, the event pair, the read-side
   dedupe rule), this file, and the `CLAUDE.md` invariants block.

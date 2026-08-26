@@ -1219,6 +1219,146 @@ func TestOrgConnectionAdmissionMetricsDoNotCountDisabledUserAsVCPULimit(t *testi
 	}
 }
 
+func TestOrgConnectionAdmissionRecognizesServiceCredentialIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state string
+	}{
+		{name: "live", state: "live"},
+		{name: "expired after handshake", state: "expired"},
+		{name: "revoked after handshake", state: "revoked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			upsertActiveCP(t, store, "cp-service")
+			const (
+				orgID        = "org-service-admission"
+				credentialID = "svc_0123456789abcdef01234567"
+				requestID    = "request-service"
+			)
+			seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, nil)
+			if err := store.DB().Create(&cpconfigstore.ServiceGrant{
+				OrgID: orgID, CredentialID: credentialID, Principal: "dagster:backfill",
+				PasswordHash: "test-password-hash", MintedAt: time.Now(), LastRotatedAt: time.Now(),
+				ExpiresAt: time.Now().Add(time.Hour),
+			}).Error; err != nil {
+				t.Fatalf("seed service grant: %v", err)
+			}
+
+			now := time.Now()
+			if err := store.EnqueueOrgConnectionRequest(&cpconfigstore.OrgConnectionQueueEntry{
+				RequestID: requestID, OrgID: orgID, Username: credentialID, CPInstanceID: "cp-service",
+				PID: 1001, Protocol: "postgres", RequestedVCPUs: 2,
+				EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+			}); err != nil {
+				t.Fatalf("enqueue service credential: %v", err)
+			}
+			// The request enters admission only after a successful handshake.
+			// Mutate lifecycle state after enqueue to prove expiry/revocation do
+			// not kill that established connection while it waits for a worker.
+			switch tc.state {
+			case "expired":
+				if err := store.DB().Model(&cpconfigstore.ServiceGrant{}).
+					Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+					Update("expires_at", time.Now().Add(-time.Hour)).Error; err != nil {
+					t.Fatalf("expire queued credential: %v", err)
+				}
+			case "revoked":
+				revokedAt := time.Now()
+				if err := store.DB().Model(&cpconfigstore.ServiceGrant{}).
+					Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+					Updates(map[string]any{"revoked_at": revokedAt, "password_hash": ""}).Error; err != nil {
+					t.Fatalf("revoke queued credential: %v", err)
+				}
+			}
+
+			ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requestID, OrgID: orgID, CPInstanceID: "cp-service"}
+			lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+			if err != nil {
+				t.Fatalf("admit service credential: %v", err)
+			}
+			if lease == nil {
+				t.Fatalf("service credential was not admitted: evaluation = %#v", evaluation)
+			}
+			if evaluation.Decision != "granted_current" || evaluation.Reason != "none" {
+				t.Fatalf("evaluation = %#v, want granted_current/none", evaluation)
+			}
+		})
+	}
+}
+
+func TestOrgConnectionAdmissionRejectsUnknownServiceCredentialIdentity(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-unknown-service")
+	const (
+		orgID        = "org-unknown-service"
+		credentialID = "svc_eeeeeeeeeeeeeeeeeeeeeeee"
+		requestID    = "request-unknown-service"
+	)
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, nil)
+	now := time.Now()
+	if err := store.EnqueueOrgConnectionRequest(&cpconfigstore.OrgConnectionQueueEntry{
+		RequestID: requestID, OrgID: orgID, Username: credentialID, CPInstanceID: "cp-unknown-service",
+		PID: 1001, Protocol: "postgres", RequestedVCPUs: 1,
+		EnqueuedAt: now, ExpiresAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("enqueue unknown service credential: %v", err)
+	}
+	ref := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requestID, OrgID: orgID, CPInstanceID: "cp-unknown-service"}
+	lease, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), ref)
+	if err != nil {
+		t.Fatalf("evaluate unknown service credential: %v", err)
+	}
+	if lease != nil || evaluation.Decision != "blocked" || evaluation.Reason != "user_ineligible" {
+		t.Fatalf("unknown service credential = lease %#v, evaluation %#v; want blocked/user_ineligible", lease, evaluation)
+	}
+}
+
+func TestOrgConnectionAdmissionAppliesOnlyOrgLimitToServiceCredential(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-service-a")
+	upsertActiveCP(t, store, "cp-service-b")
+	const orgID = "org-service-limit"
+	seedAuthoritativeOrgConnectionLimits(t, store, orgID, 2, map[string]int{
+		// A same-named org-user row must not define the service credential's
+		// per-user cap. Service identities are root-shaped and org-limited.
+		"svc_aaaaaaaaaaaaaaaaaaaaaaaa": 1,
+	})
+	for _, credentialID := range []string{"svc_aaaaaaaaaaaaaaaaaaaaaaaa", "svc_bbbbbbbbbbbbbbbbbbbbbbbb"} {
+		if err := store.DB().Create(&cpconfigstore.ServiceGrant{
+			OrgID: orgID, CredentialID: credentialID, Principal: "dagster:backfill",
+			PasswordHash: "test-password-hash", MintedAt: time.Now(), LastRotatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatalf("seed service grant %s: %v", credentialID, err)
+		}
+	}
+
+	now := time.Now()
+	requests := []*cpconfigstore.OrgConnectionQueueEntry{
+		{RequestID: "request-service-a", OrgID: orgID, Username: "svc_aaaaaaaaaaaaaaaaaaaaaaaa", CPInstanceID: "cp-service-a", PID: 1001, Protocol: "postgres", RequestedVCPUs: 2, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute)},
+		{RequestID: "request-service-b", OrgID: orgID, Username: "svc_bbbbbbbbbbbbbbbbbbbbbbbb", CPInstanceID: "cp-service-b", PID: 1002, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now.Add(time.Millisecond), ExpiresAt: now.Add(time.Minute)},
+	}
+	for _, request := range requests {
+		if err := store.EnqueueOrgConnectionRequest(request); err != nil {
+			t.Fatalf("enqueue %s: %v", request.RequestID, err)
+		}
+	}
+
+	firstRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requests[0].RequestID, OrgID: orgID, CPInstanceID: requests[0].CPInstanceID}
+	first, _, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), firstRef)
+	if err != nil || first == nil {
+		t.Fatalf("service credential should ignore normal per-user max: lease = %#v, err = %v", first, err)
+	}
+	secondRef := cpconfigstore.OrgConnectionAdmissionRef{RequestID: requests[1].RequestID, OrgID: orgID, CPInstanceID: requests[1].CPInstanceID}
+	second, evaluation, err := store.ScheduleAndClaimOrgConnectionLeaseForRefWithEvaluationContext(t.Context(), secondRef)
+	if err != nil {
+		t.Fatalf("evaluate org-limited service credential: %v", err)
+	}
+	if second != nil || evaluation.Decision != "blocked" || evaluation.Reason != "org_vcpu" {
+		t.Fatalf("second service credential = lease %#v, evaluation %#v; want blocked/org_vcpu", second, evaluation)
+	}
+}
+
 func TestOrgConnectionAdmissionMetricsDoNotCountPermanentlyImpossibleForeignHeadAsSaturation(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	upsertActiveCP(t, store, "cp-impossible-head")
@@ -1809,6 +1949,56 @@ func TestOrgConnectionLeasesIgnoreExpiredControlPlaneOwners(t *testing.T) {
 	}
 	if lease == nil {
 		t.Fatal("expected expired cp-a lease to stop counting against org limit")
+	}
+}
+
+func TestOrgConnectionMonitoringStateExcludesExpiredRuntimeRows(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	upsertActiveCP(t, store, "cp-active")
+
+	now := time.Now().UTC()
+	expiredAt := now.Add(-time.Minute)
+	if err := store.UpsertControlPlaneInstance(&cpconfigstore.ControlPlaneInstance{
+		ID:              "cp-expired",
+		PodName:         "cp-expired",
+		State:           cpconfigstore.ControlPlaneInstanceStateExpired,
+		StartedAt:       now.Add(-time.Hour),
+		LastHeartbeatAt: now.Add(-10 * time.Minute),
+		ExpiredAt:       &expiredAt,
+	}); err != nil {
+		t.Fatalf("upsert expired control plane: %v", err)
+	}
+
+	leaseTable := store.RuntimeSchema() + ".org_connection_leases"
+	leases := []*cpconfigstore.OrgConnectionLease{
+		{LeaseID: "active", RequestID: "request-active", OrgID: "org-monitoring", Username: "alice", CPInstanceID: "cp-active", PID: 1, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+		{LeaseID: "expired-owner", RequestID: "request-expired-owner", OrgID: "org-monitoring", Username: "bob", CPInstanceID: "cp-expired", PID: 2, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+		{LeaseID: "recent-missing-owner", RequestID: "request-recent-missing-owner", OrgID: "org-monitoring", Username: "carol", CPInstanceID: "cp-missing", PID: 3, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+		{LeaseID: "stale-missing-owner", RequestID: "request-stale-missing-owner", OrgID: "org-monitoring", Username: "dave", CPInstanceID: "cp-stale", PID: 4, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now.Add(-10 * time.Minute)},
+		{LeaseID: "other-org", RequestID: "request-other-org", OrgID: "org-other", Username: "eve", CPInstanceID: "cp-active", PID: 5, Protocol: "postgres", RequestedVCPUs: 1, AcquiredAt: now},
+	}
+	if err := store.DB().Table(leaseTable).Create(leases).Error; err != nil {
+		t.Fatalf("insert monitoring leases: %v", err)
+	}
+
+	grantedAt := now
+	queueTable := store.RuntimeSchema() + ".org_connection_queue"
+	queue := []*cpconfigstore.OrgConnectionQueueEntry{
+		{RequestID: "pending", OrgID: "org-monitoring", Username: "alice", CPInstanceID: "cp-active", PID: 11, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute)},
+		{RequestID: "expired", OrgID: "org-monitoring", Username: "bob", CPInstanceID: "cp-active", PID: 12, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now.Add(-2 * time.Minute), ExpiresAt: now.Add(-time.Minute)},
+		{RequestID: "granted", OrgID: "org-monitoring", Username: "carol", CPInstanceID: "cp-active", PID: 13, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute), GrantedAt: &grantedAt},
+		{RequestID: "other-org-pending", OrgID: "org-other", Username: "eve", CPInstanceID: "cp-active", PID: 14, Protocol: "postgres", RequestedVCPUs: 1, EnqueuedAt: now, ExpiresAt: now.Add(time.Minute)},
+	}
+	if err := store.DB().Table(queueTable).Create(queue).Error; err != nil {
+		t.Fatalf("insert monitoring queue: %v", err)
+	}
+
+	status, err := store.OrgConnectionMonitoringState("org-monitoring")
+	if err != nil {
+		t.Fatalf("monitoring state: %v", err)
+	}
+	if status.ActiveLeases != 2 || status.QueuedConns != 1 {
+		t.Fatalf("monitoring state = %+v, want 2 active leases / 1 queued connection", status)
 	}
 }
 

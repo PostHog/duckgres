@@ -95,6 +95,9 @@ func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgSta
 	// Admin-only Operators management (the admin-console access list). Each
 	// route self-gates with RequireAdmin; mutations are audited via the group.
 	registerOperatorsAPI(r, store)
+	// Monthly per-team usage for the "Usage" page — a read-only view over the
+	// billing buffer (see usage_api.go).
+	registerUsageAPI(r, store)
 }
 
 func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo, fetcher PeerFetcher) {
@@ -138,6 +141,14 @@ func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo,
 	r.GET("/orgs/:id/users/:username", h.getUser)
 	r.PUT("/orgs/:id/users/:username", h.updateUser)
 	r.DELETE("/orgs/:id/users/:username", h.deleteUser)
+
+	// Service grants (duckgres_service_grants): every minted service
+	// credential, all statuses (live / expired / revoked). Read carries NO
+	// secret material (PasswordHash is json:"-"); revoke sets revoked_at and
+	// blanks the stored hash server-side. Both are ordinary admin-console
+	// routes behind the group middleware (valid admin session + audit).
+	r.GET("/orgs/:id/service-grants", h.listServiceGrants)
+	r.DELETE("/orgs/:id/service-grants/:credential_id", h.revokeServiceGrant)
 	// Peer-only fan-out target: see reloadSnapshot below.
 	r.POST("/internal/reload-snapshot", h.reloadSnapshot)
 
@@ -189,6 +200,15 @@ type apiStore interface {
 	// configstore.ErrProjectTeamUnavailable when the team is missing/disabled.
 	UpsertProjectLogin(orgID string, teamID int64, username, password, accessMode string) (*configstore.OrgUser, error)
 
+	// ListServiceGrants returns every service-grant row for the org (all
+	// statuses); gorm.ErrRecordNotFound for a ghost org. RevokeServiceGrant
+	// terminally revokes one grant (sets revoked_at, blanks the hash);
+	// gorm.ErrRecordNotFound for a ghost org,
+	// configstore.ErrServiceCredentialNotFound for an unknown credential_id,
+	// idempotent on an already-revoked grant.
+	ListServiceGrants(orgID string) ([]configstore.ServiceGrant, error)
+	RevokeServiceGrant(orgID, credentialID string) error
+
 	GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error)
 	UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error)
 	// MutateManagedWarehouse loads the existing warehouse (or a zero value if
@@ -231,6 +251,21 @@ func (s *gormAPIStore) CreateOrg(org *configstore.Org, teamID int64, schemaName 
 	// One transaction: org row + its first team row (same contract as the
 	// provisioning path — an org cannot exist without a team).
 	return s.db().Transaction(func(tx *gorm.DB) error {
+		// Serialize name reuse with credential lifecycle operations. Grants do
+		// not have a foreign key, so clean up rows orphaned by older Duckgres
+		// versions before this name becomes an org again.
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, org.Name); err != nil {
+			return err
+		}
+		var existing int64
+		if err := tx.Model(&configstore.Org{}).Where("name = ?", org.Name).Count(&existing).Error; err != nil {
+			return err
+		}
+		if existing == 0 {
+			if err := tx.Where("org_id = ?", org.Name).Delete(&configstore.ServiceGrant{}).Error; err != nil {
+				return err
+			}
+		}
 		if err := tx.Omit("Warehouse", "Teams").Create(org).Error; err != nil {
 			return err
 		}
@@ -261,6 +296,24 @@ func (s *gormAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 		"default_worker_memory":       updates.DefaultWorkerMemory,
 		"default_worker_ttl":          updates.DefaultWorkerTTL,
 		"default_worker_min_hot_idle": updates.DefaultWorkerMinHotIdle,
+		// Hot-idle pool caps: written unconditionally for the same reason —
+		// 0 / "" clears the cap back to unlimited after the presence-merge.
+		"max_hot_idle_workers": updates.MaxHotIdleWorkers,
+		"max_hot_idle_cpu":     updates.MaxHotIdleCPU,
+		"max_hot_idle_memory":  updates.MaxHotIdleMemory,
+	}
+	if updates.DataImportsTableNamingVersion != "" {
+		fields["data_imports_table_naming_version"] = updates.DataImportsTableNamingVersion
+	}
+	// DatabaseName is "" = preserve (the column is NOT NULL and the handler's
+	// presence-merge has already preserved omitted fields, so a "" here can
+	// only mean "key absent"). A non-empty value renames the database — and
+	// with it the org's managed hostname (<database_name>.<managed-suffix>),
+	// which is exactly the operator surface for fixing orgs whose stored name
+	// is not a routable DNS label. The unique index still guards collisions;
+	// validation lives in the handler.
+	if updates.DatabaseName != "" {
+		fields["database_name"] = updates.DatabaseName
 	}
 	// HostnameAlias is *string: nil = preserve, "" = clear (NULL), "x" = set.
 	// NULL releases the unique-index slot so other orgs can take that alias.
@@ -327,6 +380,12 @@ func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 			return err
 		}
 		if err := tx.Where("org_id = ?", name).Delete(&configstore.OrgUser{}).Error; err != nil {
+			return err
+		}
+		// Org deletion is the lifecycle boundary for otherwise durable grant
+		// audit rows. Retaining them could reactivate an old secret if this org
+		// name were created again.
+		if err := tx.Where("org_id = ?", name).Delete(&configstore.ServiceGrant{}).Error; err != nil {
 			return err
 		}
 		result := tx.Where("name = ?", name).Delete(&configstore.Org{})
@@ -650,6 +709,14 @@ func (s *gormAPIStore) UpsertProjectLogin(orgID string, teamID int64, username, 
 	return &stored, nil
 }
 
+func (s *gormAPIStore) ListServiceGrants(orgID string) ([]configstore.ServiceGrant, error) {
+	return s.store.ListServiceGrants(orgID)
+}
+
+func (s *gormAPIStore) RevokeServiceGrant(orgID, credentialID string) error {
+	return s.store.RevokeServiceGrant(orgID, credentialID)
+}
+
 func (s *gormAPIStore) ReloadSnapshot() error {
 	return s.store.ReloadSnapshot()
 }
@@ -877,6 +944,15 @@ func (h *apiHandler) createOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	// database_name becomes the org's managed hostname label, so it must be a
+	// routable single DNS label at birth (same rule as the provisioning API).
+	// Trim the operator's value first so " acme" fails with the real problem
+	// instead of storing leading whitespace.
+	org.DatabaseName = strings.TrimSpace(org.DatabaseName)
+	if err := configstore.ValidateDatabaseName(org.DatabaseName); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if req.TeamID <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "team_id is required (a positive PostHog team id — every org must have at least one team)"})
 		return
@@ -937,6 +1013,12 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if _, ok := fields["data_imports_table_naming_version"]; ok {
+		if err := validateDataImportsTableNamingVersion(updates.DataImportsTableNamingVersion); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 	existing, err := h.store.GetOrg(name)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -947,6 +1029,22 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 		return
 	}
 	merged := *existing
+	// database_name is presence-aware like every other column: absent keeps the
+	// stored value; a present value must be a valid DNS label (it becomes the
+	// org's hostname). This is the break-glass edit surface for orgs whose
+	// stored name predates the DNS-label rule and is therefore unroutable —
+	// rename and the hostname works the moment the snapshot reloads.
+	if _, ok := fields["database_name"]; ok {
+		// Trim whitespace around the operator's value before validating/
+		// storing so " acme" 400s with the real problem instead of storing a
+		// subtly different name than the operator typed and saw validated.
+		updates.DatabaseName = strings.TrimSpace(updates.DatabaseName)
+		if err := configstore.ValidateDatabaseName(updates.DatabaseName); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		merged.DatabaseName = updates.DatabaseName
+	}
 	if _, ok := fields["max_workers"]; ok {
 		merged.MaxWorkers = updates.MaxWorkers
 	}
@@ -967,8 +1065,22 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 	if _, ok := fields["default_worker_min_hot_idle"]; ok {
 		merged.DefaultWorkerMinHotIdle = updates.DefaultWorkerMinHotIdle
 	}
+	// Hot-idle pool caps: present-in-payload wins, including an explicit
+	// 0 / "" which clears the cap back to unlimited.
+	if _, ok := fields["max_hot_idle_workers"]; ok {
+		merged.MaxHotIdleWorkers = updates.MaxHotIdleWorkers
+	}
+	if _, ok := fields["max_hot_idle_cpu"]; ok {
+		merged.MaxHotIdleCPU = updates.MaxHotIdleCPU
+	}
+	if _, ok := fields["max_hot_idle_memory"]; ok {
+		merged.MaxHotIdleMemory = updates.MaxHotIdleMemory
+	}
 	if _, ok := fields["hostname_alias"]; ok {
 		merged.HostnameAlias = updates.HostnameAlias
+	}
+	if _, ok := fields["data_imports_table_naming_version"]; ok {
+		merged.DataImportsTableNamingVersion = updates.DataImportsTableNamingVersion
 	}
 	// Audit detail: which fields changed and their old → new values, so the
 	// console shows "max_workers 4 → 10" instead of a bare "org.update". These
@@ -979,25 +1091,46 @@ func (h *apiHandler) updateOrg(c *gin.Context) {
 			changes = append(changes, fmt.Sprintf("%s %v → %v", key, old, next))
 		}
 	}
+	addChange("database_name", existing.DatabaseName, merged.DatabaseName)
 	addChange("max_workers", existing.MaxWorkers, merged.MaxWorkers)
 	addChange("max_vcpus", existing.MaxVCPUs, merged.MaxVCPUs)
 	addChange("default_worker_cpu", orgStr(existing.DefaultWorkerCPU), orgStr(merged.DefaultWorkerCPU))
 	addChange("default_worker_memory", orgStr(existing.DefaultWorkerMemory), orgStr(merged.DefaultWorkerMemory))
 	addChange("default_worker_ttl", orgStr(existing.DefaultWorkerTTL), orgStr(merged.DefaultWorkerTTL))
 	addChange("default_worker_min_hot_idle", existing.DefaultWorkerMinHotIdle, merged.DefaultWorkerMinHotIdle)
+	addChange("max_hot_idle_workers", existing.MaxHotIdleWorkers, merged.MaxHotIdleWorkers)
+	addChange("max_hot_idle_cpu", orgStr(existing.MaxHotIdleCPU), orgStr(merged.MaxHotIdleCPU))
+	addChange("max_hot_idle_memory", orgStr(existing.MaxHotIdleMemory), orgStr(merged.MaxHotIdleMemory))
 	addChange("hostname_alias", orgStrPtr(existing.HostnameAlias), orgStrPtr(merged.HostnameAlias))
+	addChange("data_imports_table_naming_version", existing.DataImportsTableNamingVersion, merged.DataImportsTableNamingVersion)
 	if len(changes) > 0 {
 		setAuditDetail(c, strings.Join(changes, ", "))
 	}
 
 	org, ok, err := h.store.UpdateOrg(name, merged)
 	if err != nil {
+		if configstore.IsUniqueViolationErr(err) {
+			// database_name or hostname_alias unique index — same 409 the
+			// create/provision surfaces map for the identical conflict.
+			c.JSON(http.StatusConflict, gin.H{"error": "database_name or hostname_alias is already in use by another org"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
 		return
+	}
+	// A database_name rename moves the org's managed hostname: without forcing
+	// a reload, every replica routes on its stale snapshot until the next poll
+	// (the new hostname 08006s while the API here already reported success).
+	// Same snapshot-convergence contract as user/team mutations.
+	if existing.DatabaseName != org.DatabaseName {
+		if err := h.notifyPeersOfChange(c); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("renamed, but failed to reload the local snapshot: %v", err)})
+			return
+		}
 	}
 	c.JSON(http.StatusOK, org)
 }
@@ -1307,6 +1440,11 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 			return err
 		}
 	}
+	if org.DataImportsTableNamingVersion != "" {
+		if err := validateDataImportsTableNamingVersion(org.DataImportsTableNamingVersion); err != nil {
+			return err
+		}
+	}
 	if err := validateOrgDefaultWorkerProfile(org); err != nil {
 		return err
 	}
@@ -1316,7 +1454,39 @@ func validateOrgMutationPayload(org *configstore.Org) error {
 	if org.MaxVCPUs < 0 {
 		return fmt.Errorf("max_vcpus: value %d must be >= 0", org.MaxVCPUs)
 	}
+	if org.MaxHotIdleWorkers < 0 {
+		return fmt.Errorf("max_hot_idle_workers: value %d must be >= 0", org.MaxHotIdleWorkers)
+	}
+	// The cap quantities must be positive when set: an unparseable or zero
+	// value would silently mean UNLIMITED in the sweep — fail closed here so
+	// an operator typo can never read as "no cap".
+	for _, f := range []struct{ name, raw string }{
+		{"max_hot_idle_cpu", org.MaxHotIdleCPU},
+		{"max_hot_idle_memory", org.MaxHotIdleMemory},
+	} {
+		if f.raw == "" {
+			continue
+		}
+		q, err := resource.ParseQuantity(f.raw)
+		if err != nil {
+			return fmt.Errorf("%s: invalid quantity %q", f.name, f.raw)
+		}
+		if q.Sign() <= 0 {
+			return fmt.Errorf("%s: quantity %q must be positive (clear the field for unlimited)", f.name, f.raw)
+		}
+	}
 	return nil
+}
+
+func validateDataImportsTableNamingVersion(version string) error {
+	if configstore.IsValidDataImportsTableNamingVersion(version) {
+		return nil
+	}
+	return fmt.Errorf(
+		"data_imports_table_naming_version must be %q or %q",
+		configstore.DataImportsTableNamingVersionLegacyBatchV1,
+		configstore.DataImportsTableNamingVersionCopyV1,
+	)
 }
 
 // validateOrgDefaultWorkerProfile rejects garbage default-worker-profile
@@ -1856,6 +2026,52 @@ func (h *apiHandler) upsertProjectLogin(c *gin.Context, accessMode string, usern
 	})
 }
 
+// listServiceGrants returns the org's service credentials — every
+// duckgres_service_grants row, all statuses (live, expired, revoked), flat.
+// NO plaintext and no hashes: configstore.ServiceGrant.PasswordHash is
+// json:"-", so the serialized view is identity + lifecycle + audit
+// attribution only.
+func (h *apiHandler) listServiceGrants(c *gin.Context) {
+	orgID := c.Param("id")
+	grants, err := h.store.ListServiceGrants(orgID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, grants)
+}
+
+// revokeServiceGrant terminally revokes one minted credential: revoked_at is
+// stamped and the bcrypt hash is blanked server-side, so a leaked credential
+// can never authenticate again. The row stays for provenance (the minted-by
+// principal remains queryable after a leak). Established sessions are NOT
+// torn down — revocation, like expiry, is enforced at the pgwire handshake.
+func (h *apiHandler) revokeServiceGrant(c *gin.Context) {
+	orgID := c.Param("id")
+	credentialID := c.Param("credential_id")
+	if err := h.store.RevokeServiceGrant(orgID, credentialID); err != nil {
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": "org not found"})
+		case errors.Is(err, configstore.ErrServiceCredentialNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+	setAuditDetail(c, "revoked service credential "+credentialID)
+	if err := h.notifyPeersOfChange(c); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"revoked": credentialID})
+}
+
 // notifyPeersOfChange reloads THIS replica's config snapshot immediately
 // (bypassing the poll interval, default 30s) and fans the same reload out to
 // every other CP replica, mirroring the disable/enable reload pattern in
@@ -1898,8 +2114,8 @@ func (h *apiHandler) listWorkers(c *gin.Context) {
 	}
 	// A worker is owned by exactly one CP (disjoint union); dedup makes it idempotent.
 	if !localScope(c) && h.fetcher != nil {
-		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
-		mergePeer(&workers, bodies, func(e []WorkerStatus) []WorkerStatus { return e })
+		peerResult := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/workers")
+		mergePeer(&workers, peerResult.Bodies, func(e []WorkerStatus) []WorkerStatus { return e })
 		workers = dedupeBy(workers, func(w WorkerStatus) int { return w.ID })
 	}
 	c.JSON(http.StatusOK, workers)
@@ -1914,8 +2130,8 @@ func (h *apiHandler) listSessions(c *gin.Context) {
 	}
 	// A session lives on exactly one CP (disjoint union); dedup makes it idempotent.
 	if !localScope(c) && h.fetcher != nil {
-		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
-		mergePeer(&sessions, bodies, func(e []SessionStatus) []SessionStatus { return e })
+		peerResult := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/sessions")
+		mergePeer(&sessions, peerResult.Bodies, func(e []SessionStatus) []SessionStatus { return e })
 		sessions = dedupeBy(sessions, func(s SessionStatus) int { return s.WorkerID })
 	}
 	c.JSON(http.StatusOK, sessions)
@@ -1931,8 +2147,8 @@ func (h *apiHandler) getClusterStatus(c *gin.Context) {
 	// Per-org active-session counts are per-CP; merge every CP's slice so the
 	// Overview cards reflect the whole cluster instead of one replica's view.
 	if !localScope(c) && h.fetcher != nil {
-		bodies, _ := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/status")
-		orgStats = mergeOrgStats(orgStats, bodies)
+		peerResult := h.fetcher.FetchPeers(c.Request.Context(), "/api/v1/status")
+		orgStats = mergeOrgStats(orgStats, peerResult.Bodies)
 	}
 
 	totalWorkers := 0

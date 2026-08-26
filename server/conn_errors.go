@@ -141,9 +141,9 @@ func unwrapFlightError(msg string) string {
 		msg = msg[idx+len("desc = "):]
 	}
 	msg = strings.TrimSpace(msg)
-	// The worker's Flight SQL ingress wraps the raw DuckDB error one more time
+	// The worker's Flight SQL handler wraps the raw DuckDB error one more time
 	// with "failed to execute query: " / "failed to execute update: " (see
-	// server/flightsqlingress/ingress.go). That sits between "desc = " and the
+	// duckdbservice/flight_handler.go). That sits between "desc = " and the
 	// DuckDB exception prefix, so without stripping it the HasPrefix("Catalog
 	// Error:" …) classifiers below all miss and the error falls through to
 	// XX000. Strip any one such worker prefix so classification sees the bare
@@ -355,4 +355,21 @@ func isDropTableOnViewError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "is of type View") &&
 		strings.Contains(msg, "trying to drop type Table")
+}
+
+// isWorkerOutOfMemoryError reports whether a query failed because DuckDB on
+// the worker exhausted its memory_limit — the signal the exploratory tier
+// uses to transparently re-execute the read on a normal-size worker. String
+// match, like every other DuckDB error classifier here. It matches the
+// engine's OOM exception only; a pod-level OOMKill surfaces as ErrWorkerDead
+// (the CP closes the client conn via OnWorkerCrash) and is deliberately NOT
+// re-executed — the connection is already gone.
+func isWorkerOutOfMemoryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Out of Memory Error") ||
+		strings.Contains(msg, "failed to allocate data of size") ||
+		strings.Contains(msg, "could not allocate block of size")
 }

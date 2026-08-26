@@ -460,6 +460,41 @@ func TestHealthCheckReportsDraining(t *testing.T) {
 	}
 }
 
+func TestHealthCheckReportsOTLPExportFields(t *testing.T) {
+	pool := &SessionPool{
+		sessions:    make(map[string]*Session),
+		stopRefresh: make(map[string]func()),
+		warmupDone:  make(chan struct{}),
+		startTime:   time.Now(),
+	}
+	close(pool.warmupDone)
+	handler := &FlightSQLHandler{pool: pool, alloc: memory.DefaultAllocator}
+	stream := &mockDoActionStream{}
+	if err := handler.doHealthCheck([]byte(`{}`), stream); err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(stream.results[0].Body, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := resp["otlp_export_enabled"]; !ok {
+		t.Fatal("health JSON missing otlp_export_enabled")
+	}
+	if _, ok := resp["otlp_export_failures"]; !ok {
+		t.Fatal("health JSON missing otlp_export_failures")
+	}
+	if enabled, ok := resp["otlp_export_enabled"].(bool); !ok {
+		t.Fatalf("otlp_export_enabled type %T", resp["otlp_export_enabled"])
+	} else if enabled {
+		t.Fatal("export is off in this test process; otlp_export_enabled must be false")
+	}
+	if n, ok := resp["otlp_export_failures"].(float64); !ok {
+		t.Fatalf("otlp_export_failures type %T", resp["otlp_export_failures"])
+	} else if n < 0 {
+		t.Fatalf("otlp_export_failures = %v, want >= 0", n)
+	}
+}
+
 func TestHealthCheckAcceptsMismatchedEpochInSharedWarmMode(t *testing.T) {
 	pool := &SessionPool{
 		sessions:          make(map[string]*Session),

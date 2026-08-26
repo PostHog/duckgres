@@ -236,6 +236,65 @@ func TestUpsertOrgTeamSchemaConflictPostgres(t *testing.T) {
 	}
 }
 
+func TestProvisionedOrgMaxVCPUsPostgres(t *testing.T) {
+	tests := []struct {
+		name             string
+		existingMaxVCPUs *int
+		wantMaxVCPUs     int
+	}{
+		{name: "new org defaults to 60", wantMaxVCPUs: 60},
+		{name: "reprovision preserves unlimited", existingMaxVCPUs: intPtr(0), wantMaxVCPUs: 0},
+		{name: "reprovision preserves explicit limit", existingMaxVCPUs: intPtr(1024), wantMaxVCPUs: 1024},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newIsolatedConfigStore(t)
+			pstore := provisioning.NewGormStore(store)
+			const orgID = "provisioned-vcpu-org"
+
+			if tt.existingMaxVCPUs != nil {
+				if err := store.DB().Create(&configstore.Org{
+					Name:         orgID,
+					DatabaseName: "provisioned_vcpu_org",
+					MaxVCPUs:     *tt.existingMaxVCPUs,
+				}).Error; err != nil {
+					t.Fatalf("seed org: %v", err)
+				}
+			}
+
+			provision := func() {
+				t.Helper()
+				if err := pstore.Provision(provisioning.ProvisionRequest{
+					OrgID:        orgID,
+					DatabaseName: "provisioned_vcpu_org",
+					TeamID:       1,
+					Warehouse:    &configstore.ManagedWarehouse{DucklingName: orgID},
+					RootUserHash: "hash",
+				}); err != nil {
+					t.Fatalf("provision: %v", err)
+				}
+			}
+
+			provision()
+			if tt.existingMaxVCPUs != nil {
+				markWarehouseDeleted(t, store, orgID)
+				provision()
+			}
+
+			var org configstore.Org
+			if err := store.DB().First(&org, "name = ?", orgID).Error; err != nil {
+				t.Fatalf("read provisioned org: %v", err)
+			}
+			if org.MaxVCPUs != tt.wantMaxVCPUs {
+				t.Fatalf("MaxVCPUs = %d, want %d", org.MaxVCPUs, tt.wantMaxVCPUs)
+			}
+		})
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
 // TestDeleteOrgTeamPostgres covers the transactional delete rules: last-team
 // refusal (an org must always have at least one team), the project-reader
 // cleanup riding in the same transaction, and that a delete never touches
@@ -441,6 +500,58 @@ func TestProvisionWithTeamIDAndSchemaNamePostgres(t *testing.T) {
 	})
 	if !errors.Is(err, provisioning.ErrProvisionTeamRequired) {
 		t.Fatalf("teamless new-org provision: err = %v, want ErrProvisionTeamRequired", err)
+	}
+}
+
+func TestProvisionOrgCreationPurgesOrphanGrantsButReprovisionPreservesLiveGrants(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	pstore := provisioning.NewGormStore(store)
+	const (
+		orgID        = "provision-orphan-grant"
+		credentialID = "svc_0123456789abcdef01234567"
+	)
+	now := time.Now().UTC()
+	if err := store.DB().Create(&configstore.ServiceGrant{
+		OrgID: orgID, CredentialID: credentialID, Principal: "old:lifecycle",
+		PasswordHash: "old-hash", MintedAt: now, LastRotatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("seed orphan grant: %v", err)
+	}
+	provision := func() error {
+		return pstore.Provision(provisioning.ProvisionRequest{
+			OrgID: orgID, DatabaseName: "provision_orphan_grant", TeamID: 1,
+			Warehouse: &configstore.ManagedWarehouse{DucklingName: orgID}, RootUserHash: "root-hash",
+		})
+	}
+	if err := provision(); err != nil {
+		t.Fatalf("provision new org: %v", err)
+	}
+	var orphanCount int64
+	if err := store.DB().Model(&configstore.ServiceGrant{}).
+		Where("org_id = ? AND credential_id = ?", orgID, credentialID).
+		Count(&orphanCount).Error; err != nil {
+		t.Fatalf("count orphan grant: %v", err)
+	}
+	if orphanCount != 0 {
+		t.Fatalf("new org inherited %d orphan grants", orphanCount)
+	}
+
+	live, err := store.MintServiceCredential(orgID, "dagster:live", 15*time.Minute)
+	if err != nil {
+		t.Fatalf("mint live grant: %v", err)
+	}
+	markWarehouseDeleted(t, store, orgID)
+	if err := provision(); err != nil {
+		t.Fatalf("reprovision existing org: %v", err)
+	}
+	var liveCount int64
+	if err := store.DB().Model(&configstore.ServiceGrant{}).
+		Where("org_id = ? AND credential_id = ?", orgID, live.CredentialID).
+		Count(&liveCount).Error; err != nil {
+		t.Fatalf("count live grant after reprovision: %v", err)
+	}
+	if liveCount != 1 {
+		t.Fatal("reprovisioning an existing org purged its live service credential")
 	}
 }
 

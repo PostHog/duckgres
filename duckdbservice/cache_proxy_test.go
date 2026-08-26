@@ -2,6 +2,7 @@ package duckdbservice
 
 import (
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/server"
 )
@@ -57,6 +58,33 @@ func TestOverrideS3EndpointForCacheProxy(t *testing.T) {
 		overrideS3EndpointForCacheProxy(&cfg)
 		if cfg.HTTPProxy != "http://localhost:8080" {
 			t.Errorf("expected localhost fallback, got %q", cfg.HTTPProxy)
+		}
+	})
+}
+
+func TestCacheProxyConnectTimeout(t *testing.T) {
+	t.Run("default is documented and bounded", func(t *testing.T) {
+		t.Setenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT", "")
+		if got := cacheProxyConnectTimeout(); got != 5*time.Second {
+			t.Fatalf("default timeout = %s, want 5s", got)
+		}
+	})
+	t.Run("uses explicit duration", func(t *testing.T) {
+		t.Setenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT", "750ms")
+		if got := cacheProxyConnectTimeout(); got != 750*time.Millisecond {
+			t.Fatalf("timeout = %s, want 750ms", got)
+		}
+	})
+	t.Run("invalid value fails safely to default", func(t *testing.T) {
+		t.Setenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT", "0s")
+		if got := cacheProxyConnectTimeout(); got != defaultCacheProxyConnectTimeout {
+			t.Fatalf("timeout = %s, want default %s", got, defaultCacheProxyConnectTimeout)
+		}
+	})
+	t.Run("clamps an excessive value to preserve worker startup budget", func(t *testing.T) {
+		t.Setenv("DUCKGRES_CACHE_PROXY_CONNECT_TIMEOUT", "2m")
+		if got := cacheProxyConnectTimeout(); got != maxCacheProxyConnectTimeout {
+			t.Fatalf("timeout = %s, want capped maximum %s", got, maxCacheProxyConnectTimeout)
 		}
 	})
 }

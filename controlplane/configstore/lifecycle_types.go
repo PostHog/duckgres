@@ -84,7 +84,7 @@ func (s WorkerSnapshot) Record() WorkerRecord { return s.record }
 // credential-refresh scheduler.
 //
 // Leases are produced by the store methods that establish ownership:
-// ClaimIdleWorker, ClaimHotIdleWorker, TakeOverWorker, the Create*Slot
+// ClaimIdleWorker, ClaimHotIdleWorker, the Create*Slot
 // variants, and RefreshLease. Outside this package they cannot be
 // constructed by hand, which means a caller without a real lease cannot
 // invoke the lease-only lifecycle methods.

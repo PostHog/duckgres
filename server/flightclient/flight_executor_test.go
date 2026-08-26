@@ -69,6 +69,7 @@ type closeWaitFlightServer struct {
 	closeAfterFirstBatch  bool
 	invalidInfoSchema     bool
 	doGetErr              error
+	doGetTrailer          metadata.MD
 	doActionErr           error
 }
 
@@ -123,6 +124,7 @@ func (s *closeWaitFlightServer) DoGet(_ *flight.Ticket, stream pb.FlightService_
 		return err
 	}
 	if s.closeAfterFirstBatch {
+		stream.SetTrailer(s.doGetTrailer)
 		close(s.doGetDone)
 		return nil
 	}
@@ -132,6 +134,30 @@ func (s *closeWaitFlightServer) DoGet(_ *flight.Ticket, stream pb.FlightService_
 	<-s.allowDoGetReturn
 	close(s.doGetDone)
 	return stream.Context().Err()
+}
+
+func TestFlightExecutorStoresDoGetProfilingTrailerAfterEOF(t *testing.T) {
+	srv := newCloseWaitFlightServer()
+	srv.closeAfterFirstBatch = true
+	srv.doGetTrailer = metadata.Pairs(profilingMetadataKey, `{"latency": 2}`)
+	exec, ctx := newCloseWaitExecutor(t, srv)
+	exec.lastProfiling.Store(`{"latency": 0.1}`)
+
+	rows, err := exec.QueryContext(ctx, "SELECT 1")
+	if err != nil {
+		t.Fatalf("QueryContext: %v", err)
+	}
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("row stream: %v", err)
+	}
+	if got := exec.LastProfilingOutput(); got != `{"latency": 2}` {
+		t.Fatalf("profiling output = %q, want DoGet trailer", got)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }
 
 func (s *closeWaitFlightServer) DoAction(action *flight.Action, stream pb.FlightService_DoActionServer) error {

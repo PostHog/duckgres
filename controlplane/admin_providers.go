@@ -23,6 +23,12 @@ type clusterInfoProvider struct {
 	srv              *server.Server
 	selfCPID         string
 	metadataSessions *metadataProxySessionRegistry
+	// defaultWorkerCPU/Memory are the CP-global default worker shape (the pod
+	// requests unsized workers are actually spawned with) — the final
+	// fallback in shape resolution for fleet/hot-idle reporting so an unsized
+	// worker on a default-less org doesn't report zero cpu/memory.
+	defaultWorkerCPU    string
+	defaultWorkerMemory string
 }
 
 var _ admin.LiveInfo = (*clusterInfoProvider)(nil)
@@ -135,12 +141,33 @@ func (p *clusterInfoProvider) QueryDetailForWorkerID(workerID int) (admin.QueryD
 // durable runtime store — the only source that sees hot-idle/spawning/draining
 // workers that hold no session.
 func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
-	stats, err := p.store.ListWorkerLifecycleStats()
+	stats, err := p.store.ListWorkerLifecycleStats(p.defaultWorkerCPU, p.defaultWorkerMemory)
 	if err != nil {
 		return nil, err
 	}
+	return aggregateWorkerFleet(stats), nil
+}
+
+// aggregateWorkerFleet preserves the org-agnostic admin API contract now that
+// the underlying lifecycle stats include org for Prometheus. Rows retain their
+// first-seen order from the store's deterministic query.
+func aggregateWorkerFleet(stats []configstore.WorkerLifecycleStats) []admin.FleetStat {
+	type fleetKey struct {
+		image   string
+		state   string
+		binding string
+	}
 	out := make([]admin.FleetStat, 0, len(stats))
+	indexes := make(map[fleetKey]int)
 	for _, s := range stats {
+		key := fleetKey{image: s.Image, state: string(s.State), binding: s.Binding}
+		if i, ok := indexes[key]; ok {
+			out[i].Count += s.Count
+			out[i].CPUCores += s.CPUCores
+			out[i].MemoryBytes += s.MemoryBytes
+			continue
+		}
+		indexes[key] = len(out)
 		out = append(out, admin.FleetStat{
 			Image:       s.Image,
 			State:       string(s.State),
@@ -149,6 +176,42 @@ func (p *clusterInfoProvider) WorkerFleet() ([]admin.FleetStat, error) {
 			CPUCores:    s.CPUCores,
 			MemoryBytes: s.MemoryBytes,
 		})
+	}
+	return out
+}
+
+// HotIdleByOrg returns each org's hot-idle pool footprint (durable runtime
+// store) joined with its configured max_hot_idle_* caps (config orgs table).
+func (p *clusterInfoProvider) HotIdleByOrg() ([]admin.HotIdleOrg, error) {
+	stats, err := p.store.ListHotIdleByOrg(p.defaultWorkerCPU, p.defaultWorkerMemory)
+	if err != nil {
+		return nil, err
+	}
+	var orgs []configstore.Org
+	if err := p.store.DB().
+		Select("name", "max_hot_idle_workers", "max_hot_idle_cpu", "max_hot_idle_memory").
+		Find(&orgs).Error; err != nil {
+		return nil, err
+	}
+	caps := make(map[string]configstore.Org, len(orgs))
+	for _, o := range orgs {
+		caps[o.Name] = o
+	}
+	out := make([]admin.HotIdleOrg, 0, len(stats))
+	for _, s := range stats {
+		row := admin.HotIdleOrg{
+			OrgID:              s.OrgID,
+			Count:              s.Count,
+			CPUCores:           s.CPUCores,
+			MemoryBytes:        s.MemoryBytes,
+			OldestHotIdleSince: s.OldestHotIdleSince,
+		}
+		if org, ok := caps[s.OrgID]; ok {
+			row.CapWorkers = org.MaxHotIdleWorkers
+			row.CapCPU = org.MaxHotIdleCPU
+			row.CapMemory = org.MaxHotIdleMemory
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -265,9 +328,9 @@ func (im *impersonator) Impersonate(c *gin.Context, org, username, sql string, a
 	ctx := c.Request.Context()
 
 	pid := impersonationPIDSeq.Add(-1)
-	// Empty memoryLimit/threads + nil profile: the worker auto-sizes DuckDB to
-	// its own pod and the default org worker shape is acquired/reused.
-	_, executor, err := stack.Sessions.CreateSessionWithProtocol(ctx, username, pid, "", 0, "flight", nil)
+	// Empty memoryLimit/threads + nil profile: the default org worker shape is
+	// acquired/reused, and its DuckDB limits are derived by the org stack.
+	_, executor, err := stack.Sessions.CreateSessionWithProtocol(ctx, username, pid, "", 0, "admin", nil)
 	if err != nil {
 		return nil, fmt.Errorf("open session as %s@%s: %w", username, org, err)
 	}

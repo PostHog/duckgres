@@ -76,6 +76,12 @@ type Controller struct {
 	// the composition keeps deriving the name.
 	bucketSuffix string
 
+	// Trino-side reconcile dependency. Optional: if nil (the default in
+	// deployments without a Trino cell, or in tests that don't exercise
+	// the Trino path), the Trino reconcile step is skipped silently.
+	// See WithTrinoProvisioner.
+	trinoProvisioner *TrinoProvisioner
+
 	// cnpgShardFieldUnsupported latches when a cnpg-shard backfill read-back
 	// shows the API server pruned spec.metadataStore.cnpgShard — i.e. the
 	// cluster's Duckling XRD predates the field. Cluster-wide condition, so
@@ -130,6 +136,22 @@ func (c *Controller) WithBucketSuffix(suffix string) *Controller {
 	return c
 }
 
+// WithTrinoProvisioner enables the Trino reconcile branch. The Trino
+// reconcile runs once per controller tick — it doesn't iterate per-warehouse
+// like the warehouse branches do, because the Trino projection is a single
+// batched output (a handful of Secrets + one ConfigMap + one OPA bundle for
+// the whole cell).
+//
+// Skipped entirely if p is nil so deployments without a Trino cell don't
+// need to know about it.
+func (c *Controller) WithTrinoProvisioner(p *TrinoProvisioner) *Controller {
+	if p == nil {
+		panic("WithTrinoProvisioner: provisioner is nil; call NewTrinoProvisioner first")
+	}
+	c.trinoProvisioner = p
+	return c
+}
+
 // Run starts the reconciliation loop. Blocks until ctx is cancelled.
 func (c *Controller) Run(ctx context.Context) {
 	slog.Info("Provisioning controller started.", "poll_interval", c.pollInterval)
@@ -153,10 +175,14 @@ func (c *Controller) Run(ctx context.Context) {
 // actionableStates are the warehouse states the controller acts on.
 // Ready is included so we can drift-correct user-mutable CR fields (today
 // just pgbouncer.enabled) without waiting for the Duckling to be recreated.
+// Failed remains actionable as an observation state: the controller leaves it
+// failed while the Duckling or end-to-end metadata path is unhealthy, but can
+// converge the row back to ready after externally managed dependencies recover.
 var actionableStates = []configstore.ManagedWarehouseProvisioningState{
 	configstore.ManagedWarehouseStatePending,
 	configstore.ManagedWarehouseStateProvisioning,
 	configstore.ManagedWarehouseStateReady,
+	configstore.ManagedWarehouseStateFailed,
 	configstore.ManagedWarehouseStateDeleting,
 }
 
@@ -178,8 +204,20 @@ func (c *Controller) reconcile(ctx context.Context) {
 			c.reconcileProvisioning(ctx, &w)
 		case configstore.ManagedWarehouseStateReady:
 			c.reconcileReady(ctx, &w)
+		case configstore.ManagedWarehouseStateFailed:
+			c.reconcileFailed(ctx, &w)
 		case configstore.ManagedWarehouseStateDeleting:
 			c.reconcileDeleting(ctx, &w)
+		}
+	}
+
+	// Trino reconcile runs once per tick (not per warehouse) — the
+	// projection is a single batched output for the cell. Errors are
+	// logged but don't block other reconcile branches; the next tick
+	// re-runs everything.
+	if c.trinoProvisioner != nil && ctx.Err() == nil {
+		if err := c.trinoProvisioner.Reconcile(ctx); err != nil {
+			slog.Warn("Trino provisioner reconcile failed.", "error", err)
 		}
 	}
 }
@@ -238,7 +276,28 @@ func (c *Controller) reconcilePending(ctx context.Context, w *configstore.Manage
 }
 
 func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.ManagedWarehouse) {
-	log := slog.With("org", w.OrgID, "phase", "provisioning")
+	c.reconcileWarehouseReadiness(ctx, w, true)
+}
+
+// reconcileFailed observes a warehouse whose previous provisioning attempt
+// exhausted the work Duckgres could do itself. Failed remains sticky while the
+// Duckling or the end-to-end metadata path is still unhealthy. If those
+// externally managed dependencies later become fully healthy, run the same
+// readiness gates as provisioning and CAS directly back to Ready.
+//
+// Failure timers are deliberately disabled here: ProvisioningStartedAt records
+// the original attempt, so applying its 10/30-minute thresholds to recovery
+// would fail the row again before observing the repaired Duckling.
+func (c *Controller) reconcileFailed(ctx context.Context, w *configstore.ManagedWarehouse) {
+	c.reconcileWarehouseReadiness(ctx, w, false)
+}
+
+// reconcileWarehouseReadiness mirrors the Duckling's aggregate/component
+// readiness and runs the worker-shaped metadata probe. A normal provisioning
+// attempt may transition to Failed on its bounded timers; a failed-row recovery
+// only observes and may transition to Ready.
+func (c *Controller) reconcileWarehouseReadiness(ctx context.Context, w *configstore.ManagedWarehouse, failureTimersEnabled bool) {
+	log := slog.With("org", w.OrgID, "phase", w.State)
 
 	// Use ProvisioningStartedAt if set (tracks when we entered provisioning state),
 	// fall back to CreatedAt for warehouses created before this field existed.
@@ -248,7 +307,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	}
 
 	// Check for timeout (30 minutes)
-	if time.Since(startedAt) > 30*time.Minute {
+	if failureTimersEnabled && time.Since(startedAt) > 30*time.Minute {
 		log.Warn("Provisioning timed out.")
 		err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
@@ -269,7 +328,7 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	// Crossplane resources commonly flap Synced=False transiently (e.g., IAM
 	// eventual consistency, metadata-store endpoint DNS propagation), so we only transition
 	// to failed if 10+ minutes have passed, giving transient errors time to resolve.
-	if status.SyncedFalseMessage != "" && time.Since(startedAt) > 10*time.Minute {
+	if failureTimersEnabled && status.SyncedFalseMessage != "" && time.Since(startedAt) > 10*time.Minute {
 		log.Warn("Crossplane sync failure.", "message", status.SyncedFalseMessage)
 		err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, map[string]interface{}{
 			"state":          configstore.ManagedWarehouseStateFailed,
@@ -340,14 +399,18 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 			status.MetadataStore.Database,
 			probeSSLMode,
 		); err != nil {
+			blocker := metadataProbeStatusMessage(err)
 			log.Info("Infrastructure provisioned but end-to-end probe still failing — staying in provisioning.",
-				"pgbouncer_enabled", w.PgBouncer.Enabled, "error", err)
-			updates["status_message"] = "Provisioning in progress..."
+				"pgbouncer_enabled", w.PgBouncer.Enabled, "blocker", blocker)
+			if blocker != w.StatusMessage {
+				updates["status_message"] = blocker
+			}
 		} else {
 			now := time.Now().UTC()
 			updates["state"] = configstore.ManagedWarehouseStateReady
 			updates["status_message"] = "Infrastructure ready"
 			updates["ready_at"] = now
+			updates["failed_at"] = nil
 			log.Info("Infrastructure ready, transitioning to ready.", "pgbouncer_enabled", w.PgBouncer.Enabled)
 		}
 	} else if !status.ReadyCondition {
@@ -363,13 +426,13 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 	}
 
 	if len(updates) > 0 {
-		if err := c.store.UpdateWarehouseState(w.OrgID, configstore.ManagedWarehouseStateProvisioning, updates); err != nil {
+		if err := c.store.UpdateWarehouseState(w.OrgID, w.State, updates); err != nil {
 			log.Warn("Failed to update warehouse state.", "error", err)
 		} else if updates["state"] == configstore.ManagedWarehouseStateReady {
 			// Terminal success: the warehouse just flipped to Ready and is now
-			// usable. Guarded on a successful CAS from Provisioning, so this
-			// fires exactly once — the next tick routes a Ready warehouse to
-			// reconcileReady, not here.
+			// usable. Guarded on a successful CAS from the observed Provisioning
+			// or Failed state, so this fires exactly once — the next tick routes
+			// a Ready warehouse to reconcileReady, not here.
 			analytics.Default().Capture("warehouse_provision_success", w.OrgID, provisionEventProps(w))
 		}
 	}
@@ -379,6 +442,25 @@ func (c *Controller) reconcileProvisioning(ctx context.Context, w *configstore.M
 // statusMessageMaxLen bounds the diagnostic status message so a verbose provider
 // error can't overflow the status_message column (VARCHAR(1024)).
 const statusMessageMaxLen = 1000
+
+// metadataProbeStatusMessage turns an untrusted probe error into a fixed,
+// credential-safe operator message. Probe errors normally come from pgx, but
+// MetadataProbe is injectable and a future implementation could include a raw
+// DSN (and password) in Error(), so never interpolate the original text into a
+// persisted status or log field.
+func metadataProbeStatusMessage(err error) string {
+	if isAuthProbeError(err) {
+		return "Infrastructure is ready, but metadata-store authentication failed; the PostgreSQL role password may not match its credential Secret. Waiting for recovery."
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "Infrastructure is ready, but the metadata-store connection check timed out. Waiting for recovery."
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "no such host") || strings.Contains(msg, "server misbehaving") {
+		return "Infrastructure is ready, but the metadata-store endpoint could not be resolved. Waiting for recovery."
+	}
+	return "Infrastructure is ready, but the metadata-store connection check is still failing. Waiting for recovery."
+}
 
 // diagnoseNotReady builds a human-facing explanation of why a still-provisioning
 // warehouse is not Ready. It asks Kubernetes for the failing composed resources

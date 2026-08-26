@@ -63,6 +63,10 @@ func (c *clientConn) handleParse(body []byte) {
 	// DuckDB doesn't support DECLARE/FETCH/CLOSE natively, so cursor
 	// emulation is needed for all users including passthrough.
 	cursorTree, cursorParseErr := pg_query.Parse(query)
+	// Exploratory tier: classify once, here, off the tree just parsed —
+	// Describe and Execute escalate off the small worker before a pinning
+	// statement reaches the executor, without re-parsing per Execute.
+	pinsWorker := classifyParsedTier(cursorTree, cursorParseErr) == tierPinning
 	if cursorParseErr == nil && len(cursorTree.Stmts) == 1 {
 		switch s := cursorTree.Stmts[0].Stmt.Node.(type) {
 		case *pg_query.Node_DeclareCursorStmt:
@@ -82,6 +86,7 @@ func (c *clientConn) handleParse(body []byte) {
 				cursorOp:       cursorOpDeclare,
 				cursorName:     s.DeclareCursorStmt.Portalname,
 				cursorQuery:    transpiledSQL,
+				pinsWorker:     pinsWorker,
 			}
 			_ = wire.WriteParseComplete(c.writer)
 			return
@@ -99,6 +104,7 @@ func (c *clientConn) handleParse(body []byte) {
 				cursorName:     s.FetchStmt.Portalname,
 				fetchCount:     s.FetchStmt.HowMany,
 				cursorIsMove:   s.FetchStmt.Ismove,
+				pinsWorker:     pinsWorker,
 			}
 			_ = wire.WriteParseComplete(c.writer)
 			return
@@ -110,6 +116,7 @@ func (c *clientConn) handleParse(body []byte) {
 				convertedQuery: query,
 				cursorOp:       cursorOpClose,
 				cursorName:     s.ClosePortalStmt.Portalname,
+				pinsWorker:     pinsWorker,
 			}
 			_ = wire.WriteParseComplete(c.writer)
 			return
@@ -125,6 +132,7 @@ func (c *clientConn) handleParse(body []byte) {
 			convertedQuery: query,
 			cursorOp:       cursorOpPgCursorsQuery,
 			cursorName:     cursorName,
+			pinsWorker:     pinsWorker,
 		}
 		if parameterized {
 			ps.numParams = 1
@@ -142,6 +150,7 @@ func (c *clientConn) handleParse(body []byte) {
 			query:          query,
 			convertedQuery: query,
 			cursorOp:       cursorOpPgStatActivity,
+			pinsWorker:     pinsWorker,
 		}
 		_ = wire.WriteParseComplete(c.writer)
 		return
@@ -158,6 +167,7 @@ func (c *clientConn) handleParse(body []byte) {
 			convertedQuery:  query,
 			paramTypes:      paramTypes,
 			numParams:       paramCount,
+			pinsWorker:      pinsWorker,
 		}
 		_ = wire.WriteParseComplete(c.writer)
 		return
@@ -179,6 +189,14 @@ func (c *clientConn) handleParse(body []byte) {
 
 	// Handle fallback to native DuckDB: PostgreSQL parsing failed, try DuckDB directly
 	if result.FallbackToNative {
+		// Lazy activation: validateWithDuckDB EXPLAINs on the engine, and Parse
+		// runs above every tier hook. pinsWorker is true here by construction (a
+		// parse failure classifies as pinning), so this is the statement's single
+		// acquire. A failure is connection-fatal and rides out on c.fatalErr,
+		// since this handler cannot return one.
+		if err := c.activateForStatement(query, pinsWorker); err != nil {
+			return
+		}
 		if err := c.validateWithDuckDB(query); err != nil {
 			// Neither PostgreSQL nor DuckDB can parse this query
 			c.observeExtendedParseQueryError("42601", fmt.Sprintf("syntax error: %v", err))
@@ -203,8 +221,11 @@ func (c *clientConn) handleParse(body []byte) {
 		querySourceShow:   result.QuerySourceShow,   // SHOW duckgres.query_source
 		s3CacheSet:        result.S3CacheSet,        // SET duckgres.s3_cache (custom GUC)
 		s3CacheShow:       result.S3CacheShow,       // SHOW duckgres.s3_cache
+		workerTTLSet:      result.WorkerTTLSet,      // SET duckgres.worker_ttl (custom GUC)
+		workerTTLShow:     result.WorkerTTLShow,     // SHOW duckgres.worker_ttl
 		statements:        result.Statements,        // Multi-statement rewrite (writable CTE)
 		cleanupStatements: result.CleanupStatements, // Cleanup statements
+		pinsWorker:        pinsWorker,               // Exploratory tier: escalate before Describe/Execute
 	}
 
 	c.logger().Debug("Prepared statement.", "name", stmtName, "query", usersecrets.RedactForLog(query))
@@ -306,6 +327,17 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
+		// duckgres.worker_ttl custom GUC: same shape as query_source above.
+		if ps.workerTTLSet != nil {
+			_ = wire.WriteNoData(c.writer)
+			return
+		}
+		if ps.workerTTLShow {
+			_ = c.sendRowDescription([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+			ps.described = true
+			return
+		}
+
 		// For queries that return results, we need to send RowDescription
 		// For other queries, send NoData
 		returnsResults := queryReturnsResults(ps.query)
@@ -338,6 +370,15 @@ func (c *clientConn) handleDescribe(body []byte) {
 		if isExplainStmt(ps.query) {
 			_ = c.sendRowDescription([]string{explainPlanColumn(ps.query)}, []ColumnTyper{staticColumnType("VARCHAR")})
 			ps.described = true
+			return
+		}
+
+		// Exploratory tier: the probe below EXECUTES the statement, so a
+		// pinning one must escalate first — LIMIT 0 bounds the rows, not the
+		// side effects (`SELECT … INTO t2` returns results by prefix, is not
+		// DML-RETURNING, and creates a table when probed). The intercepts above
+		// already answered every statement the CP handles itself.
+		if err := c.escalateForPinningTier(ps.query, ps.pinsWorker); err != nil {
 			return
 		}
 
@@ -429,11 +470,13 @@ func (c *clientConn) handleDescribe(body []byte) {
 			return
 		}
 
-		// duckgres-namespaced custom GUCs (query_source, s3_cache): answered
-		// from session state, never probed against DuckDB (which does not know
-		// these settings — the LIMIT-0 probe below would just fail and degrade
-		// to NoData). SET returns no rows; SHOW returns a single text column.
-		if p.stmt.querySourceSet != nil || p.stmt.s3CacheSet != nil {
+		// duckgres-namespaced custom GUCs (query_source, s3_cache, worker_ttl):
+		// answered from session state, never probed against DuckDB (which does
+		// not know these settings — the LIMIT-0 probe below would just fail and
+		// degrade to NoData, and on the exploratory tier it would acquire a
+		// worker to do it). SET returns no rows; SHOW returns a single text
+		// column.
+		if p.stmt.querySourceSet != nil || p.stmt.s3CacheSet != nil || p.stmt.workerTTLSet != nil {
 			_ = wire.WriteNoData(c.writer)
 			return
 		}
@@ -444,6 +487,11 @@ func (c *clientConn) handleDescribe(body []byte) {
 		}
 		if p.stmt.s3CacheShow {
 			_ = c.sendRowDescriptionWithFormats([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
+			p.described = true
+			return
+		}
+		if p.stmt.workerTTLShow {
+			_ = c.sendRowDescriptionWithFormats([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
 			p.described = true
 			return
 		}
@@ -475,6 +523,13 @@ func (c *clientConn) handleDescribe(body []byte) {
 			_ = c.sendRowDescriptionWithFormats([]string{explainPlanColumn(p.stmt.query)}, []ColumnTyper{staticColumnType("VARCHAR")}, p.resultFormats)
 			p.described = true
 			p.stmt.described = true
+			return
+		}
+
+		// Exploratory tier: as in the statement-Describe branch above, the
+		// LIMIT-0 probe really executes the statement, so a pinning one
+		// escalates first.
+		if err := c.escalateForPinningTier(p.stmt.query, p.stmt.pinsWorker); err != nil {
 			return
 		}
 
@@ -551,6 +606,14 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	// Continuation of a suspended portal: resume streaming from the open
+	// rowset. The query must NOT re-run — the client is fetching the next
+	// page of the same result set.
+	if p.exec != nil {
+		c.resumeSuspendedPortal(p, maxRows)
+		return
+	}
+
 	// Redacted form for everything observable (pg_stat_activity, spans,
 	// logs): CREATE SECRET option lists carry credential material.
 	loggableQuery := usersecrets.RedactForLog(p.stmt.query)
@@ -592,6 +655,16 @@ func (c *clientConn) handleExecute(body []byte) {
 	// Handle cursor operations before normal execution
 	switch p.stmt.cursorOp {
 	case cursorOpDeclare:
+		// Same contract as the simple-protocol DECLARE (handleQuery): this
+		// case returns above the general pin hook below, so without a hook of
+		// its own the cursor's worker-side RowSet would open on the
+		// exploratory worker and a later pinning statement would strand it.
+		// FETCH/CLOSE need no hook — an open cursor proves its DECLARE already
+		// pinned this connection. A failed escalation is connection-fatal; the
+		// error is parked on c.fatalErr for runExtendedQueryMessage.
+		if err := c.escalateForPinningTier(p.stmt.query, p.stmt.pinsWorker); err != nil {
+			return
+		}
 		c.handleDeclareCursorExtended(p)
 		return
 	case cursorOpFetch:
@@ -619,6 +692,14 @@ func (c *clientConn) handleExecute(body []byte) {
 	upperQuery := strings.ToUpper(strings.TrimSpace(p.stmt.query))
 	cmdType := c.getCommandType(upperQuery)
 	returnsResults := queryReturnsResults(p.stmt.query)
+
+	// Secret DDL creates worker-side state and the interception below executes
+	// it above the general pin hook, so the exploratory tier escalates first
+	// (connection-fatal on failure, parked on c.fatalErr). See
+	// escalateForSecretDDL.
+	if err := c.escalateForSecretDDL(p.stmt.query); err != nil {
+		return
+	}
 
 	// Intercept persistent-secret DDL (multitenant remote backend): persist /
 	// delete the user's stored secret alongside the session-side DDL. Uses
@@ -652,6 +733,11 @@ func (c *clientConn) handleExecute(body []byte) {
 	// during Parse. A failed swap errors the Execute so the session state
 	// never diverges from the worker's actual transport.
 	if p.stmt.s3CacheSet != nil {
+		// Lazy activation: the swap needs a worker to apply to (see the matching
+		// site in handleQuery). Not pinning, so the exploratory tier is enough.
+		if err := c.activateForStatement(p.stmt.query, false); err != nil {
+			return
+		}
 		if err := c.applyS3CacheSetting(*p.stmt.s3CacheSet); err != nil {
 			c.sendError("ERROR", "XX000", err.Error())
 			return
@@ -660,10 +746,43 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 	if p.stmt.s3CacheShow {
+		// Lazy activation before answering, only if a connect-time option is
+		// still pending: see the matching site in handleQuery.
+		if err := c.activateForS3CacheShow(p.stmt.query); err != nil {
+			return
+		}
 		if !p.described {
 			_ = c.sendRowDescription([]string{s3CacheGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
 		}
 		_ = c.sendDataRowWithFormats([]interface{}{c.s3CacheValue()}, p.resultFormats, nil)
+		_ = c.writeCommandComplete("SHOW")
+		return
+	}
+
+	// duckgres.worker_ttl custom GUC (SET / SHOW): intercepted session-side,
+	// applied via the bound worker's pool-side hot-idle TTL override.
+	// Determined by the transpiler during Parse. A failed apply errors the
+	// Execute so the session state never diverges from the TTL the worker
+	// will actually park with.
+	if p.stmt.workerTTLSet != nil {
+		// Lazy activation: the override needs a worker to apply to (see the
+		// matching site in handleQuery). Not pinning, so the exploratory tier
+		// is enough.
+		if err := c.activateForStatement(p.stmt.query, false); err != nil {
+			return
+		}
+		if err := c.applyWorkerTTLSetting(*p.stmt.workerTTLSet); err != nil {
+			c.sendError("ERROR", workerTTLApplyErrorSQLState(err), err.Error())
+			return
+		}
+		_ = c.writeCommandComplete("SET")
+		return
+	}
+	if p.stmt.workerTTLShow {
+		if !p.described {
+			_ = c.sendRowDescription([]string{WorkerTTLGUCName}, []ColumnTyper{staticColumnType("VARCHAR")})
+		}
+		_ = c.sendDataRowWithFormats([]interface{}{c.workerTTLValue()}, p.resultFormats, nil)
 		_ = c.writeCommandComplete("SHOW")
 		return
 	}
@@ -681,6 +800,20 @@ func (c *clientConn) handleExecute(body []byte) {
 	if p.stmt.isNoOp {
 		c.logger().Debug("No-op command (DuckLake limitation).", "query", p.stmt.query)
 		_ = c.writeCommandComplete(p.stmt.noOpTag)
+		return
+	}
+
+	// Exploratory tier: a statement that writes or creates session state must
+	// run on (and pin) a normal-size worker, so escalate BEFORE execution and
+	// keep the small worker stateless by construction. Mirrors the simple-query
+	// hook in handleQuery, including its position: the interpreted statements
+	// the CP answers itself (cursor / pg_stat_activity / secret DDL / GUC /
+	// ignored-SET / no-op) returned above and never reach here, and this sits
+	// above the writable-CTE rewrite branch because that branch runs the
+	// embedded DML on the worker. Classification came from Parse. A failed
+	// escalation is connection-fatal — the previous session is already gone —
+	// and rides out on c.fatalErr, since this handler cannot return one.
+	if err := c.escalateForPinningTier(p.stmt.query, p.stmt.pinsWorker); err != nil {
 		return
 	}
 
@@ -811,9 +944,25 @@ func (c *clientConn) handleExecute(body []byte) {
 			runQuery,
 		)
 	}
-	c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
-	execSpan.End()
+	// Exploratory tier: a read that blew the small worker's memory_limit is
+	// transparently re-executed on a normal-size worker. Prepare phase only —
+	// nothing has been sent to the client yet, so the retry is invisible. Never
+	// inside a transaction: the new worker has none of its accumulated state.
+	// runQuery reads c.executor at call time, so it targets the new worker.
+	// Same contract as executeSelectQuery; a failed escalation surfaces the
+	// ORIGINAL query error as FATAL and terminates the connection.
+	if err != nil && c.onExploratoryWorker && isWorkerOutOfMemoryError(err) && c.txStatus == txStatusIdle {
+		if escErr := c.escalateWorker(queryCtx, escalateReasonOOM); escErr != nil {
+			queryFinalErr = err
+			execSpan.End()
+			_ = c.failEscalation(convertedQuery, escErr, err.Error())
+			return
+		}
+		rows, err = runQuery()
+	}
 	if err != nil {
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
 		queryFinalErr = err
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
@@ -827,7 +976,28 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
 		return
 	}
-	defer func() { _ = rows.Close() }()
+	keepRowsOpen := false
+	rowsFinished := false
+	profilingFinished := false
+	finishProfiling := func() {
+		if profilingFinished {
+			return
+		}
+		profilingFinished = true
+		c.lastProfilingSummary = observe.EnrichSpanWithProfiling(execCtx, execSpan, execStart, c.executor, c.orgID)
+		execSpan.End()
+	}
+	finishRows := func() {
+		if keepRowsOpen || rowsFinished {
+			return
+		}
+		rowsFinished = true
+		_ = rows.Close()
+		finishProfiling()
+	}
+	defer func() {
+		finishRows()
+	}()
 
 	cols, err := rows.Columns()
 	if err != nil {
@@ -835,6 +1005,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.logger().Error("Columns error.", "error", err)
 		c.sendError("ERROR", "42000", err.Error())
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
 		return
 	}
@@ -857,37 +1028,57 @@ func (c *clientConn) handleExecute(body []byte) {
 		}
 	}
 
-	// Send rows with the format codes from Bind
-	rowCount := 0
-	for rows.Next() {
-		if maxRows > 0 && int32(rowCount) >= maxRows {
-			// Portal suspended - but we don't support this yet
-			break
-		}
+	// Send rows with the format codes from Bind. Shared with the simple-query
+	// path so the exploratory tier's zero-row retry below behaves identically
+	// on both protocols; the RowDescription was already handled above. maxRows
+	// caps the DataRows sent, and reaching it suspends the portal
+	// (stream.limitReached below) instead of completing it.
+	activeRows := rows
+	stream := c.streamSelectRows(rows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 
-		values := make([]interface{}, len(cols))
-		valuePtrs := make([]interface{}, len(cols))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			queryFinalErr = err
-			c.sendError("ERROR", "42000", err.Error())
-			c.setTxError()
-			c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", err.Error(), "extended")
+	// Exploratory tier: an OOM raised before a SINGLE DataRow reached the
+	// client is still re-executable on a normal-size worker — all the client
+	// has seen is the RowDescription, which the identical query on the same
+	// engine reproduces exactly, so it is deliberately NOT resent. Once rows
+	// are out the door the error must surface: a retry cannot un-send them.
+	if stream.rowsErr != nil && stream.rowsSent == 0 &&
+		c.onExploratoryWorker && isWorkerOutOfMemoryError(stream.rowsErr) && c.txStatus == txStatusIdle {
+		oomErr := stream.rowsErr
+		_ = rows.Close()
+		if escErr := c.escalateWorker(queryCtx, escalateReasonOOM); escErr != nil {
+			queryFinalErr = oomErr
+			_ = c.failEscalation(convertedQuery, escErr, oomErr.Error())
 			return
 		}
-
-		if err := c.sendDataRowWithFormats(values, p.resultFormats, typeOIDs); err != nil {
-			queryFinalErr = err
-			return
+		retryRows, retryErr := runQuery()
+		if retryErr != nil {
+			stream.rowsErr = retryErr
+		} else {
+			// The retried rowset replaces the original everywhere below —
+			// including as the rowset a suspension keeps open.
+			rows = retryRows
+			activeRows = retryRows
+			stream = c.streamSelectRows(retryRows, cols, colTypes, typeOIDs, false, p.resultFormats, maxRows)
 		}
-		rowCount++
 	}
+
+	if stream.scanErr != nil {
+		queryFinalErr = stream.scanErr
+		c.sendError("ERROR", "42000", stream.scanErr.Error())
+		c.setTxError()
+		finishRows()
+		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, "42000", stream.scanErr.Error(), "extended")
+		return
+	}
+	if stream.writeErr != nil {
+		queryFinalErr = stream.writeErr
+		return
+	}
+
+	rowCount := stream.rowsSent
 	queryRowsAff = int64(rowCount)
 
-	if err := rows.Err(); err != nil {
+	if err := stream.rowsErr; err != nil {
 		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
@@ -900,14 +1091,119 @@ func (c *clientConn) handleExecute(body []byte) {
 			c.sendError("ERROR", errCode, errMsg)
 		}
 		c.setTxError()
+		finishRows()
 		c.logQuery(start, originalQuery, convertedQuery, cmdType, 0, 0, errCode, errMsg, "extended")
+		return
+	}
+
+	if stream.limitReached {
+		// The row limit was reached with the result set possibly unexhausted:
+		// keep the rowset open on the portal and tell the client to Execute
+		// again. CommandComplete here would silently truncate the result set
+		// to the client's page size (the Hex 1024-row bug). The query log
+		// entry is written by the leg that completes the portal.
+		keepRowsOpen = true
+		p.exec = &portalExec{
+			rows:            activeRows,
+			cols:            cols,
+			typeOIDs:        typeOIDs,
+			cmdType:         cmdType,
+			rowCount:        int64(rowCount),
+			originalQuery:   originalQuery,
+			convertedQuery:  convertedQuery,
+			start:           start,
+			finishProfiling: finishProfiling,
+		}
+		_ = wire.WritePortalSuspended(c.writer)
 		return
 	}
 
 	c.updateTxStatus(cmdType)
 	tag := buildCommandTagFromRowCount(cmdType, int64(rowCount))
 	_ = c.writeCommandComplete(tag)
+	finishRows()
 	c.logQuery(start, originalQuery, convertedQuery, cmdType, int64(rowCount), 0, "", "", "extended")
+}
+
+// resumeSuspendedPortal continues streaming a portal previously suspended by
+// Execute hitting its row limit. The query is not re-executed — the portal's
+// open rowset picks up exactly where the previous Execute leg stopped. The
+// query log entry (spanning all legs, with the cumulative row count) is
+// written by whichever leg finishes the portal. There is deliberately no
+// exploratory-tier retry here: rows from earlier legs are already out the
+// door, so an error must surface (same rule as the mid-stream case above).
+func (c *clientConn) resumeSuspendedPortal(p *portal, maxRows int32) {
+	exec := p.exec
+
+	loggableQuery := usersecrets.RedactForLog(exec.originalQuery)
+	c.currentQuery.Store(loggableQuery)
+	c.queryStart.Store(time.Now())
+	defer func() {
+		c.currentQuery.Store("")
+		c.queryStart.Store(time.Time{})
+	}()
+
+	// Each Execute leg is one protocol message, so it gets its own metrics
+	// scope, mirroring the fresh path — which also gives the leg the terminal
+	// wire flush (finishQueryMetrics) every Execute relies on.
+	queryMetrics := c.beginQueryMetrics(time.Now())
+	queryMetrics.queryText = loggableQuery
+	defer c.finishQueryMetrics(queryMetrics)
+
+	stream := c.streamSelectRows(exec.rows, exec.cols, nil, exec.typeOIDs, false, p.resultFormats, maxRows)
+	exec.rowCount += int64(stream.rowsSent)
+
+	if stream.scanErr != nil {
+		p.closeExec()
+		c.sendError("ERROR", "42000", stream.scanErr.Error())
+		c.setTxError()
+		c.logQuery(exec.start, exec.originalQuery, exec.convertedQuery, exec.cmdType, 0, 0, "42000", stream.scanErr.Error(), "extended")
+		return
+	}
+	if stream.writeErr != nil {
+		p.closeExec()
+		return
+	}
+	if err := stream.rowsErr; err != nil {
+		p.closeExec()
+		errCode := "42000"
+		errMsg := err.Error()
+		if c.isCallerCancellation(err) {
+			errCode = "57014"
+			errMsg = "canceling statement due to user request"
+		} else {
+			c.logger().Error("Row iteration error.", "error", err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
+		c.setTxError()
+		c.logQuery(exec.start, exec.originalQuery, exec.convertedQuery, exec.cmdType, 0, 0, errCode, errMsg, "extended")
+		return
+	}
+	if stream.limitReached {
+		_ = wire.WritePortalSuspended(c.writer)
+		return
+	}
+
+	p.closeExec()
+	c.updateTxStatus(exec.cmdType)
+	tag := buildCommandTagFromRowCount(exec.cmdType, exec.rowCount)
+	_ = c.writeCommandComplete(tag)
+	c.logQuery(exec.start, exec.originalQuery, exec.convertedQuery, exec.cmdType, exec.rowCount, 0, "", "", "extended")
+}
+
+// closeSuspendedPortals releases every suspended portal's open rowset and
+// destroys the portal, matching PostgreSQL (portals do not survive
+// transaction end). Destroying — not just releasing — matters: a suspended
+// portal whose rowset was closed but whose entry survived would re-run the
+// query from row 0 on the next Execute, silently replaying the first page as
+// a continuation. A 34000 "portal does not exist" is the honest answer.
+func (c *clientConn) closeSuspendedPortals() {
+	for name, p := range c.portals {
+		if p.exec != nil {
+			p.closeExec()
+			delete(c.portals, name)
+		}
+	}
 }
 
 func (c *clientConn) handleClose(body []byte) {
@@ -927,6 +1223,9 @@ func (c *clientConn) handleClose(body []byte) {
 	case 'S':
 		delete(c.stmts, name)
 	case 'P':
+		if p, ok := c.portals[name]; ok {
+			p.closeExec()
+		}
 		delete(c.portals, name)
 	}
 
@@ -975,15 +1274,32 @@ func readCString(r *bytes.Reader) (string, error) {
 // arm the skip too. The trigger is deliberately the error event itself, NOT
 // txStatus == txStatusError: an aborted transaction must still accept the
 // Parse/Bind/Execute of a ROLLBACK sent after Sync.
-func (c *clientConn) runExtendedQueryMessage(handler func([]byte), body []byte) {
+//
+// Returns a non-nil error ONLY for a connection-fatal failure (today: a failed
+// exploratory-tier escalation, whose switcher already destroyed the session).
+// The handlers are void, so such a failure is parked on c.fatalErr and read
+// back here; skip-until-Sync is not enough for it — there is no session left to
+// resynchronize to, so the message loop must terminate the connection.
+func (c *clientConn) runExtendedQueryMessage(handler func([]byte), body []byte) error {
 	if c.ignoreTillSync {
-		return
+		return nil
 	}
 	before := c.errorResponsesSent
-	handler(body)
+	// Sync — not the handler — owns ReadyForQuery on this protocol; the shared
+	// statement-failure paths read this to know that.
+	c.inExtendedMessage = true
+	func() {
+		defer func() { c.inExtendedMessage = false }()
+		handler(body)
+	}()
 	if c.errorResponsesSent != before {
 		c.ignoreTillSync = true
 	}
+	if c.fatalErr != nil {
+		c.logger().Error("Extended query error.", "error", c.fatalErr)
+		return c.fatalErr
+	}
+	return nil
 }
 
 func (c *clientConn) handleBind(body []byte) {
@@ -1096,8 +1412,12 @@ func (c *clientConn) handleBind(body []byte) {
 		}
 	}
 
-	// Close existing portal with same name
-	delete(c.portals, portalName)
+	// Close existing portal with same name — including the open rowset of a
+	// suspended portal being abandoned.
+	if old, ok := c.portals[portalName]; ok {
+		old.closeExec()
+		delete(c.portals, portalName)
+	}
 
 	c.portals[portalName] = &portal{
 		stmt:          ps,

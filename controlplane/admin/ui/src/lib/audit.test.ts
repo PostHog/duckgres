@@ -23,6 +23,11 @@ describe("actionLabel", () => {
     expect(actionLabel("operators.delete")).toBe("Removed operator");
     expect(actionLabel("org.update")).toBe("Updated org config");
     expect(actionLabel("warehouse.update")).toBe("Updated warehouse config");
+    expect(actionLabel("warehouse.provision")).toBe("Provisioned warehouse");
+    expect(actionLabel("warehouse.deprovision")).toBe("Deprovisioned warehouse");
+    expect(actionLabel("warehouse.reset_password")).toBe("Reset warehouse root password");
+    expect(actionLabel("credential.create")).toBe("Minted service credential");
+    expect(actionLabel("credential.refresh")).toBe("Refreshed service credential");
     expect(actionLabel("user.kill")).toBe("Killed user sessions");
     expect(actionLabel("user.disable")).toBe("Disabled user");
     expect(actionLabel("secret.delete")).toBe("Deleted user secret");
@@ -46,5 +51,22 @@ describe("auditSummary", () => {
 
   it("falls back to the bare label when there is no target", () => {
     expect(auditSummary(entry({ action: "org.create", target_user: "" }))).toBe("Created org");
+  });
+
+  it("renders a pre-mint credential failure as failed", () => {
+    expect(auditSummary(entry({ action: "credential.create", status: 500 }))).toBe(
+      "Failed to mint service credential",
+    );
+  });
+
+  it("renders a 2xx credential mint as successful", () => {
+    expect(auditSummary(entry({ action: "credential.create", status: 201 }))).toBe("Minted service credential");
+  });
+
+  it("renders a durable mint as successful even when post-mint work returns 500", () => {
+    const durableMint = entry({ action: "credential.create", status: 500 });
+    Object.assign(durableMint, { outcome: "credential_minted" });
+
+    expect(auditSummary(durableMint)).toBe("Minted service credential");
   });
 });

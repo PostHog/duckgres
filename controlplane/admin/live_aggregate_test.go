@@ -18,6 +18,7 @@ import (
 
 // fakeLiveInfo returns a fixed local view.
 type fakeLiveInfo struct {
+	hotIdle []HotIdleOrg
 	queries  []QueryStatus
 	sessions []SessionStatus
 	orgStats []OrgStatus
@@ -42,6 +43,7 @@ func (f *fakeLiveInfo) QueryDetailForWorkerID(wid int) (QueryDetail, bool) {
 	return QueryDetail{}, false
 }
 func (f *fakeLiveInfo) WorkerFleet() ([]FleetStat, error)            { return nil, nil }
+func (f *fakeLiveInfo) HotIdleByOrg() ([]HotIdleOrg, error)          { return f.hotIdle, nil }
 func (f *fakeLiveInfo) ControlPlaneInstances() ([]CPInstance, error) { return nil, nil }
 func (f *fakeLiveInfo) KillSession(int32) error                      { return nil }
 func (f *fakeLiveInfo) KillSessionByWorkerID(wid int) int {
@@ -96,18 +98,19 @@ func (f *fakeUserAdmin) isDisabled(org, user string) bool {
 // (to prove ?scope=local does NOT fan out). It serves GET (byPath) and POST
 // (postByPath) fan-outs separately so a test can assert which verb was used.
 type fakePeerFetcher struct {
-	byPath     map[string][][]byte
-	postByPath map[string][][]byte
-	calls      int32
-	postCalls  int32
-	mu         sync.Mutex
-	postPaths  []string
+	byPath          map[string][][]byte
+	postByPath      map[string][][]byte
+	discoveryFailed bool
+	calls           int32
+	postCalls       int32
+	mu              sync.Mutex
+	postPaths       []string
 }
 
-func (f *fakePeerFetcher) FetchPeers(_ context.Context, path string) ([][]byte, int) {
+func (f *fakePeerFetcher) FetchPeers(_ context.Context, path string) PeerFetchResult {
 	atomic.AddInt32(&f.calls, 1)
 	b := f.byPath[path]
-	return b, len(b)
+	return PeerFetchResult{Bodies: b, Peers: len(b), DiscoveryComplete: !f.discoveryFailed}
 }
 
 func (f *fakePeerFetcher) PostPeers(_ context.Context, path string) ([][]byte, int) {
@@ -159,6 +162,18 @@ func TestQueriesAggregateAcrossCPs(t *testing.T) {
 	}
 	if atomic.LoadInt32(&fetcher.calls) != 0 {
 		t.Fatalf("scope=local must NOT fan out, but fetcher ran %d times", fetcher.calls)
+	}
+
+	failedDiscovery := &fakePeerFetcher{discoveryFailed: true}
+	r = gin.New()
+	registerLiveAPI(r.Group("/api/v1"), local, failedDiscovery, nil)
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/queries", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal failed-discovery response: %v", err)
+	}
+	if got.Responders != 1 || got.Total != 2 {
+		t.Fatalf("failed-discovery coverage = %d/%d, want incomplete 1/2", got.Responders, got.Total)
 	}
 }
 

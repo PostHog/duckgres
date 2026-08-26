@@ -11,13 +11,15 @@ import (
 // original orgs/users/warehouse CRUD: live cluster state, user-secret
 // management, impersonation, audit log, and the Prometheus metrics proxy.
 type Extras struct {
-	Store        secretStore // *configstore.ConfigStore
-	Live         LiveInfo
-	Users        UserAdmin // per-user kill switch (disable/enable); *configstore.ConfigStore
-	Impersonator Impersonator
-	Audit        *AuditStore
-	Metrics      *MetricsProxy
-	Fetcher      PeerFetcher // cross-CP live-state aggregation (nil = single-CP)
+	Store                    secretStore // *configstore.ConfigStore
+	Monitoring               monitoringStore
+	MonitoringWorkerDefaults MonitoringWorkerDefaults
+	Live                     LiveInfo
+	Users                    UserAdmin // per-user kill switch (disable/enable); *configstore.ConfigStore
+	Impersonator             Impersonator
+	Audit                    *AuditStore
+	Metrics                  *MetricsProxy
+	Fetcher                  PeerFetcher // cross-CP live-state aggregation (nil = single-CP)
 	// ClusterClient backs the read-only node-overview topology endpoints
 	// (/cluster/nodes,/pods,/events,/nodepools). nil (non-k8s backends, tests)
 	// leaves those routes unregistered.
@@ -30,6 +32,7 @@ type Extras struct {
 func RegisterExtras(r *gin.RouterGroup, x Extras) {
 	r.GET("/me", meHandler)
 	registerLiveAPI(r, x.Live, x.Fetcher, x.Users)
+	registerMonitoringAPI(r, x.Monitoring, x.Live, x.Fetcher, x.Metrics, x.MonitoringWorkerDefaults)
 	if x.ClusterClient != nil {
 		registerClusterAPI(r, x.ClusterClient)
 	}

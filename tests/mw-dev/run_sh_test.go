@@ -711,7 +711,7 @@ func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
 					map[string]any{"name": "NODE_NAME", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "spec.nodeName"}}},
 					map[string]any{"name": "DUCKGRES_MEMORY_LIMIT", "value": "1GB"},
 					map[string]any{"name": "GOMEMLIMIT", "value": "192MiB"},
-					map[string]any{"name": "DUCKGRES_THREADS", "value": "1"},
+					map[string]any{"name": "DUCKGRES_THREADS", "value": "2"},
 				},
 				"volumeMounts": []any{map[string]any{"mountPath": "/data"}},
 				"resources": map[string]any{
@@ -729,7 +729,7 @@ func TestE2EHarnessWorkerInspectionJSONPathParsesSnapshot(t *testing.T) {
 	if err := template.Execute(&got, pod); err != nil {
 		t.Fatalf("execute worker inspection JSONPath: %v", err)
 	}
-	const want = "|Running|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1"
+	const want = "|Running|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|2"
 	if got.String() != want {
 		t.Fatalf("worker inspection snapshot = %q, want %q", got.String(), want)
 	}
@@ -787,6 +787,11 @@ if [[ "$*" == *"get pods -l app=duckgres-worker,duckgres/active-org=test-org"* ]
   esac
   exit 0
 fi
+if [[ "$*" == *"POSTHOG_API_KEY"* ]]; then
+  # Fixture workers have no PostHog env. Empty output is the success case
+  # for the plaintext-forbidden assert (and skips the secretKeyRef copy).
+  exit 0
+fi
 if [[ "$*" == *"get pod stale-worker"* ]]; then
   echo 'Error from server (NotFound): pods "stale-worker" not found' >&2
   exit 1
@@ -803,7 +808,7 @@ if [[ "$*" == *"get pod pending-worker"* && "$*" == *"-o jsonpath="* ]] || \
   if [[ "$*" == *".status.phase"* ]]; then
     printf '|%s' "$phase"
   fi
-  printf '%s' '|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|1'
+  printf '%s' '|duckgres-worker|control-plane|worker-123|true|1000|false|metadata.name|spec.nodeName|data,|/data,|750m|1536Mi|1GB|192MiB|2'
   exit 0
 fi
 echo "unexpected kubectl invocation: $*" >&2
@@ -836,7 +841,7 @@ exit 1
 	if got := strings.Count(callLog, "get pods -l app=duckgres-worker,duckgres/active-org=test-org"); got != 3 {
 		t.Fatalf("worker selections = %d, want 3 (stale, terminal, then replacement); calls:\n%s", got, callLog)
 	}
-	if got := strings.Count(callLog, "--field-selector=status.phase=Running"); got != 3 {
+	if got := strings.Count(callLog, "app=duckgres-worker,duckgres/active-org=test-org --field-selector=status.phase=Running"); got != 3 {
 		t.Fatalf("running-worker selections = %d, want 3; calls:\n%s", got, callLog)
 	}
 	if !strings.Contains(callLog, "get pod stale-worker") {
@@ -848,8 +853,68 @@ exit 1
 	if got := strings.Count(callLog, "get pod transitioned-worker"); got != 1 {
 		t.Fatalf("terminal transition inspections = %d, want 1; calls:\n%s", got, callLog)
 	}
-	if got := strings.Count(callLog, "get pod replacement-worker"); got != 1 {
-		t.Fatalf("replacement inspection reads = %d, want 1 atomic snapshot; calls:\n%s", got, callLog)
+	if got := strings.Count(callLog, "get pod replacement-worker -o jsonpath={.metadata.deletionTimestamp"); got != 1 {
+		t.Fatalf("replacement inspection snapshots = %d, want 1; calls:\n%s", got, callLog)
+	}
+	if !strings.Contains(callLog, "get pod replacement-worker -o jsonpath={range .spec.containers") {
+		t.Fatalf("did not run plaintext POSTHOG_API_KEY check on replacement; calls:\n%s", callLog)
+	}
+}
+
+func TestE2EHarnessColdBurstAcceptsStaggeredWorkerReadiness(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+
+	harness := strings.Replace(string(raw), "\nstart_kubectl_download\nk() {", "\nKUBECTL=\"${TEST_KUBECTL:?}\"\nk() {", 1)
+	harness = strings.Replace(harness, "\nmain \"$@\"\n", "\nkill() { return 1; }\ncold_burst_parallel_spawns test-org test-password\n", 1)
+	if harness == string(raw) {
+		t.Fatal("could not prepare cold-burst harness fixture")
+	}
+
+	dir := t.TempDir()
+	harnessPath := filepath.Join(dir, "harness.sh")
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o755); err != nil {
+		t.Fatalf("write harness fixture: %v", err)
+	}
+
+	kubectlPath := filepath.Join(dir, "kubectl")
+	writeFake(t, dir, "kubectl", `#!/usr/bin/env bash
+case "$*" in
+  *"delete pods -l app=duckgres-worker,duckgres/active-org=test-org"*|*"wait --for=delete pods -l app=duckgres-worker,duckgres/active-org=test-org"*)
+    exit 0
+    ;;
+  *"get pods -l app=duckgres-worker,duckgres/active-org=test-org"*"-o jsonpath="*)
+    printf '%s' '2024-01-01T00:00:00Z 2024-01-01T00:00:01Z 2024-01-01T00:00:02Z'
+    exit 0
+    ;;
+esac
+echo "unexpected kubectl invocation: $*" >&2
+exit 1
+`)
+	writeFake(t, dir, "psql", "#!/usr/bin/env sh\nprintf 1500000000\n")
+	writeFake(t, dir, "date", `#!/usr/bin/env sh
+case "$*" in
+  *"2024-01-01T00:00:00Z"*) printf 100 ;;
+  *"2024-01-01T00:00:02Z"*) printf 102 ;;
+  *) exit 1 ;;
+esac
+`)
+
+	cmd := exec.Command("sh", harnessPath)
+	cmd.Env = append(os.Environ(),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TEST_KUBECTL="+kubectlPath,
+		"CP_API=http://test.invalid",
+		"CP_PG_HOST=control-plane.test",
+		"INTERNAL_SECRET=test-secret",
+		"NAMESPACE=test-namespace",
+		"PR_NUMBER=123",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("cold burst rejected three distinct parallel-created workers after their clients exited: %v\n%s", err, out)
 	}
 }
 
@@ -945,7 +1010,7 @@ func TestScenarioPodIsProtectedFromKarpenterDisruption(t *testing.T) {
 	}
 }
 
-func TestControlPlaneServiceExposesFlight(t *testing.T) {
+func TestControlPlaneServiceDoesNotExposeFlight(t *testing.T) {
 	raw, err := os.ReadFile("manifests.tmpl.yaml")
 	if err != nil {
 		t.Fatalf("read manifests template: %v", err)
@@ -975,11 +1040,11 @@ func TestControlPlaneServiceExposesFlight(t *testing.T) {
 		}
 
 		for _, port := range manifestPorts(manifest) {
-			if port["name"] == "flight" && port["port"] == float64(8815) && port["targetPort"] == "flight" {
-				return
+			if port["name"] == "flight" || port["port"] == float64(8815) || port["targetPort"] == "flight" {
+				t.Fatalf("duckgres-control-plane Service exposes obsolete Flight port: %#v", port)
 			}
 		}
-		t.Fatalf("duckgres-control-plane Service does not expose flight port 8815 to targetPort flight")
+		return
 	}
 
 	t.Fatal("duckgres-control-plane Service missing from manifests template")

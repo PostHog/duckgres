@@ -26,11 +26,10 @@ var proxyTracer = otel.Tracer("duckgres/cache-proxy")
 // import cliboot because cliboot transitively pulls in the DuckDB CGO runtime
 // (via posthog/duckgres/server), which this standalone proxy must not link.
 //
-// Cache-proxy spans are emitted as their own root traces (DuckDB httpfs sends
-// no traceparent), tagged with service.name=duckgres-cache-proxy so they're
-// distinguishable from query traces in Tempo. They are NOT stitched into the
-// query trace — cross-reference by time + s3 path + client.address (worker pod
-// IP) + node. Returns a shutdown func that flushes the batch processor.
+// Cache-proxy spans are tagged with service.name=duckgres-cache-proxy. Requests
+// carrying W3C context from a Duckgres worker join that query trace; requests
+// without a parent remain standalone roots. Returns a shutdown func that
+// flushes the batch processor.
 func initTracing() func() {
 	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
 	if endpoint == "" {

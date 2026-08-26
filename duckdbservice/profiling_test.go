@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // validateGRPCMetadataValue checks that a string is safe for use as a gRPC
@@ -111,5 +113,30 @@ func TestProfilingOutputGRPCSafety(t *testing.T) {
 	}
 	if parsed["query_name"] != "SELECT * FROM \"my_table\" WHERE name = 'O''Brien'" {
 		t.Errorf("query_name mangled: %v", parsed["query_name"])
+	}
+}
+
+func TestSendProfilingMetadataSinceRejectsStaleOutput(t *testing.T) {
+	previousPath := profilingOutputPath
+	profilingOutputPath = t.TempDir() + "/profiling.json"
+	t.Cleanup(func() { profilingOutputPath = previousPath })
+
+	if err := os.WriteFile(profilingOutputPath, []byte(`{"latency":0.1}`), 0o600); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+	if got := profilingMetadataSince(time.Now()); got != "" {
+		t.Fatalf("stale profile metadata = %q, want empty", got)
+	}
+
+	startedAt := clearProfilingOutput()
+	if err := os.WriteFile(profilingOutputPath, []byte(`{"latency":0.2}`), 0o600); err != nil {
+		t.Fatalf("write completed profile: %v", err)
+	}
+	freshAt := startedAt.Add(time.Second)
+	if err := os.Chtimes(profilingOutputPath, freshAt, freshAt); err != nil {
+		t.Fatalf("set completed profile mtime: %v", err)
+	}
+	if got := profilingMetadataSince(startedAt); got != `{"latency":0.2}` {
+		t.Fatalf("completed profile metadata = %q", got)
 	}
 }

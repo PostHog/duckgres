@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ManagedWarehouse, Org } from "@/types/api";
 
 const hooks = vi.hoisted(() => ({
+  useDatabaseNameAvailable: vi.fn(),
   useDeleteOrg: vi.fn(),
   useDeprovisionWarehouse: vi.fn(),
   useDucklingsMetadata: vi.fn(),
@@ -30,9 +31,17 @@ vi.mock("@/components/OrgTeamDialogs", () => ({
   LegacyNamesBadge: () => null,
 }));
 
+// The usage charts section is independently tested in OrgUsage.test.tsx; here
+// it would need the useApi mock to grow a useOrgDailyUsage entry it never
+// asserts on.
+vi.mock("@/pages/OrgUsage", () => ({
+  OrgUsageSection: () => null,
+}));
+
 import { OrgDetail } from "./OrgDetail";
 
 const warehouseUpdate = vi.fn();
+const orgUpdate = vi.fn();
 const ok = <T,>(data: T) => ({
   data,
   isSuccess: true,
@@ -56,6 +65,10 @@ const ORG: Org = {
   default_worker_memory: "8Gi",
   default_worker_ttl: "75m",
   default_worker_min_hot_idle: 0,
+  max_hot_idle_workers: 0,
+  max_hot_idle_cpu: "",
+  max_hot_idle_memory: "",
+  data_imports_table_naming_version: "legacy_batch_v1",
   created_at: "2026-07-01T00:00:00Z",
   updated_at: "2026-07-01T00:00:00Z",
 };
@@ -103,8 +116,8 @@ function warehouse(metadataProxyEnabled: boolean): ManagedWarehouse {
   } as ManagedWarehouse;
 }
 
-function renderPage(metadataProxyEnabled: boolean) {
-  hooks.useWarehouse.mockReturnValue(ok(warehouse(metadataProxyEnabled)));
+function renderPage(metadataProxyEnabled: boolean, warehouseOverrides: Partial<ManagedWarehouse> = {}) {
+  hooks.useWarehouse.mockReturnValue(ok({ ...warehouse(metadataProxyEnabled), ...warehouseOverrides }));
   render(
     <MemoryRouter initialEntries={["/orgs/acme"]}>
       <TooltipProvider>
@@ -116,7 +129,7 @@ function renderPage(metadataProxyEnabled: boolean) {
   );
 }
 
-describe("Org warehouse metadata proxy setting", () => {
+describe("Org detail", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     identity.useIdentity.mockReturnValue({
@@ -124,13 +137,54 @@ describe("Org warehouse metadata proxy setting", () => {
       me: { email: "admin@example.com", role: "admin", source: "sso" },
     });
     hooks.useOrg.mockReturnValue(ok(ORG));
-    hooks.useUpdateOrg.mockReturnValue(mut());
+    hooks.useDatabaseNameAvailable.mockReturnValue({ data: null, isLoading: false });
+    hooks.useUpdateOrg.mockReturnValue(mut(orgUpdate));
     hooks.useDeleteOrg.mockReturnValue(mut());
     hooks.useUpdateWarehouse.mockReturnValue(mut(warehouseUpdate));
     hooks.useDeprovisionWarehouse.mockReturnValue(mut());
     hooks.useDucklingsMetadata.mockReturnValue(ok({ available: true, entries: [] }));
     hooks.useOrgReshards.mockReturnValue(ok([]));
     hooks.useOrgTeams.mockReturnValue(ok([]));
+  });
+
+  it("headline leads with the database name; the org id is a subline with a copy button", () => {
+    // The URL org id ("acme") is the subline; the readable database_name is
+    // the headline. (The headline falls back to the raw id while the org is
+    // still loading, covered by the loading branch of Header.)
+    hooks.useOrg.mockReturnValue(ok({ ...ORG, database_name: "posthog" }));
+    renderPage(false);
+
+    const headline = screen.getByRole("heading", { level: 1 });
+    expect(within(headline).getByText("posthog")).toBeInTheDocument();
+    expect(within(headline).getByText("acme")).toBeInTheDocument();
+    expect(within(headline).getByRole("button", { name: /copy acme/i })).toBeInTheDocument();
+  });
+
+  it("distinguishes ready infrastructure components from an operational readiness blocker", () => {
+    const blocker =
+      "Infrastructure is ready, but metadata-store authentication failed; the PostgreSQL role password may not match its credential Secret. Waiting for recovery.";
+    renderPage(false, {
+      state: "failed",
+      metadata_store_state: "ready",
+      s3_state: "ready",
+      identity_state: "ready",
+      secrets_state: "ready",
+      status_message: blocker,
+      failed_at: "2026-08-14T10:18:09Z",
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(within(alert).getByText("Warehouse is not operationally ready")).toBeInTheDocument();
+    expect(within(alert).getByText("Current blocker")).toBeInTheDocument();
+    expect(within(alert).getByText(blocker)).toBeInTheDocument();
+    expect(within(alert).getByText(/component badges reflect Duckling infrastructure/i)).toBeInTheDocument();
+    expect(within(alert).getByText(/recovery is checked automatically/i)).toBeInTheDocument();
+    expect(screen.getByText("Metadata store").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("S3").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("Identity").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("Secrets").parentElement).toHaveTextContent("ready");
+    expect(screen.getByText("Last ready")).toBeInTheDocument();
+    expect(screen.getByText("Last failed")).toBeInTheDocument();
   });
 
   it.each([
@@ -149,5 +203,128 @@ describe("Org warehouse metadata proxy setting", () => {
 
     expect(warehouseUpdate).toHaveBeenCalledTimes(1);
     expect(warehouseUpdate).toHaveBeenCalledWith({ metadata_proxy_enabled: next });
+  });
+
+  it("sends database_name only when it changed", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    // Untouched: save carries no database_name (no spurious rename).
+    await user.click(screen.getByText("Save changes"));
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.not.objectContaining({ database_name: expect.anything() }));
+
+    orgUpdate.mockClear();
+
+    // Fixed a broken stored name: the rename rides the update.
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme-inc");
+    await user.click(screen.getByText("Save changes"));
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.objectContaining({ database_name: "acme-inc" }));
+  });
+
+  it("keeps every other setting editable for an org whose stored name predates the rule", async () => {
+    // The premise of the break-glass surface: grandfathered rows like
+    // "ACME INC" must NOT wedge the whole org-config card behind a forced
+    // rename. The server preserves database_name when the key is absent
+    // (Go test TestUpdateOrgWithoutDatabaseNameKeyPreservesIt).
+    const user = userEvent.setup();
+    hooks.useOrg.mockReturnValue(ok({ ...ORG, database_name: "ACME INC" }));
+    renderPage(false);
+
+    const save = screen.getByRole("button", { name: /save changes/i });
+    expect(save).toBeEnabled();
+    expect(screen.getByLabelText(/database name/i)).toHaveValue("ACME INC");
+
+    await user.click(save);
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(expect.not.objectContaining({ database_name: expect.anything() }));
+
+    // Fixing the name unlocks the rename path.
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme-inc");
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(orgUpdate).toHaveBeenLastCalledWith(expect.objectContaining({ database_name: "acme-inc" }));
+  });
+
+  it("rejects a database name that is not a valid DNS label client-side", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "acme inc");
+
+    expect(screen.getByText(/single DNS label/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled();
+  });
+
+  it("disables save with an explanation when the database name is cleared", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+
+    expect(screen.getByText(/database name is required/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled();
+  });
+
+  it("blocks a rename onto a database name another org already owns", async () => {
+    const user = userEvent.setup();
+    hooks.useDatabaseNameAvailable.mockReturnValue(ok({ name: "taken-name", available: false }));
+    renderPage(false);
+
+    const dbInput = screen.getByLabelText(/database name/i);
+    await user.clear(dbInput);
+    await user.type(dbInput, "taken-name");
+
+    expect(await screen.findByText(/already in use by another org/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled();
+  });
+
+  it("saves a changed data import table naming version", async () => {
+    const user = userEvent.setup();
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    renderPage(false);
+
+    const namingSelect = screen.getByLabelText("Data import table naming");
+    expect(namingSelect).toHaveTextContent("Legacy batch (legacy_batch_v1)");
+
+    namingSelect.focus();
+    await user.keyboard("{Enter}{ArrowDown}{Enter}");
+    await user.click(screen.getByText("Save changes"));
+
+    expect(orgUpdate).toHaveBeenCalledTimes(1);
+    expect(orgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data_imports_table_naming_version: "copy_v1" }),
+    );
+  });
+
+  it("saves the hot-idle pool caps with the org form", async () => {
+    const user = userEvent.setup();
+    renderPage(false);
+
+    const workers = await screen.findByLabelText(/max hot-idle workers/i);
+    await user.clear(workers);
+    await user.type(workers, "5");
+    const cpu = screen.getByLabelText(/max hot-idle vcpu/i);
+    await user.clear(cpu);
+    await user.type(cpu, "16");
+    const mem = screen.getByLabelText(/max hot-idle memory/i);
+    await user.clear(mem);
+    await user.type(mem, "64Gi");
+    await user.click(screen.getByText("Save changes"));
+
+    expect(orgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        max_hot_idle_workers: 5,
+        max_hot_idle_cpu: "16",
+        max_hot_idle_memory: "64Gi",
+      }),
+    );
   });
 });

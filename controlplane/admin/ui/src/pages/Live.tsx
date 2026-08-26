@@ -18,15 +18,21 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useCancelSession, useKillUserSessions, useQueries, useSessions } from "@/hooks/useApi";
-import { fmtAge, fmtDurationMs, fmtInt, fmtTime } from "@/lib/format";
+import { useCancelSession, useKillUserSessions, useOrgs, useQueries, useSessions } from "@/hooks/useApi";
+import { fmtAge, fmtDurationMs, fmtInt, fmtTime, orgLabel } from "@/lib/format";
 import { idleInTransaction, isIdleSession, sessionStateLabel } from "@/lib/session";
 import { compareByStarted, compareByWorker } from "@/lib/liveSort";
+import { OrgRef } from "@/components/OrgRef";
 import { QueryDetailDialog } from "@/components/QueryDetailDialog";
+
+// OrgRef is the shared readable-org cell (components/OrgRef). The local copy
+// that used to live here ("OrgIdentity") was replaced so every page renders
+// an org reference the same way.
 
 export function Live() {
   const queries = useQueries();
   const sessions = useSessions();
+  const orgs = useOrgs();
   const cancel = useCancelSession();
   const killUser = useKillUserSessions();
   const [org, setOrg] = useState("");
@@ -36,6 +42,11 @@ export function Live() {
   // The kill endpoint targets an EXACT (org, user); the filter boxes are
   // substring matches, so only offer it once both are set, and pass them verbatim.
   const canKillUser = org.trim() !== "" && user.trim() !== "";
+
+  const orgLabels = useMemo(
+    () => new Map((orgs.data ?? []).map((o) => [o.name, orgLabel(o)])),
+    [orgs.data],
+  );
 
   const matchOrg = (o?: string) => !org || (o ?? "").toLowerCase().includes(org.toLowerCase());
   const matchUser = (u?: string) => !user || (u ?? "").toLowerCase().includes(user.toLowerCase());
@@ -164,7 +175,9 @@ export function Live() {
                         title="View query detail"
                       >
                         <TableCell className="font-mono text-xs">{q.pid}</TableCell>
-                        <TableCell className="font-mono text-xs">{q.org}</TableCell>
+                        <TableCell>
+                          <OrgRef id={q.org} label={orgLabels.get(q.org)} />
+                        </TableCell>
                         <TableCell className="font-mono text-xs">{q.user || "—"}</TableCell>
                         <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
                           <Tooltip>
@@ -263,7 +276,9 @@ export function Live() {
                   {liveSessions.map((s) => (
                     <TableRow key={`${s.pid}-${s.worker_id}`} className="[&>td]:py-1.5">
                       <TableCell className="font-mono text-xs">{s.pid}</TableCell>
-                      <TableCell className="font-mono text-xs">{s.org}</TableCell>
+                      <TableCell>
+                        <OrgRef id={s.org} label={orgLabels.get(s.org)} />
+                      </TableCell>
                       <TableCell className="font-mono text-xs">{s.user || "—"}</TableCell>
                       <TableCell className="font-mono text-xs">#{s.worker_id}</TableCell>
                       <TableCell>
@@ -292,6 +307,7 @@ export function Live() {
       </PageBody>
       <QueryDetailDialog
         workerId={detailWid}
+        orgLabels={orgLabels}
         onClose={() => setDetailWid(null)}
         onCancel={(workerId) => cancel.mutate(workerId)}
       />

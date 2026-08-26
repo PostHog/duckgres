@@ -279,11 +279,11 @@
       padding: 6px 18px; border-bottom: 1px solid var(--line); align-items: center;
     }
     .dform .frow label { color: var(--dim); font-size: 11px; letter-spacing: .04em; }
-    .dform .frow input {
+    .dform .frow input, .dform .frow select {
       background: var(--panel2); border: 1px solid var(--line-bright); border-radius: 4px;
       color: var(--text); font-family: inherit; font-size: 12px; padding: 5px 8px; width: 100%;
     }
-    .dform .frow input:focus { outline: none; border-color: var(--worker); }
+    .dform .frow input:focus, .dform .frow select:focus { outline: none; border-color: var(--worker); }
     .dform .factions { display: flex; gap: 8px; padding: 13px 18px; }
 
     .empty { padding: 40px 22px; color: var(--dim); font-size: 12px; letter-spacing: .04em; }
@@ -445,27 +445,13 @@
       created_at: "When this worker record was created.",
       updated_at: "When this worker record was last modified.",
     },
-    "flight-session-records": {
-      session_token: "Opaque Flight session token. Primary key.",
-      username: "User that owns the Flight session.",
-      org_id: "Org the session belongs to.",
-      worker_id: "Worker pod serving this session.",
-      pid: "Client backend PID associated with the durable session.",
-      owner_epoch: "Worker ownership epoch at the time the session was bound, to fence stale workers.",
-      cp_instance_id: "Control-plane instance handling this session.",
-      state: "Durable reconnect state (active, reconnecting, expired, closed).",
-      expires_at: "When the session reconnect window expires.",
-      last_seen_at: "Most recent activity on the session.",
-      created_at: "When this session record was created.",
-      updated_at: "When this session record was last modified.",
-    },
     "org-connection-queue": {
       request_id: "Unique admission request id. Primary key.",
       org_id: "Org requesting resource admission.",
       username: "User requesting resource admission.",
       cp_instance_id: "Control-plane instance that enqueued the request.",
       pid: "Client backend PID associated with the request.",
-      protocol: "Client protocol of the request (e.g. postgres, flight).",
+      protocol: "Session interface for the request (postgres or admin).",
       requested_vcpus: "Worker pod vCPUs requested by this admission entry.",
       enqueued_at: "When the request joined the FIFO queue; orders fairness.",
       expires_at: "When this queue entry expires and is reclaimed.",
@@ -480,7 +466,7 @@
       username: "User holding the admission lease.",
       cp_instance_id: "Control-plane instance that owns the lease.",
       pid: "Client backend PID holding the lease.",
-      protocol: "Client protocol of the leased connection.",
+      protocol: "Session interface for the lease (postgres or admin).",
       requested_vcpus: "Worker pod vCPUs charged to the org and user budgets.",
       acquired_at: "When the lease was acquired; counts toward active vCPU resource budgets.",
       created_at: "When this lease record was created.",
@@ -497,7 +483,6 @@
     "managed-warehouses": "The config-store source of truth for an org's managed warehouse: image, metadata/object stores, catalogs, identity, and provisioning status.",
     "cp-instances": "A runtime coordination record for one control-plane process, with liveness state and heartbeat.",
     "worker-records": "A durable runtime record for one worker pod: lifecycle state, owner, profile, TTL, and credential expiry.",
-    "flight-session-records": "A durable reconnect record for a Flight-only session, binding it to a worker and control-plane instance.",
     "org-connection-queue": "A cluster-wide FIFO resource admission request for one org/user session; rows expire quickly and coordinate fairness across CP replicas.",
     "org-connection-leases": "A durable cluster-wide resource admission lease for a live session; active leases count toward org and user vCPU budgets.",
   };
@@ -725,7 +710,8 @@
   // intersected with the live listing columns (orgEditableCols) so the edit form
   // auto-adapts as columns are added/removed from the model — non-mergeable
   // columns (name, database_name, users, warehouse, *_state, timestamps) are
-  // simply never in this allowlist. "int" → numeric input, else text.
+  // simply never in this allowlist. "int" uses a numeric input and
+  // "naming-version" uses the two supported policy values.
   const ORG_EDIT_FIELDS = {
     max_workers: "int",
     max_vcpus: "int",
@@ -734,6 +720,7 @@
     default_worker_ttl: "text",
     default_worker_min_hot_idle: "int",
     hostname_alias: "text",
+    data_imports_table_naming_version: "naming-version",
   };
   function orgEditableCols() {
     const cols = (state.listing && state.listing.columns) || [];
@@ -835,11 +822,18 @@
   function orgEditFormHTML(row) {
     let html = '<div class="dform">';
     for (const c of orgEditableCols()) {
-      const type = ORG_EDIT_FIELDS[c] === "int" ? "number" : "text";
       const raw = row[c];
       const v = (raw === null || raw === undefined) ? "" : String(raw);
-      html += '<div class="frow"><label for="orgf-' + esc(c) + '">' + esc(c) + "</label>" +
-        '<input id="orgf-' + esc(c) + '" type="' + type + '" value="' + esc(v) + '"></div>';
+      if (ORG_EDIT_FIELDS[c] === "naming-version") {
+        const options = ["legacy_batch_v1", "copy_v1"].map(value =>
+          '<option value="' + value + '"' + (value === v ? " selected" : "") + ">" + value + "</option>").join("");
+        html += '<div class="frow"><label for="orgf-' + esc(c) + '">' + esc(c) + "</label>" +
+          '<select id="orgf-' + esc(c) + '">' + options + "</select></div>";
+      } else {
+        const type = ORG_EDIT_FIELDS[c] === "int" ? "number" : "text";
+        html += '<div class="frow"><label for="orgf-' + esc(c) + '">' + esc(c) + "</label>" +
+          '<input id="orgf-' + esc(c) + '" type="' + type + '" value="' + esc(v) + '"></div>';
+      }
     }
     html += '<div class="factions"><button class="btn" id="org-edit-save">Save</button>' +
       '<button class="btn" id="org-edit-cancel">Cancel</button></div></div>';

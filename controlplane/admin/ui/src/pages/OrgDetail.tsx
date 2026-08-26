@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { StateBadge } from "@/components/StateBadge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AdminGate } from "@/components/AdminOnly";
@@ -22,9 +23,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ApiError } from "@/lib/api";
-import { ducklingBroken, ducklingEntryFor, fmtTime } from "@/lib/format";
+import { databaseNameProblem } from "@/lib/databaseName";
+import { ducklingBroken, ducklingEntryFor, fmtTime, orgLabel } from "@/lib/format";
+import { CopyButton } from "@/components/CopyButton";
 import { ShardBadge } from "@/components/ShardBadge";
+import { OrgUsageSection } from "@/pages/OrgUsage";
 import {
+  useDatabaseNameAvailable,
   useDeleteOrg,
   useDeprovisionWarehouse,
   useDucklingsMetadata,
@@ -44,35 +49,50 @@ import {
   LegacyNamesBadge,
 } from "@/components/OrgTeamDialogs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { ManagedWarehouse, OrgTeam, OrgUpdate } from "@/types/api";
+import type { DataImportsTableNamingVersion, ManagedWarehouse, Org, OrgTeam, OrgUpdate } from "@/types/api";
 
 interface FormState {
+  database_name: string;
   max_workers: string;
   max_vcpus: string;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
   default_worker_min_hot_idle: string;
+  max_hot_idle_workers: string;
+  max_hot_idle_cpu: string;
+  max_hot_idle_memory: string;
   hostname_alias: string;
+  data_imports_table_naming_version: DataImportsTableNamingVersion;
 }
 
 function orgToForm(o: {
+  database_name: string;
   max_workers: number;
   max_vcpus: number;
   default_worker_cpu: string;
   default_worker_memory: string;
   default_worker_ttl: string;
   default_worker_min_hot_idle: number;
+  max_hot_idle_workers: number;
+  max_hot_idle_cpu: string;
+  max_hot_idle_memory: string;
   hostname_alias: string | null;
+  data_imports_table_naming_version: DataImportsTableNamingVersion;
 }): FormState {
   return {
+    database_name: o.database_name,
     max_workers: String(o.max_workers),
     max_vcpus: String(o.max_vcpus),
     default_worker_cpu: o.default_worker_cpu,
     default_worker_memory: o.default_worker_memory,
     default_worker_ttl: o.default_worker_ttl,
     default_worker_min_hot_idle: String(o.default_worker_min_hot_idle),
+    max_hot_idle_workers: String(o.max_hot_idle_workers),
+    max_hot_idle_cpu: o.max_hot_idle_cpu,
+    max_hot_idle_memory: o.max_hot_idle_memory,
     hostname_alias: o.hostname_alias ?? "",
+    data_imports_table_naming_version: o.data_imports_table_naming_version,
   };
 }
 
@@ -93,10 +113,29 @@ export function OrgDetail() {
     if (org.data) setForm(orgToForm(org.data));
   }, [org.data]);
 
+  // Client-side mirror of the server's DNS-label rule (configstore
+  // .ValidateDatabaseName) so a typo is a red border, not a round-trip 400.
+  // Crucially the save gate only applies when the operator actually CHANGED
+  // the name: orgs whose stored value predates the rule (the premise of this
+  // break-glass surface) must keep every OTHER org setting editable without
+  // forcing a rename, and database_name is only sent when it differs (save()
+  // below), so an unchanged grandfathered value never blocks saving.
+  // (Derived BEFORE the early returns below: the availability hook must run
+  // on every render, unconditionally.)
+  const trimmedDb = form ? form.database_name.trim() : "";
+  const dbChanged = form !== null && trimmedDb !== org.data?.database_name;
+  const dbProblem =
+    form === null || !dbChanged ? null : trimmedDb === "" ? "Database name is required." : databaseNameProblem(trimmedDb);
+  // Availability probe for the rename target: renaming onto another org's
+  // name is the one failure an operator can hit at save time, so flag it
+  // before the round-trip (the server still 409s authoritatively).
+  const dbCheck = useDatabaseNameAvailable(trimmedDb, dbChanged && dbProblem === null);
+  const dbTaken = Boolean(dbChanged && dbProblem === null && dbCheck.data && !dbCheck.data.available);
+
   if (org.isLoading || !form) {
     return (
       <>
-        <Header id={id} />
+        <Header id={id} org={org.data} />
         <PageBody>{org.isError ? <ErrorState error={org.error} /> : <LoadingState />}</PageBody>
       </>
     );
@@ -104,7 +143,7 @@ export function OrgDetail() {
   if (org.isError) {
     return (
       <>
-        <Header id={id} />
+        <Header id={id} org={org.data} />
         <PageBody>
           <ErrorState error={org.error} onRetry={() => org.refetch()} />
         </PageBody>
@@ -116,6 +155,7 @@ export function OrgDetail() {
 
   const save = async () => {
     setMsg(null);
+    const trimmedDb = form.database_name.trim();
     const body: OrgUpdate = {
       max_workers: Number(form.max_workers) || 0,
       max_vcpus: Number(form.max_vcpus) || 0,
@@ -123,8 +163,20 @@ export function OrgDetail() {
       default_worker_memory: form.default_worker_memory,
       default_worker_ttl: form.default_worker_ttl,
       default_worker_min_hot_idle: Number(form.default_worker_min_hot_idle) || 0,
+      max_hot_idle_workers: Number(form.max_hot_idle_workers) || 0,
+      max_hot_idle_cpu: form.max_hot_idle_cpu,
+      max_hot_idle_memory: form.max_hot_idle_memory,
       hostname_alias: form.hostname_alias === "" ? "" : form.hostname_alias,
+      data_imports_table_naming_version: form.data_imports_table_naming_version,
     };
+    // Only send database_name when it actually changed — renaming it also
+    // renames the org's managed hostname, so an untouched form never risks a
+    // spurious rename. The change reason: orgs whose stored name predates the
+    // DNS-label rule are unroutable (<name>.<suffix> isn't a valid hostname);
+    // this is the operator surface that fixes them without a SQL round-trip.
+    if (trimmedDb !== org.data?.database_name) {
+      body.database_name = trimmedDb;
+    }
     try {
       await update.mutateAsync(body);
       setMsg({ kind: "ok", text: "Saved." });
@@ -161,6 +213,7 @@ export function OrgDetail() {
     <>
       <Header
         id={id}
+        org={org.data}
         actions={
           <AdminGate>
             {orgHasWarehouse ? (
@@ -236,7 +289,61 @@ export function OrgDetail() {
                     onChange={(e) => set("default_worker_min_hot_idle", e.target.value)}
                   />
                 </Field>
+                <Field label="Max hot-idle workers (0 = unlimited)">
+                  <Input
+                    type="number"
+                    min={0}
+                    aria-label="Max hot-idle workers"
+                    value={form.max_hot_idle_workers}
+                    onChange={(e) => set("max_hot_idle_workers", e.target.value)}
+                  />
+                </Field>
+                <Field label="Max hot-idle vCPU (empty = unlimited)">
+                  <Input
+                    aria-label="Max hot-idle vCPU"
+                    value={form.max_hot_idle_cpu}
+                    placeholder='e.g. "16"'
+                    onChange={(e) => set("max_hot_idle_cpu", e.target.value)}
+                  />
+                </Field>
+                <Field label="Max hot-idle memory (empty = unlimited)">
+                  <Input
+                    aria-label="Max hot-idle memory"
+                    value={form.max_hot_idle_memory}
+                    placeholder='e.g. "64Gi"'
+                    onChange={(e) => set("max_hot_idle_memory", e.target.value)}
+                  />
+                </Field>
               </div>
+              <Field label="Database name (also the hostname label)">
+                <Input
+                  aria-label="Database name"
+                  value={form.database_name}
+                  placeholder="single DNS label, e.g. acme-prod"
+                  className={`font-mono text-xs ${dbProblem ? "border-destructive" : ""}`}
+                  onChange={(e) => set("database_name", e.target.value)}
+                />
+              </Field>
+              {dbProblem ? (
+                <p className="text-xs text-destructive">{dbProblem}</p>
+              ) : dbTaken ? (
+                <p className="text-xs text-destructive">
+                  The database name "{trimmedDb}" is already in use by another org.
+                </p>
+              ) : (
+                dbChanged && (
+                  <p className="flex items-start gap-2 text-xs text-warning">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      The database name is this org's hostname — clients reach it at
+                      <span className="font-mono"> {trimmedDb || "<name>"}.&lt;managed-suffix&gt;</span> and
+                      connect with dbname={trimmedDb || "<name>"}. Renaming moves the hostname and the
+                      dbname immediately; fix invalid stored names here, and coordinate the rename with
+                      the tenants' connection settings.
+                    </span>
+                  </p>
+                )
+              )}
               <Field label="Hostname alias (empty clears)">
                 <Input
                   value={form.hostname_alias}
@@ -244,9 +351,38 @@ export function OrgDetail() {
                   onChange={(e) => set("hostname_alias", e.target.value)}
                 />
               </Field>
+              <Field label="Data import table naming">
+                <Select
+                  value={form.data_imports_table_naming_version}
+                  onValueChange={(value) => {
+                    if (value === "legacy_batch_v1" || value === "copy_v1") {
+                      setForm((current) =>
+                        current ? { ...current, data_imports_table_naming_version: value } : current,
+                      );
+                    }
+                  }}
+                >
+                  <SelectTrigger aria-label="Data import table naming">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="legacy_batch_v1">Legacy batch (legacy_batch_v1)</SelectItem>
+                    <SelectItem value="copy_v1">Copy workflow (copy_v1)</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              {form.data_imports_table_naming_version !== org.data?.data_imports_table_naming_version && (
+                <p className="flex items-start gap-2 text-xs text-warning">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    Changing the naming version does not rename or move existing data. Migrate the
+                    existing tables before saving this change.
+                  </span>
+                </p>
+              )}
               <div className="flex items-center gap-3 pt-1">
                 <AdminGate>
-                  <Button size="sm" onClick={save} disabled={update.isPending}>
+                  <Button size="sm" onClick={save} disabled={update.isPending || dbProblem !== null || dbTaken}>
                     <Save className="h-4 w-4" /> {update.isPending ? "Saving…" : "Save changes"}
                   </Button>
                 </AdminGate>
@@ -261,6 +397,7 @@ export function OrgDetail() {
 
           <WarehousePanel orgId={id} data={warehouse.data ?? null} loading={warehouse.isLoading} error={warehouse.error} />
         </div>
+        <OrgUsageSection orgId={id} />
         <OrgTeamsCard orgId={id} />
       </PageBody>
 
@@ -310,7 +447,12 @@ export function OrgDetail() {
   );
 }
 
-function Header({ id, actions }: { id: string; actions?: React.ReactNode }) {
+function Header({ id, org, actions }: { id: string; org?: Org; actions?: React.ReactNode }) {
+  // Headline leads with the human-readable name (database_name, else alias)
+  // — that is what an operator recognizes at a glance ("Posthog") — and drops
+  // the opaque org id (a UUID for most tenants) to a subline with a copy
+  // button for when it is actually needed (config store, API, k8s labels).
+  const label = org ? orgLabel(org) : id;
   return (
     <PageHeader
       title={
@@ -318,7 +460,15 @@ function Header({ id, actions }: { id: string; actions?: React.ReactNode }) {
           <Link to="/orgs" className="text-muted-foreground hover:text-foreground">
             <ArrowLeft className="h-4 w-4" />
           </Link>
-          <span className="font-mono">{id}</span>
+          <span className="flex min-w-0 flex-col">
+            <span className="truncate font-medium">{label}</span>
+            <span className="flex items-center gap-1.5">
+              <span className="truncate font-mono text-xs font-normal text-muted-foreground" title={id}>
+                {id}
+              </span>
+              <CopyButton value={id} />
+            </span>
+          </span>
         </span>
       }
       description="Per-org configuration and managed warehouse."
@@ -383,7 +533,7 @@ function WarehousePanel({
     : missing
       ? "No duckling provisioned for this org"
       : broken
-        ? `Duckling unhealthy (state: ${data?.state})`
+        ? `Managed warehouse not ready (state: ${data?.state})`
         : null;
 
   const ducklingNameEmpty = ducklingNameInput.trim() === "";
@@ -489,12 +639,37 @@ function WarehousePanel({
                   </div>
                 ))}
               </div>
-              {data.status_message && (
+              {data.state === "failed" ? (
+                <div
+                  role="alert"
+                  className="mt-3 flex gap-3 rounded-md border border-warning/40 bg-warning/10 p-3 text-warning"
+                >
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <div className="space-y-1 text-xs">
+                    <p className="font-medium">Warehouse is not operationally ready</p>
+                    <p>
+                      <span className="font-medium">Current blocker</span>
+                    </p>
+                    <p className="font-mono text-foreground">
+                      {data.status_message || "No current blocker detail is available yet."}
+                    </p>
+                    <p className="text-muted-foreground">
+                      Component badges reflect Duckling infrastructure. Overall readiness also requires a successful
+                      end-to-end metadata-store connection check. Recovery is checked automatically; this page updates
+                      when dependencies recover.
+                    </p>
+                  </div>
+                </div>
+              ) : data.status_message ? (
                 <p className="mt-2 font-mono text-xs text-muted-foreground">{data.status_message}</p>
-              )}
+              ) : null}
               <div className="mt-2 flex gap-4 text-[11px] text-muted-foreground">
-                <span>ready: {data.ready_at ? fmtTime(data.ready_at) : "—"}</span>
-                <span>failed: {data.failed_at ? fmtTime(data.failed_at) : "—"}</span>
+                <span>
+                  <span className="font-medium">Last ready</span>: {data.ready_at ? fmtTime(data.ready_at) : "—"}
+                </span>
+                <span>
+                  <span className="font-medium">Last failed</span>: {data.failed_at ? fmtTime(data.failed_at) : "—"}
+                </span>
               </div>
             </div>
 
@@ -675,6 +850,8 @@ function ReshardHistory({ orgId }: { orgId: string }) {
 // OrgTeamsCard lists the org's duckgres_org_teams rows with full CRUD.
 function OrgTeamsCard({ orgId }: { orgId: string }) {
   const teams = useOrgTeams(orgId);
+  const org = useOrg(orgId);
+  const orgName = org.data ? orgLabel(org.data) : undefined;
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<OrgTeam | null>(null);
   const [deleting, setDeleting] = useState<OrgTeam | null>(null);
@@ -771,10 +948,10 @@ function OrgTeamsCard({ orgId }: { orgId: string }) {
         )}
       </CardContent>
 
-      <CreateTeamDialog open={creating} onClose={() => setCreating(false)} org={orgId} />
-      {editing && <EditTeamDialog team={editing} onClose={() => setEditing(null)} />}
+      <CreateTeamDialog open={creating} onClose={() => setCreating(false)} org={orgId} orgLabel={orgName} />
+      {editing && <EditTeamDialog team={editing} orgLabel={orgName} onClose={() => setEditing(null)} />}
       {deleting && (
-        <DeleteTeamDialog team={deleting} teamCount={rows.length} onClose={() => setDeleting(null)} />
+        <DeleteTeamDialog team={deleting} teamCount={rows.length} orgLabel={orgName} onClose={() => setDeleting(null)} />
       )}
     </Card>
   );

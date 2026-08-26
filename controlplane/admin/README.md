@@ -64,13 +64,18 @@ Added for the console:
 | `GET /api/v1/errors` | viewer | recent redacted query errors (live-triage ring, newest-first), `?org=&user=&sqlstate=&category=&limit=` slicing. Fans out + merges across CPs (each error belongs to one CP — disjoint, no dedup). `query`/`message` redacted server-side |
 | `GET /api/v1/sessions`, `/workers` | viewer | live sessions / session-holding workers |
 | `GET /api/v1/workers/fleet` | viewer | cluster worker counts by lifecycle state |
+| `GET /api/v1/workers/hot-idle` | viewer | per-org hot-idle pool reporting (count, vCPU, memory, oldest park) + each org's configured `max_hot_idle_*` caps; backs the Workers page "Hot idle by org" card |
 | `GET /api/v1/cluster/instances` | viewer | live CP replicas (self-flagged) |
 | `POST /api/v1/sessions/:pid/cancel` | admin | tear down a session by pid — LOCAL only (pid is per-CP); prefer the worker-id form |
 | `POST /api/v1/sessions/by-worker/:wid/cancel` | admin | tear down the session on a cluster-unique worker id; fans out to whichever CP owns it (pid can't be fanned out — it collides across CPs). Returns `{killed, cp_responders, cp_total}` |
 | `POST /api/v1/orgs/:id/users/:username/kill` | admin | per-user kill switch (one-shot): tear down ALL of a user's sessions + in-flight queries cluster-wide. Returns `{killed, cp_responders, cp_total}`. Does NOT block reconnects |
-| `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at connect on PG wire + Flight), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
+| `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at pgwire connect), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
 | `POST /api/v1/orgs/:id/users/:username/enable` | admin | persist `disabled=false` + reload cluster-wide so the user can reconnect at once |
 | `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
+| `GET /api/v1/usage/monthly` | admin | cumulative per-team usage per UTC month (CPU-seconds, memory GiB-seconds, S3 GiB-seconds), backing the **Usage** page. Self-gates with `RequireAdmin` (not just RoleGate's method check) because per-team cost data across all orgs is as sensitive as the raw billing families. Reads the SAME billing buffer as `GET /billing/usage`, so retention is the buffer's: acked buckets are deleted, >30d buckets GC'd — `watermark_low` in the response marks where billed data was removed. `?months=N` (default 6, max 36) sets the window |
+| `GET /api/v1/orgs/:id/usage/daily` | admin | one org's daily per-team usage series (same families), backing the org detail page's **Usage** charts. Same RequireAdmin gate and buffer-retention semantics; the org scope is the `:id` path segment flowing into the queries' WHERE clause. `?days=N` (default 14, max 31 — the buffer's 30d GC bounds useful range) |
+| `GET /api/v1/orgs/:id/monitoring/snapshot` | internal secret | Customer-safe org warehouse state, resource limits, workers, sessions, queue depth, and CP coverage. Omits user, pod, image, SQL, client, trace, and control-plane identifiers |
+| `GET /api/v1/orgs/:id/monitoring/series` | internal secret | Customer-safe, org-forced Prometheus range query. Requires an allow-listed `metric`; `window` is one of `1h`, `6h`, `24h` (default), `7d`, `30d` |
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
 | `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
 | `GET /api/v1/audit` | admin | admin action log |
@@ -101,9 +106,8 @@ call `ConfigStore.ReloadSnapshot()` on every replica so the connect-time block
 (the `duckgres_org_users.disabled` column, goose migration
 `000011_add_org_user_disabled.sql`) takes effect cluster-wide immediately rather
 than one config-poll later. The disabled flag is enforced at auth in
-`control.go` (PG wire → distinct `28000` "account is disabled" error, only after
-the password checks out so it never leaks account existence) and in
-`ConfigStore.ValidateOrgUser*` (Flight ingress).
+`control.go` (pgwire → distinct `28000` "account is disabled" error, only after
+the password checks out so it never leaks account existence).
 
 ### Impersonation (`impersonate.go` + `controlplane/admin_providers.go`)
 
@@ -124,6 +128,31 @@ the PromQL is built server-side from the allow-list (`rangePanels`). Forwards to
 `DUCKGRES_PROMETHEUS_URL` (the in-cluster VictoriaMetrics vmselect, Prometheus-
 compatible). Org-labelled panels (`duckgres_query_total{org,status,reason}` etc.) keep
 slicing enforced. Unset URL → 503 so the UI shows "metrics not configured".
+
+### Product monitoring API (`monitoring.go`)
+
+The PostHog backend reads `GET /api/v1/orgs/:id/monitoring/snapshot` and
+`/series` with the internal secret. These routes are not operator-dashboard
+shortcuts: they are a deliberately smaller customer-safe contract. The org is
+fixed by the path, every config-store query uses that org, and every Prometheus
+query includes an exact `org` label selector. SSO identities, including admin
+operators, receive 403.
+
+The snapshot combines durable worker records and connection leases/queue rows
+with the cross-CP live-session fan-out. It reports `cp_responders`, `cp_total`,
+and `partial` so a missing control plane never looks like zero activity. Worker
+limits use the current org defaults with deployment fallbacks. Empty worker
+profile and zero-TTL sentinels use deployment defaults because org-shaped
+workers persist explicit profiles. Query progress is `null` when DuckDB does not
+provide a percentage. It intentionally omits usernames, PIDs, pod/image names,
+control-plane ownership, SQL, client metadata, trace identifiers, and secrets.
+
+The series endpoint accepts only `query_rate`, `error_ratio`, `duration_p50`,
+`duration_p95`, `sessions_active`, `acquire_p95`,
+`acquire_by_source`, `storage_bytes`, and `worker_crash_rate`. It normalizes the
+Prometheus response and retains only the `status`, `reason`, or `source` labels needed by
+the corresponding chart. Unknown metrics and windows return 400; unknown orgs
+return 404 with `code: "managed_warehouse_not_found"` before Prometheus is called.
 
 ## Local UI development
 

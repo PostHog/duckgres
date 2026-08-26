@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -241,6 +242,20 @@ func firstNonEmpty(a, b string) string {
 	return b
 }
 
+// effectiveDefaultWorkerTTL resolves the hot-idle retention floor: the
+// operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
+// K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
+// defaultWorkerTTL (1m — the same fallback sized-but-no-ttl requests get at
+// profile resolution, so there is exactly ONE default TTL however a worker
+// came to have no explicit one). The full per-request precedence is:
+// client GUC > org default > deployment default TTL > built-in 1m.
+func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return defaultWorkerTTL
+}
+
 func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int, error) {
 	cpu := strings.TrimSpace(workerCPURequest)
 	if profile != nil && strings.TrimSpace(profile.CPU) != "" {
@@ -258,4 +273,86 @@ func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int,
 		return 0, fmt.Errorf("worker cpu quantity %q must be positive", cpu)
 	}
 	return int((millis + 999) / 1000), nil
+}
+
+// useExploratoryTier decides whether a connection starts on the small
+// exploratory worker rather than directly on its target shape. Every exclusion
+// here is a case where starting small is a guaranteed-wasted acquire +
+// escalate cycle, not a policy preference:
+//
+//   - Non-remote backends have no per-org worker pods to size at all.
+//   - explProfile == nil means the tier is off or half-configured
+//     (exploratoryWorkerProfile degrades to nil), so behave exactly as today.
+//   - The client explicitly asked for a shape via duckgres.worker_* — give it
+//     that shape from the first statement.
+//   - Passthrough users speak raw DuckDB SQL, which pg_query cannot parse, so
+//     classifyStatementTier pins on their FIRST statement no matter what it is.
+//     This exclusion is also what keeps server's executeQueryDirect — the
+//     passthrough-only execution path, which carries no tier hooks —
+//     unreachable with onExploratoryWorker set.
+func (cp *ControlPlane) useExploratoryTier(explProfile *WorkerProfile, passthroughUser bool, startupOptions map[string]string) bool {
+	return cp.isRemoteBackend && explProfile != nil && !passthroughUser &&
+		!clientSuppliedWorkerGUCs(cp.cfg.K8s, startupOptions)
+}
+
+// clientSuppliedWorkerGUCs reports whether the client's startup options carry
+// an explicit worker sizing (any duckgres.worker_* GUC, honored only when the
+// deployment trusts client sizing). Such connections bypass the exploratory
+// tier: the client asked for a specific shape, so give it that shape from the
+// first statement instead of starting small and escalating.
+//
+// Gated on AllowClientWorkerProfile for the same reason resolveWorkerProfile
+// is: with the gate off the GUCs are ignored everywhere, so they must not
+// silently steer tier selection either.
+func clientSuppliedWorkerGUCs(k K8sConfig, opts map[string]string) bool {
+	if !k.AllowClientWorkerProfile {
+		return false
+	}
+	return strings.TrimSpace(opts[gucWorkerCPU]) != "" ||
+		strings.TrimSpace(opts[gucWorkerMemory]) != "" ||
+		strings.TrimSpace(opts[gucWorkerTTL]) != ""
+}
+
+// disabledUserMessage is the client-facing text for the per-user kill switch.
+// Shared by the connect-time 28000 rejection and the tier-escalation re-check
+// so a disabled user gets the same explanation whichever gate catches it.
+const disabledUserMessage = "this account is disabled; contact your administrator"
+
+// errEscalationUserDisabled aborts a tier escalation whose user was disabled
+// during the switcher's destroy→create window — the one window in which a
+// connection is invisible to the per-user disable fan-out (it holds neither a
+// session nor a registered conn-closer). Escalation failure is
+// connection-fatal, so this text reaches the client.
+var errEscalationUserDisabled = errors.New(disabledUserMessage)
+
+// defaultExploratoryWorkerTTL keeps an org's exploratory worker parked
+// hot-idle for two days after its last connection — the "warm pod for every
+// recently-active team" retention from the tier design.
+const defaultExploratoryWorkerTTL = 48 * time.Hour
+
+// exploratoryWorkerProfile resolves the deployment's exploratory small-worker
+// shape. Returns nil when the tier is disabled OR unusable (missing/invalid
+// size) — a half-configured tier must degrade to today's behavior, never to a
+// BestEffort pod. Sizes are normalized so MatchKey-based reuse is canonical.
+func exploratoryWorkerProfile(k K8sConfig) (*WorkerProfile, []string) {
+	if !k.ExploratoryTierEnabled {
+		return nil, nil
+	}
+	var warns []string
+	if strings.TrimSpace(k.ExploratoryWorkerCPU) == "" || strings.TrimSpace(k.ExploratoryWorkerMemory) == "" {
+		return nil, append(warns, "exploratory tier enabled but DUCKGRES_EXPLORATORY_WORKER_CPU/MEMORY not both set; tier disabled")
+	}
+	cpu, _, err := sizeField("exploratory worker cpu", k.ExploratoryWorkerCPU, "", "")
+	if err != nil {
+		return nil, append(warns, fmt.Sprintf("invalid exploratory worker cpu; tier disabled: %v", err))
+	}
+	mem, _, err := sizeField("exploratory worker memory", k.ExploratoryWorkerMemory, "", "")
+	if err != nil {
+		return nil, append(warns, fmt.Sprintf("invalid exploratory worker memory; tier disabled: %v", err))
+	}
+	ttl := defaultExploratoryWorkerTTL
+	if k.ExploratoryWorkerTTL > 0 {
+		ttl = k.ExploratoryWorkerTTL
+	}
+	return &WorkerProfile{CPU: cpu, Memory: mem, TTL: ttl}, warns
 }

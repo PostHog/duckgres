@@ -8,7 +8,8 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useIdentity } from "@/components/IdentityProvider";
-import { useAudit } from "@/hooks/useApi";
+import { useAudit, useOrgLabels } from "@/hooks/useApi";
+import { OrgRef } from "@/components/OrgRef";
 import { fmtTime } from "@/lib/format";
 import { auditSummary } from "@/lib/audit";
 import type { AuditEntry } from "@/types/api";
@@ -40,6 +41,7 @@ export function Audit() {
   const [q, setQ] = useState("");
   const [org, setOrg] = useState("");
   const audit = useAudit({ org });
+  const orgLabels = useOrgLabels();
 
   const columns = useMemo<ColumnDef<AuditEntry, any>[]>(
     () => [
@@ -99,10 +101,12 @@ export function Audit() {
       {
         accessorKey: "org",
         header: "Org",
-        cell: ({ getValue }) => {
-          const v = getValue() as string | undefined;
-          return v ? <span className="font-mono text-xs">{v}</span> : <span className="text-muted-foreground">—</span>;
-        },
+        cell: ({ row }) =>
+          row.original.org ? (
+            <OrgRef id={row.original.org} label={orgLabels.get(row.original.org)} />
+          ) : (
+            <span className="text-muted-foreground">—</span>
+          ),
       },
       {
         accessorKey: "sql_redacted",
@@ -127,7 +131,7 @@ export function Audit() {
         },
       },
     ],
-    [],
+    [orgLabels],
   );
 
   if (!isAdmin) {

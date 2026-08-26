@@ -327,7 +327,7 @@ func writeFixtureCSVFile(t *testing.T, runDir string) {
 	csvText := strings.Join([]string{
 		"query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at",
 		"q_orders_total,intent_orders_total,1,pgwire,ok,,,1,11.629588,2026-03-11T23:43:12.669631583Z",
-		"q_orders_total,intent_orders_total,1,flight,error,boom,execution_error,0,12.500000,2026-03-11T23:43:12.770000000Z",
+		"q_orders_total,intent_orders_total,1,pgwire,error,boom,execution_error,0,12.500000,2026-03-11T23:43:12.770000000Z",
 		"",
 	}, "\n")
 	csvPath := filepath.Join(runDir, "query_results.csv")

@@ -10,9 +10,14 @@ import (
 )
 
 var (
-	relationPlaceholderRE = regexp.MustCompile(`\{\{\s*relation\s+"([A-Za-z_][A-Za-z0-9_]*)"\s*\}\}`)
-	identifierPartRE      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	identifierPartRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
+
+type relationPlaceholder struct {
+	start int
+	end   int
+	role  string
+}
 
 type catalogFile struct {
 	Name              string                              `yaml:"name"`
@@ -136,11 +141,11 @@ func validateRelationVariants(variants map[StorageTarget]map[string]string, entr
 		return nil
 	}
 	if len(variants) != 2 {
-		return fmt.Errorf("paired catalogs must declare exactly the raw_view and managed_table storage variants")
+		return fmt.Errorf("paired catalogs must declare exactly the raw_view and ducklake_table storage variants")
 	}
-	for _, target := range []StorageTarget{StorageTargetRawView, StorageTargetManagedTable} {
+	for _, target := range []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable} {
 		if _, ok := variants[target]; !ok {
-			return fmt.Errorf("paired catalogs must declare exactly the raw_view and managed_table storage variants")
+			return fmt.Errorf("paired catalogs must declare exactly the raw_view and ducklake_table storage variants")
 		}
 	}
 	return nil
@@ -153,18 +158,17 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 	if def.IntentID == "" {
 		return nil, fmt.Errorf("paired query %s missing intent_id", def.QueryIDBase)
 	}
-	matches := relationPlaceholderRE.FindAllStringSubmatch(def.SQLTemplate, -1)
-	remaining := relationPlaceholderRE.ReplaceAllString(def.SQLTemplate, "")
-	if strings.Contains(remaining, "{{") || strings.Contains(remaining, "}}") {
-		return nil, fmt.Errorf("paired query %s has unsupported template action", def.QueryIDBase)
+	placeholders, err := scanRelationPlaceholders(def.QueryIDBase, def.SQLTemplate)
+	if err != nil {
+		return nil, err
 	}
-	if len(matches) == 0 {
+	if len(placeholders) == 0 {
 		return nil, fmt.Errorf("paired query %s must contain at least one relation placeholder", def.QueryIDBase)
 	}
 
 	queries := make([]Query, 0, 2)
-	for _, target := range []StorageTarget{StorageTargetRawView, StorageTargetManagedTable} {
-		rendered, err := renderRelationTemplate(def.QueryIDBase, def.SQLTemplate, matches, variants[target], target)
+	for _, target := range []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable} {
+		rendered, err := renderRelationTemplate(def.QueryIDBase, def.SQLTemplate, placeholders, variants[target], target)
 		if err != nil {
 			return nil, err
 		}
@@ -178,31 +182,157 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 			Tags:          def.Tags,
 			Params:        def.Params,
 			PGWireSQL:     rendered,
-			DuckhogSQL:    rendered,
 			StorageTarget: target,
 		})
+	}
+	if queries[0].PGWireSQL == queries[1].PGWireSQL {
+		return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets", def.QueryIDBase)
 	}
 	return queries, nil
 }
 
-func renderRelationTemplate(queryID, template string, matches [][]string, bindings map[string]string, target StorageTarget) (string, error) {
-	replacements := make(map[string]string, len(matches))
-	for _, match := range matches {
-		role := match[1]
-		binding, ok := bindings[role]
+func scanRelationPlaceholders(queryID, sql string) ([]relationPlaceholder, error) {
+	var placeholders []relationPlaceholder
+	for i := 0; i < len(sql); {
+		switch {
+		case sql[i] == '\'':
+			end, closed := skipSingleQuotedSQLString(sql, i)
+			if !closed {
+				return nil, fmt.Errorf("paired query %s has an unterminated SQL string", queryID)
+			}
+			if containsTemplateDelimiter(sql[i:end]) {
+				return nil, fmt.Errorf("paired query %s relation placeholder must appear in SQL code, not a string", queryID)
+			}
+			i = end
+		case sql[i] == '"':
+			end, closed := skipDoubleQuotedSQLIdentifier(sql, i)
+			if !closed {
+				return nil, fmt.Errorf("paired query %s has an unterminated quoted identifier", queryID)
+			}
+			if containsTemplateDelimiter(sql[i:end]) {
+				return nil, fmt.Errorf("paired query %s relation placeholder must appear in SQL code, not a quoted identifier", queryID)
+			}
+			i = end
+		case i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-':
+			end := skipSQLLineComment(sql, i)
+			if containsTemplateDelimiter(sql[i:end]) {
+				return nil, fmt.Errorf("paired query %s relation placeholder must appear in SQL code, not a comment", queryID)
+			}
+			i = end
+		case i+1 < len(sql) && sql[i] == '/' && sql[i+1] == '*':
+			end, closed := skipSQLBlockComment(sql, i)
+			if !closed {
+				return nil, fmt.Errorf("paired query %s has an unterminated SQL comment", queryID)
+			}
+			if containsTemplateDelimiter(sql[i:end]) {
+				return nil, fmt.Errorf("paired query %s relation placeholder must appear in SQL code, not a comment", queryID)
+			}
+			i = end
+		case sql[i] == '$':
+			delimiter, ok := dollarQuoteDelimiterAt(sql, i)
+			if !ok {
+				i++
+				continue
+			}
+			end, closed := skipDollarQuotedSQLString(sql, i, delimiter)
+			if !closed {
+				return nil, fmt.Errorf("paired query %s has an unterminated dollar-quoted string", queryID)
+			}
+			if containsTemplateDelimiter(sql[i:end]) {
+				return nil, fmt.Errorf("paired query %s relation placeholder must appear in SQL code, not a string", queryID)
+			}
+			i = end
+		case strings.HasPrefix(sql[i:], "{{"):
+			placeholder, err := parseRelationPlaceholder(sql, i)
+			if err != nil {
+				return nil, fmt.Errorf("paired query %s has unsupported template action: %w", queryID, err)
+			}
+			placeholders = append(placeholders, placeholder)
+			i = placeholder.end
+		case strings.HasPrefix(sql[i:], "}}"):
+			return nil, fmt.Errorf("paired query %s has unsupported template action: unmatched closing braces", queryID)
+		default:
+			i++
+		}
+	}
+	return placeholders, nil
+}
+
+func parseRelationPlaceholder(sql string, start int) (relationPlaceholder, error) {
+	i := start + 2
+	i = skipTemplateWhitespace(sql, i)
+	if !strings.HasPrefix(sql[i:], "relation") {
+		return relationPlaceholder{}, fmt.Errorf("expected relation action")
+	}
+	i += len("relation")
+	if i >= len(sql) || !isTemplateWhitespace(sql[i]) {
+		return relationPlaceholder{}, fmt.Errorf("expected whitespace after relation")
+	}
+	i = skipTemplateWhitespace(sql, i)
+	if i >= len(sql) || sql[i] != '"' {
+		return relationPlaceholder{}, fmt.Errorf("expected a quoted relation role")
+	}
+	i++
+	roleStart := i
+	for i < len(sql) && isSQLRoleIdentifierPart(sql[i]) {
+		i++
+	}
+	role := sql[roleStart:i]
+	if role == "" || !identifierPartRE.MatchString(role) {
+		return relationPlaceholder{}, fmt.Errorf("invalid relation role")
+	}
+	if i >= len(sql) || sql[i] != '"' {
+		return relationPlaceholder{}, fmt.Errorf("expected closing quote after relation role")
+	}
+	i++
+	i = skipTemplateWhitespace(sql, i)
+	if i+1 >= len(sql) || sql[i] != '}' || sql[i+1] != '}' {
+		return relationPlaceholder{}, fmt.Errorf("expected closing braces")
+	}
+	end := i + 2
+	if end < len(sql) && sql[end] == '}' {
+		return relationPlaceholder{}, fmt.Errorf("unexpected extra closing brace")
+	}
+	return relationPlaceholder{start: start, end: end, role: role}, nil
+}
+
+func renderRelationTemplate(queryID, template string, placeholders []relationPlaceholder, bindings map[string]string, target StorageTarget) (string, error) {
+	var rendered strings.Builder
+	last := 0
+	for _, placeholder := range placeholders {
+		binding, ok := bindings[placeholder.role]
 		if !ok || binding == "" {
-			return "", fmt.Errorf("paired query %s missing relation binding for role %q in storage target %q", queryID, role, target)
+			return "", fmt.Errorf("paired query %s missing relation binding for role %q in storage target %q", queryID, placeholder.role, target)
 		}
 		quoted, err := quoteRelationIdentifier(binding)
 		if err != nil {
-			return "", fmt.Errorf("paired query %s has invalid relation identifier for role %q in storage target %q: %w", queryID, role, target, err)
+			return "", fmt.Errorf("paired query %s has invalid relation identifier for role %q in storage target %q: %w", queryID, placeholder.role, target, err)
 		}
-		replacements[role] = quoted
+		rendered.WriteString(template[last:placeholder.start])
+		rendered.WriteString(quoted)
+		last = placeholder.end
 	}
-	return relationPlaceholderRE.ReplaceAllStringFunc(template, func(placeholder string) string {
-		role := relationPlaceholderRE.FindStringSubmatch(placeholder)[1]
-		return replacements[role]
-	}), nil
+	rendered.WriteString(template[last:])
+	return rendered.String(), nil
+}
+
+func skipTemplateWhitespace(sql string, start int) int {
+	for start < len(sql) && isTemplateWhitespace(sql[start]) {
+		start++
+	}
+	return start
+}
+
+func isTemplateWhitespace(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v'
+}
+
+func isSQLRoleIdentifierPart(ch byte) bool {
+	return ch == '_' || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')
+}
+
+func containsTemplateDelimiter(sql string) bool {
+	return strings.Contains(sql, "{{") || strings.Contains(sql, "}}")
 }
 
 func quoteRelationIdentifier(identifier string) (string, error) {
@@ -235,7 +365,7 @@ func validateCatalog(c Catalog) error {
 	}
 	seenTargets := map[Protocol]struct{}{}
 	for _, target := range c.Targets {
-		if target != ProtocolPGWire && target != ProtocolFlight {
+		if target != ProtocolPGWire {
 			return fmt.Errorf("unsupported target protocol %q", target)
 		}
 		if _, ok := seenTargets[target]; ok {
@@ -261,9 +391,6 @@ func validateCatalog(c Catalog) error {
 		if q.PGWireSQL == "" {
 			return fmt.Errorf("query %s missing pgwire_sql", q.QueryID)
 		}
-		if q.DuckhogSQL == "" {
-			return fmt.Errorf("query %s missing duckhog_sql", q.QueryID)
-		}
 	}
 	return nil
 }
@@ -271,9 +398,6 @@ func validateCatalog(c Catalog) error {
 func ValidateReadOnlyCatalog(c Catalog) error {
 	for _, q := range c.Queries {
 		if err := validateSelectOnlySQL("pgwire_sql", q.QueryID, q.PGWireSQL); err != nil {
-			return err
-		}
-		if err := validateSelectOnlySQL("duckhog_sql", q.QueryID, q.DuckhogSQL); err != nil {
 			return err
 		}
 	}
@@ -311,21 +435,19 @@ func containsSQLKeyword(sql, keyword string) bool {
 	for i := 0; i < len(sql); {
 		switch {
 		case sql[i] == '\'':
-			i = skipQuotedSQLString(sql, i, '\'')
+			i, _ = skipSingleQuotedSQLString(sql, i)
 		case sql[i] == '"':
-			i = skipQuotedSQLString(sql, i, '"')
+			i, _ = skipDoubleQuotedSQLIdentifier(sql, i)
 		case i+1 < len(sql) && sql[i] == '-' && sql[i+1] == '-':
-			i += 2
-			for i < len(sql) && sql[i] != '\n' {
-				i++
-			}
+			i = skipSQLLineComment(sql, i)
 		case i+1 < len(sql) && sql[i] == '/' && sql[i+1] == '*':
-			i += 2
-			for i+1 < len(sql) && (sql[i] != '*' || sql[i+1] != '/') {
+			i, _ = skipSQLBlockComment(sql, i)
+		case sql[i] == '$':
+			delimiter, ok := dollarQuoteDelimiterAt(sql, i)
+			if ok {
+				i, _ = skipDollarQuotedSQLString(sql, i, delimiter)
+			} else {
 				i++
-			}
-			if i+1 < len(sql) {
-				i += 2
 			}
 		case isSQLIdentifierStart(sql[i]):
 			start := i
@@ -343,18 +465,93 @@ func containsSQLKeyword(sql, keyword string) bool {
 	return false
 }
 
-func skipQuotedSQLString(sql string, start int, quote byte) int {
+func skipSingleQuotedSQLString(sql string, start int) (int, bool) {
 	for i := start + 1; i < len(sql); i++ {
-		if sql[i] != quote {
+		switch sql[i] {
+		case '\\':
+			if i+1 < len(sql) {
+				i++
+			}
+		case '\'':
+			if i+1 < len(sql) && sql[i+1] == '\'' {
+				i++
+				continue
+			}
+			return i + 1, true
+		}
+	}
+	return len(sql), false
+}
+
+func skipDoubleQuotedSQLIdentifier(sql string, start int) (int, bool) {
+	for i := start + 1; i < len(sql); i++ {
+		if sql[i] != '"' {
 			continue
 		}
-		if i+1 < len(sql) && sql[i+1] == quote {
+		if i+1 < len(sql) && sql[i+1] == '"' {
 			i++
 			continue
 		}
-		return i + 1
+		return i + 1, true
 	}
-	return len(sql)
+	return len(sql), false
+}
+
+func skipSQLLineComment(sql string, start int) int {
+	i := start + 2
+	for i < len(sql) && sql[i] != '\n' {
+		i++
+	}
+	return i
+}
+
+func skipSQLBlockComment(sql string, start int) (int, bool) {
+	depth := 1
+	for i := start + 2; i < len(sql); {
+		switch {
+		case i+1 < len(sql) && sql[i] == '/' && sql[i+1] == '*':
+			depth++
+			i += 2
+		case i+1 < len(sql) && sql[i] == '*' && sql[i+1] == '/':
+			depth--
+			i += 2
+			if depth == 0 {
+				return i, true
+			}
+		default:
+			i++
+		}
+	}
+	return len(sql), false
+}
+
+func dollarQuoteDelimiterAt(sql string, start int) (string, bool) {
+	if start >= len(sql) || sql[start] != '$' || start+1 >= len(sql) {
+		return "", false
+	}
+	if sql[start+1] == '$' {
+		return "$$", true
+	}
+	if !isSQLIdentifierStart(sql[start+1]) {
+		return "", false
+	}
+	i := start + 2
+	for i < len(sql) && isSQLRoleIdentifierPart(sql[i]) {
+		i++
+	}
+	if i >= len(sql) || sql[i] != '$' {
+		return "", false
+	}
+	return sql[start : i+1], true
+}
+
+func skipDollarQuotedSQLString(sql string, start int, delimiter string) (int, bool) {
+	bodyStart := start + len(delimiter)
+	offset := strings.Index(sql[bodyStart:], delimiter)
+	if offset < 0 {
+		return len(sql), false
+	}
+	return bodyStart + offset + len(delimiter), true
 }
 
 func isSQLIdentifierStart(ch byte) bool {

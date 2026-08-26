@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
@@ -64,10 +65,14 @@ func errInvalidQuerySource() *CodedError {
 // forwarded to DuckDB. See clientConn.S3CacheEnabled in server/.
 const s3CacheParam = "duckgres.s3_cache"
 
+// S3CacheMode is the closed state set for the duckgres.s3_cache GUC.
+type S3CacheMode string
+
 // Canonical values for the duckgres.s3_cache GUC.
 const (
-	S3CacheOn  = "on"
-	S3CacheOff = "off"
+	S3CacheOn          = "on"
+	S3CacheOff         = "off"
+	S3CachePassthrough = "passthrough"
 )
 
 // NormalizeS3Cache validates a client-supplied duckgres.s3_cache value. The
@@ -84,6 +89,8 @@ func NormalizeS3Cache(raw string) (string, error) {
 		return S3CacheOn, nil
 	case S3CacheOff, "false", "no", "0":
 		return S3CacheOff, nil
+	case S3CachePassthrough:
+		return S3CachePassthrough, nil
 	default:
 		return "", errInvalidS3Cache()
 	}
@@ -94,8 +101,48 @@ func NormalizeS3Cache(raw string) (string, error) {
 func errInvalidS3Cache() *CodedError {
 	return &CodedError{
 		Code: "22023", // invalid_parameter_value
-		Message: fmt.Sprintf("invalid value for %q: must be %q or %q",
-			s3CacheParam, S3CacheOn, S3CacheOff),
+		Message: fmt.Sprintf("invalid value for %q: must be %q, %q, or %q",
+			s3CacheParam, S3CacheOn, S3CacheOff, S3CachePassthrough),
+	}
+}
+
+// workerTTLParam is the duckgres-namespaced custom GUC that overrides how long
+// the session's worker stays hot-idle (warm) after its last session ends
+// (remote/k8s backend). Intercepted here and applied by the connection layer
+// (which updates the bound worker's pool-side TTL); it is NEVER forwarded to
+// DuckDB. See clientConn.applyWorkerTTLSetting in server/.
+const workerTTLParam = "duckgres.worker_ttl"
+
+// NormalizeWorkerTTL validates a client-supplied duckgres.worker_ttl value: a
+// Go duration of at least one minute ("20m", "1h30m"). Matching ignores
+// surrounding whitespace; the returned value is the canonical duration string.
+// Empty is valid and means "reset to default" (the session then parks with the
+// TTL resolved at connect time). Zero and sub-minute values are REJECTED:
+// the parked TTL is persisted with whole-minute precision (ttl_minutes), where
+// 0 means "reaper applies the deployment default" — accepting 30s/0s would
+// silently park the worker for the deployment default instead, with SHOW
+// reporting a TTL the reapers never honor. An invalid value returns a 22023
+// (invalid_parameter_value) CodedError that, like NormalizeQuerySource, does
+// not echo the offending client input.
+func NormalizeWorkerTTL(raw string) (string, error) {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return "", nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < time.Minute || d%time.Minute != 0 {
+		return "", errInvalidWorkerTTL()
+	}
+	return d.String(), nil
+}
+
+// errInvalidWorkerTTL is the SET-time rejection for a bad duckgres.worker_ttl
+// value: 22023 invalid_parameter_value, same treatment as duckgres.s3_cache.
+func errInvalidWorkerTTL() *CodedError {
+	return &CodedError{
+		Code: "22023", // invalid_parameter_value
+		Message: fmt.Sprintf("invalid value for %q: must be a Go duration of at least 1m in whole minutes (e.g. \"20m\")",
+			workerTTLParam),
 	}
 }
 
@@ -247,18 +294,18 @@ func NewSetShowTransform() *SetShowTransform {
 			"wal_receiver_timeout":      true,
 
 			// Session settings (silently accept)
-			"datestyle":                    true,
-			"intervalstyle":                true,
-			"standard_conforming_strings":  true,
-			"escape_string_warning":        true,
-			"array_nulls":                  true,
-			"backslash_quote":              true,
-			"default_with_oids":            true,
-			"quote_all_identifiers":        true,
-			"sql_inheritance":              true,
-			"transform_null_equals":        true,
-			"lo_compat_privileges":         true,
-			"operator_precedence_warning":  true,
+			"datestyle":                   true,
+			"intervalstyle":               true,
+			"standard_conforming_strings": true,
+			"escape_string_warning":       true,
+			"array_nulls":                 true,
+			"backslash_quote":             true,
+			"default_with_oids":           true,
+			"quote_all_identifiers":       true,
+			"sql_inheritance":             true,
+			"transform_null_equals":       true,
+			"lo_compat_privileges":        true,
+			"operator_precedence_warning": true,
 
 			// Server version settings (commonly queried)
 			"server_version":     true,
@@ -266,8 +313,8 @@ func NewSetShowTransform() *SetShowTransform {
 			"server_encoding":    true,
 
 			// Timezone (DuckDB has its own timezone setting)
-			"timezone":         true,
-			"log_timezone":     true,
+			"timezone":               true,
+			"log_timezone":           true,
 			"timezone_abbreviations": true,
 		},
 		PassthroughParams: map[string]bool{
@@ -396,6 +443,35 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 					return true, nil
 				}
 
+				// duckgres.worker_ttl: same interception contract as
+				// duckgres.s3_cache above (single-statement only; RESET /
+				// SET ... TO DEFAULT map to the empty value = the TTL resolved
+				// at connect time; invalid durations rejected with 22023 via
+				// result.Error). The connection layer applies the value to the
+				// session's bound worker — never forwarded to DuckDB.
+				if paramName == workerTTLParam && !multiStatement {
+					value := ""
+					if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_SET_VALUE {
+						extracted := false
+						if len(n.VariableSetStmt.Args) == 1 {
+							if v, ok := searchPathValue(n.VariableSetStmt.Args[0]); ok {
+								value, extracted = v, true
+							}
+						}
+						if !extracted {
+							result.Error = errInvalidWorkerTTL()
+							return true, nil
+						}
+					}
+					norm, err := NormalizeWorkerTTL(value)
+					if err != nil {
+						result.Error = err
+						return true, nil
+					}
+					result.WorkerTTLSet = &norm
+					return true, nil
+				}
+
 				if paramName == "search_path" {
 					if sql, ok := normalizeSearchPathSet(n.VariableSetStmt); ok {
 						result.SQLOverride = sql
@@ -459,6 +535,14 @@ func (t *SetShowTransform) Transform(tree *pg_query.ParseResult, result *Result)
 				// connection layer (defaulting to "on"), not DuckDB.
 				if paramName == s3CacheParam && !multiStatement {
 					result.S3CacheShow = true
+					return true, nil
+				}
+
+				// duckgres.worker_ttl: answered from session state by the
+				// connection layer (the TTL the session's worker will park
+				// with), not DuckDB.
+				if paramName == workerTTLParam && !multiStatement {
+					result.WorkerTTLShow = true
 					return true, nil
 				}
 
@@ -577,11 +661,11 @@ func searchPathValue(node *pg_query.Node) (string, bool) {
 func (t *SetShowTransform) getDefaultValue(paramName string) string {
 	defaults := map[string]string{
 		// Client connection settings
-		"application_name":   "duckgres",
-		"client_encoding":    "UTF8",
-		"statement_timeout":  "0",
-		"lock_timeout":       "0",
-		"extra_float_digits": "1",
+		"application_name":    "duckgres",
+		"client_encoding":     "UTF8",
+		"statement_timeout":   "0",
+		"lock_timeout":        "0",
+		"extra_float_digits":  "1",
 		"client_min_messages": "notice",
 
 		// Transaction settings
@@ -614,18 +698,18 @@ func (t *SetShowTransform) getDefaultValue(paramName string) string {
 		"timezone": "UTC",
 
 		// Other commonly queried settings
-		"max_identifier_length":      "63",
-		"default_tablespace":         "",
-		"temp_tablespaces":           "",
-		"lc_collate":                 "en_US.UTF-8",
-		"lc_ctype":                   "en_US.UTF-8",
-		"lc_messages":                "en_US.UTF-8",
-		"lc_monetary":                "en_US.UTF-8",
-		"lc_numeric":                 "en_US.UTF-8",
-		"lc_time":                    "en_US.UTF-8",
-		"integer_datetimes":          "on",
-		"is_superuser":               "on",
-		"session_authorization":      "duckdb",
+		"max_identifier_length": "63",
+		"default_tablespace":    "",
+		"temp_tablespaces":      "",
+		"lc_collate":            "en_US.UTF-8",
+		"lc_ctype":              "en_US.UTF-8",
+		"lc_messages":           "en_US.UTF-8",
+		"lc_monetary":           "en_US.UTF-8",
+		"lc_numeric":            "en_US.UTF-8",
+		"lc_time":               "en_US.UTF-8",
+		"integer_datetimes":     "on",
+		"is_superuser":          "on",
+		"session_authorization": "duckdb",
 	}
 	if val, ok := defaults[paramName]; ok {
 		return val

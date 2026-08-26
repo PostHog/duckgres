@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -175,5 +176,39 @@ func TestCancelByWorkerFansOut(t *testing.T) {
 	r3.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/sessions/by-worker/99/cancel", nil))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("unknown worker cancel should 404, got %d", w.Code)
+	}
+}
+
+// The hot-idle reporting endpoint serves the provider's per-org rows under
+// {orgs:[...]} — the operator's "who is holding parked workers, and at what
+// configured ceiling" view.
+func TestHotIdleRoute(t *testing.T) {
+	since := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	live := &fakeLiveInfo{hotIdle: []HotIdleOrg{
+		{OrgID: "acme", Count: 3, CPUCores: 8, MemoryBytes: 32 << 30, OldestHotIdleSince: &since, CapWorkers: 5, CapCPU: "16", CapMemory: "64Gi"},
+		{OrgID: "globex", Count: 1, CPUCores: 2, MemoryBytes: 8 << 30},
+	}}
+	r := liveTestRouter(live, nil)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/workers/hot-idle", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /workers/hot-idle = %d (%s)", w.Code, w.Body.String())
+	}
+	var body struct {
+		Orgs []HotIdleOrg `json:"orgs"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(body.Orgs) != 2 {
+		t.Fatalf("want 2 orgs, got %+v", body.Orgs)
+	}
+	acme := body.Orgs[0]
+	if acme.OrgID != "acme" || acme.Count != 3 || acme.CPUCores != 8 || acme.CapWorkers != 5 || acme.CapCPU != "16" || acme.CapMemory != "64Gi" {
+		t.Fatalf("acme row wrong: %+v", acme)
+	}
+	if acme.OldestHotIdleSince == nil || !acme.OldestHotIdleSince.Equal(since) {
+		t.Fatalf("oldest since not carried: %+v", acme)
 	}
 }

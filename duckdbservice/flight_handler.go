@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	bindings "github.com/duckdb/duckdb-go-bindings"
+	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -237,9 +237,19 @@ func (h *FlightSQLHandler) doCreateSession(body []byte, stream flight.FlightServ
 	}
 
 	session, secretWarnings, err := h.pool.CreateSession(req.Username, req.MemoryLimit, req.Threads, req.SecretStatements)
+	attachSessionLog(session, req.Username, req.PID)
 	if drainErr := workerDrainingStatus(err); drainErr != nil {
 		return drainErr
 	}
+	// Session create runs DDL against the instance, so it is where an ALREADY
+	// invalidated worker announces itself: the observed failure sequence is a
+	// fatal on one session, then the CP handing the same worker a brand new
+	// session ~2 minutes later that dies initializing its database metadata.
+	// Flagging here retires the worker on that first rejected create instead of
+	// waiting for the liveness probe. Opaque because this path replays the
+	// user's persistent CREATE SECRET statements: its error can echo a
+	// credential with no single statement to classify against.
+	h.pool.noteInstanceErrorOpaque(err)
 	if err != nil {
 		return status.Errorf(codes.ResourceExhausted, "create session: %v", err)
 	}
@@ -325,6 +335,15 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 	// that hasn't attached DuckLake yet.
 	<-h.pool.warmupDone
 
+	// Kick a SELECT 1 liveness probe. Before this, the health check never
+	// executed SQL — it only read progress counters — so a DuckDB instance
+	// invalidated by an Internal/Fatal engine error passed every check and
+	// stayed schedulable, and the org's next connection was handed the dead
+	// instance. The probe runs asynchronously and we report the flag it sets;
+	// see probeInstanceLivenessAsync for why it must not block this response.
+	h.pool.probeInstanceLivenessAsync()
+	instanceInvalidated := h.pool.InstanceInvalidated()
+
 	// Poll DuckDB query progress for each active session.
 	//
 	// QueryProgress is a CGO call into DuckDB that *should* return instantly
@@ -355,6 +374,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 
 	type sessionSnapshot struct {
 		key      string
+		session  *Session
 		conn     duckdbConnHandle
 		progress *progressState
 		queryID  string
@@ -372,6 +392,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 		}
 		snapshots = append(snapshots, sessionSnapshot{
 			key:      key,
+			session:  session,
 			conn:     session.duckdbConn,
 			progress: &session.progress,
 			queryID:  session.CurrentQueryID(),
@@ -419,7 +440,7 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 						// is exactly the case whose query-log row may never get
 						// a terminal event, and this is what ties the two
 						// together.
-						slog.Warn("Query appears stuck — no progress detected.",
+						logStuckQuery(snap.session,
 							withQueryIDAttr([]any{
 								"session", snap.key, "rows_processed", pr.rows, "total_rows", pr.total,
 								"stalled_checks", stallCheckThreshold,
@@ -438,13 +459,21 @@ func (h *FlightSQLHandler) doHealthCheck(body []byte, stream flight.FlightServic
 		}
 	}
 
+	// An invalidated instance reports healthy=false as well as the specific
+	// flag: the flag is what the CP acts and alerts on, while healthy=false
+	// makes the generic reuse gate (validateReservedWorkerHealth) reject the
+	// worker even on a CP that predates the flag.
 	resp, _ := json.Marshal(map[string]interface{}{
-		"healthy":          true,
-		"draining":         h.pool.IsDraining(),
-		"sessions":         h.pool.ActiveSessions(),
-		"active_queries":   h.pool.ActiveDrainWork(),
-		"uptime_ns":        time.Since(h.pool.startTime).Nanoseconds(),
-		"session_progress": sessionProgress,
+		"healthy":                 !instanceInvalidated,
+		"draining":                h.pool.IsDraining(),
+		"sessions":                h.pool.ActiveSessions(),
+		"active_queries":          h.pool.ActiveDrainWork(),
+		"uptime_ns":               time.Since(h.pool.startTime).Nanoseconds(),
+		"session_progress":        sessionProgress,
+		"instance_invalidated":    instanceInvalidated,
+		"instance_invalid_reason": h.pool.InstanceInvalidReason(),
+		"otlp_export_enabled":     cliboot.OTLPExportEnabled(),
+		"otlp_export_failures":    cliboot.OTLPExportFailures(),
 	})
 	return sendActionResult(stream, &flight.Result{Body: resp})
 }
@@ -494,7 +523,14 @@ func (h *FlightSQLHandler) doSetSessionS3Cache(body []byte, stream flight.Flight
 	if _, err := h.sessionFromContext(stream.Context()); err != nil {
 		return err
 	}
-	if err := h.pool.SetS3CacheEnabled(req.Enabled); err != nil {
+	mode := req.Mode
+	if mode == "" {
+		mode = "off"
+		if req.Enabled {
+			mode = "on"
+		}
+	}
+	if err := h.pool.SetS3CacheMode(mode); err != nil {
 		return status.Errorf(codes.Internal, "set session s3 cache: %v", err)
 	}
 
@@ -645,6 +681,8 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	defer session.progress.queryActive.Store(false)
 	endTxnWork := ttx.beginWork()
 	defer endTxnWork()
+	clearCacheProxyContext := h.pool.setActiveCacheProxyContext(ctx)
+	defer clearCacheProxyContext()
 
 	// Only retry on transient errors for autocommit queries. Inside a
 	// transaction, a transient error invalidates the transaction — retrying
@@ -654,7 +692,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	if inTransaction {
 		schema, err = session.getQuerySchema(ctx, query, tx)
 	} else {
-		schema, err = retryOnTransient(func() (*arrow.Schema, error) {
+		schema, err = retryOnTransient(session.Logger(), func() (*arrow.Schema, error) {
 			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
@@ -663,12 +701,17 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	// conflict retry — acceptable since the error patterns are distinct in practice.
 	if shouldRetryDuckLakeConflict(err, inTransaction) {
 		ducklakeConflictTotal.Inc()
-		schema, err = retryOnConflict(func() (*arrow.Schema, error) {
+		schema, err = retryOnConflict(session.Logger(), func() (*arrow.Schema, error) {
 			return session.getQuerySchema(ctx, query, tx)
 		})
 	}
+	// An Internal/Fatal engine error here has already poisoned the whole
+	// instance; flag it so this worker is retired rather than reused. The query
+	// is passed un-redacted so the reason can be classified for secret DDL.
+	h.pool.noteInstanceError(query, err)
 	if err != nil {
 		schema, err, _ = recoverAbortedTransaction(
+			session.Logger(),
 			err,
 			!inTransaction,
 			func() error { return session.rollbackConn(context.Background()) },
@@ -683,10 +726,6 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 		}
 		return nil, status.Errorf(codes.InvalidArgument, "failed to prepare query: %v", err)
 	}
-
-	// Send DuckDB profiling output as gRPC trailing metadata so the
-	// control plane can attach it to the trace span.
-	sendProfilingMetadata(ctx, session)
 
 	handleID := fmt.Sprintf("query-%d", session.handleCounter.Add(1))
 	ticketBytes, err := flightsql.CreateStatementQueryTicket([]byte(handleID))
@@ -766,6 +805,8 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 			releaseQueryHandleValue(handle)
 		}()
 		defer endConnWork()
+		clearCacheProxyContext := h.pool.setActiveCacheProxyContext(ctx)
+		defer clearCacheProxyContext()
 
 		// The query ID's lifetime mirrors queryActive exactly: the progress
 		// monitor reads both from its own goroutine, and a stuck-query warning
@@ -783,6 +824,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 
 		inTxn := tx != nil || session.sqlTxActive.Load()
 		var closeRows func() error
+		execStartedAt := clearProfilingOutput()
 		queryFn := func() (*sql.Rows, error) {
 			rows, closer, err := session.queryRows(ctx, tx, handle.Query)
 			if err != nil {
@@ -797,17 +839,21 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		if inTxn {
 			rows, qerr = queryFn()
 		} else {
-			rows, qerr = retryOnTransient(queryFn)
+			rows, qerr = retryOnTransient(session.Logger(), queryFn)
 		}
 		// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 		if shouldRetryDuckLakeConflict(qerr, inTxn) {
 			ducklakeConflictTotal.Inc()
-			rows, qerr = retryOnConflict(func() (*sql.Rows, error) {
+			rows, qerr = retryOnConflict(session.Logger(), func() (*sql.Rows, error) {
 				return queryFn()
 			})
 		}
+		// See the note in GetFlightInfoStatement: an Internal/Fatal error has
+		// killed the instance, so the worker must not be handed out again.
+		h.pool.noteInstanceError(handle.Query, qerr)
 		if qerr != nil {
 			rows, qerr, _ = recoverAbortedTransaction(
+				session.Logger(),
 				qerr,
 				!inTxn,
 				func() error { return session.rollbackConn(context.Background()) },
@@ -820,6 +866,7 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		}
 		defer func() {
 			_ = closeRows()
+			sendProfilingMetadataSince(ctx, execStartedAt)
 		}()
 
 		for {
@@ -895,6 +942,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	defer session.progress.queryActive.Store(false)
 	endTxnWork := ttx.beginWork()
 	defer endTxnWork()
+	execStartedAt := clearProfilingOutput()
 
 	execFn := func() (sql.Result, error) {
 		return session.exec(ctx, tx, query)
@@ -919,18 +967,19 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 	if inTransaction || isTxControl {
 		result, execErr = execFn()
 	} else {
-		result, execErr = retryOnTransient(execFn)
+		result, execErr = retryOnTransient(session.Logger(), execFn)
 	}
 
 	// Conflict retry for autocommit only (see GetFlightInfoStatement comment).
 	if shouldRetryDuckLakeConflict(execErr, inTransaction) {
 		ducklakeConflictTotal.Inc()
-		result, execErr = retryOnConflict(func() (sql.Result, error) {
+		result, execErr = retryOnConflict(session.Logger(), func() (sql.Result, error) {
 			return session.execConn(ctx, query)
 		})
 	}
 	if execErr != nil {
 		result, execErr, _ = recoverAbortedTransaction(
+			session.Logger(),
 			execErr,
 			!inTransaction,
 			func() error { return session.rollbackConn(context.Background()) },
@@ -939,6 +988,10 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 			},
 		)
 	}
+	// See the note in GetFlightInfoStatement. This is the DML/DDL path, so it
+	// is where a DuckLake commit fatal (the known source of instance
+	// invalidation) actually lands.
+	h.pool.noteInstanceError(query, execErr)
 	// Track SQL-level transaction state for BEGIN/COMMIT/ROLLBACK sent as raw SQL.
 	trackSQLTransactionState(query, execErr, &session.sqlTxActive)
 	if tx == nil && isTransactionStartStmt(query) && execErr == nil {
@@ -957,7 +1010,7 @@ func (h *FlightSQLHandler) DoPutCommandStatementUpdate(ctx context.Context,
 		return 0, status.Errorf(codes.InvalidArgument, "failed to execute update: %v", execErr)
 	}
 
-	sendProfilingMetadata(ctx, session)
+	sendProfilingMetadataSince(ctx, execStartedAt)
 
 	affected, err := result.RowsAffected()
 	if err != nil {

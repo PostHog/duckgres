@@ -16,6 +16,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+func TestOrgRouterDefaultWorkerDuckDBThreads(t *testing.T) {
+	tests := []struct {
+		name       string
+		cpuRequest string
+		want       int
+	}{
+		{name: "production shape", cpuRequest: "15", want: 38},
+		{name: "fractional shape", cpuRequest: "750m", want: 2},
+		{name: "built-in worker shape", cpuRequest: "", want: 20},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			router := &OrgRouter{baseCfg: K8sWorkerPoolConfig{WorkerCPURequest: tt.cpuRequest}}
+			if got := router.defaultWorkerDuckDBThreads(); got != tt.want {
+				t.Fatalf("defaultWorkerDuckDBThreads() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
 type recordingOrgRouterPool struct {
 	events        *[]string
 	shutdownCount *atomic.Int32
@@ -806,14 +827,10 @@ func TestOrgRouterHandleConfigChangeDeletingDestroysExistingStackExactlyOnce(t *
 	}
 }
 
-func TestOrgRouterHandleConfigChangeReconcilesAfterRemovalBecomesStaleInFlight(t *testing.T) {
-	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
+func TestOrgRouterHandleConfigChangeUsesLatestSnapshotForStaleRemoval(t *testing.T) {
 	org := &configstore.OrgConfig{Name: "analytics"}
 	beforeRemoval := &configstore.Snapshot{
 		Orgs: map[string]*configstore.OrgConfig{"analytics": org},
-		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
-			key: {Mode: configstore.OrgUserAccessModeProjectReader},
-		},
 	}
 	removed := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}}
 	restored := &configstore.Snapshot{
@@ -830,65 +847,20 @@ func TestOrgRouterHandleConfigChangeReconcilesAfterRemovalBecomesStaleInFlight(t
 		configStore: store,
 	}
 
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	releaseBarrier := func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	}
-	t.Cleanup(releaseBarrier)
-	router.setProjectScopedUserChangeHandler(func(string, string) {
-		close(entered)
-		<-release
-	})
-	staleDone := make(chan struct{})
-	go func() {
-		router.HandleConfigChange(beforeRemoval, removed)
-		close(staleDone)
-	}()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("stale removal callback did not reach the barrier")
-	}
-
 	setTestConfigStoreSnapshot(store, restored)
-	latestDone := make(chan struct{})
-	go func() {
-		router.HandleConfigChange(removed, restored)
-		close(latestDone)
-	}()
-	select {
-	case <-latestDone:
-	case <-time.After(time.Second):
-		t.Fatal("latest restore callback did not finish")
-	}
-	if got, ok := router.StackForOrg("analytics"); !ok || got != stack {
-		t.Fatal("latest restore callback did not preserve the current stack")
-	}
-
-	releaseBarrier()
-	select {
-	case <-staleDone:
-	case <-time.After(time.Second):
-		t.Fatal("stale removal callback did not finish")
-	}
+	router.HandleConfigChange(beforeRemoval, removed)
 
 	got, ok := router.StackForOrg("analytics")
 	if !ok || got != stack {
-		t.Fatal("in-flight stale removal destroyed the stack restored by the latest snapshot")
+		t.Fatal("stale removal destroyed the stack retained by the latest snapshot")
 	}
 	if got := shutdownCount.Load(); got != 0 {
-		t.Fatalf("in-flight stale removal shut down the current stack %d times, want 0", got)
+		t.Fatalf("stale removal shut down the current stack %d times, want 0", got)
 	}
 }
 
-func TestOrgRouterHandleConfigChangeReconcilesLatestConfigAfterCreateBecomesStaleInFlight(t *testing.T) {
+func TestOrgRouterHandleConfigChangeUsesLatestSnapshotForStaleCreate(t *testing.T) {
 	sharedPool, _ := newTestK8sPool(t, 10)
-	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
 	v1 := &configstore.OrgConfig{
 		Name:       "analytics",
 		MaxWorkers: 2,
@@ -905,17 +877,12 @@ func TestOrgRouterHandleConfigChangeReconcilesLatestConfigAfterCreateBecomesStal
 			Image: "posthog/duckgres:v2",
 		},
 	}
-	userAccess := map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
-		key: {Mode: configstore.OrgUserAccessModeProjectReader},
-	}
 	beforeCreate := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{}}
 	readyV1 := &configstore.Snapshot{
-		Orgs:          map[string]*configstore.OrgConfig{"analytics": v1},
-		OrgUserAccess: userAccess,
+		Orgs: map[string]*configstore.OrgConfig{"analytics": v1},
 	}
 	readyV2 := &configstore.Snapshot{
-		Orgs:          map[string]*configstore.OrgConfig{"analytics": v2},
-		OrgUserAccess: userAccess,
+		Orgs: map[string]*configstore.OrgConfig{"analytics": v2},
 	}
 	store := newTestConfigStoreWithSnapshot(readyV1)
 	router := &OrgRouter{
@@ -925,63 +892,15 @@ func TestOrgRouterHandleConfigChangeReconcilesLatestConfigAfterCreateBecomesStal
 	}
 	t.Cleanup(router.ShutdownAll)
 
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	releaseBarrier := func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	}
-	t.Cleanup(releaseBarrier)
-	router.setProjectScopedUserChangeHandler(func(string, string) {
-		close(entered)
-		<-release
-	})
-	staleDone := make(chan struct{})
-	go func() {
-		router.HandleConfigChange(beforeCreate, readyV1)
-		close(staleDone)
-	}()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("stale create callback did not reach the barrier")
-	}
-
 	setTestConfigStoreSnapshot(store, readyV2)
-	latestDone := make(chan struct{})
-	go func() {
-		router.HandleConfigChange(readyV1, readyV2)
-		close(latestDone)
-	}()
-	select {
-	case <-latestDone:
-	case <-time.After(time.Second):
-		t.Fatal("latest ready callback did not finish")
-	}
-	latestStack, ok := router.StackForOrg("analytics")
-	if !ok || latestStack.Config != v2 {
-		t.Fatal("latest ready callback did not publish the v2 stack")
-	}
-
-	releaseBarrier()
-	select {
-	case <-staleDone:
-	case <-time.After(time.Second):
-		t.Fatal("stale create callback did not finish")
-	}
+	router.HandleConfigChange(beforeCreate, readyV1)
 
 	stack, ok := router.StackForOrg("analytics")
 	if !ok {
 		t.Fatal("latest ready snapshot did not result in an org stack")
 	}
-	if stack != latestStack {
-		t.Fatal("stale callback replaced the generation published by the latest callback")
-	}
 	if stack.Config != v2 {
-		t.Fatal("in-flight stale create did not publish the latest org config")
+		t.Fatal("stale create did not publish the latest org config")
 	}
 	pool, ok := stack.Pool.(*OrgReservedPool)
 	if !ok {
@@ -1123,34 +1042,6 @@ func TestChangedProjectScopedUsersTracksProjectUserNamespaces(t *testing.T) {
 	}
 	if _, ok := changedProjectScopedUsers(old, renamed)[key]; !ok {
 		t.Fatal("namespace change did not invalidate project user")
-	}
-}
-
-func TestOrgRouterHandleConfigChangeNotifiesFlightSessionRevocation(t *testing.T) {
-	teamID := int64(42)
-	key := configstore.OrgUserKey{OrgID: "analytics", Username: "reader"}
-	old := &configstore.Snapshot{
-		Orgs:            map[string]*configstore.OrgConfig{"analytics": {Teams: []configstore.OrgTeamConfig{{TeamID: teamID, Enabled: true}}}},
-		OrgUserPassword: map[configstore.OrgUserKey]string{key: "old"},
-		OrgUserDisabled: map[configstore.OrgUserKey]bool{},
-		OrgUserAccess: map[configstore.OrgUserKey]configstore.OrgUserAccessConfig{
-			key: {Mode: configstore.OrgUserAccessModeProjectReader, TeamID: &teamID},
-		},
-	}
-	updated := *old
-	updated.OrgUserPassword = map[configstore.OrgUserKey]string{key: "new"}
-
-	var revokedOrg, revokedUser string
-	router := &OrgRouter{orgs: map[string]*OrgStack{
-		"analytics": {Config: old.Orgs["analytics"]},
-	}}
-	router.setProjectScopedUserChangeHandler(func(orgID, username string) {
-		revokedOrg, revokedUser = orgID, username
-	})
-	router.HandleConfigChange(old, &updated)
-
-	if revokedOrg != "analytics" || revokedUser != "reader" {
-		t.Fatalf("revoked user = %s/%s, want analytics/reader", revokedOrg, revokedUser)
 	}
 }
 

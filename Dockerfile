@@ -22,14 +22,16 @@ RUN go mod download
 # previously ran after the source COPY + build, so they re-fetched on every
 # edit.)
 ARG TARGETARCH
-ARG DUCKDB_EXTENSION_VERSION=1.5.3
-ARG HTTPFS_EXTENSION_TAG=v1.5.3-cred-refresh-write-retry
-ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.6
+ARG DUCKDB_EXTENSION_VERSION=1.5.5
+ARG HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
+ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
-# Repository for postgres_scanner specifically. Defaults to the stable
-# extensions repo, overridable per-row in CI (e.g. legacy DuckDB versions
-# may need the nightly repo to match what was previously published).
-ARG POSTGRES_SCANNER_REPOSITORY=https://extensions.duckdb.org
+# Repository for postgres_scanner specifically. The checksums content-pin the
+# DuckDB 1.5.5 nightly artifact built from duckdb-postgres ab217c6; CI overrides
+# all three values together for rollback rows.
+ARG POSTGRES_SCANNER_REPOSITORY=https://nightly-extensions.duckdb.org
+ARG POSTGRES_SCANNER_SHA256_AMD64=7ff4913fab203f7895eaa6a9a87a14a7ad659d400deff667f8bf16e58a28937f
+ARG POSTGRES_SCANNER_SHA256_ARM64=9ea7d5a3610f2b460bd2a5075684c5f6dad55fa19745a377b5471f4994a8b460
 # `: ${VAR:?msg}` asserts every required input is non-empty — catches a
 # CI matrix row that forgets to pass a build-arg and would otherwise
 # silently fall back to the ARG default, producing a cross-version
@@ -43,6 +45,12 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
     && : "${DUCKLAKE_EXTENSION_TAG:?must be set}" \
     && : "${DUCKDB_EXTENSION_REPOSITORY:?must be set}" \
     && : "${POSTGRES_SCANNER_REPOSITORY:?must be set}" \
+    && case "${TARGETARCH}" in \
+         amd64) postgres_scanner_sha256="${POSTGRES_SCANNER_SHA256_AMD64}" ;; \
+         arm64) postgres_scanner_sha256="${POSTGRES_SCANNER_SHA256_ARM64}" ;; \
+         *) echo "ERROR: unsupported TARGETARCH for postgres_scanner: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && : "${postgres_scanner_sha256:?postgres_scanner checksum must be set}" \
     && mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
     && curl -fsSL "https://github.com/PostHog/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension" \
@@ -51,7 +59,11 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
     && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension.gz" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \
     && curl -fsSL "${POSTGRES_SCANNER_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
-      | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
+      -o /tmp/postgres_scanner.duckdb_extension.gz \
+    && echo "${postgres_scanner_sha256}  /tmp/postgres_scanner.duckdb_extension.gz" | sha256sum -c - \
+    && gunzip -c /tmp/postgres_scanner.duckdb_extension.gz \
+      > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
+    && rm /tmp/postgres_scanner.duckdb_extension.gz \
     && for f in httpfs ducklake json postgres_scanner; do \
          [ -s "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/$f.duckdb_extension" ] \
            || { echo "ERROR: $f.duckdb_extension is empty after fetch" >&2; exit 1; }; \

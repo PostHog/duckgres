@@ -26,7 +26,7 @@ func TestModelDescriptorsRedaction(t *testing.T) {
 	// Registry must cover exactly the persisted models we expect.
 	wantKeys := map[string]bool{
 		"orgs": true, "org-teams": true, "org-users": true, "org-user-secrets": true, "managed-warehouses": true,
-		"cp-instances": true, "worker-records": true, "flight-session-records": true,
+		"cp-instances": true, "worker-records": true,
 		"org-connection-queue": true, "org-connection-leases": true,
 		"operators": true,
 	}

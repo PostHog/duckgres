@@ -21,10 +21,12 @@ type captureControlPlaneExpiryStore struct {
 	stuckSpawningBefore   []time.Time
 	stuckActivatingBefore []time.Time
 	stuckWorkers          []configstore.WorkerRecord
-	expiredSessionsBefore []time.Time
 	expiredHotIdleWorkers []configstore.WorkerRecord
 	hotIdleCounts         map[string]int
 	hotIdleCountCalls     []string
+	// orgHotIdle fixtures the cap sweep's per-org listing (oldest-first, as
+	// the store guarantees).
+	orgHotIdle map[string][]configstore.WorkerRecord
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
@@ -82,13 +84,6 @@ func (s *captureControlPlaneExpiryStore) ListStuckWorkerSnapshots(spawningBefore
 	return out, nil
 }
 
-func (s *captureControlPlaneExpiryStore) ExpireFlightSessionRecords(before time.Time) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.expiredSessionsBefore = append(s.expiredSessionsBefore, before)
-	return 0, nil
-}
-
 // ListExpiredHotIdleSnapshots is the lifecycle-typed counterpart used
 // by the migrated janitor hot-idle path. The mock wraps the same
 // underlying slice through NewWorkerSnapshot so existing
@@ -104,6 +99,19 @@ func (s *captureControlPlaneExpiryStore) ListExpiredHotIdleSnapshots(now time.Ti
 		out = append(out, configstore.NewWorkerSnapshot(rec))
 	}
 	return out, nil
+}
+
+// ListOrgHotIdleSnapshots serves the orgHotIdle fixture (already ordered
+// oldest-first, as the real query guarantees) for the cap sweep.
+func (s *captureControlPlaneExpiryStore) ListOrgHotIdleSnapshots(orgID string) ([]configstore.WorkerSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	records := s.orgHotIdle[orgID]
+	snaps := make([]configstore.WorkerSnapshot, len(records))
+	for i, r := range records {
+		snaps[i] = configstore.NewWorkerSnapshot(r)
+	}
+	return snaps, nil
 }
 
 func (s *captureControlPlaneExpiryStore) CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error) {
@@ -218,9 +226,6 @@ func TestControlPlaneJanitorRunRetiresOrphanedAndStuckWorkers(t *testing.T) {
 	}
 	if len(store.stuckSpawningBefore) == 0 || len(store.stuckActivatingBefore) == 0 {
 		t.Fatal("expected stuck worker cutoff lookup")
-	}
-	if len(store.expiredSessionsBefore) == 0 {
-		t.Fatal("expected expired flight session cleanup")
 	}
 }
 
@@ -512,9 +517,6 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	if len(store.stuckSpawningBefore) != 1 || len(store.stuckActivatingBefore) != 1 {
 		t.Fatalf("expected stuck worker lookup despite expiry error, got spawning=%d activating=%d", len(store.stuckSpawningBefore), len(store.stuckActivatingBefore))
 	}
-	if len(store.expiredSessionsBefore) != 1 {
-		t.Fatalf("expected flight session expiry despite expiry error, got %d", len(store.expiredSessionsBefore))
-	}
 	if got := lifecycleStore.orphanTransitions; len(got) != 1 || got[0].workerID != 7 {
 		t.Fatalf("expected one orphan CAS for worker 7 despite expiry error, got %#v", got)
 	}
@@ -526,5 +528,131 @@ func TestControlPlaneJanitorRunOnceContinuesAfterExpireError(t *testing.T) {
 	defer mu.Unlock()
 	if lifecycleObserved != 1 {
 		t.Fatalf("expected worker lifecycle observation despite expiry error, got %d", lifecycleObserved)
+	}
+}
+
+// The hot-idle cap sweep retires ONLY the oldest parked workers past a
+// capped org's limits — by count, by total vCPU, and by total memory —
+// leaving orgs within their limits alone. The store returns oldest-first; the
+// sweep must retire exactly the prefix needed to get within ALL limits — the
+// longest-parked excess goes first, fresh warm capacity stays.
+func TestControlPlaneJanitorHotIdleCapSweep(t *testing.T) {
+	since := time.Now().Add(-time.Hour)
+	hotIdle := func(id int, pod, org, cpu, mem string) configstore.WorkerRecord {
+		return configstore.WorkerRecord{
+			WorkerID: id, PodName: pod, State: configstore.WorkerStateHotIdle, OrgID: org,
+			OwnerCPInstanceID: "cp-a", OwnerEpoch: 1, HotIdleSince: &since,
+			ProfileCPU: cpu, ProfileMemory: mem,
+		}
+	}
+	store := &captureControlPlaneExpiryStore{
+		orgHotIdle: map[string][]configstore.WorkerRecord{
+			// Count cap 2 with 3 parked → retire exactly the oldest.
+			"acme": {
+				hotIdle(11, "w-acme-old", "acme", "2", "8Gi"),
+				hotIdle(12, "w-acme-mid", "acme", "2", "8Gi"),
+				hotIdle(13, "w-acme-new", "acme", "2", "8Gi"),
+			},
+			// CPU cap "6" with 2×4 cores parked → retire the oldest (4 ≤ 6).
+			// Second worker carries no profile → resolves via the org default.
+			"globex": {
+				hotIdle(21, "w-globex-old", "globex", "4", "16Gi"),
+				hotIdle(22, "w-globex-new", "globex", "", ""),
+			},
+			// Memory cap "20Gi" with 2×16Gi parked → retire the oldest (16 ≤ 20).
+			"initech": {
+				hotIdle(31, "w-initech-old", "initech", "4", "16Gi"),
+				hotIdle(32, "w-initech-new", "initech", "4", "16Gi"),
+			},
+			// Under all its limits — left alone.
+			"under": {
+				hotIdle(41, "w-under-1", "under", "2", "8Gi"),
+			},
+		},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	cleanup := &fakePhysicalCleanup{}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.now = func() time.Time { return time.Date(2026, time.August, 19, 12, 0, 0, 0, time.UTC) }
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, cleanup)
+	janitor.hotIdleCaps = func() map[string]orgHotIdleLimit {
+		return map[string]orgHotIdleLimit{
+			"acme":    {Workers: 2},
+			"globex":  {CPU: "6", DefaultCPU: "4", DefaultMemory: "16Gi"},
+			"initech": {Memory: "20Gi"},
+			"under":   {Workers: 5, CPU: "16", Memory: "64Gi"},
+		}
+	}
+
+	janitor.runOnce()
+
+	var retired []int
+	for _, tr := range lifecycleStore.terminalTransitions {
+		if tr.target != configstore.WorkerStateRetired || tr.reason != janitorRetireReasonHotIdleCap {
+			t.Fatalf("unexpected transition: %#v", tr)
+		}
+		retired = append(retired, tr.workerID)
+	}
+	want := []int{11, 21, 31} // exactly the oldest excess of each over-limit org
+	if len(retired) != len(want) {
+		t.Fatalf("retired %v, want %v", retired, want)
+	}
+	seen := map[int]bool{}
+	for _, id := range retired {
+		seen[id] = true
+	}
+	for _, id := range want {
+		if !seen[id] {
+			t.Fatalf("worker %d not retired: %v", id, retired)
+		}
+	}
+}
+
+// A nil hotIdleCaps function (unwired) must disable the sweep entirely — no
+// store calls, no retires.
+func TestControlPlaneJanitorHotIdleCapSweepDisabledWhenUnwired(t *testing.T) {
+	store := &captureControlPlaneExpiryStore{
+		orgHotIdle: map[string][]configstore.WorkerRecord{
+			"acme": {
+				{WorkerID: 11, PodName: "w-acme-1", State: configstore.WorkerStateHotIdle, OrgID: "acme", OwnerCPInstanceID: "cp-a", OwnerEpoch: 1},
+			},
+		},
+	}
+	lifecycleStore := &fakeLifecycleStore{terminalReturn: true}
+	janitor := NewControlPlaneJanitor(store, 10*time.Millisecond, 20*time.Second)
+	janitor.lifecycle = NewWorkerLifecycle(lifecycleStore, &fakePhysicalCleanup{})
+
+	janitor.runOnce()
+
+	if len(lifecycleStore.terminalTransitions) != 0 {
+		t.Fatalf("unwired caps must retire nothing, got %#v", lifecycleStore.terminalTransitions)
+	}
+}
+
+// The multitenant.go wiring builds the caps map from the config snapshot via
+// orgHotIdleLimitsFromSnapshot — pin the glue: orgs without limits drop out,
+// an org's own default profile wins, and a default-less org falls back to the
+// CP-global shape (the zero-shape bug's fix).
+func TestOrgHotIdleLimitsFromSnapshot(t *testing.T) {
+	if got := orgHotIdleLimitsFromSnapshot(nil, "15", "120Gi"); got != nil {
+		t.Fatalf("nil snapshot must yield nil, got %v", got)
+	}
+	snap := &configstore.Snapshot{Orgs: map[string]*configstore.OrgConfig{
+		"acme":     {MaxHotIdleWorkers: 2, DefaultWorkerCPU: "4", DefaultWorkerMemory: "16Gi"},
+		"globex":   {MaxHotIdleCPU: "8"}, // no org default profile at all
+		"uncapped": {},
+		"nilorg":   nil,
+	}}
+	caps := orgHotIdleLimitsFromSnapshot(snap, "15", "120Gi")
+	if len(caps) != 2 {
+		t.Fatalf("want only the two capped orgs, got %v", caps)
+	}
+	acme := caps["acme"]
+	if acme.Workers != 2 || acme.DefaultCPU != "4" || acme.DefaultMemory != "16Gi" {
+		t.Fatalf("acme: org default profile must win: %+v", acme)
+	}
+	globex := caps["globex"]
+	if globex.CPU != "8" || globex.DefaultCPU != "15" || globex.DefaultMemory != "120Gi" {
+		t.Fatalf("globex: shape fallback must reach the CP-global default: %+v", globex)
 	}
 }

@@ -1,15 +1,19 @@
 package main
 
 import (
+	"container/list"
+	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,14 +54,81 @@ var (
 		Name: "cache_proxy_cache_size_bytes",
 		Help: "Current cache size on disk",
 	})
+	cacheEntries = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_entries",
+		Help: "Current committed cache entries represented by the exact index",
+	})
+	cacheEntryLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_entry_limit",
+		Help: "Active committed cache entry limit",
+	})
+	cacheHardEntryLimit = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_hard_entry_limit",
+		Help: "Non-configurable exact-index safety guardrail",
+	})
+	cacheExactIndexEstimatedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_exact_index_estimated_bytes",
+		Help: "Conservative estimated bytes occupied by exact-index metadata and keys",
+	})
+	cacheOwnedBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_owned_bytes",
+		Help: "Committed cache bytes owned and reclaimable by the cache",
+	})
 	cacheCapacityBytes = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "cache_proxy_cache_capacity_bytes",
 		Help: "Maximum cache capacity",
 	})
+	cacheDiskTargetBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_disk_target_bytes",
+		Help: "Configured percentage-of-disk cache target before free-space clamping",
+	})
+	cacheDiskReserveBytes = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_disk_reserve_bytes",
+		Help: "Whole-filesystem reserve excluded from cache capacity",
+	})
+	cacheEntryLimitReason = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "cache_proxy_cache_entry_limit_reason",
+		Help: "Future derived entry-limit bottleneck; exactly one of disk or metadata is 1",
+	}, []string{"reason"})
 	cacheEvictionsTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "cache_proxy_evictions_total",
 		Help: "Number of LRU cache evictions",
 	})
+	cacheEvictionsByPhaseReasonTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "cache_proxy_evictions_by_phase_reason_total",
+		Help: "Committed cache-entry evictions by bounded phase and pressure reason",
+	}, []string{"phase", "reason"})
+	cacheStartupScanDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "cache_proxy_cache_startup_scan_duration_seconds",
+		Help: "Duration of cache startup scans",
+	})
+	cacheStartupScanFilesInspectedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_cache_startup_scan_files_inspected_total",
+		Help: "Directory entries inspected during cache startup scans",
+	})
+	cacheStartupInvalidFilesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_cache_startup_invalid_files_total",
+		Help: "Invalid or unrelated root-directory entries excluded from cache ownership during startup scans",
+	})
+	cacheTemporaryFilesRemovedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "cache_proxy_cache_temporary_files_removed_total",
+		Help: "Incomplete temporary cache files removed during startup cleanup",
+	})
+)
+
+type cacheEvictionPhase = string
+
+const (
+	cacheEvictionPhaseStartup    cacheEvictionPhase = "startup"
+	cacheEvictionPhaseBackground cacheEvictionPhase = "background"
+	cacheEvictionPhaseRequest    cacheEvictionPhase = "request"
+)
+
+type cacheEvictionReason = string
+
+const (
+	cacheEvictionReasonEntry cacheEvictionReason = "entry"
+	cacheEvictionReasonByte  cacheEvictionReason = "byte"
 )
 
 // CacheKey computes a deterministic cache key from a full URL and byte range.
@@ -70,155 +141,556 @@ func CacheKey(url, rangeHeader string) string {
 }
 
 // DiskCache manages cached S3 responses on local NVMe storage with LRU eviction.
+//
+// Every operation below holds the one mutex, and a production node tracks
+// hundreds of thousands of entries — so each critical section must be O(1).
+// The previous slice-based order ([]cacheEntry with linear scans and splices)
+// put ~half the proxy's CPU into LRU bookkeeping under this lock, serializing
+// all cache traffic behind it.
 type DiskCache struct {
-	dir         string
-	maxBytes    int64
-	currentSize int64
+	dir string
+	// maxBytes is the eviction threshold. The constructor sets it to
+	// maxPercent of the filesystem's TOTAL bytes, and the background refresh
+	// loop (refreshCapacity) lowers it whenever FREE space shrinks so the
+	// cache can never grow into disk it doesn't own. currentSize is the sum
+	// of tracked entry sizes.
+	maxBytes       int64
+	maxEntries     int
+	hardMaxEntries int
+	currentSize    int64
+	maxPercent     int
+	blockSize      int64
+	space          capacityProvider
+
+	// Consecutive above-current samples are required before raising capacity.
+	// Reductions apply immediately to restore the filesystem reserve.
+	recoveryCandidate int64
+	recoverySamples   int
 
 	mu sync.Mutex
-	// access order: most recently used at the end
-	order []cacheEntry
+	// order is the access list: least recently used at the front, most recent
+	// at the back. index maps a key to its element for O(1) touch/drop.
+	order *list.List
+	index map[string]*list.Element
+	// summary is enabled only in summary lookup mode. It mirrors index
+	// mutations incrementally, so snapshot serving never scans the cache index.
+	summary *summaryIndex
+	// renameFile is os.Rename in production and a per-cache failure seam in tests.
+	renameFile func(string, string) error
+	// removeFile is os.Remove in production and a per-cache failure seam in tests.
+	removeFile func(string) error
+	// openScanDirectory is os.Open in production and lets constructor tests
+	// inject directory-open and mid-scan failures deterministically.
+	openScanDirectory openCacheDirectory
+
+	// Durable recency is optional for tests and always enabled by main. Exact
+	// LRU updates remain synchronous; only coarse mtime persistence is queued.
+	recency         *recencyWriter
+	recencyNow      func() time.Time
+	recencyInterval time.Duration
+	// commitMu linearizes the short final rename/accounting/recency commit with
+	// shutdown without coupling lifecycle progress to a potentially blocking
+	// pressure-driven unlink under mu.
+	commitMu sync.Mutex
+
+	convergenceCancel context.CancelFunc
+	convergenceDone   chan struct{}
+	convergenceWake   chan struct{}
+	closing           atomic.Bool
+}
+
+const defaultCacheMaxEntries = 1_000_000
+
+const (
+	defaultCacheBlockSizeBytes       int64 = 8 << 20
+	capacityRecoveryRequiredSamples        = 2
+	defaultConvergenceInterval             = time.Millisecond
+	estimatedExactIndexBytesPerEntry       = 256
+)
+
+type diskSpace struct {
+	TotalBytes int64
+	FreeBytes  int64
+}
+
+type capacityProvider func(string) (diskSpace, error)
+
+type cacheDirectory interface {
+	ReadDir(int) ([]os.DirEntry, error)
+	Close() error
+}
+
+type openCacheDirectory func(string) (cacheDirectory, error)
+
+func openDirectory(path string) (cacheDirectory, error) {
+	return os.Open(path)
 }
 
 type cacheEntry struct {
-	key        string
-	size       int64
-	lastAccess time.Time
+	key                  string
+	size                 int64
+	lastAccess           time.Time
+	lastPersistedRecency time.Time
+	evictionInFlight     bool
 }
 
 // NewDiskCache creates a cache backed by the given directory.
 // maxPercent is the percentage of filesystem capacity to use (e.g. 80).
-func NewDiskCache(dir string, maxPercent int) (*DiskCache, error) {
+func NewDiskCache(dir string, maxPercent int, options ...DiskCacheOptions) (*DiskCache, error) {
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 
-	// Recreate the temp dir from scratch so any half-written streams left by a
-	// crash don't linger and leak disk.
-	tmpDir := filepath.Join(dir, tmpSubdir)
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0750); err != nil {
-		return nil, fmt.Errorf("create cache temp dir: %w", err)
+	dc := &DiskCache{
+		dir: dir,
+		// Startup must account for committed files before applying a byte
+		// ceiling, so scans initially load without byte pruning.
+		maxBytes:          math.MaxInt64,
+		maxEntries:        defaultCacheMaxEntries,
+		hardMaxEntries:    int(cacheMetadataEntryLimit),
+		maxPercent:        maxPercent,
+		blockSize:         defaultCacheBlockSizeBytes,
+		space:             statfsDiskSpace,
+		order:             list.New(),
+		index:             make(map[string]*list.Element),
+		renameFile:        os.Rename,
+		removeFile:        os.Remove,
+		openScanDirectory: openDirectory,
+		recencyNow:        time.Now,
+		recencyInterval:   defaultRecencyGranularity,
+	}
+	var option DiskCacheOptions
+	if len(options) > 0 {
+		option = options[0]
+		if option.MaxEntries > 0 {
+			dc.maxEntries = option.MaxEntries
+		}
+		if option.BlockSizeBytes > 0 {
+			dc.blockSize = option.BlockSizeBytes
+		}
+		if option.CapacityProvider != nil {
+			dc.space = option.CapacityProvider
+		}
+		if option.openScanDirectory != nil {
+			dc.openScanDirectory = option.openScanDirectory
+		}
+		if option.removeFile != nil {
+			dc.removeFile = option.removeFile
+		}
+		if option.hardMaxEntries > 0 {
+			dc.hardMaxEntries = option.hardMaxEntries
+		}
+		if option.recencyNow != nil {
+			dc.recencyNow = option.recencyNow
+		}
+		if option.recencyInterval > 0 {
+			dc.recencyInterval = option.recencyInterval
+		}
+	}
+	if dc.maxEntries > dc.hardMaxEntries {
+		dc.maxEntries = dc.hardMaxEntries
 	}
 
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(dir, &stat); err != nil {
+	startupContext := option.startupContext
+	if startupContext == nil {
+		startupContext = context.Background()
+	}
+	removedTemporaryFiles, err := resetTemporaryDirectory(startupContext, filepath.Join(dir, tmpSubdir))
+	if err != nil {
+		return nil, fmt.Errorf("reset cache temp dir: %w", err)
+	}
+	if removedTemporaryFiles > 0 {
+		cacheTemporaryFilesRemovedTotal.Add(float64(removedTemporaryFiles))
+	}
+
+	// Complete enumeration and the exceptional hard-cap survivor pass before
+	// sampling free space. No soft-target deletion occurs during startup.
+	ownedBytes, err := dc.scanExistingContext(startupContext)
+	if err != nil {
+		return nil, fmt.Errorf("scan existing cache entries: %w", err)
+	}
+	startupSpace, err := dc.diskSpace()
+	if err != nil {
 		return nil, fmt.Errorf("statfs %s: %w", dir, err)
 	}
+	if err := dc.initializeCapacity(ownedBytes, startupSpace); err != nil {
+		return nil, fmt.Errorf("apply startup cache limits: %w", err)
+	}
+	if option.IncrementalSummary {
+		summaryCapacity := fixedSummaryBloomCapacity()
+		if option.DynamicSummary {
+			diskTarget := deriveDiskCapacity(startupSpace.TotalBytes, startupSpace.FreeBytes, ownedBytes, dc.maxPercent).DiskTargetBytes
+			summaryCapacity = deriveBloomCapacity(diskTarget, dc.blockSize)
+			if !validSummaryBloomCapacity(summaryCapacity) {
+				return nil, errors.New("derive dynamic Bloom capacity: cache disk target and block size must produce a non-zero layout")
+			}
+		}
+		if option.SummaryMemoryLimitBytes > 0 {
+			if err := validateSummaryMemoryLimit(option.SummaryMemoryLimitBytes, summaryCapacity); err != nil {
+				return nil, err
+			}
+		}
+		dc.summary = newSummaryIndexWithParams(summaryCapacity.BitCount, summaryCapacity.Hashes, int(summaryCapacity.DesignEntries))
+		// The disk target is not known until after the bounded startup scan and
+		// statfs sample. Rehash the already bounded exact index once into the
+		// selected fixed or dynamic layout so restart snapshots cannot omit keys.
+		rehashed := 0
+		for element := dc.order.Front(); element != nil; element = element.Next() {
+			if rehashed%startupScanChunkSize == 0 {
+				if option.summaryRehashHook != nil {
+					option.summaryRehashHook(rehashed)
+				}
+				if err := startupContext.Err(); err != nil {
+					return nil, fmt.Errorf("rebuild startup Bloom summary: %w", err)
+				}
+			}
+			dc.summary.Add(element.Value.(*cacheEntry).key)
+			rehashed++
+		}
+	}
 
-	totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
-	maxBytes := totalBytes * int64(maxPercent) / 100
+	if option.DurableRecency {
+		dc.recency = newRecencyWriter(dir, option.recencyQueueCapacity, option.recencyWorkerCount, option.recencyChtimes)
+	}
+	if option.convergencePermits != nil || option.BackgroundConvergence {
+		dc.startConvergence(startupContext, option.convergencePermits, option.convergenceInterval)
+	}
 
 	slog.Info("Cache initialized.",
 		"dir", dir,
-		"total_disk", totalBytes,
-		"max_cache", maxBytes,
+		"max_cache", dc.maxBytes,
 		"max_percent", maxPercent,
 	)
-
-	cacheCapacityBytes.Set(float64(maxBytes))
-
-	dc := &DiskCache{
-		dir:      dir,
-		maxBytes: maxBytes,
-	}
-
-	// Scan existing cache entries
-	dc.scanExisting()
 
 	return dc, nil
 }
 
-func (c *DiskCache) scanExisting() {
-	entries, err := os.ReadDir(c.dir)
-	if err != nil {
-		return
+type DiskCacheOptions struct {
+	IncrementalSummary      bool
+	DynamicSummary          bool
+	SummaryMemoryLimitBytes int64
+	DurableRecency          bool
+	BackgroundConvergence   bool
+	MaxEntries              int
+	BlockSizeBytes          int64
+	CapacityProvider        capacityProvider
+	openScanDirectory       openCacheDirectory
+	removeFile              func(string) error
+	hardMaxEntries          int
+	startupContext          context.Context
+	summaryRehashHook       func(int)
+	recencyNow              func() time.Time
+	recencyChtimes          recencyPersistence
+	recencyInterval         time.Duration
+	recencyQueueCapacity    int
+	recencyWorkerCount      int
+	convergencePermits      <-chan struct{}
+	convergenceInterval     time.Duration
+}
+
+// Close stops background convergence and drains accepted durable-recency work
+// until ctx expires. It is safe to call more than once.
+func (c *DiskCache) Close(ctx context.Context) error {
+	c.closing.Store(true)
+	if c.convergenceCancel != nil {
+		c.convergenceCancel()
 	}
+	// A commit that already passed its closing check publishes its recency intent
+	// before writer admission closes. Eviction syscalls never hold this gate, so
+	// shutdown is not trapped behind a stalled unlink.
+	c.commitMu.Lock()
+	var recencyDone <-chan struct{}
+	if c.recency != nil {
+		recencyDone = c.recency.beginClose()
+	}
+	c.commitMu.Unlock()
+	if c.convergenceDone != nil {
+		select {
+		case <-c.convergenceDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if recencyDone != nil {
+		select {
+		case <-recencyDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (c *DiskCache) waitForRecencyIdle(ctx context.Context) error {
+	if c.recency == nil {
+		return nil
+	}
+	return c.recency.waitIdle(ctx)
+}
+
+// clampToFree remains a narrow compatibility helper for callers that have no
+// owned-cache total. DiskCache itself always uses deriveDiskCapacity instead.
+func clampToFree(target, totalBytes, freeBytes int64) int64 {
+	reserve := percentageOf(nonNegative(totalBytes), cacheDiskReservePercent)
+	if avail := freeBytes - reserve; target > avail {
+		target = avail
+	}
+	if target < 0 {
+		target = 0
+	}
+	return target
+}
+
+// refreshCapacityStats recomputes maxBytes from live disk state. Valid
+// committed files are reclaimable cache-owned bytes, unlike invalid and
+// unrelated files. Capacity reductions are immediate to restore the 5%
+// reserve; capacity recovery requires two consecutive healthy samples to keep
+// short-lived external writers from flapping the advertised ceiling.
+func (c *DiskCache) refreshCapacityStats(maxPercent int) (int64, int64, bool) {
+	space, err := c.diskSpace()
+	if err != nil {
+		return 0, 0, false
+	}
+
+	c.mu.Lock()
+	capacity := deriveDiskCapacity(space.TotalBytes, space.FreeBytes, c.currentSize, maxPercent)
+	c.applyCapacityLocked(capacity)
+	max := c.maxBytes
+	c.mu.Unlock()
+	return space.TotalBytes, max, true
+}
+
+// refreshCapacity periodically re-derives maxBytes from live statfs data so a
+// disk that fills up from outside the cache shrinks the cache instead of the
+// cache ENOSPC-ing after evicting healthy entries for room it never had.
+func (c *DiskCache) refreshCapacity(maxPercent int) {
+	c.refreshCapacityStats(maxPercent)
+}
+
+func (c *DiskCache) initializeCapacity(ownedBytes int64, space diskSpace) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	capacity := deriveDiskCapacity(space.TotalBytes, space.FreeBytes, ownedBytes, c.maxPercent)
+	c.maxBytes = capacity.ByteCeiling
+	c.recoveryCandidate = 0
+	c.recoverySamples = 0
+	c.updateCapacityMetricsLocked(capacity)
+	c.updateStateMetricsLocked()
+	return nil
+}
 
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+func (c *DiskCache) applyCapacityLocked(capacity diskCapacity) {
+	oldMax := c.maxBytes
+	newMax := capacity.ByteCeiling
+	switch {
+	case newMax < oldMax:
+		c.maxBytes = newMax
+		c.recoveryCandidate = 0
+		c.recoverySamples = 0
+		slog.Warn("Cache capacity lowered to fit live disk pressure.",
+			"old_max", oldMax, "new_max", newMax, "owned_bytes", c.currentSize)
+	case newMax > oldMax:
+		if newMax >= c.recoveryCandidate {
+			c.recoveryCandidate = newMax
+			c.recoverySamples++
+		} else {
+			c.recoveryCandidate = newMax
+			c.recoverySamples = 1
 		}
-		// Only count real cache entries — the .tmp dir's contents and any
-		// stray non-key files must not enter the LRU accounting.
-		if !IsValidCacheKey(e.Name()) {
-			continue
+		if c.recoverySamples >= capacityRecoveryRequiredSamples {
+			c.maxBytes = newMax
+			c.recoveryCandidate = 0
+			c.recoverySamples = 0
+			slog.Info("Cache capacity recovered after stable disk samples.", "old_max", oldMax, "new_max", newMax)
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		c.order = append(c.order, cacheEntry{
-			key:        e.Name(),
-			size:       info.Size(),
-			lastAccess: info.ModTime(),
-		})
-		c.currentSize += info.Size()
+	default:
+		c.recoveryCandidate = 0
+		c.recoverySamples = 0
 	}
+	c.updateCapacityMetricsLocked(capacity)
+	c.updateStateMetricsLocked()
+}
+
+func (c *DiskCache) updateCapacityMetricsLocked(capacity diskCapacity) {
+	cacheCapacityBytes.Set(float64(c.maxBytes))
+	cacheDiskTargetBytes.Set(float64(capacity.DiskTargetBytes))
+	cacheDiskReserveBytes.Set(float64(capacity.ReserveBytes))
+
+	// The active admission ceiling remains the compatibility 1M value in PR 1.
+	// These two reason series describe which guardrail would limit the future
+	// disk-derived ceiling, keeping the rollout observable before enabling it.
+	if deriveCacheEntryCeiling(capacity.ByteCeiling, c.blockSize) >= cacheMetadataEntryLimit {
+		cacheEntryLimitReason.WithLabelValues("disk").Set(0)
+		cacheEntryLimitReason.WithLabelValues("metadata").Set(1)
+	} else {
+		cacheEntryLimitReason.WithLabelValues("disk").Set(1)
+		cacheEntryLimitReason.WithLabelValues("metadata").Set(0)
+	}
+}
+
+func (c *DiskCache) updateStateMetricsLocked() {
 	cacheSizeBytes.Set(float64(c.currentSize))
+	cacheOwnedBytes.Set(float64(c.currentSize))
+	cacheEntries.Set(float64(c.order.Len()))
+	cacheEntryLimit.Set(float64(c.maxEntries))
+	cacheHardEntryLimit.Set(float64(c.hardMaxEntries))
+	cacheExactIndexEstimatedBytes.Set(float64(c.order.Len()) * estimatedExactIndexBytesPerEntry)
+	c.updateConvergenceMetricsLocked()
 }
 
-// Has returns true if the cache contains the given key.
-func (c *DiskCache) Has(key string) bool {
-	if !IsValidCacheKey(key) {
-		return false
+func (c *DiskCache) diskSpace() (diskSpace, error) {
+	if c.space == nil {
+		return diskSpace{}, errors.New("no disk capacity provider")
 	}
-	path := filepath.Join(c.dir, key)
-	_, err := os.Stat(path)
-	return err == nil
+	return c.space(c.dir)
 }
 
-// Get returns the cached data for the given key, or nil if not found.
-func (c *DiskCache) Get(key string) ([]byte, bool) {
-	if !IsValidCacheKey(key) {
-		return nil, false
+func statfsDiskSpace(dir string) (diskSpace, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(dir, &stat); err != nil {
+		return diskSpace{}, err
 	}
-	path := filepath.Join(c.dir, key)
-	data, err := os.ReadFile(path)
+	blockSize := uint64(stat.Bsize)
+	return diskSpace{
+		TotalBytes: filesystemBytes(stat.Blocks, blockSize),
+		FreeBytes:  filesystemBytes(stat.Bavail, blockSize),
+	}, nil
+}
+
+func filesystemBytes(blocks, blockSize uint64) int64 {
+	if blocks == 0 || blockSize == 0 {
+		return 0
+	}
+	if blocks > uint64(math.MaxInt64)/blockSize {
+		return math.MaxInt64
+	}
+	return int64(blocks * blockSize)
+}
+
+func resetTemporaryDirectory(ctx context.Context, tmpDir string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	removed, err := removeTemporaryTree(ctx, tmpDir)
 	if err != nil {
-		return nil, false
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(tmpDir, 0750); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
+
+// removeTemporaryTree is the cancellation-aware equivalent of RemoveAll for
+// the private staging directory. It never follows symlinks and checks the
+// startup context before each filesystem operation, so a large interrupted
+// fill tree cannot delay SIGTERM until the entire cleanup finishes.
+func removeTemporaryTree(ctx context.Context, path string) (int, error) {
+	return removeTemporaryTreeWith(ctx, path, openDirectory)
+}
+
+func removeTemporaryTreeWith(ctx context.Context, path string, openDir openCacheDirectory) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		return 1, nil
 	}
 
+	removed := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		dir, err := openDir(path)
+		if err != nil {
+			return 0, err
+		}
+		entries, readErr := dir.ReadDir(startupScanChunkSize)
+		closeErr := dir.Close()
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if closeErr != nil {
+			return 0, closeErr
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return 0, readErr
+		}
+		if len(entries) == 0 {
+			break
+		}
+		for _, entry := range entries {
+			count, err := removeTemporaryTreeWith(ctx, filepath.Join(path, entry.Name()), openDir)
+			if err != nil {
+				return 0, err
+			}
+			removed += count
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return 0, err
+	}
+	return removed, nil
+}
+
+// SummarySnapshot returns an immutable bounded copy of the locally maintained
+// Bloom bits. It does not scan or lock the cache index.
+func (c *DiskCache) SummarySnapshot() (items int, bits []byte, ok bool) {
+	if c.summary == nil {
+		return 0, nil, false
+	}
+	items, bits = c.summary.Snapshot()
+	return items, bits, true
+}
+
+func (c *DiskCache) SummaryBloomCapacity() bloomCapacity {
+	if c.summary == nil {
+		return bloomCapacity{}
+	}
+	c.summary.mu.RLock()
+	defer c.summary.mu.RUnlock()
+	return bloomCapacity{
+		DesignEntries: int64(c.summary.targetItems),
+		BitCount:      c.summary.bitCount,
+		Hashes:        c.summary.hashes,
+	}
+}
+
+// Has returns true if the key is a tracked cache entry. It answers from the
+// in-memory index under the mutex — not the filesystem — so "has it" always
+// agrees with what eviction and size accounting believe, and costs no syscall.
+func (c *DiskCache) Has(key string) bool {
+	c.mu.Lock()
+	_, ok := c.index[key]
+	c.mu.Unlock()
+	return ok
+}
+
+// Touch marks a key as most recently used without serving it. HandlePeerHas
+// uses it: a peer /cache/has probe counts as an access, so an entry that is
+// popular with peers is not evicted as "least recently used" while it is in
+// fact one of the busiest blocks on the node.
+func (c *DiskCache) Touch(key string) {
 	c.mu.Lock()
 	c.touchLocked(key)
 	c.mu.Unlock()
-
-	cacheHitsTotal.Inc()
-	return data, true
-}
-
-// Put stores data in the cache, evicting old entries if needed.
-func (c *DiskCache) Put(key string, data []byte) error {
-	if !IsValidCacheKey(key) {
-		return fmt.Errorf("invalid cache key")
-	}
-	size := int64(len(data))
-
-	c.mu.Lock()
-	// Evict until we have space
-	for c.currentSize+size > c.maxBytes && len(c.order) > 0 {
-		c.evictOldest()
-	}
-	c.mu.Unlock()
-
-	path := filepath.Join(c.dir, key)
-	if err := os.WriteFile(path, data, 0640); err != nil {
-		return fmt.Errorf("write cache entry: %w", err)
-	}
-
-	c.mu.Lock()
-	c.order = append(c.order, cacheEntry{
-		key:        key,
-		size:       size,
-		lastAccess: time.Now(),
-	})
-	c.currentSize += size
-	cacheSizeBytes.Set(float64(c.currentSize))
-	c.mu.Unlock()
-
-	return nil
 }
 
 // PutStream stores data from r under key without buffering the whole body in
@@ -230,7 +702,9 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 	if !IsValidCacheKey(key) {
 		return 0, fmt.Errorf("invalid cache key")
 	}
-
+	if c.closing.Load() {
+		return 0, errors.New("cache is closed for writes")
+	}
 	tmp, err := os.CreateTemp(filepath.Join(c.dir, tmpSubdir), key+"-*")
 	if err != nil {
 		return 0, fmt.Errorf("create temp: %w", err)
@@ -247,35 +721,64 @@ func (c *DiskCache) PutStream(key string, r io.Reader) (int64, error) {
 		return 0, closeErr
 	}
 
-	// Now that the actual size is known, drop any prior accounting for this key
-	// (the rename below overwrites it) and evict to make room.
-	c.mu.Lock()
-	c.dropLocked(key)
-	for c.currentSize+size > c.maxBytes && len(c.order) > 0 {
-		c.evictOldest()
-	}
-	c.mu.Unlock()
-
 	path := filepath.Join(c.dir, key)
-	if err := os.Rename(tmpPath, path); err != nil {
+	renameFile := c.renameFile
+	if renameFile == nil {
+		renameFile = os.Rename
+	}
+	// Make the local metadata rename and its index/Bloom bookkeeping one atomic
+	// commit. Streaming happened above without this lock; only the short rename
+	// syscall is serialized so eviction cannot delete the replacement in between.
+	c.mu.Lock()
+	if c.closing.Load() {
+		c.mu.Unlock()
+		_ = os.Remove(tmpPath)
+		return 0, errors.New("cache is closed for writes")
+	}
+	el, replacing := c.index[key]
+	if replacing {
+		if !c.makeRoomForReplacementLocked(el, size, cacheEvictionPhaseRequest) {
+			c.mu.Unlock()
+			_ = os.Remove(tmpPath)
+			return 0, errors.New("admit cache replacement: required eviction failed")
+		}
+	} else {
+		if !c.makeRoomForNewEntryLocked(size, cacheEvictionPhaseRequest) {
+			c.mu.Unlock()
+			_ = os.Remove(tmpPath)
+			return 0, errors.New("admit cache entry: required eviction failed")
+		}
+	}
+	c.commitMu.Lock()
+	if c.closing.Load() {
+		c.commitMu.Unlock()
+		c.mu.Unlock()
+		_ = os.Remove(tmpPath)
+		return 0, errors.New("cache is closed for writes")
+	}
+	if err := renameFile(tmpPath, path); err != nil {
+		c.commitMu.Unlock()
+		c.mu.Unlock()
 		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("commit cache entry: %w", err)
 	}
 
-	c.mu.Lock()
-	// dropLocked again before appending: in production singleFlight serializes
-	// writes per key so the earlier drop is enough, but guarding here keeps the
-	// "one entry per key" invariant (and currentSize) correct even if some
-	// future caller writes the same key concurrently — a duplicate entry would
-	// otherwise permanently inflate currentSize.
-	c.dropLocked(key)
-	c.order = append(c.order, cacheEntry{
-		key:        key,
-		size:       size,
-		lastAccess: time.Now(),
-	})
-	c.currentSize += size
-	cacheSizeBytes.Set(float64(c.currentSize))
+	if replacing {
+		// The key remained represented throughout the filesystem commit. Update
+		// its accounting in place so a concurrent Bloom snapshot can never see a
+		// transient negative for an already committed entry.
+		entry := el.Value.(*cacheEntry)
+		c.currentSize += size - entry.size
+		entry.size = size
+		now := c.now()
+		entry.lastAccess = now
+		c.order.MoveToBack(el)
+		c.queueRecencyLocked(entry, now, true)
+		c.updateStateMetricsLocked()
+	} else {
+		c.addLocked(key, size)
+	}
+	c.commitMu.Unlock()
 	c.mu.Unlock()
 
 	return size, nil
@@ -292,9 +795,9 @@ func (c *DiskCache) Open(key string) (io.ReadCloser, int64, bool) {
 	return f, size, true
 }
 
-// openFile opens a cached entry WITHOUT recording a hit. Used to serve a body
-// that was just fetched on a miss — that path already counted a miss, so
-// counting it as a hit too would double-count.
+// openFile opens and touches a cached entry WITHOUT recording a worker-facing
+// hit. It serves bodies just fetched on a miss and peer API reads; neither is a
+// local hit for the requesting worker.
 func (c *DiskCache) openFile(key string) (io.ReadCloser, int64, bool) {
 	if !IsValidCacheKey(key) {
 		return nil, 0, false
@@ -317,47 +820,186 @@ func (c *DiskCache) openFile(key string) (io.ReadCloser, int64, bool) {
 	return f, info.Size(), true
 }
 
+// touchLocked marks key as most recently used. No-op if the key isn't
+// tracked. Caller holds c.mu.
 func (c *DiskCache) touchLocked(key string) {
-	for i := range c.order {
-		if c.order[i].key == key {
-			c.order[i].lastAccess = time.Now()
-			// Move to end (most recent)
-			entry := c.order[i]
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			c.order = append(c.order, entry)
-			return
-		}
+	el, ok := c.index[key]
+	if !ok {
+		return
 	}
+	entry := el.Value.(*cacheEntry)
+	now := c.now()
+	entry.lastAccess = now
+	c.order.MoveToBack(el)
+	c.queueRecencyLocked(entry, now, false)
+}
+
+func (c *DiskCache) now() time.Time {
+	if c.recencyNow == nil {
+		return time.Now()
+	}
+	return c.recencyNow()
+}
+
+func (c *DiskCache) queueRecencyLocked(entry *cacheEntry, timestamp time.Time, force bool) {
+	if c.recency == nil {
+		return
+	}
+	interval := c.recencyInterval
+	if interval <= 0 {
+		interval = defaultRecencyGranularity
+	}
+	bucket := timestamp
+	if !force {
+		cacheRecencyTouchAttemptsTotal.Inc()
+		bucket = timestamp.Truncate(interval)
+	}
+	if !force && !bucket.After(entry.lastPersistedRecency) {
+		cacheRecencyTouchCoalescedTotal.Inc()
+		return
+	}
+	_ = c.recency.submit(entry.key, bucket)
+	// A dropped update intentionally degrades only this bucket's restart
+	// accuracy. Recording the attempt prevents a hot overflowed key from
+	// contending on the bounded writer for every hit; the next bucket retries.
+	entry.lastPersistedRecency = bucket
 }
 
 // dropLocked removes any accounting for key (used when an overwrite is about to
 // replace the file under it) so currentSize doesn't double-count. No-op if the
 // key isn't tracked. Caller holds c.mu.
 func (c *DiskCache) dropLocked(key string) {
-	for i := range c.order {
-		if c.order[i].key == key {
-			c.currentSize -= c.order[i].size
-			c.order = append(c.order[:i], c.order[i+1:]...)
-			return
-		}
+	el, ok := c.index[key]
+	if !ok {
+		return
+	}
+	c.currentSize -= el.Value.(*cacheEntry).size
+	c.order.Remove(el)
+	delete(c.index, key)
+	if c.summary != nil {
+		c.summary.Remove(key)
 	}
 }
 
-func (c *DiskCache) evictOldest() {
-	if len(c.order) == 0 {
-		return
+// addLocked records a freshly written entry as most recently used, replacing
+// any prior entry for the key so "one entry per key" (and currentSize) holds.
+// Caller holds c.mu.
+func (c *DiskCache) addLocked(key string, size int64) {
+	c.dropLocked(key)
+	now := c.now()
+	entry := &cacheEntry{
+		key:        key,
+		size:       size,
+		lastAccess: now,
 	}
+	c.index[key] = c.order.PushBack(entry)
+	c.currentSize += size
+	if c.summary != nil {
+		c.summary.Add(key)
+	}
+	c.queueRecencyLocked(entry, now, true)
+	c.updateStateMetricsLocked()
+}
 
-	// Sort by last access, evict the oldest
-	sort.Slice(c.order, func(i, j int) bool {
-		return c.order[i].lastAccess.Before(c.order[j].lastAccess)
-	})
-
-	oldest := c.order[0]
+// evictOldest removes the least recently used entry. The list front is the
+// LRU entry by construction: adds and touches always move entries to the
+// back, and scanExisting seeds the list in recency order.
+func (c *DiskCache) evictOldest(phase cacheEvictionPhase, reason cacheEvictionReason) error {
+	front := c.oldestEvictableLocked()
+	if front == nil {
+		return errors.New("no cache entry available for eviction")
+	}
+	oldest := front.Value.(*cacheEntry)
 	path := filepath.Join(c.dir, oldest.key)
-	_ = os.Remove(path)
-	c.currentSize -= oldest.size
-	c.order = c.order[1:]
-	cacheEvictionsTotal.Inc()
-	cacheSizeBytes.Set(float64(c.currentSize))
+	if _, err := c.removeCommittedFile(path, phase, reason); err != nil {
+		return err
+	}
+	c.forgetEntryLocked(front)
+	return nil
+}
+
+func (c *DiskCache) oldestEvictableLocked() *list.Element {
+	for candidate := c.order.Front(); candidate != nil; candidate = candidate.Next() {
+		if !candidate.Value.(*cacheEntry).evictionInFlight {
+			return candidate
+		}
+	}
+	return nil
+}
+
+func (c *DiskCache) forgetEntryLocked(element *list.Element) {
+	entry := element.Value.(*cacheEntry)
+	c.currentSize -= entry.size
+	c.order.Remove(element)
+	delete(c.index, entry.key)
+	if c.summary != nil {
+		c.summary.Remove(entry.key)
+	}
+	c.updateStateMetricsLocked()
+}
+
+func (c *DiskCache) makeRoomForNewEntryLocked(size int64, phase cacheEvictionPhase) bool {
+	if c.order.Len() == 0 {
+		return true
+	}
+	// Byte capacity protects the filesystem reserve and remains strict on the
+	// request path. In block mode this normally removes one equal-sized block;
+	// the loop also handles short tail blocks without admitting above capacity.
+	for c.currentSize+size > c.maxBytes && c.order.Len() > 0 {
+		if c.evictOldest(phase, cacheEvictionReasonByte) != nil {
+			return false
+		}
+	}
+	// Entry count is a soft convergence target. At or above it, perform only a
+	// net-neutral one-for-one swap rather than collapsing restart overage here.
+	if c.order.Len() >= c.maxEntries && c.order.Len() > 0 {
+		if c.evictOldest(phase, cacheEvictionReasonEntry) != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *DiskCache) makeRoomForReplacementLocked(replacement *list.Element, size int64, phase cacheEvictionPhase) bool {
+	entry := replacement.Value.(*cacheEntry)
+	if entry.evictionInFlight {
+		return false
+	}
+	// Protect the entry being replaced from eviction. If reservation or rename
+	// fails, its old committed body and accounting remain usable.
+	c.order.MoveToBack(replacement)
+	projectedSize := c.currentSize - entry.size + size
+	// A replacement is count-neutral. Only evict one unrelated LRU entry when
+	// the replacement itself would make byte pressure worse; the background
+	// worker handles any pre-existing overage at its bounded rate.
+	for projectedSize > c.maxBytes && c.order.Len() > 1 {
+		if c.evictOldest(phase, cacheEvictionReasonByte) != nil {
+			return false
+		}
+		projectedSize = c.currentSize - entry.size + size
+	}
+	return true
+}
+
+// removeCommittedFile is the one filesystem deletion path for valid cache
+// files under pressure. A successful unlink is always visible in both the
+// aggregate eviction counter and its bounded phase/reason breakdown. A file
+// already removed by an external actor is forgotten without claiming an
+// eviction; a hard unlink failure preserves its index accounting.
+func (c *DiskCache) removeCommittedFile(path string, phase cacheEvictionPhase, reason cacheEvictionReason) (bool, error) {
+	removeFile := c.removeFile
+	if removeFile == nil {
+		removeFile = os.Remove
+	}
+	err := removeFile(path)
+	if err == nil {
+		cacheEvictionsTotal.Inc()
+		cacheEvictionsByPhaseReasonTotal.WithLabelValues(string(phase), string(reason)).Inc()
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	slog.Warn("Unable to evict committed cache file.", "path", path, "phase", phase, "reason", reason, "error", err)
+	return false, err
 }

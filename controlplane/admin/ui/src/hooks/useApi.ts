@@ -11,25 +11,31 @@ import {
   type UseQueryOptions,
 } from "@tanstack/react-query";
 import { api, ApiError } from "@/lib/api";
+import { orgLabel } from "@/lib/format";
 import { POLL } from "@/lib/query";
 import { useRevealedCount } from "@/lib/logReplay";
+import { warehouseNeedsPolling } from "@/lib/warehouseLifecycle";
 import { useIdentity } from "@/components/IdentityProvider";
 import type {
   AuditEntry,
   ClusterStatus,
   ClusterSummary,
   CreateUserBody,
+  DailyUsageResponse,
+  DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
   ErrorEntry,
   ErrorFilters,
   FleetStat,
+  HotIdleOrg,
   ImpersonateBody,
   ManagedWarehouse,
   Me,
   MetricsPanels,
   ModelListing,
   ModelSummary,
+  MonthlyUsageResponse,
   Operator,
   Org,
   OrgTeam,
@@ -47,6 +53,7 @@ import type {
   SessionStatus,
   StartReshardBody,
   UpdateUserBody,
+  WarehouseStatusResult,
   WorkerStatus,
 } from "@/types/api";
 
@@ -115,6 +122,8 @@ export function useOrgs() {
   return useQuery<Org[]>({
     queryKey: ["orgs"],
     queryFn: () => tolerate404<Org[]>([])(api.listOrgs()),
+    refetchInterval: (q) =>
+      q.state.data?.some((org) => warehouseNeedsPolling(org.warehouse?.state)) ? POLL.normal : false,
   });
 }
 
@@ -124,6 +133,23 @@ export function useOrg(id: string | undefined) {
     queryFn: () => api.getOrg(id!),
     enabled: !!id,
   });
+}
+
+// useOrgLabels resolves an org id (org.name / team.org_id / worker.org / …)
+// to its human-readable label from orgLabel(): the database_name (preferred)
+// or hostname_alias. Returns a Map keyed by org id so a detail page where the
+// underlying list row only carries a bare org-id string can still render the
+// readable name. Falls back gracefully (no entry) when the org lookup 404s —
+// callers render the raw id in that case.
+export function useOrgLabels(): Map<string, string> {
+  const orgs = useOrgs();
+  return useMemo(() => {
+    const m = new Map<string, string>();
+    for (const o of orgs.data ?? []) {
+      m.set(o.name, orgLabel(o));
+    }
+    return m;
+  }, [orgs.data]);
 }
 
 export function useUpdateOrg(id: string) {
@@ -149,6 +175,7 @@ export function useWarehouse(id: string | undefined) {
     queryKey: ["orgs", id, "warehouse"],
     queryFn: () => tolerate404<ManagedWarehouse | null>(null)(api.getWarehouse(id!)),
     enabled: !!id,
+    refetchInterval: (q) => (warehouseNeedsPolling(q.state.data?.state) ? POLL.normal : false),
   });
 }
 
@@ -171,6 +198,34 @@ export function useDeprovisionWarehouse(id: string) {
       qc.invalidateQueries({ queryKey: ["orgs", id, "warehouse"] });
       qc.invalidateQueries({ queryKey: ["orgs"] });
     },
+  });
+}
+
+// No useProvisionWarehouse mutation hook: the AddOrgDialog calls
+// api.provisionWarehouse directly so the 202 payload — which carries the
+// one-time root password — never sits in the TanStack Query cache.
+
+// GET /orgs/:id/warehouse/status — provisioning lifecycle watch. Pass a
+// refetchInterval to follow an in-flight provision.
+export function useWarehouseStatus(id: string | undefined, opts?: { refetchInterval?: number | false }) {
+  return useQuery<WarehouseStatusResult>({
+    queryKey: ["warehouse-status", id],
+    queryFn: () => api.warehouseStatus(id!),
+    enabled: !!id,
+    refetchInterval: opts?.refetchInterval ?? false,
+    retry: 1,
+  });
+}
+
+// GET /database-name/check — availability probe for the provision form.
+// Debounced/disabled by the caller via `enabled`.
+export function useDatabaseNameAvailable(name: string, enabled: boolean) {
+  return useQuery<DatabaseNameCheck>({
+    queryKey: ["database-name-check", name],
+    queryFn: () => api.checkDatabaseName(name),
+    enabled: enabled && name.trim() !== "",
+    retry: 1,
+    staleTime: 30_000,
   });
 }
 
@@ -420,6 +475,15 @@ export function useFleet() {
   });
 }
 
+// Hot-idle pool reporting: which orgs hold parked workers + their caps.
+export function useHotIdle() {
+  return useQuery<HotIdleOrg[]>({
+    queryKey: ["hot-idle"],
+    queryFn: () => tolerate404<HotIdleOrg[]>([])(api.hotIdle()),
+    refetchInterval: POLL.normal,
+  });
+}
+
 // ---- metrics ----
 
 export function useMetricsPanels() {
@@ -519,6 +583,31 @@ export function useAudit(params: { actor?: string; org?: string }) {
     queryKey: ["audit", params.actor ?? "", params.org ?? ""],
     queryFn: () =>
       tolerate404<AuditEntry[]>([])(api.audit({ actor: params.actor, org: params.org, limit: 500 })),
+  });
+}
+
+// ---- monthly usage (the Usage page) ----
+
+// Monthly per-team usage over the retained billing buffer. The endpoint is
+// RequireAdmin (per-team cost data), so the query only fires for admins —
+// viewers never spend a 403 round-trip.
+export function useMonthlyUsage(months: number) {
+  const { isAdmin } = useIdentity();
+  return useQuery<MonthlyUsageResponse>({
+    queryKey: ["usage", "monthly", months],
+    queryFn: () => api.monthlyUsage(months),
+    enabled: isAdmin,
+  });
+}
+
+// One org's daily per-team usage series for the org detail page's charts.
+// RequireAdmin like the monthly endpoint — fires for admins only.
+export function useOrgDailyUsage(orgId: string, days: number) {
+  const { isAdmin } = useIdentity();
+  return useQuery<DailyUsageResponse>({
+    queryKey: ["usage", "daily", orgId, days],
+    queryFn: () => api.orgDailyUsage(orgId, days),
+    enabled: isAdmin,
   });
 }
 

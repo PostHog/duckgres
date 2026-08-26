@@ -41,6 +41,7 @@ func (p *K8sWorkerPool) retireWorkerWithReason(id int, reason string, origin Lif
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
+	forgetWorkerOTLPExport(id)
 
 	go p.retireWorkerPod(id, w)
 	return true
@@ -70,6 +71,7 @@ func (p *K8sWorkerPool) retireWorkerIfNoSessionsWithReason(id int, reason string
 		workerCount := len(p.workers)
 		p.mu.Unlock()
 		observeControlPlaneWorkers(workerCount)
+		forgetWorkerOTLPExport(id)
 		go p.retireWorkerPod(id, w)
 		return true
 	}
@@ -136,7 +138,38 @@ func (p *K8sWorkerPool) RetireIfDrainingAndEmpty(id int, origin LifecycleOrigin)
 	workerCount := len(p.workers)
 	p.mu.Unlock()
 	observeControlPlaneWorkers(workerCount)
+	forgetWorkerOTLPExport(id)
 	go p.retireWorkerPod(id, w)
+}
+
+// SetWorkerTTL overrides the TTL stamped on the worker's record when it next
+// parks hot → hot_idle — the pool-side half of `SET duckgres.worker_ttl`.
+// In-memory only is sufficient: workerRecordFor re-reads profile.TTL on every
+// persist, the park write (commitHotIdleLocked) is what the expiry queries
+// consult, and ttl_minutes on a HOT row is never used for reaping. Returns
+// false when the worker is gone.
+func (p *K8sWorkerPool) SetWorkerTTL(id int, ttl time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	w, ok := p.workers[id]
+	if !ok {
+		return false
+	}
+	w.profile.TTL = ttl
+	return true
+}
+
+// WorkerTTL reports the TTL the worker would park with if its last session
+// ended now (0 = the deployment default applies at reap time). ok=false when
+// the worker is gone.
+func (p *K8sWorkerPool) WorkerTTL(id int) (time.Duration, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	w, ok := p.workers[id]
+	if !ok {
+		return 0, false
+	}
+	return w.profile.TTL, true
 }
 
 // TransitionToHotIdleIfNoSessions decrements the worker's active session count
@@ -437,6 +470,9 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 							hcResult, healthErr = doHealthCheckWithMetadata(hctx, w.client, p.healthCheckPayloadForLease(lease))
 							cancel()
 						}()
+						if hcResult != nil {
+							observeWorkerOTLPExportFromHealth(lease.workerID, hcResult)
+						}
 						// Skip both metric emission AND failure-counter
 						// increment when the parent loop ctx was canceled
 						// (CP shutting down). Without this guard:
@@ -452,36 +488,71 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						if stderrors.Is(healthErr, context.Canceled) {
 							return
 						}
+						// A worker whose DuckDB instance was invalidated by an
+						// Internal/Fatal engine error still answers RPCs
+						// perfectly, so healthErr is nil and the consecutive
+						// -failure counter never fires. Treat it as an
+						// immediate, uncounted retirement: the instance cannot
+						// recover without a process restart, so waiting only
+						// keeps a dead worker schedulable.
+						instanceDead := healthErr == nil && hcResult != nil && hcResult.InstanceInvalidated
+
 						if healthErr != nil {
 							observeHealthCheck(HealthCheckResultFail, lease.image)
 						} else {
 							observeHealthCheck(HealthCheckResultPass, lease.image)
 						}
 
-						if healthErr != nil {
-							if p.workerLeaseLocallyDraining(lease) {
+						// A draining worker is already on its way out; its pod
+						// exit is the cleanup path, so don't race it.
+						if instanceDead && p.workerLeaseLocallyDraining(lease) {
+							p.logw(lease.workerID).Warn("K8s worker DuckDB instance invalidated while worker is draining; waiting for pod exit.",
+								"reason", hcResult.InstanceInvalidReason)
+							return
+						}
+
+						if healthErr != nil || instanceDead {
+							if healthErr != nil && p.workerLeaseLocallyDraining(lease) {
 								if p.workerLeaseDurablyDrainingOrRepair(lease) {
 									p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining; waiting for pod exit.", "error", healthErr)
 									return
 								}
 								p.logw(lease.workerID).Warn("K8s worker health check failed while worker is locally draining but durable state is not draining; treating as health failure.", "error", healthErr)
 							}
-							mu.Lock()
-							failures[lease]++
-							count := failures[lease]
-							mu.Unlock()
+							var count int
+							if instanceDead {
+								workerInstanceInvalidatedTotal.Inc()
+								p.logw(lease.workerID).Error("K8s worker DuckDB instance invalidated by a fatal engine error; retiring worker.",
+									"reason", hcResult.InstanceInvalidReason)
+							} else {
+								mu.Lock()
+								failures[lease]++
+								count = failures[lease]
+								mu.Unlock()
 
-							p.logw(lease.workerID).Warn("K8s worker health check failed.", "error", healthErr, "consecutive_failures", count)
+								p.logw(lease.workerID).Warn("K8s worker health check failed.", "error", healthErr, "consecutive_failures", count)
+							}
 
-							if count >= maxConsecutiveHealthFailures {
+							// The retirement path below is shared with the
+							// unresponsive-worker case, but an invalidated
+							// worker is answering RPCs fine — only its engine is
+							// dead. Carry the cause so the operator-facing logs
+							// do not tell two contradictory stories about the
+							// same deletion (and so consecutive_failures=0 reads
+							// as "not counter-driven", not as missing data).
+							cause := "unresponsive"
+							if instanceDead {
+								cause = "instance_invalidated"
+							}
+							if instanceDead || count >= maxConsecutiveHealthFailures {
 								lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginHealthCheckCrash)
 								if err != nil {
-									p.logw(lease.workerID).Error("K8s worker unresponsive but lease validation failed; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)
+									p.logw(lease.workerID).Error("K8s worker retirement blocked: lease validation failed; leaving cleanup to retry.", "cause", cause, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count, "error", err)
 									return
 								}
 
 								if lostDisposition == workerLostLeaseRetry {
-									p.logw(lease.workerID).Warn("K8s worker unresponsive while runtime lease is newer for this CP; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									p.logw(lease.workerID).Warn("K8s worker retirement deferred: runtime lease is newer for this CP; leaving cleanup to retry.", "cause", cause, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
 									return
 								}
 
@@ -497,7 +568,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 										return
 									}
 									observeControlPlaneWorkers(workerCount)
-									p.logw(lease.workerID).Warn("K8s worker unresponsive under stale lease; dropping local worker without crash notification or pod delete.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
+									p.logw(lease.workerID).Warn("K8s worker retired under stale lease; dropping local worker without crash notification or pod delete.", "cause", cause, "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "consecutive_failures", count)
 									if removedWorker.client != nil {
 										_ = removedWorker.client.Close()
 									}
@@ -519,7 +590,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 								// Snapshot pod/container state before the delete below removes
 								// the easiest source of OOMKilled/Evicted/exit-code evidence.
 								podName := p.workerPodName(removedWorker)
-								deleteAttrs := []any{"consecutive_failures", count}
+								deleteAttrs := []any{"cause", cause, "consecutive_failures", count}
 								if podName != "" && p.clientset != nil {
 									statusCtx, statusCancel := context.WithTimeout(ctx, 2*time.Second)
 									pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(statusCtx, podName, metav1.GetOptions{})
@@ -531,7 +602,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 									}
 								}
 								logger := slog.With(workerLogAttrs(removedWorker)...)
-								logger.Error("K8s worker unresponsive, deleting pod.", deleteAttrs...)
+								logger.Error("K8s worker retired, deleting pod.", deleteAttrs...)
 								deleteResultAttrs := append(append([]any{}, deleteAttrs...), "grace_period_seconds", 10)
 								if podName == "" || p.clientset == nil {
 									logger.Warn("K8s worker pod delete skipped.", append(deleteResultAttrs, "reason", "missing_pod_or_client")...)
@@ -578,8 +649,10 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 	}
 }
 
-// ShutdownAll stops all workers by deleting their pods. Per worker it runs a
-// 3-step CAS chain against the runtime store and K8s API:
+// ShutdownAll stops idle workers by deleting their pods. Workers with active
+// sessions are preserved so a shutdown path cannot cancel their live queries.
+// Per idle worker it runs a 3-step CAS chain against the runtime store and K8s
+// API:
 //
 //  1. MarkWorkerDraining — atomic SQL CAS from a non-terminal state to
 //     draining. Fences the worker against claims by other CPs: their claim
@@ -618,24 +691,12 @@ func (p *K8sWorkerPool) ShutdownAll() {
 	for _, w := range workers {
 		podName := p.workerPodName(w)
 
-		// A worker that's serving sessions must not be torn down during
-		// CP shutdown — pod-deletion would kill in-flight customer queries
-		// at exactly the moment ShutdownAll runs (the failure mode hit by
-		// the production worker-40761 incident on a 15-minute drain wall).
-		// Leave the worker in `hot` state, owned by this dying CP. Two
-		// downstream guarantees keep this safe:
-		//   (1) Flight clients can reconnect by session token; a peer CP
-		//       claims via TakeOverWorker and starts a fresh remote session
-		//       on the surviving worker.
-		//   (2) ListOrphanedWorkers' JOIN against flight_session_records
-		//       prevents peer CPs' janitors from retiring the worker
-		//       while a session is still active or reconnecting; once the
-		//       session record is expired the worker is retired normally.
-		// pgwire customers connected to this CP have already lost their
-		// connection (the CP socket is going away) — protecting the
-		// worker doesn't help them, but it doesn't hurt either.
+		// ShutdownAll normally follows the control-plane drain, but worker and
+		// connection drain accounting can race. Do not turn that race into an
+		// immediate cancellation of a live query: leave workers with active
+		// sessions running and keep their in-memory bookkeeping intact.
 		if w.activeSessions > 0 {
-			p.logw(w.ID).Info("ShutdownAll: worker has active sessions; leaving pod alive for Flight reconnect.", "worker_pod", podName, "active_sessions", w.activeSessions)
+			p.logw(w.ID).Info("ShutdownAll: worker has active sessions; leaving pod alive.", "worker_pod", podName, "active_sessions", w.activeSessions)
 			preserved[w.ID] = w
 			continue
 		}
@@ -735,10 +796,6 @@ func (p *K8sWorkerPool) ShutdownAll() {
 		p.mu.Unlock()
 	}
 
-	// Workers preserved due to active sessions stay in the in-memory map
-	// so any remaining session bookkeeping inside this CP still finds them
-	// during the residual shutdown window. The map is wiped on process
-	// exit; preservation is purely about not yanking the rug here.
 	p.mu.Lock()
 	p.workers = preserved
 	p.mu.Unlock()

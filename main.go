@@ -79,9 +79,11 @@ func main() {
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
 		// Use the same logging/tracing setup as parent for consistent format
-		loggingShutdown := cliboot.InitLogging()
+		_ = os.Setenv("DUCKGRES_MODE", "duckdb-service")
+		bi := buildInfo()
+		loggingShutdown := cliboot.InitLogging(bi)
 		defer loggingShutdown()
-		tracingShutdown := cliboot.InitTracing()
+		tracingShutdown := cliboot.InitTracing(bi)
 		defer tracingShutdown()
 		duckdbservice.LogCacheProxyStatus()
 		server.RunChildMode()
@@ -120,17 +122,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CONFIG             Path to YAML config file\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_HOST               Host to bind to (default: 0.0.0.0)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PORT               Port to listen on (default: 5432)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_PORT        Control-plane Arrow Flight SQL ingress port (default: disabled)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_IDLE_TTL      Flight auth session idle TTL (default: 10m)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL Flight auth session reap interval (default: 1m)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_HANDLE_IDLE_TTL       Flight prepared/query handle idle TTL (default: 15m)\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_FLIGHT_SESSION_TOKEN_TTL     Flight issued session token absolute TTL (default: 1h)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_FILE_PERSISTENCE   Persist DuckDB to <data_dir>/<username>.duckdb (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX  Maximum client-requested idle timeout; unset disables client overrides\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_SESSION_INIT_TIMEOUT  Session startup metadata/probe timeout (default: 10s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
@@ -204,13 +202,15 @@ func main() {
 		_ = os.Setenv("DUCKGRES_LOG_LEVEL", fileCfg.LogLevel)
 	}
 
-	loggingShutdown := cliboot.InitLogging()
+	_ = os.Setenv("DUCKGRES_MODE", *mode)
+	bi := buildInfo()
+	loggingShutdown := cliboot.InitLogging(bi)
 	defer loggingShutdown()
 
 	analyticsShutdown := cliboot.InitAnalytics()
 	defer analyticsShutdown()
 
-	tracingShutdown := cliboot.InitTracing()
+	tracingShutdown := cliboot.InitTracing(bi)
 	defer tracingShutdown()
 
 	buildInfo().Log(*mode)
@@ -421,6 +421,10 @@ func main() {
 				WorkerProfileMaxMemory:       resolved.K8sWorkerProfileMaxMemory,
 				WorkerMaxTTL:                 resolved.K8sWorkerMaxTTL,
 				WorkerDefaultTTL:             resolved.K8sWorkerDefaultTTL,
+				ExploratoryTierEnabled:       resolved.K8sExploratoryTierEnabled,
+				ExploratoryWorkerCPU:         resolved.K8sExploratoryWorkerCPU,
+				ExploratoryWorkerMemory:      resolved.K8sExploratoryWorkerMemory,
+				ExploratoryWorkerTTL:         resolved.K8sExploratoryWorkerTTL,
 				ReshardPodCPU:                resolved.K8sReshardPodCPU,
 				ReshardPodMemory:             resolved.K8sReshardPodMemory,
 				AWSRegion:                    resolved.AWSRegion,

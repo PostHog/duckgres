@@ -1,15 +1,18 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { type ColumnDef } from "@tanstack/react-table";
-import { AlertTriangle, Building2, Search } from "lucide-react";
+import { AlertTriangle, Building2, Plus, Search } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { DataTable } from "@/components/DataTable";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { StateBadge } from "@/components/StateBadge";
 import { ShardBadge } from "@/components/ShardBadge";
+import { AdminGate } from "@/components/AdminOnly";
+import { AddOrgDialog } from "@/components/AddOrgDialog";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useDucklingDrift, useDucklingsMetadata, useOrgs } from "@/hooks/useApi";
 import { ducklingEntryFor, fmtInt } from "@/lib/format";
@@ -21,6 +24,7 @@ export function Orgs() {
   const metadata = useDucklingsMetadata();
   const navigate = useNavigate();
   const [filter, setFilter] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
 
   // Live drift keyed by org, so a row whose config state is "ready" but whose
   // Duckling CR is actually missing still gets flagged (config state alone
@@ -135,14 +139,22 @@ export function Orgs() {
         title="Organizations"
         description="Tenants and their per-org limits. Click a row to edit config and warehouse."
         actions={
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter orgs…"
-              className="w-64 pl-8"
-            />
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="Filter orgs…"
+                className="w-64 pl-8"
+              />
+            </div>
+            <AdminGate reason="Provisioning requires the admin role">
+              <Button size="sm" onClick={() => setAddOpen(true)}>
+                <Plus className="mr-1 h-4 w-4" />
+                Add organization
+              </Button>
+            </AdminGate>
           </div>
         }
       />
@@ -174,6 +186,7 @@ export function Orgs() {
           )}
         </Card>
       </PageBody>
+      <AddOrgDialog open={addOpen} onClose={() => setAddOpen(false)} />
     </>
   );
 }

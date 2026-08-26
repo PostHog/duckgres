@@ -239,7 +239,7 @@ run-multitenant-kind: kind-cluster-reset multitenant-config-store-up-kind build-
     @echo "Multi-tenant control plane ready on kind."
     @echo "Default login: postgres / postgres"
     @echo "Fetch admin token with: kubectl -n duckgres logs deployment/duckgres-control-plane | rg 'Generated admin API token'"
-    @echo "Run 'just multitenant-port-forward-pg' in another terminal if you want direct pgwire or Flight access."
+    @echo "Run 'just multitenant-port-forward-pg' in another terminal for direct pgwire access."
 
 # Tear down the optional OrbStack/local multitenant environment
 [group('dev')]
@@ -254,10 +254,10 @@ cleanup-multitenant-kind:
     just multitenant-config-store-down-kind
     just kind-cluster-down
 
-# Port-forward pgwire and Flight traffic from the local control plane
+# Port-forward pgwire traffic from the local control plane
 [group('dev')]
 multitenant-port-forward-pg:
-    kubectl -n duckgres port-forward svc/duckgres 5432:5432 8815:8815
+    kubectl -n duckgres port-forward svc/duckgres 5432:5432
 
 # Port-forward the API server (admin + provisioning) from the local control plane
 [group('dev')]
@@ -353,6 +353,12 @@ test-perf:
 test-ducklake:
     ./scripts/test_ducklake.sh
 
+# Verify read-only Trino access to the Duckgres-created local DuckLake fixture.
+# Set TRINO_DUCKLAKE_SMOKE_ARTIFACT_DIR to override the version-report location.
+[group('test')]
+trino-ducklake-smoke:
+    TZ=UTC TRINO_DUCKLAKE_SMOKE_ARTIFACT_DIR=artifacts/trino-ducklake-smoke go test -v -count=1 -timeout 10m ./tests/trino-ducklake-smoke
+
 # Run DuckLake concurrency benchmarks (current version)
 [group('test')]
 test-ducklake-concurrency:
@@ -397,6 +403,18 @@ test-metrics:
 [group('test')]
 perf-smoke:
     ./scripts/perf_smoke.sh
+
+# Compare local Duckgres PGWire and Trino against the same synthetic DuckLake data.
+# Override TRINO_DUCKLAKE_PERF_ROWS (default 1000000) to change the fixture size.
+[group('test')]
+perf-trino-ducklake:
+    TZ=UTC TRINO_DUCKLAKE_PERF=1 TRINO_DUCKLAKE_PERF_ARTIFACT_DIR=artifacts/trino-ducklake-perf go test -v -count=1 -timeout 30m -run TestTrinoDuckLakePerf ./tests/trino-ducklake-smoke
+
+# Compare local Duckgres and Trino with wide, PostHog-shaped synthetic DuckLake events.
+# Set TRINO_DUCKLAKE_REALISTIC_PERF_PROFILE=realistic-local for 1m events.
+[group('test')]
+perf-trino-ducklake-realistic:
+    TZ=UTC TRINO_DUCKLAKE_REALISTIC_PERF=1 TRINO_DUCKLAKE_PERF_ARTIFACT_DIR=artifacts/trino-ducklake-perf go test -v -count=1 -timeout 30m -run TestTrinoDuckLakeRealisticPerf ./tests/trino-ducklake-smoke
 
 # Full perf nightly suite
 [group('test')]

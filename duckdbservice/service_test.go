@@ -76,6 +76,89 @@ func isContextBackgroundCall(expr ast.Expr) bool {
 	return ok && pkg.Name == "context"
 }
 
+func TestDrainTimeoutFlushesAfterCloseAll(t *testing.T) {
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, "service.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse service.go: %v", err)
+	}
+
+	timeoutClose, timeoutFlush := -1, -1
+	successShutdown, successFlush := -1, -1
+
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		block, ok := node.(*ast.BlockStmt)
+		if !ok {
+			return true
+		}
+		for i, stmt := range block.List {
+			ifStmt, ok := stmt.(*ast.IfStmt)
+			if !ok || !isNotWaitForDrain(ifStmt.Cond) {
+				continue
+			}
+			for j, bodyStmt := range ifStmt.Body.List {
+				switch exprStmtSelector(bodyStmt) {
+				case "CloseAll":
+					timeoutClose = j
+				case "FlushLogging":
+					timeoutFlush = j
+				}
+			}
+			for j := i + 1; j < len(block.List); j++ {
+				switch exprStmtSelector(block.List[j]) {
+				case "Shutdown":
+					successShutdown = j
+				case "FlushLogging":
+					successFlush = j
+				}
+			}
+		}
+		return true
+	})
+
+	if timeoutClose < 0 || timeoutFlush < 0 {
+		t.Fatal("drain timeout path missing CloseAll or FlushLogging")
+	}
+	if timeoutFlush < timeoutClose {
+		t.Fatalf("timeout path flushes at stmt %d before CloseAll at %d", timeoutFlush, timeoutClose)
+	}
+	if successShutdown < 0 || successFlush < 0 {
+		t.Fatal("success drain path missing Shutdown or FlushLogging")
+	}
+	if successFlush < successShutdown {
+		t.Fatalf("success path flushes at stmt %d before Shutdown at %d", successFlush, successShutdown)
+	}
+}
+
+func isNotWaitForDrain(cond ast.Expr) bool {
+	unary, ok := cond.(*ast.UnaryExpr)
+	if !ok || unary.Op != token.NOT {
+		return false
+	}
+	call, ok := unary.X.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "WaitForDrain"
+}
+
+func exprStmtSelector(stmt ast.Stmt) string {
+	es, ok := stmt.(*ast.ExprStmt)
+	if !ok {
+		return ""
+	}
+	call, ok := es.X.(*ast.CallExpr)
+	if !ok {
+		return ""
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return ""
+	}
+	return sel.Sel.Name
+}
+
 // With MaxSessions=1 (how the control plane spawns remote worker pods), a worker
 // serves exactly one client query session — a second concurrent CreateSession is
 // rejected rather than silently overcommitting the pod's resources. Internal

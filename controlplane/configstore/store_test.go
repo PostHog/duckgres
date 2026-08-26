@@ -375,9 +375,8 @@ func TestResolvePostgresConnection(t *testing.T) {
 }
 
 // TestDisabledUserEnforcement covers the per-user kill switch at the snapshot
-// level: a disabled user with CORRECT credentials is refused on every auth path
-// (PG resolution reports Valid+Disabled so the CP can emit a distinct error;
-// Flight's ValidateOrgUser* return false), while enabled users are unaffected.
+// level: a disabled user with CORRECT credentials is reported as Valid+Disabled
+// so the control plane can emit a distinct error, while enabled users are unaffected.
 func TestDisabledUserEnforcement(t *testing.T) {
 	cs := &ConfigStore{
 		snapshot: &Snapshot{
@@ -422,23 +421,32 @@ func TestDisabledUserEnforcement(t *testing.T) {
 		}
 	})
 
-	t.Run("Flight ValidateOrgUser refuses disabled user", func(t *testing.T) {
-		if cs.ValidateOrgUser("acme", "bob", "secret") {
-			t.Fatal("ValidateOrgUser must return false for a disabled user")
+	// The tier-escalation re-check (controlplane/control.go's exploratory
+	// switcher) cannot re-run ResolvePostgresConnection — it has no password —
+	// so it re-reads the SAME OrgUserDisabled snapshot map through
+	// OrgUserSessionQueryAccess. Pin that this accessor actually reports a
+	// disabled user as not-ok, or a user disabled during the switcher's
+	// destroy→create window would come back alive on the escalated worker.
+	t.Run("session re-check: disabled user is not ok, enabled user is", func(t *testing.T) {
+		withRevisions := &ConfigStore{snapshot: &Snapshot{
+			Orgs:            cs.snapshot.Orgs,
+			DatabaseOrg:     cs.snapshot.DatabaseOrg,
+			OrgUserPassword: cs.snapshot.OrgUserPassword,
+			OrgUserDisabled: cs.snapshot.OrgUserDisabled,
+			OrgUserRevision: map[OrgUserKey]string{
+				{OrgID: "acme", Username: "bob"}:   "rev-1",
+				{OrgID: "acme", Username: "alice"}: "rev-1",
+			},
+			OrgUserAccess: map[OrgUserKey]OrgUserAccessConfig{},
+		}}
+		if _, _, ok := withRevisions.OrgUserSessionQueryAccess("acme", "bob"); ok {
+			t.Fatal("disabled user must resolve ok=false so an escalation re-check fails closed")
 		}
-		if !cs.ValidateOrgUser("acme", "alice", "secret") {
-			t.Fatal("ValidateOrgUser must return true for an enabled user")
+		if _, _, ok := withRevisions.OrgUserSessionQueryAccess("acme", "alice"); !ok {
+			t.Fatal("enabled user must resolve ok=true so a normal escalation is not aborted")
 		}
-	})
-
-	t.Run("ValidateOrgUserAndGetPassthrough refuses disabled user without leaking passthrough", func(t *testing.T) {
-		valid, passthrough := cs.ValidateOrgUserAndGetPassthrough("acme", "bob", "secret")
-		if valid || passthrough {
-			t.Fatalf("disabled user: want (false,false), got (%v,%v)", valid, passthrough)
-		}
-		valid, _ = cs.ValidateOrgUserAndGetPassthrough("acme", "alice", "secret")
-		if !valid {
-			t.Fatal("enabled user should validate")
+		if _, _, ok := withRevisions.OrgUserSessionQueryAccess("acme", "ghost"); ok {
+			t.Fatal("unknown user must resolve ok=false")
 		}
 	})
 }

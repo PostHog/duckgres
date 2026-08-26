@@ -27,6 +27,8 @@ var ErrWarehouseNonTerminal = errors.New("warehouse already exists in non-termin
 // 400.
 var ErrProvisionTeamRequired = errors.New("team_id is required when provisioning a warehouse for a new org")
 
+const defaultProvisionedOrgMaxVCPUs = 60
+
 // ProvisionRequest is the all-or-nothing input the Provision endpoint
 // dispatches into a single configstore transaction. Warehouse + root
 // user are always written.
@@ -55,6 +57,9 @@ type ProvisionRequest struct {
 	// password. Plaintext stays in the handler (returned to the
 	// caller); only the hash is persisted, same as before.
 	RootUserHash string
+	// Trino, when non-nil, additionally writes a ManagedWarehouseTrino
+	// row inside the same transaction. nil leaves Trino opt-out alone.
+	Trino *configstore.TrinoSettings
 }
 
 // gormStore implements Store using a ConfigStore's GORM DB.
@@ -62,8 +67,11 @@ type gormStore struct {
 	cs *configstore.ConfigStore
 }
 
-// NewGormStore creates a Store backed by the given ConfigStore.
-func NewGormStore(cs *configstore.ConfigStore) Store {
+// NewGormStore creates a Store backed by the given ConfigStore. It returns
+// the concrete *gormStore (not the Store interface) so callers that also need
+// the TenantStore half — RegisterAPI's service-credentials wiring — can rely
+// on it without a runtime type assertion.
+func NewGormStore(cs *configstore.ConfigStore) *gormStore {
 	return &gormStore{cs: cs}
 }
 
@@ -79,8 +87,12 @@ func (s *gormStore) CreateOrgUser(orgID, username, passwordHash string) error {
 	return s.cs.CreateOrgUser(orgID, username, passwordHash)
 }
 
-func (s *gormStore) UpdateOrgUserPassword(orgID, username, passwordHash string) error {
-	return s.cs.UpdateOrgUserPassword(orgID, username, passwordHash)
+func (s *gormStore) GetOrgUser(orgID, username string) (*configstore.OrgUser, error) {
+	var user configstore.OrgUser
+	if err := s.cs.DB().First(&user, "org_id = ? AND username = ?", orgID, username).Error; err != nil {
+		return nil, err
+	}
+	return &user, nil
 }
 
 func (s *gormStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWarehouse, error) {
@@ -110,6 +122,11 @@ func (s *gormStore) CreatePendingWarehouse(orgID, databaseName string, warehouse
 // exists in non-terminal state") so HTTP handlers can map to 409
 // without an extra error type.
 func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, teamID int64, schemaName string, warehouse *configstore.ManagedWarehouse) error {
+	// Serialize the existence decision and any name-reuse cleanup with
+	// credential lifecycle operations and admin org deletion.
+	if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+		return err
+	}
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
 	// creates everything). A NEW org MUST carry team_id — a warehouse cannot
 	// exist without a team; the id becomes the org's first
@@ -122,7 +139,16 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, teamID in
 		if teamID == 0 {
 			return ErrProvisionTeamRequired
 		}
-		org = configstore.Org{Name: orgID, DatabaseName: databaseName}
+		// Purge grants orphaned by org deletions from older versions before
+		// reusing the org name. Existing-org reprovisioning preserves grants.
+		if err := tx.Where("org_id = ?", orgID).Delete(&configstore.ServiceGrant{}).Error; err != nil {
+			return err
+		}
+		org = configstore.Org{
+			Name:         orgID,
+			DatabaseName: databaseName,
+			MaxVCPUs:     defaultProvisionedOrgMaxVCPUs,
+		}
 		if err := tx.Create(&org).Error; err != nil {
 			return err
 		}
@@ -238,8 +264,42 @@ func (s *gormStore) Provision(req ProvisionRequest) error {
 			return fmt.Errorf("create root user: %w", err)
 		}
 
+		// 3. Optional Trino opt-in. State seeds to Pending so the
+		// reconcile loop sees a fresh row to act on; the OnConflict
+		// columns deliberately exclude State / StatusMessage / ReadyAt /
+		// FailedAt / TrinoCellID so a re-provision doesn't clobber the
+		// reconcile loop's prior outcome or move the org between cells.
+		if req.Trino != nil {
+			trinoRow := configstore.ManagedWarehouseTrino{
+				OrgID:   req.OrgID,
+				Enabled: true,
+				Tier:    req.Trino.Tier,
+				State:   configstore.ManagedWarehouseStatePending,
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "org_id"}},
+				DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
+			}).Create(&trinoRow).Error; err != nil {
+				return fmt.Errorf("enable trino: %w", err)
+			}
+		}
+
 		return nil
 	})
+}
+
+// EnableTrino persists the per-org Trino opt-in. Idempotent — the
+// configstore implementation upserts on (org_id) so re-enabling updates
+// the tier without flipping Enabled false-then-true.
+func (s *gormStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
+	return s.cs.EnableTrino(orgID, settings)
+}
+
+// DisableTrino marks the org's Trino row as disabled. The row is kept
+// (with Enabled=false) so the provisioner observes the transition and
+// can clean up downstream state. No-op when no row exists.
+func (s *gormStore) DisableTrino(orgID string) error {
+	return s.cs.DisableTrino(orgID)
 }
 
 func (s *gormStore) IsDatabaseNameAvailable(name string) (bool, error) {
@@ -279,8 +339,40 @@ func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore
 	return nil
 }
 
-// ListOrgTeams returns every duckgres_org_teams row for the org, or
-// gorm.ErrRecordNotFound when the org doesn't exist.
+// MintServiceCredential delegates to the config store: create a fresh
+// credential whose principal is audit attribution only.
+func (s *gormStore) MintServiceCredential(
+	orgID string,
+	principal string,
+	ttl time.Duration,
+) (*configstore.ServiceCredentialIssue, error) {
+	return s.cs.MintServiceCredential(orgID, principal, ttl)
+}
+
+// RefreshServiceCredential delegates to the config store: always-rotate the
+// named grant's secret — see configstore.RefreshServiceCredential.
+func (s *gormStore) RefreshServiceCredential(
+	orgID string,
+	credentialID string,
+	ttl time.Duration,
+) (*configstore.ServiceCredentialIssue, error) {
+	return s.cs.RefreshServiceCredential(orgID, credentialID, ttl)
+}
+
+// OrgExists reports whether the org row exists (the service-credential
+// handlers 404 on a ghost org before minting against it).
+func (s *gormStore) OrgExists(orgID string) (bool, error) {
+	var count int64
+	if err := s.cs.DB().Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (s *gormStore) ReloadSnapshot() error {
+	return s.cs.ReloadSnapshot()
+}
+
 func (s *gormStore) ListOrgTeams(orgID string) ([]configstore.OrgTeam, error) {
 	var count int64
 	if err := s.cs.DB().Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {

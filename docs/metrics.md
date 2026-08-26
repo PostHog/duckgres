@@ -27,6 +27,18 @@ The request path uses these label terms consistently:
 
 Histograms expose the usual `_bucket`, `_count`, and `_sum` series.
 
+## Managed warehouse state
+
+`duckgres_managed_warehouse_state{org,duckling,state}` is a Kubernetes-only
+gauge with value `1` for each warehouse that has not finished deletion. The
+state label is one of `pending`, `provisioning`, `ready`, `failed`, `deleting`,
+`resharding`, or `unknown`. Unexpected stored values map to `unknown` to keep
+metric cardinality bounded.
+
+Each control-plane replica emits the same snapshot-backed series. Use `max by`
+instead of `sum by` when evaluating warehouse state across replicas. A deleted
+warehouse disappears from the metric on the next snapshot refresh.
+
 ## Request path boundaries
 
 | Stage | Metrics | Boundary |
@@ -138,8 +150,8 @@ The PostgreSQL terminal counter collapses those outcomes to `success` or
 `canceled`, `transport`, and `unknown`. The first four represent failures an
 operator can usually alleviate. The remaining reasons let alerts exclude bad
 client input, planned lifecycle transitions, client disconnects, wire errors,
-and newly added paths that have not yet been classified. Flight SQL does not
-emit this counter. `capacity` covers runtime worker exhaustion and admission
+and newly added paths that have not yet been classified. `capacity` covers
+runtime worker exhaustion and admission
 timeouts; requests that exceed a configured hard org or user vCPU limit are
 reported with reason `client`.
 
@@ -200,6 +212,136 @@ The Kubernetes worker allocator keeps its existing names:
 The older fleet-level `duckgres_control_plane_worker_*` metrics remain useful
 for process-wide worker counts, spawn time, and the approximate post-admission
 worker queue. They have no org label and are not admission saturation metrics.
+
+### Node-local cache proxy metrics
+
+These worker-local metrics have no tenant labels. Exactly one
+`duckgres_worker_cache_proxy_mode{mode}` series is `1`.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `duckgres_worker_cache_proxy_mode` | `mode` | Current cache mode: `cached`, `bypassed`, or `disabled`; the active mode is `1`. |
+| `duckgres_worker_cache_proxy_bypass_transitions_total` | `reason` | Entries into bypass mode: `startup_unavailable`, `runtime_unavailable`, or `upstream_unavailable`. |
+| `duckgres_worker_cache_proxy_bypassed_operations_total` | `reason` | Operations routed around the node-local cache. |
+| `duckgres_worker_cache_proxy_reconnect_attempts_total` | None | Health checks made by the recovery supervisor. |
+| `duckgres_worker_cache_proxy_recoveries_total` | None | Successful cache re-enablement events. |
+
+### Cache proxy request-path metrics
+
+These are emitted by the standalone `cache-proxy` binary itself (`cmd/cache-proxy`), on its own `HEALTH_ADDR` `/metrics` endpoint — a separate process and port from the control plane's `:9090`. The `duckgres_worker_cache_proxy_*` family above is the worker-side client wrapper's view; these are the proxy's own view of the requests it served.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `cache_proxy_request_duration_seconds` | Histogram | `path`, `source` | End-to-end duration of a served request. `path` is `block` (block-aligned cache path) or `forward` (uncached forward-proxy path); `source` is `local`, `peer`, or `s3` for `block`, and always `origin` for `forward`. |
+| `cache_proxy_forward_requests_total` | Counter | `method` | Requests handled by the uncached forward-proxy path, by HTTP method. |
+| `cache_proxy_inflight_requests` | Gauge | None | Requests currently being handled by the proxy's request entry point; the queue-depth signal. |
+| `cache_proxy_hits_total` | Counter | None | Worker-facing cacheable requests served entirely from data already present on local NVMe. Peer API reads and requests that first fetch any block from a peer are excluded. |
+| `cache_proxy_misses_total` | Counter | None | Worker-facing cacheable requests that require a peer or origin fill before they can be served. |
+| `cache_proxy_bytes_served_total` | Counter | `source` | Directional byte mix by `local`, `peer`, or `s3`. Block mode counts assembled response bytes under the slowest source used; the legacy exact-range path counts the local read or deduplicated fill once, so this is not an exact client-egress counter. |
+| `cache_proxy_cache_entries` / `cache_proxy_cache_entry_limit` | Gauge | None | Current exact-index entries and the configured compatibility soft target (`CACHE_MAX_ENTRIES`, default 1,000,000). |
+| `cache_proxy_cache_hard_entry_limit` | Gauge | None | Fixed exact-index startup/admission safety guardrail (10,000,000). Configured soft targets are clamped to it. |
+| `cache_proxy_cache_exact_index_estimated_bytes` | Gauge | None | Conservative exact-index metadata estimate (256 bytes per tracked entry); use process/cgroup metrics for authoritative memory usage. |
+| `cache_proxy_cache_owned_bytes` / `cache_proxy_cache_capacity_bytes` | Gauge | None | Bytes in committed cache entries and the current capacity ceiling. Committed bytes are reclaimable in capacity calculation after restart. |
+| `cache_proxy_cache_disk_target_bytes` / `cache_proxy_cache_disk_reserve_bytes` | Gauge | None | The configured percentage-of-disk target and the fixed 5%-of-total-disk reserve. |
+| `cache_proxy_cache_entry_limit_reason` | Gauge | `reason` | Future derived-entry bottleneck. Exactly one `reason` (`disk` or `metadata`) is 1; this anticipates the later derived-entry rollout without replacing the configured legacy admission limit. |
+| `cache_proxy_cache_startup_scan_duration_seconds` | Histogram | None | Cache directory startup-scan duration. |
+| `cache_proxy_cache_startup_scan_files_inspected_total` / `cache_proxy_cache_startup_invalid_files_total` | Counter | None | Root-directory entries scanned and entries excluded from committed cache ownership because they are invalid or unrelated. |
+| `cache_proxy_cache_startup_uninspectable_files_total` | Counter | None | Valid-looking files preserved but excluded from ownership because their metadata could not be inspected. |
+| `cache_proxy_cache_startup_discovered_owned_bytes` | Gauge | None | Inspectable committed bytes discovered before exceptional hard-guardrail survivor pruning. |
+| `cache_proxy_cache_startup_selected_entries` / `cache_proxy_cache_startup_selected_bytes` | Gauge | None | Entries and logical bytes selected for the bounded exact index during the most recent startup. |
+| `cache_proxy_cache_startup_phase` | Gauge | `phase` | Active bounded startup phase (`enumerate`, `hard_prune`, or `index`); all series are zero after startup. |
+| `cache_proxy_cache_startup_hard_prune_candidates_total` / `cache_proxy_cache_startup_hard_prune_completed_total` / `cache_proxy_cache_startup_hard_prune_failures_total` / `cache_proxy_cache_startup_hard_prune_preserved_total` | Counter | None | Exceptional above-10M survivor-selection progress and outcomes. Successful committed deletion remains authoritative in `cache_proxy_evictions_total`. |
+| `cache_proxy_cache_startup_cancellations_total` | Counter | None | Startup scans or hard-prune passes canceled by process shutdown. |
+| `cache_proxy_cache_temporary_files_removed_total` | Counter | None | Interrupted temporary files removed from `.tmp` on startup. They are never counted as cache evictions. |
+| `cache_proxy_cache_recency_touch_attempts_total` / `cache_proxy_cache_recency_touch_successes_total` / `cache_proxy_cache_recency_touch_failures_total` | Counter | None | Coarse durable-recency access attempts and filesystem persistence outcomes. Missing files raced by eviction are benign and excluded from failures. |
+| `cache_proxy_cache_recency_touch_coalesced_total` / `cache_proxy_cache_recency_touch_dropped_total` | Counter | None | Same-key or same-minute recency updates coalesced, and nonblocking updates dropped because bounded work was full or closed. |
+| `cache_proxy_cache_recency_queue_depth` | Gauge | None | Unique opaque keys with queued or in-flight recency persistence work. |
+| `cache_proxy_cache_recency_last_successful_persistence_timestamp_seconds` | Gauge | None | Unix timestamp of the last successful coarse mtime update. |
+| `cache_proxy_cache_convergence_active` | Gauge | None | `1` while tracked entries or bytes exceed the current soft target. |
+| `cache_proxy_cache_convergence_excess_entries` / `cache_proxy_cache_convergence_excess_bytes` | Gauge | None | Current overage awaiting bounded background convergence. |
+| `cache_proxy_cache_convergence_eviction_attempts_total` / `cache_proxy_cache_convergence_eviction_failures_total` | Counter | None | One-at-a-time background convergence deletion attempts and hard failures. Successful deletions also increment the aggregate and phase/reason eviction metrics. |
+| `cache_proxy_evictions_total` | Counter | None | Aggregate successful removal of committed cache entries under entry or byte pressure. |
+| `cache_proxy_evictions_by_phase_reason_total` | Counter | `phase`, `reason` | The same evictions by bounded `phase` (`startup`, `background`, or `request`) and pressure `reason` (`entry` or `byte`). Failed or already-absent files are not reported as successful evictions. |
+| `cache_proxy_peer_fetches_total` | Counter | None | Logical peer lookups in either mode. |
+| `cache_proxy_peer_hits_total` | Counter | None | Successful peer body transfers. A block-mode request can record up to two transfers for one logical lookup. |
+| `cache_proxy_peer_probes_total` | Counter | `outcome` | Physical `/cache/has` attempts only. In summary mode these are bounded confirmations of Bloom-positive or uncovered peers, never fleet-wide fanout. The per-request maximum is `CACHE_PEER_MAX_PROBES_PER_REQUEST`. |
+| `cache_proxy_peer_probes_skipped_total` | Counter | None | Summary-mode confirmations skipped because the pod-wide active `/cache/has` HTTP-request/socket budget was exhausted; those requests fall back to origin without queuing. This budget does not count total process goroutines. |
+| `cache_proxy_summary_pulls_total` | Counter | `outcome` | Receiver-driven `GET /cache/summary` attempts by outcome, including success, not-modified, timeout, rejection, and size/read failures. |
+| `cache_proxy_summary_serves_total` | Counter | `outcome` | Local summary endpoint and snapshot-build outcomes. |
+| `cache_proxy_summary_selected_peers` | Gauge | None | Deterministic peer prefix selected for summary pulls after conservatively charging each peer at the largest accepted dynamic bitset. |
+| `cache_proxy_summary_resident_count` | Gauge | None | Current retained peer summary records, including expired records awaiting membership-refresh pruning. |
+| `cache_proxy_summary_valid_resident_peers` | Gauge | None | Retained peer summaries whose advertised TTL has not expired. Compare with selected peers to measure current usable coverage. |
+| `cache_proxy_summary_resident_bytes` | Gauge | None | Conservative total Bloom-state accounting: the current fixed or dynamic local counting filter, maximum v3 snapshot/pull transient reserve, and actual retained remote summary bits. This is reserved/accounted memory, not measured process RSS. It is `0` outside summary mode. |
+| `cache_proxy_summary_memory_limit_bytes` | Gauge | None | Effective `min(1 GiB, 20% of GOMEMLIMIT, optional explicit emergency ceiling)` used for total Bloom-state accounting. It is `0` outside summary mode. Alert when resident bytes approach this value. |
+| `cache_proxy_summary_age_seconds` | Histogram | None | Age of summaries used in local Bloom lookups. |
+| `cache_proxy_summary_lookups_total` | Counter | `outcome` | `no_valid_summary`, `no_positive`, or `positive_candidate`. |
+| `cache_proxy_summary_confirmed_gets_total` | Counter | `outcome` | Peer body GET outcomes in summary mode. A GET is attempted only after an exact bounded `/cache/has` confirmation. |
+| `cache_proxy_summary_bloom_items` | Gauge | None | Local live cache keys represented by the incrementally maintained counting Bloom filter. |
+| `cache_proxy_summary_bloom_design_items` | Gauge | None | Entry count used to derive the current local Bloom dimensions at the 1% target FPR: 1m in fixed mode or disk-derived in dynamic mode. |
+| `cache_proxy_summary_bloom_bits` / `cache_proxy_summary_bloom_hashes` | Gauge | None | Current fixed or disk-derived Bloom-filter layout. |
+| `cache_proxy_summary_bloom_false_positive_ratio` | Gauge | None | Predicted per-peer false-positive ratio from live item count and the current filter layout. Use fleet size to interpret aggregate request cost. |
+| `cache_proxy_summary_bloom_saturated` | Gauge | None | `1` when the local live key count exceeds the current design-item count; snapshot refresh and serving continue. |
+| `cache_proxy_summary_bloom_bit_occupancy_ratio` | Gauge | None | Fraction of local Bloom bits set; a direct saturation signal independent of the FPR estimate. |
+| `cache_proxy_summary_bloom_additions_total` / `cache_proxy_summary_bloom_removals_total` | Counter | None | Cache commits and evictions applied incrementally to the local Bloom index. |
+| `cache_proxy_summary_bloom_counter_saturations_total` | Counter | None | Counting-Bloom cells that reached `uint16` saturation and were made sticky to avoid false negatives. |
+| `cache_proxy_summary_bloom_snapshots_total` / `cache_proxy_summary_bloom_snapshot_bytes` | Counter / Gauge | None | Immutable local Bloom snapshots prepared for the pull endpoint and their bounded raw-bit size. |
+
+Cache-proxy metrics deliberately have no org label. Use the existing per-org
+Duckgres query and worker-acquisition metrics for customer-facing rollout
+guardrails, and use these proxy metrics for cache locality and amplification.
+
+Local cache hit ratio:
+
+```promql
+sum(rate(cache_proxy_hits_total[5m]))
+/
+clamp_min(
+  sum(rate(cache_proxy_hits_total[5m]))
+    + sum(rate(cache_proxy_misses_total[5m])),
+  1e-9
+)
+```
+
+Average physical peer fanout per logical lookup:
+
+```promql
+sum(rate(cache_proxy_peer_probes_total[5m]))
+/
+clamp_min(sum(rate(cache_proxy_peer_fetches_total[5m])), 1e-9)
+```
+
+Successful peer body transfers per logical lookup (this can exceed `1` for a
+multi-block request):
+
+```promql
+sum(rate(cache_proxy_peer_hits_total[5m]))
+/
+clamp_min(sum(rate(cache_proxy_peer_fetches_total[5m])), 1e-9)
+```
+
+For an org-affinity canary, pair those signals with the existing per-org
+customer failure and worker-acquisition guardrails:
+
+```promql
+sum by (org) (
+  rate(duckgres_query_total{status="error"}[5m])
+)
+/
+clamp_min(
+  sum by (org) (rate(duckgres_query_total[5m])),
+  1e-9
+)
+
+sum by (org, outcome) (
+  rate(duckgres_worker_acquire_total_seconds_count{outcome=~"capacity|error|canceled"}[5m])
+)
+/
+on (org) group_left
+clamp_min(
+  sum by (org) (rate(duckgres_worker_acquire_total_seconds_count[5m])),
+  1e-9
+)
+```
 
 ## PromQL recipes
 

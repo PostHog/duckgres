@@ -24,9 +24,8 @@ env:
 # To add a DuckDB version, add a row under matrix.duckdb. The
 # DUCKDB_GO_VERSION / DUCKDB_BINDINGS_VERSION pair maps to the
 # duckdb-go module versions; the encoding is `v0.<major><minor:02d><patch:02d>.0`,
-# so DuckDB 1.5.2 → v0.10502.0 / v2.10502.0 and 1.5.3 → v0.10503.0 /
-# v2.10503.0. See scripts/ducklake_version_matrix.sh for the same
-# mapping in test code.
+# so DuckDB 1.5.5 → v0.10505.0 / v2.10505.0. See
+# scripts/ducklake_version_matrix.sh for the same mapping in test code.
 #
 # Each row must declare every field below — Dockerfile.worker asserts the
 # build-args are non-empty (`:?must be set`) so a forgotten key produces a
@@ -68,21 +67,48 @@ jobs:
             fail-fast: false
             matrix:
                 duckdb:
-                    - version: "1.5.3"
-                      go: "v2.10503.0"
-                      bindings: "v0.10503.0"
+                    - version: "1.5.5"
+                      go: "v2.10505.0"
+                      bindings: "v0.10505.0"
                       # cred-refresh-write-retry: mid-statement S3 credential
-                      # recovery on ExpiredToken read/write auth failures
-                      # (supersedes v1.5.3-cred-refresh, which it is based on).
+                      # recovery on ExpiredToken read/write auth failures.
                       # Lets statements outlive their starting STS token as long
                       # as the credential-refresh scheduler keeps rotating the
                       # ducklake_s3 secret.
-                      httpfs: "v1.5.3-cred-refresh-write-retry"
-                      ducklake: "v1.0-posthog.6"
-                      # Stable repo hosts postgres_scanner for 1.5.3; nightly
-                      # does not. See scripts/ducklake_version_matrix.sh
-                      # commit history for the rationale on each row.
-                      pg_scanner_repo: "https://extensions.duckdb.org"
+                      httpfs: "v1.5.5-cred-refresh-write-retry"
+                      # First PostHog DuckLake release built for DuckDB 1.5.5.
+                      ducklake: "v1.0-posthog.7"
+                      # The stable 1.5.5 scanner predates duckdb-postgres
+                      # 71b85668, which fixes inconsistent snapshots across
+                      # scan connections, so we deliberately take the nightly
+                      # and content-pin it.
+                      #
+                      # WARNING: the nightly URL is a MOVING target — upstream
+                      # rebuilds it and the pinned hash then stops matching,
+                      # which hard-fails every build until someone re-pins
+                      # (2026-08-04 -> 2026-08-08 was one such break). These
+                      # hashes were re-pinned to the nightly served on
+                      # 2026-08-08; the previous pin named descendant ab217c6,
+                      # and the current artifact's upstream commit is not
+                      # identifiable from the artifact itself. It is still
+                      # necessarily a descendant of 71b85668 (it is newer than
+                      # ab217c6, which already was), so the reason for
+                      # preferring nightly over stable still holds — but the
+                      # exact scanner build we ship is no longer named here.
+                      # Mirroring the artifact we want, instead of pinning a
+                      # hash against a URL whose contents change, is the real
+                      # fix.
+                      #
+                      # These values are duplicated in e2e-mw-dev.yml,
+                      # scenario-dev.yml, Dockerfile and Dockerfile.worker.
+                      # The workflow build-args OVERRIDE the Dockerfile ARG
+                      # defaults, so updating only the Dockerfiles does
+                      # nothing for CI — change all five together.
+                      pg_scanner_repo: "https://nightly-extensions.duckdb.org"
+                      pg_scanner_sha256_amd64: "7ff4913fab203f7895eaa6a9a87a14a7ad659d400deff667f8bf16e58a28937f"
+                      pg_scanner_sha256_arm64: "9ea7d5a3610f2b460bd2a5075684c5f6dad55fa19745a377b5471f4994a8b460"
+                      # Fleet default: also publishes the unsuffixed tags and
+                      # dispatches Charts.
                       default: true
                 platform:
                     - platform: linux/arm64
@@ -140,6 +166,8 @@ jobs:
                       HTTPFS_EXTENSION_TAG=${{ matrix.duckdb.httpfs }}
                       DUCKLAKE_EXTENSION_TAG=${{ matrix.duckdb.ducklake }}
                       POSTGRES_SCANNER_REPOSITORY=${{ matrix.duckdb.pg_scanner_repo }}
+                      POSTGRES_SCANNER_SHA256_AMD64=${{ matrix.duckdb.pg_scanner_sha256_amd64 }}
+                      POSTGRES_SCANNER_SHA256_ARM64=${{ matrix.duckdb.pg_scanner_sha256_arm64 }}
                   cache-from: type=gha,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                   cache-to: type=gha,mode=max,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
 
@@ -264,7 +292,7 @@ jobs:
             fail-fast: false
             matrix:
                 duckdb:
-                    - version: "1.5.3"
+                    - version: "1.5.5"
                       default: true
         runs-on: ubuntu-24.04
         permissions:

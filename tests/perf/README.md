@@ -15,7 +15,7 @@ relation_variants:
   raw_view:
     events: frozen_v1.events_file_view
     persons: frozen_v1.persons_file_view
-  managed_table:
+  ducklake_table:
     events: posthog.events
     persons: posthog.persons
 
@@ -33,10 +33,10 @@ paired_queries:
       ORDER BY 1
 ```
 
-Paired catalogs must declare exactly the `raw_view` and `managed_table`
+Paired catalogs must declare exactly the `raw_view` and `ducklake_table`
 variants. A template expands in declaration order, with `raw_view` before
-`managed_table`, into `q_events_daily__raw_view` and
-`q_events_daily__managed_table`. Generated queries retain the same
+`ducklake_table`, into `q_events_daily__raw_view` and
+`q_events_daily__ducklake_table`. Generated queries retain the same
 `intent_id`, tags, parameters, and semantic template; only declared relation
 placeholders differ. They carry in-memory storage-target metadata, so later
 code does not need to infer the target from the generated ID. Legacy queries
@@ -50,9 +50,11 @@ template. Bindings are unquoted, dot-separated identifiers such as
 `posthog.events`; the loader validates every identifier segment and emits it
 as a safely quoted relation. SQL expressions, comments, semicolons,
 whitespace, quoted identifiers, and malformed names are rejected in bindings;
-all template actions other than the relation placeholder are rejected. The
-rendered SQL must be a single read-only `SELECT` statement and is copied into
-both current protocol SQL fields.
+all template actions other than the relation placeholder are rejected.
+Placeholder syntax inside SQL strings, quoted identifiers, or comments is also
+rejected so a target cannot be mislabeled without changing the executed
+relation. The rendered SQL must be a single read-only `SELECT` statement and is
+stored in the PGWire SQL field.
 
 This is catalog abstraction only. Fair scheduling, migration of the real
 frozen PostHog query catalog, paired artifacts, dashboards, and Grafana work
@@ -73,16 +75,14 @@ go test ./tests/perf \
   -perf-catalog tests/perf/queries/smoke.yaml
 ```
 
-By default the harness auto-starts a temporary local Duckgres control-plane
-instance with Flight ingress, executes queries over both protocols, then shuts
-it down after artifact generation.
+By default the harness auto-starts a temporary local Duckgres control plane,
+executes queries over pgwire, then shuts it down after artifact generation.
 
 For frozen DuckLake dataset smoke runs, set:
 
 ```bash
 DUCKGRES_PERF_DATASET_VERSION=v1 \
 DUCKGRES_PERF_PGWIRE_DSN="host=127.0.0.1 port=5432 user=perfuser dbname=test sslmode=require" \
-DUCKGRES_PERF_FLIGHT_ADDR="127.0.0.1:50051" \
 ./scripts/perf_smoke.sh
 ```
 
@@ -133,7 +133,7 @@ Nightly uses lock/timeout guards:
 Nightly frozen dataset requirements:
 
 - `DUCKGRES_PERF_DATASET_VERSION` is required
-- `DUCKGRES_PERF_PGWIRE_DSN` and `DUCKGRES_PERF_FLIGHT_ADDR` are required
+- `DUCKGRES_PERF_PGWIRE_DSN` is required
 - default catalog is `tests/perf/queries/ducklake_frozen.yaml`
 - `dataset_manifest.json` must exist after run and match the configured dataset version
 
@@ -151,4 +151,3 @@ Optional artifact publisher:
 - `-perf-output-base`: base output directory.
 - `-perf-run-id`: fixed run id.
 - `-perf-pgwire-dsn`: use an existing PGWire endpoint instead of auto-start.
-- `-perf-flight-addr`: use an existing Flight endpoint instead of auto-start.

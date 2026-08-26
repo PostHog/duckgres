@@ -37,13 +37,14 @@ import (
 const MaxGRPCMessageSize = 1 << 30 // 1GB
 
 const (
-	waitSessionIdleAction    = "WaitSessionIdle"
-	releaseQueryHandleAction = "ReleaseQueryHandle"
-	logQueryAction           = "LogQuery"
-	setSessionS3CacheAction  = "SetSessionS3Cache"
-	queryCloseWaitTimeout    = 30 * time.Second
-	queryLogForwardTimeout   = 5 * time.Second
-	queryLogMaxInFlight      = 64
+	waitSessionIdleAction       = "WaitSessionIdle"
+	releaseQueryHandleAction    = "ReleaseQueryHandle"
+	logQueryAction              = "LogQuery"
+	setSessionS3CacheAction     = "SetSessionS3Cache"
+	setSessionS3CacheModeAction = "SetSessionS3CacheMode"
+	queryCloseWaitTimeout       = 30 * time.Second
+	queryLogForwardTimeout      = 5 * time.Second
+	queryLogMaxInFlight         = 64
 )
 
 // ErrWorkerDead is returned when the backing worker process has crashed.
@@ -201,8 +202,8 @@ func (e *FlightExecutor) withSession(ctx context.Context) context.Context {
 		"x-duckgres-owner-epoch", strconv.FormatInt(e.ownerEpoch, 10),
 	)
 	// Sourced from the context rather than executor state: the executor is
-	// per-session and serves many statements, and both front-ends (PG wire and
-	// the Flight SQL ingress) reach it through the same call.
+	// per-session and serves many statements while pgwire reaches it through
+	// the same call.
 	if queryID := wire.QueryIDFromContext(ctx); queryID != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, wire.QueryIDMetadataKey, queryID)
 	}
@@ -242,6 +243,7 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 	// Return empty results for queries that are only semicolons, whitespace,
 	// and/or comments. These represent PostgreSQL client pings (e.g., pgx sends "-- ping").
 	if sqlcore.IsEmptyQuery(query) {
+		e.lastProfiling.Store("")
 		return &emptyRowSet{}, nil
 	}
 
@@ -287,7 +289,8 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		return nil, err
 	}
 
-	reader, err := e.client.DoGet(reqCtx, ticket)
+	var doGetTrailer metadata.MD
+	reader, err := e.client.DoGet(reqCtx, ticket, grpc.Trailer(&doGetTrailer))
 	if err != nil {
 		// If cancellation lands after Execute has registered a worker-side
 		// handle but before DoGet returns a RowSet, there is no Close call to
@@ -312,6 +315,9 @@ func (e *FlightExecutor) QueryContext(ctx context.Context, query string, args ..
 		schema:        schema,
 		cancel:        cancel,
 		waitForClosed: e.waitForSessionIdle,
+		storeProfiling: func() {
+			e.storeProfilingFromTrailer(doGetTrailer)
+		},
 	}, nil
 }
 
@@ -651,6 +657,49 @@ func (e *FlightExecutor) SetS3CacheEnabled(ctx context.Context, enabled bool) (e
 	}
 }
 
+// SetS3CacheMode selects the cache transport mode on the session worker.
+func (e *FlightExecutor) SetS3CacheMode(ctx context.Context, mode string) (err error) {
+	if e.dead.Load() {
+		return ErrWorkerDead
+	}
+	if e.client == nil || e.client.Client == nil {
+		return ErrWorkerDead
+	}
+	defer recoverClientPanic(&err)
+
+	payload, err := json.Marshal(wire.WorkerSetS3CachePayload{
+		WorkerControlMetadata: wire.WorkerControlMetadata{
+			WorkerID:     e.workerID,
+			OwnerEpoch:   e.ownerEpoch,
+			CPInstanceID: e.cpInstanceID,
+		},
+		Mode: mode,
+	})
+	if err != nil {
+		return err
+	}
+
+	merged, cancel := e.mergedContext(ctx)
+	defer cancel()
+
+	stream, err := e.client.Client.DoAction(
+		e.withSession(merged),
+		&flight.Action{Type: setSessionS3CacheModeAction, Body: payload},
+	)
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
 func (e *FlightExecutor) releaseQueryHandle(ticket *flight.Ticket) (err error) {
 	if e.dead.Load() {
 		return nil
@@ -737,14 +786,24 @@ type FlightRowSet struct {
 	schema *arrow.Schema
 
 	// Current batch state
-	currentBatch  arrow.RecordBatch
-	batchRow      int // current row index within currentBatch
-	done          bool
-	err           error
-	closeOnce     sync.Once
-	closeErr      error
-	cancel        context.CancelFunc
-	waitForClosed func() error
+	currentBatch   arrow.RecordBatch
+	batchRow       int // current row index within currentBatch
+	done           bool
+	err            error
+	closeOnce      sync.Once
+	closeErr       error
+	cancel         context.CancelFunc
+	waitForClosed  func() error
+	storeProfiling func()
+	profilingOnce  sync.Once
+}
+
+func (r *FlightRowSet) captureProfiling() {
+	r.profilingOnce.Do(func() {
+		if r.storeProfiling != nil {
+			r.storeProfiling()
+		}
+	})
 }
 
 func (r *FlightRowSet) Columns() ([]string, error) {
@@ -794,6 +853,9 @@ func (r *FlightRowSet) Next() bool {
 
 	r.done = true
 	r.err = r.reader.Err()
+	if r.err == nil {
+		r.captureProfiling()
+	}
 	return false
 }
 
@@ -830,6 +892,9 @@ func (r *FlightRowSet) Close() error {
 			r.currentBatch = nil
 		}
 		r.reader.Release()
+		if r.done && r.err == nil {
+			r.captureProfiling()
+		}
 		if r.waitForClosed != nil && (!r.done || r.err != nil) {
 			r.closeErr = r.waitForClosed()
 		}

@@ -33,7 +33,7 @@ type ManagedSession struct {
 	PID          int32
 	Username     string // org user the session was created for (for admin slicing/attribution)
 	WorkerID     int
-	Protocol     string    // "postgres" or "flight"
+	Protocol     string    // "postgres" or "admin"
 	StartedAt    time.Time // when the session was created (UTC); surfaced in the Live view
 	SessionToken string
 	Executor     *flightclient.FlightExecutor
@@ -99,14 +99,6 @@ type SessionManager struct {
 	// multitenant/remote backend. A loader error must not block the session:
 	// callers log and continue without secrets.
 	userSecretLoader func(ctx context.Context, username string) ([]string, error)
-}
-
-type flightReconnectPool interface {
-	ReconnectFlightWorker(ctx context.Context, workerID int, ownerEpoch int64) (*ManagedWorker, error)
-}
-
-type flightReconnectProfileProvider interface {
-	ReconnectFlightWorkerProfile(ctx context.Context, workerID int, ownerEpoch int64) (*WorkerProfile, error)
 }
 
 type connectionWaiter struct {
@@ -346,9 +338,6 @@ func (sm *SessionManager) CreateSessionWithProtocol(ctx context.Context, usernam
 		resultErr = ErrSessionManagerDraining
 	}()
 
-	if protocol == "flight" && pid == 0 {
-		pid = sm.ReservePID()
-	}
 	lease, err := sm.acquireConnectionSlot(ctx, pid, username, protocol, profile)
 	if err != nil {
 		return 0, nil, err
@@ -521,63 +510,6 @@ func (sm *SessionManager) resolveSessionLimits(memoryLimit string, threads int) 
 	return memoryLimit, threads
 }
 
-func (sm *SessionManager) ReconnectFlightSession(ctx context.Context, username string, workerID int, ownerEpoch int64) (resultPID int32, resultExecutor *flightclient.FlightExecutor, resultErr error) {
-	ctx, finishCreation, err := sm.beginSessionCreation(ctx)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer func() {
-		if !finishCreation() {
-			return
-		}
-		if resultErr == nil && resultPID != 0 {
-			sm.DestroySession(resultPID)
-			resultPID = 0
-			resultExecutor = nil
-		}
-		resultErr = ErrSessionManagerDraining
-	}()
-
-	var profile *WorkerProfile
-	if provider, ok := sm.pool.(flightReconnectProfileProvider); ok {
-		profile, err = provider.ReconnectFlightWorkerProfile(ctx, workerID, ownerEpoch)
-		if err != nil {
-			return 0, nil, fmt.Errorf("resolve reconnect worker profile %d: %w", workerID, err)
-		}
-	}
-
-	pid := sm.ReservePID()
-	lease, err := sm.acquireConnectionSlot(ctx, pid, username, "flight", profile)
-	if err != nil {
-		return 0, nil, err
-	}
-	success := false
-	defer func() {
-		if !success {
-			sm.releaseConnectionSlot(lease)
-		}
-	}()
-
-	reconnector, ok := sm.pool.(flightReconnectPool)
-	if !ok {
-		return 0, nil, fmt.Errorf("worker pool does not support flight reconnect")
-	}
-	worker, err := reconnector.ReconnectFlightWorker(ctx, workerID, ownerEpoch)
-	if err != nil {
-		return 0, nil, fmt.Errorf("reconnect worker %d: %w", workerID, err)
-	}
-	pid, exec, err := sm.createSessionOnWorker(ctx, username, pid, "", 0, worker, "flight", false, lease)
-	if err != nil {
-		// ReconnectFlightWorker pre-claimed the session on the worker; undo
-		// the claim so the worker parks hot-idle instead of looking busy
-		// forever with no session on it.
-		sm.pool.ReleaseWorker(worker.ID)
-		return 0, nil, err
-	}
-	success = true
-	return pid, exec, nil
-}
-
 func (sm *SessionManager) beginSessionCreation(ctx context.Context) (context.Context, func() bool, error) {
 	return sm.lifecycle.begin(ctx)
 }
@@ -608,7 +540,7 @@ func (sm *SessionManager) createSessionOnWorker(ctx context.Context, username st
 		}
 	}
 
-	sessionToken, secretWarnings, err := worker.CreateSession(ctx, username, memoryLimit, threads, secretStatements)
+	sessionToken, secretWarnings, err := worker.CreateSession(ctx, username, memoryLimit, threads, secretStatements, pid)
 	if err != nil {
 		sm.log.Warn("Failed to create session on worker.",
 			"pid", pid,
@@ -1013,6 +945,49 @@ func (sm *SessionManager) WorkerIDForPID(pid int32) int {
 	return -1
 }
 
+// SetWorkerTTLForPID overrides the hot-idle TTL of the worker bound to pid's
+// session — the apply half of the `duckgres.worker_ttl` session GUC. It is a
+// no-op success when the pool has no per-worker TTL (the process backend:
+// its idle reaping is pool-global, and the GUC hook is only installed for the
+// remote backend anyway). An error means the override did NOT take effect
+// (the session or its worker is gone), so the caller must not update its
+// session state.
+func (sm *SessionManager) SetWorkerTTLForPID(pid int32, ttl time.Duration) error {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("no session for pid %d", pid)
+	}
+	pool, ok := sm.pool.(workerTTLPool)
+	if !ok {
+		return nil
+	}
+	if !pool.SetWorkerTTL(s.WorkerID, ttl) {
+		return fmt.Errorf("worker %d is no longer in the pool", s.WorkerID)
+	}
+	return nil
+}
+
+// WorkerTTLForPID reports the hot-idle TTL the worker bound to pid's session
+// would park with right now — the SHOW half of the `duckgres.worker_ttl`
+// session GUC. ok=false when there is no session, no worker, or the pool has
+// no per-worker TTL. A zero TTL with ok=true means the deployment default
+// applies at reap time (the caller resolves it).
+func (sm *SessionManager) WorkerTTLForPID(pid int32) (time.Duration, bool) {
+	sm.mu.RLock()
+	s, ok := sm.sessions[pid]
+	sm.mu.RUnlock()
+	if !ok {
+		return 0, false
+	}
+	pool, ok := sm.pool.(workerTTLPool)
+	if !ok {
+		return 0, false
+	}
+	return pool.WorkerTTL(s.WorkerID)
+}
+
 // SessionForWorker returns the session bound to the given cluster-unique worker
 // id, or ok=false if this stack has none. One session per worker, so the first
 // (only) pid in the worker's index is authoritative. Used by the admin
@@ -1028,7 +1003,7 @@ func (sm *SessionManager) SessionForWorker(workerID int) (*ManagedSession, bool)
 	return s, ok
 }
 
-// ProtocolForPID returns the wire protocol ("postgres"/"flight") for a session,
+// ProtocolForPID returns the session interface ("postgres"/"admin"),
 // or "" if not found. O(1) lookup for the admin live-query detail view.
 func (sm *SessionManager) ProtocolForPID(pid int32) string {
 	sm.mu.RLock()

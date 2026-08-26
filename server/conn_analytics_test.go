@@ -35,7 +35,7 @@ func installFakeQueryTracker(t *testing.T) *fakeQueryTracker {
 
 func TestLogClientQueryReceivedEmitsQueryInitiated(t *testing.T) {
 	fake := installFakeQueryTracker(t)
-	c := &clientConn{orgID: "acme", username: "root", teamID: 42, ctx: context.Background()}
+	c := &clientConn{orgID: "acme", username: "root", teamID: 42, applicationName: "psql", ctx: context.Background()}
 
 	c.logClientQueryReceived(context.Background(), "simple", "SELECT 1")
 
@@ -55,11 +55,14 @@ func TestLogClientQueryReceivedEmitsQueryInitiated(t *testing.T) {
 	if e.props["team_id"] != int64(42) {
 		t.Errorf("team_id = %v, want 42", e.props["team_id"])
 	}
+	if e.props["application_name"] != "psql" {
+		t.Errorf("application_name = %v, want psql", e.props["application_name"])
+	}
 }
 
 func TestLogQueryErrorEmitsQueryFailed(t *testing.T) {
 	fake := installFakeQueryTracker(t)
-	c := &clientConn{orgID: "acme", username: "root", ctx: context.Background()}
+	c := &clientConn{orgID: "acme", username: "root", applicationName: "dagster", ctx: context.Background()}
 
 	// A plain error matches no DuckDB prefix → system category, XX000.
 	c.logQueryError("SELECT 1", errors.New("worker connection reset"))
@@ -80,6 +83,9 @@ func TestLogQueryErrorEmitsQueryFailed(t *testing.T) {
 	if e.props["error_code"] != "XX000" {
 		t.Errorf("error_code = %v, want XX000", e.props["error_code"])
 	}
+	if e.props["application_name"] != "dagster" {
+		t.Errorf("application_name = %v, want dagster", e.props["application_name"])
+	}
 }
 
 func TestLogQueryErrorClassifiesUserError(t *testing.T) {
@@ -99,7 +105,7 @@ func TestLogQueryEmitsQueryCompletedOnSuccess(t *testing.T) {
 	fake := installFakeQueryTracker(t)
 	// No server → queryLogSink is nil, so this exercises the analytics emission
 	// independently of the query-log sink.
-	c := &clientConn{orgID: "acme", username: "root", teamID: 42, ctx: context.Background()}
+	c := &clientConn{orgID: "acme", username: "root", teamID: 42, applicationName: "posthog-register", ctx: context.Background()}
 	c.lastProfilingSummary = observe.QueryProfilingSummary{CPUTimeSeconds: 2.5}
 
 	c.logQuery(time.Now().Add(-100*time.Millisecond), "SELECT 1", "SELECT 1", "SELECT", 1, 0, "", "", "simple")
@@ -116,6 +122,9 @@ func TestLogQueryEmitsQueryCompletedOnSuccess(t *testing.T) {
 	}
 	if e.props["team_id"] != int64(42) {
 		t.Errorf("team_id = %v, want 42", e.props["team_id"])
+	}
+	if e.props["application_name"] != "posthog-register" {
+		t.Errorf("application_name = %v, want posthog-register", e.props["application_name"])
 	}
 	if e.props["cpu_seconds"] != 2.5 {
 		t.Errorf("cpu_seconds = %v, want 2.5", e.props["cpu_seconds"])

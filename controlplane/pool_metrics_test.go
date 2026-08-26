@@ -222,42 +222,57 @@ func TestReapStuckActivatingWorkers_RecentlyReservedNotReaped(t *testing.T) {
 	}
 }
 
-func TestObserveWorkerLifecycleStatsSeedsZerosAndDeletesStaleImages(t *testing.T) {
+func TestObserveWorkerLifecycleStatsSeedsZerosAndDeletesStaleImageOrgPairs(t *testing.T) {
 	currentImage := "duckgres:current-lifecycle"
 	staleImage := "duckgres:stale-lifecycle"
-	workerLifecycleCountGauge.DeleteLabelValues(currentImage, string(configstore.WorkerStateIdle), "neutral")
-	workerLifecycleCountGauge.DeleteLabelValues(currentImage, string(configstore.WorkerStateHot), "org_bound")
-	workerLifecycleCountGauge.DeleteLabelValues(staleImage, string(configstore.WorkerStateIdle), "neutral")
+	currentOrg := "current-org"
+	staleOrg := "stale-org"
+	workerLifecycleCountGauge.DeleteLabelValues(currentImage, string(configstore.WorkerStateIdle), "neutral", currentOrg)
+	workerLifecycleCountGauge.DeleteLabelValues(currentImage, string(configstore.WorkerStateHot), "org_bound", currentOrg)
+	workerLifecycleCountGauge.DeleteLabelValues(currentImage, string(configstore.WorkerStateIdle), "neutral", staleOrg)
+	workerLifecycleCountGauge.DeleteLabelValues(staleImage, string(configstore.WorkerStateIdle), "neutral", staleOrg)
 
 	previous := []configstore.WorkerLifecycleStats{
-		{Image: staleImage, State: configstore.WorkerStateIdle, Binding: "neutral", Count: 3},
+		{Image: staleImage, State: configstore.WorkerStateIdle, Binding: "neutral", Org: staleOrg, Count: 3},
+		{Image: currentImage, State: configstore.WorkerStateIdle, Binding: "neutral", Org: staleOrg, Count: 2},
 	}
 	observeWorkerLifecycleStats(previous)
 	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
 		"image":   staleImage,
 		"state":   string(configstore.WorkerStateIdle),
 		"binding": "neutral",
+		"org":     staleOrg,
 	}); !ok {
-		t.Fatal("expected stale image series to exist before replacement observation")
+		t.Fatal("expected stale image/org series to exist before replacement observation")
 	}
 
 	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
-		{Image: currentImage, State: configstore.WorkerStateHot, Binding: "org_bound", Count: 1},
+		{Image: currentImage, State: configstore.WorkerStateHot, Binding: "org_bound", Org: currentOrg, Count: 1},
 	}, previous)
 
 	if got, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
 		"image":   currentImage,
 		"state":   string(configstore.WorkerStateIdle),
 		"binding": "neutral",
+		"org":     currentOrg,
 	}); !ok || got != 0 {
-		t.Fatalf("expected seeded idle/neutral zero series for current image, got value=%v ok=%v", got, ok)
+		t.Fatalf("expected seeded idle/neutral zero series for current image/org, got value=%v ok=%v", got, ok)
 	}
 	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
 		"image":   staleImage,
 		"state":   string(configstore.WorkerStateIdle),
 		"binding": "neutral",
+		"org":     staleOrg,
 	}); ok {
-		t.Fatal("expected stale lifecycle image series to be deleted")
+		t.Fatal("expected stale lifecycle image/org series to be deleted")
+	}
+	if _, ok := metricGaugeFamilyLabelValue(t, "duckgres_worker_lifecycle_count", map[string]string{
+		"image":   currentImage,
+		"state":   string(configstore.WorkerStateIdle),
+		"binding": "neutral",
+		"org":     staleOrg,
+	}); ok {
+		t.Fatal("expected stale lifecycle org series to be deleted even when its image remains")
 	}
 }
 
@@ -265,12 +280,12 @@ func TestResetLeaderOwnedClusterMetrics(t *testing.T) {
 	image := "duckgres:leader-reset-test"
 
 	observeWorkerLifecycleStats([]configstore.WorkerLifecycleStats{
-		{Image: image, State: configstore.WorkerStateIdle, Binding: "org_bound", Count: 2},
+		{Image: image, State: configstore.WorkerStateIdle, Binding: "org_bound", Org: "analytics", Count: 2},
 	})
 
 	resetLeaderOwnedClusterMetrics()
 
-	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "org_bound")
+	assertGaugeVecValue(t, workerLifecycleCountGauge, 0, image, string(configstore.WorkerStateIdle), "org_bound", "analytics")
 }
 
 // --- Helpers ---

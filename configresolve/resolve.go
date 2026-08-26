@@ -29,11 +29,6 @@ type CLIInputs struct {
 
 	Host                        string
 	Port                        int
-	FlightPort                  int
-	FlightSessionIdleTTL        string
-	FlightSessionReapInterval   string
-	FlightHandleIdleTTL         string
-	FlightSessionTokenTTL       string
 	DataDir                     string
 	CertFile                    string
 	KeyFile                     string
@@ -64,8 +59,8 @@ type CLIInputs struct {
 	ConfigPollInterval          string
 	InternalSecret              string
 	InternalSecretFallbacks     string
-	ReadOnlySecret             string
-	ReadOnlySecretFallbacks    string
+	ReadOnlySecret              string
+	ReadOnlySecretFallbacks     string
 	SNIRoutingMode              string
 	ManagedHostnameSuffixes     string
 	WorkerBackend               string
@@ -121,6 +116,10 @@ type Resolved struct {
 	K8sWorkerProfileMaxMemory       string
 	K8sWorkerMaxTTL                 time.Duration
 	K8sWorkerDefaultTTL             time.Duration
+	K8sExploratoryTierEnabled       bool
+	K8sExploratoryWorkerCPU         string
+	K8sExploratoryWorkerMemory      string
+	K8sExploratoryWorkerTTL         time.Duration
 	K8sReshardPodCPU                string
 	K8sReshardPodMemory             string
 	AWSRegion                       string
@@ -128,8 +127,8 @@ type Resolved struct {
 	ConfigPollInterval              time.Duration
 	InternalSecret                  string
 	InternalSecretFallbacks         []string
-	ReadOnlySecret                 string
-	ReadOnlySecretFallbacks        []string
+	ReadOnlySecret                  string
+	ReadOnlySecretFallbacks         []string
 	UserSecretKey                   string
 	SNIRoutingMode                  string
 	ManagedHostnameSuffixes         []string
@@ -146,17 +145,12 @@ func boolPtr(b bool) *bool { return &b }
 
 func DefaultServerConfig() server.Config {
 	return server.Config{
-		Host:                      "0.0.0.0",
-		Port:                      5432,
-		FlightPort:                0,
-		FlightSessionIdleTTL:      10 * time.Minute,
-		FlightSessionReapInterval: 1 * time.Minute,
-		FlightHandleIdleTTL:       15 * time.Minute,
-		FlightSessionTokenTTL:     1 * time.Hour,
-		DataDir:                   "./data",
-		SessionInitTimeout:        server.DefaultSessionInitTimeout,
-		TLSCertFile:               "./certs/server.crt",
-		TLSKeyFile:                "./certs/server.key",
+		Host:               "0.0.0.0",
+		Port:               5432,
+		DataDir:            "./data",
+		SessionInitTimeout: server.DefaultSessionInitTimeout,
+		TLSCertFile:        "./certs/server.crt",
+		TLSKeyFile:         "./certs/server.key",
 		Users: map[string]string{
 			"postgres": "postgres",
 		},
@@ -214,6 +208,9 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	var k8sWorkerCPURequest, k8sWorkerMemoryRequest string
 	var k8sWorkerNodeSelector, k8sWorkerTolerationKey, k8sWorkerTolerationValue string
 	var k8sReshardPodCPU, k8sReshardPodMemory string
+	var k8sExploratoryTierEnabled bool
+	var k8sExploratoryWorkerCPU, k8sExploratoryWorkerMemory string
+	var k8sExploratoryWorkerTTL time.Duration
 	var awsRegion string
 	var configStoreConn string
 	var configPollInterval time.Duration
@@ -234,37 +231,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		}
 		if fileCfg.Port != 0 {
 			cfg.Port = fileCfg.Port
-		}
-		if fileCfg.FlightPort != 0 {
-			cfg.FlightPort = fileCfg.FlightPort
-		}
-		if fileCfg.FlightSessionIdleTTL != "" {
-			if d, err := time.ParseDuration(fileCfg.FlightSessionIdleTTL); err == nil {
-				cfg.FlightSessionIdleTTL = d
-			} else {
-				warn("Invalid flight_session_idle_ttl duration: " + err.Error())
-			}
-		}
-		if fileCfg.FlightSessionReapInterval != "" {
-			if d, err := time.ParseDuration(fileCfg.FlightSessionReapInterval); err == nil {
-				cfg.FlightSessionReapInterval = d
-			} else {
-				warn("Invalid flight_session_reap_interval duration: " + err.Error())
-			}
-		}
-		if fileCfg.FlightHandleIdleTTL != "" {
-			if d, err := time.ParseDuration(fileCfg.FlightHandleIdleTTL); err == nil {
-				cfg.FlightHandleIdleTTL = d
-			} else {
-				warn("Invalid flight_handle_idle_ttl duration: " + err.Error())
-			}
-		}
-		if fileCfg.FlightSessionTokenTTL != "" {
-			if d, err := time.ParseDuration(fileCfg.FlightSessionTokenTTL); err == nil {
-				cfg.FlightSessionTokenTTL = d
-			} else {
-				warn("Invalid flight_session_token_ttl duration: " + err.Error())
-			}
 		}
 		if fileCfg.DataDir != "" {
 			cfg.DataDir = fileCfg.DataDir
@@ -512,41 +478,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			cfg.Port = p
 		}
 	}
-	if v := getenv("DUCKGRES_FLIGHT_PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			cfg.FlightPort = p
-		} else {
-			warn("Invalid DUCKGRES_FLIGHT_PORT: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_FLIGHT_SESSION_IDLE_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.FlightSessionIdleTTL = d
-		} else {
-			warn("Invalid DUCKGRES_FLIGHT_SESSION_IDLE_TTL duration: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.FlightSessionReapInterval = d
-		} else {
-			warn("Invalid DUCKGRES_FLIGHT_SESSION_REAP_INTERVAL duration: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_FLIGHT_HANDLE_IDLE_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.FlightHandleIdleTTL = d
-		} else {
-			warn("Invalid DUCKGRES_FLIGHT_HANDLE_IDLE_TTL duration: " + err.Error())
-		}
-	}
-	if v := getenv("DUCKGRES_FLIGHT_SESSION_TOKEN_TTL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.FlightSessionTokenTTL = d
-		} else {
-			warn("Invalid DUCKGRES_FLIGHT_SESSION_TOKEN_TTL duration: " + err.Error())
-		}
-	}
 	if v := getenv("DUCKGRES_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}
@@ -657,6 +588,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			warn("Invalid DUCKGRES_IDLE_TIMEOUT duration: " + err.Error())
 		}
 	}
+	if v := getenv("DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.ClientIdleTimeoutMax = d
+		} else {
+			warn("Invalid DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX: must be a positive duration")
+		}
+	}
 	if v := getenv("DUCKGRES_SESSION_INIT_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.SessionInitTimeout = d
@@ -682,6 +620,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			cfg.MemoryRebalance = b
 		} else {
 			warn("Invalid DUCKGRES_MEMORY_REBALANCE: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_DISABLE_PARQUET_PREFETCHING"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			cfg.DisableParquetPrefetching = b
+		} else {
+			warn("Invalid DUCKGRES_DISABLE_PARQUET_PREFETCHING: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_PROCESS_MIN_WORKERS"); v != "" {
@@ -909,6 +854,29 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		k8sPlaceholderPriorityClassName = v
 	}
 
+	// Exploratory small-worker tier (env-only, like the other pod-shape knobs).
+	// See docs/superpowers/specs/2026-08-04-exploratory-worker-tier-design.md.
+	if v := getenv("DUCKGRES_EXPLORATORY_TIER_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			k8sExploratoryTierEnabled = b
+		} else {
+			warn("Invalid DUCKGRES_EXPLORATORY_TIER_ENABLED: " + err.Error())
+		}
+	}
+	if v := getenv("DUCKGRES_EXPLORATORY_WORKER_CPU"); v != "" {
+		k8sExploratoryWorkerCPU = v
+	}
+	if v := getenv("DUCKGRES_EXPLORATORY_WORKER_MEMORY"); v != "" {
+		k8sExploratoryWorkerMemory = v
+	}
+	if v := getenv("DUCKGRES_EXPLORATORY_WORKER_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			k8sExploratoryWorkerTTL = d
+		} else {
+			warn("Invalid DUCKGRES_EXPLORATORY_WORKER_TTL: " + v)
+		}
+	}
+
 	if v := getenv("DUCKGRES_AWS_REGION"); v != "" {
 		awsRegion = v
 	}
@@ -951,37 +919,6 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 	}
 	if cli.Set["port"] {
 		cfg.Port = cli.Port
-	}
-	if cli.Set["flight-port"] {
-		cfg.FlightPort = cli.FlightPort
-	}
-	if cli.Set["flight-session-idle-ttl"] {
-		if d, err := time.ParseDuration(cli.FlightSessionIdleTTL); err == nil {
-			cfg.FlightSessionIdleTTL = d
-		} else {
-			warn("Invalid --flight-session-idle-ttl duration: " + err.Error())
-		}
-	}
-	if cli.Set["flight-session-reap-interval"] {
-		if d, err := time.ParseDuration(cli.FlightSessionReapInterval); err == nil {
-			cfg.FlightSessionReapInterval = d
-		} else {
-			warn("Invalid --flight-session-reap-interval duration: " + err.Error())
-		}
-	}
-	if cli.Set["flight-handle-idle-ttl"] {
-		if d, err := time.ParseDuration(cli.FlightHandleIdleTTL); err == nil {
-			cfg.FlightHandleIdleTTL = d
-		} else {
-			warn("Invalid --flight-handle-idle-ttl duration: " + err.Error())
-		}
-	}
-	if cli.Set["flight-session-token-ttl"] {
-		if d, err := time.ParseDuration(cli.FlightSessionTokenTTL); err == nil {
-			cfg.FlightSessionTokenTTL = d
-		} else {
-			warn("Invalid --flight-session-token-ttl duration: " + err.Error())
-		}
 	}
 	if cli.Set["data-dir"] {
 		cfg.DataDir = cli.DataDir
@@ -1248,6 +1185,10 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		K8sWorkerProfileMaxMemory:       k8sWorkerProfileMaxMemory,
 		K8sWorkerMaxTTL:                 k8sWorkerMaxTTL,
 		K8sWorkerDefaultTTL:             k8sWorkerDefaultTTL,
+		K8sExploratoryTierEnabled:       k8sExploratoryTierEnabled,
+		K8sExploratoryWorkerCPU:         k8sExploratoryWorkerCPU,
+		K8sExploratoryWorkerMemory:      k8sExploratoryWorkerMemory,
+		K8sExploratoryWorkerTTL:         k8sExploratoryWorkerTTL,
 		K8sReshardPodCPU:                k8sReshardPodCPU,
 		K8sReshardPodMemory:             k8sReshardPodMemory,
 		AWSRegion:                       awsRegion,
@@ -1255,8 +1196,8 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		ConfigPollInterval:              configPollInterval,
 		InternalSecret:                  internalSecret,
 		InternalSecretFallbacks:         internalSecretFallbacks,
-		ReadOnlySecret:                 readOnlySecret,
-		ReadOnlySecretFallbacks:        readOnlySecretFallbacks,
+		ReadOnlySecret:                  readOnlySecret,
+		ReadOnlySecretFallbacks:         readOnlySecretFallbacks,
 		UserSecretKey:                   userSecretKey,
 		SNIRoutingMode:                  sniRoutingMode,
 		ManagedHostnameSuffixes:         managedHostnameSuffixes,

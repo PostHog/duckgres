@@ -285,7 +285,7 @@ func TestInFlightScanDiesOnCredentialRotation(t *testing.T) {
 // the credentials it started with.
 //
 // Runs only when DUCKGRES_TEST_PATCHED_HTTPFS points at a locally-built
-// extension binary (see PostHog/duckdb-httpfs v1.5.3-cred-refresh-write-retry):
+// extension binary (see PostHog/duckdb-httpfs v1.5.5-cred-refresh-write-retry):
 //
 //	DUCKGRES_TEST_PATCHED_HTTPFS=/path/to/httpfs.duckdb_extension \
 //	  go test ./tests/integration/ -run SurvivesRotationWithPatchedHTTPFS -v

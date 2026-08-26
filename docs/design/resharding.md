@@ -27,7 +27,7 @@ those stay valid because the bucket is untouched.
 | Duckling CR patches (flip, compaction pause, cnpg-orphan/adopt: `SetMetadataStoreRetainCnpgOnFlip`, `CnpgSourceMRsOrphaned`, `SetMetadataStoreCnpgAdopt`) | `controlplane/provisioner/k8s_client.go` |
 | Admin REST API (start/read/cancel + `GET /reshards/targets` destination discovery: all cnpg shards incl. empty ones via the cluster-topology pod read, RBAC-degrading to occupied shards; known external stores from live warehouse rows) | `controlplane/admin/reshard.go` |
 | Console UI (form + operation page with live log) | `admin/ui/src/pages/ReshardForm.tsx`, `ReshardOperation.tsx` |
-| Connection gates | `controlplane/control.go` (57P03), `flight_ingress.go`, grant-path check in `configstore/org_connections.go` |
+| Connection gates | `controlplane/control.go` (57P03), grant-path check in `configstore/org_connections.go` |
 
 The cutover primitive underneath is `spec.metadataStore.cnpgShard` on the
 Duckling CR (charts #12918): changing it re-points the provider-sql
@@ -183,7 +183,7 @@ blocking → preparing_access → draining → fencing_source → pausing_compac
    LOAD-BEARING: the lease-GRANT
    transaction checks warehouse state under the same lock
    (`org_connections.go`), so after the CAS commits no new connection lease
-   can ever be granted. The connect-time 57P03 gates (PG wire + Flight) are
+   can ever be granted. The connect-time pgwire 57P03 gate is
    UX only — a request that passed them can be granted a lease up to a
    queue-timeout later, which is why the grant-path check exists. The runner
    then waits 2× the config poll interval so every CP replica's snapshot
@@ -201,9 +201,7 @@ blocking → preparing_access → draining → fencing_source → pausing_compac
    grace are retired via the standard CAS retire path (what the janitor's TTL
    reap uses) — never raw pod deletes. Workers must be GONE because each one
    runs a `DuckLakeCheckpointer` that writes the catalog independent of
-   sessions. Parked reconnectable Flight sessions would hold leases up to the
-   token TTL (1h); each CP destroys its own parked (no txn/stream/query)
-   Flight sessions for resharding orgs on the session reap tick.
+   sessions.
 4. **fencing_source** (cnpg sources) — only after draining has observed zero
    leases, zero queued requests, and zero worker records, switch the
    maintenance phase to `fenced`. The composition reconciles the ordinary

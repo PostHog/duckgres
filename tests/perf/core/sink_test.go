@@ -34,7 +34,7 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 		QueryID:          "q2",
 		IntentID:         "i2",
 		MeasureIteration: 2,
-		Protocol:         ProtocolFlight,
+		Protocol:         ProtocolPGWire,
 		Status:           "error",
 		Error:            "boom",
 		Duration:         5 * time.Millisecond,
@@ -84,7 +84,7 @@ func TestArtifactSinkWritesSummaryCSVAndMetrics(t *testing.T) {
 	if !strings.Contains(csvText, "query_id,") || !strings.Contains(csvText, ",measure_iteration,") || !strings.Contains(csvText, ",protocol,") {
 		t.Fatalf("csv header missing query_id/measure_iteration/protocol: %q", csvText)
 	}
-	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") || !strings.Contains(csvText, "\nq2,i2,2,flight,error,boom,") {
+	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") || !strings.Contains(csvText, "\nq2,i2,2,pgwire,error,boom,") {
 		t.Fatalf("csv rows missing measure_iteration values: %q", csvText)
 	}
 }
@@ -138,7 +138,7 @@ paired_queries:
 	if !reflect.DeepEqual(records[0], wantHeader) {
 		t.Fatalf("CSV header: got %v want %v", records[0], wantHeader)
 	}
-	if got, want := []string{records[1][0], records[2][0]}, []string{"q_events__raw_view", "q_events__managed_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := []string{records[1][0], records[2][0]}, []string{"q_events__raw_view", "q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("CSV query IDs: got %v want %v", got, want)
 	}
 }

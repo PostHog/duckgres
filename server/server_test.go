@@ -410,6 +410,20 @@ func TestDuckLakeMetadataIndexesNamesMatchStatements(t *testing.T) {
 	if _, ok := seen["idx_ducklake_schema_versions_tbl_schema_version"]; !ok {
 		t.Errorf("expected ducklake_schema_versions table/schema_version index")
 	}
+	// Reader-path indexes (per-file lookups and table-scoped per-file fetches)
+	// plus the live-file compaction scans.
+	for _, name := range []string{
+		"idx_ducklake_file_col_stats_file",
+		"idx_ducklake_file_col_stats_tbl_file",
+		"idx_ducklake_file_part_val_file",
+		"idx_ducklake_file_part_val_tbl_file",
+		"idx_ducklake_data_file_compaction",
+		"idx_ducklake_delete_file_compaction",
+	} {
+		if _, ok := seen[name]; !ok {
+			t.Errorf("expected index %q in duckLakeMetadataIndexes", name)
+		}
+	}
 }
 
 func TestStartCredentialRefresh_NoOpForStaticCredentials(t *testing.T) {
@@ -826,5 +840,16 @@ func TestFileDBPoolRefCounting(t *testing.T) {
 	s.fileDBsMu.Unlock()
 	if exists {
 		t.Fatal("entry should be removed after last release")
+	}
+}
+
+func TestParquetPrefetchPolicyStatements(t *testing.T) {
+	if got := parquetPrefetchPolicyStatements(false); len(got) != 0 {
+		t.Fatalf("disabled policy must produce no statements, got %v", got)
+	}
+	got := parquetPrefetchPolicyStatements(true)
+	want := []string{"SET GLOBAL disable_parquet_prefetching = true"}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("got %v, want %v", got, want)
 	}
 }

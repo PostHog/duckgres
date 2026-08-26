@@ -11,13 +11,17 @@ import type {
   ClusterSummary,
   CreateUserBody,
   CPInstance,
+  DailyUsageResponse,
+  DatabaseNameCheck,
   DucklingDriftResponse,
   DucklingMetadataResponse,
   ErrorEntry,
   ErrorFilters,
   FleetStat,
+  HotIdleOrg,
   ImpersonateBody,
   Me,
+  MonthlyUsageResponse,
   ManagedWarehouse,
   MetricsPanels,
   ModelListing,
@@ -32,6 +36,8 @@ import type {
   OrgUser,
   OrgUserSecret,
   PromRangeResponse,
+  ProvisionWarehouseBody,
+  ProvisionWarehouseResult,
   QueryDetail,
   QueryResult,
   ReshardLogEntry,
@@ -42,6 +48,7 @@ import type {
   StartReshardBody,
   UpdateUserBody,
   UserKillResult,
+  WarehouseStatusResult,
   WorkerStatus,
 } from "@/types/api";
 
@@ -141,6 +148,14 @@ export const api = {
   // warehouse state isn't ready/failed/provisioning.
   deprovisionWarehouse: (id: string) =>
     post<{ status: string; org: string }>(`/orgs/${enc(id)}/deprovision`, {}),
+  // The EXACT onboarding API the PostHog backend (django) calls to provision an
+  // org's warehouse (202 Accepted; response carries the root password — shown
+  // once, never retrievable again).
+  provisionWarehouse: (id: string, body: ProvisionWarehouseBody) =>
+    post<ProvisionWarehouseResult>(`/orgs/${enc(id)}/provision`, body),
+  warehouseStatus: (id: string) => get<WarehouseStatusResult>(`/orgs/${enc(id)}/warehouse/status`),
+  checkDatabaseName: (name: string) =>
+    get<DatabaseNameCheck>("/database-name/check", { name }),
 
   // org teams (duckgres_org_teams). Schema names are immutable after create
   // on this surface; delete removes config only (never warehouse data).
@@ -174,6 +189,7 @@ export const api = {
   // workers / sessions / live
   listWorkers: () => get<WorkerStatus[]>("/workers"),
   fleet: () => get<{ fleet: FleetStat[] }>("/workers/fleet").then((r) => r.fleet ?? []),
+  hotIdle: () => get<{ orgs: HotIdleOrg[] }>("/workers/hot-idle").then((r) => r.orgs ?? []),
   instances: () =>
     get<{ instances: CPInstance[] }>("/cluster/instances").then((r) => r.instances ?? []),
   listSessions: () => get<SessionStatus[]>("/sessions"),
@@ -237,6 +253,12 @@ export const api = {
   // audit
   audit: (params?: { actor?: string; org?: string; limit?: number }) =>
     get<{ entries: AuditEntry[] }>("/audit", params).then((r) => r.entries ?? []),
+
+  // monthly per-team usage (the Usage page) + per-org daily series (the org
+  // detail page's usage charts). Both RequireAdmin — per-team cost data.
+  monthlyUsage: (months: number) => get<MonthlyUsageResponse>("/usage/monthly", { months }),
+  orgDailyUsage: (org: string, days: number) =>
+    get<DailyUsageResponse>(`/orgs/${enc(org)}/usage/daily`, { days }),
 
   // reshard operations (metadata-store migrations; POSTs are admin-only)
   startReshard: (org: string, body: StartReshardBody) =>

@@ -147,3 +147,44 @@ func TestRedactingHandler(t *testing.T) {
 		})
 	}
 }
+
+func TestFlushLoggingIdempotent(t *testing.T) {
+	t.Run("disabled export does not panic", func(t *testing.T) {
+		t.Setenv("POSTHOG_API_KEY", "")
+		shutdown := InitLogging(BuildInfo{})
+		FlushLogging()
+		FlushLogging()
+		shutdown()
+		FlushLogging()
+	})
+
+	t.Run("never initialized does not panic", func(t *testing.T) {
+		// A fresh flusher with a nil fn is what production has before
+		// InitLogging (and after a test that cleared it). FlushLogging
+		// must still be safe — os.Exit paths can theoretically race
+		// startup, and tests call this without an exporter.
+		installLoggingFlusher(nil)
+		FlushLogging()
+		FlushLogging()
+	})
+
+	t.Run("second call is a no-op", func(t *testing.T) {
+		var calls int
+		installLoggingFlusher(func() { calls++ })
+		FlushLogging()
+		FlushLogging()
+		if calls != 1 {
+			t.Fatalf("FlushLogging ran %d times, want 1", calls)
+		}
+	})
+
+	t.Run("shutdown closure shares Once with FlushLogging", func(t *testing.T) {
+		var calls int
+		shutdown := installLoggingFlusher(func() { calls++ })
+		shutdown()
+		FlushLogging()
+		if calls != 1 {
+			t.Fatalf("shared flush ran %d times, want 1", calls)
+		}
+	})
+}

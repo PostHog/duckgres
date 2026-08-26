@@ -12,13 +12,16 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
+	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -99,19 +102,9 @@ func (a *orgRouterAdapter) MetadataProxySessions() *metadataProxySessionRegistry
 	return a.metadataSessions
 }
 
-// effectiveDefaultWorkerTTL resolves the janitor's hot-idle retention: the
-// operator default TTL (DUCKGRES_K8S_WORKER_DEFAULT_TTL →
-// K8sConfig.WorkerDefaultTTL) when set, otherwise the single built-in
-// defaultWorkerTTL (1m — the same fallback sized-but-no-ttl requests get at
-// profile resolution, so there is exactly ONE default TTL however a worker
-// came to have no explicit one). The full per-request precedence is:
-// client GUC > org default > deployment default TTL > built-in 1m.
-func effectiveDefaultWorkerTTL(configured time.Duration) time.Duration {
-	if configured > 0 {
-		return configured
-	}
-	return defaultWorkerTTL
-}
+// effectiveDefaultWorkerTTL moved to worker_profile.go (untagged) so the
+// duckgres.worker_ttl session-GUC hook can resolve the same default in every
+// build flavor.
 
 func (a *orgRouterAdapter) StackForOrg(orgID string) (WorkerPool, *SessionManager, *MemoryRebalancer, bool) {
 	stack, ok := a.router.StackForOrg(orgID)
@@ -133,10 +126,6 @@ func (a *orgRouterAdapter) BeginDrain() {
 func (a *orgRouterAdapter) ShutdownAll() {
 	a.metadataSessions.KillAll()
 	a.router.ShutdownAll()
-}
-
-func (a *orgRouterAdapter) SetProjectScopedUserChangeHandler(handler func(orgID, username string)) {
-	a.router.setProjectScopedUserChangeHandler(handler)
 }
 
 func (a *orgRouterAdapter) ReleaseIdleHotWorkers() int {
@@ -377,7 +366,7 @@ func SetupMultiTenant(
 	// their TTL — there is no warm pool to reconcile, so this is pure
 	// observability, leader-only.
 	janitor.observeWorkerLifecycle = func() {
-		stats, err := listWorkerLifecycleStats(store)
+		stats, err := listWorkerLifecycleStats(store, firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU), firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory))
 		if err != nil {
 			slog.Warn("Janitor failed to read worker lifecycle stats.", "error", err)
 			return
@@ -431,6 +420,15 @@ func SetupMultiTenant(
 			return 0
 		}
 		return org.DefaultWorkerMinHotIdle
+	}
+	// Hot-idle pool caps (max_hot_idle_*): the sweep reads the same config
+	// snapshot as the floor, so an admin-console cap edit takes effect on the
+	// next tick after the config poll reloads. Shape fallback resolves to the
+	// CP-global default worker shape (orgHotIdleLimitsFromSnapshot).
+	janitor.hotIdleCaps = func() map[string]orgHotIdleLimit {
+		return orgHotIdleLimitsFromSnapshot(store.Snapshot(),
+			firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU),
+			firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory))
 	}
 	// Node-headroom controller: keep low-priority placeholder pods as warm,
 	// preemptible spare capacity so worker spawns schedule immediately.
@@ -510,15 +508,74 @@ func SetupMultiTenant(
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
+	var trinoBundleHandler *opa.Handler
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
+		// Without the controller, the Trino reconcile loop cannot run.
+		// If the operator asked for Trino explicitly (URL set), that's a
+		// fatal startup failure — same "Trino is binary" stance as the
+		// wiring-failure branch below. Without this check, the Trino
+		// branch would be silently skipped (it's nested in the else)
+		// and password/group/tenant/bundle projections would stop updating.
+		if trinoProvisionerEnabled() {
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but provisioning controller unavailable: %w",
+				envTrinoCoordinatorURL, err)
+		}
 		slog.Warn("Provisioning controller unavailable.", "error", err)
 	} else {
 		// Env suffix for CP-owned s3bucket naming: drives the backfill of
 		// spec.dataStore.bucketName onto existing ready ducklings. Empty leaves
 		// it disabled (composition keeps deriving).
 		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
-		go provCtrl.Run(context.Background())
+		// Trino cell provisioner branch. Enablement is signaled by setting
+		// DUCKGRES_TRINO_COORDINATOR_URL (no separate boolean gate — the
+		// URL is the intent). When enabled, wiring failure is fatal:
+		// silently skipping would leave the cell's OPA sidecar serving the
+		// last-good bundle while password/group-file and tenant-password
+		// changes never propagate, which is worse than failing the rollout.
+		// Trino is binary: if you asked for it, you need it.
+		if trinoProvisionerEnabled() {
+			kc, tkErr := newTrinoKubeClient()
+			if tkErr != nil {
+				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but K8s client unavailable: %w",
+					envTrinoCoordinatorURL, tkErr)
+			}
+			// Same Duckling CR read the worker activation path uses; nil
+			// when the Duckling client couldn't be built, which
+			// buildTrinoWiring rejects rather than half-wiring.
+			trinoWire, twErr := buildTrinoWiring(store, kc, resolveDucklingStatus)
+			if twErr != nil {
+				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
+			}
+			if trinoWire == nil {
+				// buildTrinoWiring returns (nil, nil) only when the
+				// env gate is off — and the outer if guarded against
+				// that. So a nil here is a wiring bug.
+				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
+			}
+			provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
+			trinoBundleHandler = trinoWire.BundleHandler
+			slog.Info("Trino provisioner enabled.", "cell", trinoWire.Cell.ID, "coordinator", trinoWire.Cell.CoordinatorURL)
+		}
+		// SIGTERM stops the reconcile loop immediately, rather than letting a
+		// replaced replica ride out the drain.
+		//
+		// The control plane's terminationGracePeriodSeconds is 24h so live
+		// pgwire sessions finish, and the pod keeps running that whole time.
+		// The provisioner, though, writes CLUSTER-WIDE state — password.db,
+		// group.db, resource-groups.json, and CREATE/DROP CATALOG against the
+		// coordinator — so a draining replica is a second writer, and during
+		// a rollout it is a second writer running the OLD binary.
+		//
+		// That is not hypothetical: after a change to how catalogs are named,
+		// draining replicas repeatedly DROPped the catalog the new replicas
+		// had just created, because the old code computed a different name
+		// and treated the new one as stale. The tenant's catalog flapped
+		// every ~20s until the old pods were force-deleted.
+		//
+		// Only the reconcile loop stops here; the pgwire drain is untouched.
+		provCtx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		go provCtrl.Run(provCtx)
 	}
 
 	// Reshard operations execute in DEDICATED per-op pods, never inside a CP
@@ -624,11 +681,13 @@ func SetupMultiTenant(
 	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
 	clusterInfo := &clusterInfoProvider{
-		router:           router,
-		store:            store,
-		srv:              srv,
-		selfCPID:         cpInstanceID,
-		metadataSessions: metadataSessions,
+		router:              router,
+		store:               store,
+		srv:                 srv,
+		selfCPID:            cpInstanceID,
+		metadataSessions:    metadataSessions,
+		defaultWorkerCPU:    firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU),
+		defaultWorkerMemory: firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory),
 	}
 	imp := &impersonator{router: router}
 	// Cross-CP live-state aggregation: live sessions/queries are per-CP in
@@ -654,7 +713,23 @@ func SetupMultiTenant(
 		admin.RoleGate(),
 	)
 	admin.RegisterAPI(api, store, adpt, liveFetcher)
-	provisioning.RegisterAPI(api, provisioning.NewGormStore(store), cfg.DucklingBucketSuffix)
+	// gormStore implements both provisioning.Store (HTTP-shape operations) and
+	// provisioning.TenantStore (service-credential mint + snapshot reload), so a
+	// single wrapper serves both RegisterAPI arguments. liveFetcher doubles as
+	// the mint's peer-reload fan-out (same aggregation plumbing, same nil-when-
+	// single-CP semantics).
+	gormStore := provisioning.NewGormStore(store)
+	// Wire the service-credential connect block's ingress host to the same
+	// managed hostname suffix the pgwire TLS server_name pins (the CP's first
+	// configured ManagedHostnameSuffixes entry), so the mint response tells the
+	// caller the exact ingress the credential authenticates against. When the
+	// CP has no managed suffix configured, provisioning falls back to its
+	// DefaultManagedIngressSuffix.
+	var ingressSuffix string
+	if len(cfg.ManagedHostnameSuffixes) > 0 {
+		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
+	}
+	provisioning.RegisterAPIWithIngressSuffix(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
@@ -669,7 +744,13 @@ func SetupMultiTenant(
 		clusterClient = router.sharedPool.clientset
 	}
 	admin.RegisterExtras(api, admin.Extras{
-		Store:         store,
+		Store:      store,
+		Monitoring: store,
+		MonitoringWorkerDefaults: admin.MonitoringWorkerDefaults{
+			CPU:    firstNonEmpty(cfg.K8s.WorkerCPURequest, defaultWorkerCPU),
+			Memory: firstNonEmpty(cfg.K8s.WorkerMemoryRequest, defaultWorkerMemory),
+			TTL:    effectiveDefaultWorkerTTL(cfg.K8s.WorkerDefaultTTL),
+		},
 		Live:          clusterInfo,
 		Users:         store,
 		Fetcher:       liveFetcher,
@@ -678,6 +759,15 @@ func SetupMultiTenant(
 		Metrics:       metricsProxy,
 		ClusterClient: clusterClient,
 	})
+
+	// Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1 admin group on
+	// purpose — it does its own bearer-token auth (the bundle exposes the
+	// customer roster; a separate shared secret between provisioner and the
+	// OPA sidecar). When the Trino provisioner is disabled (the default),
+	// trinoBundleHandler is nil and the route isn't registered.
+	if trinoBundleHandler != nil {
+		engine.Any("/bundles/trino", gin.WrapH(trinoBundleHandler))
+	}
 
 	// Live Duckling drift finder. Reuse the in-cluster Duckling client built
 	// above (dc); pass nil when it's unavailable so the endpoint degrades to
@@ -796,14 +886,14 @@ func (a ducklingMetadataAdapter) CRMetadataStores(ctx context.Context) (map[stri
 }
 
 type workerLifecycleStatsLister interface {
-	ListWorkerLifecycleStats() ([]configstore.WorkerLifecycleStats, error)
+	ListWorkerLifecycleStats(defaultCPU, defaultMemory string) ([]configstore.WorkerLifecycleStats, error)
 }
 
-func listWorkerLifecycleStats(lister workerLifecycleStatsLister) ([]configstore.WorkerLifecycleStats, error) {
+func listWorkerLifecycleStats(lister workerLifecycleStatsLister, defaultCPU, defaultMemory string) ([]configstore.WorkerLifecycleStats, error) {
 	if lister == nil {
 		return nil, nil
 	}
-	return lister.ListWorkerLifecycleStats()
+	return lister.ListWorkerLifecycleStats(defaultCPU, defaultMemory)
 }
 
 func cloneWorkerLifecycleStats(stats []configstore.WorkerLifecycleStats) []configstore.WorkerLifecycleStats {

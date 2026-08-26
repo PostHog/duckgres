@@ -206,6 +206,16 @@ normal `go test ./...` lane.
 
 ### Deliberately not covered here
 
+- **Portal suspension (extended-query Execute row limit)** — the harness
+  drives all SQL through psql, and libpq never sends a nonzero Execute row
+  limit, so a paging client (JDBC `setFetchSize`, Hex) cannot be simulated
+  in-Job. The behavior is deterministically covered against a real server by
+  `tests/integration/portal_suspension_test.go::TestPortalSuspensionPaging`
+  (raw pgproto3 frontend paging a 1000-row result set over TLS) and by the
+  server unit tests in `server/conn_portal_suspension_test.go`; the path is
+  identical on the remote backend (suspension lives entirely in the CP's
+  pgwire layer above the executor).
+
 - **Native metadata proxy denial for an external metadata-store org** — the
   live suite intentionally provisions only CNPG-backed orgs and has no RDS
   credential with which to create an external-store tenant. The backend-kind
@@ -222,7 +232,7 @@ normal `go test ./...` lane.
   code. What an ext org would add is DSN/sslmode resolution, which
   `reshard_targets` and the activation assertions already cover.
 
-- **Mid-statement STS credential recovery (httpfs `v1.5.3-cred-refresh-write-retry`)** —
+- **Mid-statement STS credential recovery (patched PostHog httpfs)** —
   the worker image bundles the PostHog httpfs fork patch that re-resolves the
   latest committed `ducklake_s3` secret and retries on ExpiredToken read/write
   auth failures, letting a statement outlive the STS token it started with.
@@ -287,7 +297,7 @@ normal `go test ./...` lane.
   harness enters through pgwire, where one client connection maps to one worker
   session and operations are serialized by the control plane. Driving this
   specific defense-in-depth path end-to-end would need a bespoke concurrent
-  Flight-ingress client, so the rejection contract, required
+  direct worker Flight client, so the rejection contract, required
   GetFlightInfo-to-DoGet handoffs, and abandoned-continuation cleanup are covered
   by `duckdbservice` unit tests. The harness still asserts the cluster invariant
   this protects: one active session owns one worker.
@@ -321,7 +331,7 @@ normal `go test ./...` lane.
   survive credential rotation (DuckDB resolves secrets through the
   statement's MVCC snapshot, and scan-workload file opens skip the HEAD that
   could trigger httpfs' refresh-on-403). With the bundled
-  `v1.5.3-cred-refresh-write-retry` fork build the floor is defense-in-depth rather than
+  `v1.5.5-cred-refresh-write-retry` fork build the floor is defense-in-depth rather than
   the only protection — see the mid-statement recovery bullet above.
 - **PostHog product-analytics events** (`internal/analytics`,
   `warehouse_provision_begin`/`_success`/`_failed`,
@@ -338,6 +348,23 @@ normal `go test ./...` lane.
   events), `controlplane/provisioner/controller_analytics_test.go` (the
   terminal `_success`/`_failed` events the provisioner controller emits on the
   Ready/Failed/Deleted transitions), and `server/conn_analytics_test.go`.
+  The same applies to WHICH exporter a given key enables: `POSTHOG_API_KEY`
+  turns on analytics *and* the OTLP log export, while
+  `POSTHOG_ANALYTICS_API_KEY` turns on analytics alone (so query text is not
+  exported). Confirming that split end-to-end means reading both PostHog Logs
+  and the event stream back, which the Job cannot do for the reason above; the
+  key resolution is covered by `TestAnalyticsAPIKeyPrefersDedicatedKey` in
+  `internal/cliboot/analytics_test.go`.
+- **PostHog Logs (OTLP)** — `assert_worker_pod` checks plumbing only: the
+  worker must not carry a plaintext `POSTHOG_API_KEY` `value:`, and when the
+  CP container's *named* env has a `secretKeyRef` the worker must copy the
+  same secret name+key. Until charts set that named env the copy branch is
+  skipped; the plaintext assert still runs. **Ingest cannot be asserted
+  in-Job** for the same reason as analytics: the Job holds no PostHog
+  query-API creds and cannot read the destination project. Do not require a
+  successful export. The first mw-dev `service.name=duckgres-worker` record
+  in the **analytics** project is the human egress proof; in-repo
+  NetworkPolicy 443 is not production Cilium.
 
 ## Isolation model
 

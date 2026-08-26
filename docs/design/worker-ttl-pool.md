@@ -50,6 +50,12 @@ options=-c duckgres.worker_cpu=8 -c duckgres.worker_memory=16Gi -c duckgres.work
   to `[min,max]` and ttl to `[0,maxTTL]` per deployment (out-of-range → clamp +
   warn). Gate off → every request uses the defaults.
 
+`duckgres.worker_ttl` is additionally settable mid-session
+(`SET duckgres.worker_ttl = '20m'` / `SHOW` / `RESET`) for clients that cannot
+set startup options: the override updates the bound worker's pool-side TTL
+(gated on `AllowClientWorkerProfile`, clamped to `WorkerMaxTTL`, like the
+startup option) and is re-applied across exploratory-tier worker switches.
+
 TTL resolution, per request (the same chain whether the request is sized or
 not — there is exactly ONE default TTL however a worker comes to have no
 explicit one):
@@ -73,8 +79,8 @@ worker on a small query. On reuse, the worker's TTL is reset to the request's
 ttl and it transitions hot-idle → hot-active.
 
 DuckDB limits for the single session derive from the worker's **actual** size
-(75% of pod memory, all cores) — unchanged from `workerDuckDBLimits`, now keyed
-off size not profile.
+(75% of pod memory and 2.5 threads per requested CPU, rounded up) through
+`workerDuckDBLimits`, keyed off size rather than profile.
 
 ## Lifecycle
 

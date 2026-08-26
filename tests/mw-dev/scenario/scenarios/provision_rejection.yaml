@@ -11,7 +11,7 @@ steps:
     with:
       org_id: scenario-reject-${run_id_compact}
       request:
-        database_name: scenario_reject_${run_id_token}
+        database_name: scenario-reject-${run_id_token}
         team_id: 1
         metadata_store:
           type: cnpg-shard

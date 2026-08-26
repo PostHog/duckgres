@@ -86,23 +86,29 @@ func cpDeploymentPrefix(podName string) string {
 // FetchPeers returns each peer CP's body for path+"?scope=local" and the total
 // number of peers attempted. Peers are fetched concurrently with a short
 // per-peer timeout; a slow/down peer is simply omitted (graceful degradation).
-func (f *clusterPeerFetcher) FetchPeers(ctx context.Context, path string) ([][]byte, int) {
-	return f.fanOut(ctx, http.MethodGet, path)
+func (f *clusterPeerFetcher) FetchPeers(ctx context.Context, path string) admin.PeerFetchResult {
+	bodies, peers, discoveryComplete := f.fanOut(ctx, http.MethodGet, path)
+	return admin.PeerFetchResult{Bodies: bodies, Peers: peers, DiscoveryComplete: discoveryComplete}
 }
 
 // PostPeers is FetchPeers for a mutating action — same discovery, concurrency,
 // timeouts, and scope=local recursion guard, but with POST.
 func (f *clusterPeerFetcher) PostPeers(ctx context.Context, path string) ([][]byte, int) {
-	return f.fanOut(ctx, http.MethodPost, path)
+	bodies, peers, _ := f.fanOut(ctx, http.MethodPost, path)
+	return bodies, peers
 }
 
-func (f *clusterPeerFetcher) fanOut(ctx context.Context, method, path string) ([][]byte, int) {
+func (f *clusterPeerFetcher) fanOut(ctx context.Context, method, path string) ([][]byte, int, bool) {
 	if f == nil || f.clientset == nil || f.selfPod == "" {
-		return nil, 0
+		return nil, 0, false
 	}
-	ips := f.discoverPeerIPs(ctx)
+	ips, err := f.discoverPeerIPs(ctx)
+	if err != nil {
+		slog.Warn("admin live aggregation failed to discover peer control planes", "error", err)
+		return nil, 0, false
+	}
 	if len(ips) == 0 {
-		return nil, 0
+		return nil, 0, true
 	}
 	bodies := make([][]byte, 0, len(ips))
 	var mu sync.Mutex
@@ -119,17 +125,17 @@ func (f *clusterPeerFetcher) fanOut(ctx context.Context, method, path string) ([
 		}(ip)
 	}
 	wg.Wait()
-	return bodies, len(ips)
+	return bodies, len(ips), true
 }
 
-func (f *clusterPeerFetcher) discoverPeerIPs(ctx context.Context) []string {
+func (f *clusterPeerFetcher) discoverPeerIPs(ctx context.Context) ([]string, error) {
 	lctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	pods, err := f.clientset.CoreV1().Pods(f.namespace).List(lctx, metav1.ListOptions{
 		LabelSelector: "app.kubernetes.io/name=duckgres",
 	})
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var ips []string
 	for i := range pods.Items {
@@ -155,7 +161,7 @@ func (f *clusterPeerFetcher) discoverPeerIPs(ctx context.Context) []string {
 	if len(ips) == 0 && len(pods.Items) <= 1 {
 		slog.Debug("admin live aggregation found no peer CPs", "namespace", f.namespace, "deploy_prefix", f.deployPrefix, "pods_listed", len(pods.Items))
 	}
-	return ips
+	return ips, nil
 }
 
 func (f *clusterPeerFetcher) doOne(ctx context.Context, method, ip, path string) ([]byte, bool) {
