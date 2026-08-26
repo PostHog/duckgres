@@ -557,12 +557,28 @@ batch contains i if {
 # ---------------------------------------------------------------------------
 # ReadSystemInformation: the observer only.
 #
-# Trino annotates `/v1/node` and `/v1/resourceGroupState` with
-# @ResourceSecurity(MANAGEMENT_READ), which ResourceSecurityDynamicFeature
-# enforces via checkCanReadSystemInformation -- so the cell's node list,
-# worker version skew and resource-group queue state all hang off this one
-# operation. The console's cluster page needs it; no tenant does, and the
-# provisioner does not either (it only issues catalog DDL).
+# ResourceSecurityDynamicFeature enforces @ResourceSecurity(MANAGEMENT_READ)
+# via checkCanReadSystemInformation, so this ONE operation gates every
+# MANAGEMENT_READ resource on the coordinator, not just the two the console
+# reads. Verified against the fork, the full set is:
+#
+#   /v1/node                   the console's cluster page (needed)
+#   /v1/resourceGroupState     per-group queue state (needed)
+#   /v1/thread                 coordinator thread dump
+#   /v1/announce (GET)         the discovered node URIs
+#   /v1/maxActiveSplits        one number from the task executor
+#   /v1/integrations/gateway   cluster size / free bytes / system load
+#
+# All six are GETs of cluster-operational state; none reads a tenant
+# catalog, a table, or SQL text. `/v1/thread` is the widest -- thread names
+# embed query and task ids -- and is worth knowing about when weighing this
+# grant, which is why the list is written out rather than left implied. The
+# POST half of /v1/announce, which actually registers a node, is
+# INTERNAL_ONLY and needs the node-to-node shared secret, so this grant
+# cannot be used to join a fake worker to the cell.
+#
+# No tenant needs any of it, and the provisioner does not either -- it only
+# issues catalog DDL.
 #
 # The WRITE half (WriteSystemInformation, which would let a caller change
 # the coordinator's state) is never granted to anyone -- it falls through

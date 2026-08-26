@@ -1609,7 +1609,10 @@ password/tenant/catalog changes never propagate.
   Split authority: admin does CREATE/DROP CATALOG and sees only its own
   queries; the observer gets cluster-wide `ViewQueryOwnedBy` /
   `FilterViewQueryOwnedBy` / `KillQueryOwnedBy` plus `ReadSystemInformation`
-  (for `/v1/node` + `/v1/resourceGroupState`, both MANAGEMENT_READ) and
+  (one op gating EVERY MANAGEMENT_READ resource — `/v1/node` and
+  `/v1/resourceGroupState`, which the console reads, plus `/v1/thread`,
+  `/v1/announce` GET, `/v1/maxActiveSplits`, `/v1/integrations/gateway`; all
+  GETs of operational state, enumerated in policy.rego) and
   holds NO catalog — no `data.group_catalogs` entry, and the observer group
   is excluded from `tenant_owns_catalog` and from the same-org query match,
   so even a mistaken bundle entry grants no data access. `is_observer` is

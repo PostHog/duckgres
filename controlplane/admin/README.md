@@ -173,7 +173,13 @@ and projects into `password.db` / `group.db`.
   `FilterViewQueryOwnedBy`, `/v1/query/{id}` is gated on `ViewQueryOwnedBy`,
   kill on `KillQueryOwnedBy`, and `/v1/node` + `/v1/resourceGroupState` are
   `MANAGEMENT_READ` (`checkCanReadSystemInformation`). A console credential
-  with no grant sees an empty cluster. The grant is deliberately NOT added
+  with no grant sees an empty cluster. Note that `ReadSystemInformation` is
+  a single operation gating *every* `MANAGEMENT_READ` resource — also
+  `/v1/thread`, `/v1/announce` (GET), `/v1/maxActiveSplits` and
+  `/v1/integrations/gateway`. All are GETs of cluster-operational state and
+  none reads a catalog, a table or SQL text; the node-registering POST on
+  `/v1/announce` is `INTERNAL_ONLY`. The enumeration lives in policy.rego so
+  the real blast radius is visible where the grant is written. The grant is deliberately NOT added
   to `__admin_provisioner`: that credential can CREATE/DROP catalogs and by
   policy sees only its own queries, while the observer sees every tenant's
   query metadata and holds **no catalog at all** (no entry in

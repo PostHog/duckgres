@@ -226,12 +226,22 @@ func (a *TrinoAPI) index() (principalIndex, error) {
 // duckgres org that owns it. Trino only knows the principal; the mapping
 // back to an org id lives here, in the config store, which is why the
 // annotation happens server-side rather than in the SPA.
-func (a *TrinoAPI) liveQueries(ctx context.Context) ([]TrinoQuery, principalIndex, error) {
+// A handler that already holds an index passes it in; principalIndex's zero
+// value means "fetch one". Handlers that need the org list anyway would
+// otherwise read the config store twice per request, and /trino/status is
+// polled every few seconds by every open tab.
+func (a *TrinoAPI) liveQueries(ctx context.Context, known ...principalIndex) ([]TrinoQuery, principalIndex, error) {
 	queries, err := a.queries.get(ctx, a.client.Queries)
 	if err != nil {
 		return nil, principalIndex{}, err
 	}
-	idx, idxErr := a.index()
+	var idx principalIndex
+	var idxErr error
+	if len(known) > 0 && known[0].orgByPrincipal != nil {
+		idx = known[0]
+	} else {
+		idx, idxErr = a.index()
+	}
 	if idxErr != nil {
 		// The coordinator answered; a config-store blip should degrade the
 		// org column, not the whole live view.
@@ -258,7 +268,8 @@ func (a *TrinoAPI) handleStatus(c *gin.Context) {
 	// Provisioning state comes from the config store, so it is reported
 	// even when the coordinator is unreachable — "the cell is down" and
 	// "these tenants never provisioned" are different incidents.
-	if idx, err := a.index(); err == nil {
+	idx, idxErr := a.index()
+	if idxErr == nil {
 		status.TotalOrgs = len(idx.rows)
 		for _, o := range idx.rows {
 			state := string(o.State)
@@ -268,7 +279,7 @@ func (a *TrinoAPI) handleStatus(c *gin.Context) {
 			status.OrgsByState[state]++
 		}
 	} else {
-		slog.Warn("admin: trino org list unavailable for status", "error", err)
+		slog.Warn("admin: trino org list unavailable for status", "error", idxErr)
 	}
 
 	// /v1/info is PUBLIC in Trino, so it answers even when the observer's
@@ -281,7 +292,7 @@ func (a *TrinoAPI) handleStatus(c *gin.Context) {
 		status.Error = err.Error()
 	}
 
-	queries, _, err := a.liveQueries(ctx)
+	queries, _, err := a.liveQueries(ctx, idx)
 	if err != nil {
 		status.Available = false
 		if status.Error == "" {
@@ -314,9 +325,26 @@ func (a *TrinoAPI) handleStatus(c *gin.Context) {
 // Trino's own query-state names, used where the console reasons about a
 // specific state rather than just counting.
 const (
-	trinoStateQueued  = "QUEUED"
-	trinoStateRunning = "RUNNING"
+	trinoStateQueued   = "QUEUED"
+	trinoStateRunning  = "RUNNING"
+	trinoStateFinished = "FINISHED"
+	trinoStateFailed   = "FAILED"
 )
+
+// isActiveTrinoState reports whether a query is still in flight, mirroring
+// QueryState.isDone(): FINISHED and FAILED are the only terminal states.
+//
+// Defining it as the COMPLEMENT of the terminal pair rather than as a list
+// of interesting states is load-bearing. Trino has nine states, and a query
+// sitting in WAITING_FOR_RESOURCES, DISPATCHING, PLANNING, STARTING or
+// FINISHING is still running, still killable, and — for a cell backed by
+// DuckLake, where planning talks to a per-tenant Postgres — is exactly the
+// pathology an operator opens this page to find. An allowlist of
+// {RUNNING, QUEUED} hides all five, and hides them precisely when they
+// matter.
+func isActiveTrinoState(state string) bool {
+	return state != trinoStateFinished && state != trinoStateFailed
+}
 
 func (a *TrinoAPI) handleQueries(c *gin.Context) {
 	queries, _, err := a.liveQueries(c.Request.Context())
@@ -344,7 +372,7 @@ func (a *TrinoAPI) handleQueries(c *gin.Context) {
 		if state != "" && q.State != state {
 			continue
 		}
-		if activeOnly && q.State != trinoStateRunning && q.State != trinoStateQueued {
+		if activeOnly && !isActiveTrinoState(q.State) {
 			continue
 		}
 		out = append(out, q)
@@ -467,7 +495,7 @@ func (a *TrinoAPI) handleOrgs(c *gin.Context) {
 	// this view and must render even when the coordinator is unreachable.
 	running, queued := map[string]int{}, map[string]int{}
 	available := true
-	if queries, _, qErr := a.liveQueries(c.Request.Context()); qErr == nil {
+	if queries, _, qErr := a.liveQueries(c.Request.Context(), idx); qErr == nil {
 		for _, q := range queries {
 			switch q.State {
 			case trinoStateRunning:

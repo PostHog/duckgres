@@ -240,6 +240,44 @@ func TestQueriesFiltering(t *testing.T) {
 	}
 }
 
+// TestActiveFilterKeepsEveryNonTerminalState is the regression guard for a
+// filter that used to allowlist {RUNNING, QUEUED}. Trino has nine query
+// states and only FINISHED and FAILED are terminal, so that allowlist hid
+// five in-flight states — including PLANNING, which on a DuckLake-backed
+// cell means "waiting on the tenant's metadata Postgres" and is the single
+// most likely thing an operator opens this page to find.
+func TestActiveFilterKeepsEveryNonTerminalState(t *testing.T) {
+	inFlight := []string{
+		"QUEUED", "WAITING_FOR_RESOURCES", "DISPATCHING",
+		"PLANNING", "STARTING", "RUNNING", "FINISHING",
+	}
+	var queries []TrinoQuery
+	for i, st := range inFlight {
+		queries = append(queries, TrinoQuery{QueryID: st, State: st, Principal: "db_a", ElapsedMS: int64(i)})
+	}
+	queries = append(queries,
+		TrinoQuery{QueryID: "FINISHED", State: "FINISHED", Principal: "db_a"},
+		TrinoQuery{QueryID: "FAILED", State: "FAILED", Principal: "db_a"},
+	)
+	r := trinoTestRouter(testTrinoAPI(t, &fakeTrinoCoordinator{queries: queries}, twoOrgTrinoStore()), RoleViewer)
+
+	_, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/trino/queries?active=1", "")
+	got := map[string]bool{}
+	for _, raw := range body["queries"].([]any) {
+		got[raw.(map[string]any)["query_id"].(string)] = true
+	}
+	for _, st := range inFlight {
+		if !got[st] {
+			t.Errorf("active=1 dropped %s; it is not a terminal state and the query is still killable", st)
+		}
+	}
+	for _, st := range []string{"FINISHED", "FAILED"} {
+		if got[st] {
+			t.Errorf("active=1 kept terminal state %s", st)
+		}
+	}
+}
+
 // --------------------------------------------------------------------------
 // Degradation.
 // --------------------------------------------------------------------------

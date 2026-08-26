@@ -8,12 +8,20 @@
 import type { BadgeProps } from "@/components/ui/badge";
 import type { TrinoNode, TrinoOrgStatus, TrinoQuery, TrinoStatus } from "@/types/api";
 
-// Trino's query states, in the order an operator cares about them.
-export const TRINO_ACTIVE_STATES = ["RUNNING", "QUEUED", "PLANNING", "STARTING"] as const;
+// Trino's terminal states, mirroring QueryState.isDone(). Everything else --
+// QUEUED, WAITING_FOR_RESOURCES, DISPATCHING, PLANNING, STARTING, RUNNING,
+// FINISHING -- is still in flight and still killable.
+//
+// Defined as the terminal pair rather than as an allowlist of interesting
+// states so this cannot drift out of step with the server's `active=1`
+// filter, and so a query stuck in PLANNING (for a DuckLake-backed cell,
+// planning talks to a per-tenant Postgres, so this is a real pathology)
+// stays visible instead of being quietly filtered away.
+export const TRINO_TERMINAL_STATES = ["FINISHED", "FAILED"] as const;
 
 // A query is "actionable" when killing it would still do something.
 export function isActiveTrinoQuery(q: TrinoQuery): boolean {
-  return (TRINO_ACTIVE_STATES as readonly string[]).includes(q.state);
+  return !(TRINO_TERMINAL_STATES as readonly string[]).includes(q.state);
 }
 
 export function trinoStateVariant(state: string): BadgeProps["variant"] {

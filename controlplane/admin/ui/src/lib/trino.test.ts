@@ -82,10 +82,21 @@ function org(over: Partial<TrinoOrgStatus> = {}): TrinoOrgStatus {
 }
 
 describe("isActiveTrinoQuery", () => {
-  it("counts every pre-terminal state, not just RUNNING", () => {
-    // PLANNING and STARTING are pre-execution but still killable, and a
-    // query stuck in PLANNING is exactly the kind an operator hunts for.
-    for (const state of ["RUNNING", "QUEUED", "PLANNING", "STARTING"]) {
+  it("counts every one of Trino's seven non-terminal states", () => {
+    // Trino has nine states and only two are terminal. An allowlist of the
+    // interesting-looking ones silently drops a query stuck in PLANNING or
+    // WAITING_FOR_RESOURCES — which, on a DuckLake-backed cell where
+    // planning talks to a per-tenant Postgres, is exactly what an operator
+    // opens this page to find.
+    for (const state of [
+      "QUEUED",
+      "WAITING_FOR_RESOURCES",
+      "DISPATCHING",
+      "PLANNING",
+      "STARTING",
+      "RUNNING",
+      "FINISHING",
+    ]) {
       expect(isActiveTrinoQuery(query({ state }))).toBe(true);
     }
     for (const state of ["FINISHED", "FAILED"]) {
