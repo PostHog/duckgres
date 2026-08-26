@@ -8,8 +8,12 @@
 # at plugin/trino-opa/src/main/java/io/trino/plugin/opa/):
 #
 #   input.context.identity.user        -- the Trino current_user. Used only
-#                                         for the admin-principal carve-out
-#                                         (catalog management).
+#                                         for the two operational carve-outs:
+#                                         the admin principal (catalog
+#                                         management) and the observer
+#                                         principal (the control plane's
+#                                         admin console -- cluster-wide query
+#                                         visibility, no catalog access).
 #   input.context.identity.groups      -- group memberships resolved by
 #                                         Trino's file group provider (v1)
 #                                         or OIDC group claim (post-v1).
@@ -75,8 +79,12 @@
 # allowed to view the query -- through `SELECT * FROM
 # system.runtime.queries` and through the coordinator's web UI. So the
 # three query-ownership operations the plugin sends (ViewQueryOwnedBy,
-# FilterViewQueryOwnedBy, KillQueryOwnedBy) are same-org-only, derived
-# from the SAME group/catalog ownership map every other decision uses.
+# FilterViewQueryOwnedBy, KillQueryOwnedBy) are same-org-only for tenants,
+# derived from the SAME group/catalog ownership map every other decision
+# uses. The one exception is the observer principal (see "Observer
+# principal" below), which is the control plane's own admin console and is
+# granted cluster-wide query visibility precisely so operators can see and
+# kill runaway queries -- in exchange for holding no catalog access at all.
 # ExecuteQuery stays unconditionally allowed -- resource groups, not OPA,
 # bound concurrency.
 #
@@ -147,6 +155,49 @@ is_admin if {
 }
 
 # ---------------------------------------------------------------------------
+# Observer principal: the control plane's admin console.
+#
+# The console reads the cell's live state over the coordinator REST API,
+# and Trino routes every one of those reads through this policy:
+# `GET /v1/query` filters its result through FilterViewQueryOwnedBy,
+# `GET /v1/query/{id}` is gated on ViewQueryOwnedBy, kill on
+# KillQueryOwnedBy, and `/v1/node` + `/v1/resourceGroupState` are
+# MANAGEMENT_READ, i.e. checkCanReadSystemInformation. Without a grant the
+# console sees an empty cluster.
+#
+# This is a SEPARATE principal from the provisioner's admin, not a
+# widening of it, and the split is the security bargain:
+#
+#   __admin_provisioner  CREATE/DROP CATALOG; sees only its own queries.
+#   __duckgres_observer  every tenant's query metadata; NO catalog at all.
+#
+# The observer holds no entry in data.group_catalogs, so every read path
+# (AccessCatalog, SelectFromColumns, the Show*/Filter* family) denies, and
+# catalog management is gated on is_admin, which requires the admin
+# USERNAME. Neither half can be levered into the other, so one leaked
+# credential never yields both catalog authority and tenant SQL text.
+#
+# Query SQL text is tenant data. The grant below is what lets an operator
+# see it, and the control plane redacts it before it reaches a browser --
+# that redaction is a control-plane responsibility, not a policy one.
+#
+# Like is_admin this is a CONJUNCTION of username and group claim, so a
+# projection regression that drops a tenant into observer_group grants
+# nothing on its own.
+#
+# Keep in sync with opa.ObserverPrincipal / opa.ObserverGroup in types.go.
+# ---------------------------------------------------------------------------
+
+observer_principal := "__duckgres_observer"
+
+observer_group := "__duckgres_observer"
+
+is_observer if {
+	user == observer_principal
+	observer_group in input.context.identity.groups
+}
+
+# ---------------------------------------------------------------------------
 # Catalog-name shape: matches what trinoSanitize + TrinoCatalogName produce
 # (`org_<sanitized>`, sanitized to [a-z0-9_]). Used as a defense-in-
 # depth name constraint on admin-scoped operations so admin authority is
@@ -195,6 +246,7 @@ managed_catalog_name(catalog) if {
 tenant_owns_catalog(catalog) if {
 	some g in input.context.identity.groups
 	g != admin_group
+	g != observer_group
 	data.group_catalogs[g][catalog] == true
 }
 
@@ -436,41 +488,90 @@ query_visibility_ops := {
 	"KillQueryOwnedBy",
 }
 
-# The query owner's group memberships. Undefined when the plugin sent no
-# resource.user (or the String-form TrinoUser, as ImpersonateUser does),
-# which fails same_org_query_owner closed.
-query_owner_groups := input.action.resource.user.groups
+# visible_query_owner(owner) decides whether the requester may see and
+# control queries owned by `owner` -- the {user, groups} object the plugin
+# sends. It takes the owner as a PARAMETER rather than reading
+# input.action.resource directly so the scalar and batched entrypoints can
+# share one predicate: `allow` passes input.action.resource.user, `batch`
+# passes each candidate out of filterResources. That is the same
+# no-duplicate-predicate discipline the catalog filters follow, and it is
+# what stops the two shapes from drifting into different answers.
+#
+# Undefined owner (no resource.user, or the String-form TrinoUser that
+# ImpersonateUser sends, which carries no groups key) fails every clause
+# and therefore denies.
 
-# same_org_query_owner: requester and owner share at least one org group
-# that the bundle actually knows about. admin_group is excluded so an
-# admin-group claim can never be the shared group.
-same_org_query_owner if {
+# Same org: requester and owner share at least one org group that the
+# bundle actually knows about. admin_group and observer_group are excluded
+# so neither operational claim can ever be the shared group.
+visible_query_owner(owner) if {
 	some g in input.context.identity.groups
 	g != admin_group
+	g != observer_group
 	data.group_catalogs[g]
-	g in query_owner_groups
+	g in owner.groups
 }
 
-# self_owned_query: the owner IS the requesting principal. Trino's own
+# Self: the owner IS the requesting principal. Trino's own
 # AccessControlUtil short-circuits this case before it reaches OPA
 # (identity.getUser().equals(queryOwner.getUser()) -> return), so the rule
 # is belt-and-braces: it keeps "my own query" visible even if the group
 # provider has not stamped groups onto the owner identity, and it cannot
 # widen anything, because an identical username IS an identical principal.
 # The non-empty guard stops two absent/blank usernames from matching.
-self_owned_query if {
-	owner := input.action.resource.user.user
-	owner != ""
-	owner == user
+visible_query_owner(owner) if {
+	owner.user != ""
+	owner.user == user
 }
 
-visible_query_owner if same_org_query_owner
-
-visible_query_owner if self_owned_query
+# Operator console: cluster-wide, every owner. Gated on the full
+# is_observer conjunction (username AND group), and paired with the
+# observer holding no catalog anywhere in data.group_catalogs, so this
+# grants query METADATA across tenants and tenant DATA nowhere.
+visible_query_owner(_) if is_observer
 
 allow if {
 	input.action.operation in query_visibility_ops
-	visible_query_owner
+	visible_query_owner(input.action.resource.user)
+}
+
+# Batched counterpart. `/v1/query` -- the endpoint the console's live view
+# and Trino's own web UI both read -- filters through
+# OpaBatchAccessControl.filterViewQueryOwnedBy, which sends every candidate
+# owner in ONE request under filterResources. Without this rule the batched
+# answer is the empty set: the same-org visibility the section above
+# describes is inert in production (each tenant still sees its own query,
+# because Trino short-circuits self-ownership before OPA, so the gap looks
+# like "org-mates' queries are missing" rather than an outright failure)
+# and the observer principal sees nothing at all.
+#
+# Same predicate as `allow`, candidate read directly out of filterResources
+# rather than substituted with `with` -- see the batched-filtering section
+# above for why the `with` formulation is quadratic and unusable here.
+batch contains i if {
+	some i
+	input.action.operation == "FilterViewQueryOwnedBy"
+	visible_query_owner(input.action.filterResources[i].user)
+}
+
+# ---------------------------------------------------------------------------
+# ReadSystemInformation: the observer only.
+#
+# Trino annotates `/v1/node` and `/v1/resourceGroupState` with
+# @ResourceSecurity(MANAGEMENT_READ), which ResourceSecurityDynamicFeature
+# enforces via checkCanReadSystemInformation -- so the cell's node list,
+# worker version skew and resource-group queue state all hang off this one
+# operation. The console's cluster page needs it; no tenant does, and the
+# provisioner does not either (it only issues catalog DDL).
+#
+# The WRITE half (WriteSystemInformation, which would let a caller change
+# the coordinator's state) is never granted to anyone -- it falls through
+# to default-deny, and the hard-denies section below says so.
+# ---------------------------------------------------------------------------
+
+allow if {
+	is_observer
+	input.action.operation == "ReadSystemInformation"
 }
 
 # ---------------------------------------------------------------------------
@@ -483,11 +584,15 @@ allow if {
 #
 # - ImpersonateUser: NEVER allowed. There is no carve-out, not even for
 #   the admin principal -- the provisioner has no need to impersonate.
-# - WriteSystemInformation / ReadSystemInformation: never allowed. Note
-#   that `opa.allow-permission-management-operations` does NOT gate these
-#   -- it gates only the grant/deny/revoke/set-authorization family, via
-#   enforcePermissionManagementOperation in OpaAccessControl.java -- so
-#   they really are sent to OPA, and really are denied here.
+# - WriteSystemInformation: never allowed, to anyone. Note that
+#   `opa.allow-permission-management-operations` does NOT gate it -- it
+#   gates only the grant/deny/revoke/set-authorization family, via
+#   enforcePermissionManagementOperation in OpaAccessControl.java -- so it
+#   really is sent to OPA, and really is denied here.
+# - ReadSystemInformation: denied for every tenant AND for the admin
+#   principal. The sole grantee is the observer principal, which needs it
+#   for `/v1/node` and `/v1/resourceGroupState` (both MANAGEMENT_READ);
+#   see the ReadSystemInformation section above.
 # - KillQueryOwnedBy / ViewQueryOwnedBy / FilterViewQueryOwnedBy: NOT
 #   default-deny any more; see "Query visibility" above. They are allowed
 #   for a same-org query owner and denied for everyone else, including
