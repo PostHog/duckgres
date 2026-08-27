@@ -341,6 +341,16 @@ func TestPublishRejectsInvalidSemanticRecipeGraph(t *testing.T) {
 				snapshot.Functions[0].Rewrite = FunctionRewriteIsNotNull
 			},
 		},
+		{
+			name: "session property with too many name parts",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ModifierDefaults[1].SessionProperty = []PhysicalIdentifier{
+					{Value: "catalog"},
+					{Value: "namespace"},
+					{Value: "property"},
+				}
+			},
+		},
 	}
 
 	for _, test := range tests {

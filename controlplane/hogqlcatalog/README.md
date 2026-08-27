@@ -111,8 +111,16 @@ unary, non-variadic, and returns `boolean` using case-insensitive canonical type
 text. Distinct, ordering, filter, and window traits are disabled. Missing,
 unknown, or implementation-incompatible rewrite values, signatures, and traits
 fail validation. Modifier behavior is one of compiler handling, a named Trino
-session property, a safe no-op, or explicitly unsupported. Consumers must still
-fail closed when a requested capability is not declared.
+session property, a safe no-op, or explicitly unsupported. A consumer applies
+modifier defaults only after pinning this snapshot. An explicit request value
+replaces the declared default and must have the same canonical type signature.
+Explicit modifiers therefore require a snapshot even when the query otherwise
+uses no semantic relation. Compiler modifiers require a compiler handler,
+session-property modifiers use a separate typed override channel, safe no-ops
+are validated and ignored, and unsupported modifiers fail when explicitly
+requested. An omitted unsupported modifier is inert. Consumers must still fail
+closed when a requested capability is not declared and must not interpolate
+modifier values into SQL.
 
 Published generations are persisted in the config-store Postgres database.
 Rows are append-only and the latest snapshot is selected by generation, so all

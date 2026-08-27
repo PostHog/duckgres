@@ -815,6 +815,9 @@ func validateModifiers(definitions []SemanticModifierDefault) error {
 			if len(definition.SessionProperty) == 0 {
 				return invalidSnapshot("modifier %q must name a session property", definition.Name)
 			}
+			if len(definition.SessionProperty) > 2 {
+				return invalidSnapshot("modifier %q session property has too many name parts", definition.Name)
+			}
 		} else if len(definition.SessionProperty) != 0 {
 			return invalidSnapshot("modifier %q cannot name a session property", definition.Name)
 		}
