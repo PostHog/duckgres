@@ -2,6 +2,64 @@
 
 This package contains the golden-query performance harness.
 
+## Paired Query Catalogs
+
+Existing catalogs continue to use `queries:` unchanged. A catalog may contain
+legacy `queries:`, `paired_queries:`, or both. Paired definitions let one
+semantic SQL template run against the frozen raw Parquet views and the
+production-shaped DuckLake tables without changing the runner or artifact
+contracts:
+
+```yaml
+relation_variants:
+  raw_view:
+    events: frozen_v1.events_file_view
+    persons: frozen_v1.persons_file_view
+  ducklake_table:
+    events: posthog.events
+    persons: posthog.persons
+
+paired_queries:
+  - query_id_base: q_events_daily
+    intent_id: ph.events.daily.v1
+    tags: [posthog, events, time-series]
+    params: {}
+    sql_template: |
+      SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events
+      FROM {{ relation "events" }}
+      WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'
+        AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00'
+      GROUP BY 1
+      ORDER BY 1
+```
+
+Paired catalogs must declare exactly the `raw_view` and `ducklake_table`
+variants. A template expands in declaration order, with `raw_view` before
+`ducklake_table`, into `q_events_daily__raw_view` and
+`q_events_daily__ducklake_table`. Generated queries retain the same
+`intent_id`, tags, parameters, and semantic template; only declared relation
+placeholders differ. They carry in-memory storage-target metadata, so later
+code does not need to infer the target from the generated ID. Legacy queries
+remain unpaired. The v1 artifact and publisher schemas remain unchanged, so
+artifact rows distinguish paired targets only by these generated query IDs;
+they do not include a storage-target column.
+
+Templating is intentionally limited to `{{ relation "<role>" }}`. Each role
+must have a binding in both variants, and multiple roles may be used in one
+template. Bindings are unquoted, dot-separated identifiers such as
+`posthog.events`; the loader validates every identifier segment and emits it
+as a safely quoted relation. SQL expressions, comments, semicolons,
+whitespace, quoted identifiers, and malformed names are rejected in bindings;
+all template actions other than the relation placeholder are rejected.
+Placeholder syntax inside SQL strings, quoted identifiers, or comments is also
+rejected so a target cannot be mislabeled without changing the executed
+relation. The rendered SQL must be a single read-only `SELECT` statement and is
+stored in the PGWire SQL field.
+
+This is catalog abstraction only. Fair scheduling, migration of the real
+frozen PostHog query catalog, paired artifacts, dashboards, and Grafana work
+are deliberately deferred to later PRs.
+
 ## Local Smoke Run
 
 ```bash
