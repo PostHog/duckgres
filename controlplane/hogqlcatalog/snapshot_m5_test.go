@@ -180,6 +180,33 @@ func TestPublishRejectsInvalidSemanticRecipeGraph(t *testing.T) {
 			},
 		},
 		{
+			name: "binary operator with one argument",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Recipe = ExpressionRecipe{
+					Kind: ExpressionRecipeOperator,
+					Operator: &OperatorRecipe{
+						Operator:  SemanticOperatorAdd,
+						Arguments: []ExpressionRecipe{fieldRecipe("events", "id")},
+					},
+				}
+			},
+		},
+		{
+			name: "unary operator with two arguments",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Recipe = ExpressionRecipe{
+					Kind: ExpressionRecipeOperator,
+					Operator: &OperatorRecipe{
+						Operator: SemanticOperatorNot,
+						Arguments: []ExpressionRecipe{
+							fieldRecipe("events", "id"),
+							fieldRecipe("events", "id"),
+						},
+					},
+				}
+			},
+		},
+		{
 			name: "expression recipe depth limit",
 			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
 				recipe := fieldRecipe("events", "id")

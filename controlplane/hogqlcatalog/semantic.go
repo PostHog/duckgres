@@ -402,8 +402,11 @@ func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth
 			}
 		}
 	case ExpressionRecipeOperator:
-		if recipe.Operator == nil || payloads != 1 || !slices.Contains(validSemanticOperators, recipe.Operator.Operator) || len(recipe.Operator.Arguments) == 0 {
+		if recipe.Operator == nil || payloads != 1 || !slices.Contains(validSemanticOperators, recipe.Operator.Operator) {
 			return invalidSnapshot("invalid OPERATOR recipe")
+		}
+		if len(recipe.Operator.Arguments) != semanticOperatorArity(recipe.Operator.Operator) {
+			return invalidSnapshot("invalid OPERATOR recipe argument count")
 		}
 		for index := range recipe.Operator.Arguments {
 			if err := validateExpressionRecipe(&recipe.Operator.Arguments[index], ownerTable, depth+1, nodes, tables, expressionFields, functions, dependencies); err != nil {
@@ -422,6 +425,32 @@ func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth
 		return invalidSnapshot("unknown expression recipe kind")
 	}
 	return nil
+}
+
+func semanticOperatorArity(operator SemanticOperator) int {
+	switch operator {
+	case SemanticOperatorAdd,
+		SemanticOperatorSubtract,
+		SemanticOperatorMultiply,
+		SemanticOperatorDivide,
+		SemanticOperatorModulus,
+		SemanticOperatorEqual,
+		SemanticOperatorNotEqual,
+		SemanticOperatorLessThan,
+		SemanticOperatorLessThanOrEqual,
+		SemanticOperatorGreaterThan,
+		SemanticOperatorGreaterThanOrEqual,
+		SemanticOperatorAnd,
+		SemanticOperatorOr:
+		return 2
+	case SemanticOperatorNot,
+		SemanticOperatorNegate,
+		SemanticOperatorIsNull,
+		SemanticOperatorIsNotNull:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func validateTypedLiteral(literal *TypedLiteral) error {
