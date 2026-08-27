@@ -109,7 +109,7 @@ func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 }
 
 func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measureIteration int, summary *RunSummary) error {
-	for _, query := range r.cfg.Catalog.Queries {
+	for _, query := range queriesForIteration(r.cfg.Catalog.Queries, measureIteration) {
 		args := orderedParamValues(query.Params)
 		for _, protocol := range r.cfg.Catalog.Targets {
 			driver := r.cfg.Drivers[protocol]
@@ -153,6 +153,28 @@ func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measur
 		}
 	}
 	return nil
+}
+
+// queriesForIteration alternates each generated raw-view/DuckLake-table pair
+// on measured iterations. This balances which storage target runs first and
+// prevents one target from consistently inheriting cache state from the other.
+// Legacy queries retain their declared order.
+func queriesForIteration(queries []Query, measureIteration int) []Query {
+	if measureIteration <= 0 || measureIteration%2 == 1 {
+		return queries
+	}
+	ordered := append([]Query(nil), queries...)
+	for index := 0; index+1 < len(ordered); index++ {
+		first, second := ordered[index], ordered[index+1]
+		if first.StorageTarget != StorageTargetRawView ||
+			second.StorageTarget != StorageTargetDuckLakeTable ||
+			first.IntentID != second.IntentID {
+			continue
+		}
+		ordered[index], ordered[index+1] = second, first
+		index++
+	}
+	return ordered
 }
 
 func orderedParamValues(params map[string]any) []any {

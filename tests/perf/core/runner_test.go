@@ -46,7 +46,10 @@ paired_queries:
 	if _, err := runner.Run(context.Background()); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	wantIDs := []string{"q_events__raw_view", "q_events__ducklake_table"}
+	wantIDs := []string{
+		"q_events__raw_view", "q_events__ducklake_table",
+		"q_events__ducklake_table", "q_events__raw_view",
+	}
 	if !reflect.DeepEqual(driver.queryIDs, wantIDs) {
 		t.Fatalf("driver query order: got %v want %v", driver.queryIDs, wantIDs)
 	}
@@ -56,6 +59,94 @@ paired_queries:
 	}
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("result query IDs: got %v want %v", gotIDs, wantIDs)
+	}
+}
+
+func TestQueriesForIterationSwapsOnlyCompletePairsWithoutMutatingCatalogOrder(t *testing.T) {
+	queries := []Query{
+		{QueryID: "legacy_before"},
+		{QueryID: "pair_a_raw", IntentID: "intent_a", StorageTarget: StorageTargetRawView},
+		{QueryID: "pair_a_table", IntentID: "intent_a", StorageTarget: StorageTargetDuckLakeTable},
+		{QueryID: "legacy_middle"},
+		{QueryID: "pair_b_raw", IntentID: "intent_b", StorageTarget: StorageTargetRawView},
+		{QueryID: "pair_b_table", IntentID: "intent_b", StorageTarget: StorageTargetDuckLakeTable},
+		{QueryID: "legacy_after"},
+	}
+	declaredOrder := queryIDOrder(queries)
+	if got := queryIDOrder(queriesForIteration(queries, 1)); !reflect.DeepEqual(got, declaredOrder) {
+		t.Fatalf("odd iteration order: got %v want %v", got, declaredOrder)
+	}
+	wantEven := []string{
+		"legacy_before",
+		"pair_a_table", "pair_a_raw",
+		"legacy_middle",
+		"pair_b_table", "pair_b_raw",
+		"legacy_after",
+	}
+	if got := queryIDOrder(queriesForIteration(queries, 2)); !reflect.DeepEqual(got, wantEven) {
+		t.Fatalf("even iteration order: got %v want %v", got, wantEven)
+	}
+	if got := queryIDOrder(queries); !reflect.DeepEqual(got, declaredOrder) {
+		t.Fatalf("catalog order mutated: got %v want %v", got, declaredOrder)
+	}
+}
+
+func queryIDOrder(queries []Query) []string {
+	ids := make([]string, 0, len(queries))
+	for _, query := range queries {
+		ids = append(ids, query.QueryID)
+	}
+	return ids
+}
+
+func TestRunnerBalancesPairedQueryOrderAcrossMeasuredIterations(t *testing.T) {
+	driver := &testDriver{protocol: ProtocolPGWire}
+	sink := &inMemorySink{}
+	runner := NewQueryRunner(RunnerConfig{
+		Catalog: Catalog{
+			Name:              "paired",
+			MeasureIterations: 4,
+			Targets:           []Protocol{ProtocolPGWire},
+			Queries: []Query{
+				{
+					QueryID:       "q_events__raw_view",
+					IntentID:      "intent_events",
+					PGWireSQL:     "SELECT COUNT(*) FROM frozen_v1.events_file_view",
+					StorageTarget: StorageTargetRawView,
+				},
+				{
+					QueryID:       "q_events__ducklake_table",
+					IntentID:      "intent_events",
+					PGWireSQL:     "SELECT COUNT(*) FROM posthog.events",
+					StorageTarget: StorageTargetDuckLakeTable,
+				},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{
+			ProtocolPGWire: driver,
+		},
+		Sink: sink,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	if _, err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	wantIDs := []string{
+		"q_events__raw_view", "q_events__ducklake_table",
+		"q_events__ducklake_table", "q_events__raw_view",
+		"q_events__raw_view", "q_events__ducklake_table",
+		"q_events__ducklake_table", "q_events__raw_view",
+	}
+	if !reflect.DeepEqual(driver.queryIDs, wantIDs) {
+		t.Fatalf("driver query order: got %v want %v", driver.queryIDs, wantIDs)
+	}
+	gotIDs := make([]string, 0, len(sink.results))
+	for _, result := range sink.results {
+		gotIDs = append(gotIDs, result.QueryID)
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("result query order: got %v want %v", gotIDs, wantIDs)
 	}
 }
 

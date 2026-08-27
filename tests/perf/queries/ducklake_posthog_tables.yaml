@@ -1,86 +1,63 @@
-name: posthog-frozen-ducklake-golden-v1
-description: Paired raw-Parquet-view and DuckLake-table queries, plus table-only regression probes, over the frozen PostHog dataset.
+name: posthog-frozen-ducklake-golden-v2
+description: Identical query shapes with balanced execution order over frozen raw Parquet views and production-shaped DuckLake tables.
 seed: 42
 dataset_scale: 1
 targets:
   - pgwire
 warmup_iterations: 1
-measure_iterations: 3
-queries:
-  # Paired probes use identical SQL shapes to compare raw Parquet access with
-  # DuckLake-managed-table execution in the same artifact.
-  - query_id: q_events_total__raw_view
-    intent_id: intent_events_total
-    tags: [nightly, frozen, posthog, events, aggregate, paired, raw-view]
-    params: {}
-    pgwire_sql: SELECT COUNT(*) AS events FROM frozen_v1.events_file_view
+measure_iterations: 4
 
-  - query_id: q_events_total__ducklake_table
-    intent_id: intent_events_total
-    tags: [nightly, frozen, posthog, events, aggregate, paired, ducklake-table]
-    params: {}
-    pgwire_sql: SELECT COUNT(*) AS events FROM posthog.events
+relation_variants:
+  raw_view:
+    events: frozen_v1.events_file_view
+    persons: frozen_v1.persons_file_view
+  ducklake_table:
+    events: posthog.events
+    persons: posthog.persons
 
-  - query_id: q_events_count_one_day__raw_view
-    intent_id: intent_events_count_one_day
-    tags: [nightly, frozen, posthog, events, aggregate, one-day, paired, raw-view]
+paired_queries:
+  - query_id_base: q_events_total_balanced_v2
+    intent_id: intent_events_total_balanced_v2
+    tags: [nightly, frozen, posthog, events, aggregate, paired]
     params: {}
-    pgwire_sql: >
+    sql_template: SELECT COUNT(*) AS events FROM {{ relation "events" }}
+
+  - query_id_base: q_events_count_one_day_balanced_v2
+    intent_id: intent_events_count_one_day_balanced_v2
+    tags: [nightly, frozen, posthog, events, aggregate, one-day, paired]
+    params: {}
+    sql_template: >
       SELECT COUNT(*) AS events
-      FROM frozen_v1.events_file_view
+      FROM {{ relation "events" }}
       WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'
         AND "timestamp" < TIMESTAMPTZ '2026-03-02 00:00:00+00'
 
-  - query_id: q_events_count_one_day__ducklake_table
-    intent_id: intent_events_count_one_day
-    tags: [nightly, frozen, posthog, events, aggregate, one-day, paired, ducklake-table]
+  - query_id_base: q_events_by_name_march_2026_balanced_v2
+    intent_id: intent_events_by_name_march_2026_balanced_v2
+    tags: [nightly, frozen, posthog, events, aggregate, analytics, paired]
     params: {}
-    pgwire_sql: >
-      SELECT COUNT(*) AS events
-      FROM posthog.events
-      WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'
-        AND "timestamp" < TIMESTAMPTZ '2026-03-02 00:00:00+00'
+    sql_template: SELECT event, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
 
-  - query_id: q_events_by_name_march_2026__raw_view
-    intent_id: intent_events_by_name_march_2026
-    tags: [nightly, frozen, posthog, events, aggregate, analytics, paired, raw-view]
+  - query_id_base: q_events_distinct_persons_balanced_v2
+    intent_id: intent_events_distinct_persons_balanced_v2
+    tags: [nightly, frozen, posthog, events, aggregate, distinct, paired]
     params: {}
-    pgwire_sql: SELECT event, COUNT(*) AS events FROM frozen_v1.events_file_view WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+    sql_template: SELECT COUNT(DISTINCT person_id) AS distinct_persons FROM {{ relation "events" }} WHERE person_id IS NOT NULL
 
-  - query_id: q_events_by_name_march_2026__ducklake_table
-    intent_id: intent_events_by_name_march_2026
-    tags: [nightly, frozen, posthog, events, aggregate, analytics, paired, ducklake-table]
+  - query_id_base: q_persons_total_balanced_v2
+    intent_id: intent_persons_total_balanced_v2
+    tags: [nightly, frozen, posthog, persons, aggregate, paired]
     params: {}
-    pgwire_sql: SELECT event, COUNT(*) AS events FROM posthog.events WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+    sql_template: SELECT COUNT(*) AS persons FROM {{ relation "persons" }}
 
-  - query_id: q_events_distinct_persons__raw_view
-    intent_id: intent_events_distinct_persons
-    tags: [nightly, frozen, posthog, events, aggregate, distinct, paired, raw-view]
+  - query_id_base: q_persons_daily_april_2026_balanced_v2
+    intent_id: intent_persons_daily_april_2026_balanced_v2
+    tags: [nightly, frozen, posthog, persons, aggregate, time-series, paired]
     params: {}
-    pgwire_sql: SELECT COUNT(DISTINCT person_id) AS distinct_persons FROM frozen_v1.events_file_view WHERE person_id IS NOT NULL
+    sql_template: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM {{ relation "persons" }} WHERE _timestamp >= TIMESTAMPTZ '2026-04-01 00:00:00+00' AND _timestamp < TIMESTAMPTZ '2026-05-01 00:00:00+00' GROUP BY 1 ORDER BY 1
 
-  - query_id: q_events_distinct_persons__ducklake_table
-    intent_id: intent_events_distinct_persons
-    tags: [nightly, frozen, posthog, events, aggregate, distinct, paired, ducklake-table]
+  - query_id_base: q_events_daily_march_2026_balanced_v2
+    intent_id: intent_events_daily_march_2026_balanced_v2
+    tags: [nightly, frozen, posthog, events, aggregate, time-series, paired]
     params: {}
-    pgwire_sql: SELECT COUNT(DISTINCT person_id) AS distinct_persons FROM posthog.events WHERE person_id IS NOT NULL
-
-  # Table-only probes track the DuckLake workload over time without a raw
-  # Parquet control query.
-  - query_id: q_persons_total__ducklake_table
-    intent_id: intent_persons_total
-    tags: [nightly, frozen, posthog, persons, aggregate, ducklake-table]
-    params: {}
-    pgwire_sql: SELECT COUNT(*) AS persons FROM posthog.persons
-
-  - query_id: q_persons_daily_april_2026__ducklake_table
-    intent_id: intent_persons_daily_april_2026
-    tags: [nightly, frozen, posthog, persons, aggregate, time-series, ducklake-table]
-    params: {}
-    pgwire_sql: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM posthog.persons WHERE _timestamp >= TIMESTAMPTZ '2026-04-01 00:00:00+00' AND _timestamp < TIMESTAMPTZ '2026-05-01 00:00:00+00' GROUP BY 1 ORDER BY 1
-
-  - query_id: q_events_daily_march_2026__ducklake_table
-    intent_id: intent_events_daily_march_2026
-    tags: [nightly, frozen, posthog, events, aggregate, time-series, ducklake-table]
-    params: {}
-    pgwire_sql: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM posthog.events WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY 1 ORDER BY 1
+    sql_template: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY 1 ORDER BY 1
