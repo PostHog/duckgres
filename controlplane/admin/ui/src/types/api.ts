@@ -836,6 +836,11 @@ export interface TrinoStatus {
   server?: TrinoServerInfo;
   queries_by_state: Record<string, number>;
   blocked_queries: number;
+  // node_stats=false means this cell does not report nodes at all, so nodes
+  // and failed_nodes are both zero and mean nothing. Trino serves /v1/node
+  // only under discovery.type=AIRLIFT_DISCOVERY; these cells run the default
+  // ANNOUNCE. Render "not reported" rather than zero nodes.
+  node_stats: boolean;
   nodes: number;
   failed_nodes: number;
   orgs_by_state: Record<string, number>;

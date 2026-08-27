@@ -96,8 +96,12 @@ type TrinoStatus struct {
 	// than one that is busy.
 	BlockedQueries int `json:"blocked_queries"`
 
-	Nodes       int `json:"nodes"`
-	FailedNodes int `json:"failed_nodes"`
+	// NodeStats reports whether Nodes and FailedNodes mean anything. A cell
+	// using Trino's default discovery.type=ANNOUNCE does not serve /v1/node,
+	// so the console must show "not reported here" rather than zero nodes.
+	NodeStats   bool `json:"node_stats"`
+	Nodes       int  `json:"nodes"`
+	FailedNodes int  `json:"failed_nodes"`
 
 	// OrgsByState counts Trino-enabled orgs by provisioning state, so a
 	// stuck tenant is visible without opening the org list.
@@ -307,13 +311,20 @@ func (a *TrinoAPI) handleStatus(c *gin.Context) {
 		}
 	}
 
+	// Node stats are best-effort. A cell built with the default
+	// discovery.type=ANNOUNCE does not serve /v1/node at all, and a healthy
+	// cell must not be reported as down because an endpoint it never had is
+	// missing. Any other error still counts against the cell.
 	if nodes, nodeErr := a.nodes.get(ctx, a.client.Nodes); nodeErr == nil {
+		status.NodeStats = true
 		status.Nodes = len(nodes)
 		for _, n := range nodes {
 			if n.Failed {
 				status.FailedNodes++
 			}
 		}
+	} else if isTrinoEndpointUnavailable(nodeErr) {
+		status.NodeStats = false
 	} else if status.Error == "" {
 		status.Available = false
 		status.Error = nodeErr.Error()
@@ -477,6 +488,17 @@ func (a *TrinoAPI) handleKillQuery(c *gin.Context) {
 
 func (a *TrinoAPI) handleNodes(c *gin.Context) {
 	nodes, err := a.nodes.get(c.Request.Context(), a.client.Nodes)
+	if isTrinoEndpointUnavailable(err) {
+		// Not a gateway failure: the coordinator answered, and it does not
+		// serve this route. 501 says the console asked for something this
+		// cell cannot provide, which is what an operator needs to know.
+		c.JSON(http.StatusNotImplemented, gin.H{
+			"cell":      a.cell,
+			"available": false,
+			"reason":    "this cell does not serve /v1/node; Trino binds it only under discovery.type=AIRLIFT_DISCOVERY",
+		})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error(), "available": false})
 		return

@@ -291,6 +291,48 @@ func TestCoordinatorClientGoneQueryIsNotFound(t *testing.T) {
 	if !isTrinoNotFound(err) {
 		t.Errorf("410 Gone should map to a not-found error, got %v", err)
 	}
+	if isTrinoEndpointUnavailable(err) {
+		t.Error("410 Gone is a missing query, not a missing endpoint")
+	}
+}
+
+// TestCoordinatorClientMissingRouteIsEndpointUnavailable: a coordinator
+// built with Trino's default discovery.type=ANNOUNCE does not bind
+// NodeResource, so /v1/node answers 404. The cell is healthy and must not be
+// reported as one that never answered.
+func TestCoordinatorClientMissingRouteIsEndpointUnavailable(t *testing.T) {
+	c, _ := newTrinoTestCoordinator(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	_, err := c.Nodes(context.Background())
+	if !isTrinoEndpointUnavailable(err) {
+		t.Errorf("404 should map to an endpoint-unavailable error, got %v", err)
+	}
+	if isTrinoNotFound(err) {
+		t.Error("a missing route must not read as a missing query")
+	}
+}
+
+// TestCoordinatorClientQueryRoute404StaysNotFound guards the per-query
+// routes. /v1/query/{id} is always served, so a 404 there is about the id —
+// JAX-RS answers 404 when it cannot parse one into a QueryId. An operator
+// following a malformed link must be told the query is missing, not that the
+// coordinator does not serve query lookups.
+func TestCoordinatorClientQueryRoute404StaysNotFound(t *testing.T) {
+	c, _ := newTrinoTestCoordinator(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	_, err := c.Query(context.Background(), "not a query id")
+	if !isTrinoNotFound(err) {
+		t.Errorf("404 on the query route should read as a missing query, got %v", err)
+	}
+	if isTrinoEndpointUnavailable(err) {
+		t.Error("the query route exists; a 404 there is not a missing endpoint")
+	}
+
+	if killErr := c.KillQuery(context.Background(), "not a query id", "why"); !isTrinoNotFound(killErr) {
+		t.Errorf("404 on kill should read as a missing query, got %v", killErr)
+	}
 }
 
 // TestCoordinatorClientForbiddenIsSurfaced: a 403 means the observer's OPA
