@@ -291,6 +291,26 @@ func TestCoordinatorClientGoneQueryIsNotFound(t *testing.T) {
 	if !isTrinoNotFound(err) {
 		t.Errorf("410 Gone should map to a not-found error, got %v", err)
 	}
+	if isTrinoEndpointUnavailable(err) {
+		t.Error("410 Gone is a missing query, not a missing endpoint")
+	}
+}
+
+// TestCoordinatorClientMissingRouteIsEndpointUnavailable: a coordinator
+// built with Trino's default discovery.type=ANNOUNCE does not bind
+// NodeResource, so /v1/node answers 404. The cell is healthy and must not be
+// reported as one that never answered.
+func TestCoordinatorClientMissingRouteIsEndpointUnavailable(t *testing.T) {
+	c, _ := newTrinoTestCoordinator(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	_, err := c.Nodes(context.Background())
+	if !isTrinoEndpointUnavailable(err) {
+		t.Errorf("404 should map to an endpoint-unavailable error, got %v", err)
+	}
+	if isTrinoNotFound(err) {
+		t.Error("a missing route must not read as a missing query")
+	}
 }
 
 // TestCoordinatorClientForbiddenIsSurfaced: a 403 means the observer's OPA

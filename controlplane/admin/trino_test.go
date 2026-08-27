@@ -313,6 +313,40 @@ func TestStatusReportsProvisioningWhenTheCoordinatorIsDown(t *testing.T) {
 	}
 }
 
+// TestStatusStaysAvailableWhenTheCellDoesNotServeNodes is the bug this
+// distinction exists for. Trino binds NodeResource only under
+// discovery.type=AIRLIFT_DISCOVERY, and these cells run the default
+// ANNOUNCE, so /v1/node answers 404 on a perfectly healthy coordinator.
+// Before this, that 404 set available=false and the console reported a
+// working cell as one that never answered.
+func TestStatusStaysAvailableWhenTheCellDoesNotServeNodes(t *testing.T) {
+	coord := &fakeTrinoCoordinator{
+		info:     &TrinoServerInfo{Version: "484", Environment: "production"},
+		queries:  []TrinoQuery{{QueryID: "q1", State: "RUNNING", Principal: "db_a"}},
+		nodesErr: fmt.Errorf("GET /v1/node: %w", errTrinoEndpointUnavailable),
+	}
+	r := trinoTestRouter(testTrinoAPI(t, coord, twoOrgTrinoStore()), RoleViewer)
+
+	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/trino/status", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if body["available"] != true {
+		t.Errorf("a cell that does not serve /v1/node is still available, body: %v", body)
+	}
+	if s, _ := body["error"].(string); s != "" {
+		t.Errorf("a missing endpoint is not a cell error, got %q", s)
+	}
+	if body["node_stats"] != false {
+		t.Error("node_stats must be false so the console shows 'not reported' rather than zero nodes")
+	}
+	// The rest of the cell must still be reported.
+	states := body["queries_by_state"].(map[string]any)
+	if states["RUNNING"] != float64(1) {
+		t.Errorf("queries must still be counted, got %v", states)
+	}
+}
+
 func TestStatusCountsQueriesAndNodes(t *testing.T) {
 	coord := &fakeTrinoCoordinator{
 		info: &TrinoServerInfo{Version: "484", Environment: "production", UptimeMS: 3600000},

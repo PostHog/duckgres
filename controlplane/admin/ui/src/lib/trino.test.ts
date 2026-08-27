@@ -59,6 +59,7 @@ function status(over: Partial<TrinoStatus> = {}): TrinoStatus {
     available: true,
     queries_by_state: {},
     blocked_queries: 0,
+    node_stats: true,
     nodes: 0,
     failed_nodes: 0,
     orgs_by_state: {},

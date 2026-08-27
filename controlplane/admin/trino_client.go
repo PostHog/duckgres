@@ -50,6 +50,21 @@ var errTrinoNotFound = errors.New("trino: query not found")
 
 func isTrinoNotFound(err error) bool { return errors.Is(err, errTrinoNotFound) }
 
+// errTrinoEndpointUnavailable is returned when the coordinator answers but
+// does not serve the route at all. That is a statement about how the cell is
+// built, not about its health, and it is not the same incident as a
+// coordinator that never answered.
+//
+// /v1/node is the case this exists for. Trino binds NodeResource only under
+// discovery.type=AIRLIFT_DISCOVERY; the default is ANNOUNCE, which these
+// cells use, so the route is absent and the coordinator correctly answers
+// 404. Reporting that as a dead cell hides the real state of a healthy one.
+var errTrinoEndpointUnavailable = errors.New("trino: endpoint not served by this coordinator")
+
+func isTrinoEndpointUnavailable(err error) bool {
+	return errors.Is(err, errTrinoEndpointUnavailable)
+}
+
 // TrinoQuery is one query as the console shows it: identity, lifecycle and
 // the cost counters an operator triages on.
 //
@@ -194,9 +209,16 @@ func NewTrinoCoordinatorClient(baseURL, tlsServerName string, creds TrinoCredent
 }
 
 // do issues one authenticated request and returns the body. Non-2xx is an
-// error carrying the status, except 410 Gone, which maps to
-// errTrinoNotFound so a stale query link reads as "gone" rather than as a
-// broken cell.
+// error carrying the status, except two cases that are not cell failures:
+//
+//	410 Gone      the query is no longer held -> errTrinoNotFound, so a
+//	              stale query link reads as "gone" rather than as a broken
+//	              cell. QueryResource throws GoneException for this, and
+//	              only for this.
+//	404 Not Found the coordinator does not serve the route at all ->
+//	              errTrinoEndpointUnavailable, so an endpoint this cell was
+//	              never built with reads as unavailable rather than as
+//	              silence from the coordinator.
 func (c *trinoCoordinatorHTTPClient) do(ctx context.Context, method, path string, body io.Reader) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
@@ -215,8 +237,10 @@ func (c *trinoCoordinatorHTTPClient) do(ctx context.Context, method, path string
 	defer func() { _ = resp.Body.Close() }()
 	raw, readErr := io.ReadAll(resp.Body)
 	switch {
-	case resp.StatusCode == http.StatusGone, resp.StatusCode == http.StatusNotFound:
+	case resp.StatusCode == http.StatusGone:
 		return nil, fmt.Errorf("%s %s: %w", method, path, errTrinoNotFound)
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, fmt.Errorf("%s %s: %w", method, path, errTrinoEndpointUnavailable)
 	case resp.StatusCode == http.StatusForbidden:
 		// Worth its own message: this is what a missing observer grant or
 		// an un-rolled-out OPA bundle looks like, and it is fixed in a
