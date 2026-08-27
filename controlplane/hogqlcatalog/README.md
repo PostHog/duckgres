@@ -25,6 +25,27 @@ opaque provenance; their required logical, virtual, or materialized target is
 the complete locally executable version 2 form. Query text is not part of this
 transport, so reads never require a hot-path metadata RPC.
 
+## Physical metadata assembly
+
+`PhysicalMetadataProvider` is the boundary for an authoritative DuckLake
+metadata reader. `BuildPhysicalSnapshot` translates one complete provider result
+into a normalized version 2 snapshot: tables and columns are ordered
+deterministically, exact structured identifiers are preserved, and each column
+carries its provider-supplied Trino type signature, nullability, and star
+visibility. HogQL logical types are derived from the Trino type family. Types
+that do not have a HogQL family remain `UNKNOWN` without changing the exact
+Trino signature. Nullability and star visibility use explicit dispositions, so
+an omitted provider value cannot silently become `NOT NULL` or hidden.
+
+The provider result is all-or-nothing. Missing inventories, a mismatched
+catalog, noncanonical identifiers, duplicate tables, columns, or ordinals, and
+empty or noncanonical type-signature text fail before a snapshot can be
+published. Full Trino type syntax is parsed by the Trino consumer; this boundary
+preserves the provider's exact signature rather than approximating it. This
+package does not synthesize tables when DuckLake metadata is unavailable. The
+control plane still needs a production provider backed by the tenant metadata
+store; the current HTTP publisher accepts already assembled snapshots.
+
 ## API
 
 The control plane exposes one internal-token-authenticated compatibility resource:
