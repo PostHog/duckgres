@@ -39,7 +39,7 @@ func newTestStorageSampler(store storageUsageStore, orgs []storageOrg, footprint
 		func(_ context.Context, orgID string) (string, error) { return "postgres://meta/" + orgID, nil },
 	)
 	s.queryFootprint = footprint
-	s.queryHotBytes = func(_ context.Context, _ string) (int64, error) { return 0, nil }
+	s.queryHotStats = func(_ context.Context, _ string) (int64, float64, error) { return 0, 0, nil }
 	s.now = func() time.Time { return time.Date(2026, 7, 8, 12, 0, 47, 0, time.UTC) }
 	return s
 }
@@ -74,19 +74,23 @@ func TestStorageSamplerCreditsOneIntervalPerOrg(t *testing.T) {
 	}
 }
 
-func TestStorageSamplerReportsQueryLogHotBytesWithoutChangingStorageCredit(t *testing.T) {
+func TestStorageSamplerReportsQueryLogHotStatsWithoutChangingStorageCredit(t *testing.T) {
 	queryLogHotBytesGauge.Reset()
-	t.Cleanup(queryLogHotBytesGauge.Reset)
+	queryLogHotRowsGauge.Reset()
+	t.Cleanup(func() {
+		queryLogHotBytesGauge.Reset()
+		queryLogHotRowsGauge.Reset()
+	})
 
 	store := &fakeStorageStore{}
 	s := newTestStorageSampler(store,
 		[]storageOrg{{OrgID: "hot-bytes-org", TeamID: 42}},
 		func(_ context.Context, _ string) (int64, int64, error) { return 512, 0, nil })
-	s.queryHotBytes = func(_ context.Context, dsn string) (int64, error) {
+	s.queryHotStats = func(_ context.Context, dsn string) (int64, float64, error) {
 		if dsn != "postgres://meta/hot-bytes-org" {
 			t.Fatalf("hot-bytes DSN = %q", dsn)
 		}
-		return 9 * 1024 * 1024, nil
+		return 9 * 1024 * 1024, 1234.5, nil
 	}
 
 	s.sampleAll(context.Background())
@@ -100,11 +104,18 @@ func TestStorageSamplerReportsQueryLogHotBytesWithoutChangingStorageCredit(t *te
 	if got, want := testutil.ToFloat64(queryLogHotBytesGauge.WithLabelValues("hot-bytes-org")), float64(9*1024*1024); got != want {
 		t.Fatalf("query-log hot bytes = %v, want %v", got, want)
 	}
+	if got, want := testutil.ToFloat64(queryLogHotRowsGauge.WithLabelValues("hot-bytes-org")), 1234.5; got != want {
+		t.Fatalf("query-log hot rows = %v, want %v", got, want)
+	}
 }
 
-func TestStorageSamplerHotBytesFailurePreservesLastValueAndBilling(t *testing.T) {
+func TestStorageSamplerHotStatsFailurePreservesLastValuesAndBilling(t *testing.T) {
 	queryLogHotBytesGauge.Reset()
-	t.Cleanup(queryLogHotBytesGauge.Reset)
+	queryLogHotRowsGauge.Reset()
+	t.Cleanup(func() {
+		queryLogHotBytesGauge.Reset()
+		queryLogHotRowsGauge.Reset()
+	})
 
 	const orgID = "hot-bytes-failure-org"
 	store := &fakeStorageStore{}
@@ -112,12 +123,12 @@ func TestStorageSamplerHotBytesFailurePreservesLastValueAndBilling(t *testing.T)
 		[]storageOrg{{OrgID: orgID, TeamID: 42}},
 		func(_ context.Context, _ string) (int64, int64, error) { return 1024, 0, nil })
 	var calls int
-	s.queryHotBytes = func(_ context.Context, _ string) (int64, error) {
+	s.queryHotStats = func(_ context.Context, _ string) (int64, float64, error) {
 		calls++
 		if calls == 1 {
-			return 900, nil
+			return 900, 45.5, nil
 		}
-		return 0, errors.New("hot-size query failed")
+		return 0, 0, errors.New("hot-stats query failed")
 	}
 	storageErrorsBefore := testutil.ToFloat64(storageSampleErrorsCounter.WithLabelValues(orgID))
 
@@ -137,6 +148,9 @@ func TestStorageSamplerHotBytesFailurePreservesLastValueAndBilling(t *testing.T)
 	}
 	if got := testutil.ToFloat64(queryLogHotBytesGauge.WithLabelValues(orgID)); got != 900 {
 		t.Fatalf("query-log hot bytes after failed refresh = %v, want last good value 900", got)
+	}
+	if got := testutil.ToFloat64(queryLogHotRowsGauge.WithLabelValues(orgID)); got != 45.5 {
+		t.Fatalf("query-log hot rows after failed refresh = %v, want last good value 45.5", got)
 	}
 }
 
@@ -177,7 +191,7 @@ func TestStorageSamplerRunStopsOnCancel(t *testing.T) {
 		func(_ context.Context, orgID string) (string, error) { return "postgres://meta/" + orgID, nil },
 	)
 	s.queryFootprint = func(_ context.Context, _ string) (int64, int64, error) { return 2048, 0, nil }
-	s.queryHotBytes = func(_ context.Context, _ string) (int64, error) { return 0, nil }
+	s.queryHotStats = func(_ context.Context, _ string) (int64, float64, error) { return 0, 0, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -197,10 +211,12 @@ func TestStorageSamplerClearsLeaderOwnedGaugesOnCancel(t *testing.T) {
 	storageTrackedBytesGauge.Reset()
 	storagePendingDeleteFilesGauge.Reset()
 	queryLogHotBytesGauge.Reset()
+	queryLogHotRowsGauge.Reset()
 	t.Cleanup(func() {
 		storageTrackedBytesGauge.Reset()
 		storagePendingDeleteFilesGauge.Reset()
 		queryLogHotBytesGauge.Reset()
+		queryLogHotRowsGauge.Reset()
 	})
 
 	store := &fakeStorageStore{}
@@ -209,7 +225,7 @@ func TestStorageSamplerClearsLeaderOwnedGaugesOnCancel(t *testing.T) {
 		func(_ context.Context, orgID string) (string, error) { return "postgres://meta/" + orgID, nil },
 	)
 	s.queryFootprint = func(_ context.Context, _ string) (int64, int64, error) { return 2048, 3, nil }
-	s.queryHotBytes = func(_ context.Context, _ string) (int64, error) { return 512, nil }
+	s.queryHotStats = func(_ context.Context, _ string) (int64, float64, error) { return 512, 7.5, nil }
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -230,6 +246,10 @@ func TestStorageSamplerClearsLeaderOwnedGaugesOnCancel(t *testing.T) {
 		cancel()
 		t.Fatalf("query-log hot-bytes gauge series while leading = %d, want 1", got)
 	}
+	if got := testutil.CollectAndCount(queryLogHotRowsGauge); got != 1 {
+		cancel()
+		t.Fatalf("query-log hot-rows gauge series while leading = %d, want 1", got)
+	}
 
 	cancel()
 	select {
@@ -245,6 +265,9 @@ func TestStorageSamplerClearsLeaderOwnedGaugesOnCancel(t *testing.T) {
 	}
 	if got := testutil.CollectAndCount(queryLogHotBytesGauge); got != 0 {
 		t.Fatalf("query-log hot-bytes gauge series after leadership loss = %d, want 0", got)
+	}
+	if got := testutil.CollectAndCount(queryLogHotRowsGauge); got != 0 {
+		t.Fatalf("query-log hot-rows gauge series after leadership loss = %d, want 0", got)
 	}
 }
 
