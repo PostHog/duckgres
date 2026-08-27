@@ -39,7 +39,7 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 	}
 }
 
-func TestCheckedInPostHogCatalogPublishedIDsRemainStable(t *testing.T) {
+func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 	catalog, err := LoadCatalog(filepath.Join("..", "queries", "ducklake_posthog_tables.yaml"))
 	if err != nil {
 		t.Fatalf("LoadCatalog: %v", err)
@@ -53,16 +53,46 @@ func TestCheckedInPostHogCatalogPublishedIDsRemainStable(t *testing.T) {
 		"q_events_by_name_march_2026__ducklake_table",
 		"q_events_distinct_persons__raw_view",
 		"q_events_distinct_persons__ducklake_table",
+		"q_persons_total__raw_view",
 		"q_persons_total__ducklake_table",
+		"q_persons_daily_april_2026__raw_view",
 		"q_persons_daily_april_2026__ducklake_table",
+		"q_events_daily_march_2026__raw_view",
 		"q_events_daily_march_2026__ducklake_table",
 	}
 	if got := queryIDs(catalog); !reflect.DeepEqual(got, want) {
 		t.Fatalf("checked-in PostHog query IDs changed: got %v want %v", got, want)
 	}
-	for _, query := range catalog.Queries {
-		if query.StorageTarget != "" {
-			t.Fatalf("legacy query %s unexpectedly inferred storage target %q", query.QueryID, query.StorageTarget)
+	for index, query := range catalog.Queries {
+		wantTarget := StorageTargetRawView
+		if index%2 == 1 {
+			wantTarget = StorageTargetDuckLakeTable
+		}
+		if query.StorageTarget != wantTarget {
+			t.Fatalf("query %s storage target = %q, want %q", query.QueryID, query.StorageTarget, wantTarget)
+		}
+		if index%2 != 1 {
+			continue
+		}
+
+		rawQuery := catalog.Queries[index-1]
+		if query.IntentID != rawQuery.IntentID {
+			t.Fatalf("query pair %s/%s has mismatched intents %q/%q", rawQuery.QueryID, query.QueryID, rawQuery.IntentID, query.IntentID)
+		}
+		if !reflect.DeepEqual(query.Tags, rawQuery.Tags) || !reflect.DeepEqual(query.Params, rawQuery.Params) {
+			t.Fatalf("query pair %s/%s must share tags and params", rawQuery.QueryID, query.QueryID)
+		}
+
+		rawRelation := `"frozen_v1"."events_file_view"`
+		duckLakeRelation := `"posthog"."events"`
+		if strings.HasPrefix(query.IntentID, "intent_persons_") {
+			rawRelation = `"frozen_v1"."persons_file_view"`
+			duckLakeRelation = `"posthog"."persons"`
+		}
+		rawShape := strings.ReplaceAll(rawQuery.PGWireSQL, rawRelation, "<relation>")
+		duckLakeShape := strings.ReplaceAll(query.PGWireSQL, duckLakeRelation, "<relation>")
+		if rawShape != duckLakeShape {
+			t.Fatalf("query pair %s/%s differs beyond its relation:\nraw: %s\ntable: %s", rawQuery.QueryID, query.QueryID, rawQuery.PGWireSQL, query.PGWireSQL)
 		}
 	}
 }
