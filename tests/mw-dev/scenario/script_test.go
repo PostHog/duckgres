@@ -73,9 +73,9 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"workflow_dispatch:",
 		"scenario:",
 		"default: full-suite",
-		"- name: Scenario dev target selected\n        env:\n          SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}",
-		"- name: Run selected scenario\n        env:\n          SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}",
 		"schedule:",
+		"- cron: \"17 8 * * *\"",
+		"SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}",
 		"id-token: write",
 		"uses: ./.github/workflows/_image-build.yml",
 		"image-name: duckgres",
@@ -141,6 +141,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"postgresql://",
 		"--dsn",
 		"--password",
+		"SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("workflow contains internal detail %q", forbidden)
