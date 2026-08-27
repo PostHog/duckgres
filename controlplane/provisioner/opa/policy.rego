@@ -15,7 +15,7 @@
 #                                         or OIDC group claim (post-v1).
 #                                         Customer principals get
 #                                         `org_<org>` (org = sanitized
-#                                         Org.Name); the admin gets
+#                                         database name); the admin gets
 #                                         the admin group. Customer access
 #                                         decisions key on this, not on the
 #                                         username -- so the bundle schema
@@ -28,6 +28,8 @@
 #   input.action.resource.catalog.name -- target catalog name where applicable.
 #   input.action.resource.schema.catalogName / .schemaName
 #   input.action.resource.table.catalogName / .schemaName / .tableName
+#   input.action.targetResource.schema...  -- rename destination for schemas.
+#   input.action.targetResource.table...   -- rename destination for tables/views.
 #   input.action.resource.systemSessionProperty.name
 #   input.action.resource.user.user    -- on the query-ownership operations
 #                                         (ViewQueryOwnedBy /
@@ -168,8 +170,9 @@ managed_catalog_name(catalog) if {
 }
 
 # ---------------------------------------------------------------------------
-# Ownership / readability / listability — three predicates kept distinct
-# so admin's orphan-cleanup carve-out doesn't leak into data-plane reads.
+# Ownership / readability / writability / listability — kept distinct so
+# admin's orphan-cleanup and smoke-test carve-outs don't leak into tenant
+# data-plane writes.
 #
 # tenant_owns_catalog(c): a customer group has c in data.group_catalogs.
 #   Excludes admin_group from iteration so a bare admin-group claim grants
@@ -184,6 +187,11 @@ managed_catalog_name(catalog) if {
 #   surface (AccessCatalog, ShowSchemas, ShowTables, SelectFromColumns,
 #   FilterSchemas, FilterTables, ShowColumns, FilterColumns). Catalogs
 #   outside the bundle CANNOT be read by anyone.
+#
+# writable_catalog(c) = tenant_owns AND managed_catalog_name. Customers can
+#   mutate only the provisioner-owned catalog projected for one of their org
+#   groups. The provisioner admin deliberately has no table/schema write path:
+#   its bundle entry exists only for read smoke tests and catalog management.
 #
 # listable_catalog(c) = readable OR (is_admin AND managed_catalog_name).
 #   The orphan-cleanup carve-out: admin sees `org_*` catalogs
@@ -205,6 +213,12 @@ admin_bundle_catalog(catalog) if {
 
 readable_catalog(catalog) if tenant_owns_catalog(catalog)
 readable_catalog(catalog) if admin_bundle_catalog(catalog)
+
+writable_catalog(catalog) if {
+	not is_admin
+	tenant_owns_catalog(catalog)
+	managed_catalog_name(catalog)
+}
 
 listable_catalog(catalog) if readable_catalog(catalog)
 
@@ -261,6 +275,22 @@ allow if {
 	readable_catalog(input.action.resource.schema.catalogName)
 }
 
+# DuckLake schema DDL. Rename checks BOTH resource and targetResource even
+# though Trino currently keeps schema renames inside one catalog. The explicit
+# target check makes a future cross-catalog shape fail closed.
+schema_write_ops := {"CreateSchema", "DropSchema"}
+
+allow if {
+	input.action.operation in schema_write_ops
+	writable_catalog(input.action.resource.schema.catalogName)
+}
+
+allow if {
+	input.action.operation == "RenameSchema"
+	writable_catalog(input.action.resource.schema.catalogName)
+	writable_catalog(input.action.targetResource.schema.catalogName)
+}
+
 # ---------------------------------------------------------------------------
 # Table-scope decisions. Resource is TrinoTable
 # {catalogName, schemaName, tableName, columns?}.
@@ -284,6 +314,44 @@ allow if {
 allow if {
 	input.action.operation == "FilterColumns"
 	readable_catalog(input.action.resource.table.catalogName)
+}
+
+# DuckLake table and view DDL/DML. MERGE and CTAS are composed by Trino from
+# these checks (create/insert/update/delete), so no separate operation string
+# exists for them in OpaAccessControl. Authorization changes, grants, catalog
+# session properties, functions and materialized views intentionally remain
+# default-denied below.
+table_write_ops := {
+	"CreateTable",
+	"DropTable",
+	"SetTableProperties",
+	"SetTableComment",
+	"SetColumnComment",
+	"AddColumn",
+	"AlterColumn",
+	"DropColumn",
+	"RenameColumn",
+	"InsertIntoTable",
+	"DeleteFromTable",
+	"TruncateTable",
+	"UpdateTableColumns",
+	"CreateView",
+	"SetViewComment",
+	"DropView",
+	"CreateViewWithSelectFromColumns",
+}
+
+allow if {
+	input.action.operation in table_write_ops
+	writable_catalog(input.action.resource.table.catalogName)
+}
+
+table_rename_ops := {"RenameTable", "RenameView"}
+
+allow if {
+	input.action.operation in table_rename_ops
+	writable_catalog(input.action.resource.table.catalogName)
+	writable_catalog(input.action.targetResource.table.catalogName)
 }
 
 # ---------------------------------------------------------------------------
@@ -493,8 +561,8 @@ allow if {
 #   for a same-org query owner and denied for everyone else, including
 #   the admin principal. An input that omits resource.user, or its
 #   `user` / `groups` fields, still falls through to default-deny.
-# - GRANT-related ops, view/function creation, table mutation: not part of
-#   v1's per-org Iceberg-catalog model.
+# - GRANT/authorization operations, catalog session properties, functions and
+#   materialized views: not part of the tenant-owned DuckLake write surface.
 #
 # All of the above fall through to default-deny; no explicit rule needed.
 # ---------------------------------------------------------------------------
