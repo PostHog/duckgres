@@ -39,6 +39,30 @@ SELECT COALESCE((SELECT SUM(file_size_bytes) FROM ducklake_data_file), 0)
      + COALESCE((SELECT SUM(file_size_bytes) FROM ducklake_delete_file), 0),
        (SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion)`
 
+// queryLogHotBytesQuery measures the native metadata-Postgres footprint of
+// the partitioned query log. pg_total_relation_size includes heap, indexes,
+// and TOAST; summing leaves includes both monthly and default partitions. The
+// recursive catalog walk deliberately starts with nullable to_regclass so an
+// uninitialized query log reports zero without calling a partition helper on
+// an invalid relation.
+const queryLogHotBytesQuery = `
+WITH RECURSIVE parts(relid) AS (
+    SELECT to_regclass('querylog.query_log_entries')
+    UNION ALL
+    SELECT i.inhrelid
+    FROM pg_inherits i
+    JOIN parts p ON i.inhparent = p.relid
+), leaves AS (
+    SELECT p.relid
+    FROM parts p
+    WHERE p.relid IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM pg_inherits child WHERE child.inhparent = p.relid
+      )
+)
+SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0)::BIGINT
+FROM leaves`
+
 var storageTrackedBytesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_org_storage_tracked_bytes",
 	Help: "Tracked DuckLake S3 footprint per org (bytes), from the last storage-billing sample.",
@@ -47,6 +71,11 @@ var storageTrackedBytesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 var storagePendingDeleteFilesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_org_storage_pending_delete_files",
 	Help: "Files scheduled for deletion but not yet cleaned per org — bytes on S3 invisible to the storage meter. Sustained nonzero = cleanup lagging (drift).",
+}, []string{"org"})
+
+var queryLogHotBytesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_org_query_log_hot_bytes",
+	Help: "Physical metadata-Postgres footprint of the query log per org (bytes), including indexes and TOAST, from the last successful sample.",
 }, []string{"org"})
 
 var storageSampleErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -84,7 +113,10 @@ type storageSampler struct {
 	resolveDSN func(ctx context.Context, orgID string) (string, error)
 	// queryFootprint visits one org's metadata Postgres; swappable in tests.
 	queryFootprint func(ctx context.Context, dsn string) (trackedBytes, pendingDeleteFiles int64, err error)
-	now            func() time.Time
+	// queryHotBytes independently measures the native query-log footprint. Its
+	// failure is warning-only and never changes storage billing.
+	queryHotBytes func(ctx context.Context, dsn string) (int64, error)
+	now           func() time.Time
 }
 
 func newStorageSampler(store storageUsageStore, interval time.Duration, listOrgs func() []storageOrg, resolveDSN func(ctx context.Context, orgID string) (string, error)) *storageSampler {
@@ -97,6 +129,7 @@ func newStorageSampler(store storageUsageStore, interval time.Duration, listOrgs
 		listOrgs:       listOrgs,
 		resolveDSN:     resolveDSN,
 		queryFootprint: queryStorageFootprint,
+		queryHotBytes:  queryQueryLogHotBytes,
 		now:            time.Now,
 	}
 }
@@ -119,6 +152,7 @@ func (s *storageSampler) Run(ctx context.Context) {
 	}
 	defer storageTrackedBytesGauge.Reset()
 	defer storagePendingDeleteFilesGauge.Reset()
+	defer queryLogHotBytesGauge.Reset()
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 	for {
@@ -152,14 +186,14 @@ func (s *storageSampler) sampleAll(ctx context.Context) {
 }
 
 func (s *storageSampler) sampleOrg(ctx context.Context, org storageOrg) error {
-	orgCtx, cancel := context.WithTimeout(ctx, storageSampleQueryTimeout)
-	defer cancel()
+	storageCtx, cancelStorage := context.WithTimeout(ctx, storageSampleQueryTimeout)
+	defer cancelStorage()
 
-	dsn, err := s.resolveDSN(orgCtx, org.OrgID)
+	dsn, err := s.resolveDSN(storageCtx, org.OrgID)
 	if err != nil {
 		return err
 	}
-	trackedBytes, pendingDelete, err := s.queryFootprint(orgCtx, dsn)
+	trackedBytes, pendingDelete, err := s.queryFootprint(storageCtx, dsn)
 	if err != nil {
 		return err
 	}
@@ -171,7 +205,21 @@ func (s *storageSampler) sampleOrg(ctx context.Context, org storageOrg) error {
 	// the shared closed-bucket/watermark rules apply unchanged).
 	byteSeconds := trackedBytes * int64(s.interval/time.Second)
 	bucket := s.now().UTC().Truncate(computeBucketWidth)
-	return s.store.UpsertStorageSample(org.OrgID, org.TeamID, bucket, byteSeconds)
+	billingErr := s.store.UpsertStorageSample(org.OrgID, org.TeamID, bucket, byteSeconds)
+
+	// Query-log hot bytes are observability only. Sample them after the billing
+	// write so a slow or failed inspection cannot suppress a valid S3 sample.
+	// Give it an independent timeout so time spent resolving and sampling S3
+	// storage cannot consume its budget. Preserve the last good value on error.
+	hotCtx, cancelHot := context.WithTimeout(ctx, storageSampleQueryTimeout)
+	defer cancelHot()
+	if hotBytes, err := s.queryHotBytes(hotCtx, dsn); err != nil {
+		slog.Warn("Query-log hot-bytes sample failed; retaining last good value.", "org", org.OrgID, "error", err)
+	} else {
+		queryLogHotBytesGauge.WithLabelValues(org.OrgID).Set(float64(hotBytes))
+	}
+
+	return billingErr
 }
 
 // queryStorageFootprint opens the org's metadata Postgres and runs the
@@ -189,6 +237,21 @@ func queryStorageFootprint(ctx context.Context, dsn string) (trackedBytes, pendi
 		return 0, 0, err
 	}
 	return trackedBytes, pendingDeleteFiles, nil
+}
+
+func queryQueryLogHotBytes(ctx context.Context, dsn string) (int64, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
+	var hotBytes int64
+	if err := db.QueryRowContext(ctx, queryLogHotBytesQuery).Scan(&hotBytes); err != nil {
+		return 0, err
+	}
+	return hotBytes, nil
 }
 
 // storageSampleIntervalFromEnv reads the env-only sampling-interval override
