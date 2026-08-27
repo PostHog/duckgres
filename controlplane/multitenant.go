@@ -20,6 +20,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/hogqlcatalog"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"github.com/posthog/duckgres/controlplane/provisioning"
@@ -730,6 +731,8 @@ func SetupMultiTenant(
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
 	provisioning.RegisterAPIWithIngressSuffix(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix)
+	hogQLCatalogStore := hogqlcatalog.NewPostgresStore(store.DB())
+	registerHogQLCatalogGroup(engine, adminTokens, hogQLCatalogStore, hogQLCatalogStore)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
