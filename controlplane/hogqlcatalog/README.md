@@ -7,13 +7,12 @@ definitions plus references to physical qualified names.
 
 ## API
 
-The control plane exposes these internal-token-authenticated routes:
+The control plane exposes one internal-token-authenticated compatibility resource:
 
-- `PUT /v1/hogql/catalogs/:catalog/snapshots` publishes one immutable generation.
-- `GET /v1/hogql/catalogs/:catalog/snapshots/latest?languageVersion=:version`
+- `PUT /v1/hogql/compatibility/semantic-catalog` publishes one immutable generation.
+- `GET /v1/hogql/compatibility/semantic-catalog?protocolVersion=1&languageVersion=:version&catalog=:catalog&catalogDelimited=:boolean`
   reads the highest published generation.
-- `GET /v1/hogql/catalogs/:catalog/snapshots/:generation?languageVersion=:version`
-  reads an exact generation.
+- Adding `&generation=:generation` to that `GET` reads an exact generation.
 
 Every manifest must include `protocolVersion: 1`, a supported schema and language
 version, a positive monotonically increasing generation, and all fields in the

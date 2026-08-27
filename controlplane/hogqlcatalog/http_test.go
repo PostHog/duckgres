@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -18,16 +20,32 @@ func TestHTTPPublishesAndReadsLatestAndPinnedSnapshots(t *testing.T) {
 	publishSnapshot(t, router, testSnapshot(1), http.StatusNoContent)
 	publishSnapshot(t, router, testSnapshot(2), http.StatusNoContent)
 
-	latest := getSnapshot(t, router, "/v1/hogql/catalogs/ducklake/snapshots/latest?languageVersion=1.0.0", http.StatusOK)
+	latest := getSnapshot(t, router, compatibilityPath("ducklake", false, 0, "1.0.0"), http.StatusOK)
 	if latest.Generation != 2 {
 		t.Fatalf("latest generation = %d, want 2", latest.Generation)
 	}
 	if latest.ProtocolVersion != SnapshotProtocolVersion {
 		t.Fatalf("protocol version = %d, want %d", latest.ProtocolVersion, SnapshotProtocolVersion)
 	}
-	pinned := getSnapshot(t, router, "/v1/hogql/catalogs/ducklake/snapshots/1?languageVersion=1.0.0", http.StatusOK)
+	pinned := getSnapshot(t, router, compatibilityPath("ducklake", false, 1, "1.0.0"), http.StatusOK)
 	if pinned.Generation != 1 {
 		t.Fatalf("pinned generation = %d, want 1", pinned.Generation)
+	}
+}
+
+func TestHTTPPublishesAndReadsDelimitedCatalog(t *testing.T) {
+	store := NewMemoryStore()
+	router := testRouter(store)
+	snapshot := testSnapshot(1)
+	snapshot.Catalog = PhysicalIdentifier{Value: "Case Sensitive", Delimited: true}
+	for index := range snapshot.LogicalTables {
+		snapshot.LogicalTables[index].PhysicalTable.Catalog = snapshot.Catalog
+	}
+
+	publishSnapshot(t, router, snapshot, http.StatusNoContent)
+	read := getSnapshot(t, router, compatibilityPath("Case Sensitive", true, 0, "1.0.0"), http.StatusOK)
+	if read.Catalog != snapshot.Catalog {
+		t.Fatalf("catalog = %#v, want %#v", read.Catalog, snapshot.Catalog)
 	}
 }
 
@@ -44,25 +62,37 @@ func TestHTTPFailsClosedForUnknownAndMismatchedReads(t *testing.T) {
 	}{
 		{
 			name:   "unknown catalog",
-			path:   "/v1/hogql/catalogs/missing/snapshots/latest?languageVersion=1.0.0",
+			path:   compatibilityPath("missing", false, 0, "1.0.0"),
 			status: http.StatusNotFound,
 			code:   "HOGQL_CATALOG_NOT_FOUND",
 		},
 		{
 			name:   "unknown generation",
-			path:   "/v1/hogql/catalogs/ducklake/snapshots/9?languageVersion=1.0.0",
+			path:   compatibilityPath("ducklake", false, 9, "1.0.0"),
 			status: http.StatusNotFound,
 			code:   "HOGQL_CATALOG_GENERATION_NOT_FOUND",
 		},
 		{
 			name:   "language mismatch",
-			path:   "/v1/hogql/catalogs/ducklake/snapshots/latest?languageVersion=2.0.0",
+			path:   compatibilityPath("ducklake", false, 0, "2.0.0"),
 			status: http.StatusConflict,
 			code:   "HOGQL_CATALOG_LANGUAGE_MISMATCH",
 		},
 		{
 			name:   "missing language version",
-			path:   "/v1/hogql/catalogs/ducklake/snapshots/latest",
+			path:   "/v1/hogql/compatibility/semantic-catalog?protocolVersion=1&catalog=ducklake&catalogDelimited=false",
+			status: http.StatusBadRequest,
+			code:   "HOGQL_CATALOG_INVALID_REQUEST",
+		},
+		{
+			name:   "unsupported protocol version",
+			path:   "/v1/hogql/compatibility/semantic-catalog?protocolVersion=2&languageVersion=1.0.0&catalog=ducklake&catalogDelimited=false",
+			status: http.StatusConflict,
+			code:   "HOGQL_CATALOG_PROTOCOL_MISMATCH",
+		},
+		{
+			name:   "unknown query field",
+			path:   compatibilityPath("ducklake", false, 0, "1.0.0") + "&unknown=true",
 			status: http.StatusBadRequest,
 			code:   "HOGQL_CATALOG_INVALID_REQUEST",
 		},
@@ -85,16 +115,9 @@ func TestHTTPFailsClosedForUnknownAndMismatchedReads(t *testing.T) {
 	}
 }
 
-func TestHTTPRejectsCatalogMismatchAndUnknownJSONFields(t *testing.T) {
+func TestHTTPRejectsUnknownJSONFields(t *testing.T) {
 	store := NewMemoryStore()
 	router := testRouter(store)
-
-	mismatch := testSnapshot(1)
-	mismatch.Catalog = PhysicalIdentifier{Value: "other"}
-	for index := range mismatch.LogicalTables {
-		mismatch.LogicalTables[index].PhysicalTable.Catalog = mismatch.Catalog
-	}
-	publishSnapshot(t, router, mismatch, http.StatusConflict)
 
 	body := []byte(`{
 		"schemaVersion": 1,
@@ -104,7 +127,7 @@ func TestHTTPRejectsCatalogMismatchAndUnknownJSONFields(t *testing.T) {
 		"logicalTables": [],
 		"executableSql": "SELECT 1"
 	}`)
-	rec := doRequest(router, http.MethodPut, "/v1/hogql/catalogs/ducklake/snapshots", body)
+	rec := doRequest(router, http.MethodPut, "/v1/hogql/compatibility/semantic-catalog", body)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("unknown JSON field status = %d, want 400: %s", rec.Code, rec.Body.String())
 	}
@@ -149,10 +172,18 @@ func publishSnapshot(t *testing.T, router http.Handler, snapshot *HogQLSemanticC
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
-	rec := doRequest(router, http.MethodPut, "/v1/hogql/catalogs/ducklake/snapshots", body)
+	rec := doRequest(router, http.MethodPut, "/v1/hogql/compatibility/semantic-catalog", body)
 	if rec.Code != expectedStatus {
 		t.Fatalf("publish status = %d, want %d: %s", rec.Code, expectedStatus, rec.Body.String())
 	}
+}
+
+func compatibilityPath(catalog string, catalogDelimited bool, generation int64, languageVersion string) string {
+	path := "/v1/hogql/compatibility/semantic-catalog?protocolVersion=1&languageVersion=" + url.QueryEscape(languageVersion) + "&catalog=" + url.QueryEscape(catalog) + "&catalogDelimited=" + strconv.FormatBool(catalogDelimited)
+	if generation > 0 {
+		path += "&generation=" + strconv.FormatInt(generation, 10)
+	}
+	return path
 }
 
 func getSnapshot(t *testing.T, router http.Handler, path string, expectedStatus int) *HogQLSemanticCatalogSnapshot {

@@ -30,7 +30,7 @@ func TestHogQLCatalogGroupRequiresInternalToken(t *testing.T) {
 	}
 	registerHogQLCatalogGroup(engine, admin.NewTokenSet("internal-secret", nil), store, store)
 
-	path := "/v1/hogql/catalogs/ducklake/snapshots/latest?languageVersion=1.0.0"
+	path := "/v1/hogql/compatibility/semantic-catalog?protocolVersion=1&languageVersion=1.0.0&catalog=ducklake&catalogDelimited=false"
 	unauthorized := httptest.NewRecorder()
 	engine.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, path, nil))
 	if unauthorized.Code != http.StatusUnauthorized {

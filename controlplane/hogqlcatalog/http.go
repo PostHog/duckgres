@@ -28,9 +28,8 @@ type apiHandler struct {
 
 func RegisterAPI(router gin.IRouter, reader Reader, publisher Publisher) {
 	handler := &apiHandler{reader: reader, publisher: publisher}
-	router.PUT("/catalogs/:catalog/snapshots", handler.publish)
-	router.GET("/catalogs/:catalog/snapshots/latest", handler.latest)
-	router.GET("/catalogs/:catalog/snapshots/:generation", handler.generation)
+	router.PUT("/compatibility/semantic-catalog", handler.publish)
+	router.GET("/compatibility/semantic-catalog", handler.read)
 }
 
 func DecodeSnapshot(reader io.Reader) (*HogQLSemanticCatalogSnapshot, error) {
@@ -115,15 +114,6 @@ func (h *apiHandler) publish(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "HOGQL_CATALOG_INVALID_MANIFEST", "invalid HogQL semantic catalog snapshot")
 		return
 	}
-	requestedCatalog, err := catalogFromPath(c.Param("catalog"))
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "HOGQL_CATALOG_INVALID_REQUEST", "invalid catalog identifier")
-		return
-	}
-	if snapshot.Catalog != requestedCatalog {
-		writeError(c, http.StatusConflict, "HOGQL_CATALOG_MISMATCH", "snapshot catalog does not match requested catalog")
-		return
-	}
 	if err := h.publisher.Publish(c.Request.Context(), snapshot); err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidSnapshot):
@@ -138,36 +128,22 @@ func (h *apiHandler) publish(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-func (h *apiHandler) latest(c *gin.Context) {
-	h.read(c, 0)
-}
-
-func (h *apiHandler) generation(c *gin.Context) {
-	generation, err := strconv.ParseInt(c.Param("generation"), 10, 64)
-	if err != nil || generation <= 0 {
-		writeError(c, http.StatusBadRequest, "HOGQL_CATALOG_INVALID_REQUEST", "generation must be a positive integer")
-		return
-	}
-	h.read(c, generation)
-}
-
-func (h *apiHandler) read(c *gin.Context, generation int64) {
-	catalog, err := catalogFromPath(c.Param("catalog"))
+func (h *apiHandler) read(c *gin.Context) {
+	request, err := decodeCompatibilityRequest(c)
 	if err != nil {
-		writeError(c, http.StatusBadRequest, "HOGQL_CATALOG_INVALID_REQUEST", "invalid catalog identifier")
-		return
-	}
-	languageVersion, ok := requestedLanguageVersion(c)
-	if !ok {
-		writeError(c, http.StatusBadRequest, "HOGQL_CATALOG_INVALID_REQUEST", "languageVersion is required and must be a supported version string")
+		if errors.Is(err, errProtocolMismatch) {
+			writeError(c, http.StatusConflict, "HOGQL_CATALOG_PROTOCOL_MISMATCH", "requested protocol version is not supported")
+			return
+		}
+		writeError(c, http.StatusBadRequest, "HOGQL_CATALOG_INVALID_REQUEST", "invalid semantic catalog compatibility request")
 		return
 	}
 
 	var snapshot *HogQLSemanticCatalogSnapshot
-	if generation == 0 {
-		snapshot, err = h.reader.Latest(c.Request.Context(), catalog)
+	if request.generation == 0 {
+		snapshot, err = h.reader.Latest(c.Request.Context(), request.catalog)
 	} else {
-		snapshot, err = h.reader.Generation(c.Request.Context(), catalog, generation)
+		snapshot, err = h.reader.Generation(c.Request.Context(), request.catalog, request.generation)
 	}
 	if err != nil {
 		switch {
@@ -180,33 +156,89 @@ func (h *apiHandler) read(c *gin.Context, generation int64) {
 		}
 		return
 	}
-	if snapshot == nil || snapshot.Catalog != catalog {
+	if snapshot == nil || snapshot.Catalog != request.catalog {
 		writeError(c, http.StatusConflict, "HOGQL_CATALOG_MISMATCH", "published snapshot does not match requested catalog")
 		return
 	}
-	if generation != 0 && snapshot.Generation != generation {
+	if request.generation != 0 && snapshot.Generation != request.generation {
 		writeError(c, http.StatusConflict, "HOGQL_CATALOG_GENERATION_MISMATCH", "published snapshot does not match requested generation")
 		return
 	}
-	if snapshot.LanguageVersion != languageVersion {
+	if snapshot.LanguageVersion != request.languageVersion {
 		writeError(c, http.StatusConflict, "HOGQL_CATALOG_LANGUAGE_MISMATCH", "published snapshot does not match requested language version")
 		return
 	}
-	c.Header("ETag", fmt.Sprintf(`"hogql-%s-%d"`, catalog.Value, snapshot.Generation))
+	c.Header("ETag", fmt.Sprintf(`"hogql-%d"`, snapshot.Generation))
 	c.JSON(http.StatusOK, snapshot)
 }
 
-func requestedLanguageVersion(c *gin.Context) (string, bool) {
+var errProtocolMismatch = errors.New("HogQL catalog protocol mismatch")
+
+type compatibilityRequest struct {
+	catalog         PhysicalIdentifier
+	languageVersion string
+	generation      int64
+}
+
+func decodeCompatibilityRequest(c *gin.Context) (compatibilityRequest, error) {
 	query := c.Request.URL.Query()
-	values, exists := query["languageVersion"]
-	if !exists || len(query) != 1 || len(values) != 1 || !languageVersionPattern.MatchString(values[0]) {
+	if len(query) < 4 || len(query) > 5 {
+		return compatibilityRequest{}, errors.New("unexpected query fields")
+	}
+	for name := range query {
+		if name != "protocolVersion" && name != "languageVersion" && name != "catalog" && name != "catalogDelimited" && name != "generation" {
+			return compatibilityRequest{}, errors.New("unexpected query field")
+		}
+	}
+	protocolVersion, ok := singleQueryValue(query, "protocolVersion")
+	if !ok {
+		return compatibilityRequest{}, errors.New("protocolVersion is required")
+	}
+	if protocolVersion != strconv.Itoa(SnapshotProtocolVersion) {
+		if _, err := strconv.Atoi(protocolVersion); err != nil {
+			return compatibilityRequest{}, errors.New("protocolVersion must be an integer")
+		}
+		return compatibilityRequest{}, errProtocolMismatch
+	}
+	languageVersion, ok := singleQueryValue(query, "languageVersion")
+	if !ok || !languageVersionPattern.MatchString(languageVersion) {
+		return compatibilityRequest{}, errors.New("languageVersion is invalid")
+	}
+	catalogValue, ok := singleQueryValue(query, "catalog")
+	if !ok {
+		return compatibilityRequest{}, errors.New("catalog is required")
+	}
+	catalogDelimitedValue, ok := singleQueryValue(query, "catalogDelimited")
+	if !ok || (catalogDelimitedValue != "true" && catalogDelimitedValue != "false") {
+		return compatibilityRequest{}, errors.New("catalogDelimited must be a boolean")
+	}
+	catalog, err := normalizedCatalog(PhysicalIdentifier{
+		Value:     catalogValue,
+		Delimited: catalogDelimitedValue == "true",
+	})
+	if err != nil {
+		return compatibilityRequest{}, err
+	}
+
+	var generation int64
+	if generationValue, exists := query["generation"]; exists {
+		if len(generationValue) != 1 {
+			return compatibilityRequest{}, errors.New("generation must appear once")
+		}
+		generation, err = strconv.ParseInt(generationValue[0], 10, 64)
+		if err != nil || generation <= 0 {
+			return compatibilityRequest{}, errors.New("generation must be a positive integer")
+		}
+	}
+	return compatibilityRequest{catalog: catalog, languageVersion: languageVersion, generation: generation}, nil
+}
+
+func singleQueryValue(query map[string][]string, name string) (string, bool) {
+	values, exists := query[name]
+	if !exists || len(values) != 1 {
 		return "", false
 	}
 	return values[0], true
-}
-
-func catalogFromPath(value string) (PhysicalIdentifier, error) {
-	return normalizedCatalog(PhysicalIdentifier{Value: value})
 }
 
 func writeError(c *gin.Context, status int, code, message string) {
