@@ -82,7 +82,7 @@ Added for the console:
 | `GET /api/v1/trino/queries` | viewer | live queries, `?org=&state=&active=1` slicing, longest-running first. SQL is redacted server-side; each row is stamped with the duckgres org resolved from the Trino principal |
 | `GET /api/v1/trino/queries/:id` | viewer | one query; 404 when the coordinator has aged it out (410 Gone upstream) |
 | `POST /api/v1/trino/queries/:id/kill` | admin | fail a query with a reason (`PUT /v1/query/{id}/killed`). The reason reaches the TENANT as the query's error message. Audited as `trino.query.kill` with the owning org |
-| `GET /api/v1/trino/nodes` | viewer | the coordinator's failure-detector view (`/v1/node` + `/v1/node/failed`) |
+| `GET /api/v1/trino/nodes` | viewer | the cell's fleet: `/v1/node` + `/v1/node/failed` where bound, else `/v1/announce` membership; the response names which (`source`) |
 | `GET /api/v1/trino/orgs` | viewer | per-org Trino provisioning state + that org's live query counts |
 | `GET /api/v1/orgs/:id/trino` | viewer | one org's Trino state; `enabled:false` for an org with no Trino row (not an error) |
 | `GET /api/v1/audit` | admin | admin action log |
@@ -206,9 +206,26 @@ and projects into `password.db` / `group.db`.
   (`duckgres-admin` here, `duckgres-provisioner` in the reconcile loop), so
   control-plane traffic is distinguishable from tenant SQL in
   `system.runtime.queries` and in the console's own live view.
-- `/v1/node` reports heartbeat health keyed by URI and carries **no node id
-  or version**, so worker version skew is not observable there; the Nodes
-  page's pod projection (running images) is where that lives.
+- **Trino binds exactly one node-listing route, chosen by `discovery.type`.**
+  `/v1/node` (heartbeat health, plus `/v1/node/failed`) exists only under
+  `AIRLIFT_DISCOVERY`; `/v1/announce` (the set of announced node URIs, no
+  health) is bound under `ANNOUNCE` — Trino's default, and what these cells
+  run — and under `DNS`. The client tries `/v1/node` and falls back, and the
+  payload carries `source` so the SPA renders membership-only rows instead of
+  zero-filled health columns. Both routes are `@ResourceSecurity(MANAGEMENT_READ)`,
+  so the observer's existing `ReadSystemInformation` grant covers both.
+- **`system.runtime.nodes` is preferred over `/v1/announce`** on a cell that
+  binds no `/v1/node`: it is served regardless of `discovery.type` and is the
+  only source carrying `node_version`, so it is where worker version skew
+  becomes visible. It is the observer's one data grant — `AccessCatalog` on
+  `system` plus `SelectFromColumns` pinned to that single table — and it
+  needs its own resource-group lane, because the catch-all selector would
+  otherwise file the console's query as a tenant. Order is `/v1/node` →
+  `system.runtime.nodes` → `/v1/announce`, so a cell where the grant has not
+  rolled out yet still lists its fleet.
+- Neither route carries a node id or version, so worker version skew is not
+  observable there; the Nodes page's pod projection (running images) is where
+  that lives.
 - No cell configured (`DUCKGRES_TRINO_COORDINATOR_URL` unset) leaves every
   route unregistered, and the SPA renders a "no cell" state off the 404.
 

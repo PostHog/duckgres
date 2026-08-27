@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -145,12 +146,18 @@ type TrinoServerInfo struct {
 	UptimeMS int64 `json:"uptime_ms"`
 }
 
-// TrinoNode is one entry of the coordinator's failure-detector view.
+// TrinoNode is one node of the cell as its coordinator describes it.
 //
-// `/v1/node` reports heartbeat health keyed by URI and carries NO node id
-// or version — worker version skew is not observable here. The console
-// derives that from the K8s pod projection (/cluster/pods) instead, which
-// reports each pod's running image.
+// Neither inventory Trino can serve carries a node id or a version, so
+// worker version skew is not observable here. The console derives that from
+// the K8s pod projection (/cluster/pods) instead, which reports each pod's
+// running image.
+//
+// Only the failure-detector inventory fills the heartbeat fields; under
+// ANNOUNCE every field but URI is a zero value that means "not reported",
+// NOT "reported as zero". Read TrinoNodeInventory.Source before showing
+// them — a rendered 0.0 failure ratio sourced from ANNOUNCE is a
+// fabricated health claim.
 type TrinoNode struct {
 	URI                string  `json:"uri"`
 	AgeMS              int64   `json:"age_ms"`
@@ -162,6 +169,63 @@ type TrinoNode struct {
 	// rather than re-deriving a threshold here; the failure detector is
 	// what actually removes a node from scheduling.
 	Failed bool `json:"failed"`
+
+	// The remaining fields come only from system.runtime.nodes. NodeID and
+	// Version are not on either REST route, so this is the one place worker
+	// version skew is observable from the coordinator.
+	NodeID string `json:"node_id,omitempty"`
+	// Version is the worker's Trino version. During a rollout a cell runs
+	// two of these at once, which is exactly what an operator wants to see.
+	Version     string `json:"version,omitempty"`
+	Coordinator bool   `json:"coordinator,omitempty"`
+	// State is Trino's own NodeState: ACTIVE, INACTIVE, DRAINING,
+	// DRAINED or SHUTTING_DOWN.
+	State string `json:"state,omitempty"`
+}
+
+// Which of Trino's two node inventories a TrinoNodeInventory came from.
+// They differ in detail, not just in route, so the source travels with the
+// data rather than being re-derived by each consumer.
+const (
+	// TrinoNodeSourceFailureDetector is `/v1/node`: per-node heartbeat
+	// health, plus the coordinator's own failed verdict. Bound only under
+	// discovery.type=AIRLIFT_DISCOVERY.
+	TrinoNodeSourceFailureDetector = "failure_detector"
+	// TrinoNodeSourceSystemTable is `system.runtime.nodes` over SQL: node
+	// id, uri, VERSION, coordinator flag and lifecycle state. Served by any
+	// cell regardless of discovery.type, because the system connector does
+	// not depend on it. Richer than either REST route on everything except
+	// heartbeat ratios, and the only source carrying version.
+	TrinoNodeSourceSystemTable = "system_table"
+	// TrinoNodeSourceAnnounce is `/v1/announce`: the set of node URIs that
+	// have announced themselves. Bound under the ANNOUNCE and DNS
+	// inventories — ANNOUNCE being Trino's default and what these cells
+	// run. It answers "who is in the fleet" and nothing about their health.
+	TrinoNodeSourceAnnounce = "announce"
+)
+
+// TrinoNodeInventory is the fleet as this cell is able to describe it.
+//
+// Trino binds exactly one node-listing route depending on discovery.type,
+// and the two carry different detail. Returning the source alongside the
+// nodes is what lets the console show membership from a cell that cannot
+// report health, instead of showing nothing (which reads as an empty
+// cluster) or showing zeros (which reads as a perfectly healthy one).
+type TrinoNodeInventory struct {
+	Source string      `json:"source"`
+	Nodes  []TrinoNode `json:"nodes"`
+}
+
+// HasHealth reports whether the entries carry the failure detector's
+// heartbeat fields (age, recent failure ratio, the failed verdict).
+func (i TrinoNodeInventory) HasHealth() bool {
+	return i.Source == TrinoNodeSourceFailureDetector
+}
+
+// HasNodeDetail reports whether the entries carry node id, version,
+// coordinator flag and lifecycle state.
+func (i TrinoNodeInventory) HasNodeDetail() bool {
+	return i.Source == TrinoNodeSourceSystemTable
 }
 
 // TrinoCoordinatorClient is the narrow read surface the console needs.
@@ -171,7 +235,7 @@ type TrinoCoordinatorClient interface {
 	Queries(ctx context.Context) ([]TrinoQuery, error)
 	Query(ctx context.Context, queryID string) (*TrinoQuery, error)
 	KillQuery(ctx context.Context, queryID, message string) error
-	Nodes(ctx context.Context) ([]TrinoNode, error)
+	Nodes(ctx context.Context) (TrinoNodeInventory, error)
 	ServerInfo(ctx context.Context) (*TrinoServerInfo, error)
 }
 
@@ -235,9 +299,17 @@ func NewTrinoCoordinatorClient(baseURL, tlsServerName string, creds TrinoCredent
 //	              never built with reads as unavailable rather than as
 //	              silence from the coordinator.
 func (c *trinoCoordinatorHTTPClient) do(ctx context.Context, method, path string, body io.Reader) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	return c.doURL(ctx, method, c.baseURL+path, path, body)
+}
+
+// doURL is do() against an absolute URL. The /v1/statement protocol hands
+// back absolute nextUri links, so the drain cannot go through the
+// baseURL-relative helper. `label` keeps the error text talking about the
+// route rather than echoing a full internal coordinator URL.
+func (c *trinoCoordinatorHTTPClient) doURL(ctx context.Context, method, rawURL, label string, body io.Reader) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
 	if err != nil {
-		return nil, fmt.Errorf("build %s %s: %w", method, path, err)
+		return nil, fmt.Errorf("build %s %s: %w", method, label, err)
 	}
 	user, password := c.creds()
 	req.Header.Set("X-Trino-User", user)
@@ -247,26 +319,26 @@ func (c *trinoCoordinatorHTTPClient) do(ctx context.Context, method, path string
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, path, err)
+		return nil, fmt.Errorf("%s %s: %w", method, label, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, readErr := io.ReadAll(resp.Body)
 	switch {
 	case resp.StatusCode == http.StatusGone:
-		return nil, fmt.Errorf("%s %s: %w", method, path, errTrinoNotFound)
+		return nil, fmt.Errorf("%s %s: %w", method, label, errTrinoNotFound)
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("%s %s: %w", method, path, errTrinoEndpointUnavailable)
+		return nil, fmt.Errorf("%s %s: %w", method, label, errTrinoEndpointUnavailable)
 	case resp.StatusCode == http.StatusForbidden:
 		// Worth its own message: this is what a missing observer grant or
 		// an un-rolled-out OPA bundle looks like, and it is fixed in a
 		// completely different place from a 5xx.
 		return nil, fmt.Errorf("%s %s: 403 forbidden — the %s principal is not authorized by the cell's OPA bundle",
-			method, path, trinoObserverUser)
+			method, label, trinoObserverUser)
 	case resp.StatusCode/100 != 2:
-		return nil, fmt.Errorf("%s %s: status %d: %s", method, path, resp.StatusCode, truncateForError(string(raw)))
+		return nil, fmt.Errorf("%s %s: status %d: %s", method, label, resp.StatusCode, truncateForError(string(raw)))
 	}
 	if readErr != nil {
-		return nil, fmt.Errorf("%s %s: read body: %w", method, path, readErr)
+		return nil, fmt.Errorf("%s %s: read body: %w", method, label, readErr)
 	}
 	return raw, nil
 }
@@ -430,14 +502,25 @@ type trinoNodeStats struct {
 // applied here: the failure detector's verdict is what determines whether
 // a node receives splits, and a second opinion computed in the console
 // would disagree with the engine exactly when it matters.
-func (c *trinoCoordinatorHTTPClient) Nodes(ctx context.Context) ([]TrinoNode, error) {
+func (c *trinoCoordinatorHTTPClient) Nodes(ctx context.Context) (TrinoNodeInventory, error) {
 	raw, err := c.do(ctx, http.MethodGet, "/v1/node", nil)
 	if err != nil {
-		return nil, err
+		// A cell on the default discovery.type does not bind /v1/node at
+		// all. Fall back rather than report a fleet we asked for the wrong
+		// way: system.runtime.nodes first, because it carries version and
+		// lifecycle state and every cell serves it, then /v1/announce for
+		// bare membership if the SQL path is unavailable too.
+		if isTrinoEndpointUnavailable(err) {
+			if inv, sqlErr := c.systemTableNodes(ctx); sqlErr == nil {
+				return inv, nil
+			}
+			return c.announcedNodes(ctx)
+		}
+		return TrinoNodeInventory{}, err
 	}
 	var wire []trinoNodeStats
 	if err := json.Unmarshal(raw, &wire); err != nil {
-		return nil, fmt.Errorf("decode node list: %w", err)
+		return TrinoNodeInventory{}, fmt.Errorf("decode node list: %w", err)
 	}
 
 	failed := map[string]bool{}
@@ -462,7 +545,143 @@ func (c *trinoCoordinatorHTTPClient) Nodes(ctx context.Context) ([]TrinoNode, er
 			Failed:             failed[n.URI],
 		})
 	}
-	return out, nil
+	return TrinoNodeInventory{Source: TrinoNodeSourceFailureDetector, Nodes: out}, nil
+}
+
+// trinoNodesQuery is the console's ONE SQL statement. Columns are listed
+// explicitly rather than SELECT *, so a future Trino adding a column cannot
+// silently change the row shape this decodes positionally.
+//
+// The observer's OPA grant is pinned to exactly this table; see the
+// "observer's ONE data read" section of policy.rego.
+const trinoNodesQuery = `SELECT node_id, http_uri, node_version, coordinator, state FROM system.runtime.nodes`
+
+// systemTableNodes reads the fleet from system.runtime.nodes over SQL.
+//
+// The system connector is served by every cell regardless of discovery.type,
+// so this works where /v1/node does not, and it is the only source that
+// carries the worker VERSION — i.e. the only way the console can show
+// version skew mid-rollout.
+//
+// It costs the observer a catalog grant (AccessCatalog on `system`,
+// SelectFromColumns on this one table) and a resource-group lane. Both are
+// deliberately narrow; policy.rego documents exactly what stays denied.
+func (c *trinoCoordinatorHTTPClient) systemTableNodes(ctx context.Context) (TrinoNodeInventory, error) {
+	rows, err := c.runStatement(ctx, trinoNodesQuery)
+	if err != nil {
+		return TrinoNodeInventory{}, err
+	}
+	out := make([]TrinoNode, 0, len(rows))
+	for _, r := range rows {
+		// Positional decode against trinoNodesQuery's column list. A short
+		// row is skipped rather than panicking a console request.
+		if len(r) < 5 {
+			continue
+		}
+		out = append(out, TrinoNode{
+			NodeID:      stringCell(r[0]),
+			URI:         stringCell(r[1]),
+			Version:     stringCell(r[2]),
+			Coordinator: r[3] == true,
+			State:       stringCell(r[4]),
+		})
+	}
+	// Coordinator first, then by URI: a stable order, and the node an
+	// operator most often wants at the top.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Coordinator != out[j].Coordinator {
+			return out[i].Coordinator
+		}
+		return out[i].URI < out[j].URI
+	})
+	return TrinoNodeInventory{Source: TrinoNodeSourceSystemTable, Nodes: out}, nil
+}
+
+// stringCell reads a Trino JSON result cell as a string, tolerating the
+// null a nullable column can produce.
+func stringCell(v interface{}) string {
+	s, _ := v.(string)
+	return s
+}
+
+// trinoStatementResponse is the subset of the /v1/statement response the
+// console needs. The full payload is much larger.
+type trinoStatementResponse struct {
+	NextURI string          `json:"nextUri,omitempty"`
+	Data    [][]interface{} `json:"data,omitempty"`
+	Error   *struct {
+		Message   string `json:"message"`
+		ErrorName string `json:"errorName"`
+		ErrorType string `json:"errorType"`
+	} `json:"error,omitempty"`
+}
+
+// runStatement executes one statement and drains the nextUri chain.
+//
+// Bounded hops so a coordinator that never completes cannot hang a console
+// request; the node query returns in a couple of hops in practice. Every hop
+// honours ctx, so the handler's timeout aborts the drain promptly.
+func (c *trinoCoordinatorHTTPClient) runStatement(ctx context.Context, sql string) ([][]interface{}, error) {
+	const maxDrainHops = 50
+	body, err := c.doURL(ctx, http.MethodPost, c.baseURL+"/v1/statement", "/v1/statement", strings.NewReader(sql))
+	if err != nil {
+		return nil, err
+	}
+	var all [][]interface{}
+	for hop := 0; hop < maxDrainHops; hop++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("statement drain aborted: %w", err)
+		}
+		var r trinoStatementResponse
+		if err := json.Unmarshal(body, &r); err != nil {
+			return nil, fmt.Errorf("parse statement response: %w", err)
+		}
+		if r.Error != nil {
+			// A denied grant surfaces here rather than as an HTTP status:
+			// the POST succeeds and the failure arrives inside the payload.
+			return nil, fmt.Errorf("trino: %s (%s): %s", r.Error.ErrorName, r.Error.ErrorType, r.Error.Message)
+		}
+		all = append(all, r.Data...)
+		if r.NextURI == "" {
+			return all, nil
+		}
+		if body, err = c.doURL(ctx, http.MethodGet, r.NextURI, "/v1/statement", nil); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("statement drain exceeded %d hops without completing", maxDrainHops)
+}
+
+// announcedNodes reads the ANNOUNCE inventory: the set of node URIs that
+// have announced themselves to this coordinator.
+//
+// `GET /v1/announce` is bound by AnnounceNodeInventoryModule and
+// DnsNodeInventoryModule — i.e. for every discovery.type except the one
+// that binds /v1/node — so between them the console can name the fleet of
+// any cell. It carries membership only: no heartbeat, no age, no failed
+// verdict, which is why the inventory records where it came from.
+//
+// It is declared @ResourceSecurity(MANAGEMENT_READ), the same access type
+// as /v1/node, so the observer's existing ReadSystemInformation grant
+// already covers it. This needs no change to policy.rego.
+func (c *trinoCoordinatorHTTPClient) announcedNodes(ctx context.Context) (TrinoNodeInventory, error) {
+	raw, err := c.do(ctx, http.MethodGet, "/v1/announce", nil)
+	if err != nil {
+		return TrinoNodeInventory{}, err
+	}
+	var uris []string
+	if err := json.Unmarshal(raw, &uris); err != nil {
+		return TrinoNodeInventory{}, fmt.Errorf("decode announced node list: %w", err)
+	}
+	// The wire type is a Set<URI>, so the order is whatever the coordinator's
+	// hash iteration produced. Sort it: without this the console reshuffles
+	// its node rows on every poll.
+	sort.Strings(uris)
+	out := make([]TrinoNode, 0, len(uris))
+	for _, u := range uris {
+		out = append(out, TrinoNode{URI: u})
+	}
+	return TrinoNodeInventory{Source: TrinoNodeSourceAnnounce, Nodes: out}, nil
 }
 
 type trinoServerInfoWire struct {

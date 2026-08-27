@@ -6,7 +6,7 @@
 // function with a test in trino.test.ts.
 
 import type { BadgeProps } from "@/components/ui/badge";
-import type { TrinoNode, TrinoOrgStatus, TrinoQuery, TrinoStatus } from "@/types/api";
+import type { TrinoNode, TrinoNodeSource, TrinoOrgStatus, TrinoQuery, TrinoStatus } from "@/types/api";
 
 // Trino's terminal states, mirroring QueryState.isDone(). Everything else --
 // QUEUED, WAITING_FOR_RESOURCES, DISPATCHING, PLANNING, STARTING, RUNNING,
@@ -103,14 +103,31 @@ export function summarizeTrinoQueries(queries: TrinoQuery[]): TrinoQuerySummary 
   return s;
 }
 
+// Trino's NodeState for a node that is scheduling work normally. Anything
+// else is draining, shutting down or already gone.
+export const TRINO_ACTIVE_NODE_STATE = "ACTIVE";
+
 export interface TrinoNodeHealth {
   total: number;
+  // healthKnown=false means the cell reported membership only (the announce
+  // inventory), so failed/degraded/worstFailureRatio are zero because
+  // nothing was measured. A view that renders them as "all healthy" is
+  // making a claim the coordinator never made — check this first.
+  healthKnown: boolean;
   failed: number;
   // degraded counts nodes the coordinator still schedules onto but which
   // are losing heartbeats. They are the early warning the `failed` count
   // gives only after the fact.
   degraded: number;
   worstFailureRatio: number;
+  // detailKnown=true means the source carried lifecycle state and version
+  // (system.runtime.nodes). inactive and versions are meaningful only then.
+  detailKnown: boolean;
+  // Nodes not in the ACTIVE state: draining, shutting down or inactive.
+  inactive: number;
+  // Distinct node versions, sorted. More than one means a rollout is in
+  // flight — or stuck, which is the case worth seeing.
+  versions: string[];
 }
 
 // A node that is still scheduled but failing this share of its heartbeats
@@ -118,8 +135,34 @@ export interface TrinoNodeHealth {
 // point is to see trouble before the coordinator evicts the node.
 export const TRINO_DEGRADED_FAILURE_RATIO = 0.1;
 
-export function summarizeTrinoNodes(nodes: TrinoNode[]): TrinoNodeHealth {
-  const h: TrinoNodeHealth = { total: nodes.length, failed: 0, degraded: 0, worstFailureRatio: 0 };
+export function summarizeTrinoNodes(
+  nodes: TrinoNode[],
+  source: TrinoNodeSource | undefined = "failure_detector",
+): TrinoNodeHealth {
+  const healthKnown = source === "failure_detector";
+  const detailKnown = source === "system_table";
+  const h: TrinoNodeHealth = {
+    total: nodes.length,
+    healthKnown,
+    failed: 0,
+    degraded: 0,
+    worstFailureRatio: 0,
+    detailKnown,
+    inactive: 0,
+    versions: [],
+  };
+  if (detailKnown) {
+    const seen = new Set<string>();
+    for (const n of nodes) {
+      if (n.state && n.state !== TRINO_ACTIVE_NODE_STATE) h.inactive += 1;
+      if (n.version) seen.add(n.version);
+    }
+    h.versions = [...seen].sort();
+    return h;
+  }
+  // The announce inventory carries a URI and nothing else. Counting its
+  // zeroed heartbeat fields would manufacture a clean bill of health.
+  if (!healthKnown) return h;
   for (const n of nodes) {
     const ratio = n.recent_failure_ratio ?? 0;
     if (n.failed) {

@@ -1566,8 +1566,10 @@ func TestObserverHasNoCatalogAccess(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.op, func(t *testing.T) {
 			if evalAllow(t, q, buildInput(ObserverPrincipal, tc.op, tc.resource)) {
-				t.Errorf("%s: the observer principal must have NO catalog authority -- "+
-					"it is the read-only query-visibility half of the split credential", tc.op)
+				t.Errorf("%s: the observer principal must have NO authority over TENANT "+
+					"catalogs -- it is the read-only query-visibility half of the split "+
+					"credential. Its one data grant is system.runtime.nodes, which is "+
+					"pinned by TestObserverSystemGrantIsPinnedToTheNodesTable", tc.op)
 			}
 		})
 	}
@@ -1726,5 +1728,93 @@ func batchedQueryOwnerInput(user string, groups []string, candidates []map[strin
 			"operation":       "FilterViewQueryOwnedBy",
 			"filterResources": candidates,
 		},
+	}
+}
+
+// The observer reads the fleet from system.runtime.nodes, because a cell on
+// Trino's default discovery.type serves no /v1/node and /v1/announce carries
+// no health or version. This is the observer's only data read.
+func TestObserverReadsSystemRuntimeNodes(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	if !evalAllow(t, q, buildInput(ObserverPrincipal, "AccessCatalog", catalogResource("system"))) {
+		t.Error("observer must reach the system catalog, or the nodes query cannot be planned")
+	}
+	if !evalAllow(t, q, buildInput(ObserverPrincipal, "SelectFromColumns",
+		tableResource("system", "runtime", "nodes"))) {
+		t.Error("observer must read system.runtime.nodes -- it is the only place worker version is observable")
+	}
+}
+
+// The whole point of the grant above is that it stops at one table. Reaching
+// the system catalog must not become a way to enumerate tenants:
+// system.metadata and system.jdbc list every catalog, schema, table and
+// column in the cell, and system.runtime.queries carries tenant SQL text
+// unfiltered by FilterViewQueryOwnedBy.
+func TestObserverSystemGrantIsPinnedToTheNodesTable(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	denied := []struct {
+		schema, table, why string
+	}{
+		{"runtime", "queries", "tenant SQL text, unfiltered by query-owner visibility"},
+		{"runtime", "tasks", "per-task detail the console does not use"},
+		{"runtime", "transactions", "not needed by the console"},
+		{"metadata", "table_comments", "enumerates every tenant table"},
+		{"metadata", "catalogs", "enumerates every tenant catalog"},
+		{"jdbc", "tables", "enumerates every tenant table by another route"},
+		{"jdbc", "columns", "enumerates every tenant column"},
+		{"information_schema", "tables", "enumerates every tenant table"},
+	}
+	for _, d := range denied {
+		t.Run("system."+d.schema+"."+d.table, func(t *testing.T) {
+			if evalAllow(t, q, buildInput(ObserverPrincipal, "SelectFromColumns",
+				tableResource("system", d.schema, d.table))) {
+				t.Errorf("observer must NOT read system.%s.%s: %s", d.schema, d.table, d.why)
+			}
+		})
+	}
+
+	// A nodes table in some OTHER catalog is not the one we granted.
+	if evalAllow(t, q, buildInput(ObserverPrincipal, "SelectFromColumns",
+		tableResource("org_42", "runtime", "nodes"))) {
+		t.Error("the grant is pinned to the system catalog, not to any table named runtime.nodes")
+	}
+
+	// Reaching the catalog must not imply browsing it.
+	for _, op := range []string{"ShowSchemas", "ShowTables", "FilterTables", "FilterColumns", "ShowColumns"} {
+		t.Run(op, func(t *testing.T) {
+			if evalAllow(t, q, buildInput(ObserverPrincipal, op, tableResource("system", "metadata", "catalogs"))) {
+				t.Errorf("%s: AccessCatalog on system must not open metadata browsing", op)
+			}
+		})
+	}
+}
+
+// The grant is keyed on is_observer, so it must not leak to a tenant or to
+// the admin principal -- neither of which has any business reading it, and
+// a tenant reaching the system catalog at all would be a boundary failure.
+func TestSystemNodesGrantIsObserverOnly(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	for _, user := range []string{"42", AdminPrincipal} {
+		t.Run(user, func(t *testing.T) {
+			if evalAllow(t, q, buildInput(user, "AccessCatalog", catalogResource("system"))) {
+				t.Errorf("%s must not reach the system catalog", user)
+			}
+			if evalAllow(t, q, buildInput(user, "SelectFromColumns",
+				tableResource("system", "runtime", "nodes"))) {
+				t.Errorf("%s must not read system.runtime.nodes", user)
+			}
+		})
+	}
+
+	// A caller claiming the observer group without the observer username
+	// gets nothing, same as every other observer grant.
+	in := buildInput("42", "SelectFromColumns", tableResource("system", "runtime", "nodes"))
+	in["context"].(map[string]interface{})["identity"].(map[string]interface{})["groups"] =
+		[]interface{}{ObserverGroup}
+	if evalAllow(t, q, in) {
+		t.Error("claiming the observer group without the observer username must grant nothing")
 	}
 }

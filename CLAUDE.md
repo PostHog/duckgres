@@ -1613,15 +1613,30 @@ password/tenant/catalog changes never propagate.
   `/v1/resourceGroupState`, which the console reads, plus `/v1/thread`,
   `/v1/announce` GET, `/v1/maxActiveSplits`, `/v1/integrations/gateway`; all
   GETs of operational state, enumerated in policy.rego) and
-  holds NO catalog — no `data.group_catalogs` entry, and the observer group
-  is excluded from `tenant_owns_catalog` and from the same-org query match,
-  so even a mistaken bundle entry grants no data access. `is_observer` is
+  holds NO TENANT catalog — no `data.group_catalogs` entry, and the observer
+  group is excluded from `tenant_owns_catalog` and from the same-org query
+  match, so even a mistaken bundle entry grants no tenant data access. Its
+  ONE data grant is `system.runtime.nodes`: `AccessCatalog` on `system` plus
+  `SelectFromColumns` pinned to that single table, because a cell on the
+  default `discovery.type` serves no `/v1/node` and `/v1/announce` carries
+  neither health nor version. `AccessCatalog` alone opens nothing — every
+  read still passes `SelectFromColumns` — so `system.runtime.queries`
+  (tenant SQL), `system.metadata.*` and `system.jdbc.*` (which would
+  enumerate every tenant catalog, schema, table and column) all stay denied;
+  `TestObserverSystemGrantIsPinnedToTheNodesTable` pins that. `is_observer` is
   the same username-AND-group conjunction as `is_admin`. Its credential is
   a second regenerate-if-missing pair on `trino-auth`
   (`ensureCredentialPair`), projected into password.db/group.db and read by
   the console through `TrinoProvisioner.ObserverCredential` on every call
   (never captured — a self-heal would otherwise 401 forever). Console reads
   redact SQL before it leaves the CP. See `controlplane/admin/README.md`.
+- **Resource groups must keep a selector for BOTH operational principals**
+  (`root.admin.__admin_provisioner` and `root.admin.__duckgres_observer`).
+  The final selector matches user `(?<org>.*)`, which matches anything, so a
+  principal without its own lane is admitted as a tenant into
+  `root.tenants.free.<principal>` — and those leaves are `JmxExport: true`,
+  so it would appear as a phantom tenant in the per-tenant resource-group
+  metrics.
 - **Resource groups must keep the `root.admin.__admin_provisioner` selector.**
   Trino rejects a query matching no resource group, so dropping it silently
   breaks every reconcile tick's own DDL.

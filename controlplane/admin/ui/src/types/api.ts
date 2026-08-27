@@ -803,6 +803,21 @@ export interface TrinoServerInfo {
   uptime_ms: number;
 }
 
+// Which of Trino's two node inventories a list came from. They carry
+// different detail, so the source has to travel with the data:
+//   failure_detector  /v1/node, bound only under AIRLIFT_DISCOVERY. Full
+//                     heartbeat health per node.
+//   announce          /v1/announce, bound under ANNOUNCE (Trino's default,
+//                     and what these cells run) and DNS. Membership only.
+//   system_table      system.runtime.nodes over SQL. Served by every cell
+//                     regardless of discovery.type, and the only source
+//                     carrying node_version — i.e. version skew.
+export type TrinoNodeSource = "failure_detector" | "announce" | "system_table";
+
+// Every field but `uri` is filled ONLY when the source is failure_detector.
+// Under announce they are zero because nothing was measured, which is not
+// the same as measured-and-zero — rendering them as health invents a claim
+// the coordinator never made.
 export interface TrinoNode {
   uri: string;
   age_ms: number;
@@ -811,6 +826,12 @@ export interface TrinoNode {
   recent_failure_ratio: number;
   last_response_time?: string;
   failed: boolean;
+  // Present only when the source is system_table.
+  node_id?: string;
+  version?: string;
+  coordinator?: boolean;
+  // Trino's NodeState: ACTIVE, INACTIVE, DRAINING, DRAINED, SHUTTING_DOWN.
+  state?: string;
 }
 
 export interface TrinoOrgStatus {
@@ -836,11 +857,14 @@ export interface TrinoStatus {
   server?: TrinoServerInfo;
   queries_by_state: Record<string, number>;
   blocked_queries: number;
-  // node_stats=false means this cell does not report nodes at all, so nodes
-  // and failed_nodes are both zero and mean nothing. Trino serves /v1/node
-  // only under discovery.type=AIRLIFT_DISCOVERY; these cells run the default
-  // ANNOUNCE. Render "not reported" rather than zero nodes.
+  // node_stats=false means this cell serves neither node inventory, so nodes
+  // and failed_nodes are both zero and mean nothing. Render "not reported"
+  // rather than zero nodes.
   node_stats: boolean;
+  // Which inventory `nodes` was counted from. Under "announce" the cell
+  // reports membership without health, so failed_nodes is 0 because nothing
+  // is measured, not because the fleet is known to be well.
+  node_source?: TrinoNodeSource;
   nodes: number;
   failed_nodes: number;
   orgs_by_state: Record<string, number>;
@@ -856,6 +880,7 @@ export interface TrinoQueriesResponse {
 export interface TrinoNodesResponse {
   cell: TrinoCell;
   available: boolean;
+  source?: TrinoNodeSource;
   nodes: TrinoNode[];
 }
 

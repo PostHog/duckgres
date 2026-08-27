@@ -659,6 +659,69 @@ allow if {
 }
 
 # ---------------------------------------------------------------------------
+# The observer's ONE data read: system.runtime.nodes.
+#
+# Trino reports per-node health through two different surfaces, and which
+# one a cell has depends on discovery.type. The REST route /v1/node exists
+# only under AIRLIFT_DISCOVERY; these cells run the default (ANNOUNCE),
+# whose /v1/announce carries membership and nothing else. The engine still
+# knows the fleet -- it just answers through SQL here, via the `system`
+# connector's runtime.nodes table, which is also the only place worker
+# VERSION is observable (node_version), and therefore the only way the
+# console can see version skew during a rollout.
+#
+# Reading it costs the observer a catalog grant, so the grant is written as
+# narrowly as the operations allow:
+#
+#   AccessCatalog on `system` ONLY. This is necessary but nowhere near
+#   sufficient -- it opens no table by itself. Every read still has to pass
+#   SelectFromColumns, which below is pinned to one schema and one table.
+#
+#   SelectFromColumns on system.runtime.nodes ONLY. Not the `system`
+#   catalog, not the `runtime` schema: the single table.
+#
+# What the observer still CANNOT read, and why each matters:
+#
+#   system.runtime.queries       every tenant's SQL text. (It already sees
+#                                queries through the REST API, but that path
+#                                redacts and is bounded by
+#                                FilterViewQueryOwnedBy; this one would not
+#                                be, so it stays denied.)
+#   system.metadata.*            would enumerate every tenant catalog,
+#                                schema, table and column name in the cell.
+#   system.jdbc.*                same enumeration by another route.
+#   org_<tenant> catalogs        tenant data. Unchanged: these flow through
+#                                readable_catalog, which excludes the
+#                                observer group, and this rule does not
+#                                touch that path.
+#
+# system.runtime.nodes itself holds node_id, http_uri, node_version,
+# coordinator and state. No tenant identifier appears in it, so widening
+# the observer to this table exposes no customer data even in full.
+#
+# The observer is NOT admin: it cannot CREATE/DROP/ALTER any catalog, and
+# this rule grants nothing on `org_*`.
+# ---------------------------------------------------------------------------
+
+observer_nodes_table(table) if {
+	table.catalogName == "system"
+	table.schemaName == "runtime"
+	table.tableName == "nodes"
+}
+
+allow if {
+	is_observer
+	input.action.operation == "AccessCatalog"
+	input.action.resource.catalog.name == "system"
+}
+
+allow if {
+	is_observer
+	input.action.operation == "SelectFromColumns"
+	observer_nodes_table(input.action.resource.table)
+}
+
+# ---------------------------------------------------------------------------
 # Hard denies for customer principals.
 #
 # These are listed explicitly even though `default allow := false` already
