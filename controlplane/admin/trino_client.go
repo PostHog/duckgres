@@ -65,6 +65,21 @@ func isTrinoEndpointUnavailable(err error) bool {
 	return errors.Is(err, errTrinoEndpointUnavailable)
 }
 
+// queryRouteNotFound re-reads a 404 for the per-query routes as a missing
+// query rather than a missing route.
+//
+// /v1/query/{id} is always served, so a 404 there is about the id, not the
+// route: JAX-RS answers 404 when it cannot convert the path parameter into a
+// QueryId. Only the aged-out case answers 410, so without this an operator
+// following a malformed link would be told the coordinator does not serve
+// query lookups at all.
+func queryRouteNotFound(err error) error {
+	if isTrinoEndpointUnavailable(err) {
+		return fmt.Errorf("%w", errTrinoNotFound)
+	}
+	return err
+}
+
 // TrinoQuery is one query as the console shows it: identity, lifecycle and
 // the cost counters an operator triages on.
 //
@@ -376,7 +391,7 @@ func (c *trinoCoordinatorHTTPClient) Queries(ctx context.Context) ([]TrinoQuery,
 func (c *trinoCoordinatorHTTPClient) Query(ctx context.Context, queryID string) (*TrinoQuery, error) {
 	raw, err := c.do(ctx, http.MethodGet, "/v1/query/"+url.PathEscape(queryID)+"?pruned=true", nil)
 	if err != nil {
-		return nil, err
+		return nil, queryRouteNotFound(err)
 	}
 	var wire trinoBasicQueryInfo
 	if err := json.Unmarshal(raw, &wire); err != nil {
@@ -396,7 +411,7 @@ func (c *trinoCoordinatorHTTPClient) KillQuery(ctx context.Context, queryID, mes
 	ctx, cancel := context.WithTimeout(ctx, trinoKillTimeout)
 	defer cancel()
 	_, err := c.do(ctx, http.MethodPut, "/v1/query/"+url.PathEscape(queryID)+"/killed", strings.NewReader(message))
-	return err
+	return queryRouteNotFound(err)
 }
 
 type trinoNodeStats struct {

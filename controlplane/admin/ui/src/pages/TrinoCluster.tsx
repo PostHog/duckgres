@@ -181,6 +181,14 @@ export function TrinoCluster() {
           <CardContent>
             {nodes.isLoading ? (
               <TableSkeleton cols={5} />
+            ) : status.data && !status.data.node_stats ? (
+              // Not the same as an empty fleet. Trino serves /v1/node only
+              // under discovery.type=AIRLIFT_DISCOVERY, and a cell on the
+              // default ANNOUNCE has no such endpoint to answer with.
+              <EmptyState
+                title="Nodes are not reported by this cell"
+                description="This coordinator does not serve /v1/node. Trino registers that endpoint only under discovery.type=AIRLIFT_DISCOVERY, and this cell uses the default. The cell is healthy; its fleet is simply not visible here."
+              />
             ) : (nodes.data?.nodes ?? []).length === 0 ? (
               <EmptyState
                 title="No nodes reported"
