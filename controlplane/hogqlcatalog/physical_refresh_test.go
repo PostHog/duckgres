@@ -79,6 +79,35 @@ func TestMemoryStorePhysicalRefreshIsIdempotentAndMonotonic(t *testing.T) {
 	}
 }
 
+func TestPhysicalRefreshMergesSemanticPublicationAfterLeaseAcquisition(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	lease := acquirePhysicalRefresh(t, store)
+
+	semantic := testSnapshot(1)
+	semantic.LogicalTables[0].Fields[0].Name = "event_key"
+	semantic.LogicalTables[0].Properties[0].SourceField = "event_key"
+	semantic.LogicalTables[0].Relationships[0].JoinKeys[0].SourceField = "event_key"
+	if err := store.Publish(ctx, semantic); err != nil {
+		t.Fatalf("publish semantic snapshot during physical fetch: %v", err)
+	}
+
+	refreshed, published, err := store.PublishPhysicalRefresh(ctx, lease, physicalCatalog("bigint", false), "1.0.0", time.Hour)
+	if err != nil || !published {
+		t.Fatalf("publish physical refresh = (%#v, %t, %v)", refreshed, published, err)
+	}
+	if refreshed.Generation != 2 {
+		t.Fatalf("physical refresh generation = %d, want 2", refreshed.Generation)
+	}
+	if refreshed.LogicalTables[0].Fields[0].Name != "event_key" || refreshed.LogicalTables[0].Fields[0].TrinoTypeSignature != "bigint" {
+		t.Fatalf("physical refresh did not merge the latest semantic generation: %#v", refreshed.LogicalTables[0].Fields[0])
+	}
+	if !reflect.DeepEqual(refreshed.LogicalTables[0].Properties, semantic.LogicalTables[0].Properties) ||
+		!reflect.DeepEqual(refreshed.LogicalTables[0].Relationships, semantic.LogicalTables[0].Relationships) {
+		t.Fatalf("physical refresh replaced concurrently published semantics: %#v", refreshed.LogicalTables[0])
+	}
+}
+
 func TestMemoryStoreRejectsStalePhysicalRefreshLease(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()
