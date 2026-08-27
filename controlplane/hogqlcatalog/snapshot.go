@@ -215,10 +215,20 @@ func validateTableMembers(table *LogicalTableDefinition) error {
 			return invalidSnapshot("logical field %q has unknown logicalType", field.Name)
 		}
 	}
+	properties := make(map[string]struct{}, len(table.Properties))
 	for _, property := range table.Properties {
-		if err := addMember(members, table.Name, property.Name); err != nil {
+		if err := validateDefinitionText(property.Name, "logical member name"); err != nil {
 			return err
 		}
+		propertyName := canonicalName(property.Name)
+		if _, exists := properties[propertyName]; exists {
+			return invalidSnapshot("duplicate logical member %q on table %q", property.Name, table.Name)
+		}
+		properties[propertyName] = struct{}{}
+		if _, exists := members[propertyName]; exists && propertyName != canonicalName(property.SourceField) {
+			return invalidSnapshot("duplicate logical member %q on table %q", property.Name, table.Name)
+		}
+		members[propertyName] = struct{}{}
 		if err := validateDefinitionText(property.SourceField, "property source field"); err != nil {
 			return err
 		}

@@ -72,6 +72,22 @@ func TestMemoryStoreFailsClosedForUnknownCatalogAndGeneration(t *testing.T) {
 	}
 }
 
+func TestPublishAllowsPropertyContainerBackedBySameLogicalField(t *testing.T) {
+	snapshot := testSnapshot(1)
+	snapshot.LogicalTables[0].Fields = append(snapshot.LogicalTables[0].Fields, LogicalFieldDefinition{
+		Name:               "properties",
+		PhysicalColumn:     PhysicalIdentifier{Value: "properties_blob"},
+		TrinoTypeSignature: "map(varchar, json)",
+		LogicalType:        LogicalTypeMap,
+		Nullable:           true,
+	})
+	snapshot.LogicalTables[0].Properties[0].SourceField = "properties"
+
+	if err := NewMemoryStore().Publish(context.Background(), snapshot); err != nil {
+		t.Fatalf("publish property container backed by the same field: %v", err)
+	}
+}
+
 func TestPublishRejectsInvalidSemanticOverlay(t *testing.T) {
 	ctx := context.Background()
 	tests := []struct {
@@ -106,6 +122,20 @@ func TestPublishRejectsInvalidSemanticOverlay(t *testing.T) {
 			name: "missing required relationship list",
 			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
 				snapshot.LogicalTables[1].Relationships = nil
+			},
+		},
+		{
+			name: "property collides with unrelated field",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.LogicalTables[0].Fields = append(snapshot.LogicalTables[0].Fields, LogicalFieldDefinition{
+					Name:               "properties",
+					PhysicalColumn:     PhysicalIdentifier{Value: "properties_blob"},
+					TrinoTypeSignature: "map(varchar, json)",
+					LogicalType:        LogicalTypeMap,
+					Nullable:           true,
+				})
+				snapshot.LogicalTables[0].Properties[0].Name = "id"
+				snapshot.LogicalTables[0].Properties[0].SourceField = "properties"
 			},
 		},
 	}
