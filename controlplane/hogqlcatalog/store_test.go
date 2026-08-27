@@ -128,8 +128,8 @@ func testCatalog() PhysicalIdentifier {
 func testSnapshot(generation int64) *HogQLSemanticCatalogSnapshot {
 	catalog := testCatalog()
 	return &HogQLSemanticCatalogSnapshot{
-		ProtocolVersion: 1,
-		SchemaVersion:   1,
+		ProtocolVersion: SnapshotProtocolVersion,
+		SchemaVersion:   SnapshotSchemaVersion,
 		LanguageVersion: "1.0.0",
 		Catalog:         catalog,
 		Generation:      generation,
@@ -191,5 +191,11 @@ func testSnapshot(generation int64) *HogQLSemanticCatalogSnapshot {
 				Relationships: []RelationshipDefinition{},
 			},
 		},
+		ExpressionFields:  []ExpressionFieldDefinition{},
+		VirtualTables:     []VirtualTableDefinition{},
+		SavedQueries:      []SavedQueryReference{},
+		MaterializedViews: []MaterializedViewReference{},
+		Functions:         []FunctionCapabilityDefinition{},
+		ModifierDefaults:  []SemanticModifierDefault{},
 	}
 }

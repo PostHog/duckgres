@@ -5,6 +5,7 @@ package hogqlcatalog
 import (
 	"errors"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -38,7 +39,8 @@ func TestPostgresStorePersistsImmutableGenerationsAcrossInstances(t *testing.T) 
 	}
 
 	firstProcess := NewPostgresStore(config.DB())
-	if err := firstProcess.Publish(t.Context(), testSnapshot(1)); err != nil {
+	expected := completeSemanticSnapshot(1)
+	if err := firstProcess.Publish(t.Context(), expected); err != nil {
 		t.Fatalf("publish generation 1: %v", err)
 	}
 
@@ -49,6 +51,9 @@ func TestPostgresStorePersistsImmutableGenerationsAcrossInstances(t *testing.T) 
 	}
 	if pinned.Generation != 1 {
 		t.Fatalf("pinned generation = %d, want 1", pinned.Generation)
+	}
+	if !reflect.DeepEqual(pinned, expected) {
+		t.Fatalf("persisted snapshot changed after restart\n got: %#v\nwant: %#v", pinned, expected)
 	}
 	if err := restartedProcess.Publish(t.Context(), testSnapshot(2)); err != nil {
 		t.Fatalf("publish generation 2: %v", err)

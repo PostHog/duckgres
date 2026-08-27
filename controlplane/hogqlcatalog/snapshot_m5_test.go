@@ -1,0 +1,262 @@
+package hogqlcatalog
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestSemanticMetadataJSONAndPublisherRoundTrip(t *testing.T) {
+	snapshot := completeSemanticSnapshot(1)
+	document, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	decoded, err := DecodeSnapshot(strings.NewReader(string(document)))
+	if err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("remarshal snapshot: %v", err)
+	}
+	if string(encoded) != string(document) {
+		t.Fatalf("JSON contract changed during decode\n got: %s\nwant: %s", encoded, document)
+	}
+
+	store := NewMemoryStore()
+	if err := store.Publish(context.Background(), snapshot); err != nil {
+		t.Fatalf("publish snapshot: %v", err)
+	}
+	read, err := store.Latest(context.Background(), testCatalog())
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if !reflect.DeepEqual(read, snapshot) {
+		t.Fatalf("publisher round trip changed snapshot\n got: %#v\nwant: %#v", read, snapshot)
+	}
+
+	snapshot.ExpressionFields[0].Recipe.FunctionCall.Arguments[0].FieldReference.Field = "mutated"
+	read.VirtualTables[0].Projections[0].Name = "mutated"
+	again, err := store.Latest(context.Background(), testCatalog())
+	if err != nil {
+		t.Fatalf("reread snapshot: %v", err)
+	}
+	if got := again.ExpressionFields[0].Recipe.FunctionCall.Arguments[0].FieldReference.Field; got != "id" {
+		t.Fatalf("published expression leaked caller mutation: field = %q", got)
+	}
+	if got := again.VirtualTables[0].Projections[0].Name; got != "id" {
+		t.Fatalf("published projection leaked reader mutation: name = %q", got)
+	}
+}
+
+func TestHTTPSemanticMetadataRoundTrip(t *testing.T) {
+	snapshot := completeSemanticSnapshot(1)
+	router := testRouter(NewMemoryStore())
+	publishSnapshot(t, router, snapshot, 204)
+	read := getSnapshot(t, router, compatibilityPath("ducklake", false, 1, "1.0.0"), 200)
+	if !reflect.DeepEqual(read, snapshot) {
+		t.Fatalf("HTTP round trip changed snapshot\n got: %#v\nwant: %#v", read, snapshot)
+	}
+}
+
+func TestDecimalLiteralValidationIsExact(t *testing.T) {
+	valid := completeSemanticSnapshot(1)
+	valid.ModifierDefaults = append(valid.ModifierDefaults, SemanticModifierDefault{
+		Name: "large_decimal", Behavior: ModifierBehaviorCompiler,
+		DefaultValue: TypedLiteral{TypeSignature: "decimal(38, 9)", Encoding: LiteralEncodingDecimal, Value: "12345678901234567890123456789.123456789"},
+	})
+	if err := NewMemoryStore().Publish(context.Background(), valid); err != nil {
+		t.Fatalf("publish exact decimal: %v", err)
+	}
+
+	for _, value := range []string{"NaN", "Inf", "-Inf", "1e3", ".5", "01"} {
+		t.Run(value, func(t *testing.T) {
+			snapshot := completeSemanticSnapshot(1)
+			snapshot.ModifierDefaults[0].DefaultValue = TypedLiteral{TypeSignature: "decimal(10, 2)", Encoding: LiteralEncodingDecimal, Value: value}
+			if err := NewMemoryStore().Publish(context.Background(), snapshot); !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("publish decimal %q error = %v, want ErrInvalidSnapshot", value, err)
+			}
+		})
+	}
+}
+
+func TestPublishRejectsInvalidSemanticRecipeGraph(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*HogQLSemanticCatalogSnapshot)
+	}{
+		{
+			name: "unknown virtual source",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.VirtualTables[0].Source.Name = "missing"
+			},
+		},
+		{
+			name: "unknown saved query target",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.SavedQueries[0].Target.Name = "missing"
+			},
+		},
+		{
+			name: "saved query and virtual table cycle",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.VirtualTables[0].Source = RelationReference{Kind: RelationKindSavedQuery, Name: "example_funnel"}
+			},
+		},
+		{
+			name: "virtual source cycle",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.VirtualTables = append(snapshot.VirtualTables, VirtualTableDefinition{
+					Name: "cycle_a", Source: RelationReference{Kind: RelationKindVirtualTable, Name: "cycle_b"}, Projections: []VirtualProjection{{Name: "id", SourceField: "id", StarVisible: true}},
+				}, VirtualTableDefinition{
+					Name: "cycle_b", Source: RelationReference{Kind: RelationKindVirtualTable, Name: "cycle_a"}, Projections: []VirtualProjection{{Name: "id", SourceField: "id", StarVisible: true}},
+				})
+			},
+		},
+		{
+			name: "semantic relation depth limit",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				for index := range maxSemanticRelationDepth + 1 {
+					source := RelationReference{Kind: RelationKindLogicalTable, Name: "events"}
+					if index < maxSemanticRelationDepth {
+						source = RelationReference{Kind: RelationKindVirtualTable, Name: "deep_" + strconv.Itoa(index+1)}
+					}
+					snapshot.VirtualTables = append(snapshot.VirtualTables, VirtualTableDefinition{
+						Name: "deep_" + strconv.Itoa(index), Source: source,
+						Projections: []VirtualProjection{{Name: "id", SourceField: "id", StarVisible: true}},
+					})
+				}
+			},
+		},
+		{
+			name: "expression field cycle",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields = []ExpressionFieldDefinition{
+					{Table: "events", Name: "a", TrinoTypeSignature: "varchar", LogicalType: LogicalTypeString, Recipe: fieldRecipe("events", "b")},
+					{Table: "events", Name: "b", TrinoTypeSignature: "varchar", LogicalType: LogicalTypeString, Recipe: fieldRecipe("events", "a")},
+				}
+			},
+		},
+		{
+			name: "expression field conflicts with property",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Name = "properties"
+			},
+		},
+		{
+			name: "expression field conflicts with relationship",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Name = "person"
+			},
+		},
+		{
+			name: "unknown expression field reference",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Recipe.FunctionCall.Arguments[0] = fieldRecipe("events", "missing")
+			},
+		},
+		{
+			name: "cross-table expression field reference",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Recipe.FunctionCall.Arguments[0] = fieldRecipe("persons", "id")
+			},
+		},
+		{
+			name: "lossy decimal literal",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Recipe.FunctionCall.Arguments[1].Literal.Encoding = LiteralEncodingDecimal
+				snapshot.ExpressionFields[0].Recipe.FunctionCall.Arguments[1].Literal.Value = "1e309"
+			},
+		},
+		{
+			name: "mismatched recipe payload",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ExpressionFields[0].Recipe.FieldReference = &FieldReferenceRecipe{Table: "events", Field: "id"}
+			},
+		},
+		{
+			name: "expression recipe depth limit",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				recipe := fieldRecipe("events", "id")
+				for range maxExpressionRecipeDepth {
+					nested := recipe
+					recipe = ExpressionRecipe{Kind: ExpressionRecipeCast, Cast: &CastRecipe{Expression: &nested, TargetTypeSignature: "varchar"}}
+				}
+				snapshot.ExpressionFields[0].Recipe = recipe
+			},
+		},
+		{
+			name: "session modifier missing property",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.ModifierDefaults[1].SessionProperty = nil
+			},
+		},
+		{
+			name: "stock function missing Trino name",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[0].TrinoName = nil
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := completeSemanticSnapshot(1)
+			test.mutate(snapshot)
+			if err := NewMemoryStore().Publish(context.Background(), snapshot); !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("publish error = %v, want ErrInvalidSnapshot", err)
+			}
+		})
+	}
+}
+
+func completeSemanticSnapshot(generation int64) *HogQLSemanticCatalogSnapshot {
+	snapshot := testSnapshot(generation)
+	snapshot.ExpressionFields = []ExpressionFieldDefinition{
+		{
+			Table: "events", Name: "display_name", TrinoTypeSignature: "varchar", LogicalType: LogicalTypeString, Nullable: false, StarVisible: true,
+			Recipe: ExpressionRecipe{Kind: ExpressionRecipeFunctionCall, FunctionCall: &FunctionCallRecipe{
+				Name: "concat",
+				Arguments: []ExpressionRecipe{
+					fieldRecipe("events", "id"),
+					{Kind: ExpressionRecipeLiteral, Literal: &TypedLiteral{TypeSignature: "varchar", Encoding: LiteralEncodingString, Value: "-synthetic"}},
+				},
+			}},
+		},
+	}
+	snapshot.VirtualTables = []VirtualTableDefinition{{
+		Name: "recent_events", Source: RelationReference{Kind: RelationKindLogicalTable, Name: "events"},
+		Projections: []VirtualProjection{{Name: "id", SourceField: "id", StarVisible: true}, {Name: "display_name", SourceField: "display_name", StarVisible: true}},
+	}}
+	snapshot.SavedQueries = []SavedQueryReference{{
+		Name: "example_funnel", QueryID: "saved_query_example", Target: RelationReference{Kind: RelationKindVirtualTable, Name: "recent_events"},
+		Fields: []ReferencedField{
+			{Name: "id", TrinoTypeSignature: "varchar", LogicalType: LogicalTypeString, Nullable: false, StarVisible: true},
+			{Name: "display_name", TrinoTypeSignature: "varchar", LogicalType: LogicalTypeString, Nullable: false, StarVisible: true},
+		},
+	}}
+	snapshot.MaterializedViews = []MaterializedViewReference{{
+		Name:         "daily_events",
+		PhysicalView: PhysicalQualifiedName{Catalog: testCatalog(), Schema: PhysicalIdentifier{Value: "default"}, Table: PhysicalIdentifier{Value: "daily_events"}},
+		Fields:       []ReferencedField{{Name: "day", TrinoTypeSignature: "date", LogicalType: LogicalTypeDate, Nullable: false, StarVisible: true}},
+	}}
+	snapshot.Functions = []FunctionCapabilityDefinition{{
+		Name: "concat", Kind: FunctionKindScalar, Implementation: FunctionImplementationStock,
+		TrinoName: []PhysicalIdentifier{{Value: "concat"}}, Deterministic: true,
+		Signatures: []FunctionSignature{{ArgumentTypes: []string{"varchar", "varchar"}, ReturnType: "varchar", Variadic: false}},
+	}}
+	snapshot.ModifierDefaults = []SemanticModifierDefault{
+		{Name: "week_start", Behavior: ModifierBehaviorCompiler, DefaultValue: TypedLiteral{TypeSignature: "integer", Encoding: LiteralEncodingInteger, Value: "1"}},
+		{Name: "optimize_metadata_queries", Behavior: ModifierBehaviorTrinoSessionProperty, DefaultValue: TypedLiteral{TypeSignature: "boolean", Encoding: LiteralEncodingBoolean, Value: "true"}, SessionProperty: []PhysicalIdentifier{{Value: "optimizer"}, {Value: "optimize_metadata_queries"}}},
+	}
+	return snapshot
+}
+
+func fieldRecipe(table, field string) ExpressionRecipe {
+	return ExpressionRecipe{Kind: ExpressionRecipeFieldReference, FieldReference: &FieldReferenceRecipe{Table: table, Field: field}}
+}

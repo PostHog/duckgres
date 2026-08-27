@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -70,11 +71,15 @@ func validateRequiredJSONFields(document []byte, valueType reflect.Type, path st
 		}
 		for index := range valueType.NumField() {
 			field := valueType.Field(index)
-			jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
+			jsonTag := strings.Split(field.Tag.Get("json"), ",")
+			jsonName := jsonTag[0]
 			if jsonName == "" || jsonName == "-" {
 				continue
 			}
 			fieldDocument, exists := object[jsonName]
+			if slices.Contains(jsonTag[1:], "omitempty") && !exists {
+				continue
+			}
 			if !exists {
 				return fmt.Errorf("decode HogQL semantic catalog snapshot: %s.%s is required", path, jsonName)
 			}

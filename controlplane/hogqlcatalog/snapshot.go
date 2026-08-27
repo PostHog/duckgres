@@ -10,7 +10,7 @@ import (
 
 const (
 	SnapshotProtocolVersion = 1
-	SnapshotSchemaVersion   = 1
+	SnapshotSchemaVersion   = 2
 )
 
 var (
@@ -25,12 +25,18 @@ var (
 )
 
 type HogQLSemanticCatalogSnapshot struct {
-	ProtocolVersion int                      `json:"protocolVersion"`
-	SchemaVersion   int                      `json:"schemaVersion"`
-	LanguageVersion string                   `json:"languageVersion"`
-	Catalog         PhysicalIdentifier       `json:"catalog"`
-	Generation      int64                    `json:"generation"`
-	LogicalTables   []LogicalTableDefinition `json:"logicalTables"`
+	ProtocolVersion   int                            `json:"protocolVersion"`
+	SchemaVersion     int                            `json:"schemaVersion"`
+	LanguageVersion   string                         `json:"languageVersion"`
+	Catalog           PhysicalIdentifier             `json:"catalog"`
+	Generation        int64                          `json:"generation"`
+	LogicalTables     []LogicalTableDefinition       `json:"logicalTables"`
+	ExpressionFields  []ExpressionFieldDefinition    `json:"expressionFields"`
+	VirtualTables     []VirtualTableDefinition       `json:"virtualTables"`
+	SavedQueries      []SavedQueryReference          `json:"savedQueries"`
+	MaterializedViews []MaterializedViewReference    `json:"materializedViews"`
+	Functions         []FunctionCapabilityDefinition `json:"functions"`
+	ModifierDefaults  []SemanticModifierDefault      `json:"modifierDefaults"`
 }
 
 type LogicalTableDefinition struct {
@@ -120,6 +126,9 @@ func normalizeAndValidateSnapshot(snapshot *HogQLSemanticCatalogSnapshot) (*HogQ
 	if snapshot == nil {
 		return nil, invalidSnapshot("snapshot is null")
 	}
+	if err := validateSemanticShapeBounds(snapshot); err != nil {
+		return nil, err
+	}
 	normalized := cloneSnapshot(snapshot)
 	if normalized.ProtocolVersion != SnapshotProtocolVersion {
 		return nil, invalidSnapshot("unsupported protocolVersion %d", normalized.ProtocolVersion)
@@ -165,6 +174,9 @@ func normalizeAndValidateSnapshot(snapshot *HogQLSemanticCatalogSnapshot) (*HogQ
 		}
 	}
 	if err := validateReferences(tables); err != nil {
+		return nil, err
+	}
+	if err := validateSemanticMetadata(normalized, tables); err != nil {
 		return nil, err
 	}
 	return normalized, nil
@@ -329,6 +341,7 @@ func cloneSnapshot(snapshot *HogQLSemanticCatalogSnapshot) *HogQLSemanticCatalog
 			clone.LogicalTables[tableIndex].Relationships[relationshipIndex].JoinKeys = slices.Clone(relationship.JoinKeys)
 		}
 	}
+	cloneSemanticMetadata(&clone, snapshot)
 	return &clone
 }
 
