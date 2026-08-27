@@ -45,23 +45,31 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 		t.Fatalf("LoadCatalog: %v", err)
 	}
 	want := []string{
-		"q_events_total__raw_view",
-		"q_events_total__ducklake_table",
-		"q_events_count_one_day__raw_view",
-		"q_events_count_one_day__ducklake_table",
-		"q_events_by_name_march_2026__raw_view",
-		"q_events_by_name_march_2026__ducklake_table",
-		"q_events_distinct_persons__raw_view",
-		"q_events_distinct_persons__ducklake_table",
-		"q_persons_total__raw_view",
-		"q_persons_total__ducklake_table",
-		"q_persons_daily_april_2026__raw_view",
-		"q_persons_daily_april_2026__ducklake_table",
-		"q_events_daily_march_2026__raw_view",
-		"q_events_daily_march_2026__ducklake_table",
+		"q_events_total_balanced_v2__raw_view",
+		"q_events_total_balanced_v2__ducklake_table",
+		"q_events_count_one_day_balanced_v2__raw_view",
+		"q_events_count_one_day_balanced_v2__ducklake_table",
+		"q_events_by_name_march_2026_balanced_v2__raw_view",
+		"q_events_by_name_march_2026_balanced_v2__ducklake_table",
+		"q_events_distinct_persons_balanced_v2__raw_view",
+		"q_events_distinct_persons_balanced_v2__ducklake_table",
+		"q_persons_total_balanced_v2__raw_view",
+		"q_persons_total_balanced_v2__ducklake_table",
+		"q_persons_daily_april_2026_balanced_v2__raw_view",
+		"q_persons_daily_april_2026_balanced_v2__ducklake_table",
+		"q_events_daily_march_2026_balanced_v2__raw_view",
+		"q_events_daily_march_2026_balanced_v2__ducklake_table",
 	}
 	if got := queryIDs(catalog); !reflect.DeepEqual(got, want) {
 		t.Fatalf("checked-in PostHog query IDs changed: got %v want %v", got, want)
+	}
+	if catalog.MeasureIterations != 4 {
+		t.Fatalf("checked-in PostHog measure iterations = %d, want 4 for balanced target order", catalog.MeasureIterations)
+	}
+	for _, query := range catalog.Queries {
+		if !strings.HasSuffix(query.IntentID, "_balanced_v2") {
+			t.Fatalf("checked-in PostHog query %s has unversioned methodology intent %q", query.QueryID, query.IntentID)
+		}
 	}
 	for index, query := range catalog.Queries {
 		wantTarget := StorageTargetRawView
@@ -129,6 +137,19 @@ queries:
 	}
 	if catalog.Queries[0].StorageTarget != "" {
 		t.Fatalf("legacy query unexpectedly has storage target %q", catalog.Queries[0].StorageTarget)
+	}
+}
+
+func TestParseCatalogRejectsOddMeasureIterationsForPairedQueries(t *testing.T) {
+	raw := strings.Replace(pairedCatalogYAML(`
+paired_queries:
+  - query_id_base: q_events
+    intent_id: ph.events.v1
+    sql_template: SELECT COUNT(*) FROM {{ relation "events" }}
+`), "measure_iterations: 2", "measure_iterations: 3", 1)
+	_, err := ParseCatalog([]byte(raw))
+	if err == nil || !strings.Contains(err.Error(), "even") {
+		t.Fatalf("ParseCatalog error = %v, want even measure_iterations requirement", err)
 	}
 }
 
@@ -405,7 +426,7 @@ seed: 1
 dataset_scale: 1
 targets: [pgwire]
 warmup_iterations: 0
-measure_iterations: 1
+measure_iterations: 2
 ` + body
 }
 

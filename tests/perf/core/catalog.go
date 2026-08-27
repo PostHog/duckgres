@@ -377,6 +377,7 @@ func validateCatalog(c Catalog) error {
 		return fmt.Errorf("queries must include at least one entry")
 	}
 	seenQueryIDs := map[string]struct{}{}
+	hasPairedQueries := false
 	for _, q := range c.Queries {
 		if q.QueryID == "" {
 			return fmt.Errorf("query_id is required")
@@ -391,6 +392,12 @@ func validateCatalog(c Catalog) error {
 		if q.PGWireSQL == "" {
 			return fmt.Errorf("query %s missing pgwire_sql", q.QueryID)
 		}
+		if q.StorageTarget != "" {
+			hasPairedQueries = true
+		}
+	}
+	if hasPairedQueries && c.MeasureIterations%2 != 0 {
+		return fmt.Errorf("paired catalogs require an even measure_iterations value to balance storage-target execution order")
 	}
 	return nil
 }
