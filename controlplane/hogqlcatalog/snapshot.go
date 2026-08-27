@@ -37,6 +37,9 @@ type HogQLSemanticCatalogSnapshot struct {
 	MaterializedViews []MaterializedViewReference    `json:"materializedViews"`
 	Functions         []FunctionCapabilityDefinition `json:"functions"`
 	ModifierDefaults  []SemanticModifierDefault      `json:"modifierDefaults"`
+	LazyTables        []LazyTableDefinition          `json:"lazyTables,omitempty"`
+	Actions           []ActionReference              `json:"actions,omitempty"`
+	Cohorts           []CohortReference              `json:"cohorts,omitempty"`
 }
 
 type LogicalTableDefinition struct {
@@ -57,18 +60,22 @@ type LogicalFieldDefinition struct {
 }
 
 type PropertyDefinition struct {
-	Name        string          `json:"name"`
-	SourceField string          `json:"sourceField"`
-	Storage     PropertyStorage `json:"storage"`
-	LogicalType LogicalType     `json:"logicalType"`
-	Nullable    bool            `json:"nullable"`
+	Name               string            `json:"name"`
+	SourceField        string            `json:"sourceField"`
+	Storage            PropertyStorage   `json:"storage"`
+	LogicalType        LogicalType       `json:"logicalType"`
+	Nullable           bool              `json:"nullable"`
+	KeyTypeSignature   string            `json:"keyTypeSignature,omitempty"`
+	ValueTypeSignature string            `json:"valueTypeSignature,omitempty"`
+	LookupRecipe       *ExpressionRecipe `json:"lookupRecipe,omitempty"`
 }
 
 type RelationshipDefinition struct {
-	Name        string                  `json:"name"`
-	TargetTable string                  `json:"targetTable"`
-	Cardinality RelationshipCardinality `json:"cardinality"`
-	JoinKeys    []JoinKey               `json:"joinKeys"`
+	Name          string                  `json:"name"`
+	TargetTable   string                  `json:"targetTable"`
+	Cardinality   RelationshipCardinality `json:"cardinality"`
+	JoinKeys      []JoinKey               `json:"joinKeys"`
+	JoinPredicate *ExpressionRecipe       `json:"joinPredicate,omitempty"`
 }
 
 type JoinKey struct {
@@ -130,6 +137,15 @@ func normalizeAndValidateSnapshot(snapshot *HogQLSemanticCatalogSnapshot) (*HogQ
 		return nil, err
 	}
 	normalized := cloneSnapshot(snapshot)
+	if len(normalized.LazyTables) == 0 {
+		normalized.LazyTables = nil
+	}
+	if len(normalized.Actions) == 0 {
+		normalized.Actions = nil
+	}
+	if len(normalized.Cohorts) == 0 {
+		normalized.Cohorts = nil
+	}
 	if normalized.ProtocolVersion != SnapshotProtocolVersion {
 		return nil, invalidSnapshot("unsupported protocolVersion %d", normalized.ProtocolVersion)
 	}
@@ -337,8 +353,18 @@ func cloneSnapshot(snapshot *HogQLSemanticCatalogSnapshot) *HogQLSemanticCatalog
 		clone.LogicalTables[tableIndex].Fields = slices.Clone(table.Fields)
 		clone.LogicalTables[tableIndex].Properties = slices.Clone(table.Properties)
 		clone.LogicalTables[tableIndex].Relationships = slices.Clone(table.Relationships)
+		for propertyIndex, property := range clone.LogicalTables[tableIndex].Properties {
+			if property.LookupRecipe != nil {
+				recipe := cloneExpressionRecipe(*property.LookupRecipe)
+				clone.LogicalTables[tableIndex].Properties[propertyIndex].LookupRecipe = &recipe
+			}
+		}
 		for relationshipIndex, relationship := range clone.LogicalTables[tableIndex].Relationships {
 			clone.LogicalTables[tableIndex].Relationships[relationshipIndex].JoinKeys = slices.Clone(relationship.JoinKeys)
+			if relationship.JoinPredicate != nil {
+				recipe := cloneExpressionRecipe(*relationship.JoinPredicate)
+				clone.LogicalTables[tableIndex].Relationships[relationshipIndex].JoinPredicate = &recipe
+			}
 		}
 	}
 	cloneSemanticMetadata(&clone, snapshot)

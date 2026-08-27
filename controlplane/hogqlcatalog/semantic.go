@@ -29,22 +29,28 @@ type ExpressionFieldDefinition struct {
 }
 
 type ExpressionRecipe struct {
-	Kind           ExpressionRecipeKind  `json:"kind"`
-	FieldReference *FieldReferenceRecipe `json:"fieldReference,omitempty"`
-	Literal        *TypedLiteral         `json:"literal,omitempty"`
-	FunctionCall   *FunctionCallRecipe   `json:"functionCall,omitempty"`
-	Operator       *OperatorRecipe       `json:"operator,omitempty"`
-	Cast           *CastRecipe           `json:"cast,omitempty"`
+	Kind                 ExpressionRecipeKind           `json:"kind"`
+	FieldReference       *FieldReferenceRecipe          `json:"fieldReference,omitempty"`
+	Literal              *TypedLiteral                  `json:"literal,omitempty"`
+	FunctionCall         *FunctionCallRecipe            `json:"functionCall,omitempty"`
+	Operator             *OperatorRecipe                `json:"operator,omitempty"`
+	Cast                 *CastRecipe                    `json:"cast,omitempty"`
+	ArgumentReference    *ArgumentReferenceRecipe       `json:"argumentReference,omitempty"`
+	ScopedFieldReference *ScopedFieldReferenceRecipe    `json:"scopedFieldReference,omitempty"`
+	PropertyLookup       *PropertyLookupReferenceRecipe `json:"propertyLookup,omitempty"`
 }
 
 type ExpressionRecipeKind string
 
 const (
-	ExpressionRecipeFieldReference ExpressionRecipeKind = "FIELD_REFERENCE"
-	ExpressionRecipeLiteral        ExpressionRecipeKind = "LITERAL"
-	ExpressionRecipeFunctionCall   ExpressionRecipeKind = "FUNCTION_CALL"
-	ExpressionRecipeOperator       ExpressionRecipeKind = "OPERATOR"
-	ExpressionRecipeCast           ExpressionRecipeKind = "CAST"
+	ExpressionRecipeFieldReference       ExpressionRecipeKind = "FIELD_REFERENCE"
+	ExpressionRecipeLiteral              ExpressionRecipeKind = "LITERAL"
+	ExpressionRecipeFunctionCall         ExpressionRecipeKind = "FUNCTION_CALL"
+	ExpressionRecipeOperator             ExpressionRecipeKind = "OPERATOR"
+	ExpressionRecipeCast                 ExpressionRecipeKind = "CAST"
+	ExpressionRecipeArgumentReference    ExpressionRecipeKind = "ARGUMENT_REFERENCE"
+	ExpressionRecipeScopedFieldReference ExpressionRecipeKind = "SCOPED_FIELD_REFERENCE"
+	ExpressionRecipePropertyLookup       ExpressionRecipeKind = "PROPERTY_LOOKUP"
 )
 
 type FieldReferenceRecipe struct {
@@ -82,7 +88,37 @@ const (
 	SemanticOperatorNegate             SemanticOperator = "NEGATE"
 	SemanticOperatorIsNull             SemanticOperator = "IS_NULL"
 	SemanticOperatorIsNotNull          SemanticOperator = "IS_NOT_NULL"
+	SemanticOperatorSubscript          SemanticOperator = "SUBSCRIPT"
 )
+
+type ArgumentReferenceRecipe struct {
+	Argument ExpressionArgument `json:"argument"`
+}
+
+type ExpressionArgument string
+
+const (
+	ExpressionArgumentPropertySource ExpressionArgument = "PROPERTY_SOURCE"
+	ExpressionArgumentPropertyKey    ExpressionArgument = "PROPERTY_KEY"
+)
+
+type ScopedFieldReferenceRecipe struct {
+	Side  RelationshipJoinSide `json:"side"`
+	Field string               `json:"field"`
+}
+
+type RelationshipJoinSide string
+
+const (
+	RelationshipJoinSource RelationshipJoinSide = "SOURCE"
+	RelationshipJoinTarget RelationshipJoinSide = "TARGET"
+)
+
+type PropertyLookupReferenceRecipe struct {
+	Table    string            `json:"table"`
+	Property string            `json:"property"`
+	Key      *ExpressionRecipe `json:"key"`
+}
 
 type CastRecipe struct {
 	Expression          *ExpressionRecipe `json:"expression"`
@@ -218,7 +254,7 @@ func validateSemanticMetadata(snapshot *HogQLSemanticCatalogSnapshot, logicalTab
 	if snapshot.ExpressionFields == nil || snapshot.VirtualTables == nil || snapshot.SavedQueries == nil || snapshot.MaterializedViews == nil || snapshot.Functions == nil || snapshot.ModifierDefaults == nil {
 		return invalidSnapshot("semantic metadata lists are required")
 	}
-	definitionCount := len(snapshot.ExpressionFields) + len(snapshot.VirtualTables) + len(snapshot.SavedQueries) + len(snapshot.MaterializedViews) + len(snapshot.Functions) + len(snapshot.ModifierDefaults)
+	definitionCount := semanticDefinitionCount(snapshot)
 	if definitionCount > maxSemanticDefinitions {
 		return invalidSnapshot("semantic metadata exceeds definition limit")
 	}
@@ -231,17 +267,30 @@ func validateSemanticMetadata(snapshot *HogQLSemanticCatalogSnapshot, logicalTab
 	if err != nil {
 		return err
 	}
+	if err := validatePropertyRecipes(logicalTables, expressionFields, functions); err != nil {
+		return err
+	}
 	if err := validateExpressionRecipes(snapshot.ExpressionFields, logicalTables, expressionFields, functions); err != nil {
 		return err
 	}
 	if err := validateModifiers(snapshot.ModifierDefaults); err != nil {
 		return err
 	}
-	return validateRelations(snapshot, logicalTables, expressionFields)
+	if err := validateRelationshipPredicates(logicalTables, expressionFields, functions); err != nil {
+		return err
+	}
+	relations, err := validateRelations(snapshot, logicalTables, expressionFields)
+	if err != nil {
+		return err
+	}
+	if err := validateLazyTables(snapshot.LazyTables, logicalTables, expressionFields, functions); err != nil {
+		return err
+	}
+	return validateSemanticEntities(snapshot, logicalTables, expressionFields, functions, relations)
 }
 
 func validateSemanticShapeBounds(snapshot *HogQLSemanticCatalogSnapshot) error {
-	definitionCount := len(snapshot.ExpressionFields) + len(snapshot.VirtualTables) + len(snapshot.SavedQueries) + len(snapshot.MaterializedViews) + len(snapshot.Functions) + len(snapshot.ModifierDefaults)
+	definitionCount := semanticDefinitionCount(snapshot)
 	if definitionCount > maxSemanticDefinitions {
 		return invalidSnapshot("semantic metadata exceeds definition limit")
 	}
@@ -250,8 +299,32 @@ func validateSemanticShapeBounds(snapshot *HogQLSemanticCatalogSnapshot) error {
 		depth  int
 	}
 	pending := make([]pendingRecipe, 0, len(snapshot.ExpressionFields))
+	appendRecipe := func(recipe *ExpressionRecipe) {
+		if recipe != nil {
+			pending = append(pending, pendingRecipe{recipe: recipe, depth: 1})
+		}
+	}
 	for index := range snapshot.ExpressionFields {
-		pending = append(pending, pendingRecipe{recipe: &snapshot.ExpressionFields[index].Recipe, depth: 1})
+		appendRecipe(&snapshot.ExpressionFields[index].Recipe)
+	}
+	for tableIndex := range snapshot.LogicalTables {
+		for propertyIndex := range snapshot.LogicalTables[tableIndex].Properties {
+			appendRecipe(snapshot.LogicalTables[tableIndex].Properties[propertyIndex].LookupRecipe)
+		}
+		for relationshipIndex := range snapshot.LogicalTables[tableIndex].Relationships {
+			appendRecipe(snapshot.LogicalTables[tableIndex].Relationships[relationshipIndex].JoinPredicate)
+		}
+	}
+	for lazyTableIndex := range snapshot.LazyTables {
+		for projectionIndex := range snapshot.LazyTables[lazyTableIndex].Projections {
+			appendRecipe(&snapshot.LazyTables[lazyTableIndex].Projections[projectionIndex].Recipe)
+		}
+	}
+	for index := range snapshot.Actions {
+		appendRecipe(snapshot.Actions[index].Representation.Predicate)
+	}
+	for index := range snapshot.Cohorts {
+		appendRecipe(snapshot.Cohorts[index].Representation.Predicate)
 	}
 	nodes := 0
 	for len(pending) > 0 {
@@ -276,6 +349,9 @@ func validateSemanticShapeBounds(snapshot *HogQLSemanticCatalogSnapshot) error {
 		}
 		if current.recipe.Cast != nil && current.recipe.Cast.Expression != nil {
 			pending = append(pending, pendingRecipe{recipe: current.recipe.Cast.Expression, depth: current.depth + 1})
+		}
+		if current.recipe.PropertyLookup != nil && current.recipe.PropertyLookup.Key != nil {
+			pending = append(pending, pendingRecipe{recipe: current.recipe.PropertyLookup.Key, depth: current.depth + 1})
 		}
 	}
 	return nil
@@ -318,7 +394,7 @@ func logicalMemberNames(table *LogicalTableDefinition) map[string]struct{} {
 	return members
 }
 
-func validateExpressionRecipes(definitions []ExpressionFieldDefinition, tables map[string]*LogicalTableDefinition, expressionFields map[string]*ExpressionFieldDefinition, functions map[string]struct{}) error {
+func validateExpressionRecipes(definitions []ExpressionFieldDefinition, tables map[string]*LogicalTableDefinition, expressionFields map[string]*ExpressionFieldDefinition, functions map[string]*FunctionCapabilityDefinition) error {
 	dependencies := make(map[string][]string, len(definitions))
 	nodes := 0
 	for index := range definitions {
@@ -333,7 +409,32 @@ func validateExpressionRecipes(definitions []ExpressionFieldDefinition, tables m
 	return validateDependencyCycles(dependencies, "expression field")
 }
 
-func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth int, nodes *int, tables map[string]*LogicalTableDefinition, expressionFields map[string]*ExpressionFieldDefinition, functions map[string]struct{}, dependencies *[]string) error {
+func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth int, nodes *int, tables map[string]*LogicalTableDefinition, expressionFields map[string]*ExpressionFieldDefinition, functions map[string]*FunctionCapabilityDefinition, dependencies *[]string) error {
+	context := expressionRecipeValidationContext{
+		ownerTable:           ownerTable,
+		tables:               tables,
+		expressionFields:     expressionFields,
+		functions:            functions,
+		dependencies:         dependencies,
+		allowFieldReferences: true,
+		allowPropertyLookups: true,
+	}
+	return validateExpressionRecipeWithContext(recipe, depth, nodes, context)
+}
+
+type expressionRecipeValidationContext struct {
+	ownerTable           string
+	tables               map[string]*LogicalTableDefinition
+	expressionFields     map[string]*ExpressionFieldDefinition
+	functions            map[string]*FunctionCapabilityDefinition
+	dependencies         *[]string
+	allowFieldReferences bool
+	allowPropertyLookups bool
+	arguments            map[ExpressionArgument]int
+	scopedTables         map[RelationshipJoinSide]string
+}
+
+func validateExpressionRecipeWithContext(recipe *ExpressionRecipe, depth int, nodes *int, context expressionRecipeValidationContext) error {
 	if depth > maxExpressionRecipeDepth {
 		return invalidSnapshot("expression recipe exceeds depth limit")
 	}
@@ -342,7 +443,16 @@ func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth
 		return invalidSnapshot("expression recipes exceed node limit")
 	}
 	payloads := 0
-	for _, present := range []bool{recipe.FieldReference != nil, recipe.Literal != nil, recipe.FunctionCall != nil, recipe.Operator != nil, recipe.Cast != nil} {
+	for _, present := range []bool{
+		recipe.FieldReference != nil,
+		recipe.Literal != nil,
+		recipe.FunctionCall != nil,
+		recipe.Operator != nil,
+		recipe.Cast != nil,
+		recipe.ArgumentReference != nil,
+		recipe.ScopedFieldReference != nil,
+		recipe.PropertyLookup != nil,
+	} {
 		if present {
 			payloads++
 		}
@@ -362,16 +472,21 @@ func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth
 		if err := validateDefinitionText(ref.Field, "field reference field"); err != nil {
 			return err
 		}
-		if canonicalName(ref.Table) != canonicalName(ownerTable) {
+		if !context.allowFieldReferences {
+			return invalidSnapshot("field reference is not valid in this recipe")
+		}
+		if canonicalName(ref.Table) != canonicalName(context.ownerTable) {
 			return invalidSnapshot("field reference crosses tables without a relationship path")
 		}
-		table := tables[canonicalName(ref.Table)]
+		table := context.tables[canonicalName(ref.Table)]
 		if table == nil {
 			return invalidSnapshot("field reference has unknown table")
 		}
 		key := expressionFieldKey(ref.Table, ref.Field)
-		if _, exists := expressionFields[key]; exists {
-			*dependencies = append(*dependencies, key)
+		if _, exists := context.expressionFields[key]; exists {
+			if context.dependencies != nil {
+				*context.dependencies = append(*context.dependencies, key)
+			}
 			return nil
 		}
 		if _, exists := fieldNames(table)[canonicalName(ref.Field)]; !exists {
@@ -390,14 +505,18 @@ func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth
 		if err := validateDefinitionText(call.Name, "function name"); err != nil {
 			return err
 		}
-		if _, exists := functions[canonicalName(call.Name)]; !exists {
+		function := context.functions[canonicalName(call.Name)]
+		if function == nil {
 			return invalidSnapshot("function call references an undeclared function")
 		}
 		if call.Arguments == nil {
 			return invalidSnapshot("function arguments are required")
 		}
+		if !functionAcceptsArity(function, len(call.Arguments)) {
+			return invalidSnapshot("function call has an unsupported argument count")
+		}
 		for index := range call.Arguments {
-			if err := validateExpressionRecipe(&call.Arguments[index], ownerTable, depth+1, nodes, tables, expressionFields, functions, dependencies); err != nil {
+			if err := validateExpressionRecipeWithContext(&call.Arguments[index], depth+1, nodes, context); err != nil {
 				return err
 			}
 		}
@@ -409,7 +528,7 @@ func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth
 			return invalidSnapshot("invalid OPERATOR recipe argument count")
 		}
 		for index := range recipe.Operator.Arguments {
-			if err := validateExpressionRecipe(&recipe.Operator.Arguments[index], ownerTable, depth+1, nodes, tables, expressionFields, functions, dependencies); err != nil {
+			if err := validateExpressionRecipeWithContext(&recipe.Operator.Arguments[index], depth+1, nodes, context); err != nil {
 				return err
 			}
 		}
@@ -420,9 +539,89 @@ func validateExpressionRecipe(recipe *ExpressionRecipe, ownerTable string, depth
 		if err := validateDefinitionText(recipe.Cast.TargetTypeSignature, "cast target type signature"); err != nil {
 			return err
 		}
-		return validateExpressionRecipe(recipe.Cast.Expression, ownerTable, depth+1, nodes, tables, expressionFields, functions, dependencies)
+		return validateExpressionRecipeWithContext(recipe.Cast.Expression, depth+1, nodes, context)
+	case ExpressionRecipeArgumentReference:
+		if recipe.ArgumentReference == nil || payloads != 1 || context.arguments == nil {
+			return invalidSnapshot("invalid ARGUMENT_REFERENCE recipe")
+		}
+		argument := recipe.ArgumentReference.Argument
+		if argument != ExpressionArgumentPropertySource && argument != ExpressionArgumentPropertyKey {
+			return invalidSnapshot("unknown recipe argument")
+		}
+		context.arguments[argument]++
+	case ExpressionRecipeScopedFieldReference:
+		if recipe.ScopedFieldReference == nil || payloads != 1 || context.scopedTables == nil {
+			return invalidSnapshot("invalid SCOPED_FIELD_REFERENCE recipe")
+		}
+		ref := recipe.ScopedFieldReference
+		if err := validateDefinitionText(ref.Field, "scoped field reference"); err != nil {
+			return err
+		}
+		tableName := context.scopedTables[ref.Side]
+		if tableName == "" {
+			return invalidSnapshot("unknown scoped field side")
+		}
+		if _, exists := semanticFieldNames(context.tables[canonicalName(tableName)], context.expressionFields)[canonicalName(ref.Field)]; !exists {
+			return invalidSnapshot("scoped field reference has unknown field")
+		}
+	case ExpressionRecipePropertyLookup:
+		if recipe.PropertyLookup == nil || payloads != 1 || !context.allowPropertyLookups {
+			return invalidSnapshot("invalid PROPERTY_LOOKUP recipe")
+		}
+		lookup := recipe.PropertyLookup
+		if lookup.Key == nil {
+			return invalidSnapshot("property lookup key is required")
+		}
+		if err := validateDefinitionText(lookup.Table, "property lookup table"); err != nil {
+			return err
+		}
+		if err := validateDefinitionText(lookup.Property, "property lookup name"); err != nil {
+			return err
+		}
+		if !recipeContextAllowsTable(context, lookup.Table) {
+			return invalidSnapshot("property lookup crosses tables without a declared scope")
+		}
+		table := context.tables[canonicalName(lookup.Table)]
+		if table == nil || findProperty(table, lookup.Property) == nil {
+			return invalidSnapshot("property lookup references an unknown property")
+		}
+		return validateExpressionRecipeWithContext(lookup.Key, depth+1, nodes, context)
 	default:
 		return invalidSnapshot("unknown expression recipe kind")
+	}
+	return nil
+}
+
+func recipeContextAllowsTable(context expressionRecipeValidationContext, table string) bool {
+	if canonicalName(table) == canonicalName(context.ownerTable) {
+		return true
+	}
+	for _, scopedTable := range context.scopedTables {
+		if canonicalName(table) == canonicalName(scopedTable) {
+			return true
+		}
+	}
+	return false
+}
+
+func semanticFieldNames(table *LogicalTableDefinition, expressionFields map[string]*ExpressionFieldDefinition) map[string]struct{} {
+	if table == nil {
+		return nil
+	}
+	fields := fieldNames(table)
+	for key, field := range expressionFields {
+		if strings.HasPrefix(key, canonicalName(table.Name)+".") {
+			fields[canonicalName(field.Name)] = struct{}{}
+		}
+	}
+	return fields
+}
+
+func findProperty(table *LogicalTableDefinition, name string) *PropertyDefinition {
+	for index := range table.Properties {
+		if canonicalName(table.Properties[index].Name) == canonicalName(name) {
+			return &table.Properties[index]
+		}
 	}
 	return nil
 }
@@ -441,7 +640,8 @@ func semanticOperatorArity(operator SemanticOperator) int {
 		SemanticOperatorGreaterThan,
 		SemanticOperatorGreaterThanOrEqual,
 		SemanticOperatorAnd,
-		SemanticOperatorOr:
+		SemanticOperatorOr,
+		SemanticOperatorSubscript:
 		return 2
 	case SemanticOperatorNot,
 		SemanticOperatorNegate,
@@ -497,8 +697,8 @@ func validateTypedLiteral(literal *TypedLiteral) error {
 	return nil
 }
 
-func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]struct{}, error) {
-	functions := make(map[string]struct{}, len(definitions))
+func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]*FunctionCapabilityDefinition, error) {
+	functions := make(map[string]*FunctionCapabilityDefinition, len(definitions))
 	for index := range definitions {
 		definition := &definitions[index]
 		if err := validateDefinitionText(definition.Name, "function name"); err != nil {
@@ -508,7 +708,7 @@ func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]s
 		if _, exists := functions[name]; exists {
 			return nil, invalidSnapshot("duplicate function %q", definition.Name)
 		}
-		functions[name] = struct{}{}
+		functions[name] = definition
 		if !slices.Contains(validFunctionKinds, definition.Kind) || !slices.Contains(validFunctionImplementations, definition.Implementation) {
 			return nil, invalidSnapshot("function %q has an unknown capability", definition.Name)
 		}
@@ -535,12 +735,30 @@ func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]s
 					return nil, err
 				}
 			}
+			if signature.Variadic && len(signature.ArgumentTypes) == 0 {
+				return nil, invalidSnapshot("function %q variadic signature must declare an argument", definition.Name)
+			}
 			if err := validateDefinitionText(signature.ReturnType, "function return type"); err != nil {
 				return nil, err
 			}
 		}
 	}
 	return functions, nil
+}
+
+func functionAcceptsArity(function *FunctionCapabilityDefinition, arity int) bool {
+	for _, signature := range function.Signatures {
+		if signature.Variadic {
+			if arity >= len(signature.ArgumentTypes)-1 {
+				return true
+			}
+			continue
+		}
+		if arity == len(signature.ArgumentTypes) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateModifiers(definitions []SemanticModifierDefault) error {
@@ -577,7 +795,7 @@ func validateModifiers(definitions []SemanticModifierDefault) error {
 	return nil
 }
 
-func validateRelations(snapshot *HogQLSemanticCatalogSnapshot, logicalTables map[string]*LogicalTableDefinition, expressionFields map[string]*ExpressionFieldDefinition) error {
+func validateRelations(snapshot *HogQLSemanticCatalogSnapshot, logicalTables map[string]*LogicalTableDefinition, expressionFields map[string]*ExpressionFieldDefinition) (map[string]*semanticRelation, error) {
 	relations := make(map[string]*semanticRelation, len(logicalTables)+len(snapshot.VirtualTables)+len(snapshot.SavedQueries)+len(snapshot.MaterializedViews))
 	for name, table := range logicalTables {
 		fields := fieldNames(table)
@@ -592,52 +810,56 @@ func validateRelations(snapshot *HogQLSemanticCatalogSnapshot, logicalTables map
 		definition := &snapshot.SavedQueries[index]
 		fields, err := validateReferencedRelation(definition.Name, definition.Fields)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := validateDefinitionText(definition.QueryID, "saved query ID"); err != nil {
-			return err
+			return nil, err
 		}
 		if err := addRelation(relations, definition.Name, RelationKindSavedQuery, fields, nil, definition); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for index := range snapshot.MaterializedViews {
 		definition := &snapshot.MaterializedViews[index]
 		fields, err := validateReferencedRelation(definition.Name, definition.Fields)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := normalizePhysicalQualifiedName(&definition.PhysicalView); err != nil {
-			return err
+			return nil, err
 		}
 		if definition.PhysicalView.Catalog != snapshot.Catalog {
-			return invalidSnapshot("materialized view %q physical catalog does not match snapshot catalog", definition.Name)
+			return nil, invalidSnapshot("materialized view %q physical catalog does not match snapshot catalog", definition.Name)
 		}
 		if err := addRelation(relations, definition.Name, RelationKindMaterializedView, fields, nil, nil); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for index := range snapshot.VirtualTables {
 		definition := &snapshot.VirtualTables[index]
 		if definition.Projections == nil {
-			return invalidSnapshot("virtual table %q projections are required", definition.Name)
+			return nil, invalidSnapshot("virtual table %q projections are required", definition.Name)
 		}
 		if err := addRelation(relations, definition.Name, RelationKindVirtualTable, nil, definition, nil); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	states := make(map[string]uint8, len(snapshot.VirtualTables)+len(snapshot.SavedQueries))
 	for index := range snapshot.VirtualTables {
 		if _, err := resolveSemanticRelation(canonicalName(snapshot.VirtualTables[index].Name), relations, states, 1); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	for index := range snapshot.SavedQueries {
 		if _, err := resolveSemanticRelation(canonicalName(snapshot.SavedQueries[index].Name), relations, states, 1); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return relations, nil
+}
+
+func semanticDefinitionCount(snapshot *HogQLSemanticCatalogSnapshot) int {
+	return len(snapshot.ExpressionFields) + len(snapshot.VirtualTables) + len(snapshot.SavedQueries) + len(snapshot.MaterializedViews) + len(snapshot.Functions) + len(snapshot.ModifierDefaults) + len(snapshot.LazyTables) + len(snapshot.Actions) + len(snapshot.Cohorts)
 }
 
 func validateReferencedRelation(name string, fields []ReferencedField) (map[string]struct{}, error) {
@@ -830,6 +1052,35 @@ func cloneSemanticMetadata(clone, snapshot *HogQLSemanticCatalogSnapshot) {
 	for index := range clone.ModifierDefaults {
 		clone.ModifierDefaults[index].SessionProperty = slices.Clone(snapshot.ModifierDefaults[index].SessionProperty)
 	}
+	clone.LazyTables = slices.Clone(snapshot.LazyTables)
+	for index := range clone.LazyTables {
+		clone.LazyTables[index].RelationshipPath = slices.Clone(snapshot.LazyTables[index].RelationshipPath)
+		clone.LazyTables[index].Projections = slices.Clone(snapshot.LazyTables[index].Projections)
+		for projectionIndex := range clone.LazyTables[index].Projections {
+			clone.LazyTables[index].Projections[projectionIndex].Recipe = cloneExpressionRecipe(snapshot.LazyTables[index].Projections[projectionIndex].Recipe)
+		}
+	}
+	clone.Actions = slices.Clone(snapshot.Actions)
+	for index := range clone.Actions {
+		clone.Actions[index].Representation = cloneSemanticEntityRepresentation(snapshot.Actions[index].Representation)
+	}
+	clone.Cohorts = slices.Clone(snapshot.Cohorts)
+	for index := range clone.Cohorts {
+		clone.Cohorts[index].Representation = cloneSemanticEntityRepresentation(snapshot.Cohorts[index].Representation)
+	}
+}
+
+func cloneSemanticEntityRepresentation(representation SemanticEntityRepresentation) SemanticEntityRepresentation {
+	clone := representation
+	if representation.Predicate != nil {
+		predicate := cloneExpressionRecipe(*representation.Predicate)
+		clone.Predicate = &predicate
+	}
+	if representation.Relation != nil {
+		relation := *representation.Relation
+		clone.Relation = &relation
+	}
+	return clone
 }
 
 func cloneExpressionRecipe(recipe ExpressionRecipe) ExpressionRecipe {
@@ -866,6 +1117,22 @@ func cloneExpressionRecipe(recipe ExpressionRecipe) ExpressionRecipe {
 		}
 		clone.Cast = &value
 	}
+	if recipe.ArgumentReference != nil {
+		value := *recipe.ArgumentReference
+		clone.ArgumentReference = &value
+	}
+	if recipe.ScopedFieldReference != nil {
+		value := *recipe.ScopedFieldReference
+		clone.ScopedFieldReference = &value
+	}
+	if recipe.PropertyLookup != nil {
+		value := *recipe.PropertyLookup
+		if recipe.PropertyLookup.Key != nil {
+			key := cloneExpressionRecipe(*recipe.PropertyLookup.Key)
+			value.Key = &key
+		}
+		clone.PropertyLookup = &value
+	}
 	return clone
 }
 
@@ -874,6 +1141,7 @@ var validSemanticOperators = []SemanticOperator{
 	SemanticOperatorEqual, SemanticOperatorNotEqual, SemanticOperatorLessThan, SemanticOperatorLessThanOrEqual,
 	SemanticOperatorGreaterThan, SemanticOperatorGreaterThanOrEqual, SemanticOperatorAnd, SemanticOperatorOr,
 	SemanticOperatorNot, SemanticOperatorNegate, SemanticOperatorIsNull, SemanticOperatorIsNotNull,
+	SemanticOperatorSubscript,
 }
 
 var validFunctionKinds = []FunctionKind{FunctionKindScalar, FunctionKindAggregate, FunctionKindWindow, FunctionKindTable}
