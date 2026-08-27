@@ -62,6 +62,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 270
     env:
+      SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
       WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
@@ -81,8 +82,6 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Scenario dev target selected
-        env:
-          SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}
         run: echo "Deploying an isolated Duckgres stack for $SCENARIO_NAME."
 
       - name: Set up Go
@@ -119,8 +118,6 @@ jobs:
         run: tests/mw-dev/run.sh deploy
 
       - name: Run selected scenario
-        env:
-          SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}
         run: tests/mw-dev/run.sh test-scenario
 
       - name: Publish scenario summary
