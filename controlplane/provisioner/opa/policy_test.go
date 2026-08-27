@@ -110,6 +110,15 @@ func buildInputWithGroups(user string, groups []string, operation string, resour
 	return in
 }
 
+// buildInputWithTarget adds the targetResource shape used by Trino's rename
+// checks. A rename is safe only when both the source and destination remain
+// inside a catalog owned by the requesting tenant.
+func buildInputWithTarget(user, operation string, resource, targetResource map[string]interface{}) map[string]interface{} {
+	in := buildInput(user, operation, resource)
+	in["action"].(map[string]interface{})["targetResource"] = targetResource
+	return in
+}
+
 func catalogResource(name string) map[string]interface{} {
 	return map[string]interface{}{
 		"catalog": map[string]interface{}{"name": name},
@@ -287,6 +296,160 @@ func TestTableScopeOps(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
+// Tenant writes: a customer has full DuckLake DDL/DML authority inside the
+// catalog projected for its org, and no write authority anywhere else.
+// Catalog management, permission management and materialized views remain
+// separate, denied surfaces.
+// --------------------------------------------------------------------------
+
+func TestTenantSchemaWritesOwnCatalogOnly(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	for _, op := range []string{"CreateSchema", "DropSchema"} {
+		t.Run(op+"/own", func(t *testing.T) {
+			if !evalAllow(t, q, buildInput("42", op, schemaResource("org_42", "analytics"))) {
+				t.Errorf("%s in the tenant's catalog must allow", op)
+			}
+		})
+		t.Run(op+"/other", func(t *testing.T) {
+			if evalAllow(t, q, buildInput("42", op, schemaResource("org_43", "analytics"))) {
+				t.Errorf("%s in another tenant's catalog must deny", op)
+			}
+		})
+		t.Run(op+"/unmanaged", func(t *testing.T) {
+			if evalAllow(t, q, buildInput("42", op, schemaResource("system", "runtime"))) {
+				t.Errorf("%s in an unmanaged catalog must deny", op)
+			}
+		})
+		t.Run(op+"/unknown-user", func(t *testing.T) {
+			if evalAllow(t, q, buildInput("99", op, schemaResource("org_42", "analytics"))) {
+				t.Errorf("%s by an unknown tenant must deny", op)
+			}
+		})
+		t.Run(op+"/admin", func(t *testing.T) {
+			if evalAllow(t, q, buildInput(AdminPrincipal, op, schemaResource("org_42", "analytics"))) {
+				t.Errorf("%s by the catalog-management admin must deny", op)
+			}
+		})
+		t.Run(op+"/admin-with-tenant-group", func(t *testing.T) {
+			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup, "org_42"}, op, schemaResource("org_42", "analytics"))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s by the admin must deny even with an accidental tenant-group claim", op)
+			}
+		})
+	}
+}
+
+func TestTenantTableAndViewWritesOwnCatalogOnly(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	writeOps := []string{
+		"CreateTable",
+		"DropTable",
+		"SetTableProperties",
+		"SetTableComment",
+		"SetColumnComment",
+		"AddColumn",
+		"AlterColumn",
+		"DropColumn",
+		"RenameColumn",
+		"InsertIntoTable",
+		"DeleteFromTable",
+		"TruncateTable",
+		"UpdateTableColumns",
+		"CreateView",
+		"SetViewComment",
+		"DropView",
+		"CreateViewWithSelectFromColumns",
+	}
+
+	for _, op := range writeOps {
+		t.Run(op+"/own", func(t *testing.T) {
+			if !evalAllow(t, q, buildInput("42", op, tableResource("org_42", "posthog", "events"))) {
+				t.Errorf("%s in the tenant's catalog must allow", op)
+			}
+		})
+		t.Run(op+"/other", func(t *testing.T) {
+			if evalAllow(t, q, buildInput("42", op, tableResource("org_43", "posthog", "events"))) {
+				t.Errorf("%s in another tenant's catalog must deny", op)
+			}
+		})
+		t.Run(op+"/unmanaged", func(t *testing.T) {
+			if evalAllow(t, q, buildInput("42", op, tableResource("system", "runtime", "queries"))) {
+				t.Errorf("%s in an unmanaged catalog must deny", op)
+			}
+		})
+		t.Run(op+"/unknown-user", func(t *testing.T) {
+			if evalAllow(t, q, buildInput("99", op, tableResource("org_42", "posthog", "events"))) {
+				t.Errorf("%s by an unknown tenant must deny", op)
+			}
+		})
+		t.Run(op+"/admin", func(t *testing.T) {
+			if evalAllow(t, q, buildInput(AdminPrincipal, op, tableResource("org_42", "posthog", "events"))) {
+				t.Errorf("%s by the catalog-management admin must deny", op)
+			}
+		})
+		t.Run(op+"/admin-with-tenant-group", func(t *testing.T) {
+			in := buildInputWithGroups(AdminPrincipal, []string{AdminGroup, "org_42"}, op, tableResource("org_42", "posthog", "events"))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s by the admin must deny even with an accidental tenant-group claim", op)
+			}
+		})
+	}
+}
+
+func TestTenantRenamesRequireOwnedSourceAndTarget(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	tests := []struct {
+		operation string
+		resource  func(catalog, name string) map[string]interface{}
+	}{
+		{"RenameSchema", func(catalog, name string) map[string]interface{} {
+			return schemaResource(catalog, name)
+		}},
+		{"RenameTable", func(catalog, name string) map[string]interface{} {
+			return tableResource(catalog, "posthog", name)
+		}},
+		{"RenameView", func(catalog, name string) map[string]interface{} {
+			return tableResource(catalog, "posthog", name)
+		}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.operation+"/inside-own-catalog", func(t *testing.T) {
+			in := buildInputWithTarget("42", tc.operation, tc.resource("org_42", "old"), tc.resource("org_42", "new"))
+			if !evalAllow(t, q, in) {
+				t.Errorf("%s inside the tenant's catalog must allow", tc.operation)
+			}
+		})
+		t.Run(tc.operation+"/target-other-catalog", func(t *testing.T) {
+			in := buildInputWithTarget("42", tc.operation, tc.resource("org_42", "old"), tc.resource("org_43", "new"))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s into another tenant's catalog must deny", tc.operation)
+			}
+		})
+		t.Run(tc.operation+"/source-other-catalog", func(t *testing.T) {
+			in := buildInputWithTarget("42", tc.operation, tc.resource("org_43", "old"), tc.resource("org_42", "new"))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s out of another tenant's catalog must deny", tc.operation)
+			}
+		})
+		t.Run(tc.operation+"/missing-target", func(t *testing.T) {
+			if evalAllow(t, q, buildInput("42", tc.operation, tc.resource("org_42", "old"))) {
+				t.Errorf("%s without targetResource must deny", tc.operation)
+			}
+		})
+		t.Run(tc.operation+"/admin", func(t *testing.T) {
+			in := buildInputWithTarget(AdminPrincipal, tc.operation, tc.resource("org_42", "old"), tc.resource("org_42", "new"))
+			if evalAllow(t, q, in) {
+				t.Errorf("%s by the catalog-management admin must deny", tc.operation)
+			}
+		})
+	}
+}
+
+// --------------------------------------------------------------------------
 // Session-property allowlist.
 // --------------------------------------------------------------------------
 
@@ -425,17 +588,14 @@ func TestDefaultDeny(t *testing.T) {
 		"ReadSystemInformation",
 		"KillQueryOwnedBy",
 		"ViewQueryOwnedBy",
-		"InsertIntoTable",
-		"DeleteFromTable",
-		"UpdateTableColumns",
-		"TruncateTable",
-		"CreateTable",
-		"DropTable",
-		"RenameTable",
-		"CreateSchema",
-		"DropSchema",
-		"CreateView",
-		"DropView",
+		"SetSchemaAuthorization",
+		"SetTableAuthorization",
+		"SetViewAuthorization",
+		"CreateMaterializedView",
+		"RefreshMaterializedView",
+		"SetMaterializedViewProperties",
+		"DropMaterializedView",
+		"RenameMaterializedView",
 		"SetCatalogSessionProperty",
 		"GrantSchemaPrivilege",
 		"DenySchemaPrivilege",

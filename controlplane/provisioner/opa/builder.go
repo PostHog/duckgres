@@ -20,7 +20,7 @@ var policyRego []byte
 // the revision on activation; bumping it on policy edits makes bundle
 // pushes visible in OPA logs. The build encoding (data hash) further
 // disambiguates bundles with the same revision but different data.
-const bundleRevision = "v1"
+const bundleRevision = "v2"
 
 // policyPath is the in-bundle path of policy.rego. The bundle library
 // requires .rego files to live under a path; the choice of name is
