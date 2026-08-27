@@ -6,7 +6,7 @@
 // function with a test in trino.test.ts.
 
 import type { BadgeProps } from "@/components/ui/badge";
-import type { TrinoNode, TrinoOrgStatus, TrinoQuery, TrinoStatus } from "@/types/api";
+import type { TrinoNode, TrinoNodeSource, TrinoOrgStatus, TrinoQuery, TrinoStatus } from "@/types/api";
 
 // Trino's terminal states, mirroring QueryState.isDone(). Everything else --
 // QUEUED, WAITING_FOR_RESOURCES, DISPATCHING, PLANNING, STARTING, RUNNING,
@@ -105,6 +105,11 @@ export function summarizeTrinoQueries(queries: TrinoQuery[]): TrinoQuerySummary 
 
 export interface TrinoNodeHealth {
   total: number;
+  // healthKnown=false means the cell reported membership only (the announce
+  // inventory), so failed/degraded/worstFailureRatio are zero because
+  // nothing was measured. A view that renders them as "all healthy" is
+  // making a claim the coordinator never made — check this first.
+  healthKnown: boolean;
   failed: number;
   // degraded counts nodes the coordinator still schedules onto but which
   // are losing heartbeats. They are the early warning the `failed` count
@@ -118,8 +123,21 @@ export interface TrinoNodeHealth {
 // point is to see trouble before the coordinator evicts the node.
 export const TRINO_DEGRADED_FAILURE_RATIO = 0.1;
 
-export function summarizeTrinoNodes(nodes: TrinoNode[]): TrinoNodeHealth {
-  const h: TrinoNodeHealth = { total: nodes.length, failed: 0, degraded: 0, worstFailureRatio: 0 };
+export function summarizeTrinoNodes(
+  nodes: TrinoNode[],
+  source: TrinoNodeSource | undefined = "failure_detector",
+): TrinoNodeHealth {
+  const healthKnown = source === "failure_detector";
+  const h: TrinoNodeHealth = {
+    total: nodes.length,
+    healthKnown,
+    failed: 0,
+    degraded: 0,
+    worstFailureRatio: 0,
+  };
+  // The announce inventory carries a URI and nothing else. Counting its
+  // zeroed heartbeat fields would manufacture a clean bill of health.
+  if (!healthKnown) return h;
   for (const n of nodes) {
     const ratio = n.recent_failure_ratio ?? 0;
     if (n.failed) {

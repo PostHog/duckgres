@@ -24,7 +24,14 @@ export function TrinoCluster() {
   const orgs = useTrinoOrgs();
   const orgLabels = useOrgLabels();
 
-  const nodeHealth = useMemo(() => summarizeTrinoNodes(nodes.data?.nodes ?? []), [nodes.data]);
+  // The nodes payload names its own inventory; status carries it too for
+  // the case where only the summary has loaded.
+  const nodeSource = nodes.data?.source ?? status.data?.node_source;
+  const announcedOnly = nodeSource === "announce";
+  const nodeHealth = useMemo(
+    () => summarizeTrinoNodes(nodes.data?.nodes ?? [], nodeSource),
+    [nodes.data, nodeSource],
+  );
   const orgRows = useMemo(() => orgs.data?.orgs ?? [], [orgs.data]);
   const needAttention = useMemo(() => trinoOrgsNeedingAttention(orgRows), [orgRows]);
   const reason = trinoUnavailableReason(status.data);
@@ -75,11 +82,21 @@ export function TrinoCluster() {
             label="Nodes"
             value={fmtInt(nodeHealth.total)}
             hint={
-              nodeHealth.failed > 0 || nodeHealth.degraded > 0
-                ? `${nodeHealth.failed} failed · ${nodeHealth.degraded} degraded`
-                : "all healthy"
+              !nodeHealth.healthKnown
+                ? "membership only"
+                : nodeHealth.failed > 0 || nodeHealth.degraded > 0
+                  ? `${nodeHealth.failed} failed · ${nodeHealth.degraded} degraded`
+                  : "all healthy"
             }
-            accent={nodeHealth.failed > 0 ? "destructive" : nodeHealth.degraded > 0 ? "warning" : "success"}
+            accent={
+              !nodeHealth.healthKnown
+                ? undefined
+                : nodeHealth.failed > 0
+                  ? "destructive"
+                  : nodeHealth.degraded > 0
+                    ? "warning"
+                    : "success"
+            }
             icon={<Network className="h-4 w-4" />}
           />
           <StatCard
@@ -180,20 +197,50 @@ export function TrinoCluster() {
           </CardHeader>
           <CardContent>
             {nodes.isLoading ? (
-              <TableSkeleton cols={5} />
+              <TableSkeleton cols={announcedOnly ? 1 : 5} />
             ) : status.data && !status.data.node_stats ? (
-              // Not the same as an empty fleet. Trino serves /v1/node only
-              // under discovery.type=AIRLIFT_DISCOVERY, and a cell on the
-              // default ANNOUNCE has no such endpoint to answer with.
+              // Not the same as an empty fleet: this cell serves neither
+              // /v1/node nor /v1/announce, so it cannot name its workers.
               <EmptyState
                 title="Nodes are not reported by this cell"
-                description="This coordinator does not serve /v1/node. Trino registers that endpoint only under discovery.type=AIRLIFT_DISCOVERY, and this cell uses the default. The cell is healthy; its fleet is simply not visible here."
+                description="This coordinator serves neither /v1/node nor /v1/announce, so its fleet cannot be listed. The cell is healthy; its membership is simply not visible here."
               />
             ) : (nodes.data?.nodes ?? []).length === 0 ? (
               <EmptyState
                 title="No nodes reported"
-                description="The coordinator's failure detector has not reported any peers."
+                description={
+                  announcedOnly
+                    ? "No worker has announced itself to this coordinator."
+                    : "The coordinator's failure detector has not reported any peers."
+                }
               />
+            ) : announcedOnly ? (
+              // Membership without health. The heartbeat columns are absent
+              // rather than zero-filled: a rendered "healthy" badge here
+              // would be the console's own invention, not the cell's report.
+              <>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Node</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {(nodes.data?.nodes ?? []).map((n) => (
+                      <TableRow key={n.uri}>
+                        <TableCell className="font-mono text-xs">{n.uri}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <p className="mt-3 text-[11px] text-muted-foreground">
+                  Membership from <code>/v1/announce</code>, which is what this cell serves under
+                  Trino&apos;s default <code>discovery.type=ANNOUNCE</code>. It lists the workers
+                  that have announced themselves and reports no per-node health; heartbeat
+                  detail needs <code>discovery.type=AIRLIFT_DISCOVERY</code>. Node liveness is
+                  visible on the Pods view.
+                </p>
+              </>
             ) : (
               <>
                 <Table>

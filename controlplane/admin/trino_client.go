@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -145,12 +146,18 @@ type TrinoServerInfo struct {
 	UptimeMS int64 `json:"uptime_ms"`
 }
 
-// TrinoNode is one entry of the coordinator's failure-detector view.
+// TrinoNode is one node of the cell as its coordinator describes it.
 //
-// `/v1/node` reports heartbeat health keyed by URI and carries NO node id
-// or version — worker version skew is not observable here. The console
-// derives that from the K8s pod projection (/cluster/pods) instead, which
-// reports each pod's running image.
+// Neither inventory Trino can serve carries a node id or a version, so
+// worker version skew is not observable here. The console derives that from
+// the K8s pod projection (/cluster/pods) instead, which reports each pod's
+// running image.
+//
+// Only the failure-detector inventory fills the heartbeat fields; under
+// ANNOUNCE every field but URI is a zero value that means "not reported",
+// NOT "reported as zero". Read TrinoNodeInventory.Source before showing
+// them — a rendered 0.0 failure ratio sourced from ANNOUNCE is a
+// fabricated health claim.
 type TrinoNode struct {
 	URI                string  `json:"uri"`
 	AgeMS              int64   `json:"age_ms"`
@@ -164,6 +171,39 @@ type TrinoNode struct {
 	Failed bool `json:"failed"`
 }
 
+// Which of Trino's two node inventories a TrinoNodeInventory came from.
+// They differ in detail, not just in route, so the source travels with the
+// data rather than being re-derived by each consumer.
+const (
+	// TrinoNodeSourceFailureDetector is `/v1/node`: per-node heartbeat
+	// health, plus the coordinator's own failed verdict. Bound only under
+	// discovery.type=AIRLIFT_DISCOVERY.
+	TrinoNodeSourceFailureDetector = "failure_detector"
+	// TrinoNodeSourceAnnounce is `/v1/announce`: the set of node URIs that
+	// have announced themselves. Bound under the ANNOUNCE and DNS
+	// inventories — ANNOUNCE being Trino's default and what these cells
+	// run. It answers "who is in the fleet" and nothing about their health.
+	TrinoNodeSourceAnnounce = "announce"
+)
+
+// TrinoNodeInventory is the fleet as this cell is able to describe it.
+//
+// Trino binds exactly one node-listing route depending on discovery.type,
+// and the two carry different detail. Returning the source alongside the
+// nodes is what lets the console show membership from a cell that cannot
+// report health, instead of showing nothing (which reads as an empty
+// cluster) or showing zeros (which reads as a perfectly healthy one).
+type TrinoNodeInventory struct {
+	Source string      `json:"source"`
+	Nodes  []TrinoNode `json:"nodes"`
+}
+
+// HasHealth reports whether the entries carry the heartbeat fields. False
+// means URI is the only meaningful field on every node.
+func (i TrinoNodeInventory) HasHealth() bool {
+	return i.Source == TrinoNodeSourceFailureDetector
+}
+
 // TrinoCoordinatorClient is the narrow read surface the console needs.
 // An interface so handler tests can drive them without an HTTP server and
 // so a coordinator outage is a substitutable condition.
@@ -171,7 +211,7 @@ type TrinoCoordinatorClient interface {
 	Queries(ctx context.Context) ([]TrinoQuery, error)
 	Query(ctx context.Context, queryID string) (*TrinoQuery, error)
 	KillQuery(ctx context.Context, queryID, message string) error
-	Nodes(ctx context.Context) ([]TrinoNode, error)
+	Nodes(ctx context.Context) (TrinoNodeInventory, error)
 	ServerInfo(ctx context.Context) (*TrinoServerInfo, error)
 }
 
@@ -430,14 +470,20 @@ type trinoNodeStats struct {
 // applied here: the failure detector's verdict is what determines whether
 // a node receives splits, and a second opinion computed in the console
 // would disagree with the engine exactly when it matters.
-func (c *trinoCoordinatorHTTPClient) Nodes(ctx context.Context) ([]TrinoNode, error) {
+func (c *trinoCoordinatorHTTPClient) Nodes(ctx context.Context) (TrinoNodeInventory, error) {
 	raw, err := c.do(ctx, http.MethodGet, "/v1/node", nil)
 	if err != nil {
-		return nil, err
+		// A cell on the default discovery.type does not bind /v1/node at
+		// all. It does bind /v1/announce, so fall back to membership
+		// rather than reporting a fleet we simply asked for the wrong way.
+		if isTrinoEndpointUnavailable(err) {
+			return c.announcedNodes(ctx)
+		}
+		return TrinoNodeInventory{}, err
 	}
 	var wire []trinoNodeStats
 	if err := json.Unmarshal(raw, &wire); err != nil {
-		return nil, fmt.Errorf("decode node list: %w", err)
+		return TrinoNodeInventory{}, fmt.Errorf("decode node list: %w", err)
 	}
 
 	failed := map[string]bool{}
@@ -462,7 +508,39 @@ func (c *trinoCoordinatorHTTPClient) Nodes(ctx context.Context) ([]TrinoNode, er
 			Failed:             failed[n.URI],
 		})
 	}
-	return out, nil
+	return TrinoNodeInventory{Source: TrinoNodeSourceFailureDetector, Nodes: out}, nil
+}
+
+// announcedNodes reads the ANNOUNCE inventory: the set of node URIs that
+// have announced themselves to this coordinator.
+//
+// `GET /v1/announce` is bound by AnnounceNodeInventoryModule and
+// DnsNodeInventoryModule — i.e. for every discovery.type except the one
+// that binds /v1/node — so between them the console can name the fleet of
+// any cell. It carries membership only: no heartbeat, no age, no failed
+// verdict, which is why the inventory records where it came from.
+//
+// It is declared @ResourceSecurity(MANAGEMENT_READ), the same access type
+// as /v1/node, so the observer's existing ReadSystemInformation grant
+// already covers it. This needs no change to policy.rego.
+func (c *trinoCoordinatorHTTPClient) announcedNodes(ctx context.Context) (TrinoNodeInventory, error) {
+	raw, err := c.do(ctx, http.MethodGet, "/v1/announce", nil)
+	if err != nil {
+		return TrinoNodeInventory{}, err
+	}
+	var uris []string
+	if err := json.Unmarshal(raw, &uris); err != nil {
+		return TrinoNodeInventory{}, fmt.Errorf("decode announced node list: %w", err)
+	}
+	// The wire type is a Set<URI>, so the order is whatever the coordinator's
+	// hash iteration produced. Sort it: without this the console reshuffles
+	// its node rows on every poll.
+	sort.Strings(uris)
+	out := make([]TrinoNode, 0, len(uris))
+	for _, u := range uris {
+		out = append(out, TrinoNode{URI: u})
+	}
+	return TrinoNodeInventory{Source: TrinoNodeSourceAnnounce, Nodes: out}, nil
 }
 
 type trinoServerInfoWire struct {

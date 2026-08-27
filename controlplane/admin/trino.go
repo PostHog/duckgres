@@ -96,12 +96,17 @@ type TrinoStatus struct {
 	// than one that is busy.
 	BlockedQueries int `json:"blocked_queries"`
 
-	// NodeStats reports whether Nodes and FailedNodes mean anything. A cell
-	// using Trino's default discovery.type=ANNOUNCE does not serve /v1/node,
-	// so the console must show "not reported here" rather than zero nodes.
-	NodeStats   bool `json:"node_stats"`
-	Nodes       int  `json:"nodes"`
-	FailedNodes int  `json:"failed_nodes"`
+	// NodeStats reports whether Nodes means anything: false when the cell
+	// serves neither node inventory, so the console shows "not reported
+	// here" rather than an authoritative zero.
+	NodeStats bool `json:"node_stats"`
+	// NodeSource names the inventory Nodes was counted from. Under
+	// TrinoNodeSourceAnnounce the cell reports membership without health,
+	// so FailedNodes is always 0 because nothing is measured — not because
+	// the fleet is known to be well. The SPA must not render it as health.
+	NodeSource  string `json:"node_source,omitempty"`
+	Nodes       int    `json:"nodes"`
+	FailedNodes int    `json:"failed_nodes"`
 
 	// OrgsByState counts Trino-enabled orgs by provisioning state, so a
 	// stuck tenant is visible without opening the org list.
@@ -167,7 +172,7 @@ type TrinoAPI struct {
 	orgs    TrinoOrgStore
 	audit   *AuditStore
 	queries *trinoCache[[]TrinoQuery]
-	nodes   *trinoCache[[]TrinoNode]
+	nodes   *trinoCache[TrinoNodeInventory]
 	info    *trinoCache[*TrinoServerInfo]
 }
 
@@ -184,7 +189,7 @@ func NewTrinoAPI(cell TrinoCell, client TrinoCoordinatorClient, orgs TrinoOrgSto
 		orgs:    orgs,
 		audit:   audit,
 		queries: newTrinoCache[[]TrinoQuery](trinoQueriesCacheTTL),
-		nodes:   newTrinoCache[[]TrinoNode](trinoClusterCacheTTL),
+		nodes:   newTrinoCache[TrinoNodeInventory](trinoClusterCacheTTL),
 		info:    newTrinoCache[*TrinoServerInfo](trinoClusterCacheTTL),
 	}
 }
@@ -311,16 +316,23 @@ func (a *TrinoAPI) handleStatus(c *gin.Context) {
 		}
 	}
 
-	// Node stats are best-effort. A cell built with the default
-	// discovery.type=ANNOUNCE does not serve /v1/node at all, and a healthy
-	// cell must not be reported as down because an endpoint it never had is
-	// missing. Any other error still counts against the cell.
-	if nodes, nodeErr := a.nodes.get(ctx, a.client.Nodes); nodeErr == nil {
+	// Node stats are best-effort. The client already falls back from
+	// /v1/node to /v1/announce, so reaching the unavailable branch means the
+	// cell serves neither inventory. A healthy cell must not be reported as
+	// down because an endpoint it never had is missing; any other error
+	// still counts against the cell.
+	if inv, nodeErr := a.nodes.get(ctx, a.client.Nodes); nodeErr == nil {
 		status.NodeStats = true
-		status.Nodes = len(nodes)
-		for _, n := range nodes {
-			if n.Failed {
-				status.FailedNodes++
+		status.NodeSource = inv.Source
+		status.Nodes = len(inv.Nodes)
+		// Only the failure detector measures this. Under ANNOUNCE every
+		// Failed is false because nothing was measured, and the SPA keys
+		// off NodeSource rather than reading 0 as "all healthy".
+		if inv.HasHealth() {
+			for _, n := range inv.Nodes {
+				if n.Failed {
+					status.FailedNodes++
+				}
 			}
 		}
 	} else if isTrinoEndpointUnavailable(nodeErr) {
@@ -487,15 +499,15 @@ func (a *TrinoAPI) handleKillQuery(c *gin.Context) {
 }
 
 func (a *TrinoAPI) handleNodes(c *gin.Context) {
-	nodes, err := a.nodes.get(c.Request.Context(), a.client.Nodes)
+	inv, err := a.nodes.get(c.Request.Context(), a.client.Nodes)
 	if isTrinoEndpointUnavailable(err) {
-		// Not a gateway failure: the coordinator answered, and it does not
-		// serve this route. 501 says the console asked for something this
-		// cell cannot provide, which is what an operator needs to know.
+		// Not a gateway failure: the coordinator answered, and it serves
+		// neither node inventory. 501 says the console asked for something
+		// this cell cannot provide, which is what an operator needs to know.
 		c.JSON(http.StatusNotImplemented, gin.H{
 			"cell":      a.cell,
 			"available": false,
-			"reason":    "this cell does not serve /v1/node; Trino binds it only under discovery.type=AIRLIFT_DISCOVERY",
+			"reason":    "this cell serves neither /v1/node nor /v1/announce, so its fleet cannot be listed",
 		})
 		return
 	}
@@ -503,7 +515,12 @@ func (a *TrinoAPI) handleNodes(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error(), "available": false})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"cell": a.cell, "available": true, "nodes": nodes})
+	c.JSON(http.StatusOK, gin.H{
+		"cell":      a.cell,
+		"available": true,
+		"source":    inv.Source,
+		"nodes":     inv.Nodes,
+	})
 }
 
 func (a *TrinoAPI) handleOrgs(c *gin.Context) {

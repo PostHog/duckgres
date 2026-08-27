@@ -26,6 +26,7 @@ type fakeTrinoCoordinator struct {
 	queryByID   map[string]TrinoQuery
 	queryErr    error
 	nodes       []TrinoNode
+	nodeSource  string
 	nodesErr    error
 	info        *TrinoServerInfo
 	infoErr     error
@@ -62,8 +63,14 @@ func (f *fakeTrinoCoordinator) KillQuery(_ context.Context, id, message string) 
 	return nil
 }
 
-func (f *fakeTrinoCoordinator) Nodes(context.Context) ([]TrinoNode, error) {
-	return f.nodes, f.nodesErr
+func (f *fakeTrinoCoordinator) Nodes(context.Context) (TrinoNodeInventory, error) {
+	// Default to the failure detector so the existing cases keep describing
+	// an AIRLIFT_DISCOVERY cell; the ANNOUNCE cases set nodeSource.
+	source := f.nodeSource
+	if source == "" {
+		source = TrinoNodeSourceFailureDetector
+	}
+	return TrinoNodeInventory{Source: source, Nodes: f.nodes}, f.nodesErr
 }
 
 func (f *fakeTrinoCoordinator) ServerInfo(context.Context) (*TrinoServerInfo, error) {
@@ -641,5 +648,59 @@ func TestTrinoRoutesUnregisteredWithoutACell(t *testing.T) {
 	e.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/trino/status", nil))
 	if w.Code != http.StatusNotFound {
 		t.Errorf("expected 404 with no Trino cell wired, got %d", w.Code)
+	}
+}
+
+// A cell on Trino's default discovery.type reports membership through
+// /v1/announce and no health at all. The status payload must name that
+// source, and must not turn "nothing was measured" into "nothing is wrong":
+// FailedNodes stays 0 because the field is meaningless, and the SPA keys off
+// node_source rather than reading that 0 as a healthy fleet.
+func TestStatusNamesTheAnnounceInventoryAndClaimsNoHealth(t *testing.T) {
+	coord := &fakeTrinoCoordinator{
+		info:       &TrinoServerInfo{Version: "476", Environment: "mw"},
+		nodeSource: TrinoNodeSourceAnnounce,
+		// Failed is set to prove the handler ignores it for this source
+		// rather than merely relying on the client to zero it.
+		nodes: []TrinoNode{{URI: "http://a"}, {URI: "http://b", Failed: true}},
+	}
+	r := trinoTestRouter(testTrinoAPI(t, coord, twoOrgTrinoStore()), RoleViewer)
+
+	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/trino/status", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if body["available"] != true || body["node_stats"] != true {
+		t.Fatalf("an announce-only cell is still available and still reports nodes, body: %v", body)
+	}
+	if body["node_source"] != TrinoNodeSourceAnnounce {
+		t.Errorf("node_source = %v, want %q", body["node_source"], TrinoNodeSourceAnnounce)
+	}
+	if body["nodes"] != float64(2) {
+		t.Errorf("nodes = %v, want 2", body["nodes"])
+	}
+	if body["failed_nodes"] != float64(0) {
+		t.Errorf("failed_nodes = %v; the announce inventory measures no health, so it must not be counted", body["failed_nodes"])
+	}
+}
+
+// The nodes route tells the SPA which inventory answered, so it can render
+// membership-only rows instead of zero-filled health columns.
+func TestNodesRouteReportsItsSource(t *testing.T) {
+	coord := &fakeTrinoCoordinator{
+		nodeSource: TrinoNodeSourceAnnounce,
+		nodes:      []TrinoNode{{URI: "http://a"}},
+	}
+	r := trinoTestRouter(testTrinoAPI(t, coord, twoOrgTrinoStore()), RoleViewer)
+
+	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/trino/nodes", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if body["source"] != TrinoNodeSourceAnnounce {
+		t.Errorf("source = %v, want %q", body["source"], TrinoNodeSourceAnnounce)
+	}
+	if got := body["nodes"].([]any); len(got) != 1 {
+		t.Errorf("nodes = %v, want 1 entry", got)
 	}
 }

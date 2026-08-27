@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 )
@@ -297,9 +298,11 @@ func TestCoordinatorClientGoneQueryIsNotFound(t *testing.T) {
 }
 
 // TestCoordinatorClientMissingRouteIsEndpointUnavailable: a coordinator
-// built with Trino's default discovery.type=ANNOUNCE does not bind
-// NodeResource, so /v1/node answers 404. The cell is healthy and must not be
-// reported as one that never answered.
+// A cell that serves NEITHER node inventory still must not read as a cell
+// that never answered. /v1/node is bound only under AIRLIFT_DISCOVERY and
+// /v1/announce only under ANNOUNCE/DNS, so in practice one of them is always
+// present; this pins the behaviour for the case where the fallback also
+// 404s, which is a statement about how the cell is built, not its health.
 func TestCoordinatorClientMissingRouteIsEndpointUnavailable(t *testing.T) {
 	c, _ := newTrinoTestCoordinator(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -380,15 +383,18 @@ func TestCoordinatorClientNodes(t *testing.T) {
 		]`))
 	})
 
-	nodes, err := c.Nodes(context.Background())
+	inv, err := c.Nodes(context.Background())
 	if err != nil {
 		t.Fatalf("Nodes: %v", err)
 	}
-	if len(nodes) != 2 {
-		t.Fatalf("expected 2 nodes, got %d", len(nodes))
+	if inv.Source != TrinoNodeSourceFailureDetector || !inv.HasHealth() {
+		t.Fatalf("a cell serving /v1/node reports failure-detector health, got source %q", inv.Source)
+	}
+	if len(inv.Nodes) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(inv.Nodes))
 	}
 	byURI := map[string]TrinoNode{}
-	for _, n := range nodes {
+	for _, n := range inv.Nodes {
 		byURI[n.URI] = n
 	}
 	healthy := byURI["http://10.0.0.1:8080"]
@@ -400,5 +406,73 @@ func TestCoordinatorClientNodes(t *testing.T) {
 	}
 	if !byURI["http://10.0.0.2:8080"].Failed {
 		t.Error("the node listed under /v1/node/failed must be flagged failed")
+	}
+}
+
+// The cells in production run Trino's default discovery.type=ANNOUNCE, which
+// binds /v1/announce and not /v1/node. Listing the fleet from the inventory
+// the cell actually serves is the difference between the console naming the
+// workers and the console showing an operator nothing at all.
+func TestNodesFallBackToTheAnnounceInventory(t *testing.T) {
+	c, rec := newTrinoTestCoordinator(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/node" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Set<URI> serializes unordered; return it worst-case out of order.
+		_, _ = w.Write([]byte(`["http://10.0.0.9:8080","http://10.0.0.1:8080"]`))
+	})
+
+	inv, err := c.Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("Nodes: %v", err)
+	}
+	if inv.Source != TrinoNodeSourceAnnounce {
+		t.Errorf("source = %q, want %q", inv.Source, TrinoNodeSourceAnnounce)
+	}
+	// The announce inventory carries membership only. Claiming health here
+	// would render a 0.0 failure ratio the coordinator never measured.
+	if inv.HasHealth() {
+		t.Error("the announce inventory must not claim to carry health")
+	}
+	got := []string{}
+	for _, n := range inv.Nodes {
+		got = append(got, n.URI)
+		if n.Failed || n.AgeMS != 0 || n.RecentFailureRatio != 0 {
+			t.Errorf("announced node %s carries unmeasured health fields: %+v", n.URI, n)
+		}
+	}
+	// Sorted, so the console does not reshuffle its rows between polls.
+	want := []string{"http://10.0.0.1:8080", "http://10.0.0.9:8080"}
+	if !slices.Equal(got, want) {
+		t.Errorf("nodes = %v, want %v (sorted)", got, want)
+	}
+
+	var paths []string
+	for _, r := range rec.requests {
+		paths = append(paths, r.URL.Path)
+	}
+	if !slices.Contains(paths, "/v1/node") || !slices.Contains(paths, "/v1/announce") {
+		t.Errorf("expected /v1/node to be tried before /v1/announce, got %v", paths)
+	}
+}
+
+// A cell that serves /v1/node must not also be asked for /v1/announce: the
+// fallback exists for the cells that lack the first route, and a per-poll
+// extra request against every coordinator is a cost paid for nothing.
+func TestNodesDoNotQueryAnnounceWhenTheFailureDetectorAnswers(t *testing.T) {
+	_, rec := newTrinoTestCoordinator(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"uri":"http://10.0.0.1:8080","age":"1.00h"}]`))
+	})
+	c := newTrinoCoordinatorClient(rec.server.URL, "obs-password", "")
+	if _, err := c.Nodes(context.Background()); err != nil {
+		t.Fatalf("Nodes: %v", err)
+	}
+	for _, r := range rec.requests {
+		if r.URL.Path == "/v1/announce" {
+			t.Error("/v1/announce must not be queried when /v1/node answers")
+		}
 	}
 }
