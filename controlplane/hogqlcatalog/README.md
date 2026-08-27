@@ -43,8 +43,13 @@ empty or noncanonical type-signature text fail before a snapshot can be
 published. Full Trino type syntax is parsed by the Trino consumer; this boundary
 preserves the provider's exact signature rather than approximating it. This
 package does not synthesize tables when DuckLake metadata is unavailable. The
-control plane still needs a production provider backed by the tenant metadata
-store; the current HTTP publisher accepts already assembled snapshots.
+Trino catalog HTTP client implements this provider by calling the authenticated,
+versioned coordinator endpoint with the provisioner's existing rotated admin
+Basic credential. The adapter strictly decodes the response, preserves original
+connector ordinals after visibility filtering, and rejects protocol, schema,
+catalog, or visibility inconsistencies before translation. The current HTTP
+publisher still accepts already assembled snapshots; wiring refresh publication
+to the per-tenant reconcile lifecycle remains separate from the transport.
 
 ## API
 
