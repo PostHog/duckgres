@@ -78,6 +78,13 @@ Added for the console:
 | `GET /api/v1/orgs/:id/monitoring/series` | internal secret | Customer-safe, org-forced Prometheus range query. Requires an allow-listed `metric`; `window` is one of `1h`, `6h`, `24h` (default), `7d`, `30d` |
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
 | `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
+| `GET /api/v1/trino/status` | viewer | Trino cell overview: cell id, coordinator `/v1/info` (version, environment, uptime, starting), query counts by state, blocked-query count, node/failed-node counts, and Trino-enabled orgs by provisioning state. `available:false` + `error` when the coordinator can't be read — the provisioning half still comes from the config store, so "the cell is down" and "these tenants never provisioned" stay distinguishable |
+| `GET /api/v1/trino/queries` | viewer | live queries, `?org=&state=&active=1` slicing, longest-running first. SQL is redacted server-side; each row is stamped with the duckgres org resolved from the Trino principal |
+| `GET /api/v1/trino/queries/:id` | viewer | one query; 404 when the coordinator has aged it out (410 Gone upstream) |
+| `POST /api/v1/trino/queries/:id/kill` | admin | fail a query with a reason (`PUT /v1/query/{id}/killed`). The reason reaches the TENANT as the query's error message. Audited as `trino.query.kill` with the owning org |
+| `GET /api/v1/trino/nodes` | viewer | the coordinator's failure-detector view (`/v1/node` + `/v1/node/failed`) |
+| `GET /api/v1/trino/orgs` | viewer | per-org Trino provisioning state + that org's live query counts |
+| `GET /api/v1/orgs/:id/trino` | viewer | one org's Trino state; `enabled:false` for an org with no Trino row (not an error) |
 | `GET /api/v1/audit` | admin | admin action log |
 | `GET /api/v1/operators` | admin | list console operators (email → role) |
 | `POST /api/v1/operators` | admin | add/update an operator (`{email, role}`; last-admin demotion → 409) |
@@ -153,6 +160,61 @@ The series endpoint accepts only `query_rate`, `error_ratio`, `duration_p50`,
 Prometheus response and retains only the `status`, `reason`, or `source` labels needed by
 the corresponding chart. Unknown metrics and windows return 400; unknown orgs
 return 404 with `code: "managed_warehouse_not_found"` before Prometheus is called.
+
+### Trino cell views (`trino.go` + `trino_client.go`)
+
+The console observes the shared Trino cell through the coordinator's REST
+API, as a dedicated **observer principal** (`opa.ObserverPrincipal` =
+`__duckgres_observer`) that the provisioner mints alongside the admin pair
+and projects into `password.db` / `group.db`.
+
+- **Why a second principal.** Trino routes operator reads through the same
+  access-control SPI as everything else — `GET /v1/query` filters through
+  `FilterViewQueryOwnedBy`, `/v1/query/{id}` is gated on `ViewQueryOwnedBy`,
+  kill on `KillQueryOwnedBy`, and `/v1/node` + `/v1/resourceGroupState` are
+  `MANAGEMENT_READ` (`checkCanReadSystemInformation`). A console credential
+  with no grant sees an empty cluster. Note that `ReadSystemInformation` is
+  a single operation gating *every* `MANAGEMENT_READ` resource — also
+  `/v1/thread`, `/v1/announce` (GET), `/v1/maxActiveSplits` and
+  `/v1/integrations/gateway`. All are GETs of cluster-operational state and
+  none reads a catalog, a table or SQL text; the node-registering POST on
+  `/v1/announce` is `INTERNAL_ONLY`. The enumeration lives in policy.rego so
+  the real blast radius is visible where the grant is written. The grant is deliberately NOT added
+  to `__admin_provisioner`: that credential can CREATE/DROP catalogs and by
+  policy sees only its own queries, while the observer sees every tenant's
+  query metadata and holds **no catalog at all** (no entry in
+  `data.group_catalogs`; the observer group is excluded from
+  `tenant_owns_catalog` and from the same-org query match). One leaked
+  credential yields one half of that authority, never both.
+- **SQL text is redacted at decode** (`usersecrets.RedactForLog`, in
+  `toTrinoQuery`), not per-caller, so no handler can leak it by forgetting.
+  Query text is tenant data: table names, filter literals, customer
+  identifiers, and a failed `CREATE SECRET` carries a credential.
+- **Airlift units are STRINGS on the wire.** `io.airlift.units.Duration`
+  serializes as `"%.2f<unit>"` (`"12.34ms"`, `"1.50s"`) and `DataSize` as an
+  exact byte count with a `B` suffix (`"1234B"`). Decoding either into a
+  numeric Go field silently yields a page of zeroes — hence
+  `parseAirliftDurationMS` / `parseAirliftDataSizeBytes`, both of which
+  return 0 rather than failing so a unit-spelling change costs one column,
+  not the operator's whole view.
+- **Reads are cached** (2s for queries, 15s for nodes/info) because the
+  console polls from every open tab and `/v1/query` walks every query the
+  coordinator holds. A refresh in flight does not block readers — they get
+  the previous value — so a slow coordinator can't turn N polling tabs into
+  N stuck requests during the incident the console exists for.
+- **Both sides of the console tag `X-Trino-Source`**
+  (`duckgres-admin` here, `duckgres-provisioner` in the reconcile loop), so
+  control-plane traffic is distinguishable from tenant SQL in
+  `system.runtime.queries` and in the console's own live view.
+- `/v1/node` reports heartbeat health keyed by URI and carries **no node id
+  or version**, so worker version skew is not observable there; the Nodes
+  page's pod projection (running images) is where that lives.
+- No cell configured (`DUCKGRES_TRINO_COORDINATOR_URL` unset) leaves every
+  route unregistered, and the SPA renders a "no cell" state off the 404.
+
+Touching this → update `trino_test.go`, `trino_client_test.go`,
+`ui/src/lib/trino.test.ts`, `ui/src/pages/TrinoQueries.test.tsx`, and
+`ui/src/pages/OrgTrinoCard.test.tsx`.
 
 ## Local UI development
 

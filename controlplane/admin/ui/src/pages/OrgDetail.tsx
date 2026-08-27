@@ -28,6 +28,7 @@ import { ducklingBroken, ducklingEntryFor, fmtTime, orgLabel } from "@/lib/forma
 import { CopyButton } from "@/components/CopyButton";
 import { ShardBadge } from "@/components/ShardBadge";
 import { OrgUsageSection } from "@/pages/OrgUsage";
+import { OrgTrinoCard } from "@/pages/OrgTrinoCard";
 import {
   useDatabaseNameAvailable,
   useDeleteOrg,
@@ -398,6 +399,7 @@ export function OrgDetail() {
           <WarehousePanel orgId={id} data={warehouse.data ?? null} loading={warehouse.isLoading} error={warehouse.error} />
         </div>
         <OrgUsageSection orgId={id} />
+        <OrgTrinoCard orgId={id} />
         <OrgTeamsCard orgId={id} />
       </PageBody>
 

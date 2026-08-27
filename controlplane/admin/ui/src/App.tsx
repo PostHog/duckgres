@@ -17,6 +17,8 @@ import { Errors } from "@/pages/Errors";
 import { Nodes } from "@/pages/Nodes";
 import { Workers } from "@/pages/Workers";
 import { Metrics } from "@/pages/Metrics";
+import { TrinoCluster } from "@/pages/TrinoCluster";
+import { TrinoQueries } from "@/pages/TrinoQueries";
 import { Usage } from "@/pages/Usage";
 import { ConfigStore } from "@/pages/ConfigStore";
 import { Impersonate } from "@/pages/Impersonate";
@@ -47,6 +49,8 @@ export default function App() {
         <Route path="/nodes" element={<Nodes />} />
         <Route path="/workers" element={<Workers />} />
         <Route path="/metrics" element={<Metrics />} />
+        <Route path="/trino" element={<TrinoCluster />} />
+        <Route path="/trino/queries" element={<TrinoQueries />} />
         <Route path="/usage" element={<Usage />} />
         <Route path="/configstore" element={<ConfigStore />} />
         <Route path="/impersonate" element={<Impersonate />} />

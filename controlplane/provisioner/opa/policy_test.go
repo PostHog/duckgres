@@ -75,6 +75,9 @@ func groupsFor(user string) []string {
 	if user == AdminPrincipal {
 		return []string{AdminGroup}
 	}
+	if user == ObserverPrincipal {
+		return []string{ObserverGroup}
+	}
 	if user == "" {
 		return nil
 	}
@@ -863,19 +866,18 @@ func TestIsolationMatrix(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// Batched OPA shape: the policy is the NON-BATCHED contract. Trino's
-// batched access control (OpaBatchAccessControl, behind
-// `opa.policy.batched-uri`) sends candidates under `action.filterResources`
-// (plural list), not `action.resource` (singular object). Our filter rules
-// read `action.resource.*`, so under the batched shape they all fail their
-// body and fall through to default-deny. That's fail-closed -- safe by the
-// threat model -- but it means enabling batched mode in the chart silently
-// denies every filter query.
+// Batched OPA shape. Trino's batched access control (OpaBatchAccessControl,
+// behind `opa.policy.batched-uri`) sends candidates under
+// `action.filterResources` (plural list), not `action.resource` (singular
+// object), and expects the allowed INDICES back. The policy answers BOTH
+// shapes: `allow` is the non-batched contract, `batch` the batched one, and
+// each `batch` rule applies the same authorization predicate its `allow`
+// counterpart uses so the two cannot drift.
 //
-// This test locks in the fail-closed behaviour: if someone later extends
-// the policy to support batched decisions, this test must be updated
-// deliberately (and the new batched contract reviewed for cross-tenant
-// safety). Default-deny is the floor.
+// `allow` must still deny a batched-shaped input outright -- its rules read
+// `action.resource`, which the batched shape does not carry. That is the
+// fail-closed floor, asserted below, and it is what makes a missing `batch`
+// rule show up as "nobody sees anything" rather than as a silent allow.
 // --------------------------------------------------------------------------
 
 // preparedBatch compiles the policy for the batched entrypoint.
@@ -1404,12 +1406,12 @@ func TestQueryVisibilityGroupWithNoCatalogs(t *testing.T) {
 	}
 }
 
-// TestQueryVisibilityBatchedInputDeniesByDefault extends the batched-shape
-// regression guard to the query-ownership ops. Under
-// `opa.policy.batched-uri`, FilterViewQueryOwnedBy candidates arrive under
-// action.filterResources (plural) and action.resource is absent, so the
-// rules fail their body and fall through to default-deny. Fail-closed is
-// the floor; enabling batched mode still requires extending the policy.
+// TestQueryVisibilityBatchedInputDeniesByDefault pins the fail-closed floor
+// for the SCALAR entrypoint: under `opa.policy.batched-uri`,
+// FilterViewQueryOwnedBy candidates arrive under action.filterResources
+// (plural) and action.resource is absent, so every `allow` rule fails its
+// body. `allow` must never answer a batched input -- the batched answer is
+// `batch`, exercised by TestBatchedQueryFilteringMatchesNonBatched below.
 func TestQueryVisibilityBatchedInputDeniesByDefault(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 
@@ -1469,4 +1471,260 @@ func stripRegoComments(src string) string {
 		out.WriteByte('\n')
 	}
 	return out.String()
+}
+
+// --------------------------------------------------------------------------
+// Observer principal: the admin console's read-only cluster-wide query
+// visibility.
+//
+// The operator console needs to list, inspect and kill queries across every
+// tenant on the cell -- that is the whole point of a Trino live view. Trino
+// routes each of those through OPA (QueryResource filters `/v1/query` with
+// FilterViewQueryOwnedBy, gates `/v1/query/{id}` on ViewQueryOwnedBy and
+// kill on KillQueryOwnedBy), so the capability has to be granted in policy
+// or the console sees an empty cluster.
+//
+// It is deliberately a SEPARATE principal from __admin_provisioner rather
+// than a widening of it. The admin credential can CREATE and DROP catalogs;
+// pairing that authority with "can read every tenant's SQL text" in one
+// credential makes the blast radius of a leak strictly worse. The observer
+// can do the opposite half and nothing else: it holds no catalog in
+// data.group_catalogs, so every read path (AccessCatalog, SelectFromColumns,
+// ShowSchemas/Tables/Columns and their filters) denies, and catalog
+// management is gated on is_admin, which requires the admin USERNAME.
+// --------------------------------------------------------------------------
+
+// TestObserverSeesEveryTenantQuery is the capability the console is built
+// on: cluster-wide visibility of, and kill authority over, every tenant's
+// queries -- via both the scalar and the batched entrypoint.
+func TestObserverSeesEveryTenantQuery(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	for _, op := range queryVisibilityOps {
+		for _, owner := range []string{"42", "43", AdminPrincipal, ObserverPrincipal} {
+			t.Run(op+"/observer vs "+owner, func(t *testing.T) {
+				if !evalAllow(t, q, buildInput(ObserverPrincipal, op, ownerOf(owner))) {
+					t.Errorf("%s: the observer principal must see and control %s's queries -- "+
+						"without it the admin console's Trino live view is empty", op, owner)
+				}
+			})
+		}
+	}
+
+	// An org with a projected group but no catalog yet is still a query
+	// owner the console must be able to see.
+	if !evalAllow(t, q, buildInput(ObserverPrincipal, "ViewQueryOwnedBy", ownerOf("pending"))) {
+		t.Error("observer must see queries owned by an org that owns no catalog yet")
+	}
+}
+
+// TestObserverBatchedQueryFiltering covers the shape the coordinator
+// actually uses for `/v1/query`: OpaBatchAccessControl.filterViewQueryOwnedBy
+// sends every candidate owner in ONE request. If the batch rule is missing,
+// the console lists zero queries while the scalar tests still pass.
+func TestObserverBatchedQueryFiltering(t *testing.T) {
+	batchQ := preparedBatch(t, twoOrgFixture())
+
+	in := batchedQueryOwnerInput(ObserverPrincipal, groupsFor(ObserverPrincipal), []map[string]interface{}{
+		ownerOf("42"), ownerOf("43"), ownerOf(AdminPrincipal),
+	})
+	got := evalBatch(t, batchQ, in)
+	for i := range 3 {
+		if !got[i] {
+			t.Errorf("observer batched FilterViewQueryOwnedBy: candidate %d not allowed; got %v -- "+
+				"the console's query list is filtered through this call", i, got)
+		}
+	}
+}
+
+// TestObserverHasNoCatalogAccess is the other half of the split-credential
+// bargain: the observer sees query METADATA cluster-wide and tenant DATA
+// nowhere. Every catalog-scope operation must deny, including for catalogs
+// that exist in the bundle.
+func TestObserverHasNoCatalogAccess(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	cases := []struct {
+		op       string
+		resource map[string]interface{}
+	}{
+		{"AccessCatalog", catalogResource("org_42")},
+		{"FilterCatalogs", catalogResource("org_42")},
+		{"ShowSchemas", catalogResource("org_42")},
+		{"FilterSchemas", schemaResource("org_42", "public")},
+		{"ShowTables", schemaResource("org_42", "public")},
+		{"SelectFromColumns", tableResource("org_42", "public", "events")},
+		{"FilterTables", tableResource("org_42", "public", "events")},
+		{"ShowColumns", tableResource("org_42", "public", "events")},
+		{"FilterColumns", tableResource("org_42", "public", "events")},
+		{"CreateCatalog", catalogResource("org_44")},
+		{"DropCatalog", catalogResource("org_42")},
+		{"AlterCatalog", catalogResource("org_42")},
+		{"ImpersonateUser", map[string]interface{}{"user": map[string]interface{}{"user": "42"}}},
+		{"WriteSystemInformation", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.op, func(t *testing.T) {
+			if evalAllow(t, q, buildInput(ObserverPrincipal, tc.op, tc.resource)) {
+				t.Errorf("%s: the observer principal must have NO catalog authority -- "+
+					"it is the read-only query-visibility half of the split credential", tc.op)
+			}
+		})
+	}
+}
+
+// TestObserverBatchedCatalogFilteringDenies closes the batched side of the
+// same boundary: a catalog listing must not leak through filterResources
+// just because the scalar path denies.
+func TestObserverBatchedCatalogFilteringDenies(t *testing.T) {
+	batchQ := preparedBatch(t, twoOrgFixture())
+
+	in := map[string]interface{}{
+		"context": map[string]interface{}{
+			"identity": map[string]interface{}{
+				"user":   ObserverPrincipal,
+				"groups": groupsFor(ObserverPrincipal),
+			},
+			"softwareStack": map[string]interface{}{"trinoVersion": "476"},
+		},
+		"action": map[string]interface{}{
+			"operation": "FilterCatalogs",
+			"filterResources": []map[string]interface{}{
+				catalogResource("org_42"), catalogResource("org_43"),
+			},
+		},
+	}
+	if got := evalBatch(t, batchQ, in); len(got) != 0 {
+		t.Errorf("observer batched FilterCatalogs allowed %v; the observer must enumerate no catalog", got)
+	}
+}
+
+// TestObserverReadSystemInformation covers `/v1/node` and
+// `/v1/resourceGroupState`, which Trino annotates MANAGEMENT_READ and
+// therefore gates on checkCanReadSystemInformation. The console's cluster
+// page reads both; nobody else gets the grant.
+func TestObserverReadSystemInformation(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	if !evalAllow(t, q, buildInput(ObserverPrincipal, "ReadSystemInformation", nil)) {
+		t.Error("observer must be allowed ReadSystemInformation -- /v1/node and " +
+			"/v1/resourceGroupState are MANAGEMENT_READ and back the console's cluster page")
+	}
+	for _, u := range []string{"42", "43", AdminPrincipal} {
+		if evalAllow(t, q, buildInput(u, "ReadSystemInformation", nil)) {
+			t.Errorf("%s must NOT be allowed ReadSystemInformation", u)
+		}
+	}
+	// The write half is never granted, to anyone.
+	if evalAllow(t, q, buildInput(ObserverPrincipal, "WriteSystemInformation", nil)) {
+		t.Error("WriteSystemInformation must stay denied for the observer")
+	}
+}
+
+// TestObserverRequiresUsernameAndGroup mirrors the is_admin conjunction:
+// either signal alone grants nothing. Both come from the same projected
+// Secret today, so the conjunction guards against a projection regression
+// that lets a tenant claim the group or collide with the username.
+func TestObserverRequiresUsernameAndGroup(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+
+	// Group claim without the username: a tenant that somehow lands in the
+	// observer group must not inherit cluster-wide query visibility.
+	forged := buildInputWithGroups("42", []string{"org_42", ObserverGroup}, "ViewQueryOwnedBy", ownerOf("43"))
+	if evalAllow(t, q, forged) {
+		t.Error("a forged observer-group claim without the observer username must grant nothing")
+	}
+	if evalAllow(t, q, buildInputWithGroups("42", []string{"org_42", ObserverGroup}, "ReadSystemInformation", nil)) {
+		t.Error("a forged observer-group claim must not grant ReadSystemInformation")
+	}
+
+	// Username without the group membership.
+	bare := buildInputWithGroups(ObserverPrincipal, nil, "ViewQueryOwnedBy", ownerOf("42"))
+	if evalAllow(t, q, bare) {
+		t.Error("the observer username without observer-group membership must grant nothing")
+	}
+
+	// And the observer group is never a shared org group: two principals
+	// both carrying it must not see each other through the same-org rule.
+	crossed := buildInputWithGroups("42", []string{ObserverGroup}, "ViewQueryOwnedBy",
+		queryOwnerResource("43", []string{ObserverGroup}))
+	if evalAllow(t, q, crossed) {
+		t.Error("the observer group must be excluded from the same-org match, like the admin group")
+	}
+}
+
+// TestObserverGroupGrantsNoCatalogViaBundle is the defense-in-depth check
+// on the bundle side: even if a future bundle mistakenly listed catalogs
+// under the observer group, that must not become read access.
+func TestObserverGroupGrantsNoCatalogViaBundle(t *testing.T) {
+	gc := twoOrgFixture()
+	gc[ObserverGroup] = map[string]bool{"org_42": true, "org_43": true}
+	q := preparedPolicy(t, gc)
+
+	for _, op := range []string{"AccessCatalog", "FilterCatalogs", "ShowSchemas"} {
+		if evalAllow(t, q, buildInput(ObserverPrincipal, op, catalogResource("org_42"))) {
+			t.Errorf("%s: a catalog listed under the observer group must NOT become readable -- "+
+				"the observer group is excluded from tenant_owns_catalog", op)
+		}
+	}
+	if evalAllow(t, q, buildInput(ObserverPrincipal, "SelectFromColumns", tableResource("org_42", "public", "events"))) {
+		t.Error("SelectFromColumns: a bundle entry under the observer group must not grant tenant data reads")
+	}
+}
+
+// TestBatchedQueryFilteringMatchesNonBatched closes the drift gap the
+// catalog/schema/table rules already close. `/v1/query` filters through
+// OpaBatchAccessControl.filterViewQueryOwnedBy, so without this rule the
+// SAME-ORG visibility the policy documents is inert in production: every
+// tenant sees only its own query (Trino short-circuits self-ownership
+// before OPA) and org-mates' queries vanish.
+func TestBatchedQueryFilteringMatchesNonBatched(t *testing.T) {
+	allowQ := preparedPolicy(t, twoOrgFixture())
+	batchQ := preparedBatch(t, twoOrgFixture())
+
+	requesters := []struct {
+		user   string
+		groups []string
+	}{
+		{"42", groupsFor("42")},
+		{"43", groupsFor("43")},
+		{AdminPrincipal, groupsFor(AdminPrincipal)},
+		{ObserverPrincipal, groupsFor(ObserverPrincipal)},
+	}
+	candidates := []map[string]interface{}{
+		ownerOf("42"), ownerOf("43"), ownerOf(AdminPrincipal), ownerOf("pending"),
+	}
+
+	for _, r := range requesters {
+		t.Run(r.user, func(t *testing.T) {
+			got := evalBatch(t, batchQ, batchedQueryOwnerInput(r.user, r.groups, candidates))
+			for i, cand := range candidates {
+				scalar := evalAllow(t, allowQ, buildInputWithGroups(r.user, r.groups, "FilterViewQueryOwnedBy", cand))
+				if got[i] != scalar {
+					t.Errorf("candidate %d: batch=%v scalar=%v -- the batched and non-batched "+
+						"query filters must be the same decision", i, got[i], scalar)
+				}
+			}
+		})
+	}
+}
+
+// batchedQueryOwnerInput builds the OpaBatchAccessControl input for
+// FilterViewQueryOwnedBy: the candidate owners ride in filterResources
+// (plural), each carrying the same `user: {user, groups}` shape the scalar
+// path puts at action.resource.
+func batchedQueryOwnerInput(user string, groups []string, candidates []map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"context": map[string]interface{}{
+			"identity": map[string]interface{}{
+				"user":   user,
+				"groups": groups,
+			},
+			"softwareStack": map[string]interface{}{"trinoVersion": "476"},
+		},
+		"action": map[string]interface{}{
+			"operation":       "FilterViewQueryOwnedBy",
+			"filterResources": candidates,
+		},
+	}
 }

@@ -24,6 +24,11 @@ type Extras struct {
 	// (/cluster/nodes,/pods,/events,/nodepools). nil (non-k8s backends, tests)
 	// leaves those routes unregistered.
 	ClusterClient kubernetes.Interface
+	// Trino backs the Trino cell views (/trino/*, /orgs/:id/trino). nil
+	// whenever the deployment has no Trino cell — which is every deployment
+	// that leaves DUCKGRES_TRINO_COORDINATOR_URL unset — and the routes are
+	// then simply absent rather than present-and-broken.
+	Trino *TrinoAPI
 }
 
 // RegisterExtras wires the additional endpoints onto the authenticated /api/v1
@@ -36,6 +41,7 @@ func RegisterExtras(r *gin.RouterGroup, x Extras) {
 	if x.ClusterClient != nil {
 		registerClusterAPI(r, x.ClusterClient)
 	}
+	registerTrinoAPI(r, x.Trino)
 	if x.Store != nil {
 		registerUserSecretsAPI(r, x.Store)
 	}

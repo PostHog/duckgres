@@ -114,3 +114,45 @@ const AdminGroup = "__admin_provisioner"
 // If you change this string, update policy.rego's regex.match literal
 // to match, then re-run both tests.
 const ManagedCatalogPattern = `^org_[a-z0-9_]+$`
+
+// ObserverPrincipal is the Trino username the control plane's admin
+// console authenticates as when it reads the cell's query and node state
+// over the coordinator REST API. It is deliberately NOT AdminPrincipal.
+//
+// Trino routes operator-console reads through the same access-control SPI
+// as everything else: `GET /v1/query` filters its result through
+// FilterViewQueryOwnedBy, `GET /v1/query/{id}` is gated on
+// ViewQueryOwnedBy, kill on KillQueryOwnedBy, and `/v1/node` +
+// `/v1/resourceGroupState` are MANAGEMENT_READ (checkCanReadSystemInformation).
+// A console credential with no policy grant sees an empty cluster, so the
+// capability has to exist in policy.rego.
+//
+// Splitting it from the admin principal is the security bargain: the admin
+// credential can CREATE/DROP catalogs but sees only its own queries; the
+// observer sees every tenant's query metadata but holds no catalog in
+// data.group_catalogs and therefore cannot read a single row of tenant
+// data. Neither half can be levered into the other. Keeping them fused
+// would mean one leaked credential yields both catalog authority and every
+// tenant's SQL text.
+//
+// A query's SQL text is tenant data, so anything the console surfaces from
+// this principal is redacted before it leaves the control plane, the same
+// way the pgwire error ring is.
+//
+// Keep in sync with the Rego policy's `observer_principal` constant and
+// with the provisioner's password.db/group.db projection.
+const ObserverPrincipal = "__duckgres_observer"
+
+// ObserverGroup is the Trino group the provisioner stamps onto
+// ObserverPrincipal in group.db. Like AdminGroup it is required as an
+// identity claim -- `is_observer` is the conjunction of the observer
+// USERNAME and this group membership, so a projection regression that
+// puts a tenant in this group grants nothing on its own.
+//
+// Unlike AdminGroup it is NEVER used as a catalog-ownership label: the
+// bundle generator must not place catalogs under it, and the policy
+// excludes it from tenant_owns_catalog and from the same-org query match
+// so a stray bundle entry still grants no data access.
+//
+// Keep in sync with the Rego policy's `observer_group` constant.
+const ObserverGroup = "__duckgres_observer"
