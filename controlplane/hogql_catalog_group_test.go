@@ -18,12 +18,18 @@ func TestHogQLCatalogGroupRequiresInternalToken(t *testing.T) {
 	engine := gin.New()
 	store := hogqlcatalog.NewMemoryStore()
 	snapshot := &hogqlcatalog.HogQLSemanticCatalogSnapshot{
-		ProtocolVersion: hogqlcatalog.SnapshotProtocolVersion,
-		SchemaVersion:   hogqlcatalog.SnapshotSchemaVersion,
-		LanguageVersion: "1.0.0",
-		Catalog:         hogqlcatalog.PhysicalIdentifier{Value: "ducklake"},
-		Generation:      1,
-		LogicalTables:   []hogqlcatalog.LogicalTableDefinition{},
+		ProtocolVersion:   hogqlcatalog.SnapshotProtocolVersion,
+		SchemaVersion:     hogqlcatalog.SnapshotSchemaVersion,
+		LanguageVersion:   "1.0.0",
+		Catalog:           hogqlcatalog.PhysicalIdentifier{Value: "ducklake"},
+		Generation:        1,
+		LogicalTables:     []hogqlcatalog.LogicalTableDefinition{},
+		ExpressionFields:  []hogqlcatalog.ExpressionFieldDefinition{},
+		VirtualTables:     []hogqlcatalog.VirtualTableDefinition{},
+		SavedQueries:      []hogqlcatalog.SavedQueryReference{},
+		MaterializedViews: []hogqlcatalog.MaterializedViewReference{},
+		Functions:         []hogqlcatalog.FunctionCapabilityDefinition{},
+		ModifierDefaults:  []hogqlcatalog.SemanticModifierDefault{},
 	}
 	if err := store.Publish(context.Background(), snapshot); err != nil {
 		t.Fatalf("publish fixture: %v", err)

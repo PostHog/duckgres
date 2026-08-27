@@ -68,6 +68,13 @@ func BuildPhysicalSnapshot(ctx context.Context, provider PhysicalMetadataProvide
 	if err != nil {
 		return nil, fmt.Errorf("load HogQL physical catalog metadata: %w", err)
 	}
+	return buildPhysicalSnapshot(ctx, metadata, normalizedCatalog, languageVersion, generation)
+}
+
+func buildPhysicalSnapshot(ctx context.Context, metadata *PhysicalCatalogMetadata, normalizedCatalog PhysicalIdentifier, languageVersion string, generation int64) (*HogQLSemanticCatalogSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if metadata == nil {
 		return nil, invalidPhysicalMetadata("provider returned no catalog")
 	}

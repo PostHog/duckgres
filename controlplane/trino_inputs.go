@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/hogqlcatalog"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"k8s.io/client-go/kubernetes"
@@ -230,6 +231,7 @@ func buildTrinoWiring(
 	// is https but dials the in-cluster Service address (see
 	// envTrinoCoordinatorServerName).
 	catalogClient := provisioner.NewTrinoCatalogHTTPClient(cell.CoordinatorURL, opa.AdminPrincipal, "", cell.TLSServerName)
+	hogQLCatalogStore := hogqlcatalog.NewPostgresStore(store.DB())
 
 	bundleStore := &opa.BundleStore{}
 
@@ -243,6 +245,7 @@ func buildTrinoWiring(
 		CellID:                cell.ID,
 		TenantSecretMountPath: strings.TrimSpace(os.Getenv(envTrinoTenantSecretMountPath)),
 		Catalog:               catalogClient,
+		HogQLCatalogs:         hogQLCatalogStore,
 		BundleStore:           bundleStore,
 		BundleBuilder:         opa.NewBuilder(),
 		AWSRegion:             strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),

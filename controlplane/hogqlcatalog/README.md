@@ -47,9 +47,39 @@ Trino catalog HTTP client implements this provider by calling the authenticated,
 versioned coordinator endpoint with the provisioner's existing rotated admin
 Basic credential. The adapter strictly decodes the response, preserves original
 connector ordinals after visibility filtering, and rejects protocol, schema,
-catalog, or visibility inconsistencies before translation. The current HTTP
-publisher still accepts already assembled snapshots; wiring refresh publication
-to the per-tenant reconcile lifecycle remains separate from the transport.
+catalog, or visibility inconsistencies before translation.
+
+The Trino provisioner refreshes both newly created and existing tenant catalogs.
+New catalogs request an immediate refresh. Existing catalogs use a persisted
+five-minute refresh schedule, so the ten-second reconcile loop does not scan
+every connector inventory on every tick. A failed fetch or publication retries
+after 30 seconds. An identical physical inventory keeps the current generation.
+
+Each refresh first acquires a one-minute per-catalog lease in Postgres. The
+lease transaction commits before the HTTP request starts. Its opaque token and
+monotonic epoch fence publication, so an expired older fetch cannot publish
+after a newer lease holder. Publication verifies the unexpired token while
+holding the same short per-catalog advisory transaction lock used for semantic
+publication. No database transaction, Kubernetes lock, or catalog-client lock
+is held across the Trino request. The Duckgres generation records publication
+order. It does not claim that Trino supplied a monotonically versioned schema
+snapshot.
+
+Physical refresh matches logical tables by their structured physical qualified
+name and fields by their structured physical column name. It replaces exact
+connector types, logical type families, nullability, star visibility, and field
+order. It preserves logical table and field names, properties, relationships,
+and every root semantic definition. Multiple logical tables may project the
+same physical table; each projection is preserved and refreshed. New physical
+tables and columns receive default logical names. Removed physical members,
+name collisions, and broken semantic references fail validation before
+publication.
+
+Fetch, merge, validation, and storage failures leave the last good generation
+available. When no generation exists yet and another replica owns the refresh
+lease, the tenant remains provisioning until that lease publishes. To recover,
+fix the reported Trino metadata or catalog error and allow the scheduled retry
+to run. Do not edit an existing manifest generation or the lease row manually.
 
 ## API
 

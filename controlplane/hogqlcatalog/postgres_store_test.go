@@ -37,6 +37,12 @@ func TestPostgresStorePersistsImmutableGenerationsAcrossInstances(t *testing.T) 
 	).Error; err != nil {
 		t.Fatalf("reset catalog snapshots: %v", err)
 	}
+	if err := config.DB().Exec(
+		"DELETE FROM duckgres_hogql_physical_catalog_refresh_leases WHERE catalog_value = ?",
+		testCatalog().Value,
+	).Error; err != nil {
+		t.Fatalf("reset physical refresh lease: %v", err)
+	}
 
 	firstProcess := NewPostgresStore(config.DB())
 	expected := completeSemanticSnapshot(1)
@@ -60,5 +66,43 @@ func TestPostgresStorePersistsImmutableGenerationsAcrossInstances(t *testing.T) 
 	}
 	if err := firstProcess.Publish(t.Context(), testSnapshot(1)); !errors.Is(err, ErrGenerationRegression) {
 		t.Fatalf("publish older generation error = %v, want ErrGenerationRegression", err)
+	}
+
+	stale, acquired, err := firstProcess.AcquirePhysicalRefresh(t.Context(), testCatalog(), time.Minute, true)
+	if err != nil || !acquired {
+		t.Fatalf("acquire stale refresh = (%#v, %t, %v)", stale, acquired, err)
+	}
+	if err := config.DB().Exec(
+		"UPDATE duckgres_hogql_physical_catalog_refresh_leases SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE catalog_value = ? AND catalog_delimited = ?",
+		testCatalog().Value,
+		testCatalog().Delimited,
+	).Error; err != nil {
+		t.Fatalf("expire stale refresh: %v", err)
+	}
+	if _, _, err := firstProcess.PublishPhysicalRefresh(t.Context(), stale, physicalCatalog("varchar", false), "1.0.0", time.Hour); !errors.Is(err, ErrPhysicalRefreshLeaseLost) {
+		t.Fatalf("publish expired refresh error = %v, want ErrPhysicalRefreshLeaseLost", err)
+	}
+	current, acquired, err := restartedProcess.AcquirePhysicalRefresh(t.Context(), testCatalog(), time.Minute, true)
+	if err != nil || !acquired {
+		t.Fatalf("acquire current refresh = (%#v, %t, %v)", current, acquired, err)
+	}
+	refreshed, published, err := restartedProcess.PublishPhysicalRefresh(t.Context(), current, physicalCatalog("bigint", false), "1.0.0", time.Hour)
+	if err != nil || !published || refreshed.Generation != 3 {
+		t.Fatalf("publish current refresh = (%#v, %t, %v), want generation 3", refreshed, published, err)
+	}
+	if scheduled, acquired, err := firstProcess.AcquirePhysicalRefresh(t.Context(), testCatalog(), time.Minute, false); err != nil || acquired || scheduled != nil {
+		t.Fatalf("scheduled refresh acquisition = (%#v, %t, %v), want not acquired", scheduled, acquired, err)
+	}
+	if _, _, err := firstProcess.PublishPhysicalRefresh(t.Context(), stale, physicalCatalog("varchar", false), "1.0.0", time.Hour); !errors.Is(err, ErrPhysicalRefreshLeaseLost) {
+		t.Fatalf("publish stale refresh error = %v, want ErrPhysicalRefreshLeaseLost", err)
+	}
+
+	retry, acquired, err := firstProcess.AcquirePhysicalRefresh(t.Context(), testCatalog(), time.Minute, true)
+	if err != nil || !acquired {
+		t.Fatalf("acquire identical retry = (%#v, %t, %v)", retry, acquired, err)
+	}
+	unchanged, published, err := firstProcess.PublishPhysicalRefresh(t.Context(), retry, physicalCatalog("bigint", false), "1.0.0", time.Hour)
+	if err != nil || published || unchanged.Generation != 3 {
+		t.Fatalf("publish identical retry = (%#v, %t, %v), want unchanged generation 3", unchanged, published, err)
 	}
 }

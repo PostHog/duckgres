@@ -12,8 +12,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/hogqlcatalog"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -127,12 +129,15 @@ func readyDuckling(orgID string) *DucklingStatus {
 }
 
 type fakeCatalogClient struct {
-	mu        sync.Mutex
-	existing  []string
-	created   map[string]map[string]string
-	dropped   []string
-	listErr   error
-	createErr error
+	mu                 sync.Mutex
+	existing           []string
+	created            map[string]map[string]string
+	dropped            []string
+	physicalRequests   []string
+	physicalCatalogs   map[string]*hogqlcatalog.PhysicalCatalogMetadata
+	physicalCatalogErr error
+	listErr            error
+	createErr          error
 }
 
 func (c *fakeCatalogClient) ListCatalogs(ctx context.Context) ([]string, error) {
@@ -180,6 +185,19 @@ func (c *fakeCatalogClient) DropCatalog(ctx context.Context, name string) error 
 	}
 	c.existing = filtered
 	return nil
+}
+
+func (c *fakeCatalogClient) PhysicalCatalog(_ context.Context, catalog hogqlcatalog.PhysicalIdentifier) (*hogqlcatalog.PhysicalCatalogMetadata, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.physicalRequests = append(c.physicalRequests, catalog.Value)
+	if c.physicalCatalogErr != nil {
+		return nil, c.physicalCatalogErr
+	}
+	if metadata := c.physicalCatalogs[catalog.Value]; metadata != nil {
+		return metadata, nil
+	}
+	return testTrinoPhysicalCatalog(catalog.Value), nil
 }
 
 // --- pure-function tests ---
@@ -705,6 +723,7 @@ type testProvisionerHarness struct {
 	bundles     *opa.BundleStore
 	store       *fakeTrinoStore
 	warehouses  *fakeWarehouseStore
+	hogqlStore  *hogqlcatalog.MemoryStore
 	// ducklings is the fake Duckling CR status source: org id -> status.
 	// A missing entry resolves to ("", nil) — the duckling-not-ready wait.
 	ducklings map[string]*DucklingStatus
@@ -722,6 +741,7 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 		bundles:     &opa.BundleStore{},
 		store:       &fakeTrinoStore{orgs: orgs},
 		warehouses:  &fakeWarehouseStore{rows: warehouses},
+		hogqlStore:  hogqlcatalog.NewMemoryStore(),
 		ducklings:   map[string]*DucklingStatus{},
 		passwordErr: map[string]error{},
 	}
@@ -744,6 +764,7 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 		Namespace:     TrinoCustomerNamespace,
 		CellID:        testCellID,
 		Catalog:       h.catalog,
+		HogQLCatalogs: h.hogqlStore,
 		BundleStore:   h.bundles,
 		BundleBuilder: opa.NewBuilder(),
 		AWSRegion:     "us-east-1",
@@ -1158,6 +1179,109 @@ func TestReconcile_IsIdempotentWhenCatalogExists(t *testing.T) {
 	}
 }
 
+func TestReconcile_RefreshesPhysicalCatalogForCreatedAndExistingCatalogs(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+		{OrgID: "43", DatabaseName: "db43", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{
+		"42": readyWarehouse("42"),
+		"43": readyWarehouse("43"),
+	})
+	h.catalog.existing = []string{TrinoCatalogName("db42")}
+
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, catalog := range []string{TrinoCatalogName("db42"), TrinoCatalogName("db43")} {
+		if !contains(h.catalog.physicalRequests, catalog) {
+			t.Fatalf("physical refresh requests = %v, want %s", h.catalog.physicalRequests, catalog)
+		}
+		latest, err := h.hogqlStore.Latest(context.Background(), hogqlcatalog.PhysicalIdentifier{Value: catalog})
+		if err != nil || latest.Generation != 1 {
+			t.Fatalf("latest %s physical generation = (%#v, %v), want generation 1", catalog, latest, err)
+		}
+	}
+
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("idempotent Reconcile: %v", err)
+	}
+	if len(h.catalog.physicalRequests) != 2 {
+		t.Fatalf("scheduled refresh made redundant Trino requests: %v", h.catalog.physicalRequests)
+	}
+	for _, catalog := range []string{TrinoCatalogName("db42"), TrinoCatalogName("db43")} {
+		latest, err := h.hogqlStore.Latest(context.Background(), hogqlcatalog.PhysicalIdentifier{Value: catalog})
+		if err != nil || latest.Generation != 1 {
+			t.Fatalf("latest %s after identical refresh = (%#v, %v), want generation 1", catalog, latest, err)
+		}
+	}
+}
+
+func TestReconcile_FirstPhysicalRefreshContentionStaysPending(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h",
+	}}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+	catalog := hogqlcatalog.PhysicalIdentifier{Value: TrinoCatalogName("db42")}
+	lease, acquired, err := h.hogqlStore.AcquirePhysicalRefresh(context.Background(), catalog, time.Minute, true)
+	if err != nil || !acquired {
+		t.Fatalf("acquire competing refresh = (%#v, %t, %v)", lease, acquired, err)
+	}
+
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("contended Reconcile: %v", err)
+	}
+	state, _ := h.store.lastState("42")
+	if state.State != configstore.ManagedWarehouseStateProvisioning || !strings.Contains(state.StatusMessage, "physical catalog refresh") {
+		t.Fatalf("state during first refresh contention = %#v", state)
+	}
+	if _, err := h.hogqlStore.Latest(context.Background(), catalog); !errors.Is(err, hogqlcatalog.ErrCatalogNotFound) {
+		t.Fatalf("latest during first refresh contention error = %v, want ErrCatalogNotFound", err)
+	}
+
+	if err := h.hogqlStore.ReleasePhysicalRefresh(context.Background(), lease, 0); err != nil {
+		t.Fatalf("release competing refresh: %v", err)
+	}
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("recovered Reconcile: %v", err)
+	}
+	state, _ = h.store.lastState("42")
+	if state.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("state after refresh contention clears = %#v", state)
+	}
+}
+
+func TestReconcile_RetainsLastPhysicalGenerationWhenRefreshFails(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h",
+	}}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("initial Reconcile: %v", err)
+	}
+	catalog := hogqlcatalog.PhysicalIdentifier{Value: TrinoCatalogName("db42")}
+	due, acquired, err := h.hogqlStore.AcquirePhysicalRefresh(context.Background(), catalog, time.Minute, true)
+	if err != nil || !acquired {
+		t.Fatalf("acquire forced refresh = (%#v, %t, %v)", due, acquired, err)
+	}
+	if err := h.hogqlStore.ReleasePhysicalRefresh(context.Background(), due, 0); err != nil {
+		t.Fatalf("schedule immediate refresh: %v", err)
+	}
+	h.catalog.physicalCatalogErr = errors.New("metadata unavailable")
+	if err := h.provisioner.Reconcile(context.Background()); err == nil {
+		t.Fatal("refresh failure must surface from Reconcile")
+	}
+
+	latest, err := h.hogqlStore.Latest(context.Background(), catalog)
+	if err != nil || latest.Generation != 1 {
+		t.Fatalf("latest after refresh failure = (%#v, %v), want generation 1", latest, err)
+	}
+	state, _ := h.store.lastState("42")
+	if state.State != configstore.ManagedWarehouseStateFailed || !strings.Contains(state.StatusMessage, "physical catalog") {
+		t.Fatalf("state after refresh failure = %#v", state)
+	}
+}
+
 func TestReconcile_SecretUpdateIsIdempotent(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
 		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
@@ -1465,8 +1589,26 @@ func baseTestOpts() TrinoProvisionerOpts {
 		Ducklings:         func(context.Context, string) (*DucklingStatus, error) { return nil, nil },
 		Kubernetes:        kubefake.NewClientset(),
 		Catalog:           &fakeCatalogClient{},
+		HogQLCatalogs:     hogqlcatalog.NewMemoryStore(),
 		BundleStore:       &opa.BundleStore{},
 		BundleBuilder:     opa.NewBuilder(),
+	}
+}
+
+func testTrinoPhysicalCatalog(catalog string) *hogqlcatalog.PhysicalCatalogMetadata {
+	return &hogqlcatalog.PhysicalCatalogMetadata{
+		Catalog: hogqlcatalog.PhysicalIdentifier{Value: catalog},
+		Tables: []hogqlcatalog.PhysicalTableMetadata{{
+			Schema: hogqlcatalog.PhysicalIdentifier{Value: "default"},
+			Table:  hogqlcatalog.PhysicalIdentifier{Value: "events"},
+			Columns: []hogqlcatalog.PhysicalColumnMetadata{{
+				Name:               hogqlcatalog.PhysicalIdentifier{Value: "id"},
+				Ordinal:            1,
+				TrinoTypeSignature: "uuid",
+				Nullability:        hogqlcatalog.ColumnNotNull,
+				StarVisibility:     hogqlcatalog.ColumnStarVisible,
+			}},
+		}},
 	}
 }
 
@@ -1483,6 +1625,7 @@ func TestNewTrinoProvisioner_RequiresAllDeps(t *testing.T) {
 		func(o *TrinoProvisionerOpts) { o.Ducklings = nil },
 		func(o *TrinoProvisionerOpts) { o.Kubernetes = nil },
 		func(o *TrinoProvisionerOpts) { o.Catalog = nil },
+		func(o *TrinoProvisionerOpts) { o.HogQLCatalogs = nil },
 		func(o *TrinoProvisionerOpts) { o.BundleStore = nil },
 		func(o *TrinoProvisionerOpts) { o.BundleBuilder = nil },
 	} {
