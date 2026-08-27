@@ -16,6 +16,20 @@ func TestSemanticMetadataJSONAndPublisherRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
+	var manifest struct {
+		Functions []map[string]json.RawMessage `json:"functions"`
+	}
+	if err := json.Unmarshal(document, &manifest); err != nil {
+		t.Fatalf("inspect function contract: %v", err)
+	}
+	for index, rewrite := range []string{`"IS_NULL"`, `"IS_NOT_NULL"`} {
+		if got := string(manifest.Functions[index+1]["rewrite"]); got != rewrite {
+			t.Fatalf("function %d rewrite = %s, want %s", index+1, got, rewrite)
+		}
+	}
+	if _, exists := manifest.Functions[0]["rewrite"]; exists {
+		t.Fatal("stock function unexpectedly published rewrite")
+	}
 	decoded, err := DecodeSnapshot(strings.NewReader(string(document)))
 	if err != nil {
 		t.Fatalf("decode snapshot: %v", err)
@@ -229,6 +243,104 @@ func TestPublishRejectsInvalidSemanticRecipeGraph(t *testing.T) {
 				snapshot.Functions[0].TrinoName = nil
 			},
 		},
+		{
+			name: "UDF missing Trino name",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[0].Implementation = FunctionImplementationUDF
+				snapshot.Functions[0].TrinoName = []PhysicalIdentifier{}
+			},
+		},
+		{
+			name: "rewrite function missing rewrite identifier",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Rewrite = ""
+			},
+		},
+		{
+			name: "rewrite function with unknown rewrite identifier",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Rewrite = FunctionRewriteIdentifier("UNKNOWN")
+			},
+		},
+		{
+			name: "rewrite function with Trino name",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].TrinoName = []PhysicalIdentifier{{Value: "is_null"}}
+			},
+		},
+		{
+			name: "rewrite function with non-scalar kind",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Kind = FunctionKindAggregate
+			},
+		},
+		{
+			name: "rewrite function is non-deterministic",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Deterministic = false
+			},
+		},
+		{
+			name: "rewrite function has zero-argument signature",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Signatures = append(snapshot.Functions[1].Signatures, FunctionSignature{ArgumentTypes: []string{}, ReturnType: "boolean"})
+			},
+		},
+		{
+			name: "rewrite function has two-argument signature",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Signatures = append(snapshot.Functions[1].Signatures, FunctionSignature{ArgumentTypes: []string{"varchar", "varchar"}, ReturnType: "boolean"})
+			},
+		},
+		{
+			name: "rewrite function has variadic signature",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Signatures = append(snapshot.Functions[1].Signatures, FunctionSignature{ArgumentTypes: []string{"varchar"}, ReturnType: "boolean", Variadic: true})
+			},
+		},
+		{
+			name: "rewrite function has non-boolean return type",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].Signatures = append(snapshot.Functions[1].Signatures, FunctionSignature{ArgumentTypes: []string{"varchar"}, ReturnType: "bigint"})
+			},
+		},
+		{
+			name: "rewrite function supports distinct",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].SupportsDistinct = true
+			},
+		},
+		{
+			name: "rewrite function supports order by",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].SupportsOrderBy = true
+			},
+		},
+		{
+			name: "rewrite function supports filter",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].SupportsFilter = true
+			},
+		},
+		{
+			name: "rewrite function supports window",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[1].SupportsWindow = true
+			},
+		},
+		{
+			name: "stock function with rewrite identifier",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[0].Rewrite = FunctionRewriteIsNull
+			},
+		},
+		{
+			name: "UDF with rewrite identifier",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.Functions[0].Implementation = FunctionImplementationUDF
+				snapshot.Functions[0].Rewrite = FunctionRewriteIsNotNull
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -272,11 +384,23 @@ func completeSemanticSnapshot(generation int64) *HogQLSemanticCatalogSnapshot {
 		PhysicalView: PhysicalQualifiedName{Catalog: testCatalog(), Schema: PhysicalIdentifier{Value: "default"}, Table: PhysicalIdentifier{Value: "daily_events"}},
 		Fields:       []ReferencedField{{Name: "day", TrinoTypeSignature: "date", LogicalType: LogicalTypeDate, Nullable: false, StarVisible: true}},
 	}}
-	snapshot.Functions = []FunctionCapabilityDefinition{{
-		Name: "concat", Kind: FunctionKindScalar, Implementation: FunctionImplementationStock,
-		TrinoName: []PhysicalIdentifier{{Value: "concat"}}, Deterministic: true,
-		Signatures: []FunctionSignature{{ArgumentTypes: []string{"varchar", "varchar"}, ReturnType: "varchar", Variadic: false}},
-	}}
+	snapshot.Functions = []FunctionCapabilityDefinition{
+		{
+			Name: "concat", Kind: FunctionKindScalar, Implementation: FunctionImplementationStock,
+			TrinoName: []PhysicalIdentifier{{Value: "concat"}}, Deterministic: true,
+			Signatures: []FunctionSignature{{ArgumentTypes: []string{"varchar", "varchar"}, ReturnType: "varchar", Variadic: false}},
+		},
+		{
+			Name: "isNull", Kind: FunctionKindScalar, Implementation: FunctionImplementationRewrite,
+			TrinoName: []PhysicalIdentifier{}, Rewrite: FunctionRewriteIsNull, Deterministic: true,
+			Signatures: []FunctionSignature{{ArgumentTypes: []string{"varchar"}, ReturnType: "boolean", Variadic: false}},
+		},
+		{
+			Name: "isNotNull", Kind: FunctionKindScalar, Implementation: FunctionImplementationRewrite,
+			TrinoName: []PhysicalIdentifier{}, Rewrite: FunctionRewriteIsNotNull, Deterministic: true,
+			Signatures: []FunctionSignature{{ArgumentTypes: []string{"varchar"}, ReturnType: "boolean", Variadic: false}},
+		},
+	}
 	snapshot.ModifierDefaults = []SemanticModifierDefault{
 		{Name: "week_start", Behavior: ModifierBehaviorCompiler, DefaultValue: TypedLiteral{TypeSignature: "integer", Encoding: LiteralEncodingInteger, Value: "1"}},
 		{Name: "optimize_metadata_queries", Behavior: ModifierBehaviorTrinoSessionProperty, DefaultValue: TypedLiteral{TypeSignature: "boolean", Encoding: LiteralEncodingBoolean, Value: "true"}, SessionProperty: []PhysicalIdentifier{{Value: "optimizer"}, {Value: "optimize_metadata_queries"}}},

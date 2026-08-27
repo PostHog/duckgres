@@ -103,10 +103,16 @@ table. A future cross-table recipe must carry an explicit relationship path;
 consumers must never infer a join.
 
 Function declarations state whether lowering uses a stock Trino function, a
-registered UDF, or a compiler rewrite. Modifier behavior is one of compiler
-handling, a named Trino session property, a safe no-op, or explicitly
-unsupported. Consumers must still fail closed when a requested capability is
-not declared.
+registered UDF, or a compiler rewrite. Stock and UDF declarations omit
+`rewrite` and provide a non-empty structured `trinoName`. Rewrite declarations
+provide an empty `trinoName` and one closed `rewrite` identifier: `IS_NULL` or
+`IS_NOT_NULL`. Rewrites are deterministic scalar functions; every signature is
+unary, non-variadic, and returns `boolean` using case-insensitive canonical type
+text. Distinct, ordering, filter, and window traits are disabled. Missing,
+unknown, or implementation-incompatible rewrite values, signatures, and traits
+fail validation. Modifier behavior is one of compiler handling, a named Trino
+session property, a safe no-op, or explicitly unsupported. Consumers must still
+fail closed when a requested capability is not declared.
 
 Published generations are persisted in the config-store Postgres database.
 Rows are append-only and the latest snapshot is selected by generation, so all

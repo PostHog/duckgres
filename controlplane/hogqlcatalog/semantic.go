@@ -192,16 +192,17 @@ type ReferencedField struct {
 }
 
 type FunctionCapabilityDefinition struct {
-	Name             string                 `json:"name"`
-	Kind             FunctionKind           `json:"kind"`
-	Implementation   FunctionImplementation `json:"implementation"`
-	TrinoName        []PhysicalIdentifier   `json:"trinoName"`
-	Signatures       []FunctionSignature    `json:"signatures"`
-	Deterministic    bool                   `json:"deterministic"`
-	SupportsDistinct bool                   `json:"supportsDistinct"`
-	SupportsOrderBy  bool                   `json:"supportsOrderBy"`
-	SupportsFilter   bool                   `json:"supportsFilter"`
-	SupportsWindow   bool                   `json:"supportsWindow"`
+	Name             string                    `json:"name"`
+	Kind             FunctionKind              `json:"kind"`
+	Implementation   FunctionImplementation    `json:"implementation"`
+	TrinoName        []PhysicalIdentifier      `json:"trinoName"`
+	Rewrite          FunctionRewriteIdentifier `json:"rewrite,omitempty"`
+	Signatures       []FunctionSignature       `json:"signatures"`
+	Deterministic    bool                      `json:"deterministic"`
+	SupportsDistinct bool                      `json:"supportsDistinct"`
+	SupportsOrderBy  bool                      `json:"supportsOrderBy"`
+	SupportsFilter   bool                      `json:"supportsFilter"`
+	SupportsWindow   bool                      `json:"supportsWindow"`
 }
 
 type FunctionKind string
@@ -219,6 +220,13 @@ const (
 	FunctionImplementationStock   FunctionImplementation = "STOCK"
 	FunctionImplementationUDF     FunctionImplementation = "UDF"
 	FunctionImplementationRewrite FunctionImplementation = "REWRITE"
+)
+
+type FunctionRewriteIdentifier string
+
+const (
+	FunctionRewriteIsNull    FunctionRewriteIdentifier = "IS_NULL"
+	FunctionRewriteIsNotNull FunctionRewriteIdentifier = "IS_NOT_NULL"
 )
 
 type FunctionSignature struct {
@@ -715,11 +723,29 @@ func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]*
 		if definition.TrinoName == nil || definition.Signatures == nil || len(definition.Signatures) == 0 {
 			return nil, invalidSnapshot("function %q must include Trino name and signatures", definition.Name)
 		}
-		if definition.Implementation == FunctionImplementationRewrite && len(definition.TrinoName) != 0 {
-			return nil, invalidSnapshot("rewrite function %q cannot name a Trino function", definition.Name)
-		}
-		if definition.Implementation != FunctionImplementationRewrite && len(definition.TrinoName) == 0 {
-			return nil, invalidSnapshot("function %q must name a Trino function", definition.Name)
+		if definition.Implementation == FunctionImplementationRewrite {
+			if !slices.Contains(validFunctionRewrites, definition.Rewrite) {
+				return nil, invalidSnapshot("rewrite function %q has an unknown rewrite", definition.Name)
+			}
+			if len(definition.TrinoName) != 0 {
+				return nil, invalidSnapshot("rewrite function %q cannot name a Trino function", definition.Name)
+			}
+			if definition.Kind != FunctionKindScalar {
+				return nil, invalidSnapshot("rewrite function %q must be scalar", definition.Name)
+			}
+			if !definition.Deterministic {
+				return nil, invalidSnapshot("rewrite function %q must be deterministic", definition.Name)
+			}
+			if definition.SupportsDistinct || definition.SupportsOrderBy || definition.SupportsFilter || definition.SupportsWindow {
+				return nil, invalidSnapshot("rewrite function %q cannot declare aggregate or window traits", definition.Name)
+			}
+		} else {
+			if definition.Rewrite != "" {
+				return nil, invalidSnapshot("function %q cannot declare a compiler rewrite", definition.Name)
+			}
+			if len(definition.TrinoName) == 0 {
+				return nil, invalidSnapshot("function %q must name a Trino function", definition.Name)
+			}
 		}
 		for nameIndex := range definition.TrinoName {
 			if err := normalizePhysicalIdentifier(&definition.TrinoName[nameIndex]); err != nil {
@@ -729,6 +755,12 @@ func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]*
 		for _, signature := range definition.Signatures {
 			if signature.ArgumentTypes == nil {
 				return nil, invalidSnapshot("function %q signature arguments are required", definition.Name)
+			}
+			if definition.Implementation == FunctionImplementationRewrite && (len(signature.ArgumentTypes) != 1 || signature.Variadic) {
+				return nil, invalidSnapshot("rewrite function %q signatures must be unary and non-variadic", definition.Name)
+			}
+			if definition.Implementation == FunctionImplementationRewrite && !strings.EqualFold(signature.ReturnType, "boolean") {
+				return nil, invalidSnapshot("rewrite function %q signatures must return boolean", definition.Name)
 			}
 			for _, argument := range signature.ArgumentTypes {
 				if err := validateDefinitionText(argument, "function argument type"); err != nil {
@@ -1147,6 +1179,8 @@ var validSemanticOperators = []SemanticOperator{
 var validFunctionKinds = []FunctionKind{FunctionKindScalar, FunctionKindAggregate, FunctionKindWindow, FunctionKindTable}
 
 var validFunctionImplementations = []FunctionImplementation{FunctionImplementationStock, FunctionImplementationUDF, FunctionImplementationRewrite}
+
+var validFunctionRewrites = []FunctionRewriteIdentifier{FunctionRewriteIsNull, FunctionRewriteIsNotNull}
 
 var validModifierBehaviors = []ModifierBehavior{ModifierBehaviorCompiler, ModifierBehaviorTrinoSessionProperty, ModifierBehaviorSafeNoop, ModifierBehaviorUnsupported}
 
