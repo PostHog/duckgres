@@ -1942,7 +1942,8 @@ func tierLimits(tier string) resourceGroupSubGroup {
 // which the file group provider DOES reload (file.refresh-period=60s), so a
 // retier takes effect within a minute and still needs no restart.
 //
-// Selector order is first-match-wins. Admin is first so its catalog DDL never
+// Selector order is first-match-wins. The two operational principals come
+// first so neither the provisioner's catalog DDL nor the console's node query
 // falls into a tenant lane, then the explicit tiers, then free as the
 // catch-all — an org with an unknown or empty tier lands in the smallest lane
 // rather than matching nothing, which would reject its queries outright.
@@ -1969,9 +1970,18 @@ func BuildTrinoResourceGroups() ([]byte, error) {
 		return l
 	}
 
+	// Both operational principals get an explicit lane BEFORE the tenant
+	// selectors. The last selector matches user `(?<org>.*)`, which matches
+	// anything, so without these the provisioner and the observer would be
+	// admitted as tenants into root.tenants.free.<principal>. Those leaves
+	// are JmxExport=true, so each would appear as a phantom tenant in the
+	// per-tenant resource-group metrics and in anything alerting off them.
 	selectors := []resourceGroupSelector{{
 		User:  opa.AdminPrincipal,
 		Group: "root.admin." + opa.AdminPrincipal,
+	}, {
+		User:  opa.ObserverPrincipal,
+		Group: "root.admin." + opa.ObserverPrincipal,
 	}}
 	for _, tier := range []string{tierScale, tierGrowth} {
 		selectors = append(selectors, resourceGroupSelector{
@@ -2000,6 +2010,16 @@ func BuildTrinoResourceGroups() ([]byte, error) {
 			SoftMemoryLimit:      "5%",
 			HardConcurrencyLimit: 4,
 			MaxQueued:            20,
+		}, {
+			// The observer runs one query: SELECT from system.runtime.nodes,
+			// on the cluster page's refresh interval. Its own small lane so a
+			// console left open cannot queue behind, or ahead of, the
+			// provisioner's catalog DDL. Unexported for the same reason the
+			// admin leaf is: it is not a tenant.
+			Name:                 opa.ObserverPrincipal,
+			SoftMemoryLimit:      "2%",
+			HardConcurrencyLimit: 2,
+			MaxQueued:            10,
 		}},
 	}
 

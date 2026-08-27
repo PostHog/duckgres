@@ -381,3 +381,55 @@ describe("summarizeTrinoNodes on an announce-only cell", () => {
     expect(summarizeTrinoNodes(announced).healthKnown).toBe(true);
   });
 });
+
+describe("summarizeTrinoNodes from system.runtime.nodes", () => {
+  const node = (
+    uri: string,
+    version: string,
+    state: string,
+    coordinator = false,
+  ) => ({
+    uri,
+    version,
+    state,
+    coordinator,
+    node_id: uri,
+    age_ms: 0,
+    recent_failures: 0,
+    recent_successes: 0,
+    recent_failure_ratio: 0,
+    failed: false,
+  });
+
+  it("surfaces version skew, which is the point of this source", () => {
+    const h = summarizeTrinoNodes(
+      [node("a", "476", "ACTIVE", true), node("b", "477", "ACTIVE")],
+      "system_table",
+    );
+    expect(h.detailKnown).toBe(true);
+    expect(h.versions).toEqual(["476", "477"]);
+    expect(h.total).toBe(2);
+  });
+
+  it("collapses a single version and counts non-active nodes", () => {
+    const h = summarizeTrinoNodes(
+      [
+        node("a", "476", "ACTIVE"),
+        node("b", "476", "SHUTTING_DOWN"),
+        node("c", "476", "INACTIVE"),
+      ],
+      "system_table",
+    );
+    expect(h.versions).toEqual(["476"]);
+    expect(h.inactive).toBe(2);
+  });
+
+  // It carries no heartbeat ratios, so it must not claim the failure
+  // detector's kind of health any more than the announce inventory does.
+  it("does not claim heartbeat health", () => {
+    const h = summarizeTrinoNodes([node("a", "476", "ACTIVE")], "system_table");
+    expect(h.healthKnown).toBe(false);
+    expect(h.failed).toBe(0);
+    expect(h.degraded).toBe(0);
+  });
+});

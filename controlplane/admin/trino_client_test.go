@@ -5,6 +5,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -474,5 +475,118 @@ func TestNodesDoNotQueryAnnounceWhenTheFailureDetectorAnswers(t *testing.T) {
 		if r.URL.Path == "/v1/announce" {
 			t.Error("/v1/announce must not be queried when /v1/node answers")
 		}
+	}
+}
+
+// On a cell with no /v1/node, system.runtime.nodes is preferred over
+// /v1/announce: it is the only source carrying node_version, which is what
+// makes version skew visible during a rollout.
+func TestNodesPreferTheSystemTableOverAnnounce(t *testing.T) {
+	c, rec := newTrinoTestCoordinator(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/node" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/statement" {
+			_, _ = w.Write([]byte(`{"data":[
+			  ["worker2","http://10.0.0.2:8080","477",false,"ACTIVE"],
+			  ["coord","http://10.0.0.1:8080","476",true,"ACTIVE"],
+			  ["worker1","http://10.0.0.3:8080","476",false,"SHUTTING_DOWN"]
+			]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`["http://should-not-be-used:8080"]`))
+	})
+
+	inv, err := c.Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("Nodes: %v", err)
+	}
+	if inv.Source != TrinoNodeSourceSystemTable || !inv.HasNodeDetail() {
+		t.Fatalf("source = %q, want %q", inv.Source, TrinoNodeSourceSystemTable)
+	}
+	if inv.HasHealth() {
+		t.Error("the system table carries no heartbeat ratios and must not claim health")
+	}
+	if len(inv.Nodes) != 3 {
+		t.Fatalf("expected 3 nodes, got %d", len(inv.Nodes))
+	}
+	// Coordinator first, then by URI.
+	if !inv.Nodes[0].Coordinator || inv.Nodes[0].NodeID != "coord" {
+		t.Errorf("coordinator must sort first, got %+v", inv.Nodes[0])
+	}
+	if inv.Nodes[1].URI != "http://10.0.0.2:8080" || inv.Nodes[2].URI != "http://10.0.0.3:8080" {
+		t.Errorf("workers must sort by URI, got %+v", inv.Nodes[1:])
+	}
+	// Version is the whole reason this source is preferred.
+	if inv.Nodes[1].Version != "477" || inv.Nodes[2].Version != "476" {
+		t.Errorf("node versions not decoded: %+v", inv.Nodes)
+	}
+	if inv.Nodes[2].State != "SHUTTING_DOWN" {
+		t.Errorf("state not decoded: %+v", inv.Nodes[2])
+	}
+	for _, r := range rec.requests {
+		if r.URL.Path == "/v1/announce" {
+			t.Error("/v1/announce must not be queried when the system table answers")
+		}
+	}
+}
+
+// If the SQL path fails — the grant is not rolled out yet, the resource
+// group rejects it — the console must still name the fleet rather than show
+// nothing. /v1/announce is the last resort.
+func TestNodesFallBackToAnnounceWhenTheSystemTableIsDenied(t *testing.T) {
+	c, _ := newTrinoTestCoordinator(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/node" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/statement" {
+			// Trino reports authorization failures inside a 200 payload.
+			_, _ = w.Write([]byte(`{"error":{"message":"Access Denied: Cannot access catalog system","errorName":"PERMISSION_DENIED","errorType":"USER_ERROR"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`["http://10.0.0.1:8080"]`))
+	})
+
+	inv, err := c.Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("a denied system table must not fail the whole node read: %v", err)
+	}
+	if inv.Source != TrinoNodeSourceAnnounce {
+		t.Errorf("source = %q, want the announce fallback", inv.Source)
+	}
+	if len(inv.Nodes) != 1 {
+		t.Errorf("expected the announced node, got %+v", inv.Nodes)
+	}
+}
+
+// The statement protocol pages through nextUri; rows arrive across hops.
+func TestSystemTableNodesDrainsTheNextUriChain(t *testing.T) {
+	var hop int
+	var base string
+	c, rec := newTrinoTestCoordinator(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/node" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		hop++
+		if hop == 1 {
+			_, _ = fmt.Fprintf(w, `{"nextUri":"%s/v1/statement/x/1","data":[["a","http://10.0.0.1:8080","476",true,"ACTIVE"]]}`, base)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[["b","http://10.0.0.2:8080","476",false,"ACTIVE"]]}`))
+	})
+	base = rec.server.URL
+
+	inv, err := c.Nodes(context.Background())
+	if err != nil {
+		t.Fatalf("Nodes: %v", err)
+	}
+	if len(inv.Nodes) != 2 {
+		t.Fatalf("rows from every hop must be kept, got %+v", inv.Nodes)
 	}
 }

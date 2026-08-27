@@ -809,7 +809,10 @@ export interface TrinoServerInfo {
 //                     heartbeat health per node.
 //   announce          /v1/announce, bound under ANNOUNCE (Trino's default,
 //                     and what these cells run) and DNS. Membership only.
-export type TrinoNodeSource = "failure_detector" | "announce";
+//   system_table      system.runtime.nodes over SQL. Served by every cell
+//                     regardless of discovery.type, and the only source
+//                     carrying node_version — i.e. version skew.
+export type TrinoNodeSource = "failure_detector" | "announce" | "system_table";
 
 // Every field but `uri` is filled ONLY when the source is failure_detector.
 // Under announce they are zero because nothing was measured, which is not
@@ -823,6 +826,12 @@ export interface TrinoNode {
   recent_failure_ratio: number;
   last_response_time?: string;
   failed: boolean;
+  // Present only when the source is system_table.
+  node_id?: string;
+  version?: string;
+  coordinator?: boolean;
+  // Trino's NodeState: ACTIVE, INACTIVE, DRAINING, DRAINED, SHUTTING_DOWN.
+  state?: string;
 }
 
 export interface TrinoOrgStatus {

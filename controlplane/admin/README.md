@@ -213,8 +213,16 @@ and projects into `password.db` / `group.db`.
   run — and under `DNS`. The client tries `/v1/node` and falls back, and the
   payload carries `source` so the SPA renders membership-only rows instead of
   zero-filled health columns. Both routes are `@ResourceSecurity(MANAGEMENT_READ)`,
-  so the observer's existing `ReadSystemInformation` grant covers both and the
-  fallback needs **no policy change**.
+  so the observer's existing `ReadSystemInformation` grant covers both.
+- **`system.runtime.nodes` is preferred over `/v1/announce`** on a cell that
+  binds no `/v1/node`: it is served regardless of `discovery.type` and is the
+  only source carrying `node_version`, so it is where worker version skew
+  becomes visible. It is the observer's one data grant — `AccessCatalog` on
+  `system` plus `SelectFromColumns` pinned to that single table — and it
+  needs its own resource-group lane, because the catch-all selector would
+  otherwise file the console's query as a tenant. Order is `/v1/node` →
+  `system.runtime.nodes` → `/v1/announce`, so a cell where the grant has not
+  rolled out yet still lists its fleet.
 - Neither route carries a node id or version, so worker version skew is not
   observable there; the Nodes page's pod projection (running images) is where
   that lives.

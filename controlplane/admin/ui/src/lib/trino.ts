@@ -103,6 +103,10 @@ export function summarizeTrinoQueries(queries: TrinoQuery[]): TrinoQuerySummary 
   return s;
 }
 
+// Trino's NodeState for a node that is scheduling work normally. Anything
+// else is draining, shutting down or already gone.
+export const TRINO_ACTIVE_NODE_STATE = "ACTIVE";
+
 export interface TrinoNodeHealth {
   total: number;
   // healthKnown=false means the cell reported membership only (the announce
@@ -116,6 +120,14 @@ export interface TrinoNodeHealth {
   // gives only after the fact.
   degraded: number;
   worstFailureRatio: number;
+  // detailKnown=true means the source carried lifecycle state and version
+  // (system.runtime.nodes). inactive and versions are meaningful only then.
+  detailKnown: boolean;
+  // Nodes not in the ACTIVE state: draining, shutting down or inactive.
+  inactive: number;
+  // Distinct node versions, sorted. More than one means a rollout is in
+  // flight — or stuck, which is the case worth seeing.
+  versions: string[];
 }
 
 // A node that is still scheduled but failing this share of its heartbeats
@@ -128,13 +140,26 @@ export function summarizeTrinoNodes(
   source: TrinoNodeSource | undefined = "failure_detector",
 ): TrinoNodeHealth {
   const healthKnown = source === "failure_detector";
+  const detailKnown = source === "system_table";
   const h: TrinoNodeHealth = {
     total: nodes.length,
     healthKnown,
     failed: 0,
     degraded: 0,
     worstFailureRatio: 0,
+    detailKnown,
+    inactive: 0,
+    versions: [],
   };
+  if (detailKnown) {
+    const seen = new Set<string>();
+    for (const n of nodes) {
+      if (n.state && n.state !== TRINO_ACTIVE_NODE_STATE) h.inactive += 1;
+      if (n.version) seen.add(n.version);
+    }
+    h.versions = [...seen].sort();
+    return h;
+  }
   // The announce inventory carries a URI and nothing else. Counting its
   // zeroed heartbeat fields would manufacture a clean bill of health.
   if (!healthKnown) return h;

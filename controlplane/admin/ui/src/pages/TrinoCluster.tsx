@@ -12,6 +12,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { useOrgLabels, useTrinoNodes, useTrinoOrgs, useTrinoStatus } from "@/hooks/useApi";
 import { fmtDurationMs, fmtInt, fmtPercent, fmtTime } from "@/lib/format";
 import {
+  TRINO_ACTIVE_NODE_STATE,
   summarizeTrinoNodes,
   trinoOrgsNeedingAttention,
   trinoUnavailableMessage,
@@ -28,6 +29,7 @@ export function TrinoCluster() {
   // the case where only the summary has loaded.
   const nodeSource = nodes.data?.source ?? status.data?.node_source;
   const announcedOnly = nodeSource === "announce";
+  const fromSystemTable = nodeSource === "system_table";
   const nodeHealth = useMemo(
     () => summarizeTrinoNodes(nodes.data?.nodes ?? [], nodeSource),
     [nodes.data, nodeSource],
@@ -82,20 +84,32 @@ export function TrinoCluster() {
             label="Nodes"
             value={fmtInt(nodeHealth.total)}
             hint={
-              !nodeHealth.healthKnown
-                ? "membership only"
-                : nodeHealth.failed > 0 || nodeHealth.degraded > 0
-                  ? `${nodeHealth.failed} failed · ${nodeHealth.degraded} degraded`
-                  : "all healthy"
+              nodeHealth.detailKnown
+                ? // More than one version means a rollout is in flight, or
+                  // stuck. That is the thing to surface, ahead of the count.
+                  nodeHealth.versions.length > 1
+                  ? `version skew: ${nodeHealth.versions.join(" · ")}`
+                  : nodeHealth.inactive > 0
+                    ? `${nodeHealth.inactive} not active`
+                    : `all active${nodeHealth.versions[0] ? ` · ${nodeHealth.versions[0]}` : ""}`
+                : !nodeHealth.healthKnown
+                  ? "membership only"
+                  : nodeHealth.failed > 0 || nodeHealth.degraded > 0
+                    ? `${nodeHealth.failed} failed · ${nodeHealth.degraded} degraded`
+                    : "all healthy"
             }
             accent={
-              !nodeHealth.healthKnown
-                ? undefined
-                : nodeHealth.failed > 0
-                  ? "destructive"
-                  : nodeHealth.degraded > 0
-                    ? "warning"
-                    : "success"
+              nodeHealth.detailKnown
+                ? nodeHealth.versions.length > 1 || nodeHealth.inactive > 0
+                  ? "warning"
+                  : "success"
+                : !nodeHealth.healthKnown
+                  ? undefined
+                  : nodeHealth.failed > 0
+                    ? "destructive"
+                    : nodeHealth.degraded > 0
+                      ? "warning"
+                      : "success"
             }
             icon={<Network className="h-4 w-4" />}
           />
@@ -214,6 +228,51 @@ export function TrinoCluster() {
                     : "The coordinator's failure detector has not reported any peers."
                 }
               />
+            ) : fromSystemTable ? (
+              <>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Node</TableHead>
+                      <TableHead>Role</TableHead>
+                      <TableHead>Version</TableHead>
+                      <TableHead>State</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {(nodes.data?.nodes ?? []).map((n) => (
+                      <TableRow key={n.node_id ?? n.uri}>
+                        <TableCell className="font-mono text-xs">{n.uri}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {n.coordinator ? "coordinator" : "worker"}
+                        </TableCell>
+                        <TableCell className="font-mono text-xs">
+                          {/* Highlighted during skew: two versions here is a
+                              rollout in progress, or one that stalled. */}
+                          {nodeHealth.versions.length > 1 ? (
+                            <Badge variant="warning">{n.version}</Badge>
+                          ) : (
+                            (n.version ?? "—")
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {n.state === TRINO_ACTIVE_NODE_STATE ? (
+                            <Badge variant="success">{n.state}</Badge>
+                          ) : (
+                            <Badge variant="warning">{n.state ?? "unknown"}</Badge>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <p className="mt-3 text-[11px] text-muted-foreground">
+                  From <code>system.runtime.nodes</code>, which every cell serves regardless of{" "}
+                  <code>discovery.type</code> and which is the only source carrying node version.
+                  Per-node heartbeat ratios need <code>/v1/node</code>, i.e.{" "}
+                  <code>discovery.type=AIRLIFT_DISCOVERY</code>.
+                </p>
+              </>
             ) : announcedOnly ? (
               // Membership without health. The heartbeat columns are absent
               // rather than zero-filled: a rendered "healthy" badge here

@@ -525,21 +525,44 @@ func TestBuildTrinoResourceGroups_IsStaticAndTemplated(t *testing.T) {
 		}
 	}
 
-	// Selector order is first-match-wins: admin, then the explicit tiers,
-	// then free as the catch-all so an unknown tier still matches something.
-	if len(parsed.Selectors) != 4 {
-		t.Fatalf("expected 4 selectors (admin + scale + growth + catch-all), got %+v", parsed.Selectors)
+	// Selector order is first-match-wins: the two operational principals,
+	// then the explicit tiers, then free as the catch-all so an unknown tier
+	// still matches something.
+	if len(parsed.Selectors) != 5 {
+		t.Fatalf("expected 5 selectors (admin + observer + scale + growth + catch-all), got %+v", parsed.Selectors)
 	}
 	if parsed.Selectors[0].User != opa.AdminPrincipal {
 		t.Errorf("admin selector must be first, got %+v", parsed.Selectors[0])
+	}
+	// The observer must be matched before the catch-all. That last selector
+	// is user `(?<org>.*)`, so without its own lane the console's node query
+	// would be admitted as a tenant into root.tenants.free.<observer> — a
+	// JmxExport'd leaf, i.e. a phantom tenant in the per-tenant metrics.
+	if parsed.Selectors[1].User != opa.ObserverPrincipal {
+		t.Errorf("observer selector must precede the tenant selectors, got %+v", parsed.Selectors[1])
+	}
+	if got := parsed.Selectors[1].Group; got != "root.admin."+opa.ObserverPrincipal {
+		t.Errorf("observer must land in the admin tier, not a tenant lane, got %q", got)
 	}
 	last := parsed.Selectors[len(parsed.Selectors)-1]
 	if last.UserGroup != "" || last.Group != "root.tenants.free.${org}" {
 		t.Errorf("last selector must be the untiered catch-all into free, got %+v", last)
 	}
-	for _, sel := range parsed.Selectors[1:3] {
+	for _, sel := range parsed.Selectors[2:4] {
 		if sel.UserGroup == "" {
 			t.Errorf("tier selector must match on userGroup, got %+v", sel)
+		}
+	}
+
+	// Neither operational lane may be JMX-exported: those metrics are the
+	// per-tenant series, and an operational principal is not a tenant.
+	admin := findSubGroup(t, parsed.RootGroups[0].SubGroups, "admin")
+	if len(admin.SubGroups) != 2 {
+		t.Fatalf("expected admin tier to hold both operational principals, got %+v", admin.SubGroups)
+	}
+	for _, g := range admin.SubGroups {
+		if g.JmxExport {
+			t.Errorf("operational lane %q must not be JMX-exported as a tenant", g.Name)
 		}
 	}
 }
