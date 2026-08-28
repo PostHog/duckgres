@@ -162,12 +162,57 @@ consumers must never infer a join.
 Function declarations state whether lowering uses a stock Trino function, a
 registered UDF, or a compiler rewrite. Stock and UDF declarations omit
 `rewrite` and provide a non-empty structured `trinoName`. Rewrite declarations
-provide an empty `trinoName` and one closed `rewrite` identifier: `IS_NULL` or
-`IS_NOT_NULL`. Rewrites are deterministic scalar functions; every signature is
-unary, non-variadic, and returns `boolean` using case-insensitive canonical type
-text. Distinct, ordering, filter, and window traits are disabled. Missing,
-unknown, or implementation-incompatible rewrite values, signatures, and traits
-fail validation. Modifier behavior is one of compiler handling, a named Trino
+provide an empty `trinoName` and one identifier from the closed contract below.
+All rewrites are deterministic and disable distinct, ordering, and filter
+traits. Aggregate rewrites may enable window invocation; scalar rewrites may
+not. Only `IS_NULL` and `IS_NOT_NULL` require a `boolean` return type.
+
+Aggregate rewrite signatures are:
+
+- one argument: `COUNT_IF`, `COUNT_DISTINCT`, `GROUP_UNIQ_ARRAY`, `UNIQ_EXACT`;
+- two arguments: `ANY_IF`, `AVG_IF`, `GROUP_UNIQ_ARRAY_IF`, `MAX_IF`,
+  `MEDIAN_IF`, `MIN_IF`, `QUANTILE`, `QUANTILE_EXACT`, `SUM_IF`,
+  `UNIQ_EXACT_IF`, `UNIQ_IF`;
+- three arguments: `ARG_MAX_IF`, `ARG_MIN_IF`, `QUANTILE_IF`;
+- two or three arguments: `GROUP_ARRAY_IF`.
+
+Scalar rewrite signatures are:
+
+- no arguments: `TODAY`;
+- one argument: `ARRAY_ENUMERATE`, `ARRAY_SUM`, `ASSUME_NOT_NULL`,
+  `CAST_BIGINT`, `CAST_DATE`, `CAST_DOUBLE`, `CAST_SMALLINT`, `CAST_UUID`,
+  `CAST_VARCHAR`, `DATE_TRUNC_DAY`, `DATE_TRUNC_HOUR`, `DATE_TRUNC_MONTH`,
+  `DATE_TRUNC_WEEK`, `EMPTY`, `FLOAT_OR_ZERO`, `INTERVAL_DAY`,
+  `INTERVAL_MONTH`, `INT_OR_ZERO`, `IS_NULL`, `IS_NOT_NULL`, `MD5`, `NOT`,
+  `NOT_EMPTY`, `PARSE_TIMESTAMP`, `START_WEEK`, `TO_JSON_STRING`,
+  `TO_UNIX_TIMESTAMP`;
+- two arguments: `ADD_DAYS`, `ADD_MONTHS`, `ARRAY_ELEMENT`, `ARRAY_FILTER`,
+  `ARRAY_FIRST`, `ARRAY_MAP`, `DATE_PART`, `DECIMAL_CAST`, `DIVIDE_DECIMAL`,
+  `EQUALS`, `FLOAT_OR_DEFAULT`, `GREATER`, `GREATER_OR_EQUAL`, `HAS`,
+  `IN_ARRAY`, `INT_DIV`, `JSON_EXTRACT_TYPED`, `JSON_HAS`,
+  `JSON_KEYS_AND_VALUES`, `JSON_VALUE`, `LESS_OR_EQUAL`, `LIKE`, `MINUS`,
+  `MULTIPLY`, `MULTIPLY_DECIMAL`, `NOT_EQUALS`, `PLUS`, `REGEX_EXTRACT`,
+  `REGEX_EXTRACT_ALL`, `SPLIT_CHAR`, `SPLIT_STRING`, `SUBTRACT_MONTHS`,
+  `SUBTRACT_YEARS`, `SURVEY_RESPONSE`, `TUPLE_ELEMENT`;
+- three arguments: `ARRAY_SLICE`, `REGEX_REPLACE_ALL`, `REGEX_REPLACE_ONE`;
+- one or two arguments: `ARRAY_SORT`, `CAST_TIMESTAMP`, `RANGE`;
+- two or three arguments: `DATE_ADD`;
+- variadic with at least one argument: `TUPLE`;
+- variadic with at least two arguments: `JSON_EXTRACT_BOOL`,
+  `JSON_EXTRACT_FLOAT`, `JSON_EXTRACT_INT`, `JSON_EXTRACT_RAW`,
+  `JSON_EXTRACT_UINT`;
+- either one fixed argument or variadic with at least two arguments:
+  `JSON_EXTRACT_ARRAY_RAW`, `JSON_EXTRACT_KEYS`, `JSON_EXTRACT_STRING`,
+  `JSON_KEYS_AND_VALUES_RAW`, `JSON_LENGTH`;
+- either two fixed arguments or variadic with at least two arguments: `AND`;
+- variadic with at least three arguments: `MULTI_IF`. Invocations must contain
+  condition/result pairs followed by one default value, so their actual arity
+  is odd.
+
+For a variadic manifest signature, `argumentTypes` contains one more entry than
+the minimum accepted invocation arity. Missing, unknown, or
+implementation-incompatible rewrite values, kinds, signatures, and traits fail
+validation. Modifier behavior is one of compiler handling, a named Trino
 session property, a safe no-op, or explicitly unsupported. A consumer applies
 modifier defaults only after pinning this snapshot. An explicit request value
 replaces the declared default and must have the same canonical type signature.

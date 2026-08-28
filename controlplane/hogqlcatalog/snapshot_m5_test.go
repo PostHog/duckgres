@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -65,6 +66,80 @@ func TestSemanticMetadataJSONAndPublisherRoundTrip(t *testing.T) {
 	}
 	if got := again.VirtualTables[0].Projections[0].Name; got != "id" {
 		t.Fatalf("published projection leaked reader mutation: name = %q", got)
+	}
+}
+
+func TestFunctionRewriteContractRoundTrip(t *testing.T) {
+	rewrites := make([]FunctionRewriteIdentifier, 0, len(functionRewriteContracts))
+	for rewrite := range functionRewriteContracts {
+		rewrites = append(rewrites, rewrite)
+	}
+	sort.Slice(rewrites, func(left, right int) bool { return rewrites[left] < rewrites[right] })
+
+	snapshot := testSnapshot(1)
+	snapshot.Functions = make([]FunctionCapabilityDefinition, 0, len(rewrites))
+	for _, rewrite := range rewrites {
+		contract := functionRewriteContracts[rewrite]
+		snapshot.Functions = append(snapshot.Functions, validRewriteFunction(rewrite, contract.Signature))
+	}
+	document, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	decoded, err := DecodeSnapshot(strings.NewReader(string(document)))
+	if err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	if !reflect.DeepEqual(decoded.Functions, snapshot.Functions) {
+		t.Fatalf("rewrite contract changed during JSON round trip\n got: %#v\nwant: %#v", decoded.Functions, snapshot.Functions)
+	}
+}
+
+func TestFunctionRewriteSignatureContract(t *testing.T) {
+	tests := []struct {
+		name           string
+		rewrite        FunctionRewriteIdentifier
+		kind           FunctionKind
+		signature      FunctionSignature
+		supportsWindow bool
+		valid          bool
+	}{
+		{name: "zero argument scalar", rewrite: FunctionRewriteToday, kind: FunctionKindScalar, signature: rewriteSignature(0, false, "date"), valid: true},
+		{name: "unary scalar", rewrite: FunctionRewriteCastBigint, kind: FunctionKindScalar, signature: rewriteSignature(1, false, "bigint"), valid: true},
+		{name: "binary aggregate", rewrite: FunctionRewriteSumIf, kind: FunctionKindAggregate, signature: rewriteSignature(2, false, "any"), valid: true},
+		{name: "ternary aggregate", rewrite: FunctionRewriteArgMaxIf, kind: FunctionKindAggregate, signature: rewriteSignature(3, false, "any"), valid: true},
+		{name: "one or two arguments", rewrite: FunctionRewriteCastTimestamp, kind: FunctionKindScalar, signature: rewriteSignature(2, false, "timestamp"), valid: true},
+		{name: "two or three arguments", rewrite: FunctionRewriteDateAdd, kind: FunctionKindScalar, signature: rewriteSignature(3, false, "any"), valid: true},
+		{name: "fixed or variadic from one", rewrite: FunctionRewriteJSONLength, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "bigint"), valid: true},
+		{name: "fixed or variadic from two", rewrite: FunctionRewriteAnd, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "boolean"), valid: true},
+		{name: "variadic from one", rewrite: FunctionRewriteTuple, kind: FunctionKindScalar, signature: rewriteSignature(2, true, "row"), valid: true},
+		{name: "variadic from two", rewrite: FunctionRewriteJSONExtractInt, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "bigint"), valid: true},
+		{name: "variadic from three", rewrite: FunctionRewriteMultiIf, kind: FunctionKindScalar, signature: rewriteSignature(4, true, "any"), valid: true},
+		{name: "wrong kind", rewrite: FunctionRewriteCountIf, kind: FunctionKindScalar, signature: rewriteSignature(1, false, "bigint"), valid: false},
+		{name: "wrong fixed arity", rewrite: FunctionRewriteRegexReplaceAll, kind: FunctionKindScalar, signature: rewriteSignature(2, false, "varchar"), valid: false},
+		{name: "wrong variadic shape", rewrite: FunctionRewriteMultiIf, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "any"), valid: false},
+		{name: "unexpected variadic signature", rewrite: FunctionRewriteCastDate, kind: FunctionKindScalar, signature: rewriteSignature(2, true, "date"), valid: false},
+		{name: "null predicate non-boolean result", rewrite: FunctionRewriteIsNull, kind: FunctionKindScalar, signature: rewriteSignature(1, false, "bigint"), valid: false},
+		{name: "aggregate window invocation", rewrite: FunctionRewriteSumIf, kind: FunctionKindAggregate, signature: rewriteSignature(2, false, "any"), supportsWindow: true, valid: true},
+		{name: "scalar window invocation", rewrite: FunctionRewriteCastDate, kind: FunctionKindScalar, signature: rewriteSignature(1, false, "date"), supportsWindow: true, valid: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := testSnapshot(1)
+			function := validRewriteFunction(test.rewrite, functionRewriteContracts[test.rewrite].Signature)
+			function.Kind = test.kind
+			function.Signatures = []FunctionSignature{test.signature}
+			function.SupportsWindow = test.supportsWindow
+			snapshot.Functions = []FunctionCapabilityDefinition{function}
+			err := NewMemoryStore().Publish(context.Background(), snapshot)
+			if test.valid && err != nil {
+				t.Fatalf("publish valid rewrite: %v", err)
+			}
+			if !test.valid && !errors.Is(err, ErrInvalidSnapshot) {
+				t.Fatalf("publish invalid rewrite error = %v, want ErrInvalidSnapshot", err)
+			}
+		})
 	}
 }
 
@@ -323,7 +398,7 @@ func TestPublishRejectsInvalidSemanticRecipeGraph(t *testing.T) {
 			},
 		},
 		{
-			name: "rewrite function supports window",
+			name: "scalar rewrite function supports window",
 			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
 				snapshot.Functions[1].SupportsWindow = true
 			},
@@ -420,4 +495,49 @@ func completeSemanticSnapshot(generation int64) *HogQLSemanticCatalogSnapshot {
 
 func fieldRecipe(table, field string) ExpressionRecipe {
 	return ExpressionRecipe{Kind: ExpressionRecipeFieldReference, FieldReference: &FieldReferenceRecipe{Table: table, Field: field}}
+}
+
+func validRewriteFunction(rewrite FunctionRewriteIdentifier, signatureContract rewriteSignatureContract) FunctionCapabilityDefinition {
+	returnType := "any"
+	if rewrite == FunctionRewriteIsNull || rewrite == FunctionRewriteIsNotNull {
+		returnType = "boolean"
+	}
+	return FunctionCapabilityDefinition{
+		Name:           "rewrite_" + strings.ToLower(string(rewrite)),
+		Kind:           functionRewriteContracts[rewrite].Kind,
+		Implementation: FunctionImplementationRewrite,
+		TrinoName:      []PhysicalIdentifier{},
+		Rewrite:        rewrite,
+		Signatures:     []FunctionSignature{validRewriteSignature(signatureContract, returnType)},
+		Deterministic:  true,
+	}
+}
+
+func validRewriteSignature(contract rewriteSignatureContract, returnType string) FunctionSignature {
+	switch contract {
+	case rewriteSignatureFixedZero:
+		return rewriteSignature(0, false, returnType)
+	case rewriteSignatureFixedOne, rewriteSignatureFixedOneOrTwo, rewriteSignatureFixedOneOrVariadicMinimumTwo:
+		return rewriteSignature(1, false, returnType)
+	case rewriteSignatureFixedTwo, rewriteSignatureFixedTwoOrThree, rewriteSignatureFixedTwoOrVariadicMinimumTwo:
+		return rewriteSignature(2, false, returnType)
+	case rewriteSignatureFixedThree:
+		return rewriteSignature(3, false, returnType)
+	case rewriteSignatureVariadicMinimumOne:
+		return rewriteSignature(2, true, returnType)
+	case rewriteSignatureVariadicMinimumTwo:
+		return rewriteSignature(3, true, returnType)
+	case rewriteSignatureVariadicMinimumThree:
+		return rewriteSignature(4, true, returnType)
+	default:
+		panic("unknown rewrite signature contract")
+	}
+}
+
+func rewriteSignature(argumentCount int, variadic bool, returnType string) FunctionSignature {
+	arguments := make([]string, argumentCount)
+	for index := range arguments {
+		arguments[index] = "any"
+	}
+	return FunctionSignature{ArgumentTypes: arguments, ReturnType: returnType, Variadic: variadic}
 }

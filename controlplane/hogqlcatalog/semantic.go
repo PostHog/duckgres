@@ -226,9 +226,130 @@ const (
 type FunctionRewriteIdentifier string
 
 const (
-	FunctionRewriteIsNull    FunctionRewriteIdentifier = "IS_NULL"
-	FunctionRewriteIsNotNull FunctionRewriteIdentifier = "IS_NOT_NULL"
+	FunctionRewriteCastDate             FunctionRewriteIdentifier = "CAST_DATE"
+	FunctionRewriteCastDouble           FunctionRewriteIdentifier = "CAST_DOUBLE"
+	FunctionRewriteCastSmallint         FunctionRewriteIdentifier = "CAST_SMALLINT"
+	FunctionRewriteCastBigint           FunctionRewriteIdentifier = "CAST_BIGINT"
+	FunctionRewriteCastTimestamp        FunctionRewriteIdentifier = "CAST_TIMESTAMP"
+	FunctionRewriteCastUUID             FunctionRewriteIdentifier = "CAST_UUID"
+	FunctionRewriteCastVarchar          FunctionRewriteIdentifier = "CAST_VARCHAR"
+	FunctionRewriteAddDays              FunctionRewriteIdentifier = "ADD_DAYS"
+	FunctionRewriteAddMonths            FunctionRewriteIdentifier = "ADD_MONTHS"
+	FunctionRewriteAnd                  FunctionRewriteIdentifier = "AND"
+	FunctionRewriteAnyIf                FunctionRewriteIdentifier = "ANY_IF"
+	FunctionRewriteArgMaxIf             FunctionRewriteIdentifier = "ARG_MAX_IF"
+	FunctionRewriteArgMinIf             FunctionRewriteIdentifier = "ARG_MIN_IF"
+	FunctionRewriteArrayElement         FunctionRewriteIdentifier = "ARRAY_ELEMENT"
+	FunctionRewriteArrayEnumerate       FunctionRewriteIdentifier = "ARRAY_ENUMERATE"
+	FunctionRewriteArrayFilter          FunctionRewriteIdentifier = "ARRAY_FILTER"
+	FunctionRewriteArrayFirst           FunctionRewriteIdentifier = "ARRAY_FIRST"
+	FunctionRewriteArrayMap             FunctionRewriteIdentifier = "ARRAY_MAP"
+	FunctionRewriteArraySlice           FunctionRewriteIdentifier = "ARRAY_SLICE"
+	FunctionRewriteArraySort            FunctionRewriteIdentifier = "ARRAY_SORT"
+	FunctionRewriteArraySum             FunctionRewriteIdentifier = "ARRAY_SUM"
+	FunctionRewriteAssumeNotNull        FunctionRewriteIdentifier = "ASSUME_NOT_NULL"
+	FunctionRewriteAvgIf                FunctionRewriteIdentifier = "AVG_IF"
+	FunctionRewriteDateAdd              FunctionRewriteIdentifier = "DATE_ADD"
+	FunctionRewriteDatePart             FunctionRewriteIdentifier = "DATE_PART"
+	FunctionRewriteDateTruncDay         FunctionRewriteIdentifier = "DATE_TRUNC_DAY"
+	FunctionRewriteDateTruncHour        FunctionRewriteIdentifier = "DATE_TRUNC_HOUR"
+	FunctionRewriteDateTruncMonth       FunctionRewriteIdentifier = "DATE_TRUNC_MONTH"
+	FunctionRewriteDateTruncWeek        FunctionRewriteIdentifier = "DATE_TRUNC_WEEK"
+	FunctionRewriteCountIf              FunctionRewriteIdentifier = "COUNT_IF"
+	FunctionRewriteCountDistinct        FunctionRewriteIdentifier = "COUNT_DISTINCT"
+	FunctionRewriteDecimalCast          FunctionRewriteIdentifier = "DECIMAL_CAST"
+	FunctionRewriteDivideDecimal        FunctionRewriteIdentifier = "DIVIDE_DECIMAL"
+	FunctionRewriteEmpty                FunctionRewriteIdentifier = "EMPTY"
+	FunctionRewriteEquals               FunctionRewriteIdentifier = "EQUALS"
+	FunctionRewriteFloatOrDefault       FunctionRewriteIdentifier = "FLOAT_OR_DEFAULT"
+	FunctionRewriteFloatOrZero          FunctionRewriteIdentifier = "FLOAT_OR_ZERO"
+	FunctionRewriteGroupUniqArray       FunctionRewriteIdentifier = "GROUP_UNIQ_ARRAY"
+	FunctionRewriteGreater              FunctionRewriteIdentifier = "GREATER"
+	FunctionRewriteGreaterOrEqual       FunctionRewriteIdentifier = "GREATER_OR_EQUAL"
+	FunctionRewriteGroupArrayIf         FunctionRewriteIdentifier = "GROUP_ARRAY_IF"
+	FunctionRewriteGroupUniqArrayIf     FunctionRewriteIdentifier = "GROUP_UNIQ_ARRAY_IF"
+	FunctionRewriteHas                  FunctionRewriteIdentifier = "HAS"
+	FunctionRewriteInArray              FunctionRewriteIdentifier = "IN_ARRAY"
+	FunctionRewriteIntervalDay          FunctionRewriteIdentifier = "INTERVAL_DAY"
+	FunctionRewriteIntDiv               FunctionRewriteIdentifier = "INT_DIV"
+	FunctionRewriteIntOrZero            FunctionRewriteIdentifier = "INT_OR_ZERO"
+	FunctionRewriteIntervalMonth        FunctionRewriteIdentifier = "INTERVAL_MONTH"
+	FunctionRewriteIsNull               FunctionRewriteIdentifier = "IS_NULL"
+	FunctionRewriteIsNotNull            FunctionRewriteIdentifier = "IS_NOT_NULL"
+	FunctionRewriteJSONExtractArrayRaw  FunctionRewriteIdentifier = "JSON_EXTRACT_ARRAY_RAW"
+	FunctionRewriteJSONExtractBool      FunctionRewriteIdentifier = "JSON_EXTRACT_BOOL"
+	FunctionRewriteJSONExtractFloat     FunctionRewriteIdentifier = "JSON_EXTRACT_FLOAT"
+	FunctionRewriteJSONExtractInt       FunctionRewriteIdentifier = "JSON_EXTRACT_INT"
+	FunctionRewriteJSONExtractKeys      FunctionRewriteIdentifier = "JSON_EXTRACT_KEYS"
+	FunctionRewriteJSONExtractRaw       FunctionRewriteIdentifier = "JSON_EXTRACT_RAW"
+	FunctionRewriteJSONExtractString    FunctionRewriteIdentifier = "JSON_EXTRACT_STRING"
+	FunctionRewriteJSONExtractTyped     FunctionRewriteIdentifier = "JSON_EXTRACT_TYPED"
+	FunctionRewriteJSONExtractUInt      FunctionRewriteIdentifier = "JSON_EXTRACT_UINT"
+	FunctionRewriteJSONHas              FunctionRewriteIdentifier = "JSON_HAS"
+	FunctionRewriteJSONKeysAndValues    FunctionRewriteIdentifier = "JSON_KEYS_AND_VALUES"
+	FunctionRewriteJSONKeysAndValuesRaw FunctionRewriteIdentifier = "JSON_KEYS_AND_VALUES_RAW"
+	FunctionRewriteJSONLength           FunctionRewriteIdentifier = "JSON_LENGTH"
+	FunctionRewriteJSONValue            FunctionRewriteIdentifier = "JSON_VALUE"
+	FunctionRewriteLike                 FunctionRewriteIdentifier = "LIKE"
+	FunctionRewriteLessOrEqual          FunctionRewriteIdentifier = "LESS_OR_EQUAL"
+	FunctionRewriteMaxIf                FunctionRewriteIdentifier = "MAX_IF"
+	FunctionRewriteMD5                  FunctionRewriteIdentifier = "MD5"
+	FunctionRewriteMedianIf             FunctionRewriteIdentifier = "MEDIAN_IF"
+	FunctionRewriteMinIf                FunctionRewriteIdentifier = "MIN_IF"
+	FunctionRewriteMinus                FunctionRewriteIdentifier = "MINUS"
+	FunctionRewriteMultiply             FunctionRewriteIdentifier = "MULTIPLY"
+	FunctionRewriteMultiplyDecimal      FunctionRewriteIdentifier = "MULTIPLY_DECIMAL"
+	FunctionRewriteMultiIf              FunctionRewriteIdentifier = "MULTI_IF"
+	FunctionRewriteNot                  FunctionRewriteIdentifier = "NOT"
+	FunctionRewriteNotEquals            FunctionRewriteIdentifier = "NOT_EQUALS"
+	FunctionRewriteNotEmpty             FunctionRewriteIdentifier = "NOT_EMPTY"
+	FunctionRewriteParseTimestamp       FunctionRewriteIdentifier = "PARSE_TIMESTAMP"
+	FunctionRewritePlus                 FunctionRewriteIdentifier = "PLUS"
+	FunctionRewriteQuantile             FunctionRewriteIdentifier = "QUANTILE"
+	FunctionRewriteQuantileExact        FunctionRewriteIdentifier = "QUANTILE_EXACT"
+	FunctionRewriteQuantileIf           FunctionRewriteIdentifier = "QUANTILE_IF"
+	FunctionRewriteRegexExtract         FunctionRewriteIdentifier = "REGEX_EXTRACT"
+	FunctionRewriteRegexExtractAll      FunctionRewriteIdentifier = "REGEX_EXTRACT_ALL"
+	FunctionRewriteRegexReplaceAll      FunctionRewriteIdentifier = "REGEX_REPLACE_ALL"
+	FunctionRewriteRegexReplaceOne      FunctionRewriteIdentifier = "REGEX_REPLACE_ONE"
+	FunctionRewriteRange                FunctionRewriteIdentifier = "RANGE"
+	FunctionRewriteSplitChar            FunctionRewriteIdentifier = "SPLIT_CHAR"
+	FunctionRewriteSplitString          FunctionRewriteIdentifier = "SPLIT_STRING"
+	FunctionRewriteStartWeek            FunctionRewriteIdentifier = "START_WEEK"
+	FunctionRewriteSubtractMonths       FunctionRewriteIdentifier = "SUBTRACT_MONTHS"
+	FunctionRewriteSubtractYears        FunctionRewriteIdentifier = "SUBTRACT_YEARS"
+	FunctionRewriteSumIf                FunctionRewriteIdentifier = "SUM_IF"
+	FunctionRewriteSurveyResponse       FunctionRewriteIdentifier = "SURVEY_RESPONSE"
+	FunctionRewriteToday                FunctionRewriteIdentifier = "TODAY"
+	FunctionRewriteToJSONString         FunctionRewriteIdentifier = "TO_JSON_STRING"
+	FunctionRewriteToUnixTimestamp      FunctionRewriteIdentifier = "TO_UNIX_TIMESTAMP"
+	FunctionRewriteTuple                FunctionRewriteIdentifier = "TUPLE"
+	FunctionRewriteTupleElement         FunctionRewriteIdentifier = "TUPLE_ELEMENT"
+	FunctionRewriteUniqExact            FunctionRewriteIdentifier = "UNIQ_EXACT"
+	FunctionRewriteUniqExactIf          FunctionRewriteIdentifier = "UNIQ_EXACT_IF"
+	FunctionRewriteUniqIf               FunctionRewriteIdentifier = "UNIQ_IF"
 )
+
+type rewriteSignatureContract uint8
+
+const (
+	rewriteSignatureFixedZero rewriteSignatureContract = iota
+	rewriteSignatureFixedOne
+	rewriteSignatureFixedTwo
+	rewriteSignatureFixedThree
+	rewriteSignatureFixedOneOrTwo
+	rewriteSignatureFixedTwoOrThree
+	rewriteSignatureVariadicMinimumOne
+	rewriteSignatureVariadicMinimumTwo
+	rewriteSignatureVariadicMinimumThree
+	rewriteSignatureFixedOneOrVariadicMinimumTwo
+	rewriteSignatureFixedTwoOrVariadicMinimumTwo
+)
+
+type functionRewriteContract struct {
+	Kind      FunctionKind
+	Signature rewriteSignatureContract
+}
 
 type FunctionSignature struct {
 	ArgumentTypes []string `json:"argumentTypes"`
@@ -726,20 +847,30 @@ func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]*
 			return nil, invalidSnapshot("function %q must include Trino name and signatures", definition.Name)
 		}
 		if definition.Implementation == FunctionImplementationRewrite {
-			if !slices.Contains(validFunctionRewrites, definition.Rewrite) {
+			contract, exists := functionRewriteContracts[definition.Rewrite]
+			if !exists {
 				return nil, invalidSnapshot("rewrite function %q has an unknown rewrite", definition.Name)
 			}
 			if len(definition.TrinoName) != 0 {
 				return nil, invalidSnapshot("rewrite function %q cannot name a Trino function", definition.Name)
 			}
-			if definition.Kind != FunctionKindScalar {
-				return nil, invalidSnapshot("rewrite function %q must be scalar", definition.Name)
+			if definition.Kind != contract.Kind {
+				return nil, invalidSnapshot("rewrite function %q kind does not match its rewrite", definition.Name)
 			}
 			if !definition.Deterministic {
 				return nil, invalidSnapshot("rewrite function %q must be deterministic", definition.Name)
 			}
-			if definition.SupportsDistinct || definition.SupportsOrderBy || definition.SupportsFilter || definition.SupportsWindow {
-				return nil, invalidSnapshot("rewrite function %q cannot declare aggregate or window traits", definition.Name)
+			if definition.SupportsDistinct {
+				return nil, invalidSnapshot("rewrite function %q cannot support DISTINCT", definition.Name)
+			}
+			if definition.SupportsOrderBy {
+				return nil, invalidSnapshot("rewrite function %q cannot support ORDER BY", definition.Name)
+			}
+			if definition.SupportsFilter {
+				return nil, invalidSnapshot("rewrite function %q cannot support FILTER", definition.Name)
+			}
+			if definition.SupportsWindow && contract.Kind != FunctionKindAggregate {
+				return nil, invalidSnapshot("scalar rewrite function %q cannot support window invocation", definition.Name)
 			}
 		} else {
 			if definition.Rewrite != "" {
@@ -758,11 +889,14 @@ func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]*
 			if signature.ArgumentTypes == nil {
 				return nil, invalidSnapshot("function %q signature arguments are required", definition.Name)
 			}
-			if definition.Implementation == FunctionImplementationRewrite && (len(signature.ArgumentTypes) != 1 || signature.Variadic) {
-				return nil, invalidSnapshot("rewrite function %q signatures must be unary and non-variadic", definition.Name)
-			}
-			if definition.Implementation == FunctionImplementationRewrite && !strings.EqualFold(signature.ReturnType, "boolean") {
-				return nil, invalidSnapshot("rewrite function %q signatures must return boolean", definition.Name)
+			if definition.Implementation == FunctionImplementationRewrite {
+				contract := functionRewriteContracts[definition.Rewrite]
+				if !contract.accepts(signature) {
+					return nil, invalidSnapshot("rewrite function %q declares an invalid signature", definition.Name)
+				}
+				if (definition.Rewrite == FunctionRewriteIsNull || definition.Rewrite == FunctionRewriteIsNotNull) && !strings.EqualFold(signature.ReturnType, "boolean") {
+					return nil, invalidSnapshot("null predicate rewrite function %q signatures must return boolean", definition.Name)
+				}
 			}
 			for _, argument := range signature.ArgumentTypes {
 				if err := validateDefinitionText(argument, "function argument type"); err != nil {
@@ -778,6 +912,36 @@ func validateFunctions(definitions []FunctionCapabilityDefinition) (map[string]*
 		}
 	}
 	return functions, nil
+}
+
+func (contract functionRewriteContract) accepts(signature FunctionSignature) bool {
+	argumentCount := len(signature.ArgumentTypes)
+	switch contract.Signature {
+	case rewriteSignatureFixedZero:
+		return !signature.Variadic && argumentCount == 0
+	case rewriteSignatureFixedOne:
+		return !signature.Variadic && argumentCount == 1
+	case rewriteSignatureFixedTwo:
+		return !signature.Variadic && argumentCount == 2
+	case rewriteSignatureFixedThree:
+		return !signature.Variadic && argumentCount == 3
+	case rewriteSignatureFixedOneOrTwo:
+		return !signature.Variadic && (argumentCount == 1 || argumentCount == 2)
+	case rewriteSignatureFixedTwoOrThree:
+		return !signature.Variadic && (argumentCount == 2 || argumentCount == 3)
+	case rewriteSignatureVariadicMinimumOne:
+		return signature.Variadic && argumentCount == 2
+	case rewriteSignatureVariadicMinimumTwo:
+		return signature.Variadic && argumentCount == 3
+	case rewriteSignatureVariadicMinimumThree:
+		return signature.Variadic && argumentCount == 4
+	case rewriteSignatureFixedOneOrVariadicMinimumTwo:
+		return !signature.Variadic && argumentCount == 1 || signature.Variadic && argumentCount == 3
+	case rewriteSignatureFixedTwoOrVariadicMinimumTwo:
+		return !signature.Variadic && argumentCount == 2 || signature.Variadic && argumentCount == 3
+	default:
+		return false
+	}
 }
 
 func functionAcceptsArity(function *FunctionCapabilityDefinition, arity int) bool {
@@ -1185,7 +1349,143 @@ var validFunctionKinds = []FunctionKind{FunctionKindScalar, FunctionKindAggregat
 
 var validFunctionImplementations = []FunctionImplementation{FunctionImplementationStock, FunctionImplementationUDF, FunctionImplementationRewrite}
 
-var validFunctionRewrites = []FunctionRewriteIdentifier{FunctionRewriteIsNull, FunctionRewriteIsNotNull}
+var functionRewriteContracts = buildFunctionRewriteContracts()
+
+func buildFunctionRewriteContracts() map[FunctionRewriteIdentifier]functionRewriteContract {
+	contracts := make(map[FunctionRewriteIdentifier]functionRewriteContract)
+	add := func(kind FunctionKind, signature rewriteSignatureContract, rewrites ...FunctionRewriteIdentifier) {
+		for _, rewrite := range rewrites {
+			if _, exists := contracts[rewrite]; exists {
+				panic("duplicate function rewrite contract")
+			}
+			contracts[rewrite] = functionRewriteContract{Kind: kind, Signature: signature}
+		}
+	}
+
+	add(FunctionKindAggregate, rewriteSignatureFixedOne,
+		FunctionRewriteCountIf,
+		FunctionRewriteCountDistinct,
+		FunctionRewriteGroupUniqArray,
+		FunctionRewriteUniqExact,
+	)
+	add(FunctionKindAggregate, rewriteSignatureFixedTwo,
+		FunctionRewriteAnyIf,
+		FunctionRewriteAvgIf,
+		FunctionRewriteGroupUniqArrayIf,
+		FunctionRewriteMaxIf,
+		FunctionRewriteMedianIf,
+		FunctionRewriteMinIf,
+		FunctionRewriteQuantile,
+		FunctionRewriteQuantileExact,
+		FunctionRewriteSumIf,
+		FunctionRewriteUniqExactIf,
+		FunctionRewriteUniqIf,
+	)
+	add(FunctionKindAggregate, rewriteSignatureFixedThree,
+		FunctionRewriteArgMaxIf,
+		FunctionRewriteArgMinIf,
+		FunctionRewriteQuantileIf,
+	)
+	add(FunctionKindAggregate, rewriteSignatureFixedTwoOrThree, FunctionRewriteGroupArrayIf)
+
+	add(FunctionKindScalar, rewriteSignatureFixedZero, FunctionRewriteToday)
+	add(FunctionKindScalar, rewriteSignatureFixedOne,
+		FunctionRewriteArrayEnumerate,
+		FunctionRewriteArraySum,
+		FunctionRewriteAssumeNotNull,
+		FunctionRewriteCastBigint,
+		FunctionRewriteCastDate,
+		FunctionRewriteCastDouble,
+		FunctionRewriteCastSmallint,
+		FunctionRewriteCastUUID,
+		FunctionRewriteCastVarchar,
+		FunctionRewriteDateTruncDay,
+		FunctionRewriteDateTruncHour,
+		FunctionRewriteDateTruncMonth,
+		FunctionRewriteDateTruncWeek,
+		FunctionRewriteEmpty,
+		FunctionRewriteFloatOrZero,
+		FunctionRewriteIntervalDay,
+		FunctionRewriteIntervalMonth,
+		FunctionRewriteIntOrZero,
+		FunctionRewriteIsNull,
+		FunctionRewriteIsNotNull,
+		FunctionRewriteMD5,
+		FunctionRewriteNot,
+		FunctionRewriteNotEmpty,
+		FunctionRewriteParseTimestamp,
+		FunctionRewriteStartWeek,
+		FunctionRewriteToJSONString,
+		FunctionRewriteToUnixTimestamp,
+	)
+	add(FunctionKindScalar, rewriteSignatureFixedTwo,
+		FunctionRewriteAddDays,
+		FunctionRewriteAddMonths,
+		FunctionRewriteArrayElement,
+		FunctionRewriteArrayFilter,
+		FunctionRewriteArrayFirst,
+		FunctionRewriteArrayMap,
+		FunctionRewriteDatePart,
+		FunctionRewriteDecimalCast,
+		FunctionRewriteDivideDecimal,
+		FunctionRewriteEquals,
+		FunctionRewriteFloatOrDefault,
+		FunctionRewriteGreater,
+		FunctionRewriteGreaterOrEqual,
+		FunctionRewriteHas,
+		FunctionRewriteInArray,
+		FunctionRewriteIntDiv,
+		FunctionRewriteJSONExtractTyped,
+		FunctionRewriteJSONHas,
+		FunctionRewriteJSONKeysAndValues,
+		FunctionRewriteJSONValue,
+		FunctionRewriteLessOrEqual,
+		FunctionRewriteLike,
+		FunctionRewriteMinus,
+		FunctionRewriteMultiply,
+		FunctionRewriteMultiplyDecimal,
+		FunctionRewriteNotEquals,
+		FunctionRewritePlus,
+		FunctionRewriteRegexExtract,
+		FunctionRewriteRegexExtractAll,
+		FunctionRewriteSplitChar,
+		FunctionRewriteSplitString,
+		FunctionRewriteSubtractMonths,
+		FunctionRewriteSubtractYears,
+		FunctionRewriteSurveyResponse,
+		FunctionRewriteTupleElement,
+	)
+	add(FunctionKindScalar, rewriteSignatureFixedThree,
+		FunctionRewriteArraySlice,
+		FunctionRewriteRegexReplaceAll,
+		FunctionRewriteRegexReplaceOne,
+	)
+	add(FunctionKindScalar, rewriteSignatureFixedOneOrTwo,
+		FunctionRewriteArraySort,
+		FunctionRewriteCastTimestamp,
+		FunctionRewriteRange,
+	)
+	add(FunctionKindScalar, rewriteSignatureFixedTwoOrThree, FunctionRewriteDateAdd)
+	add(FunctionKindScalar, rewriteSignatureVariadicMinimumTwo,
+		FunctionRewriteJSONExtractBool,
+		FunctionRewriteJSONExtractFloat,
+		FunctionRewriteJSONExtractInt,
+		FunctionRewriteJSONExtractRaw,
+		FunctionRewriteJSONExtractUInt,
+	)
+	add(FunctionKindScalar, rewriteSignatureFixedOneOrVariadicMinimumTwo,
+		FunctionRewriteJSONExtractArrayRaw,
+		FunctionRewriteJSONExtractKeys,
+		FunctionRewriteJSONExtractString,
+		FunctionRewriteJSONKeysAndValuesRaw,
+		FunctionRewriteJSONLength,
+	)
+	add(FunctionKindScalar, rewriteSignatureFixedTwoOrVariadicMinimumTwo, FunctionRewriteAnd)
+	add(FunctionKindScalar, rewriteSignatureVariadicMinimumThree, FunctionRewriteMultiIf)
+	add(FunctionKindScalar, rewriteSignatureVariadicMinimumOne, FunctionRewriteTuple)
+
+	return contracts
+}
 
 var validModifierBehaviors = []ModifierBehavior{ModifierBehaviorCompiler, ModifierBehaviorTrinoSessionProperty, ModifierBehaviorSafeNoop, ModifierBehaviorUnsupported}
 
