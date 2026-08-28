@@ -1378,6 +1378,111 @@ func TestReconcile_StateTransitions(t *testing.T) {
 	}
 }
 
+// --- tenant secret mount lag ---
+
+// trinoSecretMountLagError reproduces what the coordinator actually returned in
+// production when a catalog was created in the same tick that projected the
+// org's key onto the tenant Secret, before the kubelet refreshed the mount.
+func trinoSecretMountLagError(orgID string) error {
+	return &TrinoStatementError{
+		ErrorName: "GENERIC_INTERNAL_ERROR",
+		ErrorType: "INTERNAL_ERROR",
+		Message: "Configuration errors:\n\n1) Error: Invalid configuration property " +
+			trinoDuckLakePasswordFileProperty + ": file does not exist: " +
+			DefaultTrinoTenantSecretMountPath + "/" + orgID +
+			" (for class DuckLakeConfig.connectionPasswordFile)\n\n1 error\n",
+	}
+}
+
+// A freshly onboarded org races the kubelet's Secret refresh. That window is a
+// wait, not a failure: before this the org was stamped Failed with a Trino
+// configuration error in status_message, then flipped to Ready seconds later.
+func TestReconcile_TenantSecretMountLagIsPendingNotFailed(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h", Tier: "free"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+	h.catalog.createErr = trinoSecretMountLagError("42")
+
+	// The tick itself must report success — otherwise the reconcile loop logs
+	// "Trino provisioner reconcile failed" for a routine onboarding.
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: a mount-lag race must not fail the tick: %v", err)
+	}
+	st, ok := h.store.lastState("42")
+	if !ok {
+		t.Fatalf("no state written for 42")
+	}
+	if st.State != configstore.ManagedWarehouseStateProvisioning {
+		t.Errorf("state = %q, want provisioning (msg=%q)", st.State, st.StatusMessage)
+	}
+	if !strings.Contains(st.StatusMessage, "tenant password file") {
+		t.Errorf("status_message = %q, want the mount-lag reason", st.StatusMessage)
+	}
+	if st.FailedAt != nil && !st.FailedAt.IsZero() {
+		t.Errorf("a mount-lag race must not stamp failed_at, got %v", st.FailedAt)
+	}
+
+	// Next tick, once the kubelet has caught up: converges unaided.
+	h.catalog.createErr = nil
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile (after the mount catches up): %v", err)
+	}
+	if st, _ := h.store.lastState("42"); st.State != configstore.ManagedWarehouseStateReady {
+		t.Errorf("state = %q, want ready once the password file exists", st.State)
+	}
+}
+
+// The classifier decides whether a real failure gets silently downgraded to
+// "still waiting", so it must match ONLY this org's missing password file.
+// Catalog properties carry tenant-influenced values that Trino echoes back in
+// configuration errors, which is exactly how a loose substring match would
+// misfire.
+func TestTenantSecretNotMountedYetOnlyMatchesThisOrgsMissingPasswordFile(t *testing.T) {
+	h := newTestTrinoProvisioner(t, nil, nil)
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"the production mount-lag error", trinoSecretMountLagError("42"), true},
+		{"another org's password file", trinoSecretMountLagError("43"), false},
+		{
+			"a different property missing a different file",
+			&TrinoStatementError{
+				ErrorName: "GENERIC_INTERNAL_ERROR",
+				Message: "Invalid configuration property ducklake.metadata.connection-url: " +
+					"file does not exist: /etc/trino/somewhere-else",
+			},
+			false,
+		},
+		{
+			"tenant data echoed back inside an unrelated config error",
+			&TrinoStatementError{
+				ErrorName: "GENERIC_INTERNAL_ERROR",
+				Message: `Invalid configuration property ducklake.data-path: cannot read bucket ` +
+					`"file does not exist: ` + DefaultTrinoTenantSecretMountPath + `/42"`,
+			},
+			false,
+		},
+		{
+			"the same text as an untyped error",
+			errors.New(trinoSecretMountLagError("42").Error()),
+			false,
+		},
+		{"an unrelated coordinator failure", errors.New("trino: 503 service unavailable"), false},
+		{"no error at all", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := h.provisioner.tenantSecretNotMountedYet(tc.err, "42"); got != tc.want {
+				t.Errorf("tenantSecretNotMountedYet = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // --- cell awareness ---
 
 func TestReconcile_ClaimsUnassignedOrgsIntoThisCell(t *testing.T) {
