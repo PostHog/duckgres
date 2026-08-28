@@ -106,6 +106,12 @@ func TestPublishRejectsInvalidLogicalSemanticRecipes(t *testing.T) {
 			},
 		},
 		{
+			name: "JSON object lookup operator arity",
+			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
+				snapshot.LogicalTables[0].Properties[0].LookupRecipe.Operator.Arguments = snapshot.LogicalTables[0].Properties[0].LookupRecipe.Operator.Arguments[:1]
+			},
+		},
+		{
 			name: "property reference unknown property",
 			mutate: func(snapshot *HogQLSemanticCatalogSnapshot) {
 				snapshot.Actions[0].Representation.Predicate.Operator.Arguments[0].PropertyLookup.Property = "missing"
@@ -238,7 +244,7 @@ func logicalSemanticSnapshot(generation int64) *HogQLSemanticCatalogSnapshot {
 	snapshot.LogicalTables[0].Properties[0].LookupRecipe = &ExpressionRecipe{
 		Kind: ExpressionRecipeOperator,
 		Operator: &OperatorRecipe{
-			Operator: SemanticOperatorSubscript,
+			Operator: SemanticOperatorJSONObjectLookup,
 			Arguments: []ExpressionRecipe{
 				argumentRecipe(ExpressionArgumentPropertySource),
 				argumentRecipe(ExpressionArgumentPropertyKey),
@@ -251,7 +257,7 @@ func logicalSemanticSnapshot(generation int64) *HogQLSemanticCatalogSnapshot {
 		LookupRecipe: ptrExpressionRecipe(ExpressionRecipe{
 			Kind: ExpressionRecipeOperator,
 			Operator: &OperatorRecipe{
-				Operator: SemanticOperatorSubscript,
+				Operator: SemanticOperatorJSONObjectLookup,
 				Arguments: []ExpressionRecipe{
 					argumentRecipe(ExpressionArgumentPropertySource),
 					argumentRecipe(ExpressionArgumentPropertyKey),

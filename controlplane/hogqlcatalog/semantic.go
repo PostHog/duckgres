@@ -89,6 +89,7 @@ const (
 	SemanticOperatorIsNull             SemanticOperator = "IS_NULL"
 	SemanticOperatorIsNotNull          SemanticOperator = "IS_NOT_NULL"
 	SemanticOperatorSubscript          SemanticOperator = "SUBSCRIPT"
+	SemanticOperatorJSONObjectLookup   SemanticOperator = "JSON_OBJECT_LOOKUP"
 )
 
 type ArgumentReferenceRecipe struct {
@@ -649,7 +650,8 @@ func semanticOperatorArity(operator SemanticOperator) int {
 		SemanticOperatorGreaterThanOrEqual,
 		SemanticOperatorAnd,
 		SemanticOperatorOr,
-		SemanticOperatorSubscript:
+		SemanticOperatorSubscript,
+		SemanticOperatorJSONObjectLookup:
 		return 2
 	case SemanticOperatorNot,
 		SemanticOperatorNegate,
@@ -1176,7 +1178,7 @@ var validSemanticOperators = []SemanticOperator{
 	SemanticOperatorEqual, SemanticOperatorNotEqual, SemanticOperatorLessThan, SemanticOperatorLessThanOrEqual,
 	SemanticOperatorGreaterThan, SemanticOperatorGreaterThanOrEqual, SemanticOperatorAnd, SemanticOperatorOr,
 	SemanticOperatorNot, SemanticOperatorNegate, SemanticOperatorIsNull, SemanticOperatorIsNotNull,
-	SemanticOperatorSubscript,
+	SemanticOperatorSubscript, SemanticOperatorJSONObjectLookup,
 }
 
 var validFunctionKinds = []FunctionKind{FunctionKindScalar, FunctionKindAggregate, FunctionKindWindow, FunctionKindTable}

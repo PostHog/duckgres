@@ -118,7 +118,7 @@ func (s *MemoryStore) PublishPhysicalRefresh(ctx context.Context, lease *Physica
 	if err != nil {
 		return nil, false, err
 	}
-	if latest != nil && physicalInventoriesEqual(latest, merged) {
+	if latest != nil && snapshotContentsEqual(latest, merged) {
 		s.releasePhysicalRefresh(lease, s.now().Add(refreshAfter))
 		return cloneSnapshot(latest), false, nil
 	}

@@ -12,39 +12,39 @@ func mergePhysicalCatalog(ctx context.Context, metadata *PhysicalCatalogMetadata
 	if err != nil {
 		return nil, err
 	}
-	if latest == nil {
-		return physical, nil
-	}
-	current, err := normalizeAndValidateSnapshot(latest)
-	if err != nil {
-		return nil, err
-	}
-	if current.Catalog != physical.Catalog {
-		return nil, invalidSnapshot("physical refresh catalog does not match latest snapshot")
-	}
-	if current.LanguageVersion != languageVersion {
-		return nil, invalidSnapshot("physical refresh languageVersion does not match latest snapshot")
-	}
+	if latest != nil {
+		current, err := normalizeAndValidateSnapshot(latest)
+		if err != nil {
+			return nil, err
+		}
+		if current.Catalog != physical.Catalog {
+			return nil, invalidSnapshot("physical refresh catalog does not match latest snapshot")
+		}
+		if current.LanguageVersion != languageVersion {
+			return nil, invalidSnapshot("physical refresh languageVersion does not match latest snapshot")
+		}
 
-	currentTables := make(map[string][]LogicalTableDefinition, len(current.LogicalTables))
-	for _, table := range current.LogicalTables {
-		key := physicalQualifiedNameKey(table.PhysicalTable)
-		currentTables[key] = append(currentTables[key], table)
-	}
-	refreshedTables := make([]LogicalTableDefinition, 0, len(physical.LogicalTables))
-	for _, physicalTable := range physical.LogicalTables {
-		currentDefinitions := currentTables[physicalQualifiedNameKey(physicalTable.PhysicalTable)]
-		if len(currentDefinitions) == 0 {
-			refreshedTables = append(refreshedTables, physicalTable)
-			continue
+		currentTables := make(map[string][]LogicalTableDefinition, len(current.LogicalTables))
+		for _, table := range current.LogicalTables {
+			key := physicalQualifiedNameKey(table.PhysicalTable)
+			currentTables[key] = append(currentTables[key], table)
 		}
-		for _, currentTable := range currentDefinitions {
-			refreshedTables = append(refreshedTables, refreshLogicalTable(physicalTable, currentTable))
+		refreshedTables := make([]LogicalTableDefinition, 0, len(physical.LogicalTables))
+		for _, physicalTable := range physical.LogicalTables {
+			currentDefinitions := currentTables[physicalQualifiedNameKey(physicalTable.PhysicalTable)]
+			if len(currentDefinitions) == 0 {
+				refreshedTables = append(refreshedTables, physicalTable)
+				continue
+			}
+			for _, currentTable := range currentDefinitions {
+				refreshedTables = append(refreshedTables, refreshLogicalTable(physicalTable, currentTable))
+			}
 		}
+		physical.LogicalTables = refreshedTables
+		cloneSemanticMetadata(physical, current)
 	}
-	physical.LogicalTables = refreshedTables
-	cloneSemanticMetadata(physical, current)
-	normalized, err := normalizeAndValidateSnapshot(physical)
+	profiled := applyPostHogV0Profile(physical)
+	normalized, err := normalizeAndValidateSnapshot(profiled)
 	if err != nil {
 		return nil, fmt.Errorf("merge HogQL physical catalog metadata: %w", err)
 	}
@@ -74,37 +74,10 @@ func physicalQualifiedNameKey(name PhysicalQualifiedName) string {
 	return physicalIdentifierKey(name.Catalog) + "\x00" + physicalIdentifierKey(name.Schema) + "\x00" + physicalIdentifierKey(name.Table)
 }
 
-func physicalInventoriesEqual(left, right *HogQLSemanticCatalogSnapshot) bool {
-	return reflect.DeepEqual(physicalInventory(left), physicalInventory(right))
-}
-
-type physicalInventoryTable struct {
-	name   PhysicalQualifiedName
-	fields []physicalInventoryField
-}
-
-type physicalInventoryField struct {
-	column             PhysicalIdentifier
-	trinoTypeSignature string
-	logicalType        LogicalType
-	nullable           bool
-	starVisible        bool
-}
-
-func physicalInventory(snapshot *HogQLSemanticCatalogSnapshot) []physicalInventoryTable {
-	tables := make([]physicalInventoryTable, 0, len(snapshot.LogicalTables))
-	for _, table := range snapshot.LogicalTables {
-		fields := make([]physicalInventoryField, 0, len(table.Fields))
-		for _, field := range table.Fields {
-			fields = append(fields, physicalInventoryField{
-				column:             field.PhysicalColumn,
-				trinoTypeSignature: field.TrinoTypeSignature,
-				logicalType:        field.LogicalType,
-				nullable:           field.Nullable,
-				starVisible:        field.StarVisible,
-			})
-		}
-		tables = append(tables, physicalInventoryTable{name: table.PhysicalTable, fields: fields})
-	}
-	return tables
+func snapshotContentsEqual(left, right *HogQLSemanticCatalogSnapshot) bool {
+	leftContent := cloneSnapshot(left)
+	rightContent := cloneSnapshot(right)
+	leftContent.Generation = 0
+	rightContent.Generation = 0
+	return reflect.DeepEqual(leftContent, rightContent)
 }

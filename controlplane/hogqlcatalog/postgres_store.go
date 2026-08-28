@@ -134,7 +134,7 @@ func (s *PostgresStore) PublishPhysicalRefresh(ctx context.Context, lease *Physi
 		if err != nil {
 			return err
 		}
-		if latest != nil && physicalInventoriesEqual(latest, merged) {
+		if latest != nil && snapshotContentsEqual(latest, merged) {
 			published = latest
 		} else {
 			if err := insertPostgresSnapshot(tx, merged); err != nil {
