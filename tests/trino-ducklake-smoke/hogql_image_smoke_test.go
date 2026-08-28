@@ -24,9 +24,11 @@ import (
 )
 
 const (
-	hogQLStatementPath = "/v1/hogql"
-	trinoStatementPath = "/v1/statement"
-	hogQLCatalogToken  = "synthetic-hogql-catalog-token"
+	hogQLStatementPath       = "/v1/hogql"
+	trinoStatementPath       = "/v1/statement"
+	hogQLSemanticCatalogPath = "/v1/hogql/compatibility/semantic-catalog"
+	hogQLExchangeRatesPath   = "/v1/hogql/compatibility/exchange-rates"
+	hogQLCatalogToken        = "synthetic-hogql-catalog-token"
 )
 
 type imageQueryError struct {
@@ -56,6 +58,8 @@ type imageQueryOutcome struct {
 type imageTrinoClient struct {
 	baseURL    string
 	httpClient *http.Client
+	catalog    string
+	schema     string
 }
 
 type semanticCatalogRequest struct {
@@ -70,6 +74,7 @@ type semanticCatalogServer struct {
 	available bool
 	latest    int64
 	snapshots map[int64][]byte
+	exchange  []byte
 	requests  []semanticCatalogRequest
 }
 
@@ -87,9 +92,9 @@ func TestHogQLExactImageSmoke(t *testing.T) {
 	tokenPath := filepath.Join(configDir, "catalog-token")
 	writeTestFile(t, tokenPath, hogQLCatalogToken+"\n")
 	configPath := filepath.Join(configDir, "config.properties")
-	writeTestFile(t, configPath, hogQLTrinoConfig(server.Listener.Addr().(*net.TCPAddr).Port))
+	writeTestFile(t, configPath, hogQLTrinoConfig(server.Listener.Addr().(*net.TCPAddr).Port, "100ms", "750ms"))
 
-	baseURL := startHogQLTrinoContainer(t, image, configPath, tokenPath)
+	baseURL := startHogQLTrinoContainer(t, image, configPath, tokenPath, "", true)
 	client := &imageTrinoClient{baseURL: baseURL, httpClient: &http.Client{Timeout: 2 * time.Minute}}
 	waitForTrino(t, client)
 	seedHogQLMemoryFixture(t, client)
@@ -175,11 +180,20 @@ func newSemanticCatalogServer(t *testing.T, token string, snapshot *hogqlcatalog
 		token:     token,
 		latest:    snapshot.Generation,
 		snapshots: map[int64][]byte{snapshot.Generation: payload},
+		exchange:  validatedExchangeRateJSON(t, syntheticExchangeRateSnapshot()),
 	}
 }
 
 func (s *semanticCatalogServer) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	if request.Method != http.MethodGet || request.URL.Path != "/v1/hogql/compatibility/semantic-catalog" {
+	if request.Method != http.MethodGet {
+		http.NotFound(writer, request)
+		return
+	}
+	if request.URL.Path == hogQLExchangeRatesPath {
+		s.serveExchangeRates(writer, request)
+		return
+	}
+	if request.URL.Path != hogQLSemanticCatalogPath {
 		http.NotFound(writer, request)
 		return
 	}
@@ -214,6 +228,55 @@ func (s *semanticCatalogServer) ServeHTTP(writer http.ResponseWriter, request *h
 	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("ETag", fmt.Sprintf(`"hogql-%d"`, generation))
 	_, _ = writer.Write(payload)
+}
+
+func (s *semanticCatalogServer) serveExchangeRates(writer http.ResponseWriter, request *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if request.Header.Get("X-Duckgres-Internal-Secret") != s.token {
+		writeSemanticCatalogError(writer, http.StatusUnauthorized)
+		return
+	}
+	if !s.available {
+		writeSemanticCatalogError(writer, http.StatusServiceUnavailable)
+		return
+	}
+	if request.URL.Query().Get("protocolVersion") != strconv.Itoa(hogqlcatalog.ExchangeRateProtocolVersion) {
+		writeSemanticCatalogError(writer, http.StatusConflict)
+		return
+	}
+	if rawGeneration := request.URL.Query().Get("generation"); rawGeneration != "" && rawGeneration != "1" {
+		writeSemanticCatalogError(writer, http.StatusNotFound)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("ETag", `"hogql-exchange-rates-1"`)
+	_, _ = writer.Write(s.exchange)
+}
+
+func syntheticExchangeRateSnapshot() *hogqlcatalog.ExchangeRateSnapshot {
+	return &hogqlcatalog.ExchangeRateSnapshot{
+		ProtocolVersion: hogqlcatalog.ExchangeRateProtocolVersion,
+		SchemaVersion:   hogqlcatalog.ExchangeRateSchemaVersion,
+		Generation:      1,
+		BaseCurrency:    hogqlcatalog.ExchangeRateBaseCurrency,
+		DecimalScale:    hogqlcatalog.ExchangeRateDecimalScale,
+		Rates: []hogqlcatalog.ExchangeRateEntry{
+			{Currency: "USD", EffectiveDate: "1970-01-01", UnscaledRate: "10000000000"},
+		},
+	}
+}
+
+func validatedExchangeRateJSON(t *testing.T, snapshot *hogqlcatalog.ExchangeRateSnapshot) []byte {
+	t.Helper()
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal synthetic exchange rates: %v", err)
+	}
+	if _, err := hogqlcatalog.DecodeExchangeRateSnapshot(strings.NewReader(string(payload))); err != nil {
+		t.Fatalf("validate synthetic exchange rates: %v", err)
+	}
+	return payload
 }
 
 func (s *semanticCatalogServer) publish(t *testing.T, snapshot *hogqlcatalog.HogQLSemanticCatalogSnapshot) {
@@ -383,7 +446,7 @@ func hogQLSnapshot(t *testing.T, generation int64) *hogqlcatalog.HogQLSemanticCa
 	}
 }
 
-func hogQLTrinoConfig(semanticCatalogPort int) string {
+func hogQLTrinoConfig(semanticCatalogPort int, refreshAfter, expireAfter string) string {
 	return fmt.Sprintf(`coordinator=true
 node-scheduler.include-coordinator=true
 discovery.uri=http://localhost:8080
@@ -393,11 +456,11 @@ hogql.compilation-threads=2
 hogql.compilation-queue-capacity=8
 hogql.semantic-catalog.uri=http://host.docker.internal:%d
 hogql.semantic-catalog.authentication-token-file=/run/secrets/hogql-catalog-token
-hogql.semantic-catalog.refresh-after=100ms
-hogql.semantic-catalog.expire-after=750ms
+hogql.semantic-catalog.refresh-after=%s
+hogql.semantic-catalog.expire-after=%s
 hogql.semantic-catalog.failure-backoff=25ms
 hogql.semantic-catalog.request-timeout=1s
-`, semanticCatalogPort)
+`, semanticCatalogPort, refreshAfter, expireAfter)
 }
 
 func resolveImmutableImageReference(t *testing.T, image string) string {
@@ -428,7 +491,7 @@ func immutableImageReference(image string) bool {
 	return err == nil && len(decoded) == 32
 }
 
-func startHogQLTrinoContainer(t *testing.T, image, configPath, tokenPath string) string {
+func startHogQLTrinoContainer(t *testing.T, image, configPath, tokenPath, catalogDirectory string, logFailure bool) string {
 	t.Helper()
 	port := reserveTCPPort(t)
 	name := fmt.Sprintf("duckgres-hogql-smoke-%d-%d", os.Getpid(), time.Now().UnixNano())
@@ -438,16 +501,22 @@ func startHogQLTrinoContainer(t *testing.T, image, configPath, tokenPath string)
 		"--add-host", "host.docker.internal:host-gateway",
 		"--volume", configPath + ":/etc/trino/config.properties:ro",
 		"--volume", tokenPath + ":/run/secrets/hogql-catalog-token:ro",
-		image,
 	}
+	if catalogDirectory != "" {
+		args = append(args, "--volume", catalogDirectory+":/etc/trino/catalog:ro")
+	}
+	args = append(args, image)
 	output, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("start exact Trino image: %v\n%s", err, output)
 	}
 	t.Cleanup(func() {
-		if t.Failed() {
-			logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
-			t.Logf("Trino container logs:\n%s", logs)
+		if t.Failed() && logFailure {
+			running, _ := exec.Command("docker", "inspect", "--format", "{{.State.Running}}", name).CombinedOutput()
+			if strings.TrimSpace(string(running)) != "true" {
+				logs, _ := exec.Command("docker", "logs", name).CombinedOutput()
+				t.Logf("Trino container logs:\n%s", logs)
+			}
 		}
 		_, _ = exec.Command("docker", "rm", "--force", name).CombinedOutput()
 	})
@@ -531,8 +600,8 @@ func assertExactImageDifferentialCorpus(t *testing.T, client *imageTrinoClient) 
 		},
 		{
 			name:     "set operations",
-			hogQL:    "SELECT 2 AS value UNION SELECT 3",
-			trinoSQL: "SELECT 2 AS value UNION SELECT 3",
+			hogQL:    "SELECT 2 AS value UNION SELECT 3 ORDER BY value",
+			trinoSQL: "SELECT 2 AS value UNION SELECT 3 ORDER BY value",
 		},
 		{
 			name:     "native values",
@@ -578,7 +647,7 @@ func assertExactImageDifferentialCorpus(t *testing.T, client *imageTrinoClient) 
 	for _, query := range queries {
 		query := query
 		t.Run(query.name, func(t *testing.T) {
-			hogQL := requireHogQLSuccess(t, client, hogQLRequest(query.hogQL, 0, nil))
+			hogQL := waitForHogQLSuccess(t, client, hogQLRequest(query.hogQL, 0, nil))
 			trinoSQL := requireSQLSuccess(t, client, query.trinoSQL)
 			if !reflect.DeepEqual(hogQL.Columns, trinoSQL.Columns) {
 				t.Fatalf("schema differs\nHogQL: %v\nSQL: %v", hogQL.Columns, trinoSQL.Columns)
@@ -689,9 +758,17 @@ func (c *imageTrinoClient) cancel(nextURI string) error {
 }
 
 func (c *imageTrinoClient) setHeaders(request *http.Request) {
+	catalog := c.catalog
+	if catalog == "" {
+		catalog = "memory"
+	}
+	schema := c.schema
+	if schema == "" {
+		schema = "default"
+	}
 	request.Header.Set("X-Trino-User", "hogql-smoke")
-	request.Header.Set("X-Trino-Catalog", "memory")
-	request.Header.Set("X-Trino-Schema", "default")
+	request.Header.Set("X-Trino-Catalog", catalog)
+	request.Header.Set("X-Trino-Schema", schema)
 	request.Header.Set("X-Trino-Time-Zone", "UTC")
 }
 
