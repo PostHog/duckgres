@@ -60,7 +60,7 @@ func normalizeAndValidateExchangeRateSnapshot(snapshot *ExchangeRateSnapshot) (*
 	if snapshot.DecimalScale != ExchangeRateDecimalScale {
 		return nil, invalidExchangeRateSnapshot("decimalScale must be %d", ExchangeRateDecimalScale)
 	}
-	if snapshot.Rates == nil || len(snapshot.Rates) == 0 {
+	if len(snapshot.Rates) == 0 {
 		return nil, invalidExchangeRateSnapshot("rates must be a non-empty array")
 	}
 	if len(snapshot.Rates) > maximumExchangeRateEntries {
