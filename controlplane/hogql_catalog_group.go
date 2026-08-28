@@ -11,10 +11,11 @@ import (
 func registerHogQLCatalogGroup(
 	engine *gin.Engine,
 	readOnlyTokens, adminTokens admin.TokenSet,
-	reader hogqlcatalog.Reader,
-	publisher hogqlcatalog.Publisher,
+	reader hogqlcatalog.CompatibilityReader,
+	publisher hogqlcatalog.CompatibilityPublisher,
 ) {
 	readAPI := engine.Group("/v1/hogql", admin.AnyTokenAuthMiddleware(readOnlyTokens, adminTokens))
 	publishAPI := engine.Group("/v1/hogql", admin.AnyTokenAuthMiddleware(adminTokens))
 	hogqlcatalog.RegisterAPI(readAPI, publishAPI, reader, publisher)
+	hogqlcatalog.RegisterExchangeRateAPI(readAPI, publishAPI, reader, publisher)
 }

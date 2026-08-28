@@ -17,6 +17,7 @@ import (
 const (
 	postgresSnapshotTable             = "duckgres_hogql_semantic_catalog_snapshots"
 	postgresPhysicalRefreshLeaseTable = "duckgres_hogql_physical_catalog_refresh_leases"
+	postgresExchangeRateSnapshotTable = "duckgres_hogql_exchange_rate_snapshots"
 )
 
 type PostgresStore struct {
@@ -31,6 +32,15 @@ type postgresSnapshotRow struct {
 	SchemaVersion    int
 	LanguageVersion  string
 	Manifest         []byte
+}
+
+type postgresExchangeRateSnapshotRow struct {
+	Generation      int64
+	ProtocolVersion int
+	SchemaVersion   int
+	BaseCurrency    string
+	DecimalScale    int
+	Snapshot        []byte
 }
 
 func NewPostgresStore(db *gorm.DB) *PostgresStore {
@@ -365,6 +375,123 @@ func decodePostgresRow(row *postgresSnapshotRow) (*HogQLSemanticCatalogSnapshot,
 		snapshot.SchemaVersion != row.SchemaVersion ||
 		snapshot.LanguageVersion != row.LanguageVersion {
 		return nil, fmt.Errorf("%w: persisted snapshot columns do not match manifest", ErrInvalidSnapshot)
+	}
+	return snapshot, nil
+}
+
+func (s *PostgresStore) PublishExchangeRates(ctx context.Context, snapshot *ExchangeRateSnapshot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	normalized, err := normalizeAndValidateExchangeRateSnapshot(snapshot)
+	if err != nil {
+		return err
+	}
+	document, err := json.Marshal(normalized)
+	if err != nil {
+		return fmt.Errorf("encode HogQL exchange-rate snapshot: %w", err)
+	}
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtextextended('hogql-exchange-rates', 0))").Error; err != nil {
+			return fmt.Errorf("lock HogQL exchange rates: %w", err)
+		}
+		latest, err := latestPostgresExchangeRateRow(tx)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err == nil {
+			switch {
+			case normalized.Generation < latest.Generation:
+				return fmt.Errorf("%w: latest=%d received=%d", ErrExchangeRateGenerationRegression, latest.Generation, normalized.Generation)
+			case normalized.Generation == latest.Generation:
+				published, decodeErr := decodePostgresExchangeRateRow(latest)
+				if decodeErr != nil {
+					return decodeErr
+				}
+				if reflect.DeepEqual(published, normalized) {
+					return nil
+				}
+				return fmt.Errorf("%w: generation=%d", ErrExchangeRateGenerationConflict, normalized.Generation)
+			}
+		}
+
+		row := postgresExchangeRateSnapshotRow{
+			Generation:      normalized.Generation,
+			ProtocolVersion: normalized.ProtocolVersion,
+			SchemaVersion:   normalized.SchemaVersion,
+			BaseCurrency:    normalized.BaseCurrency,
+			DecimalScale:    normalized.DecimalScale,
+			Snapshot:        document,
+		}
+		if err := tx.Table(postgresExchangeRateSnapshotTable).Create(&row).Error; err != nil {
+			return fmt.Errorf("publish HogQL exchange-rate snapshot: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s *PostgresStore) LatestExchangeRates(ctx context.Context) (*ExchangeRateSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	row, err := latestPostgresExchangeRateRow(s.db.WithContext(ctx))
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrExchangeRatesNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decodePostgresExchangeRateRow(row)
+}
+
+func (s *PostgresStore) ExchangeRateGeneration(ctx context.Context, generation int64) (*ExchangeRateSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if generation <= 0 {
+		return nil, ErrExchangeRateGenerationNotFound
+	}
+	db := s.db.WithContext(ctx)
+	var row postgresExchangeRateSnapshotRow
+	err := db.Table(postgresExchangeRateSnapshotTable).Where("generation = ?", generation).Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		if _, latestErr := latestPostgresExchangeRateRow(db); errors.Is(latestErr, gorm.ErrRecordNotFound) {
+			return nil, ErrExchangeRatesNotFound
+		} else if latestErr != nil {
+			return nil, latestErr
+		}
+		return nil, ErrExchangeRateGenerationNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read HogQL exchange-rate generation: %w", err)
+	}
+	return decodePostgresExchangeRateRow(&row)
+}
+
+func latestPostgresExchangeRateRow(db *gorm.DB) (*postgresExchangeRateSnapshotRow, error) {
+	var row postgresExchangeRateSnapshotRow
+	err := db.Table(postgresExchangeRateSnapshotTable).Order("generation DESC").Take(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("read latest HogQL exchange-rate snapshot: %w", err)
+	}
+	return &row, nil
+}
+
+func decodePostgresExchangeRateRow(row *postgresExchangeRateSnapshotRow) (*ExchangeRateSnapshot, error) {
+	snapshot, err := DecodeExchangeRateSnapshot(bytes.NewReader(row.Snapshot))
+	if err != nil {
+		return nil, fmt.Errorf("decode persisted HogQL exchange-rate snapshot: %w", err)
+	}
+	if snapshot.Generation != row.Generation ||
+		snapshot.ProtocolVersion != row.ProtocolVersion ||
+		snapshot.SchemaVersion != row.SchemaVersion ||
+		snapshot.BaseCurrency != row.BaseCurrency ||
+		snapshot.DecimalScale != row.DecimalScale {
+		return nil, fmt.Errorf("%w: persisted snapshot columns do not match document", ErrInvalidExchangeRateSnapshot)
 	}
 	return snapshot, nil
 }

@@ -83,11 +83,19 @@ to run. Do not edit an existing manifest generation or the lease row manually.
 
 ## API
 
-The control plane exposes one internal-token-authenticated compatibility resource:
+The control plane exposes two internal-token-authenticated compatibility resources.
+The semantic-catalog resource is scoped to one DuckLake catalog:
 
 - `PUT /v1/hogql/compatibility/semantic-catalog` publishes one immutable generation.
 - `GET /v1/hogql/compatibility/semantic-catalog?protocolVersion=1&languageVersion=:version&catalog=:catalog&catalogDelimited=:boolean`
   reads the highest published generation.
+- Adding `&generation=:generation` to that `GET` reads an exact generation.
+
+The exchange-rate resource is global rather than catalog-scoped:
+
+- `PUT /v1/hogql/compatibility/exchange-rates` publishes one immutable generation.
+- `GET /v1/hogql/compatibility/exchange-rates?protocolVersion=1` reads the highest
+  published generation.
 - Adding `&generation=:generation` to that `GET` reads an exact generation.
 
 `GET` accepts either the rotated read-only token or the rotated admin token.
@@ -96,6 +104,17 @@ are valid during a rotation window, and invalid or missing credentials fail
 before the catalog handler runs. Trino should mount a read-only token and read
 it from `hogql.semantic-catalog.authentication-token-file`; publishers retain
 the separate admin credential.
+
+Every exchange-rate snapshot uses protocol and schema version 1, a positive
+monotonically increasing generation, base currency `USD`, and decimal scale 10.
+Rates are a non-empty array strictly sorted by three-letter uppercase currency
+code and ISO date. Each rate is an unsigned canonical Decimal64 unscaled value;
+USD entries must equal one at the declared scale, and at least one USD entry is
+required. Unknown or missing fields and noncanonical values fail closed.
+
+Exchange-rate generations share the semantic catalog's append-only publication
+rules. An identical retry of the latest generation is idempotent. Changed
+content at the same generation and lower generations are rejected.
 
 Every manifest must include `protocolVersion: 1`, `schemaVersion: 2`, a supported language
 version, a positive monotonically increasing generation, and all fields in the

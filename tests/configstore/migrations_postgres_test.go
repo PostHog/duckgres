@@ -56,7 +56,10 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 35)
 	requireGooseMigrationRecorded(t, db, 36)
 	requireGooseMigrationRecorded(t, db, 38)
-	requireGooseLatestVersion(t, db, 38)
+	requireGooseMigrationRecorded(t, db, 39)
+	requireGooseMigrationRecorded(t, db, 40)
+	requireGooseMigrationRecorded(t, db, 41)
+	requireGooseLatestVersion(t, db, 41)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -261,6 +264,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireColumnNotNull(t, db, "duckgres_managed_warehouse_trino", "trino_cell_id")
 	requireColumnNullable(t, db, "duckgres_managed_warehouse_trino", "ready_at")
 	requireColumnNullable(t, db, "duckgres_managed_warehouse_trino", "failed_at")
+	requireTablePresent(t, db, "duckgres_hogql_semantic_catalog_snapshots")
+	requireTablePresent(t, db, "duckgres_hogql_physical_catalog_refresh_leases")
+	requireTablePresent(t, db, "duckgres_hogql_exchange_rate_snapshots")
+	requireColumnType(t, db, "duckgres_hogql_exchange_rate_snapshots", "generation", "bigint")
+	requireColumnType(t, db, "duckgres_hogql_exchange_rate_snapshots", "snapshot", "jsonb")
 	// The bootstrap sentinel stores ONE BIT per namespace and no
 	// credential material: the K8s Secrets are the source of truth for the
 	// values. A column here holding a credential would be a bug.
@@ -316,7 +324,10 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_service_grants;
 			DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 			DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38);
+			DROP TABLE IF EXISTS duckgres_hogql_exchange_rate_snapshots;
+			DROP TABLE IF EXISTS duckgres_hogql_physical_catalog_refresh_leases;
+			DROP TABLE IF EXISTS duckgres_hogql_semantic_catalog_snapshots;
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -367,7 +378,10 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
 	requireGooseMigrationRecorded(t, upgradedDB, 38)
-	requireGooseLatestVersion(t, upgradedDB, 38)
+	requireGooseMigrationRecorded(t, upgradedDB, 39)
+	requireGooseMigrationRecorded(t, upgradedDB, 40)
+	requireGooseMigrationRecorded(t, upgradedDB, 41)
+	requireGooseLatestVersion(t, upgradedDB, 41)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -395,6 +409,9 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireTablePresent(t, upgradedDB, "duckgres_managed_warehouse_trino")
 	requireColumnPresent(t, upgradedDB, "duckgres_managed_warehouse_trino", "trino_cell_id")
 	requireTablePresent(t, upgradedDB, "duckgres_trino_cluster_bootstrap")
+	requireTablePresent(t, upgradedDB, "duckgres_hogql_semantic_catalog_snapshots")
+	requireTablePresent(t, upgradedDB, "duckgres_hogql_physical_catalog_refresh_leases")
+	requireTablePresent(t, upgradedDB, "duckgres_hogql_exchange_rate_snapshots")
 }
 
 func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
@@ -416,7 +433,10 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		DROP TABLE IF EXISTS duckgres_service_grants;
 		DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 		DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38);
+		DROP TABLE IF EXISTS duckgres_hogql_exchange_rate_snapshots;
+		DROP TABLE IF EXISTS duckgres_hogql_physical_catalog_refresh_leases;
+		DROP TABLE IF EXISTS duckgres_hogql_semantic_catalog_snapshots;
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40, 41);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}

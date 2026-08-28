@@ -38,6 +38,9 @@ func TestHogQLCatalogGroupMethodAuthorization(t *testing.T) {
 			if err := store.Publish(context.Background(), hogQLCatalogSnapshot(1)); err != nil {
 				t.Fatalf("publish fixture: %v", err)
 			}
+			if err := store.PublishExchangeRates(context.Background(), hogQLExchangeRateSnapshot(1)); err != nil {
+				t.Fatalf("publish exchange-rate fixture: %v", err)
+			}
 			readOnlyTokens := admin.NewTokenSet("read-current", []string{"read-fallback"})
 			adminTokens := admin.NewTokenSet("admin-current", []string{"admin-fallback"})
 			registerHogQLCatalogGroup(engine, readOnlyTokens, adminTokens, store, store)
@@ -67,7 +70,46 @@ func TestHogQLCatalogGroupMethodAuthorization(t *testing.T) {
 			if putResponse.Code != test.putStatus {
 				t.Fatalf("PUT status = %d, want %d: %s", putResponse.Code, test.putStatus, putResponse.Body.String())
 			}
+
+			exchangeGetRequest := httptest.NewRequest(http.MethodGet, "/v1/hogql/compatibility/exchange-rates?protocolVersion=1", nil)
+			if test.token != "" {
+				exchangeGetRequest.Header.Set("X-Duckgres-Internal-Secret", test.token)
+			}
+			exchangeGetResponse := httptest.NewRecorder()
+			engine.ServeHTTP(exchangeGetResponse, exchangeGetRequest)
+			if exchangeGetResponse.Code != test.getStatus {
+				t.Fatalf("exchange-rate GET status = %d, want %d: %s", exchangeGetResponse.Code, test.getStatus, exchangeGetResponse.Body.String())
+			}
+
+			exchangeBody, err := json.Marshal(hogQLExchangeRateSnapshot(2))
+			if err != nil {
+				t.Fatalf("marshal exchange-rate snapshot: %v", err)
+			}
+			exchangePutRequest := httptest.NewRequest(http.MethodPut, "/v1/hogql/compatibility/exchange-rates", bytes.NewReader(exchangeBody))
+			exchangePutRequest.Header.Set("Content-Type", "application/json")
+			if test.token != "" {
+				exchangePutRequest.Header.Set("X-Duckgres-Internal-Secret", test.token)
+			}
+			exchangePutResponse := httptest.NewRecorder()
+			engine.ServeHTTP(exchangePutResponse, exchangePutRequest)
+			if exchangePutResponse.Code != test.putStatus {
+				t.Fatalf("exchange-rate PUT status = %d, want %d: %s", exchangePutResponse.Code, test.putStatus, exchangePutResponse.Body.String())
+			}
 		})
+	}
+}
+
+func hogQLExchangeRateSnapshot(generation int64) *hogqlcatalog.ExchangeRateSnapshot {
+	return &hogqlcatalog.ExchangeRateSnapshot{
+		ProtocolVersion: hogqlcatalog.ExchangeRateProtocolVersion,
+		SchemaVersion:   hogqlcatalog.ExchangeRateSchemaVersion,
+		Generation:      generation,
+		BaseCurrency:    hogqlcatalog.ExchangeRateBaseCurrency,
+		DecimalScale:    hogqlcatalog.ExchangeRateDecimalScale,
+		Rates: []hogqlcatalog.ExchangeRateEntry{
+			{Currency: "EUR", EffectiveDate: "2024-01-01", UnscaledRate: "9049000000"},
+			{Currency: "USD", EffectiveDate: "1970-01-01", UnscaledRate: "10000000000"},
+		},
 	}
 }
 

@@ -22,6 +22,25 @@ type Publisher interface {
 	Publish(ctx context.Context, snapshot *HogQLSemanticCatalogSnapshot) error
 }
 
+type ExchangeRateReader interface {
+	LatestExchangeRates(ctx context.Context) (*ExchangeRateSnapshot, error)
+	ExchangeRateGeneration(ctx context.Context, generation int64) (*ExchangeRateSnapshot, error)
+}
+
+type ExchangeRatePublisher interface {
+	PublishExchangeRates(ctx context.Context, snapshot *ExchangeRateSnapshot) error
+}
+
+type CompatibilityReader interface {
+	Reader
+	ExchangeRateReader
+}
+
+type CompatibilityPublisher interface {
+	Publisher
+	ExchangeRatePublisher
+}
+
 type PhysicalRefreshStore interface {
 	Reader
 	AcquirePhysicalRefresh(ctx context.Context, catalog PhysicalIdentifier, ttl time.Duration, force bool) (*PhysicalRefreshLease, bool, error)
@@ -36,10 +55,11 @@ type PhysicalRefreshLease struct {
 }
 
 type MemoryStore struct {
-	mu       sync.RWMutex
-	catalogs map[PhysicalIdentifier]*catalogHistory
-	leases   map[PhysicalIdentifier]memoryPhysicalRefreshLease
-	now      func() time.Time
+	mu            sync.RWMutex
+	catalogs      map[PhysicalIdentifier]*catalogHistory
+	leases        map[PhysicalIdentifier]memoryPhysicalRefreshLease
+	exchangeRates *exchangeRateHistory
+	now           func() time.Time
 }
 
 type memoryPhysicalRefreshLease struct {
@@ -52,6 +72,11 @@ type memoryPhysicalRefreshLease struct {
 type catalogHistory struct {
 	latest      int64
 	generations map[int64]*HogQLSemanticCatalogSnapshot
+}
+
+type exchangeRateHistory struct {
+	latest      int64
+	generations map[int64]*ExchangeRateSnapshot
 }
 
 func NewMemoryStore() *MemoryStore {
@@ -242,6 +267,65 @@ func (s *MemoryStore) Generation(ctx context.Context, catalog PhysicalIdentifier
 		return nil, ErrGenerationNotFound
 	}
 	return cloneSnapshot(snapshot), nil
+}
+
+func (s *MemoryStore) PublishExchangeRates(ctx context.Context, snapshot *ExchangeRateSnapshot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	normalized, err := normalizeAndValidateExchangeRateSnapshot(snapshot)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exchangeRates == nil {
+		s.exchangeRates = &exchangeRateHistory{generations: make(map[int64]*ExchangeRateSnapshot)}
+	}
+	if normalized.Generation < s.exchangeRates.latest {
+		return fmt.Errorf("%w: latest=%d received=%d", ErrExchangeRateGenerationRegression, s.exchangeRates.latest, normalized.Generation)
+	}
+	if normalized.Generation == s.exchangeRates.latest && s.exchangeRates.latest != 0 {
+		if reflect.DeepEqual(s.exchangeRates.generations[s.exchangeRates.latest], normalized) {
+			return nil
+		}
+		return fmt.Errorf("%w: generation=%d", ErrExchangeRateGenerationConflict, normalized.Generation)
+	}
+	s.exchangeRates.generations[normalized.Generation] = normalized
+	s.exchangeRates.latest = normalized.Generation
+	return nil
+}
+
+func (s *MemoryStore) LatestExchangeRates(ctx context.Context) (*ExchangeRateSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.exchangeRates == nil {
+		return nil, ErrExchangeRatesNotFound
+	}
+	return cloneExchangeRateSnapshot(s.exchangeRates.generations[s.exchangeRates.latest]), nil
+}
+
+func (s *MemoryStore) ExchangeRateGeneration(ctx context.Context, generation int64) (*ExchangeRateSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if generation <= 0 {
+		return nil, ErrExchangeRateGenerationNotFound
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.exchangeRates == nil {
+		return nil, ErrExchangeRatesNotFound
+	}
+	snapshot := s.exchangeRates.generations[generation]
+	if snapshot == nil {
+		return nil, ErrExchangeRateGenerationNotFound
+	}
+	return cloneExchangeRateSnapshot(snapshot), nil
 }
 
 func normalizedCatalog(catalog PhysicalIdentifier) (PhysicalIdentifier, error) {

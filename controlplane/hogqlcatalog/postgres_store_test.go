@@ -43,11 +43,18 @@ func TestPostgresStorePersistsImmutableGenerationsAcrossInstances(t *testing.T) 
 	).Error; err != nil {
 		t.Fatalf("reset physical refresh lease: %v", err)
 	}
+	if err := config.DB().Exec("DELETE FROM duckgres_hogql_exchange_rate_snapshots").Error; err != nil {
+		t.Fatalf("reset exchange-rate snapshots: %v", err)
+	}
 
 	firstProcess := NewPostgresStore(config.DB())
 	expected := completeSemanticSnapshot(1)
 	if err := firstProcess.Publish(t.Context(), expected); err != nil {
 		t.Fatalf("publish generation 1: %v", err)
+	}
+	expectedExchangeRates := testExchangeRateSnapshot(1)
+	if err := firstProcess.PublishExchangeRates(t.Context(), expectedExchangeRates); err != nil {
+		t.Fatalf("publish exchange-rate generation 1: %v", err)
 	}
 
 	restartedProcess := NewPostgresStore(config.DB())
@@ -60,6 +67,16 @@ func TestPostgresStorePersistsImmutableGenerationsAcrossInstances(t *testing.T) 
 	}
 	if !reflect.DeepEqual(pinned, expected) {
 		t.Fatalf("persisted snapshot changed after restart\n got: %#v\nwant: %#v", pinned, expected)
+	}
+	pinnedExchangeRates, err := restartedProcess.ExchangeRateGeneration(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("read exchange-rate generation 1 after restart: %v", err)
+	}
+	if !reflect.DeepEqual(pinnedExchangeRates, expectedExchangeRates) {
+		t.Fatalf("persisted exchange-rate snapshot changed after restart\n got: %#v\nwant: %#v", pinnedExchangeRates, expectedExchangeRates)
+	}
+	if err := restartedProcess.PublishExchangeRates(t.Context(), expectedExchangeRates); err != nil {
+		t.Fatalf("retry exchange-rate generation 1 after restart: %v", err)
 	}
 	if err := restartedProcess.Publish(t.Context(), testSnapshot(2)); err != nil {
 		t.Fatalf("publish generation 2: %v", err)
