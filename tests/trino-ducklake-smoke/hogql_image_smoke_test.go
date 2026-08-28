@@ -433,7 +433,7 @@ func startHogQLTrinoContainer(t *testing.T, image, configPath, tokenPath string)
 	port := reserveTCPPort(t)
 	name := fmt.Sprintf("duckgres-hogql-smoke-%d-%d", os.Getpid(), time.Now().UnixNano())
 	args := []string{
-		"run", "--detach", "--rm", "--name", name,
+		"run", "--detach", "--name", name,
 		"--publish", fmt.Sprintf("127.0.0.1:%d:8080", port),
 		"--add-host", "host.docker.internal:host-gateway",
 		"--volume", configPath + ":/etc/trino/config.properties:ro",
