@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/hogqlcatalog"
 	"github.com/posthog/duckgres/controlplane/provisioner"
@@ -173,6 +174,35 @@ type trinoWiring struct {
 	// Cell is the cell this wiring reconciles; carried out for startup
 	// logging.
 	Cell trinoCell
+	// Console is what the admin console needs to observe this cell. Built
+	// here rather than in multitenant.go so the observer credential is read
+	// through the provisioner that owns it and nothing else has to know how
+	// the coordinator is authenticated.
+	Console *trinoConsoleWiring
+}
+
+// trinoConsoleWiring is the admin console's half of the Trino branch: the
+// cell's identity plus a coordinator client authenticated as the OBSERVER
+// principal.
+//
+// The observer is deliberately NOT the provisioner's admin principal. The
+// admin can CREATE/DROP catalogs and, by policy, sees only its own queries;
+// the observer sees every tenant's query metadata and holds no catalog at
+// all. Keeping them separate means a leak of either credential yields one
+// half of that authority, never both. See opa.ObserverPrincipal.
+type trinoConsoleWiring struct {
+	Cell     admin.TrinoCell
+	Observer admin.TrinoCoordinatorClient
+}
+
+// newTrinoAdminAPI builds the console's Trino surface, or nil when the
+// deployment has no cell. Split out so multitenant.go can construct it at
+// the point where the audit store finally exists.
+func newTrinoAdminAPI(console *trinoConsoleWiring, orgs admin.TrinoOrgStore, audit *admin.AuditStore) *admin.TrinoAPI {
+	if console == nil {
+		return nil
+	}
+	return admin.NewTrinoAPI(console.Cell, console.Observer, orgs, audit)
 }
 
 // buildTrinoWiring constructs everything the Trino branch needs from
@@ -277,6 +307,15 @@ func buildTrinoWiring(
 		BundleStore:   bundleStore,
 		BundleHandler: bundleHandler,
 		Cell:          cell,
+		Console: &trinoConsoleWiring{
+			Cell: admin.TrinoCell{ID: cell.ID, CoordinatorURL: cell.CoordinatorURL},
+			// Read the credential through the provisioner on every call
+			// rather than capturing it here: the pair is regenerated if it
+			// ever goes missing, and a captured copy would 401 forever
+			// after that self-heal.
+			Observer: admin.NewTrinoCoordinatorClient(
+				cell.CoordinatorURL, cell.TLSServerName, trinoProv.ObserverCredential),
+		},
 	}, nil
 }
 

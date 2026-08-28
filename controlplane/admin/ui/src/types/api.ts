@@ -748,3 +748,157 @@ export interface HotIdleOrg {
   cap_cpu: string;
   cap_memory: string;
 }
+
+// --- Trino cell ---------------------------------------------------------
+//
+// Backed by controlplane/admin/trino.go. The console reads one cell today;
+// every payload carries the cell so consumers are already cell-aware when a
+// second one lands.
+
+export interface TrinoCell {
+  id: string;
+  coordinator_url: string;
+}
+
+// TrinoQuery.query is REDACTED server-side (usersecrets.RedactForLog) — raw
+// tenant SQL never reaches the browser.
+export interface TrinoQuery {
+  query_id: string;
+  state: string;
+  // org is the duckgres org id, resolved from the Trino principal. Empty for
+  // the control plane's own principals (the provisioner, this console).
+  org: string;
+  principal: string;
+  source: string;
+  resource_group: string;
+  query: string;
+  created?: string;
+  elapsed_ms: number;
+  queued_ms: number;
+  cpu_ms: number;
+  physical_input_bytes: number;
+  internal_network_bytes: number;
+  peak_memory_bytes: number;
+  spilled_bytes: number;
+  processed_input_rows: number;
+  total_drivers: number;
+  queued_drivers: number;
+  running_drivers: number;
+  completed_drivers: number;
+  // fully_blocked: every driver blocked — waiting on the metadata store or
+  // S3 rather than doing work.
+  fully_blocked: boolean;
+  // null when Trino cannot estimate progress (queued queries, and any query
+  // whose splits are not all known). Distinct from 0.
+  progress_percentage: number | null;
+  error_type?: string;
+  error_code?: string;
+}
+
+export interface TrinoServerInfo {
+  version: string;
+  environment: string;
+  coordinator: boolean;
+  starting: boolean;
+  uptime_ms: number;
+}
+
+// Which of Trino's two node inventories a list came from. They carry
+// different detail, so the source has to travel with the data:
+//   failure_detector  /v1/node, bound only under AIRLIFT_DISCOVERY. Full
+//                     heartbeat health per node.
+//   announce          /v1/announce, bound under ANNOUNCE (Trino's default,
+//                     and what these cells run) and DNS. Membership only.
+//   system_table      system.runtime.nodes over SQL. Served by every cell
+//                     regardless of discovery.type, and the only source
+//                     carrying node_version — i.e. version skew.
+export type TrinoNodeSource = "failure_detector" | "announce" | "system_table";
+
+// Every field but `uri` is filled ONLY when the source is failure_detector.
+// Under announce they are zero because nothing was measured, which is not
+// the same as measured-and-zero — rendering them as health invents a claim
+// the coordinator never made.
+export interface TrinoNode {
+  uri: string;
+  age_ms: number;
+  recent_failures: number;
+  recent_successes: number;
+  recent_failure_ratio: number;
+  last_response_time?: string;
+  failed: boolean;
+  // Present only when the source is system_table.
+  node_id?: string;
+  version?: string;
+  coordinator?: boolean;
+  // Trino's NodeState: ACTIVE, INACTIVE, DRAINING, DRAINED, SHUTTING_DOWN.
+  state?: string;
+}
+
+export interface TrinoOrgStatus {
+  org: string;
+  principal: string;
+  catalog: string;
+  tier: string;
+  cell: string;
+  state: string;
+  status_message?: string;
+  ready_at?: string;
+  failed_at?: string;
+  running_queries: number;
+  queued_queries: number;
+}
+
+// available=false means the coordinator could not be read. Every count then
+// reads zero, so a view that ignores it renders an outage as an idle cell.
+export interface TrinoStatus {
+  cell: TrinoCell;
+  available: boolean;
+  error?: string;
+  server?: TrinoServerInfo;
+  queries_by_state: Record<string, number>;
+  blocked_queries: number;
+  // node_stats=false means this cell serves neither node inventory, so nodes
+  // and failed_nodes are both zero and mean nothing. Render "not reported"
+  // rather than zero nodes.
+  node_stats: boolean;
+  // Which inventory `nodes` was counted from. Under "announce" the cell
+  // reports membership without health, so failed_nodes is 0 because nothing
+  // is measured, not because the fleet is known to be well.
+  node_source?: TrinoNodeSource;
+  nodes: number;
+  failed_nodes: number;
+  orgs_by_state: Record<string, number>;
+  total_orgs: number;
+}
+
+export interface TrinoQueriesResponse {
+  cell: TrinoCell;
+  available: boolean;
+  queries: TrinoQuery[];
+}
+
+export interface TrinoNodesResponse {
+  cell: TrinoCell;
+  available: boolean;
+  source?: TrinoNodeSource;
+  nodes: TrinoNode[];
+}
+
+export interface TrinoOrgsResponse {
+  cell: TrinoCell;
+  available: boolean;
+  orgs: TrinoOrgStatus[];
+}
+
+export interface TrinoOrgDetail {
+  cell: TrinoCell;
+  enabled: boolean;
+  available?: boolean;
+  status?: TrinoOrgStatus;
+}
+
+export interface TrinoKillResult {
+  killed: boolean;
+  query_id: string;
+  org: string;
+}

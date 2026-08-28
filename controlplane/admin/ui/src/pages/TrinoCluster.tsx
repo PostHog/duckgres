@@ -1,0 +1,353 @@
+import { useMemo } from "react";
+import { Link } from "react-router-dom";
+import { AlertTriangle, Boxes, Cpu, Network, ServerCog } from "lucide-react";
+import { PageBody, PageHeader } from "@/components/AppShell";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { StatCard } from "@/components/StatCard";
+import { StateBadge } from "@/components/StateBadge";
+import { EmptyState, TableSkeleton } from "@/components/states";
+import { OrgRef } from "@/components/OrgRef";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { useOrgLabels, useTrinoNodes, useTrinoOrgs, useTrinoStatus } from "@/hooks/useApi";
+import { fmtDurationMs, fmtInt, fmtPercent, fmtTime } from "@/lib/format";
+import {
+  TRINO_ACTIVE_NODE_STATE,
+  summarizeTrinoNodes,
+  trinoOrgsNeedingAttention,
+  trinoUnavailableMessage,
+  trinoUnavailableReason,
+} from "@/lib/trino";
+
+export function TrinoCluster() {
+  const status = useTrinoStatus();
+  const nodes = useTrinoNodes();
+  const orgs = useTrinoOrgs();
+  const orgLabels = useOrgLabels();
+
+  // The nodes payload names its own inventory; status carries it too for
+  // the case where only the summary has loaded.
+  const nodeSource = nodes.data?.source ?? status.data?.node_source;
+  const announcedOnly = nodeSource === "announce";
+  const fromSystemTable = nodeSource === "system_table";
+  const nodeHealth = useMemo(
+    () => summarizeTrinoNodes(nodes.data?.nodes ?? [], nodeSource),
+    [nodes.data, nodeSource],
+  );
+  const orgRows = useMemo(() => orgs.data?.orgs ?? [], [orgs.data]);
+  const needAttention = useMemo(() => trinoOrgsNeedingAttention(orgRows), [orgRows]);
+  const reason = trinoUnavailableReason(status.data);
+  const server = status.data?.server;
+
+  return (
+    <>
+      <PageHeader
+        title="Trino cell"
+        description={
+          status.data?.cell.id
+            ? `${status.data.cell.id} · ${status.data.cell.coordinator_url}`
+            : "The shared multi-tenant Trino cell."
+        }
+      />
+      <PageBody>
+        {reason && (
+          <Card className="mb-4 border-warning/40">
+            <CardContent className="flex items-start gap-2 p-4 text-sm">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+              <span>
+                {trinoUnavailableMessage(reason)}
+                {status.data?.error && (
+                  <span className="mt-1 block font-mono text-[11px] text-muted-foreground">
+                    {status.data.error}
+                  </span>
+                )}
+              </span>
+            </CardContent>
+          </Card>
+        )}
+
+        <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-5">
+          <StatCard
+            label="Coordinator"
+            value={server?.version ?? "—"}
+            hint={
+              server
+                ? server.starting
+                  ? "starting — queries are rejected"
+                  : `${server.environment} · up ${fmtDurationMs(server.uptime_ms)}`
+                : "unreachable"
+            }
+            accent={server ? (server.starting ? "warning" : "success") : "destructive"}
+            icon={<ServerCog className="h-4 w-4" />}
+          />
+          <StatCard
+            label="Nodes"
+            value={fmtInt(nodeHealth.total)}
+            hint={
+              nodeHealth.detailKnown
+                ? // More than one version means a rollout is in flight, or
+                  // stuck. That is the thing to surface, ahead of the count.
+                  nodeHealth.versions.length > 1
+                  ? `version skew: ${nodeHealth.versions.join(" · ")}`
+                  : nodeHealth.inactive > 0
+                    ? `${nodeHealth.inactive} not active`
+                    : `all active${nodeHealth.versions[0] ? ` · ${nodeHealth.versions[0]}` : ""}`
+                : !nodeHealth.healthKnown
+                  ? "membership only"
+                  : nodeHealth.failed > 0 || nodeHealth.degraded > 0
+                    ? `${nodeHealth.failed} failed · ${nodeHealth.degraded} degraded`
+                    : "all healthy"
+            }
+            accent={
+              nodeHealth.detailKnown
+                ? nodeHealth.versions.length > 1 || nodeHealth.inactive > 0
+                  ? "warning"
+                  : "success"
+                : !nodeHealth.healthKnown
+                  ? undefined
+                  : nodeHealth.failed > 0
+                    ? "destructive"
+                    : nodeHealth.degraded > 0
+                      ? "warning"
+                      : "success"
+            }
+            icon={<Network className="h-4 w-4" />}
+          />
+          <StatCard
+            label="Running"
+            value={fmtInt(status.data?.queries_by_state?.RUNNING ?? 0)}
+            hint={`${fmtInt(status.data?.queries_by_state?.QUEUED ?? 0)} queued`}
+            icon={<Cpu className="h-4 w-4" />}
+          />
+          <StatCard
+            label="Blocked"
+            value={fmtInt(status.data?.blocked_queries ?? 0)}
+            hint="waiting on metadata or S3"
+            accent={(status.data?.blocked_queries ?? 0) > 0 ? "destructive" : "default"}
+          />
+          <StatCard
+            label="Tenants"
+            value={fmtInt(status.data?.total_orgs ?? 0)}
+            hint={
+              needAttention.length > 0
+                ? `${needAttention.length} need attention`
+                : "all provisioned"
+            }
+            accent={needAttention.length > 0 ? "warning" : "success"}
+            icon={<Boxes className="h-4 w-4" />}
+          />
+        </div>
+
+        <Card className="mb-4">
+          <CardHeader>
+            <CardTitle>Tenants on this cell</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {orgs.isLoading ? (
+              <TableSkeleton cols={7} />
+            ) : orgRows.length === 0 ? (
+              <EmptyState
+                title="No Trino-enabled orgs"
+                description="Enable Trino for an org to give it a catalog on this cell."
+              />
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Org</TableHead>
+                    <TableHead>Catalog</TableHead>
+                    <TableHead>Tier</TableHead>
+                    <TableHead>State</TableHead>
+                    <TableHead className="text-right">Running</TableHead>
+                    <TableHead className="text-right">Queued</TableHead>
+                    <TableHead>Last reconcile</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {orgRows.map((o) => (
+                    <TableRow key={o.org}>
+                      <TableCell className="max-w-[14rem]">
+                        <Link to={`/orgs/${encodeURIComponent(o.org)}`} className="hover:underline">
+                          <OrgRef id={o.org} label={orgLabels.get(o.org)} copyable={false} />
+                        </Link>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">{o.catalog}</TableCell>
+                      <TableCell>
+                        <Badge variant="outline">{o.tier || "default"}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        <StateBadge state={o.state} />
+                        {o.status_message && (
+                          // The reconcile detail is the actionable part of a
+                          // failed provision — it names the step that broke.
+                          <span
+                            className="mt-0.5 block max-w-[22rem] truncate text-[11px] text-muted-foreground"
+                            title={o.status_message}
+                          >
+                            {o.status_message}
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {orgs.data?.available ? fmtInt(o.running_queries) : "—"}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {orgs.data?.available ? fmtInt(o.queued_queries) : "—"}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        {o.failed_at ? fmtTime(o.failed_at) : o.ready_at ? fmtTime(o.ready_at) : "—"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Coordinator&apos;s view of the fleet</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {nodes.isLoading ? (
+              <TableSkeleton cols={announcedOnly ? 1 : 5} />
+            ) : status.data && !status.data.node_stats ? (
+              // Not the same as an empty fleet: this cell serves neither
+              // /v1/node nor /v1/announce, so it cannot name its workers.
+              <EmptyState
+                title="Nodes are not reported by this cell"
+                description="This coordinator serves neither /v1/node nor /v1/announce, so its fleet cannot be listed. The cell is healthy; its membership is simply not visible here."
+              />
+            ) : (nodes.data?.nodes ?? []).length === 0 ? (
+              <EmptyState
+                title="No nodes reported"
+                description={
+                  announcedOnly
+                    ? "No worker has announced itself to this coordinator."
+                    : "The coordinator's failure detector has not reported any peers."
+                }
+              />
+            ) : fromSystemTable ? (
+              <>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Node</TableHead>
+                      <TableHead>Role</TableHead>
+                      <TableHead>Version</TableHead>
+                      <TableHead>State</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {(nodes.data?.nodes ?? []).map((n) => (
+                      <TableRow key={n.node_id ?? n.uri}>
+                        <TableCell className="font-mono text-xs">{n.uri}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {n.coordinator ? "coordinator" : "worker"}
+                        </TableCell>
+                        <TableCell className="font-mono text-xs">
+                          {/* Highlighted during skew: two versions here is a
+                              rollout in progress, or one that stalled. */}
+                          {nodeHealth.versions.length > 1 ? (
+                            <Badge variant="warning">{n.version}</Badge>
+                          ) : (
+                            (n.version ?? "—")
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {n.state === TRINO_ACTIVE_NODE_STATE ? (
+                            <Badge variant="success">{n.state}</Badge>
+                          ) : (
+                            <Badge variant="warning">{n.state ?? "unknown"}</Badge>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <p className="mt-3 text-[11px] text-muted-foreground">
+                  From <code>system.runtime.nodes</code>, which every cell serves regardless of{" "}
+                  <code>discovery.type</code> and which is the only source carrying node version.
+                  Per-node heartbeat ratios need <code>/v1/node</code>, i.e.{" "}
+                  <code>discovery.type=AIRLIFT_DISCOVERY</code>.
+                </p>
+              </>
+            ) : announcedOnly ? (
+              // Membership without health. The heartbeat columns are absent
+              // rather than zero-filled: a rendered "healthy" badge here
+              // would be the console's own invention, not the cell's report.
+              <>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Node</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {(nodes.data?.nodes ?? []).map((n) => (
+                      <TableRow key={n.uri}>
+                        <TableCell className="font-mono text-xs">{n.uri}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <p className="mt-3 text-[11px] text-muted-foreground">
+                  Membership from <code>/v1/announce</code>, which is what this cell serves under
+                  Trino&apos;s default <code>discovery.type=ANNOUNCE</code>. It lists the workers
+                  that have announced themselves and reports no per-node health; heartbeat
+                  detail needs <code>discovery.type=AIRLIFT_DISCOVERY</code>. Node liveness is
+                  visible on the Pods view.
+                </p>
+              </>
+            ) : (
+              <>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Node</TableHead>
+                      <TableHead>Health</TableHead>
+                      <TableHead className="text-right">Failure ratio</TableHead>
+                      <TableHead className="text-right">Recent requests</TableHead>
+                      <TableHead>Seen for</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {(nodes.data?.nodes ?? []).map((n) => (
+                      <TableRow key={n.uri}>
+                        <TableCell className="font-mono text-xs">{n.uri}</TableCell>
+                        <TableCell>
+                          {n.failed ? (
+                            <Badge variant="destructive">failed</Badge>
+                          ) : n.recent_failure_ratio > 0 ? (
+                            <Badge variant="warning">degraded</Badge>
+                          ) : (
+                            <Badge variant="success">healthy</Badge>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {fmtPercent(n.recent_failure_ratio * 100)}
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {fmtInt(Math.round(n.recent_successes + n.recent_failures))}
+                        </TableCell>
+                        <TableCell className="text-xs text-muted-foreground">
+                          {fmtDurationMs(n.age_ms)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <p className="mt-3 text-[11px] text-muted-foreground">
+                  Trino&apos;s <code>/v1/node</code> reports heartbeat health keyed by URI and
+                  carries no node id or version, so worker version skew is not visible here — check
+                  the running images on the Nodes page after a rollout.
+                </p>
+              </>
+            )}
+          </CardContent>
+        </Card>
+      </PageBody>
+    </>
+  );
+}

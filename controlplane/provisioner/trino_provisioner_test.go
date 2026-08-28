@@ -6,6 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"regexp"
 	"sort"
@@ -17,6 +20,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/hogqlcatalog"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
+	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -209,7 +213,7 @@ func TestBuildTrinoAuthFiles_OneUserPerOrg(t *testing.T) {
 	}
 	// Empty admin hash so the test focuses on the per-org projection;
 	// admin-line projection is exercised in its own test below.
-	pw, grp := BuildTrinoAuthFiles(orgs, "")
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 
 	// Usernames are the orgs' database_names, NOT their org ids — the
 	// tenant authenticates to Trino as the same name it uses for its
@@ -239,7 +243,7 @@ func TestTrinoIdentityIsDatabaseNameNotOrgID(t *testing.T) {
 		RootPasswordHash: "$2a$10$hash",
 	}}
 
-	pw, grp := BuildTrinoAuthFiles(orgs, "")
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 	if strings.Contains(pw, orgs[0].OrgID) || strings.Contains(grp, orgs[0].OrgID) {
 		t.Errorf("auth files leak the org id:\npassword.db=%q\ngroup.db=%q", pw, grp)
 	}
@@ -275,7 +279,7 @@ func TestBuildTrinoAuthFiles_SkipsOrgWithoutDatabaseName(t *testing.T) {
 		{OrgID: "42", DatabaseName: "", RootPasswordHash: "$2a$10$hash42"},
 		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$2a$10$hash43"},
 	}
-	pw, grp := BuildTrinoAuthFiles(orgs, "")
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 	if want := "db43:$2a$10$hash43\n"; pw != want {
 		t.Errorf("password.db = %q, want %q", pw, want)
 	}
@@ -335,8 +339,8 @@ func TestBuildTrinoAuthFiles_DeterministicOrder(t *testing.T) {
 		{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$a"},
 		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$b"},
 	}
-	pw1, grp1 := BuildTrinoAuthFiles(orgs, "")
-	pw2, grp2 := BuildTrinoAuthFiles(orgs, "")
+	pw1, grp1 := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
+	pw2, grp2 := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 	if pw1 != pw2 || grp1 != grp2 {
 		t.Errorf("projection not deterministic for identical input")
 	}
@@ -348,7 +352,7 @@ func TestBuildTrinoAuthFiles_SkipsEmptyHashes(t *testing.T) {
 		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$2a$10$hash43"},
 		{OrgID: "", RootPasswordHash: "$2a$10$orphan"},
 	}
-	pw, grp := BuildTrinoAuthFiles(orgs, "")
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 	if strings.Contains(pw, "42:") {
 		t.Errorf("expected org 42 (empty hash) to be skipped: %q", pw)
 	}
@@ -361,7 +365,7 @@ func TestBuildTrinoAuthFiles_SkipsEmptyHashes(t *testing.T) {
 }
 
 func TestBuildTrinoAuthFiles_Empty(t *testing.T) {
-	pw, grp := BuildTrinoAuthFiles(nil, "")
+	pw, grp := BuildTrinoAuthFiles(nil, TrinoClusterPrincipals{})
 	if pw != "" || grp != "" {
 		t.Errorf("expected empty files for empty input, got %q / %q", pw, grp)
 	}
@@ -372,7 +376,7 @@ func TestBuildTrinoAuthFiles_IncludesAdminWhenHashProvided(t *testing.T) {
 	// membership, so the admin has to appear in BOTH files or the
 	// provisioner cannot manage catalogs at all.
 	orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$2a$10$hash42"}}
-	pw, grp := BuildTrinoAuthFiles(orgs, "$2a$10$adminhash")
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{AdminPasswordHash: "$2a$10$adminhash"})
 
 	if !strings.HasPrefix(pw, opa.AdminPrincipal+":$2a$10$adminhash\n") {
 		t.Errorf("password.db must start with the admin line, got %q", pw)
@@ -387,7 +391,7 @@ func TestBuildTrinoAuthFiles_IncludesAdminWhenHashProvided(t *testing.T) {
 	// Empty hash (unit-test wiring) omits the admin lines entirely
 	// rather than projecting a hash-less, therefore un-authenticatable,
 	// entry.
-	pwNoAdmin, grpNoAdmin := BuildTrinoAuthFiles(orgs, "")
+	pwNoAdmin, grpNoAdmin := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 	if strings.Contains(pwNoAdmin, opa.AdminPrincipal) || strings.Contains(grpNoAdmin, opa.AdminPrincipal) {
 		t.Errorf("empty admin hash must project no admin lines, got %q / %q", pwNoAdmin, grpNoAdmin)
 	}
@@ -539,21 +543,44 @@ func TestBuildTrinoResourceGroups_IsStaticAndTemplated(t *testing.T) {
 		}
 	}
 
-	// Selector order is first-match-wins: admin, then the explicit tiers,
-	// then free as the catch-all so an unknown tier still matches something.
-	if len(parsed.Selectors) != 4 {
-		t.Fatalf("expected 4 selectors (admin + scale + growth + catch-all), got %+v", parsed.Selectors)
+	// Selector order is first-match-wins: the two operational principals,
+	// then the explicit tiers, then free as the catch-all so an unknown tier
+	// still matches something.
+	if len(parsed.Selectors) != 5 {
+		t.Fatalf("expected 5 selectors (admin + observer + scale + growth + catch-all), got %+v", parsed.Selectors)
 	}
 	if parsed.Selectors[0].User != opa.AdminPrincipal {
 		t.Errorf("admin selector must be first, got %+v", parsed.Selectors[0])
+	}
+	// The observer must be matched before the catch-all. That last selector
+	// is user `(?<org>.*)`, so without its own lane the console's node query
+	// would be admitted as a tenant into root.tenants.free.<observer> — a
+	// JmxExport'd leaf, i.e. a phantom tenant in the per-tenant metrics.
+	if parsed.Selectors[1].User != opa.ObserverPrincipal {
+		t.Errorf("observer selector must precede the tenant selectors, got %+v", parsed.Selectors[1])
+	}
+	if got := parsed.Selectors[1].Group; got != "root.admin."+opa.ObserverPrincipal {
+		t.Errorf("observer must land in the admin tier, not a tenant lane, got %q", got)
 	}
 	last := parsed.Selectors[len(parsed.Selectors)-1]
 	if last.UserGroup != "" || last.Group != "root.tenants.free.${org}" {
 		t.Errorf("last selector must be the untiered catch-all into free, got %+v", last)
 	}
-	for _, sel := range parsed.Selectors[1:3] {
+	for _, sel := range parsed.Selectors[2:4] {
 		if sel.UserGroup == "" {
 			t.Errorf("tier selector must match on userGroup, got %+v", sel)
+		}
+	}
+
+	// Neither operational lane may be JMX-exported: those metrics are the
+	// per-tenant series, and an operational principal is not a tenant.
+	admin := findSubGroup(t, parsed.RootGroups[0].SubGroups, "admin")
+	if len(admin.SubGroups) != 2 {
+		t.Fatalf("expected admin tier to hold both operational principals, got %+v", admin.SubGroups)
+	}
+	for _, g := range admin.SubGroups {
+		if g.JmxExport {
+			t.Errorf("operational lane %q must not be JMX-exported as a tenant", g.Name)
 		}
 	}
 }
@@ -729,6 +756,23 @@ type testProvisionerHarness struct {
 	ducklings map[string]*DucklingStatus
 	// passwordErr, when non-nil for an org, fails that org's resolution.
 	passwordErr map[string]error
+	// builder records the GroupCatalogs each reconcile derived, so tests
+	// can assert on the ownership map itself rather than decoding the
+	// gzip bundle. It still delegates to the real builder, so the bundle
+	// bytes the store receives are exactly what production would produce.
+	builder *capturingBundleBuilder
+}
+
+// capturingBundleBuilder is a pass-through opa.BundleBuilder that
+// remembers its last input.
+type capturingBundleBuilder struct {
+	inner opa.BundleBuilder
+	last  opa.GroupCatalogs
+}
+
+func (c *capturingBundleBuilder) BuildBundle(gc opa.GroupCatalogs) ([]byte, error) {
+	c.last = gc
+	return c.inner.BuildBundle(gc)
 }
 
 const testCellID = "cell-test"
@@ -744,6 +788,7 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 		hogqlStore:  hogqlcatalog.NewMemoryStore(),
 		ducklings:   map[string]*DucklingStatus{},
 		passwordErr: map[string]error{},
+		builder:     &capturingBundleBuilder{inner: opa.NewBuilder()},
 	}
 	// Every org in the fixture gets a password unless the test removes
 	// it — the interesting cases are the exceptions, not the norm.
@@ -766,7 +811,7 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 		Catalog:       h.catalog,
 		HogQLCatalogs: h.hogqlStore,
 		BundleStore:   h.bundles,
-		BundleBuilder: opa.NewBuilder(),
+		BundleBuilder: h.builder,
 		AWSRegion:     "us-east-1",
 	})
 	if err != nil {
@@ -1679,5 +1724,188 @@ func failSecretNamed(name string) k8stesting.ReactionFunc {
 func failAlways() k8stesting.ReactionFunc {
 	return func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("simulated apiserver failure")
+	}
+}
+
+// TestBuildTrinoAuthFiles_IncludesObserverWhenHashProvided mirrors the
+// admin projection: OPA's is_observer is a CONJUNCTION of username and
+// group membership, so the observer has to appear in BOTH files or the
+// admin console authenticates fine and then sees an empty cluster.
+func TestBuildTrinoAuthFiles_IncludesObserverWhenHashProvided(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$2a$10$hash42"}}
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{
+		AdminPasswordHash:    "$2a$10$adminhash",
+		ObserverPasswordHash: "$2a$10$observerhash",
+	})
+
+	if !strings.Contains(pw, opa.ObserverPrincipal+":$2a$10$observerhash\n") {
+		t.Errorf("password.db must carry the observer line, got %q", pw)
+	}
+	if !strings.Contains(grp, opa.ObserverGroup+":"+opa.ObserverPrincipal+"\n") {
+		t.Errorf("group.db must carry the observer group line, got %q", grp)
+	}
+	// Neither operational principal displaces the other or the tenants.
+	for _, want := range []string{opa.AdminPrincipal + ":$2a$10$adminhash", "42:$2a$10$hash42"} {
+		if !strings.Contains(pw, want) {
+			t.Errorf("password.db lost %q when the observer was added, got %q", want, pw)
+		}
+	}
+
+	// Empty hash projects no observer lines at all, rather than an
+	// un-authenticatable entry.
+	pwNone, grpNone := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{AdminPasswordHash: "$2a$10$adminhash"})
+	if strings.Contains(pwNone, opa.ObserverPrincipal) || strings.Contains(grpNone, opa.ObserverPrincipal) {
+		t.Errorf("empty observer hash must project no observer lines, got %q / %q", pwNone, grpNone)
+	}
+}
+
+// TestBuildTrinoAuthFiles_ObserverIsInNoTierGroup keeps the observer out of
+// the resource-group selectors. Tier groups are what route a tenant's
+// queries to its resource group; the observer submits no SQL (it reads the
+// coordinator's REST API only), so a tier claim would be both meaningless
+// and a way for console traffic to consume a tenant's concurrency slots.
+func TestBuildTrinoAuthFiles_ObserverIsInNoTierGroup(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{OrgID: "42", DatabaseName: "db42", Tier: "free", RootPasswordHash: "$2a$10$hash42"}}
+	_, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{
+		AdminPasswordHash:    "$2a$10$adminhash",
+		ObserverPasswordHash: "$2a$10$observerhash",
+	})
+
+	for _, line := range strings.Split(grp, "\n") {
+		name, members, ok := strings.Cut(line, ":")
+		if !ok || !strings.HasPrefix(name, "tier_") {
+			continue
+		}
+		for _, m := range strings.Split(members, ",") {
+			if m == opa.ObserverPrincipal {
+				t.Errorf("observer must not be a member of tier group %q (line %q)", name, line)
+			}
+		}
+	}
+}
+
+// TestReconcile_ProjectsObserverIntoAuthFiles closes the loop end to end:
+// Bootstrap mints the credential, Reconcile projects it, and the
+// coordinator's file authenticator therefore knows the console's identity.
+func TestReconcile_ProjectsObserverIntoAuthFiles(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", Tier: "free", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+	if _, err := h.provisioner.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	sec, err := h.kube.CoreV1().Secrets(TrinoCustomerNamespace).
+		Get(context.Background(), TrinoAuthSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get auth secret: %v", err)
+	}
+	passwordDB := string(sec.Data[TrinoAuthSecretKeyPasswordDB])
+	groupDB := string(sec.Data[TrinoAuthSecretKeyGroupDB])
+
+	if !strings.Contains(passwordDB, opa.ObserverPrincipal+":") {
+		t.Errorf("projected password.db has no observer entry:\n%s", passwordDB)
+	}
+	if !strings.Contains(groupDB, opa.ObserverGroup+":"+opa.ObserverPrincipal) {
+		t.Errorf("projected group.db has no observer group entry:\n%s", groupDB)
+	}
+
+	// The projected hash must be the one the minted plaintext validates
+	// against, or the console gets a 401 from the coordinator.
+	_, plaintext := h.provisioner.ObserverCredential()
+	var projected string
+	for _, line := range strings.Split(passwordDB, "\n") {
+		if name, hash, ok := strings.Cut(line, ":"); ok && name == opa.ObserverPrincipal {
+			projected = hash
+		}
+	}
+	if projected == "" {
+		t.Fatal("no observer hash found in the projected password.db")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(projected), []byte(plaintext)); err != nil {
+		t.Errorf("projected observer hash does not validate against the minted password: %v", err)
+	}
+}
+
+// TestReconcile_BundleGrantsObserverNoCatalog is the bundle-side half of
+// the observer's "query metadata yes, tenant data no" boundary. The policy
+// excludes the observer group from tenant_owns_catalog, but the bundle must
+// not list catalogs under it either -- defense in depth, and it keeps the
+// bundle honest about who owns what.
+func TestReconcile_BundleGrantsObserverNoCatalog(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", Tier: "free", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+	if _, err := h.provisioner.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	gc := h.builder.last
+	if catalogs, ok := gc[opa.ObserverGroup]; ok {
+		t.Errorf("the OPA bundle lists catalogs %v under the observer group; it must own none", catalogs)
+	}
+	// Sanity: the bundle is populated, so an empty observer entry is a real
+	// assertion rather than an artefact of an empty bundle.
+	if _, ok := gc[TrinoGroupName("db42")]; !ok {
+		t.Fatalf("expected the tenant's group in the bundle, got %v", gc)
+	}
+}
+
+// TestCatalogHTTPClientTagsItsSource pins the X-Trino-Source header onto
+// every hop of the statement protocol, including the nextUri follow-ups.
+// Trino records it verbatim as system.runtime.queries.source, which is how
+// an operator (and the admin console's live view) tells reconcile-loop DDL
+// apart from tenant SQL. An untagged hop shows up as an unattributed query
+// from a privileged principal.
+func TestCatalogHTTPClientTagsItsSource(t *testing.T) {
+	var mu sync.Mutex
+	var sources, users []string
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sources = append(sources, r.Header.Get("X-Trino-Source"))
+		users = append(users, r.Header.Get("X-Trino-User"))
+		hop := len(sources)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if hop == 1 {
+			// First hop hands back a nextUri so the drain loop runs and
+			// the follow-up GET's headers are exercised too.
+			fmt.Fprintf(w, `{"id":"q1","nextUri":%q}`, srv.URL+"/v1/statement/q1/1")
+			return
+		}
+		fmt.Fprint(w, `{"id":"q1","data":[["system"]]}`)
+	}))
+	defer srv.Close()
+
+	c := NewTrinoCatalogHTTPClient(srv.URL, opa.AdminPrincipal, "pw", "")
+	if _, err := c.ListCatalogs(context.Background()); err != nil {
+		t.Fatalf("ListCatalogs: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sources) < 2 {
+		t.Fatalf("expected the POST and at least one nextUri GET, got %d requests", len(sources))
+	}
+	for i, got := range sources {
+		if got != TrinoProvisionerSource {
+			t.Errorf("request %d: X-Trino-Source = %q, want %q", i, got, TrinoProvisionerSource)
+		}
+	}
+	for i, got := range users {
+		if got != opa.AdminPrincipal {
+			t.Errorf("request %d: X-Trino-User = %q, want %q", i, got, opa.AdminPrincipal)
+		}
 	}
 }

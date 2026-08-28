@@ -345,3 +345,147 @@ func TestBootstrap_TransientSentinelErrorRetries(t *testing.T) {
 	// The provisioner must NOT have assumed not-bootstrapped and written
 	// Secrets — failing closed on an indeterminate sentinel is the point.
 }
+
+// --------------------------------------------------------------------------
+// Observer credential: the admin console's read-only Trino identity.
+//
+// It shares trino-auth and the regenerate-if-missing semantics with the
+// admin pair (both are provisioner-owned with no external consumer, so
+// losing one self-heals within a password-file refresh rather than
+// wedging), but it must be a genuinely DISTINCT credential: the whole
+// point of the split is that leaking one does not yield the other's
+// authority. See opa.ObserverPrincipal.
+// --------------------------------------------------------------------------
+
+func TestBootstrap_MintsObserverCredential(t *testing.T) {
+	p, kc, _ := newClusterSecretsTestProvisioner(t)
+
+	if _, err := p.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	auth := getSecret(t, kc, TrinoAuthSecretName)
+	plain := auth.Data[TrinoAuthSecretKeyObserverPassword]
+	hash := auth.Data[TrinoAuthSecretKeyObserverPasswordHash]
+	if len(plain) == 0 || len(hash) == 0 {
+		t.Fatal("observer password/hash keys missing on trino-auth -- the admin console cannot authenticate to the coordinator without them")
+	}
+	if err := bcrypt.CompareHashAndPassword(hash, plain); err != nil {
+		t.Errorf("observer password/hash pair does not validate: %v", err)
+	}
+
+	// The accessor the control plane's admin wiring reads.
+	user, pass := p.ObserverCredential()
+	if user != opa.ObserverPrincipal {
+		t.Errorf("ObserverCredential user = %q, want %q", user, opa.ObserverPrincipal)
+	}
+	if pass != string(plain) {
+		t.Error("ObserverCredential password does not match the projected Secret value")
+	}
+}
+
+// TestBootstrap_ObserverCredentialIsDistinctFromAdmin is the split itself.
+// If these ever coincide, the console's read-only identity silently carries
+// CREATE/DROP CATALOG authority and the security bargain in
+// opa.ObserverPrincipal is void.
+func TestBootstrap_ObserverCredentialIsDistinctFromAdmin(t *testing.T) {
+	p, kc, _ := newClusterSecretsTestProvisioner(t)
+
+	if _, err := p.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	auth := getSecret(t, kc, TrinoAuthSecretName)
+	adminPlain := string(auth.Data[TrinoAuthSecretKeyAdminPassword])
+	observerPlain := string(auth.Data[TrinoAuthSecretKeyObserverPassword])
+	if adminPlain == "" || observerPlain == "" {
+		t.Fatal("expected both credentials to be minted")
+	}
+	if adminPlain == observerPlain {
+		t.Error("observer and admin passwords are identical -- they must be independent credentials")
+	}
+	if opa.ObserverPrincipal == opa.AdminPrincipal {
+		t.Error("observer and admin principals must be distinct usernames")
+	}
+}
+
+// TestBootstrap_AdoptsExistingObserverCredential: a second Bootstrap (a
+// restart, or another replica) must converge on the durable pair rather
+// than rotating it out from under a running console.
+func TestBootstrap_AdoptsExistingObserverCredential(t *testing.T) {
+	p, kc, _ := newClusterSecretsTestProvisioner(t)
+
+	if _, err := p.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("first Bootstrap: %v", err)
+	}
+	first := string(getSecret(t, kc, TrinoAuthSecretName).Data[TrinoAuthSecretKeyObserverPassword])
+
+	if _, err := p.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("second Bootstrap: %v", err)
+	}
+	second := string(getSecret(t, kc, TrinoAuthSecretName).Data[TrinoAuthSecretKeyObserverPassword])
+
+	if first != second {
+		t.Error("second Bootstrap rotated the observer password; it must adopt the durable pair")
+	}
+	if _, pass := p.ObserverCredential(); pass != second {
+		t.Error("ObserverCredential drifted from the Secret after re-Bootstrap")
+	}
+}
+
+// TestBootstrap_ObserverPairMismatchFailsLoud mirrors the admin behaviour:
+// a hand-edited half-pair is a configuration error, not something to paper
+// over by regenerating (which would rotate a credential someone is using).
+func TestBootstrap_ObserverPairMismatchFailsLoud(t *testing.T) {
+	p, kc, sentinel := newClusterSecretsTestProvisioner(t)
+	if _, err := p.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	auth := getSecret(t, kc, TrinoAuthSecretName)
+	auth.Data[TrinoAuthSecretKeyObserverPassword] = []byte("not-the-password-that-hash-is-for")
+	if _, err := kc.CoreV1().Secrets(TrinoCustomerNamespace).
+		Update(context.Background(), auth, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update secret: %v", err)
+	}
+	if ok, _ := sentinel.IsTrinoClusterBootstrapped(context.Background(), TrinoCustomerNamespace); !ok {
+		t.Fatal("expected the sentinel to be set after the first boot")
+	}
+
+	if _, err := p.Bootstrap(context.Background()); err == nil {
+		t.Error("Bootstrap accepted an inconsistent observer password/hash pair; it must fail loud")
+	}
+}
+
+// TestBootstrap_ObserverKeyLossRegenerates: unlike the internal-communication
+// secret (env-projected into long-lived pods, so regeneration would
+// split-brain the cluster), the observer pair has no external consumer.
+// Losing it must self-heal on the next tick.
+func TestBootstrap_ObserverKeyLossRegenerates(t *testing.T) {
+	p, kc, _ := newClusterSecretsTestProvisioner(t)
+	if _, err := p.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	auth := getSecret(t, kc, TrinoAuthSecretName)
+	delete(auth.Data, TrinoAuthSecretKeyObserverPassword)
+	delete(auth.Data, TrinoAuthSecretKeyObserverPasswordHash)
+	if _, err := kc.CoreV1().Secrets(TrinoCustomerNamespace).
+		Update(context.Background(), auth, metav1.UpdateOptions{}); err != nil {
+		t.Fatalf("update secret: %v", err)
+	}
+
+	if _, err := p.Bootstrap(context.Background()); err != nil {
+		t.Fatalf("Bootstrap after observer key loss: %v", err)
+	}
+	regenerated := getSecret(t, kc, TrinoAuthSecretName)
+	if len(regenerated.Data[TrinoAuthSecretKeyObserverPassword]) == 0 {
+		t.Error("observer credential was not regenerated after key loss")
+	}
+	if err := bcrypt.CompareHashAndPassword(
+		regenerated.Data[TrinoAuthSecretKeyObserverPasswordHash],
+		regenerated.Data[TrinoAuthSecretKeyObserverPassword],
+	); err != nil {
+		t.Errorf("regenerated observer pair does not validate: %v", err)
+	}
+}

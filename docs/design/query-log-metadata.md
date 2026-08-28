@@ -582,10 +582,14 @@ attacker-controlled strings that land in a log table and an admin UI.
   `query_log.retention` (default ~90d) under the advisory-lock pattern the
   partition-create path already uses. **Required before the fat columns ship.**
 - **Hot-footprint visibility**: the leader-owned storage sampler exports
-  `duckgres_org_query_log_hot_bytes{org}` every 30 minutes from the native
+  `duckgres_org_query_log_hot_bytes{org}` and
+  `duckgres_org_query_log_hot_rows{org}` every 30 minutes. Bytes are the native
   metadata-Postgres relation size (heap + indexes + TOAST across all leaf
-  partitions). It is observability-only and is never included in S3 storage
-  billing; a failed refresh retains the last successful gauge value.
+  partitions); rows are an inexpensive estimate summed from
+  `pg_class.reltuples`, not a table scan. Negative estimates on new,
+  unanalyzed partitions contribute zero. Both metrics are observability-only
+  and are never included in S3 storage billing; a failed refresh retains the
+  last successful gauge values.
 - **Admin console**: surface the new dimensions and the start/terminal pairing
   on the Queries/Errors pages.
 - **Shadow-mode RBAC report**: evaluate a candidate grant set against logged

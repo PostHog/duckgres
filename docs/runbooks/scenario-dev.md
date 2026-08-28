@@ -7,9 +7,14 @@ identity, diagnostics, and teardown.
 
 ## Scheduled Runs
 
-The scheduled trigger runs `full-suite`, which covers the frozen dataset
-metadata, perf, and dbt workloads with one shared warehouse lifecycle. Manual
-runs also default to `full-suite`.
+The daily scheduled trigger runs `posthog_frozen_perf`, which creates
+production-shaped DuckLake tables from the frozen dataset, executes paired
+raw-view and DuckLake-table queries, and publishes the comparison history.
+Scheduled runs no longer execute `full-suite`.
+
+Manual runs remain selectable and default to `full-suite`, which covers the
+frozen dataset metadata, legacy perf, and dbt workloads with one shared
+warehouse lifecycle.
 
 Scenario jobs override the shared harness's default worker request to 2 CPU and
 8Gi memory for the frozen pgwire perf workload. This adds process headroom for

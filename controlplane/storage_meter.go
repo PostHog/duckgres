@@ -39,13 +39,14 @@ SELECT COALESCE((SELECT SUM(file_size_bytes) FROM ducklake_data_file), 0)
      + COALESCE((SELECT SUM(file_size_bytes) FROM ducklake_delete_file), 0),
        (SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion)`
 
-// queryLogHotBytesQuery measures the native metadata-Postgres footprint of
-// the partitioned query log. pg_total_relation_size includes heap, indexes,
-// and TOAST; summing leaves includes both monthly and default partitions. The
-// recursive catalog walk deliberately starts with nullable to_regclass so an
-// uninitialized query log reports zero without calling a partition helper on
-// an invalid relation.
-const queryLogHotBytesQuery = `
+// queryLogHotStatsQuery measures the native metadata-Postgres footprint and
+// estimated row count of the partitioned query log. pg_total_relation_size
+// includes heap, indexes, and TOAST; pg_class.reltuples supplies an inexpensive
+// row estimate. Summing leaves includes both monthly and default partitions.
+// The recursive catalog walk deliberately starts with nullable to_regclass so
+// an uninitialized query log reports zeros without calling a partition helper
+// on an invalid relation.
+const queryLogHotStatsQuery = `
 WITH RECURSIVE parts(relid) AS (
     SELECT to_regclass('querylog.query_log_entries')
     UNION ALL
@@ -60,8 +61,15 @@ WITH RECURSIVE parts(relid) AS (
           SELECT 1 FROM pg_inherits child WHERE child.inhparent = p.relid
       )
 )
-SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0)::BIGINT
-FROM leaves`
+SELECT COALESCE(SUM(pg_total_relation_size(l.relid)), 0)::BIGINT,
+       COALESCE(SUM(
+           CASE
+               WHEN c.reltuples < 0 THEN 0::DOUBLE PRECISION
+               ELSE c.reltuples::DOUBLE PRECISION
+           END
+       ), 0::DOUBLE PRECISION)
+FROM leaves l
+JOIN pg_class c ON c.oid = l.relid`
 
 var storageTrackedBytesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_org_storage_tracked_bytes",
@@ -76,6 +84,11 @@ var storagePendingDeleteFilesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 var queryLogHotBytesGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
 	Name: "duckgres_org_query_log_hot_bytes",
 	Help: "Physical metadata-Postgres footprint of the query log per org (bytes), including indexes and TOAST, from the last successful sample.",
+}, []string{"org"})
+
+var queryLogHotRowsGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "duckgres_org_query_log_hot_rows",
+	Help: "Approximate query-log rows in metadata Postgres per org, summed from leaf-partition pg_class.reltuples at the last successful sample.",
 }, []string{"org"})
 
 var storageSampleErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -113,9 +126,10 @@ type storageSampler struct {
 	resolveDSN func(ctx context.Context, orgID string) (string, error)
 	// queryFootprint visits one org's metadata Postgres; swappable in tests.
 	queryFootprint func(ctx context.Context, dsn string) (trackedBytes, pendingDeleteFiles int64, err error)
-	// queryHotBytes independently measures the native query-log footprint. Its
-	// failure is warning-only and never changes storage billing.
-	queryHotBytes func(ctx context.Context, dsn string) (int64, error)
+	// queryHotStats independently measures the native query-log footprint and
+	// approximate row count. Its failure is warning-only and never changes
+	// storage billing.
+	queryHotStats func(ctx context.Context, dsn string) (hotBytes int64, hotRows float64, err error)
 	now           func() time.Time
 }
 
@@ -129,7 +143,7 @@ func newStorageSampler(store storageUsageStore, interval time.Duration, listOrgs
 		listOrgs:       listOrgs,
 		resolveDSN:     resolveDSN,
 		queryFootprint: queryStorageFootprint,
-		queryHotBytes:  queryQueryLogHotBytes,
+		queryHotStats:  queryQueryLogHotStats,
 		now:            time.Now,
 	}
 }
@@ -153,6 +167,7 @@ func (s *storageSampler) Run(ctx context.Context) {
 	defer storageTrackedBytesGauge.Reset()
 	defer storagePendingDeleteFilesGauge.Reset()
 	defer queryLogHotBytesGauge.Reset()
+	defer queryLogHotRowsGauge.Reset()
 	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 	for {
@@ -207,16 +222,17 @@ func (s *storageSampler) sampleOrg(ctx context.Context, org storageOrg) error {
 	bucket := s.now().UTC().Truncate(computeBucketWidth)
 	billingErr := s.store.UpsertStorageSample(org.OrgID, org.TeamID, bucket, byteSeconds)
 
-	// Query-log hot bytes are observability only. Sample them after the billing
+	// Query-log hot stats are observability only. Sample them after the billing
 	// write so a slow or failed inspection cannot suppress a valid S3 sample.
 	// Give it an independent timeout so time spent resolving and sampling S3
-	// storage cannot consume its budget. Preserve the last good value on error.
+	// storage cannot consume its budget. Preserve the last good values on error.
 	hotCtx, cancelHot := context.WithTimeout(ctx, storageSampleQueryTimeout)
 	defer cancelHot()
-	if hotBytes, err := s.queryHotBytes(hotCtx, dsn); err != nil {
-		slog.Warn("Query-log hot-bytes sample failed; retaining last good value.", "org", org.OrgID, "error", err)
+	if hotBytes, hotRows, err := s.queryHotStats(hotCtx, dsn); err != nil {
+		slog.Warn("Query-log hot-stats sample failed; retaining last good values.", "org", org.OrgID, "error", err)
 	} else {
 		queryLogHotBytesGauge.WithLabelValues(org.OrgID).Set(float64(hotBytes))
+		queryLogHotRowsGauge.WithLabelValues(org.OrgID).Set(hotRows)
 	}
 
 	return billingErr
@@ -239,19 +255,20 @@ func queryStorageFootprint(ctx context.Context, dsn string) (trackedBytes, pendi
 	return trackedBytes, pendingDeleteFiles, nil
 }
 
-func queryQueryLogHotBytes(ctx context.Context, dsn string) (int64, error) {
+func queryQueryLogHotStats(ctx context.Context, dsn string) (int64, float64, error) {
 	db, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 
 	var hotBytes int64
-	if err := db.QueryRowContext(ctx, queryLogHotBytesQuery).Scan(&hotBytes); err != nil {
-		return 0, err
+	var hotRows float64
+	if err := db.QueryRowContext(ctx, queryLogHotStatsQuery).Scan(&hotBytes, &hotRows); err != nil {
+		return 0, 0, err
 	}
-	return hotBytes, nil
+	return hotBytes, hotRows, nil
 }
 
 // storageSampleIntervalFromEnv reads the env-only sampling-interval override

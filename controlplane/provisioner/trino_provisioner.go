@@ -30,6 +30,15 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+// TrinoProvisionerSource is the `X-Trino-Source` the provisioner stamps on
+// its catalog-management statements. Trino records the header verbatim as
+// the `source` column of system.runtime.queries and shows it in the query
+// listing, so tagging it is what lets an operator tell control-plane
+// traffic apart from tenant SQL — including filtering it out of the admin
+// console's own live-query view. Untagged, every reconcile tick's SHOW
+// CATALOGS looks like a mystery query from a privileged user.
+const TrinoProvisionerSource = "duckgres-provisioner"
+
 // TrinoCustomerNamespace is the K8s namespace where the shared Trino cell
 // lives. The auth Secret, tenant-password Secret and resource-groups
 // ConfigMap are projected into this namespace by the provisioner.
@@ -94,6 +103,26 @@ const TrinoOPABundleTokenSecretKey = "token"
 const (
 	TrinoAuthSecretKeyAdminPassword     = "admin-password"
 	TrinoAuthSecretKeyAdminPasswordHash = "admin-password-hash" //nolint:gosec // K8s secret key name, not a hardcoded credential
+)
+
+// The observer principal's plaintext + bcrypt hash, consumed by the
+// control plane's admin console when it reads the cell's live query and
+// node state over the coordinator REST API.
+//
+// Deliberately a SECOND credential on the same Secret rather than a reuse
+// of the admin pair: the admin principal can CREATE/DROP catalogs and sees
+// only its own queries; the observer sees every tenant's query metadata
+// and owns no catalog at all. Fusing them would make one leaked credential
+// yield both halves. See opa.ObserverPrincipal for the full argument, and
+// policy.rego's "Observer principal" section for the enforcement.
+//
+// Same lifecycle as the admin pair (ensureCredentialPair): regenerated if
+// missing, because the provisioner owns both sides and nothing external
+// consumes the value, so loss self-heals within one password-file refresh
+// instead of wedging the cell.
+const (
+	TrinoAuthSecretKeyObserverPassword     = "observer-password"
+	TrinoAuthSecretKeyObserverPasswordHash = "observer-password-hash" //nolint:gosec // K8s secret key name, not a hardcoded credential
 )
 
 // TrinoTenantSecretName is the K8s Secret holding ONE KEY PER
@@ -402,6 +431,48 @@ type TrinoProvisioner struct {
 	// trino-auth K8s Secret and prepended to password.db on projection.
 	// Empty until the first Reconcile.
 	adminPasswordHash string
+
+	// observerPassword / observerPasswordHash are the admin console's
+	// Trino credential, cached from the same Secret. The hash is
+	// projected into password.db; the plaintext is handed to the console
+	// wiring through ObserverCredential and never logged, never written
+	// to the config store, and never rendered into a catalog property.
+	//
+	// Guarded because ObserverCredential is read by the API layer on a
+	// different goroutine from the reconcile loop that writes them.
+	credMu               sync.RWMutex
+	observerPassword     string
+	observerPasswordHash string
+}
+
+// ObserverCredential returns the Trino username + plaintext password the
+// admin console authenticates to the coordinator with. Empty password
+// until the first Bootstrap has run.
+//
+// The console is a READ-ONLY consumer of this credential: policy.rego
+// grants the observer cluster-wide query visibility (and kill) plus
+// ReadSystemInformation, and nothing else -- notably no catalog access, so
+// this credential cannot read a row of tenant data.
+func (p *TrinoProvisioner) ObserverCredential() (username, password string) {
+	p.credMu.RLock()
+	defer p.credMu.RUnlock()
+	return opa.ObserverPrincipal, p.observerPassword
+}
+
+// observerHash reads the cached bcrypt hash for the password.db
+// projection.
+func (p *TrinoProvisioner) observerHash() string {
+	p.credMu.RLock()
+	defer p.credMu.RUnlock()
+	return p.observerPasswordHash
+}
+
+// setObserverCredential caches the minted pair for the projection step
+// and for ObserverCredential.
+func (p *TrinoProvisioner) setObserverCredential(plaintext, hash string) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.observerPassword, p.observerPasswordHash = plaintext, hash
 }
 
 // NewTrinoProvisioner constructs a TrinoProvisioner from required deps.
@@ -758,8 +829,10 @@ func (p *TrinoProvisioner) Bootstrap(ctx context.Context) (bundleToken string, e
 	return p.ensureClusterSecrets(ctx)
 }
 
-// ensureClusterSecrets makes the three cluster-level K8s Secrets exist
-// and returns the OPA bundle bearer token (for the startup handler).
+// ensureClusterSecrets makes the cluster-level K8s Secrets exist and
+// returns the OPA bundle bearer token (for the startup handler): the
+// internal-communication shared secret, the bundle token, and the two
+// provisioner-owned credential pairs on trino-auth (admin, observer).
 //
 // The K8s Secret is the SINGLE source of truth for each credential
 // value (mirrors ensureWorkerRPCSecret); the configstore holds only a
@@ -781,6 +854,10 @@ func (p *TrinoProvisioner) Bootstrap(ctx context.Context) (bundleToken string, e
 // rest adopt); the sentinel Mark is idempotent. A crash mid-set leaves
 // convergent state (next tick adopts what exists, generates what's
 // missing, then Marks) rather than an orphan.
+//
+// "All three the same way" below refers to the write-once family; the two
+// credential PAIRS on trino-auth are the deliberate exception, documented
+// at ensureCredentialPair.
 func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToken string, err error) {
 	bootstrapped, err := p.bootstrapSentinel.IsTrinoClusterBootstrapped(ctx, p.namespace)
 	if err != nil {
@@ -815,7 +892,18 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 		return "", err
 	}
 
-	// All three confirmed present + valid — only now record the
+	// observer password + bcrypt hash: the admin console's read-only
+	// Trino identity, on the same Secret with the same
+	// regenerate-if-missing semantics and for the same reason (no
+	// external consumer). Established AFTER the admin pair so the
+	// first-boot Create of trino-auth is owned by one code path; this
+	// call then merges into the Secret the admin pair just created.
+	observerPlaintext, observerHash, err := p.ensureObserverCredential(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	// All confirmed present + valid — only now record the
 	// sentinel, so a partial first boot (some Secrets created, then a
 	// crash) re-enters the generate path next tick rather than fail-loud.
 	if !bootstrapped {
@@ -825,6 +913,7 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 	}
 
 	p.adminPasswordHash = adminHash
+	p.setObserverCredential(observerPlaintext, observerHash)
 	// Push the admin plaintext into the catalog client if it supports
 	// runtime credential updates (test fakes don't).
 	if updater, ok := p.catalog.(TrinoCatalogCredentialUpdater); ok {
@@ -914,11 +1003,14 @@ func (p *TrinoProvisioner) ensureWriteOnceSecret(ctx context.Context, name, key 
 // password.db/group.db each tick), so the admin keys are MERGED in. The
 // merge is retried on a 409 conflict so two replicas racing on first
 // boot don't crash the loser — it re-reads and adopts the winner's pair.
-func (p *TrinoProvisioner) ensureAdminCredential(ctx context.Context) (plaintext, hash string, err error) {
+// ensureCredentialPair is that algorithm, parameterized over which pair of
+// keys on trino-auth it establishes. Both the admin and the observer
+// principal use it; label names the credential in error messages.
+func (p *TrinoProvisioner) ensureCredentialPair(ctx context.Context, label, plainKey, hashKey string) (plaintext, hash string, err error) {
 	const maxAttempts = 5
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		plainBytes, plainErr := p.readSecretKey(ctx, TrinoAuthSecretName, TrinoAuthSecretKeyAdminPassword)
-		hashBytes, hashErr := p.readSecretKey(ctx, TrinoAuthSecretName, TrinoAuthSecretKeyAdminPasswordHash)
+		plainBytes, plainErr := p.readSecretKey(ctx, TrinoAuthSecretName, plainKey)
+		hashBytes, hashErr := p.readSecretKey(ctx, TrinoAuthSecretName, hashKey)
 
 		// Both present: validate the pair and ADOPT it. This is the
 		// convergence point — every replica that finds a present pair
@@ -927,8 +1019,8 @@ func (p *TrinoProvisioner) ensureAdminCredential(ctx context.Context) (plaintext
 		if plainErr == nil && hashErr == nil {
 			if bcryptErr := bcrypt.CompareHashAndPassword(hashBytes, plainBytes); bcryptErr != nil {
 				return "", "", fmt.Errorf(
-					"trino-auth admin-password-hash does not validate against admin-password (inconsistent pair, likely a "+
-						"manual edit): %w", bcryptErr)
+					"trino-auth %s does not validate against %s (inconsistent pair, likely a "+
+						"manual edit): %w", hashKey, plainKey, bcryptErr)
 			}
 			return string(plainBytes), string(hashBytes), nil
 		}
@@ -940,7 +1032,7 @@ func (p *TrinoProvisioner) ensureAdminCredential(ctx context.Context) (plaintext
 			}
 			var mse missingSecretError
 			if !errors.As(e, &mse) {
-				return "", "", fmt.Errorf("ensure trino-auth admin credential: %w", e)
+				return "", "", fmt.Errorf("ensure trino-auth %s credential: %w", label, e)
 			}
 		}
 
@@ -948,45 +1040,64 @@ func (p *TrinoProvisioner) ensureAdminCredential(ctx context.Context) (plaintext
 		// ESTABLISH it without overwriting a concurrent winner.
 		newPlain, genErr := configstore.GeneratePassword()
 		if genErr != nil {
-			return "", "", fmt.Errorf("generate admin password: %w", genErr)
+			return "", "", fmt.Errorf("generate %s password: %w", label, genErr)
 		}
 		newHash, hashGenErr := configstore.HashPassword(newPlain)
 		if hashGenErr != nil {
-			return "", "", fmt.Errorf("hash admin password: %w", hashGenErr)
+			return "", "", fmt.Errorf("hash %s password: %w", label, hashGenErr)
 		}
-		adminData := map[string][]byte{
-			TrinoAuthSecretKeyAdminPassword:     []byte(newPlain),
-			TrinoAuthSecretKeyAdminPasswordHash: []byte(newHash),
+		pairData := map[string][]byte{
+			plainKey: []byte(newPlain),
+			hashKey:  []byte(newHash),
 		}
 
 		// First boot: ensureClusterSecrets runs before reconcileAuthSecret,
 		// so trino-auth typically doesn't exist yet. Create-once makes the
-		// admin keys atomic: the winner owns them, racing replicas get
+		// pair atomic: the winner owns it, racing replicas get
 		// AlreadyExists and loop back to ADOPT (top of the loop) rather
 		// than overwriting the winner's pair.
-		createErr := p.createManagedSecret(ctx, TrinoAuthSecretName, adminData, false /*mutable: reconcileAuthSecret adds password.db/group.db*/)
+		createErr := p.createManagedSecret(ctx, TrinoAuthSecretName, pairData, false /*mutable: reconcileAuthSecret adds password.db/group.db*/)
 		if createErr == nil {
 			return newPlain, newHash, nil
 		}
 		if !apierrors.IsAlreadyExists(createErr) {
-			return "", "", fmt.Errorf("create trino-auth admin credential: %w", createErr)
+			return "", "", fmt.Errorf("create trino-auth %s credential: %w", label, createErr)
 		}
 
 		// trino-auth already exists. Re-read: if a pair is now present
 		// (a racing replica won the Create, or it was set since our read),
 		// the loop top will adopt it. If still absent (legacy upgrade:
-		// trino-auth holds only password.db/group.db, no admin keys), merge
+		// trino-auth holds only password.db/group.db, no such keys), merge
 		// our pair in. The merge can still race a concurrent merge, but the
 		// loop re-reads and converges on the durable winner.
-		if _, e := p.readSecretKey(ctx, TrinoAuthSecretName, TrinoAuthSecretKeyAdminPassword); e == nil {
+		if _, e := p.readSecretKey(ctx, TrinoAuthSecretName, plainKey); e == nil {
 			continue // pair appeared — adopt on next iteration
 		}
-		if mergeErr := p.upsertSecretMerge(ctx, TrinoAuthSecretName, adminData); mergeErr != nil && !apierrors.IsConflict(mergeErr) {
-			return "", "", fmt.Errorf("merge trino-auth admin credential: %w", mergeErr)
+		if mergeErr := p.upsertSecretMerge(ctx, TrinoAuthSecretName, pairData); mergeErr != nil && !apierrors.IsConflict(mergeErr) {
+			return "", "", fmt.Errorf("merge trino-auth %s credential: %w", label, mergeErr)
 		}
 		// Loop back: re-read and adopt whatever durably won.
 	}
-	return "", "", fmt.Errorf("ensure trino-auth admin credential: did not converge after %d attempts (will retry next reconcile)", maxAttempts)
+	return "", "", fmt.Errorf("ensure trino-auth %s credential: did not converge after %d attempts (will retry next reconcile)", label, maxAttempts)
+}
+
+// ensureAdminCredential establishes the provisioner's own
+// catalog-management credential.
+func (p *TrinoProvisioner) ensureAdminCredential(ctx context.Context) (plaintext, hash string, err error) {
+	return p.ensureCredentialPair(ctx, "admin",
+		TrinoAuthSecretKeyAdminPassword, TrinoAuthSecretKeyAdminPasswordHash)
+}
+
+// ensureObserverCredential establishes the admin console's read-only
+// Trino credential. Same regenerate-if-missing semantics as the admin
+// pair and for the same reason: the provisioner owns both sides, so a
+// lost pair self-heals on the next tick instead of wedging. A rotation
+// costs the console only a 401 until the coordinator's password-file
+// refresh picks up the new hash, because the console reads the credential
+// from this provisioner on each call rather than caching it at startup.
+func (p *TrinoProvisioner) ensureObserverCredential(ctx context.Context) (plaintext, hash string, err error) {
+	return p.ensureCredentialPair(ctx, "observer",
+		TrinoAuthSecretKeyObserverPassword, TrinoAuthSecretKeyObserverPasswordHash)
 }
 
 // createManagedSecret creates a Secret with the standard managed
@@ -1631,11 +1742,32 @@ func ducklakeDataPath(bucket, pathPrefix string) string {
 // Mounted into the coordinator pod only (chart configuration in Stream
 // F). Workers never see this Secret.
 func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
-	passwordDB, groupDB := BuildTrinoAuthFiles(orgs, p.adminPasswordHash)
+	passwordDB, groupDB := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{
+		AdminPasswordHash:    p.adminPasswordHash,
+		ObserverPasswordHash: p.observerHash(),
+	})
 	return p.upsertSecretMerge(ctx, TrinoAuthSecretName, map[string][]byte{
 		TrinoAuthSecretKeyPasswordDB: []byte(passwordDB),
 		TrinoAuthSecretKeyGroupDB:    []byte(groupDB),
 	})
+}
+
+// TrinoClusterPrincipals carries the bcrypt hashes for the cell's two
+// non-tenant principals. A struct rather than two positional strings
+// because they are the same type, adjacent, and swapping them would hand
+// the console's identity catalog-management authority and the
+// provisioner's identity none — a mistake the compiler could not catch.
+//
+// Both are provisioner-owned pairs on the trino-auth Secret; see
+// TrinoAuthSecretKeyAdminPassword and TrinoAuthSecretKeyObserverPassword.
+type TrinoClusterPrincipals struct {
+	// AdminPasswordHash authenticates opa.AdminPrincipal, which performs
+	// CREATE/DROP CATALOG and sees only its own queries.
+	AdminPasswordHash string
+	// ObserverPasswordHash authenticates opa.ObserverPrincipal, the admin
+	// console's read-only identity: cluster-wide query visibility and
+	// ReadSystemInformation, and no catalog access whatsoever.
+	ObserverPasswordHash string
 }
 
 // BuildTrinoAuthFiles deterministically renders the (password.db,
@@ -1663,23 +1795,34 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 // non-blank database_name, so this is just defensive against future
 // changes).
 //
-// adminPasswordHash is the bcrypt for opa.AdminPrincipal — the
-// provisioner's own catalog-management identity. When non-empty, the
-// admin entry is unconditionally prepended to both files (regardless of
-// orgs). The plan ("Internal admin principal for catalog management")
-// requires the admin in *both* password.db and group.db so OPA's
-// is_admin = (admin username AND admin group) conjunction holds; the
-// provisioner cannot do CREATE/DROP CATALOG otherwise. Empty hash skips
-// the admin lines (acceptable in unit tests where the catalog client is
-// a fake; never acceptable in production — see NewTrinoProvisioner).
-func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, adminPasswordHash string) (passwordDB, groupDB string) {
+// cluster carries the bcrypt hashes for the two non-tenant principals.
+// Each is prepended to both files when non-empty, regardless of orgs —
+// OPA gates both on a username-AND-group conjunction (is_admin,
+// is_observer), so a principal missing from either file has no authority
+// at all. An empty hash skips that principal's lines entirely rather than
+// projecting an un-authenticatable entry (acceptable in unit tests where
+// the catalog client is a fake; never acceptable in production — see
+// NewTrinoProvisioner).
+//
+// Neither operational principal joins a tier group: tier membership is
+// what routes a query to a tenant's resource group, and neither of these
+// submits tenant SQL (the admin issues catalog DDL under its own
+// root.admin selector; the observer submits nothing at all, reading the
+// coordinator's REST API instead).
+func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, cluster TrinoClusterPrincipals) (passwordDB, groupDB string) {
 	var pwLines, grpLines []string
 	tierMembers := map[string][]string{}
-	if adminPasswordHash != "" {
-		// Prepend so the admin is always present even if every org row
-		// is filtered out (empty cluster bootstrap).
-		pwLines = append(pwLines, fmt.Sprintf("%s:%s", opa.AdminPrincipal, adminPasswordHash))
-		grpLines = append(grpLines, fmt.Sprintf("%s:%s", opa.AdminGroup, opa.AdminPrincipal))
+	// Prepend so the operational principals are always present even if
+	// every org row is filtered out (empty cluster bootstrap).
+	for _, cp := range []struct{ principal, group, hash string }{
+		{opa.AdminPrincipal, opa.AdminGroup, cluster.AdminPasswordHash},
+		{opa.ObserverPrincipal, opa.ObserverGroup, cluster.ObserverPasswordHash},
+	} {
+		if cp.hash == "" {
+			continue
+		}
+		pwLines = append(pwLines, fmt.Sprintf("%s:%s", cp.principal, cp.hash))
+		grpLines = append(grpLines, fmt.Sprintf("%s:%s", cp.group, cp.principal))
 	}
 	for _, o := range orgs {
 		principal := o.TrinoPrincipal()
@@ -1884,7 +2027,8 @@ func tierLimits(tier string) resourceGroupSubGroup {
 // which the file group provider DOES reload (file.refresh-period=60s), so a
 // retier takes effect within a minute and still needs no restart.
 //
-// Selector order is first-match-wins. Admin is first so its catalog DDL never
+// Selector order is first-match-wins. The two operational principals come
+// first so neither the provisioner's catalog DDL nor the console's node query
 // falls into a tenant lane, then the explicit tiers, then free as the
 // catch-all — an org with an unknown or empty tier lands in the smallest lane
 // rather than matching nothing, which would reject its queries outright.
@@ -1911,9 +2055,18 @@ func BuildTrinoResourceGroups() ([]byte, error) {
 		return l
 	}
 
+	// Both operational principals get an explicit lane BEFORE the tenant
+	// selectors. The last selector matches user `(?<org>.*)`, which matches
+	// anything, so without these the provisioner and the observer would be
+	// admitted as tenants into root.tenants.free.<principal>. Those leaves
+	// are JmxExport=true, so each would appear as a phantom tenant in the
+	// per-tenant resource-group metrics and in anything alerting off them.
 	selectors := []resourceGroupSelector{{
 		User:  opa.AdminPrincipal,
 		Group: "root.admin." + opa.AdminPrincipal,
+	}, {
+		User:  opa.ObserverPrincipal,
+		Group: "root.admin." + opa.ObserverPrincipal,
 	}}
 	for _, tier := range []string{tierScale, tierGrowth} {
 		selectors = append(selectors, resourceGroupSelector{
@@ -1942,6 +2095,16 @@ func BuildTrinoResourceGroups() ([]byte, error) {
 			SoftMemoryLimit:      "5%",
 			HardConcurrencyLimit: 4,
 			MaxQueued:            20,
+		}, {
+			// The observer runs one query: SELECT from system.runtime.nodes,
+			// on the cluster page's refresh interval. Its own small lane so a
+			// console left open cannot queue behind, or ahead of, the
+			// provisioner's catalog DDL. Unexported for the same reason the
+			// admin leaf is: it is not a tenant.
+			Name:                 opa.ObserverPrincipal,
+			SoftMemoryLimit:      "2%",
+			HardConcurrencyLimit: 2,
+			MaxQueued:            10,
 		}},
 	}
 
@@ -2286,6 +2449,7 @@ func (c *trinoCatalogHTTPClient) runStatement(ctx context.Context, sql string) (
 	req.Header.Set("Content-Type", "text/plain")
 	username, password := c.credentials()
 	req.Header.Set("X-Trino-User", username)
+	req.Header.Set("X-Trino-Source", TrinoProvisionerSource)
 	req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
 
 	resp, err := c.hc.Do(req)
@@ -2336,6 +2500,7 @@ func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []b
 		}
 		username, password := c.credentials()
 		req.Header.Set("X-Trino-User", username)
+		req.Header.Set("X-Trino-Source", TrinoProvisionerSource)
 		req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
 		resp, err := c.hc.Do(req)
 		if err != nil {

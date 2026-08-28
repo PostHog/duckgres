@@ -38,6 +38,11 @@ vi.mock("@/pages/OrgUsage", () => ({
   OrgUsageSection: () => null,
 }));
 
+// Same for the Trino card (OrgTrinoCard.test.tsx).
+vi.mock("@/pages/OrgTrinoCard", () => ({
+  OrgTrinoCard: () => null,
+}));
+
 import { OrgDetail } from "./OrgDetail";
 
 const warehouseUpdate = vi.fn();

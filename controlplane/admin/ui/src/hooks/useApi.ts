@@ -52,6 +52,12 @@ import type {
   RunningQuery,
   SessionStatus,
   StartReshardBody,
+  TrinoCell,
+  TrinoNodesResponse,
+  TrinoOrgDetail,
+  TrinoOrgsResponse,
+  TrinoQueriesResponse,
+  TrinoStatus,
   UpdateUserBody,
   WarehouseStatusResult,
   WorkerStatus,
@@ -761,5 +767,87 @@ export function useCancelReshard() {
   return useMutation({
     mutationFn: (opId: number) => api.cancelReshard(opId),
     onSuccess: (_data, opId) => qc.invalidateQueries({ queryKey: ["reshard", opId] }),
+  });
+}
+
+// ---- trino cell ----
+//
+// Every read tolerates 404: a deployment with no Trino cell leaves the
+// routes unregistered, and the pages render a "no cell configured" state
+// rather than an error.
+
+const NO_TRINO_CELL: TrinoCell = { id: "", coordinator_url: "" };
+
+export function useTrinoStatus() {
+  return useQuery({
+    queryKey: ["trino", "status"],
+    queryFn: () =>
+      tolerate404<TrinoStatus>({
+        cell: NO_TRINO_CELL,
+        available: false,
+        queries_by_state: {},
+        blocked_queries: 0,
+        node_stats: true,
+        nodes: 0,
+        failed_nodes: 0,
+        orgs_by_state: {},
+        total_orgs: 0,
+      })(api.trinoStatus()),
+    refetchInterval: POLL.normal,
+  });
+}
+
+export function useTrinoQueries(filters: { org?: string; state?: string; active?: boolean }) {
+  return useQuery({
+    queryKey: ["trino", "queries", filters],
+    queryFn: () =>
+      tolerate404<TrinoQueriesResponse>({ cell: NO_TRINO_CELL, available: false, queries: [] })(
+        api.trinoQueries(filters),
+      ),
+    refetchInterval: POLL.fast,
+  });
+}
+
+export function useTrinoNodes() {
+  return useQuery({
+    queryKey: ["trino", "nodes"],
+    queryFn: () =>
+      tolerate404<TrinoNodesResponse>({ cell: NO_TRINO_CELL, available: false, nodes: [] })(
+        api.trinoNodes(),
+      ),
+    refetchInterval: POLL.slow,
+  });
+}
+
+export function useTrinoOrgs() {
+  return useQuery({
+    queryKey: ["trino", "orgs"],
+    queryFn: () =>
+      tolerate404<TrinoOrgsResponse>({ cell: NO_TRINO_CELL, available: false, orgs: [] })(
+        api.trinoOrgs(),
+      ),
+    refetchInterval: POLL.slow,
+  });
+}
+
+// useOrgTrino backs the org detail page's Trino card. `enabled: false` is a
+// normal answer (most orgs have no Trino row), not an error state.
+export function useOrgTrino(org: string) {
+  return useQuery({
+    queryKey: ["trino", "org", org],
+    queryFn: () =>
+      tolerate404<TrinoOrgDetail>({ cell: NO_TRINO_CELL, enabled: false })(api.orgTrino(org)),
+    enabled: org !== "",
+    refetchInterval: POLL.slow,
+  });
+}
+
+export function useKillTrinoQuery() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason: string }) => api.killTrinoQuery(id, reason),
+    // A kill changes what the live list should show, so drop the whole
+    // trino cache rather than waiting out the poll interval.
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["trino"] }),
   });
 }
