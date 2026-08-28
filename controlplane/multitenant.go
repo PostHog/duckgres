@@ -620,11 +620,10 @@ func SetupMultiTenant(
 		// Count only — never log the secret values.
 		slog.Info("Internal secret rotation fallbacks active.", "fallback_count", n)
 	}
-	// Scoped read-only token for the discovery endpoints. Empty secret ⇒
-	// empty TokenSet ⇒ never validates; discovery then accepts only the
-	// internal secret (pre-rollout behavior). A discovery value colliding
-	// with the internal set would silently un-scope the credential, so
-	// that's a startup failure, not a warning.
+	// Scoped read-only token for discovery and HogQL catalog reads. Empty secret
+	// means the TokenSet never validates and only the internal secret works. A
+	// read-only value colliding with the internal set would silently un-scope the
+	// credential, so startup must fail.
 	if err := validateDistinctReadOnlySecret(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks, internalSecret, cfg.InternalSecretFallbacks); err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
@@ -633,10 +632,10 @@ func SetupMultiTenant(
 		// Keyed off the TokenSet, not just cfg.ReadOnlySecret: fallbacks
 		// alone (mid-rotation) still validate, and saying otherwise here
 		// would mislead an operator debugging exactly that state.
-		slog.Info("Read-only secret not set; discovery endpoints accept only the internal secret. Set --read-only-secret or DUCKGRES_READ_ONLY_SECRET to give external writers a scoped credential.")
+		slog.Info("Read-only secret not set; read-only API endpoints accept only the internal secret. Set --read-only-secret or DUCKGRES_READ_ONLY_SECRET to configure a scoped credential.")
 	} else if n := len(cfg.ReadOnlySecretFallbacks); n > 0 {
 		// Count only — never log the secret values.
-		slog.Info("Discovery secret rotation fallbacks active.", "fallback_count", n)
+		slog.Info("Read-only secret rotation fallbacks active.", "fallback_count", n)
 	}
 
 	// Set up API server (admin + provisioning + dashboard on :8080).
@@ -732,7 +731,7 @@ func SetupMultiTenant(
 	}
 	provisioning.RegisterAPIWithIngressSuffix(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix)
 	hogQLCatalogStore := hogqlcatalog.NewPostgresStore(store.DB())
-	registerHogQLCatalogGroup(engine, adminTokens, hogQLCatalogStore, hogQLCatalogStore)
+	registerHogQLCatalogGroup(engine, readOnlyTokens, adminTokens, hogQLCatalogStore, hogQLCatalogStore)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

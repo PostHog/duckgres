@@ -27,10 +27,10 @@ type apiHandler struct {
 	publisher Publisher
 }
 
-func RegisterAPI(router gin.IRouter, reader Reader, publisher Publisher) {
+func RegisterAPI(readRouter, publishRouter gin.IRouter, reader Reader, publisher Publisher) {
 	handler := &apiHandler{reader: reader, publisher: publisher}
-	router.PUT("/compatibility/semantic-catalog", handler.publish)
-	router.GET("/compatibility/semantic-catalog", handler.read)
+	publishRouter.PUT("/compatibility/semantic-catalog", handler.publish)
+	readRouter.GET("/compatibility/semantic-catalog", handler.read)
 }
 
 func DecodeSnapshot(reader io.Reader) (*HogQLSemanticCatalogSnapshot, error) {

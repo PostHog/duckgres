@@ -162,7 +162,8 @@ func TestDecodeSnapshotRejectsTrailingAndUnknownJSON(t *testing.T) {
 func testRouter(store *MemoryStore) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	RegisterAPI(router.Group("/v1/hogql"), store, store)
+	api := router.Group("/v1/hogql")
+	RegisterAPI(api, api, store, store)
 	return router
 }
 

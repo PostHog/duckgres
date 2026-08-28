@@ -90,6 +90,13 @@ The control plane exposes one internal-token-authenticated compatibility resourc
   reads the highest published generation.
 - Adding `&generation=:generation` to that `GET` reads an exact generation.
 
+`GET` accepts either the rotated read-only token or the rotated admin token.
+`PUT` accepts only the admin token. Both current and fallback rotation values
+are valid during a rotation window, and invalid or missing credentials fail
+before the catalog handler runs. Trino should mount a read-only token and read
+it from `hogql.semantic-catalog.authentication-token-file`; publishers retain
+the separate admin credential.
+
 Every manifest must include `protocolVersion: 1`, `schemaVersion: 2`, a supported language
 version, a positive monotonically increasing generation, and all fields in the
 typed JSON contract. Unknown fields, unknown references, executable SQL, missing
@@ -109,8 +116,23 @@ A property may add `keyTypeSignature`, `valueTypeSignature`, and a
 storage field and the query's typed property key without interpolating SQL.
 Lookup recipes use the same closed literal, function, operator, and cast forms
 as expression fields. `SUBSCRIPT` is the stock two-argument representation for
-map and JSON-object access. A `PROPERTY_LOOKUP` expression names a declared
+map access. `JSON_OBJECT_LOOKUP` accepts a VARCHAR JSON object and VARCHAR key;
+the consumer lowers it through `json_parse`, a cast to `map(varchar, json)`, and
+a subscript without constructing a JSON path. The PostHog v0 property recipe
+declares a VARCHAR result, so the consumer's outer value cast exposes HogQL's
+scalar string semantics. A `PROPERTY_LOOKUP` expression names a declared
 property and carries one typed key expression.
+
+Physical refresh applies the built-in PostHog v0 profile when exactly one
+logical projection of a physical `events` table and one of a physical `persons`
+table share a schema and expose compatible `properties`, `person_id`, and `id`
+columns. The profile adds event and person scalar-property definitions and the
+many-to-one `events.person` relationship. It leaves existing semantic members
+unchanged and stays inert for missing, ambiguous, or incompatible shapes.
+The profile publishes no actions, cohorts, saved queries, modifiers, lazy-table
+definitions, or function declarations. The Trino compiler owns the frozen v0
+function registry, while this manifest supplies only catalog-derived table,
+property, and relationship semantics.
 
 Relationship join keys remain required and describe equijoins. An optional
 `joinPredicate` adds a typed condition when the equijoin does not capture the

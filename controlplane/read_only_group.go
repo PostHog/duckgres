@@ -13,11 +13,10 @@ import (
 
 // registerReadOnlyGroup mounts the read-only discovery endpoints on their
 // OWN gin group: token-only auth (no SSO, no roles) accepting the scoped
-// read-only secret OR the admin internal secret. The read-only secret
-// grants nothing outside this group — an external writer's pod compromise
-// must not escalate to the provisioning/admin surface. ALL discovery
-// routes go through this function so TestReadOnlyGroupTopology can pin
-// the exact surface the discovery credential reaches.
+// read-only secret OR the admin internal secret. The read-only secret grants
+// no mutation or admin access; other explicitly read-only service routes may
+// reuse the same TokenSet. ALL discovery routes go through this function so
+// TestReadOnlyGroupTopology can pin the exact discovery surface.
 func registerReadOnlyGroup(engine *gin.Engine, readOnlyTokens, adminTokens admin.TokenSet, store provisioning.Store) {
 	discoveryAPI := engine.Group("/api/v1",
 		admin.AnyTokenAuthMiddleware(readOnlyTokens, adminTokens),
@@ -32,7 +31,7 @@ func registerReadOnlyGroup(engine *gin.Engine, readOnlyTokens, adminTokens admin
 // password resets, impersonation — which is exactly what the discovery
 // secret exists to prevent. Failing startup is the only honest behavior;
 // the operator copy-pasted the wrong value and nothing downstream can tell.
-func validateDistinctReadOnlySecret(discovery string, discoveryFallbacks []string, internal string, internalFallbacks []string) error {
+func validateDistinctReadOnlySecret(readOnly string, readOnlyFallbacks []string, internal string, internalFallbacks []string) error {
 	adminValues := make(map[string]struct{}, 1+len(internalFallbacks))
 	if internal != "" {
 		adminValues[internal] = struct{}{}
@@ -51,10 +50,10 @@ func validateDistinctReadOnlySecret(discovery string, discoveryFallbacks []strin
 		}
 		return nil
 	}
-	if err := check(discovery, "read-only secret"); err != nil {
+	if err := check(readOnly, "read-only secret"); err != nil {
 		return err
 	}
-	for _, v := range discoveryFallbacks {
+	for _, v := range readOnlyFallbacks {
 		if err := check(v, "a read-only secret fallback"); err != nil {
 			return err
 		}
