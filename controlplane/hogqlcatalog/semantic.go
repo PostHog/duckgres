@@ -293,6 +293,7 @@ const (
 	FunctionRewriteLike                 FunctionRewriteIdentifier = "LIKE"
 	FunctionRewriteLessOrEqual          FunctionRewriteIdentifier = "LESS_OR_EQUAL"
 	FunctionRewriteMaxIf                FunctionRewriteIdentifier = "MAX_IF"
+	FunctionRewriteMapConstructor       FunctionRewriteIdentifier = "MAP_CONSTRUCTOR"
 	FunctionRewriteMD5                  FunctionRewriteIdentifier = "MD5"
 	FunctionRewriteMedianIf             FunctionRewriteIdentifier = "MEDIAN_IF"
 	FunctionRewriteMinIf                FunctionRewriteIdentifier = "MIN_IF"
@@ -344,6 +345,7 @@ const (
 	rewriteSignatureVariadicMinimumThree
 	rewriteSignatureFixedOneOrVariadicMinimumTwo
 	rewriteSignatureFixedTwoOrVariadicMinimumTwo
+	rewriteSignatureFixedZeroOrVariadicMinimumTwo
 )
 
 type functionRewriteContract struct {
@@ -939,6 +941,8 @@ func (contract functionRewriteContract) accepts(signature FunctionSignature) boo
 		return !signature.Variadic && argumentCount == 1 || signature.Variadic && argumentCount == 3
 	case rewriteSignatureFixedTwoOrVariadicMinimumTwo:
 		return !signature.Variadic && argumentCount == 2 || signature.Variadic && argumentCount == 3
+	case rewriteSignatureFixedZeroOrVariadicMinimumTwo:
+		return !signature.Variadic && argumentCount == 0 || signature.Variadic && argumentCount == 3
 	default:
 		return false
 	}
@@ -1481,6 +1485,7 @@ func buildFunctionRewriteContracts() map[FunctionRewriteIdentifier]functionRewri
 		FunctionRewriteJSONLength,
 	)
 	add(FunctionKindScalar, rewriteSignatureFixedTwoOrVariadicMinimumTwo, FunctionRewriteAnd)
+	add(FunctionKindScalar, rewriteSignatureFixedZeroOrVariadicMinimumTwo, FunctionRewriteMapConstructor)
 	add(FunctionKindScalar, rewriteSignatureVariadicMinimumThree, FunctionRewriteMultiIf)
 	add(FunctionKindScalar, rewriteSignatureVariadicMinimumOne, FunctionRewriteTuple)
 

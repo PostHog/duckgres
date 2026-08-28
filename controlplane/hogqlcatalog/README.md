@@ -205,6 +205,8 @@ Scalar rewrite signatures are:
   `JSON_EXTRACT_ARRAY_RAW`, `JSON_EXTRACT_KEYS`, `JSON_EXTRACT_STRING`,
   `JSON_KEYS_AND_VALUES_RAW`, `JSON_LENGTH`;
 - either two fixed arguments or variadic with at least two arguments: `AND`;
+- either no fixed arguments or variadic with at least two arguments:
+  `MAP_CONSTRUCTOR`;
 - variadic with at least three arguments: `MULTI_IF`. Invocations must contain
   condition/result pairs followed by one default value, so their actual arity
   is odd.

@@ -112,6 +112,8 @@ func TestFunctionRewriteSignatureContract(t *testing.T) {
 		{name: "two or three arguments", rewrite: FunctionRewriteDateAdd, kind: FunctionKindScalar, signature: rewriteSignature(3, false, "any"), valid: true},
 		{name: "fixed or variadic from one", rewrite: FunctionRewriteJSONLength, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "bigint"), valid: true},
 		{name: "fixed or variadic from two", rewrite: FunctionRewriteAnd, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "boolean"), valid: true},
+		{name: "empty map constructor", rewrite: FunctionRewriteMapConstructor, kind: FunctionKindScalar, signature: rewriteSignature(0, false, "map(any,any)"), valid: true},
+		{name: "variadic map constructor", rewrite: FunctionRewriteMapConstructor, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "map(any,any)"), valid: true},
 		{name: "variadic from one", rewrite: FunctionRewriteTuple, kind: FunctionKindScalar, signature: rewriteSignature(2, true, "row"), valid: true},
 		{name: "variadic from two", rewrite: FunctionRewriteJSONExtractInt, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "bigint"), valid: true},
 		{name: "variadic from three", rewrite: FunctionRewriteMultiIf, kind: FunctionKindScalar, signature: rewriteSignature(4, true, "any"), valid: true},
@@ -119,6 +121,7 @@ func TestFunctionRewriteSignatureContract(t *testing.T) {
 		{name: "wrong fixed arity", rewrite: FunctionRewriteRegexReplaceAll, kind: FunctionKindScalar, signature: rewriteSignature(2, false, "varchar"), valid: false},
 		{name: "wrong variadic shape", rewrite: FunctionRewriteMultiIf, kind: FunctionKindScalar, signature: rewriteSignature(3, true, "any"), valid: false},
 		{name: "unexpected variadic signature", rewrite: FunctionRewriteCastDate, kind: FunctionKindScalar, signature: rewriteSignature(2, true, "date"), valid: false},
+		{name: "map constructor fixed arguments", rewrite: FunctionRewriteMapConstructor, kind: FunctionKindScalar, signature: rewriteSignature(2, false, "map(any,any)"), valid: false},
 		{name: "null predicate non-boolean result", rewrite: FunctionRewriteIsNull, kind: FunctionKindScalar, signature: rewriteSignature(1, false, "bigint"), valid: false},
 		{name: "aggregate window invocation", rewrite: FunctionRewriteSumIf, kind: FunctionKindAggregate, signature: rewriteSignature(2, false, "any"), supportsWindow: true, valid: true},
 		{name: "scalar window invocation", rewrite: FunctionRewriteCastDate, kind: FunctionKindScalar, signature: rewriteSignature(1, false, "date"), supportsWindow: true, valid: false},
@@ -515,7 +518,7 @@ func validRewriteFunction(rewrite FunctionRewriteIdentifier, signatureContract r
 
 func validRewriteSignature(contract rewriteSignatureContract, returnType string) FunctionSignature {
 	switch contract {
-	case rewriteSignatureFixedZero:
+	case rewriteSignatureFixedZero, rewriteSignatureFixedZeroOrVariadicMinimumTwo:
 		return rewriteSignature(0, false, returnType)
 	case rewriteSignatureFixedOne, rewriteSignatureFixedOneOrTwo, rewriteSignatureFixedOneOrVariadicMinimumTwo:
 		return rewriteSignature(1, false, returnType)
