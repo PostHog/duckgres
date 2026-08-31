@@ -152,6 +152,16 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]
+  # Trino's resource-group projection is a fixed per-namespace ConfigMap.
+  # Create cannot be restricted by resourceNames; the e2e namespace is
+  # disposable and this ServiceAccount already owns its other projections.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["trino-resource-groups"]
+    verbs: ["get", "update", "patch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create", "get", "update"]

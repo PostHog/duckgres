@@ -181,10 +181,10 @@ func TestTeardownFailsWhenCNPGCleanupCannotReachAPrimary(t *testing.T) {
 			}
 
 			calls := fakes.calls(t)
-			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 9 {
-				t.Fatalf("primary discovery calls = %d, want 9 (three retries for each CI org); calls:\n%s", got, calls)
+			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 15 {
+				t.Fatalf("primary discovery calls = %d, want 15 (three retries for each CI org); calls:\n%s", got, calls)
 			}
-			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 9 {
+			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 15 {
 				t.Fatalf("psql attempts were not bounded to three per CI org; calls:\n%s", calls)
 			}
 			if !strings.Contains(calls, "delete namespace duckgres-ci-pr-123 --ignore-not-found --wait=false") {
@@ -1239,8 +1239,10 @@ func TestE2EHarnessJobReceivesSuiteSelection(t *testing.T) {
 	}
 	script := string(raw)
 	for _, want := range []string{
-		`E2E_SUITE="${E2E_SUITE:-full}"`,
+		`E2E_SUITE="${E2E_SUITE:-neutral}"`,
 		`{ name: E2E_SUITE, value: "$E2E_SUITE" }`,
+		`case "$E2E_SUITE" in`,
+		`neutral|duckdb|trino|reshard)`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("run.sh missing e2e suite contract %q", want)
@@ -1248,7 +1250,7 @@ func TestE2EHarnessJobReceivesSuiteSelection(t *testing.T) {
 	}
 }
 
-func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
+func TestE2EWorkflowRunsNeutralDuckDBAndTrinoSuitesInParallelNamespaces(t *testing.T) {
 	raw, err := os.ReadFile("../../.github/workflows/e2e-mw-dev.yml")
 	if err != nil {
 		t.Fatalf("read e2e workflow: %v", err)
@@ -1256,10 +1258,14 @@ func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
 	workflow := string(raw)
 	for _, want := range []string{
 		"matrix:",
-		"suite: full",
+		"suite: neutral",
+		"suite: duckdb",
+		"suite: trino",
 		"suite: reshard",
 		`lane_prefix: "1"`,
 		`lane_prefix: "2"`,
+		`lane_prefix: "3"`,
+		`lane_prefix: "4"`,
 		"github.event.pull_request.number || github.run_id",
 		"github.event_name == 'workflow_dispatch' && github.run_id",
 		"NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix",
@@ -1270,10 +1276,14 @@ func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
 		}
 	}
 	for _, duplicated := range []string{
-		"suite: full",
+		"suite: neutral",
+		"suite: duckdb",
+		"suite: trino",
 		"suite: reshard",
 		`lane_prefix: "1"`,
 		`lane_prefix: "2"`,
+		`lane_prefix: "3"`,
+		`lane_prefix: "4"`,
 	} {
 		if got := strings.Count(workflow, duplicated); got != 2 {
 			t.Fatalf("e2e and teardown matrices must share %q exactly twice; got %d", duplicated, got)
@@ -1290,19 +1300,118 @@ func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
 	}
 }
 
-func TestFocusedReshardSuiteDoesNotProvisionUnusedResilienceOrg(t *testing.T) {
+func TestE2ESuitesKeepNeutralAndEngineSpecificCoverageDisjoint(t *testing.T) {
 	raw, err := os.ReadFile("e2e/harness.sh")
 	if err != nil {
 		t.Fatalf("read e2e harness: %v", err)
 	}
 	script := string(raw)
 	for _, want := range []string{
-		`if [ "${E2E_SUITE:-full}" = "full" ]; then`,
-		`provision "$RES1" "$(res_body "$RES1")"`,
-		`join_lanes ready_cnpg ready_res2`,
+		`lane_neutral()`,
+		`lane_duckdb()`,
+		`case "${E2E_SUITE:-neutral}" in`,
+		`neutral) lane_neutral ;;`,
+		`duckdb) lane_duckdb ;;`,
+		`reshard) lane_reshard ;;`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("e2e harness missing focused-suite contract %q", want)
+		}
+	}
+	neutralStart := strings.Index(script, "lane_neutral() {")
+	duckdbStart := strings.Index(script, "lane_duckdb() {")
+	engineStart := strings.Index(script, "engine_main() {")
+	mainStart := strings.Index(script, "\nmain() {")
+	if mainStart >= 0 {
+		mainStart++
+	}
+	if neutralStart < 0 || duckdbStart <= neutralStart || engineStart <= duckdbStart || mainStart <= engineStart {
+		t.Fatal("could not isolate neutral and engine lane bodies")
+	}
+	neutralBody := script[neutralStart:duckdbStart]
+	engineBody := script[engineStart:mainStart]
+	for _, call := range []string{
+		"admin_dashboard_no_query_token",
+		"internal_secret_fallback_auth",
+		"models_explorer_api",
+		"provision_team_contract",
+		"org_teams_crud",
+		"discovery_endpoints",
+		"admin_ducklings_metadata",
+		"duckling_shard_backfill",
+		"lifecycle_teardown_cnpg",
+	} {
+		if !strings.Contains(neutralBody, call) {
+			t.Errorf("neutral lane does not own %s", call)
+		}
+		if strings.Contains(engineBody, call) {
+			t.Errorf("engine lane duplicates neutral assertion %s", call)
+		}
+	}
+	if !strings.Contains(engineBody, "metadata_proxy_e2e") || strings.Contains(neutralBody, "metadata_proxy_e2e") {
+		t.Error("native metadata proxy coverage must belong only to the DuckDB/PGWire engine lane")
+	}
+}
+
+func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T) {
+	manifestRaw, err := os.ReadFile("manifests.trino.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+	patchRaw, err := os.ReadFile("trino-controlplane-patch.tmpl.json")
+	if err != nil {
+		t.Fatalf("read Trino control-plane patch: %v", err)
+	}
+	manifest := string(manifestRaw) + string(patchRaw)
+	for _, want := range []string{
+		`name: duckgres-trino`,
+		`name: duckgres-trino-opa`,
+		`"value": "https://duckgres-trino.${NAMESPACE}.svc:8443"`,
+		`"name": "DUCKGRES_TRINO_NAMESPACE"`,
+		`"value": "${NAMESPACE}"`,
+		`"name": "DUCKGRES_TRINO_CELL_ID"`,
+		`"value": "ci-pr-${PR_NUMBER}"`,
+	} {
+		if !strings.Contains(manifest, want) {
+			t.Fatalf("isolated Trino manifest missing %q", want)
+		}
+	}
+	for _, unsafe := range []string{
+		`trino.trino.svc`,
+		`value: "trino" # shared`,
+	} {
+		if strings.Contains(manifest, unsafe) {
+			t.Fatalf("per-PR control plane must not reference shared Trino state %q", unsafe)
+		}
+	}
+
+	runRaw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	for _, want := range []string{
+		`TRINO_IMAGE="${TRINO_IMAGE:-`,
+		`envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE`,
+		`if [ "$E2E_SUITE" = "trino" ]; then`,
+		`e2e/trino.sh`,
+	} {
+		if !strings.Contains(string(runRaw), want) {
+			t.Fatalf("run.sh missing isolated Trino contract %q", want)
+		}
+	}
+
+	harnessRaw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	harness := string(harnessRaw)
+	for _, want := range []string{
+		`"$API/api/v1/trino/queries/$query_id"`,
+		`'.query_id == $q and .org == $org'`,
+		`catalog_absent=false`,
+	} {
+		if !strings.Contains(harness, want) {
+			t.Errorf("Trino harness missing live admin/detail cleanup contract %q", want)
 		}
 	}
 }

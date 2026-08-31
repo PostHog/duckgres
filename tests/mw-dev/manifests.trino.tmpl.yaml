@@ -1,0 +1,274 @@
+---
+# Trino resources are rendered only for E2E_SUITE=trino. They deliberately
+# share the lane's throwaway namespace/config store, never the mw-dev Trino
+# namespace or catalog store.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: trino
+  namespace: ${NAMESPACE}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-trino-tls
+  namespace: ${NAMESPACE}
+type: Opaque
+data:
+  ca.crt: ${TRINO_CA_CERT_B64}
+  keystore.p12: ${TRINO_SERVER_P12_B64}
+stringData:
+  password: "${TRINO_TLS_PASSWORD}"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-trino-catalog-store
+  namespace: ${NAMESPACE}
+stringData:
+  password: duckgres
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckgres-trino-coordinator
+  namespace: ${NAMESPACE}
+data:
+  node.properties: |
+    node.environment=ci-pr-${PR_NUMBER}
+    node.data-dir=/data/trino
+  jvm.config: |
+    -server
+    -Xmx2G
+    -XX:+UseG1GC
+    -XX:+ExitOnOutOfMemoryError
+    -Dfile.encoding=UTF-8
+  config.properties: |
+    coordinator=true
+    node-scheduler.include-coordinator=false
+    http-server.http.port=8080
+    http-server.https.enabled=true
+    http-server.https.port=8443
+    http-server.https.keystore.path=/etc/trino/tls/keystore.p12
+    http-server.https.keystore.key=${ENV:TRINO_TLS_KEYSTORE_PASSWORD}
+    discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
+    query.max-memory=2GB
+    query.max-memory-per-node=1GB
+    catalog.management=dynamic
+    catalog.store=posthog
+    http-server.authentication.type=password
+    password-authenticator.config-files=etc/password-authenticator.properties
+    internal-communication.shared-secret=${ENV:TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET}
+    access-control.config-files=etc/access-control.properties
+  password-authenticator.properties: |
+    password-authenticator.name=file
+    file.password-file=/etc/trino/auth/password.db
+    file.refresh-period=5s
+  group-provider.properties: |
+    group-provider.name=file
+    file.group-file=/etc/trino/auth/group.db
+    file.refresh-period=5s
+  access-control.properties: |
+    access-control.name=opa
+    opa.policy.uri=http://localhost:8181/v1/data/trino/allow
+    opa.policy.batched-uri=http://localhost:8181/v1/data/trino/batch
+  resource-groups.properties: |
+    resource-groups.configuration-manager=file
+    resource-groups.config-file=/etc/trino/resource-groups/resource-groups.json
+  catalog-store.properties: |
+    catalog-store.cell-id=ci-pr-${PR_NUMBER}
+    catalog-store.connection-url=jdbc:postgresql://duckgres-config-store.${NAMESPACE}.svc:5432/duckgres?sslmode=disable
+    catalog-store.connection-user=duckgres
+    catalog-store.connection-password-file=/etc/trino/catalog-store/password
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckgres-trino-worker
+  namespace: ${NAMESPACE}
+data:
+  node.properties: |
+    node.environment=ci-pr-${PR_NUMBER}
+    node.data-dir=/data/trino
+  jvm.config: |
+    -server
+    -Xmx3G
+    -XX:+UseG1GC
+    -XX:+ExitOnOutOfMemoryError
+    -Dfile.encoding=UTF-8
+  config.properties: |
+    coordinator=false
+    http-server.http.port=8080
+    discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
+    query.max-memory=2GB
+    query.max-memory-per-node=1GB
+    shutdown.grace-period=10s
+    catalog.management=dynamic
+    internal-communication.shared-secret=${ENV:TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: duckgres-trino-opa
+  namespace: ${NAMESPACE}
+data:
+  config.yaml: |
+    services:
+      provisioner:
+        url: "http://duckgres-control-plane.${NAMESPACE}.svc:8080"
+        credentials:
+          bearer:
+            token_path: /etc/opa/secrets/token
+    bundles:
+      trino:
+        service: provisioner
+        resource: /bundles/trino
+        persist: true
+        polling:
+          min_delay_seconds: 2
+          max_delay_seconds: 5
+    persistence_directory: /var/lib/opa
+    status:
+      console: false
+  bootstrap.rego: |
+    package trino
+    import rego.v1
+    default allow := false
+    default batch := []
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-trino
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: duckgres-trino
+    component: coordinator
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+    - { name: https, port: 8443, targetPort: https }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-trino-coordinator
+  namespace: ${NAMESPACE}
+spec:
+  # run.sh creates the Trino Pod Identity association and waits for the CP's
+  # projections before admitting this pod.
+  replicas: 0
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: duckgres-trino, component: coordinator }
+  template:
+    metadata:
+      labels: { app: duckgres-trino, component: coordinator }
+      annotations: { karpenter.sh/do-not-disrupt: "true" }
+    spec:
+      serviceAccountName: trino
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: trino-coordinator
+          image: ${TRINO_IMAGE}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET
+              valueFrom: { secretKeyRef: { name: trino-internal-communication, key: shared-secret } }
+            - name: TRINO_TLS_KEYSTORE_PASSWORD
+              valueFrom: { secretKeyRef: { name: duckgres-trino-tls, key: password } }
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: https, containerPort: 8443 }
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "case $(curl -sf http://localhost:8080/v1/info) in *'\"starting\":false'*) exit 0;; *) exit 1;; esac"]
+            initialDelaySeconds: 20
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "1", memory: 3Gi }
+            limits: { cpu: "2", memory: 3Gi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
+            - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }
+            - { name: config, mountPath: /etc/trino/config.properties, subPath: config.properties }
+            - { name: config, mountPath: /etc/trino/password-authenticator.properties, subPath: password-authenticator.properties }
+            - { name: config, mountPath: /etc/trino/group-provider.properties, subPath: group-provider.properties }
+            - { name: config, mountPath: /etc/trino/access-control.properties, subPath: access-control.properties }
+            - { name: config, mountPath: /etc/trino/resource-groups.properties, subPath: resource-groups.properties }
+            - { name: config, mountPath: /etc/trino/catalog-store.properties, subPath: catalog-store.properties }
+            - { name: trino-auth, mountPath: /etc/trino/auth, readOnly: true }
+            - { name: tenant-secrets, mountPath: /etc/trino/tenant-secrets, readOnly: true }
+            - { name: resource-groups, mountPath: /etc/trino/resource-groups, readOnly: true }
+            - { name: catalog-store, mountPath: /etc/trino/catalog-store, readOnly: true }
+            - { name: tls, mountPath: /etc/trino/tls, readOnly: true }
+            - { name: data, mountPath: /data/trino }
+        - name: duckgres-trino-opa
+          image: openpolicyagent/opa:0.70.0-static
+          args: ["run", "--server", "--addr=0.0.0.0:8181", "--config-file=/etc/opa/config.yaml", "/etc/opa/bootstrap"]
+          ports: [{ name: opa, containerPort: 8181 }]
+          readinessProbe: { httpGet: { path: "/health?bundles=false", port: opa }, initialDelaySeconds: 5, periodSeconds: 5 }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          volumeMounts:
+            - { name: opa-config, mountPath: /etc/opa/config.yaml, subPath: config.yaml }
+            - { name: opa-config, mountPath: /etc/opa/bootstrap/bootstrap.rego, subPath: bootstrap.rego }
+            - { name: opa-token, mountPath: /etc/opa/secrets, readOnly: true }
+            - { name: opa-cache, mountPath: /var/lib/opa }
+      volumes:
+        - { name: config, configMap: { name: duckgres-trino-coordinator } }
+        - { name: trino-auth, secret: { secretName: trino-auth, optional: true } }
+        - { name: tenant-secrets, secret: { secretName: trino-tenant-secrets, optional: true } }
+        - { name: resource-groups, configMap: { name: trino-resource-groups, optional: true } }
+        - { name: catalog-store, secret: { secretName: duckgres-trino-catalog-store } }
+        - { name: tls, secret: { secretName: duckgres-trino-tls } }
+        - { name: opa-config, configMap: { name: duckgres-trino-opa } }
+        - { name: opa-token, secret: { secretName: trino-opa-bundle-token, optional: true } }
+        - { name: opa-cache, emptyDir: {} }
+        - { name: data, emptyDir: {} }
+      nodeSelector: { kubernetes.io/arch: arm64 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-trino-worker
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 0
+  selector:
+    matchLabels: { app: duckgres-trino, component: worker }
+  template:
+    metadata:
+      labels: { app: duckgres-trino, component: worker }
+    spec:
+      serviceAccountName: trino
+      terminationGracePeriodSeconds: 60
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      containers:
+        - name: trino-worker
+          image: ${TRINO_IMAGE}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET
+              valueFrom: { secretKeyRef: { name: trino-internal-communication, key: shared-secret } }
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "case $(curl -sf http://localhost:8080/v1/info) in *'\"starting\":false'*) exit 0;; *) exit 1;; esac"]
+            initialDelaySeconds: 20
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "1", memory: 4Gi }
+            limits: { cpu: "2", memory: 4Gi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
+            - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }
+            - { name: config, mountPath: /etc/trino/config.properties, subPath: config.properties }
+            - { name: tenant-secrets, mountPath: /etc/trino/tenant-secrets, readOnly: true }
+            - { name: data, mountPath: /data/trino }
+      volumes:
+        - { name: config, configMap: { name: duckgres-trino-worker } }
+        - { name: tenant-secrets, secret: { secretName: trino-tenant-secrets, optional: true } }
+        - { name: data, emptyDir: {} }
+      nodeSelector: { kubernetes.io/arch: arm64 }

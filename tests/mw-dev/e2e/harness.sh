@@ -4426,12 +4426,45 @@ lane_res2() { # scheduling-shape resilience on its own org (heavy, cold spawns)
   exploratory_oom_escalation "$RES2" "$res2_pw" ducklake
 }
 
-main() {
+lane_neutral() {
   resolve_cp_ip
-
-  # No org dependency — assert the admin surface auth contract up front.
   admin_dashboard_no_query_token
   internal_secret_fallback_auth
+  mkdir -p "$LANE_DIR"
+
+  provision "$CNPG" "$CNPG_BODY" > "$LANE_DIR/prov_cnpg.json" & p1=$!
+  provision "$RES2" "$(res_body "$RES2")" > "$LANE_DIR/prov_res2.json" & p2=$!
+  wait "$p1" || fail "provision $CNPG failed"
+  wait "$p2" || fail "provision $RES2 failed"
+  bootstrap_kubectl
+  run_lane ready_cnpg wait_state "$CNPG" ready "$READY_TIMEOUT"
+  run_lane ready_res2 wait_state "$RES2" ready "$READY_TIMEOUT"
+  join_lanes ready_cnpg ready_res2
+  sleep "${CONFIG_POLL_SETTLE:-12}"
+
+  models_explorer_api
+  admin_console_api
+  admin_operators
+  admin_rbac_viewer "$CNPG"
+  provision_team_contract "$CNPG" "$CNPG_TEAM_ID"
+  org_teams_crud "$CNPG" "$CNPG_TEAM_ID"
+  discovery_endpoints "$CNPG" "$CNPG_TEAM_ID"
+  admin_ducklings_metadata "$CNPG"
+  duckling_shard_backfill "$CNPG"
+  lifecycle_teardown_cnpg "$CNPG"
+  log "PASS: neutral provisioning + admin + discovery + Duckling lifecycle"
+}
+
+lane_duckdb() {
+  engine_main
+}
+
+lane_reshard() {
+  engine_main
+}
+
+engine_main() {
+  resolve_cp_ip
 
   mkdir -p "$LANE_DIR"
 
@@ -4440,19 +4473,19 @@ main() {
   # after a handful of failed auths, and a fresh password isn't live until the
   # next config-store poll. Provision returns the live password directly.
   # Independent Ducklings provision concurrently. The focused reshard lane
-  # needs CNPG plus RES2 only; RES1 exists solely for the full suite's worker
+  # needs CNPG plus RES2 only; RES1 exists solely for the DuckDB lane's worker
   # disruption assertions.
   provision "$CNPG" "$CNPG_BODY"        > "$LANE_DIR/prov_cnpg.json" &
   prov1=$!
   provision "$RES2" "$(res_body "$RES2")" > "$LANE_DIR/prov_res2.json" &
   prov3=$!
-  if [ "${E2E_SUITE:-full}" = "full" ]; then
+  if [ "${E2E_SUITE:-duckdb}" = "duckdb" ]; then
     provision "$RES1" "$(res_body "$RES1")" > "$LANE_DIR/prov_res1.json" &
     prov2=$!
   fi
   wait "$prov1" || fail "provision $CNPG failed"
   wait "$prov3" || fail "provision $RES2 failed"
-  if [ "${E2E_SUITE:-full}" = "full" ]; then
+  if [ "${E2E_SUITE:-duckdb}" = "duckdb" ]; then
     wait "$prov2" || fail "provision $RES1 failed"
   fi
   cnpg_pw="$(jq -r .password "$LANE_DIR/prov_cnpg.json")"
@@ -4460,7 +4493,7 @@ main() {
   for v in "$cnpg_pw" "$res2_pw"; do
     case "$v" in ""|null) fail "a provision call returned no password" ;; esac
   done
-  if [ "${E2E_SUITE:-full}" = "full" ]; then
+  if [ "${E2E_SUITE:-duckdb}" = "duckdb" ]; then
     res1_pw="$(jq -r .password "$LANE_DIR/prov_res1.json")"
     case "$res1_pw" in ""|null) fail "provision $RES1 returned no password" ;; esac
   fi
@@ -4468,7 +4501,7 @@ main() {
 
   run_lane ready_cnpg wait_state "$CNPG" ready "$READY_TIMEOUT"
   run_lane ready_res2 wait_state "$RES2" ready "$READY_TIMEOUT"
-  if [ "${E2E_SUITE:-full}" = "full" ]; then
+  if [ "${E2E_SUITE:-duckdb}" = "duckdb" ]; then
     run_lane ready_res1 wait_state "$RES1" ready "$READY_TIMEOUT"
     join_lanes ready_cnpg ready_res1 ready_res2
   else
@@ -4484,9 +4517,9 @@ main() {
   sleep "${CONFIG_POLL_SETTLE:-12}"
 
   # The dedicated reshard workflow lane has a disjoint PR identity and starts
-  # these assertions immediately after provisioning. The long general suite
+  # these assertions immediately after provisioning. The long DuckDB suite
   # executes concurrently in its own namespace and deliberately skips them.
-  if [ "${E2E_SUITE:-full}" = "reshard" ]; then
+  if [ "${E2E_SUITE:-duckdb}" = "reshard" ]; then
     reshard_targets
     reshard_validation "$CNPG"
     reshard_cancel_during_drain "$RES2" "$res2_pw"
@@ -4499,33 +4532,13 @@ main() {
   # deterministically exists before we query it through native Postgres. The
   # subsequent metadata-proxy connection itself bypasses the worker entirely.
   wait_worker "$CNPG" "$cnpg_pw" ducklake
-  # Assert the proxy before the three worker-churn lanes. RES2 is the
-  # same-backend disabled sibling.
   metadata_proxy_e2e "$CNPG" "$cnpg_pw" "$RES2" "$res2_pw"
-
-  # Admin models explorer: orgs + their users now exist in the config store, so
-  # the sidebar counts are non-trivial and the org-users redaction check bites
-  # against a real bcrypt-hash-bearing row.
-  models_explorer_api
-
-  # Admin console read surfaces: identity/role, live state, metrics proxy, auth
-  # gate. Independent of the per-org lanes, so run it here once orgs exist.
-  admin_console_api
-  admin_operators
-  admin_rbac_viewer "$CNPG"
-
   # ---- the three parallel assertion lanes (see lane_* above) ----
   # (kubectl was bootstrapped before the readiness lanes above.)
   run_lane cnpg lane_cnpg
   run_lane res1 lane_res1
   run_lane res2 lane_res2
   join_lanes cnpg res1 res2
-
-  # Provisioning/admin contracts are backend-independent; retain their live
-  # coverage on the primary CNPG org.
-  provision_team_contract "$CNPG" "$CNPG_TEAM_ID"
-  org_teams_crud "$CNPG" "$CNPG_TEAM_ID"
-  discovery_endpoints "$CNPG" "$CNPG_TEAM_ID"
 
   # ---- admin impersonation round-trip + audit (cnpg stack is warm now) ----
   admin_impersonation_audited "$CNPG"
@@ -4538,12 +4551,6 @@ main() {
 
   # ---- generated project user: team-wide read/write, same project boundary --
   project_user_isolation "$CNPG" "$cnpg_pw" "$CNPG_TEAM_ID"
-
-  # ---- admin ducklings metadata: live cnpg shard assignment ----------------
-  admin_ducklings_metadata "$CNPG"
-
-  # ---- provisioner backfills pinned shard into duckling spec (cnpg) --------
-  duckling_shard_backfill "$CNPG"
 
   # ---- admin live-query detail view (phase 1) — cnpg stack is warm now ----
   admin_query_detail "$CNPG" "$cnpg_pw"
@@ -4583,16 +4590,21 @@ main() {
   # ---- cross-tenant isolation between independent CNPG-backed orgs ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$RES1" "$res1_pw"
 
-  # ---- lifecycle: deprovision cnpg + assert the Duckling CR fully deletes ----
-  # (res1/res2 are deprovisioned by run.sh teardown; the cascade assertion
-  # only needs one cnpg-shard org.)
-  lifecycle_teardown_cnpg "$CNPG"
-
   # NOTE: the version-mismatch worker reaper is not exercised in-Job (it needs a
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
   log "SKIP version-reaper (needs an in-run image bump; see README)"
 
-  log "PASS: admin-no-query-token + models-explorer-api(redaction) + admin-console-api(me/live/metrics/auth-gate) + admin-rbac-viewer(403 mutate/audit) + admin-impersonation(round-trip+audit) + project-reader(team-wide-read/cross-project-deny/read-only/legacy-override-grant) + project-user(in-project-dml+ddl/cross-project-deny/unqualified-target-deny/namespace-ddl-deny/reader-stays-read-only) + native-metadata-proxy(explicit-opt-in/exact-db/real-cnpg-query/per-org-disable) + wire + binary-copy(native+fallback+route-guard+rollback) + malformed-startup-resilience + jsonb-concat + cold-burst-absorption + pipeline-error-recovery + cancel-reuse + activation(DuckLake) + ducklake-explain + ext-forks + worker-pod + concurrency + durability + crash-recovery + busy-only-do-not-disrupt + graceful-drain + one-session-per-worker + parallel-cold-burst-ramp + worker-sizing(cnpg DuckLake, doubles as exploratory-tier GUC-bypass) + org-default-profile(cnpg) + exploratory-tier(small-first plain read) + exploratory-lazy-activation(connect+quit spends no pod) + exploratory-state-pin(escalation target + state survives) + exploratory-oom-escalation(transparent re-execute, reason=oom logged) + query-log-worker-tier + persistent-user-secrets(cnpg, cross-user isolation) + user-kill-switch(cnpg) + user-disable-block(cnpg) + connection-duration-logged + compute-usage-pull-api(cnpg, compute+storage) + query-log-round-trip(cnpg, view+query_id+QueryStart/terminal pair) + query-log-access-metadata(read/write split + incomplete-not-empty + CALL opaque-but-complete) + duckling-shard-backfill(cnpg) + isolation + lifecycle-teardown(+org-delete/name-release), on cnpg (3 parallel lanes)"
+  log "PASS: DuckDB/PGWire engine-specific behavior (3 parallel tenant lanes)"
+}
+
+main() {
+  case "${E2E_SUITE:-neutral}" in
+    neutral) lane_neutral ;;
+    duckdb) lane_duckdb ;;
+    reshard) lane_reshard ;;
+    trino) fail "Trino must use e2e/trino.sh" ;;
+    *) fail "unknown E2E_SUITE: ${E2E_SUITE:-}" ;;
+  esac
 }
 
 main "$@"
