@@ -30,8 +30,8 @@ ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # DuckDB 1.5.5 nightly artifact built from duckdb-postgres ab217c6; CI overrides
 # all three values together for rollback rows.
 ARG POSTGRES_SCANNER_REPOSITORY=https://nightly-extensions.duckdb.org
-ARG POSTGRES_SCANNER_SHA256_AMD64=7ff4913fab203f7895eaa6a9a87a14a7ad659d400deff667f8bf16e58a28937f
-ARG POSTGRES_SCANNER_SHA256_ARM64=9ea7d5a3610f2b460bd2a5075684c5f6dad55fa19745a377b5471f4994a8b460
+ARG POSTGRES_SCANNER_SHA256_AMD64=574bd831461f4fcbd2c5cb516572455ed200b3a1f33055523f613f5c8a97f265
+ARG POSTGRES_SCANNER_SHA256_ARM64=2558961c60f71a1678b8a19a07dfe89fd653cffa2d3b10e5030ee92d50199696
 # `: ${VAR:?msg}` asserts every required input is non-empty — catches a
 # CI matrix row that forgets to pass a build-arg and would otherwise
 # silently fall back to the ARG default, producing a cross-version
@@ -54,7 +54,7 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
     && mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
     && curl -fsSL "https://github.com/PostHog/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension" \
-    && curl -fsSL "https://github.com/PostHog/ducklake/releases/download/${DUCKLAKE_EXTENSION_TAG}/ducklake-linux-${TARGETARCH}.duckdb_extension" \
+    && curl -fsSL "https://github.com/PostHog/hoglake/releases/download/${DUCKLAKE_EXTENSION_TAG}/ducklake-linux-${TARGETARCH}.duckdb_extension" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/ducklake.duckdb_extension" \
     && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension.gz" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \

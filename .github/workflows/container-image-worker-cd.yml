@@ -105,8 +105,8 @@ jobs:
                       # defaults, so updating only the Dockerfiles does
                       # nothing for CI — change all five together.
                       pg_scanner_repo: "https://nightly-extensions.duckdb.org"
-                      pg_scanner_sha256_amd64: "7ff4913fab203f7895eaa6a9a87a14a7ad659d400deff667f8bf16e58a28937f"
-                      pg_scanner_sha256_arm64: "9ea7d5a3610f2b460bd2a5075684c5f6dad55fa19745a377b5471f4994a8b460"
+                      pg_scanner_sha256_amd64: "574bd831461f4fcbd2c5cb516572455ed200b3a1f33055523f613f5c8a97f265"
+                      pg_scanner_sha256_arm64: "2558961c60f71a1678b8a19a07dfe89fd653cffa2d3b10e5030ee92d50199696"
                       # Fleet default: also publishes the unsuffixed tags and
                       # dispatches Charts.
                       default: true
