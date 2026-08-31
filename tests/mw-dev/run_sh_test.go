@@ -1270,6 +1270,7 @@ func TestE2EWorkflowRunsNeutralDuckDBAndTrinoSuitesInParallelNamespaces(t *testi
 		"github.event_name == 'workflow_dispatch' && github.run_id",
 		"NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix",
 		"E2E_SUITE: ${{ matrix.suite }}",
+		"- name: Test e2e harness scripts\n        env:\n          E2E_SUITE: neutral\n        run: go test -count=1 ./tests/mw-dev",
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("e2e workflow missing parallel suite contract %q", want)

@@ -150,7 +150,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The matrix value configures deployment, but these structural tests
+      # exercise every suite and must not inherit one lane's selection.
       - name: Test e2e harness scripts
+        env:
+          E2E_SUITE: neutral
         run: go test -count=1 ./tests/mw-dev
 
       - name: Configure AWS credentials (OIDC)
