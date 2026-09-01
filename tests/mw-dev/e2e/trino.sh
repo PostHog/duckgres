@@ -10,7 +10,7 @@ SECRET="${INTERNAL_SECRET:?}"
 PR="${PR_NUMBER:?}"
 NS="${NAMESPACE:?}"
 H="X-Duckgres-Internal-Secret: $SECRET"
-TRINO="https://duckgres-trino.$NS.svc:8443"
+TRINO=""
 CA=/trino-ca/ca.crt
 ORG_A="ci-pr-${PR}-trinoa"
 ORG_B="ci-pr-${PR}-trinob"
@@ -94,9 +94,10 @@ wait_trino() { # org expected-principal expected-catalog
     body="$(api "$API/api/v1/orgs/$1/trino" 2>/dev/null || true)"
     state="$(printf %s "$body" | jq -r '.status.state // empty' 2>/dev/null || true)"
     if [ "$state" = ready ]; then
-      printf %s "$body" | jq -e --arg p "$2" --arg c "$3" --arg cell "ci-pr-$PR" \
-        '.enabled == true and .status.principal == $p and .status.catalog == $c and .status.cell == $cell and .status.tier == "free"' >/dev/null \
+      printf %s "$body" | jq -e --arg p "$2" --arg c "$3" --arg cell "ci-pr-$PR" --arg host "duckgres-trino.$NS.svc" \
+        '.enabled == true and .available == true and .status.principal == $p and .status.catalog == $c and .status.cell == $cell and .status.tier == "free" and .status.connection.host == $host and .status.connection.port == 8443 and .status.connection.username == $p and (.status.connection | has("password") | not)' >/dev/null \
         || fail "$1 Trino status identity mismatch: $body"
+      TRINO="https://$(printf %s "$body" | jq -r '.status.connection.host'):$(printf %s "$body" | jq -r '.status.connection.port')"
       return 0
     fi
     [ "$state" = failed ] && fail "$1 Trino provisioning failed: $body"

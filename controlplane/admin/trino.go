@@ -6,7 +6,9 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +48,14 @@ type TrinoOrgStore interface {
 type TrinoCell struct {
 	ID             string `json:"id"`
 	CoordinatorURL string `json:"coordinator_url"`
+	TLSServerName  string `json:"-"`
+	ClientURL      string `json:"-"`
+}
+
+type TrinoConnection struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Username string `json:"username"`
 }
 
 // TrinoOrgStatus is one org's Trino provisioning state, joined with what
@@ -65,15 +75,46 @@ type TrinoOrgStatus struct {
 	Cell             string `json:"cell"`
 	// State is the most recent reconcile tick's outcome: pending /
 	// provisioning / ready / failed.
-	State         string     `json:"state"`
-	StatusMessage string     `json:"status_message,omitempty"`
-	ReadyAt       *time.Time `json:"ready_at,omitempty"`
-	FailedAt      *time.Time `json:"failed_at,omitempty"`
+	State         string           `json:"state"`
+	StatusMessage string           `json:"status_message,omitempty"`
+	ReadyAt       *time.Time       `json:"ready_at,omitempty"`
+	FailedAt      *time.Time       `json:"failed_at,omitempty"`
+	Connection    *TrinoConnection `json:"connection,omitempty"`
 	// RunningQueries / QueuedQueries are this org's share of the cell right
 	// now. Zero when the coordinator is unreachable — the envelope's
 	// `available` flag is what distinguishes that from a genuinely idle org.
 	RunningQueries int `json:"running_queries"`
 	QueuedQueries  int `json:"queued_queries"`
+}
+
+func (c TrinoCell) connectionFor(username string) *TrinoConnection {
+	if username == "" {
+		return nil
+	}
+
+	clientURL := c.ClientURL
+	if clientURL == "" {
+		clientURL = c.CoordinatorURL
+	}
+	parsedClientURL, err := url.Parse(clientURL)
+	if err != nil || parsedClientURL.Scheme != "https" || parsedClientURL.Hostname() == "" {
+		return nil
+	}
+
+	port := 443
+	if rawPort := parsedClientURL.Port(); rawPort != "" {
+		port, err = strconv.Atoi(rawPort)
+		if err != nil || port < 1 || port > 65535 {
+			return nil
+		}
+	}
+
+	host := parsedClientURL.Hostname()
+	if c.ClientURL == "" && c.TLSServerName != "" {
+		host = c.TLSServerName
+	}
+
+	return &TrinoConnection{Host: host, Port: port, Username: username}
 }
 
 // TrinoStatus is the cluster overview: which cell, whether it answers, what
@@ -611,6 +652,9 @@ func (a *TrinoAPI) handleOrgDetail(c *gin.Context) {
 	status.FailedAt = row.FailedAt
 	status.Tier = row.Tier
 	status.Cell = row.TrinoCellID
+	if available && status.State == string(configstore.ManagedWarehouseStateReady) && status.Cell == a.cell.ID {
+		status.Connection = a.cell.connectionFor(status.Principal)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"cell":      a.cell,

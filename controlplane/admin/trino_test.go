@@ -541,9 +541,58 @@ func TestOrgDetailSurfacesTheReconcileOutcome(t *testing.T) {
 	if st["failed_at"] == nil {
 		t.Error("failed_at must be surfaced")
 	}
+	if _, ok := st["connection"]; ok {
+		t.Error("a failed Trino target must not expose connection details")
+	}
 	// Live counts are scoped to this org only.
 	if st["running_queries"] != float64(1) || st["queued_queries"] != float64(1) {
 		t.Errorf("live counts = %v/%v, want 1 running and 1 queued for org-b", st["running_queries"], st["queued_queries"])
+	}
+}
+
+func TestReadyOrgDetailReturnsTenantClientConnection(t *testing.T) {
+	store := twoOrgTrinoStore()
+	store.rows = map[string]*configstore.ManagedWarehouseTrino{
+		"org-a": {
+			OrgID:       "org-a",
+			Enabled:     true,
+			TrinoCellID: "cell-test",
+			State:       configstore.ManagedWarehouseStateReady,
+		},
+	}
+	api := NewTrinoAPI(
+		TrinoCell{
+			ID:             "cell-test",
+			CoordinatorURL: "https://coordinator.invalid:8443",
+			TLSServerName:  "coordinator.example.com",
+			ClientURL:      "https://trino.example.com:443",
+		},
+		&fakeTrinoCoordinator{},
+		store,
+		nil,
+	)
+	if api == nil {
+		t.Fatal("NewTrinoAPI returned nil for a fully-wired cell")
+	}
+	r := trinoTestRouter(api, RoleViewer)
+
+	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/orgs/org-a/trino", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	status := body["status"].(map[string]any)
+	connection := status["connection"].(map[string]any)
+	if connection["host"] != "trino.example.com" {
+		t.Errorf("connection host = %v, want trino.example.com", connection["host"])
+	}
+	if connection["port"] != float64(443) {
+		t.Errorf("connection port = %v, want 443", connection["port"])
+	}
+	if connection["username"] != "db_a" {
+		t.Errorf("connection username = %v, want db_a", connection["username"])
+	}
+	if _, ok := connection["password"]; ok {
+		t.Error("the control plane must not return the tenant password")
 	}
 }
 

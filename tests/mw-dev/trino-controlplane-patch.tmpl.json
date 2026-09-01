@@ -15,6 +15,10 @@
                 "value": "duckgres-trino.${NAMESPACE}.svc"
               },
               {
+                "name": "DUCKGRES_TRINO_CLIENT_URL",
+                "value": "https://duckgres-trino.${NAMESPACE}.svc:8443"
+              },
+              {
                 "name": "DUCKGRES_TRINO_NAMESPACE",
                 "value": "${NAMESPACE}"
               },
