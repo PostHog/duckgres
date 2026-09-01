@@ -3,6 +3,8 @@
 package configstore_test
 
 import (
+	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -339,5 +341,134 @@ func TestEnableTrinoOnUnknownOrgViolatesForeignKeyPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	if err := store.EnableTrino("nosuchorg", configstore.TrinoSettings{}); err == nil {
 		t.Fatal("expected a foreign-key violation enabling Trino for an org that does not exist")
+	}
+}
+
+// Every one of an org's own logins must reach the Trino projection, not just
+// `root` — that is the whole point of per-user Trino access. The listing also
+// has to fail closed on a disabled user, which must never reach a password
+// file.
+func TestListTrinoEnabledOrgsProjectsEveryLogin(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "acme")
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "free"}); err != nil {
+		t.Fatalf("EnableTrino: %v", err)
+	}
+	for _, u := range []struct{ name, hash string }{
+		{"analyst", "$2a$10$analyst"},
+		{"dashboards", "$2a$10$dashboards"},
+		{"leaver", "$2a$10$leaver"},
+	} {
+		if err := store.CreateOrgUser("acme", u.name, u.hash); err != nil {
+			t.Fatalf("CreateOrgUser(%s): %v", u.name, err)
+		}
+	}
+	if err := store.SetOrgUserDisabled("acme", "leaver", true); err != nil {
+		t.Fatalf("SetOrgUserDisabled: %v", err)
+	}
+	if err := store.ReloadSnapshot(); err != nil {
+		t.Fatalf("ReloadSnapshot: %v", err)
+	}
+
+	got, err := store.ListTrinoEnabledOrgs()
+	if err != nil {
+		t.Fatalf("ListTrinoEnabledOrgs: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 org, got %d", len(got))
+	}
+	byName := map[string]configstore.TrinoOrgUser{}
+	for _, u := range got[0].Users {
+		byName[u.Username] = u
+	}
+	// root appears here too, alongside the bare org principal, so the same
+	// credential works under either username.
+	for _, want := range []struct{ name, hash string }{
+		{"root", "$2a$10$hash-acme"},
+		{"analyst", "$2a$10$analyst"},
+		{"dashboards", "$2a$10$dashboards"},
+	} {
+		u, ok := byName[want.name]
+		if !ok {
+			t.Errorf("login %q missing from the projection", want.name)
+			continue
+		}
+		// The hash is copied through unchanged: it is the SAME bcrypt the
+		// pgwire handshake verifies, so one password works on both engines.
+		if u.PasswordHash != want.hash {
+			t.Errorf("login %q hash = %q, want %q", want.name, u.PasswordHash, want.hash)
+		}
+		if u.Scope != nil {
+			t.Errorf("login %q must be unscoped", want.name)
+		}
+	}
+	if _, ok := byName["leaver"]; ok {
+		t.Error("a disabled login must never reach the password file")
+	}
+	if len(byName) != 3 {
+		t.Errorf("projected logins = %v, want exactly root/analyst/dashboards", byName)
+	}
+}
+
+// A project-scoped login must arrive carrying the SAME scope the pgwire
+// session path enforces, so Trino and DuckDB cannot disagree about which
+// schemas the login may read.
+func TestListTrinoEnabledOrgsCarriesProjectScopes(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "acme")
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "free"}); err != nil {
+		t.Fatalf("EnableTrino: %v", err)
+	}
+	if _, err := configstore.UpsertOrgTeamTx(store.DB(), "acme", configstore.OrgTeamUpsert{
+		TeamID:     7,
+		SchemaName: "posthog_7",
+	}); err != nil {
+		t.Fatalf("UpsertOrgTeamTx: %v", err)
+	}
+	if err := store.CreateOrgUser("acme", "posthog_team_7", "$2a$10$team7"); err != nil {
+		t.Fatalf("CreateOrgUser: %v", err)
+	}
+	// No configstore mutator binds a login to a team (the admin API owns that
+	// surface), so bind it directly — the point under test is the listing,
+	// not the admin handler.
+	if err := store.DB().Exec(
+		`UPDATE duckgres_org_users SET access_mode = 'project_reader', team_id = 7
+		  WHERE org_id = 'acme' AND username = 'posthog_team_7'`).Error; err != nil {
+		t.Fatalf("bind project login: %v", err)
+	}
+	if err := store.ReloadSnapshot(); err != nil {
+		t.Fatalf("ReloadSnapshot: %v", err)
+	}
+
+	got, err := store.ListTrinoEnabledOrgs()
+	if err != nil {
+		t.Fatalf("ListTrinoEnabledOrgs: %v", err)
+	}
+	var scoped *configstore.TrinoOrgUser
+	for i, u := range got[0].Users {
+		if u.Username == "posthog_team_7" {
+			scoped = &got[0].Users[i]
+		}
+	}
+	if scoped == nil {
+		t.Fatal("the project login is missing from the projection")
+	}
+	if scoped.Scope == nil {
+		t.Fatal("the project login must carry a scope, or it would read the whole catalog")
+	}
+	if scoped.TeamID == nil || *scoped.TeamID != 7 {
+		t.Fatalf("TeamID = %v, want 7 — the scope group is keyed on it", scoped.TeamID)
+	}
+	// Exactly what OrgUserQueryAccess reports for the same user, which is
+	// what pgwire enforces.
+	want, ok := store.OrgUserQueryAccess("acme", "posthog_team_7")
+	if !ok {
+		t.Fatal("OrgUserQueryAccess must report the login as scoped")
+	}
+	if !reflect.DeepEqual(*scoped.Scope, want) {
+		t.Errorf("scope = %+v, want %+v (the same policy pgwire enforces)", *scoped.Scope, want)
+	}
+	if !slices.Contains(scoped.Scope.AllowedSchemas, "posthog_7") {
+		t.Errorf("AllowedSchemas = %v, must contain the team's schema", scoped.Scope.AllowedSchemas)
 	}
 }
