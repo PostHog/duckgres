@@ -143,6 +143,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # The Trino lane deletes coordinator/worker pods and uses rollout status to
+  # prove their owning Deployments restore readiness. Keep that observation
+  # read-only and restricted to the two disposable Trino workloads.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["duckgres-trino-worker", "duckgres-trino-coordinator"]
+    verbs: ["get", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
     # list/watch needed by the CP's stranded-secret reconciler (the prod chart

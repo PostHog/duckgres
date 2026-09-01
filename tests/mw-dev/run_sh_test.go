@@ -1510,6 +1510,23 @@ func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T)
 	}
 }
 
+func TestTrinoHarnessCanObserveOnlyItsRestartedDeployments(t *testing.T) {
+	raw, err := os.ReadFile("manifests.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+	manifest := string(raw)
+	for _, want := range []string{
+		`resources: ["deployments"]`,
+		`resourceNames: ["duckgres-trino-worker", "duckgres-trino-coordinator"]`,
+		`verbs: ["get", "watch"]`,
+	} {
+		if !strings.Contains(manifest, want) {
+			t.Errorf("Trino restart rollout RBAC missing %q", want)
+		}
+	}
+}
+
 func TestTrinoHarnessBootstrapsDuckLakeBeforeCatalogQueries(t *testing.T) {
 	raw, err := os.ReadFile("e2e/trino.sh")
 	if err != nil {
