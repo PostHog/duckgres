@@ -3061,15 +3061,27 @@ admin_per_org_workers() { # org password
 
 # ---- connection idle timeout: idle conn reaped, worker freed ----------------
 # An idle client connection pins a worker (one session per worker), so the
-# control plane defaults to a short connection idle timeout (server.Default
-# ControlPlaneIdleTimeout, 60s): a connection with no traffic for that long is
-# closed by the message loop's read deadline, DestroySession runs, and the
-# worker returns to hot-idle. We hold a connection idle-in-transaction PAST the
-# timeout and assert its session disappears from /queries while our client is
-# still connected (so the reap is the CP's, not our client exiting). The unit
-# tests (TestNormalizeIdleTimeout + TestMessageLoopIdleTimeoutClosesConnection)
-# are the deterministic gate for the mechanism; this proves the real default
-# fires end-to-end in-cluster.
+# control plane closes a connection with no traffic: the message loop hits its
+# read deadline, DestroySession runs, and the worker returns to hot-idle. We
+# hold a connection idle-in-transaction PAST the timeout and assert its session
+# disappears from /queries while our client is still connected (so the reap is
+# the CP's, not our client exiting). The unit tests (TestNormalizeIdleTimeout +
+# TestMessageLoopIdleTimeoutClosesConnection) are the deterministic gate for
+# the mechanism; this proves it fires end-to-end in-cluster.
+#
+# This connection asks for its OWN short idle timeout with
+# duckgres.idle_timeout, allowed by DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX in
+# manifests.tmpl.yaml. It does not ride the product default, which is 5m
+# (server.DefaultControlPlaneIdleTimeout): riding that would cost six minutes
+# of Job time per run to watch one reap. What this test is for is the reap
+# path, which is the same at any value, and TestDefaultControlPlaneIdleTimeout
+# pins the default itself.
+#
+# Do NOT "simplify" this by shortening DUCKGRES_IDLE_TIMEOUT CP-wide instead.
+# admin_idle_session_flagged holds a connection idle-in-transaction for 30s and
+# admin_cancel_by_worker for up to 90s; a short CP-wide default reaps those
+# mid-assertion. Scoping the short timeout to this one connection is what keeps
+# them independent. It also gives the client-override path its only e2e cover.
 #
 # TIER AUDIT — the assertion's MEANING shifted, its mechanics did not. With
 # lazy acquisition an idle connection may hold NO session at all (nothing to
@@ -3088,9 +3100,9 @@ conn_idle_timeout_reaps_session() { # org password
       | jq -r --arg o "$org" '[.queries[]? | select(.org==$o and .user=="root") | .worker_id] | sort | join(" ")'
   }
   before="$(rootwids)"
-  # Hold a connection idle-in-transaction for 150s (well past the 60s timeout):
+  # Hold a connection idle-in-transaction for 90s (well past the 20s timeout):
   # send BEGIN, then keep stdin open so psql waits and issues no further query.
-  ( printf 'BEGIN;\n'; sleep 150 ) | PGPASSWORD="$pw" psql \
+  ( printf 'BEGIN;\n'; sleep 90 ) | PGOPTIONS="-c duckgres.idle_timeout=20s" PGPASSWORD="$pw" psql \
       "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
       -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
   bg=$!
@@ -3107,17 +3119,18 @@ conn_idle_timeout_reaps_session() { # org password
   done
   [ -n "$wid" ] || { cleanup_ir; fail "conn_idle_timeout: idle session never appeared for $org"; }
   log "conn idle timeout: idle session on worker $wid — waiting for the CP to reap it"
-  # Must vanish from /queries within ~90s (60s timeout + grace), while our client
-  # is STILL alive (kill -0) so the disappearance is the CP reaping, not us.
+  # Must vanish from /queries within ~60s (20s timeout + generous grace), while
+  # our client is STILL alive (kill -0) so the disappearance is the CP reaping,
+  # not us.
   gone="" a=0
-  while [ "$a" -lt 30 ]; do
+  while [ "$a" -lt 20 ]; do
     kill -0 "$bg" 2>/dev/null || { cleanup_ir; fail "conn_idle_timeout: our client exited before reap — inconclusive"; }
     present="$(curl -fsS -H "$H" "$API/api/v1/queries" | jq -r --argjson w "$wid" 'any(.queries[]?; .worker_id==$w)')"
     [ "$present" = "false" ] && { gone=1; break; }
     sleep 3; a=$((a + 1))
   done
   cleanup_ir
-  [ -n "$gone" ] || fail "conn_idle_timeout: idle session on worker $wid was NOT reaped within ~90s (idle timeout not enforced)"
+  [ -n "$gone" ] || fail "conn_idle_timeout: idle session on worker $wid was NOT reaped within ~60s (idle timeout not enforced)"
   log "conn idle timeout: idle session reaped, worker $wid freed on $org"
 }
 
@@ -3369,7 +3382,7 @@ admin_cancel_by_worker() { # org password
   log "admin: cancel a live session by worker id on $org"
   # Hold longer than the appear-poll budget (30×2s) so a slow cold-start can't
   # exit the client before the session is observed (we cancel it well before
-  # the 60s idle timeout anyway).
+  # the 5m idle timeout anyway).
   ( printf 'BEGIN;\n'; sleep 90 ) | PGPASSWORD="$pw" psql \
       "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
       -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &

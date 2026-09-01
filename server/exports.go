@@ -86,7 +86,20 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 // so an idle connection is closed after this long — its message loop hits the
 // read deadline, returns, and the worker is released back to the hot-idle pool.
 // Operators override it with --idle-timeout (a negative value disables it).
-const DefaultControlPlaneIdleTimeout = 60 * time.Second
+//
+// This was 60s, which reclaimed a pinned worker quickly but broke any client
+// that pauses between statements. A batch client running its DAG across
+// several parallel connections idles a connection whenever a thread waits on
+// work elsewhere. It then finds the connection closed and reports a lost
+// connection rather than an idle one — and a client cannot safely replay a
+// write that may already have committed, so the failure reaches the user.
+//
+// 5m keeps the reclaim bounded while covering the gaps a batch or BI client
+// leaves between statements. Deployments that want tighter worker density set
+// --idle-timeout / DUCKGRES_IDLE_TIMEOUT; a client that needs longer asks for
+// it per connection with duckgres.idle_timeout, bounded by
+// DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX.
+const DefaultControlPlaneIdleTimeout = 5 * time.Minute
 
 // NormalizeIdleTimeout resolves a configured connection idle timeout: zero means
 // "unset" → use zeroDefault; a negative value means "explicitly disabled" → 0

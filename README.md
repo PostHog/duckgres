@@ -391,7 +391,7 @@ Run with config file:
 | `DUCKGRES_DISABLE_PARQUET_PREFETCHING` | Disable DuckDB Parquet prefetching for standalone/process workers and control-plane-spawned K8s workers. Boolean values use Go's accepted forms (`true`, `TRUE`, `1`, etc.). | `false` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
-| `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
+| `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` standalone, `5m` control-plane |
 | `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` | Maximum client-requested `duckgres.idle_timeout`; unset disables client overrides | disabled |
 | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
 | `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
@@ -424,7 +424,7 @@ Run with config file:
 ### Client-requested idle timeout
 
 The control plane closes inactive client sessions after its configured
-`DUCKGRES_IDLE_TIMEOUT` (60 seconds by default). To let clients request a
+`DUCKGRES_IDLE_TIMEOUT` (5 minutes by default on the control plane). To let clients request a
 longer, bounded timeout, set a positive `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` on
 the control plane. For example, with `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX=15m`:
 
