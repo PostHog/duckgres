@@ -531,6 +531,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_PG_HOST, value: "$pg" }
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
+            - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
             # The Crossplane composition grants this isolated service account
             # exact-name access to only the matching CNPG credential Secret.
@@ -545,6 +546,7 @@ spec:
             limits: { memory: "6Gi" }
           volumeMounts:
             - { name: artifacts, mountPath: /artifacts }
+            - { name: trino-ca, mountPath: /trino-ca, readOnly: true }
         # Keep the shared artifact volume attached to a running container after
         # the scenario exits. kubectl cp uses exec/tar and cannot copy from a
         # terminated scenario container.
@@ -562,6 +564,7 @@ spec:
             - { name: artifacts, mountPath: /artifacts }
       volumes:
         - { name: artifacts, emptyDir: {} }
+        - { name: trino-ca, secret: { secretName: duckgres-trino-tls, optional: true, items: [{ key: ca.crt, path: ca.crt }] } }
 YAML
 
   echo "Streaming scenario logs for $job..."

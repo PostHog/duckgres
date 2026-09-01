@@ -25,6 +25,7 @@ Optional environment:
 Scenario-specific required environment:
   DUCKGRES_SCENARIO_ORG_ID       (required by successful provisioning scenarios)
   DUCKGRES_SCENARIO_FROZEN_S3_URI (required by frozen dataset scenarios)
+  DUCKGRES_SCENARIO_TRINO_CA_CERT (required by Trino scenarios)
 USAGE
 }
 

@@ -70,6 +70,9 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 		if !strings.HasSuffix(query.IntentID, "_balanced_v2") {
 			t.Fatalf("checked-in PostHog query %s has unversioned methodology intent %q", query.QueryID, query.IntentID)
 		}
+		if strings.Contains(query.PGWireSQL, "TIMESTAMPTZ '") {
+			t.Fatalf("query %s uses a DuckDB-only timestamp literal instead of protocol-portable SQL: %s", query.QueryID, query.PGWireSQL)
+		}
 	}
 	for index, query := range catalog.Queries {
 		wantTarget := StorageTargetRawView

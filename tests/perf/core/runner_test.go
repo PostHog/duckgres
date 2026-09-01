@@ -150,6 +150,57 @@ func TestRunnerBalancesPairedQueryOrderAcrossMeasuredIterations(t *testing.T) {
 	}
 }
 
+func TestRunnerKeepsRawViewsOnPGWireAndRunsDuckLakeTablesOnEveryTarget(t *testing.T) {
+	const trino Protocol = "trino"
+	pg := &testDriver{protocol: ProtocolPGWire}
+	trinoDriver := &testDriver{protocol: trino}
+	sink := &inMemorySink{}
+	runner := NewQueryRunner(RunnerConfig{
+		Catalog: Catalog{
+			Name:              "paired-multi-protocol",
+			MeasureIterations: 1,
+			Targets:           []Protocol{ProtocolPGWire, trino},
+			Queries: []Query{
+				{
+					QueryID:       "q_events__raw_view",
+					IntentID:      "intent_events",
+					PGWireSQL:     "SELECT COUNT(*) FROM frozen_v1.events_file_view",
+					StorageTarget: StorageTargetRawView,
+				},
+				{
+					QueryID:       "q_events__ducklake_table",
+					IntentID:      "intent_events",
+					PGWireSQL:     "SELECT COUNT(*) FROM posthog.events",
+					StorageTarget: StorageTargetDuckLakeTable,
+				},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{
+			ProtocolPGWire: pg,
+			trino:          trinoDriver,
+		},
+		Sink: sink,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got, want := pg.queryIDs, []string{"q_events__raw_view", "q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pgwire query IDs: got %v want %v", got, want)
+	}
+	if got, want := trinoDriver.queryIDs, []string{"q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("trino query IDs: got %v want %v", got, want)
+	}
+	if summary.TotalQueries != 3 {
+		t.Fatalf("total measured queries = %d, want 3", summary.TotalQueries)
+	}
+	if len(sink.results) != 3 {
+		t.Fatalf("recorded results = %d, want 3", len(sink.results))
+	}
+}
+
 func (d *testDriver) Close() error { return nil }
 
 type inMemorySink struct {
