@@ -24,8 +24,12 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadCatalog(%s): %v", path, err)
 			}
-			if len(catalog.Targets) != 1 || catalog.Targets[0] != ProtocolPGWire {
-				t.Fatalf("catalog targets = %v, want [pgwire]", catalog.Targets)
+			wantTargets := []Protocol{ProtocolPGWire}
+			if filepath.Base(path) == "ducklake_posthog_tables.yaml" {
+				wantTargets = []Protocol{ProtocolPGWire, ProtocolTrino}
+			}
+			if !reflect.DeepEqual(catalog.Targets, wantTargets) {
+				t.Fatalf("catalog targets = %v, want %v", catalog.Targets, wantTargets)
 			}
 
 			raw, err := os.ReadFile(path)
