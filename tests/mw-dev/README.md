@@ -16,11 +16,12 @@ cnpg-shard metadata stores.
    Postgres + a control-plane Deployment on the test image, spawning worker pods
    in the same namespace.
 4. **Test** via an in-cluster payload Job hitting the CP ClusterIP service.
-   The PR workflow runs `E2E_SUITE=full` and `E2E_SUITE=reshard` as parallel
-   matrix lanes. The reshard lane starts its target-discovery, validation,
-   cancellation, and rollback checks immediately after provisioning; the full
-   lane runs the remaining behavioral suite. The lanes use partitioned numeric
-   identities `1<base>` and `2<base>`, where `base` is the PR number or the
+   The PR workflow runs four parallel matrix lanes: `neutral`, `duckdb`,
+   `trino`, and `reshard`. Control-plane/provisioning/admin checks live only in
+   `neutral`; DuckDB/PGWire and Trino each exercise their own query contract,
+   and the focused reshard lane retains its target-discovery, validation,
+   cancellation, and rollback coverage. The lanes use partitioned numeric
+   identities `1<base>` through `4<base>`, where `base` is the PR number or the
    workflow run ID for a manual invocation. Their namespaces, Ducklings,
    metadata roles, and teardown are therefore isolated while still matching
    the CI RBAC allowlist. Each matrix cell is visible separately, while the
@@ -55,6 +56,45 @@ The isolated control plane's default worker request is configurable through
 `1536Mi`, respectively, preserving the e2e harness's worker-packing behavior.
 `scenario-dev.yml` explicitly overrides them to 2 CPU and 8Gi for the frozen
 perf workload. Direct `run.sh` callers can make the same explicit override.
+
+## Isolated Trino lane
+
+The Trino lane never uses the shared mw-dev Trino namespace or coordinator.
+It deploys one coordinator, one worker, and an OPA sidecar in the lane's
+`duckgres-ci-pr-<N>` namespace. The control plane projects fixed-name auth,
+tenant-secret, OPA-token, and resource-group objects into that same namespace;
+its cell id and PostgreSQL catalog store are also PR-local. This isolation is
+load-bearing: pointing a PR control plane at the shared cell could overwrite
+authoritative projections or drop catalogs absent from the PR's config store.
+
+The lane defaults `TRINO_IMAGE` to the pinned PostHog fork used when this suite
+was added. That fork contains the DuckLake connector and PostgreSQL dynamic
+catalog store; upstream `trinodb/trino` is not compatible. Update the default
+in `run.sh` and `e2e-mw-dev.yml` together when promoting a Trino build.
+`TRINO_TLS_PASSWORD` defaults to `duckgres-e2e-keystore`; it protects only the
+random, two-day, per-run PKCS12 file. `run.sh` generates a fresh CA and leaf
+certificate under `DUCKGRES_CI_SECRET_DIR`, mounts the CA into the PR control
+plane through `SSL_CERT_FILE`, and uses verified HTTPS for provisioning and
+tenant password authentication.
+
+Repository setup requires the `MW_DEV_TRINO_POD_IDENTITY_ROLE` Actions secret.
+The `github-duckgres-e2e` role must be able to pass that role and create/list/
+delete EKS Pod Identity associations. Deploy creates a second association for
+the PR-local `trino` ServiceAccount before scaling Trino above zero replicas;
+teardown and the six-hour cleanup sweep delete all associations in the PR
+namespace.
+
+Failure recovery:
+
+1. Inspect `run.sh diagnostics` output for the control plane, coordinator,
+   worker, and OPA logs. Auth/catalog failures usually mean a missing projected
+   Secret/ConfigMap; S3 failures usually mean Trino Pod Identity was not
+   injected at pod admission.
+2. Re-run the workflow. Deploy first deletes the prior namespace, Ducklings,
+   CNPG roles/databases, and namespace Pod Identity associations.
+3. If a canceled run survives, invoke the scheduled `e2e-cleanup` workflow or
+   run `tests/mw-dev/run.sh e2e-cleanup` with the documented cluster access.
+   Never redirect a PR control plane to the shared Trino cell as a workaround.
 
 A scheduled (`cron`) **e2e-cleanup** job (`run.sh e2e-cleanup`) runs every 6h and
 reaps any `duckgres-ci-pr-*` namespace older than 6h — a backstop for runs that
@@ -390,8 +430,9 @@ finalizers are still running.
 | var | `TS_WIF_CLIENT_ID_MW_DEV` | Tailscale OAuth WIF client (mirror of hogland's) |
 | var | `TS_WIF_AUDIENCE_MW_DEV` | Tailscale WIF audience |
 | secret | `MW_DEV_ACCOUNT_ID` | mw-dev AWS account id (kept out of committed code; ARNs are built from it) |
+| secret | `MW_DEV_TRINO_POD_IDENTITY_ROLE` | full ARN of the dedicated mw-dev Trino Pod Identity role (consumed only by the Trino lane) |
 | secret | `AWS_ECR_PUBLISH_IAM_ROLE` | ECR push (already exists; used by CD) |
-| (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP role + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
+| (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP and dedicated Trino roles + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
 | repo setting | "Require approval for all outside collaborators" | the access gate (see below) |
 
 The `scenario-dev` workflow requests a 16,200-second session from
@@ -453,8 +494,9 @@ id committed).
 
 - **`github-duckgres-e2e` role (posthog-cloud-infra).** AWS policy:
   `eks:DescribeCluster`, `eks:{Create,List,Delete,Describe}PodIdentityAssociation`
-  on the cluster + its associations, and `iam:PassRole` on
-  `duckgres-control-plane-dev`. Trust: `repo:PostHog/duckgres:*`. Plus an EKS
+  on the cluster + its associations, and `iam:PassRole` on both
+  `duckgres-control-plane-dev` and the dedicated role referenced by
+  `MW_DEV_TRINO_POD_IDENTITY_ROLE`. Trust: `repo:PostHog/duckgres:*`. Plus an EKS
   **access entry** binding the role to k8s RBAC that can create namespaces, the
   cross-namespace bindings, and the in-namespace resources (the kubectl the
   harness runs). Scope as tightly as the cluster admins allow — deliberately
@@ -463,6 +505,12 @@ id committed).
   failed auths (~15 min). The harness uses the provision-time password and
   settles one config-poll interval before connecting — keep it that way; a
   reset-password + tight retry loop will trip the ban.
+- **Trino password rotation is eventually consistent.** The Trino lane allows
+  up to 180 seconds for the control-plane reconcile, kubelet Secret-volume
+  projection, and Trino's password-file reload. If it times out, inspect the
+  control-plane reconcile and coordinator logs before rerunning; repeated
+  immediate authentication attempts do not make the mounted Secret refresh
+  faster.
 - **Teardown / recreate are now CR-synchronous.** `run.sh deploy`, `run.sh
   teardown`, and the in-harness same-org recreate all `kubectl wait --for=delete`
   on the Duckling CR, whose finalizers run the Crossplane DROP of the cnpg
@@ -477,11 +525,14 @@ id committed).
 - **Shared-infra contention.** Concurrent PRs provision real ducklings against
   the same cnpg-shards infra. Org-ID prefix keeps them
   distinct; watch quay.io / cnpg pooler limits under parallelism.
-- **Parallel-lane recovery.** The `full` and `reshard` jobs have matching
-  teardown matrix entries and `fail-fast: false`, so one lane failing does not
-  cancel the other or skip its cleanup. A cancelled workflow can still strand a
+- **Parallel-lane recovery.** Every matrix lane has a matching teardown entry
+  and `fail-fast: false`, so one lane failing does not cancel the others or skip
+  their cleanup. A cancelled workflow can still strand a
   lane temporarily; rerunning reaps that lane identity before deploy, and the
-  scheduled `e2e-cleanup` sweep remains the final backstop.
+  scheduled `e2e-cleanup` sweep remains the final backstop. Reshard status polls
+  bound each API attempt to 15 seconds and retry transient service-DNS failures;
+  a persistent outage still exhausts the operation's overall wait budget and
+  fails with the operation log.
 - **e2e-cleanup** is wired: the `e2e-mw-dev.yml` `schedule` trigger runs
   `run.sh e2e-cleanup` every 6h, reaping `duckgres-ci-pr-*` namespaces older than
   6h (`E2E_CLEANUP_MAX_AGE_HOURS`) along with their ducklings, cnpg role+db, Pod

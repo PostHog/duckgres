@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -60,6 +62,73 @@ func TestDeployFailureDoesNotDumpDucklingYAML(t *testing.T) {
 	}
 	if !strings.Contains(output, "finalizers=") {
 		t.Fatalf("deploy output did not include a narrow stuck-Duckling summary:\n%s", output)
+	}
+}
+
+func TestDeployWaitsForReshardRollbackBeforeReusingNamespace(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	start := strings.Index(script, "reset_pr_stack() {")
+	end := strings.Index(script, "\ncmd_deploy() {")
+	if start < 0 || end <= start {
+		t.Fatal("could not isolate reset_pr_stack")
+	}
+	reset := script[start:end]
+	if !strings.Contains(reset, `delete namespace "$NS" --ignore-not-found --wait=true --timeout=720s`) {
+		t.Fatal("namespace reset must outlive the reshard runner's 600s rollback grace period")
+	}
+	for _, unsafe := range []string{"--force", "--grace-period=0"} {
+		if strings.Contains(reset, unsafe) {
+			t.Fatalf("namespace reset bypasses rollback-safe termination with %q", unsafe)
+		}
+	}
+}
+
+func TestDiagnosticsHarnessPodJSONPathParses(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	match := regexp.MustCompile(`(?s)get pods -l job-name=duckgres-harness\s+-o jsonpath='([^']+)'`).FindSubmatch(raw)
+	if len(match) != 2 {
+		t.Fatal("diagnostics harness-pod JSONPath is missing")
+	}
+	if err := kjsonpath.New("diagnostics-harness-pod").Parse(string(match[1])); err != nil {
+		t.Fatalf("diagnostics harness-pod JSONPath does not parse: %v", err)
+	}
+}
+
+func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
+	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
+		if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
+			t.Fatalf("write fake Trino TLS material: %v", err)
+		}
+	}
+
+	cmd := runSHCommand(t, fakes.binDir, "deploy",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"E2E_SUITE=trino",
+		"TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-dev",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Trino deploy failed: %v\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	if strings.Contains(calls, " scale ") {
+		t.Fatalf("Trino deploy requires deployments/scale RBAC; calls:\n%s", calls)
+	}
+	for _, deployment := range []string{"duckgres-trino-coordinator", "duckgres-trino-worker"} {
+		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":1}}"
+		if !strings.Contains(calls, want) {
+			t.Errorf("Trino deploy did not start %s through the deployment resource; calls:\n%s", deployment, calls)
+		}
 	}
 }
 
@@ -181,10 +250,10 @@ func TestTeardownFailsWhenCNPGCleanupCannotReachAPrimary(t *testing.T) {
 			}
 
 			calls := fakes.calls(t)
-			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 9 {
-				t.Fatalf("primary discovery calls = %d, want 9 (three retries for each CI org); calls:\n%s", got, calls)
+			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 15 {
+				t.Fatalf("primary discovery calls = %d, want 15 (three retries for each CI org); calls:\n%s", got, calls)
 			}
-			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 9 {
+			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 15 {
 				t.Fatalf("psql attempts were not bounded to three per CI org; calls:\n%s", calls)
 			}
 			if !strings.Contains(calls, "delete namespace duckgres-ci-pr-123 --ignore-not-found --wait=false") {
@@ -1050,7 +1119,7 @@ func TestControlPlaneServiceDoesNotExposeFlight(t *testing.T) {
 	t.Fatal("duckgres-control-plane Service missing from manifests template")
 }
 
-func TestReshardLaneCanReadOnlyConfiguredShardProvisionerSecrets(t *testing.T) {
+func TestE2ELanesCanReadOnlyRequiredDucklingsSecrets(t *testing.T) {
 	raw, err := os.ReadFile("manifests.tmpl.yaml")
 	if err != nil {
 		t.Fatalf("read manifests template: %v", err)
@@ -1108,7 +1177,9 @@ func TestReshardLaneCanReadOnlyConfiguredShardProvisionerSecrets(t *testing.T) {
 	if got := strings.Join(stringSlice(rule["verbs"]), ","); got != "get" {
 		t.Fatalf("verbs = %q, want get", got)
 	}
-	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner" {
+	wantResourceNames := "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner," +
+		"cnpg-tenant-ci-pr-123-trinoa-password,cnpg-tenant-ci-pr-123-trinob-password"
+	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != wantResourceNames {
 		t.Fatalf("resourceNames = %q", got)
 	}
 	bindingMetadata := binding["metadata"].(map[string]any)
@@ -1141,6 +1212,28 @@ func TestReshardE2EUsesReachableDestinationAndForcesRollbackAfterPreflight(t *te
 	if !strings.Contains(script, `"cnpg_shard":"shard-002"`) ||
 		!strings.Contains(script, `"cutover_timeout_seconds":1`) {
 		t.Fatal("reshard rollback e2e must use reachable shard-002 with a forced one-second cutover timeout")
+	}
+}
+
+func TestReshardTerminalPollBoundsAndRetriesTransientAPIFailures(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	script := string(raw)
+	start := strings.Index(script, "reshard_wait_terminal() {")
+	if start < 0 {
+		t.Fatal("could not find reshard_wait_terminal")
+	}
+	end := strings.Index(script[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("could not isolate reshard_wait_terminal")
+	}
+	body := script[start : start+end]
+	for _, want := range []string{"--connect-timeout", "--max-time", "|| true"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("reshard terminal poll must bound and retry transient API failures; missing %q", want)
+		}
 	}
 }
 
@@ -1239,8 +1332,10 @@ func TestE2EHarnessJobReceivesSuiteSelection(t *testing.T) {
 	}
 	script := string(raw)
 	for _, want := range []string{
-		`E2E_SUITE="${E2E_SUITE:-full}"`,
+		`E2E_SUITE="${E2E_SUITE:-neutral}"`,
 		`{ name: E2E_SUITE, value: "$E2E_SUITE" }`,
+		`case "$E2E_SUITE" in`,
+		`neutral|duckdb|trino|reshard)`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("run.sh missing e2e suite contract %q", want)
@@ -1248,7 +1343,7 @@ func TestE2EHarnessJobReceivesSuiteSelection(t *testing.T) {
 	}
 }
 
-func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
+func TestE2EWorkflowRunsNeutralDuckDBAndTrinoSuitesInParallelNamespaces(t *testing.T) {
 	raw, err := os.ReadFile("../../.github/workflows/e2e-mw-dev.yml")
 	if err != nil {
 		t.Fatalf("read e2e workflow: %v", err)
@@ -1256,24 +1351,33 @@ func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
 	workflow := string(raw)
 	for _, want := range []string{
 		"matrix:",
-		"suite: full",
+		"suite: neutral",
+		"suite: duckdb",
+		"suite: trino",
 		"suite: reshard",
 		`lane_prefix: "1"`,
 		`lane_prefix: "2"`,
+		`lane_prefix: "3"`,
+		`lane_prefix: "4"`,
 		"github.event.pull_request.number || github.run_id",
 		"github.event_name == 'workflow_dispatch' && github.run_id",
 		"NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix",
 		"E2E_SUITE: ${{ matrix.suite }}",
+		"- name: Test e2e harness scripts\n        env:\n          E2E_SUITE: neutral\n        run: go test -count=1 ./tests/mw-dev",
 	} {
 		if !strings.Contains(workflow, want) {
 			t.Fatalf("e2e workflow missing parallel suite contract %q", want)
 		}
 	}
 	for _, duplicated := range []string{
-		"suite: full",
+		"suite: neutral",
+		"suite: duckdb",
+		"suite: trino",
 		"suite: reshard",
 		`lane_prefix: "1"`,
 		`lane_prefix: "2"`,
+		`lane_prefix: "3"`,
+		`lane_prefix: "4"`,
 	} {
 		if got := strings.Count(workflow, duplicated); got != 2 {
 			t.Fatalf("e2e and teardown matrices must share %q exactly twice; got %d", duplicated, got)
@@ -1290,19 +1394,237 @@ func TestE2EWorkflowRunsFullAndReshardSuitesInParallelNamespaces(t *testing.T) {
 	}
 }
 
-func TestFocusedReshardSuiteDoesNotProvisionUnusedResilienceOrg(t *testing.T) {
+func TestE2ESuitesKeepNeutralAndEngineSpecificCoverageDisjoint(t *testing.T) {
 	raw, err := os.ReadFile("e2e/harness.sh")
 	if err != nil {
 		t.Fatalf("read e2e harness: %v", err)
 	}
 	script := string(raw)
 	for _, want := range []string{
-		`if [ "${E2E_SUITE:-full}" = "full" ]; then`,
-		`provision "$RES1" "$(res_body "$RES1")"`,
-		`join_lanes ready_cnpg ready_res2`,
+		`lane_neutral()`,
+		`lane_duckdb()`,
+		`case "${E2E_SUITE:-neutral}" in`,
+		`neutral) lane_neutral ;;`,
+		`duckdb) lane_duckdb ;;`,
+		`reshard) lane_reshard ;;`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("e2e harness missing focused-suite contract %q", want)
+		}
+	}
+	neutralStart := strings.Index(script, "lane_neutral() {")
+	duckdbStart := strings.Index(script, "lane_duckdb() {")
+	engineStart := strings.Index(script, "engine_main() {")
+	mainStart := strings.Index(script, "\nmain() {")
+	if mainStart >= 0 {
+		mainStart++
+	}
+	if neutralStart < 0 || duckdbStart <= neutralStart || engineStart <= duckdbStart || mainStart <= engineStart {
+		t.Fatal("could not isolate neutral and engine lane bodies")
+	}
+	neutralBody := script[neutralStart:duckdbStart]
+	engineBody := script[engineStart:mainStart]
+	for _, call := range []string{
+		"admin_dashboard_no_query_token",
+		"internal_secret_fallback_auth",
+		"models_explorer_api",
+		"provision_team_contract",
+		"org_teams_crud",
+		"discovery_endpoints",
+		"admin_ducklings_metadata",
+		"duckling_shard_backfill",
+		"lifecycle_teardown_cnpg",
+	} {
+		if !strings.Contains(neutralBody, call) {
+			t.Errorf("neutral lane does not own %s", call)
+		}
+		if strings.Contains(engineBody, call) {
+			t.Errorf("engine lane duplicates neutral assertion %s", call)
+		}
+	}
+	if !strings.Contains(engineBody, "metadata_proxy_e2e") || strings.Contains(neutralBody, "metadata_proxy_e2e") {
+		t.Error("native metadata proxy coverage must belong only to the DuckDB/PGWire engine lane")
+	}
+}
+
+func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T) {
+	manifestRaw, err := os.ReadFile("manifests.trino.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+	patchRaw, err := os.ReadFile("trino-controlplane-patch.tmpl.json")
+	if err != nil {
+		t.Fatalf("read Trino control-plane patch: %v", err)
+	}
+	manifest := string(manifestRaw) + string(patchRaw)
+	for _, want := range []string{
+		`name: duckgres-trino`,
+		`name: duckgres-trino-opa`,
+		`"value": "https://duckgres-trino.${NAMESPACE}.svc:8443"`,
+		`"name": "DUCKGRES_TRINO_NAMESPACE"`,
+		`"value": "${NAMESPACE}"`,
+		`"name": "DUCKGRES_TRINO_CELL_ID"`,
+		`"value": "ci-pr-${PR_NUMBER}"`,
+	} {
+		if !strings.Contains(manifest, want) {
+			t.Fatalf("isolated Trino manifest missing %q", want)
+		}
+	}
+	for _, unsafe := range []string{
+		`trino.trino.svc`,
+		`value: "trino" # shared`,
+	} {
+		if strings.Contains(manifest, unsafe) {
+			t.Fatalf("per-PR control plane must not reference shared Trino state %q", unsafe)
+		}
+	}
+
+	runRaw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	for _, want := range []string{
+		`TRINO_IMAGE="${TRINO_IMAGE:-`,
+		`envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE`,
+		`if [ "$E2E_SUITE" = "trino" ]; then`,
+		`e2e/trino.sh`,
+	} {
+		if !strings.Contains(string(runRaw), want) {
+			t.Fatalf("run.sh missing isolated Trino contract %q", want)
+		}
+	}
+
+	harnessRaw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	harness := string(harnessRaw)
+	for _, want := range []string{
+		`"$API/api/v1/trino/queries/$query_id"`,
+		`'.query_id == $q and .org == $org'`,
+		`catalog_absent=false`,
+	} {
+		if !strings.Contains(harness, want) {
+			t.Errorf("Trino harness missing live admin/detail cleanup contract %q", want)
+		}
+	}
+}
+
+func TestTrinoHarnessCanObserveDeploymentsInItsIsolatedNamespace(t *testing.T) {
+	raw, err := os.ReadFile("manifests.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read manifests template: %v", err)
+	}
+	manifest := string(raw)
+	for _, want := range []string{
+		`resources: ["deployments"]`,
+		`verbs: ["get", "list", "watch"]`,
+	} {
+		if !strings.Contains(manifest, want) {
+			t.Errorf("Trino restart rollout RBAC missing %q", want)
+		}
+	}
+}
+
+func TestTrinoHarnessBootstrapsDuckLakeBeforeCatalogQueries(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	script := string(raw)
+
+	bootstrap := strings.Index(script, `bootstrap_ducklake "$ORG_A" "$pw_a"`)
+	firstCatalogQuery := strings.Index(script, `log "TLS/password auth, discovery, and DDL/DML"`)
+	if bootstrap < 0 {
+		t.Fatal("Trino harness does not initialize the fresh DuckLake metadata store through Duckgres")
+	}
+	if firstCatalogQuery < 0 || bootstrap >= firstCatalogQuery {
+		t.Fatal("fresh DuckLake metadata must be initialized before the first Trino catalog query")
+	}
+	warehouseB := strings.Index(script, `wait_warehouse "$ORG_B"`)
+	bootstrapB := strings.Index(script, `bootstrap_ducklake "$ORG_B" "$pw_b"`)
+	trinoB := strings.Index(script, `wait_trino "$ORG_B" "$DB_B" "$CAT_B"`)
+	if warehouseB < 0 || bootstrapB <= warehouseB || trinoB <= bootstrapB {
+		t.Fatal("hot-added tenant DuckLake metadata must be initialized after warehouse readiness and before Trino readiness")
+	}
+	for _, want := range []string{
+		`bootstrap_ducklake()`,
+		`dbname=ducklake`,
+		`host=$1$SNI_SUFFIX`,
+		`hostaddr=$CP_IP`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Trino DuckLake bootstrap is missing %q", want)
+		}
+	}
+}
+
+func TestTrinoKillQueryWorkloadHonorsSequenceLimit(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	matches := regexp.MustCompile(`sequence\(1,\s*([0-9]+)\)`).FindAllSubmatch(raw, -1)
+	if len(matches) < 3 {
+		t.Fatalf("long-query workload uses %d sequences, want at least three bounded factors", len(matches))
+	}
+	for _, match := range matches {
+		limit, err := strconv.Atoi(string(match[1]))
+		if err != nil {
+			t.Fatalf("parse sequence limit %q: %v", match[1], err)
+		}
+		if limit > 10_000 {
+			t.Errorf("Trino sequence limit %d exceeds the engine maximum of 10000", limit)
+		}
+	}
+}
+
+func TestTrinoPasswordRotationAllowsSecretProjectionWindow(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	script := string(raw)
+
+	const minimumProjectionWindowSeconds = 150
+	values := make(map[string]int)
+	for _, match := range regexp.MustCompile(`(?m)^(TRINO_AUTH_ROTATION_ATTEMPTS|TRINO_AUTH_ROTATION_RETRY_SECONDS)=([0-9]+)$`).FindAllStringSubmatch(script, -1) {
+		value, err := strconv.Atoi(match[2])
+		if err != nil {
+			t.Fatalf("parse %s=%q: %v", match[1], match[2], err)
+		}
+		values[match[1]] = value
+	}
+	attempts := values["TRINO_AUTH_ROTATION_ATTEMPTS"]
+	retrySeconds := values["TRINO_AUTH_ROTATION_RETRY_SECONDS"]
+	if attempts*retrySeconds < minimumProjectionWindowSeconds {
+		t.Fatalf("Trino password rotation wait = %ds, want at least %ds for provisioner, kubelet Secret projection, and Trino reload", attempts*retrySeconds, minimumProjectionWindowSeconds)
+	}
+	for _, want := range []string{
+		`while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do`,
+		`sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Trino password rotation does not use bounded wait setting %q", want)
+		}
+	}
+}
+
+func TestTrinoNodeEnvironmentUsesValidIdentifier(t *testing.T) {
+	raw, err := os.ReadFile("manifests.trino.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read Trino manifests template: %v", err)
+	}
+
+	environments := regexp.MustCompile(`(?m)^\s*node\.environment=(\S+)$`).FindAllStringSubmatch(string(raw), -1)
+	if len(environments) != 2 {
+		t.Fatalf("Trino node.environment values = %d, want coordinator and worker", len(environments))
+	}
+	valid := regexp.MustCompile(`^[a-z0-9][_a-z0-9]*$`)
+	for _, match := range environments {
+		rendered := strings.ReplaceAll(match[1], "${PR_NUMBER}", "123")
+		if !valid.MatchString(rendered) {
+			t.Errorf("Trino node.environment %q violates the Trino identifier grammar", rendered)
 		}
 	}
 }
@@ -1412,6 +1734,10 @@ if [[ "$*" == *" -n cnpg-shards exec "* && "$*" == *" psql -U postgres -c "* ]];
   exit 0
 fi
 if [[ "$*" == *" apply -f -"* ]]; then
+  tee -a "$RUN_SH_TEST_CALLS" >/dev/null
+  exit 0
+fi
+if [[ "$*" == *" --patch-file=/dev/stdin"* ]]; then
   tee -a "$RUN_SH_TEST_CALLS" >/dev/null
   exit 0
 fi

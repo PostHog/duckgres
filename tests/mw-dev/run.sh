@@ -28,11 +28,13 @@ SCENARIO_NAME="${SCENARIO_NAME:-full-suite}"
 SCENARIO_ARTIFACTS_DIR="${SCENARIO_ARTIFACTS_DIR:-$HERE/../../artifacts/scenario-dev}"
 DUCKGRES_K8S_WORKER_CPU_REQUEST="${DUCKGRES_K8S_WORKER_CPU_REQUEST:-750m}"
 DUCKGRES_K8S_WORKER_MEMORY_REQUEST="${DUCKGRES_K8S_WORKER_MEMORY_REQUEST:-1536Mi}"
-E2E_SUITE="${E2E_SUITE:-full}"
+E2E_SUITE="${E2E_SUITE:-neutral}"
 case "$E2E_SUITE" in
-  full|reshard) ;;
-  *) echo "E2E_SUITE must be full or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
+  neutral|duckdb|trino|reshard) ;;
+  *) echo "E2E_SUITE must be neutral, duckdb, trino, or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
 esac
+TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07}"
+TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -45,6 +47,12 @@ internal_secret_fallback_file="$secret_dir/duckgres-ci-internal-secret-fallback"
 # AES key for user persistent secrets (DUCKGRES_USER_SECRET_KEY). Random per
 # run: stored user secrets only need to outlive the run's sessions.
 user_secret_key_file="$secret_dir/duckgres-ci-user-secret-key"
+trino_ca_key_file="$secret_dir/duckgres-ci-trino-ca.key"
+trino_ca_cert_file="$secret_dir/duckgres-ci-trino-ca.crt"
+trino_server_key_file="$secret_dir/duckgres-ci-trino-server.key"
+trino_server_cert_file="$secret_dir/duckgres-ci-trino-server.crt"
+trino_server_csr_file="$secret_dir/duckgres-ci-trino-server.csr"
+trino_server_p12_file="$secret_dir/duckgres-ci-trino-server.p12"
 
 require_pr_identity() {
   : "${PR_NUMBER:?PR_NUMBER is required}"
@@ -79,6 +87,39 @@ render() {
   DUCKGRES_K8S_WORKER_MEMORY_REQUEST="$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" \
     envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY $DUCKGRES_K8S_WORKER_CPU_REQUEST $DUCKGRES_K8S_WORKER_MEMORY_REQUEST' \
     < "$HERE/manifests.tmpl.yaml"
+
+  if [ "$E2E_SUITE" = "trino" ]; then
+    ensure_trino_tls
+    TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
+    TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
+    TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
+      NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
+      envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64' \
+      < "$HERE/manifests.trino.tmpl.yaml"
+  fi
+}
+
+ensure_trino_tls() {
+  local san="duckgres-trino.$NS.svc"
+  if [ -s "$trino_ca_cert_file" ] && [ -s "$trino_server_p12_file" ]; then
+    return
+  fi
+  # Per-run CA and leaf: password auth stays on verified HTTPS without sharing
+  # the real mw-dev wildcard certificate or weakening the Go TLS client.
+  ( umask 077
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+      -subj "/CN=duckgres-e2e-trino-ca" \
+      -keyout "$trino_ca_key_file" -out "$trino_ca_cert_file" >/dev/null 2>&1
+    openssl req -newkey rsa:2048 -nodes -subj "/CN=$san" \
+      -addext "subjectAltName=DNS:$san,DNS:$san.cluster.local" \
+      -keyout "$trino_server_key_file" -out "$trino_server_csr_file" >/dev/null 2>&1
+    openssl x509 -req -days 2 -sha256 \
+      -in "$trino_server_csr_file" -CA "$trino_ca_cert_file" -CAkey "$trino_ca_key_file" \
+      -CAcreateserial -copy_extensions copy -out "$trino_server_cert_file" >/dev/null 2>&1
+    openssl pkcs12 -export -name trino -passout "pass:$TRINO_TLS_PASSWORD" \
+      -inkey "$trino_server_key_file" -in "$trino_server_cert_file" \
+      -certfile "$trino_ca_cert_file" -out "$trino_server_p12_file" >/dev/null 2>&1
+  )
 }
 
 ensure_secret_dir() {
@@ -107,10 +148,20 @@ ensure_pod_identity() {
   # pod-identity agent for newly-admitted pods, leaving the CP without creds.
   # Delete any existing, then create.
   delete_pod_identity
+  create_pod_identity "$SA_NAME" "$CP_POD_IDENTITY_ROLE"
+}
+
+create_pod_identity() { # service-account role-arn
+  local service_account="$1" role_arn="$2"
   aws eks create-pod-identity-association --region "$AWS_REGION" \
     --cluster-name "$EKS_CLUSTER_NAME" --namespace "$NS" \
-    --service-account "$SA_NAME" --role-arn "$CP_POD_IDENTITY_ROLE" >/dev/null
-  echo "Created Pod Identity association $NS/$SA_NAME -> $CP_POD_IDENTITY_ROLE"
+    --service-account "$service_account" --role-arn "$role_arn" >/dev/null
+  echo "Created Pod Identity association for $NS/$service_account"
+}
+
+ensure_trino_pod_identity() {
+  : "${TRINO_POD_IDENTITY_ROLE:?TRINO_POD_IDENTITY_ROLE is required for the trino e2e suite}"
+  create_pod_identity trino "$TRINO_POD_IDENTITY_ROLE"
 }
 
 delete_pod_identity() {
@@ -205,7 +256,7 @@ drop_cnpg_role() { # org-id
 # (harness.sh main()). Keep in sync with harness.sh.
 ci_orgs() { # pr-number
   local pr="$1"
-  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2"
+  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2 ci-pr-${pr}-trinoa ci-pr-${pr}-trinob"
 }
 
 delete_ci_ducklings() { # pr-number
@@ -257,7 +308,10 @@ reset_pr_stack() {
   for org in $(ci_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
   delete_pod_identity
   delete_ci_bindings "$PR_NUMBER"
-  "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=300s
+  # Reshard runners intentionally get 600s to roll back safely on termination.
+  # A cancelled workflow can leave one in that grace period, so the next run's
+  # reset must wait longer instead of force-deleting it or timing out halfway.
+  "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=720s
 }
 
 cmd_deploy() {
@@ -273,6 +327,32 @@ cmd_deploy() {
   # pod actually carries the injected credentials.
   ensure_pod_identity
   restart_cp_with_identity
+
+  if [ "$E2E_SUITE" = "trino" ]; then
+    # Associate before admitting Trino pods: the Pod Identity agent injects
+    # credentials only at admission and never retrofits an existing pod.
+    ensure_trino_pod_identity
+    envsubst '$NAMESPACE $PR_NUMBER' < "$HERE/trino-controlplane-patch.tmpl.json" \
+      | "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane \
+          --type=strategic --patch-file=/dev/stdin
+    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-control-plane --timeout=180s
+    # Bootstrap creates the fixed-name Trino Secrets/ConfigMap. Keep workloads
+    # at zero replicas until all projections exist, then admit them with the
+    # already-propagated Trino Pod Identity association.
+    "${KUBECTL[@]}" -n "$NS" wait --for=create secret/trino-auth --timeout=120s
+    "${KUBECTL[@]}" -n "$NS" wait --for=create secret/trino-internal-communication --timeout=120s
+    "${KUBECTL[@]}" -n "$NS" wait --for=create secret/trino-opa-bundle-token --timeout=120s
+    "${KUBECTL[@]}" -n "$NS" wait --for=create configmap/trino-resource-groups --timeout=120s
+    # Patch the Deployment resources directly. The CI deployer intentionally
+    # cannot patch the deployments/scale subresource, while it already needs
+    # narrowly scoped Deployment patch access for the control-plane config.
+    for deployment in duckgres-trino-coordinator duckgres-trino-worker; do
+      "${KUBECTL[@]}" -n "$NS" patch deployment "$deployment" \
+        --type=merge -p '{"spec":{"replicas":1}}'
+    done
+    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
+    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
+  fi
 }
 
 cmd_test_e2e() {
@@ -283,8 +363,12 @@ cmd_test_e2e() {
   # hits when it stashes the whole object in the last-applied annotation
   # (metadata.annotations: Too long). SSA stores field ownership instead and
   # allows the full 1MiB ConfigMap payload.
+  harness_file="$HERE/e2e/harness.sh"
+  if [ "$E2E_SUITE" = "trino" ]; then
+    harness_file="$HERE/e2e/trino.sh"
+  fi
   "${KUBECTL[@]}" -n "$NS" create configmap duckgres-harness \
-    --from-file=harness.sh="$HERE/e2e/harness.sh" \
+    --from-file=harness.sh="$harness_file" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply --server-side --force-conflicts -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
@@ -333,8 +417,12 @@ spec:
           resources:
             requests: { cpu: 200m, memory: 256Mi }
             limits: { memory: 512Mi }
-          volumeMounts: [{ name: h, mountPath: /harness }]
-      volumes: [{ name: h, configMap: { name: duckgres-harness } }]
+          volumeMounts:
+            - { name: h, mountPath: /harness }
+            - { name: trino-ca, mountPath: /trino-ca, readOnly: true }
+      volumes:
+        - { name: h, configMap: { name: duckgres-harness } }
+        - { name: trino-ca, secret: { secretName: duckgres-trino-tls, optional: true, items: [{ key: ca.crt, path: ca.crt }] } }
 YAML
 
   echo "Streaming harness logs…"
@@ -657,12 +745,16 @@ cmd_diagnostics() {
   "${KUBECTL[@]}" -n "$NS" get pods,svc,job -o wide || true
   echo "::endgroup::"
   echo "::group::harness pod status (eviction / OOM / exit code)"
-  "${KUBECTL[@]}" -n "$NS" get pods -l job-name=duckgres-harness     -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase} reason={.status.reason} msg={.status.message} exit={.status.containerStatuses[0].state.terminated.exitCode} term-reason={.status.containerStatuses[0].state.terminated.reason}{"
-"}{end}' || true
+  "${KUBECTL[@]}" -n "$NS" get pods -l job-name=duckgres-harness     -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase} reason={.status.reason} msg={.status.message} exit={.status.containerStatuses[0].state.terminated.exitCode} term-reason={.status.containerStatuses[0].state.terminated.reason}{"\n"}{end}' || true
   "${KUBECTL[@]}" -n "$NS" describe pods -l job-name=duckgres-harness 2>/dev/null | tail -30 || true
   echo "::endgroup::"
   echo "::group::control-plane logs (tail)"
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-control-plane --tail=200 || true
+  echo "::endgroup::"
+  echo "::group::Trino coordinator, worker, and OPA logs"
+  "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c trino-coordinator --tail=300 || true
+  "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c duckgres-trino-opa --tail=300 || true
+  "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-worker -c trino-worker --tail=300 || true
   echo "::endgroup::"
   echo "::group::worker pods"
   "${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-worker -o wide || true

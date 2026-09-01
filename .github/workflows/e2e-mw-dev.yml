@@ -30,7 +30,8 @@
 # Required repo configuration (one-time, see tests/mw-dev/README.md):
 #   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV
 #   secrets: AWS_ECR_PUBLISH_IAM_ROLE (already exists, used by CD),
-#            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it)
+#            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it),
+#            MW_DEV_TRINO_POD_IDENTITY_ROLE (full ARN; kept out of public git)
 #   IAM:     github-duckgres-e2e role in the mw-dev account (posthog-cloud-infra)
 #            — stripped down, NOT the account-admin terraform-infra role.
 #   Repo setting: "Require approval for all outside collaborators".
@@ -106,14 +107,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: full
+          - suite: neutral
             lane_prefix: "1"
-          - suite: reshard
+          - suite: duckdb
             lane_prefix: "2"
+          - suite: trino
+            lane_prefix: "3"
+          - suite: reshard
+            lane_prefix: "4"
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     env:
-      # Partition both lanes so no lane can collide with a real PR number.
+      # Partition all lanes so no lane can collide with a real PR number.
       # workflow_dispatch has no pull_request payload, so it uses run_id.
       PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
       NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
@@ -130,6 +135,13 @@ jobs:
       # injection. Built from the account-id secret (no account id committed) +
       # the non-sensitive role name.
       CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
+      # Trino assumes each Duckling role directly. Keep this as a dedicated
+      # secret so no account id or internal role ARN lands in this public repo.
+      # Only the trino matrix cell consumes it.
+      TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
+      # Pinned PostHog fork: it contains the DuckLake connector and the
+      # PostgreSQL-backed dynamic catalog store used by managed warehouse.
+      TRINO_IMAGE: ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -138,7 +150,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # The matrix value configures deployment, but these structural tests
+      # exercise every suite and must not inherit one lane's selection.
       - name: Test e2e harness scripts
+        env:
+          E2E_SUITE: neutral
         run: go test -count=1 ./tests/mw-dev
 
       - name: Configure AWS credentials (OIDC)
@@ -146,7 +162,8 @@ jobs:
         with:
           # Dedicated, stripped-down e2e role (NOT the account-admin
           # terraform-infra role): eks:DescribeCluster + Pod Identity
-          # association calls + iam:PassRole on the CP role, plus an EKS access
+          # association calls + iam:PassRole on the CP and dedicated Trino
+          # roles, plus an EKS access
           # entry for the kubectl it needs. Defined in posthog-cloud-infra
           # (mw-dev account). Account id comes from a repo secret so no AWS
           # account id is committed; the role name is not sensitive.
@@ -217,10 +234,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: full
+          - suite: neutral
             lane_prefix: "1"
-          - suite: reshard
+          - suite: duckdb
             lane_prefix: "2"
+          - suite: trino
+            lane_prefix: "3"
+          - suite: reshard
+            lane_prefix: "4"
     env:
       PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
       NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}

@@ -143,6 +143,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # The Trino lane deletes coordinator/worker pods and uses rollout status to
+  # prove their owning Deployments restore readiness. rollout status lists
+  # before watching, so keep this read-only and namespace-scoped; every
+  # Deployment in this per-PR namespace is disposable.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["secrets"]
     # list/watch needed by the CP's stranded-secret reconciler (the prod chart
@@ -152,6 +159,16 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get"]
+  # Trino's resource-group projection is a fixed per-namespace ConfigMap.
+  # Create cannot be restricted by resourceNames; the e2e namespace is
+  # disposable and this ServiceAccount already owns its other projections.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["trino-resource-groups"]
+    verbs: ["get", "update", "patch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create", "get", "update"]
@@ -188,9 +205,10 @@ roleRef:
 # the grant must live on duckgres-duckling-reader (see charts repo,
 # charts/duckgres/templates/rbac.yaml) and be deployed to the cluster.
 ---
-# Destination preflight uses the same two configured dev-shard provisioner
-# Secrets as the production chart. Keep this disposable grant by-name and
-# read-only; its ci-pr label lets teardown remove the cross-namespace objects.
+# Destination preflight uses the two configured dev-shard provisioner Secrets;
+# Trino catalog projection resolves only its two predictable CI tenant password
+# Secrets. Keep this disposable grant by-name and read-only; its ci-pr label
+# lets teardown remove the cross-namespace objects.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -204,6 +222,8 @@ rules:
     resourceNames:
       - cnpg-shard-001-provisioner
       - cnpg-shard-002-provisioner
+      - cnpg-tenant-ci-pr-${PR_NUMBER}-trinoa-password
+      - cnpg-tenant-ci-pr-${PR_NUMBER}-trinob-password
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
