@@ -915,7 +915,9 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   columns, which were surfaced nowhere before, so a failed Trino provision
   was silent). Read as the OBSERVER principal, never the provisioner's
   admin — see the Trino Cells section and `admin/README.md`. Payloads are
-  redacted (SQL) and projected (never `TrinoEnabledOrg.RootPasswordHash`).
+  redacted (SQL) and projected (never `TrinoEnabledOrg.RootPasswordHash`). A
+  ready, reachable org includes non-secret `status.connection` coordinates;
+  passwords remain write-only provision/reset results.
   Every read is cached + timeout-bounded and degrades to `available:false`
   plus a reason rather than erroring the page: the console must render
   during exactly the incident it exists for. Unset
@@ -1577,6 +1579,12 @@ password/tenant/catalog changes never propagate.
   workers can never authenticate a tenant's metadata store with two different
   credentials. The projection is AUTHORITATIVE, not additive: a disabled org's
   key is removed on the next tick.
+- **Tenant client coordinates are non-secret and readiness-gated.** The org
+  detail endpoint returns `status.connection` only while the catalog is ready
+  and the coordinator is reachable. `DUCKGRES_TRINO_CLIENT_URL` names the HTTPS
+  endpoint clients should dial; when unset, the control plane falls back to its
+  coordinator URL and TLS server name. The response contains host, port and the
+  tenant principal, never a password or password hash.
 - **`Reconcile` order is load-bearing**: cluster secrets → auth files →
   resource groups → OPA bundle → tenant passwords → catalogs, and the
   `globalErr` gate SKIPS the catalog step if any projection failed. A
@@ -1682,12 +1690,8 @@ password/tenant/catalog changes never propagate.
   `trino_cluster_secrets_test.go`, the migration asserts in
   `tests/configstore/migrations_postgres_test.go`, and — for anything the
   admin console reads — `controlplane/admin/trino{,_client}_test.go` plus
-  the `ui/src/lib/trino.test.ts` derivations. **There is no
-  `tests/mw-dev/e2e/harness.sh` coverage yet**, and that is a stated gap, not
-  an oversight: mw-dev runs no Trino cell, so there is nothing for the
-  in-cluster Job to talk to. The harness assertion (enable an org, poll the
-  row to `ready`, query the catalog as the org's `root`) lands with the chart
-  that deploys the cell.
+  the `ui/src/lib/trino.test.ts` derivations and
+  `tests/mw-dev/e2e/trino.sh`.
 
 ## TODO Reference
 

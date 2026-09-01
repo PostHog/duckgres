@@ -74,6 +74,11 @@ const (
 	// http, so https is effectively required for the provisioner to authenticate.
 	envTrinoCoordinatorServerName = "DUCKGRES_TRINO_COORDINATOR_SERVER_NAME"
 
+	// envTrinoClientURL is the HTTPS endpoint tenant clients should dial.
+	// Empty falls back to the coordinator URL, with its TLS server name used
+	// as the host when configured.
+	envTrinoClientURL = "DUCKGRES_TRINO_CLIENT_URL"
+
 	// envTrinoCellID names the Trino cell this control plane reconciles.
 	// Empty == configstore.DefaultTrinoCellID. The provisioner claims
 	// unassigned Trino-enabled orgs into this cell and ignores orgs
@@ -136,6 +141,7 @@ type trinoCell struct {
 	ID             string
 	CoordinatorURL string
 	TLSServerName  string
+	ClientURL      string
 }
 
 // resolveTrinoCell reads the single cell's configuration from the
@@ -154,6 +160,7 @@ func resolveTrinoCell() (trinoCell, error) {
 		ID:             cellID,
 		CoordinatorURL: coordinatorURL,
 		TLSServerName:  strings.TrimSpace(os.Getenv(envTrinoCoordinatorServerName)),
+		ClientURL:      strings.TrimSpace(os.Getenv(envTrinoClientURL)),
 	}, nil
 }
 
@@ -305,7 +312,12 @@ func buildTrinoWiring(
 		BundleHandler: bundleHandler,
 		Cell:          cell,
 		Console: &trinoConsoleWiring{
-			Cell: admin.TrinoCell{ID: cell.ID, CoordinatorURL: cell.CoordinatorURL},
+			Cell: admin.TrinoCell{
+				ID:             cell.ID,
+				CoordinatorURL: cell.CoordinatorURL,
+				TLSServerName:  cell.TLSServerName,
+				ClientURL:      cell.ClientURL,
+			},
 			// Read the credential through the provisioner on every call
 			// rather than capturing it here: the pair is regenerated if it
 			// ever goes missing, and a captured copy would 401 forever

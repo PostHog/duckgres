@@ -844,8 +844,15 @@ export interface TrinoOrgStatus {
   status_message?: string;
   ready_at?: string;
   failed_at?: string;
+  connection?: TrinoConnection;
   running_queries: number;
   queued_queries: number;
+}
+
+export interface TrinoConnection {
+  host: string;
+  port: number;
+  username: string;
 }
 
 // available=false means the coordinator could not be read. Every count then
