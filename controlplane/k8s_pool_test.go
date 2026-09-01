@@ -2962,9 +2962,10 @@ func assertSpawnedWorkerPod(t *testing.T, pod *corev1.Pod) {
 	// base DB off the NODE's /proc/meminfo (sysinfo.AutoMemoryLimit) and all
 	// pre-session work (DuckLake ATTACH, activation) runs effectively
 	// unbounded, and the Go runtime has no ceiling at all.
-	// Default pool shape is 16Gi/8cpu -> 75% = 12GB, GOMEMLIMIT = 1/8 pod.
-	if got := envByName["DUCKGRES_MEMORY_LIMIT"]; got != "12GB" {
-		t.Fatalf("expected DUCKGRES_MEMORY_LIMIT=12GB (75%% of 16Gi pod), got %q", got)
+	// Default pool shape is 16Gi/8cpu. Headroom is max(25%, min(6GiB, 40%)),
+	// so a 16Gi pod keeps 6GiB back and DuckDB gets 10GB, not a flat 75%.
+	if got := envByName["DUCKGRES_MEMORY_LIMIT"]; got != "10GB" {
+		t.Fatalf("expected DUCKGRES_MEMORY_LIMIT=10GB (16Gi pod less 6GiB headroom), got %q", got)
 	}
 	if got := envByName["DUCKGRES_THREADS"]; got != "20" {
 		t.Fatalf("expected DUCKGRES_THREADS=20 (2.5x the 8 CPU pod request), got %q", got)
@@ -4561,8 +4562,10 @@ func TestWorkerMemoryHygieneEnv(t *testing.T) {
 			"DUCKGRES_MEMORY_LIMIT": "90GB", "GOMEMLIMIT": "15360MiB", "DUCKGRES_THREADS": "38"}},
 		{"dev 15/64Gi", mk("15", "64Gi"), map[string]string{
 			"DUCKGRES_MEMORY_LIMIT": "48GB", "GOMEMLIMIT": "8192MiB", "DUCKGRES_THREADS": "38"}},
+		// Well under the 24Gi crossover, so the headroom floor's 40% cap
+		// applies rather than a flat 25%: 512Mi - 40% = 307MB.
 		{"sub-GB pod formats MB", mk("500m", "512Mi"), map[string]string{
-			"DUCKGRES_MEMORY_LIMIT": "384MB", "GOMEMLIMIT": "64MiB", "DUCKGRES_THREADS": "2"}},
+			"DUCKGRES_MEMORY_LIMIT": "307MB", "GOMEMLIMIT": "64MiB", "DUCKGRES_THREADS": "2"}},
 		{"no requests -> no env", corev1.ResourceRequirements{}, map[string]string{}},
 	}
 	for _, tc := range cases {

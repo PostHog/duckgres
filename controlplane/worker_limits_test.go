@@ -3,6 +3,7 @@
 package controlplane
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -18,7 +19,7 @@ func TestWorkerDuckDBLimits_RemoteBackend(t *testing.T) {
 			name:       "typical large worker",
 			cpuReq:     "46000m",
 			memReq:     "360Gi",
-			wantMem:    "270GB", // 75% of 360Gi (386547056640 bytes) = 270GB
+			wantMem:    "270GB", // 360Gi - 25% headroom (the floor does not bind) = 270GB
 			wantThread: 115,
 		},
 		{
@@ -29,17 +30,45 @@ func TestWorkerDuckDBLimits_RemoteBackend(t *testing.T) {
 			wantThread: 115,
 		},
 		{
-			name:       "small worker",
+			// Below the 24Gi crossover the absolute headroom floor binds:
+			// 8Gi keeps min(6GiB, 40%) = 3.2GiB back, not 25%.
+			name:       "small worker reserves more than a flat quarter",
 			cpuReq:     "4000m",
 			memReq:     "8Gi",
-			wantMem:    "6GB",
+			wantMem:    "4GB",
 			wantThread: 10,
+		},
+		{
+			// Regression: 16Gi workers were sized to 12GB and OOMKilled in
+			// mw-prod-us once a reused pod's RSS ratcheted to ~14.8GiB.
+			// 6GiB of headroom keeps the plateau under the cgroup limit.
+			name:       "16Gi worker keeps the absolute headroom floor",
+			cpuReq:     "4000m",
+			memReq:     "16Gi",
+			wantMem:    "10GB",
+			wantThread: 10,
+		},
+		{
+			// At 24Gi the proportional reserve equals the floor, so this and
+			// every larger pod keep byte-identical sizing to the flat rule.
+			name:       "24Gi worker is the crossover and is unchanged",
+			cpuReq:     "8000m",
+			memReq:     "24Gi",
+			wantMem:    "18GB",
+			wantThread: 20,
+		},
+		{
+			name:       "pool default 120Gi worker is unchanged",
+			cpuReq:     "15",
+			memReq:     "120Gi",
+			wantMem:    "90GB",
+			wantThread: 38,
 		},
 		{
 			name:       "fractional CPU rounds multiplied threads up",
 			cpuReq:     "500m",
 			memReq:     "1Gi",
-			wantMem:    "768MB",
+			wantMem:    "614MB",
 			wantThread: 2,
 		},
 		{
@@ -223,4 +252,79 @@ func TestDuckDBThreadsForK8sCPU(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWorkerMemoryHeadroom_FloorAndCrossover pins the headroom rule itself:
+// max(25% of pod, min(6GiB, 40% of pod)).
+//
+// The load-bearing property is the crossover. Worker sizing is
+// percentage-based above 24Gi and floor-based below it, so every pod size the
+// fleet actually runs at scale — the 120Gi pool default and the 360Gi
+// client-profile ceiling — must keep byte-identical sizing to the flat-75%
+// rule this replaced. Only small pods may move.
+func TestWorkerMemoryHeadroom_FloorAndCrossover(t *testing.T) {
+	const gib = uint64(1024 * 1024 * 1024)
+
+	t.Run("floor binds below the crossover", func(t *testing.T) {
+		for _, tc := range []struct {
+			podGiB       uint64
+			wantHeadroom uint64
+		}{
+			{4, 4 * gib * 2 / 5}, // 40% cap: 1.6GiB
+			{8, 8 * gib * 2 / 5}, // 40% cap: 3.2GiB
+			{16, 6 * gib},        // absolute floor
+			{23, 6 * gib},        // still the floor
+		} {
+			got := workerMemoryHeadroomBytes(tc.podGiB * gib)
+			if got != tc.wantHeadroom {
+				t.Errorf("headroom(%dGi) = %d, want %d", tc.podGiB, got, tc.wantHeadroom)
+			}
+		}
+	})
+
+	t.Run("proportional reserve binds at and above the crossover", func(t *testing.T) {
+		for _, podGiB := range []uint64{24, 32, 64, 120, 360} {
+			pod := podGiB * gib
+			if got, want := workerMemoryHeadroomBytes(pod), pod/4; got != want {
+				t.Errorf("headroom(%dGi) = %d, want 25%% = %d", podGiB, got, want)
+			}
+		}
+	})
+
+	t.Run("sizing at and above the crossover is unchanged from the flat rule", func(t *testing.T) {
+		for _, podGiB := range []uint64{24, 32, 64, 120, 360} {
+			pod := podGiB * gib
+			flat := formatDuckDBBytes(pod * 3 / 4)
+			if got := duckdbMemoryLimitForPodMemory(pod); got != flat {
+				t.Errorf("duckdbMemoryLimitForPodMemory(%dGi) = %q, want %q (flat-75%% parity)", podGiB, got, flat)
+			}
+		}
+	})
+
+	t.Run("a 16Gi worker keeps enough margin for un-governed overhead", func(t *testing.T) {
+		// Regression for the mw-prod-us OOM: a reused 16Gi worker's RSS
+		// ratcheted to ~14.8GiB against a 12GiB limit. Headroom must now
+		// exceed the ~2.8GiB of overhead measured above the limit there.
+		const observedOvershoot = 2800 * 1024 * 1024
+		if got := workerMemoryHeadroomBytes(16 * gib); got <= observedOvershoot {
+			t.Errorf("headroom(16Gi) = %d, want > observed overshoot %d", got, observedOvershoot)
+		}
+	})
+
+	t.Run("zero is unsized", func(t *testing.T) {
+		if got := duckdbMemoryLimitForPodMemory(0); got != "" {
+			t.Errorf("duckdbMemoryLimitForPodMemory(0) = %q, want empty", got)
+		}
+	})
+}
+
+// formatDuckDBBytes mirrors duckdbMemoryLimitForPodMemory's formatting so the
+// parity assertion above compares sizing rules, not formatting.
+func formatDuckDBBytes(b uint64) string {
+	const gb = 1024 * 1024 * 1024
+	const mb = 1024 * 1024
+	if b >= gb {
+		return fmt.Sprintf("%dGB", b/gb)
+	}
+	return fmt.Sprintf("%dMB", b/mb)
 }

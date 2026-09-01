@@ -242,11 +242,25 @@ DML with RETURNING is rejected at extended-query Describe time with SQLSTATE `0A
 
 In the **control-plane remote/k8s backend** a worker pod serves **exactly one
 client query session at a time**. This is deliberate: `workerDuckDBLimits`
-(`controlplane/control.go`) gives the single session ~75% of the *whole pod's*
-RAM plus 2.5 DuckDB threads per requested CPU, rounded up. It does NOT divide
-by session count. Two sessions on one pod would each believe they own 75% →
-~150% overcommit → nondeterministic OOM /
+(`controlplane/control.go`) gives the single session the *whole pod's* RAM
+less a headroom reserve, plus 2.5 DuckDB threads per requested CPU, rounded
+up. It does NOT divide by session count. Two sessions on one pod would each
+believe they own the whole budget → ~200% overcommit → nondeterministic OOM /
 a heavy query killed by a co-resident one. Do not break the following:
+
+Headroom is `max(25% of pod, min(6GiB, 40% of pod))`
+(`workerMemoryHeadroomBytes`), not a flat percentage. The proportional term
+binds at and above 24Gi, so the 120Gi pool default and the 360Gi client-profile
+ceiling keep the sizing they have always had; the absolute floor binds below
+that. The reserve covers what `memory_limit` does not govern — DuckDB C++
+catalog objects, postgres_scanner/libpq result buffers, Arrow Flight batches,
+the Go runtime, page cache — and those allocations do not shrink with pod size.
+It is also cumulative: DuckDB does not return buffer-pool pages to the OS when
+a session ends, so a hot-idle worker's RSS ratchets across the sequential
+sessions it serves and settles near `memory_limit` + overhead. A flat 25% left
+a 16Gi pod ~2.2GiB of real margin and it was OOMKilled in mw-prod-us; the same
+overhead on a 120Gi pod sat inside 14.4GiB and survived. Size headroom by the
+absolute margin it has to absorb, never by percentage alone.
 
 - **One session per worker is enforced, not emergent.** The CP spawns remote
   worker pods with `DUCKGRES_DUCKDB_MAX_SESSIONS=1` (`k8s_pool.go::spawnWorker`).

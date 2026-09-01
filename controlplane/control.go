@@ -2191,8 +2191,9 @@ func authorizedClientSearchPath(searchPath string, policy *server.QueryAccessPol
 }
 
 // workerDuckDBLimits derives DuckDB memory_limit and threads from the worker
-// pod's K8s resource spec. Uses 75% of the worker's memory limit for DuckDB
-// and 2.5x the CPU request, rounded up, as the thread count. Returns empty/zero if worker
+// pod's K8s resource spec. Gives DuckDB the pod's memory less
+// workerMemoryHeadroomBytes, and 2.5x the CPU request, rounded up, as the
+// thread count. Returns empty/zero if worker
 // resources are not configured (DuckDB will then auto-detect on the worker).
 func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit string, threads int) {
 	// A non-default profile sizes DuckDB from the profile's pod shape, not the
@@ -2220,10 +2221,65 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 	return memLimit, threads
 }
 
+// Worker memory headroom: the part of a worker pod's RAM deliberately left
+// OUTSIDE DuckDB's memory_limit, for everything memory_limit does not govern
+// (DuckDB C++ catalog objects, postgres_scanner/libpq result buffers, Arrow
+// Flight batches in flight, the Go runtime, page cache).
+//
+// Headroom is a percentage floored by an absolute reserve, NOT a flat
+// percentage. A flat 25% shrinks the absolute margin linearly with pod size,
+// but the allocations it has to absorb do not shrink: one parquet row group,
+// one Arrow batch or one libpq result set is roughly the same size on a 16Gi
+// pod as on a 120Gi one. The un-governed overhead is also cumulative across
+// the sequential sessions a hot-idle worker serves — DuckDB does not return
+// buffer-pool pages to the OS when a session ends — so a reused small pod
+// ratchets toward memory_limit + overhead and the cgroup kills it there.
+//
+// Observed in mw-prod-us: 16Gi workers plateaued at ~14.8GiB RSS against a
+// 12GiB limit (2.2GiB of margin left) and were OOMKilled, while 120Gi workers
+// carrying the same overhead peaked at ~105GiB against a 90GiB limit and
+// survived on 14.4GiB of margin. Same percentage, very different safety.
+const (
+	// workerMemoryHeadroomNumerator/Denominator is the proportional reserve,
+	// unchanged from the historical flat rule so large pods keep today's sizing.
+	workerMemoryHeadroomNumerator   = 1
+	workerMemoryHeadroomDenominator = 4
+
+	// workerMinMemoryHeadroomBytes is the absolute floor the proportional
+	// reserve is raised to on small pods. Sized from the ~2-4GiB of
+	// un-governed overhead measured on production import workers.
+	workerMinMemoryHeadroomBytes uint64 = 6 * 1024 * 1024 * 1024
+
+	// workerMaxMemoryHeadroomNumerator/Denominator caps the floor's bite on very
+	// small pods, so a 4Gi or 8Gi worker still gets a usable DuckDB budget
+	// rather than being starved by a 6GiB reserve.
+	workerMaxMemoryHeadroomNumerator   = 2
+	workerMaxMemoryHeadroomDenominator = 5
+)
+
+// workerMemoryHeadroomBytes returns the bytes of a worker pod's RAM to keep
+// outside DuckDB's memory_limit:
+//
+//	max(25% of pod, min(6GiB, 40% of pod))
+//
+// The proportional term dominates at and above 24Gi, so every pod size at or
+// above that — including the 120Gi pool default and the 360Gi client-profile
+// ceiling — keeps byte-identical sizing to the previous flat-75% rule. Below
+// 24Gi the absolute floor takes over and buys back real margin.
+func workerMemoryHeadroomBytes(memBytes uint64) uint64 {
+	proportional := memBytes * workerMemoryHeadroomNumerator / workerMemoryHeadroomDenominator
+	floor := workerMinMemoryHeadroomBytes
+	if capped := memBytes * workerMaxMemoryHeadroomNumerator / workerMaxMemoryHeadroomDenominator; capped < floor {
+		floor = capped
+	}
+	if floor > proportional {
+		return floor
+	}
+	return proportional
+}
+
 // duckdbMemoryLimitForPodMemory formats the DuckDB memory_limit for a worker
-// pod of the given memory size: 75% of the pod, leaving the remainder as
-// headroom for everything memory_limit does NOT govern (DuckDB C++ catalog
-// objects, postgres_scanner/libpq result buffers, the Go runtime, page cache).
+// pod of the given memory size: the pod minus workerMemoryHeadroomBytes.
 // Returns "" when memBytes is 0/unparseable (DuckDB then auto-detects).
 // Shared between session sizing (workerDuckDBLimits) and the spawn-time
 // DUCKGRES_MEMORY_LIMIT env so the two can never disagree.
@@ -2231,7 +2287,7 @@ func duckdbMemoryLimitForPodMemory(memBytes uint64) string {
 	if memBytes == 0 {
 		return ""
 	}
-	duckdbBytes := memBytes * 3 / 4 // 75% of worker memory for DuckDB
+	duckdbBytes := memBytes - workerMemoryHeadroomBytes(memBytes)
 	const gb = 1024 * 1024 * 1024
 	const mb = 1024 * 1024
 	if duckdbBytes >= gb {
@@ -2245,7 +2301,8 @@ func duckdbMemoryLimitForPodMemory(memBytes uint64) string {
 // source-of-truth selection: a non-default profile sizes from the profile's pod
 // shape, falling back to the pool-global request. Returns (0, 0) when the size
 // is unconfigured (metering then skipped). NOTE: this is the *provisioned*
-// pod size (the full vCPU/GiB billed), NOT the 75%-of-RAM DuckDB memory_limit.
+// pod size (the full vCPU/GiB billed), NOT the headroom-adjusted DuckDB
+// memory_limit.
 func (cp *ControlPlane) workerBillingSize(profile *WorkerProfile) (millicores, mib int64) {
 	cpuReq := cp.cfg.K8s.WorkerCPURequest
 	memReq := cp.cfg.K8s.WorkerMemoryRequest

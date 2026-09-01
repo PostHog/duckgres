@@ -79,8 +79,9 @@ worker on a small query. On reuse, the worker's TTL is reset to the request's
 ttl and it transitions hot-idle → hot-active.
 
 DuckDB limits for the single session derive from the worker's **actual** size
-(75% of pod memory and 2.5 threads per requested CPU, rounded up) through
-`workerDuckDBLimits`, keyed off size rather than profile.
+(pod memory less `workerMemoryHeadroomBytes` — `max(25%, min(6GiB, 40%))` — and
+2.5 threads per requested CPU, rounded up) through `workerDuckDBLimits`, keyed
+off size rather than profile.
 
 ## Lifecycle
 
