@@ -245,22 +245,32 @@ client query session at a time**. This is deliberate: `workerDuckDBLimits`
 (`controlplane/control.go`) gives the single session the *whole pod's* RAM
 less a headroom reserve, plus 2.5 DuckDB threads per requested CPU, rounded
 up. It does NOT divide by session count. Two sessions on one pod would each
-believe they own the whole budget → ~200% overcommit → nondeterministic OOM /
-a heavy query killed by a co-resident one. Do not break the following:
+believe they own the whole budget → 125-150% of the pod's RAM committed →
+nondeterministic OOM / a heavy query killed by a co-resident one. Do not break
+the following:
 
 Headroom is `max(25% of pod, min(6GiB, 40% of pod))`
-(`workerMemoryHeadroomBytes`), not a flat percentage. The proportional term
-binds at and above 24Gi, so the 120Gi pool default and the 360Gi client-profile
-ceiling keep the sizing they have always had; the absolute floor binds below
-that. The reserve covers what `memory_limit` does not govern — DuckDB C++
-catalog objects, postgres_scanner/libpq result buffers, Arrow Flight batches,
-the Go runtime, page cache — and those allocations do not shrink with pod size.
-It is also cumulative: DuckDB does not return buffer-pool pages to the OS when
-a session ends, so a hot-idle worker's RSS ratchets across the sequential
-sessions it serves and settles near `memory_limit` + overhead. A flat 25% left
-a 16Gi pod ~2.2GiB of real margin and it was OOMKilled in mw-prod-us; the same
-overhead on a 120Gi pod sat inside 14.4GiB and survived. Size headroom by the
-absolute margin it has to absorb, never by percentage alone.
+(`workerMemoryHeadroomBytes`), not a flat percentage — 40% below 15Gi, exactly
+6GiB in `[15Gi, 24Gi)`, 25% at and above 24Gi. The 24Gi region is the old
+flat-75% rule exactly, so the 120Gi pool default and the 360Gi client-profile
+ceiling keep the sizing they have always had.
+
+The reserve covers what `memory_limit` does not govern — DuckDB C++ catalog
+objects, postgres_scanner/libpq result buffers, Arrow Flight batches, the Go
+runtime, page cache — and it is CUMULATIVE, not a per-query peak: DuckDB does
+not return buffer-pool pages to the OS when a session ends, so a hot-idle
+worker's RSS ratchets across the sequential sessions it serves and settles near
+`memory_limit` + overhead. In mw-prod-us a 16Gi worker ratcheted to 14.8GiB —
+2.8GiB past its 12GiB limit, 1.2GiB of pod left — and was OOMKilled, while
+120Gi workers ran 15.6GiB past a 90GiB limit inside 14.4GiB of remaining pod
+and were not. The overhead is not constant across pod sizes, but it grows
+sub-linearly, so a flat fraction leaves proportionally less usable margin the
+smaller the pod. Size headroom by the margin it must absorb, not by percentage
+alone.
+
+DuckDB budgets below the crossover are formatted in MB, not GB: truncating a
+fractional-GiB budget (8Gi - 40% = 4.8GiB) to whole GB would hand back the
+very margin the cap exists to reserve.
 
 - **One session per worker is enforced, not emergent.** The CP spawns remote
   worker pods with `DUCKGRES_DUCKDB_MAX_SESSIONS=1` (`k8s_pool.go::spawnWorker`).

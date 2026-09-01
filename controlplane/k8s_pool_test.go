@@ -4566,6 +4566,10 @@ func TestWorkerMemoryHygieneEnv(t *testing.T) {
 		// applies rather than a flat 25%: 512Mi - 40% = 307MB.
 		{"sub-GB pod formats MB", mk("500m", "512Mi"), map[string]string{
 			"DUCKGRES_MEMORY_LIMIT": "307MB", "GOMEMLIMIT": "64MiB", "DUCKGRES_THREADS": "2"}},
+		// Fractional-GiB budget must stay in MB: 8Gi - 40% = 4.8GiB. Emitting
+		// "4GB" here would turn the 40% reserve into 50%.
+		{"fractional-GiB budget is not truncated to whole GB", mk("4", "8Gi"), map[string]string{
+			"DUCKGRES_MEMORY_LIMIT": "4915MB", "GOMEMLIMIT": "1024MiB", "DUCKGRES_THREADS": "10"}},
 		{"no requests -> no env", corev1.ResourceRequirements{}, map[string]string{}},
 	}
 	for _, tc := range cases {

@@ -2226,33 +2226,45 @@ func (cp *ControlPlane) workerDuckDBLimits(profile *WorkerProfile) (memLimit str
 // (DuckDB C++ catalog objects, postgres_scanner/libpq result buffers, Arrow
 // Flight batches in flight, the Go runtime, page cache).
 //
-// Headroom is a percentage floored by an absolute reserve, NOT a flat
-// percentage. A flat 25% shrinks the absolute margin linearly with pod size,
-// but the allocations it has to absorb do not shrink: one parquet row group,
-// one Arrow batch or one libpq result set is roughly the same size on a 16Gi
-// pod as on a 120Gi one. The un-governed overhead is also cumulative across
-// the sequential sessions a hot-idle worker serves — DuckDB does not return
-// buffer-pool pages to the OS when a session ends — so a reused small pod
-// ratchets toward memory_limit + overhead and the cgroup kills it there.
+// That overhead is cumulative, not a per-query peak. DuckDB does not return
+// buffer-pool pages to the OS when a session ends, and a hot-idle worker
+// deliberately serves many SEQUENTIAL sessions (one at a time — see the Worker
+// Session Model contract), so RSS ratchets across them and settles near
+// memory_limit + overhead. Nothing resets between sessions.
 //
-// Observed in mw-prod-us: 16Gi workers plateaued at ~14.8GiB RSS against a
-// 12GiB limit (2.2GiB of margin left) and were OOMKilled, while 120Gi workers
-// carrying the same overhead peaked at ~105GiB against a 90GiB limit and
-// survived on 14.4GiB of margin. Same percentage, very different safety.
+// Measured in mw-prod-us. A 16Gi worker climbed 5.4 -> 7.3 -> 9.1 -> 11.9 ->
+// 13.1 -> 14.8GiB across ten sequential sessions, never dropping back, and was
+// OOMKilled: 2.8GiB above its 12GiB limit, 1.2GiB of pod left. Across the
+// fleet over 6h the 16Gi tier peaked at 13.8GiB (2.2GiB of pod left) while the
+// 120Gi tier peaked at 105.6GiB against a 90GiB limit (15.6GiB above it,
+// 14.4GiB of pod left) and was never OOMKilled.
+//
+// Note what those numbers do and do not say. The overhead is NOT constant:
+// 2.8GiB on the small pod vs 15.6GiB on the large one. But it grows
+// SUB-LINEARLY — 5.6x the overhead for 7.5x the pod — so a flat percentage
+// leaves proportionally less usable margin the smaller the pod gets. The small
+// pod burned ~70% of its 4GiB nominal reserve; the large pod ~52% of its
+// 30GiB. Reserving a flat fraction is what fails; the fix is to reserve more,
+// proportionally, as pods shrink.
 const (
 	// workerMemoryHeadroomNumerator/Denominator is the proportional reserve,
 	// unchanged from the historical flat rule so large pods keep today's sizing.
 	workerMemoryHeadroomNumerator   = 1
 	workerMemoryHeadroomDenominator = 4
 
-	// workerMinMemoryHeadroomBytes is the absolute floor the proportional
-	// reserve is raised to on small pods. Sized from the ~2-4GiB of
-	// un-governed overhead measured on production import workers.
+	// workerMinMemoryHeadroomBytes bounds the reserve in the band where the
+	// proportional term is still too thin but 40% would be wasteful. Because
+	// the cap below is 40%, this constant only binds for pods in
+	// [15Gi, 24Gi) — below 15Gi the 40% cap is the smaller of the two, and at
+	// or above 24Gi the 25% term already exceeds 6GiB. Raising it changes
+	// nothing outside that band.
 	workerMinMemoryHeadroomBytes uint64 = 6 * 1024 * 1024 * 1024
 
-	// workerMaxMemoryHeadroomNumerator/Denominator caps the floor's bite on very
-	// small pods, so a 4Gi or 8Gi worker still gets a usable DuckDB budget
-	// rather than being starved by a 6GiB reserve.
+	// workerMaxMemoryHeadroomNumerator/Denominator caps the reserve at 40% so
+	// a small pod is not handed an unusable budget. This is a judgement call,
+	// not a figure derived from the measurements above: on a pod of a few GiB
+	// no split survives multi-GiB overhead, and 40% is simply where we stopped
+	// trading budget for margin.
 	workerMaxMemoryHeadroomNumerator   = 2
 	workerMaxMemoryHeadroomDenominator = 5
 )
@@ -2262,10 +2274,15 @@ const (
 //
 //	max(25% of pod, min(6GiB, 40% of pod))
 //
-// The proportional term dominates at and above 24Gi, so every pod size at or
-// above that — including the 120Gi pool default and the 360Gi client-profile
-// ceiling — keeps byte-identical sizing to the previous flat-75% rule. Below
-// 24Gi the absolute floor takes over and buys back real margin.
+// Three regions, in increasing pod size:
+//
+//	< 15Gi        reserve 40% of the pod (the cap binds)
+//	15Gi .. 24Gi  reserve exactly 6GiB   (the floor binds)
+//	>= 24Gi       reserve 25% of the pod (the proportional term binds)
+//
+// At and above 24Gi that is the previous flat-75% rule exactly, so the 120Gi
+// pool default and the 360Gi client-profile ceiling keep the sizing they have
+// always had — byte-identical for any pod size expressible in Ki/Mi/Gi.
 func workerMemoryHeadroomBytes(memBytes uint64) uint64 {
 	proportional := memBytes * workerMemoryHeadroomNumerator / workerMemoryHeadroomDenominator
 	floor := workerMinMemoryHeadroomBytes
@@ -2290,7 +2307,13 @@ func duckdbMemoryLimitForPodMemory(memBytes uint64) string {
 	duckdbBytes := memBytes - workerMemoryHeadroomBytes(memBytes)
 	const gb = 1024 * 1024 * 1024
 	const mb = 1024 * 1024
-	if duckdbBytes >= gb {
+	// Format in GB only when the budget is a whole number of them. Below the
+	// 24Gi crossover the reserve is 40%, which lands on a fractional GiB for
+	// most pod sizes (8Gi -> 4.8GiB), and truncating that to "4GB" would
+	// silently turn a 40% reserve into 50% — giving back exactly the budget
+	// the cap exists to protect. MB granularity keeps the rule honest; the
+	// process-mode path already sizes in MB for the same reason.
+	if duckdbBytes >= gb && duckdbBytes%gb == 0 {
 		return fmt.Sprintf("%dGB", duckdbBytes/gb)
 	}
 	return fmt.Sprintf("%dMB", duckdbBytes/mb)
