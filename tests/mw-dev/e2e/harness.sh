@@ -3648,7 +3648,10 @@ reshard_post() { # org body
 reshard_wait_terminal() { # opid timeout_s -> echoes final state
   deadline=$(( $(date +%s) + ${2:-600} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    st="$(curl -fsS -H "$H" "$API/api/v1/reshards/$1" | jq -r .state)"
+    # A transient cluster-DNS failure must consume one poll, not curl's
+    # five-minute default resolution timeout and therefore the whole wait.
+    st="$(curl -fsS --connect-timeout 5 --max-time 15 -H "$H" \
+      "$API/api/v1/reshards/$1" 2>/dev/null | jq -r '.state // empty' 2>/dev/null || true)"
     case "$st" in succeeded|failed|cancelled) echo "$st"; return 0;; esac
     sleep 5
   done
@@ -3659,7 +3662,8 @@ reshard_wait_step() { # opid step timeout_s
   cur=""
   deadline=$(( $(date +%s) + ${3:-120} ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    cur="$(curl -fsS -H "$H" "$API/api/v1/reshards/$1" | jq -r .step)"
+    cur="$(curl -fsS --connect-timeout 5 --max-time 15 -H "$H" \
+      "$API/api/v1/reshards/$1" 2>/dev/null | jq -r '.step // empty' 2>/dev/null || true)"
     [ "$cur" = "$2" ] && return 0
     sleep 2
   done

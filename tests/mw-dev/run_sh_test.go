@@ -1215,6 +1215,28 @@ func TestReshardE2EUsesReachableDestinationAndForcesRollbackAfterPreflight(t *te
 	}
 }
 
+func TestReshardTerminalPollBoundsAndRetriesTransientAPIFailures(t *testing.T) {
+	raw, err := os.ReadFile("e2e/harness.sh")
+	if err != nil {
+		t.Fatalf("read e2e harness: %v", err)
+	}
+	script := string(raw)
+	start := strings.Index(script, "reshard_wait_terminal() {")
+	if start < 0 {
+		t.Fatal("could not find reshard_wait_terminal")
+	}
+	end := strings.Index(script[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("could not isolate reshard_wait_terminal")
+	}
+	body := script[start : start+end]
+	for _, want := range []string{"--connect-timeout", "--max-time", "|| true"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("reshard terminal poll must bound and retry transient API failures; missing %q", want)
+		}
+	}
+}
+
 func TestControlPlaneWorkerDefaultsAreConfigurable(t *testing.T) {
 	raw, err := os.ReadFile("manifests.tmpl.yaml")
 	if err != nil {
@@ -1537,6 +1559,37 @@ func TestTrinoKillQueryWorkloadHonorsSequenceLimit(t *testing.T) {
 		}
 		if limit > 10_000 {
 			t.Errorf("Trino sequence limit %d exceeds the engine maximum of 10000", limit)
+		}
+	}
+}
+
+func TestTrinoPasswordRotationAllowsSecretProjectionWindow(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	script := string(raw)
+
+	const minimumProjectionWindowSeconds = 150
+	values := make(map[string]int)
+	for _, match := range regexp.MustCompile(`(?m)^(TRINO_AUTH_ROTATION_ATTEMPTS|TRINO_AUTH_ROTATION_RETRY_SECONDS)=([0-9]+)$`).FindAllStringSubmatch(script, -1) {
+		value, err := strconv.Atoi(match[2])
+		if err != nil {
+			t.Fatalf("parse %s=%q: %v", match[1], match[2], err)
+		}
+		values[match[1]] = value
+	}
+	attempts := values["TRINO_AUTH_ROTATION_ATTEMPTS"]
+	retrySeconds := values["TRINO_AUTH_ROTATION_RETRY_SECONDS"]
+	if attempts*retrySeconds < minimumProjectionWindowSeconds {
+		t.Fatalf("Trino password rotation wait = %ds, want at least %ds for provisioner, kubelet Secret projection, and Trino reload", attempts*retrySeconds, minimumProjectionWindowSeconds)
+	}
+	for _, want := range []string{
+		`while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do`,
+		`sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Trino password rotation does not use bounded wait setting %q", want)
 		}
 	}
 }

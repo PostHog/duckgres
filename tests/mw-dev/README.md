@@ -505,6 +505,12 @@ id committed).
   failed auths (~15 min). The harness uses the provision-time password and
   settles one config-poll interval before connecting — keep it that way; a
   reset-password + tight retry loop will trip the ban.
+- **Trino password rotation is eventually consistent.** The Trino lane allows
+  up to 180 seconds for the control-plane reconcile, kubelet Secret-volume
+  projection, and Trino's password-file reload. If it times out, inspect the
+  control-plane reconcile and coordinator logs before rerunning; repeated
+  immediate authentication attempts do not make the mounted Secret refresh
+  faster.
 - **Teardown / recreate are now CR-synchronous.** `run.sh deploy`, `run.sh
   teardown`, and the in-harness same-org recreate all `kubectl wait --for=delete`
   on the Duckling CR, whose finalizers run the Crossplane DROP of the cnpg
@@ -519,11 +525,14 @@ id committed).
 - **Shared-infra contention.** Concurrent PRs provision real ducklings against
   the same cnpg-shards infra. Org-ID prefix keeps them
   distinct; watch quay.io / cnpg pooler limits under parallelism.
-- **Parallel-lane recovery.** The `full` and `reshard` jobs have matching
-  teardown matrix entries and `fail-fast: false`, so one lane failing does not
-  cancel the other or skip its cleanup. A cancelled workflow can still strand a
+- **Parallel-lane recovery.** Every matrix lane has a matching teardown entry
+  and `fail-fast: false`, so one lane failing does not cancel the others or skip
+  their cleanup. A cancelled workflow can still strand a
   lane temporarily; rerunning reaps that lane identity before deploy, and the
-  scheduled `e2e-cleanup` sweep remains the final backstop.
+  scheduled `e2e-cleanup` sweep remains the final backstop. Reshard status polls
+  bound each API attempt to 15 seconds and retry transient service-DNS failures;
+  a persistent outage still exhausts the operation's overall wait budget and
+  fails with the operation log.
 - **e2e-cleanup** is wired: the `e2e-mw-dev.yml` `schedule` trigger runs
   `run.sh e2e-cleanup` every 6h, reaping `duckgres-ci-pr-*` namespaces older than
   6h (`E2E_CLEANUP_MAX_AGE_HOURS`) along with their ducklings, cnpg role+db, Pod

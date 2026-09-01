@@ -22,6 +22,12 @@ TEAM_A=93001
 TEAM_B=93002
 SNI_SUFFIX=".ci.duckgres.local"
 CP_IP=""
+# Password rotation crosses the 10s provisioner reconcile, kubelet's
+# eventually-consistent Secret-volume projection, and Trino's 5s file reload.
+# Keep the total window above the expected projection delay while avoiding a
+# tight authentication loop against the coordinator.
+TRINO_AUTH_ROTATION_ATTEMPTS=36
+TRINO_AUTH_ROTATION_RETRY_SECONDS=5
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 log() { echo ">>> $*" >&2; }
@@ -248,11 +254,11 @@ log "password rotation"
 new_pw="$(api -X POST "$API/api/v1/orgs/$ORG_A/reset-password" | jq -r .password)"
 [ -n "$new_pw" ] && [ "$new_pw" != null ] || fail "password reset returned no password"
 i=0
-while [ "$i" -lt 30 ]; do
+while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
   trino_query "$DB_A" "$new_pw" 'SELECT 1' >/dev/null 2>&1 && break
-  sleep 2; i=$((i + 1))
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
 done
-[ "$i" -lt 30 ] || fail "rotated Trino password never became active"
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "rotated Trino password never became active"
 trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 && fail "old Trino password still authenticates"
 pw_a="$new_pw"
 
