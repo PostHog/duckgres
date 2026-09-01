@@ -1523,9 +1523,9 @@ assert_worker_pod() { # org password
   dmem="$worker_memory"
   case "$dcpu/$dmem" in
     # Pool default (DUCKGRES_K8S_WORKER_{CPU,MEMORY}_REQUEST).
-    750m/1536Mi) want_gomem="192MiB"; want_threads="2" ;;
+    750m/1536Mi) want_gomem="192MiB"; want_threads="2"; want_dml="921MB" ;;
     # Exploratory tier (DUCKGRES_EXPLORATORY_WORKER_{CPU,MEMORY}).
-    1/2Gi)        want_gomem="256MiB"; want_threads="3" ;;
+    1/2Gi)        want_gomem="256MiB"; want_threads="3"; want_dml="1228MB" ;;
     *) fail "unsized worker $pod requests cpu='$dcpu' memory='$dmem' — neither the pool default (750m/1536Mi) nor the exploratory shape (1/2Gi); BestEffort regression?" ;;
   esac
 
@@ -1533,11 +1533,15 @@ assert_worker_pod() { # org password
   # a pod-derived DuckDB memory_limit, a Go soft memory ceiling, and the thread
   # count at spawn — otherwise the worker sizes its base DB off the NODE's
   # /proc/meminfo and all pre-session work (DuckLake ATTACH, activation) runs
-  # effectively unbounded. Both shapes above derive DUCKGRES_MEMORY_LIMIT=1GB
-  # (75% of 1536Mi and of 2Gi both GB-floor to 1). DUCKGRES_THREADS is 2.5x
-  # CPU, rounded up: 750m -> 2 and 1 CPU -> 3.
+  # effectively unbounded. DUCKGRES_MEMORY_LIMIT is the pod less headroom
+  # (workerMemoryHeadroomBytes: max(25%, min(6GiB, 40%))). Both dev shapes sit
+  # far below the 24Gi crossover, so the 40% cap binds: 1536Mi - 40% = 921MB
+  # and 2Gi - 40% = 1228MB. Fractional-GiB budgets format in MB so the reserve
+  # is not truncated back. want_dml comes from the same case as the other two
+  # expectations above, so the shape tables cannot drift apart.
+  # DUCKGRES_THREADS is 2.5x CPU, rounded up: 750m -> 2 and 1 CPU -> 3.
   dml="$worker_memory_limit"
-  [ "$dml" = "1GB" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_MEMORY_LIMIT='$dml' want '1GB' (75% of pod memory, GB-floored)"
+  [ "$dml" = "$want_dml" ] || fail "unsized worker $pod ($dcpu/$dmem) DUCKGRES_MEMORY_LIMIT='$dml' want '$want_dml' (pod less max(25%, min(6GiB, 40%)) headroom, GB/MB-floored)"
   gml="$worker_go_memory_limit"
   [ "$gml" = "$want_gomem" ] || fail "unsized worker $pod ($dcpu/$dmem) GOMEMLIMIT='$gml' want '$want_gomem' (1/8 of pod memory)"
   thr="$worker_threads"
@@ -1605,6 +1609,22 @@ sized_worker() { # org password catalog cpu memory ttl
   [ "$rmem" = "$mem" ] || fail "sized worker $pod requests.memory='$rmem' want '$mem'"
   [ "$lcpu" = "$cpu" ] || fail "sized worker $pod limits.cpu='$lcpu' want '$cpu'"
   [ "$lmem" = "$mem" ] || fail "sized worker $pod limits.memory='$lmem' want '$mem'"
+  # The sized pod's DuckDB budget must follow the headroom rule for THAT pod,
+  # not a flat fraction: workerMemoryHeadroomBytes = max(25%, min(6GiB, 40%)).
+  # Regression gate for the mw-prod-us OOM class — a small worker sized at a
+  # flat 75% left too little absolute margin for the allocations memory_limit
+  # does not govern (Arrow Flight batches, libpq results, catalog, Go runtime),
+  # and a reused pod's RSS ratcheted into the cgroup limit and was OOMKilled.
+  # Fail-closed on an unknown shape rather than skipping: a silently-disabled
+  # gate is how this regression class comes back. Add the arm when you add a
+  # shape (assert_worker_pod's default arm does the same).
+  case "$mem" in
+    4Gi) want_sized_dml="2457MB" ;;   # 4Gi - 40% = 2.4GiB
+    6Gi) want_sized_dml="3686MB" ;;   # 6Gi - 40% = 3.6GiB
+    *)   fail "sized worker: no expected DUCKGRES_MEMORY_LIMIT for shape '$mem' — add it to this case rather than leaving the headroom gate dark" ;;
+  esac
+  sdml="$(k get pod "$pod" -o jsonpath="${WORKER_C}.env[?(@.name==\"DUCKGRES_MEMORY_LIMIT\")].value}" 2>/dev/null || true)"
+  [ "$sdml" = "$want_sized_dml" ] || fail "sized worker $pod ($cpu/$mem) DUCKGRES_MEMORY_LIMIT='$sdml' want '$want_sized_dml' (pod less max(25%, min(6GiB, 40%)) headroom, MB-formatted so the reserve is not truncated) — flat-percentage sizing regression"
   log "sized worker OK: $pod requests/limits cpu=$rcpu mem=$rmem"
 }
 
@@ -1892,8 +1912,8 @@ exploratory_state_pin() { # org password catalog target_cpu
 #    state in memory and cannot spill to the worker's temp_directory (unlike a
 #    hash aggregate or a sort, which DuckDB happily runs out-of-core), so a
 #    list of 200M BIGINTs (~1.6GB) is a hard "Out of Memory Error" against the
-#    small worker's 1GB memory_limit (75% of 2Gi, GB-floored) and comfortably
-#    fits the 6GB limit of the 2/8Gi escalation target.
+#    small worker's 1228MB memory_limit (2Gi less 40% headroom) and comfortably
+#    fits the 4915MB limit of the 2/8Gi escalation target.
 #  * The escalation is PROVEN, not inferred from the result. The CP logs
 #    `Escalated connection off exploratory worker.` with reason=oom and the
 #    org; we count those lines in the window this assertion ran. (The :9090
@@ -1913,7 +1933,7 @@ exploratory_oom_escalation() { # org password catalog
   sleep "${CONFIG_POLL_SETTLE:-12}"
 
   started="$(date +%s)"
-  # ~1.6GB of list state: OOMs the 1GB small worker, fits the 6GB target.
+  # ~1.6GB of list state: OOMs the 1228MB small worker, fits the 4915MB target.
   # array_length(x, 1) is PG spelling; the transpiler rewrites it to DuckDB len().
   q="SELECT array_length(list(i), 1) FROM range(200000000) t(i)"
   oomrc=0

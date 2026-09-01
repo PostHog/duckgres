@@ -566,8 +566,8 @@ func (p *K8sWorkerPool) workerPodEnv(secretName string, workerResources corev1.R
 		},
 		{
 			// One client query session per worker pod: the pod's full
-			// resources (workerDuckDBLimits gives the session ~75% of pod RAM
-			// + 2.5 DuckDB threads per requested CPU) belong to a single query,
+			// resources (workerDuckDBLimits gives the session the pod's RAM
+			// less headroom + 2.5 DuckDB threads per requested CPU) belong to a single query,
 			// so queries never
 			// contend and a heavy query can't be OOM'd by a co-resident
 			// one. The CP scheduler (OrgReservedPool) already never
@@ -588,8 +588,9 @@ func (p *K8sWorkerPool) workerPodEnv(secretName string, workerResources corev1.R
 	// worker's ConfigureMainDB falls back to sysinfo.AutoMemoryLimit(), which
 	// reads the NODE's /proc/meminfo — so all pre-session work (DuckLake
 	// ATTACH, activation, warmup, controlDB) runs with a memory_limit sized to
-	// the node, not the pod cgroup. Pass the pod-derived limit (same 75% the
-	// per-session SET uses, via duckdbMemoryLimitForPodMemory) and the CPU-derived
+	// the node, not the pod cgroup. Pass the pod-derived limit (the same
+	// headroom-adjusted value the per-session SET uses, via
+	// duckdbMemoryLimitForPodMemory) and the CPU-derived
 	// thread count so the base DB is correctly bounded from process start.
 	// GOMEMLIMIT (read by the Go runtime directly) gives the Go side a soft
 	// ceiling at 1/8 of the pod so GC pushes back before the cgroup OOM-kills;

@@ -124,7 +124,9 @@ Per statement, three outcomes:
 ### 4. Optimistic execution + re-execute fallback
 
 - Reads run on the small pod under its natural memory limit (existing
-  `workerDuckDBLimits`, ~75% of the small pod) plus an optional time budget.
+  `workerDuckDBLimits`; a small pod is below the 24Gi headroom crossover, so it
+  keeps `min(6GiB, 40%)` back rather than a flat 25%) plus an optional time
+  budget.
 - On OOM / budget exceeded: **iff no data rows have been streamed to the
   client**, the CP acquires a normal-size worker, re-executes, and streams
   from there — invisible to the client. If rows already went out, the error
