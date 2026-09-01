@@ -13,12 +13,14 @@ import (
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
 	pgdriver "github.com/posthog/duckgres/tests/perf/drivers/pgwire"
+	trinodriver "github.com/posthog/duckgres/tests/perf/drivers/trino"
 )
 
 const StepTypePerfQueries = "perf_queries"
 
 type DriverFactory interface {
 	NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error)
+	NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error)
 }
 
 type ExecutorConfig struct {
@@ -62,6 +64,9 @@ type stepSpec struct {
 	OutputSubdir      string
 	ReadOnly          bool
 	FailOnQueryErrors bool
+	TrinoSchema       string
+	TrinoCACertFile   string
+	TrinoStartup      trinodriver.StartupOptions
 }
 
 type defaultDriverFactory struct{}
@@ -136,7 +141,7 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		}
 	}
 
-	drivers, err := e.driversForCatalog(catalog, spec)
+	drivers, err := e.driversForCatalog(ctx, catalog, spec)
 	if err != nil {
 		return err
 	}
@@ -213,6 +218,14 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	if err != nil {
 		return stepSpec{}, err
 	}
+	trinoStartupTimeout, err := durationFromWith(step, "trino_startup_timeout")
+	if err != nil {
+		return stepSpec{}, err
+	}
+	trinoStartupPollInterval, err := durationFromWith(step, "trino_startup_poll_interval")
+	if err != nil {
+		return stepSpec{}, err
+	}
 
 	username := stringFromWith(step, "username", "root")
 	password := stringFromWith(step, "password", "")
@@ -242,6 +255,12 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		OutputSubdir:      stringFromWith(step, "output_subdir", "perf"),
 		ReadOnly:          boolFromWith(step, "read_only", true),
 		FailOnQueryErrors: boolFromWith(step, "fail_on_query_errors", true),
+		TrinoSchema:       stringFromWith(step, "trino_schema", "posthog"),
+		TrinoCACertFile:   stringFromWith(step, "trino_ca_cert_file", ""),
+		TrinoStartup: trinodriver.StartupOptions{
+			Timeout:      trinoStartupTimeout,
+			PollInterval: trinoStartupPollInterval,
+		},
 	}, nil
 }
 
@@ -264,7 +283,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolTrino:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -295,7 +314,7 @@ func restrictCatalogTargets(catalog perfcore.Catalog, targets []perfcore.Protoco
 	return catalog, nil
 }
 
-func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (map[perfcore.Protocol]perfcore.ProtocolDriver, error) {
+func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catalog, spec stepSpec) (map[perfcore.Protocol]perfcore.ProtocolDriver, error) {
 	drivers := make(map[perfcore.Protocol]perfcore.ProtocolDriver, len(catalog.Targets))
 	var success bool
 	defer func() {
@@ -318,12 +337,53 @@ func (e *Executor) driversForCatalog(catalog perfcore.Catalog, spec stepSpec) (m
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
 			drivers[target] = driver
+		case perfcore.ProtocolTrino:
+			connection, err := e.trinoConnection(spec)
+			if err != nil {
+				return nil, err
+			}
+			driver, err := e.driverFactory.NewTrino(ctx, connection)
+			if err != nil {
+				return nil, classified(ErrorClassConfig, fmt.Errorf("create Trino perf driver: %w", err))
+			}
+			drivers[target] = driver
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("unsupported perf target protocol %q", target))
 		}
 	}
 	success = true
 	return drivers, nil
+}
+
+func (e *Executor) trinoConnection(spec stepSpec) (trinodriver.ConnectionConfig, error) {
+	if e.provisionState == nil {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("provision state is required for Trino perf target"))
+	}
+	status, ok := e.provisionState.TrinoStatus(spec.OrgID)
+	if !ok {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("no Trino readiness state found for org %q; run wait_trino_ready before perf_queries", spec.OrgID))
+	}
+	if !status.Enabled || !status.Available || status.Status == nil ||
+		status.Status.State != provision.WarehouseStateReady ||
+		status.Cell.ID == "" || status.Status.Cell != status.Cell.ID {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q is incomplete; run wait_trino_ready before perf_queries", spec.OrgID))
+	}
+	if status.Cell.CoordinatorURL == "" {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no coordinator URL", spec.OrgID))
+	}
+	if status.Status.Principal == "" || status.Status.Catalog == "" {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no principal or catalog", spec.OrgID))
+	}
+	return trinodriver.ConnectionConfig{
+		ServerURL:  status.Cell.CoordinatorURL,
+		Username:   status.Status.Principal,
+		Password:   spec.Password,
+		Catalog:    status.Status.Catalog,
+		Schema:     spec.TrinoSchema,
+		Source:     "duckgres-perf",
+		CACertFile: spec.TrinoCACertFile,
+		Startup:    spec.TrinoStartup,
+	}, nil
 }
 
 func (e *Executor) pgwireConnection(spec stepSpec) (scenariosql.PGWireConnection, error) {
@@ -351,6 +411,10 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (
 		return nil, err
 	}
 	return pgdriver.NewWithDB(db), nil
+}
+
+func (defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+	return trinodriver.New(ctx, connection)
 }
 
 func requiredString(step core.Step, key string) (string, error) {
@@ -384,4 +448,20 @@ func boolFromWith(step core.Step, key string, fallback bool) bool {
 		}
 	}
 	return fallback
+}
+
+func durationFromWith(step core.Step, key string) (time.Duration, error) {
+	raw, ok := step.With[key]
+	if !ok {
+		return 0, nil
+	}
+	value, ok := raw.(string)
+	if !ok || value == "" {
+		return 0, classified(ErrorClassConfig, fmt.Errorf("step %s with.%s must be a positive duration string", step.ID, key))
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, classified(ErrorClassConfig, fmt.Errorf("step %s with.%s must be a positive duration string", step.ID, key))
+	}
+	return duration, nil
 }

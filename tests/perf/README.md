@@ -2,6 +2,21 @@
 
 This package contains the golden-query performance harness.
 
+## Protocol Drivers
+
+Catalogs may target `pgwire`, `trino`, or both. Both drivers execute the same
+rendered statement stored in the existing `pgwire_sql` catalog field; the
+legacy field name is retained for catalog compatibility and must not be used
+to create a second, protocol-specific query definition. Keep shared benchmark
+SQL within the intersection supported by DuckDB and Trino.
+
+The Trino driver requires an HTTPS coordinator and always verifies its TLS
+certificate. It uses system roots by default, or the explicitly configured CA
+certificate file for an isolated cluster. Before measurement it runs an
+authenticated `SELECT 1` outside query timing, retrying for up to 2 minutes at
+2-second intervals by default. This absorbs the bounded delay between Trino
+readiness, Kubernetes Secret projection, and file-authenticator refresh.
+
 ## Paired Query Catalogs
 
 Existing catalogs continue to use `queries:` unchanged. A catalog may contain

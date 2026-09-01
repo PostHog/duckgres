@@ -13,11 +13,11 @@ func NewIntentMatcher() *IntentMatcher {
 
 func (m *IntentMatcher) SQLFor(query Query, protocol Protocol) (string, error) {
 	switch protocol {
-	case ProtocolPGWire:
-		if strings.TrimSpace(query.PGWireSQL) == "" {
-			return "", fmt.Errorf("query %s missing pgwire_sql", query.QueryID)
+	case ProtocolPGWire, ProtocolTrino:
+		if strings.TrimSpace(query.CanonicalSQL()) == "" {
+			return "", fmt.Errorf("query %s missing canonical SQL", query.QueryID)
 		}
-		return query.PGWireSQL, nil
+		return query.CanonicalSQL(), nil
 	default:
 		return "", fmt.Errorf("unknown protocol %q", protocol)
 	}
