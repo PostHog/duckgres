@@ -74,11 +74,11 @@ use a `wait_trino_ready` step before a Trino workload:
 
 The step polls the authenticated org detail API (`GET
 /api/v1/orgs/:id/trino`) until Trino is enabled, its latest reconcile state is
-`ready`, and the control plane can reach the cell. It fails immediately when
-the reconcile state is `failed`, preserving `status_message` in the scenario
-error. The scenario runner defaults are a 15-minute timeout and 10-second poll
-interval; a step can override them with `timeout`, `poll_interval`, or
-`max_attempts`.
+`ready`, its principal and catalog are resolved for the reported cell, and the
+control plane can reach that cell. It fails immediately when the reconcile
+state is `failed`, preserving `status_message` in the scenario error. The
+scenario runner defaults are a 15-minute timeout and 10-second poll interval;
+a step can override them with `timeout`, `poll_interval`, or `max_attempts`.
 
 This readiness boundary deliberately does not claim that a newly projected
 tenant password has reloaded in Trino. Kubernetes Secret projection and the

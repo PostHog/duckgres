@@ -322,6 +322,72 @@ func TestClientWaitTrinoReadyPollsUntilEnabledAvailableAndReady(t *testing.T) {
 	}
 }
 
+func TestClientWaitTrinoReadyRequiresResolvedIdentityAndMatchingCell(t *testing.T) {
+	responses := []map[string]any{
+		{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":   "scenario-org",
+				"cell":  "cell-001",
+				"state": "ready",
+			},
+		},
+		{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":       "scenario-org",
+				"principal": "scenario-db",
+				"catalog":   "org_scenario_db",
+				"cell":      "cell-002",
+				"state":     "ready",
+			},
+		},
+		{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":       "scenario-org",
+				"principal": "scenario-db",
+				"catalog":   "org_scenario_db",
+				"cell":      "cell-001",
+				"state":     "ready",
+			},
+		},
+	}
+	polls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(responses[polls])
+		polls++
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	var sleeps int
+	status, err := client.WaitTrinoReady(context.Background(), "scenario-org", WaitOptions{
+		Sleep: func(context.Context, time.Duration) error {
+			sleeps++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("WaitTrinoReady returned error: %v", err)
+	}
+	if status.Status == nil || status.Status.Cell != status.Cell.ID {
+		t.Fatalf("Trino status = %+v, want matching cell assignment", status)
+	}
+	if polls != 3 || sleeps != 2 {
+		t.Fatalf("polls/sleeps = %d/%d, want 3/2", polls, sleeps)
+	}
+}
+
 func TestClientWaitTrinoReadyFailsFastOnFailed(t *testing.T) {
 	polls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

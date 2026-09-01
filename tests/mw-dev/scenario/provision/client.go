@@ -200,7 +200,7 @@ func (c *Client) WaitTrinoReady(ctx context.Context, orgID string, opts WaitOpti
 			return last, err
 		}
 		last = status
-		if status.Enabled && status.Available && status.Status != nil && status.Status.State == WarehouseStateReady {
+		if trinoReady(status) {
 			return status, nil
 		}
 		if status.Status != nil && status.Status.State == WarehouseStateFailed {
@@ -222,6 +222,18 @@ func (c *Client) WaitTrinoReady(ctx context.Context, orgID string, opts WaitOpti
 			return status, classified(ErrorClassProvisionAPI, fmt.Errorf("sleep while waiting for %s Trino readiness: %w", orgID, err))
 		}
 	}
+}
+
+func trinoReady(status TrinoStatus) bool {
+	if !status.Enabled || !status.Available || status.Status == nil {
+		return false
+	}
+	detail := status.Status
+	return detail.State == WarehouseStateReady &&
+		detail.Principal != "" &&
+		detail.Catalog != "" &&
+		status.Cell.ID != "" &&
+		detail.Cell == status.Cell.ID
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any, expectedStatus int) error {
