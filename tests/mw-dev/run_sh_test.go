@@ -1082,7 +1082,7 @@ func TestControlPlaneServiceDoesNotExposeFlight(t *testing.T) {
 	t.Fatal("duckgres-control-plane Service missing from manifests template")
 }
 
-func TestReshardLaneCanReadOnlyConfiguredShardProvisionerSecrets(t *testing.T) {
+func TestE2ELanesCanReadOnlyRequiredDucklingsSecrets(t *testing.T) {
 	raw, err := os.ReadFile("manifests.tmpl.yaml")
 	if err != nil {
 		t.Fatalf("read manifests template: %v", err)
@@ -1140,7 +1140,9 @@ func TestReshardLaneCanReadOnlyConfiguredShardProvisionerSecrets(t *testing.T) {
 	if got := strings.Join(stringSlice(rule["verbs"]), ","); got != "get" {
 		t.Fatalf("verbs = %q, want get", got)
 	}
-	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner" {
+	wantResourceNames := "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner," +
+		"cnpg-tenant-ci-pr-123-trinoa-password,cnpg-tenant-ci-pr-123-trinob-password"
+	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != wantResourceNames {
 		t.Fatalf("resourceNames = %q", got)
 	}
 	bindingMetadata := binding["metadata"].(map[string]any)
