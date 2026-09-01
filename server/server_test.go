@@ -31,6 +31,40 @@ func TestCancelQueryDoesNotLogSecretKey(t *testing.T) {
 	}
 }
 
+// TestDefaultControlPlaneIdleTimeout pins the control-plane idle-timeout
+// default. The value is a product decision, not an implementation detail: it
+// decides whether a client that pauses between statements keeps its connection.
+//
+// At 60s it did not. A batch client spreading its DAG over parallel
+// connections idles one whenever a thread waits on work elsewhere, so the
+// control plane closed it and the client reported a lost connection on its
+// next statement. A client cannot safely replay a write that may already have
+// committed, so that surfaced as a failed run rather than a reconnect.
+//
+// The floor is what matters here. Anything at or below a minute reintroduces
+// that failure; the exact value above it is a density trade-off operators can
+// make with --idle-timeout.
+func TestDefaultControlPlaneIdleTimeout(t *testing.T) {
+	if DefaultControlPlaneIdleTimeout != 5*time.Minute {
+		t.Errorf("DefaultControlPlaneIdleTimeout = %v, want 5m", DefaultControlPlaneIdleTimeout)
+	}
+	// A client that pauses between statements must survive the pause.
+	if DefaultControlPlaneIdleTimeout <= time.Minute {
+		t.Errorf(
+			"DefaultControlPlaneIdleTimeout = %v: at or below a minute a batch client "+
+				"loses idle connections between statements",
+			DefaultControlPlaneIdleTimeout,
+		)
+	}
+	// An abandoned connection still has to give its worker back promptly.
+	if DefaultControlPlaneIdleTimeout > 15*time.Minute {
+		t.Errorf(
+			"DefaultControlPlaneIdleTimeout = %v: too long to hold a pinned worker by default",
+			DefaultControlPlaneIdleTimeout,
+		)
+	}
+}
+
 func TestNormalizeIdleTimeout(t *testing.T) {
 	const def = 60 * time.Second
 	cases := []struct {

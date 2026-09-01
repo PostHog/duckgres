@@ -336,6 +336,13 @@ spec:
             # settle and two org-default-profile propagation waits — which drop
             # from 40s each to CONFIG_POLL_SETTLE (12s) on the back of it.
             - { name: DUCKGRES_CONFIG_POLL_INTERVAL, value: "5s" }
+            # Short connection idle timeout for CI only. The product default is
+            # server.DefaultControlPlaneIdleTimeout (5m), which would make
+            # conn_idle_timeout_reaps_session hold a connection for six minutes
+            # to observe one reap. The assertion is about the reap MECHANISM, so
+            # it is driven from an explicit value here; the default itself is
+            # pinned by TestDefaultControlPlaneIdleTimeout.
+            - { name: DUCKGRES_IDLE_TIMEOUT, value: "20s" }
             - name: DUCKGRES_INTERNAL_SECRET
               valueFrom: { secretKeyRef: { name: duckgres-tokens, key: internal-secret } }
             # Previous internal secrets still accepted during rotation; the
