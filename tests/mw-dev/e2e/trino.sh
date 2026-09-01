@@ -219,7 +219,7 @@ printf %s "$queries" | jq -e --arg a "$ORG_A" --arg table "$table" \
 log "tenant query visibility and audited admin kill"
 kill_out=/tmp/trino-kill-query.out
 ( trino_query "$DB_A" "$pw_a" \
-    'SELECT count(*) FROM UNNEST(sequence(1, 1000000)) a(x) CROSS JOIN UNNEST(sequence(1, 10000)) b(y) WHERE random() >= 0' \
+    'SELECT count(*) FROM UNNEST(sequence(1, 10000)) a(x) CROSS JOIN UNNEST(sequence(1, 10000)) b(y) CROSS JOIN UNNEST(sequence(1, 100)) c(z) WHERE random() >= 0' \
     >"$kill_out" 2>&1 ) & kill_pid=$!
 query_id=""; i=0
 while [ "$i" -lt 30 ]; do

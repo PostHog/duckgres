@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1516,6 +1517,26 @@ func TestTrinoHarnessBootstrapsDuckLakeBeforeCatalogQueries(t *testing.T) {
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("Trino DuckLake bootstrap is missing %q", want)
+		}
+	}
+}
+
+func TestTrinoKillQueryWorkloadHonorsSequenceLimit(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	matches := regexp.MustCompile(`sequence\(1,\s*([0-9]+)\)`).FindAllSubmatch(raw, -1)
+	if len(matches) < 3 {
+		t.Fatalf("long-query workload uses %d sequences, want at least three bounded factors", len(matches))
+	}
+	for _, match := range matches {
+		limit, err := strconv.Atoi(string(match[1]))
+		if err != nil {
+			t.Fatalf("parse sequence limit %q: %v", match[1], err)
+		}
+		if limit > 10_000 {
+			t.Errorf("Trino sequence limit %d exceeds the engine maximum of 10000", limit)
 		}
 	}
 }
