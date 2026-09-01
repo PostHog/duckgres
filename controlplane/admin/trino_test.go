@@ -412,6 +412,9 @@ func TestOrgsRenderWhenTheCoordinatorIsDown(t *testing.T) {
 	if first["org"] != "org-a" || first["catalog"] != "org_db_a" || first["principal"] != "db_a" {
 		t.Errorf("unexpected org row: %v", first)
 	}
+	if first["trino_catalog_name"] != "org_db_a" {
+		t.Errorf("trino_catalog_name = %v, want org_db_a", first["trino_catalog_name"])
+	}
 }
 
 // --------------------------------------------------------------------------
@@ -526,6 +529,9 @@ func TestOrgDetailSurfacesTheReconcileOutcome(t *testing.T) {
 		t.Fatalf("expected enabled, got %v", body)
 	}
 	st := body["status"].(map[string]any)
+	if st["trino_catalog_name"] != "org_db_b" {
+		t.Errorf("trino_catalog_name = %v, want org_db_b", st["trino_catalog_name"])
+	}
 	if st["state"] != "failed" {
 		t.Errorf("state = %v, want failed", st["state"])
 	}

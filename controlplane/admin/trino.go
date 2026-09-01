@@ -58,10 +58,11 @@ type TrinoOrgStatus struct {
 	Org string `json:"org"`
 	// Principal is the org's Trino username (its database_name), and the
 	// stem its catalog and groups are derived from.
-	Principal string `json:"principal"`
-	Catalog   string `json:"catalog"`
-	Tier      string `json:"tier"`
-	Cell      string `json:"cell"`
+	Principal        string `json:"principal"`
+	Catalog          string `json:"catalog"`
+	TrinoCatalogName string `json:"trino_catalog_name"`
+	Tier             string `json:"tier"`
+	Cell             string `json:"cell"`
 	// State is the most recent reconcile tick's outcome: pending /
 	// provisioning / ready / failed.
 	State         string     `json:"state"`
@@ -633,13 +634,14 @@ func trinoOrgStatus(o configstore.TrinoEnabledOrg, running, queued int) TrinoOrg
 		state = string(configstore.ManagedWarehouseStatePending)
 	}
 	return TrinoOrgStatus{
-		Org:            o.OrgID,
-		Principal:      principal,
-		Catalog:        catalog,
-		Tier:           o.Tier,
-		Cell:           o.CellID,
-		State:          state,
-		RunningQueries: running,
-		QueuedQueries:  queued,
+		Org:              o.OrgID,
+		Principal:        principal,
+		Catalog:          catalog,
+		TrinoCatalogName: catalog,
+		Tier:             o.Tier,
+		Cell:             o.CellID,
+		State:            state,
+		RunningQueries:   running,
+		QueuedQueries:    queued,
 	}
 }

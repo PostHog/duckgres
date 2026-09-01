@@ -84,7 +84,7 @@ Added for the console:
 | `POST /api/v1/trino/queries/:id/kill` | admin | fail a query with a reason (`PUT /v1/query/{id}/killed`). The reason reaches the TENANT as the query's error message. Audited as `trino.query.kill` with the owning org |
 | `GET /api/v1/trino/nodes` | viewer | the cell's fleet: `/v1/node` + `/v1/node/failed` where bound, else `/v1/announce` membership; the response names which (`source`) |
 | `GET /api/v1/trino/orgs` | viewer | per-org Trino provisioning state + that org's live query counts |
-| `GET /api/v1/orgs/:id/trino` | viewer | one org's Trino state; `enabled:false` for an org with no Trino row (not an error) |
+| `GET /api/v1/orgs/:id/trino` | viewer | one org's Trino state; `status.trino_catalog_name` is the provisioned catalog identifier, and `enabled:false` represents an org with no Trino row |
 | `GET /api/v1/audit` | admin | admin action log |
 | `GET /api/v1/operators` | admin | list console operators (email → role) |
 | `POST /api/v1/operators` | admin | add/update an operator (`{email, role}`; last-admin demotion → 409) |
