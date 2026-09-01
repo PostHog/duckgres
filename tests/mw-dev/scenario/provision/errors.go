@@ -21,7 +21,9 @@ const (
 var (
 	ErrUnexpectedStatus = errors.New("unexpected provisioning api status")
 	ErrWarehouseFailed  = errors.New("warehouse failed")
+	ErrTrinoFailed      = errors.New("trino provisioning failed")
 	ErrWaitTimeout      = errors.New("warehouse wait timeout")
+	ErrTrinoWaitTimeout = errors.New("trino wait timeout")
 )
 
 type classifiedError struct {

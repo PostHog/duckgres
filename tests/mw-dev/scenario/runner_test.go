@@ -857,7 +857,7 @@ type dispatchExecutor struct {
 
 func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error {
 	switch step.Type {
-	case provision.StepTypeProvisionWarehouse, provision.StepTypeWaitWarehouseReady, provision.StepTypeDeprovisionWarehouse:
+	case provision.StepTypeProvisionWarehouse, provision.StepTypeWaitWarehouseReady, provision.StepTypeWaitTrinoReady, provision.StepTypeDeprovisionWarehouse:
 		return e.provision.ExecuteStep(ctx, step)
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return e.sql.ExecuteStep(ctx, step)
@@ -879,7 +879,7 @@ func (e dispatchExecutor) StepResultMetadata(stepID string) (core.StepResultMeta
 
 func dispatchSupports(stepType string) bool {
 	switch stepType {
-	case provision.StepTypeProvisionWarehouse, provision.StepTypeWaitWarehouseReady, provision.StepTypeDeprovisionWarehouse:
+	case provision.StepTypeProvisionWarehouse, provision.StepTypeWaitWarehouseReady, provision.StepTypeWaitTrinoReady, provision.StepTypeDeprovisionWarehouse:
 		return true
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return true
