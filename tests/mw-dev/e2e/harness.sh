@@ -3049,12 +3049,19 @@ admin_per_org_workers() { # org password
 # TestMessageLoopIdleTimeoutClosesConnection) are the deterministic gate for
 # the mechanism; this proves it fires end-to-end in-cluster.
 #
-# The timeout is driven from DUCKGRES_IDLE_TIMEOUT=20s in manifests.tmpl.yaml,
-# NOT from the product default. The default is 5m (server.Default
-# ControlPlaneIdleTimeout), so riding it would cost six minutes of Job time per
-# run to watch one reap. What this test is for is the reap path, which is the
-# same at either value. TestDefaultControlPlaneIdleTimeout pins the default.
-# If you change the manifest value, change the two waits below with it.
+# This connection asks for its OWN short idle timeout with
+# duckgres.idle_timeout, allowed by DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX in
+# manifests.tmpl.yaml. It does not ride the product default, which is 5m
+# (server.DefaultControlPlaneIdleTimeout): riding that would cost six minutes
+# of Job time per run to watch one reap. What this test is for is the reap
+# path, which is the same at any value, and TestDefaultControlPlaneIdleTimeout
+# pins the default itself.
+#
+# Do NOT "simplify" this by shortening DUCKGRES_IDLE_TIMEOUT CP-wide instead.
+# admin_idle_session_flagged holds a connection idle-in-transaction for 30s and
+# admin_cancel_by_worker for up to 90s; a short CP-wide default reaps those
+# mid-assertion. Scoping the short timeout to this one connection is what keeps
+# them independent. It also gives the client-override path its only e2e cover.
 #
 # TIER AUDIT — the assertion's MEANING shifted, its mechanics did not. With
 # lazy acquisition an idle connection may hold NO session at all (nothing to
@@ -3075,7 +3082,7 @@ conn_idle_timeout_reaps_session() { # org password
   before="$(rootwids)"
   # Hold a connection idle-in-transaction for 90s (well past the 20s timeout):
   # send BEGIN, then keep stdin open so psql waits and issues no further query.
-  ( printf 'BEGIN;\n'; sleep 90 ) | PGPASSWORD="$pw" psql \
+  ( printf 'BEGIN;\n'; sleep 90 ) | PGOPTIONS="-c duckgres.idle_timeout=20s" PGPASSWORD="$pw" psql \
       "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
       -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
   bg=$!
@@ -3355,7 +3362,7 @@ admin_cancel_by_worker() { # org password
   log "admin: cancel a live session by worker id on $org"
   # Hold longer than the appear-poll budget (30×2s) so a slow cold-start can't
   # exit the client before the session is observed (we cancel it well before
-  # the 60s idle timeout anyway).
+  # the 5m idle timeout anyway).
   ( printf 'BEGIN;\n'; sleep 90 ) | PGPASSWORD="$pw" psql \
       "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
       -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
