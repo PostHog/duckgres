@@ -308,7 +308,10 @@ reset_pr_stack() {
   for org in $(ci_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
   delete_pod_identity
   delete_ci_bindings "$PR_NUMBER"
-  "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=300s
+  # Reshard runners intentionally get 600s to roll back safely on termination.
+  # A cancelled workflow can leave one in that grace period, so the next run's
+  # reset must wait longer instead of force-deleting it or timing out halfway.
+  "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=720s
 }
 
 cmd_deploy() {
@@ -742,8 +745,7 @@ cmd_diagnostics() {
   "${KUBECTL[@]}" -n "$NS" get pods,svc,job -o wide || true
   echo "::endgroup::"
   echo "::group::harness pod status (eviction / OOM / exit code)"
-  "${KUBECTL[@]}" -n "$NS" get pods -l job-name=duckgres-harness     -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase} reason={.status.reason} msg={.status.message} exit={.status.containerStatuses[0].state.terminated.exitCode} term-reason={.status.containerStatuses[0].state.terminated.reason}{"
-"}{end}' || true
+  "${KUBECTL[@]}" -n "$NS" get pods -l job-name=duckgres-harness     -o jsonpath='{range .items[*]}{.metadata.name} phase={.status.phase} reason={.status.reason} msg={.status.message} exit={.status.containerStatuses[0].state.terminated.exitCode} term-reason={.status.containerStatuses[0].state.terminated.reason}{"\n"}{end}' || true
   "${KUBECTL[@]}" -n "$NS" describe pods -l job-name=duckgres-harness 2>/dev/null | tail -30 || true
   echo "::endgroup::"
   echo "::group::control-plane logs (tail)"

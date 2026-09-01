@@ -5,6 +5,7 @@ set -eu
 trap 'rc=$?; [ "$rc" = 0 ] || echo "TRINO HARNESS EXIT rc=$rc" >&2' EXIT
 
 API="${CP_API:?}"
+PGHOST="${CP_PG_HOST:?}"
 SECRET="${INTERNAL_SECRET:?}"
 PR="${PR_NUMBER:?}"
 NS="${NAMESPACE:?}"
@@ -19,11 +20,15 @@ CAT_A="org_$(printf %s "$DB_A" | tr '-' '_')"
 CAT_B="org_$(printf %s "$DB_B" | tr '-' '_')"
 TEAM_A=93001
 TEAM_B=93002
+SNI_SUFFIX=".ci.duckgres.local"
+CP_IP=""
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 log() { echo ">>> $*" >&2; }
 apk add --no-cache curl jq >/dev/null 2>&1
 [ -s "$CA" ] || fail "per-run Trino CA is not mounted"
+CP_IP="$(getent hosts "$PGHOST" | awk '{print $1}' | head -1)"
+[ -n "$CP_IP" ] || fail "could not resolve $PGHOST"
 KUBECTL=/tmp/kubectl
 KUBECTL_VERSION=v1.33.1
 curl -fsSLo "$KUBECTL" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/arm64/kubectl"
@@ -31,6 +36,34 @@ chmod +x "$KUBECTL"
 "$KUBECTL" version --client >/dev/null || fail "pinned kubectl bootstrap failed"
 
 api() { curl -fsS -H "$H" "$@"; }
+
+# A fresh managed warehouse has an empty metadata database. DuckLake's Trino
+# connector consumes an existing DuckLake catalog; it does not create the
+# metadata tables itself. Initialize them once through Duckgres's normal
+# DuckLake activation path before asking Trino to use the catalog. This is
+# setup, not duplicated DuckDB coverage: all behavioral assertions below still
+# execute through Trino.
+bootstrap_ducklake() { # org password
+  attempt=0
+  while [ "$attempt" -lt 12 ]; do
+    if out="$(PGPASSWORD="$2" psql \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+        -v ON_ERROR_STOP=1 -tAc 'SELECT 1' 2>&1)" && [ "$out" = 1 ]; then
+      return 0
+    fi
+    case "$out" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|\
+      *"spawn sized worker"*|*"failed to detect attached catalogs"*) ;;
+      *) fail "DuckLake bootstrap failed for $1: $out" ;;
+    esac
+    log "DuckLake bootstrap worker not ready for $1; retrying"
+    sleep 15
+    attempt=$((attempt + 1))
+  done
+  fail "DuckLake bootstrap worker did not become ready for $1"
+}
 
 provision() { # org db team
   api -X POST -H 'Content-Type: application/json' \
@@ -96,6 +129,7 @@ log "provisioning first Trino tenant"
 pw_a="$(provision "$ORG_A" "$DB_A" "$TEAM_A" | jq -r .password)"
 [ -n "$pw_a" ] && [ "$pw_a" != null ] || fail "tenant A provision returned no password"
 wait_warehouse "$ORG_A"
+bootstrap_ducklake "$ORG_A" "$pw_a"
 wait_trino "$ORG_A" "$DB_A" "$CAT_A"
 
 log "TLS/password auth, discovery, and DDL/DML"
@@ -142,6 +176,7 @@ coord_uid_before="$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component
 pw_b="$(provision "$ORG_B" "$DB_B" "$TEAM_B" | jq -r .password)"
 [ -n "$pw_b" ] && [ "$pw_b" != null ] || fail "tenant B provision returned no password"
 wait_warehouse "$ORG_B"
+bootstrap_ducklake "$ORG_B" "$pw_b"
 wait_trino "$ORG_B" "$DB_B" "$CAT_B"
 [ "$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component=coordinator' -o jsonpath='{.items[0].metadata.uid}')" = "$coord_uid_before" ] \
   || fail "adding tenant B restarted the Trino coordinator"

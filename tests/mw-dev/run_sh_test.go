@@ -64,6 +64,42 @@ func TestDeployFailureDoesNotDumpDucklingYAML(t *testing.T) {
 	}
 }
 
+func TestDeployWaitsForReshardRollbackBeforeReusingNamespace(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	script := string(raw)
+	start := strings.Index(script, "reset_pr_stack() {")
+	end := strings.Index(script, "\ncmd_deploy() {")
+	if start < 0 || end <= start {
+		t.Fatal("could not isolate reset_pr_stack")
+	}
+	reset := script[start:end]
+	if !strings.Contains(reset, `delete namespace "$NS" --ignore-not-found --wait=true --timeout=720s`) {
+		t.Fatal("namespace reset must outlive the reshard runner's 600s rollback grace period")
+	}
+	for _, unsafe := range []string{"--force", "--grace-period=0"} {
+		if strings.Contains(reset, unsafe) {
+			t.Fatalf("namespace reset bypasses rollback-safe termination with %q", unsafe)
+		}
+	}
+}
+
+func TestDiagnosticsHarnessPodJSONPathParses(t *testing.T) {
+	raw, err := os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	match := regexp.MustCompile(`(?s)get pods -l job-name=duckgres-harness\s+-o jsonpath='([^']+)'`).FindSubmatch(raw)
+	if len(match) != 2 {
+		t.Fatal("diagnostics harness-pod JSONPath is missing")
+	}
+	if err := kjsonpath.New("diagnostics-harness-pod").Parse(string(match[1])); err != nil {
+		t.Fatalf("diagnostics harness-pod JSONPath does not parse: %v", err)
+	}
+}
+
 func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	fakes := newRunSHFakes(t)
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
@@ -1447,6 +1483,39 @@ func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T)
 	} {
 		if !strings.Contains(harness, want) {
 			t.Errorf("Trino harness missing live admin/detail cleanup contract %q", want)
+		}
+	}
+}
+
+func TestTrinoHarnessBootstrapsDuckLakeBeforeCatalogQueries(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatalf("read Trino harness: %v", err)
+	}
+	script := string(raw)
+
+	bootstrap := strings.Index(script, `bootstrap_ducklake "$ORG_A" "$pw_a"`)
+	firstCatalogQuery := strings.Index(script, `log "TLS/password auth, discovery, and DDL/DML"`)
+	if bootstrap < 0 {
+		t.Fatal("Trino harness does not initialize the fresh DuckLake metadata store through Duckgres")
+	}
+	if firstCatalogQuery < 0 || bootstrap >= firstCatalogQuery {
+		t.Fatal("fresh DuckLake metadata must be initialized before the first Trino catalog query")
+	}
+	warehouseB := strings.Index(script, `wait_warehouse "$ORG_B"`)
+	bootstrapB := strings.Index(script, `bootstrap_ducklake "$ORG_B" "$pw_b"`)
+	trinoB := strings.Index(script, `wait_trino "$ORG_B" "$DB_B" "$CAT_B"`)
+	if warehouseB < 0 || bootstrapB <= warehouseB || trinoB <= bootstrapB {
+		t.Fatal("hot-added tenant DuckLake metadata must be initialized after warehouse readiness and before Trino readiness")
+	}
+	for _, want := range []string{
+		`bootstrap_ducklake()`,
+		`dbname=ducklake`,
+		`host=$1$SNI_SUFFIX`,
+		`hostaddr=$CP_IP`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Trino DuckLake bootstrap is missing %q", want)
 		}
 	}
 }
