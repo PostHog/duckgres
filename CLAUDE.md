@@ -1577,6 +1577,33 @@ password/tenant/catalog changes never propagate.
   `opa.ManagedCatalogPattern`, and the regex literal inside `policy.rego`.
   `TestTrinoCatalogNameMatchesManagedNamePattern` +
   `TestPolicyRegoContainsManagedNamePattern` fail if any one moves alone.
+- **Every duckgres login authenticates to Trino, under `<database_name>.<username>`.**
+  `ListTrinoEnabledOrgs` returns the org's logins in `Users`, and
+  `BuildTrinoAuthFiles` writes one `password.db` line per login with the
+  bcrypt hash **copied through unchanged** — it is the same hash pgwire
+  verifies, so one password works on both engines and nothing is re-hashed or
+  minted. The bare `<database_name>` principal survives alongside them. Three
+  rules that are load-bearing rather than cosmetic: (1) usernames are
+  projected through an **allowlist** (`trinoUsernamePattern`) because
+  duckgres barely validates them and a `:`, `,` or newline would let whoever
+  can create org users append lines to `password.db` — including an admin
+  line; (2) `rejectPrincipalCollisions` now also holds back orgs that derive
+  the same Trino username, since the password file is ONE flat namespace per
+  cell and a duplicate line is a cross-tenant auth bug; (3) the resource-group
+  selector's `orgCaptureRegex` captures only up to the first `.`, or every
+  login gets a private leaf with the full per-tenant limits and an org with
+  ten logins holds ten times its budget.
+- **A project-scoped login (`project_reader` / `project_user`) joins
+  `scope_<org>_team_<id>`, NOT the org group.** The scope group owns the same
+  catalog in `group_catalogs` — so the cross-tenant check is the unchanged
+  check — and carries a `group_scopes` document that narrows it to that
+  team's schemas. Scopes only ever SUBTRACT; keep it that way if the rules are
+  restructured. The scope comes from `OrgUserQueryAccess`, the same derivation
+  the pgwire path uses, so Trino and DuckDB cannot disagree about it, and a
+  scoped row whose scope will not resolve is DROPPED rather than projected
+  unscoped. Scoped logins get **no write authority at all** — `project_user`
+  is read/write on pgwire and read-only here, a narrowing; making it writable
+  means gating writes per-schema, not per-catalog.
 - **The Rego policy is the tenant-isolation boundary.** The cell can assume
   every per-org duckling role, so nothing below OPA stops org A reading org
   B's catalog. Treat `provisioner/opa/policy.rego` as security review.

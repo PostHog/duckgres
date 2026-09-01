@@ -270,6 +270,7 @@ writable_catalog(catalog) if {
 	not is_admin
 	tenant_owns_catalog(catalog)
 	managed_catalog_name(catalog)
+	not holds_scoped_group
 }
 
 listable_catalog(catalog) if readable_catalog(catalog)
@@ -282,6 +283,101 @@ listable_catalog(catalog) if readable_catalog(catalog)
 listable_catalog(catalog) if {
 	is_admin
 	managed_catalog_name(catalog)
+}
+
+# ---------------------------------------------------------------------------
+# Project scopes: narrowing a group to part of the catalog it owns.
+#
+# A duckgres login can be bound to ONE project (team), in which case it reads
+# only that project's schemas rather than the whole org catalog. The control
+# plane projects such a login into a `scope_<org>_team_<id>` group, grants
+# that group the org's catalog in data.group_catalogs exactly like an unscoped
+# group, and ADDITIONALLY publishes a scope document for it under
+# data.group_scopes.
+#
+# The layering is deliberate and load-bearing: a scope only ever REMOVES
+# access. Every schema and table decision below still requires a group that
+# owns the catalog in data.group_catalogs, so the cross-tenant boundary is the
+# same rule it has always been, and a bug anywhere in this section can widen
+# access only WITHIN the org's own catalog -- never across tenants. That is
+# the property to preserve if these rules are ever restructured.
+#
+# Shape (every set is an object with value true so lookups stay O(1)):
+#
+#   data.group_scopes[g].schemas[<schema>]            whole schema readable
+#   data.group_scopes[g].relations["<schema>.<table>"] one table readable
+#   data.group_scopes[g].relation_schemas[<schema>]   a schema that appears in
+#                                                     `relations`, precomputed
+#                                                     so schema-level decisions
+#                                                     stay O(1) instead of
+#                                                     scanning `relations`
+#
+# A group with NO document under data.group_scopes is unscoped and sees the
+# whole catalog -- which is what every org's `org_<name>` group is, so the
+# unscoped tenant path is unchanged.
+#
+# Scoped identities get NO write authority (see writable_catalog): duckgres
+# has a read-only project login and a read/write one, and only the read-only
+# half is expressible here today. Denying writes to both is a narrowing of the
+# read/write login, never a widening of the read-only one.
+# ---------------------------------------------------------------------------
+
+# The requester's own groups that own `catalog`. Both branches below draw
+# their group from this set, so neither can authorize a catalog that no group
+# of the requester's owns.
+granting_groups(catalog) := {g |
+	some g in input.context.identity.groups
+	g != admin_group
+	g != observer_group
+	data.group_catalogs[g][catalog] == true
+}
+
+# A group is scoped iff the bundle carries a scope document for it.
+scoped_group(g) if data.group_scopes[g]
+
+# holds_scoped_group: the requester is in at least one project-scoped group.
+# Used to deny write authority outright rather than per-object.
+holds_scoped_group if {
+	some g in input.context.identity.groups
+	scoped_group(g)
+}
+
+# readable_schema / readable_table are the scope-aware counterparts of
+# readable_catalog. An unscoped granting group allows everything in its
+# catalog; a scoped one allows only what its document names.
+
+readable_schema(catalog, _) if admin_bundle_catalog(catalog)
+
+readable_schema(catalog, _) if {
+	some g in granting_groups(catalog)
+	not scoped_group(g)
+}
+
+readable_schema(catalog, schema) if {
+	some g in granting_groups(catalog)
+	data.group_scopes[g].schemas[schema] == true
+}
+
+readable_schema(catalog, schema) if {
+	some g in granting_groups(catalog)
+	data.group_scopes[g].relation_schemas[schema] == true
+}
+
+readable_table(catalog, _, _) if admin_bundle_catalog(catalog)
+
+readable_table(catalog, _, _) if {
+	some g in granting_groups(catalog)
+	not scoped_group(g)
+}
+
+readable_table(catalog, schema, _) if {
+	some g in granting_groups(catalog)
+	data.group_scopes[g].schemas[schema] == true
+}
+
+readable_table(catalog, schema, table) if {
+	some g in granting_groups(catalog)
+	data.group_scopes[g].relations[concat(".", [schema, table])] == true
 }
 
 # ---------------------------------------------------------------------------
@@ -319,12 +415,18 @@ allow if {
 
 allow if {
 	input.action.operation == "FilterSchemas"
-	readable_catalog(input.action.resource.schema.catalogName)
+	readable_schema(
+		input.action.resource.schema.catalogName,
+		input.action.resource.schema.schemaName,
+	)
 }
 
 allow if {
 	input.action.operation == "ShowTables"
-	readable_catalog(input.action.resource.schema.catalogName)
+	readable_schema(
+		input.action.resource.schema.catalogName,
+		input.action.resource.schema.schemaName,
+	)
 }
 
 # DuckLake schema DDL. Rename checks BOTH resource and targetResource even
@@ -350,22 +452,38 @@ allow if {
 
 allow if {
 	input.action.operation == "SelectFromColumns"
-	readable_catalog(input.action.resource.table.catalogName)
+	readable_table(
+		input.action.resource.table.catalogName,
+		input.action.resource.table.schemaName,
+		input.action.resource.table.tableName,
+	)
 }
 
 allow if {
 	input.action.operation == "FilterTables"
-	readable_catalog(input.action.resource.table.catalogName)
+	readable_table(
+		input.action.resource.table.catalogName,
+		input.action.resource.table.schemaName,
+		input.action.resource.table.tableName,
+	)
 }
 
 allow if {
 	input.action.operation == "ShowColumns"
-	readable_catalog(input.action.resource.table.catalogName)
+	readable_table(
+		input.action.resource.table.catalogName,
+		input.action.resource.table.schemaName,
+		input.action.resource.table.tableName,
+	)
 }
 
 allow if {
 	input.action.operation == "FilterColumns"
-	readable_catalog(input.action.resource.table.catalogName)
+	readable_table(
+		input.action.resource.table.catalogName,
+		input.action.resource.table.schemaName,
+		input.action.resource.table.tableName,
+	)
 }
 
 # DuckLake table and view DDL/DML. MERGE and CTAS are composed by Trino from
@@ -444,13 +562,20 @@ batch contains i if {
 batch contains i if {
 	some i
 	input.action.operation == "FilterSchemas"
-	readable_catalog(input.action.filterResources[i].schema.catalogName)
+	readable_schema(
+		input.action.filterResources[i].schema.catalogName,
+		input.action.filterResources[i].schema.schemaName,
+	)
 }
 
 batch contains i if {
 	some i
 	input.action.operation == "FilterTables"
-	readable_catalog(input.action.filterResources[i].table.catalogName)
+	readable_table(
+		input.action.filterResources[i].table.catalogName,
+		input.action.filterResources[i].table.schemaName,
+		input.action.filterResources[i].table.tableName,
+	)
 }
 
 # FilterColumns is the one operation whose indices point into the candidate's
@@ -459,7 +584,11 @@ batch contains i if {
 batch contains i if {
 	input.action.operation == "FilterColumns"
 	count(input.action.filterResources) == 1
-	readable_catalog(input.action.filterResources[0].table.catalogName)
+	readable_table(
+		input.action.filterResources[0].table.catalogName,
+		input.action.filterResources[0].table.schemaName,
+		input.action.filterResources[0].table.tableName,
+	)
 	some i, _ in input.action.filterResources[0].table.columns
 }
 

@@ -3,6 +3,7 @@ package configstore
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"gorm.io/gorm"
@@ -188,9 +189,15 @@ func (cs *ConfigStore) DisableTrino(orgID string) error {
 }
 
 // ListTrinoEnabledOrgs returns every org with ManagedWarehouseTrino.Enabled
-// = true joined against its `root` OrgUser row. The provisioner needs the
-// bcrypt hash to project the Trino password file, so this is a single join
-// rather than two round-trips.
+// = true joined against its `root` OrgUser row, each carrying the org's full
+// set of projectable logins in Users. The provisioner needs the bcrypt hashes
+// to project the Trino password file.
+//
+// The `root` join stays because database_name alone remains a principal in
+// its own right (TrinoPrincipal) for service-to-service use and for every
+// client configured before per-user logins existed. Users is the ADDITIONAL
+// per-human projection; root therefore appears twice, as `<db>` and as
+// `<db>.root`, and both authenticate against the same hash.
 //
 // Orgs that are Trino-enabled but have no `root` OrgUser are skipped — that
 // shape can't legitimately happen via the provisioning API (CreateOrgUser
@@ -229,7 +236,92 @@ func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list trino-enabled orgs: %w", err)
 	}
+	if len(out) == 0 {
+		return out, nil
+	}
+	if err := cs.attachTrinoOrgUsers(out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// trinoOrgUserRow is one (org, login) pair from the second listing query.
+type trinoOrgUserRow struct {
+	OrgID      string
+	Username   string
+	Password   string
+	AccessMode string
+	TeamID     *int64
+}
+
+// attachTrinoOrgUsers loads every projectable duckgres login for the listed
+// orgs and hangs it off the matching TrinoEnabledOrg.
+//
+// A second query rather than a widened join: the outer listing is one row per
+// org and the provisioner's per-org steps (catalog, tenant password, state)
+// all key on that shape, so fanning it out to one row per user would make
+// every caller de-duplicate. One extra round trip per reconcile tick is not
+// a cost worth that.
+//
+// Two rows are excluded in SQL, both fail-closed:
+//
+//   - disabled = true. duckgres_org_users.disabled is the per-user kill
+//     switch. Trino learns about a flip only when the projected Secret is
+//     re-read (kubelet sync + the group provider's file.refresh-period), so
+//     a disable takes effect here in up to a couple of minutes rather than
+//     instantly as it does on pgwire. That lag is worth stating wherever the
+//     kill switch is surfaced to operators; it is not a reason to leave the
+//     row out of the exclusion.
+//   - a blank password. There is no hash to project and Trino would reject
+//     the line anyway.
+//
+// Project-scoped logins ARE included, and carry their scope. The scope is
+// read through OrgUserQueryAccess -- the SAME derivation the pgwire session
+// path uses -- so Trino and DuckDB can never disagree about which schemas a
+// project login may read. A scoped row whose scope cannot be resolved is
+// dropped rather than projected unscoped: an unresolvable scope must never
+// silently widen into org-wide access.
+func (cs *ConfigStore) attachTrinoOrgUsers(orgs []TrinoEnabledOrg) error {
+	ids := make([]string, 0, len(orgs))
+	for _, o := range orgs {
+		ids = append(ids, o.OrgID)
+	}
+	var rows []trinoOrgUserRow
+	err := cs.db.Table("duckgres_org_users").
+		Select("org_id, username, password, access_mode, team_id").
+		Where("org_id IN ?", ids).
+		Where("disabled = ?", false).
+		Where("password <> ''").
+		Order("org_id ASC, username ASC").
+		Scan(&rows).Error
+	if err != nil {
+		return fmt.Errorf("list trino org users: %w", err)
+	}
+
+	byOrg := make(map[string][]TrinoOrgUser, len(orgs))
+	for _, r := range rows {
+		u := TrinoOrgUser{Username: r.Username, PasswordHash: r.Password}
+		if IsProjectScopedAccessMode(r.AccessMode) {
+			access, scoped := cs.OrgUserQueryAccess(r.OrgID, r.Username)
+			if !scoped || r.TeamID == nil {
+				// The row says scoped but the snapshot does not agree --
+				// an unloaded or stale snapshot, or a user written since
+				// the last poll. Projecting it now would grant the whole
+				// org catalog to a login that must only see one project.
+				// Drop it; the next tick projects it once both agree.
+				slog.Warn("Trino: skipping project-scoped login whose scope is unresolved.",
+					"org", r.OrgID, "user", r.Username, "access_mode", r.AccessMode)
+				continue
+			}
+			u.Scope = &access
+			u.TeamID = r.TeamID
+		}
+		byOrg[r.OrgID] = append(byOrg[r.OrgID], u)
+	}
+	for i := range orgs {
+		orgs[i].Users = byOrg[orgs[i].OrgID]
+	}
+	return nil
 }
 
 // GetManagedWarehouseTrino reads the Trino row for an org. Returns
