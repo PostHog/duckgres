@@ -1181,6 +1181,7 @@ func TestE2ELanesCanReadOnlyRequiredDucklingsSecrets(t *testing.T) {
 		t.Fatalf("verbs = %q, want get", got)
 	}
 	wantResourceNames := "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner," +
+		"cnpg-tenant-ci-pr-123-cnpg-password," +
 		"cnpg-tenant-ci-pr-123-trinoa-password,cnpg-tenant-ci-pr-123-trinob-password"
 	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != wantResourceNames {
 		t.Fatalf("resourceNames = %q", got)
