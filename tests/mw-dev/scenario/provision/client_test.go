@@ -204,6 +204,192 @@ func TestClientWaitWarehouseReadyFailsFastOnFailed(t *testing.T) {
 	}
 }
 
+func TestClientTrinoStatusUsesOrgDetailEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("method = %s, want GET", r.Method)
+		}
+		if r.URL.Path != "/api/v1/orgs/scenario-org/trino" {
+			t.Fatalf("path = %s, want org Trino detail path", r.URL.Path)
+		}
+		if got := r.Header.Get("X-Duckgres-Internal-Secret"); got != "internal-secret" {
+			t.Fatalf("internal secret header = %q, want internal-secret", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":                "scenario-org",
+				"principal":          "scenario-db",
+				"catalog":            "org_scenario_db",
+				"trino_catalog_name": "org_scenario_db",
+				"tier":               "free",
+				"cell":               "cell-001",
+				"state":              "ready",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		BaseURL:        server.URL,
+		InternalSecret: "internal-secret",
+		HTTPClient:     server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	status, err := client.TrinoStatus(context.Background(), "scenario-org")
+	if err != nil {
+		t.Fatalf("TrinoStatus returned error: %v", err)
+	}
+	if !status.Enabled || !status.Available || status.Status == nil {
+		t.Fatalf("Trino status = %+v, want enabled and available detail", status)
+	}
+	if status.Status.Principal != "scenario-db" || status.Status.Catalog != "org_scenario_db" {
+		t.Fatalf("Trino identity = %+v, want scenario-db/org_scenario_db", status.Status)
+	}
+}
+
+func TestClientWaitTrinoReadyPollsUntilEnabledAvailableAndReady(t *testing.T) {
+	responses := []map[string]any{
+		{
+			"cell":    map[string]any{"id": "cell-001"},
+			"enabled": false,
+		},
+		{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":   "scenario-org",
+				"state": "pending",
+			},
+		},
+		{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": false,
+			"status": map[string]any{
+				"org":   "scenario-org",
+				"state": "ready",
+			},
+		},
+		{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":       "scenario-org",
+				"principal": "scenario-db",
+				"catalog":   "org_scenario_db",
+				"cell":      "cell-001",
+				"state":     "ready",
+			},
+		},
+	}
+	polls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(responses[polls])
+		polls++
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	var sleeps []time.Duration
+	status, err := client.WaitTrinoReady(context.Background(), "scenario-org", WaitOptions{
+		PollInterval: 25 * time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			sleeps = append(sleeps, d)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("WaitTrinoReady returned error: %v", err)
+	}
+	if status.Status == nil || status.Status.State != WarehouseStateReady {
+		t.Fatalf("Trino status = %+v, want ready detail", status)
+	}
+	if polls != 4 {
+		t.Fatalf("polls = %d, want 4", polls)
+	}
+	if len(sleeps) != 3 {
+		t.Fatalf("sleeps = %#v, want three sleeps", sleeps)
+	}
+}
+
+func TestClientWaitTrinoReadyFailsFastOnFailed(t *testing.T) {
+	polls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		polls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":            "scenario-org",
+				"state":          "failed",
+				"status_message": "catalog projection failed",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	_, err = client.WaitTrinoReady(context.Background(), "scenario-org", WaitOptions{
+		Sleep: func(context.Context, time.Duration) error {
+			t.Fatal("sleep should not be called for failed Trino state")
+			return nil
+		},
+	})
+	if !errors.Is(err, ErrTrinoFailed) {
+		t.Fatalf("WaitTrinoReady error = %v, want ErrTrinoFailed", err)
+	}
+	if polls != 1 {
+		t.Fatalf("polls = %d, want 1", polls)
+	}
+	if !strings.Contains(err.Error(), "catalog projection failed") {
+		t.Fatalf("error = %v, want status message", err)
+	}
+}
+
+func TestClientWaitTrinoReadyReportsUnavailableTimeout(t *testing.T) {
+	polls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		polls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"enabled":   true,
+			"available": false,
+			"status": map[string]any{
+				"org":   "scenario-org",
+				"state": "ready",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	_, err = client.WaitTrinoReady(context.Background(), "scenario-org", WaitOptions{
+		MaxAttempts: 2,
+		Sleep:       func(context.Context, time.Duration) error { return nil },
+	})
+	if !errors.Is(err, ErrTrinoWaitTimeout) {
+		t.Fatalf("WaitTrinoReady error = %v, want ErrTrinoWaitTimeout", err)
+	}
+	if polls != 2 {
+		t.Fatalf("polls = %d, want 2", polls)
+	}
+}
+
 func TestClientDeprovisionSendsExpectedRequest(t *testing.T) {
 	called := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

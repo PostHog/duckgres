@@ -14,6 +14,7 @@ import (
 const (
 	StepTypeProvisionWarehouse   = "provision_warehouse"
 	StepTypeWaitWarehouseReady   = "wait_warehouse_ready"
+	StepTypeWaitTrinoReady       = "wait_trino_ready"
 	StepTypeDeprovisionWarehouse = "deprovision_warehouse"
 )
 
@@ -33,6 +34,7 @@ type State struct {
 	mu                 sync.Mutex
 	provisionResponses map[string]ProvisionResponse
 	statuses           map[string]WarehouseStatus
+	trinoStatuses      map[string]TrinoStatus
 }
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
@@ -51,6 +53,7 @@ func NewState() *State {
 	return &State{
 		provisionResponses: make(map[string]ProvisionResponse),
 		statuses:           make(map[string]WarehouseStatus),
+		trinoStatuses:      make(map[string]TrinoStatus),
 	}
 }
 
@@ -80,6 +83,19 @@ func (s *State) Status(orgID string) (WarehouseStatus, bool) {
 	return status, ok
 }
 
+func (s *State) StoreTrinoStatus(orgID string, status TrinoStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.trinoStatuses[orgID] = status
+}
+
+func (s *State) TrinoStatus(orgID string) (TrinoStatus, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status, ok := s.trinoStatuses[orgID]
+	return status, ok
+}
+
 func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 	if e.client == nil {
 		return classified(ErrorClassConfig, fmt.Errorf("provision executor client is required"))
@@ -89,11 +105,30 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		return e.executeProvision(ctx, step)
 	case StepTypeWaitWarehouseReady:
 		return e.executeWaitReady(ctx, step)
+	case StepTypeWaitTrinoReady:
+		return e.executeWaitTrinoReady(ctx, step)
 	case StepTypeDeprovisionWarehouse:
 		return e.executeDeprovision(ctx, step)
 	default:
 		return classified(ErrorClassUnsupportedStep, fmt.Errorf("unsupported provision step type %q", step.Type))
 	}
+}
+
+func (e *Executor) executeWaitTrinoReady(ctx context.Context, step core.Step) error {
+	orgID, err := requiredString(step, "org_id")
+	if err != nil {
+		return err
+	}
+	opts, err := e.waitOptionsForStep(step)
+	if err != nil {
+		return err
+	}
+	status, err := e.client.WaitTrinoReady(ctx, orgID, opts)
+	if err != nil {
+		return err
+	}
+	e.state.StoreTrinoStatus(orgID, status)
+	return nil
 }
 
 func (e *Executor) executeProvision(ctx context.Context, step core.Step) error {

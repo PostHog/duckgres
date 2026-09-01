@@ -57,6 +57,37 @@ The isolated control plane's default worker request is configurable through
 `scenario-dev.yml` explicitly overrides them to 2 CPU and 8Gi for the frozen
 perf workload. Direct `run.sh` callers can make the same explicit override.
 
+### Scenario Trino readiness
+
+Scenarios that opt an org into Trino in their `provision_warehouse` request can
+use a `wait_trino_ready` step before a Trino workload:
+
+```yaml
+- id: wait_trino_ready
+  type: wait_trino_ready
+  depends_on: [wait_ready]
+  with:
+    org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+    timeout: 5m
+    poll_interval: 5s
+```
+
+The step polls the authenticated org detail API (`GET
+/api/v1/orgs/:id/trino`) until Trino is enabled, its latest reconcile state is
+`ready`, and the control plane can reach the cell. It fails immediately when
+the reconcile state is `failed`, preserving `status_message` in the scenario
+error. The scenario runner defaults are a 15-minute timeout and 10-second poll
+interval; a step can override them with `timeout`, `poll_interval`, or
+`max_attempts`.
+
+This readiness boundary deliberately does not claim that a newly projected
+tenant password has reloaded in Trino. Kubernetes Secret projection and the
+file authenticator refresh can lag the reconcile state, so the first
+authenticated Trino query must still retry within its own bounded startup
+window. On failure, inspect the org detail response first: `failed` is a
+catalog/projection failure, while `ready` plus `available: false` points to the
+cell or its observer credentials.
+
 ## Isolated Trino lane
 
 The Trino lane never uses the shared mw-dev Trino namespace or coordinator.

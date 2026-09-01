@@ -63,6 +63,37 @@ type WarehouseStatus struct {
 	Bucket             string             `json:"bucket,omitempty"`
 }
 
+// TrinoStatus is the org-scoped admin API envelope returned by
+// GET /api/v1/orgs/:id/trino. The Status detail is absent while Trino is not
+// enabled; once enabled it carries the provisioner's authoritative lifecycle
+// state and the derived tenant identity.
+type TrinoStatus struct {
+	Cell      TrinoCell       `json:"cell"`
+	Enabled   bool            `json:"enabled"`
+	Available bool            `json:"available"`
+	Status    *TrinoOrgStatus `json:"status,omitempty"`
+}
+
+type TrinoCell struct {
+	ID             string `json:"id"`
+	CoordinatorURL string `json:"coordinator_url,omitempty"`
+}
+
+type TrinoOrgStatus struct {
+	Org              string     `json:"org"`
+	Principal        string     `json:"principal"`
+	Catalog          string     `json:"catalog"`
+	TrinoCatalogName string     `json:"trino_catalog_name"`
+	Tier             string     `json:"tier"`
+	Cell             string     `json:"cell"`
+	State            string     `json:"state"`
+	StatusMessage    string     `json:"status_message,omitempty"`
+	ReadyAt          *time.Time `json:"ready_at,omitempty"`
+	FailedAt         *time.Time `json:"failed_at,omitempty"`
+	RunningQueries   int        `json:"running_queries"`
+	QueuedQueries    int        `json:"queued_queries"`
+}
+
 type ConnectionDetails struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
@@ -115,6 +146,14 @@ func (c *Client) WarehouseStatus(ctx context.Context, orgID string) (WarehouseSt
 	return resp, nil
 }
 
+func (c *Client) TrinoStatus(ctx context.Context, orgID string) (TrinoStatus, error) {
+	var resp TrinoStatus
+	if err := c.doJSON(ctx, http.MethodGet, orgPath(orgID, "trino"), nil, &resp, http.StatusOK); err != nil {
+		return TrinoStatus{}, err
+	}
+	return resp, nil
+}
+
 func (c *Client) Deprovision(ctx context.Context, orgID string) (DeprovisionResponse, error) {
 	var resp DeprovisionResponse
 	path := orgPath(orgID, "deprovision")
@@ -131,6 +170,58 @@ func (c *Client) WaitWarehouseReady(ctx context.Context, orgID string, opts Wait
 func (c *Client) WaitWarehouseDeleted(ctx context.Context, orgID string, opts WaitOptions) (WarehouseStatus, error) {
 	opts.AcceptNotFound = true
 	return c.waitForState(ctx, orgID, WarehouseStateDeleted, opts)
+}
+
+// WaitTrinoReady waits for both the provisioner's lifecycle state and the
+// admin API's live coordinator observation. A ready config-store row alone is
+// not sufficient when the cell is unavailable; the later query smoke still
+// owns tenant-auth verification because Secret projection and Trino's file
+// refresh can lag this status briefly.
+func (c *Client) WaitTrinoReady(ctx context.Context, orgID string, opts WaitOptions) (TrinoStatus, error) {
+	waitCtx, cancel := contextWithOptionalTimeout(ctx, opts.Timeout)
+	defer cancel()
+
+	interval := opts.PollInterval
+	if interval <= 0 {
+		interval = defaultPollInterval
+	}
+	sleep := opts.Sleep
+	if sleep == nil {
+		sleep = waitSleep
+	}
+
+	var last TrinoStatus
+	for attempts := 1; ; attempts++ {
+		status, err := c.TrinoStatus(waitCtx, orgID)
+		if err != nil {
+			if waitCtx.Err() != nil {
+				return last, trinoWaitContextError(waitCtx, orgID)
+			}
+			return last, err
+		}
+		last = status
+		if status.Enabled && status.Available && status.Status != nil && status.Status.State == WarehouseStateReady {
+			return status, nil
+		}
+		if status.Status != nil && status.Status.State == WarehouseStateFailed {
+			return status, classified(ErrorClassProvisionFailed, fmt.Errorf("%w for %s: %s", ErrTrinoFailed, orgID, status.Status.StatusMessage))
+		}
+		if opts.MaxAttempts > 0 && attempts >= opts.MaxAttempts {
+			return status, trinoWaitTimeoutError(orgID)
+		}
+		if err := sleep(waitCtx, interval); err != nil {
+			if waitCtx.Err() != nil {
+				return status, trinoWaitContextError(waitCtx, orgID)
+			}
+			if errors.Is(err, context.Canceled) {
+				return status, err
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return status, trinoWaitTimeoutError(orgID)
+			}
+			return status, classified(ErrorClassProvisionAPI, fmt.Errorf("sleep while waiting for %s Trino readiness: %w", orgID, err))
+		}
+	}
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any, expectedStatus int) error {
@@ -191,16 +282,7 @@ func (c *Client) waitForState(ctx context.Context, orgID, target string, opts Wa
 	}
 	sleep := opts.Sleep
 	if sleep == nil {
-		sleep = func(ctx context.Context, d time.Duration) error {
-			timer := time.NewTimer(d)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-timer.C:
-				return nil
-			}
-		}
+		sleep = waitSleep
 	}
 
 	var last WarehouseStatus
@@ -241,6 +323,17 @@ func (c *Client) waitForState(ctx context.Context, orgID, target string, opts Wa
 	}
 }
 
+func waitSleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func contextWithOptionalTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return ctx, func() {}
@@ -255,6 +348,17 @@ func waitTimeoutError(target, orgID string) error {
 func waitContextError(ctx context.Context, target, orgID string) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return waitTimeoutError(target, orgID)
+	}
+	return ctx.Err()
+}
+
+func trinoWaitTimeoutError(orgID string) error {
+	return classified(ErrorClassWaitTimeout, fmt.Errorf("%w: org %s did not become ready and available", ErrTrinoWaitTimeout, orgID))
+}
+
+func trinoWaitContextError(ctx context.Context, orgID string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return trinoWaitTimeoutError(orgID)
 	}
 	return ctx.Err()
 }

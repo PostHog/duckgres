@@ -279,7 +279,7 @@ func (s *gormAPIStore) CreateOrg(org *configstore.Org, teamID int64, schemaName 
 
 func (s *gormAPIStore) GetOrg(name string) (*configstore.Org, error) {
 	var org configstore.Org
-	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").First(&org, "name = ?", name).Error; err != nil {
+	if err := s.db().Preload("Users").Preload("Warehouse").Preload("Teams").Preload("Trino").First(&org, "name = ?", name).Error; err != nil {
 		return nil, err
 	}
 	return &org, nil

@@ -104,6 +104,33 @@ func TestAdminAdmissionConfigMutationsSerializePostgres(t *testing.T) {
 	}
 }
 
+func TestAdminGetOrgPreloadsTrinoPostgres(t *testing.T) {
+	store := newPostgresConfigStore(t)
+	const orgID = "admin-get-org-trino"
+	if err := store.DB().Create(&configstore.Org{Name: orgID, DatabaseName: "admin-get-org-trino"}).Error; err != nil {
+		t.Fatalf("create org: %v", err)
+	}
+	if err := store.DB().Create(&configstore.ManagedWarehouseTrino{
+		OrgID:   orgID,
+		Enabled: true,
+		Tier:    "free",
+		State:   configstore.ManagedWarehouseStateReady,
+	}).Error; err != nil {
+		t.Fatalf("create Trino row: %v", err)
+	}
+
+	org, err := newGormAPIStore(store).(*gormAPIStore).GetOrg(orgID)
+	if err != nil {
+		t.Fatalf("GetOrg returned error: %v", err)
+	}
+	if org.Trino == nil {
+		t.Fatal("GetOrg did not preload the Trino association")
+	}
+	if !org.Trino.Enabled || org.Trino.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("preloaded Trino row = %+v, want enabled ready", org.Trino)
+	}
+}
+
 // TestAdminUpdateOrgRenamesDatabaseNamePostgres exercises the gorm store's
 // database_name threading against real Postgres: a non-empty value renames
 // (the break-glass fix for unroutable stored names), an empty value preserves

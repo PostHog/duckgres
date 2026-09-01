@@ -305,3 +305,50 @@ func TestExecutorRejectsInvalidWaitOptions(t *testing.T) {
 		t.Fatalf("error class = %q, want %q", classified.ErrorClass(), ErrorClassInvalidStepConfig)
 	}
 }
+
+func TestExecutorWaitTrinoReadyStoresStatusForLaterSteps(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/orgs/scenario-org/trino" {
+			t.Fatalf("path = %s, want org Trino detail path", r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"cell":      map[string]any{"id": "cell-001"},
+			"enabled":   true,
+			"available": true,
+			"status": map[string]any{
+				"org":       "scenario-org",
+				"principal": "scenario-db",
+				"catalog":   "org_scenario_db",
+				"cell":      "cell-001",
+				"state":     "ready",
+			},
+		})
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("NewClient returned error: %v", err)
+	}
+	state := NewState()
+	executor := NewExecutor(ExecutorConfig{Client: client, State: state})
+	err = executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "wait_trino",
+		Type: StepTypeWaitTrinoReady,
+		With: map[string]any{
+			"org_id":        "scenario-org",
+			"timeout":       "5m",
+			"poll_interval": "5s",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+	status, ok := state.TrinoStatus("scenario-org")
+	if !ok || status.Status == nil {
+		t.Fatalf("stored Trino status = %+v, %v; want ready detail", status, ok)
+	}
+	if status.Status.Catalog != "org_scenario_db" {
+		t.Fatalf("stored catalog = %q, want org_scenario_db", status.Status.Catalog)
+	}
+}
