@@ -35,7 +35,7 @@ metadata:
   namespace: ${NAMESPACE}
 data:
   node.properties: |
-    node.environment=ci-pr-${PR_NUMBER}
+    node.environment=ci_pr_${PR_NUMBER}
     node.data-dir=/data/trino
   jvm.config: |
     -server
@@ -88,7 +88,7 @@ metadata:
   namespace: ${NAMESPACE}
 data:
   node.properties: |
-    node.environment=ci-pr-${PR_NUMBER}
+    node.environment=ci_pr_${PR_NUMBER}
     node.data-dir=/data/trino
   jvm.config: |
     -server

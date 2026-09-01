@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -1444,6 +1445,25 @@ func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T)
 	} {
 		if !strings.Contains(harness, want) {
 			t.Errorf("Trino harness missing live admin/detail cleanup contract %q", want)
+		}
+	}
+}
+
+func TestTrinoNodeEnvironmentUsesValidIdentifier(t *testing.T) {
+	raw, err := os.ReadFile("manifests.trino.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read Trino manifests template: %v", err)
+	}
+
+	environments := regexp.MustCompile(`(?m)^\s*node\.environment=(\S+)$`).FindAllStringSubmatch(string(raw), -1)
+	if len(environments) != 2 {
+		t.Fatalf("Trino node.environment values = %d, want coordinator and worker", len(environments))
+	}
+	valid := regexp.MustCompile(`^[a-z0-9][_a-z0-9]*$`)
+	for _, match := range environments {
+		rendered := strings.ReplaceAll(match[1], "${PR_NUMBER}", "123")
+		if !valid.MatchString(rendered) {
+			t.Errorf("Trino node.environment %q violates the Trino identifier grammar", rendered)
 		}
 	}
 }
