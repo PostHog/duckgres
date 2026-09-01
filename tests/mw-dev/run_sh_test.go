@@ -63,6 +63,37 @@ func TestDeployFailureDoesNotDumpDucklingYAML(t *testing.T) {
 	}
 }
 
+func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
+	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
+		if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
+			t.Fatalf("write fake Trino TLS material: %v", err)
+		}
+	}
+
+	cmd := runSHCommand(t, fakes.binDir, "deploy",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"E2E_SUITE=trino",
+		"TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-dev",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Trino deploy failed: %v\n%s", err, out)
+	}
+
+	calls := fakes.calls(t)
+	if strings.Contains(calls, " scale ") {
+		t.Fatalf("Trino deploy requires deployments/scale RBAC; calls:\n%s", calls)
+	}
+	for _, deployment := range []string{"duckgres-trino-coordinator", "duckgres-trino-worker"} {
+		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":1}}"
+		if !strings.Contains(calls, want) {
+			t.Errorf("Trino deploy did not start %s through the deployment resource; calls:\n%s", deployment, calls)
+		}
+	}
+}
+
 func TestScheduledCleanupKeepsGoingWhenDucklingsDoNotDelete(t *testing.T) {
 	fakes := newRunSHFakes(t)
 
@@ -1522,6 +1553,10 @@ if [[ "$*" == *" -n cnpg-shards exec "* && "$*" == *" psql -U postgres -c "* ]];
   exit 0
 fi
 if [[ "$*" == *" apply -f -"* ]]; then
+  tee -a "$RUN_SH_TEST_CALLS" >/dev/null
+  exit 0
+fi
+if [[ "$*" == *" --patch-file=/dev/stdin"* ]]; then
   tee -a "$RUN_SH_TEST_CALLS" >/dev/null
   exit 0
 fi
