@@ -88,13 +88,9 @@ jobs:
                       # which hard-fails every build until someone re-pins
                       # (2026-08-04 -> 2026-08-08 was one such break). These
                       # hashes were re-pinned to the nightly served on
-                      # 2026-08-08; the previous pin named descendant ab217c6,
-                      # and the current artifact's upstream commit is not
-                      # identifiable from the artifact itself. It is still
-                      # necessarily a descendant of 71b85668 (it is newer than
-                      # ab217c6, which already was), so the reason for
-                      # preferring nightly over stable still holds — but the
-                      # exact scanner build we ship is no longer named here.
+                      # 2026-09-01. Its extension footer identifies
+                      # duckdb-postgres 4053b61, a descendant of 71b85668, so
+                      # the required snapshot fix remains present.
                       # Mirroring the artifact we want, instead of pinning a
                       # hash against a URL whose contents change, is the real
                       # fix.
@@ -105,8 +101,8 @@ jobs:
                       # defaults, so updating only the Dockerfiles does
                       # nothing for CI — change all five together.
                       pg_scanner_repo: "https://nightly-extensions.duckdb.org"
-                      pg_scanner_sha256_amd64: "574bd831461f4fcbd2c5cb516572455ed200b3a1f33055523f613f5c8a97f265"
-                      pg_scanner_sha256_arm64: "2558961c60f71a1678b8a19a07dfe89fd653cffa2d3b10e5030ee92d50199696"
+                      pg_scanner_sha256_amd64: "fdeb8a146f79a91b4af0c00708f62496b5c40ae6e741786e9bc53cfc59b322c2"
+                      pg_scanner_sha256_arm64: "d5663be7338af2cce5595c4c0ca170c7939d6979fec5adede284021aba405b1f"
                       # Fleet default: also publishes the unsuffixed tags and
                       # dispatches Charts.
                       default: true
