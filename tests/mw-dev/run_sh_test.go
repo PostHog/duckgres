@@ -126,7 +126,7 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	}
 	for deployment, replicas := range map[string]int{
 		"duckgres-trino-coordinator": 1,
-		"duckgres-trino-worker":      2,
+		"duckgres-trino-worker":      3,
 	} {
 		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":" + strconv.Itoa(replicas) + "}}"
 		if !strings.Contains(calls, want) {
@@ -185,6 +185,10 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 			t.Errorf("Trino worker %s = %v, want 1 CPU and 4Gi", field, values)
 		}
 	}
+	workerData := workerConfig["data"].(map[string]any)
+	if jvmConfig := workerData["jvm.config"].(string); !strings.Contains(jvmConfig, "-Xmx3G") {
+		t.Errorf("Trino worker JVM config does not fit its 4Gi pod:\n%s", jvmConfig)
+	}
 
 	for name, expectedPerNode := range map[string]string{
 		"coordinator": "1GB",
@@ -196,7 +200,7 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 		}
 		data := manifest["data"].(map[string]any)
 		config := data["config.properties"].(string)
-		for _, want := range []string{"query.max-memory=4GB", "query.max-memory-per-node=" + expectedPerNode} {
+		for _, want := range []string{"query.max-memory=6GB", "query.max-memory-per-node=" + expectedPerNode} {
 			if !strings.Contains(config, want) {
 				t.Errorf("Trino %s config missing %q:\n%s", name, want, config)
 			}

@@ -52,7 +52,7 @@ data:
     http-server.https.keystore.path=/etc/trino/tls/keystore.p12
     http-server.https.keystore.key=${ENV:TRINO_TLS_KEYSTORE_PASSWORD}
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=4GB
+    query.max-memory=6GB
     # The coordinator does not execute tasks and retains headroom in its 2G
     # heap; execution workers carry the 2GB per-node allowance below.
     query.max-memory-per-node=1GB
@@ -102,7 +102,7 @@ data:
     coordinator=false
     http-server.http.port=8080
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=4GB
+    query.max-memory=6GB
     query.max-memory-per-node=2GB
     shutdown.grace-period=10s
     catalog.management=dynamic
@@ -262,7 +262,7 @@ spec:
             periodSeconds: 5
           resources:
             requests: { cpu: "1", memory: 4Gi }
-            # Two replicas provide the same aggregate 2-CPU/8Gi execution
+            # Three replicas provide the same aggregate 3-CPU/12Gi execution
             # budget as the frozen-perf Duckgres worker. Keep requests equal
             # to limits so node contention cannot change the comparison.
             limits: { cpu: "1", memory: 4Gi }
