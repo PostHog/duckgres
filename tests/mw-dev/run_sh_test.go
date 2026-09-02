@@ -181,14 +181,18 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 	resources := worker["resources"].(map[string]any)
 	for _, field := range []string{"requests", "limits"} {
 		values := resources[field].(map[string]any)
-		if values["cpu"] != "1" || values["memory"] != "4Gi" {
-			t.Errorf("Trino worker %s = %v, want 1 CPU and 4Gi", field, values)
+		if values["cpu"] != "1500m" || values["memory"] != "6Gi" {
+			t.Errorf("Trino worker %s = %v, want 1500m CPU and 6Gi", field, values)
 		}
+	}
+	workerData := workerConfig["data"].(map[string]any)
+	if jvmConfig := workerData["jvm.config"].(string); !strings.Contains(jvmConfig, "-Xmx4608M") {
+		t.Errorf("Trino worker JVM config does not increase heap by 50%%:\n%s", jvmConfig)
 	}
 
 	for name, expectedPerNode := range map[string]string{
 		"coordinator": "1GB",
-		"worker":      "2GB",
+		"worker":      "3GB",
 	} {
 		manifest := coordinatorConfig
 		if name == "worker" {
@@ -196,7 +200,7 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 		}
 		data := manifest["data"].(map[string]any)
 		config := data["config.properties"].(string)
-		for _, want := range []string{"query.max-memory=4GB", "query.max-memory-per-node=" + expectedPerNode} {
+		for _, want := range []string{"query.max-memory=6GB", "query.max-memory-per-node=" + expectedPerNode} {
 			if !strings.Contains(config, want) {
 				t.Errorf("Trino %s config missing %q:\n%s", name, want, config)
 			}

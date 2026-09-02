@@ -81,8 +81,8 @@ jobs:
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
       # Add process headroom for repeated full-dataset pgwire aggregates.
-      DUCKGRES_K8S_WORKER_CPU_REQUEST: "2"
-      DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 8Gi
+      DUCKGRES_K8S_WORKER_CPU_REQUEST: "3"
+      DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 12Gi
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 

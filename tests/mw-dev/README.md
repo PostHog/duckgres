@@ -54,7 +54,7 @@ The isolated control plane's default worker request is configurable through
 `DUCKGRES_K8S_WORKER_CPU_REQUEST` and
 `DUCKGRES_K8S_WORKER_MEMORY_REQUEST`; `run.sh` defaults them to `750m` and
 `1536Mi`, respectively, preserving the e2e harness's worker-packing behavior.
-`scenario-dev.yml` explicitly overrides them to 2 CPU and 8Gi for the frozen
+`scenario-dev.yml` explicitly overrides them to 3 CPU and 12Gi for the frozen
 perf workload. Direct `run.sh` callers can make the same explicit override.
 
 ### Scenario Trino readiness
@@ -132,12 +132,13 @@ The lane defaults `TRINO_IMAGE` to the pinned PostHog fork used when this suite
 was added. That fork contains the DuckLake connector and PostgreSQL dynamic
 catalog store; upstream `trinodb/trino` is not compatible. Update the default
 in `run.sh` and `e2e-mw-dev.yml` together when promoting a Trino build.
-Each Trino worker has requests and limits of 1 CPU and 4Gi. Together they match
-the frozen perf Duckgres worker's aggregate 2 CPU and 8Gi execution budget while
-exercising Trino's distributed execution path. Trino permits 2GB of query
-memory per worker and 4GB cluster-wide. The coordinator does not execute query
-tasks (`node-scheduler.include-coordinator=false`) and is additional Trino
-control-plane overhead rather than part of the matched execution budget.
+Each Trino worker has requests and limits of 1500m CPU and 6Gi. Together they
+match the frozen perf Duckgres worker's aggregate 3 CPU and 12Gi execution
+budget while exercising Trino's distributed execution path. Trino permits 3GB
+of query memory per worker and 6GB cluster-wide. The coordinator does not
+execute query tasks (`node-scheduler.include-coordinator=false`) and is
+additional Trino control-plane overhead rather than part of the matched
+execution budget.
 `TRINO_TLS_PASSWORD` defaults to `duckgres-e2e-keystore`; it protects only the
 random, two-day, per-run PKCS12 file. `run.sh` generates a fresh CA and leaf
 certificate under `DUCKGRES_CI_SECRET_DIR`, mounts the CA into the PR control
