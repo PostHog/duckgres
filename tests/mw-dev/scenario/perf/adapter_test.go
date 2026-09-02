@@ -13,6 +13,7 @@ import (
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
+	trinodriver "github.com/posthog/duckgres/tests/perf/drivers/trino"
 )
 
 func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
@@ -139,6 +140,103 @@ func TestExecutorRestrictsCatalogToStepTargets(t *testing.T) {
 	}
 	if !strings.Contains(string(csvBytes), ",pgwire,") {
 		t.Fatalf("query_results.csv does not contain pgwire result: %q", string(csvBytes))
+	}
+}
+
+func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolTrino})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
+		Org:      "scenario-org",
+		Username: "root",
+		Password: "root-password",
+	})
+	provisionState.StoreTrinoStatus("scenario-org", provision.TrinoStatus{
+		Cell: provision.TrinoCell{
+			ID:             "cell-a",
+			CoordinatorURL: "https://trino.example.test:8443",
+		},
+		Enabled:   true,
+		Available: true,
+		Status: &provision.TrinoOrgStatus{
+			Org:       "scenario-org",
+			Principal: "org_database",
+			Catalog:   "org_catalog",
+			Cell:      "cell-a",
+			State:     provision.WarehouseStateReady,
+		},
+	})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		OutputDir:      t.TempDir(),
+		DriverFactory:  factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":                      "scenario-org",
+			"catalog_file":                catalogPath,
+			"run_id":                      "scenario-run-1",
+			"targets":                     []any{"trino"},
+			"trino_ca_cert_file":          "/trino-ca/ca.crt",
+			"trino_startup_timeout":       "45s",
+			"trino_startup_poll_interval": "3s",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+
+	got := factory.trinoConnection
+	if got.ServerURL != "https://trino.example.test:8443" || got.Username != "org_database" {
+		t.Fatalf("Trino identity = %+v, want coordinator and status principal", got)
+	}
+	if got.Username == "root" {
+		t.Fatal("Trino must use the derived status principal, not root")
+	}
+	if got.Password != "root-password" || got.Catalog != "org_catalog" || got.Schema != "posthog" {
+		t.Fatalf("Trino auth/catalog = %+v, want provision password, status catalog, and posthog schema", got)
+	}
+	if got.CACertFile != "/trino-ca/ca.crt" || got.Startup.Timeout != 45*time.Second || got.Startup.PollInterval != 3*time.Second {
+		t.Fatalf("Trino TLS/startup = %+v, want explicit verified CA and retry bounds", got)
+	}
+	if factory.trinoContext == nil {
+		t.Fatal("Trino factory did not receive scenario context for untimed startup smoke")
+	}
+
+	csvBytes, err := os.ReadFile(filepath.Join(executor.OutputDir(), "perf", "query_results.csv"))
+	if err != nil {
+		t.Fatalf("read query_results.csv: %v", err)
+	}
+	if !strings.Contains(string(csvBytes), "\nq1,i1,1,trino,ok,") {
+		t.Fatalf("query_results.csv missing measured Trino row: %q", string(csvBytes))
+	}
+}
+
+func TestExecutorRejectsTrinoWithoutReadinessState(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolTrino})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{Password: "root-password"})
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		OutputDir:      t.TempDir(),
+		DriverFactory:  &fakeDriverFactory{},
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":       "scenario-org",
+			"catalog_file": catalogPath,
+			"run_id":       "scenario-run-1",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "wait_trino_ready") {
+		t.Fatalf("error = %v, want missing readiness-state guidance", err)
 	}
 }
 
@@ -337,12 +435,22 @@ type fakeDriverFactory struct {
 	pgwireConnection scenariosql.PGWireConnection
 	pgwireErr        error
 	pgwireDriver     *fakeProtocolDriver
+	trinoConnection  trinodriver.ConnectionConfig
+	trinoContext     context.Context
+	trinoDriver      *fakeProtocolDriver
 }
 
 func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
 	f.pgwireConnection = connection
 	f.pgwireDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolPGWire, err: f.pgwireErr}
 	return f.pgwireDriver, nil
+}
+
+func (f *fakeDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+	f.trinoContext = ctx
+	f.trinoConnection = connection
+	f.trinoDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolTrino}
+	return f.trinoDriver, nil
 }
 
 type fakeProtocolDriver struct {

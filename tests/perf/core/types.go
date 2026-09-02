@@ -6,6 +6,7 @@ type Protocol string
 
 const (
 	ProtocolPGWire Protocol = "pgwire"
+	ProtocolTrino  Protocol = "trino"
 )
 
 // StorageTarget identifies the physical relation family selected for a paired
@@ -36,6 +37,14 @@ type Query struct {
 	Params        map[string]any `yaml:"params"`
 	PGWireSQL     string         `yaml:"pgwire_sql"`
 	StorageTarget StorageTarget  `yaml:"-" json:"-"`
+}
+
+// CanonicalSQL returns the single rendered SQL statement shared by protocol
+// drivers. The yaml name is retained for backward compatibility with existing
+// catalogs; protocol-specific copies would allow benchmark definitions to
+// drift.
+func (q Query) CanonicalSQL() string {
+	return q.PGWireSQL
 }
 
 type ExecutionResult struct {

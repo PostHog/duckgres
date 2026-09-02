@@ -88,6 +88,24 @@ window. On failure, inspect the org detail response first: `failed` is a
 catalog/projection failure, while `ready` plus `available: false` points to the
 cell or its observer credentials.
 
+A `perf_queries` step targeting Trino consumes that stored readiness state. It
+uses `status.principal` as the Trino username (not `root`), `status.catalog` as
+the catalog, the provision response's root password, and schema `posthog` by
+default. The coordinator URL comes from `cell.coordinator_url`. Isolated cells
+must mount their per-run CA and set `trino_ca_cert_file`; the driver requires
+verified HTTPS and never disables certificate verification.
+
+Optional perf-step settings are:
+
+- `trino_schema` (default `posthog`)
+- `trino_ca_cert_file` (default empty, using system roots)
+- `trino_startup_timeout` (default `2m`)
+- `trino_startup_poll_interval` (default `2s`)
+
+The startup window contains an authenticated `SELECT 1` retry and completes
+before warmup or measured statements run. For the isolated mw-dev cell, use
+`trino_ca_cert_file: /trino-ca/ca.crt`.
+
 ## Isolated Trino lane
 
 The Trino lane never uses the shared mw-dev Trino namespace or coordinator.

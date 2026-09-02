@@ -2,14 +2,16 @@ package core
 
 import "testing"
 
-func TestIntentMatcherReturnsPGWireSQL(t *testing.T) {
+func TestIntentMatcherReturnsCanonicalSQLForBothProtocols(t *testing.T) {
 	m := NewIntentMatcher()
 	q := Query{
 		QueryID:   "q1",
 		IntentID:  "i1",
 		PGWireSQL: "SELECT 1",
 	}
-	if got, err := m.SQLFor(q, ProtocolPGWire); err != nil || got != "SELECT 1" {
-		t.Fatalf("unexpected pgwire SQL result: sql=%q err=%v", got, err)
+	for _, protocol := range []Protocol{ProtocolPGWire, ProtocolTrino} {
+		if got, err := m.SQLFor(q, protocol); err != nil || got != "SELECT 1" {
+			t.Fatalf("unexpected %s SQL result: sql=%q err=%v", protocol, got, err)
+		}
 	}
 }

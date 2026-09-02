@@ -18,7 +18,7 @@ func (f *fakeExec) Execute(_ context.Context, query string, _ []any) (int64, err
 
 func (f *fakeExec) Close() error { return nil }
 
-func TestDriverUsesPGWireVariant(t *testing.T) {
+func TestDriverUsesCanonicalRenderedSQL(t *testing.T) {
 	exec := &fakeExec{}
 	driver := NewWithExecutor(exec)
 	_, err := driver.Execute(context.Background(), core.Query{
@@ -30,6 +30,6 @@ func TestDriverUsesPGWireVariant(t *testing.T) {
 		t.Fatalf("Execute returned error: %v", err)
 	}
 	if exec.lastQuery != "SELECT 1" {
-		t.Fatalf("expected pgwire SQL, got %q", exec.lastQuery)
+		t.Fatalf("expected canonical rendered SQL, got %q", exec.lastQuery)
 	}
 }
