@@ -346,10 +346,12 @@ cmd_deploy() {
     # Patch the Deployment resources directly. The CI deployer intentionally
     # cannot patch the deployments/scale subresource, while it already needs
     # narrowly scoped Deployment patch access for the control-plane config.
-    for deployment in duckgres-trino-coordinator duckgres-trino-worker; do
-      "${KUBECTL[@]}" -n "$NS" patch deployment "$deployment" \
-        --type=merge -p '{"spec":{"replicas":1}}'
-    done
+    # Two 1-CPU/4Gi workers match the frozen-perf Duckgres worker's aggregate
+    # 2-CPU/8Gi execution budget while exercising Trino's distributed path.
+    "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-coordinator \
+      --type=merge -p '{"spec":{"replicas":1}}'
+    "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-worker \
+      --type=merge -p '{"spec":{"replicas":2}}'
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
   fi
