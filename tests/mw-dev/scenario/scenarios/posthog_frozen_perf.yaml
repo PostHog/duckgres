@@ -3,6 +3,7 @@ run_id_prefix: scenario-frozen-perf
 required_env:
   - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
+  - DUCKGRES_SCENARIO_TRINO_CA_CERT
 steps:
   - id: provision
     type: provision_warehouse
@@ -17,6 +18,9 @@ steps:
           enabled: true
         data_store:
           type: s3bucket
+        trino:
+          enabled: true
+          tier: free
 
   - id: wait_ready
     type: wait_warehouse_ready
@@ -25,8 +29,17 @@ steps:
       timeout: 15m
       poll_interval: 10s
 
+  - id: wait_trino_ready
+    type: wait_trino_ready
+    depends_on: [wait_ready]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      timeout: 15m
+      poll_interval: 10s
+
   - id: setup_frozen_views
     type: sql
+    depends_on: [wait_ready]
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
@@ -56,12 +69,15 @@ steps:
 
   - id: perf_queries
     type: perf_queries
-    depends_on: [validate_posthog_tables]
+    depends_on: [validate_posthog_tables, wait_trino_ready]
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       catalog_file: ../../../perf/queries/ducklake_posthog_tables.yaml
-      targets: [pgwire]
+      targets: [pgwire, trino]
+      trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
+      trino_startup_timeout: 2m
+      trino_startup_poll_interval: 2s
       run_id: ${run_id}
       dataset_version: posthog-file-views-v1
       fail_on_query_errors: true

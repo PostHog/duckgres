@@ -206,9 +206,9 @@ roleRef:
 # charts/duckgres/templates/rbac.yaml) and be deployed to the cluster.
 ---
 # Destination preflight uses the two configured dev-shard provisioner Secrets;
-# Trino catalog projection resolves only its two predictable CI tenant password
-# Secrets. Keep this disposable grant by-name and read-only; its ci-pr label
-# lets teardown remove the cross-namespace objects.
+# Trino catalog projection resolves only the predictable E2E and scenario
+# tenant password Secrets. Keep this disposable grant by-name and read-only;
+# its ci-pr label lets teardown remove the cross-namespace objects.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -222,6 +222,7 @@ rules:
     resourceNames:
       - cnpg-shard-001-provisioner
       - cnpg-shard-002-provisioner
+      - cnpg-tenant-ci-pr-${PR_NUMBER}-cnpg-password
       - cnpg-tenant-ci-pr-${PR_NUMBER}-trinoa-password
       - cnpg-tenant-ci-pr-${PR_NUMBER}-trinob-password
     verbs: ["get"]

@@ -24,8 +24,12 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadCatalog(%s): %v", path, err)
 			}
-			if len(catalog.Targets) != 1 || catalog.Targets[0] != ProtocolPGWire {
-				t.Fatalf("catalog targets = %v, want [pgwire]", catalog.Targets)
+			wantTargets := []Protocol{ProtocolPGWire}
+			if filepath.Base(path) == "ducklake_posthog_tables.yaml" {
+				wantTargets = []Protocol{ProtocolPGWire, ProtocolTrino}
+			}
+			if !reflect.DeepEqual(catalog.Targets, wantTargets) {
+				t.Fatalf("catalog targets = %v, want %v", catalog.Targets, wantTargets)
 			}
 
 			raw, err := os.ReadFile(path)
@@ -69,6 +73,9 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 	for _, query := range catalog.Queries {
 		if !strings.HasSuffix(query.IntentID, "_balanced_v2") {
 			t.Fatalf("checked-in PostHog query %s has unversioned methodology intent %q", query.QueryID, query.IntentID)
+		}
+		if strings.Contains(query.PGWireSQL, "TIMESTAMPTZ '") {
+			t.Fatalf("query %s uses a DuckDB-only timestamp literal instead of protocol-portable SQL: %s", query.QueryID, query.PGWireSQL)
 		}
 	}
 	for index, query := range catalog.Queries {

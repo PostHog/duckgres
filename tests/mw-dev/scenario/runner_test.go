@@ -163,6 +163,7 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 	const scenarioOrgID = "ci-pr-123-cnpg"
+	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 
 	for _, scenarioFile := range []string{
 		"posthog_frozen_metadata.yaml",
@@ -448,6 +449,7 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
+	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
 	if err != nil {
@@ -484,7 +486,10 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 			t.Fatal("frozen perf scenario should not configure the deprecated Flight endpoint")
 		}
 		assertPerfQueryErrorsFailStep(t, step)
-		assertPerfTargetsOnlyPGWire(t, step)
+		assertPerfTargetsPGWireAndTrino(t, step)
+		if got, _ := step.With["trino_ca_cert_file"].(string); got != "/tmp/test-trino-ca.crt" {
+			t.Fatalf("perf Trino CA file = %q, want resolved environment path", got)
+		}
 	}
 	if !foundPerf {
 		t.Fatal("expected frozen perf scenario to include a perf_queries step")
@@ -494,6 +499,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
+	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
 	if err != nil {
@@ -529,8 +535,20 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 	if got := validation.DependsOn; len(got) != 1 || got[0] != "setup_posthog_tables" {
 		t.Fatalf("posthog validation dependencies = %#v, want [setup_posthog_tables]", got)
 	}
-	if got := steps["perf_queries"].DependsOn; len(got) != 1 || got[0] != "validate_posthog_tables" {
-		t.Fatalf("perf dependencies = %#v, want [validate_posthog_tables]", got)
+	waitTrino, ok := steps["wait_trino_ready"]
+	if !ok {
+		t.Fatal("expected Trino readiness step")
+	}
+	if got := waitTrino.DependsOn; len(got) != 1 || got[0] != "wait_ready" {
+		t.Fatalf("Trino readiness dependencies = %#v, want [wait_ready]", got)
+	}
+	provisionRequest, _ := steps["provision"].With["request"].(map[string]any)
+	trinoRequest, _ := provisionRequest["trino"].(map[string]any)
+	if enabled, _ := trinoRequest["enabled"].(bool); !enabled {
+		t.Fatalf("Trino provision request = %#v, want enabled", provisionRequest["trino"])
+	}
+	if got := steps["perf_queries"].DependsOn; len(got) != 2 || got[0] != "validate_posthog_tables" || got[1] != "wait_trino_ready" {
+		t.Fatalf("perf dependencies = %#v, want [validate_posthog_tables wait_trino_ready]", got)
 	}
 }
 
@@ -703,6 +721,14 @@ func assertPerfTargetsOnlyPGWire(t *testing.T, step core.Step) {
 	targets, ok := step.With["targets"].([]any)
 	if !ok || len(targets) != 1 || targets[0] != "pgwire" {
 		t.Fatalf("perf step %s targets = %#v, want [pgwire]", step.ID, step.With["targets"])
+	}
+}
+
+func assertPerfTargetsPGWireAndTrino(t *testing.T, step core.Step) {
+	t.Helper()
+	targets, ok := step.With["targets"].([]any)
+	if !ok || len(targets) != 2 || targets[0] != "pgwire" || targets[1] != "trino" {
+		t.Fatalf("perf step %s targets = %#v, want [pgwire trino]", step.ID, step.With["targets"])
 	}
 }
 

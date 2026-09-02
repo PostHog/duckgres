@@ -106,6 +106,18 @@ The startup window contains an authenticated `SELECT 1` retry and completes
 before warmup or measured statements run. For the isolated mw-dev cell, use
 `trino_ca_cert_file: /trino-ca/ca.crt`.
 
+`posthog_frozen_perf` enables Trino and selects the isolated Trino suite. Its
+scenario Job mounts the per-run CA from `duckgres-trino-tls` and passes that
+path through `DUCKGRES_SCENARIO_TRINO_CA_CERT`; the perf adapter verifies the
+coordinator certificate and retries its first authenticated query for the
+bounded Secret-projection window. The paired catalog remains the single SQL
+source: direct-Parquet `raw_view` members run only through PGWire, while each
+production-shaped `ducklake_table` member runs through both PGWire and Trino.
+To reproduce the scheduled run, deploy and test with `E2E_SUITE=trino` and the
+same `TRINO_POD_IDENTITY_ROLE` required by the isolated Trino lane. Teardown and
+the scheduled cleanup sweep remove both namespace-local workloads and their
+Pod Identity associations.
+
 ## Isolated Trino lane
 
 The Trino lane never uses the shared mw-dev Trino namespace or coordinator.

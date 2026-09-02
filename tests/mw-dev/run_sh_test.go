@@ -342,6 +342,9 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"name: artifact-keeper",
 		"value: \"isolated-test-secret\"",
 		"name: DUCKGRES_SCENARIO_ORG_ID, value: \"ci-pr-123-cnpg\"",
+		"name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: \"/trino-ca/ca.crt\"",
+		"name: trino-ca, mountPath: /trino-ca, readOnly: true",
+		"name: trino-ca, secret: { secretName: duckgres-trino-tls, optional: true",
 		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f pod/duckgres-scenario-pod",
 		"-c scenario",
 		"kubectl --context test-context -n duckgres-ci-pr-123 wait --for=jsonpath={.status.containerStatuses[?(@.name==\"scenario\")].state.terminated.reason} pod/duckgres-scenario-pod",
@@ -1178,6 +1181,7 @@ func TestE2ELanesCanReadOnlyRequiredDucklingsSecrets(t *testing.T) {
 		t.Fatalf("verbs = %q, want get", got)
 	}
 	wantResourceNames := "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner," +
+		"cnpg-tenant-ci-pr-123-cnpg-password," +
 		"cnpg-tenant-ci-pr-123-trinoa-password,cnpg-tenant-ci-pr-123-trinob-password"
 	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != wantResourceNames {
 		t.Fatalf("resourceNames = %q", got)

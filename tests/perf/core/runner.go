@@ -112,6 +112,9 @@ func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measur
 	for _, query := range queriesForIteration(r.cfg.Catalog.Queries, measureIteration) {
 		args := orderedParamValues(query.Params)
 		for _, protocol := range r.cfg.Catalog.Targets {
+			if !querySupportsProtocol(query, protocol) {
+				continue
+			}
 			driver := r.cfg.Drivers[protocol]
 			started := r.cfg.Now()
 			result := QueryResult{
@@ -153,6 +156,15 @@ func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measur
 		}
 	}
 	return nil
+}
+
+// Raw-view members of a paired catalog are DuckDB views over read_parquet and
+// therefore exist only behind PGWire. DuckLake-table members are backed by the
+// shared catalog and intentionally run through every selected protocol. This
+// keeps one canonical paired query definition while preventing a copied
+// Trino-only catalog from drifting away from the PGWire workload.
+func querySupportsProtocol(query Query, protocol Protocol) bool {
+	return query.StorageTarget != StorageTargetRawView || protocol == ProtocolPGWire
 }
 
 // queriesForIteration alternates each generated raw-view/DuckLake-table pair

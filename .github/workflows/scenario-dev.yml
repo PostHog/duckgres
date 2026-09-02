@@ -71,6 +71,11 @@ jobs:
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
       CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev
+      # Frozen perf uses a namespace-local Trino cell. The dedicated role is
+      # consumed only when E2E_SUITE selects that isolated deployment.
+      TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
+      TRINO_IMAGE: ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07
+      E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h

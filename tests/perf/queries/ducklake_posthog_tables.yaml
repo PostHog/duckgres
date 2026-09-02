@@ -4,6 +4,7 @@ seed: 42
 dataset_scale: 1
 targets:
   - pgwire
+  - trino
 warmup_iterations: 1
 measure_iterations: 4
 
@@ -29,14 +30,14 @@ paired_queries:
     sql_template: >
       SELECT COUNT(*) AS events
       FROM {{ relation "events" }}
-      WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'
-        AND "timestamp" < TIMESTAMPTZ '2026-03-02 00:00:00+00'
+      WHERE "timestamp" >= CAST('2026-03-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+        AND "timestamp" < CAST('2026-03-02 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
 
   - query_id_base: q_events_by_name_march_2026_balanced_v2
     intent_id: intent_events_by_name_march_2026_balanced_v2
     tags: [nightly, frozen, posthog, events, aggregate, analytics, paired]
     params: {}
-    sql_template: SELECT event, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY event ORDER BY events DESC, event LIMIT 20
+    sql_template: SELECT event, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND "timestamp" < CAST('2026-03-18 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) GROUP BY event ORDER BY events DESC, event LIMIT 20
 
   - query_id_base: q_events_distinct_persons_balanced_v2
     intent_id: intent_events_distinct_persons_balanced_v2
@@ -54,10 +55,10 @@ paired_queries:
     intent_id: intent_persons_daily_april_2026_balanced_v2
     tags: [nightly, frozen, posthog, persons, aggregate, time-series, paired]
     params: {}
-    sql_template: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM {{ relation "persons" }} WHERE _timestamp >= TIMESTAMPTZ '2026-04-01 00:00:00+00' AND _timestamp < TIMESTAMPTZ '2026-05-01 00:00:00+00' GROUP BY 1 ORDER BY 1
+    sql_template: SELECT date_trunc('day', _timestamp) AS day, COUNT(*) AS persons FROM {{ relation "persons" }} WHERE _timestamp >= CAST('2026-04-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND _timestamp < CAST('2026-05-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) GROUP BY 1 ORDER BY 1
 
   - query_id_base: q_events_daily_march_2026_balanced_v2
     intent_id: intent_events_daily_march_2026_balanced_v2
     tags: [nightly, frozen, posthog, events, aggregate, time-series, paired]
     params: {}
-    sql_template: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND "timestamp" < TIMESTAMPTZ '2026-03-18 00:00:00+00' GROUP BY 1 ORDER BY 1
+    sql_template: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND "timestamp" < CAST('2026-03-18 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) GROUP BY 1 ORDER BY 1

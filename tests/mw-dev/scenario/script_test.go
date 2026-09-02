@@ -50,6 +50,7 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	for _, name := range []string{
 		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
+		"DUCKGRES_SCENARIO_TRINO_CA_CERT",
 	} {
 		if !strings.Contains(text, name) {
 			t.Fatalf("script output %q missing %s", text, name)
@@ -86,6 +87,9 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"CLUSTER_NAME: posthog-mw-dev",
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
+		"TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}",
+		"TRINO_IMAGE: ghcr.io/posthog/trino:",
+		"E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}",
 		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"2\"",
 		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 8Gi",
 		"role-duration-seconds: 16200",
@@ -126,6 +130,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET_NAME",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET_KEY",
 		"matrix:",
+		"trino.trino.svc",
 		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.",
 		"DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.",
