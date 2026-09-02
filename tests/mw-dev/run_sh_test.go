@@ -124,10 +124,82 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	if strings.Contains(calls, " scale ") {
 		t.Fatalf("Trino deploy requires deployments/scale RBAC; calls:\n%s", calls)
 	}
-	for _, deployment := range []string{"duckgres-trino-coordinator", "duckgres-trino-worker"} {
-		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":1}}"
+	for deployment, replicas := range map[string]int{
+		"duckgres-trino-coordinator": 1,
+		"duckgres-trino-worker":      2,
+	} {
+		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":" + strconv.Itoa(replicas) + "}}"
 		if !strings.Contains(calls, want) {
-			t.Errorf("Trino deploy did not start %s through the deployment resource; calls:\n%s", deployment, calls)
+			t.Errorf("Trino deploy did not start %s with %d replicas through the deployment resource; calls:\n%s", deployment, replicas, calls)
+		}
+	}
+}
+
+func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
+	raw, err := os.ReadFile("manifests.trino.tmpl.yaml")
+	if err != nil {
+		t.Fatalf("read Trino manifests template: %v", err)
+	}
+	rendered := strings.NewReplacer(
+		"${NAMESPACE}", "test-namespace",
+		"${PR_NUMBER}", "123",
+		"${TRINO_IMAGE}", "example.invalid/trino:test",
+		"${TRINO_TLS_PASSWORD}", "test-password",
+		"${TRINO_CA_CERT_B64}", "dGVzdA==",
+		"${TRINO_SERVER_P12_B64}", "dGVzdA==",
+	).Replace(string(raw))
+
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
+	var workerDeployment, coordinatorConfig, workerConfig map[string]any
+	for {
+		var manifest map[string]any
+		err := decoder.Decode(&manifest)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("decode Trino manifests template: %v", err)
+		}
+		switch {
+		case manifest["kind"] == "Deployment" && manifestName(manifest) == "duckgres-trino-worker":
+			workerDeployment = manifest
+		case manifest["kind"] == "ConfigMap" && manifestName(manifest) == "duckgres-trino-coordinator":
+			coordinatorConfig = manifest
+		case manifest["kind"] == "ConfigMap" && manifestName(manifest) == "duckgres-trino-worker":
+			workerConfig = manifest
+		}
+	}
+	if workerDeployment == nil || coordinatorConfig == nil || workerConfig == nil {
+		t.Fatalf("missing Trino manifests: worker deployment=%t coordinator config=%t worker config=%t", workerDeployment != nil, coordinatorConfig != nil, workerConfig != nil)
+	}
+
+	spec := workerDeployment["spec"].(map[string]any)
+	template := spec["template"].(map[string]any)
+	podSpec := template["spec"].(map[string]any)
+	containers := podSpec["containers"].([]any)
+	worker := containers[0].(map[string]any)
+	resources := worker["resources"].(map[string]any)
+	for _, field := range []string{"requests", "limits"} {
+		values := resources[field].(map[string]any)
+		if values["cpu"] != "1" || values["memory"] != "4Gi" {
+			t.Errorf("Trino worker %s = %v, want 1 CPU and 4Gi", field, values)
+		}
+	}
+
+	for name, expectedPerNode := range map[string]string{
+		"coordinator": "1GB",
+		"worker":      "2GB",
+	} {
+		manifest := coordinatorConfig
+		if name == "worker" {
+			manifest = workerConfig
+		}
+		data := manifest["data"].(map[string]any)
+		config := data["config.properties"].(string)
+		for _, want := range []string{"query.max-memory=4GB", "query.max-memory-per-node=" + expectedPerNode} {
+			if !strings.Contains(config, want) {
+				t.Errorf("Trino %s config missing %q:\n%s", name, want, config)
+			}
 		}
 	}
 }
