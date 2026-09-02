@@ -164,6 +164,8 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 	const scenarioOrgID = "ci-pr-123-cnpg"
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
+	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
+	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
 
 	for _, scenarioFile := range []string{
 		"posthog_frozen_metadata.yaml",
@@ -450,6 +452,8 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
+	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
+	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
 	if err != nil {
@@ -490,6 +494,12 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		if got, _ := step.With["trino_ca_cert_file"].(string); got != "/tmp/test-trino-ca.crt" {
 			t.Fatalf("perf Trino CA file = %q, want resolved environment path", got)
 		}
+		if got, _ := step.With["worker_cpu"].(string); got != "3" {
+			t.Fatalf("perf worker_cpu = %q, want standard worker CPU", got)
+		}
+		if got, _ := step.With["worker_memory"].(string); got != "12Gi" {
+			t.Fatalf("perf worker_memory = %q, want standard worker memory", got)
+		}
 	}
 	if !foundPerf {
 		t.Fatal("expected frozen perf scenario to include a perf_queries step")
@@ -500,6 +510,8 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
+	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
+	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
 
 	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
 	if err != nil {

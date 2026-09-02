@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -64,6 +65,8 @@ type stepSpec struct {
 	OutputSubdir      string
 	ReadOnly          bool
 	FailOnQueryErrors bool
+	WorkerCPU         string
+	WorkerMemory      string
 	TrinoSchema       string
 	TrinoCACertFile   string
 	TrinoStartup      trinodriver.StartupOptions
@@ -255,6 +258,8 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		OutputSubdir:      stringFromWith(step, "output_subdir", "perf"),
 		ReadOnly:          boolFromWith(step, "read_only", true),
 		FailOnQueryErrors: boolFromWith(step, "fail_on_query_errors", true),
+		WorkerCPU:         stringFromWith(step, "worker_cpu", ""),
+		WorkerMemory:      stringFromWith(step, "worker_memory", ""),
 		TrinoSchema:       stringFromWith(step, "trino_schema", "posthog"),
 		TrinoCACertFile:   stringFromWith(step, "trino_ca_cert_file", ""),
 		TrinoStartup: trinodriver.StartupOptions{
@@ -392,6 +397,19 @@ func (e *Executor) pgwireConnection(spec stepSpec) (scenariosql.PGWireConnection
 	cfg.Database = spec.Database
 	cfg.Username = spec.Username
 	cfg.Password = spec.Password
+	workerOptions := make([]string, 0, 4)
+	if spec.WorkerCPU != "" {
+		workerOptions = append(workerOptions, "-c", "duckgres.worker_cpu="+spec.WorkerCPU)
+	}
+	if spec.WorkerMemory != "" {
+		workerOptions = append(workerOptions, "-c", "duckgres.worker_memory="+spec.WorkerMemory)
+	}
+	if len(workerOptions) > 0 {
+		if cfg.StartupOptions != "" {
+			cfg.StartupOptions += " "
+		}
+		cfg.StartupOptions += strings.Join(workerOptions, " ")
+	}
 	connection, err := cfg.PGWire()
 	if err != nil {
 		return scenariosql.PGWireConnection{}, classified(ErrorClassConfig, err)

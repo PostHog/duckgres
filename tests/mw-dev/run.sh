@@ -536,6 +536,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
+            - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "$DUCKGRES_K8S_WORKER_CPU_REQUEST" }
+            - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" }
             # The Crossplane composition grants this isolated service account
             # exact-name access to only the matching CNPG credential Secret.
             - { name: DUCKGRES_SCENARIO_ORG_ID, value: "ci-pr-${PR_NUMBER}-cnpg" }

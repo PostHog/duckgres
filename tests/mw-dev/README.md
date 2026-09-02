@@ -97,6 +97,8 @@ verified HTTPS and never disables certificate verification.
 
 Optional perf-step settings are:
 
+- `worker_cpu` (default empty, leaving PGWire worker selection to the server)
+- `worker_memory` (default empty, leaving PGWire worker selection to the server)
 - `trino_schema` (default `posthog`)
 - `trino_ca_cert_file` (default empty, using system roots)
 - `trino_startup_timeout` (default `2m`)
@@ -110,7 +112,10 @@ before warmup or measured statements run. For the isolated mw-dev cell, use
 scenario Job mounts the per-run CA from `duckgres-trino-tls` and passes that
 path through `DUCKGRES_SCENARIO_TRINO_CA_CERT`; the perf adapter verifies the
 coordinator certificate and retries its first authenticated query for the
-bounded Secret-projection window. The paired catalog remains the single SQL
+bounded Secret-projection window. It also passes the deployed
+`DUCKGRES_K8S_WORKER_CPU_REQUEST` and `DUCKGRES_K8S_WORKER_MEMORY_REQUEST` into
+the perf step, which requests that exact shape through PGWire startup options
+and therefore bypasses the exploratory worker tier. The paired catalog remains the single SQL
 source: direct-Parquet `raw_view` members run only through PGWire, while each
 production-shaped `ducklake_table` member runs through both PGWire and Trino.
 To reproduce the scheduled run, deploy and test with `E2E_SUITE=trino` and the

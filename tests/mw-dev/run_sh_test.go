@@ -1156,6 +1156,13 @@ func TestScenarioPodIsProtectedFromKarpenterDisruption(t *testing.T) {
 	if got := annotations["karpenter.sh/do-not-disrupt"]; got != "true" {
 		t.Fatalf("scenario Pod karpenter.sh/do-not-disrupt = %v, want true", got)
 	}
+	env := deploymentContainerEnv(manifest, "scenario")
+	if got := env["DUCKGRES_K8S_WORKER_CPU_REQUEST"]; got != "$DUCKGRES_K8S_WORKER_CPU_REQUEST" {
+		t.Fatalf("scenario worker CPU env = %q, want deployed standard worker CPU", got)
+	}
+	if got := env["DUCKGRES_K8S_WORKER_MEMORY_REQUEST"]; got != "$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" {
+		t.Fatalf("scenario worker memory env = %q, want deployed standard worker memory", got)
+	}
 }
 
 func TestControlPlaneServiceDoesNotExposeFlight(t *testing.T) {
