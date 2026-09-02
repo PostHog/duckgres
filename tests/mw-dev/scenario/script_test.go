@@ -51,6 +51,8 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 		"DUCKGRES_SCENARIO_ORG_ID",
 		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
 		"DUCKGRES_SCENARIO_TRINO_CA_CERT",
+		"DUCKGRES_K8S_WORKER_CPU_REQUEST",
+		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST",
 	} {
 		if !strings.Contains(text, name) {
 			t.Fatalf("script output %q missing %s", text, name)

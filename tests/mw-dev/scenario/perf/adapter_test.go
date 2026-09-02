@@ -50,6 +50,8 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 			"catalog_file":    catalogPath,
 			"run_id":          "scenario-run-1",
 			"dataset_version": "posthog-file-views-v1",
+			"worker_cpu":      "3",
+			"worker_memory":   "12Gi",
 		},
 	})
 	if err != nil {
@@ -69,6 +71,9 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	}
 	if strings.Contains(pgwireDSN, "hostaddr=") {
 		t.Fatalf("pgwire dsn = %q, should not use unsupported lib/pq hostaddr", pgwireDSN)
+	}
+	if !strings.Contains(pgwireDSN, "options='-c duckgres.worker_cpu=3 -c duckgres.worker_memory=12Gi'") {
+		t.Fatalf("pgwire dsn = %q, want explicit standard worker sizing options", pgwireDSN)
 	}
 	if factory.pgwireConnection.DialAddress != "10.0.0.10:5432" {
 		t.Fatalf("pgwire direct address = %q, want 10.0.0.10:5432", factory.pgwireConnection.DialAddress)

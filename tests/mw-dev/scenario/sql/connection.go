@@ -23,6 +23,7 @@ type ConnectionConfig struct {
 	SSLMode         string
 	ConnectTimeout  int
 	ApplicationName string
+	StartupOptions  string
 }
 
 // PGWireConnection separates the hostname used for managed-warehouse TLS
@@ -74,6 +75,9 @@ func (c ConnectionConfig) PGWire() (PGWireConnection, error) {
 	}
 	if c.ApplicationName != "" {
 		values = append(values, [2]string{"application_name", c.ApplicationName})
+	}
+	if c.StartupOptions != "" {
+		values = append(values, [2]string{"options", c.StartupOptions})
 	}
 
 	parts := make([]string, 0, len(values))
