@@ -50,6 +50,29 @@ func (c *clientConn) applyStartupIdleTimeout(raw string) error {
 	return nil
 }
 
+// sendIdleTimeoutError tells the client WHY its connection is about to be
+// closed. Without an ErrorResponse the idle reap is a bare socket close, which
+// drivers surface as a generic transport failure ("SSL connection has been
+// closed unexpectedly" in libpq/psycopg2) indistinguishable from a network
+// fault — so a client-side pool cannot tell a deliberate reap from a broken
+// path. This mirrors PostgreSQL's own idle_session_timeout: a FATAL with
+// SQLSTATE 57P05 (idle_session_timeout) and no ReadyForQuery, then close.
+// libpq keeps the buffered FATAL and reports its message when the connection
+// is next used, so even a client that only notices minutes later sees the
+// reason. The message names the effective timeout so an operator of a reaped
+// client knows which value applied and which knob (duckgres.idle_timeout) can
+// raise it.
+//
+// The peer may be gone or not reading, so the write is bounded by a short
+// deadline rather than allowed to wedge the reap; the connection is closed by
+// the caller immediately after, so the deadline is never cleared.
+func (c *clientConn) sendIdleTimeoutError() {
+	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	c.sendError("FATAL", "57P05", fmt.Sprintf(
+		"terminating connection due to idle timeout (duckgres.idle_timeout is %s)",
+		c.effectiveIdleTimeout()))
+}
+
 func (c *clientConn) effectiveIdleTimeout() time.Duration {
 	if c.idleTimeout > 0 {
 		return c.idleTimeout

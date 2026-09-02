@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -52,7 +53,10 @@ func (e *blockingDrainExecutor) ExecContext(ctx context.Context, _ string, _ ...
 // control-plane idle default relies on: with IdleTimeout configured, a
 // connection that sends nothing hits the read deadline and the message loop
 // returns nil (a clean close), which in the CP triggers DestroySession →
-// worker back to hot-idle.
+// worker back to hot-idle. The client must first receive a FATAL 57P05
+// ErrorResponse naming the timeout — a bare close is indistinguishable from a
+// network fault ("SSL connection has been closed unexpectedly" in
+// libpq/psycopg2), so client pools cannot react to a deliberate reap.
 func TestMessageLoopIdleTimeoutClosesConnection(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	defer func() { _ = clientSide.Close() }()
@@ -72,6 +76,12 @@ func TestMessageLoopIdleTimeoutClosesConnection(t *testing.T) {
 		cancel: cancel,
 	}
 
+	received := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(clientSide)
+		received <- b
+	}()
+
 	done := make(chan error, 1)
 	go func() { done <- cc.messageLoop() }()
 
@@ -84,6 +94,22 @@ func TestMessageLoopIdleTimeoutClosesConnection(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("messageLoop did not return on idle timeout")
+	}
+	_ = serverSide.Close()
+
+	var wire []byte
+	select {
+	case wire = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("client never observed the server side closing")
+	}
+	if len(wire) == 0 || wire[0] != 'E' {
+		t.Fatalf("idle reap did not send an ErrorResponse before closing, got % x", wire)
+	}
+	for _, want := range []string{"SFATAL\x00", "C57P05\x00", "terminating connection due to idle timeout", "50ms"} {
+		if !bytes.Contains(wire, []byte(want)) {
+			t.Fatalf("idle-timeout ErrorResponse missing %q in % x", want, wire)
+		}
 	}
 }
 
@@ -105,6 +131,10 @@ func TestMessageLoopUsesClientIdleTimeoutOverride(t *testing.T) {
 		cancel:      cancel,
 		idleTimeout: 180 * time.Millisecond,
 	}
+
+	// The loop now sends a FATAL before closing; drain it so the unbuffered
+	// net.Pipe write cannot block the loop's exit.
+	go func() { _, _ = io.Copy(io.Discard, clientSide) }()
 
 	done := make(chan error, 1)
 	go func() { done <- cc.messageLoop() }()
