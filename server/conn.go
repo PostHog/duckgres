@@ -1307,6 +1307,7 @@ func (c *clientConn) messageLoop() error {
 			// Check if this is a timeout error
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				c.logger().Info("Connection idle timeout, closing.")
+				c.sendIdleTimeoutError()
 				return nil
 			}
 			return err

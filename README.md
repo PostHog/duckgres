@@ -424,7 +424,12 @@ Run with config file:
 ### Client-requested idle timeout
 
 The control plane closes inactive client sessions after its configured
-`DUCKGRES_IDLE_TIMEOUT` (5 minutes by default on the control plane). To let clients request a
+`DUCKGRES_IDLE_TIMEOUT` (5 minutes by default on the control plane). Before
+closing, it sends a `FATAL` ErrorResponse with SQLSTATE `57P05`
+(`idle_session_timeout`) naming the effective timeout — the same protocol
+sequence PostgreSQL uses for `idle_session_timeout` — so a client's next use of
+the reaped connection reports "terminating connection due to idle timeout"
+instead of a generic transport failure. To let clients request a
 longer, bounded timeout, set a positive `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` on
 the control plane. For example, with `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX=15m`:
 

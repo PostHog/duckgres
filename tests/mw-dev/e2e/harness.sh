@@ -3065,7 +3065,9 @@ admin_per_org_workers() { # org password
 # read deadline, DestroySession runs, and the worker returns to hot-idle. We
 # hold a connection idle-in-transaction PAST the timeout and assert its session
 # disappears from /queries while our client is still connected (so the reap is
-# the CP's, not our client exiting). The unit tests (TestNormalizeIdleTimeout +
+# the CP's, not our client exiting), THEN that the client receives the FATAL
+# 57P05 idle-timeout error on its next use of the reaped connection. The unit
+# tests (TestNormalizeIdleTimeout +
 # TestMessageLoopIdleTimeoutClosesConnection) are the deterministic gate for
 # the mechanism; this proves it fires end-to-end in-cluster.
 #
@@ -3100,13 +3102,20 @@ conn_idle_timeout_reaps_session() { # org password
       | jq -r --arg o "$org" '[.queries[]? | select(.org==$o and .user=="root") | .worker_id] | sort | join(" ")'
   }
   before="$(rootwids)"
-  # Hold a connection idle-in-transaction for 90s (well past the 20s timeout):
-  # send BEGIN, then keep stdin open so psql waits and issues no further query.
-  ( printf 'BEGIN;\n'; sleep 90 ) | PGOPTIONS="-c duckgres.idle_timeout=20s" PGPASSWORD="$pw" psql \
+  # Hold a connection idle-in-transaction past the 20s timeout: send BEGIN,
+  # then keep stdin (a fifo we hold open on fd 9) open so psql waits and
+  # issues no further query. The fifo (instead of a fixed sleep) lets the
+  # second phase below send one more statement at exactly the right moment:
+  # AFTER the reap is confirmed, so the client's next use of the connection
+  # must surface the CP's FATAL rather than race the reap itself.
+  ctl="$(mktemp -u)"; mkfifo "$ctl"; errout="$(mktemp)"
+  PGOPTIONS="-c duckgres.idle_timeout=20s" PGPASSWORD="$pw" psql \
       "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
-      -v ON_ERROR_STOP=1 -qtA >/dev/null 2>&1 &
+      -v ON_ERROR_STOP=1 -qtA <"$ctl" >/dev/null 2>"$errout" &
   bg=$!
-  cleanup_ir() { kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; }
+  exec 9>"$ctl"
+  printf 'BEGIN;\n' >&9
+  cleanup_ir() { exec 9>&- || true; kill "$bg" 2>/dev/null || true; wait "$bg" 2>/dev/null || true; rm -f "$ctl" "$errout"; }
   # The NEW root worker_id (not present before) is our idle connection's.
   wid="" a=0
   while [ "$a" -lt 30 ]; do
@@ -3129,9 +3138,33 @@ conn_idle_timeout_reaps_session() { # org password
     [ "$present" = "false" ] && { gone=1; break; }
     sleep 3; a=$((a + 1))
   done
-  cleanup_ir
-  [ -n "$gone" ] || fail "conn_idle_timeout: idle session on worker $wid was NOT reaped within ~60s (idle timeout not enforced)"
-  log "conn idle timeout: idle session reaped, worker $wid freed on $org"
+  [ -n "$gone" ] || { cleanup_ir; fail "conn_idle_timeout: idle session on worker $wid was NOT reaped within ~60s (idle timeout not enforced)"; }
+  log "conn idle timeout: idle session reaped — verifying the client RECEIVES the FATAL"
+  # The reap must be VISIBLE to the client, not a bare socket close. The CP
+  # sends a FATAL 57P05 naming the effective timeout before closing
+  # (server/client_idle_timeout.go sendIdleTimeoutError); libpq keeps that
+  # buffered FATAL and reports it on the connection's next use. Our psql has
+  # not touched the socket since BEGIN, so one more statement through the fifo
+  # forces that next use: its stderr must carry the idle-timeout message with
+  # the effective (client-requested) 20s value, not just a generic
+  # "server closed the connection unexpectedly" — which is the pre-fix symptom
+  # that made deliberate reaps indistinguishable from network faults.
+  printf 'SELECT 1;\n' >&9
+  exec 9>&-
+  if wait "$bg" 2>/dev/null; then
+    rm -f "$ctl" "$errout"
+    fail "conn_idle_timeout: statement on the reaped connection unexpectedly succeeded"
+  fi
+  grep -q "terminating connection due to idle timeout" "$errout" || {
+    echo "--- psql stderr ---" >&2; cat "$errout" >&2
+    fail "conn_idle_timeout: client did not receive the FATAL idle-timeout error on next use (bare close?)"
+  }
+  grep -q "duckgres.idle_timeout is 20s" "$errout" || {
+    echo "--- psql stderr ---" >&2; cat "$errout" >&2
+    fail "conn_idle_timeout: FATAL idle-timeout error does not name the effective 20s timeout"
+  }
+  rm -f "$ctl" "$errout"
+  log "conn idle timeout: idle session reaped, worker $wid freed, FATAL 57P05 delivered on $org"
 }
 
 # ---- COPY FROM STDIN: active in Live + survives the idle timeout ------------
