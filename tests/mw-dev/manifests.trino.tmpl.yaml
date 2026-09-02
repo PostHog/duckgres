@@ -54,7 +54,7 @@ data:
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
     query.max-memory=6GB
     # The coordinator does not execute tasks and retains headroom in its 2G
-    # heap; execution workers carry the 3GB per-node allowance below.
+    # heap; execution workers carry the 2GB per-node allowance below.
     query.max-memory-per-node=1GB
     catalog.management=dynamic
     catalog.store=posthog
@@ -94,7 +94,7 @@ data:
     node.data-dir=/data/trino
   jvm.config: |
     -server
-    -Xmx4608M
+    -Xmx3G
     -XX:+UseG1GC
     -XX:+ExitOnOutOfMemoryError
     -Dfile.encoding=UTF-8
@@ -103,7 +103,7 @@ data:
     http-server.http.port=8080
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
     query.max-memory=6GB
-    query.max-memory-per-node=3GB
+    query.max-memory-per-node=2GB
     shutdown.grace-period=10s
     catalog.management=dynamic
     internal-communication.shared-secret=${ENV:TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET}
@@ -261,11 +261,11 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 5
           resources:
-            requests: { cpu: "1500m", memory: 6Gi }
-            # Two replicas provide the same aggregate 3-CPU/12Gi execution
+            requests: { cpu: "1", memory: 4Gi }
+            # Three replicas provide the same aggregate 3-CPU/12Gi execution
             # budget as the frozen-perf Duckgres worker. Keep requests equal
             # to limits so node contention cannot change the comparison.
-            limits: { cpu: "1500m", memory: 6Gi }
+            limits: { cpu: "1", memory: 4Gi }
           volumeMounts:
             - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
             - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }

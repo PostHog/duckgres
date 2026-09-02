@@ -121,7 +121,7 @@ Pod Identity associations.
 ## Isolated Trino lane
 
 The Trino lane never uses the shared mw-dev Trino namespace or coordinator.
-It deploys one coordinator, two workers, and an OPA sidecar in the lane's
+It deploys one coordinator, three workers, and an OPA sidecar in the lane's
 `duckgres-ci-pr-<N>` namespace. The control plane projects fixed-name auth,
 tenant-secret, OPA-token, and resource-group objects into that same namespace;
 its cell id and PostgreSQL catalog store are also PR-local. This isolation is
@@ -132,9 +132,9 @@ The lane defaults `TRINO_IMAGE` to the pinned PostHog fork used when this suite
 was added. That fork contains the DuckLake connector and PostgreSQL dynamic
 catalog store; upstream `trinodb/trino` is not compatible. Update the default
 in `run.sh` and `e2e-mw-dev.yml` together when promoting a Trino build.
-Each Trino worker has requests and limits of 1500m CPU and 6Gi. Together they
+Each Trino worker has requests and limits of 1 CPU and 4Gi. Together they
 match the frozen perf Duckgres worker's aggregate 3 CPU and 12Gi execution
-budget while exercising Trino's distributed execution path. Trino permits 3GB
+budget while exercising Trino's distributed execution path. Trino permits 2GB
 of query memory per worker and 6GB cluster-wide. The coordinator does not
 execute query tasks (`node-scheduler.include-coordinator=false`) and is
 additional Trino control-plane overhead rather than part of the matched

@@ -126,7 +126,7 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	}
 	for deployment, replicas := range map[string]int{
 		"duckgres-trino-coordinator": 1,
-		"duckgres-trino-worker":      2,
+		"duckgres-trino-worker":      3,
 	} {
 		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":" + strconv.Itoa(replicas) + "}}"
 		if !strings.Contains(calls, want) {
@@ -181,18 +181,18 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 	resources := worker["resources"].(map[string]any)
 	for _, field := range []string{"requests", "limits"} {
 		values := resources[field].(map[string]any)
-		if values["cpu"] != "1500m" || values["memory"] != "6Gi" {
-			t.Errorf("Trino worker %s = %v, want 1500m CPU and 6Gi", field, values)
+		if values["cpu"] != "1" || values["memory"] != "4Gi" {
+			t.Errorf("Trino worker %s = %v, want 1 CPU and 4Gi", field, values)
 		}
 	}
 	workerData := workerConfig["data"].(map[string]any)
-	if jvmConfig := workerData["jvm.config"].(string); !strings.Contains(jvmConfig, "-Xmx4608M") {
-		t.Errorf("Trino worker JVM config does not increase heap by 50%%:\n%s", jvmConfig)
+	if jvmConfig := workerData["jvm.config"].(string); !strings.Contains(jvmConfig, "-Xmx3G") {
+		t.Errorf("Trino worker JVM config does not fit its 4Gi pod:\n%s", jvmConfig)
 	}
 
 	for name, expectedPerNode := range map[string]string{
 		"coordinator": "1GB",
-		"worker":      "3GB",
+		"worker":      "2GB",
 	} {
 		manifest := coordinatorConfig
 		if name == "worker" {
