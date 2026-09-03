@@ -28,7 +28,6 @@ function currentMonth(): string {
 export function Usage() {
   const { isAdmin } = useIdentity();
   const [months, setMonths] = useState(6);
-  const [pricingRegion, setPricingRegion] = useState<PricingRegion>("US");
   const usage = useMonthlyUsage(months);
   const orgLabels = useOrgLabels();
   const rows = useMemo(() => usage.data?.rows ?? [], [usage.data]);
@@ -52,6 +51,7 @@ export function Usage() {
   // team stamp, so collapse those rows before display rather than showing
   // duplicate-looking org lines when that stamp changed within the month.
   const orgRows = useMemo(() => orgTotals(monthRows), [monthRows]);
+  const pricingRegion: PricingRegion = usage.data?.customer_pricing_region ?? "US";
   const pricing = useMemo(
     () => priceStorageByOrg(orgRows, month, pricingRegion),
     [orgRows, month, pricingRegion],
@@ -132,7 +132,7 @@ export function Usage() {
                 label="Total price"
                 value={fmtMoney(pricing.summary.price)}
                 icon={<InfoTooltip label="Explain customer price" text={customerPriceTooltip(pricingRegion)} />}
-                hint={`${pricingRegion} progressive customer tiers`}
+                hint={`${pricingRegion} progressive tiers · ${usage.data?.aws_region}`}
               />
               <StatCard
                 label="Total gross margin"
@@ -153,13 +153,7 @@ export function Usage() {
                 description={`No usage has been recorded for ${month} in the retained billing buffer.`}
               />
             ) : (
-              <UsagePricing
-                rows={monthRows}
-                labels={orgLabels}
-                month={month}
-                region={pricingRegion}
-                onRegionChange={setPricingRegion}
-              />
+              <UsagePricing rows={monthRows} labels={orgLabels} month={month} region={pricingRegion} />
             )}
           </>
         )}

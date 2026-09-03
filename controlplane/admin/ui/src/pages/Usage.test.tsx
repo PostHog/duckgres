@@ -24,6 +24,8 @@ const gibSeconds = (gibMonths: number) => gibMonths * AUGUST_HOURS * 3600;
 const RESPONSE: MonthlyUsageResponse = {
   from: "2026-06-01T00:00:00Z",
   months: 3,
+  aws_region: "us-east-1",
+  customer_pricing_region: "US",
   watermark_low: "2026-07-20T00:00:00Z",
   rows: [
     // Two historical team stamps for the same org must become one storage row.
@@ -84,11 +86,24 @@ describe("Usage page", () => {
 
     expect(within(screen.getByTestId("stat-Total cost")).getByText("$14.95")).toBeInTheDocument();
     expect(within(screen.getByTestId("stat-Total price")).getByText("$19.50")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Total price")).getByText("US progressive tiers · us-east-1")).toBeInTheDocument();
     expect(within(screen.getByTestId("stat-Total gross margin")).getByText("23.3%")).toBeInTheDocument();
     expect(within(screen.getByTestId("stat-Total gross margin")).getByText("$4.55 gross profit")).toBeInTheDocument();
     expect(screen.queryByTestId("stat-S3 GiB·h")).not.toBeInTheDocument();
     expect(screen.queryByTestId("stat-CPU-min")).not.toBeInTheDocument();
     expect(screen.queryByTestId("stat-Memory GiB·min")).not.toBeInTheDocument();
+  });
+
+  it("automatically applies EU pricing reported by the deployment", () => {
+    hooks.useMonthlyUsage.mockReturnValue(
+      ok({ ...RESPONSE, aws_region: "eu-central-1", customer_pricing_region: "EU" }),
+    );
+    renderPage();
+
+    expect(within(screen.getByTestId("stat-Total price")).getByText("$21.45")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Total price")).getByText("EU progressive tiers · eu-central-1")).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /customer price.*eu/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /us pricing|eu pricing/i })).not.toBeInTheDocument();
   });
 
   it("renders the retention caveat when billing has acked a watermark", () => {
@@ -99,7 +114,16 @@ describe("Usage page", () => {
   });
 
   it("renders an empty state when there is no usage", () => {
-    hooks.useMonthlyUsage.mockReturnValue(ok({ from: "2026-06-01T00:00:00Z", months: 3, watermark_low: null, rows: [] }));
+    hooks.useMonthlyUsage.mockReturnValue(
+      ok({
+        from: "2026-06-01T00:00:00Z",
+        months: 3,
+        aws_region: "us-east-1",
+        customer_pricing_region: "US",
+        watermark_low: null,
+        rows: [],
+      }),
+    );
     renderPage();
     expect(screen.getByText(/no usage has been recorded/i)).toBeInTheDocument();
   });

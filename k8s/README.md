@@ -67,6 +67,7 @@ Key flags for Kubernetes multitenant mode:
 | `--handover-drain-timeout` | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns/upgrades before forced exit (`15m` default in remote mode) |
 | `--sni-routing-mode` | `DUCKGRES_SNI_ROUTING_MODE` | Managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty |
 | `--managed-hostname-suffixes` | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.test.local` |
+| `--aws-region` | `DUCKGRES_AWS_REGION` | Effective deployment AWS region (empty by default). Required for the admin storage-economics view: `us-*` selects US customer pricing and `eu-*` selects EU customer pricing; missing/unsupported values fail that view closed. |
 | `--k8s-worker-image` | `DUCKGRES_K8S_WORKER_IMAGE` | Docker image for worker pods |
 | `--k8s-worker-image-pull-policy` | `DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY` | Image pull policy (`Never`, `IfNotPresent`, `Always`) |
 | `--k8s-worker-service-account` | `DUCKGRES_K8S_WORKER_SERVICE_ACCOUNT` | Shared ServiceAccount name for worker pods (`duckgres-worker` default) |

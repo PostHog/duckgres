@@ -86,7 +86,7 @@ type OrgStackInfo interface {
 // RegisterAPI registers all admin REST endpoints on the given router group.
 // fetcher (may be nil) aggregates per-CP live state (sessions/workers) across
 // replicas so the dashboard shows cluster-wide numbers instead of one CP's slice.
-func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo, fetcher PeerFetcher) {
+func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgStackInfo, fetcher PeerFetcher, awsRegion string) {
 	registerAPIWithStore(r, newGormAPIStore(store), info, fetcher)
 	// Generic read-only models explorer (sidebar + table + detail UI). Reads
 	// the concrete store directly because it needs the runtime schema name and
@@ -97,7 +97,7 @@ func RegisterAPI(r *gin.RouterGroup, store *configstore.ConfigStore, info OrgSta
 	registerOperatorsAPI(r, store)
 	// Monthly per-team usage for the "Usage" page — a read-only view over the
 	// billing buffer (see usage_api.go).
-	registerUsageAPI(r, store)
+	registerUsageAPI(r, store, awsRegion)
 }
 
 func registerAPIWithStore(r *gin.RouterGroup, store apiStore, info OrgStackInfo, fetcher PeerFetcher) {

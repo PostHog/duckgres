@@ -1,7 +1,7 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/states";
 import { InfoTooltip } from "@/components/InfoTooltip";
 import { OrgRef } from "@/components/OrgRef";
@@ -12,6 +12,7 @@ import {
   BINARY_UNITS_NOTE,
   GIB_HOURS_TOOLTIP,
   GROSS_MARGIN_TOOLTIP,
+  PRICE_AT_80_PERCENT_MARGIN_TOOLTIP,
   customerPriceTooltip,
   fmtMoney,
   orgTotals,
@@ -20,25 +21,61 @@ import {
 } from "@/lib/pricing";
 import type { MonthlyUsageRow } from "@/types/api";
 
-function HeaderWithTooltip({
-  children,
-  label,
-  text,
-}: {
-  children: ReactNode;
-  label: string;
-  text: string;
-}) {
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      {children}
-      <InfoTooltip label={label} text={text} />
-    </span>
-  );
-}
-
 function fmtMargin(profit: number, percent: number | null): string {
   return `${percent == null ? "N/A" : `${percent.toFixed(1)}%`} (${fmtMoney(profit)} profit)`;
+}
+
+type SortKey =
+  | "org"
+  | "storageGiBHours"
+  | "cost"
+  | "price"
+  | "priceAt80PercentMargin"
+  | "grossMarginPercent";
+type SortDirection = "asc" | "desc";
+
+const orgCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+
+function SortableHeader({
+  sortKey,
+  label,
+  activeKey,
+  direction,
+  onSort,
+  tooltipLabel,
+  tooltipText,
+  align = "left",
+}: {
+  sortKey: SortKey;
+  label: string;
+  activeKey: SortKey;
+  direction: SortDirection;
+  onSort: (key: SortKey) => void;
+  tooltipLabel?: string;
+  tooltipText?: string;
+  align?: "left" | "right";
+}) {
+  const active = activeKey === sortKey;
+  const SortIcon = active ? (direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+  return (
+    <TableHead
+      className={align === "right" ? "text-right" : undefined}
+      aria-sort={active ? (direction === "asc" ? "ascending" : "descending") : undefined}
+    >
+      <span className={`inline-flex items-center gap-1.5 ${align === "right" ? "w-full justify-end" : ""}`}>
+        <button
+          type="button"
+          className="inline-flex items-center gap-1 rounded-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={`Sort by ${label}`}
+          onClick={() => onSort(sortKey)}
+        >
+          <span>{label}</span>
+          <SortIcon className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+        {tooltipLabel && tooltipText ? <InfoTooltip label={tooltipLabel} text={tooltipText} /> : null}
+      </span>
+    </TableHead>
+  );
 }
 
 export function UsagePricing({
@@ -46,41 +83,56 @@ export function UsagePricing({
   labels,
   month,
   region,
-  onRegionChange,
 }: {
   rows: MonthlyUsageRow[];
   labels?: Map<string, string>;
   month: string;
   region: PricingRegion;
-  onRegionChange: (region: PricingRegion) => void;
 }) {
+  const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({
+    key: "org",
+    direction: "asc",
+  });
   const totals = useMemo(() => orgTotals(rows), [rows]);
   const pricing = useMemo(() => priceStorageByOrg(totals, month, region), [totals, month, region]);
+  const sortedRows = useMemo(() => {
+    const displayOrg = (orgId: string) => labels?.get(orgId)?.trim() || orgId;
+    const tieBreak = (a: (typeof pricing.rows)[number], b: (typeof pricing.rows)[number]) =>
+      orgCollator.compare(displayOrg(a.orgId), displayOrg(b.orgId)) ||
+      orgCollator.compare(a.orgId, b.orgId);
+    return [...pricing.rows].sort((a, b) => {
+      if (sort.key === "org") {
+        const comparison = tieBreak(a, b);
+        return sort.direction === "asc" ? comparison : -comparison;
+      }
+      const av = a[sort.key];
+      const bv = b[sort.key];
+      const aMissing = av == null || !Number.isFinite(av);
+      const bMissing = bv == null || !Number.isFinite(bv);
+      if (aMissing !== bMissing) return aMissing ? 1 : -1;
+      if (aMissing && bMissing) return tieBreak(a, b);
+      const comparison = (av as number) - (bv as number);
+      return comparison === 0 ? tieBreak(a, b) : sort.direction === "asc" ? comparison : -comparison;
+    });
+  }, [labels, pricing.rows, sort]);
+
+  const handleSort = (key: SortKey) => {
+    setSort((current) =>
+      current.key === key
+        ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+        : { key, direction: key === "org" ? "asc" : "desc" },
+    );
+  };
 
   return (
     <Card className="mt-4">
-      <CardHeader className="flex-row items-start justify-between gap-3">
+      <CardHeader>
         <div>
           <CardTitle>Storage economics</CardTitle>
           <p className="mt-0.5 text-xs text-muted-foreground">
             Estimated AWS storage cost, customer price, and gross margin for retained usage in {month}.
           </p>
           <p className="mt-1 text-xs text-muted-foreground">{BINARY_UNITS_NOTE}</p>
-        </div>
-        <div className="flex shrink-0 items-center gap-1" aria-label="Customer pricing region">
-          <span className="mr-1 text-xs text-muted-foreground">Customer pricing</span>
-          {(["US", "EU"] as const).map((value) => (
-            <Button
-              key={value}
-              size="sm"
-              variant={region === value ? "secondary" : "ghost"}
-              className="h-7 px-2 text-xs"
-              aria-label={`${value} pricing`}
-              onClick={() => onRegionChange(value)}
-            >
-              {value}
-            </Button>
-          ))}
         </div>
       </CardHeader>
       <CardContent>
@@ -90,31 +142,66 @@ export function UsagePricing({
           <Table>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
-                <TableHead>Org</TableHead>
-                <TableHead>
-                  <HeaderWithTooltip label="Explain S3 GiB·h" text={GIB_HOURS_TOOLTIP}>
-                    S3 GiB·h
-                  </HeaderWithTooltip>
-                </TableHead>
-                <TableHead className="text-right">
-                  <HeaderWithTooltip label="Explain AWS storage cost" text={AWS_COST_TOOLTIP}>
-                    Allocated AWS cost
-                  </HeaderWithTooltip>
-                </TableHead>
-                <TableHead className="text-right">
-                  <HeaderWithTooltip label="Explain customer price" text={customerPriceTooltip(region)}>
-                    Customer price ({region})
-                  </HeaderWithTooltip>
-                </TableHead>
-                <TableHead className="text-right">
-                  <HeaderWithTooltip label="Explain gross margin" text={GROSS_MARGIN_TOOLTIP}>
-                    Gross margin
-                  </HeaderWithTooltip>
-                </TableHead>
+                <SortableHeader
+                  sortKey="org"
+                  label="Org"
+                  activeKey={sort.key}
+                  direction={sort.direction}
+                  onSort={handleSort}
+                />
+                <SortableHeader
+                  sortKey="storageGiBHours"
+                  label="S3 GiB·h"
+                  activeKey={sort.key}
+                  direction={sort.direction}
+                  onSort={handleSort}
+                  tooltipLabel="Explain S3 GiB·h"
+                  tooltipText={GIB_HOURS_TOOLTIP}
+                />
+                <SortableHeader
+                  sortKey="cost"
+                  label="Allocated AWS cost"
+                  activeKey={sort.key}
+                  direction={sort.direction}
+                  onSort={handleSort}
+                  tooltipLabel="Explain AWS storage cost"
+                  tooltipText={AWS_COST_TOOLTIP}
+                  align="right"
+                />
+                <SortableHeader
+                  sortKey="price"
+                  label={`Customer price (${region})`}
+                  activeKey={sort.key}
+                  direction={sort.direction}
+                  onSort={handleSort}
+                  tooltipLabel="Explain customer price"
+                  tooltipText={customerPriceTooltip(region)}
+                  align="right"
+                />
+                <SortableHeader
+                  sortKey="priceAt80PercentMargin"
+                  label="Price at 80% margin"
+                  activeKey={sort.key}
+                  direction={sort.direction}
+                  onSort={handleSort}
+                  tooltipLabel="Explain price at 80% margin"
+                  tooltipText={PRICE_AT_80_PERCENT_MARGIN_TOOLTIP}
+                  align="right"
+                />
+                <SortableHeader
+                  sortKey="grossMarginPercent"
+                  label="Gross margin"
+                  activeKey={sort.key}
+                  direction={sort.direction}
+                  onSort={handleSort}
+                  tooltipLabel="Explain gross margin"
+                  tooltipText={GROSS_MARGIN_TOOLTIP}
+                  align="right"
+                />
               </TableRow>
             </TableHeader>
             <TableBody>
-              {pricing.rows.map((row) => (
+              {sortedRows.map((row) => (
                 <TableRow key={row.orgId}>
                   <TableCell>
                     <Link to={`/orgs/${encodeURIComponent(row.orgId)}`} className="block hover:underline">
@@ -124,6 +211,9 @@ export function UsagePricing({
                   <TableCell className="font-mono text-xs">{fmtUnits(row.storageGiBHours)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{fmtMoney(row.cost)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{fmtMoney(row.price)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">
+                    {fmtMoney(row.priceAt80PercentMargin)}
+                  </TableCell>
                   <TableCell className="text-right font-mono text-xs font-medium">
                     {fmtMargin(row.grossProfit, row.grossMarginPercent)}
                   </TableCell>
@@ -134,6 +224,9 @@ export function UsagePricing({
                 <TableCell className="font-mono text-xs">{fmtUnits(pricing.summary.storageGiBHours)}</TableCell>
                 <TableCell className="text-right font-mono text-xs">{fmtMoney(pricing.summary.cost)}</TableCell>
                 <TableCell className="text-right font-mono text-xs">{fmtMoney(pricing.summary.price)}</TableCell>
+                <TableCell className="text-right font-mono text-xs">
+                  {fmtMoney(pricing.summary.priceAt80PercentMargin)}
+                </TableCell>
                 <TableCell className="text-right font-mono text-xs">
                   {fmtMargin(pricing.summary.grossProfit, pricing.summary.grossMarginPercent)}
                 </TableCell>
