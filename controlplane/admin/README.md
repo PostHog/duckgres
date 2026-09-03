@@ -90,6 +90,16 @@ Added for the console:
 | `POST /api/v1/operators` | admin | add/update an operator (`{email, role}`; last-admin demotion → 409) |
 | `DELETE /api/v1/operators/:email` | admin | remove an operator (removing the last admin → 409) |
 
+The Usage page currently presents storage only. It converts retained S3 GiB·h
+to GiB-month using the actual number of hours in the selected UTC calendar
+month. The storage-economics view defaults to the US customer pricing schedule;
+operators can switch it to EU. Customer tiers are progressive and calculated
+separately for each organization. The AWS cost is a capacity-only estimate using
+public S3 Standard us-east-1 rates across aggregate usage in the view, then
+allocated to organizations in proportion to their usage. It excludes requests, transfers,
+taxes, credits, negotiated discounts, and other AWS account usage, so it is not
+an invoice or an exact CUR charge.
+
 ### Cross-CP live-state aggregation (`live_aggregate.go` + `controlplane/live_aggregator.go`)
 
 Live session/query state is **in-memory per CP** — each replica only knows the
