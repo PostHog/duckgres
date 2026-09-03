@@ -710,6 +710,8 @@ export interface MonthlyUsageRow {
 export interface MonthlyUsageResponse {
   from: string;
   months: number;
+  aws_region: string;
+  customer_pricing_region: "US" | "EU";
   watermark_low: string | null;
   rows: MonthlyUsageRow[];
 }

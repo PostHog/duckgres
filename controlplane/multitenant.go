@@ -719,7 +719,7 @@ func SetupMultiTenant(
 		admin.AuditMiddleware(auditStore),
 		admin.RoleGate(),
 	)
-	admin.RegisterAPI(api, store, adpt, liveFetcher)
+	admin.RegisterAPI(api, store, adpt, liveFetcher, cfg.K8s.AWSRegion)
 	// gormStore implements both provisioning.Store (HTTP-shape operations) and
 	// provisioning.TenantStore (service-credential mint + snapshot reload), so a
 	// single wrapper serves both RegisterAPI arguments. liveFetcher doubles as

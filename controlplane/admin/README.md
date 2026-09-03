@@ -72,7 +72,7 @@ Added for the console:
 | `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at pgwire connect), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
 | `POST /api/v1/orgs/:id/users/:username/enable` | admin | persist `disabled=false` + reload cluster-wide so the user can reconnect at once |
 | `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
-| `GET /api/v1/usage/monthly` | admin | cumulative per-team usage per UTC month (CPU-seconds, memory GiB-seconds, S3 GiB-seconds), backing the **Usage** page. Self-gates with `RequireAdmin` (not just RoleGate's method check) because per-team cost data across all orgs is as sensitive as the raw billing families. Reads the SAME billing buffer as `GET /billing/usage`, so retention is the buffer's: acked buckets are deleted, >30d buckets GC'd — `watermark_low` in the response marks where billed data was removed. `?months=N` (default 6, max 36) sets the window |
+| `GET /api/v1/usage/monthly` | admin | cumulative per-team usage per UTC month (CPU-seconds, memory GiB-seconds, S3 GiB-seconds), backing the **Usage** page. The response also identifies the control plane's effective `aws_region` and its derived `customer_pricing_region`. Self-gates with `RequireAdmin` (not just RoleGate's method check) because per-team cost data across all orgs is as sensitive as the raw billing families. Reads the SAME billing buffer as `GET /billing/usage`, so retention is the buffer's: acked buckets are deleted, >30d buckets GC'd — `watermark_low` in the response marks where billed data was removed. `?months=N` (default 6, max 36) sets the window |
 | `GET /api/v1/orgs/:id/usage/daily` | admin | one org's daily per-team usage series (same families), backing the org detail page's **Usage** charts. Same RequireAdmin gate and buffer-retention semantics; the org scope is the `:id` path segment flowing into the queries' WHERE clause. `?days=N` (default 14, max 31 — the buffer's 30d GC bounds useful range) |
 | `GET /api/v1/orgs/:id/monitoring/snapshot` | internal secret | Customer-safe org warehouse state, resource limits, workers, sessions, queue depth, and CP coverage. Omits user, pod, image, SQL, client, trace, and control-plane identifiers |
 | `GET /api/v1/orgs/:id/monitoring/series` | internal secret | Customer-safe, org-forced Prometheus range query. Requires an allow-listed `metric`; `window` is one of `1h`, `6h`, `24h` (default), `7d`, `30d` |
@@ -92,13 +92,21 @@ Added for the console:
 
 The Usage page currently presents storage only. It converts retained S3 GiB·h
 to GiB-month using the actual number of hours in the selected UTC calendar
-month. The storage-economics view defaults to the US customer pricing schedule;
-operators can switch it to EU. Customer tiers are progressive and calculated
-separately for each organization. The AWS cost is a capacity-only estimate using
-public S3 Standard us-east-1 rates across aggregate usage in the view, then
-allocated to organizations in proportion to their usage. It excludes requests, transfers,
-taxes, credits, negotiated discounts, and other AWS account usage, so it is not
-an invoice or an exact CUR charge.
+month. Customer pricing is selected automatically from the control plane's
+effective `DUCKGRES_AWS_REGION`: `us-*` uses the US schedule and `eu-*` uses
+the EU schedule. Missing or unsupported regions make this endpoint return 503
+rather than showing a plausible but incorrect price. Customer tiers are
+progressive and calculated separately for each organization. Every column is
+sortable; unavailable gross margins stay last in both directions. “Price at
+80% margin” is a what-if value equal to allocated AWS cost divided by 20%
+(`5 × cost`), calculated before currency rounding.
+
+The AWS cost model remains separate from customer pricing: it is a
+capacity-only estimate using public S3 Standard us-east-1 rates across
+aggregate usage in the view, then allocated to organizations in proportion to
+their usage. It excludes requests, transfers, taxes, credits, negotiated
+discounts, and other AWS account usage, so it is not an invoice or an exact
+CUR charge.
 
 ### Cross-CP live-state aggregation (`live_aggregate.go` + `controlplane/live_aggregator.go`)
 
@@ -261,6 +269,14 @@ just ui-dev mw-prod-us-admin   # → RED prod banner
 
 The SPA uses relative `/api/v1` paths, so the same bundle runs identically
 embedded, under Vite, or under the Go devserver.
+
+For local usage-pricing development, start the proxied control plane with an
+explicit `--aws-region` or `DUCKGRES_AWS_REGION`; there is intentionally no
+pricing-region default. If `/usage` reports that customer pricing is
+unsupported, inspect the effective AWS region, correct it to the deployment's
+`us-*` or `eu-*` region, and restart/redeploy the control plane. Do not work
+around the error by inferring the browser domain or an individual org's bucket
+region.
 
 ## Tests
 

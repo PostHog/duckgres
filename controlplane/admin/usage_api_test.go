@@ -42,6 +42,10 @@ func (s *fakeMonthlyUsageStore) ComputeBillingCursor() (time.Time, bool, error) 
 // identity standing in for AuthMiddleware. role="" simulates an
 // unauthenticated caller (no identity in context).
 func setupUsageRouter(store usageStore, role Role) *gin.Engine {
+	return setupUsageRouterForRegion(store, role, "us-east-1")
+}
+
+func setupUsageRouterForRegion(store usageStore, role Role, awsRegion string) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	if role != "" {
@@ -49,7 +53,7 @@ func setupUsageRouter(store usageStore, role Role) *gin.Engine {
 			c.Set(ctxIdentityKey, &Identity{Email: "op@posthog.com", Role: role, Source: "sso"})
 		})
 	}
-	registerUsageAPI(r.Group("/api/v1"), store)
+	registerUsageAPI(r.Group("/api/v1"), store, awsRegion)
 	return r
 }
 
@@ -61,10 +65,38 @@ func setupUsageRouterAt(store usageStore, now func() time.Time) *gin.Engine {
 	r.Use(func(c *gin.Context) {
 		c.Set(ctxIdentityKey, &Identity{Email: "op@posthog.com", Role: RoleAdmin, Source: "sso"})
 	})
-	h := &usageAPIHandler{store: store, now: now}
+	h := &usageAPIHandler{store: store, now: now, awsRegion: "us-east-1"}
 	r.GET("/api/v1/usage/monthly", RequireAdmin(), h.getMonthlyUsage)
 	r.GET("/api/v1/orgs/:id/usage/daily", RequireAdmin(), h.getDailyUsage)
 	return r
+}
+
+func TestMonthlyUsageReportsDeploymentPricingRegion(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name        string
+		awsRegion   string
+		wantStatus  int
+		wantPricing string
+	}{
+		{name: "US production and development", awsRegion: "us-east-1", wantStatus: http.StatusOK, wantPricing: "US"},
+		{name: "EU deployment", awsRegion: "eu-central-1", wantStatus: http.StatusOK, wantPricing: "EU"},
+		{name: "missing region", awsRegion: "", wantStatus: http.StatusServiceUnavailable},
+		{name: "unsupported region", awsRegion: "ap-southeast-1", wantStatus: http.StatusServiceUnavailable},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := setupUsageRouterForRegion(&fakeMonthlyUsageStore{}, RoleAdmin, tt.awsRegion)
+			code, body := usageRequest(t, r, "/api/v1/usage/monthly")
+			if code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d: %v", code, tt.wantStatus, body)
+			}
+			if code == http.StatusOK && (body["aws_region"] != tt.awsRegion || body["customer_pricing_region"] != tt.wantPricing) {
+				t.Fatalf("deployment pricing fields = %v, want aws_region=%q customer_pricing_region=%q", body, tt.awsRegion, tt.wantPricing)
+			}
+		})
+	}
 }
 
 // Usage data is cost data: the billing pull API gates the raw families behind

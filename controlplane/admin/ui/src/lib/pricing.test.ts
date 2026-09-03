@@ -76,6 +76,11 @@ describe("storage pricing", () => {
     expect(priced.rows[0].price).toBeCloseTo(19.5);
     expect(priced.rows[0].grossProfit).toBeCloseTo(5.7);
     expect(priced.rows[0].grossMarginPercent).toBeCloseTo(29.2307);
+    expect(priced.rows[0].priceAt80PercentMargin).toBeCloseTo(69);
+    expect(
+      (priced.rows[0].priceAt80PercentMargin - priced.rows[0].cost) /
+        priced.rows[0].priceAt80PercentMargin,
+    ).toBeCloseTo(0.8);
 
     expect(priced.rows[1].cost).toBeCloseTo(1.15);
     expect(priced.rows[1].price).toBe(0);
@@ -86,6 +91,16 @@ describe("storage pricing", () => {
     expect(priced.summary.price).toBeCloseTo(19.5);
     expect(priced.summary.grossProfit).toBeCloseTo(4.55);
     expect(priced.summary.grossMarginPercent).toBeCloseTo(23.3333);
+    expect(priced.summary.priceAt80PercentMargin).toBeCloseTo(74.75);
+    expect(priced.summary.priceAt80PercentMargin).toBeCloseTo(
+      priced.rows.reduce((sum, row) => sum + row.priceAt80PercentMargin, 0),
+    );
+  });
+
+  it("reports a zero target price when allocated storage cost is zero", () => {
+    const priced = priceStorageByOrg([{ orgId: "org-a", storageGiBHours: 0 }], "2026-08", "US");
+    expect(priced.rows[0].priceAt80PercentMargin).toBe(0);
+    expect(priced.summary.priceAt80PercentMargin).toBe(0);
   });
 });
 

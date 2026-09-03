@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -31,8 +32,9 @@ type usageStore interface {
 // watermark_low so the UI can caveat the window instead of silently implying
 // all-time totals.
 type usageAPIHandler struct {
-	store usageStore
-	now   func() time.Time
+	store     usageStore
+	now       func() time.Time
+	awsRegion string
 }
 
 const (
@@ -64,8 +66,8 @@ type monthlyUsageResponseRow struct {
 // API gates the raw families behind RequireAdmin for exactly that reason, and
 // the monthly aggregate is no less sensitive. The gate travels with the route
 // (not RoleGate's path list), so renaming the route cannot downgrade it.
-func registerUsageAPI(r gin.IRouter, store usageStore) {
-	h := &usageAPIHandler{store: store, now: time.Now}
+func registerUsageAPI(r gin.IRouter, store usageStore, awsRegion string) {
+	h := &usageAPIHandler{store: store, now: time.Now, awsRegion: awsRegion}
 	r.GET("/usage/monthly", RequireAdmin(), h.getMonthlyUsage)
 	// Per-org daily series for the org detail page's usage charts. Same
 	// RequireAdmin gate as the monthly read (per-team cost data).
@@ -73,6 +75,13 @@ func registerUsageAPI(r gin.IRouter, store usageStore) {
 }
 
 func (h *usageAPIHandler) getMonthlyUsage(c *gin.Context) {
+	pricingRegion, ok := customerPricingRegionForAWSRegion(h.awsRegion)
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": "storage customer pricing is unsupported for the configured AWS region",
+		})
+		return
+	}
 	months := usageDefaultMonths
 	if raw := c.Query("months"); raw != "" {
 		n, err := strconv.Atoi(raw)
@@ -152,11 +161,29 @@ func (h *usageAPIHandler) getMonthlyUsage(c *gin.Context) {
 		watermarkLow = cursor.UTC().Format(time.RFC3339)
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"months":        months,
-		"from":          from.Format(time.RFC3339),
-		"watermark_low": watermarkLow,
-		"rows":          rows,
+		"months":                  months,
+		"from":                    from.Format(time.RFC3339),
+		"aws_region":              strings.TrimSpace(h.awsRegion),
+		"customer_pricing_region": pricingRegion,
+		"watermark_low":           watermarkLow,
+		"rows":                    rows,
 	})
+}
+
+// customerPricingRegionForAWSRegion maps the control plane's effective AWS
+// region to the only two customer storage-price schedules we operate. Keep
+// this strict: guessing a price for an unset or future region would make the
+// admin economics view confidently wrong.
+func customerPricingRegionForAWSRegion(awsRegion string) (string, bool) {
+	region := strings.ToLower(strings.TrimSpace(awsRegion))
+	switch {
+	case strings.HasPrefix(region, "us-"):
+		return "US", true
+	case strings.HasPrefix(region, "eu-"):
+		return "EU", true
+	default:
+		return "", false
+	}
 }
 
 // dailyUsageResponseRow is one (date, team) line of an org's daily series —

@@ -16,6 +16,7 @@ export interface OrgStoragePricing extends OrgUsageTotals {
   price: number;
   grossProfit: number;
   grossMarginPercent: number | null;
+  priceAt80PercentMargin: number;
 }
 
 export interface StoragePricingSummary {
@@ -25,6 +26,7 @@ export interface StoragePricingSummary {
   price: number;
   grossProfit: number;
   grossMarginPercent: number | null;
+  priceAt80PercentMargin: number;
 }
 
 type StorageTier = {
@@ -79,6 +81,9 @@ export function customerPriceTooltip(region: PricingRegion): string {
 
 export const GROSS_MARGIN_TOOLTIP =
   "Gross margin is gross profit divided by customer price, where gross profit is customer price minus allocated AWS storage cost. The table shows both. Free-tier organizations can have negative gross profit because S3 still costs us; margin is unavailable when customer price is $0.";
+
+export const PRICE_AT_80_PERCENT_MARGIN_TOOLTIP =
+  "Price that would produce an 80% storage gross margin for this organization using its allocated estimated AWS storage cost: target price = allocated cost ÷ (1 − 0.80) = 5 × allocated cost. This is a what-if value, not the current progressive customer price, and it inherits the AWS cost estimate's exclusions and allocation assumptions. At zero allocated cost it displays $0.00; margin itself is undefined when both cost and price are zero.";
 
 export const BINARY_UNITS_NOTE =
   "Storage follows AWS's binary convention: 1 GB = 2^30 bytes (1 GiB), and 1 TB = 2^40 bytes (1024 GB).";
@@ -151,6 +156,7 @@ export function priceStorageByOrg(
       price,
       grossProfit,
       grossMarginPercent: price > 0 ? (grossProfit / price) * 100 : null,
+      priceAt80PercentMargin: cost / (1 - 0.8),
     };
   });
 
@@ -166,6 +172,7 @@ export function priceStorageByOrg(
       price,
       grossProfit,
       grossMarginPercent: price > 0 ? (grossProfit / price) * 100 : null,
+      priceAt80PercentMargin: totalCost / (1 - 0.8),
     },
   };
 }
