@@ -3176,25 +3176,22 @@ copy_active_and_survives_idle() { # org password
   fail "copy_active: streaming COPY (~70s) failed all $attempt attempts with transient stream errors — likely a real re-arm/reaper regression (last: $last)"
 }
 
-# ---- admin RBAC: SSO viewer is read-only -----------------------------------
-# A forged ALB OIDC header (no internal secret) for an @posthog.com email that
-# is NOT in the operators table resolves to the viewer role (fail-closed
-# default): it can read but must be blocked from mutations and from the audit
-# log. Exercises RoleGate + RequireAdmin against the REAL router (the unit tests
-# cover the gate algorithm; this covers the wiring). The JWT is unsigned because
-# the CP trusts the ALB-injected header by network position. (Role is no longer
-# group-based — it comes from the operators table; an unknown email = viewer.)
+# ---- admin SSO: forged headers are rejected ---------------------------------
+# The admin API verifies the ALB OIDC JWT signature. An unsigned JWT, and the
+# unsigned identity-only header, must both get 401 — the pod is reachable
+# without crossing the ALB (same-namespace pods, kubectl port-forward), so the
+# signature is the trust boundary. The viewer RoleGate wiring stays covered by
+# the unit tests (TestAuthMiddlewareSSORoleMapping, TestRoleGate); the real
+# ALB JWT is not available to this harness.
 admin_rbac_viewer() { # org
   org="$1"
-  log "admin RBAC: forged SSO viewer (unknown operator) is read-only (no mutate, no audit)"
+  log "admin SSO: forged OIDC headers are rejected (401)"
   payload="$(printf '{"email":"ci-viewer@posthog.com","email_verified":true}' | base64 -w0 | tr '+/' '-_' | tr -d '=')"
   vh="X-Amzn-Oidc-Data: e30.${payload}.sig"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/orgs")"
-  [ "$code" = "200" ] || fail "viewer GET /orgs returned $code, want 200 (reads allowed)"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -H "$vh" "$API/api/v1/audit")"
-  [ "$code" = "403" ] || fail "viewer GET /audit returned $code, want 403 (audit is admin-only)"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "$vh" -H 'Content-Type: application/json' -d '{}' "$API/api/v1/orgs/$org")"
-  [ "$code" = "403" ] || fail "viewer PUT /orgs/$org returned $code, want 403 (mutations are admin-only)"
+  [ "$code" = "401" ] || fail "forged X-Amzn-Oidc-Data GET /orgs returned $code, want 401"
+  code="$(curl -s -o /dev/null -w '%{http_code}' -H "X-Amzn-Oidc-Identity: ci-viewer@posthog.com" "$API/api/v1/orgs")"
+  [ "$code" = "401" ] || fail "forged X-Amzn-Oidc-Identity GET /orgs returned $code, want 401"
 }
 
 # ---- instance-invalidation guard: no spurious retirement --------------------

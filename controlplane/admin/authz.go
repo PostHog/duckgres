@@ -30,13 +30,15 @@ const (
 
 	// albOIDCDataHeader is the signed JWT the AWS ALB injects after a
 	// successful Cognito (Google Workspace) authentication. It carries the
-	// user's claims (email, groups). The ALB strips any client-supplied copy,
-	// so on an internal-scheme LB reachable only over the tailnet it is the
-	// trust boundary for operator identity.
+	// user's claims (email, groups). The ALB strips any client-supplied copy.
+	// The admin layer verifies the JWT signature before trusting it, because
+	// the pod is also reachable without crossing the ALB (same-namespace pods,
+	// kubectl port-forward).
+	//
+	// The companion X-Amzn-Oidc-Identity header (a bare email string) is
+	// deliberately not read: it carries no signature, so it is forgeable by
+	// any caller that bypasses the ALB.
 	albOIDCDataHeader = "X-Amzn-Oidc-Data"
-	// albOIDCIdentityHeader carries just the subject/email; used as a fallback
-	// when the full data JWT is absent.
-	albOIDCIdentityHeader = "X-Amzn-Oidc-Identity"
 )
 
 // ssoEmailDomain is the only email domain accepted on the SSO path. SSO emails
@@ -74,7 +76,13 @@ func IdentityFromContext(c *gin.Context) *Identity {
 // path and always maps to admin. Otherwise the ALB-injected Cognito JWT yields
 // the caller's email, and resolve (the operators-table lookup) maps that email
 // to a Role. Unauthenticated requests are rejected 401.
-func AuthMiddleware(tokens TokenSet, resolve RoleResolver) gin.HandlerFunc {
+//
+// The verifier checks the ALB OIDC JWT signature. A nil verifier disables the
+// SSO path entirely: SSO headers are ignored and only bearer tokens
+// authenticate. The control plane fails startup when SSO is configured without
+// a verifier, so a nil verifier means the operator deliberately runs without
+// SSO.
+func AuthMiddleware(tokens TokenSet, resolve RoleResolver, verifier *ALBOIDCVerifier) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 1. Internal secret (header or login cookie) -> admin (break-glass).
 		if tokens.Valid(requestAdminToken(c)) {
@@ -82,8 +90,12 @@ func AuthMiddleware(tokens TokenSet, resolve RoleResolver) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		// 2. ALB/Cognito SSO identity: extract the email, then resolve its role.
-		email := emailFromOIDC(c)
+		// 2. ALB/Cognito SSO identity: verify the JWT, extract the email, then
+		// resolve its role.
+		email := ""
+		if verifier != nil {
+			email = emailFromOIDC(c, verifier)
+		}
 		if email == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
 			return
@@ -97,33 +109,25 @@ func AuthMiddleware(tokens TokenSet, resolve RoleResolver) gin.HandlerFunc {
 	}
 }
 
-// emailFromOIDC extracts the caller's email from the ALB OIDC data JWT (falling
-// back to the `sub` claim, then to the identity-only header). It returns "" when
-// no usable SSO identity is present OR when the email fails domain hardening.
+// emailFromOIDC extracts the caller's email from a signature-verified ALB OIDC
+// data JWT. It returns "" when no usable SSO identity is present OR when the
+// email fails domain hardening.
+//
+// The X-Amzn-Oidc-Identity header is never consulted. It is an unsigned bare
+// email string, so any caller that bypasses the ALB could forge it.
 //
 // Domain hardening: only @posthog.com emails are accepted, and a JWT
 // email_verified claim that is explicitly false rejects the identity. This is
 // defense in depth on top of the ALB/Cognito allow-list — a stray non-corporate
 // or unverified identity never becomes a logged-in (even viewer) caller.
-//
-// The JWT signature is NOT verified here: the request only reaches this pod via
-// the internal-scheme ALB (which signs and injects the header and strips
-// client-supplied copies) over a tailnet-restricted network. Verifying the
-// ALB's regional public key by `kid` is a hardening follow-up tracked in the
-// design doc.
-func emailFromOIDC(c *gin.Context) string {
+func emailFromOIDC(c *gin.Context, verifier *ALBOIDCVerifier) string {
 	raw := c.GetHeader(albOIDCDataHeader)
 	if raw == "" {
-		// Fallback: identity-only header (email/subject). The data JWT is absent,
-		// so there is no email_verified claim to consult — domain check still applies.
-		if email := c.GetHeader(albOIDCIdentityHeader); acceptableSSOEmail(email, true) {
-			return strings.ToLower(strings.TrimSpace(email))
-		}
 		return ""
 	}
-	claims, err := decodeJWTClaims(raw)
+	claims, err := verifier.Verify(raw)
 	if err != nil {
-		slog.Warn("admin: failed to decode ALB OIDC data header", "error", err)
+		slog.Warn("admin: rejected ALB OIDC data header", "error", err)
 		return ""
 	}
 	email := stringClaim(claims, "email")
