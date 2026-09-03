@@ -78,16 +78,18 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 		}
 	}
 
-	warmupIterations := r.cfg.Catalog.WarmupIterations
-	for i := 0; i < warmupIterations; i++ {
-		if err := r.executeIteration(ctx, false, 0, &summary); err != nil {
-			return summary, err
+	for _, protocol := range r.cfg.Catalog.Targets {
+		warmupIterations := r.cfg.Catalog.WarmupIterations
+		for i := 0; i < warmupIterations; i++ {
+			if err := r.executeIteration(ctx, protocol, false, 0, &summary); err != nil {
+				return summary, err
+			}
 		}
-	}
-	measureIterations := r.cfg.Catalog.MeasureIterations
-	for i := 0; i < measureIterations; i++ {
-		if err := r.executeIteration(ctx, true, i+1, &summary); err != nil {
-			return summary, err
+		measureIterations := r.cfg.Catalog.MeasureIterations
+		for i := 0; i < measureIterations; i++ {
+			if err := r.executeIteration(ctx, protocol, true, i+1, &summary); err != nil {
+				return summary, err
+			}
 		}
 	}
 
@@ -108,51 +110,49 @@ func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 	return r.metrics.Gatherer()
 }
 
-func (r *QueryRunner) executeIteration(ctx context.Context, measure bool, measureIteration int, summary *RunSummary) error {
+func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, measure bool, measureIteration int, summary *RunSummary) error {
 	for _, query := range queriesForIteration(r.cfg.Catalog.Queries, measureIteration) {
+		if !querySupportsProtocol(query, protocol) {
+			continue
+		}
 		args := orderedParamValues(query.Params)
-		for _, protocol := range r.cfg.Catalog.Targets {
-			if !querySupportsProtocol(query, protocol) {
-				continue
-			}
-			driver := r.cfg.Drivers[protocol]
-			started := r.cfg.Now()
-			result := QueryResult{
-				QueryID:          query.QueryID,
-				IntentID:         query.IntentID,
-				MeasureIteration: measureIteration,
-				Protocol:         protocol,
-				StartedAt:        started,
-			}
+		driver := r.cfg.Drivers[protocol]
+		started := r.cfg.Now()
+		result := QueryResult{
+			QueryID:          query.QueryID,
+			IntentID:         query.IntentID,
+			MeasureIteration: measureIteration,
+			Protocol:         protocol,
+			StartedAt:        started,
+		}
 
-			execResult, err := driver.Execute(ctx, query, args)
-			if execResult.Duration <= 0 {
-				execResult.Duration = time.Since(started)
-			}
-			result.Duration = execResult.Duration
-			result.Rows = execResult.Rows
-			if err != nil {
-				result.Status = "error"
-				result.Error = err.Error()
-				result.ErrorClass = "execution_error"
-			} else {
-				result.Status = "ok"
-			}
-			r.metrics.Observe(result)
+		execResult, err := driver.Execute(ctx, query, args)
+		if execResult.Duration <= 0 {
+			execResult.Duration = time.Since(started)
+		}
+		result.Duration = execResult.Duration
+		result.Rows = execResult.Rows
+		if err != nil {
+			result.Status = "error"
+			result.Error = err.Error()
+			result.ErrorClass = "execution_error"
+		} else {
+			result.Status = "ok"
+		}
+		r.metrics.Observe(result)
 
-			if measure {
-				summary.TotalQueries++
-				if result.Status == "error" {
-					summary.TotalErrors++
-				}
-				if r.cfg.Sink != nil {
-					if err := r.cfg.Sink.Record(result); err != nil {
-						return fmt.Errorf("sink record (%s/%s): %w", protocol, query.QueryID, err)
-					}
-				}
-			} else {
-				summary.WarmupQueries++
+		if measure {
+			summary.TotalQueries++
+			if result.Status == "error" {
+				summary.TotalErrors++
 			}
+			if r.cfg.Sink != nil {
+				if err := r.cfg.Sink.Record(result); err != nil {
+					return fmt.Errorf("sink record (%s/%s): %w", protocol, query.QueryID, err)
+				}
+			}
+		} else {
+			summary.WarmupQueries++
 		}
 	}
 	return nil
