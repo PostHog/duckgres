@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ type testDriver struct {
 	protocol Protocol
 	calls    int
 	queryIDs []string
+	events   *[]string
 }
 
 func (d *testDriver) Protocol() Protocol { return d.protocol }
@@ -18,7 +20,66 @@ func (d *testDriver) Protocol() Protocol { return d.protocol }
 func (d *testDriver) Execute(_ context.Context, query Query, _ []any) (ExecutionResult, error) {
 	d.calls++
 	d.queryIDs = append(d.queryIDs, query.QueryID)
+	if d.events != nil {
+		*d.events = append(*d.events, string(d.protocol)+"/"+query.QueryID)
+	}
 	return ExecutionResult{Rows: 1}, nil
+}
+
+func TestRunnerCompletesWarmupAndMeasurementsForEachProtocolBeforeStartingNext(t *testing.T) {
+	const trino Protocol = "trino"
+	events := []string{}
+	pg := &testDriver{protocol: ProtocolPGWire, events: &events}
+	trinoDriver := &testDriver{protocol: trino, events: &events}
+	sink := &inMemorySink{}
+	runner := NewQueryRunner(RunnerConfig{
+		Catalog: Catalog{
+			Name:              "protocol-isolation",
+			WarmupIterations:  1,
+			MeasureIterations: 2,
+			Targets:           []Protocol{ProtocolPGWire, trino},
+			Queries: []Query{
+				{
+					QueryID:   "q1",
+					IntentID:  "i1",
+					PGWireSQL: "SELECT 1",
+				},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{
+			ProtocolPGWire: pg,
+			trino:          trinoDriver,
+		},
+		Sink: sink,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	want := []string{
+		"pgwire/q1", "pgwire/q1", "pgwire/q1",
+		"trino/q1", "trino/q1", "trino/q1",
+	}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("execution order: got %v want %v", events, want)
+	}
+	if got, want := summaryProtocolIterations(sink), []string{"pgwire/1", "pgwire/2", "trino/1", "trino/2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected sink records: got %v want %v", got, want)
+	}
+	if summary.WarmupQueries != 2 || summary.TotalQueries != 4 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+}
+
+func summaryProtocolIterations(sink *inMemorySink) []string {
+	results := sink.results
+	got := make([]string, 0, len(results))
+	for _, result := range results {
+		got = append(got, fmt.Sprintf("%s/%d", result.Protocol, result.MeasureIteration))
+	}
+	return got
 }
 
 func TestRunnerExecutesPairedQueriesThroughExistingRuntimeContract(t *testing.T) {

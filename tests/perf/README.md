@@ -17,6 +17,12 @@ authenticated `SELECT 1` outside query timing, retrying for up to 2 minutes at
 2-second intervals by default. This absorbs the bounded delay between Trino
 readiness, Kubernetes Secret projection, and file-authenticator refresh.
 
+When a catalog targets multiple protocols, the runner completes all warmup and
+measured iterations for one protocol before starting the next protocol in the
+catalog's declared target order. This keeps each protocol's connection and
+worker cache active throughout its measurements and prevents slow queries in
+one protocol from changing another protocol's cache context.
+
 ## Paired Query Catalogs
 
 Existing catalogs continue to use `queries:` unchanged. A catalog may contain

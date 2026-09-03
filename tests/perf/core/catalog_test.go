@@ -49,20 +49,20 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 		t.Fatalf("LoadCatalog: %v", err)
 	}
 	want := []string{
-		"q_events_total_balanced_v2__raw_view",
-		"q_events_total_balanced_v2__ducklake_table",
-		"q_events_count_one_day_balanced_v2__raw_view",
-		"q_events_count_one_day_balanced_v2__ducklake_table",
-		"q_events_by_name_march_2026_balanced_v2__raw_view",
-		"q_events_by_name_march_2026_balanced_v2__ducklake_table",
-		"q_events_distinct_persons_balanced_v2__raw_view",
-		"q_events_distinct_persons_balanced_v2__ducklake_table",
-		"q_persons_total_balanced_v2__raw_view",
-		"q_persons_total_balanced_v2__ducklake_table",
-		"q_persons_daily_april_2026_balanced_v2__raw_view",
-		"q_persons_daily_april_2026_balanced_v2__ducklake_table",
-		"q_events_daily_march_2026_balanced_v2__raw_view",
-		"q_events_daily_march_2026_balanced_v2__ducklake_table",
+		"q_events_total_balanced_v3__raw_view",
+		"q_events_total_balanced_v3__ducklake_table",
+		"q_events_count_one_day_balanced_v3__raw_view",
+		"q_events_count_one_day_balanced_v3__ducklake_table",
+		"q_events_by_name_march_2026_balanced_v3__raw_view",
+		"q_events_by_name_march_2026_balanced_v3__ducklake_table",
+		"q_events_distinct_persons_balanced_v3__raw_view",
+		"q_events_distinct_persons_balanced_v3__ducklake_table",
+		"q_persons_total_balanced_v3__raw_view",
+		"q_persons_total_balanced_v3__ducklake_table",
+		"q_persons_daily_april_2026_balanced_v3__raw_view",
+		"q_persons_daily_april_2026_balanced_v3__ducklake_table",
+		"q_events_daily_march_2026_balanced_v3__raw_view",
+		"q_events_daily_march_2026_balanced_v3__ducklake_table",
 	}
 	if got := queryIDs(catalog); !reflect.DeepEqual(got, want) {
 		t.Fatalf("checked-in PostHog query IDs changed: got %v want %v", got, want)
@@ -71,7 +71,7 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 		t.Fatalf("checked-in PostHog measure iterations = %d, want 4 for balanced target order", catalog.MeasureIterations)
 	}
 	for _, query := range catalog.Queries {
-		if !strings.HasSuffix(query.IntentID, "_balanced_v2") {
+		if !strings.HasSuffix(query.IntentID, "_balanced_v3") {
 			t.Fatalf("checked-in PostHog query %s has unversioned methodology intent %q", query.QueryID, query.IntentID)
 		}
 		if strings.Contains(query.PGWireSQL, "TIMESTAMPTZ '") {
