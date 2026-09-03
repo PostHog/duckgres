@@ -20,6 +20,7 @@ KUBECTL=(kubectl --context "$CTX")
 EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-posthog-mw-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SA_NAME="duckgres"
+SCENARIO_SA_NAME="duckgres-scenario"
 FROZEN_S3_URI="${DUCKGRES_SCENARIO_FROZEN_S3_URI:-s3://posthog-duckgres-scenario-frozen-data-mw-dev/frozen_v1/}"
 SCENARIO_JOB_WATCH_TIMEOUT_SECONDS="${SCENARIO_JOB_WATCH_TIMEOUT_SECONDS:-16200}"
 SCENARIO_JOB_CLEANUP_TIMEOUT_SECONDS="${SCENARIO_JOB_CLEANUP_TIMEOUT_SECONDS:-180}"
@@ -162,6 +163,14 @@ create_pod_identity() { # service-account role-arn
 ensure_trino_pod_identity() {
   : "${TRINO_POD_IDENTITY_ROLE:?TRINO_POD_IDENTITY_ROLE is required for the trino e2e suite}"
   create_pod_identity trino "$TRINO_POD_IDENTITY_ROLE"
+}
+
+ensure_scenario_pod_identity() {
+  : "${SCENARIO_POD_IDENTITY_ROLE:?SCENARIO_POD_IDENTITY_ROLE is required for the Athena perf scenario}"
+  create_pod_identity "$SCENARIO_SA_NAME" "$SCENARIO_POD_IDENTITY_ROLE"
+  # Pod Identity is injected only at pod admission. Let the association reach
+  # the node agent before test-scenario creates the runner Job.
+  sleep 15
 }
 
 delete_pod_identity() {
@@ -327,6 +336,10 @@ cmd_deploy() {
   # pod actually carries the injected credentials.
   ensure_pod_identity
   restart_cp_with_identity
+
+  if [ "$SCENARIO_NAME" = "posthog_frozen_perf" ]; then
+    ensure_scenario_pod_identity
+  fi
 
   if [ "$E2E_SUITE" = "trino" ]; then
     # Associate before admitting Trino pods: the Pod Identity agent injects
@@ -520,6 +533,7 @@ spec:
         # holds the only artifact copy. Voluntary disruption would lose both.
         karpenter.sh/do-not-disrupt: "true"
     spec:
+      serviceAccountName: $SCENARIO_SA_NAME
       restartPolicy: Never
       nodeSelector:
         kubernetes.io/arch: arm64
@@ -535,6 +549,10 @@ spec:
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
+            - { name: DUCKGRES_SCENARIO_ATHENA_REGION, value: "$AWS_REGION" }
+            - { name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: "${DUCKGRES_SCENARIO_ATHENA_WORKGROUP:-}" }
+            - { name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: "${DUCKGRES_SCENARIO_ATHENA_DATABASE:-}" }
+            - { name: DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI, value: "${DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI:-}" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
             - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "$DUCKGRES_K8S_WORKER_CPU_REQUEST" }
             - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" }

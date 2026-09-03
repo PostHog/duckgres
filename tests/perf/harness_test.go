@@ -153,7 +153,7 @@ func TestGoldenQueryPerformanceHarness(t *testing.T) {
 		t.Fatalf("write runner.log: %v", err)
 	}
 
-	for _, artifact := range []string{"summary.json", "query_results.csv", "server_metrics.prom", "runner.log"} {
+	for _, artifact := range []string{"summary.json", "query_results.csv", "query_service_metrics.csv", "server_metrics.prom", "runner.log"} {
 		if _, err := os.Stat(filepath.Join(outputDir, artifact)); err != nil {
 			t.Fatalf("expected artifact %s: %v", artifact, err)
 		}

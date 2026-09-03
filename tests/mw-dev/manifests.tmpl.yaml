@@ -128,6 +128,12 @@ metadata:
   namespace: ${NAMESPACE}
 automountServiceAccountToken: false
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: duckgres-scenario
+  namespace: ${NAMESPACE}
+---
 # In-namespace CP permissions: spawn/patch worker pods, manage per-worker
 # secrets, read the worker configmap, hold the janitor lease. Mirrors the
 # chart's duckgres-control-plane Role.

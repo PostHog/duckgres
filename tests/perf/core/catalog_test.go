@@ -26,7 +26,7 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 			}
 			wantTargets := []Protocol{ProtocolPGWire}
 			if filepath.Base(path) == "ducklake_posthog_tables.yaml" {
-				wantTargets = []Protocol{ProtocolPGWire, ProtocolTrino}
+				wantTargets = []Protocol{ProtocolPGWire, ProtocolTrino, ProtocolAthena}
 			}
 			if !reflect.DeepEqual(catalog.Targets, wantTargets) {
 				t.Fatalf("catalog targets = %v, want %v", catalog.Targets, wantTargets)
@@ -51,18 +51,25 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 	want := []string{
 		"q_events_total_balanced_v3__raw_view",
 		"q_events_total_balanced_v3__ducklake_table",
+		"q_events_total_balanced_v3__athena_external",
 		"q_events_count_one_day_balanced_v3__raw_view",
 		"q_events_count_one_day_balanced_v3__ducklake_table",
+		"q_events_count_one_day_balanced_v3__athena_external",
 		"q_events_by_name_march_2026_balanced_v3__raw_view",
 		"q_events_by_name_march_2026_balanced_v3__ducklake_table",
+		"q_events_by_name_march_2026_balanced_v3__athena_external",
 		"q_events_distinct_persons_balanced_v3__raw_view",
 		"q_events_distinct_persons_balanced_v3__ducklake_table",
+		"q_events_distinct_persons_balanced_v3__athena_external",
 		"q_persons_total_balanced_v3__raw_view",
 		"q_persons_total_balanced_v3__ducklake_table",
+		"q_persons_total_balanced_v3__athena_external",
 		"q_persons_daily_april_2026_balanced_v3__raw_view",
 		"q_persons_daily_april_2026_balanced_v3__ducklake_table",
+		"q_persons_daily_april_2026_balanced_v3__athena_external",
 		"q_events_daily_march_2026_balanced_v3__raw_view",
 		"q_events_daily_march_2026_balanced_v3__ducklake_table",
+		"q_events_daily_march_2026_balanced_v3__athena_external",
 	}
 	if got := queryIDs(catalog); !reflect.DeepEqual(got, want) {
 		t.Fatalf("checked-in PostHog query IDs changed: got %v want %v", got, want)
@@ -79,36 +86,73 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 		}
 	}
 	for index, query := range catalog.Queries {
-		wantTarget := StorageTargetRawView
-		if index%2 == 1 {
-			wantTarget = StorageTargetDuckLakeTable
-		}
+		wantTarget := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable, StorageTargetAthenaExternal}[index%3]
 		if query.StorageTarget != wantTarget {
 			t.Fatalf("query %s storage target = %q, want %q", query.QueryID, query.StorageTarget, wantTarget)
 		}
-		if index%2 != 1 {
+		if index%3 != 2 {
 			continue
 		}
 
-		rawQuery := catalog.Queries[index-1]
-		if query.IntentID != rawQuery.IntentID {
-			t.Fatalf("query pair %s/%s has mismatched intents %q/%q", rawQuery.QueryID, query.QueryID, rawQuery.IntentID, query.IntentID)
+		rawQuery := catalog.Queries[index-2]
+		duckLakeQuery := catalog.Queries[index-1]
+		if query.IntentID != rawQuery.IntentID || duckLakeQuery.IntentID != rawQuery.IntentID {
+			t.Fatalf("query variants have mismatched intents: %q/%q/%q", rawQuery.IntentID, duckLakeQuery.IntentID, query.IntentID)
 		}
-		if !reflect.DeepEqual(query.Tags, rawQuery.Tags) || !reflect.DeepEqual(query.Params, rawQuery.Params) {
-			t.Fatalf("query pair %s/%s must share tags and params", rawQuery.QueryID, query.QueryID)
+		if !reflect.DeepEqual(query.Tags, rawQuery.Tags) || !reflect.DeepEqual(query.Params, rawQuery.Params) ||
+			!reflect.DeepEqual(duckLakeQuery.Tags, rawQuery.Tags) || !reflect.DeepEqual(duckLakeQuery.Params, rawQuery.Params) {
+			t.Fatalf("query variants for %s must share tags and params", rawQuery.IntentID)
 		}
 
 		rawRelation := `"frozen_v1"."events_file_view"`
 		duckLakeRelation := `"posthog"."events"`
+		athenaRelation := `"events"`
 		if strings.HasPrefix(query.IntentID, "intent_persons_") {
 			rawRelation = `"frozen_v1"."persons_file_view"`
 			duckLakeRelation = `"posthog"."persons"`
+			athenaRelation = `"persons"`
 		}
 		rawShape := strings.ReplaceAll(rawQuery.PGWireSQL, rawRelation, "<relation>")
-		duckLakeShape := strings.ReplaceAll(query.PGWireSQL, duckLakeRelation, "<relation>")
-		if rawShape != duckLakeShape {
-			t.Fatalf("query pair %s/%s differs beyond its relation:\nraw: %s\ntable: %s", rawQuery.QueryID, query.QueryID, rawQuery.PGWireSQL, query.PGWireSQL)
+		duckLakeShape := strings.ReplaceAll(duckLakeQuery.PGWireSQL, duckLakeRelation, "<relation>")
+		athenaShape := strings.ReplaceAll(query.PGWireSQL, athenaRelation, "<relation>")
+		if rawShape != duckLakeShape || rawShape != athenaShape {
+			t.Fatalf("query variants for %s differ beyond their relation", rawQuery.IntentID)
 		}
+	}
+}
+
+func TestParseCatalogExpandsAthenaExternalVariantWhenAthenaIsTargeted(t *testing.T) {
+	catalog, err := ParseCatalog([]byte(athenaCatalogYAML(`
+paired_queries:
+  - query_id_base: q_events
+    intent_id: ph.events.v1
+    sql_template: SELECT COUNT(*) FROM {{ relation "events" }}
+`)))
+	if err != nil {
+		t.Fatalf("ParseCatalog returned error: %v", err)
+	}
+	if got, want := queryIDs(catalog), []string{"q_events__raw_view", "q_events__ducklake_table", "q_events__athena_external"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected generated query order: got %v want %v", got, want)
+	}
+	athenaQuery := catalog.Queries[2]
+	if got, want := athenaQuery.StorageTarget, StorageTargetAthenaExternal; got != want {
+		t.Fatalf("Athena query target: got %q want %q", got, want)
+	}
+	if got, want := athenaQuery.PGWireSQL, `SELECT COUNT(*) FROM "events"`; got != want {
+		t.Fatalf("Athena query SQL: got %q want %q", got, want)
+	}
+}
+
+func TestParseCatalogRejectsAthenaTargetWithoutExternalVariant(t *testing.T) {
+	raw := strings.Replace(pairedCatalogYAML(`
+paired_queries:
+  - query_id_base: q_events
+    intent_id: ph.events.v1
+    sql_template: SELECT COUNT(*) FROM {{ relation "events" }}
+`), "targets: [pgwire]", "targets: [pgwire, athena]", 1)
+	_, err := ParseCatalog([]byte(raw))
+	if err == nil || !strings.Contains(err.Error(), "athena_external") {
+		t.Fatalf("ParseCatalog error = %v, want missing athena_external variant", err)
 	}
 }
 
@@ -423,6 +467,21 @@ relation_variants:
     events: posthog.events
     persons: posthog.persons
 	`, "\t") + body)
+}
+
+func athenaCatalogYAML(body string) string {
+	return strings.Replace(catalogYAML(strings.TrimSuffix(`
+relation_variants:
+  raw_view:
+    events: frozen_v1.events_file_view
+    persons: frozen_v1.persons_file_view
+  ducklake_table:
+    events: posthog.events
+    persons: posthog.persons
+  athena_external:
+    events: events
+    persons: persons
+	`, "\t")+body), "targets: [pgwire]", "targets: [pgwire, trino, athena]", 1)
 }
 
 func catalogYAML(body string) string {

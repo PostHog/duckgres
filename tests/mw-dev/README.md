@@ -103,12 +103,20 @@ Optional perf-step settings are:
 - `trino_ca_cert_file` (default empty, using system roots)
 - `trino_startup_timeout` (default `2m`)
 - `trino_startup_poll_interval` (default `2s`)
+- `athena_catalog` (default `AwsDataCatalog`)
+- `athena_poll_interval` (default `500ms`)
+- `athena_query_timeout` (default `30m`)
+
+An Athena target additionally requires explicit `athena_region`,
+`athena_workgroup`, `athena_database`, and `athena_output_location` settings.
+The output location must be the same `s3://` prefix enforced by the workgroup.
+Athena uses unique query execution IDs for result object names.
 
 The startup window contains an authenticated `SELECT 1` retry and completes
 before warmup or measured statements run. For the isolated mw-dev cell, use
 `trino_ca_cert_file: /trino-ca/ca.crt`.
 
-`posthog_frozen_perf` enables Trino and selects the isolated Trino suite. Its
+`posthog_frozen_perf` enables Trino and Athena and selects the isolated Trino suite. Its
 scenario Job mounts the per-run CA from `duckgres-trino-tls` and passes that
 path through `DUCKGRES_SCENARIO_TRINO_CA_CERT`; the perf adapter verifies the
 coordinator certificate and retries its first authenticated query for the
@@ -116,8 +124,12 @@ bounded Secret-projection window. It also passes the deployed
 `DUCKGRES_K8S_WORKER_CPU_REQUEST` and `DUCKGRES_K8S_WORKER_MEMORY_REQUEST` into
 the perf step, which requests that exact shape through PGWire startup options
 and therefore bypasses the exploratory worker tier. The paired catalog remains the single SQL
-source: direct-Parquet `raw_view` members run only through PGWire, while each
-production-shaped `ducklake_table` member runs through both PGWire and Trino.
+source: direct-Parquet `raw_view` members run only through PGWire,
+production-shaped `ducklake_table` members run through PGWire and Trino, and
+`athena_external` members run through Athena against Glue tables over the same
+immutable Parquet objects. Athena is on-demand, result reuse is disabled, and
+the harness records service-side timing and scanned bytes in
+`query_service_metrics.csv`.
 To reproduce the scheduled run, deploy and test with `E2E_SUITE=trino` and the
 same `TRINO_POD_IDENTITY_ROLE` required by the isolated Trino lane. Teardown and
 the scheduled cleanup sweep remove both namespace-local workloads and their
@@ -504,6 +516,10 @@ finalizers are still running.
 | var | `TS_WIF_AUDIENCE_MW_DEV` | Tailscale WIF audience |
 | secret | `MW_DEV_ACCOUNT_ID` | mw-dev AWS account id (kept out of committed code; ARNs are built from it) |
 | secret | `MW_DEV_TRINO_POD_IDENTITY_ROLE` | full ARN of the dedicated mw-dev Trino Pod Identity role (consumed only by the Trino lane) |
+| secret | `MW_DEV_ATHENA_POD_IDENTITY_ROLE` | full ARN of the least-privilege Athena scenario Pod Identity role |
+| var | `MW_DEV_ATHENA_WORKGROUP` | on-demand Athena engine-v3 workgroup |
+| var | `MW_DEV_ATHENA_DATABASE` | Glue database containing the frozen external tables |
+| var | `MW_DEV_ATHENA_RESULTS_S3_URI` | encrypted result prefix ending in `/`; lifecycle expiry is required |
 | secret | `AWS_ECR_PUBLISH_IAM_ROLE` | ECR push (already exists; used by CD) |
 | (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP and dedicated Trino roles + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
 | repo setting | "Require approval for all outside collaborators" | the access gate (see below) |

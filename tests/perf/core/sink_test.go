@@ -142,3 +142,67 @@ paired_queries:
 		t.Fatalf("CSV query IDs: got %v want %v", got, want)
 	}
 }
+
+func TestArtifactSinkWritesAthenaServiceMetricsWithoutChangingQueryResultsV1(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := NewArtifactSink(dir)
+	if err != nil {
+		t.Fatalf("NewArtifactSink returned error: %v", err)
+	}
+	if err := sink.Record(QueryResult{
+		QueryID:          "q1__athena_external",
+		IntentID:         "i1",
+		MeasureIteration: 1,
+		Protocol:         ProtocolAthena,
+		Status:           "ok",
+		Rows:             1,
+		Duration:         3 * time.Second,
+		StartedAt:        time.Unix(1700000000, 0),
+		ServiceMetrics: &ServiceMetrics{
+			QueueDuration:    100 * time.Millisecond,
+			PlanningDuration: 200 * time.Millisecond,
+			EngineDuration:   2 * time.Second,
+			ServiceDuration:  2500 * time.Millisecond,
+			BytesScanned:     4096,
+			DPUCount:         4,
+			ResultReused:     false,
+			EngineVersion:    "Athena engine version 3",
+		},
+	}); err != nil {
+		t.Fatalf("Record returned error: %v", err)
+	}
+	if err := sink.Close(RunSummary{}, ""); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+
+	queryFile, err := os.Open(filepath.Join(dir, "query_results.csv"))
+	if err != nil {
+		t.Fatalf("open query_results.csv: %v", err)
+	}
+	queryRecords, err := csv.NewReader(queryFile).ReadAll()
+	_ = queryFile.Close()
+	if err != nil {
+		t.Fatalf("read query_results.csv: %v", err)
+	}
+	wantQueryHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at"}
+	if !reflect.DeepEqual(queryRecords[0], wantQueryHeader) {
+		t.Fatalf("query_results.csv v1 header changed: got %v want %v", queryRecords[0], wantQueryHeader)
+	}
+
+	metricsFile, err := os.Open(filepath.Join(dir, "query_service_metrics.csv"))
+	if err != nil {
+		t.Fatalf("open query_service_metrics.csv: %v", err)
+	}
+	metricsRecords, err := csv.NewReader(metricsFile).ReadAll()
+	_ = metricsFile.Close()
+	if err != nil {
+		t.Fatalf("read query_service_metrics.csv: %v", err)
+	}
+	wantMetricsHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "queue_ms", "planning_ms", "engine_ms", "service_ms", "bytes_scanned", "dpu_count", "result_reused", "engine_version"}
+	if !reflect.DeepEqual(metricsRecords[0], wantMetricsHeader) {
+		t.Fatalf("service metrics header: got %v want %v", metricsRecords[0], wantMetricsHeader)
+	}
+	if got, want := metricsRecords[1], []string{"q1__athena_external", "i1", "1", "athena", "100.000000", "200.000000", "2000.000000", "2500.000000", "4096", "4", "false", "Athena engine version 3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("service metrics row: got %v want %v", got, want)
+	}
+}

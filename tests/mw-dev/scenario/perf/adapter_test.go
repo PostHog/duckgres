@@ -13,6 +13,7 @@ import (
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
+	athenadriver "github.com/posthog/duckgres/tests/perf/drivers/athena"
 	trinodriver "github.com/posthog/duckgres/tests/perf/drivers/trino"
 )
 
@@ -80,7 +81,7 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	}
 
 	perfDir := filepath.Join(executor.OutputDir(), "perf")
-	for _, name := range []string{"summary.json", "query_results.csv", "server_metrics.prom"} {
+	for _, name := range []string{"summary.json", "query_results.csv", "query_service_metrics.csv", "server_metrics.prom"} {
 		if _, err := os.Stat(filepath.Join(perfDir, name)); err != nil {
 			t.Fatalf("expected perf artifact %s: %v", name, err)
 		}
@@ -218,6 +219,55 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 	}
 	if !strings.Contains(string(csvBytes), "\nq1,i1,1,trino,ok,") {
 		t.Fatalf("query_results.csv missing measured Trino row: %q", string(csvBytes))
+	}
+}
+
+func TestExecutorBuildsAthenaDriverFromExplicitOnDemandConfig(t *testing.T) {
+	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolAthena})
+	provisionState := provision.NewState()
+	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{Password: "root-password"})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: provisionState,
+		OutputDir:      t.TempDir(),
+		DriverFactory:  factory,
+	})
+
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id":                 "scenario-org",
+			"catalog_file":           catalogPath,
+			"run_id":                 "scenario-run-1",
+			"targets":                []any{"athena"},
+			"athena_region":          "us-east-1",
+			"athena_workgroup":       "benchmark",
+			"athena_catalog":         "AwsDataCatalog",
+			"athena_database":        "benchmark_frozen",
+			"athena_output_location": "s3://benchmark-results/run/",
+			"athena_poll_interval":   "750ms",
+			"athena_query_timeout":   "20m",
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStep returned error: %v", err)
+	}
+
+	want := athenadriver.ConnectionConfig{
+		Region:         "us-east-1",
+		WorkGroup:      "benchmark",
+		Catalog:        "AwsDataCatalog",
+		Database:       "benchmark_frozen",
+		OutputLocation: "s3://benchmark-results/run/",
+		PollInterval:   750 * time.Millisecond,
+		QueryTimeout:   20 * time.Minute,
+	}
+	if factory.athenaConnection != want {
+		t.Fatalf("Athena connection = %+v, want %+v", factory.athenaConnection, want)
+	}
+	if factory.athenaContext == nil {
+		t.Fatal("Athena factory did not receive scenario context")
 	}
 }
 
@@ -443,6 +493,9 @@ type fakeDriverFactory struct {
 	trinoConnection  trinodriver.ConnectionConfig
 	trinoContext     context.Context
 	trinoDriver      *fakeProtocolDriver
+	athenaConnection athenadriver.ConnectionConfig
+	athenaContext    context.Context
+	athenaDriver     *fakeProtocolDriver
 }
 
 func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
@@ -456,6 +509,13 @@ func (f *fakeDriverFactory) NewTrino(ctx context.Context, connection trinodriver
 	f.trinoConnection = connection
 	f.trinoDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolTrino}
 	return f.trinoDriver, nil
+}
+
+func (f *fakeDriverFactory) NewAthena(ctx context.Context, connection athenadriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+	f.athenaContext = ctx
+	f.athenaConnection = connection
+	f.athenaDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolAthena}
+	return f.athenaDriver, nil
 }
 
 type fakeProtocolDriver struct {
