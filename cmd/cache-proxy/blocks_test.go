@@ -59,9 +59,9 @@ func TestBlockSpan(t *testing.T) {
 }
 
 func TestBlockKey(t *testing.T) {
-	k1 := BlockKey("http://s3/bucket/f.parquet", 0, 8<<20)
-	k2 := BlockKey("http://s3/bucket/f.parquet", 1, 8<<20)
-	k3 := BlockKey("http://s3/bucket/f.parquet", 0, 16<<20)
+	k1 := BlockKey("", "http://s3/bucket/f.parquet", 0, 8<<20)
+	k2 := BlockKey("", "http://s3/bucket/f.parquet", 1, 8<<20)
+	k3 := BlockKey("", "http://s3/bucket/f.parquet", 0, 16<<20)
 	if !IsValidCacheKey(k1) {
 		t.Fatalf("BlockKey output %q is not a valid cache key", k1)
 	}
@@ -71,10 +71,10 @@ func TestBlockKey(t *testing.T) {
 	if k1 == k3 {
 		t.Fatal("different block sizes must produce different keys")
 	}
-	if k1 != BlockKey("http://s3/bucket/f.parquet", 0, 8<<20) {
+	if k1 != BlockKey("", "http://s3/bucket/f.parquet", 0, 8<<20) {
 		t.Fatal("BlockKey must be deterministic")
 	}
-	if k1 == CacheKey("http://s3/bucket/f.parquet", "bytes=0-100") {
+	if k1 == CacheKey("", "http://s3/bucket/f.parquet", "bytes=0-100") {
 		t.Fatal("block keys must not collide with legacy keys")
 	}
 }

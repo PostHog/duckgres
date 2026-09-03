@@ -151,6 +151,18 @@ func main() {
 		}
 	}
 
+	// Comma-separated hostname substrings a CONNECT target must contain.
+	// Empty means any hostname on port 443 is allowed; the port and local-IP
+	// rules apply either way. See connectRefusalReason.
+	var connectAllowedSuffixes []string
+	if raw := os.Getenv("CONNECT_ALLOWED_SUFFIXES"); raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				connectAllowedSuffixes = append(connectAllowedSuffixes, s)
+			}
+		}
+	}
+
 	slog.Info("Starting cache-proxy.",
 		"cache_dir", cacheDir,
 		"max_percent", maxPercent,
@@ -164,6 +176,7 @@ func main() {
 		"peer_service", peerService,
 		"peer_lookup_mode", lookupMode,
 		"cache_host_suffixes", cacheHostSuffixes,
+		"connect_allowed_suffixes", connectAllowedSuffixes,
 	)
 
 	// Block-aligned cache mode: fixed-size, content-addressed blocks instead of
@@ -213,6 +226,7 @@ func main() {
 	proxy.blockMode = blockMode
 	proxy.blockSize = blockSize
 	proxy.maxSpanBlocks = maxSpanBlocks
+	proxy.connectAllowedSuffixes = connectAllowedSuffixes
 
 	// Forward HTTP proxy (DuckDB httpfs traffic). ServeMux can't match absolute
 	// URLs in forward-proxy requests, so use the handler directly.

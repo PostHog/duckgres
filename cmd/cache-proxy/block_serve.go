@@ -85,13 +85,14 @@ func writeRangeNotSatisfiable(w http.ResponseWriter, objectSize int64) {
 }
 
 // fetchOriginSpan fetches blocks [firstIdx, lastIdx] of r.URL in ONE origin
-// range GET and commits each block to the store under its BlockKey. Rewriting
+// range GET and commits each block to the store under its BlockKey. scope is
+// the tenant scope from TenantScope and is part of every block key. Rewriting
 // the Range header is legal: DuckDB httpfs signs only
 // host;x-amz-content-sha256;x-amz-date (see forwardUncached), so Range is not
 // covered by the SigV4 signature. Content-Range is validated before any block
 // is committed, and each selected block must contain exactly the advertised
 // number of bytes.
-func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastIdx int64) error {
+func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastIdx int64, scope string) error {
 	timeout := p.originTimeout
 	if timeout <= 0 {
 		timeout = defaultOriginTimeout
@@ -160,7 +161,7 @@ func (p *CacheProxy) fetchOriginSpan(r *http.Request, blockSize, firstIdx, lastI
 	remaining := expectedBodySize
 	for idx := firstIdx; idx <= lastIdx && remaining > 0; idx++ {
 		blockBytes := min(blockSize, remaining)
-		size, err := p.store.PutStream(BlockKey(r.URL.String(), idx, blockSize), &exactLengthReader{
+		size, err := p.store.PutStream(BlockKey(scope, r.URL.String(), idx, blockSize), &exactLengthReader{
 			r:         resp.Body,
 			remaining: blockBytes,
 		})
@@ -190,9 +191,11 @@ func (p *CacheProxy) blockPresent(key string) bool {
 // serveBlockAligned serves a cacheable GET whose Range is an absolute
 // bytes=start-end pair from block-aligned cache entries: local disk, then
 // peers, then coalesced origin fetches for contiguous missing runs (chunked
-// at maxSpanBlocks per origin request). Returns false when the request shape
-// is not block-servable; the caller then runs the legacy exact-range path.
-func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, rangeHeader string) bool {
+// at maxSpanBlocks per origin request). scope is the tenant scope from
+// TenantScope and is part of every block key. Returns false when the request
+// shape is not block-servable; the caller then runs the legacy exact-range
+// path.
+func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, rangeHeader, scope string) bool {
 	requestStart := time.Now()
 	var peerDur, s3Dur, writeDur time.Duration
 
@@ -251,7 +254,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 			// if only lo keyed the call, the loser would adopt the winner's
 			// (shorter) fetch result while believing its own longer span was
 			// covered — silently leaving trailing blocks unfetched.
-			flightKey := fmt.Sprintf("%s|%d", BlockKey(urlStr, lo, p.blockSize), hi)
+			flightKey := fmt.Sprintf("%s|%d", BlockKey(scope, urlStr, lo, p.blockSize), hi)
 			_, err := p.flights.Do(flightKey, func() (fetchResult, error) {
 				fetchStart := time.Now()
 				// Retry transient origin failures inside the flight so every
@@ -259,7 +262,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 				// absorbed here instead of reaching DuckDB as a 502.
 				_, fetchSpan := proxyTracer.Start(r.Context(), "cache.origin_span_fetch")
 				fetchErr := p.retryOriginFetch(r, fetchSpan, func() error {
-					return p.fetchOriginSpan(r, p.blockSize, lo, hi)
+					return p.fetchOriginSpan(r, p.blockSize, lo, hi, scope)
 				})
 				fetchSpan.End()
 				s3Dur += time.Since(fetchStart)
@@ -300,7 +303,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		return true
 	}
 	for idx := firstIdx; idx <= lastIdx; idx++ {
-		key := BlockKey(urlStr, idx, p.blockSize)
+		key := BlockKey(scope, urlStr, idx, p.blockSize)
 		if p.blockPresent(key) {
 			if !flushRun(idx - 1) {
 				return true // error already written
@@ -376,7 +379,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		fetchStart := time.Now()
 		_, fetchSpan := proxyTracer.Start(r.Context(), "cache.origin_span_refetch")
 		err := p.retryOriginFetch(r, fetchSpan, func() error {
-			return p.fetchOriginSpan(r, p.blockSize, lo, runEnd)
+			return p.fetchOriginSpan(r, p.blockSize, lo, runEnd, scope)
 		})
 		fetchSpan.End()
 		s3Dur += time.Since(fetchStart)
@@ -388,7 +391,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		nOrigin += runEnd - lo + 1
 	}
 	for idx := firstIdx; idx <= lastIdx; idx++ {
-		if p.blockPresent(BlockKey(urlStr, idx, p.blockSize)) {
+		if p.blockPresent(BlockKey(scope, urlStr, idx, p.blockSize)) {
 			reverify(idx - 1)
 			continue
 		}
@@ -398,7 +401,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 	}
 	reverify(lastIdx)
 	for idx := firstIdx; idx <= lastIdx; idx++ {
-		if !p.blockPresent(BlockKey(urlStr, idx, p.blockSize)) {
+		if !p.blockPresent(BlockKey(scope, urlStr, idx, p.blockSize)) {
 			slog.Error("Block still missing after presence re-fetch; failing closed.",
 				"url", urlStr, "block", idx)
 			http.Error(w, "block cache entry missing after re-fetch", http.StatusBadGateway)
@@ -425,7 +428,7 @@ func (p *CacheProxy) serveBlockAligned(w http.ResponseWriter, r *http.Request, r
 		}
 	}
 	for idx := firstIdx; idx <= lastIdx; idx++ {
-		reader, size, ok := p.store.openFile(BlockKey(urlStr, idx, p.blockSize))
+		reader, size, ok := p.store.openFile(BlockKey(scope, urlStr, idx, p.blockSize))
 		if !ok {
 			closeOpened()
 			blockFallbackTotal.WithLabelValues("entry_vanished").Inc()

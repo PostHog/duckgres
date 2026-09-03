@@ -19,7 +19,8 @@ available, and forwards cache misses to origin object storage.
 | `CACHE_MAX_CONCURRENT_PEER_PROBES` | `64` | Per-pod non-blocking cap on active summary-mode `/cache/has` HTTP requests and sockets. It is not a process goroutine limit. When exhausted, confirmations are skipped and the request fetches origin. `CACHE_MAX_PEER_PROBES_IN_FLIGHT` is a deprecated alias. |
 | `CACHE_PROXY_ID` | pod name, node name, then hostname | Stable opaque receiver identity used for deterministic peer-summary selection; it must not be a customer or object identifier. |
 | `HEALTH_ADDR` | `:8082` | Health and Prometheus metrics listener. |
-| `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. |
+| `CACHE_HOST_SUFFIXES` | empty | Empty means all `GET` hosts are cacheable. Otherwise, cache only hosts containing one of the comma-separated suffixes. When non-empty, the plain-HTTP forward path also refuses targets outside the list with `403`; when empty (legacy mode), forwarding stays unrestricted. |
+| `CONNECT_ALLOWED_SUFFIXES` | empty | Optional hostname substrings a `CONNECT` target must contain. Empty means any hostname on port 443 is allowed. The port-443 and local-IP-refusal rules always apply. |
 | `CACHE_BLOCK_MODE` | `off` | `on` enables block-aligned caching; any other value (including unset) keeps the legacy exact-range path. See [Block-aligned mode](#block-aligned-mode). |
 | `CACHE_BLOCK_SIZE_BYTES` | `8388608` (8 MiB) | Fixed block size for block-aligned mode. Ignored when block mode is off. |
 | `CACHE_BLOCK_MAX_SPAN_BLOCKS` | `8` | Max blocks coalesced into one origin range fetch. Ignored when block mode is off. |
@@ -91,9 +92,40 @@ All lookup state comes from the in-memory index under the cache mutex, not
 from filesystem stats, so `/cache/has` and eviction/size accounting can never
 disagree about whether an entry exists.
 
+## Security boundaries
+
+The proxy binds a hostPort and serves unauthenticated requests from any pod in
+the cluster. Two boundaries keep that safe in the managed-warehouse topology,
+where tenants share a bucket with per-org path prefixes:
+
+- **Cache keys are tenant-scoped.** The scope is the SigV4 access key ID from
+  the request's `Authorization` header
+  (`AWS4-HMAC-SHA256 Credential=<ACCESS_KEY_ID>/...`). STS access key IDs are
+  unique per issued credential set, so the scope separates tenants. The legacy
+  key is `sha256(scope + "\x00" + url + "|" + range)` and the block key is
+  `sha256(scope + "\x00" + url + "|blk|" + idx + "|" + blockSize)`. A warm
+  entry for one tenant — local or from a peer — is never served to a request
+  signed by another tenant; it simply misses and goes to the origin, where
+  S3 authorization applies. Requests without a parseable SigV4 header share
+  the empty-scope namespace, which is correct for public objects. The access
+  key ID is an identifier, not a secret; the secret key and the signature
+  never enter the key. Peer traffic carries only these opaque keys, so the
+  peer protocol is unchanged. Changing the key format invalidates all
+  existing on-disk entries: they become unreachable and age out by LRU.
+- **The relay surface is locked down.** `CONNECT` only dials port 443, refuses
+  loopback, link-local, and unspecified IP literals, and optionally requires
+  the hostname to contain a `CONNECT_ALLOWED_SUFFIXES` entry. Port 443 for
+  arbitrary hostnames stays allowed because DuckDB reads external HTTPS
+  sources through the proxy while `http_proxy` is set globally. The
+  plain-HTTP forward path (non-`GET`, passthrough, non-cache hosts) forwards
+  only to hosts matching `CACHE_HOST_SUFFIXES` when that list is configured;
+  signed S3 traffic matches by definition. With no suffixes configured the
+  forward path stays unrestricted for backward compatibility.
+
 ## Block-aligned mode
 
-The legacy cache key is `sha256(url|range)` — an exact match on the client's
+The legacy cache key is `sha256(scope + "\x00" + url + "|" + range)` — an
+exact match on the client's
 `Range` header. DuckDB's Parquet reader rarely issues the same byte range
 twice, even across repeat runs of the same query: footer probes, row-group
 reads, and column-chunk reads all drift by a few bytes depending on prior
@@ -104,7 +136,8 @@ miss rate on a workload that should have been fully warm.
 
 Block-aligned mode fixes this by keying the cache on fixed-size blocks of the
 underlying object instead of the client's exact range. The key is
-`sha256(url|blk|idx|blockSize)`, where `idx` is the block index (`start /
+`sha256(scope + "\x00" + url + "|blk|" + idx + "|" + blockSize)`, where `idx`
+is the block index (`start /
 blockSize`) and `blockSize` is part of the key so a config change can't serve
 a wrong-sized entry — old-size entries just become unreachable and age out
 normally. A request is served by locating the blocks its range overlaps

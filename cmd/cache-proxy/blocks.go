@@ -85,8 +85,13 @@ func blockSpan(start, end, blockSize int64) (firstIdx, lastIdx int64) {
 // BlockKey computes the cache key for one block of an object. blockSize is
 // part of the key so a block-size config change can never serve a
 // wrong-sized entry — old-size entries simply become unreachable and age out.
-func BlockKey(url string, blockIdx, blockSize int64) string {
+// scope is the SigV4 access key ID (see TenantScope), so two tenants reading
+// the same object URL never share a block.
+//
+// Hash input format: scope + "\x00" + url + "|blk|" + idx + "|" + blockSize.
+// The NUL separator makes the scope boundary unambiguous, same as CacheKey.
+func BlockKey(scope, url string, blockIdx, blockSize int64) string {
 	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%s|blk|%d|%d", url, blockIdx, blockSize)
+	_, _ = fmt.Fprintf(h, "%s\x00%s|blk|%d|%d", scope, url, blockIdx, blockSize)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }

@@ -39,14 +39,19 @@ func requestSpanAttrs(r *http.Request) []attribute.KeyValue {
 
 // CacheProxy is a forward HTTP proxy that caches responses on local NVMe.
 // DuckDB httpfs sends each S3 request as a signed plain-HTTP request to the
-// proxy; the proxy caches by URL+Range and forwards misses verbatim. The
-// SigV4 signature stays valid because Host/URL are unchanged, so the proxy
-// needs no AWS credentials of its own.
+// proxy; the proxy caches by tenant scope (SigV4 access key ID) + URL + Range
+// and forwards misses verbatim. The SigV4 signature stays valid because
+// Host/URL are unchanged, so the proxy needs no AWS credentials of its own.
 type CacheProxy struct {
 	store   *DiskCache
 	peers   *PeerManager
 	client  *http.Client
 	flights singleFlight
+
+	// connectDial dials CONNECT tunnel targets. It is net.DialTimeout in
+	// production and a seam in tests, where an allowed target (port 443,
+	// non-local hostname) cannot resolve to a real listener.
+	connectDial func(network, addr string, timeout time.Duration) (net.Conn, error)
 
 	originTimeout             time.Duration
 	originRetryMaxAttempts    int
@@ -55,8 +60,17 @@ type CacheProxy struct {
 
 	// cacheHostSuffixes are the Host substrings that identify DuckLake bucket
 	// traffic worth caching. Requests whose Host doesn't contain any of these
-	// are passed through without caching.
+	// are passed through without caching. When the list is non-empty it also
+	// bounds the plain-HTTP forward path: a host matching no suffix is
+	// refused with 403 (see forward).
 	cacheHostSuffixes []string
+
+	// connectAllowedSuffixes optionally bounds CONNECT tunnel targets. When
+	// non-empty, the target hostname must contain one of these substrings
+	// (same strings.Contains semantics as cacheHostSuffixes). Empty means any
+	// hostname on port 443 is allowed; the port and local-IP rules always
+	// apply. See connectRefusalReason.
+	connectAllowedSuffixes []string
 
 	// blockMode, blockSize, and maxSpanBlocks configure the block-aligned
 	// serve path (serveBlockAligned): whether it's active, the fixed block
@@ -147,6 +161,7 @@ func NewCacheProxy(store *DiskCache, peers *PeerManager, cacheHostSuffixes []str
 		store:                     store,
 		peers:                     peers,
 		client:                    &http.Client{Timeout: defaultOriginTimeout},
+		connectDial:               net.DialTimeout,
 		originTimeout:             defaultOriginTimeout,
 		originRetryMaxAttempts:    defaultOriginRetryMaxAttempts,
 		originRetryInitialBackoff: defaultOriginRetryInitialBackoff,
@@ -196,6 +211,12 @@ func (p *CacheProxy) shouldCache(r *http.Request) bool {
 // and spot dial failures. For full request/response visibility on writes,
 // DuckDB has to actually use plain HTTP via forwardUncached (s3_use_ssl =
 // false), which httpfs has been observed ignoring for some PUT paths.
+//
+// The proxy binds a hostPort and is reachable cluster-wide without
+// authentication, so the tunnel target is restricted (connectRefusalReason):
+// port 443 only, no local IP literals, optionally a hostname suffix list.
+// Without this the CONNECT path is an open relay into every TCP service
+// reachable from the node's network context.
 func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	connectStart := time.Now()
 	target := r.Host
@@ -203,7 +224,14 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		attribute.String("server.address", target),
 		attribute.String("client.address", r.RemoteAddr),
 	))
-	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if reason := p.connectRefusalReason(target); reason != "" {
+		span.SetStatus(codes.Error, reason)
+		span.End()
+		slog.Warn("Forward-proxy CONNECT target refused.", "target", target, "reason", reason, "client", r.RemoteAddr)
+		http.Error(w, "CONNECT target not allowed: "+reason, http.StatusForbidden)
+		return
+	}
+	upstream, err := p.connectDial("tcp", target, 10*time.Second)
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.End()
@@ -278,6 +306,44 @@ func (p *CacheProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// connectRefusalReason returns "" when a CONNECT target may be dialed, else
+// a short reason for the Warn log. Only port 443 is allowed: DuckDB tunnels
+// external HTTPS reads through the proxy while http_proxy is set globally,
+// and 443 is the only port those reads need. Refusing every other port keeps
+// the tunnel from relaying into node-internal services (peer APIs, the
+// control plane, Kubelet). IP literals that name loopback, link-local, or
+// unspecified addresses are refused outright, so the tunnel cannot reach the
+// node itself or the cloud metadata endpoint. When connectAllowedSuffixes is
+// configured the hostname must also contain one of its suffixes.
+//
+// Known limit: a hostname is checked as a string, not resolved. A public
+// hostname whose DNS record points at a local address still passes. Closing
+// that gap requires a resolve-and-pin dialer; the port-443 restriction keeps
+// the residual exposure small.
+func (p *CacheProxy) connectRefusalReason(target string) string {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "target is not host:port"
+	}
+	if port != "443" {
+		return "port is not 443"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return "local or non-routable IP literal"
+		}
+	}
+	if len(p.connectAllowedSuffixes) > 0 {
+		for _, s := range p.connectAllowedSuffixes {
+			if strings.Contains(host, s) {
+				return ""
+			}
+		}
+		return "hostname not in CONNECT_ALLOWED_SUFFIXES"
+	}
+	return ""
+}
+
 // Hop-by-hop headers per RFC 7230 §6.1 — must not be forwarded.
 var hopByHop = map[string]bool{
 	"connection":          true,
@@ -322,28 +388,32 @@ func (p *CacheProxy) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Non-GET (HEAD, etc.) is never cached — forward and return.
 	if r.Method != http.MethodGet {
-		p.forwardUncached(w, r)
+		p.forward(w, r)
 		return
 	}
 	if r.Header.Get(cachePassthroughHeader) == "true" {
-		p.forwardUncached(w, r)
+		p.forward(w, r)
 		return
 	}
 
 	// Only cache URLs that look like DuckLake bucket traffic. Anything else
 	// (non-bucket HTTP) is a passthrough.
 	if !p.shouldCache(r) {
-		p.forwardUncached(w, r)
+		p.forward(w, r)
 		return
 	}
 
 	rangeHeader := r.Header.Get("Range")
+	// The tenant scope (SigV4 access key ID) is part of every cache key, so
+	// an entry written for one tenant's credentials is never served to a
+	// request signed by another tenant.
+	scope := TenantScope(r)
 
-	if p.blockMode && p.serveBlockAligned(w, r, rangeHeader) {
+	if p.blockMode && p.serveBlockAligned(w, r, rangeHeader, scope) {
 		return
 	}
 	// Legacy exact-range path (also the fallback for non-absolute ranges).
-	cacheKey := CacheKey(r.URL.String(), rangeHeader)
+	cacheKey := CacheKey(scope, r.URL.String(), rangeHeader)
 
 	// Requests without a propagated parent still start a standalone trace.
 	// Thread the cache request span context into origin/peer work below.
@@ -781,6 +851,26 @@ func (p *CacheProxy) serveStream(w http.ResponseWriter, r io.Reader, size int64,
 		w.WriteHeader(http.StatusPartialContent)
 	}
 	_, _ = io.Copy(w, r)
+}
+
+// forward gates the uncached plain-HTTP forward path on the configured host
+// list, then forwards. The proxy binds a hostPort and is reachable
+// cluster-wide without authentication, so an unbounded forward path is an
+// open relay to any URL reachable from the node. When cacheHostSuffixes is
+// configured, a target host matching no suffix is refused with 403. Signed
+// S3 traffic is unaffected: S3 endpoints match the suffixes by definition.
+// When no suffixes are configured (legacy mode) every host is allowed —
+// deployments predating CACHE_HOST_SUFFIXES rely on unrestricted
+// passthrough, and with no configured host list there is no boundary to
+// enforce.
+func (p *CacheProxy) forward(w http.ResponseWriter, r *http.Request) {
+	if len(p.cacheHostSuffixes) > 0 && !p.shouldCache(r) {
+		slog.Warn("Forward-proxy target host not in CACHE_HOST_SUFFIXES; refusing.",
+			"method", r.Method, "url", r.URL.String(), "client", r.RemoteAddr)
+		http.Error(w, "forward target host not allowed", http.StatusForbidden)
+		return
+	}
+	p.forwardUncached(w, r)
 }
 
 // forwardUncached forwards a request to the origin without caching. Used for
