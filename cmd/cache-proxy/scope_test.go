@@ -56,17 +56,19 @@ func TestCacheKeyTenantScope(t *testing.T) {
 	if a != CacheKey("ASIAAAAA", url, rng) {
 		t.Fatal("CacheKey must be deterministic for a fixed scope")
 	}
-	if CacheKey("", url, rng) == a || CacheKey("", url, rng) == b {
+	unsigned := CacheKey("", url, rng)
+	if unsigned == a || unsigned == b {
 		t.Fatal("unsigned requests must not collide with a signed tenant namespace")
 	}
-	if CacheKey("", url, rng) != CacheKey("", url, rng) {
+	if CacheKey("", url, rng) != unsigned {
 		t.Fatal("unsigned requests must share one cache namespace")
 	}
 
 	if BlockKey("ASIAAAAA", url, 0, 8<<20) == BlockKey("ASIABBBB", url, 0, 8<<20) {
 		t.Fatal("different access key IDs must produce different block keys")
 	}
-	if BlockKey("", url, 0, 8<<20) != BlockKey("", url, 0, 8<<20) {
+	unsignedBlock := BlockKey("", url, 0, 8<<20)
+	if BlockKey("", url, 0, 8<<20) != unsignedBlock {
 		t.Fatal("unsigned requests must share one block namespace")
 	}
 }
