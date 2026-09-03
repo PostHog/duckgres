@@ -1,6 +1,7 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { DailyUsageResponse } from "@/types/api";
 
 // Mock data + identity hooks: render OrgUsageSection with a controlled daily
@@ -35,27 +36,32 @@ const RESPONSE: DailyUsageResponse = {
 function renderSection() {
   return render(
     <MemoryRouter>
-      <OrgUsageSection orgId="acme" />
+      <TooltipProvider delayDuration={0}>
+        <OrgUsageSection orgId="acme" />
+      </TooltipProvider>
     </MemoryRouter>,
   );
 }
 
 describe("OrgUsageSection", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     identity.useIdentity.mockReturnValue({ isAdmin: true, me: { email: "op@posthog.com", role: "admin", source: "sso" } });
     hooks.useOrgDailyUsage.mockReturnValue(ok(RESPONSE));
   });
 
-  it("renders the three usage charts with window totals", () => {
+  it("renders one org-level storage chart without compute or team series", () => {
     renderSection();
-    expect(screen.getByText("CPU-minutes")).toBeInTheDocument();
-    expect(screen.getByText("Memory GiB·minutes")).toBeInTheDocument();
     expect(screen.getByText("S3 GiB·hours")).toBeInTheDocument();
-    // Window totals: CPU (7200+60+600)/60 = 131; mem (3600+60+600)/60 = 71; S3 (3600+7200)/3600 = 3.
-    expect(screen.getByText(/131 total/)).toBeInTheDocument();
-    expect(screen.getByText(/71 total/)).toBeInTheDocument();
     expect(screen.getByText(/3 total/)).toBeInTheDocument();
+    expect(screen.queryByText("CPU-minutes")).not.toBeInTheDocument();
+    expect(screen.queryByText("Memory GiB·minutes")).not.toBeInTheDocument();
+    expect(screen.queryByText("team_5")).not.toBeInTheDocument();
+    expect(screen.queryByText("team_6")).not.toBeInTheDocument();
   });
 
   it("queries with the selected period when a period button is clicked", () => {
@@ -63,6 +69,26 @@ describe("OrgUsageSection", () => {
     expect(hooks.useOrgDailyUsage).toHaveBeenCalledWith("acme", 14);
     fireEvent.click(screen.getByRole("button", { name: "30d" }));
     expect(hooks.useOrgDailyUsage).toHaveBeenCalledWith("acme", 30);
+  });
+
+  it("offers UTC week-to-date and month-to-date presets", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-19T12:00:00Z")); // Wednesday, day 19.
+    renderSection();
+
+    fireEvent.click(screen.getByRole("button", { name: "WTD" }));
+    expect(hooks.useOrgDailyUsage).toHaveBeenCalledWith("acme", 3);
+
+    fireEvent.click(screen.getByRole("button", { name: "MTD" }));
+    expect(hooks.useOrgDailyUsage).toHaveBeenCalledWith("acme", 19);
+  });
+
+  it("explains that GiB·h is storage over time", async () => {
+    renderSection();
+    fireEvent.focus(screen.getByRole("button", { name: "Explain S3 GiB·h" }));
+    expect(
+      (await screen.findAllByText(/storage over time, not current bucket size or a transfer rate/i)).length,
+    ).toBeGreaterThan(0);
   });
 
   it("renders an empty state when the org has no usage in the window", () => {
@@ -75,6 +101,7 @@ describe("OrgUsageSection", () => {
     hooks.useOrgDailyUsage.mockReturnValue(ok({ ...RESPONSE, watermark_low: "2026-08-12T00:00:00Z" }));
     renderSection();
     expect(screen.getByText(/billed and removed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/garbage-collected/i)).not.toBeInTheDocument();
   });
 
   it("renders nothing for viewers (cost data is admin-only)", () => {

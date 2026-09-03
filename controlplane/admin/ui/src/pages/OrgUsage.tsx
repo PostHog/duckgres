@@ -1,58 +1,57 @@
 import { useMemo, useState } from "react";
-import { Bar, BarChart, CartesianGrid, Legend, Tooltip as RTooltip, ResponsiveContainer, XAxis, YAxis } from "recharts";
+import { Bar, BarChart, CartesianGrid, Tooltip as RTooltip, ResponsiveContainer, XAxis, YAxis } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { EmptyState, ErrorState, LoadingState } from "@/components/states";
+import { InfoTooltip } from "@/components/InfoTooltip";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useOrgDailyUsage } from "@/hooks/useApi";
-import { hashColor } from "@/lib/colors";
 import { fmtTime, fmtUnits } from "@/lib/format";
+import { GIB_HOURS_TOOLTIP } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
 import type { DailyUsageRow } from "@/types/api";
 
-const PERIODS = [7, 14, 30];
+type PeriodKey = "7d" | "14d" | "30d" | "wtd" | "mtd";
 
-type Metric = {
-  key: string;
-  title: string;
-  // derive the chart value (display units) from a raw daily row
-  value: (r: DailyUsageRow) => number;
-  unit: string;
-};
+function periodDays(period: PeriodKey, now = new Date()): number {
+  if (period === "wtd") {
+    const weekday = now.getUTCDay();
+    return weekday === 0 ? 7 : weekday;
+  }
+  if (period === "mtd") return now.getUTCDate();
+  return Number.parseInt(period, 10);
+}
 
-const METRICS: Metric[] = [
-  { key: "cpu", title: "CPU-minutes", value: (r) => r.cpu_seconds / 60, unit: "CPU-min" },
-  { key: "mem", title: "Memory GiB·minutes", value: (r) => r.memory_seconds / 60, unit: "GiB·min" },
-  { key: "storage", title: "S3 GiB·hours", value: (r) => Number(r.gib_seconds) / 3600, unit: "GiB·h" },
+const PERIODS: { key: PeriodKey; label: string }[] = [
+  { key: "7d", label: "7d" },
+  { key: "14d", label: "14d" },
+  { key: "30d", label: "30d" },
+  { key: "wtd", label: "WTD" },
+  { key: "mtd", label: "MTD" },
 ];
 
-function teamLabel(r: DailyUsageRow): string {
-  return r.schema_name ?? `team ${r.team_id}`;
-}
-
-// Pivot rows into recharts shape: one object per date, one key per team.
-function pivot(rows: DailyUsageRow[], metric: Metric) {
-  const teams = [...new Set(rows.map(teamLabel))].sort();
-  const byDate = new Map<string, Record<string, number | string>>();
+// The API retains an informational team stamp, but storage belongs to the org.
+// Collapse all stamps into one value per UTC date.
+function dailyStorage(rows: DailyUsageRow[]) {
+  const byDate = new Map<string, number>();
   for (const r of rows) {
-    let d = byDate.get(r.date);
-    if (!d) {
-      d = { date: r.date };
-      byDate.set(r.date, d);
-    }
-    const k = teamLabel(r);
-    d[k] = ((d[k] as number) ?? 0) + metric.value(r);
+    byDate.set(r.date, (byDate.get(r.date) ?? 0) + Number(r.gib_seconds) / 3600);
   }
-  return { data: [...byDate.values()].sort((a, b) => String(a.date).localeCompare(String(b.date))), teams };
+  return [...byDate.entries()]
+    .map(([date, storage]) => ({ date, storage }))
+    .sort((a, b) => a.date.localeCompare(b.date));
 }
 
-function UsageChart({ metric, rows }: { metric: Metric; rows: DailyUsageRow[] }) {
-  const { data, teams } = useMemo(() => pivot(rows, metric), [rows, metric]);
-  const total = useMemo(() => rows.reduce((s, r) => s + metric.value(r), 0), [rows, metric]);
+function UsageChart({ rows }: { rows: DailyUsageRow[] }) {
+  const data = useMemo(() => dailyStorage(rows), [rows]);
+  const total = useMemo(() => data.reduce((sum, row) => sum + row.storage, 0), [data]);
   return (
     <Card>
       <CardHeader>
-        <CardTitle>{metric.title}</CardTitle>
+        <CardTitle className="flex items-center gap-1.5">
+          S3 GiB·hours
+          <InfoTooltip label="Explain S3 GiB·h" text={GIB_HOURS_TOOLTIP} />
+        </CardTitle>
         <p className="text-xs text-muted-foreground">{fmtUnits(total)} total in window</p>
       </CardHeader>
       <CardContent>
@@ -76,12 +75,9 @@ function UsageChart({ metric, rows }: { metric: Metric; rows: DailyUsageRow[] })
                   borderRadius: 8,
                   fontSize: 12,
                 }}
-                formatter={(v: number, name) => [`${fmtUnits(v)} ${metric.unit}`, name]}
+                formatter={(v: number) => [`${fmtUnits(v)} GiB·h`, "S3 storage"]}
               />
-              <Legend wrapperStyle={{ fontSize: 11 }} />
-              {teams.map((t) => (
-                <Bar key={t} dataKey={t} stackId="usage" fill={hashColor(t)} isAnimationActive={false} />
-              ))}
+              <Bar dataKey="storage" fill="hsl(var(--primary))" isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>
         )}
@@ -90,13 +86,14 @@ function UsageChart({ metric, rows }: { metric: Metric; rows: DailyUsageRow[] })
   );
 }
 
-// OrgUsageSection renders the org's daily usage charts (CPU / memory / S3,
-// stacked by team) over a selectable window. Cost data is admin-only —
+// OrgUsageSection renders the org's daily S3 usage over a selectable window.
+// Cost data is admin-only —
 // viewers get nothing at all (the API 403s them anyway; this keeps the page
 // clean and avoids the wasted request).
 export function OrgUsageSection({ orgId }: { orgId: string }) {
   const { isAdmin } = useIdentity();
-  const [days, setDays] = useState(14);
+  const [period, setPeriod] = useState<PeriodKey>("14d");
+  const days = periodDays(period);
   const usage = useOrgDailyUsage(orgId, days);
 
   if (!isAdmin) return null;
@@ -108,19 +105,19 @@ export function OrgUsageSection({ orgId }: { orgId: string }) {
         <div>
           <CardTitle>Usage</CardTitle>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Daily compute and storage per team, summed over the retained billing buffer.
+            Daily S3 storage-time (GiB·h) for this organization, summed over the retained billing buffer.
           </p>
         </div>
         <div className="flex items-center gap-1">
-          {PERIODS.map((n) => (
+          {PERIODS.map(({ key, label }) => (
             <Button
-              key={n}
+              key={key}
               size="sm"
-              variant={days === n ? "secondary" : "ghost"}
-              className={cn("h-7 px-2 text-xs", days === n && "font-semibold")}
-              onClick={() => setDays(n)}
+              variant={period === key ? "secondary" : "ghost"}
+              className={cn("h-7 px-2 text-xs", period === key && "font-semibold")}
+              onClick={() => setPeriod(key)}
             >
-              {n}d
+              {label}
             </Button>
           ))}
         </div>
@@ -128,8 +125,8 @@ export function OrgUsageSection({ orgId }: { orgId: string }) {
       <CardContent>
         {usage.data?.watermark_low && (
           <p className="mb-3 rounded-md border border-warning/40 bg-warning/5 p-2 text-xs text-muted-foreground">
-            Usage at or before {fmtTime(usage.data.watermark_low)} has been billed and removed from the buffer, and
-            buckets older than 30 days are garbage-collected — the left edge of a long window may be partial.
+            Usage at or before {fmtTime(usage.data.watermark_low)} has been billed and removed from the buffer, so the
+            left edge of the selected period may be partial.
           </p>
         )}
         {usage.isError ? (
@@ -139,11 +136,7 @@ export function OrgUsageSection({ orgId }: { orgId: string }) {
         ) : rows.length === 0 ? (
           <EmptyState title="No usage recorded" description={`No usage for this org in the last ${days} days of the retained buffer.`} />
         ) : (
-          <div className="grid gap-4 lg:grid-cols-3">
-            {METRICS.map((m) => (
-              <UsageChart key={m.key} metric={m} rows={rows} />
-            ))}
-          </div>
+          <UsageChart rows={rows} />
         )}
       </CardContent>
     </Card>

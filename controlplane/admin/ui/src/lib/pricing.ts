@@ -1,69 +1,180 @@
-// Pricing-sensitivity logic for the Usage page's cost calculator. Pure
-// functions — the feature is entirely client-side over the monthly usage
-// endpoint's rows (per-team usage units per org per month), so the math here
-// is the whole feature and is unit-tested directly.
+// Storage pricing for the Usage page. Duckgres meters GiB-hours; both AWS
+// cost and customer pricing are monthly, progressive schedules.
 
 import type { MonthlyUsageRow } from "@/types/api";
 
-// PriceScenario is one named set of unit prices ("what if CPU cost X?").
-// Prices are USD per usage unit, matching the units the Usage page displays.
-export interface PriceScenario {
-  id: string;
-  name: string;
-  cpuPerMin: number; // $ per CPU-minute
-  memPerGiBMin: number; // $ per GiB·minute of memory
-  storagePerGiBH: number; // $ per GiB·hour of S3
-}
+export type PricingRegion = "US" | "EU";
 
-// OrgUsageTotals is one org's month totals in display units (the sums of its
-// teams' rows).
 export interface OrgUsageTotals {
   orgId: string;
-  cpuMinutes: number;
-  memGiBMinutes: number;
   storageGiBHours: number;
 }
 
-// orgTotals aggregates per-team monthly rows into one totals line per org,
-// sorted by org id for a stable table.
+export interface OrgStoragePricing extends OrgUsageTotals {
+  gibMonths: number;
+  cost: number;
+  price: number;
+  grossProfit: number;
+  grossMarginPercent: number | null;
+}
+
+export interface StoragePricingSummary {
+  storageGiBHours: number;
+  gibMonths: number;
+  cost: number;
+  price: number;
+  grossProfit: number;
+  grossMarginPercent: number | null;
+}
+
+type StorageTier = {
+  upperBoundGiBMonths: number;
+  rate: number;
+};
+
+const TIB_IN_GIB = 1024;
+
+// Each customer tier applies only to the corresponding portion of one org's
+// monthly usage. Bounds follow the supplied binary convention: 1 TB = 1024 GB.
+const CUSTOMER_TIERS: Record<PricingRegion, StorageTier[]> = {
+  US: [
+    { upperBoundGiBMonths: 100, rate: 0 },
+    { upperBoundGiBMonths: 500, rate: 0.04 },
+    { upperBoundGiBMonths: TIB_IN_GIB, rate: 0.035 },
+    { upperBoundGiBMonths: 10 * TIB_IN_GIB, rate: 0.03 },
+    { upperBoundGiBMonths: 50 * TIB_IN_GIB, rate: 0.0245 },
+    { upperBoundGiBMonths: Number.POSITIVE_INFINITY, rate: 0.0235 },
+  ],
+  EU: [
+    { upperBoundGiBMonths: 100, rate: 0 },
+    { upperBoundGiBMonths: 500, rate: 0.044 },
+    { upperBoundGiBMonths: TIB_IN_GIB, rate: 0.0385 },
+    { upperBoundGiBMonths: 10 * TIB_IN_GIB, rate: 0.033 },
+    { upperBoundGiBMonths: 50 * TIB_IN_GIB, rate: 0.027 },
+    { upperBoundGiBMonths: Number.POSITIVE_INFINITY, rate: 0.026 },
+  ],
+};
+
+// Public S3 Standard list rates for us-east-1, verified 2026-09-03. AWS
+// applies these tiers to combined regional usage, not independently per bucket.
+const AWS_US_EAST_1_TIERS: StorageTier[] = [
+  { upperBoundGiBMonths: 50 * TIB_IN_GIB, rate: 0.023 },
+  { upperBoundGiBMonths: 500 * TIB_IN_GIB, rate: 0.022 },
+  { upperBoundGiBMonths: Number.POSITIVE_INFINITY, rate: 0.021 },
+];
+
+export const GIB_HOURS_TOOLTIP =
+  "S3 GiB·h measures storage over time, not current bucket size or a transfer rate. Duckgres samples tracked DuckLake file bytes every 30 minutes. Each sample contributes tracked GiB × 0.5 hours; for example, 10 GiB stored for 24 hours is 240 GiB·h. This view includes only samples still in the retained billing buffer.";
+
+export const AWS_COST_TOOLTIP =
+  "Estimated S3 Standard storage cost at public us-east-1 rates, not an AWS invoice or CUR charge. GiB·h is divided by the number of hours in the selected UTC month to get GiB-month. AWS tiers the combined monthly usage in this view: $0.023/GiB-month for the first 50 TiB, $0.022 for the next 450 TiB, and $0.021 thereafter. Storage capacity only; excludes requests, transfer, taxes, credits, negotiated discounts, and storage outside this view. Per-org cost is allocated in proportion to usage.";
+
+export function customerPriceTooltip(region: PricingRegion): string {
+  const rates =
+    region === "US"
+      ? "$0.040 from 100–500 GiB, $0.035 from 500 GiB–1 TiB, $0.030 from 1–10 TiB, $0.0245 from 10–50 TiB, and $0.0235 above 50 TiB"
+      : "$0.044 from 100–500 GiB, $0.0385 from 500 GiB–1 TiB, $0.033 from 1–10 TiB, $0.027 from 10–50 TiB, and $0.026 above 50 TiB";
+  return `Estimated customer charge under the progressive ${region} monthly tiers. GiB·h is divided by the number of hours in the selected UTC month to get GiB-month. Each organization is priced independently, with its first 100 GiB-month free, then ${rates}. Each rate applies only to usage within that tier.`;
+}
+
+export const GROSS_MARGIN_TOOLTIP =
+  "Gross margin is gross profit divided by customer price, where gross profit is customer price minus allocated AWS storage cost. The table shows both. Free-tier organizations can have negative gross profit because S3 still costs us; margin is unavailable when customer price is $0.";
+
+export const BINARY_UNITS_NOTE =
+  "Storage follows AWS's binary convention: 1 GB = 2^30 bytes (1 GiB), and 1 TB = 2^40 bytes (1024 GB).";
+
 export function orgTotals(rows: MonthlyUsageRow[]): OrgUsageTotals[] {
   const byOrg = new Map<string, OrgUsageTotals>();
-  for (const r of rows) {
-    let t = byOrg.get(r.org_id);
-    if (!t) {
-      t = { orgId: r.org_id, cpuMinutes: 0, memGiBMinutes: 0, storageGiBHours: 0 };
-      byOrg.set(r.org_id, t);
+  for (const row of rows) {
+    let total = byOrg.get(row.org_id);
+    if (!total) {
+      total = { orgId: row.org_id, storageGiBHours: 0 };
+      byOrg.set(row.org_id, total);
     }
-    t.cpuMinutes += r.cpu_seconds / 60;
-    t.memGiBMinutes += r.memory_seconds / 60;
-    t.storageGiBHours += Number(r.gib_seconds) / 3600;
+    total.storageGiBHours += Number(row.gib_seconds) / 3600;
   }
   return [...byOrg.values()].sort((a, b) => a.orgId.localeCompare(b.orgId));
 }
 
-// scenarioCost prices one org's month under one scenario.
-export function scenarioCost(t: OrgUsageTotals, s: PriceScenario): number {
-  return t.cpuMinutes * s.cpuPerMin + t.memGiBMinutes * s.memPerGiBMin + t.storageGiBHours * s.storagePerGiBH;
+export function hoursInUTCMonth(month: string): number {
+  const match = /^(\d{4})-(\d{2})$/.exec(month);
+  if (!match) throw new Error(`invalid UTC month: ${month}`);
+  const year = Number(match[1]);
+  const monthIndex = Number(match[2]) - 1;
+  if (monthIndex < 0 || monthIndex > 11) throw new Error(`invalid UTC month: ${month}`);
+  return (Date.UTC(year, monthIndex + 1, 1) - Date.UTC(year, monthIndex, 1)) / 3_600_000;
 }
 
-// Grounded defaults for a fresh scenario, so the calculator is useful on
-// first open — roughly EC2 on-demand m6i/r6gd-class economics (≈$0.024/vCPU·h
-// and ≈$0.006/GiB·h RAM, i.e. half the instance price attributed to each)
-// plus S3 standard storage (≈$0.023/GiB·mo ≈ $0.00003/GiB·h). These are
-// editable starting points for sensitivity analysis, not PostHog pricing.
-export const DEFAULT_CPU_PER_MIN = 0.0004;
-export const DEFAULT_MEM_PER_GIB_MIN = 0.0001;
-export const DEFAULT_STORAGE_PER_GIB_H = 0.00003;
-
-// parsePrice reads a price input: non-negative finite numbers pass through,
-// anything else (empty, NaN, negative) is 0 — a half-typed input must never
-// make a cost cell NaN.
-export function parsePrice(raw: string): number {
-  const v = Number.parseFloat(raw);
-  return Number.isFinite(v) && v >= 0 ? v : 0;
+export function storageGiBMonths(storageGiBHours: number, month: string): number {
+  return Math.max(0, storageGiBHours) / hoursInUTCMonth(month);
 }
 
-// fmtMoney formats a USD amount with grouping and two decimals.
-export function fmtMoney(n: number): string {
-  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+function progressiveCharge(quantity: number, tiers: StorageTier[]): number {
+  let charge = 0;
+  let lowerBound = 0;
+  const usage = Math.max(0, quantity);
+  for (const tier of tiers) {
+    const inTier = Math.min(Math.max(usage - lowerBound, 0), tier.upperBoundGiBMonths - lowerBound);
+    charge += inTier * tier.rate;
+    lowerBound = tier.upperBoundGiBMonths;
+    if (usage <= lowerBound) break;
+  }
+  return charge;
+}
+
+export function customerStoragePrice(gibMonths: number, region: PricingRegion): number {
+  return progressiveCharge(gibMonths, CUSTOMER_TIERS[region]);
+}
+
+function awsStorageCost(gibMonths: number): number {
+  return progressiveCharge(gibMonths, AWS_US_EAST_1_TIERS);
+}
+
+export function priceStorageByOrg(
+  totals: OrgUsageTotals[],
+  month: string,
+  region: PricingRegion,
+): { rows: OrgStoragePricing[]; summary: StoragePricingSummary } {
+  const withMonths = totals.map((total) => ({ ...total, gibMonths: storageGiBMonths(total.storageGiBHours, month) }));
+  const totalGiBMonths = withMonths.reduce((sum, row) => sum + row.gibMonths, 0);
+  const totalCost = awsStorageCost(totalGiBMonths);
+
+  const rows = withMonths.map((row): OrgStoragePricing => {
+    // AWS tiers combined regional usage. Allocate that aggregate list cost by
+    // metered usage so per-org cost and margin rows add exactly to the total.
+    const cost = totalGiBMonths === 0 ? 0 : totalCost * (row.gibMonths / totalGiBMonths);
+    const price = customerStoragePrice(row.gibMonths, region);
+    const grossProfit = price - cost;
+    return {
+      ...row,
+      cost,
+      price,
+      grossProfit,
+      grossMarginPercent: price > 0 ? (grossProfit / price) * 100 : null,
+    };
+  });
+
+  const storageGiBHours = totals.reduce((sum, row) => sum + row.storageGiBHours, 0);
+  const price = rows.reduce((sum, row) => sum + row.price, 0);
+  const grossProfit = price - totalCost;
+  return {
+    rows,
+    summary: {
+      storageGiBHours,
+      gibMonths: totalGiBMonths,
+      cost: totalCost,
+      price,
+      grossProfit,
+      grossMarginPercent: price > 0 ? (grossProfit / price) * 100 : null,
+    },
+  };
+}
+
+export function fmtMoney(value: number): string {
+  return value.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }

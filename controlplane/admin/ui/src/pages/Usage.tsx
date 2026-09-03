@@ -1,10 +1,7 @@
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { type ColumnDef } from "@tanstack/react-table";
-import { Coins, Cpu, Database, MemoryStick, ShieldAlert } from "lucide-react";
+import { Coins, ShieldAlert } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
-import { DataTable } from "@/components/DataTable";
-import { OrgRef } from "@/components/OrgRef";
+import { InfoTooltip } from "@/components/InfoTooltip";
 import { StatCard } from "@/components/StatCard";
 import { UsagePricing } from "@/pages/UsagePricing";
 import { Card } from "@/components/ui/card";
@@ -12,12 +9,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useMonthlyUsage, useOrgLabels } from "@/hooks/useApi";
-import { fmtTime, fmtUnits } from "@/lib/format";
-import type { MonthlyUsageRow } from "@/types/api";
-
-const cpuMinutes = (r: MonthlyUsageRow) => r.cpu_seconds / 60;
-const memGiBMinutes = (r: MonthlyUsageRow) => r.memory_seconds / 60;
-const storageGiBHours = (r: MonthlyUsageRow) => Number(r.gib_seconds) / 3600;
+import { fmtTime } from "@/lib/format";
+import {
+  AWS_COST_TOOLTIP,
+  GROSS_MARGIN_TOOLTIP,
+  customerPriceTooltip,
+  fmtMoney,
+  orgTotals,
+  priceStorageByOrg,
+  type PricingRegion,
+} from "@/lib/pricing";
 
 function currentMonth(): string {
   const d = new Date();
@@ -26,8 +27,8 @@ function currentMonth(): string {
 
 export function Usage() {
   const { isAdmin } = useIdentity();
-  const navigate = useNavigate();
   const [months, setMonths] = useState(6);
+  const [pricingRegion, setPricingRegion] = useState<PricingRegion>("US");
   const usage = useMonthlyUsage(months);
   const orgLabels = useOrgLabels();
   const rows = useMemo(() => usage.data?.rows ?? [], [usage.data]);
@@ -47,73 +48,26 @@ export function Usage() {
       : (monthOptions.find((m) => rows.some((r) => r.month === m)) ?? currentMonth());
 
   const monthRows = useMemo(() => rows.filter((r) => r.month === month), [rows, month]);
-  const totals = useMemo(
-    () =>
-      monthRows.reduce(
-        (acc, r) => ({
-          cpu: acc.cpu + cpuMinutes(r),
-          mem: acc.mem + memGiBMinutes(r),
-          storage: acc.storage + storageGiBHours(r),
-        }),
-        { cpu: 0, mem: 0, storage: 0 },
-      ),
-    [monthRows],
+  // Storage is org-scoped. The API still carries its historical informational
+  // team stamp, so collapse those rows before display rather than showing
+  // duplicate-looking org lines when that stamp changed within the month.
+  const orgRows = useMemo(() => orgTotals(monthRows), [monthRows]);
+  const pricing = useMemo(
+    () => priceStorageByOrg(orgRows, month, pricingRegion),
+    [orgRows, month, pricingRegion],
   );
 
-  const columns = useMemo<ColumnDef<MonthlyUsageRow, any>[]>(
-    () => [
-      {
-        accessorKey: "org_id",
-        header: "Org",
-        cell: ({ row }) => <OrgRef id={row.original.org_id} label={orgLabels.get(row.original.org_id)} />,
-      },
-      {
-        id: "team",
-        header: "Team",
-        accessorFn: (r) => r.schema_name ?? `team ${r.team_id}`,
-        cell: ({ row }) => {
-          const r = row.original;
-          return (
-            <div className="flex flex-col gap-0.5">
-              <span className="font-mono text-xs">{r.schema_name ?? `team ${r.team_id}`}</span>
-              <span className="text-[11px] text-muted-foreground">id {r.team_id}</span>
-            </div>
-          );
-        },
-      },
-      {
-        id: "cpu_minutes",
-        header: "CPU-min",
-        accessorFn: cpuMinutes,
-        cell: ({ getValue }) => <span className="font-mono text-xs">{fmtUnits(getValue() as number)}</span>,
-      },
-      {
-        id: "mem_gib_minutes",
-        header: "Memory GiB·min",
-        accessorFn: memGiBMinutes,
-        cell: ({ getValue }) => <span className="font-mono text-xs">{fmtUnits(getValue() as number)}</span>,
-      },
-      {
-        id: "storage_gib_hours",
-        header: "S3 GiB·h",
-        accessorFn: storageGiBHours,
-        cell: ({ getValue }) => <span className="font-mono text-xs">{fmtUnits(getValue() as number)}</span>,
-      },
-    ],
-    [orgLabels],
-  );
-
-  // Per-team cost data is admin-only (the API enforces RequireAdmin; this is
+  // Organization cost data is admin-only (the API enforces RequireAdmin; this is
   // just the friendly notice, matching the Operators page).
   if (!isAdmin) {
     return (
       <>
-        <PageHeader title="Usage" description="Monthly per-team compute and storage usage." />
+        <PageHeader title="Usage" description="Monthly storage usage by organization." />
         <PageBody>
           <EmptyState
             icon={<ShieldAlert className="h-6 w-6 text-warning" />}
             title="Admin only"
-            description="Per-team usage and cost data requires the admin role."
+            description="Organization usage and cost data requires the admin role."
           />
         </PageBody>
       </>
@@ -124,7 +78,7 @@ export function Usage() {
     <>
       <PageHeader
         title="Usage"
-        description="Cumulative monthly compute and storage per team, summed over the retained billing buffer."
+        description="S3 storage-time (GiB·h) by organization, summed over the retained billing buffer."
         actions={
           <>
             <Select value={month} onValueChange={setSelected}>
@@ -157,9 +111,8 @@ export function Usage() {
       <PageBody>
         {usage.data?.watermark_low && (
           <Card className="mb-4 border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground">
-            Usage at or before {fmtTime(usage.data.watermark_low)} has been billed and removed from the buffer, and
-            buckets older than 30 days are garbage-collected — earlier months may be partial or absent. This page is
-            an operations view, not an invoice.
+            Usage at or before {fmtTime(usage.data.watermark_low)} has been billed and removed from the buffer, so
+            earlier months may be partial or absent. This page is an operations view, not an invoice.
           </Card>
         )}
         {usage.isError ? (
@@ -169,18 +122,28 @@ export function Usage() {
         ) : (
           <>
             <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <StatCard label="CPU-min" value={fmtUnits(totals.cpu)} icon={<Cpu className="h-4 w-4" />} hint={`${month} total`} />
               <StatCard
-                label="Memory GiB·min"
-                value={fmtUnits(totals.mem)}
-                icon={<MemoryStick className="h-4 w-4" />}
-                hint={`${month} total`}
+                label="Total cost"
+                value={fmtMoney(pricing.summary.cost)}
+                icon={<InfoTooltip label="Explain AWS storage cost" text={AWS_COST_TOOLTIP} />}
+                hint="AWS us-east-1 storage estimate"
               />
               <StatCard
-                label="S3 GiB·h"
-                value={fmtUnits(totals.storage)}
-                icon={<Database className="h-4 w-4" />}
-                hint={`${month} total`}
+                label="Total price"
+                value={fmtMoney(pricing.summary.price)}
+                icon={<InfoTooltip label="Explain customer price" text={customerPriceTooltip(pricingRegion)} />}
+                hint={`${pricingRegion} progressive customer tiers`}
+              />
+              <StatCard
+                label="Total gross margin"
+                value={
+                  pricing.summary.grossMarginPercent == null
+                    ? "N/A"
+                    : `${pricing.summary.grossMarginPercent.toFixed(1)}%`
+                }
+                icon={<InfoTooltip label="Explain gross margin" text={GROSS_MARGIN_TOOLTIP} />}
+                hint={`${fmtMoney(pricing.summary.grossProfit)} gross profit`}
+                accent={pricing.summary.grossProfit < 0 ? "destructive" : "success"}
               />
             </div>
             {monthRows.length === 0 ? (
@@ -190,18 +153,14 @@ export function Usage() {
                 description={`No usage has been recorded for ${month} in the retained billing buffer.`}
               />
             ) : (
-              <Card>
-                <DataTable
-                  data={monthRows}
-                  columns={columns}
-                  initialSorting={[{ id: "cpu_minutes", desc: true }]}
-                  // Click through to the org's daily usage charts.
-                  onRowClick={(r) => navigate(`/orgs/${encodeURIComponent(r.org_id)}`)}
-                  rowClassName={() => "cursor-pointer"}
-                />
-              </Card>
+              <UsagePricing
+                rows={monthRows}
+                labels={orgLabels}
+                month={month}
+                region={pricingRegion}
+                onRegionChange={setPricingRegion}
+              />
             )}
-            <UsagePricing rows={monthRows} labels={orgLabels} />
           </>
         )}
       </PageBody>
