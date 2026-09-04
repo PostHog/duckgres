@@ -94,12 +94,26 @@ func NewClientConn(s *Server, conn net.Conn, reader *bufio.Reader, writer *bufio
 // connection rather than an idle one — and a client cannot safely replay a
 // write that may already have committed, so the failure reaches the user.
 //
-// 5m keeps the reclaim bounded while covering the gaps a batch or BI client
-// leaves between statements. Deployments that want tighter worker density set
-// --idle-timeout / DUCKGRES_IDLE_TIMEOUT; a client that needs longer asks for
-// it per connection with duckgres.idle_timeout, bounded by
-// DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX.
-const DefaultControlPlaneIdleTimeout = 5 * time.Minute
+// 5m fixed the worst of that but still sat inside the gaps clients actually
+// leave. Measured over a production deployment, the connections it reaped were
+// not abandoned: the client came back a median of 8s after the reap and at
+// worst 58s, so every observed idle gap fell between 5m00s and 5m58s. Those
+// clients were missing the threshold by seconds and paying a cold worker
+// respawn to get back, which is churn with no reclaim benefit — and only ~4%
+// of reaps had no client return at all, so a longer window is not exposing
+// many genuinely abandoned connections.
+//
+// 15m clears that cluster with margin for a slower run, and costs on the order
+// of one continuously-held worker across the fleet. It is deliberately at the
+// ceiling the accompanying test enforces: past this, an abandoned connection
+// holds a pinned worker too long to justify by default. Deployments that want
+// tighter worker density set --idle-timeout / DUCKGRES_IDLE_TIMEOUT; a client
+// that needs longer asks for it per connection with duckgres.idle_timeout,
+// bounded by DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX.
+//
+// This is a frequency reduction, not a correctness fix: a client whose gap can
+// exceed any finite timeout still needs to treat the reap as retryable.
+const DefaultControlPlaneIdleTimeout = 15 * time.Minute
 
 // NormalizeIdleTimeout resolves a configured connection idle timeout: zero means
 // "unset" → use zeroDefault; a negative value means "explicitly disabled" → 0
