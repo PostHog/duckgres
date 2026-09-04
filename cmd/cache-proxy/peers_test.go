@@ -372,7 +372,7 @@ func TestPeerServesBlockKeys(t *testing.T) {
 	}
 
 	// Create a block key for a parquet block.
-	key := BlockKey("http://s3/bucket/f.parquet", 3, 8<<20)
+	key := BlockKey("", "http://s3/bucket/f.parquet", 3, 8<<20)
 	blockContent := "block-content"
 
 	// Store the block.

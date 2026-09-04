@@ -131,12 +131,18 @@ const (
 	cacheEvictionReasonByte  cacheEvictionReason = "byte"
 )
 
-// CacheKey computes a deterministic cache key from a full URL and byte range.
-// The URL includes scheme, host, path, and query — so different buckets, regions,
-// or query-signed URLs naturally produce different keys.
-func CacheKey(url, rangeHeader string) string {
+// CacheKey computes a deterministic cache key from a tenant scope, a full
+// URL, and a byte range. The URL includes scheme, host, path, and query — so
+// different buckets, regions, or query-signed URLs naturally produce
+// different keys. The scope is the SigV4 access key ID (see TenantScope), so
+// two tenants reading the same object URL never share an entry.
+//
+// Hash input format: scope + "\x00" + url + "|" + range. The NUL separator
+// makes the scope boundary unambiguous: no URL or range byte sequence can
+// shift bytes into or out of the scope field.
+func CacheKey(scope, url, rangeHeader string) string {
 	h := sha256.New()
-	_, _ = fmt.Fprintf(h, "%s|%s", url, rangeHeader)
+	_, _ = fmt.Fprintf(h, "%s\x00%s|%s", scope, url, rangeHeader)
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 

@@ -221,7 +221,7 @@ func TestHandleProxyPassthroughGETSkipsCacheAndStripsMarker(t *testing.T) {
 	if traceHeadersReachedOrigin.Load() {
 		t.Fatal("trace propagation headers reached origin")
 	}
-	if _, _, ok := proxy.store.Open(CacheKey(originURL+"/bucket/file.parquet", "")); ok {
+	if _, _, ok := proxy.store.Open(CacheKey("", originURL+"/bucket/file.parquet", "")); ok {
 		t.Fatal("passthrough request populated the cache")
 	}
 }
@@ -1138,8 +1138,14 @@ func TestHandleConnectLogsOpenAndClose(t *testing.T) {
 
 	// Proxy: wrap HandleProxy in an httptest server. CONNECT requests go
 	// through Go's standard server hijack path, which is what the real
-	// cache-proxy does in production.
+	// cache-proxy does in production. The CONNECT lockdown only allows port
+	// 443 and refuses local IP literals, so the test target is
+	// "example.com:443" and the dial seam redirects it to the local echo
+	// origin.
 	proxy := newTestProxy(t)
+	proxy.connectDial = func(_, _ string, _ time.Duration) (net.Conn, error) {
+		return net.Dial("tcp", origin.Addr().String())
+	}
 	proxySrv := httptest.NewServer(http.HandlerFunc(proxy.HandleProxy))
 	defer proxySrv.Close()
 	proxyURL, _ := url.Parse(proxySrv.URL)
@@ -1153,7 +1159,7 @@ func TestHandleConnectLogsOpenAndClose(t *testing.T) {
 	}
 	defer func() { _ = pconn.Close() }()
 
-	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", origin.Addr().String(), origin.Addr().String())
+	connectReq := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
 	if _, err := pconn.Write([]byte(connectReq)); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -1202,8 +1208,8 @@ func TestHandleConnectLogsOpenAndClose(t *testing.T) {
 	if !strings.Contains(out, `msg="Forward-proxy CONNECT closed."`) {
 		t.Errorf("expected close log, got:\n%s", out)
 	}
-	if !strings.Contains(out, fmt.Sprintf(`target=%s`, origin.Addr().String())) {
-		t.Errorf("expected target= attr matching origin addr, got:\n%s", out)
+	if !strings.Contains(out, `target=example.com:443`) {
+		t.Errorf("expected target= attr matching the CONNECT target, got:\n%s", out)
 	}
 }
 
@@ -1215,6 +1221,11 @@ func TestHandleConnectLogsDialFailure(t *testing.T) {
 	defer restore()
 
 	proxy := newTestProxy(t)
+	// The CONNECT lockdown only allows port 443 targets, so the dial seam
+	// stands in for an unreachable upstream.
+	proxy.connectDial = func(_, _ string, _ time.Duration) (net.Conn, error) {
+		return nil, fmt.Errorf("connection refused")
+	}
 	proxySrv := httptest.NewServer(http.HandlerFunc(proxy.HandleProxy))
 	defer proxySrv.Close()
 	proxyURL, _ := url.Parse(proxySrv.URL)
@@ -1225,8 +1236,7 @@ func TestHandleConnectLogsDialFailure(t *testing.T) {
 	}
 	defer func() { _ = pconn.Close() }()
 
-	// 127.0.0.1:1 is reserved/unbound — kernel rejects the dial fast.
-	connectReq := "CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n"
+	connectReq := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
 	if _, err := pconn.Write([]byte(connectReq)); err != nil {
 		t.Fatalf("write CONNECT: %v", err)
 	}
@@ -1505,5 +1515,167 @@ func TestForwardUncachedPreservesMethod(t *testing.T) {
 				t.Errorf("method mutated: got %q, want %q", gotMethod, method)
 			}
 		})
+	}
+}
+
+// TestConnectRefusalReason covers the CONNECT relay lockdown: only port 443,
+// no local or non-routable IP literals, and the optional hostname suffix list.
+func TestConnectRefusalReason(t *testing.T) {
+	cases := []struct {
+		target    string
+		suffixes  []string
+		wantAllow bool
+	}{
+		// Internal TCP services must not be reachable through the tunnel.
+		{target: "worker:8816", wantAllow: false},
+		{target: "peer.cache-proxy:8081", wantAllow: false},
+		{target: "example.com:80", wantAllow: false},
+		{target: "example.com:4430", wantAllow: false},
+		{target: "example.com", wantAllow: false},
+		// Local and non-routable IP literals are refused even on 443.
+		{target: "127.0.0.1:443", wantAllow: false},
+		{target: "127.1.2.3:443", wantAllow: false},
+		{target: "[::1]:443", wantAllow: false},
+		{target: "169.254.169.254:443", wantAllow: false},
+		{target: "169.254.169.254:80", wantAllow: false},
+		{target: "[fe80::1]:443", wantAllow: false},
+		{target: "0.0.0.0:443", wantAllow: false},
+		// Public HTTPS targets are the documented product need.
+		{target: "example.com:443", wantAllow: true},
+		{target: "datasets.clickhouse.com:443", wantAllow: true},
+		{target: "8.8.8.8:443", wantAllow: true},
+		// The suffix list narrows allowed hostnames when configured.
+		{target: "example.com:443", suffixes: []string{"s3.amazonaws.com"}, wantAllow: false},
+		{target: "bucket.s3.amazonaws.com:443", suffixes: []string{"s3.amazonaws.com"}, wantAllow: true},
+	}
+	for _, c := range cases {
+		p := &CacheProxy{connectAllowedSuffixes: c.suffixes}
+		reason := p.connectRefusalReason(c.target)
+		if gotAllow := reason == ""; gotAllow != c.wantAllow {
+			t.Errorf("connectRefusalReason(%q, suffixes=%v) allow = %v (reason %q), want allow = %v",
+				c.target, c.suffixes, gotAllow, reason, c.wantAllow)
+		}
+	}
+}
+
+// TestHandleConnectRefused: a CONNECT to an internal service port is refused
+// with 403 and a Warn log before any dial is attempted.
+func TestHandleConnectRefused(t *testing.T) {
+	buf, restore := captureSlog(t)
+	defer restore()
+
+	proxy := newTestProxy(t)
+	dialed := false
+	proxy.connectDial = func(_, _ string, _ time.Duration) (net.Conn, error) {
+		dialed = true
+		return nil, fmt.Errorf("must not be called")
+	}
+
+	for _, target := range []string{"worker:8816", "169.254.169.254:80", "127.0.0.1:443"} {
+		req := httptest.NewRequest(http.MethodConnect, "//"+target, nil)
+		req.Host = target
+		rec := httptest.NewRecorder()
+		proxy.HandleProxy(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("CONNECT %s: status = %d, want 403", target, rec.Code)
+		}
+	}
+	if dialed {
+		t.Fatal("refused CONNECT reached the dialer")
+	}
+	if out := buf.String(); !strings.Contains(out, `Forward-proxy CONNECT target refused.`) {
+		t.Errorf("expected refusal Warn log, got:\n%s", out)
+	}
+}
+
+// TestHandleConnectAllowedTargetIsNotForbidden: an allowed target
+// (port 443, public hostname) passes the gate; the dial then fails in the
+// test environment and must surface as 502, not 403.
+func TestHandleConnectAllowedTargetIsNotForbidden(t *testing.T) {
+	proxy := newTestProxy(t)
+	dialed := false
+	proxy.connectDial = func(_, _ string, _ time.Duration) (net.Conn, error) {
+		dialed = true
+		return nil, fmt.Errorf("connection refused")
+	}
+
+	req := httptest.NewRequest(http.MethodConnect, "//example.com:443", nil)
+	req.Host = "example.com:443"
+	rec := httptest.NewRecorder()
+	proxy.HandleProxy(rec, req)
+	if rec.Code == http.StatusForbidden {
+		t.Fatalf("allowed CONNECT target got 403: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("allowed CONNECT target with failed dial: status = %d, want 502", rec.Code)
+	}
+	if !dialed {
+		t.Fatal("allowed CONNECT never reached the dialer")
+	}
+}
+
+// TestForwardRefusesNonSuffixHost: with CACHE_HOST_SUFFIXES configured, the
+// plain-HTTP forward path must refuse targets outside the suffix list —
+// otherwise it is an open relay to any URL reachable from the node. Requests
+// to matching hosts (signed S3 traffic by definition) keep working.
+func TestForwardRefusesNonSuffixHost(t *testing.T) {
+	var originCalls atomic.Int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		originCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	// The httptest origin is a 127.0.0.1 URL; use it as the allowed suffix so
+	// matching-host traffic reaches it, and refuse everything else.
+	proxy := NewCacheProxy(newTestCache(t), nil, []string{"127.0.0.1"})
+
+	// GET, PUT, and passthrough GET to a non-suffix host: all refused.
+	for _, c := range []struct {
+		method  string
+		headers http.Header
+	}{
+		{method: http.MethodGet},
+		{method: http.MethodPut},
+		{method: http.MethodGet, headers: http.Header{cachePassthroughHeader: []string{"true"}}},
+	} {
+		rec := doForwardProxyRequest(proxy, c.method, "http://evil.internal:8816/x", c.headers)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s to non-suffix host: status = %d, want 403", c.method, rec.Code)
+		}
+	}
+	if got := originCalls.Load(); got != 0 {
+		t.Fatalf("origin calls = %d, want 0 for refused targets", got)
+	}
+
+	// A matching host still forwards (non-GET) and caches (GET).
+	if rec := doForwardProxyRequest(proxy, http.MethodPut, originURL+"/bucket/k", nil); rec.Code != http.StatusOK {
+		t.Errorf("PUT to suffix host: status = %d, want 200", rec.Code)
+	}
+	if rec := doForwardProxyRequest(proxy, http.MethodGet, originURL+"/bucket/k", http.Header{
+		cachePassthroughHeader: []string{"true"},
+	}); rec.Code != http.StatusOK {
+		t.Errorf("passthrough GET to suffix host: status = %d, want 200", rec.Code)
+	}
+	if got := originCalls.Load(); got != 2 {
+		t.Fatalf("origin calls = %d, want 2 for allowed suffix-host traffic", got)
+	}
+}
+
+// TestForwardLegacyModeAllowsAllHosts: with no CACHE_HOST_SUFFIXES
+// configured the forward path stays unrestricted (legacy mode) — deployments
+// predating the setting rely on unrestricted passthrough.
+func TestForwardLegacyModeAllowsAllHosts(t *testing.T) {
+	proxy := newTestProxy(t) // no suffixes
+	var originCalls atomic.Int32
+	_, originURL := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		originCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	if rec := doForwardProxyRequest(proxy, http.MethodHead, originURL+"/bucket/k", nil); rec.Code != http.StatusOK {
+		t.Errorf("legacy-mode HEAD: status = %d, want 200", rec.Code)
+	}
+	if got := originCalls.Load(); got != 1 {
+		t.Fatalf("origin calls = %d, want 1", got)
 	}
 }

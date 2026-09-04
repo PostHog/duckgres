@@ -71,13 +71,13 @@ func TestFetchOriginSpan(t *testing.T) {
 	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{}}
 
 	// Fetch blocks 1..3 in one span (block 3 is the short tail).
-	if err := p.fetchOriginSpan(req, blockSize, 1, 3); err != nil {
+	if err := p.fetchOriginSpan(req, blockSize, 1, 3, ""); err != nil {
 		t.Fatalf("fetchOriginSpan: %v", err)
 	}
 
 	// Every block in the span must now be a complete, correct cache entry.
 	for idx := int64(1); idx <= 3; idx++ {
-		key := BlockKey(u.String(), idx, blockSize)
+		key := BlockKey("", u.String(), idx, blockSize)
 		reader, size, ok := store.Open(key)
 		if !ok {
 			t.Fatalf("block %d not committed to store", idx)
@@ -99,7 +99,7 @@ func TestFetchOriginSpan(t *testing.T) {
 	}
 
 	// Block 0 was outside the span and must not exist.
-	if store.Has(BlockKey(u.String(), 0, blockSize)) {
+	if store.Has(BlockKey("", u.String(), 0, blockSize)) {
 		t.Fatal("block 0 should not have been fetched")
 	}
 }
@@ -135,7 +135,7 @@ func TestFetchOriginSpanRejects200(t *testing.T) {
 	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
 	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{}}
 
-	err = p.fetchOriginSpan(req, blockSize, 1, 2)
+	err = p.fetchOriginSpan(req, blockSize, 1, 2, "")
 	if err == nil {
 		t.Fatal("expected fetchOriginSpan to fail closed on a 200 response to a ranged request")
 	}
@@ -143,7 +143,7 @@ func TestFetchOriginSpanRejects200(t *testing.T) {
 		t.Fatalf("error %q should mention the unexpected status code", err.Error())
 	}
 	for idx := int64(0); idx <= 3; idx++ {
-		if store.Has(BlockKey(u.String(), idx, blockSize)) {
+		if store.Has(BlockKey("", u.String(), idx, blockSize)) {
 			t.Fatalf("block %d must not be committed when the origin ignored Range", idx)
 		}
 	}
@@ -170,11 +170,11 @@ func TestFetchOriginSpanRejectsMismatchedContentRange(t *testing.T) {
 	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
 	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{}}
 
-	if err := p.fetchOriginSpan(req, blockSize, 1, 2); err == nil {
+	if err := p.fetchOriginSpan(req, blockSize, 1, 2, ""); err == nil {
 		t.Fatal("expected mismatched Content-Range to be rejected")
 	}
 	for idx := int64(1); idx <= 2; idx++ {
-		if store.Has(BlockKey(u.String(), idx, blockSize)) {
+		if store.Has(BlockKey("", u.String(), idx, blockSize)) {
 			t.Fatalf("block %d committed from a mismatched Content-Range", idx)
 		}
 	}
@@ -199,10 +199,10 @@ func TestFetchOriginSpanRejectsCleanShortBody(t *testing.T) {
 	u, _ := url.Parse(origin.URL + "/bucket/f.parquet")
 	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{}}
 
-	if err := p.fetchOriginSpan(req, blockSize, 1, 2); err == nil {
+	if err := p.fetchOriginSpan(req, blockSize, 1, 2, ""); err == nil {
 		t.Fatal("expected clean short 206 body to be rejected")
 	}
-	if store.Has(BlockKey(u.String(), 2, blockSize)) {
+	if store.Has(BlockKey("", u.String(), 2, blockSize)) {
 		t.Fatal("truncated block committed from a short 206 body")
 	}
 }
@@ -230,7 +230,7 @@ func TestServeBlockAlignedFailsClosedOn200Origin(t *testing.T) {
 	req = req.WithContext(context.Background())
 	w := httptest.NewRecorder()
 
-	if !p.serveBlockAligned(w, req, "bytes=1500-2500") {
+	if !p.serveBlockAligned(w, req, "bytes=1500-2500", "") {
 		t.Fatal("expected serveBlockAligned to handle the request (not fall back)")
 	}
 	if w.Code != http.StatusBadGateway {
@@ -240,7 +240,7 @@ func TestServeBlockAlignedFailsClosedOn200Origin(t *testing.T) {
 		t.Fatalf("Content-Range = %q, want unset: headers must not be committed before the 502", got)
 	}
 	for idx := int64(0); idx <= 3; idx++ {
-		if store.Has(BlockKey(u.String(), idx, blockSize)) {
+		if store.Has(BlockKey("", u.String(), idx, blockSize)) {
 			t.Fatalf("block %d must not be committed when the origin ignored Range", idx)
 		}
 	}
@@ -332,7 +332,7 @@ func TestServeBlockAlignedRetriesTruncatedOriginBody(t *testing.T) {
 	// The truncated first attempt must not have left partial blocks behind:
 	// blocks 1 and 2 must be complete.
 	for idx := int64(1); idx <= 2; idx++ {
-		_, size, ok := store.Open(BlockKey(u.String(), idx, blockSize))
+		_, size, ok := store.Open(BlockKey("", u.String(), idx, blockSize))
 		if !ok || size != blockSize {
 			t.Fatalf("block %d: present=%v size=%d, want present size %d", idx, ok, size, blockSize)
 		}
@@ -405,7 +405,7 @@ func TestFetchOriginSpanSendsBlockAlignedRange(t *testing.T) {
 	req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, Header: http.Header{
 		"Range": []string{"bytes=1500-2500"}, // client's original, must be ignored
 	}}
-	if err := p.fetchOriginSpan(req, blockSize, 1, 2); err != nil {
+	if err := p.fetchOriginSpan(req, blockSize, 1, 2, ""); err != nil {
 		t.Fatal(err)
 	}
 	want := "bytes=" + strconv.Itoa(1*blockSize) + "-" + strconv.Itoa(3*blockSize-1)
@@ -437,7 +437,7 @@ func doBlockRequest(t *testing.T, p *CacheProxy, rawURL, rangeHeader string) *ht
 		Header: http.Header{"Range": []string{rangeHeader}}}
 	req = req.WithContext(context.Background())
 	w := httptest.NewRecorder()
-	if !p.serveBlockAligned(w, req, rangeHeader) {
+	if !p.serveBlockAligned(w, req, rangeHeader, "") {
 		t.Fatalf("serveBlockAligned returned false for %q", rangeHeader)
 	}
 	return w
@@ -553,7 +553,7 @@ func TestServeBlockAlignedFallsBackOnRangeShape(t *testing.T) {
 			req = req.WithContext(context.Background())
 
 			before := counterValue(t, blockFallbackTotal.WithLabelValues(tt.reason))
-			if p.serveBlockAligned(httptest.NewRecorder(), req, tt.rangeHeader) {
+			if p.serveBlockAligned(httptest.NewRecorder(), req, tt.rangeHeader, "") {
 				t.Fatalf("range %q must return false (legacy fallback)", tt.rangeHeader)
 			}
 			if got := counterValue(t, blockFallbackTotal.WithLabelValues(tt.reason)); got != before+1 {
@@ -605,7 +605,7 @@ func TestServeBlockAlignedPeerFillCountsAsLocalMiss(t *testing.T) {
 	for i := range blockData {
 		blockData[i] = byte(i % 251)
 	}
-	key := BlockKey(target, 0, blockSize)
+	key := BlockKey("", target, 0, blockSize)
 	var hasCalls, getCalls int32
 	peerAddr := newPeerServer(t, key, blockData, http.StatusOK, &hasCalls, &getCalls)
 
@@ -691,7 +691,7 @@ func TestServeBlockAlignedDoesNotReverifyPastObjectEOF(t *testing.T) {
 	req = req.WithContext(context.Background())
 	w := httptest.NewRecorder()
 
-	if !p.serveBlockAligned(w, req, "bytes=0-4095") {
+	if !p.serveBlockAligned(w, req, "bytes=0-4095", "") {
 		t.Fatal("expected serveBlockAligned to handle the request (not fall back)")
 	}
 	if w.Code != http.StatusPartialContent {
@@ -730,7 +730,7 @@ func TestServeBlockAlignedReturns416ForColdPastEOFStart(t *testing.T) {
 	req = req.WithContext(context.Background())
 	w := httptest.NewRecorder()
 
-	if !p.serveBlockAligned(w, req, "bytes=2200-3000") {
+	if !p.serveBlockAligned(w, req, "bytes=2200-3000", "") {
 		t.Fatal("expected serveBlockAligned to handle the request (not fall back)")
 	}
 	if w.Code != http.StatusRequestedRangeNotSatisfiable {
@@ -742,7 +742,7 @@ func TestServeBlockAlignedReturns416ForColdPastEOFStart(t *testing.T) {
 	if got := w.Body.Len(); got != 0 {
 		t.Fatalf("body length = %d, want 0", got)
 	}
-	if !store.Has(BlockKey(target, 2, blockSize)) {
+	if !store.Has(BlockKey("", target, 2, blockSize)) {
 		t.Fatal("validated tail block was not cached while learning object size")
 	}
 }
@@ -767,10 +767,10 @@ func TestHandleProxyRoutesToBlockMode(t *testing.T) {
 		t.Fatalf("block-mode HandleProxy: status %d len %d", w.Code, w.Body.Len())
 	}
 	// Blocks 0-2 stored under block keys; the legacy exact-range key must NOT exist.
-	if store.Has(CacheKey(u.String(), "bytes=100-2100")) {
+	if store.Has(CacheKey("", u.String(), "bytes=100-2100")) {
 		t.Fatal("legacy key written in block mode")
 	}
-	if !store.Has(BlockKey(u.String(), 0, blockSize)) {
+	if !store.Has(BlockKey("", u.String(), 0, blockSize)) {
 		t.Fatal("block 0 missing after block-mode request")
 	}
 }
@@ -790,10 +790,10 @@ func TestHandleProxyBlockModeOffUsesLegacyPath(t *testing.T) {
 	req.Header.Set("Range", "bytes=100-2100")
 	p.HandleProxy(httptest.NewRecorder(), req)
 
-	if !store.Has(CacheKey(u.String(), "bytes=100-2100")) {
+	if !store.Has(CacheKey("", u.String(), "bytes=100-2100")) {
 		t.Fatal("legacy key missing with block mode off")
 	}
-	if store.Has(BlockKey(u.String(), 0, blockSize)) {
+	if store.Has(BlockKey("", u.String(), 0, blockSize)) {
 		t.Fatal("block key written with block mode off")
 	}
 }
@@ -838,7 +838,7 @@ func TestServeBlockAlignedConcurrentDriftedRanges(t *testing.T) {
 			w := httptest.NewRecorder()
 			// t.Errorf (not Fatalf) below: FailNow must only be called from
 			// the goroutine running the test function, not spawned ones.
-			if !p.serveBlockAligned(w, req, rangeHeader) {
+			if !p.serveBlockAligned(w, req, rangeHeader, "") {
 				t.Errorf("goroutine %d: serveBlockAligned returned false (legacy fallback) for %q", i, rangeHeader)
 				return
 			}
@@ -896,7 +896,7 @@ func TestServeBlockAlignedRejectsDegenerateConfig(t *testing.T) {
 			req := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host,
 				Header: http.Header{"Range": []string{"bytes=0-100"}}}
 			req = req.WithContext(context.Background())
-			if p.serveBlockAligned(httptest.NewRecorder(), req, "bytes=0-100") {
+			if p.serveBlockAligned(httptest.NewRecorder(), req, "bytes=0-100", "") {
 				t.Fatal("expected false (legacy fallback) for degenerate config")
 			}
 		})
@@ -931,7 +931,7 @@ func TestServeBlockAlignedPinsBlocksBeforeHeaders(t *testing.T) {
 		for i := range data {
 			data[i] = byte((idx*blockSize + int64(i)) % 251)
 		}
-		if _, err := store.PutStream(BlockKey(target, idx, blockSize), strings.NewReader(string(data))); err != nil {
+		if _, err := store.PutStream(BlockKey("", target, idx, blockSize), strings.NewReader(string(data))); err != nil {
 			t.Fatalf("seed block %d: %v", idx, err)
 		}
 	}
@@ -951,7 +951,7 @@ func TestServeBlockAlignedPinsBlocksBeforeHeaders(t *testing.T) {
 		}
 	}
 
-	if !p.serveBlockAligned(w, req, "bytes=0-2047") {
+	if !p.serveBlockAligned(w, req, "bytes=0-2047", "") {
 		t.Fatal("serveBlockAligned unexpectedly fell back")
 	}
 	if w.Code != http.StatusPartialContent || w.Body.Len() != 2*int(blockSize) {
@@ -1021,11 +1021,11 @@ func TestHandleProxyOversizedBlockSpanFallsBackToLegacy(t *testing.T) {
 	if w.Code != http.StatusPartialContent || w.Body.Len() != 3*int(blockSize) {
 		t.Fatalf("response status=%d len=%d, want legacy 206 and %d bytes", w.Code, w.Body.Len(), 3*blockSize)
 	}
-	if !store.Has(CacheKey(target, "bytes=0-3071")) {
+	if !store.Has(CacheKey("", target, "bytes=0-3071")) {
 		t.Fatal("legacy exact-range entry was not written")
 	}
 	for idx := int64(0); idx < 3; idx++ {
-		if store.Has(BlockKey(target, idx, blockSize)) {
+		if store.Has(BlockKey("", target, idx, blockSize)) {
 			t.Fatalf("block %d was written before oversized-span fallback", idx)
 		}
 	}

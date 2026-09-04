@@ -253,7 +253,7 @@ func TestBlockPresentRejectsUntrackedDiskFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key := BlockKey("https://example.invalid/object", 0, 1024)
+	key := BlockKey("", "https://example.invalid/object", 0, 1024)
 	if err := os.WriteFile(filepath.Join(store.dir, key), []byte("stray"), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -1060,7 +1060,7 @@ func TestBlockRequestSharesOneConfirmationBudgetAcrossAllBlocks(t *testing.T) {
 	target := origin.URL + "/bucket/large.parquet"
 	keys := make([]string, 8)
 	for i := range keys {
-		keys[i] = BlockKey(target, int64(i), blockSize)
+		keys[i] = BlockKey("", target, int64(i), blockSize)
 	}
 
 	var hasCalls, getCalls int32
@@ -1105,7 +1105,7 @@ func TestBlockRequestStopsSummaryLookupsAfterGETBudgetExhaustion(t *testing.T) {
 	target := origin.URL + "/bucket/get-budget.parquet"
 	keys := make([]string, 4)
 	for i := range keys {
-		keys[i] = BlockKey(target, int64(i), blockSize)
+		keys[i] = BlockKey("", target, int64(i), blockSize)
 	}
 
 	var hasCalls, getCalls int32

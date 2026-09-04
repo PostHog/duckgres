@@ -113,15 +113,15 @@ func TestIsValidCacheKey(t *testing.T) {
 }
 
 func TestCacheKeyDeterministic(t *testing.T) {
-	a := CacheKey("http://s3/bucket/file.parquet", "bytes=0-1023")
-	b := CacheKey("http://s3/bucket/file.parquet", "bytes=0-1023")
+	a := CacheKey("", "http://s3/bucket/file.parquet", "bytes=0-1023")
+	b := CacheKey("", "http://s3/bucket/file.parquet", "bytes=0-1023")
 	if a != b {
 		t.Fatalf("CacheKey not deterministic: %s != %s", a, b)
 	}
 	if !IsValidCacheKey(a) {
 		t.Errorf("CacheKey output %q is not a valid key", a)
 	}
-	c := CacheKey("http://s3/bucket/file.parquet", "bytes=0-2047")
+	c := CacheKey("", "http://s3/bucket/file.parquet", "bytes=0-2047")
 	if a == c {
 		t.Fatal("different ranges produced identical keys")
 	}
@@ -1236,7 +1236,7 @@ func BenchmarkTouchLargeCache(b *testing.B) {
 	c := &DiskCache{order: list.New(), index: make(map[string]*list.Element)}
 	keys := make([]string, 285000)
 	for i := range keys {
-		keys[i] = CacheKey(fmt.Sprintf("http://bucket/f%d.parquet", i), "bytes=0-1")
+		keys[i] = CacheKey("", fmt.Sprintf("http://bucket/f%d.parquet", i), "bytes=0-1")
 		c.addLocked(keys[i], 1)
 	}
 	b.ResetTimer()
