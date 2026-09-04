@@ -114,16 +114,22 @@ func (c *clientConn) handlePgStatActivityExtended(p *portal) {
 
 func (c *clientConn) visiblePgStatActivityConns() []*clientConn {
 	conns := c.server.listConns()
-	if c.queryAccessPolicy == nil {
-		return conns
-	}
-
 	visible := make([]*clientConn, 0, len(conns))
 	for _, conn := range conns {
-		// Cluster project readers have one distinct username per project.
-		if conn.orgID == c.orgID && conn.username == c.username {
-			visible = append(visible, conn)
+		// The multitenant control plane registers every org's connections in
+		// one process-wide map. Scope rows to the caller's org so a full-power
+		// org principal cannot read another org's query text, usernames, or
+		// client addresses. Standalone mode leaves orgID empty on every
+		// connection, so this filter passes all rows there.
+		if conn.orgID != c.orgID {
+			continue
 		}
+		// Project-scoped users see only their own connections. Cluster project
+		// readers have one distinct username per project.
+		if c.queryAccessPolicy != nil && conn.username != c.username {
+			continue
+		}
+		visible = append(visible, conn)
 	}
 	return visible
 }

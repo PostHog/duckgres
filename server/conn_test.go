@@ -3902,6 +3902,45 @@ func TestSetQueryAccessPolicyDisablesPassthrough(t *testing.T) {
 	}
 }
 
+// An org's full-power principal (nil QueryAccessPolicy) sees its own org's
+// connections in pg_stat_activity, never another org's. On the multitenant
+// control plane every org shares one process-wide connection registry.
+func TestPgStatActivityOrgRootSeesOnlyOwnOrg(t *testing.T) {
+	srv := &Server{conns: make(map[int32]*clientConn)}
+	root := &clientConn{server: srv, username: "root", orgID: "org-a", pid: 100}
+	sameOrg := &clientConn{username: "svc-reporting", orgID: "org-a", pid: 101}
+	otherOrg := &clientConn{username: "root", orgID: "org-b", pid: 102}
+	for _, conn := range []*clientConn{root, sameOrg, otherOrg} {
+		srv.registerConn(conn)
+	}
+
+	visible := root.visiblePgStatActivityConns()
+	pids := map[int32]bool{}
+	for _, conn := range visible {
+		pids[conn.pid] = true
+	}
+	if len(visible) != 2 || !pids[100] || !pids[101] {
+		t.Fatalf("org root should see exactly its own org's connections, got pids %v", pids)
+	}
+	if pids[102] {
+		t.Fatal("org root saw another org's connection in pg_stat_activity")
+	}
+}
+
+// Standalone mode leaves orgID empty on every connection. The org filter
+// passes all rows there, preserving the single-tenant behavior.
+func TestPgStatActivityStandaloneSeesAll(t *testing.T) {
+	srv := &Server{conns: make(map[int32]*clientConn)}
+	first := &clientConn{server: srv, username: "postgres", pid: 100}
+	second := &clientConn{username: "postgres", pid: 101}
+	for _, conn := range []*clientConn{first, second} {
+		srv.registerConn(conn)
+	}
+	if got := len(first.visiblePgStatActivityConns()); got != 2 {
+		t.Fatalf("standalone connection should see all %d connections, got %d", 2, got)
+	}
+}
+
 func TestConnectionRegistry(t *testing.T) {
 	srv := &Server{
 		conns: make(map[int32]*clientConn),

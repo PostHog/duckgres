@@ -64,9 +64,13 @@ the proxy is not an open PromQL relay. Org-labelled metrics we expose:
 `duckgres_scan_*{org}`. Fleet (no org label): worker lifecycle/spawn/reap/queue/cap-drift.
 
 ### 3. RBAC + audit — `authz.go`, `audit.go`
-- `AuthMiddleware`: decode `x-amzn-oidc-data` (ALB-signed JWT; verify via the ALB public
-  key endpoint, cache keys — hardening follow-up) → email. Only `@posthog.com` +
-  `email_verified != false` is accepted, else 401. The role is resolved per-request from
+- `AuthMiddleware`: verify `x-amzn-oidc-data` (ALB-signed JWT) via the ALB regional
+  public-key endpoint (`alb_oidc.go`, keys cached per `kid`) — signature, `exp`,
+  `signer` (must be an ALB ARN in the configured region), `iss`
+  (`DUCKGRES_ADMIN_SSO_ISSUER`), `client` (`DUCKGRES_ADMIN_SSO_CLIENT_ID`). The
+  unsigned `x-amzn-oidc-identity` header is never trusted. Without
+  `DUCKGRES_ADMIN_SSO_ISSUER` the SSO path is off and only bearer tokens
+  authenticate. Only `@posthog.com` + `email_verified != false` is accepted, else 401. The role is resolved per-request from
   the `duckgres_operators` config-schema table (goose migration
   `000006_create_operators.sql`): an `admin` row → `admin`, else
   (including no row) → `viewer`. Admins manage operators under **Admin → Operators**

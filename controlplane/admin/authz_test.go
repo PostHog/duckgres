@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -12,12 +13,32 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// mkOIDC builds a fake ALB x-amzn-oidc-data JWT (header.payload.sig) with the
-// given claims. Only the payload segment is read by the decoder.
-func mkOIDC(claims map[string]any) string {
+// mkUnsignedOIDC builds a fake ALB x-amzn-oidc-data JWT (header.payload.sig)
+// with the given claims. It carries no valid signature. The verifier rejects
+// it; tests use it to prove that.
+func mkUnsignedOIDC(claims map[string]any) string {
 	payload, _ := json.Marshal(claims)
 	seg := base64.RawURLEncoding.EncodeToString(payload)
 	return "eyJ0eXAiOiJKV1QifQ." + seg + ".sig"
+}
+
+// testSSO wires a signed-JWT SSO path for middleware tests.
+type testSSO struct {
+	key      *ecdsa.PrivateKey
+	verifier *ALBOIDCVerifier
+}
+
+func newTestSSO(t *testing.T) *testSSO {
+	t.Helper()
+	key := testALBSigningKey(t)
+	return &testSSO{key: key, verifier: testALBVerifier(t, key, testALBIssuer, testALBClientID)}
+}
+
+// oidc returns a signed JWT that the test verifier accepts, with the given
+// claim overrides (typically "email").
+func (s *testSSO) oidc(t *testing.T, overrides map[string]any) string {
+	t.Helper()
+	return signedOIDC(t, s.key, validALBClaims(overrides))
 }
 
 // roleByEmail builds a fake RoleResolver from an email→role map. Unknown
@@ -38,7 +59,7 @@ func roleByEmail(admins ...string) RoleResolver {
 func TestAuthMiddlewareInternalSecretIsAdmin(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), roleByEmail()), func(c *gin.Context) {
+	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), roleByEmail(), nil), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
 	})
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -57,6 +78,7 @@ func TestAuthMiddlewareInternalSecretIsAdmin(t *testing.T) {
 // production, the operators-table lookup). Unknown emails fail closed to viewer.
 func TestAuthMiddlewareSSORoleMapping(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	sso := newTestSSO(t)
 	resolve := roleByEmail("a@posthog.com")
 	cases := []struct {
 		name  string
@@ -70,11 +92,11 @@ func TestAuthMiddlewareSSORoleMapping(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := gin.New()
-			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve), func(c *gin.Context) {
+			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve, sso.verifier), func(c *gin.Context) {
 				c.JSON(http.StatusOK, gin.H{"role": IdentityFromContext(c).Role})
 			})
 			req := httptest.NewRequest(http.MethodGet, "/x", nil)
-			req.Header.Set(albOIDCDataHeader, mkOIDC(map[string]any{"email": tc.email}))
+			req.Header.Set(albOIDCDataHeader, sso.oidc(t, map[string]any{"email": tc.email}))
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
@@ -93,6 +115,7 @@ func TestAuthMiddlewareSSORoleMapping(t *testing.T) {
 // rejected too.
 func TestAuthMiddlewareDomainHardening(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	sso := newTestSSO(t)
 	// Resolver returns admin for everything to prove rejection is upstream of it.
 	resolve := func(string) Role { return RoleAdmin }
 	for _, tc := range []struct {
@@ -104,11 +127,11 @@ func TestAuthMiddlewareDomainHardening(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := gin.New()
-			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve), func(c *gin.Context) {
+			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve, sso.verifier), func(c *gin.Context) {
 				c.JSON(http.StatusOK, gin.H{"ok": true})
 			})
 			req := httptest.NewRequest(http.MethodGet, "/x", nil)
-			req.Header.Set(albOIDCDataHeader, mkOIDC(tc.claims))
+			req.Header.Set(albOIDCDataHeader, sso.oidc(t, tc.claims))
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 			if rec.Code != http.StatusUnauthorized {
@@ -118,16 +141,75 @@ func TestAuthMiddlewareDomainHardening(t *testing.T) {
 	}
 }
 
+// A forged SSO header never authenticates: unsigned JWTs, JWTs signed by the
+// wrong key, and the unsigned identity-only header all fail with 401. This is
+// the regression test for the header-forgery finding: the pod is reachable
+// without crossing the ALB, so the signature is the trust boundary.
+func TestAuthMiddlewareRejectsForgedSSO(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sso := newTestSSO(t)
+	// Resolver returns admin for everything to prove rejection is upstream of it.
+	resolve := func(string) Role { return RoleAdmin }
+
+	otherKey := testALBSigningKey(t)
+
+	cases := []struct {
+		name   string
+		header string
+		value  string
+	}{
+		{"unsigned data JWT", albOIDCDataHeader, mkUnsignedOIDC(map[string]any{"email": "a@posthog.com"})},
+		{"wrong-key signature", albOIDCDataHeader, signedOIDC(t, otherKey, validALBClaims(map[string]any{"email": "a@posthog.com"}))},
+		{"identity-only header", "X-Amzn-Oidc-Identity", "a@posthog.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := gin.New()
+			r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve, sso.verifier), func(c *gin.Context) {
+				c.JSON(http.StatusOK, gin.H{"ok": true})
+			})
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			req.Header.Set(tc.header, tc.value)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+// Without a verifier, SSO headers are ignored entirely: only bearer tokens
+// authenticate. This is the fail-closed default for deployments without an
+// ALB.
+func TestAuthMiddlewareWithoutVerifierIgnoresSSO(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sso := newTestSSO(t)
+	resolve := func(string) Role { return RoleAdmin }
+	r := gin.New()
+	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), resolve, nil), func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set(albOIDCDataHeader, sso.oidc(t, map[string]any{"email": "a@posthog.com"}))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+}
+
 // RequireAdmin gates a route regardless of method (used by the audit read).
 func TestRequireAdmin(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	sso := newTestSSO(t)
 	resolve := roleByEmail("a@posthog.com")
 	r := gin.New()
-	r.GET("/audit", AuthMiddleware(NewTokenSet("secret", nil), resolve), RequireAdmin(), func(c *gin.Context) {
+	r.GET("/audit", AuthMiddleware(NewTokenSet("secret", nil), resolve, sso.verifier), RequireAdmin(), func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
-	viewer := mkOIDC(map[string]any{"email": "v@posthog.com"})
-	admin := mkOIDC(map[string]any{"email": "a@posthog.com"})
+	viewer := sso.oidc(t, map[string]any{"email": "v@posthog.com"})
+	admin := sso.oidc(t, map[string]any{"email": "a@posthog.com"})
 	for _, tc := range []struct {
 		name, oidc string
 		want       int
@@ -150,7 +232,7 @@ func TestRequireAdmin(t *testing.T) {
 func TestAuthMiddlewareRejectsUnauthenticated(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), roleByEmail()), func(c *gin.Context) {
+	r.GET("/x", AuthMiddleware(NewTokenSet("secret", nil), roleByEmail(), nil), func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -164,11 +246,12 @@ func TestAuthMiddlewareRejectsUnauthenticated(t *testing.T) {
 // RoleGate: viewers can GET but not mutate; the audit log GET is admin-only.
 func TestRoleGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	sso := newTestSSO(t)
 	resolve := roleByEmail("a@posthog.com")
 	build := func() *gin.Engine {
 		r := gin.New()
 		grp := r.Group("/api/v1",
-			AuthMiddleware(NewTokenSet("secret", nil), resolve),
+			AuthMiddleware(NewTokenSet("secret", nil), resolve, sso.verifier),
 			RoleGate("/api/v1/audit"),
 		)
 		grp.GET("/orgs", func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -176,8 +259,8 @@ func TestRoleGate(t *testing.T) {
 		grp.GET("/audit", func(c *gin.Context) { c.Status(http.StatusOK) })
 		return r
 	}
-	viewer := mkOIDC(map[string]any{"email": "v@posthog.com"})
-	admin := mkOIDC(map[string]any{"email": "a@posthog.com"})
+	viewer := sso.oidc(t, map[string]any{"email": "v@posthog.com"})
+	admin := sso.oidc(t, map[string]any{"email": "a@posthog.com"})
 
 	cases := []struct {
 		name, method, path, oidc string

@@ -686,6 +686,28 @@ func SetupMultiTenant(
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
 	}
+
+	// Admin SSO verifier. The admin API trusts the ALB-injected OIDC JWT only
+	// when its ES256 signature verifies against the ALB's regional AWS public
+	// key. Without this check, any caller that reaches the pod directly
+	// (same-namespace pod, kubectl port-forward) can forge the header and
+	// claim any operator's identity.
+	//
+	// Configuration is env-only, matching the other K8s admin knobs:
+	//   DUCKGRES_ADMIN_SSO_ISSUER    — expected iss claim (the Cognito user
+	//                                  pool URL). Set it to enable SSO.
+	//   DUCKGRES_ADMIN_SSO_CLIENT_ID — expected client claim (the Cognito app
+	//                                  client ID). Recommended.
+	//   DUCKGRES_ADMIN_SSO_REGION    — ALB region. Falls back to
+	//                                  DUCKGRES_AWS_REGION (cfg.K8s.AWSRegion).
+	//
+	// When the issuer is unset, the SSO path is off and only bearer tokens
+	// authenticate. That state is deliberate for local runs, so it logs a
+	// warning instead of failing startup.
+	ssoVerifier, err := adminSSOVerifierFromEnv(cfg.K8s.AWSRegion)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
 	clusterInfo := &clusterInfoProvider{
 		router:              router,
@@ -715,7 +737,7 @@ func SetupMultiTenant(
 	// RoleGate blocks viewer mutations (method-based); the audit-log read
 	// self-gates via RequireAdmin at its route (no brittle path coupling here).
 	api := engine.Group("/api/v1",
-		admin.AuthMiddleware(adminTokens, resolve),
+		admin.AuthMiddleware(adminTokens, resolve, ssoVerifier),
 		admin.AuditMiddleware(auditStore),
 		admin.RoleGate(),
 	)
