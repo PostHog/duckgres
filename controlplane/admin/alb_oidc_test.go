@@ -48,57 +48,93 @@ func testALBVerifier(t *testing.T, key *ecdsa.PrivateKey, issuer, clientID strin
 	}
 	v.keyURL = func(kid string) string { return srv.URL + "/" + url.PathEscape(kid) }
 	v.httpClient = srv.Client()
+	v.now = func() time.Time { return testALBNow }
 	return v
 }
 
-// signedOIDC builds an ES256-signed JWT with the given claims, in the
-// X-Amzn-Oidc-Data wire format (header.payload.signature).
+// signedOIDC builds an AWS ALB X-Amzn-Oidc-Data JWT. ALB security metadata
+// lives in the protected header, while the payload contains only user claims.
 func signedOIDC(t *testing.T, key *ecdsa.PrivateKey, claims map[string]any) string {
 	t.Helper()
-	headerSeg := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","kid":"test-kid","typ":"JWT"}`))
-	payload, err := json.Marshal(claims)
+	return signedOIDCWithHeader(t, key, validALBHeader(nil), claims)
+}
+
+func signedOIDCWithHeader(t *testing.T, key *ecdsa.PrivateKey, header, claims map[string]any) string {
+	t.Helper()
+	signingInput := oidcSigningInput(t, header, claims)
+	digest := sha256.Sum256([]byte(signingInput))
+	r, s, err := ecdsa.Sign(rand.Reader, key, digest[:])
 	if err != nil {
-		t.Fatalf("marshal claims: %v", err)
+		t.Fatalf("sign test JWT: %v", err)
 	}
-	payloadSeg := base64.RawURLEncoding.EncodeToString(payload)
-	digest := sha256.Sum256([]byte(headerSeg + "." + payloadSeg))
+	sig := make([]byte, 64)
+	r.FillBytes(sig[:32])
+	s.FillBytes(sig[32:])
+	return signingInput + "." + base64.URLEncoding.EncodeToString(sig)
+}
+
+func signedOIDCASN1(t *testing.T, key *ecdsa.PrivateKey, header, claims map[string]any) string {
+	t.Helper()
+	signingInput := oidcSigningInput(t, header, claims)
+	digest := sha256.Sum256([]byte(signingInput))
 	sig, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
 	if err != nil {
 		t.Fatalf("sign test JWT: %v", err)
 	}
-	return headerSeg + "." + payloadSeg + "." + base64.RawURLEncoding.EncodeToString(sig)
+	return signingInput + "." + base64.URLEncoding.EncodeToString(sig)
 }
 
-// validALBClaims returns claims that pass the verifier's claim checks for a
-// verifier built with issuer testALBIssuer and clientID testALBClientID.
-// Callers override individual keys to build rejection cases.
+func oidcSigningInput(t *testing.T, header, claims map[string]any) string {
+	t.Helper()
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		t.Fatalf("marshal header: %v", err)
+	}
+	payloadJSON, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal claims: %v", err)
+	}
+	// AWS ALB uses padded base64url segments.
+	return base64.URLEncoding.EncodeToString(headerJSON) + "." + base64.URLEncoding.EncodeToString(payloadJSON)
+}
+
 const (
 	testALBIssuer   = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TEST"
 	testALBClientID = "test-client-id"
+	testALBSigner   = "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/test/abc"
 )
 
-func validALBClaims(overrides map[string]any) map[string]any {
-	claims := map[string]any{
-		"exp":    float64(time.Now().Add(time.Hour).Unix()),
-		"signer": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/internal/test/abc",
+var testALBNow = time.Date(2026, time.September, 4, 12, 0, 0, 0, time.UTC)
+
+// validALBHeader returns the protected header emitted by AWS ALB. Callers
+// override individual fields to build rejection cases.
+func validALBHeader(overrides map[string]any) map[string]any {
+	header := map[string]any{
+		"alg":    "ES256",
+		"kid":    "test-kid",
+		"signer": testALBSigner,
 		"iss":    testALBIssuer,
 		"client": testALBClientID,
+		"exp":    testALBNow.Add(time.Hour).Unix(),
 	}
 	for k, v := range overrides {
-		claims[k] = v
+		header[k] = v
 	}
-	return claims
+	return header
 }
 
 func TestALBOIDCVerifierAcceptsValidToken(t *testing.T) {
 	key := testALBSigningKey(t)
 	v := testALBVerifier(t, key, testALBIssuer, testALBClientID)
-	claims, err := v.Verify(signedOIDC(t, key, validALBClaims(map[string]any{"email": "a@posthog.com"})))
+	claims, err := v.Verify(signedOIDC(t, key, map[string]any{"email": "a@posthog.com"}))
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
 	if claims["email"] != "a@posthog.com" {
 		t.Fatalf("email = %v", claims["email"])
+	}
+	if _, ok := claims["exp"]; ok {
+		t.Fatal("Verify returned protected-header metadata as a payload claim")
 	}
 }
 
@@ -107,13 +143,21 @@ func TestALBOIDCVerifierRejections(t *testing.T) {
 	otherKey := testALBSigningKey(t)
 	v := testALBVerifier(t, key, testALBIssuer, testALBClientID)
 
-	wrongSig := signedOIDC(t, otherKey, validALBClaims(nil))
+	wrongSig := signedOIDC(t, otherKey, map[string]any{"email": "a@posthog.com"})
 
-	tampered := signedOIDC(t, key, validALBClaims(nil))
+	tampered := signedOIDC(t, key, map[string]any{"email": "a@posthog.com"})
 	// Replace the payload with attacker claims, keep the original signature.
-	forgedPayload, _ := json.Marshal(validALBClaims(map[string]any{"email": "admin@posthog.com", "role": "admin"}))
+	forgedPayload, _ := json.Marshal(map[string]any{"email": "admin@posthog.com", "role": "admin"})
 	parts := splitForTest(t, tampered)
-	tampered = parts[0] + "." + base64.RawURLEncoding.EncodeToString(forgedPayload) + "." + parts[2]
+	tampered = parts[0] + "." + base64.URLEncoding.EncodeToString(forgedPayload) + "." + parts[2]
+
+	missingExpHeader := validALBHeader(nil)
+	delete(missingExpHeader, "exp")
+	metadataInPayload := validALBHeader(nil)
+	metadataInPayload["email"] = "a@posthog.com"
+	noUserClaims := map[string]any{}
+	validParts := splitForTest(t, signedOIDC(t, key, map[string]any{"email": "a@posthog.com"}))
+	shortSignature := validParts[0] + "." + validParts[1] + "." + base64.URLEncoding.EncodeToString(make([]byte, 63))
 
 	cases := []struct {
 		name  string
@@ -122,11 +166,15 @@ func TestALBOIDCVerifierRejections(t *testing.T) {
 		{"signature from wrong key", wrongSig},
 		{"tampered payload", tampered},
 		{"unsigned legacy token", mkUnsignedOIDC(map[string]any{"email": "a@posthog.com"})},
-		{"expired", signedOIDC(t, key, validALBClaims(map[string]any{"exp": float64(time.Now().Add(-time.Hour).Unix())}))},
-		{"missing exp", signedOIDC(t, key, map[string]any{"signer": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/internal/test/abc", "iss": testALBIssuer, "client": testALBClientID})},
-		{"signer in another region", signedOIDC(t, key, validALBClaims(map[string]any{"signer": "arn:aws:elasticloadbalancing:eu-central-1:123456789012:loadbalancer/internal/test/abc"}))},
-		{"wrong issuer", signedOIDC(t, key, validALBClaims(map[string]any{"iss": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_OTHER"}))},
-		{"wrong client", signedOIDC(t, key, validALBClaims(map[string]any{"client": "other-client"}))},
+		{"ASN.1 signature", signedOIDCASN1(t, key, validALBHeader(nil), map[string]any{"email": "a@posthog.com"})},
+		{"short JWS signature", shortSignature},
+		{"expired", signedOIDCWithHeader(t, key, validALBHeader(map[string]any{"exp": testALBNow.Add(-time.Hour).Unix()}), noUserClaims)},
+		{"missing exp", signedOIDCWithHeader(t, key, missingExpHeader, noUserClaims)},
+		{"non-integer exp", signedOIDCWithHeader(t, key, validALBHeader(map[string]any{"exp": "not-a-number"}), noUserClaims)},
+		{"metadata only in payload", signedOIDCWithHeader(t, key, map[string]any{"alg": "ES256", "kid": "test-kid"}, metadataInPayload)},
+		{"signer in another region", signedOIDCWithHeader(t, key, validALBHeader(map[string]any{"signer": "arn:aws:elasticloadbalancing:eu-central-1:123456789012:loadbalancer/app/test/abc"}), noUserClaims)},
+		{"wrong issuer", signedOIDCWithHeader(t, key, validALBHeader(map[string]any{"iss": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_OTHER"}), noUserClaims)},
+		{"wrong client", signedOIDCWithHeader(t, key, validALBHeader(map[string]any{"client": "other-client"}), noUserClaims)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

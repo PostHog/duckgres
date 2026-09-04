@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"regexp"
 	"strings"
@@ -25,8 +26,9 @@ import (
 //
 // The verifier checks the ES256 signature against the ALB's regional public
 // key. AWS publishes these keys at a fixed HTTPS endpoint per region. The
-// verifier also checks the exp, signer, iss, and client claims. A request
-// that never crossed the ALB cannot produce a JWT that passes these checks.
+// verifier also checks the exp, signer, iss, and client protected-header
+// fields. A request that never crossed the ALB cannot produce a JWT that
+// passes these checks.
 //
 // This verification is the trust boundary for operator identity. Earlier
 // versions trusted the header without a signature check. That trusted the
@@ -90,8 +92,12 @@ func (v *ALBOIDCVerifier) Verify(token string) (map[string]any, error) {
 		}
 	}
 	var header struct {
-		Alg string `json:"alg"`
-		Kid string `json:"kid"`
+		Alg      string `json:"alg"`
+		Kid      string `json:"kid"`
+		Signer   string `json:"signer"`
+		Issuer   string `json:"iss"`
+		ClientID string `json:"client"`
+		Expires  *int64 `json:"exp"`
 	}
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
 		return nil, errMalformedJWT
@@ -118,42 +124,48 @@ func (v *ALBOIDCVerifier) Verify(token string) (map[string]any, error) {
 		}
 	}
 	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if !ecdsa.VerifyASN1(key, digest[:], sig) {
+	// JWS encodes an ES256 signature as the fixed-width concatenation R || S,
+	// with 32 bytes per integer. It is not an ASN.1 DER signature.
+	if len(sig) != 64 {
 		return nil, &jwtError{"JWT signature verification failed"}
+	}
+	r := new(big.Int).SetBytes(sig[:32])
+	s := new(big.Int).SetBytes(sig[32:])
+	if !ecdsa.Verify(key, digest[:], r, s) {
+		return nil, &jwtError{"JWT signature verification failed"}
+	}
+	if err := v.checkHeader(header.Expires, header.Signer, header.Issuer, header.ClientID); err != nil {
+		return nil, err
 	}
 
 	claims, err := decodeJWTClaims(token)
 	if err != nil {
 		return nil, err
 	}
-	if err := v.checkClaims(claims); err != nil {
-		return nil, err
-	}
 	return claims, nil
 }
 
-// checkClaims validates the registered claims of a verified JWT.
-func (v *ALBOIDCVerifier) checkClaims(claims map[string]any) error {
+// checkHeader validates the ALB metadata in the verified JWT's protected
+// header. The payload contains only the user claims returned by the IdP.
+func (v *ALBOIDCVerifier) checkHeader(exp *int64, signer, issuer, clientID string) error {
 	// The ALB always sets exp. Reject tokens without it.
-	exp, ok := claims["exp"].(float64)
-	if !ok {
+	if exp == nil {
 		return &jwtError{"missing exp claim"}
 	}
 	// Allow 60 seconds of clock skew between the ALB and this process.
-	if time.Unix(int64(exp), 0).Add(60 * time.Second).Before(v.now()) {
+	if time.Unix(*exp, 0).Add(60 * time.Second).Before(v.now()) {
 		return &jwtError{"JWT expired"}
 	}
-	// The signer claim names the ALB that signed the JWT. It must be an ALB
-	// in the configured region. This blocks JWTs that a different ALB signed.
-	signer := stringClaim(claims, "signer")
+	// The signer header field names the ALB that signed the JWT. Require an ALB
+	// ARN in the configured region.
 	expectedPrefix := "arn:aws:elasticloadbalancing:" + v.region + ":"
 	if !strings.HasPrefix(signer, expectedPrefix) {
 		return &jwtError{"unexpected JWT signer"}
 	}
-	if v.issuer != "" && stringClaim(claims, "iss") != v.issuer {
+	if v.issuer != "" && issuer != v.issuer {
 		return &jwtError{"unexpected JWT issuer"}
 	}
-	if v.clientID != "" && stringClaim(claims, "client") != v.clientID {
+	if v.clientID != "" && clientID != v.clientID {
 		return &jwtError{"unexpected JWT client"}
 	}
 	return nil
