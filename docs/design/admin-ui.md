@@ -65,8 +65,9 @@ the proxy is not an open PromQL relay. Org-labelled metrics we expose:
 
 ### 3. RBAC + audit — `authz.go`, `audit.go`
 - `AuthMiddleware`: verify `x-amzn-oidc-data` (ALB-signed JWT) via the ALB regional
-  public-key endpoint (`alb_oidc.go`, keys cached per `kid`) — signature, `exp`,
-  `signer` (must be an ALB ARN in the configured region), `iss`
+  public-key endpoint (`alb_oidc.go`, keys cached per `kid`) — the JOSE ES256
+  signature plus protected-header fields `exp`, `signer` (must be an ALB ARN in
+  the configured region), `iss`
   (`DUCKGRES_ADMIN_SSO_ISSUER`), `client` (`DUCKGRES_ADMIN_SSO_CLIENT_ID`). The
   unsigned `x-amzn-oidc-identity` header is never trusted. Without
   `DUCKGRES_ADMIN_SSO_ISSUER` the SSO path is off and only bearer tokens

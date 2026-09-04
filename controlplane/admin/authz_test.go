@@ -38,7 +38,7 @@ func newTestSSO(t *testing.T) *testSSO {
 // claim overrides (typically "email").
 func (s *testSSO) oidc(t *testing.T, overrides map[string]any) string {
 	t.Helper()
-	return signedOIDC(t, s.key, validALBClaims(overrides))
+	return signedOIDC(t, s.key, overrides)
 }
 
 // roleByEmail builds a fake RoleResolver from an email→role map. Unknown
@@ -159,7 +159,7 @@ func TestAuthMiddlewareRejectsForgedSSO(t *testing.T) {
 		value  string
 	}{
 		{"unsigned data JWT", albOIDCDataHeader, mkUnsignedOIDC(map[string]any{"email": "a@posthog.com"})},
-		{"wrong-key signature", albOIDCDataHeader, signedOIDC(t, otherKey, validALBClaims(map[string]any{"email": "a@posthog.com"}))},
+		{"wrong-key signature", albOIDCDataHeader, signedOIDC(t, otherKey, map[string]any{"email": "a@posthog.com"})},
 		{"identity-only header", "X-Amzn-Oidc-Identity", "a@posthog.com"},
 	}
 	for _, tc := range cases {

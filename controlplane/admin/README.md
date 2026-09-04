@@ -41,9 +41,13 @@ with a `Role`:
 
 `RoleGate` enforces the split: mutating verbs (POST/PUT/PATCH/DELETE) and the
 audit-log GET require admin; other GETs allow viewer. `AuditMiddleware` records
-every mutation. The ALB OIDC JWT signature is currently trusted-by-network (the
-internal LB is the only ingress and strips client copies); verifying it by `kid`
-is a hardening follow-up (see the design doc).
+every mutation. The ALB OIDC JWT's ES256 signature is verified against AWS's
+regional public-key endpoint. Its expiry, signer region, configured issuer, and
+configured client are validated from the protected header before payload user
+claims are trusted. `DUCKGRES_ADMIN_SSO_ISSUER` enables SSO; when unset, SSO is
+disabled and only bearer tokens authenticate. `DUCKGRES_ADMIN_SSO_CLIENT_ID`
+pins the client when set. `DUCKGRES_ADMIN_SSO_REGION` selects the key endpoint
+and signer region, defaulting to `DUCKGRES_AWS_REGION`.
 
 `?token=` URL auth is deliberately rejected (#721).
 
