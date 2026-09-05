@@ -60,8 +60,18 @@ func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore
 		return fmt.Errorf("detect ducklake attachment: %w", err)
 	}
 
+	attachedMemoryCatalog := false
 	if _, err := executor.ExecContext(ctx, "USE memory"); err != nil {
-		return fmt.Errorf("switch to memory catalog: %w", err)
+		if !isMissingMemoryCatalogError(err) {
+			return fmt.Errorf("switch to memory catalog: %w", err)
+		}
+		if _, attachErr := executor.ExecContext(ctx, "ATTACH ':memory:' AS memory"); attachErr != nil {
+			return fmt.Errorf("attach memory catalog: %w", attachErr)
+		}
+		attachedMemoryCatalog = true
+		if _, useErr := executor.ExecContext(ctx, "USE memory"); useErr != nil {
+			return fmt.Errorf("switch to attached memory catalog: %w", useErr)
+		}
 	}
 	defer func() {
 		// Leave the session in a real catalog (we entered `memory` to install the
@@ -71,6 +81,9 @@ func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore
 		if duckLakeAttached {
 			_, _ = executor.ExecContext(context.Background(), "USE ducklake")
 			_, _ = executor.ExecContext(context.Background(), "SET search_path = 'main,memory.main'")
+		} else if attachedMemoryCatalog && !strings.EqualFold(catalog, "memory") {
+			_, _ = executor.ExecContext(context.Background(), "USE "+sqlcore.QuoteIdentifier(catalog))
+			_, _ = executor.ExecContext(context.Background(), "SET search_path = 'main,memory.main'")
 		}
 	}()
 
@@ -79,6 +92,15 @@ func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore
 	}
 
 	return nil
+}
+
+func isMissingMemoryCatalogError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, `No catalog + schema named "memory" found`) ||
+		strings.Contains(msg, `Catalog with name "memory" does not exist`)
 }
 
 func HasAttachedCatalog(ctx context.Context, executor sqlcore.QueryExecutor, catalog string) (bool, error) {

@@ -1049,8 +1049,16 @@ func (c *clientConn) serve() error {
 		// the real attached catalog, not the client's connection database name.
 		// Standalone has a single backing catalog, so honor whatever is attached.
 		catalog := c.database
-		if duckLakeAttached {
+		switch {
+		case duckLakeAttached:
 			catalog = physicalDuckLakeCatalog
+		case c.server.cfg.FilePersistence && c.server.cfg.DataDir != "" && c.username != "":
+			// File persistence opens <DataDir>/<username>.duckdb, so DuckDB names the
+			// backing catalog after the user, not after c.database. Without this the
+			// metadata views filter on a catalog that holds nothing and the user's own
+			// tables are missing from pg_tables / information_schema.tables. An empty
+			// DataDir means DuckDBDSN fell back to :memory:, where no such catalog exists.
+			catalog = c.username
 		}
 		if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, c.executor, catalog); err != nil {
 			initCancel()
