@@ -17,8 +17,16 @@ import (
 // binary, not once per case.
 func preparedPolicy(t *testing.T, gc GroupCatalogs) rego.PreparedEvalQuery {
 	t.Helper()
+	return preparedScopedPolicy(t, gc, nil)
+}
+
+// preparedScopedPolicy is preparedPolicy with project scopes in the bundle.
+// Separate entry point so every pre-scopes test keeps calling preparedPolicy
+// and keeps asserting the unscoped behaviour verbatim.
+func preparedScopedPolicy(t *testing.T, gc GroupCatalogs, gs GroupScopes) rego.PreparedEvalQuery {
+	t.Helper()
 	ctx := context.Background()
-	data, err := buildDataDocument(gc)
+	data, err := buildDataDocument(gc, gs)
 	if err != nil {
 		t.Fatalf("buildDataDocument: %v", err)
 	}
@@ -883,7 +891,13 @@ func TestIsolationMatrix(t *testing.T) {
 // preparedBatch compiles the policy for the batched entrypoint.
 func preparedBatch(t *testing.T, gc GroupCatalogs) rego.PreparedEvalQuery {
 	t.Helper()
-	data, err := buildDataDocument(gc)
+	return preparedScopedBatch(t, gc, nil)
+}
+
+// preparedScopedBatch is preparedBatch with project scopes in the bundle.
+func preparedScopedBatch(t *testing.T, gc GroupCatalogs, gs GroupScopes) rego.PreparedEvalQuery {
+	t.Helper()
+	data, err := buildDataDocument(gc, gs)
 	if err != nil {
 		t.Fatalf("buildDataDocument: %v", err)
 	}
@@ -1816,5 +1830,303 @@ func TestSystemNodesGrantIsObserverOnly(t *testing.T) {
 		[]interface{}{ObserverGroup}
 	if evalAllow(t, q, in) {
 		t.Error("claiming the observer group without the observer username must grant nothing")
+	}
+}
+
+// --------------------------------------------------------------------------
+// Project scopes.
+//
+// A project-scoped login is in `scope_<org>_team_<id>`, which owns the SAME
+// catalog the org group owns and additionally carries a scope document. The
+// property every test here defends is that the scope only ever SUBTRACTS: it
+// cannot reach another tenant, and removing the scope document must restore
+// exactly the unscoped behaviour.
+// --------------------------------------------------------------------------
+
+// scopedFixture is one org with an unscoped group and a project-scoped group,
+// both owning org_acme. Team 7 holds schema posthog_7 whole, plus the single
+// relation posthog.events out of the shared legacy schema.
+func scopedFixture() (GroupCatalogs, GroupScopes) {
+	gc := GroupCatalogs{
+		"org_acme":          {"org_acme": true},
+		"scope_acme_team_7": {"org_acme": true},
+		"org_other":         {"org_other": true},
+	}
+	gs := GroupScopes{
+		"scope_acme_team_7": NewGroupScope(
+			[]string{"posthog_7", "posthog_7_data_imports"},
+			[]string{"posthog.events"},
+		),
+	}
+	return gc, gs
+}
+
+func scopedIdentity() map[string]interface{} {
+	return map[string]interface{}{
+		"identity": map[string]interface{}{
+			"user":   "acme.posthog_team_7",
+			"groups": []interface{}{"scope_acme_team_7", "tier_free"},
+		},
+	}
+}
+
+func tableInput(op, catalog, schema, table string, ctx map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"context": ctx,
+		"action": map[string]interface{}{
+			"operation": op,
+			"resource": map[string]interface{}{
+				"table": map[string]interface{}{
+					"catalogName": catalog,
+					"schemaName":  schema,
+					"tableName":   table,
+				},
+			},
+		},
+	}
+}
+
+func schemaInput(op, catalog, schema string, ctx map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"context": ctx,
+		"action": map[string]interface{}{
+			"operation": op,
+			"resource": map[string]interface{}{
+				"schema": map[string]interface{}{
+					"catalogName": catalog,
+					"schemaName":  schema,
+				},
+			},
+		},
+	}
+}
+
+// A scoped login reads its own project's schemas and nothing else in the very
+// same catalog. This is the whole point of the feature: without it a project
+// login projected into Trino would see every other project's data.
+func TestScopedGroupReadsOnlyItsOwnSchemas(t *testing.T) {
+	gc, gs := scopedFixture()
+	q := preparedScopedPolicy(t, gc, gs)
+
+	for _, tc := range []struct {
+		name   string
+		schema string
+		table  string
+		want   bool
+	}{
+		{"own schema", "posthog_7", "events", true},
+		{"own imports schema", "posthog_7_data_imports", "stripe_charges", true},
+		{"another project's schema", "posthog_9", "events", false},
+		{"a shared schema it holds no grant in", "public", "anything", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, op := range []string{"SelectFromColumns", "FilterTables", "ShowColumns"} {
+				got := evalAllow(t, q, tableInput(op, "org_acme", tc.schema, tc.table, scopedIdentity()))
+				if got != tc.want {
+					t.Errorf("%s on %s.%s = %v, want %v", op, tc.schema, tc.table, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// An individually granted relation is readable, and its SIBLINGS in the same
+// schema are not. duckgres grants a project the shared legacy `posthog`
+// schema one table at a time precisely because the schema holds every other
+// project's tables too, so a grant that leaked to the whole schema would be a
+// cross-project read.
+func TestScopedGroupRelationGrantDoesNotLeakItsSchema(t *testing.T) {
+	gc, gs := scopedFixture()
+	q := preparedScopedPolicy(t, gc, gs)
+
+	if !evalAllow(t, q, tableInput("SelectFromColumns", "org_acme", "posthog", "events", scopedIdentity())) {
+		t.Error("granted relation posthog.events must be readable")
+	}
+	if evalAllow(t, q, tableInput("SelectFromColumns", "org_acme", "posthog", "persons", scopedIdentity())) {
+		t.Error("posthog.persons was NOT granted and must not be readable")
+	}
+}
+
+// The schema holding a granted relation must be visible at schema level, or
+// the client can never navigate to the table it is allowed to read.
+func TestScopedGroupSeesTheSchemaOfAGrantedRelation(t *testing.T) {
+	gc, gs := scopedFixture()
+	q := preparedScopedPolicy(t, gc, gs)
+
+	for _, op := range []string{"FilterSchemas", "ShowTables"} {
+		if !evalAllow(t, q, schemaInput(op, "org_acme", "posthog", scopedIdentity())) {
+			t.Errorf("%s on the schema of a granted relation must be allowed", op)
+		}
+		if !evalAllow(t, q, schemaInput(op, "org_acme", "posthog_7", scopedIdentity())) {
+			t.Errorf("%s on a wholly granted schema must be allowed", op)
+		}
+		if evalAllow(t, q, schemaInput(op, "org_acme", "posthog_9", scopedIdentity())) {
+			t.Errorf("%s on another project's schema must be denied", op)
+		}
+	}
+}
+
+// The cross-tenant boundary is unchanged for a scoped login: its scope names
+// schemas, and a schema name says nothing about which catalog it is in. A
+// scope group that owns only org_acme must not reach org_other even for a
+// schema name its own scope happens to list.
+func TestScopedGroupStillCannotCrossTenants(t *testing.T) {
+	gc, gs := scopedFixture()
+	q := preparedScopedPolicy(t, gc, gs)
+
+	for _, op := range []string{"SelectFromColumns", "FilterTables", "ShowColumns"} {
+		if evalAllow(t, q, tableInput(op, "org_other", "posthog_7", "events", scopedIdentity())) {
+			t.Errorf("%s reached another tenant's catalog", op)
+		}
+	}
+	if evalAllow(t, q, schemaInput("FilterSchemas", "org_other", "posthog_7", scopedIdentity())) {
+		t.Error("FilterSchemas reached another tenant's catalog")
+	}
+	catalogInput := map[string]interface{}{
+		"context": scopedIdentity(),
+		"action": map[string]interface{}{
+			"operation": "AccessCatalog",
+			"resource":  map[string]interface{}{"catalog": map[string]interface{}{"name": "org_other"}},
+		},
+	}
+	if evalAllow(t, q, catalogInput) {
+		t.Error("AccessCatalog reached another tenant's catalog")
+	}
+}
+
+// A scoped login still needs the catalog itself, or it cannot run any query
+// at all against the schemas it IS allowed to read.
+func TestScopedGroupCanAccessItsOwnCatalog(t *testing.T) {
+	gc, gs := scopedFixture()
+	q := preparedScopedPolicy(t, gc, gs)
+
+	for _, op := range []string{"AccessCatalog", "FilterCatalogs", "ShowSchemas"} {
+		in := map[string]interface{}{
+			"context": scopedIdentity(),
+			"action": map[string]interface{}{
+				"operation": op,
+				"resource":  map[string]interface{}{"catalog": map[string]interface{}{"name": "org_acme"}},
+			},
+		}
+		if !evalAllow(t, q, in) {
+			t.Errorf("%s on its own catalog must be allowed", op)
+		}
+	}
+}
+
+// Scoped logins get no write authority anywhere, including inside the schemas
+// they can read. duckgres has a read-only project login and a read/write one;
+// only the read-only half is expressible here today, so both are read-only in
+// Trino. That is a narrowing of the read/write login and never a widening of
+// the read-only one -- if this test starts failing because writes were added
+// for project_user, the scope must gate them per-schema, not per-catalog.
+func TestScopedGroupHasNoWriteAuthority(t *testing.T) {
+	gc, gs := scopedFixture()
+	q := preparedScopedPolicy(t, gc, gs)
+
+	for _, op := range []string{"CreateSchema", "DropSchema"} {
+		if evalAllow(t, q, schemaInput(op, "org_acme", "posthog_7", scopedIdentity())) {
+			t.Errorf("%s must be denied to a scoped login", op)
+		}
+	}
+	for _, op := range []string{"CreateTable", "DropTable", "InsertIntoTable", "DeleteFromTable", "UpdateTableColumns"} {
+		if evalAllow(t, q, tableInput(op, "org_acme", "posthog_7", "events", scopedIdentity())) {
+			t.Errorf("%s must be denied to a scoped login", op)
+		}
+	}
+}
+
+// The unscoped org login is untouched by any of the above: it reads every
+// schema in its catalog and keeps its write authority. This is the
+// regression guard for every tenant that has no project logins at all.
+func TestUnscopedGroupIsUnaffectedByScopesInTheBundle(t *testing.T) {
+	gc, gs := scopedFixture()
+	q := preparedScopedPolicy(t, gc, gs)
+
+	unscoped := map[string]interface{}{
+		"identity": map[string]interface{}{
+			"user":   "acme",
+			"groups": []interface{}{"org_acme", "tier_free"},
+		},
+	}
+	for _, schema := range []string{"posthog_7", "posthog_9", "public"} {
+		if !evalAllow(t, q, tableInput("SelectFromColumns", "org_acme", schema, "events", unscoped)) {
+			t.Errorf("unscoped login must read %s", schema)
+		}
+		if !evalAllow(t, q, schemaInput("FilterSchemas", "org_acme", schema, unscoped)) {
+			t.Errorf("unscoped login must see %s", schema)
+		}
+	}
+	if !evalAllow(t, q, schemaInput("CreateSchema", "org_acme", "whatever", unscoped)) {
+		t.Error("unscoped login must keep its write authority")
+	}
+	if evalAllow(t, q, tableInput("SelectFromColumns", "org_other", "posthog_7", "events", unscoped)) {
+		t.Error("unscoped login must not cross tenants")
+	}
+}
+
+// A scope document with no readable namespace is the fail-closed shape
+// configstore produces for a missing or disabled team. It must read NOTHING
+// rather than degrading into unscoped access.
+func TestEmptyScopeReadsNothing(t *testing.T) {
+	gc := GroupCatalogs{"scope_acme_team_7": {"org_acme": true}}
+	gs := GroupScopes{"scope_acme_team_7": NewGroupScope(nil, nil)}
+	q := preparedScopedPolicy(t, gc, gs)
+
+	if evalAllow(t, q, tableInput("SelectFromColumns", "org_acme", "posthog_7", "events", scopedIdentity())) {
+		t.Error("an empty scope must read no table")
+	}
+	if evalAllow(t, q, schemaInput("FilterSchemas", "org_acme", "posthog_7", scopedIdentity())) {
+		t.Error("an empty scope must see no schema")
+	}
+}
+
+// Batched filtering must answer identically to the non-batched path for
+// scoped groups too, candidate by candidate -- the same invariant
+// TestBatchedFilteringMatchesNonBatched pins for the unscoped path. The two
+// entrypoints dispatch separately, so a scope rule added to one and not the
+// other is exactly the drift this catches.
+func TestBatchedFilteringMatchesNonBatchedForScopes(t *testing.T) {
+	gc, gs := scopedFixture()
+	single := preparedScopedPolicy(t, gc, gs)
+	batched := preparedScopedBatch(t, gc, gs)
+	ctx := context.Background()
+
+	schemas := []string{"posthog_7", "posthog_9", "posthog", "public"}
+	resources := make([]interface{}, 0, len(schemas))
+	for _, s := range schemas {
+		resources = append(resources, map[string]interface{}{
+			"schema": map[string]interface{}{"catalogName": "org_acme", "schemaName": s},
+		})
+	}
+	rs, err := batched.Eval(ctx, rego.EvalInput(map[string]interface{}{
+		"context": scopedIdentity(),
+		"action": map[string]interface{}{
+			"operation":       "FilterSchemas",
+			"filterResources": resources,
+		},
+	}))
+	if err != nil {
+		t.Fatalf("Eval batch: %v", err)
+	}
+	allowed := map[int]bool{}
+	if len(rs) > 0 {
+		for _, v := range rs[0].Expressions[0].Value.([]interface{}) {
+			n, ok := v.(json.Number)
+			if !ok {
+				t.Fatalf("expected numeric index, got %T (%v)", v, v)
+			}
+			i, err := n.Int64()
+			if err != nil {
+				t.Fatalf("index %v: %v", v, err)
+			}
+			allowed[int(i)] = true
+		}
+	}
+	for i, s := range schemas {
+		want := evalAllow(t, single, schemaInput("FilterSchemas", "org_acme", s, scopedIdentity()))
+		if allowed[i] != want {
+			t.Errorf("schema %s: batch=%v single=%v", s, allowed[i], want)
+		}
 	}
 }

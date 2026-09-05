@@ -522,6 +522,69 @@ type TrinoEnabledOrg struct {
 	CellID           string
 	RootPasswordHash string                            // bcrypt hash from OrgUser row where Username = "root"
 	State            ManagedWarehouseProvisioningState // current state at read time
+	// Users are the org's own duckgres logins, each of which authenticates
+	// to Trino under TrinoUserPrincipal(Username) with the very same bcrypt
+	// hash it uses at the pgwire handshake. Populated by a second query in
+	// ListTrinoEnabledOrgs, hence `gorm:"-"` -- it is not a column on the
+	// row the outer join scans into.
+	Users []TrinoOrgUser `gorm:"-"`
+}
+
+// TrinoOrgUser is one of an org's duckgres logins, projected into the cell's
+// password file so a person who already has a pgwire credential can use that
+// same credential against Trino instead of sharing the org's root password.
+type TrinoOrgUser struct {
+	Username string
+	// PasswordHash is duckgres_org_users.password, copied through unchanged.
+	// It is bcrypt at cost 10, which Trino's file authenticator accepts as
+	// is (its floor is cost 8), so ONE password works on both engines and no
+	// separate Trino credential is ever minted or stored.
+	PasswordHash string
+	// Scope, when non-nil, restricts the login to one project's schemas.
+	// Mirrors duckgres_org_users.access_mode's project_reader / project_user
+	// modes; nil means an unrestricted org-wide login.
+	//
+	// The value is whatever OrgUserQueryAccess reports for this user, so the
+	// scope Trino enforces and the scope pgwire enforces are the same object
+	// derived by the same code -- see ListTrinoEnabledOrgs.
+	Scope *OrgUserQueryAccess
+	// TeamID is the project a scoped login is bound to, and is what its Trino
+	// group is keyed on. Non-nil exactly when Scope is: the two are set
+	// together and a scoped row with no team is dropped rather than
+	// projected (the table's CHECK constraint already forbids that shape).
+	//
+	// Carried here rather than on OrgUserQueryAccess because that type is the
+	// pgwire session path's policy object and has no reason to grow a field
+	// only the Trino projection reads.
+	TeamID *int64
+}
+
+// TrinoPrincipalSeparator joins an org's principal to one of its usernames to
+// form a cell-wide-unique Trino username.
+//
+// Trino's password file is ONE flat namespace per cell while duckgres keys a
+// login on (org, username) and recovers the org from SNI -- which a Trino
+// login carries no equivalent of. Two orgs may each have an `analyst`, and
+// two identical password-file lines would let one org's user authenticate
+// against the other's entry and land in the other's group. Qualifying the
+// username is what makes the flat namespace safe.
+//
+// `.` is the separator because a valid database_name cannot contain one (see
+// ValidateDatabaseName: a DNS label) and neither can a projectable username
+// (see projectableTrinoUsername), so `<org>.<user>` splits unambiguously and
+// the org prefix stays recoverable -- which the resource-group selector's
+// named capture depends on.
+const TrinoPrincipalSeparator = "."
+
+// TrinoUserPrincipal returns the Trino username for one of the org's duckgres
+// logins: the org's own principal, the separator, then the duckgres username.
+// Returns "" when either half is missing, which callers skip.
+func (o TrinoEnabledOrg) TrinoUserPrincipal(username string) string {
+	principal := o.TrinoPrincipal()
+	if principal == "" || username == "" {
+		return ""
+	}
+	return principal + TrinoPrincipalSeparator + username
 }
 
 // TrinoPrincipal is the tenant's customer-facing identity in Trino: the
