@@ -54,11 +54,16 @@ shape deployed with the scenario stack:
 ```bash
 export DUCKGRES_K8S_WORKER_CPU_REQUEST="3"
 export DUCKGRES_K8S_WORKER_MEMORY_REQUEST="12Gi"
+export DUCKGRES_SCENARIO_ATHENA_REGION="<aws-region>"
+export DUCKGRES_SCENARIO_ATHENA_WORKGROUP="<on-demand-workgroup>"
+export DUCKGRES_SCENARIO_ATHENA_DATABASE="<glue-database>"
+export DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI="s3://<results-bucket>/<prefix>/"
 ```
 
 The full and fast suites exercise PGWire only. The targeted frozen perf
-scenario compares PGWire and Trino. It records per-query success and failure
-rows in `query_results.csv`.
+scenario compares PGWire, Trino, and on-demand Athena. It records per-query
+success and failure rows in `query_results.csv` and Athena service details in
+`query_service_metrics.csv`.
 Measured query errors fail the perf DAG step after its artifacts are written;
 independent sibling steps continue to run.
 
@@ -150,7 +155,7 @@ The frozen perf scenario uses:
 - `tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml`
 - `tests/perf/queries/ducklake_frozen.yaml`
 
-Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `summary.json`, and `server_metrics.prom`.
+Perf artifacts are written under `artifacts/scenario/<run_id>/perf/` using the existing `tests/perf/core` artifact schema, including `query_results.csv`, `query_service_metrics.csv`, `summary.json`, and `server_metrics.prom`.
 
 The frozen dbt scenario uses:
 

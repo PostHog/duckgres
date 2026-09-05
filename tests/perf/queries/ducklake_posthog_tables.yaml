@@ -5,6 +5,7 @@ dataset_scale: 1
 targets:
   - pgwire
   - trino
+  - athena
 warmup_iterations: 1
 measure_iterations: 4
 
@@ -15,6 +16,9 @@ relation_variants:
   ducklake_table:
     events: posthog.events
     persons: posthog.persons
+  athena_external:
+    events: events
+    persons: persons
 
 paired_queries:
   - query_id_base: q_events_total_balanced_v3

@@ -4,11 +4,19 @@ This package contains the golden-query performance harness.
 
 ## Protocol Drivers
 
-Catalogs may target `pgwire`, `trino`, or both. Both drivers execute the same
+Catalogs may target `pgwire`, `trino`, `athena`, or any supported combination. All drivers execute the same
 rendered statement stored in the existing `pgwire_sql` catalog field; the
 legacy field name is retained for catalog compatibility and must not be used
 to create a second, protocol-specific query definition. Keep shared benchmark
-SQL within the intersection supported by DuckDB and Trino.
+SQL within the intersection supported by DuckDB, Trino, and Athena.
+
+The Athena driver uses on-demand capacity in an explicitly configured
+workgroup, database, and S3 result prefix. It disables result reuse for every
+execution and rejects a response which reports reuse. Timing is end to end:
+it includes queueing, engine execution, and paginated result retrieval. The
+driver defaults to catalog `AwsDataCatalog`, a 500ms status poll interval, and
+a 30-minute query timeout. Workgroup, database, result prefix, and AWS region
+are explicit scenario settings. Cancellation stops any unfinished query.
 
 The Trino driver requires an HTTPS coordinator and always verifies its TLS
 certificate. It uses system roots by default, or the explicitly configured CA
@@ -54,10 +62,10 @@ paired_queries:
       ORDER BY 1
 ```
 
-Paired catalogs must declare exactly the `raw_view` and `ducklake_table`
-variants. A template expands in declaration order, with `raw_view` before
-`ducklake_table`, into `q_events_daily__raw_view` and
-`q_events_daily__ducklake_table`. Generated queries retain the same
+Paired catalogs without Athena declare exactly the `raw_view` and
+`ducklake_table` variants. Athena catalogs add `athena_external`, whose generic
+table names are resolved in the configured Glue database. A template expands
+in stable order: `raw_view`, `ducklake_table`, then `athena_external`. Generated queries retain the same
 `intent_id`, tags, parameters, and semantic template; only declared relation
 placeholders differ. They carry in-memory storage-target metadata, so later
 code does not need to infer the target from the generated ID. Legacy queries
@@ -89,6 +97,8 @@ stored in the PGWire SQL field.
 
 This abstraction preserves the artifact contract while allowing downstream
 dashboards to compare paired targets by their generated query-ID suffixes.
+PGWire executes `raw_view` and `ducklake_table`; Trino executes only
+`ducklake_table`; Athena executes only `athena_external`.
 
 ## Local Smoke Run
 
@@ -126,6 +136,7 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 
 - `summary.json`
 - `query_results.csv`
+- `query_service_metrics.csv`
 - `server_metrics.prom`
 - `runner.log`
 - `dataset_manifest.json` (only when `DUCKGRES_PERF_DATASET_VERSION` is set)
@@ -148,6 +159,12 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 `measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
 `duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
 No CSV schema mutation is expected in this phase.
+
+`query_service_metrics.csv` is an additive sidecar. Provider-backed rows record
+queue, planning, engine, and service time; bytes scanned; DPU count when the
+service returns it; result reuse; and engine version. `query_results.csv`
+remains the canonical latency/status artifact and keeps its v1 header
+unchanged.
 
 ## Nightly Run
 

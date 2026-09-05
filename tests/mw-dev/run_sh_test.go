@@ -135,6 +135,24 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	}
 }
 
+func TestDeployCreatesDedicatedScenarioPodIdentityForAthenaPerf(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	cmd := runSHCommand(t, fakes.binDir, "deploy",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"SCENARIO_NAME=posthog_frozen_perf",
+		"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/athena-perf",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Athena perf deploy failed: %v\n%s", err, out)
+	}
+	calls := fakes.calls(t)
+	want := "aws eks create-pod-identity-association --region us-east-1 --cluster-name test-cluster --namespace duckgres-ci-pr-123 --service-account duckgres-scenario --role-arn arn:aws:iam::123456789012:role/athena-perf"
+	if !strings.Contains(calls, want) {
+		t.Fatalf("deploy did not create dedicated scenario Pod Identity; calls:\n%s", calls)
+	}
+}
+
 func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 	raw, err := os.ReadFile("manifests.trino.tmpl.yaml")
 	if err != nil {
@@ -405,6 +423,9 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
 		"SCENARIO_NAME=fast-suite",
+		"DUCKGRES_SCENARIO_ATHENA_WORKGROUP=benchmark",
+		"DUCKGRES_SCENARIO_ATHENA_DATABASE=benchmark_frozen",
+		"DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI=s3://benchmark-results/root/",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -416,9 +437,14 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"kubectl --context test-context -n duckgres-ci-pr-123 get svc duckgres-control-plane -o jsonpath={.spec.clusterIP}",
 		"kubectl --context test-context -n duckgres-ci-pr-123 apply -f -",
 		"name: artifact-keeper",
+		"serviceAccountName: duckgres-scenario",
 		"value: \"isolated-test-secret\"",
 		"name: DUCKGRES_SCENARIO_ORG_ID, value: \"ci-pr-123-cnpg\"",
 		"name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: \"/trino-ca/ca.crt\"",
+		"name: DUCKGRES_SCENARIO_ATHENA_REGION, value: \"us-east-1\"",
+		"name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: \"benchmark\"",
+		"name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: \"benchmark_frozen\"",
+		"name: DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI, value: \"s3://benchmark-results/root/\"",
 		"name: trino-ca, mountPath: /trino-ca, readOnly: true",
 		"name: trino-ca, secret: { secretName: duckgres-trino-tls, optional: true",
 		"kubectl --context test-context -n duckgres-ci-pr-123 logs -f pod/duckgres-scenario-pod",
