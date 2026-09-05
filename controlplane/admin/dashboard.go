@@ -86,12 +86,10 @@ func APIAuthMiddleware(tokens TokenSet) gin.HandlerFunc {
 // Service-to-service only: header-only (no cookie fallback — this surface
 // must never be drivable from a browser session), no SSO, no role
 // resolution; routes behind this middleware must not consult Identity or
-// RoleGate. Used for the discovery endpoints, which accept the scoped
-// read-only secret OR the admin internal secret (operator/debug access and
-// rotation-window compatibility) but grant nothing beyond the routes they
-// are mounted on. Failed requests always traverse every set (the only
-// early exit is on success), so a rejected probe learns nothing about
-// which set nearly matched.
+// RoleGate. Used for service endpoints that accept scoped read-only or admin
+// internal secrets but grant nothing beyond the routes where it is mounted.
+// Failed requests always traverse every set (the only early exit is on
+// success), so a rejected probe learns nothing about which set nearly matched.
 func AnyTokenAuthMiddleware(tokenSets ...TokenSet) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		got := c.GetHeader("X-Duckgres-Internal-Secret")

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/posthog/duckgres/controlplane/hogqlcatalog"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +32,7 @@ func newClusterSecretsTestProvisioner(t *testing.T) (*TrinoProvisioner, *kubefak
 		Kubernetes:        kc,
 		Namespace:         TrinoCustomerNamespace,
 		Catalog:           &fakeCatalogClient{},
+		HogQLCatalogs:     hogqlcatalog.NewMemoryStore(),
 		BundleStore:       &opa.BundleStore{},
 		BundleBuilder:     opa.NewBuilder(),
 	})
@@ -279,6 +281,7 @@ func TestBootstrap_ConcurrentReplicasConverge(t *testing.T) {
 			Kubernetes:        kc, // shared
 			Namespace:         TrinoCustomerNamespace,
 			Catalog:           &fakeCatalogClient{},
+			HogQLCatalogs:     hogqlcatalog.NewMemoryStore(),
 			BundleStore:       &opa.BundleStore{},
 			BundleBuilder:     opa.NewBuilder(),
 		})

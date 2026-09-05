@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/hogqlcatalog"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"golang.org/x/crypto/bcrypt"
 	corev1 "k8s.io/api/core/v1"
@@ -160,6 +161,13 @@ const DefaultTrinoTenantSecretMountPath = "/etc/trino/tenant-secrets"
 // requests is already at its resource-group concurrency limit.
 const defaultTrinoS3MaxConnections = 50
 
+const (
+	defaultHogQLLanguageVersion        = "1.0.0"
+	hogQLPhysicalRefreshLeaseTTL       = time.Minute
+	hogQLPhysicalRefreshInterval       = 5 * time.Minute
+	hogQLPhysicalRefreshFailureBackoff = 30 * time.Second
+)
+
 // metadataStoreDefaultPort is the Postgres port assumed when the warehouse
 // row carries no explicit port (cnpg-shard rows are mirrored from a CR
 // status that publishes no port; the pooler serves 5432).
@@ -245,6 +253,7 @@ type TrinoCatalogClient interface {
 	CreateCatalog(ctx context.Context, name string, props map[string]string) error
 	AlterCatalog(ctx context.Context, name string, props map[string]string) error
 	DropCatalog(ctx context.Context, name string) error
+	PhysicalCatalog(ctx context.Context, catalog hogqlcatalog.PhysicalIdentifier) (*hogqlcatalog.PhysicalCatalogMetadata, error)
 }
 
 // TrinoProvisionerOpts groups all the dependencies trino_provisioner.go
@@ -310,6 +319,10 @@ type TrinoProvisionerOpts struct {
 	// TrinoCatalogClient interface). For unit tests a fake catalog
 	// client with no auth surface is fine.
 	Catalog TrinoCatalogClient
+
+	HogQLCatalogs hogqlcatalog.PhysicalRefreshStore
+
+	HogQLLanguageVersion string
 
 	// BundleStore is the in-memory holder of the most recently built OPA
 	// bundle. The provisioner Set()s into it on every reconcile tick.
@@ -406,6 +419,8 @@ type TrinoProvisioner struct {
 	namespace             string
 	cellID                string
 	catalog               TrinoCatalogClient
+	hogqlCatalogs         hogqlcatalog.PhysicalRefreshStore
+	hogqlLanguageVersion  string
 	bundleStore           *opa.BundleStore
 	bundleBuilder         opa.BundleBuilder
 	tenantSecretMountPath string
@@ -482,6 +497,9 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if opts.Catalog == nil {
 		return nil, errors.New("TrinoProvisioner: Catalog client is required")
 	}
+	if opts.HogQLCatalogs == nil {
+		return nil, errors.New("TrinoProvisioner: HogQLCatalogs store is required")
+	}
 	if opts.BundleStore == nil {
 		return nil, errors.New("TrinoProvisioner: BundleStore is required")
 	}
@@ -504,6 +522,10 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if maxConns <= 0 {
 		maxConns = defaultTrinoS3MaxConnections
 	}
+	languageVersion := strings.TrimSpace(opts.HogQLLanguageVersion)
+	if languageVersion == "" {
+		languageVersion = defaultHogQLLanguageVersion
+	}
 	return &TrinoProvisioner{
 		store:                 opts.Store,
 		bootstrapSentinel:     opts.BootstrapSentinel,
@@ -513,6 +535,8 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		namespace:             ns,
 		cellID:                cell,
 		catalog:               opts.Catalog,
+		hogqlCatalogs:         opts.HogQLCatalogs,
+		hogqlLanguageVersion:  languageVersion,
 		bundleStore:           opts.BundleStore,
 		bundleBuilder:         opts.BundleBuilder,
 		tenantSecretMountPath: strings.TrimRight(mountPath, "/"),
@@ -1431,6 +1455,17 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 			// post-v1: the only property that can move under a live
 			// catalog is the metadata endpoint after a reshard, and that
 			// path fences the tenant separately.
+			ready, err := p.refreshPhysicalCatalog(ctx, name, false)
+			if err != nil {
+				perOrgErr := fmt.Errorf("refresh physical catalog %s: %w", name, err)
+				errs = append(errs, perOrgErr)
+				outcomes[o.OrgID] = catalogOutcome{Err: perOrgErr}
+				continue
+			}
+			if !ready {
+				outcomes[o.OrgID] = catalogOutcome{Pending: true, PendingReason: "physical catalog refresh is scheduled or in progress"}
+				continue
+			}
 			outcomes[o.OrgID] = catalogOutcome{Existed: true}
 			continue
 		}
@@ -1482,6 +1517,17 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 			continue
 		}
 		slog.Info("Trino reconcile: catalog created.", "org", o.OrgID, "catalog", name)
+		ready, err := p.refreshPhysicalCatalog(ctx, name, true)
+		if err != nil {
+			perOrgErr := fmt.Errorf("refresh physical catalog %s: %w", name, err)
+			errs = append(errs, perOrgErr)
+			outcomes[o.OrgID] = catalogOutcome{Err: perOrgErr}
+			continue
+		}
+		if !ready {
+			outcomes[o.OrgID] = catalogOutcome{Pending: true, PendingReason: "physical catalog refresh is scheduled or in progress"}
+			continue
+		}
 		outcomes[o.OrgID] = catalogOutcome{Created: true}
 	}
 
@@ -1503,6 +1549,45 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 		return outcomes, errors.Join(errs...)
 	}
 	return outcomes, nil
+}
+
+func (p *TrinoProvisioner) refreshPhysicalCatalog(ctx context.Context, catalogName string, force bool) (bool, error) {
+	catalog := hogqlcatalog.PhysicalIdentifier{Value: catalogName}
+	lease, acquired, err := p.hogqlCatalogs.AcquirePhysicalRefresh(ctx, catalog, hogQLPhysicalRefreshLeaseTTL, force)
+	if err != nil {
+		return false, fmt.Errorf("acquire refresh lease: %w", err)
+	}
+	if !acquired {
+		if _, err := p.hogqlCatalogs.Latest(ctx, catalog); err == nil {
+			return true, nil
+		} else if errors.Is(err, hogqlcatalog.ErrCatalogNotFound) {
+			return false, nil
+		} else {
+			return false, fmt.Errorf("read latest physical catalog: %w", err)
+		}
+	}
+	metadata, err := p.catalog.PhysicalCatalog(ctx, catalog)
+	if err != nil {
+		return false, errors.Join(
+			fmt.Errorf("fetch Trino physical catalog: %w", err),
+			releasePhysicalRefresh(ctx, p.hogqlCatalogs, lease, hogQLPhysicalRefreshFailureBackoff),
+		)
+	}
+	if _, _, err := p.hogqlCatalogs.PublishPhysicalRefresh(ctx, lease, metadata, p.hogqlLanguageVersion, hogQLPhysicalRefreshInterval); err != nil {
+		return false, errors.Join(
+			fmt.Errorf("publish physical catalog: %w", err),
+			releasePhysicalRefresh(ctx, p.hogqlCatalogs, lease, hogQLPhysicalRefreshFailureBackoff),
+		)
+	}
+	return true, nil
+}
+
+func releasePhysicalRefresh(ctx context.Context, store hogqlcatalog.PhysicalRefreshStore, lease *hogqlcatalog.PhysicalRefreshLease, retryAfter time.Duration) error {
+	err := store.ReleasePhysicalRefresh(ctx, lease, retryAfter)
+	if errors.Is(err, hogqlcatalog.ErrPhysicalRefreshLeaseLost) {
+		return nil
+	}
+	return err
 }
 
 // missingCatalogInputs lists the warehouse fields a DuckLake catalog needs
