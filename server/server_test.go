@@ -44,9 +44,14 @@ func TestCancelQueryDoesNotLogSecretKey(t *testing.T) {
 // The floor is what matters here. Anything at or below a minute reintroduces
 // that failure; the exact value above it is a density trade-off operators can
 // make with --idle-timeout.
+//
+// 5m was still short of the gaps clients leave in practice: measured in
+// production, reaped connections came back a median of 8s (worst 58s) after
+// the reap, so the reaps were hitting clients that missed the threshold by
+// seconds and then paid a cold respawn. 15m clears that with margin.
 func TestDefaultControlPlaneIdleTimeout(t *testing.T) {
-	if DefaultControlPlaneIdleTimeout != 5*time.Minute {
-		t.Errorf("DefaultControlPlaneIdleTimeout = %v, want 5m", DefaultControlPlaneIdleTimeout)
+	if DefaultControlPlaneIdleTimeout != 15*time.Minute {
+		t.Errorf("DefaultControlPlaneIdleTimeout = %v, want 15m", DefaultControlPlaneIdleTimeout)
 	}
 	// A client that pauses between statements must survive the pause.
 	if DefaultControlPlaneIdleTimeout <= time.Minute {
