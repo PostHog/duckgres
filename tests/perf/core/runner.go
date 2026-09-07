@@ -132,6 +132,7 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 		}
 		result.Duration = execResult.Duration
 		result.Rows = execResult.Rows
+		result.ServiceMetrics = execResult.ServiceMetrics
 		if err != nil {
 			result.Status = "error"
 			result.Error = err.Error()
@@ -158,13 +159,23 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 	return nil
 }
 
-// Raw-view members of a paired catalog are DuckDB views over read_parquet and
-// therefore exist only behind PGWire. DuckLake-table members are backed by the
-// shared catalog and intentionally run through every selected protocol. This
-// keeps one canonical paired query definition while preventing a copied
-// Trino-only catalog from drifting away from the PGWire workload.
+// Each physical relation family is routed only to protocols which expose it.
+// PGWire measures both the raw Parquet view and production-shaped DuckLake
+// table, Trino measures the shared DuckLake table, and Athena measures its
+// Glue external table over the same immutable Parquet files.
 func querySupportsProtocol(query Query, protocol Protocol) bool {
-	return query.StorageTarget != StorageTargetRawView || protocol == ProtocolPGWire
+	switch query.StorageTarget {
+	case "":
+		return true
+	case StorageTargetRawView:
+		return protocol == ProtocolPGWire
+	case StorageTargetDuckLakeTable:
+		return protocol == ProtocolPGWire || protocol == ProtocolTrino
+	case StorageTargetAthenaExternal:
+		return protocol == ProtocolAthena
+	default:
+		return false
+	}
 }
 
 // queriesForIteration alternates each generated raw-view/DuckLake-table pair

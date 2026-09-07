@@ -119,6 +119,10 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
 
+      - name: Load Athena perf configuration
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
+        run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
+
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
 

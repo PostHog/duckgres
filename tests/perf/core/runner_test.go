@@ -262,6 +262,49 @@ func TestRunnerKeepsRawViewsOnPGWireAndRunsDuckLakeTablesOnEveryTarget(t *testin
 	}
 }
 
+func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T) {
+	pg := &testDriver{protocol: ProtocolPGWire}
+	trinoDriver := &testDriver{protocol: ProtocolTrino}
+	athenaDriver := &testDriver{protocol: ProtocolAthena}
+	sink := &inMemorySink{}
+	runner := NewQueryRunner(RunnerConfig{
+		Catalog: Catalog{
+			Name:              "three-engine-comparison",
+			MeasureIterations: 1,
+			Targets:           []Protocol{ProtocolPGWire, ProtocolTrino, ProtocolAthena},
+			Queries: []Query{
+				{QueryID: "q__raw_view", IntentID: "intent", StorageTarget: StorageTargetRawView},
+				{QueryID: "q__ducklake_table", IntentID: "intent", StorageTarget: StorageTargetDuckLakeTable},
+				{QueryID: "q__athena_external", IntentID: "intent", StorageTarget: StorageTargetAthenaExternal},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{
+			ProtocolPGWire: pg,
+			ProtocolTrino:  trinoDriver,
+			ProtocolAthena: athenaDriver,
+		},
+		Sink: sink,
+		Now:  func() time.Time { return time.Unix(1700000000, 0) },
+	})
+
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got, want := pg.queryIDs, []string{"q__raw_view", "q__ducklake_table"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PGWire query IDs: got %v want %v", got, want)
+	}
+	if got, want := trinoDriver.queryIDs, []string{"q__ducklake_table"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Trino query IDs: got %v want %v", got, want)
+	}
+	if got, want := athenaDriver.queryIDs, []string{"q__athena_external"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Athena query IDs: got %v want %v", got, want)
+	}
+	if summary.TotalQueries != 4 {
+		t.Fatalf("total measured queries = %d, want 4", summary.TotalQueries)
+	}
+}
+
 func (d *testDriver) Close() error { return nil }
 
 type inMemorySink struct {

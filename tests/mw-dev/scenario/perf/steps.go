@@ -13,6 +13,7 @@ import (
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/provision"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
+	athenadriver "github.com/posthog/duckgres/tests/perf/drivers/athena"
 	pgdriver "github.com/posthog/duckgres/tests/perf/drivers/pgwire"
 	trinodriver "github.com/posthog/duckgres/tests/perf/drivers/trino"
 )
@@ -22,6 +23,7 @@ const StepTypePerfQueries = "perf_queries"
 type DriverFactory interface {
 	NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error)
 	NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error)
+	NewAthena(ctx context.Context, connection athenadriver.ConnectionConfig) (perfcore.ProtocolDriver, error)
 }
 
 type ExecutorConfig struct {
@@ -54,22 +56,29 @@ type StepResult struct {
 }
 
 type stepSpec struct {
-	OrgID             string
-	Username          string
-	Password          string
-	CatalogFile       string
-	Targets           []perfcore.Protocol
-	RunID             string
-	DatasetVersion    string
-	Database          string
-	OutputSubdir      string
-	ReadOnly          bool
-	FailOnQueryErrors bool
-	WorkerCPU         string
-	WorkerMemory      string
-	TrinoSchema       string
-	TrinoCACertFile   string
-	TrinoStartup      trinodriver.StartupOptions
+	OrgID                string
+	Username             string
+	Password             string
+	CatalogFile          string
+	Targets              []perfcore.Protocol
+	RunID                string
+	DatasetVersion       string
+	Database             string
+	OutputSubdir         string
+	ReadOnly             bool
+	FailOnQueryErrors    bool
+	WorkerCPU            string
+	WorkerMemory         string
+	TrinoSchema          string
+	TrinoCACertFile      string
+	TrinoStartup         trinodriver.StartupOptions
+	AthenaRegion         string
+	AthenaWorkGroup      string
+	AthenaCatalog        string
+	AthenaDatabase       string
+	AthenaOutputLocation string
+	AthenaPollInterval   time.Duration
+	AthenaQueryTimeout   time.Duration
 }
 
 type defaultDriverFactory struct{}
@@ -229,6 +238,14 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	if err != nil {
 		return stepSpec{}, err
 	}
+	athenaPollInterval, err := durationFromWith(step, "athena_poll_interval")
+	if err != nil {
+		return stepSpec{}, err
+	}
+	athenaQueryTimeout, err := durationFromWith(step, "athena_query_timeout")
+	if err != nil {
+		return stepSpec{}, err
+	}
 
 	username := stringFromWith(step, "username", "root")
 	password := stringFromWith(step, "password", "")
@@ -266,6 +283,13 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 			Timeout:      trinoStartupTimeout,
 			PollInterval: trinoStartupPollInterval,
 		},
+		AthenaRegion:         stringFromWith(step, "athena_region", ""),
+		AthenaWorkGroup:      stringFromWith(step, "athena_workgroup", ""),
+		AthenaCatalog:        stringFromWith(step, "athena_catalog", "AwsDataCatalog"),
+		AthenaDatabase:       stringFromWith(step, "athena_database", ""),
+		AthenaOutputLocation: stringFromWith(step, "athena_output_location", ""),
+		AthenaPollInterval:   athenaPollInterval,
+		AthenaQueryTimeout:   athenaQueryTimeout,
 	}, nil
 }
 
@@ -288,7 +312,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire, perfcore.ProtocolTrino:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolTrino, perfcore.ProtocolAthena:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -352,12 +376,48 @@ func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catal
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create Trino perf driver: %w", err))
 			}
 			drivers[target] = driver
+		case perfcore.ProtocolAthena:
+			connection, err := e.athenaConnection(spec)
+			if err != nil {
+				return nil, err
+			}
+			driver, err := e.driverFactory.NewAthena(ctx, connection)
+			if err != nil {
+				return nil, classified(ErrorClassConfig, fmt.Errorf("create Athena perf driver: %w", err))
+			}
+			drivers[target] = driver
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("unsupported perf target protocol %q", target))
 		}
 	}
 	success = true
 	return drivers, nil
+}
+
+func (e *Executor) athenaConnection(spec stepSpec) (athenadriver.ConnectionConfig, error) {
+	required := []struct {
+		key   string
+		value string
+	}{
+		{key: "athena_region", value: spec.AthenaRegion},
+		{key: "athena_workgroup", value: spec.AthenaWorkGroup},
+		{key: "athena_database", value: spec.AthenaDatabase},
+		{key: "athena_output_location", value: spec.AthenaOutputLocation},
+	}
+	for _, setting := range required {
+		if strings.TrimSpace(setting.value) == "" {
+			return athenadriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("athena perf target requires with.%s", setting.key))
+		}
+	}
+	return athenadriver.ConnectionConfig{
+		Region:         spec.AthenaRegion,
+		WorkGroup:      spec.AthenaWorkGroup,
+		Catalog:        spec.AthenaCatalog,
+		Database:       spec.AthenaDatabase,
+		OutputLocation: spec.AthenaOutputLocation,
+		PollInterval:   spec.AthenaPollInterval,
+		QueryTimeout:   spec.AthenaQueryTimeout,
+	}, nil
 }
 
 func (e *Executor) trinoConnection(spec stepSpec) (trinodriver.ConnectionConfig, error) {
@@ -433,6 +493,10 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (
 
 func (defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
 	return trinodriver.New(ctx, connection)
+}
+
+func (defaultDriverFactory) NewAthena(ctx context.Context, connection athenadriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+	return athenadriver.New(ctx, connection)
 }
 
 func requiredString(step core.Step, key string) (string, error) {

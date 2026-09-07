@@ -70,7 +70,7 @@ func ParseCatalog(raw []byte) (Catalog, error) {
 		return Catalog{}, err
 	}
 	if len(entries) > 0 {
-		if err := validateRelationVariants(file.RelationVariants, entries); err != nil {
+		if err := validateRelationVariants(file.Targets, file.RelationVariants, entries); err != nil {
 			return Catalog{}, err
 		}
 	}
@@ -129,7 +129,7 @@ func catalogEntries(raw []byte) ([]catalogEntry, error) {
 	return entries, nil
 }
 
-func validateRelationVariants(variants map[StorageTarget]map[string]string, entries []catalogEntry) error {
+func validateRelationVariants(targets []Protocol, variants map[StorageTarget]map[string]string, entries []catalogEntry) error {
 	hasPairedQueries := false
 	for _, entry := range entries {
 		if entry.paired != nil {
@@ -140,15 +140,30 @@ func validateRelationVariants(variants map[StorageTarget]map[string]string, entr
 	if !hasPairedQueries {
 		return nil
 	}
-	if len(variants) != 2 {
-		return fmt.Errorf("paired catalogs must declare exactly the raw_view and ducklake_table storage variants")
+	requiredTargets := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable}
+	for _, target := range targets {
+		if target == ProtocolAthena {
+			requiredTargets = append(requiredTargets, StorageTargetAthenaExternal)
+			break
+		}
 	}
-	for _, target := range []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable} {
+	if len(variants) != len(requiredTargets) {
+		return fmt.Errorf("paired catalogs must declare exactly the %s storage variants", storageTargetList(requiredTargets))
+	}
+	for _, target := range requiredTargets {
 		if _, ok := variants[target]; !ok {
-			return fmt.Errorf("paired catalogs must declare exactly the raw_view and ducklake_table storage variants")
+			return fmt.Errorf("paired catalogs must declare exactly the %s storage variants", storageTargetList(requiredTargets))
 		}
 	}
 	return nil
+}
+
+func storageTargetList(targets []StorageTarget) string {
+	names := make([]string, 0, len(targets))
+	for _, target := range targets {
+		names = append(names, string(target))
+	}
+	return strings.Join(names, ", ")
 }
 
 func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map[string]string) ([]Query, error) {
@@ -166,8 +181,12 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 		return nil, fmt.Errorf("paired query %s must contain at least one relation placeholder", def.QueryIDBase)
 	}
 
-	queries := make([]Query, 0, 2)
-	for _, target := range []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable} {
+	targets := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable}
+	if _, ok := variants[StorageTargetAthenaExternal]; ok {
+		targets = append(targets, StorageTargetAthenaExternal)
+	}
+	queries := make([]Query, 0, len(targets))
+	for _, target := range targets {
 		rendered, err := renderRelationTemplate(def.QueryIDBase, def.SQLTemplate, placeholders, variants[target], target)
 		if err != nil {
 			return nil, err
@@ -185,8 +204,12 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 			StorageTarget: target,
 		})
 	}
-	if queries[0].PGWireSQL == queries[1].PGWireSQL {
-		return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets", def.QueryIDBase)
+	renderedSQL := make(map[string]struct{}, len(queries))
+	for _, query := range queries {
+		if _, exists := renderedSQL[query.PGWireSQL]; exists {
+			return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets", def.QueryIDBase)
+		}
+		renderedSQL[query.PGWireSQL] = struct{}{}
 	}
 	return queries, nil
 }
@@ -366,7 +389,7 @@ func validateCatalog(c Catalog) error {
 	seenTargets := map[Protocol]struct{}{}
 	for _, target := range c.Targets {
 		switch target {
-		case ProtocolPGWire, ProtocolTrino:
+		case ProtocolPGWire, ProtocolTrino, ProtocolAthena:
 		default:
 			return fmt.Errorf("unsupported target protocol %q", target)
 		}

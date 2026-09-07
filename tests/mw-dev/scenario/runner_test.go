@@ -164,6 +164,7 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 	const scenarioOrgID = "ci-pr-123-cnpg"
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
+	setAthenaPerfEnv(t)
 	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
 	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
 
@@ -452,6 +453,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
+	setAthenaPerfEnv(t)
 	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
 	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
 
@@ -490,7 +492,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 			t.Fatal("frozen perf scenario should not configure the deprecated Flight endpoint")
 		}
 		assertPerfQueryErrorsFailStep(t, step)
-		assertPerfTargetsPGWireAndTrino(t, step)
+		assertPerfTargetsPGWireTrinoAndAthena(t, step)
 		if got, _ := step.With["trino_ca_cert_file"].(string); got != "/tmp/test-trino-ca.crt" {
 			t.Fatalf("perf Trino CA file = %q, want resolved environment path", got)
 		}
@@ -499,6 +501,9 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		}
 		if got, _ := step.With["worker_memory"].(string); got != "12Gi" {
 			t.Fatalf("perf worker_memory = %q, want standard worker memory", got)
+		}
+		if got, _ := step.With["athena_output_location"].(string); got != "s3://benchmark-results/root/" {
+			t.Fatalf("Athena output location = %q, want workgroup-enforced results prefix", got)
 		}
 	}
 	if !foundPerf {
@@ -510,6 +515,7 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
+	setAthenaPerfEnv(t)
 	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
 	t.Setenv("DUCKGRES_K8S_WORKER_MEMORY_REQUEST", "12Gi")
 
@@ -736,12 +742,20 @@ func assertPerfTargetsOnlyPGWire(t *testing.T, step core.Step) {
 	}
 }
 
-func assertPerfTargetsPGWireAndTrino(t *testing.T, step core.Step) {
+func assertPerfTargetsPGWireTrinoAndAthena(t *testing.T, step core.Step) {
 	t.Helper()
 	targets, ok := step.With["targets"].([]any)
-	if !ok || len(targets) != 2 || targets[0] != "pgwire" || targets[1] != "trino" {
-		t.Fatalf("perf step %s targets = %#v, want [pgwire trino]", step.ID, step.With["targets"])
+	if !ok || len(targets) != 3 || targets[0] != "pgwire" || targets[1] != "trino" || targets[2] != "athena" {
+		t.Fatalf("perf step %s targets = %#v, want [pgwire trino athena]", step.ID, step.With["targets"])
 	}
+}
+
+func setAthenaPerfEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("DUCKGRES_SCENARIO_ATHENA_REGION", "us-east-1")
+	t.Setenv("DUCKGRES_SCENARIO_ATHENA_WORKGROUP", "benchmark")
+	t.Setenv("DUCKGRES_SCENARIO_ATHENA_DATABASE", "benchmark_frozen")
+	t.Setenv("DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI", "s3://benchmark-results/root/")
 }
 
 func TestFrozenDBTProjectModelsRealisticProductAnalyticsWorkload(t *testing.T) {

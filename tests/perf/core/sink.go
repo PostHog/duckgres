@@ -11,10 +11,12 @@ import (
 )
 
 type ArtifactSink struct {
-	dir       string
-	csvFile   *os.File
-	csvWriter *csv.Writer
-	closed    bool
+	dir                  string
+	csvFile              *os.File
+	csvWriter            *csv.Writer
+	serviceMetricsFile   *os.File
+	serviceMetricsWriter *csv.Writer
+	closed               bool
 }
 
 func NewArtifactSink(dir string) (*ArtifactSink, error) {
@@ -48,10 +50,44 @@ func NewArtifactSink(dir string) (*ArtifactSink, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("flush csv header: %w", err)
 	}
+	serviceMetricsPath := filepath.Join(dir, "query_service_metrics.csv")
+	serviceMetricsFile, err := os.Create(serviceMetricsPath)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("create service metrics artifact: %w", err)
+	}
+	serviceMetricsWriter := csv.NewWriter(serviceMetricsFile)
+	serviceMetricsHeader := []string{
+		"query_id",
+		"intent_id",
+		"measure_iteration",
+		"protocol",
+		"queue_ms",
+		"planning_ms",
+		"engine_ms",
+		"service_ms",
+		"bytes_scanned",
+		"dpu_count",
+		"result_reused",
+		"engine_version",
+	}
+	if err := serviceMetricsWriter.Write(serviceMetricsHeader); err != nil {
+		_ = serviceMetricsFile.Close()
+		_ = f.Close()
+		return nil, fmt.Errorf("write service metrics header: %w", err)
+	}
+	serviceMetricsWriter.Flush()
+	if err := serviceMetricsWriter.Error(); err != nil {
+		_ = serviceMetricsFile.Close()
+		_ = f.Close()
+		return nil, fmt.Errorf("flush service metrics header: %w", err)
+	}
 	return &ArtifactSink{
-		dir:       dir,
-		csvFile:   f,
-		csvWriter: w,
+		dir:                  dir,
+		csvFile:              f,
+		csvWriter:            w,
+		serviceMetricsFile:   serviceMetricsFile,
+		serviceMetricsWriter: serviceMetricsWriter,
 	}, nil
 }
 
@@ -78,6 +114,30 @@ func (s *ArtifactSink) Record(result QueryResult) error {
 	if err := s.csvWriter.Error(); err != nil {
 		return fmt.Errorf("flush csv row: %w", err)
 	}
+	if result.ServiceMetrics != nil {
+		metrics := result.ServiceMetrics
+		serviceMetricsRow := []string{
+			result.QueryID,
+			result.IntentID,
+			strconv.Itoa(result.MeasureIteration),
+			string(result.Protocol),
+			formatMilliseconds(metrics.QueueDuration),
+			formatMilliseconds(metrics.PlanningDuration),
+			formatMilliseconds(metrics.EngineDuration),
+			formatMilliseconds(metrics.ServiceDuration),
+			strconv.FormatInt(metrics.BytesScanned, 10),
+			strconv.FormatFloat(metrics.DPUCount, 'f', -1, 64),
+			strconv.FormatBool(metrics.ResultReused),
+			metrics.EngineVersion,
+		}
+		if err := s.serviceMetricsWriter.Write(serviceMetricsRow); err != nil {
+			return fmt.Errorf("write service metrics row: %w", err)
+		}
+		s.serviceMetricsWriter.Flush()
+		if err := s.serviceMetricsWriter.Error(); err != nil {
+			return fmt.Errorf("flush service metrics row: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -95,6 +155,17 @@ func (s *ArtifactSink) Close(summary RunSummary, serverMetrics string) error {
 	if s.csvFile != nil {
 		if err := s.csvFile.Close(); err != nil {
 			return fmt.Errorf("close csv file: %w", err)
+		}
+	}
+	if s.serviceMetricsWriter != nil {
+		s.serviceMetricsWriter.Flush()
+		if err := s.serviceMetricsWriter.Error(); err != nil {
+			return fmt.Errorf("flush service metrics close: %w", err)
+		}
+	}
+	if s.serviceMetricsFile != nil {
+		if err := s.serviceMetricsFile.Close(); err != nil {
+			return fmt.Errorf("close service metrics file: %w", err)
 		}
 	}
 
@@ -118,4 +189,8 @@ func (s *ArtifactSink) Close(summary RunSummary, serverMetrics string) error {
 		return fmt.Errorf("write server metrics: %w", err)
 	}
 	return nil
+}
+
+func formatMilliseconds(duration time.Duration) string {
+	return strconv.FormatFloat(float64(duration)/float64(time.Millisecond), 'f', 6, 64)
 }
