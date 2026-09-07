@@ -217,7 +217,7 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	isHealthy func() bool,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, *computeMeter, error) {
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
 	pollInterval := cfg.ConfigPollInterval
 	if pollInterval <= 0 {
 		pollInterval = 30 * time.Second
@@ -225,7 +225,7 @@ func SetupMultiTenant(
 
 	store, err := configstore.NewConfigStore(cfg.ConfigStoreConn, pollInterval)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	// Identity info-metric for dashboards (org ↔ team ↔ duckling). Reads the
 	// snapshot at scrape time — registered here where the concrete store is
@@ -237,7 +237,7 @@ func SetupMultiTenant(
 	// but persistence is disabled with a clear client-facing error.
 	userSecrets, err := NewCPUserSecretManager(store, cfg.UserSecretKey)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	server.SetUserSecretManager(srv, userSecrets)
 	if cfg.UserSecretKey == "" {
@@ -248,7 +248,7 @@ func SetupMultiTenant(
 
 	namespace, err := resolveK8sNamespace(cfg.K8s.WorkerNamespace)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	cpID := cfg.K8s.ControlPlaneID
@@ -264,7 +264,7 @@ func SetupMultiTenant(
 	}
 	bootID := make([]byte, 16)
 	if _, err := rand.Read(bootID); err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("generate control plane boot id: %w", err)
 	}
 	bootIDHex := hex.EncodeToString(bootID)
 	cpInstanceID := makeControlPlaneInstanceID(podUID, bootIDHex)
@@ -336,7 +336,7 @@ func SetupMultiTenant(
 
 	router, err := NewOrgRouter(store, baseCfg, cfg, srv, stsBroker, userSecrets, resolveDucklingStatus)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	metadataSessions := newMetadataProxySessionRegistry(cfg.MetadataProxyMaxConns)
@@ -504,11 +504,12 @@ func SetupMultiTenant(
 	}
 	janitorLeader, err := NewJanitorLeaderManager(namespace, cpInstanceID, janitor)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	var trinoBundleHandler *opa.Handler
+	var trinoUsageToken, trinoUsageCell string
 	// trinoConsole carries what the admin console needs from the Trino
 	// branch (cell identity + an observer-credentialed coordinator client).
 	// Nil unless the branch wires, so a deployment without a cell simply
@@ -524,7 +525,7 @@ func SetupMultiTenant(
 		// branch would be silently skipped (it's nested in the else)
 		// and password/group/tenant/bundle projections would stop updating.
 		if trinoProvisionerEnabled() {
-			return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but provisioning controller unavailable: %w",
+			return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but provisioning controller unavailable: %w",
 				envTrinoCoordinatorURL, err)
 		}
 		slog.Warn("Provisioning controller unavailable.", "error", err)
@@ -543,7 +544,7 @@ func SetupMultiTenant(
 		if trinoProvisionerEnabled() {
 			kc, tkErr := newTrinoKubeClient()
 			if tkErr != nil {
-				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but K8s client unavailable: %w",
+				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but K8s client unavailable: %w",
 					envTrinoCoordinatorURL, tkErr)
 			}
 			// Same Duckling CR read the worker activation path uses; nil
@@ -551,16 +552,17 @@ func SetupMultiTenant(
 			// buildTrinoWiring rejects rather than half-wiring.
 			trinoWire, twErr := buildTrinoWiring(store, kc, resolveDucklingStatus)
 			if twErr != nil {
-				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
+				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
 			}
 			if trinoWire == nil {
 				// buildTrinoWiring returns (nil, nil) only when the
 				// env gate is off — and the outer if guarded against
 				// that. So a nil here is a wiring bug.
-				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
+				return nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
 			}
 			provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
 			trinoBundleHandler = trinoWire.BundleHandler
+			trinoUsageToken, trinoUsageCell = trinoWire.UsageToken, trinoWire.Cell.ID
 			trinoConsole = trinoWire.Console
 			slog.Info("Trino provisioner enabled.", "cell", trinoWire.Cell.ID, "coordinator", trinoWire.Cell.CoordinatorURL)
 		}
@@ -616,7 +618,7 @@ func SetupMultiTenant(
 	if internalSecret == "" {
 		tokenBytes := make([]byte, 32)
 		if _, err := rand.Read(tokenBytes); err != nil {
-			return nil, nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("generate internal secret: %w", err)
 		}
 		internalSecret = hex.EncodeToString(tokenBytes)
 		slog.Info("Generated internal secret; set --internal-secret or DUCKGRES_INTERNAL_SECRET explicitly to avoid rotation on restart.")
@@ -632,7 +634,7 @@ func SetupMultiTenant(
 	// with the internal set would silently un-scope the credential, so
 	// that's a startup failure, not a warning.
 	if err := validateDistinctReadOnlySecret(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks, internalSecret, cfg.InternalSecretFallbacks); err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	readOnlyTokens := admin.NewTokenSet(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks)
 	if readOnlyTokens.Count() == 0 {
@@ -684,7 +686,7 @@ func SetupMultiTenant(
 	}
 	auditStore, err := admin.NewAuditStore(store.DB())
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("init admin audit store: %w", err)
 	}
 
 	// Admin SSO verifier. The admin API trusts the ALB-injected OIDC JWT only
@@ -706,7 +708,7 @@ func SetupMultiTenant(
 	// warning instead of failing startup.
 	ssoVerifier, err := adminSSOVerifierFromEnv(cfg.K8s.AWSRegion)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	metricsProxy := admin.NewMetricsProxy(os.Getenv("DUCKGRES_PROMETHEUS_URL"))
 	clusterInfo := &clusterInfoProvider{
@@ -762,10 +764,13 @@ func SetupMultiTenant(
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
-	// Pull-based compute-billing API (GET /billing/usage + POST /billing/ack).
+	// Retained scan-byte and storage billing batches.
 	// The billing service authenticates with the internal secret (→ admin);
 	// RequireAdmin keeps SSO viewers away from raw usage + the ack mutation.
 	registerBillingAPI(api, store, admin.RequireAdmin())
+	if trinoUsageToken != "" {
+		registerTrinoUsageAPI(engine, store, trinoUsageCell, trinoUsageToken)
+	}
 	// Node-overview topology reads reuse the shared K8s pool's in-cluster
 	// clientset (nil when there's no shared pool — leaves those routes off).
 	var clusterClient kubernetes.Interface
@@ -836,7 +841,7 @@ func SetupMultiTenant(
 
 	// Embedded React SPA (served unauthenticated; all data is under /api/v1).
 	if err := admin.RegisterUI(engine); err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("register admin UI: %w", err)
 	}
 
 	apiServer := &http.Server{
@@ -850,26 +855,12 @@ func SetupMultiTenant(
 		}
 	}()
 
-	// Compute-usage metering (managed-warehouse billing, pull model — see
-	// docs/design/billing-pull-api.md). Always on for the remote backend: every
-	// CP pod meters connection-end usage and flushes it into the config-store
-	// buffer (cross-pod UPSERT-increment); billing pulls it via the
-	// GET/ack API registered above. Best-effort throughout — queries are NEVER
-	// failed on its account. The 30-day safety GC is leader-only, co-located
-	// under the janitor lease so exactly one CP pod sweeps.
-	meter := newComputeMeter(store, store.OrgUsageTeamID)
-	go meter.Run(context.Background())
-	if janitorLeader != nil {
-		janitorLeader.AttachLeaderLoop(func(ctx context.Context) { runComputeUsageGC(ctx, store) })
-	}
-	slog.Info("Managed-warehouse compute-usage metering enabled (pull API).")
-
 	// Storage-billing sampler (leader-only, so exactly one CP credits each
 	// interval): every ~30min it reads each Ready warehouse's tracked DuckLake
 	// footprint straight from the org's metadata Postgres (via the same
 	// cross-org resolution the credential refresher uses) and credits
 	// bytes × interval into the storage buffer; billing pulls it alongside
-	// compute. Best-effort — a failed sample under-bills one interval, never
+	// scan bytes. Best-effort — a failed sample under-bills one interval, never
 	// affects anything user-facing.
 	storageSamplerLoop := newStorageSampler(store, storageSampleIntervalFromEnv(),
 		func() []storageOrg {
@@ -892,7 +883,7 @@ func SetupMultiTenant(
 	}
 	slog.Info("Managed-warehouse storage-usage sampling enabled.", "interval", storageSamplerLoop.interval.String())
 
-	return store, adpt, apiServer, runtimeTracker, janitorLeader, meter, nil
+	return store, adpt, apiServer, runtimeTracker, janitorLeader, nil
 }
 
 // ducklingMetadataAdapter converts provisioner.CRMetadataStore into the

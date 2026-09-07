@@ -3,6 +3,7 @@
 package configstore_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -339,12 +340,14 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 		}
 	}
 	bucket := time.Date(2026, 7, 14, 10, 0, 0, 0, time.UTC)
-	if err := store.FlushComputeUsage([]configstore.ComputeUsageDelta{{
-		OrgID: "acme", TeamID: 1, QuerySource: "standard",
-		Millicores: 2000, MiB: 4096, BucketStart: bucket,
-		CPUSeconds: 10, MemorySeconds: 20,
-	}}); err != nil {
-		t.Fatalf("seed compute usage: %v", err)
+	if err := store.RememberTrinoUsagePrincipals([]configstore.TrinoEnabledOrg{{OrgID: "acme", DatabaseName: "acme"}}); err != nil {
+		t.Fatalf("remember usage principal: %v", err)
+	}
+	if _, err := store.RecordTrinoQueryUsage(context.Background(), configstore.QueryUsageEvent{
+		ClusterID: "test-cluster", QueryID: "team-delete-query", Principal: "acme", State: "FINISHED",
+		CompletedAt: bucket, PhysicalInputBytes: 10, StatisticsComplete: true,
+	}); err != nil {
+		t.Fatalf("seed scan usage: %v", err)
 	}
 
 	// Deleting a team removes its row and BOTH of its project-scoped logins —
@@ -371,7 +374,7 @@ func TestDeleteOrgTeamPostgres(t *testing.T) {
 	// keeps its stamped (informational) team id — attribution belongs to the
 	// external billing service.
 	var usageTeams []int64
-	if err := store.DB().Raw(`SELECT team_id FROM duckgres_org_compute_usage WHERE org_id = 'acme'`).Scan(&usageTeams).Error; err != nil {
+	if err := store.DB().Raw(`SELECT team_id FROM duckgres_trino_query_usage WHERE org_id = 'acme'`).Scan(&usageTeams).Error; err != nil {
 		t.Fatalf("read usage teams: %v", err)
 	}
 	if len(usageTeams) != 1 || usageTeams[0] != 1 {

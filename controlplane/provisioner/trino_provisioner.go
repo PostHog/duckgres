@@ -362,6 +362,7 @@ type TrinoCatalogCredentialUpdater interface {
 // configstore import everywhere.
 type TrinoStore interface {
 	ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error)
+	RememberTrinoUsagePrincipals(orgs []configstore.TrinoEnabledOrg) error
 	UpdateTrinoState(orgID string, upd configstore.TrinoStateUpdate) error
 	// AssignTrinoCell claims an org with no cell into this provisioner's
 	// cell. Only ever writes rows whose cell is still unset.
@@ -572,6 +573,11 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	// group would be granted the shared catalog name and it could read the
 	// other tenant's data through the catalog that org legitimately owns.
 	projectable, collisions := rejectPrincipalCollisions(orgs)
+	// Persist attribution before a tenant can authenticate. Historical mappings
+	// survive disablement and prevent another org from reusing the principal.
+	if err := p.store.RememberTrinoUsagePrincipals(projectable); err != nil {
+		return fmt.Errorf("remember trino usage principals: %w", err)
+	}
 
 	var errs []error
 
@@ -803,6 +809,32 @@ func (p *TrinoProvisioner) claimCellOrgs(orgs []configstore.TrinoEnabledOrg) []c
 // endpoint can't authenticate and catalog REST can't authorize.
 func (p *TrinoProvisioner) Bootstrap(ctx context.Context) (bundleToken string, err error) {
 	return p.ensureClusterSecrets(ctx)
+}
+
+// TrinoUsageTokenSecretName identifies the cell's usage-ingestion credential.
+const TrinoUsageTokenSecretName = "trino-usage-token"
+
+// TrinoUsageTokenSecretKey is the bearer-token key mounted by the coordinator.
+const TrinoUsageTokenSecretKey = "token"
+
+// BootstrapUsageToken creates or adopts the immutable usage-ingestion token.
+// A separate sentinel lets existing cells initialize this new credential.
+// Receivers and coordinators capture the token at startup, so deletion after
+// initialization requires restoration or a coordinated restart, not regeneration.
+func (p *TrinoProvisioner) BootstrapUsageToken(ctx context.Context) (string, error) {
+	sentinelKey := p.namespace + "/usage-token"
+	bootstrapped, err := p.bootstrapSentinel.IsTrinoClusterBootstrapped(ctx, sentinelKey)
+	if err != nil {
+		return "", fmt.Errorf("read trino usage token sentinel: %w", err)
+	}
+	token, err := p.ensureWriteOnceSecret(ctx, TrinoUsageTokenSecretName, TrinoUsageTokenSecretKey, bootstrapped)
+	if err != nil {
+		return "", fmt.Errorf("bootstrap trino usage token: %w", err)
+	}
+	if err := p.bootstrapSentinel.MarkTrinoClusterBootstrapped(ctx, sentinelKey); err != nil {
+		return "", fmt.Errorf("mark trino usage token initialized: %w", err)
+	}
+	return token, nil
 }
 
 // ensureClusterSecrets makes the cluster-level K8s Secrets exist and

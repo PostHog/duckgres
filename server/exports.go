@@ -10,7 +10,6 @@ import (
 	"github.com/posthog/duckgres/server/observe"
 	"github.com/posthog/duckgres/server/sessionmeta"
 	"github.com/posthog/duckgres/server/wire"
-	"github.com/posthog/duckgres/transpiler/transform"
 )
 
 // Exported wrappers for protocol functions used by the control plane worker.
@@ -222,19 +221,6 @@ func (s *Server) ConnSummariesByWorkerID() map[int]ConnLiveSummary {
 	return out
 }
 
-// SetConnectionWorkerSize records the provisioned worker pod size (in
-// milli-units) on a control-plane connection for compute-usage billing.
-// millicores == 0 means the size is unknown (non-remote / standalone) and
-// metering is skipped. Constant for the connection's life, except that tier
-// escalation may raise it once (largest size wins) from the message-loop
-// goroutine — the same goroutine that reads it at teardown.
-func SetConnectionWorkerSize(cc *clientConn, millicores, mib int64) {
-	if cc != nil {
-		cc.workerMillicores = millicores
-		cc.workerMiB = mib
-	}
-}
-
 // SetConnectionExploratory marks a control-plane connection as starting on
 // the exploratory small worker and installs the switcher used to escalate it.
 // Call before RunMessageLoop; the switcher runs on the message-loop goroutine.
@@ -324,37 +310,6 @@ func SetConnectionIdleTimeout(cc *clientConn, timeout time.Duration) {
 	if cc != nil && timeout > 0 {
 		cc.idleTimeout = timeout
 	}
-}
-
-// ConnectionBilling returns the data needed to meter one connection's
-// compute-usage at teardown: the org, the authenticated username (used to
-// resolve the informational team id stamped onto the bucket — the user's own
-// team when it has one, else the org's oldest team), the session's query
-// source (the `duckgres.query_source` GUC — "standard" unless the client set
-// it), the provisioned worker size in milli-units, and the connection's
-// elapsed lifetime. millicores == 0 means metering should be skipped (unknown
-// worker size). Call at the same teardown point as CloseConnectionMetrics. A
-// mid-connection GUC change is not split: the whole connection is metered
-// under the final value (documented in docs/design/billing-pull-api.md).
-//
-// The query source is clamped to the closed {standard, endpoints} set as
-// defense in depth: every set path already validates (22023 at SET / startup
-// time), so a non-canonical value here means a validation bypass — degrade it
-// to the default rather than writing unbounded-cardinality client input into
-// the billing bucket key (and onward into billing exports).
-func ConnectionBilling(cc *clientConn) (orgID, username, querySource string, millicores, mib int64, dur time.Duration) {
-	if cc == nil {
-		return "", "", "", 0, 0, 0
-	}
-	qs := cc.QuerySource()
-	if qs != transform.QuerySourceStandard && qs != transform.QuerySourceEndpoints {
-		// Should be unreachable. Log the length, not the value — it is
-		// arbitrary client input.
-		cc.logger().Warn("Non-canonical duckgres.query_source at billing teardown; degrading to default.",
-			"value_len", len(qs))
-		qs = defaultQuerySource
-	}
-	return cc.orgID, cc.username, qs, cc.workerMillicores, cc.workerMiB, time.Since(cc.backendStart)
 }
 
 // CancelClientConn cancels the context of a clientConn.

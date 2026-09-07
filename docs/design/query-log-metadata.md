@@ -487,8 +487,8 @@ Deliberately skipped (CH-engine-specific or unknowable here): `partitions`,
 | `interface` | `interface` | B | **[new]** `pg` \| `admin` |
 | `is_secure`, `tls_version`, `tls_cipher` | `is_secure` | S | **[session]** from `*tls.Conn` handshake state |
 | `auth_method`, `access_scope` | — | S | **[session]** password/passthrough/internal; root vs project-scoped |
-| `query_source` | — | B | **[session]** the `duckgres.query_source` GUC — already a billing dimension, currently unjoinable to the log |
-| `team_id` | — | B | **[session]** resolved as `compute_meter` does (user's team, else org's oldest) |
+| `query_source` | — | B | **[session]** the `duckgres.query_source` GUC — legacy session metadata, currently unjoinable to the log |
+| `team_id` | — | B | **[session]** resolved from the session (user's team, else org's oldest) |
 | `log_comment` | `log_comment` | S | **[new]** free-text `duckgres.log_comment` GUC, length-capped |
 | `client_metadata`, `client_traceparent` | `http_user_agent`/`http_referer` | S | **[new]** sqlcommenter map parsed from the **original inbound text** (comments do not survive deparse); `traceparent` additionally links our span to the client's trace |
 | `settings` | `Settings` map | S | **[new]** session GUCs differing from default; needs a small `sessionSettings` map fed by the transpiler's parsed `VariableSetStmt` |

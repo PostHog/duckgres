@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// StorageUsageRow is one aggregated storage row served by the billing pull
-// API: the sum of every closed bucket for one (org, team) on one UTC day,
+// StorageUsageRow is one aggregated storage row served in a billing batch:
+// the sum of claimed byte-seconds for one (org, team) on one UTC day,
 // exposed as exact-decimal GiB-seconds (byte-seconds / 2^30 — a finite
 // decimal). See docs/design/billing-pull-api.md "Storage metric".
 type StorageUsageRow struct {
@@ -104,15 +104,4 @@ func byteSecondsToGiBSeconds(byteSeconds string) (json.Number, error) {
 		out = "-" + out
 	}
 	return json.Number(out), nil
-}
-
-// GCStorageUsage hard-deletes buffered storage buckets older than the cutoff
-// regardless of ack — same safety net as GCComputeUsage. Returns the number
-// of rows dropped.
-func (cs *ConfigStore) GCStorageUsage(olderThan time.Time) (int64, error) {
-	res := cs.db.Exec(`DELETE FROM duckgres_org_storage_usage WHERE bucket_start < ?`, olderThan.UTC())
-	if res.Error != nil {
-		return 0, fmt.Errorf("gc storage usage: %w", res.Error)
-	}
-	return res.RowsAffected, nil
 }

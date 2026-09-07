@@ -15,26 +15,21 @@ import (
 
 // fakeMonthlyUsageStore is an in-memory usageStore for handler tests.
 type fakeMonthlyUsageStore struct {
-	compute   []configstore.MonthlyComputeUsageRow
-	storage   []configstore.MonthlyStorageUsageRow
-	cursor    time.Time
-	hasCursor bool
-	err       error
+	scan    []configstore.MonthlyScanUsageRow
+	storage []configstore.MonthlyStorageUsageRow
+	err     error
 
-	dailyCompute  []configstore.DailyComputeUsageRow
+	dailyScan     []configstore.DailyScanUsageRow
 	dailyStorage  []configstore.DailyStorageUsageRow
 	lastDailyOrg  string
 	lastDailyFrom time.Time
 }
 
-func (s *fakeMonthlyUsageStore) AggregateComputeUsageMonthly(from time.Time) ([]configstore.MonthlyComputeUsageRow, error) {
-	return s.compute, s.err
+func (s *fakeMonthlyUsageStore) AggregateScanUsageMonthly(from time.Time) ([]configstore.MonthlyScanUsageRow, error) {
+	return s.scan, s.err
 }
 func (s *fakeMonthlyUsageStore) AggregateStorageUsageMonthly(from time.Time) ([]configstore.MonthlyStorageUsageRow, error) {
 	return s.storage, s.err
-}
-func (s *fakeMonthlyUsageStore) ComputeBillingCursor() (time.Time, bool, error) {
-	return s.cursor, s.hasCursor, nil
 }
 
 // setupUsageRouter mounts the monthly-usage route exactly as production does
@@ -141,21 +136,19 @@ func usageRequest(t *testing.T, r *gin.Engine, path string) (int, map[string]int
 
 func strptr(s string) *string { return &s }
 
-// The handler merges the compute and storage families on (month, org, team):
+// The handler merges the scan and storage families on (month, org, team):
 // a key present in both lands in ONE row with both metric sets; a key in only
 // one family still appears with the other zeroed.
 func TestMonthlyUsageMergesFamilies(t *testing.T) {
 	store := &fakeMonthlyUsageStore{
-		compute: []configstore.MonthlyComputeUsageRow{
-			{Month: "2026-08", OrgID: "acme", TeamID: 5, SchemaName: strptr("team_5"), CPUSeconds: 120, MemorySeconds: 240},
-			{Month: "2026-08", OrgID: "globex", TeamID: 7, CPUSeconds: 60, MemorySeconds: 60},
+		scan: []configstore.MonthlyScanUsageRow{
+			{Month: "2026-08", OrgID: "acme", TeamID: 5, SchemaName: strptr("team_5"), BytesScanned: "120"},
+			{Month: "2026-08", OrgID: "globex", TeamID: 7, BytesScanned: "60"},
 		},
 		storage: []configstore.MonthlyStorageUsageRow{
 			{Month: "2026-08", OrgID: "acme", TeamID: 5, SchemaName: strptr("team_5"), GiBSeconds: "10800"},
 			{Month: "2026-07", OrgID: "acme", TeamID: 5, SchemaName: strptr("team_5"), GiBSeconds: "3600"},
 		},
-		cursor:    time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
-		hasCursor: true,
 	}
 	r := setupUsageRouter(store, RoleAdmin)
 
@@ -186,8 +179,8 @@ func TestMonthlyUsageMergesFamilies(t *testing.T) {
 	if acmeAug == nil {
 		t.Fatalf("merged acme 2026-08 row missing: %v", rows)
 	}
-	if acmeAug["cpu_seconds"].(float64) != 120 || acmeAug["memory_seconds"].(float64) != 240 {
-		t.Fatalf("compute side lost in merge: %v", acmeAug)
+	if acmeAug["bytes_scanned"].(float64) != 120 {
+		t.Fatalf("scan side lost in merge: %v", acmeAug)
 	}
 	if acmeAug["gib_seconds"].(float64) != 10800 {
 		t.Fatalf("storage side lost in merge: %v", acmeAug)
@@ -195,7 +188,7 @@ func TestMonthlyUsageMergesFamilies(t *testing.T) {
 	if acmeAug["schema_name"] != "team_5" {
 		t.Fatalf("schema name not carried: %v", acmeAug)
 	}
-	// Storage-only row (July) appears with zeroed compute.
+	// Storage-only row (July) appears with zeroed scan.
 	var july map[string]interface{}
 	for _, ri := range rows {
 		m := ri.(map[string]interface{})
@@ -203,12 +196,12 @@ func TestMonthlyUsageMergesFamilies(t *testing.T) {
 			july = m
 		}
 	}
-	if july == nil || july["cpu_seconds"].(float64) != 0 || july["gib_seconds"].(float64) != 3600 {
+	if july == nil || july["bytes_scanned"].(float64) != 0 || july["gib_seconds"].(float64) != 3600 {
 		t.Fatalf("storage-only row wrong: %v", july)
 	}
-	// The ack cursor is surfaced so the UI can caveat the retention window.
-	if body["watermark_low"] == nil {
-		t.Fatalf("watermark_low missing: %v", body)
+	// Retained history is independent of billing acknowledgement.
+	if _, ok := body["watermark_low"]; ok {
+		t.Fatalf("obsolete watermark_low present: %v", body)
 	}
 }
 
@@ -235,9 +228,9 @@ type spyUsageStore struct {
 	onFrom func(time.Time)
 }
 
-func (s *spyUsageStore) AggregateComputeUsageMonthly(from time.Time) ([]configstore.MonthlyComputeUsageRow, error) {
+func (s *spyUsageStore) AggregateScanUsageMonthly(from time.Time) ([]configstore.MonthlyScanUsageRow, error) {
 	s.onFrom(from)
-	return s.fakeMonthlyUsageStore.AggregateComputeUsageMonthly(from)
+	return s.fakeMonthlyUsageStore.AggregateScanUsageMonthly(from)
 }
 
 func TestMonthlyUsageRejectsBadMonthsParam(t *testing.T) {
@@ -268,10 +261,10 @@ func (errFakeUsageStoreT) Error() string { return "fake store error" }
 
 // ---- daily per-org usage (org detail page charts) ----
 
-func (s *fakeMonthlyUsageStore) AggregateComputeUsageDaily(orgID string, from time.Time) ([]configstore.DailyComputeUsageRow, error) {
+func (s *fakeMonthlyUsageStore) AggregateScanUsageDaily(orgID string, from time.Time) ([]configstore.DailyScanUsageRow, error) {
 	s.lastDailyOrg = orgID
 	s.lastDailyFrom = from
-	return s.dailyCompute, s.err
+	return s.dailyScan, s.err
 }
 func (s *fakeMonthlyUsageStore) AggregateStorageUsageDaily(orgID string, from time.Time) ([]configstore.DailyStorageUsageRow, error) {
 	return s.dailyStorage, s.err
@@ -282,9 +275,9 @@ func (s *fakeMonthlyUsageStore) AggregateStorageUsageDaily(orgID string, from ti
 // org's usage away from another's, so pin that the handler never swaps it.
 func TestDailyUsageScopesToOrgAndMergesFamilies(t *testing.T) {
 	store := &fakeMonthlyUsageStore{
-		dailyCompute: []configstore.DailyComputeUsageRow{
-			{Date: "2026-08-13", TeamID: 5, SchemaName: strptr("team_5"), CPUSeconds: 600, MemorySeconds: 1200},
-			{Date: "2026-08-13", TeamID: 6, CPUSeconds: 60, MemorySeconds: 60},
+		dailyScan: []configstore.DailyScanUsageRow{
+			{Date: "2026-08-13", TeamID: 5, SchemaName: strptr("team_5"), BytesScanned: "600"},
+			{Date: "2026-08-13", TeamID: 6, BytesScanned: "60"},
 		},
 		dailyStorage: []configstore.DailyStorageUsageRow{
 			{Date: "2026-08-13", TeamID: 5, SchemaName: strptr("team_5"), GiBSeconds: "3600"},
@@ -315,7 +308,7 @@ func TestDailyUsageScopesToOrgAndMergesFamilies(t *testing.T) {
 			d13 = m
 		}
 	}
-	if d13 == nil || d13["cpu_seconds"].(float64) != 600 || d13["gib_seconds"].(float64) != 3600 {
+	if d13 == nil || d13["bytes_scanned"].(float64) != 600 || d13["gib_seconds"].(float64) != 3600 {
 		t.Fatalf("merged 08-13/team5 row wrong: %v", d13)
 	}
 	// Storage-only day still appears.
@@ -326,12 +319,12 @@ func TestDailyUsageScopesToOrgAndMergesFamilies(t *testing.T) {
 			d14 = m
 		}
 	}
-	if d14 == nil || d14["cpu_seconds"].(float64) != 0 || d14["gib_seconds"].(float64) != 7200 {
+	if d14 == nil || d14["bytes_scanned"].(float64) != 0 || d14["gib_seconds"].(float64) != 7200 {
 		t.Fatalf("storage-only day row wrong: %v", d14)
 	}
-	// Retention transparency travels on this endpoint too.
-	if _, ok := body["watermark_low"]; !ok {
-		t.Fatalf("watermark_low missing: %v", body)
+	// No billing cursor limits retained history.
+	if _, ok := body["watermark_low"]; ok {
+		t.Fatalf("obsolete watermark_low present: %v", body)
 	}
 }
 
@@ -385,5 +378,29 @@ func TestDailyUsageRequiresAdmin(t *testing.T) {
 		if code != tc.want {
 			t.Fatalf("role %q: status %d, want %d", tc.role, code, tc.want)
 		}
+	}
+}
+
+// A monthly aggregate can exceed int64 even though each query is bounded by it.
+// The API must preserve exact decimal digits until clients choose display rounding.
+func TestMonthlyUsagePreservesScanPrecision(t *testing.T) {
+	store := &fakeMonthlyUsageStore{scan: []configstore.MonthlyScanUsageRow{
+		{Month: "2026-08", OrgID: "acme", BytesScanned: "18446744073709551614"},
+	}}
+	w := httptest.NewRecorder()
+	setupUsageRouter(store, RoleAdmin).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/usage/monthly", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Rows []struct {
+			BytesScanned json.Number `json:"bytes_scanned"`
+		} `json:"rows"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Rows) != 1 || body.Rows[0].BytesScanned.String() != "18446744073709551614" {
+		t.Fatalf("precision lost: %s", w.Body.String())
 	}
 }

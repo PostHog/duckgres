@@ -5,7 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { DailyUsageResponse } from "@/types/api";
 
 // Mock data + identity hooks: render OrgUsageSection with a controlled daily
-// response and assert the chart cards, window totals, period switch, caveat,
+// response and assert the chart cards, window totals, period switch, history,
 // and the viewer gate. (Recharts draws nothing in jsdom — the assertions are
 // on the surrounding card chrome, which is where the totals live.)
 const hooks = vi.hoisted(() => ({
@@ -24,12 +24,11 @@ const RESPONSE: DailyUsageResponse = {
   org_id: "acme",
   days: 14,
   from: "2026-08-01T00:00:00Z",
-  watermark_low: null,
   rows: [
-    // 7200 CPU-seconds = 120 CPU-min; 3600 mem-seconds = 60 GiB·min; 3600 gib-seconds = 1 GiB·h.
-    { date: "2026-08-13", team_id: 5, schema_name: "team_5", cpu_seconds: 7200, memory_seconds: 3600, gib_seconds: 3600 },
-    { date: "2026-08-13", team_id: 6, schema_name: "team_6", cpu_seconds: 60, memory_seconds: 60, gib_seconds: 0 },
-    { date: "2026-08-14", team_id: 5, schema_name: "team_5", cpu_seconds: 600, memory_seconds: 600, gib_seconds: 7200 },
+    // Scan bytes sum independently of storage time; 3600 GiB-seconds = 1 GiB·h.
+    { date: "2026-08-13", team_id: 5, schema_name: "team_5", bytes_scanned: 7200, gib_seconds: 3600 },
+    { date: "2026-08-13", team_id: 6, schema_name: "team_6", bytes_scanned: 60, gib_seconds: 0 },
+    { date: "2026-08-14", team_id: 5, schema_name: "team_5", bytes_scanned: 600, gib_seconds: 7200 },
   ],
 };
 
@@ -54,9 +53,11 @@ describe("OrgUsageSection", () => {
     hooks.useOrgDailyUsage.mockReturnValue(ok(RESPONSE));
   });
 
-  it("renders one org-level storage chart without compute or team series", () => {
+  it("renders organization scan and storage charts without CPU, memory or team series", () => {
     renderSection();
     expect(screen.getByText("S3 GiB·hours")).toBeInTheDocument();
+    expect(screen.getByText("Bytes scanned")).toBeInTheDocument();
+    expect(screen.getByText("7.7 KB total in window")).toBeInTheDocument();
     expect(screen.getByText(/3 total/)).toBeInTheDocument();
     expect(screen.queryByText("CPU-minutes")).not.toBeInTheDocument();
     expect(screen.queryByText("Memory GiB·minutes")).not.toBeInTheDocument();
@@ -97,10 +98,9 @@ describe("OrgUsageSection", () => {
     expect(screen.getByText(/no usage recorded/i)).toBeInTheDocument();
   });
 
-  it("shows the retention caveat when billing has acked inside the window", () => {
-    hooks.useOrgDailyUsage.mockReturnValue(ok({ ...RESPONSE, watermark_low: "2026-08-12T00:00:00Z" }));
+  it("retains billed usage without a deletion caveat", () => {
     renderSection();
-    expect(screen.getByText(/billed and removed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/billed and removed/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/garbage-collected/i)).not.toBeInTheDocument();
   });
 

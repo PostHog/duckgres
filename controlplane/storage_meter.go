@@ -219,7 +219,7 @@ func (s *storageSampler) sampleOrg(ctx context.Context, org storageOrg) error {
 	// sample-minute's bucket (same 60s bucket_start convention as compute, so
 	// the shared closed-bucket/watermark rules apply unchanged).
 	byteSeconds := trackedBytes * int64(s.interval/time.Second)
-	bucket := s.now().UTC().Truncate(computeBucketWidth)
+	bucket := s.now().UTC().Truncate(time.Minute)
 	billingErr := s.store.UpsertStorageSample(org.OrgID, org.TeamID, bucket, byteSeconds)
 
 	// Query-log hot stats are observability only. Sample them after the billing

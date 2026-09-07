@@ -245,8 +245,7 @@ type clientConn struct {
 	// querySource holds the value of the duckgres-namespaced session GUC
 	// `duckgres.query_source` (a custom config parameter, NOT forwarded to
 	// DuckDB). Empty means unset; readers see the default via QuerySource().
-	// This is a prerequisite for pull-based compute billing (usage buckets are
-	// keyed by query_source). Set via `SET duckgres.query_source = '...'` (or a
+	// Set via `SET duckgres.query_source = '...'` (or a
 	// `-c duckgres.query_source=...` startup option) and read back via
 	// `SHOW duckgres.query_source` / current_setting. Every set path validates
 	// against the closed {standard, endpoints} set (22023 on anything else), so
@@ -264,17 +263,6 @@ type clientConn struct {
 	// the server default. It is initialized before the message loop starts and
 	// never changes, so it needs no synchronization.
 	idleTimeout time.Duration
-
-	// Provisioned worker pod size for compute-usage billing (remote/k8s backend
-	// only). Counted in milli-units to avoid truncating a fractional-core or
-	// sub-GiB worker. workerMillicores == 0 means "unknown size" (non-remote /
-	// standalone), in which case metering is skipped. Constant for the
-	// connection's life, except that exploratory-tier escalation may raise it
-	// once (largest size wins) on the message-loop goroutine — the same
-	// goroutine that reads it; the metric is computed once at teardown over
-	// backendStart→now.
-	workerMillicores int64
-	workerMiB        int64
 
 	// Exploratory-tier state (remote backend only). onExploratoryWorker is
 	// true while the connection runs on the small exploratory worker;
@@ -388,14 +376,13 @@ func (c *clientConn) newTranspiler(convertPlaceholders bool) *transpiler.Transpi
 const querySourceGUCName = "duckgres.query_source"
 
 // defaultQuerySource is the value reported for `duckgres.query_source` when the
-// session GUC has not been set. Downstream (pull-based compute billing) treats a
-// missing query_source as this bucket.
+// session GUC has not been set.
 const defaultQuerySource = "standard"
 
 // QuerySource returns the current value of the `duckgres.query_source` session
 // GUC, or defaultQuerySource ("standard") if it was never set / set to empty.
 // This never errors on a missing value: an unset GUC is defined to mean
-// "standard". It is the accessor a future compute meter reads to bucket usage.
+// "standard".
 func (c *clientConn) QuerySource() string {
 	if c.querySource == "" {
 		return defaultQuerySource
@@ -408,15 +395,13 @@ func (c *clientConn) QuerySource() string {
 // "endpoints", or "" = reset to default): the transpiler validates SET
 // statements (transform.NormalizeQuerySource, rejecting anything else with
 // 22023 before this is reached) and applyStartupQuerySource validates the
-// startup option. The setter itself stays dumb; ConnectionBilling additionally
-// clamps at the metering boundary as defense in depth.
+// startup option.
 func (c *clientConn) setQuerySource(value string) {
 	c.querySource = value
 }
 
 // applyStartupQuerySource validates and applies a `-c duckgres.query_source=…`
-// startup-option value. The GUC is a billing dimension, so the value must be
-// in the closed {standard, endpoints} set (case-insensitive, normalized to
+// startup-option value. The value must be in the closed {standard, endpoints} set (case-insensitive, normalized to
 // lowercase; empty = default). An invalid value returns the 22023 error for
 // the caller to reject the connection with, mirroring how the control plane
 // rejects invalid duckgres.worker_* startup options.

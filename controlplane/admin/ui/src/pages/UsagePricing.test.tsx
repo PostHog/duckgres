@@ -9,10 +9,10 @@ import type { PricingRegion } from "@/lib/pricing";
 const AUGUST_HOURS = 744;
 const gibSeconds = (gibMonths: number) => gibMonths * AUGUST_HOURS * 3600;
 const ROWS: MonthlyUsageRow[] = [
-  { month: "2026-08", org_id: "acme", team_id: 5, schema_name: "team_5", cpu_seconds: 1, memory_seconds: 1, gib_seconds: gibSeconds(200) },
-  { month: "2026-08", org_id: "acme", team_id: 6, schema_name: "team_6", cpu_seconds: 1, memory_seconds: 1, gib_seconds: gibSeconds(400) },
-  { month: "2026-08", org_id: "globex", team_id: 9, schema_name: "team_9", cpu_seconds: 1, memory_seconds: 1, gib_seconds: gibSeconds(50) },
-  { month: "2026-08", org_id: "initech", team_id: 10, schema_name: "team_10", cpu_seconds: 1, memory_seconds: 1, gib_seconds: gibSeconds(200) },
+  { month: "2026-08", org_id: "acme", team_id: 5, schema_name: "team_5", bytes_scanned: 1, gib_seconds: gibSeconds(200) },
+  { month: "2026-08", org_id: "acme", team_id: 6, schema_name: "team_6", bytes_scanned: 1, gib_seconds: gibSeconds(400) },
+  { month: "2026-08", org_id: "globex", team_id: 9, schema_name: "team_9", bytes_scanned: 1, gib_seconds: gibSeconds(50) },
+  { month: "2026-08", org_id: "initech", team_id: 10, schema_name: "team_10", bytes_scanned: 1, gib_seconds: gibSeconds(200) },
 ];
 
 const LABELS = new Map([
@@ -52,7 +52,7 @@ describe("UsagePricing", () => {
     expect(within(globex).getByText("N/A (-$1.15 profit)")).toBeInTheDocument();
 
     const acmeCells = within(acme).getAllByRole("cell");
-    expect(acmeCells[4]).toHaveTextContent("$69.00");
+    expect(acmeCells[5]).toHaveTextContent("$69.00");
   });
 
   it("shows the binary-unit note on the pricing page", () => {
@@ -94,6 +94,7 @@ describe("UsagePricing", () => {
   });
 
   it.each([
+    ["Bytes scanned", ["Acme Inc", "Aardvark Systems", "Globex Corp"], ["Aardvark Systems", "Globex Corp", "Acme Inc"]],
     ["S3 GiB·h", ["Acme Inc", "Aardvark Systems", "Globex Corp"], ["Globex Corp", "Aardvark Systems", "Acme Inc"]],
     ["Allocated AWS cost", ["Acme Inc", "Aardvark Systems", "Globex Corp"], ["Globex Corp", "Aardvark Systems", "Acme Inc"]],
     ["Customer price (US)", ["Acme Inc", "Aardvark Systems", "Globex Corp"], ["Globex Corp", "Aardvark Systems", "Acme Inc"]],

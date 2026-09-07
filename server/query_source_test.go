@@ -8,10 +8,9 @@ import (
 	"net"
 	"strings"
 	"testing"
-	"time"
 )
 
-// TestQuerySourceGetter covers the session accessor the compute meter reads:
+// TestQuerySourceGetter covers the session configuration accessor:
 // unset defaults to "standard", a SET value round-trips, and reset to empty
 // falls back to the default. Callers of setQuerySource pass already-validated
 // canonical values (the transpiler / startup-option validation reject anything
@@ -277,9 +276,8 @@ func errorResponseWith(msgs []wireMsg, wants ...string) bool {
 // TestQuerySourceInvalidSimpleSetRejected asserts the simple-protocol SET path
 // rejects a value outside {standard, endpoints} with SQLSTATE 22023, names the
 // valid values, leaves the session value untouched, and a subsequent SHOW
-// still reports the default. The value is the billing bucket key
-// (duckgres_org_compute_usage.query_source), so junk here would flow into the
-// billing table and its exports with unbounded cardinality.
+// still reports the default. The legacy session option preserves its closed
+// set of accepted values.
 func TestQuerySourceInvalidSimpleSetRejected(t *testing.T) {
 	c, out := newBufferedConn(&selectOneExecutor{})
 
@@ -403,27 +401,6 @@ func TestQuerySourceExtendedParseInvalidRejected(t *testing.T) {
 	}
 	if st.querySourceSet == nil || *st.querySourceSet != "endpoints" {
 		t.Fatalf("prepared stmt querySourceSet = %v, want endpoints", st.querySourceSet)
-	}
-}
-
-// TestConnectionBillingClampsQuerySource is the defense-in-depth assert: if a
-// non-canonical value ever reaches teardown despite SET/startup validation
-// (i.e. a future bypass), ConnectionBilling degrades it to "standard" instead
-// of writing arbitrary client input into the billing bucket key.
-func TestConnectionBillingClampsQuerySource(t *testing.T) {
-	cases := map[string]string{
-		"":          "standard",
-		"standard":  "standard",
-		"endpoints": "endpoints",
-		"garbage":   "standard", // bypassed junk degrades to the default
-		"ENDPOINTS": "standard", // non-canonical case counts as junk here too
-	}
-	for stored, want := range cases {
-		cc := &clientConn{querySource: stored, backendStart: time.Now(), workerMillicores: 1000, workerMiB: 1024}
-		_, _, qs, _, _, _ := ConnectionBilling(cc)
-		if qs != want {
-			t.Fatalf("ConnectionBilling with stored %q: querySource = %q, want %q", stored, qs, want)
-		}
 	}
 }
 
