@@ -516,13 +516,22 @@ finalizers are still running.
 | var | `TS_WIF_AUDIENCE_MW_DEV` | Tailscale WIF audience |
 | secret | `MW_DEV_ACCOUNT_ID` | mw-dev AWS account id (kept out of committed code; ARNs are built from it) |
 | secret | `MW_DEV_TRINO_POD_IDENTITY_ROLE` | full ARN of the dedicated mw-dev Trino Pod Identity role (consumed only by the Trino lane) |
-| secret | `MW_DEV_ATHENA_POD_IDENTITY_ROLE` | full ARN of the least-privilege Athena scenario Pod Identity role |
-| var | `MW_DEV_ATHENA_WORKGROUP` | on-demand Athena engine-v3 workgroup |
-| var | `MW_DEV_ATHENA_DATABASE` | Glue database containing the frozen external tables |
-| var | `MW_DEV_ATHENA_RESULTS_S3_URI` | encrypted result prefix ending in `/`; lifecycle expiry is required |
 | secret | `AWS_ECR_PUBLISH_IAM_ROLE` | ECR push (already exists; used by CD) |
 | (role) | `github-duckgres-e2e` | dedicated stripped role in the mw-dev account (posthog-cloud-infra) — `eks:DescribeCluster` + Pod Identity association calls + `iam:PassRole`/`iam:GetRole` on the CP and dedicated Trino roles + an EKS access entry for kubectl. The workflow assumes `arn:aws:iam::<MW_DEV_ACCOUNT_ID>:role/github-duckgres-e2e`. |
 | repo setting | "Require approval for all outside collaborators" | the access gate (see below) |
+
+Athena adds no one-time GitHub configuration. Its Terraform unit publishes the
+SSM String parameter `/duckgres/perf/athena` and grants the existing workflow
+OIDC role `ssm:GetParameter` on that exact parameter. The JSON keys are
+`pod_identity_role_arn`, `workgroup_name`, `glue_database_name`, and
+`results_s3_uri`, all derived from the deployed resources. The frozen-perf
+workflow loads them with `bash scripts/scenario_athena_config.sh` and exports
+the existing scenario environment variables before deployment. The loader
+requires AWS CLI, jq, and an explicit `AWS_REGION`; it fails without exporting
+partial settings if fetching or validation fails. Apply the infrastructure
+first, and fix configuration in Terraform rather than editing SSM manually.
+Direct local scenario invocations still accept the documented explicit Athena
+environment variables.
 
 The `scenario-dev` workflow requests a 16,200-second session from
 `github-duckgres-e2e`, matching its 270-minute job timeout. The role's

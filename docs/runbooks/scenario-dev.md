@@ -42,16 +42,22 @@ Configure these repository secrets:
 - `AWS_ECR_PUBLISH_IAM_ROLE`
 - `MW_DEV_ACCOUNT_ID`
 - `MW_DEV_TRINO_POD_IDENTITY_ROLE`
-- `MW_DEV_ATHENA_POD_IDENTITY_ROLE`
 
 Configure these repository variables:
 
 - `TS_WIF_CLIENT_ID_MW_DEV`
 - `TS_WIF_AUDIENCE_MW_DEV`
 - `MW_DEV_SCENARIO_PERF_SECRET_ID`
-- `MW_DEV_ATHENA_WORKGROUP`
-- `MW_DEV_ATHENA_DATABASE`
-- `MW_DEV_ATHENA_RESULTS_S3_URI`
+
+Athena requires no additional GitHub settings. Terraform publishes its
+configuration to the SSM String parameter `/duckgres/perf/athena` in the dev
+account and grants the workflow's existing OIDC role `ssm:GetParameter` on
+that parameter only. Apply this infrastructure before enabling Athena runs.
+For frozen perf, `scripts/scenario_athena_config.sh` loads and validates the
+JSON after AWS authentication and before deploying the isolated stack. Other
+scenarios do not load it. The parameter contains `pod_identity_role_arn`,
+`workgroup_name`, `glue_database_name`, and `results_s3_uri`, derived from
+Terraform resources; they are configuration identifiers, not credentials.
 
 The Athena values must identify an engine-v3 on-demand workgroup, a Glue
 database with explicit `events` and `persons` external tables over the frozen
@@ -89,6 +95,13 @@ collide with another run. Scenario-specific frozen-dataset variables remain
 required as reported by `scripts/scenario_run.sh --check-env`.
 
 ## Failure Recovery
+
+If loading `/duckgres/perf/athena` fails, confirm the Athena Terraform apply
+completed, the workflow is using the expected AWS account/region, and its
+OIDC role has the exact-parameter read grant. Invalid or incomplete JSON fails
+before deployment and exports no partial settings. Fix the Terraform source
+and apply it again rather than editing the parameter manually. Rerun the
+workflow after the parameter and permission are available.
 
 Every scenario sub-run provisions its own org or warehouse name and includes
 cleanup steps. The isolated stack also tears down the temporary namespace after

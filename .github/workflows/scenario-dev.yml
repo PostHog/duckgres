@@ -74,10 +74,6 @@ jobs:
       # Frozen perf uses a namespace-local Trino cell. The dedicated role is
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      SCENARIO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_ATHENA_POD_IDENTITY_ROLE }}
-      DUCKGRES_SCENARIO_ATHENA_WORKGROUP: ${{ vars.MW_DEV_ATHENA_WORKGROUP }}
-      DUCKGRES_SCENARIO_ATHENA_DATABASE: ${{ vars.MW_DEV_ATHENA_DATABASE }}
-      DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI: ${{ vars.MW_DEV_ATHENA_RESULTS_S3_URI }}
       TRINO_IMAGE: ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07
       E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}
@@ -122,6 +118,10 @@ jobs:
 
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
+
+      - name: Load Athena perf configuration
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
+        run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy

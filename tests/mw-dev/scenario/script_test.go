@@ -94,10 +94,9 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
 		"TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}",
-		"SCENARIO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_ATHENA_POD_IDENTITY_ROLE }}",
-		"DUCKGRES_SCENARIO_ATHENA_WORKGROUP: ${{ vars.MW_DEV_ATHENA_WORKGROUP }}",
-		"DUCKGRES_SCENARIO_ATHENA_DATABASE: ${{ vars.MW_DEV_ATHENA_DATABASE }}",
-		"DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI: ${{ vars.MW_DEV_ATHENA_RESULTS_S3_URI }}",
+		"- name: Load Athena perf configuration",
+		"if: env.SCENARIO_NAME == 'posthog_frozen_perf'",
+		"bash scripts/scenario_athena_config.sh >> \"$GITHUB_ENV\"",
 		"TRINO_IMAGE: ghcr.io/posthog/trino:",
 		"E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}",
 		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"3\"",
@@ -126,6 +125,10 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	}
 
 	for _, forbidden := range []string{
+		"MW_DEV_ATHENA_POD_IDENTITY_ROLE",
+		"MW_DEV_ATHENA_WORKGROUP",
+		"MW_DEV_ATHENA_DATABASE",
+		"MW_DEV_ATHENA_RESULTS_S3_URI",
 		"skip_slow:",
 		"inputs.skip_slow",
 		"scenario-skipped:",
@@ -161,6 +164,13 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("workflow contains internal detail %q", forbidden)
 		}
+	}
+
+	authIndex := strings.Index(workflow, "- name: Configure AWS credentials (OIDC)")
+	configIndex := strings.Index(workflow, "- name: Load Athena perf configuration")
+	deployIndex := strings.Index(workflow, "- name: Deploy isolated Duckgres stack")
+	if authIndex < 0 || configIndex < authIndex || deployIndex < configIndex {
+		t.Fatal("Athena config must load after AWS authentication and before deploying the stack")
 	}
 
 	teardownIndex := strings.Index(workflow, "- name: Teardown")
