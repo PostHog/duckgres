@@ -102,6 +102,9 @@ func TestDiagnosticsHarnessPodJSONPathParses(t *testing.T) {
 }
 
 func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
+	// Scenario workflows export these before running the script tests.
+	t.Setenv("SCENARIO_NAME", "posthog_frozen_perf")
+	t.Setenv("SCENARIO_POD_IDENTITY_ROLE", "")
 	fakes := newRunSHFakes(t)
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
 	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
@@ -702,10 +705,10 @@ func TestScenarioArtifactTokenCollisionCreatesANewResultDirectory(t *testing.T) 
 }
 
 func TestScenarioDefaultsToFullSuite(t *testing.T) {
-	t.Setenv("SCENARIO_NAME", "")
 	fakes := newRunSHFakes(t)
 
 	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_NAME=",
 		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario",
 	)
 	out, err := cmd.CombinedOutput()
@@ -1122,6 +1125,9 @@ func TestE2EHarnessCoversRemoteBinaryCopy(t *testing.T) {
 }
 
 func TestDeployCreatesConfiguredSecretDirectoryPrivately(t *testing.T) {
+	t.Setenv("SCENARIO_NAME", "posthog_frozen_perf")
+	t.Setenv("SCENARIO_POD_IDENTITY_ROLE", "")
+	t.Setenv("E2E_SUITE", "trino")
 	fakes := newRunSHFakes(t)
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "generated", "secrets")
 
@@ -2039,6 +2045,9 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"CP_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/duckgres-control-plane-dev",
 		"EKS_CLUSTER_NAME=test-cluster",
 		"AWS_REGION=us-east-1",
+		"E2E_SUITE=neutral",
+		"SCENARIO_NAME=full-suite",
+		"SCENARIO_POD_IDENTITY_ROLE=",
 		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),
 		"DUCKGRES_CI_SECRET_DIR="+filepath.Join(filepath.Dir(binDir), "secrets"),
 	)
