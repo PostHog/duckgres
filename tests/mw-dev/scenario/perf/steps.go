@@ -21,7 +21,7 @@ import (
 const StepTypePerfQueries = "perf_queries"
 
 type DriverFactory interface {
-	NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error)
+	NewPGWire(connection scenariosql.PGWireConnection, protocol perfcore.Protocol) (perfcore.ProtocolDriver, error)
 	NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error)
 	NewAthena(ctx context.Context, connection athenadriver.ConnectionConfig) (perfcore.ProtocolDriver, error)
 }
@@ -312,7 +312,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire, perfcore.ProtocolTrino, perfcore.ProtocolAthena:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached, perfcore.ProtocolTrino, perfcore.ProtocolAthena:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -356,12 +356,12 @@ func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catal
 			continue
 		}
 		switch target {
-		case perfcore.ProtocolPGWire:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached:
 			connection, err := e.pgwireConnection(spec)
 			if err != nil {
 				return nil, err
 			}
-			driver, err := e.driverFactory.NewPGWire(connection)
+			driver, err := e.driverFactory.NewPGWire(connection, target)
 			if err != nil {
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
@@ -483,12 +483,17 @@ func closeDrivers(drivers map[perfcore.Protocol]perfcore.ProtocolDriver) {
 	}
 }
 
-func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
+func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, protocol perfcore.Protocol) (perfcore.ProtocolDriver, error) {
 	db, err := connection.OpenDB()
 	if err != nil {
 		return nil, err
 	}
-	return pgdriver.NewWithDB(db), nil
+	driver, err := pgdriver.NewWithDBAndProtocol(db, protocol)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return driver, nil
 }
 
 func (defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {

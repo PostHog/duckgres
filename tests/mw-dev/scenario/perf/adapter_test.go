@@ -99,6 +99,48 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	}
 }
 
+func TestExecutorRecordsBothPGWireCacheVariantsWithEqualResources(t *testing.T) {
+	targets := []perfcore.Protocol{perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached}
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		Connection: scenariosql.ConnectionConfig{DialHost: "127.0.0.1", SNISuffix: ".example.test", SSLMode: "require"},
+		OutputDir:  t.TempDir(), DriverFactory: factory,
+	})
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID: "cache-comparison", Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id": "scenario-org", "username": "root", "password": "test-password",
+			"catalog_file": writePerfCatalog(t, targets), "targets": []any{"pgwire_uncached", "pgwire_cached"},
+			"run_id": "cache-run", "worker_cpu": "3", "worker_memory": "12Gi",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := executor.State().Result("cache-comparison")
+	if !ok || result.Summary.RunID != "cache-run" || result.Summary.TotalQueries != 2 || result.Summary.WarmupQueries != 2 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if len(factory.pgwireConnections) != 2 {
+		t.Fatalf("PGWire factories called for %d targets, want 2", len(factory.pgwireConnections))
+	}
+	for _, protocol := range targets {
+		connection, ok := factory.pgwireConnections[protocol]
+		if !ok || !strings.Contains(connection.DSN, "options='-c duckgres.worker_cpu=3 -c duckgres.worker_memory=12Gi'") {
+			t.Fatalf("%s connection missing standard resources: %+v", protocol, connection)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(result.OutputDir, "query_results.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, protocol := range targets {
+		if !strings.Contains(string(raw), "\nq1,i1,1,"+string(protocol)+",ok,") {
+			t.Fatalf("missing %s result for shared query/intent: %s", protocol, raw)
+		}
+	}
+}
+
 func TestExecutorRestrictsCatalogToStepTargets(t *testing.T) {
 	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
 	provisionState := provision.NewState()
@@ -487,20 +529,25 @@ func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 }
 
 type fakeDriverFactory struct {
-	pgwireConnection scenariosql.PGWireConnection
-	pgwireErr        error
-	pgwireDriver     *fakeProtocolDriver
-	trinoConnection  trinodriver.ConnectionConfig
-	trinoContext     context.Context
-	trinoDriver      *fakeProtocolDriver
-	athenaConnection athenadriver.ConnectionConfig
-	athenaContext    context.Context
-	athenaDriver     *fakeProtocolDriver
+	pgwireConnections map[perfcore.Protocol]scenariosql.PGWireConnection
+	pgwireConnection  scenariosql.PGWireConnection
+	pgwireErr         error
+	pgwireDriver      *fakeProtocolDriver
+	trinoConnection   trinodriver.ConnectionConfig
+	trinoContext      context.Context
+	trinoDriver       *fakeProtocolDriver
+	athenaConnection  athenadriver.ConnectionConfig
+	athenaContext     context.Context
+	athenaDriver      *fakeProtocolDriver
 }
 
-func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection) (perfcore.ProtocolDriver, error) {
+func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, protocol perfcore.Protocol) (perfcore.ProtocolDriver, error) {
+	if f.pgwireConnections == nil {
+		f.pgwireConnections = make(map[perfcore.Protocol]scenariosql.PGWireConnection)
+	}
+	f.pgwireConnections[protocol] = connection
 	f.pgwireConnection = connection
-	f.pgwireDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolPGWire, err: f.pgwireErr}
+	f.pgwireDriver = &fakeProtocolDriver{protocol: protocol, err: f.pgwireErr}
 	return f.pgwireDriver, nil
 }
 

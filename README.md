@@ -302,36 +302,6 @@ Duckgres supports three configuration methods (in order of precedence):
 3. YAML config file
 4. Built-in defaults (lowest priority)
 
-### DuckDB worker remote-file caches
-
-Every DuckDB worker starts with `enable_external_file_cache`,
-`parquet_metadata_cache`, and `enable_http_metadata_cache` explicitly set to
-`false` using `SET GLOBAL`. These startup defaults apply to all sessions on the
-worker and are reapplied when its database is recreated. Standalone mode is
-unchanged. There is no additional configuration flag.
-
-This disables DuckDB's cross-query external-file data, Parquet metadata, and
-shared HTTP metadata caches. It does not disable query-local buffers, Parquet
-prefetching, DuckLake catalog caching, the optional `cache_httpfs` extension, or
-the node-local cache proxy below. A warmed worker is therefore not necessarily
-a fully cold end-to-end read path.
-
-For local verification, run `just test-unit`, or query a running worker:
-
-```sql
-SELECT name, value FROM duckdb_settings()
-WHERE name IN ('enable_external_file_cache', 'parquet_metadata_cache',
-               'enable_http_metadata_cache');
-```
-
-All three values should be `false`. Failure to apply a setting aborts worker
-startup with `disable worker cache <setting>` in the error. If a rollout fails
-or causes unacceptable read latency or object-store traffic, roll back to the
-previous worker image and replace affected workers using the
-[worker upgrade runbook](docs/runbooks/worker-upgrades.md). Existing workers
-keep their settings until replaced; changing a setting in one live worker is
-not a durable rollout or rollback.
-
 ### Node-local cache proxy
 
 Kubernetes workers can use the optional node-local NVMe cache proxy with

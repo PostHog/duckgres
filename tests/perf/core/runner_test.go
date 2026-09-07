@@ -305,6 +305,56 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 	}
 }
 
+func TestRunnerRunsUncachedAndCachedPGWireAsDistinctComparableResults(t *testing.T) {
+	uncached, cached := ProtocolPGWireUncached, ProtocolPGWireCached
+	var events []string
+	uncachedDriver := &testDriver{protocol: uncached, events: &events}
+	cachedDriver := &testDriver{protocol: cached, events: &events}
+	sink := &inMemorySink{}
+	runner := NewQueryRunner(RunnerConfig{
+		RunID: "cache-comparison",
+		Catalog: Catalog{
+			Targets: []Protocol{uncached, cached}, WarmupIterations: 1, MeasureIterations: 1,
+			Queries: []Query{
+				{QueryID: "q__raw_view", IntentID: "intent", StorageTarget: StorageTargetRawView},
+				{QueryID: "q__ducklake_table", IntentID: "intent", StorageTarget: StorageTargetDuckLakeTable},
+				{QueryID: "q__athena_external", IntentID: "intent", StorageTarget: StorageTargetAthenaExternal},
+			},
+		},
+		Drivers: map[Protocol]ProtocolDriver{uncached: uncachedDriver, cached: cachedDriver}, Sink: sink,
+	})
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RunID != "cache-comparison" || summary.TotalQueries != 4 || summary.WarmupQueries != 4 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	for _, driver := range []*testDriver{uncachedDriver, cachedDriver} {
+		if want := []string{"q__raw_view", "q__ducklake_table", "q__raw_view", "q__ducklake_table"}; !reflect.DeepEqual(driver.queryIDs, want) {
+			t.Fatalf("%s routed queries = %v, want %v", driver.protocol, driver.queryIDs, want)
+		}
+	}
+	wantEvents := []string{
+		"pgwire_uncached/q__raw_view", "pgwire_uncached/q__ducklake_table",
+		"pgwire_uncached/q__raw_view", "pgwire_uncached/q__ducklake_table",
+		"pgwire_cached/q__raw_view", "pgwire_cached/q__ducklake_table",
+		"pgwire_cached/q__raw_view", "pgwire_cached/q__ducklake_table",
+	}
+	if !reflect.DeepEqual(events, wantEvents) {
+		t.Fatalf("execution order = %v, want %v", events, wantEvents)
+	}
+	for index, result := range sink.results {
+		wantProtocol := uncached
+		if index >= 2 {
+			wantProtocol = cached
+		}
+		if result.Protocol != wantProtocol || result.IntentID != "intent" || result.MeasureIteration != 1 {
+			t.Fatalf("result %d = %+v", index, result)
+		}
+	}
+}
+
 func (d *testDriver) Close() error { return nil }
 
 type inMemorySink struct {

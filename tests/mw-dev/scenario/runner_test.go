@@ -745,8 +745,8 @@ func assertPerfTargetsOnlyPGWire(t *testing.T, step core.Step) {
 func assertPerfTargetsPGWireTrinoAndAthena(t *testing.T, step core.Step) {
 	t.Helper()
 	targets, ok := step.With["targets"].([]any)
-	if !ok || len(targets) != 3 || targets[0] != "pgwire" || targets[1] != "trino" || targets[2] != "athena" {
-		t.Fatalf("perf step %s targets = %#v, want [pgwire trino athena]", step.ID, step.With["targets"])
+	if !ok || len(targets) != 4 || targets[0] != "pgwire_uncached" || targets[1] != "pgwire_cached" || targets[2] != "trino" || targets[3] != "athena" {
+		t.Fatalf("perf step %s targets = %#v, want [pgwire_uncached pgwire_cached trino athena]", step.ID, step.With["targets"])
 	}
 }
 

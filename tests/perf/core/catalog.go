@@ -389,7 +389,7 @@ func validateCatalog(c Catalog) error {
 	seenTargets := map[Protocol]struct{}{}
 	for _, target := range c.Targets {
 		switch target {
-		case ProtocolPGWire, ProtocolTrino, ProtocolAthena:
+		case ProtocolPGWire, ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolAthena:
 		default:
 			return fmt.Errorf("unsupported target protocol %q", target)
 		}
