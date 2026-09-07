@@ -154,6 +154,19 @@ func OpenDuckDBPair(cfg server.Config, username string) (*DuckDBPair, error) {
 		_ = connector.Close()
 		return nil, err
 	}
+	// Disable cross-query remote-file caches on every worker instance, including
+	// instances recreated on recycle. GLOBAL also covers control and new session
+	// connections sharing the connector; query-local buffers are unaffected.
+	for _, setting := range []string{
+		"enable_external_file_cache", "parquet_metadata_cache", "enable_http_metadata_cache",
+	} {
+		if _, err := mainDB.Exec("SET GLOBAL " + setting + " = false"); err != nil {
+			_ = mainDB.Close()
+			_ = controlDB.Close()
+			_ = connector.Close()
+			return nil, fmt.Errorf("disable worker cache %s: %w", setting, err)
+		}
+	}
 	if _, err := mainDB.Exec(fmt.Sprintf("SET GLOBAL late_materialization_max_rows = %d", workerLateMaterializationMaxRows)); err != nil {
 		slog.Warn("Failed to set DuckDB late_materialization_max_rows.", "late_materialization_max_rows", workerLateMaterializationMaxRows, "error", err)
 	}

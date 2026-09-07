@@ -33,3 +33,32 @@ func TestOpenDuckDBPairSetsLateMaterializationMaxRows(t *testing.T) {
 		t.Errorf("late_materialization_max_rows = %q, want %q", got, "6000")
 	}
 }
+
+func TestOpenDuckDBPairDisablesRemoteFileCaches(t *testing.T) {
+	pair, err := OpenDuckDBPair(server.Config{DataDir: t.TempDir()}, "worker")
+	if err != nil {
+		t.Fatalf("OpenDuckDBPair: %v", err)
+	}
+	defer func() { _ = pair.Close() }()
+
+	// A fresh session must inherit the policy, not just the startup connection.
+	sessionDB := sql.OpenDB(&nonClosingConnector{inner: pair.connector})
+	defer func() { _ = sessionDB.Close() }()
+	for name, db := range map[string]*sql.DB{
+		"main": pair.Main, "control": pair.Control, "fresh session": sessionDB,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, setting := range []string{
+				"enable_external_file_cache", "parquet_metadata_cache", "enable_http_metadata_cache",
+			} {
+				var enabled bool
+				if err := db.QueryRow("SELECT current_setting(?)", setting).Scan(&enabled); err != nil {
+					t.Fatalf("read %s: %v", setting, err)
+				}
+				if enabled {
+					t.Errorf("%s is enabled, want disabled", setting)
+				}
+			}
+		})
+	}
+}
