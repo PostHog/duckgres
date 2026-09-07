@@ -16,7 +16,11 @@ execution and rejects a response which reports reuse. Timing is end to end:
 it includes queueing, engine execution, and paginated result retrieval. The
 driver defaults to catalog `AwsDataCatalog`, a 500ms status poll interval, and
 a 30-minute query timeout. Workgroup, database, result prefix, and AWS region
-are explicit scenario settings. Cancellation stops any unfinished query.
+are explicit scenario settings. Cancellation attempts to stop any unfinished
+query; Athena's independent server-side timeout still applies if that request
+fails. Available terminal service statistics are retained even when execution,
+result validation, or result retrieval fails. Executions without service
+statistics do not emit a service-metrics row.
 
 The Trino driver requires an HTTPS coordinator and always verifies its TLS
 certificate. It uses system roots by default, or the explicitly configured CA

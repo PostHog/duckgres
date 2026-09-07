@@ -6,6 +6,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	awsathena "github.com/aws/aws-sdk-go-v2/service/athena"
+	athenatypes "github.com/aws/aws-sdk-go-v2/service/athena/types"
+
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
 )
 
@@ -14,16 +19,6 @@ const (
 	defaultPollInterval = 500 * time.Millisecond
 	defaultQueryTimeout = 30 * time.Minute
 	stopTimeout         = 5 * time.Second
-)
-
-type QueryState string
-
-const (
-	QueryStateQueued    QueryState = "QUEUED"
-	QueryStateRunning   QueryState = "RUNNING"
-	QueryStateSucceeded QueryState = "SUCCEEDED"
-	QueryStateFailed    QueryState = "FAILED"
-	QueryStateCancelled QueryState = "CANCELLED"
 )
 
 type ConnectionConfig struct {
@@ -36,66 +31,33 @@ type ConnectionConfig struct {
 	QueryTimeout   time.Duration
 }
 
-type StartQueryInput struct {
-	SQL                string
-	WorkGroup          string
-	Catalog            string
-	Database           string
-	OutputLocation     string
-	ResultReuseEnabled bool
-}
-
-type QueryStatistics struct {
-	QueueDuration    time.Duration
-	PlanningDuration time.Duration
-	EngineDuration   time.Duration
-	ServiceDuration  time.Duration
-	BytesScanned     int64
-	DPUCount         float64
-	ResultReused     bool
-}
-
-type QueryExecution struct {
-	State             QueryState
-	StateChangeReason string
-	OutputLocation    string
-	EngineVersion     string
-	Statistics        QueryStatistics
-}
-
-type ResultPage struct {
-	RowCount  int64
-	NextToken string
-}
-
-type Client interface {
-	StartQuery(context.Context, StartQueryInput) (string, error)
-	GetQuery(context.Context, string) (QueryExecution, error)
-	GetResults(context.Context, string, string) (ResultPage, error)
-	StopQuery(context.Context, string) error
-}
-
-type DriverOptions struct {
-	Now   func() time.Time
-	Sleep func(context.Context, time.Duration) error
+type athenaAPI interface {
+	StartQueryExecution(context.Context, *awsathena.StartQueryExecutionInput, ...func(*awsathena.Options)) (*awsathena.StartQueryExecutionOutput, error)
+	GetQueryExecution(context.Context, *awsathena.GetQueryExecutionInput, ...func(*awsathena.Options)) (*awsathena.GetQueryExecutionOutput, error)
+	GetQueryResults(context.Context, *awsathena.GetQueryResultsInput, ...func(*awsathena.Options)) (*awsathena.GetQueryResultsOutput, error)
+	StopQueryExecution(context.Context, *awsathena.StopQueryExecutionInput, ...func(*awsathena.Options)) (*awsathena.StopQueryExecutionOutput, error)
 }
 
 type Driver struct {
-	client Client
+	client athenaAPI
 	cfg    ConnectionConfig
 	now    func() time.Time
 	sleep  func(context.Context, time.Duration) error
 }
 
 func New(ctx context.Context, cfg ConnectionConfig) (*Driver, error) {
-	client, err := newAWSClient(ctx, cfg.Region)
-	if err != nil {
-		return nil, err
+	options := []func(*awsconfig.LoadOptions) error{}
+	if cfg.Region != "" {
+		options = append(options, awsconfig.WithRegion(cfg.Region))
 	}
-	return NewWithClient(client, cfg, DriverOptions{})
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, options...)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS configuration for Athena: %w", err)
+	}
+	return newWithClient(awsathena.NewFromConfig(awsCfg), cfg)
 }
 
-func NewWithClient(client Client, cfg ConnectionConfig, options DriverOptions) (*Driver, error) {
+func newWithClient(client athenaAPI, cfg ConnectionConfig) (*Driver, error) {
 	if client == nil {
 		return nil, fmt.Errorf("athena client is required")
 	}
@@ -117,13 +79,7 @@ func NewWithClient(client Client, cfg ConnectionConfig, options DriverOptions) (
 	if cfg.QueryTimeout <= 0 {
 		cfg.QueryTimeout = defaultQueryTimeout
 	}
-	if options.Now == nil {
-		options.Now = time.Now
-	}
-	if options.Sleep == nil {
-		options.Sleep = sleepWithContext
-	}
-	return &Driver{client: client, cfg: cfg, now: options.Now, sleep: options.Sleep}, nil
+	return &Driver{client: client, cfg: cfg, now: time.Now, sleep: sleepWithContext}, nil
 }
 
 func (d *Driver) Protocol() perfcore.Protocol { return perfcore.ProtocolAthena }
@@ -136,17 +92,25 @@ func (d *Driver) Execute(ctx context.Context, query perfcore.Query, args []any) 
 	defer cancel()
 
 	startedAt := d.now()
-	queryID, err := d.client.StartQuery(queryCtx, StartQueryInput{
-		SQL:                query.CanonicalSQL(),
-		WorkGroup:          d.cfg.WorkGroup,
-		Catalog:            d.cfg.Catalog,
-		Database:           d.cfg.Database,
-		OutputLocation:     d.cfg.OutputLocation,
-		ResultReuseEnabled: false,
+	defer func() { result.Duration = d.now().Sub(startedAt) }()
+	started, err := d.client.StartQueryExecution(queryCtx, &awsathena.StartQueryExecutionInput{
+		QueryString: aws.String(query.CanonicalSQL()),
+		WorkGroup:   aws.String(d.cfg.WorkGroup),
+		QueryExecutionContext: &athenatypes.QueryExecutionContext{
+			Catalog: aws.String(d.cfg.Catalog), Database: aws.String(d.cfg.Database),
+		},
+		ResultConfiguration: &athenatypes.ResultConfiguration{OutputLocation: aws.String(d.cfg.OutputLocation)},
+		ResultReuseConfiguration: &athenatypes.ResultReuseConfiguration{
+			ResultReuseByAgeConfiguration: &athenatypes.ResultReuseByAgeConfiguration{Enabled: false},
+		},
 	})
 	if err != nil {
 		return result, fmt.Errorf("start Athena query: %w", err)
 	}
+	if started == nil || aws.ToString(started.QueryExecutionId) == "" {
+		return result, fmt.Errorf("athena returned an empty query execution ID")
+	}
+	queryID := started.QueryExecutionId
 	completed := false
 	defer func() {
 		if completed {
@@ -154,77 +118,101 @@ func (d *Driver) Execute(ctx context.Context, query perfcore.Query, args []any) 
 		}
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), stopTimeout)
 		defer stopCancel()
-		_ = d.client.StopQuery(stopCtx, queryID)
+		_, _ = d.client.StopQueryExecution(stopCtx, &awsathena.StopQueryExecutionInput{QueryExecutionId: queryID})
 	}()
 
-	var execution QueryExecution
+	var execution *athenatypes.QueryExecution
 	for {
-		execution, err = d.client.GetQuery(queryCtx, queryID)
+		output, err := d.client.GetQueryExecution(queryCtx, &awsathena.GetQueryExecutionInput{QueryExecutionId: queryID})
 		if err != nil {
-			return result, fmt.Errorf("get Athena query %s: %w", queryID, err)
+			return result, fmt.Errorf("get Athena query %s: %w", *queryID, err)
 		}
-		switch execution.State {
-		case QueryStateQueued, QueryStateRunning:
+		if output == nil || output.QueryExecution == nil || output.QueryExecution.Status == nil {
+			return result, fmt.Errorf("athena returned incomplete execution state for query %s", *queryID)
+		}
+		execution = output.QueryExecution
+		switch execution.Status.State {
+		case athenatypes.QueryExecutionStateQueued, athenatypes.QueryExecutionStateRunning:
 			if err := d.sleep(queryCtx, d.cfg.PollInterval); err != nil {
 				return result, err
 			}
-		case QueryStateSucceeded:
+		case athenatypes.QueryExecutionStateSucceeded, athenatypes.QueryExecutionStateFailed, athenatypes.QueryExecutionStateCancelled:
 			completed = true
 			goto queryComplete
-		case QueryStateFailed, QueryStateCancelled:
-			completed = true
-			return result, fmt.Errorf("athena query %s ended in state %s: %s", queryID, execution.State, execution.StateChangeReason)
 		default:
-			return result, fmt.Errorf("athena query %s returned unknown state %q", queryID, execution.State)
+			return result, fmt.Errorf("athena query %s returned unknown state %q", *queryID, execution.Status.State)
 		}
 	}
 
 queryComplete:
-	if execution.Statistics.ResultReused {
-		return result, fmt.Errorf("athena query %s reused a previous result despite result reuse being disabled", queryID)
+	// Preserve final service statistics even if execution or result retrieval fails.
+	result.ServiceMetrics = serviceMetrics(execution)
+	if execution.Status.State != athenatypes.QueryExecutionStateSucceeded {
+		return result, fmt.Errorf("athena query %s ended in state %s: %s", *queryID, execution.Status.State, aws.ToString(execution.Status.StateChangeReason))
 	}
-	if !outputWithinRoot(execution.OutputLocation, d.cfg.OutputLocation) {
-		return result, fmt.Errorf("athena query output %q is outside configured output location %q", execution.OutputLocation, d.cfg.OutputLocation)
+	if result.ServiceMetrics != nil && result.ServiceMetrics.ResultReused {
+		return result, fmt.Errorf("athena query %s reused a previous result despite result reuse being disabled", *queryID)
+	}
+	var outputLocation string
+	if execution.ResultConfiguration != nil {
+		outputLocation = aws.ToString(execution.ResultConfiguration.OutputLocation)
+	}
+	if !outputWithinRoot(outputLocation, d.cfg.OutputLocation) {
+		return result, fmt.Errorf("athena query output %q is outside configured output location %q", outputLocation, d.cfg.OutputLocation)
 	}
 
-	rows, err := d.countRows(queryCtx, queryID)
+	rows, err := d.countRows(queryCtx, *queryID)
 	if err != nil {
 		return result, err
 	}
 	result.Rows = rows
-	result.Duration = d.now().Sub(startedAt)
-	result.ServiceMetrics = &perfcore.ServiceMetrics{
-		QueueDuration:    execution.Statistics.QueueDuration,
-		PlanningDuration: execution.Statistics.PlanningDuration,
-		EngineDuration:   execution.Statistics.EngineDuration,
-		ServiceDuration:  execution.Statistics.ServiceDuration,
-		BytesScanned:     execution.Statistics.BytesScanned,
-		DPUCount:         execution.Statistics.DPUCount,
-		ResultReused:     execution.Statistics.ResultReused,
-		EngineVersion:    execution.EngineVersion,
-	}
 	return result, nil
+}
+
+func serviceMetrics(execution *athenatypes.QueryExecution) *perfcore.ServiceMetrics {
+	statistics := execution.Statistics
+	if statistics == nil {
+		return nil
+	}
+	metrics := &perfcore.ServiceMetrics{
+		QueueDuration:    time.Duration(aws.ToInt64(statistics.QueryQueueTimeInMillis)) * time.Millisecond,
+		PlanningDuration: time.Duration(aws.ToInt64(statistics.QueryPlanningTimeInMillis)) * time.Millisecond,
+		EngineDuration:   time.Duration(aws.ToInt64(statistics.EngineExecutionTimeInMillis)) * time.Millisecond,
+		ServiceDuration:  time.Duration(aws.ToInt64(statistics.TotalExecutionTimeInMillis)) * time.Millisecond,
+		BytesScanned:     aws.ToInt64(statistics.DataScannedInBytes),
+		DPUCount:         aws.ToFloat64(statistics.DpuCount),
+	}
+	if statistics.ResultReuseInformation != nil {
+		metrics.ResultReused = statistics.ResultReuseInformation.ReusedPreviousResult
+	}
+	if execution.EngineVersion != nil {
+		metrics.EngineVersion = aws.ToString(execution.EngineVersion.EffectiveEngineVersion)
+	}
+	return metrics
 }
 
 func (d *Driver) countRows(ctx context.Context, queryID string) (int64, error) {
 	var rows int64
-	var nextToken string
+	input := &awsathena.GetQueryResultsInput{QueryExecutionId: aws.String(queryID), MaxResults: aws.Int32(1000)}
 	firstPage := true
 	for {
-		page, err := d.client.GetResults(ctx, queryID, nextToken)
+		page, err := d.client.GetQueryResults(ctx, input)
 		if err != nil {
 			return 0, fmt.Errorf("get Athena query results %s: %w", queryID, err)
 		}
-		pageRows := page.RowCount
+		var pageRows int64
+		if page.ResultSet != nil {
+			pageRows = int64(len(page.ResultSet.Rows))
+		}
 		if firstPage && pageRows > 0 {
 			pageRows-- // Athena returns the column header as the first result row.
 		}
 		rows += pageRows
 		firstPage = false
-		if page.NextToken == "" {
+		if aws.ToString(page.NextToken) == "" {
 			return rows, nil
 		}
-		nextToken = page.NextToken
+		input.NextToken = page.NextToken
 	}
 }
 
