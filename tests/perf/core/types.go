@@ -5,9 +5,11 @@ import "time"
 type Protocol string
 
 const (
-	ProtocolPGWire Protocol = "pgwire"
-	ProtocolTrino  Protocol = "trino"
-	ProtocolAthena Protocol = "athena"
+	ProtocolPGWire         Protocol = "pgwire"
+	ProtocolPGWireUncached Protocol = "pgwire_uncached"
+	ProtocolPGWireCached   Protocol = "pgwire_cached"
+	ProtocolTrino          Protocol = "trino"
+	ProtocolAthena         Protocol = "athena"
 )
 
 // StorageTarget identifies the physical relation family selected for a paired

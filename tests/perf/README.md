@@ -4,7 +4,8 @@ This package contains the golden-query performance harness.
 
 ## Protocol Drivers
 
-Catalogs may target `pgwire`, `trino`, `athena`, or any supported combination. All drivers execute the same
+Catalogs may target `pgwire`, `pgwire_uncached`, `pgwire_cached`, `trino`,
+`athena`, or any supported combination. All drivers execute the same
 rendered statement stored in the existing `pgwire_sql` catalog field; the
 legacy field name is retained for catalog compatibility and must not be used
 to create a second, protocol-specific query definition. Keep shared benchmark
@@ -32,8 +33,47 @@ readiness, Kubernetes Secret projection, and file-authenticator refresh.
 When a catalog targets multiple protocols, the runner completes all warmup and
 measured iterations for one protocol before starting the next protocol in the
 catalog's declared target order. This keeps each protocol's connection and
-worker cache active throughout its measurements and prevents slow queries in
+worker context active throughout its measurements and prevents slow queries in
 one protocol from changing another protocol's cache context.
+
+### DuckDB cache comparison
+
+`posthog_frozen_perf` runs four separately labeled targets in one result set,
+in order: **`pgwire_uncached` (baseline)**, `pgwire_cached`, `trino`, `athena`.
+Both DuckDB variants use identical queries, worker resource requests, warmup
+counts, and measured iterations. Each variant finishes before the next begins;
+Trino and Athena run once, not once per cache mode. Legacy `pgwire` catalogs
+keep their existing behavior and are not relabeled as uncached history.
+
+Only the perf driver changes cache settings. It pins its PGWire connection and
+applies `SET GLOBAL` before that variant's first warmup and outside query timing:
+
+| Setting | Uncached baseline | Cached |
+| --- | --- | --- |
+| `enable_external_file_cache` | `false` | `true` |
+| `parquet_metadata_cache` | `false` | `false` |
+| `enable_http_metadata_cache` | `false` | `false` |
+
+The cached variant matches DuckDB's default remote-file caching policy rather
+than enabling metadata caches that ordinary workers leave off. Setup is lazy,
+so the cached driver's construction cannot enable caching during the uncached
+phase. A lost pinned connection fails the query instead of silently connecting
+to an unconfigured worker. Worker startup and production configuration are
+unchanged.
+
+Use the isolated scenario workflow for this comparison. Local
+`just scenario-frozen-perf` runs require a dedicated test warehouse: these
+settings affect the underlying worker globally, and the two variants must not
+run concurrently against a shared worker. The scenario's sequential phases
+also work when connections reuse the same worker. If cache setup fails, inspect
+the artifact errors and recreate the test stack; do not publish fallback runs
+under either explicit cache-mode label. Teardown removes the test workers.
+
+Warmup does not imply that the entire dataset fits in memory. Query-local
+buffering, prefetching, DuckLake catalog caching, and separate cache
+proxies/extensions are unaffected, so "uncached" here is not a fully cold
+end-to-end read path. The paired query and intent IDs use `balanced_v4` to
+separate this methodology from `balanced_v3`; the dataset is unchanged.
 
 ## Paired Query Catalogs
 
