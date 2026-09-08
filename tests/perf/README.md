@@ -75,6 +75,79 @@ proxies/extensions are unaffected, so "uncached" here is not a fully cold
 end-to-end read path. The paired query and intent IDs use `balanced_v4` to
 separate this methodology from `balanced_v3`; the dataset is unchanged.
 
+### Trino worker shape experiments
+
+The `scenario-dev` workflow accepts a manual `trino_perf_shape` choice for
+`posthog_frozen_perf`. Scheduled runs and callers that omit the choice retain
+`baseline`. The three experiments vary worker size and total execution
+resources independently:
+
+| Shape | Workers | CPU / memory per worker | Total CPU / memory | Heap per worker | Query memory per worker / cluster |
+| --- | ---: | --- | --- | --- | --- |
+| `baseline` | 3 | 1 / 4 GiB | 3 / 12 GiB | 3 GiB | 2 / 6 GiB |
+| `large` | 1 | 3 / 12 GiB | 3 / 12 GiB | 9 GiB | 6 / 6 GiB |
+| `scaleout` | 6 | 1 / 4 GiB | 6 / 24 GiB | 3 GiB | 2 / 12 GiB |
+| `large-scaleout` | 2 | 3 / 12 GiB | 6 / 24 GiB | 9 GiB | 6 / 12 GiB |
+
+Worker CPU and memory requests equal their limits. The coordinator keeps its
+existing resources, 2 GiB heap, and 1 GiB per-node query limit; its cluster
+query-memory setting follows the selected budget. JVM heap headroom retains
+Trino's default of 30% of the heap. Duckgres remains at 3 CPU / 12 GiB in the
+workflow, so only `baseline` and `large` match its execution resource budget.
+Coordinator and supporting-service resources are additional to the table.
+
+To run an experiment after merging, dispatch one shape at a time:
+
+```bash
+gh workflow run scenario-dev.yml --ref main \
+  -f scenario=posthog_frozen_perf \
+  -f trino_perf_shape=large
+```
+
+Run `baseline`, `large`, `scaleout`, and `large-scaleout` sequentially from the
+same Git revision. Wait for each run's teardown before starting the next;
+GitHub concurrency groups serialize runs on the same ref but do not guarantee
+that multiple queued dispatches are retained. Use the same pinned Duckgres
+image through `duckgres_image` if the base branch changes between dispatches.
+For a PR trial, replace `main` with the PR branch. The Trino image remains
+pinned by the workflow. Compare identical query IDs and protocol labels from
+the current `balanced_v4` catalog; do not mix them with older methodology.
+
+The workflow title and summary identify the shape. The downloadable scenario
+artifact includes `trino-perf-shape.json` with configured resource and image
+provenance, including on deployment failure. A copy accompanies the collected
+scenario results. Nonbaseline experiments are artifact-only and do not publish
+to the daily baseline's historical tables. The SQL, cache settings, protocol
+order, warmup count, and measured iteration count are identical across shapes.
+
+Use per-query median latency and allocated CPU-seconds (total worker CPU times
+elapsed seconds) to compare speed and resource efficiency. The distinct-person
+query is the primary diagnostic case. The harness excludes warmups from
+`query_results.csv`; these results are measured iterations, not a separately
+instrumented cold-cache benchmark. A topology speedup alone does not distinguish
+GC, throttling, exchange traffic, scan throughput, or memory pressure: correlate
+with execution telemetry before attributing its cause.
+
+For local harness development, set `TRINO_PERF_SHAPE` to one of these choices
+alongside `SCENARIO_NAME=posthog_frozen_perf`, `E2E_SUITE=trino`, and the usual
+isolated-stack environment, and use that same environment for `run.sh deploy`
+and `run.sh test-scenario`. The test invocation checks any saved deployment
+provenance and rejects a different shape, resource budget, or deployment image;
+restore the deployment environment or redeploy before continuing. Use a separate
+`SCENARIO_ARTIFACTS_DIR` for each local stack. Install `jq` on the machine running `run.sh` to
+write the JSON provenance (the GitHub runner already includes it). Explicitly
+set the Duckgres worker variables to
+`3` and `12Gi` to reproduce the workflow. The generic harness retains its
+smaller Duckgres defaults. `just scenario-frozen-perf` uses an existing
+warehouse and does not resize Trino. Unknown shapes and nonbaseline shapes
+outside the isolated frozen-perf scenario are rejected before cloud mutations.
+
+If deployment or testing fails, inspect the selected shape artifact and pod
+events, then use the normal `run.sh teardown` with the same namespace and run
+identity. Teardown remains available even with a malformed shape selection.
+Rerun in a fresh isolated stack; a partially started worker pool is not a valid
+measurement. Restore `baseline` to return to the daily configuration.
+
 ## Paired Query Catalogs
 
 Existing catalogs continue to use `queries:` unchanged. A catalog may contain

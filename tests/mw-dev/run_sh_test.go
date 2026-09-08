@@ -2,6 +2,7 @@ package e2emwdev_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
@@ -168,6 +169,11 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 		"${TRINO_TLS_PASSWORD}", "test-password",
 		"${TRINO_CA_CERT_B64}", "dGVzdA==",
 		"${TRINO_SERVER_P12_B64}", "dGVzdA==",
+		"${TRINO_WORKER_CPU}", "1",
+		"${TRINO_WORKER_MEMORY}", "4Gi",
+		"${TRINO_WORKER_HEAP}", "3G",
+		"${TRINO_QUERY_MEMORY_PER_NODE}", "2GB",
+		"${TRINO_QUERY_MEMORY}", "6GB",
 	).Replace(string(raw))
 
 	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
@@ -226,6 +232,165 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 				t.Errorf("Trino %s config missing %q:\n%s", name, want, config)
 			}
 		}
+	}
+}
+
+func TestTrinoPerfShapesDeployAndRecordResources(t *testing.T) {
+	for _, tc := range []struct {
+		shape, cpu, memory, heap, perNode, cluster string
+		replicas, totalCPU, totalMemoryGiB         int
+	}{
+		{"baseline", "1", "4Gi", "3G", "2GB", "6GB", 3, 3, 12},
+		{"large", "3", "12Gi", "9G", "6GB", "6GB", 1, 3, 12},
+		{"scaleout", "1", "4Gi", "3G", "2GB", "12GB", 6, 6, 24},
+		{"large-scaleout", "3", "12Gi", "9G", "6GB", "12GB", 2, 6, 24},
+	} {
+		t.Run(tc.shape, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+			for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
+				if err := os.WriteFile(filepath.Join(filepath.Dir(fakes.binDir), "secrets", name), []byte("tls-test-secret"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, err := runSHCommand(t, fakes.binDir, "deploy",
+				"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf",
+				"TRINO_PERF_SHAPE="+tc.shape, "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-trino",
+				"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-scenario",
+				"TRINO_IMAGE=example.invalid/trino:experiment", "TRINO_TLS_PASSWORD=never-record-this-secret",
+			).CombinedOutput()
+			if err != nil {
+				t.Fatalf("deploy failed: %v\n%s", err, out)
+			}
+			calls := fakes.calls(t)
+			for _, want := range []string{
+				`patch deployment duckgres-trino-worker --type=merge -p {"spec":{"replicas":` + strconv.Itoa(tc.replicas) + `}}`,
+				`requests: { cpu: "` + tc.cpu + `", memory: ` + tc.memory + ` }`,
+				`limits: { cpu: "` + tc.cpu + `", memory: ` + tc.memory + ` }`,
+				"-Xmx" + tc.heap, "query.max-memory-per-node=" + tc.perNode, "query.max-memory=" + tc.cluster,
+				"-Xmx2G", "query.max-memory-per-node=1GB", "${ENV:TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET}",
+			} {
+				if !strings.Contains(calls, want) {
+					t.Errorf("rendered deploy missing %q", want)
+				}
+			}
+			raw, err := os.ReadFile(filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts", "trino-perf-shape.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metadata map[string]any
+			if err := json.Unmarshal(raw, &metadata); err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]any{
+				"shape": tc.shape, "worker_replicas": float64(tc.replicas), "worker_cpu": tc.cpu,
+				"worker_memory": tc.memory, "worker_heap": tc.heap, "query_memory_per_node": tc.perNode,
+				"query_memory": tc.cluster, "total_worker_cpu": float64(tc.totalCPU), "total_worker_memory_gib": float64(tc.totalMemoryGiB),
+				"trino_image": "example.invalid/trino:experiment",
+			} {
+				if metadata[key] != want {
+					t.Errorf("metadata[%s] = %v, want %v", key, metadata[key], want)
+				}
+			}
+			if strings.Contains(string(raw), "secret") {
+				t.Errorf("metadata contains a secret: %s", raw)
+			}
+			if !strings.Contains(string(out), "Trino perf shape: "+tc.shape) {
+				t.Errorf("missing shape summary: %s", out)
+			}
+		})
+	}
+}
+
+func TestTrinoPerfShapeRejectsInvalidSelectionBeforeCloudCalls(t *testing.T) {
+	for _, env := range [][]string{
+		{"TRINO_PERF_SHAPE=unknown", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf"},
+		{"TRINO_PERF_SHAPE=large", "E2E_SUITE=neutral", "SCENARIO_NAME=posthog_frozen_perf"},
+		{"TRINO_PERF_SHAPE=scaleout", "E2E_SUITE=trino", "SCENARIO_NAME=full-suite"},
+	} {
+		for _, subcommand := range []string{"deploy", "test-scenario"} {
+			fakes := newRunSHFakes(t)
+			out, err := runSHCommand(t, fakes.binDir, subcommand, env...).CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "TRINO_PERF_SHAPE") {
+				t.Errorf("invalid shape accepted: %s", out)
+			}
+			if calls := fakes.calls(t); calls != "" {
+				t.Errorf("invalid shape performed cloud calls: %s", calls)
+			}
+		}
+	}
+}
+
+func TestTrinoPerfShapeProvenanceSurvivesDeployFailure(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	out, err := runSHCommand(t, fakes.binDir, "deploy", "TRINO_PERF_SHAPE=large", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf").CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "refusing to reuse") {
+		t.Fatalf("expected failed stack reset: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts", "trino-perf-shape.json")); err != nil {
+		t.Fatalf("failure lost provenance: %v", err)
+	}
+}
+
+func TestTrinoPerfShapeIncludedWithScenarioArtifacts(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	out, err := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/scenario:test", "TRINO_PERF_SHAPE=large-scaleout",
+		"E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf",
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("scenario failed: %v\n%s", err, out)
+	}
+	root := filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			if _, err := os.Stat(filepath.Join(root, entry.Name(), "trino-perf-shape.json")); err != nil {
+				t.Fatalf("scenario lost provenance: %v", err)
+			}
+			return
+		}
+	}
+	t.Fatal("missing scenario result directory")
+}
+
+func TestTrinoPerfShapeDoesNotBlockTeardown(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	out, err := runSHCommand(t, fakes.binDir, "teardown", "TRINO_PERF_SHAPE=invalid", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("invalid shape blocked teardown: %v\n%s", err, out)
+	}
+	if !strings.Contains(fakes.calls(t), "delete namespace duckgres-ci-pr-123") {
+		t.Fatal("teardown did not delete namespace")
+	}
+}
+
+func TestTrinoPerfShapeRejectsScenarioProvenanceMismatch(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	// Even a failed deployment leaves the shape selected for that attempt.
+	_, _ = runSHCommand(t, fakes.binDir, "deploy", "TRINO_PERF_SHAPE=large", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf").CombinedOutput()
+	priorCalls := fakes.calls(t)
+	out, err := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/scenario:test", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf",
+	).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "does not match recorded deployment") {
+		t.Fatalf("scenario accepted different deployment shape: %v\n%s", err, out)
+	}
+	if calls := fakes.calls(t); calls != priorCalls {
+		t.Fatal("mismatched scenario made cloud calls")
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(fakes.binDir), "scenario-artifacts", "trino-perf-shape.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(raw, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata["shape"] != "large" {
+		t.Fatalf("overwrote deployed shape: %s", raw)
 	}
 }
 
@@ -1987,7 +2152,12 @@ printf 'test-secret\n'
 
 	writeFake(t, binDir, "envsubst", `#!/usr/bin/env bash
 printf 'envsubst %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
-cat
+template="$(cat)"
+for token in $1; do
+  name="${token#\$}"
+  template="${template//\$\{$name\}/${!name}}"
+done
+printf '%s\n' "$template"
 `)
 
 	writeFake(t, binDir, "curl", `#!/usr/bin/env bash
@@ -2046,6 +2216,7 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"EKS_CLUSTER_NAME=test-cluster",
 		"AWS_REGION=us-east-1",
 		"E2E_SUITE=neutral",
+		"TRINO_PERF_SHAPE=baseline",
 		"SCENARIO_NAME=full-suite",
 		"SCENARIO_POD_IDENTITY_ROLE=",
 		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),

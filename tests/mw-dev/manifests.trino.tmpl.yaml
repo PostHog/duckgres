@@ -52,9 +52,9 @@ data:
     http-server.https.keystore.path=/etc/trino/tls/keystore.p12
     http-server.https.keystore.key=${ENV:TRINO_TLS_KEYSTORE_PASSWORD}
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=6GB
+    query.max-memory=${TRINO_QUERY_MEMORY}
     # The coordinator does not execute tasks and retains headroom in its 2G
-    # heap; execution workers carry the 2GB per-node allowance below.
+    # heap; execution workers carry the selected per-node allowance below.
     query.max-memory-per-node=1GB
     catalog.management=dynamic
     catalog.store=posthog
@@ -94,7 +94,7 @@ data:
     node.data-dir=/data/trino
   jvm.config: |
     -server
-    -Xmx3G
+    -Xmx${TRINO_WORKER_HEAP}
     -XX:+UseG1GC
     -XX:+ExitOnOutOfMemoryError
     -Dfile.encoding=UTF-8
@@ -102,8 +102,8 @@ data:
     coordinator=false
     http-server.http.port=8080
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=6GB
-    query.max-memory-per-node=2GB
+    query.max-memory=${TRINO_QUERY_MEMORY}
+    query.max-memory-per-node=${TRINO_QUERY_MEMORY_PER_NODE}
     shutdown.grace-period=10s
     catalog.management=dynamic
     internal-communication.shared-secret=${ENV:TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET}
@@ -261,11 +261,9 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 5
           resources:
-            requests: { cpu: "1", memory: 4Gi }
-            # Three replicas provide the same aggregate 3-CPU/12Gi execution
-            # budget as the frozen-perf Duckgres worker. Keep requests equal
-            # to limits so node contention cannot change the comparison.
-            limits: { cpu: "1", memory: 4Gi }
+            requests: { cpu: "${TRINO_WORKER_CPU}", memory: ${TRINO_WORKER_MEMORY} }
+            # Keep requests equal to limits for every experimental shape.
+            limits: { cpu: "${TRINO_WORKER_CPU}", memory: ${TRINO_WORKER_MEMORY} }
           volumeMounts:
             - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
             - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }

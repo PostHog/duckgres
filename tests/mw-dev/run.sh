@@ -36,6 +36,68 @@ case "$E2E_SUITE" in
 esac
 TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07}"
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
+TRINO_PERF_SHAPE="${TRINO_PERF_SHAPE:-baseline}"
+
+# Fixed experimental shapes keep worker sizing and aggregate memory limits in
+# sync. Do not accept independent resource overrides that would change the A/B.
+configure_trino_perf_shape() {
+  case "$TRINO_PERF_SHAPE" in
+    baseline) TRINO_WORKER_REPLICAS=3; TRINO_WORKER_CPU=1 ;;
+    large) TRINO_WORKER_REPLICAS=1; TRINO_WORKER_CPU=3 ;;
+    scaleout) TRINO_WORKER_REPLICAS=6; TRINO_WORKER_CPU=1 ;;
+    large-scaleout) TRINO_WORKER_REPLICAS=2; TRINO_WORKER_CPU=3 ;;
+    *) echo "TRINO_PERF_SHAPE must be baseline, large, scaleout, or large-scaleout (got $TRINO_PERF_SHAPE)" >&2; return 2 ;;
+  esac
+  if [ "$TRINO_PERF_SHAPE" != baseline ] && { [ "$SCENARIO_NAME" != posthog_frozen_perf ] || [ "$E2E_SUITE" != trino ]; }; then
+    echo "Nonbaseline TRINO_PERF_SHAPE requires SCENARIO_NAME=posthog_frozen_perf and E2E_SUITE=trino." >&2
+    return 2
+  fi
+  TRINO_WORKER_MEMORY="$((TRINO_WORKER_CPU * 4))Gi"
+  TRINO_WORKER_HEAP="$((TRINO_WORKER_CPU * 3))G"
+  TRINO_QUERY_MEMORY_PER_NODE="$((TRINO_WORKER_CPU * 2))GB"
+  TRINO_QUERY_MEMORY="$((TRINO_WORKER_REPLICAS * TRINO_WORKER_CPU * 2))GB"
+}
+
+trino_perf_shape_json() {
+  jq -n \
+    --arg shape "$TRINO_PERF_SHAPE" \
+    --argjson worker_replicas "$TRINO_WORKER_REPLICAS" \
+    --arg worker_cpu "$TRINO_WORKER_CPU" --arg worker_memory "$TRINO_WORKER_MEMORY" \
+    --arg worker_heap "$TRINO_WORKER_HEAP" \
+    --arg query_memory_per_node "$TRINO_QUERY_MEMORY_PER_NODE" --arg query_memory "$TRINO_QUERY_MEMORY" \
+    --argjson total_worker_cpu "$((TRINO_WORKER_REPLICAS * TRINO_WORKER_CPU))" \
+    --argjson total_worker_memory_gib "$((TRINO_WORKER_REPLICAS * TRINO_WORKER_CPU * 4))" \
+    --arg trino_image "$TRINO_IMAGE" --arg duckgres_worker_image "${WORKER_IMAGE:-}" \
+    --arg controlplane_image "${CONTROLPLANE_IMAGE:-}" --arg scenario_runner_image "${SCENARIO_RUNNER_IMAGE:-}" \
+    --arg duckgres_worker_cpu "$DUCKGRES_K8S_WORKER_CPU_REQUEST" \
+    --arg duckgres_worker_memory "$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" \
+    --arg git_sha "${GITHUB_SHA:-}" --arg run_id "${GITHUB_RUN_ID:-}" \
+    '$ARGS.named + {coordinator_cpu_request: "1", coordinator_cpu_limit: "2", coordinator_memory: "3Gi", coordinator_heap: "2G", coordinator_query_memory_per_node: "1GB", architecture: "arm64"}'
+}
+
+record_trino_perf_shape() {
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ] && [ "$E2E_SUITE" = trino ] || return 0
+  mkdir -p "$SCENARIO_ARTIFACTS_DIR"
+  trino_perf_shape_json > "$SCENARIO_ARTIFACTS_DIR/trino-perf-shape.json"
+  echo "Trino perf shape: $TRINO_PERF_SHAPE; $TRINO_WORKER_REPLICAS workers x $TRINO_WORKER_CPU CPU/$TRINO_WORKER_MEMORY; heap=$TRINO_WORKER_HEAP; query memory=$TRINO_QUERY_MEMORY_PER_NODE per worker, $TRINO_QUERY_MEMORY cluster"
+}
+
+verify_trino_perf_shape() {
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ] && [ "$E2E_SUITE" = trino ] || return 0
+  if [ -f "$SCENARIO_ARTIFACTS_DIR/trino-perf-shape.json" ]; then
+    # A separate test-scenario invocation must not silently relabel a stack
+    # deployed with another shape, image, resource budget, or workflow run.
+    # The runner image may be supplied only at test time; it does not size the
+    # deployed execution workers.
+    if ! jq -e --argjson expected "$(trino_perf_shape_json)" \
+        'del(.scenario_runner_image) == ($expected | del(.scenario_runner_image))' \
+        "$SCENARIO_ARTIFACTS_DIR/trino-perf-shape.json" >/dev/null; then
+      echo "TRINO_PERF_SHAPE configuration does not match recorded deployment; restore the deployment environment or redeploy with the requested shape." >&2
+      return 2
+    fi
+  fi
+  record_trino_perf_shape
+}
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -74,6 +136,7 @@ require_pr_identity() {
 }
 
 render() {
+  configure_trino_perf_shape
   : "${WORKER_IMAGE:?}" "${CONTROLPLANE_IMAGE:?}" "${PR_NUMBER:?}"
   ensure_secret_dir
   [ -f "$internal_secret_file" ] || (umask 077; openssl rand -hex 16 > "$internal_secret_file")
@@ -94,8 +157,11 @@ render() {
     TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
     TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
     TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
+    TRINO_WORKER_CPU="$TRINO_WORKER_CPU" TRINO_WORKER_MEMORY="$TRINO_WORKER_MEMORY" \
+    TRINO_WORKER_HEAP="$TRINO_WORKER_HEAP" TRINO_QUERY_MEMORY="$TRINO_QUERY_MEMORY" \
+    TRINO_QUERY_MEMORY_PER_NODE="$TRINO_QUERY_MEMORY_PER_NODE" \
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
-      envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64' \
+      envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $TRINO_WORKER_CPU $TRINO_WORKER_MEMORY $TRINO_WORKER_HEAP $TRINO_QUERY_MEMORY $TRINO_QUERY_MEMORY_PER_NODE' \
       < "$HERE/manifests.trino.tmpl.yaml"
   fi
 }
@@ -324,6 +390,8 @@ reset_pr_stack() {
 }
 
 cmd_deploy() {
+  configure_trino_perf_shape
+  record_trino_perf_shape
   reset_pr_stack
 
   echo "::group::Apply manifests ($NS)"
@@ -359,13 +427,11 @@ cmd_deploy() {
     # Patch the Deployment resources directly. The CI deployer intentionally
     # cannot patch the deployments/scale subresource, while it already needs
     # narrowly scoped Deployment patch access for the control-plane config.
-    # Three 1-CPU/4Gi workers match the frozen-perf Duckgres worker's
-    # aggregate 3-CPU/12Gi execution budget while exercising Trino's
-    # distributed path.
+    # Admit exactly the selected worker count after identity propagation.
     "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-coordinator \
       --type=merge -p '{"spec":{"replicas":1}}'
     "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-worker \
-      --type=merge -p '{"spec":{"replicas":3}}'
+      --type=merge -p "{\"spec\":{\"replicas\":$TRINO_WORKER_REPLICAS}}"
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
   fi
@@ -488,6 +554,8 @@ scenario_job_name() {
 }
 
 cmd_test_scenario() {
+  configure_trino_perf_shape
+  verify_trino_perf_shape
   local scenario_file scenario_name
   : "${SCENARIO_RUNNER_IMAGE:?SCENARIO_RUNNER_IMAGE is required}"
 
@@ -717,6 +785,13 @@ copy_scenario_artifacts() {
         failure_reason="${failure_reason}${failure_reason:+; }missing required scenario artifact $artifact"
       fi
     done
+    if [ "$copy_failed" -eq 0 ]; then
+      if [ "$SCENARIO_NAME" = posthog_frozen_perf ] && [ "$E2E_SUITE" = trino ] && \
+          ! cp "$SCENARIO_ARTIFACTS_DIR/trino-perf-shape.json" "$staging/trino-perf-shape.json"; then
+        copy_failed=1
+        failure_reason="failed to copy Trino shape provenance"
+      fi
+    fi
     if [ "$copy_failed" -eq 0 ]; then
       if mv "$staging" "$dest"; then
         echo "Copied scenario artifacts to $dest."

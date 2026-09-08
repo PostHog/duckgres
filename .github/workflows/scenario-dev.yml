@@ -1,4 +1,5 @@
 name: scenario-dev
+run-name: scenario-dev / ${{ inputs.scenario || 'posthog_frozen_perf' }} / Trino ${{ inputs.trino_perf_shape || 'baseline' }}
 
 on:
   workflow_dispatch:
@@ -13,6 +14,16 @@ on:
         required: false
         default: ""
         type: string
+      trino_perf_shape:
+        description: Trino execution shape (experiments require posthog_frozen_perf)
+        required: false
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - large
+          - scaleout
+          - large-scaleout
   schedule:
     - cron: "17 8 * * *"
 
@@ -63,6 +74,7 @@ jobs:
     timeout-minutes: 270
     env:
       SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}
+      TRINO_PERF_SHAPE: ${{ inputs.trino_perf_shape || 'baseline' }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
       WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
@@ -133,6 +145,17 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          shape_file=artifacts/scenario-dev/trino-perf-shape.json
+          if [ -f "$shape_file" ]; then
+            {
+              echo '## Trino execution shape'
+              echo
+              echo '```json'
+              cat "$shape_file"
+              echo '```'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           summary_file="$(find artifacts/scenario-dev -type f -name scenario_summary.md -print -quit 2>/dev/null || true)"
           if [ -n "$summary_file" ]; then
             cat "$summary_file" >> "$GITHUB_STEP_SUMMARY"
@@ -162,7 +185,9 @@ jobs:
           retention-days: 14
 
       - name: Publish scenario perf results
-        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        # Shape experiments remain downloadable artifacts; publishing them
+        # would mix different resource budgets into the daily baseline.
+        if: ${{ always() && github.ref == 'refs/heads/main' && env.TRINO_PERF_SHAPE == 'baseline' }}
         timeout-minutes: 10
         env:
           MW_DEV_SCENARIO_PERF_SECRET_ID: ${{ vars.MW_DEV_SCENARIO_PERF_SECRET_ID }}

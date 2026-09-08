@@ -57,6 +57,12 @@ The isolated control plane's default worker request is configurable through
 `scenario-dev.yml` explicitly overrides them to 3 CPU and 12Gi for the frozen
 perf workload. Direct `run.sh` callers can make the same explicit override.
 
+Manual frozen-perf runs can select `TRINO_PERF_SHAPE=baseline|large|scaleout|large-scaleout`
+(`trino_perf_shape` in workflow dispatch). The default remains `baseline` for
+scheduled runs and the Trino E2E lane. See the
+[Trino experiment runbook](../perf/README.md#trino-worker-shape-experiments)
+for resource budgets, result provenance, sequential comparison, and recovery.
+
 ### Scenario Trino readiness
 
 Scenarios that opt an org into Trino in their `provision_warehouse` request can
