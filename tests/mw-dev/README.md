@@ -59,7 +59,9 @@ perf workload. Direct `run.sh` callers can make the same explicit override.
 
 Manual frozen-perf runs can select `TRINO_PERF_SHAPE=baseline|large|scaleout|large-scaleout`
 (`trino_perf_shape` in workflow dispatch). The default remains `baseline` for
-scheduled runs and the Trino E2E lane. See the
+scheduled runs and the Trino E2E lane. Workflow dispatch also accepts `all` to
+run all four shapes sequentially with shared image builds and one comparison
+summary. Each shape receives a separate temporary stack and cleanup. See the
 [Trino experiment runbook](../perf/README.md#trino-worker-shape-experiments)
 for resource budgets, result provenance, sequential comparison, and recovery.
 

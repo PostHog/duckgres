@@ -142,7 +142,6 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"DUCKGRES_SCENARIO_CONFIG_SECRET",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET_NAME",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET_KEY",
-		"matrix:",
 		"trino.trino.svc",
 		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.",

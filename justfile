@@ -301,6 +301,7 @@ test:
 test-unit:
     go test -v -p 1 . ./configresolve/... ./duckdbservice/... ./server/... ./transpiler/... ./internal/... ./tests/manifests/...
     go test -v -count=1 ./tests/mw-dev/...
+    go test -v -count=1 ./tests/perf/shapecompare ./cmd/duckgres-perf-shape-summary
 
 # Run scenario runner unit tests
 [group('test')]

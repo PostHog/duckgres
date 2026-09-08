@@ -24,6 +24,7 @@ on:
           - large
           - scaleout
           - large-scaleout
+          - all
   schedule:
     - cron: "17 8 * * *"
 
@@ -36,7 +37,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.shapes.outputs.matrix }}
+    env:
+      SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}
+      TRINO_PERF_SHAPE: ${{ inputs.trino_perf_shape || 'baseline' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Select Trino shapes
+        id: shapes
+        run: |
+          matrix="$(bash scripts/scenario_trino_shapes.sh)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   scenario-runner-image:
+    needs: [plan]
     uses: ./.github/workflows/_image-build.yml
     with:
       dockerfile: tests/mw-dev/scenario/Dockerfile
@@ -48,6 +66,7 @@ jobs:
       ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
 
   duckgres-image:
+    needs: [plan]
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.duckgres_image == '' }}
     uses: ./.github/workflows/_image-build.yml
     with:
@@ -68,13 +87,20 @@ jobs:
       ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
 
   scenario:
-    needs: [scenario-runner-image, duckgres-image]
-    if: ${{ always() && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
+    name: scenario (${{ matrix.shape }})
+    needs: [plan, scenario-runner-image, duckgres-image]
+    if: ${{ always() && needs.plan.result == 'success' && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
+    strategy:
+      # Each job includes teardown. A fresh runner also refreshes credentials
+      # and the timeout budget before admitting the next shape.
+      max-parallel: 1
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
     env:
       SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}
-      TRINO_PERF_SHAPE: ${{ inputs.trino_perf_shape || 'baseline' }}
+      TRINO_PERF_SHAPE: ${{ matrix.shape }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
       WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
@@ -88,8 +114,8 @@ jobs:
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
       TRINO_IMAGE: ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07
       E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}
-      PR_NUMBER: ${{ github.run_id }}
-      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
+      PR_NUMBER: ${{ github.run_id }}${{ matrix.suffix }}
+      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.suffix }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
       # Add process headroom for repeated full-dataset pgwire aggregates.
@@ -107,7 +133,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Test scenario workflow scripts
-        run: go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev ./tests/perf/publishercli
+        run: go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev ./tests/perf/publishercli ./tests/perf/shapecompare ./cmd/duckgres-perf-shape-summary
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2
@@ -136,9 +162,11 @@ jobs:
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
       - name: Deploy isolated Duckgres stack
+        id: deploy
         run: tests/mw-dev/run.sh deploy
 
       - name: Run selected scenario
+        id: benchmark
         run: tests/mw-dev/run.sh test-scenario
 
       - name: Publish scenario summary
@@ -172,14 +200,28 @@ jobs:
         run: tests/mw-dev/run.sh diagnostics
 
       - name: Teardown
+        id: teardown
         if: always()
         run: tests/mw-dev/run.sh teardown
+
+      - name: Record shape outcome
+        if: always()
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          SCENARIO_OUTCOME: ${{ steps.benchmark.outcome }}
+          TEARDOWN_OUTCOME: ${{ steps.teardown.outcome }}
+        run: |
+          mkdir -p artifacts/scenario-dev
+          jq -n --arg shape "$TRINO_PERF_SHAPE" \
+            --arg deploy "$DEPLOY_OUTCOME" --arg scenario "$SCENARIO_OUTCOME" \
+            --arg teardown "$TEARDOWN_OUTCOME" \
+            '$ARGS.named' > artifacts/scenario-dev/shape-result.json
 
       - name: Upload scenario artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scenario-dev-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scenario-dev-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shape }}
           path: artifacts/scenario-dev/
           if-no-files-found: warn
           retention-days: 14
@@ -187,7 +229,7 @@ jobs:
       - name: Publish scenario perf results
         # Shape experiments remain downloadable artifacts; publishing them
         # would mix different resource budgets into the daily baseline.
-        if: ${{ always() && github.ref == 'refs/heads/main' && env.TRINO_PERF_SHAPE == 'baseline' }}
+        if: ${{ always() && github.ref == 'refs/heads/main' && env.TRINO_PERF_SHAPE == 'baseline' && inputs.trino_perf_shape != 'all' }}
         timeout-minutes: 10
         env:
           MW_DEV_SCENARIO_PERF_SECRET_ID: ${{ vars.MW_DEV_SCENARIO_PERF_SECRET_ID }}
@@ -220,3 +262,40 @@ jobs:
             fi
           done
           exit "$publish_failed"
+
+  compare-shapes:
+    needs: [plan, scenario]
+    if: ${{ always() && needs.plan.result == 'success' && inputs.trino_perf_shape == 'all' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+      - name: Download shape artifacts
+        # Missing uploads are reported as missing shapes by the comparison.
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: scenario-dev-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: artifacts/trino-shapes
+          merge-multiple: false
+      - name: Compare Trino shapes
+        run: go run ./cmd/duckgres-perf-shape-summary --artifacts-dir artifacts/trino-shapes > trino-shape-comparison.md
+      - name: Publish Trino shape comparison
+        if: always()
+        run: |
+          if [ -s trino-shape-comparison.md ]; then
+            cat trino-shape-comparison.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Trino shape comparison unavailable. Inspect the shape jobs and their artifacts.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload Trino shape comparison
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trino-shape-comparison-${{ github.run_id }}-${{ github.run_attempt }}
+          path: trino-shape-comparison.md
+          if-no-files-found: warn
+          retention-days: 14

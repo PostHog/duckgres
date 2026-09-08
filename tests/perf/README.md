@@ -96,28 +96,42 @@ Trino's default of 30% of the heap. Duckgres remains at 3 CPU / 12 GiB in the
 workflow, so only `baseline` and `large` match its execution resource budget.
 Coordinator and supporting-service resources are additional to the table.
 
-To run an experiment after merging, dispatch one shape at a time:
+Run the entire comparison with one dispatch on the PR branch (or `main` after
+merging):
 
 ```bash
-gh workflow run scenario-dev.yml --ref main \
+gh workflow run scenario-dev.yml --ref codex/trino-perf-shape-experiments \
   -f scenario=posthog_frozen_perf \
-  -f trino_perf_shape=large
+  -f trino_perf_shape=all
 ```
 
-Run `baseline`, `large`, `scaleout`, and `large-scaleout` sequentially from the
-same Git revision. Wait for each run's teardown before starting the next;
-GitHub concurrency groups serialize runs on the same ref but do not guarantee
-that multiple queued dispatches are retained. Use the same pinned Duckgres
-image through `duckgres_image` if the base branch changes between dispatches.
-For a PR trial, replace `main` with the PR branch. The Trino image remains
-pinned by the workflow. Compare identical query IDs and protocol labels from
-the current `balanced_v4` catalog; do not mix them with older methodology.
+`all` builds the runner and Duckgres images once, then runs the four shapes as
+a sequential matrix (`max-parallel: 1`). Each shape gets one temporary stack,
+the existing warmup and four measured iterations, and teardown before the next
+job starts. Numeric suffixes `1` through `4` on the workflow run ID give each
+shape a separate namespace and warehouse identity. Each job has its own
+270-minute timeout and fresh credentials. A failed shape does not cancel the
+remaining jobs. This is one measurement round, with no repeated deployments
+per shape. The Trino image remains pinned by the workflow.
+
+The final `compare-shapes` job presents Trino medians, baseline-relative
+speedups, and CPU-budget efficiency in one workflow summary and a downloadable
+`trino-shape-comparison-<run>-<attempt>` artifact. Missing or failed results and
+teardown failures are marked incomplete and fail the comparison job. Each
+shape's raw artifact is named `scenario-dev-<run>-<attempt>-<shape>` and includes
+`shape-result.json` with deployment, scenario, and teardown outcomes.
+
+Individual choices remain available: replace `all` with `baseline`, `large`,
+`scaleout`, or `large-scaleout`. Default and scheduled invocations execute just
+`baseline`. Compare identical query IDs and protocol labels from the current
+`balanced_v4` catalog; do not mix them with older methodology.
 
 The workflow title and summary identify the shape. The downloadable scenario
 artifact includes `trino-perf-shape.json` with configured resource and image
 provenance, including on deployment failure. A copy accompanies the collected
-scenario results. Nonbaseline experiments are artifact-only and do not publish
-to the daily baseline's historical tables. The SQL, cache settings, protocol
+scenario results. Nonbaseline experiments and the entire `all` comparison
+(including its baseline member) are artifact-only and do not publish to the
+daily baseline's historical tables. The SQL, cache settings, protocol
 order, warmup count, and measured iteration count are identical across shapes.
 
 Use per-query median latency and allocated CPU-seconds (total worker CPU times
@@ -128,13 +142,14 @@ instrumented cold-cache benchmark. A topology speedup alone does not distinguish
 GC, throttling, exchange traffic, scan throughput, or memory pressure: correlate
 with execution telemetry before attributing its cause.
 
-For local harness development, set `TRINO_PERF_SHAPE` to one of these choices
+For local harness development, set `TRINO_PERF_SHAPE` to one concrete shape
 alongside `SCENARIO_NAME=posthog_frozen_perf`, `E2E_SUITE=trino`, and the usual
 isolated-stack environment, and use that same environment for `run.sh deploy`
 and `run.sh test-scenario`. The test invocation checks any saved deployment
 provenance and rejects a different shape, resource budget, or deployment image;
 restore the deployment environment or redeploy before continuing. Use a separate
-`SCENARIO_ARTIFACTS_DIR` for each local stack. Install `jq` on the machine running `run.sh` to
+`SCENARIO_ARTIFACTS_DIR` for each local stack. `all` is a workflow selection,
+not a shape accepted by `run.sh`. Install `jq` on the machine running `run.sh` to
 write the JSON provenance (the GitHub runner already includes it). Explicitly
 set the Duckgres worker variables to
 `3` and `12Gi` to reproduce the workflow. The generic harness retains its
@@ -145,6 +160,10 @@ outside the isolated frozen-perf scenario are rejected before cloud mutations.
 If deployment or testing fails, inspect the selected shape artifact and pod
 events, then use the normal `run.sh teardown` with the same namespace and run
 identity. Teardown remains available even with a malformed shape selection.
+For an `all` run, use the suffixed `PR_NUMBER` and namespace shown in the failed
+shape job, not the unsuffixed workflow run ID. Rerun the whole workflow for a
+complete combined report; rerunning only failed jobs produces a new attempt
+with missing shape artifacts, which the comparison intentionally rejects.
 Rerun in a fresh isolated stack; a partially started worker pool is not a valid
 measurement. Restore `baseline` to return to the daily configuration.
 
