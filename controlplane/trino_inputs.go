@@ -144,6 +144,17 @@ type trinoCell struct {
 	ClientURL      string
 }
 
+// consoleCell names the existing deployment without changing its persisted ownership.
+func (c trinoCell) consoleCell() admin.TrinoCell {
+	return admin.TrinoCell{
+		ID:             "legacy",
+		StoredID:       c.ID,
+		CoordinatorURL: c.CoordinatorURL,
+		TLSServerName:  c.TLSServerName,
+		ClientURL:      c.ClientURL,
+	}
+}
+
 // resolveTrinoCell reads the single cell's configuration from the
 // environment. Returns an error when the coordinator URL is missing, which
 // is fatal for an operator who asked for Trino.
@@ -312,12 +323,7 @@ func buildTrinoWiring(
 		BundleHandler: bundleHandler,
 		Cell:          cell,
 		Console: &trinoConsoleWiring{
-			Cell: admin.TrinoCell{
-				ID:             cell.ID,
-				CoordinatorURL: cell.CoordinatorURL,
-				TLSServerName:  cell.TLSServerName,
-				ClientURL:      cell.ClientURL,
-			},
+			Cell: cell.consoleCell(),
 			// Read the credential through the provisioner on every call
 			// rather than capturing it here: the pair is regenerated if it
 			// ever goes missing, and a captured copy would 401 forever

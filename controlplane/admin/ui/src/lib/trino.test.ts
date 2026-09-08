@@ -60,7 +60,7 @@ function node(over: Partial<TrinoNode> = {}): TrinoNode {
 
 function status(over: Partial<TrinoStatus> = {}): TrinoStatus {
   return {
-    cell: { id: "cell-001", coordinator_url: "https://coordinator" },
+    cell: { id: "legacy", coordinator_url: "https://coordinator" },
     available: true,
     queries_by_state: {},
     blocked_queries: 0,
@@ -79,7 +79,7 @@ function org(over: Partial<TrinoOrgStatus> = {}): TrinoOrgStatus {
     principal: "db_a",
     catalog: "org_db_a",
     tier: "free",
-    cell: "cell-001",
+    cell: "legacy",
     state: "ready",
     running_queries: 0,
     queued_queries: 0,

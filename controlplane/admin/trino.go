@@ -46,10 +46,26 @@ type TrinoOrgStore interface {
 // (see controlplane/trino_inputs.go); every payload carries the id so the
 // SPA and its consumers are already cell-aware when a second one lands.
 type TrinoCell struct {
-	ID             string `json:"id"`
+	ID string `json:"id"`
+	// StoredID separates persisted ownership from the API identity. Empty uses ID.
+	StoredID       string `json:"-"`
 	CoordinatorURL string `json:"coordinator_url"`
 	TLSServerName  string `json:"-"`
 	ClientURL      string `json:"-"`
+}
+
+func (c TrinoCell) storedID() string {
+	if c.StoredID != "" {
+		return c.StoredID
+	}
+	return c.ID
+}
+
+func (c TrinoCell) publicID(storedID string) string {
+	if storedID != "" && storedID == c.storedID() {
+		return c.ID
+	}
+	return storedID
 }
 
 type TrinoConnection struct {
@@ -591,7 +607,9 @@ func (a *TrinoAPI) handleOrgs(c *gin.Context) {
 
 	out := make([]TrinoOrgStatus, 0, len(idx.rows))
 	for _, o := range idx.rows {
-		out = append(out, trinoOrgStatus(o, running[o.OrgID], queued[o.OrgID]))
+		status := trinoOrgStatus(o, running[o.OrgID], queued[o.OrgID])
+		status.Cell = a.cell.publicID(o.CellID)
+		out = append(out, status)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Org < out[j].Org })
 
@@ -651,8 +669,8 @@ func (a *TrinoAPI) handleOrgDetail(c *gin.Context) {
 	status.ReadyAt = row.ReadyAt
 	status.FailedAt = row.FailedAt
 	status.Tier = row.Tier
-	status.Cell = row.TrinoCellID
-	if available && status.State == string(configstore.ManagedWarehouseStateReady) && status.Cell == a.cell.ID {
+	status.Cell = a.cell.publicID(row.TrinoCellID)
+	if available && status.State == string(configstore.ManagedWarehouseStateReady) && row.TrinoCellID != "" && row.TrinoCellID == a.cell.storedID() {
 		status.Connection = a.cell.connectionFor(status.Principal)
 	}
 

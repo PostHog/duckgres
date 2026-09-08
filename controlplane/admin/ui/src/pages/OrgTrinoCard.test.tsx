@@ -16,7 +16,7 @@ function orgStatus(over: Partial<TrinoOrgStatus> = {}): TrinoOrgStatus {
     principal: "product_analytics",
     catalog: "org_product_analytics",
     tier: "free",
-    cell: "cell-001",
+    cell: "legacy",
     state: "ready",
     ready_at: "2026-08-01T10:00:00Z",
     running_queries: 2,
@@ -27,7 +27,7 @@ function orgStatus(over: Partial<TrinoOrgStatus> = {}): TrinoOrgStatus {
 
 function detail(over: Partial<TrinoOrgDetail> = {}): TrinoOrgDetail {
   return {
-    cell: { id: "cell-001", coordinator_url: "https://coordinator" },
+    cell: { id: "legacy", coordinator_url: "https://coordinator" },
     enabled: true,
     available: true,
     status: orgStatus(),
@@ -61,6 +61,7 @@ describe("OrgTrinoCard", () => {
     expect(screen.getByText("product_analytics")).toBeInTheDocument();
     expect(screen.getByText("org_product_analytics")).toBeInTheDocument();
     expect(screen.getByText("ready")).toBeInTheDocument();
+    expect(screen.getByText("legacy")).toBeInTheDocument();
   });
 
   it("surfaces the reconcile failure message, which is the actionable part", () => {

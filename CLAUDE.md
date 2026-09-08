@@ -1680,6 +1680,13 @@ password/tenant/catalog changes never propagate.
   and deliberately no assignment policy, capacity model, rebalancer or cell
   drain; `resolveTrinoCell` becoming `resolveTrinoCells` is the whole shape of
   adding a second.
+- **The existing deployment's API identity is `legacy`.** The Trino console
+  exposes this name in `cell.id` and in owned orgs' `status.cell` / `orgs[].cell`.
+  `TrinoCell.StoredID` keeps the configured ownership ID private to the adapter.
+  Match connection readiness against the raw persisted ID, never the alias.
+  Do not rename org assignments, catalog-store keys or environment settings.
+  The general org endpoint still exposes the original `trino.trino_cell_id`.
+  Unknown and unassigned ownership values are not relabeled.
 - **The bundle endpoint is mounted OUTSIDE `/api/v1`** (`/bundles/trino`) with
   its own bearer auth, and `buildTrinoWiring` bootstraps SYNCHRONOUSLY so the
   handler is constructed with the real token — there is no window where it

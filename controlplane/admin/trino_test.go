@@ -596,6 +596,54 @@ func TestReadyOrgDetailReturnsTenantClientConnection(t *testing.T) {
 	}
 }
 
+func TestTrinoCellAPIAliasPreservesStoredOwnership(t *testing.T) {
+	for _, storedID := range []string{"stored-cell", "another-cell", "legacy", ""} {
+		t.Run("stored="+storedID, func(t *testing.T) {
+			store := &fakeTrinoOrgStore{
+				orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "db_a", CellID: storedID, State: configstore.ManagedWarehouseStateReady}},
+				rows: map[string]*configstore.ManagedWarehouseTrino{
+					"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: storedID, State: configstore.ManagedWarehouseStateReady},
+				},
+			}
+			cell := TrinoCell{ID: "legacy", StoredID: "stored-cell", CoordinatorURL: "https://coordinator.example.test"}
+			api := NewTrinoAPI(cell, &fakeTrinoCoordinator{}, store, nil)
+			router := trinoTestRouter(api, RoleViewer)
+			wantID := storedID
+			if storedID == "stored-cell" {
+				wantID = "legacy"
+			}
+			for _, endpoint := range []string{"/api/v1/orgs/org-a/trino", "/api/v1/trino/orgs"} {
+				code, body := doTrinoJSON(t, router, http.MethodGet, endpoint, "")
+				if code != http.StatusOK {
+					t.Fatalf("%s: status %d", endpoint, code)
+				}
+				if body["cell"].(map[string]any)["id"] != "legacy" {
+					t.Fatalf("API cell identity: %+v", body)
+				}
+				var status map[string]any
+				if endpoint == "/api/v1/trino/orgs" {
+					status = body["orgs"].([]any)[0].(map[string]any)
+				} else {
+					status = body["status"].(map[string]any)
+					_, connected := status["connection"]
+					if connected != (storedID == "stored-cell") {
+						t.Fatalf("connection must match persisted ownership: %+v", status)
+					}
+				}
+				if status["cell"] != wantID {
+					t.Fatalf("status cell = %v, want %s", status["cell"], wantID)
+				}
+				if identity := body["cell"].(map[string]any); len(identity) != 2 || identity["coordinator_url"] != cell.CoordinatorURL {
+					t.Fatalf("unexpected public identity fields: %+v", identity)
+				}
+			}
+			if store.rows["org-a"].TrinoCellID != storedID || store.orgs[0].CellID != storedID {
+				t.Fatal("API alias mutated persisted ownership")
+			}
+		})
+	}
+}
+
 // TestOrgDetailNotEnabledIsNotAnError: most orgs have no Trino row, and
 // the org page renders a "not enabled" state rather than a failure.
 func TestOrgDetailNotEnabledIsNotAnError(t *testing.T) {

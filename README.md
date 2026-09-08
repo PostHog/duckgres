@@ -9,6 +9,7 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 ## Table of Contents
 
 - [Features](#features)
+- [Trino API identity](#trino-api-identity)
 - [Metrics](#metrics)
 - [Runbooks](#runbooks)
   - [Perf Runbook](docs/perf-harness-runbook.md)
@@ -58,6 +59,16 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 - **Control Plane Mode**: Multi-process architecture with long-lived workers, zero-downtime deployments, and rolling updates
 - **Flexible Configuration**: YAML config files, environment variables, and CLI flags
 - **Prometheus Metrics**: Built-in metrics endpoint for monitoring
+
+## Trino API identity
+
+The existing Trino deployment appears as `legacy` in the Trino console API.
+This name does not change its stored org assignments or catalog-store key.
+`DUCKGRES_TRINO_CELL_ID` remains the ownership setting, with the existing default
+`cell-001`; do not change it to `legacy` to match the API display name.
+Connection details remain readiness-gated and use the existing endpoint.
+See the [Trino admin API documentation](controlplane/admin/README.md#trino-cell-views-trinogo--trino_clientgo)
+for local verification, compatibility details, and recovery instructions.
 
 ## Metrics
 
