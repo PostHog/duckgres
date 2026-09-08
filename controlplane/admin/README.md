@@ -190,6 +190,21 @@ API, as a dedicated **observer principal** (`opa.ObserverPrincipal` =
 `__duckgres_observer`) that the provisioner mints alongside the admin pair
 and projects into `password.db` / `group.db`.
 
+The existing deployment appears as `legacy` in the Trino API's `cell.id` and
+its owned orgs' `status.cell` / `orgs[].cell`. This is an API alias, not a storage
+migration: `DUCKGRES_TRINO_CELL_ID`, persisted org assignments, and Trino's
+catalog-store key retain their existing values. The general org endpoint still
+returns the persisted `trino.trino_cell_id`. Unassigned and foreign-cell rows
+retain their original IDs and receive no connection details. This change adds
+no cell selection or tenant migration endpoint.
+
+For local verification, run `just test-controlplane-k8s` and `just ui-test`.
+The isolated Trino end-to-end suite checks both the API alias and unchanged
+persisted ownership. If connection details disappear after an upgrade, check
+the org's persisted ID against the configured `DUCKGRES_TRINO_CELL_ID`; do not
+rename stored IDs to match the API alias. Roll back the application version if
+an API consumer requires the previous displayed ID.
+
 - **Why a second principal.** Trino routes operator reads through the same
   access-control SPI as everything else — `GET /v1/query` filters through
   `FilterViewQueryOwnedBy`, `/v1/query/{id}` is gated on `ViewQueryOwnedBy`,

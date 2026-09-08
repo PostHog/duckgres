@@ -94,9 +94,12 @@ wait_trino() { # org expected-principal expected-catalog
     body="$(api "$API/api/v1/orgs/$1/trino" 2>/dev/null || true)"
     state="$(printf %s "$body" | jq -r '.status.state // empty' 2>/dev/null || true)"
     if [ "$state" = ready ]; then
-      printf %s "$body" | jq -e --arg p "$2" --arg c "$3" --arg cell "ci-pr-$PR" --arg host "duckgres-trino.$NS.svc" \
+      printf %s "$body" | jq -e --arg p "$2" --arg c "$3" --arg cell legacy --arg host "duckgres-trino.$NS.svc" \
         '.enabled == true and .available == true and .status.principal == $p and .status.catalog == $c and .status.cell == $cell and .status.tier == "free" and .status.connection.host == $host and .status.connection.port == 8443 and .status.connection.username == $p and (.status.connection | has("password") | not)' >/dev/null \
         || fail "$1 Trino status identity mismatch: $body"
+      api "$API/api/v1/orgs/$1" | jq -e --arg stored_cell "ci-pr-$PR" \
+        '.trino.trino_cell_id == $stored_cell' >/dev/null \
+        || fail "$1 legacy API identity changed persisted Trino ownership"
       TRINO="https://$(printf %s "$body" | jq -r '.status.connection.host'):$(printf %s "$body" | jq -r '.status.connection.port')"
       return 0
     fi
@@ -214,10 +217,10 @@ must_fail "$DB_B" "$pw_b" "DROP TABLE $CAT_A.$schema.$table" 'denied|access|cata
 [ "$(scalar "$DB_A" "$pw_a" "SELECT count(*) FROM $CAT_A.$schema.$table")" = 1 ] || fail "cross-tenant attempts changed tenant A data"
 
 log "admin Trino fleet/org/query surfaces"
-api "$API/api/v1/trino/status" | jq -e --arg cell "ci-pr-$PR" '.available == true and .cell.id == $cell' >/dev/null
+api "$API/api/v1/trino/status" | jq -e --arg cell legacy '.available == true and .cell.id == $cell' >/dev/null
 api "$API/api/v1/trino/nodes" | jq -e '.available == true and (.nodes | length) >= 2' >/dev/null
 api "$API/api/v1/trino/orgs" | jq -e --arg a "$ORG_A" --arg b "$ORG_B" \
-  'any(.orgs[]; .org == $a and .state == "ready") and any(.orgs[]; .org == $b and .state == "ready")' >/dev/null
+  'any(.orgs[]; .org == $a and .state == "ready" and .cell == "legacy") and any(.orgs[]; .org == $b and .state == "ready" and .cell == "legacy")' >/dev/null
 queries="$(api "$API/api/v1/trino/queries?org=$ORG_A")"
 printf %s "$queries" | jq -e --arg a "$ORG_A" --arg table "$table" \
   'all(.queries[]; .org == $a) and any(.queries[]; .query | contains($table))' >/dev/null \

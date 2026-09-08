@@ -54,7 +54,7 @@ function query(over: Partial<TrinoQuery> = {}): TrinoQuery {
 
 function status(over: Partial<TrinoStatus> = {}): TrinoStatus {
   return {
-    cell: { id: "cell-001", coordinator_url: "https://coordinator" },
+    cell: { id: "legacy", coordinator_url: "https://coordinator" },
     available: true,
     queries_by_state: {},
     blocked_queries: 0,
