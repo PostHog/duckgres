@@ -264,6 +264,43 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 	}
 }
 
+func TestExecutorRunsFrozenCatalogTrinoOnly(t *testing.T) {
+	state := provision.NewState()
+	state.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{Password: "test-password"})
+	state.StoreTrinoStatus("scenario-org", provision.TrinoStatus{
+		Cell:    provision.TrinoCell{ID: "test-cell", CoordinatorURL: "https://trino.example.test:8443"},
+		Enabled: true, Available: true,
+		Status: &provision.TrinoOrgStatus{
+			Org: "scenario-org", Cell: "test-cell", Principal: "test-principal", Catalog: "test_catalog", State: provision.WarehouseStateReady,
+		},
+	})
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{
+		ProvisionState: state, OutputDir: t.TempDir(), DriverFactory: factory,
+	})
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID: "perf_queries", Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id": "scenario-org", "run_id": "test-run",
+			"catalog_file": filepath.Join("..", "..", "..", "perf", "queries", "ducklake_posthog_tables.yaml"),
+			"targets":      []any{"trino"}, "trino_ca_cert_file": "/tmp/test-ca.crt",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if factory.pgwireDriver != nil || factory.athenaDriver != nil || factory.trinoDriver == nil {
+		t.Fatal("Trino-only must not initialize non-Trino drivers")
+	}
+	result, ok := executor.State().Result("perf_queries")
+	if !ok || result.Summary.WarmupQueries != 7 || result.Summary.TotalQueries != 28 || result.Summary.TotalErrors != 0 {
+		t.Fatalf("expected seven warmups and four measurements per Trino query: %+v", result)
+	}
+	if !factory.trinoDriver.closed {
+		t.Fatal("Trino driver was not closed")
+	}
+}
+
 func TestExecutorBuildsAthenaDriverFromExplicitOnDemandConfig(t *testing.T) {
 	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolAthena})
 	provisionState := provision.NewState()

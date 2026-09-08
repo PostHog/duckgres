@@ -66,9 +66,15 @@ func TestScenarioWorkflowTrinoShapeExperiments(t *testing.T) {
 	if plan.Env["TRINO_PERF_SHAPE"] != "${{ inputs.trino_perf_shape || 'baseline' }}" {
 		t.Fatal("scheduled/default runs must plan a single baseline shape")
 	}
-	var foundPublish, foundSummary bool
+	var foundPublish, foundSummary, foundAthena bool
 	var teardownIndex, outcomeIndex, uploadIndex = -1, -1, -1
 	for i, step := range job.Steps {
+		if step.Name == "Load Athena perf configuration" {
+			foundAthena = true
+			if step.If != "env.SCENARIO_NAME == 'posthog_frozen_perf' && matrix.shape == 'baseline'" {
+				t.Fatalf("only baseline needs Athena configuration: %s", step.If)
+			}
+		}
 		if step.Name == "Publish scenario perf results" {
 			foundPublish = true
 			if step.If != "${{ always() && github.ref == 'refs/heads/main' && env.TRINO_PERF_SHAPE == 'baseline' && inputs.trino_perf_shape != 'all' }}" {
@@ -99,7 +105,7 @@ func TestScenarioWorkflowTrinoShapeExperiments(t *testing.T) {
 			}
 		}
 	}
-	if !foundPublish || !foundSummary {
+	if !foundPublish || !foundSummary || !foundAthena {
 		t.Fatal("missing summary or performance publication step")
 	}
 	if teardownIndex < 0 || outcomeIndex <= teardownIndex || uploadIndex <= outcomeIndex {

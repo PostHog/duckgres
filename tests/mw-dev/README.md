@@ -61,7 +61,13 @@ Manual frozen-perf runs can select `TRINO_PERF_SHAPE=baseline|large|scaleout|lar
 (`trino_perf_shape` in workflow dispatch). The default remains `baseline` for
 scheduled runs and the Trino E2E lane. Workflow dispatch also accepts `all` to
 run all four shapes sequentially with shared image builds and one comparison
-summary. Each shape receives a separate temporary stack and cleanup. See the
+summary. Each shape receives a separate temporary stack and cleanup. Baseline
+runs the full cross-engine benchmark; nonbaseline shapes measure only Trino,
+with identical SQL, warmup, and measured iterations, while retaining setup and
+validation. The harness derives `DUCKGRES_SCENARIO_PERF_MODE=full` or
+`trino-only` from the shape and records it in provenance; an inherited value
+cannot override it. Nonbaseline shapes need no Athena configuration or scenario
+Pod Identity role. See the
 [Trino experiment runbook](../perf/README.md#trino-worker-shape-experiments)
 for resource budgets, result provenance, sequential comparison, and recovery.
 

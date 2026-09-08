@@ -52,6 +52,12 @@ configure_trino_perf_shape() {
     echo "Nonbaseline TRINO_PERF_SHAPE requires SCENARIO_NAME=posthog_frozen_perf and E2E_SUITE=trino." >&2
     return 2
   fi
+  # Benchmark selection follows the validated shape, not inherited environment:
+  # keep cross-engine reference measurements once, then vary only Trino.
+  DUCKGRES_SCENARIO_PERF_MODE=full
+  if [ "$TRINO_PERF_SHAPE" != baseline ]; then
+    DUCKGRES_SCENARIO_PERF_MODE=trino-only
+  fi
   TRINO_WORKER_MEMORY="$((TRINO_WORKER_CPU * 4))Gi"
   TRINO_WORKER_HEAP="$((TRINO_WORKER_CPU * 3))G"
   TRINO_QUERY_MEMORY_PER_NODE="$((TRINO_WORKER_CPU * 2))GB"
@@ -61,6 +67,7 @@ configure_trino_perf_shape() {
 trino_perf_shape_json() {
   jq -n \
     --arg shape "$TRINO_PERF_SHAPE" \
+    --arg perf_mode "$DUCKGRES_SCENARIO_PERF_MODE" \
     --argjson worker_replicas "$TRINO_WORKER_REPLICAS" \
     --arg worker_cpu "$TRINO_WORKER_CPU" --arg worker_memory "$TRINO_WORKER_MEMORY" \
     --arg worker_heap "$TRINO_WORKER_HEAP" \
@@ -405,7 +412,7 @@ cmd_deploy() {
   ensure_pod_identity
   restart_cp_with_identity
 
-  if [ "$SCENARIO_NAME" = "posthog_frozen_perf" ]; then
+  if [ "$SCENARIO_NAME" = "posthog_frozen_perf" ] && [ "$DUCKGRES_SCENARIO_PERF_MODE" = full ]; then
     ensure_scenario_pod_identity
   fi
 
@@ -617,6 +624,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
+            - { name: DUCKGRES_SCENARIO_PERF_MODE, value: "$DUCKGRES_SCENARIO_PERF_MODE" }
             - { name: DUCKGRES_SCENARIO_ATHENA_REGION, value: "$AWS_REGION" }
             - { name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: "${DUCKGRES_SCENARIO_ATHENA_WORKGROUP:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: "${DUCKGRES_SCENARIO_ATHENA_DATABASE:-}" }

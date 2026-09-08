@@ -50,6 +50,113 @@ func TestGenerateUsesMedianAndIgnoresOtherProtocolLatency(t *testing.T) {
 	}
 }
 
+func TestGenerateFullBaselineAndTrinoOnlyExperiments(t *testing.T) {
+	dir := mixedProtocolFixture(t)
+	got, err := Generate(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Comparison complete",
+		"Only Trino measurements contribute to latency and speedup comparisons; baseline artifacts may also include other engines.",
+		"| large | 2.00× | 200.0% |",
+		"| large-scaleout | 4.00× | 200.0% |",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "__ducklake_table |") != 7 || strings.Contains(got, "__raw_view") {
+		t.Fatalf("comparison must contain exactly the seven Trino table queries:\n%s", got)
+	}
+}
+
+func TestGenerateMixedProtocolsStillRejectsIncompleteMeasurements(t *testing.T) {
+	dir := mixedProtocolFixture(t)
+	mutateCSV(t, dir, func(rows [][]string) [][]string { return rows[:len(rows)-1] })
+	writeJSON(t, filepath.Join(dir, "artifact-large", "scenario", "perf", "summary.json"), map[string]any{
+		"total_queries": 27, "warmup_queries": 7, "total_errors": 0, "dataset_version": "fixture",
+	})
+	got, err := Generate(dir)
+	if err == nil || !strings.Contains(got, "incomplete measured iterations") {
+		t.Fatalf("missing fourth Trino iteration must fail comparison: err=%v\n%s", err, got)
+	}
+}
+
+func TestGenerateValidatesDeclaredPerfMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, want string
+	}{
+		{"unknown mode", "unknown", "missing or inconsistent resource provenance"},
+		{"Trino-only with other protocols", "trino-only", "query protocol does not match declared perf mode"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := mixedProtocolFixture(t)
+			setPerfMode(t, dir, "baseline", tc.mode)
+			got, err := Generate(dir)
+			if err == nil || !strings.Contains(got, tc.want) {
+				t.Fatalf("invalid declared mode must fail: err=%v\n%s", err, got)
+			}
+		})
+	}
+}
+
+func setPerfMode(t *testing.T, dir, shape, mode string) {
+	t.Helper()
+	path := filepath.Join(dir, "artifact-"+shape, "trino-perf-shape.json")
+	var metadata map[string]any
+	if err := readJSON(path, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	metadata["perf_mode"] = mode
+	writeJSON(t, path, metadata)
+}
+
+func mixedProtocolFixture(t *testing.T) string {
+	t.Helper()
+	dir := completeFixture(t)
+	queries := []string{
+		"events_total", "events_count_one_day", "events_by_name_march_2026",
+		"events_distinct_persons", "persons_total", "persons_daily_april_2026", "events_daily_march_2026",
+	}
+	type protocolVariant struct{ protocol, representation string }
+	for _, s := range shapes {
+		mode := "trino-only"
+		variants := []protocolVariant{{"trino", "ducklake_table"}}
+		if s.name == "baseline" {
+			mode = "full"
+			variants = append(variants,
+				protocolVariant{"pgwire_uncached", "raw_view"},
+				protocolVariant{"pgwire_uncached", "ducklake_table"},
+				protocolVariant{"pgwire_cached", "raw_view"},
+				protocolVariant{"pgwire_cached", "ducklake_table"},
+				protocolVariant{"athena", "athena_external"},
+			)
+		}
+		setPerfMode(t, dir, s.name, mode)
+		rows := [][]string{{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at"}}
+		for _, variant := range variants {
+			ms := "1" // Non-Trino timings must not affect shape speedups.
+			if variant.protocol == "trino" {
+				ms = map[string]string{"baseline": "10000", "large": "5000", "scaleout": "5000", "large-scaleout": "2500"}[s.name]
+			}
+			for _, query := range queries {
+				for iteration := 1; iteration <= 4; iteration++ {
+					rows = append(rows, []string{"q_" + query + "_balanced_v4__" + variant.representation, "intent_" + query, strconv.Itoa(iteration), variant.protocol, "ok", "", "", "1", ms, "2026-01-01T00:00:00Z"})
+				}
+			}
+		}
+		perf := filepath.Join(dir, "artifact-"+s.name, "scenario", "perf")
+		// The runner counts warmups in summary.json but emits only measured
+		// executions to query_results.csv: baseline 42/168; experiments 7/28.
+		writeJSON(t, filepath.Join(perf, "summary.json"), map[string]any{
+			"total_queries": len(rows) - 1, "warmup_queries": len(variants) * len(queries), "total_errors": 0, "dataset_version": "fixture",
+		})
+		writeCSV(t, filepath.Join(perf, "query_results.csv"), rows)
+	}
+	return dir
+}
+
 func TestGenerateIncompleteAndUnsafeArtifacts(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

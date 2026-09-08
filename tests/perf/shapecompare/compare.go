@@ -95,6 +95,7 @@ func Generate(dir string) (string, error) {
 	}
 	var out strings.Builder
 	out.WriteString("## Trino worker-shape comparison\n\n")
+	out.WriteString("Only Trino measurements contribute to latency and speedup comparisons; baseline artifacts may also include other engines.\n\n")
 	out.WriteString("| Shape | Execution workers | Status |\n|---|---|---|\n")
 	for _, s := range shapes {
 		r := results[s.name]
@@ -188,8 +189,13 @@ func load(root string, s shape) result {
 		TotalCPU    int    `json:"total_worker_cpu"`
 		TotalMemory int    `json:"total_worker_memory_gib"`
 		Image       string `json:"trino_image"`
+		PerfMode    string `json:"perf_mode"`
 	}
 	if readJSON(filepath.Join(root, "trino-perf-shape.json"), &provenance) != nil || provenance.Shape != s.name || provenance.Replicas != s.replicas || provenance.CPU != strconv.Itoa(s.cpu) || provenance.TotalCPU != s.replicas*s.cpu || provenance.TotalMemory != s.replicas*s.cpu*4 || provenance.Image == "" {
+		return fail("missing or inconsistent resource provenance")
+	}
+	// Older experiment artifacts predate perf_mode and remain comparable.
+	if provenance.PerfMode != "" && provenance.PerfMode != "full" && provenance.PerfMode != "trino-only" {
 		return fail("missing or inconsistent resource provenance")
 	}
 	var scenarioFiles []string
@@ -237,6 +243,9 @@ func load(root string, s shape) result {
 	for _, row := range rows[1:] {
 		if len(row) != len(header) {
 			return fail("failed or invalid query result")
+		}
+		if provenance.PerfMode == "trino-only" && row[3] != "trino" {
+			return fail("query protocol does not match declared perf mode")
 		}
 		ms, msErr := strconv.ParseFloat(row[8], 64)
 		iteration, iterationErr := strconv.Atoi(row[2])

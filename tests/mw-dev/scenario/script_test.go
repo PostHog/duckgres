@@ -67,6 +67,72 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	}
 }
 
+func TestScenarioRunScriptPerfModePreflight(t *testing.T) {
+	for _, tc := range []struct {
+		name, mode, scenario, missing, want string
+		execute                             bool
+	}{
+		{name: "trino-only needs no Athena", mode: "trino-only"},
+		{name: "Trino-only reaches Go without Athena", mode: "trino-only", execute: true},
+		{name: "full still requires Athena", mode: "full", want: "DUCKGRES_SCENARIO_ATHENA_WORKGROUP"},
+		{name: "default still requires Athena", want: "DUCKGRES_SCENARIO_ATHENA_WORKGROUP"},
+		{name: "Trino CA still required", mode: "trino-only", missing: "DUCKGRES_SCENARIO_TRINO_CA_CERT", want: "DUCKGRES_SCENARIO_TRINO_CA_CERT"},
+		{name: "invalid mode", mode: "other", want: "DUCKGRES_SCENARIO_PERF_MODE"},
+		{name: "invalid mode does not reach Go", mode: "other", want: "DUCKGRES_SCENARIO_PERF_MODE", execute: true},
+		{name: "wrong scenario", mode: "trino-only", scenario: "provision_smoke", want: "trino-only requires"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scenario := tc.scenario
+			if scenario == "" {
+				scenario = "posthog_frozen_perf"
+			}
+			binDir := t.TempDir()
+			marker := filepath.Join(binDir, "external-call")
+			for _, bin := range []string{"go", "aws", "kubectl"} {
+				if err := os.WriteFile(filepath.Join(binDir, bin), []byte("#!/bin/sh\ntouch \"$TEST_EXTERNAL_CALL\"\nexit 99\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(binDir, "go"), []byte("#!/bin/sh\nprintf '%s\\n' \"$DUCKGRES_SCENARIO_PERF_MODE\" \"$*\" > \"$TEST_EXTERNAL_CALL\"\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{filepath.Join("..", "..", "..", "scripts", "scenario_run.sh")}
+			if !tc.execute {
+				args = append(args, "--check-env")
+			}
+			args = append(args, "tests/mw-dev/scenario/scenarios/"+scenario+".yaml")
+			cmd := exec.Command("bash", args...)
+			cmd.Env = []string{"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"), "TEST_EXTERNAL_CALL=" + marker, "DUCKGRES_SCENARIO_PERF_MODE=" + tc.mode}
+			for key, value := range map[string]string{
+				"DUCKGRES_SCENARIO_API_BASE": "http://127.0.0.1", "DUCKGRES_SCENARIO_INTERNAL_SECRET": "test-secret",
+				"DUCKGRES_SCENARIO_PG_HOST": "127.0.0.1", "DUCKGRES_SCENARIO_SNI_SUFFIX": ".dev.example",
+				"DUCKGRES_SCENARIO_ORG_ID": "test-org", "DUCKGRES_SCENARIO_FROZEN_S3_URI": "s3://example/frozen/",
+				"DUCKGRES_SCENARIO_TRINO_CA_CERT": "/tmp/test-ca.crt", "DUCKGRES_K8S_WORKER_CPU_REQUEST": "3",
+				"DUCKGRES_K8S_WORKER_MEMORY_REQUEST": "12Gi",
+			} {
+				if key != tc.missing {
+					cmd.Env = append(cmd.Env, key+"="+value)
+				}
+			}
+			out, err := cmd.CombinedOutput()
+			if tc.want == "" && err != nil {
+				t.Fatalf("preflight should succeed: %v\n%s", err, out)
+			}
+			if tc.want != "" && (err == nil || !strings.Contains(string(out), tc.want)) {
+				t.Fatalf("preflight should reject with %q: %v\n%s", tc.want, err, out)
+			}
+			if tc.execute && tc.want == "" {
+				call, err := os.ReadFile(marker)
+				if err != nil || !strings.Contains(string(call), "trino-only\ntest -count=1 ./tests/mw-dev/scenario") {
+					t.Fatalf("entrypoint did not invoke Go with inherited Trino-only mode: %v\n%s", err, call)
+				}
+			} else if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("preflight made an external call: %v", err)
+			}
+		})
+	}
+}
+
 func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	workflowPath := filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml")
 	raw, err := os.ReadFile(workflowPath)

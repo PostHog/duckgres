@@ -1012,7 +1012,45 @@ func loadScenarioForRun(path string) (core.Scenario, string, error) {
 	if err != nil {
 		return core.Scenario{}, "", err
 	}
+	scenario, err = selectPerfMode(scenario, os.Getenv("DUCKGRES_SCENARIO_PERF_MODE"))
+	if err != nil {
+		return core.Scenario{}, "", err
+	}
 	return resolveScenarioFilePaths(scenario, filepath.Dir(absPath)), absPath, nil
+}
+
+// Select targets before required-env validation and template resolution, so a
+// Trino-only experiment does not need credentials for engines it never runs.
+// The shared catalog and all provisioning/validation/cleanup steps stay intact.
+func selectPerfMode(s core.Scenario, mode string) (core.Scenario, error) {
+	if mode == "" || mode == "full" {
+		return s, nil
+	}
+	if mode != "trino-only" || s.Name != "posthog-frozen-perf" {
+		return core.Scenario{}, fmt.Errorf("DUCKGRES_SCENARIO_PERF_MODE must be full, or trino-only for posthog-frozen-perf")
+	}
+	out := s
+	out.RequiredEnv = make([]string, 0, len(s.RequiredEnv))
+	for _, key := range s.RequiredEnv {
+		if !strings.HasPrefix(key, "DUCKGRES_SCENARIO_ATHENA_") {
+			out.RequiredEnv = append(out.RequiredEnv, key)
+		}
+	}
+	out.Steps = make([]core.Step, len(s.Steps))
+	for i, step := range s.Steps {
+		if step.Type == scenarioperf.StepTypePerfQueries {
+			with := make(map[string]any, len(step.With))
+			for key, value := range step.With {
+				if !strings.HasPrefix(key, "athena_") {
+					with[key] = value
+				}
+			}
+			with["targets"] = []any{"trino"}
+			step.With = with
+		}
+		out.Steps[i] = step
+	}
+	return out, nil
 }
 
 func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {

@@ -21,6 +21,7 @@ Optional environment:
   DUCKGRES_SCENARIO_DBT_BIN
   DUCKGRES_SCENARIO_MAX_RUNTIME
   DUCKGRES_SCENARIO_GO_TEST_TIMEOUT
+  DUCKGRES_SCENARIO_PERF_MODE      (default: full; trino-only for posthog-frozen-perf)
 
 Scenario-specific required environment:
   DUCKGRES_SCENARIO_ORG_ID       (required by successful provisioning scenarios)
@@ -83,6 +84,29 @@ root_relative_path() {
 scenario_file="$(root_relative_path "$scenario_file")"
 output_base="$(root_relative_path "$output_base")"
 
+# Keep preflight aligned with the Go scenario loader: Trino-only removes the
+# Athena target and its environment requirements before template resolution.
+perf_mode="${DUCKGRES_SCENARIO_PERF_MODE:-full}"
+case "$perf_mode" in
+  full) ;;
+  trino-only)
+    scenario_name="$(awk '/^name:[[:space:]]*/ {
+      sub(/^name:[[:space:]]*/, "")
+      sub(/[[:space:]]*$/, "")
+      gsub(/^["'\'']|["'\'']$/, "")
+      print; exit
+    }' "$scenario_file")"
+    if [ "$scenario_name" != posthog-frozen-perf ]; then
+      echo "DUCKGRES_SCENARIO_PERF_MODE=trino-only requires the posthog-frozen-perf scenario." >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "DUCKGRES_SCENARIO_PERF_MODE must be full or trino-only." >&2
+    exit 2
+    ;;
+esac
+
 scenario_required_env() {
   awk '
     /^[^[:space:]]/ { in_required = 0 }
@@ -104,6 +128,11 @@ required=(
 )
 if [ -f "$scenario_file" ]; then
   while IFS= read -r name; do
+    if [ "$perf_mode" = trino-only ]; then
+      case "$name" in
+        DUCKGRES_SCENARIO_ATHENA_REGION|DUCKGRES_SCENARIO_ATHENA_WORKGROUP|DUCKGRES_SCENARIO_ATHENA_DATABASE|DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI) continue ;;
+      esac
+    fi
     required+=("$name")
   done < <(scenario_required_env "$scenario_file")
 elif [ "$check_env_only" -eq 1 ]; then

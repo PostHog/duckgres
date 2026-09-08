@@ -114,6 +114,14 @@ shape a separate namespace and warehouse identity. Each job has its own
 remaining jobs. This is one measurement round, with no repeated deployments
 per shape. The Trino image remains pinned by the workflow.
 
+The baseline runs the full cross-engine benchmark (uncached and cached
+Duckgres, Trino, and Athena). The three nonbaseline shapes run only Trino
+measurements, avoiding redundant Duckgres and Athena work. Each still performs
+the same isolated warehouse provisioning, frozen-data setup, and table/view
+validation. Trino SQL, query order, warmup, and four measured iterations are
+unchanged. Nonbaseline shapes do not load Athena configuration or create the
+scenario runner's Athena Pod Identity association.
+
 The final `compare-shapes` job presents Trino medians, baseline-relative
 speedups, and CPU-budget efficiency in one workflow summary and a downloadable
 `trino-shape-comparison-<run>-<attempt>` artifact. Missing or failed results and
@@ -123,16 +131,19 @@ shape's raw artifact is named `scenario-dev-<run>-<attempt>-<shape>` and include
 
 Individual choices remain available: replace `all` with `baseline`, `large`,
 `scaleout`, or `large-scaleout`. Default and scheduled invocations execute just
-`baseline`. Compare identical query IDs and protocol labels from the current
+`baseline`, with the full workload. Individual nonbaseline choices also run
+Trino-only measurements. Compare identical query IDs and protocol labels from the current
 `balanced_v4` catalog; do not mix them with older methodology.
 
 The workflow title and summary identify the shape. The downloadable scenario
 artifact includes `trino-perf-shape.json` with configured resource and image
-provenance, including on deployment failure. A copy accompanies the collected
+provenance and `perf_mode` (`full` or `trino-only`), including on deployment
+failure. A copy accompanies the collected
 scenario results. Nonbaseline experiments and the entire `all` comparison
 (including its baseline member) are artifact-only and do not publish to the
-daily baseline's historical tables. The SQL, cache settings, protocol
-order, warmup count, and measured iteration count are identical across shapes.
+daily baseline's historical tables. Trino SQL, cache settings, warmup count,
+and measured iteration count are identical across shapes; other protocols are
+measured only in the baseline.
 
 Use per-query median latency and allocated CPU-seconds (total worker CPU times
 elapsed seconds) to compare speed and resource efficiency. The distinct-person
@@ -146,8 +157,10 @@ For local harness development, set `TRINO_PERF_SHAPE` to one concrete shape
 alongside `SCENARIO_NAME=posthog_frozen_perf`, `E2E_SUITE=trino`, and the usual
 isolated-stack environment, and use that same environment for `run.sh deploy`
 and `run.sh test-scenario`. The test invocation checks any saved deployment
-provenance and rejects a different shape, resource budget, or deployment image;
-restore the deployment environment or redeploy before continuing. Use a separate
+provenance, including the measurement mode derived from the selected shape.
+`DUCKGRES_SCENARIO_PERF_MODE` is set by the harness and cannot override that
+selection. The harness rejects a different shape, resource budget, or deployment
+image; restore the deployment environment or redeploy before continuing. Use a separate
 `SCENARIO_ARTIFACTS_DIR` for each local stack. `all` is a workflow selection,
 not a shape accepted by `run.sh`. Install `jq` on the machine running `run.sh` to
 write the JSON provenance (the GitHub runner already includes it). Explicitly

@@ -157,6 +157,19 @@ func TestDeployCreatesDedicatedScenarioPodIdentityForAthenaPerf(t *testing.T) {
 	}
 }
 
+func TestBaselinePerfStillRequiresAthenaPodIdentity(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	out, err := runSHCommand(t, fakes.binDir, "deploy",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"SCENARIO_NAME=posthog_frozen_perf",
+		"SCENARIO_POD_IDENTITY_ROLE=",
+		"DUCKGRES_SCENARIO_PERF_MODE=trino-only",
+	).CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "SCENARIO_POD_IDENTITY_ROLE is required for the Athena perf scenario") {
+		t.Fatalf("baseline must require Athena identity despite inherited Trino-only mode: %v\n%s", err, out)
+	}
+}
+
 func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 	raw, err := os.ReadFile("manifests.trino.tmpl.yaml")
 	if err != nil {
@@ -247,6 +260,10 @@ func TestTrinoPerfShapesDeployAndRecordResources(t *testing.T) {
 	} {
 		t.Run(tc.shape, func(t *testing.T) {
 			fakes := newRunSHFakes(t)
+			perfMode, scenarioRole := "trino-only", ""
+			if tc.shape == "baseline" {
+				perfMode, scenarioRole = "full", "arn:aws:iam::123456789012:role/test-scenario"
+			}
 			for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
 				if err := os.WriteFile(filepath.Join(filepath.Dir(fakes.binDir), "secrets", name), []byte("tls-test-secret"), 0o600); err != nil {
 					t.Fatal(err)
@@ -255,13 +272,17 @@ func TestTrinoPerfShapesDeployAndRecordResources(t *testing.T) {
 			out, err := runSHCommand(t, fakes.binDir, "deploy",
 				"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf",
 				"TRINO_PERF_SHAPE="+tc.shape, "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-trino",
-				"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-scenario",
+				"SCENARIO_POD_IDENTITY_ROLE="+scenarioRole,
+				"DUCKGRES_SCENARIO_PERF_MODE=inherited-invalid-mode",
 				"TRINO_IMAGE=example.invalid/trino:experiment", "TRINO_TLS_PASSWORD=never-record-this-secret",
 			).CombinedOutput()
 			if err != nil {
 				t.Fatalf("deploy failed: %v\n%s", err, out)
 			}
 			calls := fakes.calls(t)
+			if got := strings.Contains(calls, "--service-account duckgres-scenario --role-arn"); got != (tc.shape == "baseline") {
+				t.Errorf("scenario Pod Identity present = %v, want %v", got, tc.shape == "baseline")
+			}
 			for _, want := range []string{
 				`patch deployment duckgres-trino-worker --type=merge -p {"spec":{"replicas":` + strconv.Itoa(tc.replicas) + `}}`,
 				`requests: { cpu: "` + tc.cpu + `", memory: ` + tc.memory + ` }`,
@@ -285,7 +306,7 @@ func TestTrinoPerfShapesDeployAndRecordResources(t *testing.T) {
 				"shape": tc.shape, "worker_replicas": float64(tc.replicas), "worker_cpu": tc.cpu,
 				"worker_memory": tc.memory, "worker_heap": tc.heap, "query_memory_per_node": tc.perNode,
 				"query_memory": tc.cluster, "total_worker_cpu": float64(tc.totalCPU), "total_worker_memory_gib": float64(tc.totalMemoryGiB),
-				"trino_image": "example.invalid/trino:experiment",
+				"trino_image": "example.invalid/trino:experiment", "perf_mode": perfMode,
 			} {
 				if metadata[key] != want {
 					t.Errorf("metadata[%s] = %v, want %v", key, metadata[key], want)
@@ -296,6 +317,30 @@ func TestTrinoPerfShapesDeployAndRecordResources(t *testing.T) {
 			}
 			if !strings.Contains(string(out), "Trino perf shape: "+tc.shape) {
 				t.Errorf("missing shape summary: %s", out)
+			}
+		})
+	}
+}
+
+func TestTrinoPerfShapeDerivesRunnerMode(t *testing.T) {
+	for _, shape := range []string{"baseline", "large", "scaleout", "large-scaleout"} {
+		t.Run(shape, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+			out, err := runSHCommand(t, fakes.binDir, "test-scenario",
+				"SCENARIO_RUNNER_IMAGE=example.invalid/scenario:test", "TRINO_PERF_SHAPE="+shape,
+				"E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf",
+				"DUCKGRES_SCENARIO_PERF_MODE=inherited-invalid-mode",
+			).CombinedOutput()
+			if err != nil {
+				t.Fatalf("scenario failed: %v\n%s", err, out)
+			}
+			mode := "trino-only"
+			if shape == "baseline" {
+				mode = "full"
+			}
+			want := `name: DUCKGRES_SCENARIO_PERF_MODE, value: "` + mode + `"`
+			if calls := fakes.calls(t); !strings.Contains(calls, want) || strings.Contains(calls, "inherited-invalid-mode") {
+				t.Fatalf("runner must receive derived mode %s, never inherited override; calls:\n%s", mode, calls)
 			}
 		})
 	}
