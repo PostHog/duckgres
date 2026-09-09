@@ -141,7 +141,7 @@ jobs:
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
       # Pinned PostHog fork: it contains the DuckLake connector and the
       # PostgreSQL-backed dynamic catalog store used by managed warehouse.
-      TRINO_IMAGE: ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07
+      TRINO_IMAGE: ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 

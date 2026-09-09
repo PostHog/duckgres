@@ -34,7 +34,7 @@ case "$E2E_SUITE" in
   neutral|duckdb|trino|reshard) ;;
   *) echo "E2E_SUITE must be neutral, duckdb, trino, or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
 esac
-TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:4505364c570d6b51edecd299b603fca4b6693d86@sha256:ac80c275fd18a439d25da5652ab5cd3c80bcbdd2d88d64c9722dc3e8bb68ba07}"
+TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8}"
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
