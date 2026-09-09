@@ -1629,6 +1629,25 @@ func TestTrinoSuiteUsesOnlyItsOwnCoordinatorAndProjectionNamespace(t *testing.T)
 	}
 }
 
+func TestTrinoImagePinMatchesAcrossHarnessWorkflows(t *testing.T) {
+	const image = "ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8"
+
+	paths := []string{
+		"run.sh",
+		filepath.Join("..", "..", ".github", "workflows", "e2e-mw-dev.yml"),
+		filepath.Join("..", "..", ".github", "workflows", "scenario-dev.yml"),
+	}
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(raw), image) {
+			t.Errorf("%s does not use the promoted Trino image %s", path, image)
+		}
+	}
+}
+
 func TestTrinoHarnessCanObserveDeploymentsInItsIsolatedNamespace(t *testing.T) {
 	raw, err := os.ReadFile("manifests.tmpl.yaml")
 	if err != nil {

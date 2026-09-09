@@ -145,10 +145,11 @@ its cell id and PostgreSQL catalog store are also PR-local. This isolation is
 load-bearing: pointing a PR control plane at the shared cell could overwrite
 authoritative projections or drop catalogs absent from the PR's config store.
 
-The lane defaults `TRINO_IMAGE` to the pinned PostHog fork used when this suite
-was added. That fork contains the DuckLake connector and PostgreSQL dynamic
-catalog store; upstream `trinodb/trino` is not compatible. Update the default
-in `run.sh` and `e2e-mw-dev.yml` together when promoting a Trino build.
+The lane defaults `TRINO_IMAGE` to the pinned PostHog fork promoted for these
+tests. That fork contains the DuckLake connector and PostgreSQL dynamic catalog
+store; upstream `trinodb/trino` is not compatible. Update the default in
+`run.sh`, `e2e-mw-dev.yml`, and `scenario-dev.yml` together when promoting a
+Trino build. `TestTrinoImagePinMatchesAcrossHarnessWorkflows` enforces this.
 Each Trino worker has requests and limits of 1 CPU and 4Gi. Together they
 match the frozen perf Duckgres worker's aggregate 3 CPU and 12Gi execution
 budget while exercising Trino's distributed execution path. Trino permits 2GB
