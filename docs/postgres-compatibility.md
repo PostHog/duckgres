@@ -78,7 +78,7 @@ why.
 | ON CONFLICT DO NOTHING | 🟡 | `dml_test.go::TestDMLInsertOnConflict` (subtest skipped) | |
 | MERGE (user-facing) | ⛔ | — | Not a PostgreSQL compatibility target; Duckgres only uses MERGE internally for DuckLake ON CONFLICT emulation |
 | TRUNCATE | ✅ | `ddl_test.go::TestDDLTruncate` | |
-| COPY … FROM STDIN (text/CSV) | ✅ | `copy_test.go::TestCopyFromStdin`, `::TestCopyFromStdinWithSpecialChars`, `::TestCopyFromStdinMultilineJSON` | Escape sequences stored literally (documented DuckDB CSV-parser limitation) |
+| COPY … FROM STDIN (text/CSV) | ✅ | `copy_test.go::TestCopyFromStdin`, `::TestCopyFromStdinWithSpecialChars`, `::TestCopyFromStdinMultilineJSON`; `conn_test.go::TestBuildDuckDBCopyFromSQLAllowsLargeRecord` | Escape sequences stored literally (documented DuckDB CSV-parser limitation); individual records are limited to 64 MiB |
 | COPY … TO STDOUT | 🟡 | `copy_test.go::TestCopyToStdout` (skipped under lib/pq); `conn_test.go::TestCopyToStdoutRegex`; client-compat `psycopg` COPY suite | Integration skip is a lib/pq driver limitation, not a Duckgres gap |
 | COPY binary format | 🟡 | `conn_test.go::TestShouldHandleCopyBeforeTranspile`; `types_test.go` encode/decode | Unit-level only |
 

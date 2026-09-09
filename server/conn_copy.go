@@ -64,6 +64,8 @@ type CopyFromOptions struct {
 	IsBinary   bool   // True if FORMAT binary
 }
 
+const copyMaxLineSizeBytes = 64 * 1024 * 1024
+
 // ParseCopyFromOptions extracts options from a COPY FROM STDIN command
 func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {
 	upperQuery := strings.ToUpper(query)
@@ -164,7 +166,13 @@ func BuildDuckDBCopyFromSQL(tableName, columnList, filePath string, opts *CopyFr
 	// STRICT_MODE FALSE allows reading rows that don't strictly comply with CSV standard
 	// PARALLEL FALSE avoids "Parallel CSV Reader does not support full read" errors
 	// on files streamed from COPY FROM STDIN (temp files with no seek support for sniffing)
-	copyOptions := []string{"FORMAT CSV", "AUTO_DETECT FALSE", "STRICT_MODE FALSE", "PARALLEL FALSE", "MAX_LINE_SIZE 10485760"}
+	copyOptions := []string{
+		"FORMAT CSV",
+		"AUTO_DETECT FALSE",
+		"STRICT_MODE FALSE",
+		"PARALLEL FALSE",
+		fmt.Sprintf("MAX_LINE_SIZE %d", copyMaxLineSizeBytes),
+	}
 	if opts.HasHeader {
 		copyOptions = append(copyOptions, "HEADER")
 	}

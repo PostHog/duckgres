@@ -865,6 +865,7 @@ COPY tablename FROM STDIN WITH CSV HEADER;
 ```
 
 This works with psql's `\copy` command and programmatic COPY operations from PostgreSQL drivers.
+Individual text and CSV records may be up to 64 MiB; larger records are rejected by the DuckDB CSV reader.
 
 ## Graceful Shutdown
 
