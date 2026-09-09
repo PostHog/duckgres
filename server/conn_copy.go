@@ -64,7 +64,9 @@ type CopyFromOptions struct {
 	IsBinary   bool   // True if FORMAT binary
 }
 
-const copyMaxLineSizeBytes = 64 * 1024 * 1024
+// DuckDB sizes CSV buffers from MAX_LINE_SIZE. Keep enough headroom for large
+// records without exhausting the memory available to a standard worker.
+const copyMaxLineSizeBytes = 16 * 1024 * 1024
 
 // ParseCopyFromOptions extracts options from a COPY FROM STDIN command
 func ParseCopyFromOptions(query string) (*CopyFromOptions, error) {

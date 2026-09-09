@@ -2674,7 +2674,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				HasHeader:  false,
 				NullString: "\\N",
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 67108864, NULL '\\N', DELIMITER '\t')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 16777216, NULL '\\N', DELIMITER '\t')",
 		},
 		{
 			name:       "CSV with header",
@@ -2687,7 +2687,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 67108864, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 16777216, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "with column list",
@@ -2700,7 +2700,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 67108864, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users (id, name) FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 16777216, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "custom NULL string",
@@ -2713,7 +2713,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "NA",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 67108864, NULL 'NA', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 16777216, NULL 'NA', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "empty NULL string",
@@ -2726,7 +2726,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "",
 				Quote:      `"`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 67108864, HEADER, NULL '', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 16777216, HEADER, NULL '', DELIMITER ',', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "schema qualified table",
@@ -2739,7 +2739,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				NullString: "\\N",
 				Quote:      `"`,
 			},
-			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 67108864, HEADER, NULL '\\N', DELIMITER '\t', QUOTE '\"', ESCAPE '\"')",
+			want: "COPY public.users (id, name, email) FROM '/var/tmp/copy-123.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 16777216, HEADER, NULL '\\N', DELIMITER '\t', QUOTE '\"', ESCAPE '\"')",
 		},
 		{
 			name:       "CSV with custom escape character",
@@ -2753,7 +2753,7 @@ func TestBuildDuckDBCopyFromSQL(t *testing.T) {
 				Quote:      `"`,
 				Escape:     `\`,
 			},
-			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 67108864, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\\')",
+			want: "COPY users  FROM '/tmp/data.csv' (FORMAT CSV, AUTO_DETECT FALSE, STRICT_MODE FALSE, PARALLEL FALSE, MAX_LINE_SIZE 16777216, HEADER, NULL '\\N', DELIMITER ',', QUOTE '\"', ESCAPE '\\')",
 		},
 	}
 
@@ -2776,6 +2776,9 @@ func TestBuildDuckDBCopyFromSQLAllowsLargeRecord(t *testing.T) {
 	}
 	defer func() { _ = db.Close() }()
 
+	if _, err = db.Exec("SET memory_limit = '878 MiB'"); err != nil {
+		t.Fatalf("set worker memory limit: %v", err)
+	}
 	if _, err = db.Exec("CREATE TABLE copy_large_record_test (payload TEXT)"); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
