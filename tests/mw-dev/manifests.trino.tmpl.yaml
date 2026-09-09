@@ -104,6 +104,10 @@ data:
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
     query.max-memory=6GB
     query.max-memory-per-node=2GB
+    # Overlap scan work at the existing CPU/memory budget: 4x the expected
+    # one-CPU defaults (2 threads / 4 leaf drivers). Keep task.concurrency default.
+    task.max-worker-threads=8
+    task.min-drivers=16
     shutdown.grace-period=10s
     catalog.management=dynamic
     internal-communication.shared-secret=${ENV:TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET}

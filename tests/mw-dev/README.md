@@ -156,6 +156,30 @@ of query memory per worker and 6GB cluster-wide. The coordinator does not
 execute query tasks (`node-scheduler.include-coordinator=false`) and is
 additional Trino control-plane overhead rather than part of the matched
 execution budget.
+
+The isolated lane explicitly sets `task.max-worker-threads=8` and
+`task.min-drivers=16` per worker, four times the pinned engine's expected
+one-CPU defaults of 2 and 4. The latter is a leaf-driver target, not a hard
+limit or a count of simultaneous storage requests. These settings apply to
+both the isolated Trino E2E suite and `posthog_frozen_perf`; they do not change
+shared or production deployments. Worker resources, 3G heaps, query-memory
+limits, coordinator configuration, and aggregation `task.concurrency` remain
+unchanged. This tests whether more overlapping scan work improves throughput
+when the existing CPU budget is underused; it is not a proven speedup.
+
+To validate a branch against the existing frozen benchmark:
+
+```bash
+gh workflow run scenario-dev.yml --ref <branch> -f scenario=posthog_frozen_perf
+```
+
+Compare per-query Trino medians against the prior baseline, checking for query
+errors, worker restarts, CPU throttling, and memory pressure. Higher concurrency
+can increase heap usage and context switching. If it regresses, remove the two
+worker properties in `manifests.trino.tmpl.yaml` (and update their test assertions)
+to restore CPU-derived defaults, then rerun in a fresh isolated deployment.
+Do not patch a running benchmark; let workflow teardown clean up its stack.
+
 `TRINO_TLS_PASSWORD` defaults to `duckgres-e2e-keystore`; it protects only the
 random, two-day, per-run PKCS12 file. `run.sh` generates a fresh CA and leaf
 certificate under `DUCKGRES_CI_SECRET_DIR`, mounts the CA into the PR control

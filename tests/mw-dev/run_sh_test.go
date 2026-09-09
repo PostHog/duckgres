@@ -207,6 +207,23 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 		}
 	}
 	workerData := workerConfig["data"].(map[string]any)
+	workerProperties := workerData["config.properties"].(string)
+	for _, want := range []string{"task.max-worker-threads=8", "task.min-drivers=16"} {
+		if !strings.Contains("\n"+workerProperties, "\n"+want+"\n") {
+			t.Errorf("Trino worker config missing explicit concurrency setting %q:\n%s", want, workerProperties)
+		}
+	}
+	coordinatorProperties := coordinatorConfig["data"].(map[string]any)["config.properties"].(string)
+	for _, key := range []string{"task.max-worker-threads=", "task.min-drivers="} {
+		if strings.Contains(coordinatorProperties, key) {
+			t.Errorf("worker concurrency setting %q must not change coordinator config", key)
+		}
+	}
+	for name, config := range map[string]string{"worker": workerProperties, "coordinator": coordinatorProperties} {
+		if strings.Contains(config, "task.concurrency=") {
+			t.Errorf("Trino %s must retain default aggregation concurrency", name)
+		}
+	}
 	if jvmConfig := workerData["jvm.config"].(string); !strings.Contains(jvmConfig, "-Xmx3G") {
 		t.Errorf("Trino worker JVM config does not fit its 4Gi pod:\n%s", jvmConfig)
 	}
