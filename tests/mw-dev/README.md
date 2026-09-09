@@ -176,7 +176,7 @@ gh workflow run scenario-dev.yml --ref <branch> -f scenario=posthog_frozen_perf
 Compare per-query Trino medians against the prior baseline, checking for query
 errors, worker restarts, CPU throttling, and memory pressure. Higher concurrency
 can increase heap usage and context switching. If it regresses, remove the two
-worker properties in `manifests.trino.tmpl.yaml` (and update their test assertions)
+worker properties in `manifests.trino.tmpl.yaml`
 to restore CPU-derived defaults, then rerun in a fresh isolated deployment.
 Do not patch a running benchmark; let workflow teardown clean up its stack.
 
