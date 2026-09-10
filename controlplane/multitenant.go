@@ -789,6 +789,16 @@ func SetupMultiTenant(
 		ClusterClient: clusterClient,
 		Trino:         newTrinoAdminAPI(trinoConsole, store, auditStore),
 	})
+	if janitorLeader != nil && trinoConsole != nil {
+		// The coordinator owns the authoritative runtime view of Trino query
+		// usage. Keep its collector under the existing leader lease so one CP
+		// emits each terminal query, independent of admin-console traffic.
+		janitorLeader.AttachLeaderLoop(newTrinoUsageCollector(
+			trinoConsole.Observer,
+			store,
+			store.OrgUsageTeamID,
+		).Run)
+	}
 
 	// Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1 admin group on
 	// purpose — it does its own bearer-token auth (the bundle exposes the
