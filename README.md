@@ -581,8 +581,8 @@ teardown), so you can build a provisioning funnel and alert on failures.
 | `warehouse_deprovision_failed` | A teardown attempt failed (provisioner controller) | `reason` (`duckling_delete_failed`) |
 | `warehouse_password_reset` | An org's root password is reset (admin API) | `username` |
 | `query_initiated` | An accepted, non-empty client query is received | `user`, `team_id`, `trace_id`, `application_name` |
-| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows`, `application_name` |
-| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`), `application_name` |
+| `query_completed` | A statement finishes executing successfully | `user`, `team_id`, `trace_id`, `protocol`, `query_kind`, `duration_ms`, `cpu_seconds` (DuckDB CPU/thread-time), `result_rows`, `application_name`; Trino adds `execution_engine=trino`, `query_id`, queue/input/memory/spill/driver resource fields, `source`, and `resource_group` |
+| `query_failed` | A query errors | `user`, `team_id`, `trace_id`, `error_code` (SQLSTATE), `error_category` (`user`/`system`/`conflict`/`metadata_connection_lost`), `application_name`; Trino adds `execution_engine=trino`, `query_id`, resource fields, `error_type`, and Trino `error_code` |
 
 > Note: `warehouse_provision_success` / `_failed` and `warehouse_deprovision_success`
 > are terminal and fire exactly once per warehouse (guarded on the state
@@ -614,6 +614,13 @@ teardown), so you can build a provisioning funnel and alert on failures.
 > PostHog-side callers (e.g. the register workflow, Dagster, the SQL editor)
 > from customer `psql` connections. It is an empty string when the client
 > didn't set one.
+
+> Trino terminal queries are collected by the janitor leader every 10 seconds
+> from the coordinator and use the same `query_completed` / `query_failed`
+> events with `execution_engine=trino`. They never include SQL text. The
+> coordinator retains completed queries only temporarily, so this is
+> best-effort product telemetry rather than the billing source of truth;
+> consumers should deduplicate by `query_id` during a leader failover.
 
 ### Query Logs
 
