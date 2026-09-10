@@ -18,6 +18,32 @@ TRINO_DUCKLAKE_SMOKE_ARTIFACT_DIR=artifacts/my-trino-ducklake-smoke \
   just trino-ducklake-smoke
 ```
 
+## Exact-image HogQL smoke
+
+The legacy smoke above remains pinned to Trino 483 and the external Brikk
+connector. To validate a locally built or published PostHog Trino image through
+the native HogQL endpoint, set `TRINO_HOGQL_SMOKE_IMAGE` and run the focused
+test:
+
+```bash
+TRINO_HOGQL_SMOKE_IMAGE=posthog-trino-hogql-mvp:484-SNAPSHOT-arm64 \
+  go test -v -count=1 -timeout 10m -run TestHogQLExactImageSmoke \
+  ./tests/trino-ducklake-smoke
+```
+
+A mutable local tag is resolved to its immutable local image ID before the
+container starts. Published images can be supplied directly as
+`repository@sha256:digest`.
+
+The test runs a single-node coordinator against a synthetic in-memory fixture
+and a local semantic-catalog server. It verifies the catalog credential,
+logical `events` and `persons`, JSON properties, the lazy `events.person`
+relationship, exact generation requests, and result parity with standard Trino
+SQL. It also exercises explicit unsupported-function errors, `EXPLAIN`, result
+paging, cancellation, cold-cache recovery through catalog prewarming,
+last-good retention during an outage, fail-closed expiry, and recovery. It does
+not contact managed warehouse infrastructure or persist query fixtures.
+
 ## Local DuckLake performance comparison
 
 Run the opt-in local comparison between Duckgres PGWire and Trino HTTP against
