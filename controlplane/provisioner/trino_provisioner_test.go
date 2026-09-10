@@ -747,13 +747,17 @@ type testProvisionerHarness struct {
 // capturingBundleBuilder is a pass-through opa.BundleBuilder that
 // remembers its last input.
 type capturingBundleBuilder struct {
-	inner opa.BundleBuilder
-	last  opa.GroupCatalogs
+	inner        opa.BundleBuilder
+	last         opa.GroupCatalogs
+	lastCatalogs opa.GroupCatalogs
+	lastScopes   opa.GroupScopes
 }
 
-func (c *capturingBundleBuilder) BuildBundle(gc opa.GroupCatalogs) ([]byte, error) {
+func (c *capturingBundleBuilder) BuildBundle(gc opa.GroupCatalogs, gs opa.GroupScopes) ([]byte, error) {
 	c.last = gc
-	return c.inner.BuildBundle(gc)
+	c.lastCatalogs = gc
+	c.lastScopes = gs
+	return c.inner.BuildBundle(gc, gs)
 }
 
 const testCellID = "cell-test"
@@ -1869,5 +1873,295 @@ func TestCatalogHTTPClientTagsItsSource(t *testing.T) {
 		if got != opa.AdminPrincipal {
 			t.Errorf("request %d: X-Trino-User = %q, want %q", i, got, opa.AdminPrincipal)
 		}
+	}
+}
+
+// --- per-user logins ---
+
+func teamID(id int64) *int64 { return &id }
+
+// The point of the feature: an org's OWN duckgres logins each authenticate to
+// Trino, under <database_name>.<username>, with the very same bcrypt hash
+// they use on pgwire. The bare org principal survives alongside them, so
+// anything configured before per-user logins existed keeps working.
+func TestBuildTrinoAuthFiles_ProjectsEveryOrgUser(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:            "42",
+		DatabaseName:     "acme",
+		RootPasswordHash: "$2a$10$roothash",
+		Users: []configstore.TrinoOrgUser{
+			{Username: "root", PasswordHash: "$2a$10$roothash"},
+			{Username: "analyst", PasswordHash: "$2a$10$analysthash"},
+		},
+	}}
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
+
+	wantPW := "acme:$2a$10$roothash\n" +
+		"acme.root:$2a$10$roothash\n" +
+		"acme.analyst:$2a$10$analysthash\n"
+	if pw != wantPW {
+		t.Errorf("password.db =\n%q\nwant\n%q", pw, wantPW)
+	}
+	// All three principals share the org group, which the bundle grants the
+	// whole catalog, and all three carry the tier claim that routes them to
+	// the org's resource group.
+	wantGrp := "org_acme:acme,acme.analyst,acme.root\n" +
+		"tier_free:acme,acme.analyst,acme.root\n"
+	if grp != wantGrp {
+		t.Errorf("group.db =\n%q\nwant\n%q", grp, wantGrp)
+	}
+}
+
+// A project-scoped login joins its scope group and NOT the org group. The org
+// group is unscoped in the bundle, so membership in it would hand the login
+// the whole catalog and defeat the scope entirely.
+func TestBuildTrinoAuthFiles_ScopedUserJoinsOnlyItsScopeGroup(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:            "42",
+		DatabaseName:     "acme",
+		RootPasswordHash: "$2a$10$roothash",
+		Users: []configstore.TrinoOrgUser{
+			{Username: "analyst", PasswordHash: "$2a$10$analysthash"},
+			{
+				Username:     "posthog_team_7",
+				PasswordHash: "$2a$10$teamhash",
+				TeamID:       teamID(7),
+				Scope:        &configstore.OrgUserQueryAccess{ReadOnly: true, AllowedSchemas: []string{"posthog_7"}},
+			},
+		},
+	}}
+	_, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
+
+	wantGrp := "org_acme:acme,acme.analyst\n" +
+		"scope_acme_team_7:acme.posthog_team_7\n" +
+		"tier_free:acme,acme.analyst,acme.posthog_team_7\n"
+	if grp != wantGrp {
+		t.Errorf("group.db =\n%q\nwant\n%q", grp, wantGrp)
+	}
+	if strings.Contains(grp, "org_acme:acme,acme.analyst,acme.posthog_team_7") {
+		t.Error("the scoped login must NOT be in the unscoped org group")
+	}
+}
+
+// Several logins on one team share one scope group — the group is keyed on
+// (org, team), not on the user.
+func TestBuildTrinoAuthFiles_ScopeGroupIsSharedPerTeam(t *testing.T) {
+	scope := &configstore.OrgUserQueryAccess{ReadOnly: true, AllowedSchemas: []string{"posthog_7"}}
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:        "42",
+		DatabaseName: "acme",
+		Users: []configstore.TrinoOrgUser{
+			{Username: "reader", PasswordHash: "$2a$10$a", TeamID: teamID(7), Scope: scope},
+			{Username: "writer", PasswordHash: "$2a$10$b", TeamID: teamID(7), Scope: scope},
+		},
+	}}
+	_, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
+	if want := "scope_acme_team_7:acme.reader,acme.writer\n" +
+		"tier_free:acme.reader,acme.writer\n"; grp != want {
+		t.Errorf("group.db =\n%q\nwant\n%q", grp, want)
+	}
+}
+
+// duckgres validates a username as little more than "not empty", while
+// password.db is `<user>:<hash>` per line and group.db is
+// `<group>:<user>,<user>`. A username carrying `:`, `,` or a newline would
+// let whoever can create org users append arbitrary lines to those files —
+// including a line for the admin principal. The grammar is an allowlist, so
+// such a row is never rendered at all.
+func TestBuildTrinoAuthFiles_RefusesUsernamesThatCouldInjectLines(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:            "42",
+		DatabaseName:     "acme",
+		RootPasswordHash: "$2a$10$roothash",
+		Users: []configstore.TrinoOrgUser{
+			{Username: "ok", PasswordHash: "$2a$10$okhash"},
+			{Username: "evil\n__admin_provisioner", PasswordHash: "$2a$10$attacker"},
+			{Username: "has:colon", PasswordHash: "$2a$10$x"},
+			{Username: "has,comma", PasswordHash: "$2a$10$x"},
+			{Username: "has space", PasswordHash: "$2a$10$x"},
+			{Username: "has.dot", PasswordHash: "$2a$10$x"},
+			{Username: "", PasswordHash: "$2a$10$x"},
+		},
+	}}
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
+
+	if want := "acme:$2a$10$roothash\nacme.ok:$2a$10$okhash\n"; pw != want {
+		t.Errorf("password.db =\n%q\nwant\n%q", pw, want)
+	}
+	if strings.Contains(pw, "$2a$10$attacker") {
+		t.Error("an injected admin line reached password.db")
+	}
+	for _, bad := range []string{"has:colon", "has,comma", "has space", "has.dot"} {
+		if strings.Contains(pw, bad) || strings.Contains(grp, bad) {
+			t.Errorf("username %q must not be projected", bad)
+		}
+	}
+	// Every rendered line must still be exactly one `user:hash` pair.
+	for _, line := range strings.Split(strings.TrimSuffix(pw, "\n"), "\n") {
+		if strings.Count(line, ":") != 1 {
+			t.Errorf("password.db line %q is not a single user:hash pair", line)
+		}
+	}
+}
+
+// An org with per-user logins but no root hash still projects those logins:
+// the bare org principal is one credential among several now, not the only
+// way in.
+func TestBuildTrinoAuthFiles_ProjectsUsersWithoutARootHash(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:        "42",
+		DatabaseName: "acme",
+		Users:        []configstore.TrinoOrgUser{{Username: "analyst", PasswordHash: "$2a$10$a"}},
+	}}
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
+	if want := "acme.analyst:$2a$10$a\n"; pw != want {
+		t.Errorf("password.db = %q, want %q", pw, want)
+	}
+	if want := "org_acme:acme.analyst\ntier_free:acme.analyst\n"; grp != want {
+		t.Errorf("group.db = %q, want %q", grp, want)
+	}
+}
+
+// Two orgs deriving the same Trino username is a cross-tenant authentication
+// bug: password.db is one flat namespace per cell, so the duplicate line lets
+// one org's user authenticate against the other's entry. Valid database_names
+// make it unreachable, but grandfathered rows may hold a dot — which is how
+// org `acme.analyst` and org `acme` + login `analyst` come to claim one name.
+func TestRejectPrincipalCollisions_HoldsBackOrgsSharingATrinoUsername(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "1", DatabaseName: "acme.analyst", RootPasswordHash: "$2a$10$a"},
+		{
+			OrgID:            "2",
+			DatabaseName:     "acme",
+			RootPasswordHash: "$2a$10$b",
+			Users:            []configstore.TrinoOrgUser{{Username: "analyst", PasswordHash: "$2a$10$c"}},
+		},
+	}
+	projectable, collisions := rejectPrincipalCollisions(orgs)
+	if len(projectable) != 0 {
+		t.Errorf("both orgs must be held back, got %d projectable", len(projectable))
+	}
+	for _, id := range []string{"1", "2"} {
+		if collisions[id] == nil {
+			t.Errorf("org %s must be reported as colliding", id)
+		}
+	}
+}
+
+// A tenant that derives one of the cell's own principals must be held back:
+// the OPA policy's admin authority rests on that username belonging to the
+// provisioner alone.
+func TestRejectPrincipalCollisions_HoldsBackATenantClaimingAnOperationalPrincipal(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:            "1",
+		DatabaseName:     opa.AdminPrincipal,
+		RootPasswordHash: "$2a$10$a",
+	}}
+	projectable, collisions := rejectPrincipalCollisions(orgs)
+	if len(projectable) != 0 {
+		t.Errorf("the org must be held back, got %d projectable", len(projectable))
+	}
+	if collisions["1"] == nil {
+		t.Error("claiming the admin principal must be reported as a collision")
+	}
+}
+
+// Orgs with no user rows at all must project exactly as they did before
+// per-user logins existed. This is the regression guard for every tenant on
+// the cell today.
+func TestBuildTrinoAuthFiles_UnchangedForOrgsWithoutUsers(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", RootPasswordHash: "$2a$10$hash42"},
+		{OrgID: "43", DatabaseName: "db43", RootPasswordHash: "$2a$10$hash43"},
+	}
+	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
+	if want := "db42:$2a$10$hash42\ndb43:$2a$10$hash43\n"; pw != want {
+		t.Errorf("password.db = %q, want %q", pw, want)
+	}
+	if want := "org_db42:db42\norg_db43:db43\ntier_free:db42,db43\n"; grp != want {
+		t.Errorf("group.db = %q, want %q", grp, want)
+	}
+}
+
+// The resource-group selector must map BOTH the bare org principal and every
+// qualified per-user login onto the SAME leaf group. The previous
+// `(?<org>.*)` capture matched the whole username, which would give each user
+// a private leaf carrying the full per-tenant limits — an org with ten logins
+// would quietly hold ten times its concurrency and memory budget.
+//
+// The constant is a Java regex (Trino compiles it with java.util.regex) and
+// Go spells named groups `(?P<...>`, so the test translates that one token
+// and nothing else. Trino matches with Pattern.matcher(user).matches(), i.e.
+// a full match, which MustCompile + FindStringSubmatch on an anchored pattern
+// reproduces.
+func TestBuildTrinoResourceGroups_CapturesOrgFromQualifiedUsername(t *testing.T) {
+	goPattern := strings.ReplaceAll(orgCaptureRegex, "(?<", "(?P<")
+	re := regexp.MustCompile("^(?:" + goPattern + ")$")
+	idx := re.SubexpIndex("org")
+	if idx < 0 {
+		t.Fatalf("pattern %q has no `org` capture", orgCaptureRegex)
+	}
+
+	for _, tc := range []struct{ user, want string }{
+		{"acme", "acme"},
+		{"acme.root", "acme"},
+		{"acme.analyst", "acme"},
+		{"acme.posthog_team_7", "acme"},
+		{"acme-analytics.analyst", "acme-analytics"},
+	} {
+		m := re.FindStringSubmatch(tc.user)
+		if m == nil {
+			t.Errorf("user %q does not match the selector at all — its queries would be rejected", tc.user)
+			continue
+		}
+		if m[idx] != tc.want {
+			t.Errorf("user %q captured org %q, want %q", tc.user, m[idx], tc.want)
+		}
+	}
+}
+
+// The bundle must grant a scope group the SAME catalog its org group owns —
+// the cross-tenant check is the same check for both — and additionally carry
+// the scope that narrows it.
+func TestReconcileOPABundle_ScopeGroupOwnsTheSameCatalog(t *testing.T) {
+	p := &TrinoProvisioner{}
+	captured := &capturingBundleBuilder{inner: opa.NewBuilder()}
+	p.bundleBuilder = captured
+	p.bundleStore = &opa.BundleStore{}
+
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:        "42",
+		DatabaseName: "acme",
+		Users: []configstore.TrinoOrgUser{{
+			Username:     "posthog_team_7",
+			PasswordHash: "$2a$10$a",
+			TeamID:       teamID(7),
+			Scope: &configstore.OrgUserQueryAccess{
+				ReadOnly:         true,
+				AllowedSchemas:   []string{"posthog_7"},
+				AllowedRelations: []string{"posthog.events"},
+			},
+		}},
+	}}
+	if err := p.reconcileOPABundle(context.Background(), orgs); err != nil {
+		t.Fatalf("reconcileOPABundle: %v", err)
+	}
+
+	gc, gs := captured.lastCatalogs, captured.lastScopes
+	if !gc["org_acme"]["org_acme"] {
+		t.Error("org group must own its catalog")
+	}
+	if !gc["scope_acme_team_7"]["org_acme"] {
+		t.Error("scope group must own the SAME catalog as its org group")
+	}
+	if _, ok := gs["org_acme"]; ok {
+		t.Error("the org group must stay unscoped")
+	}
+	scope, ok := gs["scope_acme_team_7"]
+	if !ok {
+		t.Fatal("scope group must carry a scope document")
+	}
+	if !scope.Schemas["posthog_7"] || !scope.Relations["posthog.events"] || !scope.RelationSchemas["posthog"] {
+		t.Errorf("scope = %#v, want the team's schemas and relations", scope)
 	}
 }

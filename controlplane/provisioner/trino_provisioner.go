@@ -225,6 +225,42 @@ func TrinoGroupName(principal string) string {
 	return "org_" + trinoSanitize(principal)
 }
 
+// trinoUsernamePattern is the grammar a duckgres username must satisfy to be
+// projected into the cell's auth files.
+//
+// This is an ALLOWLIST, and it is a security control rather than a tidiness
+// one. duckgres validates a username as little more than "not empty" (see
+// controlplane/validation.go), while password.db is `<user>:<hash>` per line
+// and group.db is `<group>:<user>,<user>` per line. A username holding `:`,
+// `,` or a newline would not merely render oddly -- it would let whoever can
+// create org users append arbitrary lines to those files, including a line
+// for the admin principal. Anything outside this grammar is therefore never
+// written, and no amount of downstream escaping is relied on.
+//
+// `.` is excluded as well, so that `<org>.<user>` carries exactly the one
+// separator TrinoPrincipalSeparator puts there and the org prefix stays
+// recoverable by the resource-group selector (see orgCaptureRegex).
+var trinoUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]*$`)
+
+// projectableTrinoUsername reports whether a duckgres username is safe to
+// render into password.db / group.db.
+func projectableTrinoUsername(username string) bool {
+	return len(username) <= 255 && trinoUsernamePattern.MatchString(username)
+}
+
+// TrinoScopeGroupName returns the group label for a project-scoped login:
+// one group per (org, team), carrying that team's schema scope in the OPA
+// bundle.
+//
+// The `scope_` prefix keeps these out of TrinoGroupName's `org_<name>` space
+// and TrinoTierGroupName's `tier_` space. That separation matters: a group in
+// the `org_` space that the bundle happens not to scope reads the whole
+// catalog, so a scope group whose name could collide with an org group would
+// be a silent widening rather than a name clash.
+func TrinoScopeGroupName(principal string, teamID int64) string {
+	return fmt.Sprintf("scope_%s_team_%d", trinoSanitize(principal), teamID)
+}
+
 // TrinoResourceGroupName returns the resource-group selector key for
 // an org. Sanitized like the catalog name so a `.` in orgName doesn't
 // get re-interpreted as a hierarchy separator in Trino's resource-
@@ -678,8 +714,8 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	return nil
 }
 
-// rejectPrincipalCollisions splits orgs into those safe to project and
-// those whose Trino catalog name is not unique to them.
+// rejectPrincipalCollisions splits orgs into those safe to project and those
+// whose Trino catalog name, or whose Trino username, is not unique to them.
 //
 // Every Trino-facing name is trinoSanitize(principal), and sanitization is
 // injective over principals that satisfy ValidateDatabaseName — that grammar
@@ -699,6 +735,19 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 // the other also believes it owns.
 func rejectPrincipalCollisions(orgs []configstore.TrinoEnabledOrg) (projectable []configstore.TrinoEnabledOrg, collisions map[string]error) {
 	byCatalog := make(map[string][]string, len(orgs))
+	byPrincipal := make(map[string]map[string]bool, len(orgs))
+	claim := func(principal, orgID string) {
+		if byPrincipal[principal] == nil {
+			byPrincipal[principal] = map[string]bool{}
+		}
+		byPrincipal[principal][orgID] = true
+	}
+	// The cell's own principals are claimed first, so a tenant that derives
+	// either name is treated as contesting it and is held back. Neither is
+	// reachable from a valid database_name, but the policy's whole admin
+	// conjunction rests on the name being the provisioner's alone.
+	claim(opa.AdminPrincipal, "")
+	claim(opa.ObserverPrincipal, "")
 	for _, o := range orgs {
 		principal := o.TrinoPrincipal()
 		if principal == "" {
@@ -708,6 +757,13 @@ func rejectPrincipalCollisions(orgs []configstore.TrinoEnabledOrg) (projectable 
 		}
 		name := TrinoCatalogName(principal)
 		byCatalog[name] = append(byCatalog[name], o.OrgID)
+		claim(principal, o.OrgID)
+		for _, u := range o.Users {
+			if !projectableTrinoUsername(u.Username) {
+				continue
+			}
+			claim(o.TrinoUserPrincipal(u.Username), o.OrgID)
+		}
 	}
 
 	contested := make(map[string]string, 0) // orgID -> catalog name
@@ -719,15 +775,51 @@ func rejectPrincipalCollisions(orgs []configstore.TrinoEnabledOrg) (projectable 
 			contested[id] = name
 		}
 	}
-	if len(contested) == 0 {
+	// A Trino username claimed by two orgs is a cross-tenant authentication
+	// bug, not a cosmetic clash: password.db is one flat namespace per cell,
+	// so the duplicate line lets one org's user authenticate against the
+	// other's entry and land in the other's group. Valid database_names make
+	// this unreachable — they are DNS labels, so `<org>.<user>` splits at its
+	// only dot — but grandfathered rows predate that rule and may hold a dot,
+	// which is exactly how `acme.analytics` the org and `acme` + `analytics`
+	// the login come to claim one name.
+	contestedPrincipal := map[string]string{} // orgID -> principal
+	for principal, owners := range byPrincipal {
+		if len(owners) < 2 {
+			continue
+		}
+		for id := range owners {
+			if id == "" {
+				continue // the cell's own principal, not an org
+			}
+			contestedPrincipal[id] = principal
+		}
+	}
+	if len(contested) == 0 && len(contestedPrincipal) == 0 {
 		return orgs, nil
 	}
 
-	collisions = make(map[string]error, len(contested))
-	projectable = make([]configstore.TrinoEnabledOrg, 0, len(orgs)-len(contested))
+	collisions = make(map[string]error, len(contested)+len(contestedPrincipal))
+	projectable = make([]configstore.TrinoEnabledOrg, 0, len(orgs))
 	for _, o := range orgs {
 		name, bad := contested[o.OrgID]
 		if !bad {
+			if principal, dup := contestedPrincipal[o.OrgID]; dup {
+				others := make([]string, 0, len(byPrincipal[principal]))
+				for id := range byPrincipal[principal] {
+					if id != o.OrgID {
+						others = append(others, orgLabel(id))
+					}
+				}
+				sort.Strings(others)
+				collisions[o.OrgID] = fmt.Errorf(
+					"Trino username %q is also claimed by %s; refusing to project either — "+
+						"rename the org's database_name or the colliding login so the usernames differ",
+					principal, strings.Join(others, ", "))
+				slog.Error("Trino reconcile: refusing to project orgs whose Trino usernames collide.",
+					"org", o.OrgID, "principal", principal, "colliding_with", others)
+				continue
+			}
 			projectable = append(projectable, o)
 			continue
 		}
@@ -746,6 +838,16 @@ func rejectPrincipalCollisions(orgs []configstore.TrinoEnabledOrg) (projectable 
 			"org", o.OrgID, "database_name", o.TrinoPrincipal(), "catalog", name, "colliding_with", others)
 	}
 	return projectable, collisions
+}
+
+// orgLabel names a principal's claimant in an operator-facing message. The
+// empty org id is the cell itself (see the AdminPrincipal/ObserverPrincipal
+// claims in rejectPrincipalCollisions), which has no org row to name.
+func orgLabel(orgID string) string {
+	if orgID == "" {
+		return "this Trino cell's own operational principals"
+	}
+	return "org " + orgID
 }
 
 // claimCellOrgs filters the fleet-wide Trino-enabled listing down to the
@@ -1742,22 +1844,28 @@ type TrinoClusterPrincipals struct {
 // Format conventions:
 //
 //	password.db: <principal>:<bcrypt hash from OrgUser.Password>
-//	             One line per org. The principal is the org's
+//	             Two kinds of tenant line. The org's own principal is its
 //	             database_name (see TrinoEnabledOrg.TrinoPrincipal), so the
-//	             tenant's Trino username is the same name it uses for its
-//	             DuckDB warehouse rather than a bare org UUID. Hash is
-//	             copied through unchanged — it's already bcrypt in the
-//	             configstore, and it is the SAME hash the DuckDB warehouse
-//	             authenticates with, so one password works for both.
+//	             tenant is known by the same name it uses for its DuckDB
+//	             warehouse rather than a bare org UUID. Each of the org's
+//	             duckgres logins additionally gets `<database_name>.<user>`
+//	             (TrinoUserPrincipal). Hashes are copied through unchanged —
+//	             they are already bcrypt in the configstore, and they are the
+//	             SAME hashes pgwire authenticates with, so one password works
+//	             on both engines and nothing has to be re-hashed or reset.
 //	group.db:    <group_name>:<comma-separated users>
 //	             NOTE: this is the opposite direction from password.db.
-//	             For v1 (one user per org) the value is the single
-//	             principal. Easy to get backwards, hence this comment.
+//	             Easy to get backwards, hence this comment.
 //
-// Orgs without a RootPasswordHash or a principal are skipped silently
-// (the listing query already filters to (org, root-user) pairs with a
-// non-blank database_name, so this is just defensive against future
-// changes).
+//	             An org's unscoped principals share its `org_<name>` group,
+//	             which the OPA bundle grants the whole catalog. A
+//	             project-scoped login goes into a `scope_<name>_team_<id>`
+//	             group INSTEAD — never both, because the org group is
+//	             unscoped and membership in it would defeat the scope.
+//
+// Orgs without a principal are skipped entirely. An org with a principal but
+// no RootPasswordHash still projects its per-user logins: the bare org
+// principal is one credential among several now, not the only way in.
 //
 // cluster carries the bcrypt hashes for the two non-tenant principals.
 // Each is prepended to both files when non-empty, regardless of orgs —
@@ -1790,14 +1898,56 @@ func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, cluster TrinoCluste
 	}
 	for _, o := range orgs {
 		principal := o.TrinoPrincipal()
-		if o.RootPasswordHash == "" || principal == "" {
+		if principal == "" {
 			continue
 		}
-		pwLines = append(pwLines, fmt.Sprintf("%s:%s", principal, o.RootPasswordHash))
-		// group_name first, comma-separated users second. For v1 this
-		// is one user per group (the principal only).
-		grpLines = append(grpLines, fmt.Sprintf("%s:%s", TrinoGroupName(principal), principal))
-		tierMembers[normalizeTier(o.Tier)] = append(tierMembers[normalizeTier(o.Tier)], principal)
+		// The org's own principal: database_name authenticating with the
+		// root hash. Kept for service-to-service use and for clients
+		// configured before per-user logins existed.
+		var orgGroupMembers []string
+		if o.RootPasswordHash != "" {
+			pwLines = append(pwLines, fmt.Sprintf("%s:%s", principal, o.RootPasswordHash))
+			orgGroupMembers = append(orgGroupMembers, principal)
+			tierMembers[normalizeTier(o.Tier)] = append(tierMembers[normalizeTier(o.Tier)], principal)
+		}
+		// Per-user logins. Each one authenticates as <org>.<user> with the
+		// very same bcrypt hash it uses on pgwire.
+		scopeMembers := map[string][]string{}
+		for _, u := range o.Users {
+			if u.PasswordHash == "" || !projectableTrinoUsername(u.Username) {
+				// An unprojectable username costs that ONE login its Trino
+				// access and nothing else. Holding the whole org back would
+				// turn one odd name into an org-wide outage.
+				if u.PasswordHash != "" {
+					slog.Warn("Trino: skipping login whose username cannot be rendered into the auth files.",
+						"org", o.OrgID, "user", u.Username)
+				}
+				continue
+			}
+			userPrincipal := o.TrinoUserPrincipal(u.Username)
+			pwLines = append(pwLines, fmt.Sprintf("%s:%s", userPrincipal, u.PasswordHash))
+			// A scoped login joins its scope group INSTEAD of the org group:
+			// the org group is unscoped in the bundle, so putting a project
+			// login in it would hand it the whole catalog.
+			if group, ok := scopeGroupFor(o, u); ok {
+				scopeMembers[group] = append(scopeMembers[group], userPrincipal)
+			} else {
+				orgGroupMembers = append(orgGroupMembers, userPrincipal)
+			}
+			tierMembers[normalizeTier(o.Tier)] = append(tierMembers[normalizeTier(o.Tier)], userPrincipal)
+		}
+		// group_name first, comma-separated users second. NOTE this is the
+		// opposite direction from password.db; easy to get backwards.
+		if len(orgGroupMembers) > 0 {
+			sort.Strings(orgGroupMembers)
+			grpLines = append(grpLines, fmt.Sprintf("%s:%s",
+				TrinoGroupName(principal), strings.Join(orgGroupMembers, ",")))
+		}
+		for _, group := range sortedKeys(scopeMembers) {
+			members := scopeMembers[group]
+			sort.Strings(members)
+			grpLines = append(grpLines, fmt.Sprintf("%s:%s", group, strings.Join(members, ",")))
+		}
 	}
 	// Tier claims. These carry a tenant's tier to the resource-group
 	// selectors, which match on userGroup — that is what keeps
@@ -1822,6 +1972,35 @@ func BuildTrinoAuthFiles(orgs []configstore.TrinoEnabledOrg, cluster TrinoCluste
 		grpLines = append(grpLines, "")
 	}
 	return strings.Join(pwLines, "\n"), strings.Join(grpLines, "\n")
+}
+
+// scopeGroupFor returns the scope group a login belongs in, and whether it is
+// scoped at all. A login is scoped iff the config store resolved a project
+// policy for it AND that policy names a team, which is what the group is
+// keyed on.
+//
+// A scoped login whose policy resolved to NO readable namespace still gets a
+// group — an empty scope in the bundle, which reads nothing. That is the
+// fail-closed shape configstore produces for a team that is missing or
+// disabled, and it must survive the trip rather than degrading into "no scope
+// group", which would put the login in the unscoped org group.
+func scopeGroupFor(o configstore.TrinoEnabledOrg, u configstore.TrinoOrgUser) (string, bool) {
+	if u.Scope == nil || u.TeamID == nil {
+		return "", false
+	}
+	return TrinoScopeGroupName(o.TrinoPrincipal(), *u.TeamID), true
+}
+
+// sortedKeys returns a map's keys in sorted order, so every projection this
+// file writes is byte-stable across ticks (an unstable file would rewrite the
+// Secret every reconcile and re-trigger every coordinator's file refresh).
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // reconcileResourceGroups projects resource-groups.json into the
@@ -1911,9 +2090,21 @@ const (
 // selector's named capture; orgCaptureRegex is the capture that fills it.
 // Together they let one templated node serve every tenant, which is what
 // keeps this file free of tenant names — see BuildTrinoResourceGroups.
+//
+// The capture stops at the first `.` because a tenant principal is either the
+// org's bare database_name (`acme`) or one of its per-user logins
+// (`acme.analyst`, see configstore.TrinoUserPrincipal), and BOTH must resolve
+// to the SAME leaf resource group. A `(?<org>.*)` capture -- what this was
+// before per-user logins -- matches the whole username, so every user would
+// get a private leaf carrying the full per-tenant limits, and an org with ten
+// logins would quietly hold ten times its concurrency and memory budget. The
+// selector is matched with Pattern.matcher(user).matches(), i.e. a full
+// match, so the trailing group is required for qualified names to match at
+// all; TestBuildTrinoResourceGroups_CapturesOrgFromQualifiedUsername pins
+// both shapes.
 const (
 	orgTemplateVariable = "${org}"
-	orgCaptureRegex     = "(?<org>.*)"
+	orgCaptureRegex     = `(?<org>[^.]+)(?:\..*)?`
 )
 
 // TrinoTierGroupName is the group.db claim that puts an org in a tier lane.
@@ -2116,11 +2307,19 @@ func BuildTrinoResourceGroups() ([]byte, error) {
 // managed catalog so the provisioner's own SHOW CATALOGS idempotency
 // check (run as opa.AdminPrincipal) is allowed.
 //
+// Project-scoped logins add a second kind of group, `scope_<org>_team_<id>`,
+// which owns exactly the same catalog its org group does and additionally
+// carries a GroupScope. That layering is what keeps this change off the
+// tenant-isolation path: the catalog grant is the same grant, and the scope
+// can only subtract from it (see the "Project scopes" section of
+// policy.rego).
+//
 // ctx is currently unused (the builder is pure and the store Set is
 // in-memory), but kept on the signature for parity with the other
 // reconcile* steps and to permit instrumented builders later.
 func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configstore.TrinoEnabledOrg) error {
 	gc := make(opa.GroupCatalogs, len(orgs)+1)
+	gs := opa.GroupScopes{}
 	adminCatalogs := make(map[string]bool, len(orgs))
 	for _, o := range orgs {
 		principal := o.TrinoPrincipal()
@@ -2130,6 +2329,18 @@ func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configst
 		catalog := TrinoCatalogName(principal)
 		gc[TrinoGroupName(principal)] = map[string]bool{catalog: true}
 		adminCatalogs[catalog] = true
+		// A project-scoped login sits in its own group, which owns the SAME
+		// catalog — the cross-tenant check is unchanged for it — and carries
+		// a scope document that narrows it to that project's schemas. Groups
+		// are per (org, team), so several logins on one team share one entry.
+		for _, u := range o.Users {
+			group, scoped := scopeGroupFor(o, u)
+			if !scoped || !projectableTrinoUsername(u.Username) || u.PasswordHash == "" {
+				continue
+			}
+			gc[group] = map[string]bool{catalog: true}
+			gs[group] = opa.NewGroupScope(u.Scope.AllowedSchemas, u.Scope.AllowedRelations)
+		}
 	}
 	if len(adminCatalogs) > 0 {
 		// Admin owns every managed catalog so SHOW CATALOGS / catalog
@@ -2138,7 +2349,7 @@ func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configst
 		// docstring).
 		gc[opa.AdminGroup] = adminCatalogs
 	}
-	bundle, err := p.bundleBuilder.BuildBundle(gc)
+	bundle, err := p.bundleBuilder.BuildBundle(gc, gs)
 	if err != nil {
 		return fmt.Errorf("build opa bundle: %w", err)
 	}

@@ -47,8 +47,14 @@ func NewBuilder() BundleBuilder {
 // activates a deny-everything policy (since no group owns any catalog).
 // That is the correct bootstrap behaviour: until the provisioner pushes
 // a populated GroupCatalogs, all customer queries are denied.
-func (defaultBuilder) BuildBundle(gc GroupCatalogs) ([]byte, error) {
-	data, err := buildDataDocument(gc)
+//
+// gs carries the project scopes that narrow individual groups. A nil or empty
+// GroupScopes means no group is scoped, which is the pre-scopes behaviour: a
+// group reads the whole catalog it owns. Both documents are always emitted so
+// the policy's `data.group_scopes[g]` lookup is undefined-on-missing-key
+// rather than an error on a missing document.
+func (defaultBuilder) BuildBundle(gc GroupCatalogs, gs GroupScopes) ([]byte, error) {
+	data, err := buildDataDocument(gc, gs)
 	if err != nil {
 		return nil, fmt.Errorf("build data document: %w", err)
 	}
@@ -56,7 +62,7 @@ func (defaultBuilder) BuildBundle(gc GroupCatalogs) ([]byte, error) {
 	b := bundle.Bundle{
 		Manifest: bundle.Manifest{
 			Revision: bundleRevision,
-			Roots:    &[]string{"trino", "group_catalogs"},
+			Roots:    &[]string{"trino", "group_catalogs", "group_scopes"},
 		},
 		Modules: []bundle.ModuleFile{
 			{
@@ -85,26 +91,30 @@ func (defaultBuilder) BuildBundle(gc GroupCatalogs) ([]byte, error) {
 // stores under data.<root>. We always emit `group_catalogs` even when gc is
 // nil so the policy's `data.group_catalogs[group][catalog]` lookup is
 // well-formed (undefined-on-missing-key, not error-on-missing-document).
-func buildDataDocument(gc GroupCatalogs) (map[string]interface{}, error) {
+func buildDataDocument(gc GroupCatalogs, gs GroupScopes) (map[string]interface{}, error) {
 	// JSON round-trip ensures we emit canonical JSON-decoded types
 	// (map[string]interface{} and bool) regardless of what the caller
 	// passes in. OPA's bundle loader expects these types and treats
 	// concrete map[string]map[string]bool as opaque if it ever leaks
 	// through. Round-tripping is also a stable serialization for tests.
+	if gc == nil {
+		// Marshalling a nil map emits "null"; substitute an empty object so
+		// the policy sees `data.group_catalogs == {}` not `null`.
+		gc = GroupCatalogs{}
+	}
+	if gs == nil {
+		gs = GroupScopes{}
+	}
 	raw, err := json.Marshal(struct {
 		GroupCatalogs GroupCatalogs `json:"group_catalogs"`
-	}{GroupCatalogs: gc})
+		GroupScopes   GroupScopes   `json:"group_scopes"`
+	}{GroupCatalogs: gc, GroupScopes: gs})
 	if err != nil {
-		return nil, fmt.Errorf("marshal group_catalogs: %w", err)
-	}
-	if gc == nil {
-		// Marshalling a nil map emits "null"; substitute an empty object
-		// so the policy sees `data.group_catalogs == {}` not `null`.
-		raw = []byte(`{"group_catalogs":{}}`)
+		return nil, fmt.Errorf("marshal bundle data: %w", err)
 	}
 	var data map[string]interface{}
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return nil, fmt.Errorf("unmarshal group_catalogs: %w", err)
+		return nil, fmt.Errorf("unmarshal bundle data: %w", err)
 	}
 	return data, nil
 }

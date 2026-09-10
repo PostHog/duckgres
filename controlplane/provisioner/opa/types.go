@@ -28,6 +28,8 @@
 // per-user and require a bundle-shape migration during the OIDC rollout.
 package opa
 
+import "strings"
+
 // GroupCatalogs maps a Trino group name (e.g. `org_<org>` for customer
 // orgs, where `org` is the sanitized Org.Name; or the admin group for
 // the provisioner's smoke-test access) to the set of catalog names that
@@ -44,11 +46,71 @@ package opa
 // bounded iteration, still O(1) in catalog count.
 type GroupCatalogs map[string]map[string]bool
 
+// GroupScope narrows one group to part of the catalog it owns. A group with
+// no GroupScope is unscoped and reads the whole catalog; a group WITH one
+// reads only what these sets name. The policy consults a scope only after the
+// group has already been found to own the catalog in GroupCatalogs, so a
+// scope can subtract access but never add any -- in particular it can never
+// reach another tenant's catalog.
+//
+// Each field is a set represented as map[string]bool with the value always
+// true, for the same O(1)-lookup reason GroupCatalogs is (see above): the
+// policy indexes into these objects rather than scanning them.
+type GroupScope struct {
+	// Schemas are readable in full: every table in them is allowed.
+	Schemas map[string]bool `json:"schemas"`
+	// Relations are individually readable tables, keyed "<schema>.<table>",
+	// for schemas the group does NOT hold in full. duckgres grants these for
+	// a project's tables that live in the shared legacy `posthog` schema.
+	Relations map[string]bool `json:"relations"`
+	// RelationSchemas is the set of schema names appearing in Relations,
+	// precomputed so a schema-level decision (FilterSchemas, ShowTables) is
+	// an object lookup rather than a scan over Relations. Derived data --
+	// build it with NewGroupScope rather than by hand, so it cannot drift
+	// from Relations and silently hide a schema the group can read a table
+	// in.
+	RelationSchemas map[string]bool `json:"relation_schemas"`
+}
+
+// GroupScopes maps a Trino group name to the scope narrowing it. Only
+// project-scoped groups appear; the absence of a key means "unscoped", which
+// is what every org's own `org_<name>` group is.
+type GroupScopes map[string]GroupScope
+
+// NewGroupScope builds a GroupScope from the allowed-schema and
+// allowed-relation lists duckgres derives for a project login, deriving
+// RelationSchemas from relations so the two cannot disagree.
+//
+// A relation that is not "<schema>.<table>" is dropped rather than guessed
+// at: it would otherwise land in the policy as a key no decision can ever
+// match, which reads as a working grant and is not one.
+func NewGroupScope(schemas, relations []string) GroupScope {
+	scope := GroupScope{
+		Schemas:         map[string]bool{},
+		Relations:       map[string]bool{},
+		RelationSchemas: map[string]bool{},
+	}
+	for _, s := range schemas {
+		if s != "" {
+			scope.Schemas[s] = true
+		}
+	}
+	for _, r := range relations {
+		schema, table, ok := strings.Cut(r, ".")
+		if !ok || schema == "" || table == "" || strings.Contains(table, ".") {
+			continue
+		}
+		scope.Relations[r] = true
+		scope.RelationSchemas[schema] = true
+	}
+	return scope
+}
+
 // BundleBuilder builds an OPA bundle (gzip'd tarball per OPA's bundle spec)
 // from a GroupCatalogs input. The returned bytes are suitable for serving
 // from a bundle endpoint or POSTing through OPA's bundle service API.
 type BundleBuilder interface {
-	BuildBundle(gc GroupCatalogs) ([]byte, error)
+	BuildBundle(gc GroupCatalogs, gs GroupScopes) ([]byte, error)
 }
 
 // AdminPrincipal is the Trino username the provisioner authenticates as

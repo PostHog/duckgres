@@ -46,7 +46,7 @@ func largeFixture(orgs int) GroupCatalogs {
 // decisions against it).
 func preparedLargeBundle(b interface{ Fatalf(string, ...interface{}) }, orgs int) rego.PreparedEvalQuery {
 	ctx := context.Background()
-	data, err := buildDataDocument(largeFixture(orgs))
+	data, err := buildDataDocument(largeFixture(orgs), nil)
 	if err != nil {
 		b.Fatalf("buildDataDocument: %v", err)
 	}
