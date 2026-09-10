@@ -6,7 +6,7 @@ import { EmptyState, ErrorState, LoadingState } from "@/components/states";
 import { InfoTooltip } from "@/components/InfoTooltip";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useOrgDailyUsage } from "@/hooks/useApi";
-import { fmtTime, fmtUnits } from "@/lib/format";
+import { fmtBytes, fmtUnits } from "@/lib/format";
 import { GIB_HOURS_TOOLTIP } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
 import type { DailyUsageRow } from "@/types/api";
@@ -32,27 +32,28 @@ const PERIODS: { key: PeriodKey; label: string }[] = [
 
 // The API retains an informational team stamp, but storage belongs to the org.
 // Collapse all stamps into one value per UTC date.
-function dailyStorage(rows: DailyUsageRow[]) {
+function dailyUsage(rows: DailyUsageRow[], metric: "storage" | "scan") {
   const byDate = new Map<string, number>();
   for (const r of rows) {
-    byDate.set(r.date, (byDate.get(r.date) ?? 0) + Number(r.gib_seconds) / 3600);
+    byDate.set(r.date, (byDate.get(r.date) ?? 0) + (metric === "storage" ? Number(r.gib_seconds) / 3600 : Number(r.bytes_scanned)));
   }
   return [...byDate.entries()]
-    .map(([date, storage]) => ({ date, storage }))
+    .map(([date, value]) => ({ date, value }))
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
-function UsageChart({ rows }: { rows: DailyUsageRow[] }) {
-  const data = useMemo(() => dailyStorage(rows), [rows]);
-  const total = useMemo(() => data.reduce((sum, row) => sum + row.storage, 0), [data]);
+function UsageChart({ rows, metric }: { rows: DailyUsageRow[]; metric: "storage" | "scan" }) {
+  const data = useMemo(() => dailyUsage(rows, metric), [rows, metric]);
+  const total = useMemo(() => data.reduce((sum, row) => sum + row.value, 0), [data]);
+  const format = metric === "storage" ? fmtUnits : fmtBytes;
   return (
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-1.5">
-          S3 GiB·hours
-          <InfoTooltip label="Explain S3 GiB·h" text={GIB_HOURS_TOOLTIP} />
+          {metric === "storage" ? "S3 GiB·hours" : "Bytes scanned"}
+          {metric === "storage" && <InfoTooltip label="Explain S3 GiB·h" text={GIB_HOURS_TOOLTIP} />}
         </CardTitle>
-        <p className="text-xs text-muted-foreground">{fmtUnits(total)} total in window</p>
+        <p className="text-xs text-muted-foreground">{format(total)} total in window</p>
       </CardHeader>
       <CardContent>
         {data.length === 0 ? (
@@ -67,7 +68,7 @@ function UsageChart({ rows }: { rows: DailyUsageRow[] }) {
                 stroke="hsl(var(--muted-foreground))"
                 fontSize={10}
               />
-              <YAxis stroke="hsl(var(--muted-foreground))" fontSize={10} width={56} tickFormatter={fmtUnits} />
+              <YAxis stroke="hsl(var(--muted-foreground))" fontSize={10} width={56} tickFormatter={format} />
               <RTooltip
                 contentStyle={{
                   background: "hsl(var(--popover))",
@@ -75,9 +76,9 @@ function UsageChart({ rows }: { rows: DailyUsageRow[] }) {
                   borderRadius: 8,
                   fontSize: 12,
                 }}
-                formatter={(v: number) => [`${fmtUnits(v)} GiB·h`, "S3 storage"]}
+                formatter={(v: number) => metric === "storage" ? [`${fmtUnits(v)} GiB·h`, "S3 storage"] : [fmtBytes(v), "Bytes scanned"]}
               />
-              <Bar dataKey="storage" fill="hsl(var(--primary))" isAnimationActive={false} />
+              <Bar dataKey="value" fill="hsl(var(--primary))" isAnimationActive={false} />
             </BarChart>
           </ResponsiveContainer>
         )}
@@ -86,7 +87,7 @@ function UsageChart({ rows }: { rows: DailyUsageRow[] }) {
   );
 }
 
-// OrgUsageSection renders the org's daily S3 usage over a selectable window.
+// OrgUsageSection renders retained daily scan and S3 usage.
 // Cost data is admin-only —
 // viewers get nothing at all (the API 403s them anyway; this keeps the page
 // clean and avoids the wasted request).
@@ -105,7 +106,7 @@ export function OrgUsageSection({ orgId }: { orgId: string }) {
         <div>
           <CardTitle>Usage</CardTitle>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Daily S3 storage-time (GiB·h) for this organization, summed over the retained billing buffer.
+            Daily query scan bytes and S3 storage-time (GiB·h). Failed and cancelled queries are included.
           </p>
         </div>
         <div className="flex items-center gap-1">
@@ -123,20 +124,17 @@ export function OrgUsageSection({ orgId }: { orgId: string }) {
         </div>
       </CardHeader>
       <CardContent>
-        {usage.data?.watermark_low && (
-          <p className="mb-3 rounded-md border border-warning/40 bg-warning/5 p-2 text-xs text-muted-foreground">
-            Usage at or before {fmtTime(usage.data.watermark_low)} has been billed and removed from the buffer, so the
-            left edge of the selected period may be partial.
-          </p>
-        )}
         {usage.isError ? (
           <ErrorState error={usage.error} onRetry={() => usage.refetch()} />
         ) : usage.isLoading ? (
           <LoadingState />
         ) : rows.length === 0 ? (
-          <EmptyState title="No usage recorded" description={`No usage for this org in the last ${days} days of the retained buffer.`} />
+          <EmptyState title="No usage recorded" description={`No usage for this org in the last ${days} days.`} />
         ) : (
-          <UsageChart rows={rows} />
+          <div className="grid gap-3 lg:grid-cols-2">
+            <UsageChart rows={rows} metric="scan" />
+            <UsageChart rows={rows} metric="storage" />
+          </div>
         )}
       </CardContent>
     </Card>

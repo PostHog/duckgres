@@ -1,3 +1,6 @@
+> Historical design, superseded entirely by [scan bytes and storage billing](billing-pull-api.md).
+> DuckDB compute metering and its API are removed; this file records the old design only.
+
 # Compute-Seconds Billing — Design / Implementation Plan
 
 Status: **PARTIALLY SUPERSEDED**. The metering side (connection wall-clock ×

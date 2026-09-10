@@ -15,8 +15,8 @@ func SetupMultiTenant(
 	srv *server.Server,
 	memBudget uint64,
 	isHealthy func() bool,
-) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, *computeMeter, error) {
-	return nil, nil, nil, nil, nil, nil, errMultiTenantRequiresKubernetes()
+) (ConfigStoreInterface, OrgRouterInterface, *http.Server, *ControlPlaneRuntimeTracker, *JanitorLeaderManager, error) {
+	return nil, nil, nil, nil, nil, errMultiTenantRequiresKubernetes()
 }
 
 // errMultiTenantRequiresKubernetes is returned via a helper (not an inline

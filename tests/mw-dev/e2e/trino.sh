@@ -167,6 +167,38 @@ trino_query "$DB_A" "$pw_a" "CREATE VIEW $CAT_A.$schema.$view AS SELECT * FROM $
 tables="$(trino_query "$DB_A" "$pw_a" "SHOW TABLES FROM $CAT_A.$schema")"
 printf %s "$tables" | jq -e --arg t "$table" --arg v "$view" \
   'any(.[]; .[0] == $t) and any(.[]; .[0] == $v)' >/dev/null || fail "SHOW TABLES missed table/view: $tables"
+
+log "Trino completed-event delivery and immutable billing batches"
+usage_status="$(curl -sS -o /tmp/trino-usage-unauthorized -w '%{http_code}' \
+  -X POST -H 'Content-Type: application/json' --data '{}' "$API/api/v1/trino/usage")"
+[ "$usage_status" = 401 ] || fail "unauthenticated usage ingestion returned $usage_status, want 401"
+usage_found=false
+i=0
+while [ "$i" -lt 60 ]; do
+  usage_batch="$(api -X POST "$API/api/v1/billing/batches/next")"
+  batch_id="$(printf %s "$usage_batch" | jq -r '.batch.batch_id // empty')"
+  if [ -n "$batch_id" ]; then
+    batch_repeat="$(api -X POST "$API/api/v1/billing/batches/next")"
+    [ "$(printf %s "$batch_repeat" | jq -cS .)" = "$(printf %s "$usage_batch" | jq -cS .)" ] \
+      || fail "billing retry changed the pending batch"
+    if printf %s "$usage_batch" | jq -e --arg org "$ORG_A" --argjson team "$TEAM_A" \
+      'any(.batch.scans[]; .org_id == $org and .team_id == $team and .bytes_scanned > 0 and .query_count > 0)' >/dev/null; then
+      usage_found=true
+    fi
+    api -X POST "$API/api/v1/billing/batches/$batch_id/ack" | jq -e --arg id "$batch_id" '.acked == $id' >/dev/null \
+      || fail "billing ACK failed"
+    api -X POST "$API/api/v1/billing/batches/$batch_id/ack" | jq -e --arg id "$batch_id" '.acked == $id' >/dev/null \
+      || fail "billing repeated ACK failed"
+    batch_replay="$(api "$API/api/v1/billing/batches/$batch_id")"
+    [ "$(printf %s "$batch_replay" | jq -cS .)" = "$(printf %s "$usage_batch" | jq -cS .)" ] \
+      || fail "billing replay changed an acknowledged batch"
+  fi
+  [ "$usage_found" = true ] && break
+  sleep 2
+  i=$((i + 1))
+done
+[ "$usage_found" = true ] || fail "Trino scan usage did not reach the billing batch API"
+
 trino_query "$DB_A" "$pw_a" "EXPLAIN SELECT * FROM $CAT_A.$schema.$table" >/dev/null
 trino_query "$DB_A" "$pw_a" "CREATE TABLE $CAT_A.$schema.$scratch (id INTEGER)" >/dev/null
 trino_query "$DB_A" "$pw_a" "INSERT INTO $CAT_A.$schema.$scratch VALUES 1, 2" >/dev/null

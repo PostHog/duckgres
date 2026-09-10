@@ -76,8 +76,8 @@ Added for the console:
 | `POST /api/v1/orgs/:id/users/:username/disable` | admin | persist `disabled=true` (refused at pgwire connect), reload the snapshot cluster-wide so the block is immediate, AND kill the user's live sessions. Returns `{disabled, killed, …}` |
 | `POST /api/v1/orgs/:id/users/:username/enable` | admin | persist `disabled=false` + reload cluster-wide so the user can reconnect at once |
 | `GET /api/v1/metrics/panels`, `/metrics/query_range` | viewer | Prometheus proxy (allow-listed panels only) |
-| `GET /api/v1/usage/monthly` | admin | cumulative per-team usage per UTC month (CPU-seconds, memory GiB-seconds, S3 GiB-seconds), backing the **Usage** page. The response also identifies the control plane's effective `aws_region` and its derived `customer_pricing_region`. Self-gates with `RequireAdmin` (not just RoleGate's method check) because per-team cost data across all orgs is as sensitive as the raw billing families. Reads the SAME billing buffer as `GET /billing/usage`, so retention is the buffer's: acked buckets are deleted, >30d buckets GC'd — `watermark_low` in the response marks where billed data was removed. `?months=N` (default 6, max 36) sets the window |
-| `GET /api/v1/orgs/:id/usage/daily` | admin | one org's daily per-team usage series (same families), backing the org detail page's **Usage** charts. Same RequireAdmin gate and buffer-retention semantics; the org scope is the `:id` path segment flowing into the queries' WHERE clause. `?days=N` (default 14, max 31 — the buffer's 30d GC bounds useful range) |
+| `GET /api/v1/usage/monthly` | admin | retained per-team usage per UTC month (`bytes_scanned`, S3 `gib_seconds`), backing the **Usage** page. The response also identifies the control plane's effective `aws_region` and its derived `customer_pricing_region`. Self-gates with `RequireAdmin` (not just RoleGate's method check) because per-team cost data across all orgs is as sensitive as the raw billing families. Reads the retained query ledger and storage samples; billing acknowledgements never remove history. Scan bytes include failed and cancelled queries, grouped by UTC completion time. `?months=N` (default 6, max 36) sets the window |
+| `GET /api/v1/orgs/:id/usage/daily` | admin | one org's daily per-team usage series (same families), backing the org detail page's **Usage** charts. Same RequireAdmin gate and indefinite retention; the org scope is the `:id` path segment flowing into the queries' WHERE clause. `?days=N` (default 14, max 31 to bound response size) |
 | `GET /api/v1/orgs/:id/monitoring/snapshot` | internal secret | Customer-safe org warehouse state, resource limits, workers, sessions, queue depth, and CP coverage. Omits user, pod, image, SQL, client, trace, and control-plane identifiers |
 | `GET /api/v1/orgs/:id/monitoring/series` | internal secret | Customer-safe, org-forced Prometheus range query. Requires an allow-listed `metric`; `window` is one of `1h`, `6h`, `24h` (default), `7d`, `30d` |
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
@@ -94,7 +94,11 @@ Added for the console:
 | `POST /api/v1/operators` | admin | add/update an operator (`{email, role}`; last-admin demotion → 409) |
 | `DELETE /api/v1/operators/:email` | admin | remove an operator (removing the last admin → 409) |
 
-The Usage page currently presents storage only. It converts retained S3 GiB·h
+The Usage page presents query scan volume alongside storage economics. Scan
+bytes have no price estimate; cost, price and margin totals cover storage only.
+The daily organization view shows both scan bytes and storage-time. API byte
+aggregates preserve exact decimal digits; charts use rounded display values.
+It converts retained S3 GiB·h
 to GiB-month using the actual number of hours in the selected UTC calendar
 month. Customer pricing is selected automatically from the control plane's
 effective `DUCKGRES_AWS_REGION`: `us-*` uses the US schedule and `eu-*` uses

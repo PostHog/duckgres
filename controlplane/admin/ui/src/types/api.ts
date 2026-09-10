@@ -692,18 +692,14 @@ export interface ExternalMetadataStoreInfo {
   database: string;
 }
 
-// GET /api/v1/usage/monthly — the Usage page. Rows are per (UTC month, org,
-// team), merged across the compute + storage billing families over the
-// RETAINED billing buffer (acked buckets are deleted; >30d buckets GC'd) —
-// watermark_low is the billing ack cursor that bounds how far back data can
-// exist. gib_seconds is the exact-decimal GiB-seconds JSON number.
+// GET /api/v1/usage/monthly: retained scan bytes and storage time by UTC month, org and team.
+// API numbers are exact; browser numbers are used only for approximate display.
 export interface MonthlyUsageRow {
   month: string; // "YYYY-MM" UTC
   org_id: string;
   team_id: number;
   schema_name: string | null;
-  cpu_seconds: number;
-  memory_seconds: number;
+  bytes_scanned: number;
   gib_seconds: number;
 }
 
@@ -712,20 +708,15 @@ export interface MonthlyUsageResponse {
   months: number;
   aws_region: string;
   customer_pricing_region: "US" | "EU";
-  watermark_low: string | null;
   rows: MonthlyUsageRow[];
 }
 
-// GET /api/v1/orgs/:id/usage/daily — the org detail page's usage charts.
-// One row per (UTC date, team), compute + storage merged, over the retained
-// billing buffer (same retention as the monthly view: acked buckets are
-// deleted, >30d buckets GC'd — watermark_low marks where billed data went).
+// GET /api/v1/orgs/:id/usage/daily: retained usage by UTC completion date and team.
 export interface DailyUsageRow {
   date: string; // "YYYY-MM-DD" UTC
   team_id: number;
   schema_name: string | null;
-  cpu_seconds: number;
-  memory_seconds: number;
+  bytes_scanned: number;
   gib_seconds: number;
 }
 
@@ -733,7 +724,6 @@ export interface DailyUsageResponse {
   org_id: string;
   days: number;
   from: string;
-  watermark_low: string | null;
   rows: DailyUsageRow[];
 }
 

@@ -6,7 +6,7 @@ import { EmptyState } from "@/components/states";
 import { InfoTooltip } from "@/components/InfoTooltip";
 import { OrgRef } from "@/components/OrgRef";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { fmtUnits } from "@/lib/format";
+import { fmtBytes, fmtUnits } from "@/lib/format";
 import {
   AWS_COST_TOOLTIP,
   BINARY_UNITS_NOTE,
@@ -27,6 +27,7 @@ function fmtMargin(profit: number, percent: number | null): string {
 
 type SortKey =
   | "org"
+  | "bytesScanned"
   | "storageGiBHours"
   | "cost"
   | "price"
@@ -93,6 +94,11 @@ export function UsagePricing({
     key: "org",
     direction: "asc",
   });
+  const scanByOrg = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const row of rows) totals.set(row.org_id, (totals.get(row.org_id) ?? 0) + Number(row.bytes_scanned));
+    return totals;
+  }, [rows]);
   const totals = useMemo(() => orgTotals(rows), [rows]);
   const pricing = useMemo(() => priceStorageByOrg(totals, month, region), [totals, month, region]);
   const sortedRows = useMemo(() => {
@@ -105,8 +111,8 @@ export function UsagePricing({
         const comparison = tieBreak(a, b);
         return sort.direction === "asc" ? comparison : -comparison;
       }
-      const av = a[sort.key];
-      const bv = b[sort.key];
+      const av = sort.key === "bytesScanned" ? (scanByOrg.get(a.orgId) ?? 0) : a[sort.key];
+      const bv = sort.key === "bytesScanned" ? (scanByOrg.get(b.orgId) ?? 0) : b[sort.key];
       const aMissing = av == null || !Number.isFinite(av);
       const bMissing = bv == null || !Number.isFinite(bv);
       if (aMissing !== bMissing) return aMissing ? 1 : -1;
@@ -114,7 +120,7 @@ export function UsagePricing({
       const comparison = (av as number) - (bv as number);
       return comparison === 0 ? tieBreak(a, b) : sort.direction === "asc" ? comparison : -comparison;
     });
-  }, [labels, pricing.rows, sort]);
+  }, [labels, pricing.rows, scanByOrg, sort]);
 
   const handleSort = (key: SortKey) => {
     setSort((current) =>
@@ -128,16 +134,16 @@ export function UsagePricing({
     <Card className="mt-4">
       <CardHeader>
         <div>
-          <CardTitle>Storage economics</CardTitle>
+          <CardTitle>Usage and storage economics</CardTitle>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Estimated AWS storage cost, customer price, and gross margin for retained usage in {month}.
+            Estimated AWS storage cost, customer price, and gross margin for storage usage in {month}. Scan volume has no price estimate.
           </p>
           <p className="mt-1 text-xs text-muted-foreground">{BINARY_UNITS_NOTE}</p>
         </div>
       </CardHeader>
       <CardContent>
         {pricing.rows.length === 0 ? (
-          <EmptyState title="No usage rows" description="Pick a month with retained storage usage above to price it." />
+          <EmptyState title="No usage rows" description="Pick a month with usage above." />
         ) : (
           <Table>
             <TableHeader>
@@ -145,6 +151,13 @@ export function UsagePricing({
                 <SortableHeader
                   sortKey="org"
                   label="Org"
+                  activeKey={sort.key}
+                  direction={sort.direction}
+                  onSort={handleSort}
+                />
+                <SortableHeader
+                  sortKey="bytesScanned"
+                  label="Bytes scanned"
                   activeKey={sort.key}
                   direction={sort.direction}
                   onSort={handleSort}
@@ -208,6 +221,7 @@ export function UsagePricing({
                       <OrgRef id={row.orgId} label={labels?.get(row.orgId)} copyable={false} />
                     </Link>
                   </TableCell>
+                  <TableCell className="font-mono text-xs">{fmtBytes(scanByOrg.get(row.orgId) ?? 0)}</TableCell>
                   <TableCell className="font-mono text-xs">{fmtUnits(row.storageGiBHours)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{fmtMoney(row.cost)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{fmtMoney(row.price)}</TableCell>
@@ -221,6 +235,7 @@ export function UsagePricing({
               ))}
               <TableRow className="border-t-2 font-semibold">
                 <TableCell className="text-xs">All orgs</TableCell>
+                <TableCell className="font-mono text-xs">{fmtBytes([...scanByOrg.values()].reduce((sum, bytes) => sum + bytes, 0))}</TableCell>
                 <TableCell className="font-mono text-xs">{fmtUnits(pricing.summary.storageGiBHours)}</TableCell>
                 <TableCell className="text-right font-mono text-xs">{fmtMoney(pricing.summary.cost)}</TableCell>
                 <TableCell className="text-right font-mono text-xs">{fmtMoney(pricing.summary.price)}</TableCell>

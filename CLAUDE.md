@@ -139,7 +139,7 @@ Key CLI flags for control-plane mode:
   - Config store: `--config-store`, `--config-poll-interval`, `--internal-secret`
   - K8s pool: `--k8s-worker-image`, `--k8s-worker-namespace`, `--k8s-control-plane-id`, `--k8s-worker-port`, `--k8s-worker-secret`, `--k8s-worker-configmap`, `--k8s-worker-image-pull-policy`, `--k8s-worker-service-account` (no global worker cap — per-org `Org.MaxWorkers`, 0=unbounded, is the only cap)
   - AWS / STS: `--aws-region`
-  - Compute-usage billing needs no config: metering is always on for the remote backend and billing PULLS usage over the internal-secret-authed HTTP API (`GET /api/v1/billing/usage` + `POST /api/v1/billing/ack`). See `docs/design/billing-pull-api.md` and "Compute-Usage Billing" below.
+  - Billing reports native Trino scan bytes and unchanged storage GiB-seconds through retained batches; see `docs/design/billing-pull-api.md` and "Scan-byte and storage billing" below.
   - Pod scheduling knobs (CPU/memory requests, node selector, tolerations) are env-only — see `config_resolution.go`.
 
 Key CLI flags for duckdb-service mode:
@@ -1118,166 +1118,31 @@ not the CP's. The CP wires the suffix from its first configured
   caller-side minter in the PostHog repo
   (`products/managed_warehouse/backend/service_credentials.py`).
 
-## Compute-Usage Billing (managed-warehouse, remote backend only)
+## Scan-byte and storage billing
 
-duckgres meters per-org compute usage of worker pods into 60s buckets in the
-config store; the billing service **pulls** the accumulated usage over an HTTP
-API and acks a watermark, at which point duckgres deletes the acked buckets.
-Full design + decisions: `docs/design/billing-pull-api.md` (supersedes the
-push/capture reporting hop of `billing-compute-seconds-plan.md`; the metering
-side of that doc still applies). Scope is **only** the remote/k8s backend
-(per-org worker pod with a known `WorkerProfile` size). Pipeline:
+The current accounting contract and operational runbook are in
+`docs/design/billing-pull-api.md`. Trino native completion events are committed
+through `POST /api/v1/trino/usage` using the dedicated per-cell usage token. All
+query outcomes count at `physicalInputBytes`; `(cell, query ID)` deduplicates.
+Historical principal ownership is remembered before authentication projection.
+Unknown principals remain durable but unexported until resolved.
 
-```
-compute: conn end → in-proc counter keyed (org, informational team, query_source, worker size)
-              │  flusher (~15s) UPSERT-increment → config-store buffer (cross-CP sum)
-              ▼  duckgres_org_compute_usage (+ duckgres_compute_billing_cursor)
-storage: leader sampler (~30m) → org's DuckLake metadata Postgres
-              SUM(data+delete file sizes) × interval → duckgres_org_storage_usage
-billing: GET /api/v1/billing/usage (usage + storage arrays, per key per UTC day, watermarks)
-       → POST /api/v1/billing/ack {watermark_high} → cursor advance + delete ≤ it (BOTH tables)
-safety:  leader-only GC hard-deletes buckets older than 30 days (WARN, alertable)
-```
+Billing uses immutable `POST /billing/batches/next`, exact-ID `POST
+/billing/batches/:batch_id/ack`, and retained `GET /billing/batches/:batch_id`.
+There is one outstanding batch, no destructive watermark, no retention GC, and
+no DuckDB compute meter. Preserve exact numeric amounts and transactional batch
+membership. Storage still samples tracked DuckLake data+delete files at the
+existing cadence and reports GiB-seconds; additive same-minute samples must not
+be lost during export. Ack never removes usage or changes admin history.
 
-Two raw metrics per connection over its full lifetime, using the **provisioned**
-worker size: `cpu_seconds = vCPU × ceil(conn_secs)`, `memory_seconds = GiB ×
-ceil(conn_secs)`. Counted internally in integer **millicore-seconds** /
-**MiB-seconds** (`compute_meter.go`) to avoid truncating a fractional-core /
-sub-GiB worker; worker size is stored in the bucket key as exact NUMERIC
-decimals (vCPU / GiB). `team_id` is **informational only** (an integer —
-PostHog's `Team.id`; a JSON NUMBER on every API surface): duckgres does NOT
-own team-level billing attribution — the external billing service maps
-org → team(s) itself. The stamp is resolved from the config snapshot at
-record time: compute buckets get the CONNECTING USER's team
-(`duckgres_org_users.team_id`, e.g. a project-reader login) when it has one,
-else the org's OLDEST team (min `created_at`, ties broken by the smaller
-`team_id` — in practice the provision-time first team; `ConfigStore.OrgUsageTeamID`);
-storage buckets always get the oldest team (`OrgOldestTeamID`). 0 appears
-only defensively (unknown org / stale snapshot — a committed org always has
-at least one team). Team changes/deletions NEVER re-attribute existing
-buckets; `query_source` is the
-`duckgres.query_source` session GUC (`standard` unless set; a mid-connection
-change bills the whole connection under the final value). The GUC is a **closed
-enum validated at SET time** (`transform.NormalizeQuerySource`): only
-`standard` | `endpoints` (case-insensitive, normalized to lowercase; empty =
-reset to default) — anything else is rejected with `22023` on every set path
-(simple/batched SET, extended Parse, and the `-c` startup option, which rejects
-the connection like invalid `duckgres.worker_*` options), and
-`server.ConnectionBilling` clamps a non-canonical value to `standard` as
-defense in depth so client junk can never become a billing bucket key.
-Invariants for anyone
-touching this path:
+Admin daily/monthly views show scan volume and storage usage. Storage price
+calculations remain storage-only; no scan price is invented. Query/row dates
+represent occurrence while each batch's UTC `billing_month` controls invoicing.
 
-- **Metering is strictly best-effort and off the hot path.** A metering error
-  (counter, flush) must NEVER block or fail a query or connection teardown. The
-  connection-end record is added to an in-process counter (map+mutex,
-  microseconds, no I/O); the flush is async. `cp.computeMeter` is nil outside
-  the remote backend — every call site is nil-safe. There is no enable knob:
-  the remote backend always meters.
-- **Worker size is plumbed onto the connection** (`server.SetConnectionWorkerSize`
-  → `clientConn.workerMillicores/workerMiB`, set in `control.go::handleConnection`
-  from `workerBillingSize(workerProfile)`, remote-only). `workerMillicores==0`
-  (non-remote / unknown) → metering skipped. The metric is computed once at the
-  SAME teardown point as `CloseConnectionMetrics` (the `#841` lifetime defer),
-  via `server.ConnectionBilling` (which also carries the query source).
-- **Bucket = connection-end time floored to 60s.** Flush carries the sub-unit
-  remainder forward so rounding never loses counts across flushes. Buffer flush
-  is UPSERT-increment so all CP pods sum into one row per key.
-- **Serve only closed buckets.** `watermark_high` = the newest bucket with
-  `bucket_start ≤ now − 60s − 30s grace` (grace > flush interval, so every
-  CP's contribution has landed before a minute is served). The GET aggregates
-  the window `(cursor, watermark_high]` into one row per
-  `(org, team, query_source, cpu, mem_gib)` per **UTC day** — response size is
-  bounded by active keys × days, so billing downtime can't make it explode.
-- **Ack is the only deletion path (plus the 30d GC).** `POST /billing/ack`
-  advances the single global cursor monotonically and deletes buckets
-  `≤ watermark_high` in one TXN (`AckComputeUsage`). Idempotent — re-acks and
-  stale acks are no-ops. An ack beyond the latest closed bucket is rejected
-  (400) so it can never delete buckets that were never served. Auth is the
-  admin internal secret (`RequireAdmin` on both routes, registered inside the
-  audited `/api/v1` group in `multitenant.go`).
-- **Safety GC is leader-only** (`runComputeUsageGC`, attached under the janitor
-  lease): hard-deletes buckets older than 30 days regardless of ack and logs a
-  WARN with the dropped count — nonzero means billing stopped pulling (alert).
-- **Graceful shutdown does a final flush** after connections drain to their
-  natural end (`shutdown`/`drainAndShutdown`), so a departing CP pod lands its
-  last interval before exit.
-- **Org team CRUD (`duckgres_org_teams`)**: the PostHog backend manages an
-  org's team rows via `GET/POST /api/v1/orgs/:id/teams` +
-  `DELETE /api/v1/orgs/:id/teams/:team_id` (internal secret,
-  `controlplane/provisioning`). The POST is the **grandfather upsert**: it MAY
-  overwrite an existing row's `schema_name` and the legacy
-  `events_table_name`/`persons_table_name`/`schema_data_imports_name`
-  overrides (NULL = derive from `schema_name`: `<schema>.events`,
-  `<schema>.persons`, `<schema>_data_imports`), because the PostHog backfill
-  replaces migration 000024's `team_<id>` placeholder through it. Two teams in
-  one org can never share a schema (unique `(org_id, schema_name)`, migration
-  000025 → 409). Provisioning a warehouse for a NEW org REQUIRES `team_id`
-  (`ErrProvisionTeamRequired` → 400; `default_team_id` is accepted as a
-  transitional alias) and creates the org's first plain team row — a
-  warehouse cannot exist without a team. DELETE removes CONFIG only (never
-  warehouse data) and never touches usage buckets; the org's LAST team is
-  undeletable (409 — an org must always have at least one team; delete the
-  org instead). The admin console mirrors this on a user-facing surface
-  (`GET /teams`, `POST /teams`, `PUT /orgs/:id/teams/:team_id`) where
-  `schema_name` is immutable. Shared rules live in
-  `configstore.UpsertOrgTeamTx` / `DeleteOrgTeamTx`; tests:
-  `tests/configstore/org_teams_postgres_test.go`, the provisioning/admin API
-  tests, and `org_teams_crud` in the e2e harness.
-- **Storage metric** (`managed_warehouse_storage_gib_seconds`,
-  `storage_meter.go`): a LEADER-ONLY sampler (double writers would
-  double-bill — the UPSERT is additive) visits each Ready warehouse's DuckLake
-  metadata Postgres every 30m (env-only `DUCKGRES_STORAGE_SAMPLE_INTERVAL`;
-  e2e uses 60s) and credits exactly `tracked_bytes × interval` byte-seconds —
-  no elapsed-time tracking, a missed sample under-bills one interval. The SUM
-  is over `ducklake_data_file` + `ducklake_delete_file` with NO snapshot
-  filter (never `ducklake_table_info()`/`ducklake_table_stats` — current-
-  snapshot-only / approximate). byte-seconds are NUMERIC (BIGINT overflows);
-  served as exact-decimal GiB-seconds (÷2³⁰ terminates;
-  `byteSecondsToGiBSeconds` big-int math). Connection resolution reuses the
-  cross-org activator (`MetadataPostgresURL`: duckling pgbouncer → sslmode
-  disable, direct RDS → require). Drift gauges:
-  `duckgres_org_storage_pending_delete_files` (alert on sustained nonzero) +
-  `duckgres_org_storage_tracked_bytes`.
-- **The admin console usage views read the SAME buffer** —
-  `GET /api/v1/usage/monthly` (the **Usage** page) and
-  `GET /api/v1/orgs/:id/usage/daily` (the org detail page's **Usage** charts)
-  in `controlplane/admin/usage_api.go`, backed by
-  `configstore.Aggregate{Compute,Storage}Usage{Monthly,Daily}`, sum retained
-  buckets per UTC month / per UTC day per (org, team), merging the compute and
-  storage families and joining the team schema name for display. Both
-  self-gate with `RequireAdmin` (per-team cost data across all orgs is as
-  sensitive as the raw billing families — viewers get 403, and the UI hides
-  the nav item / fires no query for them). The daily endpoint's org scope is
-  the `:id` path segment flowing into the queries' WHERE clause — one org's
-  usage must never leak into another org's page (the e2e asserts
-  `.org_id == $o` on the response). These are operations views, NOT invoices:
-  acked buckets are already deleted and >30d buckets are
-  GC'd, so responses carry the ack cursor as `watermark_low` and the UI
-  shows the retention caveat instead of implying all-time totals. They add NO
-  second accounting pipeline — keep them pure reads over the buffer.
-  The Usage page also carries a **client-side pricing-sensitivity calculator**
-  (`ui/src/pages/UsagePricing.tsx` + `lib/pricing.ts`): named unit-price
-  scenarios ($/CPU-min, $/GiB·min, $/GiB·h) priced against each org's month
-  totals. It is pure browser math over the monthly rows — no endpoint, no
-  persistence beyond the operator's own localStorage — so it inherits the
-  page's admin-only gate and needs no server-side access control of its own
-  (a PM gets it by holding the console admin role; a lighter pricing-viewer
-  role is a named follow-up, not implemented).
-- Touching the meter/flush/API/GC, the worker-size or query-source plumbing,
-  the storage sampler, or the bucket keys → update
-  `controlplane/compute_meter_test.go`, `compute_billing_api_test.go`,
-  `compute_size_test.go`, `storage_meter_test.go`,
-  `configstore/storage_usage_test.go`, the migration assertion in
-  `tests/configstore/migrations_postgres_test.go`, and the
-  `compute_usage_pull_api` assertion (compute + storage, incl. the
-  `usage-monthly` checks) in
-  `tests/mw-dev/e2e/harness.sh`. Touching the monthly/daily aggregation or
-  the usage views → update `controlplane/admin/usage_api_test.go`,
-  `tests/configstore/usage_monthly_postgres_test.go` +
-  `usage_daily_postgres_test.go`,
-  `ui/src/pages/Usage.test.tsx` + `OrgUsage.test.tsx`, and the
-  `usage-monthly` / `usage-daily` harness checks.
+Changes must update HTTP tests, PostgreSQL ledger/aggregation tests and the
+applicable real-stack harness: `tests/mw-dev/e2e/harness.sh` for storage,
+`tests/mw-dev/e2e/trino.sh` for native completion delivery. Document rollout
+ordering (RBAC, CP, listener, consumer) and keep SQL/secrets out of usage records.
 
 ## Discovery Endpoints (external-writer tenant listing)
 

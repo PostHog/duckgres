@@ -26,13 +26,12 @@ const RESPONSE: MonthlyUsageResponse = {
   months: 3,
   aws_region: "us-east-1",
   customer_pricing_region: "US",
-  watermark_low: "2026-07-20T00:00:00Z",
   rows: [
     // Two historical team stamps for the same org must become one storage row.
-    { month: "2026-08", org_id: "acme", team_id: 5, schema_name: "team_5", cpu_seconds: 1, memory_seconds: 1, gib_seconds: gibSeconds(200) },
-    { month: "2026-08", org_id: "acme", team_id: 6, schema_name: "team_6", cpu_seconds: 1, memory_seconds: 1, gib_seconds: gibSeconds(400) },
-    { month: "2026-08", org_id: "globex", team_id: 9, schema_name: "team_9", cpu_seconds: 1, memory_seconds: 1, gib_seconds: gibSeconds(50) },
-    { month: "2026-07", org_id: "acme", team_id: 5, schema_name: "team_5", cpu_seconds: 600, memory_seconds: 600, gib_seconds: 0 },
+    { month: "2026-08", org_id: "acme", team_id: 5, schema_name: "team_5", bytes_scanned: 1, gib_seconds: gibSeconds(200) },
+    { month: "2026-08", org_id: "acme", team_id: 6, schema_name: "team_6", bytes_scanned: 1, gib_seconds: gibSeconds(400) },
+    { month: "2026-08", org_id: "globex", team_id: 9, schema_name: "team_9", bytes_scanned: 1, gib_seconds: gibSeconds(50) },
+    { month: "2026-07", org_id: "acme", team_id: 5, schema_name: "team_5", bytes_scanned: 600, gib_seconds: 0 },
   ],
 };
 
@@ -62,17 +61,18 @@ describe("Usage page", () => {
     expect(screen.queryByText(/per-team/i)).not.toBeInTheDocument();
   });
 
-  it("shows storage only and aggregates historical team rows into one org row", () => {
+  it("shows scan volume and aggregates historical team rows into one org row", () => {
     hooks.useMonthlyUsage.mockReturnValue(ok(RESPONSE));
     renderPage();
 
-    expect(screen.getByText(/storage-time.*retained billing buffer/i)).toBeInTheDocument();
+    expect(screen.getByText(/scan.*storage-time/i)).toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: "Team" })).not.toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: /CPU/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: /Memory/i })).not.toBeInTheDocument();
     expect(screen.queryByText("team_5")).not.toBeInTheDocument();
     expect(screen.queryByText("team_6")).not.toBeInTheDocument();
 
+    expect(screen.getByTestId("stat-Bytes scanned")).toBeInTheDocument();
     expect(screen.getAllByRole("table")).toHaveLength(1);
     const usageTable = screen.getByRole("table");
     expect(within(usageTable).getByRole("columnheader", { name: /allocated aws cost/i })).toBeInTheDocument();
@@ -84,11 +84,11 @@ describe("Usage page", () => {
     hooks.useMonthlyUsage.mockReturnValue(ok(RESPONSE));
     renderPage();
 
-    expect(within(screen.getByTestId("stat-Total cost")).getByText("$14.95")).toBeInTheDocument();
-    expect(within(screen.getByTestId("stat-Total price")).getByText("$19.50")).toBeInTheDocument();
-    expect(within(screen.getByTestId("stat-Total price")).getByText("US progressive tiers · us-east-1")).toBeInTheDocument();
-    expect(within(screen.getByTestId("stat-Total gross margin")).getByText("23.3%")).toBeInTheDocument();
-    expect(within(screen.getByTestId("stat-Total gross margin")).getByText("$4.55 gross profit")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Storage cost")).getByText("$14.95")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Storage price")).getByText("$19.50")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Storage price")).getByText("US progressive tiers · us-east-1")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Storage gross margin")).getByText("23.3%")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Storage gross margin")).getByText("$4.55 gross profit")).toBeInTheDocument();
     expect(screen.queryByTestId("stat-S3 GiB·h")).not.toBeInTheDocument();
     expect(screen.queryByTestId("stat-CPU-min")).not.toBeInTheDocument();
     expect(screen.queryByTestId("stat-Memory GiB·min")).not.toBeInTheDocument();
@@ -100,16 +100,16 @@ describe("Usage page", () => {
     );
     renderPage();
 
-    expect(within(screen.getByTestId("stat-Total price")).getByText("$21.45")).toBeInTheDocument();
-    expect(within(screen.getByTestId("stat-Total price")).getByText("EU progressive tiers · eu-central-1")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Storage price")).getByText("$21.45")).toBeInTheDocument();
+    expect(within(screen.getByTestId("stat-Storage price")).getByText("EU progressive tiers · eu-central-1")).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: /customer price.*eu/i })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /us pricing|eu pricing/i })).not.toBeInTheDocument();
   });
 
-  it("renders the retention caveat when billing has acked a watermark", () => {
+  it("retains billed usage without a deletion caveat", () => {
     hooks.useMonthlyUsage.mockReturnValue(ok(RESPONSE));
     renderPage();
-    expect(screen.getByText(/billed and removed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/billed and removed/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/garbage-collected/i)).not.toBeInTheDocument();
   });
 
@@ -120,7 +120,6 @@ describe("Usage page", () => {
         months: 3,
         aws_region: "us-east-1",
         customer_pricing_region: "US",
-        watermark_low: null,
         rows: [],
       }),
     );

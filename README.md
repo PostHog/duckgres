@@ -559,8 +559,7 @@ The org name is duckgres-internal, so the query events additionally carry a
 user's team, else the org's oldest team; 0 when unknown or standalone). This is
 the PostHog-native key that joins duckgres usage to the rest of PostHog (e.g.
 product-intent cohorts for managed-warehouse activation). It is a config-snapshot
-read stamped once per connection, and mirrors the informational team id the
-compute-usage meter records.
+read stamped once per connection. Billing uses the separate Trino usage ledger.
 
 Events never include SQL text, credentials, or secret values — only metadata.
 
@@ -1194,3 +1193,22 @@ The full, authoritative breakdown — every PostgreSQL feature with its support 
 ## License
 
 MIT
+
+## Scan bytes and storage billing
+
+Trino completion events report native `physicalInputBytes`, including failed and
+cancelled queries, to `POST /api/v1/trino/usage`. The provisioner generates a
+dedicated immutable `trino-usage-token` Secret. In the Trino chart,
+`queryUsage.enabled` defaults to `false`; enable it after the new Duckgres API and
+Secret RBAC are deployed. Ingestion accepts at most 16 MiB and waits up to 10s for
+a durable database write. The built-in HTTP listener retries transient failures;
+rare loss before ingestion is accepted.
+
+Billing uses `POST /api/v1/billing/batches/next` (optional `limit`, default/max
+10,000 per metric family), `POST /api/v1/billing/batches/:batch_id/ack`, and
+`GET /api/v1/billing/batches/:batch_id` for retained replay. The API reports exact
+scan bytes and storage GiB-seconds; DuckDB CPU/memory metering has been removed.
+Usage and batches are kept indefinitely. Storage measurement and its default
+30-minute sampling cadence remain unchanged. See the
+[billing contract and rollout/recovery runbook](docs/design/billing-pull-api.md)
+for downstream idempotency, month boundaries and deployment ordering.

@@ -384,9 +384,9 @@ func resetConfigStoreTables(t *testing.T, db *gorm.DB) {
 			t.Fatalf("delete %T: %v", model, err)
 		}
 	}
-	// Billing usage buffers have no gorm model (raw goose-migrated tables) but
+	// Billing usage tables have no gorm model (raw goose-migrated tables) but
 	// leak across tests on the shared schema all the same.
-	for _, table := range []string{"duckgres_org_compute_usage", "duckgres_org_storage_usage"} {
+	for _, table := range []string{"duckgres_trino_query_usage", "duckgres_trino_usage_principals", "duckgres_org_storage_usage"} {
 		if err := db.Exec("DELETE FROM " + table).Error; err != nil {
 			t.Fatalf("delete %s: %v", table, err)
 		}

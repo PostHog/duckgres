@@ -564,18 +564,14 @@ pg_compat_functions() { # org password
 }
 
 # query_source_guc exercises the duckgres.query_source session GUC end-to-end
-# (prerequisite for pull-based compute billing). The CP intercepts the
+# as a legacy session option. The CP intercepts the
 # duckgres-namespaced custom GUC in the SET/SHOW path and answers it from
 # session state — it is NEVER forwarded to a DuckDB worker (DuckDB rejects
 # unknown settings). Assertions, each in a single simple-query session:
 #   1. unset SHOW → default "standard" (never errors on a missing value)
 #   2. SET then SHOW in the same session → the value round-trips
-#   3. the value is a billing dimension (bucket key in
-#      duckgres_org_compute_usage + the billing pull API), so it is a closed
-#      enum: a non-{standard,endpoints} value MUST be rejected at SET time
-#      (22023 invalid_parameter_value) with an error naming the valid values,
-#      and a subsequent SHOW still reports the default — client junk must
-#      never reach the billing key (unbounded cardinality + junk in exports).
+#   3. the value remains a closed enum: non-{standard,endpoints} values
+#      are rejected with 22023 and do not modify the session setting.
 #   4. matching is case-insensitive, normalized to lowercase (SHOW reports the
 #      canonical form).
 #   5. a batch mixing the GUC SET with a normal statement runs the normal
@@ -596,7 +592,7 @@ query_source_guc() { # org password
   # The trailing SHOW never runs (ON_ERROR_STOP), and the session value is
   # untouched: a fresh session's SHOW below still reports the default.
   if out="$(pg_try "$1" "$2" ducklake "SET duckgres.query_source = 'garbage'; SHOW duckgres.query_source")"; then
-    fail "query_source: invalid value 'garbage' was accepted (junk would reach the billing bucket key): $out"
+    fail "query_source: invalid value 'garbage' was accepted: $out"
   fi
   case "$out" in
     *'must be "standard" or "endpoints"'*) ;;
@@ -762,144 +758,48 @@ connection_duration_logged() { # org password
   [ "$ms" -gt 0 ] || fail "disconnect duration_ms is $ms (want > 0 — backendStart not honoured?)"
 }
 
-# Managed-warehouse compute-usage billing (pull API, docs/design/billing-pull-api.md).
-# At connection teardown the CP meters cpu_seconds/memory_seconds from the
-# provisioned worker size over the connection lifetime into an in-proc counter
-# keyed (org, informational team, query_source, worker size), flushes it to
-# the durable config-store buffer (~15s), and serves it aggregated over
-# GET /api/v1/billing/usage; POST /api/v1/billing/ack advances the cursor and
-# deletes acked buckets. This asserts the FULL round-trip against the real
-# stack: two real connections (one standard, one with the duckgres.query_source
-# GUC set to endpoints) must surface as separate usage rows carrying the
-# stamped team id and a positive worker size, then an ack of the served
-# watermark_high must 200 and the next GET's watermark_low must equal it
-# (cursor advanced, acked buckets deleted). The stamped team_id is
-# INFORMATIONAL only (attribution is the external billing service's job): root
-# has no team of its own, so both compute rows and the storage rows carry the
-# org's OLDEST team = the provision-time first team ($CNPG_TEAM_ID). The
-# storage family is asserted in the same round-trip: the leader's sampler (60s
-# here) must serve a storage row with gib_seconds > 0 for the org, and the
-# shared ack must advance past it. A bucket closes ~90s after the connection
-# ends (60s width + 30s grace) plus ≤15s flush, so the poll allows ~4
-# minutes. The SAME buffer backs the admin console's Usage page, asserted here
-# too (before the ack deletes it): GET /api/v1/usage/monthly must show the
-# generated compute + storage under the current UTC month per team, and the
-# org detail page's daily series (GET /api/v1/orgs/:id/usage/daily) must show
-# it org-scoped under the current UTC day. This e2e stack has its own config
-# store, so acking here cannot eat production usage.
-compute_usage_pull_api() { # org password
+# Retained storage billing through the real sampler and config store. Trino's
+# listener-to-scan-batch coverage lives in trino.sh. This isolated stack has its
+# own config store; acknowledging test batches cannot affect production usage.
+storage_usage_batch_api() { # org password
   org="$1"; pw="$2"
-  log "compute-usage pull API round-trip on $org"
-
-  # Generate usage under both query sources. Each pg call is one connection;
-  # the batched SET applies to the SELECT's session (split-path, see #868).
+  log "storage billing batch round-trip on $org"
+  # Keep the following hot-idle assertions grounded in a real connection.
   pg "$org" "$pw" ducklake 'SELECT 1' >/dev/null
-  pg "$org" "$pw" ducklake "SET duckgres.query_source = 'endpoints'; SELECT 1" >/dev/null
-
-  # Poll until both rows are served (bucket close + flush lag).
   a=0 body=""
   while [ "$a" -lt 30 ]; do
-    body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
-    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" '
-        (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="standard"  and .cpu_seconds>0 and .cpu>0 and .mem_gib>0)) | length >= 1)
-        and
-        (.usage | map(select(.org_id==$o and .team_id==$t and .query_source=="endpoints" and .cpu_seconds>0)) | length >= 1)' >/dev/null 2>&1; then
+    body="$(curl -fsS -X POST -H "$H" "$API/api/v1/billing/batches/next")" || fail "billing batch pull failed"
+    if echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" '
+      [.batch.storage[]? | select(.org_id==$o and .team_id==$t and .gib_seconds>0)] | length >= 1' >/dev/null; then
       break
+    fi
+    # An outstanding batch is deliberately stable, so drain unrelated batches
+    # before waiting for the next successful storage sample (60s in this stack).
+    batch_id="$(echo "$body" | jq -r '.batch.batch_id // empty')"
+    if [ -n "$batch_id" ]; then
+      curl -fsS -X POST -H "$H" "$API/api/v1/billing/batches/$batch_id/ack" >/dev/null || fail "billing batch ack failed"
     fi
     sleep 10; a=$((a + 1))
   done
-  [ "$a" -lt 30 ] || fail "compute-usage: rows for $org (standard+endpoints, team=$CNPG_TEAM_ID) never appeared in GET /billing/usage: $(echo "$body" | head -c 600)"
-  wl="$(echo "$body" | jq -r '.watermark_low')"
-  wh="$(echo "$body" | jq -r '.watermark_high')"
-  log "compute-usage OK: usage served (low=$wl high=$wh)"
-
-  # The admin "Usage" page reads the SAME buffer: before the ack deletes it,
-  # the just-generated usage must show up under the current UTC month on
-  # GET /api/v1/usage/monthly, attributed to the org's oldest team.
-  cur_month="$(date -u +%Y-%m)"
-  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
-    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg m "$cur_month" '
-        .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .cpu_seconds>0 and .memory_seconds>0)) | length >= 1' >/dev/null \
-    || fail "usage-monthly: no compute row for $org team=$CNPG_TEAM_ID month=$cur_month: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
-  log "usage-monthly OK: compute row for $org visible in month $cur_month"
-
-  # The org detail page's usage charts read the same buffer, org-scoped and
-  # day-grained: today's UTC date must carry this org's compute, and the
-  # response must contain ONLY this org (the handler derives the org scope
-  # from the path — a wrong scope is the cross-account leak).
-  cur_day="$(date -u +%F)"
-  curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" \
-    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg d "$cur_day" '
-        .org_id == $o and
-        (.rows | map(select(.team_id==$t and .date==$d and .cpu_seconds>0)) | length >= 1)' >/dev/null \
-    || fail "usage-daily: no compute row for $org team=$CNPG_TEAM_ID date=$cur_day: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" | head -c 600)"
-  log "usage-daily OK: compute row for $org visible on $cur_day"
-
-  # Ack the served watermark; the cursor must advance and acked buckets die.
-  ack="$(curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
-    -d "{\"watermark_high\":\"$wh\"}" "$API/api/v1/billing/ack")" \
-    || fail "compute-usage: ack POST failed"
-  deleted="$(echo "$ack" | jq -r '.deleted')"
-  [ "${deleted:-0}" -ge 1 ] || fail "compute-usage: ack deleted=$deleted (want >=1): $ack"
-  low2="$(curl -fsS -H "$H" "$API/api/v1/billing/usage" | jq -r '.watermark_low')"
-  [ "$low2" = "$wh" ] || fail "compute-usage: after ack, watermark_low='$low2' want '$wh' (cursor did not advance)"
-  # Idempotency: re-acking the same watermark is a safe no-op (200).
-  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json' \
-    -d "{\"watermark_high\":\"$wh\"}" "$API/api/v1/billing/ack" >/dev/null \
-    || fail "compute-usage: re-ack of the same watermark failed (must be idempotent)"
-  # Acking into the still-open present must be rejected (400), never delete.
-  future="$(jq -rn 'now + 3600 | todate')"
-  code="$(curl -s -o /tmp/ack_future -w '%{http_code}' -X POST -H "$H" -H 'Content-Type: application/json' \
-    -d "{\"watermark_high\":\"$future\"}" "$API/api/v1/billing/ack")"
-  [ "$code" = "400" ] || fail "compute-usage: future ack -> HTTP $code want 400: $(cat /tmp/ack_future)"
-  log "compute-usage OK: ack advanced cursor (deleted=$deleted), idempotent re-ack, future ack rejected"
-
-  # ---- storage metric (same pipeline, second family) ----
-  # The leader samples each Ready warehouse's tracked DuckLake footprint every
-  # 60s here (DUCKGRES_STORAGE_SAMPLE_INTERVAL in manifests.tmpl.yaml; 30m in
-  # prod) and credits bytes×interval byte-seconds. The org has real Parquet
-  # data by now (the lane's earlier writes), so a storage row with
-  # gib_seconds > 0 and the provisioned team id must appear once a sampled
-  # minute closes (sample 60s + close 90s → poll ~4min covers cold start).
-  a=0
-  while [ "$a" -lt 30 ]; do
-    body="$(curl -fsS -H "$H" "$API/api/v1/billing/usage")" || body=""
-    if [ -n "$body" ] && echo "$body" | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" '
-        .storage | map(select(.org_id==$o and .team_id==$t and .gib_seconds>0)) | length >= 1' >/dev/null 2>&1; then
-      break
-    fi
-    sleep 10; a=$((a + 1))
+  [ "$a" -lt 30 ] || fail "storage usage never appeared in a billing batch"
+  batch_id="$(echo "$body" | jq -r '.batch.batch_id')"
+  replay="$(curl -fsS -X POST -H "$H" "$API/api/v1/billing/batches/next")" || fail "billing retry failed"
+  [ "$(echo "$body" | jq -cS .)" = "$(echo "$replay" | jq -cS .)" ] || fail "billing retry changed outstanding batch"
+  for attempt in 1 2; do
+    curl -fsS -X POST -H "$H" "$API/api/v1/billing/batches/$batch_id/ack" >/dev/null || fail "billing ack must be idempotent"
   done
-  [ "$a" -lt 30 ] || fail "storage-usage: no storage row for $org (team=$CNPG_TEAM_ID, gib_seconds>0) in GET /billing/usage: $(echo "$body" | head -c 600)"
-  gib="$(echo "$body" | jq -r --arg o "$org" '[.storage[] | select(.org_id==$o)][0].gib_seconds')"
-  wh2="$(echo "$body" | jq -r '.watermark_high')"
-  log "storage-usage OK: $org gib_seconds=$gib served"
+  replay="$(curl -fsS -H "$H" "$API/api/v1/billing/batches/$batch_id")" || fail "billing replay failed"
+  [ "$(echo "$body" | jq -cS .)" = "$(echo "$replay" | jq -cS .)" ] || fail "ack changed retained batch"
 
-  # The monthly Usage view must carry the storage family too (same buffer).
-  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
-    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg m "$(date -u +%Y-%m)" '
-        .rows | map(select(.org_id==$o and .team_id==$t and .month==$m and .gib_seconds>0)) | length >= 1' >/dev/null \
-    || fail "usage-monthly: no storage row for $org team=$CNPG_TEAM_ID: $(curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | head -c 600)"
-  log "usage-monthly OK: storage row for $org visible"
-
-  # Same for the org-scoped daily series (storage family).
-  curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" \
-    | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" --arg d "$(date -u +%F)" '
-        .org_id == $o and
-        (.rows | map(select(.team_id==$t and .date==$d and .gib_seconds>0)) | length >= 1)' >/dev/null \
-    || fail "usage-daily: no storage row for $org team=$CNPG_TEAM_ID: $(curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" | head -c 600)"
-  log "usage-daily OK: storage row for $org visible"
-
-  # The shared ack must clear storage buckets too: ack the served watermark,
-  # then the next GET's storage array must not contain rows ≤ it for this org
-  # (watermark_low advanced past them; new samples land in newer buckets).
-  curl -fsS -X POST -H "$H" -H 'Content-Type: application/json'     -d "{\"watermark_high\":\"$wh2\"}" "$API/api/v1/billing/ack" >/dev/null     || fail "storage-usage: ack POST failed"
-  low3="$(curl -fsS -H "$H" "$API/api/v1/billing/usage" | jq -r '.watermark_low')"
-  [ "$low3" = "$wh2" ] || fail "storage-usage: after ack, watermark_low='$low3' want '$wh2'"
-  log "storage-usage OK: shared ack advanced the cursor past storage buckets"
+  # Admin history survives ack and remains scoped to the organization.
+  curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" '
+    [.rows[] | select(.org_id==$o and .team_id==$t and .gib_seconds>0)] | length >= 1' >/dev/null || fail "monthly storage history lost after ack"
+  curl -fsS -H "$H" "$API/api/v1/orgs/$org/usage/daily?days=1" | jq -e --arg o "$org" --argjson t "$CNPG_TEAM_ID" '
+    .org_id==$o and ([.rows[] | select(.team_id==$t and .gib_seconds>0)] | length >= 1)' >/dev/null || fail "daily storage history lost after ack"
+  log "storage billing OK: stable batches, idempotent ack, retained replay and history"
 }
 
-# Hot-idle pool reporting + the per-org cap sweep. compute_usage_pull_api
+# Hot-idle pool reporting + the per-org cap sweep. storage_usage_batch_api
 # just closed its connections, so this org holds >=1 parked hot-idle worker
 # that must be visible in GET /api/v1/workers/hot-idle (per-org count, vCPU,
 # memory, oldest-park, configured caps). Setting the org's
@@ -2902,20 +2802,20 @@ admin_console_api() {
     || fail "/cluster/summary missing numeric totals (nodes/workers/cpu/mem/placeholders/pending)"
   # The monthly per-team usage read backing the admin "Usage" page: envelope
   # only here (rows may be empty before any usage lands); the populated path
-  # is asserted in compute_usage_pull_api against real generated usage. (The
+  # is asserted in storage_usage_batch_api against real sampled storage. (The
   # page's pricing-sensitivity calculator has no e2e assertion BY DESIGN: it
   # is pure client-side math over this endpoint's rows — no backend surface —
   # covered by ui/src/pages/UsagePricing.test.tsx + lib/pricing.test.ts.)
   curl -fsS -H "$H" "$API/api/v1/usage/monthly?months=1" \
-    | jq -e 'has("rows") and (.rows | type == "array") and has("months") and has("from") and has("watermark_low")' >/dev/null \
+    | jq -e 'has("rows") and (.rows | type == "array") and has("months") and has("from") and (has("watermark_low") | not)' >/dev/null \
     || fail "/usage/monthly did not return its envelope"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/usage/monthly?months=0")"
   [ "$code" = "400" ] || fail "/usage/monthly?months=0 returned $code, want 400"
   # The per-org daily series (org detail page's usage charts): same envelope
   # + validation, org-scoped. Populated rows are asserted in
-  # compute_usage_pull_api; here the org may simply have no usage yet.
+  # storage_usage_batch_api; here the org may simply have no usage yet.
   curl -fsS -H "$H" "$API/api/v1/orgs/$CNPG/usage/daily?days=7" \
-    | jq -e --arg o "$CNPG" '.org_id == $o and has("rows") and (.rows | type == "array") and has("days") and has("watermark_low")' >/dev/null \
+    | jq -e --arg o "$CNPG" '.org_id == $o and has("rows") and (.rows | type == "array") and has("days") and (has("watermark_low") | not)' >/dev/null \
     || fail "/orgs/$CNPG/usage/daily did not return its envelope"
   code="$(curl -s -o /dev/null -w '%{http_code}' -H "$H" "$API/api/v1/orgs/$CNPG/usage/daily?days=99")"
   [ "$code" = "400" ] || fail "/orgs/$CNPG/usage/daily?days=99 returned $code, want 400"
@@ -4648,8 +4548,8 @@ engine_main() {
   #      many connect/disconnects, so the disconnect log is warm) ----
   connection_duration_logged "$CNPG" "$cnpg_pw"
 
-  # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
-  compute_usage_pull_api "$CNPG" "$cnpg_pw"
+  # ---- storage billing (sampler → retained batch → ack → replay) ----
+  storage_usage_batch_api "$CNPG" "$cnpg_pw"
 
   # ---- hot-idle pool reporting + per-org cap sweep ----
   hot_idle_reporting_and_cap "$CNPG"

@@ -56,7 +56,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 35)
 	requireGooseMigrationRecorded(t, db, 36)
 	requireGooseMigrationRecorded(t, db, 38)
-	requireGooseLatestVersion(t, db, 38)
+	requireGooseMigrationRecorded(t, db, 39)
+	requireGooseLatestVersion(t, db, 39)
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
 	// Migration 000018 added the reshard operation + verbose log tables.
@@ -316,7 +317,14 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_service_grants;
 			DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 			DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38);
+			DROP TABLE duckgres_billing_batch_storage;
+            DROP INDEX duckgres_storage_usage_pending;
+            ALTER TABLE duckgres_org_storage_usage DROP COLUMN exported_byte_seconds;
+            DROP TABLE duckgres_trino_query_usage;
+            DROP TABLE duckgres_billing_consumer;
+            DROP TABLE duckgres_billing_batches;
+            DROP TABLE duckgres_trino_usage_principals;
+            DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -367,7 +375,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
 	requireGooseMigrationRecorded(t, upgradedDB, 38)
-	requireGooseLatestVersion(t, upgradedDB, 38)
+	requireGooseLatestVersion(t, upgradedDB, 39)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -416,7 +424,14 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		DROP TABLE IF EXISTS duckgres_service_grants;
 		DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 		DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38);
+		DROP TABLE duckgres_billing_batch_storage;
+            DROP INDEX duckgres_storage_usage_pending;
+            ALTER TABLE duckgres_org_storage_usage DROP COLUMN exported_byte_seconds;
+            DROP TABLE duckgres_trino_query_usage;
+            DROP TABLE duckgres_billing_consumer;
+            DROP TABLE duckgres_billing_batches;
+            DROP TABLE duckgres_trino_usage_principals;
+            DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}

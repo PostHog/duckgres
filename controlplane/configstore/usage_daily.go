@@ -6,16 +6,12 @@ import (
 	"time"
 )
 
-// DailyComputeUsageRow is the compute family of the org detail page's usage
-// charts: one org's buffered buckets summed per UTC day per team. Same data
-// source and retention caveats as AggregateComputeUsageMonthly — the buffer,
-// not all-time history.
-type DailyComputeUsageRow struct {
-	Date          string  `json:"date"` // "YYYY-MM-DD", UTC
-	TeamID        int64   `json:"team_id"`
-	SchemaName    *string `json:"schema_name"`
-	CPUSeconds    int64   `json:"cpu_seconds"`
-	MemorySeconds int64   `json:"memory_seconds"`
+// DailyScanUsageRow reports retained query scan bytes, including failed and cancelled queries.
+type DailyScanUsageRow struct {
+	Date         string      `json:"date"` // "YYYY-MM-DD", UTC
+	TeamID       int64       `json:"team_id"`
+	SchemaName   *string     `json:"schema_name"`
+	BytesScanned json.Number `json:"bytes_scanned"`
 }
 
 // DailyStorageUsageRow is the storage family of the daily view: byte-seconds
@@ -27,41 +23,37 @@ type DailyStorageUsageRow struct {
 	GiBSeconds json.Number `json:"gib_seconds"`
 }
 
-// AggregateComputeUsageDaily sums one org's buffered compute buckets at or
-// after from into one row per UTC day per team. The org filter is the query's
-// WHERE clause — the caller's :id path segment flows straight here, so one
-// org's usage can never leak into another org's page.
-func (cs *ConfigStore) AggregateComputeUsageDaily(orgID string, from time.Time) ([]DailyComputeUsageRow, error) {
+// AggregateScanUsageDaily sums retained query usage by completion time in UTC.
+func (cs *ConfigStore) AggregateScanUsageDaily(orgID string, from time.Time) ([]DailyScanUsageRow, error) {
 	const q = `
-SELECT to_char((bucket_start AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS date,
+SELECT to_char((completed_at AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS date,
        u.team_id, t.schema_name,
-       SUM(u.cpu_seconds), SUM(u.memory_seconds)
-FROM duckgres_org_compute_usage u
+       SUM(u.physical_input_bytes)::text
+FROM duckgres_trino_query_usage u
 LEFT JOIN duckgres_org_teams t ON t.org_id = u.org_id AND t.team_id = u.team_id
-WHERE u.org_id = ? AND u.bucket_start >= ?
+WHERE u.org_id = ? AND u.completed_at >= ?
 GROUP BY 1, u.team_id, t.schema_name
 ORDER BY 1, u.team_id`
 
 	rows, err := cs.db.Raw(q, orgID, from.UTC()).Rows()
 	if err != nil {
-		return nil, fmt.Errorf("aggregate daily compute usage (org=%s): %w", orgID, err)
+		return nil, fmt.Errorf("aggregate daily scan usage (org=%s): %w", orgID, err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var out []DailyComputeUsageRow
+	var out []DailyScanUsageRow
 	for rows.Next() {
-		var r DailyComputeUsageRow
-		if err := rows.Scan(&r.Date, &r.TeamID, &r.SchemaName, &r.CPUSeconds, &r.MemorySeconds); err != nil {
-			return nil, fmt.Errorf("scan daily compute usage row: %w", err)
+		var r DailyScanUsageRow
+		if err := rows.Scan(&r.Date, &r.TeamID, &r.SchemaName, &r.BytesScanned); err != nil {
+			return nil, fmt.Errorf("decode daily scan usage row: %w", err)
 		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
 }
 
-// AggregateStorageUsageDaily is the storage half of
-// AggregateComputeUsageDaily — same org scope and window, byte-seconds
-// converted to exact GiB-seconds.
+// AggregateStorageUsageDaily sums retained storage samples in UTC,
+// converting byte-seconds to exact GiB-seconds.
 func (cs *ConfigStore) AggregateStorageUsageDaily(orgID string, from time.Time) ([]DailyStorageUsageRow, error) {
 	const q = `
 SELECT to_char((bucket_start AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS date,

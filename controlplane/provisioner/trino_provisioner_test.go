@@ -29,12 +29,24 @@ import (
 // --- fakes ---
 
 type fakeTrinoStore struct {
-	mu       sync.Mutex
-	orgs     []configstore.TrinoEnabledOrg
-	states   map[string]configstore.TrinoStateUpdate // captured per-org state writes
-	cells    map[string]string                       // captured cell claims
-	cellErr  error                                   // injectable: fail AssignTrinoCell
-	claimLog []string
+	mu          sync.Mutex
+	orgs        []configstore.TrinoEnabledOrg
+	states      map[string]configstore.TrinoStateUpdate // captured per-org state writes
+	cells       map[string]string                       // captured cell claims
+	cellErr     error                                   // injectable: fail AssignTrinoCell
+	claimLog    []string
+	remembered  []configstore.TrinoEnabledOrg
+	rememberErr error
+}
+
+func (s *fakeTrinoStore) RememberTrinoUsagePrincipals(orgs []configstore.TrinoEnabledOrg) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rememberErr != nil {
+		return s.rememberErr
+	}
+	s.remembered = append([]configstore.TrinoEnabledOrg(nil), orgs...)
+	return nil
 }
 
 func (s *fakeTrinoStore) ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error) {

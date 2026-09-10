@@ -188,6 +188,7 @@ type trinoWiring struct {
 	// and stable for the process lifetime (rotation is a follow-up
 	// rotation-API concern).
 	BundleHandler *opa.Handler
+	UsageToken    string
 	// Cell is the cell this wiring reconciles; carried out for startup
 	// logging.
 	Cell trinoCell
@@ -312,6 +313,11 @@ func buildTrinoWiring(
 		return nil, fmt.Errorf("bootstrap Trino cluster secrets: %w", err)
 	}
 
+	usageToken, err := trinoProv.BootstrapUsageToken(bootstrapCtx)
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap Trino usage token: %w", err)
+	}
+
 	// Build the handler with the real token directly — no placeholder,
 	// no post-construction swap, so no window where the endpoint serves
 	// with a token a real client could match by accident.
@@ -321,6 +327,7 @@ func buildTrinoWiring(
 		Provisioner:   trinoProv,
 		BundleStore:   bundleStore,
 		BundleHandler: bundleHandler,
+		UsageToken:    usageToken,
 		Cell:          cell,
 		Console: &trinoConsoleWiring{
 			Cell: cell.consoleCell(),

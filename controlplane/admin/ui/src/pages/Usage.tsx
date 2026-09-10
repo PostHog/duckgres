@@ -4,12 +4,11 @@ import { PageBody, PageHeader } from "@/components/AppShell";
 import { InfoTooltip } from "@/components/InfoTooltip";
 import { StatCard } from "@/components/StatCard";
 import { UsagePricing } from "@/pages/UsagePricing";
-import { Card } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { useIdentity } from "@/components/IdentityProvider";
 import { useMonthlyUsage, useOrgLabels } from "@/hooks/useApi";
-import { fmtTime } from "@/lib/format";
+import { fmtBytes } from "@/lib/format";
 import {
   AWS_COST_TOOLTIP,
   GROSS_MARGIN_TOOLTIP,
@@ -62,7 +61,7 @@ export function Usage() {
   if (!isAdmin) {
     return (
       <>
-        <PageHeader title="Usage" description="Monthly storage usage by organization." />
+        <PageHeader title="Usage" description="Monthly scan and storage usage by organization." />
         <PageBody>
           <EmptyState
             icon={<ShieldAlert className="h-6 w-6 text-warning" />}
@@ -78,7 +77,7 @@ export function Usage() {
     <>
       <PageHeader
         title="Usage"
-        description="S3 storage-time (GiB·h) by organization, summed over the retained billing buffer."
+        description="Query scan bytes and S3 storage-time (GiB·h) by organization."
         actions={
           <>
             <Select value={month} onValueChange={setSelected}>
@@ -109,33 +108,32 @@ export function Usage() {
         }
       />
       <PageBody>
-        {usage.data?.watermark_low && (
-          <Card className="mb-4 border-warning/40 bg-warning/5 p-3 text-xs text-muted-foreground">
-            Usage at or before {fmtTime(usage.data.watermark_low)} has been billed and removed from the buffer, so
-            earlier months may be partial or absent. This page is an operations view, not an invoice.
-          </Card>
-        )}
         {usage.isError ? (
           <ErrorState error={usage.error} onRetry={() => usage.refetch()} />
         ) : usage.isLoading ? (
           <TableSkeleton />
         ) : (
           <>
-            <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <StatCard
-                label="Total cost"
+                label="Bytes scanned"
+                value={fmtBytes(monthRows.reduce((sum, row) => sum + Number(row.bytes_scanned), 0))}
+                hint="Includes failed and cancelled queries"
+              />
+              <StatCard
+                label="Storage cost"
                 value={fmtMoney(pricing.summary.cost)}
                 icon={<InfoTooltip label="Explain AWS storage cost" text={AWS_COST_TOOLTIP} />}
                 hint="AWS us-east-1 storage estimate"
               />
               <StatCard
-                label="Total price"
+                label="Storage price"
                 value={fmtMoney(pricing.summary.price)}
                 icon={<InfoTooltip label="Explain customer price" text={customerPriceTooltip(pricingRegion)} />}
                 hint={`${pricingRegion} progressive tiers · ${usage.data?.aws_region}`}
               />
               <StatCard
-                label="Total gross margin"
+                label="Storage gross margin"
                 value={
                   pricing.summary.grossMarginPercent == null
                     ? "N/A"
@@ -150,7 +148,7 @@ export function Usage() {
               <EmptyState
                 icon={<Coins className="h-8 w-8" />}
                 title="No usage"
-                description={`No usage has been recorded for ${month} in the retained billing buffer.`}
+                description={`No usage has been recorded for ${month}.`}
               />
             ) : (
               <UsagePricing rows={monthRows} labels={orgLabels} month={month} region={pricingRegion} />
