@@ -67,3 +67,34 @@ paired_queries:
     tags: [nightly, frozen, posthog, events, aggregate, time-series, paired]
     params: {}
     sql_template: SELECT date_trunc('day', "timestamp") AS day, COUNT(*) AS events FROM {{ relation "events" }} WHERE "timestamp" >= CAST('2026-03-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) AND "timestamp" < CAST('2026-03-18 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE) GROUP BY 1 ORDER BY 1
+
+  - query_id_base: q_events_by_browser_one_day_balanced_v4
+    intent_id: intent_events_by_browser_one_day_balanced_v4
+    tags: [nightly, frozen, posthog, events, aggregate, properties, breakdown, one-day, paired]
+    params: {}
+    sql_template: >
+      SELECT browser, COUNT(*) AS events
+      FROM (
+        SELECT {{ json_string "properties" "$browser" }} AS browser
+        FROM {{ relation "events" }}
+        WHERE "timestamp" >= CAST('2026-03-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+          AND "timestamp" < CAST('2026-03-02 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+      ) AS projected
+      WHERE browser IS NOT NULL
+      GROUP BY browser
+      ORDER BY events DESC, browser
+      LIMIT 20
+
+  - query_id_base: q_events_by_name_chrome_one_day_balanced_v4
+    intent_id: intent_events_by_name_chrome_one_day_balanced_v4
+    tags: [nightly, frozen, posthog, events, aggregate, properties, filter, one-day, paired]
+    params: {}
+    sql_template: >
+      SELECT event, COUNT(*) AS events
+      FROM {{ relation "events" }}
+      WHERE "timestamp" >= CAST('2026-03-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+        AND "timestamp" < CAST('2026-03-02 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+        AND {{ json_string "properties" "$browser" }} = 'Chrome'
+      GROUP BY event
+      ORDER BY events DESC, event
+      LIMIT 20

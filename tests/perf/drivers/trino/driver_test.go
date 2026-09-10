@@ -63,6 +63,19 @@ func TestDriverRejectsMissingCanonicalSQL(t *testing.T) {
 	}
 }
 
+func TestDriverUsesRenderedDialectSQL(t *testing.T) {
+	exec := &fakeExecutor{}
+	driver := NewWithExecutor(exec)
+	const native = `SELECT json_extract_scalar(properties, '$["$browser"]') FROM events`
+	_, err := driver.Execute(context.Background(), core.Query{PGWireSQL: "SELECT fallback", TrinoSQL: native}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.queries) != 1 || exec.queries[0] != native {
+		t.Fatalf("queries = %v", exec.queries)
+	}
+}
+
 func TestWaitReadyRetriesOutsideMeasuredExecution(t *testing.T) {
 	exec := &fakeExecutor{errors: []error{errors.New("credentials not loaded"), errors.New("credentials not loaded")}}
 	driver := NewWithExecutor(exec)

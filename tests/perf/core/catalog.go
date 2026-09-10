@@ -10,13 +10,16 @@ import (
 )
 
 var (
-	identifierPartRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	identifierPartRE   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	jsonStringActionRE = regexp.MustCompile(`^json_string\s+"([A-Za-z_][A-Za-z0-9_]*)"\s+"([$A-Za-z_][$A-Za-z0-9_]*)"\s*$`)
 )
 
 type relationPlaceholder struct {
-	start int
-	end   int
-	role  string
+	start  int
+	end    int
+	role   string
+	column string
+	key    string
 }
 
 type catalogFile struct {
@@ -177,7 +180,11 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 	if err != nil {
 		return nil, err
 	}
-	if len(placeholders) == 0 {
+	hasRelation := false
+	for _, placeholder := range placeholders {
+		hasRelation = hasRelation || placeholder.role != ""
+	}
+	if !hasRelation {
 		return nil, fmt.Errorf("paired query %s must contain at least one relation placeholder", def.QueryIDBase)
 	}
 
@@ -192,6 +199,10 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 			return nil, err
 		}
 		queryID := def.QueryIDBase + "__" + string(target)
+		trinoSQL, err := renderTemplateForProtocol(def.QueryIDBase, def.SQLTemplate, placeholders, variants[target], target, ProtocolTrino)
+		if err != nil {
+			return nil, err
+		}
 		if err := validateSelectOnlySQL("sql_template", queryID, rendered); err != nil {
 			return nil, err
 		}
@@ -201,6 +212,8 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 			Tags:          def.Tags,
 			Params:        def.Params,
 			PGWireSQL:     rendered,
+			TrinoSQL:      trinoSQL,
+			AthenaSQL:     trinoSQL,
 			StorageTarget: target,
 		})
 	}
@@ -284,6 +297,21 @@ func scanRelationPlaceholders(queryID, sql string) ([]relationPlaceholder, error
 func parseRelationPlaceholder(sql string, start int) (relationPlaceholder, error) {
 	i := start + 2
 	i = skipTemplateWhitespace(sql, i)
+	if strings.HasPrefix(sql[i:], "json_string") {
+		end := strings.Index(sql[i:], "}}")
+		if end < 0 {
+			return relationPlaceholder{}, fmt.Errorf("expected closing braces")
+		}
+		matches := jsonStringActionRE.FindStringSubmatch(sql[i : i+end])
+		if matches == nil {
+			return relationPlaceholder{}, fmt.Errorf("json_string requires a column identifier and a simple top-level key")
+		}
+		end += i + 2
+		if end < len(sql) && sql[end] == '}' {
+			return relationPlaceholder{}, fmt.Errorf("unexpected extra closing brace")
+		}
+		return relationPlaceholder{start: start, end: end, column: matches[1], key: matches[2]}, nil
+	}
 	if !strings.HasPrefix(sql[i:], "relation") {
 		return relationPlaceholder{}, fmt.Errorf("expected relation action")
 	}
@@ -320,9 +348,23 @@ func parseRelationPlaceholder(sql string, start int) (relationPlaceholder, error
 }
 
 func renderRelationTemplate(queryID, template string, placeholders []relationPlaceholder, bindings map[string]string, target StorageTarget) (string, error) {
+	return renderTemplateForProtocol(queryID, template, placeholders, bindings, target, ProtocolPGWire)
+}
+
+func renderTemplateForProtocol(queryID, template string, placeholders []relationPlaceholder, bindings map[string]string, target StorageTarget, protocol Protocol) (string, error) {
 	var rendered strings.Builder
 	last := 0
 	for _, placeholder := range placeholders {
+		if placeholder.column != "" {
+			rendered.WriteString(template[last:placeholder.start])
+			if protocol == ProtocolTrino || protocol == ProtocolAthena {
+				fmt.Fprintf(&rendered, `json_extract_scalar("%s", '$["%s"]')`, placeholder.column, placeholder.key)
+			} else {
+				fmt.Fprintf(&rendered, `json_extract_string("%s", '$."%s"')`, placeholder.column, placeholder.key)
+			}
+			last = placeholder.end
+			continue
+		}
 		binding, ok := bindings[placeholder.role]
 		if !ok || binding == "" {
 			return "", fmt.Errorf("paired query %s missing relation binding for role %q in storage target %q", queryID, placeholder.role, target)

@@ -68,7 +68,7 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	if d.exec == nil {
 		return core.ExecutionResult{}, fmt.Errorf("pgwire driver has no executor")
 	}
-	sqlText := query.CanonicalSQL()
+	sqlText := query.SQLForProtocol(core.ProtocolPGWire)
 	if sqlText == "" {
 		return core.ExecutionResult{}, fmt.Errorf("query %s missing pgwire_sql", query.QueryID)
 	}

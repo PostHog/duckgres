@@ -75,6 +75,37 @@ proxies/extensions are unaffected, so "uncached" here is not a fully cold
 end-to-end read path. The paired query and intent IDs use `balanced_v4` to
 separate this methodology from `balanced_v3`; the dataset is unchanged.
 
+### Properties-access coverage
+
+The frozen catalog includes an event breakdown by `$browser` and an event-name
+breakdown filtered to `$browser = 'Chrome'`. Both use the fixed UTC day
+2026-03-01 (inclusive) to 2026-03-02 (exclusive) to bound the additional scan
+cost. They return at most 20 groups, with deterministic count/name ordering.
+Missing properties, JSON null, and SQL NULL do not form a browser group or
+match the filter. The fixture contract is valid JSON with a string-or-null
+`$browser`; arbitrary objects, arrays, and malformed JSON are not cross-engine
+compatibility cases for these queries.
+
+Each intent expands over raw views, DuckLake tables, and Athena external
+tables using the existing protocol routing. The nine-intent corpus produces
+54 warmups and 216 measured executions with the unchanged one warmup and four
+measured iterations. The original seven query IDs and SQL remain unchanged;
+compare the common intents rather than whole-corpus totals across this addition.
+
+These queries measure property extraction and filtering, not proof of
+shredding. Setup registers the existing frozen Parquet objects without rewriting
+them. To evaluate shredded-column support, separately verify the physical file
+layout and the engine plan's projected fields/physical reads.
+
+Run `just test-perf` for synthetic-data semantics and catalog/driver coverage.
+For live validation, dispatch `scenario-dev.yml` with
+`scenario=posthog_frozen_perf`. Confirm the new queries have nonempty results
+and inspect their error rows before interpreting timing; an absent property or
+filter value is not a useful benchmark. If fixture membership or JSON types
+do not match this contract, investigate the fixture before changing the key or
+filter; version the new intent if its semantics change. Do not publish property
+values or raw records from the fixture.
+
 ## Paired Query Catalogs
 
 Existing catalogs continue to use `queries:` unchanged. A catalog may contain
@@ -110,8 +141,8 @@ Paired catalogs without Athena declare exactly the `raw_view` and
 `ducklake_table` variants. Athena catalogs add `athena_external`, whose generic
 table names are resolved in the configured Glue database. A template expands
 in stable order: `raw_view`, `ducklake_table`, then `athena_external`. Generated queries retain the same
-`intent_id`, tags, parameters, and semantic template; only declared relation
-placeholders differ. They carry in-memory storage-target metadata, so later
+`intent_id`, tags, parameters, and semantic template; relation placeholders and
+the native spelling of JSON extraction differ. They carry in-memory storage-target metadata, so later
 code does not need to infer the target from the generated ID. Legacy queries
 remain unpaired. The v1 artifact and publisher schemas remain unchanged, so
 artifact rows distinguish paired targets only by these generated query IDs;
@@ -127,17 +158,26 @@ order. Query and intent IDs must be versioned when their measurement
 methodology changes so historical latency series do not mix different cache
 contexts, including dashboards that aggregate by intent.
 
-Templating is intentionally limited to `{{ relation "<role>" }}`. Each role
+Relations use `{{ relation "<role>" }}`. Each role
 must have a binding in both variants, and multiple roles may be used in one
 template. Bindings are unquoted, dot-separated identifiers such as
 `posthog.events`; the loader validates every identifier segment and emits it
 as a safely quoted relation. SQL expressions, comments, semicolons,
 whitespace, quoted identifiers, and malformed names are rejected in bindings;
-all template actions other than the relation placeholder are rejected.
+The additional `{{ json_string "<column>" "<top-level-key>" }}` action renders
+native extraction without duplicating query definitions: Duckgres uses
+`json_extract_string`, while Trino and Athena use `json_extract_scalar` with
+their corresponding JSONPath syntax. The column must be an unqualified SQL
+identifier; keys match `[$A-Za-z_][$A-Za-z0-9_]*` (for example, `$browser`).
+Nested paths, punctuation, and escaped key names are not supported.
+Use it only for valid JSON string/null
+properties; engines differ on malformed JSON and non-scalar values. No arbitrary
+SQL overrides are supported. All other template actions are rejected.
 Placeholder syntax inside SQL strings, quoted identifiers, or comments is also
 rejected so a target cannot be mislabeled without changing the executed
 relation. The rendered SQL must be a single read-only `SELECT` statement and is
-stored in the PGWire SQL field.
+stored in the PGWire SQL field, with derived protocol SQL held in memory when
+JSON extraction requires a dialect-specific expression.
 
 This abstraction preserves the artifact contract while allowing downstream
 dashboards to compare paired targets by their generated query-ID suffixes.

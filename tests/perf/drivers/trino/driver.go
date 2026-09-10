@@ -127,7 +127,7 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	if d.exec == nil {
 		return core.ExecutionResult{}, fmt.Errorf("trino driver has no executor")
 	}
-	sqlText := query.CanonicalSQL()
+	sqlText := query.SQLForProtocol(core.ProtocolTrino)
 	if sqlText == "" {
 		return core.ExecutionResult{}, fmt.Errorf("query %s missing canonical SQL", query.QueryID)
 	}

@@ -70,6 +70,12 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 		"q_events_daily_march_2026_balanced_v4__raw_view",
 		"q_events_daily_march_2026_balanced_v4__ducklake_table",
 		"q_events_daily_march_2026_balanced_v4__athena_external",
+		"q_events_by_browser_one_day_balanced_v4__raw_view",
+		"q_events_by_browser_one_day_balanced_v4__ducklake_table",
+		"q_events_by_browser_one_day_balanced_v4__athena_external",
+		"q_events_by_name_chrome_one_day_balanced_v4__raw_view",
+		"q_events_by_name_chrome_one_day_balanced_v4__ducklake_table",
+		"q_events_by_name_chrome_one_day_balanced_v4__athena_external",
 	}
 	if got := queryIDs(catalog); !reflect.DeepEqual(got, want) {
 		t.Fatalf("checked-in PostHog query IDs changed: got %v want %v", got, want)

@@ -92,6 +92,19 @@ func TestDriverStopsAthenaQueryWhenContextIsCancelled(t *testing.T) {
 	}
 }
 
+func TestDriverUsesRenderedDialectSQL(t *testing.T) {
+	client := &fakeClient{executions: []*athenatypes.QueryExecution{terminalExecution(athenatypes.QueryExecutionStateSucceeded)}, resultPages: []*awsathena.GetQueryResultsOutput{{ResultSet: &athenatypes.ResultSet{Rows: make([]athenatypes.Row, 1)}}}}
+	driver := testDriver(t, client)
+	const native = `SELECT json_extract_scalar(properties, '$["$browser"]') FROM events`
+	_, err := driver.Execute(context.Background(), perfcore.Query{PGWireSQL: "SELECT fallback", AthenaSQL: native}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aws.ToString(client.startInput.QueryString) != native {
+		t.Fatalf("query = %s", aws.ToString(client.startInput.QueryString))
+	}
+}
+
 func TestDriverPreservesMetricsWhenExecutionEndsWithError(t *testing.T) {
 	for _, state := range []athenatypes.QueryExecutionState{
 		athenatypes.QueryExecutionStateFailed, athenatypes.QueryExecutionStateCancelled, athenatypes.QueryExecutionStateSucceeded,

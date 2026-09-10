@@ -94,7 +94,7 @@ func (d *Driver) Execute(ctx context.Context, query perfcore.Query, args []any) 
 	startedAt := d.now()
 	defer func() { result.Duration = d.now().Sub(startedAt) }()
 	started, err := d.client.StartQueryExecution(queryCtx, &awsathena.StartQueryExecutionInput{
-		QueryString: aws.String(query.CanonicalSQL()),
+		QueryString: aws.String(query.SQLForProtocol(perfcore.ProtocolAthena)),
 		WorkGroup:   aws.String(d.cfg.WorkGroup),
 		QueryExecutionContext: &athenatypes.QueryExecutionContext{
 			Catalog: aws.String(d.cfg.Catalog), Database: aws.String(d.cfg.Database),

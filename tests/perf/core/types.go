@@ -40,15 +40,26 @@ type Query struct {
 	Tags          []string       `yaml:"tags"`
 	Params        map[string]any `yaml:"params"`
 	PGWireSQL     string         `yaml:"pgwire_sql"`
+	TrinoSQL      string         `yaml:"-" json:"-"`
+	AthenaSQL     string         `yaml:"-" json:"-"`
 	StorageTarget StorageTarget  `yaml:"-" json:"-"`
 }
 
-// CanonicalSQL returns the single rendered SQL statement shared by protocol
-// drivers. The yaml name is retained for backward compatibility with existing
-// catalogs; protocol-specific copies would allow benchmark definitions to
-// drift.
+// CanonicalSQL returns the DuckDB rendering of the shared query definition.
 func (q Query) CanonicalSQL() string {
 	return q.PGWireSQL
+}
+
+// SQLForProtocol selects runtime-only dialect rendering of a shared template.
+// Legacy queries and templates without dialect helpers use canonical SQL.
+func (q Query) SQLForProtocol(protocol Protocol) string {
+	if protocol == ProtocolTrino && q.TrinoSQL != "" {
+		return q.TrinoSQL
+	}
+	if protocol == ProtocolAthena && q.AthenaSQL != "" {
+		return q.AthenaSQL
+	}
+	return q.CanonicalSQL()
 }
 
 type ExecutionResult struct {

@@ -15,3 +15,19 @@ func TestIntentMatcherReturnsCanonicalSQLForBothProtocols(t *testing.T) {
 		}
 	}
 }
+
+func TestIntentMatcherReturnsRenderedDialectSQL(t *testing.T) {
+	matcher := NewIntentMatcher()
+	query := Query{
+		QueryID:   "property",
+		PGWireSQL: `SELECT json_extract_string(properties, '$."$browser"')`,
+		TrinoSQL:  `SELECT json_extract_scalar(properties, '$["$browser"]')`,
+		AthenaSQL: `SELECT json_extract_scalar(properties, '$["$browser"]')`,
+	}
+	for _, protocol := range []Protocol{ProtocolPGWire, ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolAthena} {
+		got, err := matcher.SQLFor(query, protocol)
+		if err != nil || got != query.SQLForProtocol(protocol) {
+			t.Errorf("%s SQL = %q, error = %v; want %q", protocol, got, err, query.SQLForProtocol(protocol))
+		}
+	}
+}
