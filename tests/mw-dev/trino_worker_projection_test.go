@@ -23,6 +23,9 @@ func TestTrinoWorkerProjectionGate(t *testing.T) {
 		t.Fatal("unterminated worker helper")
 	}
 	helper := text[start : start+end+3]
+	if strings.Contains(helper, "--request-timeout") || strings.Count(helper, `timeout 5 "$KUBECTL"`) != 3 {
+		t.Fatal("bound kubectl externally to preserve in-cluster credential discovery")
+	}
 	for _, tc := range []struct {
 		name string
 		ok   bool
@@ -43,11 +46,12 @@ CELL_NS=duckgres-ci-pr-0123
 [ "$MODE" != wrong-identity ] || CELL_NS=another-namespace
 KUBECTL=kubectl
 sleep() { :; }
+timeout() { [ "$1" = 5 ] || exit 90; shift; "$@"; }
 log() { echo "$*"; }
 fail() { echo "$*" >&2; exit 1; }
 kubectl() {
-  [ "$1" = --request-timeout=5s ] && [ "$2" = -n ] && [ "$3" = "$CELL_NS" ] || exit 90
-  shift 3
+  [ "$1" = -n ] && [ "$2" = "$CELL_NS" ] || exit 90
+  shift 2
   if [ "$MODE" = denied ]; then return 1; fi
   case "$1 $2" in
     'get deployment')

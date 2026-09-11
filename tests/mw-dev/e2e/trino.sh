@@ -32,6 +32,7 @@ TRINO_AUTH_ROTATION_RETRY_SECONDS=5
 fail() { echo "FAIL: $*" >&2; exit 1; }
 log() { echo ">>> $*" >&2; }
 apk add --no-cache curl jq >/dev/null 2>&1
+command -v timeout >/dev/null || fail "timeout is required for bounded worker checks"
 [ -s "$CA" ] || fail "per-run Trino CA is not mounted"
 CP_IP="$(getent hosts "$PGHOST" | awk '{print $1}' | head -1)"
 [ -n "$CP_IP" ] || fail "could not resolve $PGHOST"

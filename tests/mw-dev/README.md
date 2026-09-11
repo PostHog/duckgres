@@ -549,6 +549,9 @@ contents or retry writes. The fixture's secondary namespace Role permits pod
 listing and exec for these checks under the existing CI grant. No production
 or cluster-wide RBAC changes are required. Control-plane `ready` alone does
 not prove every worker's projected Secret volume has converged.
+The worker checks use a process timeout rather than kubectl's request-timeout
+flag. The pinned client otherwise loses its implicit in-cluster configuration
+and attempts to connect to localhost. No token or kubeconfig is copied.
 
 After these checks, the lane restarts its control plane in registry-only mode,
 verifies both registered backends still query the warehouse, rejects legacy
