@@ -159,8 +159,15 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 // one — i.e. the control plane accepted an org catalog name at connect. Every
 // other session (standalone, plain "ducklake", memory) has no alias, so this is
 // false and nothing new is rewritten.
+//
+// The empty-database guard is load-bearing, not belt-and-braces. `USE ""`
+// arrives here as an empty name — rewriteDirectQuery's empty-target check runs
+// BEFORE quote-stripping, so `""` passes it and unquotes to "". Without the
+// guard, a session whose database is unset matches its own empty name and
+// invalid SQL is silently rewritten into `USE ducklake.main`.
 func (c *clientConn) namesDuckLakeCatalog(name string) bool {
 	return c.physicalCatalog == physicalDuckLakeCatalog &&
+		c.database != "" &&
 		!strings.EqualFold(c.database, physicalDuckLakeCatalog) &&
 		strings.EqualFold(c.database, name)
 }
