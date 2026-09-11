@@ -330,8 +330,22 @@ test-configstore-integration:
 
 # Run Kubernetes-only control plane package tests
 [group('test')]
+test-trino pattern="Trino":
+    go test -v -count=1 -tags kubernetes -run '{{pattern}}' ./controlplane ./controlplane/admin ./controlplane/provisioner
+
+[group('test')]
 test-controlplane-k8s:
     go test -v -count=1 -tags kubernetes . ./controlplane ./controlplane/admin ./controlplane/provisioner
+
+# Test Trino cell selection and the admin API.
+[group('test')]
+test-trino-admin:
+    go test -v -count=1 -tags kubernetes -run Trino ./controlplane/admin ./tests/configstore
+
+# Test isolated deployment fixtures without contacting a cluster.
+[group('test')]
+test-mw-fixtures:
+    go test -v -count=1 ./tests/mw-dev
 
 # Print the test impact plan for the current branch
 [group('test')]

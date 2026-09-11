@@ -67,9 +67,9 @@ function status(over: Partial<TrinoStatus> = {}): TrinoStatus {
   };
 }
 
-function renderPage() {
+function renderPage(path = "/trino/queries") {
   return render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[path]}>
       <TooltipProvider>
         <TrinoQueries />
       </TooltipProvider>
@@ -111,6 +111,12 @@ describe("TrinoQueries page", () => {
     // Blocked is counted separately from running: it means every driver is
     // waiting on the metadata store or S3, which is a cell problem.
     expect(statValue("Blocked")).toBe("1");
+  });
+
+  it("keeps a selected cell in both query and status requests", () => {
+    renderPage("/trino/queries?cell=cell-001");
+    expect(hooks.useTrinoQueries).toHaveBeenCalledWith({ active: true, cell: "cell-001" });
+    expect(hooks.useTrinoStatus).toHaveBeenCalledWith("cell-001");
   });
 
   it("flags a blocked query rather than calling it merely slow", () => {

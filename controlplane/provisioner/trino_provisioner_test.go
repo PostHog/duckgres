@@ -56,12 +56,12 @@ func (s *fakeTrinoStore) UpdateTrinoState(orgID string, upd configstore.TrinoSta
 	return nil
 }
 
-func (s *fakeTrinoStore) AssignTrinoCell(orgID, cellID string) error {
+func (s *fakeTrinoStore) ClaimTrinoCell(orgID, cellID string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.claimLog = append(s.claimLog, orgID+"->"+cellID)
 	if s.cellErr != nil {
-		return s.cellErr
+		return false, s.cellErr
 	}
 	if s.cells == nil {
 		s.cells = make(map[string]string)
@@ -74,7 +74,7 @@ func (s *fakeTrinoStore) AssignTrinoCell(orgID, cellID string) error {
 			s.orgs[i].CellID = cellID
 		}
 	}
-	return nil
+	return true, nil
 }
 
 func (s *fakeTrinoStore) lastState(orgID string) (configstore.TrinoStateUpdate, bool) {

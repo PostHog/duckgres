@@ -80,7 +80,7 @@ type Controller struct {
 	// deployments without a Trino cell, or in tests that don't exercise
 	// the Trino path), the Trino reconcile step is skipped silently.
 	// See WithTrinoProvisioner.
-	trinoProvisioner *TrinoProvisioner
+	trinoProvisioner interface{ Reconcile(context.Context) error }
 
 	// cnpgShardFieldUnsupported latches when a cnpg-shard backfill read-back
 	// shows the API server pruned spec.metadataStore.cnpgShard — i.e. the
@@ -142,11 +142,18 @@ func (c *Controller) WithBucketSuffix(suffix string) *Controller {
 // batched output (a handful of Secrets + one ConfigMap + one OPA bundle for
 // the whole cell).
 //
-// Skipped entirely if p is nil so deployments without a Trino cell don't
-// need to know about it.
+// A nil provisioner is rejected before the controller starts.
 func (c *Controller) WithTrinoProvisioner(p *TrinoProvisioner) *Controller {
 	if p == nil {
 		panic("WithTrinoProvisioner: provisioner is nil; call NewTrinoProvisioner first")
+	}
+	return c.WithTrinoReconciler(p)
+}
+
+// WithTrinoReconciler installs the configured fleet's reconciliation entry point.
+func (c *Controller) WithTrinoReconciler(p interface{ Reconcile(context.Context) error }) *Controller {
+	if p == nil {
+		panic("WithTrinoReconciler: reconciler is nil")
 	}
 	c.trinoProvisioner = p
 	return c

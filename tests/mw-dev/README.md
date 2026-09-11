@@ -518,6 +518,53 @@ normal `go test ./...` lane.
 
 ## Isolation model
 
+### Trino multicell lane
+
+The full Trino E2E lane adds a second disposable namespace,
+`duckgres-ci-pr-0<N>`, alongside the canonical `duckgres-ci-pr-<N>` identity.
+Canonical lane identities must be positive numbers without a leading zero.
+The secondary namespace carries the original lane label and a `trino-cell`
+component label. It owns no control plane, config-store, or Duckling resources.
+Performance scenarios keep the existing single-cell fixture and resource budget.
+
+The additional `cell-test` starts with one blue coordinator and one worker;
+green remains at zero replicas. Both colors use distinct internal credentials,
+node environments, discovery Services, and catalog-store keys. Their shared
+cell-local auth, tenant-password, OPA, and resource-group projections are
+managed by the primary control plane through a scoped RoleBinding.
+
+`e2e/trino-multicell.sh` provisions a new warehouse without Trino, selects its
+initial cell, enables Trino, and verifies real DuckLake writes and reads. It
+asserts that legacy remains queryable, credentials and OPA tokens cannot cross
+cells, and an existing legacy assignment cannot be changed. It then starts
+green, updates the startup-loaded registry, restarts the control plane, and
+queries the same data through green's independently hydrated catalog. Direct
+coordinator URLs are fixture-only; this does not test Gateway routing or a
+maintenance move of an existing warehouse.
+
+The fixture preserves the existing CI network-policy posture. It does not
+create network policies or add cluster-wide RBAC grants. Isolation assertions
+cover application authentication and OPA authorization, not network isolation.
+If an existing cluster policy blocks the fixture, investigate that policy;
+do not weaken it to make the test pass.
+
+All lanes generate a random config-store password in `DUCKGRES_CI_SECRET_DIR`
+and reuse it for that run. PostgreSQL, the control plane, and benchmark Jobs
+read Kubernetes Secret references; Trino receives the same password through
+its catalog-store Secret. Credentials never appear as literal pod environment
+values. GitHub Actions masks the generated password before deployment.
+
+Run `just test-mw-fixtures` for local rendering and cleanup guard tests. The
+real acceptance gate is the PR's Trino E2E workflow. A rendered fixture is not
+proof that CI has the required cross-namespace RBAC and Pod Identity grants.
+On failure, keep the PR in draft and inspect its isolated job/deployment logs.
+Do not redirect the suite to an existing shared cell.
+
+Normal reset/teardown and stale cleanup delete the secondary namespace only
+after its name, original lane label, component label, and UID match. Namespace
+deletion uses a UID precondition. Secondary cleanup removes its Pod Identity
+association but never independently deletes the primary lane's warehouses.
+
 Dedicated CP + throwaway config-store **per e2e lane**, provisioning three **real**
 CNPG-backed ducklings (org IDs `ci-pr-<N>-cnpg` plus the ducklake-only
 resilience-lane orgs `ci-pr-<N>-res1`/`-res2`) through the **shared**
@@ -672,7 +719,7 @@ pod-identity calls. Both images point at the same all-in-one ref.
 ```sh
 IMG=<ecr>/duckgres:<tag>
 AWS_PROFILE=mw-dev \
-NAMESPACE=duckgres-ci-pr-0 PR_NUMBER=0 KUBE_CONTEXT=posthog-mw-dev \
+NAMESPACE="duckgres-ci-pr-${LANE_ID:?}" PR_NUMBER="$LANE_ID" KUBE_CONTEXT=posthog-mw-dev \
   WORKER_IMAGE=$IMG CONTROLPLANE_IMAGE=$IMG \
   CP_POD_IDENTITY_ROLE=arn:aws:iam::<mw-dev-account-id>:role/duckgres-control-plane-dev \
   bash tests/mw-dev/run.sh deploy

@@ -131,11 +131,17 @@ func (cs *ConfigStore) UpdateTrinoState(orgID string, upd TrinoStateUpdate) erro
 // else (or disabled) between the list and the write. The next tick re-reads
 // and skips the org because its cell no longer matches.
 func (cs *ConfigStore) AssignTrinoCell(orgID, cellID string) error {
+	_, err := cs.ClaimTrinoCell(orgID, cellID)
+	return err
+}
+
+// ClaimTrinoCell reports whether this call acquired the previously unassigned row.
+func (cs *ConfigStore) ClaimTrinoCell(orgID, cellID string) (bool, error) {
 	if orgID == "" {
-		return errors.New("AssignTrinoCell: orgID is required")
+		return false, errors.New("ClaimTrinoCell: orgID is required")
 	}
 	if cellID == "" {
-		return errors.New("AssignTrinoCell: cellID is required")
+		return false, errors.New("ClaimTrinoCell: cellID is required")
 	}
 	result := cs.db.Model(&ManagedWarehouseTrino{}).
 		Where("org_id = ? AND enabled = ? AND (trino_cell_id IS NULL OR trino_cell_id = ?)", orgID, true, "").
@@ -144,9 +150,45 @@ func (cs *ConfigStore) AssignTrinoCell(orgID, cellID string) error {
 			"updated_at":    time.Now().UTC(),
 		})
 	if result.Error != nil {
-		return fmt.Errorf("assign trino cell for %q: %w", orgID, result.Error)
+		return false, fmt.Errorf("assign trino cell for %q: %w", orgID, result.Error)
 	}
-	return nil
+	return result.RowsAffected == 1, nil
+}
+
+var (
+	ErrTrinoCellSelectionConflict = errors.New("trino cell selection is only available before initial enablement; existing assignments cannot change")
+	ErrTrinoWarehouseNotFound     = errors.New("managed warehouse not found")
+)
+
+// SelectTrinoCell assigns an initial cell without enabling Trino or moving an existing tenant.
+func (cs *ConfigStore) SelectTrinoCell(orgID, cellID string) error {
+	if orgID == "" || cellID == "" {
+		return errors.New("SelectTrinoCell: orgID and cellID are required")
+	}
+	return cs.db.Transaction(func(tx *gorm.DB) error {
+		var warehouse ManagedWarehouse
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&warehouse, "org_id = ?", orgID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrTrinoWarehouseNotFound
+			}
+			return err
+		}
+		row := ManagedWarehouseTrino{OrgID: orgID, State: ManagedWarehouseStatePending}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "org_id = ?", orgID).Error; err != nil {
+			return err
+		}
+		if row.TrinoCellID == cellID {
+			return nil
+		}
+		if row.TrinoCellID != "" || row.Enabled || row.State != ManagedWarehouseStatePending || row.ReadyAt != nil || row.FailedAt != nil {
+			return ErrTrinoCellSelectionConflict
+		}
+		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ?", orgID).
+			Updates(map[string]any{"trino_cell_id": cellID, "updated_at": time.Now().UTC()}).Error
+	})
 }
 
 // DisableTrino marks the org as no longer Trino-enabled. The row is

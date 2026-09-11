@@ -41,7 +41,7 @@ curl -fsSLo "$KUBECTL" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/a
 chmod +x "$KUBECTL"
 "$KUBECTL" version --client >/dev/null || fail "pinned kubectl bootstrap failed"
 
-api() { curl -fsS -H "$H" "$@"; }
+api() { curl --connect-timeout 5 --max-time 60 -fsS -H "$H" "$@"; }
 
 # A fresh managed warehouse has an empty metadata database. DuckLake's Trino
 # connector consumes an existing DuckLake catalog; it does not create the
@@ -113,7 +113,7 @@ wait_trino() { # org expected-principal expected-catalog
 # nextUri; every follow-up keeps both Basic auth and the tenant identity.
 trino_query() { # principal password sql
   principal="$1" password="$2" sql="$3"
-  response="$(curl --cacert "$CA" -fsS --user "$principal:$password" \
+  response="$(curl --connect-timeout 5 --max-time 60 --cacert "$CA" -fsS --user "$principal:$password" \
     -H "X-Trino-User: $principal" -H 'X-Trino-Time-Zone: UTC' \
     --data-binary "$sql" "$TRINO/v1/statement")" || return 1
   rows='[]'
@@ -123,7 +123,7 @@ trino_query() { # principal password sql
     rows="$(printf %s "$response" | jq -c --argjson rows "$rows" '$rows + (.data // [])')"
     next="$(printf %s "$response" | jq -r '.nextUri // empty')"
     [ -n "$next" ] || break
-    response="$(curl --cacert "$CA" -fsS --user "$principal:$password" \
+    response="$(curl --connect-timeout 5 --max-time 60 --cacert "$CA" -fsS --user "$principal:$password" \
       -H "X-Trino-User: $principal" -H 'X-Trino-Time-Zone: UTC' "$next")" || return 1
   done
   printf '%s\n' "$rows"
@@ -311,4 +311,7 @@ trino_query "$DB_A" "$pw_a" "DROP TABLE $CAT_A.$schema.$table" >/dev/null
 trino_query "$DB_A" "$pw_a" "DROP TABLE $CAT_A.$schema.$scratch" >/dev/null
 trino_query "$DB_A" "$pw_a" "DROP TABLE $CAT_A.$schema.$writes" >/dev/null
 trino_query "$DB_A" "$pw_a" "DROP SCHEMA $CAT_A.$schema" >/dev/null
+if [ "${TRINO_MULTICELL_ENABLED:-false}" = true ]; then
+  . /harness/trino-multicell.sh
+fi
 log "PASS: isolated Trino provisioning + verified auth + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable"

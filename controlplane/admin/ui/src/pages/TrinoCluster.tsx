@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { AlertTriangle, Boxes, Cpu, Network, ServerCog } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -20,9 +20,11 @@ import {
 } from "@/lib/trino";
 
 export function TrinoCluster() {
-  const status = useTrinoStatus();
-  const nodes = useTrinoNodes();
-  const orgs = useTrinoOrgs();
+  const [params] = useSearchParams();
+  const cell = params.get("cell") ?? undefined;
+  const status = useTrinoStatus(cell);
+  const nodes = useTrinoNodes(cell);
+  const orgs = useTrinoOrgs(cell);
   const orgLabels = useOrgLabels();
 
   // The nodes payload names its own inventory; status carries it too for

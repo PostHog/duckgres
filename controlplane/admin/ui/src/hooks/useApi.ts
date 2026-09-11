@@ -778,9 +778,9 @@ export function useCancelReshard() {
 
 const NO_TRINO_CELL: TrinoCell = { id: "", coordinator_url: "" };
 
-export function useTrinoStatus() {
+export function useTrinoStatus(cell?: string) {
   return useQuery({
-    queryKey: ["trino", "status"],
+    queryKey: ["trino", "status", cell],
     queryFn: () =>
       tolerate404<TrinoStatus>({
         cell: NO_TRINO_CELL,
@@ -792,12 +792,12 @@ export function useTrinoStatus() {
         failed_nodes: 0,
         orgs_by_state: {},
         total_orgs: 0,
-      })(api.trinoStatus()),
+      })(api.trinoStatus(cell)),
     refetchInterval: POLL.normal,
   });
 }
 
-export function useTrinoQueries(filters: { org?: string; state?: string; active?: boolean }) {
+export function useTrinoQueries(filters: { org?: string; state?: string; active?: boolean; cell?: string }) {
   return useQuery({
     queryKey: ["trino", "queries", filters],
     queryFn: () =>
@@ -808,23 +808,23 @@ export function useTrinoQueries(filters: { org?: string; state?: string; active?
   });
 }
 
-export function useTrinoNodes() {
+export function useTrinoNodes(cell?: string) {
   return useQuery({
-    queryKey: ["trino", "nodes"],
+    queryKey: ["trino", "nodes", cell],
     queryFn: () =>
       tolerate404<TrinoNodesResponse>({ cell: NO_TRINO_CELL, available: false, nodes: [] })(
-        api.trinoNodes(),
+        api.trinoNodes(cell),
       ),
     refetchInterval: POLL.slow,
   });
 }
 
-export function useTrinoOrgs() {
+export function useTrinoOrgs(cell?: string) {
   return useQuery({
-    queryKey: ["trino", "orgs"],
+    queryKey: ["trino", "orgs", cell],
     queryFn: () =>
       tolerate404<TrinoOrgsResponse>({ cell: NO_TRINO_CELL, available: false, orgs: [] })(
-        api.trinoOrgs(),
+        api.trinoOrgs(cell),
       ),
     refetchInterval: POLL.slow,
   });
@@ -842,10 +842,26 @@ export function useOrgTrino(org: string) {
   });
 }
 
-export function useKillTrinoQuery() {
+export function useTrinoCells() {
+  return useQuery({
+    queryKey: ["trino", "cells"],
+    queryFn: () => tolerate404<{ cells: TrinoCell[] }>({ cells: [] })(api.trinoCells()),
+    refetchInterval: POLL.slow,
+  });
+}
+
+export function useSelectTrinoCell() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, reason }: { id: string; reason: string }) => api.killTrinoQuery(id, reason),
+    mutationFn: ({ org, cell }: { org: string; cell: string }) => api.selectTrinoCell(org, cell),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["trino"] }),
+  });
+}
+
+export function useKillTrinoQuery(cell?: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: string; reason: string }) => api.killTrinoQuery(id, reason, cell),
     // A kill changes what the live list should show, so drop the whole
     // trino cache rather than waiting out the poll interval.
     onSuccess: () => qc.invalidateQueries({ queryKey: ["trino"] }),

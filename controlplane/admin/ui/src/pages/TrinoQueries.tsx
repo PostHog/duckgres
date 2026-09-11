@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { AlertTriangle, Ban, Database, Gauge, Hourglass, Timer } from "lucide-react";
 import { PageBody, PageHeader } from "@/components/AppShell";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -59,7 +60,8 @@ function KillDialog({
   onClose: () => void;
 }) {
   const [reason, setReason] = useState("");
-  const kill = useKillTrinoQuery();
+  const [params] = useSearchParams();
+  const kill = useKillTrinoQuery(params.get("cell") ?? undefined);
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent>
@@ -115,8 +117,10 @@ export function TrinoQueries() {
   const [orgFilter, setOrgFilter] = useState("");
   const [killing, setKilling] = useState<TrinoQuery | null>(null);
 
-  const status = useTrinoStatus();
-  const queries = useTrinoQueries({ active: activeOnly });
+  const [params] = useSearchParams();
+  const cell = params.get("cell") ?? undefined;
+  const status = useTrinoStatus(cell);
+  const queries = useTrinoQueries({ active: activeOnly, ...(cell ? { cell } : {}) });
   const orgLabels = useOrgLabels();
 
   const rows = useMemo(() => {

@@ -347,10 +347,10 @@ func TestTeardownFailsWhenCNPGCleanupCannotReachAPrimary(t *testing.T) {
 			}
 
 			calls := fakes.calls(t)
-			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 15 {
-				t.Fatalf("primary discovery calls = %d, want 15 (three retries for each CI org); calls:\n%s", got, calls)
+			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 18 {
+				t.Fatalf("primary discovery calls = %d, want 18 (three retries for each CI org); calls:\n%s", got, calls)
 			}
-			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 15 {
+			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 18 {
 				t.Fatalf("psql attempts were not bounded to three per CI org; calls:\n%s", calls)
 			}
 			if !strings.Contains(calls, "delete namespace duckgres-ci-pr-123 --ignore-not-found --wait=false") {
@@ -444,6 +444,7 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"value: \"isolated-test-secret\"",
 		"name: DUCKGRES_SCENARIO_ORG_ID, value: \"ci-pr-123-cnpg\"",
 		"name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: \"/trino-ca/ca.crt\"",
+		"name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN\n              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: dsn } }",
 		"name: DUCKGRES_SCENARIO_ATHENA_REGION, value: \"us-east-1\"",
 		"name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: \"benchmark\"",
 		"name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: \"benchmark_frozen\"",
@@ -1297,7 +1298,7 @@ func TestE2ELanesCanReadOnlyRequiredDucklingsSecrets(t *testing.T) {
 	}
 	wantResourceNames := "cnpg-shard-001-provisioner,cnpg-shard-002-provisioner," +
 		"cnpg-tenant-ci-pr-123-cnpg-password," +
-		"cnpg-tenant-ci-pr-123-trinoa-password,cnpg-tenant-ci-pr-123-trinob-password"
+		"cnpg-tenant-ci-pr-123-trinoa-password,cnpg-tenant-ci-pr-123-trinob-password,cnpg-tenant-ci-pr-123-trinoc-password"
 	if got := strings.Join(stringSlice(rule["resourceNames"]), ","); got != wantResourceNames {
 		t.Fatalf("resourceNames = %q", got)
 	}
@@ -1853,10 +1854,18 @@ if [[ "$*" == *" -n cnpg-shards exec "* && "$*" == *" psql -U postgres -c "* ]];
   exit 0
 fi
 if [[ "$*" == *" apply -f -"* ]]; then
-  tee -a "$RUN_SH_TEST_CALLS" >/dev/null
+  if [[ -n "${RUN_SH_TEST_RENDERED:-}" ]]; then
+    tee -a "$RUN_SH_TEST_CALLS" "$RUN_SH_TEST_RENDERED" >/dev/null
+  else
+    tee -a "$RUN_SH_TEST_CALLS" >/dev/null
+  fi
   exit 0
 fi
 if [[ "$*" == *" --patch-file=/dev/stdin"* ]]; then
+  tee -a "$RUN_SH_TEST_CALLS" >/dev/null
+  exit 0
+fi
+if [[ "$*" == *" delete --raw /api/v1/namespaces/"* ]]; then
   tee -a "$RUN_SH_TEST_CALLS" >/dev/null
   exit 0
 fi
@@ -1945,7 +1954,11 @@ YAML
   exit 0
 fi
 if [[ "$*" == *" get ns -l app.kubernetes.io/managed-by=e2e-mw-dev "* ]]; then
-  printf 'duckgres-ci-pr-123 2026-01-01T00:00:00Z\n'
+  printf '%s\n' "${RUN_SH_TEST_NAMESPACE_INVENTORY:-duckgres-ci-pr-123 2026-01-01T00:00:00Z 123}"
+  exit 0
+fi
+if [[ "$*" == *" get namespace duckgres-ci-pr-0123 "* ]]; then
+  printf '%s' "${RUN_SH_TEST_SECONDARY_NAMESPACE:-}"
   exit 0
 fi
 if [[ "$*" == *" get pod -l app=duckgres-control-plane "* ]]; then

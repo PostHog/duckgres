@@ -47,6 +47,7 @@ import type {
   SessionStatus,
   StartReshardBody,
   TrinoKillResult,
+  TrinoCell,
   TrinoNodesResponse,
   TrinoOrgDetail,
   TrinoOrgsResponse,
@@ -294,21 +295,25 @@ export const api = {
 
   // trino cell (absent entirely on a deployment with no cell — these 404,
   // which the *Optional hooks turn into an empty state)
-  trinoStatus: () => get<TrinoStatus>("/trino/status"),
+  trinoStatus: (cell?: string) => get<TrinoStatus>("/trino/status", { cell }),
   // active=1 keeps the live view to the states an operator can still act on;
   // the server also serves recently-finished queries without it.
-  trinoQueries: (filters: { org?: string; state?: string; active?: boolean }) =>
+  trinoQueries: (filters: { org?: string; state?: string; active?: boolean; cell?: string }) =>
     get<TrinoQueriesResponse>("/trino/queries", {
       org: filters.org,
       state: filters.state,
       active: filters.active ? 1 : undefined,
+      cell: filters.cell,
     }),
-  trinoQuery: (id: string) => get<TrinoQuery>(`/trino/queries/${enc(id)}`),
+  trinoQuery: (id: string, cell?: string) => get<TrinoQuery>(`/trino/queries/${enc(id)}`, { cell }),
   // The reason reaches the TENANT as their query's failure message, so they
   // learn why it died rather than seeing an unexplained cancellation.
-  killTrinoQuery: (id: string, reason: string) =>
-    post<TrinoKillResult>(`/trino/queries/${enc(id)}/kill`, { reason }),
-  trinoNodes: () => get<TrinoNodesResponse>("/trino/nodes"),
-  trinoOrgs: () => get<TrinoOrgsResponse>("/trino/orgs"),
+  killTrinoQuery: (id: string, reason: string, cell?: string) =>
+    post<TrinoKillResult>(`/trino/queries/${enc(id)}/kill${cell ? `?cell=${enc(cell)}` : ""}`, { reason }),
+  trinoNodes: (cell?: string) => get<TrinoNodesResponse>("/trino/nodes", { cell }),
+  trinoOrgs: (cell?: string) => get<TrinoOrgsResponse>("/trino/orgs", { cell }),
   orgTrino: (org: string) => get<TrinoOrgDetail>(`/orgs/${enc(org)}/trino`),
+  trinoCells: () => get<{ cells: TrinoCell[] }>("/trino/cells"),
+  selectTrinoCell: (org: string, cell: string) =>
+    put<{ cell: TrinoCell; assigned: boolean }>(`/orgs/${enc(org)}/trino/cell`, { cell }),
 };
