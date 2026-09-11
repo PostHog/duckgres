@@ -27,11 +27,11 @@ ARG HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
 ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
 # Repository for postgres_scanner specifically. The checksums content-pin the
-# DuckDB 1.5.5 nightly artifact built from duckdb-postgres 4053b61; CI overrides
+# DuckDB 1.5.5 nightly artifact built from duckdb-postgres a3516c0; CI overrides
 # all three values together for rollback rows.
 ARG POSTGRES_SCANNER_REPOSITORY=https://nightly-extensions.duckdb.org
-ARG POSTGRES_SCANNER_SHA256_AMD64=fdeb8a146f79a91b4af0c00708f62496b5c40ae6e741786e9bc53cfc59b322c2
-ARG POSTGRES_SCANNER_SHA256_ARM64=d5663be7338af2cce5595c4c0ca170c7939d6979fec5adede284021aba405b1f
+ARG POSTGRES_SCANNER_SHA256_AMD64=5b1657abe8f829b16da8e79570dc10751252361e59294ab890e3fcbdf94d4a82
+ARG POSTGRES_SCANNER_SHA256_ARM64=c7e18454bd7d52a39d4e19a27932470d7fd071b606fe5f7a00f07d626155eac8
 # `: ${VAR:?msg}` asserts every required input is non-empty — catches a
 # CI matrix row that forgets to pass a build-arg and would otherwise
 # silently fall back to the ARG default, producing a cross-version
