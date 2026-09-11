@@ -4,9 +4,11 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -16,6 +18,62 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 )
+
+type fleetCatalog struct {
+	called chan struct{}
+	block  bool
+}
+
+func (c *fleetCatalog) ListCatalogs(ctx context.Context) ([]string, error) {
+	close(c.called)
+	if c.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return nil, nil
+}
+func (c *fleetCatalog) CreateCatalog(context.Context, string, map[string]string) error { return nil }
+func (c *fleetCatalog) AlterCatalog(context.Context, string, map[string]string) error  { return nil }
+func (c *fleetCatalog) DropCatalog(context.Context, string) error                      { return nil }
+
+func TestTrinoFleetSlowCellDoesNotBlockSibling(t *testing.T) {
+	store := &fleetBootstrapStore{initialized: map[string]bool{}}
+	kc := kubefake.NewClientset()
+	catalogs := []*fleetCatalog{{called: make(chan struct{}), block: true}, {called: make(chan struct{})}}
+	var fleet trinoFleet
+	for i, namespace := range []string{"legacy", "registered"} {
+		p, err := provisioner.NewTrinoProvisioner(provisioner.TrinoProvisionerOpts{
+			Store: store, BootstrapSentinel: store, Warehouses: store, Kubernetes: kc,
+			Ducklings: func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil },
+			Namespace: namespace, CellID: namespace, Catalog: catalogs[i], BundleStore: &opa.BundleStore{}, BundleBuilder: opa.NewBuilder(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.Bootstrap(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		fleet = append(fleet, &trinoWiring{Provisioner: p, Cell: trinoCell{ID: namespace}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- fleet.Reconcile(ctx) }()
+	select {
+	case <-catalogs[1].called:
+	case <-time.After(10 * time.Second):
+		t.Fatal("blocked cell prevented its sibling from reconciling")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected cancellation, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fleet did not cancel")
+	}
+}
 
 type fleetBootstrapStore struct{ initialized map[string]bool }
 
