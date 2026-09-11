@@ -51,6 +51,15 @@ func TestScenarioRunner(t *testing.T) {
 		t.Fatalf("resolve scenario templates: %v", err)
 	}
 
+	if loaded.Standalone {
+		executor, err := standaloneExecutor(loaded, filepath.Join(*scenarioOutputBase, runID))
+		if err != nil {
+			t.Fatalf("configure standalone scenario: %v", err)
+		}
+		runLoadedScenario(t, loaded, runID, executor)
+		return
+	}
+
 	provisionClient, err := provision.NewClient(provision.Config{
 		BaseURL:        mustEnv(t, "DUCKGRES_SCENARIO_API_BASE"),
 		InternalSecret: mustEnv(t, "DUCKGRES_SCENARIO_INTERNAL_SECRET"),
@@ -107,19 +116,49 @@ func TestScenarioRunner(t *testing.T) {
 		DBTBinary: envOrDefault("DUCKGRES_SCENARIO_DBT_BIN", "dbt"),
 	})
 
+	runLoadedScenario(t, loaded, runID, dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor, dbt: dbtExecutor})
+}
+
+func runLoadedScenario(t *testing.T, loaded core.Scenario, runID string, executor core.StepExecutor) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), *scenarioMaxRuntime)
 	defer cancel()
 	runner := core.NewRunner(core.RunnerConfig{
 		RunID:          runID,
 		Scenario:       loaded,
-		Executor:       dispatchExecutor{provision: provisionExecutor, sql: sqlExecutor, perf: perfExecutor, dbt: dbtExecutor},
-		OutputDir:      scenarioOutputDir,
+		Executor:       executor,
+		OutputDir:      filepath.Join(*scenarioOutputBase, runID),
 		WriteFiles:     true,
 		CleanupTimeout: 15 * time.Minute,
 	})
 	if summary, err := runner.Run(ctx); err != nil {
 		t.Fatalf("scenario failed: %+v: %v", summary, err)
 	}
+}
+
+// Standalone scenarios use an existing Trino endpoint and explicit credentials.
+// Validate every step before constructing the executor so a mixed scenario
+// cannot accidentally use missing provisioning or PGWire dependencies.
+func standaloneExecutor(scenario core.Scenario, outputDir string) (core.StepExecutor, error) {
+	if !scenario.Standalone || len(scenario.Steps) == 0 {
+		return nil, fmt.Errorf("standalone mode requires standalone: true and at least one perf step")
+	}
+	for _, step := range scenario.Steps {
+		if step.Type != scenarioperf.StepTypePerfQueries {
+			return nil, fmt.Errorf("standalone step %s must be perf_queries", step.ID)
+		}
+		targets, ok := step.With["targets"].([]any)
+		if !ok || len(targets) != 1 || targets[0] != "trino_hoglake" {
+			return nil, fmt.Errorf("standalone step %s requires targets: [trino_hoglake]", step.ID)
+		}
+		for _, key := range []string{"username", "password", "trino_server_url", "trino_catalog", "trino_reference_catalog"} {
+			value, ok := step.With[key].(string)
+			if !ok || strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("standalone step %s requires explicit %s", step.ID, key)
+			}
+		}
+	}
+	return scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{OutputDir: outputDir}), nil
 }
 
 func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSteps(t *testing.T) {

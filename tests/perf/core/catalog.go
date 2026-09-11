@@ -142,9 +142,11 @@ func validateRelationVariants(targets []Protocol, variants map[StorageTarget]map
 	}
 	requiredTargets := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable}
 	for _, target := range targets {
-		if target == ProtocolAthena {
+		switch target {
+		case ProtocolAthena:
 			requiredTargets = append(requiredTargets, StorageTargetAthenaExternal)
-			break
+		case ProtocolTrinoHoglake:
+			requiredTargets = append(requiredTargets, StorageTargetHoglakeTable)
 		}
 	}
 	if len(variants) != len(requiredTargets) {
@@ -185,6 +187,9 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 	if _, ok := variants[StorageTargetAthenaExternal]; ok {
 		targets = append(targets, StorageTargetAthenaExternal)
 	}
+	if _, ok := variants[StorageTargetHoglakeTable]; ok {
+		targets = append(targets, StorageTargetHoglakeTable)
+	}
 	queries := make([]Query, 0, len(targets))
 	for _, target := range targets {
 		rendered, err := renderRelationTemplate(def.QueryIDBase, def.SQLTemplate, placeholders, variants[target], target)
@@ -204,12 +209,19 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 			StorageTarget: target,
 		})
 	}
-	renderedSQL := make(map[string]struct{}, len(queries))
-	for _, query := range queries {
-		if _, exists := renderedSQL[query.PGWireSQL]; exists {
-			return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets", def.QueryIDBase)
+	// Identical names can refer to different catalogs on separate protocols.
+	// Within one protocol, variants must resolve to different relations.
+	for index, query := range queries {
+		for _, other := range queries[:index] {
+			if query.CanonicalSQL() != other.CanonicalSQL() {
+				continue
+			}
+			for _, protocol := range []Protocol{ProtocolPGWire, ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolTrinoHoglake, ProtocolAthena} {
+				if querySupportsProtocol(query, protocol) && querySupportsProtocol(other, protocol) {
+					return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets on %s", def.QueryIDBase, protocol)
+				}
+			}
 		}
-		renderedSQL[query.PGWireSQL] = struct{}{}
 	}
 	return queries, nil
 }
@@ -389,7 +401,7 @@ func validateCatalog(c Catalog) error {
 	seenTargets := map[Protocol]struct{}{}
 	for _, target := range c.Targets {
 		switch target {
-		case ProtocolPGWire, ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena:
+		case ProtocolPGWire, ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolTrinoHoglake, ProtocolAthena:
 		default:
 			return fmt.Errorf("unsupported target protocol %q", target)
 		}

@@ -162,7 +162,8 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 // Each physical relation family is routed only to protocols which expose it.
 // PGWire measures both the raw Parquet view and production-shaped DuckLake
 // table, Trino measures the shared DuckLake table, and Athena measures its
-// Glue external table over the same immutable Parquet files.
+// Glue external table over the same immutable Parquet files. Hoglake uses its
+// own Trino catalog and never runs the DuckLake or raw-view variants.
 func querySupportsProtocol(query Query, protocol Protocol) bool {
 	switch query.StorageTarget {
 	case "":
@@ -171,6 +172,8 @@ func querySupportsProtocol(query Query, protocol Protocol) bool {
 		return protocol == ProtocolPGWire || protocol == ProtocolPGWireUncached || protocol == ProtocolPGWireCached
 	case StorageTargetDuckLakeTable:
 		return protocol == ProtocolPGWire || protocol == ProtocolPGWireUncached || protocol == ProtocolPGWireCached || protocol == ProtocolTrino || protocol == ProtocolTrinoCached
+	case StorageTargetHoglakeTable:
+		return protocol == ProtocolTrinoHoglake
 	case StorageTargetAthenaExternal:
 		return protocol == ProtocolAthena
 	default:

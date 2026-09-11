@@ -57,29 +57,32 @@ type StepResult struct {
 }
 
 type stepSpec struct {
-	OrgID                string
-	Username             string
-	Password             string
-	CatalogFile          string
-	Targets              []perfcore.Protocol
-	RunID                string
-	DatasetVersion       string
-	Database             string
-	OutputSubdir         string
-	ReadOnly             bool
-	FailOnQueryErrors    bool
-	WorkerCPU            string
-	WorkerMemory         string
-	TrinoSchema          string
-	TrinoCACertFile      string
-	TrinoStartup         trinodriver.StartupOptions
-	AthenaRegion         string
-	AthenaWorkGroup      string
-	AthenaCatalog        string
-	AthenaDatabase       string
-	AthenaOutputLocation string
-	AthenaPollInterval   time.Duration
-	AthenaQueryTimeout   time.Duration
+	OrgID                 string
+	Username              string
+	Password              string
+	CatalogFile           string
+	Targets               []perfcore.Protocol
+	RunID                 string
+	DatasetVersion        string
+	Database              string
+	OutputSubdir          string
+	ReadOnly              bool
+	FailOnQueryErrors     bool
+	WorkerCPU             string
+	WorkerMemory          string
+	TrinoServerURL        string
+	TrinoCatalog          string
+	TrinoReferenceCatalog string
+	TrinoSchema           string
+	TrinoCACertFile       string
+	TrinoStartup          trinodriver.StartupOptions
+	AthenaRegion          string
+	AthenaWorkGroup       string
+	AthenaCatalog         string
+	AthenaDatabase        string
+	AthenaOutputLocation  string
+	AthenaPollInterval    time.Duration
+	AthenaQueryTimeout    time.Duration
 }
 
 type defaultDriverFactory struct {
@@ -267,21 +270,24 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	}
 
 	return stepSpec{
-		OrgID:             orgID,
-		Username:          username,
-		Password:          password,
-		CatalogFile:       catalogFile,
-		Targets:           targets,
-		RunID:             runID,
-		DatasetVersion:    stringFromWith(step, "dataset_version", ""),
-		Database:          stringFromWith(step, "catalog", "ducklake"),
-		OutputSubdir:      stringFromWith(step, "output_subdir", "perf"),
-		ReadOnly:          boolFromWith(step, "read_only", true),
-		FailOnQueryErrors: boolFromWith(step, "fail_on_query_errors", true),
-		WorkerCPU:         stringFromWith(step, "worker_cpu", ""),
-		WorkerMemory:      stringFromWith(step, "worker_memory", ""),
-		TrinoSchema:       stringFromWith(step, "trino_schema", "posthog"),
-		TrinoCACertFile:   stringFromWith(step, "trino_ca_cert_file", ""),
+		OrgID:                 orgID,
+		Username:              username,
+		Password:              password,
+		CatalogFile:           catalogFile,
+		Targets:               targets,
+		RunID:                 runID,
+		DatasetVersion:        stringFromWith(step, "dataset_version", ""),
+		Database:              stringFromWith(step, "catalog", "ducklake"),
+		OutputSubdir:          stringFromWith(step, "output_subdir", "perf"),
+		ReadOnly:              boolFromWith(step, "read_only", true),
+		FailOnQueryErrors:     boolFromWith(step, "fail_on_query_errors", true),
+		WorkerCPU:             stringFromWith(step, "worker_cpu", ""),
+		WorkerMemory:          stringFromWith(step, "worker_memory", ""),
+		TrinoServerURL:        stringFromWith(step, "trino_server_url", ""),
+		TrinoCatalog:          stringFromWith(step, "trino_catalog", ""),
+		TrinoReferenceCatalog: stringFromWith(step, "trino_reference_catalog", ""),
+		TrinoSchema:           stringFromWith(step, "trino_schema", "posthog"),
+		TrinoCACertFile:       stringFromWith(step, "trino_ca_cert_file", ""),
 		TrinoStartup: trinodriver.StartupOptions{
 			Timeout:      trinoStartupTimeout,
 			PollInterval: trinoStartupPollInterval,
@@ -315,7 +321,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached, perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached, perfcore.ProtocolAthena:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached, perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached, perfcore.ProtocolTrinoHoglake, perfcore.ProtocolAthena:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -378,8 +384,14 @@ func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catal
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
 			drivers[target] = driver
-		case perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached:
-			connection, err := e.trinoConnection(spec)
+		case perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached, perfcore.ProtocolTrinoHoglake:
+			var connection trinodriver.ConnectionConfig
+			var err error
+			if target == perfcore.ProtocolTrinoHoglake {
+				connection, err = hoglakeTrinoConnection(spec)
+			} else {
+				connection, err = e.trinoConnection(spec)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -430,6 +442,30 @@ func (e *Executor) athenaConnection(spec stepSpec) (athenadriver.ConnectionConfi
 		OutputLocation: spec.AthenaOutputLocation,
 		PollInterval:   spec.AthenaPollInterval,
 		QueryTimeout:   spec.AthenaQueryTimeout,
+	}, nil
+}
+
+// Hoglake uses an explicitly configured coordinator and catalog. Warehouse
+// provisioning currently supplies DuckLake catalogs, so reusing that state
+// would silently benchmark the wrong connector.
+func hoglakeTrinoConnection(spec stepSpec) (trinodriver.ConnectionConfig, error) {
+	for _, setting := range []struct{ key, value string }{
+		{"trino_server_url", spec.TrinoServerURL},
+		{"trino_catalog", spec.TrinoCatalog},
+		{"trino_reference_catalog", spec.TrinoReferenceCatalog},
+	} {
+		if strings.TrimSpace(setting.value) == "" {
+			return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino_hoglake requires with.%s", setting.key))
+		}
+	}
+	if spec.TrinoCatalog == spec.TrinoReferenceCatalog {
+		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("hoglake and reference catalogs must differ"))
+	}
+	return trinodriver.ConnectionConfig{
+		ServerURL: spec.TrinoServerURL, Catalog: spec.TrinoCatalog,
+		ReferenceCatalog: spec.TrinoReferenceCatalog,
+		Username:         spec.Username, Password: spec.Password, Schema: spec.TrinoSchema,
+		CACertFile: spec.TrinoCACertFile, Startup: spec.TrinoStartup, Source: "duckgres-perf",
 	}, nil
 }
 
@@ -510,8 +546,10 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, p
 }
 
 func (f defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
-	if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, connection.Protocol); err != nil {
-		return nil, err
+	if connection.Protocol != perfcore.ProtocolTrinoHoglake {
+		if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, connection.Protocol); err != nil {
+			return nil, err
+		}
 	}
 	return trinodriver.New(ctx, connection)
 }

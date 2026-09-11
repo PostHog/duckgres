@@ -10,6 +10,7 @@ const (
 	ProtocolPGWireCached   Protocol = "pgwire_cached"
 	ProtocolTrino          Protocol = "trino"
 	ProtocolTrinoCached    Protocol = "trino_cached"
+	ProtocolTrinoHoglake   Protocol = "trino_hoglake"
 	ProtocolAthena         Protocol = "athena"
 )
 
@@ -22,6 +23,7 @@ const (
 	StorageTargetRawView        StorageTarget = "raw_view"
 	StorageTargetDuckLakeTable  StorageTarget = "ducklake_table"
 	StorageTargetAthenaExternal StorageTarget = "athena_external"
+	StorageTargetHoglakeTable   StorageTarget = "hoglake_table"
 )
 
 type Catalog struct {

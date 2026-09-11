@@ -3,9 +3,11 @@ package trino
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/posthog/duckgres/tests/perf/core"
@@ -35,15 +37,16 @@ type StartupOptions struct {
 
 type ConnectionConfig struct {
 	// Protocol defaults to trino; trino_cached labels runs against a cache-enabled deployment.
-	Protocol   core.Protocol
-	ServerURL  string
-	Username   string
-	Password   string
-	Catalog    string
-	Schema     string
-	Source     string
-	CACertFile string
-	Startup    StartupOptions
+	Protocol         core.Protocol
+	ReferenceCatalog string
+	ServerURL        string
+	Username         string
+	Password         string
+	Catalog          string
+	Schema           string
+	Source           string
+	CACertFile       string
+	Startup          StartupOptions
 }
 
 func (c ConnectionConfig) DSN() (string, error) {
@@ -97,8 +100,11 @@ func (c ConnectionConfig) DSN() (string, error) {
 }
 
 type Driver struct {
-	protocol core.Protocol
-	exec     Executor
+	protocol     core.Protocol
+	exec         Executor
+	reference    resultExecutor
+	validationMu sync.Mutex
+	validated    map[string]bool
 }
 
 func New(ctx context.Context, config ConnectionConfig) (*Driver, error) {
@@ -106,8 +112,11 @@ func New(ctx context.Context, config ConnectionConfig) (*Driver, error) {
 	if protocol == "" {
 		protocol = core.ProtocolTrino
 	}
-	if protocol != core.ProtocolTrino && protocol != core.ProtocolTrinoCached {
+	if protocol != core.ProtocolTrino && protocol != core.ProtocolTrinoCached && protocol != core.ProtocolTrinoHoglake {
 		return nil, fmt.Errorf("unsupported Trino protocol %q", protocol)
+	}
+	if protocol == core.ProtocolTrinoHoglake && (strings.TrimSpace(config.ReferenceCatalog) == "" || config.ReferenceCatalog == config.Catalog) {
+		return nil, fmt.Errorf("hoglake reference catalog must be specified and differ from target catalog")
 	}
 	dsn, err := config.DSN()
 	if err != nil {
@@ -121,6 +130,30 @@ func New(ctx context.Context, config ConnectionConfig) (*Driver, error) {
 	if err := driver.WaitReady(ctx, config.Startup); err != nil {
 		_ = driver.Close()
 		return nil, err
+	}
+	if protocol == core.ProtocolTrinoHoglake {
+		lookup := func(ctx context.Context, catalog string) (string, error) {
+			var connectorName string
+			err := db.QueryRowContext(ctx, "SELECT connector_name FROM system.metadata.catalogs WHERE catalog_name = ?", catalog).Scan(&connectorName)
+			return connectorName, err
+		}
+		if err := validateCatalogs(ctx, lookup, config.Catalog, config.ReferenceCatalog); err != nil {
+			_ = driver.Close()
+			return nil, err
+		}
+		referenceConfig := config
+		referenceConfig.Catalog = config.ReferenceCatalog
+		referenceDSN, err := referenceConfig.DSN()
+		if err != nil {
+			_ = driver.Close()
+			return nil, err
+		}
+		referenceDB, err := sql.Open("trino", referenceDSN)
+		if err != nil {
+			_ = driver.Close()
+			return nil, fmt.Errorf("open reference Trino connection")
+		}
+		driver.reference = &sqlExecutor{db: referenceDB}
 	}
 	return driver, nil
 }
@@ -143,6 +176,11 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	sqlText := query.CanonicalSQL()
 	if sqlText == "" {
 		return core.ExecutionResult{}, fmt.Errorf("query %s missing canonical SQL", query.QueryID)
+	}
+	if d.reference != nil {
+		if err := d.validate(ctx, sqlText, args); err != nil {
+			return core.ExecutionResult{}, err
+		}
 	}
 	started := time.Now()
 	rows, err := d.exec.Execute(ctx, sqlText, args)
@@ -192,10 +230,14 @@ func (d *Driver) WaitReady(ctx context.Context, options StartupOptions) error {
 }
 
 func (d *Driver) Close() error {
-	if d.exec == nil {
-		return nil
+	var errs []error
+	if d.exec != nil {
+		errs = append(errs, d.exec.Close())
 	}
-	return d.exec.Close()
+	if d.reference != nil {
+		errs = append(errs, d.reference.Close())
+	}
+	return errors.Join(errs...)
 }
 
 func waitSleep(ctx context.Context, duration time.Duration) error {

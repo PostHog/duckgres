@@ -205,3 +205,10 @@ transaction deletes both destination tables before inserting, so it cannot dupli
 rows after partial setup. Refresh the fixture only after confirming the pinned
 backfill mapping remains appropriate; change the pin and mappings together when
 upstream production schema changes.
+
+## Hoglake full-corpus comparison
+
+Use the standalone [Hoglake benchmark runbook](hoglake-perf.md) to run all shared
+paired query intents against an explicitly configured Hoglake Trino catalog,
+with untimed result validation against a DuckLake reference catalog. The target
+is `trino_hoglake`; unsupported queries remain recorded failures.

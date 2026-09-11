@@ -637,3 +637,60 @@ func (d *fakeProtocolDriver) Close() error {
 	d.closed = true
 	return nil
 }
+
+func TestExecutorRunsFullHoglakeCorpusWithExplicitConnection(t *testing.T) {
+	factory := &fakeDriverFactory{}
+	executor := NewExecutor(ExecutorConfig{OutputDir: t.TempDir(), DriverFactory: factory})
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID: "hoglake", Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id": "scenario-org", "username": "benchmark", "password": "test-password",
+			"catalog_file": "../../../perf/queries/ducklake_posthog_tables.yaml",
+			"targets":      []any{"trino_hoglake"}, "run_id": "hoglake-full",
+			"trino_server_url": "https://trino.example.test:8443",
+			"trino_catalog":    "hoglake_benchmark", "trino_reference_catalog": "ducklake_reference",
+			"trino_ca_cert_file": "/tmp/benchmark-ca.pem",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := perfcore.LoadCatalog("../../../perf/queries/ducklake_posthog_tables.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intents := make(map[string]bool)
+	for _, query := range catalog.Queries {
+		intents[query.IntentID] = true
+	}
+	result, ok := executor.State().Result("hoglake")
+	if !ok || result.Summary.TotalQueries != len(intents)*catalog.MeasureIterations || result.Summary.WarmupQueries != len(intents)*catalog.WarmupIterations {
+		t.Fatalf("full corpus was not executed: %+v", result)
+	}
+	got := factory.trinoConnection
+	if got.ServerURL != "https://trino.example.test:8443" || got.Catalog != "hoglake_benchmark" || got.ReferenceCatalog != "ducklake_reference" || got.Username != "benchmark" || got.Password != "test-password" || got.Protocol != perfcore.Protocol("trino_hoglake") {
+		t.Fatalf("wrong explicit connection: %+v", got)
+	}
+}
+
+func TestHoglakeConnectionRequiresExplicitCatalogs(t *testing.T) {
+	base := stepSpec{TrinoServerURL: "https://trino.example.test", TrinoCatalog: "hoglake_benchmark", TrinoReferenceCatalog: "reference"}
+	for _, field := range []string{"url", "catalog", "reference", "same"} {
+		t.Run(field, func(t *testing.T) {
+			spec := base
+			switch field {
+			case "url":
+				spec.TrinoServerURL = ""
+			case "catalog":
+				spec.TrinoCatalog = ""
+			case "reference":
+				spec.TrinoReferenceCatalog = ""
+			case "same":
+				spec.TrinoReferenceCatalog = spec.TrinoCatalog
+			}
+			if _, err := hoglakeTrinoConnection(spec); err == nil {
+				t.Fatal("accepted incomplete or self-referencing benchmark configuration")
+			}
+		})
+	}
+}

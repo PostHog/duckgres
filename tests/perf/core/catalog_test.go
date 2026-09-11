@@ -26,7 +26,7 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 			}
 			wantTargets := []Protocol{ProtocolPGWire}
 			if filepath.Base(path) == "ducklake_posthog_tables.yaml" {
-				wantTargets = []Protocol{ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena}
+				wantTargets = []Protocol{ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena, ProtocolTrinoHoglake}
 			}
 			if !reflect.DeepEqual(catalog.Targets, wantTargets) {
 				t.Fatalf("catalog targets = %v, want %v", catalog.Targets, wantTargets)
@@ -48,6 +48,13 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCatalog: %v", err)
 	}
+	var existing []Query
+	for _, query := range catalog.Queries {
+		if query.StorageTarget != StorageTargetHoglakeTable {
+			existing = append(existing, query)
+		}
+	}
+	catalog.Queries = existing
 	want := []string{
 		"q_events_total_balanced_v4__raw_view",
 		"q_events_total_balanced_v4__ducklake_table",
