@@ -79,7 +79,7 @@ jobs:
       # Frozen perf uses a namespace-local Trino cell. The dedicated role is
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      TRINO_IMAGE: ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8
+      TRINO_IMAGE: ghcr.io/posthog/trino:59184e0c58c2fdbde031f3a08787c926dc4d7f69@sha256:a7072f7c86fcbb815c2502bb455b27bc4679d201ad6ce81725378a7c5ce84325
       E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}${{ strategy.job-index }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ strategy.job-index }}
