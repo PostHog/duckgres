@@ -31,19 +31,44 @@ wait_worker_tenant_file() {
     || fail "worker mount check escaped fixture identity"
   worker_app="duckgres-trino-$worker_color"
   attempt=0
+  last_worker_stage=""
   while [ "$attempt" -lt 36 ]; do
-    deployment="$("$KUBECTL" --request-timeout=5s -n "$CELL_NS" get deployment "$worker_app-worker" -o json 2>/dev/null || true)"
+    worker_stage=deployment-readiness
+    worker_code=0
+    deployment="$("$KUBECTL" --request-timeout=5s -n "$CELL_NS" get deployment "$worker_app-worker" -o json 2>/dev/null)" \
+      || { worker_code=$?; worker_stage=deployment-read; }
     replicas="$(printf %s "$deployment" | jq -er 'select(.metadata.generation == .status.observedGeneration and .spec.replicas > 0 and .status.readyReplicas == .spec.replicas and .status.updatedReplicas == .spec.replicas) | .spec.replicas' 2>/dev/null || true)"
-    snapshot="$("$KUBECTL" --request-timeout=5s -n "$CELL_NS" get pods -l "app=$worker_app,component=worker" -o json 2>/dev/null || true)"
-    workers="$(printf %s "$snapshot" | jq -er --arg app "$worker_app" --argjson replicas "${replicas:-0}" \
-      'select($replicas > 0 and (.items | length) == $replicas and all(.items[]; .metadata.deletionTimestamp == null and .metadata.labels.app == $app and .metadata.labels.component == "worker" and (.metadata.name | startswith($app + "-worker-")) and .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True"))) | .items[].metadata.name' 2>/dev/null || true)"
-    if [ -n "$workers" ]; then
-      mounted=1
-      for worker in $workers; do
-        "$KUBECTL" --request-timeout=5s -n "$CELL_NS" exec "$worker" -c trino-worker \
-          -- test -r "/etc/trino/tenant-secrets/$ORG_C" >/dev/null 2>&1 || mounted=0
-      done
-      [ "$mounted" = 1 ] && return 0
+    if [ "$worker_code" = 0 ] && [ -n "$replicas" ]; then
+      worker_stage=pod-readiness
+      snapshot="$("$KUBECTL" --request-timeout=5s -n "$CELL_NS" get pods -l "app=$worker_app,component=worker" -o json 2>/dev/null)" \
+        || { worker_code=$?; worker_stage=pod-read; }
+      workers="$(printf %s "$snapshot" | jq -er --arg app "$worker_app" --argjson replicas "$replicas" \
+        'select($replicas > 0 and (.items | length) == $replicas and all(.items[]; .metadata.deletionTimestamp == null and .metadata.labels.app == $app and .metadata.labels.component == "worker" and (.metadata.name | startswith($app + "-worker-")) and .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True"))) | .items[].metadata.name' 2>/dev/null || true)"
+      if [ "$worker_code" = 0 ] && [ -n "$workers" ]; then
+        mounted=1
+        worker_stage=worker-file
+        for worker in $workers; do
+          if worker_result="$("$KUBECTL" --request-timeout=5s -n "$CELL_NS" exec "$worker" -c trino-worker \
+            -- test -r "/etc/trino/tenant-secrets/$ORG_C" 2>&1)"; then
+            :
+          else
+            worker_code=$?
+            mounted=0
+            case "$worker_result" in
+              *'command terminated with exit code 1'*) worker_stage=worker-file ;;
+              *Forbidden*|*forbidden*) worker_stage=worker-exec-permission ;;
+              *'deadline exceeded'*|*'timed out'*) worker_stage=worker-exec-timeout ;;
+              *'executable file not found'*) worker_stage=worker-exec-program ;;
+              *) worker_stage=worker-exec ;;
+            esac
+          fi
+        done
+        [ "$mounted" = 1 ] && return 0
+      fi
+    fi
+    if [ "$last_worker_stage" != "$worker_stage:$worker_code" ]; then
+      log "Worker mount readiness: $worker_stage (exit $worker_code)"
+      last_worker_stage="$worker_stage:$worker_code"
     fi
     sleep 5
     attempt=$((attempt + 1))

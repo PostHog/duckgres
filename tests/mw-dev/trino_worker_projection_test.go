@@ -32,6 +32,7 @@ func TestTrinoWorkerProjectionGate(t *testing.T) {
 		{"wrong-label", false}, {"wrong-name", false}, {"denied", false},
 		{"stale-generation", false}, {"ready-count", false}, {"updated-count", false},
 		{"wrong-identity", false}, {"missing-worker", false},
+		{"exec-timeout", false}, {"exec-denied", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			counter := filepath.Join(t.TempDir(), "checks")
@@ -42,6 +43,7 @@ CELL_NS=duckgres-ci-pr-0123
 [ "$MODE" != wrong-identity ] || CELL_NS=another-namespace
 KUBECTL=kubectl
 sleep() { :; }
+log() { echo "$*"; }
 fail() { echo "$*" >&2; exit 1; }
 kubectl() {
   [ "$1" = --request-timeout=5s ] && [ "$2" = -n ] && [ "$3" = "$CELL_NS" ] || exit 90
@@ -70,7 +72,9 @@ kubectl() {
     exec*)
       [ "$3" = -c ] && [ "$4" = trino-worker ] && [ "$5" = -- ] && [ "$6" = test ] && [ "$7" = -r ] && [ "$8" = /etc/trino/tenant-secrets/ci-pr-123-trinoc ] || exit 90
       printf '%s\n' "$2" >> "$COUNTER"
-      if [ "$MODE" = missing-file ]; then return 1; fi
+      if [ "$MODE" = missing-file ]; then echo 'command terminated with exit code 1' >&2; return 1; fi
+      if [ "$MODE" = exec-timeout ]; then echo 'context deadline exceeded private-payload' >&2; return 1; fi
+      if [ "$MODE" = exec-denied ]; then echo 'Forbidden private-payload' >&2; return 1; fi
       if [ "$MODE" = one-worker-lags ] && [ "$2" = duckgres-trino-blue-worker-2 ] && [ "$(wc -l < "$COUNTER")" -lt 3 ]; then return 1; fi
       ;;
     *) exit 90 ;;
@@ -82,6 +86,21 @@ kubectl() {
 			out, err := cmd.CombinedOutput()
 			if (err == nil) != tc.ok {
 				t.Fatalf("success=%v, want=%v: %s", err == nil, tc.ok, out)
+			}
+			if tc.name == "missing-file" && !strings.Contains(string(out), "worker-file (exit 1)") {
+				t.Fatal("missing safe file-check failure diagnostics")
+			}
+			if tc.name == "denied" && !strings.Contains(string(out), "deployment-read (exit 1)") {
+				t.Fatal("missing safe API failure diagnostics")
+			}
+			if tc.name == "exec-timeout" && !strings.Contains(string(out), "worker-exec-timeout (exit 1)") {
+				t.Fatal("missing safe timeout diagnostics")
+			}
+			if tc.name == "exec-denied" && !strings.Contains(string(out), "worker-exec-permission (exit 1)") {
+				t.Fatal("missing safe permission diagnostics")
+			}
+			if strings.Contains(string(out), "private-payload") {
+				t.Fatal("raw exec stderr must never enter diagnostics")
 			}
 			if tc.ok {
 				checks, err := os.ReadFile(counter)
