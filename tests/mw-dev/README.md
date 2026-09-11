@@ -651,8 +651,10 @@ got through, in order — each was a real fix:
    `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES=.ci.duckgres.local` +
    `DUCKGRES_SNI_ROUTING_MODE=passthrough`, and connecting with libpq
    `host=<org>.<suffix>` (SNI) + `hostaddr=<CP ClusterIP>` (TCP).
-5. ✅ catalog selection — `dbname` must be `ducklake`, not the org
-   (PR #651: *database = catalog selection*). harness.sh now does this.
+5. ✅ catalog selection — `dbname` must be `ducklake` or the org's own Trino
+   catalog name (`org_<database_name>`, a logical alias for the same catalog),
+   never an arbitrary name (PR #651: *database = catalog selection*).
+   harness.sh covers both, in `logical_catalog_alias`.
 
 6. ✅ **activation (cnpg DuckLake)** — the control plane resolves the metadata
    password from the Secret referenced by Duckling status. Activation failed at

@@ -3952,6 +3952,68 @@ tenant_isolation() { # orgA pwA orgB pwB
   pg "$1" "$2" ducklake "DROP TABLE $t;"
 }
 
+# ---- logical catalog alias (org_<database_name> as the dbname) -------------
+# An org's Trino catalog name is a second, LOGICAL name for the same physical
+# DuckLake catalog. SQLMesh must see one catalog name on both engines, so a
+# session that connects with it has to behave exactly like a `ducklake` one
+# while REPORTING the logical name everywhere a client can observe a catalog.
+#
+# Also the security half of PR #651: the dbname is catalog selection, never
+# identity. The alias is validated against the org the SNI hostname already
+# resolved, so a sibling tenant's catalog name must be refused — the same 3D000
+# any other unknown name gets, and no routing to the sibling.
+trino_catalog_name() { # org -> org_<sanitized database_name>
+  printf 'org_%s' "$(printf %s "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_' '_')"
+}
+
+logical_catalog_alias() { # org password sibling_org
+  alias_db="$(trino_catalog_name "$1")"
+  sibling_db="$(trino_catalog_name "$3")"
+  log "logical catalog alias: $1 connects as $alias_db"
+
+  # Every pg-visible catalog surface reports the LOGICAL name.
+  got="$(pg "$1" "$2" "$alias_db" 'SELECT current_database()')"
+  [ "$got" = "$alias_db" ] \
+    || fail "logical alias: current_database() = '$got', want '$alias_db'"
+  got="$(pg "$1" "$2" "$alias_db" 'SELECT datname FROM pg_database WHERE datname = current_database()')"
+  [ "$got" = "$alias_db" ] \
+    || fail "logical alias: pg_database datname = '$got', want '$alias_db'"
+
+  # A three-part reference written against the logical name reaches the real
+  # catalog, and so does `USE <alias>`. This is what SQLMesh emits.
+  t="alias_$(printf %s "$1" | tr -c 'a-z0-9' _)"
+  pg "$1" "$2" "$alias_db" \
+    "DROP TABLE IF EXISTS $alias_db.public.$t; CREATE TABLE $alias_db.public.$t AS SELECT 42 AS v;"
+  got="$(pg "$1" "$2" "$alias_db" "SELECT v FROM $alias_db.public.$t")"
+  [ "$got" = "42" ] || fail "logical alias: three-part read returned '$got', want 42"
+  got="$(pg "$1" "$2" "$alias_db" "USE $alias_db; SELECT v FROM $t;" | tail -1)"
+  [ "$got" = "42" ] || fail "logical alias: USE $alias_db then unqualified read returned '$got', want 42"
+
+  # The alias renames; it does not fork storage. The same row is there for a
+  # session connected the ordinary way.
+  got="$(pg "$1" "$2" ducklake "SELECT v FROM main.$t")"
+  [ "$got" = "42" ] || fail "logical alias: ducklake session read returned '$got', want 42 (same catalog)"
+  pg "$1" "$2" ducklake "DROP TABLE main.$t;"
+
+  # A sibling tenant's catalog name is not selectable, even with valid creds.
+  if out="$(pg_try "$1" "$2" "$sibling_db" 'SELECT 1')"; then
+    fail "logical alias: $1 connected with $3's catalog name $sibling_db (got '$out') — isolation breach"
+  fi
+  case "$out" in
+    *'does not exist'*) ;;
+    *) fail "logical alias: sibling-catalog rejection was not the 3D000 does-not-exist: $out" ;;
+  esac
+
+  # An arbitrary name still fails closed.
+  if out="$(pg_try "$1" "$2" org_not_a_tenant 'SELECT 1')"; then
+    fail "logical alias: an arbitrary dbname connected (got '$out')"
+  fi
+  case "$out" in
+    *'does not exist'*) ;;
+    *) fail "logical alias: arbitrary-dbname rejection was wrong: $out" ;;
+  esac
+}
+
 # ---- lifecycle: deprovision → warehouse deleted → Duckling CR fully gone ----
 # Proves the teardown path works end to end: warehouse marked deleted, the
 # Crossplane Duckling CR removed, and its finalizer cascade (which drops the
@@ -4656,6 +4718,9 @@ engine_main() {
 
   # ---- cross-tenant isolation between independent CNPG-backed orgs ----
   tenant_isolation "$CNPG" "$cnpg_pw" "$RES1" "$res1_pw"
+
+  # ---- logical catalog alias: org_<database_name> selects the same catalog --
+  logical_catalog_alias "$CNPG" "$cnpg_pw" "$RES1"
 
   # NOTE: the version-mismatch worker reaper is not exercised in-Job (it needs a
   # mid-run image bump); it stays covered by the controlplane/ unit tests.
