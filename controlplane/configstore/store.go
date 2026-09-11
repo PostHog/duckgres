@@ -621,7 +621,7 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	// it can neither discover nor select an org — a sibling tenant's catalog
 	// name is just another unrecognized string here, and fails closed. Never
 	// rewrite this as a lookup from name to org.
-	if !result.CatalogValid && requestedCatalog != "" && databaseName != "" &&
+	if !result.CatalogValid && databaseName != "" &&
 		requestedCatalog == TrinoCatalogName(databaseName) {
 		result.EffectiveCatalog = catalogDuckLake
 		result.LogicalCatalog = requestedCatalog

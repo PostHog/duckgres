@@ -161,7 +161,6 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 // false and nothing new is rewritten.
 func (c *clientConn) namesDuckLakeCatalog(name string) bool {
 	return c.physicalCatalog == physicalDuckLakeCatalog &&
-		c.database != "" &&
 		!strings.EqualFold(c.database, physicalDuckLakeCatalog) &&
 		strings.EqualFold(c.database, name)
 }
