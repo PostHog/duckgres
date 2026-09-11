@@ -444,6 +444,7 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 		"value: \"isolated-test-secret\"",
 		"name: DUCKGRES_SCENARIO_ORG_ID, value: \"ci-pr-123-cnpg\"",
 		"name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: \"/trino-ca/ca.crt\"",
+		"name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN\n              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: dsn } }",
 		"name: DUCKGRES_SCENARIO_ATHENA_REGION, value: \"us-east-1\"",
 		"name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: \"benchmark\"",
 		"name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: \"benchmark_frozen\"",

@@ -18,6 +18,15 @@ metadata:
     app.kubernetes.io/managed-by: e2e-mw-dev
     duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
 ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: duckgres-config-store-credentials
+  namespace: ${NAMESPACE}
+stringData:
+  password: "${CONFIG_STORE_PASSWORD}"
+  dsn: "postgres://duckgres:${CONFIG_STORE_PASSWORD}@duckgres-config-store.${NAMESPACE}.svc:5432/duckgres?sslmode=disable"
+---
 # Throwaway config-store. The namespace-scoped PVC is deleted on teardown, but
 # survives a config-store pod recreation during the e2e run; losing these rows
 # mid-harness makes the control plane forget already-provisioned orgs.
@@ -55,7 +64,8 @@ spec:
           image: public.ecr.aws/docker/library/postgres:16-alpine
           env:
             - { name: POSTGRES_USER, value: duckgres }
-            - { name: POSTGRES_PASSWORD, value: duckgres }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: password } }
             - { name: POSTGRES_DB, value: duckgres }
             - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
           ports: [{ containerPort: 5432 }]
@@ -285,7 +295,7 @@ spec:
             - name: NODE_NAME
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
             - name: DUCKGRES_CONFIG_STORE
-              value: "postgres://duckgres:duckgres@duckgres-config-store.${NAMESPACE}.svc:5432/duckgres?sslmode=disable"
+              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: dsn } }
             - { name: DUCKGRES_K8S_WORKER_IMAGE, value: "${WORKER_IMAGE}" }
             - { name: DUCKGRES_K8S_WORKER_IMAGE_PULL_POLICY, value: "IfNotPresent" }
             # Spawn workers in THIS namespace so teardown is a single ns delete.

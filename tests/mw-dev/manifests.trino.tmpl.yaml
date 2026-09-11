@@ -26,7 +26,7 @@ metadata:
   name: duckgres-trino-catalog-store
   namespace: ${NAMESPACE}
 stringData:
-  password: duckgres
+  password: "${CONFIG_STORE_PASSWORD}"
 ---
 apiVersion: v1
 kind: ConfigMap

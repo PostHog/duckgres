@@ -548,6 +548,12 @@ cover application authentication and OPA authorization, not network isolation.
 If an existing cluster policy blocks the fixture, investigate that policy;
 do not weaken it to make the test pass.
 
+All lanes generate a random config-store password in `DUCKGRES_CI_SECRET_DIR`
+and reuse it for that run. PostgreSQL, the control plane, and benchmark Jobs
+read Kubernetes Secret references; Trino receives the same password through
+its catalog-store Secret. Credentials never appear as literal pod environment
+values. GitHub Actions masks the generated password before deployment.
+
 Run `just test-mw-fixtures` for local rendering and cleanup guard tests. The
 real acceptance gate is the PR's Trino E2E workflow. A rendered fixture is not
 proof that CI has the required cross-namespace RBAC and Pod Identity grants.

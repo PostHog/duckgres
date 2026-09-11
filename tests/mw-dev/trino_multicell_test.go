@@ -1,6 +1,7 @@
 package e2emwdev_test
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
@@ -44,6 +45,11 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 	}
 	fakes := newRunSHFakes(t)
 	writeFake(t, fakes.binDir, "envsubst", "#!/usr/bin/env bash\nexec "+envsubst+" \"$@\"\n")
+	openssl, err := exec.LookPath("openssl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFake(t, fakes.binDir, "openssl", "#!/usr/bin/env bash\nexec "+openssl+" \"$@\"\n")
 	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
 	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
 		if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material"), 0o600); err != nil {
@@ -51,9 +57,10 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 		}
 	}
 	renderedFile := filepath.Join(t.TempDir(), "rendered.yaml")
-	cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "SCENARIO_NAME=full-suite", "E2E_SUITE=trino", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-trino", "RUN_SH_TEST_RENDERED="+renderedFile)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("render/deploy: %v\n%s", err, out)
+	cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "SCENARIO_NAME=full-suite", "E2E_SUITE=trino", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-trino", "RUN_SH_TEST_RENDERED="+renderedFile, "GITHUB_ACTIONS=true")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("render/deploy: %v\n%s", err, output)
 	}
 	raw, err := os.ReadFile(renderedFile)
 	if err != nil {
@@ -62,6 +69,8 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(string(raw)), 4096)
 	configs := map[string]map[string]any{}
 	deployments := map[string]map[string]any{}
+	secrets := []map[string]any{}
+	publicManifests := []map[string]any{}
 	for {
 		var manifest map[string]any
 		if err := decoder.Decode(&manifest); err == io.EOF {
@@ -82,6 +91,98 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 		}
 		if manifest["kind"] == "Deployment" {
 			deployments[manifestName(manifest)] = manifest
+		}
+		if manifest["kind"] == "Secret" {
+			secrets = append(secrets, manifest)
+		} else {
+			publicManifests = append(publicManifests, manifest)
+		}
+	}
+	passwordBytes, err := os.ReadFile(filepath.Join(secretDir, "duckgres-ci-config-store-password"))
+	if err != nil {
+		t.Fatal("renderer must generate a per-run config-store credential:", err)
+	}
+	password := strings.TrimSpace(string(passwordBytes))
+	if len(password) != 64 || strings.Trim(password, "0123456789abcdef") != "" {
+		t.Fatal("config store must use a random, URL-safe 32-byte password")
+	}
+	mask := "::add-mask::" + password + "\n"
+	if !strings.Contains(string(output), mask) || strings.Contains(strings.ReplaceAll(string(output), mask, ""), password) {
+		t.Fatal("password must only appear in the GitHub masking directive")
+	}
+	info, err := os.Stat(filepath.Join(secretDir, "duckgres-ci-config-store-password"))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatal("local credential must be owner-readable only")
+	}
+	credentialCount := 0
+	for _, secret := range secrets {
+		switch manifestName(secret) {
+		case "duckgres-config-store-credentials", "duckgres-trino-catalog-store":
+			credentialCount++
+			data := secret["stringData"].(map[string]any)
+			if data["password"] != password {
+				t.Fatal("config-store credentials differ between consumers")
+			}
+			if manifestName(secret) == "duckgres-config-store-credentials" && data["dsn"] != "postgres://duckgres:"+password+"@duckgres-config-store.duckgres-ci-pr-123.svc:5432/duckgres?sslmode=disable" {
+				t.Fatal("control-plane DSN does not match config-store password")
+			}
+		}
+	}
+	if credentialCount != 4 {
+		t.Fatalf("expected primary credential and three catalog-store Secrets, got %d", credentialCount)
+	}
+	for _, manifest := range publicManifests {
+		encoded, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), password) {
+			t.Fatalf("credential leaked into non-Secret %s %s", manifest["kind"], manifestName(manifest))
+		}
+	}
+	for deploymentName, envName := range map[string]string{
+		"duckgres-config-store": "POSTGRES_PASSWORD", "duckgres-control-plane": "DUCKGRES_CONFIG_STORE",
+	} {
+		deployment := deployments[deploymentName]
+		containers := deployment["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)
+		found := false
+		for _, container := range containers {
+			for _, value := range container.(map[string]any)["env"].([]any) {
+				env := value.(map[string]any)
+				if env["name"] != envName {
+					continue
+				}
+				found = true
+				ref := env["valueFrom"].(map[string]any)["secretKeyRef"].(map[string]any)
+				key := "dsn"
+				if envName == "POSTGRES_PASSWORD" {
+					key = "password"
+				}
+				if ref["name"] != "duckgres-config-store-credentials" || ref["key"] != key {
+					t.Fatalf("incorrect credential reference for %s", envName)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("missing credential reference for %s", envName)
+		}
+	}
+	for _, sameRun := range []bool{true, false} {
+		repeatFakes := fakes
+		if !sameRun {
+			repeatFakes = newRunSHFakes(t)
+			writeFake(t, repeatFakes.binDir, "openssl", "#!/usr/bin/env bash\nexec "+openssl+" \"$@\"\n")
+		}
+		cmd := runSHCommand(t, repeatFakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "GITHUB_ACTIONS=false")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("repeat render: %v %s", err, out)
+		}
+		repeated, err := os.ReadFile(filepath.Join(filepath.Dir(repeatFakes.binDir), "secrets", "duckgres-ci-config-store-password"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (strings.TrimSpace(string(repeated)) == password) != sameRun {
+			t.Fatal("credential must be stable within a run and different across fresh runs")
 		}
 	}
 	for _, color := range []string{"blue", "green"} {

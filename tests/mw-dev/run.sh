@@ -58,6 +58,7 @@ internal_secret_fallback_file="$secret_dir/duckgres-ci-internal-secret-fallback"
 # AES key for user persistent secrets (DUCKGRES_USER_SECRET_KEY). Random per
 # run: stored user secrets only need to outlive the run's sessions.
 user_secret_key_file="$secret_dir/duckgres-ci-user-secret-key"
+config_store_password_file="$secret_dir/duckgres-ci-config-store-password"
 trino_ca_key_file="$secret_dir/duckgres-ci-trino-ca.key"
 trino_ca_cert_file="$secret_dir/duckgres-ci-trino-ca.crt"
 trino_server_key_file="$secret_dir/duckgres-ci-trino-server.key"
@@ -93,8 +94,9 @@ render_trino_backend() {
   TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
   TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
   TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
+  CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
   NAMESPACE="$TRINO_CELL_NS" PR_NUMBER="$PR_NUMBER" \
-    envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64' \
+    envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
     < "$HERE/manifests.trino.tmpl.yaml" \
     | sed -e "s/duckgres-trino-coordinator/duckgres-trino-$color-coordinator/g" \
       -e "s/duckgres-trino-worker/duckgres-trino-$color-worker/g" \
@@ -148,6 +150,11 @@ render() {
   [ -f "$internal_secret_file" ] || (umask 077; openssl rand -hex 16 > "$internal_secret_file")
   [ -f "$internal_secret_fallback_file" ] || (umask 077; openssl rand -hex 16 > "$internal_secret_fallback_file")
   [ -f "$user_secret_key_file" ] || (umask 077; openssl rand -base64 32 > "$user_secret_key_file")
+  [ -s "$config_store_password_file" ] || (umask 077; openssl rand -hex 32 > "$config_store_password_file")
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::add-mask::%s\n' "$(cat "$config_store_password_file")" >&2
+  fi
+  CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
   INTERNAL_SECRET="$(cat "$internal_secret_file")" \
   INTERNAL_SECRET_FALLBACK="$(cat "$internal_secret_fallback_file")" \
   USER_SECRET_KEY="$(cat "$user_secret_key_file")" \
@@ -155,7 +162,7 @@ render() {
   WORKER_IMAGE="$WORKER_IMAGE" CONTROLPLANE_IMAGE="$CONTROLPLANE_IMAGE" \
   DUCKGRES_K8S_WORKER_CPU_REQUEST="$DUCKGRES_K8S_WORKER_CPU_REQUEST" \
   DUCKGRES_K8S_WORKER_MEMORY_REQUEST="$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" \
-    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY $DUCKGRES_K8S_WORKER_CPU_REQUEST $DUCKGRES_K8S_WORKER_MEMORY_REQUEST' \
+    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY $DUCKGRES_K8S_WORKER_CPU_REQUEST $DUCKGRES_K8S_WORKER_MEMORY_REQUEST $CONFIG_STORE_PASSWORD' \
     < "$HERE/manifests.tmpl.yaml"
 
   if [ "$E2E_SUITE" = "trino" ]; then
@@ -163,8 +170,9 @@ render() {
     TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
     TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
     TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
+      CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
-      envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64' \
+      envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
       < "$HERE/manifests.trino.tmpl.yaml"
     if trino_multicell_enabled; then render_trino_multicell; fi
   fi
@@ -644,7 +652,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
             # Only the throwaway benchmark config store; never a shared dev/prod store.
-            - { name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN, value: "postgres://duckgres:duckgres@duckgres-config-store.$NS.svc:5432/duckgres?sslmode=disable" }
+            - name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
+              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: dsn } }
             - { name: DUCKGRES_SCENARIO_ATHENA_REGION, value: "$AWS_REGION" }
             - { name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: "${DUCKGRES_SCENARIO_ATHENA_WORKGROUP:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: "${DUCKGRES_SCENARIO_ATHENA_DATABASE:-}" }
