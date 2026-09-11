@@ -130,9 +130,11 @@ legacy_owner="$(api "$API/api/v1/orgs/$ORG_A" | jq -r .trino.trino_cell_id)"
 "$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
   '{"spec":{"template":{"spec":{"containers":[{"name":"controlplane","env":[{"name":"DUCKGRES_TRINO_COORDINATOR_URL","$patch":"delete"},{"name":"DUCKGRES_TRINO_REGISTRY_ONLY","value":"true"}]}]}}}}' >/dev/null
 "$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
+# Deployment readiness can precede Service endpoint convergence after restart.
+# Wait for an authenticated API response before asserting registry contents.
+wait_cell_ready
 api "$API/api/v1/trino/cells" | jq -e '.cells | map(.id) == ["cell-test"]' >/dev/null \
   || fail "registry-only startup invented a legacy cell"
-wait_cell_ready
 for endpoint in "$BLUE_TRINO" "$GREEN_TRINO"; do
   TRINO="$endpoint"
   [ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
