@@ -8,6 +8,22 @@ LEGACY_TRINO="$TRINO"
 BLUE_TRINO="https://duckgres-trino-blue.$CELL_NS.svc:8443"
 GREEN_TRINO="https://duckgres-trino-green.$CELL_NS.svc:8443"
 
+wait_cell_registry() {
+  expected_cells="$1"
+  attempt=0
+  while [ "$attempt" -lt 36 ]; do
+    result="$(api --max-time 5 "$API/api/v1/trino/cells" 2>/dev/null || true)"
+    if printf %s "$result" | jq -e --argjson expected "$expected_cells" \
+      '.cells | map(.id) | sort == $expected' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+  fail "cell registry did not converge after control-plane restart"
+}
+
+
 log "multicell initial placement with green stopped"
 api "$API/api/v1/trino/cells" | jq -e '.cells | map(.id) | sort == ["cell-test","legacy"]' >/dev/null \
   || fail "both cells must be registered"
@@ -67,6 +83,7 @@ code="$(curl --connect-timeout 5 --max-time 30 -sS -o /tmp/trino-cell-selection-
 
 TRINO="$BLUE_TRINO"
 wait_cell_auth
+wait_worker_tenant_file blue "$ORG_C"
 trino_query "$DB_C" "$pw_c" "CREATE SCHEMA $CAT_C.cell_test" >/dev/null
 trino_query "$DB_C" "$pw_c" "CREATE TABLE $CAT_C.cell_test.values_test (value BIGINT)" >/dev/null
 trino_query "$DB_C" "$pw_c" "INSERT INTO $CAT_C.cell_test.values_test VALUES (7),(11)" >/dev/null
@@ -114,6 +131,7 @@ done
 wait_cell_ready
 TRINO="$GREEN_TRINO"
 wait_cell_auth
+wait_worker_tenant_file green "$ORG_C"
 result="$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")"
 [ "$result" = '[[2,18]]' ] || fail "green failed to hydrate its independent catalog from the same DuckLake warehouse"
 must_fail "$DB_A" "$pw_a" 'SELECT 1' '401|Unauthorized|Authentication|credentials'
@@ -130,8 +148,7 @@ legacy_owner="$(api "$API/api/v1/orgs/$ORG_A" | jq -r .trino.trino_cell_id)"
 "$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
   '{"spec":{"template":{"spec":{"containers":[{"name":"controlplane","env":[{"name":"DUCKGRES_TRINO_COORDINATOR_URL","$patch":"delete"},{"name":"DUCKGRES_TRINO_REGISTRY_ONLY","value":"true"}]}]}}}}' >/dev/null
 "$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
-api "$API/api/v1/trino/cells" | jq -e '.cells | map(.id) == ["cell-test"]' >/dev/null \
-  || fail "registry-only startup invented a legacy cell"
+wait_cell_registry '["cell-test"]'
 wait_cell_ready
 for endpoint in "$BLUE_TRINO" "$GREEN_TRINO"; do
   TRINO="$endpoint"
@@ -162,6 +179,7 @@ log "restore legacy fixture configuration"
 patch="$(printf %s "$legacy_env" | jq -c '{spec:{template:{spec:{containers:[{name:"controlplane",env:[.,{name:"DUCKGRES_TRINO_REGISTRY_ONLY","$patch":"delete"}]}]}}}}')"
 "$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch" >/dev/null
 "$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
+wait_cell_registry '["cell-test","legacy"]'
 TRINO="$LEGACY_TRINO"
 [ "$(trino_query "$DB_A" "$pw_a" 'SELECT 1')" = '[[1]]' ] || fail "legacy query failed after registry-only fixture restore"
 log "PASS: registry-only startup + explicit selection + no legacy dependency + restored fixture"
