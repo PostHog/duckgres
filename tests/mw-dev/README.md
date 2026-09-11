@@ -542,6 +542,12 @@ queries the same data through green's independently hydrated catalog. Direct
 coordinator URLs are fixture-only; this does not test Gateway routing or a
 maintenance move of an existing warehouse.
 
+The fixture preserves the existing CI network-policy posture. It does not
+create network policies or add cluster-wide RBAC grants. Isolation assertions
+cover application authentication and OPA authorization, not network isolation.
+If an existing cluster policy blocks the fixture, investigate that policy;
+do not weaken it to make the test pass.
+
 Run `just test-mw-fixtures` for local rendering and cleanup guard tests. The
 real acceptance gate is the PR's Trino E2E workflow. A rendered fixture is not
 proof that CI has the required cross-namespace RBAC and Pod Identity grants.

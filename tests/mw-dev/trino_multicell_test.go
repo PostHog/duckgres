@@ -69,6 +69,14 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 		} else if err != nil {
 			t.Fatalf("decode real manifests: %v", err)
 		}
+		switch manifest["kind"] {
+		case "ClusterRoleBinding":
+			if manifestName(manifest) != "duckgres-ci-pr-123-duckling-reader" {
+				t.Errorf("multicell renderer added cluster privileges: %s", manifestName(manifest))
+			}
+		case "NetworkPolicy", "CiliumNetworkPolicy", "CiliumClusterwideNetworkPolicy", "ClusterRole":
+			t.Errorf("multicell renderer must preserve baseline network policy and cluster privileges, got %s %s", manifest["kind"], manifestName(manifest))
+		}
 		if manifest["kind"] == "ConfigMap" {
 			configs[manifestName(manifest)] = manifest["data"].(map[string]any)
 		}

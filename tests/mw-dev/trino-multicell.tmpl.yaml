@@ -101,26 +101,3 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: trino-cell-harness
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: trino-cell-to-control-plane
-  namespace: ${NAMESPACE}
-spec:
-  podSelector:
-    matchExpressions:
-      - key: app
-        operator: In
-        values: [duckgres-control-plane, duckgres-config-store]
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - podSelector: {}
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: ${TRINO_CELL_NAMESPACE}
-      ports:
-        - { protocol: TCP, port: 5432 }
-        - { protocol: TCP, port: 8080 }
