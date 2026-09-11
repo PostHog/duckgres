@@ -63,16 +63,16 @@ func runRotationScenario(t *testing.T, sc rotationScenario) rotationResult {
 	}
 
 	mc := func(args ...string) (string, error) {
-		out, err := exec.Command("docker", append([]string{"exec", rotationMinioContainer, "mc"}, args...)...).CombinedOutput()
+		out, err := exec.Command("docker", append([]string{"exec", rotationMinioContainer, "mcli"}, args...)...).CombinedOutput()
 		return string(out), err
 	}
 	if out, err := mc("ready", "local"); err != nil {
-		t.Skipf("mc not available in MinIO container (%v): %s", err, out)
+		t.Fatalf("mcli not ready in Silo container (%v): %s", err, out)
 	}
 	// The image's built-in `local` alias is anonymous (enough for the compose
 	// healthcheck, not for admin ops) — register an authenticated alias.
 	if out, err := mc("alias", "set", "localadmin", "http://localhost:9000", "minioadmin", "minioadmin"); err != nil {
-		t.Skipf("could not configure authenticated mc alias (%v): %s", err, out)
+		t.Fatalf("could not configure authenticated mcli alias (%v): %s", err, out)
 	}
 
 	// --- MinIO fixtures: private bucket + two users with readwrite policy ---
@@ -253,7 +253,7 @@ func loadStockHTTPFS(t *testing.T, db *sql.DB) {
 // recovery (at which point the fork patch and the freshness-floor caveats in
 // controlplane/sts_broker.go can both be revisited).
 //
-// Requires the integration docker compose stack (MinIO with admin `mc` in the
+// Requires the integration docker compose stack (Silo with admin `mcli` in the
 // container); skips otherwise.
 func TestInFlightScanDiesOnCredentialRotation(t *testing.T) {
 	r := runRotationScenario(t, rotationScenario{loadHTTPFS: loadStockHTTPFS})

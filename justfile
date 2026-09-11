@@ -152,15 +152,15 @@ check-multitenant-kind-ports:
 [group('dev')]
 multitenant-config-store-up: check-multitenant-local-ports
     docker compose -f k8s/local-config-store.compose.yaml -f k8s/orbstack/dependency-ports.overlay.yaml up -d --wait
-    docker exec duckgres-local-minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-    docker exec duckgres-local-minio mc mb local/duckgres-local --ignore-existing
+    docker exec duckgres-local-minio mcli alias set local http://127.0.0.1:9000 minioadmin minioadmin
+    docker exec duckgres-local-minio mcli mb local/duckgres-local --ignore-existing
 
 # Start the local PostgreSQL config store used by the kind-backed multi-tenant K8s flow
 [group('dev')]
 multitenant-config-store-up-kind: check-multitenant-kind-ports
     docker compose -f k8s/local-config-store.compose.yaml -f k8s/kind/config-store.overlay.yaml up -d --wait
-    docker exec duckgres-local-minio mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-    docker exec duckgres-local-minio mc mb local/duckgres-local --ignore-existing
+    docker exec duckgres-local-minio mcli alias set local http://127.0.0.1:9000 minioadmin minioadmin
+    docker exec duckgres-local-minio mcli mb local/duckgres-local --ignore-existing
 
 # Stop the local PostgreSQL config store used by the multi-tenant K8s flow
 [group('dev')]
@@ -316,6 +316,11 @@ test-cache-proxy:
 [group('test')]
 test-integration:
     go test -v ./tests/integration/...
+
+# Verify Silo S3 permissions and admin credential revocation after starting the integration stack.
+[group('test')]
+test-silo:
+    bash scripts/test_silo.sh
 
 # Run shared/process control plane tests
 [group('test')]

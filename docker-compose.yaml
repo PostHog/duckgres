@@ -17,7 +17,7 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio:latest
+    image: docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z@sha256:b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3
     container_name: ducklake-storage
     command: server /data --console-address ":9001"
     environment:
@@ -29,23 +29,23 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "mcli", "ready", "local"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   # Creates the ducklake bucket on startup
   minio-init:
-    image: minio/mc:latest
+    image: docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z@sha256:b616a0cf8cb281e7e6bb3c9b1fb53875b4016a2878223925541c18f82d6c5ca3
     container_name: ducklake-storage-init
     depends_on:
       minio:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      mc alias set minio http://minio:9000 minioadmin minioadmin;
-      mc mb minio/ducklake --ignore-existing;
-      mc anonymous set download minio/ducklake;
+      mcli alias set minio http://minio:9000 minioadmin minioadmin;
+      mcli mb minio/ducklake --ignore-existing;
+      mcli anonymous set download minio/ducklake;
       echo 'Bucket ducklake created successfully';
       "
 
