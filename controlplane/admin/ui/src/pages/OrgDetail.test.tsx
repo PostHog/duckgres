@@ -16,6 +16,10 @@ const hooks = vi.hoisted(() => ({
   useUpdateOrg: vi.fn(),
   useUpdateWarehouse: vi.fn(),
   useWarehouse: vi.fn(),
+  useOrgTrino: vi.fn(),
+  useTrinoCells: vi.fn(),
+  useSelectTrinoCell: vi.fn(),
+  useSetTrinoEnabled: vi.fn(),
 }));
 vi.mock("@/hooks/useApi", () => hooks);
 
@@ -44,6 +48,7 @@ vi.mock("@/pages/OrgTrinoCard", () => ({
 }));
 
 import { OrgDetail } from "./OrgDetail";
+
 
 const warehouseUpdate = vi.fn();
 const orgUpdate = vi.fn();
@@ -142,6 +147,10 @@ describe("Org detail", () => {
       me: { email: "admin@example.com", role: "admin", source: "sso" },
     });
     hooks.useOrg.mockReturnValue(ok(ORG));
+    hooks.useOrgTrino.mockReturnValue(ok({ enabled: false, assigned: false, cell: { id: "legacy" } }));
+    hooks.useTrinoCells.mockReturnValue(ok({ cells: [{ id: "legacy" }] }));
+    hooks.useSelectTrinoCell.mockReturnValue(mut());
+    hooks.useSetTrinoEnabled.mockReturnValue(mut());
     hooks.useDatabaseNameAvailable.mockReturnValue({ data: null, isLoading: false });
     hooks.useUpdateOrg.mockReturnValue(mut(orgUpdate));
     hooks.useDeleteOrg.mockReturnValue(mut());
@@ -150,6 +159,29 @@ describe("Org detail", () => {
     hooks.useDucklingsMetadata.mockReturnValue(ok({ available: true, entries: [] }));
     hooks.useOrgReshards.mockReturnValue(ok([]));
     hooks.useOrgTeams.mockReturnValue(ok([]));
+  });
+
+  it("places Trino controls before worker settings in org configuration", () => {
+    renderPage(false);
+    const config = screen.getByText("Org configuration").closest(".rounded-lg")!;
+    const trino = within(config as HTMLElement).getByText("Trino configuration");
+    const workers = within(config as HTMLElement).getByText("Max workers (0 = unbounded)");
+    expect(trino.compareDocumentPosition(workers) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("keeps unsaved org fields separate from an initial Trino selection", async () => {
+    const select = vi.fn().mockResolvedValue({ assigned: true });
+    hooks.useSelectTrinoCell.mockReturnValue(mut(select));
+    renderPage(false);
+    const user = userEvent.setup();
+    const database = screen.getByLabelText("Database name");
+    await user.clear(database);
+    await user.type(database, "pending-name");
+    await user.selectOptions(screen.getByLabelText("Initial Trino cell"), "legacy");
+    await user.click(screen.getByRole("button", { name: "Select cell" }));
+    expect(select).toHaveBeenCalledWith({ org: "acme", cell: "legacy" });
+    expect(orgUpdate).not.toHaveBeenCalled();
+    expect(database).toHaveValue("pending-name");
   });
 
   it("headline leads with the database name; the org id is a subline with a copy button", () => {

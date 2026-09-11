@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { TrinoOrgDetail, TrinoOrgStatus } from "@/types/api";
 
@@ -53,30 +53,10 @@ describe("OrgTrinoCard", () => {
     identity.useIdentity.mockReturnValue({ isAdmin: true });
   });
 
-  it("lets an admin select an initial cell without enabling Trino", () => {
-    const mutate = vi.fn();
-    hooks.useOrgTrino.mockReturnValue(ok(detail({ enabled: false, assigned: false, status: undefined })));
-    hooks.useTrinoCells.mockReturnValue(ok({ cells: [{ id: "legacy" }, { id: "cell-001" }] }));
-    hooks.useSelectTrinoCell.mockReturnValue({ mutate, isPending: false });
-    renderCard();
-    fireEvent.change(screen.getByLabelText("Initial Trino cell"), { target: { value: "cell-001" } });
-    fireEvent.click(screen.getByRole("button", { name: "Select cell" }));
-    expect(mutate).toHaveBeenCalledWith({ org: "org-a", cell: "cell-001" });
-    expect(screen.getByText(/does not enable Trino/)).toBeInTheDocument();
-  });
-
-  it("keeps a disabled warehouse's assignment immutable", () => {
+  it("does not duplicate the configuration controls for a disabled assignment", () => {
     hooks.useOrgTrino.mockReturnValue(ok(detail({ enabled: false, assigned: true, status: undefined })));
-    renderCard();
-    expect(screen.getByText(/Assigned cell: legacy/)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Select cell" })).not.toBeInTheDocument();
-  });
-
-  it("never offers selection to viewers", () => {
-    identity.useIdentity.mockReturnValue({ isAdmin: false });
-    hooks.useOrgTrino.mockReturnValue(ok(detail({ enabled: false, assigned: false, status: undefined })));
-    hooks.useTrinoCells.mockReturnValue(ok({ cells: [{ id: "legacy" }, { id: "cell-001" }] }));
-    renderCard();
+    const { container } = renderCard();
+    expect(container).toBeEmptyDOMElement();
     expect(screen.queryByRole("button", { name: "Select cell" })).not.toBeInTheDocument();
   });
 
@@ -85,14 +65,6 @@ describe("OrgTrinoCard", () => {
     renderCard();
     expect(screen.getByText(/Unknown assignment/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Select cell" })).not.toBeInTheDocument();
-  });
-
-  it("shows a rejected selection without hiding the error", () => {
-    hooks.useOrgTrino.mockReturnValue(ok(detail({ enabled: false, assigned: false, status: undefined })));
-    hooks.useTrinoCells.mockReturnValue(ok({ cells: [{ id: "legacy" }] }));
-    hooks.useSelectTrinoCell.mockReturnValue({ mutate: vi.fn(), error: new Error("Assignment is immutable") });
-    renderCard();
-    expect(screen.getByRole("alert")).toHaveTextContent("Assignment is immutable");
   });
 
   it("renders nothing for an org that is not Trino-enabled", () => {

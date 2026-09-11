@@ -316,4 +316,8 @@ export const api = {
   trinoCells: () => get<{ cells: TrinoCell[] }>("/trino/cells"),
   selectTrinoCell: (org: string, cell: string) =>
     put<{ cell: TrinoCell; assigned: boolean }>(`/orgs/${enc(org)}/trino/cell`, { cell }),
+  enableTrino: (org: string, tier: string) =>
+    post<{ status: string; org: string }>(`/orgs/${enc(org)}/trino`, { enabled: true, tier }),
+  disableTrino: (org: string) =>
+    del<{ status: string; org: string }>(`/orgs/${enc(org)}/trino`),
 };

@@ -59,6 +59,7 @@ export interface Org {
   data_imports_table_naming_version: DataImportsTableNamingVersion;
   users?: OrgUser[];
   warehouse?: ManagedWarehouse | null;
+  trino?: { enabled: boolean; tier: string; trino_cell_id: string } | null;
   created_at: string;
   updated_at: string;
 }

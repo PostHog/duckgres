@@ -202,7 +202,7 @@ routes accept `?cell=<logical-id>` and default to `legacy`. Org detail resolves
 its authoritative stored assignment regardless of a supplied cell parameter.
 Each coordinator has separate caches; tenant counts include only its cell.
 
-Admins can select an initial cell in the org's Trino card or send
+Admins can select an initial cell at the top of **Org configuration** or send
 `PUT /api/v1/orgs/:id/trino/cell` with `{"cell":"cell-001"}`. This stores a
 disabled assignment before the normal enable endpoint is called. The warehouse
 must already exist. Selection does not enable Trino or move an existing tenant.
@@ -211,6 +211,20 @@ selection of the same assignment is idempotent. An enabled unassigned row also
 rejects selection because its first provisioning tick may already be running.
 On a 409, inspect the current assignment rather than editing its database row.
 Moving an existing tenant requires a separate maintenance/drain workflow.
+
+The Trino section has separate **Select cell**, **Enable Trino**, and
+**Disable Trino** actions. These do not submit the other org configuration
+fields. The UI requires a saved assignment before enabling and preserves the
+stored resource-group tier when re-enabling. Selection alone never enables
+Trino; disabling retains the assignment and is not a maintenance barrier.
+Viewers can read the configuration but cannot change it. The lower Trino card
+continues to show provisioning status and live query counts.
+
+Enablement uses the existing same-origin POST/DELETE `/api/v1/orgs/:id/trino`
+routes, protected by the shared admin authentication, role gate, and audit
+middleware. The browser receives no provisioning token. Vitest covers these
+UI actions and request shapes; the isolated Trino suite exercises the unchanged
+enable/disable endpoints against real infrastructure.
 
 For newly registered cells, configure the shared customer endpoint separately
 from the observer coordinator URL. This API does not configure Gateway routing.

@@ -29,6 +29,7 @@ import { CopyButton } from "@/components/CopyButton";
 import { ShardBadge } from "@/components/ShardBadge";
 import { OrgUsageSection } from "@/pages/OrgUsage";
 import { OrgTrinoCard } from "@/pages/OrgTrinoCard";
+import { OrgTrinoSettings } from "@/pages/OrgTrinoSettings";
 import {
   useDatabaseNameAvailable,
   useDeleteOrg,
@@ -250,6 +251,7 @@ export function OrgDetail() {
               </span>
             </CardHeader>
             <CardContent className="space-y-3">
+              <OrgTrinoSettings key={id} orgId={id} hasWarehouse={orgHasWarehouse} tier={org.data?.trino?.tier ?? ""} />
               <div className="grid grid-cols-2 gap-3">
                 <Field label="Max workers (0 = unbounded)">
                   <Input type="number" value={form.max_workers} onChange={(e) => set("max_workers", e.target.value)} />
