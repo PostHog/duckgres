@@ -170,7 +170,7 @@ func querySupportsProtocol(query Query, protocol Protocol) bool {
 	case StorageTargetRawView:
 		return protocol == ProtocolPGWire || protocol == ProtocolPGWireUncached || protocol == ProtocolPGWireCached
 	case StorageTargetDuckLakeTable:
-		return protocol == ProtocolPGWire || protocol == ProtocolPGWireUncached || protocol == ProtocolPGWireCached || protocol == ProtocolTrino
+		return protocol == ProtocolPGWire || protocol == ProtocolPGWireUncached || protocol == ProtocolPGWireCached || protocol == ProtocolTrino || protocol == ProtocolTrinoCached
 	case StorageTargetAthenaExternal:
 		return protocol == ProtocolAthena
 	default:

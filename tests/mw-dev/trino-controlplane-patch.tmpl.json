@@ -33,6 +33,10 @@
               {
                 "name": "SSL_CERT_FILE",
                 "value": "/etc/duckgres/trino-ca/ca.crt"
+              },
+              {
+                "name": "DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED",
+                "value": "${TRINO_FILESYSTEM_CACHE_ENABLED}"
               }
             ],
             "volumeMounts": [
@@ -50,7 +54,10 @@
             "secret": {
               "secretName": "duckgres-trino-tls",
               "items": [
-                { "key": "ca.crt", "path": "ca.crt" }
+                {
+                  "key": "ca.crt",
+                  "path": "ca.crt"
+                }
               ]
             }
           }

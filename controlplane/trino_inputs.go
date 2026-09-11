@@ -108,6 +108,10 @@ const (
 	// envTrinoS3MaxConnections overrides the per-catalog S3 connection
 	// pool bound. Empty or unparseable == the provisioner default.
 	envTrinoS3MaxConnections = "DUCKGRES_TRINO_S3_MAX_CONNECTIONS"
+
+	// envTrinoFilesystemCacheEnabled enables caching for newly created catalogs.
+	// Empty defaults to false; Trino nodes also need a configured cache manager.
+	envTrinoFilesystemCacheEnabled = "DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED"
 )
 
 // trinoProvisionerEnabled reports whether the control plane should
@@ -264,6 +268,11 @@ func buildTrinoWiring(
 		return nil, err
 	}
 
+	filesystemCacheEnabled, err := trinoFilesystemCacheEnabled()
+	if err != nil {
+		return nil, err
+	}
+
 	if ducklings == nil {
 		// Without it every catalog sits pending forever waiting on a
 		// duckling status that nothing resolves — a silent, permanent
@@ -282,19 +291,20 @@ func buildTrinoWiring(
 	bundleStore := &opa.BundleStore{}
 
 	trinoProv, err := provisioner.NewTrinoProvisioner(provisioner.TrinoProvisionerOpts{
-		Store:                 store,
-		BootstrapSentinel:     store,
-		Warehouses:            store,
-		Ducklings:             ducklings,
-		Kubernetes:            kc,
-		Namespace:             strings.TrimSpace(os.Getenv(envTrinoNamespace)),
-		CellID:                cell.ID,
-		TenantSecretMountPath: strings.TrimSpace(os.Getenv(envTrinoTenantSecretMountPath)),
-		Catalog:               catalogClient,
-		BundleStore:           bundleStore,
-		BundleBuilder:         opa.NewBuilder(),
-		AWSRegion:             strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
-		S3MaxConnections:      envInt(envTrinoS3MaxConnections),
+		Store:                  store,
+		BootstrapSentinel:      store,
+		Warehouses:             store,
+		Ducklings:              ducklings,
+		Kubernetes:             kc,
+		Namespace:              strings.TrimSpace(os.Getenv(envTrinoNamespace)),
+		CellID:                 cell.ID,
+		TenantSecretMountPath:  strings.TrimSpace(os.Getenv(envTrinoTenantSecretMountPath)),
+		Catalog:                catalogClient,
+		BundleStore:            bundleStore,
+		BundleBuilder:          opa.NewBuilder(),
+		AWSRegion:              strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
+		S3MaxConnections:       envInt(envTrinoS3MaxConnections),
+		FilesystemCacheEnabled: filesystemCacheEnabled,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Trino provisioner: %w", err)
@@ -370,4 +380,18 @@ func envInt(name string) int {
 		return 0
 	}
 	return n
+}
+
+// trinoFilesystemCacheEnabled rejects invalid settings rather than silently
+// benchmarking a different cache mode than the operator requested.
+func trinoFilesystemCacheEnabled() (bool, error) {
+	value := strings.TrimSpace(os.Getenv(envTrinoFilesystemCacheEnabled))
+	if value == "" {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean", envTrinoFilesystemCacheEnabled)
+	}
+	return enabled, nil
 }

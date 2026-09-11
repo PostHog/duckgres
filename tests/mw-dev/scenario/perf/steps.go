@@ -312,7 +312,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached, perfcore.ProtocolTrino, perfcore.ProtocolAthena:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached, perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached, perfcore.ProtocolAthena:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -366,11 +366,12 @@ func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catal
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
 			drivers[target] = driver
-		case perfcore.ProtocolTrino:
+		case perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached:
 			connection, err := e.trinoConnection(spec)
 			if err != nil {
 				return nil, err
 			}
+			connection.Protocol = target
 			driver, err := e.driverFactory.NewTrino(ctx, connection)
 			if err != nil {
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create Trino perf driver: %w", err))

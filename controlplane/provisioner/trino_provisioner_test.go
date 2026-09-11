@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -862,6 +863,7 @@ func TestReconcile_CreatesCatalogProjectsSecretsAndConfigMap(t *testing.T) {
 		"ducklake.metadata.connection-password-file": DefaultTrinoTenantSecretMountPath + "/42",
 		"ducklake.data-path":                         "s3://posthog-duckling-42-mw-dev/",
 		"fs.s3.enabled":                              "true",
+		"fs.cache.enabled":                           "false",
 		"s3.region":                                  "us-east-1",
 		"s3.auth-type":                               "IAM_ROLE",
 		"s3.iam-role":                                "arn:aws:iam::123456789012:role/duckling-42",
@@ -1869,5 +1871,22 @@ func TestCatalogHTTPClientTagsItsSource(t *testing.T) {
 		if got != opa.AdminPrincipal {
 			t.Errorf("request %d: X-Trino-User = %q, want %q", i, got, opa.AdminPrincipal)
 		}
+	}
+}
+
+func TestCatalogFilesystemCacheSetting(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			opts := baseTestOpts()
+			opts.FilesystemCacheEnabled = enabled
+			p, err := NewTrinoProvisioner(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			props := p.buildCatalogProperties("42", readyWarehouse("42"), readyDuckling("42"))
+			if got, want := props["fs.cache.enabled"], strconv.FormatBool(enabled); got != want {
+				t.Fatalf("fs.cache.enabled = %q, want %q", got, want)
+			}
+		})
 	}
 }

@@ -144,3 +144,14 @@ func TestConnectionConfigRequiresVerifiedHTTPSAndPreservesCAPath(t *testing.T) {
 		t.Fatalf("insecure DSN error = %v, want HTTPS requirement", err)
 	}
 }
+
+func TestCachedProtocolAndInvalidProtocol(t *testing.T) {
+	driver := &Driver{protocol: core.ProtocolTrinoCached}
+	if driver.Protocol() != core.ProtocolTrinoCached {
+		t.Fatalf("Protocol = %q", driver.Protocol())
+	}
+	_, err := New(context.Background(), ConnectionConfig{Protocol: core.ProtocolPGWire})
+	if err == nil || !strings.Contains(err.Error(), "unsupported Trino protocol") {
+		t.Fatalf("New invalid protocol error = %v", err)
+	}
+}
