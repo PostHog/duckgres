@@ -265,13 +265,14 @@ func TestRunnerKeepsRawViewsOnPGWireAndRunsDuckLakeTablesOnEveryTarget(t *testin
 func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T) {
 	pg := &testDriver{protocol: ProtocolPGWire}
 	trinoDriver := &testDriver{protocol: ProtocolTrino}
+	cachedDriver := &testDriver{protocol: ProtocolTrinoCached}
 	athenaDriver := &testDriver{protocol: ProtocolAthena}
 	sink := &inMemorySink{}
 	runner := NewQueryRunner(RunnerConfig{
 		Catalog: Catalog{
 			Name:              "three-engine-comparison",
 			MeasureIterations: 1,
-			Targets:           []Protocol{ProtocolPGWire, ProtocolTrino, ProtocolAthena},
+			Targets:           []Protocol{ProtocolPGWire, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena},
 			Queries: []Query{
 				{QueryID: "q__raw_view", IntentID: "intent", StorageTarget: StorageTargetRawView},
 				{QueryID: "q__ducklake_table", IntentID: "intent", StorageTarget: StorageTargetDuckLakeTable},
@@ -279,9 +280,10 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 			},
 		},
 		Drivers: map[Protocol]ProtocolDriver{
-			ProtocolPGWire: pg,
-			ProtocolTrino:  trinoDriver,
-			ProtocolAthena: athenaDriver,
+			ProtocolPGWire:      pg,
+			ProtocolTrino:       trinoDriver,
+			ProtocolAthena:      athenaDriver,
+			ProtocolTrinoCached: cachedDriver,
 		},
 		Sink: sink,
 		Now:  func() time.Time { return time.Unix(1700000000, 0) },
@@ -300,8 +302,11 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 	if got, want := athenaDriver.queryIDs, []string{"q__athena_external"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Athena query IDs: got %v want %v", got, want)
 	}
-	if summary.TotalQueries != 4 {
-		t.Fatalf("total measured queries = %d, want 4", summary.TotalQueries)
+	if got, want := cachedDriver.queryIDs, []string{"q__ducklake_table"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Cached Trino query IDs: got %v want %v", got, want)
+	}
+	if summary.TotalQueries != 5 {
+		t.Fatalf("total measured queries = %d, want 5", summary.TotalQueries)
 	}
 }
 

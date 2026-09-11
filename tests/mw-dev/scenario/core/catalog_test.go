@@ -212,3 +212,45 @@ steps:
 		t.Fatalf("error = %v, want required_env index", err)
 	}
 }
+
+func TestCachedTrinoScenarioPreservesBaselineAndCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		file    string
+		targets []string
+	}{
+		{"posthog_frozen_perf", []string{"pgwire_uncached", "pgwire_cached", "trino", "athena"}},
+		{"posthog_frozen_perf_trino_cached", []string{"trino_cached"}},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			scenario, err := LoadScenario("../scenarios/" + tc.file + ".yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, step := range scenario.Steps {
+				if step.ID == "perf_queries" {
+					found = true
+					targets := step.With["targets"].([]any)
+					if len(targets) != len(tc.targets) {
+						t.Fatalf("targets = %v", targets)
+					}
+					for i, want := range tc.targets {
+						if targets[i] != want {
+							t.Errorf("target %d = %v, want %s", i, targets[i], want)
+						}
+					}
+					if step.With["fail_on_query_errors"] != true {
+						t.Error("perf errors must fail the scenario")
+					}
+				}
+			}
+			if !found {
+				t.Fatal("missing perf queries")
+			}
+			last := scenario.Steps[len(scenario.Steps)-1]
+			if last.ID != "deprovision" || !last.AlwaysRun {
+				t.Fatal("missing unconditional cleanup")
+			}
+		})
+	}
+}

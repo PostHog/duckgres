@@ -36,6 +36,15 @@ case "$E2E_SUITE" in
 esac
 TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8}"
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
+# Derive cache mode from the scenario so reported protocol and catalog agree.
+TRINO_FILESYSTEM_CACHE_ENABLED=false
+if [ "$SCENARIO_NAME" = "posthog_frozen_perf_trino_cached" ]; then
+  TRINO_FILESYSTEM_CACHE_ENABLED=true
+  if [ "$E2E_SUITE" != "trino" ]; then
+    echo "posthog_frozen_perf_trino_cached requires E2E_SUITE=trino" >&2
+    exit 2
+  fi
+fi
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
 # Stamped into the rendered manifests and handed to the in-cluster harness.
@@ -345,7 +354,8 @@ cmd_deploy() {
     # Associate before admitting Trino pods: the Pod Identity agent injects
     # credentials only at admission and never retrofits an existing pod.
     ensure_trino_pod_identity
-    envsubst '$NAMESPACE $PR_NUMBER' < "$HERE/trino-controlplane-patch.tmpl.json" \
+    TRINO_FILESYSTEM_CACHE_ENABLED="$TRINO_FILESYSTEM_CACHE_ENABLED" \
+    envsubst '$NAMESPACE $PR_NUMBER $TRINO_FILESYSTEM_CACHE_ENABLED' < "$HERE/trino-controlplane-patch.tmpl.json" \
       | "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane \
           --type=strategic --patch-file=/dev/stdin
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-control-plane --timeout=180s
@@ -549,6 +559,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
+            # Only the throwaway benchmark config store; never a shared dev/prod store.
+            - { name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN, value: "postgres://duckgres:duckgres@duckgres-config-store.$NS.svc:5432/duckgres?sslmode=disable" }
             - { name: DUCKGRES_SCENARIO_ATHENA_REGION, value: "$AWS_REGION" }
             - { name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: "${DUCKGRES_SCENARIO_ATHENA_WORKGROUP:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: "${DUCKGRES_SCENARIO_ATHENA_DATABASE:-}" }

@@ -2092,3 +2092,98 @@ func (f runSHFakes) calls(t *testing.T) string {
 	}
 	return string(b)
 }
+
+func TestTrinoCacheManagersHaveWritableBoundedStorage(t *testing.T) {
+	raw, err := os.ReadFile("manifests.trino.tmpl.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(strings.ReplaceAll(string(raw), "${NAMESPACE}", "test-namespace")), 4096)
+	configs, deployments := 0, 0
+	for {
+		var manifest map[string]any
+		if err := decoder.Decode(&manifest); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		name := manifestName(manifest)
+		if name != "duckgres-trino-worker" && name != "duckgres-trino-coordinator" {
+			continue
+		}
+		switch manifest["kind"] {
+		case "ConfigMap":
+			configs++
+			data := manifest["data"].(map[string]any)
+			if !strings.Contains(data["config.properties"].(string), "cache-manager.config-files=etc/cache-manager-alluxio.properties,etc/cache-manager-memory.properties") {
+				t.Errorf("%s does not load both cache managers", name)
+			}
+			alluxio, _ := data["cache-manager-alluxio.properties"].(string)
+			for _, setting := range []string{"cache-manager.name=alluxio", "fs.cache.directories=/cache/trino", "fs.cache.max-sizes=16GB", "fs.cache.page-size=64kB"} {
+				if !strings.Contains(alluxio, setting) {
+					t.Errorf("%s missing %s", name, setting)
+				}
+			}
+			memory, _ := data["cache-manager-memory.properties"].(string)
+			if !strings.Contains(memory, "cache-manager.name=memory") {
+				t.Errorf("%s missing memory cache manager", name)
+			}
+		case "Deployment":
+			deployments++
+			spec := manifest["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+			found := false
+			for _, v := range spec["volumes"].([]any) {
+				volume := v.(map[string]any)
+				if volume["name"] == "file-cache" {
+					found = true
+					if volume["emptyDir"].(map[string]any)["sizeLimit"] != "20Gi" {
+						t.Errorf("%s cache volume must be bounded", name)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("%s missing cache volume", name)
+			}
+			container := spec["containers"].([]any)[0].(map[string]any)
+			mounts := map[string]bool{}
+			for _, v := range container["volumeMounts"].([]any) {
+				mounts[v.(map[string]any)["mountPath"].(string)] = true
+			}
+			for _, path := range []string{"/cache/trino", "/etc/trino/cache-manager-alluxio.properties", "/etc/trino/cache-manager-memory.properties"} {
+				if !mounts[path] {
+					t.Errorf("%s missing mount %s", name, path)
+				}
+			}
+		}
+	}
+	if configs != 2 || deployments != 2 {
+		t.Fatalf("found %d configs and %d deployments", configs, deployments)
+	}
+}
+
+func TestTrinoCacheModeFollowsScenario(t *testing.T) {
+	for _, tc := range []struct{ scenario, enabled string }{
+		{"posthog_frozen_perf", "false"}, {"posthog_frozen_perf_trino_cached", "true"},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+			writeFake(t, fakes.binDir, "envsubst", `#!/usr/bin/env bash
+printf 'cache-mode %s\n' "${TRINO_FILESYSTEM_CACHE_ENABLED:-unset}" >> "$RUN_SH_TEST_CALLS"
+cat
+`)
+			secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
+			for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
+				if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino", "SCENARIO_NAME="+tc.scenario, "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-test", "SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-test")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("deploy: %v\n%s", err, out)
+			}
+			if calls := fakes.calls(t); !strings.Contains(calls, "cache-mode "+tc.enabled+"\n") {
+				t.Fatalf("catalog cache mode was not %s: %s", tc.enabled, calls)
+			}
+		})
+	}
+}

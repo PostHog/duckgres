@@ -34,6 +34,8 @@ type StartupOptions struct {
 }
 
 type ConnectionConfig struct {
+	// Protocol defaults to trino; trino_cached labels runs against a cache-enabled deployment.
+	Protocol   core.Protocol
 	ServerURL  string
 	Username   string
 	Password   string
@@ -95,10 +97,18 @@ func (c ConnectionConfig) DSN() (string, error) {
 }
 
 type Driver struct {
-	exec Executor
+	protocol core.Protocol
+	exec     Executor
 }
 
 func New(ctx context.Context, config ConnectionConfig) (*Driver, error) {
+	protocol := config.Protocol
+	if protocol == "" {
+		protocol = core.ProtocolTrino
+	}
+	if protocol != core.ProtocolTrino && protocol != core.ProtocolTrinoCached {
+		return nil, fmt.Errorf("unsupported Trino protocol %q", protocol)
+	}
 	dsn, err := config.DSN()
 	if err != nil {
 		return nil, err
@@ -107,7 +117,7 @@ func New(ctx context.Context, config ConnectionConfig) (*Driver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open Trino connection: %w", err)
 	}
-	driver := NewWithExecutor(&sqlExecutor{db: db})
+	driver := &Driver{exec: &sqlExecutor{db: db}, protocol: protocol}
 	if err := driver.WaitReady(ctx, config.Startup); err != nil {
 		_ = driver.Close()
 		return nil, err
@@ -120,7 +130,10 @@ func NewWithExecutor(exec Executor) *Driver {
 }
 
 func (d *Driver) Protocol() core.Protocol {
-	return core.ProtocolTrino
+	if d.protocol == "" {
+		return core.ProtocolTrino
+	}
+	return d.protocol
 }
 
 func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (core.ExecutionResult, error) {

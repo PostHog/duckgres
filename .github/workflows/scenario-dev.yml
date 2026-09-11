@@ -59,10 +59,15 @@ jobs:
   scenario:
     needs: [scenario-runner-image, duckgres-image]
     if: ${{ always() && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        scenario: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && fromJSON('["posthog_frozen_perf", "posthog_frozen_perf_trino_cached"]') || fromJSON(format('["{0}"]', inputs.scenario)) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
     env:
-      SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}
+      SCENARIO_NAME: ${{ matrix.scenario }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
       WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
@@ -75,9 +80,9 @@ jobs:
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
       TRINO_IMAGE: ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8
-      E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}
-      PR_NUMBER: ${{ github.run_id }}
-      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
+      E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}
+      PR_NUMBER: ${{ github.run_id }}${{ strategy.job-index }}
+      NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ strategy.job-index }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
       # Add process headroom for repeated full-dataset pgwire aggregates.
@@ -85,6 +90,12 @@ jobs:
       DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 12Gi
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Require a current image for cached comparisons
+        if: ${{ inputs.duckgres_image != '' && (inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_trino_cached') }}
+        run: |
+          echo "::error::Cached Trino comparisons require the control-plane image built from this revision. Omit duckgres_image so an older image cannot silently ignore the cache flag."
+          exit 1
 
       - name: Scenario dev target selected
         run: echo "Deploying an isolated Duckgres stack for $SCENARIO_NAME."
@@ -156,7 +167,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scenario-dev-${{ github.run_id }}-${{ github.run_attempt }}
+          name: scenario-dev-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/scenario-dev/
           if-no-files-found: warn
           retention-days: 14

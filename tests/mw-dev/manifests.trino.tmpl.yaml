@@ -43,6 +43,14 @@ data:
     -XX:+UseG1GC
     -XX:+ExitOnOutOfMemoryError
     -Dfile.encoding=UTF-8
+  cache-manager-alluxio.properties: |
+    cache-manager.name=alluxio
+    fs.cache.directories=/cache/trino
+    fs.cache.max-sizes=16GB
+    fs.cache.page-size=64kB
+    fs.cache.ttl=7d
+  cache-manager-memory.properties: |
+    cache-manager.name=memory
   config.properties: |
     coordinator=true
     node-scheduler.include-coordinator=false
@@ -57,6 +65,8 @@ data:
     # heap; execution workers carry the 2GB per-node allowance below.
     query.max-memory-per-node=1GB
     catalog.management=dynamic
+    # Both targets load the same managers; catalog fs.cache.enabled gates use.
+    cache-manager.config-files=etc/cache-manager-alluxio.properties,etc/cache-manager-memory.properties
     catalog.store=posthog
     http-server.authentication.type=password
     password-authenticator.config-files=etc/password-authenticator.properties
@@ -98,6 +108,14 @@ data:
     -XX:+UseG1GC
     -XX:+ExitOnOutOfMemoryError
     -Dfile.encoding=UTF-8
+  cache-manager-alluxio.properties: |
+    cache-manager.name=alluxio
+    fs.cache.directories=/cache/trino
+    fs.cache.max-sizes=16GB
+    fs.cache.page-size=64kB
+    fs.cache.ttl=7d
+  cache-manager-memory.properties: |
+    cache-manager.name=memory
   config.properties: |
     coordinator=false
     http-server.http.port=8080
@@ -110,6 +128,8 @@ data:
     task.min-drivers=16
     shutdown.grace-period=10s
     catalog.management=dynamic
+    # Both targets load the same managers; catalog fs.cache.enabled gates use.
+    cache-manager.config-files=etc/cache-manager-alluxio.properties,etc/cache-manager-memory.properties
     internal-communication.shared-secret=${ENV:TRINO_INTERNAL_COMMUNICATION_SHARED_SECRET}
 ---
 apiVersion: v1
@@ -198,6 +218,9 @@ spec:
             - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
             - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }
             - { name: config, mountPath: /etc/trino/config.properties, subPath: config.properties }
+            - { name: config, mountPath: /etc/trino/cache-manager-alluxio.properties, subPath: cache-manager-alluxio.properties }
+            - { name: config, mountPath: /etc/trino/cache-manager-memory.properties, subPath: cache-manager-memory.properties }
+            - { name: file-cache, mountPath: /cache/trino }
             - { name: config, mountPath: /etc/trino/password-authenticator.properties, subPath: password-authenticator.properties }
             - { name: config, mountPath: /etc/trino/group-provider.properties, subPath: group-provider.properties }
             - { name: config, mountPath: /etc/trino/access-control.properties, subPath: access-control.properties }
@@ -233,6 +256,7 @@ spec:
         - { name: opa-token, secret: { secretName: trino-opa-bundle-token, optional: true } }
         - { name: opa-cache, emptyDir: {} }
         - { name: data, emptyDir: {} }
+        - { name: file-cache, emptyDir: { sizeLimit: 20Gi } }
       nodeSelector: { kubernetes.io/arch: arm64 }
 ---
 apiVersion: apps/v1
@@ -274,10 +298,14 @@ spec:
             - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
             - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }
             - { name: config, mountPath: /etc/trino/config.properties, subPath: config.properties }
+            - { name: config, mountPath: /etc/trino/cache-manager-alluxio.properties, subPath: cache-manager-alluxio.properties }
+            - { name: config, mountPath: /etc/trino/cache-manager-memory.properties, subPath: cache-manager-memory.properties }
+            - { name: file-cache, mountPath: /cache/trino }
             - { name: tenant-secrets, mountPath: /etc/trino/tenant-secrets, readOnly: true }
             - { name: data, mountPath: /data/trino }
       volumes:
         - { name: config, configMap: { name: duckgres-trino-worker } }
         - { name: tenant-secrets, secret: { secretName: trino-tenant-secrets, optional: true } }
         - { name: data, emptyDir: {} }
+        - { name: file-cache, emptyDir: { sizeLimit: 20Gi } }
       nodeSelector: { kubernetes.io/arch: arm64 }

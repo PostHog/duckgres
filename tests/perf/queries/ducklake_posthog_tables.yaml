@@ -6,6 +6,7 @@ targets:
   - pgwire_uncached
   - pgwire_cached
   - trino
+  - trino_cached
   - athena
 warmup_iterations: 1
 measure_iterations: 4

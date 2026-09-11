@@ -4,7 +4,7 @@ This package contains the golden-query performance harness.
 
 ## Protocol Drivers
 
-Catalogs may target `pgwire`, `pgwire_uncached`, `pgwire_cached`, `trino`,
+Catalogs may target `pgwire`, `pgwire_uncached`, `pgwire_cached`, `trino`, `trino_cached`,
 `athena`, or any supported combination. All drivers execute the same
 rendered statement stored in the existing `pgwire_sql` catalog field; the
 legacy field name is retained for catalog compatibility and must not be used
@@ -41,8 +41,9 @@ one protocol from changing another protocol's cache context.
 `posthog_frozen_perf` runs four separately labeled targets in one result set,
 in order: **`pgwire_uncached` (baseline)**, `pgwire_cached`, `trino`, `athena`.
 Both DuckDB variants use identical queries, worker resource requests, warmup
-counts, and measured iterations. Each variant finishes before the next begins;
-Trino and Athena run once, not once per cache mode. Legacy `pgwire` catalogs
+counts, and measured iterations. Each variant finishes before the next begins.
+The baseline scenario runs Trino and Athena once. A separate cached-Trino scenario
+adds `trino_cached` without repeating the DuckDB/Athena targets. Legacy `pgwire` catalogs
 keep their existing behavior and are not relabeled as uncached history.
 
 Only the perf driver changes cache settings. It pins its PGWire connection and
@@ -242,3 +243,31 @@ Optional artifact publisher:
 - `-perf-output-base`: base output directory.
 - `-perf-run-id`: fixed run id.
 - `-perf-pgwire-dsn`: use an existing PGWire endpoint instead of auto-start.
+
+### Cached Trino comparison
+
+The scheduled workflow and manual `posthog_frozen_perf` selection run the baseline
+and `posthog_frozen_perf_trino_cached` sequentially in separate throwaway namespaces.
+The latter measures only `trino_cached`, using the same registered DuckLake tables,
+SQL, one warm-up iteration and four measured iterations per query as the baseline.
+CSV/history rows retain the distinct `trino_cached` protocol label. To run only
+that variant, select `posthog_frozen_perf_trino_cached` manually.
+
+Both clusters load the same Alluxio and memory cache managers. The provisioner sets
+`fs.cache.enabled=false` for the baseline catalog and `true` for the cached catalog.
+Each node has a 16GB disk-cache budget in a 20Gi ephemeral volume, with 64kB pages
+and a seven-day TTL. The cache persists between queries/iterations within a job;
+teardown removes it. Entries can be evicted, and a single warm-up does not guarantee
+every replica holds the complete working set. This measures a warmed, bounded
+filesystem cache, not a fully cached theoretical optimum. Worker CPU/memory limits
+remain three workers at 1 CPU/4Gi each; disk caching is additional storage.
+
+The pinned DuckLake connector uses filesystem caching for data and footer/index
+bytes, but does not opt into the separate coordinator heap metadata-cache tier.
+Loading the memory manager does not change that. No query-result cache is enabled:
+Trino still executes decoding and aggregation. The baseline is filesystem-cache-off,
+not a guarantee that JVM, OS, or storage-service caches are cold. Do not mix the two
+protocol labels in performance comparisons.
+
+Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
+external-read/hit counters to distinguish storage traffic from cached reads.

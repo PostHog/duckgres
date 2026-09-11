@@ -9,6 +9,7 @@ const (
 	ProtocolPGWireUncached Protocol = "pgwire_uncached"
 	ProtocolPGWireCached   Protocol = "pgwire_cached"
 	ProtocolTrino          Protocol = "trino"
+	ProtocolTrinoCached    Protocol = "trino_cached"
 	ProtocolAthena         Protocol = "athena"
 )
 

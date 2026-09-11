@@ -27,12 +27,13 @@ type DriverFactory interface {
 }
 
 type ExecutorConfig struct {
-	ProvisionState *provision.State
-	Connection     scenariosql.ConnectionConfig
-	OutputDir      string
-	DriverFactory  DriverFactory
-	State          *State
-	Now            func() time.Time
+	TrinoCatalogStoreDSN string
+	ProvisionState       *provision.State
+	Connection           scenariosql.ConnectionConfig
+	OutputDir            string
+	DriverFactory        DriverFactory
+	State                *State
+	Now                  func() time.Time
 }
 
 type Executor struct {
@@ -81,12 +82,14 @@ type stepSpec struct {
 	AthenaQueryTimeout   time.Duration
 }
 
-type defaultDriverFactory struct{}
+type defaultDriverFactory struct {
+	trinoCatalogStoreDSN string
+}
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
 	factory := cfg.DriverFactory
 	if factory == nil {
-		factory = defaultDriverFactory{}
+		factory = defaultDriverFactory{trinoCatalogStoreDSN: cfg.TrinoCatalogStoreDSN}
 	}
 	state := cfg.State
 	if state == nil {
@@ -312,7 +315,7 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 		}
 		target := perfcore.Protocol(value)
 		switch target {
-		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached, perfcore.ProtocolTrino, perfcore.ProtocolAthena:
+		case perfcore.ProtocolPGWire, perfcore.ProtocolPGWireUncached, perfcore.ProtocolPGWireCached, perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached, perfcore.ProtocolAthena:
 		default:
 			return nil, classified(ErrorClassConfig, fmt.Errorf("step %s with.targets[%d] has unsupported perf protocol %q", step.ID, i, target))
 		}
@@ -327,7 +330,16 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 
 func restrictCatalogTargets(catalog perfcore.Catalog, targets []perfcore.Protocol) (perfcore.Catalog, error) {
 	if targets == nil {
-		return catalog, nil
+		targets = catalog.Targets
+	}
+
+	var hasTrino, hasTrinoCached bool
+	for _, target := range targets {
+		hasTrino = hasTrino || target == perfcore.ProtocolTrino
+		hasTrinoCached = hasTrinoCached || target == perfcore.ProtocolTrinoCached
+	}
+	if hasTrino && hasTrinoCached {
+		return perfcore.Catalog{}, fmt.Errorf("trino and trino_cached require separate deployments; select one mode with with.targets")
 	}
 
 	available := make(map[perfcore.Protocol]struct{}, len(catalog.Targets))
@@ -366,11 +378,12 @@ func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catal
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create pgwire perf driver: %w", err))
 			}
 			drivers[target] = driver
-		case perfcore.ProtocolTrino:
+		case perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached:
 			connection, err := e.trinoConnection(spec)
 			if err != nil {
 				return nil, err
 			}
+			connection.Protocol = target
 			driver, err := e.driverFactory.NewTrino(ctx, connection)
 			if err != nil {
 				return nil, classified(ErrorClassConfig, fmt.Errorf("create Trino perf driver: %w", err))
@@ -496,7 +509,10 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, p
 	return driver, nil
 }
 
-func (defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+func (f defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+	if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, connection.Protocol); err != nil {
+		return nil, err
+	}
 	return trinodriver.New(ctx, connection)
 }
 

@@ -329,6 +329,10 @@ type TrinoProvisionerOpts struct {
 	// S3MaxConnections overrides defaultTrinoS3MaxConnections for the
 	// per-catalog S3 client pool. Zero == the default.
 	S3MaxConnections int
+
+	// FilesystemCacheEnabled enables the node-local filesystem cache for new
+	// catalogs. Defaults to false. Trino nodes must configure a cache manager.
+	FilesystemCacheEnabled bool
 }
 
 // TrinoBootstrapSentinelStore is the narrow configstore surface the
@@ -398,19 +402,20 @@ type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingSta
 // fires on first install; thereafter ensureClusterSecrets adopts the
 // existing K8s Secrets.
 type TrinoProvisioner struct {
-	store                 TrinoStore
-	bootstrapSentinel     TrinoBootstrapSentinelStore
-	warehouses            TrinoWarehouseStore
-	ducklings             TrinoDucklingResolver
-	kubernetes            kubernetes.Interface
-	namespace             string
-	cellID                string
-	catalog               TrinoCatalogClient
-	bundleStore           *opa.BundleStore
-	bundleBuilder         opa.BundleBuilder
-	tenantSecretMountPath string
-	awsRegion             string
-	s3MaxConnections      int
+	store                  TrinoStore
+	bootstrapSentinel      TrinoBootstrapSentinelStore
+	warehouses             TrinoWarehouseStore
+	ducklings              TrinoDucklingResolver
+	kubernetes             kubernetes.Interface
+	namespace              string
+	cellID                 string
+	catalog                TrinoCatalogClient
+	bundleStore            *opa.BundleStore
+	bundleBuilder          opa.BundleBuilder
+	tenantSecretMountPath  string
+	awsRegion              string
+	s3MaxConnections       int
+	filesystemCacheEnabled bool
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -505,19 +510,20 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		maxConns = defaultTrinoS3MaxConnections
 	}
 	return &TrinoProvisioner{
-		store:                 opts.Store,
-		bootstrapSentinel:     opts.BootstrapSentinel,
-		warehouses:            opts.Warehouses,
-		ducklings:             opts.Ducklings,
-		kubernetes:            opts.Kubernetes,
-		namespace:             ns,
-		cellID:                cell,
-		catalog:               opts.Catalog,
-		bundleStore:           opts.BundleStore,
-		bundleBuilder:         opts.BundleBuilder,
-		tenantSecretMountPath: strings.TrimRight(mountPath, "/"),
-		awsRegion:             opts.AWSRegion,
-		s3MaxConnections:      maxConns,
+		store:                  opts.Store,
+		bootstrapSentinel:      opts.BootstrapSentinel,
+		warehouses:             opts.Warehouses,
+		ducklings:              opts.Ducklings,
+		kubernetes:             opts.Kubernetes,
+		namespace:              ns,
+		cellID:                 cell,
+		catalog:                opts.Catalog,
+		bundleStore:            opts.BundleStore,
+		bundleBuilder:          opts.BundleBuilder,
+		tenantSecretMountPath:  strings.TrimRight(mountPath, "/"),
+		awsRegion:              opts.AWSRegion,
+		s3MaxConnections:       maxConns,
+		filesystemCacheEnabled: opts.FilesystemCacheEnabled,
 	}, nil
 }
 
@@ -1590,6 +1596,7 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.M
 		trinoDuckLakePasswordFileProperty:   p.tenantPasswordFilePath(orgID),
 		"ducklake.data-path":                ducklakeDataPath(d.DataStore.BucketName, w.S3.PathPrefix),
 		"fs.s3.enabled":                     "true",
+		"fs.cache.enabled":                  strconv.FormatBool(p.filesystemCacheEnabled),
 		"s3.region":                         region,
 		"s3.auth-type":                      "IAM_ROLE",
 		"s3.iam-role":                       d.IAMRoleARN,

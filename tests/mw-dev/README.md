@@ -677,3 +677,44 @@ NAMESPACE=duckgres-ci-pr-0 PR_NUMBER=0 KUBE_CONTEXT=posthog-mw-dev \
   CP_POD_IDENTITY_ROLE=arn:aws:iam::<mw-dev-account-id>:role/duckgres-control-plane-dev \
   bash tests/mw-dev/run.sh deploy
 ```
+
+### Running the cached Trino perf variant
+
+`posthog_frozen_perf_trino_cached` uses the isolated Trino lane and measures only
+`trino_cached`. The scheduled workflow and manual `posthog_frozen_perf` selection
+run both variants serially, with unique numeric namespace identities and separate
+artifacts. A manual cached-only scenario selection runs just the cached variant.
+For either perf selection, omit the `duckgres_image` override: the workflow
+requires the current control-plane build, preventing older images from ignoring
+the cache flag and producing falsely labeled cached results.
+
+For local invocation, set `SCENARIO_NAME=posthog_frozen_perf_trino_cached` and
+`E2E_SUITE=trino` before both `tests/mw-dev/run.sh deploy` and `test-scenario`.
+Use the existing isolated-lane credentials, image and namespace requirements.
+The harness derives `DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED=true` from that scenario;
+other scenarios use false. The flag affects newly created catalogs only: tear down
+and redeploy into a fresh namespace when changing mode. Never reuse a cached
+namespace for a baseline run.
+
+Before Trino startup/warm-up, the runner checks the persisted catalog
+`fs.cache.enabled` against the selected target. Missing or mismatched settings
+fail the run, including when an older control-plane image ignored the flag.
+`run.sh` supplies `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN` for the throwaway
+namespace database; direct runner invocations must supply that isolated database
+connection too. Never point this check at a shared dev/prod catalog store.
+On failure, rebuild the control plane and deploy a fresh namespace with the
+matching scenario. A single `perf_queries` step cannot select both `trino` and
+`trino_cached`; select one explicitly and use separate deployments for comparison.
+
+The environment flag defaults to false outside this harness. Enabling it requires
+a compatible cache manager on every Trino node. The pinned image configures managers
+with `cache-manager.config-files`; cache directory/size properties belong in the
+Alluxio manager file, not in the tenant catalog. The harness mounts writable,
+node-local ephemeral cache storage and keeps worker CPU/memory limits unchanged.
+See `tests/perf/README.md` for cache budgets, warm-up behavior and cache-layer limits.
+
+If a cached catalog fails readiness, inspect coordinator/worker logs for unavailable
+cache managers, invalid properties, unwritable `/cache/trino`, or exhausted ephemeral
+storage. Preserve artifacts, then run the normal `teardown`; the namespace deletion
+removes cache volumes. Do not switch the cached target to an uncached catalog merely
+to make a failed run pass.
