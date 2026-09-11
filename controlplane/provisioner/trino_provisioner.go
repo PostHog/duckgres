@@ -181,40 +181,19 @@ var secretDataKeyPattern = regexp.MustCompile(`^[-._a-zA-Z0-9]+$`)
 // admin authority from drifting apart.
 var managedCatalogRe = regexp.MustCompile(opa.ManagedCatalogPattern)
 
-// trinoCatalogIdentifier is the Trino catalog identifier grammar
-// ([a-z0-9_]+). Anything outside this set in Org.Name is replaced with
-// `_` before forming the catalog name.
-var trinoCatalogIdentifier = regexp.MustCompile(`[^a-z0-9_]`)
-
 // trinoSanitize lowercases and replaces non-[a-z0-9_] runs with `_`.
-// Pure function so callers can recover the sanitized name without
-// holding the provisioner.
+// Thin alias for the canonical definition: the same sanitization backs the
+// pgwire logical catalog alias, which every build needs, so it lives in
+// configstore (untagged) rather than in this kubernetes-tagged file.
 func trinoSanitize(orgName string) string {
-	lower := strings.ToLower(orgName)
-	return trinoCatalogIdentifier.ReplaceAllString(lower, "_")
+	return configstore.TrinoSanitize(orgName)
 }
 
 // TrinoCatalogName returns the catalog identifier for an org.
-// Format: org_<sanitized>. The sanitization maps Org.Name to Trino
-// identifier rules ([a-z0-9_]); any other characters collapse to
-// underscores.
-//
-// For principals that satisfy ValidateDatabaseName the mapping is injective
-// — that grammar allows only lowercase alphanumerics and hyphens, so the
-// hyphen is the only character rewritten and no valid principal contains the
-// underscore it becomes — which, with database_name's global unique index,
-// makes distinct orgs' catalog names distinct by construction. Grandfathered
-// rows predate the validation and can still converge; rejectPrincipalCollisions
-// holds those orgs back rather than letting one read the other's catalog.
-//
-// The name carried an `_iceberg` suffix while the backing table format was
-// Iceberg behind Lakekeeper. Warehouses are DuckLake now (migration 000014
-// dropped every iceberg_* column), so the suffix went with it. The shape is
-// pinned from three sides — this function, opa.ManagedCatalogPattern, and
-// the regex literal inside policy.rego — and the pair of tests named in
-// ManagedCatalogPattern's doc comment fails if any one of them moves alone.
+// Format: org_<sanitized>. See configstore.TrinoCatalogName for the full
+// contract — this is the Trino-side spelling of that one definition.
 func TrinoCatalogName(principal string) string {
-	return "org_" + trinoSanitize(principal)
+	return configstore.TrinoCatalogName(principal)
 }
 
 // TrinoGroupName returns the file-group-provider group label for an org,

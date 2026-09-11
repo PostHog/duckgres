@@ -712,3 +712,85 @@ func TestProjectMetadataViewsHideRelationsOutsideAccessPolicy(t *testing.T) {
 		FROM memory.main.information_schema_sequences_compat
 	`, "team_42.owned_seq")
 }
+
+// TestInitSessionDatabaseMetadataReportsLogicalCatalogAlias covers a session
+// connected under its org's Trino catalog name: every pg-visible catalog
+// surface reports the LOGICAL name, while the session still executes against
+// the physical `ducklake` catalog. That split is the whole point of the alias —
+// SQLMesh sees one catalog name on the Duckgres and Trino engines, and nothing
+// about execution moves.
+func TestInitSessionDatabaseMetadataReportsLogicalCatalogAlias(t *testing.T) {
+	const logicalCatalog = "org_acme_analytics"
+
+	db, err := sql.Open("duckdb", ":memory:")
+	if err != nil {
+		t.Fatalf("open duckdb: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.Exec(`ATTACH ':memory:' AS ducklake`); err != nil {
+		t.Fatalf("attach ducklake: %v", err)
+	}
+	if err := initInformationSchema(db, true); err != nil {
+		t.Fatalf("init information_schema: %v", err)
+	}
+	if _, err := db.Exec("USE ducklake"); err != nil {
+		t.Fatalf("use ducklake: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE main.events(id INTEGER)"); err != nil {
+		t.Fatalf("create ducklake table: %v", err)
+	}
+
+	executor := NewLocalExecutor(db)
+	if err := sessionmeta.InitSessionDatabaseMetadata(context.Background(), executor, logicalCatalog); err != nil {
+		t.Fatalf("init session database metadata: %v", err)
+	}
+
+	assertSingleValue := func(label, query, want string) {
+		t.Helper()
+		var got string
+		if err := db.QueryRow(query).Scan(&got); err != nil {
+			t.Fatalf("%s query: %v", label, err)
+		}
+		if got != want {
+			t.Fatalf("%s = %q, want %q", label, got, want)
+		}
+	}
+
+	assertSingleValue("current_database", "SELECT current_database()", logicalCatalog)
+	assertSingleValue("pg_database",
+		"SELECT datname FROM memory.main.pg_database WHERE datname = current_database()", logicalCatalog)
+	assertSingleValue("information_schema.tables catalog", `
+		SELECT DISTINCT table_catalog
+		FROM memory.main.information_schema_tables_compat
+		WHERE table_name = 'events'
+	`, logicalCatalog)
+	assertSingleValue("information_schema.schemata catalog", `
+		SELECT DISTINCT catalog_name
+		FROM memory.main.information_schema_schemata_compat
+		WHERE schema_name = 'public'
+	`, logicalCatalog)
+	assertSingleValue("information_schema.columns catalog", `
+		SELECT DISTINCT table_catalog
+		FROM memory.main.information_schema_columns_compat
+		WHERE table_name = 'events'
+	`, logicalCatalog)
+
+	// The alias renames; it never redirects. Unqualified DDL after init must
+	// still land in the PHYSICAL catalog — there is no catalog called
+	// org_acme_analytics for it to land in.
+	if _, err := db.Exec("CREATE TABLE alias_probe(id INTEGER)"); err != nil {
+		t.Fatalf("create table under the alias: %v", err)
+	}
+	var probes int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM duckdb_tables()
+		WHERE database_name = 'ducklake' AND table_name = 'alias_probe'
+	`).Scan(&probes); err != nil {
+		t.Fatalf("probe query: %v", err)
+	}
+	if probes != 1 {
+		t.Fatalf("alias_probe rows in the ducklake catalog = %d, want 1 — execution must stay physical", probes)
+	}
+}

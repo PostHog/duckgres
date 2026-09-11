@@ -104,8 +104,15 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 // `catalog.schema` target. This is NOT logical-name masking — the catalog name
 // is real; the rewrite only works around DuckDB's bare-catalog `USE`
 // resolution (a bare `USE ducklake` issued while the session is in another
-// catalog resolves `ducklake` as a *schema* within that catalog). Any other
-// `USE <name>` and all other statements are passed through unchanged.
+// catalog resolves `ducklake` as a *schema* within that catalog).
+//
+// A session connected under its org's logical catalog alias (c.database, the
+// org's Trino catalog name) may name the catalog either way: the alias is the
+// only catalog name such a client ever sees, so `USE <alias>` has to land where
+// `USE ducklake` does. That alias was validated against the session's own org
+// at connect time, so it can only ever name this session's own catalog.
+//
+// Any other `USE <name>` and all other statements are passed through unchanged.
 func (c *clientConn) rewriteDirectQuery(query string) string {
 	if c == nil || c.server == nil || c.passthrough || !c.catalogUseRewrite {
 		return query
@@ -133,7 +140,7 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		unquoted = strings.ReplaceAll(target[1:len(target)-1], `""`, `"`)
 	}
 
-	if !strings.EqualFold(unquoted, physicalDuckLakeCatalog) {
+	if !strings.EqualFold(unquoted, physicalDuckLakeCatalog) && !c.namesDuckLakeCatalog(unquoted) {
 		return query
 	}
 	// `USE ducklake` -> ducklake.main (DuckLake's real schema is `main`).
@@ -144,6 +151,19 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 		rewritten += ";"
 	}
 	return rewritten
+}
+
+// namesDuckLakeCatalog reports whether name is this session's logical alias for
+// the physical DuckLake catalog. True only when the session actually executes
+// against DuckLake and its PG-visible database name differs from the physical
+// one — i.e. the control plane accepted an org catalog name at connect. Every
+// other session (standalone, plain "ducklake", memory) has no alias, so this is
+// false and nothing new is rewritten.
+func (c *clientConn) namesDuckLakeCatalog(name string) bool {
+	return c.physicalCatalog == physicalDuckLakeCatalog &&
+		c.database != "" &&
+		!strings.EqualFold(c.database, physicalDuckLakeCatalog) &&
+		strings.EqualFold(c.database, name)
 }
 
 // physicalDuckLakeCatalog is the physical catalog name DuckLake is attached as.

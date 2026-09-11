@@ -103,3 +103,51 @@ func TestRewriteDirectQueryPreservesUseWithoutCatalogRewrite(t *testing.T) {
 		t.Fatalf("rewriteDirectQuery(USE ducklake) = %q, want %q", got, want)
 	}
 }
+
+// TestRewriteDirectQueryLogicalCatalogAlias covers a session connected under
+// its org's Trino catalog name: `USE <alias>` must reach the same physical
+// catalog as `USE ducklake`, so a client that sees one catalog name can switch
+// to it by that name. Any OTHER name still passes through untouched.
+func TestRewriteDirectQueryLogicalCatalogAlias(t *testing.T) {
+	c := &clientConn{
+		server:            &Server{},
+		database:          "org_acme_analytics",
+		physicalCatalog:   physicalDuckLakeCatalog,
+		catalogUseRewrite: true,
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{
+			name:  "rewrites the logical alias to two-part ducklake.main",
+			query: "USE org_acme_analytics",
+			want:  "USE ducklake.main",
+		},
+		{
+			name:  "rewrites the quoted logical alias",
+			query: `USE "org_acme_analytics";`,
+			want:  "USE ducklake.main;",
+		},
+		{
+			name:  "still rewrites the physical name",
+			query: "USE ducklake",
+			want:  "USE ducklake.main",
+		},
+		{
+			name:  "preserves another org's catalog name",
+			query: "USE org_billing_db",
+			want:  "USE org_billing_db",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := c.rewriteDirectQuery(tc.query); got != tc.want {
+				t.Fatalf("rewriteDirectQuery(%q) = %q, want %q", tc.query, got, tc.want)
+			}
+		})
+	}
+}
