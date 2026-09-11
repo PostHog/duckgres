@@ -65,6 +65,11 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 ## Trino API identity
 
+`DUCKGRES_TRINO_HOGLAKE_URI` defaults to empty (DuckLake catalog provisioning).
+The frozen perf deployments set it automatically to their namespace-local Hoglake
+service, replacing the Trino backend in the existing cached and uncached scenarios.
+See the [scenario runbook](docs/runbooks/scenario-runner.md).
+
 The existing Trino deployment appears as `legacy` in the Trino console API.
 This name does not change its stored org assignments or catalog-store key.
 `DUCKGRES_TRINO_CELL_ID` remains the ownership setting, with the existing default

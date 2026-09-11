@@ -13,7 +13,7 @@ func NewIntentMatcher() *IntentMatcher {
 
 func (m *IntentMatcher) SQLFor(query Query, protocol Protocol) (string, error) {
 	switch protocol {
-	case ProtocolPGWire, ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolTrinoHoglake:
+	case ProtocolPGWire, ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached:
 		if strings.TrimSpace(query.CanonicalSQL()) == "" {
 			return "", fmt.Errorf("query %s missing canonical SQL", query.QueryID)
 		}

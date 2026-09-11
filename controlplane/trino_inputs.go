@@ -5,6 +5,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -109,6 +110,9 @@ const (
 	// envTrinoFilesystemCacheEnabled enables caching for newly created catalogs.
 	// Empty defaults to false; Trino nodes also need a configured cache manager.
 	envTrinoFilesystemCacheEnabled = "DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED"
+
+	// envTrinoHoglakeURI selects Hoglake catalogs when set. Empty preserves DuckLake.
+	envTrinoHoglakeURI = "DUCKGRES_TRINO_HOGLAKE_URI"
 )
 
 // trinoProvisionerEnabled recognizes legacy or registry configuration.
@@ -273,6 +277,11 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 		return nil, err
 	}
 
+	hoglakeURI, err := trinoHoglakeURI()
+	if err != nil {
+		return nil, err
+	}
+
 	if ducklings == nil {
 		// Without it every catalog sits pending forever waiting on a
 		// duckling status that nothing resolves — a silent, permanent
@@ -316,6 +325,7 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 		AWSRegion:               strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
 		S3MaxConnections:        envInt(envTrinoS3MaxConnections),
 		FilesystemCacheEnabled:  filesystemCacheEnabled,
+		HoglakeURI:              hoglakeURI,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Trino provisioner: %w", err)
@@ -412,4 +422,16 @@ func trinoFilesystemCacheEnabled() (bool, error) {
 		return false, fmt.Errorf("%s must be a boolean", envTrinoFilesystemCacheEnabled)
 	}
 	return enabled, nil
+}
+
+func trinoHoglakeURI() (string, error) {
+	value := strings.TrimSpace(os.Getenv(envTrinoHoglakeURI))
+	if value == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", fmt.Errorf("%s must be an HTTP(S) URL without credentials, query, or fragment", envTrinoHoglakeURI)
+	}
+	return value, nil
 }

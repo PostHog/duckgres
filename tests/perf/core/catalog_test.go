@@ -26,7 +26,7 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 			}
 			wantTargets := []Protocol{ProtocolPGWire}
 			if filepath.Base(path) == "ducklake_posthog_tables.yaml" {
-				wantTargets = []Protocol{ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena, ProtocolTrinoHoglake}
+				wantTargets = []Protocol{ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena}
 			}
 			if !reflect.DeepEqual(catalog.Targets, wantTargets) {
 				t.Fatalf("catalog targets = %v, want %v", catalog.Targets, wantTargets)
@@ -48,34 +48,34 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCatalog: %v", err)
 	}
-	var existing []Query
-	for _, query := range catalog.Queries {
-		if query.StorageTarget != StorageTargetHoglakeTable {
-			existing = append(existing, query)
-		}
-	}
-	catalog.Queries = existing
 	want := []string{
 		"q_events_total_balanced_v4__raw_view",
 		"q_events_total_balanced_v4__ducklake_table",
+		"q_events_total_balanced_v4__hoglake_table",
 		"q_events_total_balanced_v4__athena_external",
 		"q_events_count_one_day_balanced_v4__raw_view",
 		"q_events_count_one_day_balanced_v4__ducklake_table",
+		"q_events_count_one_day_balanced_v4__hoglake_table",
 		"q_events_count_one_day_balanced_v4__athena_external",
 		"q_events_by_name_march_2026_balanced_v4__raw_view",
 		"q_events_by_name_march_2026_balanced_v4__ducklake_table",
+		"q_events_by_name_march_2026_balanced_v4__hoglake_table",
 		"q_events_by_name_march_2026_balanced_v4__athena_external",
 		"q_events_distinct_persons_balanced_v4__raw_view",
 		"q_events_distinct_persons_balanced_v4__ducklake_table",
+		"q_events_distinct_persons_balanced_v4__hoglake_table",
 		"q_events_distinct_persons_balanced_v4__athena_external",
 		"q_persons_total_balanced_v4__raw_view",
 		"q_persons_total_balanced_v4__ducklake_table",
+		"q_persons_total_balanced_v4__hoglake_table",
 		"q_persons_total_balanced_v4__athena_external",
 		"q_persons_daily_april_2026_balanced_v4__raw_view",
 		"q_persons_daily_april_2026_balanced_v4__ducklake_table",
+		"q_persons_daily_april_2026_balanced_v4__hoglake_table",
 		"q_persons_daily_april_2026_balanced_v4__athena_external",
 		"q_events_daily_march_2026_balanced_v4__raw_view",
 		"q_events_daily_march_2026_balanced_v4__ducklake_table",
+		"q_events_daily_march_2026_balanced_v4__hoglake_table",
 		"q_events_daily_march_2026_balanced_v4__athena_external",
 	}
 	if got := queryIDs(catalog); !reflect.DeepEqual(got, want) {
@@ -93,16 +93,20 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 		}
 	}
 	for index, query := range catalog.Queries {
-		wantTarget := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable, StorageTargetAthenaExternal}[index%3]
+		wantTarget := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable, StorageTargetHoglakeTable, StorageTargetAthenaExternal}[index%4]
 		if query.StorageTarget != wantTarget {
 			t.Fatalf("query %s storage target = %q, want %q", query.QueryID, query.StorageTarget, wantTarget)
 		}
-		if index%3 != 2 {
+		if index%4 != 3 {
 			continue
 		}
 
-		rawQuery := catalog.Queries[index-2]
-		duckLakeQuery := catalog.Queries[index-1]
+		rawQuery := catalog.Queries[index-3]
+		duckLakeQuery := catalog.Queries[index-2]
+		hoglakeQuery := catalog.Queries[index-1]
+		if hoglakeQuery.PGWireSQL != duckLakeQuery.PGWireSQL || hoglakeQuery.IntentID != duckLakeQuery.IntentID {
+			t.Fatalf("Hoglake query %s must use the shared SQL and intent", hoglakeQuery.QueryID)
+		}
 		if query.IntentID != rawQuery.IntentID || duckLakeQuery.IntentID != rawQuery.IntentID {
 			t.Fatalf("query variants have mismatched intents: %q/%q/%q", rawQuery.IntentID, duckLakeQuery.IntentID, query.IntentID)
 		}
@@ -138,10 +142,10 @@ paired_queries:
 	if err != nil {
 		t.Fatalf("ParseCatalog returned error: %v", err)
 	}
-	if got, want := queryIDs(catalog), []string{"q_events__raw_view", "q_events__ducklake_table", "q_events__athena_external"}; !reflect.DeepEqual(got, want) {
+	if got, want := queryIDs(catalog), []string{"q_events__raw_view", "q_events__ducklake_table", "q_events__hoglake_table", "q_events__athena_external"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected generated query order: got %v want %v", got, want)
 	}
-	athenaQuery := catalog.Queries[2]
+	athenaQuery := catalog.Queries[3]
 	if got, want := athenaQuery.StorageTarget, StorageTargetAthenaExternal; got != want {
 		t.Fatalf("Athena query target: got %q want %q", got, want)
 	}
@@ -483,6 +487,9 @@ relation_variants:
     events: frozen_v1.events_file_view
     persons: frozen_v1.persons_file_view
   ducklake_table:
+    events: posthog.events
+    persons: posthog.persons
+  hoglake_table:
     events: posthog.events
     persons: posthog.persons
   athena_external:

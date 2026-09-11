@@ -10,7 +10,6 @@ import (
 )
 
 type Scenario struct {
-	Standalone  bool     `yaml:"standalone" json:"standalone,omitempty"`
 	Name        string   `yaml:"name" json:"name"`
 	RunIDPrefix string   `yaml:"run_id_prefix" json:"run_id_prefix,omitempty"`
 	RequiredEnv []string `yaml:"required_env" json:"required_env,omitempty"`
@@ -32,7 +31,6 @@ type ExpectedError struct {
 }
 
 type rawScenario struct {
-	Standalone  bool      `yaml:"standalone"`
 	Name        string    `yaml:"name"`
 	RunIDPrefix string    `yaml:"run_id_prefix"`
 	RequiredEnv []string  `yaml:"required_env"`
@@ -68,7 +66,6 @@ func ParseScenario(raw []byte) (Scenario, error) {
 
 func normalizeScenario(raw rawScenario) (Scenario, error) {
 	scenario := Scenario{
-		Standalone:  raw.Standalone,
 		Name:        strings.TrimSpace(raw.Name),
 		RunIDPrefix: strings.TrimSpace(raw.RunIDPrefix),
 		RequiredEnv: make([]string, 0, len(raw.RequiredEnv)),

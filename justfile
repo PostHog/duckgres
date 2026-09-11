@@ -362,11 +362,6 @@ test-k8s-integration:
 test-perf:
     go test -v ./tests/perf/...
 
-# Test the Hoglake fixture importer (Python must have its requirements installed)
-[group('test')]
-test-hoglake-fixture python="python3":
-    {{python}} -m unittest discover -s tests/perf/datasets/hoglake
-
 # Run DuckLake-specific tests
 [group('test')]
 test-ducklake:

@@ -6,15 +6,19 @@ The scenario runner executes end-to-end managed-warehouse flows against a config
 
 The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. `fast-suite.yaml` follows the same flow without dbt. The standalone provisioning, frozen metadata, perf, and dbt scenarios remain available for focused debugging.
 
-The targeted frozen-perf scenario additionally creates production-shaped DuckLake
-tables, `posthog.events` and `posthog.persons`, from those raw views. It uses the
-PostHog backfill schema pinned at `056583335dc739b9e025efede811c9b4f5e153f5`,
-rewritten inserts, and `year(timestamp), month(timestamp), day(timestamp)` /
-`year(_timestamp), month(_timestamp)` partitioning. The raw views are deliberately
-retained as the later paired-query performance-control target.
+The existing frozen-perf scenarios compare Duckgres raw views and DuckLake tables,
+Trino Hoglake tables, and Athena external tables over the same immutable S3 files.
+`posthog_frozen_perf` runs `trino` with `fs.cache.enabled=false`;
+`posthog_frozen_perf_trino_cached` runs `trino_cached` with it set to `true`.
+The pinned Hoglake connector currently ignores that flag; enabling actual cache
+support is deferred. Both modes run the full seven-query corpus, with one warmup
+and four measured iterations.
 
-`project_id` is the one mapping exception: it is derived from `team_id`, exactly
-as the pinned production exporter does, so no `project_id` fixture column is needed.
+The scenario deployment creates a namespace-local Hoglake server and metadata
+PostgreSQL database. Setup registers the frozen `events` and `persons` Parquet
+files in the org's Hoglake catalog without copying or rewriting S3 data. Namespace
+teardown removes the server and metadata database. Duckgres continues to use
+DuckLake for its PGWire measurements.
 
 ## Required Environment
 
@@ -61,7 +65,7 @@ export DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI="s3://<results-bucket>/<prefix>/"
 ```
 
 The full and fast suites exercise PGWire only. The targeted frozen perf
-scenario compares PGWire, Trino, and on-demand Athena. It records per-query
+scenario compares PGWire on DuckLake, Trino on Hoglake, and on-demand Athena. It records per-query
 success and failure rows in `query_results.csv` and Athena service details in
 `query_service_metrics.csv`.
 Measured query errors fail the perf DAG step after its artifacts are written;
@@ -71,6 +75,14 @@ A `perf_queries` step can set `with.targets` to a non-empty subset of the
 catalog's targets. Optional `with.worker_cpu` and `with.worker_memory` values
 are sent as PGWire startup options. Both default to empty, which leaves worker
 selection to the server; set both for resource-controlled comparisons.
+
+For the two frozen-perf scenarios, `tests/mw-dev/run.sh` automatically supplies
+`DUCKGRES_TRINO_HOGLAKE_URI` to the control plane and
+`DUCKGRES_SCENARIO_HOGLAKE_URI` to the runner. No catalog configuration is supplied
+by the caller. Outside these deployments, the control-plane URI defaults to empty
+and catalog provisioning continues to use DuckLake. `HOGLAKE_IMAGE` can override
+the pinned server image. The scenario image includes Python, boto3, and pyarrow
+for reading Parquet footers from S3 during setup.
 
 Do not commit concrete dev endpoints, secrets, org IDs, or private bucket names.
 
@@ -114,9 +126,9 @@ just scenario-frozen-perf
 
 This runs, in order: raw-view setup, source-column preflight, explicit PostHog
 table DDL, registration of the frozen Parquet files in DuckLake, then partition
-and file-metadata validation. Registration reads Parquet footers but does not
+and file-metadata validation, followed by Hoglake registration for Trino. Registration reads Parquet footers but does not
 rewrite the fixture rows, so the raw-view and DuckLake-table queries use the
-same frozen S3 objects. Validation checks the declared schema and partition
+same frozen S3 objects as Hoglake. Validation checks the declared schema and partition
 metadata plus exact source/registered file-list equality. Neither `fast-suite`
 nor `full-suite` enables these tables yet.
 
@@ -205,10 +217,3 @@ transaction deletes both destination tables before inserting, so it cannot dupli
 rows after partial setup. Refresh the fixture only after confirming the pinned
 backfill mapping remains appropriate; change the pin and mappings together when
 upstream production schema changes.
-
-## Hoglake full-corpus comparison
-
-Use the standalone [Hoglake benchmark runbook](hoglake-perf.md) to run all shared
-paired query intents against an explicitly configured Hoglake Trino catalog,
-with untimed result validation against a DuckLake reference catalog. The target
-is `trino_hoglake`; unsupported queries remain recorded failures.

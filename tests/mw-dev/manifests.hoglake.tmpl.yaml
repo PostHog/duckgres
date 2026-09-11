@@ -1,0 +1,108 @@
+# Frozen-perf metadata only. Parquet stays in the shared, read-only S3 fixture.
+# Both deployments and the catalog PVC are removed with the scenario namespace.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: duckgres-hoglake-postgres
+  namespace: ${NAMESPACE}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-hoglake-postgres
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: duckgres-hoglake-postgres }
+  template:
+    metadata:
+      labels: { app: duckgres-hoglake-postgres }
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      containers:
+        - name: postgres
+          image: public.ecr.aws/docker/library/postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: hoglake }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: password } }
+            - { name: POSTGRES_DB, value: hoglake }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "hoglake"] }
+            periodSeconds: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: duckgres-hoglake-postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-hoglake-postgres
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: duckgres-hoglake-postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-hoglake
+  namespace: ${NAMESPACE}
+spec:
+  # run.sh admits the server only after its Pod Identity association exists.
+  replicas: 0
+  selector:
+    matchLabels: { app: duckgres-hoglake }
+  template:
+    metadata:
+      labels: { app: duckgres-hoglake }
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      serviceAccountName: trino
+      containers:
+        - name: hoglake
+          image: ${HOGLAKE_IMAGE}
+          env:
+            - { name: HOGLAKE_JDBC_URL, value: "jdbc:postgresql://duckgres-hoglake-postgres.${NAMESPACE}.svc:5432/hoglake" }
+            - { name: HOGLAKE_DB_USER, value: hoglake }
+            - name: HOGLAKE_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: duckgres-config-store-credentials, key: password } }
+            - { name: HOGLAKE_S3_REGION, value: "${AWS_REGION}" }
+            - { name: HOGLAKE_S3_PATH_STYLE, value: "false" }
+            - { name: HOGLAKE_COMPACTION_INTERVAL_MS, value: "0" }
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 2Gi }
+          startupProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-hoglake
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: duckgres-hoglake }
+  ports: [{ port: 8080, targetPort: 8080 }]

@@ -2,6 +2,7 @@ name: posthog-frozen-perf-trino-cached
 run_id_prefix: scenario-frozen-perf-trino-cached
 required_env:
   - DUCKGRES_SCENARIO_ORG_ID
+  - DUCKGRES_SCENARIO_HOGLAKE_URI
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_SCENARIO_TRINO_CA_CERT
   - DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
@@ -70,9 +71,18 @@ steps:
       max_attempts: 3
       retry_interval: 10s
 
+  - id: setup_hoglake
+    type: setup_hoglake
+    depends_on: [validate_posthog_tables]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
+      source: ${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}
+      file: ../perf/setup_hoglake.py
+
   - id: perf_queries
     type: perf_queries
-    depends_on: [validate_posthog_tables, wait_trino_ready]
+    depends_on: [setup_hoglake, wait_trino_ready]
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake

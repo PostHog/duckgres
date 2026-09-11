@@ -101,8 +101,8 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"EKS_CLUSTER_NAME: posthog-mw-dev",
 		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
 		"TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}",
-		"- name: Load Athena perf configuration",
-		"if: env.SCENARIO_NAME == 'posthog_frozen_perf'",
+		"- name: Load frozen perf identity and Athena configuration",
+		"if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_trino_cached'",
 		"bash scripts/scenario_athena_config.sh >> \"$GITHUB_ENV\"",
 		"TRINO_IMAGE: ghcr.io/posthog/trino:",
 		"E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}",
@@ -173,10 +173,10 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	}
 
 	authIndex := strings.Index(workflow, "- name: Configure AWS credentials (OIDC)")
-	configIndex := strings.Index(workflow, "- name: Load Athena perf configuration")
+	configIndex := strings.Index(workflow, "- name: Load frozen perf identity and Athena configuration")
 	deployIndex := strings.Index(workflow, "- name: Deploy isolated Duckgres stack")
 	if authIndex < 0 || configIndex < authIndex || deployIndex < configIndex {
-		t.Fatal("Athena config must load after AWS authentication and before deploying the stack")
+		t.Fatal("Frozen perf configuration must load after AWS authentication and before deploying the stack")
 	}
 
 	teardownIndex := strings.Index(workflow, "- name: Teardown")

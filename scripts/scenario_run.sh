@@ -7,7 +7,7 @@ Usage: scripts/scenario_run.sh [--check-env] [--scenario-file PATH] [--output-ba
 
 Runs a Duckgres scenario through the Go test entry point.
 
-Required environment (unless the scenario declares standalone: true):
+Required environment:
   DUCKGRES_SCENARIO_API_BASE
   DUCKGRES_SCENARIO_INTERNAL_SECRET
   DUCKGRES_SCENARIO_PG_HOST        (direct PGWire TCP host)
@@ -103,11 +103,6 @@ required=(
   DUCKGRES_SCENARIO_SNI_SUFFIX
 )
 if [ -f "$scenario_file" ]; then
-  # Standalone perf scenarios declare all their endpoint requirements themselves.
-  # The Go runner validates allowed steps before executing anything.
-  if awk '/^standalone:[[:space:]]*true[[:space:]]*(#.*)?$/ { found = 1 } END { exit !found }' "$scenario_file"; then
-    required=()
-  fi
   while IFS= read -r name; do
     required+=("$name")
   done < <(scenario_required_env "$scenario_file")
