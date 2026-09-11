@@ -159,6 +159,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # The fixture checks password-file availability without reading its contents.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["get", "create"]
   # The Trino lane deletes coordinator/worker pods and uses rollout status to
   # prove their owning Deployments restore readiness. rollout status lists
   # before watching, so keep this read-only and namespace-scoped; every

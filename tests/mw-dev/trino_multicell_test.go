@@ -149,6 +149,7 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 	secrets := []map[string]any{}
 	publicManifests := []map[string]any{}
 	workerPermissions := map[string]bool{}
+	primaryWorkerExec := false
 	for {
 		var manifest map[string]any
 		if err := decoder.Decode(&manifest); err == io.EOF {
@@ -169,6 +170,25 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 		}
 		if manifest["kind"] == "Deployment" {
 			deployments[manifestName(manifest)] = manifest
+		}
+		if manifest["kind"] == "Role" && manifestName(manifest) == "duckgres-control-plane" {
+			if manifest["metadata"].(map[string]any)["namespace"] != "duckgres-ci-pr-123" {
+				t.Fatal("legacy worker inspection must remain in the isolated primary namespace")
+			}
+			for _, rawRule := range manifest["rules"].([]any) {
+				rule := rawRule.(map[string]any)
+				resources, err := json.Marshal(rule["resources"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(resources) == `["pods/exec"]` {
+					verbs, err := json.Marshal(rule["verbs"])
+					if err != nil || string(verbs) != `["get","create"]` {
+						t.Fatal("legacy worker exec must use only get/create")
+					}
+					primaryWorkerExec = true
+				}
+			}
 		}
 		if manifest["kind"] == "Role" && manifestName(manifest) == "trino-cell-projection" {
 			if manifest["metadata"].(map[string]any)["namespace"] != "duckgres-ci-pr-0123" {
@@ -203,6 +223,9 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 	}
 	if !workerPermissions["pods"] || !workerPermissions["pods/exec"] {
 		t.Fatal("missing isolated worker mount inspection permissions")
+	}
+	if !primaryWorkerExec {
+		t.Fatal("missing isolated legacy worker inspection permission")
 	}
 	passwordBytes, err := os.ReadFile(filepath.Join(secretDir, "duckgres-ci-config-store-password"))
 	if err != nil {

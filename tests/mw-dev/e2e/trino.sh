@@ -44,6 +44,74 @@ chmod +x "$KUBECTL"
 
 api() { curl --connect-timeout 5 --max-time 60 -fsS -H "$H" "$@"; }
 
+wait_worker_tenant_file() {
+  worker_color="$1"
+  worker_org="$2"
+  case "$PR" in ''|*[!0-9]*|0*) fail "invalid fixture identity" ;; esac
+  case "$worker_color" in
+    legacy)
+      [ "$NS" = "duckgres-ci-pr-$PR" ] || fail "worker mount check escaped fixture identity"
+      case "$worker_org" in
+        "ci-pr-$PR-trinoa"|"ci-pr-$PR-trinob") ;;
+        *) fail "worker mount check crossed tenant boundary" ;;
+      esac
+      worker_namespace="$NS"
+      worker_app=duckgres-trino
+      ;;
+    blue|green)
+      [ "${CELL_NS:-}" = "duckgres-ci-pr-0$PR" ] && [ "$worker_org" = "ci-pr-$PR-trinoc" ] \
+        || fail "worker mount check escaped fixture identity"
+      worker_namespace="$CELL_NS"
+      worker_app="duckgres-trino-$worker_color"
+      ;;
+    *) fail "invalid worker color" ;;
+  esac
+  attempt=0
+  last_worker_stage=""
+  while [ "$attempt" -lt 36 ]; do
+    worker_stage=deployment-readiness
+    worker_code=0
+    deployment="$(timeout 5 "$KUBECTL" -n "$worker_namespace" get deployment "$worker_app-worker" -o json 2>/dev/null)" \
+      || { worker_code=$?; worker_stage=deployment-read; }
+    replicas="$(printf %s "$deployment" | jq -er 'select(.metadata.generation == .status.observedGeneration and .spec.replicas > 0 and .status.readyReplicas == .spec.replicas and .status.updatedReplicas == .spec.replicas) | .spec.replicas' 2>/dev/null || true)"
+    if [ "$worker_code" = 0 ] && [ -n "$replicas" ]; then
+      worker_stage=pod-readiness
+      snapshot="$(timeout 5 "$KUBECTL" -n "$worker_namespace" get pods -l "app=$worker_app,component=worker" -o json 2>/dev/null)" \
+        || { worker_code=$?; worker_stage=pod-read; }
+      workers="$(printf %s "$snapshot" | jq -er --arg app "$worker_app" --argjson replicas "$replicas" \
+        'select($replicas > 0 and (.items | length) == $replicas and all(.items[]; .metadata.deletionTimestamp == null and .metadata.labels.app == $app and .metadata.labels.component == "worker" and (.metadata.name | startswith($app + "-worker-")) and .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True"))) | .items[].metadata.name' 2>/dev/null || true)"
+      if [ "$worker_code" = 0 ] && [ -n "$workers" ]; then
+        mounted=1
+        worker_stage=worker-file
+        for worker in $workers; do
+          if worker_result="$(timeout 5 "$KUBECTL" -n "$worker_namespace" exec "$worker" -c trino-worker \
+            -- test -r "/etc/trino/tenant-secrets/$worker_org" 2>&1)"; then
+            :
+          else
+            worker_code=$?
+            mounted=0
+            case "$worker_result" in
+              *'command terminated with exit code 1'*) worker_stage=worker-file ;;
+              *Forbidden*|*forbidden*) worker_stage=worker-exec-permission ;;
+              *'deadline exceeded'*|*'timed out'*) worker_stage=worker-exec-timeout ;;
+              *'executable file not found'*) worker_stage=worker-exec-program ;;
+              *) worker_stage=worker-exec ;;
+            esac
+          fi
+        done
+        [ "$mounted" = 1 ] && return 0
+      fi
+    fi
+    if [ "$last_worker_stage" != "$worker_stage:$worker_code" ]; then
+      log "Worker mount readiness: $worker_stage (exit $worker_code)"
+      last_worker_stage="$worker_stage:$worker_code"
+    fi
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+  fail "worker tenant password file did not converge in the isolated cell"
+}
+
 # A fresh managed warehouse has an empty metadata database. DuckLake's Trino
 # connector consumes an existing DuckLake catalog; it does not create the
 # metadata tables itself. Initialize them once through Duckgres's normal
@@ -142,6 +210,7 @@ pw_a="$(provision "$ORG_A" "$DB_A" "$TEAM_A" | jq -r .password)"
 wait_warehouse "$ORG_A"
 bootstrap_ducklake "$ORG_A" "$pw_a"
 wait_trino "$ORG_A" "$DB_A" "$CAT_A"
+wait_worker_tenant_file legacy "$ORG_A"
 
 log "TLS/password auth, discovery, and DDL/DML"
 [ "$(scalar "$DB_A" "$pw_a" 'SELECT 1')" = 1 ] || fail "Trino SELECT 1 failed"
@@ -189,6 +258,7 @@ pw_b="$(provision "$ORG_B" "$DB_B" "$TEAM_B" | jq -r .password)"
 wait_warehouse "$ORG_B"
 bootstrap_ducklake "$ORG_B" "$pw_b"
 wait_trino "$ORG_B" "$DB_B" "$CAT_B"
+wait_worker_tenant_file legacy "$ORG_B"
 [ "$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component=coordinator' -o jsonpath='{.items[0].metadata.uid}')" = "$coord_uid_before" ] \
   || fail "adding tenant B restarted the Trino coordinator"
 [ "$(scalar "$DB_B" "$pw_b" 'SELECT 1')" = 1 ] || fail "hot-added tenant cannot authenticate"
