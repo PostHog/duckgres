@@ -148,6 +148,7 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 	deployments := map[string]map[string]any{}
 	secrets := []map[string]any{}
 	publicManifests := []map[string]any{}
+	workerPermissions := map[string]bool{}
 	for {
 		var manifest map[string]any
 		if err := decoder.Decode(&manifest); err == io.EOF {
@@ -169,11 +170,39 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 		if manifest["kind"] == "Deployment" {
 			deployments[manifestName(manifest)] = manifest
 		}
+		if manifest["kind"] == "Role" && manifestName(manifest) == "trino-cell-projection" {
+			if manifest["metadata"].(map[string]any)["namespace"] != "duckgres-ci-pr-0123" {
+				t.Fatal("worker inspection permissions must remain in the isolated secondary namespace")
+			}
+			for _, rawRule := range manifest["rules"].([]any) {
+				rule := rawRule.(map[string]any)
+				for _, resource := range rule["resources"].([]any) {
+					if resource != "pods" && resource != "pods/exec" {
+						continue
+					}
+					verbs, err := json.Marshal(rule["verbs"])
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := `["get","list"]`
+					if resource == "pods/exec" {
+						want = `["create","get"]`
+					}
+					if string(verbs) != want {
+						t.Fatalf("unexpected worker inspection verbs: %s", verbs)
+					}
+					workerPermissions[resource.(string)] = true
+				}
+			}
+		}
 		if manifest["kind"] == "Secret" {
 			secrets = append(secrets, manifest)
 		} else {
 			publicManifests = append(publicManifests, manifest)
 		}
+	}
+	if !workerPermissions["pods"] || !workerPermissions["pods/exec"] {
+		t.Fatal("missing isolated worker mount inspection permissions")
 	}
 	passwordBytes, err := os.ReadFile(filepath.Join(secretDir, "duckgres-ci-config-store-password"))
 	if err != nil {

@@ -107,6 +107,11 @@ or live observer polls. A stopped green does not make blue's tenants unhealthy.
 When green starts, update the registry and restart the control plane. Every
 running backend must reconcile successfully before a tenant is reported ready;
 one successful coordinator cannot conceal another's missing catalog or failure.
+This state confirms control-plane and coordinator catalog reconciliation, not
+tenant-password volume convergence on every worker. A worker can briefly lack
+a newly added tenant's password file even after the coordinator reports ready.
+Initial testing must check worker file availability before the first write;
+do not blindly retry writes when their commit outcome is unknown.
 The console observes the configured routing-active backend. Usage collection
 polls each running backend independently under the existing leader lease.
 

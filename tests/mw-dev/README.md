@@ -542,6 +542,14 @@ queries the same data through green's independently hydrated catalog. Direct
 coordinator URLs are fixture-only; this does not test Gateway routing or a
 maintenance move of an existing warehouse.
 
+Before the first write, the fixture checks the expected tenant password file
+is readable on every ready blue worker. It repeats that check for green before
+querying. These bounded checks use only `test -r`; they never read password
+contents or retry writes. The fixture's secondary namespace Role permits pod
+listing and exec for these checks under the existing CI grant. No production
+or cluster-wide RBAC changes are required. Control-plane `ready` alone does
+not prove every worker's projected Secret volume has converged.
+
 After these checks, the lane restarts its control plane in registry-only mode,
 verifies both registered backends still query the warehouse, rejects legacy
 ownership and implicit cell selection, and verifies the legacy bundle endpoint

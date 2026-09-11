@@ -23,6 +23,34 @@ wait_cell_registry() {
   fail "cell registry did not converge after control-plane restart"
 }
 
+wait_worker_tenant_file() {
+  worker_color="$1"
+  case "$worker_color" in blue|green) ;; *) fail "invalid worker color" ;; esac
+  case "$PR" in ''|*[!0-9]*|0*) fail "invalid fixture identity" ;; esac
+  [ "$CELL_NS" = "duckgres-ci-pr-0$PR" ] && [ "$ORG_C" = "ci-pr-$PR-trinoc" ] \
+    || fail "worker mount check escaped fixture identity"
+  worker_app="duckgres-trino-$worker_color"
+  attempt=0
+  while [ "$attempt" -lt 36 ]; do
+    deployment="$("$KUBECTL" --request-timeout=5s -n "$CELL_NS" get deployment "$worker_app-worker" -o json 2>/dev/null || true)"
+    replicas="$(printf %s "$deployment" | jq -er 'select(.metadata.generation == .status.observedGeneration and .spec.replicas > 0 and .status.readyReplicas == .spec.replicas and .status.updatedReplicas == .spec.replicas) | .spec.replicas' 2>/dev/null || true)"
+    snapshot="$("$KUBECTL" --request-timeout=5s -n "$CELL_NS" get pods -l "app=$worker_app,component=worker" -o json 2>/dev/null || true)"
+    workers="$(printf %s "$snapshot" | jq -er --arg app "$worker_app" --argjson replicas "${replicas:-0}" \
+      'select($replicas > 0 and (.items | length) == $replicas and all(.items[]; .metadata.deletionTimestamp == null and .metadata.labels.app == $app and .metadata.labels.component == "worker" and (.metadata.name | startswith($app + "-worker-")) and .status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True"))) | .items[].metadata.name' 2>/dev/null || true)"
+    if [ -n "$workers" ]; then
+      mounted=1
+      for worker in $workers; do
+        "$KUBECTL" --request-timeout=5s -n "$CELL_NS" exec "$worker" -c trino-worker \
+          -- test -r "/etc/trino/tenant-secrets/$ORG_C" >/dev/null 2>&1 || mounted=0
+      done
+      [ "$mounted" = 1 ] && return 0
+    fi
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+  fail "worker tenant password file did not converge in the isolated cell"
+}
+
 log "multicell initial placement with green stopped"
 api "$API/api/v1/trino/cells" | jq -e '.cells | map(.id) | sort == ["cell-test","legacy"]' >/dev/null \
   || fail "both cells must be registered"
@@ -82,6 +110,7 @@ code="$(curl --connect-timeout 5 --max-time 30 -sS -o /tmp/trino-cell-selection-
 
 TRINO="$BLUE_TRINO"
 wait_cell_auth
+wait_worker_tenant_file blue
 trino_query "$DB_C" "$pw_c" "CREATE SCHEMA $CAT_C.cell_test" >/dev/null
 trino_query "$DB_C" "$pw_c" "CREATE TABLE $CAT_C.cell_test.values_test (value BIGINT)" >/dev/null
 trino_query "$DB_C" "$pw_c" "INSERT INTO $CAT_C.cell_test.values_test VALUES (7),(11)" >/dev/null
@@ -129,6 +158,7 @@ done
 wait_cell_ready
 TRINO="$GREEN_TRINO"
 wait_cell_auth
+wait_worker_tenant_file green
 result="$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")"
 [ "$result" = '[[2,18]]' ] || fail "green failed to hydrate its independent catalog from the same DuckLake warehouse"
 must_fail "$DB_A" "$pw_a" 'SELECT 1' '401|Unauthorized|Authentication|credentials'
