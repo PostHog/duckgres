@@ -298,6 +298,25 @@ just docker   # Build image (tagged duckgres:dev)
 docker run --rm -p 5432:5432 -p 9090:9090 duckgres:dev
 ```
 
+The bundled `postgres_scanner` defaults to DuckDB 1.5.5 artifacts from
+`https://nightly-extensions.duckdb.org`, content-pinned to scanner revision
+`a3516c0` (verified 2026-09-11). `POSTGRES_SCANNER_REPOSITORY` and
+`POSTGRES_SCANNER_SHA256_AMD64` / `POSTGRES_SCANNER_SHA256_ARM64` are Docker build
+arguments; the SHA256 values cover the downloaded gzip files, before extraction.
+Run `just test-postgres-scanner-artifacts` (requires Python 3, curl, and network
+access) to check all five build configurations, download both architectures, and
+verify their checksums and extension metadata.
+
+If a nightly rebuild causes a checksum failure, independently inspect both new
+artifacts and their upstream source revision before changing pins. Update
+`Dockerfile`, `Dockerfile.worker`, `.github/workflows/container-image-worker-cd.yml`,
+`.github/workflows/e2e-mw-dev.yml`, and `.github/workflows/scenario-dev.yml`
+together, then rerun the verification recipe and image builds. Both Dockerfiles
+also test binary COPY with the bundled scanner. Never remove checksum verification.
+Upstream supports versioned uploads, but this revision's workflow does not enable
+them; the `postgres_scanner/a3516c0/v1.5.5/linux_{arch}/` paths returned HTTP 403
+when checked. The default nightly URLs can still change and fail closed.
+
 Mount a config file and persist data:
 
 ```bash
