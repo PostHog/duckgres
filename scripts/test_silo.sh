@@ -7,10 +7,6 @@
 set -euo pipefail
 
 container=${SILO_TEST_CONTAINER:-duckgres-test-minio}
-root_user=${SILO_TEST_ROOT_USER:-minioadmin}
-root_password=${SILO_TEST_ROOT_PASSWORD:-minioadmin}
-reader_user=${SILO_TEST_READER_USER:-trino-reader}
-reader_password=${SILO_TEST_READER_PASSWORD:-trino-reader}
 fixture="silo-contract-$(date +%s)-$$"
 config="/tmp/$fixture"
 object="ducklake/data/$fixture.txt"
@@ -44,7 +40,7 @@ expect_denied() {
     fi
 }
 
-mcli alias set root http://127.0.0.1:9000 "$root_user" "$root_password"
+mcli alias set root http://127.0.0.1:9000 minioadmin minioadmin
 mcli ready root
 # Require the initialized bucket; never make a missing initialization pass.
 mcli stat root/ducklake
@@ -63,7 +59,7 @@ mcli admin user remove root "$fixture"
 expect_denied mcli cat "writer/$object"
 
 # Exercise the exact reader configured for Trino, including the data/ boundary.
-mcli alias set reader http://127.0.0.1:9000 "$reader_user" "$reader_password"
+mcli alias set reader http://127.0.0.1:9000 trino-reader trino-reader
 test "$(mcli cat "reader/$object")" = "$payload"
 mcli ls "reader/ducklake/data/" >/dev/null
 expect_denied mcli cp "root/$object" "reader/$object"
