@@ -552,7 +552,7 @@ func SetupMultiTenant(
 				// that. So a nil here is a wiring bug.
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
 			}
-			provCtrl.WithTrinoProvisioner(trinoWire)
+			provCtrl.WithTrinoReconciler(trinoWire)
 			trinoCells = trinoWire
 			for _, wire := range trinoWire {
 				slog.Info("Trino provisioner enabled.", "cell", wire.Cell.consoleCell().ID, "coordinator", wire.Cell.CoordinatorURL)

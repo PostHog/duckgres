@@ -142,11 +142,18 @@ func (c *Controller) WithBucketSuffix(suffix string) *Controller {
 // batched output (a handful of Secrets + one ConfigMap + one OPA bundle for
 // the whole cell).
 //
-// Skipped entirely if p is nil so deployments without a Trino cell don't
-// need to know about it.
-func (c *Controller) WithTrinoProvisioner(p interface{ Reconcile(context.Context) error }) *Controller {
+// A nil provisioner is rejected before the controller starts.
+func (c *Controller) WithTrinoProvisioner(p *TrinoProvisioner) *Controller {
 	if p == nil {
 		panic("WithTrinoProvisioner: provisioner is nil; call NewTrinoProvisioner first")
+	}
+	return c.WithTrinoReconciler(p)
+}
+
+// WithTrinoReconciler installs the configured fleet's reconciliation entry point.
+func (c *Controller) WithTrinoReconciler(p interface{ Reconcile(context.Context) error }) *Controller {
+	if p == nil {
+		panic("WithTrinoReconciler: reconciler is nil")
 	}
 	c.trinoProvisioner = p
 	return c
