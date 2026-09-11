@@ -403,11 +403,6 @@ bench-ducklake-full-matrix latencies="0ms,50ms,100ms":
 test-extensions:
     ./scripts/test_extensions.sh
 
-# Fetch and verify both Linux scanner artifacts and all build configuration pins
-[group('test')]
-test-postgres-scanner-artifacts:
-    python3 ./scripts/test_postgres_scanner_artifacts.py
-
 # Run rate limiting tests
 [group('test')]
 test-ratelimit:
