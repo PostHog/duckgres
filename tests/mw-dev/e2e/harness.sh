@@ -318,8 +318,15 @@ pg_try() { # org password dbname sql [user=root]
 # `USE` has to come through here, not through pg/pg_try.
 #
 # Same positive/abort contract and transient-retry set as _pg_exec.
-# TODO: the retry case list is now spelled three times (_pg_exec, pg_try, here);
-# fold them into one classifier next time this file is open for real work.
+#
+# project_reader_isolation predates this helper and does the same thing inline
+# with `psql -c <stmt> -c <stmt>` (also one message per statement, one session)
+# plus its own copy of the retry loop. Both forms are correct; those two are the
+# only places in this file that issue a `USE`.
+# TODO: the retry case list is now spelled four times (_pg_exec, pg_try,
+# project_reader_isolation, here). Fold them into one classifier, and move
+# project_reader_isolation onto this helper, next time this file is open for
+# real work.
 pg_script() { # org password dbname sql_script [user=root] -> prints output; rc 0 ok / 1 real error
   a=0 out=""
   while [ "$a" -lt 12 ]; do

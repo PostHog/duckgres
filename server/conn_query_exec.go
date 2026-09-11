@@ -165,6 +165,15 @@ func (c *clientConn) rewriteDirectQuery(query string) string {
 // BEFORE quote-stripping, so `""` passes it and unquotes to "". Without the
 // guard, a session whose database is unset matches its own empty name and
 // invalid SQL is silently rewritten into `USE ducklake.main`.
+//
+// TODO: a catalog-qualified `SET search_path = '<alias>.main'` is NOT rewritten
+// and fails on the worker, while the physical `'ducklake.main'` works. Neither
+// this function nor the transpiler's LogicalCatalogTransform sees it: the
+// catalog name sits inside a string literal, not a RangeVar, so the AST pass
+// has nothing to match on and this pass only inspects `USE`. Left alone
+// deliberately — SQLMesh selects a catalog with `USE <catalog>` as its own
+// statement (the path above), and uses search_path only in dbt code it marks
+// unsupported. Fix it here if a client ever needs the qualified form.
 func (c *clientConn) namesDuckLakeCatalog(name string) bool {
 	return c.physicalCatalog == physicalDuckLakeCatalog &&
 		c.database != "" &&
