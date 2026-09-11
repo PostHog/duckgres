@@ -47,6 +47,10 @@ func registerTrinoFleetAPI(r *gin.RouterGroup, api *TrinoAPI) {
 
 func (a *TrinoAPI) forCell(handle func(*TrinoAPI, *gin.Context)) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if _, explicit := c.GetQuery("cell"); !explicit && a.fleet["legacy"] == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "explicit Trino cell selection is required"})
+			return
+		}
 		id := c.DefaultQuery("cell", "legacy")
 		selected := a.fleet[id]
 		if selected == nil {
@@ -73,6 +77,14 @@ func (a *TrinoAPI) handleFleetOrg(c *gin.Context) {
 		return
 	}
 	selected := a.fleet["legacy"]
+	if selected == nil && (row == nil || row.TrinoCellID == "") {
+		response := gin.H{"cell": TrinoCell{}, "enabled": row != nil && row.Enabled, "assigned": false, "available": false}
+		if row != nil && row.Enabled {
+			response["status"] = TrinoOrgStatus{Org: c.Param("id"), Tier: row.Tier, State: string(configstore.ManagedWarehouseStatePending), StatusMessage: "No Trino cell is assigned. Disable Trino, select an initial cell, then enable it again."}
+		}
+		c.JSON(http.StatusOK, response)
+		return
+	}
 	if row != nil && row.TrinoCellID != "" {
 		selected = nil
 		for _, candidate := range a.fleet {

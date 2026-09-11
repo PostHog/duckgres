@@ -511,14 +511,13 @@ func SetupMultiTenant(
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		// Without the controller, the Trino reconcile loop cannot run.
-		// If the operator asked for Trino explicitly (URL set), that's a
+		// If the operator configured Trino, that's a
 		// fatal startup failure — same "Trino is binary" stance as the
 		// wiring-failure branch below. Without this check, the Trino
 		// branch would be silently skipped (it's nested in the else)
 		// and password/group/tenant/bundle projections would stop updating.
 		if trinoProvisionerEnabled() {
-			return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but provisioning controller unavailable: %w",
-				envTrinoCoordinatorURL, err)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner configured but provisioning controller unavailable: %w", err)
 		}
 		slog.Warn("Provisioning controller unavailable.", "error", err)
 	} else {
@@ -527,8 +526,8 @@ func SetupMultiTenant(
 		// it disabled (composition keeps deriving).
 		provCtrl.WithBucketSuffix(cfg.DucklingBucketSuffix)
 		// Trino cell provisioner branch. Enablement is signaled by setting
-		// DUCKGRES_TRINO_COORDINATOR_URL (no separate boolean gate — the
-		// URL is the intent). When enabled, wiring failure is fatal:
+		// a legacy coordinator URL or explicit registry configuration.
+		// When enabled, wiring failure is fatal:
 		// silently skipping would leave the cell's OPA sidecar serving the
 		// last-good bundle while password/group-file and tenant-password
 		// changes never propagate, which is worse than failing the rollout.
@@ -536,8 +535,7 @@ func SetupMultiTenant(
 		if trinoProvisionerEnabled() {
 			kc, tkErr := newTrinoKubeClient()
 			if tkErr != nil {
-				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled (%s set) but K8s client unavailable: %w",
-					envTrinoCoordinatorURL, tkErr)
+				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner configured but K8s client unavailable: %w", tkErr)
 			}
 			// Same Duckling CR read the worker activation path uses; nil
 			// when the Duckling client couldn't be built, which
@@ -752,7 +750,7 @@ func SetupMultiTenant(
 	if len(cfg.ManagedHostnameSuffixes) > 0 {
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
-	provisioning.RegisterAPIWithIngressSuffix(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix)
+	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store))
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

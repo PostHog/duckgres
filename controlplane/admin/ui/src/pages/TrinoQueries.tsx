@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { StatCard } from "@/components/StatCard";
 import { EmptyState, ErrorState, TableSkeleton } from "@/components/states";
 import { OrgRef } from "@/components/OrgRef";
+import { TrinoCellPicker } from "@/components/TrinoCellPicker";
 import { AdminGate } from "@/components/AdminOnly";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import {
@@ -149,6 +150,7 @@ export function TrinoQueries() {
         }
         actions={
           <div className="flex items-center gap-2">
+            <TrinoCellPicker />
             <Input
               className="h-8 w-56"
               placeholder="Filter by org or principal…"

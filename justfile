@@ -331,7 +331,7 @@ test-configstore-integration:
 # Run Kubernetes-only control plane package tests
 [group('test')]
 test-trino pattern="Trino":
-    go test -v -count=1 -tags kubernetes -run '{{pattern}}' ./controlplane ./controlplane/admin ./controlplane/provisioner
+    go test -v -count=1 -tags kubernetes -run '{{pattern}}' ./controlplane ./controlplane/admin ./controlplane/provisioner ./controlplane/provisioning
 
 [group('test')]
 test-controlplane-k8s:

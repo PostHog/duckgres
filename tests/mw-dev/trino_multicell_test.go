@@ -38,6 +38,24 @@ func TestTrinoMulticellFixtureKeepsIndependentBackendState(t *testing.T) {
 	}
 }
 
+func TestTrinoRegistryOnlyHarnessFollowsLegacyCompatibility(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino-multicell.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	phase := strings.Index(text, `log "registry-only startup without legacy"`)
+	compat := strings.Index(text, `legacy failed during green hydration`)
+	if phase < compat || compat < 0 {
+		t.Fatal("registry-only phase must follow legacy and green validation")
+	}
+	for _, want := range []string{`DUCKGRES_TRINO_REGISTRY_ONLY`, `DUCKGRES_TRINO_COORDINATOR_URL`, `"$code" = 409`, `"$code" = 404`, `registry-only registered query failed`, `restore legacy fixture configuration`, `registry-only initial selection required`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing registry-only E2E contract %q", want)
+		}
+	}
+}
+
 func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 	envsubst, err := exec.LookPath("envsubst")
 	if err != nil {

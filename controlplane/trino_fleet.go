@@ -12,12 +12,13 @@ import (
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
+	"github.com/posthog/duckgres/controlplane/provisioning"
 	"k8s.io/client-go/kubernetes"
 )
 
 type trinoFleet []*trinoWiring
 
-func buildTrinoFleetWiring(store *configstore.ConfigStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver) (trinoFleet, error) {
+func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver) (trinoFleet, error) {
 	if !trinoProvisionerEnabled() {
 		return nil, nil
 	}
@@ -34,6 +35,35 @@ func buildTrinoFleetWiring(store *configstore.ConfigStore, kc kubernetes.Interfa
 		fleet = append(fleet, wire)
 	}
 	return fleet, nil
+}
+
+// enablementCheck requires explicit placement when no legacy provisioner exists.
+func (f trinoFleet) enablementCheck(store interface {
+	GetManagedWarehouseTrino(string) (*configstore.ManagedWarehouseTrino, error)
+}) func(string) error {
+	if len(f) == 0 {
+		return nil
+	}
+	owners := make(map[string]bool, len(f))
+	for _, wire := range f {
+		if wire.Cell.PublicID == "" {
+			return nil
+		}
+		owners[wire.Cell.ID] = true
+	}
+	return func(orgID string) error {
+		row, err := store.GetManagedWarehouseTrino(orgID)
+		if err != nil {
+			return err
+		}
+		if row == nil || row.TrinoCellID == "" {
+			return provisioning.ErrTrinoCellSelectionRequired
+		}
+		if !owners[row.TrinoCellID] {
+			return provisioning.ErrTrinoCellNotConfigured
+		}
+		return nil
+	}
 }
 
 // Reconcile isolates cell failures and bounds each cell's external API work.

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -14,10 +16,96 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
+	"github.com/posthog/duckgres/controlplane/provisioning"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 )
+
+type registryOnlyOrgStore struct {
+	row *configstore.ManagedWarehouseTrino
+	err error
+}
+
+func (s registryOnlyOrgStore) GetManagedWarehouseTrino(string) (*configstore.ManagedWarehouseTrino, error) {
+	return s.row, s.err
+}
+
+func TestTrinoRegistryOnlyAdmissionUsesStoredOwnership(t *testing.T) {
+	fleet := trinoFleet{&trinoWiring{Cell: trinoCell{ID: "registered:cell-test", PublicID: "cell-test"}}}
+	for _, tc := range []struct {
+		owner string
+		want  error
+	}{
+		{"", provisioning.ErrTrinoCellSelectionRequired}, {"cell-001", provisioning.ErrTrinoCellNotConfigured},
+		{"legacy", provisioning.ErrTrinoCellNotConfigured}, {"registered:unknown", provisioning.ErrTrinoCellNotConfigured}, {"registered:cell-test", nil},
+	} {
+		store := registryOnlyOrgStore{row: &configstore.ManagedWarehouseTrino{TrinoCellID: tc.owner}}
+		if err := fleet.enablementCheck(store)("tenant"); !errors.Is(err, tc.want) {
+			t.Fatalf("owner %q: %v", tc.owner, err)
+		}
+	}
+	if err := fleet.enablementCheck(registryOnlyOrgStore{})("tenant"); !errors.Is(err, provisioning.ErrTrinoCellSelectionRequired) {
+		t.Fatal("missing row admitted")
+	}
+	dbErr := errors.New("database unavailable")
+	if err := fleet.enablementCheck(registryOnlyOrgStore{err: dbErr})("tenant"); !errors.Is(err, dbErr) {
+		t.Fatal("read failure admitted")
+	}
+	fleet = append(fleet, &trinoWiring{Cell: trinoCell{ID: "cell-001"}})
+	if fleet.enablementCheck(registryOnlyOrgStore{}) != nil || (trinoFleet(nil)).enablementCheck(registryOnlyOrgStore{}) != nil {
+		t.Fatal("legacy or disabled behavior changed")
+	}
+}
+
+func TestTrinoRegistryOnlyBootstrapHasNoLegacyDependency(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cells.json")
+	if err := os.WriteFile(path, []byte(testTrinoRegistryJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envTrinoCellsFile, path)
+	t.Setenv(envTrinoCoordinatorURL, "")
+	t.Setenv(envTrinoRegistryOnly, "true")
+	t.Setenv(envTrinoNamespace, "unused-legacy")
+	t.Setenv(envTrinoFilesystemCacheEnabled, "false")
+	store := &fleetBootstrapStore{initialized: map[string]bool{}}
+	kc := kubefake.NewClientset()
+	for _, name := range []string{"blue-internal", "green-internal"} {
+		_, err := kc.CoreV1().Secrets("trino-test").Create(context.Background(), &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name}, Data: map[string][]byte{"shared-secret": []byte("fixture-" + name)}}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	fleet, err := buildTrinoFleetWiring(store, kc, func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fleet) != 1 || len(store.initialized) != 1 || !store.initialized["trino-test"] {
+		t.Fatal("legacy was bootstrapped")
+	}
+	for _, action := range kc.Actions() {
+		if action.GetNamespace() != "trino-test" {
+			t.Fatalf("unexpected namespace request %s", action.GetNamespace())
+		}
+	}
+	engine := gin.New()
+	wire := fleet[0]
+	wire.BundleStore.Set(opa.NewBundle([]byte("registered")))
+	engine.Any(wire.bundlePath(), gin.WrapH(wire.BundleHandler))
+	secret, err := kc.CoreV1().Secrets("trino-test").Get(context.Background(), provisioner.TrinoOPABundleTokenSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]int{"/bundles/trino": http.StatusNotFound, "/bundles/trino/cell-test": http.StatusOK} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+string(secret.Data["token"]))
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("bundle %s: %d", path, rec.Code)
+		}
+	}
+}
 
 type fleetCatalog struct {
 	called chan struct{}

@@ -921,7 +921,7 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   Every read is cached + timeout-bounded and degrades to `available:false`
   plus a reason rather than erroring the page: the console must render
   during exactly the incident it exists for. Unset
-  `DUCKGRES_TRINO_COORDINATOR_URL` leaves the routes unregistered.
+  legacy URL and registry configuration leaves the routes unregistered.
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
   `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`,
   `trino_test.go`, `trino_client_test.go`),
@@ -1553,7 +1553,10 @@ projects it every controller tick from `duckgres_managed_warehouse_trino` +
 the org's warehouse row + its Duckling CR. Enablement is env-inferred —
 `DUCKGRES_TRINO_COORDINATOR_URL` identifies legacy (`controlplane/trino_inputs.go`).
 The optional `DUCKGRES_TRINO_CELLS_FILE` adds namespace-isolated logical cells
-with blue/green backends; it still requires legacy configuration. With neither
+with blue/green backends. It requires legacy unless
+`DUCKGRES_TRINO_REGISTRY_ONLY=true` explicitly selects a registry-only deployment.
+That mode requires a valid registry and forbids a legacy coordinator URL.
+It never claims unassigned warehouses or reinterprets legacy ownership. With neither
 setting, the branch never wires and nothing changes. **Trino is binary: if
 you asked for it, a wiring failure is fatal at startup**, because silently
 skipping leaves the cell's OPA sidecar serving a last-good bundle while

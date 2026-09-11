@@ -19,20 +19,41 @@ import (
 )
 
 const envTrinoCellsFile = "DUCKGRES_TRINO_CELLS_FILE"
+const envTrinoRegistryOnly = "DUCKGRES_TRINO_REGISTRY_ONLY"
 
 const registeredTrinoCellPrefix = "registered:"
 
-// resolveTrinoCells extends the legacy configuration without changing its ownership.
+// resolveTrinoCells preserves legacy unless registry-only mode explicitly excludes it.
 func resolveTrinoCells() ([]trinoCell, error) {
-	legacy, err := resolveTrinoCell()
-	if err != nil {
-		return nil, err
+	registryOnly := false
+	if value := strings.TrimSpace(os.Getenv(envTrinoRegistryOnly)); value != "" {
+		var err error
+		registryOnly, err = strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s must be a boolean", envTrinoRegistryOnly)
+		}
 	}
-	if strings.HasPrefix(legacy.ID, registeredTrinoCellPrefix) {
-		return nil, errors.New("legacy Trino cell ID uses the reserved registered prefix")
-	}
-	cells := []trinoCell{legacy}
 	path := strings.TrimSpace(os.Getenv(envTrinoCellsFile))
+	var legacy trinoCell
+	var cells []trinoCell
+	if registryOnly {
+		if path == "" {
+			return nil, fmt.Errorf("%s requires %s", envTrinoRegistryOnly, envTrinoCellsFile)
+		}
+		if strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" {
+			return nil, fmt.Errorf("%s cannot be combined with %s", envTrinoRegistryOnly, envTrinoCoordinatorURL)
+		}
+	} else {
+		var err error
+		legacy, err = resolveTrinoCell()
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(legacy.ID, registeredTrinoCellPrefix) {
+			return nil, errors.New("legacy Trino cell ID uses the reserved registered prefix")
+		}
+		cells = append(cells, legacy)
+	}
 	if path == "" {
 		return cells, nil
 	}
@@ -48,18 +69,21 @@ func resolveTrinoCells() ([]trinoCell, error) {
 	if legacyNS == "" {
 		legacyNS = provisioner.TrinoCustomerNamespace
 	}
-	legacyEndpoint, err := trinoEndpointKey(legacy.CoordinatorURL)
-	if err != nil {
-		return nil, fmt.Errorf("legacy coordinator URL: %w", err)
+	var legacyEndpoint string
+	if !registryOnly {
+		legacyEndpoint, err = trinoEndpointKey(legacy.CoordinatorURL)
+		if err != nil {
+			return nil, fmt.Errorf("legacy coordinator URL: %w", err)
+		}
 	}
 	for _, entry := range registered {
-		if entry.Namespace == legacyNS {
+		if !registryOnly && entry.Namespace == legacyNS {
 			return nil, errors.New("registered cell must not share the legacy namespace")
 		}
 		cell := trinoCell{ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends}
 		for _, backend := range entry.Backends {
 			endpoint, _ := trinoEndpointKey(backend.CoordinatorURL)
-			if endpoint == legacyEndpoint {
+			if !registryOnly && endpoint == legacyEndpoint {
 				return nil, errors.New("registered cell must not share a legacy coordinator")
 			}
 			if backend.RoutingActive {
