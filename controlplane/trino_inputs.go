@@ -59,8 +59,7 @@ const (
 	// this to a non-empty value enables the Trino provisioner branch;
 	// leaving it empty disables it. Required configuration when enabled.
 	//
-	// One cell today, so one URL. See resolveTrinoCell for the shape a
-	// second cell takes.
+	// This URL continues to identify the legacy cell when a registry is mounted.
 	envTrinoCoordinatorURL = "DUCKGRES_TRINO_COORDINATOR_URL"
 
 	// envTrinoCoordinatorServerName is the TLS server name (the coordinator
@@ -114,44 +113,33 @@ const (
 	envTrinoFilesystemCacheEnabled = "DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED"
 )
 
-// trinoProvisionerEnabled reports whether the control plane should
-// wire the Trino provisioner branch. True iff
-// DUCKGRES_TRINO_COORDINATOR_URL is non-empty; the URL doubles as the
-// enable signal because operators can't meaningfully use the
-// provisioner without it (there'd be nothing to talk to).
+// trinoProvisionerEnabled recognizes legacy or registry configuration.
+// A registry still requires the legacy URL to preserve existing ownership.
 func trinoProvisionerEnabled() bool {
-	return strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != ""
+	return strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" || strings.TrimSpace(os.Getenv(envTrinoCellsFile)) != ""
 }
 
-// trinoCell is one Trino cell: an id plus the coordinator that serves it.
-// A cell is the unit a shared Trino deployment scales in — one coordinator
-// and worker fleet, one OPA sidecar, one set of projected Secrets, and the
-// orgs stamped with its id.
-//
-// There is exactly ONE cell today, described by the two env vars below.
-// The shape a second cell takes is deliberate and small: resolveTrinoCell
-// becomes resolveTrinoCells returning a map[cellID]trinoCell (parsed from a
-// JSON env var or a mounted config), SetupMultiTenant builds one
-// TrinoProvisioner per entry, and each provisioner keeps reconciling only
-// the orgs its own claim/skip filter admits. Nothing else in the reconcile
-// path has to change — which is the entire reason the cell id is on the row
-// rather than implied by the deployment.
-//
-// What is explicitly NOT here and NOT planned in this change: assignment
-// policy (which cell should a new org land on?), capacity accounting,
-// rebalancing, or draining a cell. An org lands on whichever cell claims it
-// first, and today only one does.
+// trinoCell separates durable ownership from the operator-visible identity.
+// Registered cells share projections across their independently scheduled backends.
+// Only the legacy cell claims unassigned tenants.
 type trinoCell struct {
 	ID             string
+	PublicID       string
+	Namespace      string
+	Backends       []trinoRegisteredBackend
 	CoordinatorURL string
 	TLSServerName  string
 	ClientURL      string
 }
 
-// consoleCell names the existing deployment without changing its persisted ownership.
+// consoleCell preserves legacy ownership and exposes each logical identity.
 func (c trinoCell) consoleCell() admin.TrinoCell {
+	id := c.PublicID
+	if id == "" {
+		id = "legacy"
+	}
 	return admin.TrinoCell{
-		ID:             "legacy",
+		ID:             id,
 		StoredID:       c.ID,
 		CoordinatorURL: c.CoordinatorURL,
 		TLSServerName:  c.TLSServerName,
@@ -173,6 +161,7 @@ func resolveTrinoCell() (trinoCell, error) {
 	}
 	return trinoCell{
 		ID:             cellID,
+		Namespace:      strings.TrimSpace(os.Getenv(envTrinoNamespace)),
 		CoordinatorURL: coordinatorURL,
 		TLSServerName:  strings.TrimSpace(os.Getenv(envTrinoCoordinatorServerName)),
 		ClientURL:      strings.TrimSpace(os.Getenv(envTrinoClientURL)),
@@ -199,7 +188,8 @@ type trinoWiring struct {
 	// here rather than in multitenant.go so the observer credential is read
 	// through the provisioner that owns it and nothing else has to know how
 	// the coordinator is authenticated.
-	Console *trinoConsoleWiring
+	Console   *trinoConsoleWiring
+	Observers []admin.TrinoCoordinatorClient
 }
 
 // trinoConsoleWiring is the admin console's half of the Trino branch: the
@@ -267,6 +257,16 @@ func buildTrinoWiring(
 	if err != nil {
 		return nil, err
 	}
+	return buildTrinoCellWiring(store, kc, ducklings, cell)
+}
+
+type trinoWiringStore interface {
+	provisioner.TrinoStore
+	provisioner.TrinoBootstrapSentinelStore
+	provisioner.TrinoWarehouseStore
+}
+
+func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver, cell trinoCell) (*trinoWiring, error) {
 
 	filesystemCacheEnabled, err := trinoFilesystemCacheEnabled()
 	if err != nil {
@@ -287,24 +287,35 @@ func buildTrinoWiring(
 	// is https but dials the in-cluster Service address (see
 	// envTrinoCoordinatorServerName).
 	catalogClient := provisioner.NewTrinoCatalogHTTPClient(cell.CoordinatorURL, opa.AdminPrincipal, "", cell.TLSServerName)
+	var additional []provisioner.TrinoCatalogClient
+	var internalSecrets []string
+	for _, backend := range cell.Backends {
+		internalSecrets = append(internalSecrets, backend.InternalSecretName)
+		if backend.Running && !backend.RoutingActive {
+			additional = append(additional, provisioner.NewTrinoCatalogHTTPClient(backend.CoordinatorURL, opa.AdminPrincipal, "", backend.TLSServerName))
+		}
+	}
 
 	bundleStore := &opa.BundleStore{}
 
 	trinoProv, err := provisioner.NewTrinoProvisioner(provisioner.TrinoProvisionerOpts{
-		Store:                  store,
-		BootstrapSentinel:      store,
-		Warehouses:             store,
-		Ducklings:              ducklings,
-		Kubernetes:             kc,
-		Namespace:              strings.TrimSpace(os.Getenv(envTrinoNamespace)),
-		CellID:                 cell.ID,
-		TenantSecretMountPath:  strings.TrimSpace(os.Getenv(envTrinoTenantSecretMountPath)),
-		Catalog:                catalogClient,
-		BundleStore:            bundleStore,
-		BundleBuilder:          opa.NewBuilder(),
-		AWSRegion:              strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
-		S3MaxConnections:       envInt(envTrinoS3MaxConnections),
-		FilesystemCacheEnabled: filesystemCacheEnabled,
+		Store:                   store,
+		BootstrapSentinel:       store,
+		Warehouses:              store,
+		Ducklings:               ducklings,
+		Kubernetes:              kc,
+		Namespace:               cell.Namespace,
+		CellID:                  cell.ID,
+		ExplicitAssignmentOnly:  cell.PublicID != "",
+		AdditionalCatalogs:      additional,
+		ExistingInternalSecrets: internalSecrets,
+		TenantSecretMountPath:   strings.TrimSpace(os.Getenv(envTrinoTenantSecretMountPath)),
+		Catalog:                 catalogClient,
+		BundleStore:             bundleStore,
+		BundleBuilder:           opa.NewBuilder(),
+		AWSRegion:               strings.TrimSpace(os.Getenv(envTrinoAWSRegion)),
+		S3MaxConnections:        envInt(envTrinoS3MaxConnections),
+		FilesystemCacheEnabled:  filesystemCacheEnabled,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Trino provisioner: %w", err)
@@ -326,20 +337,27 @@ func buildTrinoWiring(
 	// no post-construction swap, so no window where the endpoint serves
 	// with a token a real client could match by accident.
 	bundleHandler := opa.NewHandler(bundleStore, opa.BearerTokenAuth(bundleToken))
+	observer := admin.NewTrinoCoordinatorClient(cell.CoordinatorURL, cell.TLSServerName, trinoProv.ObserverCredential)
+	observers := []admin.TrinoCoordinatorClient{observer}
+	for _, backend := range cell.Backends {
+		if backend.Running && !backend.RoutingActive {
+			observers = append(observers, admin.NewTrinoCoordinatorClient(backend.CoordinatorURL, backend.TLSServerName, trinoProv.ObserverCredential))
+		}
+	}
 
 	return &trinoWiring{
 		Provisioner:   trinoProv,
 		BundleStore:   bundleStore,
 		BundleHandler: bundleHandler,
 		Cell:          cell,
+		Observers:     observers,
 		Console: &trinoConsoleWiring{
 			Cell: cell.consoleCell(),
 			// Read the credential through the provisioner on every call
 			// rather than capturing it here: the pair is regenerated if it
 			// ever goes missing, and a captured copy would 401 forever
 			// after that self-heal.
-			Observer: admin.NewTrinoCoordinatorClient(
-				cell.CoordinatorURL, cell.TLSServerName, trinoProv.ObserverCredential),
+			Observer: observer,
 		},
 	}, nil
 }

@@ -1,5 +1,8 @@
 # Duckgres
 
+Trino operators: see [cell registration and placement](docs/trino-cells.md) for
+the optional registry, unchanged legacy defaults, and migration limitations.
+
 <p align="center">
   <img src="media/oh_duck.png" alt="Duckgres Mascot" width="200">
 </p>

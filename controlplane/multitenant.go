@@ -21,7 +21,6 @@ import (
 	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
-	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"github.com/posthog/duckgres/controlplane/provisioning"
 	"github.com/posthog/duckgres/server"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -508,13 +507,7 @@ func SetupMultiTenant(
 	}
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
-	var trinoBundleHandler *opa.Handler
-	// trinoConsole carries what the admin console needs from the Trino
-	// branch (cell identity + an observer-credentialed coordinator client).
-	// Nil unless the branch wires, so a deployment without a cell simply
-	// has no /trino routes. Held rather than turned into a TrinoAPI here
-	// because that also needs the audit store, which is built later.
-	var trinoConsole *trinoConsoleWiring
+	var trinoCells trinoFleet
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		// Without the controller, the Trino reconcile loop cannot run.
@@ -549,7 +542,7 @@ func SetupMultiTenant(
 			// Same Duckling CR read the worker activation path uses; nil
 			// when the Duckling client couldn't be built, which
 			// buildTrinoWiring rejects rather than half-wiring.
-			trinoWire, twErr := buildTrinoWiring(store, kc, resolveDucklingStatus)
+			trinoWire, twErr := buildTrinoFleetWiring(store, kc, resolveDucklingStatus)
 			if twErr != nil {
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
 			}
@@ -559,10 +552,11 @@ func SetupMultiTenant(
 				// that. So a nil here is a wiring bug.
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
 			}
-			provCtrl.WithTrinoProvisioner(trinoWire.Provisioner)
-			trinoBundleHandler = trinoWire.BundleHandler
-			trinoConsole = trinoWire.Console
-			slog.Info("Trino provisioner enabled.", "cell", trinoWire.Cell.ID, "coordinator", trinoWire.Cell.CoordinatorURL)
+			provCtrl.WithTrinoProvisioner(trinoWire)
+			trinoCells = trinoWire
+			for _, wire := range trinoWire {
+				slog.Info("Trino provisioner enabled.", "cell", wire.Cell.consoleCell().ID, "coordinator", wire.Cell.CoordinatorURL)
+			}
 		}
 		// SIGTERM stops the reconcile loop immediately, rather than letting a
 		// replaced replica ride out the drain.
@@ -787,26 +781,25 @@ func SetupMultiTenant(
 		Audit:         auditStore,
 		Metrics:       metricsProxy,
 		ClusterClient: clusterClient,
-		Trino:         newTrinoAdminAPI(trinoConsole, store, auditStore),
+		Trino:         trinoCells.adminAPI(store, auditStore),
 	})
-	if janitorLeader != nil && trinoConsole != nil {
+	if janitorLeader != nil {
 		// The coordinator owns the authoritative runtime view of Trino query
 		// usage. Keep its collector under the existing leader lease so one CP
 		// emits each terminal query, independent of admin-console traffic.
-		janitorLeader.AttachLeaderLoop(newTrinoUsageCollector(
-			trinoConsole.Observer,
-			store,
-			store.OrgUsageTeamID,
-		).Run)
+		for _, wire := range trinoCells {
+			for _, observer := range wire.Observers {
+				janitorLeader.AttachLeaderLoop(newTrinoUsageCollector(observer, store, store.OrgUsageTeamID).Run)
+			}
+		}
 	}
 
 	// Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1 admin group on
 	// purpose — it does its own bearer-token auth (the bundle exposes the
 	// customer roster; a separate shared secret between provisioner and the
-	// OPA sidecar). When the Trino provisioner is disabled (the default),
-	// trinoBundleHandler is nil and the route isn't registered.
-	if trinoBundleHandler != nil {
-		engine.Any("/bundles/trino", gin.WrapH(trinoBundleHandler))
+	// OPA sidecar). The fleet is empty when provisioning is disabled.
+	for _, wire := range trinoCells {
+		engine.Any(wire.bundlePath(), gin.WrapH(wire.BundleHandler))
 	}
 
 	// Live Duckling drift finder. Reuse the in-cluster Duckling client built

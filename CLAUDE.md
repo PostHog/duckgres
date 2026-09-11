@@ -1551,8 +1551,10 @@ limits on a shared multi-tenant Trino cluster called a **cell**. The control
 plane is the only writer of that state: `provisioner/trino_provisioner.go`
 projects it every controller tick from `duckgres_managed_warehouse_trino` +
 the org's warehouse row + its Duckling CR. Enablement is env-inferred —
-`DUCKGRES_TRINO_COORDINATOR_URL` set means on (`controlplane/trino_inputs.go`);
-unset means the branch never wires and nothing changes. **Trino is binary: if
+`DUCKGRES_TRINO_COORDINATOR_URL` identifies legacy (`controlplane/trino_inputs.go`).
+The optional `DUCKGRES_TRINO_CELLS_FILE` adds namespace-isolated logical cells
+with blue/green backends; it still requires legacy configuration. With neither
+setting, the branch never wires and nothing changes. **Trino is binary: if
 you asked for it, a wiring failure is fatal at startup**, because silently
 skipping leaves the cell's OPA sidecar serving a last-good bundle while
 password/tenant/catalog changes never propagate.
@@ -1674,12 +1676,22 @@ password/tenant/catalog changes never propagate.
   breaks every reconcile tick's own DDL.
 - **Cells, minimally**: `trino_cell_id` on the row names the owning cell
   (`DUCKGRES_TRINO_CELL_ID`, default `configstore.DefaultTrinoCellID`). A
-  provisioner claims unassigned orgs (`AssignTrinoCell`, conditional in SQL so
+  provisioner claims unassigned orgs (`ClaimTrinoCell`, conditional in SQL so
   no cell can steal another's tenant), reconciles its own, and ignores the
-  rest — including writing NO state for them. There is exactly ONE cell today
-  and deliberately no assignment policy, capacity model, rebalancer or cell
-  drain; `resolveTrinoCell` becoming `resolveTrinoCells` is the whole shape of
-  adding a second.
+  rest — including writing NO state for them. Claims return an authoritative
+  boolean: a lost claim must never project the losing cell's tenant. Only
+  legacy claims unassigned warehouses. Registered logical IDs have the reserved
+  storage prefix `registered:`; the old stored `cell-001` remains legacy.
+  Admin-only initial selection runs before first enablement and refuses changes
+  to any already owned warehouse, including a disabled one. No maintenance move,
+  capacity model, rebalancer, drain, or Gateway routing controller is included.
+  See [docs/trino-cells.md](docs/trino-cells.md) for configuration and recovery.
+- **Blue/green projections share one logical cell's namespace**, but internal
+  communication Secrets remain distinct, chart-owned read-only references.
+  Stopped backends do not receive catalog calls or observer polling. Every
+  running backend must reconcile its independent catalog set before the org is
+  ready. Cell failures do not block sibling-cell projections. Configuration is
+  startup-loaded and must agree across control-plane replicas.
 - **The existing deployment's API identity is `legacy`.** The Trino console
   exposes this name in `cell.id` and in owned orgs' `status.cell` / `orgs[].cell`.
   `TrinoCell.StoredID` keeps the configured ownership ID private to the adapter.
@@ -1690,7 +1702,8 @@ password/tenant/catalog changes never propagate.
 - **The bundle endpoint is mounted OUTSIDE `/api/v1`** (`/bundles/trino`) with
   its own bearer auth, and `buildTrinoWiring` bootstraps SYNCHRONOUSLY so the
   handler is constructed with the real token — there is no window where it
-  serves under a placeholder.
+  serves under a placeholder. Registered cells use `/bundles/trino/<cell-id>`;
+  each cell's token can read only its own bundle. Legacy retains the old path.
 - Touching any of this → update `provisioner/trino_provisioner_test.go`,
   `provisioner/trino_cluster_secrets_test.go`, `provisioner/opa/*_test.go`,
   `provisioning/api_test.go`, `tests/configstore/trino_postgres_test.go` +

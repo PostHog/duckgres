@@ -295,6 +295,17 @@ type TrinoProvisionerOpts struct {
 	// Empty == configstore.DefaultTrinoCellID.
 	CellID string
 
+	// ExplicitAssignmentOnly prevents this cell from claiming unassigned tenants.
+	ExplicitAssignmentOnly bool
+
+	// AdditionalCatalogs contains other running backends in this logical cell.
+	// Stopped backends must not be included. All running backends gate readiness.
+	AdditionalCatalogs []TrinoCatalogClient
+
+	// ExistingInternalSecrets names chart-owned internal-communication secrets.
+	// When set, the provisioner validates these references without modifying them.
+	ExistingInternalSecrets []string
+
 	// TenantSecretMountPath is the in-pod path the chart mounts
 	// TrinoTenantSecretName at; each org's catalog points its
 	// connection-password-file at <TenantSecretMountPath>/<orgID>. Empty ==
@@ -367,9 +378,8 @@ type TrinoCatalogCredentialUpdater interface {
 type TrinoStore interface {
 	ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error)
 	UpdateTrinoState(orgID string, upd configstore.TrinoStateUpdate) error
-	// AssignTrinoCell claims an org with no cell into this provisioner's
-	// cell. Only ever writes rows whose cell is still unset.
-	AssignTrinoCell(orgID, cellID string) error
+	// ClaimTrinoCell returns true only when this call acquires ownership.
+	ClaimTrinoCell(orgID, cellID string) (bool, error)
 }
 
 // TrinoWarehouseStore reads a single org's warehouse row to populate the
@@ -402,20 +412,24 @@ type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingSta
 // fires on first install; thereafter ensureClusterSecrets adopts the
 // existing K8s Secrets.
 type TrinoProvisioner struct {
-	store                  TrinoStore
-	bootstrapSentinel      TrinoBootstrapSentinelStore
-	warehouses             TrinoWarehouseStore
-	ducklings              TrinoDucklingResolver
-	kubernetes             kubernetes.Interface
-	namespace              string
-	cellID                 string
-	catalog                TrinoCatalogClient
-	bundleStore            *opa.BundleStore
-	bundleBuilder          opa.BundleBuilder
-	tenantSecretMountPath  string
-	awsRegion              string
-	s3MaxConnections       int
-	filesystemCacheEnabled bool
+	store                   TrinoStore
+	bootstrapSentinel       TrinoBootstrapSentinelStore
+	warehouses              TrinoWarehouseStore
+	ducklings               TrinoDucklingResolver
+	kubernetes              kubernetes.Interface
+	namespace               string
+	cellID                  string
+	explicitAssignmentOnly  bool
+	catalog                 TrinoCatalogClient
+	additionalCatalogs      []TrinoCatalogClient
+	catalogTimeout          time.Duration
+	existingInternalSecrets []string
+	bundleStore             *opa.BundleStore
+	bundleBuilder           opa.BundleBuilder
+	tenantSecretMountPath   string
+	awsRegion               string
+	s3MaxConnections        int
+	filesystemCacheEnabled  bool
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -487,6 +501,11 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if opts.Catalog == nil {
 		return nil, errors.New("TrinoProvisioner: Catalog client is required")
 	}
+	for _, catalog := range opts.AdditionalCatalogs {
+		if catalog == nil {
+			return nil, errors.New("TrinoProvisioner: additional catalog client must not be nil")
+		}
+	}
 	if opts.BundleStore == nil {
 		return nil, errors.New("TrinoProvisioner: BundleStore is required")
 	}
@@ -510,20 +529,24 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		maxConns = defaultTrinoS3MaxConnections
 	}
 	return &TrinoProvisioner{
-		store:                  opts.Store,
-		bootstrapSentinel:      opts.BootstrapSentinel,
-		warehouses:             opts.Warehouses,
-		ducklings:              opts.Ducklings,
-		kubernetes:             opts.Kubernetes,
-		namespace:              ns,
-		cellID:                 cell,
-		catalog:                opts.Catalog,
-		bundleStore:            opts.BundleStore,
-		bundleBuilder:          opts.BundleBuilder,
-		tenantSecretMountPath:  strings.TrimRight(mountPath, "/"),
-		awsRegion:              opts.AWSRegion,
-		s3MaxConnections:       maxConns,
-		filesystemCacheEnabled: opts.FilesystemCacheEnabled,
+		store:                   opts.Store,
+		bootstrapSentinel:       opts.BootstrapSentinel,
+		warehouses:              opts.Warehouses,
+		ducklings:               opts.Ducklings,
+		kubernetes:              opts.Kubernetes,
+		namespace:               ns,
+		cellID:                  cell,
+		explicitAssignmentOnly:  opts.ExplicitAssignmentOnly,
+		catalog:                 opts.Catalog,
+		additionalCatalogs:      append([]TrinoCatalogClient(nil), opts.AdditionalCatalogs...),
+		catalogTimeout:          30 * time.Second,
+		existingInternalSecrets: append([]string(nil), opts.ExistingInternalSecrets...),
+		bundleStore:             opts.BundleStore,
+		bundleBuilder:           opts.BundleBuilder,
+		tenantSecretMountPath:   strings.TrimRight(mountPath, "/"),
+		awsRegion:               opts.AWSRegion,
+		s3MaxConnections:        maxConns,
+		filesystemCacheEnabled:  opts.FilesystemCacheEnabled,
 	}, nil
 }
 
@@ -768,8 +791,7 @@ func rejectPrincipalCollisions(orgs []configstore.TrinoEnabledOrg) (projectable 
 //     error and not a state write: writing state for an org we don't own
 //     would fight the owning cell's writer every tick.
 //
-// There is exactly one cell today. This function is the whole of "cell
-// awareness" — no assignment policy, no rebalancing, no capacity model.
+// Registered cells require explicit assignment and never claim the default fleet.
 func (p *TrinoProvisioner) claimCellOrgs(orgs []configstore.TrinoEnabledOrg) []configstore.TrinoEnabledOrg {
 	mine := make([]configstore.TrinoEnabledOrg, 0, len(orgs))
 	for _, o := range orgs {
@@ -777,12 +799,19 @@ func (p *TrinoProvisioner) claimCellOrgs(orgs []configstore.TrinoEnabledOrg) []c
 		case p.cellID:
 			mine = append(mine, o)
 		case "":
-			if err := p.store.AssignTrinoCell(o.OrgID, p.cellID); err != nil {
+			if p.explicitAssignmentOnly {
+				continue
+			}
+			claimed, err := p.store.ClaimTrinoCell(o.OrgID, p.cellID)
+			if err != nil {
 				// Transient write failure — leave the org unassigned and
 				// let the next tick claim it. Projecting it now would
 				// mean serving a tenant whose ownership is unrecorded.
 				slog.Warn("Trino reconcile: failed to claim org into cell.",
 					"org", o.OrgID, "cell", p.cellID, "error", err)
+				continue
+			}
+			if !claimed {
 				continue
 			}
 			slog.Info("Trino reconcile: org claimed into cell.", "org", o.OrgID, "cell", p.cellID)
@@ -851,8 +880,16 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 	// internal-communication shared secret: write-once + immutable. The
 	// provisioner doesn't consume its value at runtime (it's env-
 	// projected to Trino pods by the chart), but it must exist.
-	if _, err := p.ensureWriteOnceSecret(ctx, TrinoInternalCommunicationSecretName, TrinoInternalCommunicationSecretKey, bootstrapped); err != nil {
-		return "", err
+	if len(p.existingInternalSecrets) == 0 {
+		if _, err := p.ensureWriteOnceSecret(ctx, TrinoInternalCommunicationSecretName, TrinoInternalCommunicationSecretKey, bootstrapped); err != nil {
+			return "", err
+		}
+	} else {
+		for _, name := range p.existingInternalSecrets {
+			if _, err := p.readSecretKey(ctx, name, TrinoInternalCommunicationSecretKey); err != nil {
+				return "", fmt.Errorf("read chart-owned internal secret %s: %w", name, err)
+			}
+		}
 	}
 
 	// OPA bundle bearer token: write-once + immutable. Returned so the
@@ -900,6 +937,11 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 	// runtime credential updates (test fakes don't).
 	if updater, ok := p.catalog.(TrinoCatalogCredentialUpdater); ok {
 		updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
+	}
+	for _, catalog := range p.additionalCatalogs {
+		if updater, ok := catalog.(TrinoCatalogCredentialUpdater); ok {
+			updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
+		}
 	}
 
 	return bundleToken, nil
@@ -1371,9 +1413,40 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	orgs []configstore.TrinoEnabledOrg,
 	tenants tenantSecretProjection,
 ) (map[string]catalogOutcome, error) {
+	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalog)
+	errs := []error{firstErr}
+	for i, catalog := range p.additionalCatalogs {
+		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("additional running backend %d: %w", i, err))
+		}
+		for orgID, next := range backendOutcomes {
+			previous := outcomes[orgID]
+			if next.Err != nil {
+				outcomes[orgID] = catalogOutcome{Err: errors.Join(previous.Err, next.Err)}
+			} else if previous.Err == nil && next.Pending {
+				outcomes[orgID] = next
+			}
+		}
+	}
+	return outcomes, errors.Join(errs...)
+}
+
+func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []configstore.TrinoEnabledOrg, tenants tenantSecretProjection, catalog TrinoCatalogClient) (map[string]catalogOutcome, error) {
+	backendCtx, cancel := context.WithTimeout(ctx, p.catalogTimeout)
+	defer cancel()
+	return p.reconcileBackendCatalogs(backendCtx, orgs, tenants, catalog)
+}
+
+func (p *TrinoProvisioner) reconcileBackendCatalogs(
+	ctx context.Context,
+	orgs []configstore.TrinoEnabledOrg,
+	tenants tenantSecretProjection,
+	catalog TrinoCatalogClient,
+) (map[string]catalogOutcome, error) {
 	outcomes := make(map[string]catalogOutcome, len(orgs))
 
-	existing, err := p.catalog.ListCatalogs(ctx)
+	existing, err := catalog.ListCatalogs(ctx)
 	if err != nil {
 		// Listing failed — we can't safely attribute per-org outcomes,
 		// so flag every org as failed-with-this-error so they don't
@@ -1470,7 +1543,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 			continue
 		}
 		props := p.buildCatalogProperties(o.OrgID, warehouse, duckling)
-		if err := p.catalog.CreateCatalog(ctx, name, props); err != nil {
+		if err := catalog.CreateCatalog(ctx, name, props); err != nil {
 			if p.tenantSecretNotMountedYet(err, o.OrgID) {
 				// Not a failure: the Secret key is projected (checked
 				// above) and the pods just have not seen it yet.
@@ -1498,7 +1571,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 		if wanted[c] {
 			continue
 		}
-		if err := p.catalog.DropCatalog(ctx, c); err != nil {
+		if err := catalog.DropCatalog(ctx, c); err != nil {
 			errs = append(errs, fmt.Errorf("drop stale catalog %s: %w", c, err))
 			continue
 		}
