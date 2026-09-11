@@ -308,6 +308,38 @@ pg_try() { # org password dbname sql [user=root]
   printf %s "$out"; return 1
 }
 
+# Runs a MULTI-statement script on ONE session, feeding it on stdin so psql
+# sends each statement as its OWN simple-query message. `psql -c "a; b"` does
+# not do this: it sends the whole string as a single message, and duckgres only
+# splits such a batch when pg_query can parse it (conn.go: `parseErr == nil &&
+# len(tree.Stmts) > 1`). `USE` is not PostgreSQL syntax, so a USE-led batch
+# never splits — it reaches the worker whole and DuckDB fails the bare `USE`.
+# So any assertion that needs session state from an earlier statement AND a
+# `USE` has to come through here, not through pg/pg_try.
+#
+# Same positive/abort contract and transient-retry set as _pg_exec.
+# TODO: the retry case list is now spelled three times (_pg_exec, pg_try, here);
+# fold them into one classifier next time this file is open for real work.
+pg_script() { # org password dbname sql_script [user=root] -> prints output; rc 0 ok / 1 real error
+  a=0 out=""
+  while [ "$a" -lt 12 ]; do
+    if out="$(printf '%s\n' "$4" | PGPASSWORD="$2" psql \
+        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=${5:-root} dbname=$3" \
+        -v ON_ERROR_STOP=1 -tA 2>&1)"; then
+      printf %s "$out"; return 0
+    fi
+    case "$out" in
+      *"capacity exhausted"*|*"no Duckgres worker"*|\
+      *"still provisioning"*|*"failed to initialize session"*|\
+      *"timed out waiting for an available worker"*|*"failed to start"*|*"spawn sized worker"*|\
+      *"failed to detect attached catalogs"*)
+        sleep 10; a=$((a + 1)); continue ;;
+      *) printf %s "$out" >&2; return 1 ;;
+    esac
+  done
+  printf %s "$out" >&2; return 1
+}
+
 # Connect preflight: a worker isn't ready the instant a warehouse goes ready —
 # there is no warm pool, so the first connection for an org cold-spawns a worker
 # (and a burst can momentarily hit the org/global cap). The CP returns a
@@ -3986,7 +4018,11 @@ logical_catalog_alias() { # org password sibling_org
     "DROP TABLE IF EXISTS $alias_db.public.$t; CREATE TABLE $alias_db.public.$t AS SELECT 42 AS v;"
   got="$(pg "$1" "$2" "$alias_db" "SELECT v FROM $alias_db.public.$t")"
   [ "$got" = "42" ] || fail "logical alias: three-part read returned '$got', want 42"
-  got="$(pg "$1" "$2" "$alias_db" "USE $alias_db; SELECT v FROM $t;" | tail -1)"
+  # `USE` must be its own simple-query message — see pg_script. The read that
+  # follows shares the session, so it proves the USE actually moved the session
+  # into the catalog rather than just returning without an error.
+  got="$(pg_script "$1" "$2" "$alias_db" "USE $alias_db;
+SELECT v FROM $t;" | tail -1)"
   [ "$got" = "42" ] || fail "logical alias: USE $alias_db then unqualified read returned '$got', want 42"
 
   # The alias renames; it does not fork storage. The same row is there for a
