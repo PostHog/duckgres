@@ -559,6 +559,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
+            # Only the throwaway benchmark config store; never a shared dev/prod store.
+            - { name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN, value: "postgres://duckgres:duckgres@duckgres-config-store.$NS.svc:5432/duckgres?sslmode=disable" }
             - { name: DUCKGRES_SCENARIO_ATHENA_REGION, value: "$AWS_REGION" }
             - { name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: "${DUCKGRES_SCENARIO_ATHENA_WORKGROUP:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: "${DUCKGRES_SCENARIO_ATHENA_DATABASE:-}" }

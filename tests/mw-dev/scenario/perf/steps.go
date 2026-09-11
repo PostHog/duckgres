@@ -27,12 +27,13 @@ type DriverFactory interface {
 }
 
 type ExecutorConfig struct {
-	ProvisionState *provision.State
-	Connection     scenariosql.ConnectionConfig
-	OutputDir      string
-	DriverFactory  DriverFactory
-	State          *State
-	Now            func() time.Time
+	TrinoCatalogStoreDSN string
+	ProvisionState       *provision.State
+	Connection           scenariosql.ConnectionConfig
+	OutputDir            string
+	DriverFactory        DriverFactory
+	State                *State
+	Now                  func() time.Time
 }
 
 type Executor struct {
@@ -81,12 +82,14 @@ type stepSpec struct {
 	AthenaQueryTimeout   time.Duration
 }
 
-type defaultDriverFactory struct{}
+type defaultDriverFactory struct {
+	trinoCatalogStoreDSN string
+}
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
 	factory := cfg.DriverFactory
 	if factory == nil {
-		factory = defaultDriverFactory{}
+		factory = defaultDriverFactory{trinoCatalogStoreDSN: cfg.TrinoCatalogStoreDSN}
 	}
 	state := cfg.State
 	if state == nil {
@@ -327,7 +330,16 @@ func targetsFromWith(step core.Step) ([]perfcore.Protocol, error) {
 
 func restrictCatalogTargets(catalog perfcore.Catalog, targets []perfcore.Protocol) (perfcore.Catalog, error) {
 	if targets == nil {
-		return catalog, nil
+		targets = catalog.Targets
+	}
+
+	var hasTrino, hasTrinoCached bool
+	for _, target := range targets {
+		hasTrino = hasTrino || target == perfcore.ProtocolTrino
+		hasTrinoCached = hasTrinoCached || target == perfcore.ProtocolTrinoCached
+	}
+	if hasTrino && hasTrinoCached {
+		return perfcore.Catalog{}, fmt.Errorf("trino and trino_cached require separate deployments; select one mode with with.targets")
 	}
 
 	available := make(map[perfcore.Protocol]struct{}, len(catalog.Targets))
@@ -497,7 +509,10 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, p
 	return driver, nil
 }
 
-func (defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+func (f defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+	if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, connection.Protocol); err != nil {
+		return nil, err
+	}
 	return trinodriver.New(ctx, connection)
 }
 

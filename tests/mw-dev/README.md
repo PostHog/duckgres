@@ -696,6 +696,16 @@ other scenarios use false. The flag affects newly created catalogs only: tear do
 and redeploy into a fresh namespace when changing mode. Never reuse a cached
 namespace for a baseline run.
 
+Before Trino startup/warm-up, the runner checks the persisted catalog
+`fs.cache.enabled` against the selected target. Missing or mismatched settings
+fail the run, including when an older control-plane image ignored the flag.
+`run.sh` supplies `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN` for the throwaway
+namespace database; direct runner invocations must supply that isolated database
+connection too. Never point this check at a shared dev/prod catalog store.
+On failure, rebuild the control plane and deploy a fresh namespace with the
+matching scenario. A single `perf_queries` step cannot select both `trino` and
+`trino_cached`; select one explicitly and use separate deployments for comparison.
+
 The environment flag defaults to false outside this harness. Enabling it requires
 a compatible cache manager on every Trino node. The pinned image configures managers
 with `cache-manager.config-files`; cache directory/size properties belong in the

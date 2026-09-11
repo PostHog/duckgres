@@ -81,7 +81,8 @@ func TestScenarioRunner(t *testing.T) {
 	})
 	scenarioOutputDir := filepath.Join(*scenarioOutputBase, runID)
 	perfExecutor := scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{
-		ProvisionState: provisionState,
+		TrinoCatalogStoreDSN: os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN"),
+		ProvisionState:       provisionState,
 		Connection: scenariosql.ConnectionConfig{
 			DialHost:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
 			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),

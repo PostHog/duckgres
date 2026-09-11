@@ -272,6 +272,54 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 	}
 }
 
+func TestDefaultTrinoFactoryRequiresCacheValidation(t *testing.T) {
+	factory := defaultDriverFactory{}
+	_, err := factory.NewTrino(context.Background(), trinodriver.ConnectionConfig{
+		ServerURL: "invalid-url",
+		Catalog:   "org_catalog",
+		Protocol:  perfcore.ProtocolTrinoCached,
+	})
+	if err == nil || !strings.Contains(err.Error(), "catalog store DSN") {
+		t.Fatalf("error = %v, want missing catalog store DSN before Trino startup", err)
+	}
+}
+
+func TestExecutorRejectsMixedTrinoCacheModes(t *testing.T) {
+	for _, explicitTargets := range []bool{false, true} {
+		name := "catalog_defaults"
+		if explicitTargets {
+			name = "explicit_targets"
+		}
+		t.Run(name, func(t *testing.T) {
+			factory := &fakeDriverFactory{}
+			executor := NewExecutor(ExecutorConfig{
+				OutputDir:     t.TempDir(),
+				DriverFactory: factory,
+			})
+			with := map[string]any{
+				"org_id":       "scenario-org",
+				"password":     "test-password",
+				"catalog_file": writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached}),
+				"run_id":       "scenario-run-1",
+			}
+			if explicitTargets {
+				with["targets"] = []any{"trino", "trino_cached"}
+			}
+			err := executor.ExecuteStep(context.Background(), core.Step{
+				ID:   "perf_queries",
+				Type: StepTypePerfQueries,
+				With: with,
+			})
+			if err == nil || !strings.Contains(err.Error(), "trino and trino_cached require separate deployments") {
+				t.Fatalf("error = %v, want mixed Trino cache modes rejected", err)
+			}
+			if factory.trinoContext != nil {
+				t.Fatal("mixed cache modes must be rejected before constructing a Trino driver")
+			}
+		})
+	}
+}
+
 func TestExecutorBuildsAthenaDriverFromExplicitOnDemandConfig(t *testing.T) {
 	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolAthena})
 	provisionState := provision.NewState()
