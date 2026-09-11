@@ -42,7 +42,9 @@ services:
 
   # MinIO for DuckLake object storage
   minio:
-    image: minio/minio:latest
+    # MinIO deleted its Docker Hub repositories, so pull from quay.io. The tag is a
+    # dated release rather than `latest` so a rebuild cannot silently change it.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: duckgres-test-minio
     command: server /data --console-address ":9001"
     environment:
@@ -61,7 +63,7 @@ services:
 
   # Creates the ducklake bucket on startup
   minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: duckgres-test-minio-init
     depends_on:
       minio:
