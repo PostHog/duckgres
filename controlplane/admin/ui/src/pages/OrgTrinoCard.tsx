@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import { AlertTriangle, Sparkles } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -5,7 +6,9 @@ import { Badge } from "@/components/ui/badge";
 import { StateBadge } from "@/components/StateBadge";
 import { LoadingState } from "@/components/states";
 import { CopyButton } from "@/components/CopyButton";
-import { useOrgTrino } from "@/hooks/useApi";
+import { useOrgTrino, useTrinoCells, useSelectTrinoCell } from "@/hooks/useApi";
+import { useIdentity } from "@/components/IdentityProvider";
+import { Button } from "@/components/ui/button";
 import { fmtInt, fmtTime } from "@/lib/format";
 
 function Field({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
@@ -41,7 +44,13 @@ export function OrgTrinoCard({ orgId }: { orgId: string }) {
       </Card>
     );
   }
-  if (!trino.data?.enabled || !trino.data.status) {
+  if (trino.isError) {
+    return <Card><CardContent className="pt-6 text-destructive">Cannot read Trino assignment. {trino.error?.message}</CardContent></Card>;
+  }
+  if (!trino.data?.enabled) {
+    return <InitialCellSelection orgId={orgId} assigned={trino.data?.assigned ?? false} cell={trino.data?.cell.id ?? ""} />;
+  }
+  if (!trino.data.status) {
     return null;
   }
 
@@ -106,11 +115,36 @@ export function OrgTrinoCard({ orgId }: { orgId: string }) {
         </div>
 
         <Link
-          to={`/trino/queries`}
+          to={`/trino/queries?cell=${encodeURIComponent(s.cell)}`}
           className="inline-block text-xs text-primary hover:underline"
         >
           View this cell&apos;s live queries →
         </Link>
+      </CardContent>
+    </Card>
+  );
+}
+
+function InitialCellSelection({ orgId, assigned, cell }: { orgId: string; assigned: boolean; cell: string }) {
+  const { isAdmin } = useIdentity();
+  const cells = useTrinoCells();
+  const selection = useSelectTrinoCell();
+  const [chosen, setChosen] = useState("");
+  if (assigned) {
+    return <Card><CardContent className="pt-6 text-sm">Assigned cell: {cell}. Trino is disabled. Existing assignments cannot be changed here.</CardContent></Card>;
+  }
+  if (!isAdmin || !cells.data?.cells.length) return null;
+  return (
+    <Card>
+      <CardHeader><CardTitle>Trino cell</CardTitle></CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm">Select the initial cell before enabling Trino. This does not enable Trino. The assignment cannot be changed here afterward.</p>
+        <select aria-label="Initial Trino cell" value={chosen} onChange={(event) => setChosen(event.target.value)} className="rounded border bg-background p-2 text-sm">
+          <option value="">Choose a cell</option>
+          {cells.data.cells.map((entry) => <option key={entry.id} value={entry.id}>{entry.id}</option>)}
+        </select>
+        <Button disabled={!chosen || selection.isPending} onClick={() => selection.mutate({ org: orgId, cell: chosen })}>Select cell</Button>
+        {selection.error && <p role="alert" className="text-sm text-destructive">{selection.error.message}</p>}
       </CardContent>
     </Card>
   );

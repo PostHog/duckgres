@@ -333,6 +333,11 @@ test-configstore-integration:
 test-controlplane-k8s:
     go test -v -count=1 -tags kubernetes . ./controlplane ./controlplane/admin ./controlplane/provisioner
 
+# Test Trino cell selection and the admin API.
+[group('test')]
+test-trino-admin:
+    go test -v -count=1 -tags kubernetes -run Trino ./controlplane/admin ./tests/configstore
+
 # Print the test impact plan for the current branch
 [group('test')]
 test-impact-plan base="origin/main" head="HEAD":

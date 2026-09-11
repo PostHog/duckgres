@@ -225,13 +225,15 @@ func (c *trinoCache[T]) get(ctx context.Context, fetch func(context.Context) (T,
 // TrinoAPI is the console's Trino surface: a coordinator client, the config
 // store, and the cell's identity.
 type TrinoAPI struct {
-	cell    TrinoCell
-	client  TrinoCoordinatorClient
-	orgs    TrinoOrgStore
-	audit   *AuditStore
-	queries *trinoCache[[]TrinoQuery]
-	nodes   *trinoCache[TrinoNodeInventory]
-	info    *trinoCache[*TrinoServerInfo]
+	fleet      map[string]*TrinoAPI
+	filterCell bool
+	cell       TrinoCell
+	client     TrinoCoordinatorClient
+	orgs       TrinoOrgStore
+	audit      *AuditStore
+	queries    *trinoCache[[]TrinoQuery]
+	nodes      *trinoCache[TrinoNodeInventory]
+	info       *trinoCache[*TrinoServerInfo]
 }
 
 // NewTrinoAPI builds the console's Trino surface. A nil client or store
@@ -259,6 +261,10 @@ func registerTrinoAPI(r *gin.RouterGroup, api *TrinoAPI) {
 	if api == nil {
 		return
 	}
+	if api.fleet != nil {
+		registerTrinoFleetAPI(r, api)
+		return
+	}
 	r.GET("/trino/status", api.handleStatus)
 	r.GET("/trino/queries", api.handleQueries)
 	r.GET("/trino/queries/:id", api.handleQueryDetail)
@@ -281,7 +287,15 @@ func (a *TrinoAPI) index() (principalIndex, error) {
 		return principalIndex{}, err
 	}
 	idx := principalIndex{orgByPrincipal: make(map[string]string, len(rows)), rows: rows}
-	for _, o := range rows {
+	if a.filterCell {
+		idx.rows = nil
+		for _, row := range rows {
+			if row.CellID == a.cell.storedID() || (row.CellID == "" && a.cell.ID == "legacy") {
+				idx.rows = append(idx.rows, row)
+			}
+		}
+	}
+	for _, o := range idx.rows {
 		if p := o.TrinoPrincipal(); p != "" {
 			idx.orgByPrincipal[p] = o.OrgID
 		}
@@ -623,10 +637,14 @@ func (a *TrinoAPI) handleOrgDetail(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	a.writeOrgDetail(c, orgID, row)
+}
+
+func (a *TrinoAPI) writeOrgDetail(c *gin.Context, orgID string, row *configstore.ManagedWarehouseTrino) {
 	if row == nil || !row.Enabled {
 		// Not an error: most orgs are not Trino-enabled, and the org page
 		// renders a "not enabled" state rather than a failure.
-		c.JSON(http.StatusOK, gin.H{"cell": a.cell, "enabled": false})
+		c.JSON(http.StatusOK, gin.H{"cell": a.cell, "enabled": false, "assigned": row != nil && row.TrinoCellID != ""})
 		return
 	}
 
@@ -677,6 +695,7 @@ func (a *TrinoAPI) handleOrgDetail(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"cell":      a.cell,
 		"enabled":   true,
+		"assigned":  row.TrinoCellID != "",
 		"available": available,
 		"status":    status,
 	})

@@ -902,6 +902,7 @@ export interface TrinoOrgsResponse {
 export interface TrinoOrgDetail {
   cell: TrinoCell;
   enabled: boolean;
+  assigned?: boolean;
   available?: boolean;
   status?: TrinoOrgStatus;
 }

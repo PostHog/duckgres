@@ -194,9 +194,26 @@ The existing deployment appears as `legacy` in the Trino API's `cell.id` and
 its owned orgs' `status.cell` / `orgs[].cell`. This is an API alias, not a storage
 migration: `DUCKGRES_TRINO_CELL_ID`, persisted org assignments, and Trino's
 catalog-store key retain their existing values. The general org endpoint still
-returns the persisted `trino.trino_cell_id`. Unassigned and foreign-cell rows
-retain their original IDs and receive no connection details. This change adds
-no cell selection or tenant migration endpoint.
+returns the persisted `trino.trino_cell_id`. Registered cells use separate
+`registered:<cell-id>` ownership values. Unknown stored owners fail closed.
+
+`GET /api/v1/trino/cells` lists configured logical cells. Operational Trino
+routes accept `?cell=<logical-id>` and default to `legacy`. Org detail resolves
+its authoritative stored assignment regardless of a supplied cell parameter.
+Each coordinator has separate caches; tenant counts include only its cell.
+
+Admins can select an initial cell in the org's Trino card or send
+`PUT /api/v1/orgs/:id/trino/cell` with `{"cell":"cell-001"}`. This stores a
+disabled assignment before the normal enable endpoint is called. The warehouse
+must already exist. Selection does not enable Trino or move an existing tenant.
+An existing assignment is immutable, including after disable/re-enable; repeat
+selection of the same assignment is idempotent. An enabled unassigned row also
+rejects selection because its first provisioning tick may already be running.
+On a 409, inspect the current assignment rather than editing its database row.
+Moving an existing tenant requires a separate maintenance/drain workflow.
+
+For newly registered cells, configure the shared customer endpoint separately
+from the observer coordinator URL. This API does not configure Gateway routing.
 
 For local verification, run `just test-controlplane-k8s` and `just ui-test`.
 The isolated Trino end-to-end suite checks both the API alias and unchanged
