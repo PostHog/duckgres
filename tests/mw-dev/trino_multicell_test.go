@@ -56,6 +56,65 @@ func TestTrinoRegistryOnlyHarnessFollowsLegacyCompatibility(t *testing.T) {
 	}
 }
 
+func TestTrinoCellRegistryWaitsForServiceConvergence(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino-multicell.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	start := strings.Index(text, "wait_cell_registry() {")
+	if start < 0 {
+		t.Fatal("missing bounded registry convergence helper")
+	}
+	end := strings.Index(text[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("missing registry helper end")
+	}
+	helper := text[start : start+end+3]
+	for _, tc := range []struct {
+		name, responses string
+		wantSuccess     bool
+	}{
+		{"connection refused then ready", "refused\ncell-test\n", true},
+		{"old endpoint then ready", "cell-test,legacy\ncell-test\n", true},
+		{"wrong registry never accepted", "cell-test,legacy\n", false},
+		{"unavailable API times out", "refused\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			responses := filepath.Join(t.TempDir(), "responses")
+			if err := os.WriteFile(responses, []byte(tc.responses), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			script := `set -eu
+api() {
+  [ "$1" = --max-time ] && [ "$2" = 5 ] || exit 90
+  response=$(head -n 1 "$RESPONSES")
+  if [ "$(wc -l < "$RESPONSES")" -gt 1 ]; then
+    tail -n +2 "$RESPONSES" > "$RESPONSES.next"
+    mv "$RESPONSES.next" "$RESPONSES"
+  fi
+  [ "$response" != refused ] || return 7
+  printf %s "$response" | jq -Rc '{cells:(split(",") | map({id:.}))}'
+}
+sleep() { :; }
+fail() { echo "$*" >&2; exit 1; }
+API=http://fixture.invalid
+` + helper + `
+wait_cell_registry '["cell-test"]'
+`
+			cmd := exec.Command("sh", "-c", script)
+			cmd.Env = append(os.Environ(), "RESPONSES="+responses)
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != tc.wantSuccess {
+				t.Fatalf("success=%v, want=%v: %s", err == nil, tc.wantSuccess, output)
+			}
+			if !tc.wantSuccess && !strings.Contains(string(output), "cell registry did not converge") {
+				t.Fatalf("missing actionable timeout: %s", output)
+			}
+		})
+	}
+}
+
 func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 	envsubst, err := exec.LookPath("envsubst")
 	if err != nil {
