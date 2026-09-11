@@ -16,6 +16,7 @@ CTX="${KUBE_CONTEXT:?}"
 # NAMESPACE is required by deploy|test|diagnostics|teardown but NOT by
 # e2e-cleanup (which discovers stale namespaces itself). Don't require it here.
 NS="${NAMESPACE:-}"
+TRINO_CELL_NS="duckgres-ci-pr-0${PR_NUMBER:-}"
 KUBECTL=(kubectl --context "$CTX")
 EKS_CLUSTER_NAME="${EKS_CLUSTER_NAME:-posthog-mw-dev}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
@@ -67,7 +68,7 @@ trino_server_p12_file="$secret_dir/duckgres-ci-trino-server.p12"
 require_pr_identity() {
   : "${PR_NUMBER:?PR_NUMBER is required}"
   case "$PR_NUMBER" in
-    *[!0-9]*)
+    0*|*[!0-9]*)
       echo "PR_NUMBER must be numeric, got '$PR_NUMBER'." >&2
       return 2
       ;;
@@ -80,6 +81,65 @@ require_pr_identity() {
     echo "NAMESPACE '$NS' does not match PR_NUMBER '$PR_NUMBER'." >&2
     return 2
   fi
+  TRINO_CELL_NS="duckgres-ci-pr-0${PR_NUMBER}"
+}
+
+trino_multicell_enabled() {
+  [ "$E2E_SUITE" = trino ] && [ "$SCENARIO_NAME" = full-suite ]
+}
+
+render_trino_backend() {
+  local color="$1"
+  TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
+  TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
+  TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
+  NAMESPACE="$TRINO_CELL_NS" PR_NUMBER="$PR_NUMBER" \
+    envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64' \
+    < "$HERE/manifests.trino.tmpl.yaml" \
+    | sed -e "s/duckgres-trino-coordinator/duckgres-trino-$color-coordinator/g" \
+      -e "s/duckgres-trino-worker/duckgres-trino-$color-worker/g" \
+      -e "s/app: duckgres-trino/app: duckgres-trino-$color/g" \
+      -e "s/name: duckgres-trino$/name: duckgres-trino-$color/" \
+      -e "s/duckgres-trino\.$TRINO_CELL_NS\.svc/duckgres-trino-$color.$TRINO_CELL_NS.svc/g" \
+      -e "s/trino-internal-communication/trino-$color-internal/g" \
+      -e "s/cell-id=ci-pr-$PR_NUMBER/cell-id=ci-pr-$PR_NUMBER-$color/" \
+      -e "s/node.environment=ci_pr_$PR_NUMBER/node.environment=ci_pr_${PR_NUMBER}_$color/" \
+      -e "s/duckgres-config-store\.$TRINO_CELL_NS\.svc/duckgres-config-store.$NS.svc/g" \
+      -e "s/duckgres-control-plane\.$TRINO_CELL_NS\.svc/duckgres-control-plane.$NS.svc/g" \
+      -e 's@resource: /bundles/trino$@resource: /bundles/trino/cell-test@'
+}
+
+render_trino_multicell() {
+  local color
+  for color in blue green; do
+    [ -f "$secret_dir/trino-$color-internal" ] || (umask 077; openssl rand -base64 32 > "$secret_dir/trino-$color-internal")
+  done
+  TRINO_BLUE_INTERNAL_SECRET="$(cat "$secret_dir/trino-blue-internal")" \
+  TRINO_GREEN_INTERNAL_SECRET="$(cat "$secret_dir/trino-green-internal")" \
+  TRINO_CELL_NAMESPACE="$TRINO_CELL_NS" NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
+    envsubst '$TRINO_CELL_NAMESPACE $NAMESPACE $PR_NUMBER $TRINO_BLUE_INTERNAL_SECRET $TRINO_GREEN_INTERNAL_SECRET' \
+      < "$HERE/trino-multicell.tmpl.yaml"
+  render_trino_backend blue
+  render_trino_backend green
+}
+
+trino_cell_namespace_uid() {
+  local target="duckgres-ci-pr-0${PR_NUMBER}" namespace_json
+  namespace_json="$("${KUBECTL[@]}" get namespace "$target" --ignore-not-found -o json)" || return 1
+  [ -n "$namespace_json" ] || return 0
+  printf %s "$namespace_json" | jq -er --arg pr "$PR_NUMBER" --arg name "$target" \
+    'select(.metadata.name == $name and .metadata.labels["app.kubernetes.io/managed-by"] == "e2e-mw-dev" and .metadata.labels["duckgres.posthog.com/ci-pr"] == $pr and .metadata.labels["duckgres.posthog.com/ci-component"] == "trino-cell") | .metadata.uid | select(type == "string" and length > 0)'
+}
+
+delete_trino_cell_stack() {
+  local target="duckgres-ci-pr-0${PR_NUMBER}" uid
+  uid="$(trino_cell_namespace_uid)" \
+    || { echo "Refusing to delete a namespace without matching Trino fixture ownership." >&2; return 1; }
+  [ -n "$uid" ] || return 0
+  NS="$target" delete_pod_identity
+  jq -n --arg uid "$uid" '{apiVersion:"v1",kind:"DeleteOptions",preconditions:{uid:$uid}}' \
+    | "${KUBECTL[@]}" delete --raw "/api/v1/namespaces/$target" -f - >/dev/null
+  "${KUBECTL[@]}" wait --for=delete namespace/"$target" --timeout=720s
 }
 
 render() {
@@ -106,11 +166,16 @@ render() {
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
       envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64' \
       < "$HERE/manifests.trino.tmpl.yaml"
+    if trino_multicell_enabled; then render_trino_multicell; fi
   fi
 }
 
 ensure_trino_tls() {
   local san="duckgres-trino.$NS.svc"
+  local sans="DNS:$san"
+  if trino_multicell_enabled; then
+    sans="$sans,DNS:duckgres-trino-blue.$TRINO_CELL_NS.svc,DNS:duckgres-trino-green.$TRINO_CELL_NS.svc"
+  fi
   if [ -s "$trino_ca_cert_file" ] && [ -s "$trino_server_p12_file" ]; then
     return
   fi
@@ -121,7 +186,7 @@ ensure_trino_tls() {
       -subj "/CN=duckgres-e2e-trino-ca" \
       -keyout "$trino_ca_key_file" -out "$trino_ca_cert_file" >/dev/null 2>&1
     openssl req -newkey rsa:2048 -nodes -subj "/CN=$san" \
-      -addext "subjectAltName=DNS:$san,DNS:$san.cluster.local" \
+      -addext "subjectAltName=$sans,DNS:$san.cluster.local" \
       -keyout "$trino_server_key_file" -out "$trino_server_csr_file" >/dev/null 2>&1
     openssl x509 -req -days 2 -sha256 \
       -in "$trino_server_csr_file" -CA "$trino_ca_cert_file" -CAkey "$trino_ca_key_file" \
@@ -274,7 +339,7 @@ drop_cnpg_role() { # org-id
 # (harness.sh main()). Keep in sync with harness.sh.
 ci_orgs() { # pr-number
   local pr="$1"
-  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2 ci-pr-${pr}-trinoa ci-pr-${pr}-trinob"
+  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2 ci-pr-${pr}-trinoa ci-pr-${pr}-trinob ci-pr-${pr}-trinoc"
 }
 
 delete_ci_ducklings() { # pr-number
@@ -325,6 +390,7 @@ reset_pr_stack() {
   wait_ci_ducklings_deleted "$PR_NUMBER" 300s
   for org in $(ci_orgs "$PR_NUMBER"); do drop_cnpg_role "$org"; done
   delete_pod_identity
+  delete_trino_cell_stack
   delete_ci_bindings "$PR_NUMBER"
   # Reshard runners intentionally get 600s to roll back safely on termination.
   # A cancelled workflow can leave one in that grace period, so the next run's
@@ -354,6 +420,11 @@ cmd_deploy() {
     # Associate before admitting Trino pods: the Pod Identity agent injects
     # credentials only at admission and never retrofits an existing pod.
     ensure_trino_pod_identity
+    if trino_multicell_enabled; then
+      NS="$TRINO_CELL_NS" ensure_trino_pod_identity
+      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
+        '{"spec":{"template":{"spec":{"containers":[{"name":"controlplane","env":[{"name":"DUCKGRES_TRINO_CELLS_FILE","value":"/etc/duckgres/trino-cells/cells.json"}],"volumeMounts":[{"name":"trino-cell-registry","mountPath":"/etc/duckgres/trino-cells","readOnly":true}]}],"volumes":[{"name":"trino-cell-registry","configMap":{"name":"trino-cell-registry"}}]}}}}'
+    fi
     TRINO_FILESYSTEM_CACHE_ENABLED="$TRINO_FILESYSTEM_CACHE_ENABLED" \
     envsubst '$NAMESPACE $PR_NUMBER $TRINO_FILESYSTEM_CACHE_ENABLED' < "$HERE/trino-controlplane-patch.tmpl.json" \
       | "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane \
@@ -378,6 +449,14 @@ cmd_deploy() {
       --type=merge -p '{"spec":{"replicas":3}}'
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
+    if trino_multicell_enabled; then
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" wait --for=create secret/trino-auth --timeout=120s
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" wait --for=create configmap/trino-resource-groups --timeout=120s
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" patch deployment duckgres-trino-blue-coordinator --type=merge -p '{"spec":{"replicas":1}}'
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" patch deployment duckgres-trino-blue-worker --type=merge -p '{"spec":{"replicas":1}}'
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" rollout status deploy/duckgres-trino-blue-coordinator --timeout=300s
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" rollout status deploy/duckgres-trino-blue-worker --timeout=300s
+    fi
   fi
 }
 
@@ -395,10 +474,13 @@ cmd_test_e2e() {
   fi
   "${KUBECTL[@]}" -n "$NS" create configmap duckgres-harness \
     --from-file=harness.sh="$harness_file" \
+    --from-file=trino-multicell.sh="$HERE/e2e/trino-multicell.sh" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply --server-side --force-conflicts -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
   INTERNAL_SECRET_FALLBACK="$(cat "$internal_secret_fallback_file")"
+  TRINO_MULTICELL_ENABLED=false
+  if trino_multicell_enabled; then TRINO_MULTICELL_ENABLED=true; fi
   "${KUBECTL[@]}" -n "$NS" delete job duckgres-harness --ignore-not-found
   cat <<YAML | "${KUBECTL[@]}" apply -f -
 apiVersion: batch/v1
@@ -432,6 +514,8 @@ spec:
             - { name: NAMESPACE, value: "$NS" }
             - { name: PR_NUMBER, value: "$PR_NUMBER" }
             - { name: E2E_SUITE, value: "$E2E_SUITE" }
+            - { name: TRINO_CELL_NAMESPACE, value: "$TRINO_CELL_NS" }
+            - { name: TRINO_MULTICELL_ENABLED, value: "$TRINO_MULTICELL_ENABLED" }
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
             - { name: INTERNAL_SECRET_FALLBACK, value: "$INTERNAL_SECRET_FALLBACK" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }
@@ -779,6 +863,18 @@ release_artifact_keeper() {
 }
 
 cmd_diagnostics() {
+  local cell_uid color
+  cell_uid="$(trino_cell_namespace_uid 2>/dev/null || true)"
+  if [ -n "$cell_uid" ]; then
+    echo "::group::isolated Trino cell diagnostics"
+    "${KUBECTL[@]}" -n "$TRINO_CELL_NS" get pods,deployments,services,events -o wide || true
+    for color in blue green; do
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" logs "deploy/duckgres-trino-$color-coordinator" -c trino-coordinator --tail=200 || true
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" logs "deploy/duckgres-trino-$color-coordinator" -c duckgres-trino-opa --tail=100 || true
+      "${KUBECTL[@]}" -n "$TRINO_CELL_NS" logs "deploy/duckgres-trino-$color-worker" -c trino-worker --tail=100 || true
+    done
+    echo "::endgroup::"
+  fi
   echo "::group::namespace state"
   "${KUBECTL[@]}" -n "$NS" get pods,svc,job -o wide || true
   echo "::endgroup::"
@@ -879,6 +975,8 @@ cmd_teardown() {
   # Drop the Pod Identity association (it's an EKS resource, not in the ns).
   delete_pod_identity
 
+  delete_trino_cell_stack
+
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=false
@@ -898,23 +996,31 @@ cmd_teardown() {
 # Named e2e-cleanup (not "janitor") to avoid colliding with duckgres's own
 # control-plane janitor. NAMESPACE is not required for this path.
 cmd_e2e_cleanup() {
-  local max_age_h now ns created age pr
+  local max_age_h now ns created age pr component
   max_age_h="${E2E_CLEANUP_MAX_AGE_HOURS:-6}"
   now="$(date +%s)"
   "${KUBECTL[@]}" get ns -l app.kubernetes.io/managed-by=e2e-mw-dev \
-    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}' 2>/dev/null \
-  | while read -r ns created; do
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{" "}{.metadata.labels.duckgres\.posthog\.com/ci-pr}{" "}{.metadata.labels.duckgres\.posthog\.com/ci-component}{"\n"}{end}' 2>/dev/null \
+  | while read -r ns created pr component; do
       [ -n "$ns" ] || continue
+      case "$pr" in ''|0*|*[!0-9]*) echo "e2e-cleanup: skip namespace without a canonical PR label: $ns"; continue ;; esac
+      if [ "$ns" != "duckgres-ci-pr-$pr" ] && { [ "$ns" != "duckgres-ci-pr-0$pr" ] || [ "$component" != trino-cell ]; }; then
+        echo "e2e-cleanup: skip unexpected namespace: $ns"; continue
+      fi
       age=$(( (now - $(date -d "$created" +%s)) / 3600 ))
       if [ "$age" -lt "$max_age_h" ]; then
         echo "e2e-cleanup: keep $ns (age ${age}h < ${max_age_h}h)"; continue
       fi
-      pr="${ns#duckgres-ci-pr-}"
+      if [ "$component" = trino-cell ]; then
+        PR_NUMBER="$pr" delete_trino_cell_stack
+        continue
+      fi
       echo "e2e-cleanup: reaping $ns (age ${age}h, PR $pr)"
       delete_ci_ducklings "$pr"
       wait_ci_ducklings_deleted "$pr" 300s || true
       for org in $(ci_orgs "$pr"); do drop_cnpg_role "$org"; done
       NS="$ns" delete_pod_identity
+      PR_NUMBER="$pr" delete_trino_cell_stack
       delete_ci_bindings "$pr"
       "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false
     done

@@ -342,6 +342,11 @@ test-controlplane-k8s:
 test-trino-admin:
     go test -v -count=1 -tags kubernetes -run Trino ./controlplane/admin ./tests/configstore
 
+# Test isolated deployment fixtures without contacting a cluster.
+[group('test')]
+test-mw-fixtures:
+    go test -v -count=1 ./tests/mw-dev
+
 # Print the test impact plan for the current branch
 [group('test')]
 test-impact-plan base="origin/main" head="HEAD":

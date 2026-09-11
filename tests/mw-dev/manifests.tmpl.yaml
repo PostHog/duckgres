@@ -231,6 +231,7 @@ rules:
       - cnpg-tenant-ci-pr-${PR_NUMBER}-cnpg-password
       - cnpg-tenant-ci-pr-${PR_NUMBER}-trinoa-password
       - cnpg-tenant-ci-pr-${PR_NUMBER}-trinob-password
+      - cnpg-tenant-ci-pr-${PR_NUMBER}-trinoc-password
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

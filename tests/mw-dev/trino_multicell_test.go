@@ -1,0 +1,200 @@
+package e2emwdev_test
+
+import (
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+)
+
+func TestTrinoMulticellFixtureKeepsIndependentBackendState(t *testing.T) {
+	raw, err := os.ReadFile("trino-multicell.tmpl.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`name: ${TRINO_CELL_NAMESPACE}`, `namespace: ${NAMESPACE}`,
+		`"id":"cell-test"`, `"running":false`, `"routing_active":false`,
+		`trino-blue-internal`, `trino-green-internal`,
+		`name: trino-cell-projection`, `resourceNames: ["trino-auth", "trino-tenant-secrets", "trino-opa-bundle-token"]`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("missing isolated fleet fixture contract %q", want)
+		}
+	}
+	raw, err = os.ReadFile("run.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`TRINO_CELL_NS="duckgres-ci-pr-0${PR_NUMBER}"`, `render_trino_backend`, `delete_trino_cell_stack`, `DUCKGRES_TRINO_CELLS_FILE`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("missing fleet lifecycle contract %q", want)
+		}
+	}
+}
+
+func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
+	envsubst, err := exec.LookPath("envsubst")
+	if err != nil {
+		t.Fatal("envsubst is required to verify the real renderer")
+	}
+	fakes := newRunSHFakes(t)
+	writeFake(t, fakes.binDir, "envsubst", "#!/usr/bin/env bash\nexec "+envsubst+" \"$@\"\n")
+	secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
+	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
+		if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	renderedFile := filepath.Join(t.TempDir(), "rendered.yaml")
+	cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "SCENARIO_NAME=full-suite", "E2E_SUITE=trino", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-trino", "RUN_SH_TEST_RENDERED="+renderedFile)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("render/deploy: %v\n%s", err, out)
+	}
+	raw, err := os.ReadFile(renderedFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(string(raw)), 4096)
+	configs := map[string]map[string]any{}
+	deployments := map[string]map[string]any{}
+	for {
+		var manifest map[string]any
+		if err := decoder.Decode(&manifest); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("decode real manifests: %v", err)
+		}
+		if manifest["kind"] == "ConfigMap" {
+			configs[manifestName(manifest)] = manifest["data"].(map[string]any)
+		}
+		if manifest["kind"] == "Deployment" {
+			deployments[manifestName(manifest)] = manifest
+		}
+	}
+	for _, color := range []string{"blue", "green"} {
+		name := "duckgres-trino-" + color
+		config := configs[name+"-coordinator"]
+		if config == nil {
+			t.Fatalf("missing %s config", color)
+		}
+		for key, want := range map[string]string{
+			"config.properties":        "discovery.uri=http://" + name + ".duckgres-ci-pr-0123.svc:8080",
+			"node.properties":          "node.environment=ci_pr_123_" + color,
+			"catalog-store.properties": "catalog-store.cell-id=ci-pr-123-" + color,
+		} {
+			if !strings.Contains(config[key].(string), want) {
+				t.Fatalf("%s %s missing %q", color, key, want)
+			}
+		}
+		if !strings.Contains(config["catalog-store.properties"].(string), "duckgres-config-store.duckgres-ci-pr-123.svc") {
+			t.Fatal("catalog store must remain in primary namespace")
+		}
+		for _, role := range []string{"coordinator", "worker"} {
+			deployment := deployments[name+"-"+role]
+			if deployment == nil {
+				t.Fatalf("missing %s %s", color, role)
+			}
+			spec := deployment["spec"].(map[string]any)
+			if spec["replicas"] != float64(0) {
+				t.Fatal("all Trino pods must await projection bootstrap")
+			}
+			labels := spec["selector"].(map[string]any)["matchLabels"].(map[string]any)
+			if labels["app"] != name {
+				t.Fatalf("backend selector overlaps: %+v", labels)
+			}
+		}
+	}
+	if !strings.Contains(configs["duckgres-trino-opa"]["config.yaml"].(string), "/bundles/trino/cell-test") {
+		t.Fatal("new cell must use its scoped OPA bundle")
+	}
+	calls := fakes.calls(t)
+	if strings.Contains(calls, "patch deployment duckgres-trino-green-") {
+		t.Fatal("deploy must not start stopped green")
+	}
+	if !strings.Contains(calls, "--namespace duckgres-ci-pr-0123 --service-account trino") {
+		t.Fatal("new cell must receive its own Pod Identity association")
+	}
+}
+
+func TestTrinoSecondaryNamespaceCleanupFailsClosed(t *testing.T) {
+	for _, inventory := range []string{
+		"duckgres-ci-pr-0123 2026-01-01T00:00:00Z 999 trino-cell",
+		"duckgres-ci-pr-123 2026-01-01T00:00:00Z",
+		"unrelated 2026-01-01T00:00:00Z 123",
+	} {
+		fakes := newRunSHFakes(t)
+		cmd := runSHCommand(t, fakes.binDir, "e2e-cleanup", "RUN_SH_TEST_NAMESPACE_INVENTORY="+inventory)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("cleanup: %v %s", err, out)
+		}
+		calls := fakes.calls(t)
+		if strings.Contains(calls, " delete ") || strings.Contains(calls, "aws eks") {
+			t.Fatalf("unowned namespace triggered cleanup: %s", calls)
+		}
+	}
+}
+
+func TestTrinoSecondaryNamespaceCleanupRequiresOwnershipAndUID(t *testing.T) {
+	for _, tc := range []struct {
+		name, object string
+		allowed      bool
+	}{
+		{"owned", `{"metadata":{"name":"duckgres-ci-pr-0123","uid":"test-uid","labels":{"app.kubernetes.io/managed-by":"e2e-mw-dev","duckgres.posthog.com/ci-pr":"123","duckgres.posthog.com/ci-component":"trino-cell"}}}`, true},
+		{"unowned", `{"metadata":{"name":"duckgres-ci-pr-0123","uid":"test-uid","labels":{"app.kubernetes.io/managed-by":"e2e-mw-dev","duckgres.posthog.com/ci-pr":"999","duckgres.posthog.com/ci-component":"trino-cell"}}}`, false},
+		{"missing-uid", `{"metadata":{"name":"duckgres-ci-pr-0123","labels":{"app.kubernetes.io/managed-by":"e2e-mw-dev","duckgres.posthog.com/ci-pr":"123","duckgres.posthog.com/ci-component":"trino-cell"}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+			cmd := runSHCommand(t, fakes.binDir, "e2e-cleanup", "RUN_SH_TEST_NAMESPACE_INVENTORY=duckgres-ci-pr-0123 2026-01-01T00:00:00Z 123 trino-cell", "RUN_SH_TEST_SECONDARY_NAMESPACE="+tc.object)
+			out, err := cmd.CombinedOutput()
+			if tc.allowed && err != nil {
+				t.Fatalf("owned cleanup failed: %v %s", err, out)
+			}
+			if !tc.allowed && err == nil {
+				t.Fatal("unowned cleanup must fail")
+			}
+			calls := fakes.calls(t)
+			if strings.Contains(calls, "delete --raw /api/v1/namespaces/duckgres-ci-pr-0123") != tc.allowed {
+				t.Fatalf("wrong deletion decision: %s", calls)
+			}
+			if tc.allowed && !strings.Contains(calls, `"uid": "test-uid"`) {
+				t.Fatal("namespace delete lost UID precondition")
+			}
+			if strings.Contains(calls, "ducklings") || strings.Contains(calls, "cnpg-shards") {
+				t.Fatal("secondary cleanup touched primary warehouse resources")
+			}
+		})
+	}
+}
+
+func TestTrinoNamespaceRejectsNoncanonicalPRNumbers(t *testing.T) {
+	for _, pr := range []string{"0", "0123", "-1", "123x"} {
+		fakes := newRunSHFakes(t)
+		cmd := runSHCommand(t, fakes.binDir, "deploy", "PR_NUMBER="+pr, "NAMESPACE=duckgres-ci-pr-"+pr)
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("noncanonical PR accepted: %s %s", pr, out)
+		}
+	}
+}
+
+func TestTrinoMulticellHarnessExercisesRealPlacementAndHydration(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino-multicell.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`/trino/cell`, `registered:cell-test`, `green catalog hydration`,
+		`/bundles/trino/cell-test`, `trino-blue-internal`, `trino-green-internal`,
+		`legacy remains queryable`, `SELECT COUNT(*)`,
+		`'{"enabled":true,"tier":"free"}'`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("missing real fleet assertion %q", want)
+		}
+	}
+}

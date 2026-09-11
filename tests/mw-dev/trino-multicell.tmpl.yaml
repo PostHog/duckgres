@@ -1,0 +1,126 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${TRINO_CELL_NAMESPACE}
+  labels:
+    app.kubernetes.io/managed-by: e2e-mw-dev
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+    duckgres.posthog.com/ci-component: trino-cell
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trino-blue-internal
+  namespace: ${TRINO_CELL_NAMESPACE}
+stringData:
+  shared-secret: "${TRINO_BLUE_INTERNAL_SECRET}"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trino-green-internal
+  namespace: ${TRINO_CELL_NAMESPACE}
+stringData:
+  shared-secret: "${TRINO_GREEN_INTERNAL_SECRET}"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-cell-registry
+  namespace: ${NAMESPACE}
+data:
+  cells.json: |
+    {"cells":[{"id":"cell-test","namespace":"${TRINO_CELL_NAMESPACE}","routing_group":"cell-test","client_url":"https://duckgres-trino-blue.${TRINO_CELL_NAMESPACE}.svc:8443","backends":[{"id":"blue","coordinator_url":"https://duckgres-trino-blue.${TRINO_CELL_NAMESPACE}.svc:8443","running":true,"routing_active":true,"internal_secret_name":"trino-blue-internal"},{"id":"green","coordinator_url":"https://duckgres-trino-green.${TRINO_CELL_NAMESPACE}.svc:8443","running":false,"routing_active":false,"internal_secret_name":"trino-green-internal"}]}]}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trino-cell-projection
+  namespace: ${TRINO_CELL_NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["trino-auth", "trino-tenant-secrets", "trino-opa-bundle-token"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["trino-blue-internal", "trino-green-internal"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["trino-resource-groups"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["duckgres-trino-blue-coordinator", "duckgres-trino-blue-worker", "duckgres-trino-green-coordinator", "duckgres-trino-green-worker"]
+    verbs: ["get", "patch", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trino-cell-projection
+  namespace: ${TRINO_CELL_NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: duckgres
+    namespace: ${NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: trino-cell-projection
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trino-cell-harness
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["duckgres-control-plane"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["trino-cell-registry"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trino-cell-harness
+  namespace: ${NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: duckgres
+    namespace: ${NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: trino-cell-harness
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: trino-cell-to-control-plane
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [duckgres-control-plane, duckgres-config-store]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${TRINO_CELL_NAMESPACE}
+      ports:
+        - { protocol: TCP, port: 5432 }
+        - { protocol: TCP, port: 8080 }
