@@ -137,7 +137,12 @@ func RegisterAPI(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucke
 // response hands back is the ingress the credential authenticates against. An
 // empty ingressSuffix falls back to DefaultManagedIngressSuffix.
 func RegisterAPIWithIngressSuffix(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout, ingressSuffix string) {
-	h := &handler{store: store, bucketSuffix: bucketSuffix, peerFanout: peerFanout, ingressSuffix: ingressSuffix}
+	RegisterAPIWithTrinoAdmission(r, store, tenantStore, bucketSuffix, peerFanout, ingressSuffix, nil)
+}
+
+// RegisterAPIWithTrinoAdmission optionally checks cell assignment before enabling Trino.
+func RegisterAPIWithTrinoAdmission(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout, ingressSuffix string, admission func(string) error) {
+	h := &handler{store: store, bucketSuffix: bucketSuffix, peerFanout: peerFanout, ingressSuffix: ingressSuffix, trinoAdmission: admission}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
@@ -180,7 +185,8 @@ func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
 }
 
 type handler struct {
-	store Store
+	store          Store
+	trinoAdmission func(string) error
 	// bucketSuffix is the env suffix (e.g. "mw-prod-us") used to compute the
 	// CP-owned s3bucket name; empty disables CP naming. See
 	// configstore.DucklingBucketName.
@@ -483,6 +489,9 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	// extra per-Trino constraint.
 	var trinoSettings *configstore.TrinoSettings
 	if req.Trino != nil && req.Trino.Enabled {
+		if !h.admitTrino(c, orgID) {
+			return
+		}
 		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier}
 	}
 
@@ -623,6 +632,9 @@ func (h *handler) enableTrino(c *gin.Context) {
 		return
 	}
 
+	if !h.admitTrino(c, orgID) {
+		return
+	}
 	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

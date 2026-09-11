@@ -198,7 +198,10 @@ returns the persisted `trino.trino_cell_id`. Registered cells use separate
 `registered:<cell-id>` ownership values. Unknown stored owners fail closed.
 
 `GET /api/v1/trino/cells` lists configured logical cells. Operational Trino
-routes accept `?cell=<logical-id>` and default to `legacy`. Org detail resolves
+routes accept `?cell=<logical-id>` and default to `legacy` only when configured.
+Registry-only deployments require an explicit cell parameter; the Trino pages
+provide a cell selector. Unassigned org details expose no coordinator or client
+coordinates and allow initial selection before enablement. Org detail resolves
 its authoritative stored assignment regardless of a supplied cell parameter.
 Each coordinator has separate caches; tenant counts include only its cell.
 
@@ -294,7 +297,7 @@ an API consumer requires the previous displayed ID.
 - Neither route carries a node id or version, so worker version skew is not
   observable there; the Nodes page's pod projection (running images) is where
   that lives.
-- No cell configured (`DUCKGRES_TRINO_COORDINATOR_URL` unset) leaves every
+- No legacy URL or registry configured leaves every
   route unregistered, and the SPA renders a "no cell" state off the 404.
 
 Touching this → update `trino_test.go`, `trino_client_test.go`,

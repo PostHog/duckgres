@@ -8,6 +8,7 @@ import { StatCard } from "@/components/StatCard";
 import { StateBadge } from "@/components/StateBadge";
 import { EmptyState, TableSkeleton } from "@/components/states";
 import { OrgRef } from "@/components/OrgRef";
+import { TrinoCellPicker } from "@/components/TrinoCellPicker";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useOrgLabels, useTrinoNodes, useTrinoOrgs, useTrinoStatus } from "@/hooks/useApi";
 import { fmtDurationMs, fmtInt, fmtPercent, fmtTime } from "@/lib/format";
@@ -45,6 +46,7 @@ export function TrinoCluster() {
     <>
       <PageHeader
         title="Trino cell"
+        actions={<TrinoCellPicker />}
         description={
           status.data?.cell.id
             ? `${status.data.cell.id} · ${status.data.cell.coordinator_url}`

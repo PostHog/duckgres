@@ -15,6 +15,12 @@ Keep the existing `DUCKGRES_TRINO_COORDINATOR_URL`, namespace, TLS name, and cel
 ID unchanged; they continue to describe legacy. A registry without a legacy
 coordinator is rejected, rather than silently abandoning existing warehouses.
 
+For a deployment that has no legacy coordinator, explicitly set
+`DUCKGRES_TRINO_REGISTRY_ONLY=true` (default `false`). This requires a nonempty,
+valid `DUCKGRES_TRINO_CELLS_FILE` and rejects a configured legacy coordinator
+URL. It bootstraps only registered cells and exposes no legacy bundle endpoint.
+Existing legacy ownership is never reinterpreted or migrated.
+
 ```json
 {
   "cells": [
@@ -75,8 +81,17 @@ Use the authenticated operator console to select a cell **before first enabling
 Trino**, or use its admin-only `PUT /api/v1/orgs/<org>/trino/cell` endpoint with
 `{"cell":"cell-001"}`. Selection itself does not enable Trino. Unselected new
 warehouses retain the existing default: legacy claims them when enabled.
+In registry-only mode there is no default placement: both enablement endpoints
+reject an unassigned warehouse with "select an initial Trino cell before
+enabling Trino". Provision without Trino, select the initial cell, then enable.
+Already-enabled unassigned rows remain unprovisioned; disable them before
+initial selection. Unknown stored ownership fails closed without mutation.
 Assignments survive disable/re-enable. Already owned warehouses cannot change
 cells through this endpoint, even when disabled.
+
+Operational API calls require `?cell=<logical-id>` when no legacy cell exists.
+The Trino pages provide an explicit cell selector; they never select an arbitrary
+registered cell. The legacy default remains unchanged when legacy is configured.
 
 `client_url` is the opaque client endpoint, not a cell-selection instruction to
 customers. This PR does not implement authenticated Gateway assignment lookup.

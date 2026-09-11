@@ -9,6 +9,51 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
+func TestTrinoRegistryOnlyAdminHasNoImplicitCell(t *testing.T) {
+	client := &fakeTrinoCoordinator{}
+	store := &selectingTrinoStore{fakeTrinoOrgStore: fakeTrinoOrgStore{rows: map[string]*configstore.ManagedWarehouseTrino{}}}
+	api := NewTrinoFleetAPI([]TrinoCell{{ID: "cell-test", StoredID: "registered:cell-test", ClientURL: "https://gateway.example.test"}}, []TrinoCoordinatorClient{client}, store, nil)
+	r := trinoTestRouter(api, RoleAdmin)
+	for _, path := range []string{"status", "queries", "nodes", "orgs", "queries/query"} {
+		code, _ := doTrinoJSON(t, r, http.MethodGet, "/api/v1/trino/"+path, "")
+		if code != http.StatusBadRequest {
+			t.Errorf("missing explicit cell for %s: %d", path, code)
+		}
+	}
+	for _, row := range []*configstore.ManagedWarehouseTrino{nil, {OrgID: "tenant"}, {OrgID: "tenant", Enabled: true, State: configstore.ManagedWarehouseStateReady}} {
+		store.rows["tenant"] = row
+		code, data := doTrinoJSON(t, r, http.MethodGet, "/api/v1/orgs/tenant/trino", "")
+		if code != http.StatusOK || data["assigned"] != false || data["available"] != false || data["cell"].(map[string]any)["id"] != "" {
+			t.Fatalf("unassigned detail: %d %#v", code, data)
+		}
+		if row != nil && row.Enabled {
+			status := data["status"].(map[string]any)
+			if status["connection"] != nil || status["state"] != "pending" || status["status_message"] == "" {
+				t.Fatalf("unassigned falsely ready: %#v", status)
+			}
+		}
+	}
+	for _, owner := range []string{"cell-001", "legacy", "unknown"} {
+		store.rows["tenant"] = &configstore.ManagedWarehouseTrino{OrgID: "tenant", Enabled: true, TrinoCellID: owner}
+		code, _ := doTrinoJSON(t, r, http.MethodGet, "/api/v1/orgs/tenant/trino", "")
+		if code != http.StatusConflict || store.rows["tenant"].TrinoCellID != owner {
+			t.Fatalf("unknown owner changed or accepted: %s %d", owner, code)
+		}
+	}
+	if client.queryCalls.Load() != 0 {
+		t.Fatal("unassigned/unknown rows reached a coordinator")
+	}
+	store.rows["tenant"] = &configstore.ManagedWarehouseTrino{OrgID: "tenant"}
+	code, _ := doTrinoJSON(t, r, http.MethodPut, "/api/v1/orgs/tenant/trino/cell", `{"cell":"cell-test"}`)
+	if code != http.StatusOK || store.selected != "registered:cell-test" {
+		t.Fatalf("explicit selection failed: %d", code)
+	}
+	code, _ = doTrinoJSON(t, r, http.MethodGet, "/api/v1/trino/queries?cell=cell-test", "")
+	if code != http.StatusOK {
+		t.Fatalf("explicit cell unavailable: %d", code)
+	}
+}
+
 func TestTrinoFleetSelectsAuthoritativeOwner(t *testing.T) {
 	legacy := &fakeTrinoCoordinator{}
 	current := &fakeTrinoCoordinator{queries: []TrinoQuery{{Principal: "tenant"}}}

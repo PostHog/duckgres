@@ -9,6 +9,7 @@ const hooks = vi.hoisted(() => ({
   useOrgLabels: vi.fn(),
   useTrinoQueries: vi.fn(),
   useTrinoStatus: vi.fn(),
+  useTrinoCells: vi.fn(),
 }));
 vi.mock("@/hooks/useApi", () => hooks);
 
@@ -85,6 +86,7 @@ function statValue(label: string): string {
 describe("TrinoQueries page", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    hooks.useTrinoCells.mockReturnValue(ok({ cells: [{ id: "legacy" }] }));
     identity.useIdentity.mockReturnValue({ isAdmin: true });
     hooks.useKillTrinoQuery.mockReturnValue({ mutate: vi.fn(), isPending: false, isError: false });
     hooks.useOrgLabels.mockReturnValue(new Map([["org-a-id", "product_analytics"]]));

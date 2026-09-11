@@ -113,6 +113,35 @@ func TestTrinoRegisteredCellNeverClaimsUnassignedTenants(t *testing.T) {
 	}
 }
 
+func TestTrinoRegistryOnlyCannotProjectLegacyOrUnassignedTenants(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "old", DatabaseName: "old", CellID: "cell-001", RootPasswordHash: "old-hash"},
+		{OrgID: "unassigned", DatabaseName: "unassigned", RootPasswordHash: "unassigned-hash"},
+		{OrgID: "selected", DatabaseName: "selected", CellID: "registered:cell-test", RootPasswordHash: "selected-hash"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"old": readyWarehouse("old"), "unassigned": readyWarehouse("unassigned"), "selected": readyWarehouse("selected")})
+	h.provisioner.cellID = "registered:cell-test"
+	h.provisioner.explicitAssignmentOnly = true
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.store.claimLog) != 0 || len(h.catalog.created) != 1 || h.catalog.created[TrinoCatalogName("selected")] == nil {
+		t.Fatal("registry-only projected or claimed an unowned tenant")
+	}
+	auth := getSecret(t, h.kube, TrinoAuthSecretName)
+	for _, org := range []string{"old", "unassigned"} {
+		if _, ok := h.store.lastState(org); ok {
+			t.Fatal("unowned state mutated")
+		}
+		if strings.Contains(string(auth.Data[TrinoAuthSecretKeyPasswordDB]), org+":") || h.builder.last[TrinoGroupName(org)] != nil {
+			t.Fatal("unowned auth/OPA leaked")
+		}
+	}
+	if state, ok := h.store.lastState("selected"); !ok || state.State != configstore.ManagedWarehouseStateReady {
+		t.Fatal("selected tenant did not provision")
+	}
+}
+
 type lostClaimStore struct{ *fakeTrinoStore }
 
 func (s lostClaimStore) AssignTrinoCell(string, string) error        { return nil }

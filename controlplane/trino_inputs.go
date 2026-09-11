@@ -38,12 +38,10 @@ func newTrinoKubeClient() (kubernetes.Interface, error) {
 //
 // Intent inference (no explicit on/off gate):
 //
-//	Enablement is signaled by setting DUCKGRES_TRINO_COORDINATOR_URL.
-//	If the URL is empty, the provisioner branch is off and existing
-//	non-MW deployments stay unaffected. If the URL is set, the other
-//	required env vars must also be set; missing-required-value errors
-//	are fatal at startup (silently no-op'ing wouldn't help — the chart
-//	side would be waiting forever for projections that never come).
+//	A coordinator URL or registry configuration enables the branch.
+//	Registry-only deployments require explicit opt-in and a valid registry.
+//	Invalid or incomplete requested configuration fails startup.
+//	With neither configuration, existing deployments remain unaffected.
 //
 // Credentials are NOT env vars:
 //
@@ -56,8 +54,8 @@ func newTrinoKubeClient() (kubernetes.Interface, error) {
 const (
 	// envTrinoCoordinatorURL is the Trino coordinator's REST endpoint,
 	// e.g. https://trino-coordinator.trino-customer.svc:8443. Setting
-	// this to a non-empty value enables the Trino provisioner branch;
-	// leaving it empty disables it. Required configuration when enabled.
+	// this to a non-empty value enables the legacy Trino provisioner.
+	// Only explicit registry-only mode permits a fleet without this URL.
 	//
 	// This URL continues to identify the legacy cell when a registry is mounted.
 	envTrinoCoordinatorURL = "DUCKGRES_TRINO_COORDINATOR_URL"
@@ -114,9 +112,11 @@ const (
 )
 
 // trinoProvisionerEnabled recognizes legacy or registry configuration.
-// A registry still requires the legacy URL to preserve existing ownership.
+// Registry-only mode must reach validation even when its registry is missing.
 func trinoProvisionerEnabled() bool {
-	return strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" || strings.TrimSpace(os.Getenv(envTrinoCellsFile)) != ""
+	mode := strings.TrimSpace(os.Getenv(envTrinoRegistryOnly))
+	registryOnly, err := strconv.ParseBool(mode)
+	return strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" || strings.TrimSpace(os.Getenv(envTrinoCellsFile)) != "" || registryOnly || (mode != "" && err != nil)
 }
 
 // trinoCell separates durable ownership from the operator-visible identity.

@@ -39,6 +39,52 @@ func TestTrinoRegistryRuntimePreservesLegacyAndSkipsStoppedBackend(t *testing.T)
 
 const testTrinoRegistryJSON = `{"cells":[{"id":"cell-test","namespace":"trino-test","client_url":"https://gateway.example.test","routing_group":"cell-test","backends":[{"id":"blue","coordinator_url":"https://blue.example.test","running":true,"routing_active":true,"internal_secret_name":"blue-internal"},{"id":"green","coordinator_url":"https://green.example.test","running":false,"routing_active":false,"internal_secret_name":"green-internal"}]}]}`
 
+func TestTrinoRegistryOnlyRequiresExplicitValidConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cells.json")
+	if err := os.WriteFile(path, []byte(testTrinoRegistryJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, mode, url, file string
+		valid                 bool
+	}{
+		{"explicit", "true", "", path, true},
+		{"default still requires legacy", "", "", path, false},
+		{"disabled still requires legacy", "false", "", path, false},
+		{"mixed", "true", "https://legacy.example.test", path, false},
+		{"missing registry", "true", "", "", false},
+		{"unreadable registry", "true", "", path + "-missing", false},
+		{"invalid boolean", "invalid", "", path, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DUCKGRES_TRINO_REGISTRY_ONLY", tc.mode)
+			t.Setenv(envTrinoCoordinatorURL, tc.url)
+			t.Setenv(envTrinoCellsFile, tc.file)
+			if !trinoProvisionerEnabled() {
+				t.Fatal("explicit or invalid Trino configuration must reach startup validation")
+			}
+			cells, err := resolveTrinoCells()
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v error=%v", tc.valid, err)
+			}
+			if tc.valid && (len(cells) != 1 || cells[0].PublicID != "cell-test" || cells[0].ID != "registered:cell-test") {
+				t.Fatalf("unexpected registry-only fleet: %+v", cells)
+			}
+		})
+	}
+}
+
+func TestTrinoRegistryOnlyDisabledLeavesUnconfiguredDeploymentOff(t *testing.T) {
+	t.Setenv(envTrinoCoordinatorURL, "")
+	t.Setenv(envTrinoCellsFile, "")
+	for _, value := range []string{"", "false", "0"} {
+		t.Setenv(envTrinoRegistryOnly, value)
+		if trinoProvisionerEnabled() {
+			t.Fatalf("disabled mode %q unexpectedly enabled Trino", value)
+		}
+	}
+}
+
 func TestTrinoRegistryPreservesStoppedBackend(t *testing.T) {
 	cells, err := parseTrinoCellRegistry([]byte(testTrinoRegistryJSON))
 	if err != nil {

@@ -122,3 +122,46 @@ TRINO="$BLUE_TRINO"
 TRINO="$LEGACY_TRINO"
 [ "$(trino_query "$DB_A" "$pw_a" 'SELECT 1')" = '[[1]]' ] || fail "legacy failed during green hydration"
 log "PASS: initial placement + stopped green + isolated credentials/OPA + real DuckLake queries + green hydration"
+
+log "registry-only startup without legacy"
+legacy_env="$("$KUBECTL" -n "$NS" get deployment duckgres-control-plane -o json | jq -c '.spec.template.spec.containers[] | select(.name == "controlplane") | .env[] | select(.name == "DUCKGRES_TRINO_COORDINATOR_URL")')"
+[ -n "$legacy_env" ] || fail "missing legacy configuration before registry-only test"
+legacy_owner="$(api "$API/api/v1/orgs/$ORG_A" | jq -r .trino.trino_cell_id)"
+"$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"controlplane","env":[{"name":"DUCKGRES_TRINO_COORDINATOR_URL","$patch":"delete"},{"name":"DUCKGRES_TRINO_REGISTRY_ONLY","value":"true"}]}]}}}}' >/dev/null
+"$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
+api "$API/api/v1/trino/cells" | jq -e '.cells | map(.id) == ["cell-test"]' >/dev/null \
+  || fail "registry-only startup invented a legacy cell"
+wait_cell_ready
+for endpoint in "$BLUE_TRINO" "$GREEN_TRINO"; do
+  TRINO="$endpoint"
+  [ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
+    || fail "registry-only registered query failed"
+done
+code="$(curl --connect-timeout 5 --max-time 30 -sS -o /dev/null -w '%{http_code}' -H "$H" -H 'Content-Type: application/json' \
+  -X POST -d '{"enabled":true,"tier":"free"}' "$API/api/v1/orgs/$ORG_A/trino")"
+[ "$code" = 409 ] || fail "registry-only enablement accepted legacy ownership"
+api -X POST -H 'Content-Type: application/json' -d '{"enabled":true,"tier":"free"}' "$API/api/v1/orgs/$ORG_C/trino" >/dev/null
+for endpoint in "/api/v1/orgs/$ORG_A/trino" "/api/v1/trino/status"; do
+  code="$(curl --connect-timeout 5 --max-time 30 -sS -o /dev/null -w '%{http_code}' -H "$H" "$API$endpoint")"
+  if [ "$endpoint" = "/api/v1/trino/status" ]; then
+    [ "$code" = 400 ] || fail "registry-only implicitly selected a cell"
+  else
+    [ "$code" = 409 ] || fail "registry-only exposed legacy-owned warehouse"
+  fi
+done
+code="$(curl --connect-timeout 5 --max-time 30 -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $cell_token" "$API/bundles/trino")"
+[ "$code" = 404 ] || fail "registry-only exposed legacy bundle endpoint"
+api "$API/api/v1/orgs/$ORG_A" | jq -e --arg owner "$legacy_owner" '.trino.trino_cell_id == $owner' >/dev/null \
+  || fail "registry-only changed legacy ownership"
+api "$API/api/v1/orgs/ci-pr-$PR-unassigned/trino" \
+  | jq -e '.assigned == false and .enabled == false and .available == false and .cell.id == ""' >/dev/null \
+  || fail "registry-only initial selection required but not accessible"
+
+log "restore legacy fixture configuration"
+patch="$(printf %s "$legacy_env" | jq -c '{spec:{template:{spec:{containers:[{name:"controlplane",env:[.,{name:"DUCKGRES_TRINO_REGISTRY_ONLY","$patch":"delete"}]}]}}}}')"
+"$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch" >/dev/null
+"$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
+TRINO="$LEGACY_TRINO"
+[ "$(trino_query "$DB_A" "$pw_a" 'SELECT 1')" = '[[1]]' ] || fail "legacy query failed after registry-only fixture restore"
+log "PASS: registry-only startup + explicit selection + no legacy dependency + restored fixture"

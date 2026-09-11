@@ -542,6 +542,16 @@ queries the same data through green's independently hydrated catalog. Direct
 coordinator URLs are fixture-only; this does not test Gateway routing or a
 maintenance move of an existing warehouse.
 
+After these checks, the lane restarts its control plane in registry-only mode,
+verifies both registered backends still query the warehouse, rejects legacy
+ownership and implicit cell selection, and verifies the legacy bundle endpoint
+is absent. It restores the original configuration on success. Workflow teardown
+removes the disposable namespaces on failure, including during this phase.
+The registry-only phase also checks enablement admission for existing registered
+and legacy-owned warehouses. Initial assignment without a legacy default is
+covered by startup, admin, provisioning, and projection package tests; the
+real initial-placement flow runs earlier while both cells are configured.
+
 The fixture preserves the existing CI network-policy posture. It does not
 create network policies or add cluster-wide RBAC grants. Isolation assertions
 cover application authentication and OPA authorization, not network isolation.
