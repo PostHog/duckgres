@@ -1,5 +1,5 @@
 name: posthog-frozen-ducklake-golden-v4
-description: Identical query shapes with protocol-isolated, balanced execution order over frozen raw Parquet views and production-shaped DuckLake tables.
+description: Identical query shapes with protocol-isolated, balanced execution order over frozen raw Parquet views and DuckLake tables on PGWire, Hoglake tables on Trino, and Athena external tables.
 seed: 42
 dataset_scale: 1
 targets:
@@ -16,6 +16,9 @@ relation_variants:
     events: frozen_v1.events_file_view
     persons: frozen_v1.persons_file_view
   ducklake_table:
+    events: posthog.events
+    persons: posthog.persons
+  hoglake_table:
     events: posthog.events
     persons: posthog.persons
   athena_external:

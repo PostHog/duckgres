@@ -142,6 +142,12 @@ func validateRelationVariants(targets []Protocol, variants map[StorageTarget]map
 	}
 	requiredTargets := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable}
 	for _, target := range targets {
+		if target == ProtocolTrino || target == ProtocolTrinoCached {
+			requiredTargets = append(requiredTargets, StorageTargetHoglakeTable)
+			break
+		}
+	}
+	for _, target := range targets {
 		if target == ProtocolAthena {
 			requiredTargets = append(requiredTargets, StorageTargetAthenaExternal)
 			break
@@ -182,6 +188,9 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 	}
 
 	targets := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable}
+	if _, ok := variants[StorageTargetHoglakeTable]; ok {
+		targets = append(targets, StorageTargetHoglakeTable)
+	}
 	if _, ok := variants[StorageTargetAthenaExternal]; ok {
 		targets = append(targets, StorageTargetAthenaExternal)
 	}
@@ -204,12 +213,10 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 			StorageTarget: target,
 		})
 	}
-	renderedSQL := make(map[string]struct{}, len(queries))
-	for _, query := range queries {
-		if _, exists := renderedSQL[query.PGWireSQL]; exists {
-			return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets", def.QueryIDBase)
-		}
-		renderedSQL[query.PGWireSQL] = struct{}{}
+	// Identical relation names are valid across engines, but the raw-view and
+	// DuckLake variants run on the same PGWire target and must differ.
+	if queries[0].PGWireSQL == queries[1].PGWireSQL {
+		return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets", def.QueryIDBase)
 	}
 	return queries, nil
 }

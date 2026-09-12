@@ -124,6 +124,7 @@ func TestScenarioRunner(t *testing.T) {
 
 func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSteps(t *testing.T) {
 	const scenarioOrgID = "ci-pr-123-cnpg"
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", scenarioOrgID)
 
 	scenario, err := core.LoadScenario(filepath.Join("scenarios", "provision_smoke.yaml"))
@@ -163,7 +164,9 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 }
 
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	const scenarioOrgID = "ci-pr-123-cnpg"
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 	setAthenaPerfEnv(t)
 	t.Setenv("DUCKGRES_K8S_WORKER_CPU_REQUEST", "3")
@@ -451,6 +454,7 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 }
 
 func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
@@ -513,6 +517,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 }
 
 func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
@@ -566,8 +571,17 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 	if enabled, _ := trinoRequest["enabled"].(bool); !enabled {
 		t.Fatalf("Trino provision request = %#v, want enabled", provisionRequest["trino"])
 	}
-	if got := steps["perf_queries"].DependsOn; len(got) != 2 || got[0] != "validate_posthog_tables" || got[1] != "wait_trino_ready" {
-		t.Fatalf("perf dependencies = %#v, want [validate_posthog_tables wait_trino_ready]", got)
+	hoglake := steps["setup_hoglake"]
+	if hoglake.Type != scenarioperf.StepTypeSetupHoglake || len(hoglake.DependsOn) != 1 || hoglake.DependsOn[0] != "validate_posthog_tables" {
+		t.Fatalf("Hoglake setup must follow fixture validation: %#v", hoglake)
+	}
+	if file, _ := hoglake.With["file"].(string); file == "" {
+		t.Fatal("missing Hoglake setup script")
+	} else if _, err := os.Stat(file); err != nil {
+		t.Fatal(err)
+	}
+	if got := steps["perf_queries"].DependsOn; len(got) != 2 || got[0] != "setup_hoglake" || got[1] != "wait_trino_ready" {
+		t.Fatalf("perf dependencies = %#v, want [setup_hoglake wait_trino_ready]", got)
 	}
 }
 
@@ -914,7 +928,7 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 		return e.provision.ExecuteStep(ctx, step)
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return e.sql.ExecuteStep(ctx, step)
-	case scenarioperf.StepTypePerfQueries:
+	case scenarioperf.StepTypePerfQueries, scenarioperf.StepTypeSetupHoglake:
 		return e.perf.ExecuteStep(ctx, step)
 	case scenariodbt.StepTypeDBTRun:
 		return e.dbt.ExecuteStep(ctx, step)
@@ -936,7 +950,7 @@ func dispatchSupports(stepType string) bool {
 		return true
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return true
-	case scenarioperf.StepTypePerfQueries:
+	case scenarioperf.StepTypePerfQueries, scenarioperf.StepTypeSetupHoglake:
 		return true
 	case scenariodbt.StepTypeDBTRun:
 		return true

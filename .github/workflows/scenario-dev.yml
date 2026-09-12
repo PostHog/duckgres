@@ -77,7 +77,7 @@ jobs:
       # Frozen perf uses a namespace-local Trino cell. The dedicated role is
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      TRINO_IMAGE: ghcr.io/posthog/trino:59184e0c58c2fdbde031f3a08787c926dc4d7f69@sha256:a7072f7c86fcbb815c2502bb455b27bc4679d201ad6ce81725378a7c5ce84325
+      TRINO_IMAGE: ghcr.io/posthog/trino:a2943f5ec37f1d5a9ab90b9bec56695a00de4584@sha256:7a57712498446bd97393cadece90ce0bc297f6feab8e0098510668fe2667ac39
       E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}${{ strategy.job-index }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ strategy.job-index }}
@@ -128,8 +128,8 @@ jobs:
       - name: Update kubeconfig
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
 
-      - name: Load Athena perf configuration
-        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
+      - name: Load frozen perf identity and Athena configuration
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_trino_cached'
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
       - name: Deploy isolated Duckgres stack

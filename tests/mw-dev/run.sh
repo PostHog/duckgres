@@ -35,8 +35,14 @@ case "$E2E_SUITE" in
   neutral|duckdb|trino|reshard) ;;
   *) echo "E2E_SUITE must be neutral, duckdb, trino, or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
 esac
-TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8}"
+# Frozen perf requires the Hoglake connector; other E2E lanes retain their pin.
+if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_trino_cached ]; then
+  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:a2943f5ec37f1d5a9ab90b9bec56695a00de4584@sha256:7a57712498446bd97393cadece90ce0bc297f6feab8e0098510668fe2667ac39}"
+else
+  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8}"
+fi
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
+HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:f10c34f9c779e2794fca662d5302f97dc26e48a6b2a601ae344cad945e70483c}"
 # Derive cache mode from the scenario so reported protocol and catalog agree.
 TRINO_FILESYSTEM_CACHE_ENABLED=false
 if [ "$SCENARIO_NAME" = "posthog_frozen_perf_trino_cached" ]; then
@@ -83,6 +89,14 @@ require_pr_identity() {
     return 2
   fi
   TRINO_CELL_NS="duckgres-ci-pr-0${PR_NUMBER}"
+}
+
+frozen_perf_scenario() {
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_trino_cached ]
+}
+
+hoglake_perf_enabled() {
+  [ "$E2E_SUITE" = trino ] && frozen_perf_scenario
 }
 
 trino_multicell_enabled() {
@@ -174,6 +188,10 @@ render() {
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
       envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
       < "$HERE/manifests.trino.tmpl.yaml"
+    if hoglake_perf_enabled; then
+      NAMESPACE="$NS" HOGLAKE_IMAGE="$HOGLAKE_IMAGE" AWS_REGION="$AWS_REGION" \
+        envsubst '$NAMESPACE $HOGLAKE_IMAGE $AWS_REGION' < "$HERE/manifests.hoglake.tmpl.yaml"
+    fi
     if trino_multicell_enabled; then render_trino_multicell; fi
   fi
 }
@@ -248,7 +266,7 @@ ensure_trino_pod_identity() {
 }
 
 ensure_scenario_pod_identity() {
-  : "${SCENARIO_POD_IDENTITY_ROLE:?SCENARIO_POD_IDENTITY_ROLE is required for the Athena perf scenario}"
+  : "${SCENARIO_POD_IDENTITY_ROLE:?SCENARIO_POD_IDENTITY_ROLE is required for frozen perf scenarios}"
   create_pod_identity "$SCENARIO_SA_NAME" "$SCENARIO_POD_IDENTITY_ROLE"
   # Pod Identity is injected only at pod admission. Let the association reach
   # the node agent before test-scenario creates the runner Job.
@@ -420,7 +438,7 @@ cmd_deploy() {
   ensure_pod_identity
   restart_cp_with_identity
 
-  if [ "$SCENARIO_NAME" = "posthog_frozen_perf" ]; then
+  if frozen_perf_scenario; then
     ensure_scenario_pod_identity
   fi
 
@@ -428,6 +446,16 @@ cmd_deploy() {
     # Associate before admitting Trino pods: the Pod Identity agent injects
     # credentials only at admission and never retrofits an existing pod.
     ensure_trino_pod_identity
+    if hoglake_perf_enabled; then
+      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake-postgres --timeout=120s
+      # Allow the association to reach the node agent before pod admission.
+      sleep 15
+      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-hoglake \
+        --type=merge -p '{"spec":{"replicas":1}}'
+      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake --timeout=300s
+      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
+        "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"controlplane\",\"env\":[{\"name\":\"DUCKGRES_TRINO_HOGLAKE_URI\",\"value\":\"http://duckgres-hoglake.$NS.svc:8080\"}]}]}}}}"
+    fi
     if trino_multicell_enabled; then
       NS="$TRINO_CELL_NS" ensure_trino_pod_identity
       "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
@@ -619,6 +647,9 @@ run_scenario() {
   internal_secret="$(cat "$internal_secret_file")"
   job="$(scenario_job_name "$scenario_name")"
 
+  local hoglake_uri=""
+  if hoglake_perf_enabled; then hoglake_uri="http://duckgres-hoglake.$NS.svc:8080"; fi
+
   delete_scenario_job "$job"
   cat <<YAML | "${KUBECTL[@]}" -n "$NS" apply -f -
 apiVersion: batch/v1
@@ -650,6 +681,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_PG_HOST, value: "$pg" }
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
+            - { name: DUCKGRES_SCENARIO_HOGLAKE_URI, value: "$hoglake_uri" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
             # Only the throwaway benchmark config store; never a shared dev/prod store.
             - name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
@@ -898,6 +930,10 @@ cmd_diagnostics() {
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c trino-coordinator --tail=300 || true
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c duckgres-trino-opa --tail=300 || true
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-worker -c trino-worker --tail=300 || true
+  if hoglake_perf_enabled; then
+    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-hoglake --tail=300 || true
+    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-hoglake-postgres --tail=100 || true
+  fi
   echo "::endgroup::"
   echo "::group::worker pods"
   "${KUBECTL[@]}" -n "$NS" get pods -l app=duckgres-worker -o wide || true
