@@ -78,6 +78,10 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 		}
 	}
 
+	if err := r.validateRepresentations(ctx); err != nil {
+		return summary, err
+	}
+
 	for _, protocol := range r.cfg.Catalog.Targets {
 		warmupIterations := r.cfg.Catalog.WarmupIterations
 		for i := 0; i < warmupIterations; i++ {
@@ -120,6 +124,7 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 		started := r.cfg.Now()
 		result := QueryResult{
 			QueryID:          query.QueryID,
+			Representation:   query.Representation,
 			IntentID:         query.IntentID,
 			MeasureIteration: measureIteration,
 			Protocol:         protocol,
@@ -164,6 +169,18 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 // table, Trino measures the shared DuckLake table, and Athena measures its
 // Glue external table over the same immutable Parquet files.
 func querySupportsProtocol(query Query, protocol Protocol) bool {
+	if len(query.Targets) > 0 {
+		allowed := false
+		for _, target := range query.Targets {
+			if target == protocol {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
 	switch query.StorageTarget {
 	case "":
 		return true

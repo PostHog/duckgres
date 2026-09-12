@@ -417,6 +417,23 @@ func validateCatalog(c Catalog) error {
 		if q.PGWireSQL == "" {
 			return fmt.Errorf("query %s missing pgwire_sql", q.QueryID)
 		}
+		if q.Representation != "" && q.Representation != "json" && q.Representation != "struct" && q.Representation != "variant" {
+			return fmt.Errorf("query %s has unsupported representation %q", q.QueryID, q.Representation)
+		}
+		queryTargets := q.Targets
+		if len(queryTargets) == 0 {
+			queryTargets = c.Targets
+		}
+		seenQueryTargets := map[Protocol]bool{}
+		for _, target := range queryTargets {
+			if _, ok := seenTargets[target]; !ok || seenQueryTargets[target] {
+				return fmt.Errorf("query %s has invalid or duplicate target %q", q.QueryID, target)
+			}
+			seenQueryTargets[target] = true
+			if q.Representation == "variant" && target != ProtocolPGWire && target != ProtocolPGWireUncached && target != ProtocolPGWireCached {
+				return fmt.Errorf("query %s variant requires a supported PGWire reader", q.QueryID)
+			}
+		}
 		if q.StorageTarget != "" {
 			hasPairedQueries = true
 		}

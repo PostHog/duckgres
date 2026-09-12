@@ -155,3 +155,33 @@ func TestCachedProtocolAndInvalidProtocol(t *testing.T) {
 		t.Fatalf("New invalid protocol error = %v", err)
 	}
 }
+
+type resultExecutor struct {
+	fakeExecutor
+	resultQuery string
+}
+
+func (f *resultExecutor) ReadResults(_ context.Context, query string, _ []any) ([][]*string, error) {
+	f.resultQuery = query
+	value := "Chrome"
+	count := "10"
+	return [][]*string{{&value, &count}}, nil
+}
+func TestReadResultsUsesSameDialectAsExecute(t *testing.T) {
+	exec := &resultExecutor{}
+	d := NewWithExecutor(exec)
+	q := core.Query{Representation: "json", PGWireSQL: "SELECT json_extract_string(properties, '$.browser'), count(*)"}
+	got, err := d.ReadResults(context.Background(), q, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Execute(context.Background(), q, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || *got[0][0] != "Chrome" || *got[0][1] != "10" {
+		t.Fatal(got)
+	}
+	if len(exec.queries) != 1 || exec.resultQuery != exec.queries[0] || !strings.Contains(exec.resultQuery, "json_extract_scalar") {
+		t.Fatalf("SQL differs: %q vs %v", exec.resultQuery, exec.queries)
+	}
+}

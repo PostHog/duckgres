@@ -1027,7 +1027,7 @@ func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {
 		with := make(map[string]any, len(step.With))
 		for k, v := range step.With {
 			if k == "file" || k == "catalog_file" || k == "project_dir" || k == "profiles_dir" {
-				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) {
+				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) && !strings.HasPrefix(file, "${env:") {
 					v = filepath.Clean(filepath.Join(baseDir, file))
 				}
 			}
@@ -1143,4 +1143,25 @@ func containsTemplate(value any) bool {
 		return strings.Contains(typed, "${")
 	}
 	return false
+}
+
+func TestPropertiesScenarioGeneratedPathsResolve(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", "/tmp/properties-generated")
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_properties_perf.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range scenario.Steps {
+		for _, field := range []string{"file", "catalog_file"} {
+			if path, ok := step.With[field].(string); ok {
+				resolved, err := core.ResolveEnvTemplates(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if filepath.Dir(resolved) != "/tmp/properties-generated" {
+					t.Fatalf("generated artifact path = %q", resolved)
+				}
+			}
+		}
+	}
 }

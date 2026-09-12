@@ -134,7 +134,7 @@ paired_queries:
 	if err != nil {
 		t.Fatalf("read query_results.csv: %v", err)
 	}
-	wantHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at"}
+	wantHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at", "representation"}
 	if !reflect.DeepEqual(records[0], wantHeader) {
 		t.Fatalf("CSV header: got %v want %v", records[0], wantHeader)
 	}
@@ -143,7 +143,7 @@ paired_queries:
 	}
 }
 
-func TestArtifactSinkWritesAthenaServiceMetricsWithoutChangingQueryResultsV1(t *testing.T) {
+func TestArtifactSinkWritesAthenaServiceMetrics(t *testing.T) {
 	dir := t.TempDir()
 	sink, err := NewArtifactSink(dir)
 	if err != nil {
@@ -184,9 +184,9 @@ func TestArtifactSinkWritesAthenaServiceMetricsWithoutChangingQueryResultsV1(t *
 	if err != nil {
 		t.Fatalf("read query_results.csv: %v", err)
 	}
-	wantQueryHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at"}
+	wantQueryHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at", "representation"}
 	if !reflect.DeepEqual(queryRecords[0], wantQueryHeader) {
-		t.Fatalf("query_results.csv v1 header changed: got %v want %v", queryRecords[0], wantQueryHeader)
+		t.Fatalf("query_results.csv header: got %v want %v", queryRecords[0], wantQueryHeader)
 	}
 
 	metricsFile, err := os.Open(filepath.Join(dir, "query_service_metrics.csv"))
@@ -198,11 +198,39 @@ func TestArtifactSinkWritesAthenaServiceMetricsWithoutChangingQueryResultsV1(t *
 	if err != nil {
 		t.Fatalf("read query_service_metrics.csv: %v", err)
 	}
-	wantMetricsHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "queue_ms", "planning_ms", "engine_ms", "service_ms", "bytes_scanned", "dpu_count", "result_reused", "engine_version"}
+	wantMetricsHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "queue_ms", "planning_ms", "engine_ms", "service_ms", "bytes_scanned", "dpu_count", "result_reused", "engine_version", "representation"}
 	if !reflect.DeepEqual(metricsRecords[0], wantMetricsHeader) {
 		t.Fatalf("service metrics header: got %v want %v", metricsRecords[0], wantMetricsHeader)
 	}
-	if got, want := metricsRecords[1], []string{"q1__athena_external", "i1", "1", "athena", "100.000000", "200.000000", "2000.000000", "2500.000000", "4096", "4", "false", "Athena engine version 3"}; !reflect.DeepEqual(got, want) {
+	if got, want := metricsRecords[1], []string{"q1__athena_external", "i1", "1", "athena", "100.000000", "200.000000", "2000.000000", "2500.000000", "4096", "4", "false", "Athena engine version 3", ""}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("service metrics row: got %v want %v", got, want)
+	}
+}
+
+func TestArtifactSinkLabelsRepresentations(t *testing.T) {
+	dir := t.TempDir()
+	sink, err := NewArtifactSink(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = sink.Record(QueryResult{QueryID: "properties_browser_v1__struct", IntentID: "browser", Representation: "struct", ServiceMetrics: &ServiceMetrics{BytesScanned: 42}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = sink.Close(RunSummary{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"query_results.csv", "query_service_metrics.csv"} {
+		raw, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows, err := csv.NewReader(strings.NewReader(string(raw))).ReadAll()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rows[0][len(rows[0])-1] != "representation" || rows[1][len(rows[1])-1] != "struct" {
+			t.Errorf("%s lacks representation label", name)
+		}
 	}
 }

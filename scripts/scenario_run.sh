@@ -130,6 +130,18 @@ if [ "$check_env_only" -eq 1 ]; then
   exit 0
 fi
 
+# Prepare only this explicitly selected workload; environment checks remain read-only.
+if [ "$(basename "$scenario_file")" = "posthog_properties_perf.yaml" ]; then
+  export DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR="$(root_relative_path "${DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR:-/tmp/properties-perf}")"
+  go run ./cmd/perf-properties-prepare \
+    -manifest "$DUCKGRES_SCENARIO_PROPERTIES_MANIFEST" \
+    -output-dir "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR" \
+    -athena-database "$DUCKGRES_SCENARIO_ATHENA_DATABASE" \
+    -athena-region "$DUCKGRES_SCENARIO_ATHENA_REGION"
+  DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION="$(cat "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR/dataset-version.txt")"
+  export DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION
+fi
+
 args=(
   go test -count=1 ./tests/mw-dev/scenario
   -timeout "$go_test_timeout"

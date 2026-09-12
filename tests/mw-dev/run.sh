@@ -420,7 +420,7 @@ cmd_deploy() {
   ensure_pod_identity
   restart_cp_with_identity
 
-  if [ "$SCENARIO_NAME" = "posthog_frozen_perf" ]; then
+  if [ "$SCENARIO_NAME" = "posthog_frozen_perf" ] || [ "$SCENARIO_NAME" = "posthog_properties_perf" ]; then
     ensure_scenario_pod_identity
   fi
 
@@ -658,6 +658,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: "${DUCKGRES_SCENARIO_ATHENA_WORKGROUP:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: "${DUCKGRES_SCENARIO_ATHENA_DATABASE:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI, value: "${DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI:-}" }
+            - { name: DUCKGRES_SCENARIO_PROPERTIES_MANIFEST, value: "${DUCKGRES_SCENARIO_PROPERTIES_MANIFEST:-}" }
+            - { name: DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR, value: "/tmp/properties-perf" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
             - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "$DUCKGRES_K8S_WORKER_CPU_REQUEST" }
             - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" }

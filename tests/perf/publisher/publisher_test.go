@@ -151,6 +151,7 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 		t.Fatalf("loadArtifacts returned error: %v", err)
 	}
 
+	artifacts.Results[0].Representation = "struct"
 	db := &fakeDB{tx: &fakeTx{}}
 	cfg := Config{Schema: "duckgres_perf", BootstrapSchema: true}
 	if err := publishArtifacts(context.Background(), cfg, db, artifacts); err != nil {
@@ -162,24 +163,27 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 	if db.tx.rolledBack {
 		t.Fatalf("did not expect rollback")
 	}
-	if len(db.tx.execs) != 9 {
-		t.Fatalf("expected 9 execs, got %d", len(db.tx.execs))
+	if len(db.tx.execs) != 10 {
+		t.Fatalf("expected 10 execs, got %d", len(db.tx.execs))
 	}
-	runInsert := db.tx.execs[6]
+	runInsert := db.tx.execs[7]
 	if !strings.Contains(runInsert.query, "INSERT INTO duckgres_perf.runs") {
 		t.Fatalf("unexpected run insert query: %s", runInsert.query)
 	}
 	if got, ok := runInsert.args[0].(string); !ok || got != "nightly-v1-20260311T234300Z" {
 		t.Fatalf("unexpected run insert args: %#v", runInsert.args)
 	}
-	firstResultInsert := db.tx.execs[7]
+	firstResultInsert := db.tx.execs[8]
 	if !strings.Contains(firstResultInsert.query, "INSERT INTO duckgres_perf.query_results") {
 		t.Fatalf("unexpected result insert query: %s", firstResultInsert.query)
 	}
 	if got, ok := firstResultInsert.args[8].(*int64); !ok || got == nil || *got != 1 {
 		t.Fatalf("expected rows pointer with value 1, got %#v", firstResultInsert.args[8])
 	}
-	secondResultInsert := db.tx.execs[8]
+	if got := firstResultInsert.args[13]; got != "struct" {
+		t.Fatalf("representation not published: %v", got)
+	}
+	secondResultInsert := db.tx.execs[9]
 	if got, ok := secondResultInsert.args[6].(*string); !ok || got == nil || *got != "boom" {
 		t.Fatalf("expected error arg, got %#v", secondResultInsert.args[6])
 	}
@@ -191,11 +195,11 @@ func TestBootstrapSchemaDoesNotUseUnsupportedConstraints(t *testing.T) {
 	if err := bootstrapSchema(context.Background(), tx, "duckgres_perf"); err != nil {
 		t.Fatalf("bootstrapSchema returned error: %v", err)
 	}
-	if len(tx.execs) != 4 {
-		t.Fatalf("expected 4 bootstrap statements, got %d", len(tx.execs))
+	if len(tx.execs) != 5 {
+		t.Fatalf("expected 5 bootstrap statements, got %d", len(tx.execs))
 	}
 
-	runsDDL := tx.execs[3].query
+	runsDDL := tx.execs[4].query
 	if !strings.Contains(runsDDL, "CREATE TABLE IF NOT EXISTS duckgres_perf.runs") {
 		t.Fatalf("unexpected runs ddl: %s", runsDDL)
 	}
@@ -211,7 +215,7 @@ func TestPublishArtifactsRollsBackOnInsertFailure(t *testing.T) {
 		t.Fatalf("loadArtifacts returned error: %v", err)
 	}
 
-	db := &fakeDB{tx: &fakeTx{failOnExec: 7}}
+	db := &fakeDB{tx: &fakeTx{failOnExec: 8}}
 	cfg := Config{Schema: "duckgres_perf", BootstrapSchema: true}
 	err = publishArtifacts(context.Background(), cfg, db, artifacts)
 	if err == nil || !strings.Contains(err.Error(), "insert run summary") {
@@ -345,5 +349,20 @@ func writeMinimalCSVFile(t *testing.T, runDir string) {
 	csvPath := filepath.Join(runDir, "query_results.csv")
 	if err := os.WriteFile(csvPath, []byte(csvText), 0o644); err != nil {
 		t.Fatalf("WriteFile csv: %v", err)
+	}
+}
+
+func TestLoadQueryResultsWithRepresentationColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "query_results.csv")
+	data := "query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at,representation\nq__struct,i,1,pgwire,ok,,,2,10,2026-03-17T00:00:00Z,struct\n"
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := loadQueryResults(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].Representation != "struct" {
+		t.Fatalf("lost label: %+v", rows[0])
 	}
 }

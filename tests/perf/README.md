@@ -186,9 +186,9 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `runner.log`
 - `dataset_manifest.json` (only when `DUCKGRES_PERF_DATASET_VERSION` is set)
 
-## Artifact Schema Contract (v1)
+## Artifact Schema Contract (v2)
 
-`query_results.csv` is the canonical per-query artifact and its columns are fixed in v1:
+`query_results.csv` is the canonical per-query artifact and its columns are:
 
 - `query_id`
 - `intent_id`
@@ -200,16 +200,16 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `rows`
 - `duration_ms`
 - `started_at`
+- `representation` (empty for existing workloads; `json`, `struct`, or `variant` for properties)
 
 `measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
 `duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
-No CSV schema mutation is expected in this phase.
+The publisher accepts both the original ten-column v1 header and the v2 header with the appended representation column.
 
 `query_service_metrics.csv` is an additive sidecar. Provider-backed rows record
 queue, planning, engine, and service time; bytes scanned; DPU count when the
 service returns it; result reuse; and engine version. `query_results.csv`
-remains the canonical latency/status artifact and keeps its v1 header
-unchanged.
+remains the canonical latency/status artifact. Both CSVs append the representation label; stable query IDs also include it.
 
 ## Nightly Run
 
@@ -271,3 +271,19 @@ protocol labels in performance comparisons.
 
 Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
 external-read/hit counters to distinguish storage traffic from cached reads.
+
+## Published properties workload
+
+`just scenario-properties-perf` runs the opt-in JSON/STRUCT/VARIANT comparison
+on a validated completion manifest. Set `DUCKGRES_SCENARIO_PROPERTIES_MANIFEST`
+explicitly; there is no default fixture. Preparation defaults to
+`/tmp/properties-perf` and a five-minute timeout. The catalog uses one warmup
+and four measured iterations, with UTC date bounds from the manifest. JSON and
+STRUCT run on PGWire, Trino, and Athena; VARIANT runs on PGWire only.
+
+`just prepare-properties-perf "$DUCKGRES_SCENARIO_PROPERTIES_MANIFEST"` emits
+private setup inputs after validating the manifest and live object inventory.
+The optional second argument changes the output directory. The scenario also
+verifies the precreated Athena table before provisioning, then compares complete
+query results outside timing. See the [properties runbook](../../docs/runbooks/properties-perf.md)
+for isolated execution, metadata registration, configuration, and recovery.

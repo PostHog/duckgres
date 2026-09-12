@@ -50,6 +50,7 @@ type artifacts struct {
 }
 
 type resultRow struct {
+	Representation   string
 	QueryID          string
 	IntentID         string
 	MeasureIteration int
@@ -184,7 +185,7 @@ func loadQueryResults(path string) ([]resultRow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read query_results.csv header: %w", err)
 	}
-	if !equalStringSlices(header, expectedQueryResultsHeader) {
+	if !equalStringSlices(header, expectedQueryResultsHeader) && !equalStringSlices(header, append(append([]string(nil), expectedQueryResultsHeader...), "representation")) {
 		return nil, fmt.Errorf("unexpected query_results.csv header: %q", strings.Join(header, ","))
 	}
 	var results []resultRow
@@ -206,7 +207,7 @@ func loadQueryResults(path string) ([]resultRow, error) {
 }
 
 func parseResultRow(record []string) (resultRow, error) {
-	if len(record) != len(expectedQueryResultsHeader) {
+	if len(record) != len(expectedQueryResultsHeader) && len(record) != len(expectedQueryResultsHeader)+1 {
 		return resultRow{}, fmt.Errorf("unexpected query_results.csv column count: got %d want %d", len(record), len(expectedQueryResultsHeader))
 	}
 	measureIteration, err := strconv.Atoi(record[2])
@@ -229,7 +230,15 @@ func parseResultRow(record []string) (resultRow, error) {
 	if err != nil {
 		return resultRow{}, fmt.Errorf("parse started_at %q: %w", record[9], err)
 	}
+	representation := ""
+	if len(record) == len(expectedQueryResultsHeader)+1 {
+		representation = record[len(record)-1]
+		if representation != "" && representation != "json" && representation != "struct" && representation != "variant" {
+			return resultRow{}, fmt.Errorf("invalid representation %q", representation)
+		}
+	}
 	return resultRow{
+		Representation:   representation,
 		QueryID:          record[0],
 		IntentID:         record[1],
 		MeasureIteration: measureIteration,
@@ -276,12 +285,12 @@ func publishArtifacts(ctx context.Context, cfg Config, db dbHandle, loaded artif
 		return fmt.Errorf("insert run summary: %w", err)
 	}
 	insertQuery := fmt.Sprintf(
-		"INSERT INTO %s.query_results (run_id, query_id, intent_id, measure_iteration, protocol, status, error, error_class, rows, duration_ms, started_at, dataset_version, run_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+		"INSERT INTO %s.query_results (run_id, query_id, intent_id, measure_iteration, protocol, status, error, error_class, rows, duration_ms, started_at, dataset_version, run_date, representation) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
 		schema,
 	)
 	runDate := loaded.Summary.StartedAt.UTC().Format("2006-01-02")
 	for _, result := range loaded.Results {
-		if _, err = tx.ExecContext(ctx, insertQuery, loaded.Summary.RunID, result.QueryID, result.IntentID, result.MeasureIteration, result.Protocol, result.Status, result.Error, result.ErrorClass, result.Rows, result.DurationMS, result.StartedAt, loaded.Summary.DatasetVersion, runDate); err != nil {
+		if _, err = tx.ExecContext(ctx, insertQuery, loaded.Summary.RunID, result.QueryID, result.IntentID, result.MeasureIteration, result.Protocol, result.Status, result.Error, result.ErrorClass, result.Rows, result.DurationMS, result.StartedAt, loaded.Summary.DatasetVersion, runDate, result.Representation); err != nil {
 			return fmt.Errorf("insert query result (%s/%s/%d/%s): %w", loaded.Summary.RunID, result.QueryID, result.MeasureIteration, result.Protocol, err)
 		}
 	}
@@ -310,6 +319,7 @@ func bootstrapSchema(ctx context.Context, tx txHandle, schema string) error {
   run_date DATE NOT NULL
 )`, schema),
 		fmt.Sprintf("ALTER TABLE %s.query_results ADD COLUMN IF NOT EXISTS measure_iteration INTEGER", schema),
+		fmt.Sprintf("ALTER TABLE %s.query_results ADD COLUMN IF NOT EXISTS representation TEXT", schema),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.runs (
   run_id TEXT NOT NULL,
   dataset_version TEXT NOT NULL,
