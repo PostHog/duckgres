@@ -285,13 +285,18 @@ func requestedWorkerVCPUs(profile *WorkerProfile, workerCPURequest string) (int,
 //     (exploratoryWorkerProfile degrades to nil), so behave exactly as today.
 //   - The client explicitly asked for a shape via duckgres.worker_* — give it
 //     that shape from the first statement.
+//   - The client asked to pin the session with duckgres.session_affinity — the
+//     exploratory tier can migrate a session between workers, which drops
+//     worker-side state the tier does not replay (ad-hoc ATTACH catalogs,
+//     exported transaction snapshots), so an affinity request must acquire the
+//     standard worker eagerly and keep it.
 //   - Passthrough users speak raw DuckDB SQL, which pg_query cannot parse, so
 //     classifyStatementTier pins on their FIRST statement no matter what it is.
 //     This exclusion is also what keeps server's executeQueryDirect — the
 //     passthrough-only execution path, which carries no tier hooks —
 //     unreachable with onExploratoryWorker set.
-func (cp *ControlPlane) useExploratoryTier(explProfile *WorkerProfile, passthroughUser bool, startupOptions map[string]string) bool {
-	return cp.isRemoteBackend && explProfile != nil && !passthroughUser &&
+func (cp *ControlPlane) useExploratoryTier(explProfile *WorkerProfile, passthroughUser, sessionAffinity bool, startupOptions map[string]string) bool {
+	return cp.isRemoteBackend && explProfile != nil && !passthroughUser && !sessionAffinity &&
 		!clientSuppliedWorkerGUCs(cp.cfg.K8s, startupOptions)
 }
 
