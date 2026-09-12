@@ -138,6 +138,18 @@ type fakeCatalogClient struct {
 	dropped   []string
 	listErr   error
 	createErr error
+	nodes     []TrinoNode
+	nodesErr  error
+}
+
+func (c *fakeCatalogClient) ListNodes(context.Context) ([]TrinoNode, error) {
+	if c.nodesErr != nil {
+		return nil, c.nodesErr
+	}
+	if c.nodes != nil {
+		return append([]TrinoNode{}, c.nodes...), nil
+	}
+	return readyTrinoNodes(), nil
 }
 
 func (c *fakeCatalogClient) ListCatalogs(ctx context.Context) ([]string, error) {
@@ -786,13 +798,14 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 			}
 			return h.ducklings[orgID], nil
 		},
-		Kubernetes:    h.kube,
-		Namespace:     TrinoCustomerNamespace,
-		CellID:        testCellID,
-		Catalog:       h.catalog,
-		BundleStore:   h.bundles,
-		BundleBuilder: h.builder,
-		AWSRegion:     "us-east-1",
+		Kubernetes:      h.kube,
+		SecretReadiness: &fakeTrinoSecretReadiness{},
+		Namespace:       TrinoCustomerNamespace,
+		CellID:          testCellID,
+		Catalog:         h.catalog,
+		BundleStore:     h.bundles,
+		BundleBuilder:   h.builder,
+		AWSRegion:       "us-east-1",
 	})
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)

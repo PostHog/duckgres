@@ -32,8 +32,8 @@ const uiNotBuiltPage = `<!doctype html><html lang="en"><head><meta charset="utf-
 	`(controlplane/admin/ui), or use the Docker image which builds it.</p></body></html>`
 
 // RegisterUI serves the embedded SPA on the engine: real files (index.html,
-// /assets/*) are served directly; any other non-API GET falls back to
-// index.html so client-side routing works. The bundle carries no secrets, so it
+// /assets/*) are served directly; paths outside /api and /bundles fall back to
+// index.html so client-side routing works. The UI bundle carries no secrets, so it
 // is served unauthenticated — every data call under /api/v1 is auth-gated.
 // When no real build is embedded (only .gitkeep), a graceful "not built" notice
 // is served so the control plane still starts.
@@ -50,8 +50,9 @@ func RegisterUI(engine *gin.Engine) error {
 
 	engine.NoRoute(func(c *gin.Context) {
 		p := c.Request.URL.Path
-		// Never SPA-fallback an API path — return a JSON 404 instead of HTML.
-		if p == "/api" || strings.HasPrefix(p, "/api/") {
+		// Unregistered API and OPA bundle routes must remain absent. In
+		// particular, registry-only mode intentionally omits the legacy bundle.
+		if p == "/api" || strings.HasPrefix(p, "/api/") || p == "/bundles" || strings.HasPrefix(p, "/bundles/") {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 			return
 		}

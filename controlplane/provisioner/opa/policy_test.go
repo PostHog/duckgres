@@ -1791,13 +1791,11 @@ func TestObserverSystemGrantIsPinnedToTheNodesTable(t *testing.T) {
 	}
 }
 
-// The grant is keyed on is_observer, so it must not leak to a tenant or to
-// the admin principal -- neither of which has any business reading it, and
-// a tenant reaching the system catalog at all would be a boundary failure.
-func TestSystemNodesGrantIsObserverOnly(t *testing.T) {
+// Operational node inventory grants must not leak to tenant identities.
+func TestSystemNodesGrantExcludesTenants(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 
-	for _, user := range []string{"42", AdminPrincipal} {
+	for _, user := range []string{"42", "43"} {
 		t.Run(user, func(t *testing.T) {
 			if evalAllow(t, q, buildInput(user, "AccessCatalog", catalogResource("system"))) {
 				t.Errorf("%s must not reach the system catalog", user)
@@ -1816,5 +1814,47 @@ func TestSystemNodesGrantIsObserverOnly(t *testing.T) {
 		[]interface{}{ObserverGroup}
 	if evalAllow(t, q, in) {
 		t.Error("claiming the observer group without the observer username must grant nothing")
+	}
+}
+
+func TestTrinoProvisionerReadsOnlySystemRuntimeNodes(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+	if !evalAllow(t, q, buildInput(AdminPrincipal, "AccessCatalog", catalogResource("system"))) {
+		t.Error("provisioner must reach system for worker readiness inventory")
+	}
+	if !evalAllow(t, q, buildInput(AdminPrincipal, "SelectFromColumns", tableResource("system", "runtime", "nodes"))) {
+		t.Error("provisioner must read system.runtime.nodes for worker readiness inventory")
+	}
+	for _, table := range []struct{ catalog, schema, name string }{
+		{"system", "runtime", "queries"},
+		{"system", "runtime", "tasks"},
+		{"system", "runtime", "transactions"},
+		{"system", "metadata", "catalogs"},
+		{"system", "jdbc", "tables"},
+		{"system", "information_schema", "tables"},
+		{"system", "other", "nodes"},
+		{"other", "runtime", "nodes"},
+	} {
+		if evalAllow(t, q, buildInput(AdminPrincipal, "SelectFromColumns", tableResource(table.catalog, table.schema, table.name))) {
+			t.Errorf("provisioner node inventory grant must not read %s.%s.%s", table.catalog, table.schema, table.name)
+		}
+	}
+	for _, operation := range []string{"InsertIntoTable", "DeleteFromTable", "DropTable", "ShowTables", "FilterTables", "ShowColumns", "FilterColumns"} {
+		if evalAllow(t, q, buildInput(AdminPrincipal, operation, tableResource("system", "runtime", "nodes"))) {
+			t.Errorf("node inventory grant must not allow %s", operation)
+		}
+	}
+	for _, identity := range []struct {
+		user   string
+		groups []string
+	}{
+		{AdminPrincipal, nil},
+		{AdminPrincipal, []string{ObserverGroup}},
+		{"42", []string{AdminGroup}},
+	} {
+		if evalAllow(t, q, buildInputWithGroups(identity.user, identity.groups, "AccessCatalog", catalogResource("system"))) ||
+			evalAllow(t, q, buildInputWithGroups(identity.user, identity.groups, "SelectFromColumns", tableResource("system", "runtime", "nodes"))) {
+			t.Errorf("incomplete provisioner identity must not receive node inventory access: %s", identity.user)
+		}
 	}
 }

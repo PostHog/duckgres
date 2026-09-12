@@ -65,10 +65,15 @@ deployment-managed internal-communication Secrets. Duckgres reads those
 references and refuses missing keys; it never creates or modifies them.
 They must exist even for a stopped backend. Grant the control-plane service
 account the corresponding namespace-scoped projection permissions first.
+Mounted credential readiness additionally requires `get`/`list` on `pods` and
+`create` on `pods/exec` in each Trino namespace. Apply those chart permissions
+before deploying the readiness-aware control plane.
 
 New-cell OPA sidecars poll `/bundles/trino/<cell-id>` with that namespace's
 bundle token. Legacy keeps `/bundles/trino`. Tokens cannot read another cell's
 bundle. The observer credential remains separate from the catalog administrator.
+In registry-only mode, `/bundles/trino` is absent and returns HTTP 404. Missing
+bundle URLs never fall back to the admin UI page.
 
 ## Initial assignment
 
@@ -107,6 +112,13 @@ or live observer polls. A stopped green does not make blue's tenants unhealthy.
 When green starts, update the registry and restart the control plane. Every
 running backend must reconcile successfully before a tenant is reported ready;
 one successful coordinator cannot conceal another's missing catalog or failure.
+Catalog creation is followed by a check of the current tenant password file on
+every active member reported by `system.runtime.nodes`, including a coordinator
+and at least one worker. Node and pod identities are checked again after the
+observation; replacements or projection lag keep the tenant `provisioning`.
+Existing catalogs undergo the same check on every reconcile. See the
+[readiness runbook](runbooks/trino-readiness.md) for the precise contract and
+failure recovery.
 The console observes the configured routing-active backend. Usage collection
 polls each running backend independently under the existing leader lease.
 
