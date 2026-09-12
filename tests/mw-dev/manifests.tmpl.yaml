@@ -156,6 +156,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  # The control plane checks Trino's mounted tenant credentials before readiness.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
@@ -265,6 +269,9 @@ metadata:
   namespace: ${NAMESPACE}
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
   selector:
     matchLabels: { app: duckgres-control-plane }
   template:
@@ -280,11 +287,20 @@ spec:
         karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: duckgres
+      # The hook consumes five seconds; retain the previous default 30-second
+      # budget for the control plane's session drain after SIGTERM.
+      terminationGracePeriodSeconds: 35
       containers:
         - name: controlplane
           image: ${CONTROLPLANE_IMAGE}
           imagePullPolicy: IfNotPresent
           args: ["--mode", "control-plane", "--worker-backend", "remote"]
+          lifecycle:
+            preStop:
+              # Pod termination withdraws its Service endpoint asynchronously.
+              # Keep the API listening while client-node routing catches up;
+              # an idle control plane otherwise exits immediately on SIGTERM.
+              exec: { command: ["sleep", "5"] }
           env:
             # Pod identity for log stamping: the shared logging handler attaches
             # pod=/node= to every line when these are set (workers get them via

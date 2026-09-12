@@ -145,9 +145,8 @@ const (
 const TrinoTenantSecretName = "trino-tenant-secrets" //nolint:gosec // K8s object name, not a credential
 
 // DefaultTrinoTenantSecretMountPath is where the chart mounts
-// TrinoTenantSecretName inside the Trino pods. The provisioner never reads
-// this path itself — it only renders it into each catalog's
-// `ducklake.metadata.connection-password-file` — so it MUST agree with the
+// TrinoTenantSecretName inside the Trino pods. Catalog properties and mounted
+// credential readiness checks use this path, so it MUST agree with the
 // chart's volumeMount. Override with DUCKGRES_TRINO_TENANT_SECRET_MOUNT_PATH
 // if the chart mounts it elsewhere.
 const DefaultTrinoTenantSecretMountPath = "/etc/trino/tenant-secrets"
@@ -181,40 +180,19 @@ var secretDataKeyPattern = regexp.MustCompile(`^[-._a-zA-Z0-9]+$`)
 // admin authority from drifting apart.
 var managedCatalogRe = regexp.MustCompile(opa.ManagedCatalogPattern)
 
-// trinoCatalogIdentifier is the Trino catalog identifier grammar
-// ([a-z0-9_]+). Anything outside this set in Org.Name is replaced with
-// `_` before forming the catalog name.
-var trinoCatalogIdentifier = regexp.MustCompile(`[^a-z0-9_]`)
-
 // trinoSanitize lowercases and replaces non-[a-z0-9_] runs with `_`.
-// Pure function so callers can recover the sanitized name without
-// holding the provisioner.
+// Thin alias for the canonical definition: the same sanitization backs the
+// pgwire logical catalog alias, which every build needs, so it lives in
+// configstore (untagged) rather than in this kubernetes-tagged file.
 func trinoSanitize(orgName string) string {
-	lower := strings.ToLower(orgName)
-	return trinoCatalogIdentifier.ReplaceAllString(lower, "_")
+	return configstore.TrinoSanitize(orgName)
 }
 
 // TrinoCatalogName returns the catalog identifier for an org.
-// Format: org_<sanitized>. The sanitization maps Org.Name to Trino
-// identifier rules ([a-z0-9_]); any other characters collapse to
-// underscores.
-//
-// For principals that satisfy ValidateDatabaseName the mapping is injective
-// — that grammar allows only lowercase alphanumerics and hyphens, so the
-// hyphen is the only character rewritten and no valid principal contains the
-// underscore it becomes — which, with database_name's global unique index,
-// makes distinct orgs' catalog names distinct by construction. Grandfathered
-// rows predate the validation and can still converge; rejectPrincipalCollisions
-// holds those orgs back rather than letting one read the other's catalog.
-//
-// The name carried an `_iceberg` suffix while the backing table format was
-// Iceberg behind Lakekeeper. Warehouses are DuckLake now (migration 000014
-// dropped every iceberg_* column), so the suffix went with it. The shape is
-// pinned from three sides — this function, opa.ManagedCatalogPattern, and
-// the regex literal inside policy.rego — and the pair of tests named in
-// ManagedCatalogPattern's doc comment fails if any one of them moves alone.
+// Format: org_<sanitized>. See configstore.TrinoCatalogName for the full
+// contract — this is the Trino-side spelling of that one definition.
 func TrinoCatalogName(principal string) string {
-	return "org_" + trinoSanitize(principal)
+	return configstore.TrinoCatalogName(principal)
 }
 
 // TrinoGroupName returns the file-group-provider group label for an org,
@@ -242,6 +220,7 @@ func TrinoResourceGroupName(principal string) string {
 // is exported so tests can inject a fake at the function boundary.
 type TrinoCatalogClient interface {
 	ListCatalogs(ctx context.Context) ([]string, error)
+	ListNodes(ctx context.Context) ([]TrinoNode, error)
 	CreateCatalog(ctx context.Context, name string, props map[string]string) error
 	AlterCatalog(ctx context.Context, name string, props map[string]string) error
 	DropCatalog(ctx context.Context, name string) error
@@ -284,6 +263,10 @@ type TrinoProvisionerOpts struct {
 	// Kubernetes is used for the auth Secret, tenant-password Secret and
 	// resource-groups ConfigMap projections in the Trino namespace.
 	Kubernetes kubernetes.Interface
+
+	// SecretReadiness confirms the tenant credentials visible on serving Trino
+	// nodes. Nil uses Kubernetes pod exec with in-cluster credentials.
+	SecretReadiness TrinoSecretReadiness
 
 	// Namespace overrides TrinoCustomerNamespace. Empty == default.
 	// Useful for dev clusters that namespace Trino differently.
@@ -417,6 +400,7 @@ type TrinoProvisioner struct {
 	warehouses              TrinoWarehouseStore
 	ducklings               TrinoDucklingResolver
 	kubernetes              kubernetes.Interface
+	secretReadiness         TrinoSecretReadiness
 	namespace               string
 	cellID                  string
 	explicitAssignmentOnly  bool
@@ -528,12 +512,17 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if maxConns <= 0 {
 		maxConns = defaultTrinoS3MaxConnections
 	}
+	secretReadiness := opts.SecretReadiness
+	if secretReadiness == nil {
+		secretReadiness = NewKubernetesTrinoSecretReadiness(opts.Kubernetes, nil)
+	}
 	return &TrinoProvisioner{
 		store:                   opts.Store,
 		bootstrapSentinel:       opts.BootstrapSentinel,
 		warehouses:              opts.Warehouses,
 		ducklings:               opts.Ducklings,
 		kubernetes:              opts.Kubernetes,
+		secretReadiness:         secretReadiness,
 		namespace:               ns,
 		cellID:                  cell,
 		explicitAssignmentOnly:  opts.ExplicitAssignmentOnly,
@@ -1285,7 +1274,7 @@ func (p *TrinoProvisioner) writePerOrgStates(
 				msg = "waiting for warehouse provisioning to complete"
 			}
 		default:
-			// Created or Existed + no global failure == Ready.
+			// Catalog reconciled, member credentials observed, no global failure.
 			nextState = configstore.ManagedWarehouseStateReady
 			msg = ""
 		}
@@ -1344,6 +1333,9 @@ type tenantSecretProjection struct {
 	// rather than re-reading it (or, worse, reading object-store fields
 	// off the config store, where they are never populated).
 	statuses map[string]*DucklingStatus
+	// data is the exact Secret payload written during this reconcile. Readiness
+	// compares mounted credentials against this generation, not a later read.
+	data map[string][]byte
 }
 
 // reconcileTenantSecrets resolves every enabled org's DuckLake
@@ -1397,6 +1389,7 @@ func (p *TrinoProvisioner) reconcileTenantSecrets(ctx context.Context, orgs []co
 	if err := p.replaceSecret(ctx, TrinoTenantSecretName, data); err != nil {
 		return tenantSecretProjection{}, err
 	}
+	proj.data = data
 	return proj, nil
 }
 
@@ -1435,7 +1428,77 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []configstore.TrinoEnabledOrg, tenants tenantSecretProjection, catalog TrinoCatalogClient) (map[string]catalogOutcome, error) {
 	backendCtx, cancel := context.WithTimeout(ctx, p.catalogTimeout)
 	defer cancel()
-	return p.reconcileBackendCatalogs(backendCtx, orgs, tenants, catalog)
+	outcomes, catalogErr := p.reconcileBackendCatalogs(backendCtx, orgs, tenants, catalog)
+	expected := make(map[string][]byte)
+	for org, outcome := range outcomes {
+		if outcome.Err == nil && !outcome.Pending && (outcome.Created || outcome.Existed) {
+			expected[org] = tenants.data[org]
+		}
+	}
+	if len(expected) == 0 {
+		return outcomes, catalogErr
+	}
+
+	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected)
+	for org := range expected {
+		if readinessErr != nil {
+			outcomes[org] = catalogOutcome{Err: readinessErr}
+		} else if reason, waiting := pending[org]; waiting {
+			outcomes[org] = catalogOutcome{Pending: true, PendingReason: reason}
+		}
+	}
+	return outcomes, errors.Join(catalogErr, readinessErr)
+}
+
+// A successful CREATE CATALOG only validates the coordinator's local files.
+// Observe the same credentials on every active member before declaring this
+// backend ready, including when the catalog already existed on this tick.
+func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalog TrinoCatalogClient, expected map[string][]byte) (map[string]string, error) {
+	nodes, err := catalog.ListNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read Trino readiness membership: %w", err)
+	}
+	active := activeTrinoMembers(nodes)
+	coordinator, worker := false, false
+	for _, node := range active {
+		coordinator = coordinator || node.Coordinator
+		worker = worker || !node.Coordinator
+	}
+	if !coordinator || !worker {
+		return trinoAllPending(expected, "waiting for an active Trino coordinator and worker"), nil
+	}
+	pending, err := p.secretReadiness.Check(ctx, p.namespace, p.tenantSecretMountPath, expected, active)
+	if err != nil {
+		return nil, fmt.Errorf("verify Trino mounted credentials: %w", err)
+	}
+	after, err := catalog.ListNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("verify Trino readiness membership: %w", err)
+	}
+	current := activeTrinoMembers(after)
+	if len(active) != len(current) {
+		return trinoAllPending(expected, "Trino membership changed during credential observation"), nil
+	}
+	for i := range active {
+		if active[i] != current[i] {
+			return trinoAllPending(expected, "Trino membership changed during credential observation"), nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return pending, nil
+}
+
+func activeTrinoMembers(nodes []TrinoNode) []TrinoNode {
+	active := make([]TrinoNode, 0, len(nodes))
+	for _, node := range nodes {
+		if strings.EqualFold(node.State, "active") {
+			active = append(active, node)
+		}
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].ID < active[j].ID })
+	return active
 }
 
 func (p *TrinoProvisioner) reconcileBackendCatalogs(
