@@ -230,12 +230,18 @@ The test suite includes benchmarks that measure DuckLake transaction conflict ra
 
 ### Prerequisites
 
-The DuckLake benchmarks require the metadata PostgreSQL and MinIO infrastructure:
+The DuckLake benchmarks require the metadata PostgreSQL and PGSTY Silo infrastructure:
 
 ```bash
 # Start DuckLake infrastructure
 docker compose -f tests/integration/docker-compose.yml up -d ducklake-metadata minio minio-init
 ```
+
+The service names `minio` and `minio-init` remain stable; their pinned Silo
+image supplies both the `silo` server and `mcli` admin client. Existing buckets,
+reader policies, test credentials, and credential revocation assertions remain
+part of the fixture. See the [Silo local storage runbook](../../docs/silo-local-storage.md)
+for release pins and migration/recovery instructions.
 
 ### Running concurrency benchmarks
 

@@ -733,7 +733,7 @@ larger steady-state metadata connection footprint.
 The easiest way to get started with DuckLake is using the included Docker Compose setup:
 
 ```bash
-# Start PostgreSQL (metadata) and MinIO (object storage)
+# Start PostgreSQL (metadata) and PGSTY Silo (object storage)
 docker compose up -d
 
 # Wait for services to be ready
@@ -754,7 +754,7 @@ The `docker-compose.yaml` creates:
 - Database: `ducklake`
 - User/Password: `ducklake` / `ducklake`
 
-**MinIO** (S3-compatible object storage):
+**PGSTY Silo** (S3-compatible object storage):
 - S3 API: `localhost:9000`
 - Web Console: `http://localhost:9001`
 - Access Key: `minioadmin`
@@ -762,6 +762,12 @@ The `docker-compose.yaml` creates:
 - Bucket: `ducklake` (auto-created on startup)
 
 The included `duckgres.yaml` is pre-configured to use both services.
+
+Local and CI object storage use a pinned PGSTY Silo release with its bundled
+`mcli` admin client. The Compose service names `minio` and `minio-init`,
+`MINIO_*` settings, and existing endpoints are retained for compatibility.
+See the [Silo local storage runbook](docs/silo-local-storage.md) for exact
+image pins, migration, validation, and rollback instructions.
 
 ### Object Storage Configuration
 
