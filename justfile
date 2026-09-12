@@ -520,3 +520,13 @@ gen-certs:
 [group('scripts')]
 seed-ducklake:
     ./scripts/seed_ducklake.sh
+
+# Validate the immutable properties fixture and prepare workload SQL/catalog.
+[group('test')]
+prepare-properties-perf manifest output_dir="/tmp/properties-perf":
+    go run ./cmd/perf-properties-prepare -manifest {{quote(manifest)}} -output-dir {{quote(output_dir)}}
+
+# Run the published properties workload in a configured disposable warehouse.
+[group('test')]
+scenario-properties-perf:
+    ./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_properties_perf.yaml

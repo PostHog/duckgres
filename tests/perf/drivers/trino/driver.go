@@ -140,7 +140,10 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	if d.exec == nil {
 		return core.ExecutionResult{}, fmt.Errorf("trino driver has no executor")
 	}
-	sqlText := query.CanonicalSQL()
+	sqlText, err := query.SQLFor(d.Protocol())
+	if err != nil {
+		return core.ExecutionResult{}, err
+	}
 	if sqlText == "" {
 		return core.ExecutionResult{}, fmt.Errorf("query %s missing canonical SQL", query.QueryID)
 	}
@@ -252,3 +255,25 @@ func (e *sqlExecutor) Close() error {
 
 var _ core.ProtocolDriver = (*Driver)(nil)
 var _ Executor = (*sqlExecutor)(nil)
+
+func (d *Driver) ReadResults(ctx context.Context, query core.Query, args []any) ([][]*string, error) {
+	reader, ok := d.exec.(interface {
+		ReadResults(context.Context, string, []any) ([][]*string, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("executor cannot read result values")
+	}
+	sqlText, err := query.SQLFor(d.Protocol())
+	if err != nil {
+		return nil, err
+	}
+	return reader.ReadResults(ctx, sqlText, args)
+}
+func (e *sqlExecutor) ReadResults(ctx context.Context, query string, args []any) ([][]*string, error) {
+	queryContext := e.db.QueryContext
+	rows, err := queryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return core.ReadSQLResults(rows)
+}

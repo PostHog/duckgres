@@ -151,9 +151,11 @@ Rows are stored with:
 - `dataset_version`
 - `run_date`
 
-The source CSV schema is fixed to:
+The current source CSV schema is:
 
-`query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at`
+`query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at,representation`
+
+The publisher also accepts the original header without `representation`. Schema bootstrap adds the nullable `representation` column to existing result tables; deployments with bootstrap disabled must apply that additive migration before publishing. Existing workloads use an empty label. Properties query IDs retain their representation suffix for existing dashboard grouping.
 
 `summary.json` remains a local run artifact and is also consumed by the publisher to populate run-level dashboard metadata.
 For frozen runs, `dataset_manifest.json` is written and validated by the harness before publisher writes begin.

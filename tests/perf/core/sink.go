@@ -40,6 +40,7 @@ func NewArtifactSink(dir string) (*ArtifactSink, error) {
 		"rows",
 		"duration_ms",
 		"started_at",
+		"representation",
 	}
 	if err := w.Write(header); err != nil {
 		_ = f.Close()
@@ -70,6 +71,7 @@ func NewArtifactSink(dir string) (*ArtifactSink, error) {
 		"dpu_count",
 		"result_reused",
 		"engine_version",
+		"representation",
 	}
 	if err := serviceMetricsWriter.Write(serviceMetricsHeader); err != nil {
 		_ = serviceMetricsFile.Close()
@@ -106,6 +108,7 @@ func (s *ArtifactSink) Record(result QueryResult) error {
 		strconv.FormatInt(result.Rows, 10),
 		strconv.FormatFloat(float64(result.Duration)/float64(time.Millisecond), 'f', 6, 64),
 		result.StartedAt.UTC().Format(time.RFC3339Nano),
+		result.Representation,
 	}
 	if err := s.csvWriter.Write(row); err != nil {
 		return fmt.Errorf("write csv row: %w", err)
@@ -129,6 +132,7 @@ func (s *ArtifactSink) Record(result QueryResult) error {
 			strconv.FormatFloat(metrics.DPUCount, 'f', -1, 64),
 			strconv.FormatBool(metrics.ResultReused),
 			metrics.EngineVersion,
+			result.Representation,
 		}
 		if err := s.serviceMetricsWriter.Write(serviceMetricsRow); err != nil {
 			return fmt.Errorf("write service metrics row: %w", err)

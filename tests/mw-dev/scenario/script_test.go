@@ -77,6 +77,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 
 	for _, required := range []string{
 		"name: scenario-dev",
+		"DUCKGRES_SCENARIO_PROPERTIES_MANIFEST: ${{ secrets.DUCKGRES_PROPERTIES_MANIFEST_URI }}",
 		"workflow_dispatch:",
 		"scenario:",
 		"default: full-suite",
@@ -105,7 +106,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"if: env.SCENARIO_NAME == 'posthog_frozen_perf'",
 		"bash scripts/scenario_athena_config.sh >> \"$GITHUB_ENV\"",
 		"TRINO_IMAGE: ghcr.io/posthog/trino:",
-		"E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}",
+		"E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached' || matrix.scenario == 'posthog_properties_perf') && 'trino' || 'neutral' }}",
 		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"3\"",
 		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 12Gi",
 		"role-duration-seconds: 16200",
@@ -138,6 +139,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"MW_DEV_ATHENA_RESULTS_S3_URI",
 		"skip_slow:",
 		"inputs.skip_slow",
+		"inputs.properties_manifest",
 		"scenario-skipped:",
 		"test-scenario-full",
 		"use_shared_dev:",
@@ -249,5 +251,44 @@ func TestScenarioWorkflowsUseNode24Actions(t *testing.T) {
 		if !strings.Contains(string(imageWorkflow), required) {
 			t.Fatalf("image workflow missing Node 24 action pin %q", required)
 		}
+	}
+}
+
+func TestPropertiesScenarioPreparation(t *testing.T) {
+	script := filepath.Join("..", "..", "..", "scripts", "scenario_run.sh")
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls")
+	mock := "#!/bin/sh\nif [ \"$1\" = run ]; then printf 'properties-fixture-test\\n' > \"$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR/dataset-version.txt\"; fi\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "go"), []byte(mock), 0755); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"PATH=" + dir + ":" + os.Getenv("PATH"), "CALL_LOG=" + log}
+	for _, name := range []string{"API_BASE", "INTERNAL_SECRET", "PG_HOST", "SNI_SUFFIX", "ORG_ID", "TRINO_CA_CERT", "TRINO_CATALOG_STORE_DSN", "ATHENA_REGION", "ATHENA_WORKGROUP", "ATHENA_DATABASE", "ATHENA_RESULTS_S3_URI"} {
+		env = append(env, "DUCKGRES_SCENARIO_"+name+"=synthetic")
+	}
+	env = append(env, "DUCKGRES_K8S_WORKER_CPU_REQUEST=1", "DUCKGRES_K8S_WORKER_MEMORY_REQUEST=1Gi", "DUCKGRES_SCENARIO_PROPERTIES_MANIFEST=s3://fixture/complete.json", "DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR="+dir)
+	for _, check := range []bool{true, false} {
+		args := []string{script, "tests/mw-dev/scenario/scenarios/posthog_properties_perf.yaml"}
+		if check {
+			args = append(args, "--check-env")
+		}
+		cmd := exec.Command("bash", args...)
+		cmd.Env = env
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("script: %v: %s", err, out)
+		}
+		if check {
+			if _, err := os.Stat(log); !os.IsNotExist(err) {
+				t.Fatal("check-env must not prepare or run")
+			}
+		}
+	}
+	calls, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "run ./cmd/perf-properties-prepare -manifest s3://fixture/complete.json -output-dir "+dir) || !strings.HasPrefix(lines[1], "test ") {
+		t.Fatalf("wrong preparation/run ordering: %s", calls)
 	}
 }

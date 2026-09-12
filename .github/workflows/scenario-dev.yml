@@ -66,6 +66,7 @@ jobs:
     timeout-minutes: 270
     env:
       SCENARIO_NAME: ${{ matrix.scenario }}
+      DUCKGRES_SCENARIO_PROPERTIES_MANIFEST: ${{ secrets.DUCKGRES_PROPERTIES_MANIFEST_URI }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
       WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
@@ -78,7 +79,7 @@ jobs:
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
       TRINO_IMAGE: ghcr.io/posthog/trino:59184e0c58c2fdbde031f3a08787c926dc4d7f69@sha256:a7072f7c86fcbb815c2502bb455b27bc4679d201ad6ce81725378a7c5ce84325
-      E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}
+      E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached' || matrix.scenario == 'posthog_properties_perf') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}${{ strategy.job-index }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ strategy.job-index }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
@@ -129,7 +130,7 @@ jobs:
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
 
       - name: Load Athena perf configuration
-        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_properties_perf'
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
       - name: Deploy isolated Duckgres stack

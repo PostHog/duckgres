@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.28
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.32
 	github.com/aws/aws-sdk-go-v2/service/athena v1.64.0
+	github.com/aws/aws-sdk-go-v2/service/glue v1.155.0
 	github.com/aws/aws-sdk-go-v2/service/route53 v1.62.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.105.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.44.0

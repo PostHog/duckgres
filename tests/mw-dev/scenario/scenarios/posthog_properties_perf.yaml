@@ -1,0 +1,89 @@
+name: posthog-properties-perf
+run_id_prefix: scenario-properties-perf
+required_env:
+  - DUCKGRES_SCENARIO_ORG_ID
+  - DUCKGRES_SCENARIO_PROPERTIES_MANIFEST
+  - DUCKGRES_SCENARIO_TRINO_CA_CERT
+  - DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
+  - DUCKGRES_SCENARIO_ATHENA_REGION
+  - DUCKGRES_SCENARIO_ATHENA_WORKGROUP
+  - DUCKGRES_SCENARIO_ATHENA_DATABASE
+  - DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI
+  - DUCKGRES_K8S_WORKER_CPU_REQUEST
+  - DUCKGRES_K8S_WORKER_MEMORY_REQUEST
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      request:
+        database_name: scenario-properties-perf-${run_id_token}
+        team_id: 1
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+        trino:
+          enabled: true
+          tier: free
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: wait_trino_ready
+    type: wait_trino_ready
+    depends_on: [wait_ready]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: setup_properties
+    type: sql
+    depends_on: [wait_ready]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/setup.sql
+      max_attempts: 1
+      exec_only: true
+
+  - id: perf_queries
+    type: perf_queries
+    depends_on: [setup_properties, wait_trino_ready]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      catalog_file: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/catalog.yaml
+      targets: [pgwire_uncached, pgwire_cached, trino, athena]
+      trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
+      trino_startup_timeout: 2m
+      trino_startup_poll_interval: 2s
+      athena_region: ${env:DUCKGRES_SCENARIO_ATHENA_REGION}
+      athena_workgroup: ${env:DUCKGRES_SCENARIO_ATHENA_WORKGROUP}
+      athena_catalog: AwsDataCatalog
+      athena_database: ${env:DUCKGRES_SCENARIO_ATHENA_DATABASE}
+      athena_output_location: ${env:DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI}
+      athena_poll_interval: 500ms
+      athena_query_timeout: 30m
+      run_id: ${run_id}
+      dataset_version: ${env:DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION}
+      fail_on_query_errors: true
+      worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
+      worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
+
+  - id: deprovision
+    type: deprovision_warehouse
+    depends_on: [perf_queries]
+    always_run: true
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      verify_deleted: true
+      cleanup_timeout: 15m
+      poll_interval: 10s

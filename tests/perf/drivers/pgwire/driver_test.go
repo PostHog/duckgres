@@ -223,3 +223,22 @@ func (r *cacheTestRows) Next(values []driver.Value) error {
 	values[0] = int64(1)
 	return nil
 }
+
+func TestReadResultsUsesPinnedConnectionAndCollectsValues(t *testing.T) {
+	connector := &cacheTestConnector{}
+	d, err := NewWithDBAndProtocol(sql.OpenDB(connector), core.ProtocolPGWireUncached)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	got, err := d.ReadResults(context.Background(), core.Query{PGWireSQL: "SELECT 1", Representation: "json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || len(got[0]) != 1 || got[0][0] == nil || *got[0][0] != "1" {
+		t.Fatalf("results=%v", got)
+	}
+	if connector.connections != 1 || len(connector.statements) != 4 {
+		t.Fatalf("setup/connection not preserved: %+v", connector)
+	}
+}

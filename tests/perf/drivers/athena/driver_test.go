@@ -256,3 +256,24 @@ func (f *fakeClient) StopQueryExecution(ctx context.Context, input *awsathena.St
 	f.stopContextErr = ctx.Err()
 	return &awsathena.StopQueryExecutionOutput{}, nil
 }
+
+func TestReadResultsPreservesValuesNullsAndPagination(t *testing.T) {
+	client := &fakeClient{executions: []*athenatypes.QueryExecution{terminalExecution(athenatypes.QueryExecutionStateSucceeded)}, resultPages: []*awsathena.GetQueryResultsOutput{
+		{ResultSet: &athenatypes.ResultSet{Rows: []athenatypes.Row{
+			{Data: []athenatypes.Datum{{VarCharValue: aws.String("key")}, {VarCharValue: aws.String("count")}}},
+			{Data: []athenatypes.Datum{{VarCharValue: aws.String("null")}, {VarCharValue: aws.String("2")}}},
+		}}, NextToken: aws.String("page-2")},
+		{ResultSet: &athenatypes.ResultSet{Rows: []athenatypes.Row{{Data: []athenatypes.Datum{{}, {VarCharValue: aws.String("1")}}}}}},
+	}}
+	got, err := testDriver(t, client).ReadResults(context.Background(), perfcore.Query{Representation: "json", PGWireSQL: "SELECT json_extract_string(properties, '$.browser'), count(*)"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]*string{{aws.String("null"), aws.String("2")}, {nil, aws.String("1")}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("results=%v", got)
+	}
+	if !strings.Contains(aws.ToString(client.startInput.QueryString), "json_extract_scalar") {
+		t.Fatal("incorrect dialect")
+	}
+}
