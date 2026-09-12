@@ -38,7 +38,7 @@ def column_type(field):
         return {"type": "binary"}
     if pa.types.is_date32(t):
         return {"type": "date"}
-    if pa.types.is_timestamp(t) and t.unit == "us":
+    if pa.types.is_timestamp(t) and t.unit in ("ms", "us"):
         return {"type": "timestamptz" if t.tz else "timestamp"}
     if pa.types.is_time64(t) and t.unit == "us":
         return {"type": "time"}
