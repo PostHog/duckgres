@@ -38,6 +38,26 @@ func TestSendErrorDoesNotLogErrorContents(t *testing.T) {
 	}
 }
 
+func TestSendDataRowWithFormatsBinaryEncodeFailureReturnsError(t *testing.T) {
+	// When the client requests binary results but a column value cannot be
+	// binary-encoded, the row must fail with an error rather than write text
+	// bytes under a binary format code, which would corrupt the field.
+	var out bytes.Buffer
+	conn := &clientConn{writer: bufio.NewWriter(&out)}
+
+	err := conn.sendDataRowWithFormats(
+		[]any{true}, // bool has no binary NUMERIC encoding
+		[]int16{1},  // binary format
+		[]int32{OidNumeric},
+	)
+	if err == nil {
+		t.Fatal("sendDataRowWithFormats: expected error for unencodable binary column, got nil")
+	}
+	if out.Len() != 0 {
+		t.Errorf("sendDataRowWithFormats wrote %d bytes on failure, want 0", out.Len())
+	}
+}
+
 func TestSendDataRowWithFormatsUsesTypeOIDForTextDates(t *testing.T) {
 	date := time.Date(2022, 4, 1, 0, 0, 0, 0, time.UTC)
 	timestampTZ := time.Date(2022, 3, 31, 20, 0, 0, 123456000, time.FixedZone("UTC-4", -4*60*60))
