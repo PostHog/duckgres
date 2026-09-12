@@ -103,3 +103,80 @@ func TestRewriteDirectQueryPreservesUseWithoutCatalogRewrite(t *testing.T) {
 		t.Fatalf("rewriteDirectQuery(USE ducklake) = %q, want %q", got, want)
 	}
 }
+
+// TestRewriteDirectQueryLogicalCatalogAlias covers a session connected under
+// its org's Trino catalog name: `USE <alias>` must reach the same physical
+// catalog as `USE ducklake`, so a client that sees one catalog name can switch
+// to it by that name. Any OTHER name still passes through untouched.
+func TestRewriteDirectQueryLogicalCatalogAlias(t *testing.T) {
+	c := &clientConn{
+		server:            &Server{},
+		database:          "org_acme_analytics",
+		physicalCatalog:   physicalDuckLakeCatalog,
+		catalogUseRewrite: true,
+	}
+
+	tests := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{
+			name:  "rewrites the logical alias to two-part ducklake.main",
+			query: "USE org_acme_analytics",
+			want:  "USE ducklake.main",
+		},
+		{
+			name:  "rewrites the quoted logical alias",
+			query: `USE "org_acme_analytics";`,
+			want:  "USE ducklake.main;",
+		},
+		{
+			name:  "still rewrites the physical name",
+			query: "USE ducklake",
+			want:  "USE ducklake.main",
+		},
+		{
+			name:  "preserves another org's catalog name",
+			query: "USE org_billing_db",
+			want:  "USE org_billing_db",
+		},
+		{
+			name:  "preserves an empty quoted identifier",
+			query: `USE ""`,
+			want:  `USE ""`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := c.rewriteDirectQuery(tc.query); got != tc.want {
+				t.Fatalf("rewriteDirectQuery(%q) = %q, want %q", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRewriteDirectQueryEmptyQuotedUseIsNotAnAlias is the regression net for the
+// alias predicate. `USE ""` reaches the alias check as an EMPTY name: the
+// empty-target check in rewriteDirectQuery runs before quote-stripping, so `""`
+// gets past it and then unquotes to "". A session whose database is unset must
+// not match that empty name — `USE ""` is invalid SQL and has to pass through to
+// DuckDB and error there, never be silently rewritten into `USE ducklake.main`.
+func TestRewriteDirectQueryEmptyQuotedUseIsNotAnAlias(t *testing.T) {
+	unnamed := &clientConn{
+		server:            &Server{},
+		database:          "",
+		physicalCatalog:   physicalDuckLakeCatalog,
+		catalogUseRewrite: true,
+	}
+
+	if got, want := unnamed.rewriteDirectQuery(`USE ""`), `USE ""`; got != want {
+		t.Fatalf("rewriteDirectQuery(%q) on an unnamed session = %q, want %q", `USE ""`, got, want)
+	}
+	// The same session still rewrites the physical name, so the guard narrows
+	// nothing it should not.
+	if got, want := unnamed.rewriteDirectQuery("USE ducklake"), "USE ducklake.main"; got != want {
+		t.Fatalf("rewriteDirectQuery(USE ducklake) = %q, want %q", got, want)
+	}
+}

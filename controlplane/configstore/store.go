@@ -110,9 +110,10 @@ type Snapshot struct {
 	OrgUserAccess      map[OrgUserKey]OrgUserAccessConfig
 }
 
-// Selectable catalog names. The startup `database` param now names the catalog
-// a session defaults to rather than identifying the org — these are the only
-// non-empty values a client may request.
+// The physical catalog name. The startup `database` param now names the
+// catalog a session defaults to rather than identifying the org; a client may
+// request this, "", or its own org's logical alias (TrinoCatalogName of the
+// org's database_name) and nothing else.
 const (
 	catalogDuckLake = "ducklake"
 )
@@ -133,11 +134,21 @@ type PostgresConnectionResolution struct {
 	SNIAliasUsed bool
 	// SNIResolved is true when the managed hostname resolved to a known org.
 	SNIResolved bool
-	// EffectiveCatalog is the catalog the session should default to, selected by
-	// the startup `database` param: "" (use the attached default) or "ducklake".
+	// EffectiveCatalog is the REAL catalog the session should default to,
+	// selected by the startup `database` param: "" (use the attached default)
+	// or "ducklake". A logical alias still resolves to "ducklake" here —
+	// execution always targets the physical catalog.
 	EffectiveCatalog string
+	// LogicalCatalog is the client-visible name for that same catalog, set only
+	// when the startup `database` matched the SNI-resolved org's own Trino
+	// catalog name (`org_<database_name>`). Empty for "" and "ducklake", which
+	// report the physical name. It renames the catalog on the PG wire
+	// (current_database(), pg_database, information_schema) and in three-part
+	// references; it never changes what the session executes against.
+	LogicalCatalog string
 	// CatalogValid is false when the requested `database` is not a selectable
-	// catalog name (anything other than "" or "ducklake").
+	// catalog name: anything other than "", "ducklake", or the SNI-resolved
+	// org's own catalog name.
 	CatalogValid bool
 	// Valid is true when (OrgID, username, password) authenticated.
 	Valid bool
@@ -565,10 +576,12 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result := PostgresConnectionResolution{}
 
 	// The startup `database` param is now pure catalog selection, not identity.
-	// Valid values: "" (use the attached default) or "ducklake". Anything else
-	// fails closed — there is no logical-name masking, so an arbitrary name no
-	// longer routes anywhere.
-	switch strings.ToLower(strings.TrimSpace(startupDatabase)) {
+	// Valid values: "" (use the attached default), "ducklake", or — resolved
+	// further down, once SNI has named an org — that org's own Trino catalog
+	// name. Anything else fails closed: there is no logical-name masking, so an
+	// arbitrary name no longer routes anywhere.
+	requestedCatalog := strings.ToLower(strings.TrimSpace(startupDatabase))
+	switch requestedCatalog {
 	case "":
 		result.CatalogValid = true
 	case catalogDuckLake:
@@ -588,7 +601,7 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	if !useManagedSNI {
 		return result
 	}
-	orgID, _, aliasUsed := resolveSNIPrefixFromSnapshot(cs.snapshot, sniPrefix)
+	orgID, databaseName, aliasUsed := resolveSNIPrefixFromSnapshot(cs.snapshot, sniPrefix)
 	if orgID == "" {
 		return result
 	}
@@ -596,6 +609,24 @@ func (cs *ConfigStore) ResolvePostgresConnection(startupDatabase, sniPrefix stri
 	result.SNIAliasUsed = aliasUsed
 	result.SNIOrgID = orgID
 	result.OrgID = orgID
+
+	// Logical catalog alias. A session may also name the catalog THIS org
+	// already has on Trino (`org_<database_name>`) and get the same physical
+	// DuckLake catalog under that name, so one engine-agnostic catalog name
+	// works on both engines.
+	//
+	// Direction matters, and it is the whole of PR #651's invariant: the name
+	// is compared against the catalog name derived from the org SNI has ALREADY
+	// resolved. It is never a key into DatabaseOrg, Orgs, or any other map, so
+	// it can neither discover nor select an org — a sibling tenant's catalog
+	// name is just another unrecognized string here, and fails closed. Never
+	// rewrite this as a lookup from name to org.
+	if !result.CatalogValid && databaseName != "" &&
+		requestedCatalog == TrinoCatalogName(databaseName) {
+		result.EffectiveCatalog = catalogDuckLake
+		result.LogicalCatalog = requestedCatalog
+		result.CatalogValid = true
+	}
 
 	// Authenticate the user within the resolved org. Minted service
 	// credentials (svc_-prefixed usernames) resolve against the grants

@@ -65,6 +65,22 @@ func resolveEffectiveCatalog(requested string, duckLakeAttached bool) (string, b
 	return "", false
 }
 
+// visibleCatalogName returns the name the session reports for its catalog on
+// the PG wire — current_database(), pg_database, information_schema, the logs,
+// and the catalog half of a three-part reference.
+//
+// It is the logical alias when the connection selected one (its org's Trino
+// catalog name, validated against the SNI-resolved org in
+// ResolvePostgresConnection), else the real attached catalog. Only the NAME
+// differs: every statement still executes against effectiveCatalog, and the
+// transpiler rewrites the alias back to it.
+func visibleCatalogName(logicalCatalog, effectiveCatalog string) string {
+	if logicalCatalog != "" {
+		return logicalCatalog
+	}
+	return effectiveCatalog
+}
+
 func ensureMemoryMainInSearchPath(searchPath string) string {
 	if strings.Contains(strings.ToLower(searchPath), "memory.main") {
 		return searchPath

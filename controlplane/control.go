@@ -1042,11 +1042,15 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	// In multi-tenant mode the org is resolved solely from the managed hostname
 	// (SNI); the user is authenticated within that org. The startup `database`
 	// param no longer identifies the org — it selects which attached catalog
-	// (ducklake) the session defaults to.
+	// (ducklake) the session defaults to, optionally under the org's own Trino
+	// catalog name as a logical alias.
 	var (
-		orgID             string
-		passthroughUser   bool
-		requestedCatalog  string // "" | "ducklake" (validated below)
+		orgID            string
+		passthroughUser  bool
+		requestedCatalog string // "" | "ducklake" (validated below)
+		// logicalCatalog is the client-visible name for that same catalog when
+		// the connection selected its org's Trino catalog name; "" otherwise.
+		logicalCatalog    string
 		queryAccessPolicy *server.QueryAccessPolicy
 	)
 	if cp.configStore != nil {
@@ -1082,8 +1086,10 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 		if !resolution.CatalogValid {
-			// The startup `database` is now a catalog selector; only
-			// "ducklake"/empty are valid. No logical-name masking.
+			// The startup `database` is now a catalog selector: "ducklake",
+			// empty, or this org's own Trino catalog name. No org lookup — an
+			// unrecognized name (a sibling tenant's catalog included) is refused
+			// here, never routed.
 			clog.Warn("Postgres connection rejected: requested database is not a selectable catalog.",
 				"database", database, "org", resolution.OrgID)
 			_ = server.WriteErrorResponse(writer, "FATAL", "3D000",
@@ -1115,6 +1121,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		clog = clog.With("org", orgID)
 		passthroughUser = resolution.Passthrough
 		requestedCatalog = resolution.EffectiveCatalog
+		logicalCatalog = resolution.LogicalCatalog
 		if resolution.QueryAccess != nil {
 			queryAccessPolicy = &server.QueryAccessPolicy{
 				ReadOnly:         resolution.QueryAccess.ReadOnly,
@@ -1408,6 +1415,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 	sessionMeta := sessionMetadataInput{
 		database:          database,
 		requestedCatalog:  requestedCatalog,
+		logicalCatalog:    logicalCatalog,
 		passthroughUser:   passthroughUser,
 		clientSearchPath:  clientSearchPath,
 		queryAccessPolicy: queryAccessPolicy,
@@ -1443,7 +1451,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			return
 		}
 		duckLakeAttached = true
-		database = effectiveCatalog
+		database = visibleCatalogName(logicalCatalog, effectiveCatalog)
 		defer destroySessionOnExit()
 		// No slow pre-ready acquisition to watch: ReadyForQuery follows the
 		// initial parameters immediately, so the disconnect watcher would only
@@ -1508,10 +1516,12 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 		}
 		duckLakeAttached = meta.duckLakeAttached
 		effectiveCatalog = meta.effectiveCatalog
-		// `database` now reflects the real catalog the session defaults to — this is
-		// what drives the current_database() macro/pg_database view and what logs and
+		// `database` now reflects the name the session's catalog answers to — the
+		// logical alias when one was selected, else the real attached catalog.
+		// This is what drives the current_database() macro/pg_database view, what
+		// the transpiler rewrites three-part references from, and what logs and
 		// observability surface.
-		database = effectiveCatalog
+		database = meta.visibleCatalog
 
 		// Register the TCP connection so OnWorkerCrash can close it to unblock
 		// the message loop if the backing worker dies.
@@ -1745,7 +1755,7 @@ func (cp *ControlPlane) handleConnection(conn net.Conn) {
 			// being silently ignored.
 			server.SetConnectionPhysicalCatalog(cc, res.meta.effectiveCatalog)
 			server.SetCatalogUseRewrite(cc, res.meta.duckLakeAttached && !passthroughUser)
-			server.SetConnectionDatabase(cc, res.meta.effectiveCatalog)
+			server.SetConnectionDatabase(cc, res.meta.visibleCatalog)
 			if pinned {
 				// Off the tier without a worker switch: the connection is
 				// already ON the escalation target, so escalating would destroy
@@ -1924,6 +1934,10 @@ type sessionMetadataInput struct {
 	// requestedCatalog is the multitenant user resolution's effective catalog
 	// ("" = the connection's default).
 	requestedCatalog string
+	// logicalCatalog is the client-visible alias the connection selected for
+	// that catalog (its org's Trino catalog name); "" when it connected with
+	// "ducklake" or nothing. Renames the catalog on the PG wire only.
+	logicalCatalog string
 	// passthroughUser skips pg_catalog init + catalog USE rewriting.
 	passthroughUser bool
 	// clientSearchPath is the connect-time `-c search_path=...` (already
@@ -1945,6 +1959,9 @@ type sessionMetadataResult struct {
 	duckLakeAttached bool
 	// effectiveCatalog is the real catalog the session defaults to.
 	effectiveCatalog string
+	// visibleCatalog is the name that catalog answers to on the PG wire — the
+	// logical alias when the connection selected one, else effectiveCatalog.
+	visibleCatalog string
 }
 
 // sessionInitError is a session-metadata init failure. It has ALREADY been
@@ -2033,6 +2050,7 @@ func (cp *ControlPlane) initSessionMetadata(
 		}
 	}
 	res.effectiveCatalog = effectiveCatalog
+	res.visibleCatalog = visibleCatalogName(in.logicalCatalog, effectiveCatalog)
 
 	// Passthrough users skip pg_catalog initialization and the catalog USE
 	// rewriting — they bypass the PG compatibility layer entirely. They still
@@ -2048,7 +2066,11 @@ func (cp *ControlPlane) initSessionMetadata(
 				AllowedRelations: in.queryAccessPolicy.AllowedRelations,
 			}
 		}
-		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, exec, effectiveCatalog, metadataAccess); err != nil {
+		// The metadata surfaces report the VISIBLE name — the logical alias when
+		// the connection selected one — so current_database() and the
+		// information_schema views agree with the name the client connected
+		// with. Everything that executes below still uses effectiveCatalog.
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, exec, res.visibleCatalog, metadataAccess); err != nil {
 			initContextErr := initCtx.Err()
 			initCancel()
 			outcome, reason := controlPlaneSessionStartOperationResult(
@@ -2057,7 +2079,7 @@ func (cp *ControlPlane) initSessionMetadata(
 				cp.isDraining(),
 				observe.SessionStartReasonMetadataStore,
 			)
-			clog.Error("Failed to initialize session database metadata.", "database", effectiveCatalog, "error", err)
+			clog.Error("Failed to initialize session database metadata.", "database", res.visibleCatalog, "error", err)
 			return res, &sessionInitError{
 				outcome: outcome, reason: reason,
 				code: "XX000", message: "failed to initialize session database metadata", err: err,

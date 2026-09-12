@@ -337,7 +337,7 @@ region.
 `dashboard_test.go` (TokenSet / break-glass login / cookie), `api_test.go` +
 `api_postgres_test.go` (CRUD), `models_api_test.go` (redaction). e2e: the
 `admin_*` / `impersonation_*` / `models_explorer_api` assertions in
-`tests/e2e-mw-dev/harness.sh`.
+`tests/mw-dev/e2e/harness.sh`.
 
 **Frontend** (`ui/`, Vitest + Testing Library — `just ui-test`, CI job
 `ui-tests`): the dashboard's data-derivation logic has shipped wrong more than

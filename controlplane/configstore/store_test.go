@@ -830,3 +830,98 @@ func TestWithSnapshotHoldsPublicationReadLock(t *testing.T) {
 		t.Fatal("WithSnapshot did not invoke callback")
 	}
 }
+
+// TestResolvePostgresConnectionLogicalCatalog covers the logical catalog alias:
+// a session may name its org's Trino catalog (`org_<database_name>`) as the
+// startup `database` and get the SAME physical DuckLake catalog under that
+// name. The alias is validated AGAINST the org the managed hostname already
+// resolved — it is never a lookup key, so it cannot route anywhere (PR #651).
+func TestResolvePostgresConnectionLogicalCatalog(t *testing.T) {
+	cs := &ConfigStore{
+		snapshot: &Snapshot{
+			Orgs: map[string]*OrgConfig{
+				"acme":    {Name: "acme", DatabaseName: "acme-analytics"},
+				"billing": {Name: "billing", DatabaseName: "billing_db"},
+			},
+			DatabaseOrg: map[string]string{
+				"acme-analytics": "acme",
+				"billing_db":     "billing",
+			},
+			OrgUserPassword: map[OrgUserKey]string{
+				{OrgID: "acme", Username: "root"}:    mustHash(t, "secret"),
+				{OrgID: "billing", Username: "root"}: mustHash(t, "secret"),
+			},
+		},
+	}
+
+	t.Run("org catalog name selects the physical catalog under the logical name", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("org_acme_analytics", "acme-analytics", true, "root", "secret")
+		if !got.CatalogValid {
+			t.Fatalf("org catalog name must be selectable: %+v", got)
+		}
+		if got.EffectiveCatalog != "ducklake" {
+			t.Fatalf("EffectiveCatalog = %q, want ducklake (execution stays physical): %+v", got.EffectiveCatalog, got)
+		}
+		if got.LogicalCatalog != "org_acme_analytics" {
+			t.Fatalf("LogicalCatalog = %q, want org_acme_analytics: %+v", got.LogicalCatalog, got)
+		}
+		if !got.Valid || got.OrgID != "acme" {
+			t.Fatalf("unexpected auth result: %+v", got)
+		}
+	})
+
+	t.Run("mixed case and surrounding space normalize to the canonical name", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("  ORG_Acme_Analytics ", "acme-analytics", true, "root", "secret")
+		if !got.CatalogValid || got.LogicalCatalog != "org_acme_analytics" {
+			t.Fatalf("catalog = (valid=%v, logical=%q), want the canonical lowercase name: %+v",
+				got.CatalogValid, got.LogicalCatalog, got)
+		}
+	})
+
+	t.Run("ducklake and empty carry no logical name", func(t *testing.T) {
+		for _, db := range []string{"", "ducklake"} {
+			got := cs.ResolvePostgresConnection(db, "acme-analytics", true, "root", "secret")
+			if !got.CatalogValid || got.LogicalCatalog != "" {
+				t.Fatalf("database %q: catalog = (valid=%v, logical=%q), want valid with no logical name: %+v",
+					db, got.CatalogValid, got.LogicalCatalog, got)
+			}
+		}
+	})
+
+	t.Run("an arbitrary name still fails closed", func(t *testing.T) {
+		for _, db := range []string{"postgres", "org_", "org_nope", "acme-analytics", "acme"} {
+			got := cs.ResolvePostgresConnection(db, "acme-analytics", true, "root", "secret")
+			if got.CatalogValid || got.LogicalCatalog != "" {
+				t.Fatalf("database %q must fail closed: %+v", db, got)
+			}
+		}
+	})
+
+	t.Run("another org's catalog name is refused", func(t *testing.T) {
+		// The security case: SNI authenticates acme, so billing's catalog name
+		// must not be selectable — not even with acme's valid credentials.
+		got := cs.ResolvePostgresConnection("org_billing_db", "acme-analytics", true, "root", "secret")
+		if got.CatalogValid || got.LogicalCatalog != "" {
+			t.Fatalf("a sibling org's catalog name must fail closed: %+v", got)
+		}
+		if got.OrgID != "acme" {
+			t.Fatalf("OrgID = %q, want acme — identity still comes from SNI alone", got.OrgID)
+		}
+	})
+
+	t.Run("without managed SNI there is no org to validate against", func(t *testing.T) {
+		// No SNI-resolved org means no catalog name to compare to, so the alias
+		// cannot be accepted. The startup database must never resolve an org.
+		got := cs.ResolvePostgresConnection("org_acme_analytics", "acme-analytics", false, "root", "secret")
+		if got.CatalogValid || got.SNIResolved {
+			t.Fatalf("logical alias must not be accepted without managed SNI: %+v", got)
+		}
+	})
+
+	t.Run("unknown managed hostname refuses the alias", func(t *testing.T) {
+		got := cs.ResolvePostgresConnection("org_acme_analytics", "ghostorg", true, "root", "secret")
+		if got.CatalogValid || got.SNIResolved || got.OrgID != "" {
+			t.Fatalf("unknown SNI must not admit a logical alias: %+v", got)
+		}
+	})
+}

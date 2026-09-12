@@ -80,3 +80,30 @@ func TestResolveEffectiveCatalog(t *testing.T) {
 		})
 	}
 }
+
+// TestVisibleCatalogName pins the split between the name a session reports and
+// the catalog it executes against: a logical alias renames, it never redirects.
+func TestVisibleCatalogName(t *testing.T) {
+	tests := []struct {
+		name      string
+		logical   string
+		effective string
+		want      string
+	}{
+		{name: "no alias reports the physical catalog", logical: "", effective: "ducklake", want: "ducklake"},
+		{name: "alias renames the physical catalog", logical: "org_acme", effective: "ducklake", want: "org_acme"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := visibleCatalogName(tt.logical, tt.effective); got != tt.want {
+				t.Fatalf("visibleCatalogName(%q, %q) = %q, want %q", tt.logical, tt.effective, got, tt.want)
+			}
+		})
+	}
+
+	// The alias is a NAME. Execution still resolves to the attached catalog,
+	// so resolveEffectiveCatalog must be unaffected by it.
+	if got, ok := resolveEffectiveCatalog("ducklake", true); got != "ducklake" || !ok {
+		t.Fatalf("resolveEffectiveCatalog under an alias = (%q, %v), want (ducklake, true)", got, ok)
+	}
+}
