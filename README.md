@@ -70,6 +70,14 @@ This name does not change its stored org assignments or catalog-store key.
 `DUCKGRES_TRINO_CELL_ID` remains the ownership setting, with the existing default
 `cell-001`; do not change it to `legacy` to match the API display name.
 Connection details remain readiness-gated and use the existing endpoint.
+Trino readiness requires a reconciled catalog and the current tenant password
+file on every active coordinator and worker of every running backend. Secret
+projection lag remains `provisioning`; catalog creation alone does not make a
+tenant ready. Checks use namespace-scoped pod read/exec access, with batches of
+128 files, up to four concurrent observations and a five-second timeout per
+observation within the existing 30-second backend budget. These limits are
+fixed defaults. See the [readiness runbook](docs/runbooks/trino-readiness.md)
+for deployment requirements, local verification, and recovery.
 See the [Trino admin API documentation](controlplane/admin/README.md#trino-cell-views-trinogo--trino_clientgo)
 for local verification, compatibility details, and recovery instructions.
 

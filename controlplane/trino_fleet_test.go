@@ -123,6 +123,7 @@ func (c *fleetCatalog) ListCatalogs(ctx context.Context) ([]string, error) {
 func (c *fleetCatalog) CreateCatalog(context.Context, string, map[string]string) error { return nil }
 func (c *fleetCatalog) AlterCatalog(context.Context, string, map[string]string) error  { return nil }
 func (c *fleetCatalog) DropCatalog(context.Context, string) error                      { return nil }
+func (c *fleetCatalog) ListNodes(context.Context) ([]provisioner.TrinoNode, error)     { return nil, nil }
 
 func TestTrinoFleetSlowCellDoesNotBlockSibling(t *testing.T) {
 	store := &fleetBootstrapStore{initialized: map[string]bool{}}

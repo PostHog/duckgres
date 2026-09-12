@@ -156,6 +156,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  # The control plane checks Trino's mounted tenant credentials before readiness.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]

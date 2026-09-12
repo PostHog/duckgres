@@ -39,6 +39,13 @@ metadata:
   name: trino-cell-projection
   namespace: ${TRINO_CELL_NAMESPACE}
 rules:
+  # Verify credentials in the cell's Trino pods before reporting tenant readiness.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
   - apiGroups: [""]
     resources: ["secrets", "configmaps"]
     verbs: ["create"]
