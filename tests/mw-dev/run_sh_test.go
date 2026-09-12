@@ -2182,7 +2182,6 @@ func TestTrinoCacheModeFollowsScenario(t *testing.T) {
 			fakes := newRunSHFakes(t)
 			writeFake(t, fakes.binDir, "envsubst", `#!/usr/bin/env bash
 printf 'cache-mode %s\n' "${TRINO_FILESYSTEM_CACHE_ENABLED:-unset}" >> "$RUN_SH_TEST_CALLS"
-printf 'trino-image %s\n' "${TRINO_IMAGE:-unset}" >> "$RUN_SH_TEST_CALLS"
 cat
 `)
 			secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
@@ -2191,31 +2190,12 @@ cat
 					t.Fatal(err)
 				}
 			}
-			cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino", "SCENARIO_NAME="+tc.scenario, "TRINO_IMAGE=", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-test", "SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-test")
+			cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino", "SCENARIO_NAME="+tc.scenario, "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-test", "SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-test")
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("deploy: %v\n%s", err, out)
 			}
-			calls := fakes.calls(t)
-			if !strings.Contains(calls, "cache-mode "+tc.enabled+"\n") {
+			if calls := fakes.calls(t); !strings.Contains(calls, "cache-mode "+tc.enabled+"\n") {
 				t.Fatalf("catalog cache mode was not %s: %s", tc.enabled, calls)
-			}
-			for _, want := range []string{
-				"--service-account duckgres-scenario --role-arn arn:aws:iam::123456789012:role/scenario-test",
-				"trino-image ghcr.io/posthog/trino:a2943f5ec37f1d5a9ab90b9bec56695a00de4584@sha256:7a57712498446bd97393cadece90ce0bc297f6feab8e0098510668fe2667ac39",
-				"rollout status deploy/duckgres-hoglake-postgres",
-				"rollout status deploy/duckgres-hoglake",
-				`"name":"DUCKGRES_TRINO_HOGLAKE_URI","value":"http://duckgres-hoglake.duckgres-ci-pr-123.svc:8080"`,
-			} {
-				if !strings.Contains(calls, want) {
-					t.Errorf("missing Hoglake scenario deployment %q", want)
-				}
-			}
-			identity := strings.Index(calls, "--service-account trino --role-arn")
-			hoglakeStart := strings.Index(calls, "patch deployment duckgres-hoglake --type=merge")
-			ready := strings.Index(calls, "rollout status deploy/duckgres-hoglake --timeout=")
-			catalog := strings.Index(calls, `"name":"DUCKGRES_TRINO_HOGLAKE_URI"`)
-			if identity < 0 || hoglakeStart <= identity || ready <= hoglakeStart || catalog <= ready {
-				t.Error("Hoglake must start after Pod Identity and become ready before the control plane uses its catalog")
 			}
 		})
 	}

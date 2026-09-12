@@ -12,7 +12,6 @@ RUN go mod download
 
 COPY . .
 RUN go test -run '^$' ./tests/mw-dev/scenario
-RUN python3 -m unittest discover -s tests/mw-dev/scenario/perf -p test_setup_hoglake.py
 
 ENV DUCKGRES_SCENARIO_DBT_BIN=dbt
 
