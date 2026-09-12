@@ -3,6 +3,7 @@ package composefile
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -10,7 +11,7 @@ import (
 
 // TestDockerComposeCoreStack guards the shape of the integration compose
 // stack: the comparison Postgres, the DuckLake metadata Postgres, and the
-// MinIO object store the DuckLake tests run against.
+// Silo object store the DuckLake tests run against.
 func TestDockerComposeCoreStack(t *testing.T) {
 	compose := readCompose(t)
 
@@ -44,6 +45,32 @@ func TestDockerComposeCoreStack(t *testing.T) {
 	}
 }
 
+// Keep every local server and bundled admin client on the same immutable release.
+func TestDockerComposeSilo(t *testing.T) {
+	image := serviceNamed(t, readCompose(t), "minio").Image
+	if !regexp.MustCompile(`^docker\.io/pgsty/silo:RELEASE\.[^@]+@sha256:[0-9a-f]{64}$`).MatchString(image) {
+		t.Fatalf("storage image must pin a Silo release and digest: %q", image)
+	}
+	for _, path := range []string{
+		filepath.Join("..", "docker-compose.yml"),
+		filepath.Join("..", "..", "..", "docker-compose.yaml"),
+		filepath.Join("..", "..", "..", "k8s", "local-config-store.compose.yaml"),
+	} {
+		t.Run(path, func(t *testing.T) {
+			compose := readComposePath(t, path)
+			storage := serviceNamed(t, compose, "minio")
+			if storage.Image != image {
+				t.Errorf("storage image = %q, want pinned Silo %q", storage.Image, image)
+			}
+			if init, ok := compose.Services["minio-init"]; ok {
+				if init.Image != image {
+					t.Errorf("init image = %q, want same bundled client release as server", init.Image)
+				}
+			}
+		})
+	}
+}
+
 type composeFile struct {
 	Services map[string]service `yaml:"services"`
 }
@@ -57,8 +84,12 @@ type service struct {
 
 func readCompose(t *testing.T) composeFile {
 	t.Helper()
+	return readComposePath(t, filepath.Join("..", "docker-compose.yml"))
+}
 
-	raw, err := os.ReadFile(filepath.Join("..", "docker-compose.yml"))
+func readComposePath(t *testing.T, path string) composeFile {
+	t.Helper()
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read docker-compose.yml: %v", err)
 	}

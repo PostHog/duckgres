@@ -1,5 +1,22 @@
 #!/bin/sh
 # The main Trino harness supplies authenticated API and SQL helpers.
+# Keep the exact retiring replicas: rollout status can succeed while their
+# preStop hooks still serve the previous configuration.
+snapshot_control_plane_pods() {
+  old_control_plane_pods="$("$KUBECTL" -n "$NS" get pods -l app=duckgres-control-plane -o name)" \
+    || fail "could not snapshot control-plane pods before rollout"
+  [ -n "$old_control_plane_pods" ] || fail "no control-plane pods before rollout"
+}
+wait_control_plane_rollout() {
+  "$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null \
+    || fail "control-plane rollout failed"
+  # Intentional word splitting of kubectl's newline-separated resource names.
+  # The fixed snapshot excludes replacement pods and includes all old replicas.
+  # shellcheck disable=SC2086
+  "$KUBECTL" -n "$NS" wait --for=delete $old_control_plane_pods --timeout=180s >/dev/null \
+    || fail "old control-plane pods did not terminate after rollout"
+}
+
 CELL_NS="${TRINO_CELL_NAMESPACE:?}"
 ORG_C="ci-pr-${PR}-trinoc"
 DB_C="trino-c-${PR}"
@@ -91,9 +108,10 @@ log "green catalog hydration"
 registry="$("$KUBECTL" -n "$NS" get configmap trino-cell-registry -o json \
   | jq -r '.data["cells.json"]' | jq '.cells[0].backends |= map(if .id == "green" then .running=true else . end)')"
 patch="$(printf %s "$registry" | jq -Rs '{data:{"cells.json":.}}')"
+snapshot_control_plane_pods
 "$KUBECTL" -n "$NS" patch configmap trino-cell-registry --type=merge -p "$patch" >/dev/null
 "$KUBECTL" -n "$NS" rollout restart deployment/duckgres-control-plane >/dev/null
-"$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
+wait_control_plane_rollout
 for target in coordinator worker; do
   "$KUBECTL" -n "$CELL_NS" patch deployment "duckgres-trino-green-$target" --type=merge -p '{"spec":{"replicas":1}}' >/dev/null
 done
@@ -127,14 +145,14 @@ log "registry-only startup without legacy"
 legacy_env="$("$KUBECTL" -n "$NS" get deployment duckgres-control-plane -o json | jq -c '.spec.template.spec.containers[] | select(.name == "controlplane") | .env[] | select(.name == "DUCKGRES_TRINO_COORDINATOR_URL")')"
 [ -n "$legacy_env" ] || fail "missing legacy configuration before registry-only test"
 legacy_owner="$(api "$API/api/v1/orgs/$ORG_A" | jq -r .trino.trino_cell_id)"
+snapshot_control_plane_pods
 "$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
   '{"spec":{"template":{"spec":{"containers":[{"name":"controlplane","env":[{"name":"DUCKGRES_TRINO_COORDINATOR_URL","$patch":"delete"},{"name":"DUCKGRES_TRINO_REGISTRY_ONLY","value":"true"}]}]}}}}' >/dev/null
-"$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
-# Deployment readiness can precede Service endpoint convergence after restart.
-# Wait for an authenticated API response before asserting registry contents.
-wait_cell_ready
-api "$API/api/v1/trino/cells" | jq -e '.cells | map(.id) == ["cell-test"]' >/dev/null \
+wait_control_plane_rollout
+cells="$(api "$API/api/v1/trino/cells")" || fail "registry-only cells API request failed"
+printf %s "$cells" | jq -e '.cells | map(.id) == ["cell-test"]' >/dev/null \
   || fail "registry-only startup invented a legacy cell"
+wait_cell_ready
 for endpoint in "$BLUE_TRINO" "$GREEN_TRINO"; do
   TRINO="$endpoint"
   [ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
@@ -162,8 +180,9 @@ api "$API/api/v1/orgs/ci-pr-$PR-unassigned/trino" \
 
 log "restore legacy fixture configuration"
 patch="$(printf %s "$legacy_env" | jq -c '{spec:{template:{spec:{containers:[{name:"controlplane",env:[.,{name:"DUCKGRES_TRINO_REGISTRY_ONLY","$patch":"delete"}]}]}}}}')"
+snapshot_control_plane_pods
 "$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch" >/dev/null
-"$KUBECTL" -n "$NS" rollout status deployment/duckgres-control-plane --timeout=180s >/dev/null
+wait_control_plane_rollout
 TRINO="$LEGACY_TRINO"
 [ "$(trino_query "$DB_A" "$pw_a" 'SELECT 1')" = '[[1]]' ] || fail "legacy query failed after registry-only fixture restore"
 log "PASS: registry-only startup + explicit selection + no legacy dependency + restored fixture"

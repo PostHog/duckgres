@@ -139,8 +139,8 @@ func assertS3ReaderCannotWrite(t *testing.T, composeFile string) {
 	t.Helper()
 	cmdArgs := []string{
 		"compose", "-f", composeFile, "run", "--rm", "--no-deps", "--entrypoint", "/bin/sh", "minio-init", "-ec",
-		"mc alias set reader http://minio:9000 trino-reader trino-reader && " +
-			"printf blocked | mc pipe reader/ducklake/data/trino-smoke-write-probe",
+		"mcli alias set reader http://minio:9000 trino-reader trino-reader && " +
+			"printf blocked | mcli pipe reader/ducklake/data/trino-smoke-write-probe",
 	}
 	cmd := exec.Command("docker", cmdArgs...)
 	output, err := cmd.CombinedOutput()

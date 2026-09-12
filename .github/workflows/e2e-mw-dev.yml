@@ -94,9 +94,7 @@ jobs:
         HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
         DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
         DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
-        POSTGRES_SCANNER_REPOSITORY=https://nightly-extensions.duckdb.org
-        POSTGRES_SCANNER_SHA256_AMD64=5b1657abe8f829b16da8e79570dc10751252361e59294ab890e3fcbdf94d4a82
-        POSTGRES_SCANNER_SHA256_ARM64=c7e18454bd7d52a39d4e19a27932470d7fd071b606fe5f7a00f07d626155eac8
+        POSTGRES_SCANNER_TAG=v1.5.5-a3516c0
     secrets:
       ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
 

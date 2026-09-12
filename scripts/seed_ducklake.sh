@@ -1,12 +1,12 @@
 #!/bin/bash
-# Seed script for DuckLake catalog with sample data stored in MinIO
+# Seed script for DuckLake catalog with sample data stored in PGSTY Silo
 #
 # This script connects to a running Duckgres server with DuckLake configured
-# (PostgreSQL metadata + MinIO object storage) and creates tables with sample
-# data. DuckLake automatically stores the data as Parquet files in MinIO.
+# (PostgreSQL metadata + Silo object storage) and creates tables with sample
+# data. DuckLake automatically stores the data as Parquet files in Silo.
 #
 # Prerequisites:
-#   - docker compose up -d (PostgreSQL + MinIO running)
+#   - docker compose up -d (PostgreSQL + Silo running)
 #   - ./duckgres --config duckgres.yaml (Duckgres server running)
 #
 # Usage:
@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             echo "Usage: $0 [options]"
             echo ""
-            echo "Seeds the DuckLake catalog with sample data stored as Parquet in MinIO."
+            echo "Seeds the DuckLake catalog with sample data stored as Parquet in Silo."
             echo ""
             echo "Options:"
             echo "  --host HOST       Server host (default: 127.0.0.1)"
@@ -79,7 +79,7 @@ done
 CONN="host=$HOST port=$PORT user=$USER sslmode=require"
 
 echo "=== DuckLake Catalog Seed Script ==="
-echo "Seeding DuckLake with Parquet data in MinIO"
+echo "Seeding DuckLake with Parquet data in Silo"
 echo ""
 echo "Connecting to $HOST:$PORT as $USER..."
 
@@ -113,7 +113,7 @@ if ! run_sql "SHOW ALL TABLES" 2>&1 | grep -q "ducklake"; then
     echo ""
     echo "Make sure duckgres.yaml has DuckLake configured with:"
     echo "  - metadata_store pointing to PostgreSQL"
-    echo "  - object_store pointing to MinIO (s3://ducklake/data/)"
+    echo "  - object_store pointing to Silo (s3://ducklake/data/)"
     echo "  - S3 credentials configured"
     exit 1
 fi
@@ -135,7 +135,7 @@ if [ "$CLEAN" = true ]; then
 fi
 
 echo "=== Creating Tables in DuckLake Catalog ==="
-echo "(Data will be stored as Parquet files in MinIO)"
+echo "(Data will be stored as Parquet files in Silo)"
 echo ""
 
 # Create categories table
@@ -240,7 +240,7 @@ EOF
 
 echo ""
 echo "=== Inserting Data into DuckLake ==="
-echo "(This creates Parquet files in MinIO)"
+echo "(This creates Parquet files in Silo)"
 echo ""
 
 # Seed categories
@@ -410,9 +410,9 @@ echo "=== Seed Complete! ==="
 echo ""
 echo "Data is now stored in DuckLake with:"
 echo "  - Metadata in PostgreSQL (localhost:5433)"
-echo "  - Parquet files in MinIO (localhost:9000, bucket: ducklake)"
+echo "  - Parquet files in Silo (localhost:9000, bucket: ducklake)"
 echo ""
-echo "View MinIO console at: http://localhost:9001"
+echo "View Silo console at: http://localhost:9001"
 echo "  Username: minioadmin"
 echo "  Password: minioadmin"
 echo ""

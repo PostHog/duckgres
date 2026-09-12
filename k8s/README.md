@@ -53,7 +53,7 @@ The control plane handles TLS, authentication, PostgreSQL wire protocol, and SQL
 | `kind/config-store.overlay.yaml` | Compose overlay that attaches local dependency containers to the external Docker `kind` network |
 | `kind/config-store.seed.sql` | Kind-oriented managed-warehouse seed for the shared-worker flow |
 | `kind/control-plane.yaml` | Kind-first shared-worker control-plane manifest used by local dev and CI |
-| `orbstack/dependency-ports.overlay.yaml` | Optional OrbStack overlay that publishes local DuckLake and MinIO dependency ports on the host |
+| `orbstack/dependency-ports.overlay.yaml` | Optional OrbStack overlay that publishes local DuckLake and PGSTY Silo dependency ports on the host |
 
 ## Configuration
 
@@ -104,7 +104,13 @@ PGPASSWORD=postgres psql "host=127.0.0.1 port=5432 user=postgres dbname=duckgres
 
 `just multitenant-port-forward-pg` forwards pgwire on `5432`.
 
-`just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and MinIO backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared-worker control plane.
+`just run-multitenant-kind` recreates a local kind cluster, starts the config store plus the local warehouse DB, DuckLake metadata DB, and PGSTY Silo backing the seeded managed-warehouse contract, attaches those dependency containers to the Docker `kind` network, loads the locally built image into kind, and deploys the shared-worker control plane.
+
+The local object store retains its `minio` service name, `MINIO_*` settings,
+and existing dependency endpoints. Both kind and OrbStack use the pinned Silo
+image and its bundled `mcli` admin client. See the
+[Silo local storage runbook](../docs/silo-local-storage.md) before migrating
+existing data or recovering a failed local setup.
 
 Default login: `postgres / postgres`
 

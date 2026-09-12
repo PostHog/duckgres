@@ -3,11 +3,16 @@
 `just trino-ducklake-smoke` creates the existing local DuckLake fixture through
 Duckgres, then starts one pinned Trino coordinator with the pinned Brikk
 DuckLake connector. It verifies that read-only Trino credentials can discover
-and query the same PostgreSQL metadata catalog and MinIO data path.
+and query the same PostgreSQL metadata catalog and PGSTY Silo data path.
 
 The test is intentionally separate from the normal integration suite because
 it downloads and starts Trino. It uses only local Docker services and test
 credentials; it does not contact managed-warehouse infrastructure.
+
+The shared object-storage fixture retains the `minio` endpoint and service
+name while using pinned Silo and its bundled `mcli` client. Trino's existing
+read-only S3 policy is unchanged. Release pins and local migration/rollback
+instructions are in the [Silo local storage runbook](../../docs/silo-local-storage.md).
 
 The `just` recipe writes the version artifact to
 `artifacts/trino-ducklake-smoke/`. Set `TRINO_DUCKLAKE_SMOKE_ARTIFACT_DIR` to
@@ -35,7 +40,7 @@ to change the dataset size. Artifacts are written to
 set.
 
 This is a local end-to-end comparison, including PGWire or HTTP client overhead
-and local Postgres/MinIO access. It is not a production capacity benchmark.
+and local Postgres/Silo access. It is not a production capacity benchmark.
 
 For wide, PostHog-shaped synthetic events, use the explicit realistic profile:
 

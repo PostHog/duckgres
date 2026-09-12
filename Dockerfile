@@ -26,12 +26,14 @@ ARG DUCKDB_EXTENSION_VERSION=1.5.5
 ARG HTTPFS_EXTENSION_TAG=v1.5.5-cred-refresh-write-retry
 ARG DUCKLAKE_EXTENSION_TAG=v1.0-posthog.7
 ARG DUCKDB_EXTENSION_REPOSITORY=https://extensions.duckdb.org
-# Repository for postgres_scanner specifically. The checksums content-pin the
-# DuckDB 1.5.5 nightly artifact built from duckdb-postgres a3516c0; CI overrides
-# all three values together for rollback rows.
-ARG POSTGRES_SCANNER_REPOSITORY=https://nightly-extensions.duckdb.org
-ARG POSTGRES_SCANNER_SHA256_AMD64=5b1657abe8f829b16da8e79570dc10751252361e59294ab890e3fcbdf94d4a82
-ARG POSTGRES_SCANNER_SHA256_ARM64=c7e18454bd7d52a39d4e19a27932470d7fd071b606fe5f7a00f07d626155eac8
+# postgres_scanner comes from a PostHog mirror, not from DuckDB's extension
+# repositories. The stable 1.5.5 scanner predates duckdb-postgres 71b85668, which
+# fixes inconsistent snapshots across scan connections, so we need a nightly build.
+# The nightly URL is mutable: upstream rebuilds it and a content pin then stops
+# matching, which hard-failed the build five times between 2026-08-03 and
+# 2026-09-11. The mirror is that nightly artifact captured at a known-good
+# revision behind an immutable URL, so there is nothing left to re-pin.
+ARG POSTGRES_SCANNER_TAG=v1.5.5-a3516c0
 # `: ${VAR:?msg}` asserts every required input is non-empty — catches a
 # CI matrix row that forgets to pass a build-arg and would otherwise
 # silently fall back to the ARG default, producing a cross-version
@@ -44,13 +46,7 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
     && : "${HTTPFS_EXTENSION_TAG:?must be set}" \
     && : "${DUCKLAKE_EXTENSION_TAG:?must be set}" \
     && : "${DUCKDB_EXTENSION_REPOSITORY:?must be set}" \
-    && : "${POSTGRES_SCANNER_REPOSITORY:?must be set}" \
-    && case "${TARGETARCH}" in \
-         amd64) postgres_scanner_sha256="${POSTGRES_SCANNER_SHA256_AMD64}" ;; \
-         arm64) postgres_scanner_sha256="${POSTGRES_SCANNER_SHA256_ARM64}" ;; \
-         *) echo "ERROR: unsupported TARGETARCH for postgres_scanner: ${TARGETARCH}" >&2; exit 1 ;; \
-       esac \
-    && : "${postgres_scanner_sha256:?postgres_scanner checksum must be set}" \
+    && : "${POSTGRES_SCANNER_TAG:?must be set}" \
     && mkdir -p "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}" \
     && curl -fsSL "https://github.com/PostHog/duckdb-httpfs/releases/download/${HTTPFS_EXTENSION_TAG}/httpfs-linux-${TARGETARCH}.duckdb_extension" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/httpfs.duckdb_extension" \
@@ -58,12 +54,8 @@ RUN : "${DUCKDB_EXTENSION_VERSION:?must be set}" \
       -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/ducklake.duckdb_extension" \
     && curl -fsSL "${DUCKDB_EXTENSION_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension.gz" \
       | gunzip > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/json.duckdb_extension" \
-    && curl -fsSL "${POSTGRES_SCANNER_REPOSITORY}/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension.gz" \
-      -o /tmp/postgres_scanner.duckdb_extension.gz \
-    && echo "${postgres_scanner_sha256}  /tmp/postgres_scanner.duckdb_extension.gz" | sha256sum -c - \
-    && gunzip -c /tmp/postgres_scanner.duckdb_extension.gz \
-      > "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
-    && rm /tmp/postgres_scanner.duckdb_extension.gz \
+    && curl -fsSL "https://github.com/PostHog/duckdb-postgres/releases/download/${POSTGRES_SCANNER_TAG}/postgres_scanner-linux-${TARGETARCH}.duckdb_extension" \
+      -o "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/postgres_scanner.duckdb_extension" \
     && for f in httpfs ducklake json postgres_scanner; do \
          [ -s "/build/duckdb-extensions/v${DUCKDB_EXTENSION_VERSION}/linux_${TARGETARCH}/$f.duckdb_extension" ] \
            || { echo "ERROR: $f.duckdb_extension is empty after fetch" >&2; exit 1; }; \

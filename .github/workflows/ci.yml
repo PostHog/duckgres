@@ -173,25 +173,16 @@ jobs:
       - name: Build
         run: go build -o duckgres .
 
-      - name: Start MinIO
+      - name: Start PGSTY Silo
         run: |
-          docker run -d --name minio \
-            -p 39000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
-          # Wait for MinIO to be ready
-          for i in {1..30}; do
-            curl -sf http://localhost:39000/minio/health/live && break
-            sleep 1
-          done
+          docker compose -f tests/integration/docker-compose.yml up -d --wait minio
 
-      - name: Create MinIO bucket
+      - name: Create Silo bucket
         run: |
-          docker run --rm --network container:minio \
-            -e MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000 \
-            quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z \
-            mb minio/ducklake --ignore-existing
+          docker compose -f tests/integration/docker-compose.yml run --rm --no-deps minio-init
+
+      - name: Verify Silo storage and credential revocation
+        run: just test-silo
 
       - name: Run integration tests
         run: just test-integration

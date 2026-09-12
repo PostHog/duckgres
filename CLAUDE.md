@@ -180,7 +180,7 @@ The project uses [just](https://github.com/casey/just) as a command runner. Run 
 
 **Every feature, behavior change, bugfix, AND refactor that affects runtime or
 cluster behavior MUST ship with a solid end-to-end test case in
-`tests/e2e-mw-dev/` (`harness.sh`).** This is not just for new features — any
+`tests/mw-dev/e2e/` (`harness.sh`).** This is not just for new features — any
 change to how the system behaves at runtime (new capability, changed semantics,
 a fixed bug, a new config knob, an activation/routing/teardown tweak) extends or
 adds a harness assertion in the same PR. Refactors count too: when you move or
@@ -202,11 +202,11 @@ Three test lanes worth knowing about, in increasing order of blast radius:
 
 - **Unit / package tests** (`go test ./...`): in-process, no external deps. Where most coverage lives. Includes `tests/manifests/` (static-manifest artifact asserts for `k8s/rbac.yaml` + `k8s/networkpolicy.yaml`).
 - **`tests/integration/`** (`just test-integration`): spins up the standalone server binary against a real MinIO + Postgres metadata store via docker compose. Covers wire protocol, DuckLake on real S3-compatible storage, transpilation against a live server.
-- **`tests/e2e-mw-dev/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real AWS S3. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/e2e-mw-dev/README.md`.
+- **`tests/mw-dev/e2e/`** (per-PR GitHub workflow `e2e-mw-dev.yml`): the full multi-tenant activation pipeline against the **real posthog-mw-dev EKS cluster** — real Cilium, real Crossplane ducklings, real cnpg-shard + external-RDS metadata, real AWS S3. A shell harness (`harness.sh`) runs as an in-cluster Job per PR; `run.sh` orchestrates deploy/test/teardown/e2e-cleanup. **Replaces the retired kind suite** (`tests/k8s/`) — that suite's `k8s-integration-tests` CI job and its Go tests are gone; the supporting `k8s/` scripts/manifests + Dockerfiles are kept for now. See `tests/mw-dev/README.md`.
 
 ### When code changes obligate test changes
 
-`tests/e2e-mw-dev/` is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating the harness as part of the change, not a follow-up:
+`tests/mw-dev/e2e/` is the only place we exercise the full activation pipeline (control plane → STS broker → worker pod → DuckDB → ATTACH against real cloud storage). If your change touches any of the following, treat updating the harness as part of the change, not a follow-up:
 
 - `controlplane/shared_worker_activator.go`, `controlplane/sts_broker.go`, anything in the activation payload shape (`TenantActivationPayload`, `server.DuckLakeConfig`)
 - `server/server.go::AttachDeltaCatalog`, `server.attachDuckLake*`, `server.refresh*Secret`
@@ -1715,6 +1715,39 @@ password/tenant/catalog changes never propagate.
   admin console reads — `controlplane/admin/trino{,_client}_test.go` plus
   the `ui/src/lib/trino.test.ts` derivations and
   `tests/mw-dev/e2e/trino.sh`.
+
+## Logical Catalog Alias (`org_<database_name>` as the startup `database`)
+
+A pgwire session may select its catalog by the name the org has on Trino
+(`configstore.TrinoCatalogName`, `org_<sanitized database_name>`) instead of
+`ducklake`. The catalog is the same one either way: the alias only renames it
+on the wire. This exists so SQLMesh sees ONE catalog name across the Duckgres
+and Trino engines and migrating between them needs no state rewrite.
+
+- **What the startup `database` may be**: `""`, `ducklake`, or the
+  SNI-resolved org's own catalog name. Everything else is 3D000, as before.
+- **Identity is still SNI-only, and this must stay true.** The alias is
+  compared against the catalog name of the org the managed hostname ALREADY
+  resolved — it is never a key into `DatabaseOrg`, `Orgs`, or any other map,
+  so it can neither discover nor select an org. A sibling tenant's catalog
+  name is just an unrecognized string and fails closed. If a change here ever
+  looks up an org BY the database name, it has reintroduced exactly what PR
+  #651 removed. See the comment in `ResolvePostgresConnection`.
+- **Physical vs. visible**: `EffectiveCatalog` stays `ducklake` and is what
+  every statement executes against; `LogicalCatalog` (and
+  `sessionMetadataResult.visibleCatalog`) is the name reported by
+  `current_database()`, `pg_database`, `information_schema`, and the logs.
+  `visibleCatalogName` is the one place that chooses between them.
+- **SQL written against the alias**: the transpiler's `LogicalCatalogTransform`
+  rewrites `<alias>.public.t` → `ducklake.main.t` (fed by `clientConn.database`
+  in `newTranspiler`), and `rewriteDirectQuery` expands `USE <alias>` to
+  `ducklake.main`.
+- Opt-in per connection: a session that connects with `ducklake` or nothing is
+  byte-for-byte unaffected.
+- Touching any of this → update `controlplane/configstore/store_test.go`,
+  `controlplane/session_search_path_test.go`, `server/direct_query_rewrite_test.go`,
+  `server/logical_catalog_alias_test.go`, `server/session_database_metadata_test.go`,
+  and `logical_catalog_alias` in `tests/mw-dev/e2e/harness.sh`.
 
 ## TODO Reference
 

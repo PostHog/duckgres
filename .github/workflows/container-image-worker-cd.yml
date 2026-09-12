@@ -80,29 +80,21 @@ jobs:
                       ducklake: "v1.0-posthog.7"
                       # The stable 1.5.5 scanner predates duckdb-postgres
                       # 71b85668, which fixes inconsistent snapshots across
-                      # scan connections, so we deliberately take the nightly
-                      # and content-pin it.
+                      # scan connections, so we need a nightly build. The
+                      # nightly URL is mutable, and pinning a hash against it
+                      # hard-failed the build five times between 2026-08-03
+                      # and 2026-09-11. So we mirror the artifact instead:
+                      # PostHog/duckdb-postgres holds that nightly captured at
+                      # duckdb-postgres a3516c0, a descendant of 71b85668.
+                      # A release asset URL does not move, so this tag needs
+                      # no refresh — it changes only to adopt a new revision.
                       #
-                      # WARNING: the nightly URL is a MOVING target — upstream
-                      # rebuilds it and the pinned hash then stops matching,
-                      # which hard-fails every build until someone re-pins
-                      # (2026-08-04 -> 2026-08-08 was one such break). These
-                      # hashes were re-pinned to the nightly served on
-                      # 2026-09-11. Its extension footer identifies
-                      # duckdb-postgres a3516c0, a descendant of 71b85668, so
-                      # the required snapshot fix remains present.
-                      # Mirroring the artifact we want, instead of pinning a
-                      # hash against a URL whose contents change, is the real
-                      # fix.
-                      #
-                      # These values are duplicated in e2e-mw-dev.yml,
+                      # This value is duplicated in e2e-mw-dev.yml,
                       # scenario-dev.yml, Dockerfile and Dockerfile.worker.
                       # The workflow build-args OVERRIDE the Dockerfile ARG
                       # defaults, so updating only the Dockerfiles does
                       # nothing for CI — change all five together.
-                      pg_scanner_repo: "https://nightly-extensions.duckdb.org"
-                      pg_scanner_sha256_amd64: "5b1657abe8f829b16da8e79570dc10751252361e59294ab890e3fcbdf94d4a82"
-                      pg_scanner_sha256_arm64: "c7e18454bd7d52a39d4e19a27932470d7fd071b606fe5f7a00f07d626155eac8"
+                      pg_scanner_tag: "v1.5.5-a3516c0"
                       # Fleet default: also publishes the unsuffixed tags and
                       # dispatches Charts.
                       default: true
@@ -161,9 +153,7 @@ jobs:
                       DUCKDB_EXTENSION_VERSION=${{ matrix.duckdb.version }}
                       HTTPFS_EXTENSION_TAG=${{ matrix.duckdb.httpfs }}
                       DUCKLAKE_EXTENSION_TAG=${{ matrix.duckdb.ducklake }}
-                      POSTGRES_SCANNER_REPOSITORY=${{ matrix.duckdb.pg_scanner_repo }}
-                      POSTGRES_SCANNER_SHA256_AMD64=${{ matrix.duckdb.pg_scanner_sha256_amd64 }}
-                      POSTGRES_SCANNER_SHA256_ARM64=${{ matrix.duckdb.pg_scanner_sha256_arm64 }}
+                      POSTGRES_SCANNER_TAG=${{ matrix.duckdb.pg_scanner_tag }}
                   cache-from: type=gha,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
                   cache-to: type=gha,mode=max,scope=worker-${{ matrix.duckdb.version }}-${{ matrix.platform.slug }}
 

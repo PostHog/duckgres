@@ -278,7 +278,7 @@ observed peer outcome (`present`, `in_flight`, `negative`, `timeout`,
 span for every probe. `org_id` is intentionally absent — the proxy has no
 per-request tenant identity.
 
-> The cache proxy is not deployed in the `tests/e2e-mw-dev` environment
+> The cache proxy is not deployed in the `tests/mw-dev/e2e` environment
 > (`DUCKGRES_CACHE_ENABLED` is off there). Unit tests in
 > `cmd/cache-proxy/tracing_test.go` cover propagation behavior; validate the
 > complete trace in a cache-enabled dev deployment.

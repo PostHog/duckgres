@@ -721,6 +721,21 @@ allow if {
 	observer_nodes_table(input.action.resource.table)
 }
 
+# The provisioner needs the same precise node inventory to acknowledge tenant
+# password projection on every active worker before publishing tenant readiness.
+# Catalog access alone grants no other system table, browsing or mutation rights.
+allow if {
+	is_admin
+	input.action.operation == "AccessCatalog"
+	input.action.resource.catalog.name == "system"
+}
+
+allow if {
+	is_admin
+	input.action.operation == "SelectFromColumns"
+	observer_nodes_table(input.action.resource.table)
+}
+
 # ---------------------------------------------------------------------------
 # Hard denies for customer principals.
 #

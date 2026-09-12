@@ -57,6 +57,31 @@ The isolated control plane's default worker request is configurable through
 `scenario-dev.yml` explicitly overrides them to 3 CPU and 12Gi for the frozen
 perf workload. Direct `run.sh` callers can make the same explicit override.
 
+### Control-plane rollout retirement
+
+The isolated Deployment uses `maxUnavailable: 0`, `maxSurge: 1`, a five-second
+`preStop` hook, and `terminationGracePeriodSeconds: 35`. These are explicit
+fixture settings: the hook keeps the API listening while Kubernetes withdraws
+the terminating pod from Service routing, then leaves the previous 30-second
+budget for session drain after SIGTERM. An idle control plane can otherwise
+exit before client-node routing updates and reject a post-rollout connection.
+
+Trino configuration transitions capture the old pod names before each patch,
+wait for Deployment rollout completion, then wait for those exact pods to be
+deleted. Each wait is bounded at 180 seconds. Deployment replica counters alone
+can report success while a previous pod is still running its retirement hook
+and serving the previous configuration. The cells assertion remains a single
+authenticated request; transport failures and incorrect cell contents both
+fail the test, with distinct diagnostics.
+
+Run `just test-mw-fixtures` locally to exercise retirement ordering and error
+handling without a cluster. For a stalled live transition, inspect the named
+old pods and their events/logs for a stuck hook or session drain. Do not force
+delete them or add retries to the content assertion. For connection failures,
+capture old/new pod logs, EndpointSlice transitions, and client-node Service
+routing during the rollout; post-failure pod readiness alone misses the race.
+See [Control-plane rollout](../../docs/runbooks/control-plane-rollout.md).
+
 ### Scenario Trino readiness
 
 Scenarios that opt an org into Trino in their `provision_warehouse` request can
@@ -651,8 +676,10 @@ got through, in order — each was a real fix:
    `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES=.ci.duckgres.local` +
    `DUCKGRES_SNI_ROUTING_MODE=passthrough`, and connecting with libpq
    `host=<org>.<suffix>` (SNI) + `hostaddr=<CP ClusterIP>` (TCP).
-5. ✅ catalog selection — `dbname` must be `ducklake`, not the org
-   (PR #651: *database = catalog selection*). harness.sh now does this.
+5. ✅ catalog selection — `dbname` must be `ducklake` or the org's own Trino
+   catalog name (`org_<database_name>`, a logical alias for the same catalog),
+   never an arbitrary name (PR #651: *database = catalog selection*).
+   harness.sh covers both, in `logical_catalog_alias`.
 
 6. ✅ **activation (cnpg DuckLake)** — the control plane resolves the metadata
    password from the Secret referenced by Duckling status. Activation failed at
