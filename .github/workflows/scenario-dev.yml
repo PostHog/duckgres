@@ -66,7 +66,6 @@ jobs:
     timeout-minutes: 270
     env:
       SCENARIO_NAME: ${{ matrix.scenario }}
-      DUCKGRES_SCENARIO_PROPERTIES_MANIFEST: ${{ secrets.DUCKGRES_PROPERTIES_MANIFEST_URI }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
       WORKER_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}
       CONTROLPLANE_IMAGE: ${{ (github.event_name == 'workflow_dispatch' && inputs.duckgres_image) || needs.duckgres-image.outputs.image }}

@@ -74,10 +74,12 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		t.Fatalf("read dev scenario workflow: %v", err)
 	}
 	workflow := string(raw)
+	if strings.Contains(workflow, "secrets.DUCKGRES_PROPERTIES_MANIFEST_URI") {
+		t.Fatal("properties fixture selection must not require a new repository secret")
+	}
 
 	for _, required := range []string{
 		"name: scenario-dev",
-		"DUCKGRES_SCENARIO_PROPERTIES_MANIFEST: ${{ secrets.DUCKGRES_PROPERTIES_MANIFEST_URI }}",
 		"workflow_dispatch:",
 		"scenario:",
 		"default: full-suite",

@@ -38,13 +38,16 @@ against the selected fixture, and exports its manifest-derived dataset version.
 relative paths are resolved from the repository root. `--check-env` checks
 required settings without reading S3, preparing files, or provisioning.
 
-Configure the repository Actions secret `DUCKGRES_PROPERTIES_MANIFEST_URI` with
-the private completed manifest URI. Do not pass it as a public workflow input.
-For the normal isolated CI stack, manually select `posthog_properties_perf` in
-`scenario-dev`. It enables the isolated Trino cell and the existing Athena Pod
-Identity configuration. The properties workload is opt-in; it is not added to
-the daily selection or the existing full suite. Do not run it against an
-unrelated existing dev warehouse. The scenario's SQL setup runs once with `exec_only: true`, which drains every statement and propagates later validation errors without replaying the script. Other SQL steps default to `exec_only: false`.
+Supply the private manifest URI through `DUCKGRES_SCENARIO_PROPERTIES_MANIFEST`
+in the runner environment. The harness does not create repository secrets or
+other configuration resources. GitHub workflow fixture selection remains
+unwired until its configuration source is agreed; selecting this scenario in
+Actions without that wiring fails the required-environment check.
+
+The isolated harness supports `SCENARIO_NAME=posthog_properties_perf` with
+`E2E_SUITE=trino` and the existing Athena identity configuration. The workload
+is opt-in and is not added to the daily selection or existing full suite. Do
+not run it against an unrelated existing dev warehouse. The scenario's SQL setup runs once with `exec_only: true`, which drains every statement and propagates later validation errors without replaying the script. Other SQL steps default to `exec_only: false`.
 
 The generated catalog defaults to one warmup and four measured iterations per implementation. Date bounds come from the manifest as explicit UTC instants. JSON and STRUCT use the supported logical table; VARIANT runs only on PGWire.
 
