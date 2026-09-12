@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
@@ -92,6 +93,9 @@ func TestTrinoRegistryOnlyBootstrapHasNoLegacyDependency(t *testing.T) {
 	wire := fleet[0]
 	wire.BundleStore.Set(opa.NewBundle([]byte("registered")))
 	engine.Any(wire.bundlePath(), gin.WrapH(wire.BundleHandler))
+	if err := admin.RegisterUI(engine); err != nil {
+		t.Fatal(err)
+	}
 	secret, err := kc.CoreV1().Secrets("trino-test").Get(context.Background(), provisioner.TrinoOPABundleTokenSecretName, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)

@@ -72,6 +72,8 @@ before deploying the readiness-aware control plane.
 New-cell OPA sidecars poll `/bundles/trino/<cell-id>` with that namespace's
 bundle token. Legacy keeps `/bundles/trino`. Tokens cannot read another cell's
 bundle. The observer credential remains separate from the catalog administrator.
+In registry-only mode, `/bundles/trino` is absent and returns HTTP 404. Missing
+bundle URLs never fall back to the admin UI page.
 
 ## Initial assignment
 
