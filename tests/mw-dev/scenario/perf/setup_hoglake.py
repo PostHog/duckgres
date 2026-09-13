@@ -182,7 +182,7 @@ def run(store, api, source, catalog):
 
 
 
-def run_properties(store, api, source, catalog):
+def run_properties(store, api, source, catalog, representation):
     """Register projections in an existing catalog after validating every input.
 
     column_type intentionally remains authoritative: unsupported physical VARIANT
@@ -205,10 +205,10 @@ def run_properties(store, api, source, catalog):
         return metadata[obj["key"]]
 
     plans = {}
-    for table, selected in (
-        ("events_supported", ["event", "timestamp", "properties"]),
-        ("events_variant", ["event", "timestamp", "properties", "properties_variant"]),
-    ):
+    projections = [("events_supported", ["event", "timestamp", "properties"])]
+    if representation == "variant":
+        projections.append(("events_variant", ["event", "timestamp", "properties", "properties_variant"]))
+    for table, selected in projections:
         columns, files = inspect_table(objects, read_footer, selected)
         expected_types = {"event": "string", "timestamp": "timestamptz", "properties": "string", "properties_variant": "variant"}
         if any(c["type"] != expected_types[c["name"]] for c in columns if c["name"] in expected_types):
@@ -305,12 +305,13 @@ def main():
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--source")
     inputs.add_argument("--properties-source")
+    parser.add_argument("--properties-representation", choices=("json", "variant"), default="variant")
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--uri", required=True)
     args = parser.parse_args()
     store, api = S3Store(boto3.client("s3")), RestAPI(args.uri)
     if args.properties_source:
-        result = run_properties(store, api, args.properties_source, args.catalog)
+        result = run_properties(store, api, args.properties_source, args.catalog, args.properties_representation)
     else:
         result = run(store, api, args.source, args.catalog)
     print(f"Registered frozen fixtures at snapshot {result['snapshot_id']}")

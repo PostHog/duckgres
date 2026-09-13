@@ -134,7 +134,7 @@ paired_queries:
 	if err != nil {
 		t.Fatalf("read query_results.csv: %v", err)
 	}
-	wantHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at", "representation"}
+	wantHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at", "representation", "run_label"}
 	if !reflect.DeepEqual(records[0], wantHeader) {
 		t.Fatalf("CSV header: got %v want %v", records[0], wantHeader)
 	}
@@ -184,7 +184,7 @@ func TestArtifactSinkWritesAthenaServiceMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read query_results.csv: %v", err)
 	}
-	wantQueryHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at", "representation"}
+	wantQueryHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "status", "error", "error_class", "rows", "duration_ms", "started_at", "representation", "run_label"}
 	if !reflect.DeepEqual(queryRecords[0], wantQueryHeader) {
 		t.Fatalf("query_results.csv header: got %v want %v", queryRecords[0], wantQueryHeader)
 	}
@@ -198,11 +198,11 @@ func TestArtifactSinkWritesAthenaServiceMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read query_service_metrics.csv: %v", err)
 	}
-	wantMetricsHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "queue_ms", "planning_ms", "engine_ms", "service_ms", "bytes_scanned", "dpu_count", "result_reused", "engine_version", "representation"}
+	wantMetricsHeader := []string{"query_id", "intent_id", "measure_iteration", "protocol", "queue_ms", "planning_ms", "engine_ms", "service_ms", "bytes_scanned", "dpu_count", "result_reused", "engine_version", "representation", "run_label"}
 	if !reflect.DeepEqual(metricsRecords[0], wantMetricsHeader) {
 		t.Fatalf("service metrics header: got %v want %v", metricsRecords[0], wantMetricsHeader)
 	}
-	if got, want := metricsRecords[1], []string{"q1__athena_external", "i1", "1", "athena", "100.000000", "200.000000", "2000.000000", "2500.000000", "4096", "4", "false", "Athena engine version 3", ""}; !reflect.DeepEqual(got, want) {
+	if got, want := metricsRecords[1], []string{"q1__athena_external", "i1", "1", "athena", "100.000000", "200.000000", "2000.000000", "2500.000000", "4096", "4", "false", "Athena engine version 3", "", "athena"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("service metrics row: got %v want %v", got, want)
 	}
 }

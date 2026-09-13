@@ -33,7 +33,18 @@ func (e *Executor) setupHoglake(ctx context.Context, step core.Step) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "python3", script, "--uri", uri, inputFlag, input, "--catalog", orgID)
+	args := []string{script, "--uri", uri, inputFlag, input, "--catalog", orgID}
+	if propertiesSource != "" {
+		representation, err := requiredString(step, "representation")
+		if err != nil {
+			return err
+		}
+		if representation != "json" && representation != "variant" {
+			return fmt.Errorf("properties representation must be json or variant")
+		}
+		args = append(args, "--properties-representation", representation)
+	}
+	cmd := exec.CommandContext(ctx, "python3", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

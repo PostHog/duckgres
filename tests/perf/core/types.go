@@ -16,6 +16,23 @@ const (
 	ProtocolAthena         Protocol = "athena"
 )
 
+// RunLabel names the properties comparison without changing protocol routing or
+// relabeling older/full-corpus measurements that lack representation metadata.
+func (p Protocol) RunLabel(representation string) string {
+	switch {
+	case p == ProtocolPGWireUncached && representation == "json":
+		return "duckgres (vanilla)"
+	case p == ProtocolPGWireCached && representation == "variant":
+		return "duckgres (cache+variant)"
+	case p == ProtocolTrino && representation == "json":
+		return "trino (vanilla)"
+	case p == ProtocolTrinoCached && representation == "variant":
+		return "trino (cache+variant)"
+	default:
+		return string(p)
+	}
+}
+
 // StorageTarget identifies the physical relation family selected for a paired
 // catalog query. It is runtime-only metadata; artifacts continue to use the
 // existing query ID and intent ID fields.

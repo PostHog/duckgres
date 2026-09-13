@@ -28,15 +28,31 @@ and uses its existing AWS role.
 
 Duckgres registers `properties_perf.events_supported` and
 `properties_perf.events_variant`; Hoglake registers the corresponding projections
-in the scenario's catalog. Athena uses the precreated
+in the scenario's catalog. Uncached Trino registers only the JSON projection;
+cached Trino additionally registers VARIANT. Scenario steps specify this through
+`representation`; the Python helper defaults `--properties-representation` to
+`variant` for direct invocations. Athena uses the precreated
 `properties_events_supported` table in the configured benchmark database.
 Provision that table with the generated `athena.sql` before the ordinary scenario;
 preparation verifies its mapping. The cached-Trino scenario requires no Athena
 configuration. All projections refer to the same Parquet prefix.
 
 Queries cover the entire selected dataset, with one warmup and four measured
-iterations. Measured queries select VARIANT for Duckgres and Trino and STRUCT
-for Athena. JSON supplies untimed correctness baselines. Complete query results
+iterations. The measured properties comparisons are:
+
+| Run label | Cache | Properties representation |
+| --- | --- | --- |
+| duckgres (vanilla) | Off | JSON |
+| duckgres (cache+variant) | On | VARIANT |
+| trino (vanilla) | Off | JSON |
+| trino (cache+variant) | On | VARIANT |
+| Athena | — | STRUCT |
+
+These names are emitted as `run_label` in result and service-metric CSVs and
+published query results. The `protocol` identifiers remain stable. Original
+full-corpus rows keep their existing labels because they do not use VARIANT.
+
+Cached readers and Athena also run untimed JSON baselines. Complete query results
 must agree before measurements start. The first live branch run failed earlier
 in DuckLake file registration: `Expected VARIANT, found type STRUCT` for
 `properties_variant`. Hoglake registration and properties queries were skipped.

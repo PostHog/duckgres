@@ -126,6 +126,7 @@ steps:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
       properties_source: ${env:DUCKGRES_SCENARIO_PROPERTIES_S3_URI}
+      representation: json
       file: ../perf/setup_hoglake.py
 
   - id: perf_properties

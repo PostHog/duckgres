@@ -201,6 +201,7 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `duration_ms`
 - `started_at`
 - `representation` (empty for existing workloads; `json`, `struct`, or `variant` for properties)
+- `run_label` (display name for the properties comparison; `protocol` retains its routing identifier)
 
 `measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
 `duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
@@ -281,8 +282,11 @@ emits private SQL/catalog inputs to `/tmp/properties-perf` (optional second
 argument overrides it), using a five-minute timeout.
 
 The catalog queries the entire selected dataset with one warmup and four measured
-iterations. VARIANT is selected for Duckgres and Trino; STRUCT for Athena.
-JSON supplies untimed complete-result correctness checks. The first live run
+iterations. Uncached Duckgres and Trino measure JSON and are labeled
+`duckgres (vanilla)` and `trino (vanilla)`. Cached Duckgres and Trino measure VARIANT
+and are labeled `duckgres (cache+variant)` and `trino (cache+variant)`. Athena
+measures STRUCT. Cached readers and Athena also use untimed JSON correctness
+baselines. The first live run
 failed in DuckLake registration with `Expected VARIANT, found type STRUCT`,
 before properties registration in Hoglake or measured properties queries.
 The main scenario verifies the precreated Athena table; cached Trino skips it.

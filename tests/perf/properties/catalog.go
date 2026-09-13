@@ -14,7 +14,7 @@ func Catalog() core.Catalog {
 		for _, rep := range []string{"json", "struct", "variant"} {
 			relation := `"properties_perf"."events_supported"`
 			expr := `json_extract_string(properties, '$."$browser"')`
-			qt := targets
+			qt := []core.Protocol{core.ProtocolPGWireUncached, core.ProtocolTrino}
 			switch rep {
 			case "struct":
 				expr = `properties_typed."$browser"`
@@ -22,7 +22,7 @@ func Catalog() core.Catalog {
 			case "variant":
 				expr = `CAST(properties_variant['$browser'] AS VARCHAR)`
 				relation = `"properties_perf"."events_variant"`
-				qt = targets[:4]
+				qt = []core.Protocol{core.ProtocolPGWireCached, core.ProtocolTrinoCached}
 			}
 			var sql string
 			if intent == "browser_breakdown" {
@@ -30,7 +30,11 @@ func Catalog() core.Catalog {
 			} else {
 				sql = fmt.Sprintf("SELECT event, COUNT(*) AS event_count FROM %s WHERE %s = 'Chrome' GROUP BY event ORDER BY event_count DESC, event ASC NULLS LAST LIMIT 20", relation, expr)
 			}
-			c.Queries = append(c.Queries, core.Query{QueryID: "properties_" + intent + "_v1__" + rep, IntentID: "properties." + intent + ".v1", Representation: rep, ValidationOnly: rep == "json", Targets: qt, PGWireSQL: sql})
+			c.Queries = append(c.Queries, core.Query{QueryID: "properties_" + intent + "_v1__" + rep, IntentID: "properties." + intent + ".v1", Representation: rep, Targets: qt, PGWireSQL: sql})
+			if rep == "json" {
+				// Cached readers and Athena still verify against an untimed JSON baseline.
+				c.Queries = append(c.Queries, core.Query{QueryID: "properties_" + intent + "_v1__json_baseline", IntentID: "properties." + intent + ".v1", Representation: "json", ValidationOnly: true, Targets: []core.Protocol{core.ProtocolPGWireCached, core.ProtocolTrinoCached, core.ProtocolAthena}, PGWireSQL: sql})
+			}
 		}
 	}
 	return c
