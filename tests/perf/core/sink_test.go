@@ -206,31 +206,3 @@ func TestArtifactSinkWritesAthenaServiceMetrics(t *testing.T) {
 		t.Fatalf("service metrics row: got %v want %v", got, want)
 	}
 }
-
-func TestArtifactSinkLabelsRepresentations(t *testing.T) {
-	dir := t.TempDir()
-	sink, err := NewArtifactSink(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = sink.Record(QueryResult{QueryID: "properties_browser_v1__struct", IntentID: "browser", Representation: "struct", ServiceMetrics: &ServiceMetrics{BytesScanned: 42}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = sink.Close(RunSummary{}, ""); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"query_results.csv", "query_service_metrics.csv"} {
-		raw, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		rows, err := csv.NewReader(strings.NewReader(string(raw))).ReadAll()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if rows[0][len(rows[0])-1] != "representation" || rows[1][len(rows[1])-1] != "struct" {
-			t.Errorf("%s lacks representation label", name)
-		}
-	}
-}

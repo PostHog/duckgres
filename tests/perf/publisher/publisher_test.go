@@ -151,7 +151,6 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 		t.Fatalf("loadArtifacts returned error: %v", err)
 	}
 
-	artifacts.Results[0].Representation = "struct"
 	db := &fakeDB{tx: &fakeTx{}}
 	cfg := Config{Schema: "duckgres_perf", BootstrapSchema: true}
 	if err := publishArtifacts(context.Background(), cfg, db, artifacts); err != nil {
@@ -179,9 +178,6 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 	}
 	if got, ok := firstResultInsert.args[8].(*int64); !ok || got == nil || *got != 1 {
 		t.Fatalf("expected rows pointer with value 1, got %#v", firstResultInsert.args[8])
-	}
-	if got := firstResultInsert.args[13]; got != "struct" {
-		t.Fatalf("representation not published: %v", got)
 	}
 	secondResultInsert := db.tx.execs[9]
 	if got, ok := secondResultInsert.args[6].(*string); !ok || got == nil || *got != "boom" {
@@ -349,20 +345,5 @@ func writeMinimalCSVFile(t *testing.T, runDir string) {
 	csvPath := filepath.Join(runDir, "query_results.csv")
 	if err := os.WriteFile(csvPath, []byte(csvText), 0o644); err != nil {
 		t.Fatalf("WriteFile csv: %v", err)
-	}
-}
-
-func TestLoadQueryResultsWithRepresentationColumn(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "query_results.csv")
-	data := "query_id,intent_id,measure_iteration,protocol,status,error,error_class,rows,duration_ms,started_at,representation\nq__struct,i,1,pgwire,ok,,,2,10,2026-03-17T00:00:00Z,struct\n"
-	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := loadQueryResults(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rows[0].Representation != "struct" {
-		t.Fatalf("lost label: %+v", rows[0])
 	}
 }

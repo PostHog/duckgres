@@ -2,7 +2,6 @@ package sql
 
 import (
 	"context"
-	stdsql "database/sql"
 	"fmt"
 	"time"
 )
@@ -27,9 +26,7 @@ type QueryResult struct {
 	Duration time.Duration
 }
 
-type DatabaseDriver struct {
-	openDB func(PGWireConnection) (*stdsql.DB, error)
-}
+type DatabaseDriver struct{}
 
 func NewDatabaseDriver() *DatabaseDriver {
 	return &DatabaseDriver{}
@@ -37,11 +34,7 @@ func NewDatabaseDriver() *DatabaseDriver {
 
 func (d *DatabaseDriver) Execute(ctx context.Context, req QueryRequest) (QueryResult, error) {
 	started := time.Now()
-	openDB := d.openDB
-	if openDB == nil {
-		openDB = PGWireConnection.OpenDB
-	}
-	db, err := openDB(req.PGWire)
+	db, err := req.PGWire.OpenDB()
 	if err != nil {
 		return QueryResult{}, fmt.Errorf("open pgwire connection: %w", err)
 	}

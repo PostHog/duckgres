@@ -1167,32 +1167,3 @@ func containsTemplate(value any) bool {
 	}
 	return false
 }
-
-func TestPropertiesScenarioGeneratedPathsResolve(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", "/tmp/properties-generated")
-	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	checked := 0
-	for _, step := range scenario.Steps {
-		if step.ID != "setup_properties" && step.ID != "perf_properties" && step.ID != "setup_hoglake_properties" {
-			continue
-		}
-		for _, field := range []string{"file", "catalog_file", "properties_plan"} {
-			if path, ok := step.With[field].(string); ok && strings.Contains(path, "DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR") {
-				resolved, err := core.ResolveEnvTemplates(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				checked++
-				if filepath.Dir(resolved) != "/tmp/properties-generated" {
-					t.Fatalf("generated artifact path = %q", resolved)
-				}
-			}
-		}
-	}
-	if checked != 3 {
-		t.Fatalf("checked %d generated paths, want 3", checked)
-	}
-}

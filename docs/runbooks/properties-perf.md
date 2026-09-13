@@ -93,11 +93,3 @@ warehouse. The isolated workflow retains its normal namespace teardown. For an
 interrupted local run, use the scenario recovery runbook with only the recorded
 owned warehouse identity, preserving artifacts before cleanup. Leave unrelated
 warehouses and running workloads alone.
-
-## Local registration tests
-
-The registration tests use the scenario runtime's PyArrow dependency. In an
-isolated Python environment with `pyarrow` installed, run
-`just test-properties-hoglake`. Run `just test-perf` and `just test-scenario`
-for query semantics, correctness gates, and scenario wiring. The registration
-tests use synthetic metadata and do not regenerate the published fixture.

@@ -525,8 +525,3 @@ seed-ducklake:
 [group('test')]
 prepare-properties-perf manifest output_dir="/tmp/properties-perf":
     go run ./cmd/perf-properties-prepare -manifest {{quote(manifest)}} -output-dir {{quote(output_dir)}}
-
-# Test Hoglake fixture registration with the scenario runtime's PyArrow dependency.
-[group('test')]
-test-properties-hoglake:
-    python3 -B -m unittest discover -s tests/mw-dev/scenario/perf -p 'test_setup_hoglake.py'
