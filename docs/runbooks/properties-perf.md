@@ -32,8 +32,10 @@ cached Trino additionally registers VARIANT. Scenario steps specify this through
 `representation`; the Python helper defaults `--properties-representation` to
 `variant` for direct invocations. Athena uses the precreated
 `properties_events_supported` table in the configured benchmark database.
-Provision that table with the generated `athena.sql` before the ordinary scenario;
-preparation verifies its mapping. The cached-Trino scenario requires no Athena
+The workflow creates this external table if missing, using its existing AWS role;
+it leaves existing tables intact and preparation verifies their mapping. This
+requires `glue:GetTable` and `glue:CreateTable` on the benchmark database/table.
+For direct local runs, provision it with the generated `athena.sql` first. The cached-Trino scenario requires no Athena
 configuration. All projections refer to the same Parquet prefix.
 
 Queries cover the entire selected dataset, with one warmup and four measured

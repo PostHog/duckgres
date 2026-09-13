@@ -148,6 +148,38 @@ jobs:
           echo "::add-mask::$source"
           echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=$source" >> "$GITHUB_ENV"
 
+      - name: Register Athena properties table if missing
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import subprocess
+
+          database = os.environ["DUCKGRES_SCENARIO_ATHENA_DATABASE"]
+          table = "properties_events_supported"
+          existing = subprocess.run(["aws", "glue", "get-table", "--database-name", database, "--name", table], capture_output=True, text=True)
+          if existing.returncode == 0:
+              print("Athena properties table exists; scenario preparation will verify its mapping.")
+          elif "EntityNotFoundException" not in existing.stderr:
+              raise SystemExit(existing.stderr)
+          else:
+              descriptor = {
+                  "Columns": [{"Name": name, "Type": kind} for name, kind in [
+                      ("event", "string"), ("timestamp", "timestamp"),
+                      ("properties", "string"), ("properties_typed", "struct<$browser:string>")]],
+                  "Location": os.environ["DUCKGRES_SCENARIO_PROPERTIES_S3_URI"].rstrip("/") + "/",
+                  "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                  "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                  "SerdeInfo": {"SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"},
+              }
+              payload = {"Name": table, "TableType": "EXTERNAL_TABLE", "PartitionKeys": [],
+                         "Parameters": {"EXTERNAL": "TRUE"}, "StorageDescriptor": descriptor}
+              subprocess.run(["aws", "glue", "create-table", "--database-name", database,
+                              "--table-input", json.dumps(payload)], check=True)
+              print("Registered Athena properties table over the selected Parquet prefix.")
+          PYTHON
+
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
 
