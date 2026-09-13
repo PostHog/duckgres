@@ -282,8 +282,9 @@ argument overrides it), using a five-minute timeout.
 
 The catalog queries the entire selected dataset with one warmup and four measured
 iterations. VARIANT is selected for Duckgres and Trino; STRUCT for Athena.
-JSON supplies untimed complete-result correctness checks. Hoglake's current type
-mapping rejects VARIANT; reader support must be established by live execution.
+JSON supplies untimed complete-result correctness checks. The first live run
+failed in DuckLake registration with `Expected VARIANT, found type STRUCT`,
+before properties registration in Hoglake or measured properties queries.
 The main scenario verifies the precreated Athena table; cached Trino skips it.
 See the [properties runbook](../../docs/runbooks/properties-perf.md) for workflow
 inputs, registration, execution, and recovery.

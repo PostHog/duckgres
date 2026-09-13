@@ -37,9 +37,11 @@ configuration. All projections refer to the same Parquet prefix.
 Queries cover the entire selected dataset, with one warmup and four measured
 iterations. Measured queries select VARIANT for Duckgres and Trino and STRUCT
 for Athena. JSON supplies untimed correctness baselines. Complete query results
-must agree before measurements start. Hoglake currently rejects VARIANT types;
-a live run is needed to establish the exact failure. Unsupported types are not
-silently substituted.
+must agree before measurements start. The first live branch run failed earlier
+in DuckLake file registration: `Expected VARIANT, found type STRUCT` for
+`properties_variant`. Hoglake registration and properties queries were skipped.
+Changing only Trino to JSON does not resolve that reader/registration blocker.
+Unsupported types are not silently substituted.
 
 ## Results and recovery
 
