@@ -283,12 +283,14 @@ argument overrides it), using a five-minute timeout.
 
 The catalog queries the entire selected dataset with one warmup and four measured
 iterations. Uncached Duckgres and Trino measure JSON and are labeled
-`duckgres (vanilla)` and `trino (vanilla)`. Cached Duckgres and Trino measure VARIANT
-and are labeled `duckgres (cache+variant)` and `trino (cache+variant)`. Athena
-measures STRUCT. Cached readers and Athena also use untimed JSON correctness
+`duckgres (vanilla)` and `trino (vanilla)`. Cached Duckgres measures JSON as `duckgres (cache)`. Cached Trino measures
+VARIANT as `trino (cache+variant)`. Athena measures STRUCT. Cached Trino and
+Athena also use untimed JSON correctness
 baselines. The first live run
 failed in DuckLake registration with `Expected VARIANT, found type STRUCT`,
 before properties registration in Hoglake or measured properties queries.
+Duckgres now omits VARIANT registration and measures JSON in both cache modes;
+cached Trino still requires Hoglake VARIANT support.
 The main scenario verifies the precreated Athena table; cached Trino skips it.
 See the [properties runbook](../../docs/runbooks/properties-perf.md) for workflow
 inputs, registration, execution, and recovery.

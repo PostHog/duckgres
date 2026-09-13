@@ -26,8 +26,7 @@ This runs both ordinary and cached-Trino scenarios. To run cached Trino alone,
 select `posthog_frozen_perf_trino_cached`. The workflow masks the input in logs
 and uses its existing AWS role.
 
-Duckgres registers `properties_perf.events_supported` and
-`properties_perf.events_variant`; Hoglake registers the corresponding projections
+Duckgres registers only `properties_perf.events_supported`; Hoglake registers its projections
 in the scenario's catalog. Uncached Trino registers only the JSON projection;
 cached Trino additionally registers VARIANT. Scenario steps specify this through
 `representation`; the Python helper defaults `--properties-representation` to
@@ -43,7 +42,7 @@ iterations. The measured properties comparisons are:
 | Run label | Cache | Properties representation |
 | --- | --- | --- |
 | duckgres (vanilla) | Off | JSON |
-| duckgres (cache+variant) | On | VARIANT |
+| duckgres (cache) | On | JSON |
 | trino (vanilla) | Off | JSON |
 | trino (cache+variant) | On | VARIANT |
 | Athena | — | STRUCT |
@@ -52,11 +51,12 @@ These names are emitted as `run_label` in result and service-metric CSVs and
 published query results. The `protocol` identifiers remain stable. Original
 full-corpus rows keep their existing labels because they do not use VARIANT.
 
-Cached readers and Athena also run untimed JSON baselines. Complete query results
+Cached Trino and Athena also run untimed JSON baselines. Complete query results
 must agree before measurements start. The first live branch run failed earlier
 in DuckLake file registration: `Expected VARIANT, found type STRUCT` for
 `properties_variant`. Hoglake registration and properties queries were skipped.
-Changing only Trino to JSON does not resolve that reader/registration blocker.
+Duckgres now uses JSON in both cache modes and does not register the VARIANT
+column, avoiding that path. Cached Trino still requires VARIANT support in Hoglake.
 Unsupported types are not silently substituted.
 
 ## Results and recovery

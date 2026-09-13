@@ -22,8 +22,8 @@ func (p Protocol) RunLabel(representation string) string {
 	switch {
 	case p == ProtocolPGWireUncached && representation == "json":
 		return "duckgres (vanilla)"
-	case p == ProtocolPGWireCached && representation == "variant":
-		return "duckgres (cache+variant)"
+	case p == ProtocolPGWireCached && representation == "json":
+		return "duckgres (cache)"
 	case p == ProtocolTrino && representation == "json":
 		return "trino (vanilla)"
 	case p == ProtocolTrinoCached && representation == "variant":

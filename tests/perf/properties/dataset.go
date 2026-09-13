@@ -31,7 +31,7 @@ func s3URL(value string) (*url.URL, error) {
 }
 func literal(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
 
-// SetupSQL registers both logical projections from exactly the same objects.
+// SetupSQL registers the supported JSON/STRUCT projection for Duckgres.
 func (m *Dataset) SetupSQL() string {
 	u, _ := s3URL(m.Prefix)
 	files := make([]string, len(m.Files))
@@ -40,14 +40,8 @@ func (m *Dataset) SetupSQL() string {
 	}
 	var b strings.Builder
 	b.WriteString("CREATE SCHEMA IF NOT EXISTS properties_perf;\nBEGIN TRANSACTION;\n")
-	for _, table := range []string{"events_supported", "events_variant"} {
-		extra := ""
-		if table == "events_variant" {
-			extra = ", properties_variant VARIANT"
-		}
-		fmt.Fprintf(&b, "DROP TABLE IF EXISTS properties_perf.%s;\nCREATE TABLE properties_perf.%s (event VARCHAR, timestamp TIMESTAMPTZ, properties VARCHAR, properties_typed STRUCT(\"$browser\" VARCHAR)%s);\n", table, table, extra)
-		fmt.Fprintf(&b, "CALL ducklake_add_data_files('ducklake', '%s', [%s], schema => 'properties_perf', ignore_extra_columns => true);\n", table, strings.Join(files, ", "))
-	}
+	b.WriteString("DROP TABLE IF EXISTS properties_perf.events_supported;\nCREATE TABLE properties_perf.events_supported (event VARCHAR, timestamp TIMESTAMPTZ, properties VARCHAR, properties_typed STRUCT(\"$browser\" VARCHAR));\n")
+	fmt.Fprintf(&b, "CALL ducklake_add_data_files('ducklake', 'events_supported', [%s], schema => 'properties_perf', ignore_extra_columns => true);\n", strings.Join(files, ", "))
 	b.WriteString("COMMIT;\n")
 	return b.String()
 }
