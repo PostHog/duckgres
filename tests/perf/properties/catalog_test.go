@@ -1,6 +1,7 @@
 package properties
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,8 +27,19 @@ func TestCatalogUsesManifestBoundsAndEquivalentIntents(t *testing.T) {
 				t.Errorf("%s missing %s", q.QueryID, want)
 			}
 		}
-		if q.Representation == "variant" && len(q.Targets) != 2 {
-			t.Fatal("variant must route only to two pgwire modes")
+		wantTargets := map[string][]core.Protocol{
+			"json":    {core.ProtocolPGWireUncached, core.ProtocolPGWireCached, core.ProtocolTrino, core.ProtocolTrinoCached, core.ProtocolAthena},
+			"variant": {core.ProtocolPGWireUncached, core.ProtocolPGWireCached, core.ProtocolTrino, core.ProtocolTrinoCached},
+			"struct":  {core.ProtocolAthena},
+		}
+		if !reflect.DeepEqual(q.Targets, wantTargets[q.Representation]) {
+			t.Errorf("%s targets=%v", q.QueryID, q.Targets)
+		}
+		if q.Representation == "variant" && !strings.Contains(q.PGWireSQL, "properties_variant['$browser']") {
+			t.Errorf("variant SQL must use shared subscript access: %s", q.PGWireSQL)
+		}
+		if q.ValidationOnly != (q.Representation == "json") {
+			t.Errorf("%s validation-only=%v", q.QueryID, q.ValidationOnly)
 		}
 		if strings.Contains(q.IntentID, "chrome") && !strings.Contains(q.PGWireSQL, "= 'Chrome'") {
 			t.Fatal("missing exact Chrome filter")

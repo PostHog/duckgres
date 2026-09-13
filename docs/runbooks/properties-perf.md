@@ -1,73 +1,103 @@
-# Published properties performance workload
+# Published properties in the full performance scenario
 
-The `posthog_properties_perf` scenario compares JSON and STRUCT on DuckDB,
-Trino, and Athena, plus VARIANT on DuckDB, using the same published Parquet
-files. It provisions and removes an isolated warehouse. Existing full-corpus
-queries and the scheduled workflow selection are unchanged.
+The existing `posthog_frozen_perf` and `posthog_frozen_perf_trino_cached`
+scenarios include the published properties workload after their full-corpus
+queries. They reuse each scenario's isolated warehouse and normal cleanup.
+Existing full-corpus table registration, Hoglake setup, and queries remain intact.
+There is no separate properties scenario or infrastructure suite.
+
+The requested measured representations are VARIANT on DuckDB and Trino, and
+STRUCT on Athena. JSON queries serve only as untimed correctness baselines.
+The cached scenario runs the properties workload on `trino_cached`; the main
+scenario uses PGWire uncached/cached, Trino, and Athena. Reader compatibility
+must succeed before measurement; never substitute another representation to
+bypass an unsupported type.
 
 ## Prepare and run
 
-Set `DUCKGRES_SCENARIO_PROPERTIES_MANIFEST` to the private S3 URI of the
-published `complete.json`. Keep operational configuration and generated files
-outside this public repository. Never select incomplete output with a wildcard.
-
-`just prepare-properties-perf "$DUCKGRES_SCENARIO_PROPERTIES_MANIFEST"` validates
-the fixture and writes `setup.sql`, `athena.sql`, `catalog.yaml`, and
-`dataset-version.txt` to `/tmp/properties-perf` by default. Its second argument
-overrides that directory. Preparation reads the published fixture; it does not
-generate or rewrite source data. Completion-manifest value checks are sampled;
-the workload's full query-result comparisons provide a separate correctness gate.
-
-An operator with Glue table-creation permission must provision
-`properties_events_supported` in the configured Athena database using the
-generated `athena.sql` before running. This logical schema omits VARIANT while
-pointing at the same physical fixture. The ordinary scenario identity has
-read-only Glue access. Do not expand its privileges or replace existing shared
-benchmark tables to bypass a setup failure.
-
-With an explicitly configured disposable warehouse identity and the environment
-required by the scenario YAML, run:
+Set `DUCKGRES_SCENARIO_PROPERTIES_MANIFEST` to the private URI or local path of
+the published `complete.json`, alongside the existing scenario environment.
+This is a required input, not a new repository secret. Keep configuration and
+generated files outside this public repository. Preparation validates manifest
+completion and the exact live object inventory without generating or rewriting
+data. Completion-manifest value checks are sampled; the workload's complete
+query-result comparisons provide a separate correctness gate.
 
 ```sh
-just scenario-properties-perf
+just prepare-properties-perf "$DUCKGRES_SCENARIO_PROPERTIES_MANIFEST"
 ```
 
-The runner prepares the fixture before provisioning, verifies the Athena table
-against the selected fixture, and exports its manifest-derived dataset version.
-`DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR` overrides `/tmp/properties-perf`;
-relative paths are resolved from the repository root. `--check-env` checks
-required settings without reading S3, preparing files, or provisioning.
+Preparation writes `setup.sql`, `athena.sql`, `catalog.yaml`, and
+`dataset-version.txt` and `hoglake-properties.json` to `/tmp/properties-perf`
+by default. The recipe's second argument changes the output directory. For ordinary scenario execution,
+`DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR` overrides the same default; relative
+paths resolve from the repository root.
 
-Supply the private manifest URI through `DUCKGRES_SCENARIO_PROPERTIES_MANIFEST`
-in the runner environment. The harness does not create repository secrets or
-other configuration resources. GitHub workflow fixture selection remains
-unwired until its configuration source is agreed; selecting this scenario in
-Actions without that wiring fails the required-environment check.
+An authorized operator must provision `properties_events_supported` in the
+configured Athena database using the generated `athena.sql` before running the
+main scenario. Its logical schema omits VARIANT while referring to the same
+physical files. The ordinary scenario preparation checks this existing Glue
+mapping read-only, including column names, location, and Parquet reader settings.
+The cached Trino scenario does not require Athena metadata or credentials.
 
-The isolated harness supports `SCENARIO_NAME=posthog_properties_perf` with
-`E2E_SUITE=trino` and the existing Athena identity configuration. The workload
-is opt-in and is not added to the daily selection or existing full suite. Do
-not run it against an unrelated existing dev warehouse. The scenario's SQL setup runs once with `exec_only: true`, which drains every statement and propagates later validation errors without replaying the script. Other SQL steps default to `exec_only: false`.
+Run the existing scenario entry point with its normal isolated configuration:
 
-The generated catalog defaults to one warmup and four measured iterations per implementation. Date bounds come from the manifest as explicit UTC instants. JSON and STRUCT use the supported logical table; VARIANT runs only on PGWire.
+```sh
+./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml
+./scripts/scenario_run.sh tests/mw-dev/scenario/scenarios/posthog_frozen_perf_trino_cached.yaml
+```
+
+Preparation occurs before warehouse provisioning. `--check-env` verifies required
+settings without reading S3, creating files, or provisioning. Supply the private
+manifest through the runner environment; the harness does not create secrets or
+configuration resources. In Actions, the existing paired scenario selection and
+infrastructure handling apply. A missing manifest fails the environment check.
+
+The properties SQL setup runs once with `exec_only: true`, draining every
+statement and propagating later errors without replaying registration. The
+existing `setup_hoglake.py` also consumes the generated private properties plan
+in a separate `setup_hoglake_properties` step. It registers only the selected
+manifest files, using the existing Hoglake client type mapper. Both properties
+perf steps depend on successful registration. Native VARIANT schema mapping and reader
+support in that client and the Trino connector are prerequisites; unsupported
+types fail registration explicitly before properties timings.
+
+The catalog defaults to one warmup and four measured iterations. Date bounds come
+from the manifest as explicit UTC instants.
 
 ## Results and recovery
 
-The existing perf artifacts contain representation labels and the selected
-manifest's dataset version. Correctness checks precede all timed iterations and
-compare returned keys and counts against JSON. Do not report timing for a failed
-correctness gate. Engine compatibility is established by successfully reading
-the supported columns; an EXPLAIN plan alone does not establish read efficiency.
+Full-corpus artifacts remain in `perf/`; properties artifacts use
+`perf-properties/` and a run ID ending in `-properties`. The distinct run ID
+prevents historical publication from replacing the full-corpus results. The
+workflow publishes both directories through the existing publisher.
+Representation labels and the manifest-derived dataset version identify the
+properties results.
 
-If manifest, object inventory, or Athena mapping validation fails, fix the
-selection or precreated metadata and rerun preparation. Never edit the manifest,
-regenerate this fixture, or silently omit a failing engine. If a reader rejects
-the mixed Parquet schema or a property type, preserve the exact error privately
-and report the platform blocker. Keep public diagnostics free of object paths,
-customer identifiers, and raw property values.
+Correctness checks run before timed iterations and compare complete returned
+keys and counts against JSON. Do not report timing for a failed gate. Successful
+reads establish compatibility; EXPLAIN alone does not establish read efficiency.
+The requested Trino VARIANT mapping is blocked: the currently pinned Hoglake
+client API and Trino connector reject VARIANT. Registration and reader
+compatibility for this mapping have not been verified. Do not claim a completed Trino run or
+silently fall back to STRUCT while this blocker remains.
 
-The scenario always attempts to deprovision its warehouse after execution. The
-isolated workflow also runs its normal namespace teardown. For an interrupted
-local run, follow the scenario runner recovery runbook using only the recorded
-owned warehouse identity; do not run shared-infrastructure cleanup. Preserve
-artifacts before deleting an interrupted run's resources.
+If manifest, object inventory, or Athena mapping validation fails, correct the
+selection or precreated metadata and rerun preparation. Never edit the manifest
+or regenerate the fixture to bypass a failure. Preserve reader errors privately
+and report platform blockers without publishing paths, customer identifiers, or
+raw values.
+
+Cleanup depends on both perf steps and always attempts to deprovision the owned
+warehouse. The isolated workflow retains its normal namespace teardown. For an
+interrupted local run, use the scenario recovery runbook with only the recorded
+owned warehouse identity, preserving artifacts before cleanup. Leave unrelated
+warehouses and running workloads alone.
+
+## Local registration tests
+
+The registration tests use the scenario runtime's PyArrow dependency. In an
+isolated Python environment with `pyarrow` installed, run
+`just test-properties-hoglake`. Run `just test-perf` and `just test-scenario`
+for query semantics, correctness gates, and scenario wiring. The registration
+tests use synthetic metadata and do not regenerate the published fixture.

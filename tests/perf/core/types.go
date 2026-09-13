@@ -40,6 +40,8 @@ type Catalog struct {
 }
 
 type Query struct {
+	// ValidationOnly keeps a baseline in the correctness gate but excludes warmup and measurements.
+	ValidationOnly bool           `yaml:"validation_only,omitempty" json:"validation_only,omitempty"`
 	Representation string         `yaml:"representation,omitempty" json:"representation,omitempty"`
 	Targets        []Protocol     `yaml:"targets,omitempty" json:"-"`
 	QueryID        string         `yaml:"query_id"`

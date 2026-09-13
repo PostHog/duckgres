@@ -438,7 +438,7 @@ cmd_deploy() {
   ensure_pod_identity
   restart_cp_with_identity
 
-  if frozen_perf_scenario || [ "$SCENARIO_NAME" = "posthog_properties_perf" ]; then
+  if frozen_perf_scenario; then
     ensure_scenario_pod_identity
   fi
 

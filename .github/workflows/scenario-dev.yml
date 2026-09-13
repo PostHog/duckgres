@@ -78,7 +78,7 @@ jobs:
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
       TRINO_IMAGE: ghcr.io/posthog/trino:a2943f5ec37f1d5a9ab90b9bec56695a00de4584@sha256:7a57712498446bd97393cadece90ce0bc297f6feab8e0098510668fe2667ac39
-      E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached' || matrix.scenario == 'posthog_properties_perf') && 'trino' || 'neutral' }}
+      E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}${{ strategy.job-index }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ strategy.job-index }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
@@ -129,7 +129,7 @@ jobs:
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
 
       - name: Load frozen perf identity and Athena configuration
-        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_trino_cached' || env.SCENARIO_NAME == 'posthog_properties_perf'
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_trino_cached'
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
       - name: Deploy isolated Duckgres stack
@@ -178,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -d '' perf_summaries < <(
-            find artifacts/scenario-dev -type f -path '*/perf/summary.json' -print0 2>/dev/null | sort -z
+            find artifacts/scenario-dev -type f \( -path '*/perf/summary.json' -o -path '*/perf-properties/summary.json' \) -print0 2>/dev/null | sort -z
           )
           if [ "${#perf_summaries[@]}" -eq 0 ]; then
             echo "No scenario perf artifact was produced; skipping historical publish."

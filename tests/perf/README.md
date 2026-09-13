@@ -274,16 +274,21 @@ external-read/hit counters to distinguish storage traffic from cached reads.
 
 ## Published properties workload
 
-`just scenario-properties-perf` runs the opt-in JSON/STRUCT/VARIANT comparison
+The existing frozen-perf scenarios include the properties workload
 on a validated completion manifest. Set `DUCKGRES_SCENARIO_PROPERTIES_MANIFEST`
 explicitly; there is no default fixture. Preparation defaults to
 `/tmp/properties-perf` and a five-minute timeout. The catalog uses one warmup
-and four measured iterations, with UTC date bounds from the manifest. JSON and
-STRUCT run on PGWire, Trino, and Athena; VARIANT runs on PGWire only.
+and four measured iterations, with UTC date bounds from the manifest. STRUCT
+runs on Athena; VARIANT is selected for PGWire and Trino. JSON is used only for
+untimed correctness checks. The current Hoglake API and connector lack native
+VARIANT support, so that support is a prerequisite for a successful Trino run.
+Properties registration fails explicitly on unsupported types before timing.
 
 `just prepare-properties-perf "$DUCKGRES_SCENARIO_PROPERTIES_MANIFEST"` emits
-private setup inputs after validating the manifest and live object inventory.
-The optional second argument changes the output directory. The scenario also
-verifies the precreated Athena table before provisioning, then compares complete
+private setup inputs, including `hoglake-properties.json`, after validating the
+manifest and live object inventory.
+The optional second argument changes the output directory. The main scenario also
+verifies the precreated Athena table before provisioning; the cached Trino
+scenario skips Athena verification. Both compare complete
 query results outside timing. See the [properties runbook](../../docs/runbooks/properties-perf.md)
 for isolated execution, metadata registration, configuration, and recovery.

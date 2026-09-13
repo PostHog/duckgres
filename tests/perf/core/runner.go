@@ -116,7 +116,7 @@ func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 
 func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, measure bool, measureIteration int, summary *RunSummary) error {
 	for _, query := range queriesForIteration(r.cfg.Catalog.Queries, measureIteration) {
-		if !querySupportsProtocol(query, protocol) {
+		if query.ValidationOnly || !querySupportsProtocol(query, protocol) {
 			continue
 		}
 		args := orderedParamValues(query.Params)

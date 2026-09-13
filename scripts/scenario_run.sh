@@ -131,13 +131,16 @@ if [ "$check_env_only" -eq 1 ]; then
 fi
 
 # Prepare only this explicitly selected workload; environment checks remain read-only.
-if [ "$(basename "$scenario_file")" = "posthog_properties_perf.yaml" ]; then
+scenario_name="$(basename "$scenario_file")"
+if [ "$scenario_name" = "posthog_frozen_perf.yaml" ] || [ "$scenario_name" = "posthog_frozen_perf_trino_cached.yaml" ]; then
   export DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR="$(root_relative_path "${DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR:-/tmp/properties-perf}")"
-  go run ./cmd/perf-properties-prepare \
+  prepare_args=(go run ./cmd/perf-properties-prepare \
     -manifest "$DUCKGRES_SCENARIO_PROPERTIES_MANIFEST" \
-    -output-dir "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR" \
-    -athena-database "$DUCKGRES_SCENARIO_ATHENA_DATABASE" \
-    -athena-region "$DUCKGRES_SCENARIO_ATHENA_REGION"
+    -output-dir "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR")
+  if [ "$scenario_name" = "posthog_frozen_perf.yaml" ]; then
+    prepare_args+=(-athena-database "$DUCKGRES_SCENARIO_ATHENA_DATABASE" -athena-region "$DUCKGRES_SCENARIO_ATHENA_REGION")
+  fi
+  "${prepare_args[@]}"
   DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION="$(cat "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR/dataset-version.txt")"
   export DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION
 fi

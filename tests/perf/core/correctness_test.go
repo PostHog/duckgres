@@ -8,10 +8,11 @@ import (
 )
 
 type resultDriver struct {
-	protocol Protocol
-	results  map[string][][]*string
-	events   *[]string
-	readErr  error
+	protocol    Protocol
+	results     map[string][][]*string
+	events      *[]string
+	readErr     error
+	queryErrors map[string]error
 }
 
 func (d *resultDriver) Protocol() Protocol { return d.protocol }
@@ -22,6 +23,9 @@ func (d *resultDriver) Execute(_ context.Context, q Query, _ []any) (ExecutionRe
 }
 func (d *resultDriver) ReadResults(_ context.Context, q Query, _ []any) ([][]*string, error) {
 	*d.events = append(*d.events, "read:"+q.QueryID)
+	if err := d.queryErrors[q.QueryID]; err != nil {
+		return nil, err
+	}
 	return d.results[q.QueryID], d.readErr
 }
 func cell(s string) *string { return &s }
@@ -86,5 +90,40 @@ func TestRepresentationDialectAndRouting(t *testing.T) {
 	}
 	if querySupportsProtocol(q, ProtocolTrino) || !querySupportsProtocol(q, ProtocolPGWire) {
 		t.Fatal("query targets ignored")
+	}
+}
+
+func TestValidationOnlyJSONNeverRunsTimed(t *testing.T) {
+	for _, protocol := range []Protocol{ProtocolPGWire, ProtocolTrino, ProtocolTrinoCached} {
+		t.Run(string(protocol), func(t *testing.T) {
+			var events []string
+			queries := []Query{{QueryID: "json", IntentID: "browser", Representation: "json", ValidationOnly: true}, {QueryID: "variant", IntentID: "browser", Representation: "variant"}}
+			values := [][]*string{{cell("Chrome"), cell("10")}}
+			d := &resultDriver{protocol: protocol, events: &events, results: map[string][][]*string{"json": values, "variant": values}}
+			summary, err := NewQueryRunner(RunnerConfig{Catalog: Catalog{Targets: []Protocol{protocol}, Queries: queries, WarmupIterations: 1, MeasureIterations: 2}, Drivers: map[Protocol]ProtocolDriver{protocol: d}}).Run(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"read:json", "read:variant", "time:variant", "time:variant", "time:variant"}
+			if strings.Join(events, ",") != strings.Join(want, ",") {
+				t.Fatalf("events=%v", events)
+			}
+			if summary.TotalQueries != 2 || summary.WarmupQueries != 1 {
+				t.Fatalf("summary includes validation: %+v", summary)
+			}
+		})
+	}
+}
+
+func TestUnsupportedTrinoVariantFailsBeforeTiming(t *testing.T) {
+	var events []string
+	d := &resultDriver{protocol: ProtocolTrino, events: &events, results: map[string][][]*string{"json": {{cell("Chrome"), cell("1")}}}, queryErrors: map[string]error{"variant": errors.New("unsupported variant reader")}}
+	queries := []Query{{QueryID: "json", IntentID: "browser", Representation: "json", ValidationOnly: true}, {QueryID: "variant", IntentID: "browser", Representation: "variant"}}
+	summary, err := NewQueryRunner(RunnerConfig{Catalog: Catalog{Targets: []Protocol{ProtocolTrino}, Queries: queries, WarmupIterations: 1, MeasureIterations: 1}, Drivers: map[Protocol]ProtocolDriver{ProtocolTrino: d}}).Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unsupported variant reader") {
+		t.Fatalf("unsupported reader must fail: %v", err)
+	}
+	if strings.Join(events, ",") != "read:json,read:variant" || summary.TotalQueries != 0 || summary.WarmupQueries != 0 {
+		t.Fatalf("unsupported reader fell back or timed: %v %+v", events, summary)
 	}
 }

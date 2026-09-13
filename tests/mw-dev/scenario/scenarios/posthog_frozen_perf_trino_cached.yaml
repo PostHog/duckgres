@@ -3,6 +3,7 @@ run_id_prefix: scenario-frozen-perf-trino-cached
 required_env:
   - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_HOGLAKE_URI
+  - DUCKGRES_SCENARIO_PROPERTIES_MANIFEST
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_SCENARIO_TRINO_CA_CERT
   - DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
@@ -97,9 +98,46 @@ steps:
       worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
       worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
 
+  - id: setup_properties
+    type: sql
+    depends_on: [perf_queries]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/setup.sql
+      max_attempts: 1
+      exec_only: true
+
+  - id: setup_hoglake_properties
+    type: setup_hoglake
+    depends_on: [setup_properties]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
+      properties_plan: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/hoglake-properties.json
+      file: ../perf/setup_hoglake.py
+
+  - id: perf_properties
+    type: perf_queries
+    depends_on: [setup_hoglake_properties, wait_trino_ready]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      catalog_file: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/catalog.yaml
+      targets: [trino_cached]
+      trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
+      trino_startup_timeout: 2m
+      trino_startup_poll_interval: 2s
+      output_subdir: perf-properties
+      run_id: ${run_id}-properties
+      dataset_version: ${env:DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION}
+      fail_on_query_errors: true
+      worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
+      worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
+
   - id: deprovision
     type: deprovision_warehouse
-    depends_on: [perf_queries]
+    depends_on: [perf_queries, perf_properties]
     always_run: true
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}

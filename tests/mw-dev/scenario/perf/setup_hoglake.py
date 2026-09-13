@@ -52,14 +52,18 @@ def column_type(field):
     )
 
 
-def inspect_table(objects, read_footer):
+def inspect_table(objects, read_footer, selected=None):
     columns = {}
     files = []
     field_ids = []
     for obj in objects:
         metadata = read_footer(obj)
         schema = metadata.schema.to_arrow_schema()
+        if selected is not None and any(schema.names.count(name) != 1 for name in selected):
+            raise ValueError("missing selected fixture column")
         for index, field in enumerate(schema):
+            if selected is not None and field.name not in selected:
+                continue
             if not re.fullmatch(r"[a-z_][a-z0-9_]{0,127}", field.name):
                 raise ValueError(
                     f"unsupported identifier {field.name!r}; lowercase column names required"
@@ -177,6 +181,71 @@ def run(store, api, source, catalog):
     return result
 
 
+
+def run_properties(store, api, plan, catalog):
+    """Register projections in an existing catalog after validating every input.
+
+    column_type intentionally remains authoritative: unsupported physical VARIANT
+    representations fail before writes, without coercion or omitted columns.
+    """
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", catalog):
+        raise ValueError("invalid catalog identifier")
+    source = plan["destination_prefix"]
+    bucket, prefix = location(source)
+    data_prefix = prefix + "data/"
+    expected = plan["outputs"]
+    if not expected or type(plan["rows"]) is not int or plan["rows"] <= 0:
+        raise ValueError("invalid properties inventory or row count")
+    keys = set()
+    for obj in expected:
+        key = obj["key"]
+        if (key in keys or not key.startswith(data_prefix) or not key.endswith(".parquet")
+                or any(part in (".", "..") for part in key.split("/"))
+                or type(obj["size"]) is not int or obj["size"] <= 0 or not obj["etag"]):
+            raise ValueError("invalid properties inventory")
+        keys.add(key)
+    objects = sorted(store.objects(source.rstrip("/") + "/data/"), key=lambda obj: obj["key"])
+    if objects != sorted(expected, key=lambda obj: obj["key"]):
+        raise ValueError("properties inventory changed")
+    metadata = {}
+
+    def read_footer(obj):
+        if obj["key"] not in metadata:
+            metadata[obj["key"]] = store.footer(bucket, obj)
+        return metadata[obj["key"]]
+
+    plans = {}
+    for table, selected in (
+        ("events_supported", ["event", "timestamp", "properties"]),
+        ("events_variant", ["event", "timestamp", "properties", "properties_variant"]),
+    ):
+        columns, files = inspect_table(objects, read_footer, selected)
+        expected_types = {"event": "string", "timestamp": "timestamptz", "properties": "string", "properties_variant": "variant"}
+        if any(c["type"] != expected_types[c["name"]] for c in columns if c["name"] in expected_types):
+            raise ValueError("properties fixture logical column type mismatch")
+        if sum(f["rows"] for f in files) != plan["rows"]:
+            raise ValueError("properties fixture row count mismatch")
+        plans[table] = columns, files
+    # Never create or replace the shared catalog; the scenario already owns it.
+    root = "/v1/catalogs/" + catalog
+    api.post(root + "/namespaces", {"name": "properties_perf"})
+    registrations = []
+    for table, (columns, files) in plans.items():
+        info = api.post(root + "/namespaces/properties_perf/tables", {"name": table, "columns": columns})
+        if [(c["name"], c["field_id"]) for c in info["columns"]] != [
+            (c["name"], i + 1) for i, c in enumerate(columns)
+        ]:
+            raise ValueError("server assigned unexpected field IDs; no source files registered")
+        registrations.append({
+            "namespace": "properties_perf", "table": table,
+            "expected_table_uuid": info["table_uuid"],
+            "files": [{"path": f"s3://{bucket}/{obj['key']}", "record_count": obj["rows"],
+                       "file_size_bytes": obj["size"], "footer_size": obj["footer_size"]} for obj in files],
+        })
+    return api.post(root + "/commit", {"appends": registrations, "author": "perf-fixture",
+                                      "message": "Register immutable properties fixtures"})
+
+
 class S3Store:
     def __init__(self, client):
         self.client = client
@@ -245,11 +314,19 @@ def main():
     import boto3
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--source")
+    inputs.add_argument("--properties-plan")
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--uri", required=True)
     args = parser.parse_args()
-    result = run(S3Store(boto3.client("s3")), RestAPI(args.uri), args.source, args.catalog)
+    store, api = S3Store(boto3.client("s3")), RestAPI(args.uri)
+    if args.properties_plan:
+        with open(args.properties_plan, encoding="utf-8") as handle:
+            plan = json.load(handle)
+        result = run_properties(store, api, plan, args.catalog)
+    else:
+        result = run(store, api, args.source, args.catalog)
     print(f"Registered frozen fixtures at snapshot {result['snapshot_id']}")
 
 

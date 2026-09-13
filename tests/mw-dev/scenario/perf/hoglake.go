@@ -20,15 +20,20 @@ func (e *Executor) setupHoglake(ctx context.Context, step core.Step) error {
 	if err != nil {
 		return err
 	}
-	source, err := requiredString(step, "source")
-	if err != nil {
-		return err
+	source := stringFromWith(step, "source", "")
+	plan := stringFromWith(step, "properties_plan", "")
+	if (source == "") == (plan == "") {
+		return fmt.Errorf("setup_hoglake requires exactly one of source or properties_plan")
+	}
+	inputFlag, input := "--source", source
+	if plan != "" {
+		inputFlag, input = "--properties-plan", plan
 	}
 	script, err := requiredString(step, "file")
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "python3", script, "--uri", uri, "--source", source, "--catalog", orgID)
+	cmd := exec.CommandContext(ctx, "python3", script, "--uri", uri, inputFlag, input, "--catalog", orgID)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

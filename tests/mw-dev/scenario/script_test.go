@@ -108,7 +108,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_trino_cached'",
 		"bash scripts/scenario_athena_config.sh >> \"$GITHUB_ENV\"",
 		"TRINO_IMAGE: ghcr.io/posthog/trino:",
-		"E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached' || matrix.scenario == 'posthog_properties_perf') && 'trino' || 'neutral' }}",
+		"E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}",
 		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"3\"",
 		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 12Gi",
 		"role-duration-seconds: 16200",
@@ -265,12 +265,12 @@ func TestPropertiesScenarioPreparation(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := []string{"PATH=" + dir + ":" + os.Getenv("PATH"), "CALL_LOG=" + log}
-	for _, name := range []string{"API_BASE", "INTERNAL_SECRET", "PG_HOST", "SNI_SUFFIX", "ORG_ID", "TRINO_CA_CERT", "TRINO_CATALOG_STORE_DSN", "ATHENA_REGION", "ATHENA_WORKGROUP", "ATHENA_DATABASE", "ATHENA_RESULTS_S3_URI"} {
+	for _, name := range []string{"API_BASE", "INTERNAL_SECRET", "PG_HOST", "SNI_SUFFIX", "ORG_ID", "FROZEN_S3_URI", "HOGLAKE_URI", "TRINO_CA_CERT", "TRINO_CATALOG_STORE_DSN", "ATHENA_REGION", "ATHENA_WORKGROUP", "ATHENA_DATABASE", "ATHENA_RESULTS_S3_URI"} {
 		env = append(env, "DUCKGRES_SCENARIO_"+name+"=synthetic")
 	}
 	env = append(env, "DUCKGRES_K8S_WORKER_CPU_REQUEST=1", "DUCKGRES_K8S_WORKER_MEMORY_REQUEST=1Gi", "DUCKGRES_SCENARIO_PROPERTIES_MANIFEST=s3://fixture/complete.json", "DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR="+dir)
 	for _, check := range []bool{true, false} {
-		args := []string{script, "tests/mw-dev/scenario/scenarios/posthog_properties_perf.yaml"}
+		args := []string{script, "tests/mw-dev/scenario/scenarios/posthog_frozen_perf.yaml"}
 		if check {
 			args = append(args, "--check-env")
 		}
@@ -292,5 +292,57 @@ func TestPropertiesScenarioPreparation(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(string(calls)), "\n")
 	if len(lines) != 2 || !strings.HasPrefix(lines[0], "run ./cmd/perf-properties-prepare -manifest s3://fixture/complete.json -output-dir "+dir) || !strings.HasPrefix(lines[1], "test ") {
 		t.Fatalf("wrong preparation/run ordering: %s", calls)
+	}
+}
+
+func TestFrozenScenariosIncludeProperties(t *testing.T) {
+	for _, name := range []string{"posthog_frozen_perf", "posthog_frozen_perf_trino_cached"} {
+		data, err := os.ReadFile(filepath.Join("scenarios", name+".yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"DUCKGRES_SCENARIO_PROPERTIES_MANIFEST", "id: setup_hoglake\n", "id: setup_properties\n", "id: setup_hoglake_properties\n", "properties_plan: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/hoglake-properties.json", "depends_on: [setup_hoglake_properties, wait_trino_ready]", "id: perf_properties\n", "output_subdir: perf-properties", "run_id: ${run_id}-properties", "depends_on: [perf_queries, perf_properties]"} {
+			if !strings.Contains(string(data), want) {
+				t.Errorf("%s missing %s", name, want)
+			}
+		}
+	}
+	if _, err := os.Stat(filepath.Join("scenarios", "posthog_properties_perf.yaml")); !os.IsNotExist(err) {
+		t.Fatal("properties must use the existing full perf scenarios")
+	}
+	workflow, err := os.ReadFile(filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(workflow), "-path '*/perf-properties/summary.json'") {
+		t.Fatal("publisher must include properties artifacts")
+	}
+}
+
+func TestCachedScenarioPreparationDoesNotVerifyAthena(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls")
+	mock := "#!/bin/sh\nif [ \"$1\" = run ]; then printf 'test-version\\n' > \"$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR/dataset-version.txt\"; fi\nprintf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "go"), []byte(mock), 0755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", filepath.Join("..", "..", "..", "scripts", "scenario_run.sh"), "tests/mw-dev/scenario/scenarios/posthog_frozen_perf_trino_cached.yaml")
+	cmd.Env = []string{"PATH=" + dir + ":" + os.Getenv("PATH"), "CALL_LOG=" + log, "DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR=" + dir}
+	for _, n := range []string{"API_BASE", "INTERNAL_SECRET", "PG_HOST", "SNI_SUFFIX", "ORG_ID", "FROZEN_S3_URI", "HOGLAKE_URI", "TRINO_CA_CERT", "TRINO_CATALOG_STORE_DSN", "PROPERTIES_MANIFEST"} {
+		cmd.Env = append(cmd.Env, "DUCKGRES_SCENARIO_"+n+"=synthetic")
+	}
+	cmd.Env = append(cmd.Env, "DUCKGRES_K8S_WORKER_CPU_REQUEST=1", "DUCKGRES_K8S_WORKER_MEMORY_REQUEST=1Gi")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cached scenario: %v %s", err, out)
+	}
+	calls, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "-athena-") {
+		t.Fatal("cached Trino must not require Athena credentials")
+	}
+	if !strings.Contains(string(calls), "run ./cmd/perf-properties-prepare") {
+		t.Fatal("missing properties preparation")
 	}
 }

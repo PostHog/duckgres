@@ -63,3 +63,26 @@ func TestManifestContract(t *testing.T) {
 		t.Fatal("registration must use exact inventory")
 	}
 }
+
+func TestHoglakePlanPreservesVerifiedSelection(t *testing.T) {
+	raw, _ := json.Marshal(validManifest())
+	m, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := m.HoglakePlan()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan struct {
+		Destination string `json:"destination_prefix"`
+		Files       []File `json:"outputs"`
+		Rows        int64  `json:"rows"`
+	}
+	if err = json.Unmarshal(data, &plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Destination != m.Config.DestinationPrefix || plan.Rows != m.Rows || len(plan.Files) != len(m.Files) || plan.Files[0] != m.Files[0] {
+		t.Fatal("Hoglake plan lost verified fixture identity")
+	}
+}

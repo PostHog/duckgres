@@ -164,6 +164,9 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 }
 
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_MANIFEST", "s3://example/complete.json")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	const scenarioOrgID = "ci-pr-123-cnpg"
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
@@ -454,6 +457,9 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 }
 
 func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_MANIFEST", "s3://example/complete.json")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
@@ -479,7 +485,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		if containsTemplate(step.With) {
 			t.Fatalf("step %s still contains unresolved template values: %#v", step.ID, step.With)
 		}
-		if step.Type != scenarioperf.StepTypePerfQueries {
+		if step.ID != "perf_queries" {
 			continue
 		}
 		foundPerf = true
@@ -517,6 +523,9 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 }
 
 func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_MANIFEST", "s3://example/complete.json")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
@@ -1161,21 +1170,29 @@ func containsTemplate(value any) bool {
 
 func TestPropertiesScenarioGeneratedPathsResolve(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", "/tmp/properties-generated")
-	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_properties_perf.yaml"))
+	scenario, _, err := loadScenarioForRun(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	checked := 0
 	for _, step := range scenario.Steps {
-		for _, field := range []string{"file", "catalog_file"} {
-			if path, ok := step.With[field].(string); ok {
+		if step.ID != "setup_properties" && step.ID != "perf_properties" && step.ID != "setup_hoglake_properties" {
+			continue
+		}
+		for _, field := range []string{"file", "catalog_file", "properties_plan"} {
+			if path, ok := step.With[field].(string); ok && strings.Contains(path, "DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR") {
 				resolved, err := core.ResolveEnvTemplates(path)
 				if err != nil {
 					t.Fatal(err)
 				}
+				checked++
 				if filepath.Dir(resolved) != "/tmp/properties-generated" {
 					t.Fatalf("generated artifact path = %q", resolved)
 				}
 			}
 		}
+	}
+	if checked != 3 {
+		t.Fatalf("checked %d generated paths, want 3", checked)
 	}
 }

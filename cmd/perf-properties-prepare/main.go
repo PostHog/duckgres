@@ -72,10 +72,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	hoglakePlan, err := m.HoglakePlan()
+	if err != nil {
+		return err
+	}
 	if err = os.MkdirAll(*output, 0700); err != nil {
 		return err
 	}
-	for name, data := range map[string][]byte{"setup.sql": []byte(m.SetupSQL()), "athena.sql": []byte(athenaSQL), "catalog.yaml": catalog, "dataset-version.txt": []byte("properties-v3-sha256-" + m.SHA256 + "\n")} {
+	for name, data := range map[string][]byte{"hoglake-properties.json": hoglakePlan, "setup.sql": []byte(m.SetupSQL()), "athena.sql": []byte(athenaSQL), "catalog.yaml": catalog, "dataset-version.txt": []byte("properties-v3-sha256-" + m.SHA256 + "\n")} {
 		if err = os.WriteFile(filepath.Join(*output, name), data, 0600); err != nil {
 			return err
 		}

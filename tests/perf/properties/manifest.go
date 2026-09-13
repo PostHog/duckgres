@@ -211,3 +211,13 @@ func (m *Manifest) AthenaSQL(table string) (string, error) {
 	}
 	return fmt.Sprintf("CREATE EXTERNAL TABLE %s (event string, `timestamp` timestamp, properties string, properties_typed struct<`$browser`:string>) STORED AS PARQUET LOCATION %s;\n", table, literal(m.Config.DestinationPrefix+"data/")), nil
 }
+
+// HoglakePlan carries the verified physical inventory to the existing registration
+// helper. It contains private object locations and belongs only in the run directory.
+func (m *Manifest) HoglakePlan() ([]byte, error) {
+	return json.Marshal(struct {
+		Destination string `json:"destination_prefix"`
+		Files       []File `json:"outputs"`
+		Rows        int64  `json:"rows"`
+	}{m.Config.DestinationPrefix, m.Files, m.Rows})
+}
