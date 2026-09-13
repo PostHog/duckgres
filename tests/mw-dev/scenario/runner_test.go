@@ -456,12 +456,13 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 	}
 }
 
-func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
+func TestFrozenPerfScenarioUsesSupportedStepsAndGeneratedCatalog(t *testing.T) {
+	outputDir := t.TempDir()
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", outputDir)
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
-	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 	setAthenaPerfEnv(t)
@@ -493,8 +494,8 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 		if !ok || !filepath.IsAbs(catalogFile) {
 			t.Fatalf("perf catalog_file = %#v, want absolute path", step.With["catalog_file"])
 		}
-		if _, err := os.Stat(catalogFile); err != nil {
-			t.Fatalf("perf catalog file %q should exist: %v", catalogFile, err)
+		if want := filepath.Join(outputDir, "catalog.yaml"); catalogFile != want {
+			t.Fatalf("perf catalog_file = %q, want generated catalog %q", catalogFile, want)
 		}
 		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-perf-20260102t030405z" {
 			t.Fatalf("perf run_id = %q, want scenario run id", runID)
@@ -522,12 +523,13 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	}
 }
 
-func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
+func TestFrozenPerfScenarioRegistersPropertiesBeforePerf(t *testing.T) {
+	outputDir := t.TempDir()
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", outputDir)
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
-	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 	setAthenaPerfEnv(t)
@@ -547,26 +549,16 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 	for _, step := range resolved.Steps {
 		steps[step.ID] = step
 	}
-	setup, ok := steps["setup_posthog_tables"]
+	setup, ok := steps["setup_properties"]
 	if !ok {
-		t.Fatal("expected posthog table setup step")
+		t.Fatal("expected properties table setup step")
 	}
-	if got := setup.DependsOn; len(got) != 1 || got[0] != "setup_frozen_views" {
-		t.Fatalf("posthog setup dependencies = %#v, want [setup_frozen_views]", got)
+	if got := setup.DependsOn; len(got) != 1 || got[0] != "wait_ready" {
+		t.Fatalf("properties setup dependencies = %#v, want [wait_ready]", got)
 	}
 	setupFile, _ := setup.With["file"].(string)
-	if !strings.HasSuffix(setupFile, filepath.Join("sql", "setup_posthog_tables.sql")) {
-		t.Fatalf("posthog setup file = %q, want setup_posthog_tables.sql", setupFile)
-	}
-	if _, err := os.Stat(setupFile); err != nil {
-		t.Fatalf("posthog setup file %q should exist: %v", setupFile, err)
-	}
-	validation, ok := steps["validate_posthog_tables"]
-	if !ok {
-		t.Fatal("expected posthog table validation step")
-	}
-	if got := validation.DependsOn; len(got) != 1 || got[0] != "setup_posthog_tables" {
-		t.Fatalf("posthog validation dependencies = %#v, want [setup_posthog_tables]", got)
+	if want := filepath.Join(outputDir, "setup.sql"); setupFile != want {
+		t.Fatalf("properties setup file = %q, want generated setup %q", setupFile, want)
 	}
 	waitTrino, ok := steps["wait_trino_ready"]
 	if !ok {
@@ -581,16 +573,16 @@ func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.
 		t.Fatalf("Trino provision request = %#v, want enabled", provisionRequest["trino"])
 	}
 	hoglake := steps["setup_hoglake"]
-	if hoglake.Type != scenarioperf.StepTypeSetupHoglake || len(hoglake.DependsOn) != 1 || hoglake.DependsOn[0] != "validate_posthog_tables" {
-		t.Fatalf("Hoglake setup must follow fixture validation: %#v", hoglake)
+	if hoglake.Type != scenarioperf.StepTypeSetupHoglake || len(hoglake.DependsOn) != 1 || hoglake.DependsOn[0] != "wait_ready" {
+		t.Fatalf("Hoglake setup must follow warehouse readiness: %#v", hoglake)
 	}
 	if file, _ := hoglake.With["file"].(string); file == "" {
 		t.Fatal("missing Hoglake setup script")
 	} else if _, err := os.Stat(file); err != nil {
 		t.Fatal(err)
 	}
-	if got := steps["perf_queries"].DependsOn; len(got) != 2 || got[0] != "setup_hoglake" || got[1] != "wait_trino_ready" {
-		t.Fatalf("perf dependencies = %#v, want [setup_hoglake wait_trino_ready]", got)
+	if got := steps["perf_queries"].DependsOn; len(got) != 3 || got[0] != "setup_properties" || got[1] != "setup_hoglake" || got[2] != "wait_trino_ready" {
+		t.Fatalf("perf dependencies = %#v, want [setup_properties setup_hoglake wait_trino_ready]", got)
 	}
 }
 

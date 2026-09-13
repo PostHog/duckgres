@@ -4,7 +4,6 @@ required_env:
   - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_HOGLAKE_URI
   - DUCKGRES_SCENARIO_PROPERTIES_S3_URI
-  - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_SCENARIO_TRINO_CA_CERT
   - DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
   - DUCKGRES_K8S_WORKER_CPU_REQUEST
@@ -42,43 +41,14 @@ steps:
       timeout: 15m
       poll_interval: 10s
 
-  - id: setup_frozen_views
-    type: sql
+  - id: setup_hoglake
+    type: setup_hoglake
     depends_on: [wait_ready]
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
-      catalog: ducklake
-      file: ../sql/setup_frozen_views.sql
-      max_attempts: 12
-      retry_interval: 10s
-
-  - id: setup_posthog_tables
-    type: sql
-    depends_on: [setup_frozen_views]
-    with:
-      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
-      catalog: ducklake
-      file: ../sql/setup_posthog_tables.sql
-      max_attempts: 3
-      retry_interval: 10s
-
-  - id: validate_posthog_tables
-    type: sql
-    depends_on: [setup_posthog_tables]
-    with:
-      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
-      catalog: ducklake
-      file: ../sql/validate_posthog_tables.sql
-      max_attempts: 3
-      retry_interval: 10s
-
-  - id: setup_hoglake
-    type: setup_hoglake
-    depends_on: [validate_posthog_tables]
-    with:
-      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
-      source: ${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}
+      properties_source: ${env:DUCKGRES_SCENARIO_PROPERTIES_S3_URI}
+      representation: variant
       file: ../perf/setup_hoglake.py
 
   - id: perf_queries
@@ -87,50 +57,12 @@ steps:
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
-      catalog_file: ../../../perf/queries/ducklake_posthog_tables.yaml
-      targets: [trino_cached]
-      trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
-      trino_startup_timeout: 2m
-      trino_startup_poll_interval: 2s
-      run_id: ${run_id}
-      dataset_version: posthog-file-views-v1
-      fail_on_query_errors: true
-      worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
-      worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
-
-  - id: setup_properties
-    type: sql
-    depends_on: [perf_queries]
-    with:
-      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
-      catalog: ducklake
-      file: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/setup.sql
-      max_attempts: 1
-      exec_only: true
-
-  - id: setup_hoglake_properties
-    type: setup_hoglake
-    depends_on: [setup_properties]
-    with:
-      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
-      uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
-      properties_source: ${env:DUCKGRES_SCENARIO_PROPERTIES_S3_URI}
-      representation: variant
-      file: ../perf/setup_hoglake.py
-
-  - id: perf_properties
-    type: perf_queries
-    depends_on: [setup_hoglake_properties, wait_trino_ready]
-    with:
-      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
-      catalog: ducklake
       catalog_file: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/catalog.yaml
       targets: [trino_cached]
       trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
       trino_startup_timeout: 2m
       trino_startup_poll_interval: 2s
-      output_subdir: perf-properties
-      run_id: ${run_id}-properties
+      run_id: ${run_id}
       dataset_version: ${env:DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION}
       fail_on_query_errors: true
       worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
@@ -138,7 +70,7 @@ steps:
 
   - id: deprovision
     type: deprovision_warehouse
-    depends_on: [perf_queries, perf_properties]
+    depends_on: [perf_queries]
     always_run: true
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}

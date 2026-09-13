@@ -73,8 +73,9 @@ under either explicit cache-mode label. Teardown removes the test workers.
 Warmup does not imply that the entire dataset fits in memory. Query-local
 buffering, prefetching, DuckLake catalog caching, and separate cache
 proxies/extensions are unaffected, so "uncached" here is not a fully cold
-end-to-end read path. The paired query and intent IDs use `balanced_v4` to
-separate this methodology from `balanced_v3`; the dataset is unchanged.
+end-to-end read path. The legacy full-corpus paired catalog uses `balanced_v4`
+query and intent IDs to separate its methodology from `balanced_v3`. The frozen
+scenarios now use the generated properties catalog described below.
 
 ## Paired Query Catalogs
 
@@ -281,16 +282,24 @@ new repository secret. `just prepare-properties-perf "$DUCKGRES_SCENARIO_PROPERT
 emits private SQL/catalog inputs to `/tmp/properties-perf` (optional second
 argument overrides it), using a five-minute timeout.
 
+Properties are the sole benchmark suite in these scenarios: registration and
+validation happen before their single `perf_queries` step. The original
+full-corpus benchmark phase is no longer run. Results use the existing `perf/`
+artifact location and scenario run ID.
+
 The catalog queries the entire selected dataset with one warmup and four measured
-iterations. Uncached Duckgres and Trino measure JSON and are labeled
-`duckgres (vanilla)` and `trino (vanilla)`. Cached Duckgres measures JSON as `duckgres (cache)`. Cached Trino measures
-VARIANT as `trino (cache+variant)`. Athena measures STRUCT. Cached Trino and
-Athena also use untimed JSON correctness
-baselines. The first live run
-failed in DuckLake registration with `Expected VARIANT, found type STRUCT`,
-before properties registration in Hoglake or measured properties queries.
-Duckgres now omits VARIANT registration and measures JSON in both cache modes;
-cached Trino still requires Hoglake VARIANT support.
-The main scenario verifies the precreated Athena table; cached Trino skips it.
+iterations. The main scenario measures JSON with `duckgres (vanilla)`,
+`duckgres (cache)`, and `trino (vanilla)`, plus STRUCT with Athena. The separate
+cached-Trino scenario measures VARIANT as `trino (cache+variant)` without
+repeating the other four configurations. Cached Trino and Athena also use
+untimed JSON correctness baselines.
+
+Hoglake's catalog `data_path` is initialized from the selected properties prefix
+so its registered Parquet files are inside the catalog's allowed location.
+Duckgres registers only JSON in both cache modes. Cached Trino still requires
+Hoglake VARIANT support; its current registration failure is isolated to its
+own job and does not prevent the main scenario's results from being collected.
+The workflow creates the Athena external table if missing and the main scenario
+verifies its mapping; cached Trino skips Athena configuration.
 See the [properties runbook](../../docs/runbooks/properties-perf.md) for workflow
 inputs, registration, execution, and recovery.

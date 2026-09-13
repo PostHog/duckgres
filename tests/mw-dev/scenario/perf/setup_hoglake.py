@@ -183,7 +183,7 @@ def run(store, api, source, catalog):
 
 
 def run_properties(store, api, source, catalog, representation):
-    """Register projections in an existing catalog after validating every input.
+    """Create the scenario catalog at the properties prefix and register projections.
 
     column_type intentionally remains authoritative: unsupported physical VARIANT
     representations fail before writes, without coercion or omitted columns.
@@ -214,8 +214,10 @@ def run_properties(store, api, source, catalog, representation):
         if any(c["type"] != expected_types[c["name"]] for c in columns if c["name"] in expected_types):
             raise ValueError("properties fixture logical column type mismatch")
         plans[table] = columns, files
-    # Never create or replace the shared catalog; the scenario already owns it.
+    # The catalog only accepts files below its data_path. Use this dataset,
+    # rather than inheriting the unrelated original frozen fixture prefix.
     root = "/v1/catalogs/" + catalog
+    api.post("/v1/catalogs", {"name": catalog, "data_path": source.rstrip("/") + "/"})
     api.post(root + "/namespaces", {"name": "properties_perf"})
     registrations = []
     for table, (columns, files) in plans.items():

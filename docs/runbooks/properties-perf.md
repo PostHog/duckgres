@@ -1,7 +1,9 @@
 # Properties in frozen performance scenarios
 
 The existing `posthog_frozen_perf` and `posthog_frozen_perf_trino_cached`
-scenarios register generated properties Parquet alongside the full frozen corpus.
+scenarios benchmark the generated properties Parquet dataset. This replaces the
+original full-corpus benchmark phase in these scenarios; each scenario runs one
+`perf_queries` step after dataset registration and validation.
 Set `DUCKGRES_SCENARIO_PROPERTIES_S3_URI` to the directory containing the generated
 Parquet files (the published dataset's `data/` prefix). There is no default.
 No completion manifest or new repository secret is required.
@@ -27,10 +29,12 @@ select `posthog_frozen_perf_trino_cached`. The workflow masks the input in logs
 and uses its existing AWS role.
 
 Duckgres registers only `properties_perf.events_supported`; Hoglake registers its projections
-in the scenario's catalog. Uncached Trino registers only the JSON projection;
+in the scenario's catalog, whose `data_path` is initialized from the selected
+properties Parquet prefix. All registered files must be beneath that path.
+Uncached Trino registers only the JSON projection;
 cached Trino additionally registers VARIANT. Scenario steps specify this through
 `representation`; the Python helper defaults `--properties-representation` to
-`variant` for direct invocations. Athena uses the precreated
+`variant` for direct invocations. Athena uses the
 `properties_events_supported` table in the configured benchmark database.
 The workflow creates this external table if missing, using its existing AWS role;
 it leaves existing tables intact and preparation verifies their mapping. This
@@ -39,7 +43,9 @@ For direct local runs, provision it with the generated `athena.sql` first. The c
 configuration. All projections refer to the same Parquet prefix.
 
 Queries cover the entire selected dataset, with one warmup and four measured
-iterations. The measured properties comparisons are:
+iterations. The main scenario measures Duckgres in both cache modes, uncached Trino, and
+Athena. The separate cached-Trino scenario measures only cached Trino. Together
+they provide these five comparisons:
 
 | Run label | Cache | Properties representation |
 | --- | --- | --- |
@@ -50,26 +56,28 @@ iterations. The measured properties comparisons are:
 | Athena | — | STRUCT |
 
 These names are emitted as `run_label` in result and service-metric CSVs and
-published query results. The `protocol` identifiers remain stable. Original
-full-corpus rows keep their existing labels because they do not use VARIANT.
+published query results. The `protocol` identifiers remain stable.
 
 Cached Trino and Athena also run untimed JSON baselines. Complete query results
-must agree before measurements start. The first live branch run failed earlier
-in DuckLake file registration: `Expected VARIANT, found type STRUCT` for
-`properties_variant`. Hoglake registration and properties queries were skipped.
-Duckgres now uses JSON in both cache modes and does not register the VARIANT
-column, avoiding that path. Cached Trino still requires VARIANT support in Hoglake.
-Unsupported types are not silently substituted.
+must agree before measurements start. Duckgres registers only its JSON projection
+in both cache modes. Cached Trino still requires VARIANT support in Hoglake:
+its current registration fails on the physical VARIANT representation. This
+fails the cached-Trino job independently; it does not prevent the main scenario
+from producing results. Unsupported types are not silently substituted.
 
 ## Results and recovery
 
-Full-corpus results remain in `perf/`; properties results use `perf-properties/`
-and a distinct run ID ending in `-properties`. Dataset versions derive from the
-selected object inventory. Keep the prefix immutable to compare runs reliably.
-The existing publisher preserves representation labels and both workloads.
+Each scenario writes its sole benchmark result set to `perf/` under its existing
+run ID. Dataset versions derive from the selected object inventory. Keep the
+prefix immutable to compare runs reliably. The existing publisher preserves
+representation labels. Workflow artifact upload preserves successful results
+when the other scenario fails; branch runs do not publish to the shared dashboard.
 
 For empty or inaccessible prefixes, correct the input or access and rerun.
 For Athena mapping failures, correct the table using the generated SQL.
+For a Hoglake `data_path` rejection, verify that catalog initialization and
+properties registration use the same selected prefix; recreate the isolated
+scenario catalog with that prefix before retrying.
 Keep raw values and private paths out of published diagnostics.
 Scenario cleanup deprovisions the owned warehouse, and workflow teardown removes
 the isolated stack. For interrupted runs, follow the scenario recovery runbook
