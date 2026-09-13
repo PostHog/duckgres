@@ -1,4 +1,4 @@
-// perf-properties-prepare validates a published fixture and emits private run inputs.
+// perf-properties-prepare selects a generated Parquet dataset and emits private run inputs.
 package main
 
 import (
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -24,14 +23,14 @@ func main() {
 	}
 }
 func run() error {
-	manifest := flag.String("manifest", "", "Required local path or s3:// completion manifest")
+	source := flag.String("s3-uri", "", "Required s3:// prefix containing the generated Parquet dataset")
 	output := flag.String("output-dir", "", "Required private output directory")
 	athenaDB := flag.String("athena-database", "", "Optional existing Athena database; enables read-only table verification")
 	athenaRegion := flag.String("athena-region", "", "AWS region for Athena Glue metadata; defaults to SDK region")
 	athenaTable := flag.String("athena-table", "properties_events_supported", "Existing Athena table (catalog currently requires properties_events_supported)")
 	flag.Parse()
-	if *manifest == "" || *output == "" {
-		return fmt.Errorf("-manifest and -output-dir are required")
+	if *source == "" || *output == "" {
+		return fmt.Errorf("-s3-uri and -output-dir are required")
 	}
 	if *athenaTable != "properties_events_supported" {
 		return fmt.Errorf("-athena-table must be properties_events_supported to match the catalog")
@@ -43,16 +42,8 @@ func run() error {
 		return err
 	}
 	client := s3.NewFromConfig(cfg)
-	var m *properties.Manifest
-	if strings.HasPrefix(*manifest, "s3://") {
-		m, err = properties.LoadS3(ctx, client, *manifest)
-	} else {
-		m, err = properties.Load(*manifest)
-	}
+	m, err := properties.Discover(ctx, client, *source)
 	if err != nil {
-		return err
-	}
-	if err = m.VerifyInventory(ctx, client); err != nil {
 		return err
 	}
 	if *athenaDB != "" {
@@ -68,22 +59,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	catalog, err := yaml.Marshal(properties.Catalog(m))
-	if err != nil {
-		return err
-	}
-	hoglakePlan, err := m.HoglakePlan()
+	catalog, err := yaml.Marshal(properties.Catalog())
 	if err != nil {
 		return err
 	}
 	if err = os.MkdirAll(*output, 0700); err != nil {
 		return err
 	}
-	for name, data := range map[string][]byte{"hoglake-properties.json": hoglakePlan, "setup.sql": []byte(m.SetupSQL()), "athena.sql": []byte(athenaSQL), "catalog.yaml": catalog, "dataset-version.txt": []byte("properties-v3-sha256-" + m.SHA256 + "\n")} {
+	for name, data := range map[string][]byte{"setup.sql": []byte(m.SetupSQL()), "athena.sql": []byte(athenaSQL), "catalog.yaml": catalog, "dataset-version.txt": []byte("properties-sha256-" + m.SHA256 + "\n")} {
 		if err = os.WriteFile(filepath.Join(*output, name), data, 0600); err != nil {
 			return err
 		}
 	}
-	fmt.Printf("Validated manifest and %d objects; value validation remains sampled until paired query checks pass.\n", len(m.Files))
+	fmt.Printf("Selected %d Parquet objects; paired query checks run before measurement.\n", len(m.Files))
 	return nil
 }

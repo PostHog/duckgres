@@ -135,7 +135,7 @@ scenario_name="$(basename "$scenario_file")"
 if [ "$scenario_name" = "posthog_frozen_perf.yaml" ] || [ "$scenario_name" = "posthog_frozen_perf_trino_cached.yaml" ]; then
   export DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR="$(root_relative_path "${DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR:-/tmp/properties-perf}")"
   prepare_args=(go run ./cmd/perf-properties-prepare \
-    -manifest "$DUCKGRES_SCENARIO_PROPERTIES_MANIFEST" \
+    -s3-uri "$DUCKGRES_SCENARIO_PROPERTIES_S3_URI" \
     -output-dir "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR")
   if [ "$scenario_name" = "posthog_frozen_perf.yaml" ]; then
     prepare_args+=(-athena-database "$DUCKGRES_SCENARIO_ATHENA_DATABASE" -athena-region "$DUCKGRES_SCENARIO_ATHENA_REGION")

@@ -166,7 +166,7 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_MANIFEST", "s3://example/complete.json")
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	const scenarioOrgID = "ci-pr-123-cnpg"
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
@@ -459,7 +459,7 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_MANIFEST", "s3://example/complete.json")
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
@@ -525,7 +525,7 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndRelativeCatalog(t *testing.T) {
 func TestFrozenPerfScenarioBuildsAndValidatesPostHogTablesBeforePerf(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_MANIFEST", "s3://example/complete.json")
+	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")

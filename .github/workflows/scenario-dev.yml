@@ -8,6 +8,11 @@ on:
         required: true
         default: full-suite
         type: string
+      properties_s3_uri:
+        description: Generated properties Parquet S3 prefix for frozen perf
+        required: false
+        default: ""
+        type: string
       duckgres_image:
         description: Existing Duckgres image to deploy instead of building this SHA
         required: false
@@ -131,6 +136,17 @@ jobs:
       - name: Load frozen perf identity and Athena configuration
         if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_trino_cached'
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
+
+      - name: Load properties fixture selection
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_trino_cached'
+        run: |
+          source=$(jq -r '.inputs.properties_s3_uri // ""' "$GITHUB_EVENT_PATH")
+          if [[ ! "$source" =~ ^s3://[^[:space:]]+$ ]]; then
+            echo "::error::Frozen perf requires a properties_s3_uri S3 prefix."
+            exit 1
+          fi
+          echo "::add-mask::$source"
+          echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=$source" >> "$GITHUB_ENV"
 
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy

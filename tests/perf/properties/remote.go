@@ -2,8 +2,11 @@ package properties
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"io"
+	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,54 +15,49 @@ import (
 )
 
 type S3Client interface {
-	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 }
 
-// LoadS3 retrieves a completion manifest; inventory verification remains mandatory.
-func LoadS3(ctx context.Context, client S3Client, uri string) (*Manifest, error) {
+// Discover lists the Parquet files directly below the configured dataset prefix,
+// including nested directories, just as the frozen-data registration does.
+func Discover(ctx context.Context, client S3Client, uri string) (*Dataset, error) {
 	u, err := s3URL(uri)
 	if err != nil {
 		return nil, err
 	}
-	out, err := client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(u.Host), Key: aws.String(strings.TrimPrefix(u.Path, "/"))})
-	if err != nil {
-		return nil, fmt.Errorf("read completion manifest: %w", err)
-	}
-	defer func() { _ = out.Body.Close() }()
-	data, err := io.ReadAll(io.LimitReader(out.Body, 16<<20))
-	if err != nil {
-		return nil, err
-	}
-	return Parse(data)
-}
-
-// VerifyInventory compares every live data-prefix object, including unexpected files.
-func (m *Manifest) VerifyInventory(ctx context.Context, client S3Client) error {
-	u, _ := s3URL(m.Config.DestinationPrefix)
-	expected := make(map[string]File, len(m.Files))
-	for _, f := range m.Files {
-		expected[f.Key] = f
-	}
-	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: aws.String(u.Host), Prefix: aws.String(strings.TrimPrefix(u.Path, "/") + "data/")})
+	prefix := strings.TrimRight(strings.TrimPrefix(u.Path, "/"), "/") + "/"
+	dataset := &Dataset{Prefix: "s3://" + u.Host + "/" + prefix}
+	pager := s3.NewListObjectsV2Paginator(client, &s3.ListObjectsV2Input{Bucket: aws.String(u.Host), Prefix: aws.String(prefix)})
 	for pager.HasMorePages() {
 		page, err := pager.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("verify fixture inventory: %w", err)
+			return nil, fmt.Errorf("list properties dataset: %w", err)
 		}
 		for _, object := range page.Contents {
 			key := aws.ToString(object.Key)
-			f, ok := expected[key]
-			if !ok || f.Size != aws.ToInt64(object.Size) || f.ETag != aws.ToString(object.ETag) {
-				return fmt.Errorf("fixture inventory changed: unexpected or modified object")
+			if !strings.HasSuffix(key, ".parquet") {
+				continue
 			}
-			delete(expected, key)
+			if aws.ToInt64(object.Size) <= 0 {
+				return nil, fmt.Errorf("properties dataset contains an empty Parquet object")
+			}
+			dataset.Files = append(dataset.Files, File{Key: key, Size: aws.ToInt64(object.Size), ETag: aws.ToString(object.ETag)})
 		}
 	}
-	if len(expected) > 0 {
-		return fmt.Errorf("fixture inventory changed: %d missing objects", len(expected))
+	if len(dataset.Files) == 0 {
+		return nil, fmt.Errorf("properties dataset contains no Parquet files")
 	}
-	return nil
+	sort.Slice(dataset.Files, func(i, j int) bool { return dataset.Files[i].Key < dataset.Files[j].Key })
+	inventory, err := json.Marshal(struct {
+		Prefix string
+		Files  []File
+	}{dataset.Prefix, dataset.Files})
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(inventory)
+	dataset.SHA256 = hex.EncodeToString(digest[:])
+	return dataset, nil
 }
 
 type GlueClient interface {
@@ -67,7 +65,7 @@ type GlueClient interface {
 }
 
 // VerifyAthenaTable checks the preprovisioned logical projection without mutating Glue.
-func (m *Manifest) VerifyAthenaTable(ctx context.Context, client GlueClient, database, table string) error {
+func (m *Dataset) VerifyAthenaTable(ctx context.Context, client GlueClient, database, table string) error {
 	out, err := client.GetTable(ctx, &glue.GetTableInput{DatabaseName: aws.String(database), Name: aws.String(table)})
 	if err != nil {
 		return fmt.Errorf("verify Athena table: %w", err)
@@ -83,7 +81,7 @@ func (m *Manifest) VerifyAthenaTable(ctx context.Context, client GlueClient, dat
 		return fmt.Errorf("athena table requires standard Parquet SerDe")
 	}
 
-	if aws.ToString(sd.Location) != m.Config.DestinationPrefix+"data/" {
+	if aws.ToString(sd.Location) != m.Prefix {
 		return fmt.Errorf("athena table location differs from fixture")
 	}
 	if strings.EqualFold(out.Table.Parameters["parquet.column.index.access"], "true") || strings.EqualFold(sd.SerdeInfo.Parameters["parquet.column.index.access"], "true") {

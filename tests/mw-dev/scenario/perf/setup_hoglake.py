@@ -182,7 +182,7 @@ def run(store, api, source, catalog):
 
 
 
-def run_properties(store, api, plan, catalog):
+def run_properties(store, api, source, catalog):
     """Register projections in an existing catalog after validating every input.
 
     column_type intentionally remains authoritative: unsupported physical VARIANT
@@ -190,23 +190,13 @@ def run_properties(store, api, plan, catalog):
     """
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", catalog):
         raise ValueError("invalid catalog identifier")
-    source = plan["destination_prefix"]
-    bucket, prefix = location(source)
-    data_prefix = prefix + "data/"
-    expected = plan["outputs"]
-    if not expected or type(plan["rows"]) is not int or plan["rows"] <= 0:
-        raise ValueError("invalid properties inventory or row count")
-    keys = set()
-    for obj in expected:
-        key = obj["key"]
-        if (key in keys or not key.startswith(data_prefix) or not key.endswith(".parquet")
-                or any(part in (".", "..") for part in key.split("/"))
-                or type(obj["size"]) is not int or obj["size"] <= 0 or not obj["etag"]):
-            raise ValueError("invalid properties inventory")
-        keys.add(key)
-    objects = sorted(store.objects(source.rstrip("/") + "/data/"), key=lambda obj: obj["key"])
-    if objects != sorted(expected, key=lambda obj: obj["key"]):
-        raise ValueError("properties inventory changed")
+    bucket, _ = location(source)
+    objects = sorted(
+        (obj for obj in store.objects(source) if obj["key"].endswith(".parquet")),
+        key=lambda obj: obj["key"],
+    )
+    if not objects:
+        raise ValueError("no properties Parquet files in source")
     metadata = {}
 
     def read_footer(obj):
@@ -223,8 +213,6 @@ def run_properties(store, api, plan, catalog):
         expected_types = {"event": "string", "timestamp": "timestamptz", "properties": "string", "properties_variant": "variant"}
         if any(c["type"] != expected_types[c["name"]] for c in columns if c["name"] in expected_types):
             raise ValueError("properties fixture logical column type mismatch")
-        if sum(f["rows"] for f in files) != plan["rows"]:
-            raise ValueError("properties fixture row count mismatch")
         plans[table] = columns, files
     # Never create or replace the shared catalog; the scenario already owns it.
     root = "/v1/catalogs/" + catalog
@@ -316,15 +304,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--source")
-    inputs.add_argument("--properties-plan")
+    inputs.add_argument("--properties-source")
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--uri", required=True)
     args = parser.parse_args()
     store, api = S3Store(boto3.client("s3")), RestAPI(args.uri)
-    if args.properties_plan:
-        with open(args.properties_plan, encoding="utf-8") as handle:
-            plan = json.load(handle)
-        result = run_properties(store, api, plan, args.catalog)
+    if args.properties_source:
+        result = run_properties(store, api, args.properties_source, args.catalog)
     else:
         result = run(store, api, args.source, args.catalog)
     print(f"Registered frozen fixtures at snapshot {result['snapshot_id']}")

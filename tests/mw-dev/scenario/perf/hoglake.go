@@ -21,13 +21,13 @@ func (e *Executor) setupHoglake(ctx context.Context, step core.Step) error {
 		return err
 	}
 	source := stringFromWith(step, "source", "")
-	plan := stringFromWith(step, "properties_plan", "")
-	if (source == "") == (plan == "") {
-		return fmt.Errorf("setup_hoglake requires exactly one of source or properties_plan")
+	propertiesSource := stringFromWith(step, "properties_source", "")
+	if (source == "") == (propertiesSource == "") {
+		return fmt.Errorf("setup_hoglake requires exactly one of source or properties_source")
 	}
 	inputFlag, input := "--source", source
-	if plan != "" {
-		inputFlag, input = "--properties-plan", plan
+	if propertiesSource != "" {
+		inputFlag, input = "--properties-source", propertiesSource
 	}
 	script, err := requiredString(step, "file")
 	if err != nil {

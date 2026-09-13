@@ -521,7 +521,7 @@ gen-certs:
 seed-ducklake:
     ./scripts/seed_ducklake.sh
 
-# Validate the immutable properties fixture and prepare workload SQL/catalog.
+# Prepare properties workload SQL/catalog from an existing Parquet prefix.
 [group('test')]
-prepare-properties-perf manifest output_dir="/tmp/properties-perf":
-    go run ./cmd/perf-properties-prepare -manifest {{quote(manifest)}} -output-dir {{quote(output_dir)}}
+prepare-properties-perf s3_uri output_dir="/tmp/properties-perf":
+    go run ./cmd/perf-properties-prepare -s3-uri {{quote(s3_uri)}} -output-dir {{quote(output_dir)}}

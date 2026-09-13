@@ -3,7 +3,7 @@ run_id_prefix: scenario-frozen-perf
 required_env:
   - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_HOGLAKE_URI
-  - DUCKGRES_SCENARIO_PROPERTIES_MANIFEST
+  - DUCKGRES_SCENARIO_PROPERTIES_S3_URI
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_SCENARIO_TRINO_CA_CERT
   - DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
@@ -125,7 +125,7 @@ steps:
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
-      properties_plan: ${env:DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR}/hoglake-properties.json
+      properties_source: ${env:DUCKGRES_SCENARIO_PROPERTIES_S3_URI}
       file: ../perf/setup_hoglake.py
 
   - id: perf_properties
