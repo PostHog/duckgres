@@ -135,6 +135,9 @@ func (s *State) Result(stepID string) (StepResult, bool) {
 }
 
 func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
+	if step.Type == StepTypeSetupHoglake {
+		return e.setupHoglake(ctx, step)
+	}
 	if step.Type != StepTypePerfQueries {
 		return classified(ErrorClassUnsupportedStep, fmt.Errorf("unsupported perf step type %q", step.Type))
 	}

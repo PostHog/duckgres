@@ -24,6 +24,7 @@ type StorageTarget string
 const (
 	StorageTargetRawView        StorageTarget = "raw_view"
 	StorageTargetDuckLakeTable  StorageTarget = "ducklake_table"
+	StorageTargetHoglakeTable   StorageTarget = "hoglake_table"
 	StorageTargetAthenaExternal StorageTarget = "athena_external"
 )
 

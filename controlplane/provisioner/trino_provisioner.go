@@ -327,6 +327,10 @@ type TrinoProvisionerOpts struct {
 	// FilesystemCacheEnabled enables the node-local filesystem cache for new
 	// catalogs. Defaults to false. Trino nodes must configure a cache manager.
 	FilesystemCacheEnabled bool
+
+	// HoglakeURI selects Hoglake catalogs using the pod's S3 credentials.
+	// Empty retains the default DuckLake catalog configuration.
+	HoglakeURI string
 }
 
 // TrinoBootstrapSentinelStore is the narrow configstore surface the
@@ -414,6 +418,7 @@ type TrinoProvisioner struct {
 	awsRegion               string
 	s3MaxConnections        int
 	filesystemCacheEnabled  bool
+	hoglakeURI              string
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -536,6 +541,7 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		awsRegion:               opts.AWSRegion,
 		s3MaxConnections:        maxConns,
 		filesystemCacheEnabled:  opts.FilesystemCacheEnabled,
+		hoglakeURI:              opts.HoglakeURI,
 	}, nil
 }
 
@@ -1724,6 +1730,15 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.M
 	region := d.DataStore.S3Region
 	if region == "" {
 		region = p.awsRegion
+	}
+	if p.hoglakeURI != "" {
+		return map[string]string{
+			"connector.name":    "hoglake",
+			"hoglake.uri":       p.hoglakeURI,
+			"hoglake.catalog":   orgID,
+			"fs.cache.enabled":  strconv.FormatBool(p.filesystemCacheEnabled),
+			"hoglake.s3.region": region,
+		}
 	}
 	return map[string]string{
 		"connector.name":                    "ducklake",

@@ -181,6 +181,7 @@ func TestRunnerBalancesPairedQueryOrderAcrossMeasuredIterations(t *testing.T) {
 					PGWireSQL:     "SELECT COUNT(*) FROM posthog.events",
 					StorageTarget: StorageTargetDuckLakeTable,
 				},
+				{QueryID: "q_events__hoglake_table", IntentID: "intent_events", PGWireSQL: "SELECT COUNT(*) FROM posthog.events", StorageTarget: StorageTargetHoglakeTable},
 			},
 		},
 		Drivers: map[Protocol]ProtocolDriver{
@@ -211,7 +212,7 @@ func TestRunnerBalancesPairedQueryOrderAcrossMeasuredIterations(t *testing.T) {
 	}
 }
 
-func TestRunnerKeepsRawViewsOnPGWireAndRunsDuckLakeTablesOnEveryTarget(t *testing.T) {
+func TestRunnerKeepsDuckLakeOnPGWireAndRunsHoglakeOnTrino(t *testing.T) {
 	const trino Protocol = "trino"
 	pg := &testDriver{protocol: ProtocolPGWire}
 	trinoDriver := &testDriver{protocol: trino}
@@ -234,6 +235,12 @@ func TestRunnerKeepsRawViewsOnPGWireAndRunsDuckLakeTablesOnEveryTarget(t *testin
 					PGWireSQL:     "SELECT COUNT(*) FROM posthog.events",
 					StorageTarget: StorageTargetDuckLakeTable,
 				},
+				{
+					QueryID:       "q_events__hoglake_table",
+					IntentID:      "intent_events",
+					PGWireSQL:     "SELECT COUNT(*) FROM posthog.events",
+					StorageTarget: StorageTargetHoglakeTable,
+				},
 			},
 		},
 		Drivers: map[Protocol]ProtocolDriver{
@@ -251,7 +258,7 @@ func TestRunnerKeepsRawViewsOnPGWireAndRunsDuckLakeTablesOnEveryTarget(t *testin
 	if got, want := pg.queryIDs, []string{"q_events__raw_view", "q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("pgwire query IDs: got %v want %v", got, want)
 	}
-	if got, want := trinoDriver.queryIDs, []string{"q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := trinoDriver.queryIDs, []string{"q_events__hoglake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("trino query IDs: got %v want %v", got, want)
 	}
 	if summary.TotalQueries != 3 {
@@ -276,6 +283,7 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 			Queries: []Query{
 				{QueryID: "q__raw_view", IntentID: "intent", StorageTarget: StorageTargetRawView},
 				{QueryID: "q__ducklake_table", IntentID: "intent", StorageTarget: StorageTargetDuckLakeTable},
+				{QueryID: "q__hoglake_table", IntentID: "intent", StorageTarget: StorageTargetHoglakeTable},
 				{QueryID: "q__athena_external", IntentID: "intent", StorageTarget: StorageTargetAthenaExternal},
 			},
 		},
@@ -296,13 +304,13 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 	if got, want := pg.queryIDs, []string{"q__raw_view", "q__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("PGWire query IDs: got %v want %v", got, want)
 	}
-	if got, want := trinoDriver.queryIDs, []string{"q__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := trinoDriver.queryIDs, []string{"q__hoglake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Trino query IDs: got %v want %v", got, want)
 	}
 	if got, want := athenaDriver.queryIDs, []string{"q__athena_external"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Athena query IDs: got %v want %v", got, want)
 	}
-	if got, want := cachedDriver.queryIDs, []string{"q__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := cachedDriver.queryIDs, []string{"q__hoglake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Cached Trino query IDs: got %v want %v", got, want)
 	}
 	if summary.TotalQueries != 5 {
@@ -323,6 +331,7 @@ func TestRunnerRunsUncachedAndCachedPGWireAsDistinctComparableResults(t *testing
 			Queries: []Query{
 				{QueryID: "q__raw_view", IntentID: "intent", StorageTarget: StorageTargetRawView},
 				{QueryID: "q__ducklake_table", IntentID: "intent", StorageTarget: StorageTargetDuckLakeTable},
+				{QueryID: "q__hoglake_table", IntentID: "intent", StorageTarget: StorageTargetHoglakeTable},
 				{QueryID: "q__athena_external", IntentID: "intent", StorageTarget: StorageTargetAthenaExternal},
 			},
 		},
