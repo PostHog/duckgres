@@ -55,7 +55,7 @@ The isolated control plane's default worker request is configurable through
 `DUCKGRES_K8S_WORKER_MEMORY_REQUEST`; `run.sh` defaults them to `750m` and
 `1536Mi`, respectively, preserving the e2e harness's worker-packing behavior.
 `scenario-dev.yml` explicitly overrides them to 3 CPU and 64Gi for the frozen
-perf workload. Direct `run.sh` callers can make the same explicit override.
+perf workload. On this experiment branch, the worker profile maximum is also 64Gi so explicit session requests are not clamped to 16Gi. Direct `run.sh` callers can make the same explicit override.
 
 ### Control-plane rollout retirement
 
