@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -198,6 +200,11 @@ func (d *Driver) ReadResults(ctx context.Context, query core.Query, args []any) 
 	return reader.ReadResults(ctx, sqlText, args)
 }
 func (e *sqlExecutor) ReadResults(ctx context.Context, query string, args []any) ([][]*string, error) {
+	if strings.Contains(query, "properties_perf") && e.conn != nil {
+		e.traceProperties(ctx, query)
+		return nil, fmt.Errorf("diagnostic probe completed; no benchmark measurements requested")
+	}
+
 	queryContext := e.db.QueryContext
 	if e.conn != nil {
 		queryContext = e.conn.QueryContext
@@ -207,4 +214,50 @@ func (e *sqlExecutor) ReadResults(ctx context.Context, query string, args []any)
 		return nil, err
 	}
 	return core.ReadSQLResults(rows)
+}
+
+// Diagnostic branch only: log numeric summaries, never fixture result values.
+func (e *sqlExecutor) traceProperties(ctx context.Context, original string) {
+	probe := func(label, query string, printValues bool) {
+		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		defer cancel()
+		start := time.Now()
+		rows, err := e.conn.QueryContext(probeCtx, query)
+		if err != nil {
+			log.Printf("OOM_TRACE %s elapsed=%s error=%v", label, time.Since(start), err)
+			return
+		}
+		values, err := core.ReadSQLResults(rows)
+		log.Printf("OOM_TRACE %s elapsed=%s rows=%d error=%v", label, time.Since(start), len(values), err)
+		if printValues {
+			for _, row := range values {
+				out := make([]string, len(row))
+				for i, v := range row {
+					if v != nil {
+						out[i] = *v
+					}
+				}
+				log.Printf("OOM_TRACE %s values=%q", label, out)
+			}
+		}
+	}
+	memory := func(label string) {
+		probe(label, "SELECT tag, memory_usage_bytes, temporary_storage_bytes FROM duckdb_memory() WHERE memory_usage_bytes > 0", true)
+	}
+	probe("settings", "SELECT name,value FROM duckdb_settings() WHERE name IN ('memory_limit','threads','enable_external_file_cache','parquet_metadata_cache','enable_http_metadata_cache')", true)
+	memory("memory_before")
+	probe("describe", "DESCRIBE "+original, false)
+	memory("memory_after_describe")
+	probe("baseline_threads8", original, false)
+	memory("memory_after_baseline")
+	for _, threads := range []int{1, 2, 4} {
+		_, err := e.conn.ExecContext(ctx, fmt.Sprintf("SET threads=%d", threads))
+		if err != nil {
+			log.Printf("OOM_TRACE set_threads error=%v", err)
+			continue
+		}
+		probe(fmt.Sprintf("query_threads%d", threads), original, false)
+		memory(fmt.Sprintf("memory_after_threads%d", threads))
+	}
+	probe("sample_json_lengths", `SELECT count(*), max(length(properties)), avg(length(properties)) FROM (SELECT properties FROM properties_perf.events_supported LIMIT 10000)`, true)
 }

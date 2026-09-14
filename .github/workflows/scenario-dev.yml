@@ -66,7 +66,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        scenario: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && fromJSON('["posthog_frozen_perf", "posthog_frozen_perf_trino_cached"]') || fromJSON(format('["{0}"]', inputs.scenario)) }}
+        scenario: ${{ (github.event_name == 'schedule') && fromJSON('["posthog_frozen_perf", "posthog_frozen_perf_trino_cached"]') || fromJSON(format('["{0}"]', inputs.scenario)) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 270
     env:
