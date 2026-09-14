@@ -736,6 +736,19 @@ allow if {
 	observer_nodes_table(input.action.resource.table)
 }
 
+# The provisioner reads catalog startup status without querying tenant data.
+allow if {
+	is_admin
+	input.action.operation == "SelectFromColumns"
+	table := input.action.resource.table
+	table.catalogName == "system"
+	table.schemaName == "metadata"
+	table.tableName == "catalogs"
+	every column in table.columns {
+		column in {"catalog_name", "state"}
+	}
+}
+
 # ---------------------------------------------------------------------------
 # Hard denies for customer principals.
 #
