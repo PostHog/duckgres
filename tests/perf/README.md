@@ -38,12 +38,12 @@ one protocol from changing another protocol's cache context.
 
 ### DuckDB cache comparison
 
-`posthog_frozen_perf` runs four separately labeled targets in one result set,
-in order: **`pgwire_uncached` (baseline)**, `pgwire_cached`, `trino`, `athena`.
+`posthog_frozen_perf` runs five separately labeled targets in one result set,
+in order: **`pgwire_uncached` (baseline)**, `pgwire_cached`, `trino`, `trino_cached`, `athena`.
 Both DuckDB variants use identical queries, worker resource requests, warmup
 counts, and measured iterations. Each variant finishes before the next begins.
-The baseline scenario runs Trino and Athena once. A separate cached-Trino scenario
-adds `trino_cached` without repeating the DuckDB/Athena targets. Legacy `pgwire` catalogs
+Dataset registration runs once and both Trino clusters share the same Hoglake
+catalog. Legacy `pgwire` catalogs
 keep their existing behavior and are not relabeled as uncached history.
 
 Only the perf driver changes cache settings. It pins its PGWire connection and
@@ -248,58 +248,61 @@ Optional artifact publisher:
 
 ### Cached Trino comparison
 
-The scheduled workflow and manual `posthog_frozen_perf` selection run the baseline
-and `posthog_frozen_perf_trino_cached` sequentially in separate throwaway namespaces.
-The latter measures only `trino_cached`, using the same registered DuckLake tables,
-SQL, one warm-up iteration and four measured iterations per query as the baseline.
-CSV/history rows retain the distinct `trino_cached` protocol label. To run only
-that variant, select `posthog_frozen_perf_trino_cached` manually.
+The scheduled workflow and manual `posthog_frozen_perf` selection run one scenario
+in one throwaway namespace. It provisions the dataset once, then measures all five
+targets sequentially into one result set. Both Trino targets use the same SQL,
+one warm-up iteration and four measured iterations per query. CSV/history rows
+retain the distinct `trino` and `trino_cached` protocol labels.
 
-Both clusters load the same Alluxio and memory cache managers. The provisioner sets
-`fs.cache.enabled=false` for the baseline catalog and `true` for the cached catalog.
+The harness deploys two Trino clusters with separate discovery services, catalog
+store cell IDs, and ephemeral cache volumes. They share tenant authentication,
+authorization, and the registered Hoglake dataset. The control plane provisions
+the baseline catalog with `fs.cache.enabled=false`. Before measurement the runner
+creates the same catalog on the second cluster, copying its properties with only
+`fs.cache.enabled=true`. It validates persisted properties by cell and catalog.
+Both clusters load the same Alluxio and memory cache managers.
 Each node has a 16GB disk-cache budget in a 20Gi ephemeral volume, with 64kB pages
-and a seven-day TTL. The cache persists between queries/iterations within a job;
-teardown removes it. Entries can be evicted, and a single warm-up does not guarantee
-every replica holds the complete working set. This measures a warmed, bounded
-filesystem cache, not a fully cached theoretical optimum. Worker CPU/memory limits
-remain three workers at 1 CPU/4Gi each; disk caching is additional storage.
+and a seven-day TTL. For connectors that use this cache, entries persist between
+queries/iterations until eviction or teardown; one warm-up does not guarantee
+every replica holds the complete working set. Worker CPU/memory limits remain
+three workers at 1 CPU/4Gi per cluster; cache volumes reserve additional storage.
 
-The pinned DuckLake connector uses filesystem caching for data and footer/index
-bytes, but does not opt into the separate coordinator heap metadata-cache tier.
-Loading the memory manager does not change that. No query-result cache is enabled:
-Trino still executes decoding and aggregation. The baseline is filesystem-cache-off,
-not a guarantee that JVM, OS, or storage-service caches are cold. Do not mix the two
-protocol labels in performance comparisons.
+The current frozen suite uses the pinned Hoglake connector, which ignores
+`fs.cache.enabled`; actual filesystem-cache support remains deferred. Thus
+`trino_cached` currently labels the requested configuration, not verified cache
+hits or a demonstrated cache benefit. Consolidating the scenario does not change
+that connector behavior. The baseline also does not guarantee cold JVM, OS, or
+storage-service caches. Keep the protocol labels separate in history.
 
 Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
 external-read/hit counters to distinguish storage traffic from cached reads.
 
 ## Published properties workload
 
-The existing frozen-perf scenarios take `DUCKGRES_SCENARIO_PROPERTIES_S3_URI`,
+The existing frozen-perf scenario takes `DUCKGRES_SCENARIO_PROPERTIES_S3_URI`,
 the generated Parquet directory, with no completion manifest requirement or
 new repository secret. `just prepare-properties-perf "$DUCKGRES_SCENARIO_PROPERTIES_S3_URI"`
 emits private SQL/catalog inputs to `/tmp/properties-perf` (optional second
 argument overrides it), using a five-minute timeout.
 
-Properties are the sole benchmark suite in these scenarios: registration and
+Properties are the sole benchmark suite in this scenario: registration and
 validation happen before their single `perf_queries` step. The original
 full-corpus benchmark phase is no longer run. Results use the existing `perf/`
 artifact location and scenario run ID.
 
 The catalog queries the entire selected dataset with one warmup and four measured
 iterations. The main scenario measures JSON with `duckgres (vanilla)`,
-`duckgres (cache)`, and `trino (vanilla)`, plus STRUCT with Athena. The separate
-cached-Trino scenario measures VARIANT as `trino (cache+variant)` without
-repeating the other four configurations. Cached Trino and Athena also use
+`duckgres (cache)`, and `trino (vanilla)`, plus STRUCT with Athena. The same
+scenario requests VARIANT as `trino (cache+variant)` on a separate cached Trino
+coordinator. Cached Trino and Athena also use
 untimed JSON correctness baselines.
 
 Hoglake's catalog `data_path` is initialized from the selected properties prefix
 so its registered Parquet files are inside the catalog's allowed location.
 Duckgres registers only JSON in both cache modes. Cached Trino still requires
-Hoglake VARIANT support; its current registration failure is isolated to its
-own job and does not prevent the main scenario's results from being collected.
-The workflow creates the Athena external table if missing and the main scenario
-verifies its mapping; cached Trino skips Athena configuration.
+Hoglake VARIANT support. The shared JSON setup does not register its VARIANT
+relation, so this target currently fails the shared correctness gate and can
+prevent measurements for all targets. The workflow creates the Athena external
+table if missing and the scenario verifies its mapping.
 See the [properties runbook](../../docs/runbooks/properties-perf.md) for workflow
 inputs, registration, execution, and recovery.

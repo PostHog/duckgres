@@ -129,6 +129,12 @@ budgets are not a hard deadline for stalled database calls.
 
 ## Local verification and recovery
 
+For opt-in shared-store blue/green cells, use the
+[shared catalog runbook](runbooks/trino-shared-catalogs.md). This mode freezes
+new provisioning before target startup and uses the Gateway's active route.
+It does not replay catalog CREATE statements on the standby. The static
+registry behavior documented above remains the default.
+
 Run `just test-trino`, `just test-trino-admin`, `just ui-test`, and `just lint`.
 The PostgreSQL-backed tests exercise initial-selection races against legacy
 claiming and enablement. The isolated Trino CI lane exercises the real query

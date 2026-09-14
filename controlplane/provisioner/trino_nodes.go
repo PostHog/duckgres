@@ -25,6 +25,10 @@ func (c *trinoCatalogHTTPClient) ListNodes(ctx context.Context) ([]TrinoNode, er
 	if err != nil {
 		return nil, fmt.Errorf("query Trino node inventory: %w", err)
 	}
+	return parseTrinoNodes(rows)
+}
+
+func parseTrinoNodes(rows [][]interface{}) ([]TrinoNode, error) {
 	nodes := make([]TrinoNode, 0, len(rows))
 	ids := make(map[string]bool, len(rows))
 	uris := make(map[string]bool, len(rows))

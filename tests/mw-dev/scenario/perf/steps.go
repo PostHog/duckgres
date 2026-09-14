@@ -27,13 +27,16 @@ type DriverFactory interface {
 }
 
 type ExecutorConfig struct {
-	TrinoCatalogStoreDSN string
-	ProvisionState       *provision.State
-	Connection           scenariosql.ConnectionConfig
-	OutputDir            string
-	DriverFactory        DriverFactory
-	State                *State
-	Now                  func() time.Time
+	TrinoCatalogStoreDSN   string
+	TrinoCachedURL         string
+	TrinoCachedCellID      string
+	TrinoAdminPasswordFile string
+	ProvisionState         *provision.State
+	Connection             scenariosql.ConnectionConfig
+	OutputDir              string
+	DriverFactory          DriverFactory
+	State                  *State
+	Now                    func() time.Time
 }
 
 type Executor struct {
@@ -83,13 +86,21 @@ type stepSpec struct {
 }
 
 type defaultDriverFactory struct {
-	trinoCatalogStoreDSN string
+	trinoCatalogStoreDSN   string
+	trinoCachedURL         string
+	trinoCachedCellID      string
+	trinoAdminPasswordFile string
 }
 
 func NewExecutor(cfg ExecutorConfig) *Executor {
 	factory := cfg.DriverFactory
 	if factory == nil {
-		factory = defaultDriverFactory{trinoCatalogStoreDSN: cfg.TrinoCatalogStoreDSN}
+		factory = defaultDriverFactory{
+			trinoCatalogStoreDSN:   cfg.TrinoCatalogStoreDSN,
+			trinoCachedURL:         cfg.TrinoCachedURL,
+			trinoCachedCellID:      cfg.TrinoCachedCellID,
+			trinoAdminPasswordFile: cfg.TrinoAdminPasswordFile,
+		}
 	}
 	state := cfg.State
 	if state == nil {
@@ -336,15 +347,6 @@ func restrictCatalogTargets(catalog perfcore.Catalog, targets []perfcore.Protoco
 		targets = catalog.Targets
 	}
 
-	var hasTrino, hasTrinoCached bool
-	for _, target := range targets {
-		hasTrino = hasTrino || target == perfcore.ProtocolTrino
-		hasTrinoCached = hasTrinoCached || target == perfcore.ProtocolTrinoCached
-	}
-	if hasTrino && hasTrinoCached {
-		return perfcore.Catalog{}, fmt.Errorf("trino and trino_cached require separate deployments; select one mode with with.targets")
-	}
-
 	available := make(map[perfcore.Protocol]struct{}, len(catalog.Targets))
 	for _, target := range catalog.Targets {
 		available[target] = struct{}{}
@@ -456,14 +458,15 @@ func (e *Executor) trinoConnection(spec stepSpec) (trinodriver.ConnectionConfig,
 		return trinodriver.ConnectionConfig{}, classified(ErrorClassConfig, fmt.Errorf("trino readiness state for org %q has no principal or catalog", spec.OrgID))
 	}
 	return trinodriver.ConnectionConfig{
-		ServerURL:  status.Cell.CoordinatorURL,
-		Username:   status.Status.Principal,
-		Password:   spec.Password,
-		Catalog:    status.Status.Catalog,
-		Schema:     spec.TrinoSchema,
-		Source:     "duckgres-perf",
-		CACertFile: spec.TrinoCACertFile,
-		Startup:    spec.TrinoStartup,
+		ServerURL:          status.Cell.CoordinatorURL,
+		CatalogStoreCellID: status.Cell.ID,
+		Username:           status.Status.Principal,
+		Password:           spec.Password,
+		Catalog:            status.Status.Catalog,
+		Schema:             spec.TrinoSchema,
+		Source:             "duckgres-perf",
+		CACertFile:         spec.TrinoCACertFile,
+		Startup:            spec.TrinoStartup,
 	}, nil
 }
 
@@ -513,9 +516,17 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, p
 }
 
 func (f defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
-	if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, connection.Protocol); err != nil {
+	if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, perfcore.ProtocolTrino, connection.CatalogStoreCellID); err != nil {
 		return nil, err
 	}
+	if connection.Protocol == perfcore.ProtocolTrinoCached {
+		if err := f.prepareCachedCatalog(ctx, connection); err != nil {
+			return nil, err
+		}
+		connection.ServerURL = f.trinoCachedURL
+		connection.CatalogStoreCellID = f.trinoCachedCellID
+	}
+
 	return trinodriver.New(ctx, connection)
 }
 

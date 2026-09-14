@@ -80,7 +80,7 @@ func resolveTrinoCells() ([]trinoCell, error) {
 		if !registryOnly && entry.Namespace == legacyNS {
 			return nil, errors.New("registered cell must not share the legacy namespace")
 		}
-		cell := trinoCell{ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends}
+		cell := trinoCell{ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, RoutingGroup: entry.RoutingGroup, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends, CatalogManagement: entry.CatalogManagement}
 		for _, backend := range entry.Backends {
 			endpoint, _ := trinoEndpointKey(backend.CoordinatorURL)
 			if !registryOnly && endpoint == legacyEndpoint {
@@ -96,11 +96,12 @@ func resolveTrinoCells() ([]trinoCell, error) {
 }
 
 type trinoRegisteredCell struct {
-	ID           string                   `json:"id"`
-	Namespace    string                   `json:"namespace"`
-	ClientURL    string                   `json:"client_url"`
-	RoutingGroup string                   `json:"routing_group"`
-	Backends     []trinoRegisteredBackend `json:"backends"`
+	CatalogManagement string                   `json:"catalog_management,omitempty"`
+	ID                string                   `json:"id"`
+	Namespace         string                   `json:"namespace"`
+	ClientURL         string                   `json:"client_url"`
+	RoutingGroup      string                   `json:"routing_group"`
+	Backends          []trinoRegisteredBackend `json:"backends"`
 }
 
 type trinoRegisteredBackend struct {
@@ -132,6 +133,12 @@ func parseTrinoCellRegistry(data []byte) ([]trinoRegisteredCell, error) {
 	}
 	identities, namespaces, groups, endpoints := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
 	for _, cell := range registry.Cells {
+		if cell.CatalogManagement != "" && cell.CatalogManagement != "paused" && cell.CatalogManagement != "gateway-shared" {
+			return nil, errors.New("unsupported Trino catalog management mode")
+		}
+		if cell.CatalogManagement != "" && (len(cell.Backends) != 2 || cell.Backends[0].ID == cell.Backends[1].ID || (cell.Backends[0].ID != "blue" && cell.Backends[0].ID != "green") || (cell.Backends[1].ID != "blue" && cell.Backends[1].ID != "green")) {
+			return nil, errors.New("managed Trino cell requires exactly blue and green slots")
+		}
 		if cell.ID == "legacy" || len(validation.IsDNS1123Label(cell.ID)) != 0 {
 			return nil, errors.New("Trino cell identity must be a DNS label other than legacy")
 		}

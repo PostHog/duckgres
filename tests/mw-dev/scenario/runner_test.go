@@ -81,8 +81,11 @@ func TestScenarioRunner(t *testing.T) {
 	})
 	scenarioOutputDir := filepath.Join(*scenarioOutputBase, runID)
 	perfExecutor := scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{
-		TrinoCatalogStoreDSN: os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN"),
-		ProvisionState:       provisionState,
+		TrinoCatalogStoreDSN:   os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN"),
+		TrinoCachedURL:         os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_URL"),
+		TrinoCachedCellID:      os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID"),
+		TrinoAdminPasswordFile: os.Getenv("DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE"),
+		ProvisionState:         provisionState,
 		Connection: scenariosql.ConnectionConfig{
 			DialHost:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
 			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),
@@ -761,8 +764,8 @@ func assertPerfTargetsOnlyPGWire(t *testing.T, step core.Step) {
 func assertPerfTargetsPGWireTrinoAndAthena(t *testing.T, step core.Step) {
 	t.Helper()
 	targets, ok := step.With["targets"].([]any)
-	if !ok || len(targets) != 4 || targets[0] != "pgwire_uncached" || targets[1] != "pgwire_cached" || targets[2] != "trino" || targets[3] != "athena" {
-		t.Fatalf("perf step %s targets = %#v, want [pgwire_uncached pgwire_cached trino athena]", step.ID, step.With["targets"])
+	if !ok || len(targets) != 5 || targets[0] != "pgwire_uncached" || targets[1] != "pgwire_cached" || targets[2] != "trino" || targets[3] != "trino_cached" || targets[4] != "athena" {
+		t.Fatalf("perf step %s targets = %#v, want [pgwire_uncached pgwire_cached trino trino_cached athena]", step.ID, step.With["targets"])
 	}
 }
 

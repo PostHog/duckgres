@@ -84,6 +84,49 @@ code="$(curl --connect-timeout 5 --max-time 30 -sS -o /tmp/trino-cell-selection-
 
 TRINO="$BLUE_TRINO"
 wait_cell_auth
+
+log "read-only rollout readiness with a private fixture canary"
+rollout_token="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+if [ "${TRINO_SHARED_CATALOGS_ENABLED:-false}" = true ]; then
+  rollout_token="$("$KUBECTL" -n "$NS" get secret trino-shared-gateway -o json | jq -r '.data["admin-token"]' | base64 -d)"
+  [ "${#rollout_token}" -ge 32 ] || fail "isolated Gateway token is missing"
+fi
+canaries="$(jq -cn --arg org "$ORG_C" --arg principal "$DB_C" --arg password "$pw_c" \
+  '{canaries:[{cell:"cell-test",orgID:$org,principal:$principal,password:$password}]}')"
+printf %s "$canaries" | jq -Rs --arg token "$rollout_token" --arg ns "$NS" \
+  '{apiVersion:"v1",kind:"Secret",metadata:{name:"trino-rollout-readiness",namespace:$ns},stringData:{"token":$token,"canaries.json":.}}' \
+  | "$KUBECTL" -n "$NS" create -f - >/dev/null \
+  || fail "could not install private fixture readiness credentials"
+unset canaries
+snapshot_control_plane_pods
+"$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"controlplane","env":[{"name":"DUCKGRES_TRINO_ROLLOUT_TOKEN_FILE","value":"/etc/duckgres/trino-rollout/token"},{"name":"DUCKGRES_TRINO_ROLLOUT_CANARIES_FILE","value":"/etc/duckgres/trino-rollout/canaries.json"}],"volumeMounts":[{"name":"trino-rollout-readiness","mountPath":"/etc/duckgres/trino-rollout","readOnly":true}]}],"volumes":[{"name":"trino-rollout-readiness","secret":{"secretName":"trino-rollout-readiness"}}]}}}}' >/dev/null
+wait_control_plane_rollout
+rollout_readiness() {
+  curl --connect-timeout 5 --max-time 15 -fsS -H "X-Gateway-Transaction-Admin-Token: $rollout_token" \
+    "$API/internal/trino/rollout-readiness/cell-test/$1"
+}
+wait_rollout_warm() {
+  readiness_color="$1"
+  readiness_attempt=0
+  while [ "$readiness_attempt" -lt 36 ]; do
+    if readiness_body="$(rollout_readiness "$readiness_color" 2>/dev/null)" && \
+       printf %s "$readiness_body" | jq -e --arg color "$readiness_color" \
+       '.schemaVersion == 1 and .cell == "cell-test" and .routingGroup == "cell-test" and .color == $color and .backendName == ("cell-test-" + $color) and .pods.total == 2 and .pods.readyCoordinators == 1 and .pods.readyWorkers == 1 and .pods.terminating == 0 and (.pods.images | length > 0) and all(.pods.images[]; (.specImage | contains("@sha256:")) and (.runtimeImageID | length > 0)) and (.coordinator.nodeId | length > 0) and (.coordinator.coordinatorId | length == 5) and .coordinator.registeredWorkers == 1 and .canary.authenticated == true and .canary.catalogMetadataRead == true' >/dev/null; then
+      return 0
+    fi
+    sleep 5
+    readiness_attempt=$((readiness_attempt + 1))
+  done
+  fail "rollout warm readiness did not converge"
+}
+code="$(curl --connect-timeout 5 --max-time 15 -sS -o /dev/null -w '%{http_code}' -H "$H" \
+  "$API/internal/trino/rollout-readiness/cell-test/blue")"
+[ "$code" = 401 ] || fail "general API credentials must not grant rollout readiness"
+rollout_readiness green | jq -e '.pods.total == 0 and .coordinator == null and .canary == null' >/dev/null \
+  || fail "stopped green must report only pod absence"
+wait_rollout_warm blue
+
 trino_query "$DB_C" "$pw_c" "CREATE SCHEMA $CAT_C.cell_test" >/dev/null
 trino_query "$DB_C" "$pw_c" "CREATE TABLE $CAT_C.cell_test.values_test (value BIGINT)" >/dev/null
 trino_query "$DB_C" "$pw_c" "INSERT INTO $CAT_C.cell_test.values_test VALUES (7),(11)" >/dev/null
@@ -132,6 +175,7 @@ done
 wait_cell_ready
 TRINO="$GREEN_TRINO"
 wait_cell_auth
+wait_rollout_warm green
 result="$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")"
 [ "$result" = '[[2,18]]' ] || fail "green failed to hydrate its independent catalog from the same DuckLake warehouse"
 must_fail "$DB_A" "$pw_a" 'SELECT 1' '401|Unauthorized|Authentication|credentials'

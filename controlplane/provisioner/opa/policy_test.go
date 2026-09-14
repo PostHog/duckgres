@@ -1817,7 +1817,7 @@ func TestSystemNodesGrantExcludesTenants(t *testing.T) {
 	}
 }
 
-func TestTrinoProvisionerReadsOnlySystemRuntimeNodes(t *testing.T) {
+func TestTrinoProvisionerReadsOnlySystemReadinessInventories(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 	if !evalAllow(t, q, buildInput(AdminPrincipal, "AccessCatalog", catalogResource("system"))) {
 		t.Error("provisioner must reach system for worker readiness inventory")
@@ -1829,7 +1829,6 @@ func TestTrinoProvisionerReadsOnlySystemRuntimeNodes(t *testing.T) {
 		{"system", "runtime", "queries"},
 		{"system", "runtime", "tasks"},
 		{"system", "runtime", "transactions"},
-		{"system", "metadata", "catalogs"},
 		{"system", "jdbc", "tables"},
 		{"system", "information_schema", "tables"},
 		{"system", "other", "nodes"},
@@ -1855,6 +1854,26 @@ func TestTrinoProvisionerReadsOnlySystemRuntimeNodes(t *testing.T) {
 		if evalAllow(t, q, buildInputWithGroups(identity.user, identity.groups, "AccessCatalog", catalogResource("system"))) ||
 			evalAllow(t, q, buildInputWithGroups(identity.user, identity.groups, "SelectFromColumns", tableResource("system", "runtime", "nodes"))) {
 			t.Errorf("incomplete provisioner identity must not receive node inventory access: %s", identity.user)
+		}
+	}
+}
+
+func TestTrinoProvisionerCatalogStatesAreNarrow(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+	for _, tc := range []struct {
+		user    string
+		columns []string
+		allowed bool
+	}{
+		{AdminPrincipal, []string{"catalog_name", "state"}, true},
+		{AdminPrincipal, []string{"connector_name"}, false},
+		{ObserverPrincipal, []string{"catalog_name", "state"}, false},
+		{"42", []string{"catalog_name", "state"}, false},
+	} {
+		resource := tableResource("system", "metadata", "catalogs")
+		resource["table"].(map[string]interface{})["columns"] = tc.columns
+		if actual := evalAllow(t, q, buildInput(tc.user, "SelectFromColumns", resource)); actual != tc.allowed {
+			t.Fatalf("catalog inventory permission for %s = %v, expected %v", tc.user, actual, tc.allowed)
 		}
 	}
 }
