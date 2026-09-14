@@ -584,6 +584,10 @@ func (p *K8sWorkerPool) workerPodEnv(secretName string, workerResources corev1.R
 			Value: "true",
 		},
 	}
+	// Pass the opt-in diagnostic switch to workers in this experiment.
+	if os.Getenv("DUCKGRES_STALL_DIAGNOSTICS") == "1" {
+		env = append(env, corev1.EnvVar{Name: "DUCKGRES_STALL_DIAGNOSTICS", Value: "1"})
+	}
 	// Pre-session memory hygiene. Without an explicit DUCKGRES_MEMORY_LIMIT the
 	// worker's ConfigureMainDB falls back to sysinfo.AutoMemoryLimit(), which
 	// reads the NODE's /proc/meminfo — so all pre-session work (DuckLake

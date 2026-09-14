@@ -22,6 +22,7 @@ import (
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/internal/crashhandler"
+	"github.com/posthog/duckgres/internal/stalldiagnostics"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -41,6 +42,7 @@ func buildInfo() cliboot.BuildInfo {
 }
 
 func main() {
+	stalldiagnostics.Install()
 	// Ignore SIGPIPE so DuckDB's C++ code (and libraries like libpq used by
 	// DuckLake) don't crash the process when a network connection drops
 	// mid-query. Same rationale as the all-in-one binary.

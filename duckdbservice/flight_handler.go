@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	bindings "github.com/duckdb/duckdb-go-bindings"
 	"github.com/posthog/duckgres/internal/cliboot"
+	"github.com/posthog/duckgres/internal/stalldiagnostics"
 	"github.com/posthog/duckgres/server"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -604,6 +605,8 @@ func (h *FlightSQLHandler) doLogQuery(body []byte, stream flight.FlightService_D
 
 func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery,
 	desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	finishInfoDiagnostic := stalldiagnostics.Begin("get_flight_info")
+	defer finishInfoDiagnostic()
 
 	session, err := h.sessionFromContext(ctx)
 	if err != nil {
@@ -689,6 +692,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 	// would run in autocommit mode and mask the failure.
 	inTransaction := tx != nil || session.sqlTxActive.Load()
 	var schema *arrow.Schema
+	finishSchemaDiagnostic := stalldiagnostics.Begin("schema_discovery")
 	if inTransaction {
 		schema, err = session.getQuerySchema(ctx, query, tx)
 	} else {
@@ -720,6 +724,7 @@ func (h *FlightSQLHandler) GetFlightInfoStatement(ctx context.Context, cmd fligh
 			},
 		)
 	}
+	finishSchemaDiagnostic()
 	if err != nil {
 		if closedErr := sessionClosedStatus(err); closedErr != nil {
 			return nil, closedErr
@@ -800,6 +805,8 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		endConnWork = func() {}
 	}
 	go func() {
+		finishStreamDiagnostic := stalldiagnostics.Begin("doget_stream")
+		defer finishStreamDiagnostic()
 		defer close(ch)
 		defer func() {
 			releaseQueryHandleValue(handle)
@@ -826,6 +833,8 @@ func (h *FlightSQLHandler) DoGetStatement(ctx context.Context, ticket flightsql.
 		var closeRows func() error
 		execStartedAt := clearProfilingOutput()
 		queryFn := func() (*sql.Rows, error) {
+			finishQueryDiagnostic := stalldiagnostics.Begin("doget_query_rows")
+			defer finishQueryDiagnostic()
 			rows, closer, err := session.queryRows(ctx, tx, handle.Query)
 			if err != nil {
 				return nil, err

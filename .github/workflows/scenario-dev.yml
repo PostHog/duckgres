@@ -30,6 +30,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  debugger-image:
+    uses: ./.github/workflows/_image-build.yml
+    with:
+      dockerfile: experiments/stall-debugger/Dockerfile
+      image-name: duckgres-prs
+      tag: stall-debugger-${{ github.run_id }}-arm64
+      platform: linux/arm64
+      cache-scope: stall-debugger-arm64
+    secrets:
+      ecr-role: ${{ vars.AWS_ECR_PRS_PUBLISH_IAM_ROLE }}
+
   scenario-runner-image:
     uses: ./.github/workflows/_image-build.yml
     with:
@@ -63,7 +74,7 @@ jobs:
     needs: [scenario-runner-image, duckgres-image]
     if: ${{ always() && needs.scenario-runner-image.result == 'success' && (needs.duckgres-image.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.duckgres_image != '')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 270
+    timeout-minutes: 60
     env:
       SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}
       SCENARIO_RUNNER_IMAGE: ${{ needs.scenario-runner-image.outputs.image }}
@@ -81,8 +92,8 @@ jobs:
       E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
-      DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
-      DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
+      DUCKGRES_SCENARIO_MAX_RUNTIME: 30m
+      DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 35m
       # Add process headroom for repeated full-dataset pgwire aggregates.
       DUCKGRES_K8S_WORKER_CPU_REQUEST: "3"
       DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 64Gi

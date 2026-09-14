@@ -366,6 +366,7 @@ spec:
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU, value: "8" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MIN_MEMORY, value: "2Gi" }
             - { name: DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY, value: "64Gi" }
+            - { name: DUCKGRES_STALL_DIAGNOSTICS, value: "1" }
             # Prod-logic parity (sizes differ, the knobs match prod-us):
             # - workerQueueTimeout bounds how long a connection waits for its
             #   on-demand cold spawn (binary default 60s is too tight for a

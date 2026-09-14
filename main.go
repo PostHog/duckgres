@@ -18,6 +18,7 @@ import (
 	"github.com/posthog/duckgres/duckdbservice"
 	"github.com/posthog/duckgres/internal/cliboot"
 	"github.com/posthog/duckgres/internal/crashhandler"
+	"github.com/posthog/duckgres/internal/stalldiagnostics"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -58,6 +59,7 @@ func validateRunMode(mode string) error {
 }
 
 func main() {
+	stalldiagnostics.Install()
 	// Ignore SIGPIPE to prevent DuckDB's C++ code (and libraries like libpq
 	// inside DuckLake) from crashing the process when a network connection
 	// drops mid-query. Go already converts EPIPE to errors on Write; the
