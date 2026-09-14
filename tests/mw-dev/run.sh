@@ -35,6 +35,25 @@ case "$E2E_SUITE" in
   neutral|duckdb|trino|reshard) ;;
   *) echo "E2E_SUITE must be neutral, duckdb, trino, or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
 esac
+TRINO_SHARED_CATALOGS_ENABLED="${TRINO_SHARED_CATALOGS_ENABLED:-false}"
+TRINO_GATEWAY_IMAGE="${TRINO_GATEWAY_IMAGE:-}"
+case "$TRINO_SHARED_CATALOGS_ENABLED" in
+  false) ;;
+  true)
+    case "${1:-}" in
+      teardown|e2e-cleanup|diagnostics) ;;
+      *)
+        if [ "$E2E_SUITE" != trino ] || [ "$SCENARIO_NAME" != full-suite ]; then
+          echo "Shared catalogs require the full-suite Trino lane" >&2; exit 2
+        fi
+        if ! [[ "$TRINO_GATEWAY_IMAGE" =~ ^[a-zA-Z0-9./:_-]+@sha256:[a-f0-9]{64}$ ]]; then
+          echo "Shared catalogs require a digest-pinned candidate Gateway image" >&2; exit 2
+        fi
+        ;;
+    esac
+    ;;
+  *) echo "TRINO_SHARED_CATALOGS_ENABLED must be true or false" >&2; exit 2 ;;
+esac
 # Frozen perf requires the Hoglake connector; other E2E lanes retain their pin.
 if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:f3bddd334a9e08f54788779ec7c723b8c296765a@sha256:9a4bf1293d0b4b73aa3b46c16bf014ed22bb9fc12b8ea28617cfed06534c8f2d}"
@@ -103,6 +122,10 @@ trino_multicell_enabled() {
 
 render_trino_backend() {
   local color="$1"
+  local forwarded_config=""
+  if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then
+    forwarded_config=$'s/^    http-server.https.port=8443$/&\\\n    http-server.process-forwarded=true/'
+  fi
   TRINO_CA_CERT_B64="$(base64 < "$trino_ca_cert_file" | tr -d '\n')" \
   TRINO_SERVER_P12_B64="$(base64 < "$trino_server_p12_file" | tr -d '\n')" \
   TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
@@ -122,7 +145,8 @@ render_trino_backend() {
       -e "s/node.environment=ci_pr_$PR_NUMBER/node.environment=ci_pr_${PR_NUMBER}_$color/" \
       -e "s/duckgres-config-store\.$TRINO_CELL_NS\.svc/duckgres-config-store.$NS.svc/g" \
       -e "s/duckgres-control-plane\.$TRINO_CELL_NS\.svc/duckgres-control-plane.$NS.svc/g" \
-      -e 's@resource: /bundles/trino$@resource: /bundles/trino/cell-test@'
+      -e 's@resource: /bundles/trino$@resource: /bundles/trino/cell-test@' \
+      -e "$forwarded_config"
 }
 
 # Reuse the baseline template so both clusters retain identical resource budgets.
@@ -170,6 +194,30 @@ render_trino_multicell() {
       < "$HERE/trino-multicell.tmpl.yaml"
   render_trino_backend blue
   render_trino_backend green
+  if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then render_trino_gateway; fi
+}
+
+render_trino_gateway() {
+  local key
+  for key in admin-token identity-key; do
+    [ -s "$secret_dir/gateway-$key" ] || (umask 077; openssl rand -hex 32 > "$secret_dir/gateway-$key")
+  done
+  if [ ! -s "$secret_dir/gateway-private.pem" ]; then
+    (umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$secret_dir/gateway-private.pem")
+  fi
+  (umask 077; openssl pkey -in "$secret_dir/gateway-private.pem" -pubout -out "$secret_dir/gateway-public.pem")
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    for key in admin-token identity-key; do printf '::add-mask::%s\n' "$(cat "$secret_dir/gateway-$key")" >&2; done
+  fi
+  TRINO_GATEWAY_ADMIN_TOKEN="$(cat "$secret_dir/gateway-admin-token")" \
+  TRINO_GATEWAY_IDENTITY_KEY="$(cat "$secret_dir/gateway-identity-key")" \
+  TRINO_GATEWAY_PRIVATE_KEY="$(sed 's/^/    /' "$secret_dir/gateway-private.pem")" \
+  TRINO_GATEWAY_PUBLIC_KEY="$(sed 's/^/    /' "$secret_dir/gateway-public.pem")" \
+  CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
+  TRINO_GATEWAY_IMAGE="$TRINO_GATEWAY_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
+  NAMESPACE="$NS" TRINO_CELL_NAMESPACE="$TRINO_CELL_NS" PR_NUMBER="$PR_NUMBER" \
+    envsubst '$NAMESPACE $TRINO_CELL_NAMESPACE $PR_NUMBER $TRINO_GATEWAY_ADMIN_TOKEN $TRINO_GATEWAY_IDENTITY_KEY $TRINO_GATEWAY_PRIVATE_KEY $TRINO_GATEWAY_PUBLIC_KEY $CONFIG_STORE_PASSWORD $TRINO_GATEWAY_IMAGE $TRINO_TLS_PASSWORD' \
+      < "$HERE/trino-gateway.tmpl.yaml"
 }
 
 trino_cell_namespace_uid() {
@@ -239,7 +287,14 @@ ensure_trino_tls() {
   if trino_multicell_enabled; then
     sans="$sans,DNS:duckgres-trino-blue.$TRINO_CELL_NS.svc,DNS:duckgres-trino-green.$TRINO_CELL_NS.svc"
   fi
+  if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then
+    sans="$sans,DNS:duckgres-trino-gateway.$NS.svc"
+  fi
   if [ -s "$trino_ca_cert_file" ] && [ -s "$trino_server_p12_file" ]; then
+    if [ "$TRINO_SHARED_CATALOGS_ENABLED" = true ]; then
+      openssl verify -CAfile "$trino_ca_cert_file" -verify_hostname "duckgres-trino-gateway.$NS.svc" "$trino_server_cert_file" >/dev/null \
+        || { echo "Existing test certificate does not cover the Gateway; use a fresh private test directory." >&2; return 1; }
+    fi
     return
   fi
   # Per-run CA and leaf: password auth stays on verified HTTPS without sharing
@@ -402,7 +457,7 @@ drop_cnpg_role() { # org-id
 # (harness.sh main()). Keep in sync with harness.sh.
 ci_orgs() { # pr-number
   local pr="$1"
-  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2 ci-pr-${pr}-trinoa ci-pr-${pr}-trinob ci-pr-${pr}-trinoc"
+  echo "ci-pr-${pr}-cnpg ci-pr-${pr}-res1 ci-pr-${pr}-res2 ci-pr-${pr}-trinoa ci-pr-${pr}-trinob ci-pr-${pr}-trinoc ci-pr-${pr}-trinod"
 }
 
 delete_ci_ducklings() { # pr-number
@@ -554,6 +609,7 @@ cmd_test_e2e() {
   "${KUBECTL[@]}" -n "$NS" create configmap duckgres-harness \
     --from-file=harness.sh="$harness_file" \
     --from-file=trino-multicell.sh="$HERE/e2e/trino-multicell.sh" \
+    --from-file=trino-shared-catalogs.sh="$HERE/e2e/trino-shared-catalogs.sh" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply --server-side --force-conflicts -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
@@ -595,6 +651,7 @@ spec:
             - { name: E2E_SUITE, value: "$E2E_SUITE" }
             - { name: TRINO_CELL_NAMESPACE, value: "$TRINO_CELL_NS" }
             - { name: TRINO_MULTICELL_ENABLED, value: "$TRINO_MULTICELL_ENABLED" }
+            - { name: TRINO_SHARED_CATALOGS_ENABLED, value: "$TRINO_SHARED_CATALOGS_ENABLED" }
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
             - { name: INTERNAL_SECRET_FALLBACK, value: "$INTERNAL_SECRET_FALLBACK" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }

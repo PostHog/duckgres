@@ -313,5 +313,8 @@ trino_query "$DB_A" "$pw_a" "DROP TABLE $CAT_A.$schema.$writes" >/dev/null
 trino_query "$DB_A" "$pw_a" "DROP SCHEMA $CAT_A.$schema" >/dev/null
 if [ "${TRINO_MULTICELL_ENABLED:-false}" = true ]; then
   . /harness/trino-multicell.sh
+  if [ "${TRINO_SHARED_CATALOGS_ENABLED:-false}" = true ]; then
+    . /harness/trino-shared-catalogs.sh
+  fi
 fi
 log "PASS: isolated Trino provisioning + verified auth + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable"

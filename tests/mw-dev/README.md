@@ -812,3 +812,59 @@ IDs, TLS service names, auth projections, and cache-manager configuration. Run
 `tests/mw-dev/run.sh diagnostics`, then the normal `teardown`, and redeploy a fresh
 namespace before retrying. Namespace teardown removes both clusters, cached
 catalog rows in the throwaway database, and all ephemeral cache volumes.
+
+### Optional shared catalog rollout lane
+
+`TRINO_SHARED_CATALOGS_ENABLED=true` adds an isolated, real Gateway to the
+`E2E_SUITE=trino`, `SCENARIO_NAME=full-suite` fixture. The default remains false;
+the existing static multicell tests still run first. This option requires:
+
+- A control-plane image with the managed shared-catalog runtime, lifecycle store,
+  provisioning freeze/release endpoints, and readiness endpoint.
+- `TRINO_GATEWAY_IMAGE` containing an explicit `@sha256:` digest from a build
+  with fenced rollout administration. A mutable tag is rejected before any cluster
+  operation. Verify the image's source revision before supplying its digest.
+- A fresh private `DUCKGRES_CI_SECRET_DIR`, so the per-run TLS certificate includes
+  the isolated Gateway service. Existing certificates without this identity fail
+  closed. No customer credentials or production secrets are reused.
+
+Set those variables on the existing `run.sh deploy` and `run.sh test-e2e` commands,
+using the same disposable namespace, PR identity, and explicit test context as the
+normal fixture. The regular CI lane does not automatically enable this option.
+The Gateway PR's Docker check alone is not a published-image prerequisite: the
+main-only image publisher must have produced the reviewed candidate first, or a
+separately reviewed build must supply that exact source as a digest-pinned image.
+
+The optional lane pauses catalog management, waits for old control-plane pods to
+terminate, stops green, and points green at blue's persisted catalog identity.
+It then exercises the actual Gateway operation and control-plane admission APIs:
+
+1. Freeze admission before starting green. A newly enabled fixture warehouse
+   cannot become Ready or create a catalog while frozen.
+2. Start green from zero pods. Its startup reads the shared catalog without
+   changing the existing row's version, properties, or update timestamp.
+3. Require the prepared certificate to match the target's actual process and
+   admitted roster, then query existing DuckLake data on green.
+4. Cut over and release admission. The new warehouse becomes Ready only on green;
+   the still-running blue coordinator does not gain its catalog.
+5. Drain and seal blue, require actual pod absence, and complete the operation.
+
+Before and after cutover, warehouse DuckLake queries pass through the real
+Gateway. An administrator's node query must identify the active coordinator.
+Every advertised continuation must remain on the verified Gateway origin; the
+harness rejects direct-backend or foreign-host continuations before sending
+credentials. The two fixture coordinators enable forwarded-header processing
+only when this option is selected; the legacy fixture remains unchanged.
+
+The Gateway uses its own schema in the disposable PostgreSQL database. Generated
+Gateway keys, signing material, and the dedicated fixture canary remain Kubernetes
+Secrets. No mock Gateway is accepted for this lane. The publication evidence is
+synthetic because this test does not create Git branches or PRs; native Kargo/Git
+publication safety is covered separately. This lane does not claim transaction
+affinity or load-test coverage.
+
+On failure, retain only redacted diagnostics and use the normal fixture teardown.
+Do not clear a held catalog mutation or bypass the freeze to make a test pass.
+The additional fixture warehouse is included in the existing cleanup inventory.
+Local `just test-mw-fixtures` validates opt-in checks, real rendering, and shell
+request construction; it is not proof that this real-cluster lane has executed.

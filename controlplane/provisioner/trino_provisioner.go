@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"golang.org/x/crypto/bcrypt"
@@ -230,6 +231,7 @@ type TrinoCatalogClient interface {
 // needs. Each is required at construction time — partial wiring would
 // cause silent reconcile no-ops, which we'd rather surface at startup.
 type TrinoProvisionerOpts struct {
+	ManagedCatalogs *TrinoManagedCatalogOpts
 	// Store is the cross-cutting Trino read/write surface.
 	Store TrinoStore
 
@@ -399,6 +401,7 @@ type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingSta
 // fires on first install; thereafter ensureClusterSecrets adopts the
 // existing K8s Secrets.
 type TrinoProvisioner struct {
+	managed                 *TrinoManagedCatalogOpts
 	store                   TrinoStore
 	bootstrapSentinel       TrinoBootstrapSentinelStore
 	warehouses              TrinoWarehouseStore
@@ -521,7 +524,8 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if secretReadiness == nil {
 		secretReadiness = NewKubernetesTrinoSecretReadiness(opts.Kubernetes, nil)
 	}
-	return &TrinoProvisioner{
+	result := &TrinoProvisioner{
+		managed:                 opts.ManagedCatalogs,
 		store:                   opts.Store,
 		bootstrapSentinel:       opts.BootstrapSentinel,
 		warehouses:              opts.Warehouses,
@@ -542,7 +546,13 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		s3MaxConnections:        maxConns,
 		filesystemCacheEnabled:  opts.FilesystemCacheEnabled,
 		hoglakeURI:              opts.HoglakeURI,
-	}, nil
+	}
+	if opts.ManagedCatalogs != nil {
+		if err := result.ConfigureManagedCatalogs(opts.ManagedCatalogs); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
 }
 
 // CellID reports the Trino cell this provisioner owns. Exposed for
@@ -572,6 +582,28 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	//    admin lines from. The next tick retries.
 	if _, err := p.ensureClusterSecrets(ctx); err != nil {
 		return fmt.Errorf("ensure trino cluster secrets: %w", err)
+	}
+	var managedLease *configstore.TrinoCellLease
+	managedFollower := false
+	if p.managed != nil && !p.managed.Paused {
+		var acquired bool
+		var err error
+		managedLease, acquired, err = p.managed.Store.BeginTrinoCellReconcile(ctx, p.cellID, uuid.NewString())
+		if err != nil {
+			return err
+		}
+		if !acquired {
+			managedFollower = true
+			managedLease = nil
+		} else {
+			defer func() {
+				finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+				defer cancel()
+				if err := p.managed.Store.FinishTrinoCellReconcile(finishCtx, *managedLease); err != nil {
+					slog.Error("Could not confirm managed Trino ownership release.", "cell", p.cellID)
+				}
+			}()
+		}
 	}
 
 	allOrgs, err := p.store.ListTrinoEnabledOrgs()
@@ -643,6 +675,9 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	if tenantErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile tenant secrets: %w", tenantErr))
 	}
+	if p.managed != nil && (p.managed.Paused || managedFollower) {
+		return errors.Join(errs...)
+	}
 
 	// 5. Catalogs (REST). Per-org idempotent CREATE; orgs disabled
 	//    since last tick get DROP. Runs last so all the prerequisite
@@ -669,7 +704,17 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	var catalogOutcomes map[string]catalogOutcome
 	if globalErr == nil {
 		var catErr error
-		catalogOutcomes, catErr = p.reconcileCatalogs(ctx, projectable, tenants)
+		if managedLease != nil {
+			catalogOutcomes, catErr = p.managedCatalogs(ctx, *managedLease, projectable, tenants)
+			if catErr != nil && catalogOutcomes == nil {
+				catalogOutcomes = make(map[string]catalogOutcome, len(projectable))
+				for _, org := range projectable {
+					catalogOutcomes[org.OrgID] = catalogOutcome{Err: catErr}
+				}
+			}
+		} else {
+			catalogOutcomes, catErr = p.reconcileCatalogs(ctx, projectable, tenants)
+		}
 		if catErr != nil {
 			errs = append(errs, fmt.Errorf("reconcile catalogs: %w", catErr))
 		}
@@ -694,7 +739,22 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("org %s: %w", orgID, err))
 		}
 	}
-	p.writePerOrgStates(orgs, catalogOutcomes, globalErr)
+	if managedLease == nil {
+		p.writePerOrgStates(orgs, catalogOutcomes, globalErr)
+	} else {
+		previous := make(map[string]configstore.TrinoEnabledOrg, len(orgs))
+		for _, org := range orgs {
+			previous[org.OrgID] = org
+		}
+		p.writePerOrgStates(orgs, catalogOutcomes, globalErr, func(org string, update configstore.TrinoStateUpdate) error {
+			if previous[org].State == configstore.ManagedWarehouseStateReady && globalErr == nil && collisions[org] == nil && tenants.failed[org] == nil && tenants.projected[org] {
+				update.State = configstore.ManagedWarehouseStateReady
+				update.FailedAt = nil
+			}
+			_, err := p.managed.Store.UpdateManagedTrinoState(ctx, *managedLease, org, update)
+			return err
+		})
+	}
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)
@@ -939,6 +999,13 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 		}
 	}
 
+	if p.managed != nil {
+		for _, catalog := range p.managed.CatalogClients {
+			if updater, ok := catalog.(TrinoCatalogCredentialUpdater); ok {
+				updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
+			}
+		}
+	}
 	return bundleToken, nil
 }
 
@@ -1257,7 +1324,12 @@ func (p *TrinoProvisioner) writePerOrgStates(
 	orgs []configstore.TrinoEnabledOrg,
 	catalogOutcomes map[string]catalogOutcome,
 	globalErr error,
+	stateWriters ...func(string, configstore.TrinoStateUpdate) error,
 ) {
+	writeState := p.store.UpdateTrinoState
+	if len(stateWriters) != 0 {
+		writeState = stateWriters[0]
+	}
 	now := time.Now().UTC()
 	zero := time.Time{} // pointer-to-zero signals "clear failed_at" to UpdateTrinoState
 	for _, o := range orgs {
@@ -1315,7 +1387,7 @@ func (p *TrinoProvisioner) writePerOrgStates(
 			upd.FailedAt = &zero
 		}
 
-		if err := p.store.UpdateTrinoState(o.OrgID, upd); err != nil {
+		if err := writeState(o.OrgID, upd); err != nil {
 			slog.Warn("Trino reconcile: failed to write per-org state.",
 				"org", o.OrgID, "error", err)
 		}

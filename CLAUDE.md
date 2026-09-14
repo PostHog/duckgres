@@ -1604,11 +1604,24 @@ password/tenant/catalog changes never propagate.
   internal-communication shared secret would split-brain a running cluster.
   The admin password/hash pair is the deliberate exception (no external
   consumer ⇒ regenerate-if-missing self-heals).
-- **Catalog reconcile is `SHOW CATALOGS` first**: create only what's missing,
+- **Static catalog reconcile is `SHOW CATALOGS` first**: create only what's missing,
   drop only names matching `opa.ManagedCatalogPattern` that aren't wanted, so
   `system`, `jmx` and hand-made catalogs survive. An org whose password is
   momentarily unresolvable keeps its existing catalog (never dropped) but is
   NOT reported ready.
+- **Shared catalog mode is explicit and fenced.** Registered cells can use
+  `catalog_management: paused` for compatibility rollout or `gateway-shared`
+  for sole-active-backend catalog writes. Freeze new admissions and DDL before
+  warming the standby; bulk-check catalog states and admitted tenant credentials,
+  cut over, then release before draining. See
+  [docs/runbooks/trino-shared-catalogs.md](docs/runbooks/trino-shared-catalogs.md).
+  Never replay CREATE across both slots. A remote FAILED query is not proof
+  that synchronous DDL stopped; retain the durable intent until fenced recovery.
+  Paused and non-owner replicas still refresh auth and OPA projections.
+- **Provisioner catalog inventory is narrowly authorized.** The admin can read
+  `catalog_name` and `state` from `system.metadata.catalogs`, in addition to
+  the existing node inventory. The observer and customer principals cannot.
+  `FAILING` startup placeholders are not usable catalogs.
 - **Catalog naming is a THREE-way contract**: `TrinoCatalogName` (`org_` +
   sanitized org id, no `_iceberg` suffix — warehouses are DuckLake),
   `opa.ManagedCatalogPattern`, and the regex literal inside `policy.rego`.

@@ -347,10 +347,10 @@ func TestTeardownFailsWhenCNPGCleanupCannotReachAPrimary(t *testing.T) {
 			}
 
 			calls := fakes.calls(t)
-			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 18 {
-				t.Fatalf("primary discovery calls = %d, want 18 (three retries for each CI org); calls:\n%s", got, calls)
+			if got := strings.Count(calls, "get pod -l cnpg.io/cluster=shard-001,cnpg.io/instanceRole=primary"); got != 21 {
+				t.Fatalf("primary discovery calls = %d, want 21 (three retries for each CI org); calls:\n%s", got, calls)
 			}
-			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 18 {
+			if tt.name == "all psql executions fail" && strings.Count(calls, "exec shard-001-2 -c postgres -- psql") != 21 {
 				t.Fatalf("psql attempts were not bounded to three per CI org; calls:\n%s", calls)
 			}
 			if !strings.Contains(calls, "delete namespace duckgres-ci-pr-123 --ignore-not-found --wait=false") {
