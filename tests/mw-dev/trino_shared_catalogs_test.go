@@ -55,7 +55,7 @@ func TestSharedCatalogGatewayFixtureUsesIsolatedSecretsAndPinnedImage(t *testing
 	}
 	image := "ghcr.io/example/gateway@sha256:" + strings.Repeat("a", 64)
 	renderedFile := filepath.Join(t.TempDir(), "rendered.yaml")
-	cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "SCENARIO_NAME=full-suite", "E2E_SUITE=trino", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-trino", "RUN_SH_TEST_RENDERED="+renderedFile, "TRINO_SHARED_CATALOGS_ENABLED=true", "TRINO_GATEWAY_IMAGE="+image)
+	cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "SCENARIO_NAME=full-suite", "E2E_SUITE=trino", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/test-trino", "RUN_SH_TEST_RENDERED="+renderedFile, "TRINO_SHARED_CATALOGS_ENABLED=true", "TRINO_GATEWAY_IMAGE="+image, "GITHUB_ACTIONS=true")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("optional fixture render failed: %v\n%s", err, output)
@@ -116,7 +116,8 @@ func TestSharedCatalogGatewayFixtureUsesIsolatedSecretsAndPinnedImage(t *testing
 				t.Fatal("Gateway migration schema must not overlap control-plane migrations")
 			}
 			for _, key := range []string{"admin-token", "private.pem"} {
-				if strings.Contains(string(output), data[key].(string)) {
+				value := data[key].(string)
+				if strings.Contains(fixtureOutputWithoutMaskRegistration(string(output), value), value) {
 					t.Fatal("renderer printed private Gateway material")
 				}
 			}
@@ -140,6 +141,41 @@ func TestSharedCatalogGatewayFixtureUsesIsolatedSecretsAndPinnedImage(t *testing
 	}
 	if !foundConfig || !foundDeployment || !foundPendingCredential || forwarded != 2 {
 		t.Fatal("optional fixture lacks the real Gateway resources")
+	}
+}
+
+func fixtureOutputWithoutMaskRegistration(output, value string) string {
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if line != "::add-mask::"+value {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func TestSharedCatalogOutputAllowsOnlyExactMaskRegistration(t *testing.T) {
+	const value = "synthetic-private-value"
+	for _, tc := range []struct {
+		name, output string
+		leaked       bool
+	}{
+		{"exact registration", "::add-mask::" + value + "\n", false},
+		{"plain disclosure", value + "\n", true},
+		{"disclosure after registration", "::add-mask::" + value + "\n" + value, true},
+		{"prefixed registration", "log: ::add-mask::" + value + "\n", true},
+		{"suffixed registration", "::add-mask::" + value + " trailing\n", true},
+		{"unrelated registration", "::add-mask::different\n" + value, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if strings.Contains(fixtureOutputWithoutMaskRegistration(tc.output, value), value) != tc.leaked {
+				t.Fatal("mask filtering incorrectly classified a private value")
+			}
+		})
+	}
+	privateKey := "-----BEGIN PRIVATE KEY-----\nsynthetic-key\n-----END PRIVATE KEY-----"
+	if !strings.Contains(fixtureOutputWithoutMaskRegistration(privateKey, privateKey), privateKey) {
+		t.Fatal("mask filtering hid a multiline private key")
 	}
 }
 
