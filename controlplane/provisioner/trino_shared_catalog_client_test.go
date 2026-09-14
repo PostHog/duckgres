@@ -22,7 +22,7 @@ func TestSharedCatalogStatementRequiresTerminalProof(t *testing.T) {
 		terminal, success bool
 	}{
 		{"finished", `{"id":"` + sharedTestQueryID + `","stats":{"state":"FINISHED"}}`, true, true},
-		{"failed", `{"id":"` + sharedTestQueryID + `","stats":{"state":"FAILED"},"error":{"errorName":"INVALID_CATALOG_PROPERTY","message":"private-value"}}`, true, false},
+		{"failed", `{"id":"` + sharedTestQueryID + `","stats":{"state":"FAILED"},"error":{"errorName":"INVALID_CATALOG_PROPERTY","message":"private-value"}}`, false, false},
 		{"empty", `{}`, false, false},
 		{"truncated", `{"id":`, false, false},
 		{"running_without_next", `{"id":"` + sharedTestQueryID + `","stats":{"state":"RUNNING"}}`, false, false},
@@ -229,6 +229,38 @@ func TestSharedCatalogReadFailuresRetainIntent(t *testing.T) {
 				t.Fatal("incomplete transport released intent")
 			}
 		})
+	}
+}
+
+func TestSharedCatalogFailedResponseCanPrecedeMutationCompletion(t *testing.T) {
+	finishMutation := make(chan struct{})
+	mutationDone := make(chan struct{})
+	defer func() {
+		select {
+		case <-finishMutation:
+		default:
+			close(finishMutation)
+		}
+	}()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		go func() { <-finishMutation; close(mutationDone) }()
+		_, _ = fmt.Fprintf(w, `{"id":%q,"stats":{"state":"FAILED"},"error":{"errorName":"USER_CANCELED"}}`, sharedTestQueryID)
+	}))
+	defer server.Close()
+	_, err := sharedTestClient(t, server).runStatement(context.Background(), "DROP CATALOG example")
+	select {
+	case <-mutationDone:
+		t.Fatal("fixture mutation already completed")
+	default:
+	}
+	if err == nil || TrinoCatalogOutcomeTerminal(err) {
+		t.Fatal("FAILED response authorized a later writer while mutation still runs")
+	}
+	close(finishMutation)
+	select {
+	case <-mutationDone:
+	case <-time.After(time.Second):
+		t.Fatal("fixture mutation did not finish")
 	}
 }
 
