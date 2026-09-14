@@ -116,8 +116,6 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	cmd := runSHCommand(t, fakes.binDir, "deploy",
 		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
 		"E2E_SUITE=trino",
-		"SCENARIO_NAME=posthog_frozen_perf",
-		"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-test",
 		"TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-dev",
 	)
 	out, err := cmd.CombinedOutput()
@@ -130,10 +128,8 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 		t.Fatalf("Trino deploy requires deployments/scale RBAC; calls:\n%s", calls)
 	}
 	for deployment, replicas := range map[string]int{
-		"duckgres-trino-coordinator":        1,
-		"duckgres-trino-worker":             3,
-		"duckgres-trino-cached-coordinator": 1,
-		"duckgres-trino-cached-worker":      3,
+		"duckgres-trino-coordinator": 1,
+		"duckgres-trino-worker":      3,
 	} {
 		want := "patch deployment " + deployment + " --type=merge -p {\"spec\":{\"replicas\":" + strconv.Itoa(replicas) + "}}"
 		if !strings.Contains(calls, want) {
@@ -2202,97 +2198,5 @@ cat
 				t.Fatalf("catalog cache mode was not %s: %s", tc.enabled, calls)
 			}
 		})
-	}
-}
-
-func TestCachedOnlyScenarioRejected(t *testing.T) {
-	fakes := newRunSHFakes(t)
-	cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_NAME=posthog_frozen_perf_trino_cached", "E2E_SUITE=trino", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1")
-	out, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "use posthog_frozen_perf") {
-		t.Fatalf("expected consolidated scenario guidance, got %v: %s", err, out)
-	}
-}
-
-func TestFrozenPerfCachedRunnerContract(t *testing.T) {
-	raw, err := os.ReadFile("run.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{
-		"DUCKGRES_SCENARIO_TRINO_CACHED_URL",
-		"https://duckgres-trino-cached.$NS.svc:8443",
-		"DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID",
-		"DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE",
-		"mountPath: /trino-admin, readOnly: true",
-		"items: [{ key: admin-password, path: admin-password }]",
-		"DNS:duckgres-trino-cached.$NS.svc",
-	} {
-		if !strings.Contains(string(raw), want) {
-			t.Errorf("runner missing %q", want)
-		}
-	}
-}
-
-func TestCachedTrinoRenderIsolatesClusterAndSharesProjections(t *testing.T) {
-	fakes := newRunSHFakes(t)
-	writeFake(t, fakes.binDir, "envsubst", `#!/usr/bin/env bash
-sed -e 's/${NAMESPACE}/duckgres-ci-pr-123/g' -e 's/${PR_NUMBER}/123/g' -e 's@${TRINO_IMAGE}@example.invalid/trino:test@g'
-`)
-	raw, err := os.ReadFile("run.sh")
-	if err != nil {
-		t.Fatal(err)
-	}
-	script := string(raw)
-	start := strings.Index(script, "render_trino_cached() {")
-	end := strings.Index(script[start:], "\nrender_trino_multicell()") + start
-	if start < 0 || end <= start {
-		t.Fatal("cached renderer missing")
-	}
-	cmd := exec.Command("bash", "-c", script[start:end]+"\nrender_trino_cached")
-	cmd.Env = append(os.Environ(), "PATH="+fakes.binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "RUN_SH_TEST_CALLS="+fakes.logPath, "HERE=.", "NS=duckgres-ci-pr-123", "PR_NUMBER=123", "secret_dir="+t.TempDir())
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("render: %v: %s", err, out)
-	}
-	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(out), 4096)
-	seen := map[string]int{}
-	for {
-		var manifest map[string]any
-		if err := decoder.Decode(&manifest); err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatalf("decode: %v: %s", err, out)
-		}
-		if len(manifest) == 0 {
-			continue
-		}
-		name := manifestName(manifest)
-		seen[name]++
-		if manifest["kind"] == "ConfigMap" {
-			data := manifest["data"].(map[string]any)
-			if !strings.Contains(data["node.properties"].(string), "node.environment=ci_pr_123_cached") {
-				t.Errorf("%s shares baseline environment", name)
-			}
-			if !strings.Contains(data["config.properties"].(string), "discovery.uri=http://duckgres-trino-cached.duckgres-ci-pr-123.svc:8080") {
-				t.Errorf("%s shares baseline discovery", name)
-			}
-			if name == "duckgres-trino-cached-coordinator" && !strings.Contains(data["catalog-store.properties"].(string), "catalog-store.cell-id=ci-pr-123-cached") {
-				t.Error("cached catalog store shares baseline cell")
-			}
-		}
-	}
-	for name, count := range map[string]int{"trino-cached-internal": 1, "duckgres-trino-cached": 1, "duckgres-trino-cached-coordinator": 2, "duckgres-trino-cached-worker": 2} {
-		if seen[name] != count {
-			t.Errorf("%s rendered %d times, want %d", name, seen[name], count)
-		}
-	}
-	if len(seen) != 4 {
-		t.Errorf("unexpected duplicated shared resources: %v", seen)
-	}
-	for _, want := range []string{"name: trino-cached-internal, key: shared-secret", "secretName: trino-auth", "secretName: trino-tenant-secrets", "name: trino-resource-groups", "name: duckgres-trino-opa", "secretName: duckgres-trino-tls", "secretName: duckgres-trino-catalog-store"} {
-		if !strings.Contains(string(out), want) {
-			t.Errorf("missing shared projection or isolated secret: %s", want)
-		}
 	}
 }

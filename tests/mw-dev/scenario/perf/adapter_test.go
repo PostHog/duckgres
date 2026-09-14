@@ -192,12 +192,8 @@ func TestExecutorRestrictsCatalogToStepTargets(t *testing.T) {
 }
 
 func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
-	for _, protocol := range []perfcore.Protocol{perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached, "both"} {
+	for _, protocol := range []perfcore.Protocol{perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached} {
 		t.Run(string(protocol), func(t *testing.T) {
-			targets := []any{string(protocol)}
-			if protocol == "both" {
-				targets = []any{"trino", "trino_cached"}
-			}
 			catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached})
 			provisionState := provision.NewState()
 			provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
@@ -234,7 +230,7 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 					"org_id":                      "scenario-org",
 					"catalog_file":                catalogPath,
 					"run_id":                      "scenario-run-1",
-					"targets":                     targets,
+					"targets":                     []any{string(protocol)},
 					"trino_ca_cert_file":          "/trino-ca/ca.crt",
 					"trino_startup_timeout":       "45s",
 					"trino_startup_poll_interval": "3s",
@@ -244,13 +240,9 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 				t.Fatalf("ExecuteStep returned error: %v", err)
 			}
 
-			expectedProtocol := protocol
-			if protocol == "both" {
-				expectedProtocol = perfcore.ProtocolTrinoCached
-			}
 			got := factory.trinoConnection
-			if got.Protocol != expectedProtocol {
-				t.Fatalf("connection protocol = %q, want %q", got.Protocol, expectedProtocol)
+			if got.Protocol != protocol {
+				t.Fatalf("connection protocol = %q, want %q", got.Protocol, protocol)
 			}
 			if got.ServerURL != "https://trino.example.test:8443" || got.Username != "org_database" {
 				t.Fatalf("Trino identity = %+v, want coordinator and status principal", got)
@@ -264,9 +256,6 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 			if got.CACertFile != "/trino-ca/ca.crt" || got.Startup.Timeout != 45*time.Second || got.Startup.PollInterval != 3*time.Second {
 				t.Fatalf("Trino TLS/startup = %+v, want explicit verified CA and retry bounds", got)
 			}
-			if got.CatalogStoreCellID != "cell-a" {
-				t.Fatal("missing authoritative baseline cell scope")
-			}
 			if factory.trinoContext == nil {
 				t.Fatal("Trino factory did not receive scenario context for untimed startup smoke")
 			}
@@ -275,13 +264,10 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read query_results.csv: %v", err)
 			}
-			if !strings.Contains(string(csvBytes), "\nq1,i1,1,"+string(expectedProtocol)+",ok,") {
+			if !strings.Contains(string(csvBytes), "\nq1,i1,1,"+string(protocol)+",ok,") {
 				t.Fatalf("query_results.csv missing measured Trino row: %q", string(csvBytes))
 			}
 
-			if protocol == "both" && !strings.Contains(string(csvBytes), "\nq1,i1,1,trino,ok,") {
-				t.Fatal("combined report missing baseline Trino")
-			}
 		})
 	}
 }
@@ -295,16 +281,6 @@ func TestDefaultTrinoFactoryRequiresCacheValidation(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "catalog store DSN") {
 		t.Fatalf("error = %v, want missing catalog store DSN before Trino startup", err)
-	}
-}
-
-func TestCatalogAllowsBothTrinoCacheModes(t *testing.T) {
-	targets := []perfcore.Protocol{perfcore.ProtocolTrino, perfcore.ProtocolTrinoCached}
-	for _, requested := range [][]perfcore.Protocol{nil, targets} {
-		got, err := restrictCatalogTargets(perfcore.Catalog{Targets: targets}, requested)
-		if err != nil || len(got.Targets) != 2 {
-			t.Fatalf("combined targets = %v, error %v", got.Targets, err)
-		}
 	}
 }
 
