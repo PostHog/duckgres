@@ -131,7 +131,7 @@ func (c *trinoSharedCatalogHTTPClient) runStatement(ctx context.Context, stateme
 			if state != "FINISHED" || page.Error != nil {
 				return nil, errors.New("catalog statement terminal outcome unknown")
 			}
-		} else if page.Error != nil || state == "FINISHED" || state == "FAILED" || !c.validContinuation(page.NextURI, queryID) {
+		} else if page.Error != nil || state == "FAILED" || !c.validContinuation(page.NextURI, queryID) {
 			return nil, errors.New("catalog statement continuation invalid")
 		}
 		if len(rows)+len(page.Data) > sharedTrinoMaxRows {
