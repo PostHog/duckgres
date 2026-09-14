@@ -65,6 +65,10 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 ## Trino API identity
 
+The optional [rollout readiness endpoint](docs/runbooks/trino-rollout-readiness.md)
+observes registered backend pods, coordinator identity, workers, and a dedicated
+warehouse canary. It is disabled by default and does not provision or move tenants.
+
 `DUCKGRES_TRINO_HOGLAKE_URI` defaults to empty (DuckLake catalog provisioning).
 The frozen perf deployments set it automatically to their namespace-local Hoglake
 service, replacing the Trino backend in the existing cached and uncached scenarios.

@@ -792,6 +792,14 @@ func SetupMultiTenant(
 		}
 	}
 
+	rolloutReadiness, rolloutErr := buildTrinoRolloutReadiness(trinoCells, store)
+	if rolloutErr != nil {
+		return nil, nil, nil, nil, nil, nil, rolloutErr
+	}
+	if rolloutReadiness != nil {
+		engine.Any(rolloutReadinessPrefix+"*slot", gin.WrapH(rolloutReadiness))
+	}
+
 	// Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1 admin group on
 	// purpose — it does its own bearer-token auth (the bundle exposes the
 	// customer roster; a separate shared secret between provisioner and the

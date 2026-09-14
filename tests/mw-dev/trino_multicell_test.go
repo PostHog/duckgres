@@ -234,6 +234,10 @@ func TestTrinoMulticellRenderedBackendsAreIsolated(t *testing.T) {
 			if labels["app"] != name {
 				t.Fatalf("backend selector overlaps: %+v", labels)
 			}
+			podLabels := spec["template"].(map[string]any)["metadata"].(map[string]any)["labels"].(map[string]any)
+			if podLabels["posthog.com/trino-cell"] != "cell-test" || podLabels["posthog.com/trino-color"] != color || podLabels["app.kubernetes.io/component"] != role || podLabels["app.kubernetes.io/name"] != "trino-"+role {
+				t.Fatalf("readiness cannot identify the %s %s main container", color, role)
+			}
 		}
 	}
 	if !strings.Contains(configs["duckgres-trino-opa"]["config.yaml"].(string), "/bundles/trino/cell-test") {
