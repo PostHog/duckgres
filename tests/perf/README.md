@@ -38,12 +38,12 @@ one protocol from changing another protocol's cache context.
 
 ### DuckDB cache comparison
 
-`posthog_frozen_perf` runs four separately labeled targets in one result set,
-in order: **`pgwire_uncached` (baseline)**, `pgwire_cached`, `trino`, `athena`.
+`posthog_frozen_perf` runs five separately labeled targets in one result set,
+in order: **`pgwire_uncached` (baseline)**, `pgwire_cached`, `trino`, `trino_cached`, `athena`.
 Both DuckDB variants use identical queries, worker resource requests, warmup
 counts, and measured iterations. Each variant finishes before the next begins.
-The baseline scenario runs Trino and Athena once. A separate cached-Trino scenario
-adds `trino_cached` without repeating the DuckDB/Athena targets. Legacy `pgwire` catalogs
+Dataset registration runs once and both Trino clusters share the same Hoglake
+catalog. Legacy `pgwire` catalogs
 keep their existing behavior and are not relabeled as uncached history.
 
 Only the perf driver changes cache settings. It pins its PGWire connection and
@@ -248,28 +248,31 @@ Optional artifact publisher:
 
 ### Cached Trino comparison
 
-The scheduled workflow and manual `posthog_frozen_perf` selection run the baseline
-and `posthog_frozen_perf_trino_cached` sequentially in separate throwaway namespaces.
-The latter measures only `trino_cached`, using the same registered DuckLake tables,
-SQL, one warm-up iteration and four measured iterations per query as the baseline.
-CSV/history rows retain the distinct `trino_cached` protocol label. To run only
-that variant, select `posthog_frozen_perf_trino_cached` manually.
+The scheduled workflow and manual `posthog_frozen_perf` selection run one scenario
+in one throwaway namespace. It provisions the dataset once, then measures all five
+targets sequentially into one result set. Both Trino targets use the same SQL,
+one warm-up iteration and four measured iterations per query. CSV/history rows
+retain the distinct `trino` and `trino_cached` protocol labels.
 
-Both clusters load the same Alluxio and memory cache managers. The provisioner sets
-`fs.cache.enabled=false` for the baseline catalog and `true` for the cached catalog.
+The harness deploys two Trino clusters with separate discovery services, catalog
+store cell IDs, and ephemeral cache volumes. They share tenant authentication,
+authorization, and the registered Hoglake dataset. The control plane provisions
+the baseline catalog with `fs.cache.enabled=false`. Before measurement the runner
+creates the same catalog on the second cluster, copying its properties with only
+`fs.cache.enabled=true`. It validates persisted properties by cell and catalog.
+Both clusters load the same Alluxio and memory cache managers.
 Each node has a 16GB disk-cache budget in a 20Gi ephemeral volume, with 64kB pages
-and a seven-day TTL. The cache persists between queries/iterations within a job;
-teardown removes it. Entries can be evicted, and a single warm-up does not guarantee
-every replica holds the complete working set. This measures a warmed, bounded
-filesystem cache, not a fully cached theoretical optimum. Worker CPU/memory limits
-remain three workers at 1 CPU/4Gi each; disk caching is additional storage.
+and a seven-day TTL. For connectors that use this cache, entries persist between
+queries/iterations until eviction or teardown; one warm-up does not guarantee
+every replica holds the complete working set. Worker CPU/memory limits remain
+three workers at 1 CPU/4Gi per cluster; cache volumes reserve additional storage.
 
-The pinned DuckLake connector uses filesystem caching for data and footer/index
-bytes, but does not opt into the separate coordinator heap metadata-cache tier.
-Loading the memory manager does not change that. No query-result cache is enabled:
-Trino still executes decoding and aggregation. The baseline is filesystem-cache-off,
-not a guarantee that JVM, OS, or storage-service caches are cold. Do not mix the two
-protocol labels in performance comparisons.
+The current frozen suite uses the pinned Hoglake connector, which ignores
+`fs.cache.enabled`; actual filesystem-cache support remains deferred. Thus
+`trino_cached` currently labels the requested configuration, not verified cache
+hits or a demonstrated cache benefit. Consolidating the scenario does not change
+that connector behavior. The baseline also does not guarantee cold JVM, OS, or
+storage-service caches. Keep the protocol labels separate in history.
 
 Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
 external-read/hit counters to distinguish storage traffic from cached reads.
