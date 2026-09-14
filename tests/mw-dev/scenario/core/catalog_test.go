@@ -213,13 +213,12 @@ steps:
 	}
 }
 
-func TestCachedTrinoScenarioPreservesBaselineAndCleanup(t *testing.T) {
+func TestFrozenPerfScenarioCombinesAllTargetsAndCleanup(t *testing.T) {
 	for _, tc := range []struct {
 		file    string
 		targets []string
 	}{
-		{"posthog_frozen_perf", []string{"pgwire_uncached", "pgwire_cached", "trino", "athena"}},
-		{"posthog_frozen_perf_trino_cached", []string{"trino_cached"}},
+		{"posthog_frozen_perf", []string{"pgwire_uncached", "pgwire_cached", "trino", "trino_cached", "athena"}},
 	} {
 		t.Run(tc.file, func(t *testing.T) {
 			scenario, err := LoadScenario("../scenarios/" + tc.file + ".yaml")

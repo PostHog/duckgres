@@ -28,10 +28,14 @@ func (r cacheModeRow) Scan(dest ...any) error {
 type cacheModeQuery struct {
 	row     cacheModeRow
 	catalog string
+	cell    string
+	query   string
 }
 
-func (q *cacheModeQuery) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+func (q *cacheModeQuery) QueryRow(_ context.Context, query string, args ...any) pgx.Row {
 	q.catalog = args[0].(string)
+	q.cell = args[1].(string)
+	q.query = query
 	return q.row
 }
 func TestCatalogCacheModeMatchesBenchmarkLabel(t *testing.T) {
@@ -55,13 +59,16 @@ func TestCatalogCacheModeMatchesBenchmarkLabel(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := &cacheModeQuery{row: tc.row}
-			err := checkTrinoCatalogCacheMode(context.Background(), q, "org_fixture", tc.protocol)
+			err := checkTrinoCatalogCacheMode(context.Background(), q, "org_fixture", tc.protocol, "cell-a")
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
 				}
 			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+			if q.cell != "cell-a" || !strings.Contains(q.query, "cell_id = $2") {
+				t.Fatal("cache check not scoped to cell")
 			}
 			if q.catalog != "org_fixture" {
 				t.Fatalf("checked wrong catalog %q", q.catalog)

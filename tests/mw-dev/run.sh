@@ -36,21 +36,19 @@ case "$E2E_SUITE" in
   *) echo "E2E_SUITE must be neutral, duckdb, trino, or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
 esac
 # Frozen perf requires the Hoglake connector; other E2E lanes retain their pin.
-if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_trino_cached ]; then
+if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:f3bddd334a9e08f54788779ec7c723b8c296765a@sha256:9a4bf1293d0b4b73aa3b46c16bf014ed22bb9fc12b8ea28617cfed06534c8f2d}"
 else
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8}"
 fi
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
 HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:f10c34f9c779e2794fca662d5302f97dc26e48a6b2a601ae344cad945e70483c}"
-# Derive cache mode from the scenario so reported protocol and catalog agree.
+# The control plane provisions the uncached baseline. The runner creates the
+# cached catalog in the second cluster's isolated catalog-store cell.
 TRINO_FILESYSTEM_CACHE_ENABLED=false
 if [ "$SCENARIO_NAME" = "posthog_frozen_perf_trino_cached" ]; then
-  TRINO_FILESYSTEM_CACHE_ENABLED=true
-  if [ "$E2E_SUITE" != "trino" ]; then
-    echo "posthog_frozen_perf_trino_cached requires E2E_SUITE=trino" >&2
-    exit 2
-  fi
+  echo "use posthog_frozen_perf; it includes both Trino cache modes" >&2
+  exit 2
 fi
 
 # Internal secret for the per-PR control plane. Random per run; never reused.
@@ -92,7 +90,7 @@ require_pr_identity() {
 }
 
 frozen_perf_scenario() {
-  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_trino_cached ]
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ]
 }
 
 hoglake_perf_enabled() {
@@ -125,6 +123,39 @@ render_trino_backend() {
       -e "s/duckgres-config-store\.$TRINO_CELL_NS\.svc/duckgres-config-store.$NS.svc/g" \
       -e "s/duckgres-control-plane\.$TRINO_CELL_NS\.svc/duckgres-control-plane.$NS.svc/g" \
       -e 's@resource: /bundles/trino$@resource: /bundles/trino/cell-test@'
+}
+
+# Reuse the baseline template so both clusters retain identical resource budgets.
+# Select only cluster-specific resources; TLS, auth, tenant secrets, OPA and the
+# config-store connection are intentionally shared in the throwaway namespace.
+render_trino_cached() {
+  local cached_secret_file="$secret_dir/trino-cached-internal"
+  [ -s "$cached_secret_file" ] || (umask 077; openssl rand -base64 32 > "$cached_secret_file")
+  cat <<EOF
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trino-cached-internal
+  namespace: $NS
+stringData:
+  shared-secret: "$(cat "$cached_secret_file")"
+EOF
+  TRINO_IMAGE="$TRINO_IMAGE" NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
+    envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE' < "$HERE/manifests.trino.tmpl.yaml" \
+    | awk '
+      /^---$/ { if (selected) printf "%s", document; document="---\n"; selected=0; next }
+      { document=document $0 "\n" }
+      /^  name: duckgres-trino(-coordinator|-worker)?$/ { selected=1 }
+      END { if (selected) printf "%s", document }
+    ' | sed -e 's/duckgres-trino-coordinator/duckgres-trino-cached-coordinator/g' \
+      -e 's/duckgres-trino-worker/duckgres-trino-cached-worker/g' \
+      -e 's/app: duckgres-trino/app: duckgres-trino-cached/g' \
+      -e 's/name: duckgres-trino$/name: duckgres-trino-cached/' \
+      -e "s/duckgres-trino\.$NS\.svc/duckgres-trino-cached.$NS.svc/g" \
+      -e 's/trino-internal-communication/trino-cached-internal/g' \
+      -e "s/node.environment=ci_pr_${PR_NUMBER}$/node.environment=ci_pr_${PR_NUMBER}_cached/" \
+      -e "s/catalog-store.cell-id=ci-pr-${PR_NUMBER}$/catalog-store.cell-id=ci-pr-${PR_NUMBER}-cached/"
 }
 
 render_trino_multicell() {
@@ -191,6 +222,7 @@ render() {
       envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
       < "$HERE/manifests.trino.tmpl.yaml"
     if hoglake_perf_enabled; then
+      render_trino_cached
       NAMESPACE="$NS" HOGLAKE_IMAGE="$HOGLAKE_IMAGE" AWS_REGION="$AWS_REGION" \
         envsubst '$NAMESPACE $HOGLAKE_IMAGE $AWS_REGION' < "$HERE/manifests.hoglake.tmpl.yaml"
     fi
@@ -201,6 +233,9 @@ render() {
 ensure_trino_tls() {
   local san="duckgres-trino.$NS.svc"
   local sans="DNS:$san"
+  if hoglake_perf_enabled; then
+    sans="$sans,DNS:duckgres-trino-cached.$NS.svc"
+  fi
   if trino_multicell_enabled; then
     sans="$sans,DNS:duckgres-trino-blue.$TRINO_CELL_NS.svc,DNS:duckgres-trino-green.$TRINO_CELL_NS.svc"
   fi
@@ -487,6 +522,12 @@ cmd_deploy() {
       --type=merge -p '{"spec":{"replicas":3}}'
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
+    if hoglake_perf_enabled; then
+      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-cached-coordinator --type=merge -p '{"spec":{"replicas":1}}'
+      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-cached-worker --type=merge -p '{"spec":{"replicas":3}}'
+      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-cached-coordinator --timeout=300s
+      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-cached-worker --timeout=300s
+    fi
     if trino_multicell_enabled; then
       "${KUBECTL[@]}" -n "$TRINO_CELL_NS" wait --for=create secret/trino-auth --timeout=120s
       "${KUBECTL[@]}" -n "$TRINO_CELL_NS" wait --for=create configmap/trino-resource-groups --timeout=120s
@@ -684,6 +725,9 @@ spec:
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_HOGLAKE_URI, value: "$hoglake_uri" }
+            - { name: DUCKGRES_SCENARIO_TRINO_CACHED_URL, value: "https://duckgres-trino-cached.$NS.svc:8443" }
+            - { name: DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID, value: "ci-pr-${PR_NUMBER}-cached" }
+            - { name: DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE, value: "/trino-admin/admin-password" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
             # Only the throwaway benchmark config store; never a shared dev/prod store.
             - name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
@@ -708,6 +752,7 @@ spec:
             limits: { memory: "6Gi" }
           volumeMounts:
             - { name: artifacts, mountPath: /artifacts }
+            - { name: trino-admin, mountPath: /trino-admin, readOnly: true }
             - { name: trino-ca, mountPath: /trino-ca, readOnly: true }
         # Keep the shared artifact volume attached to a running container after
         # the scenario exits. kubectl cp uses exec/tar and cannot copy from a
@@ -726,6 +771,7 @@ spec:
             - { name: artifacts, mountPath: /artifacts }
       volumes:
         - { name: artifacts, emptyDir: {} }
+        - { name: trino-admin, secret: { secretName: trino-auth, optional: true, items: [{ key: admin-password, path: admin-password }] } }
         - { name: trino-ca, secret: { secretName: duckgres-trino-tls, optional: true, items: [{ key: ca.crt, path: ca.crt }] } }
 YAML
 
@@ -932,6 +978,11 @@ cmd_diagnostics() {
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c trino-coordinator --tail=300 || true
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c duckgres-trino-opa --tail=300 || true
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-worker -c trino-worker --tail=300 || true
+  if hoglake_perf_enabled; then
+    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-coordinator -c trino-coordinator --tail=300 || true
+    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-coordinator -c duckgres-trino-opa --tail=300 || true
+    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-worker -c trino-worker --tail=300 || true
+  fi
   if hoglake_perf_enabled; then
     "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-hoglake --tail=300 || true
     "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-hoglake-postgres --tail=100 || true

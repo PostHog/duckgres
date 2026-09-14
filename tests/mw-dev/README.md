@@ -762,43 +762,53 @@ NAMESPACE="duckgres-ci-pr-${LANE_ID:?}" PR_NUMBER="$LANE_ID" KUBE_CONTEXT=postho
   bash tests/mw-dev/run.sh deploy
 ```
 
-### Running the cached Trino perf variant
+### Running the combined Trino perf comparison
 
-`posthog_frozen_perf_trino_cached` uses the isolated Trino lane and measures only
-`trino_cached`. The scheduled workflow and manual `posthog_frozen_perf` selection
-run both variants serially, with unique numeric namespace identities and separate
-artifacts. A manual cached-only scenario selection runs just the cached variant.
-For either perf selection, omit the `duckgres_image` override: the workflow
-requires the current control-plane build, preventing older images from ignoring
-the cache flag and producing falsely labeled cached results.
+The scheduled workflow and manual `posthog_frozen_perf` selection run all five
+benchmark targets in one scenario, namespace, and result set. Dataset and Hoglake
+registration run once. Measurements run sequentially: `pgwire_uncached`,
+`pgwire_cached`, `trino`, `trino_cached`, then `athena`.
+The former `posthog_frozen_perf_trino_cached` selection has been removed; use
+`posthog_frozen_perf` instead. Omit the workflow's `duckgres_image` override so the
+control-plane build explicitly persists the expected baseline cache setting.
 
-For local invocation, set `SCENARIO_NAME=posthog_frozen_perf_trino_cached` and
-`E2E_SUITE=trino` before both `tests/mw-dev/run.sh deploy` and `test-scenario`.
-Use the existing isolated-lane credentials, image and namespace requirements.
-The harness derives `DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED=true` from that scenario;
-other scenarios use false. The flag affects newly created catalogs only: tear down
-and redeploy into a fresh namespace when changing mode. Never reuse a cached
-namespace for a baseline run.
+For local invocation, set `SCENARIO_NAME=posthog_frozen_perf` and `E2E_SUITE=trino`
+before both `tests/mw-dev/run.sh deploy` and `test-scenario`. Use the existing lane
+credentials, images, and namespace requirements. The harness starts a baseline
+and a cached Trino cluster in the same namespace, each with one coordinator and
+three 1-CPU/4Gi workers. This doubles the deployed Trino worker reservation to
+6 CPU/24Gi, while each measured target retains a 3-CPU/12Gi execution budget.
+Separate discovery services and ephemeral volumes isolate the clusters' state.
 
-Before Trino startup/warm-up, the runner checks the persisted catalog
-`fs.cache.enabled` against the selected target. Missing or mismatched settings
-fail the run, including when an older control-plane image ignored the flag.
-`run.sh` supplies `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN` for the throwaway
-namespace database; direct runner invocations must supply that isolated database
-connection too. Never point this check at a shared dev/prod catalog store.
-On failure, rebuild the control plane and deploy a fresh namespace with the
-matching scenario. A single `perf_queries` step cannot select both `trino` and
-`trino_cached`; select one explicitly and use separate deployments for comparison.
+The baseline control-plane cache flag remains false. The runner reads its catalog
+properties from the throwaway database, then creates the same catalog on the
+second cluster with only `fs.cache.enabled` changed to true. Tenant credentials,
+authorization, table data, and queries are shared. An admin credential mounted
+from the namespace's `trino-auth` Secret is used only for catalog setup; benchmark
+queries authenticate as the tenant. Cache validation is scoped to each cell ID.
 
-The environment flag defaults to false outside this harness. Enabling it requires
-a compatible cache manager on every Trino node. The pinned image configures managers
-with `cache-manager.config-files`; cache directory/size properties belong in the
-Alluxio manager file, not in the tenant catalog. The harness mounts writable,
-node-local ephemeral cache storage and keeps worker CPU/memory limits unchanged.
-See `tests/perf/README.md` for cache budgets, warm-up behavior and cache-layer limits.
+`run.sh` supplies these runner settings automatically. Direct runner invocations
+must supply them for the isolated deployment:
 
-If a cached catalog fails readiness, inspect coordinator/worker logs for unavailable
-cache managers, invalid properties, unwritable `/cache/trino`, or exhausted ephemeral
-storage. Preserve artifacts, then run the normal `teardown`; the namespace deletion
-removes cache volumes. Do not switch the cached target to an uncached catalog merely
-to make a failed run pass.
+| Variable | Harness value / purpose |
+| --- | --- |
+| `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN` | Throwaway catalog database connection |
+| `DUCKGRES_SCENARIO_TRINO_CACHED_URL` | HTTPS endpoint of `duckgres-trino-cached` |
+| `DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID` | Baseline cell ID with `-cached` suffix |
+| `DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE` | `/trino-admin/admin-password` |
+
+There are no implicit cached endpoint or credential defaults. Never point this
+setup at a shared dev/prod catalog store or coordinator. A `perf_queries` step may
+select both Trino targets; `with.targets` can select a subset for focused local
+runs, while the checked-in scenario runs all five.
+
+The current pinned Hoglake connector ignores `fs.cache.enabled`; the two labels
+currently distinguish requested configuration, not verified caching behavior.
+See `tests/perf/README.md` for cache budgets and this existing connector limitation.
+
+If setup or readiness fails, preserve artifacts and inspect logs for both
+`duckgres-trino` and `duckgres-trino-cached` deployments. Check catalog-store cell
+IDs, TLS service names, auth projections, and cache-manager configuration. Run
+`tests/mw-dev/run.sh diagnostics`, then the normal `teardown`, and redeploy a fresh
+namespace before retrying. Namespace teardown removes both clusters, cached
+catalog rows in the throwaway database, and all ephemeral cache volumes.

@@ -6,10 +6,11 @@ The scenario runner executes end-to-end managed-warehouse flows against a config
 
 The default full workload uses one `full-suite.yaml` scenario: it provisions a fresh dev warehouse, creates read-only views over frozen persons/events parquet supplied by `DUCKGRES_SCENARIO_FROZEN_S3_URI`, runs metadata exploration, perf queries, and dbt models, then deprovisions. `fast-suite.yaml` follows the same flow without dbt. The standalone provisioning, frozen metadata, perf, and dbt scenarios remain available for focused debugging.
 
-The existing frozen-perf scenarios compare Duckgres raw views and DuckLake tables,
+The frozen-perf scenario compares Duckgres raw views and DuckLake tables,
 Trino Hoglake tables, and Athena external tables over the same immutable S3 files.
-`posthog_frozen_perf` runs `trino` with `fs.cache.enabled=false`;
-`posthog_frozen_perf_trino_cached` runs `trino_cached` with it set to `true`.
+`posthog_frozen_perf` runs `trino` with `fs.cache.enabled=false` and
+`trino_cached` with it set to `true`, using two clusters in one throwaway namespace.
+Dataset setup runs once; all five targets execute sequentially into one result set.
 The pinned Hoglake connector currently ignores that flag; enabling actual cache
 support is deferred. Both modes run the full seven-query corpus, with one warmup
 and four measured iterations.
@@ -76,9 +77,11 @@ catalog's targets. Optional `with.worker_cpu` and `with.worker_memory` values
 are sent as PGWire startup options. Both default to empty, which leaves worker
 selection to the server; set both for resource-controlled comparisons.
 
-For the two frozen-perf scenarios, `tests/mw-dev/run.sh` automatically supplies
+For the frozen-perf scenario, `tests/mw-dev/run.sh` automatically supplies
 `DUCKGRES_TRINO_HOGLAKE_URI` to the control plane and
-`DUCKGRES_SCENARIO_HOGLAKE_URI` to the runner. No catalog configuration is supplied
+`DUCKGRES_SCENARIO_HOGLAKE_URI` to the runner. It also supplies the cached Trino endpoint/cell and a mounted admin password
+file for creating the second catalog. See [the deployment runbook](../../tests/mw-dev/README.md#running-the-combined-trino-perf-comparison)
+for direct-runner settings and failure recovery. No catalog configuration is supplied
 by the caller. Outside these deployments, the control-plane URI defaults to empty
 and catalog provisioning continues to use DuckLake. `HOGLAKE_IMAGE` can override
 the pinned server image. The scenario image includes Python, boto3, and pyarrow
