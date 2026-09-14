@@ -127,14 +127,15 @@ func trinoProvisionerEnabled() bool {
 // Registered cells share projections across their independently scheduled backends.
 // Only the legacy cell claims unassigned tenants.
 type trinoCell struct {
-	ID             string
-	PublicID       string
-	RoutingGroup   string
-	Namespace      string
-	Backends       []trinoRegisteredBackend
-	CoordinatorURL string
-	TLSServerName  string
-	ClientURL      string
+	CatalogManagement string
+	ID                string
+	PublicID          string
+	RoutingGroup      string
+	Namespace         string
+	Backends          []trinoRegisteredBackend
+	CoordinatorURL    string
+	TLSServerName     string
+	ClientURL         string
 }
 
 // consoleCell preserves legacy ownership and exposes each logical identity.
@@ -300,10 +301,14 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	// envTrinoCoordinatorServerName).
 	catalogClient := provisioner.NewTrinoCatalogHTTPClient(cell.CoordinatorURL, opa.AdminPrincipal, "", cell.TLSServerName)
 	var additional []provisioner.TrinoCatalogClient
+	var managed *provisioner.TrinoManagedCatalogOpts
+	if cell.CatalogManagement != "" {
+		managed = &provisioner.TrinoManagedCatalogOpts{Paused: true}
+	}
 	var internalSecrets []string
 	for _, backend := range cell.Backends {
 		internalSecrets = append(internalSecrets, backend.InternalSecretName)
-		if backend.Running && !backend.RoutingActive {
+		if cell.CatalogManagement == "" && backend.Running && !backend.RoutingActive {
 			additional = append(additional, provisioner.NewTrinoCatalogHTTPClient(backend.CoordinatorURL, opa.AdminPrincipal, "", backend.TLSServerName))
 		}
 	}
@@ -311,6 +316,7 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	bundleStore := &opa.BundleStore{}
 
 	trinoProv, err := provisioner.NewTrinoProvisioner(provisioner.TrinoProvisionerOpts{
+		ManagedCatalogs:         managed,
 		Store:                   store,
 		BootstrapSentinel:       store,
 		Warehouses:              store,
