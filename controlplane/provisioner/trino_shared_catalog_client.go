@@ -126,9 +126,8 @@ func (c *trinoSharedCatalogHTTPClient) runStatement(ctx context.Context, stateme
 			return nil, errors.New("catalog statement state invalid")
 		}
 		if page.NextURI == "" {
-			if state == "FAILED" && page.Error != nil && page.Error.ErrorName != "" {
-				return nil, &trinoCatalogTerminalError{}
-			}
+			// FAILED can precede completion of a synchronous catalog mutation.
+			// Only FINISHED proves that the mutation task returned successfully.
 			if state != "FINISHED" || page.Error != nil {
 				return nil, errors.New("catalog statement terminal outcome unknown")
 			}
