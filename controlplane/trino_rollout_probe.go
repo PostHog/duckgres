@@ -121,7 +121,7 @@ type rolloutSQLClient struct {
 func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string) ([]byte, error) {
 	base, baseErr := url.Parse(c.baseURL)
 	parsed, err := url.Parse(endpoint)
-	if baseErr != nil || err != nil || parsed.Scheme != "https" || parsed.Scheme != base.Scheme || parsed.Host != base.Host || parsed.User != nil || parsed.Fragment != "" || (parsed.Path != "/v1/statement" && !strings.HasPrefix(parsed.Path, "/v1/statement/") && parsed.Path != "/v1/info") {
+	if baseErr != nil || err != nil || parsed.Scheme != "https" || parsed.Scheme != base.Scheme || !strings.EqualFold(parsed.Hostname(), base.Hostname()) || rolloutHTTPSPort(parsed) != rolloutHTTPSPort(base) || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "/v1/statement" && !strings.HasPrefix(parsed.Path, "/v1/statement/") && parsed.Path != "/v1/info") {
 		return nil, errors.New("invalid coordinator response endpoint")
 	}
 	if c.username == "" || c.password == "" {
@@ -148,6 +148,13 @@ func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string
 		return nil, errors.New("coordinator response exceeds limit")
 	}
 	return body, nil
+}
+
+func rolloutHTTPSPort(endpoint *url.URL) string {
+	if port := endpoint.Port(); port != "" {
+		return port
+	}
+	return "443"
 }
 
 func (c rolloutSQLClient) info(ctx context.Context) (*rolloutCoordinatorFacts, error) {
