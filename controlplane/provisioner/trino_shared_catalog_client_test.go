@@ -108,6 +108,39 @@ func TestSharedCatalogContinuationOriginAndIdentity(t *testing.T) {
 	}
 }
 
+func TestSharedCatalogFinishedPageStillRequiresAcknowledgement(t *testing.T) {
+	for _, acknowledge := range []bool{true, false} {
+		t.Run(fmt.Sprintf("acknowledge_%t", acknowledge), func(t *testing.T) {
+			var server *httptest.Server
+			var requests atomic.Int32
+			server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.Method == http.MethodPost {
+					_, _ = fmt.Fprintf(w, `{"id":%q,"stats":{"state":"FINISHED"},"data":[["example","OPERATIONAL"]],"nextUri":%q}`, sharedTestQueryID, server.URL+"/v1/statement/executing/"+sharedTestQueryID+"/token/1")
+					return
+				}
+				if !acknowledge {
+					http.Error(w, "unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"id":%q,"stats":{"state":"FINISHED"}}`, sharedTestQueryID)
+			}))
+			defer server.Close()
+			states, err := sharedTestClient(t, server).CatalogStates(context.Background())
+			if requests.Load() != 2 {
+				t.Fatalf("expected final acknowledgement request, got %d requests", requests.Load())
+			}
+			if acknowledge {
+				if err != nil || states["example"] != "OPERATIONAL" {
+					t.Fatalf("finished result page was not retained: states=%v err=%v", states, err)
+				}
+			} else if err == nil || TrinoCatalogOutcomeTerminal(err) {
+				t.Fatal("failed acknowledgement was classified as successful or terminal")
+			}
+		})
+	}
+}
+
 func TestSharedCatalogProductionTransportTLSAndPaging(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
