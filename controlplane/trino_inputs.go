@@ -129,6 +129,7 @@ func trinoProvisionerEnabled() bool {
 type trinoCell struct {
 	ID             string
 	PublicID       string
+	RoutingGroup   string
 	Namespace      string
 	Backends       []trinoRegisteredBackend
 	CoordinatorURL string
@@ -165,6 +166,7 @@ func resolveTrinoCell() (trinoCell, error) {
 	}
 	return trinoCell{
 		ID:             cellID,
+		RoutingGroup:   "legacy",
 		Namespace:      strings.TrimSpace(os.Getenv(envTrinoNamespace)),
 		CoordinatorURL: coordinatorURL,
 		TLSServerName:  strings.TrimSpace(os.Getenv(envTrinoCoordinatorServerName)),

@@ -5,6 +5,7 @@ package controlplane
 import (
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func (stubProvisioningStore) LatestConfigChange() (time.Time, error) { return ti
 // reach, against the REAL wiring multitenant.go uses (registerReadOnlyGroup
 // is the only mount point for discovery routes). Two assertions:
 //
-//  1. The group registers EXACTLY the two discovery GETs — a new route
+//  1. The group registers exactly two discovery GETs and one routing GET. A route
 //     added to the group shows up here and forces a deliberate decision.
 //  2. The auth matrix on those real routes: discovery and admin tokens
 //     pass, junk and empty fail. (Cross-surface rejection — discovery
@@ -73,7 +74,7 @@ func TestReadOnlyGroupTopology(t *testing.T) {
 	readOnlyTokens := admin.NewTokenSet("read-only-secret", nil)
 
 	engine := gin.New()
-	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, stubProvisioningStore{})
+	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, stubProvisioningStore{}, newTrinoRoutingSnapshot(&routingSnapshotStore{}, nil))
 
 	var got []string
 	for _, r := range engine.Routes() {
@@ -81,10 +82,11 @@ func TestReadOnlyGroupTopology(t *testing.T) {
 	}
 	sort.Strings(got)
 	want := []string{
+		"GET /api/v1/trino/routing-snapshot",
 		"GET /api/v1/warehouse-team-ids",
 		"GET /api/v1/warehouses",
 	}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("discovery group routes = %v, want exactly %v — a new route on this group extends what the discovery credential can reach; move it or update this test deliberately", got, want)
 	}
 
@@ -97,7 +99,7 @@ func TestReadOnlyGroupTopology(t *testing.T) {
 		engine.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	for _, path := range []string{"/api/v1/warehouses", "/api/v1/warehouse-team-ids"} {
+	for _, path := range []string{"/api/v1/warehouses", "/api/v1/warehouse-team-ids", "/api/v1/trino/routing-snapshot"} {
 		if code := serve(path, "read-only-secret"); code != http.StatusOK {
 			t.Errorf("%s with discovery token: %d, want 200", path, code)
 		}

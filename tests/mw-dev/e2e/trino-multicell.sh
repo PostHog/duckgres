@@ -48,6 +48,9 @@ api -X PUT -H 'Content-Type: application/json' -d '{"cell":"cell-test"}' \
   || fail "initial cell selection failed"
 api "$API/api/v1/orgs/$ORG_C/trino" | jq -e '.enabled == false and .assigned == true and .cell.id == "cell-test"' >/dev/null \
   || fail "selection must not enable Trino"
+api "$API/api/v1/trino/routing-snapshot" | jq -e --arg principal "$DB_C" \
+  'all(.routes[]; .principal != $principal)' >/dev/null \
+  || fail "disabled warehouse appeared in routing snapshot"
 api -X POST -H 'Content-Type: application/json' -d '{"enabled":true,"tier":"free"}' "$API/api/v1/orgs/$ORG_C/trino" >/dev/null
 
 wait_cell_ready() {
@@ -64,6 +67,17 @@ wait_cell_ready() {
   fail "registered cell did not reconcile tenant readiness"
 }
 wait_cell_ready
+snapshot="$(api "$API/api/v1/trino/routing-snapshot")"
+printf %s "$snapshot" | jq -e --arg legacy "$DB_A" --arg registered "$DB_C" \
+  'any(.routes[]; .principal == $legacy and .routingGroup == "legacy") and
+   any(.routes[]; .principal == $registered and .routingGroup == "cell-test") and
+   all(.routes[]; (keys | sort) == ["principal","routingGroup"])' >/dev/null \
+  || fail "routing snapshot did not project ready principals and distinct owning groups"
+for token in "" "wrong-token"; do
+  code="$(curl --connect-timeout 5 --max-time 30 -sS -o /dev/null -w '%{http_code}' \
+    -H "X-Duckgres-Internal-Secret: $token" "$API/api/v1/trino/routing-snapshot")"
+  [ "$code" = 401 ] || fail "routing snapshot accepted invalid credentials"
+done
 wait_cell_auth() {
   attempt=0
   while [ "$attempt" -lt 36 ]; do
@@ -158,6 +172,9 @@ for endpoint in "$BLUE_TRINO" "$GREEN_TRINO"; do
   [ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
     || fail "registry-only registered query failed"
 done
+api "$API/api/v1/trino/routing-snapshot" | jq -e --arg legacy "$DB_A" --arg registered "$DB_C" \
+  'all(.routes[]; .principal != $legacy) and any(.routes[]; .principal == $registered and .routingGroup == "cell-test")' >/dev/null \
+  || fail "registry-only snapshot exposed unconfigured legacy ownership"
 code="$(curl --connect-timeout 5 --max-time 30 -sS -o /dev/null -w '%{http_code}' -H "$H" -H 'Content-Type: application/json' \
   -X POST -d '{"enabled":true,"tier":"free"}' "$API/api/v1/orgs/$ORG_A/trino")"
 [ "$code" = 409 ] || fail "registry-only enablement accepted legacy ownership"

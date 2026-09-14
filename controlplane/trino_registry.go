@@ -77,10 +77,13 @@ func resolveTrinoCells() ([]trinoCell, error) {
 		}
 	}
 	for _, entry := range registered {
+		if !registryOnly && entry.RoutingGroup == "legacy" {
+			return nil, errors.New("registered cell must not share the legacy routing group")
+		}
 		if !registryOnly && entry.Namespace == legacyNS {
 			return nil, errors.New("registered cell must not share the legacy namespace")
 		}
-		cell := trinoCell{ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends}
+		cell := trinoCell{ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, RoutingGroup: entry.RoutingGroup, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends}
 		for _, backend := range entry.Backends {
 			endpoint, _ := trinoEndpointKey(backend.CoordinatorURL)
 			if !registryOnly && endpoint == legacyEndpoint {

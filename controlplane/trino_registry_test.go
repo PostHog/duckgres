@@ -11,7 +11,8 @@ import (
 
 func TestTrinoRegistryRuntimePreservesLegacyAndSkipsStoppedBackend(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cells.json")
-	if err := os.WriteFile(path, []byte(testTrinoRegistryJSON), 0600); err != nil {
+	registry := strings.Replace(testTrinoRegistryJSON, `"routing_group":"cell-test"`, `"routing_group":"pool-a"`, 1)
+	if err := os.WriteFile(path, []byte(registry), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv(envTrinoCellsFile, path)
@@ -30,6 +31,15 @@ func TestTrinoRegistryRuntimePreservesLegacyAndSkipsStoppedBackend(t *testing.T)
 	}
 	if cells[1].CoordinatorURL != "https://blue.example.test" || len(cells[1].Backends) != 2 {
 		t.Fatal("runtime discarded blue or stopped green")
+	}
+	if cells[0].RoutingGroup != "legacy" || cells[1].RoutingGroup != "pool-a" {
+		t.Fatalf("runtime routing group mismatch: %+v", cells)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(registry, `"routing_group":"pool-a"`, `"routing_group":"legacy"`, 1)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveTrinoCells(); err == nil {
+		t.Fatal("registered routing group must not alias the legacy group")
 	}
 	t.Setenv(envTrinoCoordinatorURL, "")
 	if _, err := resolveTrinoCells(); err == nil {
