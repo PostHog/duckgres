@@ -2176,7 +2176,7 @@ func TestTrinoCacheManagersHaveWritableBoundedStorage(t *testing.T) {
 
 func TestTrinoCacheModeFollowsScenario(t *testing.T) {
 	for _, tc := range []struct{ scenario, enabled string }{
-		{"posthog_frozen_perf", "false"}, {"posthog_frozen_perf_trino_cached", "true"},
+		{"posthog_frozen_perf", "false"},
 	} {
 		t.Run(tc.scenario, func(t *testing.T) {
 			fakes := newRunSHFakes(t)

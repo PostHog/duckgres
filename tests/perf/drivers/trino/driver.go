@@ -35,15 +35,17 @@ type StartupOptions struct {
 
 type ConnectionConfig struct {
 	// Protocol defaults to trino; trino_cached labels runs against a cache-enabled deployment.
-	Protocol   core.Protocol
-	ServerURL  string
-	Username   string
-	Password   string
-	Catalog    string
-	Schema     string
-	Source     string
-	CACertFile string
-	Startup    StartupOptions
+	Protocol core.Protocol
+	// CatalogStoreCellID scopes benchmark catalog validation to its deployment.
+	CatalogStoreCellID string
+	ServerURL          string
+	Username           string
+	Password           string
+	Catalog            string
+	Schema             string
+	Source             string
+	CACertFile         string
+	Startup            StartupOptions
 }
 
 func (c ConnectionConfig) DSN() (string, error) {

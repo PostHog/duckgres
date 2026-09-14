@@ -55,7 +55,7 @@ func TestCatalogCacheModeMatchesBenchmarkLabel(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := &cacheModeQuery{row: tc.row}
-			err := checkTrinoCatalogCacheMode(context.Background(), q, "org_fixture", tc.protocol)
+			err := checkTrinoCatalogCacheMode(context.Background(), q, "org_fixture", tc.protocol, "cell-a")
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
