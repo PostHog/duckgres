@@ -87,6 +87,10 @@ wait_cell_auth
 
 log "read-only rollout readiness with a private fixture canary"
 rollout_token="$(head -c 32 /dev/urandom | base64 | tr -d '\n')"
+if [ "${TRINO_SHARED_CATALOGS_ENABLED:-false}" = true ]; then
+  rollout_token="$("$KUBECTL" -n "$NS" get secret trino-shared-gateway -o json | jq -r '.data["admin-token"]' | base64 -d)"
+  [ "${#rollout_token}" -ge 32 ] || fail "isolated Gateway token is missing"
+fi
 canaries="$(jq -cn --arg org "$ORG_C" --arg principal "$DB_C" --arg password "$pw_c" \
   '{canaries:[{cell:"cell-test",orgID:$org,principal:$principal,password:$password}]}')"
 printf %s "$canaries" | jq -Rs --arg token "$rollout_token" --arg ns "$NS" \

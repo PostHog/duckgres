@@ -1,0 +1,184 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trino-shared-gateway
+  namespace: ${NAMESPACE}
+stringData:
+  admin-token: "${TRINO_GATEWAY_ADMIN_TOKEN}"
+  private.pem: |
+${TRINO_GATEWAY_PRIVATE_KEY}
+  public.pem: |
+${TRINO_GATEWAY_PUBLIC_KEY}
+  config.yaml: |
+    serverConfig:
+      node.environment: isolated_test
+      http-server.http.port: 8080
+      http-server.https.enabled: true
+      http-server.https.port: 8443
+      http-server.https.keystore.path: /etc/test-tls/keystore.p12
+      http-server.https.keystore.key: ${TRINO_TLS_PASSWORD}
+      proxy.http-client.trust-store-path: /etc/test-trust/truststore.p12
+      proxy.http-client.trust-store-password: ${TRINO_TLS_PASSWORD}
+      monitor.http-client.trust-store-path: /etc/test-trust/truststore.p12
+      monitor.http-client.trust-store-password: ${TRINO_TLS_PASSWORD}
+    dataStore:
+      jdbcUrl: jdbc:postgresql://duckgres-config-store.${NAMESPACE}.svc:5432/duckgres?currentSchema=gateway_rollout_test
+      user: duckgres
+      password: ${CONFIG_STORE_PASSWORD}
+      driver: org.postgresql.Driver
+    routing:
+      defaultRoutingGroup: cell-test
+    monitor:
+      taskDelay: 1s
+    clusterStatsConfiguration:
+      monitorType: INFO_API
+    transactionAwareness:
+      enabled: true
+      identityKey: ${TRINO_GATEWAY_IDENTITY_KEY}
+      adminToken: ${TRINO_GATEWAY_ADMIN_TOKEN}
+      terminalRetentionSeconds: 1
+    presetUsers:
+      cell-rollout:
+        password: ${TRINO_GATEWAY_ADMIN_TOKEN}
+        privileges: API
+      fixture-admin:
+        password: ${TRINO_GATEWAY_ADMIN_TOKEN}
+        privileges: ADMIN_USER_API
+    authentication:
+      defaultType: form
+      form:
+        selfSignKeyPair:
+          privateKey: /etc/test-gateway/private.pem
+          publicKey: /etc/test-gateway/public.pem
+    authorization:
+      admin: "(.*)ADMIN(.*)"
+      api: "(.*)API(.*)"
+      user: "(.*)USER(.*)"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: duckgres-trino-gateway
+  namespace: ${NAMESPACE}
+spec:
+  selector: { app: duckgres-trino-gateway }
+  ports: [{ name: https, port: 8443, targetPort: 8443 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: duckgres-trino-gateway
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 0
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: duckgres-trino-gateway }
+  template:
+    metadata:
+      labels: { app: duckgres-trino-gateway }
+    spec:
+      automountServiceAccountToken: false
+      securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000 }
+      initContainers:
+        - name: truststore
+          image: ${TRINO_GATEWAY_IMAGE}
+          command: [sh, -ec]
+          args:
+            - keytool -importcert -noprompt -alias fixture-ca -file /etc/test-tls/ca.crt -keystore /etc/test-trust/truststore.p12 -storetype PKCS12 -storepass "$KEYSTORE_PASSWORD"
+          env:
+            - name: KEYSTORE_PASSWORD
+              valueFrom: { secretKeyRef: { name: duckgres-trino-tls, key: password } }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/test-tls, readOnly: true }
+            - { name: trust, mountPath: /etc/test-trust }
+      containers:
+        - name: gateway
+          image: ${TRINO_GATEWAY_IMAGE}
+          command: [java, -Xmx512m, -jar, /usr/lib/trino-gateway/gateway-ha-jar-with-dependencies.jar, /etc/test-gateway/config.yaml]
+          ports: [{ name: https, containerPort: 8443 }]
+          readinessProbe:
+            httpGet: { scheme: HTTPS, port: https, path: /trino-gateway/readyz }
+          startupProbe:
+            httpGet: { scheme: HTTPS, port: https, path: /trino-gateway/readyz }
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: { cpu: 1, memory: 1Gi }
+            limits: { cpu: 1, memory: 1Gi }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/test-tls, readOnly: true }
+            - { name: trust, mountPath: /etc/test-trust, readOnly: true }
+            - { name: config, mountPath: /etc/test-gateway, readOnly: true }
+      volumes:
+        - { name: tls, secret: { secretName: duckgres-trino-tls } }
+        - { name: trust, emptyDir: {} }
+        - { name: config, secret: { secretName: trino-shared-gateway } }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trino-shared-gateway-harness
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [duckgres-trino-gateway]
+    verbs: [get, patch, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trino-shared-gateway-harness
+  namespace: ${NAMESPACE}
+subjects: [{ kind: ServiceAccount, name: duckgres, namespace: "${NAMESPACE}" }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: trino-shared-gateway-harness }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trino-shared-catalog-harness
+  namespace: ${TRINO_CELL_NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [duckgres-trino-blue-coordinator, duckgres-trino-green-coordinator]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trino-shared-catalog-harness
+  namespace: ${TRINO_CELL_NAMESPACE}
+subjects: [{ kind: ServiceAccount, name: duckgres, namespace: "${NAMESPACE}" }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: trino-shared-catalog-harness }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-shared-catalog-secret-reader
+  namespace: ducklings
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [cnpg-tenant-ci-pr-${PR_NUMBER}-trinod-password]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: duckgres-ci-pr-${PR_NUMBER}-shared-catalog-secret-reader
+  namespace: ducklings
+  labels:
+    duckgres.posthog.com/ci-pr: "${PR_NUMBER}"
+subjects: [{ kind: ServiceAccount, name: duckgres, namespace: "${NAMESPACE}" }]
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: duckgres-ci-pr-${PR_NUMBER}-shared-catalog-secret-reader
