@@ -107,7 +107,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"TRINO_IMAGE: ghcr.io/posthog/trino:",
 		"E2E_SUITE: ${{ (matrix.scenario == 'posthog_frozen_perf' || matrix.scenario == 'posthog_frozen_perf_trino_cached') && 'trino' || 'neutral' }}",
 		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"3\"",
-		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 12Gi",
+		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 64Gi",
 		"role-duration-seconds: 16200",
 		"tests/mw-dev/run.sh deploy",
 		"tests/mw-dev/run.sh test-scenario",
