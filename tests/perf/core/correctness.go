@@ -19,7 +19,7 @@ func (r *QueryRunner) validateRepresentations(ctx context.Context) error {
 	for _, representation := range []string{"json", "other"} {
 		for _, protocol := range r.cfg.Catalog.Targets {
 			for _, q := range r.cfg.Catalog.Queries {
-				if q.Representation == "" || !querySupportsProtocol(q, protocol) || (q.Representation == "json") != (representation == "json") {
+				if q.SkipReason != "" || q.Representation == "" || !querySupportsProtocol(q, protocol) || (q.Representation == "json") != (representation == "json") {
 					continue
 				}
 				reader, ok := r.cfg.Drivers[protocol].(ResultReader)

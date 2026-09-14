@@ -49,7 +49,7 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	text := string(out)
 	for _, name := range []string{
 		"DUCKGRES_SCENARIO_ORG_ID",
-		"DUCKGRES_SCENARIO_PROPERTIES_S3_URI",
+		"DUCKGRES_SCENARIO_FROZEN_S3_URI",
 		"DUCKGRES_SCENARIO_TRINO_CA_CERT",
 		"DUCKGRES_SCENARIO_ATHENA_REGION",
 		"DUCKGRES_SCENARIO_ATHENA_WORKGROUP",

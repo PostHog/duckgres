@@ -30,10 +30,14 @@ func Catalog() core.Catalog {
 			} else {
 				sql = fmt.Sprintf("SELECT event, COUNT(*) AS event_count FROM %s WHERE %s = 'Chrome' GROUP BY event ORDER BY event_count DESC, event ASC NULLS LAST LIMIT 20", relation, expr)
 			}
-			c.Queries = append(c.Queries, core.Query{QueryID: "properties_" + intent + "_v1__" + rep, IntentID: "properties." + intent + ".v1", Representation: rep, Targets: qt, PGWireSQL: sql})
+			q := core.Query{QueryID: "properties_" + intent + "_v1__" + rep, IntentID: "properties." + intent + ".v1", Representation: rep, Targets: qt, PGWireSQL: sql}
+			if rep == "variant" {
+				q.SkipReason = "Hoglake does not support the VARIANT representation"
+			}
+			c.Queries = append(c.Queries, q)
 			if rep == "json" {
-				// Cached Trino and Athena still verify against an untimed JSON baseline.
-				c.Queries = append(c.Queries, core.Query{QueryID: "properties_" + intent + "_v1__json_baseline", IntentID: "properties." + intent + ".v1", Representation: "json", ValidationOnly: true, Targets: []core.Protocol{core.ProtocolTrinoCached, core.ProtocolAthena}, PGWireSQL: sql})
+				// Athena verifies STRUCT against an untimed JSON baseline.
+				c.Queries = append(c.Queries, core.Query{QueryID: "properties_" + intent + "_v1__json_baseline", IntentID: "properties." + intent + ".v1", Representation: "json", ValidationOnly: true, Targets: []core.Protocol{core.ProtocolAthena}, PGWireSQL: sql})
 			}
 		}
 	}

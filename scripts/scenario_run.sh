@@ -21,6 +21,7 @@ Optional environment:
   DUCKGRES_SCENARIO_DBT_BIN
   DUCKGRES_SCENARIO_MAX_RUNTIME
   DUCKGRES_SCENARIO_GO_TEST_TIMEOUT
+  DUCKGRES_SCENARIO_PROPERTIES_S3_URI (optional generated single-day properties fixture)
 
 Scenario-specific required environment:
   DUCKGRES_SCENARIO_ORG_ID       (required by successful provisioning scenarios)
@@ -128,21 +129,6 @@ fi
 if [ "$check_env_only" -eq 1 ]; then
   echo "Duckgres scenario environment is configured."
   exit 0
-fi
-
-# Prepare only this explicitly selected workload; environment checks remain read-only.
-scenario_name="$(basename "$scenario_file")"
-if [ "$scenario_name" = "posthog_frozen_perf.yaml" ] || [ "$scenario_name" = "posthog_frozen_perf_trino_cached.yaml" ]; then
-  export DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR="$(root_relative_path "${DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR:-/tmp/properties-perf}")"
-  prepare_args=(go run ./cmd/perf-properties-prepare \
-    -s3-uri "$DUCKGRES_SCENARIO_PROPERTIES_S3_URI" \
-    -output-dir "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR")
-  if [ "$scenario_name" = "posthog_frozen_perf.yaml" ]; then
-    prepare_args+=(-athena-database "$DUCKGRES_SCENARIO_ATHENA_DATABASE" -athena-region "$DUCKGRES_SCENARIO_ATHENA_REGION")
-  fi
-  "${prepare_args[@]}"
-  DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION="$(cat "$DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR/dataset-version.txt")"
-  export DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION
 fi
 
 args=(

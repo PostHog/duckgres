@@ -167,8 +167,6 @@ func TestProvisionSmokeScenarioUsesIsolatedStackWarehouseIdentityAndSupportedSte
 }
 
 func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", t.TempDir())
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
 	const scenarioOrgID = "ci-pr-123-cnpg"
@@ -459,13 +457,10 @@ func TestLoadScenarioForRunResolvesScenarioRelativeFiles(t *testing.T) {
 	}
 }
 
-func TestFrozenPerfScenarioUsesSupportedStepsAndGeneratedCatalog(t *testing.T) {
-	outputDir := t.TempDir()
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", outputDir)
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
+func TestFrozenPerfScenarioUsesSupportedStepsAndOriginalCatalog(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
-	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 	setAthenaPerfEnv(t)
@@ -497,8 +492,8 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndGeneratedCatalog(t *testing.T) {
 		if !ok || !filepath.IsAbs(catalogFile) {
 			t.Fatalf("perf catalog_file = %#v, want absolute path", step.With["catalog_file"])
 		}
-		if want := filepath.Join(outputDir, "catalog.yaml"); catalogFile != want {
-			t.Fatalf("perf catalog_file = %q, want generated catalog %q", catalogFile, want)
+		if !strings.HasSuffix(catalogFile, filepath.Join("perf", "queries", "ducklake_posthog_tables.yaml")) {
+			t.Fatalf("perf catalog_file = %q, want original checked-in corpus", catalogFile)
 		}
 		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-perf-20260102t030405z" {
 			t.Fatalf("perf run_id = %q, want scenario run id", runID)
@@ -526,13 +521,10 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndGeneratedCatalog(t *testing.T) {
 	}
 }
 
-func TestFrozenPerfScenarioRegistersPropertiesBeforePerf(t *testing.T) {
-	outputDir := t.TempDir()
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_OUTPUT_DIR", outputDir)
-	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_DATASET_VERSION", "fixture-test-version")
+func TestFrozenPerfScenarioRunsOptionalPropertiesAfterOriginalPerf(t *testing.T) {
 	t.Setenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI", "s3://example/properties/")
 	t.Setenv("DUCKGRES_SCENARIO_HOGLAKE_URI", "http://hoglake:8080")
-	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "")
+	t.Setenv("DUCKGRES_SCENARIO_FROZEN_S3_URI", "s3://example-frozen/frozen_v1/")
 	t.Setenv("DUCKGRES_SCENARIO_ORG_ID", "ci-pr-123-cnpg")
 	t.Setenv("DUCKGRES_SCENARIO_TRINO_CA_CERT", "/tmp/test-trino-ca.crt")
 	setAthenaPerfEnv(t)
@@ -552,16 +544,17 @@ func TestFrozenPerfScenarioRegistersPropertiesBeforePerf(t *testing.T) {
 	for _, step := range resolved.Steps {
 		steps[step.ID] = step
 	}
-	setup, ok := steps["setup_properties"]
-	if !ok {
-		t.Fatal("expected properties table setup step")
+	comparison, ok := steps["properties_comparison"]
+	if !ok || comparison.Type != stepTypePropertiesComparison {
+		t.Fatal("expected optional properties comparison step")
 	}
-	if got := setup.DependsOn; len(got) != 1 || got[0] != "wait_ready" {
-		t.Fatalf("properties setup dependencies = %#v, want [wait_ready]", got)
+	if got := comparison.DependsOn; len(got) != 1 || got[0] != "perf_queries" {
+		t.Fatalf("properties dependencies = %#v, want original perf first", got)
 	}
-	setupFile, _ := setup.With["file"].(string)
-	if want := filepath.Join(outputDir, "setup.sql"); setupFile != want {
-		t.Fatalf("properties setup file = %q, want generated setup %q", setupFile, want)
+	for _, name := range scenario.RequiredEnv {
+		if name == "DUCKGRES_SCENARIO_PROPERTIES_S3_URI" {
+			t.Fatal("properties fixture must remain optional")
+		}
 	}
 	waitTrino, ok := steps["wait_trino_ready"]
 	if !ok {
@@ -576,16 +569,16 @@ func TestFrozenPerfScenarioRegistersPropertiesBeforePerf(t *testing.T) {
 		t.Fatalf("Trino provision request = %#v, want enabled", provisionRequest["trino"])
 	}
 	hoglake := steps["setup_hoglake"]
-	if hoglake.Type != scenarioperf.StepTypeSetupHoglake || len(hoglake.DependsOn) != 1 || hoglake.DependsOn[0] != "wait_ready" {
-		t.Fatalf("Hoglake setup must follow warehouse readiness: %#v", hoglake)
+	if hoglake.Type != scenarioperf.StepTypeSetupHoglake || len(hoglake.DependsOn) != 1 || hoglake.DependsOn[0] != "validate_posthog_tables" {
+		t.Fatalf("Hoglake setup must follow original table validation: %#v", hoglake)
 	}
 	if file, _ := hoglake.With["file"].(string); file == "" {
 		t.Fatal("missing Hoglake setup script")
 	} else if _, err := os.Stat(file); err != nil {
 		t.Fatal(err)
 	}
-	if got := steps["perf_queries"].DependsOn; len(got) != 3 || got[0] != "setup_properties" || got[1] != "setup_hoglake" || got[2] != "wait_trino_ready" {
-		t.Fatalf("perf dependencies = %#v, want [setup_properties setup_hoglake wait_trino_ready]", got)
+	if got := steps["perf_queries"].DependsOn; len(got) != 2 || got[0] != "setup_hoglake" || got[1] != "wait_trino_ready" {
+		t.Fatalf("perf dependencies = %#v, want original setup only", got)
 	}
 }
 
@@ -932,6 +925,8 @@ func (e dispatchExecutor) ExecuteStep(ctx context.Context, step core.Step) error
 		return e.provision.ExecuteStep(ctx, step)
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return e.sql.ExecuteStep(ctx, step)
+	case stepTypePropertiesComparison:
+		return e.runPropertiesComparison(ctx, step)
 	case scenarioperf.StepTypePerfQueries, scenarioperf.StepTypeSetupHoglake:
 		return e.perf.ExecuteStep(ctx, step)
 	case scenariodbt.StepTypeDBTRun:
@@ -954,7 +949,7 @@ func dispatchSupports(stepType string) bool {
 		return true
 	case scenariosql.StepTypeSQL, scenariosql.StepTypeSQLCatalog:
 		return true
-	case scenarioperf.StepTypePerfQueries, scenarioperf.StepTypeSetupHoglake:
+	case scenarioperf.StepTypePerfQueries, scenarioperf.StepTypeSetupHoglake, stepTypePropertiesComparison:
 		return true
 	case scenariodbt.StepTypeDBTRun:
 		return true
@@ -1044,7 +1039,7 @@ func resolveScenarioFilePaths(s core.Scenario, baseDir string) core.Scenario {
 		}
 		with := make(map[string]any, len(step.With))
 		for k, v := range step.With {
-			if k == "file" || k == "catalog_file" || k == "project_dir" || k == "profiles_dir" {
+			if k == "file" || k == "catalog_file" || k == "project_dir" || k == "profiles_dir" || k == "hoglake_file" {
 				if file, ok := v.(string); ok && file != "" && !filepath.IsAbs(file) && !strings.HasPrefix(file, "${env:") {
 					v = filepath.Clean(filepath.Join(baseDir, file))
 				}

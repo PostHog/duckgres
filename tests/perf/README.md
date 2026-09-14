@@ -73,9 +73,9 @@ under either explicit cache-mode label. Teardown removes the test workers.
 Warmup does not imply that the entire dataset fits in memory. Query-local
 buffering, prefetching, DuckLake catalog caching, and separate cache
 proxies/extensions are unaffected, so "uncached" here is not a fully cold
-end-to-end read path. The legacy full-corpus paired catalog uses `balanced_v4`
+end-to-end read path. The full-corpus paired catalog uses `balanced_v4`
 query and intent IDs to separate its methodology from `balanced_v3`. The frozen
-scenarios now use the generated properties catalog described below.
+scenario retains this catalog and optionally appends the properties comparison described below.
 
 ## Paired Query Catalogs
 
@@ -279,30 +279,39 @@ external-read/hit counters to distinguish storage traffic from cached reads.
 
 ## Published properties workload
 
-The existing frozen-perf scenario takes `DUCKGRES_SCENARIO_PROPERTIES_S3_URI`,
-the generated Parquet directory, with no completion manifest requirement or
-new repository secret. `just prepare-properties-perf "$DUCKGRES_SCENARIO_PROPERTIES_S3_URI"`
-emits private SQL/catalog inputs to `/tmp/properties-perf` (optional second
-argument overrides it), using a five-minute timeout.
+The frozen-perf scenario runs its existing catalog and frozen dataset first,
+unchanged. An optional `properties_comparison` step then compares browser
+properties on a separate generated single-day fixture. Set
+`DUCKGRES_SCENARIO_PROPERTIES_S3_URI` (workflow input `properties_s3_uri`) to its
+immutable Parquet directory. The default is empty: no properties preparation or
+queries run. No completion manifest or new repository secret is required.
 
-Properties are the sole benchmark suite in this scenario: registration and
-validation happen before their single `perf_queries` step. The original
-full-corpus benchmark phase is no longer run. Results use the existing `perf/`
-artifact location and scenario run ID.
+Choose a modest full day and generate matching JSON/VARIANT/STRUCT files before
+enabling this phase. The large previously generated fixture is not a default.
+Queries cover the entire selected prefix, with one warmup and four measured
+iterations. Merely filtering a large mixed-day file set does not guarantee small
+scans. The runner does not generate data or enforce a row-count limit.
 
-The catalog queries the entire selected dataset with one warmup and four measured
-iterations. The main scenario measures JSON with `duckgres (vanilla)`,
-`duckgres (cache)`, and `trino (vanilla)`, plus STRUCT with Athena. The same
-scenario requests VARIANT as `trino (cache+variant)` on a separate cached Trino
-coordinator. Cached Trino and Athena also use
-untimed JSON correctness baselines.
+The properties catalog measures JSON with `duckgres (vanilla)`, `duckgres (cache)`,
+and `trino (vanilla)`, plus STRUCT with Athena. Athena also runs an untimed JSON
+baseline; complete ordered results must match across supported representations
+before properties measurements start. `trino (cache+variant)` is explicitly
+unsupported until Hoglake supports VARIANT: its two comparisons emit `skipped`
+rows with a reason and no timings, and do not connect to cached Trino. Skipped
+rows use iteration zero and are excluded from measured/warmup query counts.
+Original cached Trino benchmarks continue running normally.
 
-Hoglake's catalog `data_path` is initialized from the selected properties prefix
-so its registered Parquet files are inside the catalog's allowed location.
-Duckgres registers only JSON in both cache modes. Cached Trino still requires
-Hoglake VARIANT support. The shared JSON setup does not register its VARIANT
-relation, so this target currently fails the shared correctness gate and can
-prevent measurements for all targets. The workflow creates the Athena external
-table if missing and the scenario verifies its mapping.
-See the [properties runbook](../../docs/runbooks/properties-perf.md) for workflow
-inputs, registration, execution, and recovery.
+Original results retain `perf/`, the scenario run ID, and
+`posthog-file-views-v1`. Properties results use `perf-properties/`, a
+`-properties` run ID suffix, and a version derived from the selected object
+inventory. This keeps the original dashboard history stable and prevents the
+publisher from overwriting one result set with the other. Both use the existing
+publisher; only main-branch runs publish to the shared database. Dashboard
+comparisons must match properties intent IDs and successful statuses; existing
+full-corpus aggregate panels do not automatically include properties queries.
+
+All properties preparation happens after the original result files are complete,
+so a properties setup or validation failure cannot prevent their publication.
+Failures still fail the scenario and trigger cleanup. See the
+[properties runbook](../../docs/runbooks/properties-perf.md) for fixture preparation,
+catalog registration, and recovery.

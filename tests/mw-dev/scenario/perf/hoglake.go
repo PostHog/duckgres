@@ -33,7 +33,8 @@ func (e *Executor) setupHoglake(ctx context.Context, step core.Step) error {
 	if err != nil {
 		return err
 	}
-	args := []string{script, "--uri", uri, inputFlag, input, "--catalog", orgID}
+	catalog := stringFromWith(step, "hoglake_catalog", orgID)
+	args := []string{script, "--uri", uri, inputFlag, input, "--catalog", catalog}
 	if propertiesSource != "" {
 		representation, err := requiredString(step, "representation")
 		if err != nil {

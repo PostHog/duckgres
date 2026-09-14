@@ -57,6 +57,8 @@ type Catalog struct {
 }
 
 type Query struct {
+	// SkipReason records an explicitly unsupported comparison without executing it.
+	SkipReason string `yaml:"skip_reason,omitempty" json:"skip_reason,omitempty"`
 	// ValidationOnly keeps a baseline in the correctness gate but excludes warmup and measurements.
 	ValidationOnly bool           `yaml:"validation_only,omitempty" json:"validation_only,omitempty"`
 	Representation string         `yaml:"representation,omitempty" json:"representation,omitempty"`

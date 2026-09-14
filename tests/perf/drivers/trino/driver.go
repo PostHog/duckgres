@@ -38,14 +38,16 @@ type ConnectionConfig struct {
 	Protocol core.Protocol
 	// CatalogStoreCellID scopes benchmark catalog validation to its deployment.
 	CatalogStoreCellID string
-	ServerURL          string
-	Username           string
-	Password           string
-	Catalog            string
-	Schema             string
-	Source             string
-	CACertFile         string
-	Startup            StartupOptions
+	// HoglakeCatalog explicitly selects a dataset in the disposable scenario catalog.
+	HoglakeCatalog string
+	ServerURL      string
+	Username       string
+	Password       string
+	Catalog        string
+	Schema         string
+	Source         string
+	CACertFile     string
+	Startup        StartupOptions
 }
 
 func (c ConnectionConfig) DSN() (string, error) {
