@@ -11,18 +11,19 @@ import (
 	"github.com/posthog/duckgres/controlplane/provisioning"
 )
 
-// registerReadOnlyGroup mounts the read-only discovery endpoints on their
+// registerReadOnlyGroup mounts discovery and routing snapshots on their
 // OWN gin group: token-only auth (no SSO, no roles) accepting the scoped
 // read-only secret OR the admin internal secret. The read-only secret
 // grants nothing outside this group — an external writer's pod compromise
 // must not escalate to the provisioning/admin surface. ALL discovery
-// routes go through this function so TestReadOnlyGroupTopology can pin
+// and routing routes use this function so TestReadOnlyGroupTopology can pin
 // the exact surface the discovery credential reaches.
-func registerReadOnlyGroup(engine *gin.Engine, readOnlyTokens, adminTokens admin.TokenSet, store provisioning.Store) {
+func registerReadOnlyGroup(engine *gin.Engine, readOnlyTokens, adminTokens admin.TokenSet, store provisioning.Store, routing *trinoRoutingSnapshot) {
 	discoveryAPI := engine.Group("/api/v1",
 		admin.AnyTokenAuthMiddleware(readOnlyTokens, adminTokens),
 	)
 	provisioning.RegisterDiscoveryAPI(discoveryAPI, store)
+	discoveryAPI.GET("/trino/routing-snapshot", routing.handle)
 }
 
 // validateDistinctReadOnlySecret refuses a read-only secret (or fallback)

@@ -65,6 +65,12 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 ## Trino API identity
 
+Gateway can obtain eligible principal-to-routing-group assignments from the
+machine-only `GET /api/v1/trino/routing-snapshot`, using the scoped read-only
+token rather than an admin credential. See the
+[routing snapshot contract](docs/trino-cells.md#gateway-routing-snapshot) for
+eligibility, limits, refresh guidance, and failure recovery.
+
 `DUCKGRES_TRINO_HOGLAKE_URI` defaults to empty (DuckLake catalog provisioning).
 The frozen perf deployments set it automatically to their namespace-local Hoglake
 service, replacing the Trino backend in the existing cached and uncached scenarios.

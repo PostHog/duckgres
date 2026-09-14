@@ -753,7 +753,7 @@ func SetupMultiTenant(
 	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store))
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
-	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))
+	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store), newTrinoRoutingSnapshot(store, trinoCells))
 	// Pull-based compute-billing API (GET /billing/usage + POST /billing/ack).
 	// The billing service authenticates with the internal secret (→ admin);
 	// RequireAdmin keeps SSO viewers away from raw usage + the ack mutation.

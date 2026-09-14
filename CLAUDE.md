@@ -1326,13 +1326,13 @@ are load-bearing for those consumers:
   group in `multitenant.go` behind `admin.AnyTokenAuthMiddleware`): the
   read-only discovery secret (`--read-only-secret` /
   `DUCKGRES_READ_ONLY_SECRET`, sent in `X-Duckgres-Internal-Secret`, same
-  fallback-rotation semantics as the internal secret) works ONLY on these
-  two GETs; the admin internal secret also works here (operator/debug +
+  fallback-rotation semantics as the internal secret) works only on these
+  two GETs and `GET /api/v1/trino/routing-snapshot`; the admin internal secret also works here (operator/debug +
   rotation window). Never register discovery routes inside the admin
   `api` group and never accept `readOnlyTokens` anywhere else — external
-  writer pods carry this credential, and its blast radius must stay "read
+  writer and Gateway pods carry this credential, and its blast radius must stay "read
   the tenant list and its connection topology (RDS endpoints, bucket
-  names, k8s Secret names — never values)". Tripwires:
+  names, k8s Secret names — never values), plus eligible Trino principal-to-group assignments". Tripwires:
   `TestAnyTokenAuthMiddlewareScoping` (token matrix incl. cross-surface
   rejection) and `TestReadOnlyGroupTopology` (the group's exact route
   set, against the real `registerReadOnlyGroup` wiring). A discovery
@@ -1688,6 +1688,11 @@ password/tenant/catalog changes never propagate.
   Admin-only initial selection runs before first enablement and refuses changes
   to any already owned warehouse, including a disabled one. No maintenance move,
   capacity model, rebalancer, drain, or Gateway routing controller is included.
+  The machine-authenticated routing snapshot exports eligible principal-to-group
+  assignments through a fresh bounded database join. It includes only ready,
+  enabled Trino warehouses with enabled root credentials and configured owners.
+  It exports no passwords or hashes. Gateway consumes this read-only snapshot;
+  polling, request routing, and transaction ownership live in Gateway.
   See [docs/trino-cells.md](docs/trino-cells.md) for configuration and recovery.
 - **Blue/green projections share one logical cell's namespace**, but internal
   communication Secrets remain distinct, chart-owned read-only references.

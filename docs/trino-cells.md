@@ -99,10 +99,50 @@ The Trino pages provide an explicit cell selector; they never select an arbitrar
 registered cell. The legacy default remains unchanged when legacy is configured.
 
 `client_url` is the opaque client endpoint, not a cell-selection instruction to
-customers. This PR does not implement authenticated Gateway assignment lookup.
-Do not advertise a shared Gateway URL as usable for a new cell until server-side
-routing has been separately wired and tested with an authenticated query.
+customers. Gateway routing consumes the snapshot described below. Do not
+advertise a shared Gateway URL until its polling integration is deployed and
+tested with an authenticated query without a routing header.
 Coordinator/catalog readiness alone does not prove Gateway reachability.
+
+## Gateway routing snapshot
+
+`GET /api/v1/trino/routing-snapshot` exports the authoritative assignment map:
+
+```json
+{"routes":[{"principal":"warehouse_a","routingGroup":"cell-001"}]}
+```
+
+Send `DUCKGRES_READ_ONLY_SECRET` in `X-Duckgres-Internal-Secret`. Its rotation
+fallbacks work as on the discovery endpoints. The admin internal token also
+works for diagnostics, but Gateway must receive only the read-only credential.
+This is a machine-only endpoint: browser cookies and SSO do not authenticate it.
+The read-only credential now grants exactly the two discovery GETs and this GET;
+it cannot provision, enable Trino, reset passwords, or access the admin API.
+
+Each request performs one fresh, context-bound database join, without a
+control-plane cache. Responses carry `Cache-Control: no-store`. A route requires
+an enabled, ready Trino row, a ready warehouse, a present and enabled root user
+with a nonempty stored password, and a nonempty database name. The principal is
+that database name, not the internal org identifier. Only configured owners are
+included. Legacy's stored ownership maps to `legacy`; registered ownership maps
+to the registry's explicit `routing_group`, which need not equal its cell ID.
+Registered cells cannot reuse `legacy` while a legacy deployment is configured.
+
+The query selects no passwords or hashes. Responses contain no catalog database,
+tenant metadata, or backend endpoints. Unknown/unassigned owners and disabled or
+unready warehouses are absent. Database errors, duplicate principals, and size
+overflow fail the whole request with HTTP 503; they never publish a partial map.
+Limits are 100,000 eligible principals, 8 MiB encoded response, and a three-second
+database deadline. Gateway consumers should refresh every five seconds and stop
+new admissions once their last successful snapshot reaches 15 seconds of age.
+They must not renew snapshot age on a failed refresh or fall back to a default
+cell for an unknown principal. Existing query and transaction backend ownership
+remains a Gateway responsibility, separate from this new-admission snapshot.
+
+For a failed refresh, check control-plane/database health and configured cell
+ownership. A successful empty response is a valid empty eligible set. Do not
+recover by copying assignments, supplying an admin token to Gateway, or adding a
+default routing group. This endpoint does not implement warehouse migration.
 
 ## Blue running, green stopped
 
