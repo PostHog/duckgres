@@ -37,7 +37,7 @@ case "$E2E_SUITE" in
 esac
 # Frozen perf requires the Hoglake connector; other E2E lanes retain their pin.
 if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_trino_cached ]; then
-  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:a2943f5ec37f1d5a9ab90b9bec56695a00de4584@sha256:7a57712498446bd97393cadece90ce0bc297f6feab8e0098510668fe2667ac39}"
+  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:f3bddd334a9e08f54788779ec7c723b8c296765a@sha256:9a4bf1293d0b4b73aa3b46c16bf014ed22bb9fc12b8ea28617cfed06534c8f2d}"
 else
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8}"
 fi
