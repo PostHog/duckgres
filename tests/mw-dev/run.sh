@@ -114,6 +114,8 @@ render_trino_backend() {
     < "$HERE/manifests.trino.tmpl.yaml" \
     | sed -e "s/duckgres-trino-coordinator/duckgres-trino-$color-coordinator/g" \
       -e "s/duckgres-trino-worker/duckgres-trino-$color-worker/g" \
+      -e "s/labels: { app: duckgres-trino, component: coordinator }/labels: { app: duckgres-trino, component: coordinator, posthog.com\/trino-cell: cell-test, posthog.com\/trino-color: $color, app.kubernetes.io\/component: coordinator, app.kubernetes.io\/name: trino-coordinator }/" \
+      -e "s/labels: { app: duckgres-trino, component: worker }/labels: { app: duckgres-trino, component: worker, posthog.com\/trino-cell: cell-test, posthog.com\/trino-color: $color, app.kubernetes.io\/component: worker, app.kubernetes.io\/name: trino-worker }/" \
       -e "s/app: duckgres-trino/app: duckgres-trino-$color/g" \
       -e "s/name: duckgres-trino$/name: duckgres-trino-$color/" \
       -e "s/duckgres-trino\.$TRINO_CELL_NS\.svc/duckgres-trino-$color.$TRINO_CELL_NS.svc/g" \

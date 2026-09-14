@@ -129,6 +129,7 @@ func trinoProvisionerEnabled() bool {
 type trinoCell struct {
 	ID             string
 	PublicID       string
+	RoutingGroup   string
 	Namespace      string
 	Backends       []trinoRegisteredBackend
 	CoordinatorURL string
@@ -165,6 +166,7 @@ func resolveTrinoCell() (trinoCell, error) {
 	}
 	return trinoCell{
 		ID:             cellID,
+		RoutingGroup:   "legacy",
 		Namespace:      strings.TrimSpace(os.Getenv(envTrinoNamespace)),
 		CoordinatorURL: coordinatorURL,
 		TLSServerName:  strings.TrimSpace(os.Getenv(envTrinoCoordinatorServerName)),
@@ -177,6 +179,7 @@ func resolveTrinoCell() (trinoCell, error) {
 // branch is enabled. Returned together so the caller doesn't have to
 // re-derive any of them.
 type trinoWiring struct {
+	Kubernetes  kubernetes.Interface
 	Provisioner *provisioner.TrinoProvisioner
 	BundleStore *opa.BundleStore
 	// BundleHandler is the HTTP handler the API server mounts for the
@@ -356,6 +359,7 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	}
 
 	return &trinoWiring{
+		Kubernetes:    kc,
 		Provisioner:   trinoProv,
 		BundleStore:   bundleStore,
 		BundleHandler: bundleHandler,
