@@ -315,3 +315,8 @@ so a properties setup or validation failure cannot prevent their publication.
 Failures still fail the scenario and trigger cleanup. See the
 [properties runbook](../../docs/runbooks/properties-perf.md) for fixture preparation,
 catalog registration, and recovery.
+
+Scenario Trino connections require `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID`
+(no default), matching the baseline coordinator's `catalog-store.cell-id`.
+The isolated workflow supplies it; local runs must set it. The public readiness
+API cell ID is used only for API identity validation, not catalog-store lookups.

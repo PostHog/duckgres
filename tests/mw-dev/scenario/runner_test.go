@@ -81,11 +81,12 @@ func TestScenarioRunner(t *testing.T) {
 	})
 	scenarioOutputDir := filepath.Join(*scenarioOutputBase, runID)
 	perfExecutor := scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{
-		TrinoCatalogStoreDSN:   os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN"),
-		TrinoCachedURL:         os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_URL"),
-		TrinoCachedCellID:      os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID"),
-		TrinoAdminPasswordFile: os.Getenv("DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE"),
-		ProvisionState:         provisionState,
+		TrinoCatalogStoreDSN:    os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN"),
+		TrinoCatalogStoreCellID: os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID"),
+		TrinoCachedURL:          os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_URL"),
+		TrinoCachedCellID:       os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID"),
+		TrinoAdminPasswordFile:  os.Getenv("DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE"),
+		ProvisionState:          provisionState,
 		Connection: scenariosql.ConnectionConfig{
 			DialHost:        mustEnv(t, "DUCKGRES_SCENARIO_PG_HOST"),
 			SNISuffix:       mustEnv(t, "DUCKGRES_SCENARIO_SNI_SUFFIX"),

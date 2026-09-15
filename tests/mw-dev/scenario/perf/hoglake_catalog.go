@@ -41,6 +41,9 @@ func (f defaultDriverFactory) selectHoglakeCatalog(ctx context.Context, connecti
 	if err != nil {
 		return err
 	}
+	if original == nil {
+		return errors.New("no benchmark catalog in the configured catalog-store cell; verify DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID (not the public API cell ID)")
+	}
 	if original["connector.name"] != "hoglake" || original["hoglake.catalog"] == "" || original["hoglake.uri"] == "" || original["fs.cache.enabled"] != "false" {
 		return errors.New("dataset selection requires an existing uncached Hoglake benchmark catalog")
 	}

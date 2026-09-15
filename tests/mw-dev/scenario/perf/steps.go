@@ -27,25 +27,27 @@ type DriverFactory interface {
 }
 
 type ExecutorConfig struct {
-	TrinoCatalogStoreDSN   string
-	TrinoCachedURL         string
-	TrinoCachedCellID      string
-	TrinoAdminPasswordFile string
-	ProvisionState         *provision.State
-	Connection             scenariosql.ConnectionConfig
-	OutputDir              string
-	DriverFactory          DriverFactory
-	State                  *State
-	Now                    func() time.Time
+	TrinoCatalogStoreCellID string
+	TrinoCatalogStoreDSN    string
+	TrinoCachedURL          string
+	TrinoCachedCellID       string
+	TrinoAdminPasswordFile  string
+	ProvisionState          *provision.State
+	Connection              scenariosql.ConnectionConfig
+	OutputDir               string
+	DriverFactory           DriverFactory
+	State                   *State
+	Now                     func() time.Time
 }
 
 type Executor struct {
-	provisionState *provision.State
-	connection     scenariosql.ConnectionConfig
-	outputDir      string
-	driverFactory  DriverFactory
-	state          *State
-	now            func() time.Time
+	trinoCatalogStoreCellID string
+	provisionState          *provision.State
+	connection              scenariosql.ConnectionConfig
+	outputDir               string
+	driverFactory           DriverFactory
+	state                   *State
+	now                     func() time.Time
 }
 
 type State struct {
@@ -112,12 +114,13 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 		now = time.Now
 	}
 	return &Executor{
-		provisionState: cfg.ProvisionState,
-		connection:     cfg.Connection,
-		outputDir:      cfg.OutputDir,
-		driverFactory:  factory,
-		state:          state,
-		now:            now,
+		trinoCatalogStoreCellID: cfg.TrinoCatalogStoreCellID,
+		provisionState:          cfg.ProvisionState,
+		connection:              cfg.Connection,
+		outputDir:               cfg.OutputDir,
+		driverFactory:           factory,
+		state:                   state,
+		now:                     now,
 	}
 }
 
@@ -464,7 +467,7 @@ func (e *Executor) trinoConnection(spec stepSpec) (trinodriver.ConnectionConfig,
 	}
 	return trinodriver.ConnectionConfig{
 		ServerURL:          status.Cell.CoordinatorURL,
-		CatalogStoreCellID: status.Cell.ID,
+		CatalogStoreCellID: e.trinoCatalogStoreCellID,
 		HoglakeCatalog:     spec.TrinoHoglakeCatalog,
 		Username:           status.Status.Principal,
 		Password:           spec.Password,

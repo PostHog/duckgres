@@ -783,6 +783,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_HOGLAKE_URI, value: "$hoglake_uri" }
             - { name: DUCKGRES_SCENARIO_TRINO_CACHED_URL, value: "https://duckgres-trino-cached.$NS.svc:8443" }
+            - { name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID, value: "ci-pr-${PR_NUMBER}" }
             - { name: DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID, value: "ci-pr-${PR_NUMBER}-cached" }
             - { name: DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE, value: "/trino-admin/admin-password" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }

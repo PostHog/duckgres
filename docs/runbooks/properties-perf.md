@@ -97,3 +97,11 @@ recreate the isolated stack rather than timing an unverified mapping. Preserve
 private diagnostics before cleanup. Scenario deprovisioning and workflow
 teardown remove the owned warehouse and isolated stack; follow the existing
 scenario recovery runbook for interrupted runs using only that run's identity.
+
+The runner requires `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID` to match the
+baseline coordinator's `catalog-store.cell-id`; the isolated workflow supplies
+it automatically. It has no default. Local runs must set it explicitly. The API's
+public cell identity (for example, `legacy`) is not the persisted catalog-store
+identity. Cache verification, catalog switching, and cached-catalog cloning all
+use the explicit stored identity. For a missing-catalog error, check this value
+against the baseline coordinator configuration before retrying.
