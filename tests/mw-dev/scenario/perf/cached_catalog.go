@@ -18,9 +18,10 @@ import (
 )
 
 var benchmarkCatalogName = regexp.MustCompile(`^org_[a-z0-9_]+$`)
+var benchmarkConnectorName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 func cachedCatalogStatement(catalog string, baseline map[string]string) (string, error) {
-	if !benchmarkCatalogName.MatchString(catalog) || baseline["connector.name"] == "" || baseline["fs.cache.enabled"] != "false" {
+	if !benchmarkCatalogName.MatchString(catalog) || !benchmarkConnectorName.MatchString(baseline["connector.name"]) || baseline["fs.cache.enabled"] != "false" {
 		return "", errors.New("cached benchmark requires a managed baseline catalog with caching explicitly disabled")
 	}
 	quoteIdentifier := func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
@@ -39,7 +40,9 @@ func cachedCatalogStatement(catalog string, baseline map[string]string) (string,
 		}
 		properties = append(properties, quoteIdentifier(key)+" = '"+strings.ReplaceAll(value, "'", "''")+"'")
 	}
-	return "CREATE CATALOG " + quoteIdentifier(catalog) + " USING " + quoteIdentifier(baseline["connector.name"]) + " WITH (" + strings.Join(properties, ", ") + ")", nil
+	// Trino validates Identifier.toString() as the connector name; quoting adds
+	// literal quote characters. The validated connector token must be bare.
+	return "CREATE CATALOG " + quoteIdentifier(catalog) + " USING " + baseline["connector.name"] + " WITH (" + strings.Join(properties, ", ") + ")", nil
 }
 
 func checkCachedCatalogProperties(baseline, cached map[string]string) error {

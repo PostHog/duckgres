@@ -88,7 +88,7 @@ func (f defaultDriverFactory) selectHoglakeCatalog(ctx context.Context, connecti
 	for _, k := range keys {
 		properties = append(properties, quote(k)+" = '"+strings.ReplaceAll(desired[k], "'", "''")+"'")
 	}
-	create := "CREATE CATALOG " + quote(connection.Catalog) + " USING " + quote(desired["connector.name"]) + " WITH (" + strings.Join(properties, ", ") + ")"
+	create := "CREATE CATALOG " + quote(connection.Catalog) + " USING " + desired["connector.name"] + " WITH (" + strings.Join(properties, ", ") + ")"
 	interval := connection.Startup.PollInterval
 	if interval <= 0 {
 		interval = 2 * time.Second
