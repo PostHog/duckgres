@@ -520,3 +520,8 @@ gen-certs:
 [group('scripts')]
 seed-ducklake:
     ./scripts/seed_ducklake.sh
+
+# Prepare properties workload SQL/catalog from an existing Parquet prefix.
+[group('test')]
+prepare-properties-perf s3_uri output_dir="/tmp/properties-perf":
+    go run ./cmd/perf-properties-prepare -s3-uri {{quote(s3_uri)}} -output-dir {{quote(output_dir)}}

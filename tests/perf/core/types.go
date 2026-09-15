@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type Protocol string
 
@@ -12,6 +15,23 @@ const (
 	ProtocolTrinoCached    Protocol = "trino_cached"
 	ProtocolAthena         Protocol = "athena"
 )
+
+// RunLabel names the properties comparison without changing protocol routing or
+// relabeling older/full-corpus measurements that lack representation metadata.
+func (p Protocol) RunLabel(representation string) string {
+	switch {
+	case p == ProtocolPGWireUncached && representation == "json":
+		return "duckgres (vanilla)"
+	case p == ProtocolPGWireCached && representation == "json":
+		return "duckgres (cache)"
+	case p == ProtocolTrino && representation == "json":
+		return "trino (vanilla)"
+	case p == ProtocolTrinoCached && representation == "variant":
+		return "trino (cache+variant)"
+	default:
+		return string(p)
+	}
+}
 
 // StorageTarget identifies the physical relation family selected for a paired
 // catalog query. It is runtime-only metadata; artifacts continue to use the
@@ -37,12 +57,18 @@ type Catalog struct {
 }
 
 type Query struct {
-	QueryID       string         `yaml:"query_id"`
-	IntentID      string         `yaml:"intent_id"`
-	Tags          []string       `yaml:"tags"`
-	Params        map[string]any `yaml:"params"`
-	PGWireSQL     string         `yaml:"pgwire_sql"`
-	StorageTarget StorageTarget  `yaml:"-" json:"-"`
+	// SkipReason records an explicitly unsupported comparison without executing it.
+	SkipReason string `yaml:"skip_reason,omitempty" json:"skip_reason,omitempty"`
+	// ValidationOnly keeps a baseline in the correctness gate but excludes warmup and measurements.
+	ValidationOnly bool           `yaml:"validation_only,omitempty" json:"validation_only,omitempty"`
+	Representation string         `yaml:"representation,omitempty" json:"representation,omitempty"`
+	Targets        []Protocol     `yaml:"targets,omitempty" json:"-"`
+	QueryID        string         `yaml:"query_id"`
+	IntentID       string         `yaml:"intent_id"`
+	Tags           []string       `yaml:"tags"`
+	Params         map[string]any `yaml:"params"`
+	PGWireSQL      string         `yaml:"pgwire_sql"`
+	StorageTarget  StorageTarget  `yaml:"-" json:"-"`
 }
 
 // CanonicalSQL returns the single rendered SQL statement shared by protocol
@@ -74,6 +100,7 @@ type ServiceMetrics struct {
 }
 
 type QueryResult struct {
+	Representation   string          `json:"representation,omitempty"`
 	QueryID          string          `json:"query_id"`
 	IntentID         string          `json:"intent_id"`
 	MeasureIteration int             `json:"measure_iteration"`
@@ -95,4 +122,22 @@ type RunSummary struct {
 	TotalQueries   int       `json:"total_queries"`
 	TotalErrors    int       `json:"total_errors"`
 	WarmupQueries  int       `json:"warmup_queries"`
+}
+
+// SQLFor preserves canonical SQL except for the JSON scalar extractor in the
+// explicitly labeled properties workload. The browser key keeps the same
+// semantics while using each engine's supported JSON path syntax.
+func (q Query) SQLFor(protocol Protocol) (string, error) {
+	sql := q.CanonicalSQL()
+	if q.Representation != "" && (protocol == ProtocolTrino || protocol == ProtocolTrinoCached || protocol == ProtocolAthena) {
+		sql = strings.ReplaceAll(sql, "json_extract_string(", "json_extract_scalar(")
+		// Trino/Athena require bracket notation for the dollar-prefixed key.
+		// Match the complete literal used by the generated properties catalog.
+		sql = strings.ReplaceAll(sql, `'$."$browser"'`, `'$["$browser"]'`)
+	}
+	if q.Representation != "" && protocol == ProtocolAthena {
+		// Athena uses the run-specific Glue database, with a flat external table.
+		sql = strings.ReplaceAll(sql, `"properties_perf"."events_supported"`, `"properties_events_supported"`)
+	}
+	return sql, nil
 }

@@ -73,9 +73,32 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 	}
 
 	for _, protocol := range r.cfg.Catalog.Targets {
-		if _, ok := r.cfg.Drivers[protocol]; !ok {
+		if _, ok := r.cfg.Drivers[protocol]; !ok && r.cfg.Catalog.NeedsDriver(protocol) {
 			return summary, fmt.Errorf("missing driver for protocol %q", protocol)
 		}
+	}
+
+	// Unsupported comparisons are visible in artifacts, never timed as successes.
+	for _, protocol := range r.cfg.Catalog.Targets {
+		for _, query := range r.cfg.Catalog.Queries {
+			if query.SkipReason == "" || !querySupportsProtocol(query, protocol) {
+				continue
+			}
+			if r.cfg.Sink != nil {
+				if err := r.cfg.Sink.Record(QueryResult{
+					QueryID: query.QueryID, IntentID: query.IntentID,
+					Representation: query.Representation, Protocol: protocol,
+					Status: "skipped", Error: query.SkipReason, ErrorClass: "unsupported_representation",
+					StartedAt: r.cfg.Now(),
+				}); err != nil {
+					return summary, fmt.Errorf("record unsupported comparison: %w", err)
+				}
+			}
+		}
+	}
+
+	if err := r.validateRepresentations(ctx); err != nil {
+		return summary, err
 	}
 
 	for _, protocol := range r.cfg.Catalog.Targets {
@@ -112,7 +135,7 @@ func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 
 func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, measure bool, measureIteration int, summary *RunSummary) error {
 	for _, query := range queriesForIteration(r.cfg.Catalog.Queries, measureIteration) {
-		if !querySupportsProtocol(query, protocol) {
+		if query.SkipReason != "" || query.ValidationOnly || !querySupportsProtocol(query, protocol) {
 			continue
 		}
 		args := orderedParamValues(query.Params)
@@ -120,6 +143,7 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 		started := r.cfg.Now()
 		result := QueryResult{
 			QueryID:          query.QueryID,
+			Representation:   query.Representation,
 			IntentID:         query.IntentID,
 			MeasureIteration: measureIteration,
 			Protocol:         protocol,
@@ -164,6 +188,18 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 // table, Trino measures the Hoglake table, and Athena measures its
 // Glue external table over the same immutable Parquet files.
 func querySupportsProtocol(query Query, protocol Protocol) bool {
+	if len(query.Targets) > 0 {
+		allowed := false
+		for _, target := range query.Targets {
+			if target == protocol {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
 	switch query.StorageTarget {
 	case "":
 		return true
@@ -216,4 +252,14 @@ func orderedParamValues(params map[string]any) []any {
 		values = append(values, params[k])
 	}
 	return values
+}
+
+// NeedsDriver excludes protocols whose comparisons are all explicitly skipped.
+func (c Catalog) NeedsDriver(protocol Protocol) bool {
+	for _, query := range c.Queries {
+		if query.SkipReason == "" && querySupportsProtocol(query, protocol) {
+			return true
+		}
+	}
+	return false
 }

@@ -18,9 +18,10 @@ import (
 )
 
 var benchmarkCatalogName = regexp.MustCompile(`^org_[a-z0-9_]+$`)
+var benchmarkConnectorName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 func cachedCatalogStatement(catalog string, baseline map[string]string) (string, error) {
-	if !benchmarkCatalogName.MatchString(catalog) || baseline["connector.name"] == "" || baseline["fs.cache.enabled"] != "false" {
+	if !benchmarkCatalogName.MatchString(catalog) || !benchmarkConnectorName.MatchString(baseline["connector.name"]) || baseline["fs.cache.enabled"] != "false" {
 		return "", errors.New("cached benchmark requires a managed baseline catalog with caching explicitly disabled")
 	}
 	quoteIdentifier := func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
@@ -39,7 +40,9 @@ func cachedCatalogStatement(catalog string, baseline map[string]string) (string,
 		}
 		properties = append(properties, quoteIdentifier(key)+" = '"+strings.ReplaceAll(value, "'", "''")+"'")
 	}
-	return "CREATE CATALOG " + quoteIdentifier(catalog) + " USING " + quoteIdentifier(baseline["connector.name"]) + " WITH (" + strings.Join(properties, ", ") + ")", nil
+	// Trino validates Identifier.toString() as the connector name; quoting adds
+	// literal quote characters. The validated connector token must be bare.
+	return "CREATE CATALOG " + quoteIdentifier(catalog) + " USING " + baseline["connector.name"] + " WITH (" + strings.Join(properties, ", ") + ")", nil
 }
 
 func checkCachedCatalogProperties(baseline, cached map[string]string) error {
@@ -136,22 +139,33 @@ func (f defaultDriverFactory) initializeCachedCatalog(ctx context.Context, conn 
 	if interval <= 0 {
 		interval = 2 * time.Second
 	}
+	createFailure, readinessFailure := "none", "none"
+	createAttempts, readinessAttempts := 0, 0
+	timeoutError := func() error {
+		return fmt.Errorf("cached Trino catalog did not become ready within startup timeout: create_attempts=%d last_create_failure=[%s]; readiness_attempts=%d last_readiness_failure=[%s]", createAttempts, createFailure, readinessAttempts, readinessFailure)
+	}
 	for {
 		cached, readErr := readBenchmarkCatalog(ctx, conn, f.trinoCachedCellID, baseline.Catalog)
 		if readErr != nil {
+			if ctx.Err() != nil {
+				return timeoutError()
+			}
 			return readErr
 		}
 		if cached == nil {
 			// Secret projections and OPA can become ready after coordinator health.
 			// A retry first checks persistence, so an uncertain CREATE is not repeated
 			// after its catalog has actually been committed.
-			_, _ = adminDB.ExecContext(ctx, statement)
+			createAttempts++
+			_, createErr := adminDB.ExecContext(ctx, statement)
+			retainTrinoFailure("catalog creation", createErr, &createFailure)
 		} else {
 			if err := checkCachedCatalogProperties(props, cached); err != nil {
 				return err
 			}
 			// SELECT 1 alone does not resolve the catalog. Check tenant access to its
 			// real metadata before timed queries use the independently started cluster.
+			readinessAttempts++
 			rows, queryErr := tenantDB.QueryContext(ctx, `SELECT schema_name FROM information_schema.schemata LIMIT 1`)
 			if queryErr == nil {
 				for rows.Next() {
@@ -169,10 +183,11 @@ func (f defaultDriverFactory) initializeCachedCatalog(ctx context.Context, conn 
 					return nil
 				}
 			}
+			retainTrinoFailure("tenant metadata readiness", queryErr, &readinessFailure)
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("cached Trino catalog did not become ready within startup timeout")
+			return timeoutError()
 		case <-time.After(interval):
 		}
 	}

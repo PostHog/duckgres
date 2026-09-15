@@ -73,8 +73,9 @@ under either explicit cache-mode label. Teardown removes the test workers.
 Warmup does not imply that the entire dataset fits in memory. Query-local
 buffering, prefetching, DuckLake catalog caching, and separate cache
 proxies/extensions are unaffected, so "uncached" here is not a fully cold
-end-to-end read path. The paired query and intent IDs use `balanced_v4` to
-separate this methodology from `balanced_v3`; the dataset is unchanged.
+end-to-end read path. The full-corpus paired catalog uses `balanced_v4`
+query and intent IDs to separate its methodology from `balanced_v3`. The frozen
+scenario retains this catalog and optionally appends the properties comparison described below.
 
 ## Paired Query Catalogs
 
@@ -186,9 +187,9 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `runner.log`
 - `dataset_manifest.json` (only when `DUCKGRES_PERF_DATASET_VERSION` is set)
 
-## Artifact Schema Contract (v1)
+## Artifact Schema Contract (v2)
 
-`query_results.csv` is the canonical per-query artifact and its columns are fixed in v1:
+`query_results.csv` is the canonical per-query artifact and its columns are:
 
 - `query_id`
 - `intent_id`
@@ -200,16 +201,17 @@ Artifacts are written to `artifacts/perf/<run_id>`:
 - `rows`
 - `duration_ms`
 - `started_at`
+- `representation` (empty for existing workloads; `json`, `struct`, or `variant` for properties)
+- `run_label` (display name for the properties comparison; `protocol` retains its routing identifier)
 
 `measure_iteration` is the 1-based measured repetition within a run (`0` is reserved for non-measured warmup work and is not emitted to the CSV today).
 `duration_ms` is emitted as milliseconds with fixed precision, and `started_at` is UTC RFC3339Nano.
-No CSV schema mutation is expected in this phase.
+The publisher accepts both the original ten-column v1 header and the v2 header with the appended representation column.
 
 `query_service_metrics.csv` is an additive sidecar. Provider-backed rows record
 queue, planning, engine, and service time; bytes scanned; DPU count when the
 service returns it; result reuse; and engine version. `query_results.csv`
-remains the canonical latency/status artifact and keeps its v1 header
-unchanged.
+remains the canonical latency/status artifact. Both CSVs append the representation label; stable query IDs also include it.
 
 ## Nightly Run
 
@@ -274,3 +276,47 @@ storage-service caches. Keep the protocol labels separate in history.
 
 Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
 external-read/hit counters to distinguish storage traffic from cached reads.
+
+## Published properties workload
+
+The frozen-perf scenario runs its existing catalog and frozen dataset first,
+unchanged. An optional `properties_comparison` step then compares browser
+properties on a separate generated single-day fixture. Set
+`DUCKGRES_SCENARIO_PROPERTIES_S3_URI` (workflow input `properties_s3_uri`) to its
+immutable Parquet directory. The default is empty: no properties preparation or
+queries run. No completion manifest or new repository secret is required.
+
+Choose a modest full day and generate matching JSON/VARIANT/STRUCT files before
+enabling this phase. The large previously generated fixture is not a default.
+Queries cover the entire selected prefix, with one warmup and four measured
+iterations. Merely filtering a large mixed-day file set does not guarantee small
+scans. The runner does not generate data or enforce a row-count limit.
+
+The properties catalog measures JSON with `duckgres (vanilla)`, `duckgres (cache)`,
+and `trino (vanilla)`, plus STRUCT with Athena. Athena executes only STRUCT;
+its complete ordered results must match the shared Duckgres/Trino JSON baseline
+for each intent before properties measurements start. `trino (cache+variant)` is explicitly
+unsupported until Hoglake supports VARIANT: its two comparisons emit `skipped`
+rows with a reason and no timings, and do not connect to cached Trino. Skipped
+rows use iteration zero and are excluded from measured/warmup query counts.
+Original cached Trino benchmarks continue running normally.
+
+Original results retain `perf/`, the scenario run ID, and
+`posthog-file-views-v1`. Properties results use `perf-properties/`, a
+`-properties` run ID suffix, and a version derived from the selected object
+inventory. This keeps the original dashboard history stable and prevents the
+publisher from overwriting one result set with the other. Both use the existing
+publisher; only main-branch runs publish to the shared database. Dashboard
+comparisons must match properties intent IDs and successful statuses; existing
+full-corpus aggregate panels do not automatically include properties queries.
+
+All properties preparation happens after the original result files are complete,
+so a properties setup or validation failure cannot prevent their publication.
+Failures still fail the scenario and trigger cleanup. See the
+[properties runbook](../../docs/runbooks/properties-perf.md) for fixture preparation,
+catalog registration, and recovery.
+
+Scenario Trino connections require `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID`
+(no default), matching the baseline coordinator's `catalog-store.cell-id`.
+The isolated workflow supplies it; local runs must set it. The public readiness
+API cell ID is used only for API identity validation, not catalog-store lookups.

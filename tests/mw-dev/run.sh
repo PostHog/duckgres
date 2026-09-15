@@ -783,6 +783,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_HOGLAKE_URI, value: "$hoglake_uri" }
             - { name: DUCKGRES_SCENARIO_TRINO_CACHED_URL, value: "https://duckgres-trino-cached.$NS.svc:8443" }
+            - { name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID, value: "ci-pr-${PR_NUMBER}" }
             - { name: DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID, value: "ci-pr-${PR_NUMBER}-cached" }
             - { name: DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE, value: "/trino-admin/admin-password" }
             - { name: DUCKGRES_SCENARIO_TRINO_CA_CERT, value: "/trino-ca/ca.crt" }
@@ -793,6 +794,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_ATHENA_WORKGROUP, value: "${DUCKGRES_SCENARIO_ATHENA_WORKGROUP:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_DATABASE, value: "${DUCKGRES_SCENARIO_ATHENA_DATABASE:-}" }
             - { name: DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI, value: "${DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI:-}" }
+            - { name: DUCKGRES_SCENARIO_PROPERTIES_S3_URI, value: "${DUCKGRES_SCENARIO_PROPERTIES_S3_URI:-}" }
             - { name: DUCKGRES_SCENARIO_DBT_BIN, value: "dbt" }
             - { name: DUCKGRES_K8S_WORKER_CPU_REQUEST, value: "$DUCKGRES_K8S_WORKER_CPU_REQUEST" }
             - { name: DUCKGRES_K8S_WORKER_MEMORY_REQUEST, value: "$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" }

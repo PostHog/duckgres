@@ -52,14 +52,18 @@ def column_type(field):
     )
 
 
-def inspect_table(objects, read_footer):
+def inspect_table(objects, read_footer, selected=None):
     columns = {}
     files = []
     field_ids = []
     for obj in objects:
         metadata = read_footer(obj)
         schema = metadata.schema.to_arrow_schema()
+        if selected is not None and any(schema.names.count(name) != 1 for name in selected):
+            raise ValueError("missing selected fixture column")
         for index, field in enumerate(schema):
+            if selected is not None and field.name not in selected:
+                continue
             if not re.fullmatch(r"[a-z_][a-z0-9_]{0,127}", field.name):
                 raise ValueError(
                     f"unsupported identifier {field.name!r}; lowercase column names required"
@@ -177,6 +181,61 @@ def run(store, api, source, catalog):
     return result
 
 
+
+def run_properties(store, api, source, catalog, representation):
+    """Create the scenario catalog at the properties prefix and register projections.
+
+    column_type intentionally remains authoritative: unsupported physical VARIANT
+    representations fail before writes, without coercion or omitted columns.
+    """
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,62}", catalog):
+        raise ValueError("invalid catalog identifier")
+    bucket, _ = location(source)
+    objects = sorted(
+        (obj for obj in store.objects(source) if obj["key"].endswith(".parquet")),
+        key=lambda obj: obj["key"],
+    )
+    if not objects:
+        raise ValueError("no properties Parquet files in source")
+    metadata = {}
+
+    def read_footer(obj):
+        if obj["key"] not in metadata:
+            metadata[obj["key"]] = store.footer(bucket, obj)
+        return metadata[obj["key"]]
+
+    plans = {}
+    projections = [("events_supported", ["event", "timestamp", "properties"])]
+    if representation == "variant":
+        projections.append(("events_variant", ["event", "timestamp", "properties", "properties_variant"]))
+    for table, selected in projections:
+        columns, files = inspect_table(objects, read_footer, selected)
+        expected_types = {"event": "string", "timestamp": "timestamptz", "properties": "string", "properties_variant": "variant"}
+        if any(c["type"] != expected_types[c["name"]] for c in columns if c["name"] in expected_types):
+            raise ValueError("properties fixture logical column type mismatch")
+        plans[table] = columns, files
+    # The catalog only accepts files below its data_path. Use this dataset,
+    # rather than inheriting the unrelated original frozen fixture prefix.
+    root = "/v1/catalogs/" + catalog
+    api.post("/v1/catalogs", {"name": catalog, "data_path": source.rstrip("/") + "/"})
+    api.post(root + "/namespaces", {"name": "properties_perf"})
+    registrations = []
+    for table, (columns, files) in plans.items():
+        info = api.post(root + "/namespaces/properties_perf/tables", {"name": table, "columns": columns})
+        if [(c["name"], c["field_id"]) for c in info["columns"]] != [
+            (c["name"], i + 1) for i, c in enumerate(columns)
+        ]:
+            raise ValueError("server assigned unexpected field IDs; no source files registered")
+        registrations.append({
+            "namespace": "properties_perf", "table": table,
+            "expected_table_uuid": info["table_uuid"],
+            "files": [{"path": f"s3://{bucket}/{obj['key']}", "record_count": obj["rows"],
+                       "file_size_bytes": obj["size"], "footer_size": obj["footer_size"]} for obj in files],
+        })
+    return api.post(root + "/commit", {"appends": registrations, "author": "perf-fixture",
+                                      "message": "Register immutable properties fixtures"})
+
+
 class S3Store:
     def __init__(self, client):
         self.client = client
@@ -245,11 +304,18 @@ def main():
     import boto3
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--source")
+    inputs.add_argument("--properties-source")
+    parser.add_argument("--properties-representation", choices=("json", "variant"), default="variant")
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--uri", required=True)
     args = parser.parse_args()
-    result = run(S3Store(boto3.client("s3")), RestAPI(args.uri), args.source, args.catalog)
+    store, api = S3Store(boto3.client("s3")), RestAPI(args.uri)
+    if args.properties_source:
+        result = run_properties(store, api, args.properties_source, args.catalog, args.properties_representation)
+    else:
+        result = run(store, api, args.source, args.catalog)
     print(f"Registered frozen fixtures at snapshot {result['snapshot_id']}")
 
 

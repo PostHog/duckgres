@@ -8,6 +8,11 @@ on:
         required: true
         default: full-suite
         type: string
+      properties_s3_uri:
+        description: Optional generated single-day properties Parquet S3 prefix; blank runs original benchmarks only
+        required: false
+        default: ""
+        type: string
       duckgres_image:
         description: Existing Duckgres image to deploy instead of building this SHA
         required: false
@@ -127,6 +132,20 @@ jobs:
         if: env.SCENARIO_NAME == 'posthog_frozen_perf'
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
+      - name: Load optional properties fixture selection
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
+        run: |
+          source=$(jq -r '.inputs.properties_s3_uri // ""' "$GITHUB_EVENT_PATH")
+          if [ -n "$source" ]; then
+            echo "::add-mask::$source"
+            if [[ "$source" =~ ^s3://[^[:space:]]+$ ]]; then
+              echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=$source" >> "$GITHUB_ENV"
+            else
+              echo "::warning::Invalid properties prefix; the optional comparison will fail after original benchmarks complete."
+              echo "DUCKGRES_SCENARIO_PROPERTIES_S3_URI=invalid" >> "$GITHUB_ENV"
+            fi
+          fi
+
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
 
@@ -173,7 +192,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -d '' perf_summaries < <(
-            find artifacts/scenario-dev -type f -path '*/perf/summary.json' -print0 2>/dev/null | sort -z
+            find artifacts/scenario-dev -type f \( -path '*/perf/summary.json' -o -path '*/perf-properties/summary.json' \) -print0 2>/dev/null | sort -z
           )
           if [ "${#perf_summaries[@]}" -eq 0 ]; then
             echo "No scenario perf artifact was produced; skipping historical publish."

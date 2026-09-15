@@ -220,13 +220,22 @@ func (e *Executor) queryRequest(step core.Step, spec querySpec, resultID string)
 	if err != nil {
 		return QueryRequest{}, err
 	}
+	execOnly := false
+	if value, ok := step.With["exec_only"]; ok {
+		var valid bool
+		execOnly, valid = value.(bool)
+		if !valid {
+			return QueryRequest{}, invalidStep(step.ID, "exec_only must be a boolean")
+		}
+	}
 	return QueryRequest{
-		StepID:  resultID,
-		QueryID: spec.ID,
-		OrgID:   orgID,
-		Catalog: spec.Catalog,
-		SQL:     spec.SQL,
-		PGWire:  connection,
+		ExecOnly: execOnly,
+		StepID:   resultID,
+		QueryID:  spec.ID,
+		OrgID:    orgID,
+		Catalog:  spec.Catalog,
+		SQL:      spec.SQL,
+		PGWire:   connection,
 	}, nil
 }
 

@@ -84,9 +84,29 @@ func newWithClient(client athenaAPI, cfg ConnectionConfig) (*Driver, error) {
 
 func (d *Driver) Protocol() perfcore.Protocol { return perfcore.ProtocolAthena }
 
-func (d *Driver) Execute(ctx context.Context, query perfcore.Query, args []any) (result perfcore.ExecutionResult, err error) {
+func (d *Driver) Execute(ctx context.Context, query perfcore.Query, args []any) (perfcore.ExecutionResult, error) {
+	return d.execute(ctx, query, args, nil)
+}
+
+func (d *Driver) ReadResults(ctx context.Context, query perfcore.Query, args []any) ([][]*string, error) {
+	values := make([][]*string, 0)
+	_, err := d.execute(ctx, query, args, func(row athenatypes.Row) {
+		cells := make([]*string, len(row.Data))
+		for i, datum := range row.Data {
+			cells[i] = datum.VarCharValue
+		}
+		values = append(values, cells)
+	})
+	return values, err
+}
+
+func (d *Driver) execute(ctx context.Context, query perfcore.Query, args []any, collect func(athenatypes.Row)) (result perfcore.ExecutionResult, err error) {
 	if len(args) > 0 {
 		return result, fmt.Errorf("athena perf queries do not support positional parameters")
+	}
+	sqlText, err := query.SQLFor(d.Protocol())
+	if err != nil {
+		return result, err
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, d.cfg.QueryTimeout)
 	defer cancel()
@@ -94,7 +114,7 @@ func (d *Driver) Execute(ctx context.Context, query perfcore.Query, args []any) 
 	startedAt := d.now()
 	defer func() { result.Duration = d.now().Sub(startedAt) }()
 	started, err := d.client.StartQueryExecution(queryCtx, &awsathena.StartQueryExecutionInput{
-		QueryString: aws.String(query.CanonicalSQL()),
+		QueryString: aws.String(sqlText),
 		WorkGroup:   aws.String(d.cfg.WorkGroup),
 		QueryExecutionContext: &athenatypes.QueryExecutionContext{
 			Catalog: aws.String(d.cfg.Catalog), Database: aws.String(d.cfg.Database),
@@ -161,7 +181,7 @@ queryComplete:
 		return result, fmt.Errorf("athena query output %q is outside configured output location %q", outputLocation, d.cfg.OutputLocation)
 	}
 
-	rows, err := d.countRows(queryCtx, *queryID)
+	rows, err := d.readRows(queryCtx, *queryID, collect)
 	if err != nil {
 		return result, err
 	}
@@ -191,7 +211,7 @@ func serviceMetrics(execution *athenatypes.QueryExecution) *perfcore.ServiceMetr
 	return metrics
 }
 
-func (d *Driver) countRows(ctx context.Context, queryID string) (int64, error) {
+func (d *Driver) readRows(ctx context.Context, queryID string, collect func(athenatypes.Row)) (int64, error) {
 	var rows int64
 	input := &awsathena.GetQueryResultsInput{QueryExecutionId: aws.String(queryID), MaxResults: aws.Int32(1000)}
 	firstPage := true
@@ -200,12 +220,24 @@ func (d *Driver) countRows(ctx context.Context, queryID string) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("get Athena query results %s: %w", queryID, err)
 		}
+		if page == nil {
+			return 0, fmt.Errorf("athena returned nil result page")
+		}
 		var pageRows int64
 		if page.ResultSet != nil {
 			pageRows = int64(len(page.ResultSet.Rows))
 		}
 		if firstPage && pageRows > 0 {
 			pageRows-- // Athena returns the column header as the first result row.
+		}
+		if collect != nil && page.ResultSet != nil {
+			start := 0
+			if firstPage && len(page.ResultSet.Rows) > 0 {
+				start = 1
+			}
+			for _, row := range page.ResultSet.Rows[start:] {
+				collect(row)
+			}
 		}
 		rows += pageRows
 		firstPage = false

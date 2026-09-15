@@ -27,25 +27,27 @@ type DriverFactory interface {
 }
 
 type ExecutorConfig struct {
-	TrinoCatalogStoreDSN   string
-	TrinoCachedURL         string
-	TrinoCachedCellID      string
-	TrinoAdminPasswordFile string
-	ProvisionState         *provision.State
-	Connection             scenariosql.ConnectionConfig
-	OutputDir              string
-	DriverFactory          DriverFactory
-	State                  *State
-	Now                    func() time.Time
+	TrinoCatalogStoreCellID string
+	TrinoCatalogStoreDSN    string
+	TrinoCachedURL          string
+	TrinoCachedCellID       string
+	TrinoAdminPasswordFile  string
+	ProvisionState          *provision.State
+	Connection              scenariosql.ConnectionConfig
+	OutputDir               string
+	DriverFactory           DriverFactory
+	State                   *State
+	Now                     func() time.Time
 }
 
 type Executor struct {
-	provisionState *provision.State
-	connection     scenariosql.ConnectionConfig
-	outputDir      string
-	driverFactory  DriverFactory
-	state          *State
-	now            func() time.Time
+	trinoCatalogStoreCellID string
+	provisionState          *provision.State
+	connection              scenariosql.ConnectionConfig
+	outputDir               string
+	driverFactory           DriverFactory
+	state                   *State
+	now                     func() time.Time
 }
 
 type State struct {
@@ -73,6 +75,7 @@ type stepSpec struct {
 	FailOnQueryErrors    bool
 	WorkerCPU            string
 	WorkerMemory         string
+	TrinoHoglakeCatalog  string
 	TrinoSchema          string
 	TrinoCACertFile      string
 	TrinoStartup         trinodriver.StartupOptions
@@ -111,12 +114,13 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 		now = time.Now
 	}
 	return &Executor{
-		provisionState: cfg.ProvisionState,
-		connection:     cfg.Connection,
-		outputDir:      cfg.OutputDir,
-		driverFactory:  factory,
-		state:          state,
-		now:            now,
+		trinoCatalogStoreCellID: cfg.TrinoCatalogStoreCellID,
+		provisionState:          cfg.ProvisionState,
+		connection:              cfg.Connection,
+		outputDir:               cfg.OutputDir,
+		driverFactory:           factory,
+		state:                   state,
+		now:                     now,
 	}
 }
 
@@ -281,21 +285,22 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	}
 
 	return stepSpec{
-		OrgID:             orgID,
-		Username:          username,
-		Password:          password,
-		CatalogFile:       catalogFile,
-		Targets:           targets,
-		RunID:             runID,
-		DatasetVersion:    stringFromWith(step, "dataset_version", ""),
-		Database:          stringFromWith(step, "catalog", "ducklake"),
-		OutputSubdir:      stringFromWith(step, "output_subdir", "perf"),
-		ReadOnly:          boolFromWith(step, "read_only", true),
-		FailOnQueryErrors: boolFromWith(step, "fail_on_query_errors", true),
-		WorkerCPU:         stringFromWith(step, "worker_cpu", ""),
-		WorkerMemory:      stringFromWith(step, "worker_memory", ""),
-		TrinoSchema:       stringFromWith(step, "trino_schema", "posthog"),
-		TrinoCACertFile:   stringFromWith(step, "trino_ca_cert_file", ""),
+		OrgID:               orgID,
+		Username:            username,
+		Password:            password,
+		CatalogFile:         catalogFile,
+		Targets:             targets,
+		RunID:               runID,
+		DatasetVersion:      stringFromWith(step, "dataset_version", ""),
+		Database:            stringFromWith(step, "catalog", "ducklake"),
+		OutputSubdir:        stringFromWith(step, "output_subdir", "perf"),
+		ReadOnly:            boolFromWith(step, "read_only", true),
+		FailOnQueryErrors:   boolFromWith(step, "fail_on_query_errors", true),
+		WorkerCPU:           stringFromWith(step, "worker_cpu", ""),
+		WorkerMemory:        stringFromWith(step, "worker_memory", ""),
+		TrinoHoglakeCatalog: stringFromWith(step, "trino_hoglake_catalog", ""),
+		TrinoSchema:         stringFromWith(step, "trino_schema", "posthog"),
+		TrinoCACertFile:     stringFromWith(step, "trino_ca_cert_file", ""),
 		TrinoStartup: trinodriver.StartupOptions{
 			Timeout:      trinoStartupTimeout,
 			PollInterval: trinoStartupPollInterval,
@@ -369,6 +374,9 @@ func (e *Executor) driversForCatalog(ctx context.Context, catalog perfcore.Catal
 		}
 	}()
 	for _, target := range catalog.Targets {
+		if !catalog.NeedsDriver(target) {
+			continue
+		}
 		if _, ok := drivers[target]; ok {
 			continue
 		}
@@ -459,7 +467,8 @@ func (e *Executor) trinoConnection(spec stepSpec) (trinodriver.ConnectionConfig,
 	}
 	return trinodriver.ConnectionConfig{
 		ServerURL:          status.Cell.CoordinatorURL,
-		CatalogStoreCellID: status.Cell.ID,
+		CatalogStoreCellID: e.trinoCatalogStoreCellID,
+		HoglakeCatalog:     spec.TrinoHoglakeCatalog,
 		Username:           status.Status.Principal,
 		Password:           spec.Password,
 		Catalog:            status.Status.Catalog,
@@ -516,6 +525,11 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, p
 }
 
 func (f defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
+	if connection.HoglakeCatalog != "" {
+		if err := f.selectHoglakeCatalog(ctx, connection); err != nil {
+			return nil, err
+		}
+	}
 	if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, perfcore.ProtocolTrino, connection.CatalogStoreCellID); err != nil {
 		return nil, err
 	}

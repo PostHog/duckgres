@@ -203,7 +203,7 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 			})
 			provisionState.StoreTrinoStatus("scenario-org", provision.TrinoStatus{
 				Cell: provision.TrinoCell{
-					ID:             "cell-a",
+					ID:             "legacy",
 					CoordinatorURL: "https://trino.example.test:8443",
 				},
 				Enabled:   true,
@@ -212,15 +212,16 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 					Org:       "scenario-org",
 					Principal: "org_database",
 					Catalog:   "org_catalog",
-					Cell:      "cell-a",
+					Cell:      "legacy",
 					State:     provision.WarehouseStateReady,
 				},
 			})
 			factory := &fakeDriverFactory{}
 			executor := NewExecutor(ExecutorConfig{
-				ProvisionState: provisionState,
-				OutputDir:      t.TempDir(),
-				DriverFactory:  factory,
+				ProvisionState:          provisionState,
+				TrinoCatalogStoreCellID: "ci-pr-test",
+				OutputDir:               t.TempDir(),
+				DriverFactory:           factory,
 			})
 
 			err := executor.ExecuteStep(context.Background(), core.Step{
@@ -241,6 +242,9 @@ func TestExecutorBuildsTrinoDriverFromReadinessState(t *testing.T) {
 			}
 
 			got := factory.trinoConnection
+			if got.CatalogStoreCellID != "ci-pr-test" {
+				t.Fatalf("catalog store cell = %q, want explicit stored identity instead of public legacy ID", got.CatalogStoreCellID)
+			}
 			if got.Protocol != protocol {
 				t.Fatalf("connection protocol = %q, want %q", got.Protocol, protocol)
 			}

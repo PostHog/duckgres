@@ -11,12 +11,14 @@ type Driver interface {
 }
 
 type QueryRequest struct {
-	StepID  string
-	QueryID string
-	OrgID   string
-	Catalog string
-	SQL     string
-	PGWire  PGWireConnection
+	// ExecOnly consumes all statements and never retries a mutating script as a query.
+	ExecOnly bool
+	StepID   string
+	QueryID  string
+	OrgID    string
+	Catalog  string
+	SQL      string
+	PGWire   PGWireConnection
 }
 
 type QueryResult struct {
@@ -40,6 +42,14 @@ func (d *DatabaseDriver) Execute(ctx context.Context, req QueryRequest) (QueryRe
 		_ = db.Close()
 	}()
 
+	if req.ExecOnly {
+		res, err := db.ExecContext(ctx, req.SQL)
+		if err != nil {
+			return QueryResult{}, err
+		}
+		affected, _ := res.RowsAffected()
+		return QueryResult{Rows: affected, Duration: time.Since(started)}, nil
+	}
 	rows, err := db.QueryContext(ctx, req.SQL)
 	if err == nil {
 		defer func() {

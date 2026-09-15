@@ -5,6 +5,7 @@ required_env:
   - DUCKGRES_SCENARIO_HOGLAKE_URI
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_SCENARIO_TRINO_CA_CERT
+  - DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID
   - DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN
   - DUCKGRES_SCENARIO_TRINO_CACHED_URL
   - DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID
@@ -95,6 +96,7 @@ steps:
       catalog: ducklake
       catalog_file: ../../../perf/queries/ducklake_posthog_tables.yaml
       targets: [pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
+      trino_hoglake_catalog: ${env:DUCKGRES_SCENARIO_ORG_ID}
       trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
       trino_startup_timeout: 2m
       trino_startup_poll_interval: 2s
@@ -111,9 +113,37 @@ steps:
       worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
       worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
 
+  - id: properties_comparison
+    type: properties_comparison
+    depends_on: [perf_queries]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      hoglake_uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
+      hoglake_file: ../perf/setup_hoglake.py
+      targets: [pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
+      trino_hoglake_catalog: ${env:DUCKGRES_SCENARIO_ORG_ID}-properties
+      hoglake_catalog: ${env:DUCKGRES_SCENARIO_ORG_ID}-properties
+      trino_schema: properties_perf
+      trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
+      trino_startup_timeout: 2m
+      trino_startup_poll_interval: 2s
+      athena_region: ${env:DUCKGRES_SCENARIO_ATHENA_REGION}
+      athena_workgroup: ${env:DUCKGRES_SCENARIO_ATHENA_WORKGROUP}
+      athena_catalog: AwsDataCatalog
+      athena_database: ${env:DUCKGRES_SCENARIO_ATHENA_DATABASE}
+      athena_output_location: ${env:DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI}
+      athena_poll_interval: 500ms
+      athena_query_timeout: 30m
+      run_id: ${run_id}
+      output_subdir: perf-properties
+      fail_on_query_errors: true
+      worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
+      worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
+
   - id: deprovision
     type: deprovision_warehouse
-    depends_on: [perf_queries]
+    depends_on: [properties_comparison]
     always_run: true
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}

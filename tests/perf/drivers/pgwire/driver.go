@@ -68,7 +68,10 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	if d.exec == nil {
 		return core.ExecutionResult{}, fmt.Errorf("pgwire driver has no executor")
 	}
-	sqlText := query.CanonicalSQL()
+	sqlText, err := query.SQLFor(d.Protocol())
+	if err != nil {
+		return core.ExecutionResult{}, err
+	}
 	if sqlText == "" {
 		return core.ExecutionResult{}, fmt.Errorf("query %s missing pgwire_sql", query.QueryID)
 	}
@@ -174,4 +177,34 @@ func (e *sqlExecutor) Close() error {
 		}
 	}
 	return errors.Join(connErr, e.db.Close())
+}
+
+func (d *Driver) ReadResults(ctx context.Context, query core.Query, args []any) ([][]*string, error) {
+	reader, ok := d.exec.(interface {
+		ReadResults(context.Context, string, []any) ([][]*string, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("executor cannot read result values")
+	}
+	if d.prepare != nil {
+		if err := d.prepare(ctx); err != nil {
+			return nil, err
+		}
+	}
+	sqlText, err := query.SQLFor(d.Protocol())
+	if err != nil {
+		return nil, err
+	}
+	return reader.ReadResults(ctx, sqlText, args)
+}
+func (e *sqlExecutor) ReadResults(ctx context.Context, query string, args []any) ([][]*string, error) {
+	queryContext := e.db.QueryContext
+	if e.conn != nil {
+		queryContext = e.conn.QueryContext
+	}
+	rows, err := queryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return core.ReadSQLResults(rows)
 }
