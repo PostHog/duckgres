@@ -70,8 +70,9 @@ readable by the isolated stack's existing AWS identity.
 | Athena | — | STRUCT |
 
 There are two intents: browser counts and event counts filtered to Chrome.
-Supported engines must return identical complete ordered results; Athena has an
-additional untimed JSON baseline. Measurements use one warmup and four measured
+Supported engines must return identical complete ordered results; Athena runs
+only STRUCT, validated against the shared Duckgres/Trino JSON baseline for each
+intent. Measurements use one warmup and four measured
 iterations. Hoglake does not support VARIANT, so its comparisons emit `skipped`
 results with `unsupported_representation`, iteration zero, and no timing. They
 are excluded from measured/warmup counts and never enter the correctness gate.

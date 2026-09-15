@@ -293,9 +293,9 @@ iterations. Merely filtering a large mixed-day file set does not guarantee small
 scans. The runner does not generate data or enforce a row-count limit.
 
 The properties catalog measures JSON with `duckgres (vanilla)`, `duckgres (cache)`,
-and `trino (vanilla)`, plus STRUCT with Athena. Athena also runs an untimed JSON
-baseline; complete ordered results must match across supported representations
-before properties measurements start. `trino (cache+variant)` is explicitly
+and `trino (vanilla)`, plus STRUCT with Athena. Athena executes only STRUCT;
+its complete ordered results must match the shared Duckgres/Trino JSON baseline
+for each intent before properties measurements start. `trino (cache+variant)` is explicitly
 unsupported until Hoglake supports VARIANT: its two comparisons emit `skipped`
 rows with a reason and no timings, and do not connect to cached Trino. Skipped
 rows use iteration zero and are excluded from measured/warmup query counts.
