@@ -543,6 +543,23 @@ normal `go test ./...` lane.
 
 ## Isolation model
 
+### Concurrent Trino credential bootstrap
+
+Before provisioning tenants, the Trino lane stops its PR-local control plane
+and waits for every old pod to disappear. It removes only the admin and observer
+password/hash keys with a Secret resource-version precondition, then starts
+three replicas together. The test requires three ready pods with zero restarts,
+successful admin and observer authentication against real Trino, and unchanged
+credential pairs after returning to one replica and provisioning the first
+tenant. Other Secret keys, the internal shared secret, and the OPA token remain
+unchanged. Credentials and their fingerprints stay in memory and are not logged.
+
+This exercises real concurrent startup and Kubernetes writes; it does not force
+the exact historical race interleaving. Provisioner unit tests provide that
+deterministic regression. The fixture grants patch only on its named control-plane
+Deployment and `trino-auth` Secret. Normal workflow teardown removes the fixture
+on failure, including any extra replicas. No shared environment is modified.
+
 ### Trino multicell lane
 
 The full Trino E2E lane adds a second disposable namespace,

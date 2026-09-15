@@ -1066,7 +1066,7 @@ func (p *TrinoProvisioner) ensureWriteOnceSecret(ctx context.Context, name, key 
 	return value, nil
 }
 
-// ensureAdminCredential makes the __admin_provisioner password + bcrypt
+// ensureCredentialPair makes an operational principal's password + bcrypt
 // hash exist as a matched pair on the trino-auth Secret and returns
 // (plaintext, hash).
 //
@@ -1095,31 +1095,26 @@ func (p *TrinoProvisioner) ensureWriteOnceSecret(ctx context.Context, name, key 
 func (p *TrinoProvisioner) ensureCredentialPair(ctx context.Context, label, plainKey, hashKey string) (plaintext, hash string, err error) {
 	const maxAttempts = 5
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		plainBytes, plainErr := p.readSecretKey(ctx, TrinoAuthSecretName, plainKey)
-		hashBytes, hashErr := p.readSecretKey(ctx, TrinoAuthSecretName, hashKey)
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
+		secrets := p.kubernetes.CoreV1().Secrets(p.namespace)
+		existing, readErr := secrets.Get(ctx, TrinoAuthSecretName, metav1.GetOptions{})
+		if readErr != nil && !apierrors.IsNotFound(readErr) {
+			return "", "", fmt.Errorf("ensure trino-auth %s credential: %w", label, readErr)
+		}
 
 		// Both present: validate the pair and ADOPT it. This is the
 		// convergence point — every replica that finds a present pair
 		// returns the same durable value, so even after a create/merge
 		// race the next read settles everyone onto one pair.
-		if plainErr == nil && hashErr == nil {
+		if readErr == nil && len(existing.Data[plainKey]) > 0 && len(existing.Data[hashKey]) > 0 {
+			plainBytes, hashBytes := existing.Data[plainKey], existing.Data[hashKey]
 			if bcryptErr := bcrypt.CompareHashAndPassword(hashBytes, plainBytes); bcryptErr != nil {
 				return "", "", fmt.Errorf(
-					"trino-auth %s does not validate against %s (inconsistent pair, likely a "+
-						"manual edit): %w", hashKey, plainKey, bcryptErr)
+					"trino-auth %s does not validate against %s (inconsistent stored pair): %w", hashKey, plainKey, bcryptErr)
 			}
 			return string(plainBytes), string(hashBytes), nil
-		}
-
-		// A non-missing (transient) read error → surface for retry-next-tick.
-		for _, e := range []error{plainErr, hashErr} {
-			if e == nil {
-				continue
-			}
-			var mse missingSecretError
-			if !errors.As(e, &mse) {
-				return "", "", fmt.Errorf("ensure trino-auth %s credential: %w", label, e)
-			}
 		}
 
 		// Pair missing/incomplete → generate a candidate and try to
@@ -1137,32 +1132,42 @@ func (p *TrinoProvisioner) ensureCredentialPair(ctx context.Context, label, plai
 			hashKey:  []byte(newHash),
 		}
 
-		// First boot: ensureClusterSecrets runs before reconcileAuthSecret,
-		// so trino-auth typically doesn't exist yet. Create-once makes the
-		// pair atomic: the winner owns it, racing replicas get
-		// AlreadyExists and loop back to ADOPT (top of the loop) rather
-		// than overwriting the winner's pair.
-		createErr := p.createManagedSecret(ctx, TrinoAuthSecretName, pairData, false /*mutable: reconcileAuthSecret adds password.db/group.db*/)
-		if createErr == nil {
-			return newPlain, newHash, nil
+		if err := ctx.Err(); err != nil {
+			return "", "", err
 		}
-		if !apierrors.IsAlreadyExists(createErr) {
-			return "", "", fmt.Errorf("create trino-auth %s credential: %w", label, createErr)
+		if apierrors.IsNotFound(readErr) {
+			// A concurrent creator wins; reload and adopt instead of merging.
+			createErr := p.createManagedSecret(ctx, TrinoAuthSecretName, pairData, false)
+			if apierrors.IsAlreadyExists(createErr) {
+				continue
+			}
+			if createErr != nil {
+				return "", "", fmt.Errorf("create trino-auth %s credential: %w", label, createErr)
+			}
+		} else {
+			// Preserve the snapshot's resourceVersion, unrelated keys and metadata.
+			// Never re-read inside an unconditional merge of generated credentials.
+			existing = existing.DeepCopy()
+			if existing.Data == nil {
+				existing.Data = make(map[string][]byte)
+			}
+			for key, value := range pairData {
+				existing.Data[key] = value
+			}
+			if existing.Labels == nil {
+				existing.Labels = make(map[string]string)
+			}
+			existing.Labels["app"] = "trino"
+			existing.Labels["duckgres/managed"] = "true"
+			_, updateErr := secrets.Update(ctx, existing, metav1.UpdateOptions{})
+			if apierrors.IsConflict(updateErr) {
+				continue
+			}
+			if updateErr != nil {
+				return "", "", fmt.Errorf("update trino-auth %s credential: %w", label, updateErr)
+			}
 		}
-
-		// trino-auth already exists. Re-read: if a pair is now present
-		// (a racing replica won the Create, or it was set since our read),
-		// the loop top will adopt it. If still absent (legacy upgrade:
-		// trino-auth holds only password.db/group.db, no such keys), merge
-		// our pair in. The merge can still race a concurrent merge, but the
-		// loop re-reads and converges on the durable winner.
-		if _, e := p.readSecretKey(ctx, TrinoAuthSecretName, plainKey); e == nil {
-			continue // pair appeared — adopt on next iteration
-		}
-		if mergeErr := p.upsertSecretMerge(ctx, TrinoAuthSecretName, pairData); mergeErr != nil && !apierrors.IsConflict(mergeErr) {
-			return "", "", fmt.Errorf("merge trino-auth %s credential: %w", label, mergeErr)
-		}
-		// Loop back: re-read and adopt whatever durably won.
+		return newPlain, newHash, nil
 	}
 	return "", "", fmt.Errorf("ensure trino-auth %s credential: did not converge after %d attempts (will retry next reconcile)", label, maxAttempts)
 }
@@ -2382,14 +2387,10 @@ func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configst
 // paths (notably trino-auth, which holds both the bootstrapped admin
 // credential keys and the per-tick projected password.db / group.db).
 //
-// Concurrency note: the read-modify-write here is racy in the
-// abstract — two concurrent provisioner replicas could each load the
-// same ResourceVersion, both Update, and one would lose its delta.
-// In practice the provisioner runs reconcile per replica but the
-// bootstrap path is gated by the configstore advisory lock and the
-// per-tick auth/rg/opa writes are byte-equal-deterministic, so a
-// lost-write retries identically on the next tick. If the race ever
-// matters, switch to apiserver patch with field-manager ownership.
+// Concurrent updates use resourceVersion; conflicts return to the caller.
+// Deterministic projections retry on the next reconcile tick.
+// Credential establishment uses ensureCredentialPair's conditional snapshot
+// update instead: this helper must not overwrite a concurrent credential winner.
 func (p *TrinoProvisioner) upsertSecretMerge(ctx context.Context, name string, data map[string][]byte) error {
 	secrets := p.kubernetes.CoreV1().Secrets(p.namespace)
 	existing, err := secrets.Get(ctx, name, metav1.GetOptions{})

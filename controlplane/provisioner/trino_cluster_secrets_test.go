@@ -269,6 +269,8 @@ func TestBootstrap_ConcurrentReplicasConverge(t *testing.T) {
 	// loser-overwrites-winner divergence).
 	const replicas = 16
 	kc := kubefake.NewClientset()
+	authAPI := &credentialSecretAPI{}
+	kc.PrependReactor("*", "secrets", authAPI.reactor)
 	sentinel := newFakeSentinel()
 	newReplica := func() *TrinoProvisioner {
 		p, err := NewTrinoProvisioner(TrinoProvisionerOpts{
@@ -289,6 +291,7 @@ func TestBootstrap_ConcurrentReplicasConverge(t *testing.T) {
 	}
 
 	tokens := make([]string, replicas)
+	provisioners := make([]*TrinoProvisioner, replicas)
 	errs := make([]error, replicas)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -297,6 +300,7 @@ func TestBootstrap_ConcurrentReplicasConverge(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			p := newReplica()
+			provisioners[idx] = p
 			<-start
 			tokens[idx], errs[idx] = p.Bootstrap(context.Background())
 		}(i)
@@ -312,14 +316,22 @@ func TestBootstrap_ConcurrentReplicasConverge(t *testing.T) {
 	// All bundle tokens identical = everyone adopted the same winner.
 	for i := 1; i < replicas; i++ {
 		if tokens[i] != tokens[0] {
-			t.Fatalf("bundle token diverged: replica %d=%q vs replica 0=%q", i, tokens[i], tokens[0])
+			t.Fatalf("bundle token diverged on replica %d", i)
 		}
 	}
 	// Durable Secrets are internally consistent and match the returned token.
 	if got := string(getSecret(t, kc, TrinoOPABundleTokenSecretName).Data[TrinoOPABundleTokenSecretKey]); got != tokens[0] {
-		t.Errorf("durable bundle token %q != returned %q", got, tokens[0])
+		t.Error("durable bundle token differs from returned token")
 	}
 	auth := getSecret(t, kc, TrinoAuthSecretName)
+	for i, p := range provisioners {
+		_, observerPlain := p.ObserverCredential()
+		if p.adminPasswordHash != string(auth.Data[TrinoAuthSecretKeyAdminPasswordHash]) ||
+			observerPlain != string(auth.Data[TrinoAuthSecretKeyObserverPassword]) ||
+			p.observerHash() != string(auth.Data[TrinoAuthSecretKeyObserverPasswordHash]) {
+			t.Fatalf("replica %d cached credentials differ from durable credentials", i)
+		}
+	}
 	if err := bcrypt.CompareHashAndPassword(
 		auth.Data[TrinoAuthSecretKeyAdminPasswordHash],
 		auth.Data[TrinoAuthSecretKeyAdminPassword]); err != nil {

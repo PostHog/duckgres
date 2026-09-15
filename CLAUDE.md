@@ -1602,8 +1602,14 @@ password/tenant/catalog changes never propagate.
   Secret + not bootstrapped ⇒ generate; missing Secret + already bootstrapped
   ⇒ **fail loud**, because regenerating the env-projected
   internal-communication shared secret would split-brain a running cluster.
-  The admin password/hash pair is the deliberate exception (no external
-  consumer ⇒ regenerate-if-missing self-heals).
+  Admin and observer password/hash pairs are the deliberate exceptions:
+  missing or incomplete pairs regenerate together. Each attempt reads both
+  keys from one Secret snapshot and updates with that snapshot's resource
+  version. A create/update conflict reloads and adopts the winner, with five
+  attempts per call. Complete but invalid pairs fail without writing; transient
+  API errors also fail without attempting repair. No advisory lock serializes
+  these Kubernetes writes. Never overwrite an existing complete pair to repair
+  a suspected bootstrap race. Confirm stored corruption before operator recovery.
 - **Static catalog reconcile is `SHOW CATALOGS` first**: create only what's missing,
   drop only names matching `opa.ManagedCatalogPattern` that aren't wanted, so
   `system`, `jmx` and hand-made catalogs survive. An org whose password is
