@@ -125,11 +125,15 @@ type RunSummary struct {
 }
 
 // SQLFor preserves canonical SQL except for the JSON scalar extractor in the
-// explicitly labeled properties workload. Its paths and semantics stay shared.
+// explicitly labeled properties workload. The browser key keeps the same
+// semantics while using each engine's supported JSON path syntax.
 func (q Query) SQLFor(protocol Protocol) (string, error) {
 	sql := q.CanonicalSQL()
 	if q.Representation != "" && (protocol == ProtocolTrino || protocol == ProtocolTrinoCached || protocol == ProtocolAthena) {
 		sql = strings.ReplaceAll(sql, "json_extract_string(", "json_extract_scalar(")
+		// Trino/Athena require bracket notation for the dollar-prefixed key.
+		// Match the complete literal used by the generated properties catalog.
+		sql = strings.ReplaceAll(sql, `'$."$browser"'`, `'$["$browser"]'`)
 	}
 	if q.Representation != "" && protocol == ProtocolAthena {
 		// Athena uses the run-specific Glue database, with a flat external table.
