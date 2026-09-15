@@ -135,6 +135,115 @@ must_fail() { # principal password sql pattern
   printf %s "$out" | grep -Eqi "$4" || fail "query failed for wrong reason: $out"
 }
 
+# BEGIN concurrent bootstrap helpers
+bootstrap_scope() {
+  case "$PR" in ''|*[!0-9]*) fail "bootstrap requires a numeric fixture identity" ;; esac
+  [ "$NS" = "duckgres-ci-pr-$PR" ] || fail "bootstrap requires the exact PR namespace"
+}
+
+bootstrap_pods_healthy() {
+  jq -e --argjson count "$1" --argjson old "$2" '
+    (.items | length) == $count and all(.items[];
+      .metadata.deletionTimestamp == null and
+      (.metadata.uid as $uid | ($old | index($uid)) == null) and
+      any(.status.conditions[]?; .type == "Ready" and .status == "True") and
+      ([.status.containerStatuses[]? | select(.name == "controlplane")] | length) == 1 and
+      all(.status.containerStatuses[]?; .ready == true and .restartCount == 0))' >/dev/null
+}
+
+bootstrap_remove_pairs_patch() {
+  jq -ce '
+    ["admin-password", "admin-password-hash", "observer-password", "observer-password-hash"] as $keys |
+    . as $secret |
+    if (.metadata.resourceVersion | type) != "string" or .metadata.resourceVersion == "" or
+       any($keys[]; . as $key | ($secret.data[$key] | type) != "string" or $secret.data[$key] == "") then error("invalid fixture secret") else
+      [{op:"test",path:"/metadata/resourceVersion",value:.metadata.resourceVersion}] +
+      [$keys[] | {op:"remove",path:("/data/" + .)}]
+    end'
+}
+
+bootstrap_pair_fingerprint() (
+  bootstrap_secret="$("$KUBECTL" -n "$NS" get secret trino-auth -o json)" || return 1
+  bootstrap_pairs="$(printf %s "$bootstrap_secret" | jq -ceS '
+    .data | {"admin-password":.["admin-password"], "admin-password-hash":.["admin-password-hash"],
+      "observer-password":.["observer-password"], "observer-password-hash":.["observer-password-hash"]} |
+    if all(.[]; type == "string" and length > 0) then . else error("missing credential pair") end')" || return 1
+  printf %s "$bootstrap_pairs" | sha256sum | awk '{print $1}'
+)
+
+bootstrap_fixed_secrets_fingerprint() (
+  bootstrap_secrets="$("$KUBECTL" -n "$NS" get secret trino-internal-communication trino-opa-bundle-token -o json)" || return 1
+  bootstrap_fixed="$(printf %s "$bootstrap_secrets" | jq -ceS '
+    [.items[] | {name:.metadata.name,data:.data}] | sort_by(.name) |
+    if length == 2 and all(.[]; (.data | type) == "object" and (.data | length) > 0)
+    then . else error("missing fixed cluster credentials") end')" || return 1
+  printf %s "$bootstrap_fixed" | sha256sum | awk '{print $1}'
+)
+
+bootstrap_wait_pods() {
+  bootstrap_wait_attempt=0
+  while [ "$bootstrap_wait_attempt" -lt 60 ]; do
+    if "$KUBECTL" -n "$NS" get pods -l app=duckgres-control-plane -o json |
+        bootstrap_pods_healthy "$1" "$bootstrap_old_uids"; then
+      return 0
+    fi
+    sleep 3
+    bootstrap_wait_attempt=$((bootstrap_wait_attempt + 1))
+  done
+  fail "concurrent bootstrap did not produce the required ready, restart-free replicas"
+}
+# END concurrent bootstrap helpers
+
+log "concurrent credential bootstrap in the isolated fixture"
+bootstrap_scope
+"$KUBECTL" -n "$NS" get deployment duckgres-control-plane -o json |
+  jq -e --arg ns "$NS" '.metadata.namespace == $ns and .metadata.name == "duckgres-control-plane" and
+    .spec.replicas == 1 and .spec.selector.matchLabels.app == "duckgres-control-plane" and
+    .spec.template.metadata.labels.app == "duckgres-control-plane"' >/dev/null || fail "unexpected bootstrap fixture deployment"
+bootstrap_old_pods_json="$("$KUBECTL" -n "$NS" get pods -l app=duckgres-control-plane -o json)"
+bootstrap_old_uids="$(printf %s "$bootstrap_old_pods_json" | jq -ce '[.items[].metadata.uid] | select(length > 0)')"
+bootstrap_old_names="$(printf %s "$bootstrap_old_pods_json" | jq -r '.items[] | "pod/" + .metadata.name')"
+"$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=merge -p '{"spec":{"replicas":0}}' >/dev/null
+# Expand only the names returned by the fixture's pod list.
+# shellcheck disable=SC2086
+"$KUBECTL" -n "$NS" wait --for=delete $bootstrap_old_names --timeout=180s >/dev/null
+"$KUBECTL" -n "$NS" get pods -l app=duckgres-control-plane -o json |
+  jq -e '.items | length == 0' >/dev/null || fail "old fixture controllers still exist"
+bootstrap_fixed_fingerprint="$(bootstrap_fixed_secrets_fingerprint)"
+bootstrap_auth_before="$("$KUBECTL" -n "$NS" get secret trino-auth -o json)"
+bootstrap_patch="$(printf %s "$bootstrap_auth_before" | bootstrap_remove_pairs_patch)"
+"$KUBECTL" -n "$NS" patch secret trino-auth --type=json -p "$bootstrap_patch" >/dev/null
+bootstrap_other_data="$(printf %s "$bootstrap_auth_before" | jq -cS '.data | del(.["admin-password"],.["admin-password-hash"],.["observer-password"],.["observer-password-hash"])')"
+[ "$("$KUBECTL" -n "$NS" get secret trino-auth -o json | jq -cS '.data')" = "$bootstrap_other_data" ] || fail "bootstrap modified unrelated Secret keys"
+unset bootstrap_auth_before bootstrap_other_data bootstrap_patch
+"$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=merge -p '{"spec":{"replicas":3}}' >/dev/null
+bootstrap_wait_pods 3
+bootstrap_initial_fingerprint="$(bootstrap_pair_fingerprint)"
+bootstrap_auth="$("$KUBECTL" -n "$NS" get secret trino-auth -o json)"
+bootstrap_admin="$(printf %s "$bootstrap_auth" | jq -r '.data["admin-password"] | @base64d')"
+bootstrap_observer="$(printf %s "$bootstrap_auth" | jq -r '.data["observer-password"] | @base64d')"
+unset bootstrap_auth
+TRINO="https://duckgres-trino.$NS.svc:8443"
+bootstrap_auth_attempt=0
+bootstrap_authenticated=false
+while [ "$bootstrap_auth_attempt" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
+  if trino_query __admin_provisioner "$bootstrap_admin" 'SHOW CATALOGS' >/dev/null 2>&1 &&
+      trino_query __duckgres_observer "$bootstrap_observer" 'SELECT count(*) FROM system.runtime.nodes' >/dev/null 2>&1; then
+    bootstrap_authenticated=true
+    break
+  fi
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"
+  bootstrap_auth_attempt=$((bootstrap_auth_attempt + 1))
+done
+unset bootstrap_admin bootstrap_observer
+[ "$bootstrap_authenticated" = true ] || fail "concurrent bootstrap credentials did not authenticate against Trino"
+bootstrap_wait_pods 3
+[ "$(bootstrap_pair_fingerprint)" = "$bootstrap_initial_fingerprint" ] || fail "credential pairs changed after concurrent startup"
+[ "$(bootstrap_fixed_secrets_fingerprint)" = "$bootstrap_fixed_fingerprint" ] || fail "bootstrap rotated fixed cluster credentials"
+"$KUBECTL" -n "$NS" patch deployment duckgres-control-plane --type=merge -p '{"spec":{"replicas":1}}' >/dev/null
+bootstrap_wait_pods 1
+[ "$(bootstrap_pair_fingerprint)" = "$bootstrap_initial_fingerprint" ] || fail "credential pairs changed after scale-down"
+
 log "provisioning first Trino tenant"
 pw_a="$(provision "$ORG_A" "$DB_A" "$TEAM_A" | jq -r .password)"
 [ -n "$pw_a" ] && [ "$pw_a" != null ] || fail "tenant A provision returned no password"
@@ -144,6 +253,7 @@ wait_trino "$ORG_A" "$DB_A" "$CAT_A"
 
 log "TLS/password auth, discovery, and DDL/DML"
 [ "$(scalar "$DB_A" "$pw_a" 'SELECT 1')" = 1 ] || fail "Trino SELECT 1 failed"
+[ "$(bootstrap_pair_fingerprint)" = "$bootstrap_initial_fingerprint" ] || fail "tenant provisioning replaced bootstrap credential pairs"
 must_fail "$DB_A" definitely-wrong-password 'SELECT 1' '401|Unauthorized|Authentication|credentials'
 must_fail "$ORG_A" "$pw_a" 'SELECT 1' '401|Unauthorized|Authentication|credentials'
 catalogs="$(trino_query "$DB_A" "$pw_a" 'SHOW CATALOGS')"

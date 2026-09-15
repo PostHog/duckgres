@@ -8,6 +8,36 @@ metadata:
   name: trino
   namespace: ${NAMESPACE}
 ---
+# The disposable harness tests concurrent control-plane credential bootstrap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: trino-bootstrap-harness
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["duckgres-control-plane"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["trino-auth"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: trino-bootstrap-harness
+  namespace: ${NAMESPACE}
+subjects:
+  - kind: ServiceAccount
+    name: duckgres
+    namespace: ${NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: trino-bootstrap-harness
+---
 apiVersion: v1
 kind: Secret
 metadata:
