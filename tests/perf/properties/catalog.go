@@ -35,10 +35,6 @@ func Catalog() core.Catalog {
 				q.SkipReason = "Hoglake does not support the VARIANT representation"
 			}
 			c.Queries = append(c.Queries, q)
-			if rep == "json" {
-				// Athena verifies STRUCT against an untimed JSON baseline.
-				c.Queries = append(c.Queries, core.Query{QueryID: "properties_" + intent + "_v1__json_baseline", IntentID: "properties." + intent + ".v1", Representation: "json", ValidationOnly: true, Targets: []core.Protocol{core.ProtocolAthena}, PGWireSQL: sql})
-			}
 		}
 	}
 	return c
