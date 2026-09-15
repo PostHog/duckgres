@@ -106,3 +106,11 @@ public cell identity (for example, `legacy`) is not the persisted catalog-store
 identity. Cache verification, catalog switching, and cached-catalog cloning all
 use the explicit stored identity. For a missing-catalog error, check this value
 against the baseline coordinator configuration before retrying.
+
+Cached Trino startup logs changed failure signatures for catalog creation and
+tenant metadata readiness separately. Timeout diagnostics retain both attempt
+counts and the last structured errors, including server error codes and Java
+cause/method symbols. Free-form messages, SQL, URLs, and credentials are omitted
+from public artifacts. These diagnostics distinguish a catalog that was never
+created from one that exists but cannot be read; cancellation does not overwrite
+the preceding server failure.
