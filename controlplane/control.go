@@ -2070,7 +2070,9 @@ func (cp *ControlPlane) initSessionMetadata(
 		// the connection selected one — so current_database() and the
 		// information_schema views agree with the name the client connected
 		// with. Everything that executes below still uses effectiveCatalog.
-		if err := sessionmeta.InitSessionDatabaseMetadataWithAccess(initCtx, exec, res.visibleCatalog, metadataAccess); err != nil {
+		// duckLakeAttached comes from the probe above; passing it keeps
+		// sessionmeta from repeating that `duckdb_databases()` query.
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAttached(initCtx, exec, res.visibleCatalog, metadataAccess, duckLakeAttached); err != nil {
 			initContextErr := initCtx.Err()
 			initCancel()
 			outcome, reason := controlPlaneSessionStartOperationResult(

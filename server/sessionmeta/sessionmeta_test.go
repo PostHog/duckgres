@@ -12,10 +12,12 @@ import (
 type countingExecutor struct {
 	execCalls   int
 	execQueries []string
+	queryCalls  int
 	queryRows   sqlcore.RowSet
 }
 
 func (e *countingExecutor) QueryContext(_ context.Context, _ string, _ ...any) (sqlcore.RowSet, error) {
+	e.queryCalls++
 	if e.queryRows == nil {
 		return nil, errors.New("no query rows configured")
 	}
@@ -120,5 +122,84 @@ func TestBuildSessionMetadataSQLContainsAllExpectedStatements(t *testing.T) {
 	// Database literal should appear (used in pg_database view).
 	if !strings.Contains(got, "'analytics'") {
 		t.Errorf("buildSessionMetadataSQL did not interpolate database literal")
+	}
+}
+
+// TestInitSessionDatabaseMetadataWithAttachedSkipsProbe pins the duplicate-probe
+// fix. Every session-init caller runs HasAttachedCatalog before calling in here,
+// and this function used to run it a second time — two `duckdb_databases()`
+// queries per session create. With DuckLake as the session default each one
+// starts a DuckLake transaction, and a transaction on a catalog whose schema
+// version moved pays a full catalog reload. The executor below has no queryRows
+// configured, so any probe would both bump queryCalls and fail the call.
+func TestInitSessionDatabaseMetadataWithAttachedSkipsProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		attached bool
+		// The deferred restore runs only when DuckLake is attached. Assert on
+		// the statements themselves: a bare count would still pass if the
+		// restore ran against the wrong catalog.
+		wantRestore bool
+	}{
+		{name: "attached", attached: true, wantRestore: true},
+		{name: "not attached", attached: false, wantRestore: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &countingExecutor{}
+
+			if err := InitSessionDatabaseMetadataWithAttached(
+				context.Background(), exec, "analytics", nil, tc.attached,
+			); err != nil {
+				t.Fatalf("InitSessionDatabaseMetadataWithAttached: %v", err)
+			}
+
+			if exec.queryCalls != 0 {
+				t.Errorf("issued %d probe queries, want 0 — the caller's answer must be reused", exec.queryCalls)
+			}
+
+			joined := strings.Join(exec.execQueries, "\n---\n")
+			gotRestore := false
+			gotSearchPath := false
+			for _, q := range exec.execQueries {
+				if strings.EqualFold(strings.TrimSpace(q), "USE ducklake") {
+					gotRestore = true
+				}
+				if strings.HasPrefix(strings.TrimSpace(q), "SET search_path") {
+					gotSearchPath = true
+				}
+			}
+			if gotRestore != tc.wantRestore {
+				t.Errorf("`USE ducklake` issued = %v, want %v.\nQueries:\n%s", gotRestore, tc.wantRestore, joined)
+			}
+			if gotSearchPath != tc.wantRestore {
+				t.Errorf("`SET search_path` issued = %v, want %v.\nQueries:\n%s", gotSearchPath, tc.wantRestore, joined)
+			}
+			// The session must always leave the memory catalog and install the
+			// metadata surfaces, attached or not.
+			if !strings.Contains(joined, "USE memory") {
+				t.Errorf("did not switch to the memory catalog.\nQueries:\n%s", joined)
+			}
+			if !strings.Contains(joined, "current_database()") {
+				t.Errorf("did not create the current_database() macro.\nQueries:\n%s", joined)
+			}
+		})
+	}
+}
+
+// TestInitSessionDatabaseMetadataProbesWhenAttachmentUnknown keeps the nil case
+// probing, so the exported wrappers and any caller that does not already hold
+// the answer behave exactly as before.
+func TestInitSessionDatabaseMetadataProbesWhenAttachmentUnknown(t *testing.T) {
+	exec := &countingExecutor{queryRows: &singleIntRow{v: 1}}
+
+	// The probing entry point must still issue exactly one probe.
+	if err := InitSessionDatabaseMetadataWithAccess(
+		context.Background(), exec, "analytics", nil,
+	); err != nil {
+		t.Fatalf("InitSessionDatabaseMetadataWithAccess: %v", err)
+	}
+
+	if exec.queryCalls != 1 {
+		t.Errorf("issued %d probe queries, want 1", exec.queryCalls)
 	}
 }

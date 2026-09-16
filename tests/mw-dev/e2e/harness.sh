@@ -4005,6 +4005,17 @@ trino_catalog_name() { # org -> org_<sanitized database_name>
   printf 'org_%s' "$(printf %s "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_' '_')"
 }
 
+# This assertion is ALSO the e2e coverage for sessionmeta's session-init path
+# (server/sessionmeta/sessionmeta.go). It drives current_database() and
+# pg_database, which are exactly the surfaces InitSessionDatabaseMetadata*
+# installs, so a regression in the DuckLake attachment handling — including the
+# deferred `USE ducklake` / `SET search_path` restore — fails here.
+#
+# Deliberately NOT covered in-Job (2026-09-16, PR #1192): the value of
+# DefaultSessionInitTimeout. It is a ceiling on a metadata-store stall, and the
+# only way to assert it would be to stall a real cnpg shard for ~a minute, which
+# the harness cannot do without breaking every other assertion in the run. The
+# regression net for that constant is main_test.go's default assertion.
 logical_catalog_alias() { # org password sibling_org
   alias_db="$(trino_catalog_name "$1")"
   sibling_db="$(trino_catalog_name "$3")"

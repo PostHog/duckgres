@@ -1845,7 +1845,9 @@ func initAttachedDuckLakeSessionMetadata(conn *sql.Conn, db *sql.DB, cfg server.
 	if !duckLakeAttached {
 		return nil
 	}
-	if err := sessionmeta.InitSessionDatabaseMetadata(initCtx, executor, "ducklake"); err != nil {
+	// Reuse the probe above instead of letting sessionmeta run a second
+	// `duckdb_databases()` query against the DuckLake catalog.
+	if err := sessionmeta.InitSessionDatabaseMetadataWithAttached(initCtx, executor, "ducklake", nil, duckLakeAttached); err != nil {
 		return fmt.Errorf("initialize ducklake session metadata: %w", err)
 	}
 	return nil
