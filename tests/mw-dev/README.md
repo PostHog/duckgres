@@ -426,6 +426,17 @@ normal `go test ./...` lane.
   stores only. External-source/target cutovers, rollback/recovery, ESO errors,
   and stale or concurrently-created index replay are covered by
   `controlplane/admin` and `provisioner` unit tests.
+- **Successful cnpg→cnpg cutover and the cutover milestone columns** — the
+  reshard lane runs `reshard_targets`, `reshard_validation`,
+  `reshard_cancel_during_drain` and `reshard_forced_cutover_rollback`, none of
+  which carries a cnpg→cnpg reshard through to a successful cutover, so the
+  `target_rendered_at` / `target_login_ready_at` stamps are never reached
+  in-Job. Asserting them would mean adding a full successful reshard (copy,
+  drain, flip, source drop) of a live warehouse to the Job, which costs minutes
+  and leaves the tenant on the new shard for the rest of the run. The stamp
+  ordering (the login milestone comes from the successful tenant probe, not from
+  a duckling status read) is covered by
+  `provisioner/reshard_runner_test.go::TestReshardCnpgCutoverLoginMilestoneWaitsForTheProbe`.
 - **Reshard runner-pod crash respawn** — the live reshard operations run in
   dedicated `duckgres-reshard-op-<id>` pods, but deliberately do NOT kill a
   runner pod mid-operation to exercise the leader reconciler's respawn/takeover: a

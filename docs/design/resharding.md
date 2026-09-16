@@ -247,7 +247,31 @@ blocking → preparing_access → draining → fencing_source → pausing_compac
    Ready condition, `SELECT 1` with tenant creds. Timeout → rollback. The
    wait is bounded per-op by `cutover_timeout_seconds` (0 = default 15m /
    `DUCKGRES_RESHARD_FLIP_TIMEOUT`); real cnpg cutovers need minutes —
-   provider-sql role/DB creation plus cnpg SASL credential propagation. This
+   provider-sql role/DB creation plus cnpg SASL credential propagation.
+   **The Ready condition is NOT a convergence signal** — the composition
+   renders `status.metadataStore.endpoint` straight from the patched spec, and
+   the XR's Ready condition is a roll-up over the composed managed resources.
+   The XR's own `Ready` does carry an `observedGeneration` matching
+   `metadata.generation`, but that tracks the XR alone: provider-sql omits
+   `observedGeneration` from the `Ready` condition it writes on the tenant
+   Role/Database MRs (only their `Synced` condition carries one), so the roll-up
+   cannot distinguish a `Ready=True` left over from the previous shard's
+   generation from one provider-sql has re-established against the new
+   ProviderConfig. Endpoint + Ready is therefore satisfiable within one poll of
+   the patch on entirely stale composed conditions. The two real gates are
+   `reshardMaintenance.tenantLogin` (generation-gated: the composition requires
+   `Synced.observedGeneration == generation` and reads `LOGIN` back out of
+   PostgreSQL; only rendered for a cnpg SOURCE, since the whole
+   `reshardMaintenance` status block is keyed on the spec field the runner only
+   sets then) and the `SELECT 1` itself. Expect the op log to sit on
+   `waiting for target: … no such user`: that is the shard pooler's
+   `auth_query` being unable to resolve a role/database that does not exist
+   yet, not a duckgres stall — pgbouncer does not negatively cache these, so it
+   means genuine absence rather than a stale auth cache.
+   `target_login_ready_at` is stamped from the first SUCCESSFUL probe, so
+   `target_login_ready_at − target_rendered_at` is the honest measure of the
+   whole external convergence cost (provider-sql DDL *and* pooler pickup), and
+   duckgres's own contribution to it is bounded by one `loopPoll` (5s). This
    per-op override bounds only target convergence. Rollback restoration of the
    known-good source always retains the runner's full timeout, so a deliberately
    short failed-target test cannot leave the source tenant `NOLOGIN`.

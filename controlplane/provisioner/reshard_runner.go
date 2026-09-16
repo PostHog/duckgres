@@ -1480,12 +1480,44 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 
 		st, err := o.r.duckling.Get(ctx, o.op.DucklingName)
 		if err == nil && strings.HasPrefix(st.MetadataStore.Endpoint, targetPrefix) && st.ReadyCondition {
+			// This branch means "the duckling NAMES the target and nothing it
+			// currently composes is unready" — NOT "the tenant role and
+			// database exist on the target shard". The composition renders
+			// status.metadataStore.endpoint straight from the patched spec,
+			// while the XR's Ready condition is a roll-up over the composed
+			// managed resources. The XR's own Ready does carry an
+			// observedGeneration, but that tracks the XR alone: provider-sql
+			// omits observedGeneration from the Ready condition it writes on
+			// the tenant Role/Database MRs (only their Synced condition
+			// carries one), so the roll-up cannot tell a Ready=True left over
+			// from the PREVIOUS shard's generation apart from one provider-sql
+			// has re-established against the new ProviderConfig. This branch is
+			// therefore satisfiable within one poll of the patch on entirely
+			// stale composed conditions.
+			// tenantLogin below IS generation-gated (the composition requires
+			// Synced.observedGeneration == the Role MR's generation and reads
+			// LOGIN back out of PostgreSQL), and the probe is the only thing
+			// that proves the pooler can actually route a tenant login — so
+			// those two, not this, are the real gates.
 			if o.op.TargetRenderedAt == nil {
+				// The milestone columns are write-only telemetry, so a failed
+				// write must not be able to fail the cutover: flipToCnpg runs
+				// before the source drop commits, so any error returned from
+				// here sends run() down the ROLLBACK path — flipping the
+				// duckling back and extending the maintenance window on a live
+				// customer for the sake of a timestamp nothing reads. A fenced
+				// error is different in kind: it means another runner owns this
+				// operation now, and execute() must see it so it abandons
+				// without rolling back anything under the new owner.
 				at, markErr := o.mark("target_rendered_at")
-				if markErr != nil {
+				switch {
+				case markErr == nil:
+					o.op.TargetRenderedAt = at
+				case errors.Is(markErr, configstore.ErrReshardFenced):
 					return markErr
+				default:
+					o.logf("warn", "recording the target_rendered_at milestone failed (%v); continuing the cutover", markErr)
 				}
-				o.op.TargetRenderedAt = at
 			}
 			o.target = CatalogEndpoint{
 				Host: st.MetadataStore.Endpoint, Port: 5432,
@@ -1493,22 +1525,43 @@ func (o *opRun) flipToCnpg(ctx context.Context) error {
 				SSLMode: sslModeFor(o.op.TargetKind),
 			}
 			if o.op.SourceKind == configstore.MetadataStoreKindCnpgShard && !st.ReshardMaintenance.TenantLogin {
-				lastObserved = "composition converged, waiting for provider-sql to observe LOGIN on the target tenant role"
+				lastObserved = "duckling names the target and reports Ready, waiting for provider-sql to observe LOGIN on the target tenant role"
 				goto waitForTarget
-			}
-			if o.op.TargetLoginReadyAt == nil {
-				at, markErr := o.mark("target_login_ready_at")
-				if markErr != nil {
-					return markErr
-				}
-				o.op.TargetLoginReadyAt = at
 			}
 			probeErr := o.r.copier.Probe(ctx, o.target)
 			if probeErr == nil {
+				// Milestone taken from the SUCCESSFUL probe, never from a
+				// status read. tenantLogin only says provider-sql observed
+				// LOGIN on the Role MR; it says nothing about the tenant
+				// DATABASE (no equivalent status signal exists) or about the
+				// shard pooler, whose auth_query cannot resolve the tenant
+				// until both exist — that window is what the op log shows as
+				// pgbouncer's "no such user". Stamping before the probe
+				// excluded exactly that term, which is the one an operator
+				// needs to separate "provider-sql is slow" from "the pooler
+				// has not picked the tenant up yet".
+				//
+				// As with target_rendered_at, a non-fenced write failure is
+				// logged and swallowed: the probe has already proven the
+				// target, and rolling a proven cutover back over a telemetry
+				// write would be a far worse outcome than a NULL column. A
+				// fenced error still returns, so a runner that lost the
+				// operation abandons it instead of continuing to act on it.
+				if o.op.TargetLoginReadyAt == nil {
+					at, markErr := o.mark("target_login_ready_at")
+					switch {
+					case markErr == nil:
+						o.op.TargetLoginReadyAt = at
+					case errors.Is(markErr, configstore.ErrReshardFenced):
+						return markErr
+					default:
+						o.logf("warn", "recording the target_login_ready_at milestone failed (%v); the target is proven and the cutover continues", markErr)
+					}
+				}
 				o.logf("info", "target ready: duckling converged on %s and the tenant role answers", st.MetadataStore.Endpoint)
 				return nil
 			}
-			lastObserved = "composition converged, " + describeProbeFailure(probeErr, st.MetadataStore.User)
+			lastObserved = "duckling names the target and reports Ready, " + describeProbeFailure(probeErr, st.MetadataStore.User)
 		} else {
 			switch {
 			case err != nil:

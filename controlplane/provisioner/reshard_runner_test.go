@@ -2505,3 +2505,68 @@ func TestReshardExtRecoveryProbeAuthFailureDiagnosed(t *testing.T) {
 		t.Fatalf("warehouse state = %s, want resharding after unverified recovery", store.warehouseState)
 	}
 }
+
+// TestReshardCnpgCutoverLoginMilestoneWaitsForTheProbe pins the cutover
+// milestone semantics against the real failure shape: the duckling reports the
+// target endpoint AND Ready within one poll of the patch (the endpoint is
+// rendered from the patched spec, and the XR's Ready roll-up cannot see
+// staleness in the composed provider-sql managed resources because provider-sql
+// omits observedGeneration from the Ready conditions it writes on them), and
+// the composition even reports tenantLogin, while the
+// shard pooler still rejects the tenant with pgbouncer's "no such user" because
+// the tenant database is not there yet. target_login_ready_at must be stamped
+// from the successful probe, not from either status read — stamping earlier
+// excluded the pooler-pickup term, which is the one that separates "provider-sql
+// is slow" from "the pooler has not picked the tenant up yet".
+func TestReshardCnpgCutoverLoginMilestoneWaitsForTheProbe(t *testing.T) {
+	store := newFakeReshardStore(cnpgOp())
+	duckling := &fakeDuckling{status: cnpgSourceStatus()}
+
+	var mu sync.Mutex
+	targetProbes := 0
+	var lastRejection time.Time
+	copier := &fakeCopier{copyResult: CatalogCopyResult{Tables: 1, Rows: 1}}
+	copier.probeFn = func(ep CatalogEndpoint) error {
+		if !strings.HasPrefix(ep.Host, "shard-002-pooler.") {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		targetProbes++
+		if targetProbes > 3 {
+			return nil
+		}
+		lastRejection = time.Now().UTC()
+		return errors.New("connect shard-002-pooler.cnpg-shards.svc.cluster.local:5432: FATAL: no such user (SQLSTATE 08P01)")
+	}
+
+	runOp(t, testRunner(store, duckling, copier), store)
+
+	if store.op.State != configstore.ReshardStateSucceeded {
+		t.Fatalf("state = %s (err %q), want succeeded", store.op.State, store.op.Error)
+	}
+	if store.op.TargetRenderedAt == nil || store.op.TargetLoginReadyAt == nil {
+		t.Fatalf("cutover milestones not recorded: rendered=%v login_ready=%v",
+			store.op.TargetRenderedAt, store.op.TargetLoginReadyAt)
+	}
+	mu.Lock()
+	rejectedAt := lastRejection
+	mu.Unlock()
+	if rejectedAt.IsZero() {
+		t.Fatal("the target pooler never rejected a probe; the case under test did not run")
+	}
+	if !store.op.TargetLoginReadyAt.After(rejectedAt) {
+		t.Fatalf("target_login_ready_at (%s) must be stamped from the successful probe, after the last pooler rejection (%s) — stamping from the status read drops the pooler-pickup term",
+			store.op.TargetLoginReadyAt, rejectedAt)
+	}
+	if store.op.TargetRenderedAt.After(rejectedAt) {
+		t.Fatalf("target_rendered_at (%s) should still record the endpoint/Ready read, which precedes the rejections (%s)",
+			store.op.TargetRenderedAt, rejectedAt)
+	}
+	if !store.hasLog("no such user") {
+		t.Fatal("the op log must carry the pooler's rejection so the wait is diagnosable")
+	}
+	if store.hasLog("composition converged, tenant-role probe failing") {
+		t.Fatal("the wait must not claim the composition converged on a Ready roll-up that does not prove the tenant role exists")
+	}
+}
