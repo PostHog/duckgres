@@ -136,18 +136,19 @@ func TestInitSessionDatabaseMetadataWithAttachedSkipsProbe(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		attached bool
-		// USE ducklake + SET search_path only run when DuckLake is attached.
-		wantExecCalls int
+		// The deferred restore runs only when DuckLake is attached. Assert on
+		// the statements themselves: a bare count would still pass if the
+		// restore ran against the wrong catalog.
+		wantRestore bool
 	}{
-		{name: "attached", attached: true, wantExecCalls: 5},
-		{name: "not attached", attached: false, wantExecCalls: 3},
+		{name: "attached", attached: true, wantRestore: true},
+		{name: "not attached", attached: false, wantRestore: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := &countingExecutor{}
-			attached := tc.attached
 
 			if err := InitSessionDatabaseMetadataWithAttached(
-				context.Background(), exec, "analytics", nil, &attached,
+				context.Background(), exec, "analytics", nil, tc.attached,
 			); err != nil {
 				t.Fatalf("InitSessionDatabaseMetadataWithAttached: %v", err)
 			}
@@ -155,9 +156,31 @@ func TestInitSessionDatabaseMetadataWithAttachedSkipsProbe(t *testing.T) {
 			if exec.queryCalls != 0 {
 				t.Errorf("issued %d probe queries, want 0 — the caller's answer must be reused", exec.queryCalls)
 			}
-			if exec.execCalls != tc.wantExecCalls {
-				t.Errorf("ExecContext call count = %d, want %d.\nQueries:\n%s",
-					exec.execCalls, tc.wantExecCalls, strings.Join(exec.execQueries, "\n---\n"))
+
+			joined := strings.Join(exec.execQueries, "\n---\n")
+			gotRestore := false
+			gotSearchPath := false
+			for _, q := range exec.execQueries {
+				if strings.EqualFold(strings.TrimSpace(q), "USE ducklake") {
+					gotRestore = true
+				}
+				if strings.HasPrefix(strings.TrimSpace(q), "SET search_path") {
+					gotSearchPath = true
+				}
+			}
+			if gotRestore != tc.wantRestore {
+				t.Errorf("`USE ducklake` issued = %v, want %v.\nQueries:\n%s", gotRestore, tc.wantRestore, joined)
+			}
+			if gotSearchPath != tc.wantRestore {
+				t.Errorf("`SET search_path` issued = %v, want %v.\nQueries:\n%s", gotSearchPath, tc.wantRestore, joined)
+			}
+			// The session must always leave the memory catalog and install the
+			// metadata surfaces, attached or not.
+			if !strings.Contains(joined, "USE memory") {
+				t.Errorf("did not switch to the memory catalog.\nQueries:\n%s", joined)
+			}
+			if !strings.Contains(joined, "current_database()") {
+				t.Errorf("did not create the current_database() macro.\nQueries:\n%s", joined)
 			}
 		})
 	}
@@ -169,10 +192,11 @@ func TestInitSessionDatabaseMetadataWithAttachedSkipsProbe(t *testing.T) {
 func TestInitSessionDatabaseMetadataProbesWhenAttachmentUnknown(t *testing.T) {
 	exec := &countingExecutor{queryRows: &singleIntRow{v: 1}}
 
-	if err := InitSessionDatabaseMetadataWithAttached(
-		context.Background(), exec, "analytics", nil, nil,
+	// The probing entry point must still issue exactly one probe.
+	if err := InitSessionDatabaseMetadataWithAccess(
+		context.Background(), exec, "analytics", nil,
 	); err != nil {
-		t.Fatalf("InitSessionDatabaseMetadataWithAttached: %v", err)
+		t.Fatalf("InitSessionDatabaseMetadataWithAccess: %v", err)
 	}
 
 	if exec.queryCalls != 1 {

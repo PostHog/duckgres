@@ -594,11 +594,11 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 
 func TestResolveEffectiveConfigSessionInitTimeout(t *testing.T) {
 	resolved := configresolve.ResolveEffective(nil, configresolve.CLIInputs{}, nil, nil)
-	if resolved.SessionInitTimeout != 30*time.Second {
-		t.Fatalf("expected default session init timeout 30s, got %s", resolved.SessionInitTimeout)
+	if resolved.SessionInitTimeout != 60*time.Second {
+		t.Fatalf("expected default session init timeout 60s, got %s", resolved.SessionInitTimeout)
 	}
-	if resolved.Server.SessionInitTimeout != 30*time.Second {
-		t.Fatalf("expected server default session init timeout 30s, got %s", resolved.Server.SessionInitTimeout)
+	if resolved.Server.SessionInitTimeout != 60*time.Second {
+		t.Fatalf("expected server default session init timeout 60s, got %s", resolved.Server.SessionInitTimeout)
 	}
 }
 

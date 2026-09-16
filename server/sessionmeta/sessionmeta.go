@@ -41,7 +41,7 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 // catalog itself; callers that already hold that answer should pass it to
 // InitSessionDatabaseMetadataWithAttached instead.
 func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore.QueryExecutor, catalog string, access *MetadataAccessPolicy) error {
-	return InitSessionDatabaseMetadataWithAttached(ctx, executor, catalog, access, nil)
+	return initSessionDatabaseMetadata(ctx, executor, catalog, access, nil)
 }
 
 // InitSessionDatabaseMetadataWithAttached is InitSessionDatabaseMetadataWithAccess
@@ -52,8 +52,16 @@ func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore
 // per session create. With DuckLake as the session default each of those
 // starts a DuckLake transaction, and a transaction on a catalog whose schema
 // version moved pays a full reload. Passing the known value drops the second
-// probe. A nil `attached` preserves the old behavior and probes.
-func InitSessionDatabaseMetadataWithAttached(ctx context.Context, executor sqlcore.QueryExecutor, catalog string, access *MetadataAccessPolicy, attached *bool) error {
+// probe.
+func InitSessionDatabaseMetadataWithAttached(ctx context.Context, executor sqlcore.QueryExecutor, catalog string, access *MetadataAccessPolicy, duckLakeAttached bool) error {
+	return initSessionDatabaseMetadata(ctx, executor, catalog, access, &duckLakeAttached)
+}
+
+// initSessionDatabaseMetadata does the work for both exported entry points. A
+// nil `attached` probes; a non-nil one reuses the caller's answer. The pointer
+// stays unexported so no caller has to reason about a nil-able bool, and the
+// probe keeps its original position in the statement order.
+func initSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExecutor, catalog string, access *MetadataAccessPolicy, attached *bool) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
 	}

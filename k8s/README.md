@@ -63,7 +63,7 @@ Key flags for Kubernetes multitenant mode:
 |------|---------|-------------|
 | `--worker-backend remote` | - | Use K8s remote workers in config-store-backed multitenant mode |
 | `--config-store` | `DUCKGRES_CONFIG_STORE` | PostgreSQL config-store connection string required for remote mode |
-| `--session-init-timeout` | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout (`30s` default) |
+| `--session-init-timeout` | `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout (`60s` default) |
 | `--handover-drain-timeout` | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns/upgrades before forced exit (`15m` default in remote mode) |
 | `--sni-routing-mode` | `DUCKGRES_SNI_ROUTING_MODE` | Managed-hostname routing: `off`, `passthrough`, or `enforce`. Postgres uses requested dbname first; managed SNI must resolve to the same org, and SNI supplies the database only when dbname is empty |
 | `--managed-hostname-suffixes` | `DUCKGRES_MANAGED_HOSTNAME_SUFFIXES` | Comma-separated managed hostname suffixes such as `.dw.test.local` |

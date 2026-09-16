@@ -1054,7 +1054,7 @@ func (c *clientConn) serve() error {
 		}
 		// duckLakeAttached comes from the probe above; passing it keeps
 		// sessionmeta from repeating that `duckdb_databases()` query.
-		if err := sessionmeta.InitSessionDatabaseMetadataWithAttached(initCtx, c.executor, catalog, nil, &duckLakeAttached); err != nil {
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAttached(initCtx, c.executor, catalog, nil, duckLakeAttached); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err

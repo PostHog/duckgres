@@ -2072,7 +2072,7 @@ func (cp *ControlPlane) initSessionMetadata(
 		// with. Everything that executes below still uses effectiveCatalog.
 		// duckLakeAttached comes from the probe above; passing it keeps
 		// sessionmeta from repeating that `duckdb_databases()` query.
-		if err := sessionmeta.InitSessionDatabaseMetadataWithAttached(initCtx, exec, res.visibleCatalog, metadataAccess, &duckLakeAttached); err != nil {
+		if err := sessionmeta.InitSessionDatabaseMetadataWithAttached(initCtx, exec, res.visibleCatalog, metadataAccess, duckLakeAttached); err != nil {
 			initContextErr := initCtx.Err()
 			initCancel()
 			outcome, reason := controlPlaneSessionStartOperationResult(
