@@ -357,7 +357,7 @@ Create a `duckgres.yaml` file (see `duckgres.example.yaml` for a complete exampl
 host: "0.0.0.0"
 port: 5432
 data_dir: "./data"
-session_init_timeout: "10s"
+session_init_timeout: "30s"
 admission_reclaimer_max_reservations: 4096
 
 tls:
@@ -424,7 +424,7 @@ Run with config file:
 | `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` standalone, `5m` control-plane |
 | `DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX` | Maximum client-requested `duckgres.idle_timeout`; unset disables client overrides | disabled |
-| `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `10s` |
+| `DUCKGRES_SESSION_INIT_TIMEOUT` | Session startup metadata initialization and catalog probe timeout | `30s` |
 | `DUCKGRES_WORKER_QUEUE_TIMEOUT` | Max time to wait for worker acquisition and per-org/per-user vCPU resource admission; the managed K8s queue TTL uses this value | `60s` |
 | `DUCKGRES_ADMISSION_RECLAIMER_MAX_RESERVATIONS` | Max queued/live admission identities whose cleanup ownership one control plane may retain; new admissions are rejected before enqueue when full | `4096` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |

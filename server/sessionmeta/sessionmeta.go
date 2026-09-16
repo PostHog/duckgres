@@ -37,8 +37,23 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor sqlcore.QueryExec
 }
 
 // InitSessionDatabaseMetadataWithAccess installs metadata views filtered to
-// the relations the current principal can query.
+// the relations the current principal can query. It probes for the DuckLake
+// catalog itself; callers that already hold that answer should pass it to
+// InitSessionDatabaseMetadataWithAttached instead.
 func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore.QueryExecutor, catalog string, access *MetadataAccessPolicy) error {
+	return InitSessionDatabaseMetadataWithAttached(ctx, executor, catalog, access, nil)
+}
+
+// InitSessionDatabaseMetadataWithAttached is InitSessionDatabaseMetadataWithAccess
+// with the DuckLake attachment state supplied by the caller.
+//
+// Every session-init caller already runs HasAttachedCatalog before this
+// function, which then ran it a second time — two `duckdb_databases()` queries
+// per session create. With DuckLake as the session default each of those
+// starts a DuckLake transaction, and a transaction on a catalog whose schema
+// version moved pays a full reload. Passing the known value drops the second
+// probe. A nil `attached` preserves the old behavior and probes.
+func InitSessionDatabaseMetadataWithAttached(ctx context.Context, executor sqlcore.QueryExecutor, catalog string, access *MetadataAccessPolicy, attached *bool) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
 	}
@@ -55,9 +70,15 @@ func InitSessionDatabaseMetadataWithAccess(ctx context.Context, executor sqlcore
 		return fmt.Errorf("create current_database() macro: %w", err)
 	}
 
-	duckLakeAttached, err := HasAttachedCatalog(ctx, executor, "ducklake")
-	if err != nil {
-		return fmt.Errorf("detect ducklake attachment: %w", err)
+	var duckLakeAttached bool
+	if attached != nil {
+		duckLakeAttached = *attached
+	} else {
+		probed, err := HasAttachedCatalog(ctx, executor, "ducklake")
+		if err != nil {
+			return fmt.Errorf("detect ducklake attachment: %w", err)
+		}
+		duckLakeAttached = probed
 	}
 
 	if _, err := executor.ExecContext(ctx, "USE memory"); err != nil {

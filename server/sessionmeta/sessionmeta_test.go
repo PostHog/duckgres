@@ -12,10 +12,12 @@ import (
 type countingExecutor struct {
 	execCalls   int
 	execQueries []string
+	queryCalls  int
 	queryRows   sqlcore.RowSet
 }
 
 func (e *countingExecutor) QueryContext(_ context.Context, _ string, _ ...any) (sqlcore.RowSet, error) {
+	e.queryCalls++
 	if e.queryRows == nil {
 		return nil, errors.New("no query rows configured")
 	}
@@ -120,5 +122,60 @@ func TestBuildSessionMetadataSQLContainsAllExpectedStatements(t *testing.T) {
 	// Database literal should appear (used in pg_database view).
 	if !strings.Contains(got, "'analytics'") {
 		t.Errorf("buildSessionMetadataSQL did not interpolate database literal")
+	}
+}
+
+// TestInitSessionDatabaseMetadataWithAttachedSkipsProbe pins the duplicate-probe
+// fix. Every session-init caller runs HasAttachedCatalog before calling in here,
+// and this function used to run it a second time — two `duckdb_databases()`
+// queries per session create. With DuckLake as the session default each one
+// starts a DuckLake transaction, and a transaction on a catalog whose schema
+// version moved pays a full catalog reload. The executor below has no queryRows
+// configured, so any probe would both bump queryCalls and fail the call.
+func TestInitSessionDatabaseMetadataWithAttachedSkipsProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		attached bool
+		// USE ducklake + SET search_path only run when DuckLake is attached.
+		wantExecCalls int
+	}{
+		{name: "attached", attached: true, wantExecCalls: 5},
+		{name: "not attached", attached: false, wantExecCalls: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exec := &countingExecutor{}
+			attached := tc.attached
+
+			if err := InitSessionDatabaseMetadataWithAttached(
+				context.Background(), exec, "analytics", nil, &attached,
+			); err != nil {
+				t.Fatalf("InitSessionDatabaseMetadataWithAttached: %v", err)
+			}
+
+			if exec.queryCalls != 0 {
+				t.Errorf("issued %d probe queries, want 0 — the caller's answer must be reused", exec.queryCalls)
+			}
+			if exec.execCalls != tc.wantExecCalls {
+				t.Errorf("ExecContext call count = %d, want %d.\nQueries:\n%s",
+					exec.execCalls, tc.wantExecCalls, strings.Join(exec.execQueries, "\n---\n"))
+			}
+		})
+	}
+}
+
+// TestInitSessionDatabaseMetadataProbesWhenAttachmentUnknown keeps the nil case
+// probing, so the exported wrappers and any caller that does not already hold
+// the answer behave exactly as before.
+func TestInitSessionDatabaseMetadataProbesWhenAttachmentUnknown(t *testing.T) {
+	exec := &countingExecutor{queryRows: &singleIntRow{v: 1}}
+
+	if err := InitSessionDatabaseMetadataWithAttached(
+		context.Background(), exec, "analytics", nil, nil,
+	); err != nil {
+		t.Fatalf("InitSessionDatabaseMetadataWithAttached: %v", err)
+	}
+
+	if exec.queryCalls != 1 {
+		t.Errorf("issued %d probe queries, want 1", exec.queryCalls)
 	}
 }

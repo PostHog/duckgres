@@ -129,7 +129,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX  Maximum client-requested idle timeout; unset disables client overrides\n")
-		fmt.Fprintf(os.Stderr, "  DUCKGRES_SESSION_INIT_TIMEOUT  Session startup metadata/probe timeout (default: 10s)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_SESSION_INIT_TIMEOUT  Session startup metadata/probe timeout (default: 30s)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_THREADS            DuckDB threads per session\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_BUDGET      Total memory for all DuckDB sessions (e.g., 24GB)\n")

@@ -43,7 +43,23 @@ type DuckLakeConfig = ducklake.Config
 const DefaultDuckLakeSpecVersion = ducklake.DefaultSpecVersion
 
 // DefaultSessionInitTimeout bounds startup metadata initialization and catalog probes.
-const DefaultSessionInitTimeout = 10 * time.Second
+//
+// 10s → 30s (2026-09-16): session init runs its probes with the DuckLake
+// catalog as the session default, so each statement starts a DuckLake
+// transaction. When the catalog's schema version changed since the DuckDB
+// instance last loaded it, that transaction pays a full catalog reload before
+// the probe returns. On a large tenant catalog (measured on mw-prod-us: ~5,900
+// live tables, ~1.0M live columns) the reload takes 12-22s, so a 10s budget
+// expired mid-reload. The failure is client-facing and fatal: the worker
+// returns "detect ducklake attachment: INTERRUPT Error", flight_handler maps
+// it to ResourceExhausted, and the control plane refuses the connection with
+// 58000 rather than retrying. It hit ~3% of worker spawns for that tenant.
+//
+// This bounds a pathological metadata store, not the steady state: a warm
+// instance completes session init in milliseconds, so raising the ceiling
+// costs nothing on a healthy path. Override per deployment with
+// DUCKGRES_SESSION_INIT_TIMEOUT / --session-init-timeout.
+const DefaultSessionInitTimeout = 30 * time.Second
 
 // Re-exports of the migration / backup / delta-path entry points so callers
 // that referenced them under the server package continue to compile after
