@@ -1082,9 +1082,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
-		if c.isCallerCancellation(err) {
+		if c.statementTimedOut() || c.isCallerCancellation(err) {
 			errCode = "57014"
-			errMsg = "canceling statement due to user request"
+			errMsg = c.cancellationMessage()
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
 			c.logger().Error("Row iteration error.", "error", err)
@@ -1168,9 +1168,9 @@ func (c *clientConn) resumeSuspendedPortal(p *portal, maxRows int32) {
 		p.closeExec()
 		errCode := "42000"
 		errMsg := err.Error()
-		if c.isCallerCancellation(err) {
+		if c.statementTimedOut() || c.isCallerCancellation(err) {
 			errCode = "57014"
-			errMsg = "canceling statement due to user request"
+			errMsg = c.cancellationMessage()
 		} else {
 			c.logger().Error("Row iteration error.", "error", err)
 		}

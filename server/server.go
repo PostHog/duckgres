@@ -251,6 +251,30 @@ type Config struct {
 	// Default: 10 seconds.
 	SessionInitTimeout time.Duration
 
+	// StatementTimeout bounds how long a single statement may run before the
+	// server cancels it. 0 (the default) disables it, preserving today's
+	// unbounded behaviour.
+	//
+	// This is blast-radius containment, not a performance knob. Nothing else in
+	// the stack bounds a wedged statement: DuckDB has no statement timeout,
+	// `statement_timeout` from the client is an ignored SET (see
+	// transform.SetShowTransform), the cnpg shards run
+	// idle_in_transaction_session_timeout=0, and pgwire clients wait forever. A
+	// single engine deadlock therefore cost 5h33m of a tenant's hourly refresh
+	// pipeline on 2026-09-16 -- the statement only ended when the CI job hit its
+	// own 6h wall, and every queued refresh behind it was cancelled.
+	//
+	// Size it well above the slowest legitimate statement (that tenant's real
+	// INSERTs peak near 10 minutes) and well below whatever external wall would
+	// otherwise be the only bound.
+	//
+	// NOTE: an engine that ignores cancellation (duckdb/duckdb#24961) will not
+	// stop work when this fires; the client is freed and gets a clear error, but
+	// the worker can stay wedged. Retiring a worker whose statement timed out is
+	// a follow-up -- it has to respect the destroy-before-reuse ordering in
+	// SessionManager.DestroySession.
+	StatementTimeout time.Duration
+
 	// FilePersistence stores DuckDB data in <DataDir>/<username>.duckdb instead of :memory:.
 	// DuckDB memory-maps the file and serves queries from RAM, so performance is similar
 	// to in-memory mode while data persists across connections and restarts.

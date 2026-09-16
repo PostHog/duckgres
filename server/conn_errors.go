@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 )
 
 // isQueryCancelled checks whether an error string indicates that *some*
@@ -15,7 +16,46 @@ import (
 // since infra cancels are real failures we want surfaced. Use
 // (*clientConn).isCallerCancellation for that.
 func isQueryCancelled(err error) bool {
-	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded")
+}
+
+// statementTimeout returns the effective per-statement timeout, or 0 when
+// statements are unbounded.
+func (c *clientConn) statementTimeout() time.Duration {
+	if c == nil || c.server == nil {
+		return 0
+	}
+	return c.server.cfg.StatementTimeout
+}
+
+// statementTimedOut reports whether the in-flight statement's own deadline
+// expired. The deadline lives on the STATEMENT context, so the connection
+// context is still healthy when it fires and c.ctx.Err() is nil -- which means
+// isCallerCancellation alone would misclassify a timeout as an infra failure
+// and surface it as a bare 42000 with a "context deadline exceeded" message.
+// Check this before isCallerCancellation at every classification site.
+func (c *clientConn) statementTimedOut() bool {
+	if c == nil || c.stmtCtx == nil {
+		return false
+	}
+	return errors.Is(c.stmtCtx.Err(), context.DeadlineExceeded)
+}
+
+// cancellationMessage returns the client-facing 57014 message. The wording
+// mirrors PostgreSQL's exactly, because drivers and ORMs string-match it to
+// decide whether a failure is retryable.
+func (c *clientConn) cancellationMessage() string {
+	if c.statementTimedOut() {
+		return "canceling statement due to statement timeout"
+	}
+	return "canceling statement due to user request"
 }
 
 // isCallerCancellation reports whether err is a cancellation that the caller
@@ -30,7 +70,15 @@ func (c *clientConn) isCallerCancellation(err error) bool {
 	if !isQueryCancelled(err) {
 		return false
 	}
-	if c == nil || c.ctx == nil {
+	if c == nil {
+		return false
+	}
+	// A statement timeout is caller-driven even though the connection context is
+	// untouched, so it must not be logged as an infra failure.
+	if c.statementTimedOut() {
+		return true
+	}
+	if c.ctx == nil {
 		return false
 	}
 	return c.ctx.Err() != nil

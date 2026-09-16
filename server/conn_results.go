@@ -70,8 +70,8 @@ func (c *clientConn) streamRowsToClientExtended(rows RowSet, cmdType string, res
 	}
 
 	if err := rows.Err(); err != nil {
-		if c.isCallerCancellation(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		if c.statementTimedOut() || c.isCallerCancellation(err) {
+			c.sendError("ERROR", "57014", c.cancellationMessage())
 		} else {
 			c.logger().Error("Row iteration error.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())
@@ -145,8 +145,8 @@ func (c *clientConn) streamRowsToClient(rows RowSet, cmdType string, query strin
 	}
 
 	if err := rows.Err(); err != nil {
-		if c.isCallerCancellation(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+		if c.statementTimedOut() || c.isCallerCancellation(err) {
+			c.sendError("ERROR", "57014", c.cancellationMessage())
 		} else {
 			c.logger().Error("Row iteration error.", "query", query, "error", err)
 			c.sendError("ERROR", "42000", err.Error())

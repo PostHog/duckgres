@@ -36,6 +36,7 @@ type CLIInputs struct {
 	ProcessIsolation            bool
 	IdleTimeout                 string
 	SessionInitTimeout          string
+	StatementTimeout            string
 	MemoryLimit                 string
 	Threads                     int
 	MemoryBudget                string
@@ -89,6 +90,7 @@ type Resolved struct {
 	ProcessMaxWorkers               int
 	ProcessRetireOnSessionEnd       bool
 	SessionInitTimeout              time.Duration
+	StatementTimeout                time.Duration
 	WorkerQueueTimeout              time.Duration
 	WorkerIdleTimeout               time.Duration
 	HandoverDrainTimeout            time.Duration
@@ -338,6 +340,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 				cfg.IdleTimeout = d
 			} else {
 				warn("Invalid idle_timeout duration: " + err.Error())
+			}
+		}
+		if fileCfg.StatementTimeout != "" {
+			if d, err := time.ParseDuration(fileCfg.StatementTimeout); err == nil {
+				cfg.StatementTimeout = d
+			} else {
+				warn("Invalid statement_timeout duration: " + err.Error())
 			}
 		}
 		if fileCfg.SessionInitTimeout != "" {
@@ -593,6 +602,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			cfg.ClientIdleTimeoutMax = d
 		} else {
 			warn("Invalid DUCKGRES_CLIENT_IDLE_TIMEOUT_MAX: must be a positive duration")
+		}
+	}
+	if v := getenv("DUCKGRES_STATEMENT_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.StatementTimeout = d
+		} else {
+			warn("Invalid DUCKGRES_STATEMENT_TIMEOUT duration: " + err.Error())
 		}
 	}
 	if v := getenv("DUCKGRES_SESSION_INIT_TIMEOUT"); v != "" {
@@ -940,6 +956,13 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 			cfg.IdleTimeout = d
 		} else {
 			warn("Invalid --idle-timeout duration: " + err.Error())
+		}
+	}
+	if cli.Set["statement-timeout"] {
+		if d, err := time.ParseDuration(cli.StatementTimeout); err == nil {
+			cfg.StatementTimeout = d
+		} else {
+			warn("Invalid --statement-timeout duration: " + err.Error())
 		}
 	}
 	if cli.Set["session-init-timeout"] {

@@ -225,6 +225,7 @@ type clientConn struct {
 	cursors            map[string]*cursorState  // server-side cursor emulation
 	catalogUseRewrite  bool                     // true when bare `USE ducklake` should expand to the reliable two-part target
 	ctx                context.Context          // connection context, cancelled when connection is closed
+	stmtCtx            context.Context          // in-flight statement context; carries the StatementTimeout deadline
 	cancel             context.CancelFunc       // cancels the connection context
 	drainRequested     atomic.Bool              // close at the next idle protocol boundary
 	idleRead           atomic.Bool              // blocked reading the next top-level client message
@@ -488,7 +489,17 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	// Carry the statement's ID to the engine. The worker stamps it on its own
 	// logs, so a client complaint can be followed from this connection into the
 	// pod that ran the statement.
-	ctx, cancel := context.WithCancel(wire.WithQueryID(c.ctx, c.currentQueryID()))
+	// The statement timeout rides on the statement context, not the connection
+	// context: a timeout must end one statement, not the session. That is also
+	// why statementTimedOut() cannot be answered from c.ctx -- see conn_errors.go.
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout := c.statementTimeout(); timeout > 0 {
+		ctx, cancel = context.WithTimeout(wire.WithQueryID(c.ctx, c.currentQueryID()), timeout)
+	} else {
+		ctx, cancel = context.WithCancel(wire.WithQueryID(c.ctx, c.currentQueryID()))
+	}
+	c.stmtCtx = ctx
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 
@@ -524,6 +535,10 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 		}
 		c.server.UnregisterQuery(key)
 		cancel()
+		// Deliberately NOT clearing c.stmtCtx: the error paths classify the
+		// failure after cleanup has run, and a cleared context would make a
+		// statement timeout look like an ordinary infra error. The next
+		// statement overwrites it.
 	}
 
 	return ctx, cleanup

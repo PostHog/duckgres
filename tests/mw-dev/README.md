@@ -526,6 +526,24 @@ normal `go test ./...` lane.
   fires these (it provisions, deprovisions, resets, and runs queries), but the
   events are sent asynchronously to PostHog's
   external capture API and the in-cluster Job holds no PostHog query-API creds
+- **`--statement-timeout` (`DUCKGRES_STATEMENT_TIMEOUT`) is unit-only, deliberately.**
+  The knob is server-global and defaults to `0` (unbounded), so asserting it
+  in-Job needs one of two bad options: set a short global timeout on the e2e
+  control plane, which would start killing the harness's own legitimately slow
+  assertions (reshard copies, DuckLake round-trips, concurrent-writer checks);
+  or leave it generous and burn that many minutes on a deliberately slow query
+  just to watch it expire. Neither buys more confidence than the unit tests,
+  which cover the behaviour that can actually regress: the deadline is applied
+  to the STATEMENT context and not the connection context, `0` leaves
+  statements unbounded, an expired deadline classifies as `57014` with
+  PostgreSQL's exact `canceling statement due to statement timeout` wording
+  (drivers string-match it), a user cancel keeps the `due to user request`
+  wording, and `isQueryCancelled` matches `context deadline exceeded` as well
+  as `context canceled`. See `server/statement_timeout_test.go`. If the knob
+  ever becomes per-connection (a client-honored `statement_timeout` GUC is the
+  named follow-up), it becomes cheaply assertable in-Job and should get a
+  harness assertion then.
+
   to read them back, so ingestion cannot be asserted in-Job. The emission logic
   (event name, org group-analytics attribution, properties, failure-category
   classification, and "no event on handler failure") is covered by
