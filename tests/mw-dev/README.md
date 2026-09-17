@@ -16,16 +16,11 @@ cnpg-shard metadata stores.
    Postgres + a control-plane Deployment on the test image, spawning worker pods
    in the same namespace.
 4. **Test** via an in-cluster payload Job hitting the CP ClusterIP service.
-   The PR workflow runs four parallel matrix lanes: `neutral`, `duckdb`,
-   `trino`, and `reshard`. Control-plane/provisioning/admin checks live only in
-   `neutral`; DuckDB/PGWire and Trino each exercise their own query contract,
-   and the focused reshard lane retains its target-discovery, validation,
-   cancellation, and rollback coverage. The lanes use partitioned numeric
-   identities `1<base>` through `4<base>`, where `base` is the PR number or the
-   workflow run ID for a manual invocation. Their namespaces, Ducklings,
-   metadata roles, and teardown are therefore isolated while still matching
-   the CI RBAC allowlist. Each matrix cell is visible separately, while the
-   lightweight aggregate `e2e` job preserves a stable branch-protection check.
+   The regular deployment workflow runs only `trino`, exercising Hoglake through
+   Trino. Its numeric identity is `3<base>`, where `base` is the PR number or
+   workflow run ID. Existing neutral, DuckDB, and reshard scripts and unit tests
+   remain available but are not regular deployment matrix lanes. The aggregate
+   `e2e` job keeps the existing branch-protection check name.
    `test-e2e` runs `e2e/harness.sh`; `test-scenario` runs the scenario named by
    `SCENARIO_NAME`, which defaults to `full-suite`. Scenario artifacts are
    copied to `SCENARIO_ARTIFACTS_DIR`, which defaults to
@@ -171,10 +166,11 @@ load-bearing: pointing a PR control plane at the shared cell could overwrite
 authoritative projections or drop catalogs absent from the PR's config store.
 
 The lane defaults `TRINO_IMAGE` to the pinned PostHog fork promoted for these
-tests. That fork contains the DuckLake connector and PostgreSQL dynamic catalog
+tests. That fork contains atomic Hoglake writes and the PostgreSQL dynamic catalog
 store; upstream `trinodb/trino` is not compatible. Update the default in
-`run.sh`, `e2e-mw-dev.yml`, and `scenario-dev.yml` together when promoting a
-Trino build.
+`run.sh` and `e2e-mw-dev.yml` together when promoting the regular E2E
+Trino build. The frozen benchmark retains its separate pin in `scenario-dev.yml`
+until its independent migration.
 The suite asserts per-user logins on every run: an org user authenticates as
 `<database_name>.<username>` with its pgwire password, reads only its own org's
 catalog, is attributed to its org in the admin query list, and stops
@@ -629,7 +625,7 @@ cell-local auth, tenant-password, OPA, and resource-group projections are
 managed by the primary control plane through a scoped RoleBinding.
 
 `e2e/trino-multicell.sh` provisions a new warehouse without Trino, selects its
-initial cell, enables Trino, and verifies real DuckLake writes and reads. It
+initial cell, enables Trino, and verifies real Hoglake writes and reads. It
 asserts that legacy remains queryable, credentials and OPA tokens cannot cross
 cells, and an existing legacy assignment cannot be changed. It then starts
 green, updates the startup-loaded registry, restarts the control plane, and
@@ -940,3 +936,29 @@ Do not clear a held catalog mutation or bypass the freeze to make a test pass.
 The additional fixture warehouse is included in the existing cleanup inventory.
 Local `just test-mw-fixtures` validates opt-in checks, real rendering, and shell
 request construction; it is not proof that this real-cluster lane has executed.
+
+## Regular Trino + Hoglake prerequisites
+
+Normal managed onboarding creates each tenant’s Hoglake catalog and namespace.
+The lane verifies CREATE/INSERT/CTAS, wide decimals through real compaction,
+tenant isolation, disable/re-enable persistence, and deprovision protection.
+
+The regular lane uses isolated Hoglake PostgreSQL and server deployments, plus
+three Trino workers. Apply [the CI-only Hoglake storage identity and CI deployer](https://github.com/PostHog/posthog-cloud-infra/pull/10521)
+permissions, the Duckling permissions boundary, and Crossplane tenant-prefix
+grants before running it. Configure these private GitHub repository secrets:
+
+- `MW_DEV_HOGLAKE_CI_POD_IDENTITY_ROLE`: dedicated server role, limited to
+  disposable `trino/ci-pr-*` paths. It is separate from the Trino assume-role identity.
+- `MW_DEV_HOGLAKE_DATA_PATH`: `s3://<dedicated-bucket>/trino/`, matching managed
+  provisioning and Crossplane. Each tenant writes below its Duckling name.
+
+Missing prerequisites fail deployment before namespace mutation. Cleanup waits
+for fixture writers to terminate and deletes only the numeric PR's exact prefix.
+The initialized metadata-loss protection has unit regression coverage; this
+lane does not corrupt the server database to simulate metadata loss.
+
+The frozen performance workflow remains a separate, deferred migration. Its
+external read-only catalog bootstrap is not proof of managed Hoglake onboarding
+and must be adapted independently before relying on it with the new backend
+ownership rules. This change does not copy or rewrite the frozen dataset.

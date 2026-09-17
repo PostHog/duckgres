@@ -54,14 +54,28 @@ case "$TRINO_SHARED_CATALOGS_ENABLED" in
     ;;
   *) echo "TRINO_SHARED_CATALOGS_ENABLED must be true or false" >&2; exit 2 ;;
 esac
-# Frozen perf requires the Hoglake connector; other E2E lanes retain their pin.
+# Frozen perf keeps its independent image pin. Regular Trino tests require atomic writes.
 if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:f3bddd334a9e08f54788779ec7c723b8c296765a@sha256:9a4bf1293d0b4b73aa3b46c16bf014ed22bb9fc12b8ea28617cfed06534c8f2d}"
 else
-  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8}"
+  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
 fi
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
-HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:f10c34f9c779e2794fca662d5302f97dc26e48a6b2a601ae344cad945e70483c}"
+if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
+  HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:f10c34f9c779e2794fca662d5302f97dc26e48a6b2a601ae344cad945e70483c}"
+else
+  HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:fcd2bdc2b17cbe7bdf4b52b19ebe1c901c853c5ec925cf52a94609e464e96a02}"
+fi
+HOGLAKE_DATA_PATH="${HOGLAKE_DATA_PATH:-}"
+if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "$HOGLAKE_DATA_PATH" ]; then
+  hoglake_bucket="${HOGLAKE_DATA_PATH#s3://}"
+  printf '::add-mask::%s\n' "${hoglake_bucket%%/*}" >&2
+  if [ -n "${HOGLAKE_CI_POD_IDENTITY_ROLE:-}" ]; then
+    printf '::add-mask::%s\n' "${HOGLAKE_CI_POD_IDENTITY_ROLE##*/}" >&2
+    hoglake_role_account="${HOGLAKE_CI_POD_IDENTITY_ROLE#arn:aws:iam::}"
+    printf '::add-mask::%s\n' "${hoglake_role_account%%:*}" >&2
+  fi
+fi
 # The control plane provisions the uncached baseline. The runner creates the
 # cached catalog in the second cluster's isolated catalog-store cell.
 TRINO_FILESYSTEM_CACHE_ENABLED=false
@@ -269,11 +283,11 @@ render() {
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
       envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
       < "$HERE/manifests.trino.tmpl.yaml"
-    if hoglake_perf_enabled; then
-      render_trino_cached
-      NAMESPACE="$NS" HOGLAKE_IMAGE="$HOGLAKE_IMAGE" AWS_REGION="$AWS_REGION" \
-        envsubst '$NAMESPACE $HOGLAKE_IMAGE $AWS_REGION' < "$HERE/manifests.hoglake.tmpl.yaml"
-    fi
+    if hoglake_perf_enabled; then render_trino_cached; fi
+    HOGLAKE_SERVICE_ACCOUNT=hoglake
+    if hoglake_perf_enabled; then HOGLAKE_SERVICE_ACCOUNT=trino; fi
+    NAMESPACE="$NS" HOGLAKE_IMAGE="$HOGLAKE_IMAGE" AWS_REGION="$AWS_REGION" HOGLAKE_SERVICE_ACCOUNT="$HOGLAKE_SERVICE_ACCOUNT" \
+      envsubst '$NAMESPACE $HOGLAKE_IMAGE $AWS_REGION $HOGLAKE_SERVICE_ACCOUNT' < "$HERE/manifests.hoglake.tmpl.yaml"
     if trino_multicell_enabled; then render_trino_multicell; fi
   fi
 }
@@ -516,8 +530,24 @@ reset_pr_stack() {
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=true --timeout=720s
 }
 
+# BEGIN isolated Hoglake cleanup
+cleanup_hoglake_storage() {
+  [ -n "$HOGLAKE_DATA_PATH" ] || return 0
+  require_pr_identity || return 1
+  [[ "$HOGLAKE_DATA_PATH" =~ ^s3://[a-z0-9][a-z0-9.-]+/trino/$ ]] || { echo "Refusing cleanup outside the dedicated Hoglake base" >&2; return 1; }
+  # Stop all fixture writers before removing the exact PR's tenant prefixes.
+  "${KUBECTL[@]}" wait --for=delete namespace/"$NS" --timeout=720s >/dev/null || return 1
+  aws s3 rm "${HOGLAKE_DATA_PATH}ci-pr-${PR_NUMBER}-" --recursive --only-show-errors --region "$AWS_REGION"
+}
+# END isolated Hoglake cleanup
+
 cmd_deploy() {
+  if [ "$E2E_SUITE" = trino ] && ! hoglake_perf_enabled; then
+    : "${HOGLAKE_CI_POD_IDENTITY_ROLE:?Dedicated Hoglake CI role is required}"
+    [[ "$HOGLAKE_DATA_PATH" =~ ^s3://[a-z0-9][a-z0-9.-]+/trino/$ ]] || { echo "HOGLAKE_DATA_PATH must be the configured dedicated bucket/trino/ base" >&2; return 1; }
+  fi
   reset_pr_stack
+  if [ "$E2E_SUITE" = trino ] && ! hoglake_perf_enabled; then cleanup_hoglake_storage; fi
 
   echo "::group::Apply manifests ($NS)"
   render | "${KUBECTL[@]}" apply -f -
@@ -538,15 +568,21 @@ cmd_deploy() {
     # Associate before admitting Trino pods: the Pod Identity agent injects
     # credentials only at admission and never retrofits an existing pod.
     ensure_trino_pod_identity
+    if ! hoglake_perf_enabled; then
+      : "${HOGLAKE_CI_POD_IDENTITY_ROLE:?Dedicated Hoglake CI role is required}"
+      [[ "$HOGLAKE_DATA_PATH" =~ ^s3://[a-z0-9][a-z0-9.-]+/trino/$ ]] || { echo "HOGLAKE_DATA_PATH must be the configured dedicated bucket/trino/ base" >&2; return 1; }
+      create_pod_identity hoglake "$HOGLAKE_CI_POD_IDENTITY_ROLE"
+    fi
+    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake-postgres --timeout=120s
+    sleep 15
+    "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-hoglake --type=merge -p '{"spec":{"replicas":1}}'
+    "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake --timeout=300s
     if hoglake_perf_enabled; then
-      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake-postgres --timeout=120s
-      # Allow the association to reach the node agent before pod admission.
-      sleep 15
-      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-hoglake \
-        --type=merge -p '{"spec":{"replicas":1}}'
-      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake --timeout=300s
       "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
         "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"controlplane\",\"env\":[{\"name\":\"DUCKGRES_TRINO_HOGLAKE_URI\",\"value\":\"http://duckgres-hoglake.$NS.svc:8080\"}]}]}}}}"
+    else
+      patch="$(jq -cn --arg uri "http://duckgres-hoglake.$NS.svc:8080" --arg path "$HOGLAKE_DATA_PATH" '{spec:{template:{spec:{containers:[{name:"controlplane",env:[{name:"DUCKGRES_TRINO_MANAGED_HOGLAKE_URI",value:$uri},{name:"DUCKGRES_TRINO_HOGLAKE_DATA_PATH",value:$path},{name:"DUCKGRES_TRINO_HOGLAKE_NAMESPACE",value:"main"}]}]}}}}')"
+      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch"
     fi
     if trino_multicell_enabled; then
       NS="$TRINO_CELL_NS" ensure_trino_pod_identity
@@ -656,6 +692,7 @@ spec:
             - { name: INTERNAL_SECRET_FALLBACK, value: "$INTERNAL_SECRET_FALLBACK" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }
             - { name: CP_PG_HOST, value: "duckgres-control-plane.$NS.svc" }
+            - { name: HOGLAKE_URI, value: "http://duckgres-hoglake.$NS.svc:8080" }
           # Real requests/limits: the harness shares the default nodepool with
           # the bursty per-PR worker pods. A BestEffort pod is the first thing
           # the kubelet evicts under node memory pressure — observed killing
@@ -1042,7 +1079,7 @@ cmd_diagnostics() {
     "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-coordinator -c duckgres-trino-opa --tail=300 || true
     "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-worker -c trino-worker --tail=300 || true
   fi
-  if hoglake_perf_enabled; then
+  if [ "$E2E_SUITE" = trino ]; then
     "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-hoglake --tail=300 || true
     "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-hoglake-postgres --tail=100 || true
   fi
@@ -1137,6 +1174,7 @@ cmd_teardown() {
   # Cross-namespace bindings carry the ci-pr label — sweep them, then the ns.
   delete_ci_bindings "$PR_NUMBER"
   "${KUBECTL[@]}" delete namespace "$NS" --ignore-not-found --wait=false
+  cleanup_hoglake_storage
   if [ "$duckling_delete_rc" -ne 0 ] || [ "$cnpg_cleanup_rc" -ne 0 ]; then
     return 1
   fi
@@ -1180,6 +1218,7 @@ cmd_e2e_cleanup() {
       PR_NUMBER="$pr" delete_trino_cell_stack
       delete_ci_bindings "$pr"
       "${KUBECTL[@]}" delete namespace "$ns" --ignore-not-found --wait=false
+      NS="$ns" PR_NUMBER="$pr" cleanup_hoglake_storage || return 1
     done
 }
 

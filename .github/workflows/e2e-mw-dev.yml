@@ -31,7 +31,8 @@
 #   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV
 #   secrets: AWS_ECR_PUBLISH_IAM_ROLE (already exists, used by CD),
 #            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it),
-#            MW_DEV_TRINO_POD_IDENTITY_ROLE (full ARN; kept out of public git)
+#            MW_DEV_TRINO_POD_IDENTITY_ROLE (full ARN; kept out of public git),
+#            MW_DEV_HOGLAKE_CI_POD_IDENTITY_ROLE, MW_DEV_HOGLAKE_DATA_PATH
 #   IAM:     github-duckgres-e2e role in the mw-dev account (posthog-cloud-infra)
 #            — stripped down, NOT the account-admin terraform-infra role.
 #   Repo setting: "Require approval for all outside collaborators".
@@ -105,14 +106,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: neutral
-            lane_prefix: "1"
-          - suite: duckdb
-            lane_prefix: "2"
           - suite: trino
             lane_prefix: "3"
-          - suite: reshard
-            lane_prefix: "4"
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     env:
@@ -128,6 +123,7 @@ jobs:
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
+      HOGLAKE_DATA_PATH: ${{ secrets.MW_DEV_HOGLAKE_DATA_PATH }}
       # The per-PR CP assumes the SAME EKS Pod Identity role as the real mw-dev
       # control plane, so STS-brokered S3 activation works with no cred
       # injection. Built from the account-id secret (no account id committed) +
@@ -137,9 +133,9 @@ jobs:
       # secret so no account id or internal role ARN lands in this public repo.
       # Only the trino matrix cell consumes it.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      # Pinned PostHog fork: it contains the DuckLake connector and the
-      # PostgreSQL-backed dynamic catalog store used by managed warehouse.
-      TRINO_IMAGE: ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8
+      HOGLAKE_CI_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_HOGLAKE_CI_POD_IDENTITY_ROLE }}
+      # Atomic Hoglake writes and the PostgreSQL-backed dynamic catalog store.
+      TRINO_IMAGE: ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -232,14 +228,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: neutral
-            lane_prefix: "1"
-          - suite: duckdb
-            lane_prefix: "2"
           - suite: trino
             lane_prefix: "3"
-          - suite: reshard
-            lane_prefix: "4"
     env:
       PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
       NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
@@ -247,6 +237,7 @@ jobs:
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
+      HOGLAKE_DATA_PATH: ${{ secrets.MW_DEV_HOGLAKE_DATA_PATH }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Configure AWS credentials (OIDC)
@@ -283,6 +274,7 @@ jobs:
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
+      HOGLAKE_DATA_PATH: ${{ secrets.MW_DEV_HOGLAKE_DATA_PATH }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Configure AWS credentials (OIDC)

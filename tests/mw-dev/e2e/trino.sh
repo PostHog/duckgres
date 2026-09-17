@@ -5,7 +5,6 @@ set -eu
 trap 'rc=$?; [ "$rc" = 0 ] || echo "TRINO HARNESS EXIT rc=$rc" >&2' EXIT
 
 API="${CP_API:?}"
-PGHOST="${CP_PG_HOST:?}"
 SECRET="${INTERNAL_SECRET:?}"
 PR="${PR_NUMBER:?}"
 NS="${NAMESPACE:?}"
@@ -20,8 +19,7 @@ CAT_A="org_$(printf %s "$DB_A" | tr '-' '_')"
 CAT_B="org_$(printf %s "$DB_B" | tr '-' '_')"
 TEAM_A=93001
 TEAM_B=93002
-SNI_SUFFIX=".ci.duckgres.local"
-CP_IP=""
+HOGLAKE="${HOGLAKE_URI:?}"
 # Password rotation crosses the 10s provisioner reconcile, kubelet's
 # eventually-consistent Secret-volume projection, and Trino's 5s file reload.
 # Keep the total window above the expected projection delay while avoiding a
@@ -33,8 +31,6 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 log() { echo ">>> $*" >&2; }
 apk add --no-cache curl jq >/dev/null 2>&1
 [ -s "$CA" ] || fail "per-run Trino CA is not mounted"
-CP_IP="$(getent hosts "$PGHOST" | awk '{print $1}' | head -1)"
-[ -n "$CP_IP" ] || fail "could not resolve $PGHOST"
 KUBECTL=/tmp/kubectl
 KUBECTL_VERSION=v1.33.1
 curl -fsSLo "$KUBECTL" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/arm64/kubectl"
@@ -43,33 +39,6 @@ chmod +x "$KUBECTL"
 
 api() { curl --connect-timeout 5 --max-time 60 -fsS -H "$H" "$@"; }
 
-# A fresh managed warehouse has an empty metadata database. DuckLake's Trino
-# connector consumes an existing DuckLake catalog; it does not create the
-# metadata tables itself. Initialize them once through Duckgres's normal
-# DuckLake activation path before asking Trino to use the catalog. This is
-# setup, not duplicated DuckDB coverage: all behavioral assertions below still
-# execute through Trino.
-bootstrap_ducklake() { # org password
-  attempt=0
-  while [ "$attempt" -lt 12 ]; do
-    if out="$(PGPASSWORD="$2" psql \
-        "sslmode=require host=$1$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
-        -v ON_ERROR_STOP=1 -tAc 'SELECT 1' 2>&1)" && [ "$out" = 1 ]; then
-      return 0
-    fi
-    case "$out" in
-      *"capacity exhausted"*|*"no Duckgres worker"*|\
-      *"still provisioning"*|*"failed to initialize session"*|\
-      *"timed out waiting for an available worker"*|*"failed to start"*|\
-      *"spawn sized worker"*|*"failed to detect attached catalogs"*) ;;
-      *) fail "DuckLake bootstrap failed for $1: $out" ;;
-    esac
-    log "DuckLake bootstrap worker not ready for $1; retrying"
-    sleep 15
-    attempt=$((attempt + 1))
-  done
-  fail "DuckLake bootstrap worker did not become ready for $1"
-}
 
 provision() { # org db team
   api -X POST -H 'Content-Type: application/json' \
@@ -98,7 +67,7 @@ wait_trino() { # org expected-principal expected-catalog
         '.enabled == true and .available == true and .status.principal == $p and .status.catalog == $c and .status.cell == $cell and .status.tier == "free" and .status.connection.host == $host and .status.connection.port == 8443 and .status.connection.username == $p and (.status.connection | has("password") | not)' >/dev/null \
         || fail "$1 Trino status identity mismatch: $body"
       api "$API/api/v1/orgs/$1" | jq -e --arg stored_cell "ci-pr-$PR" \
-        '.trino.trino_cell_id == $stored_cell' >/dev/null \
+        '.trino.trino_cell_id == $stored_cell and .trino.backend == "hoglake"' >/dev/null \
         || fail "$1 legacy API identity changed persisted Trino ownership"
       TRINO="https://$(printf %s "$body" | jq -r '.status.connection.host'):$(printf %s "$body" | jq -r '.status.connection.port')"
       return 0
@@ -251,7 +220,6 @@ log "provisioning first Trino tenant"
 pw_a="$(provision "$ORG_A" "$DB_A" "$TEAM_A" | jq -r .password)"
 [ -n "$pw_a" ] && [ "$pw_a" != null ] || fail "tenant A provision returned no password"
 wait_warehouse "$ORG_A"
-bootstrap_ducklake "$ORG_A" "$pw_a"
 wait_trino "$ORG_A" "$DB_A" "$CAT_A"
 
 log "TLS/password auth, discovery, and DDL/DML"
@@ -263,43 +231,38 @@ catalogs="$(trino_query "$DB_A" "$pw_a" 'SHOW CATALOGS')"
 printf %s "$catalogs" | jq -e --arg c "$CAT_A" 'any(.[]; .[0] == $c)' >/dev/null || fail "own catalog absent: $catalogs"
 printf %s "$catalogs" | jq -e --arg c "$CAT_B" 'all(.[]; .[0] != $c)' >/dev/null || fail "foreign catalog visible before tenant B exists"
 table="e2e_trino_${PR}"
-view="${table}_view"
-schema="e2e_${PR}"
+schema=main
 writes="${table}_writes"
-scratch="${table}_scratch"
-trino_query "$DB_A" "$pw_a" "CREATE SCHEMA $CAT_A.$schema" >/dev/null
+scratch="${table}_ctas"
 schemas="$(trino_query "$DB_A" "$pw_a" "SHOW SCHEMAS FROM $CAT_A")"
-printf %s "$schemas" | jq -e --arg s "$schema" 'any(.[]; .[0] == $s)' >/dev/null || fail "created schema absent: $schemas"
-trino_query "$DB_A" "$pw_a" "CREATE TABLE $CAT_A.$schema.$table (id BIGINT, flag BOOLEAN, amount DECIMAL(10,2), label VARCHAR, event_date DATE)" >/dev/null
-trino_query "$DB_A" "$pw_a" "INSERT INTO $CAT_A.$schema.$table VALUES (1, true, DECIMAL '1.25', 'one', DATE '2026-08-31'), (2, false, DECIMAL '2.50', 'two', DATE '2026-09-01')" >/dev/null
-trino_query "$DB_A" "$pw_a" "UPDATE $CAT_A.$schema.$table SET label='TWO' WHERE id=2" >/dev/null
-trino_query "$DB_A" "$pw_a" "DELETE FROM $CAT_A.$schema.$table WHERE id=1" >/dev/null
-trino_query "$DB_A" "$pw_a" "CREATE VIEW $CAT_A.$schema.$view AS SELECT * FROM $CAT_A.$schema.$table" >/dev/null
-[ "$(scalar "$DB_A" "$pw_a" "SELECT concat(cast(flag AS varchar), '|', cast(amount AS varchar), '|', label, '|', cast(event_date AS varchar)) FROM $CAT_A.$schema.$view")" = "false|2.50|TWO|2026-09-01" ] \
-  || fail "Trino representative type/DML/view data mismatch"
-tables="$(trino_query "$DB_A" "$pw_a" "SHOW TABLES FROM $CAT_A.$schema")"
-printf %s "$tables" | jq -e --arg t "$table" --arg v "$view" \
-  'any(.[]; .[0] == $t) and any(.[]; .[0] == $v)' >/dev/null || fail "SHOW TABLES missed table/view: $tables"
-trino_query "$DB_A" "$pw_a" "EXPLAIN SELECT * FROM $CAT_A.$schema.$table" >/dev/null
-trino_query "$DB_A" "$pw_a" "CREATE TABLE $CAT_A.$schema.$scratch (id INTEGER)" >/dev/null
-trino_query "$DB_A" "$pw_a" "INSERT INTO $CAT_A.$schema.$scratch VALUES 1, 2" >/dev/null
-trino_query "$DB_A" "$pw_a" "TRUNCATE TABLE $CAT_A.$schema.$scratch" >/dev/null
-[ "$(scalar "$DB_A" "$pw_a" "SELECT count(*) FROM $CAT_A.$schema.$scratch")" = 0 ] || fail "Trino TRUNCATE did not remove rows"
-trino_query "$DB_A" "$pw_a" "CREATE TABLE $CAT_A.$schema.$writes (id INTEGER)" >/dev/null
+printf %s "$schemas" | jq -e --arg s "$schema" 'any(.[]; .[0] == $s)' >/dev/null || fail "managed namespace absent"
+trino_query "$DB_A" "$pw_a" "CREATE TABLE $CAT_A.$schema.$table (id BIGINT, flag BOOLEAN, amount DECIMAL(38,2), label VARCHAR, event_date DATE)" >/dev/null
+trino_query "$DB_A" "$pw_a" "INSERT INTO $CAT_A.$schema.$table VALUES (2, false, DECIMAL '123456789012345678901234.56', 'two', DATE '2026-09-01')" >/dev/null
+[ "$(scalar "$DB_A" "$pw_a" "SELECT concat(cast(flag AS varchar), '|', cast(amount AS varchar), '|', label, '|', cast(event_date AS varchar)) FROM $CAT_A.$schema.$table")" = "false|123456789012345678901234.56|two|2026-09-01" ] || fail "Hoglake typed write/read mismatch"
+trino_query "$DB_A" "$pw_a" "CREATE TABLE $CAT_A.$schema.$scratch AS SELECT * FROM $CAT_A.$schema.$table" >/dev/null
+[ "$(scalar "$DB_A" "$pw_a" "SELECT count(*) FROM $CAT_A.$schema.$scratch")" = 1 ] || fail "Hoglake CTAS lost rows"
+trino_query "$DB_A" "$pw_a" "CREATE TABLE $CAT_A.$schema.$writes (id INTEGER, amount DECIMAL(38,2))" >/dev/null
 pids=""
-for id in 1 2 3 4; do
-  trino_query "$DB_A" "$pw_a" "INSERT INTO $CAT_A.$schema.$writes VALUES ($id)" >/dev/null & pids="$pids $!"
+for id in 1 2 3 4 5 6 7 8; do
+  trino_query "$DB_A" "$pw_a" "INSERT INTO $CAT_A.$schema.$writes VALUES ($id, DECIMAL '123456789012345678901234.56')" >/dev/null & pids="$pids $!"
 done
 rc=0; for pid in $pids; do wait "$pid" || rc=1; done
-[ "$rc" = 0 ] || fail "a concurrent Trino write failed"
-[ "$(scalar "$DB_A" "$pw_a" "SELECT count(*) FROM $CAT_A.$schema.$writes")" = 4 ] || fail "concurrent Trino writes lost rows"
+[ "$rc" = 0 ] || fail "a concurrent Hoglake write failed"
+[ "$(scalar "$DB_A" "$pw_a" "SELECT count(*) FROM $CAT_A.$schema.$writes")" = 8 ] || fail "concurrent Hoglake writes lost rows"
+before_rows="$(trino_query "$DB_A" "$pw_a" "SELECT id, CAST(amount AS VARCHAR) FROM $CAT_A.$schema.$writes ORDER BY id")"
+files_uri="$HOGLAKE/v1/catalogs/$ORG_A/namespaces/$schema/tables/$writes/scan"
+file_count_before="$(curl -fsS "$files_uri" | jq length)"
+[ "$file_count_before" -ge 8 ] || fail "compaction fixture did not create separate files"
+curl --connect-timeout 5 --max-time 120 -fsS -X POST "$HOGLAKE/v1/catalogs/$ORG_A/maintenance/compact?batch=100" >/dev/null
+file_count_after="$(curl -fsS "$files_uri" | jq length)"
+[ "$file_count_after" -lt "$file_count_before" ] || fail "compaction did not reduce file_count"
+[ "$(trino_query "$DB_A" "$pw_a" "SELECT id, CAST(amount AS VARCHAR) FROM $CAT_A.$schema.$writes ORDER BY id")" = "$before_rows" ] || fail "compaction changed wide decimal rows"
 
 log "hot-add second tenant without restarting coordinator"
 coord_uid_before="$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component=coordinator' -o jsonpath='{.items[0].metadata.uid}')"
 pw_b="$(provision "$ORG_B" "$DB_B" "$TEAM_B" | jq -r .password)"
 [ -n "$pw_b" ] && [ "$pw_b" != null ] || fail "tenant B provision returned no password"
 wait_warehouse "$ORG_B"
-bootstrap_ducklake "$ORG_B" "$pw_b"
 wait_trino "$ORG_B" "$DB_B" "$CAT_B"
 [ "$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component=coordinator' -o jsonpath='{.items[0].metadata.uid}')" = "$coord_uid_before" ] \
   || fail "adding tenant B restarted the Trino coordinator"
@@ -446,6 +409,11 @@ while [ "$i" -lt 30 ]; do
 done
 [ "$i" -lt 30 ] || fail "catalog/auth/OPA did not recover after coordinator restart"
 
+deprovision_must_conflict() {
+  status="$(curl --connect-timeout 5 --max-time 60 -sS -o /dev/null -w '%{http_code}' -H "$H" -X POST "$API/api/v1/orgs/$ORG_B/deprovision")"
+  [ "$status" = 409 ] || fail "Hoglake deprovision must require explicit recovery, got $status"
+}
+deprovision_must_conflict
 log "disable removes tenant B auth, catalog, and projection"
 api -X DELETE "$API/api/v1/orgs/$ORG_B/trino" >/dev/null
 i=0
@@ -470,11 +438,12 @@ printf %s "$catalogs_a" | jq -e --arg c "$CAT_B" 'all(.[]; .[0] != $c)' >/dev/nu
 printf %s "$admin_catalogs" | jq -e --arg c "$CAT_B" 'all(.[]; .[0] != $c)' >/dev/null \
   || fail "disabled tenant B catalog remains in the managed catalog store: $admin_catalogs"
 
-trino_query "$DB_A" "$pw_a" "DROP VIEW $CAT_A.$schema.$view" >/dev/null
-trino_query "$DB_A" "$pw_a" "DROP TABLE $CAT_A.$schema.$table" >/dev/null
-trino_query "$DB_A" "$pw_a" "DROP TABLE $CAT_A.$schema.$scratch" >/dev/null
-trino_query "$DB_A" "$pw_a" "DROP TABLE $CAT_A.$schema.$writes" >/dev/null
-trino_query "$DB_A" "$pw_a" "DROP SCHEMA $CAT_A.$schema" >/dev/null
+deprovision_must_conflict
+log "reenable preserves the Hoglake catalog and data"
+api -X POST -H 'Content-Type: application/json' -d '{"enabled":true,"tier":"free"}' "$API/api/v1/orgs/$ORG_B/trino" >/dev/null
+wait_trino "$ORG_B" "$DB_B" "$CAT_B"
+[ "$(scalar "$DB_B" "$pw_b" "SELECT count(*) FROM $CAT_B.main.$foreign_table")" = 1 ] || fail "reenabled tenant lost data"
+# Namespace teardown removes fixture metadata; the runner removes only its S3 prefixes.
 if [ "${TRINO_MULTICELL_ENABLED:-false}" = true ]; then
   . /harness/trino-multicell.sh
   if [ "${TRINO_SHARED_CATALOGS_ENABLED:-false}" = true ]; then
