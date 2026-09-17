@@ -1589,7 +1589,15 @@ password/tenant/catalog changes never propagate.
   and the coordinator is reachable. `DUCKGRES_TRINO_CLIENT_URL` names the HTTPS
   endpoint clients should dial; when unset, the control plane falls back to its
   coordinator URL and TLS server name. The response contains host, port and the
-  tenant principal, never a password or password hash.
+  tenant principal, never a password or password hash. A client URL whose
+  leading host label is `{database_name}` (registry `client_url` or the env
+  var; `ResolveTrinoClientURL`) advertises each org's own
+  `<database_name>.<domain>` with username `root`: the Trino fork qualifies a
+  login with the org its host names
+  (`http-server.authentication.password.host-qualified-user.domains`), so a
+  user types the same username and host on both engines. Set it only once
+  that host actually reaches Trino — advertising an unrouted host is worse
+  than advertising the shared one.
 - **`Reconcile` order is load-bearing**: cluster secrets → auth files →
   resource groups → OPA bundle → tenant passwords → catalogs, and the
   `globalErr` gate SKIPS the catalog step if any projection failed. A
@@ -1633,6 +1641,40 @@ password/tenant/catalog changes never propagate.
   `opa.ManagedCatalogPattern`, and the regex literal inside `policy.rego`.
   `TestTrinoCatalogNameMatchesManagedNamePattern` +
   `TestPolicyRegoContainsManagedNamePattern` fail if any one moves alone.
+- **A Trino principal resolves to its org by EXACT lookup, never by splitting.**
+  `configstore.NewTrinoPrincipalOwners` indexes the principals the auth files
+  project (bare `<database_name>` → root, `<database_name>.<username>` → that
+  login). Usage metering (`trino_usage_collector.go`, which also passes the
+  duckgres username — not the principal — to the team resolver) and the admin
+  console both use it, so a per-user login's queries are its org's usage and a
+  principal outside the password file is never attributed to anyone.
+- **Every duckgres login authenticates to Trino, under `<database_name>.<username>`.**
+  `ListTrinoEnabledOrgs` returns the org's logins in `Users`, and
+  `BuildTrinoAuthFiles` writes one `password.db` line per login with the
+  bcrypt hash **copied through unchanged** — it is the same hash pgwire
+  verifies, so one password works on both engines and nothing is re-hashed or
+  minted. The bare `<database_name>` principal survives alongside them. Three
+  rules that are load-bearing rather than cosmetic: (1) usernames are
+  projected through an **allowlist** (`trinoUsernamePattern`) because
+  duckgres barely validates them and a `:`, `,` or newline would let whoever
+  can create org users append lines to `password.db` — including an admin
+  line; (2) `rejectPrincipalCollisions` now also holds back orgs that derive
+  the same Trino username, since the password file is ONE flat namespace per
+  cell and a duplicate line is a cross-tenant auth bug; (3) the resource-group
+  selector's `orgCaptureRegex` captures only up to the first `.`, or every
+  login gets a private leaf with the full per-tenant limits and an org with
+  ten logins holds ten times its budget.
+- **A project-scoped login (`project_reader` / `project_user`) joins
+  `scope_<org>_team_<id>`, NOT the org group.** The scope group owns the same
+  catalog in `group_catalogs` — so the cross-tenant check is the unchanged
+  check — and carries a `group_scopes` document that narrows it to that
+  team's schemas. Scopes only ever SUBTRACT; keep it that way if the rules are
+  restructured. The scope comes from `OrgUserQueryAccess`, the same derivation
+  the pgwire path uses, so Trino and DuckDB cannot disagree about it, and a
+  scoped row whose scope will not resolve is DROPPED rather than projected
+  unscoped. Scoped logins get **no write authority at all** — `project_user`
+  is read/write on pgwire and read-only here, a narrowing; making it writable
+  means gating writes per-schema, not per-catalog.
 - **The Rego policy is the tenant-isolation boundary.** The cell can assume
   every per-org duckling role, so nothing below OPA stops org A reading org
   B's catalog. Treat `provisioner/opa/policy.rego` as security review.

@@ -111,11 +111,14 @@ wait_trino() { # org expected-principal expected-catalog
 
 # Print all result rows as compact JSON. Trino's statement protocol pages via
 # nextUri; every follow-up keeps both Basic auth and the tenant identity.
+# TRINO_HOST, when set, is sent as the Host header: the tenant host name a
+# host-qualified login is resolved against (TLS still verifies the coordinator).
 trino_query() { # principal password sql
   principal="$1" password="$2" sql="$3"
+  set -- -H "X-Trino-User: $principal" -H 'X-Trino-Time-Zone: UTC'
+  [ -z "${TRINO_HOST:-}" ] || set -- "$@" -H "Host: $TRINO_HOST"
   response="$(curl --connect-timeout 5 --max-time 60 --cacert "$CA" -fsS --user "$principal:$password" \
-    -H "X-Trino-User: $principal" -H 'X-Trino-Time-Zone: UTC' \
-    --data-binary "$sql" "$TRINO/v1/statement")" || return 1
+    "$@" --data-binary "$sql" "$TRINO/v1/statement")" || return 1
   rows='[]'
   while :; do
     err="$(printf %s "$response" | jq -r '.error.message // empty')"
@@ -124,7 +127,7 @@ trino_query() { # principal password sql
     next="$(printf %s "$response" | jq -r '.nextUri // empty')"
     [ -n "$next" ] || break
     response="$(curl --connect-timeout 5 --max-time 60 --cacert "$CA" -fsS --user "$principal:$password" \
-      -H "X-Trino-User: $principal" -H 'X-Trino-Time-Zone: UTC' "$next")" || return 1
+      "$@" "$next")" || return 1
   done
   printf '%s\n' "$rows"
 }
@@ -364,6 +367,57 @@ api "$API/api/v1/audit?org=$ORG_A" | jq -e --arg q "$query_id" \
   'any(.entries[]?; .action == "trino.query.kill" and .target_user == $q and .status == 200)' >/dev/null \
   || fail "Trino query kill audit row missing"
 
+log "per-user duckgres logins authenticate to Trino as <database_name>.<username>"
+# Every org login is projected into the cell's password file under its
+# qualified principal, with the same bcrypt hash pgwire verifies, so the same
+# password works on both engines. Its queries belong to its org, it cannot
+# reach another tenant, and disabling the login removes it from Trino.
+analyst=analyst
+analyst_principal="$DB_A.$analyst"
+analyst_pw="$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+api -X POST -H 'Content-Type: application/json' \
+  -d "{\"org_id\":\"$ORG_A\",\"username\":\"$analyst\",\"password\":\"$analyst_pw\"}" \
+  "$API/api/v1/users" >/dev/null
+i=0
+while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
+  trino_query "$analyst_principal" "$analyst_pw" 'SELECT 1' >/dev/null 2>&1 && break
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
+done
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "per-user login $analyst_principal never authenticated to Trino"
+[ "$(scalar "$analyst_principal" "$analyst_pw" "SELECT count(*) FROM $CAT_A.$schema.$table")" = 1 ] \
+  || fail "per-user login cannot read its own org's catalog"
+trino_query "$analyst_principal" "$pw_a" 'SELECT 1' >/dev/null 2>&1 \
+  && fail "per-user login authenticated with the root password"
+must_fail "$analyst_principal" "$analyst_pw" "SELECT * FROM $CAT_B.main.$foreign_table" 'denied|access|catalog|not found|does not exist'
+marker="per_user_attribution_$PR"
+trino_query "$analyst_principal" "$analyst_pw" "SELECT '$marker'" >/dev/null
+api "$API/api/v1/trino/queries?org=$ORG_A" | jq -e --arg m "$marker" --arg p "$analyst_principal" --arg org "$ORG_A" \
+  'any(.queries[]; .principal == $p and .org == $org and (.query | contains($m)))' >/dev/null \
+  || fail "admin query list did not attribute the per-user login's query to its org"
+
+if [ -n "${TRINO_HOST_QUALIFIED_DOMAIN:-}" ]; then
+  log "host-qualified login: $analyst on $DB_A.$TRINO_HOST_QUALIFIED_DOMAIN authenticates as $analyst_principal"
+  identity="$(TRINO_HOST="$DB_A.$TRINO_HOST_QUALIFIED_DOMAIN" trino_query "$analyst" "$analyst_pw" 'SELECT current_user')" \
+    || fail "host-qualified login failed for $analyst on tenant A's host"
+  printf %s "$identity" | jq -e --arg p "$analyst_principal" '.[0][0] == $p' >/dev/null \
+    || fail "host-qualified login ran as $identity, want $analyst_principal"
+  TRINO_HOST="$DB_B.$TRINO_HOST_QUALIFIED_DOMAIN" trino_query "$analyst" "$analyst_pw" 'SELECT 1' >/dev/null 2>&1 \
+    && fail "tenant A's login authenticated on tenant B's host"
+else
+  # Requires a Trino image with http-server.authentication.password.host-qualified-user
+  # (PostHog/trino) and that property set on the lane's coordinator; see
+  # tests/mw-dev/README.md "Isolated Trino lane".
+  log "SKIP host-qualified login: TRINO_HOST_QUALIFIED_DOMAIN is unset for this Trino image"
+fi
+
+api -X POST "$API/api/v1/orgs/$ORG_A/users/$analyst/disable" >/dev/null
+i=0
+while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
+  trino_query "$analyst_principal" "$analyst_pw" 'SELECT 1' >/dev/null 2>&1 || break
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
+done
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "disabled per-user login still authenticates to Trino"
+
 log "password rotation"
 new_pw="$(api -X POST "$API/api/v1/orgs/$ORG_A/reset-password" | jq -r .password)"
 [ -n "$new_pw" ] && [ "$new_pw" != null ] || fail "password reset returned no password"
@@ -427,4 +481,4 @@ if [ "${TRINO_MULTICELL_ENABLED:-false}" = true ]; then
     . /harness/trino-shared-catalogs.sh
   fi
 fi
-log "PASS: isolated Trino provisioning + verified auth + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable"
+log "PASS: isolated Trino provisioning + verified auth + per-user logins + DDL/DML + OPA isolation/batching + hot-add + admin + rotation + restart + disable"

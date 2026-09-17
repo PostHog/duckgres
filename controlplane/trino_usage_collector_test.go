@@ -70,7 +70,8 @@ func TestTrinoUsageCollectorCapturesTerminalQueriesOnce(t *testing.T) {
 		{QueryID: "operator", State: "FINISHED", Principal: "__observer"},
 	}}
 	collector := newTrinoUsageCollector(coordinator, trinoUsageFakeOrgs{orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-db"}}}, func(org, user string) int64 {
-		if org != "org-a" || user != "tenant-db" {
+		// The bare org principal authenticates with root's password line.
+		if org != "org-a" || user != "root" {
 			t.Fatalf("team lookup = (%q, %q)", org, user)
 		}
 		return 42
@@ -100,5 +101,41 @@ func TestTrinoUsageCollectorCapturesTerminalQueriesOnce(t *testing.T) {
 	}
 	if failed.event != "query_failed" || failed.props["error_code"] != "SYNTAX_ERROR" {
 		t.Errorf("failed = %#v", failed)
+	}
+}
+
+// A per-user login authenticates as <database_name>.<username>. Its queries are
+// the org's usage, attributed to the duckgres login's own team, while a
+// principal outside the password file stays unattributed.
+func TestTrinoUsageCollectorAttributesPerUserPrincipals(t *testing.T) {
+	tracker := &trinoUsageFakeTracker{}
+	analytics.SetDefault(tracker)
+	t.Cleanup(func() { analytics.SetDefault(nil) })
+
+	coordinator := &trinoUsageFakeCoordinator{queries: []admin.TrinoQuery{
+		{QueryID: "analyst", State: "FINISHED", Principal: "tenant-db.analyst"},
+		{QueryID: "unprojected", State: "FINISHED", Principal: "tenant-db.nobody"},
+	}}
+	orgs := []configstore.TrinoEnabledOrg{{
+		OrgID:        "org-a",
+		DatabaseName: "tenant-db",
+		Users:        []configstore.TrinoOrgUser{{Username: "analyst", PasswordHash: "$2a$10$hash"}},
+	}}
+	var lookups []string
+	collector := newTrinoUsageCollector(coordinator, trinoUsageFakeOrgs{orgs: orgs}, func(org, user string) int64 {
+		lookups = append(lookups, org+"/"+user)
+		return 7
+	})
+
+	collector.collect(context.Background())
+
+	if len(tracker.events) != 1 {
+		t.Fatalf("event count = %d, want 1 (only the projected login)", len(tracker.events))
+	}
+	if got := tracker.events[0]; got.org != "org-a" || got.props["team_id"] != int64(7) {
+		t.Errorf("event = %#v, want org-a with team 7", got)
+	}
+	if len(lookups) != 1 || lookups[0] != "org-a/analyst" {
+		t.Errorf("team lookups = %v, want [org-a/analyst]", lookups)
 	}
 }

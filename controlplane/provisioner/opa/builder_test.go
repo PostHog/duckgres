@@ -4,11 +4,24 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/open-policy-agent/opa/v1/bundle"
 )
+
+// readBundle parses built bundle bytes back through OPA's own reader, so the
+// scope assertions below check what OPA will actually load rather than what
+// the builder intended to write.
+func readBundle(t *testing.T, raw []byte) bundle.Bundle {
+	t.Helper()
+	parsed, err := bundle.NewReader(bytes.NewReader(raw)).Read()
+	if err != nil {
+		t.Fatalf("bundle.Read: %v", err)
+	}
+	return parsed
+}
 
 // TestBuildBundleRoundTrip builds a bundle, parses it back through OPA's
 // bundle reader, and asserts that the round-trip preserves the policy
@@ -20,7 +33,7 @@ func TestBuildBundleRoundTrip(t *testing.T) {
 		AdminGroup: {"org_42": true, "org_43": true},
 	}
 
-	raw, err := NewBuilder().BuildBundle(gc)
+	raw, err := NewBuilder().BuildBundle(gc, nil)
 	if err != nil {
 		t.Fatalf("BuildBundle: %v", err)
 	}
@@ -68,7 +81,7 @@ func TestBuildBundleRoundTrip(t *testing.T) {
 // what an empty group_catalogs gives us.
 func TestBuildBundleEmptyInput(t *testing.T) {
 	for _, gc := range []GroupCatalogs{nil, {}} {
-		raw, err := NewBuilder().BuildBundle(gc)
+		raw, err := NewBuilder().BuildBundle(gc, nil)
 		if err != nil {
 			t.Fatalf("BuildBundle(empty): %v", err)
 		}
@@ -100,7 +113,7 @@ func TestBuildBundleEmptyInput(t *testing.T) {
 
 func TestBundleStoreAndHandler200(t *testing.T) {
 	gc := GroupCatalogs{"org_42": {"org_42": true}}
-	raw, err := NewBuilder().BuildBundle(gc)
+	raw, err := NewBuilder().BuildBundle(gc, nil)
 	if err != nil {
 		t.Fatalf("BuildBundle: %v", err)
 	}
@@ -140,7 +153,7 @@ func TestBundleStoreAndHandler200(t *testing.T) {
 
 func TestBundleHandler304OnIfNoneMatch(t *testing.T) {
 	gc := GroupCatalogs{"org_42": {"org_42": true}}
-	raw, _ := NewBuilder().BuildBundle(gc)
+	raw, _ := NewBuilder().BuildBundle(gc, nil)
 	b := NewBundle(raw)
 	store := &BundleStore{}
 	store.Set(b)
@@ -167,7 +180,7 @@ func TestBundleHandler304OnIfNoneMatch(t *testing.T) {
 
 func TestBundleHandler200OnEtagMiss(t *testing.T) {
 	gc := GroupCatalogs{"org_42": {"org_42": true}}
-	raw, _ := NewBuilder().BuildBundle(gc)
+	raw, _ := NewBuilder().BuildBundle(gc, nil)
 	store := &BundleStore{}
 	store.Set(NewBundle(raw))
 
@@ -203,7 +216,7 @@ func TestBundleHandler503BeforeFirstBundle(t *testing.T) {
 
 func TestBundleHandlerRejectsNonGET(t *testing.T) {
 	store := &BundleStore{}
-	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}})
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}}, nil)
 	store.Set(NewBundle(raw))
 
 	srv := httptest.NewServer(NewHandler(store, allowAllForTest))
@@ -227,7 +240,7 @@ func TestBundleHandlerRejectsNonGET(t *testing.T) {
 
 func TestBundleHandlerBearerTokenAuth(t *testing.T) {
 	store := &BundleStore{}
-	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}})
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}}, nil)
 	store.Set(NewBundle(raw))
 
 	srv := httptest.NewServer(NewHandler(store, BearerTokenAuth("hunter2")))
@@ -293,7 +306,7 @@ func TestNewHandlerRejectsNilArgs(t *testing.T) {
 // guard in ServeHTTP must still fail closed.
 func TestHandlerLiteralWithNilAuthFailsClosed(t *testing.T) {
 	store := &BundleStore{}
-	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}})
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}}, nil)
 	store.Set(NewBundle(raw))
 
 	srv := httptest.NewServer(&Handler{Store: store}) // no Auth set
@@ -322,7 +335,7 @@ func TestBundleStoreSetOverwrites(t *testing.T) {
 	store := &BundleStore{}
 
 	// First bundle.
-	raw1, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}})
+	raw1, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}}, nil)
 	b1 := NewBundle(raw1)
 	store.Set(b1)
 	got, ok := store.Current()
@@ -334,7 +347,7 @@ func TestBundleStoreSetOverwrites(t *testing.T) {
 	raw2, _ := NewBuilder().BuildBundle(GroupCatalogs{
 		"org_42": {"org_42": true},
 		"org_43": {"org_43": true},
-	})
+	}, nil)
 	b2 := NewBundle(raw2)
 	if b1.ETag == b2.ETag {
 		t.Fatal("bundles with different content should not share an ETag (sha256 collision?)")
@@ -376,7 +389,7 @@ func TestNewBundleIsolatesInputSlice(t *testing.T) {
 func TestBundleHasNoExportedMutableByteAccess(t *testing.T) {
 	// Construct a bundle, store it, mutate everything we can reach.
 	store := &BundleStore{}
-	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}})
+	raw, _ := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}}, nil)
 	b := NewBundle(raw)
 	store.Set(b)
 
@@ -420,5 +433,102 @@ func TestNewBundleETagIsContentAddressed(t *testing.T) {
 	// ETag is RFC 7232 strong-validator shape: a quoted string.
 	if !strings.HasPrefix(b1.ETag, `"`) || !strings.HasSuffix(b1.ETag, `"`) {
 		t.Errorf("ETag should be a quoted string, got %q", b1.ETag)
+	}
+}
+
+// --- project scopes ---
+
+// The bundle must carry group_scopes as its own document, and must declare it
+// as a root: OPA refuses to activate a bundle that writes outside its
+// declared roots, so a missing root is a bundle that silently never applies.
+func TestBuildBundleCarriesGroupScopes(t *testing.T) {
+	gc := GroupCatalogs{"scope_acme_team_7": {"org_acme": true}}
+	gs := GroupScopes{"scope_acme_team_7": NewGroupScope(
+		[]string{"posthog_7"}, []string{"posthog.events"})}
+
+	raw, err := NewBuilder().BuildBundle(gc, gs)
+	if err != nil {
+		t.Fatalf("BuildBundle: %v", err)
+	}
+	b := readBundle(t, raw)
+
+	roots := *b.Manifest.Roots
+	if !slices.Contains(roots, "group_scopes") {
+		t.Errorf("manifest roots = %v, must contain group_scopes", roots)
+	}
+
+	scopes, ok := b.Data["group_scopes"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("group_scopes missing or wrong type: %#v", b.Data["group_scopes"])
+	}
+	scope, ok := scopes["scope_acme_team_7"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("scope document missing: %#v", scopes)
+	}
+	for _, key := range []string{"schemas", "relations", "relation_schemas"} {
+		if _, ok := scope[key].(map[string]interface{}); !ok {
+			t.Errorf("scope.%s missing or wrong type: %#v", key, scope[key])
+		}
+	}
+}
+
+// An unscoped build must still emit an EMPTY group_scopes object rather than
+// null or nothing: the policy's data.group_scopes[g] lookup has to be
+// undefined-on-missing-key, and a null document makes it an evaluation error
+// instead -- which fails every decision, not just the scoped ones.
+func TestBuildBundleAlwaysEmitsGroupScopes(t *testing.T) {
+	raw, err := NewBuilder().BuildBundle(GroupCatalogs{"org_42": {"org_42": true}}, nil)
+	if err != nil {
+		t.Fatalf("BuildBundle: %v", err)
+	}
+	b := readBundle(t, raw)
+	scopes, ok := b.Data["group_scopes"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("group_scopes must be an object even when unscoped: %#v", b.Data["group_scopes"])
+	}
+	if len(scopes) != 0 {
+		t.Errorf("group_scopes = %v, want empty", scopes)
+	}
+}
+
+// RelationSchemas is derived, never supplied, so it cannot disagree with
+// Relations. A schema the group can read one table in must appear there or
+// the client can never navigate to that table.
+func TestNewGroupScopeDerivesRelationSchemas(t *testing.T) {
+	scope := NewGroupScope(
+		[]string{"posthog_7", ""},
+		[]string{"posthog.events", "posthog.persons", "legacy.hits"},
+	)
+	if !scope.Schemas["posthog_7"] {
+		t.Error("posthog_7 must be a whole-schema grant")
+	}
+	if scope.Schemas[""] {
+		t.Error("blank schema names must be dropped")
+	}
+	for _, r := range []string{"posthog.events", "posthog.persons", "legacy.hits"} {
+		if !scope.Relations[r] {
+			t.Errorf("relation %s missing", r)
+		}
+	}
+	for _, s := range []string{"posthog", "legacy"} {
+		if !scope.RelationSchemas[s] {
+			t.Errorf("relation schema %s missing", s)
+		}
+	}
+	if len(scope.RelationSchemas) != 2 {
+		t.Errorf("relation_schemas = %v, want exactly the two relation schemas", scope.RelationSchemas)
+	}
+}
+
+// A relation that is not "<schema>.<table>" is dropped rather than stored: as
+// a key no decision can ever match it would read like a working grant and
+// silently be none.
+func TestNewGroupScopeDropsMalformedRelations(t *testing.T) {
+	scope := NewGroupScope(nil, []string{"events", "a.b.c", ".events", "posthog.", "", "ok.tbl"})
+	if len(scope.Relations) != 1 || !scope.Relations["ok.tbl"] {
+		t.Errorf("relations = %v, want only ok.tbl", scope.Relations)
+	}
+	if len(scope.RelationSchemas) != 1 || !scope.RelationSchemas["ok"] {
+		t.Errorf("relation_schemas = %v, want only ok", scope.RelationSchemas)
 	}
 }
