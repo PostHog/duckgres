@@ -56,7 +56,10 @@ DuckLake catalog with the same name fails readiness and requires explicit
 recovery. Reconciliation never silently replaces it. Trino's connector inventory
 does not expose all catalog properties, so it cannot certify an externally
 modified catalog's URI or role. Investigate manual configuration changes before
-returning the tenant to service.
+returning the tenant to service. Each backend reads one connector inventory per
+reconcile, plus one refresh when it creates Hoglake catalogs. New catalogs are
+admitted only after that refresh verifies them. Rollout certification also uses
+one inventory for the whole admitted tenant set.
 
 Readiness also requires the existing authentication and cell gates. It verifies
 metadata and connector availability, but does not perform S3 writes. The smoke

@@ -83,7 +83,7 @@ func TestTrinoHoglakeInitializedResourcesNeverRecreated(t *testing.T) {
 		for _, registrationExists := range []bool{false, true} {
 			t.Run(missing+"/"+map[bool]string{false: "after disable", true: "registered"}[registrationExists], func(t *testing.T) {
 				h, client, fixture, _ := newHoglakeStateHarness(t)
-				if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err != nil {
+				if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err != nil {
 					t.Fatal(err)
 				}
 				if !h.store.orgs[0].HoglakeInitialized {
@@ -99,7 +99,7 @@ func TestTrinoHoglakeInitializedResourcesNeverRecreated(t *testing.T) {
 					h.catalog.existing = nil
 					h.catalog.created = nil
 				}
-				if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], registrationExists); err == nil {
+				if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], registrationExists, map[string]string{"org_tenant_a": "hoglake"}); err == nil {
 					t.Fatal("lost metadata was silently accepted")
 				}
 				if fixture.posts != posts {
@@ -113,7 +113,7 @@ func TestTrinoHoglakeInitializedResourcesNeverRecreated(t *testing.T) {
 func TestTrinoHoglakeMarkerFailureRetriesWithoutAdmitting(t *testing.T) {
 	h, client, fixture, marker := newHoglakeStateHarness(t)
 	marker.markErr = errors.New("database unavailable")
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err == nil {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err == nil {
 		t.Fatal("marker persistence failure was ignored")
 	}
 	if len(h.catalog.created) != 0 {
@@ -121,7 +121,7 @@ func TestTrinoHoglakeMarkerFailureRetriesWithoutAdmitting(t *testing.T) {
 	}
 	posts := fixture.posts
 	marker.markErr = nil
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err != nil {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if fixture.posts != posts || !h.store.orgs[0].HoglakeInitialized {
@@ -132,7 +132,7 @@ func TestTrinoHoglakeMarkerFailureRetriesWithoutAdmitting(t *testing.T) {
 func TestTrinoHoglakeFailedRegistrationStillProtectsMetadata(t *testing.T) {
 	h, client, fixture, _ := newHoglakeStateHarness(t)
 	h.catalog.createErr = errors.New("registration response lost")
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err == nil {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err == nil {
 		t.Fatal("missing registration error")
 	}
 	if !h.store.orgs[0].HoglakeInitialized {
@@ -141,7 +141,7 @@ func TestTrinoHoglakeFailedRegistrationStillProtectsMetadata(t *testing.T) {
 	posts := fixture.posts
 	fixture.catalog = false
 	h.catalog.createErr = nil
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err == nil || fixture.posts != posts {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err == nil || fixture.posts != posts {
 		t.Fatal("failed registration permitted metadata recreation")
 	}
 }
@@ -220,13 +220,13 @@ func TestTrinoHoglakeUncertainRemoteCreateIsAdoptedBeforeRegistration(t *testing
 	}))
 	defer srv.Close()
 	h.provisioner.managedHoglake.URI = srv.URL
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err == nil {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err == nil {
 		t.Fatal("lost create response unexpectedly succeeded")
 	}
 	if len(h.catalog.created) != 0 || h.store.orgs[0].HoglakeInitialized {
 		t.Fatal("uncertain bootstrap admitted tenant")
 	}
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err != nil {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err != nil {
 		t.Fatal(err)
 	}
 	if fixture.posts != 2 || !h.store.orgs[0].HoglakeInitialized {
@@ -238,7 +238,7 @@ func TestTrinoHoglakeAmbiguousMarkerCommitDoesNotReinitialize(t *testing.T) {
 	h, client, fixture, marker := newHoglakeStateHarness(t)
 	marker.markErr = errors.New("commit response lost")
 	marker.commitBeforeError = true
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err == nil {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err == nil {
 		t.Fatal("missing commit error")
 	}
 	if len(h.catalog.created) != 0 || !h.store.orgs[0].HoglakeInitialized {
@@ -247,7 +247,7 @@ func TestTrinoHoglakeAmbiguousMarkerCommitDoesNotReinitialize(t *testing.T) {
 	marker.markErr = nil
 	fixture.catalog = false
 	posts := fixture.posts
-	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false); err == nil || fixture.posts != posts {
+	if err := h.provisioner.reconcileHoglakeCatalog(context.Background(), client, "org_tenant_a", "tenant-a", h.ducklings["tenant-a"], false, nil); err == nil || fixture.posts != posts {
 		t.Fatal("retry recreated metadata after committed marker")
 	}
 }

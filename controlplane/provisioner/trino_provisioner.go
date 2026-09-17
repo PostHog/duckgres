@@ -1757,6 +1757,8 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 		wanted[TrinoCatalogName(o.TrinoPrincipal())] = true
 	}
 
+	connectors, inventoryErr := hoglakeConnectorInventory(ctx, catalog, orgs)
+	createdHoglake := make(map[string]string)
 	var errs []error
 	for _, o := range orgs {
 		// No principal means no derivable catalog name. The listing query
@@ -1790,12 +1792,18 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 		}
 
 		if isManagedHoglake(o) {
-			err := p.reconcileHoglakeCatalog(ctx, catalog, name, o.OrgID, tenants.statuses[o.OrgID], existingSet[name])
+			err := inventoryErr
+			if err == nil {
+				err = p.reconcileHoglakeCatalog(ctx, catalog, name, o.OrgID, tenants.statuses[o.OrgID], existingSet[name], connectors)
+			}
 			if err != nil {
 				outcomes[o.OrgID] = catalogOutcome{Err: err}
 				errs = append(errs, err)
 			} else {
 				outcomes[o.OrgID] = catalogOutcome{Created: !existingSet[name], Existed: existingSet[name]}
+				if !existingSet[name] {
+					createdHoglake[o.OrgID] = name
+				}
 			}
 			continue
 		}
@@ -1857,6 +1865,21 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 		}
 		slog.Info("Trino reconcile: catalog created.", "org", o.OrgID, "catalog", name)
 		outcomes[o.OrgID] = catalogOutcome{Created: true}
+	}
+
+	// Verify actual post-DDL state once for the entire batch before admission.
+	if len(createdHoglake) > 0 {
+		refreshed, refreshErr := hoglakeConnectorInventory(ctx, catalog, orgs)
+		for orgID, name := range createdHoglake {
+			err := refreshErr
+			if err == nil {
+				err = verifyHoglakeConnector(refreshed, name)
+			}
+			if err != nil {
+				outcomes[orgID] = catalogOutcome{Err: err}
+				errs = append(errs, fmt.Errorf("verify created catalog %s: %w", name, err))
+			}
+		}
 	}
 
 	for _, c := range existing {

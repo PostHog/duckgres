@@ -161,6 +161,10 @@ func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease confi
 	if err != nil {
 		return err
 	}
+	connectors, err := hoglakeConnectorInventory(ctx, backend.Catalog, orgs)
+	if err != nil {
+		return err
+	}
 	var roster []string
 	expected := make(map[string][]byte)
 	for _, org := range orgs {
@@ -169,7 +173,7 @@ func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease confi
 			return errors.New("managed target is missing an admitted catalog or credential")
 		}
 		if isManagedHoglake(org) {
-			if err := verifyHoglakeConnector(ctx, backend.Catalog, name); err != nil {
+			if err := verifyHoglakeConnector(connectors, name); err != nil {
 				return err
 			}
 			if p.managedHoglake == nil {

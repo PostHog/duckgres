@@ -209,15 +209,20 @@ type trinoConnectorInventory interface {
 	CatalogConnectors(context.Context) (map[string]string, error)
 }
 
-func verifyHoglakeConnector(ctx context.Context, client TrinoCatalogClient, name string) error {
-	inventory, ok := client.(trinoConnectorInventory)
-	if !ok {
-		return errors.New("catalog client cannot verify the Hoglake connector")
+func hoglakeConnectorInventory(ctx context.Context, client TrinoCatalogClient, orgs []configstore.TrinoEnabledOrg) (map[string]string, error) {
+	for _, org := range orgs {
+		if isManagedHoglake(org) {
+			inventory, ok := client.(trinoConnectorInventory)
+			if !ok {
+				return nil, errors.New("catalog client cannot verify the Hoglake connector")
+			}
+			return inventory.CatalogConnectors(ctx)
+		}
 	}
-	connectors, err := inventory.CatalogConnectors(ctx)
-	if err != nil {
-		return err
-	}
+	return nil, nil
+}
+
+func verifyHoglakeConnector(connectors map[string]string, name string) error {
 	if connectors[name] != "hoglake" {
 		return errors.New("existing Trino catalog is not an operational Hoglake catalog; explicit migration required")
 	}
@@ -269,14 +274,14 @@ func (c *trinoManagedCatalogClient) CatalogConnectors(ctx context.Context) (map[
 	return inventory.CatalogConnectors(ctx)
 }
 
-func (p *TrinoProvisioner) reconcileHoglakeCatalog(ctx context.Context, client TrinoCatalogClient, name, orgID string, status *DucklingStatus, exists bool) error {
+func (p *TrinoProvisioner) reconcileHoglakeCatalog(ctx context.Context, client TrinoCatalogClient, name, orgID string, status *DucklingStatus, exists bool, connectors map[string]string) error {
 	props, err := p.managedHoglakeProperties(orgID, status)
 	if err != nil {
 		return err
 	}
 	// Check the existing connector before touching the remote metadata or IAM.
 	if exists {
-		if err = verifyHoglakeConnector(ctx, client, name); err != nil {
+		if err = verifyHoglakeConnector(connectors, name); err != nil {
 			return err
 		}
 	}
@@ -295,7 +300,7 @@ func (p *TrinoProvisioner) reconcileHoglakeCatalog(ctx context.Context, client T
 			return err
 		}
 	}
-	return verifyHoglakeConnector(ctx, client, name)
+	return nil
 }
 
 // TrinoHoglakeInitializationStore persists the bootstrap boundary before Trino
