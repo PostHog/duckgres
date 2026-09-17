@@ -64,6 +64,7 @@ func fieldNameToFlagName(name string) string {
 		{"FilePersistence", "file-persistence"},
 		{"IdleTimeout", "idle-timeout"},
 		{"SessionInitTimeout", "session-init-timeout"},
+		{"StatementTimeout", "statement-timeout"},
 		{"MemoryLimit", "memory-limit"},
 		{"MemoryBudget", "memory-budget"},
 		{"MemoryRebalance", "memory-rebalance"},
