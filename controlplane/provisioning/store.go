@@ -127,6 +127,10 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, teamID in
 	if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
 		return err
 	}
+	if err := configstore.CheckHoglakeLifecycleTx(tx, orgID); err != nil {
+		return err
+	}
+
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
 	// creates everything). A NEW org MUST carry team_id — a warehouse cannot
 	// exist without a team; the id becomes the org's first
@@ -309,25 +313,35 @@ func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore
 	// provisioning phases stamp status_message. Without this the message stays
 	// stale (e.g. "Infrastructure ready") until the provisioner flips it to
 	// "Resources deleted" at the very end.
-	result := s.cs.DB().Model(&configstore.ManagedWarehouse{}).
-		Where("org_id = ? AND state = ?", orgID, expectedState).
-		Updates(map[string]interface{}{
-			"state":          configstore.ManagedWarehouseStateDeleting,
-			"status_message": "Deprovisioning...",
-		})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		// Distinguish "not found" from "wrong state"
-		var count int64
-		s.cs.DB().Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", orgID).Count(&count)
-		if count == 0 {
-			return gorm.ErrRecordNotFound
+	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
 		}
-		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
-	}
-	return nil
+		if err := configstore.CheckHoglakeLifecycleTx(tx, orgID); err != nil {
+			return err
+		}
+		result := tx.Model(&configstore.ManagedWarehouse{}).
+			Where("org_id = ? AND state = ?", orgID, expectedState).
+			Updates(map[string]interface{}{
+				"state":          configstore.ManagedWarehouseStateDeleting,
+				"status_message": "Deprovisioning...",
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			// Distinguish "not found" from "wrong state"
+			var count int64
+			if err := tx.Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", orgID).Count(&count).Error; err != nil {
+				return err
+			}
+			if count == 0 {
+				return gorm.ErrRecordNotFound
+			}
+			return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
+		}
+		return nil
+	})
 }
 
 // MintServiceCredential delegates to the config store: create a fresh

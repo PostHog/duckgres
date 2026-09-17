@@ -63,6 +63,13 @@ metadata and connector availability, but does not perform S3 writes. The smoke
 test below provides that verification. The administrative OPA grant permits
 connector inventory; it does not grant tenant data writes.
 
+Hoglake warehouse deprovisioning, organization deletion, and warehouse replacement
+are blocked, including for disabled Trino clients. These operations must wait for
+an explicit Hoglake retirement workflow that fences the retained catalog and S3
+ownership before releasing the organization name. Ordinary worker image updates
+and Trino disable remain supported. Previously queued warehouse deletions also
+stop while Hoglake ownership exists.
+
 Disabling Trino removes its registration and access through the normal lifecycle.
 Hoglake metadata and S3 files remain. Neither disabling nor clearing deployment
 configuration changes the selected backend or migrates data. Repair configuration

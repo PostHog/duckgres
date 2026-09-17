@@ -527,7 +527,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		RootUserHash: hash,
 		Trino:        trinoSettings,
 	}); err != nil {
-		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) {
+		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) || errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
@@ -665,7 +665,7 @@ func (h *handler) enableTrino(c *gin.Context) {
 		return
 	}
 	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend}); err != nil {
-		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) {
+		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) || errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
@@ -744,6 +744,11 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}
+	}
+
+	if errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
 	}
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {

@@ -357,6 +357,9 @@ func (s *gormAPIStore) DeleteOrg(name string) (bool, error) {
 		if err := configstore.LockOrgConnectionAdmissionTx(tx, name); err != nil {
 			return err
 		}
+		if err := configstore.CheckHoglakeLifecycleTx(tx, name); err != nil {
+			return err
+		}
 
 		// Deleting an org while a managed warehouse row is in a non-terminal
 		// state would leak the Duckling CR + AWS infra behind it, so those
@@ -730,35 +733,23 @@ func (s *gormAPIStore) GetManagedWarehouse(orgID string) (*configstore.ManagedWa
 }
 
 func (s *gormAPIStore) UpsertManagedWarehouse(orgID string, warehouse *configstore.ManagedWarehouse) (*configstore.ManagedWarehouse, bool, error) {
-	var count int64
-	if err := s.db().Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
-		return nil, false, err
-	}
-	if count == 0 {
-		return nil, false, nil
-	}
-
-	warehouse.OrgID = orgID
-	warehouse.UpdatedAt = time.Now().UTC()
-	if err := s.db().Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "org_id"}},
-		DoUpdates: clause.AssignmentColumns(managedWarehouseUpsertColumns()),
-	}).Create(warehouse).Error; err != nil {
-		return nil, true, err
-	}
-	stored, err := s.GetManagedWarehouse(orgID)
-	if err != nil {
-		return nil, true, err
-	}
-	return stored, true, nil
+	return s.mutateManagedWarehouse(orgID, func(current *configstore.ManagedWarehouse) error { *current = *warehouse; return nil }, true)
 }
 
 func (s *gormAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error) (*configstore.ManagedWarehouse, bool, error) {
+	return s.mutateManagedWarehouse(orgID, mutate, false)
+}
+
+func (s *gormAPIStore) mutateManagedWarehouse(orgID string, mutate func(*configstore.ManagedWarehouse) error, replacement bool) (*configstore.ManagedWarehouse, bool, error) {
 	var (
 		stored    *configstore.ManagedWarehouse
 		orgExists bool
 	)
 	err := s.db().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+
 		var count int64
 		if err := tx.Model(&configstore.Org{}).Where("name = ?", orgID).Count(&count).Error; err != nil {
 			return err
@@ -778,8 +769,17 @@ func (s *gormAPIStore) MutateManagedWarehouse(orgID string, mutate func(*configs
 			return err
 		}
 
+		before := warehouse
+		missing := errors.Is(err, gorm.ErrRecordNotFound)
+
 		if err := mutate(&warehouse); err != nil {
 			return err
+		}
+
+		if replacement || missing || before.DucklingName != warehouse.DucklingName || before.State != warehouse.State {
+			if err := configstore.CheckHoglakeLifecycleTx(tx, orgID); err != nil {
+				return err
+			}
 		}
 
 		warehouse.OrgID = orgID
@@ -1139,6 +1139,10 @@ func (h *apiHandler) deleteOrg(c *gin.Context) {
 	name := c.Param("id")
 	ok, err := h.store.DeleteOrg(name)
 	if err != nil {
+		if errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		if errors.Is(err, errWarehouseStillExists) {
 			c.JSON(http.StatusConflict, gin.H{"error": "warehouse still exists — deprovision it and wait for teardown to complete before deleting the org"})
 			return
@@ -1635,6 +1639,10 @@ func (h *apiHandler) putManagedWarehouse(c *gin.Context) {
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		var badReq warehouseBadRequestError
 		if errors.As(err, &badReq) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": badReq.Error()})

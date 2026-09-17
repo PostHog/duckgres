@@ -409,6 +409,9 @@ func (s *fakeStore) IsDatabaseNameAvailable(name string) (bool, error) {
 }
 
 func (s *fakeStore) SetWarehouseDeleting(orgID string, expectedState configstore.ManagedWarehouseProvisioningState) error {
+	if row := s.trino[orgID]; row != nil && row.Backend == configstore.TrinoBackendHoglake {
+		return configstore.ErrHoglakeLifecycleProtected
+	}
 	w, ok := s.warehouses[orgID]
 	if !ok {
 		return gorm.ErrRecordNotFound
@@ -2215,5 +2218,20 @@ func TestTrinoRejectsNewDuckLakeClientWithoutWrites(t *testing.T) {
 		if rec.Code != http.StatusConflict || len(store.trino) != 0 || len(store.warehouses) != 0 {
 			t.Fatalf("new DuckLake client accepted or mutated: %d", rec.Code)
 		}
+	}
+}
+
+func TestHoglakeDeprovisionAPIConflictPreservesDisabledOwnership(t *testing.T) {
+	store := newFakeStore()
+	store.warehouses["tenant"] = &configstore.ManagedWarehouse{OrgID: "tenant", State: configstore.ManagedWarehouseStateReady}
+	store.trino["tenant"] = &configstore.ManagedWarehouseTrino{OrgID: "tenant", Backend: configstore.TrinoBackendHoglake, BackendSelected: true}
+	router := newTestRouter(store)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/deprovision", nil))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if store.warehouses["tenant"].State != configstore.ManagedWarehouseStateReady || store.trino["tenant"].Backend != configstore.TrinoBackendHoglake {
+		t.Fatal("rejected deprovision modified ownership")
 	}
 }

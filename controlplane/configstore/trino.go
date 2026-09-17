@@ -92,6 +92,9 @@ func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings)
 		return errors.New("invalid Trino backend")
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
 		row := ManagedWarehouseTrino{OrgID: orgID, Backend: TrinoBackendHoglake, State: ManagedWarehouseStatePending}
 		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
 			return err
@@ -102,6 +105,11 @@ func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings)
 		backend, err := ResolveTrinoBackend(&row, settings.Backend)
 		if err != nil {
 			return err
+		}
+		if backend == TrinoBackendHoglake {
+			if err := checkHoglakeWarehouseActiveTx(tx, orgID); err != nil {
+				return err
+			}
 		}
 		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ?", orgID).Updates(map[string]any{
 			"enabled": true, "tier": settings.Tier, "backend": backend, "backend_selected": true, "updated_at": time.Now().UTC(),
@@ -222,6 +230,13 @@ func (cs *ConfigStore) SelectTrinoCell(orgID, cellID string) error {
 		return errors.New("SelectTrinoCell: orgID and cellID are required")
 	}
 	return cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+		if err := checkHoglakeWarehouseActiveTx(tx, orgID); err != nil {
+			return err
+		}
+
 		var warehouse ManagedWarehouse
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&warehouse, "org_id = ?", orgID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
