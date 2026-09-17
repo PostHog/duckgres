@@ -134,6 +134,12 @@ type portalExec struct {
 	// finishProfiling runs after rows.Close has allowed a Flight DoGet trailer
 	// to arrive. A suspended portal retains it until its terminal Execute.
 	finishProfiling func()
+	// releaseStmtCtx cancels/unregisters the statement context whose deadline
+	// bounds this portal. A suspended portal's RowSet outlives the Execute that
+	// opened it, so — like finishProfiling — the portal owns the release until
+	// its terminal Execute. Cancelling at the opening Execute's return would
+	// tear down the rowset the next Execute resumes from.
+	releaseStmtCtx func()
 }
 
 // closeExec releases a suspended portal's open rowset (if any). Must be
@@ -146,6 +152,9 @@ func (p *portal) closeExec() {
 	_ = p.exec.rows.Close()
 	if p.exec.finishProfiling != nil {
 		p.exec.finishProfiling()
+	}
+	if p.exec.releaseStmtCtx != nil {
+		p.exec.releaseStmtCtx()
 	}
 	p.exec = nil
 }
@@ -488,7 +497,16 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	// Carry the statement's ID to the engine. The worker stamps it on its own
 	// logs, so a client complaint can be followed from this connection into the
 	// pod that ran the statement.
-	ctx, cancel := context.WithCancel(wire.WithQueryID(c.ctx, c.currentQueryID()))
+	// The statement timeout rides on the statement context, not the connection
+	// context: a timeout must end one statement, not the session. That is also
+	// why statementTimedOut() cannot be answered from c.ctx -- see conn_errors.go.
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if timeout := c.statementTimeout(); timeout > 0 {
+		ctx, cancel = context.WithTimeout(wire.WithQueryID(c.ctx, c.currentQueryID()), timeout)
+	} else {
+		ctx, cancel = context.WithCancel(wire.WithQueryID(c.ctx, c.currentQueryID()))
+	}
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 
@@ -1867,7 +1885,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
-					errMsg = "canceling statement due to user request"
+					errMsg = c.cancellationMessage(err)
 				} else {
 					c.logQueryError(query, err)
 				}

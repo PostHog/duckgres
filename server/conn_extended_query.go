@@ -852,6 +852,28 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.logWorkerStatementFinished(workerStatement, queryStart, queryRowsAff, queryFinalErr)
 	}()
 
+	// Extended-protocol Execute needs a real statement context, like the simple
+	// and batched paths. Without it this path ran on context.Background() (see
+	// PinnedExecutor.Query/Exec), which meant prepared statements — what pgx,
+	// psycopg3 and JDBC actually send — were reachable by NEITHER the statement
+	// timeout NOR a pgwire CancelRequest: RegisterQuery is only ever called from
+	// queryContextInner, and nothing on this path called it.
+	// queryContextInner(false): no disconnect monitor. Like the cursor path, the
+	// monitor's bufio Peek would race the message loop's own reads — the extended
+	// protocol pipelines Parse/Bind/Execute/Sync, so bytes for the next message
+	// are often already buffered. Disconnect still cancels via c.ctx.
+	stmtCtx, stmtCleanup := c.queryContextInner(false)
+	defer func() {
+		// A suspended portal keeps its RowSet open for the NEXT Execute, so the
+		// statement context has to outlive this handler; ownership moves to the
+		// portal and closeExec releases it.
+		if p.exec != nil {
+			p.exec.releaseStmtCtx = stmtCleanup
+			return
+		}
+		stmtCleanup()
+	}()
+
 	if !returnsResults {
 		// Open cursors pin the session's single DuckDB connection — release
 		// them before a transaction-end statement needs it.
@@ -859,12 +881,12 @@ func (c *clientConn) handleExecute(body []byte) {
 
 		// Non-result-returning query: use Exec with converted query
 		runExec := func() (ExecResult, error) {
-			result, err := c.executor.Exec(convertedQuery, args...)
+			result, err := c.executor.ExecContext(stmtCtx, convertedQuery, args...)
 			if err != nil {
 				if fallbackResult, handled, fallbackErr := c.execCompatibilityFallback(convertedQuery, err, func(fallbackQuery string) (ExecResult, error) {
 					return c.runGeneratedWorkerStatement(
 						generatedWorkerStatement(workerOriginRewrite, workerOperationCompatibilityFallback),
-						func() (ExecResult, error) { return c.executor.Exec(fallbackQuery, args...) },
+						func() (ExecResult, error) { return c.executor.ExecContext(stmtCtx, fallbackQuery, args...) },
 					)
 				}); handled {
 					return fallbackResult, fallbackErr
@@ -899,7 +921,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
-					errMsg = "canceling statement due to user request"
+					errMsg = c.cancellationMessage(err)
 				} else {
 					c.logQueryError(convertedQuery, err)
 				}
@@ -923,7 +945,7 @@ func (c *clientConn) handleExecute(body []byte) {
 
 	// Result-returning query: use Query with converted query
 	runQuery := func() (RowSet, error) {
-		return c.executor.Query(convertedQuery, args...)
+		return c.executor.QueryContext(stmtCtx, convertedQuery, args...)
 	}
 
 	execStart := time.Now()
@@ -967,7 +989,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
-			errMsg = "canceling statement due to user request"
+			errMsg = c.cancellationMessage(err)
 		} else {
 			c.logQueryError(convertedQuery, err)
 		}
@@ -1082,9 +1104,9 @@ func (c *clientConn) handleExecute(body []byte) {
 		queryFinalErr = err
 		errCode := "42000"
 		errMsg := err.Error()
-		if c.isCallerCancellation(err) {
+		if c.statementTimedOut(err) || c.isCallerCancellation(err) {
 			errCode = "57014"
-			errMsg = "canceling statement due to user request"
+			errMsg = c.cancellationMessage(err)
 			c.sendError("ERROR", errCode, errMsg)
 		} else {
 			c.logger().Error("Row iteration error.", "error", err)
@@ -1168,9 +1190,9 @@ func (c *clientConn) resumeSuspendedPortal(p *portal, maxRows int32) {
 		p.closeExec()
 		errCode := "42000"
 		errMsg := err.Error()
-		if c.isCallerCancellation(err) {
+		if c.statementTimedOut(err) || c.isCallerCancellation(err) {
 			errCode = "57014"
-			errMsg = "canceling statement due to user request"
+			errMsg = c.cancellationMessage(err)
 		} else {
 			c.logger().Error("Row iteration error.", "error", err)
 		}

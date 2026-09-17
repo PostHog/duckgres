@@ -149,7 +149,7 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 		}
 		errMsg := execErr.Error()
 		if c.isCallerCancellation(execErr) {
-			errMsg = "canceling statement due to user request"
+			errMsg = c.cancellationMessage(execErr)
 		} else {
 			c.logQueryError(query, execErr)
 		}

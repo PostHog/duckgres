@@ -31,6 +31,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 	processIsolation := fs.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := fs.String("idle-timeout", "", "Connection idle timeout: close a connection idle (no traffic) this long, freeing its worker (e.g., '30m', '1h', '-1s' to disable). Default 24h standalone, 5m control-plane where idle connections pin a worker (env: DUCKGRES_IDLE_TIMEOUT)")
 	sessionInitTimeout := fs.String("session-init-timeout", "", "Session startup metadata/probe timeout (e.g., '10s', '30s') (env: DUCKGRES_SESSION_INIT_TIMEOUT)")
+	statementTimeout := fs.String("statement-timeout", "", "Cancel any single statement that runs longer than this (e.g., '60m'); empty or '0' leaves statements unbounded (env: DUCKGRES_STATEMENT_TIMEOUT)")
 	memoryLimit := fs.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
 	threads := fs.Int("threads", 0, "DuckDB threads per session (env: DUCKGRES_THREADS)")
 	memoryBudget := fs.String("memory-budget", "", "Total memory for all DuckDB sessions (e.g., '24GB') (env: DUCKGRES_MEMORY_BUDGET)")
@@ -85,6 +86,7 @@ func RegisterCLIInputsFlags(fs *flag.FlagSet) func() CLIInputs {
 		cli.ProcessIsolation = *processIsolation
 		cli.IdleTimeout = *idleTimeout
 		cli.SessionInitTimeout = *sessionInitTimeout
+		cli.StatementTimeout = *statementTimeout
 		cli.MemoryLimit = *memoryLimit
 		cli.Threads = *threads
 		cli.MemoryBudget = *memoryBudget

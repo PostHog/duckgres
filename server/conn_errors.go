@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 )
 
 // isQueryCancelled checks whether an error string indicates that *some*
@@ -18,6 +19,49 @@ func isQueryCancelled(err error) bool {
 	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
 }
 
+// statementTimeout returns the effective per-statement timeout, or 0 when
+// statements are unbounded.
+func (c *clientConn) statementTimeout() time.Duration {
+	if c == nil || c.server == nil {
+		return 0
+	}
+	return c.server.cfg.StatementTimeout
+}
+
+// statementTimedOut reports whether err is this statement hitting the configured
+// statement timeout.
+//
+// Classified from the ERROR, not from stored state. An earlier version recorded
+// the live statement context on the connection and inspected it here, which was
+// sticky: once any statement timed out, a later unrelated failure on a path that
+// did not overwrite the field was reported as a timeout and its logging skipped.
+//
+// Gated on the timeout being configured, so a deployment with the feature off
+// keeps today's classification byte for byte -- internal deadlines (attach,
+// exec, worker gRPC) must not start surfacing as 57014 just because this code
+// exists. When the feature IS on, an internal deadline racing a statement can
+// still be labelled a statement timeout; that is an accepted narrowing, not an
+// oversight.
+func (c *clientConn) statementTimedOut(err error) bool {
+	if c == nil || err == nil || c.statementTimeout() <= 0 {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return strings.Contains(err.Error(), "context deadline exceeded")
+}
+
+// cancellationMessage returns the client-facing 57014 message. The wording
+// mirrors PostgreSQL's exactly, because drivers and ORMs string-match it to
+// decide whether a failure is retryable.
+func (c *clientConn) cancellationMessage(err error) string {
+	if c.statementTimedOut(err) {
+		return "canceling statement due to statement timeout"
+	}
+	return "canceling statement due to user request"
+}
+
 // isCallerCancellation reports whether err is a cancellation that the caller
 // asked for — either through pgwire CancelRequest, an explicit ctx cancel, or
 // a deadline. Distinct from a gRPC Canceled status that bubbles up purely
@@ -27,10 +71,21 @@ func isQueryCancelled(err error) bool {
 // cancelled". This matters for alerting — "Query execution errored." should
 // fire on worker kills, not get silently downgraded to "Worker statement finished.".
 func (c *clientConn) isCallerCancellation(err error) bool {
+	if c == nil {
+		return false
+	}
+	if c.statementTimedOut(err) {
+		return true
+	}
 	if !isQueryCancelled(err) {
 		return false
 	}
-	if c == nil || c.ctx == nil {
+	// A statement timeout is caller-driven even though the connection context is
+	// untouched, so it must not be logged as an infra failure.
+	if c.statementTimedOut(err) {
+		return true
+	}
+	if c.ctx == nil {
 		return false
 	}
 	return c.ctx.Err() != nil

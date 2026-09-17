@@ -365,16 +365,29 @@ func TestHandleExecuteLogsProfileAfterResultStreamCloses(t *testing.T) {
 
 	c.handleExecute(append([]byte("p1\x00"), 0, 0, 0, 0))
 
-	select {
-	case entry := <-c.server.queryLogger.ch:
-		if entry.CPUTimeSeconds != 2.5 {
-			t.Fatalf("CPUTimeSeconds = %f, want 2.5", entry.CPUTimeSeconds)
+	// Extended Execute now acquires a statement context, which also emits a
+	// QueryStart entry ahead of the terminal one. Scan for the terminal entry
+	// (the one carrying profiling) rather than taking the first off the channel.
+	var terminal bool
+	for drained := 0; drained < 8 && !terminal; drained++ {
+		select {
+		case entry := <-c.server.queryLogger.ch:
+			if entry.CPUTimeSeconds == 0 && entry.PeakBufferMemoryBytes == 0 {
+				continue // QueryStart
+			}
+			if entry.CPUTimeSeconds != 2.5 {
+				t.Fatalf("CPUTimeSeconds = %f, want 2.5", entry.CPUTimeSeconds)
+			}
+			if entry.PeakBufferMemoryBytes != 8192 {
+				t.Fatalf("PeakBufferMemoryBytes = %d, want 8192", entry.PeakBufferMemoryBytes)
+			}
+			terminal = true
+		default:
+			t.Fatal("expected terminal query-log entry")
 		}
-		if entry.PeakBufferMemoryBytes != 8192 {
-			t.Fatalf("PeakBufferMemoryBytes = %d, want 8192", entry.PeakBufferMemoryBytes)
-		}
-	default:
-		t.Fatal("expected terminal query-log entry")
+	}
+	if !terminal {
+		t.Fatal("no terminal query-log entry carrying profiling")
 	}
 }
 

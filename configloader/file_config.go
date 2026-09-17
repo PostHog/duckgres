@@ -25,6 +25,7 @@ type FileConfig struct {
 	ProcessIsolation     bool                `yaml:"process_isolation"`
 	IdleTimeout          string              `yaml:"idle_timeout"`
 	SessionInitTimeout   string              `yaml:"session_init_timeout"`
+	StatementTimeout     string              `yaml:"statement_timeout"`
 	MemoryLimit          string              `yaml:"memory_limit"`
 	Threads              int                 `yaml:"threads"`
 	MemoryBudget         string              `yaml:"memory_budget"`
