@@ -98,28 +98,43 @@ func TestTrinoRegistryPreservesStoppedBackend(t *testing.T) {
 	}
 }
 
+// A per-org client URL gives every org the host name it already uses for
+// pgwire; the placeholder is validated as the org label it will become.
+func TestTrinoRegistryAcceptsPerOrgClientHost(t *testing.T) {
+	data := strings.Replace(testTrinoRegistryJSON, `https://gateway.example.test`, `https://{database_name}.example.test`, 1)
+	cells, err := parseTrinoCellRegistry([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cells[0].ClientURL != "https://{database_name}.example.test" {
+		t.Fatalf("client URL = %q", cells[0].ClientURL)
+	}
+}
+
 func TestTrinoRegistryRejectsUnsafeConfiguration(t *testing.T) {
 	tests := map[string]string{
-		"unknown field":                strings.Replace(testTrinoRegistryJSON, `"cells":`, `"typo":`, 1),
-		"reserved legacy identity":     strings.Replace(testTrinoRegistryJSON, `"id":"cell-test"`, `"id":"legacy"`, 1),
-		"unsafe namespace":             strings.Replace(testTrinoRegistryJSON, `"namespace":"trino-test"`, `"namespace":"../other"`, 1),
-		"credentials field":            strings.Replace(testTrinoRegistryJSON, `"cells":`, `"password":"secret","cells":`, 1),
-		"empty registry":               `{"cells":[]}`,
-		"no backends":                  `{"cells":[{"id":"cell-test","namespace":"trino-test","client_url":"https://gateway.example.test","routing_group":"cell-test","backends":[]}]}`,
-		"plain HTTP":                   strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `http://blue.example.test`, 1),
-		"embedded credentials":         strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://user:secret@blue.example.test`, 1),
-		"URL query":                    strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://blue.example.test?token=value`, 1),
-		"URL path":                     strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://blue.example.test/catalogs`, 1),
-		"active backend stopped":       strings.Replace(testTrinoRegistryJSON, `"running":true`, `"running":false`, 1),
-		"no active backend":            strings.Replace(testTrinoRegistryJSON, `"routing_active":true`, `"routing_active":false`, 1),
-		"two active backends":          strings.Replace(testTrinoRegistryJSON, `"running":false,"routing_active":false`, `"running":true,"routing_active":true`, 1),
-		"duplicate backend identity":   strings.Replace(testTrinoRegistryJSON, `"id":"green"`, `"id":"blue"`, 1),
-		"duplicate endpoint":           strings.Replace(testTrinoRegistryJSON, `https://green.example.test`, `https://blue.example.test`, 1),
-		"duplicate canonical endpoint": strings.Replace(testTrinoRegistryJSON, `https://green.example.test`, `https://BLUE.example.test.:0443/`, 1),
-		"shared internal secret":       strings.Replace(testTrinoRegistryJSON, `green-internal`, `blue-internal`, 1),
-		"invalid internal secret":      strings.Replace(testTrinoRegistryJSON, `green-internal`, `../other`, 1),
-		"header injection":             strings.Replace(testTrinoRegistryJSON, `"routing_group":"cell-test"`, `"routing_group":"cell-test\r\nHost: other"`, 1),
-		"trailing document":            testTrinoRegistryJSON + `{}`,
+		"unknown field":                 strings.Replace(testTrinoRegistryJSON, `"cells":`, `"typo":`, 1),
+		"reserved legacy identity":      strings.Replace(testTrinoRegistryJSON, `"id":"cell-test"`, `"id":"legacy"`, 1),
+		"unsafe namespace":              strings.Replace(testTrinoRegistryJSON, `"namespace":"trino-test"`, `"namespace":"../other"`, 1),
+		"credentials field":             strings.Replace(testTrinoRegistryJSON, `"cells":`, `"password":"secret","cells":`, 1),
+		"empty registry":                `{"cells":[]}`,
+		"no backends":                   `{"cells":[{"id":"cell-test","namespace":"trino-test","client_url":"https://gateway.example.test","routing_group":"cell-test","backends":[]}]}`,
+		"plain HTTP":                    strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `http://blue.example.test`, 1),
+		"embedded credentials":          strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://user:secret@blue.example.test`, 1),
+		"URL query":                     strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://blue.example.test?token=value`, 1),
+		"URL path":                      strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://blue.example.test/catalogs`, 1),
+		"active backend stopped":        strings.Replace(testTrinoRegistryJSON, `"running":true`, `"running":false`, 1),
+		"no active backend":             strings.Replace(testTrinoRegistryJSON, `"routing_active":true`, `"routing_active":false`, 1),
+		"two active backends":           strings.Replace(testTrinoRegistryJSON, `"running":false,"routing_active":false`, `"running":true,"routing_active":true`, 1),
+		"duplicate backend identity":    strings.Replace(testTrinoRegistryJSON, `"id":"green"`, `"id":"blue"`, 1),
+		"duplicate endpoint":            strings.Replace(testTrinoRegistryJSON, `https://green.example.test`, `https://blue.example.test`, 1),
+		"duplicate canonical endpoint":  strings.Replace(testTrinoRegistryJSON, `https://green.example.test`, `https://BLUE.example.test.:0443/`, 1),
+		"shared internal secret":        strings.Replace(testTrinoRegistryJSON, `green-internal`, `blue-internal`, 1),
+		"invalid internal secret":       strings.Replace(testTrinoRegistryJSON, `green-internal`, `../other`, 1),
+		"header injection":              strings.Replace(testTrinoRegistryJSON, `"routing_group":"cell-test"`, `"routing_group":"cell-test\r\nHost: other"`, 1),
+		"trailing document":             testTrinoRegistryJSON + `{}`,
+		"placeholder not leading label": strings.Replace(testTrinoRegistryJSON, `https://gateway.example.test`, `https://gateway.{database_name}.example.test`, 1),
+		"placeholder in path":           strings.Replace(testTrinoRegistryJSON, `https://gateway.example.test`, `https://gateway.example.test/{database_name}`, 1),
 	}
 	for name, data := range tests {
 		t.Run(name, func(t *testing.T) {

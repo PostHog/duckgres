@@ -587,6 +587,47 @@ func (o TrinoEnabledOrg) TrinoUserPrincipal(username string) string {
 	return principal + TrinoPrincipalSeparator + username
 }
 
+// TrinoPrincipalOwner is the duckgres login a Trino principal authenticated
+// as: the org, and the org user whose password line it matched.
+type TrinoPrincipalOwner struct {
+	OrgID    string
+	Username string
+}
+
+// TrinoPrincipalOwners maps each Trino principal an org projects back to the
+// duckgres login it belongs to. Trino reports only the principal, and every
+// consumer that attributes a query to a tenant (usage metering, the admin
+// console) must see a per-user login as its org's, not as an unknown user.
+//
+// It is built from the SAME principals BuildTrinoAuthFiles projects, by exact
+// match, rather than by splitting on the separator, so a principal that is not
+// in the password file never resolves to an org.
+type TrinoPrincipalOwners map[string]TrinoPrincipalOwner
+
+// NewTrinoPrincipalOwners indexes the projected principals of orgs. The bare
+// org principal authenticates with the root login's hash, so it resolves to
+// root.
+func NewTrinoPrincipalOwners(orgs []TrinoEnabledOrg) TrinoPrincipalOwners {
+	owners := make(TrinoPrincipalOwners, len(orgs))
+	for _, o := range orgs {
+		if p := o.TrinoPrincipal(); p != "" {
+			owners[p] = TrinoPrincipalOwner{OrgID: o.OrgID, Username: "root"}
+		}
+		for _, u := range o.Users {
+			if p := o.TrinoUserPrincipal(u.Username); p != "" {
+				owners[p] = TrinoPrincipalOwner{OrgID: o.OrgID, Username: u.Username}
+			}
+		}
+	}
+	return owners
+}
+
+// OrgID returns the org that owns principal, or "" for an operational or
+// unknown principal.
+func (owners TrinoPrincipalOwners) OrgID(principal string) string {
+	return owners[principal].OrgID
+}
+
 // TrinoPrincipal is the tenant's customer-facing identity in Trino: the
 // username it authenticates as, and the stem every derived name is built
 // from (catalog, group, resource group).

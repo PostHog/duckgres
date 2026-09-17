@@ -175,6 +175,18 @@ tests. That fork contains the DuckLake connector and PostgreSQL dynamic catalog
 store; upstream `trinodb/trino` is not compatible. Update the default in
 `run.sh`, `e2e-mw-dev.yml`, and `scenario-dev.yml` together when promoting a
 Trino build.
+The suite asserts per-user logins on every run: an org user authenticates as
+`<database_name>.<username>` with its pgwire password, reads only its own org's
+catalog, is attributed to its org in the admin query list, and stops
+authenticating once disabled. The host-qualified login, where the same user
+types only `<username>` against `<database_name>.<domain>`, is asserted only
+when `TRINO_HOST_QUALIFIED_DOMAIN` is set, and is logged as skipped otherwise.
+It needs a fork build with
+`http-server.authentication.password.host-qualified-user.domains`, which the
+pinned image predates. When promoting such a build, set that property to the
+same domain on the lane's coordinator and pass the domain to the harness Job.
+The harness sends the tenant host as the `Host` header against the lane's own
+TLS name, so no DNS or certificate for the tenant host is needed.
 Each Trino worker has requests and limits of 1 CPU and 4Gi. Together they
 match the frozen perf Duckgres worker's aggregate 3 CPU and 12Gi execution
 budget while exercising Trino's distributed execution path. Trino permits 2GB

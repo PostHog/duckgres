@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/admin"
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/internal/analytics"
 )
 
@@ -70,10 +71,7 @@ func (c *trinoUsageCollector) collect(ctx context.Context) {
 		slog.Warn("Trino usage collection skipped: list enabled orgs failed", "error", err)
 		return
 	}
-	orgByPrincipal := make(map[string]string, len(orgs))
-	for _, org := range orgs {
-		orgByPrincipal[org.TrinoPrincipal()] = org.OrgID
-	}
+	owners := configstore.NewTrinoPrincipalOwners(orgs)
 	queries, err := c.coordinator.Queries(ctx)
 	if err != nil {
 		slog.Warn("Trino usage collection skipped: list queries failed", "error", err)
@@ -95,13 +93,16 @@ func (c *trinoUsageCollector) collect(ctx context.Context) {
 		if _, ok := c.seen[query.QueryID]; ok {
 			continue
 		}
-		orgID := orgByPrincipal[query.Principal]
-		if orgID == "" {
+		owner, ok := owners[query.Principal]
+		if !ok {
 			continue // operator queries do not represent tenant usage
 		}
+		orgID := owner.OrgID
 		teamID := int64(0)
 		if c.teamID != nil {
-			teamID = c.teamID(orgID, query.Principal)
+			// The duckgres username, not the Trino principal: a project login's
+			// team is keyed on the login it authenticated as.
+			teamID = c.teamID(orgID, owner.Username)
 		}
 		props := trinoUsageProperties(query, teamID)
 		if query.State == "FINISHED" {

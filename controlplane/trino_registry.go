@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/posthog/duckgres/controlplane/admin"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -152,7 +153,11 @@ func parseTrinoCellRegistry(data []byte) ([]trinoRegisteredCell, error) {
 			return nil, errors.New("Trino cells must have distinct identities, namespaces and routing groups")
 		}
 		identities[cell.ID], namespaces[cell.Namespace], groups[cell.RoutingGroup] = true, true, true
-		if _, err := trinoEndpointKey(cell.ClientURL); err != nil {
+		clientURL, _, ok := admin.ResolveTrinoClientURL(cell.ClientURL, "org")
+		if !ok {
+			return nil, fmt.Errorf("Trino cell %s client URL: %s may only be the leading host label", cell.ID, admin.TrinoClientHostPlaceholder)
+		}
+		if _, err := trinoEndpointKey(clientURL); err != nil {
 			return nil, fmt.Errorf("Trino cell %s client URL: %w", cell.ID, err)
 		}
 		backendIDs, secrets := map[string]bool{}, map[string]bool{}

@@ -1589,7 +1589,15 @@ password/tenant/catalog changes never propagate.
   and the coordinator is reachable. `DUCKGRES_TRINO_CLIENT_URL` names the HTTPS
   endpoint clients should dial; when unset, the control plane falls back to its
   coordinator URL and TLS server name. The response contains host, port and the
-  tenant principal, never a password or password hash.
+  tenant principal, never a password or password hash. A client URL whose
+  leading host label is `{database_name}` (registry `client_url` or the env
+  var; `ResolveTrinoClientURL`) advertises each org's own
+  `<database_name>.<domain>` with username `root`: the Trino fork qualifies a
+  login with the org its host names
+  (`http-server.authentication.password.host-qualified-user.domains`), so a
+  user types the same username and host on both engines. Set it only once
+  that host actually reaches Trino — advertising an unrouted host is worse
+  than advertising the shared one.
 - **`Reconcile` order is load-bearing**: cluster secrets → auth files →
   resource groups → OPA bundle → tenant passwords → catalogs, and the
   `globalErr` gate SKIPS the catalog step if any projection failed. A
@@ -1633,6 +1641,13 @@ password/tenant/catalog changes never propagate.
   `opa.ManagedCatalogPattern`, and the regex literal inside `policy.rego`.
   `TestTrinoCatalogNameMatchesManagedNamePattern` +
   `TestPolicyRegoContainsManagedNamePattern` fail if any one moves alone.
+- **A Trino principal resolves to its org by EXACT lookup, never by splitting.**
+  `configstore.NewTrinoPrincipalOwners` indexes the principals the auth files
+  project (bare `<database_name>` → root, `<database_name>.<username>` → that
+  login). Usage metering (`trino_usage_collector.go`, which also passes the
+  duckgres username — not the principal — to the team resolver) and the admin
+  console both use it, so a per-user login's queries are its org's usage and a
+  principal outside the password file is never attributed to anyone.
 - **Every duckgres login authenticates to Trino, under `<database_name>.<username>`.**
   `ListTrinoEnabledOrgs` returns the org's logins in `Users`, and
   `BuildTrinoAuthFiles` writes one `password.db` line per login with the

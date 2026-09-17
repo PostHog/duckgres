@@ -111,7 +111,8 @@ func trinoTestRouter(api *TrinoAPI, role Role) *gin.Engine {
 func twoOrgTrinoStore() *fakeTrinoOrgStore {
 	return &fakeTrinoOrgStore{
 		orgs: []configstore.TrinoEnabledOrg{
-			{OrgID: "org-a", DatabaseName: "db_a", Tier: "free", CellID: "cell-test", State: configstore.ManagedWarehouseStateReady, RootPasswordHash: "$2a$10$secrethash"},
+			{OrgID: "org-a", DatabaseName: "db_a", Tier: "free", CellID: "cell-test", State: configstore.ManagedWarehouseStateReady, RootPasswordHash: "$2a$10$secrethash",
+				Users: []configstore.TrinoOrgUser{{Username: "analyst", PasswordHash: "$2a$10$analysthash"}}},
 			{OrgID: "org-b", DatabaseName: "db_b", Tier: "scale", CellID: "cell-test", State: configstore.ManagedWarehouseStatePending, RootPasswordHash: "$2a$10$othersecret"},
 		},
 	}
@@ -158,6 +159,10 @@ func TestQueriesAreAnnotatedWithTheOwningOrg(t *testing.T) {
 	coord := &fakeTrinoCoordinator{queries: []TrinoQuery{
 		{QueryID: "q1", State: "RUNNING", Principal: "db_a", ElapsedMS: 100},
 		{QueryID: "q2", State: "RUNNING", Principal: "db_b", ElapsedMS: 200},
+		// A per-user login authenticates as <database_name>.<username>.
+		{QueryID: "q4", State: "RUNNING", Principal: "db_a.analyst", ElapsedMS: 300},
+		// Not in the password file: the org prefix alone must not attribute it.
+		{QueryID: "q5", State: "RUNNING", Principal: "db_a.nobody", ElapsedMS: 400},
 		// A query from a principal that is not a tenant: the provisioner's
 		// own reconcile DDL. It must appear with an EMPTY org rather than
 		// be silently attributed to someone.
@@ -174,7 +179,7 @@ func TestQueriesAreAnnotatedWithTheOwningOrg(t *testing.T) {
 		q := raw.(map[string]any)
 		got[q["query_id"].(string)] = q["org"].(string)
 	}
-	want := map[string]string{"q1": "org-a", "q2": "org-b", "q3": ""}
+	want := map[string]string{"q1": "org-a", "q2": "org-b", "q3": "", "q4": "org-a", "q5": ""}
 	for id, wantOrg := range want {
 		if got[id] != wantOrg {
 			t.Errorf("query %s: org = %q, want %q", id, got[id], wantOrg)
@@ -593,6 +598,51 @@ func TestReadyOrgDetailReturnsTenantClientConnection(t *testing.T) {
 	}
 	if _, ok := connection["password"]; ok {
 		t.Error("the control plane must not return the tenant password")
+	}
+}
+
+// With a per-org client host, an org connects to Trino at the same
+// <database_name>.<domain> it uses for pgwire, as its own duckgres login:
+// Trino qualifies that login with the org the host names.
+func TestReadyOrgDetailAdvertisesPerOrgClientHost(t *testing.T) {
+	store := &fakeTrinoOrgStore{
+		orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-a", CellID: "cell-test", State: configstore.ManagedWarehouseStateReady}},
+		rows: map[string]*configstore.ManagedWarehouseTrino{
+			"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: "cell-test", State: configstore.ManagedWarehouseStateReady},
+		},
+	}
+	api := NewTrinoAPI(TrinoCell{ID: "cell-test", CoordinatorURL: "https://coordinator.invalid", ClientURL: "https://{database_name}.dw.example.com"}, &fakeTrinoCoordinator{}, store, nil)
+	r := trinoTestRouter(api, RoleViewer)
+
+	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/orgs/org-a/trino", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	connection := body["status"].(map[string]any)["connection"].(map[string]any)
+	if connection["host"] != "tenant-a.dw.example.com" || connection["port"] != float64(443) || connection["username"] != "root" {
+		t.Errorf("connection = %v, want tenant-a.dw.example.com:443 as root", connection)
+	}
+}
+
+func TestResolveTrinoClientURL(t *testing.T) {
+	for _, tc := range []struct {
+		template, database, want string
+		perOrg, ok               bool
+	}{
+		{"https://trino.example.com", "tenant-a", "https://trino.example.com", false, true},
+		{"https://{database_name}.dw.example.com", "tenant-a", "https://tenant-a.dw.example.com", true, true},
+		{"https://{database_name}.dw.example.com:8443", "tenant-a", "https://tenant-a.dw.example.com:8443", true, true},
+		// A grandfathered database_name that is no DNS label cannot be a host label.
+		{"https://{database_name}.dw.example.com", "db_a", "", true, false},
+		{"https://{database_name}.dw.example.com", "a.b", "", true, false},
+		{"https://gateway.{database_name}.example.com", "tenant-a", "", true, false},
+		{"https://{database_name}.{database_name}.example.com", "tenant-a", "", true, false},
+		{"http://{database_name}.dw.example.com", "tenant-a", "", true, false},
+	} {
+		got, perOrg, ok := ResolveTrinoClientURL(tc.template, tc.database)
+		if got != tc.want || perOrg != tc.perOrg || ok != tc.ok {
+			t.Errorf("ResolveTrinoClientURL(%q, %q) = (%q, %v, %v), want (%q, %v, %v)", tc.template, tc.database, got, perOrg, ok, tc.want, tc.perOrg, tc.ok)
+		}
 	}
 }
 

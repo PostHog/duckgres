@@ -103,14 +103,43 @@ type TrinoOrgStatus struct {
 	QueuedQueries  int `json:"queued_queries"`
 }
 
-func (c TrinoCell) connectionFor(username string) *TrinoConnection {
-	if username == "" {
+// TrinoClientHostPlaceholder, as the leading label of a cell's client URL,
+// stands for each org's database_name: `https://{database_name}.<domain>`
+// gives every org the same host name it uses for pgwire. Trino qualifies a
+// login with the org that host names, so the connection then advertises the
+// org's own duckgres username (root) rather than the bare org principal.
+const TrinoClientHostPlaceholder = "{database_name}"
+
+// ResolveTrinoClientURL substitutes databaseName into a client URL template.
+// A URL without the placeholder is returned unchanged with perOrgHost false.
+// ok is false when the placeholder is anywhere but the leading host label, or
+// databaseName is not a DNS label and so cannot be a host name label.
+func ResolveTrinoClientURL(template, databaseName string) (resolved string, perOrgHost bool, ok bool) {
+	if !strings.Contains(template, TrinoClientHostPlaceholder) {
+		return template, false, true
+	}
+	const prefix = "https://" + TrinoClientHostPlaceholder + "."
+	if !strings.HasPrefix(template, prefix) || strings.Count(template, TrinoClientHostPlaceholder) != 1 {
+		return "", true, false
+	}
+	if configstore.ValidateDatabaseName(databaseName) != nil {
+		return "", true, false
+	}
+	return strings.Replace(template, TrinoClientHostPlaceholder, databaseName, 1), true, true
+}
+
+func (c TrinoCell) connectionFor(principal string) *TrinoConnection {
+	if principal == "" {
 		return nil
 	}
 
 	clientURL := c.ClientURL
 	if clientURL == "" {
 		clientURL = c.CoordinatorURL
+	}
+	clientURL, perOrgHost, ok := ResolveTrinoClientURL(clientURL, principal)
+	if !ok {
+		return nil
 	}
 	parsedClientURL, err := url.Parse(clientURL)
 	if err != nil || parsedClientURL.Scheme != "https" || parsedClientURL.Hostname() == "" {
@@ -130,6 +159,10 @@ func (c TrinoCell) connectionFor(username string) *TrinoConnection {
 		host = c.TLSServerName
 	}
 
+	username := principal
+	if perOrgHost {
+		username = "root"
+	}
 	return &TrinoConnection{Host: host, Port: port, Username: username}
 }
 
@@ -277,7 +310,7 @@ func registerTrinoAPI(r *gin.RouterGroup, api *TrinoAPI) {
 // principalIndex maps Trino principals to org ids, and carries the org
 // rows the handlers annotate with.
 type principalIndex struct {
-	orgByPrincipal map[string]string
+	orgByPrincipal configstore.TrinoPrincipalOwners
 	rows           []configstore.TrinoEnabledOrg
 }
 
@@ -286,7 +319,7 @@ func (a *TrinoAPI) index() (principalIndex, error) {
 	if err != nil {
 		return principalIndex{}, err
 	}
-	idx := principalIndex{orgByPrincipal: make(map[string]string, len(rows)), rows: rows}
+	idx := principalIndex{rows: rows}
 	if a.filterCell {
 		idx.rows = nil
 		for _, row := range rows {
@@ -295,11 +328,7 @@ func (a *TrinoAPI) index() (principalIndex, error) {
 			}
 		}
 	}
-	for _, o := range idx.rows {
-		if p := o.TrinoPrincipal(); p != "" {
-			idx.orgByPrincipal[p] = o.OrgID
-		}
-	}
+	idx.orgByPrincipal = configstore.NewTrinoPrincipalOwners(idx.rows)
 	return idx, nil
 }
 
@@ -327,12 +356,12 @@ func (a *TrinoAPI) liveQueries(ctx context.Context, known ...principalIndex) ([]
 		// The coordinator answered; a config-store blip should degrade the
 		// org column, not the whole live view.
 		slog.Warn("admin: trino org index unavailable, serving unannotated queries", "error", idxErr)
-		return queries, principalIndex{orgByPrincipal: map[string]string{}}, nil
+		return queries, principalIndex{orgByPrincipal: configstore.TrinoPrincipalOwners{}}, nil
 	}
 	out := make([]TrinoQuery, len(queries))
 	copy(out, queries)
 	for i := range out {
-		out[i].Org = idx.orgByPrincipal[out[i].Principal]
+		out[i].Org = idx.orgByPrincipal.OrgID(out[i].Principal)
 	}
 	return out, idx, nil
 }
@@ -496,7 +525,7 @@ func (a *TrinoAPI) handleQueryDetail(c *gin.Context) {
 		return
 	}
 	if idx, idxErr := a.index(); idxErr == nil {
-		q.Org = idx.orgByPrincipal[q.Principal]
+		q.Org = idx.orgByPrincipal.OrgID(q.Principal)
 	}
 	c.JSON(http.StatusOK, q)
 }
@@ -530,7 +559,7 @@ func (a *TrinoAPI) handleKillQuery(c *gin.Context) {
 	targetOrg := ""
 	if q, err := a.client.Query(c.Request.Context(), queryID); err == nil {
 		if idx, idxErr := a.index(); idxErr == nil {
-			targetOrg = idx.orgByPrincipal[q.Principal]
+			targetOrg = idx.orgByPrincipal.OrgID(q.Principal)
 		}
 	}
 
