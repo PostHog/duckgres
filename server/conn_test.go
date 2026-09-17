@@ -4158,6 +4158,7 @@ func TestHandleCopyInCSVWithBlob(t *testing.T) {
 	blobColIndices := []int{2}
 
 	err = c.handleCopyInCSVWithBlob(
+		context.Background(),
 		"COPY test_blob_copy FROM STDIN WITH (FORMAT csv, HEADER true)",
 		opts, cols, colTypes, blobColIndices,
 	)
@@ -4238,6 +4239,7 @@ func TestHandleCopyInCSVWithBlob_NullValues(t *testing.T) {
 	}
 
 	err = c.handleCopyInCSVWithBlob(
+		context.Background(),
 		"COPY test_blob_null FROM STDIN",
 		opts, []string{"id", "data"},
 		[]ColumnTyper{

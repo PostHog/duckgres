@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/csv"
 	"errors"
@@ -291,11 +292,13 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	}
 
 	// For other COPY commands (e.g., COPY TO file), pass through to DuckDB
+	ctx, cleanup := c.queryContext()
+	defer cleanup()
 	workerStatement := workerStatementWithQuery(workerOriginClient, workerOperationCopyDirect, query)
 	queryStart := time.Now()
 	var workerRows int64
 	c.logWorkerStatementStarted(workerStatement)
-	result, err := c.executor.Exec(query)
+	result, err := c.executor.ExecContext(ctx, query)
 	var rowsAffected int64
 	if result != nil {
 		rowsAffected, _ = result.RowsAffected()
@@ -303,9 +306,15 @@ func (c *clientConn) handleCopy(query, upperQuery string) error {
 	workerRows = rowsAffected
 	c.logWorkerStatementFinished(workerStatement, queryStart, workerRows, err)
 	if err != nil {
-		c.sendError("ERROR", "42000", err.Error())
+		errCode := "42000"
+		errMsg := err.Error()
+		if c.isCallerCancellation(err) {
+			errCode = "57014"
+			errMsg = c.cancellationMessage(err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, errCode, errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -374,13 +383,25 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 	defer func() {
 		c.logWorkerStatementFinished(workerStatement, workerStart, workerRows, workerErr)
 	}()
-	rows, err := c.executor.Query(selectQuery)
+	// One statement context for the whole COPY TO: the driving SELECT is the
+	// statement, and the timeout bounds it end to end. The disconnect monitor
+	// is safe here — COPY TO STDOUT only writes, it never reads the wire.
+	ctx, cleanup := c.queryContext()
+	defer cleanup()
+	rows, err := c.executor.QueryContext(ctx, selectQuery)
 	if err != nil {
 		workerErr = err
-		c.logger().Error("COPY TO query failed.", "query", selectQuery, "error", err)
-		c.sendError("ERROR", "42000", err.Error())
+		errCode := "42000"
+		errMsg := err.Error()
+		if c.isCallerCancellation(err) {
+			errCode = "57014"
+			errMsg = c.cancellationMessage(err)
+		} else {
+			c.logger().Error("COPY TO query failed.", "query", selectQuery, "error", err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, 0, "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, 0, errCode, errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -478,9 +499,15 @@ func (c *clientConn) handleCopyOut(query, upperQuery string) error {
 
 	if err := rows.Err(); err != nil {
 		workerErr = err
-		c.sendError("ERROR", "42000", err.Error())
+		errCode := "42000"
+		errMsg := err.Error()
+		if c.isCallerCancellation(err) {
+			errCode = "57014"
+			errMsg = c.cancellationMessage(err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), errCode, errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -608,9 +635,15 @@ func (c *clientConn) handleCopyOutBinary(query string, rows RowSet, cols []strin
 		if workerErr != nil {
 			*workerErr = err
 		}
-		c.sendError("ERROR", "42000", err.Error())
+		errCode := "42000"
+		errMsg := err.Error()
+		if c.isCallerCancellation(err) {
+			errCode = "57014"
+			errMsg = c.cancellationMessage(err)
+		}
+		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
-		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), "42000", err.Error(), "simple")
+		c.logQuery(start, query, query, "COPY", 0, int64(rowCount), errCode, errMsg, "simple")
 		_ = c.writeReadyForQuery(c.txStatus)
 		_ = c.flushWriter()
 		return nil
@@ -663,6 +696,16 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	columnList := opts.ColumnList
 	c.logger().Debug("COPY FROM STDIN parsed.", "table", tableName, "column_list_specified", columnList != "", "binary", opts.IsBinary)
 
+	// One statement context for the whole COPY: schema probe, data receive,
+	// and the load itself. The timeout therefore bounds the statement end to
+	// end — including a load that wedges in the engine. NO disconnect monitor
+	// (queryContextForCursor): the loop below reads CopyData messages inline
+	// from c.reader, which would race the monitor's Peek. Cancellation still
+	// registers, so CancelRequest reaches the probe and the load; it cannot
+	// interrupt a blocked wire read, same as before.
+	ctx, cleanup := c.queryContextForCursor()
+	defer cleanup()
+
 	// Get column info. If a column list is specified, query only those columns
 	// in the specified order to match the binary data field order.
 	var colQuery string
@@ -679,9 +722,18 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	)
 	probeStart := time.Now()
 	c.logWorkerStatementStarted(probeStatement)
-	testRows, err := c.executor.Query(colQuery)
+	testRows, err := c.executor.QueryContext(ctx, colQuery)
 	if err != nil {
 		c.logWorkerStatementFinished(probeStatement, probeStart, 0, err)
+		if c.isCallerCancellation(err) {
+			errMsg := c.cancellationMessage(err)
+			c.sendError("ERROR", "57014", errMsg)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", errMsg, "simple")
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
+			return nil
+		}
 		c.logger().Error("COPY FROM table check failed.", "table", tableName, "error", err)
 		errMsg := fmt.Sprintf("relation \"%s\" does not exist", tableName)
 		c.sendError("ERROR", "42P01", errMsg)
@@ -725,11 +777,11 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 						SQLTemplate:                     copySQL,
 						PostgresBinaryDatabaseTypeNames: databaseTypeNames,
 					}
-					return c.handleCopyInRemoteStreaming(query, request, true, copyStartTime, streamer)
+					return c.handleCopyInRemoteStreaming(ctx, query, request, true, copyStartTime, streamer)
 				}
 			}
 		}
-		return c.handleCopyInBinary(query, opts, cols, colTypes)
+		return c.handleCopyInBinary(ctx, query, opts, cols, colTypes)
 	}
 
 	// Check for BLOB columns. DuckDB's CSV parser cannot handle raw binary data
@@ -743,7 +795,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	}
 	if len(blobColIndices) > 0 {
 		c.logger().Debug("COPY FROM STDIN: table has BLOB columns, using CSV parse fallback.", "blob_columns", len(blobColIndices))
-		return c.handleCopyInCSVWithBlob(query, opts, cols, colTypes, blobColIndices)
+		return c.handleCopyInCSVWithBlob(ctx, query, opts, cols, colTypes, blobColIndices)
 	}
 
 	// Send CopyInResponse
@@ -760,7 +812,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 	// backend), so prefer the streaming path when it's available.
 	if streamer, ok := c.executor.(sqlcore.CopyFromStdinExecutor); ok {
 		copySQL := BuildDuckDBCopyFromSQL(tableName, columnList, flightclient.CopyFromStdinPathPlaceholder, opts)
-		return c.handleCopyInRemoteStreaming(query, sqlcore.CopyFromStdinRequest{SQLTemplate: copySQL}, false, copyStartTime, streamer)
+		return c.handleCopyInRemoteStreaming(ctx, query, sqlcore.CopyFromStdinRequest{SQLTemplate: copySQL}, false, copyStartTime, streamer)
 	}
 
 	// Create temp file upfront and stream data directly to it (avoids memory buffering).
@@ -839,13 +891,22 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 				"column_list_specified", columnList != "",
 			)
 			c.logWorkerStatementStarted(workerStatement)
-			result, err := c.executor.Exec(copySQL)
+			result, err := c.executor.ExecContext(ctx, copySQL)
 			var copyRowsAffected int64
 			if result != nil {
 				copyRowsAffected, _ = result.RowsAffected()
 			}
 			c.logWorkerStatementFinished(workerStatement, loadStart, copyRowsAffected, err)
 			if err != nil {
+				if c.isCallerCancellation(err) {
+					errMsg := c.cancellationMessage(err)
+					c.sendError("ERROR", "57014", errMsg)
+					c.setTxError()
+					c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "57014", errMsg, "simple")
+					_ = c.writeReadyForQuery(c.txStatus)
+					_ = c.flushWriter()
+					return nil
+				}
 				c.logger().Error("COPY FROM STDIN DuckDB COPY failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
@@ -899,6 +960,7 @@ func (c *clientConn) handleCopyIn(query, upperQuery string) error {
 // CopyFromStdin method, which ships them to the worker via Flight DoPut
 // and runs the COPY against a worker-local spool file.
 func (c *clientConn) handleCopyInRemoteStreaming(
+	ctx context.Context,
 	query string,
 	request sqlcore.CopyFromStdinRequest,
 	binary bool,
@@ -916,7 +978,7 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 		"binary", binary,
 	)
 	c.logWorkerStatementStarted(workerStatement)
-	rowCount, err := streamer.CopyFromStdin(c.ctx, request, r)
+	rowCount, err := streamer.CopyFromStdin(ctx, request, r)
 	c.logWorkerStatementFinished(workerStatement, loadStart, rowCount, err)
 
 	// On wire-level CopyFail / unexpected message, the reader returns a
@@ -942,6 +1004,15 @@ func (c *clientConn) handleCopyInRemoteStreaming(
 		return nil
 	}
 	if err != nil {
+		if c.isCallerCancellation(err) {
+			errMsg := c.cancellationMessage(err)
+			c.sendError("ERROR", "57014", errMsg)
+			c.setTxError()
+			c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", errMsg, "simple")
+			_ = c.writeReadyForQuery(c.txStatus)
+			_ = c.flushWriter()
+			return nil
+		}
 		c.logger().Error("COPY FROM STDIN remote streaming failed.", "error", err)
 		errMsg := fmt.Sprintf("COPY failed: %v", err)
 		c.sendError("ERROR", "22P02", errMsg)
@@ -1057,7 +1128,7 @@ func (r *copyDataWireReader) Read(p []byte) (int, error) {
 // DuckDB's native CSV COPY cannot handle raw binary data in BLOB columns because it
 // auto-detects the type and fails to parse the bytes. This method parses the CSV in Go,
 // converts BLOB column values to []byte, and uses batched INSERT statements.
-func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper, blobColIndices []int) error {
+func (c *clientConn) handleCopyInCSVWithBlob(ctx context.Context, query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper, blobColIndices []int) error {
 	copyStartTime := time.Now()
 
 	// Build a set for O(1) BLOB column index lookup
@@ -1145,8 +1216,17 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 			}
 
 			loadStart := time.Now()
-			rowCount, err := c.batchInsertRows(opts.TableName, opts.ColumnList, cols, rows)
+			rowCount, err := c.batchInsertRows(ctx, opts.TableName, opts.ColumnList, cols, rows)
 			if err != nil {
+				if c.isCallerCancellation(err) {
+					errMsg := c.cancellationMessage(err)
+					c.sendError("ERROR", "57014", errMsg)
+					c.setTxError()
+					c.logQuery(copyStartTime, query, query, "COPY", 0, int64(rowCount), "57014", errMsg, "simple")
+					_ = c.writeReadyForQuery(c.txStatus)
+					_ = c.flushWriter()
+					return nil
+				}
 				c.logger().Error("COPY FROM STDIN (BLOB fallback) INSERT failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
@@ -1191,7 +1271,7 @@ func (c *clientConn) handleCopyInCSVWithBlob(query string, opts *CopyFromOptions
 
 // handleCopyInBinary handles COPY ... FROM STDIN with binary format.
 // It parses the PostgreSQL binary COPY format, decodes each field, and INSERTs rows.
-func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper) error {
+func (c *clientConn) handleCopyInBinary(ctx context.Context, query string, opts *CopyFromOptions, cols []string, colTypes []ColumnTyper) error {
 	copyStartTime := time.Now()
 
 	// Get type OIDs for decoding
@@ -1224,8 +1304,17 @@ func (c *clientConn) handleCopyInBinary(query string, opts *CopyFromOptions, col
 		case wire.MsgCopyDone:
 			// Parse binary data and insert rows
 			data := buf.Bytes()
-			rowCount, err := c.parseBinaryCopyAndInsert(data, opts.TableName, opts.ColumnList, cols, typeOIDs)
+			rowCount, err := c.parseBinaryCopyAndInsert(ctx, data, opts.TableName, opts.ColumnList, cols, typeOIDs)
 			if err != nil {
+				if c.isCallerCancellation(err) {
+					errMsg := c.cancellationMessage(err)
+					c.sendError("ERROR", "57014", errMsg)
+					c.setTxError()
+					c.logQuery(copyStartTime, query, query, "COPY", 0, 0, "57014", errMsg, "simple")
+					_ = c.writeReadyForQuery(c.txStatus)
+					_ = c.flushWriter()
+					return nil
+				}
 				c.logger().Error("COPY FROM STDIN binary: parse/insert failed.", "error", err)
 				errMsg := fmt.Sprintf("COPY failed: %v", err)
 				c.sendError("ERROR", "22P02", errMsg)
@@ -1292,7 +1381,7 @@ func splitQualifiedName(name string) []string {
 // Only works for full-column inserts (no column subset).
 // batchInsertRows inserts rows using batched multi-row INSERT statements.
 // Used as fallback when Appender can't be used (column subsets, unsupported types).
-func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string, rows [][]interface{}) (int, error) {
+func (c *clientConn) batchInsertRows(ctx context.Context, tableName, columnList string, cols []string, rows [][]interface{}) (int, error) {
 	const batchSize = 1000
 	numCols := len(cols)
 
@@ -1343,7 +1432,7 @@ func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string
 		)
 		batchStart := time.Now()
 		c.logWorkerStatementStarted(workerStatement)
-		result, err := c.executor.Exec(insertSQL, args...)
+		result, err := c.executor.ExecContext(ctx, insertSQL, args...)
 		var rowsAff int64
 		if result != nil {
 			rowsAff, _ = result.RowsAffected()
@@ -1361,7 +1450,7 @@ func (c *clientConn) batchInsertRows(tableName, columnList string, cols []string
 // parseBinaryCopyAndInsert parses PostgreSQL binary COPY format data and inserts rows.
 // Uses the DuckDB Appender API for full-column inserts (fast path), falling back to
 // batched multi-row INSERT for column subsets or unsupported types.
-func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList string, cols []string, typeOIDs []int32) (int, error) {
+func (c *clientConn) parseBinaryCopyAndInsert(ctx context.Context, data []byte, tableName, columnList string, cols []string, typeOIDs []int32) (int, error) {
 	offset := 0
 
 	// Validate and skip header (19+ bytes)
@@ -1444,7 +1533,7 @@ func (c *clientConn) parseBinaryCopyAndInsert(data []byte, tableName, columnList
 	}
 
 	// Fallback: batched multi-row INSERT
-	return c.batchInsertRows(tableName, columnList, cols, rows)
+	return c.batchInsertRows(ctx, tableName, columnList, cols, rows)
 }
 
 // decodeBinaryCopy decodes a binary COPY field, using field length to resolve type ambiguity.

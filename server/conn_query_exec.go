@@ -70,6 +70,7 @@ func (c *clientConn) executeQueryDirect(query, cmdType string) error {
 			errCode := classifyErrorCode(err)
 			errMsg := err.Error()
 			if c.isCallerCancellation(err) {
+				errCode = "57014"
 				errMsg = c.cancellationMessage(err)
 			} else {
 				c.logQueryError(query, err)
@@ -246,6 +247,7 @@ func (c *clientConn) executeSelectQuery(query string, cmdType string, workerStat
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
+			errCode = "57014"
 			errMsg = c.cancellationMessage(err)
 		} else {
 			c.logQueryError(query, err)
@@ -865,6 +867,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
+					errCode = "57014"
 					errMsg = c.cancellationMessage(err)
 				} else {
 					c.logQueryError(executedQuery, err)
@@ -917,6 +920,7 @@ func (c *clientConn) executeSingleStatement(query string) (errSent bool, fatalEr
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
+			errCode = "57014"
 			errMsg = c.cancellationMessage(err)
 		} else {
 			c.logQueryError(executedQuery, err)
@@ -1013,6 +1017,14 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		cleanup = cleanup[:len(cleanup)-1] // Strip COMMIT from cleanup
 	}
 
+	// The rewrite's steps ARE the statement, so they share one statement
+	// context carrying the --statement-timeout deadline and the CancelRequest
+	// registration — a wedged writable-CTE rewrite is exactly the shape this
+	// knob exists for. (Cleanup statements stay context-less: like ROLLBACK,
+	// they must still run after the deadline has fired.)
+	ctx, stmtCleanup := c.queryContext()
+	defer stmtCleanup()
+
 	// Execute setup statements (all but last). Rewrite-generated SQL is omitted
 	// from telemetry; stable operation and position metadata identify each step.
 	for i := 0; i < len(statements)-1; i++ {
@@ -1026,7 +1038,7 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 		c.logger().Debug("Multi-stmt setup.", "step", i+1, "total", len(statements)-1)
 		setupStart := time.Now()
 		c.logWorkerStatementStarted(workerStatement)
-		result, err := c.executor.Exec(stmt)
+		result, err := c.executor.ExecContext(ctx, stmt)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
@@ -1037,7 +1049,11 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			if c.isCallerCancellation(err) {
+				c.sendError("ERROR", "57014", c.cancellationMessage(err))
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
@@ -1061,13 +1077,17 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		rows, err := c.executor.Query(finalStmt)
+		rows, err := c.executor.QueryContext(ctx, finalStmt)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt final query error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			if c.isCallerCancellation(err) {
+				c.sendError("ERROR", "57014", c.cancellationMessage(err))
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
@@ -1091,13 +1111,17 @@ func (c *clientConn) executeMultiStatement(statements []string, cleanup []string
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
-		result, err := c.executor.Exec(finalStmt)
+		result, err := c.executor.ExecContext(ctx, finalStmt)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt final exec error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			if c.isCallerCancellation(err) {
+				c.sendError("ERROR", "57014", c.cancellationMessage(err))
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
 			_ = c.writeReadyForQuery(c.txStatus)
 			_ = c.flushWriter()
 			return nil
@@ -1146,7 +1170,9 @@ func (c *clientConn) executeCleanup(cleanup []string) {
 // executeMultiStatementExtended handles execution of multi-statement query rewrites
 // for the extended query protocol (Parse/Bind/Execute).
 // Unlike executeMultiStatement, this does NOT send ReadyForQuery (that's done by Sync).
-func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup []string, args []interface{}, resultFormats []int16, described bool) {
+// stmtCtx is the Execute's statement context (timeout deadline + cancel
+// registration); the rewrite's steps are the statement, so they share it.
+func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup []string, args []interface{}, resultFormats []int16, described bool, stmtCtx context.Context) {
 	if len(statements) == 0 {
 		_ = wire.WriteEmptyQueryResponse(c.writer)
 		return
@@ -1177,7 +1203,7 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 		c.logger().Debug("Multi-stmt-ext setup.", "step", i+1, "total", len(statements)-1)
 		setupStart := time.Now()
 		c.logWorkerStatementStarted(workerStatement)
-		result, err := c.executor.Exec(stmt, args...)
+		result, err := c.executor.ExecContext(stmtCtx, stmt, args...)
 		var setupRows int64
 		if result != nil {
 			setupRows, _ = result.RowsAffected()
@@ -1188,7 +1214,11 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 			c.setTxError()
 			// On error, still try to cleanup (best effort)
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			if c.isCallerCancellation(err) {
+				c.sendError("ERROR", "57014", c.cancellationMessage(err))
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
 			return
 		}
 	}
@@ -1210,13 +1240,17 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	if queryReturnsResults(finalStmt) {
 		// Result-returning query: obtain cursor FIRST, cleanup SECOND, stream THIRD
-		rows, err := c.executor.Query(finalStmt, args...)
+		rows, err := c.executor.QueryContext(stmtCtx, finalStmt, args...)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt-ext final query error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			if c.isCallerCancellation(err) {
+				c.sendError("ERROR", "57014", c.cancellationMessage(err))
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
 			return
 		}
 		defer func() { _ = rows.Close() }()
@@ -1232,13 +1266,17 @@ func (c *clientConn) executeMultiStatementExtended(statements []string, cleanup 
 
 	} else {
 		// Non-result query (DML without RETURNING, DDL, etc.): execute then cleanup
-		result, err := c.executor.Exec(finalStmt, args...)
+		result, err := c.executor.ExecContext(stmtCtx, finalStmt, args...)
 		if err != nil {
 			finalErr = err
 			c.logger().Error("Multi-stmt-ext final exec error.", "error_code", classifyErrorCode(err))
 			c.setTxError()
 			c.executeCleanup(cleanup)
-			c.sendError("ERROR", "42000", err.Error())
+			if c.isCallerCancellation(err) {
+				c.sendError("ERROR", "57014", c.cancellationMessage(err))
+			} else {
+				c.sendError("ERROR", "42000", err.Error())
+			}
 			return
 		}
 		if result != nil {
