@@ -911,7 +911,9 @@ It then exercises the actual Gateway operation and control-plane admission APIs:
 3. Require the prepared certificate to match the target's actual process and
    admitted roster, then query existing DuckLake data on green.
 4. Cut over and release admission. The new warehouse becomes Ready only on green;
-   the still-running blue coordinator does not gain its catalog.
+   the still-running blue coordinator does not gain its catalog. Require its
+   persisted connector name to be `ducklake`, without SQL identifier quotes,
+   and read its `main` schema through Gateway using the new tenant's credentials.
 5. Drain and seal blue, require actual pod absence, and complete the operation.
 
 Before and after cutover, warehouse DuckLake queries pass through the real
