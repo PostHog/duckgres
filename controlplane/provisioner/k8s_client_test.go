@@ -450,3 +450,22 @@ func TestSetCompactionEnabledPinsDuckLakeEnablement(t *testing.T) {
 		}
 	})
 }
+
+func TestTrinoHoglakeStorageStatusDoesNotReadMetadataSecrets(t *testing.T) {
+	cr := ducklingWithCredentialRef("warehouse-a", SecretReference{Name: "unavailable-password", Namespace: "example", Key: "password"})
+	status := cr.Object["status"].(map[string]interface{})
+	status["iamRoleArn"] = "arn:aws:iam::123456789012:role/example-tenant"
+	client := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), cr)
+	actual, err := NewDucklingClientWithDynamic(client).GetStorageStatus(context.Background(), "warehouse-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual.MetadataStore.Password != "" {
+		t.Fatal("storage resolver exposed metadata credentials")
+	}
+	for _, action := range client.Actions() {
+		if action.GetResource().Resource == "secrets" {
+			t.Fatal("storage resolver read metadata secrets")
+		}
+	}
+}

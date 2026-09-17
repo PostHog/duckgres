@@ -29,6 +29,24 @@ describe("Org Trino configuration", () => {
     hooks.useSetTrinoEnabled.mockReturnValue({ mutateAsync: enable, isPending: false });
   });
 
+  it("selects Hoglake before first enablement and keeps the existing warehouse separate", async () => {
+    hooks.useOrgTrino.mockReturnValue(ok({ enabled: false, assigned: true, backend: "ducklake", backend_selected: false, cell: { id: "test-cell" } }));
+    renderSettings();
+    fireEvent.change(screen.getByLabelText("Trino backend"), { target: { value: "hoglake" } });
+    expect(screen.getByText(/does not migrate/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enable Trino" }));
+    await waitFor(() => expect(enable).toHaveBeenCalledWith({ org: "org-a", enabled: true, tier: "premium", backend: "hoglake" }));
+  });
+
+  it("preserves Hoglake when re-enabling and cannot change its backend", async () => {
+    hooks.useOrgTrino.mockReturnValue(ok({ enabled: false, assigned: true, backend: "hoglake", backend_selected: true, cell: { id: "test-cell" } }));
+    renderSettings();
+    expect(screen.getByLabelText("Trino backend")).toBeDisabled();
+    expect(screen.getByLabelText("Trino backend")).toHaveValue("hoglake");
+    fireEvent.click(screen.getByRole("button", { name: "Enable Trino" }));
+    await waitFor(() => expect(enable).toHaveBeenCalledWith({ org: "org-a", enabled: true, tier: "premium" }));
+  });
+
   it("requires an explicit saved selection before enabling and never enables on selection", async () => {
     renderSettings();
     expect(screen.getByRole("button", { name: "Enable Trino" })).toBeDisabled();

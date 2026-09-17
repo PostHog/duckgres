@@ -435,6 +435,12 @@ type ManagedWarehouseTrino struct {
 	// migration.
 	Enabled bool `gorm:"not null;default:false" json:"enabled"`
 
+	// BackendSelected remains true across disable/re-enable. New cell-only
+	// rows explicitly insert false; the database default pins old binaries
+	// that do not supply this field to DuckLake during rolling upgrades.
+	Backend         TrinoBackend `gorm:"not null;default:ducklake" json:"backend"`
+	BackendSelected bool         `gorm:"not null" json:"backend_selected"`
+
 	// Tier picks the resource-group limits applied to the org. Empty string
 	// is treated as the default tier by the resource-groups generator.
 	// Kept as a free-form string for now; refining into an enum is
@@ -516,6 +522,7 @@ func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_wareh
 // rows are still returned and can be claimed — a WHERE trino_cell_id = ?
 // would make a freshly enabled org invisible to every cell forever.
 type TrinoEnabledOrg struct {
+	Backend          TrinoBackend
 	OrgID            string
 	DatabaseName     string
 	Tier             string

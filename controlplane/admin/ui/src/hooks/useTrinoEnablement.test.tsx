@@ -21,7 +21,7 @@ describe("Trino enablement mutation", () => {
     const wrapper = ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>;
     const { result } = renderHook(() => useSetTrinoEnabled(), { wrapper });
     await act(async () => { await result.current.mutateAsync({ org: "org-a", enabled, tier: "premium" }); });
-    if (enabled) expect(api.enableTrino).toHaveBeenCalledWith("org-a", "premium");
+    if (enabled) expect(api.enableTrino).toHaveBeenCalledWith("org-a", "premium", undefined);
     else expect(api.disableTrino).toHaveBeenCalledWith("org-a");
     expect(invalidate.mock.calls).toEqual([[{ queryKey: ["trino"] }]]);
   });

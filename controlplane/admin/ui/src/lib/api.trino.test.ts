@@ -17,4 +17,13 @@ describe("Trino enablement API", () => {
       method: "DELETE", headers: { Accept: "application/json" },
     }));
   });
+  it("sends explicit backend selection without changing the separate disable route", async () => {
+    const fetch = vi.fn().mockImplementation(async () => new Response('{"status":"queued"}', { status: 202 }));
+    vi.stubGlobal("fetch", fetch);
+    await api.enableTrino("tenant", "", "hoglake");
+    expect(fetch).toHaveBeenCalledWith("/api/v1/orgs/tenant/trino", expect.objectContaining({
+      method: "POST", body: '{"enabled":true,"tier":"","backend":"hoglake"}',
+    }));
+  });
+
 });

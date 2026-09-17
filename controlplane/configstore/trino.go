@@ -20,6 +20,8 @@ import (
 type TrinoSettings struct {
 	// Tier is the resource-group tier label. Empty == default tier.
 	Tier string
+	// Backend is selected on first enablement; empty preserves an existing selection.
+	Backend TrinoBackend
 }
 
 // EnableTrino marks the org as Trino-enabled and stores the per-org Trino
@@ -35,23 +37,62 @@ func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
 	if orgID == "" {
 		return errors.New("EnableTrino: orgID is required")
 	}
-	row := ManagedWarehouseTrino{
-		OrgID:   orgID,
-		Enabled: true,
-		Tier:    settings.Tier,
-		State:   ManagedWarehouseStatePending,
+	return EnableTrinoInTransaction(cs.db, orgID, settings)
+}
+
+// TrinoBackend identifies the metadata service behind an org's Trino catalog.
+type TrinoBackend string
+
+const (
+	TrinoBackendDuckLake TrinoBackend = "ducklake"
+	TrinoBackendHoglake  TrinoBackend = "hoglake"
+)
+
+// EffectiveTrinoBackend retains the DuckLake default for legacy callers.
+func EffectiveTrinoBackend(backend TrinoBackend) TrinoBackend {
+	if backend == "" {
+		return TrinoBackendDuckLake
 	}
-	// On conflict update Enabled+Tier+UpdatedAt only. Do NOT touch
-	// State / StatusMessage / ReadyAt / FailedAt / TrinoCellID — those are
-	// owned by the reconcile loop. A re-enable on an already-Ready row stays
-	// Ready; the reconcile loop's next tick will refresh status.
-	if err := cs.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "org_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
-	}).Create(&row).Error; err != nil {
-		return fmt.Errorf("enable trino for %q: %w", orgID, err)
+	return backend
+}
+
+func (backend TrinoBackend) Valid() bool {
+	return backend == TrinoBackendDuckLake || backend == TrinoBackendHoglake
+}
+
+var ErrTrinoBackendSelectionConflict = errors.New("trino backend cannot change after initial enablement")
+
+// EnableTrinoInTransaction also supports atomic warehouse provisioning. The
+// insert serializes concurrent first enables; the row lock protects selection
+// and preserves the winner across disable/re-enable and omitted-field clients.
+// Re-enabling preserves reconciliation state and cell ownership; only the tier,
+// enabled flag and initial backend selection belong to this operation.
+func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings) error {
+	if orgID == "" {
+		return errors.New("EnableTrino: orgID is required")
 	}
-	return nil
+	if settings.Backend != "" && !settings.Backend.Valid() {
+		return errors.New("invalid Trino backend")
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		row := ManagedWarehouseTrino{OrgID: orgID, State: ManagedWarehouseStatePending}
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
+			return err
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "org_id = ?", orgID).Error; err != nil {
+			return err
+		}
+		backend := EffectiveTrinoBackend(row.Backend)
+		if settings.Backend != "" {
+			if row.BackendSelected && backend != settings.Backend {
+				return ErrTrinoBackendSelectionConflict
+			}
+			backend = settings.Backend
+		}
+		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ?", orgID).Updates(map[string]any{
+			"enabled": true, "tier": settings.Tier, "backend": backend, "backend_selected": true, "updated_at": time.Now().UTC(),
+		}).Error
+	})
 }
 
 // TrinoStateUpdate is the small set of columns the reconcile loop
@@ -265,6 +306,7 @@ func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 		Select(`t.org_id AS org_id,
 		         o.database_name AS database_name,
 		         t.tier AS tier,
+		         t.backend AS backend,
 		         COALESCE(t.trino_cell_id, '') AS cell_id,
 		         u.password AS root_password_hash,
 		         t.state AS state`).

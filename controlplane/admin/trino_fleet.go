@@ -78,9 +78,10 @@ func (a *TrinoAPI) handleFleetOrg(c *gin.Context) {
 	}
 	selected := a.fleet["legacy"]
 	if selected == nil && (row == nil || row.TrinoCellID == "") {
-		response := gin.H{"cell": TrinoCell{}, "enabled": row != nil && row.Enabled, "assigned": false, "available": false}
+		backend, selectedBackend := trinoBackendDetail(row)
+		response := gin.H{"backend": backend, "backend_selected": selectedBackend, "cell": TrinoCell{}, "enabled": row != nil && row.Enabled, "assigned": false, "available": false}
 		if row != nil && row.Enabled {
-			response["status"] = TrinoOrgStatus{Org: c.Param("id"), Tier: row.Tier, State: string(configstore.ManagedWarehouseStatePending), StatusMessage: "No Trino cell is assigned. Disable Trino, select an initial cell, then enable it again."}
+			response["status"] = TrinoOrgStatus{Backend: backend, Org: c.Param("id"), Tier: row.Tier, State: string(configstore.ManagedWarehouseStatePending), StatusMessage: "No Trino cell is assigned. Disable Trino, select an initial cell, then enable it again."}
 		}
 		c.JSON(http.StatusOK, response)
 		return

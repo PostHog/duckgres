@@ -165,8 +165,26 @@ func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease confi
 	expected := make(map[string][]byte)
 	for _, org := range orgs {
 		name := TrinoCatalogName(org.TrinoPrincipal())
-		if org.TrinoPrincipal() == "" || states[name] != "OPERATIONAL" || !tenants.projected[org.OrgID] || len(tenants.data[org.OrgID]) == 0 {
+		if org.TrinoPrincipal() == "" || states[name] != "OPERATIONAL" || !tenants.projected[org.OrgID] || (!isManagedHoglake(org) && len(tenants.data[org.OrgID]) == 0) {
 			return errors.New("managed target is missing an admitted catalog or credential")
+		}
+		if isManagedHoglake(org) {
+			if err := verifyHoglakeConnector(ctx, backend.Catalog, name); err != nil {
+				return err
+			}
+			if p.managedHoglake == nil {
+				return errors.New("managed Hoglake is not configured")
+			}
+			warehouse, err := p.warehouses.GetManagedWarehouseForTrino(org.OrgID)
+			if err != nil {
+				return err
+			}
+			if warehouse == nil {
+				return errors.New("managed Hoglake warehouse identity unavailable")
+			}
+			if err := p.managedHoglake.ensure(ctx, org.OrgID, warehouse.DucklingName); err != nil {
+				return err
+			}
 		}
 		roster = append(roster, org.OrgID+"\x00"+org.TrinoPrincipal()+"\x00"+name)
 		expected[org.OrgID] = tenants.data[org.OrgID]

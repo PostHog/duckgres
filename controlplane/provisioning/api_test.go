@@ -298,7 +298,8 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 			OrgID:   req.OrgID,
 			Enabled: true,
 			Tier:    req.Trino.Tier,
-			State:   configstore.ManagedWarehouseStatePending,
+			Backend: configstore.EffectiveTrinoBackend(req.Trino.Backend), BackendSelected: true,
+			State: configstore.ManagedWarehouseStatePending,
 		}
 	}
 
@@ -309,10 +310,19 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 }
 
 func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
+	backend := configstore.EffectiveTrinoBackend(settings.Backend)
+	if row := s.trino[orgID]; row != nil && row.BackendSelected {
+		if settings.Backend != "" && settings.Backend != row.Backend {
+			return configstore.ErrTrinoBackendSelectionConflict
+		}
+		backend = row.Backend
+	}
 	s.trino[orgID] = &configstore.ManagedWarehouseTrino{
-		OrgID:   orgID,
-		Enabled: true,
-		Tier:    settings.Tier,
+		OrgID:           orgID,
+		Enabled:         true,
+		Tier:            settings.Tier,
+		Backend:         backend,
+		BackendSelected: true,
 	}
 	return nil
 }
@@ -2033,5 +2043,96 @@ func TestProvisionInvalidSchemaNameRejected(t *testing.T) {
 	rec := doJSON(t, router, http.MethodPost, "/api/v1/orgs/neworg/provision", body)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestEnableTrinoBackendValidation(t *testing.T) {
+	for _, tc := range []struct {
+		backend string
+		status  int
+	}{{"hoglake", http.StatusAccepted}, {"unknown", http.StatusBadRequest}} {
+		t.Run(tc.backend, func(t *testing.T) {
+			store := newFakeStore()
+			store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
+			store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] = "hash"
+			router := newBackendTestRouter(store)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/trino", strings.NewReader(`{"enabled":true,"backend":"`+tc.backend+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			if tc.status == http.StatusAccepted && store.trino["tenant"].Backend != configstore.TrinoBackendHoglake {
+				t.Fatal("backend was not forwarded")
+			}
+		})
+	}
+}
+
+func TestEnableTrinoBackendConflictIs409(t *testing.T) {
+	store := newFakeStore()
+	store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
+	store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] = "hash"
+	store.trino["tenant"] = &configstore.ManagedWarehouseTrino{OrgID: "tenant", Backend: configstore.TrinoBackendDuckLake, BackendSelected: true}
+	router := newBackendTestRouter(store)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/trino", strings.NewReader(`{"enabled":true,"backend":"hoglake"}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if store.trino["tenant"].Enabled {
+		t.Fatal("conflicting request enabled Trino")
+	}
+}
+
+func newBackendTestRouter(store Store) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	tenantStore, _ := store.(TenantStore)
+	RegisterAPIWithTrinoAdmission(router.Group("/api/v1"), store, tenantStore, "", nil, "", nil, WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }))
+	return router
+}
+
+func TestTrinoHoglakeUnavailableDoesNotWrite(t *testing.T) {
+	for _, endpoint := range []string{"trino", "provision"} {
+		t.Run(endpoint, func(t *testing.T) {
+			store := newFakeStore()
+			store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
+			store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] = "hash"
+			body := `{"enabled":true,"backend":"hoglake"}`
+			if endpoint == "provision" {
+				body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true,"backend":"hoglake"}}`
+			}
+			router := newTestRouter(store)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/"+endpoint, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if len(store.trino) != 0 || len(store.warehouses) != 0 || store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] != "hash" {
+				t.Fatal("unavailable backend changed resources")
+			}
+		})
+	}
+}
+
+func TestProvisionTrinoHoglakeForwardsBackend(t *testing.T) {
+	store := newFakeStore()
+	router := newBackendTestRouter(store)
+	body := `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true,"backend":"hoglake"}}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/provision", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if row := store.trino["tenant"]; row == nil || row.Backend != configstore.TrinoBackendHoglake || !row.BackendSelected {
+		t.Fatalf("backend not forwarded: %+v", row)
 	}
 }

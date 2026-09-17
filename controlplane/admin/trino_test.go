@@ -516,7 +516,8 @@ func TestOrgDetailSurfacesTheReconcileOutcome(t *testing.T) {
 			TrinoCellID:   "cell-test",
 			State:         configstore.ManagedWarehouseStateFailed,
 			StatusMessage: "catalog reconcile failed: duckling has published no credential",
-			FailedAt:      &failedAt,
+			Backend:       configstore.TrinoBackendHoglake, BackendSelected: true,
+			FailedAt: &failedAt,
 		},
 	}
 	coord := &fakeTrinoCoordinator{queries: []TrinoQuery{
@@ -536,6 +537,9 @@ func TestOrgDetailSurfacesTheReconcileOutcome(t *testing.T) {
 	st := body["status"].(map[string]any)
 	if st["trino_catalog_name"] != "org_db_b" {
 		t.Errorf("trino_catalog_name = %v, want org_db_b", st["trino_catalog_name"])
+	}
+	if st["backend"] != "hoglake" || body["backend"] != "hoglake" || body["backend_selected"] != true {
+		t.Fatalf("missing backend detail: %+v", body)
 	}
 	if st["state"] != "failed" {
 		t.Errorf("state = %v, want failed", st["state"])
@@ -855,5 +859,15 @@ func TestNodesRouteReportsItsSource(t *testing.T) {
 	}
 	if got := body["nodes"].([]any); len(got) != 1 {
 		t.Errorf("nodes = %v, want 1 entry", got)
+	}
+}
+
+func TestTrinoOrgDetailPreservesBackendWhileDisabled(t *testing.T) {
+	store := twoOrgTrinoStore()
+	store.rows = map[string]*configstore.ManagedWarehouseTrino{"org-b": {OrgID: "org-b", Backend: configstore.TrinoBackendHoglake, BackendSelected: true, TrinoCellID: "cell-test"}}
+	router := trinoTestRouter(testTrinoAPI(t, &fakeTrinoCoordinator{}, store), RoleViewer)
+	code, body := doTrinoJSON(t, router, http.MethodGet, "/api/v1/orgs/org-b/trino", "")
+	if code != http.StatusOK || body["backend"] != "hoglake" || body["backend_selected"] != true || body["enabled"] != false {
+		t.Fatalf("lost backend ownership: %d %+v", code, body)
 	}
 }

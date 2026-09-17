@@ -81,7 +81,8 @@ type TrinoConnection struct {
 // now, surfaced nowhere: a Trino provisioning failure was silent unless
 // somebody read the table by hand.
 type TrinoOrgStatus struct {
-	Org string `json:"org"`
+	Backend configstore.TrinoBackend `json:"backend"`
+	Org     string                   `json:"org"`
 	// Principal is the org's Trino username (its database_name), and the
 	// stem its catalog and groups are derived from.
 	Principal        string `json:"principal"`
@@ -670,10 +671,11 @@ func (a *TrinoAPI) handleOrgDetail(c *gin.Context) {
 }
 
 func (a *TrinoAPI) writeOrgDetail(c *gin.Context, orgID string, row *configstore.ManagedWarehouseTrino) {
+	backend, backendSelected := trinoBackendDetail(row)
 	if row == nil || !row.Enabled {
 		// Not an error: most orgs are not Trino-enabled, and the org page
 		// renders a "not enabled" state rather than a failure.
-		c.JSON(http.StatusOK, gin.H{"cell": a.cell, "enabled": false, "assigned": row != nil && row.TrinoCellID != ""})
+		c.JSON(http.StatusOK, gin.H{"cell": a.cell, "enabled": false, "assigned": row != nil && row.TrinoCellID != "", "backend": backend, "backend_selected": backendSelected})
 		return
 	}
 
@@ -711,6 +713,7 @@ func (a *TrinoAPI) writeOrgDetail(c *gin.Context, orgID string, row *configstore
 	status.Org = orgID
 	// The Trino row is authoritative for lifecycle detail; the listing
 	// carries only the current state.
+	status.Backend = backend
 	status.State = string(row.State)
 	status.StatusMessage = row.StatusMessage
 	status.ReadyAt = row.ReadyAt
@@ -722,11 +725,13 @@ func (a *TrinoAPI) writeOrgDetail(c *gin.Context, orgID string, row *configstore
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"cell":      a.cell,
-		"enabled":   true,
-		"assigned":  row.TrinoCellID != "",
-		"available": available,
-		"status":    status,
+		"cell":             a.cell,
+		"enabled":          true,
+		"backend":          backend,
+		"backend_selected": backendSelected,
+		"assigned":         row.TrinoCellID != "",
+		"available":        available,
+		"status":           status,
 	})
 }
 
@@ -744,6 +749,7 @@ func trinoOrgStatus(o configstore.TrinoEnabledOrg, running, queued int) TrinoOrg
 		state = string(configstore.ManagedWarehouseStatePending)
 	}
 	return TrinoOrgStatus{
+		Backend:          configstore.EffectiveTrinoBackend(o.Backend),
 		Org:              o.OrgID,
 		Principal:        principal,
 		Catalog:          catalog,
@@ -754,4 +760,12 @@ func trinoOrgStatus(o configstore.TrinoEnabledOrg, running, queued int) TrinoOrg
 		RunningQueries:   running,
 		QueuedQueries:    queued,
 	}
+}
+
+// Backend selection is returned even while disabled; disabling never unlocks it.
+func trinoBackendDetail(row *configstore.ManagedWarehouseTrino) (configstore.TrinoBackend, bool) {
+	if row == nil {
+		return configstore.TrinoBackendDuckLake, false
+	}
+	return configstore.EffectiveTrinoBackend(row.Backend), row.BackendSelected
 }

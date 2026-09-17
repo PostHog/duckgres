@@ -1,91 +1,118 @@
-# Trino Hoglake provisioning
+# Managed Trino Hoglake provisioning
 
-## Current contract
+## Configuration and selection
 
-`DUCKGRES_TRINO_HOGLAKE_URI` defaults to empty. Empty selects DuckLake when
-creating a missing Trino catalog. A nonempty HTTP(S) base URI selects Hoglake
-for every missing catalog in that provisioner's scope. The URI must not contain
-credentials, a query, or a fragment; use the server base URI without `/v1`.
-This setting currently supports the frozen performance scenarios, whose runner
-bootstraps the Hoglake dataset separately. It is not a managed tenant rollout
-switch.
+Managed Trino tenants default to `ducklake`. Before the first enable, an operator
+can choose `hoglake` in the organization's Trino settings or pass
+`"backend": "hoglake"` to the enable/provision API. Cell assignment and backend
+selection are separate. Successful enable locks the backend; disabling and
+re-enabling retains it. Omitted backend values preserve the stored selection.
+Existing Trino configuration rows migrate to locked DuckLake selections,
+including disabled rows whose previous enablement history is unknown.
 
-The two catalog names are different:
+Hoglake creates a separate, initially empty catalog. It does not migrate the
+organization's DuckLake warehouse or change Duckgres query storage.
+Use a new dedicated test tenant for a pilot, rather than changing an existing
+DuckLake tenant's backend.
 
-- The Trino catalog is `org_<sanitized-database-name>`, preserving its tenant
-  identity and OPA ownership mapping.
-- The Hoglake catalog is the raw organization ID. Setting the URI does not
-  create this catalog, its namespaces, or its tables.
+The control plane requires these environment variables:
 
-The scenario runner's `setup_hoglake` step registers the externally supplied
-immutable fixture S3 prefix and creates the `posthog` namespace. The properties
-comparison uses its own catalog and `properties_perf` namespace. These are
-scenario choices, not general tenant defaults. See the
-[scenario runbook](scenario-runner.md).
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `DUCKGRES_TRINO_MANAGED_HOGLAKE_URI` | empty, disabled | Hoglake HTTP(S) origin, without credentials or an API path |
+| `DUCKGRES_TRINO_HOGLAKE_DATA_PATH` | empty | Reserved `s3://bucket/prefix/` base, with a trailing slash |
+| `DUCKGRES_TRINO_HOGLAKE_NAMESPACE` | `main` | Namespace to create and verify |
 
-Hoglake properties currently use the Trino pod's AWS credentials. Unlike the
-DuckLake branch, they do not select the tenant's IAM role. The
-`hoglake.s3.region` property is a supported compatibility alias for `s3.region`.
-The existing Duckling metadata/password projection and readiness gates still
-apply even though Hoglake does not consume the DuckLake metadata password.
-Readiness checks do not validate the Hoglake catalog, namespace, or S3 access.
+An explicit Hoglake request is rejected before database mutations if managed
+Hoglake is unavailable. Reserve the configured S3 prefix exclusively for this
+service. Do not reuse DuckLake roots or immutable performance fixtures.
 
-## Existing catalogs and recovery
+## Provisioning and ownership
 
-Reconciliation lists catalogs and retains each enabled tenant's existing catalog
-by name. It does not compare connector properties. Consequently:
+The Trino catalog retains its `org_<sanitized-database-name>` name and existing
+OPA tenant ownership mapping. The Hoglake catalog is named after the organization
+ID. Its S3 path is `<configured-base>/<warehouse-DucklingName>/`, matching the
+Crossplane tenant-role policy. The provisioner uses the Duckling storage status
+and tenant IAM role without reading a DuckLake metadata password.
 
-- Setting the URI leaves existing DuckLake catalogs as DuckLake.
-- New or recreated catalogs use Hoglake while the setting is nonempty.
-- Clearing the setting leaves existing Hoglake catalogs as Hoglake; subsequent
-  creations use DuckLake.
+Reconciliation reads the Hoglake catalog, creates it if absent, and verifies its
+exact data path. Concurrent-create conflicts are resolved by rereading and
+checking ownership. It verifies `atomic-table-creation-v1`, then creates and
+verifies the configured namespace. Trino receives the Hoglake connector and
+`s3.auth-type=IAM_ROLE` with the tenant's role.
 
-Do not drop an existing catalog to force a connector switch. This is not a data
-migration: the two services have separate metadata, and the Hoglake data path
-and namespace may not exist. Restore an accidentally changed setting before
-allowing more catalog creations, inspect which catalogs were created during the
-change, and plan their recovery explicitly. Clearing the setting alone does not
-restore their prior backend.
+An existing Trino catalog must report an operational Hoglake connector. A
+DuckLake catalog with the same name fails readiness and requires explicit
+recovery. Reconciliation never silently replaces it. Trino's connector inventory
+does not expose all catalog properties, so it cannot certify an externally
+modified catalog's URI or role. Investigate manual configuration changes before
+returning the tenant to service.
 
-For disposable performance environments, bootstrap fixtures using the scenario
-runner and its explicit S3 source. If fixture registration or connectivity fails,
-repair that input and rerun the disposable scenario; a Trino `Ready` status alone
-is not evidence that the Hoglake dataset exists.
+Readiness also requires the existing authentication and cell gates. It verifies
+metadata and connector availability, but does not perform S3 writes. The smoke
+test below provides that verification. The administrative OPA grant permits
+connector inventory; it does not grant tenant data writes.
 
-## Operator access
+Disabling Trino removes its registration and access through the normal lifecycle.
+Hoglake metadata and S3 files remain. Neither disabling nor clearing deployment
+configuration changes the selected backend or migrates data. Repair configuration
+or ownership mismatches explicitly; do not drop catalogs to force a switch.
 
-The provisioner administrator can manage only `org_*` catalog names. The
-reconciler drops managed-name catalogs that have no enabled tenant owner.
-Administrator reads require an OPA bundle grant, and this identity cannot write
-tables or schemas. Therefore manually creating an arbitrary test catalog is not
-a substitute for provisioning a tenant.
+## Rollout prerequisites
 
-Run CREATE TABLE, INSERT, and CTAS checks with a dedicated tenant's authorized
-unscoped credentials after that tenant's catalog and OPA mapping are provisioned.
-Do not disable OPA or broaden the administrator's permissions for a smoke test.
+1. Deploy the compatible control-plane version across the fleet with managed
+   Hoglake configuration disabled. Complete this before enabling the feature;
+   older binaries do not implement the new provisioning path.
+2. Deploy a Hoglake server and Trino connector supporting atomic table creation.
+   Apply their infrastructure and verify the service can maintain the reserved
+   S3 prefix.
+3. Apply tenant-role policies granting each tenant access only to its own
+   Duckling-name child prefix. The Trino pod role must be allowed to assume that
+   role. Custom roles outside the managed composition require equivalent grants.
+4. Allow the control plane and Trino cells to reach the Hoglake REST service, and
+   allow Trino and Hoglake to reach the required storage services.
+5. Supply registered-cell rollout canary credentials and verify healthy control
+   plane and cell readiness. Creating an empty secret resource is insufficient.
+6. Enable the managed configuration, create a dedicated pilot tenant, select its
+   cell and Hoglake backend, then enable Trino. Wait for reconciled readiness.
+7. Run the tenant smoke test. Keep pilot enablement limited until it succeeds.
 
-## Requirements for managed tenant enablement
+The existing `DUCKGRES_TRINO_HOGLAKE_URI` setting is separate. It applies to the
+legacy provisioner for externally bootstrapped performance fixtures, not
+registered managed cells. Preserve that workflow's explicit fixture setup; see
+the [scenario runbook](scenario-runner.md).
 
-Before using Hoglake on a shared managed deployment, implement and validate:
+## Live smoke test
 
-1. Explicit tenant backend selection, with DuckLake as the default and existing
-   catalog/backend mismatches reported instead of silently treated as migrated.
-2. Explicit ownership of a dedicated S3 data path. Do not infer that an existing
-   DuckLake root or a performance fixture prefix is available for Hoglake writes
-   and cleanup. Paths must be disjoint from other Hoglake catalogs and must not
-   give two metadata systems ownership of the same files.
-3. Idempotent catalog and namespace bootstrap before Trino registration. Read
-   existing resources and verify the intended data path; after a concurrent-create
-   conflict, reread and verify instead of accepting any same-name catalog. Keep
-   namespace choices explicit and preserve the external fixture bootstrap flow.
-4. Per-tenant S3 role configuration for Trino, plus the required access for
-   Hoglake maintenance. Verify scoped network access from the provisioner and
-   Trino to the Hoglake service and from both engines to the chosen S3 path.
-5. Readiness that verifies the selected backend, catalog, namespace, and required
-   write capability. Validate storage access with a disposable tenant smoke test:
-   CREATE TABLE, INSERT, CTAS, and compaction with unchanged query results and
-   a reduced data-file count.
+`just test-trino-hoglake-smoke` runs HTTP client regression tests and skips live
+operations by default. To opt in, provide these variables through the approved
+runtime credential mechanism:
 
-These requirements are not implemented by the URI setting. Keep shared
-provisioners on the default until the managed path is available; use isolated
-performance environments for the existing externally bootstrapped flow.
+```text
+HOGLAKE_SMOKE_TEST=1
+TRINO_SERVER=https://trino.example
+TRINO_USER=<tenant-principal>
+TRINO_PASSWORD=<tenant-password>
+TRINO_CATALOG=<tenant-trino-catalog>
+TRINO_ROUTING_GROUP=<cell-routing-group-if-required>
+HOGLAKE_URI=https://lake.example
+HOGLAKE_CATALOG=<tenant-hoglake-catalog>
+HOGLAKE_NAMESPACE=main
+```
+
+Run only against a dedicated test tenant: compaction applies to the entire
+Hoglake catalog. Coordinate automatic maintenance so it does not consume the
+multi-file baseline before the assertion. The runner needs authorized network
+access to both endpoints. Use tenant credentials, not provisioner administrator
+credentials, for Trino operations.
+
+The test creates randomly named tables, inserts eight separate batches including
+a decimal exceeding INT64, checks exact values, runs CTAS, and triggers Hoglake
+compaction. It checks unchanged source rows and a reduced source file count.
+Cleanup deletes only its generated tables using the Hoglake REST API, since the
+Trino connector does not currently implement DROP TABLE. A cleanup failure is
+reported as a test failure and requires explicit operator cleanup. No mutation
+is blindly retried after an uncertain response.
+
+Passing unit tests is not evidence of a successful deployment. Record live smoke
+results separately after the prerequisites are applied.

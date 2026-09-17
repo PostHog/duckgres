@@ -112,7 +112,10 @@ const (
 	envTrinoFilesystemCacheEnabled = "DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED"
 
 	// envTrinoHoglakeURI selects Hoglake catalogs when set. Empty preserves DuckLake.
-	envTrinoHoglakeURI = "DUCKGRES_TRINO_HOGLAKE_URI"
+	envTrinoHoglakeURI        = "DUCKGRES_TRINO_HOGLAKE_URI"
+	envTrinoManagedHoglakeURI = "DUCKGRES_TRINO_MANAGED_HOGLAKE_URI"
+	envTrinoHoglakeDataPath   = "DUCKGRES_TRINO_HOGLAKE_DATA_PATH"
+	envTrinoHoglakeNamespace  = "DUCKGRES_TRINO_HOGLAKE_NAMESPACE"
 )
 
 // trinoProvisionerEnabled recognizes legacy or registry configuration.
@@ -274,7 +277,7 @@ type trinoWiringStore interface {
 	provisioner.TrinoWarehouseStore
 }
 
-func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver, cell trinoCell) (*trinoWiring, error) {
+func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver, cell trinoCell, storageResolvers ...provisioner.TrinoDucklingResolver) (*trinoWiring, error) {
 
 	filesystemCacheEnabled, err := trinoFilesystemCacheEnabled()
 	if err != nil {
@@ -282,6 +285,11 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	}
 
 	hoglakeURI, err := trinoHoglakeURI()
+	if err != nil {
+		return nil, err
+	}
+
+	managedHoglake, err := trinoManagedHoglakeConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -313,6 +321,10 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 		}
 	}
 
+	var storageResolver provisioner.TrinoDucklingResolver
+	if len(storageResolvers) > 0 {
+		storageResolver = storageResolvers[0]
+	}
 	bundleStore := &opa.BundleStore{}
 
 	trinoProv, err := provisioner.NewTrinoProvisioner(provisioner.TrinoProvisionerOpts{
@@ -321,6 +333,7 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 		BootstrapSentinel:       store,
 		Warehouses:              store,
 		Ducklings:               ducklings,
+		HoglakeDucklings:        storageResolver,
 		Kubernetes:              kc,
 		Namespace:               cell.Namespace,
 		CellID:                  cell.ID,
@@ -335,6 +348,7 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 		S3MaxConnections:        envInt(envTrinoS3MaxConnections),
 		FilesystemCacheEnabled:  filesystemCacheEnabled,
 		HoglakeURI:              hoglakeURI,
+		ManagedHoglake:          managedHoglake,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct Trino provisioner: %w", err)
@@ -444,4 +458,21 @@ func trinoHoglakeURI() (string, error) {
 		return "", fmt.Errorf("%s must be an HTTP(S) URL without credentials, query, or fragment", envTrinoHoglakeURI)
 	}
 	return value, nil
+}
+
+func trinoManagedHoglakeConfig() (*provisioner.TrinoManagedHoglakeConfig, error) {
+	uri := strings.TrimSpace(os.Getenv(envTrinoManagedHoglakeURI))
+	path := strings.TrimSpace(os.Getenv(envTrinoHoglakeDataPath))
+	namespace := strings.TrimSpace(os.Getenv(envTrinoHoglakeNamespace))
+	if uri == "" && path == "" && namespace == "" {
+		return nil, nil
+	}
+	if namespace == "" {
+		namespace = "main"
+	}
+	config := &provisioner.TrinoManagedHoglakeConfig{URI: uri, DataPath: path, Namespace: namespace}
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("managed Hoglake configuration: %w", err)
+	}
+	return config, nil
 }

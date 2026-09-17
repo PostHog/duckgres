@@ -265,21 +265,12 @@ func (s *gormStore) Provision(req ProvisionRequest) error {
 		}
 
 		// 3. Optional Trino opt-in. State seeds to Pending so the
-		// reconcile loop sees a fresh row to act on; the OnConflict
-		// columns deliberately exclude State / StatusMessage / ReadyAt /
+		// reconcile loop sees a fresh row to act on; the helper preserves
+		// State / StatusMessage / ReadyAt /
 		// FailedAt / TrinoCellID so a re-provision doesn't clobber the
 		// reconcile loop's prior outcome or move the org between cells.
 		if req.Trino != nil {
-			trinoRow := configstore.ManagedWarehouseTrino{
-				OrgID:   req.OrgID,
-				Enabled: true,
-				Tier:    req.Trino.Tier,
-				State:   configstore.ManagedWarehouseStatePending,
-			}
-			if err := tx.Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "org_id"}},
-				DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
-			}).Create(&trinoRow).Error; err != nil {
+			if err := configstore.EnableTrinoInTransaction(tx, req.OrgID, *req.Trino); err != nil {
 				return fmt.Errorf("enable trino: %w", err)
 			}
 		}
