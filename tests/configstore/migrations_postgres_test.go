@@ -256,6 +256,7 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 		"trino_cell_id",
 		"backend",
 		"backend_selected",
+		"hoglake_initialized",
 		"state",
 		"status_message",
 		"ready_at",
@@ -1348,7 +1349,7 @@ func TestConfigStoreMigration40PinsExistingTrinoBackends(t *testing.T) {
 	if err := store.DB().Exec(`
   DROP TRIGGER duckgres_select_trino_backend_on_enable ON duckgres_managed_warehouse_trino;
   DROP FUNCTION duckgres_select_trino_backend_on_enable();
-  ALTER TABLE duckgres_managed_warehouse_trino DROP COLUMN backend, DROP COLUMN backend_selected;
+  ALTER TABLE duckgres_managed_warehouse_trino DROP COLUMN backend, DROP COLUMN backend_selected, DROP COLUMN hoglake_initialized;
   DELETE FROM goose_db_version WHERE version_id=40;
   INSERT INTO duckgres_orgs (name,database_name) VALUES ('old-enabled','old_enabled'),('old-disabled','old_disabled'),('old-cell-only','old_cell_only');
   INSERT INTO duckgres_managed_warehouse_trino (org_id,enabled) VALUES ('old-enabled',TRUE),('old-disabled',FALSE),('old-cell-only',FALSE);

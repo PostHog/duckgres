@@ -2,7 +2,8 @@
 ALTER TABLE duckgres_managed_warehouse_trino
     ADD COLUMN backend TEXT NOT NULL DEFAULT 'ducklake'
         CHECK (backend IN ('ducklake', 'hoglake')),
-    ADD COLUMN backend_selected BOOLEAN NOT NULL DEFAULT TRUE;
+    ADD COLUMN backend_selected BOOLEAN NOT NULL DEFAULT TRUE,
+    ADD COLUMN hoglake_initialized BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Prior disabled rows do not record whether enablement was attempted. Pin all
 -- existing rows to DuckLake rather than risk switching a previously used catalog.
@@ -37,5 +38,6 @@ CREATE TRIGGER duckgres_select_trino_backend_on_enable
 DROP TRIGGER duckgres_select_trino_backend_on_enable ON duckgres_managed_warehouse_trino;
 DROP FUNCTION duckgres_select_trino_backend_on_enable();
 ALTER TABLE duckgres_managed_warehouse_trino
+    DROP COLUMN hoglake_initialized,
     DROP COLUMN backend_selected,
     DROP COLUMN backend;

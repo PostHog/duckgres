@@ -182,7 +182,7 @@ func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease confi
 			if warehouse == nil {
 				return errors.New("managed Hoglake warehouse identity unavailable")
 			}
-			if err := p.managedHoglake.ensure(ctx, org.OrgID, warehouse.DucklingName); err != nil {
+			if err := p.ensureHoglakeResources(ctx, org.OrgID, warehouse.DucklingName, false); err != nil {
 				return err
 			}
 		}

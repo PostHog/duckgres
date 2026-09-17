@@ -100,6 +100,11 @@ func (c TrinoManagedHoglakeConfig) request(ctx context.Context, method, path str
 }
 
 func (c TrinoManagedHoglakeConfig) ensure(ctx context.Context, orgID, storageKey string) error {
+	return c.ensureResources(ctx, orgID, storageKey, true)
+}
+
+// ensureResources never repairs missing metadata after durable initialization.
+func (c TrinoManagedHoglakeConfig) ensureResources(ctx context.Context, orgID, storageKey string, allowCreate bool) error {
 	if !hoglakeIdentifier.MatchString(orgID) {
 		return errors.New("invalid managed Hoglake catalog name")
 	}
@@ -120,6 +125,9 @@ func (c TrinoManagedHoglakeConfig) ensure(ctx context.Context, orgID, storageKey
 		return err
 	}
 	if status == http.StatusNotFound {
+		if !allowCreate {
+			return errors.New("initialized Hoglake catalog is missing; restore metadata before returning the tenant to service")
+		}
 		status, err = c.request(ctx, http.MethodPost, "/v1/catalogs", map[string]string{"name": orgID, "data_path": dataPath}, nil)
 		if err != nil {
 			return err
@@ -150,6 +158,9 @@ func (c TrinoManagedHoglakeConfig) ensure(ctx context.Context, orgID, storageKey
 		return err
 	}
 	if status == http.StatusNotFound {
+		if !allowCreate {
+			return errors.New("initialized Hoglake namespace is missing; restore metadata before returning the tenant to service")
+		}
 		status, err = c.request(ctx, http.MethodPost, path+"/namespaces", map[string]string{"name": c.Namespace}, nil)
 		if err != nil {
 			return err
@@ -276,7 +287,7 @@ func (p *TrinoProvisioner) reconcileHoglakeCatalog(ctx context.Context, client T
 	if warehouse == nil || warehouse.DucklingName == "" {
 		return errors.New("waiting for the managed warehouse storage identity")
 	}
-	if err = p.managedHoglake.ensure(ctx, orgID, warehouse.DucklingName); err != nil {
+	if err = p.ensureHoglakeResources(ctx, orgID, warehouse.DucklingName, !exists); err != nil {
 		return err
 	}
 	if !exists {
@@ -285,4 +296,33 @@ func (p *TrinoProvisioner) reconcileHoglakeCatalog(ctx context.Context, client T
 		}
 	}
 	return verifyHoglakeConnector(ctx, client, name)
+}
+
+// TrinoHoglakeInitializationStore persists the bootstrap boundary before Trino
+// can register the tenant. It survives disable/re-enable and catalog reloads.
+type TrinoHoglakeInitializationStore interface {
+	GetTrinoHoglakeInitialized(context.Context, string) (bool, error)
+	MarkTrinoHoglakeInitialized(context.Context, string) error
+}
+
+func (p *TrinoProvisioner) ensureHoglakeResources(ctx context.Context, orgID, storageKey string, allowBootstrap bool) error {
+	state, ok := p.store.(TrinoHoglakeInitializationStore)
+	if !ok {
+		return errors.New("Hoglake initialization store is unavailable")
+	}
+	initialized, err := state.GetTrinoHoglakeInitialized(ctx, orgID)
+	if err != nil {
+		return fmt.Errorf("read Hoglake initialization: %w", err)
+	}
+	if err = p.managedHoglake.ensureResources(ctx, orgID, storageKey, allowBootstrap && !initialized); err != nil {
+		return err
+	}
+	if !initialized {
+		// A failed or ambiguous persistence attempt must stop registration. On
+		// retry GET verifies the already-created metadata before another mark.
+		if err = state.MarkTrinoHoglakeInitialized(ctx, orgID); err != nil {
+			return fmt.Errorf("persist Hoglake initialization: %w", err)
+		}
+	}
+	return nil
 }

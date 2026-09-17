@@ -440,6 +440,8 @@ type ManagedWarehouseTrino struct {
 	// that do not supply this field to DuckLake during rolling upgrades.
 	Backend         TrinoBackend `gorm:"not null;default:ducklake" json:"backend"`
 	BackendSelected bool         `gorm:"not null" json:"backend_selected"`
+	// HoglakeInitialized is monotonic: disabled clients retain their metadata identity.
+	HoglakeInitialized bool `gorm:"not null;default:false" json:"hoglake_initialized"`
 
 	// Tier picks the resource-group limits applied to the org. Empty string
 	// is treated as the default tier by the resource-groups generator.
@@ -522,13 +524,14 @@ func (ManagedWarehouseTrino) TableName() string { return "duckgres_managed_wareh
 // rows are still returned and can be claimed — a WHERE trino_cell_id = ?
 // would make a freshly enabled org invisible to every cell forever.
 type TrinoEnabledOrg struct {
-	Backend          TrinoBackend
-	OrgID            string
-	DatabaseName     string
-	Tier             string
-	CellID           string
-	RootPasswordHash string                            // bcrypt hash from OrgUser row where Username = "root"
-	State            ManagedWarehouseProvisioningState // current state at read time
+	HoglakeInitialized bool
+	Backend            TrinoBackend
+	OrgID              string
+	DatabaseName       string
+	Tier               string
+	CellID             string
+	RootPasswordHash   string                            // bcrypt hash from OrgUser row where Username = "root"
+	State              ManagedWarehouseProvisioningState // current state at read time
 	// Users are the org's own duckgres logins, each of which authenticates
 	// to Trino under TrinoUserPrincipal(Username) with the very same bcrypt
 	// hash it uses at the pgwire handshake. Populated by a second query in

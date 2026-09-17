@@ -321,6 +321,7 @@ func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 		         o.database_name AS database_name,
 		         t.tier AS tier,
 		         t.backend AS backend,
+		         t.hoglake_initialized AS hoglake_initialized,
 		         COALESCE(t.trino_cell_id, '') AS cell_id,
 		         u.password AS root_password_hash,
 		         t.state AS state`).

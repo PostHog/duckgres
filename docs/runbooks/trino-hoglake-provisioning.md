@@ -41,8 +41,15 @@ and tenant IAM role without reading a DuckLake metadata password.
 Reconciliation reads the Hoglake catalog, creates it if absent, and verifies its
 exact data path. Concurrent-create conflicts are resolved by rereading and
 checking ownership. It verifies `atomic-table-creation-v1`, then creates and
-verifies the configured namespace. Trino receives the Hoglake connector and
-`s3.auth-type=IAM_ROLE` with the tenant's role.
+verifies the configured namespace. Before registering Trino, it durably records
+that Hoglake initialization completed. This marker survives disable/re-enable
+and loss of the Trino registration. After initialization, missing catalogs or
+namespaces fail readiness and require metadata recovery; reconciliation and
+rollout certification never recreate them as empty resources. An uncertain
+initial create or marker write is retried by verifying the remote resources
+before recording initialization, without admitting the tenant prematurely.
+Trino receives the Hoglake connector and `s3.auth-type=IAM_ROLE` with the tenant's
+role.
 
 An existing Trino catalog must report an operational Hoglake connector. A
 DuckLake catalog with the same name fails readiness and requires explicit
