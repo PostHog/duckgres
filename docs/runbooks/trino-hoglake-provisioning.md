@@ -1,19 +1,22 @@
 # Managed Trino Hoglake provisioning
 
-## Configuration and selection
+## Client backend policy
 
-Managed Trino tenants default to `ducklake`. Before the first enable, an operator
-can choose `hoglake` in the organization's Trino settings or pass
-`"backend": "hoglake"` to the enable/provision API. Cell assignment and backend
-selection are separate. Successful enable locks the backend; disabling and
-re-enabling retains it. Omitted backend values preserve the stored selection.
+Existing Trino clients retain DuckLake. All new Trino clients use Hoglake; the
+admin UI reports the backend without offering a choice. API callers can omit
+`backend`: the server preserves an existing selection or assigns Hoglake to a
+new client. A request to create a new DuckLake client is rejected. Disable and
+re-enable retain the selected backend. Manual migration of existing clients is
+outside this rollout.
+
 Existing Trino configuration rows migrate to locked DuckLake selections,
-including disabled rows whose previous enablement history is unknown.
+including disabled rows whose previous enablement history is unknown. This
+conservative boundary also includes old cell-only rows: the database cannot
+prove they were never enabled. Organizations without a previous Trino
+configuration receive Hoglake when first enabled.
 
 Hoglake creates a separate, initially empty catalog. It does not migrate the
 organization's DuckLake warehouse or change Duckgres query storage.
-Use a new dedicated test tenant for a pilot, rather than changing an existing
-DuckLake tenant's backend.
 
 The control plane requires these environment variables:
 
@@ -23,9 +26,9 @@ The control plane requires these environment variables:
 | `DUCKGRES_TRINO_HOGLAKE_DATA_PATH` | empty | Reserved `s3://bucket/prefix/` base, with a trailing slash |
 | `DUCKGRES_TRINO_HOGLAKE_NAMESPACE` | `main` | Namespace to create and verify |
 
-An explicit Hoglake request is rejected before database mutations if managed
-Hoglake is unavailable. Reserve the configured S3 prefix exclusively for this
-service. Do not reuse DuckLake roots or immutable performance fixtures.
+New-client onboarding is rejected before database mutations if managed
+Hoglake is unavailable; existing DuckLake clients can still re-enable. Reserve
+the configured S3 prefix exclusively for this service. Do not reuse DuckLake roots or immutable performance fixtures.
 
 ## Provisioning and ownership
 
@@ -62,7 +65,9 @@ or ownership mismatches explicitly; do not drop catalogs to force a switch.
 
 1. Deploy the compatible control-plane version across the fleet with managed
    Hoglake configuration disabled. Complete this before enabling the feature;
-   older binaries do not implement the new provisioning path.
+   older binaries do not implement the new provisioning path. Pause new Trino
+   onboarding during the rolling update. Existing clients continue to operate;
+   new onboarding remains unavailable until managed configuration is supplied.
 2. Deploy a Hoglake server and Trino connector supporting atomic table creation.
    Apply their infrastructure and verify the service can maintain the reserved
    S3 prefix.
@@ -74,13 +79,17 @@ or ownership mismatches explicitly; do not drop catalogs to force a switch.
 5. Supply registered-cell rollout canary credentials and verify healthy control
    plane and cell readiness. Creating an empty secret resource is insufficient.
 6. Enable the managed configuration, create a dedicated pilot tenant, select its
-   cell and Hoglake backend, then enable Trino. Wait for reconciled readiness.
+   cell, then enable Trino. Hoglake is assigned automatically. Wait for
+   reconciled readiness.
 7. Run the tenant smoke test. Keep pilot enablement limited until it succeeds.
 
-The existing `DUCKGRES_TRINO_HOGLAKE_URI` setting is separate. It applies to the
-legacy provisioner for externally bootstrapped performance fixtures, not
-registered managed cells. Preserve that workflow's explicit fixture setup; see
-the [scenario runbook](scenario-runner.md).
+The historical global `DUCKGRES_TRINO_HOGLAKE_URI` switch is deprecated and
+ignored, with a startup warning. It cannot override a client's stored backend.
+Existing catalogs are retained, while new clients use the managed Hoglake path.
+The frozen performance runner still sets the historical switch: its old setup
+is insufficient for new-client onboarding. Updating that runner's storage and
+fixture setup is separate work; do not repurpose immutable fixture prefixes
+as managed write paths.
 
 ## Live smoke test
 

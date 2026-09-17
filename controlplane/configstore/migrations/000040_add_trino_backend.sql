@@ -16,6 +16,12 @@ UPDATE duckgres_managed_warehouse_trino SET backend_selected = TRUE;
 CREATE FUNCTION duckgres_select_trino_backend_on_enable() RETURNS trigger AS $$
 BEGIN
     IF NEW.enabled THEN
+        -- Old replicas omit backend_selected when enabling a new cell-only row.
+        -- Their provisioner creates DuckLake, so preserve that actual backend.
+        -- New replicas set backend_selected together with their Hoglake choice.
+        IF NOT NEW.backend_selected THEN
+            NEW.backend := 'ducklake';
+        END IF;
         NEW.backend_selected := TRUE;
     END IF;
     RETURN NEW;

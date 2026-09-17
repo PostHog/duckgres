@@ -871,3 +871,16 @@ func TestTrinoOrgDetailPreservesBackendWhileDisabled(t *testing.T) {
 		t.Fatalf("lost backend ownership: %d %+v", code, body)
 	}
 }
+
+func TestTrinoBackendDetailNewClientUsesHoglake(t *testing.T) {
+	for _, row := range []*configstore.ManagedWarehouseTrino{nil, {Backend: configstore.TrinoBackendDuckLake, BackendSelected: false}} {
+		backend, locked := trinoBackendDetail(row)
+		if backend != configstore.TrinoBackendHoglake || locked {
+			t.Fatalf("new client backend=%s locked=%v", backend, locked)
+		}
+	}
+	backend, locked := trinoBackendDetail(&configstore.ManagedWarehouseTrino{Backend: configstore.TrinoBackendDuckLake, BackendSelected: true})
+	if backend != configstore.TrinoBackendDuckLake || !locked {
+		t.Fatal("existing DuckLake client changed backend")
+	}
+}

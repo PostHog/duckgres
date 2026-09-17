@@ -367,8 +367,9 @@ type TrinoProvisionerOpts struct {
 	// catalogs. Defaults to false. Trino nodes must configure a cache manager.
 	FilesystemCacheEnabled bool
 
-	// HoglakeURI selects Hoglake catalogs using the pod's S3 credentials.
-	// Empty retains the default DuckLake catalog configuration.
+	// HoglakeURI is deprecated and has no effect on catalog selection.
+	// Retained so older deployment settings do not prevent existing clients
+	// from starting; persisted tenant backends are authoritative in all cells.
 	HoglakeURI     string
 	ManagedHoglake *TrinoManagedHoglakeConfig
 }
@@ -460,7 +461,6 @@ type TrinoProvisioner struct {
 	awsRegion               string
 	s3MaxConnections        int
 	filesystemCacheEnabled  bool
-	hoglakeURI              string
 	managedHoglake          *TrinoManagedHoglakeConfig
 
 	// adminPasswordHash is cached on each Reconcile from the
@@ -515,6 +515,9 @@ func (p *TrinoProvisioner) setObserverCredential(plaintext, hash string) {
 // Returns an error if any required dep is missing rather than panicking
 // downstream on the first reconcile tick.
 func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
+	if opts.HoglakeURI != "" {
+		slog.Warn("Legacy Trino Hoglake URI setting is ignored; configure managed Hoglake provisioning for new clients.")
+	}
 	if opts.ManagedHoglake != nil {
 		if err := opts.ManagedHoglake.Validate(); err != nil {
 			return nil, err
@@ -591,7 +594,6 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		awsRegion:               opts.AWSRegion,
 		s3MaxConnections:        maxConns,
 		filesystemCacheEnabled:  opts.FilesystemCacheEnabled,
-		hoglakeURI:              opts.HoglakeURI,
 		managedHoglake:          opts.ManagedHoglake,
 	}
 	if opts.ManagedCatalogs != nil {
@@ -1955,15 +1957,7 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.M
 	if region == "" {
 		region = p.awsRegion
 	}
-	if p.hoglakeURI != "" && !p.explicitAssignmentOnly {
-		return map[string]string{
-			"connector.name":    "hoglake",
-			"hoglake.uri":       p.hoglakeURI,
-			"hoglake.catalog":   orgID,
-			"fs.cache.enabled":  strconv.FormatBool(p.filesystemCacheEnabled),
-			"hoglake.s3.region": region,
-		}
-	}
+
 	return map[string]string{
 		"connector.name":                    "ducklake",
 		"ducklake.metadata.connection-url":  ducklakeMetadataJDBCURL(d),

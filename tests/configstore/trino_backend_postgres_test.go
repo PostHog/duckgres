@@ -21,7 +21,7 @@ func TestTrinoBackendSelectionSurvivesDisablePostgres(t *testing.T) {
 	if row := trinoRow(t, store, "tenant"); row.BackendSelected {
 		t.Fatal("cell selection must not choose backend")
 	}
-	if err := store.EnableTrino("tenant", configstore.TrinoSettings{Backend: configstore.TrinoBackendHoglake}); err != nil {
+	if err := store.EnableTrino("tenant", configstore.TrinoSettings{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.DisableTrino("tenant"); err != nil {
@@ -105,5 +105,45 @@ func TestTrinoBackendOldBinaryEnablePinsNewCellSelectionPostgres(t *testing.T) {
 	}
 	if row := trinoRow(t, store, "mixed-version"); row.Enabled || row.Backend != configstore.TrinoBackendDuckLake || !row.BackendSelected {
 		t.Fatalf("lost old binary backend ownership: %+v", row)
+	}
+}
+
+func TestTrinoBackendNewClientsUseHoglakePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "new-tenant")
+	if err := store.EnableTrino("new-tenant", configstore.TrinoSettings{}); err != nil {
+		t.Fatal(err)
+	}
+	if row := trinoRow(t, store, "new-tenant"); row.Backend != configstore.TrinoBackendHoglake || !row.BackendSelected {
+		t.Fatalf("new client did not use Hoglake: %+v", row)
+	}
+	seedTrinoOrg(t, store, "rejected-tenant")
+	if err := store.EnableTrino("rejected-tenant", configstore.TrinoSettings{Backend: configstore.TrinoBackendDuckLake}); !errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) {
+		t.Fatalf("new DuckLake client accepted: %v", err)
+	}
+	if row, err := store.GetManagedWarehouseTrino("rejected-tenant"); err != nil || row != nil {
+		t.Fatalf("rejection persisted a row: %+v %v", row, err)
+	}
+}
+
+func TestTrinoBackendExistingDuckLakePreservedPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "existing-tenant")
+	if err := store.DB().Create(&configstore.ManagedWarehouseTrino{OrgID: "existing-tenant", Enabled: true, Backend: configstore.TrinoBackendDuckLake, BackendSelected: true, State: configstore.ManagedWarehouseStateReady}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, backend := range []configstore.TrinoBackend{"", configstore.TrinoBackendDuckLake} {
+		if err := store.DisableTrino("existing-tenant"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EnableTrino("existing-tenant", configstore.TrinoSettings{Backend: backend}); err != nil {
+			t.Fatal(err)
+		}
+		if row := trinoRow(t, store, "existing-tenant"); row.Backend != configstore.TrinoBackendDuckLake || !row.BackendSelected {
+			t.Fatalf("existing client changed: %+v", row)
+		}
+	}
+	if err := store.EnableTrino("existing-tenant", configstore.TrinoSettings{Backend: configstore.TrinoBackendHoglake}); !errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) {
+		t.Fatalf("existing client switched: %v", err)
 	}
 }

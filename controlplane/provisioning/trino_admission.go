@@ -35,23 +35,33 @@ func WithTrinoBackendValidator(validate func(configstore.TrinoBackend) error) Op
 	return func(h *handler) { h.trinoBackendValidator = validate }
 }
 
-func (h *handler) admitTrinoBackend(c *gin.Context, backend configstore.TrinoBackend) bool {
-	if backend != "" && !backend.Valid() {
+// Resolve before checking deployment availability, including omitted-field clients.
+// The transactional store repeats resolution to detect a concurrent first enable.
+func (h *handler) resolveTrinoBackend(c *gin.Context, orgID string, requested configstore.TrinoBackend) (configstore.TrinoBackend, bool) {
+	if requested != "" && !requested.Valid() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "backend must be ducklake or hoglake"})
-		return false
+		return "", false
 	}
-	// Preserve the backend for existing omitted-field clients.
-	if backend == "" {
-		return true
+	row, err := h.store.GetManagedWarehouseTrino(orgID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read Trino backend"})
+		return "", false
 	}
-	if h.trinoBackendValidator != nil {
-		if err := h.trinoBackendValidator(backend); err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "requested Trino backend is not configured"})
-			return false
-		}
-	} else if backend == configstore.TrinoBackendHoglake {
+	backend, err := configstore.ResolveTrinoBackend(row, requested)
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return "", false
+	}
+	if backend == configstore.TrinoBackendDuckLake {
+		return backend, true
+	}
+	if h.trinoBackendValidator == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "managed Hoglake provisioning is not configured"})
-		return false
+		return "", false
 	}
-	return true
+	if err := h.trinoBackendValidator(backend); err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "requested Trino backend is not configured"})
+		return "", false
+	}
+	return backend, true
 }

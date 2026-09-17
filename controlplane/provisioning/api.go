@@ -91,6 +91,7 @@ type Store interface {
 	// leaves the row in place so the provisioner observes the transition
 	// and cleans up the catalog, the tenant Secret key and the password
 	// file entry on next reconcile.
+	GetManagedWarehouseTrino(orgID string) (*configstore.ManagedWarehouseTrino, error)
 	EnableTrino(orgID string, settings configstore.TrinoSettings) error
 	DisableTrino(orgID string) error
 	// Team CRUD for the PostHog backend (duckgres_org_teams rows — config
@@ -351,8 +352,12 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		return
 	}
 
-	if req.Trino != nil && req.Trino.Enabled && !h.admitTrinoBackend(c, req.Trino.Backend) {
-		return
+	if req.Trino != nil && req.Trino.Enabled {
+		backend, ok := h.resolveTrinoBackend(c, orgID, req.Trino.Backend)
+		if !ok {
+			return
+		}
+		req.Trino.Backend = backend
 	}
 
 	if err := validateDucklingOrgID(orgID); err != nil {
@@ -612,10 +617,6 @@ func (h *handler) enableTrino(c *gin.Context) {
 		return
 	}
 
-	if !h.admitTrinoBackend(c, req.Backend) {
-		return
-	}
-
 	if !req.Enabled {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true; use DELETE to disable"})
 		return
@@ -653,6 +654,12 @@ func (h *handler) enableTrino(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
+	backend, ok := h.resolveTrinoBackend(c, orgID, req.Backend)
+	if !ok {
+		return
+	}
+	req.Backend = backend
 
 	if !h.admitTrino(c, orgID) {
 		return

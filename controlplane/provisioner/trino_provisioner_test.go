@@ -1222,56 +1222,6 @@ func TestReconcile_IsIdempotentWhenCatalogExists(t *testing.T) {
 	}
 }
 
-// Changing the perf connector setting is not a backend migration: existing
-// catalogs survive, while tenants onboarded afterward use the new setting.
-func TestTrinoHoglakeURIOnlySelectsNewCatalogs(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "example-old", DatabaseName: "example-old", CellID: testCellID, RootPasswordHash: "$2a$10$example"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{
-		"example-old": readyWarehouse("example-old"),
-		"example-new": readyWarehouse("example-new"),
-	})
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("initial reconcile: %v", err)
-	}
-	oldName := TrinoCatalogName("example-old")
-	if h.catalog.created[oldName]["connector.name"] != "ducklake" {
-		t.Fatal("initial catalog must use DuckLake")
-	}
-	oldProperties := h.catalog.created[oldName]
-	// Clear the call log while retaining the catalog in the backend listing.
-	h.catalog.created = nil
-	h.provisioner.hoglakeURI = "http://hoglake.example:8080"
-	h.store.orgs = append(h.store.orgs, configstore.TrinoEnabledOrg{
-		OrgID: "example-new", DatabaseName: "example-new", CellID: testCellID, RootPasswordHash: "$2a$10$example",
-	})
-	h.ducklings["example-new"] = readyDuckling("example-new")
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("reconcile after enabling Hoglake: %v", err)
-	}
-	if len(h.catalog.dropped) != 0 {
-		t.Fatalf("existing catalogs were dropped: %v", h.catalog.dropped)
-	}
-	if len(h.catalog.created) != 1 {
-		t.Fatalf("expected only the newly onboarded catalog to be created: %v", h.catalog.created)
-	}
-	newName := TrinoCatalogName("example-new")
-	props := h.catalog.created[newName]
-	if props["connector.name"] != "hoglake" || props["hoglake.catalog"] != "example-new" || props["hoglake.uri"] != h.provisioner.hoglakeURI {
-		t.Fatalf("new catalog does not target the org's Hoglake catalog: %v", props)
-	}
-	// Removing the setting also does not migrate a catalog back to DuckLake.
-	h.catalog.created = nil
-	h.provisioner.hoglakeURI = ""
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("reconcile after disabling Hoglake: %v", err)
-	}
-	if len(h.catalog.created) != 0 || len(h.catalog.dropped) != 0 || oldProperties["connector.name"] != "ducklake" {
-		t.Fatal("changing the setting must not mutate existing catalogs")
-	}
-}
-
 func TestReconcile_SecretUpdateIsIdempotent(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
 		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
@@ -1956,28 +1906,6 @@ func TestCatalogFilesystemCacheSetting(t *testing.T) {
 			}
 			if got, want := props["fs.cache.enabled"], strconv.FormatBool(enabled); got != want {
 				t.Fatalf("fs.cache.enabled = %q, want %q", got, want)
-			}
-		})
-	}
-}
-
-func TestTrinoHoglakeCatalogProperties(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
-			opts := baseTestOpts()
-			opts.HoglakeURI = "http://hoglake:8080"
-			opts.FilesystemCacheEnabled = enabled
-			p, err := NewTrinoProvisioner(opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			d := readyDuckling("42")
-			want := map[string]string{
-				"connector.name": "hoglake", "hoglake.uri": opts.HoglakeURI, "hoglake.catalog": "42",
-				"fs.cache.enabled": strconv.FormatBool(enabled), "hoglake.s3.region": d.DataStore.S3Region,
-			}
-			if got := p.buildCatalogProperties("42", readyWarehouse("42"), d); !reflect.DeepEqual(got, want) {
-				t.Fatalf("catalog properties = %v, want %v", got, want)
 			}
 		})
 	}

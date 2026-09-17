@@ -310,12 +310,9 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 }
 
 func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
-	backend := configstore.EffectiveTrinoBackend(settings.Backend)
-	if row := s.trino[orgID]; row != nil && row.BackendSelected {
-		if settings.Backend != "" && settings.Backend != row.Backend {
-			return configstore.ErrTrinoBackendSelectionConflict
-		}
-		backend = row.Backend
+	backend, err := configstore.ResolveTrinoBackend(s.trino[orgID], settings.Backend)
+	if err != nil {
+		return err
 	}
 	s.trino[orgID] = &configstore.ManagedWarehouseTrino{
 		OrgID:           orgID,
@@ -492,7 +489,7 @@ func newTestRouterWithBucketSuffix(store Store, bucketSuffix string) *gin.Engine
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	tenantStore, _ := store.(TenantStore)
-	RegisterAPI(r.Group("/api/v1"), store, tenantStore, bucketSuffix, nil)
+	RegisterAPIWithTrinoAdmission(r.Group("/api/v1"), store, tenantStore, bucketSuffix, nil, "", nil, WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }))
 	// Mirror prod topology (multitenant.go): discovery is a separate group
 	// on the same base path, so both surfaces stay reachable in tests.
 	RegisterDiscoveryAPI(r.Group("/api/v1"), store)
@@ -1059,7 +1056,7 @@ func TestProvisionWithTrinoDisabledLeavesTrinoRowUnset(t *testing.T) {
 	// retry must never silently tear down a tenant's catalog.
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true, Tier: "growth"}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Backend: configstore.TrinoBackendDuckLake, BackendSelected: true, Enabled: true, Tier: "growth"}
 	router := newTestRouter(store)
 
 	body := []byte(`{"database_name": "analytics-db", "metadata_store": {"type": "cnpg-shard"}, "ducklake": {"enabled": true}, "trino": {"enabled": false}}`)
@@ -1215,7 +1212,7 @@ func TestEnableTrinoRejectsEnabledFalse(t *testing.T) {
 func TestDisableTrinoEndpoint(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["analytics"] = &configstore.Org{Name: "analytics"}
-	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true, Tier: "free"}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Backend: configstore.TrinoBackendDuckLake, BackendSelected: true, Enabled: true, Tier: "free"}
 	router := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/analytics/trino", nil)
@@ -1256,7 +1253,7 @@ func TestDeprovisionDisablesTrino(t *testing.T) {
 		OrgID: "analytics",
 		State: configstore.ManagedWarehouseStateReady,
 	}
-	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Enabled: true}
+	store.trino["analytics"] = &configstore.ManagedWarehouseTrino{OrgID: "analytics", Backend: configstore.TrinoBackendDuckLake, BackendSelected: true, Enabled: true}
 	router := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/analytics/deprovision", nil)
@@ -2106,7 +2103,7 @@ func TestTrinoHoglakeUnavailableDoesNotWrite(t *testing.T) {
 			if endpoint == "provision" {
 				body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true,"backend":"hoglake"}}`
 			}
-			router := newTestRouter(store)
+			router := newUnconfiguredBackendTestRouter(store)
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/"+endpoint, strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
@@ -2134,5 +2131,89 @@ func TestProvisionTrinoHoglakeForwardsBackend(t *testing.T) {
 	}
 	if row := store.trino["tenant"]; row == nil || row.Backend != configstore.TrinoBackendHoglake || !row.BackendSelected {
 		t.Fatalf("backend not forwarded: %+v", row)
+	}
+}
+
+func TestTrinoOmittedBackendUsesHoglakeAndChecksAvailability(t *testing.T) {
+	for _, endpoint := range []string{"trino", "provision"} {
+		for _, configured := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/configured=%v", endpoint, configured), func(t *testing.T) {
+				store := newFakeStore()
+				store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
+				store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] = "hash"
+				router := newUnconfiguredBackendTestRouter(store)
+				if configured {
+					router = newBackendTestRouter(store)
+				}
+				body := `{"enabled":true}`
+				if endpoint == "provision" {
+					body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true}}`
+				}
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/"+endpoint, strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				router.ServeHTTP(rec, req)
+				if !configured {
+					if rec.Code != http.StatusServiceUnavailable || len(store.trino) != 0 || len(store.warehouses) != 0 {
+						t.Fatalf("unconfigured new client mutated or accepted: %d %s", rec.Code, rec.Body.String())
+					}
+					return
+				}
+				if rec.Code != http.StatusAccepted || store.trino["tenant"].Backend != configstore.TrinoBackendHoglake {
+					t.Fatalf("new client not Hoglake: %d %s %+v", rec.Code, rec.Body.String(), store.trino["tenant"])
+				}
+			})
+		}
+	}
+}
+
+func (s *fakeStore) GetManagedWarehouseTrino(orgID string) (*configstore.ManagedWarehouseTrino, error) {
+	return s.trino[orgID], nil
+}
+
+func newUnconfiguredBackendTestRouter(store Store) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	tenantStore, _ := store.(TenantStore)
+	RegisterAPI(router.Group("/api/v1"), store, tenantStore, "", nil)
+	return router
+}
+
+func TestTrinoExistingDuckLakeReenableWithoutHoglake(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		for _, requested := range []string{"", `,"backend":"ducklake"`} {
+			store := newFakeStore()
+			store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
+			store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] = "hash"
+			store.trino["tenant"] = &configstore.ManagedWarehouseTrino{OrgID: "tenant", Enabled: enabled, Backend: configstore.TrinoBackendDuckLake, BackendSelected: true}
+			router := newUnconfiguredBackendTestRouter(store)
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/trino", strings.NewReader(`{"enabled":true`+requested+`}`))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusAccepted || store.trino["tenant"].Backend != configstore.TrinoBackendDuckLake {
+				t.Fatalf("existing client changed or blocked: %d", rec.Code)
+			}
+		}
+	}
+}
+
+func TestTrinoRejectsNewDuckLakeClientWithoutWrites(t *testing.T) {
+	for _, endpoint := range []string{"trino", "provision"} {
+		store := newFakeStore()
+		store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
+		store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] = "hash"
+		body := `{"enabled":true,"backend":"ducklake"}`
+		if endpoint == "provision" {
+			body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true,"backend":"ducklake"}}`
+		}
+		router := newBackendTestRouter(store)
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/"+endpoint, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict || len(store.trino) != 0 || len(store.warehouses) != 0 {
+			t.Fatalf("new DuckLake client accepted or mutated: %d", rec.Code)
+		}
 	}
 }

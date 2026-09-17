@@ -418,3 +418,7 @@ func (s *gormStore) LatestConfigChange() (time.Time, error) {
 	return s.cs.LatestConfigChange()
 
 }
+
+func (s *gormStore) GetManagedWarehouseTrino(orgID string) (*configstore.ManagedWarehouseTrino, error) {
+	return s.cs.GetManagedWarehouseTrino(orgID)
+}

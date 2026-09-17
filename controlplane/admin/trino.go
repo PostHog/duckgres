@@ -764,8 +764,8 @@ func trinoOrgStatus(o configstore.TrinoEnabledOrg, running, queued int) TrinoOrg
 
 // Backend selection is returned even while disabled; disabling never unlocks it.
 func trinoBackendDetail(row *configstore.ManagedWarehouseTrino) (configstore.TrinoBackend, bool) {
-	if row == nil {
-		return configstore.TrinoBackendDuckLake, false
+	if row == nil || !row.BackendSelected {
+		return configstore.TrinoBackendHoglake, false
 	}
 	return configstore.EffectiveTrinoBackend(row.Backend), row.BackendSelected
 }
