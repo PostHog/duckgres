@@ -187,6 +187,13 @@ pinned image predates. When promoting such a build, set that property to the
 same domain on the lane's coordinator and pass the domain to the harness Job.
 The harness sends the tenant host as the `Host` header against the lane's own
 TLS name, so no DNS or certificate for the tenant host is needed.
+The provisioner cancels a statement it abandons at its reconcile deadline
+(`DELETE` on the pending `nextUri`), so abandoned queries cannot fill the
+`root.admin.__admin_provisioner` resource group. The lane does not assert this:
+it needs a coordinator that holds `SHOW CATALOGS` past the 30-second reconcile
+budget, which the Job cannot produce deterministically. The contract is pinned
+by `TestTrinoStatementDrainCancelsAbandonedStatement` against a fake
+coordinator whose statement never leaves the queue.
 Each Trino worker has requests and limits of 1 CPU and 4Gi. Together they
 match the frozen perf Duckgres worker's aggregate 3 CPU and 12Gi execution
 budget while exercising Trino's distributed execution path. Trino permits 2GB

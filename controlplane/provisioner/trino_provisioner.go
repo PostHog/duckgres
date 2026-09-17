@@ -2887,6 +2887,11 @@ func (c *trinoCatalogHTTPClient) runStatement(ctx context.Context, sql string) (
 	return c.drainStatement(ctx, body)
 }
 
+// trinoStatementCancelTimeout bounds the best-effort DELETE that cancels a
+// statement the drain abandons. It runs on a context detached from the
+// (already expired) reconcile context.
+const trinoStatementCancelTimeout = 5 * time.Second
+
 // drainStatement reads the nextUri chain until the statement
 // completes. Each hop is a GET; the final body carries the result
 // data (already-accumulated rows from earlier hops are kept).
@@ -2897,10 +2902,26 @@ func (c *trinoCatalogHTTPClient) runStatement(ctx context.Context, sql string) (
 // handful of hops in practice; 1000 is generous for any sane Trino.
 // Each hop also honors ctx — a cancelled reconcile context aborts
 // promptly rather than waiting for the next request to time out.
-func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []byte) ([][]interface{}, error) {
+//
+// A drain that stops early CANCELS the statement (DELETE on its nextUri).
+// Trino keeps a query whose client walked away alive until
+// query.client.timeout; until then it holds a concurrency slot in the
+// provisioner's resource group (root.admin.__admin_provisioner, 4 running).
+// Every control-plane replica reconciles, so a slow coordinator used to
+// fill that group with abandoned SHOW CATALOGS, queue the next tick's
+// statements behind them, time those out too, and never recover on its
+// own (mw-prod-us legacy cell, 2026-09-17: QUERY_QUEUE_FULL until the
+// abandoned queries were killed by hand).
+func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []byte) (rows [][]interface{}, err error) {
 	const maxDrainHops = 1000
 	var all [][]interface{}
 	body := initial
+	pending := ""
+	defer func() {
+		if err != nil && pending != "" {
+			c.cancelStatement(ctx, pending)
+		}
+	}()
 	for hop := 0; hop < maxDrainHops; hop++ {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("statement drain aborted: %w", err)
@@ -2910,6 +2931,8 @@ func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []b
 			return nil, fmt.Errorf("parse statement response: %w (body=%q)", err, string(body))
 		}
 		if r.Error != nil {
+			// Trino reported the statement failed: it is already terminal.
+			pending = ""
 			return nil, &TrinoStatementError{
 				ErrorName: r.Error.ErrorName,
 				ErrorType: r.Error.ErrorType,
@@ -2920,14 +2943,12 @@ func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []b
 		if r.NextURI == "" {
 			return all, nil
 		}
+		pending = r.NextURI
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.NextURI, nil)
 		if err != nil {
 			return nil, fmt.Errorf("build nextUri request: %w", err)
 		}
-		username, password := c.credentials()
-		req.Header.Set("X-Trino-User", username)
-		req.Header.Set("X-Trino-Source", TrinoProvisionerSource)
-		req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
+		c.setStatementHeaders(req)
 		resp, err := c.hc.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("get nextUri: %w", err)
@@ -2939,6 +2960,32 @@ func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []b
 		}
 	}
 	return nil, fmt.Errorf("statement drain exceeded %d hops without completing", maxDrainHops)
+}
+
+// cancelStatement asks Trino to cancel the statement behind nextURI. Best
+// effort: a failure only means the query lingers until Trino abandons it.
+func (c *trinoCatalogHTTPClient) cancelStatement(ctx context.Context, nextURI string) {
+	cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), trinoStatementCancelTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cancelCtx, http.MethodDelete, nextURI, nil)
+	if err != nil {
+		return
+	}
+	c.setStatementHeaders(req)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		slog.Warn("Trino provisioner could not cancel an abandoned statement.", "error", err)
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+}
+
+func (c *trinoCatalogHTTPClient) setStatementHeaders(req *http.Request) {
+	username, password := c.credentials()
+	req.Header.Set("X-Trino-User", username)
+	req.Header.Set("X-Trino-Source", TrinoProvisionerSource)
+	req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
 }
 
 // ListCatalogs runs SHOW CATALOGS and returns the catalog names.
