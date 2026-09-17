@@ -211,6 +211,10 @@ while [ "$shared_attempt" -lt 90 ]; do
   sleep 2; shared_attempt=$((shared_attempt + 1))
 done
 [ "$shared_attempt" -lt 90 ] || fail "post-cutover warehouse was not admitted"
+[ "$(shared_sql "SELECT connector_name FROM trino_catalogs WHERE cell_id='ci-pr-$PR-blue' AND catalog_name='$CAT_D'")" = ducklake ] \
+  || fail "new shared catalog did not persist the unquoted DuckLake connector name"
+[ "$(shared_gateway_query "$DB_D" "$pw_d" "SELECT count(*) FROM $CAT_D.information_schema.schemata WHERE schema_name = 'main'")" = '[[1]]' ] \
+  || fail "newly admitted tenant cannot read its shared catalog metadata through Gateway"
 TRINO="$GREEN_TRINO"
 trino_query __admin_provisioner "$shared_admin" 'SHOW CATALOGS' | jq -e --arg catalog "$CAT_D" 'any(.[]; .[0]==$catalog)' >/dev/null \
   || fail "active green missed the new catalog"

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,51 @@ import (
 )
 
 const sharedTestQueryID = "20260101_000000_00001_abcde"
+
+func TestSharedCatalogCreateRendersUnquotedConnector(t *testing.T) {
+	for _, connector := range []string{"ducklake", "hoglake", "example_2"} {
+		t.Run(connector, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				want := `CREATE CATALOG "org_quoted""name" USING ` + connector + ` WITH ("example.property" = 'it''s a value')`
+				if r.Method != http.MethodPost || r.URL.Path != "/v1/statement" || string(body) != want {
+					t.Errorf("unexpected catalog request: %s %s %q; want %q", r.Method, r.URL.Path, body, want)
+				}
+				_, _ = fmt.Fprintf(w, `{"id":%q,"stats":{"state":"FINISHED"}}`, sharedTestQueryID)
+			}))
+			defer server.Close()
+			props := map[string]string{"connector.name": connector, "example.property": "it's a value"}
+			if err := sharedTestClient(t, server).CreateCatalog(context.Background(), `org_quoted"name`, props); err != nil {
+				t.Fatal(err)
+			}
+			if requests.Load() != 1 || len(props) != 2 || props["connector.name"] != connector {
+				t.Fatal("catalog creation changed the properties or request count")
+			}
+		})
+	}
+}
+
+func TestSharedCatalogCreateRejectsInvalidConnectorBeforeHTTP(t *testing.T) {
+	for _, connector := range []string{"", "DuckLake", " ducklake", "ducklake ", "ducklake\n", "1ducklake", "_ducklake", "duck-lake", "duck.lake", `"ducklake"`, "ducklake; DROP CATALOG example", "ducklake/*comment*/", "ducklàke", "ducklake\x00"} {
+		t.Run(fmt.Sprintf("connector_%q", connector), func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				_, _ = fmt.Fprintf(w, `{"id":%q,"stats":{"state":"FINISHED"}}`, sharedTestQueryID)
+			}))
+			defer server.Close()
+			err := sharedTestClient(t, server).CreateCatalog(context.Background(), "org_example", map[string]string{"connector.name": connector})
+			if err == nil || !TrinoCatalogOutcomeTerminal(err) || requests.Load() != 0 {
+				t.Fatalf("invalid connector must fail locally with a terminal outcome: err=%v requests=%d", err, requests.Load())
+			}
+		})
+	}
+}
 
 func TestSharedCatalogStatementRequiresTerminalProof(t *testing.T) {
 	for _, tc := range []struct {

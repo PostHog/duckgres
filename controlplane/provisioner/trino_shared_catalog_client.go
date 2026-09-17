@@ -26,6 +26,7 @@ const (
 var sharedTrinoQueryID = regexp.MustCompile(`^[0-9]{8}_[0-9]{6}_[0-9]{5,}_[a-z0-9]{5}$`)
 var sharedTrinoPageToken = regexp.MustCompile(`^[0-9]+$`)
 var sharedTrinoSlug = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+var sharedTrinoConnectorName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 type trinoCatalogTerminalError struct{}
 
@@ -193,7 +194,7 @@ func (c *trinoSharedCatalogHTTPClient) ListNodes(ctx context.Context) ([]TrinoNo
 
 func (c *trinoSharedCatalogHTTPClient) CreateCatalog(ctx context.Context, name string, props map[string]string) error {
 	connector := props["connector.name"]
-	if connector == "" {
+	if !sharedTrinoConnectorName.MatchString(connector) {
 		return &trinoCatalogTerminalError{}
 	}
 	withProps := make(map[string]string, len(props))
@@ -202,7 +203,9 @@ func (c *trinoSharedCatalogHTTPClient) CreateCatalog(ctx context.Context, name s
 			withProps[key] = value
 		}
 	}
-	_, err := c.runStatement(ctx, fmt.Sprintf("CREATE CATALOG %s USING %s%s", quoteTrinoIdentifier(name), quoteTrinoIdentifier(connector), renderWithClause(withProps)))
+	// Trino treats a quoted connector identifier as a connector name containing quotes.
+	// Validate its restricted grammar before emitting it without quotes.
+	_, err := c.runStatement(ctx, fmt.Sprintf("CREATE CATALOG %s USING %s%s", quoteTrinoIdentifier(name), connector, renderWithClause(withProps)))
 	return err
 }
 
