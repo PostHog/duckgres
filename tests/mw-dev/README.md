@@ -526,6 +526,21 @@ normal `go test ./...` lane.
   fires these (it provisions, deprovisions, resets, and runs queries), but the
   events are sent asynchronously to PostHog's
   external capture API and the in-cluster Job holds no PostHog query-API creds
+  to read them back, so ingestion cannot be asserted in-Job. The emission logic
+  (event name, org group-analytics attribution, properties, failure-category
+  classification, and "no event on handler failure") is covered by
+  `internal/analytics/analytics_test.go`,
+  `controlplane/provisioning/analytics_events_test.go` (the `_begin` admin-API
+  events), `controlplane/provisioner/controller_analytics_test.go` (the
+  terminal `_success`/`_failed` events the provisioner controller emits on the
+  Ready/Failed/Deleted transitions), and `server/conn_analytics_test.go`.
+  The same applies to WHICH exporter a given key enables: `POSTHOG_API_KEY`
+  turns on analytics *and* the OTLP log export, while
+  `POSTHOG_ANALYTICS_API_KEY` turns on analytics alone (so query text is not
+  exported). Confirming that split end-to-end means reading both PostHog Logs
+  and the event stream back, which the Job cannot do for the reason above; the
+  key resolution is covered by `TestAnalyticsAPIKeyPrefersDedicatedKey` in
+  `internal/cliboot/analytics_test.go`.
 - **`--statement-timeout` (`DUCKGRES_STATEMENT_TIMEOUT`) is unit-only, deliberately.**
   The knob is server-global and defaults to `0` (unbounded), so asserting it
   in-Job needs one of two bad options: set a short global timeout on the e2e
@@ -544,21 +559,6 @@ normal `go test ./...` lane.
   named follow-up), it becomes cheaply assertable in-Job and should get a
   harness assertion then.
 
-  to read them back, so ingestion cannot be asserted in-Job. The emission logic
-  (event name, org group-analytics attribution, properties, failure-category
-  classification, and "no event on handler failure") is covered by
-  `internal/analytics/analytics_test.go`,
-  `controlplane/provisioning/analytics_events_test.go` (the `_begin` admin-API
-  events), `controlplane/provisioner/controller_analytics_test.go` (the
-  terminal `_success`/`_failed` events the provisioner controller emits on the
-  Ready/Failed/Deleted transitions), and `server/conn_analytics_test.go`.
-  The same applies to WHICH exporter a given key enables: `POSTHOG_API_KEY`
-  turns on analytics *and* the OTLP log export, while
-  `POSTHOG_ANALYTICS_API_KEY` turns on analytics alone (so query text is not
-  exported). Confirming that split end-to-end means reading both PostHog Logs
-  and the event stream back, which the Job cannot do for the reason above; the
-  key resolution is covered by `TestAnalyticsAPIKeyPrefersDedicatedKey` in
-  `internal/cliboot/analytics_test.go`.
 - **PostHog Logs (OTLP)** — `assert_worker_pod` checks plumbing only: the
   worker must not carry a plaintext `POSTHOG_API_KEY` `value:`, and when the
   CP container's *named* env has a `secretKeyRef` the worker must copy the

@@ -134,6 +134,12 @@ type portalExec struct {
 	// finishProfiling runs after rows.Close has allowed a Flight DoGet trailer
 	// to arrive. A suspended portal retains it until its terminal Execute.
 	finishProfiling func()
+	// releaseStmtCtx cancels/unregisters the statement context whose deadline
+	// bounds this portal. A suspended portal's RowSet outlives the Execute that
+	// opened it, so — like finishProfiling — the portal owns the release until
+	// its terminal Execute. Cancelling at the opening Execute's return would
+	// tear down the rowset the next Execute resumes from.
+	releaseStmtCtx func()
 }
 
 // closeExec releases a suspended portal's open rowset (if any). Must be
@@ -146,6 +152,9 @@ func (p *portal) closeExec() {
 	_ = p.exec.rows.Close()
 	if p.exec.finishProfiling != nil {
 		p.exec.finishProfiling()
+	}
+	if p.exec.releaseStmtCtx != nil {
+		p.exec.releaseStmtCtx()
 	}
 	p.exec = nil
 }
@@ -225,7 +234,6 @@ type clientConn struct {
 	cursors            map[string]*cursorState  // server-side cursor emulation
 	catalogUseRewrite  bool                     // true when bare `USE ducklake` should expand to the reliable two-part target
 	ctx                context.Context          // connection context, cancelled when connection is closed
-	stmtCtx            context.Context          // in-flight statement context; carries the StatementTimeout deadline
 	cancel             context.CancelFunc       // cancels the connection context
 	drainRequested     atomic.Bool              // close at the next idle protocol boundary
 	idleRead           atomic.Bool              // blocked reading the next top-level client message
@@ -499,7 +507,6 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 	} else {
 		ctx, cancel = context.WithCancel(wire.WithQueryID(c.ctx, c.currentQueryID()))
 	}
-	c.stmtCtx = ctx
 	key := c.backendKey()
 	c.server.RegisterQuery(key, cancel)
 
@@ -535,10 +542,6 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 		}
 		c.server.UnregisterQuery(key)
 		cancel()
-		// Deliberately NOT clearing c.stmtCtx: the error paths classify the
-		// failure after cleanup has run, and a cleared context would make a
-		// statement timeout look like an ordinary infra error. The next
-		// statement overwrites it.
 	}
 
 	return ctx, cleanup
@@ -1882,7 +1885,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
-					errMsg = "canceling statement due to user request"
+					errMsg = c.cancellationMessage(err)
 				} else {
 					c.logQueryError(query, err)
 				}

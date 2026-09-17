@@ -306,7 +306,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 			errMsg := err.Error()
 			if c.isCallerCancellation(err) {
 				errCode = "57014"
-				errMsg = "canceling statement due to user request"
+				errMsg = c.cancellationMessage(err)
 			}
 			c.sendError("ERROR", errCode, errMsg)
 			c.setTxError()
@@ -381,7 +381,7 @@ func (c *clientConn) handleFetchCursor(query string, stmt *pg_query.FetchStmt) e
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
 			errCode = "57014"
-			errMsg = "canceling statement due to user request"
+			errMsg = c.cancellationMessage(err)
 		}
 		c.sendError("ERROR", errCode, errMsg)
 		c.setTxError()
@@ -447,7 +447,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 	if cursor.rows == nil {
 		if err := c.openCursor(cursor); err != nil {
 			if c.isCallerCancellation(err) {
-				c.sendError("ERROR", "57014", "canceling statement due to user request")
+				c.sendError("ERROR", "57014", c.cancellationMessage(err))
 			} else {
 				c.sendError("ERROR", "42000", err.Error())
 			}
@@ -506,7 +506,7 @@ func (c *clientConn) handleFetchCursorExtended(p *portal) {
 
 	if err := cursor.rows.Err(); err != nil {
 		if c.isCallerCancellation(err) {
-			c.sendError("ERROR", "57014", "canceling statement due to user request")
+			c.sendError("ERROR", "57014", c.cancellationMessage(err))
 		} else {
 			c.sendError("ERROR", "42000", err.Error())
 		}

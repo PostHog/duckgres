@@ -1470,20 +1470,25 @@ func (e *abortedSelectRecoveryExecutor) PingContext(context.Context) error {
 func (e *abortedSelectRecoveryExecutor) Close() error { return nil }
 
 type abortedExecAlterViewRecoveryExecutor struct {
-	originalQuery string
+	originalAttempts int
+	originalQuery    string
 	noopProfiling
 	rewritten    string
 	execCalls    []string
 	execCtxCalls []string
 }
 
-func (e *abortedExecAlterViewRecoveryExecutor) execResult(query string, callIndex int) (ExecResult, error) {
+func (e *abortedExecAlterViewRecoveryExecutor) execResult(query string, _ int) (ExecResult, error) {
 	trimmed := strings.TrimSpace(query)
 	switch trimmed {
 	case "ROLLBACK":
 		return &fakeExecResult{}, nil
 	case e.originalQuery:
-		if callIndex == 1 {
+		// Count attempts explicitly: statement execution and ROLLBACK now share
+		// ExecContext, so a positional index over the recorded calls is no longer
+		// a reliable way to tell the first attempt from the retry.
+		e.originalAttempts++
+		if e.originalAttempts == 1 {
 			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
 		}
 		return nil, errors.New("Binder Error: cannot use alter table on a view because this object is not a table; use ALTER VIEW instead")
@@ -1523,6 +1528,7 @@ func (e *abortedExecAlterViewRecoveryExecutor) PingContext(context.Context) erro
 func (e *abortedExecAlterViewRecoveryExecutor) Close() error { return nil }
 
 type abortedAlterViewRecoveryExecutor struct {
+	alterAttempts      int
 	execContextQueries []string
 	noopProfiling
 	execQueries []string
@@ -1538,7 +1544,11 @@ func (e *abortedAlterViewRecoveryExecutor) ExecContext(_ context.Context, query 
 	case "ROLLBACK":
 		return &fakeExecResult{}, nil
 	case "ALTER TABLE SOME_VIEW RENAME TO RENAMED_VIEW":
-		if len(e.execContextQueries) == 1 {
+		// Count attempts explicitly: statements and ROLLBACK now share
+		// ExecContext, so a positional index is no longer a reliable
+		// first-attempt signal.
+		e.alterAttempts++
+		if e.alterAttempts == 1 {
 			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
 		}
 		return nil, errors.New("Binder Error: Cannot use ALTER TABLE statement on object \"some_view\" because it is not a table")
@@ -1899,11 +1909,13 @@ func TestHandleExecuteAbortedRecoveryPreservesAlterViewFallback(t *testing.T) {
 
 	c.handleExecute(body.Bytes())
 
-	expectedExecCalls := []string{originalQuery, originalQuery, rewrittenQuery}
-	if !slices.Equal(executor.execCalls, expectedExecCalls) {
-		t.Fatalf("unexpected Exec calls: got %v want %v", executor.execCalls, expectedExecCalls)
+	// Extended Execute now runs statements through ExecContext so the statement
+	// timeout and CancelRequest reach them; the context-less Exec is no longer
+	// used on this path, and ROLLBACK shares the same method.
+	if len(executor.execCalls) != 0 {
+		t.Fatalf("context-less Exec should no longer be used: got %v", executor.execCalls)
 	}
-	expectedExecContextCalls := []string{"ROLLBACK"}
+	expectedExecContextCalls := []string{originalQuery, "ROLLBACK", originalQuery, rewrittenQuery}
 	if !slices.Equal(executor.execCtxCalls, expectedExecContextCalls) {
 		t.Fatalf("unexpected ExecContext calls: got %v want %v", executor.execCtxCalls, expectedExecContextCalls)
 	}
@@ -1943,15 +1955,19 @@ func TestHandleExecuteRecoversAbortedAutocommitAlterViewFallback(t *testing.T) {
 		"ALTER TABLE some_view RENAME TO renamed_view",
 		"ALTER VIEW some_view RENAME TO renamed_view",
 	}
-	if len(exec.execContextQueries) != 1 || exec.execContextQueries[0] != "ROLLBACK" {
-		t.Fatalf("expected one rollback via ExecContext, got %v", exec.execContextQueries)
+	// Extended Execute now runs statements through ExecContext (so the statement
+	// timeout and CancelRequest reach them), so the recovery sequence and the
+	// ROLLBACK share that method and the context-less Exec goes unused.
+	if len(exec.execQueries) != 0 {
+		t.Fatalf("context-less Exec should no longer be used: got %v", exec.execQueries)
 	}
-	if len(exec.execQueries) != len(wantExec) {
-		t.Fatalf("expected exec sequence %v, got %v", wantExec, exec.execQueries)
+	wantExecContext := []string{wantExec[0], "ROLLBACK", wantExec[1], wantExec[2]}
+	if len(exec.execContextQueries) != len(wantExecContext) {
+		t.Fatalf("expected ExecContext sequence %v, got %v", wantExecContext, exec.execContextQueries)
 	}
-	for i, got := range exec.execQueries {
-		if got != wantExec[i] {
-			t.Fatalf("expected exec query %d to be %q, got %q", i, wantExec[i], got)
+	for i, got := range exec.execContextQueries {
+		if got != wantExecContext[i] {
+			t.Fatalf("expected ExecContext query %d to be %q, got %q", i, wantExecContext[i], got)
 		}
 	}
 }

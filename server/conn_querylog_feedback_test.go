@@ -16,8 +16,13 @@ type feedbackExecutor struct {
 	queryFn func(query string, args ...any) (RowSet, error)
 }
 
-func (e *feedbackExecutor) QueryContext(_ context.Context, _ string, _ ...any) (RowSet, error) {
-	return nil, errors.New("not implemented")
+// Execution paths must run through the context-aware methods so the statement
+// timeout and CancelRequest reach them, so route the fixture's queryFn here.
+func (e *feedbackExecutor) QueryContext(_ context.Context, query string, args ...any) (RowSet, error) {
+	if e.queryFn == nil {
+		return nil, errors.New("not implemented")
+	}
+	return e.queryFn(query, args...)
 }
 
 func (e *feedbackExecutor) ExecContext(_ context.Context, _ string, _ ...any) (ExecResult, error) {
@@ -168,15 +173,29 @@ func TestHandleExecuteLogsRowsErr(t *testing.T) {
 	// Execute body: empty portal name + maxRows=0
 	c.handleExecute([]byte{0, 0, 0, 0, 0})
 
-	select {
-	case entry := <-ql.ch:
-		if entry.ExceptionCode != "42000" {
-			t.Fatalf("expected exception code 42000, got %q", entry.ExceptionCode)
+	// Extended Execute now acquires a statement context (so the timeout and
+	// CancelRequest reach it), which also emits a QueryStart entry ahead of the
+	// completion entry. Scan for the completion entry rather than assuming the
+	// first one off the channel is it.
+	var found bool
+	for drained := 0; drained < 8 && !found; drained++ {
+		select {
+		case entry := <-ql.ch:
+			if entry.ExceptionCode == "" && entry.Exception == "" {
+				continue // QueryStart
+			}
+			if entry.ExceptionCode != "42000" {
+				t.Fatalf("expected exception code 42000, got %q", entry.ExceptionCode)
+			}
+			if entry.Exception != "row iteration failed" {
+				t.Fatalf("expected row iteration error, got %q", entry.Exception)
+			}
+			found = true
+		default:
+			t.Fatal("expected query log entry for rows.Err path")
 		}
-		if entry.Exception != "row iteration failed" {
-			t.Fatalf("expected row iteration error, got %q", entry.Exception)
-		}
-	default:
-		t.Fatal("expected query log entry for rows.Err path")
+	}
+	if !found {
+		t.Fatal("no completion query log entry for rows.Err path")
 	}
 }

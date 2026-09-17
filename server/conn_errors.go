@@ -16,14 +16,7 @@ import (
 // since infra cancels are real failures we want surfaced. Use
 // (*clientConn).isCallerCancellation for that.
 func isQueryCancelled(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "context canceled") || strings.Contains(msg, "context deadline exceeded")
+	return err == context.Canceled || (err != nil && strings.Contains(err.Error(), "context canceled"))
 }
 
 // statementTimeout returns the effective per-statement timeout, or 0 when
@@ -35,24 +28,35 @@ func (c *clientConn) statementTimeout() time.Duration {
 	return c.server.cfg.StatementTimeout
 }
 
-// statementTimedOut reports whether the in-flight statement's own deadline
-// expired. The deadline lives on the STATEMENT context, so the connection
-// context is still healthy when it fires and c.ctx.Err() is nil -- which means
-// isCallerCancellation alone would misclassify a timeout as an infra failure
-// and surface it as a bare 42000 with a "context deadline exceeded" message.
-// Check this before isCallerCancellation at every classification site.
-func (c *clientConn) statementTimedOut() bool {
-	if c == nil || c.stmtCtx == nil {
+// statementTimedOut reports whether err is this statement hitting the configured
+// statement timeout.
+//
+// Classified from the ERROR, not from stored state. An earlier version recorded
+// the live statement context on the connection and inspected it here, which was
+// sticky: once any statement timed out, a later unrelated failure on a path that
+// did not overwrite the field was reported as a timeout and its logging skipped.
+//
+// Gated on the timeout being configured, so a deployment with the feature off
+// keeps today's classification byte for byte -- internal deadlines (attach,
+// exec, worker gRPC) must not start surfacing as 57014 just because this code
+// exists. When the feature IS on, an internal deadline racing a statement can
+// still be labelled a statement timeout; that is an accepted narrowing, not an
+// oversight.
+func (c *clientConn) statementTimedOut(err error) bool {
+	if c == nil || err == nil || c.statementTimeout() <= 0 {
 		return false
 	}
-	return errors.Is(c.stmtCtx.Err(), context.DeadlineExceeded)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return strings.Contains(err.Error(), "context deadline exceeded")
 }
 
 // cancellationMessage returns the client-facing 57014 message. The wording
 // mirrors PostgreSQL's exactly, because drivers and ORMs string-match it to
 // decide whether a failure is retryable.
-func (c *clientConn) cancellationMessage() string {
-	if c.statementTimedOut() {
+func (c *clientConn) cancellationMessage(err error) string {
+	if c.statementTimedOut(err) {
 		return "canceling statement due to statement timeout"
 	}
 	return "canceling statement due to user request"
@@ -67,15 +71,18 @@ func (c *clientConn) cancellationMessage() string {
 // cancelled". This matters for alerting — "Query execution errored." should
 // fire on worker kills, not get silently downgraded to "Worker statement finished.".
 func (c *clientConn) isCallerCancellation(err error) bool {
-	if !isQueryCancelled(err) {
+	if c == nil {
 		return false
 	}
-	if c == nil {
+	if c.statementTimedOut(err) {
+		return true
+	}
+	if !isQueryCancelled(err) {
 		return false
 	}
 	// A statement timeout is caller-driven even though the connection context is
 	// untouched, so it must not be logged as an infra failure.
-	if c.statementTimedOut() {
+	if c.statementTimedOut(err) {
 		return true
 	}
 	if c.ctx == nil {
