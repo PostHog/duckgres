@@ -557,6 +557,11 @@ func (c *clientConn) queryContextInner(monitor bool) (context.Context, func()) {
 // It waits for the monitor goroutine to exit before returning, ensuring the
 // bufio.Reader is not accessed concurrently with the message loop.
 func (c *clientConn) startDisconnectMonitor(ctx context.Context) (stop func()) {
+	// The monitor needs the wire connection and reader. Both are always set
+	// on a real connection; bare test fixtures may omit them.
+	if c.conn == nil || c.reader == nil {
+		return func() {}
+	}
 	stopped := make(chan struct{})
 	done := make(chan struct{})
 
@@ -880,8 +885,20 @@ func (c *clientConn) validateWithDuckDB(query string) error {
 	}
 
 	// Use EXPLAIN to validate the query without executing it
-	// DuckDB's EXPLAIN will fail if the query is syntactically invalid
-	_, err := c.executor.Exec("EXPLAIN " + query)
+	// DuckDB's EXPLAIN will fail if the query is syntactically invalid.
+	// Bound the probe by the statement timeout when configured: it runs on the
+	// engine before the statement's own context exists, and an EXPLAIN against
+	// a wedged engine would otherwise hang the client before the statement
+	// (and its deadline) is ever reached. Deliberately NOT queryContext: the
+	// probe is not statement execution — no CancelRequest registration, no
+	// execStarted marking — a validation failure stays ExceptionBeforeStart.
+	execCtx := c.ctx
+	if timeout := c.statementTimeout(); timeout > 0 {
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithTimeout(c.ctx, timeout)
+		defer cancel()
+	}
+	_, err := c.executor.ExecContext(execCtx, "EXPLAIN "+query)
 	if err != nil {
 		// Strip "EXPLAIN " from error messages to avoid confusing users
 		errMsg := strings.Replace(err.Error(), "EXPLAIN ", "", 1)
@@ -1885,6 +1902,7 @@ func (c *clientConn) handleQuery(body []byte) (retErr error) {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
+					errCode = "57014"
 					errMsg = c.cancellationMessage(err)
 				} else {
 					c.logQueryError(query, err)

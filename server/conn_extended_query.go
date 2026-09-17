@@ -399,7 +399,17 @@ func (c *clientConn) handleDescribe(body []byte) {
 			args[i] = nil
 		}
 
-		rows, err := c.executor.Query(describeQuery, args...)
+		// The probe really executes the statement (LIMIT 0 bounds rows, not
+		// planning or side effects), so it runs under a statement context like
+		// any execution: the --statement-timeout deadline must bound a probe
+		// that wedges in the engine, and the probe registers for CancelRequest.
+		// No disconnect monitor (like the Execute path): the extended protocol
+		// pipelines messages, so the next message's bytes are often already
+		// buffered. A probe failure still answers NoData; Execute then runs the
+		// statement under its own fresh context and reports the real error.
+		probeCtx, probeCleanup := c.queryContextInner(false)
+		defer probeCleanup()
+		rows, err := c.executor.QueryContext(probeCtx, describeQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
 			c.logger().Debug("Describe failed to get columns.", "error", err)
@@ -549,7 +559,12 @@ func (c *clientConn) handleDescribe(body []byte) {
 			describeQuery = describeQuery + " LIMIT 0"
 		}
 
-		rows, err := c.executor.Query(describeQuery, args...)
+		// As in the statement-Describe branch above: the probe really executes
+		// the statement, so it runs under a statement context (deadline +
+		// CancelRequest registration, no disconnect monitor).
+		probeCtx, probeCleanup := c.queryContextInner(false)
+		defer probeCleanup()
+		rows, err := c.executor.QueryContext(probeCtx, describeQuery, args...)
 		if err != nil {
 			// Can't describe - send NoData
 			_ = wire.WriteNoData(c.writer)
@@ -817,10 +832,27 @@ func (c *clientConn) handleExecute(body []byte) {
 		return
 	}
 
+	// Extended-protocol Execute needs a real statement context, like the simple
+	// and batched paths. Created ABOVE the multi-statement branch: the
+	// writable-CTE rewrite's steps ARE the statement, so they share this
+	// context (deadline + CancelRequest registration) rather than running
+	// context-less.
+	stmtCtx, stmtCleanup := c.queryContextInner(false)
+	defer func() {
+		// A suspended portal keeps its RowSet open for the NEXT Execute, so the
+		// statement context has to outlive this handler; ownership moves to the
+		// portal and closeExec releases it.
+		if p.exec != nil {
+			p.exec.releaseStmtCtx = stmtCleanup
+			return
+		}
+		stmtCleanup()
+	}()
+
 	// Handle multi-statement results (e.g., writable CTE rewrites)
 	if len(p.stmt.statements) > 0 {
 		c.logger().Debug("Execute multi-statement.", "statements", len(p.stmt.statements), "cleanup", len(p.stmt.cleanupStatements))
-		c.executeMultiStatementExtended(p.stmt.statements, p.stmt.cleanupStatements, args, p.resultFormats, p.described)
+		c.executeMultiStatementExtended(p.stmt.statements, p.stmt.cleanupStatements, args, p.resultFormats, p.described, stmtCtx)
 		return
 	}
 
@@ -852,27 +884,12 @@ func (c *clientConn) handleExecute(body []byte) {
 		c.logWorkerStatementFinished(workerStatement, queryStart, queryRowsAff, queryFinalErr)
 	}()
 
-	// Extended-protocol Execute needs a real statement context, like the simple
-	// and batched paths. Without it this path ran on context.Background() (see
-	// PinnedExecutor.Query/Exec), which meant prepared statements — what pgx,
-	// psycopg3 and JDBC actually send — were reachable by NEITHER the statement
-	// timeout NOR a pgwire CancelRequest: RegisterQuery is only ever called from
-	// queryContextInner, and nothing on this path called it.
-	// queryContextInner(false): no disconnect monitor. Like the cursor path, the
-	// monitor's bufio Peek would race the message loop's own reads — the extended
-	// protocol pipelines Parse/Bind/Execute/Sync, so bytes for the next message
-	// are often already buffered. Disconnect still cancels via c.ctx.
-	stmtCtx, stmtCleanup := c.queryContextInner(false)
-	defer func() {
-		// A suspended portal keeps its RowSet open for the NEXT Execute, so the
-		// statement context has to outlive this handler; ownership moves to the
-		// portal and closeExec releases it.
-		if p.exec != nil {
-			p.exec.releaseStmtCtx = stmtCleanup
-			return
-		}
-		stmtCleanup()
-	}()
+	// The statement context is created above the multi-statement branch; see
+	// the comment there. queryContextInner(false): no disconnect monitor. Like
+	// the cursor path, the monitor's bufio Peek would race the message loop's
+	// own reads — the extended protocol pipelines Parse/Bind/Execute/Sync, so
+	// bytes for the next message are often already buffered. Disconnect still
+	// cancels via c.ctx.
 
 	if !returnsResults {
 		// Open cursors pin the session's single DuckDB connection — release
@@ -921,6 +938,7 @@ func (c *clientConn) handleExecute(body []byte) {
 				errCode := classifyErrorCode(err)
 				errMsg := err.Error()
 				if c.isCallerCancellation(err) {
+					errCode = "57014"
 					errMsg = c.cancellationMessage(err)
 				} else {
 					c.logQueryError(convertedQuery, err)
@@ -989,6 +1007,7 @@ func (c *clientConn) handleExecute(body []byte) {
 		errCode := classifyErrorCode(err)
 		errMsg := err.Error()
 		if c.isCallerCancellation(err) {
+			errCode = "57014"
 			errMsg = c.cancellationMessage(err)
 		} else {
 			c.logQueryError(convertedQuery, err)

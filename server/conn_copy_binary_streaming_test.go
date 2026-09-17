@@ -57,6 +57,14 @@ func (e *recordingCopyFromStdinExecutor) Query(query string, args ...any) (RowSe
 	return &exactTypeRowSet{RowSet: rowSet}, nil
 }
 
+func (e *recordingCopyFromStdinExecutor) QueryContext(ctx context.Context, query string, args ...any) (RowSet, error) {
+	rowSet, err := e.LocalExecutor.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &exactTypeRowSet{RowSet: rowSet}, nil
+}
+
 type exactStaticColumnType struct {
 	reported string
 	exact    string

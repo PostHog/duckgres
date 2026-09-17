@@ -741,6 +741,11 @@ func (s *Server) ActiveConnections() int64 {
 // This allows the query to be cancelled via a cancel request from another connection.
 func (s *Server) RegisterQuery(key BackendKey, cancel context.CancelFunc) {
 	s.activeQueriesMu.Lock()
+	// Lazily initialized: production servers get the map from New, but test
+	// fixtures (and InitMinimalServer paths) may construct a bare Server.
+	if s.activeQueries == nil {
+		s.activeQueries = make(map[BackendKey]context.CancelFunc)
+	}
 	s.activeQueries[key] = cancel
 	s.activeQueriesMu.Unlock()
 }

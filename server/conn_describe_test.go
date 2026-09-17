@@ -14,8 +14,10 @@ type describeRecordingExecutor struct {
 	rowSet  RowSet
 }
 
-func (e *describeRecordingExecutor) QueryContext(context.Context, string, ...any) (RowSet, error) {
-	return nil, errors.New("not implemented")
+func (e *describeRecordingExecutor) QueryContext(_ context.Context, query string, args ...any) (RowSet, error) {
+	// The Describe probe runs through the context-aware method (it carries
+	// the statement-timeout deadline); record identically.
+	return e.Query(query, args...)
 }
 
 func (e *describeRecordingExecutor) ExecContext(context.Context, string, ...any) (ExecResult, error) {
@@ -74,7 +76,9 @@ func TestHandleDescribePortalUsesLimitZeroProbe(t *testing.T) {
 	var out bytes.Buffer
 	c := &clientConn{
 		executor: exec,
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
 		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
 		portals: map[string]*portal{
 			"p1": {
 				stmt: &preparedStmt{
@@ -112,7 +116,9 @@ func TestHandleDescribeExplainDoesNotExecute(t *testing.T) {
 			var out bytes.Buffer
 			c := &clientConn{
 				executor: exec,
+				server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
 				writer:   bufio.NewWriter(&out),
+				ctx:      context.Background(),
 				stmts: map[string]*preparedStmt{
 					"s1": {query: tc.query, convertedQuery: tc.query},
 				},
@@ -143,7 +149,9 @@ func TestHandleDescribePortalPreservesExistingLimit(t *testing.T) {
 	var out bytes.Buffer
 	c := &clientConn{
 		executor: exec,
+		server:   &Server{activeQueries: make(map[BackendKey]context.CancelFunc)},
 		writer:   bufio.NewWriter(&out),
+		ctx:      context.Background(),
 		portals: map[string]*portal{
 			"p1": {
 				stmt: &preparedStmt{

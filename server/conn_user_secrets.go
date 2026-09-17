@@ -148,13 +148,17 @@ func (c *clientConn) execUserSecretDDL(query string) (handled bool, tag string, 
 			}
 		}
 		errMsg := execErr.Error()
+		errCode := classifyErrorCode(execErr)
 		if c.isCallerCancellation(execErr) {
+			// classifyErrorCode maps a deadline to XX000; a statement timeout is
+			// 57014, same as a user cancel.
+			errCode = "57014"
 			errMsg = c.cancellationMessage(execErr)
 		} else {
 			c.logQueryError(query, execErr)
 		}
 		c.setTxError()
-		return true, "", &secretDDLError{classifyErrorCode(execErr), errMsg}
+		return true, "", &secretDDLError{errCode, errMsg}
 	}
 
 	// Session-side DDL succeeded; now make it durable. Failures here must be

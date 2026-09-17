@@ -1181,6 +1181,7 @@ func ResolveEffective(fileCfg *configloader.FileConfig, cli CLIInputs, getenv fu
 		ProcessMaxWorkers:               processMaxWorkers,
 		ProcessRetireOnSessionEnd:       processRetireOnSessionEnd,
 		SessionInitTimeout:              cfg.SessionInitTimeout,
+		StatementTimeout:                cfg.StatementTimeout,
 		WorkerQueueTimeout:              workerQueueTimeout,
 		WorkerIdleTimeout:               workerIdleTimeout,
 		HandoverDrainTimeout:            handoverDrainTimeout,

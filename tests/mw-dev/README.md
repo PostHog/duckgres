@@ -567,15 +567,20 @@ normal `go test ./...` lane.
   assertions (reshard copies, DuckLake round-trips, concurrent-writer checks);
   or leave it generous and burn that many minutes on a deliberately slow query
   just to watch it expire. Neither buys more confidence than the unit tests,
-  which cover the behaviour that can actually regress: the deadline is applied
-  to the STATEMENT context and not the connection context, `0` leaves
-  statements unbounded, an expired deadline classifies as `57014` with
-  PostgreSQL's exact `canceling statement due to statement timeout` wording
-  (drivers string-match it), a user cancel keeps the `due to user request`
-  wording, and `isQueryCancelled` matches `context deadline exceeded` as well
-  as `context canceled`. See `server/statement_timeout_test.go`. If the knob
-  ever becomes per-connection (a client-honored `statement_timeout` GUC is the
-  named follow-up), it becomes cheaply assertable in-Job and should get a
+  which drive the real protocol handlers with a wedging fake executor and
+  cover the behaviour that can actually regress: the deadline reaches the
+  engine on every execution path (simple, batched, extended Execute, the
+  writable-CTE rewrites on both protocols, the extended Describe probes, COPY
+  in both directions, cursors), it rides the STATEMENT context and never the
+  connection context, `0` leaves statements unbounded, an expired deadline
+  classifies as `57014` with PostgreSQL's exact `canceling statement due to
+  statement timeout` wording (drivers string-match it), a user cancel keeps
+  the `due to user request` wording, an internal deadline with the knob off
+  never becomes 57014, a suspended portal keeps its context alive across
+  Execute legs, and a cursor is bounded over its whole lifetime. See
+  `server/statement_timeout_test.go`. If the knob ever becomes
+  per-connection (a client-honored `statement_timeout` GUC is the named
+  follow-up), it becomes cheaply assertable in-Job and should get a
   harness assertion then.
 
 - **PostHog Logs (OTLP)** — `assert_worker_pod` checks plumbing only: the
