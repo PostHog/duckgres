@@ -70,9 +70,12 @@ observes registered backend pods, coordinator identity, workers, and a dedicated
 warehouse canary. It is disabled by default and does not provision or move tenants.
 
 `DUCKGRES_TRINO_HOGLAKE_URI` defaults to empty (DuckLake catalog provisioning).
-The frozen perf deployments set it automatically to their namespace-local Hoglake
-service, replacing the Trino backend in the existing cached and uncached scenarios.
-See the [scenario runbook](docs/runbooks/scenario-runner.md).
+It selects Hoglake for newly created catalogs across the provisioner's scope;
+changing it does not migrate existing catalogs. The frozen perf deployments use
+this setting with separately bootstrapped Hoglake fixtures. It does not provide
+managed tenant bootstrap or per-tenant S3 credentials. See the
+[Hoglake provisioning contract and rollout prerequisites](docs/runbooks/trino-hoglake-provisioning.md)
+and the [scenario runbook](docs/runbooks/scenario-runner.md).
 
 The existing Trino deployment appears as `legacy` in the Trino console API.
 This name does not change its stored org assignments or catalog-store key.
