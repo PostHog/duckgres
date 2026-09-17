@@ -110,3 +110,21 @@ func TestIsQueryCancelledMatchesDeadlineExceeded(t *testing.T) {
 		})
 	}
 }
+
+// A cursor takes ONE context at DECLARE and holds it across every FETCH, so the
+// timeout bounds the cursor's whole lifetime rather than each FETCH. That is
+// stricter than PostgreSQL and is deliberate; pin it so it cannot change silently.
+func TestStatementTimeoutBoundsCursorLifetimeNotEachFetch(t *testing.T) {
+	c := newTimeoutTestConn(t, 50*time.Millisecond)
+
+	ctx, cleanup := c.queryContextForCursor()
+	defer cleanup()
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("cursor context has no deadline; the timeout does not reach the cursor path")
+	}
+	if until := time.Until(deadline); until <= 0 || until > time.Second {
+		t.Fatalf("cursor deadline %v out of expected range", until)
+	}
+}

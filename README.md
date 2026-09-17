@@ -674,7 +674,8 @@ Options:
   -threads int             DuckDB threads per session
   -process-isolation       Enable process isolation (spawn child process per connection)
   -idle-timeout string     Connection idle timeout (e.g., '30m', '1h', '-1' to disable)
-  -statement-timeout string Cancel any single statement running longer than this (e.g., '60m'); empty/'0' = unbounded
+  -statement-timeout string
+                          Cancel any single statement running longer than this (e.g., '60m'); empty/'0' = unbounded
   -mode string             Run mode: standalone (default), control-plane, duckdb-service, or reshard-runner
   -process-min-workers int Pre-warm process worker count at startup (control-plane mode, default 0)
   -process-max-workers int Max process workers, 0=auto-derived (control-plane mode)
