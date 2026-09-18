@@ -29,6 +29,11 @@ type storedValidationReceipt struct {
 	Checks          []string `json:"checks"`
 	CertificateHash string   `json:"certificateHash"`
 	ObservedAt      string   `json:"observedAt"`
+	// Unacknowledged names security components that did not report what they
+	// loaded. It is persisted so an operator reading the receipt later can see
+	// exactly which part of the authorization state was never acknowledged,
+	// rather than inferring it from the absence of a check.
+	Unacknowledged []string `json:"unacknowledged,omitempty"`
 }
 
 func marshalValidationReceipt(validation trinoPoolValidation) (string, error) {
@@ -42,6 +47,7 @@ func marshalValidationReceipt(validation trinoPoolValidation) (string, error) {
 		Checks:          validation.Checks,
 		CertificateHash: validation.CertificateHash,
 		ObservedAt:      nowUTC().Format(time.RFC3339),
+		Unacknowledged:  validation.Unacknowledged,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode validation receipt: %w", err)
@@ -69,6 +75,7 @@ func unmarshalValidationReceipt(document string) (trinoPoolValidation, error) {
 		ReadyWorkers:    stored.ReadyWorkers,
 		Checks:          stored.Checks,
 		CertificateHash: stored.CertificateHash,
+		Unacknowledged:  stored.Unacknowledged,
 	}, nil
 }
 

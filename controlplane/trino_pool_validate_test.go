@@ -202,3 +202,57 @@ func TestCertificateHashBindsTheObservedFacts(t *testing.T) {
 		}
 	}
 }
+
+// A component that cannot report what it loaded has acknowledged nothing.
+// Trino's file password authenticator and group provider DO report; the OPA
+// access control does not, so on a cluster with OPA the auth-revision check
+// must be absent from the receipt and the silent component named. The Gateway
+// records the check list verbatim, so claiming the check here would write a
+// false acknowledgement into the operator's evidence.
+func TestValidationDoesNotClaimAnUnacknowledgedAuthRevision(t *testing.T) {
+	coordinator := newFakeCoordinator(t)
+	coordinator.sync["securityRevisions"] = []any{
+		map[string]any{"kind": "password-authenticator", "name": "file", "revision": "9"},
+		map[string]any{"kind": "group-provider", "name": "file", "revision": "4"},
+		// What the OPA access control actually reports today.
+		map[string]any{
+			"kind": "system-access-control", "name": "opa", "revision": nil,
+			"error": "system-access-control 'opa' does not report the configuration it has loaded",
+		},
+	}
+
+	validation, err := coordinator.validate(t, 2, 42)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	for _, check := range validation.Checks {
+		if check == trinoPoolCheckAuthRevision {
+			t.Fatal("the receipt claimed an auth-revision check no component acknowledged")
+		}
+	}
+	if len(validation.Unacknowledged) != 1 || validation.Unacknowledged[0] != "system-access-control/opa" {
+		t.Fatalf("unacknowledged = %v, want the OPA access control named", validation.Unacknowledged)
+	}
+}
+
+// When every component does report, the check is claimed and nothing is left
+// unacknowledged.
+func TestValidationClaimsTheAuthRevisionWhenEveryComponentReports(t *testing.T) {
+	coordinator := newFakeCoordinator(t)
+	validation, err := coordinator.validate(t, 2, 42)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	claimed := false
+	for _, check := range validation.Checks {
+		if check == trinoPoolCheckAuthRevision {
+			claimed = true
+		}
+	}
+	if !claimed {
+		t.Fatalf("checks = %v, want the auth revision claimed", validation.Checks)
+	}
+	if len(validation.Unacknowledged) != 0 {
+		t.Fatalf("unacknowledged = %v", validation.Unacknowledged)
+	}
+}

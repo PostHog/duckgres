@@ -227,6 +227,17 @@ func projectableTrinoUsername(username string) bool {
 	return len(username) <= 255 && trinoUsernamePattern.MatchString(username)
 }
 
+// ProjectableTrinoUsername reports whether a username reaches the coordinator's
+// password file at all.
+//
+// It is exported because the pooled admission binding must publish EXACTLY the
+// principals password.db contains: a username this refuses never authenticates,
+// so binding it would advertise a principal Trino rejects, and deriving the two
+// sets from different code is how they drift apart.
+func ProjectableTrinoUsername(username string) bool {
+	return projectableTrinoUsername(username)
+}
+
 // TrinoScopeGroupName returns the group label for a project-scoped login:
 // one group per (org, team), carrying that team's schema scope in the OPA
 // bundle.

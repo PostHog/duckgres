@@ -92,6 +92,12 @@ type trinoPoolValidation struct {
 	ReadyWorkers    int
 	Checks          []string
 	CertificateHash string
+	// Unacknowledged names the security components that did NOT report a
+	// loaded revision. It is recorded and surfaced rather than being folded
+	// into a pass: a component that cannot say what it loaded has not
+	// acknowledged anything, and treating its silence as agreement is exactly
+	// the false readiness this validation exists to prevent.
+	Unacknowledged []string
 }
 
 // validateTrinoPoolCandidate probes one candidate through its own endpoint.
@@ -161,6 +167,24 @@ func validateTrinoPoolCandidate(
 		return trinoPoolValidation{}, fmt.Errorf("%w: coordinator changed during observation", errTrinoPoolCandidateNotReady)
 	}
 
+	acknowledged, unacknowledged := splitSecurityRevisions(sync.SecurityRevisions)
+	checks := []string{
+		trinoPoolCheckImage,
+		trinoPoolCheckWorkers,
+		trinoPoolCheckCatalogRevision,
+		trinoPoolCheckOperationalConnection,
+	}
+	// The auth-revision check is claimed ONLY when every security component the
+	// coordinator exposes actually reported what it loaded. Today the file
+	// password authenticator and group provider do; the OPA access control does
+	// not, so on a cluster with OPA this check is absent and the receipt names
+	// the component that stayed silent. The Gateway records the check list
+	// verbatim, so claiming it here would put a false acknowledgement into the
+	// operator's evidence.
+	if len(acknowledged) > 0 && len(unacknowledged) == 0 {
+		checks = append(checks, trinoPoolCheckAuthRevision)
+	}
+
 	validation := trinoPoolValidation{
 		NodeID:          sync.NodeID,
 		ProcessID:       sync.ProcessID,
@@ -168,13 +192,8 @@ func validateTrinoPoolCandidate(
 		AppliedRevision: *sync.AppliedRevision,
 		AuthRevision:    authRevisionFingerprint(sync.SecurityRevisions),
 		ReadyWorkers:    registered,
-		Checks: []string{
-			trinoPoolCheckImage,
-			trinoPoolCheckWorkers,
-			trinoPoolCheckCatalogRevision,
-			trinoPoolCheckAuthRevision,
-			trinoPoolCheckOperationalConnection,
-		},
+		Checks:          checks,
+		Unacknowledged:  unacknowledged,
 	}
 	validation.CertificateHash = certificateHash(validation)
 	return validation, nil
@@ -295,4 +314,27 @@ func revisionText(revision *int64) string {
 		return "none"
 	}
 	return fmt.Sprint(*revision)
+}
+
+// splitSecurityRevisions separates components that reported a loaded revision
+// from those that did not.
+//
+// A component reports an error when it cannot describe its own loaded state -
+// for the OPA access control that is the normal case today, because the plugin
+// does not implement the interface that would let it say which bundle revision
+// its decisions are being made against. That silence is a fact about the
+// system, not a validation failure to retry, so it is carried forward rather
+// than swallowed.
+func splitSecurityRevisions(revisions []componentRevision) (acknowledged, unacknowledged []string) {
+	for _, revision := range revisions {
+		name := revision.Kind + "/" + revision.Name
+		if revision.Error != "" || strings.TrimSpace(revision.Revision) == "" {
+			unacknowledged = append(unacknowledged, name)
+			continue
+		}
+		acknowledged = append(acknowledged, name)
+	}
+	sort.Strings(acknowledged)
+	sort.Strings(unacknowledged)
+	return acknowledged, unacknowledged
 }
