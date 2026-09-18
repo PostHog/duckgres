@@ -1031,6 +1031,25 @@ trino_shared_pool_active() {
   [ "${orphans:-0}" = "0" ] || fail "shared pool: $orphans worker pod(s) have no coordinator"
 
   log "shared pool OK: $ready instance(s) serving, each with its own service and workers"
+
+  # Tenant admission, when the cell has the Gateway restriction on. This is the
+  # user-visible end of the publication barrier: with the gate enabled a
+  # warehouse is NOT reported ready until its publication has committed, so a
+  # ready warehouse is evidence that every serving member acknowledged its
+  # configuration - not merely that a catalog row exists.
+  [ "${E2E_TRINO_POOL_TENANT_ADMISSION:-0}" = "1" ] || {
+    log "SKIP shared-pool tenant admission (set E2E_TRINO_POOL_TENANT_ADMISSION=1 on a cell with the gate on)"
+    return 0
+  }
+  org="${E2E_TRINO_POOL_ORG:?E2E_TRINO_POOL_TENANT_ADMISSION=1 needs E2E_TRINO_POOL_ORG}"
+  a=0 state=""
+  while [ "$a" -lt 30 ]; do
+    state="$(curl -fsS -H "$H" "$API/api/v1/orgs/$org" | jq -r '.trino.state // ""')" || state=""
+    [ "$state" = "ready" ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "$state" = "ready" ] || fail "shared pool: $org is '$state', want ready once its publication commits"
+  log "shared pool OK: $org is admitted (publication committed on every serving member)"
 }
 
 hot_idle_reporting_and_cap() { # org

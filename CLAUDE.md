@@ -1809,21 +1809,38 @@ for a cell that opts in. **Ships disabled**: a cell without `mode:
 Code: `controlplane/trinopool/` (pure: blueprint, phases, planner, catalog-version
 port), `controlplane/trinocatalog/` (fenced catalog publisher),
 `controlplane/trinogateway/` (Gateway protocol v1 client),
-`controlplane/trino_pool_*.go` (config, effects, validation, operator, wiring),
-migration `000040`.
+`controlplane/trino_pool_*.go` (config, effects, validation, operator, wiring,
+publication barrier), migrations `000040`-`000044`.
 
 - **Env, all default-off**: `DUCKGRES_TRINO_POOL_ENABLED` (a pooled cell with
   this off FAILS startup — falling back to blue/green would hand the operator a
   shape they did not ask for), `DUCKGRES_TRINO_POOL_OPERATOR_ENABLED` (off =
   desired state is recorded, nothing external is touched),
   `DUCKGRES_TRINO_POOL_GATEWAY_URL`, `DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED`
-  / `_BOOTSTRAP` / `_DSN_FILE` / `_WRITER_IDENTITY`.
+  / `_BOOTSTRAP` / `_DSN_FILE` / `_WRITER_IDENTITY`, and
+  `DUCKGRES_TRINO_POOL_CONFIG_CONFIGMAP` / `_NAMESPACE` / `_REGISTRY_KEY` (the
+  desired-state source, below — REQUIRED for a pooled cell).
 - **The pool keeps the cell's identity**: routing group, namespace and the
   catalog store's `cell_id` are unchanged. Replacing compute never rewrites
   which warehouse lives where.
 - **Missing/invalid desired config FREEZES the pool** at last-good state. It is
   never a desired count of zero (that would delete the fleet) and never a
-  startup abort (a ConfigMap problem must not take the CP down).
+  startup abort (a ConfigMap problem must not take the CP down). A pool that
+  vanished from the registry is an error (⇒ freeze), never an empty desired
+  state.
+- **Desired state is published from the API OBJECT, not from the mounted copy
+  of it.** The registry and blueprint files are the BOOT source — they are what
+  tells the process a pool exists. Every publication is then derived from ONE
+  read of `DUCKGRES_TRINO_POOL_CONFIG_CONFIGMAP`, taken immediately before the
+  write, because a projected volume refreshes per pod on the kubelet's schedule
+  and a `subPath` mount never refreshes at all: two replicas can hold different
+  contents indefinitely, and an idle pod can publish what it read at boot. A
+  pooled cell that does not name that object REFUSES TO START; a silent
+  fallback would leave nobody able to say which configuration a live pool is
+  driven from. The blueprint's key is the last element of `blueprint_file` (the
+  mapping a ConfigMap volume performs), and both documents come from the SAME
+  read — two reads can straddle an update and pair a new registry entry with a
+  release the cluster has already replaced.
 - **Fences, not leadership.** The janitor lease decides who executes; the
   pool's `authority_epoch` fences every durable write — desired-state
   publication, freeze and thaw included — every Kubernetes object (annotation,
@@ -1837,7 +1854,12 @@ migration `000040`.
   the fence proves who may write, not that what they hold is current — a replica
   carrying an older blueprint could otherwise publish it over a newer one as a
   legal fenced write. The ordinal must come from the config source; a content
-  hash is not monotonic and would refuse valid configurations.
+  hash is not monotonic and would refuse valid configurations. It is a BACKSTOP,
+  not the freshness mechanism (a settings-only edit need not move it, and two
+  configurations can carry the same one — hence the API read above), and a
+  backwards generation FREEZES the pool while KEEPING the lease: it is a
+  configuration problem, not a lost fence, and reporting it as one ended the
+  leadership term every tick and handed the pool to a replica that did the same.
 - **The catalog writer's fence IS the pool authority.** It is claimed when the
   operator wins the lease, never at startup (where every replica would claim it
   and the fence would distinguish nobody), and a takeover needs a strictly
@@ -1847,11 +1869,32 @@ migration `000040`.
   reversible; LOST requires verified absence of every recorded object as
   evidence and is reported as failed. A repair NAMES the instance it replaces,
   so the Gateway charges the repair budget instead of the single planned surge.
+  SUSPECT has a SECOND exit: a member that stays suspect without becoming
+  provably dead (a crash-looping coordinator keeps its Deployment, so LOST can
+  never be claimed) is replaced through the planned drain after
+  `trinoPoolSuspectDrainAfter`. The Gateway's serving-floor refusal still
+  stands, so a pool at its floor keeps the flaky member instead of dropping
+  below it.
+- **A FAILED_PREPARING candidate is cleaned up, not abandoned.** It is NOT
+  terminal: its objects are deleted (sound only because it provably never
+  admitted work), then its Gateway member is walked PREPARING → SUSPECT → LOST,
+  which is what releases the pool's live slot, and only then does it become
+  FAILURE_RETIRED. Leaving it terminal leaked a whole Trino cluster and, at
+  desired+surge, refused every later registration — no repair, no rollout. The
+  loss claim carries the coordinator identity the GATEWAY observed at
+  registration (recorded from the registration response, migration `000043`);
+  anything re-derived is refused as evidence.
 - **Admission is a durable step.** The intent is recorded before the call, so a
   lost response is resolved by read-back under the same identity. OK, FAILED
   (a decision) and UNKNOWN (no answer) stay distinct. The step identity is the
   business intent, never the authority envelope — hashing the whole request made
-  the retry after a lost response a permanent conflict.
+  the retry after a lost response a permanent conflict. A step is recorded
+  UNKNOWN before the effect and UPDATED with the outcome after it; a decided
+  outcome is never re-decided. A failed step records `attempts` and
+  `next_attempt_at` (full jitter, 0.5s→30s) and is not retried until then — the
+  schedule is durable so a restart cannot reset it to zero — and a step that
+  succeeds, or an instance that reaches the end of its life, closes its
+  operation so `terminal_at` is not NULL forever.
 - **Instance identity is persisted BEFORE any Kubernetes object exists**, and
   names are deterministic, so a lost create is resolved by read-back rather
   than by creating a second instance. Identities and live endpoints are never
@@ -1878,10 +1921,29 @@ migration `000040`.
   DURABLE `publication_revision`, a process identity that does not change during
   the pass, a worker count that agrees with the running pods, and the pods'
   RUNNING images equal to the blueprint's pinned release. The `auth-revision`
-  check is claimed ONLY when every security component reported what it loaded;
-  a coordinator without `opa.policy.revision-uri` reports OPA as unacknowledged,
-  the check is absent, and admission fails closed — deliberate, so
-  `opa.policy.revision-uri` is required on a pooled coordinator.
+  check is claimed ONLY when every security component reported what it loaded
+  AND each projected component reports exactly what THIS control plane is
+  serving: the OPA bundle's revision (`opa.PolicyRevision`, published in the
+  bundle as `data.trino.revision` and digesting the POLICY BYTES as well as the
+  data — `policy.rego` lives in the duckgres binary, so the image check says
+  nothing about it), and the `sha256:<hex>` fingerprints of the projected
+  `password.db` and `group.db`. Every instance of a required kind must match: a
+  second password authenticator reads a file duckgres does not write. "The
+  component answered" is not evidence — a coordinator whose OPA still serves the
+  projection from before a tenant existed answers perfectly. A coordinator
+  without `opa.policy.revision-uri` reports OPA as unacknowledged, the check is
+  absent, and admission fails closed — deliberate, so `opa.policy.revision-uri`
+  is REQUIRED on a pooled coordinator, pointed at that revision document.
+- **Tenant admission is a committed publication, not a published binding.**
+  Publishing principals (PUT `…/tenants/{t}/principals`) tells the Gateway which
+  logins belong to a tenant; the Gateway dispatches work only for an ADMITTED
+  one, and only the barrier (open → receipt per active member → commit) admits
+  it. A receipt is EVIDENCE: each member's own `/v1/catalog/sync` must report
+  the published catalog revision applied and all three projection revisions
+  current before duckgres records it. A tenant that leaves the projection is
+  REVOKED, once (the durable row is kept); with the gate on, a warehouse is held
+  at Provisioning until its publication commits. All of it reads the durable
+  record (migration `000044`), never the leader's memory.
 - **One authoritative boot identity.** The coordinator's `processId` is probed
   BEFORE member registration and is sent as `bootId` on both register and admit;
   the Gateway requires the receipt to carry the pair it recorded. A restart
@@ -1912,7 +1974,9 @@ migration `000040`.
   Takeover is explicit; a mutation never claims a higher epoch implicitly. A
   lost COMMIT is resolved from the journal, never retried blind.
 - Touching any of this → update `controlplane/trinopool/*_test.go`,
-  `controlplane/trinogateway/*_test.go`, `controlplane/trino_pool_*_test.go`,
+  `controlplane/trinogateway/*_test.go` (fixtures are generated from the real
+  Java records — see `tools/gatewaywire/README.md`),
+  `controlplane/trino_pool_*_test.go`,
   `tests/configstore/trino_pool_postgres_test.go`,
   `tests/trinocatalog/*_postgres_test.go`, AND the
   `trino_shared_pool_disabled` assertion in `tests/mw-dev/e2e/harness.sh`.
