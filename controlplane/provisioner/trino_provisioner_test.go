@@ -802,14 +802,15 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 			}
 			return h.ducklings[orgID], nil
 		},
-		Kubernetes:      h.kube,
-		SecretReadiness: &fakeTrinoSecretReadiness{},
-		Namespace:       TrinoCustomerNamespace,
-		CellID:          testCellID,
-		Catalog:         h.catalog,
-		BundleStore:     h.bundles,
-		BundleBuilder:   h.builder,
-		AWSRegion:       "us-east-1",
+		Kubernetes:              h.kube,
+		SecretReadiness:         &fakeTrinoSecretReadiness{},
+		AuthenticationReadiness: &fakeTrinoAuthenticationReadiness{ready: true},
+		Namespace:               TrinoCustomerNamespace,
+		CellID:                  testCellID,
+		Catalog:                 h.catalog,
+		BundleStore:             h.bundles,
+		BundleBuilder:           h.builder,
+		AWSRegion:               "us-east-1",
 	})
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)

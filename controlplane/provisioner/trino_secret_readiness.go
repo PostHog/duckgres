@@ -39,8 +39,9 @@ type TrinoPodExecutor interface {
 }
 
 type kubernetesTrinoSecretReadiness struct {
-	kube     kubernetes.Interface
-	executor TrinoPodExecutor
+	kube       kubernetes.Interface
+	executor   TrinoPodExecutor
+	secretName string
 }
 
 // NewKubernetesTrinoSecretReadiness checks mounted files without caching their
@@ -194,7 +195,7 @@ func (c *kubernetesTrinoSecretReadiness) Check(ctx context.Context, namespace, m
 		if pod.Status.Phase != corev1.PodRunning || pod.DeletionTimestamp != nil {
 			return trinoAllPending(expected, "waiting for a running Trino member pod"), nil
 		}
-		container, err := trinoCredentialContainer(pod, mountPath, endpoint.Port(), keys)
+		container, err := trinoCredentialContainerForSecret(pod, mountPath, endpoint.Port(), keys, c.credentialSecretName())
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +260,7 @@ func (c *kubernetesTrinoSecretReadiness) Check(ctx context.Context, namespace, m
 				continue
 			}
 			count++
-			if !trinoSameObservedMember(member, pod, mountPath, keys) {
+			if !trinoSameObservedMemberForSecret(member, pod, mountPath, keys, c.credentialSecretName()) {
 				return trinoAllPending(expected, "Trino membership changed during credential observation"), nil
 			}
 		}
@@ -273,7 +274,14 @@ func (c *kubernetesTrinoSecretReadiness) Check(ctx context.Context, namespace, m
 	return pending, nil
 }
 
-func trinoCredentialContainer(pod corev1.Pod, mountPath, port string, keys []string) (corev1.Container, error) {
+func (c *kubernetesTrinoSecretReadiness) credentialSecretName() string {
+	if c.secretName != "" {
+		return c.secretName
+	}
+	return TrinoTenantSecretName
+}
+
+func trinoCredentialContainerForSecret(pod corev1.Pod, mountPath, port string, keys []string, secretName string) (corev1.Container, error) {
 	var candidates []corev1.Container
 	for _, container := range pod.Spec.Containers {
 		for _, mount := range container.VolumeMounts {
@@ -285,7 +293,7 @@ func trinoCredentialContainer(pod corev1.Pod, mountPath, port string, keys []str
 			}
 			found := false
 			for _, volume := range pod.Spec.Volumes {
-				if volume.Name != mount.Name || volume.Secret == nil || volume.Secret.SecretName != TrinoTenantSecretName {
+				if volume.Name != mount.Name || volume.Secret == nil || volume.Secret.SecretName != secretName {
 					continue
 				}
 				found = true
@@ -330,11 +338,11 @@ func trinoCredentialContainer(pod corev1.Pod, mountPath, port string, keys []str
 	return candidates[0], nil
 }
 
-func trinoSameObservedMember(before trinoObservedPod, after corev1.Pod, mountPath string, keys []string) bool {
+func trinoSameObservedMemberForSecret(before trinoObservedPod, after corev1.Pod, mountPath string, keys []string, secretName string) bool {
 	if after.Name != before.pod.Name || after.UID != before.pod.UID || after.Status.Phase != corev1.PodRunning || after.DeletionTimestamp != nil {
 		return false
 	}
-	container, err := trinoCredentialContainer(after, mountPath, before.port, keys)
+	container, err := trinoCredentialContainerForSecret(after, mountPath, before.port, keys, secretName)
 	if err != nil || container.Name != before.container.Name {
 		return false
 	}

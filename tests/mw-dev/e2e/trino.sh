@@ -343,10 +343,12 @@ api -X POST -H 'Content-Type: application/json' \
   "$API/api/v1/users" >/dev/null
 i=0
 while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
-  trino_query "$analyst_principal" "$analyst_pw" 'SELECT 1' >/dev/null 2>&1 && break
+  # User creation is asynchronous. Password and group files refresh
+  # independently, so successful authentication alone cannot acknowledge access.
+  [ "$(scalar "$analyst_principal" "$analyst_pw" "SELECT count(*) FROM $CAT_A.$schema.$table" 2>/dev/null)" = 1 ] && break
   sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
 done
-[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "per-user login $analyst_principal never authenticated to Trino"
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "per-user login $analyst_principal never gained access to its own catalog"
 [ "$(scalar "$analyst_principal" "$analyst_pw" "SELECT count(*) FROM $CAT_A.$schema.$table")" = 1 ] \
   || fail "per-user login cannot read its own org's catalog"
 trino_query "$analyst_principal" "$pw_a" 'SELECT 1' >/dev/null 2>&1 \

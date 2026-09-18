@@ -114,7 +114,7 @@ func (p *TrinoProvisioner) managedCatalogs(ctx context.Context, lease configstor
 	if backend == nil || backend.Catalog == nil || backend.Name == "" {
 		return nil, errors.New("managed active backend unavailable")
 	}
-	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, tenants.data)
+	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, tenants.data, backend.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +126,7 @@ func (p *TrinoProvisioner) managedCatalogs(ctx context.Context, lease configstor
 		return outcomes, nil
 	}
 	client := &trinoManagedCatalogClient{TrinoCatalogClient: backend.Catalog, store: p.managed.Store, lease: lease, backend: backend.Name, sequence: lease.IntentSequence}
-	return p.reconcileBoundedBackend(ctx, orgs, tenants, client)
+	return p.reconcileBoundedBackend(ctx, orgs, tenants, client, backend.Name)
 }
 
 func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease configstore.TrinoCellLease, freeze *configstore.TrinoCellFreeze, tenants tenantSecretProjection) error {
@@ -193,7 +193,7 @@ func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease confi
 		roster = append(roster, org.OrgID+"\x00"+org.TrinoPrincipal()+"\x00"+name)
 		expected[org.OrgID] = tenants.data[org.OrgID]
 	}
-	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, expected)
+	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, expected, backend.Name)
 	if err != nil || len(pending) != 0 {
 		return errors.New("managed target credential projection is not ready")
 	}

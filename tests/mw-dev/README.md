@@ -100,11 +100,11 @@ state is `failed`, preserving `status_message` in the scenario error. The
 scenario runner defaults are a 15-minute timeout and 10-second poll interval;
 a step can override them with `timeout`, `poll_interval`, or `max_attempts`.
 
-This readiness boundary deliberately does not claim that a newly projected
-tenant password has reloaded in Trino. Kubernetes Secret projection and the
-file authenticator refresh can lag the reconcile state, so the first
-authenticated Trino query must still retry within its own bounded startup
-window. On failure, inspect the org detail response first: `failed` is a
+Tenant readiness also checks coordinator login-file projection and waits out
+its configured password/group refresh periods before reporting ready. A newly
+created per-user login is asynchronous and has no separate ready endpoint: its
+startup check must wait for the intended authorized catalog read, not just
+`SELECT 1`. On failure, inspect the org detail response first: `failed` is a
 catalog/projection failure, while `ready` plus `available: false` points to the
 cell or its observer credentials.
 

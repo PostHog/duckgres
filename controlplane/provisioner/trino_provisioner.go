@@ -307,6 +307,10 @@ type TrinoProvisionerOpts struct {
 	// nodes. Nil uses Kubernetes pod exec with in-cluster credentials.
 	SecretReadiness TrinoSecretReadiness
 
+	// AuthenticationReadiness observes coordinator login files and cache expiry.
+	// Nil uses the Kubernetes observer.
+	AuthenticationReadiness TrinoAuthenticationReadiness
+
 	// Namespace overrides TrinoCustomerNamespace. Empty == default.
 	// Useful for dev clusters that namespace Trino differently.
 	Namespace string
@@ -448,6 +452,7 @@ type TrinoProvisioner struct {
 	hoglakeDucklings        TrinoDucklingResolver
 	kubernetes              kubernetes.Interface
 	secretReadiness         TrinoSecretReadiness
+	authReadiness           TrinoAuthenticationReadiness
 	namespace               string
 	cellID                  string
 	explicitAssignmentOnly  bool
@@ -572,6 +577,10 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if secretReadiness == nil {
 		secretReadiness = NewKubernetesTrinoSecretReadiness(opts.Kubernetes, nil)
 	}
+	authReadiness := opts.AuthenticationReadiness
+	if authReadiness == nil {
+		authReadiness = NewKubernetesTrinoAuthenticationReadiness(opts.Kubernetes, nil)
+	}
 	result := &TrinoProvisioner{
 		managed:                 opts.ManagedCatalogs,
 		store:                   opts.Store,
@@ -581,6 +590,7 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		hoglakeDucklings:        opts.HoglakeDucklings,
 		kubernetes:              opts.Kubernetes,
 		secretReadiness:         secretReadiness,
+		authReadiness:           authReadiness,
 		namespace:               ns,
 		cellID:                  cell,
 		explicitAssignmentOnly:  opts.ExplicitAssignmentOnly,
@@ -1621,10 +1631,10 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	orgs []configstore.TrinoEnabledOrg,
 	tenants tenantSecretProjection,
 ) (map[string]catalogOutcome, error) {
-	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalog)
+	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalog, "primary")
 	errs := []error{firstErr}
 	for i, catalog := range p.additionalCatalogs {
-		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog)
+		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog, fmt.Sprintf("additional-%d", i))
 		if err != nil {
 			errs = append(errs, fmt.Errorf("additional running backend %d: %w", i, err))
 		}
@@ -1640,7 +1650,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	return outcomes, errors.Join(errs...)
 }
 
-func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []configstore.TrinoEnabledOrg, tenants tenantSecretProjection, catalog TrinoCatalogClient) (map[string]catalogOutcome, error) {
+func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []configstore.TrinoEnabledOrg, tenants tenantSecretProjection, catalog TrinoCatalogClient, backend string) (map[string]catalogOutcome, error) {
 	backendCtx, cancel := context.WithTimeout(ctx, p.catalogTimeout)
 	defer cancel()
 	outcomes, catalogErr := p.reconcileBackendCatalogs(backendCtx, orgs, tenants, catalog)
@@ -1654,7 +1664,7 @@ func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []c
 		return outcomes, catalogErr
 	}
 
-	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected)
+	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected, backend)
 	for org := range expected {
 		if readinessErr != nil {
 			outcomes[org] = catalogOutcome{Err: readinessErr}
@@ -1668,7 +1678,7 @@ func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []c
 // A successful CREATE CATALOG only validates the coordinator's local files.
 // Observe the same credentials on every active member before declaring this
 // backend ready, including when the catalog already existed on this tick.
-func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalog TrinoCatalogClient, expected map[string][]byte) (map[string]string, error) {
+func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalog TrinoCatalogClient, expected map[string][]byte, backend string) (map[string]string, error) {
 	nodes, err := catalog.ListNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read Trino readiness membership: %w", err)
@@ -1692,6 +1702,14 @@ func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalo
 	if err != nil {
 		return nil, fmt.Errorf("verify Trino mounted credentials: %w", err)
 	}
+	authReady, err := p.authReadiness.Check(ctx, p.namespace, backend, active)
+	if err != nil {
+		return nil, fmt.Errorf("verify Trino coordinator authentication: %w", err)
+	}
+	if !authReady {
+		return trinoAllPending(expected, "waiting for coordinator authentication projection and refresh"), nil
+	}
+
 	after, err := catalog.ListNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("verify Trino readiness membership: %w", err)
@@ -2109,10 +2127,17 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 		AdminPasswordHash:    p.adminPasswordHash,
 		ObserverPasswordHash: p.observerHash(),
 	})
-	return p.upsertSecretMerge(ctx, TrinoAuthSecretName, map[string][]byte{
+	files := map[string][]byte{
 		TrinoAuthSecretKeyPasswordDB: []byte(passwordDB),
 		TrinoAuthSecretKeyGroupDB:    []byte(groupDB),
-	})
+	}
+	if err := p.upsertSecretMerge(ctx, TrinoAuthSecretName, files); err != nil {
+		return err
+	}
+	// Update even when no tenant catalogs remain: disabling must invalidate
+	// any previous authentication observation before a later re-enable.
+	p.authReadiness.SetExpected(files)
+	return nil
 }
 
 // TrinoClusterPrincipals carries the bcrypt hashes for the cell's two

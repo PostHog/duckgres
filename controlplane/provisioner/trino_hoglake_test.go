@@ -205,7 +205,7 @@ func TestTrinoHoglakeManagedReconcile(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			outcomes, e := h.provisioner.reconcileBoundedBackend(context.Background(), []configstore.TrinoEnabledOrg{org}, projection, client)
+			outcomes, e := h.provisioner.reconcileBoundedBackend(context.Background(), []configstore.TrinoEnabledOrg{org}, projection, client, "primary")
 			if e != nil {
 				t.Fatal(e)
 			}

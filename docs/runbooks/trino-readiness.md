@@ -3,7 +3,12 @@
 Duckgres reports a tenant ready only after its catalog reconciles and its
 current metadata password has been observed in the mounted Secret on every
 active member of every configured running backend. This includes an active
-coordinator and at least one active worker. Successful `CREATE CATALOG` checks
+coordinator and at least one active worker. Coordinator `password.db` and `group.db` must
+also match the desired authentication projection, and their configured file
+refresh periods must expire after observation on the same container. Until
+then, readiness remains pending across reconcile ticks. The observer reads the
+file-provider configuration; it does not assume a fixed refresh interval.
+Successful `CREATE CATALOG` checks
 the coordinator; it does not acknowledge workers' independent Secret mounts.
 
 The provisioner queries `system.runtime.nodes`, matches member addresses to
