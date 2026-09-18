@@ -44,7 +44,7 @@ func (cs *ConfigStore) ListHotIdleByOrg(defaultCPU, defaultMemory string) ([]Hot
 			"COALESCE(NULLIF(w.profile_memory, ''), NULLIF(o.default_worker_memory, ''), ?) AS memory, "+
 			"w.hot_idle_since AS hot_idle_since",
 			defaultCPU, defaultMemory).
-		Joins("LEFT JOIN " + orgTable + " AS o ON o.name = w.org_id").
+		Joins("LEFT JOIN "+orgTable+" AS o ON o.name = w.org_id").
 		Where("w.state = ? AND w.org_id <> ''", WorkerStateHotIdle).
 		Order("w.org_id ASC").
 		Scan(&rows).Error

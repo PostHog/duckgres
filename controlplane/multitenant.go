@@ -802,6 +802,18 @@ func SetupMultiTenant(
 		}
 	}
 
+	// Shared Trino compute pools. Constructed unconditionally so the wiring
+	// cannot rot while the feature is off: with no pooled cell in the registry
+	// this returns nothing and changes nothing. A wiring failure is fatal for
+	// the same reason the rest of the Trino branch is - an operator who
+	// configured a pool must not be left with a control plane that silently
+	// reconciles nothing.
+	poolOperators, poolErr := buildTrinoPoolOperators(store, trinoPoolClientset(trinoCells), trinoPoolObserverCredential(trinoCells), cpInstanceID)
+	if poolErr != nil {
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf("shared Trino pool wiring failed: %w", poolErr)
+	}
+	attachTrinoPoolOperators(janitorLeader, poolOperators)
+
 	if rolloutReadiness == nil {
 		var rolloutErr error
 		rolloutReadiness, rolloutErr = buildTrinoRolloutReadiness(trinoCells, store)

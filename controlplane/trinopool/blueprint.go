@@ -343,3 +343,16 @@ func (s BlueprintSharedResources) Protects(name string) bool {
 	}
 	return false
 }
+
+// MarshalSnapshot returns the blueprint as a JSON document for durable storage
+// alongside an instance. The instance keeps its own copy because Argo may
+// replace or prune the source ConfigMap for a new release, and a PREPARING,
+// SERVING or DRAINING instance must keep running the configuration it was
+// created with.
+func (b *Blueprint) MarshalSnapshot() (string, error) {
+	encoded, err := json.Marshal(b)
+	if err != nil {
+		return "", fmt.Errorf("encode blueprint snapshot: %w", err)
+	}
+	return string(encoded), nil
+}

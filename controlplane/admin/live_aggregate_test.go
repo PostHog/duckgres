@@ -18,7 +18,7 @@ import (
 
 // fakeLiveInfo returns a fixed local view.
 type fakeLiveInfo struct {
-	hotIdle []HotIdleOrg
+	hotIdle  []HotIdleOrg
 	queries  []QueryStatus
 	sessions []SessionStatus
 	orgStats []OrgStatus
