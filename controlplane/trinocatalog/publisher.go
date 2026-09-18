@@ -311,6 +311,37 @@ func (p *Publisher) ResolveOperation(ctx context.Context, operationID string) (*
 	return &Result{Revision: revision, Replayed: true}, nil
 }
 
+// ResolveIntentSince reports whether a mutation with this exact intent
+// committed AFTER the given revision.
+//
+// It exists because an operation id that carries the store's revision cannot be
+// recomputed once the revision has moved: a caller that loses the COMMIT
+// response and retries derives a DIFFERENT id, so resolving by id alone always
+// misses the very case the journal is for. The intent - this catalog, this
+// payload - plus "later than the revision I read before I tried" identifies the
+// same commit without matching an older, identical publication of the same
+// catalog.
+func (p *Publisher) ResolveIntentSince(ctx context.Context, catalogName, payloadHash string, afterRevision int64) (*Result, error) {
+	if catalogName == "" || payloadHash == "" {
+		return nil, errors.New("resolving a catalog intent requires a catalog name and payload hash")
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	var revision int64
+	err := p.db.QueryRowContext(ctx,
+		`SELECT revision FROM trino_catalog_journal
+		 WHERE cell_id = $1 AND catalog_name = $2 AND payload_hash = $3 AND revision > $4
+		 ORDER BY revision DESC LIMIT 1`,
+		p.cellID, catalogName, payloadHash, afterRevision).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve catalog intent: %w", err)
+	}
+	return &Result{Revision: revision, Replayed: true}, nil
+}
+
 // checkFence implements root integration decision 2: the exact epoch AND the
 // exact identity must match. A higher local epoch is not authority; it is a
 // reason to call Takeover explicitly.

@@ -23,8 +23,14 @@ func newUnavailableTrinoCatalogClient(cellID string) provisioner.TrinoCatalogCli
 	return unavailableTrinoCatalogClient{cellID: cellID}
 }
 
+// err wraps the provisioner's "not this replica" sentinel. The distinction is
+// load-bearing: a refusal here means this control plane does not own the write
+// path, NOT that the warehouse is broken, and the reconcile must leave every
+// org's Trino state row alone rather than marking the whole pool Failed on every
+// replica that is not the leader.
 func (c unavailableTrinoCatalogClient) err() error {
-	return fmt.Errorf("shared Trino pool %s has no catalog writer yet: no control plane holds the pool authority", c.cellID)
+	return fmt.Errorf("shared Trino pool %s has no catalog writer on this control plane: %w",
+		c.cellID, provisioner.ErrTrinoCatalogNotThisReplica)
 }
 
 func (c unavailableTrinoCatalogClient) ListCatalogs(context.Context) ([]string, error) {

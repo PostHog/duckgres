@@ -248,14 +248,12 @@ func (c *Client) GetTenant(ctx context.Context, poolID, tenant string) (TenantAd
 // PublishTenantPrincipals publishes the authoritative principal to tenant
 // binding the admission restriction keys on.
 //
-// Route confirmation is pending: PoolStore.publishTenantPrincipals exists in the
-// Gateway source, but PoolResource has not exposed it yet. This client sends the
-// body that store method reads; the PATH is the one remaining unverified part of
-// this call, and it must be confirmed against the Java resource before the
-// tenant gate is enabled anywhere.
+// The route is PUT, matching PoolResource: the call replaces the tenant's whole
+// principal set rather than appending to it, and a repeat of the same set is the
+// same state. Sending it as a POST reached no route at all.
 func (c *Client) PublishTenantPrincipals(ctx context.Context, poolID, tenant string, request PublishPrincipalsRequest) (TenantAdmission, error) {
 	var admission TenantAdmission
-	err := c.do(ctx, http.MethodPost, c.tenantPath(poolID, tenant)+"/principals", request, &admission)
+	err := c.do(ctx, http.MethodPut, c.tenantPath(poolID, tenant)+"/principals", request, &admission)
 	return admission, err
 }
 

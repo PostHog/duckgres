@@ -34,9 +34,9 @@ type trinoPoolOperationStore interface {
 
 // Recorded step outcomes.
 const (
-	trinoPoolStepOK      = "OK"
-	trinoPoolStepUnknown = "UNKNOWN"
-	trinoPoolStepFailed  = "FAILED"
+	trinoPoolStepOK      = configstore.TrinoPoolStepOutcomeOK
+	trinoPoolStepUnknown = configstore.TrinoPoolStepOutcomeUnknown
+	trinoPoolStepFailed  = configstore.TrinoPoolStepOutcomeFailed
 )
 
 // runDurableStep records the intent, performs the effect, and records what came

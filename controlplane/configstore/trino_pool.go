@@ -117,6 +117,31 @@ func (cs *ConfigStore) GetTrinoPool(ctx context.Context, poolID string) (*TrinoP
 	return &pool, nil
 }
 
+// RecordTrinoPoolPublicationRevision records the catalog revision the pool has
+// PUBLISHED, which is what a candidate must have applied before it may be
+// admitted.
+//
+// It is monotonic: a revision behind the recorded one is ignored rather than
+// treated as a regression, because catalog mutations commit in the catalog
+// store's own transaction and two concurrent publications can report their
+// revisions out of order. Moving the gate backwards would certify a coordinator
+// that is missing the newest tenant.
+func (cs *ConfigStore) RecordTrinoPoolPublicationRevision(ctx context.Context, lease TrinoPoolLease, poolID string, revision int64) error {
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: revision belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	if revision < 0 {
+		return errors.New("a publication revision cannot be negative")
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, pool *TrinoPool) error {
+		if revision <= pool.PublicationRevision {
+			return nil
+		}
+		return tx.Model(&TrinoPool{}).Where("pool_id = ?", poolID).
+			Updates(map[string]any{"publication_revision": revision, "updated_at": time.Now().UTC()}).Error
+	})
+}
+
 // FreezeTrinoPool holds the pool at its last-good state. This is what missing
 // or invalid desired configuration does: no creates, no drains, no deletes, and
 // explicitly NOT a desired count of zero.

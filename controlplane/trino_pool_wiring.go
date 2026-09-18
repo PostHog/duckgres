@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
@@ -107,15 +108,30 @@ func buildTrinoPoolOperators(
 		operator.identity = func(ctx context.Context, endpoint string) (string, error) {
 			return probeProcessIdentity(ctx, client, endpoint, observerCredential, true)
 		}
+		// The authorization projection is produced by THIS cell's provisioner,
+		// which is also what serves the bundle the candidate's OPA pulls.
+		provisionerForPolicy := wire.Provisioner
+		operator.policyRevision = provisionerForPolicy.PublishedPolicyRevision
 
 		// The fenced catalog writer, if this deployment has moved the cell off
 		// the coordinator-mediated path. Its fence is the pool authority, so it
 		// is claimed and installed when the operator wins the lease - never at
 		// startup, where every replica would claim it.
-		var currentLease configstore.TrinoPoolLease
-		var haveLease bool
-		writer, err := buildTrinoPoolCatalogWriter(config.PoolID,
-			func() (configstore.TrinoPoolLease, bool) { return currentLease, haveLease },
+		//
+		// The lease is held in an atomic pointer because the two sides run on
+		// different goroutines: the operator's leader loop writes it, and the
+		// provisioner's per-cell reconcile goroutines read it on every catalog
+		// publication. A plain captured variable was a data race, and the value
+		// it raced on decides whether a write is fenced at all.
+		authority := &atomic.Pointer[configstore.TrinoPoolLease]{}
+		writer, err := buildTrinoPoolCatalogWriter(config.PoolID, store,
+			func() (configstore.TrinoPoolLease, bool) {
+				lease := authority.Load()
+				if lease == nil {
+					return configstore.TrinoPoolLease{}, false
+				}
+				return *lease, true
+			},
 			// Node inventory still comes from a live coordinator: the catalog
 			// store knows nothing about cluster membership. For a pooled cell
 			// that is whichever instance the operator is currently validating,
@@ -128,9 +144,10 @@ func buildTrinoPoolOperators(
 		if writer != nil {
 			provisionerForCell := wire.Provisioner
 			operator.installWriter = func(ctx context.Context, lease configstore.TrinoPoolLease) error {
-				currentLease, haveLease = lease, true
+				held := lease
+				authority.Store(&held)
 				if err := writer.ClaimWriter(ctx); err != nil {
-					currentLease, haveLease = configstore.TrinoPoolLease{}, false
+					authority.Store(nil)
 					return err
 				}
 				provisionerForCell.SetCatalogClient(writer)
@@ -138,6 +155,11 @@ func buildTrinoPoolOperators(
 					"pool", config.PublicID, "epoch", lease.Epoch)
 				return nil
 			}
+			// When the leadership term ends - cancelled or fenced - the writer
+			// stops being able to publish. Leaving the lease behind would let a
+			// superseded process keep issuing writes that are only refused at
+			// the store's own fence, one failed catalog publication at a time.
+			operator.releaseWriter = func() { authority.Store(nil) }
 		}
 		operators = append(operators, operator)
 

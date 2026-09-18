@@ -2189,3 +2189,50 @@ func TestBatchedFilteringMatchesNonBatchedForScopes(t *testing.T) {
 		}
 	}
 }
+
+// The bundle publishes its revision as data.trino.revision, in the same
+// document root the policy's package occupies. OPA refuses a bundle whose data
+// collides with a rule path, and a refused bundle means the coordinator keeps
+// authorizing with whatever it loaded last - so the coexistence is asserted
+// against a real evaluation rather than assumed.
+func TestPolicyEvaluatesAlongsideTheRevisionDocument(t *testing.T) {
+	ctx := context.Background()
+	gc := GroupCatalogs{"org_42": {"org_42": true}}
+	data, err := buildDataDocument(gc, nil)
+	if err != nil {
+		t.Fatalf("buildDataDocument: %v", err)
+	}
+	revision, err := PolicyRevision(gc, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+	data["trino"] = map[string]interface{}{"revision": revision}
+
+	q, err := rego.New(
+		rego.Query("data.trino.allow"),
+		rego.Module("policy.rego", string(policyRego)),
+		rego.Data(data),
+	).PrepareForEval(ctx)
+	if err != nil {
+		t.Fatalf("PrepareForEval with the revision document: %v", err)
+	}
+	if !evalAllow(t, q, buildInput("42", "ExecuteQuery", nil)) {
+		t.Error("a tenant's own catalog was denied once the revision document was present")
+	}
+
+	served, err := rego.New(
+		rego.Query("data.trino.revision"),
+		rego.Module("policy.rego", string(policyRego)),
+		rego.Data(data),
+	).PrepareForEval(ctx)
+	if err != nil {
+		t.Fatalf("PrepareForEval for the revision: %v", err)
+	}
+	results, err := served.Eval(ctx)
+	if err != nil {
+		t.Fatalf("eval revision: %v", err)
+	}
+	if len(results) != 1 || results[0].Expressions[0].Value != revision {
+		t.Fatalf("data.trino.revision did not answer with %q: %v", revision, results)
+	}
+}

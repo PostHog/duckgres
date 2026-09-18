@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -262,6 +263,18 @@ func TrinoResourceGroupName(principal string) string {
 	return "root.tenants." + trinoSanitize(principal)
 }
 
+// ErrTrinoCatalogNotThisReplica marks a catalog client that cannot answer on
+// THIS control plane, as opposed to one that failed.
+//
+// A shared-pool cell publishes catalogs through a fence that only the replica
+// holding the pool authority owns. The provisioning controller runs on every
+// replica, so on all the others every catalog call must refuse - but that
+// refusal is not a statement about the warehouse. Attributing it per org marked
+// every pooled tenant Failed every tick and flapped ready_at/failed_at on rows
+// that were serving perfectly. A reconcile that hits this leaves the Trino
+// state rows untouched instead.
+var ErrTrinoCatalogNotThisReplica = errors.New("this control plane does not own the catalog write path")
+
 // TrinoCatalogClient is the REST surface the provisioner needs against
 // the customer Trino cluster: enumerate, create, alter, drop catalogs.
 // Concrete implementation in trinoCatalogHTTPClient below; the interface
@@ -464,11 +477,15 @@ type TrinoProvisioner struct {
 	existingInternalSecrets []string
 	bundleStore             *opa.BundleStore
 	bundleBuilder           opa.BundleBuilder
-	tenantSecretMountPath   string
-	awsRegion               string
-	s3MaxConnections        int
-	filesystemCacheEnabled  bool
-	hoglakeURI              string
+	// policyRevision is the revision of the authorization projection currently
+	// served. It is read from the pool operator's validation goroutine while
+	// the reconcile loop writes it, so it is atomic rather than a plain field.
+	policyRevision         atomic.Pointer[string]
+	tenantSecretMountPath  string
+	awsRegion              string
+	s3MaxConnections       int
+	filesystemCacheEnabled bool
+	hoglakeURI             string
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -784,6 +801,14 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 			catalogOutcomes, catErr = p.reconcileCatalogs(ctx, projectable, tenants)
 		}
 		if catErr != nil {
+			if errors.Is(catErr, ErrTrinoCatalogNotThisReplica) {
+				// Not this replica's work. Nothing failed, nothing is reported,
+				// and above all nothing is written: the owning replica keeps the
+				// state rows current.
+				slog.Debug("trino reconcile: catalog step belongs to another control plane",
+					"reason", catErr)
+				return errors.Join(errs...)
+			}
 			errs = append(errs, fmt.Errorf("reconcile catalogs: %w", catErr))
 		}
 	} else {
@@ -2620,8 +2645,30 @@ func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configst
 	if err != nil {
 		return fmt.Errorf("build opa bundle: %w", err)
 	}
+	// The revision of the projection now being served. A pooled candidate is
+	// only certified once its OPA reports deciding with THIS value: a
+	// structurally healthy coordinator whose policy engine still serves the
+	// previous projection would authorize against a tenant set that no longer
+	// exists. It is recorded before the bundle is published, so the value a
+	// reader sees is never newer than what is on the wire.
+	revision, err := opa.PolicyRevision(gc, gs)
+	if err != nil {
+		return fmt.Errorf("compute opa policy revision: %w", err)
+	}
+	p.policyRevision.Store(&revision)
 	p.bundleStore.Set(opa.NewBundle(bundle))
 	return nil
+}
+
+// PublishedPolicyRevision is the authorization-data revision this control plane
+// currently serves, or "" before the first projection. It is the value a
+// candidate's OPA must report before the auth-revision check may be claimed;
+// empty means nothing may claim it, which fails admission closed.
+func (p *TrinoProvisioner) PublishedPolicyRevision() string {
+	if revision := p.policyRevision.Load(); revision != nil {
+		return *revision
+	}
+	return ""
 }
 
 // upsertSecretMerge is the partial-owner Secret writer: it

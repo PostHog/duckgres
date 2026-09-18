@@ -26,9 +26,13 @@ const (
 	PhaseLost           Phase = "LOST"            // authoritative evidence the process terminated
 	PhaseFailureRetired Phase = "FAILURE_RETIRED" // failure receipt recorded, resources removed
 
-	// PhaseFailedPreparing is the one terminal state reachable without a
-	// Gateway retirement receipt, because the instance provably never admitted
-	// work. Everything past admission needs a receipt.
+	// PhaseFailedPreparing is a candidate that can never be admitted. It is NOT
+	// terminal: its Kubernetes objects still exist and its Gateway member is
+	// still PREPARING, which counts against the pool's live budget. A terminal
+	// FAILED_PREPARING leaked a whole Trino cluster and, after a single failed
+	// candidate at desired+surge, no further member could register at all - no
+	// repair and no rollout. The instance is cleaned up from here and only then
+	// becomes FAILURE_RETIRED.
 	PhaseFailedPreparing Phase = "FAILED_PREPARING"
 )
 
@@ -48,9 +52,14 @@ var phaseTransitions = map[Phase][]Phase{
 	// A failing probe is not proof of death, so SUSPECT can recover. It can
 	// also drain: an operator may replace a flaky-but-live member normally.
 	PhaseSuspect:         {PhaseServing, PhaseDraining, PhaseLost},
-	PhaseLost:            {PhaseFailureRetired},
-	PhaseFailureRetired:  nil,
-	PhaseFailedPreparing: nil,
+	PhaseLost:           {PhaseFailureRetired},
+	PhaseFailureRetired: nil,
+	// A failed candidate is cleaned up and then recorded as failure-retired.
+	// The Gateway member it registered is walked PREPARING -> SUSPECT -> LOST
+	// first, because that is what releases the pool's live slot; deletion is
+	// permitted before that only because the candidate provably never admitted
+	// work.
+	PhaseFailedPreparing: {PhaseFailureRetired},
 }
 
 // Valid reports whether the phase is one this build knows. A row written by a

@@ -58,6 +58,8 @@ func (o *trinoPoolOperator) progressInstance(ctx context.Context, instance confi
 		return o.observeHealth(ctx, instance)
 	case trinopool.PhaseLost:
 		return o.completeFailureRetirement(ctx, instance)
+	case trinopool.PhaseFailedPreparing:
+		return o.cleanupFailedCandidate(ctx, instance)
 	case trinopool.PhaseDraining:
 		return o.sealWhenDrained(ctx, instance)
 	case trinopool.PhaseSealed:
@@ -142,8 +144,15 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 	}
 	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseCreating, trinopool.PhasePreparing, map[string]any{
-			"coordinator_pod_uid":  observed.CoordinatorPodUID,
-			"coordinator_boot_id":  bootID,
+			"coordinator_pod_uid": observed.CoordinatorPodUID,
+			"coordinator_boot_id": bootID,
+			// The Gateway observes the coordinator's node and coordinator ids
+			// itself at registration and binds the member to them. Recording
+			// what it returned is the only way a later loss claim can present
+			// the identical pair; deriving them again would risk a value the
+			// Gateway never recorded, and the claim would be refused.
+			"coordinator_node_id":  member.NodeID,
+			"coordinator_id":       member.CoordinatorID,
 			"gateway_incarnation":  member.Incarnation,
 			"gateway_backend_name": member.BackendName,
 			"gateway_state":        member.Phase,
@@ -182,6 +191,7 @@ func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance conf
 	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhasePreparing, trinopool.PhaseValidating, map[string]any{
 			"coordinator_node_id":      validation.NodeID,
+			"coordinator_id":           validation.CoordinatorID,
 			"coordinator_boot_id":      validation.ProcessID,
 			"applied_catalog_revision": validation.AppliedRevision,
 			"validation_receipt":       receipt,
@@ -415,6 +425,12 @@ func (o *trinoPoolOperator) expectationFor(instance configstore.TrinoPoolInstanc
 	expectation := trinoPoolExpectation{InternalHTTP: true}
 	if o.pool != nil {
 		expectation.CatalogRevision = o.pool.PublicationRevision
+	}
+	// The authorization projection this control plane is serving right now. A
+	// candidate has to be deciding with it, not merely be able to describe
+	// itself.
+	if o.policyRevision != nil {
+		expectation.PolicyRevision = o.policyRevision()
 	}
 	// The image comes from the instance's OWN snapshot, so a release that
 	// landed after this instance was created cannot retroactively change what

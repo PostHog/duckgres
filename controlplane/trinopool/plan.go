@@ -82,8 +82,10 @@ func PlanNext(state PoolState) Plan {
 		}
 		live++
 		switch instance.Phase {
-		case PhaseSuspect, PhaseLost:
-			// Still holds a pod, but cannot be counted on to serve.
+		case PhaseSuspect, PhaseLost, PhaseFailedPreparing:
+			// Still holds a pod, but cannot be counted on to serve. A failed
+			// candidate is in this group until its cleanup completes: counting
+			// it as healthy would hide the capacity deficit it caused.
 		default:
 			healthy++
 		}

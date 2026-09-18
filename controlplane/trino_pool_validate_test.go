@@ -30,6 +30,10 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 			"securityRevisions": []any{
 				map[string]any{"kind": "password-authenticator", "name": "file", "revision": "9"},
 				map[string]any{"kind": "group-provider", "name": "file", "revision": "4"},
+				// The authorization projection the coordinator's OPA reports
+				// deciding with. This is the value the controller compares
+				// against what it currently serves.
+				map[string]any{"kind": "system-access-control", "name": "opa", "revision": fakePolicyRevision},
 			},
 		},
 		nodes: [][]any{
@@ -58,6 +62,11 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 	return coordinator
 }
 
+// fakePolicyRevision stands in for the authorization projection this control
+// plane serves. Its exact shape does not matter; that the two sides compare
+// EQUAL does.
+const fakePolicyRevision = "v2.0000000000000000000000000000000000000000000000000000000000000001"
+
 const fakeCoordinatorImage = "registry.example.invalid/trino@sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
 func (c *fakeCoordinator) validate(t *testing.T, observedWorkers int, requiredRevision int64) (trinoPoolValidation, error) {
@@ -66,7 +75,10 @@ func (c *fakeCoordinator) validate(t *testing.T, observedWorkers int, requiredRe
 		ReadyWorkers: observedWorkers, DesiredWorkers: observedWorkers,
 		CoordinatorReady: true, CoordinatorPodUID: "pod-uid",
 		CoordinatorImage: fakeCoordinatorImage, WorkerImage: fakeCoordinatorImage,
-	}, trinoPoolExpectation{Image: fakeCoordinatorImage, CatalogRevision: requiredRevision, InternalHTTP: false})
+	}, trinoPoolExpectation{
+		Image: fakeCoordinatorImage, CatalogRevision: requiredRevision,
+		PolicyRevision: fakePolicyRevision, InternalHTTP: false,
+	})
 }
 
 func (c *fakeCoordinator) validateWith(t *testing.T, observed trinoPoolObservation, expected trinoPoolExpectation) (trinoPoolValidation, error) {
@@ -350,5 +362,48 @@ func TestInternalHTTPProbeDeclaresForwardedHTTPS(t *testing.T) {
 	}
 	if len(forwarded) == 0 || forwarded[0] != "https" {
 		t.Fatalf("forwarded proto = %v, want https declared", forwarded)
+	}
+}
+
+// A coordinator whose policy engine reports a DIFFERENT projection than the one
+// this control plane serves is not certified, however healthy it looks. This is
+// the case the check exists for: OPA answers every question perfectly while
+// deciding with a bundle that predates the newest tenant, so "the component
+// reported something" is not evidence of anything.
+func TestValidationDoesNotClaimAStalePolicyRevision(t *testing.T) {
+	coordinator := newFakeCoordinator(t)
+	coordinator.sync["securityRevisions"] = []any{
+		map[string]any{"kind": "password-authenticator", "name": "file", "revision": "9"},
+		map[string]any{"kind": "group-provider", "name": "file", "revision": "4"},
+		map[string]any{"kind": "system-access-control", "name": "opa", "revision": "v2.an-older-projection"},
+	}
+
+	validation, err := coordinator.validate(t, 2, 42)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	for _, check := range validation.Checks {
+		if check == trinoPoolCheckAuthRevision {
+			t.Fatal("a coordinator deciding with an older projection claimed the auth-revision check")
+		}
+	}
+}
+
+// Before this control plane has served a projection it cannot say what a
+// coordinator ought to be deciding with, so it claims nothing - and the Gateway
+// refuses the admission, which is the fail-closed direction.
+func TestValidationDoesNotClaimAnUnknownPolicyRevision(t *testing.T) {
+	coordinator := newFakeCoordinator(t)
+	validation, err := coordinator.validateWith(t, trinoPoolObservation{
+		ReadyWorkers: 2, DesiredWorkers: 2, CoordinatorReady: true, CoordinatorPodUID: "pod-uid",
+		CoordinatorImage: fakeCoordinatorImage, WorkerImage: fakeCoordinatorImage,
+	}, trinoPoolExpectation{Image: fakeCoordinatorImage, CatalogRevision: 42})
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	for _, check := range validation.Checks {
+		if check == trinoPoolCheckAuthRevision {
+			t.Fatal("the auth-revision check was claimed with no served projection to compare against")
+		}
 	}
 }

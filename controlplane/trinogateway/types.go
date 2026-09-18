@@ -35,6 +35,14 @@ type Step struct {
 	OperationID     string `json:"operationId"`
 	StepID          string `json:"stepId"`
 	ControllerEpoch int64  `json:"controllerEpoch"`
+	// OwnerIdentity names the controller PROCESS holding the pool. The Gateway
+	// records it (`owner_identity = coalesce(:owner, owner_identity)`) and
+	// refuses an equal epoch presented by a different owner, so leaving it out
+	// left the recorded owner NULL and reduced the fence to the epoch alone -
+	// which admits an equal epoch from any other controller. It is part of the
+	// authority envelope, which the Gateway strips before it hashes the
+	// payload, so sending it cannot turn a replay into a conflict.
+	OwnerIdentity string `json:"ownerIdentity,omitempty"`
 }
 
 // PoolState is PoolStore.PoolState.

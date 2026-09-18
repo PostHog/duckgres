@@ -46,8 +46,12 @@ func TestBuildBundleRoundTrip(t *testing.T) {
 		t.Fatalf("bundle.Read: %v", err)
 	}
 
-	if parsed.Manifest.Revision != bundleRevision {
-		t.Errorf("manifest revision: want %q, got %q", bundleRevision, parsed.Manifest.Revision)
+	revision, err := PolicyRevision(gc, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+	if parsed.Manifest.Revision != revision {
+		t.Errorf("manifest revision: want %q, got %q", revision, parsed.Manifest.Revision)
 	}
 
 	// Policy file must be present and contain the package declaration.
@@ -530,5 +534,80 @@ func TestNewGroupScopeDropsMalformedRelations(t *testing.T) {
 	}
 	if len(scope.RelationSchemas) != 1 || !scope.RelationSchemas["ok"] {
 		t.Errorf("relation_schemas = %v, want only ok", scope.RelationSchemas)
+	}
+}
+
+// A coordinator answers "which authorization data am I deciding with?" out of
+// its OPA, and OPA can only answer it from a document the bundle carries. A
+// bundle without one leaves the access control unable to report anything, which
+// is indistinguishable from a coordinator serving a projection that predates a
+// tenant.
+func TestBuildBundlePublishesItsRevisionAsADocument(t *testing.T) {
+	gc := GroupCatalogs{"org_42": {"org_42": true}}
+
+	raw, err := NewBuilder().BuildBundle(gc, nil)
+	if err != nil {
+		t.Fatalf("BuildBundle: %v", err)
+	}
+	parsed, err := bundle.NewReader(bytes.NewReader(raw)).Read()
+	if err != nil {
+		t.Fatalf("bundle.Read: %v", err)
+	}
+
+	trino, ok := parsed.Data["trino"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("data.trino is not a map: %T", parsed.Data["trino"])
+	}
+	revision, ok := trino["revision"].(string)
+	if !ok || revision == "" {
+		t.Fatalf("data.trino.revision = %v, want the served revision", trino["revision"])
+	}
+	want, err := PolicyRevision(gc, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+	if revision != want {
+		t.Errorf("data.trino.revision = %q, want %q", revision, want)
+	}
+	if parsed.Manifest.Revision != revision {
+		t.Errorf("manifest revision %q disagrees with the served document %q", parsed.Manifest.Revision, revision)
+	}
+}
+
+// The revision has to change when the authorization data changes and stay put
+// when it does not: a controller compares it for equality to decide whether a
+// coordinator is current, so a constant would certify a stale one and a
+// nondeterministic value would certify nothing at all.
+func TestPolicyRevisionTracksTheProjection(t *testing.T) {
+	first, err := PolicyRevision(GroupCatalogs{"org_42": {"org_42": true}}, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+	same, err := PolicyRevision(GroupCatalogs{"org_42": {"org_42": true}}, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+	if first != same {
+		t.Errorf("the same projection produced %q and %q", first, same)
+	}
+	withTenant, err := PolicyRevision(GroupCatalogs{
+		"org_42": {"org_42": true},
+		"org_43": {"org_43": true},
+	}, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+	if withTenant == first {
+		t.Error("adding a tenant did not change the revision")
+	}
+	scoped, err := PolicyRevision(
+		GroupCatalogs{"org_42": {"org_42": true}},
+		GroupScopes{"scope_org_42_team_7": NewGroupScope([]string{"posthog"}, nil)},
+	)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+	if scoped == first {
+		t.Error("adding a project scope did not change the revision")
 	}
 }

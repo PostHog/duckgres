@@ -108,7 +108,7 @@ func (o *trinoPoolOperator) claimLossIfProven(ctx context.Context, instance conf
 			PodUID:        instance.CoordinatorPodUID,
 			BootID:        instance.CoordinatorBootID,
 			NodeID:        instance.CoordinatorNodeID,
-			CoordinatorID: instance.CoordinatorNodeID,
+			CoordinatorID: instance.CoordinatorID,
 			Source:        "kubernetes-resources-absent",
 			ObservedAt:    nowUTC().Format(time.RFC3339),
 		},
@@ -124,6 +124,107 @@ func (o *trinoPoolOperator) claimLossIfProven(ctx context.Context, instance conf
 			"gateway_generation": member.Generation,
 			"failure_reason":     "the coordinator process terminated with outstanding work",
 		}))
+}
+
+// cleanupFailedCandidate releases everything a candidate that can never be
+// admitted is still holding.
+//
+// A FAILED_PREPARING instance is not finished business: its Deployments,
+// Service and ConfigMaps are still running a whole Trino cluster, and its
+// Gateway member is still PREPARING, which the Gateway counts as LIVE. One such
+// instance at desired+surge is enough to refuse every later registration - no
+// repair, no rollout - so this path is what keeps a single restarted candidate
+// from wedging the pool.
+//
+// The order is deliberate. Kubernetes objects are deleted FIRST, because the
+// loss claim needs positive evidence that the process terminated and a running
+// pod is not that. Deleting before any Gateway step is sound only because this
+// member provably never admitted work: it was refused before activation, so
+// there is nothing to drain and nothing to lose.
+func (o *trinoPoolOperator) cleanupFailedCandidate(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+	inventory := inventoryOf(instance)
+	kube := o.kube(o.lease.Epoch)
+	if err := kube.Delete(ctx, inventory); err != nil {
+		return true, fmt.Errorf("clean up failed candidate %s: %w", instance.InstanceID, err)
+	}
+	absent, err := kube.ResourcesAbsent(ctx, inventory)
+	if err != nil || !absent {
+		// Deletion is in progress. The instance keeps its slot until absence is
+		// observed, so a terminating pod is never counted as freed capacity.
+		return false, err
+	}
+
+	if instance.GatewayIncarnation == "" {
+		// The candidate failed before it ever registered, so there is no member
+		// to release.
+		return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+			trinopool.PhaseFailedPreparing, trinopool.PhaseFailureRetired, nil))
+	}
+
+	// The Gateway is authoritative for its own member, and suspecting bumps the
+	// generation, so the CAS value is read back rather than taken from the row.
+	member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+	if err != nil {
+		return true, fmt.Errorf("read failed candidate %s: %w", instance.InstanceID, err)
+	}
+	switch member.Phase {
+	case "PREPARING", "ACTIVE", "DRAINING", "SEALED":
+		return true, o.suspectFailedCandidate(ctx, instance, member)
+	case "SUSPECT":
+		lost, err := o.gateway.LostMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.LostMemberRequest{
+			Step:               o.step(instance.InstanceID, "lost"),
+			ExpectedGeneration: member.Generation,
+			Evidence:           trinogateway.EvidenceProcessTerminated,
+			Termination: trinogateway.TerminationProof{
+				PodUID:        instance.CoordinatorPodUID,
+				BootID:        instance.CoordinatorBootID,
+				NodeID:        instance.CoordinatorNodeID,
+				CoordinatorID: instance.CoordinatorID,
+				Source:        "kubernetes-resources-absent",
+				ObservedAt:    nowUTC().Format(time.RFC3339),
+			},
+		})
+		if err != nil {
+			return true, o.dropAuthority(fmt.Errorf("record loss of failed candidate %s: %w", instance.InstanceID, err))
+		}
+		return true, o.dropAuthority(o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID, map[string]any{
+			"gateway_state":      lost.Phase,
+			"gateway_generation": lost.Generation,
+		}))
+	default:
+		// LOST or already retired: the slot is released and the record can be
+		// closed.
+		return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+			trinopool.PhaseFailedPreparing, trinopool.PhaseFailureRetired, map[string]any{
+				"gateway_state":      member.Phase,
+				"gateway_generation": member.Generation,
+			}))
+	}
+}
+
+func (o *trinoPoolOperator) suspectFailedCandidate(ctx context.Context, instance configstore.TrinoPoolInstance, member trinogateway.Member) error {
+	suspected, err := o.gateway.SuspectMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.SuspectMemberRequest{
+		Step:               o.step(instance.InstanceID, "suspect"),
+		ExpectedGeneration: member.Generation,
+		Reason:             failureReason(instance),
+	})
+	if err != nil {
+		return o.dropAuthority(fmt.Errorf("suspect failed candidate %s: %w", instance.InstanceID, err))
+	}
+	return o.dropAuthority(o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID, map[string]any{
+		"gateway_state":      suspected.Phase,
+		"gateway_generation": suspected.Generation,
+	}))
+}
+
+// failureReason is what the Gateway records for the exclusion. It is never
+// empty: the Gateway requires a reason, and "unknown" in a durable failure
+// record is worse than a generic one.
+func failureReason(instance configstore.TrinoPoolInstance) string {
+	if reason := instance.FailureReason; reason != "" {
+		return reason
+	}
+	return "the candidate could not be admitted"
 }
 
 // completeFailureRetirement finishes a LOST member. The resources are already

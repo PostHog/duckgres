@@ -85,6 +85,9 @@ type trinoPoolOperator struct {
 	kube     func(epoch int64) trinoPoolKube
 	validate trinoPoolValidator
 	identity trinoPoolIdentityProbe
+	// policyRevision reports the authorization projection this control plane
+	// currently serves, which a candidate must be deciding with.
+	policyRevision func() string
 	owner    string
 	interval time.Duration
 	// operatorEnabled gates every external effect. With it off the operator
@@ -95,6 +98,11 @@ type trinoPoolOperator struct {
 	// installWriter claims the catalog store's writer fence under the lease
 	// just acquired and installs it as the cell's catalog write path.
 	installWriter func(context.Context, configstore.TrinoPoolLease) error
+	// releaseWriter drops the authority the catalog writer publishes under. It
+	// runs when the leadership term ends, so a superseded process stops
+	// attempting writes rather than discovering the fence one publication at a
+	// time.
+	releaseWriter func()
 	// operations records durable intents around external effects, so a lost
 	// response is resolved by read-back rather than repeated blind.
 	operations trinoPoolOperationStore
@@ -132,6 +140,12 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 	// moved away and back, and another control plane may have taken the pool's
 	// authority in between.
 	o.lease = configstore.TrinoPoolLease{}
+	if o.releaseWriter != nil {
+		// The catalog writer publishes under THIS term's authority, so it has
+		// none until the term acquires one, and none again once it ends.
+		o.releaseWriter()
+		defer o.releaseWriter()
+	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -260,6 +274,9 @@ func (o *trinoPoolOperator) dropAuthority(err error) error {
 		slog.Warn("Trino pool authority lost.", "pool", o.config.PublicID, "epoch", o.lease.Epoch, "error", err)
 		o.lease = configstore.TrinoPoolLease{}
 		o.fenced = true
+		if o.releaseWriter != nil {
+			o.releaseWriter()
+		}
 	}
 	return err
 }
@@ -279,6 +296,11 @@ func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
 			// new step rather than a permanent conflict.
 			StepID:          fmt.Sprintf("configure.e%d.%s", o.lease.Epoch, o.configDigest()),
 			ControllerEpoch: o.lease.Epoch,
+			// The owner is what makes an EQUAL epoch from a different process
+			// refusable. Without it the Gateway's recorded owner stays NULL and
+			// the epoch alone fences, which admits a second controller at the
+			// same epoch.
+			OwnerIdentity: o.owner,
 		},
 		APIMode:         "POOLED",
 		MinServing:      o.config.Spec.MinServing,
@@ -450,6 +472,7 @@ func (o *trinoPoolOperator) step(instanceID, stepID string) trinogateway.Step {
 		OperationID:     "instance:" + instanceID,
 		StepID:          stepID,
 		ControllerEpoch: o.lease.Epoch,
+		OwnerIdentity:   o.owner,
 	}
 }
 

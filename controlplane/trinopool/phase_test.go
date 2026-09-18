@@ -82,13 +82,22 @@ func TestPhaseClassification(t *testing.T) {
 	}
 	// Live compute is what the surge budget counts: anything that occupies a
 	// pod, including a draining or suspect instance.
-	for _, phase := range []Phase{PhasePending, PhaseCreating, PhasePreparing, PhaseValidating, PhaseAdmitted, PhaseServing, PhaseDraining, PhaseSealed, PhaseRetiring, PhaseSuspect, PhaseLost} {
+	//
+	// FAILED_PREPARING is in this group deliberately: the candidate's pods are
+	// still running and its Gateway member is still PREPARING, which the
+	// Gateway counts as live. Treating it as a tombstone hid a whole leaked
+	// cluster and let one failed candidate exhaust the registration budget.
+	for _, phase := range []Phase{PhasePending, PhaseCreating, PhasePreparing, PhaseValidating, PhaseAdmitted, PhaseServing, PhaseDraining, PhaseSealed, PhaseRetiring, PhaseSuspect, PhaseLost, PhaseFailedPreparing} {
 		if !phase.OccupiesCapacity() {
 			t.Errorf("%s should occupy capacity", phase)
 		}
 	}
+	// A failed candidate is cleaned up rather than abandoned.
+	if PhaseFailedPreparing.Terminal() {
+		t.Error("FAILED_PREPARING must be able to reach FAILURE_RETIRED, or its resources and Gateway member leak")
+	}
 	// A historical tombstone must not consume a live slot forever.
-	for _, phase := range []Phase{PhaseRetired, PhaseFailureRetired, PhaseFailedPreparing} {
+	for _, phase := range []Phase{PhaseRetired, PhaseFailureRetired} {
 		if phase.OccupiesCapacity() {
 			t.Errorf("%s should not occupy capacity", phase)
 		}

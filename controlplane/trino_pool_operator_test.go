@@ -149,6 +149,8 @@ func applyFakeUpdates(instance *configstore.TrinoPoolInstance, updates map[strin
 			instance.CoordinatorPodUID = value.(string)
 		case "coordinator_node_id":
 			instance.CoordinatorNodeID = value.(string)
+		case "coordinator_id":
+			instance.CoordinatorID = value.(string)
 		case "coordinator_boot_id":
 			instance.CoordinatorBootID = value.(string)
 		case "gateway_incarnation":
@@ -228,9 +230,13 @@ func (f *fakePoolGateway) ConfigurePool(_ context.Context, _ string, request tri
 
 func (f *fakePoolGateway) RegisterMember(_ context.Context, poolID string, request trinogateway.RegisterMemberRequest) (trinogateway.Member, error) {
 	f.record("register:" + request.InstanceID)
+	// The Gateway probes the coordinator itself at registration and binds the
+	// member to the identity it observed, so the response - not the request -
+	// is where those values come from.
 	member := &trinogateway.Member{
 		PoolID: poolID, InstanceID: request.InstanceID, BackendName: request.BackendName,
 		Incarnation: "incarnation-" + request.InstanceID, Phase: "PREPARING", Generation: 1,
+		NodeID: "node-1", CoordinatorID: "abcde",
 	}
 	f.members[request.InstanceID] = member
 	return *member, nil
@@ -987,5 +993,71 @@ func TestCompletedStepIsNotRepeated(t *testing.T) {
 	}
 	if instance.Phase != string(trinopool.PhaseAdmitted) {
 		t.Fatalf("phase = %s, want the recorded outcome to advance the instance", instance.Phase)
+	}
+}
+
+// A candidate that can never be admitted must not be abandoned in place.
+//
+// FAILED_PREPARING used to be terminal, so the instance's Deployments, Service
+// and ConfigMaps kept running and its Gateway member stayed PREPARING - which
+// the Gateway counts as LIVE. One such candidate at desired+surge refused every
+// later registration: no repair, no rollout, and a whole leaked Trino cluster.
+func TestFailedCandidateIsCleanedUpAndReleasesItsSlot(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Spec.DesiredInstances, harness.operator.config.Spec.MinServing = 1, 1
+	harness.store.pool.DesiredInstances, harness.store.pool.MinServing = 1, 1
+
+	// create -> CREATING -> PREPARING (registered)
+	harness.tick(t, 3)
+	instanceID := harness.store.order[0]
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhasePreparing) {
+		t.Fatalf("instance phase = %s, want PREPARING", phase)
+	}
+	// The Gateway observes the coordinator identity itself at registration, and
+	// a later loss claim has to present exactly what it recorded.
+	if harness.store.instances[instanceID].CoordinatorID == "" {
+		t.Fatal("the coordinator identity the Gateway recorded was not kept; a loss claim can never be accepted")
+	}
+
+	// The coordinator restarts before admission: the registered incarnation is
+	// gone, so this candidate can never be admitted.
+	harness.operator.validate = func(context.Context, string, trinoPoolObservation, trinoPoolExpectation) (trinoPoolValidation, error) {
+		return trinoPoolValidation{
+			NodeID: "node-1", ProcessID: "process-restarted", CoordinatorID: "abcde",
+			AppliedRevision: 42, AuthRevision: "auth", ReadyWorkers: 4,
+			Checks: []string{trinoPoolCheckImage}, CertificateHash: "hash",
+		}, nil
+	}
+	harness.tick(t, 1)
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseFailedPreparing) {
+		t.Fatalf("instance phase = %s, want FAILED_PREPARING", phase)
+	}
+
+	// Nothing may be declared lost while the pods are still there.
+	harness.kube.absent = false
+	harness.tick(t, 1)
+	for _, call := range harness.gateway.calls {
+		if call == "lost:"+instanceID {
+			t.Fatal("a loss was claimed while the resources were still present")
+		}
+	}
+
+	harness.kube.absent = true
+	harness.tick(t, 3)
+	if !harness.kube.deleted[instanceID] {
+		t.Fatal("the failed candidate's Kubernetes objects were never deleted")
+	}
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseFailureRetired) {
+		t.Fatalf("instance phase = %s, want FAILURE_RETIRED", phase)
+	}
+	if member, _ := harness.gateway.GetMember(context.Background(), "cell-001", instanceID); member.Phase != "LOST" {
+		t.Fatalf("gateway member phase = %s, want LOST so the live slot is released", member.Phase)
+	}
+
+	// With the slot released the pool replaces the failed candidate instead of
+	// stalling behind it.
+	harness.tick(t, 1)
+	if len(harness.store.order) != 2 {
+		t.Fatalf("the pool created %d instances; a failed candidate blocked the replacement", len(harness.store.order))
 	}
 }

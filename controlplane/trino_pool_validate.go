@@ -91,6 +91,12 @@ type trinoPoolExpectation struct {
 	// healthy coordinator sitting at an older revision is NOT certified: it
 	// would serve a catalog set that does not include the newest tenant.
 	CatalogRevision int64
+	// PolicyRevision is the authorization projection this control plane
+	// currently serves. The candidate's access control must report deciding
+	// with exactly this value before the auth-revision check may be claimed.
+	// Empty means the projection is unknown here, and nothing may be claimed on
+	// its behalf - which fails admission closed at the Gateway.
+	PolicyRevision string
 	// InternalHTTP marks a pooled coordinator reached on its in-cluster
 	// Service, where TLS terminates at the Gateway.
 	InternalHTTP bool
@@ -210,14 +216,27 @@ func validateTrinoPoolCandidate(
 		trinoPoolCheckCatalogRevision,
 		trinoPoolCheckOperationalConnection,
 	}
-	// The auth-revision check is claimed ONLY when every security component the
-	// coordinator exposes actually reported what it loaded. Today the file
-	// password authenticator and group provider do; the OPA access control does
-	// not, so on a cluster with OPA this check is absent and the receipt names
-	// the component that stayed silent. The Gateway records the check list
-	// verbatim, so claiming it here would put a false acknowledgement into the
-	// operator's evidence.
-	if len(acknowledged) > 0 && len(unacknowledged) == 0 {
+	// The auth-revision check is claimed ONLY when both of these hold:
+	//
+	//   - every security component the coordinator exposes reported what it
+	//     loaded, and
+	//   - the authorization data one of them reports is the projection THIS
+	//     control plane is serving right now.
+	//
+	// The second condition is the one that makes the check mean anything. "The
+	// components answered" proves a coordinator can describe itself, not that
+	// it decides with current data: a pooled coordinator whose OPA still serves
+	// the bundle from before a tenant was provisioned answers perfectly and
+	// authorizes against a policy that has never heard of that tenant. The
+	// Gateway records this list verbatim and an operator reads it as evidence,
+	// so an unverifiable claim must be absent rather than optimistic.
+	//
+	// It requires `opa.policy.revision-uri` on a pooled coordinator, pointed at
+	// the document the bundle publishes. Without it the access control reports
+	// nothing, the check is absent, and admission fails closed.
+	policyAcknowledged := expected.PolicyRevision != "" &&
+		reportsRevision(sync.SecurityRevisions, trinoAccessControlKind, expected.PolicyRevision)
+	if len(acknowledged) > 0 && len(unacknowledged) == 0 && policyAcknowledged {
 		checks = append(checks, trinoPoolCheckAuthRevision)
 	}
 
@@ -233,6 +252,25 @@ func validateTrinoPoolCandidate(
 	}
 	validation.CertificateHash = certificateHash(validation)
 	return validation, nil
+}
+
+// trinoAccessControlKind is how the coordinator names an authorization
+// component in its readiness report. Matching on the KIND rather than on the
+// configured implementation name keeps this working for a deployment that names
+// its access control something other than "opa".
+const trinoAccessControlKind = "system-access-control"
+
+// reportsRevision reports whether some component of this kind acknowledged
+// exactly this revision. Equality, not ordering: the question is whether the
+// coordinator decides with the data being served, and a coordinator carrying a
+// LATER revision than this replica knows about is equally uncertifiable here.
+func reportsRevision(revisions []componentRevision, kind, revision string) bool {
+	for _, reported := range revisions {
+		if reported.Kind == kind && reported.Error == "" && reported.Revision == revision {
+			return true
+		}
+	}
+	return false
 }
 
 // authRevisionFingerprint condenses what the process's security components have

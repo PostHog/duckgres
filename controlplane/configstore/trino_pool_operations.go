@@ -114,6 +114,29 @@ func (cs *ConfigStore) RecordTrinoPoolOperationStep(ctx context.Context, lease T
 			if existing.PayloadHash != payloadHash {
 				return fmt.Errorf("%w: operation %q step %q", ErrTrinoPoolIntentChanged, operationID, stepID)
 			}
+			// A step is recorded UNKNOWN before the effect and re-recorded with
+			// the outcome after it. Returning the stored row unchanged made that
+			// second call a no-op, so a step could never leave UNKNOWN and the
+			// cross-leader read-back that keys on OK was unreachable: every
+			// retry re-called the external system and relied on ITS replay
+			// guard instead of this journal.
+			//
+			// An outcome only ever advances out of UNKNOWN. A terminal outcome
+			// is never overwritten - re-deciding a recorded OK or FAILED is
+			// exactly the rewriting of history the journal exists to prevent.
+			if existing.Outcome == TrinoPoolStepOutcomeUnknown && outcome != "" && outcome != TrinoPoolStepOutcomeUnknown {
+				if err := tx.Model(&TrinoPoolOperationStep{}).
+					Where("operation_id = ? AND step_id = ?", operationID, stepID).
+					Updates(map[string]any{
+						"outcome":     outcome,
+						"result":      result,
+						"recorded_at": time.Now().UTC(),
+					}).Error; err != nil {
+					return err
+				}
+				existing.Outcome = outcome
+				existing.Result = result
+			}
 			existing.Replayed = true
 			step = existing
 			return nil

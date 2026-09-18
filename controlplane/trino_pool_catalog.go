@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -39,11 +40,20 @@ const (
 	envTrinoPoolCatalogDSNFile   = "DUCKGRES_TRINO_POOL_CATALOG_DSN_FILE"
 )
 
+// trinoPoolRevisionStore records the published catalog revision on the pool
+// row. It is an interface so the bridge can be tested without a config store.
+type trinoPoolRevisionStore interface {
+	RecordTrinoPoolPublicationRevision(ctx context.Context, lease configstore.TrinoPoolLease, poolID string, revision int64) error
+}
+
 // trinoPoolCatalogWriter adapts the fenced publisher to the provisioner's
 // catalog client.
 type trinoPoolCatalogWriter struct {
 	db     *sql.DB
 	cellID string
+	// store records the published revision on the pool row, under the same
+	// authority the publication itself was fenced by.
+	store trinoPoolRevisionStore
 	// authority returns the pool lease this control plane currently holds. The
 	// catalog writer fence is the SAME authority as the operator's: the writer
 	// epoch is the pool's authority epoch and the writer identity is the
@@ -63,7 +73,13 @@ type trinoPoolCatalogWriter struct {
 func (w *trinoPoolCatalogWriter) publisher() (*trinocatalog.Publisher, error) {
 	lease, ok := w.authority()
 	if !ok || lease.Epoch < 1 {
-		return nil, fmt.Errorf("%w: this control plane does not hold the pool authority", trinocatalog.ErrNotWriter)
+		// Both sentinels matter. ErrNotWriter keeps the publish path treating
+		// this as a DECISION rather than a lost outcome to resolve, and
+		// ErrTrinoCatalogNotThisReplica tells the provisioner's reconcile that
+		// this is not its work - so it leaves the tenants' state rows alone
+		// instead of marking every pooled org Failed on every non-leader.
+		return nil, fmt.Errorf("%w: this control plane does not hold the pool authority (%w)",
+			trinocatalog.ErrNotWriter, provisioner.ErrTrinoCatalogNotThisReplica)
 	}
 	return trinocatalog.NewPublisher(w.db, w.cellID, lease.Owner, lease.Epoch)
 }
@@ -152,6 +168,7 @@ func (w *trinoPoolCatalogWriter) publish(ctx context.Context, mutation trinocata
 	// revision makes each of those three intents its own operation, while an
 	// immediate retry of the SAME intent (nothing else committed in between)
 	// still resolves as a replay.
+	lease, held := w.authority()
 	publisher, err := w.publisher()
 	if err != nil {
 		return err
@@ -162,24 +179,42 @@ func (w *trinoPoolCatalogWriter) publish(ctx context.Context, mutation trinocata
 	}
 	mutation.OperationID = fmt.Sprintf("catalog.%s.r%d.%s", mutation.CatalogName, state.Revision, mutation.PayloadHash()[:16])
 
-	if _, err := publisher.Apply(ctx, mutation); err == nil {
-		return nil
-	} else if isTerminalPublishError(err) {
+	result, err := publisher.Apply(ctx, mutation)
+	switch {
+	case err == nil:
+	case isTerminalPublishError(err):
 		// A fence refusal or a changed intent is a decision, not an unknown
 		// outcome. Resolving it against the journal would report somebody
 		// else's row as this call's success.
 		return err
+	default:
+		// Anything else may be a lost COMMIT, whose outcome is UNKNOWN.
+		// Resolving by operation id alone cannot answer it: the id carries the
+		// revision this attempt read, and a committed mutation has already
+		// moved it, so the retry computes a different id and misses. The INTENT
+		// plus "later than the revision I read" identifies the same commit.
+		resolved, resolveErr := publisher.ResolveIntentSince(ctx, mutation.CatalogName, mutation.PayloadHash(), state.Revision)
+		if resolveErr != nil || resolved == nil {
+			return err
+		}
+		result = *resolved
 	}
 
-	// Anything else may be a lost COMMIT, whose outcome is UNKNOWN. Resolve it
-	// from the journal under the same operation id rather than retrying blind,
-	// which could publish twice, or compensating with a drop, which could
-	// delete a live catalog.
-	resolved, resolveErr := publisher.ResolveOperation(ctx, mutation.OperationID)
-	if resolveErr == nil && resolved != nil {
-		return nil
+	// The published revision is the gate a candidate must have applied before it
+	// can be admitted. Recording it is what arms that gate; without it every
+	// coordinator is certified at revision zero and a member missing the newest
+	// tenant looks current.
+	if held && w.store != nil && result.Revision > 0 {
+		if err := w.store.RecordTrinoPoolPublicationRevision(ctx, lease, w.cellID, result.Revision); err != nil {
+			// The catalog IS published; only the gate lags. Failing the
+			// provisioner's reconcile here would mark a tenant failed over a
+			// bookkeeping write, so this is surfaced and retried on the next
+			// publication rather than propagated.
+			slog.Warn("Trino pool publication revision could not be recorded.",
+				"cell", w.cellID, "revision", result.Revision, "error", err)
+		}
 	}
-	return err
+	return nil
 }
 
 // isTerminalPublishError reports an outcome the publisher DECIDED, as opposed
@@ -210,7 +245,7 @@ func connectorProperties(properties map[string]string) map[string]string {
 // The DSN is read from a file rather than an environment variable because it
 // carries the publisher credential, which infra provisions separately from the
 // coordinators' read-only reader role.
-func buildTrinoPoolCatalogWriter(cellID string, authority func() (configstore.TrinoPoolLease, bool), nodes provisioner.TrinoCatalogClient) (*trinoPoolCatalogWriter, error) {
+func buildTrinoPoolCatalogWriter(cellID string, store trinoPoolRevisionStore, authority func() (configstore.TrinoPoolLease, bool), nodes provisioner.TrinoCatalogClient) (*trinoPoolCatalogWriter, error) {
 	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolCatalogWriter)))
 	if err != nil || !enabled {
 		return nil, nil
@@ -234,7 +269,7 @@ func buildTrinoPoolCatalogWriter(cellID string, authority func() (configstore.Tr
 	// cell's writer row anyway.
 	db.SetMaxOpenConns(4)
 
-	writer := &trinoPoolCatalogWriter{db: db, cellID: cellID, authority: authority, nodes: nodes}
+	writer := &trinoPoolCatalogWriter{db: db, cellID: cellID, store: store, authority: authority, nodes: nodes}
 
 	if bootstrap, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolCatalogBootstrap))); bootstrap {
 		// Somebody has to create the additive tables, because a managed-reader

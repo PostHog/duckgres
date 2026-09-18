@@ -129,6 +129,11 @@ type TrinoPoolInstance struct {
 	WorkerConfigMapUID        string `gorm:"column:worker_config_map_uid"`
 	CoordinatorPodUID         string `gorm:"column:coordinator_pod_uid"`
 	CoordinatorNodeID         string `gorm:"column:coordinator_node_id"`
+	// CoordinatorID is the coordinator identity the GATEWAY observed when the
+	// member registered. It is a distinct value from the node id, and a loss
+	// claim has to carry both exactly as the Gateway recorded them, or the
+	// evidence is refused and the member keeps its live slot forever.
+	CoordinatorID string `gorm:"column:coordinator_id"`
 	CoordinatorBootID         string `gorm:"column:coordinator_boot_id"`
 	EndpointURL               string `gorm:"column:endpoint_url"`
 	// TLSServerName is retained on the row for the fixed-cell path only. A
@@ -223,6 +228,21 @@ type TrinoPoolOperationStep struct {
 }
 
 func (TrinoPoolOperationStep) TableName() string { return "duckgres_trino_pool_operation_steps" }
+
+// Recorded step outcomes. They are defined here, next to the row they are
+// written into, because the store itself has to distinguish them: an UNKNOWN
+// step may be completed by a later attempt, a decided one never is.
+const (
+	// TrinoPoolStepOutcomeUnknown is recorded BEFORE the external effect. It
+	// means "this may or may not have happened", which is the only honest
+	// answer to a lost response.
+	TrinoPoolStepOutcomeUnknown = "UNKNOWN"
+	// TrinoPoolStepOutcomeOK is a completed effect, and its result is the
+	// answer a later attempt reads back instead of repeating the call.
+	TrinoPoolStepOutcomeOK = "OK"
+	// TrinoPoolStepOutcomeFailed is a REFUSAL. Retrying cannot change it.
+	TrinoPoolStepOutcomeFailed = "FAILED"
+)
 
 // TrinoPoolPublication is one warehouse's publication state on a pool.
 type TrinoPoolPublication struct {
