@@ -1801,6 +1801,83 @@ password/tenant/catalog changes never propagate.
   the `ui/src/lib/trino.test.ts` derivations and
   `tests/mw-dev/e2e/trino.sh`.
 
+## Shared Trino Compute Pool (`mode: "shared-pool"`, `kubernetes` tag) — LOAD-BEARING CONTRACT
+
+Operator-managed pool of immutable Trino instances, replacing fixed blue/green
+for a cell that opts in. **Ships disabled**: a cell without `mode:
+"shared-pool"` in `DUCKGRES_TRINO_CELLS_FILE` behaves byte for byte as today.
+Code: `controlplane/trinopool/` (pure: blueprint, phases, planner, catalog-version
+port), `controlplane/trinocatalog/` (fenced catalog publisher),
+`controlplane/trinogateway/` (Gateway protocol v1 client),
+`controlplane/trino_pool_*.go` (config, effects, validation, operator, wiring),
+migration `000040`.
+
+- **Env, all default-off**: `DUCKGRES_TRINO_POOL_ENABLED` (a pooled cell with
+  this off FAILS startup — falling back to blue/green would hand the operator a
+  shape they did not ask for), `DUCKGRES_TRINO_POOL_OPERATOR_ENABLED` (off =
+  desired state is recorded, nothing external is touched),
+  `DUCKGRES_TRINO_POOL_GATEWAY_URL`, `DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED`
+  / `_BOOTSTRAP` / `_DSN_FILE` / `_WRITER_IDENTITY`.
+- **The pool keeps the cell's identity**: routing group, namespace and the
+  catalog store's `cell_id` are unchanged. Replacing compute never rewrites
+  which warehouse lives where.
+- **Missing/invalid desired config FREEZES the pool** at last-good state. It is
+  never a desired count of zero (that would delete the fleet) and never a
+  startup abort (a ConfigMap problem must not take the CP down).
+- **Fences, not leadership.** The janitor lease decides who executes; the
+  pool's `authority_epoch` fences every durable write, every Kubernetes object
+  (annotation, compared before any adopt) and every Gateway call
+  (`controllerEpoch`). A refused fenced write DROPS the lease and re-acquires —
+  losing the CAS means superseded, not unlucky.
+- **Instance identity is persisted BEFORE any Kubernetes object exists**, and
+  names are deterministic, so a lost create is resolved by read-back rather
+  than by creating a second instance. Identities and live endpoints are never
+  reused (PK over terminal rows + partial unique index).
+- **Blueprint is not a template engine.** Argo delivers a validated JSON with
+  real `corev1.PodTemplateSpec`s; duckgres injects only object names, labels,
+  selectors, replica counts and the three env vars the `identity_binding`
+  declares. Images must be digest-pinned (sidecars included). Each instance
+  keeps its OWN blueprint snapshot, so a new release cannot change what a
+  running instance reads. Worker anti-affinity is NARROWED to the instance, not
+  dropped — a pool-wide selector would make instances fight for nodes.
+- **Deletion requires an irreversible Gateway retirement claim** for that exact
+  incarnation; the phase machine permits it only from `RETIRING` onwards (plus
+  `FAILED_PREPARING`, which provably never admitted work). Delete verifies each
+  object's UID itself before passing a precondition, and retirement completes
+  only on verified absence INCLUDING terminating pods. Pool-shared objects
+  named in the blueprint are refused by name in both apply and delete.
+- **Drain has no deadline.** Sealing is driven by the Gateway's obligations
+  endpoint; a timer would be a decision to lose open transactions. The serving
+  floor refusal is surfaced, never overridden.
+- **Candidate validation uses no canary.** The candidate is probed through its
+  OWN Service with the existing observer credential: `/v1/catalog/sync` must be
+  enabled, ready, zero failed catalogs, applied revision at least the published
+  one, a process identity that does not change during the pass, and a worker
+  count that agrees with the running pods. The `auth-revision` check is claimed
+  ONLY when every security component reported what it loaded — the OPA access
+  control does not, so it is named in the receipt as unacknowledged instead.
+- **The Gateway client matches the Java source, not a design doc**
+  (`GET members` is a bare array; admission is one `admit` call with a nested
+  receipt; fields are `desiredMembers`/`maxRepair`; the Gateway computes the
+  guard payload hash itself). Decoding is pinned by fixtures generated from the
+  real records — regenerate with `tools/gatewaywire`. Pooled registration needs
+  a Gateway backend record, created INACTIVE and never activated through the
+  legacy route.
+- **Principal binding is duckgres-authoritative.** The tenant's principal set
+  is derived from the SAME projection that writes `password.db`, asserted
+  identical in test; the gate would otherwise block real users or admit
+  principals Trino rejects.
+- **Catalog writer**: one fenced transaction per mutation against the schema
+  CONTRACT-trino owns (writer-state row lock, exact epoch AND identity, journal
+  replay resolution, `catalog_count` recomputed inside the transaction).
+  Takeover is explicit; a mutation never claims a higher epoch implicitly. A
+  lost COMMIT is resolved from the journal, never retried blind.
+- Touching any of this → update `controlplane/trinopool/*_test.go`,
+  `controlplane/trinogateway/*_test.go`, `controlplane/trino_pool_*_test.go`,
+  `tests/configstore/trino_pool_postgres_test.go`,
+  `tests/trinocatalog/*_postgres_test.go`, AND the
+  `trino_shared_pool_disabled` assertion in `tests/mw-dev/e2e/harness.sh`.
+
 ## Logical Catalog Alias (`org_<database_name>` as the startup `database`)
 
 A pgwire session may select its catalog by the name the org has on Trino

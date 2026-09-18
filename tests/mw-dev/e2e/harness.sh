@@ -946,6 +946,43 @@ compute_usage_pull_api() { # org password
 # the janitor's cap sweep (5s tick + config-poll snapshot reload — the poll
 # below covers both), retiring the OLDEST excess; restoring 0 (unlimited)
 # afterwards leaves the remaining parked worker alone.
+# The shared Trino compute pool ships DISABLED. What this asserts is exactly
+# that: with no pooled cell configured, the control plane creates no pool
+# workload at all. A feature that is supposed to change nothing is only
+# credible if "nothing changed" is actually checked.
+#
+# What CANNOT be asserted in-Job, and why:
+#
+#   - The durable pool tables. This Job reaches duckgres over pgwire and the
+#     admin API; it has no config-store credential, so a row-level assertion is
+#     not available here. The migration and every fenced write are covered by
+#     tests/configstore/trino_pool_postgres_test.go against a real PostgreSQL.
+#   - The serving path (create -> admit -> drain -> retire). It needs a registry
+#     entry with mode: "shared-pool", a Golden-Chart blueprint artifact with a
+#     real image digest, a Gateway running the pooled protocol, and the pool
+#     feature flags on. None of those exist on mw-dev today. That path is
+#     covered by the controlplane/ unit tests (fake clientset + fake Gateway)
+#     and the real-PostgreSQL publisher tests, and stays UNVERIFIED against a
+#     live cluster until an authorized deployment enables the flags.
+trino_shared_pool_disabled() {
+  log "shared Trino pool: asserting the feature is inert"
+
+  # Every object a pooled instance owns carries this label, so the check holds
+  # regardless of how the objects are named.
+  selector="app.kubernetes.io/managed-by=duckgres-trino-pool"
+
+  pods="$(kubectl get pods -A -l "$selector" -o json 2>/dev/null | jq -r '.items | length')" || pods=0
+  [ "${pods:-0}" = "0" ] || fail "shared pool: $pods pooled pod(s) exist with the feature disabled"
+
+  deployments="$(kubectl get deployments -A -l "$selector" -o json 2>/dev/null | jq -r '.items | length')" || deployments=0
+  [ "${deployments:-0}" = "0" ] || fail "shared pool: $deployments pooled deployment(s) exist with the feature disabled"
+
+  services="$(kubectl get services -A -l "$selector" -o json 2>/dev/null | jq -r '.items | length')" || services=0
+  [ "${services:-0}" = "0" ] || fail "shared pool: $services pooled service(s) exist with the feature disabled"
+
+  log "shared pool OK: no pooled workload exists (durable state + serving path are unit/PG-tested only)"
+}
+
 hot_idle_reporting_and_cap() { # org
   org="$1"
   log "hot-idle reporting + cap sweep on $org"
@@ -4798,6 +4835,9 @@ engine_main() {
 
   # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
+
+  # ---- shared Trino compute pool: must be inert while disabled ----
+  trino_shared_pool_disabled
 
   # ---- hot-idle pool reporting + per-org cap sweep ----
   hot_idle_reporting_and_cap "$CNPG"
