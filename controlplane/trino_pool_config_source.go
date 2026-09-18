@@ -40,17 +40,31 @@ const (
 	trinoPoolConfigReadBudget = 10 * time.Second
 )
 
-// trinoPoolConfigReader supplies the raw desired-configuration documents.
+// trinoPoolConfigReader supplies one CONSISTENT set of desired-configuration
+// documents.
+//
+// Snapshot is deliberately the only entry point. Reading the registry and the
+// blueprint as two separate API calls can straddle an update and produce a
+// configuration that never existed - a new registry entry paired with the
+// previous release, say - and that mixture would be published as desired state.
+// One object read once cannot do that.
 type trinoPoolConfigReader interface {
-	// Registry returns the Trino cell registry document.
-	Registry(ctx context.Context) ([]byte, error)
-	// Blueprint returns the blueprint the registry entry names. The argument is
-	// the declared blueprint path; a ConfigMap-backed reader uses its last
-	// element as the data key, which is exactly the mapping a ConfigMap volume
-	// mount performs, so one declaration addresses both sources.
-	Blueprint(ctx context.Context, declaredPath string) ([]byte, error)
+	// Snapshot reads every desired-configuration document at one instant.
+	Snapshot(ctx context.Context) (trinoPoolConfigSnapshot, error)
 	// Describe names the source in operator-facing errors.
 	Describe() string
+}
+
+// trinoPoolConfigSnapshot is one point-in-time set of documents.
+type trinoPoolConfigSnapshot interface {
+	// Registry returns the Trino cell registry document, or nil when this
+	// deployment declares no registry at all.
+	Registry() []byte
+	// Blueprint returns the blueprint the registry entry names. The argument is
+	// the declared blueprint path; a ConfigMap-backed snapshot uses its last
+	// element as the data key, which is exactly the mapping a ConfigMap volume
+	// mount performs, so one declaration addresses both sources.
+	Blueprint(declaredPath string) ([]byte, error)
 }
 
 // trinoPoolFileConfigReader reads the mounted documents. It is the BOOT source:
@@ -58,19 +72,26 @@ type trinoPoolConfigReader interface {
 // desired-state publication.
 type trinoPoolFileConfigReader struct{}
 
-func (trinoPoolFileConfigReader) Registry(context.Context) ([]byte, error) {
+// Snapshot reads the registry now and each blueprint when it is asked for.
+// Files are the BOOT source only, where there is no desired-state publication
+// to make inconsistent: the process is deciding whether a pool exists at all.
+func (r trinoPoolFileConfigReader) Snapshot(context.Context) (trinoPoolConfigSnapshot, error) {
 	location := strings.TrimSpace(os.Getenv(envTrinoCellsFile))
 	if location == "" {
-		return nil, nil
+		return trinoPoolFileSnapshot{}, nil
 	}
 	data, err := os.ReadFile(location)
 	if err != nil {
 		return nil, fmt.Errorf("read Trino registry: %w", err)
 	}
-	return data, nil
+	return trinoPoolFileSnapshot{registry: data}, nil
 }
 
-func (trinoPoolFileConfigReader) Blueprint(_ context.Context, declaredPath string) ([]byte, error) {
+type trinoPoolFileSnapshot struct{ registry []byte }
+
+func (s trinoPoolFileSnapshot) Registry() []byte { return s.registry }
+
+func (trinoPoolFileSnapshot) Blueprint(declaredPath string) ([]byte, error) {
 	info, err := os.Stat(declaredPath)
 	if err != nil {
 		return nil, fmt.Errorf("blueprint is unreadable: %w", err)
@@ -105,22 +126,14 @@ func (r trinoPoolAPIConfigReader) Describe() string {
 	return fmt.Sprintf("ConfigMap %s/%s", r.namespace, r.name)
 }
 
-func (r trinoPoolAPIConfigReader) Registry(ctx context.Context) ([]byte, error) {
-	return r.key(ctx, r.registryKey)
-}
-
-func (r trinoPoolAPIConfigReader) Blueprint(ctx context.Context, declaredPath string) ([]byte, error) {
-	// A ConfigMap volume mounts each key as a file of that name, so the key is
-	// the declared path's last element. One registry declaration therefore
-	// addresses the file the process booted from AND the API object it is
-	// published from, with no second naming scheme to keep in sync.
-	return r.key(ctx, path.Base(strings.TrimSpace(declaredPath)))
-}
-
-func (r trinoPoolAPIConfigReader) key(ctx context.Context, key string) ([]byte, error) {
-	if key == "" {
-		return nil, fmt.Errorf("no key named in %s", r.Describe())
-	}
+// Snapshot reads the whole object ONCE.
+//
+// The registry and the blueprint are keys of the same ConfigMap and are taken
+// from one read, so a resolution cannot pair a new registry entry with the
+// previous release: a two-call reader can straddle an update and publish a
+// configuration that never existed. No ordering is assumed between reads
+// either - there is only one.
+func (r trinoPoolAPIConfigReader) Snapshot(ctx context.Context) (trinoPoolConfigSnapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, trinoPoolConfigReadBudget)
 	defer cancel()
 
@@ -128,22 +141,54 @@ func (r trinoPoolAPIConfigReader) key(ctx context.Context, key string) ([]byte, 
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", r.Describe(), err)
 	}
-	if value, present := configMap.Data[key]; present {
-		if len(value) > maxBlueprintFileBytes {
-			return nil, fmt.Errorf("%s key %q exceeds the size limit", r.Describe(), key)
-		}
-		return []byte(value), nil
+	snapshot := trinoPoolAPISnapshot{source: r.Describe(), data: map[string][]byte{}}
+	for key, value := range configMap.Data {
+		snapshot.data[key] = []byte(value)
 	}
-	if value, present := configMap.BinaryData[key]; present {
-		if len(value) > maxBlueprintFileBytes {
-			return nil, fmt.Errorf("%s key %q exceeds the size limit", r.Describe(), key)
-		}
-		return value, nil
+	for key, value := range configMap.BinaryData {
+		snapshot.data[key] = value
 	}
-	// An absent key is an error, never an empty document: an empty registry
-	// would read as "this pool no longer exists" and an empty blueprint as "no
-	// release", and neither is something a missing key may assert.
-	return nil, fmt.Errorf("%s has no key %q", r.Describe(), key)
+	registry, err := snapshot.key(r.registryKey)
+	if err != nil {
+		return nil, err
+	}
+	snapshot.registry = registry
+	return snapshot, nil
+}
+
+// trinoPoolAPISnapshot is one ConfigMap read, held as the complete set of
+// documents that read contained.
+type trinoPoolAPISnapshot struct {
+	source   string
+	data     map[string][]byte
+	registry []byte
+}
+
+func (s trinoPoolAPISnapshot) Registry() []byte { return s.registry }
+
+func (s trinoPoolAPISnapshot) Blueprint(declaredPath string) ([]byte, error) {
+	// A ConfigMap volume mounts each key as a file of that name, so the key is
+	// the declared path's last element. One registry declaration therefore
+	// addresses the file the process booted from AND the API object it is
+	// published from, with no second naming scheme to keep in sync.
+	return s.key(path.Base(strings.TrimSpace(declaredPath)))
+}
+
+func (s trinoPoolAPISnapshot) key(key string) ([]byte, error) {
+	if key == "" {
+		return nil, fmt.Errorf("no key named in %s", s.source)
+	}
+	value, present := s.data[key]
+	if !present {
+		// An absent key is an error, never an empty document: an empty registry
+		// would read as "this pool no longer exists" and an empty blueprint as
+		// "no release", and neither is something a missing key may assert.
+		return nil, fmt.Errorf("%s has no key %q", s.source, key)
+	}
+	if len(value) > maxBlueprintFileBytes {
+		return nil, fmt.Errorf("%s key %q exceeds the size limit", s.source, key)
+	}
+	return value, nil
 }
 
 // newTrinoPoolAPIConfigReader builds the authoritative reader for one pool.

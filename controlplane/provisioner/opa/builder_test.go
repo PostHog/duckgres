@@ -611,3 +611,29 @@ func TestPolicyRevisionTracksTheProjection(t *testing.T) {
 		t.Error("adding a project scope did not change the revision")
 	}
 }
+
+// policy.rego lives in the CONTROL PLANE binary and is served to OPA as a
+// remote bundle, so the candidate's image check - which compares the Trino and
+// OPA images - says nothing about which rules a coordinator is deciding with.
+// Two control-plane versions can serve different rules with an identical group
+// map, and a revision that covered only the data would call the older one
+// current.
+func TestPolicyRevisionCoversThePolicyBytes(t *testing.T) {
+	gc := GroupCatalogs{"org_42": {"org_42": true}}
+	baseline, err := PolicyRevision(gc, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision: %v", err)
+	}
+
+	original := policyRego
+	t.Cleanup(func() { policyRego = original })
+	policyRego = append(append([]byte{}, original...), []byte("\n# a rule change\n")...)
+
+	changed, err := PolicyRevision(gc, nil)
+	if err != nil {
+		t.Fatalf("PolicyRevision after a policy change: %v", err)
+	}
+	if changed == baseline {
+		t.Fatal("the same data with different policy bytes produced the same revision")
+	}
+}

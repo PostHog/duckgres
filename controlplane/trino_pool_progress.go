@@ -426,11 +426,14 @@ func (o *trinoPoolOperator) expectationFor(instance configstore.TrinoPoolInstanc
 	if o.pool != nil {
 		expectation.CatalogRevision = o.pool.PublicationRevision
 	}
-	// The authorization projection this control plane is serving right now. A
-	// candidate has to be deciding with it, not merely be able to describe
-	// itself.
-	if o.policyRevision != nil {
-		expectation.PolicyRevision = o.policyRevision()
+	// What this control plane is serving right now - authorization data AND
+	// the authentication files. A candidate has to be deciding with all of it,
+	// not merely be able to describe itself.
+	if o.projection != nil {
+		projection := o.projection()
+		expectation.PolicyRevision = projection.Policy
+		expectation.PasswordRevision = projection.Password
+		expectation.GroupRevision = projection.Group
 	}
 	// The image comes from the instance's OWN snapshot, so a release that
 	// landed after this instance was created cannot retroactively change what

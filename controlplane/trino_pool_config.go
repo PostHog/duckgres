@@ -92,10 +92,14 @@ func resolveTrinoPoolConfigs() ([]trinoPoolConfig, error) {
 // chart projects them from afterwards; the parsing and validation below are
 // identical either way, so the two can never diverge in what they accept.
 func resolveTrinoPoolConfigsFrom(ctx context.Context, reader trinoPoolConfigReader) ([]trinoPoolConfig, error) {
-	data, err := reader.Registry(ctx)
+	// ONE read. Everything below is parsed out of the same snapshot, so a
+	// resolution can never pair a registry entry with a blueprint the cluster
+	// no longer has - or the other way round.
+	snapshot, err := reader.Snapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
+	data := snapshot.Registry()
 	if len(data) == 0 {
 		return nil, nil
 	}
@@ -119,7 +123,7 @@ func resolveTrinoPoolConfigsFrom(ctx context.Context, reader trinoPoolConfigRead
 		if !trinoPoolEnabled() {
 			return nil, fmt.Errorf("Trino cell %s declares shared-pool mode but %s is not enabled", cell.ID, envTrinoPoolEnabled)
 		}
-		config, err := resolveTrinoPoolConfig(ctx, reader, cell)
+		config, err := resolveTrinoPoolConfig(snapshot, cell)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +158,7 @@ func resolveTrinoPoolConfigByID(ctx context.Context, reader trinoPoolConfigReade
 	return trinoPoolConfig{}, fmt.Errorf("Trino pool %s is no longer declared in %s", publicID, reader.Describe())
 }
 
-func resolveTrinoPoolConfig(ctx context.Context, reader trinoPoolConfigReader, cell trinoRegisteredCell) (trinoPoolConfig, error) {
+func resolveTrinoPoolConfig(snapshot trinoPoolConfigSnapshot, cell trinoRegisteredCell) (trinoPoolConfig, error) {
 	pool := cell.Pool
 	if pool == nil {
 		return trinoPoolConfig{}, fmt.Errorf("Trino cell %s is in shared-pool mode but declares no pool block", cell.ID)
@@ -203,7 +207,7 @@ func resolveTrinoPoolConfig(ctx context.Context, reader trinoPoolConfigReader, c
 		},
 	}
 
-	blueprint, err := loadTrinoPoolBlueprint(ctx, reader, pool.BlueprintFile, cell.Namespace)
+	blueprint, err := loadTrinoPoolBlueprint(snapshot, pool.BlueprintFile, cell.Namespace)
 	if err != nil {
 		// Freeze rather than fail: the last-good desired state is preserved,
 		// the operator is told why, and nothing is created or deleted while the
@@ -218,8 +222,8 @@ func resolveTrinoPoolConfig(ctx context.Context, reader trinoPoolConfigReader, c
 	return config, nil
 }
 
-func loadTrinoPoolBlueprint(ctx context.Context, reader trinoPoolConfigReader, declaredPath, namespace string) (*trinopool.Blueprint, error) {
-	data, err := reader.Blueprint(ctx, declaredPath)
+func loadTrinoPoolBlueprint(snapshot trinoPoolConfigSnapshot, declaredPath, namespace string) (*trinopool.Blueprint, error) {
+	data, err := snapshot.Blueprint(declaredPath)
 	if err != nil {
 		return nil, err
 	}

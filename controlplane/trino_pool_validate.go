@@ -97,6 +97,18 @@ type trinoPoolExpectation struct {
 	// Empty means the projection is unknown here, and nothing may be claimed on
 	// its behalf - which fails admission closed at the Gateway.
 	PolicyRevision string
+	// PasswordRevision and GroupRevision are the fingerprints of the
+	// authentication files this control plane has projected.
+	//
+	// They are checked for the same reason as the policy revision, and they are
+	// NOT implied by it: the OPA bundle and the auth Secret reach a coordinator
+	// by different paths and at different times, so a candidate can be deciding
+	// with the current authorization data while its password store still
+	// predates the tenant that is about to be admitted. That candidate passes an
+	// authorization-only check and then rejects that tenant's very first
+	// request.
+	PasswordRevision string
+	GroupRevision    string
 	// InternalHTTP marks a pooled coordinator reached on its in-cluster
 	// Service, where TLS terminates at the Gateway.
 	InternalHTTP bool
@@ -234,9 +246,26 @@ func validateTrinoPoolCandidate(
 	// It requires `opa.policy.revision-uri` on a pooled coordinator, pointed at
 	// the document the bundle publishes. Without it the access control reports
 	// nothing, the check is absent, and admission fails closed.
-	policyAcknowledged := expected.PolicyRevision != "" &&
-		reportsRevision(sync.SecurityRevisions, trinoAccessControlKind, expected.PolicyRevision)
-	if len(acknowledged) > 0 && len(unacknowledged) == 0 && policyAcknowledged {
+	// Every component whose data this control plane projects must report having
+	// loaded exactly what is being served: the authorization bundle, the
+	// password file and the group file. They travel by different paths and
+	// settle at different times, so one being current says nothing about the
+	// others - a coordinator with the newest bundle and a password file from
+	// before the tenant existed refuses that tenant's first request while
+	// looking perfectly healthy.
+	expectations := map[string]string{
+		trinoAccessControlKind:      expected.PolicyRevision,
+		trinoPasswordAuthenticator:  expected.PasswordRevision,
+		trinoGroupProviderComponent: expected.GroupRevision,
+	}
+	projectionAcknowledged := true
+	for kind, revision := range expectations {
+		if revision == "" || !reportsRevision(sync.SecurityRevisions, kind, revision) {
+			projectionAcknowledged = false
+			break
+		}
+	}
+	if len(acknowledged) > 0 && len(unacknowledged) == 0 && projectionAcknowledged {
 		checks = append(checks, trinoPoolCheckAuthRevision)
 	}
 
@@ -258,19 +287,36 @@ func validateTrinoPoolCandidate(
 // component in its readiness report. Matching on the KIND rather than on the
 // configured implementation name keeps this working for a deployment that names
 // its access control something other than "opa".
-const trinoAccessControlKind = "system-access-control"
+const (
+	trinoAccessControlKind      = "system-access-control"
+	trinoPasswordAuthenticator  = "password-authenticator"
+	trinoGroupProviderComponent = "group-provider"
+)
 
-// reportsRevision reports whether some component of this kind acknowledged
-// exactly this revision. Equality, not ordering: the question is whether the
-// coordinator decides with the data being served, and a coordinator carrying a
-// LATER revision than this replica knows about is equally uncertifiable here.
+// reportsRevision reports whether this kind of component is present AND every
+// instance of it acknowledged exactly this revision.
+//
+// Equality, not ordering: the question is whether the coordinator decides with
+// the data being served, and a coordinator carrying a LATER revision than this
+// replica knows about is equally uncertifiable here.
+//
+// EVERY instance has to match, not merely one. A coordinator configured with a
+// second password authenticator - a file this control plane does not write -
+// can authenticate principals outside the projection, and admitting it on the
+// strength of the one component that agrees would put that file inside the
+// pool's trust boundary without anybody stating it.
 func reportsRevision(revisions []componentRevision, kind, revision string) bool {
+	found := false
 	for _, reported := range revisions {
-		if reported.Kind == kind && reported.Error == "" && reported.Revision == revision {
-			return true
+		if reported.Kind != kind {
+			continue
 		}
+		if reported.Error != "" || reported.Revision != revision {
+			return false
+		}
+		found = true
 	}
-	return false
+	return found
 }
 
 // authRevisionFingerprint condenses what the process's security components have
@@ -441,4 +487,18 @@ func probeProcessIdentity(ctx context.Context, client *http.Client, coordinatorU
 		return "", fmt.Errorf("%w: candidate reports no process identity", errTrinoPoolCandidateNotReady)
 	}
 	return status.ProcessID, nil
+}
+
+// trinoPoolProjectionRevisions is what this control plane currently serves to
+// coordinators: the authorization bundle's revision and the fingerprints of the
+// password and group files.
+//
+// They are carried together because they are checked together. Any one of them
+// being current is not evidence about the others: the bundle is pulled over
+// HTTP on OPA's schedule, while the files arrive as a mounted Secret the
+// kubelet refreshes on its own.
+type trinoPoolProjectionRevisions struct {
+	Policy   string
+	Password string
+	Group    string
 }

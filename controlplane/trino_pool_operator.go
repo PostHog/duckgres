@@ -85,9 +85,10 @@ type trinoPoolOperator struct {
 	kube     func(epoch int64) trinoPoolKube
 	validate trinoPoolValidator
 	identity trinoPoolIdentityProbe
-	// policyRevision reports the authorization projection this control plane
-	// currently serves, which a candidate must be deciding with.
-	policyRevision func() string
+	// projection reports what this control plane currently serves: the
+	// authorization bundle's revision and the fingerprints of the projected
+	// password and group files. A candidate must be deciding with all three.
+	projection func() trinoPoolProjectionRevisions
 	// resolveConfig re-reads this pool's desired configuration from the
 	// authoritative source. It runs on every tick, immediately before the
 	// desired state is published, so a process that has been idle since boot

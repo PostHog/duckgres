@@ -28,8 +28,8 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 			"enabled": true, "ready": true, "observedRevision": 42, "appliedRevision": 42,
 			"activeCatalogs": 7, "failedCatalogs": 0,
 			"securityRevisions": []any{
-				map[string]any{"kind": "password-authenticator", "name": "file", "revision": "9"},
-				map[string]any{"kind": "group-provider", "name": "file", "revision": "4"},
+				map[string]any{"kind": "password-authenticator", "name": "file", "revision": fakePasswordRevision},
+				map[string]any{"kind": "group-provider", "name": "file", "revision": fakeGroupRevision},
 				// The authorization projection the coordinator's OPA reports
 				// deciding with. This is the value the controller compares
 				// against what it currently serves.
@@ -65,6 +65,13 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 // fakePolicyRevision stands in for the authorization projection this control
 // plane serves. Its exact shape does not matter; that the two sides compare
 // EQUAL does.
+// The fingerprints of the authentication files this control plane projects,
+// in the form Trino's file components publish.
+const (
+	fakePasswordRevision = "sha256:00000000000000000000000000000000000000000000000000000000000000aa"
+	fakeGroupRevision    = "sha256:00000000000000000000000000000000000000000000000000000000000000bb"
+)
+
 const fakePolicyRevision = "v2.0000000000000000000000000000000000000000000000000000000000000001"
 
 const fakeCoordinatorImage = "registry.example.invalid/trino@sha256:1111111111111111111111111111111111111111111111111111111111111111"
@@ -77,7 +84,8 @@ func (c *fakeCoordinator) validate(t *testing.T, observedWorkers int, requiredRe
 		CoordinatorImage: fakeCoordinatorImage, WorkerImage: fakeCoordinatorImage,
 	}, trinoPoolExpectation{
 		Image: fakeCoordinatorImage, CatalogRevision: requiredRevision,
-		PolicyRevision: fakePolicyRevision, InternalHTTP: false,
+		PolicyRevision: fakePolicyRevision, PasswordRevision: fakePasswordRevision,
+		GroupRevision: fakeGroupRevision, InternalHTTP: false,
 	})
 }
 
@@ -235,8 +243,8 @@ func TestCertificateHashBindsTheObservedFacts(t *testing.T) {
 func TestValidationDoesNotClaimAnUnacknowledgedAuthRevision(t *testing.T) {
 	coordinator := newFakeCoordinator(t)
 	coordinator.sync["securityRevisions"] = []any{
-		map[string]any{"kind": "password-authenticator", "name": "file", "revision": "9"},
-		map[string]any{"kind": "group-provider", "name": "file", "revision": "4"},
+		map[string]any{"kind": "password-authenticator", "name": "file", "revision": fakePasswordRevision},
+		map[string]any{"kind": "group-provider", "name": "file", "revision": fakeGroupRevision},
 		// What the OPA access control actually reports today.
 		map[string]any{
 			"kind": "system-access-control", "name": "opa", "revision": nil,
@@ -373,8 +381,8 @@ func TestInternalHTTPProbeDeclaresForwardedHTTPS(t *testing.T) {
 func TestValidationDoesNotClaimAStalePolicyRevision(t *testing.T) {
 	coordinator := newFakeCoordinator(t)
 	coordinator.sync["securityRevisions"] = []any{
-		map[string]any{"kind": "password-authenticator", "name": "file", "revision": "9"},
-		map[string]any{"kind": "group-provider", "name": "file", "revision": "4"},
+		map[string]any{"kind": "password-authenticator", "name": "file", "revision": fakePasswordRevision},
+		map[string]any{"kind": "group-provider", "name": "file", "revision": fakeGroupRevision},
 		map[string]any{"kind": "system-access-control", "name": "opa", "revision": "v2.an-older-projection"},
 	}
 
@@ -405,5 +413,94 @@ func TestValidationDoesNotClaimAnUnknownPolicyRevision(t *testing.T) {
 		if check == trinoPoolCheckAuthRevision {
 			t.Fatal("the auth-revision check was claimed with no served projection to compare against")
 		}
+	}
+}
+
+// The OPA bundle and the authentication Secret reach a coordinator by different
+// paths and settle at different times. A candidate whose authorization data is
+// current but whose password file predates the tenant about to be admitted
+// looks healthy and then rejects that tenant's very first request, so each
+// projected component is compared on its own.
+func TestValidationRequiresEveryProjectedComponentToBeCurrent(t *testing.T) {
+	for _, testCase := range []struct {
+		name      string
+		revisions []any
+	}{
+		{
+			name: "current policy, stale password file",
+			revisions: []any{
+				map[string]any{"kind": "password-authenticator", "name": "file", "revision": "sha256:older"},
+				map[string]any{"kind": "group-provider", "name": "file", "revision": fakeGroupRevision},
+				map[string]any{"kind": "system-access-control", "name": "opa", "revision": fakePolicyRevision},
+			},
+		},
+		{
+			name: "current password file, stale groups",
+			revisions: []any{
+				map[string]any{"kind": "password-authenticator", "name": "file", "revision": fakePasswordRevision},
+				map[string]any{"kind": "group-provider", "name": "file", "revision": "sha256:older"},
+				map[string]any{"kind": "system-access-control", "name": "opa", "revision": fakePolicyRevision},
+			},
+		},
+		{
+			name: "no password authenticator at all",
+			revisions: []any{
+				map[string]any{"kind": "group-provider", "name": "file", "revision": fakeGroupRevision},
+				map[string]any{"kind": "system-access-control", "name": "opa", "revision": fakePolicyRevision},
+			},
+		},
+		{
+			// A second authenticator reads a file this control plane does not
+			// write, so it can authenticate principals outside the projection.
+			// Admitting on the strength of the one component that agrees would
+			// pull that file inside the pool's trust boundary silently.
+			name: "a second password authenticator this control plane does not write",
+			revisions: []any{
+				map[string]any{"kind": "password-authenticator", "name": "file", "revision": fakePasswordRevision},
+				map[string]any{"kind": "password-authenticator", "name": "file-2", "revision": "sha256:someone-elses-file"},
+				map[string]any{"kind": "group-provider", "name": "file", "revision": fakeGroupRevision},
+				map[string]any{"kind": "system-access-control", "name": "opa", "revision": fakePolicyRevision},
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			coordinator := newFakeCoordinator(t)
+			coordinator.sync["securityRevisions"] = testCase.revisions
+
+			validation, err := coordinator.validate(t, 2, 42)
+			if err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+			for _, check := range validation.Checks {
+				if check == trinoPoolCheckAuthRevision {
+					t.Fatal("the auth-revision check was claimed while a projected component was not current")
+				}
+			}
+		})
+	}
+}
+
+// With every projected component reporting exactly what is being served, the
+// check is claimed.
+func TestValidationClaimsTheAuthRevisionWhenEveryProjectionMatches(t *testing.T) {
+	coordinator := newFakeCoordinator(t)
+	coordinator.sync["securityRevisions"] = []any{
+		map[string]any{"kind": "password-authenticator", "name": "file", "revision": fakePasswordRevision},
+		map[string]any{"kind": "group-provider", "name": "file", "revision": fakeGroupRevision},
+		map[string]any{"kind": "system-access-control", "name": "opa", "revision": fakePolicyRevision},
+	}
+
+	validation, err := coordinator.validate(t, 2, 42)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	claimed := false
+	for _, check := range validation.Checks {
+		if check == trinoPoolCheckAuthRevision {
+			claimed = true
+		}
+	}
+	if !claimed {
+		t.Fatalf("checks = %v, want the auth revision claimed", validation.Checks)
 	}
 }

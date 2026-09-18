@@ -10,8 +10,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // poolRegistryJSON is the registry document, parameterised by the values a
@@ -195,11 +197,43 @@ func TestUnreadableDesiredStateSourceIsAnError(t *testing.T) {
 // second naming scheme that could drift.
 func TestBlueprintKeyIsTheDeclaredFileName(t *testing.T) {
 	reader := poolAPIReader(t, poolConfigMap(t, 3, 3))
-	data, err := reader.Blueprint(context.Background(), "/etc/duckgres/trino/blueprint.json")
+	snapshot, err := reader.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	data, err := snapshot.Blueprint("/etc/duckgres/trino/blueprint.json")
 	if err != nil {
 		t.Fatalf("read blueprint: %v", err)
 	}
 	if len(data) == 0 {
 		t.Fatal("the blueprint key resolved to nothing")
+	}
+}
+
+// The registry and the blueprint come from ONE read of ONE object.
+//
+// Reading them as two calls can straddle an update and pair a new registry
+// entry with the release the cluster has already replaced - a configuration
+// that never existed anywhere, published as desired state. The reader is
+// asserted to make a single Get per resolution.
+func TestDesiredStateIsOneAtomicRead(t *testing.T) {
+	t.Setenv(envTrinoRegistryOnly, "true")
+	t.Setenv(envTrinoPoolEnabled, "true")
+	client := poolConfigMap(t, 3, 3)
+	gets := 0
+	fakeClient, ok := client.(*fake.Clientset)
+	if !ok {
+		t.Fatalf("unexpected client type %T", client)
+	}
+	fakeClient.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		gets++
+		return false, nil, nil
+	})
+
+	if _, err := resolveTrinoPoolConfigByID(context.Background(), poolAPIReader(t, client), "cell-001"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if gets != 1 {
+		t.Fatalf("the resolution made %d reads of the desired-state object, want exactly 1", gets)
 	}
 }

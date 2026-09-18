@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 
 	"github.com/open-policy-agent/opa/v1/bundle"
 )
@@ -107,15 +109,18 @@ func (defaultBuilder) BuildBundle(gc GroupCatalogs, gs GroupScopes) ([]byte, err
 // PolicyRevision is the revision stamped on the bundle built from exactly this
 // projection.
 //
-// It is a digest of the authorization data, not a counter, for two reasons: the
+// It is a digest of the policy and its data, not a counter, for two reasons: the
 // producer is whichever control-plane replica serves the bundle, so no replica
 // owns a counter, and the value has to be comparable in both directions - a
 // controller asks "is the coordinator deciding with the data I currently
 // serve?", which is an equality question, not an ordering one.
 //
-// The policy itself is deliberately NOT part of it: policy.rego is compiled
-// into the binary, so a coordinator loading a different policy is a different
-// image, which the image check already covers.
+// The POLICY BYTES are part of it, not just the data. policy.rego is embedded
+// in the CONTROL PLANE binary and served to OPA as a remote bundle, so it is
+// not covered by the candidate's image check at all: two duckgres versions can
+// serve different rules to the same Trino and OPA images with an identical
+// group map. A revision over the data alone would call a coordinator deciding
+// with the previous RULES current.
 func PolicyRevision(gc GroupCatalogs, gs GroupScopes) (string, error) {
 	data, err := buildDataDocument(gc, gs)
 	if err != nil {
@@ -127,8 +132,19 @@ func PolicyRevision(gc GroupCatalogs, gs GroupScopes) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("canonicalize bundle data: %w", err)
 	}
-	digest := sha256.Sum256(canonical)
-	return bundleRevision + "." + hex.EncodeToString(digest[:]), nil
+	digest := sha256.New()
+	// Length-prefixed, so no rearrangement of policy and data bytes can produce
+	// the same digest as a different pair.
+	writeDigestField(digest, policyRego)
+	writeDigestField(digest, canonical)
+	return bundleRevision + "." + hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func writeDigestField(digest hash.Hash, field []byte) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(field)))
+	_, _ = digest.Write(length[:])
+	_, _ = digest.Write(field)
 }
 
 // buildDataDocument builds the JSON-decoded map[string]interface{} that OPA

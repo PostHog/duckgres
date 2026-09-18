@@ -4,8 +4,10 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -480,7 +482,10 @@ type TrinoProvisioner struct {
 	// policyRevision is the revision of the authorization projection currently
 	// served. It is read from the pool operator's validation goroutine while
 	// the reconcile loop writes it, so it is atomic rather than a plain field.
-	policyRevision         atomic.Pointer[string]
+	policyRevision atomic.Pointer[string]
+	// authRevisions are the fingerprints of the projected password and group
+	// files, read from the same goroutine and for the same reason.
+	authRevisions          atomic.Pointer[trinoAuthRevisions]
 	tenantSecretMountPath  string
 	awsRegion              string
 	s3MaxConnections       int
@@ -2104,10 +2109,55 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 		AdminPasswordHash:    p.adminPasswordHash,
 		ObserverPasswordHash: p.observerHash(),
 	})
-	return p.upsertSecretMerge(ctx, TrinoAuthSecretName, map[string][]byte{
+	if err := p.upsertSecretMerge(ctx, TrinoAuthSecretName, map[string][]byte{
 		TrinoAuthSecretKeyPasswordDB: []byte(passwordDB),
 		TrinoAuthSecretKeyGroupDB:    []byte(groupDB),
+	}); err != nil {
+		return err
+	}
+	// The fingerprints of the bytes just projected. A pooled candidate must
+	// report loading exactly these before it may be admitted: its OPA bundle
+	// and its password file arrive by different paths and at different times,
+	// so a coordinator can be current on authorization data while its password
+	// store still predates the tenant that is about to be admitted - it would
+	// pass an authorization-only check and then reject that tenant's first
+	// request.
+	p.authRevisions.Store(&trinoAuthRevisions{
+		Password: TrinoFileFingerprint([]byte(passwordDB)),
+		Group:    TrinoFileFingerprint([]byte(groupDB)),
 	})
+	return nil
+}
+
+// trinoAuthRevisions are the fingerprints of the projected authentication
+// files, held together so a reader can never pair one file's fingerprint with
+// the other's projection.
+type trinoAuthRevisions struct {
+	Password string
+	Group    string
+}
+
+// TrinoFileFingerprint computes what Trino's file password authenticator and
+// file group provider report as their loaded revision.
+//
+// This is their PUBLISHED contract - `sha256:` followed by the lower-case
+// hexadecimal SHA-256 of the file's bytes - so a controller that wrote the file
+// can compute the value it expects to see acknowledged without asking a
+// coordinator what its revision means.
+func TrinoFileFingerprint(content []byte) string {
+	digest := sha256.Sum256(content)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+// PublishedAuthRevisions reports the fingerprints of the authentication files
+// this control plane has projected, or ("", "") before the first projection.
+// Empty means nothing may be claimed on their behalf, which fails a pooled
+// admission closed.
+func (p *TrinoProvisioner) PublishedAuthRevisions() (password, group string) {
+	if revisions := p.authRevisions.Load(); revisions != nil {
+		return revisions.Password, revisions.Group
+	}
+	return "", ""
 }
 
 // TrinoClusterPrincipals carries the bcrypt hashes for the cell's two

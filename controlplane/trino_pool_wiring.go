@@ -129,10 +129,18 @@ func buildTrinoPoolOperators(
 		operator.identity = func(ctx context.Context, endpoint string) (string, error) {
 			return probeProcessIdentity(ctx, client, endpoint, observerCredential, true)
 		}
-		// The authorization projection is produced by THIS cell's provisioner,
-		// which is also what serves the bundle the candidate's OPA pulls.
-		provisionerForPolicy := wire.Provisioner
-		operator.policyRevision = provisionerForPolicy.PublishedPolicyRevision
+		// The projection is produced by THIS cell's provisioner: it serves the
+		// bundle the candidate's OPA pulls and writes the Secret the candidate
+		// mounts its password and group files from.
+		provisionerForProjection := wire.Provisioner
+		operator.projection = func() trinoPoolProjectionRevisions {
+			password, group := provisionerForProjection.PublishedAuthRevisions()
+			return trinoPoolProjectionRevisions{
+				Policy:   provisionerForProjection.PublishedPolicyRevision(),
+				Password: password,
+				Group:    group,
+			}
+		}
 
 		// The fenced catalog writer, if this deployment has moved the cell off
 		// the coordinator-mediated path. Its fence is the pool authority, so it
