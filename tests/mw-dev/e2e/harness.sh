@@ -2564,14 +2564,18 @@ persistent_user_secret_isolation() { # org rootpw
 # another session's attached catalogs, while the system catalogs (ducklake,
 # memory) must be preserved.
 user_catalog_wipe() { # org password
-  org="$1"; pw="$2"; cname="e2e_probe_catalog"
+  org="$1"; pw="$2"; cname="e2e_probe_catalog_$$"
   log "user catalog wipe on $org"
 
-  pg "$org" "$pw" ducklake "ATTACH ':memory:' AS $cname" >/dev/null
-  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name = '$cname' AND NOT internal")"
-  # The attach lands on the session's worker (native fallback — ATTACH is not
-  # PostgreSQL syntax). It must be visible within the SAME session...
-  [ "$n" = "1" ] || fail "user catalog wipe: probe catalog not attached in its own session (count=$n)"
+  # Same-session check: BOTH statements must ride ONE connection, so feed psql
+  # via stdin (each statement is its own Q message on the same session). Two
+  # separate `pg` calls would be two sessions — and the second one's
+  # CreateSession wipe would already have detached the probe.
+  out="$(printf "ATTACH IF NOT EXISTS ':memory:' AS %s;\nSELECT count(*) FROM duckdb_databases() WHERE database_name = '%s' AND NOT internal;\n" "$cname" "$cname" | \
+    PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -tA 2>&1)" || fail "user catalog wipe: attach session failed: $out"
+  [ "$(printf '%s' "$out" | tail -1)" = "1" ] || fail "user catalog wipe: probe catalog not attached in its own session ($out)"
 
   # ...and gone from the NEXT fresh session (same hot-idle worker or not).
   n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name = '$cname' AND NOT internal")"
