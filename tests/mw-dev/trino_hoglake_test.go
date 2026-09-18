@@ -75,3 +75,21 @@ func TestScheduledCleanupRemovesHoglakePrefixAndPropagatesFailure(t *testing.T) 
 		})
 	}
 }
+
+func TestHoglakeRestartAssertionsMatchInsertedFixture(t *testing.T) {
+	raw, err := os.ReadFile("e2e/trino.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	start := strings.Index(script, "\"$KUBECTL\" -n \"$NS\" delete pod -l 'app=duckgres-trino,component=worker'")
+	end := strings.Index(script, "\ndeprovision_must_conflict()")
+	if start < 0 || end <= start {
+		t.Fatal("restart assertions missing")
+	}
+	// Model the successful database read after both worker and coordinator restarts.
+	code := "set -eu\nKUBECTL=true\nNS=fixture\nDB_A=fixture\npw_a=fixture\nCAT_A=fixture\nschema=main\ntable=fixture\nscalar() { echo two; }\nlog() { :; }\nsleep() { :; }\nfail() { echo \"$*\"; exit 1; }\n" + script[start:end]
+	if out, err := exec.Command("sh", "-c", code).CombinedOutput(); err != nil {
+		t.Fatalf("persisted fixture rejected after restart: %v %s", err, out)
+	}
+}

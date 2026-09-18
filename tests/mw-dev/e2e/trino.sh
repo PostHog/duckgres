@@ -393,10 +393,10 @@ done
 trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 && fail "old Trino password still authenticates"
 pw_a="$new_pw"
 
-log "worker restart preserves DuckLake data"
+log "worker restart preserves Hoglake data"
 "$KUBECTL" -n "$NS" delete pod -l 'app=duckgres-trino,component=worker' --wait=true >/dev/null
 "$KUBECTL" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=240s >/dev/null
-[ "$(scalar "$DB_A" "$pw_a" "SELECT label FROM $CAT_A.$schema.$table")" = TWO ] || fail "data missing after Trino worker restart"
+[ "$(scalar "$DB_A" "$pw_a" "SELECT label FROM $CAT_A.$schema.$table")" = two ] || fail "data missing after Trino worker restart"
 
 log "coordinator restart restores catalog store, auth, and OPA bundle"
 "$KUBECTL" -n "$NS" delete pod -l 'app=duckgres-trino,component=coordinator' --wait=true >/dev/null
@@ -404,7 +404,7 @@ log "coordinator restart restores catalog store, auth, and OPA bundle"
 i=0
 while [ "$i" -lt 30 ]; do
   value="$(scalar "$DB_A" "$pw_a" "SELECT label FROM $CAT_A.$schema.$table" 2>/dev/null || true)"
-  [ "$value" = TWO ] && break
+  [ "$value" = two ] && break
   sleep 2; i=$((i + 1))
 done
 [ "$i" -lt 30 ] || fail "catalog/auth/OPA did not recover after coordinator restart"
