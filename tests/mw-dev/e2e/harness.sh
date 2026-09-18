@@ -2554,17 +2554,32 @@ persistent_user_secret_isolation() { # org rootpw
   # hot-idle worker, the next session's `ATTACH IF NOT EXISTS ... AS db` was a
   # no-op, and it silently queried the PREVIOUS session's target. Root leaves a
   # catalog holding a marker table; $u2's IF NOT EXISTS attach under the same
-  # alias must come up EMPTY (a fresh catalog), not inherit root's. Both sides
-  # are pinning statements, so they land on the org's standard worker rather
-  # than being split across the exploratory tier. In-memory catalogs keep the
-  # check free of external dependencies; the name carries no digits so the
-  # result survives the command-tag noise psql prints for the ATTACH.
-  pg "$org" "$pw" ducklake "ATTACH ':memory:' AS leakcat; CREATE TABLE leakcat.main.marker AS SELECT 42 AS x" >/dev/null
-  n="$(pg "$org" "$u2pw" ducklake "ATTACH IF NOT EXISTS ':memory:' AS leakcat; SELECT count(*) FROM duckdb_tables() WHERE database_name = 'leakcat'" "$u2" | tr -dc '0-9')"
-  [ "$n" = "0" ] || fail "user catalog: user $u2 inherited root's attached catalog — cross-session ATTACH leak (tables=$n)"
-  # And within one user: root's NEXT session must not see its own stale attach.
-  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'leakcat'" | tr -dc '0-9')"
-  [ "$n" = "0" ] || fail "user catalog: attached catalog survived into root's next session (count=$n)"
+  # alias must come up EMPTY (a fresh catalog), not inherit root's.
+  #
+  # Each side's statements must ride ONE connection — every `pg` call is its
+  # own session, whose session-create detach would already have removed the
+  # catalog — so they are fed to psql on stdin (one Q message per statement,
+  # same session). ATTACH is not PostgreSQL syntax, so it parse-fails into the
+  # pin set and both sides land on the org's standard worker rather than being
+  # split across the exploratory tier. In-memory catalogs keep the check free of
+  # external dependencies; the name is run-unique.
+  lcat="e2e_leakcat_$$"
+  out="$(printf "ATTACH ':memory:' AS %s;\nCREATE TABLE %s.main.marker AS SELECT 42 AS x;\nSELECT count(*) FROM duckdb_tables() WHERE database_name = '%s';\n" "$lcat" "$lcat" "$lcat" | \
+    PGPASSWORD="$pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=root dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -tA 2>&1)" || fail "user catalog: root attach session failed: $out"
+  [ "$(printf '%s' "$out" | tail -1)" = "1" ] || fail "user catalog: root's marker table not visible in its own session ($out)"
+  out="$(printf "ATTACH IF NOT EXISTS ':memory:' AS %s;\nSELECT count(*) FROM duckdb_tables() WHERE database_name = '%s';\n" "$lcat" "$lcat" | \
+    PGPASSWORD="$u2pw" psql \
+      "sslmode=require host=$org$SNI_SUFFIX hostaddr=$CP_IP port=5432 user=$u2 dbname=ducklake" \
+      -v ON_ERROR_STOP=1 -tA 2>&1)" || fail "user catalog: $u2 attach session failed: $out"
+  [ "$(printf '%s' "$out" | tail -1)" = "0" ] || fail "user catalog: user $u2 inherited root's attached catalog — cross-session ATTACH leak ($out)"
+  # Gone from the next fresh session too, while the worker-managed catalogs
+  # must survive every session-create detach.
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name = '$lcat'")"
+  [ "$n" = "0" ] || fail "user catalog: attached catalog survived into a fresh session (count=$n)"
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('ducklake','memory')")"
+  [ "$n" = "2" ] || fail "user catalog: worker-managed catalogs missing after the detach (count=$n)"
   # Root's stored (persistent) copy must be unaffected by $u2's session-create wipe.
   n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'")"
   [ "$n" = "1" ] || fail "user secret: root's persistent secret lost after $u2's session (count=$n)"
