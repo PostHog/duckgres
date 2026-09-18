@@ -946,12 +946,18 @@ tenant isolation, disable/re-enable persistence, and deprovision protection.
 The regular lane uses isolated Hoglake PostgreSQL and server deployments, plus
 three Trino workers. Apply [the CI-only Hoglake storage identity and CI deployer](https://github.com/PostHog/posthog-cloud-infra/pull/10521)
 permissions, the Duckling permissions boundary, and Crossplane tenant-prefix
-grants before running it. Configure these private GitHub repository secrets:
+grants before running it. After AWS OIDC authentication, deployment, teardown,
+and scheduled cleanup run `discover-hoglake.sh`. It reads the dedicated CI role
+with `iam:GetRole` and its `hoglake-ci-storage` inline policy with
+`iam:GetRolePolicy`, deriving the shared `s3://<bucket>/trino/` base from the
+single permitted `trino/ci-pr-*` write scope. Missing or ambiguous configuration
+fails before mutation. Values are masked before being exported through
+`GITHUB_ENV`; no Hoglake GitHub secrets or variables are required.
 
-- `MW_DEV_HOGLAKE_CI_POD_IDENTITY_ROLE`: dedicated server role, limited to
-  disposable `trino/ci-pr-*` paths. It is separate from the Trino assume-role identity.
-- `MW_DEV_HOGLAKE_DATA_PATH`: `s3://<dedicated-bucket>/trino/`, matching managed
-  provisioning and Crossplane. Each tenant writes below its Duckling name.
+For local runs, continue supplying `HOGLAKE_CI_POD_IDENTITY_ROLE` and
+`HOGLAKE_DATA_PATH` explicitly. After the discovery permission is applied and
+CI discovery succeeds, remove the obsolete `MW_DEV_HOGLAKE_CI_POD_IDENTITY_ROLE`
+and `MW_DEV_HOGLAKE_DATA_PATH` repository secrets.
 
 Missing prerequisites fail deployment before namespace mutation. Cleanup waits
 for fixture writers to terminate and deletes only the numeric PR's exact prefix.

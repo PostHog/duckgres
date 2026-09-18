@@ -31,8 +31,7 @@
 #   vars:    TS_WIF_CLIENT_ID_MW_DEV, TS_WIF_AUDIENCE_MW_DEV
 #   secrets: AWS_ECR_PUBLISH_IAM_ROLE (already exists, used by CD),
 #            MW_DEV_ACCOUNT_ID (mw-dev AWS account id; ARNs built from it),
-#            MW_DEV_TRINO_POD_IDENTITY_ROLE (full ARN; kept out of public git),
-#            MW_DEV_HOGLAKE_CI_POD_IDENTITY_ROLE, MW_DEV_HOGLAKE_DATA_PATH
+#            MW_DEV_TRINO_POD_IDENTITY_ROLE (full ARN; kept out of public git)
 #   IAM:     github-duckgres-e2e role in the mw-dev account (posthog-cloud-infra)
 #            — stripped down, NOT the account-admin terraform-infra role.
 #   Repo setting: "Require approval for all outside collaborators".
@@ -123,7 +122,6 @@ jobs:
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
-      HOGLAKE_DATA_PATH: ${{ secrets.MW_DEV_HOGLAKE_DATA_PATH }}
       # The per-PR CP assumes the SAME EKS Pod Identity role as the real mw-dev
       # control plane, so STS-brokered S3 activation works with no cred
       # injection. Built from the account-id secret (no account id committed) +
@@ -133,7 +131,6 @@ jobs:
       # secret so no account id or internal role ARN lands in this public repo.
       # Only the trino matrix cell consumes it.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      HOGLAKE_CI_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_HOGLAKE_CI_POD_IDENTITY_ROLE }}
       # Atomic Hoglake writes and the PostgreSQL-backed dynamic catalog store.
       TRINO_IMAGE: ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b
     steps:
@@ -163,6 +160,9 @@ jobs:
           # account id is committed; the role name is not sensitive.
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
+
+      - name: Discover Hoglake CI configuration
+        run: bash tests/mw-dev/discover-hoglake.sh
 
       # Private EKS API — join the org tailnet so kubectl can reach it. OIDC/WIF,
       # no static key. Mirrors PostHog/hogland deploy.yml. The subnet router
@@ -237,7 +237,6 @@ jobs:
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
-      HOGLAKE_DATA_PATH: ${{ secrets.MW_DEV_HOGLAKE_DATA_PATH }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Configure AWS credentials (OIDC)
@@ -245,6 +244,9 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
+
+      - name: Discover Hoglake CI configuration
+        run: bash tests/mw-dev/discover-hoglake.sh
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
         with:
@@ -274,7 +276,6 @@ jobs:
       CLUSTER_NAME: posthog-mw-dev
       EKS_CLUSTER_NAME: posthog-mw-dev
       AWS_REGION: us-east-1
-      HOGLAKE_DATA_PATH: ${{ secrets.MW_DEV_HOGLAKE_DATA_PATH }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Configure AWS credentials (OIDC)
@@ -282,6 +283,9 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
+
+      - name: Discover Hoglake CI configuration
+        run: bash tests/mw-dev/discover-hoglake.sh
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
         with:

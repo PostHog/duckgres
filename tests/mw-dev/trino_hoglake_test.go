@@ -93,3 +93,43 @@ func TestHoglakeRestartAssertionsMatchInsertedFixture(t *testing.T) {
 		t.Fatalf("persisted fixture rejected after restart: %v %s", err, out)
 	}
 }
+
+func TestDiscoverHoglakeConfiguration(t *testing.T) {
+	for _, mode := range []string{"valid", "missing", "ambiguous", "denied"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			fake := `#!/bin/bash
+if [[ "$*" == *get-role-policy* ]]; then
+ case "$TEST_MODE" in
+ denied) exit 1;;
+ missing) echo '{"PolicyDocument":{"Statement":[]}}';;
+ ambiguous) echo '{"PolicyDocument":{"Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::example-one/trino/ci-pr-*","arn:aws:s3:::example-two/trino/ci-pr-*"]}]}}';;
+ *) echo '{"PolicyDocument":{"Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":"arn:aws:s3:::example-hoglake/trino/ci-pr-*"}]}}';;
+ esac
+else
+ echo '{"Role":{"Arn":"arn:aws:iam::123456789012:role/hoglake-ci-dev"}}'
+fi
+`
+			if err := os.WriteFile(dir+"/aws", []byte(fake), 0755); err != nil {
+				t.Fatal(err)
+			}
+			envFile := dir + "/env"
+			cmd := exec.Command("bash", "discover-hoglake.sh")
+			cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "GITHUB_ENV="+envFile, "TEST_MODE="+mode)
+			out, err := cmd.CombinedOutput()
+			values, _ := os.ReadFile(envFile)
+			if mode == "valid" {
+				if err != nil || !strings.Contains(string(values), "HOGLAKE_DATA_PATH=s3://example-hoglake/trino/\n") || !strings.Contains(string(values), "HOGLAKE_CI_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/hoglake-ci-dev\n") {
+					t.Fatalf("discovery failed: %v %s %s", err, out, values)
+				}
+				for _, line := range strings.Split(string(out), "\n") {
+					if strings.Contains(line, "123456789012") && !strings.HasPrefix(line, "::add-mask::") {
+						t.Fatal("unmasked identifier")
+					}
+				}
+			} else if err == nil || len(values) != 0 {
+				t.Fatalf("invalid discovery published configuration: %v %s", err, values)
+			}
+		})
+	}
+}
