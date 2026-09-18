@@ -8,9 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
@@ -38,7 +41,21 @@ const (
 	envTrinoPoolCatalogWriter    = "DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED"
 	envTrinoPoolCatalogBootstrap = "DUCKGRES_TRINO_POOL_CATALOG_BOOTSTRAP"
 	envTrinoPoolCatalogDSNFile   = "DUCKGRES_TRINO_POOL_CATALOG_DSN_FILE"
+	// envTrinoPoolCatalogSchema names the schema the catalog tables live in.
+	// The publisher credential carries a database and no schema, and the role's
+	// privileges are on the cell's schema only.
+	envTrinoPoolCatalogSchema = "DUCKGRES_TRINO_POOL_CATALOG_SCHEMA"
+
+	// trinoPoolCatalogBootstrapBudget bounds the additive DDL this runs during
+	// startup wiring. An unreachable database must fail readably rather than
+	// hang the control plane's boot.
+	trinoPoolCatalogBootstrapBudget = 30 * time.Second
 )
+
+// trinoPoolSchemaPattern is the unquoted-identifier shape. The schema is
+// interpolated into a connection parameter, so anything needing quotes is
+// refused rather than escaped.
+var trinoPoolSchemaPattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 
 // trinoPoolRevisionStore records the published catalog revision on the pool
 // row. It is an interface so the bridge can be tested without a config store.
@@ -263,10 +280,26 @@ func buildTrinoPoolCatalogWriter(cellID string, store trinoPoolRevisionStore, au
 	if err != nil {
 		return nil, fmt.Errorf("read catalog writer credential: %w", err)
 	}
+	// The schema the catalog tables live in.
+	//
+	// The credential names a DATABASE and nothing else, and the publisher role
+	// holds privileges on the cell's schema alone - so unqualified SQL resolves
+	// against `public`, where that role can neither create nor read anything.
+	// It is required rather than defaulted: guessing a schema would produce
+	// exactly that failure at the first publication, on a path an operator has
+	// no reason to suspect.
+	schema, err := trinoPoolCatalogSchema()
+	if err != nil {
+		return nil, err
+	}
+	dsn, err := withSearchPath(strings.TrimSpace(string(raw)), schema)
+	if err != nil {
+		return nil, err
+	}
 	// pgx, not "postgres": lib/pq is not linked into the control-plane binary,
 	// so sql.Open("postgres", ...) fails at startup with `unknown driver`. The
 	// rest of the control plane registers pgx (see storage_meter.go).
-	db, err := sql.Open("pgx", strings.TrimSpace(string(raw)))
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open catalog store: %w", err)
 	}
@@ -281,15 +314,69 @@ func buildTrinoPoolCatalogWriter(cellID string, store trinoPoolRevisionStore, au
 		// coordinator runs no DDL at all. It is explicit so a deployment that
 		// has not split its database grants yet cannot do it by accident. This
 		// is additive DDL only and takes no fence, because it publishes nothing.
-		schema, err := trinocatalog.NewPublisher(db, cellID, "duckgres-bootstrap", 1)
+		//
+		// It is BOUNDED: this runs during startup wiring, so an unreachable
+		// database must fail with a readable error rather than hang the control
+		// plane's boot indefinitely. The error keeps its cause so the next
+		// attempt is diagnosable.
+		ctx, cancel := context.WithTimeout(context.Background(), trinoPoolCatalogBootstrapBudget)
+		defer cancel()
+		bootstrapper, err := trinocatalog.NewPublisher(db, cellID, "duckgres-bootstrap", 1)
 		if err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("configure catalog bootstrap: %w", err)
 		}
-		if err := schema.EnsureSchema(context.Background()); err != nil {
+		if err := bootstrapper.EnsureSchema(ctx); err != nil {
 			_ = db.Close()
-			return nil, fmt.Errorf("bootstrap catalog store: %w", err)
+			return nil, fmt.Errorf("bootstrap catalog store in schema %q: %w", schema, err)
 		}
 	}
 	return writer, nil
+}
+
+// trinoPoolCatalogSchema resolves and validates the schema the catalog tables
+// live in.
+//
+// The value is interpolated into a connection parameter, so it is checked
+// against the unquoted-identifier shape rather than escaped: a schema name that
+// needs quoting is a deployment mistake worth refusing, and accepting one here
+// would put caller-shaped text into a connection string.
+func trinoPoolCatalogSchema() (string, error) {
+	schema := strings.TrimSpace(os.Getenv(envTrinoPoolCatalogSchema))
+	if schema == "" {
+		return "", fmt.Errorf("%s is enabled but %s is unset: the publisher credential names a database only, and the role's privileges are on the cell's schema",
+			envTrinoPoolCatalogWriter, envTrinoPoolCatalogSchema)
+	}
+	if !trinoPoolSchemaPattern.MatchString(schema) {
+		return "", fmt.Errorf("%s=%q is not a plain lower-case identifier", envTrinoPoolCatalogSchema, schema)
+	}
+	return schema, nil
+}
+
+// withSearchPath pins the connection's search_path to that one schema.
+//
+// Every statement the publisher issues is unqualified, and the reader side of
+// the same tables resolves them the same way, so the schema belongs on the
+// connection rather than being threaded through each statement. A DSN that
+// already sets a search_path is refused instead of silently overridden: two
+// sources for the same setting is how a publisher ends up writing where nobody
+// is looking.
+func withSearchPath(dsn, schema string) (string, error) {
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		// A keyword/value DSN ("host=... dbname=...") is not a URL. Rather than
+		// re-implement that grammar, refuse it: infra provisions a URL.
+		return "", fmt.Errorf("catalog writer credential is not a postgres:// URL: %w", err)
+	}
+	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
+		return "", fmt.Errorf("catalog writer credential is not a postgres:// URL")
+	}
+	query := parsed.Query()
+	if existing := strings.TrimSpace(query.Get("search_path")); existing != "" && existing != schema {
+		return "", fmt.Errorf("catalog writer credential already pins search_path=%q, which disagrees with %s=%q",
+			existing, envTrinoPoolCatalogSchema, schema)
+	}
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
