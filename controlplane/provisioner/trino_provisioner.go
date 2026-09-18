@@ -463,17 +463,21 @@ type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingSta
 // fires on first install; thereafter ensureClusterSecrets adopts the
 // existing K8s Secrets.
 type TrinoProvisioner struct {
-	managed                 *TrinoManagedCatalogOpts
-	store                   TrinoStore
-	bootstrapSentinel       TrinoBootstrapSentinelStore
-	warehouses              TrinoWarehouseStore
-	ducklings               TrinoDucklingResolver
-	kubernetes              kubernetes.Interface
-	secretReadiness         TrinoSecretReadiness
-	namespace               string
-	cellID                  string
-	explicitAssignmentOnly  bool
-	catalog                 TrinoCatalogClient
+	managed                *TrinoManagedCatalogOpts
+	store                  TrinoStore
+	bootstrapSentinel      TrinoBootstrapSentinelStore
+	warehouses             TrinoWarehouseStore
+	ducklings              TrinoDucklingResolver
+	kubernetes             kubernetes.Interface
+	secretReadiness        TrinoSecretReadiness
+	namespace              string
+	cellID                 string
+	explicitAssignmentOnly bool
+	catalog                TrinoCatalogClient
+	// tenantAdmission reports whether a tenant's publication has committed on
+	// the pool that serves it. Nil everywhere except a shared-pool cell with the
+	// Gateway's admission restriction enabled.
+	tenantAdmission         TenantAdmissionGate
 	additionalCatalogs      []TrinoCatalogClient
 	catalogTimeout          time.Duration
 	existingInternalSecrets []string
@@ -639,6 +643,53 @@ func (p *TrinoProvisioner) SetCatalogClient(catalog TrinoCatalogClient) {
 	p.credMu.Lock()
 	defer p.credMu.Unlock()
 	p.catalog = catalog
+}
+
+// TenantAdmissionGate answers whether a tenant is ADMITTED on the pool that
+// serves it - that is, whether its publication barrier has committed, so the
+// Gateway will actually dispatch its queries. The string is the operator-facing
+// reason when it is not.
+type TenantAdmissionGate func(orgID string) (admitted bool, reason string)
+
+// SetTenantAdmissionGate installs that check. It is set only for a shared-pool
+// cell that has the Gateway's admission restriction enabled; everywhere else it
+// stays nil and nothing changes.
+func (p *TrinoProvisioner) SetTenantAdmissionGate(gate TenantAdmissionGate) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.tenantAdmission = gate
+}
+
+func (p *TrinoProvisioner) tenantAdmissionGate() TenantAdmissionGate {
+	p.credMu.RLock()
+	defer p.credMu.RUnlock()
+	return p.tenantAdmission
+}
+
+// applyTenantAdmissionGate holds a warehouse at Provisioning until its tenant is
+// actually admitted.
+//
+// With the Gateway's admission restriction on, a catalog that exists and a
+// coordinator that is healthy are NOT enough: the Gateway refuses to dispatch
+// work for a tenant whose publication has not committed, so reporting Ready
+// would tell an operator - and PostHog - that a warehouse is queryable when
+// every query it receives is refused.
+func (p *TrinoProvisioner) applyTenantAdmissionGate(outcomes map[string]catalogOutcome) {
+	gate := p.tenantAdmissionGate()
+	if gate == nil {
+		return
+	}
+	for orgID, outcome := range outcomes {
+		if outcome.Err != nil || outcome.Pending {
+			continue
+		}
+		if admitted, reason := gate(orgID); !admitted {
+			if reason == "" {
+				reason = "waiting for the pool to admit this warehouse"
+			}
+			outcomes[orgID] = catalogOutcome{Pending: true, PendingReason: reason}
+		}
+	}
 }
 
 // catalogClient reads the current write path under the same lock the setter
@@ -826,6 +877,12 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	// since each is a single K8s API write — wrap them once. Per-org
 	// variance lives at the catalog step, which folds in the per-org
 	// tenant-password outcomes.
+	// A tenant the pool has not admitted is not queryable, whatever its catalog
+	// says. This runs before the state writes so such a warehouse reads as
+	// Provisioning rather than Ready.
+	if catalogOutcomes != nil {
+		p.applyTenantAdmissionGate(catalogOutcomes)
+	}
 	if len(collisions) > 0 {
 		if catalogOutcomes == nil {
 			catalogOutcomes = make(map[string]catalogOutcome, len(collisions))

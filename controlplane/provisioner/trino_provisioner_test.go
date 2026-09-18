@@ -2222,3 +2222,49 @@ func TestReconcileOPABundle_ScopeGroupOwnsTheSameCatalog(t *testing.T) {
 		t.Errorf("scope = %#v, want the team's schemas and relations", scope)
 	}
 }
+
+// With the Gateway's admission restriction on, a catalog that exists and a
+// healthy coordinator are not enough: the Gateway refuses to dispatch work for
+// a tenant whose publication has not committed. Reporting Ready then would tell
+// an operator the warehouse is queryable while every query it receives is
+// refused.
+func TestTenantAdmissionGateHoldsAWarehouseAtProvisioning(t *testing.T) {
+	provisioner := &TrinoProvisioner{}
+	outcomes := map[string]catalogOutcome{
+		"org-admitted": {Existed: true},
+		"org-waiting":  {Created: true},
+		"org-failed":   {Err: errors.New("catalog refused")},
+		"org-pending":  {Pending: true, PendingReason: "waiting for a tenant password"},
+	}
+	provisioner.SetTenantAdmissionGate(func(orgID string) (bool, string) {
+		return orgID == "org-admitted", "waiting for the pool to admit this warehouse"
+	})
+
+	provisioner.applyTenantAdmissionGate(outcomes)
+
+	if outcomes["org-admitted"].Pending || outcomes["org-admitted"].Err != nil {
+		t.Fatalf("an admitted tenant was held back: %+v", outcomes["org-admitted"])
+	}
+	if !outcomes["org-waiting"].Pending || outcomes["org-waiting"].PendingReason == "" {
+		t.Fatalf("an unadmitted tenant reads as ready: %+v", outcomes["org-waiting"])
+	}
+	// An existing failure is more specific than "not admitted yet" and must not
+	// be overwritten by it.
+	if outcomes["org-failed"].Err == nil {
+		t.Fatalf("a catalog failure was replaced by the admission gate: %+v", outcomes["org-failed"])
+	}
+	if outcomes["org-pending"].PendingReason != "waiting for a tenant password" {
+		t.Fatalf("an existing pending reason was overwritten: %+v", outcomes["org-pending"])
+	}
+}
+
+// Without the gate - every cell that is not a pooled one with the restriction
+// enabled - nothing changes.
+func TestTenantAdmissionGateIsInertWhenUnset(t *testing.T) {
+	provisioner := &TrinoProvisioner{}
+	outcomes := map[string]catalogOutcome{"org-a": {Existed: true}}
+	provisioner.applyTenantAdmissionGate(outcomes)
+	if outcomes["org-a"].Pending {
+		t.Fatalf("an outcome changed with no gate installed: %+v", outcomes["org-a"])
+	}
+}

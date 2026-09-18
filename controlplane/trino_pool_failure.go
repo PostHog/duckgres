@@ -32,6 +32,18 @@ import (
 // deletion timer: nothing is destroyed at the end of it.
 const trinoPoolSuspectAfter = 2 * time.Minute
 
+// trinoPoolSuspectDrainAfter is how long a member may stay excluded before it
+// is replaced through the PLANNED path.
+//
+// SUSPECT had exactly one exit that freed its slot: LOST, which requires
+// verified absence of every recorded object. A crash-looping coordinator keeps
+// its Deployment forever, so it kept its slot forever, and a second such
+// failure exhausted the repair budget and stalled the pool. Draining is the
+// honest alternative: it is refused if it would break the serving floor, it
+// preserves whatever work the member still holds, and it ends in a retirement
+// receipt rather than a loss claim nobody could prove.
+const trinoPoolSuspectDrainAfter = 15 * time.Minute
+
 // observeHealth moves a serving or admitted instance onto the failure branch
 // when the cluster stops reporting a healthy coordinator, and back when it
 // recovers.
@@ -60,7 +72,15 @@ func (o *trinoPoolOperator) observeHealth(ctx context.Context, instance configst
 			return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 				trinopool.PhaseSuspect, trinopool.PhaseServing, map[string]any{"last_error": ""}))
 		}
-		return o.claimLossIfProven(ctx, instance, observed)
+		if progressed, err := o.claimLossIfProven(ctx, instance, observed); progressed || err != nil {
+			return progressed, err
+		}
+		// Still present, still unhealthy. A member that cannot be PROVEN dead
+		// has to leave through the planned path or it never leaves at all.
+		if time.Since(instance.PhaseChangedAt) < trinoPoolSuspectDrainAfter {
+			return false, nil
+		}
+		return o.drainSuspectInstance(ctx, instance)
 	default:
 		return false, nil
 	}
@@ -225,6 +245,34 @@ func failureReason(instance configstore.TrinoPoolInstance) string {
 		return reason
 	}
 	return "the candidate could not be admitted"
+}
+
+// drainSuspectInstance replaces a member that is neither healthy nor provably
+// gone, through the ordinary drain.
+//
+// The Gateway decides whether it may go: a drain that would breach the serving
+// floor is refused, and that refusal is authoritative - it is never overridden,
+// so a pool that is already at its floor keeps the flaky member rather than
+// dropping below it. Nothing is destroyed here either; the drain ends in a
+// retirement claim like any planned replacement.
+func (o *trinoPoolOperator) drainSuspectInstance(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+	member, err := o.gateway.DrainMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
+		Step:               o.step(instance.InstanceID, "drain"),
+		ExpectedGeneration: instance.GatewayGeneration,
+	})
+	if err != nil {
+		slog.Info("Trino pool cannot yet drain a suspected member.",
+			"pool", o.config.PublicID, "instance", instance.InstanceID, "reason", err)
+		return false, o.dropAuthority(err)
+	}
+	slog.Warn("Trino pool is draining a member that stayed suspect.",
+		"pool", o.config.PublicID, "instance", instance.InstanceID,
+		"suspectFor", time.Since(instance.PhaseChangedAt).Round(time.Second))
+	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+		trinopool.PhaseSuspect, trinopool.PhaseDraining, map[string]any{
+			"gateway_state":      member.Phase,
+			"gateway_generation": member.Generation,
+		}))
 }
 
 // completeFailureRetirement finishes a LOST member. The resources are already

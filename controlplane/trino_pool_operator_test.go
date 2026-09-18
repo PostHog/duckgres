@@ -122,6 +122,11 @@ func (f *fakePoolStore) AdvanceTrinoPoolInstance(_ context.Context, lease config
 		return configstore.ErrTrinoPoolConflict
 	}
 	instance.Phase = string(to)
+	// The store stamps this on every transition; the operator's failure timers
+	// measure from it, so a fake that left it alone would make a member look
+	// like it had been in its new phase since whenever it entered the previous
+	// one.
+	instance.PhaseChangedAt = time.Now().UTC()
 	applyFakeUpdates(instance, updates)
 	return nil
 }
@@ -1639,4 +1644,62 @@ func countGatewayCalls(calls []string, prefix string) int {
 		}
 	}
 	return count
+}
+
+// SUSPECT used to have exactly one exit that freed the member's slot: LOST,
+// which requires verified absence of every recorded object. A crash-looping
+// coordinator keeps its Deployment forever, so it kept its slot forever, and a
+// second such failure exhausted the repair budget and stalled the pool. A
+// member that cannot be proven dead leaves through the planned drain instead.
+func TestSuspectMemberThatCannotBeProvenDeadIsDrained(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.servingPool(t)
+	instanceID := harness.store.order[0]
+
+	// The coordinator is crash-looping: unhealthy, but its objects are present,
+	// so nothing can claim it terminated.
+	harness.kube.observed.CoordinatorPodUID = "pod-uid-replaced"
+	harness.kube.absent = false
+	harness.store.instances[instanceID].PhaseChangedAt = time.Now().Add(-trinoPoolSuspectAfter - time.Minute)
+	harness.tick(t, 1)
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseSuspect) {
+		t.Fatalf("instance phase = %s, want SUSPECT", phase)
+	}
+
+	// It is not dropped the moment it is suspected: suspicion is reversible.
+	harness.tick(t, 1)
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseSuspect) {
+		t.Fatalf("instance phase = %s, want it to stay SUSPECT while the grace lasts", phase)
+	}
+
+	harness.store.instances[instanceID].PhaseChangedAt = time.Now().Add(-trinoPoolSuspectDrainAfter - time.Minute)
+	harness.tick(t, 1)
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseDraining) {
+		t.Fatalf("instance phase = %s, want DRAINING so the slot can be released", phase)
+	}
+	for _, call := range harness.gateway.calls {
+		if call == "lost:"+instanceID {
+			t.Fatal("a loss was claimed for a member whose objects were still present")
+		}
+	}
+}
+
+// The Gateway's serving-floor refusal is authoritative even here: a pool at its
+// floor keeps a flaky member rather than dropping below it.
+func TestSuspectDrainRespectsTheServingFloor(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.servingPool(t)
+	instanceID := harness.store.order[0]
+	harness.kube.observed.CoordinatorPodUID = "pod-uid-replaced"
+	harness.kube.absent = false
+	harness.store.instances[instanceID].PhaseChangedAt = time.Now().Add(-trinoPoolSuspectAfter - time.Minute)
+	harness.tick(t, 1)
+
+	harness.gateway.drainErr = &trinogateway.Error{Code: "POOL_SERVING_FLOOR", Status: 409}
+	harness.store.instances[instanceID].PhaseChangedAt = time.Now().Add(-trinoPoolSuspectDrainAfter - time.Minute)
+	harness.tickTolerant(2)
+
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseSuspect) {
+		t.Fatalf("instance phase = %s, want it to stay SUSPECT after a refused drain", phase)
+	}
 }

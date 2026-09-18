@@ -148,6 +148,27 @@ func buildTrinoPoolOperators(
 			}
 		}
 
+		// With the Gateway's admission restriction on, a warehouse is not
+		// queryable until its publication barrier commits - so it must not read
+		// as Ready before then. The durable publication record is the answer;
+		// the Gateway's own state is authoritative for it and is what wrote it.
+		if config.Pool.TenantAdmission {
+			poolID := config.PoolID
+			wire.Provisioner.SetTenantAdmissionGate(func(orgID string) (bool, string) {
+				publication, err := store.GetTrinoPoolPublication(context.Background(), poolID, orgID)
+				if err != nil {
+					return false, "the pool's publication state is unreadable"
+				}
+				if publication == nil {
+					return false, "waiting for the pool to publish this warehouse"
+				}
+				if publication.State != configstore.TrinoPublicationAdmitted {
+					return false, "waiting for the pool to admit this warehouse: " + publication.State
+				}
+				return true, ""
+			})
+		}
+
 		// The fenced catalog writer, if this deployment has moved the cell off
 		// the coordinator-mediated path. Its fence is the pool authority, so it
 		// is claimed and installed when the operator wins the lease - never at
