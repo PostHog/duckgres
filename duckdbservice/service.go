@@ -1224,11 +1224,14 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 	// secrets are instance-global, so a hot-idle worker reused by a different
 	// user of the same org would otherwise see the previous user's secrets —
 	// both persistent ones and non-persistent (plain/TEMPORARY CREATE SECRET)
-	// ones that pass through to the worker. Wipe ALL user secrets first
-	// (mandatory — this is the cross-user isolation step), then replay this
-	// user's secrets from the control plane. Replay failures degrade to
-	// warnings; a wipe failure fails the session because handing user A's
-	// secrets to user B is not acceptable.
+	// ones that pass through to the worker. Attached catalogs are likewise
+	// instance-global, so user ATTACHes are wiped on the same boundary (a
+	// catalog holds a live upstream connection pool). Detach ALL user catalogs
+	// and wipe ALL user secrets first (mandatory — this is the cross-user
+	// isolation step), then replay this user's secrets from the control plane.
+	// Replay failures degrade to warnings; a wipe failure fails the session
+	// because handing user A's secrets or attached sources to user B is not
+	// acceptable.
 	var secretWarnings []string
 	switch {
 	case p.sharedWarmMode && p.maxSessions != 1:
@@ -1245,6 +1248,24 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 		}
 	case p.sharedWarmMode:
 		secretCtx, secretCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
+		// Catalog wipe first: an attached catalog (e.g. postgres_scanner) holds
+		// a live, authenticated upstream connection pool, so it is the same
+		// cross-user isolation boundary as secrets, one level up. Detaching
+		// before the secret wipe also closes pools that reference the secrets
+		// about to be dropped. A failure fails the session, exactly like the
+		// secret wipe below.
+		wipedCatalogs, catalogWipeErr := wipeUserCatalogs(secretCtx, conn)
+		if catalogWipeErr != nil {
+			secretCancel()
+			_ = conn.Close()
+			p.mu.Lock()
+			p.reserved--
+			p.mu.Unlock()
+			return nil, nil, fmt.Errorf("wipe user catalogs before session start: %w", catalogWipeErr)
+		}
+		if len(wipedCatalogs) > 0 {
+			slog.Info("Detached user catalogs left by previous session.", "user", username, "catalogs", wipedCatalogs)
+		}
 		wiped, wipeErr := wipeUserSecrets(secretCtx, conn)
 		if wipeErr != nil {
 			secretCancel()

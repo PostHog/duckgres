@@ -740,6 +740,18 @@ Invariants for anyone touching this path:
   + the `__default_*`/`duckgres_*` prefixes, which activation re-creates). It
   MUST run before replay on every CreateSession in shared-warm mode, and a
   wipe failure MUST fail the session.
+- **The same boundary covers user ATTACHes** (`wipeUserCatalogs`,
+  `duckdbservice/user_catalogs.go`, runs immediately before the secret wipe):
+  DuckDB catalogs are instance-global too, so an external catalog attached by
+  one session (e.g. a postgres_scanner source holding a live, authenticated
+  upstream connection pool) would otherwise be inherited by the next session
+  on a hot-idle worker. Every non-internal catalog is detached except the
+  system-managed reserved set (`ducklake`, `delta`, `memory` — activation /
+  the pg_catalog compat layer own those). A wipe failure fails the session.
+  Note the inherited pool is frozen at its creation-time configuration:
+  postgres_scanner's `pg_pool_max_connections` SET has no set-callback and
+  only applies at pool creation, so a session inheriting a stale attach cannot
+  reconfigure its pool — one more reason the attach must not survive.
 - **Execute-then-persist ordering.** Persist only statements DuckDB accepted;
   a store failure after a successful exec is an ERROR telling the user the
   secret will NOT survive the session. Replay failures at session create are
@@ -764,7 +776,8 @@ Invariants for anyone touching this path:
   the original (un-redacted) query so it can classify.
 - Touching the interception, wipe/replay, or payload shape → update
   `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
-  and the `persistent_user_secret`(+`_isolation`) assertions in
+  `duckdbservice/user_catalogs_test.go` (the catalog wipe), and the
+  `persistent_user_secret`(+`_isolation`) / `user_catalog_wipe` assertions in
   `tests/mw-dev/e2e/harness.sh`.
 
 ## Admin Console (VPC-private web UI, `kubernetes` tag)

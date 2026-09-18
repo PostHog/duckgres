@@ -2555,6 +2555,34 @@ persistent_user_secret_isolation() { # org rootpw
   log "user secret isolation OK on $org ($u2 blind to root's persistent AND temporary secrets; root's stored copy intact)"
 }
 
+# Cross-session catalog hygiene: DuckDB ATTACH is instance-global, so a catalog
+# attached by one session (e.g. an external postgres_scanner source holding a
+# live authenticated connection pool) would linger on a hot-idle worker and be
+# inherited by the next session unless the session-create wipe detaches it.
+# The second connection typically reuses the first's hot-idle worker — the leak
+# path — but the invariant holds either way: a fresh session must never see
+# another session's attached catalogs, while the system catalogs (ducklake,
+# memory) must be preserved.
+user_catalog_wipe() { # org password
+  org="$1"; pw="$2"; cname="e2e_probe_catalog"
+  log "user catalog wipe on $org"
+
+  pg "$org" "$pw" ducklake "ATTACH ':memory:' AS $cname" >/dev/null
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name = '$cname' AND NOT internal")"
+  # The attach lands on the session's worker (native fallback — ATTACH is not
+  # PostgreSQL syntax). It must be visible within the SAME session...
+  [ "$n" = "1" ] || fail "user catalog wipe: probe catalog not attached in its own session (count=$n)"
+
+  # ...and gone from the NEXT fresh session (same hot-idle worker or not).
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name = '$cname' AND NOT internal")"
+  [ "$n" = "0" ] || fail "user catalog wipe: probe catalog leaked into a fresh session (count=$n)"
+
+  # The system-managed catalogs must survive the wipe on every session.
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name IN ('ducklake','memory')")"
+  [ "$n" = "2" ] || fail "user catalog wipe: system catalogs missing on a fresh session (count=$n)"
+  log "user catalog wipe OK on $org (probe attached in-session, detached by next session, ducklake+memory preserved)"
+}
+
 # ---- resilience -----------------------------------------------------------
 # Worker pod killed mid-life → CP refills and a fresh query succeeds.
 # Ported from TestK8sWorkerCrashRecovery.
@@ -4362,6 +4390,7 @@ lane_cnpg() { # full wire/catalog/concurrency/sizing coverage on the cnpg org
   httpfs_retry_budget    "$CNPG" "$cnpg_pw"   # S3-503 retry budget raised per worker (applyHTTPFSRetryBudget)
   persistent_user_secret "$CNPG" "$cnpg_pw"   # after rw_ducklake (org worker hot)
   persistent_user_secret_isolation "$CNPG" "$cnpg_pw"
+  user_catalog_wipe "$CNPG" "$cnpg_pw"
   pipeline_error_recovery "$CNPG" "$cnpg_pw"  # after rw_ducklake (table writes proven)
   server_side_cursors    "$CNPG" "$cnpg_pw"
   cancel_then_reuse_same_session "$CNPG" "$cnpg_pw"
