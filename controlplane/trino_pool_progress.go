@@ -258,6 +258,15 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 			return fmt.Sprintf(`{"phase":%q,"generation":%d}`, admitted.Phase, admitted.Generation), nil
 		},
 	); err != nil {
+		if errors.Is(err, trinogateway.ErrPublicationBarrier) {
+			// A member joining while a tenant publication is open must
+			// acknowledge that publication's target revision, which a member
+			// registered under a release id cannot. The barrier is the thing
+			// that has to give way: it can be reopened against the membership
+			// that includes this member, whereas a candidate refused here would
+			// wait for a barrier that is itself waiting for capacity.
+			o.retireOpenBarrierForAdmission(ctx, instance.InstanceID, err)
+		}
 		return o.dropAuthority(fmt.Errorf("admit member %s: %w", instance.InstanceID, err))
 	}
 	if member.Phase == "" {

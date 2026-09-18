@@ -397,6 +397,50 @@ func (o *trinoPoolOperator) abandonForMembershipChange(
 	return o.reopenBarrier(ctx, binding, "the pool membership changed during the attempt")
 }
 
+// retireOpenBarrierForAdmission abandons an open tenant publication that is
+// standing in the way of a member's admission.
+//
+// The Gateway requires a member joining during an open publication to
+// acknowledge that publication's target revision. A member registers under its
+// RELEASE id, so it can never satisfy a tenant barrier's target, and the two
+// would wait for each other: the member for the barrier to close, the barrier
+// for a membership that includes the member. Compute wins - the barrier is
+// reopened afterwards against the membership that then exists, and a tenant
+// waiting a few more seconds is cheaper than a pool that cannot grow.
+//
+// Best effort by construction: the admission has already failed and is being
+// reported. This only removes the obstacle for the next attempt.
+func (o *trinoPoolOperator) retireOpenBarrierForAdmission(ctx context.Context, instanceID string, cause error) {
+	if o.publications == nil {
+		return
+	}
+	recorded, err := o.publications.ListTrinoPoolPublications(ctx, o.config.PoolID)
+	if err != nil {
+		slog.Warn("Trino pool could not read publications while admitting a member.",
+			"pool", o.config.PublicID, "instance", instanceID, "error", err)
+		return
+	}
+	for _, publication := range recorded {
+		if publication.State != configstore.TrinoPublicationAdmitting || publication.PublicationID == "" {
+			continue
+		}
+		slog.Info("Trino pool is reopening a tenant publication so a member can be admitted.",
+			"pool", o.config.PublicID, "tenant", publication.OrgID,
+			"publication", publication.PublicationID, "instance", instanceID, "reason", cause)
+		if _, err := o.gateway.AbandonPublication(ctx, o.config.RoutingGroup, publication.PublicationID,
+			o.step("publication."+publication.OrgID, "abandon."+publication.PublicationID)); err != nil {
+			slog.Warn("Trino pool could not abandon the open publication.",
+				"pool", o.config.PublicID, "tenant", publication.OrgID, "error", err)
+			return
+		}
+		if _, err := o.publications.BeginTrinoPoolPublicationAttempt(ctx, o.lease, o.config.PoolID, publication.OrgID); err != nil {
+			slog.Warn("Trino pool could not start the next publication attempt.",
+				"pool", o.config.PublicID, "tenant", publication.OrgID, "error", err)
+		}
+		return
+	}
+}
+
 // reopenBarrier starts a NEW attempt for this tenant.
 //
 // The attempt counter is durable and monotone, and every step identity carries

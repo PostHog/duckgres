@@ -2086,3 +2086,39 @@ func TestAFailingTenantDoesNotBlockInstanceProgress(t *testing.T) {
 			serving, harness.store.pool.DesiredInstances)
 	}
 }
+
+// A member joining while a tenant publication is open cannot acknowledge that
+// publication's target - it registers under a release id - so the Gateway
+// refuses the admission. Without a way out, the member waits for the barrier
+// and the barrier waits for the membership that includes the member. The
+// barrier gives way.
+func TestAnOpenBarrierDoesNotBlockAMemberFromJoining(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: poolOrgs(1)}
+	// The barrier will open and STAY open: no member is serving the current
+	// projection yet, so no acknowledgement can be recorded.
+	harness.operator.acknowledgement = func(context.Context, string, trinoPoolProjectionRevisions, int64) (trinoPoolAcknowledgement, error) {
+		return trinoPoolAcknowledgement{ProcessID: "process-1", AppliedRevision: 42, ProjectionCurrent: false}, nil
+	}
+	harness.servingPool(t)
+	for tick := 0; tick < 6 && countGatewayCalls(harness.gateway.calls, "open:") == 0; tick++ {
+		harness.tickTolerant(1)
+	}
+	if countGatewayCalls(harness.gateway.calls, "open:") == 0 {
+		t.Fatalf("no barrier was opened: %v", harness.gateway.calls)
+	}
+
+	// A replacement instance reaches admission and the Gateway refuses it on
+	// the barrier.
+	harness.gateway.admitErr = fmt.Errorf("%w: a member joining during a publication must acknowledge its target revision",
+		trinogateway.ErrPublicationBarrier)
+	harness.store.pool.DesiredInstances++
+	harness.operator.config.Spec.DesiredInstances++
+	harness.gateway.calls = nil
+	harness.tickTolerant(12)
+
+	if countGatewayCalls(harness.gateway.calls, "abandon:") == 0 {
+		t.Fatalf("the open barrier was not reopened to let the member in: %v", harness.gateway.calls)
+	}
+}
