@@ -95,39 +95,49 @@ type TrinoPoolLease struct {
 
 // TrinoPoolInstance is one immutable compute instance.
 type TrinoPoolInstance struct {
-	InstanceID                string     `gorm:"primaryKey;column:instance_id"`
-	PoolID                    string     `gorm:"column:pool_id"`
-	ReleaseID                 string     `gorm:"column:release_id"`
-	SpecDigest                string     `gorm:"column:spec_digest"`
-	BlueprintSnapshot         string     `gorm:"column:blueprint_snapshot;type:jsonb"`
-	Phase                     string     `gorm:"column:phase"`
-	PhaseChangedAt            time.Time  `gorm:"column:phase_changed_at"`
-	OwnerEpoch                int64      `gorm:"column:owner_epoch"`
-	Repair                    bool       `gorm:"column:repair"`
-	CoordinatorDeploymentName string     `gorm:"column:coordinator_deployment_name"`
-	CoordinatorDeploymentUID  string     `gorm:"column:coordinator_deployment_uid"`
-	WorkerDeploymentName      string     `gorm:"column:worker_deployment_name"`
-	WorkerDeploymentUID       string     `gorm:"column:worker_deployment_uid"`
-	ServiceName               string     `gorm:"column:service_name"`
-	ServiceUID                string     `gorm:"column:service_uid"`
-	ConfigMapName             string     `gorm:"column:config_map_name"`
-	ConfigMapUID              string     `gorm:"column:config_map_uid"`
-	CoordinatorPodUID         string     `gorm:"column:coordinator_pod_uid"`
-	CoordinatorNodeID         string     `gorm:"column:coordinator_node_id"`
-	CoordinatorBootID         string     `gorm:"column:coordinator_boot_id"`
-	EndpointURL               string     `gorm:"column:endpoint_url"`
-	TLSServerName             string     `gorm:"column:tls_server_name"`
-	GatewayIncarnation        string     `gorm:"column:gateway_incarnation"`
-	GatewayBackendName        string     `gorm:"column:gateway_backend_name"`
-	GatewayState              string     `gorm:"column:gateway_state"`
-	GatewayGeneration         int64      `gorm:"column:gateway_generation"`
-	AppliedCatalogRevision    int64      `gorm:"column:applied_catalog_revision"`
-	ValidationReceipt         string     `gorm:"column:validation_receipt;type:jsonb"`
-	ValidatedAt               *time.Time `gorm:"column:validated_at"`
-	RetirementReceipt         string     `gorm:"column:retirement_receipt;type:jsonb"`
-	LastError                 string     `gorm:"column:last_error"`
-	CreatedAt                 time.Time  `gorm:"column:created_at"`
-	UpdatedAt                 time.Time  `gorm:"column:updated_at"`
+	InstanceID        string    `gorm:"primaryKey;column:instance_id"`
+	PoolID            string    `gorm:"column:pool_id"`
+	ReleaseID         string    `gorm:"column:release_id"`
+	SpecDigest        string    `gorm:"column:spec_digest"`
+	BlueprintSnapshot string    `gorm:"column:blueprint_snapshot;type:jsonb"`
+	Phase             string    `gorm:"column:phase"`
+	PhaseChangedAt    time.Time `gorm:"column:phase_changed_at"`
+	OwnerEpoch        int64     `gorm:"column:owner_epoch"`
+	Repair            bool      `gorm:"column:repair"`
+	// RepairFor names the failed instance this one replaces. The Gateway
+	// charges an activation to the repair budget only when it is set; without
+	// it a repair spends the single planned surge instead.
+	RepairFor                 string `gorm:"column:repair_for"`
+	FailureReason             string `gorm:"column:failure_reason"`
+	CoordinatorDeploymentName string `gorm:"column:coordinator_deployment_name"`
+	CoordinatorDeploymentUID  string `gorm:"column:coordinator_deployment_uid"`
+	WorkerDeploymentName      string `gorm:"column:worker_deployment_name"`
+	WorkerDeploymentUID       string `gorm:"column:worker_deployment_uid"`
+	ServiceName               string `gorm:"column:service_name"`
+	ServiceUID                string `gorm:"column:service_uid"`
+	ConfigMapName             string `gorm:"column:config_map_name"`
+	ConfigMapUID              string `gorm:"column:config_map_uid"`
+	WorkerConfigMapName       string `gorm:"column:worker_config_map_name"`
+	WorkerConfigMapUID        string `gorm:"column:worker_config_map_uid"`
+	CoordinatorPodUID         string `gorm:"column:coordinator_pod_uid"`
+	CoordinatorNodeID         string `gorm:"column:coordinator_node_id"`
+	CoordinatorBootID         string `gorm:"column:coordinator_boot_id"`
+	EndpointURL               string `gorm:"column:endpoint_url"`
+	// TLSServerName is retained on the row for the fixed-cell path only. A
+	// pooled instance is reached over plain in-cluster HTTP and has no
+	// certificate of its own, so the pool never sets it.
+	TLSServerName          string     `gorm:"column:tls_server_name"`
+	GatewayIncarnation     string     `gorm:"column:gateway_incarnation"`
+	GatewayBackendName     string     `gorm:"column:gateway_backend_name"`
+	GatewayState           string     `gorm:"column:gateway_state"`
+	GatewayGeneration      int64      `gorm:"column:gateway_generation"`
+	AppliedCatalogRevision int64      `gorm:"column:applied_catalog_revision"`
+	ValidationReceipt      string     `gorm:"column:validation_receipt;type:jsonb"`
+	ValidatedAt            *time.Time `gorm:"column:validated_at"`
+	RetirementReceipt      string     `gorm:"column:retirement_receipt;type:jsonb"`
+	LastError              string     `gorm:"column:last_error"`
+	CreatedAt              time.Time  `gorm:"column:created_at"`
+	UpdatedAt              time.Time  `gorm:"column:updated_at"`
 }
 
 func (TrinoPoolInstance) TableName() string { return "duckgres_trino_pool_instances" }
@@ -152,8 +162,8 @@ type TrinoPoolInstanceSpec struct {
 	BlueprintSnapshot string
 	Phase             trinopool.Phase
 	Repair            bool
+	RepairFor         string
 	EndpointURL       string
-	TLSServerName     string
 }
 
 // TrinoPoolOperation is a durable reconcile intent that outlives the leader.

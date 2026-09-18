@@ -35,9 +35,10 @@ const (
 // the loop can be tested without a database; the implementation's own semantics
 // (fencing, CAS, replay) are covered by real-PostgreSQL tests.
 type trinoPoolStore interface {
-	UpsertTrinoPoolSpec(context.Context, configstore.TrinoPoolSpec) error
-	FreezeTrinoPool(ctx context.Context, poolID, reason string) error
-	ThawTrinoPool(ctx context.Context, poolID string) error
+	SeedTrinoPool(context.Context, configstore.TrinoPoolSpec) error
+	UpsertTrinoPoolSpec(context.Context, configstore.TrinoPoolLease, configstore.TrinoPoolSpec) error
+	FreezeTrinoPool(ctx context.Context, lease configstore.TrinoPoolLease, poolID, reason string) error
+	ThawTrinoPool(ctx context.Context, lease configstore.TrinoPoolLease, poolID string) error
 	GetTrinoPool(ctx context.Context, poolID string) (*configstore.TrinoPool, error)
 	AcquireTrinoPoolAuthority(ctx context.Context, poolID, owner string) (configstore.TrinoPoolLease, error)
 	ListTrinoPoolInstances(ctx context.Context, poolID string) ([]configstore.TrinoPoolInstance, error)
@@ -49,6 +50,7 @@ type trinoPoolStore interface {
 // trinoPoolGateway is the Gateway surface the operator uses.
 type trinoPoolGateway interface {
 	EnsureInactiveBackend(context.Context, trinogateway.Backend) error
+	PublishTenantPrincipals(ctx context.Context, poolID, tenant string, request trinogateway.PublishPrincipalsRequest) (trinogateway.TenantAdmission, error)
 	ConfigurePool(context.Context, string, trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error)
 	RegisterMember(context.Context, string, trinogateway.RegisterMemberRequest) (trinogateway.Member, error)
 	AdmitMember(ctx context.Context, poolID, instanceID string, request trinogateway.AdmitMemberRequest) (trinogateway.Member, error)
@@ -56,6 +58,8 @@ type trinoPoolGateway interface {
 	GetObligations(ctx context.Context, poolID, instanceID string) (trinogateway.Obligations, error)
 	DrainMember(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
 	SealMember(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
+	SuspectMember(ctx context.Context, poolID, instanceID string, request trinogateway.SuspectMemberRequest) (trinogateway.Member, error)
+	LostMember(ctx context.Context, poolID, instanceID string, request trinogateway.LostMemberRequest) (trinogateway.Member, error)
 	RetireMember(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
 	MemberRetired(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
 }
@@ -69,7 +73,10 @@ type trinoPoolKube interface {
 }
 
 // trinoPoolValidator probes a candidate through its own endpoint.
-type trinoPoolValidator func(ctx context.Context, endpoint string, observedWorkers int) (trinoPoolValidation, error)
+type trinoPoolValidator func(ctx context.Context, endpoint string, observed trinoPoolObservation, expected trinoPoolExpectation) (trinoPoolValidation, error)
+
+// trinoPoolIdentityProbe reads a candidate's coordinator process identity.
+type trinoPoolIdentityProbe func(ctx context.Context, endpoint string) (string, error)
 
 type trinoPoolOperator struct {
 	config   trinoPoolConfig
@@ -77,6 +84,7 @@ type trinoPoolOperator struct {
 	gateway  trinoPoolGateway
 	kube     func(epoch int64) trinoPoolKube
 	validate trinoPoolValidator
+	identity trinoPoolIdentityProbe
 	owner    string
 	interval time.Duration
 	// operatorEnabled gates every external effect. With it off the operator
@@ -84,8 +92,22 @@ type trinoPoolOperator struct {
 	// is how the feature ships disabled without the code path rotting.
 	operatorEnabled bool
 	newInstanceID   func() string
+	// installWriter claims the catalog store's writer fence under the lease
+	// just acquired and installs it as the cell's catalog write path.
+	installWriter func(context.Context, configstore.TrinoPoolLease) error
+	// tenants is the org projection the principal binding is derived from.
+	tenants trinoPoolTenantStore
+	// publishedBindings remembers the binding revision last accepted per
+	// tenant, so an unchanged tenant is not republished every tick.
+	publishedBindings map[string]string
 
 	lease configstore.TrinoPoolLease
+	// fenced records that this term lost the fence. It ends the loop rather
+	// than letting a superseded controller re-acquire.
+	fenced bool
+	// pool is the durable row read at the start of the tick, so the steps agree
+	// on one view of the desired state.
+	pool *configstore.TrinoPool
 }
 
 // Run is the leader-attached loop. It is started fresh on every leadership
@@ -96,11 +118,33 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 	if interval <= 0 {
 		interval = trinoPoolReconcileInterval
 	}
+	// A new Run is a NEW leadership term. Published-binding memory is per term
+	// too: another controller may have republished while this one was not
+	// leading, so what this process last sent proves nothing now.
+	o.publishedBindings = nil
+	o.fenced = false
+
+	// A new Run is a NEW leadership term. Any lease left on the struct belongs
+	// to the previous term and must not be reused: the janitor lease may have
+	// moved away and back, and another control plane may have taken the pool's
+	// authority in between.
+	o.lease = configstore.TrinoPoolLease{}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		if err := o.reconcileOnce(ctx); err != nil && ctx.Err() == nil {
 			slog.Warn("Trino pool reconcile failed.", "pool", o.config.PublicID, "error", err)
+			if o.fenced {
+				// The fence refused this leader. Ending the term is the correct
+				// response: re-acquiring here would ratchet the epoch against a
+				// valid new leader on every tick, and two controllers taking
+				// turns raising the epoch is worse than one stepping aside. The
+				// janitor lease decides when this process leads again.
+				slog.Warn("Trino pool leadership term ended after a fence refusal.",
+					"pool", o.config.PublicID, "epoch", o.lease.Epoch)
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -114,29 +158,46 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	// A pool whose desired configuration is unreadable freezes at its last-good
 	// state. No creates, no drains, no deletes - and explicitly not a desired
 	// count of zero.
-	if o.config.Frozen {
-		return o.store.FreezeTrinoPool(ctx, o.config.PoolID, o.config.FrozenReason)
-	}
-	if err := o.store.UpsertTrinoPoolSpec(ctx, o.config.Spec); err != nil {
-		return fmt.Errorf("record desired pool spec: %w", err)
-	}
-	if err := o.store.ThawTrinoPool(ctx, o.config.PoolID); err != nil {
-		return fmt.Errorf("clear pool freeze: %w", err)
-	}
+	// Desired-state publication is a lifecycle-affecting write, so it is fenced
+	// like every other one. Without the lease, a delayed old leader - or a
+	// replica still holding stale configuration - could overwrite a newer
+	// desired spec or clear another leader's freeze. A read-only operator does
+	// not write it at all: it has no authority to speak for the pool.
 	if !o.operatorEnabled {
-		// Read-only mode: the desired state is recorded and nothing else is
-		// touched. This is what "ships disabled" means here.
 		return nil
+	}
+	// Seeding is the one unfenced write, and it can only INSERT: a fence needs
+	// a row to lock, so the very first publication has to create one.
+	if err := o.store.SeedTrinoPool(ctx, o.config.Spec); err != nil {
+		return fmt.Errorf("seed pool row: %w", err)
 	}
 	if err := o.ensureAuthority(ctx); err != nil {
 		return err
 	}
+	if o.config.Frozen {
+		return o.dropAuthority(o.store.FreezeTrinoPool(ctx, o.lease, o.config.PoolID, o.config.FrozenReason))
+	}
+	if err := o.store.UpsertTrinoPoolSpec(ctx, o.lease, o.config.Spec); err != nil {
+		return o.dropAuthority(fmt.Errorf("record desired pool spec: %w", err))
+	}
+	if err := o.store.ThawTrinoPool(ctx, o.lease, o.config.PoolID); err != nil {
+		return o.dropAuthority(fmt.Errorf("clear pool freeze: %w", err))
+	}
 
 	pool, err := o.store.GetTrinoPool(ctx, o.config.PoolID)
-	if err != nil || pool == nil {
+	if err != nil {
 		return fmt.Errorf("read pool state: %w", err)
 	}
+	if pool == nil {
+		return fmt.Errorf("pool %s has no durable row", o.config.PoolID)
+	}
+	o.pool = pool
 	if err := o.configureGatewayPool(ctx); err != nil {
+		return err
+	}
+	// The binding has to be current BEFORE the gate can refuse anything on its
+	// basis, so it is published before any lifecycle step.
+	if err := o.publishTenantBindings(ctx); err != nil {
 		return err
 	}
 
@@ -169,16 +230,33 @@ func (o *trinoPoolOperator) ensureAuthority(ctx context.Context) error {
 	}
 	o.lease = lease
 	slog.Info("Trino pool authority acquired.", "pool", o.config.PublicID, "epoch", lease.Epoch)
+
+	// The catalog writer's fence IS this authority: claim it now, under the
+	// epoch we just won, and install it as the cell's write path. Claiming at
+	// startup instead would have every replica take the cell on boot, which
+	// would make the writer fence agree with everyone and distinguish nobody.
+	if o.installWriter != nil {
+		if err := o.installWriter(ctx, lease); err != nil {
+			// Authority is held but catalogs cannot be published. Publishing
+			// through a stale path would be worse, so the pool keeps serving and
+			// the failure is surfaced for the next tick to retry.
+			return fmt.Errorf("claim catalog writer for pool %s: %w", o.config.PublicID, err)
+		}
+	}
 	return nil
 }
 
 // dropAuthority is called when a fenced write is refused. The leader has been
-// superseded; it stops writing and re-acquires on the next tick rather than
-// continuing with an epoch the database no longer honors.
+// superseded, so it marks the term finished and stops. It does NOT re-acquire:
+// a stale controller that immediately bumps the epoch again would fence the
+// valid leader right back, and the two would trade the pool forever. Ending the
+// term hands the decision back to the janitor lease, which is the only thing
+// that knows who should be leading.
 func (o *trinoPoolOperator) dropAuthority(err error) error {
 	if errors.Is(err, configstore.ErrTrinoPoolConflict) || errors.Is(err, trinogateway.ErrStaleEpoch) {
 		slog.Warn("Trino pool authority lost.", "pool", o.config.PublicID, "epoch", o.lease.Epoch, "error", err)
 		o.lease = configstore.TrinoPoolLease{}
+		o.fenced = true
 	}
 	return err
 }
@@ -187,10 +265,16 @@ func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
 	_, err := o.gateway.ConfigurePool(ctx, o.config.RoutingGroup, trinogateway.ConfigurePoolRequest{
 		Step: trinogateway.Step{
 			OperationID: "pool-config:" + o.config.PublicID,
-			// The step identity includes the desired shape, so re-sending an
-			// unchanged configuration is a replay and a changed one is a new
-			// step rather than a conflict against the recorded payload.
-			StepID:          "configure:" + o.configDigest(),
+			// The step identity carries BOTH the desired shape and this
+			// leader's epoch.
+			//
+			// The Gateway hashes the whole request body, epoch included, so a
+			// new leader re-sending an unchanged configuration under the same
+			// step id would hash differently and conflict forever. Putting the
+			// epoch in the step id makes each leadership term its own step:
+			// a repeat within one term is still a replay, and a new term is a
+			// new step rather than a permanent conflict.
+			StepID:          fmt.Sprintf("configure.e%d.%s", o.lease.Epoch, o.configDigest()),
 			ControllerEpoch: o.lease.Epoch,
 		},
 		APIMode:         "POOLED",
@@ -199,10 +283,11 @@ func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
 		MaxSurge:        o.config.Spec.MaxSurge,
 		MaxRepair:       o.config.Spec.MaxRepair,
 		DesiredRevision: o.config.Spec.DesiredReleaseID,
-		// The tenant-admission gate stays closed until the identity question is
-		// settled. Enabling it here would claim an atomic gate duckgres cannot
-		// currently back with a verified tenant identity.
-		TenantAdmissionEnabled: false,
+		// The gate is a deliberate per-pool choice. It is deny-only: with it on,
+		// a tenant whose principals this controller has not published yet
+		// cannot dispatch work. Publishing the binding is therefore part of the
+		// same loop (see publishTenantBindings).
+		TenantAdmissionEnabled: o.config.Pool.TenantAdmission,
 	})
 	if err != nil {
 		return o.dropAuthority(fmt.Errorf("configure gateway pool: %w", err))
@@ -211,7 +296,14 @@ func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
 }
 
 func (o *trinoPoolOperator) configDigest() string {
-	return fmt.Sprintf("%s-%d-%d-%d-%d", o.config.Spec.DesiredBlueprintDigest[:8],
+	digest := o.config.Spec.DesiredBlueprintDigest
+	if len(digest) > 8 {
+		digest = digest[:8]
+	}
+	if digest == "" {
+		digest = "none"
+	}
+	return fmt.Sprintf("%s-%d-%d-%d-%d", digest,
 		o.config.Spec.DesiredInstances, o.config.Spec.MinServing, o.config.Spec.MaxSurge, o.config.Spec.MaxRepair)
 }
 
@@ -246,7 +338,14 @@ func (o *trinoPoolOperator) applyPlan(ctx context.Context, pool *configstore.Tri
 // deterministic and already recorded, so the next tick reads it back instead of
 // creating a second instance.
 func (o *trinoPoolOperator) createInstance(ctx context.Context, plan trinopool.Plan) error {
-	instanceID := o.config.PublicID + "-" + o.newInstanceID()
+	suffix := o.newInstanceID()
+	if suffix == "" {
+		// A random suffix is what keeps instance identities from being reused.
+		// Without one, this create would mint "<pool>-" and collide with itself
+		// on the next attempt.
+		return errors.New("could not generate an instance identity")
+	}
+	instanceID := o.config.PublicID + "-" + suffix
 	identity := o.identityFor(instanceID)
 	objects, err := o.config.Blueprint.Instantiate(identity)
 	if err != nil {
@@ -254,6 +353,7 @@ func (o *trinoPoolOperator) createInstance(ctx context.Context, plan trinopool.P
 	}
 	spec := configstore.TrinoPoolInstanceSpec{
 		InstanceID:        instanceID,
+		RepairFor:         plan.RepairFor,
 		PoolID:            o.config.PoolID,
 		ReleaseID:         o.config.Blueprint.ReleaseID,
 		SpecDigest:        o.config.Blueprint.SpecDigest(identity),
@@ -261,13 +361,16 @@ func (o *trinoPoolOperator) createInstance(ctx context.Context, plan trinopool.P
 		Phase:             trinopool.PhasePending,
 		Repair:            plan.Repair,
 		EndpointURL:       o.endpointFor(instanceID),
-		TLSServerName:     o.config.TLSServerName,
 	}
 	if err := o.store.CreateTrinoPoolInstance(ctx, o.lease, spec); err != nil {
 		return o.dropAuthority(fmt.Errorf("record instance %s: %w", instanceID, err))
 	}
 	slog.Info("Trino pool instance created.", "pool", o.config.PublicID, "instance", instanceID,
-		"repair", plan.Repair, "reason", plan.Reason)
+		"repair", plan.Repair, "repairFor", plan.RepairFor, "reason", plan.Reason)
+	// objects is discarded on purpose: this call is a pre-flight that the
+	// identity CAN be instantiated before the row is written. The objects
+	// themselves are created on the next tick, from the instance's own stored
+	// snapshot rather than from live configuration.
 	_ = objects
 	return nil
 }
@@ -322,8 +425,15 @@ func (o *trinoPoolOperator) serviceHost(instanceID string) string {
 	return fmt.Sprintf("%s.%s.svc.cluster.local", instanceID, o.config.Namespace)
 }
 
+// endpointFor is the instance's own in-cluster Service, over plain HTTP.
+//
+// TLS terminates at the Gateway; there is no per-instance certificate, no
+// private CA and no trust distribution. Everything that talks to a coordinator
+// this way declares the forwarded HTTPS hop instead of relaxing
+// authentication. The tradeoff is explicit: credentials and query data cross
+// the cluster network unencrypted between Gateway/operator and coordinator.
 func (o *trinoPoolOperator) endpointFor(instanceID string) string {
-	return fmt.Sprintf("https://%s:%d", o.serviceHost(instanceID), o.config.Pool.CoordinatorServicePort)
+	return fmt.Sprintf("http://%s:%d", o.serviceHost(instanceID), o.config.Pool.CoordinatorServicePort)
 }
 
 func (o *trinoPoolOperator) backendName(instanceID string) string {

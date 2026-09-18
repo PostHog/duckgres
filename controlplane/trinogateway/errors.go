@@ -47,6 +47,10 @@ var (
 	// obligations. It is the authoritative answer to "is the drain finished".
 	ErrNotDrained   = errors.New("gateway refused to seal a member that is not drained")
 	ErrRepairBudget = errors.New("gateway refused an activation: repair budget exhausted")
+	// ErrPrincipalConflict means a published principal already belongs to
+	// another tenant in this pool. That is an ambiguity the gate must never
+	// resolve by guessing, so the publication is refused whole.
+	ErrPrincipalConflict = errors.New("gateway refused a principal already bound to another tenant")
 )
 
 // Error carries the Gateway's response code alongside the mapped sentinel.
@@ -89,6 +93,7 @@ var codeSentinels = map[string]error{
 	"POOL_APIMODE":               ErrAPIMode,
 	"POOL_NOT_DRAINED":           ErrNotDrained,
 	"POOL_REPAIR_BUDGET":         ErrRepairBudget,
+	"POOL_PRINCIPAL_CONFLICT":    ErrPrincipalConflict,
 	"TENANT_NOT_ADMITTED":        ErrTenantNotAdmitted,
 	"ROUTING_STATE_UNAVAILABLE":  ErrUnavailable,
 	"TENANT_IDENTITY_UNVERIFIED": ErrTenantNotAdmitted,

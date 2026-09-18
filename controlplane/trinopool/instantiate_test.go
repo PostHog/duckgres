@@ -267,3 +267,35 @@ func TestInstantiateScopesWorkerAntiAffinityToTheInstance(t *testing.T) {
 		t.Fatal("preferred term is not instance-scoped")
 	}
 }
+
+// A leader change must not change an instance's spec digest. The epoch is who
+// last wrote the object, not what it runs: when it was folded into the digest,
+// a leader that created objects and died before the phase CAS left its
+// successor computing a different digest, so every later apply was refused as
+// a foreign object and the instance - and the whole pool behind it - wedged.
+func TestSpecDigestIgnoresTheAuthorityEpoch(t *testing.T) {
+	blueprint := validBlueprint()
+	first := testIdentity()
+	second := testIdentity()
+	second.AuthorityEpoch = first.AuthorityEpoch + 5
+
+	if blueprint.SpecDigest(first) != blueprint.SpecDigest(second) {
+		t.Fatal("a leader change changed the spec digest")
+	}
+	// And the objects a successor renders are byte-comparable for ownership.
+	firstObjects, err := blueprint.Instantiate(first)
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	secondObjects, err := blueprint.Instantiate(second)
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	if firstObjects.Service.Annotations[AnnotationSpecDigest] != secondObjects.Service.Annotations[AnnotationSpecDigest] {
+		t.Fatal("the rendered spec-digest annotation changed with the epoch")
+	}
+	// The epoch itself still travels, because ownership compares it.
+	if secondObjects.Service.Annotations[AnnotationAuthorityEpoch] == firstObjects.Service.Annotations[AnnotationAuthorityEpoch] {
+		t.Fatal("the authority-epoch annotation did not follow the leader")
+	}
+}

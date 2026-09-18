@@ -25,7 +25,7 @@ import (
 func (o *trinoPoolOperator) progressInstances(ctx context.Context, instances []configstore.TrinoPoolInstance) (bool, error) {
 	for _, instance := range instances {
 		phase := trinopool.Phase(instance.Phase)
-		if phase.Terminal() || phase == trinopool.PhaseServing {
+		if phase.Terminal() {
 			continue
 		}
 		progressed, err := o.progressInstance(ctx, instance)
@@ -50,7 +50,14 @@ func (o *trinoPoolOperator) progressInstance(ctx context.Context, instance confi
 	case trinopool.PhaseValidating:
 		return true, o.admitCandidate(ctx, instance)
 	case trinopool.PhaseAdmitted:
-		return o.markServing(ctx, instance)
+		if progressed, err := o.markServing(ctx, instance); progressed || err != nil {
+			return progressed, err
+		}
+		return o.observeHealth(ctx, instance)
+	case trinopool.PhaseServing, trinopool.PhaseSuspect:
+		return o.observeHealth(ctx, instance)
+	case trinopool.PhaseLost:
+		return o.completeFailureRetirement(ctx, instance)
 	case trinopool.PhaseDraining:
 		return o.sealWhenDrained(ctx, instance)
 	case trinopool.PhaseSealed:
@@ -98,6 +105,19 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 		return false, nil
 	}
 
+	// The coordinator's process identity is read BEFORE registration, because
+	// the Gateway binds (podUid, bootId) at registration and later requires the
+	// admission receipt to carry the identical pair. Registering the pod UID as
+	// the boot id and admitting with the coordinator's processId made every
+	// admission fail POOL_NOT_CERTIFIED. There is exactly one authoritative boot
+	// identity: the processId, which changes on every JVM start.
+	bootID, err := o.identity(ctx, instance.EndpointURL)
+	if err != nil {
+		slog.Info("Trino pool candidate has no readable process identity yet.",
+			"pool", o.config.PublicID, "instance", instance.InstanceID, "reason", err)
+		return false, nil
+	}
+
 	if err := o.gateway.EnsureInactiveBackend(ctx, trinogateway.Backend{
 		Name:         o.backendName(instance.InstanceID),
 		ProxyTo:      o.endpointFor(instance.InstanceID),
@@ -113,9 +133,9 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 		BackendName:    o.backendName(instance.InstanceID),
 		URL:            o.endpointFor(instance.InstanceID),
 		PodUID:         observed.CoordinatorPodUID,
-		BootID:         observed.CoordinatorPodUID,
+		BootID:         bootID,
 		ConfigRevision: instance.ReleaseID,
-		RepairFor:      repairTarget(instance),
+		RepairFor:      instance.RepairFor,
 	})
 	if err != nil {
 		return true, o.dropAuthority(fmt.Errorf("register member %s: %w", instance.InstanceID, err))
@@ -123,6 +143,7 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseCreating, trinopool.PhasePreparing, map[string]any{
 			"coordinator_pod_uid":  observed.CoordinatorPodUID,
+			"coordinator_boot_id":  bootID,
 			"gateway_incarnation":  member.Incarnation,
 			"gateway_backend_name": member.BackendName,
 			"gateway_state":        member.Phase,
@@ -135,13 +156,24 @@ func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance conf
 	if err != nil {
 		return false, fmt.Errorf("observe %s: %w", instance.InstanceID, err)
 	}
-	validation, err := o.validate(ctx, instance.EndpointURL, observed.ReadyWorkers)
+	validation, err := o.validate(ctx, instance.EndpointURL, observed, o.expectationFor(instance))
 	if err != nil {
 		// A candidate that is not ready yet stays PREPARING and is probed again.
 		// It holds a live slot, which the surge budget already accounts for.
 		slog.Info("Trino pool candidate is not ready yet.",
 			"pool", o.config.PublicID, "instance", instance.InstanceID, "reason", err)
 		return false, nil
+	}
+	// The registered boot identity is what the Gateway will compare the receipt
+	// against. If the coordinator restarted since registration, this member's
+	// incarnation is gone: admitting it is impossible, and waiting for it is
+	// pointless, so the candidate fails and a fresh instance replaces it.
+	if instance.CoordinatorBootID != "" && validation.ProcessID != instance.CoordinatorBootID {
+		slog.Warn("Trino pool candidate restarted before admission; failing it.",
+			"pool", o.config.PublicID, "instance", instance.InstanceID,
+			"registered", instance.CoordinatorBootID, "observed", validation.ProcessID)
+		return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing,
+			"the coordinator process restarted before admission")
 	}
 	receipt, err := marshalValidationReceipt(validation)
 	if err != nil {
@@ -288,22 +320,13 @@ func (o *trinoPoolOperator) deleteResources(ctx context.Context, instance config
 		trinopool.PhaseRetiring, trinopool.PhaseRetired, nil))
 }
 
-func repairTarget(instance configstore.TrinoPoolInstance) string {
-	if !instance.Repair {
-		return ""
-	}
-	// The Gateway charges the activation to the repair budget when it names the
-	// instance being replaced. Naming this instance itself is wrong, but the
-	// durable model does not record the failed peer yet; until it does, the
-	// repair flag only affects duckgres-side accounting.
-	return ""
-}
-
 func inventoryOf(instance configstore.TrinoPoolInstance) trinoPoolInventory {
 	return trinoPoolInventory{
 		Namespace:                 instanceNamespace(instance),
 		ConfigMapName:             instance.ConfigMapName,
 		ConfigMapUID:              instance.ConfigMapUID,
+		WorkerConfigMapName:       instance.WorkerConfigMapName,
+		WorkerConfigMapUID:        instance.WorkerConfigMapUID,
 		ServiceName:               instance.ServiceName,
 		ServiceUID:                instance.ServiceUID,
 		CoordinatorDeploymentName: instance.CoordinatorDeploymentName,
@@ -317,6 +340,8 @@ func inventoryUpdates(inventory trinoPoolInventory) map[string]any {
 	return map[string]any{
 		"config_map_name":             inventory.ConfigMapName,
 		"config_map_uid":              inventory.ConfigMapUID,
+		"worker_config_map_name":      inventory.WorkerConfigMapName,
+		"worker_config_map_uid":       inventory.WorkerConfigMapUID,
 		"service_name":                inventory.ServiceName,
 		"service_uid":                 inventory.ServiceUID,
 		"coordinator_deployment_name": inventory.CoordinatorDeploymentName,
@@ -324,4 +349,40 @@ func inventoryUpdates(inventory trinoPoolInventory) map[string]any {
 		"worker_deployment_name":      inventory.WorkerDeploymentName,
 		"worker_deployment_uid":       inventory.WorkerDeploymentUID,
 	}
+}
+
+// expectationFor is what this instance must prove before it can be admitted.
+//
+// The catalog revision comes from the pool's DURABLE publication revision, not
+// from a constant: a structurally healthy coordinator sitting at an older
+// revision is not certified for the current pool, because it would serve a
+// catalog set that does not yet include the newest tenant. Bootstrap is the
+// natural zero — before anything is published there is nothing to be behind.
+func (o *trinoPoolOperator) expectationFor(instance configstore.TrinoPoolInstance) trinoPoolExpectation {
+	expectation := trinoPoolExpectation{InternalHTTP: true}
+	if o.pool != nil {
+		expectation.CatalogRevision = o.pool.PublicationRevision
+	}
+	// The image comes from the instance's OWN snapshot, so a release that
+	// landed after this instance was created cannot retroactively change what
+	// it is required to be running.
+	if blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot)); err == nil {
+		expectation.Image = blueprint.Image
+	}
+	return expectation
+}
+
+// failCandidate records a candidate that can never be admitted.
+//
+// FAILED_PREPARING is the only terminal state reachable without a Gateway
+// retirement receipt, and it is sound exactly because the member never admitted
+// work: it was refused before activation. The instance stops occupying a live
+// slot, so the planner can replace it instead of blocking behind it forever -
+// which is what happened while no failure branch existed at all.
+func (o *trinoPoolOperator) failCandidate(ctx context.Context, instance configstore.TrinoPoolInstance, from trinopool.Phase, reason string) error {
+	return o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+		from, trinopool.PhaseFailedPreparing, map[string]any{
+			"failure_reason": reason,
+			"last_error":     reason,
+		}))
 }

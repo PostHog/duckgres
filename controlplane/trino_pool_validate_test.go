@@ -58,15 +58,26 @@ func newFakeCoordinator(t *testing.T) *fakeCoordinator {
 	return coordinator
 }
 
+const fakeCoordinatorImage = "registry.example.invalid/trino@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
 func (c *fakeCoordinator) validate(t *testing.T, observedWorkers int, requiredRevision int64) (trinoPoolValidation, error) {
+	t.Helper()
+	return c.validateWith(t, trinoPoolObservation{
+		ReadyWorkers: observedWorkers, DesiredWorkers: observedWorkers,
+		CoordinatorReady: true, CoordinatorPodUID: "pod-uid",
+		CoordinatorImage: fakeCoordinatorImage, WorkerImage: fakeCoordinatorImage,
+	}, trinoPoolExpectation{Image: fakeCoordinatorImage, CatalogRevision: requiredRevision, InternalHTTP: false})
+}
+
+func (c *fakeCoordinator) validateWith(t *testing.T, observed trinoPoolObservation, expected trinoPoolExpectation) (trinoPoolValidation, error) {
 	t.Helper()
 	return validateTrinoPoolCandidate(
 		context.Background(),
 		c.server.Client(),
 		c.server.URL,
 		func() (string, string) { return "observer", "secret" },
-		observedWorkers,
-		requiredRevision,
+		observed,
+		expected,
 	)
 }
 
@@ -254,5 +265,90 @@ func TestValidationClaimsTheAuthRevisionWhenEveryComponentReports(t *testing.T) 
 	}
 	if len(validation.Unacknowledged) != 0 {
 		t.Fatalf("unacknowledged = %v", validation.Unacknowledged)
+	}
+}
+
+// The image check must COMPARE something. Claiming it unconditionally wrote a
+// false acknowledgement into the Gateway's durable evidence, which is exactly
+// what the receipt exists to prevent.
+func TestValidationRejectsAnImageThatIsNotTheRelease(t *testing.T) {
+	coordinator := newFakeCoordinator(t)
+	other := "registry.example.invalid/trino@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+	cases := map[string]trinoPoolObservation{
+		"coordinator runs another image": {
+			ReadyWorkers: 2, DesiredWorkers: 2, CoordinatorReady: true,
+			CoordinatorImage: other, WorkerImage: fakeCoordinatorImage,
+		},
+		"workers run another image": {
+			ReadyWorkers: 2, DesiredWorkers: 2, CoordinatorReady: true,
+			CoordinatorImage: fakeCoordinatorImage, WorkerImage: other,
+		},
+		"no image observed at all": {
+			ReadyWorkers: 2, DesiredWorkers: 2, CoordinatorReady: true,
+		},
+	}
+	for name, observed := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := coordinator.validateWith(t, observed,
+				trinoPoolExpectation{Image: fakeCoordinatorImage, CatalogRevision: 42})
+			if !errors.Is(err, errTrinoPoolCandidateNotReady) {
+				t.Fatalf("error = %v, want the image mismatch to be rejected", err)
+			}
+		})
+	}
+}
+
+// A candidate at an older catalog revision is structurally healthy and still
+// not certified: it would serve a catalog set that does not include the newest
+// tenant. The required revision comes from the pool's durable publication
+// revision, so this is the check that binds them.
+func TestValidationRequiresThePublishedCatalogRevision(t *testing.T) {
+	coordinator := newFakeCoordinator(t)
+	coordinator.sync["appliedRevision"] = 41
+
+	observed := trinoPoolObservation{
+		ReadyWorkers: 2, DesiredWorkers: 2, CoordinatorReady: true,
+		CoordinatorImage: fakeCoordinatorImage, WorkerImage: fakeCoordinatorImage,
+	}
+	if _, err := coordinator.validateWith(t, observed,
+		trinoPoolExpectation{Image: fakeCoordinatorImage, CatalogRevision: 42}); !errors.Is(err, errTrinoPoolCandidateNotReady) {
+		t.Fatalf("error = %v, want an older applied revision to be refused", err)
+	}
+	// At the published revision it passes.
+	if _, err := coordinator.validateWith(t, observed,
+		trinoPoolExpectation{Image: fakeCoordinatorImage, CatalogRevision: 41}); err != nil {
+		t.Fatalf("validate at the published revision: %v", err)
+	}
+}
+
+// Internal HTTP carries the credential, so the probe must declare the Gateway's
+// terminated TLS rather than silently dropping the requirement. A coordinator
+// with process-forwarded=true refuses an authenticated request without it.
+func TestInternalHTTPProbeDeclaresForwardedHTTPS(t *testing.T) {
+	var forwarded []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded = append(forwarded, r.Header.Get("X-Forwarded-Proto"))
+		if _, _, ok := r.BasicAuth(); !ok {
+			t.Error("the probe dropped its credential")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"nodeId": "node-1", "processId": "process-1", "coordinatorId": "abcde",
+			"enabled": true, "ready": true, "observedRevision": 1, "appliedRevision": 1,
+		})
+	}))
+	defer server.Close()
+
+	processID, err := probeProcessIdentity(context.Background(), server.Client(), server.URL,
+		func() (string, string) { return "observer", "secret" }, true)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if processID != "process-1" {
+		t.Fatalf("processId = %q", processID)
+	}
+	if len(forwarded) == 0 || forwarded[0] != "https" {
+		t.Fatalf("forwarded proto = %v, want https declared", forwarded)
 	}
 }

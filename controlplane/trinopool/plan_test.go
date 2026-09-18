@@ -158,3 +158,36 @@ func TestPlanReportsBlockedSurge(t *testing.T) {
 		t.Fatalf("expected the extra outdated instance to be drained, got %+v", plan)
 	}
 }
+
+// A repair has to NAME the instance it replaces. The Gateway charges an
+// activation to the repair budget only when repairFor points at a failed
+// member; without it the repair spends the single planned surge, so a failure
+// during a release rollout cannot be repaired at all.
+func TestRepairPlanNamesTheInstanceItReplaces(t *testing.T) {
+	state := servingPool("r1", 3)
+	state.Instances[1].ID = "broken-one"
+	state.Instances[1].Phase = PhaseLost
+
+	plan := PlanNext(state)
+	if plan.Action != PlanActionCreate || !plan.Repair {
+		t.Fatalf("expected a repair create, got %+v", plan)
+	}
+	if plan.RepairFor != "broken-one" {
+		t.Fatalf("repair names %q, want the failed instance", plan.RepairFor)
+	}
+}
+
+// A SUSPECT instance is not yet proven dead, so it is not yet a repair target:
+// naming it would charge the repair budget for a member that may still recover.
+func TestRepairPrefersAProvenFailure(t *testing.T) {
+	state := servingPool("r1", 3)
+	state.Instances[0].ID = "suspected"
+	state.Instances[0].Phase = PhaseSuspect
+	state.Instances[1].ID = "lost-one"
+	state.Instances[1].Phase = PhaseLost
+
+	plan := PlanNext(state)
+	if plan.RepairFor != "lost-one" {
+		t.Fatalf("repair names %q, want the lost instance", plan.RepairFor)
+	}
+}

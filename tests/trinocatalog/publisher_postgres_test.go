@@ -429,3 +429,33 @@ func TestCatalogCountIsRecomputedInsideTheTransaction(t *testing.T) {
 		t.Fatalf("catalog_count = %d, want 3", count)
 	}
 }
+
+// Two publishers at the SAME epoch with different identities are not a
+// takeover, they are a collision. Allowing the second to overwrite the identity
+// let both pass the mutation fence afterwards - the precise ambiguity the
+// identity half of the fence exists to remove. Only a strictly higher epoch may
+// claim the cell.
+func TestTakeoverRefusesAnEqualEpochHeldByAnotherWriter(t *testing.T) {
+	db, publisher := bootstrapped(t)
+	ctx := context.Background()
+	if _, err := publisher.Apply(ctx, addCatalog("org_a")); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	impostor := newPublisher(t, db, "duckgres-impostor", 1)
+	if _, err := impostor.Takeover(ctx); !errors.Is(err, trinocatalog.ErrFenced) {
+		t.Fatalf("equal-epoch takeover error = %v, want ErrFenced", err)
+	}
+	// The original writer still owns the cell and can still write.
+	_, epoch, identity, _ := readState(t, db)
+	if epoch != 1 || identity != "duckgres-test" {
+		t.Fatalf("writer fence moved to (%d,%q)", epoch, identity)
+	}
+	if _, err := publisher.Apply(ctx, addCatalog("org_b")); err != nil {
+		t.Fatalf("original writer lost its cell: %v", err)
+	}
+	// And the impostor is still refused on the mutation path.
+	if _, err := impostor.Apply(ctx, addCatalog("org_c")); !errors.Is(err, trinocatalog.ErrNotWriter) {
+		t.Fatalf("impostor apply error = %v, want ErrNotWriter", err)
+	}
+}

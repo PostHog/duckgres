@@ -85,11 +85,22 @@ func (o Objects) All() []metav1.Object {
 // blueprint plus the identity injected into it. It is stored on the instance
 // row and annotated on every object, so "is this object mine and current?" is a
 // string comparison rather than a deep diff.
+//
+// The authority epoch is deliberately EXCLUDED. It is not execution
+// configuration — it is who last wrote the object — and it has its own
+// annotation that the ownership check compares numerically. Folding it in
+// wedged an instance permanently: a leader that recorded an instance and
+// created its objects, then died before the phase CAS, left the successor
+// (one epoch higher) computing a different digest, so every later apply hit
+// AlreadyExists and was refused as a foreign object, forever, with the
+// instance still counted as preparing and the whole pool blocked behind it.
 func (b *Blueprint) SpecDigest(identity Identity) string {
+	pinned := identity
+	pinned.AuthorityEpoch = 0
 	encoded, err := json.Marshal(struct {
 		Blueprint string   `json:"blueprint"`
 		Identity  Identity `json:"identity"`
-	}{Blueprint: b.Digest(), Identity: identity})
+	}{Blueprint: b.Digest(), Identity: pinned})
 	if err != nil {
 		return ""
 	}
@@ -159,7 +170,10 @@ func (b *Blueprint) Instantiate(identity Identity) (Objects, error) {
 		},
 	}
 
-	discoveryURI := fmt.Sprintf("https://%s:%d", identity.DiscoveryURIHost, identity.CoordinatorPort)
+	// Workers discover their coordinator over the cluster-internal HTTP port.
+	// TLS terminates at the Gateway, so there is no in-cluster certificate for
+	// a worker to verify and none is pretended.
+	discoveryURI := fmt.Sprintf("http://%s:%d", identity.DiscoveryURIHost, identity.CoordinatorPort)
 	coordinator := b.deployment(identity, meta(identity.InstanceID+"-coordinator"), componentCoordinator,
 		b.Coordinator, 1, coordinatorConfig.Name, discoveryURI)
 	worker := b.deployment(identity, meta(identity.InstanceID+"-worker"), componentWorker,

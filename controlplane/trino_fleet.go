@@ -103,3 +103,15 @@ func (w *trinoWiring) bundlePath() string {
 	}
 	return "/bundles/trino/" + w.Cell.PublicID
 }
+
+// byStoredID finds the wiring of one cell by its stored identity. Callers that
+// need a cell's credentials must use this rather than taking the first entry of
+// the fleet: a pool must never be certified with another cell's observer.
+func (f trinoFleet) byStoredID(storedID string) *trinoWiring {
+	for _, wire := range f {
+		if wire.Cell.ID == storedID {
+			return wire
+		}
+	}
+	return nil
+}

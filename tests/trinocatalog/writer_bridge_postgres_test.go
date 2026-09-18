@@ -5,6 +5,7 @@ package trinocatalog_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/trinocatalog"
@@ -156,5 +157,55 @@ func TestReaderSnapshotIsComplete(t *testing.T) {
 	}
 	if revision != 3 {
 		t.Fatalf("revision = %d, want 3", revision)
+	}
+}
+
+// Create, drop, then create again with IDENTICAL properties. With a
+// content-only operation id the third call hit the journal and returned the
+// first create's revision without writing anything: the catalog was dropped and
+// never republished, so no coordinator ever saw it again.
+func TestRecreateAfterDropIsRepublished(t *testing.T) {
+	db, publisher := bootstrapped(t)
+	ctx := context.Background()
+
+	create := func() trinocatalog.Mutation {
+		return trinocatalog.Mutation{
+			Operation: trinocatalog.OperationAddOrReplace, CatalogName: "org_acme",
+			ConnectorName: "ducklake",
+			Properties:    map[string]string{"ducklake.data-path": "s3://bucket/prefix/"},
+		}
+	}
+	// The bridge's identity scheme: the store's current revision plus the
+	// intent, so an intent repeated after other commits is a NEW operation.
+	apply := func(mutation trinocatalog.Mutation) trinocatalog.Result {
+		t.Helper()
+		state, err := publisher.State(ctx)
+		if err != nil {
+			t.Fatalf("state: %v", err)
+		}
+		mutation.OperationID = fmt.Sprintf("catalog.%s.r%d.%s", mutation.CatalogName, state.Revision, mutation.PayloadHash()[:16])
+		result, err := publisher.Apply(ctx, mutation)
+		if err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		return result
+	}
+
+	first := apply(create())
+	apply(trinocatalog.Mutation{Operation: trinocatalog.OperationRemove, CatalogName: "org_acme"})
+	third := apply(create())
+
+	if third.Replayed {
+		t.Fatal("the recreate was treated as a replay of the original create")
+	}
+	if third.Revision <= first.Revision {
+		t.Fatalf("recreate revision %d did not advance past %d", third.Revision, first.Revision)
+	}
+	var present bool
+	if err := db.QueryRow(`SELECT count(*) = 1 FROM trino_catalogs WHERE cell_id=$1 AND catalog_name='org_acme'`, testCell).Scan(&present); err != nil {
+		t.Fatalf("read catalog: %v", err)
+	}
+	if !present {
+		t.Fatal("the recreated catalog is not in the store")
 	}
 }

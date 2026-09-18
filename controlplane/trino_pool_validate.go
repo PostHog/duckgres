@@ -82,6 +82,20 @@ type componentRevision struct {
 	Error    string `json:"error"`
 }
 
+// trinoPoolExpectation is what the pool requires of a candidate. Every field is
+// compared; none of them is assumed.
+type trinoPoolExpectation struct {
+	// Image is the blueprint's digest-pinned release image.
+	Image string
+	// CatalogRevision is the pool's published catalog revision. A structurally
+	// healthy coordinator sitting at an older revision is NOT certified: it
+	// would serve a catalog set that does not include the newest tenant.
+	CatalogRevision int64
+	// InternalHTTP marks a pooled coordinator reached on its in-cluster
+	// Service, where TLS terminates at the Gateway.
+	InternalHTTP bool
+}
+
 // trinoPoolValidation is a process-bound validation result.
 type trinoPoolValidation struct {
 	NodeID          string
@@ -112,21 +126,43 @@ func validateTrinoPoolCandidate(
 	client *http.Client,
 	coordinatorURL string,
 	credential func() (string, string),
-	observedWorkers int,
-	requiredCatalogRevision int64,
+	observed trinoPoolObservation,
+	expected trinoPoolExpectation,
 ) (trinoPoolValidation, error) {
 	ctx, cancel := context.WithTimeout(ctx, trinoPoolProbePassBudget)
 	defer cancel()
 
+	// The image is checked against what the cluster is RUNNING, not against
+	// what the spec asked for. Claiming the check without comparing anything
+	// put a false acknowledgement into the Gateway's durable evidence - the
+	// same defect the auth-revision handling exists to avoid.
+	if expected.Image == "" {
+		return trinoPoolValidation{}, fmt.Errorf("%w: no expected image to verify against", errTrinoPoolCandidateNotReady)
+	}
+	if observed.CoordinatorImage != expected.Image {
+		return trinoPoolValidation{}, fmt.Errorf("%w: coordinator runs image %q, the release pins %q",
+			errTrinoPoolCandidateNotReady, observed.CoordinatorImage, expected.Image)
+	}
+	if observed.WorkerImage != "" && observed.WorkerImage != expected.Image {
+		return trinoPoolValidation{}, fmt.Errorf("%w: workers run image %q, the release pins %q",
+			errTrinoPoolCandidateNotReady, observed.WorkerImage, expected.Image)
+	}
+
+	observedWorkers := observed.ReadyWorkers
+	requiredCatalogRevision := expected.CatalogRevision
+
 	username, password := credential()
-	sql := rolloutSQLClient{baseURL: coordinatorURL, client: client, username: username, password: password}
+	sql := rolloutSQLClient{
+		baseURL: coordinatorURL, client: client, username: username, password: password,
+		internalHTTP: expected.InternalHTTP,
+	}
 
 	before, err := sql.info(ctx)
 	if err != nil {
 		return trinoPoolValidation{}, fmt.Errorf("%w: %v", errTrinoPoolCandidateNotReady, err)
 	}
 
-	sync, err := fetchCatalogSync(ctx, client, coordinatorURL, username, password)
+	sync, err := fetchCatalogSync(ctx, client, coordinatorURL, username, password, expected.InternalHTTP)
 	if err != nil {
 		return trinoPoolValidation{}, err
 	}
@@ -238,7 +274,7 @@ func certificateHash(validation trinoPoolValidation) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func fetchCatalogSync(ctx context.Context, client *http.Client, coordinatorURL, username, password string) (catalogSyncStatus, error) {
+func fetchCatalogSync(ctx context.Context, client *http.Client, coordinatorURL, username, password string, internalHTTP bool) (catalogSyncStatus, error) {
 	ctx, cancel := context.WithTimeout(ctx, trinoPoolProbeRequestBudget)
 	defer cancel()
 
@@ -248,6 +284,13 @@ func fetchCatalogSync(ctx context.Context, client *http.Client, coordinatorURL, 
 	}
 	request.SetBasicAuth(username, password)
 	request.Header.Set("Accept", "application/json")
+	if internalHTTP {
+		// Same forwarded-HTTPS declaration the statement client sends: the
+		// readiness endpoint is authenticated too, and a management probe must
+		// not be the one path that quietly drops that requirement.
+		request.Header.Set("X-Forwarded-Proto", forwardedScheme)
+		request.Header.Set("X-Forwarded-Port", "443")
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return catalogSyncStatus{}, fmt.Errorf("%w: catalog sync request failed", errTrinoPoolCandidateNotReady)
@@ -337,4 +380,27 @@ func splitSecurityRevisions(revisions []componentRevision) (acknowledged, unackn
 	sort.Strings(acknowledged)
 	sort.Strings(unacknowledged)
 	return acknowledged, unacknowledged
+}
+
+// probeProcessIdentity reads ONLY the coordinator's process identity.
+//
+// It runs before member registration because the Gateway binds podUid and
+// bootId at registration and then requires the admission receipt to carry the
+// identical pair. Registering the pod UID as the boot id and admitting with the
+// Trino processId made every admission fail POOL_NOT_CERTIFIED: there is one
+// authoritative boot identity, and it is the coordinator's processId, which
+// changes on every JVM start exactly as a boot identity must.
+func probeProcessIdentity(ctx context.Context, client *http.Client, coordinatorURL string, credential func() (string, string), internalHTTP bool) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, trinoPoolProbeRequestBudget)
+	defer cancel()
+
+	username, password := credential()
+	status, err := fetchCatalogSync(ctx, client, coordinatorURL, username, password, internalHTTP)
+	if err != nil {
+		return "", err
+	}
+	if status.ProcessID == "" {
+		return "", fmt.Errorf("%w: candidate reports no process identity", errTrinoPoolCandidateNotReady)
+	}
+	return status.ProcessID, nil
 }

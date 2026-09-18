@@ -56,7 +56,8 @@ func NewClient(config Config) (*Client, error) {
 		(origin.Path != "" && origin.Path != "/") {
 		return nil, errors.New("gateway client requires a credential-free origin without a path")
 	}
-	if origin.Scheme != "https" && !(config.AllowPlaintext && origin.Scheme == "http") {
+	plaintextAllowed := config.AllowPlaintext && origin.Scheme == "http"
+	if origin.Scheme != "https" && !plaintextAllowed {
 		return nil, errors.New("gateway client requires an HTTPS origin")
 	}
 	token := strings.TrimSpace(config.AdminToken)
@@ -241,6 +242,20 @@ func (c *Client) GetPublication(ctx context.Context, poolID, publicationID strin
 func (c *Client) GetTenant(ctx context.Context, poolID, tenant string) (TenantAdmission, error) {
 	var admission TenantAdmission
 	err := c.do(ctx, http.MethodGet, c.tenantPath(poolID, tenant), nil, &admission)
+	return admission, err
+}
+
+// PublishTenantPrincipals publishes the authoritative principal to tenant
+// binding the admission restriction keys on.
+//
+// Route confirmation is pending: PoolStore.publishTenantPrincipals exists in the
+// Gateway source, but PoolResource has not exposed it yet. This client sends the
+// body that store method reads; the PATH is the one remaining unverified part of
+// this call, and it must be confirmed against the Java resource before the
+// tenant gate is enabled anywhere.
+func (c *Client) PublishTenantPrincipals(ctx context.Context, poolID, tenant string, request PublishPrincipalsRequest) (TenantAdmission, error) {
+	var admission TenantAdmission
+	err := c.do(ctx, http.MethodPost, c.tenantPath(poolID, tenant)+"/principals", request, &admission)
 	return admission, err
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/trinopool"
@@ -66,6 +67,11 @@ type trinoPoolObservation struct {
 	CoordinatorReady  bool
 	CoordinatorPodUID string
 	PodsPresent       int
+	// The images the pods are ACTUALLY running, read from the pod specs. The
+	// admission receipt claims an image check, and a claim that compares
+	// nothing is a false statement in the Gateway's durable evidence.
+	CoordinatorImage string
+	WorkerImage      string
 }
 
 type trinoPoolEffects struct {
@@ -383,8 +389,19 @@ func (e *trinoPoolEffects) Observe(ctx context.Context, inventory trinoPoolInven
 	}
 	observation.PodsPresent = len(pods)
 	for _, pod := range pods {
-		if pod.Labels["app.kubernetes.io/component"] == "coordinator" && pod.DeletionTimestamp == nil {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		switch pod.Labels["app.kubernetes.io/component"] {
+		case componentCoordinatorLabel:
 			observation.CoordinatorPodUID = string(pod.UID)
+			observation.CoordinatorImage = trinoContainerImage(pod)
+		case componentWorkerLabel:
+			// Any running worker: they are one Deployment, so a mixed set is
+			// itself a mid-rollout state the image comparison should catch.
+			if image := trinoContainerImage(pod); image != "" {
+				observation.WorkerImage = image
+			}
 		}
 	}
 	return observation, nil
@@ -415,4 +432,26 @@ func (e *trinoPoolEffects) instancePods(ctx context.Context, inventory trinoPool
 // exactly after the instance.
 func instanceLabelFromInventory(inventory trinoPoolInventory) string {
 	return inventory.ServiceName
+}
+
+// Component label values, matching what Instantiate stamps.
+const (
+	componentCoordinatorLabel = "coordinator"
+	componentWorkerLabel      = "worker"
+)
+
+// trinoContainerImage reports the image of the pod's main Trino container. The
+// name comes from the standard app label the chart already sets, so a sidecar's
+// image can never be mistaken for the release image.
+func trinoContainerImage(pod corev1.Pod) string {
+	main := pod.Labels["app.kubernetes.io/name"]
+	for _, container := range pod.Spec.Containers {
+		if main != "" && container.Name != main && !strings.HasPrefix(container.Name, "trino-") {
+			continue
+		}
+		if strings.HasPrefix(container.Name, "trino-") || container.Name == main {
+			return container.Image
+		}
+	}
+	return ""
 }

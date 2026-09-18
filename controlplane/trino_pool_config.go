@@ -41,23 +41,22 @@ type trinoRegisteredPool struct {
 	BlueprintFile          string `json:"blueprint_file"`
 	CoordinatorServicePort int32  `json:"coordinator_service_port"`
 	NodeEnvironment        string `json:"node_environment"`
-	// TLSServerName is the name callers verify when dialling an instance's
-	// in-cluster Service. The pool's certificate is issued for a public name,
-	// so the dial address and the verified name differ by design; see
-	// trinoPoolConfig.TLSServerName.
-	TLSServerName string `json:"tls_server_name,omitempty"`
+	// TenantAdmission turns on the Gateway's pooled admission restriction for
+	// this pool. It is off by default because the restriction is deny-only: with
+	// it on, a tenant whose principals have not been published yet cannot
+	// dispatch work, which is correct but must be a deliberate choice.
+	TenantAdmission bool `json:"tenant_admission,omitempty"`
 }
 
 // trinoPoolConfig is one resolved shared pool.
 type trinoPoolConfig struct {
-	PoolID        string
-	PublicID      string
-	RoutingGroup  string
-	Namespace     string
-	TLSServerName string
-	Spec          configstore.TrinoPoolSpec
-	Blueprint     *trinopool.Blueprint
-	Pool          trinoRegisteredPool
+	PoolID       string
+	PublicID     string
+	RoutingGroup string
+	Namespace    string
+	Spec         configstore.TrinoPoolSpec
+	Blueprint    *trinopool.Blueprint
+	Pool         trinoRegisteredPool
 
 	// Frozen marks a pool whose desired configuration could not be resolved.
 	// Reconciliation then holds the last-good state: no creates, no drains, no
@@ -154,12 +153,11 @@ func resolveTrinoPoolConfig(cell trinoRegisteredCell) (trinoPoolConfig, error) {
 	}
 
 	config := trinoPoolConfig{
-		PoolID:        registeredTrinoCellPrefix + cell.ID,
-		PublicID:      cell.ID,
-		RoutingGroup:  cell.RoutingGroup,
-		Namespace:     cell.Namespace,
-		TLSServerName: strings.TrimSpace(pool.TLSServerName),
-		Pool:          *pool,
+		PoolID:       registeredTrinoCellPrefix + cell.ID,
+		PublicID:     cell.ID,
+		RoutingGroup: cell.RoutingGroup,
+		Namespace:    cell.Namespace,
+		Pool:         *pool,
 		Spec: configstore.TrinoPoolSpec{
 			PoolID:           registeredTrinoCellPrefix + cell.ID,
 			PublicID:         cell.ID,

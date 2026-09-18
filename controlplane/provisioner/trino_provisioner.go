@@ -606,6 +606,27 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 // startup logging and tests.
 func (p *TrinoProvisioner) CellID() string { return p.cellID }
 
+// SetCatalogClient replaces the catalog write path at runtime.
+//
+// A shared-pool cell has no fixed coordinator to issue CREATE CATALOG against,
+// so its catalogs are published directly to the shared store. The publisher can
+// only be built once a control plane holds the pool authority, which happens
+// after startup - hence a setter rather than a constructor argument. Everything
+// else about the reconcile loop is unchanged.
+func (p *TrinoProvisioner) SetCatalogClient(catalog TrinoCatalogClient) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.catalog = catalog
+}
+
+// catalogClient reads the current write path under the same lock the setter
+// takes, so a reconcile tick cannot observe a half-installed client.
+func (p *TrinoProvisioner) catalogClient() TrinoCatalogClient {
+	p.credMu.RLock()
+	defer p.credMu.RUnlock()
+	return p.catalog
+}
+
 // Reconcile runs one full projection: cluster secrets → auth files →
 // resource groups → OPA bundle → tenant passwords → catalogs. Errors in
 // any one output are logged and surfaced but the next output still runs —
@@ -1103,7 +1124,7 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 	p.setObserverCredential(observerPlaintext, observerHash)
 	// Push the admin plaintext into the catalog client if it supports
 	// runtime credential updates (test fakes don't).
-	if updater, ok := p.catalog.(TrinoCatalogCredentialUpdater); ok {
+	if updater, ok := p.catalogClient().(TrinoCatalogCredentialUpdater); ok {
 		updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
 	}
 	for _, catalog := range p.additionalCatalogs {
@@ -1602,7 +1623,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	orgs []configstore.TrinoEnabledOrg,
 	tenants tenantSecretProjection,
 ) (map[string]catalogOutcome, error) {
-	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalog)
+	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalogClient())
 	errs := []error{firstErr}
 	for i, catalog := range p.additionalCatalogs {
 		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog)

@@ -34,8 +34,10 @@ func poolSpec() cpconfigstore.TrinoPoolSpec {
 func newPoolStore(t *testing.T) *cpconfigstore.ConfigStore {
 	t.Helper()
 	store := newIsolatedConfigStore(t)
-	if err := store.UpsertTrinoPoolSpec(context.Background(), poolSpec()); err != nil {
-		t.Fatalf("upsert pool spec: %v", err)
+	// Seeding is the one unfenced write: a fence needs a row to lock, so the
+	// first publication has to create one. It can only INSERT.
+	if err := store.SeedTrinoPool(context.Background(), poolSpec()); err != nil {
+		t.Fatalf("seed pool: %v", err)
 	}
 	return store
 }
@@ -67,12 +69,12 @@ func TestUpsertTrinoPoolSpecPreservesRuntimeState(t *testing.T) {
 	store := newPoolStore(t)
 	lease := claimPool(t, store, "cp-a")
 
-	if err := store.FreezeTrinoPool(ctx, poolID, "blueprint unreadable"); err != nil {
+	if err := store.FreezeTrinoPool(ctx, lease, poolID, "blueprint unreadable"); err != nil {
 		t.Fatalf("freeze: %v", err)
 	}
 	spec := poolSpec()
 	spec.DesiredReleaseID = "r2"
-	if err := store.UpsertTrinoPoolSpec(ctx, spec); err != nil {
+	if err := store.UpsertTrinoPoolSpec(ctx, lease, spec); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 
@@ -91,13 +93,49 @@ func TestUpsertTrinoPoolSpecPreservesRuntimeState(t *testing.T) {
 	}
 }
 
+// Publishing desired state is lifecycle-affecting, so it is fenced: a delayed
+// old leader must not be able to overwrite a newer desired spec or clear
+// another leader's freeze.
+func TestDesiredStatePublicationIsFenced(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	stale := claimPool(t, store, "cp-a")
+	current := claimPool(t, store, "cp-b")
+
+	spec := poolSpec()
+	spec.DesiredReleaseID = "stale-release"
+	if err := store.UpsertTrinoPoolSpec(ctx, stale, spec); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale desired publication error = %v, want ErrTrinoPoolConflict", err)
+	}
+	if err := store.FreezeTrinoPool(ctx, stale, poolID, "stale freeze"); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale freeze error = %v, want ErrTrinoPoolConflict", err)
+	}
+	if err := store.ThawTrinoPool(ctx, stale, poolID); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale thaw error = %v, want ErrTrinoPoolConflict", err)
+	}
+
+	pool, err := store.GetTrinoPool(ctx, poolID)
+	if err != nil || pool == nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if pool.DesiredReleaseID == "stale-release" || pool.Frozen {
+		t.Fatalf("a superseded leader changed desired state: %+v", pool)
+	}
+
+	// The current leader still writes normally.
+	spec.DesiredReleaseID = "current-release"
+	if err := store.UpsertTrinoPoolSpec(ctx, current, spec); err != nil {
+		t.Fatalf("current leader publication: %v", err)
+	}
+}
+
 // Missing desired configuration freezes the pool. It must never be able to
 // express itself as a desired count of zero.
 func TestTrinoPoolRejectsAnEmptyDesiredCount(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	spec := poolSpec()
 	spec.DesiredInstances = 0
-	if err := store.UpsertTrinoPoolSpec(context.Background(), spec); err == nil {
+	if err := store.SeedTrinoPool(context.Background(), spec); err == nil {
 		t.Fatal("a desired count of zero was accepted")
 	}
 }

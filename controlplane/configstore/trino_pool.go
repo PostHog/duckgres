@@ -22,10 +22,42 @@ import (
 //     CAS means losing authority; the caller stops, it does not retry harder.
 
 // UpsertTrinoPoolSpec applies the desired configuration resolved from the
-// registry and blueprint. It touches only desired fields: the authority epoch,
-// the freeze flag and every runtime column belong to the operator, and a
-// startup config refresh must not disturb them.
-func (cs *ConfigStore) UpsertTrinoPoolSpec(ctx context.Context, spec TrinoPoolSpec) error {
+// registry and blueprint. It touches only desired fields; the authority epoch,
+// the freeze flag and every runtime column belong to the operator.
+//
+// It is FENCED. Publishing desired state changes what the
+// operator will do next, so it is a lifecycle mutation like any other: a
+// delayed old leader, or a replica still holding stale configuration, must not
+// be able to overwrite a newer desired spec.
+//
+// The pool row must already exist for a fenced write to be possible, so the
+// first publication seeds it - see SeedTrinoPool.
+func (cs *ConfigStore) UpsertTrinoPoolSpec(ctx context.Context, lease TrinoPoolLease, spec TrinoPoolSpec) error {
+	if err := spec.validate(); err != nil {
+		return err
+	}
+	if spec.PoolID != lease.PoolID {
+		return fmt.Errorf("%w: spec is for pool %q, lease covers %q", ErrTrinoPoolConflict, spec.PoolID, lease.PoolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Model(&TrinoPool{}).Where("pool_id = ?", spec.PoolID).Updates(map[string]any{
+			"public_id":                spec.PublicID,
+			"api_mode":                 spec.APIMode,
+			"desired_release_id":       spec.DesiredReleaseID,
+			"desired_blueprint_digest": spec.DesiredBlueprintDigest,
+			"desired_instances":        spec.DesiredInstances,
+			"min_serving":              spec.MinServing,
+			"max_surge":                spec.MaxSurge,
+			"max_repair":               spec.MaxRepair,
+			"updated_at":               time.Now().UTC(),
+		}).Error
+	})
+}
+
+// SeedTrinoPool creates the pool row if it does not exist yet. It is the one
+// unfenced write, because a fence needs a row to lock: it only ever INSERTs,
+// never updates, so it cannot overwrite anything another leader published.
+func (cs *ConfigStore) SeedTrinoPool(ctx context.Context, spec TrinoPoolSpec) error {
 	if err := spec.validate(); err != nil {
 		return err
 	}
@@ -40,13 +72,7 @@ func (cs *ConfigStore) UpsertTrinoPoolSpec(ctx context.Context, spec TrinoPoolSp
 		MaxSurge:               spec.MaxSurge,
 		MaxRepair:              spec.MaxRepair,
 	}
-	return cs.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "pool_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"public_id", "api_mode", "desired_release_id", "desired_blueprint_digest",
-			"desired_instances", "min_serving", "max_surge", "max_repair", "updated_at",
-		}),
-	}).Create(&pool).Error
+	return cs.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&pool).Error
 }
 
 func (s TrinoPoolSpec) validate() error {
@@ -86,20 +112,22 @@ func (cs *ConfigStore) GetTrinoPool(ctx context.Context, poolID string) (*TrinoP
 // FreezeTrinoPool holds the pool at its last-good state. This is what missing
 // or invalid desired configuration does: no creates, no drains, no deletes, and
 // explicitly NOT a desired count of zero.
-func (cs *ConfigStore) FreezeTrinoPool(ctx context.Context, poolID, reason string) error {
+func (cs *ConfigStore) FreezeTrinoPool(ctx context.Context, lease TrinoPoolLease, poolID, reason string) error {
 	if reason == "" {
 		return errors.New("freezing a trino pool requires a reason")
 	}
-	return cs.db.WithContext(ctx).Model(&TrinoPool{}).
-		Where("pool_id = ?", poolID).
-		Updates(map[string]any{"frozen": true, "frozen_reason": reason, "updated_at": time.Now().UTC()}).Error
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Model(&TrinoPool{}).Where("pool_id = ?", poolID).
+			Updates(map[string]any{"frozen": true, "frozen_reason": reason, "updated_at": time.Now().UTC()}).Error
+	})
 }
 
 // ThawTrinoPool clears the freeze once desired configuration is readable again.
-func (cs *ConfigStore) ThawTrinoPool(ctx context.Context, poolID string) error {
-	return cs.db.WithContext(ctx).Model(&TrinoPool{}).
-		Where("pool_id = ? AND frozen", poolID).
-		Updates(map[string]any{"frozen": false, "frozen_reason": "", "updated_at": time.Now().UTC()}).Error
+func (cs *ConfigStore) ThawTrinoPool(ctx context.Context, lease TrinoPoolLease, poolID string) error {
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Model(&TrinoPool{}).Where("pool_id = ? AND frozen", poolID).
+			Updates(map[string]any{"frozen": false, "frozen_reason": "", "updated_at": time.Now().UTC()}).Error
+	})
 }
 
 // AcquireTrinoPoolAuthority bumps the pool's authority epoch and records the new

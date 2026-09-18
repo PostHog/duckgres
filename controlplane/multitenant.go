@@ -808,7 +808,7 @@ func SetupMultiTenant(
 	// the same reason the rest of the Trino branch is - an operator who
 	// configured a pool must not be left with a control plane that silently
 	// reconciles nothing.
-	poolOperators, poolErr := buildTrinoPoolOperators(store, trinoPoolClientset(trinoCells), trinoPoolObserverCredential(trinoCells), cpInstanceID)
+	poolOperators, poolErr := buildTrinoPoolOperators(store, trinoCells, cpInstanceID)
 	if poolErr != nil {
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("shared Trino pool wiring failed: %w", poolErr)
 	}

@@ -5,13 +5,23 @@ package controlplane
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"k8s.io/client-go/kubernetes"
+	"github.com/posthog/duckgres/controlplane/provisioner"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
-func fakeKubeInterface() kubernetes.Interface { return fake.NewClientset() }
+// testPoolFleet wires one cell whose stored id matches the pooled registry
+// fixture, so the operator can find ITS OWN credentials rather than whichever
+// map entry came first.
+func testPoolFleet() trinoFleet {
+	return trinoFleet{{
+		Cell:        trinoCell{ID: registeredTrinoCellPrefix + "cell-001", PublicID: "cell-001", Mode: trinoPoolModeShared},
+		Kubernetes:  fake.NewClientset(),
+		Provisioner: &provisioner.TrinoProvisioner{},
+	}}
+}
 
 // With no pooled cell in the registry the wiring produces nothing. This is what
 // "ships disabled" has to mean at the startup boundary: the code path is
@@ -22,7 +32,7 @@ func TestPoolWiringIsInertWithoutAPooledCell(t *testing.T) {
 	t.Setenv(envTrinoPoolEnabled, "")
 	t.Setenv(envTrinoPoolOperatorEnabled, "")
 
-	operators, err := buildTrinoPoolOperators(nil, nil, nil, "cp-test")
+	operators, err := buildTrinoPoolOperators(nil, nil, "cp-test")
 	if err != nil {
 		t.Fatalf("wiring failed on a fleet without pools: %v", err)
 	}
@@ -46,7 +56,7 @@ func TestPoolWiringRefusesAnOperatorWithoutAGateway(t *testing.T) {
 	t.Setenv(envTrinoPoolGatewayURL, "")
 	t.Setenv("DUCKGRES_TRINO_MANAGED_GATEWAY_URL", "")
 
-	_, err := buildTrinoPoolOperators(nil, fakeKubeInterface(), func() (string, string) { return "observer", "secret" }, "cp-test")
+	_, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test")
 	if err == nil {
 		t.Fatal("an enabled operator without a Gateway was accepted")
 	}
@@ -66,7 +76,7 @@ func TestPoolWiringBuildsAReadOnlyOperator(t *testing.T) {
 	t.Setenv(envTrinoPoolGatewayURL, "")
 	t.Setenv("DUCKGRES_TRINO_MANAGED_GATEWAY_URL", "")
 
-	operators, err := buildTrinoPoolOperators(nil, fakeKubeInterface(), func() (string, string) { return "observer", "secret" }, "cp-test")
+	operators, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test")
 	if err != nil {
 		t.Fatalf("wiring failed: %v", err)
 	}
@@ -76,7 +86,17 @@ func TestPoolWiringBuildsAReadOnlyOperator(t *testing.T) {
 	if operators[0].operatorEnabled {
 		t.Fatal("the operator was built enabled")
 	}
-	if operators[0].owner != "cp-test" {
-		t.Fatalf("owner = %q", operators[0].owner)
+	// The owner is the control-plane id plus a per-PROCESS suffix: two
+	// processes of the same control plane must not both satisfy the fence's
+	// owner check, or the epoch is the only thing telling them apart.
+	if !strings.HasPrefix(operators[0].owner, "cp-test.") || operators[0].owner == "cp-test." {
+		t.Fatalf("owner = %q, want a per-process identity under cp-test", operators[0].owner)
+	}
+	second, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test")
+	if err != nil {
+		t.Fatalf("second wiring: %v", err)
+	}
+	if second[0].owner == operators[0].owner {
+		t.Fatal("two processes of the same control plane received the same owner identity")
 	}
 }

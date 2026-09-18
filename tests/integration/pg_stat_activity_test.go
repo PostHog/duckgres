@@ -14,15 +14,15 @@ import (
 // so we must scan all of them.
 func scanPgStatActivityRow(rows *sql.Rows) (map[string]interface{}, error) {
 	var (
-		datid, pid, usesysid, clientPort, workerID             int
-		datname, usename, appName, clientAddr, state, query    string
-		backendType                                            string
-		backendStart                                           time.Time
-		xactStart, queryStart, stateChange                     sql.NullTime
-		waitEventType, waitEvent                               sql.NullString
-		backendXid, backendXmin, leaderPid                     sql.NullInt32
-		queryProgress                                          float64
-		rowsProcessed, totalRowsToProcess                      int64
+		datid, pid, usesysid, clientPort, workerID          int
+		datname, usename, appName, clientAddr, state, query string
+		backendType                                         string
+		backendStart                                        time.Time
+		xactStart, queryStart, stateChange                  sql.NullTime
+		waitEventType, waitEvent                            sql.NullString
+		backendXid, backendXmin, leaderPid                  sql.NullInt32
+		queryProgress                                       float64
+		rowsProcessed, totalRowsToProcess                   int64
 	)
 
 	err := rows.Scan(
@@ -39,30 +39,30 @@ func scanPgStatActivityRow(rows *sql.Rows) (map[string]interface{}, error) {
 	}
 
 	return map[string]interface{}{
-		"datid":                  datid,
-		"datname":                datname,
-		"pid":                    pid,
-		"usesysid":               usesysid,
-		"usename":                usename,
-		"application_name":       appName,
-		"client_addr":            clientAddr,
-		"client_port":            clientPort,
-		"backend_start":          backendStart,
-		"xact_start":             xactStart,
-		"query_start":            queryStart,
-		"state_change":           stateChange,
-		"wait_event_type":        waitEventType,
-		"wait_event":             waitEvent,
-		"state":                  state,
-		"backend_xid":            backendXid,
-		"backend_xmin":           backendXmin,
-		"query":                  query,
-		"backend_type":           backendType,
-		"leader_pid":             leaderPid,
-		"worker_id":              workerID,
-		"query_progress":         queryProgress,
-		"rows_processed":         rowsProcessed,
-		"total_rows_to_process":  totalRowsToProcess,
+		"datid":                 datid,
+		"datname":               datname,
+		"pid":                   pid,
+		"usesysid":              usesysid,
+		"usename":               usename,
+		"application_name":      appName,
+		"client_addr":           clientAddr,
+		"client_port":           clientPort,
+		"backend_start":         backendStart,
+		"xact_start":            xactStart,
+		"query_start":           queryStart,
+		"state_change":          stateChange,
+		"wait_event_type":       waitEventType,
+		"wait_event":            waitEvent,
+		"state":                 state,
+		"backend_xid":           backendXid,
+		"backend_xmin":          backendXmin,
+		"query":                 query,
+		"backend_type":          backendType,
+		"leader_pid":            leaderPid,
+		"worker_id":             workerID,
+		"query_progress":        queryProgress,
+		"rows_processed":        rowsProcessed,
+		"total_rows_to_process": totalRowsToProcess,
 	}, nil
 }
 

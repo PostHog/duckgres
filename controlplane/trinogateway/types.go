@@ -320,7 +320,27 @@ type TenantAdmission struct {
 	State            string `json:"state"`
 	AdmittedRevision string `json:"admittedRevision"`
 	PublicationID    string `json:"publicationId"`
-	Replayed         bool   `json:"replayed"`
+	// PrincipalRevision and Principals are the authoritative binding the
+	// Gateway's admission restriction keys on.
+	PrincipalRevision string   `json:"principalRevision"`
+	Principals        []string `json:"principals"`
+	Replayed          bool     `json:"replayed"`
+}
+
+// PublishPrincipalsRequest publishes a tenant's authoritative principal set.
+//
+// The Gateway cannot derive these strings. A tenant's logins are one flat
+// namespace produced by the controller's own projection - a root login that
+// carries no separator at all, plus qualified per-user names - and they are not
+// a function of the tenant identifier. Deriving them from the shape of a name
+// would refuse legitimate root logins and could bind a principal to the wrong
+// tenant, so the controller states them.
+//
+// The set is replaced whole: a login removed here stops being admitted.
+type PublishPrincipalsRequest struct {
+	Step
+	Revision   string   `json:"revision"`
+	Principals []string `json:"principals"`
 }
 
 // RevokeTenantRequest closes a tenant's admission gate. Revocation is not

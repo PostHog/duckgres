@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
@@ -41,20 +42,27 @@ func newFakePoolStore(spec configstore.TrinoPoolSpec) *fakePoolStore {
 	}
 }
 
-func (f *fakePoolStore) UpsertTrinoPoolSpec(_ context.Context, spec configstore.TrinoPoolSpec) error {
+func (f *fakePoolStore) SeedTrinoPool(_ context.Context, _ configstore.TrinoPoolSpec) error {
+	return nil
+}
+
+func (f *fakePoolStore) UpsertTrinoPoolSpec(_ context.Context, lease configstore.TrinoPoolLease, spec configstore.TrinoPoolSpec) error {
+	if lease.Epoch != f.epoch {
+		return configstore.ErrTrinoPoolConflict
+	}
 	f.pool.DesiredInstances, f.pool.MinServing = spec.DesiredInstances, spec.MinServing
 	f.pool.MaxSurge, f.pool.MaxRepair = spec.MaxSurge, spec.MaxRepair
 	f.pool.DesiredReleaseID = spec.DesiredReleaseID
 	return nil
 }
 
-func (f *fakePoolStore) FreezeTrinoPool(_ context.Context, _, reason string) error {
+func (f *fakePoolStore) FreezeTrinoPool(_ context.Context, _ configstore.TrinoPoolLease, _, reason string) error {
 	f.frozen = reason
 	f.pool.Frozen, f.pool.FrozenReason = true, reason
 	return nil
 }
 
-func (f *fakePoolStore) ThawTrinoPool(context.Context, string) error {
+func (f *fakePoolStore) ThawTrinoPool(context.Context, configstore.TrinoPoolLease, string) error {
 	f.pool.Frozen, f.pool.FrozenReason = false, ""
 	return nil
 }
@@ -153,6 +161,16 @@ func applyFakeUpdates(instance *configstore.TrinoPoolInstance, updates map[strin
 			instance.GatewayGeneration = value.(int64)
 		case "applied_catalog_revision":
 			instance.AppliedCatalogRevision = value.(int64)
+		case "repair_for":
+			instance.RepairFor = value.(string)
+		case "failure_reason":
+			instance.FailureReason = value.(string)
+		case "worker_config_map_name":
+			instance.WorkerConfigMapName = value.(string)
+		case "worker_config_map_uid":
+			instance.WorkerConfigMapUID = value.(string)
+		case "last_error":
+			instance.LastError = value.(string)
 		case "validation_receipt":
 			instance.ValidationReceipt = value.(string)
 		case "retirement_receipt":
@@ -165,6 +183,7 @@ type fakePoolGateway struct {
 	members     map[string]*trinogateway.Member
 	obligations map[string]trinogateway.Obligations
 	backends    map[string]trinogateway.Backend
+	principals  map[string][]string
 	calls       []string
 	drainErr    error
 	configured  *trinogateway.ConfigurePoolRequest
@@ -187,6 +206,18 @@ func (f *fakePoolGateway) EnsureInactiveBackend(_ context.Context, backend trino
 	}
 	f.backends[backend.Name] = backend
 	return nil
+}
+
+func (f *fakePoolGateway) PublishTenantPrincipals(_ context.Context, _, tenant string, request trinogateway.PublishPrincipalsRequest) (trinogateway.TenantAdmission, error) {
+	f.record("principals:" + tenant)
+	if request.Revision == "" || len(request.Principals) == 0 {
+		return trinogateway.TenantAdmission{}, errors.New("a binding needs a revision and at least one principal")
+	}
+	if f.principals == nil {
+		f.principals = map[string][]string{}
+	}
+	f.principals[tenant] = request.Principals
+	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
 }
 
 func (f *fakePoolGateway) ConfigurePool(_ context.Context, _ string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
@@ -238,6 +269,26 @@ func (f *fakePoolGateway) SealMember(_ context.Context, _, instanceID string, _ 
 	f.record("seal:" + instanceID)
 	member := f.members[instanceID]
 	member.Phase, member.Generation = "SEALED", member.Generation+1
+	return *member, nil
+}
+
+func (f *fakePoolGateway) SuspectMember(_ context.Context, _, instanceID string, request trinogateway.SuspectMemberRequest) (trinogateway.Member, error) {
+	f.record("suspect:" + instanceID)
+	if request.Reason == "" {
+		return trinogateway.Member{}, errors.New("a suspicion must carry a reason")
+	}
+	member := f.members[instanceID]
+	member.Phase, member.Generation = "SUSPECT", member.Generation+1
+	return *member, nil
+}
+
+func (f *fakePoolGateway) LostMember(_ context.Context, _, instanceID string, request trinogateway.LostMemberRequest) (trinogateway.Member, error) {
+	f.record("lost:" + instanceID)
+	if request.Evidence == "" || request.Termination.Source == "" {
+		return trinogateway.Member{}, errors.New("a loss claim needs termination evidence")
+	}
+	member := f.members[instanceID]
+	member.Phase, member.Generation, member.RetirementKind = "LOST", member.Generation+1, "FAILED"
 	return *member, nil
 }
 
@@ -355,13 +406,14 @@ func newOperatorHarness(t *testing.T) *operatorHarness {
 			kube:            kube.forEpoch,
 			owner:           "cp-test",
 			operatorEnabled: true,
-			validate: func(context.Context, string, int) (trinoPoolValidation, error) {
+			validate: func(_ context.Context, _ string, _ trinoPoolObservation, _ trinoPoolExpectation) (trinoPoolValidation, error) {
 				return trinoPoolValidation{
 					NodeID: "node-1", ProcessID: "process-1", CoordinatorID: "abcde",
 					AppliedRevision: 42, AuthRevision: "auth", ReadyWorkers: 4,
 					Checks: []string{trinoPoolCheckImage}, CertificateHash: "hash",
 				}, nil
 			},
+			identity: func(context.Context, string) (string, error) { return "process-1", nil },
 			newInstanceID: func() string {
 				sequence++
 				return fmt.Sprintf("%08x", sequence)
@@ -659,4 +711,163 @@ func countCalls(calls []string, prefix string) int {
 		}
 	}
 	return total
+}
+
+// ---------------------------------------------------------------------------
+// Tenant binding, failure branch and authority lifecycle.
+// ---------------------------------------------------------------------------
+
+type fakeTenantStore struct{ orgs []configstore.TrinoEnabledOrg }
+
+func (f *fakeTenantStore) ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error) {
+	return f.orgs, nil
+}
+
+func poolOrg(users ...string) configstore.TrinoEnabledOrg {
+	org := configstore.TrinoEnabledOrg{
+		OrgID: "org-a", DatabaseName: "acme",
+		CellID: "registered:cell-001", RootPasswordHash: "hash",
+	}
+	for _, username := range users {
+		org.Users = append(org.Users, configstore.TrinoOrgUser{Username: username, PasswordHash: "hash"})
+	}
+	return org
+}
+
+// With the gate on, the binding must reach the Gateway BEFORE any lifecycle
+// step: the restriction refuses work whose principal it cannot place, so a pool
+// that admitted members before publishing would deny its own tenants.
+func TestTenantBindingIsPublishedWhenTheGateIsOn(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+
+	harness.tick(t, 1)
+
+	if harness.gateway.configured == nil || !harness.gateway.configured.TenantAdmissionEnabled {
+		t.Fatal("the gate knob was not passed to the Gateway")
+	}
+	published := harness.gateway.principals["org-a"]
+	if len(published) != 2 {
+		t.Fatalf("published principals = %v, want the root login and the user", published)
+	}
+	// The bare database name is the root login and carries no separator; a gate
+	// that inferred the tenant from a dotted prefix would refuse it.
+	var sawBare bool
+	for _, principal := range published {
+		if principal == "acme" {
+			sawBare = true
+		}
+	}
+	if !sawBare {
+		t.Fatalf("published principals = %v, want the bare root login included", published)
+	}
+}
+
+// An unchanged tenant is not republished; a changed login set is, because the
+// Gateway replaces the set whole and a removed login must stop being admitted.
+func TestTenantBindingIsRepublishedOnlyWhenItChanges(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+
+	harness.tick(t, 3)
+	if count := countCalls(harness.gateway.calls, "principals:"); count != 1 {
+		t.Fatalf("published %d times for an unchanged tenant", count)
+	}
+
+	tenants.orgs = []configstore.TrinoEnabledOrg{poolOrg("analyst", "dagster")}
+	harness.tick(t, 1)
+	if count := countCalls(harness.gateway.calls, "principals:"); count != 2 {
+		t.Fatalf("a changed login set published %d times", count)
+	}
+}
+
+// With the gate off nothing is published: the pool is not making that promise.
+func TestNoTenantBindingWhenTheGateIsOff(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+
+	harness.tick(t, 2)
+	if countCalls(harness.gateway.calls, "principals:") != 0 {
+		t.Fatal("a pool with the gate off published a binding")
+	}
+}
+
+// A serving member whose coordinator is gone did NOT drain. It is excluded from
+// new work first, and only declared lost once the resources are verifiably
+// absent - a failing probe is not evidence of death.
+func TestUnhealthyMemberIsSuspectedThenLostOnlyWithEvidence(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.tick(t, 20)
+
+	instanceID := harness.store.order[0]
+	instance := harness.store.instances[instanceID]
+	instance.PhaseChangedAt = nowUTC().Add(-time.Hour)
+	harness.kube.observed.CoordinatorReady = false
+
+	harness.tick(t, 1)
+	if instance.Phase != string(trinopool.PhaseSuspect) {
+		t.Fatalf("phase = %s, want SUSPECT", instance.Phase)
+	}
+	if countCalls(harness.gateway.calls, "lost:") != 0 {
+		t.Fatal("a member was declared lost on a failing probe alone")
+	}
+
+	// Pods still present: nothing is declared and nothing is deleted.
+	harness.kube.absent = false
+	harness.kube.observed.PodsPresent = 3
+	harness.tick(t, 1)
+	if instance.Phase != string(trinopool.PhaseSuspect) {
+		t.Fatalf("phase = %s, want the member to stay SUSPECT while its pods exist", instance.Phase)
+	}
+
+	// Verified absence is the evidence.
+	harness.kube.absent = true
+	harness.kube.observed.PodsPresent = 0
+	harness.tick(t, 1)
+	if instance.Phase != string(trinopool.PhaseLost) {
+		t.Fatalf("phase = %s, want LOST once the resources are gone", instance.Phase)
+	}
+	if countCalls(harness.gateway.calls, "lost:") != 1 {
+		t.Fatal("the loss was not recorded with the Gateway")
+	}
+	// Reported as failed, never as a clean drain.
+	if countCalls(harness.gateway.calls, "seal:") != 0 {
+		t.Fatal("a lost member was sealed as if it had drained")
+	}
+}
+
+// A member excluded on suspicion returns to service when it recovers: one bad
+// minute must not retire a healthy cluster.
+func TestSuspectedMemberRecovers(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.tick(t, 20)
+
+	instanceID := harness.store.order[0]
+	instance := harness.store.instances[instanceID]
+	instance.Phase = string(trinopool.PhaseSuspect)
+
+	harness.tick(t, 1)
+	if instance.Phase != string(trinopool.PhaseServing) {
+		t.Fatalf("phase = %s, want the recovered member back in service", instance.Phase)
+	}
+}
+
+// Desired-state publication is lifecycle-affecting, so it is fenced too. A
+// read-only operator has no authority and must not write it at all.
+func TestReadOnlyOperatorDoesNotPublishDesiredState(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.operatorEnabled = false
+	harness.store.pool.DesiredReleaseID = "someone-elses-release"
+
+	harness.tick(t, 2)
+
+	if harness.store.pool.DesiredReleaseID != "someone-elses-release" {
+		t.Fatal("a read-only operator overwrote authority-owned desired state")
+	}
+	if harness.store.epoch != 0 {
+		t.Fatal("a read-only operator claimed authority")
+	}
 }

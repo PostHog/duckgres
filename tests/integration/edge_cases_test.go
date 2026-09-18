@@ -545,11 +545,11 @@ func TestUnicodeAndSpecialData(t *testing.T) {
 			val string
 		}{
 			{1, "Hello World"},
-			{2, "日本語テスト"},         // Japanese
-			{3, "中文测试"},            // Chinese
-			{4, "한국어 테스트"},         // Korean
+			{2, "日本語テスト"},           // Japanese
+			{3, "中文测试"},             // Chinese
+			{4, "한국어 테스트"},          // Korean
 			{5, "Ñoño résumé café"}, // Accented Latin
-			{6, "🎉🚀🌍"},             // Emoji
+			{6, "🎉🚀🌍"},              // Emoji
 			{7, "مرحبا"},            // Arabic
 		}
 
@@ -637,15 +637,15 @@ func TestUnicodeAndSpecialData(t *testing.T) {
 			id  int
 			val string
 		}{
-			{1, "it's a test"},            // single quote
-			{2, `he said "hello"`},        // double quote
-			{3, `back\slash`},             // backslash
-			{4, "semi;colon"},             // semicolon
-			{5, "line\nbreak"},            // newline
-			{6, "tab\there"},              // tab
-			{7, "percent%sign"},           // percent
-			{8, "under_score"},            // underscore
-			{9, "null\x00byte"},           // null byte (may be stripped)
+			{1, "it's a test"},     // single quote
+			{2, `he said "hello"`}, // double quote
+			{3, `back\slash`},      // backslash
+			{4, "semi;colon"},      // semicolon
+			{5, "line\nbreak"},     // newline
+			{6, "tab\there"},       // tab
+			{7, "percent%sign"},    // percent
+			{8, "under_score"},     // underscore
+			{9, "null\x00byte"},    // null byte (may be stripped)
 		}
 
 		for _, tc := range testCases {

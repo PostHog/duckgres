@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/trinocatalog"
 )
@@ -36,19 +37,50 @@ const (
 	envTrinoPoolCatalogWriter    = "DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED"
 	envTrinoPoolCatalogBootstrap = "DUCKGRES_TRINO_POOL_CATALOG_BOOTSTRAP"
 	envTrinoPoolCatalogDSNFile   = "DUCKGRES_TRINO_POOL_CATALOG_DSN_FILE"
-	envTrinoPoolCatalogIdentity  = "DUCKGRES_TRINO_POOL_CATALOG_WRITER_IDENTITY"
 )
 
 // trinoPoolCatalogWriter adapts the fenced publisher to the provisioner's
 // catalog client.
 type trinoPoolCatalogWriter struct {
-	publisher *trinocatalog.Publisher
-	db        *sql.DB
-	cellID    string
+	db     *sql.DB
+	cellID string
+	// authority returns the pool lease this control plane currently holds. The
+	// catalog writer fence is the SAME authority as the operator's: the writer
+	// epoch is the pool's authority epoch and the writer identity is the
+	// per-process owner. Building the publisher per call, rather than once at
+	// startup, is what makes that true - a process that has not won the pool
+	// cannot write catalogs, and a superseded one stops being able to.
+	authority func() (configstore.TrinoPoolLease, bool)
 	// nodes is the live coordinator client. The catalog store knows nothing
 	// about cluster membership, and inventing an answer here would make the
 	// provisioner's readiness check meaningless.
 	nodes provisioner.TrinoCatalogClient
+}
+
+// publisher builds a fenced publisher for the CURRENT authority. It refuses
+// when this process holds no lease, so an unelected or superseded replica
+// cannot publish at all.
+func (w *trinoPoolCatalogWriter) publisher() (*trinocatalog.Publisher, error) {
+	lease, ok := w.authority()
+	if !ok || lease.Epoch < 1 {
+		return nil, fmt.Errorf("%w: this control plane does not hold the pool authority", trinocatalog.ErrNotWriter)
+	}
+	return trinocatalog.NewPublisher(w.db, w.cellID, lease.Owner, lease.Epoch)
+}
+
+// ClaimWriter takes the catalog store's writer fence for the lease the operator
+// just acquired. It is called once per leadership term, not at startup: the
+// claim has to follow the pool authority, or every replica would claim the cell
+// on boot and the fence would distinguish nothing.
+func (w *trinoPoolCatalogWriter) ClaimWriter(ctx context.Context) error {
+	publisher, err := w.publisher()
+	if err != nil {
+		return err
+	}
+	if _, err := publisher.Takeover(ctx); err != nil {
+		return fmt.Errorf("claim catalog writer: %w", err)
+	}
+	return nil
 }
 
 func (w *trinoPoolCatalogWriter) ListNodes(ctx context.Context) ([]provisioner.TrinoNode, error) {
@@ -109,21 +141,53 @@ func (w *trinoPoolCatalogWriter) DropCatalog(ctx context.Context, name string) e
 // instead of publishing twice. A CHANGED intent is a different operation, which
 // is what advances the revision.
 func (w *trinoPoolCatalogWriter) publish(ctx context.Context, mutation trinocatalog.Mutation) error {
-	mutation.OperationID = "catalog." + mutation.CatalogName + "." + mutation.PayloadHash()[:32]
-	result, err := w.publisher.Apply(ctx, mutation)
-	if err == nil {
-		_ = result
-		return nil
+	// The operation id includes the revision the store is at RIGHT NOW, not
+	// only the intent's content.
+	//
+	// Content alone was wrong in a way that silently lost a catalog: create X,
+	// drop X, then create X again with identical properties produced the same
+	// operation id as the first create, hit the journal, and returned the old
+	// revision without writing anything - so the recreated catalog was never
+	// republished and no coordinator ever saw it again. Including the current
+	// revision makes each of those three intents its own operation, while an
+	// immediate retry of the SAME intent (nothing else committed in between)
+	// still resolves as a replay.
+	publisher, err := w.publisher()
+	if err != nil {
+		return err
 	}
-	// A lost COMMIT leaves an UNKNOWN outcome. Resolve it from the journal
-	// under the same operation id rather than retrying blind, which could
-	// publish twice, or compensating with a drop, which could delete a live
-	// catalog.
-	resolved, resolveErr := w.publisher.ResolveOperation(ctx, mutation.OperationID)
+	state, err := publisher.State(ctx)
+	if err != nil {
+		return fmt.Errorf("read catalog writer state: %w", err)
+	}
+	mutation.OperationID = fmt.Sprintf("catalog.%s.r%d.%s", mutation.CatalogName, state.Revision, mutation.PayloadHash()[:16])
+
+	if _, err := publisher.Apply(ctx, mutation); err == nil {
+		return nil
+	} else if isTerminalPublishError(err) {
+		// A fence refusal or a changed intent is a decision, not an unknown
+		// outcome. Resolving it against the journal would report somebody
+		// else's row as this call's success.
+		return err
+	}
+
+	// Anything else may be a lost COMMIT, whose outcome is UNKNOWN. Resolve it
+	// from the journal under the same operation id rather than retrying blind,
+	// which could publish twice, or compensating with a drop, which could
+	// delete a live catalog.
+	resolved, resolveErr := publisher.ResolveOperation(ctx, mutation.OperationID)
 	if resolveErr == nil && resolved != nil {
 		return nil
 	}
 	return err
+}
+
+// isTerminalPublishError reports an outcome the publisher DECIDED, as opposed
+// to one it never got to observe.
+func isTerminalPublishError(err error) bool {
+	return errors.Is(err, trinocatalog.ErrFenced) ||
+		errors.Is(err, trinocatalog.ErrNotWriter) ||
+		errors.Is(err, trinocatalog.ErrIntentChanged)
 }
 
 // connectorProperties strips the connector name, which the store keeps in its
@@ -146,7 +210,7 @@ func connectorProperties(properties map[string]string) map[string]string {
 // The DSN is read from a file rather than an environment variable because it
 // carries the publisher credential, which infra provisions separately from the
 // coordinators' read-only reader role.
-func buildTrinoPoolCatalogWriter(cellID string, epoch int64, nodes provisioner.TrinoCatalogClient) (*trinoPoolCatalogWriter, error) {
+func buildTrinoPoolCatalogWriter(cellID string, authority func() (configstore.TrinoPoolLease, bool), nodes provisioner.TrinoCatalogClient) (*trinoPoolCatalogWriter, error) {
 	enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolCatalogWriter)))
 	if err != nil || !enabled {
 		return nil, nil
@@ -159,7 +223,10 @@ func buildTrinoPoolCatalogWriter(cellID string, epoch int64, nodes provisioner.T
 	if err != nil {
 		return nil, fmt.Errorf("read catalog writer credential: %w", err)
 	}
-	db, err := sql.Open("postgres", strings.TrimSpace(string(raw)))
+	// pgx, not "postgres": lib/pq is not linked into the control-plane binary,
+	// so sql.Open("postgres", ...) fails at startup with `unknown driver`. The
+	// rest of the control plane registers pgx (see storage_meter.go).
+	db, err := sql.Open("pgx", strings.TrimSpace(string(raw)))
 	if err != nil {
 		return nil, fmt.Errorf("open catalog store: %w", err)
 	}
@@ -167,30 +234,22 @@ func buildTrinoPoolCatalogWriter(cellID string, epoch int64, nodes provisioner.T
 	// cell's writer row anyway.
 	db.SetMaxOpenConns(4)
 
-	identity := strings.TrimSpace(os.Getenv(envTrinoPoolCatalogIdentity))
-	if identity == "" {
-		identity = "duckgres-control-plane"
-	}
-	publisher, err := trinocatalog.NewPublisher(db, cellID, identity, epoch)
-	if err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("configure catalog publisher: %w", err)
-	}
+	writer := &trinoPoolCatalogWriter{db: db, cellID: cellID, authority: authority, nodes: nodes}
+
 	if bootstrap, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolCatalogBootstrap))); bootstrap {
 		// Somebody has to create the additive tables, because a managed-reader
 		// coordinator runs no DDL at all. It is explicit so a deployment that
-		// has not split its database grants yet cannot do it by accident.
-		if err := publisher.EnsureSchema(context.Background()); err != nil {
+		// has not split its database grants yet cannot do it by accident. This
+		// is additive DDL only and takes no fence, because it publishes nothing.
+		schema, err := trinocatalog.NewPublisher(db, cellID, "duckgres-bootstrap", 1)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("configure catalog bootstrap: %w", err)
+		}
+		if err := schema.EnsureSchema(context.Background()); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("bootstrap catalog store: %w", err)
 		}
 	}
-	// Claiming the cell is explicit and serialized: it locks the same row a
-	// mutation locks, so an in-flight write by a previous publisher either
-	// commits first or fails its fence check.
-	if _, err := publisher.Takeover(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("claim catalog writer: %w", err)
-	}
-	return &trinoPoolCatalogWriter{publisher: publisher, db: db, cellID: cellID, nodes: nodes}, nil
+	return writer, nil
 }

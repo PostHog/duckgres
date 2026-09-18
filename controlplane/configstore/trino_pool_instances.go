@@ -63,8 +63,8 @@ func (cs *ConfigStore) CreateTrinoPoolInstance(ctx context.Context, lease TrinoP
 			PhaseChangedAt:    time.Now().UTC(),
 			OwnerEpoch:        lease.Epoch,
 			Repair:            spec.Repair,
+			RepairFor:         spec.RepairFor,
 			EndpointURL:       spec.EndpointURL,
-			TLSServerName:     spec.TLSServerName,
 			ValidationReceipt: "{}",
 			RetirementReceipt: "{}",
 		}

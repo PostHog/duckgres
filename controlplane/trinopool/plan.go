@@ -49,7 +49,11 @@ type Plan struct {
 	Action     PlanAction
 	InstanceID string
 	Repair     bool
-	Reason     string
+	// RepairFor names the failed instance a repair replaces. The Gateway
+	// charges an activation to the repair budget only when it is set, so a
+	// repair without it silently spends the single planned surge instead.
+	RepairFor string
+	Reason    string
 }
 
 // PlanNext decides the one step to take. The order of the rules is the
@@ -77,8 +81,8 @@ func PlanNext(state PoolState) Plan {
 			continue
 		}
 		live++
-		switch {
-		case instance.Phase == PhaseSuspect || instance.Phase == PhaseLost:
+		switch instance.Phase {
+		case PhaseSuspect, PhaseLost:
 			// Still holds a pod, but cannot be counted on to serve.
 		default:
 			healthy++
@@ -113,7 +117,11 @@ func PlanNext(state PoolState) Plan {
 		if live >= state.DesiredInstances+state.MaxSurge+state.MaxRepair {
 			return Plan{Action: PlanActionNone, Reason: "capacity is short but no live compute slot is free; investigate the failed instances"}
 		}
-		return Plan{Action: PlanActionCreate, Repair: true, Reason: "restoring capacity lost to a failed instance"}
+		return Plan{
+			Action: PlanActionCreate, Repair: true,
+			RepairFor: repairTarget(state),
+			Reason:    "restoring capacity lost to a failed instance",
+		}
 	}
 
 	// 3. One lifecycle operation at a time.
@@ -173,4 +181,29 @@ func blockedReason(base, detail string) string {
 		return base
 	}
 	return base + ": " + detail
+}
+
+// repairTarget picks the instance a repair replaces: a PROVEN failure first,
+// because a SUSPECT member may still recover and charging the repair budget for
+// it would spend a budget on a member that never failed. Oldest first, so the
+// choice is stable across leaders.
+func repairTarget(state PoolState) string {
+	var suspect string
+	var lost string
+	for _, instance := range state.Instances {
+		switch instance.Phase {
+		case PhaseLost:
+			if lost == "" || instance.ID < lost {
+				lost = instance.ID
+			}
+		case PhaseSuspect:
+			if suspect == "" || instance.ID < suspect {
+				suspect = instance.ID
+			}
+		}
+	}
+	if lost != "" {
+		return lost
+	}
+	return suspect
 }

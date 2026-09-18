@@ -207,6 +207,14 @@ func (p *Publisher) Takeover(ctx context.Context) (State, error) {
 		if current.WriterEpoch > p.epoch {
 			return fmt.Errorf("%w: recorded epoch %d is newer than %d", ErrFenced, current.WriterEpoch, p.epoch)
 		}
+		// An EQUAL epoch held by a different identity is not a takeover, it is a
+		// collision: two writers believe they are the same authority. Letting the
+		// second one overwrite the identity silently would leave both passing the
+		// mutation fence, which is exactly the ambiguity the identity check
+		// exists to remove. Only a strictly higher epoch may claim the cell.
+		if current.WriterEpoch == p.epoch && current.Identity != "" && current.Identity != p.identity {
+			return fmt.Errorf("%w: epoch %d is already held by %q", ErrFenced, current.WriterEpoch, current.Identity)
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE trino_catalog_writer_state SET writer_epoch = $2, writer_identity = $3, updated_at = now() WHERE cell_id = $1`,
 			p.cellID, p.epoch, p.identity); err != nil {
