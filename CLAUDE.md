@@ -740,6 +740,24 @@ Invariants for anyone touching this path:
   + the `__default_*`/`duckgres_*` prefixes, which activation re-creates). It
   MUST run before replay on every CreateSession in shared-warm mode, and a
   wipe failure MUST fail the session.
+- **Client-ATTACHed catalogs get the same treatment, in the same place.**
+  `detachUserCatalogs` (`duckdbservice/user_catalogs.go`) runs right after the
+  secrets wipe on every shared-warm CreateSession and a failure MUST fail the
+  session (best-effort again at DestroySession). Attached databases are
+  instance-global exactly like secrets, and an attached catalog freezes its
+  connection string — credentials included — at ATTACH time, so it outlives
+  the wipe of the secret it was built from: without the detach, user B can
+  query user A's attached Postgres without ever holding A's credential. It is
+  also a correctness bug, not just isolation: clients attach with
+  `ATTACH IF NOT EXISTS ... AS db`, a no-op when the previous session left a
+  `db` behind, so the new session silently reads the PREVIOUS session's target
+  (2026-09-18: a tenant's sqlmesh run inherited an analyst's `db` endpoint and
+  its parallel postgres scans died with `SET TRANSACTION SNAPSHOT ... snapshot
+  does not exist`). Preserved: DuckDB-internal catalogs, the instance's primary
+  database (resolved by lowest oid — it is a file stem, not `memory`, when
+  DataDir is set), and the `isSystemCatalog` allowlist (`ducklake`, `delta`,
+  `__ducklake_metadata_*`). **A new worker-managed ATTACH must be added to that
+  allowlist** or the next session create will detach it.
 - **Execute-then-persist ordering.** Persist only statements DuckDB accepted;
   a store failure after a successful exec is an ERROR telling the user the
   secret will NOT survive the session. Replay failures at session create are
@@ -762,10 +780,11 @@ Invariants for anyone touching this path:
   `usersecrets.RedactErrorForLog(query, errMsg)` guards those error sinks
   (`logQueryError`, `logQuery`); keep new error logging behind it too, and pass
   the original (un-redacted) query so it can classify.
-- Touching the interception, wipe/replay, or payload shape → update
-  `server/conn_user_secrets_test.go`, `duckdbservice/user_secrets_test.go`,
-  and the `persistent_user_secret`(+`_isolation`) assertions in
-  `tests/mw-dev/e2e/harness.sh`.
+- Touching the interception, wipe/replay, catalog detach, or payload shape →
+  update `server/conn_user_secrets_test.go`,
+  `duckdbservice/user_secrets_test.go`, `duckdbservice/user_catalogs_test.go`,
+  and the `persistent_user_secret`(+`_isolation`, which also carries the
+  attached-catalog leak check) assertions in `tests/mw-dev/e2e/harness.sh`.
 
 ## Admin Console (VPC-private web UI, `kubernetes` tag)
 

@@ -2548,11 +2548,28 @@ persistent_user_secret_isolation() { # org rootpw
   # TEMPORARY secret left behind on the instance-global worker DuckDB.
   n="$(pg "$org" "$u2pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$tname'" "$u2")"
   [ "$n" = "0" ] || fail "user secret: user $u2 sees root's TEMPORARY secret — cross-user leak (count=$n)"
+  # Same leak path for client-ATTACHed catalogs, which are instance-global too
+  # and keep the credentials they were attached with. Regression for the
+  # 2026-09-18 incident: one session's `ATTACH ... AS db` survived on the
+  # hot-idle worker, the next session's `ATTACH IF NOT EXISTS ... AS db` was a
+  # no-op, and it silently queried the PREVIOUS session's target. Root leaves a
+  # catalog holding a marker table; $u2's IF NOT EXISTS attach under the same
+  # alias must come up EMPTY (a fresh catalog), not inherit root's. Both sides
+  # are pinning statements, so they land on the org's standard worker rather
+  # than being split across the exploratory tier. In-memory catalogs keep the
+  # check free of external dependencies; the name carries no digits so the
+  # result survives the command-tag noise psql prints for the ATTACH.
+  pg "$org" "$pw" ducklake "ATTACH ':memory:' AS leakcat; CREATE TABLE leakcat.main.marker AS SELECT 42 AS x" >/dev/null
+  n="$(pg "$org" "$u2pw" ducklake "ATTACH IF NOT EXISTS ':memory:' AS leakcat; SELECT count(*) FROM duckdb_tables() WHERE database_name = 'leakcat'" "$u2" | tr -dc '0-9')"
+  [ "$n" = "0" ] || fail "user catalog: user $u2 inherited root's attached catalog — cross-session ATTACH leak (tables=$n)"
+  # And within one user: root's NEXT session must not see its own stale attach.
+  n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_databases() WHERE database_name = 'leakcat'" | tr -dc '0-9')"
+  [ "$n" = "0" ] || fail "user catalog: attached catalog survived into root's next session (count=$n)"
   # Root's stored (persistent) copy must be unaffected by $u2's session-create wipe.
   n="$(pg "$org" "$pw" ducklake "SELECT count(*) FROM duckdb_secrets() WHERE name = '$sname'")"
   [ "$n" = "1" ] || fail "user secret: root's persistent secret lost after $u2's session (count=$n)"
   pg "$org" "$pw" ducklake "DROP PERSISTENT SECRET $sname" >/dev/null
-  log "user secret isolation OK on $org ($u2 blind to root's persistent AND temporary secrets; root's stored copy intact)"
+  log "user secret isolation OK on $org ($u2 blind to root's persistent AND temporary secrets AND attached catalogs; root's stored copy intact)"
 }
 
 # ---- resilience -----------------------------------------------------------

@@ -1257,6 +1257,22 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 		if len(wiped) > 0 {
 			slog.Info("Wiped user secrets left by previous session.", "user", username, "count", len(wiped))
 		}
+		// Same isolation step for client-ATTACHed databases: they are
+		// instance-global too, and an attached catalog keeps the credentials
+		// it was built from even after the secret above is gone. Mandatory for
+		// the same reason as the wipe — see detachUserCatalogs.
+		detached, detachErr := detachUserCatalogs(secretCtx, conn)
+		if detachErr != nil {
+			secretCancel()
+			_ = conn.Close()
+			p.mu.Lock()
+			p.reserved--
+			p.mu.Unlock()
+			return nil, nil, fmt.Errorf("detach user catalogs before session start: %w", detachErr)
+		}
+		if len(detached) > 0 {
+			slog.Info("Detached user catalogs left by previous session.", "user", username, "count", len(detached), "catalogs", detached)
+		}
 		secretWarnings = replayUserSecrets(secretCtx, conn, username, secretStatements)
 		secretCancel()
 	}
@@ -1452,6 +1468,11 @@ func (p *SessionPool) DestroySession(token string) error {
 		wipeCtx, wipeCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
 		if _, err := wipeUserSecrets(wipeCtx, session.DB); err != nil {
 			log.Warn("Failed to wipe user secrets on session destroy.", "user", session.Username, "error", err)
+		}
+		// Likewise for client-ATTACHed databases, which carry their own copy
+		// of the credentials. Best-effort here; mandatory at CreateSession.
+		if _, err := detachUserCatalogs(wipeCtx, session.DB); err != nil {
+			log.Warn("Failed to detach user catalogs on session destroy.", "user", session.Username, "error", err)
 		}
 		wipeCancel()
 	}
