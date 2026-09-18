@@ -275,14 +275,24 @@ type TrinoPoolPublication struct {
 	// They are durable rather than remembered in the leader's memory: a
 	// restart or a leadership move would otherwise either republish blindly or
 	// assume an admission that never happened.
-	PrincipalRevision      string    `gorm:"column:principal_revision"`
-	TargetRevision         string    `gorm:"column:target_revision"`
-	AdmittedTargetRevision string    `gorm:"column:admitted_target_revision"`
-	State                  string    `gorm:"column:state"`
-	GatewayReceipt         string    `gorm:"column:gateway_receipt;type:jsonb"`
-	LastError              string    `gorm:"column:last_error"`
-	CreatedAt              time.Time `gorm:"column:created_at"`
-	UpdatedAt              time.Time `gorm:"column:updated_at"`
+	PrincipalRevision      string `gorm:"column:principal_revision"`
+	TargetRevision         string `gorm:"column:target_revision"`
+	AdmittedTargetRevision string `gorm:"column:admitted_target_revision"`
+	// Attempt is a monotone occurrence counter. It is part of every durable
+	// step identity this tenant's barrier and revocations use, so a reopened
+	// barrier - or a second revocation after the tenant was re-enabled - is a
+	// new operation rather than a replay that returns the first one's outcome.
+	Attempt int64 `gorm:"column:attempt"`
+	// Attempts and NextAttemptAt are this tenant's own durable backoff. The
+	// driver takes one tenant at a time, so without them a permanently failing
+	// warehouse is retried every tick and starves every tenant behind it.
+	Attempts       int64      `gorm:"column:attempts"`
+	NextAttemptAt  *time.Time `gorm:"column:next_attempt_at"`
+	State          string     `gorm:"column:state"`
+	GatewayReceipt string     `gorm:"column:gateway_receipt;type:jsonb"`
+	LastError      string     `gorm:"column:last_error"`
+	CreatedAt      time.Time  `gorm:"column:created_at"`
+	UpdatedAt      time.Time  `gorm:"column:updated_at"`
 }
 
 func (TrinoPoolPublication) TableName() string { return "duckgres_trino_pool_publications" }

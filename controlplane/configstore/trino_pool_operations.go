@@ -322,6 +322,75 @@ func (cs *ConfigStore) RecordTrinoPoolPublicationOpen(ctx context.Context, lease
 	})
 }
 
+// BeginTrinoPoolPublicationAttempt bumps a tenant's occurrence counter and
+// returns the new value.
+//
+// Every durable step identity for that tenant carries it, so an attempt that
+// follows an abandoned barrier - or a second revocation after the tenant was
+// re-enabled - is a NEW operation. Reusing the identity would replay the first
+// attempt's recorded outcome and leave the current intent unapplied, which for
+// a revocation means a tenant nobody revoked stays admitted.
+func (cs *ConfigStore) BeginTrinoPoolPublicationAttempt(ctx context.Context, lease TrinoPoolLease, poolID, orgID string) (int64, error) {
+	if orgID == "" {
+		return 0, errors.New("a publication attempt requires an org")
+	}
+	if poolID != lease.PoolID {
+		return 0, fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	var attempt int64
+	err := cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Raw(`
+			INSERT INTO duckgres_trino_pool_publications (pool_id, org_id, attempt, state, gateway_receipt)
+			VALUES (?, ?, 1, ?, '{}')
+			ON CONFLICT (pool_id, org_id) DO UPDATE SET
+				attempt = duckgres_trino_pool_publications.attempt + 1,
+				updated_at = now()
+			RETURNING attempt`,
+			poolID, orgID, TrinoPublicationPending).Scan(&attempt).Error
+	})
+	return attempt, err
+}
+
+// RecordTrinoPoolPublicationFailure records a tenant's failed attempt and the
+// wait it earned, so one unserviceable warehouse cannot busy-loop or starve the
+// tenants the driver would otherwise reach after it.
+func (cs *ConfigStore) RecordTrinoPoolPublicationFailure(ctx context.Context, lease TrinoPoolLease, poolID, orgID string, nextAttemptAt time.Time, lastError string) error {
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Exec(`
+			INSERT INTO duckgres_trino_pool_publications
+				(pool_id, org_id, attempts, next_attempt_at, last_error, state, gateway_receipt)
+			VALUES (?, ?, 1, ?, ?, ?, '{}')
+			ON CONFLICT (pool_id, org_id) DO UPDATE SET
+				attempts = duckgres_trino_pool_publications.attempts + 1,
+				next_attempt_at = EXCLUDED.next_attempt_at,
+				last_error = EXCLUDED.last_error,
+				updated_at = now()`,
+			poolID, orgID, nextAttemptAt.UTC(), lastError, TrinoPublicationPending).Error
+	})
+}
+
+// ClearTrinoPoolPublicationFailure clears a tenant's backoff after a step that
+// worked, so a tenant that recovers is not held behind a wait it no longer
+// deserves.
+func (cs *ConfigStore) ClearTrinoPoolPublicationFailure(ctx context.Context, lease TrinoPoolLease, poolID, orgID string) error {
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Model(&TrinoPoolPublication{}).
+			Where("pool_id = ? AND org_id = ? AND (attempts > 0 OR next_attempt_at IS NOT NULL)", poolID, orgID).
+			Updates(map[string]any{
+				"attempts":        0,
+				"next_attempt_at": nil,
+				"last_error":      "",
+				"updated_at":      time.Now().UTC(),
+			}).Error
+	})
+}
+
 // RecordTrinoPoolPublicationCommitted checkpoints a COMMITTED barrier.
 //
 // The Gateway's record is authoritative from the moment it commits, so this is

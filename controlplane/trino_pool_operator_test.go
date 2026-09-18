@@ -204,6 +204,7 @@ type fakePoolGateway struct {
 	drainErr     error
 	admitErr     error
 	membership   int64
+	principalErr map[string]error
 	publications map[string]*fakePublication
 	admitted     map[string]string
 	revoked      map[string]bool
@@ -231,6 +232,9 @@ func (f *fakePoolGateway) EnsureInactiveBackend(_ context.Context, backend trino
 
 func (f *fakePoolGateway) PublishTenantPrincipals(_ context.Context, _, tenant string, request trinogateway.PublishPrincipalsRequest) (trinogateway.TenantAdmission, error) {
 	f.record("principals:" + tenant)
+	if err := f.principalErr[tenant]; err != nil {
+		return trinogateway.TenantAdmission{}, err
+	}
 	if request.Revision == "" || len(request.Principals) == 0 {
 		return trinogateway.TenantAdmission{}, errors.New("a binding needs a revision and at least one principal")
 	}
@@ -1437,6 +1441,21 @@ func (f *fakePoolGateway) OpenPublication(_ context.Context, _ string, request t
 	return f.publicationView(publication), nil
 }
 
+func (f *fakePoolGateway) AbandonPublication(_ context.Context, _, publicationID string, _ trinogateway.Step) (trinogateway.Publication, error) {
+	f.record("abandon:" + publicationID)
+	publication, found := f.publications[publicationID]
+	if !found {
+		return trinogateway.Publication{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, publicationID)
+	}
+	// An admitted gate is never retracted by abandoning it: the Gateway refuses,
+	// and the caller reads it back as ADMITTED.
+	if publication.Phase == "ADMITTED" {
+		return trinogateway.Publication{}, fmt.Errorf("%w: a committed publication cannot be abandoned", trinogateway.ErrIrreversible)
+	}
+	publication.Phase = "ABANDONED"
+	return f.publicationView(publication), nil
+}
+
 func (f *fakePoolGateway) GetPublication(_ context.Context, _, publicationID string) (trinogateway.Publication, error) {
 	publication, found := f.publications[publicationID]
 	if !found {
@@ -1569,6 +1588,26 @@ func (f *fakePublicationStore) RecordTrinoPoolTenantRevoked(_ context.Context, _
 	row := f.row(poolID, orgID)
 	row.State, row.LastError = configstore.TrinoPublicationRevoked, reason
 	row.AdmittedTargetRevision, row.TargetRevision, row.PublicationID = "", "", ""
+	return nil
+}
+
+func (f *fakePublicationStore) BeginTrinoPoolPublicationAttempt(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID string) (int64, error) {
+	row := f.row(poolID, orgID)
+	row.Attempt++
+	return row.Attempt, nil
+}
+
+func (f *fakePublicationStore) RecordTrinoPoolPublicationFailure(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID string, nextAttemptAt time.Time, lastError string) error {
+	row := f.row(poolID, orgID)
+	row.Attempts++
+	next := nextAttemptAt
+	row.NextAttemptAt, row.LastError = &next, lastError
+	return nil
+}
+
+func (f *fakePublicationStore) ClearTrinoPoolPublicationFailure(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID string) error {
+	row := f.row(poolID, orgID)
+	row.Attempts, row.NextAttemptAt, row.LastError = 0, nil, ""
 	return nil
 }
 
@@ -1823,5 +1862,227 @@ func TestSuspectDrainRespectsTheServingFloor(t *testing.T) {
 
 	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseSuspect) {
 		t.Fatalf("instance phase = %s, want it to stay SUSPECT after a refused drain", phase)
+	}
+}
+
+// poolOrgs builds a fleet of tenants, each with its own root login.
+func poolOrgs(count int) []configstore.TrinoEnabledOrg {
+	orgs := make([]configstore.TrinoEnabledOrg, 0, count)
+	for i := 0; i < count; i++ {
+		orgs = append(orgs, configstore.TrinoEnabledOrg{
+			OrgID:            fmt.Sprintf("org-%04d", i),
+			DatabaseName:     fmt.Sprintf("acme%04d", i),
+			CellID:           "registered:cell-001",
+			RootPasswordHash: "hash",
+		})
+	}
+	return orgs
+}
+
+// admitAll drives the barrier until every tenant is admitted, or gives up.
+func (h *operatorHarness) admitAll(t *testing.T, tenants int) {
+	t.Helper()
+	for tick := 0; tick < tenants*8+64; tick++ {
+		h.tickTolerant(1)
+		admitted := 0
+		for _, row := range h.publications.rows {
+			if row.State == configstore.TrinoPublicationAdmitted {
+				admitted++
+			}
+		}
+		if admitted == tenants {
+			return
+		}
+	}
+	t.Fatalf("not every tenant was admitted after many ticks")
+}
+
+// A new warehouse must not wait behind a re-admission of every existing one.
+//
+// The driver performs ONE external step per five-second tick, so a target that
+// expired for the whole fleet whenever anything changed anywhere would have put
+// a new tenant hours behind thousands of pointless re-admissions. A tenant's
+// intent is its own: its principals, under its own attempt.
+func TestANewTenantDoesNotWaitForTheWholeFleetToBeReadmitted(t *testing.T) {
+	const existing = 1000
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: poolOrgs(existing)}
+	harness.operator.tenants = tenants
+	harness.servingPool(t)
+
+	// A fleet that is already admitted, as the durable record would hold it
+	// after those tenants were provisioned.
+	for _, org := range tenants.orgs {
+		binding := trinoPoolTenantBindingFor(org)
+		row := harness.publications.row(harness.operator.config.PoolID, org.OrgID)
+		row.Attempt = 1
+		row.PrincipalRevision = binding.Revision
+		row.TargetRevision = harness.operator.targetRevisionFor(binding, *row)
+		row.AdmittedTargetRevision = row.TargetRevision
+		row.State = configstore.TrinoPublicationAdmitted
+	}
+
+	// Something changes that moves the pool's catalog revision and the whole
+	// projection - exactly what provisioning a new warehouse does.
+	harness.store.pool.PublicationRevision++
+	harness.operator.projection = func() trinoPoolProjectionRevisions {
+		return trinoPoolProjectionRevisions{Policy: "policy-2", Password: "password-2", Group: "group-2"}
+	}
+	newcomer := poolOrgs(existing + 1)[existing]
+	tenants.orgs = append(tenants.orgs, newcomer)
+	harness.gateway.calls = nil
+
+	// The newcomer is admitted within a handful of steps: publish its binding,
+	// open, one receipt per serving member, commit.
+	steps := 0
+	for ; steps < 64; steps++ {
+		harness.tickTolerant(1)
+		if harness.gateway.admitted[newcomer.OrgID] != "" {
+			break
+		}
+	}
+	if harness.gateway.admitted[newcomer.OrgID] == "" {
+		t.Fatalf("the new tenant was not admitted in %d steps", steps)
+	}
+	// And nothing re-admitted the existing fleet to get there.
+	commits := countGatewayCalls(harness.gateway.calls, "commit:")
+	if commits > 2 {
+		t.Fatalf("%d publications committed to admit one new tenant; the fleet was being re-admitted", commits)
+	}
+}
+
+// A tenant whose publication always fails must not hold the queue. The driver
+// rotates and honours each tenant's durable backoff, so its neighbours still
+// get admitted.
+func TestAFailingTenantDoesNotStarveTheOthers(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	orgs := poolOrgs(3)
+	harness.operator.tenants = &fakeTenantStore{orgs: orgs}
+	// The first tenant in order can never be published - from the start, so it
+	// is never admitted and keeps failing.
+	broken := orgs[0].OrgID
+	harness.gateway.principalErr = map[string]error{broken: errors.New("principal conflict")}
+	// The ticks that bring the pool up already carry the failing tenant, which
+	// is the point: its failure must not stop them either.
+	harness.tickTolerant(12)
+
+	for tick := 0; tick < 80; tick++ {
+		harness.tickTolerant(1)
+	}
+
+	for _, org := range orgs[1:] {
+		if harness.gateway.admitted[org.OrgID] == "" {
+			t.Fatalf("tenant %s was starved by the failing tenant %s: %v", org.OrgID, broken, harness.gateway.calls)
+		}
+	}
+	if row := harness.publications.rows[broken]; row == nil || row.Attempts == 0 || row.NextAttemptAt == nil {
+		t.Fatalf("the failing tenant recorded no durable backoff: %+v", row)
+	}
+}
+
+// A tenant that is revoked, re-enabled and revoked again needs a NEW durable
+// occurrence. A constant step identity would replay the FIRST revocation's
+// recorded outcome, leaving a tenant everybody believes is revoked admitted and
+// dispatchable.
+func TestASecondRevocationIsItsOwnOccurrence(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: poolOrgs(1)}
+	harness.operator.tenants = tenants
+	org := tenants.orgs[0].OrgID
+	harness.servingPool(t)
+	harness.admitAll(t, 1)
+
+	all := tenants.orgs
+	tenants.orgs = nil
+	harness.tickTolerant(3)
+	if !harness.gateway.revoked[org] {
+		t.Fatalf("the tenant was not revoked: %v", harness.gateway.calls)
+	}
+	firstRevoke := harness.publications.rows[org].Attempt
+
+	// Re-enabled: published and admitted again.
+	tenants.orgs = all
+	harness.admitAll(t, 1)
+	if harness.gateway.admitted[org] == "" {
+		t.Fatal("the re-enabled tenant was not admitted again")
+	}
+
+	// Revoked a second time.
+	tenants.orgs = nil
+	harness.gateway.revoked = map[string]bool{}
+	harness.tickTolerant(3)
+	if !harness.gateway.revoked[org] {
+		t.Fatalf("the second revocation never happened: %v", harness.gateway.calls)
+	}
+	if second := harness.publications.rows[org].Attempt; second <= firstRevoke {
+		t.Fatalf("the second revocation reused occurrence %d (first was %d)", second, firstRevoke)
+	}
+}
+
+// Membership changes during a rollout. An attempt opened against the old
+// membership can never commit, and while it is open a joining member cannot be
+// admitted - the cycle where the commit waits for a replacement the barrier
+// itself refuses. The attempt is abandoned and a new one is opened.
+func TestBarrierReopensWhenMembershipChanges(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: poolOrgs(1)}
+	harness.operator.tenants = tenants
+	org := tenants.orgs[0].OrgID
+	harness.servingPool(t)
+
+	// Get as far as an open barrier with at least one receipt.
+	for tick := 0; tick < 8 && countGatewayCalls(harness.gateway.calls, "receipt:") == 0; tick++ {
+		harness.tickTolerant(1)
+	}
+	if countGatewayCalls(harness.gateway.calls, "open:") == 0 {
+		t.Fatalf("no barrier was opened: %v", harness.gateway.calls)
+	}
+	firstAttempt := harness.publications.rows[org].Attempt
+
+	// The membership moves under it, as a replacement does.
+	harness.gateway.membership++
+	harness.gateway.calls = nil
+	harness.tickTolerant(2)
+
+	if countGatewayCalls(harness.gateway.calls, "abandon:") == 0 {
+		t.Fatalf("the stale attempt was not abandoned: %v", harness.gateway.calls)
+	}
+	if next := harness.publications.rows[org].Attempt; next <= firstAttempt {
+		t.Fatalf("no new attempt was started (attempt %d, was %d)", next, firstAttempt)
+	}
+
+	// And it converges: the tenant is admitted against the current membership.
+	harness.admitAll(t, 1)
+	if harness.gateway.admitted[org] == "" {
+		t.Fatalf("the tenant never recovered after the membership change: %v", harness.gateway.calls)
+	}
+}
+
+// One unserviceable tenant must not stop the pool's compute lifecycle: a
+// warehouse that can never be published used to end the tick before any
+// instance was repaired, drained or replaced.
+func TestAFailingTenantDoesNotBlockInstanceProgress(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: poolOrgs(1)}
+	harness.gateway.principalErr = map[string]error{"org-0000": errors.New("principal conflict")}
+
+	// The pool still reaches its desired instance count.
+	for tick := 0; tick < 40; tick++ {
+		harness.tickTolerant(1)
+	}
+	serving := 0
+	for _, instance := range harness.store.instances {
+		if instance.Phase == string(trinopool.PhaseServing) {
+			serving++
+		}
+	}
+	if serving != harness.store.pool.DesiredInstances {
+		t.Fatalf("%d serving instances with a failing tenant, want %d: the tenant blocked the lifecycle",
+			serving, harness.store.pool.DesiredInstances)
 	}
 }

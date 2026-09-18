@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	cpconfigstore "github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinopool"
@@ -549,5 +550,76 @@ func TestTenantPublicationRecordsBindingAndAdmission(t *testing.T) {
 	stale.Epoch--
 	if err := store.RecordTrinoPoolTenantPrincipals(ctx, stale, poolID, "org-a", "binding-2"); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
 		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
+	}
+}
+
+// A tenant's occurrence counter is what makes its NEXT barrier - or its next
+// revocation - a new operation. Sharing an identity with the previous one would
+// replay that one's recorded outcome, which for a revocation means a tenant
+// nobody revoked stays admitted.
+func TestPublicationAttemptsAreMonotonePerTenant(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	first, err := store.BeginTrinoPoolPublicationAttempt(ctx, lease, poolID, "org-a")
+	if err != nil {
+		t.Fatalf("begin attempt: %v", err)
+	}
+	second, err := store.BeginTrinoPoolPublicationAttempt(ctx, lease, poolID, "org-a")
+	if err != nil {
+		t.Fatalf("begin second attempt: %v", err)
+	}
+	if first != 1 || second != 2 {
+		t.Fatalf("attempts = %d then %d, want 1 then 2", first, second)
+	}
+	// Another tenant counts independently.
+	other, err := store.BeginTrinoPoolPublicationAttempt(ctx, lease, poolID, "org-b")
+	if err != nil {
+		t.Fatalf("begin attempt for another tenant: %v", err)
+	}
+	if other != 1 {
+		t.Fatalf("attempt for a second tenant = %d, want its own 1", other)
+	}
+
+	stale := lease
+	stale.Epoch--
+	if _, err := store.BeginTrinoPoolPublicationAttempt(ctx, stale, poolID, "org-a"); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
+	}
+}
+
+// One unserviceable tenant must not busy-loop or starve the tenants behind it:
+// the driver takes one tenant per tick, so the wait a failure earns has to be
+// durable and per tenant.
+func TestPublicationFailureRecordsADurableWait(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	next := time.Now().UTC().Add(45 * time.Second)
+	if err := store.RecordTrinoPoolPublicationFailure(ctx, lease, poolID, "org-a", next, "principal conflict"); err != nil {
+		t.Fatalf("record failure: %v", err)
+	}
+	if err := store.RecordTrinoPoolPublicationFailure(ctx, lease, poolID, "org-a", next, "principal conflict"); err != nil {
+		t.Fatalf("record second failure: %v", err)
+	}
+	publication, err := store.GetTrinoPoolPublication(ctx, poolID, "org-a")
+	if err != nil || publication == nil {
+		t.Fatalf("get publication: %v", err)
+	}
+	if publication.Attempts != 2 || publication.NextAttemptAt == nil || publication.LastError == "" {
+		t.Fatalf("publication = %+v, want two recorded attempts and a next attempt time", publication)
+	}
+
+	if err := store.ClearTrinoPoolPublicationFailure(ctx, lease, poolID, "org-a"); err != nil {
+		t.Fatalf("clear failure: %v", err)
+	}
+	publication, err = store.GetTrinoPoolPublication(ctx, poolID, "org-a")
+	if err != nil || publication == nil {
+		t.Fatalf("get publication: %v", err)
+	}
+	if publication.Attempts != 0 || publication.NextAttemptAt != nil {
+		t.Fatalf("publication = %+v, want the backoff cleared after a step that worked", publication)
 	}
 }

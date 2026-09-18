@@ -54,6 +54,7 @@ type trinoPoolGateway interface {
 	ConfigurePool(context.Context, string, trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error)
 	GetPool(ctx context.Context, poolID string) (trinogateway.PoolState, error)
 	OpenPublication(ctx context.Context, poolID string, request trinogateway.OpenPublicationRequest) (trinogateway.Publication, error)
+	AbandonPublication(ctx context.Context, poolID, publicationID string, step trinogateway.Step) (trinogateway.Publication, error)
 	GetPublication(ctx context.Context, poolID, publicationID string) (trinogateway.Publication, error)
 	RecordPublicationReceipt(ctx context.Context, poolID, publicationID string, request trinogateway.PublicationReceiptRequest) (trinogateway.Publication, error)
 	CommitPublication(ctx context.Context, poolID, publicationID string, request trinogateway.CommitPublicationRequest) (trinogateway.Publication, error)
@@ -128,6 +129,12 @@ type trinoPoolOperator struct {
 	// acknowledgement asks ONE member what configuration it is serving, which
 	// is what a publication receipt asserts.
 	acknowledgement func(ctx context.Context, endpoint string, expected trinoPoolProjectionRevisions, catalogRevision int64) (trinoPoolAcknowledgement, error)
+	// bindingCursor and barrierCursor rotate which tenant is worked on. The
+	// driver performs one external step per tick, so a fixed order lets one
+	// permanently failing tenant hold the front of the queue forever - and with
+	// thousands of warehouses, "forever" is not hyperbole.
+	bindingCursor uint64
+	barrierCursor uint64
 
 	lease configstore.TrinoPoolLease
 	// fenced records that this term lost the fence. It ends the loop rather
@@ -265,8 +272,21 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	// The binding has to be current BEFORE the gate can refuse anything on its
 	// basis, and a tenant is only dispatchable once its barrier has committed,
 	// so both run before any lifecycle step.
-	if err := o.advanceTenantAdmissions(ctx); err != nil {
-		return err
+	//
+	// A tenant's failure is NOT allowed to stop the pool. One warehouse whose
+	// publication can never succeed used to end the tick here, so no instance
+	// was repaired, drained or replaced for as long as it stayed broken - the
+	// pool's compute lifecycle held hostage by one row. The failure is recorded
+	// against that tenant (with its own backoff) and reported at the end; only
+	// a lost fence stops the tick, because after that nothing this process
+	// writes can land anyway.
+	tenantErr := o.advanceTenantAdmissions(ctx)
+	if tenantErr != nil {
+		if o.fenced {
+			return tenantErr
+		}
+		slog.Warn("Trino pool tenant admission step failed; continuing with the instance lifecycle.",
+			"pool", o.config.PublicID, "error", tenantErr)
 	}
 
 	instances, err := o.store.ListTrinoPoolInstances(ctx, o.config.PoolID)
@@ -277,12 +297,12 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	// a slow rollout cannot be overtaken by its own successor.
 	progressed, err := o.progressInstances(ctx, instances)
 	if err != nil {
-		return err
+		return errors.Join(tenantErr, err)
 	}
 	if progressed {
-		return nil
+		return tenantErr
 	}
-	return o.applyPlan(ctx, pool, instances)
+	return errors.Join(tenantErr, o.applyPlan(ctx, pool, instances))
 }
 
 // refreshConfig replaces the desired configuration with what the authoritative
