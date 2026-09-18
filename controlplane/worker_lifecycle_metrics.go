@@ -44,15 +44,15 @@ const (
 type LifecycleOrigin string
 
 const (
-	LifecycleOriginJanitorOrphan          LifecycleOrigin = "janitor_orphan"
-	LifecycleOriginJanitorHotIdleTTL      LifecycleOrigin = "janitor_hot_idle_ttl"
-	LifecycleOriginJanitorStuckActivating LifecycleOrigin = "janitor_stuck_activating"
+	LifecycleOriginJanitorOrphan           LifecycleOrigin = "janitor_orphan"
+	LifecycleOriginJanitorHotIdleTTL       LifecycleOrigin = "janitor_hot_idle_ttl"
+	LifecycleOriginJanitorStuckActivating  LifecycleOrigin = "janitor_stuck_activating"
 	// LifecycleOriginJanitorHotIdleCap marks the janitor's hot-idle cap sweep
 	// (reapHotIdleCaps) retiring the oldest parked workers of an org past its
 	// configured max_hot_idle_* limits. Distinct from the TTL reaper: a
 	// nonzero rate here means an operator's cost ceiling is biting, not that
 	// warm capacity went stale.
-	LifecycleOriginJanitorHotIdleCap       LifecycleOrigin = "janitor_hot_idle_cap"
+	LifecycleOriginJanitorHotIdleCap LifecycleOrigin = "janitor_hot_idle_cap"
 	LifecycleOriginMismatchedVersionReaper LifecycleOrigin = "mismatched_version_reaper"
 	LifecycleOriginShutdownAll             LifecycleOrigin = "shutdown_all"
 	// LifecycleOriginDrainReleaseIdle marks the hot -> hot_idle park performed
@@ -60,12 +60,12 @@ const (
 	// Hot workers are released so the unfenced hot-idle TTL reaper reclaims them
 	// during the drain wait instead of pinning vCPU until the CP is declared
 	// expired. A nonzero rate here during a rollout is the leak fix working.
-	LifecycleOriginDrainReleaseIdle     LifecycleOrigin = "drain_release_idle"
-	LifecycleOriginHealthCheckCrash     LifecycleOrigin = "health_check_crash"
-	LifecycleOriginWorkerDrain          LifecycleOrigin = "worker_drain"
-	LifecycleOriginSpawnFailure         LifecycleOrigin = "spawn_failure"
-	LifecycleOriginReserveImageMismatch LifecycleOrigin = "reserve_image_mismatch"
-	LifecycleOriginCredRefresh          LifecycleOrigin = "cred_refresh"
+	LifecycleOriginDrainReleaseIdle LifecycleOrigin = "drain_release_idle"
+	LifecycleOriginHealthCheckCrash        LifecycleOrigin = "health_check_crash"
+	LifecycleOriginWorkerDrain             LifecycleOrigin = "worker_drain"
+	LifecycleOriginSpawnFailure            LifecycleOrigin = "spawn_failure"
+	LifecycleOriginReserveImageMismatch    LifecycleOrigin = "reserve_image_mismatch"
+	LifecycleOriginCredRefresh             LifecycleOrigin = "cred_refresh"
 	// LifecycleOriginReserveFailure marks retire paths that fire when
 	// ReserveSharedWorker observes a claim that cannot be activated
 	// (stale-claim retries excepted) and falls back to retire-and-retry.

@@ -30,7 +30,7 @@ func TestSessionSetSearchPath(t *testing.T) {
 		t.Fatalf("SHOW search_path failed: %v", err)
 	}
 	if !strings.Contains(searchPath, "main") {
-		t.Errorf("expected search_path to contain 'main', got %q", searchPath)
+	  t.Errorf("expected search_path to contain 'main', got %q", searchPath)
 	}
 }
 
