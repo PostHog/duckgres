@@ -88,6 +88,11 @@ type trinoPoolOperator struct {
 	// policyRevision reports the authorization projection this control plane
 	// currently serves, which a candidate must be deciding with.
 	policyRevision func() string
+	// resolveConfig re-reads this pool's desired configuration from the
+	// authoritative source. It runs on every tick, immediately before the
+	// desired state is published, so a process that has been idle since boot
+	// cannot publish what it read then. Nil in tests that drive a fixed config.
+	resolveConfig func() (trinoPoolConfig, error)
 	owner    string
 	interval time.Duration
 	// operatorEnabled gates every external effect. With it off the operator
@@ -183,6 +188,18 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	if !o.operatorEnabled {
 		return nil
 	}
+	// Desired configuration is re-read from the authoritative source on every
+	// tick, not taken from a snapshot made when this process booted.
+	//
+	// The startup snapshot was the actual staleness hazard. A replica that
+	// booted before a configuration change, sat idle, and then won the janitor
+	// lease would publish what it read at boot - a perfectly legal fenced write
+	// of old content, and one the generation guard cannot catch, because the
+	// value that orders generations does not change for a settings-only edit
+	// and two different configurations can legitimately carry the same one.
+	// Reading immediately before writing makes the published spec current by
+	// construction, and bounds the window to a single tick.
+	o.refreshConfig()
 	// Seeding is the one unfenced write, and it can only INSERT: a fence needs
 	// a row to lock, so the very first publication has to create one.
 	if err := o.store.SeedTrinoPool(ctx, o.config.Spec); err != nil {
@@ -195,6 +212,18 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 		return o.dropAuthority(o.store.FreezeTrinoPool(ctx, o.lease, o.config.PoolID, o.config.FrozenReason))
 	}
 	if err := o.store.UpsertTrinoPoolSpec(ctx, o.lease, o.config.Spec); err != nil {
+		if errors.Is(err, configstore.ErrTrinoPoolStaleGeneration) {
+			// The configuration this leader holds carries a generation the
+			// store has already passed. That is a configuration problem, not a
+			// lost fence: ending the term would hand the pool to a replica
+			// reading the same file and doing the same thing. Hold the last-good
+			// state and say why, which is what every other unusable desired
+			// configuration does.
+			slog.Error("Trino pool desired configuration went backwards; holding the last-good state.",
+				"pool", o.config.PublicID, "error", err)
+			return o.dropAuthority(o.store.FreezeTrinoPool(ctx, o.lease, o.config.PoolID,
+				"desired configuration is older than the published one: "+err.Error()))
+		}
 		return o.dropAuthority(fmt.Errorf("record desired pool spec: %w", err))
 	}
 	if err := o.store.ThawTrinoPool(ctx, o.lease, o.config.PoolID); err != nil {
@@ -232,6 +261,40 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 		return nil
 	}
 	return o.applyPlan(ctx, pool, instances)
+}
+
+// refreshConfig replaces the desired configuration with what the authoritative
+// source says NOW.
+//
+// An unreadable source freezes the pool at its last-good state rather than
+// failing the tick: the pool keeps serving, nothing is created, drained or
+// deleted, and the operator is told why. It is explicitly NOT a desired count
+// of zero and explicitly NOT a startup abort - a bad mount must not empty a
+// fleet or take the control plane down.
+//
+// A resolution that names a DIFFERENT pool is refused outright: it would mean
+// this loop is about to publish another pool's desired state under this pool's
+// authority.
+func (o *trinoPoolOperator) refreshConfig() {
+	if o.resolveConfig == nil {
+		return
+	}
+	fresh, err := o.resolveConfig()
+	if err != nil {
+		o.config.Frozen = true
+		o.config.FrozenReason = "desired configuration is unreadable: " + err.Error()
+		slog.Warn("Trino pool desired configuration is unreadable; holding the last-good state.",
+			"pool", o.config.PublicID, "error", err)
+		return
+	}
+	if fresh.PoolID != o.config.PoolID {
+		o.config.Frozen = true
+		o.config.FrozenReason = fmt.Sprintf("desired configuration now names pool %q", fresh.PoolID)
+		slog.Error("Trino pool desired configuration names a different pool; holding the last-good state.",
+			"pool", o.config.PublicID, "resolved", fresh.PoolID)
+		return
+	}
+	o.config = fresh
 }
 
 // ensureAuthority acquires the pool's authority epoch once per leadership term.

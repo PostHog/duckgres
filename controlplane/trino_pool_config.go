@@ -3,6 +3,7 @@
 package controlplane
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -83,13 +84,20 @@ func trinoPoolOperatorEnabled() bool {
 // Cells without a pool block are ignored here and continue through the existing
 // fixed-cell path untouched.
 func resolveTrinoPoolConfigs() ([]trinoPoolConfig, error) {
-	path := strings.TrimSpace(os.Getenv(envTrinoCellsFile))
-	if path == "" {
-		return nil, nil
-	}
-	data, err := os.ReadFile(path)
+	return resolveTrinoPoolConfigsFrom(context.Background(), trinoPoolFileConfigReader{})
+}
+
+// resolveTrinoPoolConfigsFrom resolves every declared shared pool from one
+// source. The source is the mounted files at startup and the ConfigMap the
+// chart projects them from afterwards; the parsing and validation below are
+// identical either way, so the two can never diverge in what they accept.
+func resolveTrinoPoolConfigsFrom(ctx context.Context, reader trinoPoolConfigReader) ([]trinoPoolConfig, error) {
+	data, err := reader.Registry(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read Trino registry: %w", err)
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
 	}
 	cells, err := parseTrinoCellRegistry(data)
 	if err != nil {
@@ -111,7 +119,7 @@ func resolveTrinoPoolConfigs() ([]trinoPoolConfig, error) {
 		if !trinoPoolEnabled() {
 			return nil, fmt.Errorf("Trino cell %s declares shared-pool mode but %s is not enabled", cell.ID, envTrinoPoolEnabled)
 		}
-		config, err := resolveTrinoPoolConfig(cell)
+		config, err := resolveTrinoPoolConfig(ctx, reader, cell)
 		if err != nil {
 			return nil, err
 		}
@@ -120,7 +128,33 @@ func resolveTrinoPoolConfigs() ([]trinoPoolConfig, error) {
 	return configs, nil
 }
 
-func resolveTrinoPoolConfig(cell trinoRegisteredCell) (trinoPoolConfig, error) {
+// resolveTrinoPoolConfigByID re-resolves ONE pool's desired configuration from
+// the authoritative source.
+//
+// This is what the operator calls before every desired-state publication. The
+// source is the API object, not a mounted copy of it: a generation ordering
+// cannot supply freshness on its own (a settings-only change need not move
+// whatever produces that value, and two different configurations can carry the
+// same one), and neither can re-reading a projected file, which lags per pod
+// and, under a subPath mount, never updates at all.
+//
+// A pool that has DISAPPEARED from the registry is an error, not an empty
+// configuration. Treating a vanished entry as "desired zero" would delete a
+// running fleet because of a registry edit nobody meant as a teardown.
+func resolveTrinoPoolConfigByID(ctx context.Context, reader trinoPoolConfigReader, publicID string) (trinoPoolConfig, error) {
+	configs, err := resolveTrinoPoolConfigsFrom(ctx, reader)
+	if err != nil {
+		return trinoPoolConfig{}, err
+	}
+	for _, config := range configs {
+		if config.PublicID == publicID {
+			return config, nil
+		}
+	}
+	return trinoPoolConfig{}, fmt.Errorf("Trino pool %s is no longer declared in %s", publicID, reader.Describe())
+}
+
+func resolveTrinoPoolConfig(ctx context.Context, reader trinoPoolConfigReader, cell trinoRegisteredCell) (trinoPoolConfig, error) {
 	pool := cell.Pool
 	if pool == nil {
 		return trinoPoolConfig{}, fmt.Errorf("Trino cell %s is in shared-pool mode but declares no pool block", cell.ID)
@@ -169,7 +203,7 @@ func resolveTrinoPoolConfig(cell trinoRegisteredCell) (trinoPoolConfig, error) {
 		},
 	}
 
-	blueprint, err := loadTrinoPoolBlueprint(pool.BlueprintFile, cell.Namespace)
+	blueprint, err := loadTrinoPoolBlueprint(ctx, reader, pool.BlueprintFile, cell.Namespace)
 	if err != nil {
 		// Freeze rather than fail: the last-good desired state is preserved,
 		// the operator is told why, and nothing is created or deleted while the
@@ -184,17 +218,13 @@ func resolveTrinoPoolConfig(cell trinoRegisteredCell) (trinoPoolConfig, error) {
 	return config, nil
 }
 
-func loadTrinoPoolBlueprint(path, namespace string) (*trinopool.Blueprint, error) {
-	info, err := os.Stat(path)
+func loadTrinoPoolBlueprint(ctx context.Context, reader trinoPoolConfigReader, declaredPath, namespace string) (*trinopool.Blueprint, error) {
+	data, err := reader.Blueprint(ctx, declaredPath)
 	if err != nil {
-		return nil, fmt.Errorf("blueprint is unreadable: %w", err)
+		return nil, err
 	}
-	if info.Size() > maxBlueprintFileBytes {
+	if len(data) > maxBlueprintFileBytes {
 		return nil, errors.New("blueprint exceeds the size limit")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("blueprint is unreadable: %w", err)
 	}
 	blueprint, err := trinopool.ParseBlueprint(data)
 	if err != nil {

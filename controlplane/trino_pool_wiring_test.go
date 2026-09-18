@@ -53,6 +53,7 @@ func TestPoolWiringRefusesAnOperatorWithoutAGateway(t *testing.T) {
 	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoPoolOperatorEnabled, "true")
+	t.Setenv(envTrinoPoolConfigMap, "duckgres-trino-pool")
 	t.Setenv(envTrinoPoolGatewayURL, "")
 	t.Setenv("DUCKGRES_TRINO_MANAGED_GATEWAY_URL", "")
 
@@ -73,6 +74,9 @@ func TestPoolWiringBuildsAReadOnlyOperator(t *testing.T) {
 	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoPoolOperatorEnabled, "false")
+	// Desired state is published from the API object, so the pool has to be
+	// told which one.
+	t.Setenv(envTrinoPoolConfigMap, "duckgres-trino-pool")
 	t.Setenv(envTrinoPoolGatewayURL, "")
 	t.Setenv("DUCKGRES_TRINO_MANAGED_GATEWAY_URL", "")
 
@@ -98,5 +102,30 @@ func TestPoolWiringBuildsAReadOnlyOperator(t *testing.T) {
 	}
 	if second[0].owner == operators[0].owner {
 		t.Fatal("two processes of the same control plane received the same owner identity")
+	}
+}
+
+// A pooled cell whose desired-state source is not named refuses to start.
+//
+// The alternative would be publishing desired state from this pod's mounted
+// copy of the configuration, which lags per pod and never updates at all under
+// a subPath mount - so two replicas could drive one pool from two different
+// configurations, indefinitely, with nothing saying which. A refusal at startup
+// is the smaller failure, and it is the same rule the rest of the Trino branch
+// follows: asking for the feature and getting a silently different shape is
+// worse than not starting.
+func TestPoolWiringRefusesWithoutADesiredStateSource(t *testing.T) {
+	blueprint := filepath.Join(t.TempDir(), "blueprint.json")
+	if err := os.WriteFile(blueprint, testBlueprintJSON(t), 0o600); err != nil {
+		t.Fatalf("write blueprint: %v", err)
+	}
+	t.Setenv(envTrinoCellsFile, sharedPoolRegistry(t, blueprint))
+	t.Setenv(envTrinoRegistryOnly, "true")
+	t.Setenv(envTrinoPoolEnabled, "true")
+	t.Setenv(envTrinoPoolOperatorEnabled, "false")
+	t.Setenv(envTrinoPoolConfigMap, "")
+
+	if _, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test"); err == nil {
+		t.Fatal("a pooled cell was wired with no authoritative desired-state source")
 	}
 }

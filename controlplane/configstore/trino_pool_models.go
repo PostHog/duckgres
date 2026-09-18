@@ -22,6 +22,16 @@ var ErrTrinoPoolConflict = errors.New("trino pool conflict")
 // would perform an effect nobody recorded an intent for.
 var ErrTrinoPoolIntentChanged = errors.New("trino pool operation was replayed with different content")
 
+// ErrTrinoPoolStaleGeneration is returned when a desired specification would
+// move the recorded generation BACKWARDS.
+//
+// It is deliberately NOT an ErrTrinoPoolConflict: losing a fence means this
+// process is no longer the authority and must stop, whereas this means the
+// authority is holding a specification the store considers older. Conflating
+// the two ended the leadership term on every tick over what is a configuration
+// problem, and handed the pool to a replica that would do exactly the same.
+var ErrTrinoPoolStaleGeneration = errors.New("trino pool desired generation is behind the published generation")
+
 // API modes. `legacy` keeps today's fixed blue/green behavior for the cell.
 const (
 	TrinoPoolAPIModeLegacy = "legacy"

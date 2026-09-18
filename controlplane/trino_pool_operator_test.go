@@ -28,6 +28,9 @@ type fakePoolStore struct {
 	frozen    string
 	// failAdvance simulates losing authority mid-tick.
 	failAdvance bool
+	// staleGeneration simulates a desired spec whose generation is behind the
+	// published one.
+	staleGeneration bool
 }
 
 func newFakePoolStore(spec configstore.TrinoPoolSpec) *fakePoolStore {
@@ -49,6 +52,9 @@ func (f *fakePoolStore) SeedTrinoPool(_ context.Context, _ configstore.TrinoPool
 func (f *fakePoolStore) UpsertTrinoPoolSpec(_ context.Context, lease configstore.TrinoPoolLease, spec configstore.TrinoPoolSpec) error {
 	if lease.Epoch != f.epoch {
 		return configstore.ErrTrinoPoolConflict
+	}
+	if f.staleGeneration {
+		return fmt.Errorf("%w: 1 is behind the published 2", configstore.ErrTrinoPoolStaleGeneration)
 	}
 	f.pool.DesiredInstances, f.pool.MinServing = spec.DesiredInstances, spec.MinServing
 	f.pool.MaxSurge, f.pool.MaxRepair = spec.MaxSurge, spec.MaxRepair
@@ -1059,5 +1065,126 @@ func TestFailedCandidateIsCleanedUpAndReleasesItsSlot(t *testing.T) {
 	harness.tick(t, 1)
 	if len(harness.store.order) != 2 {
 		t.Fatalf("the pool created %d instances; a failed candidate blocked the replacement", len(harness.store.order))
+	}
+}
+
+// The staleness hazard is a process that resolved its configuration at boot and
+// only later won the lease: publishing that snapshot is a legal fenced write of
+// old content, and no generation ordering catches it, because a settings-only
+// edit need not move the generation at all. The desired state is therefore
+// re-read immediately before it is published.
+func TestDesiredStateIsResolvedOnEveryTick(t *testing.T) {
+	harness := newOperatorHarness(t)
+	current := harness.operator.config
+	harness.operator.resolveConfig = func() (trinoPoolConfig, error) { return current, nil }
+
+	harness.tick(t, 1)
+	if harness.store.pool.DesiredInstances != 3 {
+		t.Fatalf("desired instances = %d, want the resolved 3", harness.store.pool.DesiredInstances)
+	}
+
+	// The cluster's configuration changes with no change to the generation,
+	// which is exactly the case an ordering check cannot see.
+	changed := current
+	changed.Spec.DesiredInstances, changed.Spec.MinServing = 5, 4
+	current = changed
+
+	harness.tick(t, 1)
+	if harness.store.pool.DesiredInstances != 5 || harness.store.pool.MinServing != 4 {
+		t.Fatalf("desired = %d/%d, want the configuration the source holds now (5/4)",
+			harness.store.pool.DesiredInstances, harness.store.pool.MinServing)
+	}
+}
+
+// An unreadable configuration holds the last-good state. It is never a desired
+// count of zero and never a failed tick that stops the loop: the pool keeps
+// serving while somebody fixes the mount.
+func TestUnreadableConfigurationFreezesRatherThanEmptiesThePool(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.resolveConfig = func() (trinoPoolConfig, error) {
+		return trinoPoolConfig{}, errors.New("blueprint is unreadable")
+	}
+
+	harness.tick(t, 2)
+
+	if harness.store.pool.DesiredInstances != 3 {
+		t.Fatalf("desired instances = %d, want the last-good 3", harness.store.pool.DesiredInstances)
+	}
+	if !harness.store.pool.Frozen {
+		t.Fatal("an unreadable configuration did not freeze the pool")
+	}
+	if len(harness.kube.applied) != 0 {
+		t.Fatalf("the frozen pool created %d instances", len(harness.kube.applied))
+	}
+}
+
+// A generation that went backwards is a configuration problem, not a lost
+// fence. Ending the leadership term over it handed the pool to a replica
+// reading the same file, which did the same thing: the pool never converged and
+// the epoch ratcheted on every tick.
+func TestBackwardsGenerationFreezesAndKeepsTheLease(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.store.staleGeneration = true
+
+	harness.tick(t, 1)
+
+	if !harness.store.pool.Frozen {
+		t.Fatal("a backwards desired generation did not freeze the pool")
+	}
+	if harness.operator.fenced {
+		t.Fatal("a stale generation was treated as a lost fence")
+	}
+	if harness.operator.lease.Epoch == 0 {
+		t.Fatal("the leadership term ended over a configuration problem")
+	}
+}
+
+// Leadership can move to a replica whose own copy of the configuration is old.
+// Desired state must still be the cluster's, so the publication is derived from
+// the API object at the moment of the write - by both replicas, in either
+// order.
+func TestLeadershipSwitchPublishesTheAPIObjectNotTheReplicaSnapshot(t *testing.T) {
+	t.Setenv(envTrinoRegistryOnly, "true")
+	t.Setenv(envTrinoPoolEnabled, "true")
+	t.Setenv(envTrinoCellsFile, mountedRegistry(t, 3, 3))
+	client := poolConfigMap(t, 5, 4)
+	reader := poolAPIReader(t, client)
+
+	// One durable pool, two control planes. Each booted with a different copy
+	// of the configuration, which is what independent projected volumes look
+	// like in practice.
+	shared := newOperatorHarness(t)
+	stale := newOperatorHarness(t)
+	stale.operator.store = shared.store
+	stale.store = shared.store
+	stale.operator.config.Spec.DesiredInstances, stale.operator.config.Spec.MinServing = 3, 3
+	shared.operator.config.Spec.DesiredInstances, shared.operator.config.Spec.MinServing = 2, 2
+	for _, harness := range []*operatorHarness{shared, stale} {
+		harness.operator.resolveConfig = func() (trinoPoolConfig, error) {
+			return resolveTrinoPoolConfigByID(context.Background(), reader, "cell-001")
+		}
+	}
+
+	shared.tick(t, 1)
+	if shared.store.pool.DesiredInstances != 5 || shared.store.pool.MinServing != 4 {
+		t.Fatalf("first leader published %d/%d, want the API object's 5/4",
+			shared.store.pool.DesiredInstances, shared.store.pool.MinServing)
+	}
+
+	// The lease moves. The new leader's own snapshot says 3/3 and must not
+	// revert the pool to it.
+	stale.tick(t, 1)
+	if shared.store.pool.DesiredInstances != 5 || shared.store.pool.MinServing != 4 {
+		t.Fatalf("the new leader reverted desired state to %d/%d",
+			shared.store.pool.DesiredInstances, shared.store.pool.MinServing)
+	}
+
+	// And a change made while the first leader is idle is picked up by whoever
+	// is leading, without a restart.
+	setPoolConfigMap(t, client, 4, 3)
+	stale.tick(t, 1)
+	if shared.store.pool.DesiredInstances != 4 || shared.store.pool.MinServing != 3 {
+		t.Fatalf("desired = %d/%d, want the updated 4/3",
+			shared.store.pool.DesiredInstances, shared.store.pool.MinServing)
 	}
 }

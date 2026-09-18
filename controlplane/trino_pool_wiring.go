@@ -88,13 +88,34 @@ func buildTrinoPoolOperators(
 			tenants:         store,
 			operations:      store,
 		}
-		shared := trinopool.BlueprintSharedResources{}
-		if config.Blueprint != nil {
-			shared = config.Blueprint.SharedResources
+		// Desired state is published from the ConfigMap the chart projects the
+		// registry and blueprint from, read through the Kubernetes API.
+		//
+		// The mounted copies are how this process learned the pool exists, and
+		// that is all they are trusted for. A projected volume is refreshed per
+		// pod on the kubelet's own schedule - and not at all under a subPath
+		// mount - so two replicas can hold different contents indefinitely and
+		// an idle pod can hold a configuration the cluster replaced hours ago.
+		// Publishing from the API object means every replica derives desired
+		// state from one value, and re-reading it before each publication is
+		// what bounds the staleness window to a single read.
+		configSource, err := newTrinoPoolAPIConfigReader(clientset, config.Namespace)
+		if err != nil {
+			return nil, fmt.Errorf("configure the desired-state source for pool %s: %w", config.PublicID, err)
 		}
-		namespace := config.Namespace
+		publicID := config.PublicID
+		operator.resolveConfig = func() (trinoPoolConfig, error) {
+			return resolveTrinoPoolConfigByID(context.Background(), configSource, publicID)
+		}
+		// The Kubernetes effects follow the CURRENT configuration, because a new
+		// blueprint may name different pool-shared resources, and those are the
+		// objects the effects refuse to touch.
 		operator.kube = func(epoch int64) trinoPoolKube {
-			return newTrinoPoolEffects(clientset, namespace, shared, epoch)
+			shared := trinopool.BlueprintSharedResources{}
+			if operator.config.Blueprint != nil {
+				shared = operator.config.Blueprint.SharedResources
+			}
+			return newTrinoPoolEffects(clientset, operator.config.Namespace, shared, epoch)
 		}
 		// Pooled coordinators are reached directly on their in-cluster Service
 		// over plain HTTP: TLS terminates at the Gateway. The probe declares the

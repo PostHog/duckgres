@@ -42,9 +42,17 @@ func (cs *ConfigStore) UpsertTrinoPoolSpec(ctx context.Context, lease TrinoPoolL
 	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, pool *TrinoPool) error {
 		// Stale CONTENT is refused even from a valid leader. Holding the fence
 		// proves who may write, not that what they hold is current.
+		//
+		// This orders GENERATIONS, and only generations. It does not by itself
+		// establish that a leader's configuration is current: two different
+		// configurations can carry the same generation, and whatever supplies
+		// the value may not change it for a settings-only edit. Freshness comes
+		// from re-reading the authoritative configuration at the moment of the
+		// write (see the operator's per-tick resolution); this check is the
+		// backstop against a value that provably went backwards.
 		if spec.Generation < pool.DesiredGeneration {
-			return fmt.Errorf("%w: desired generation %d is behind the published %d",
-				ErrTrinoPoolConflict, spec.Generation, pool.DesiredGeneration)
+			return fmt.Errorf("%w: %d is behind the published %d",
+				ErrTrinoPoolStaleGeneration, spec.Generation, pool.DesiredGeneration)
 		}
 		return tx.Model(&TrinoPool{}).Where("pool_id = ?", spec.PoolID).Updates(map[string]any{
 			"desired_generation":       spec.Generation,
