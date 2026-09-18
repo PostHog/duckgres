@@ -49,23 +49,27 @@ const (
 
 // TrinoPool is the desired specification plus the operator's runtime state.
 type TrinoPool struct {
-	PoolID                 string    `gorm:"primaryKey;column:pool_id"`
-	PublicID               string    `gorm:"column:public_id"`
-	APIMode                string    `gorm:"column:api_mode"`
-	DesiredReleaseID       string    `gorm:"column:desired_release_id"`
-	DesiredBlueprintDigest string    `gorm:"column:desired_blueprint_digest"`
-	DesiredInstances       int       `gorm:"column:desired_instances"`
-	MinServing             int       `gorm:"column:min_serving"`
-	MaxSurge               int       `gorm:"column:max_surge"`
-	MaxRepair              int       `gorm:"column:max_repair"`
-	AuthorityEpoch         int64     `gorm:"column:authority_epoch"`
-	AuthorityOwner         string    `gorm:"column:authority_owner"`
-	PublicationRevision    int64     `gorm:"column:publication_revision"`
-	AdmittedRevision       int64     `gorm:"column:admitted_revision"`
-	Frozen                 bool      `gorm:"column:frozen"`
-	FrozenReason           string    `gorm:"column:frozen_reason"`
-	CreatedAt              time.Time `gorm:"column:created_at"`
-	UpdatedAt              time.Time `gorm:"column:updated_at"`
+	PoolID                 string `gorm:"primaryKey;column:pool_id"`
+	PublicID               string `gorm:"column:public_id"`
+	APIMode                string `gorm:"column:api_mode"`
+	DesiredReleaseID       string `gorm:"column:desired_release_id"`
+	DesiredBlueprintDigest string `gorm:"column:desired_blueprint_digest"`
+	DesiredInstances       int    `gorm:"column:desired_instances"`
+	MinServing             int    `gorm:"column:min_serving"`
+	MaxSurge               int    `gorm:"column:max_surge"`
+	MaxRepair              int    `gorm:"column:max_repair"`
+	// DesiredGeneration orders desired-state CONTENT independently of who
+	// wrote it, so a leader carrying an older configuration cannot publish it
+	// over a newer one just because it legitimately holds the fence.
+	DesiredGeneration   int64     `gorm:"column:desired_generation"`
+	AuthorityEpoch      int64     `gorm:"column:authority_epoch"`
+	AuthorityOwner      string    `gorm:"column:authority_owner"`
+	PublicationRevision int64     `gorm:"column:publication_revision"`
+	AdmittedRevision    int64     `gorm:"column:admitted_revision"`
+	Frozen              bool      `gorm:"column:frozen"`
+	FrozenReason        string    `gorm:"column:frozen_reason"`
+	CreatedAt           time.Time `gorm:"column:created_at"`
+	UpdatedAt           time.Time `gorm:"column:updated_at"`
 }
 
 func (TrinoPool) TableName() string { return "duckgres_trino_pools" }
@@ -74,6 +78,10 @@ func (TrinoPool) TableName() string { return "duckgres_trino_pools" }
 // the blueprint. It deliberately carries no runtime state: applying it must not
 // disturb the authority epoch, the freeze flag, or anything an operator owns.
 type TrinoPoolSpec struct {
+	// Generation is the ordering of this desired content. It must increase
+	// whenever the spec changes; a publication that does not advance it is
+	// refused as stale.
+	Generation             int64
 	PoolID                 string
 	PublicID               string
 	APIMode                string

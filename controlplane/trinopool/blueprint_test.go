@@ -210,3 +210,36 @@ func TestParseBlueprintAcceptsTheCheckedInFixture(t *testing.T) {
 		t.Fatal("fixture did not populate the release identity")
 	}
 }
+
+// The generation orders desired state across control planes. Nothing in the
+// control plane can order releases itself - any replica may win the pool
+// authority and each knows only its own mounted files - so the value comes from
+// the config source. Absent is accepted and orders nothing, which is the
+// behavior before any generator emits it.
+func TestBlueprintGenerationIsOptionalAndOrdered(t *testing.T) {
+	blueprint := validBlueprint()
+	if blueprint.Generation != 0 {
+		t.Fatal("the fixture already carries a generation")
+	}
+	if err := blueprint.Validate(); err != nil {
+		t.Fatalf("a blueprint without a generation was rejected: %v", err)
+	}
+
+	blueprint.Generation = 7
+	if err := blueprint.Validate(); err != nil {
+		t.Fatalf("a generation was rejected: %v", err)
+	}
+	blueprint.Generation = -1
+	if err := blueprint.Validate(); err == nil {
+		t.Fatal("a negative generation was accepted")
+	}
+
+	// It is part of the identity: a new generation is a new spec digest, so an
+	// instance created under one release is not mistaken for another.
+	first := validBlueprint()
+	second := validBlueprint()
+	second.Generation = 9
+	if first.Digest() == second.Digest() {
+		t.Fatal("the generation did not change the blueprint digest")
+	}
+}

@@ -95,7 +95,7 @@ func (cs *ConfigStore) ListOpenTrinoPoolOperations(ctx context.Context, poolID s
 // replay with the identical payload returns the recorded result — that is how a
 // lost Gateway response becomes a lookup rather than a second mutation. A
 // different payload under the same step id is a conflict.
-func (cs *ConfigStore) RecordTrinoPoolOperationStep(ctx context.Context, operationID, stepID, payloadHash, outcome, result string) (TrinoPoolOperationStep, error) {
+func (cs *ConfigStore) RecordTrinoPoolOperationStep(ctx context.Context, lease TrinoPoolLease, operationID, stepID, payloadHash, outcome, result string) (TrinoPoolOperationStep, error) {
 	if operationID == "" || stepID == "" || payloadHash == "" {
 		return TrinoPoolOperationStep{}, errors.New("trino pool step requires an operation, step id and payload hash")
 	}
@@ -103,7 +103,10 @@ func (cs *ConfigStore) RecordTrinoPoolOperationStep(ctx context.Context, operati
 		result = "{}"
 	}
 	var step TrinoPoolOperationStep
-	err := cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	// Fenced like every other lifecycle write: a superseded leader recording
+	// step outcomes into a live operation would make the read-back path report
+	// its abandoned attempt as the operation's result.
+	err := cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
 		existing := TrinoPoolOperationStep{}
 		err := tx.Where("operation_id = ? AND step_id = ?", operationID, stepID).First(&existing).Error
 		switch {

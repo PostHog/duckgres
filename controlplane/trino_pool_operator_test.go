@@ -871,3 +871,121 @@ func TestReadOnlyOperatorDoesNotPublishDesiredState(t *testing.T) {
 		t.Fatal("a read-only operator claimed authority")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Durable operation recording.
+// ---------------------------------------------------------------------------
+
+type fakeOperationStore struct {
+	operations map[string]configstore.TrinoPoolOperation
+	steps      map[string]configstore.TrinoPoolOperationStep
+	epoch      func() int64
+}
+
+func newFakeOperationStore(epoch func() int64) *fakeOperationStore {
+	return &fakeOperationStore{
+		operations: map[string]configstore.TrinoPoolOperation{},
+		steps:      map[string]configstore.TrinoPoolOperationStep{},
+		epoch:      epoch,
+	}
+}
+
+func (f *fakeOperationStore) BeginTrinoPoolOperation(_ context.Context, lease configstore.TrinoPoolLease, spec configstore.TrinoPoolOperationSpec) (configstore.TrinoPoolOperation, error) {
+	if lease.Epoch != f.epoch() {
+		return configstore.TrinoPoolOperation{}, configstore.ErrTrinoPoolConflict
+	}
+	if existing, ok := f.operations[spec.OperationID]; ok {
+		if existing.IntentHash != spec.IntentHash {
+			return configstore.TrinoPoolOperation{}, configstore.ErrTrinoPoolIntentChanged
+		}
+		existing.Replayed = true
+		return existing, nil
+	}
+	created := configstore.TrinoPoolOperation{OperationID: spec.OperationID, IntentHash: spec.IntentHash}
+	f.operations[spec.OperationID] = created
+	return created, nil
+}
+
+func (f *fakeOperationStore) RecordTrinoPoolOperationStep(_ context.Context, lease configstore.TrinoPoolLease, operationID, stepID, payloadHash, outcome, result string) (configstore.TrinoPoolOperationStep, error) {
+	if lease.Epoch != f.epoch() {
+		return configstore.TrinoPoolOperationStep{}, configstore.ErrTrinoPoolConflict
+	}
+	key := operationID + "/" + stepID
+	if existing, ok := f.steps[key]; ok {
+		if existing.PayloadHash != payloadHash {
+			return configstore.TrinoPoolOperationStep{}, configstore.ErrTrinoPoolIntentChanged
+		}
+		existing.Replayed = true
+		// A later call with a real outcome replaces the provisional UNKNOWN.
+		if outcome != "" && outcome != "UNKNOWN" {
+			existing.Outcome, existing.Result = outcome, result
+			f.steps[key] = existing
+		}
+		return existing, nil
+	}
+	created := configstore.TrinoPoolOperationStep{
+		OperationID: operationID, StepID: stepID, PayloadHash: payloadHash,
+		Outcome: outcome, Result: result,
+	}
+	f.steps[key] = created
+	return created, nil
+}
+
+func (f *fakeOperationStore) FinishTrinoPoolOperation(context.Context, configstore.TrinoPoolLease, string, string, string) error {
+	return nil
+}
+
+// An admission whose response is lost is UNKNOWN, not failed: the member may
+// already be ACTIVE. The intent is recorded before the call, so the next
+// attempt resolves it by read-back instead of deciding from nothing.
+func TestAdmissionRecordsItsIntentAndOutcome(t *testing.T) {
+	harness := newOperatorHarness(t)
+	operations := newFakeOperationStore(func() int64 { return harness.store.epoch })
+	harness.operator.operations = operations
+
+	harness.tick(t, 20)
+
+	var admitStep configstore.TrinoPoolOperationStep
+	for key, step := range operations.steps {
+		if step.StepID == "admit" {
+			admitStep = step
+			_ = key
+			break
+		}
+	}
+	if admitStep.StepID == "" {
+		t.Fatalf("no admit step was recorded: %v", operations.steps)
+	}
+	if admitStep.Outcome != "OK" {
+		t.Fatalf("admit outcome = %q, want OK once the Gateway answered", admitStep.Outcome)
+	}
+	if admitStep.PayloadHash == "" {
+		t.Fatal("the admit step recorded no payload identity")
+	}
+	if len(operations.operations) == 0 {
+		t.Fatal("no durable operation was recorded")
+	}
+}
+
+// A step already recorded OK is not performed again: a second admission call
+// would be a duplicate effect this controller can avoid entirely.
+func TestCompletedStepIsNotRepeated(t *testing.T) {
+	harness := newOperatorHarness(t)
+	operations := newFakeOperationStore(func() int64 { return harness.store.epoch })
+	harness.operator.operations = operations
+	harness.tick(t, 20)
+
+	before := countCalls(harness.gateway.calls, "admit:")
+	instanceID := harness.store.order[0]
+	instance := harness.store.instances[instanceID]
+	// Force the instance back to the admitting step with the record intact.
+	instance.Phase = string(trinopool.PhaseValidating)
+
+	harness.tick(t, 1)
+	if countCalls(harness.gateway.calls, "admit:") != before {
+		t.Fatal("a step already recorded OK was performed again")
+	}
+	if instance.Phase != string(trinopool.PhaseAdmitted) {
+		t.Fatalf("phase = %s, want the recorded outcome to advance the instance", instance.Phase)
+	}
+}

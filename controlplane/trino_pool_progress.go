@@ -197,7 +197,7 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 	if err != nil {
 		return fmt.Errorf("instance %s has an unreadable validation receipt: %w", instance.InstanceID, err)
 	}
-	member, err := o.gateway.AdmitMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.AdmitMemberRequest{
+	request := trinogateway.AdmitMemberRequest{
 		Step:               o.step(instance.InstanceID, "admit"),
 		ExpectedGeneration: instance.GatewayGeneration,
 		Receipt: trinogateway.ValidationReceipt{
@@ -211,9 +211,53 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 			ReadyWorkers:    validation.ReadyWorkers,
 			Checks:          validation.Checks,
 		},
-	})
-	if err != nil {
+	}
+
+	// Admission is the one step whose lost response is genuinely ambiguous: the
+	// member may already be ACTIVE. Recording the intent first means the next
+	// attempt - possibly a different leader - reads the outcome back instead of
+	// deciding from nothing.
+	var member trinogateway.Member
+	if err := o.runDurableStep(ctx,
+		configstore.TrinoPoolOperationSpec{
+			OperationID: "instance:" + instance.InstanceID,
+			PoolID:      o.config.PoolID,
+			InstanceID:  instance.InstanceID,
+			Kind:        configstore.TrinoPoolOperationReplace,
+			IntentHash:  instance.SpecDigest,
+		},
+		// The step identity is the BUSINESS INTENT - this instance, this
+		// validated process, this revision - and deliberately NOT the authority
+		// envelope. The expected generation moves whenever the effect actually
+		// lands, so hashing the whole request would turn the retry after a lost
+		// response into a permanent "changed intent" conflict, which is exactly
+		// the case the record exists to resolve.
+		"admit", trinoPoolAdmitIntent{
+			InstanceID:      instance.InstanceID,
+			CertificateHash: validation.CertificateHash,
+			ConfigRevision:  instance.ReleaseID,
+			BootID:          validation.ProcessID,
+		},
+		func(ctx context.Context) (string, error) {
+			admitted, err := o.gateway.AdmitMember(ctx, o.config.RoutingGroup, instance.InstanceID, request)
+			if err != nil {
+				return "", err
+			}
+			member = admitted
+			return fmt.Sprintf(`{"phase":%q,"generation":%d}`, admitted.Phase, admitted.Generation), nil
+		},
+	); err != nil {
 		return o.dropAuthority(fmt.Errorf("admit member %s: %w", instance.InstanceID, err))
+	}
+	if member.Phase == "" {
+		// The step was already recorded as complete by an earlier attempt. Read
+		// the member back rather than trusting the recorded snapshot: the
+		// Gateway is authoritative for its own state.
+		current, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+		if err != nil {
+			return fmt.Errorf("read back admitted member %s: %w", instance.InstanceID, err)
+		}
+		member = current
 	}
 	return o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseValidating, trinopool.PhaseAdmitted, map[string]any{
@@ -349,6 +393,15 @@ func inventoryUpdates(inventory trinoPoolInventory) map[string]any {
 		"worker_deployment_name":      inventory.WorkerDeploymentName,
 		"worker_deployment_uid":       inventory.WorkerDeploymentUID,
 	}
+}
+
+// trinoPoolAdmitIntent is what an admission MEANS, separate from the authority
+// envelope that carries it.
+type trinoPoolAdmitIntent struct {
+	InstanceID      string
+	CertificateHash string
+	ConfigRevision  string
+	BootID          string
 }
 
 // expectationFor is what this instance must prove before it can be admitted.

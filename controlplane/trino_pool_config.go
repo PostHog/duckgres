@@ -180,6 +180,7 @@ func resolveTrinoPoolConfig(cell trinoRegisteredCell) (trinoPoolConfig, error) {
 	config.Blueprint = blueprint
 	config.Spec.DesiredReleaseID = blueprint.ReleaseID
 	config.Spec.DesiredBlueprintDigest = blueprint.Digest()
+	config.Spec.Generation = blueprint.Generation
 	return config, nil
 }
 

@@ -39,8 +39,15 @@ func (cs *ConfigStore) UpsertTrinoPoolSpec(ctx context.Context, lease TrinoPoolL
 	if spec.PoolID != lease.PoolID {
 		return fmt.Errorf("%w: spec is for pool %q, lease covers %q", ErrTrinoPoolConflict, spec.PoolID, lease.PoolID)
 	}
-	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, pool *TrinoPool) error {
+		// Stale CONTENT is refused even from a valid leader. Holding the fence
+		// proves who may write, not that what they hold is current.
+		if spec.Generation < pool.DesiredGeneration {
+			return fmt.Errorf("%w: desired generation %d is behind the published %d",
+				ErrTrinoPoolConflict, spec.Generation, pool.DesiredGeneration)
+		}
 		return tx.Model(&TrinoPool{}).Where("pool_id = ?", spec.PoolID).Updates(map[string]any{
+			"desired_generation":       spec.Generation,
 			"public_id":                spec.PublicID,
 			"api_mode":                 spec.APIMode,
 			"desired_release_id":       spec.DesiredReleaseID,
@@ -62,6 +69,7 @@ func (cs *ConfigStore) SeedTrinoPool(ctx context.Context, spec TrinoPoolSpec) er
 		return err
 	}
 	pool := TrinoPool{
+		DesiredGeneration:      spec.Generation,
 		PoolID:                 spec.PoolID,
 		PublicID:               spec.PublicID,
 		APIMode:                spec.APIMode,

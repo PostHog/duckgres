@@ -320,14 +320,14 @@ func TestOperationStepsAreIdempotentByPayload(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 
-	recorded, err := store.RecordTrinoPoolOperationStep(ctx, "op-1", "register", "payload-a", "OK", `{"instanceId":"i-1"}`)
+	recorded, err := store.RecordTrinoPoolOperationStep(ctx, lease, "op-1", "register", "payload-a", "OK", `{"instanceId":"i-1"}`)
 	if err != nil {
 		t.Fatalf("record step: %v", err)
 	}
 	if recorded.Replayed {
 		t.Fatal("a fresh step reported itself as a replay")
 	}
-	again, err := store.RecordTrinoPoolOperationStep(ctx, "op-1", "register", "payload-a", "OK", `{"instanceId":"i-1"}`)
+	again, err := store.RecordTrinoPoolOperationStep(ctx, lease, "op-1", "register", "payload-a", "OK", `{"instanceId":"i-1"}`)
 	if err != nil {
 		t.Fatalf("replay step: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestOperationStepsAreIdempotentByPayload(t *testing.T) {
 	if !again.Replayed || !sameJSON(t, again.Result, recorded.Result) {
 		t.Fatalf("step replay = %+v, want the recorded result %+v", again, recorded)
 	}
-	if _, err := store.RecordTrinoPoolOperationStep(ctx, "op-1", "register", "payload-b", "OK", `{}`); !errors.Is(err, cpconfigstore.ErrTrinoPoolIntentChanged) {
+	if _, err := store.RecordTrinoPoolOperationStep(ctx, lease, "op-1", "register", "payload-b", "OK", `{}`); !errors.Is(err, cpconfigstore.ErrTrinoPoolIntentChanged) {
 		t.Fatalf("changed step payload error = %v, want ErrTrinoPoolIntentChanged", err)
 	}
 }

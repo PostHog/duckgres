@@ -50,7 +50,20 @@ var (
 
 // Blueprint is the document Argo mounts for a shared-pool cell.
 type Blueprint struct {
-	BlueprintVersion   int                          `json:"blueprint_version"`
+	BlueprintVersion int `json:"blueprint_version"`
+	// Generation orders desired state across control planes. It must increase
+	// with every published release.
+	//
+	// It has to come from the config source, because nothing in the control
+	// plane can order releases on its own: any replica may win the pool
+	// authority, and each one knows only the files it has mounted. Holding the
+	// fence proves who may write, not that what they hold is current - so
+	// without an externally supplied ordinal, a replica carrying yesterday's
+	// blueprint could legitimately publish it over today's.
+	//
+	// Absent or zero is accepted and simply does not order anything, which is
+	// the behavior before any generator emits it.
+	Generation         int64                        `json:"generation,omitempty"`
 	ReleaseID          string                       `json:"release_id"`
 	ChartVersion       string                       `json:"chart_version"`
 	Image              string                       `json:"image"`
@@ -141,6 +154,9 @@ func (b *Blueprint) Validate() error {
 	}
 	if !releaseIdentifier.MatchString(b.ChartVersion) {
 		return errors.New("blueprint requires a chart version")
+	}
+	if b.Generation < 0 {
+		return errors.New("blueprint generation must not be negative")
 	}
 	// An unpinned image breaks the central promise of the model: the same spec
 	// digest must always mean the same bytes, on every pod start, forever.

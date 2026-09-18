@@ -95,6 +95,9 @@ type trinoPoolOperator struct {
 	// installWriter claims the catalog store's writer fence under the lease
 	// just acquired and installs it as the cell's catalog write path.
 	installWriter func(context.Context, configstore.TrinoPoolLease) error
+	// operations records durable intents around external effects, so a lost
+	// response is resolved by read-back rather than repeated blind.
+	operations trinoPoolOperationStore
 	// tenants is the org projection the principal binding is derived from.
 	tenants trinoPoolTenantStore
 	// publishedBindings remembers the binding revision last accepted per

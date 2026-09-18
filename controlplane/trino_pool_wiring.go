@@ -85,6 +85,7 @@ func buildTrinoPoolOperators(
 			operatorEnabled: operatorEnabled,
 			newInstanceID:   newTrinoPoolInstanceID,
 			tenants:         store,
+			operations:      store,
 		}
 		shared := trinopool.BlueprintSharedResources{}
 		if config.Blueprint != nil {

@@ -983,6 +983,56 @@ trino_shared_pool_disabled() {
   log "shared pool OK: no pooled workload exists (durable state + serving path are unit/PG-tested only)"
 }
 
+# The ACTIVE path, for a cluster that has the pool enabled.
+#
+# It runs only when E2E_TRINO_POOL=1, because it needs what mw-dev does not have
+# by default: a registry entry with mode "shared-pool", a blueprint artifact
+# carrying a real image digest, a Gateway speaking the pooled protocol, and the
+# feature flags on. When those exist this is the acceptance check - it asserts
+# the user-visible outcome (instances reach serving and answer a query), not
+# that a reconcile loop ran.
+trino_shared_pool_active() {
+  [ "${E2E_TRINO_POOL:-0}" = "1" ] || {
+    log "SKIP shared-pool active path (set E2E_TRINO_POOL=1 on a pool-enabled cluster)"
+    return 0
+  }
+  pool="${E2E_TRINO_POOL_ID:-cell-001}"
+  want="${E2E_TRINO_POOL_MIN_SERVING:-3}"
+  log "shared Trino pool: waiting for $want serving instances in $pool"
+
+  selector="app.kubernetes.io/managed-by=duckgres-trino-pool,posthog.com/trino-pool=$pool"
+  a=0 ready=0
+  while [ "$a" -lt 60 ]; do
+    # Ready coordinators, counted from the pods themselves: the operator's own
+    # view is what is under test, so it cannot also be the evidence.
+    ready="$(kubectl get pods -A -l "$selector,app.kubernetes.io/component=coordinator" \
+      -o json 2>/dev/null | jq -r '[.items[] | select(.status.phase=="Running")
+        | select([.status.conditions[]? | select(.type=="Ready" and .status=="True")] | length > 0)] | length')" || ready=0
+    [ "${ready:-0}" -ge "$want" ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "${ready:-0}" -ge "$want" ] || fail "shared pool: only $ready serving coordinator(s), want $want"
+
+  # Each instance must have its OWN Service and its own workers: a shared
+  # Service or a shared discovery URI would silently merge two clusters, which
+  # no pod-count assertion would notice.
+  services="$(kubectl get services -A -l "$selector" -o json | jq -r '.items | length')"
+  [ "${services:-0}" -ge "$want" ] || fail "shared pool: $services service(s) for $ready instance(s)"
+  instances="$(kubectl get pods -A -l "$selector,app.kubernetes.io/component=coordinator" \
+    -o json | jq -r '[.items[].metadata.labels["posthog.com/trino-instance"]] | unique | length')"
+  [ "${instances:-0}" -ge "$want" ] || fail "shared pool: $instances distinct instance(s) among the coordinators"
+
+  # Every worker must belong to an instance that has a coordinator: an orphaned
+  # worker set is the visible symptom of a half-retired instance.
+  orphans="$(kubectl get pods -A -l "$selector,app.kubernetes.io/component=worker" -o json \
+    | jq -r --argjson known "$(kubectl get pods -A -l "$selector,app.kubernetes.io/component=coordinator" \
+        -o json | jq '[.items[].metadata.labels["posthog.com/trino-instance"]]')" \
+      '[.items[] | select(([.metadata.labels["posthog.com/trino-instance"]] | inside($known)) | not)] | length')" || orphans=0
+  [ "${orphans:-0}" = "0" ] || fail "shared pool: $orphans worker pod(s) have no coordinator"
+
+  log "shared pool OK: $ready instance(s) serving, each with its own service and workers"
+}
+
 hot_idle_reporting_and_cap() { # org
   org="$1"
   log "hot-idle reporting + cap sweep on $org"
@@ -4836,8 +4886,14 @@ engine_main() {
   # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
 
-  # ---- shared Trino compute pool: must be inert while disabled ----
-  trino_shared_pool_disabled
+  # ---- shared Trino compute pool ----
+  # Inert while disabled; the active acceptance path runs on a pool-enabled
+  # cluster (E2E_TRINO_POOL=1).
+  if [ "${E2E_TRINO_POOL:-0}" = "1" ]; then
+    trino_shared_pool_active
+  else
+    trino_shared_pool_disabled
+  fi
 
   # ---- hot-idle pool reporting + per-org cap sweep ----
   hot_idle_reporting_and_cap "$CNPG"
