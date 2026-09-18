@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,12 +110,18 @@ func (c *kubernetesTrinoAuthenticationReadiness) Check(ctx context.Context, name
 	if err != nil {
 		return false, err
 	}
-	pending, err := c.observer.Check(ctx, namespace, mountPath, c.expected, coordinators)
-	if err != nil || len(pending) > 0 {
-		return false, err
-	}
 	container, err := trinoCredentialContainerForSecret(pod, mountPath, endpoint.Port(), []string{"password.db", "group.db"}, TrinoAuthSecretName)
 	if err != nil {
+		return false, err
+	}
+	// Kubernetes replaces ..data on every projected Secret update. Observing the
+	// generation closes disable/re-enable ABA across independent control planes.
+	generation, err := c.authenticationGeneration(ctx, namespace, pod.Name, container.Name, mountPath)
+	if err != nil {
+		return false, err
+	}
+	pending, err := c.observer.Check(ctx, namespace, mountPath, c.expected, coordinators)
+	if err != nil || len(pending) > 0 {
 		return false, err
 	}
 	member := trinoObservedPod{pod: pod, container: container, port: endpoint.Port()}
@@ -125,6 +132,7 @@ func (c *kubernetesTrinoAuthenticationReadiness) Check(ctx context.Context, name
 	}
 	var fingerprint strings.Builder
 	fmt.Fprintf(&fingerprint, "%s/%s/%s/%d", namespace, pod.UID, member.status.ContainerID, member.status.RestartCount)
+	fmt.Fprintf(&fingerprint, "/%x", sha256.Sum256([]byte(generation)))
 	var refresh time.Duration
 	for _, provider := range []struct{ config, name, file, key string }{
 		{"password-authenticator.properties", "password-authenticator.name", "file.password-file", "password.db"},
@@ -152,6 +160,13 @@ func (c *kubernetesTrinoAuthenticationReadiness) Check(ctx context.Context, name
 		}
 		refresh = max(refresh, period)
 		fmt.Fprintf(&fingerprint, "/%x", sha256.Sum256(content))
+	}
+	afterGeneration, err := c.authenticationGeneration(ctx, namespace, pod.Name, container.Name, mountPath)
+	if err != nil {
+		return false, err
+	}
+	if afterGeneration != generation {
+		return false, nil
 	}
 	after, err := c.observer.kube.CoreV1().Pods(namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 	if err != nil || !trinoSameObservedMemberForSecret(member, *after, mountPath, []string{"password.db", "group.db"}, TrinoAuthSecretName) {
@@ -216,4 +231,18 @@ func trinoAuthenticationProperties(content []byte) (map[string]string, error) {
 		result[key] = value
 	}
 	return result, nil
+}
+
+func (c *kubernetesTrinoAuthenticationReadiness) authenticationGeneration(ctx context.Context, namespace, pod, container, mountPath string) (string, error) {
+	execCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	output, err := c.observer.executor.Exec(execCtx, namespace, pod, container, []string{"readlink", path.Join(mountPath, "..data")})
+	if err != nil {
+		return "", errors.New("could not observe Trino authentication projection generation")
+	}
+	generation := strings.TrimSuffix(string(output), "\n")
+	if len(generation) == 0 || len(generation) > 1024 || strings.IndexFunc(generation, unicode.IsControl) >= 0 {
+		return "", errors.New("invalid Trino authentication projection generation")
+	}
+	return generation, nil
 }

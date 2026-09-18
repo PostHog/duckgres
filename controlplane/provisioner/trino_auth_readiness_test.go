@@ -20,7 +20,15 @@ func TestTrinoAuthenticationReadinessRefreshAndInvalidation(t *testing.T) {
 			kube := fake.NewClientset(pod)
 			values := map[string]string{"password.db": "password-v1", "group.db": "groups-v1"}
 			config := fmt.Sprintf("password-authenticator.name=file\nfile.password-file=/secrets/password.db\nfile.refresh-period=%s\n", delay)
+			generation := "..generation-1"
+			changeGenerationDuringRead := false
 			executor := trinoReadinessExecFunc(func(_ context.Context, _, _, _ string, cmd []string) ([]byte, error) {
+				if cmd[0] == "readlink" {
+					if changeGenerationDuringRead {
+						generation += "x"
+					}
+					return []byte(generation + "\n"), nil
+				}
 				if cmd[0] == "cat" {
 					if cmd[1] == "/etc/trino/password-authenticator.properties" {
 						return []byte(config), nil
@@ -50,6 +58,18 @@ func TestTrinoAuthenticationReadinessRefreshAndInvalidation(t *testing.T) {
 			// Disable then re-enable before another observation must invalidate even identical content.
 			checker.SetExpected(map[string][]byte{"password.db": []byte("disabled"), "group.db": []byte("disabled")})
 			checker.SetExpected(desired)
+			check(false)
+			now = now.Add(delay)
+			check(true)
+			// Another control plane can disable/re-enable between our checks.
+			// Identical bytes in a new Secret projection still need a fresh wait.
+			generation = "..generation-2"
+			check(false)
+			now = now.Add(delay)
+			check(true)
+			changeGenerationDuringRead = true
+			check(false)
+			changeGenerationDuringRead = false
 			check(false)
 			now = now.Add(delay)
 			check(true)
@@ -102,6 +122,9 @@ func TestTrinoAuthenticationReadinessRejectsUnobservedCredentials(t *testing.T) 
 				if scenario == "exec failure" {
 					return nil, fmt.Errorf("private diagnostic must not escape")
 				}
+				if cmd[0] == "readlink" {
+					return []byte("..generation-1\n"), nil
+				}
 				if cmd[0] == "cat" {
 					if scenario == "replacement during config read" {
 						pod.Status.ContainerStatuses[0].ContainerID += "-new"
@@ -148,6 +171,9 @@ func TestTrinoAuthenticationReadinessInterleavedBackends(t *testing.T) {
 	green.Spec.Volumes[0].Secret.SecretName = TrinoAuthSecretName
 	values := map[string]string{"password.db": "password", "group.db": "groups"}
 	executor := trinoReadinessExecFunc(func(_ context.Context, _, _, _ string, cmd []string) ([]byte, error) {
+		if cmd[0] == "readlink" {
+			return []byte("..generation-1\n"), nil
+		}
 		if cmd[0] == "cat" {
 			if cmd[1] == "/etc/trino/password-authenticator.properties" {
 				return []byte("password-authenticator.name=file\nfile.password-file=/secrets/password.db\n"), nil
@@ -168,5 +194,14 @@ func TestTrinoAuthenticationReadinessInterleavedBackends(t *testing.T) {
 			}
 		}
 		now = now.Add(5 * time.Second)
+	}
+}
+
+func TestTrinoAuthenticationReadinessGenerationValidation(t *testing.T) {
+	for _, output := range []string{"", "\n", "..generation\nextra\n", "..generation\x00\n", strings.Repeat("x", 1025)} {
+		checker := NewKubernetesTrinoAuthenticationReadiness(fake.NewClientset(), trinoReadinessExecFunc(func(context.Context, string, string, string, []string) ([]byte, error) { return []byte(output), nil })).(*kubernetesTrinoAuthenticationReadiness)
+		if _, err := checker.authenticationGeneration(context.Background(), "cell", "coordinator", "engine", "/secrets"); err == nil {
+			t.Fatal("accepted invalid projection generation")
+		}
 	}
 }
