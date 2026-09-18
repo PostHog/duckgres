@@ -105,14 +105,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: neutral
-            lane_prefix: "1"
-          - suite: duckdb
-            lane_prefix: "2"
           - suite: trino
             lane_prefix: "3"
-          - suite: reshard
-            lane_prefix: "4"
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
     env:
@@ -137,9 +131,8 @@ jobs:
       # secret so no account id or internal role ARN lands in this public repo.
       # Only the trino matrix cell consumes it.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      # Pinned PostHog fork: it contains the DuckLake connector and the
-      # PostgreSQL-backed dynamic catalog store used by managed warehouse.
-      TRINO_IMAGE: ghcr.io/posthog/trino:b239980432446a9893a811282217039bab24f1c4@sha256:4e459a87deb4f567858c6d537e143ef4e9411c17325269231a5a2074e0c135d8
+      # Atomic Hoglake writes and the PostgreSQL-backed dynamic catalog store.
+      TRINO_IMAGE: ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -167,6 +160,9 @@ jobs:
           # account id is committed; the role name is not sensitive.
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
+
+      - name: Discover Hoglake CI configuration
+        run: bash tests/mw-dev/discover-hoglake.sh
 
       # Private EKS API — join the org tailnet so kubectl can reach it. OIDC/WIF,
       # no static key. Mirrors PostHog/hogland deploy.yml. The subnet router
@@ -232,14 +228,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: neutral
-            lane_prefix: "1"
-          - suite: duckdb
-            lane_prefix: "2"
           - suite: trino
             lane_prefix: "3"
-          - suite: reshard
-            lane_prefix: "4"
     env:
       PR_NUMBER: ${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
       NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix, github.event.pull_request.number || github.run_id) }}
@@ -254,6 +244,9 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
+
+      - name: Discover Hoglake CI configuration
+        run: bash tests/mw-dev/discover-hoglake.sh
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
         with:
@@ -290,6 +283,9 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/github-duckgres-e2e
           aws-region: us-east-1
+
+      - name: Discover Hoglake CI configuration
+        run: bash tests/mw-dev/discover-hoglake.sh
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
         with:

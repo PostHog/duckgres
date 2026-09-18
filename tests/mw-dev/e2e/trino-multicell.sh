@@ -42,7 +42,6 @@ pw_c="$(api -X POST -H 'Content-Type: application/json' \
   "$API/api/v1/orgs/$ORG_C/provision" | jq -r .password)"
 [ -n "$pw_c" ] && [ "$pw_c" != null ] || fail "new warehouse returned no password"
 wait_warehouse "$ORG_C"
-bootstrap_ducklake "$ORG_C" "$pw_c"
 api -X PUT -H 'Content-Type: application/json' -d '{"cell":"cell-test"}' \
   "$API/api/v1/orgs/$ORG_C/trino/cell" | jq -e '.assigned == true and .cell.id == "cell-test"' >/dev/null \
   || fail "initial cell selection failed"
@@ -127,11 +126,10 @@ rollout_readiness green | jq -e '.pods.total == 0 and .coordinator == null and .
   || fail "stopped green must report only pod absence"
 wait_rollout_warm blue
 
-trino_query "$DB_C" "$pw_c" "CREATE SCHEMA $CAT_C.cell_test" >/dev/null
-trino_query "$DB_C" "$pw_c" "CREATE TABLE $CAT_C.cell_test.values_test (value BIGINT)" >/dev/null
-trino_query "$DB_C" "$pw_c" "INSERT INTO $CAT_C.cell_test.values_test VALUES (7),(11)" >/dev/null
-result="$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")"
-[ "$result" = '[[2,18]]' ] || fail "new cell did not query real DuckLake data"
+trino_query "$DB_C" "$pw_c" "CREATE TABLE $CAT_C.main.values_test (value BIGINT)" >/dev/null
+trino_query "$DB_C" "$pw_c" "INSERT INTO $CAT_C.main.values_test VALUES (7),(11)" >/dev/null
+result="$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.main.values_test")"
+[ "$result" = '[[2,18]]' ] || fail "new cell did not query real Hoglake data"
 must_fail "$DB_A" "$pw_a" 'SELECT 1' '401|Unauthorized|Authentication|credentials'
 TRINO="$LEGACY_TRINO"
 log "legacy remains queryable"
@@ -176,14 +174,14 @@ wait_cell_ready
 TRINO="$GREEN_TRINO"
 wait_cell_auth
 wait_rollout_warm green
-result="$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")"
-[ "$result" = '[[2,18]]' ] || fail "green failed to hydrate its independent catalog from the same DuckLake warehouse"
+result="$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.main.values_test")"
+[ "$result" = '[[2,18]]' ] || fail "green failed to hydrate its independent catalog from the same Hoglake warehouse"
 must_fail "$DB_A" "$pw_a" 'SELECT 1' '401|Unauthorized|Authentication|credentials'
 TRINO="$BLUE_TRINO"
-[ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*) FROM $CAT_C.cell_test.values_test")" = '[[2]]' ] || fail "blue stopped serving during green hydration"
+[ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*) FROM $CAT_C.main.values_test")" = '[[2]]' ] || fail "blue stopped serving during green hydration"
 TRINO="$LEGACY_TRINO"
 [ "$(trino_query "$DB_A" "$pw_a" 'SELECT 1')" = '[[1]]' ] || fail "legacy failed during green hydration"
-log "PASS: initial placement + stopped green + isolated credentials/OPA + real DuckLake queries + green hydration"
+log "PASS: initial placement + stopped green + isolated credentials/OPA + real Hoglake queries + green hydration"
 
 log "registry-only startup without legacy"
 legacy_env="$("$KUBECTL" -n "$NS" get deployment duckgres-control-plane -o json | jq -c '.spec.template.spec.containers[] | select(.name == "controlplane") | .env[] | select(.name == "DUCKGRES_TRINO_COORDINATOR_URL")')"
@@ -199,7 +197,7 @@ printf %s "$cells" | jq -e '.cells | map(.id) == ["cell-test"]' >/dev/null \
 wait_cell_ready
 for endpoint in "$BLUE_TRINO" "$GREEN_TRINO"; do
   TRINO="$endpoint"
-  [ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
+  [ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.main.values_test")" = '[[2,18]]' ] \
     || fail "registry-only registered query failed"
 done
 code="$(curl --connect-timeout 5 --max-time 30 -sS -o /dev/null -w '%{http_code}' -H "$H" -H 'Content-Type: application/json' \

@@ -1,5 +1,11 @@
-# Frozen-perf metadata only. Parquet stays in the shared, read-only S3 fixture.
+# Isolated Hoglake metadata and server for Trino write tests or frozen perf.
 # Both deployments and the catalog PVC are removed with the scenario namespace.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hoglake
+  namespace: ${NAMESPACE}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -74,7 +80,7 @@ spec:
       annotations:
         karpenter.sh/do-not-disrupt: "true"
     spec:
-      serviceAccountName: trino
+      serviceAccountName: ${HOGLAKE_SERVICE_ACCOUNT}
       containers:
         - name: hoglake
           image: ${HOGLAKE_IMAGE}
