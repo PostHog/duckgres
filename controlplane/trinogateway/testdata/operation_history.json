@@ -1,0 +1,14 @@
+{
+  "protocolVersion" : 1,
+  "operationId" : "op-1",
+  "steps" : [ {
+    "stepId" : "admit",
+    "payloadHash" : "0000000000000000000000000000000000000000000000000000000000000000",
+    "controllerEpoch" : 7,
+    "outcome" : "OK",
+    "recordedAt" : "2026-09-18T00:00:00Z",
+    "result" : {
+      "phase" : "ACTIVE"
+    }
+  } ]
+}

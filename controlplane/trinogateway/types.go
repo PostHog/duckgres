@@ -1,70 +1,88 @@
 package trinogateway
 
-// Wire types for the Gateway pooled-member protocol v1. The JSON tags are the
-// cross-repo contract: a typo here fails closed only at runtime, so they are
-// asserted field by field in the client tests.
-
-// Checks duckgres performs before asking the Gateway to activate a member. The
-// Gateway records them verbatim and does NOT claim to have performed them.
+// Wire types for the Gateway pooled-member protocol v1.
 //
-// There is deliberately no auth-revision check: the coordinator acknowledges
-// CATALOG revisions only, and nothing in Trino exposes an application-loaded
-// version for the password/group providers or OPA. Claiming one here would put
-// an unverifiable assertion into the Gateway's record.
+// These mirror the Java records in PoolStore (PoolState, Member, Obligations,
+// Publication, TenantAdmission, FailureReceipt, OperationHistory) and the field
+// names PoolLifecycleService actually reads out of each request body. They are
+// pinned by decoding fixtures serialized by the real Java records, not by a
+// hand-written copy of a design document.
+//
+// Two details that are easy to get wrong and fail only at runtime:
+//
+//   - The Gateway computes each mutation's payload hash ITSELF, as a SHA-256
+//     over the canonicalized request body. A client must not send a payloadHash
+//     field; the only exception is openPublication, where payloadHash is an
+//     explicit publication input.
+//   - Admission is ONE call, POST .../admit, carrying a nested receipt. There
+//     is no separate certificate or activate route.
+
+// Checks duckgres performs against a candidate. The Gateway records the list
+// verbatim and does not claim to have performed any of them; it independently
+// verifies the live process identity from the member's own endpoint.
 const (
 	CheckImage                 = "image"
 	CheckWorkers               = "workers"
 	CheckCatalogRevision       = "catalog-revision"
+	CheckAuthRevision          = "auth-revision"
 	CheckOperationalConnection = "operational-connection"
 )
 
-// Step is the idempotency envelope every mutation carries.
+// Step is the idempotency envelope every mutation carries. The Gateway derives
+// the payload hash from the whole body, so replaying an identical body resolves
+// to the recorded result and a changed body under the same step is a conflict.
 type Step struct {
 	OperationID     string `json:"operationId"`
 	StepID          string `json:"stepId"`
 	ControllerEpoch int64  `json:"controllerEpoch"`
 }
 
-// Pool is the Gateway's view of a pool.
-type Pool struct {
-	ProtocolVersion        int            `json:"protocolVersion"`
-	PoolID                 string         `json:"poolId"`
-	APIMode                string         `json:"apiMode"`
-	ControllerEpoch        int64          `json:"controllerEpoch"`
-	MembershipGeneration   int64          `json:"membershipGeneration"`
-	MinServing             int            `json:"minServing"`
-	MaxSurge               int            `json:"maxSurge"`
-	RepairBudget           int            `json:"repairBudget"`
-	DesiredRevision        string         `json:"desiredRevision"`
-	AdmittedRevision       string         `json:"admittedRevision"`
-	TenantAdmissionEnabled bool           `json:"tenantAdmissionEnabled"`
-	Counts                 map[string]int `json:"counts"`
-	ServingMembers         int            `json:"servingMembers"`
-	LiveMembers            int            `json:"liveMembers"`
-	SurgeInUse             int            `json:"surgeInUse"`
-	RepairInUse            int            `json:"repairInUse"`
-	OpenPublications       int            `json:"openPublications"`
-	Blocked                []string       `json:"blocked"`
+// PoolState is PoolStore.PoolState.
+type PoolState struct {
+	ProtocolVersion        int              `json:"protocolVersion"`
+	PoolID                 string           `json:"poolId"`
+	APIMode                string           `json:"apiMode"`
+	ControllerEpoch        int64            `json:"controllerEpoch"`
+	MembershipGeneration   int64            `json:"membershipGeneration"`
+	MinServing             int              `json:"minServing"`
+	DesiredMembers         int              `json:"desiredMembers"`
+	MaxSurge               int              `json:"maxSurge"`
+	MaxRepair              int              `json:"maxRepair"`
+	DesiredRevision        string           `json:"desiredRevision"`
+	AdmittedRevision       string           `json:"admittedRevision"`
+	TenantAdmissionEnabled bool             `json:"tenantAdmissionEnabled"`
+	Counts                 map[string]int64 `json:"counts"`
+	ServingMembers         int64            `json:"servingMembers"`
+	LiveMembers            int64            `json:"liveMembers"`
+	SurgeInUse             int64            `json:"surgeInUse"`
+	RepairInUse            int64            `json:"repairInUse"`
+	OpenPublications       int64            `json:"openPublications"`
+	Blocked                []string         `json:"blocked"`
+	Replayed               bool             `json:"replayed"`
 }
 
-// UpdatePoolRequest configures the pool. It never lowers the controller epoch.
-type UpdatePoolRequest struct {
-	ControllerEpoch        int64  `json:"controllerEpoch"`
+// ConfigurePoolRequest is the PUT body. desiredMembers defaults to minServing
+// on the Gateway side when absent, so it is always sent explicitly here.
+type ConfigurePoolRequest struct {
+	Step
 	APIMode                string `json:"apiMode"`
 	MinServing             int    `json:"minServing"`
+	DesiredMembers         int    `json:"desiredMembers"`
 	MaxSurge               int    `json:"maxSurge"`
-	RepairBudget           int    `json:"repairBudget"`
-	DesiredRevision        string `json:"desiredRevision"`
+	MaxRepair              int    `json:"maxRepair"`
+	DesiredRevision        string `json:"desiredRevision,omitempty"`
 	TenantAdmissionEnabled bool   `json:"tenantAdmissionEnabled"`
 }
 
-// Member is the shape every member response shares.
+// Member is PoolStore.Member.
 type Member struct {
 	ProtocolVersion      int    `json:"protocolVersion"`
 	PoolID               string `json:"poolId"`
 	InstanceID           string `json:"instanceId"`
 	Incarnation          string `json:"incarnation"`
 	BackendName          string `json:"backendName"`
+	URL                  string `json:"url"`
+	ExternalURL          string `json:"externalUrl"`
 	Phase                string `json:"phase"`
 	Generation           int64  `json:"generation"`
 	ControllerEpoch      int64  `json:"controllerEpoch"`
@@ -74,85 +92,120 @@ type Member struct {
 	CoordinatorID        string `json:"coordinatorId"`
 	ConfigRevision       string `json:"configRevision"`
 	CertifiedRevision    string `json:"certifiedRevision"`
-	PendingRequests      int    `json:"pendingRequests"`
-	OpenTransactions     int    `json:"openTransactions"`
-	ActiveQueries        int    `json:"activeQueries"`
-	ReadyToSeal          bool   `json:"readyToSeal"`
-	Eligible             bool   `json:"eligible"`
+	AuthRevision         string `json:"authRevision"`
+	Repair               bool   `json:"repair"`
+	RepairFor            string `json:"repairFor"`
 	RetirementKind       string `json:"retirementKind"`
+	PendingRequests      int64  `json:"pendingRequests"`
+	OpenTransactions     int64  `json:"openTransactions"`
+	ActiveQueries        int64  `json:"activeQueries"`
+	ReadyToSeal          bool   `json:"readyToSeal"`
+	Drained              bool   `json:"drained"`
+	Eligible             bool   `json:"eligible"`
 	MembershipGeneration int64  `json:"membershipGeneration"`
-	// Replayed marks a recorded result returned for an identical step rather
-	// than a fresh mutation.
-	Replayed bool `json:"replayed"`
+	Replayed             bool   `json:"replayed"`
 }
 
-// Obligations reports what still pins a member. Drain completion is read from
-// here; it is never inferred from a timer.
-func (m Member) Obligations() int {
-	return m.PendingRequests + m.OpenTransactions + m.ActiveQueries
+// Obligations is PoolStore.Obligations, returned by its own endpoint.
+//
+// Drain completion is read from HERE, never from a Member response: Go decodes
+// an absent JSON field as zero, so a Member that happens to omit the counters
+// would look like a safely drained member. This record always carries them.
+type Obligations struct {
+	ProtocolVersion  int    `json:"protocolVersion"`
+	InstanceID       string `json:"instanceId"`
+	Incarnation      string `json:"incarnation"`
+	Phase            string `json:"phase"`
+	Generation       int64  `json:"generation"`
+	PendingRequests  int64  `json:"pendingRequests"`
+	OpenTransactions int64  `json:"openTransactions"`
+	ActiveQueries    int64  `json:"activeQueries"`
+	ReadyToSeal      bool   `json:"readyToSeal"`
+	Drained          bool   `json:"drained"`
 }
 
-// RegisterMemberRequest creates a PREPARING member. Registration never creates
-// an eligible ACTIVE member.
+// Outstanding reports the work still pinned to the member.
+func (o Obligations) Outstanding() int64 {
+	return o.PendingRequests + o.OpenTransactions + o.ActiveQueries
+}
+
+// RegisterMemberRequest creates an unroutable PREPARING member.
+//
+// backendName must already exist as a Gateway backend registration in this
+// routing group: the Gateway takes the endpoint from that record rather than
+// trusting a caller-supplied URL, and observes the coordinator's process
+// identity itself. url is optional and, when sent, must match exactly.
 type RegisterMemberRequest struct {
 	Step
 	InstanceID     string `json:"instanceId"`
 	BackendName    string `json:"backendName"`
-	URL            string `json:"url"`
-	ExternalURL    string `json:"externalUrl,omitempty"`
+	URL            string `json:"url,omitempty"`
 	PodUID         string `json:"podUid"`
 	BootID         string `json:"bootId"`
 	ConfigRevision string `json:"configRevision"`
+	// RepairFor charges the member to the repair budget instead of the single
+	// planned surge, and names the failed instance it replaces.
+	RepairFor string `json:"repairFor,omitempty"`
 }
 
-// MemberStepRequest is the envelope for activate/drain/seal/retire/retired.
+// ValidationReceipt is the nested receipt of an admission. Every string field is
+// required by the Gateway: an empty value is rejected as a validation error.
+type ValidationReceipt struct {
+	CertificateHash string   `json:"certificateHash"`
+	ConfigRevision  string   `json:"configRevision"`
+	AuthRevision    string   `json:"authRevision"`
+	PodUID          string   `json:"podUid"`
+	BootID          string   `json:"bootId"`
+	NodeID          string   `json:"nodeId"`
+	CoordinatorID   string   `json:"coordinatorId"`
+	ReadyWorkers    int      `json:"readyWorkers"`
+	Checks          []string `json:"checks"`
+}
+
+// AdmitMemberRequest is the single certified-activation call.
+type AdmitMemberRequest struct {
+	Step
+	ExpectedGeneration int64             `json:"expectedGeneration"`
+	Receipt            ValidationReceipt `json:"receipt"`
+}
+
+// MemberStepRequest is the envelope for drain, seal, retire and retired.
 type MemberStepRequest struct {
 	Step
 	ExpectedGeneration int64 `json:"expectedGeneration"`
-	// RepairFor charges the activation to the repair budget instead of the
-	// single planned surge.
-	RepairFor string `json:"repairFor,omitempty"`
 	// ResourcesAbsent is the operator's assertion on `retired`. The Gateway
 	// records it and never infers resource deletion for itself.
-	ResourcesAbsent bool   `json:"resourcesAbsent,omitempty"`
-	Reason          string `json:"reason,omitempty"`
+	ResourcesAbsent bool `json:"resourcesAbsent,omitempty"`
 }
 
-// CertificateRequest carries a duckgres-performed validation receipt bound to
-// the exact process identity it was observed against. A restart or a config
-// change invalidates it.
-type CertificateRequest struct {
+// SuspectMemberRequest excludes a member from new admissions. The reason is
+// required and is recorded.
+type SuspectMemberRequest struct {
 	Step
-	ExpectedGeneration int64    `json:"expectedGeneration"`
-	ConfigRevision     string   `json:"configRevision"`
-	PodUID             string   `json:"podUid"`
-	BootID             string   `json:"bootId"`
-	NodeID             string   `json:"nodeId"`
-	CoordinatorID      string   `json:"coordinatorId"`
-	ReadyWorkers       int      `json:"readyWorkers"`
-	Checks             []string `json:"checks"`
-	CertificateHash    string   `json:"certificateHash"`
+	ExpectedGeneration int64  `json:"expectedGeneration"`
+	Reason             string `json:"reason"`
 }
 
-// LostRequest claims a member's process terminated. Evidence is mandatory: a
-// probe timeout is not death, and a partitioned but possibly live process needs
-// an explicit destructive authorization instead.
-type LostRequest struct {
+// LostMemberRequest claims a member's process terminated. Evidence is
+// mandatory: a probe timeout is not death, and a partitioned but possibly live
+// process needs an explicit destructive authorization instead.
+type LostMemberRequest struct {
 	Step
 	ExpectedGeneration       int64            `json:"expectedGeneration"`
 	Evidence                 string           `json:"evidence"`
-	DestructiveAuthorization bool             `json:"destructiveAuthorization,omitempty"`
 	Termination              TerminationProof `json:"termination"`
+	DestructiveAuthorization bool             `json:"destructiveAuthorization,omitempty"`
+	Reason                   string           `json:"reason,omitempty"`
 }
 
-// TerminationProof binds the loss claim to one exact incarnation.
+// TerminationProof binds a loss claim to one exact incarnation.
 type TerminationProof struct {
 	PodUID        string `json:"podUid"`
 	BootID        string `json:"bootId"`
 	NodeID        string `json:"nodeId"`
 	CoordinatorID string `json:"coordinatorId"`
 	Source        string `json:"source"`
-	ObservedAt    string `json:"observedAt"`
+	ObservedAt    string `json:"observedAt,omitempty"`
 }
 
 // Evidence values for a loss claim.
@@ -161,11 +214,21 @@ const (
 	EvidenceDestructiveOverride = "DESTRUCTIVE_OVERRIDE"
 )
 
-// Operation is the recorded step history, used to resolve a lost response.
-type Operation struct {
-	ProtocolVersion int             `json:"protocolVersion"`
-	OperationID     string          `json:"operationId"`
-	Steps           []OperationStep `json:"steps"`
+// FailureReceipt is PoolStore.FailureReceipt: a failed member's preserved
+// obligations, never reported as a successful drain.
+type FailureReceipt struct {
+	ProtocolVersion int    `json:"protocolVersion"`
+	PoolID          string `json:"poolId"`
+	InstanceID      string `json:"instanceId"`
+	Incarnation     string `json:"incarnation"`
+	Evidence        string `json:"evidence"`
+	// Detail is the Gateway's free-form evidence record, kept as decoded JSON
+	// so a future field cannot silently change its meaning here.
+	Detail                  map[string]any `json:"detail"`
+	OutstandingAdmissions   int64          `json:"outstandingAdmissions"`
+	OutstandingTransactions int64          `json:"outstandingTransactions"`
+	OutstandingQueries      int64          `json:"outstandingQueries"`
+	RecordedAt              string         `json:"recordedAt"`
 }
 
 // OperationStep is one recorded step outcome.
@@ -178,8 +241,15 @@ type OperationStep struct {
 	Result          map[string]any `json:"result"`
 }
 
+// OperationHistory is the read-back that resolves a lost response.
+type OperationHistory struct {
+	ProtocolVersion int             `json:"protocolVersion"`
+	OperationID     string          `json:"operationId"`
+	Steps           []OperationStep `json:"steps"`
+}
+
 // Step returns the recorded outcome of one step, if it was reached.
-func (o Operation) Step(stepID string) (OperationStep, bool) {
+func (o OperationHistory) Step(stepID string) (OperationStep, bool) {
 	for _, step := range o.Steps {
 		if step.StepID == stepID {
 			return step, true
@@ -188,7 +258,8 @@ func (o Operation) Step(stepID string) (OperationStep, bool) {
 	return OperationStep{}, false
 }
 
-// OpenPublicationRequest opens the publication barrier for one tenant.
+// OpenPublicationRequest opens the tenant publication barrier. payloadHash is
+// an explicit input here, unlike the guard hash the Gateway computes itself.
 type OpenPublicationRequest struct {
 	Step
 	PublicationID                string `json:"publicationId"`
@@ -205,7 +276,7 @@ type PublicationReceiptRequest struct {
 	PodUID          string `json:"podUid"`
 	BootID          string `json:"bootId"`
 	AppliedRevision string `json:"appliedRevision"`
-	AuthFingerprint string `json:"authFingerprint,omitempty"`
+	AuthFingerprint string `json:"authFingerprint"`
 }
 
 // CommitPublicationRequest closes the barrier and opens the tenant gate.
@@ -214,16 +285,47 @@ type CommitPublicationRequest struct {
 	ExpectedMembershipGeneration int64 `json:"expectedMembershipGeneration"`
 }
 
-// Publication is the Gateway's view of a barrier.
+// PublicationReceipt is one recorded member acknowledgement.
+type PublicationReceipt struct {
+	InstanceID      string `json:"instanceId"`
+	Incarnation     string `json:"incarnation"`
+	PodUID          string `json:"podUid"`
+	BootID          string `json:"bootId"`
+	AppliedRevision string `json:"appliedRevision"`
+	AuthFingerprint string `json:"authFingerprint"`
+}
+
+// Publication is PoolStore.Publication.
 type Publication struct {
-	ProtocolVersion      int      `json:"protocolVersion"`
-	PublicationID        string   `json:"publicationId"`
-	PoolID               string   `json:"poolId"`
-	Tenant               string   `json:"tenant"`
-	TargetRevision       string   `json:"targetRevision"`
-	Phase                string   `json:"phase"`
-	MembershipGeneration int64    `json:"membershipGeneration"`
-	RequiredMembers      []string `json:"requiredMembers"`
-	ReceivedReceipts     []string `json:"receivedReceipts"`
-	Replayed             bool     `json:"replayed"`
+	ProtocolVersion      int                  `json:"protocolVersion"`
+	PublicationID        string               `json:"publicationId"`
+	PoolID               string               `json:"poolId"`
+	Tenant               string               `json:"tenant"`
+	TargetRevision       string               `json:"targetRevision"`
+	MembershipGeneration int64                `json:"membershipGeneration"`
+	Phase                string               `json:"phase"`
+	RequiredMembers      []string             `json:"requiredMembers"`
+	Receipts             []PublicationReceipt `json:"receipts"`
+	MissingMembers       []string             `json:"missingMembers"`
+	TenantState          string               `json:"tenantState"`
+	AdmittedRevision     string               `json:"admittedRevision"`
+	Replayed             bool                 `json:"replayed"`
+}
+
+// TenantAdmission is PoolStore.TenantAdmission.
+type TenantAdmission struct {
+	ProtocolVersion  int    `json:"protocolVersion"`
+	PoolID           string `json:"poolId"`
+	Tenant           string `json:"tenant"`
+	State            string `json:"state"`
+	AdmittedRevision string `json:"admittedRevision"`
+	PublicationID    string `json:"publicationId"`
+	Replayed         bool   `json:"replayed"`
+}
+
+// RevokeTenantRequest closes a tenant's admission gate. Revocation is not
+// additive publication: it takes effect for new work immediately.
+type RevokeTenantRequest struct {
+	Step
+	Reason string `json:"reason"`
 }

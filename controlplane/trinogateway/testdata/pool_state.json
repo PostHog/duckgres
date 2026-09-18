@@ -1,0 +1,27 @@
+{
+  "protocolVersion" : 1,
+  "poolId" : "pool-001",
+  "apiMode" : "POOLED",
+  "controllerEpoch" : 7,
+  "membershipGeneration" : 19,
+  "minServing" : 3,
+  "desiredMembers" : 3,
+  "maxSurge" : 1,
+  "maxRepair" : 1,
+  "desiredRevision" : "r-42",
+  "admittedRevision" : "r-41",
+  "tenantAdmissionEnabled" : true,
+  "counts" : {
+    "RETIRED" : 4,
+    "ACTIVE" : 3,
+    "LOST" : 1,
+    "PREPARING" : 1
+  },
+  "servingMembers" : 3,
+  "liveMembers" : 4,
+  "surgeInUse" : 1,
+  "repairInUse" : 0,
+  "openPublications" : 0,
+  "blocked" : [ ],
+  "replayed" : false
+}

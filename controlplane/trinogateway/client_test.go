@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -52,19 +54,27 @@ func gatewayError(w http.ResponseWriter, status int, code string) {
 	_, _ = w.Write([]byte(code))
 }
 
-func memberResponse(phase string, generation int64) map[string]any {
-	return map[string]any{
-		"protocolVersion": 1, "poolId": "pool-1", "instanceId": "i-1",
-		"incarnation": "11111111-1111-4111-8111-111111111111", "backendName": "pool-1-i-1",
-		"phase": phase, "generation": generation, "controllerEpoch": 7,
-		"membershipGeneration": 19, "replayed": false,
+// memberResponse is the real Java-serialized member fixture, adjusted for the
+// phase and generation a given test needs. Building it from the fixture keeps
+// the handler's responses in the shape the Gateway actually emits.
+func memberResponse(t *testing.T, phase string, generation int64) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "member.json"))
+	if err != nil {
+		t.Fatalf("read member fixture: %v", err)
 	}
+	var response map[string]any
+	if err := json.Unmarshal(data, &response); err != nil {
+		t.Fatalf("decode member fixture: %v", err)
+	}
+	response["phase"], response["generation"] = phase, generation
+	return response
 }
 
 // The Gateway's existing admin credential is reused; this adds no new secret.
 func TestClientSendsTheExistingAdminCredential(t *testing.T) {
 	client, captured := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusOK, memberResponse("PREPARING", 1))
+		writeJSON(t, w, http.StatusOK, memberResponse(t, "PREPARING", 1))
 	})
 	if _, err := client.RegisterMember(context.Background(), "pool-1", RegisterMemberRequest{
 		Step:       Step{OperationID: "op-1", StepID: "register", ControllerEpoch: 7},
@@ -89,67 +99,80 @@ func TestClientSendsTheExistingAdminCredential(t *testing.T) {
 // runtime and would only show up in a live deployment.
 func TestRegisterMemberBodyMatchesTheContract(t *testing.T) {
 	client, captured := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusOK, memberResponse("PREPARING", 1))
+		writeJSON(t, w, http.StatusOK, memberResponse(t, "PREPARING", 1))
 	})
 	if _, err := client.RegisterMember(context.Background(), "pool-1", RegisterMemberRequest{
 		Step:       Step{OperationID: "op-1", StepID: "register", ControllerEpoch: 7},
 		InstanceID: "i-1", BackendName: "pool-1-i-1", URL: "https://i-1.invalid:8443",
-		ExternalURL: "https://i-1.external.invalid:8443",
-		PodUID:      "pod-uid", BootID: "boot-id", ConfigRevision: "r-42",
+		PodUID: "pod-uid", BootID: "boot-id", ConfigRevision: "r-42",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	body := (*captured)[0].body
-	for _, field := range []string{"operationId", "stepId", "controllerEpoch", "instanceId", "backendName", "url", "externalUrl", "podUid", "bootId", "configRevision"} {
+	// Exactly the fields PoolLifecycleService.registerMember reads.
+	for _, field := range []string{"operationId", "stepId", "controllerEpoch", "instanceId", "backendName", "url", "podUid", "bootId", "configRevision"} {
 		if _, present := body[field]; !present {
 			t.Errorf("request body is missing %q", field)
 		}
 	}
+	// The Gateway computes the guard's payload hash from the canonicalized body
+	// itself. Sending one would change that body and therefore the hash, making
+	// an identical replay look like a changed intent.
+	if _, present := body["payloadHash"]; present {
+		t.Error("the client sent a payloadHash the Gateway computes itself")
+	}
+	// The endpoint comes from the Gateway's own backend registration; there is
+	// no externalUrl input.
+	if _, present := body["externalUrl"]; present {
+		t.Error("the client sent externalUrl, which the Gateway does not read")
+	}
 }
 
-func TestActivateSendsTheGenerationCAS(t *testing.T) {
+func TestAdmitIsASingleCallCarryingTheReceipt(t *testing.T) {
 	client, captured := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusOK, memberResponse("ACTIVE", 4))
+		writeJSON(t, w, http.StatusOK, memberResponse(t, "ACTIVE", 4))
 	})
-	member, err := client.ActivateMember(context.Background(), "pool-1", "i-1", MemberStepRequest{
-		Step: Step{OperationID: "op-1", StepID: "activate", ControllerEpoch: 7}, ExpectedGeneration: 3,
-	})
+	member, err := client.AdmitMember(context.Background(), "pool-1", "i-1", admitRequest())
 	if err != nil {
-		t.Fatalf("activate: %v", err)
+		t.Fatalf("admit: %v", err)
 	}
 	if member.Phase != "ACTIVE" || member.Generation != 4 {
 		t.Fatalf("member = %+v", member)
 	}
-	body := (*captured)[0].body
-	if body["expectedGeneration"] != float64(3) {
-		t.Fatalf("expectedGeneration = %v", body["expectedGeneration"])
+	request := (*captured)[0]
+	// Admission is ONE call with a nested receipt. There is no /certificate and
+	// no /activate route; posting to either would 404 in production while every
+	// mock-based test kept passing.
+	if request.path != "/gateway/v1/pools/pool-1/members/i-1/admit" {
+		t.Fatalf("path = %s", request.path)
+	}
+	if request.body["expectedGeneration"] != float64(3) {
+		t.Fatalf("expectedGeneration = %v", request.body["expectedGeneration"])
+	}
+	receipt, ok := request.body["receipt"].(map[string]any)
+	if !ok {
+		t.Fatalf("receipt is not a nested object: %v", request.body["receipt"])
+	}
+	// Every one of these is read with a required-text accessor on the Java
+	// side: an empty value is a 400, not a default.
+	for _, field := range []string{"certificateHash", "configRevision", "authRevision", "podUid", "bootId", "nodeId", "coordinatorId", "readyWorkers", "checks"} {
+		if _, present := receipt[field]; !present {
+			t.Errorf("receipt is missing %q", field)
+		}
 	}
 }
 
-// The certificate reports checks DUCKGRES performed. Claiming an
-// auth-projection check the coordinator cannot acknowledge would be a lie the
-// Gateway would record verbatim.
-func TestCertificateReportsOnlyPerformedChecks(t *testing.T) {
-	client, captured := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusOK, memberResponse("PREPARING", 2))
-	})
-	if _, err := client.CertifyMember(context.Background(), "pool-1", "i-1", CertificateRequest{
-		Step: Step{OperationID: "op-1", StepID: "certificate", ControllerEpoch: 7}, ExpectedGeneration: 1,
-		ConfigRevision: "r-42", PodUID: "pod-uid", BootID: "boot-id",
-		NodeID: "node-1", CoordinatorID: "abcde", ReadyWorkers: 4,
-		Checks:          []string{CheckImage, CheckWorkers, CheckCatalogRevision, CheckOperationalConnection},
-		CertificateHash: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-	}); err != nil {
-		t.Fatalf("certify: %v", err)
-	}
-	checks, _ := (*captured)[0].body["checks"].([]any)
-	for _, check := range checks {
-		if check == "auth-revision" {
-			t.Fatal("certificate claimed an auth-revision check nothing can acknowledge")
-		}
-	}
-	if len(checks) != 4 {
-		t.Fatalf("checks = %v", checks)
+func admitRequest() AdmitMemberRequest {
+	return AdmitMemberRequest{
+		Step:               Step{OperationID: "op-1", StepID: "admit", ControllerEpoch: 7},
+		ExpectedGeneration: 3,
+		Receipt: ValidationReceipt{
+			CertificateHash: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+			ConfigRevision:  "r-42", AuthRevision: "auth-9",
+			PodUID: "pod-uid", BootID: "boot-id", NodeID: "node-1", CoordinatorID: "abcde",
+			ReadyWorkers: 4,
+			Checks:       []string{CheckImage, CheckWorkers, CheckCatalogRevision, CheckAuthRevision, CheckOperationalConnection},
+		},
 	}
 }
 
@@ -170,19 +193,26 @@ func TestGatewayConflictsAreTypedAndTerminal(t *testing.T) {
 		"POOL_RECEIPTS_INCOMPLETE": ErrReceiptsIncomplete,
 		"POOL_EVIDENCE_REQUIRED":   ErrEvidenceRequired,
 		"POOL_DISABLED":            ErrPoolDisabled,
+		"POOL_VALIDATION":          ErrValidation,
+		"POOL_NOT_FOUND":           ErrNotFound,
+		"POOL_IDENTITY_CONFLICT":   ErrIdentityConflict,
+		"POOL_APIMODE":             ErrAPIMode,
+		"POOL_NOT_DRAINED":         ErrNotDrained,
+		"POOL_REPAIR_BUDGET":       ErrRepairBudget,
 	}
 	for code, expected := range cases {
 		t.Run(code, func(t *testing.T) {
 			status := http.StatusConflict
-			if code == "POOL_DISABLED" {
+			switch code {
+			case "POOL_DISABLED", "POOL_NOT_FOUND":
 				status = http.StatusNotFound
+			case "POOL_VALIDATION":
+				status = http.StatusBadRequest
 			}
 			client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 				gatewayError(w, status, code)
 			})
-			_, err := client.ActivateMember(context.Background(), "pool-1", "i-1", MemberStepRequest{
-				Step: Step{OperationID: "op-1", StepID: "activate", ControllerEpoch: 7}, ExpectedGeneration: 1,
-			})
+			_, err := client.AdmitMember(context.Background(), "pool-1", "i-1", admitRequest())
 			if !errors.Is(err, expected) {
 				t.Fatalf("error = %v, want %v", err, expected)
 			}
@@ -208,15 +238,13 @@ func TestUnavailableIsRetryable(t *testing.T) {
 // tell that apart from a fresh mutation so it does not double-count effects.
 func TestReplayedResponsesAreReported(t *testing.T) {
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		response := memberResponse("ACTIVE", 4)
+		response := memberResponse(t, "ACTIVE", 4)
 		response["replayed"] = true
 		writeJSON(t, w, http.StatusOK, response)
 	})
-	member, err := client.ActivateMember(context.Background(), "pool-1", "i-1", MemberStepRequest{
-		Step: Step{OperationID: "op-1", StepID: "activate", ControllerEpoch: 7}, ExpectedGeneration: 3,
-	})
+	member, err := client.AdmitMember(context.Background(), "pool-1", "i-1", admitRequest())
 	if err != nil {
-		t.Fatalf("activate: %v", err)
+		t.Fatalf("admit: %v", err)
 	}
 	if !member.Replayed {
 		t.Fatal("a replayed response was reported as a fresh mutation")
@@ -230,18 +258,18 @@ func TestOperationReadBackResolvesALostResponse(t *testing.T) {
 		writeJSON(t, w, http.StatusOK, map[string]any{
 			"protocolVersion": 1, "operationId": "op-1",
 			"steps": []any{map[string]any{
-				"stepId": "activate", "payloadHash": "abc", "controllerEpoch": 7,
+				"stepId": "admit", "payloadHash": "abc", "controllerEpoch": 7,
 				"outcome": "OK", "recordedAt": "2026-09-18T00:00:00Z",
 				"result": map[string]any{"phase": "ACTIVE"},
 			}},
 		})
 	})
-	operation, err := client.GetOperation(context.Background(), "pool-1", "op-1")
+	history, err := client.GetOperation(context.Background(), "pool-1", "op-1")
 	if err != nil {
 		t.Fatalf("get operation: %v", err)
 	}
-	if len(operation.Steps) != 1 || operation.Steps[0].StepID != "activate" || operation.Steps[0].Outcome != "OK" {
-		t.Fatalf("operation = %+v", operation)
+	if len(history.Steps) != 1 || history.Steps[0].StepID != "admit" || history.Steps[0].Outcome != "OK" {
+		t.Fatalf("history = %+v", history)
 	}
 	if (*captured)[0].path != "/gateway/v1/pools/pool-1/operations/op-1" {
 		t.Fatalf("path = %s", (*captured)[0].path)

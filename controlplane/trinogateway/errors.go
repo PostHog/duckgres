@@ -33,6 +33,20 @@ var (
 	ErrEvidenceRequired   = errors.New("gateway refused a loss claim without termination evidence")
 	ErrTenantNotAdmitted  = errors.New("gateway tenant admission gate is not open")
 	ErrUnavailable        = errors.New("gateway is unavailable")
+
+	// The Gateway rejects a malformed request body with POOL_VALIDATION. For
+	// this client that is a bug in the caller, never something to retry.
+	ErrValidation = errors.New("gateway rejected the request body")
+	ErrNotFound   = errors.New("gateway does not know this pool, member or receipt")
+	// ErrIdentityConflict covers a member registered against a backend that
+	// belongs to another routing group, or an endpoint that does not match the
+	// Gateway's own backend registration.
+	ErrIdentityConflict = errors.New("gateway refused a conflicting member identity")
+	ErrAPIMode          = errors.New("gateway refused the call for this pool's api mode")
+	// ErrNotDrained is the Gateway refusing to seal a member that still has
+	// obligations. It is the authoritative answer to "is the drain finished".
+	ErrNotDrained   = errors.New("gateway refused to seal a member that is not drained")
+	ErrRepairBudget = errors.New("gateway refused an activation: repair budget exhausted")
 )
 
 // Error carries the Gateway's response code alongside the mapped sentinel.
@@ -69,6 +83,12 @@ var codeSentinels = map[string]error{
 	"POOL_MEMBERSHIP_CHANGED":    ErrMembershipChanged,
 	"POOL_RECEIPTS_INCOMPLETE":   ErrReceiptsIncomplete,
 	"POOL_EVIDENCE_REQUIRED":     ErrEvidenceRequired,
+	"POOL_VALIDATION":            ErrValidation,
+	"POOL_NOT_FOUND":             ErrNotFound,
+	"POOL_IDENTITY_CONFLICT":     ErrIdentityConflict,
+	"POOL_APIMODE":               ErrAPIMode,
+	"POOL_NOT_DRAINED":           ErrNotDrained,
+	"POOL_REPAIR_BUDGET":         ErrRepairBudget,
 	"TENANT_NOT_ADMITTED":        ErrTenantNotAdmitted,
 	"ROUTING_STATE_UNAVAILABLE":  ErrUnavailable,
 	"TENANT_IDENTITY_UNVERIFIED": ErrTenantNotAdmitted,

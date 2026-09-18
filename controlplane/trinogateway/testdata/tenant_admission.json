@@ -1,0 +1,9 @@
+{
+  "protocolVersion" : 1,
+  "poolId" : "pool-001",
+  "tenant" : "tenant-a",
+  "state" : "ADMITTED",
+  "admittedRevision" : "r-42",
+  "publicationId" : "pub-1",
+  "replayed" : false
+}

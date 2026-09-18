@@ -94,45 +94,57 @@ func NewClient(config Config) (*Client, error) {
 }
 
 // GetPool reads the pool's authoritative counts and generations.
-func (c *Client) GetPool(ctx context.Context, poolID string) (Pool, error) {
-	var pool Pool
+func (c *Client) GetPool(ctx context.Context, poolID string) (PoolState, error) {
+	var pool PoolState
 	err := c.do(ctx, http.MethodGet, c.poolPath(poolID), nil, &pool)
 	return pool, err
 }
 
-// UpdatePool applies the desired pool configuration.
-func (c *Client) UpdatePool(ctx context.Context, poolID string, request UpdatePoolRequest) (Pool, error) {
-	var pool Pool
+// ConfigurePool applies the desired pool specification.
+func (c *Client) ConfigurePool(ctx context.Context, poolID string, request ConfigurePoolRequest) (PoolState, error) {
+	var pool PoolState
 	err := c.do(ctx, http.MethodPut, c.poolPath(poolID), request, &pool)
 	return pool, err
 }
 
-// ListMembers reads the authoritative member list. This is also the read-back
-// path after a lost response on any member mutation.
+// ListMembers reads the authoritative member list. The Gateway returns a bare
+// JSON array, not an envelope.
 func (c *Client) ListMembers(ctx context.Context, poolID string) ([]Member, error) {
-	var response struct {
-		Members []Member `json:"members"`
-	}
-	if err := c.do(ctx, http.MethodGet, c.poolPath(poolID)+"/members", nil, &response); err != nil {
+	var members []Member
+	if err := c.do(ctx, http.MethodGet, c.poolPath(poolID)+"/members", nil, &members); err != nil {
 		return nil, err
 	}
-	return response.Members, nil
+	return members, nil
 }
 
-// RegisterMember creates a PREPARING member. It is not eligible for tenant work.
+// GetMember reads one member back. This is the read-back path after a lost
+// response on a member mutation.
+func (c *Client) GetMember(ctx context.Context, poolID, instanceID string) (Member, error) {
+	var member Member
+	err := c.do(ctx, http.MethodGet, c.memberPath(poolID, instanceID), nil, &member)
+	return member, err
+}
+
+// GetObligations reads what still pins a member. Drain completion is decided
+// here and nowhere else.
+func (c *Client) GetObligations(ctx context.Context, poolID, instanceID string) (Obligations, error) {
+	var obligations Obligations
+	err := c.do(ctx, http.MethodGet, c.memberPath(poolID, instanceID)+"/obligations", nil, &obligations)
+	return obligations, err
+}
+
+// RegisterMember creates a PREPARING member against an EXISTING Gateway backend
+// registration. It is not eligible for tenant work.
 func (c *Client) RegisterMember(ctx context.Context, poolID string, request RegisterMemberRequest) (Member, error) {
 	return c.member(ctx, http.MethodPost, c.poolPath(poolID)+"/members", request)
 }
 
-// CertifyMember records the duckgres-performed validation receipt.
-func (c *Client) CertifyMember(ctx context.Context, poolID, instanceID string, request CertificateRequest) (Member, error) {
-	return c.member(ctx, http.MethodPost, c.memberPath(poolID, instanceID)+"/certificate", request)
-}
-
-// ActivateMember asks the Gateway to admit the member. The Gateway enforces the
-// certificate freshness, the budgets and any open publication barrier.
-func (c *Client) ActivateMember(ctx context.Context, poolID, instanceID string, request MemberStepRequest) (Member, error) {
-	return c.member(ctx, http.MethodPost, c.memberPath(poolID, instanceID)+"/activate", request)
+// AdmitMember is the single certified-activation call: it carries the
+// duckgres-performed validation receipt and the generation CAS. The Gateway
+// enforces certificate freshness, the budgets and any open publication barrier,
+// and independently verifies the live process identity.
+func (c *Client) AdmitMember(ctx context.Context, poolID, instanceID string, request AdmitMemberRequest) (Member, error) {
+	return c.member(ctx, http.MethodPost, c.memberPath(poolID, instanceID)+"/admit", request)
 }
 
 // DrainMember starts a planned drain. The Gateway refuses it when the serving
@@ -149,12 +161,12 @@ func (c *Client) SealMember(ctx context.Context, poolID, instanceID string, requ
 
 // SuspectMember excludes a member from new admissions. It authorizes nothing
 // destructive.
-func (c *Client) SuspectMember(ctx context.Context, poolID, instanceID string, request MemberStepRequest) (Member, error) {
+func (c *Client) SuspectMember(ctx context.Context, poolID, instanceID string, request SuspectMemberRequest) (Member, error) {
 	return c.member(ctx, http.MethodPost, c.memberPath(poolID, instanceID)+"/suspect", request)
 }
 
 // LostMember records that a member's process terminated, with evidence.
-func (c *Client) LostMember(ctx context.Context, poolID, instanceID string, request LostRequest) (Member, error) {
+func (c *Client) LostMember(ctx context.Context, poolID, instanceID string, request LostMemberRequest) (Member, error) {
 	return c.member(ctx, http.MethodPost, c.memberPath(poolID, instanceID)+"/lost", request)
 }
 
@@ -171,13 +183,20 @@ func (c *Client) MemberRetired(ctx context.Context, poolID, instanceID string, r
 	return c.member(ctx, http.MethodPost, c.memberPath(poolID, instanceID)+"/retired", request)
 }
 
+// GetFailureReceipt reads a failed member's preserved obligations.
+func (c *Client) GetFailureReceipt(ctx context.Context, poolID, instanceID string) (FailureReceipt, error) {
+	var receipt FailureReceipt
+	err := c.do(ctx, http.MethodGet, c.memberPath(poolID, instanceID)+"/failure-receipt", nil, &receipt)
+	return receipt, err
+}
+
 // GetOperation reads recorded step outcomes. This is the ONLY correct response
 // to a lost reply: the operator resolves what actually happened under the same
 // operation id instead of minting a new one.
-func (c *Client) GetOperation(ctx context.Context, poolID, operationID string) (Operation, error) {
-	var operation Operation
-	err := c.do(ctx, http.MethodGet, c.poolPath(poolID)+"/operations/"+url.PathEscape(operationID), nil, &operation)
-	return operation, err
+func (c *Client) GetOperation(ctx context.Context, poolID, operationID string) (OperationHistory, error) {
+	var history OperationHistory
+	err := c.do(ctx, http.MethodGet, c.poolPath(poolID)+"/operations/"+url.PathEscape(operationID), nil, &history)
+	return history, err
 }
 
 // OpenPublication opens the tenant publication barrier.
@@ -218,6 +237,20 @@ func (c *Client) GetPublication(ctx context.Context, poolID, publicationID strin
 	return publication, err
 }
 
+// GetTenant reads a tenant's admission gate.
+func (c *Client) GetTenant(ctx context.Context, poolID, tenant string) (TenantAdmission, error) {
+	var admission TenantAdmission
+	err := c.do(ctx, http.MethodGet, c.tenantPath(poolID, tenant), nil, &admission)
+	return admission, err
+}
+
+// RevokeTenant closes a tenant's admission gate.
+func (c *Client) RevokeTenant(ctx context.Context, poolID, tenant string, request RevokeTenantRequest) (TenantAdmission, error) {
+	var admission TenantAdmission
+	err := c.do(ctx, http.MethodDelete, c.tenantPath(poolID, tenant), request, &admission)
+	return admission, err
+}
+
 func (c *Client) member(ctx context.Context, method, path string, body any) (Member, error) {
 	var member Member
 	err := c.do(ctx, method, path, body, &member)
@@ -236,17 +269,31 @@ func (c *Client) publicationPath(poolID, publicationID string) string {
 	return c.poolPath(poolID) + "/publications/" + url.PathEscape(publicationID)
 }
 
+func (c *Client) tenantPath(poolID, tenant string) string {
+	return c.poolPath(poolID) + "/tenants/" + url.PathEscape(tenant)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body, target any) error {
+	var encoded []byte
+	if body != nil {
+		var err error
+		encoded, err = json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("encode gateway request: %w", err)
+		}
+	}
+	return c.doRaw(ctx, method, path, encoded, "application/json", target)
+}
+
+// doRaw sends an already-encoded body. The legacy backend-delete endpoint takes
+// a bare string rather than JSON, which is why the encoding is a parameter.
+func (c *Client) doRaw(ctx context.Context, method, path string, body []byte, contentType string, target any) error {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
 	var payload io.Reader
 	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return fmt.Errorf("encode gateway request: %w", err)
-		}
-		payload = bytes.NewReader(encoded)
+		payload = bytes.NewReader(body)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, payload)
 	if err != nil {
@@ -258,7 +305,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, target any) 
 	request.Header.Set("X-Gateway-Transaction-Admin-Token", c.token)
 	request.Header.Set("Accept", "application/json")
 	if body != nil {
-		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Content-Type", contentType)
 	}
 
 	response, err := c.http.Do(request)
