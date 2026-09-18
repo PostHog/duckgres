@@ -1261,7 +1261,10 @@ func (p *SessionPool) CreateSession(username, memoryLimit string, threads int, s
 		// instance-global too, and an attached catalog keeps the credentials
 		// it was built from even after the secret above is gone. Mandatory for
 		// the same reason as the wipe — see detachUserCatalogs.
-		detached, detachErr := detachUserCatalogs(secretCtx, conn)
+		// Own deadline: a slow detach must not eat the replay's budget below.
+		detachCtx, detachCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
+		detached, detachErr := detachUserCatalogs(detachCtx, conn)
+		detachCancel()
 		if detachErr != nil {
 			secretCancel()
 			_ = conn.Close()
@@ -1471,10 +1474,12 @@ func (p *SessionPool) DestroySession(token string) error {
 		}
 		// Likewise for client-ATTACHed databases, which carry their own copy
 		// of the credentials. Best-effort here; mandatory at CreateSession.
-		if _, err := detachUserCatalogs(wipeCtx, session.DB); err != nil {
+		wipeCancel()
+		detachCtx, detachCancel := context.WithTimeout(context.Background(), userSecretOpTimeout)
+		if _, err := detachUserCatalogs(detachCtx, session.DB); err != nil {
 			log.Warn("Failed to detach user catalogs on session destroy.", "user", session.Username, "error", err)
 		}
-		wipeCancel()
+		detachCancel()
 	}
 
 	// Best-effort restore of the cache-proxy S3 transport if this session

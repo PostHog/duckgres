@@ -63,10 +63,18 @@ func detachUserCatalogs(ctx context.Context, h secretDBHandle) ([]string, error)
 	// non-internal oid, since everything else is attached afterwards. It is
 	// `memory` on k8s workers but a file stem when DataDir is set, so resolve it
 	// rather than hard-coding a name.
+	//
+	// The function is catalog-qualified on purpose. By this point in session
+	// create the default catalog is `ducklake`, and sessionmeta documents that
+	// an unqualified `duckdb_databases()` there starts a DuckLake transaction —
+	// which pays a full catalog reload (tens of seconds on a large tenant) when
+	// the schema version has moved. Naming `system` means the lookup never has
+	// to consult the default catalog. The session-init probe has normally paid
+	// for that reload already, so this is belt and braces, not a measured win.
 	rows, err := h.QueryContext(ctx, `
 		SELECT database_name,
-		       database_oid = (SELECT MIN(database_oid) FROM duckdb_databases() WHERE NOT internal) AS is_primary
-		FROM duckdb_databases()
+		       database_oid = (SELECT MIN(database_oid) FROM system.main.duckdb_databases() WHERE NOT internal) AS is_primary
+		FROM system.main.duckdb_databases()
 		WHERE NOT internal`)
 	if err != nil {
 		return nil, fmt.Errorf("list attached databases: %w", err)
