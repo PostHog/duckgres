@@ -1825,10 +1825,33 @@ migration `000040`.
   never a desired count of zero (that would delete the fleet) and never a
   startup abort (a ConfigMap problem must not take the CP down).
 - **Fences, not leadership.** The janitor lease decides who executes; the
-  pool's `authority_epoch` fences every durable write, every Kubernetes object
-  (annotation, compared before any adopt) and every Gateway call
-  (`controllerEpoch`). A refused fenced write DROPS the lease and re-acquires —
-  losing the CAS means superseded, not unlucky.
+  pool's `authority_epoch` fences every durable write — desired-state
+  publication, freeze and thaw included — every Kubernetes object (annotation,
+  compared before any adopt) and every Gateway call (`controllerEpoch`). Seeding
+  the pool row is the ONLY unfenced write and can only INSERT. A refused fenced
+  write ENDS the leadership term: re-acquiring would let a superseded controller
+  fence the valid leader straight back, and the two would trade the pool
+  forever. The fence owner is per-PROCESS, not per control plane.
+- **Desired state is ORDERED as well as fenced.** The blueprint carries a
+  `generation`; a publication that would move it backwards is refused. Holding
+  the fence proves who may write, not that what they hold is current — a replica
+  carrying an older blueprint could otherwise publish it over a newer one as a
+  legal fenced write. The ordinal must come from the config source; a content
+  hash is not monotonic and would refuse valid configurations.
+- **The catalog writer's fence IS the pool authority.** It is claimed when the
+  operator wins the lease, never at startup (where every replica would claim it
+  and the fence would distinguish nobody), and a takeover needs a strictly
+  higher epoch — an equal epoch held by another identity is a collision, not a
+  handover.
+- **Failure is not drain.** SUSPECT excludes a member from new work and is
+  reversible; LOST requires verified absence of every recorded object as
+  evidence and is reported as failed. A repair NAMES the instance it replaces,
+  so the Gateway charges the repair budget instead of the single planned surge.
+- **Admission is a durable step.** The intent is recorded before the call, so a
+  lost response is resolved by read-back under the same identity. OK, FAILED
+  (a decision) and UNKNOWN (no answer) stay distinct. The step identity is the
+  business intent, never the authority envelope — hashing the whole request made
+  the retry after a lost response a permanent conflict.
 - **Instance identity is persisted BEFORE any Kubernetes object exists**, and
   names are deterministic, so a lost create is resolved by read-back rather
   than by creating a second instance. Identities and live endpoints are never
@@ -1851,11 +1874,27 @@ migration `000040`.
   floor refusal is surfaced, never overridden.
 - **Candidate validation uses no canary.** The candidate is probed through its
   OWN Service with the existing observer credential: `/v1/catalog/sync` must be
-  enabled, ready, zero failed catalogs, applied revision at least the published
-  one, a process identity that does not change during the pass, and a worker
-  count that agrees with the running pods. The `auth-revision` check is claimed
-  ONLY when every security component reported what it loaded — the OPA access
-  control does not, so it is named in the receipt as unacknowledged instead.
+  enabled, ready, zero failed catalogs, applied revision at least the pool's
+  DURABLE `publication_revision`, a process identity that does not change during
+  the pass, a worker count that agrees with the running pods, and the pods'
+  RUNNING images equal to the blueprint's pinned release. The `auth-revision`
+  check is claimed ONLY when every security component reported what it loaded;
+  a coordinator without `opa.policy.revision-uri` reports OPA as unacknowledged,
+  the check is absent, and admission fails closed — deliberate, so
+  `opa.policy.revision-uri` is required on a pooled coordinator.
+- **One authoritative boot identity.** The coordinator's `processId` is probed
+  BEFORE member registration and is sent as `bootId` on both register and admit;
+  the Gateway requires the receipt to carry the pair it recorded. A restart
+  before admission fails the candidate (`FAILED_PREPARING`) rather than retrying
+  against an incarnation that no longer exists.
+- **Transport is plain internal HTTP** to each instance's ClusterIP Service; TLS
+  terminates at the Gateway. Probes declare the forwarded HTTPS hop
+  (`X-Forwarded-Proto`) rather than relaxing auth, and
+  `allow-insecure-over-http` is never set. There is no pool certificate, no
+  private CA and no `tls_server_name` for a pooled instance. Credentials and
+  query data cross the cluster network unencrypted on this hop — accepted, with
+  coordinator NetworkPolicies a deferred follow-up, so pool admission must NOT
+  be described as non-bypassable by an in-cluster caller.
 - **The Gateway client matches the Java source, not a design doc**
   (`GET members` is a bare array; admission is one `admit` call with a nested
   receipt; fields are `desiredMembers`/`maxRepair`; the Gateway computes the
