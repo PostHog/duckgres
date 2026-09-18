@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,13 +40,26 @@ func newIsolatedConfigStore(t *testing.T) *cpconfigstore.ConfigStore {
 	return store
 }
 
+// baseConfigStoreDSN is the container-backed default. DUCKGRES_TEST_PG_DSN
+// points the suite at an already-running PostgreSQL instead, which is how these
+// tests run where Docker is unavailable.
+func baseConfigStoreDSN(t *testing.T) string {
+	t.Helper()
+
+	if dsn := strings.TrimSpace(os.Getenv("DUCKGRES_TEST_PG_DSN")); dsn != "" {
+		return dsn
+	}
+	ensureIntegrationPostgres(t)
+	return "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable"
+}
+
 func newIsolatedConfigStoreSchema(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 
-	ensureIntegrationPostgres(t)
+	dsn := baseConfigStoreDSN(t)
 
 	schema := fmt.Sprintf("managed_warehouse_%d", time.Now().UnixNano())
-	adminDB, err := sql.Open("postgres", "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable")
+	adminDB, err := sql.Open("postgres", dsn)
 	if err != nil {
 		t.Fatalf("open postgres admin db: %v", err)
 	}
@@ -60,8 +74,7 @@ func newIsolatedConfigStoreSchema(t *testing.T) (*sql.DB, string) {
 		_, _ = adminDB.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
 	})
 
-	connStr := "host=127.0.0.1 port=35432 user=postgres password=postgres dbname=testdb sslmode=disable search_path=" + schema
-	return adminDB, connStr
+	return adminDB, dsn + " search_path=" + schema
 }
 
 func cpconfigStoreNew(connStr string) (*cpconfigstore.ConfigStore, error) {

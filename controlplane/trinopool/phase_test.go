@@ -1,0 +1,123 @@
+package trinopool
+
+import "testing"
+
+func TestPhaseTransitionsFollowTheLifecycle(t *testing.T) {
+	allowed := [][2]Phase{
+		{PhasePending, PhaseCreating},
+		{PhaseCreating, PhasePreparing},
+		{PhasePreparing, PhaseValidating},
+		{PhaseValidating, PhaseAdmitted},
+		{PhaseAdmitted, PhaseServing},
+		{PhaseServing, PhaseDraining},
+		{PhaseDraining, PhaseSealed},
+		{PhaseSealed, PhaseRetiring},
+		{PhaseRetiring, PhaseRetired},
+	}
+	for _, step := range allowed {
+		if err := ValidateTransition(step[0], step[1]); err != nil {
+			t.Errorf("%s -> %s rejected: %v", step[0], step[1], err)
+		}
+	}
+}
+
+// Retirement is the one irreversible claim in the whole design: once Gateway
+// has issued it, the instance's incarnation can never serve again. A resume
+// would let a retired member take new work.
+func TestRetiringNeverResumes(t *testing.T) {
+	for _, target := range []Phase{PhaseServing, PhaseAdmitted, PhaseDraining, PhaseSealed, PhasePreparing, PhaseValidating} {
+		if err := ValidateTransition(PhaseRetiring, target); err == nil {
+			t.Errorf("RETIRING -> %s was allowed", target)
+		}
+		if err := ValidateTransition(PhaseRetired, target); err == nil {
+			t.Errorf("RETIRED -> %s was allowed", target)
+		}
+	}
+}
+
+// A drained instance is gone; a lost one is a failure with preserved history.
+// Collapsing the two would report a dead coordinator's abandoned queries as a
+// successful drain.
+func TestFailureBranchIsSeparateFromDrain(t *testing.T) {
+	if err := ValidateTransition(PhaseServing, PhaseSuspect); err != nil {
+		t.Fatalf("SERVING -> SUSPECT rejected: %v", err)
+	}
+	if err := ValidateTransition(PhaseSuspect, PhaseLost); err != nil {
+		t.Fatalf("SUSPECT -> LOST rejected: %v", err)
+	}
+	if err := ValidateTransition(PhaseLost, PhaseFailureRetired); err != nil {
+		t.Fatalf("LOST -> FAILURE_RETIRED rejected: %v", err)
+	}
+	// A suspected member can recover: a probe failure is not evidence of death.
+	if err := ValidateTransition(PhaseSuspect, PhaseServing); err != nil {
+		t.Fatalf("SUSPECT -> SERVING rejected: %v", err)
+	}
+	// ... but a lost one cannot, and it must never look like a clean drain.
+	for _, target := range []Phase{PhaseServing, PhaseSealed, PhaseRetired} {
+		if err := ValidateTransition(PhaseLost, target); err == nil {
+			t.Errorf("LOST -> %s was allowed", target)
+		}
+	}
+}
+
+// A candidate that failed before it was ever admitted is the only instance the
+// operator may clean up without a Gateway retirement receipt.
+func TestFailedPreparingIsReachableOnlyBeforeAdmission(t *testing.T) {
+	for _, from := range []Phase{PhasePending, PhaseCreating, PhasePreparing, PhaseValidating} {
+		if err := ValidateTransition(from, PhaseFailedPreparing); err != nil {
+			t.Errorf("%s -> FAILED_PREPARING rejected: %v", from, err)
+		}
+	}
+	for _, from := range []Phase{PhaseAdmitted, PhaseServing, PhaseDraining, PhaseSealed} {
+		if err := ValidateTransition(from, PhaseFailedPreparing); err == nil {
+			t.Errorf("%s -> FAILED_PREPARING was allowed after admission", from)
+		}
+	}
+}
+
+func TestPhaseClassification(t *testing.T) {
+	// Serving capacity is what the minimum-serving floor counts.
+	if !PhaseServing.Serving() || PhaseDraining.Serving() || PhaseAdmitted.Serving() {
+		t.Error("serving classification is wrong")
+	}
+	// Live compute is what the surge budget counts: anything that occupies a
+	// pod, including a draining or suspect instance.
+	for _, phase := range []Phase{PhasePending, PhaseCreating, PhasePreparing, PhaseValidating, PhaseAdmitted, PhaseServing, PhaseDraining, PhaseSealed, PhaseRetiring, PhaseSuspect, PhaseLost} {
+		if !phase.OccupiesCapacity() {
+			t.Errorf("%s should occupy capacity", phase)
+		}
+	}
+	// A historical tombstone must not consume a live slot forever.
+	for _, phase := range []Phase{PhaseRetired, PhaseFailureRetired, PhaseFailedPreparing} {
+		if phase.OccupiesCapacity() {
+			t.Errorf("%s should not occupy capacity", phase)
+		}
+		if !phase.Terminal() {
+			t.Errorf("%s should be terminal", phase)
+		}
+	}
+}
+
+// Deleting Kubernetes objects before Gateway has irreversibly claimed the
+// incarnation can destroy running queries.
+func TestOnlyRetirementPhasesPermitDeletion(t *testing.T) {
+	for _, phase := range []Phase{PhaseRetiring, PhaseRetired, PhaseFailureRetired, PhaseFailedPreparing} {
+		if !phase.PermitsResourceDeletion() {
+			t.Errorf("%s should permit deletion", phase)
+		}
+	}
+	for _, phase := range []Phase{PhasePending, PhaseCreating, PhasePreparing, PhaseValidating, PhaseAdmitted, PhaseServing, PhaseDraining, PhaseSealed, PhaseSuspect, PhaseLost} {
+		if phase.PermitsResourceDeletion() {
+			t.Errorf("%s must not permit deletion", phase)
+		}
+	}
+}
+
+func TestUnknownPhaseIsRejected(t *testing.T) {
+	if err := ValidateTransition(Phase("BANANA"), PhaseServing); err == nil {
+		t.Fatal("an unknown phase was accepted")
+	}
+	if Phase("BANANA").Valid() {
+		t.Fatal("an unknown phase reported itself valid")
+	}
+}
