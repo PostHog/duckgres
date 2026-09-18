@@ -1968,9 +1968,11 @@ publication barrier), migrations `000040`-`000044`.
   is derived from the SAME projection that writes `password.db`, asserted
   identical in test; the gate would otherwise block real users or admit
   principals Trino rejects.
-- **Catalog writer**: one fenced transaction per mutation against the schema
-  CONTRACT-trino owns (writer-state row lock, exact epoch AND identity, journal
-  replay resolution, `catalog_count` recomputed inside the transaction).
+- **Catalog writer**: one fenced transaction per mutation against the
+  Trino-side catalog store's schema (writer-state row lock, exact epoch AND
+  identity, journal replay resolution, `catalog_count` recomputed inside the
+  transaction; the tables are created by `trinocatalog.EnsureSchema` and
+  asserted against a real PostgreSQL in `tests/trinocatalog/`).
   Takeover is explicit; a mutation never claims a higher epoch implicitly. A
   lost COMMIT is resolved from the journal, never retried blind.
 - Touching any of this → update `controlplane/trinopool/*_test.go`,

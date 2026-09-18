@@ -64,20 +64,25 @@ func (o *trinoPoolOperator) observeHealth(ctx context.Context, instance configst
 		}
 		return true, o.suspectInstance(ctx, instance, phase, "the coordinator is not reporting healthy")
 	case trinopool.PhaseSuspect:
-		if healthy {
-			// Recovery. A member excluded on suspicion returns to service
-			// rather than being retired on the strength of a bad minute.
-			slog.Info("Trino pool instance recovered from suspicion.",
-				"pool", o.config.PublicID, "instance", instance.InstanceID)
-			return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
-				trinopool.PhaseSuspect, trinopool.PhaseServing, map[string]any{"last_error": ""}))
-		}
+		// There is deliberately no path back to service.
+		//
+		// Suspicion is the GATEWAY's state as much as this row's: it excluded
+		// the member, and nothing short of a fresh certified admission puts it
+		// back. Flipping the local row to SERVING would leave the Gateway
+		// excluding a member this controller believes is serving - a row that
+		// says one thing while the pool does another. Re-admitting is worse: a
+		// member that failed its health check and recovered is an uncertain
+		// incarnation, and the pool has a cheap way to get a certain one.
+		//
+		// So a suspected member always leaves, and only the ROUTE depends on the
+		// evidence: proven dead, or drained like any planned replacement once
+		// capacity allows it.
 		if progressed, err := o.claimLossIfProven(ctx, instance, observed); progressed || err != nil {
 			return progressed, err
 		}
-		// Still present, still unhealthy. A member that cannot be PROVEN dead
-		// has to leave through the planned path or it never leaves at all.
 		if time.Since(instance.PhaseChangedAt) < trinoPoolSuspectDrainAfter {
+			// A brief blip is given time to become provable one way or the
+			// other before its replacement is started.
 			return false, nil
 		}
 		return o.drainSuspectInstance(ctx, instance)
@@ -156,12 +161,52 @@ func (o *trinoPoolOperator) claimLossIfProven(ctx context.Context, instance conf
 // repair, no rollout - so this path is what keeps a single restarted candidate
 // from wedging the pool.
 //
-// The order is deliberate. Kubernetes objects are deleted FIRST, because the
-// loss claim needs positive evidence that the process terminated and a running
-// pod is not that. Deleting before any Gateway step is sound only because this
-// member provably never admitted work: it was refused before activation, so
-// there is nothing to drain and nothing to lose.
+// The route is the Gateway's OWN never-admitted retirement: a PREPARING member
+// that has admitted no work may be retired directly, and the Gateway verifies
+// that for itself rather than taking this controller's word for it. That claim
+// is what authorizes deleting the objects, exactly as it does for a planned
+// replacement - no loss claim, no termination evidence, and no pretending a
+// candidate that never served was drained.
 func (o *trinoPoolOperator) cleanupFailedCandidate(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+	if instance.GatewayIncarnation == "" {
+		// The candidate failed before it ever registered, so there is no member
+		// to release: only the objects, if any, and the record.
+		return o.removeFailedCandidateResources(ctx, instance, trinogateway.Member{})
+	}
+
+	// The Gateway is authoritative for its own member, and every step bumps the
+	// generation, so the CAS value is read back rather than taken from the row.
+	member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+	if err != nil {
+		return true, fmt.Errorf("read failed candidate %s: %w", instance.InstanceID, err)
+	}
+	switch member.Phase {
+	case "RETIRING", "RETIRED":
+		return o.removeFailedCandidateResources(ctx, instance, member)
+	default:
+		retired, err := o.gateway.RetireMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
+			Step:               o.step(instance.InstanceID, "retire"),
+			ExpectedGeneration: member.Generation,
+		})
+		if err != nil {
+			return true, o.dropAuthority(fmt.Errorf("claim retirement of failed candidate %s: %w", instance.InstanceID, err))
+		}
+		slog.Warn("Trino pool is retiring a candidate that could never be admitted.",
+			"pool", o.config.PublicID, "instance", instance.InstanceID, "reason", failureReason(instance))
+		return true, o.dropAuthority(o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID, map[string]any{
+			"gateway_state":      retired.Phase,
+			"gateway_generation": retired.Generation,
+		}))
+	}
+}
+
+// removeFailedCandidateResources deletes a retired candidate's objects and
+// closes its record once they are verifiably gone.
+func (o *trinoPoolOperator) removeFailedCandidateResources(
+	ctx context.Context,
+	instance configstore.TrinoPoolInstance,
+	member trinogateway.Member,
+) (bool, error) {
 	inventory := inventoryOf(instance)
 	kube := o.kube(o.lease.Epoch)
 	if err := kube.Delete(ctx, inventory); err != nil {
@@ -173,68 +218,20 @@ func (o *trinoPoolOperator) cleanupFailedCandidate(ctx context.Context, instance
 		// observed, so a terminating pod is never counted as freed capacity.
 		return false, err
 	}
-
-	if instance.GatewayIncarnation == "" {
-		// The candidate failed before it ever registered, so there is no member
-		// to release.
-		return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
-			trinopool.PhaseFailedPreparing, trinopool.PhaseFailureRetired, nil))
-	}
-
-	// The Gateway is authoritative for its own member, and suspecting bumps the
-	// generation, so the CAS value is read back rather than taken from the row.
-	member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
-	if err != nil {
-		return true, fmt.Errorf("read failed candidate %s: %w", instance.InstanceID, err)
-	}
-	switch member.Phase {
-	case "PREPARING", "ACTIVE", "DRAINING", "SEALED":
-		return true, o.suspectFailedCandidate(ctx, instance, member)
-	case "SUSPECT":
-		lost, err := o.gateway.LostMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.LostMemberRequest{
-			Step:               o.step(instance.InstanceID, "lost"),
+	updates := map[string]any{}
+	if member.InstanceID != "" && member.Phase != "RETIRED" {
+		reported, err := o.gateway.MemberRetired(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
+			Step:               o.step(instance.InstanceID, "retired"),
 			ExpectedGeneration: member.Generation,
-			Evidence:           trinogateway.EvidenceProcessTerminated,
-			Termination: trinogateway.TerminationProof{
-				PodUID:        instance.CoordinatorPodUID,
-				BootID:        instance.CoordinatorBootID,
-				NodeID:        instance.CoordinatorNodeID,
-				CoordinatorID: instance.CoordinatorID,
-				Source:        "kubernetes-resources-absent",
-				ObservedAt:    nowUTC().Format(time.RFC3339),
-			},
+			ResourcesAbsent:    true,
 		})
 		if err != nil {
-			return true, o.dropAuthority(fmt.Errorf("record loss of failed candidate %s: %w", instance.InstanceID, err))
+			return true, o.dropAuthority(fmt.Errorf("report retirement of failed candidate %s: %w", instance.InstanceID, err))
 		}
-		return true, o.dropAuthority(o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID, map[string]any{
-			"gateway_state":      lost.Phase,
-			"gateway_generation": lost.Generation,
-		}))
-	default:
-		// LOST or already retired: the slot is released and the record can be
-		// closed.
-		return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
-			trinopool.PhaseFailedPreparing, trinopool.PhaseFailureRetired, map[string]any{
-				"gateway_state":      member.Phase,
-				"gateway_generation": member.Generation,
-			}))
+		updates["gateway_state"], updates["gateway_generation"] = reported.Phase, reported.Generation
 	}
-}
-
-func (o *trinoPoolOperator) suspectFailedCandidate(ctx context.Context, instance configstore.TrinoPoolInstance, member trinogateway.Member) error {
-	suspected, err := o.gateway.SuspectMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.SuspectMemberRequest{
-		Step:               o.step(instance.InstanceID, "suspect"),
-		ExpectedGeneration: member.Generation,
-		Reason:             failureReason(instance),
-	})
-	if err != nil {
-		return o.dropAuthority(fmt.Errorf("suspect failed candidate %s: %w", instance.InstanceID, err))
-	}
-	return o.dropAuthority(o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID, map[string]any{
-		"gateway_state":      suspected.Phase,
-		"gateway_generation": suspected.Generation,
-	}))
+	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+		trinopool.PhaseFailedPreparing, trinopool.PhaseFailureRetired, updates))
 }
 
 // failureReason is what the Gateway records for the exclusion. It is never
@@ -288,6 +285,48 @@ func (o *trinoPoolOperator) completeFailureRetirement(ctx context.Context, insta
 	if err != nil || !absent {
 		return false, err
 	}
-	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
-		trinopool.PhaseLost, trinopool.PhaseFailureRetired, nil))
+
+	// The Gateway's retirement protocol still has to run. Closing the local row
+	// while its member sat in LOST left the two records permanently
+	// disagreeing about whether that incarnation was finished with - and the
+	// retirement kind, FAILED, is the durable statement that its work was lost
+	// rather than drained.
+	member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+	if err != nil {
+		return true, fmt.Errorf("read lost member %s: %w", instance.InstanceID, err)
+	}
+	switch member.Phase {
+	case "RETIRED":
+		return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+			trinopool.PhaseLost, trinopool.PhaseFailureRetired, map[string]any{
+				"gateway_state":      member.Phase,
+				"gateway_generation": member.Generation,
+			}))
+	case "RETIRING":
+		reported, err := o.gateway.MemberRetired(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
+			Step:               o.step(instance.InstanceID, "retired"),
+			ExpectedGeneration: member.Generation,
+			ResourcesAbsent:    true,
+		})
+		if err != nil {
+			return true, o.dropAuthority(fmt.Errorf("report retirement of lost member %s: %w", instance.InstanceID, err))
+		}
+		return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+			trinopool.PhaseLost, trinopool.PhaseFailureRetired, map[string]any{
+				"gateway_state":      reported.Phase,
+				"gateway_generation": reported.Generation,
+			}))
+	default:
+		claimed, err := o.gateway.RetireMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
+			Step:               o.step(instance.InstanceID, "retire"),
+			ExpectedGeneration: member.Generation,
+		})
+		if err != nil {
+			return true, o.dropAuthority(fmt.Errorf("claim retirement of lost member %s: %w", instance.InstanceID, err))
+		}
+		return true, o.dropAuthority(o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID, map[string]any{
+			"gateway_state":      claimed.Phase,
+			"gateway_generation": claimed.Generation,
+		}))
+	}
 }

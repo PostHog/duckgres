@@ -49,9 +49,14 @@ var phaseTransitions = map[Phase][]Phase{
 	PhaseRetiring:   {PhaseRetired},
 	PhaseRetired:    nil,
 
-	// A failing probe is not proof of death, so SUSPECT can recover. It can
-	// also drain: an operator may replace a flaky-but-live member normally.
-	PhaseSuspect:         {PhaseServing, PhaseDraining, PhaseLost},
+	// A suspected member always leaves; only the route depends on the
+	// evidence. There is no path back to SERVING: suspicion is the Gateway's
+	// state too, and it excludes the member until a fresh certified admission
+	// - which a recovered-but-uncertain incarnation does not get, because the
+	// pool can replace it with a certain one instead. Recording a local
+	// recovery would leave this row claiming a member serves while the Gateway
+	// refuses to route to it.
+	PhaseSuspect:         {PhaseDraining, PhaseLost},
 	PhaseLost:           {PhaseFailureRetired},
 	PhaseFailureRetired: nil,
 	// A failed candidate is cleaned up and then recorded as failure-retired.

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -285,19 +286,61 @@ func (f *fakePoolGateway) GetObligations(_ context.Context, _, instanceID string
 	return f.obligations[instanceID], nil
 }
 
-func (f *fakePoolGateway) DrainMember(_ context.Context, _, instanceID string, _ trinogateway.MemberStepRequest) (trinogateway.Member, error) {
+// requirePhase mirrors the Gateway's own phase preconditions. Without them a
+// fake accepts transitions the real PoolStore refuses with POOL_PHASE, and the
+// tests prove the operator can drive a protocol nobody implements.
+func (f *fakePoolGateway) requirePhase(instanceID, call string, allowed ...string) (*trinogateway.Member, error) {
+	member, known := f.members[instanceID]
+	if !known {
+		return nil, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, instanceID)
+	}
+	if !slices.Contains(allowed, member.Phase) {
+		return nil, fmt.Errorf("%w: a %s member cannot %s", trinogateway.ErrPhase, member.Phase, call)
+	}
+	return member, nil
+}
+
+// requireGeneration mirrors the member CAS. A step carrying a stale generation
+// is refused, which is what makes a read-back before each step necessary rather
+// than optional.
+func requireGeneration(member *trinogateway.Member, expected int64) error {
+	if member.Generation != expected {
+		return fmt.Errorf("%w: member is at generation %d, step carries %d",
+			trinogateway.ErrStaleGeneration, member.Generation, expected)
+	}
+	return nil
+}
+
+func (f *fakePoolGateway) DrainMember(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("drain:" + instanceID)
 	if f.drainErr != nil {
 		return trinogateway.Member{}, f.drainErr
 	}
-	member := f.members[instanceID]
+	// ACTIVE is the planned drain. SUSPECT is the extension agreed with the
+	// Gateway for a member that is excluded but not provably dead: it is the
+	// only way such a member can ever leave, since a loss claim needs evidence
+	// a crash-looping pod never provides.
+	member, err := f.requirePhase(instanceID, "be drained", "ACTIVE", "SUSPECT")
+	if err != nil {
+		return trinogateway.Member{}, err
+	}
+	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
+		return trinogateway.Member{}, err
+	}
 	member.Phase, member.Generation = "DRAINING", member.Generation+1
+	f.membership++
 	return *member, nil
 }
 
-func (f *fakePoolGateway) SealMember(_ context.Context, _, instanceID string, _ trinogateway.MemberStepRequest) (trinogateway.Member, error) {
+func (f *fakePoolGateway) SealMember(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("seal:" + instanceID)
-	member := f.members[instanceID]
+	member, err := f.requirePhase(instanceID, "be sealed", "DRAINING")
+	if err != nil {
+		return trinogateway.Member{}, err
+	}
+	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
+		return trinogateway.Member{}, err
+	}
 	member.Phase, member.Generation = "SEALED", member.Generation+1
 	return *member, nil
 }
@@ -307,8 +350,18 @@ func (f *fakePoolGateway) SuspectMember(_ context.Context, _, instanceID string,
 	if request.Reason == "" {
 		return trinogateway.Member{}, errors.New("a suspicion must carry a reason")
 	}
-	member := f.members[instanceID]
+	member, err := f.requirePhase(instanceID, "become suspect", "PREPARING", "ACTIVE", "DRAINING", "SEALED")
+	if err != nil {
+		return trinogateway.Member{}, err
+	}
+	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
+		return trinogateway.Member{}, err
+	}
+	wasActive := member.Phase == "ACTIVE"
 	member.Phase, member.Generation = "SUSPECT", member.Generation+1
+	if wasActive {
+		f.membership++
+	}
 	return *member, nil
 }
 
@@ -317,15 +370,39 @@ func (f *fakePoolGateway) LostMember(_ context.Context, _, instanceID string, re
 	if request.Evidence == "" || request.Termination.Source == "" {
 		return trinogateway.Member{}, errors.New("a loss claim needs termination evidence")
 	}
-	member := f.members[instanceID]
+	member, err := f.requirePhase(instanceID, "be declared lost", "SUSPECT")
+	if err != nil {
+		return trinogateway.Member{}, err
+	}
+	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
+		return trinogateway.Member{}, err
+	}
+	// The evidence must identify the exact incarnation the Gateway recorded.
+	if request.Termination.PodUID != member.PodUID || request.Termination.BootID != member.BootID ||
+		request.Termination.NodeID != member.NodeID || request.Termination.CoordinatorID != member.CoordinatorID {
+		return trinogateway.Member{}, fmt.Errorf("%w: termination evidence does not identify this incarnation",
+			trinogateway.ErrEvidenceRequired)
+	}
 	member.Phase, member.Generation, member.RetirementKind = "LOST", member.Generation+1, "FAILED"
 	return *member, nil
 }
 
-func (f *fakePoolGateway) RetireMember(_ context.Context, _, instanceID string, _ trinogateway.MemberStepRequest) (trinogateway.Member, error) {
+func (f *fakePoolGateway) RetireMember(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("retire:" + instanceID)
-	member := f.members[instanceID]
-	member.Phase, member.Generation, member.RetirementKind = "RETIRING", member.Generation+1, "PLANNED"
+	// SEALED is a completed drain, LOST a proven failure, and PREPARING a
+	// candidate that never admitted work. Nothing else may claim retirement.
+	member, err := f.requirePhase(instanceID, "be retired", "SEALED", "LOST", "PREPARING")
+	if err != nil {
+		return trinogateway.Member{}, err
+	}
+	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
+		return trinogateway.Member{}, err
+	}
+	kind := "DRAINED"
+	if member.Phase == "LOST" {
+		kind = "FAILED"
+	}
+	member.Phase, member.Generation, member.RetirementKind = "RETIRING", member.Generation+1, kind
 	return *member, nil
 }
 
@@ -334,8 +411,14 @@ func (f *fakePoolGateway) MemberRetired(_ context.Context, _, instanceID string,
 	if !request.ResourcesAbsent {
 		return trinogateway.Member{}, errors.New("retirement reported without asserting absence")
 	}
-	member := f.members[instanceID]
-	member.Phase = "RETIRED"
+	member, err := f.requirePhase(instanceID, "complete retirement", "RETIRING")
+	if err != nil {
+		return trinogateway.Member{}, err
+	}
+	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
+		return trinogateway.Member{}, err
+	}
+	member.Phase, member.Generation = "RETIRED", member.Generation+1
 	return *member, nil
 }
 
@@ -470,6 +553,25 @@ func (h *operatorHarness) tick(t *testing.T, times int) {
 			t.Fatalf("tick %d: %v", index, err)
 		}
 	}
+}
+
+// placeInstance puts an instance into a phase on BOTH sides. The Gateway
+// enforces its own phase preconditions, so a test that moved only the local row
+// would be driving a protocol the real Gateway refuses.
+func (h *operatorHarness) placeInstance(t *testing.T, instanceID string, local trinopool.Phase, gatewayPhase string) *configstore.TrinoPoolInstance {
+	t.Helper()
+	instance, known := h.store.instances[instanceID]
+	if !known {
+		t.Fatalf("instance %s does not exist", instanceID)
+	}
+	instance.Phase = string(local)
+	member, known := h.gateway.members[instanceID]
+	if !known {
+		t.Fatalf("instance %s has no gateway member", instanceID)
+	}
+	member.Phase = gatewayPhase
+	instance.GatewayGeneration = member.Generation
+	return instance
 }
 
 // tickTolerant runs ticks that are EXPECTED to fail, which is what a refusing
@@ -639,8 +741,7 @@ func TestRetirementRequiresAClaimThenVerifiedAbsence(t *testing.T) {
 	harness.tick(t, 20)
 
 	instanceID := harness.store.order[0]
-	instance := harness.store.instances[instanceID]
-	instance.Phase = string(trinopool.PhaseSealed)
+	instance := harness.placeInstance(t, instanceID, trinopool.PhaseSealed, "SEALED")
 
 	// Sealed -> the operator claims retirement. Still nothing deleted.
 	harness.tick(t, 1)
@@ -679,10 +780,10 @@ func TestSealWaitsForObligations(t *testing.T) {
 	harness.tick(t, 20)
 
 	instanceID := harness.store.order[0]
-	instance := harness.store.instances[instanceID]
-	instance.Phase = string(trinopool.PhaseDraining)
+	instance := harness.placeInstance(t, instanceID, trinopool.PhaseDraining, "DRAINING")
+	generation := harness.gateway.members[instanceID].Generation
 	harness.gateway.obligations[instanceID] = trinogateway.Obligations{
-		Generation: 5, OpenTransactions: 1, Drained: false,
+		Generation: generation, OpenTransactions: 1, Drained: false,
 	}
 
 	harness.tick(t, 3)
@@ -693,7 +794,7 @@ func TestSealWaitsForObligations(t *testing.T) {
 		t.Fatal("a member with an open transaction was sealed")
 	}
 
-	harness.gateway.obligations[instanceID] = trinogateway.Obligations{Generation: 5, Drained: true}
+	harness.gateway.obligations[instanceID] = trinogateway.Obligations{Generation: generation, Drained: true}
 	harness.tick(t, 1)
 	if instance.Phase != string(trinopool.PhaseSealed) {
 		t.Fatalf("phase = %s, want SEALED once drained", instance.Phase)
@@ -891,17 +992,35 @@ func TestUnhealthyMemberIsSuspectedThenLostOnlyWithEvidence(t *testing.T) {
 
 // A member excluded on suspicion returns to service when it recovers: one bad
 // minute must not retire a healthy cluster.
-func TestSuspectedMemberRecovers(t *testing.T) {
+// A suspected member that starts looking healthy again is NOT returned to
+// service locally.
+//
+// Suspicion is the Gateway's state as much as this row's: it excluded the
+// member and only a fresh certified admission un-excludes it. Flipping the
+// local row back to SERVING would leave duckgres believing a member serves
+// while the Gateway routes nothing to it - the precise divergence the phase
+// machine exists to prevent. The member leaves through the planned drain
+// instead, and its replacement is certified from scratch.
+func TestRecoveredSuspectIsNotReturnedToServiceLocally(t *testing.T) {
 	harness := newOperatorHarness(t)
 	harness.tick(t, 20)
 
 	instanceID := harness.store.order[0]
-	instance := harness.store.instances[instanceID]
-	instance.Phase = string(trinopool.PhaseSuspect)
+	instance := harness.placeInstance(t, instanceID, trinopool.PhaseSuspect, "SUSPECT")
 
+	// Healthy again, as far as Kubernetes is concerned.
 	harness.tick(t, 1)
-	if instance.Phase != string(trinopool.PhaseServing) {
-		t.Fatalf("phase = %s, want the recovered member back in service", instance.Phase)
+	if instance.Phase != string(trinopool.PhaseSuspect) {
+		t.Fatalf("phase = %s, want the member to stay SUSPECT rather than be re-admitted locally", instance.Phase)
+	}
+	if harness.gateway.members[instanceID].Phase != "SUSPECT" {
+		t.Fatal("the gateway member changed phase without an admission")
+	}
+
+	// The phase machine itself refuses the transition, so no future path can
+	// reintroduce it by accident.
+	if err := trinopool.ValidateTransition(trinopool.PhaseSuspect, trinopool.PhaseServing); err == nil {
+		t.Fatal("SUSPECT -> SERVING is permitted; a local recovery would diverge from the Gateway")
 	}
 }
 
@@ -1122,8 +1241,11 @@ func TestFailedCandidateIsCleanedUpAndReleasesItsSlot(t *testing.T) {
 	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseFailureRetired) {
 		t.Fatalf("instance phase = %s, want FAILURE_RETIRED", phase)
 	}
-	if member, _ := harness.gateway.GetMember(context.Background(), "cell-001", instanceID); member.Phase != "LOST" {
-		t.Fatalf("gateway member phase = %s, want LOST so the live slot is released", member.Phase)
+	// The Gateway's own never-admitted retirement is what releases the slot: a
+	// PREPARING member that admitted no work may be retired directly, and the
+	// Gateway verifies that rather than taking this controller's word for it.
+	if member, _ := harness.gateway.GetMember(context.Background(), "cell-001", instanceID); member.Phase != "RETIRED" {
+		t.Fatalf("gateway member phase = %s, want RETIRED so the live slot is released", member.Phase)
 	}
 
 	// With the slot released the pool replaces the failed candidate instead of

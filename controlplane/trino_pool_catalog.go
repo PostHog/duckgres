@@ -101,7 +101,12 @@ func (w *trinoPoolCatalogWriter) ClaimWriter(ctx context.Context) error {
 
 func (w *trinoPoolCatalogWriter) ListNodes(ctx context.Context) ([]provisioner.TrinoNode, error) {
 	if w.nodes == nil {
-		return nil, errors.New("catalog writer has no coordinator client for node inventory")
+		// A pooled cell has no fixed coordinator to take an inventory from. The
+		// sentinel is what tells the provisioner's readiness step that this
+		// probe does not APPLY here, as opposed to failing - the pool proves the
+		// same thing per member, at admission, against the instance that will
+		// actually serve the tenant.
+		return nil, provisioner.ErrTrinoNodeInventoryUnavailable
 	}
 	return w.nodes.ListNodes(ctx)
 }

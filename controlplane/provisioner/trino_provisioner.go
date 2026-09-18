@@ -277,6 +277,19 @@ func TrinoResourceGroupName(principal string) string {
 // state rows untouched instead.
 var ErrTrinoCatalogNotThisReplica = errors.New("this control plane does not own the catalog write path")
 
+// ErrTrinoNodeInventoryUnavailable marks a catalog client that cannot answer
+// "which nodes are in this cluster" because there is no ONE cluster to ask.
+//
+// A pooled cell publishes catalogs to the shared store and its compute is a set
+// of instances that come and go, so the legacy readiness probe - which asks a
+// fixed coordinator for its node inventory and then checks every tenant's
+// mounted credential on those nodes - has no coordinator to address. Its
+// evidence comes from the pool instead: every member proves it applied the
+// catalog and the projections before it is admitted, and (with the Gateway's
+// admission restriction on) a tenant is only queryable once every serving
+// member has acknowledged it.
+var ErrTrinoNodeInventoryUnavailable = errors.New("this catalog client has no single coordinator to read a node inventory from")
+
 // TrinoCatalogClient is the REST surface the provisioner needs against
 // the customer Trino cluster: enumerate, create, alter, drop catalogs.
 // Concrete implementation in trinoCatalogHTTPClient below; the interface
@@ -1744,6 +1757,16 @@ func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []c
 	}
 
 	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected)
+	if errors.Is(readinessErr, ErrTrinoNodeInventoryUnavailable) {
+		// A pooled cell has no single coordinator to take an inventory from, and
+		// inventing one would be worse than skipping: its readiness evidence is
+		// the pool's own admission, where each member proves it applied the
+		// catalog and the projections. Failing every tenant on a probe that
+		// cannot apply to them would mark the whole pool broken.
+		slog.Debug("trino reconcile: skipping the fixed-coordinator readiness probe for a pooled cell",
+			"reason", readinessErr)
+		return outcomes, catalogErr
+	}
 	for org := range expected {
 		if readinessErr != nil {
 			outcomes[org] = catalogOutcome{Err: readinessErr}

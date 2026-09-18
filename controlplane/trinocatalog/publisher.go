@@ -10,8 +10,9 @@
 // COMMIT response into a lookup instead of a guess. Serving coordinators run as
 // managed readers with read-only credentials.
 //
-// The physical schema is owned by CONTRACT-trino.md; the Trino reader and this
-// writer are tested against the same table definitions.
+// The physical schema is owned by the Trino-side catalog store. The exact
+// table definitions this writer depends on are created by EnsureSchema below
+// and asserted against a real PostgreSQL in tests/trinocatalog/.
 package trinocatalog
 
 import (

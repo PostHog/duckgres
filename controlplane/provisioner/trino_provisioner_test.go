@@ -2268,3 +2268,41 @@ func TestTenantAdmissionGateIsInertWhenUnset(t *testing.T) {
 		t.Fatalf("an outcome changed with no gate installed: %+v", outcomes["org-a"])
 	}
 }
+
+// A pooled cell has no fixed coordinator, so the legacy readiness probe - which
+// asks one coordinator for its node inventory - cannot apply to it. Treating
+// that as a failure marked EVERY pooled warehouse failed on every tick with
+// "no coordinator client for node inventory"; the pool proves the same thing
+// per member, at admission.
+func TestPooledCellSkipsTheFixedCoordinatorReadinessProbe(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+	h.catalog.nodesErr = ErrTrinoNodeInventoryUnavailable
+
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile with a pooled catalog client: %v", err)
+	}
+
+	if state := h.store.states["42"]; state.State == configstore.ManagedWarehouseStateFailed {
+		t.Fatalf("a pooled warehouse was marked failed by a probe that does not apply to it: %+v", state)
+	}
+}
+
+// The legacy path is unchanged: a fixed cell whose coordinator cannot answer is
+// still a failure, because there the inventory IS the readiness evidence.
+func TestFixedCellStillFailsWhenTheNodeInventoryIsUnreadable(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
+	h.catalog.nodesErr = errors.New("coordinator unreachable")
+
+	if err := h.provisioner.Reconcile(context.Background()); err == nil {
+		t.Fatal("an unreadable node inventory was accepted on a fixed cell")
+	}
+	if state := h.store.states["42"]; state.State != configstore.ManagedWarehouseStateFailed {
+		t.Fatalf("org state = %+v, want Failed", state)
+	}
+}

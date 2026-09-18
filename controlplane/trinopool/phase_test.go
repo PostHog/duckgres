@@ -48,9 +48,18 @@ func TestFailureBranchIsSeparateFromDrain(t *testing.T) {
 	if err := ValidateTransition(PhaseLost, PhaseFailureRetired); err != nil {
 		t.Fatalf("LOST -> FAILURE_RETIRED rejected: %v", err)
 	}
-	// A suspected member can recover: a probe failure is not evidence of death.
-	if err := ValidateTransition(PhaseSuspect, PhaseServing); err != nil {
-		t.Fatalf("SUSPECT -> SERVING rejected: %v", err)
+	// A suspected member leaves through the planned drain when it cannot be
+	// proven dead - a crash-looping coordinator keeps its objects, so a loss
+	// claim never gets its evidence and the member would otherwise hold its
+	// slot forever.
+	if err := ValidateTransition(PhaseSuspect, PhaseDraining); err != nil {
+		t.Fatalf("SUSPECT -> DRAINING rejected: %v", err)
+	}
+	// It does NOT come back locally. The Gateway excluded it and only a fresh
+	// certified admission un-excludes it, so a local recovery would leave this
+	// row claiming a member serves while the Gateway routes nothing to it.
+	if err := ValidateTransition(PhaseSuspect, PhaseServing); err == nil {
+		t.Fatal("SUSPECT -> SERVING was allowed; a local recovery diverges from the Gateway")
 	}
 	// ... but a lost one cannot, and it must never look like a clean drain.
 	for _, target := range []Phase{PhaseServing, PhaseSealed, PhaseRetired} {
