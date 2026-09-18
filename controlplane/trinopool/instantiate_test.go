@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func testIdentity() Identity {
@@ -213,5 +214,56 @@ func TestInstantiateRejectsAnIncompleteIdentity(t *testing.T) {
 				t.Fatalf("accepted %s", name)
 			}
 		})
+	}
+}
+
+// The chart spreads workers with a selector that matches the whole Trino app.
+// Across a pool that selector also matches OTHER instances' workers, so the
+// instances would compete for nodes and a surge instance might never schedule.
+// The term has to be narrowed to this instance, not removed.
+func TestInstantiateScopesWorkerAntiAffinityToTheInstance(t *testing.T) {
+	blueprint := validBlueprint()
+	blueprint.Worker.PodTemplate.Spec.Affinity = &corev1.Affinity{
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				TopologyKey: "kubernetes.io/hostname",
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app.kubernetes.io/name": "trino"},
+				},
+			}},
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+				Weight:          100,
+				PodAffinityTerm: corev1.PodAffinityTerm{TopologyKey: "topology.kubernetes.io/zone"},
+			}},
+		},
+	}
+
+	objects, err := blueprint.Instantiate(testIdentity())
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	antiAffinity := objects.WorkerDeployment.Spec.Template.Spec.Affinity.PodAntiAffinity
+
+	required := antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if len(required) != 1 {
+		t.Fatalf("required anti-affinity was dropped: %+v", required)
+	}
+	if required[0].LabelSelector.MatchLabels[LabelInstance] != "cell-001-a1b2c3d4" {
+		t.Fatalf("required term is not instance-scoped: %v", required[0].LabelSelector.MatchLabels)
+	}
+	// The chart's own selector and topology key must survive.
+	if required[0].LabelSelector.MatchLabels["app.kubernetes.io/name"] != "trino" {
+		t.Fatalf("the chart's selector was replaced: %v", required[0].LabelSelector.MatchLabels)
+	}
+	if required[0].TopologyKey != "kubernetes.io/hostname" {
+		t.Fatalf("topology key = %q", required[0].TopologyKey)
+	}
+
+	preferred := antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	if len(preferred) != 1 || preferred[0].Weight != 100 {
+		t.Fatalf("preferred anti-affinity was dropped or reweighted: %+v", preferred)
+	}
+	if preferred[0].PodAffinityTerm.LabelSelector.MatchLabels[LabelInstance] != "cell-001-a1b2c3d4" {
+		t.Fatal("preferred term is not instance-scoped")
 	}
 }

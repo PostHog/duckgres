@@ -199,6 +199,16 @@ func (b *Blueprint) deployment(
 	template.Annotations[AnnotationSpecDigest] = objectMeta.Annotations[AnnotationSpecDigest]
 	template.Spec.ServiceAccountName = b.ServiceAccountName
 
+	// Scope every pod anti-affinity term to THIS instance.
+	//
+	// The chart spreads workers across nodes with a selector that matches the
+	// whole Trino app. Left alone, that selector would also match the workers
+	// of every other instance in the pool, so a three-instance pool would
+	// fight itself for nodes and the surge instance might never schedule. The
+	// fix is to narrow the existing terms, not to drop them: spreading one
+	// instance's workers is still what we want.
+	scopeAntiAffinityToInstance(&template.Spec, identity.InstanceID)
+
 	identityEnv := []corev1.EnvVar{
 		{Name: b.IdentityBinding.DiscoveryURIEnv, Value: discoveryURI},
 		{Name: b.IdentityBinding.NodeEnvironmentEnv, Value: identity.NodeEnvironment},
@@ -262,4 +272,30 @@ func hasVolume(volumes []corev1.Volume, name string) bool {
 // free to change the numeric port without duckgres rewriting its render.
 func intOrStringFromName(name string) intstr.IntOrString {
 	return intstr.FromString(name)
+}
+
+// scopeAntiAffinityToInstance narrows each anti-affinity term's label selector
+// with the instance label, preserving the chart's topology keys and weights.
+// Terms that already select on the instance label are left alone.
+func scopeAntiAffinityToInstance(spec *corev1.PodSpec, instanceID string) {
+	if spec.Affinity == nil || spec.Affinity.PodAntiAffinity == nil {
+		return
+	}
+	antiAffinity := spec.Affinity.PodAntiAffinity
+	for index := range antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		scopeAffinityTerm(&antiAffinity.RequiredDuringSchedulingIgnoredDuringExecution[index], instanceID)
+	}
+	for index := range antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
+		scopeAffinityTerm(&antiAffinity.PreferredDuringSchedulingIgnoredDuringExecution[index].PodAffinityTerm, instanceID)
+	}
+}
+
+func scopeAffinityTerm(term *corev1.PodAffinityTerm, instanceID string) {
+	if term.LabelSelector == nil {
+		term.LabelSelector = &metav1.LabelSelector{}
+	}
+	if term.LabelSelector.MatchLabels == nil {
+		term.LabelSelector.MatchLabels = map[string]string{}
+	}
+	term.LabelSelector.MatchLabels[LabelInstance] = instanceID
 }

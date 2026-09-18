@@ -97,12 +97,18 @@ func resolveTrinoCells() ([]trinoCell, error) {
 }
 
 type trinoRegisteredCell struct {
-	CatalogManagement string                   `json:"catalog_management,omitempty"`
-	ID                string                   `json:"id"`
-	Namespace         string                   `json:"namespace"`
-	ClientURL         string                   `json:"client_url"`
-	RoutingGroup      string                   `json:"routing_group"`
-	Backends          []trinoRegisteredBackend `json:"backends"`
+	CatalogManagement string `json:"catalog_management,omitempty"`
+	// Mode selects the compute topology: empty or "fixed" is today's blue/green
+	// cell, "shared-pool" is the operator-managed pool. Unknown values are
+	// rejected rather than defaulted, so a newer config file cannot be
+	// half-understood by an older binary.
+	Mode         string                   `json:"mode,omitempty"`
+	Pool         *trinoRegisteredPool     `json:"pool,omitempty"`
+	ID           string                   `json:"id"`
+	Namespace    string                   `json:"namespace"`
+	ClientURL    string                   `json:"client_url"`
+	RoutingGroup string                   `json:"routing_group"`
+	Backends     []trinoRegisteredBackend `json:"backends"`
 }
 
 type trinoRegisteredBackend struct {
@@ -140,6 +146,10 @@ func parseTrinoCellRegistry(data []byte) ([]trinoRegisteredCell, error) {
 		if cell.CatalogManagement != "" && (len(cell.Backends) != 2 || cell.Backends[0].ID == cell.Backends[1].ID || (cell.Backends[0].ID != "blue" && cell.Backends[0].ID != "green") || (cell.Backends[1].ID != "blue" && cell.Backends[1].ID != "green")) {
 			return nil, errors.New("managed Trino cell requires exactly blue and green slots")
 		}
+		// A shared-pool cell has no static backends: its members are created
+		// by the operator and recorded durably. The per-backend checks below
+		// therefore do not apply to it.
+		pooled := strings.TrimSpace(cell.Mode) == trinoPoolModeShared
 		if cell.ID == "legacy" || len(validation.IsDNS1123Label(cell.ID)) != 0 {
 			return nil, errors.New("Trino cell identity must be a DNS label other than legacy")
 		}
@@ -192,7 +202,7 @@ func parseTrinoCellRegistry(data []byte) ([]trinoRegisteredCell, error) {
 				active++
 			}
 		}
-		if active != 1 {
+		if active != 1 && !pooled {
 			return nil, fmt.Errorf("Trino cell %s must have exactly one routing-active backend", cell.ID)
 		}
 	}
