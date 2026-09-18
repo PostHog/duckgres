@@ -126,7 +126,7 @@ shared_patch="$(printf %s "$shared_green_config" | jq -c --arg old "cell-id=ci-p
 shared_mode gateway-shared
 wait_cell_ready
 shared_admin="$("$KUBECTL" -n "$CELL_NS" get secret trino-auth -o json | jq -r '.data["admin-password"]' | base64 -d)"
-[ "$(shared_gateway_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.main.values_test")" = '[[2,18]]' ] \
+[ "$(shared_gateway_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
   || fail "Gateway could not route the warehouse to blue before cutover"
 shared_gateway_query __admin_provisioner "$shared_admin" 'SELECT node_id FROM system.runtime.nodes WHERE coordinator' \
   | jq -e --arg node "$(printf %s "$shared_blue" | jq -r .nodeId)" '.==[[$node]]' >/dev/null \
@@ -157,6 +157,7 @@ pw_d="$(api -X POST -H 'Content-Type: application/json' \
   "$API/api/v1/orgs/$ORG_D/provision" | jq -r .password)"
 [ -n "$pw_d" ] && [ "$pw_d" != null ] || fail "new isolated warehouse returned no password"
 wait_warehouse "$ORG_D"
+bootstrap_ducklake "$ORG_D" "$pw_d"
 api -X PUT -H 'Content-Type: application/json' -d '{"cell":"cell-test"}' "$API/api/v1/orgs/$ORG_D/trino/cell" >/dev/null
 api -X POST -H 'Content-Type: application/json' -d '{"enabled":true,"tier":"free"}' "$API/api/v1/orgs/$ORG_D/trino" >/dev/null
 sleep 12
@@ -185,8 +186,8 @@ done
 [ "$shared_attempt" -lt 90 ] || fail "target certificate did not bind the admitted roster to the new process"
 [ "$(shared_catalog_fingerprint)" = "$shared_before" ] || fail "target startup replayed the existing catalog write"
 TRINO="$GREEN_TRINO"
-[ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.main.values_test")" = '[[2,18]]' ] \
-  || fail "shared target cannot read existing Hoglake data"
+[ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
+  || fail "shared target cannot read existing DuckLake data"
 shared_checkpoint VERIFIED
 
 log "cutover releases provisioning only onto the new active coordinator"
@@ -194,7 +195,7 @@ shared_body="$(jq -cn --argjson route "$shared_route" --argjson target "$shared_
   '{expectedGeneration:$route.generation,expectedBackendName:"cell-test-blue",backendName:"cell-test-green",backendIncarnation:$target.incarnation}')"
 shared_gateway -X PUT -d "$shared_body" "$GATEWAY/gateway/transactions/routes/cell-test" >/dev/null
 shared_checkpoint CUTOVER
-[ "$(shared_gateway_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.main.values_test")" = '[[2,18]]' ] \
+[ "$(shared_gateway_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
   || fail "Gateway could not route the warehouse to green after cutover"
 shared_gateway_query __admin_provisioner "$shared_admin" 'SELECT node_id FROM system.runtime.nodes WHERE coordinator' \
   | jq -e --arg node "$(printf %s "$shared_green" | jq -r .nodeId)" '.==[[$node]]' >/dev/null \
@@ -220,7 +221,7 @@ trino_query __admin_provisioner "$shared_admin" 'SHOW CATALOGS' | jq -e --arg ca
 TRINO="$BLUE_TRINO"
 trino_query __admin_provisioner "$shared_admin" 'SHOW CATALOGS' | jq -e --arg catalog "$CAT_D" 'all(.[]; .[0]!=$catalog)' >/dev/null \
   || fail "draining blue received a post-cutover catalog write"
-[ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.main.values_test")" = '[[2,18]]' ] \
+[ "$(trino_query "$DB_C" "$pw_c" "SELECT COUNT(*), SUM(value) FROM $CAT_C.cell_test.values_test")" = '[[2,18]]' ] \
   || fail "unchanged source catalog stopped serving during overlap"
 
 shared_blue="$(shared_gateway "$GATEWAY/gateway/transactions/backends/cell-test-blue/drain")"

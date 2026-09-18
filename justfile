@@ -347,11 +347,6 @@ test-controlplane-k8s:
 test-trino-admin:
     go test -v -count=1 -tags kubernetes -run Trino ./controlplane/admin ./tests/configstore
 
-# Set HOGLAKE_SMOKE_TEST=1 and the documented environment for a dedicated test tenant.
-[group('test')]
-test-trino-hoglake-smoke:
-    go test -v -count=1 -timeout 5m ./tests/trino-hoglake-smoke
-
 # Test isolated deployment fixtures without contacting a cluster.
 [group('test')]
 test-mw-fixtures:

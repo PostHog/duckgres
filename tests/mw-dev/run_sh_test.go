@@ -1463,21 +1463,22 @@ func TestE2EHarnessJobReceivesSuiteSelection(t *testing.T) {
 	}
 }
 
-func TestE2EWorkflowRunsOnlyTrinoHoglakeDeploymentLane(t *testing.T) {
+func TestE2EWorkflowRunsNeutralDuckDBAndTrinoSuitesInParallelNamespaces(t *testing.T) {
 	raw, err := os.ReadFile("../../.github/workflows/e2e-mw-dev.yml")
 	if err != nil {
 		t.Fatalf("read e2e workflow: %v", err)
 	}
 	workflow := string(raw)
-	for _, forbidden := range []string{"suite: neutral", "suite: duckdb", "suite: reshard"} {
-		if strings.Contains(workflow, forbidden) {
-			t.Fatalf("retired deployment lane remains: %s", forbidden)
-		}
-	}
 	for _, want := range []string{
 		"matrix:",
+		"suite: neutral",
+		"suite: duckdb",
 		"suite: trino",
+		"suite: reshard",
+		`lane_prefix: "1"`,
+		`lane_prefix: "2"`,
 		`lane_prefix: "3"`,
+		`lane_prefix: "4"`,
 		"github.event.pull_request.number || github.run_id",
 		"github.event_name == 'workflow_dispatch' && github.run_id",
 		"NAMESPACE: duckgres-ci-pr-${{ format('{0}{1}', matrix.lane_prefix",
@@ -1489,8 +1490,14 @@ func TestE2EWorkflowRunsOnlyTrinoHoglakeDeploymentLane(t *testing.T) {
 		}
 	}
 	for _, duplicated := range []string{
+		"suite: neutral",
+		"suite: duckdb",
 		"suite: trino",
+		"suite: reshard",
+		`lane_prefix: "1"`,
+		`lane_prefix: "2"`,
 		`lane_prefix: "3"`,
+		`lane_prefix: "4"`,
 	} {
 		if got := strings.Count(workflow, duplicated); got != 2 {
 			t.Fatalf("e2e and teardown matrices must share %q exactly twice; got %d", duplicated, got)
@@ -1639,20 +1646,35 @@ func TestTrinoHarnessCanObserveDeploymentsInItsIsolatedNamespace(t *testing.T) {
 	}
 }
 
-func TestTrinoHarnessUsesManagedHoglakeWrites(t *testing.T) {
+func TestTrinoHarnessBootstrapsDuckLakeBeforeCatalogQueries(t *testing.T) {
 	raw, err := os.ReadFile("e2e/trino.sh")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("read Trino harness: %v", err)
 	}
 	script := string(raw)
-	for _, forbidden := range []string{"bootstrap_ducklake", "dbname=ducklake", "CREATE SCHEMA", "CREATE VIEW", "TRUNCATE TABLE", "UPDATE $CAT_A", "DELETE FROM $CAT_A"} {
-		if strings.Contains(script, forbidden) {
-			t.Errorf("Hoglake lane retains unsupported or DuckLake-only operation %q", forbidden)
-		}
+
+	bootstrap := strings.Index(script, `bootstrap_ducklake "$ORG_A" "$pw_a"`)
+	firstCatalogQuery := strings.Index(script, `log "TLS/password auth, discovery, and DDL/DML"`)
+	if bootstrap < 0 {
+		t.Fatal("Trino harness does not initialize the fresh DuckLake metadata store through Duckgres")
 	}
-	for _, required := range []string{"DECIMAL(38,2)", "AS SELECT", "maintenance/compact", "file_count", "reenabled tenant lost data", "backend == \"hoglake\""} {
-		if !strings.Contains(script, required) {
-			t.Errorf("missing Hoglake lifecycle assertion %q", required)
+	if firstCatalogQuery < 0 || bootstrap >= firstCatalogQuery {
+		t.Fatal("fresh DuckLake metadata must be initialized before the first Trino catalog query")
+	}
+	warehouseB := strings.Index(script, `wait_warehouse "$ORG_B"`)
+	bootstrapB := strings.Index(script, `bootstrap_ducklake "$ORG_B" "$pw_b"`)
+	trinoB := strings.Index(script, `wait_trino "$ORG_B" "$DB_B" "$CAT_B"`)
+	if warehouseB < 0 || bootstrapB <= warehouseB || trinoB <= bootstrapB {
+		t.Fatal("hot-added tenant DuckLake metadata must be initialized after warehouse readiness and before Trino readiness")
+	}
+	for _, want := range []string{
+		`bootstrap_ducklake()`,
+		`dbname=ducklake`,
+		`host=$1$SNI_SUFFIX`,
+		`hostaddr=$CP_IP`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("Trino DuckLake bootstrap is missing %q", want)
 		}
 	}
 }
@@ -1965,7 +1987,6 @@ exec /usr/bin/mktemp "$@"
 
 	writeFake(t, binDir, "aws", `#!/usr/bin/env bash
 printf 'aws %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
-if [[ -n "${HOGLAKE_TEST_FAIL_CLEANUP:-}" && "$*" == s3\ rm* ]]; then exit 1; fi
 if [[ "$*" == *" list-pod-identity-associations "* ]]; then
   printf 'None\n'
 fi
@@ -2043,11 +2064,6 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),
 		"DUCKGRES_CI_SECRET_DIR="+filepath.Join(filepath.Dir(binDir), "secrets"),
 	)
-	for _, value := range extraEnv {
-		if value == "E2E_SUITE=trino" {
-			env = append(env, "HOGLAKE_CI_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/hoglake-ci", "HOGLAKE_DATA_PATH=s3://example-hoglake/trino/")
-		}
-	}
 	env = append(env, extraEnv...)
 	cmd.Env = env
 	return cmd

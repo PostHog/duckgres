@@ -62,8 +62,7 @@ admitted only after that refresh verifies them. Rollout certification also uses
 one inventory for the whole admitted tenant set.
 
 Readiness also requires the existing authentication and cell gates. It verifies
-metadata and connector availability, but does not perform S3 writes. The smoke
-test below provides that verification. The administrative OPA grant permits
+metadata and connector availability, but does not perform S3 writes. A live tenant write and compaction check must provide that verification. The administrative OPA grant permits
 connector inventory; it does not grant tenant data writes.
 
 Hoglake warehouse deprovisioning, organization deletion, and warehouse replacement
@@ -98,7 +97,8 @@ or ownership mismatches explicitly; do not drop catalogs to force a switch.
 6. Enable the managed configuration, create a dedicated pilot tenant, select its
    cell, then enable Trino. Hoglake is assigned automatically. Wait for
    reconciled readiness.
-7. Run the tenant smoke test. Keep pilot enablement limited until it succeeds.
+7. Verify tenant writes, CTAS, and compaction against the deployed service. Keep
+   pilot enablement limited until these checks succeed.
 
 The historical global `DUCKGRES_TRINO_HOGLAKE_URI` switch is deprecated and
 ignored, with a startup warning. It cannot override a client's stored backend.
@@ -107,38 +107,3 @@ The frozen performance runner still sets the historical switch: its old setup
 is insufficient for new-client onboarding. Updating that runner's storage and
 fixture setup is separate work; do not repurpose immutable fixture prefixes
 as managed write paths.
-
-## Live smoke test
-
-`just test-trino-hoglake-smoke` runs HTTP client regression tests and skips live
-operations by default. To opt in, provide these variables through the approved
-runtime credential mechanism:
-
-```text
-HOGLAKE_SMOKE_TEST=1
-TRINO_SERVER=https://trino.example
-TRINO_USER=<tenant-principal>
-TRINO_PASSWORD=<tenant-password>
-TRINO_CATALOG=<tenant-trino-catalog>
-TRINO_ROUTING_GROUP=<cell-routing-group-if-required>
-HOGLAKE_URI=https://lake.example
-HOGLAKE_CATALOG=<tenant-hoglake-catalog>
-HOGLAKE_NAMESPACE=main
-```
-
-Run only against a dedicated test tenant: compaction applies to the entire
-Hoglake catalog. Coordinate automatic maintenance so it does not consume the
-multi-file baseline before the assertion. The runner needs authorized network
-access to both endpoints. Use tenant credentials, not provisioner administrator
-credentials, for Trino operations.
-
-The test creates randomly named tables, inserts eight separate batches including
-a decimal exceeding INT64, checks exact values, runs CTAS, and triggers Hoglake
-compaction. It checks unchanged source rows and a reduced source file count.
-Cleanup deletes only its generated tables using the Hoglake REST API, since the
-Trino connector does not currently implement DROP TABLE. A cleanup failure is
-reported as a test failure and requires explicit operator cleanup. No mutation
-is blindly retried after an uncertain response.
-
-Passing unit tests is not evidence of a successful deployment. Record live smoke
-results separately after the prerequisites are applied.
