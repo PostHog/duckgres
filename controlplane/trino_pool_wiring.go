@@ -86,6 +86,7 @@ func buildTrinoPoolOperators(
 			operatorEnabled: operatorEnabled,
 			newInstanceID:   newTrinoPoolInstanceID,
 			tenants:         store,
+			publications:    store,
 			operations:      store,
 		}
 		// Desired state is published from the ConfigMap the chart projects the
@@ -128,6 +129,11 @@ func buildTrinoPoolOperators(
 		}
 		operator.identity = func(ctx context.Context, endpoint string) (string, error) {
 			return probeProcessIdentity(ctx, client, endpoint, observerCredential, true)
+		}
+		// What a publication receipt asserts about ONE member, read from that
+		// member rather than assumed from what was published.
+		operator.acknowledgement = func(ctx context.Context, endpoint string, expected trinoPoolProjectionRevisions, catalogRevision int64) (trinoPoolAcknowledgement, error) {
+			return probeMemberAcknowledgement(ctx, client, endpoint, observerCredential, expected, catalogRevision)
 		}
 		// The projection is produced by THIS cell's provisioner: it serves the
 		// bundle the candidate's OPA pulls and writes the Secret the candidate

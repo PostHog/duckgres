@@ -55,6 +55,10 @@ const (
 	TrinoPublicationAdmitting = "admitting"
 	TrinoPublicationAdmitted  = "admitted"
 	TrinoPublicationFailed    = "failed"
+	// TrinoPublicationRevoked is a tenant whose admission was withdrawn. The
+	// row is KEPT: a deleted row would read as "never published" and the next
+	// tick would republish the binding of a tenant that is meant to be gone.
+	TrinoPublicationRevoked = "revoked"
 )
 
 // TrinoPool is the desired specification plus the operator's runtime state.
@@ -143,9 +147,9 @@ type TrinoPoolInstance struct {
 	// member registered. It is a distinct value from the node id, and a loss
 	// claim has to carry both exactly as the Gateway recorded them, or the
 	// evidence is refused and the member keeps its live slot forever.
-	CoordinatorID string `gorm:"column:coordinator_id"`
-	CoordinatorBootID         string `gorm:"column:coordinator_boot_id"`
-	EndpointURL               string `gorm:"column:endpoint_url"`
+	CoordinatorID     string `gorm:"column:coordinator_id"`
+	CoordinatorBootID string `gorm:"column:coordinator_boot_id"`
+	EndpointURL       string `gorm:"column:endpoint_url"`
 	// TLSServerName is retained on the row for the fixed-cell path only. A
 	// pooled instance is reached over plain in-cluster HTTP and has no
 	// certificate of its own, so the pool never sets it.
@@ -256,13 +260,24 @@ const (
 
 // TrinoPoolPublication is one warehouse's publication state on a pool.
 type TrinoPoolPublication struct {
-	PoolID                 string    `gorm:"primaryKey;column:pool_id"`
-	OrgID                  string    `gorm:"primaryKey;column:org_id"`
-	DesiredRevision        int64     `gorm:"column:desired_revision"`
-	PublishedRevision      int64     `gorm:"column:published_revision"`
-	AdmittedRevision       int64     `gorm:"column:admitted_revision"`
-	PublicationID          string    `gorm:"column:publication_id"`
-	PublicationOperationID string    `gorm:"column:publication_operation_id"`
+	PoolID                 string `gorm:"primaryKey;column:pool_id"`
+	OrgID                  string `gorm:"primaryKey;column:org_id"`
+	DesiredRevision        int64  `gorm:"column:desired_revision"`
+	PublishedRevision      int64  `gorm:"column:published_revision"`
+	AdmittedRevision       int64  `gorm:"column:admitted_revision"`
+	PublicationID          string `gorm:"column:publication_id"`
+	PublicationOperationID string `gorm:"column:publication_operation_id"`
+	// PrincipalRevision is the binding (the tenant's principal set) last
+	// published to the Gateway, and TargetRevision the configuration revision
+	// the open barrier requires every serving member to acknowledge.
+	// AdmittedTargetRevision is the last one that actually committed.
+	//
+	// They are durable rather than remembered in the leader's memory: a
+	// restart or a leadership move would otherwise either republish blindly or
+	// assume an admission that never happened.
+	PrincipalRevision      string    `gorm:"column:principal_revision"`
+	TargetRevision         string    `gorm:"column:target_revision"`
+	AdmittedTargetRevision string    `gorm:"column:admitted_target_revision"`
 	State                  string    `gorm:"column:state"`
 	GatewayReceipt         string    `gorm:"column:gateway_receipt;type:jsonb"`
 	LastError              string    `gorm:"column:last_error"`

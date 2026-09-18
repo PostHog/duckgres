@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,13 +190,17 @@ func applyFakeUpdates(instance *configstore.TrinoPoolInstance, updates map[strin
 }
 
 type fakePoolGateway struct {
-	members     map[string]*trinogateway.Member
-	obligations map[string]trinogateway.Obligations
-	backends    map[string]trinogateway.Backend
-	principals  map[string][]string
-	calls       []string
-	drainErr    error
-	configured  *trinogateway.ConfigurePoolRequest
+	members      map[string]*trinogateway.Member
+	obligations  map[string]trinogateway.Obligations
+	backends     map[string]trinogateway.Backend
+	principals   map[string][]string
+	calls        []string
+	drainErr     error
+	membership   int64
+	publications map[string]*fakePublication
+	admitted     map[string]string
+	revoked      map[string]bool
+	configured   *trinogateway.ConfigurePoolRequest
 }
 
 func newFakePoolGateway() *fakePoolGateway {
@@ -243,6 +249,9 @@ func (f *fakePoolGateway) RegisterMember(_ context.Context, poolID string, reque
 		PoolID: poolID, InstanceID: request.InstanceID, BackendName: request.BackendName,
 		Incarnation: "incarnation-" + request.InstanceID, Phase: "PREPARING", Generation: 1,
 		NodeID: "node-1", CoordinatorID: "abcde",
+		// Bound at registration, and a later receipt or loss claim has to
+		// present the identical pair.
+		PodUID: request.PodUID, BootID: request.BootID,
 	}
 	f.members[request.InstanceID] = member
 	return *member, nil
@@ -379,10 +388,11 @@ func (f *fakePoolKube) ResourcesAbsent(context.Context, trinoPoolInventory) (boo
 // ---------------------------------------------------------------------------
 
 type operatorHarness struct {
-	operator *trinoPoolOperator
-	store    *fakePoolStore
-	gateway  *fakePoolGateway
-	kube     *fakePoolKube
+	operator     *trinoPoolOperator
+	store        *fakePoolStore
+	gateway      *fakePoolGateway
+	kube         *fakePoolKube
+	publications *fakePublicationStore
 }
 
 func newOperatorHarness(t *testing.T) *operatorHarness {
@@ -411,8 +421,9 @@ func newOperatorHarness(t *testing.T) *operatorHarness {
 	kube := newFakePoolKube()
 
 	sequence := 0
+	publications := newFakePublicationStore()
 	return &operatorHarness{
-		store: store, gateway: gateway, kube: kube,
+		store: store, gateway: gateway, kube: kube, publications: publications,
 		operator: &trinoPoolOperator{
 			config: config, store: store, gateway: gateway,
 			kube:            kube.forEpoch,
@@ -425,7 +436,16 @@ func newOperatorHarness(t *testing.T) *operatorHarness {
 					Checks: []string{trinoPoolCheckImage}, CertificateHash: "hash",
 				}, nil
 			},
-			identity: func(context.Context, string) (string, error) { return "process-1", nil },
+			identity:     func(context.Context, string) (string, error) { return "process-1", nil },
+			publications: publications,
+			// Every member is serving the projection the control plane is
+			// publishing. Tests that need the opposite override this.
+			acknowledgement: func(_ context.Context, _ string, _ trinoPoolProjectionRevisions, _ int64) (trinoPoolAcknowledgement, error) {
+				return trinoPoolAcknowledgement{ProcessID: "process-1", AppliedRevision: 42, ProjectionCurrent: true}, nil
+			},
+			projection: func() trinoPoolProjectionRevisions {
+				return trinoPoolProjectionRevisions{Policy: "policy-1", Password: "password-1", Group: "group-1"}
+			},
 			newInstanceID: func() string {
 				sequence++
 				return fmt.Sprintf("%08x", sequence)
@@ -1186,5 +1206,337 @@ func TestLeadershipSwitchPublishesTheAPIObjectNotTheReplicaSnapshot(t *testing.T
 	if shared.store.pool.DesiredInstances != 4 || shared.store.pool.MinServing != 3 {
 		t.Fatalf("desired = %d/%d, want the updated 4/3",
 			shared.store.pool.DesiredInstances, shared.store.pool.MinServing)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Publication barrier fakes. The Gateway's own rules (receipt identity,
+// membership CAS, serving floor) are its tests' business; these model the
+// parts the operator's decisions depend on.
+// ---------------------------------------------------------------------------
+
+type fakePublication struct {
+	trinogateway.Publication
+	received map[string]bool
+}
+
+func (f *fakePoolGateway) GetPool(context.Context, string) (trinogateway.PoolState, error) {
+	serving := int64(0)
+	for _, member := range f.members {
+		if member.Phase == "ACTIVE" {
+			serving++
+		}
+	}
+	return trinogateway.PoolState{
+		ServingMembers:       serving,
+		MembershipGeneration: f.membership,
+	}, nil
+}
+
+func (f *fakePoolGateway) activeInstanceIDs() []string {
+	var active []string
+	for id, member := range f.members {
+		if member.Phase == "ACTIVE" {
+			active = append(active, id)
+		}
+	}
+	sort.Strings(active)
+	return active
+}
+
+func (f *fakePoolGateway) OpenPublication(_ context.Context, _ string, request trinogateway.OpenPublicationRequest) (trinogateway.Publication, error) {
+	f.record("open:" + request.Tenant)
+	if f.publications == nil {
+		f.publications = map[string]*fakePublication{}
+	}
+	if existing, found := f.publications[request.PublicationID]; found {
+		return f.publicationView(existing), nil
+	}
+	active := f.activeInstanceIDs()
+	publication := &fakePublication{
+		Publication: trinogateway.Publication{
+			PublicationID:        request.PublicationID,
+			Tenant:               request.Tenant,
+			TargetRevision:       request.TargetRevision,
+			MembershipGeneration: request.ExpectedMembershipGeneration,
+			Phase:                "OPEN",
+			RequiredMembers:      active,
+			TenantState:          "PENDING",
+		},
+		received: map[string]bool{},
+	}
+	f.publications[request.PublicationID] = publication
+	return f.publicationView(publication), nil
+}
+
+func (f *fakePoolGateway) GetPublication(_ context.Context, _, publicationID string) (trinogateway.Publication, error) {
+	publication, found := f.publications[publicationID]
+	if !found {
+		return trinogateway.Publication{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, publicationID)
+	}
+	return f.publicationView(publication), nil
+}
+
+func (f *fakePoolGateway) RecordPublicationReceipt(_ context.Context, _, publicationID string, request trinogateway.PublicationReceiptRequest) (trinogateway.Publication, error) {
+	f.record("receipt:" + request.InstanceID)
+	publication, found := f.publications[publicationID]
+	if !found {
+		return trinogateway.Publication{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, publicationID)
+	}
+	if request.AppliedRevision != publication.TargetRevision {
+		return trinogateway.Publication{}, fmt.Errorf("%w: applied revision does not match the target", trinogateway.ErrPublicationBarrier)
+	}
+	member := f.members[request.InstanceID]
+	if member == nil || member.BootID != request.BootID {
+		return trinogateway.Publication{}, fmt.Errorf("%w: the acknowledgement does not identify this member's process", trinogateway.ErrPublicationBarrier)
+	}
+	publication.received[request.InstanceID] = true
+	return f.publicationView(publication), nil
+}
+
+func (f *fakePoolGateway) CommitPublication(_ context.Context, _, publicationID string, _ trinogateway.CommitPublicationRequest) (trinogateway.Publication, error) {
+	f.record("commit:" + publicationID)
+	publication, found := f.publications[publicationID]
+	if !found {
+		return trinogateway.Publication{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, publicationID)
+	}
+	view := f.publicationView(publication)
+	if len(view.MissingMembers) > 0 {
+		return trinogateway.Publication{}, fmt.Errorf("%w: %v", trinogateway.ErrReceiptsIncomplete, view.MissingMembers)
+	}
+	publication.Phase, publication.TenantState = "ADMITTED", "ADMITTED"
+	publication.AdmittedRevision = publication.TargetRevision
+	if f.admitted == nil {
+		f.admitted = map[string]string{}
+	}
+	f.admitted[publication.Tenant] = publication.TargetRevision
+	return f.publicationView(publication), nil
+}
+
+func (f *fakePoolGateway) RevokeTenant(_ context.Context, _, tenant string, request trinogateway.RevokeTenantRequest) (trinogateway.TenantAdmission, error) {
+	f.record("revoke:" + tenant)
+	if request.Reason == "" {
+		return trinogateway.TenantAdmission{}, errors.New("a revocation must carry a reason")
+	}
+	delete(f.admitted, tenant)
+	delete(f.principals, tenant)
+	if f.revoked == nil {
+		f.revoked = map[string]bool{}
+	}
+	f.revoked[tenant] = true
+	return trinogateway.TenantAdmission{Tenant: tenant, State: "REVOKED"}, nil
+}
+
+func (f *fakePoolGateway) publicationView(publication *fakePublication) trinogateway.Publication {
+	view := publication.Publication
+	view.Receipts = nil
+	view.MissingMembers = nil
+	for _, instanceID := range publication.RequiredMembers {
+		if publication.received[instanceID] {
+			view.Receipts = append(view.Receipts, trinogateway.PublicationReceipt{InstanceID: instanceID})
+			continue
+		}
+		view.MissingMembers = append(view.MissingMembers, instanceID)
+	}
+	return view
+}
+
+// fakePublicationStore is the durable publication record. It is a map, but the
+// operator must treat it as the only source of "already published" - not its
+// own memory - so the tests below restart the operator and assert that.
+type fakePublicationStore struct {
+	rows map[string]*configstore.TrinoPoolPublication
+}
+
+func newFakePublicationStore() *fakePublicationStore {
+	return &fakePublicationStore{rows: map[string]*configstore.TrinoPoolPublication{}}
+}
+
+func (f *fakePublicationStore) ListTrinoPoolPublications(_ context.Context, poolID string) ([]configstore.TrinoPoolPublication, error) {
+	ids := make([]string, 0, len(f.rows))
+	for id := range f.rows {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	publications := make([]configstore.TrinoPoolPublication, 0, len(ids))
+	for _, id := range ids {
+		if f.rows[id].PoolID == poolID {
+			publications = append(publications, *f.rows[id])
+		}
+	}
+	return publications, nil
+}
+
+func (f *fakePublicationStore) row(poolID, orgID string) *configstore.TrinoPoolPublication {
+	if f.rows[orgID] == nil {
+		f.rows[orgID] = &configstore.TrinoPoolPublication{PoolID: poolID, OrgID: orgID}
+	}
+	return f.rows[orgID]
+}
+
+func (f *fakePublicationStore) RecordTrinoPoolTenantPrincipals(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, revision string) error {
+	row := f.row(poolID, orgID)
+	row.PrincipalRevision = revision
+	if row.State == configstore.TrinoPublicationRevoked || row.State == "" {
+		row.State = configstore.TrinoPublicationPublished
+	}
+	return nil
+}
+
+func (f *fakePublicationStore) RecordTrinoPoolPublicationOpen(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, publicationID, target string) error {
+	row := f.row(poolID, orgID)
+	row.PublicationID, row.TargetRevision = publicationID, target
+	row.State = configstore.TrinoPublicationAdmitting
+	return nil
+}
+
+func (f *fakePublicationStore) RecordTrinoPoolPublicationCommitted(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, target, receipt string) error {
+	row := f.row(poolID, orgID)
+	row.AdmittedTargetRevision, row.GatewayReceipt = target, receipt
+	row.State = configstore.TrinoPublicationAdmitted
+	return nil
+}
+
+func (f *fakePublicationStore) RecordTrinoPoolTenantRevoked(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, reason string) error {
+	row := f.row(poolID, orgID)
+	row.State, row.LastError = configstore.TrinoPublicationRevoked, reason
+	row.AdmittedTargetRevision, row.TargetRevision, row.PublicationID = "", "", ""
+	return nil
+}
+
+// servingPool brings the pool to a state where every instance is ACTIVE and
+// serving, which is what a publication barrier requires.
+func (h *operatorHarness) servingPool(t *testing.T) {
+	t.Helper()
+	h.tick(t, 12)
+	for id, instance := range h.store.instances {
+		if instance.Phase != string(trinopool.PhaseServing) {
+			t.Fatalf("instance %s is %s, want SERVING before a publication", id, instance.Phase)
+		}
+	}
+}
+
+// Publishing a tenant's principals does NOT admit it. The Gateway dispatches
+// work only for a tenant in state ADMITTED, and only a committed barrier puts
+// it there - so a gate enabled without this driver denies every tenant forever.
+func TestTenantIsAdmittedOnlyThroughACommittedBarrier(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.servingPool(t)
+
+	// Principals first, then the barrier: open, one receipt per member, commit.
+	harness.tick(t, 10)
+
+	if harness.gateway.admitted["org-a"] == "" {
+		t.Fatalf("the tenant was never admitted; gateway calls: %v", harness.gateway.calls)
+	}
+	row := harness.publications.rows["org-a"]
+	if row == nil || row.State != configstore.TrinoPublicationAdmitted {
+		t.Fatalf("durable publication = %+v, want an admitted tenant", row)
+	}
+	if row.AdmittedTargetRevision == "" || row.AdmittedTargetRevision != harness.gateway.admitted["org-a"] {
+		t.Fatalf("durable target %q disagrees with the Gateway's %q",
+			row.AdmittedTargetRevision, harness.gateway.admitted["org-a"])
+	}
+	// Every serving member had to acknowledge, one receipt each.
+	receipts := 0
+	for _, call := range harness.gateway.calls {
+		if strings.HasPrefix(call, "receipt:") {
+			receipts++
+		}
+	}
+	if receipts != len(harness.store.instances) {
+		t.Fatalf("%d receipts recorded for %d members", receipts, len(harness.store.instances))
+	}
+}
+
+// A member that is not serving the tenant's configuration yet must not be
+// acknowledged on its behalf. Committing without it would admit the tenant to a
+// coordinator that cannot resolve its catalog or authenticate its login.
+func TestBarrierWaitsForAMemberThatIsNotCurrent(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.acknowledgement = func(context.Context, string, trinoPoolProjectionRevisions, int64) (trinoPoolAcknowledgement, error) {
+		return trinoPoolAcknowledgement{ProcessID: "process-1", AppliedRevision: 42, ProjectionCurrent: false}, nil
+	}
+	harness.servingPool(t)
+
+	harness.tick(t, 10)
+
+	if harness.gateway.admitted["org-a"] != "" {
+		t.Fatal("a tenant was admitted while a member was not serving its configuration")
+	}
+	for _, call := range harness.gateway.calls {
+		if strings.HasPrefix(call, "receipt:") {
+			t.Fatalf("a receipt was recorded for a member that is not current: %v", harness.gateway.calls)
+		}
+	}
+}
+
+// "Already published" cannot live in the leader's memory. A new leadership term
+// - or a different replica - reads the durable record, so an admitted tenant is
+// not republished and an unpublished one is not skipped.
+func TestPublicationStateSurvivesALeadershipChange(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.servingPool(t)
+	harness.tick(t, 10)
+	if harness.gateway.admitted["org-a"] == "" {
+		t.Fatalf("setup: the tenant was never admitted; calls: %v", harness.gateway.calls)
+	}
+
+	// A different control plane takes over: same durable state, no memory.
+	successor := newOperatorHarness(t)
+	successor.operator.store = harness.store
+	successor.operator.publications = harness.publications
+	successor.operator.gateway = harness.gateway
+	successor.operator.config.Pool.TenantAdmission = true
+	successor.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.gateway.calls = nil
+
+	successor.tick(t, 3)
+
+	for _, call := range harness.gateway.calls {
+		if strings.HasPrefix(call, "principals:") || strings.HasPrefix(call, "open:") || strings.HasPrefix(call, "commit:") {
+			t.Fatalf("the new leader republished an already admitted tenant: %v", harness.gateway.calls)
+		}
+	}
+}
+
+// A tenant that disappears from the projection is REVOKED, not forgotten. The
+// Gateway replaces a principal set only when it is published, so a removed
+// warehouse would otherwise keep its logins dispatchable indefinitely.
+func TestDepartedTenantIsRevoked(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.servingPool(t)
+	harness.tick(t, 10)
+	if harness.gateway.admitted["org-a"] == "" {
+		t.Fatalf("setup: the tenant was never admitted; calls: %v", harness.gateway.calls)
+	}
+
+	tenants.orgs = nil
+	harness.tick(t, 2)
+
+	if !harness.gateway.revoked["org-a"] {
+		t.Fatalf("the departed tenant was not revoked: %v", harness.gateway.calls)
+	}
+	if row := harness.publications.rows["org-a"]; row == nil || row.State != configstore.TrinoPublicationRevoked {
+		t.Fatalf("durable publication = %+v, want a revoked tenant", row)
+	}
+
+	// And it is revoked exactly once: the row is kept precisely so the next
+	// tick does not repeat an external mutation.
+	harness.gateway.calls = nil
+	harness.tick(t, 2)
+	for _, call := range harness.gateway.calls {
+		if strings.HasPrefix(call, "revoke:") {
+			t.Fatalf("the tenant was revoked again: %v", harness.gateway.calls)
+		}
 	}
 }

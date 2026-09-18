@@ -122,3 +122,11 @@ func newGatewayError(status int, code, body string) error {
 func Retryable(err error) bool {
 	return errors.Is(err, ErrUnavailable)
 }
+
+// IsNotFound reports the Gateway answering that it has no such pool, member or
+// publication. It is a DECISION - the thing is absent - as opposed to an
+// unanswered call, so a caller may act on it rather than resolving it by
+// read-back.
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound)
+}

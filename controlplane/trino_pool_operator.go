@@ -52,6 +52,12 @@ type trinoPoolGateway interface {
 	EnsureInactiveBackend(context.Context, trinogateway.Backend) error
 	PublishTenantPrincipals(ctx context.Context, poolID, tenant string, request trinogateway.PublishPrincipalsRequest) (trinogateway.TenantAdmission, error)
 	ConfigurePool(context.Context, string, trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error)
+	GetPool(ctx context.Context, poolID string) (trinogateway.PoolState, error)
+	OpenPublication(ctx context.Context, poolID string, request trinogateway.OpenPublicationRequest) (trinogateway.Publication, error)
+	GetPublication(ctx context.Context, poolID, publicationID string) (trinogateway.Publication, error)
+	RecordPublicationReceipt(ctx context.Context, poolID, publicationID string, request trinogateway.PublicationReceiptRequest) (trinogateway.Publication, error)
+	CommitPublication(ctx context.Context, poolID, publicationID string, request trinogateway.CommitPublicationRequest) (trinogateway.Publication, error)
+	RevokeTenant(ctx context.Context, poolID, tenant string, request trinogateway.RevokeTenantRequest) (trinogateway.TenantAdmission, error)
 	RegisterMember(context.Context, string, trinogateway.RegisterMemberRequest) (trinogateway.Member, error)
 	AdmitMember(ctx context.Context, poolID, instanceID string, request trinogateway.AdmitMemberRequest) (trinogateway.Member, error)
 	GetMember(ctx context.Context, poolID, instanceID string) (trinogateway.Member, error)
@@ -94,8 +100,8 @@ type trinoPoolOperator struct {
 	// desired state is published, so a process that has been idle since boot
 	// cannot publish what it read then. Nil in tests that drive a fixed config.
 	resolveConfig func() (trinoPoolConfig, error)
-	owner    string
-	interval time.Duration
+	owner         string
+	interval      time.Duration
 	// operatorEnabled gates every external effect. With it off the operator
 	// keeps the durable desired state in sync and touches nothing else, which
 	// is how the feature ships disabled without the code path rotting.
@@ -114,9 +120,14 @@ type trinoPoolOperator struct {
 	operations trinoPoolOperationStore
 	// tenants is the org projection the principal binding is derived from.
 	tenants trinoPoolTenantStore
-	// publishedBindings remembers the binding revision last accepted per
-	// tenant, so an unchanged tenant is not republished every tick.
-	publishedBindings map[string]string
+	// publications is the durable record of which tenant is published and
+	// admitted at which revision. It is durable rather than remembered because
+	// a restart or a leadership move must not republish blindly, nor assume an
+	// admission that never committed.
+	publications trinoPoolPublicationStore
+	// acknowledgement asks ONE member what configuration it is serving, which
+	// is what a publication receipt asserts.
+	acknowledgement func(ctx context.Context, endpoint string, expected trinoPoolProjectionRevisions, catalogRevision int64) (trinoPoolAcknowledgement, error)
 
 	lease configstore.TrinoPoolLease
 	// fenced records that this term lost the fence. It ends the loop rather
@@ -135,10 +146,6 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 	if interval <= 0 {
 		interval = trinoPoolReconcileInterval
 	}
-	// A new Run is a NEW leadership term. Published-binding memory is per term
-	// too: another controller may have republished while this one was not
-	// leading, so what this process last sent proves nothing now.
-	o.publishedBindings = nil
 	o.fenced = false
 
 	// A new Run is a NEW leadership term. Any lease left on the struct belongs
@@ -243,8 +250,9 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 		return err
 	}
 	// The binding has to be current BEFORE the gate can refuse anything on its
-	// basis, so it is published before any lifecycle step.
-	if err := o.publishTenantBindings(ctx); err != nil {
+	// basis, and a tenant is only dispatchable once its barrier has committed,
+	// so both run before any lifecycle step.
+	if err := o.advanceTenantAdmissions(ctx); err != nil {
 		return err
 	}
 

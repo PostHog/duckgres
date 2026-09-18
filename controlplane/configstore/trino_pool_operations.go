@@ -262,3 +262,124 @@ func (cs *ConfigStore) GetTrinoPoolPublication(ctx context.Context, poolID, orgI
 	}
 	return &publication, nil
 }
+
+// RecordTrinoPoolTenantPrincipals checkpoints the binding a tenant's principals
+// were last published under.
+//
+// It is durable because "already published" cannot live in a leader's memory: a
+// restart or a leadership move would either republish every tenant blindly or,
+// worse, treat an unpublished tenant as done.
+func (cs *ConfigStore) RecordTrinoPoolTenantPrincipals(ctx context.Context, lease TrinoPoolLease, poolID, orgID, principalRevision string) error {
+	if orgID == "" || principalRevision == "" {
+		return errors.New("a principal publication requires an org and a revision")
+	}
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Exec(`
+			INSERT INTO duckgres_trino_pool_publications
+				(pool_id, org_id, principal_revision, state, gateway_receipt)
+			VALUES (?, ?, ?, ?, '{}')
+			ON CONFLICT (pool_id, org_id) DO UPDATE SET
+				principal_revision = EXCLUDED.principal_revision,
+				-- A revoked tenant that is published again is live again; any
+				-- other state stays where it was, because publishing a binding
+				-- is not an admission.
+				state = CASE WHEN duckgres_trino_pool_publications.state = ?
+					THEN ? ELSE duckgres_trino_pool_publications.state END,
+				last_error = '',
+				updated_at = now()`,
+			poolID, orgID, principalRevision, TrinoPublicationPublished,
+			TrinoPublicationRevoked, TrinoPublicationPublished).Error
+	})
+}
+
+// RecordTrinoPoolPublicationOpen checkpoints an OPEN barrier.
+//
+// The identity is recorded BEFORE the Gateway call that creates it, so a lost
+// response is resolved by reading that publication back rather than by opening
+// a second barrier for the same tenant - which the Gateway refuses anyway, and
+// which would leave the first one open forever.
+func (cs *ConfigStore) RecordTrinoPoolPublicationOpen(ctx context.Context, lease TrinoPoolLease, poolID, orgID, publicationID, targetRevision string) error {
+	if orgID == "" || publicationID == "" || targetRevision == "" {
+		return errors.New("an open publication requires an org, a publication id and a target revision")
+	}
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Exec(`
+			INSERT INTO duckgres_trino_pool_publications
+				(pool_id, org_id, publication_id, target_revision, state, gateway_receipt)
+			VALUES (?, ?, ?, ?, ?, '{}')
+			ON CONFLICT (pool_id, org_id) DO UPDATE SET
+				publication_id = EXCLUDED.publication_id,
+				target_revision = EXCLUDED.target_revision,
+				state = EXCLUDED.state,
+				updated_at = now()`,
+			poolID, orgID, publicationID, targetRevision, TrinoPublicationAdmitting).Error
+	})
+}
+
+// RecordTrinoPoolPublicationCommitted checkpoints a COMMITTED barrier.
+//
+// The Gateway's record is authoritative from the moment it commits, so this is
+// a checkpoint of something already true and never a retraction point: recovery
+// after an interrupted checkpoint re-reads the Gateway and completes.
+func (cs *ConfigStore) RecordTrinoPoolPublicationCommitted(ctx context.Context, lease TrinoPoolLease, poolID, orgID, targetRevision, receipt string) error {
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	if receipt == "" {
+		receipt = "{}"
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		result := tx.Model(&TrinoPoolPublication{}).
+			Where("pool_id = ? AND org_id = ?", poolID, orgID).
+			Updates(map[string]any{
+				"admitted_target_revision": targetRevision,
+				"state":                    TrinoPublicationAdmitted,
+				"gateway_receipt":          receipt,
+				"last_error":               "",
+				"updated_at":               time.Now().UTC(),
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: publication for org %q is unknown", ErrTrinoPoolConflict, orgID)
+		}
+		return nil
+	})
+}
+
+// RecordTrinoPoolTenantRevoked checkpoints a withdrawn admission. The row is
+// kept: deleting it would read as "never published", and the next tick would
+// republish the binding of a tenant that is meant to be gone.
+func (cs *ConfigStore) RecordTrinoPoolTenantRevoked(ctx context.Context, lease TrinoPoolLease, poolID, orgID, reason string) error {
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Model(&TrinoPoolPublication{}).
+			Where("pool_id = ? AND org_id = ?", poolID, orgID).
+			Updates(map[string]any{
+				"state":                    TrinoPublicationRevoked,
+				"admitted_target_revision": "",
+				"publication_id":           "",
+				"target_revision":          "",
+				"last_error":               reason,
+				"updated_at":               time.Now().UTC(),
+			}).Error
+	})
+}
+
+// ListTrinoPoolPublications returns every tenant this pool has published,
+// including revoked ones - which is what lets a tenant that disappeared from
+// the projection be revoked exactly once rather than every tick.
+func (cs *ConfigStore) ListTrinoPoolPublications(ctx context.Context, poolID string) ([]TrinoPoolPublication, error) {
+	var publications []TrinoPoolPublication
+	err := cs.db.WithContext(ctx).Where("pool_id = ?", poolID).Order("org_id").Find(&publications).Error
+	return publications, err
+}

@@ -502,3 +502,49 @@ type trinoPoolProjectionRevisions struct {
 	Password string
 	Group    string
 }
+
+// probeMemberAcknowledgement asks one serving member what configuration it is
+// actually serving.
+//
+// It is the same authenticated readiness endpoint candidate validation uses,
+// and deliberately so: a publication receipt asserts that this member will
+// serve the tenant correctly, and the only evidence for that is what the member
+// reports having loaded. Asserting it from what the controller published would
+// commit a barrier while a coordinator still lacked the tenant's catalog,
+// password line or authorization data.
+func probeMemberAcknowledgement(
+	ctx context.Context,
+	client *http.Client,
+	coordinatorURL string,
+	credential func() (string, string),
+	expected trinoPoolProjectionRevisions,
+	catalogRevision int64,
+) (trinoPoolAcknowledgement, error) {
+	username, password := credential()
+	sync, err := fetchCatalogSync(ctx, client, coordinatorURL, username, password, true)
+	if err != nil {
+		return trinoPoolAcknowledgement{}, err
+	}
+	if !sync.Enabled || !sync.Ready || sync.FailedCatalogs != 0 {
+		return trinoPoolAcknowledgement{}, fmt.Errorf("%w: %s", errTrinoPoolCandidateNotReady, syncReason(sync))
+	}
+	if sync.ProcessID == "" {
+		return trinoPoolAcknowledgement{}, fmt.Errorf("%w: member reports no process identity", errTrinoPoolCandidateNotReady)
+	}
+	if sync.AppliedRevision == nil || *sync.AppliedRevision < catalogRevision {
+		// The member has not applied the catalog set that contains this tenant,
+		// so acknowledging on its behalf would admit the tenant to a coordinator
+		// that cannot resolve its catalog.
+		return trinoPoolAcknowledgement{}, fmt.Errorf("%w: applied catalog revision %v is behind the published revision %d",
+			errTrinoPoolCandidateNotReady, revisionText(sync.AppliedRevision), catalogRevision)
+	}
+	current := expected.Policy != "" && expected.Password != "" && expected.Group != "" &&
+		reportsRevision(sync.SecurityRevisions, trinoAccessControlKind, expected.Policy) &&
+		reportsRevision(sync.SecurityRevisions, trinoPasswordAuthenticator, expected.Password) &&
+		reportsRevision(sync.SecurityRevisions, trinoGroupProviderComponent, expected.Group)
+	return trinoPoolAcknowledgement{
+		ProcessID:         sync.ProcessID,
+		AppliedRevision:   *sync.AppliedRevision,
+		ProjectionCurrent: current,
+	}, nil
+}
