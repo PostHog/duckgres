@@ -59,7 +59,9 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 40)
 	requireGooseMigrationRecorded(t, db, 41)
 	requireGooseMigrationRecorded(t, db, 42)
-	requireGooseLatestVersion(t, db, 42)
+	requireGooseMigrationRecorded(t, db, 43)
+	requireGooseMigrationRecorded(t, db, 44)
+	requireGooseLatestVersion(t, db, 44)
 	requireTablePresent(t, db, "duckgres_trino_cell_lifecycle")
 	for _, column := range []string{"reconcile_owner", "reconcile_epoch", "intent_sequence", "intent", "admission_epoch", "freeze_operation_id", "freeze_stable", "certificate"} {
 		requireColumnPresent(t, db, "duckgres_trino_cell_lifecycle", column)
@@ -79,7 +81,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	// Migration 000041 added the worker config map inventory (it leaked on every
 	// retirement without it), the repair target the Gateway needs to charge the
 	// repair budget, and the recorded failure reason.
-	for _, column := range []string{"release_id", "spec_digest", "blueprint_snapshot", "phase", "owner_epoch", "repair", "repair_for", "failure_reason", "coordinator_deployment_uid", "worker_deployment_uid", "service_uid", "config_map_uid", "worker_config_map_name", "worker_config_map_uid", "coordinator_pod_uid", "coordinator_node_id", "coordinator_boot_id", "endpoint_url", "gateway_incarnation", "gateway_generation", "applied_catalog_revision", "validation_receipt", "retirement_receipt"} {
+	for _, column := range []string{"release_id", "spec_digest", "blueprint_snapshot", "phase", "owner_epoch", "repair", "repair_for", "failure_reason", "coordinator_deployment_uid", "worker_deployment_uid", "service_uid", "config_map_uid", "worker_config_map_name", "worker_config_map_uid", "coordinator_pod_uid", "coordinator_node_id", "coordinator_boot_id", "endpoint_url", "gateway_incarnation", "gateway_generation", "applied_catalog_revision", "validation_receipt", "retirement_receipt",
+		// Migration 000043: the coordinator identity the GATEWAY observed at
+		// registration. A loss claim must present it exactly, or a failed member
+		// keeps its live slot forever.
+		"coordinator_id"} {
 		requireColumnPresent(t, db, "duckgres_trino_pool_instances", column)
 	}
 	requireTablePresent(t, db, "duckgres_trino_pool_operations")
@@ -89,7 +95,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireTablePresent(t, db, "duckgres_trino_pool_operation_steps")
 	requireColumnPresent(t, db, "duckgres_trino_pool_operation_steps", "payload_hash")
 	requireTablePresent(t, db, "duckgres_trino_pool_publications")
-	for _, column := range []string{"desired_revision", "published_revision", "admitted_revision", "publication_id", "state", "gateway_receipt"} {
+	// Migration 000044 added the barrier's own revision strings: which binding
+	// was published, which target is open, and which one committed. They are
+	// durable because an in-memory record cannot survive a leadership move.
+	for _, column := range []string{"desired_revision", "published_revision", "admitted_revision", "publication_id", "state", "gateway_receipt",
+		"principal_revision", "target_revision", "admitted_target_revision"} {
 		requireColumnPresent(t, db, "duckgres_trino_pool_publications", column)
 	}
 	requireTablePresent(t, db, "duckgres_trino_pool_projection")
@@ -361,7 +371,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_trino_pool_operations;
 			DROP TABLE IF EXISTS duckgres_trino_pool_instances;
 			DROP TABLE IF EXISTS duckgres_trino_pools;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -412,7 +422,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
 	requireGooseMigrationRecorded(t, upgradedDB, 38)
-	requireGooseLatestVersion(t, upgradedDB, 42)
+	requireGooseLatestVersion(t, upgradedDB, 44)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -468,7 +478,7 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		DROP TABLE IF EXISTS duckgres_trino_pool_operations;
 		DROP TABLE IF EXISTS duckgres_trino_pool_instances;
 		DROP TABLE IF EXISTS duckgres_trino_pools;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40, 41, 42);
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}

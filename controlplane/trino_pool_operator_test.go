@@ -196,6 +196,7 @@ type fakePoolGateway struct {
 	principals   map[string][]string
 	calls        []string
 	drainErr     error
+	admitErr     error
 	membership   int64
 	publications map[string]*fakePublication
 	admitted     map[string]string
@@ -259,6 +260,9 @@ func (f *fakePoolGateway) RegisterMember(_ context.Context, poolID string, reque
 
 func (f *fakePoolGateway) AdmitMember(_ context.Context, _, instanceID string, _ trinogateway.AdmitMemberRequest) (trinogateway.Member, error) {
 	f.record("admit:" + instanceID)
+	if f.admitErr != nil {
+		return trinogateway.Member{}, f.admitErr
+	}
 	member := f.members[instanceID]
 	member.Phase, member.Generation, member.Eligible = "ACTIVE", member.Generation+1, true
 	return *member, nil
@@ -460,6 +464,15 @@ func (h *operatorHarness) tick(t *testing.T, times int) {
 		if err := h.operator.reconcileOnce(context.Background()); err != nil {
 			t.Fatalf("tick %d: %v", index, err)
 		}
+	}
+}
+
+// tickTolerant runs ticks that are EXPECTED to fail, which is what a refusing
+// Gateway produces. The reconcile loop logs and carries on; these tests assert
+// what was recorded while it did.
+func (h *operatorHarness) tickTolerant(times int) {
+	for index := 0; index < times; index++ {
+		_ = h.operator.reconcileOnce(context.Background())
 	}
 }
 
@@ -963,7 +976,35 @@ func (f *fakeOperationStore) RecordTrinoPoolOperationStep(_ context.Context, lea
 	return created, nil
 }
 
-func (f *fakeOperationStore) FinishTrinoPoolOperation(context.Context, configstore.TrinoPoolLease, string, string, string) error {
+func (f *fakeOperationStore) FinishTrinoPoolOperation(_ context.Context, _ configstore.TrinoPoolLease, operationID, phase, lastError string) error {
+	operation, known := f.operations[operationID]
+	if !known {
+		return configstore.ErrTrinoPoolConflict
+	}
+	now := time.Now().UTC()
+	operation.Phase, operation.LastError, operation.TerminalAt = phase, lastError, &now
+	f.operations[operationID] = operation
+	return nil
+}
+
+func (f *fakeOperationStore) UpdateTrinoPoolOperation(_ context.Context, lease configstore.TrinoPoolLease, operationID string, updates map[string]any) error {
+	if lease.Epoch != f.epoch() {
+		return configstore.ErrTrinoPoolConflict
+	}
+	operation, known := f.operations[operationID]
+	if !known || operation.TerminalAt != nil {
+		return configstore.ErrTrinoPoolConflict
+	}
+	if attempts, ok := updates["attempts"].(int64); ok {
+		operation.Attempts = attempts
+	}
+	if next, ok := updates["next_attempt_at"].(time.Time); ok {
+		operation.NextAttemptAt = &next
+	}
+	if lastError, ok := updates["last_error"].(string); ok {
+		operation.LastError = lastError
+	}
+	f.operations[operationID] = operation
 	return nil
 }
 
@@ -1539,4 +1580,63 @@ func TestDepartedTenantIsRevoked(t *testing.T) {
 			t.Fatalf("the tenant was revoked again: %v", harness.gateway.calls)
 		}
 	}
+}
+
+// A failing external call earns a wait, and the wait is DURABLE. Keeping it in
+// the leader's memory would let a restart - or a leadership move - retry
+// immediately, turning a persistent failure into a hot loop against the
+// Gateway. A successful one closes its operation, so the table does not grow
+// without bound and work in flight stays distinguishable from work that ended.
+func TestFailedStepEarnsADurableWaitAndSuccessClosesTheOperation(t *testing.T) {
+	harness := newOperatorHarness(t)
+	operations := newFakeOperationStore(func() int64 { return harness.store.epoch })
+	harness.operator.operations = operations
+
+	refusal := &trinogateway.Error{Code: "POOL_NOT_CERTIFIED", Status: 409}
+	harness.gateway.admitErr = refusal
+	harness.tickTolerant(6)
+
+	operation, known := operations.operations["instance:"+harness.store.order[0]]
+	if !known {
+		t.Fatalf("no operation was recorded: %v", operations.operations)
+	}
+	if operation.Attempts == 0 || operation.NextAttemptAt == nil {
+		t.Fatalf("operation = %+v, want a recorded attempt and a next attempt time", operation)
+	}
+	if !operation.NextAttemptAt.After(time.Now().UTC()) {
+		t.Fatalf("next attempt %s is not in the future", operation.NextAttemptAt)
+	}
+	if operation.TerminalAt != nil {
+		t.Fatal("a failed attempt closed the operation; it must stay open to be retried")
+	}
+
+	// The wait is honoured rather than retried on the next tick.
+	attempts := countGatewayCalls(harness.gateway.calls, "admit:")
+	harness.tickTolerant(3)
+	if countGatewayCalls(harness.gateway.calls, "admit:") != attempts {
+		t.Fatalf("the admission was retried during its recorded wait: %v", harness.gateway.calls)
+	}
+
+	// Once the wait elapses and the call succeeds, the operation is closed.
+	harness.gateway.admitErr = nil
+	past := time.Now().UTC().Add(-time.Minute)
+	stored := operations.operations["instance:"+harness.store.order[0]]
+	stored.NextAttemptAt = &past
+	operations.operations["instance:"+harness.store.order[0]] = stored
+
+	harness.tickTolerant(3)
+	closed := operations.operations["instance:"+harness.store.order[0]]
+	if closed.TerminalAt == nil || closed.Phase != "completed" {
+		t.Fatalf("operation = %+v, want a completed, terminal operation", closed)
+	}
+}
+
+func countGatewayCalls(calls []string, prefix string) int {
+	count := 0
+	for _, call := range calls {
+		if strings.HasPrefix(call, prefix) {
+			count++
+		}
+	}
+	return count
 }

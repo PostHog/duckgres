@@ -164,6 +164,19 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		if err := o.reconcileOnce(ctx); err != nil && ctx.Err() == nil {
+			if errors.Is(err, errTrinoPoolBackoff) {
+				// Nothing was attempted: an operation is serving out the wait a
+				// previous failure earned. That is the retry schedule working,
+				// not a fault to alert on.
+				slog.Debug("Trino pool operation is waiting for its next attempt.",
+					"pool", o.config.PublicID, "reason", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+				continue
+			}
 			slog.Warn("Trino pool reconcile failed.", "pool", o.config.PublicID, "error", err)
 			if o.fenced {
 				// The fence refused this leader. Ending the term is the correct

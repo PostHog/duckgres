@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -370,6 +371,7 @@ func (o *trinoPoolOperator) deleteResources(ctx context.Context, instance config
 		return true, o.dropAuthority(fmt.Errorf("report retirement of %s: %w", instance.InstanceID, err))
 	}
 	slog.Info("Trino pool instance retired.", "pool", o.config.PublicID, "instance", instance.InstanceID)
+	o.closeInstanceOperation(ctx, instance.InstanceID, "retired", "")
 	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseRetiring, trinopool.PhaseRetired, nil))
 }
@@ -452,9 +454,28 @@ func (o *trinoPoolOperator) expectationFor(instance configstore.TrinoPoolInstanc
 // slot, so the planner can replace it instead of blocking behind it forever -
 // which is what happened while no failure branch existed at all.
 func (o *trinoPoolOperator) failCandidate(ctx context.Context, instance configstore.TrinoPoolInstance, from trinopool.Phase, reason string) error {
+	o.closeInstanceOperation(ctx, instance.InstanceID, "failed", reason)
 	return o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		from, trinopool.PhaseFailedPreparing, map[string]any{
 			"failure_reason": reason,
 			"last_error":     reason,
 		}))
+}
+
+// closeInstanceOperation marks an instance's durable operation terminal.
+//
+// An operation that is never closed leaves `terminal_at` NULL forever: the
+// table only grows, and nothing can tell work in flight from work whose
+// instance has already reached the end of its life. It is best-effort - the
+// instance's own phase is the authoritative record - so a failure here is
+// logged rather than propagated.
+func (o *trinoPoolOperator) closeInstanceOperation(ctx context.Context, instanceID, phase, lastError string) {
+	if o.operations == nil {
+		return
+	}
+	if err := o.operations.FinishTrinoPoolOperation(ctx, o.lease, "instance:"+instanceID, phase, lastError); err != nil &&
+		!errors.Is(err, configstore.ErrTrinoPoolConflict) {
+		slog.Debug("Trino pool operation could not be closed.",
+			"pool", o.config.PublicID, "instance", instanceID, "error", err)
+	}
 }

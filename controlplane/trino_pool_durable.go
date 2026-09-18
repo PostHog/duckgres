@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
@@ -30,6 +32,35 @@ type trinoPoolOperationStore interface {
 	BeginTrinoPoolOperation(context.Context, configstore.TrinoPoolLease, configstore.TrinoPoolOperationSpec) (configstore.TrinoPoolOperation, error)
 	RecordTrinoPoolOperationStep(ctx context.Context, lease configstore.TrinoPoolLease, operationID, stepID, payloadHash, outcome, result string) (configstore.TrinoPoolOperationStep, error)
 	FinishTrinoPoolOperation(ctx context.Context, lease configstore.TrinoPoolLease, operationID, phase, lastError string) error
+	UpdateTrinoPoolOperation(ctx context.Context, lease configstore.TrinoPoolLease, operationID string, updates map[string]any) error
+}
+
+// Durable retry pacing. A failing external call is retried on a schedule the
+// DATABASE holds, not the leader's memory: a restart or a leadership move would
+// otherwise reset every backoff to zero and turn a persistent failure into a
+// hot loop against the Gateway.
+const (
+	trinoPoolRetryBase = 500 * time.Millisecond
+	trinoPoolRetryMax  = 30 * time.Second
+)
+
+// errTrinoPoolBackoff means "not yet" - the operation has a recorded next
+// attempt in the future. It is not a failure: nothing was attempted, and the
+// reconcile loop treats it as a quiet no-op rather than an error to alert on.
+var errTrinoPoolBackoff = errors.New("trino pool operation is waiting for its next attempt")
+
+// trinoPoolRetryDelay is full jitter over an exponential backoff: every attempt
+// waits a random duration up to the exponential bound, so several controllers
+// retrying the same class of failure do not synchronize into bursts.
+func trinoPoolRetryDelay(attempts int64) time.Duration {
+	bound := trinoPoolRetryBase
+	for i := int64(0); i < attempts && bound < trinoPoolRetryMax; i++ {
+		bound *= 2
+	}
+	if bound > trinoPoolRetryMax {
+		bound = trinoPoolRetryMax
+	}
+	return time.Duration(rand.Int64N(int64(bound)) + int64(trinoPoolRetryBase))
 }
 
 // Recorded step outcomes.
@@ -65,8 +96,16 @@ func (o *trinoPoolOperator) runDurableStep(
 		return err
 	}
 
-	if _, err := o.operations.BeginTrinoPoolOperation(ctx, o.lease, operation); err != nil {
+	recordedOperation, err := o.operations.BeginTrinoPoolOperation(ctx, o.lease, operation)
+	if err != nil {
 		return o.dropAuthority(fmt.Errorf("record intent for %s: %w", operation.OperationID, err))
+	}
+	if recordedOperation.NextAttemptAt != nil && time.Now().UTC().Before(*recordedOperation.NextAttemptAt) {
+		// A previous attempt failed and the wait it earned has not elapsed.
+		// Retrying now would hammer whatever refused it, and the schedule is
+		// durable precisely so a restart cannot skip it.
+		return fmt.Errorf("%w: %s until %s", errTrinoPoolBackoff,
+			operation.OperationID, recordedOperation.NextAttemptAt.Format(time.RFC3339))
 	}
 
 	hash := trinoPoolPayloadHash(payload)
@@ -104,7 +143,35 @@ func (o *trinoPoolOperator) runDurableStep(
 		slog.Warn("Trino pool step outcome could not be recorded.",
 			"pool", o.config.PublicID, "operation", operation.OperationID, "step", stepID, "error", err)
 	}
+	o.recordAttempt(ctx, operation.OperationID, recordedOperation.Attempts, effectErr)
 	return effectErr
+}
+
+// recordAttempt persists the retry schedule, or closes the operation when the
+// effect succeeded.
+//
+// Both halves matter. Without the schedule, `attempts` and `next_attempt_at`
+// stay untouched and every failing call is retried on every tick forever; with
+// no terminal marker, the operations table only grows and nothing can
+// distinguish work in flight from work that finished.
+func (o *trinoPoolOperator) recordAttempt(ctx context.Context, operationID string, attempts int64, effectErr error) {
+	if effectErr == nil {
+		if err := o.operations.FinishTrinoPoolOperation(ctx, o.lease, operationID, "completed", ""); err != nil &&
+			!errors.Is(err, configstore.ErrTrinoPoolConflict) {
+			slog.Warn("Trino pool operation could not be closed.",
+				"pool", o.config.PublicID, "operation", operationID, "error", err)
+		}
+		return
+	}
+	next := time.Now().UTC().Add(trinoPoolRetryDelay(attempts))
+	if err := o.operations.UpdateTrinoPoolOperation(ctx, o.lease, operationID, map[string]any{
+		"attempts":        attempts + 1,
+		"next_attempt_at": next,
+		"last_error":      effectErr.Error(),
+	}); err != nil && !errors.Is(err, configstore.ErrTrinoPoolConflict) {
+		slog.Warn("Trino pool retry schedule could not be recorded.",
+			"pool", o.config.PublicID, "operation", operationID, "error", err)
+	}
 }
 
 // trinoPoolDecided reports whether the Gateway made a decision, as opposed to

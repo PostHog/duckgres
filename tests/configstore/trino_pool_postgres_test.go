@@ -410,3 +410,144 @@ func TestPublicationTracksDesiredAndAdmittedSeparately(t *testing.T) {
 		t.Fatalf("publication = %+v, want an admitted tenant", publication)
 	}
 }
+
+// A step is recorded UNKNOWN before the external effect and re-recorded with
+// the outcome after it. If the second call returned the stored row unchanged,
+// a step could never leave UNKNOWN: the cross-leader read-back that keys on a
+// completed step would be unreachable and every retry would repeat the call.
+func TestOperationStepOutcomeAdvancesOutOfUnknown(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+	if _, err := store.BeginTrinoPoolOperation(ctx, lease, cpconfigstore.TrinoPoolOperationSpec{
+		OperationID: "op-1", PoolID: poolID, Kind: cpconfigstore.TrinoPoolOperationReplace, IntentHash: "hash-a",
+	}); err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	if _, err := store.RecordTrinoPoolOperationStep(ctx, lease, "op-1", "admit", "payload-a",
+		cpconfigstore.TrinoPoolStepOutcomeUnknown, "{}"); err != nil {
+		t.Fatalf("record intent: %v", err)
+	}
+	recorded, err := store.RecordTrinoPoolOperationStep(ctx, lease, "op-1", "admit", "payload-a",
+		cpconfigstore.TrinoPoolStepOutcomeOK, `{"phase":"ACTIVE"}`)
+	if err != nil {
+		t.Fatalf("record outcome: %v", err)
+	}
+	if recorded.Outcome != cpconfigstore.TrinoPoolStepOutcomeOK || !recorded.Replayed {
+		t.Fatalf("step = %+v, want a replayed step recorded OK", recorded)
+	}
+
+	// A DECIDED outcome is never re-decided: rewriting it is exactly the loss of
+	// history the journal exists to prevent.
+	again, err := store.RecordTrinoPoolOperationStep(ctx, lease, "op-1", "admit", "payload-a",
+		cpconfigstore.TrinoPoolStepOutcomeFailed, `{"phase":"REFUSED"}`)
+	if err != nil {
+		t.Fatalf("re-record: %v", err)
+	}
+	if again.Outcome != cpconfigstore.TrinoPoolStepOutcomeOK {
+		t.Fatalf("outcome = %q, want the recorded OK to stand", again.Outcome)
+	}
+}
+
+// The candidate gate compares against the pool's published catalog revision, so
+// that revision has to be written by whatever publishes catalogs. It only moves
+// forward: two publications can report out of order, and moving the gate
+// backwards would certify a coordinator missing the newest tenant.
+func TestPublicationRevisionOnlyAdvances(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	if err := store.RecordTrinoPoolPublicationRevision(ctx, lease, poolID, 7); err != nil {
+		t.Fatalf("record revision: %v", err)
+	}
+	if err := store.RecordTrinoPoolPublicationRevision(ctx, lease, poolID, 5); err != nil {
+		t.Fatalf("record older revision: %v", err)
+	}
+	pool, err := store.GetTrinoPool(ctx, poolID)
+	if err != nil || pool == nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if pool.PublicationRevision != 7 {
+		t.Fatalf("publication revision = %d, want the highest published (7)", pool.PublicationRevision)
+	}
+
+	stale := lease
+	stale.Epoch--
+	if err := store.RecordTrinoPoolPublicationRevision(ctx, stale, poolID, 9); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
+	}
+}
+
+// A desired generation that went backwards is a CONFIGURATION problem, not a
+// lost fence. Reporting it as a conflict ended the leadership term on every
+// tick and handed the pool to a replica that did the same.
+func TestBackwardsGenerationIsNotAFenceConflict(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	spec := poolSpec()
+	spec.Generation = 5
+	if err := store.UpsertTrinoPoolSpec(ctx, lease, spec); err != nil {
+		t.Fatalf("publish generation 5: %v", err)
+	}
+	spec.Generation = 4
+	err := store.UpsertTrinoPoolSpec(ctx, lease, spec)
+	if !errors.Is(err, cpconfigstore.ErrTrinoPoolStaleGeneration) {
+		t.Fatalf("backwards generation error = %v, want ErrTrinoPoolStaleGeneration", err)
+	}
+	if errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatal("a stale generation was reported as a lost fence")
+	}
+}
+
+// The publication barrier's record is what a NEW leader reads instead of its
+// own memory: which binding was published, which barrier is open, and which
+// target actually committed.
+func TestTenantPublicationRecordsBindingAndAdmission(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	if err := store.RecordTrinoPoolTenantPrincipals(ctx, lease, poolID, "org-a", "binding-1"); err != nil {
+		t.Fatalf("record principals: %v", err)
+	}
+	if err := store.RecordTrinoPoolPublicationOpen(ctx, lease, poolID, "org-a", "pub-1", "c7.pabc"); err != nil {
+		t.Fatalf("record open: %v", err)
+	}
+	if err := store.RecordTrinoPoolPublicationCommitted(ctx, lease, poolID, "org-a", "c7.pabc", `{"receipts":3}`); err != nil {
+		t.Fatalf("record commit: %v", err)
+	}
+
+	publications, err := store.ListTrinoPoolPublications(ctx, poolID)
+	if err != nil || len(publications) != 1 {
+		t.Fatalf("list publications: %v (%d rows)", err, len(publications))
+	}
+	publication := publications[0]
+	if publication.PrincipalRevision != "binding-1" || publication.AdmittedTargetRevision != "c7.pabc" ||
+		publication.State != cpconfigstore.TrinoPublicationAdmitted {
+		t.Fatalf("publication = %+v, want an admitted tenant at the committed target", publication)
+	}
+
+	// Revocation KEEPS the row. Deleting it would read as "never published", and
+	// the next tick would republish the binding of a tenant meant to be gone.
+	if err := store.RecordTrinoPoolTenantRevoked(ctx, lease, poolID, "org-a", "warehouse removed"); err != nil {
+		t.Fatalf("record revocation: %v", err)
+	}
+	publications, err = store.ListTrinoPoolPublications(ctx, poolID)
+	if err != nil || len(publications) != 1 {
+		t.Fatalf("list after revocation: %v (%d rows)", err, len(publications))
+	}
+	if publications[0].State != cpconfigstore.TrinoPublicationRevoked ||
+		publications[0].AdmittedTargetRevision != "" {
+		t.Fatalf("publication = %+v, want a revoked tenant with no admitted target", publications[0])
+	}
+
+	stale := lease
+	stale.Epoch--
+	if err := store.RecordTrinoPoolTenantPrincipals(ctx, stale, poolID, "org-a", "binding-2"); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
+	}
+}
