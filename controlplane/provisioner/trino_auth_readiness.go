@@ -138,11 +138,15 @@ func (c *kubernetesTrinoAuthenticationReadiness) Check(ctx context.Context, name
 		{"password-authenticator.properties", "password-authenticator.name", "file.password-file", "password.db"},
 		{"group-provider.properties", "group-provider.name", "file.group-file", "group.db"},
 	} {
+		configPath, err := trinoAuthenticationConfigPath(pod, container, provider.config)
+		if err != nil {
+			return false, err
+		}
 		execCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		content, execErr := c.observer.executor.Exec(execCtx, namespace, pod.Name, container.Name, []string{"cat", path.Join("/etc/trino", provider.config)})
+		content, execErr := c.observer.executor.Exec(execCtx, namespace, pod.Name, container.Name, []string{"cat", configPath})
 		cancel()
 		if execErr != nil {
-			return false, errors.New("could not observe Trino authentication configuration")
+			return false, fmt.Errorf("could not observe Trino authentication configuration (%s)", provider.config)
 		}
 		properties, parseErr := trinoAuthenticationProperties(content)
 		if parseErr != nil {
@@ -159,7 +163,7 @@ func (c *kubernetesTrinoAuthenticationReadiness) Check(ctx context.Context, name
 			}
 		}
 		refresh = max(refresh, period)
-		fmt.Fprintf(&fingerprint, "/%x", sha256.Sum256(content))
+		fmt.Fprintf(&fingerprint, "/%x/%x", sha256.Sum256([]byte(configPath)), sha256.Sum256(content))
 	}
 	afterGeneration, err := c.authenticationGeneration(ctx, namespace, pod.Name, container.Name, mountPath)
 	if err != nil {
@@ -185,6 +189,32 @@ func (c *kubernetesTrinoAuthenticationReadiness) Check(ctx context.Context, name
 		return false, nil
 	}
 	return c.now().Sub(observation.since) >= refresh, nil
+}
+
+// Supported charts mount each provider ConfigMap key as an individual file.
+// Resolve that mount in the selected engine container: the coordinator's config
+// directory differs between charts. Do not guess a default or search sidecars.
+func trinoAuthenticationConfigPath(pod corev1.Pod, container corev1.Container, file string) (string, error) {
+	configMaps := make(map[string]bool)
+	for _, volume := range pod.Spec.Volumes {
+		if volume.ConfigMap != nil {
+			configMaps[volume.Name] = true
+		}
+	}
+	var matches []string
+	for _, mount := range container.VolumeMounts {
+		if mount.SubPath != file {
+			continue
+		}
+		if !configMaps[mount.Name] || mount.SubPathExpr != "" || !path.IsAbs(mount.MountPath) || path.Clean(mount.MountPath) != mount.MountPath {
+			return "", fmt.Errorf("unsupported Trino authentication configuration mount (%s)", file)
+		}
+		matches = append(matches, mount.MountPath)
+	}
+	if len(matches) != 1 {
+		return "", fmt.Errorf("expected one Trino authentication configuration mount (%s), found %d", file, len(matches))
+	}
+	return matches[0], nil
 }
 
 func trinoAuthenticationMount(pod corev1.Pod) (string, error) {

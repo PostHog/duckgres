@@ -61,6 +61,15 @@ reconcile, plus one refresh when it creates Hoglake catalogs. New catalogs are
 admitted only after that refresh verifies them. Rollout certification also uses
 one inventory for the whole admitted tenant set.
 
+Authentication readiness reads the provider files from the coordinator container's
+explicit ConfigMap `subPath` mounts for `password-authenticator.properties` and
+`group-provider.properties`. Both `/etc/trino` and `/etc/trino/coordinator`
+layouts are supported without an additional setting. Missing, ambiguous, or
+unsupported mounts fail readiness. Custom deployments must use this same
+single-file mount contract and configure Trino to load those files. If readiness
+reports a provider observation failure, check that provider's mount and the
+control plane's pod-exec access; changing tenant passwords will not repair it.
+
 Readiness also requires the existing authentication and cell gates. It verifies
 metadata and connector availability, but does not perform S3 writes. The smoke
 test below provides that verification. The administrative OPA grant permits
