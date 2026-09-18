@@ -29,7 +29,7 @@ func TestTrinoAdmissionGuardsBothEnableSurfaces(t *testing.T) {
 					return ErrTrinoCellSelectionRequired
 				}
 				return nil
-			})
+			}, WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }))
 			body := `{"enabled":true,"tier":"free"}`
 			if endpoint == "provision" {
 				body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true}}`

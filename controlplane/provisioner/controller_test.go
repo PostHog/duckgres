@@ -22,7 +22,8 @@ import (
 
 // fakeStore implements WarehouseStore for unit tests.
 type fakeStore struct {
-	warehouses map[string]*configstore.ManagedWarehouse
+	deletionGuardErr error
+	warehouses       map[string]*configstore.ManagedWarehouse
 }
 
 type testSQLStateError struct {
@@ -1574,5 +1575,24 @@ func TestParseDucklingStatusDuckLakeEnabled(t *testing.T) {
 	ds, _ = parseDucklingStatus(mk(map[string]interface{}{"ducklake": map[string]interface{}{"enabled": false}}))
 	if ds.DuckLakeEnabled == nil || *ds.DuckLakeEnabled {
 		t.Errorf("ducklake.enabled=false → *false, got %v", ds.DuckLakeEnabled)
+	}
+}
+
+func (s *fakeStore) CheckWarehouseDeletionAllowed(string) error { return s.deletionGuardErr }
+
+func TestReconcileDeletingHoglakeOwnershipRemainsProtected(t *testing.T) {
+	dc, fakeK8s := newFakeDucklingClient()
+	fs := newFakeStore()
+	fs.deletionGuardErr = configstore.ErrHoglakeLifecycleProtected
+	fs.warehouses["tenant"] = &configstore.ManagedWarehouse{OrgID: "tenant", DucklingName: "tenant", State: configstore.ManagedWarehouseStateDeleting}
+	ctrl := NewControllerWithClient(fs, dc, time.Second)
+	ctrl.reconcile(context.Background())
+	for _, action := range fakeK8s.Actions() {
+		if action.GetVerb() == "delete" {
+			t.Fatal("queued Hoglake warehouse deletion reached Kubernetes")
+		}
+	}
+	if fs.warehouses["tenant"].State != configstore.ManagedWarehouseStateDeleting {
+		t.Fatal("blocked warehouse was marked deleted")
 	}
 }

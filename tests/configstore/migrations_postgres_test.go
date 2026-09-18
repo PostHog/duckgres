@@ -57,7 +57,8 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 36)
 	requireGooseMigrationRecorded(t, db, 38)
 	requireGooseMigrationRecorded(t, db, 39)
-	requireGooseLatestVersion(t, db, 39)
+	requireGooseMigrationRecorded(t, db, 40)
+	requireGooseLatestVersion(t, db, 40)
 	requireTablePresent(t, db, "duckgres_trino_cell_lifecycle")
 	for _, column := range []string{"reconcile_owner", "reconcile_epoch", "intent_sequence", "intent", "admission_epoch", "freeze_operation_id", "freeze_stable", "certificate"} {
 		requireColumnPresent(t, db, "duckgres_trino_cell_lifecycle", column)
@@ -253,6 +254,9 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 		"enabled",
 		"tier",
 		"trino_cell_id",
+		"backend",
+		"backend_selected",
+		"hoglake_initialized",
 		"state",
 		"status_message",
 		"ready_at",
@@ -322,7 +326,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 			DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
 			DROP TABLE IF EXISTS duckgres_trino_cell_lifecycle;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39);
+DROP FUNCTION IF EXISTS duckgres_select_trino_backend_on_enable();
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -373,7 +378,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
 	requireGooseMigrationRecorded(t, upgradedDB, 38)
-	requireGooseLatestVersion(t, upgradedDB, 39)
+	requireGooseLatestVersion(t, upgradedDB, 40)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -423,7 +428,8 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		DROP TABLE IF EXISTS duckgres_managed_warehouse_trino;
 		DROP TABLE IF EXISTS duckgres_trino_cluster_bootstrap;
 		DROP TABLE IF EXISTS duckgres_trino_cell_lifecycle;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39);
+DROP FUNCTION IF EXISTS duckgres_select_trino_backend_on_enable();
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}
@@ -1330,4 +1336,51 @@ func metadataDiff[T any](migrated, gorm map[string]T) string {
 		out += fmt.Sprintf("%s\n  migrated: %#v\n  gorm:     %#v\n", key, migratedValue, gormValue)
 	}
 	return out
+}
+
+func TestConfigStoreMigration40PinsExistingTrinoBackends(t *testing.T) {
+	_, connStr := newIsolatedConfigStoreSchema(t)
+	store, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := storeDB(t, store)
+	t.Cleanup(func() { _ = db.Close() })
+	if err := store.DB().Exec(`
+  DROP TRIGGER duckgres_select_trino_backend_on_enable ON duckgres_managed_warehouse_trino;
+  DROP FUNCTION duckgres_select_trino_backend_on_enable();
+  ALTER TABLE duckgres_managed_warehouse_trino DROP COLUMN backend, DROP COLUMN backend_selected, DROP COLUMN hoglake_initialized;
+  DELETE FROM goose_db_version WHERE version_id=40;
+  INSERT INTO duckgres_orgs (name,database_name) VALUES ('old-enabled','old_enabled'),('old-disabled','old_disabled'),('old-cell-only','old_cell_only');
+  INSERT INTO duckgres_managed_warehouse_trino (org_id,enabled) VALUES ('old-enabled',TRUE),('old-disabled',FALSE),('old-cell-only',FALSE);
+ `).Error; err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgradedDB := storeDB(t, upgraded)
+	t.Cleanup(func() { _ = upgradedDB.Close() })
+	for _, org := range []string{"old-enabled", "old-disabled", "old-cell-only"} {
+		row, err := upgraded.GetManagedWarehouseTrino(org)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.Backend != cpconfigstore.TrinoBackendDuckLake || !row.BackendSelected {
+			t.Fatalf("existing backend not pinned: %+v", row)
+		}
+	}
+	// During a rolling upgrade old binaries omit the new columns. They must
+	// still pin newly enabled/disabled DuckLake catalogs to their original backend.
+	if err := upgraded.DB().Exec(`INSERT INTO duckgres_orgs (name,database_name) VALUES ('old-binary','old_binary'); INSERT INTO duckgres_managed_warehouse_trino (org_id,enabled) VALUES ('old-binary',FALSE)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	row, err := upgraded.GetManagedWarehouseTrino("old-binary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.BackendSelected {
+		t.Fatal("old binary did not pin default backend")
+	}
 }

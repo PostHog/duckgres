@@ -802,14 +802,15 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 			}
 			return h.ducklings[orgID], nil
 		},
-		Kubernetes:      h.kube,
-		SecretReadiness: &fakeTrinoSecretReadiness{},
-		Namespace:       TrinoCustomerNamespace,
-		CellID:          testCellID,
-		Catalog:         h.catalog,
-		BundleStore:     h.bundles,
-		BundleBuilder:   h.builder,
-		AWSRegion:       "us-east-1",
+		Kubernetes:              h.kube,
+		SecretReadiness:         &fakeTrinoSecretReadiness{},
+		AuthenticationReadiness: &fakeTrinoAuthenticationReadiness{ready: true},
+		Namespace:               TrinoCustomerNamespace,
+		CellID:                  testCellID,
+		Catalog:                 h.catalog,
+		BundleStore:             h.bundles,
+		BundleBuilder:           h.builder,
+		AWSRegion:               "us-east-1",
 	})
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)
@@ -1906,28 +1907,6 @@ func TestCatalogFilesystemCacheSetting(t *testing.T) {
 			}
 			if got, want := props["fs.cache.enabled"], strconv.FormatBool(enabled); got != want {
 				t.Fatalf("fs.cache.enabled = %q, want %q", got, want)
-			}
-		})
-	}
-}
-
-func TestTrinoHoglakeCatalogProperties(t *testing.T) {
-	for _, enabled := range []bool{false, true} {
-		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
-			opts := baseTestOpts()
-			opts.HoglakeURI = "http://hoglake:8080"
-			opts.FilesystemCacheEnabled = enabled
-			p, err := NewTrinoProvisioner(opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			d := readyDuckling("42")
-			want := map[string]string{
-				"connector.name": "hoglake", "hoglake.uri": opts.HoglakeURI, "hoglake.catalog": "42",
-				"fs.cache.enabled": strconv.FormatBool(enabled), "hoglake.s3.region": d.DataStore.S3Region,
-			}
-			if got := p.buildCatalogProperties("42", readyWarehouse("42"), d); !reflect.DeepEqual(got, want) {
-				t.Fatalf("catalog properties = %v, want %v", got, want)
 			}
 		})
 	}

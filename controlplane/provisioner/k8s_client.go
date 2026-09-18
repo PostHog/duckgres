@@ -378,6 +378,16 @@ func (d *DucklingClient) GetStatusUnresolved(ctx context.Context, name string) (
 
 // Get fetches the named Duckling CR, parses its status, and resolves the
 // metadata credential Secret into MetadataStore.Password.
+// GetStorageStatus reads composition identity without resolving PostgreSQL secrets.
+// Hoglake shares the warehouse's storage role but does not use its metadata store.
+func (d *DucklingClient) GetStorageStatus(ctx context.Context, name string) (*DucklingStatus, error) {
+	cr, err := d.getCR(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("get duckling storage status: %w", err)
+	}
+	return parseDucklingStatus(cr)
+}
+
 func (d *DucklingClient) Get(ctx context.Context, name string) (*DucklingStatus, error) {
 	cr, err := d.getCR(ctx, name)
 	if err != nil {

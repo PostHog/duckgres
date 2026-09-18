@@ -838,6 +838,7 @@ export interface TrinoNode {
 }
 
 export interface TrinoOrgStatus {
+  backend?: "ducklake" | "hoglake";
   org: string;
   principal: string;
   catalog: string;
@@ -901,6 +902,8 @@ export interface TrinoOrgsResponse {
 }
 
 export interface TrinoOrgDetail {
+  backend?: "ducklake" | "hoglake";
+  backend_selected?: boolean;
   cell: TrinoCell;
   enabled: boolean;
   assigned?: boolean;

@@ -53,6 +53,7 @@ func ducklingCRName(w *configstore.ManagedWarehouse) string {
 
 // WarehouseStore is the subset of configstore.ConfigStore that the controller needs.
 type WarehouseStore interface {
+	CheckWarehouseDeletionAllowed(orgID string) error
 	ListWarehousesByStates(states []configstore.ManagedWarehouseProvisioningState) ([]configstore.ManagedWarehouse, error)
 	UpdateWarehouseState(orgID string, expectedState configstore.ManagedWarehouseProvisioningState, updates map[string]interface{}) error
 }
@@ -780,6 +781,11 @@ func (c *Controller) reconcileCnpgShard(ctx context.Context, w *configstore.Mana
 
 func (c *Controller) reconcileDeleting(ctx context.Context, w *configstore.ManagedWarehouse) {
 	log := slog.With("org", w.OrgID, "phase", "deleting")
+
+	if err := c.store.CheckWarehouseDeletionAllowed(w.OrgID); err != nil {
+		log.Warn("Warehouse deletion is blocked.", "error", err)
+		return
+	}
 
 	log.Info("Deleting Duckling CR.")
 	if err := c.duckling.Delete(ctx, ducklingCRName(w)); err != nil {

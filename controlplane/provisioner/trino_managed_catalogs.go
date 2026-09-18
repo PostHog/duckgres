@@ -114,7 +114,7 @@ func (p *TrinoProvisioner) managedCatalogs(ctx context.Context, lease configstor
 	if backend == nil || backend.Catalog == nil || backend.Name == "" {
 		return nil, errors.New("managed active backend unavailable")
 	}
-	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, tenants.data)
+	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, tenants.data, backend.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +126,7 @@ func (p *TrinoProvisioner) managedCatalogs(ctx context.Context, lease configstor
 		return outcomes, nil
 	}
 	client := &trinoManagedCatalogClient{TrinoCatalogClient: backend.Catalog, store: p.managed.Store, lease: lease, backend: backend.Name, sequence: lease.IntentSequence}
-	return p.reconcileBoundedBackend(ctx, orgs, tenants, client)
+	return p.reconcileBoundedBackend(ctx, orgs, tenants, client, backend.Name)
 }
 
 func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease configstore.TrinoCellLease, freeze *configstore.TrinoCellFreeze, tenants tenantSecretProjection) error {
@@ -161,17 +161,39 @@ func (p *TrinoProvisioner) prepareManagedTarget(ctx context.Context, lease confi
 	if err != nil {
 		return err
 	}
+	connectors, err := hoglakeConnectorInventory(ctx, backend.Catalog, orgs)
+	if err != nil {
+		return err
+	}
 	var roster []string
 	expected := make(map[string][]byte)
 	for _, org := range orgs {
 		name := TrinoCatalogName(org.TrinoPrincipal())
-		if org.TrinoPrincipal() == "" || states[name] != "OPERATIONAL" || !tenants.projected[org.OrgID] || len(tenants.data[org.OrgID]) == 0 {
+		if org.TrinoPrincipal() == "" || states[name] != "OPERATIONAL" || !tenants.projected[org.OrgID] || (!isManagedHoglake(org) && len(tenants.data[org.OrgID]) == 0) {
 			return errors.New("managed target is missing an admitted catalog or credential")
+		}
+		if isManagedHoglake(org) {
+			if err := verifyHoglakeConnector(connectors, name); err != nil {
+				return err
+			}
+			if p.managedHoglake == nil {
+				return errors.New("managed Hoglake is not configured")
+			}
+			warehouse, err := p.warehouses.GetManagedWarehouseForTrino(org.OrgID)
+			if err != nil {
+				return err
+			}
+			if warehouse == nil {
+				return errors.New("managed Hoglake warehouse identity unavailable")
+			}
+			if err := p.ensureHoglakeResources(ctx, org.OrgID, warehouse.DucklingName, false); err != nil {
+				return err
+			}
 		}
 		roster = append(roster, org.OrgID+"\x00"+org.TrinoPrincipal()+"\x00"+name)
 		expected[org.OrgID] = tenants.data[org.OrgID]
 	}
-	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, expected)
+	pending, err := p.reconcileBackendReadiness(ctx, backend.Catalog, expected, backend.Name)
 	if err != nil || len(pending) != 0 {
 		return errors.New("managed target credential projection is not ready")
 	}
