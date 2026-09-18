@@ -5,5 +5,9 @@
   "state" : "ADMITTED",
   "admittedRevision" : "r-42",
   "publicationId" : "pub-1",
+  "principalRevision" : "binding-1",
+  "principalCount" : 2,
+  "principalsHash" : "0000000000000000000000000000000000000000000000000000000000000000",
+  "principals" : [ "warehouse-one", "warehouse-one.alice" ],
   "replayed" : false
 }

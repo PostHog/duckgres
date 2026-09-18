@@ -12,10 +12,10 @@
   "admittedRevision" : "r-41",
   "tenantAdmissionEnabled" : true,
   "counts" : {
+    "PREPARING" : 1,
     "RETIRED" : 4,
     "ACTIVE" : 3,
-    "LOST" : 1,
-    "PREPARING" : 1
+    "LOST" : 1
   },
   "servingMembers" : 3,
   "liveMembers" : 4,

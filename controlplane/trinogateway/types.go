@@ -328,9 +328,16 @@ type TenantAdmission struct {
 	State            string `json:"state"`
 	AdmittedRevision string `json:"admittedRevision"`
 	PublicationID    string `json:"publicationId"`
-	// PrincipalRevision and Principals are the authoritative binding the
-	// Gateway's admission restriction keys on.
+	// PrincipalRevision, PrincipalCount and PrincipalsHash are the
+	// authoritative binding the Gateway's admission restriction keys on.
+	//
+	// Principals themselves are echoed only by the READ path. A write result is
+	// recorded as an idempotent step, so it stays bounded however many logins a
+	// tenant has: a publication response carries the count and the hash instead
+	// and leaves the list empty.
 	PrincipalRevision string   `json:"principalRevision"`
+	PrincipalCount    int      `json:"principalCount"`
+	PrincipalsHash    string   `json:"principalsHash"`
 	Principals        []string `json:"principals"`
 	Replayed          bool     `json:"replayed"`
 }

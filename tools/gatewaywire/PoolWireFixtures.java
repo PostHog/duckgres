@@ -56,8 +56,13 @@ public final class PoolWireFixtures
                 List.of(), "PENDING", null, false);
         write(mapper, out.resolve("publication.json"), publication);
 
+        // The read path echoes the published logins; a write result carries the
+        // count and hash instead, so a recorded idempotent step stays bounded
+        // however many logins a tenant has.
         PoolStore.TenantAdmission tenant = new PoolStore.TenantAdmission(
-                1, "pool-001", "tenant-a", "ADMITTED", "r-42", "pub-1", false);
+                1, "pool-001", "tenant-a", "ADMITTED", "r-42", "pub-1",
+                "binding-1", 2, "0".repeat(64),
+                List.of("warehouse-one", "warehouse-one.alice"), false);
         write(mapper, out.resolve("tenant_admission.json"), tenant);
 
         PoolStore.FailureReceipt failure = new PoolStore.FailureReceipt(
