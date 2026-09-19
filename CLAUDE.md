@@ -1823,7 +1823,10 @@ publication barrier), migrations `000040`-`000044`.
   `DUCKGRES_TRINO_POOL_CATALOG_SCHEMA` (REQUIRED with the catalog writer: the
   publisher credential names a database only, and the role's privileges are on
   the cell's schema, so unqualified SQL would resolve against `public` where it
-  can neither create nor read).
+  can neither create nor read), and `DUCKGRES_TRINO_POOL_PUBLISHER_IMAGE` (this
+  process's own digest-pinned image, rendered from the same chart helper as the
+  container and as the ConfigMap's `publisher-image` key — the projection fence
+  below compares the two).
 - **The pool keeps the cell's identity**: routing group, namespace and the
   catalog store's `cell_id` are unchanged. Replacing compute never rewrites
   which warehouse lives where.
@@ -1955,9 +1958,16 @@ publication barrier), migrations `000040`-`000044`.
   rows read INSIDE that transaction at `REPEATABLE READ`, with project scopes
   derived from the same read rather than the polled snapshot — a revision
   allocated for content read at another moment numbers bytes nobody can prove
-  were current. And an eligible PRODUCER: only a process whose own running
-  image equals the `publisher-image` key of the same pool ConfigMap may advance
-  it, compared after the authority is held. That is equality, never an ordering
+  were current. And an eligible PRODUCER: only a process whose own
+  `DUCKGRES_TRINO_POOL_PUBLISHER_IMAGE` — captured at STARTUP, from the same
+  chart helper that renders the container — equals the `publisher-image` key of
+  the same pool ConfigMap may advance it, compared after the authority is held.
+  The startup value is used rather than the pod's spec or a runtime image ID: a
+  pod specification can be edited under a running process, and the runtime
+  identity is the node's platform-specific digest rather than the manifest the
+  chart names. Both sides must be pinned by `@sha256:<64 hex>`; a floating tag
+  on either side is refused, because two equal tags are not evidence of equal
+  bytes. That is equality, never an ordering
   of image identities — an older binary that wins the lease would otherwise
   publish its own older `policy.rego` under a HIGHER revision, which no counter
   can detect, and a deliberate rollback moves the desired value so the older
@@ -1967,9 +1977,28 @@ publication barrier), migrations `000040`-`000044`.
   object's own resourceVersion as the CAS and refuses to replace a newer stamp;
   the bundle handler gates the bundle it CAPTURED before a 200 AND before a 304
   (a 304 preserves exactly the stale bundle the fence exists to retire), and an
-  unreadable record is a refusal. Candidate admission compares against the
+  unreadable record is a refusal. That gate reads the durable record on EVERY
+  request and must stay uncached: OPA's periodic downloader activates each
+  bundle inline as it fetches it, so a cached "still accepted" answer does not
+  merely delay the truth, it INSTALLS a superseded projection after a newer one
+  was accepted and a tenant admitted against it. A replica that is not the
+  advancer still BUILDS and SERVES its projection — refusing would strand every
+  coordinator polling it on its last-good bundle — but writes the auth Secret
+  only when what it built equals the accepted digest, and being un-advanceable
+  is never reported as a reconcile failure (every replica but one is in that
+  state at any moment, and failing would mark every pooled warehouse Failed).
+  Candidate admission compares against the
   accepted projection, not against what the local process last published.
   Legacy cells install no fence and are byte-for-byte unchanged.
+- **A step's expected generation comes from the RECORD, never from a fresh
+  read.** The Gateway journals each step under its identity and hashes the whole
+  request, expected generation included, so a step whose effect landed while its
+  response was lost can only be resolved by repeating the IDENTICAL request.
+  Sealing used to carry the generation from the obligations it had just read —
+  which, once the lost seal had already landed, is the generation that seal
+  produced — so the retry reported a changed intent and that member could never
+  finish draining. Regression: `TestALostResponseDoesNotChangeTheRetriedRequest`,
+  against a fake that journals payloads the way the Gateway does.
 - **Tenant admission is a committed publication, not a published binding.**
   Publishing principals (PUT `…/tenants/{t}/principals`) tells the Gateway which
   logins belong to a tenant; the Gateway dispatches work only for an ADMITTED
