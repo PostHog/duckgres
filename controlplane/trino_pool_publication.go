@@ -296,8 +296,21 @@ func (o *trinoPoolOperator) failTenantStep(
 	publication configstore.TrinoPoolPublication,
 	cause error,
 	what string,
+	firstAttempt bool,
 ) error {
-	if trinoPoolRefusedDefinitively(cause) {
+	// A refusal settles the occurrence only when nothing older can still be
+	// executing under it, which is true exactly on the FIRST request of an
+	// occurrence.
+	//
+	// On a REISSUE an earlier copy of the same request may still be on its way:
+	// the Gateway rolls a refused call back before it journals anything, so the
+	// step identity stays unclaimed and `publishTenantPrincipals` carries no
+	// revision ordering of its own. Closing here would let the controller
+	// advance to a newer intent, publish it, checkpoint it - and then have that
+	// older copy land and overwrite the Gateway's binding with the superseded
+	// principal set, which duckgres would never correct because it believes it
+	// already published the newer one.
+	if firstAttempt && trinoPoolRefusedDefinitively(cause) {
 		if errors.Is(cause, trinogateway.ErrIntentChanged) {
 			// With every reissue carrying the stored body this means something
 			// else recorded this step with different content.
@@ -447,7 +460,7 @@ func (o *trinoPoolOperator) reissueRevoke(
 		Reason: reason,
 	}); err != nil {
 		return o.failTenantStep(ctx, publication.OrgID, publication, err,
-			fmt.Sprintf("settle the revocation of %s", publication.OrgID))
+			fmt.Sprintf("settle the revocation of %s", publication.OrgID), false)
 	}
 	slog.Info("Trino pool tenant revocation settled.",
 		"pool", o.config.PublicID, "tenant", publication.OrgID, "occurrence", publication.Attempt)
@@ -481,7 +494,7 @@ func (o *trinoPoolOperator) reissuePublication(
 			return err
 		}
 		return o.failTenantStep(ctx, publication.OrgID, publication, err,
-			fmt.Sprintf("settle the publication for %s", publication.OrgID))
+			fmt.Sprintf("settle the publication for %s", publication.OrgID), false)
 	}
 	slog.Info("Trino pool tenant binding settled.",
 		"pool", o.config.PublicID, "tenant", publication.OrgID,
@@ -546,7 +559,7 @@ func (o *trinoPoolOperator) revokeDepartedTenant(
 			Reason: reason,
 		}); err != nil {
 			return true, o.failTenantStep(ctx, publication.OrgID, publication, err,
-				fmt.Sprintf("revoke tenant %s", publication.OrgID))
+				fmt.Sprintf("revoke tenant %s", publication.OrgID), true)
 		}
 		slog.Info("Trino pool tenant admission revoked.",
 			"pool", o.config.PublicID, "tenant", publication.OrgID, "occurrence", attempt)
@@ -631,7 +644,7 @@ func (o *trinoPoolOperator) publishChangedBindings(
 			return true, err
 		}
 		return true, o.failTenantStep(ctx, binding.Tenant, publication, err,
-			fmt.Sprintf("publish principals for %s", binding.Tenant))
+			fmt.Sprintf("publish principals for %s", binding.Tenant), true)
 	}
 	slog.Info("Trino pool tenant binding published.",
 		"pool", o.config.PublicID, "tenant", binding.Tenant,

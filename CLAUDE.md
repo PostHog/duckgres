@@ -2086,6 +2086,29 @@ the Trino backend selection).
   has served for weeks back to Provisioning because somebody created a user.
   All of it reads the durable record (migrations `000045`/`000046`), never the
   leader's memory.
+- **A refusal settles a tenant's occurrence only on the FIRST request of it.**
+  The Gateway rolls a refused call back before it journals anything, so the step
+  identity stays unclaimed, and publishing principals carries no revision
+  ordering of its own. On a REISSUE an earlier copy of the same request may
+  still be executing there, so closing the occurrence would let the controller
+  advance to a newer intent, publish and checkpoint it, and then have that older
+  copy land and overwrite the Gateway's binding with the superseded principal
+  set — which duckgres never corrects, because it believes it already published
+  the newer one. A removed login would stay dispatchable and a current one could
+  not dispatch. `failTenantStep` therefore takes `firstAttempt`: true from
+  `publishChangedBindings`/`revokeDepartedTenant`, false from
+  `reissuePublication`/`reissueRevoke`. The property the tests pin is that what
+  duckgres has checkpointed always names the set the Gateway actually binds
+  (`TestACheckpointedBindingNeverDivergesFromTheGateway`), NOT that the newest
+  desired set wins.
+  **Known limitation (followup, not recovery):** a tenant whose first request
+  was UNKNOWN and whose reissue is then refused for a condition that never
+  clears stays HELD on that occurrence — it publishes no corrected binding and
+  is not revoked until the refusal stops. That is the conservative direction
+  (the alternative loses a binding silently), and resolving it needs either a
+  durable "was this occurrence ever unknown" bit or a Gateway way to burn a step
+  identity. Both are out of scope here; do not "fix" it by closing the
+  occurrence on a reissue.
 - **One authoritative boot identity.** The coordinator's `processId` is probed
   BEFORE member registration and is sent as `bootId` on both register and admit;
   the Gateway requires the receipt to carry the pair it recorded. A restart
@@ -2122,6 +2145,7 @@ the Trino backend selection).
   Java records — see `tools/gatewaywire/README.md`),
   `controlplane/trino_pool_*_test.go`,
   `controlplane/trino_pool_member_retries_test.go`,
+  `controlplane/trino_pool_publication_order_test.go`,
   `tests/configstore/trino_pool_postgres_test.go`,
   `tests/trinocatalog/*_postgres_test.go`, AND the
   `trino_shared_pool_disabled` assertion in `tests/mw-dev/e2e/harness.sh`.
