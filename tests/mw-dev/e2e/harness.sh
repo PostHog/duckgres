@@ -960,8 +960,8 @@ compute_usage_pull_api() { # org password
 #   - The serving path (create -> admit -> drain -> retire). It needs a registry
 #     entry with mode: "shared-pool", a Golden-Chart blueprint artifact with a
 #     real image digest, a Gateway running the pooled protocol, and the pool
-#     feature flags on. None of those exist on mw-dev today. That path is
-#     covered by the controlplane/ unit tests (fake clientset + fake Gateway)
+#     feature flags on - a configuration this Job does not provision. That path
+#     is covered by the controlplane/ unit tests (fake clientset + fake Gateway)
 #     and the real-PostgreSQL publisher tests, and stays UNVERIFIED against a
 #     live cluster until an authorized deployment enables the flags.
 #   - The catalog-watermark admission gate (a catalog that committed while its
@@ -1008,10 +1008,11 @@ pool_object_count() { # kind selector
 
 # The ACTIVE path, for a cluster that has the pool enabled.
 #
-# It runs only when E2E_TRINO_POOL=1, because it needs what mw-dev does not have
-# by default: a registry entry with mode "shared-pool", a blueprint artifact
-# carrying a real image digest, a Gateway speaking the pooled protocol, and the
-# feature flags on. When those exist this is the acceptance check, in three
+# It runs only when E2E_TRINO_POOL=1, because it needs a configuration this lane
+# does not provision by default: a registry entry with mode "shared-pool", a
+# blueprint artifact carrying a real image digest, a Gateway speaking the pooled
+# protocol, and the feature flags on. When those exist this is the acceptance
+# check, in three
 # separately reported stages, because each is evidence for less than the next:
 #
 #   [structure] ready, non-terminating coordinator pods, each with its own

@@ -216,18 +216,18 @@ func applyFakeUpdates(instance *configstore.TrinoPoolInstance, updates map[strin
 }
 
 type fakePoolGateway struct {
-	members      map[string]*trinogateway.Member
-	obligations  map[string]trinogateway.Obligations
-	backends     map[string]trinogateway.Backend
-	principals   map[string][]string
-	calls        []string
-	drainErr     error
-	admitErr     error
-	lostErr      error
-	membership   int64
+	members     map[string]*trinogateway.Member
+	obligations map[string]trinogateway.Obligations
+	backends    map[string]trinogateway.Backend
+	principals  map[string][]string
+	calls       []string
+	drainErr    error
+	admitErr    error
+	lostErr     error
+	membership  int64
 	// lastLost is the loss claim the Gateway recorded, so a test can assert
 	// WHICH evidence a repair rested on.
-	lastLost trinogateway.LostMemberRequest
+	lastLost     trinogateway.LostMemberRequest
 	principalErr map[string]error
 	publications map[string]*fakePublication
 	admitted     map[string]string
@@ -250,9 +250,9 @@ type fakePoolGateway struct {
 	// a transport failure - the ambiguity every lifecycle retry has to survive.
 	loseResponse map[string]bool
 
-	journal      map[string]fakeStep
-	principalOf  map[string]string
-	clock        int64
+	journal     map[string]fakeStep
+	principalOf map[string]string
+	clock       int64
 	// deferPublish holds the next publication for a tenant at the server: the
 	// caller sees a lost response, and the effect commits when deliverDeferred
 	// runs.
@@ -667,15 +667,15 @@ func (f *fakePoolGateway) MemberRetired(_ context.Context, _, instanceID string,
 }
 
 type fakePoolKube struct {
-	applied    map[string]trinoPoolInventory
-	deleted    map[string]bool
-	observed   trinoPoolObservation
-	absent     bool
+	applied  map[string]trinoPoolInventory
+	deleted  map[string]bool
+	observed trinoPoolObservation
+	absent   bool
 	// absentAfterDelete makes deletion actually remove the objects, which is
 	// what lets a test drive a teardown to its end rather than asserting only
 	// the step that starts it.
 	absentAfterDelete bool
-	epochsSeen []int64
+	epochsSeen        []int64
 }
 
 func newFakePoolKube() *fakePoolKube {
