@@ -90,7 +90,9 @@ func TestACheckpointedBindingNeverDivergesFromTheGateway(t *testing.T) {
 		harness.clearBackoff("org-a")
 	}
 	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, wanted.Principals) {
-		t.Logf("the tenant is still held on its occurrence: bound %v, desired %v", got, wanted.Principals)
+		t.Fatalf("the tenant never converged: bound %v, desired %v - the refusal cleared and the "+
+			"delayed copy landed, so nothing is uncertain any more and the desired binding must be published",
+			got, wanted.Principals)
 	}
 	// Whatever it converged to, the two records must still agree.
 	bound = harness.gateway.principals["org-a"]
