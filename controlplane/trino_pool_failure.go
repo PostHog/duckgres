@@ -158,12 +158,17 @@ func (o *trinoPoolOperator) suspectInstance(ctx context.Context, instance config
 	// hashes the whole request under the step identity, so a retry after a lost
 	// response that observes the OTHER condition would report a changed intent.
 	// Reading the member back resolves that without weakening the guard.
-	if member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID); err == nil &&
-		!trinoPoolMemberBefore(member.Phase, "SUSPECT") {
+	recorded, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+	if err != nil {
+		// An unreadable member is an UNRESOLVED read-back, not permission to
+		// proceed on a body this controller derived meanwhile.
+		return fmt.Errorf("read back member %s: %w", instance.InstanceID, err)
+	}
+	if trinoPoolSuspicionRecorded[recorded.Phase] {
 		return o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 			from, trinopool.PhaseSuspect, map[string]any{
-				"gateway_state":      member.Phase,
-				"gateway_generation": member.Generation,
+				"gateway_state":      recorded.Phase,
+				"gateway_generation": recorded.Generation,
 				"last_error":         reason,
 			}))
 	}
@@ -199,9 +204,12 @@ func (o *trinoPoolOperator) claimLossIfProven(ctx context.Context, instance conf
 	// A lost response is resolved by reading the member back - the claim below
 	// is byte-stable across attempts, but the Gateway may already have recorded
 	// it while the answer never arrived.
-	if member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID); err == nil &&
-		!trinoPoolMemberBefore(member.Phase, "LOST") {
-		return true, o.dropAuthority(o.recordLost(ctx, instance, member))
+	recorded, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+	if err != nil {
+		return true, fmt.Errorf("read back member %s: %w", instance.InstanceID, err)
+	}
+	if trinoPoolLossAlreadyRecorded(recorded) {
+		return true, o.dropAuthority(o.recordLost(ctx, instance, recorded))
 	}
 	member, err := o.gateway.LostMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.LostMemberRequest{
 		Step:               o.step(instance.InstanceID, "lost"),
@@ -213,13 +221,11 @@ func (o *trinoPoolOperator) claimLossIfProven(ctx context.Context, instance conf
 			NodeID:        instance.CoordinatorNodeID,
 			CoordinatorID: instance.CoordinatorID,
 			Source:        source,
-			// The moment the member was excluded, NOT the moment of this
-			// attempt: the Gateway hashes the whole request under the step
-			// identity, so a re-stamped timestamp makes every retry after a
-			// lost response a changed intent, and the claim can never be
-			// resolved again. This value is durable and does not move while
-			// the member stays suspect.
-			ObservedAt: instance.PhaseChangedAt.UTC().Format(time.RFC3339),
+			// ObservedAt is deliberately omitted. It is optional, the Gateway
+			// stamps its receipt itself, and the only values available here are
+			// either re-derived per attempt - which makes every retry after a
+			// lost response a changed intent under the same step identity - or
+			// not the termination-observation time at all.
 		},
 	})
 	if err != nil {
@@ -246,22 +252,34 @@ func (o *trinoPoolOperator) recordLost(ctx context.Context, instance configstore
 // Two observations qualify, and both are statements Kubernetes makes only after
 // the fact:
 //
-//   - Every recorded object is gone. A process cannot outlive the objects that
-//     ran it, and the API server drops a pod once the kubelet reports its
-//     containers are finished.
-//   - The coordinator pod that hosted the admitted process is gone, or it is
-//     still there and its Trino container has a RECORDED TERMINATION while the
-//     endpoint now answers as a different process. A container hosts exactly
-//     one JVM, so a different process answering there means the admitted one is
-//     not the running container - and the termination record is Kubernetes'
-//     own statement that the previous container exited. This is what a
-//     coordinator that restarts IN PLACE produces: it keeps every object it
-//     had, so absence alone could never arrive and the member was retained
-//     forever, with its repair slot behind it.
+//   - Every recorded object is verifiably gone. This is the pre-existing proof
+//     and the same standard the owned-resource teardown uses.
+//   - The container instance that hosted the admitted process is no longer
+//     running in the pod that hosted it. That is the case a coordinator which
+//     restarts IN PLACE produces: it keeps every object it had, so absence can
+//     never arrive, and the member was retained until the drain timer - where a
+//     drain cannot finish either, because the dead process's transactions stay
+//     pinned to it.
 //
-// A timeout is never evidence. A probe that does not answer, an unreadable
-// cluster, a pod with no termination record: all leave the member suspect, and
-// nothing here deletes or restarts anything to manufacture proof.
+// The second one is only sound when it names the EXACT container instance that
+// was admitted, which is why the id is recorded at registration. An earlier
+// version accepted ANY termination record on the hosting pod plus a differing
+// identity from the member's endpoint: a pod restarted once during startup
+// carries such a record for its whole life, and a second coordinator pod makes
+// the endpoint's answer ambiguous about which process replied - together they
+// declared a live, serving member dead and wrote off its pinned work.
+//
+// Everything ambiguous fails closed: an unreadable cluster, an unenumerated pod
+// list, more than one live coordinator pod, a member registered before the
+// container id was recorded, a termination naming a different instance. Nothing
+// here deletes or restarts anything to manufacture proof, and a timeout is
+// never evidence.
+//
+// Evidence boundary, honestly: this rests on what the Kubernetes API reports.
+// A force-deleted pod object, or a node partitioned from the API server, can
+// leave a process running that the API no longer describes. Neither observation
+// below can see that, so within that boundary "proven dead" means "Kubernetes
+// reported it dead".
 func (o *trinoPoolOperator) processTerminationEvidence(
 	ctx context.Context,
 	instance configstore.TrinoPoolInstance,
@@ -271,78 +289,70 @@ func (o *trinoPoolOperator) processTerminationEvidence(
 	if err == nil && absent && observed.PodsPresent == 0 {
 		return "kubernetes-resources-absent", true
 	}
-	if instance.CoordinatorPodUID == "" || instance.CoordinatorBootID == "" {
-		// Nothing was ever bound to a process, so there is nothing to prove
-		// ended. Such a candidate leaves through the never-admitted path.
-		return "", false
-	}
+	return o.admittedContainerEnded(instance, observed)
+}
 
-	hosting, found := coordinatorPodByUID(observed.CoordinatorPods, instance.CoordinatorPodUID)
-	if len(observed.CoordinatorPods) == 0 {
-		// Nothing was enumerated. That is "not observed", never "not there":
-		// an unreadable cluster must not read as a dead process.
+func (o *trinoPoolOperator) admittedContainerEnded(
+	instance configstore.TrinoPoolInstance,
+	observed trinoPoolObservation,
+) (string, bool) {
+	if instance.CoordinatorPodUID == "" || instance.CoordinatorContainerID == "" {
+		// Nothing was bound to a container instance, so no record can be
+		// correlated with the admitted process. Such a member leaves through
+		// the planned drain instead.
 		return "", false
 	}
-	if !found {
-		// The pod that hosted the admitted process is no longer in the API, so
-		// its containers cannot still be running. Its siblings may well be.
-		return "kubernetes-coordinator-pod-absent", true
+	live := 0
+	var hosting *trinoPoolCoordinatorPod
+	for index, pod := range observed.CoordinatorPods {
+		if !pod.Terminating {
+			live++
+		}
+		if pod.UID == instance.CoordinatorPodUID {
+			hosting = &observed.CoordinatorPods[index]
+		}
 	}
-	if hosting.LastTerminated == nil {
+	if hosting == nil || live > 1 {
+		// The hosting pod was not observed - which is "not seen", never
+		// "deleted", because this listing is label-filtered and labels are
+		// mutable - or more than one coordinator pod is live, which makes any
+		// statement about which process is which ambiguous.
 		return "", false
 	}
-	if o.identity == nil || instance.EndpointURL == "" {
+	if hosting.RunningContainerID == instance.CoordinatorContainerID {
+		// The admitted container is still the running one.
 		return "", false
 	}
-	// Deliberately not paced like the serving-member probe. This one runs only
-	// for a suspected member whose container has ALREADY been recorded as
-	// terminated, and the answer ends that state: the member is declared lost
-	// on the first reply, or it drains on the existing timer. Pacing it would
-	// add half a minute to every genuine failure repair to save a request the
-	// member's own endpoint is idle enough to serve.
-	bootID, err := o.identity(ctx, instance.EndpointURL)
-	if err != nil || bootID == "" || bootID == instance.CoordinatorBootID {
-		// No answer is not evidence, and the admitted process answering is
-		// evidence of the opposite.
+	if hosting.LastTerminated == nil || hosting.RunningContainerID == "" {
+		// No termination has been recorded, or the kubelet has not reported a
+		// running container yet. Neither says the admitted instance ended.
 		return "", false
 	}
-	slog.Warn("Trino pool coordinator container terminated; the admitted process is gone.",
+	slog.Warn("Trino pool coordinator container ended; the admitted process is gone.",
 		"pool", o.config.PublicID, "instance", instance.InstanceID,
-		"admitted", instance.CoordinatorBootID, "observed", bootID,
+		"admittedContainer", instance.CoordinatorContainerID,
+		"runningContainer", hosting.RunningContainerID,
 		"exitCode", hosting.LastTerminated.ExitCode, "reason", hosting.LastTerminated.Reason)
 	return "kubernetes-coordinator-container-terminated", true
 }
 
-func coordinatorPodByUID(pods []trinoPoolCoordinatorPod, uid string) (trinoPoolCoordinatorPod, bool) {
-	for _, pod := range pods {
-		if pod.UID == uid {
-			return pod, true
-		}
-	}
-	return trinoPoolCoordinatorPod{}, false
-}
+// Accepted read-back phases. The member lifecycle is a graph, not a ranking -
+// SUSPECT can be reached from DRAINING and can itself go to DRAINING - so a
+// read-back names the states that mean "this transition is already recorded"
+// rather than inferring it from an order.
+var (
+	trinoPoolSuspicionRecorded = map[string]bool{"SUSPECT": true, "LOST": true}
+	trinoPoolLossRecorded      = map[string]bool{"LOST": true}
+)
 
-// trinoPoolMemberPhaseOrder is the Gateway's member lifecycle, so a read-back
-// can tell "already at or past this step" from "not there yet".
-var trinoPoolMemberPhaseOrder = []string{"PREPARING", "ACTIVE", "DRAINING", "SEALED", "SUSPECT", "LOST", "RETIRING", "RETIRED"}
-
-// trinoPoolMemberBefore reports whether phase comes strictly before target.
-// SUSPECT and LOST are on the failure branch, so they are ordered after the
-// phases a member can be suspected FROM and before retirement.
-func trinoPoolMemberBefore(phase, target string) bool {
-	rank := func(value string) int {
-		for index, known := range trinoPoolMemberPhaseOrder {
-			if known == value {
-				return index
-			}
-		}
-		return -1
-	}
-	phaseRank, targetRank := rank(phase), rank(target)
-	if phaseRank < 0 || targetRank < 0 {
+// trinoPoolLossAlreadyRecorded also accepts a retirement, but ONLY a failed one:
+// a DRAINED retirement is the completion of a different transition and must
+// never be read as the loss this claim is making.
+func trinoPoolLossAlreadyRecorded(member trinogateway.Member) bool {
+	if trinoPoolLossRecorded[member.Phase] {
 		return true
 	}
-	return phaseRank < targetRank
+	return (member.Phase == "RETIRING" || member.Phase == "RETIRED") && member.RetirementKind == "FAILED"
 }
 
 // cleanupFailedCandidate releases everything a candidate that can never be

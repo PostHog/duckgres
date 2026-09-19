@@ -84,11 +84,15 @@ type trinoPoolObservation struct {
 type trinoPoolCoordinatorPod struct {
 	UID         string
 	Terminating bool
-	// Restarts and LastTerminated come from the pod's own container status for
-	// the Trino container - the kubelet writes them AFTER it observed the exit,
-	// so they are a statement about a container that ended, never a timeout.
-	Restarts       int32
-	LastTerminated *trinoPoolContainerTermination
+	// RunningContainerID, Restarts and LastTerminated come from the pod's own
+	// container status for the Trino container. The kubelet writes them AFTER it
+	// observed the exit, so they are a statement about a container that ended,
+	// never a timeout. The IDs are what tie a record to ONE container instance:
+	// a termination that names some other instance says nothing about the
+	// admitted one.
+	RunningContainerID string
+	Restarts           int32
+	LastTerminated     *trinoPoolContainerTermination
 }
 
 // trinoPoolContainerTermination is Kubernetes' record of a container instance
@@ -451,6 +455,7 @@ func coordinatorPodStatus(pod corev1.Pod) trinoPoolCoordinatorPod {
 			continue
 		}
 		status.Restarts = container.RestartCount
+		status.RunningContainerID = container.ContainerID
 		if terminated := container.LastTerminationState.Terminated; terminated != nil {
 			status.LastTerminated = &trinoPoolContainerTermination{
 				ContainerID: terminated.ContainerID,

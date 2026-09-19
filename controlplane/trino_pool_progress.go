@@ -127,7 +127,7 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 	// and this instance can never leave CREATING while its member holds a live
 	// slot. What the Gateway recorded is also the only identity a later receipt
 	// or loss claim may present, so it is adopted verbatim.
-	if adopted, err := o.adoptRegisteredMember(ctx, instance); adopted || err != nil {
+	if adopted, err := o.adoptRegisteredMember(ctx, instance, observed); adopted || err != nil {
 		return adopted, err
 	}
 	if !observed.CoordinatorReady || observed.ReadyWorkers == 0 || observed.ReadyWorkers != observed.DesiredWorkers {
@@ -175,6 +175,11 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 		trinopool.PhaseCreating, trinopool.PhasePreparing, map[string]any{
 			"coordinator_pod_uid": observed.CoordinatorPodUID,
 			"coordinator_boot_id": bootID,
+			// The container instance the admitted process runs in. A termination
+			// record names a container instance, so without this there is nothing
+			// to correlate one with, and an unrelated restart from before
+			// admission reads exactly like the death of this process.
+			"coordinator_container_id": runningCoordinatorContainer(observed, observed.CoordinatorPodUID),
 			// The Gateway observes the coordinator's node and coordinator ids
 			// itself at registration and binds the member to them. Recording
 			// what it returned is the only way a later loss claim can present
@@ -197,7 +202,11 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 // candidate then fails its validation against the live process and is replaced
 // through the path that exists for exactly that, which also releases the live
 // slot the member is holding.
-func (o *trinoPoolOperator) adoptRegisteredMember(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+func (o *trinoPoolOperator) adoptRegisteredMember(
+	ctx context.Context,
+	instance configstore.TrinoPoolInstance,
+	observed trinoPoolObservation,
+) (bool, error) {
 	member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
 	if err != nil {
 		if errors.Is(err, trinogateway.ErrNotFound) {
@@ -217,15 +226,34 @@ func (o *trinoPoolOperator) adoptRegisteredMember(ctx context.Context, instance 
 		"pool", o.config.PublicID, "instance", instance.InstanceID, "phase", member.Phase)
 	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseCreating, trinopool.PhasePreparing, map[string]any{
-			"coordinator_pod_uid":  member.PodUID,
-			"coordinator_boot_id":  member.BootID,
-			"coordinator_node_id":  member.NodeID,
-			"coordinator_id":       member.CoordinatorID,
-			"gateway_incarnation":  member.Incarnation,
-			"gateway_backend_name": member.BackendName,
-			"gateway_state":        member.Phase,
-			"gateway_generation":   member.Generation,
+			"coordinator_pod_uid": member.PodUID,
+			"coordinator_boot_id": member.BootID,
+			// Only when the pod the Gateway recorded is still the one running:
+			// a container id from a different pod would correlate a later
+			// termination record with the wrong process.
+			"coordinator_container_id": runningCoordinatorContainer(observed, member.PodUID),
+			"coordinator_node_id":      member.NodeID,
+			"coordinator_id":           member.CoordinatorID,
+			"gateway_incarnation":      member.Incarnation,
+			"gateway_backend_name":     member.BackendName,
+			"gateway_state":            member.Phase,
+			"gateway_generation":       member.Generation,
 		}))
+}
+
+// runningCoordinatorContainer is the container instance currently running in the
+// named pod, or "" when that pod is not among the observed ones. Empty means the
+// termination evidence below has nothing to correlate against and stays unavailable.
+func runningCoordinatorContainer(observed trinoPoolObservation, podUID string) string {
+	if podUID == "" {
+		return ""
+	}
+	for _, pod := range observed.CoordinatorPods {
+		if pod.UID == podUID {
+			return pod.RunningContainerID
+		}
+	}
+	return ""
 }
 
 func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {

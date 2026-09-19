@@ -185,6 +185,8 @@ func applyFakeUpdates(instance *configstore.TrinoPoolInstance, updates map[strin
 			instance.CoordinatorID = value.(string)
 		case "coordinator_boot_id":
 			instance.CoordinatorBootID = value.(string)
+		case "coordinator_container_id":
+			instance.CoordinatorContainerID = value.(string)
 		case "gateway_incarnation":
 			instance.GatewayIncarnation = value.(string)
 		case "gateway_backend_name":
@@ -683,6 +685,13 @@ func newFakePoolKube() *fakePoolKube {
 		observed: trinoPoolObservation{
 			CoordinatorReady: true, ReadyWorkers: 4, DesiredWorkers: 4,
 			CoordinatorPodUID: "pod-uid-1", PodsPresent: 5,
+			// A real Observe always reports the coordinator pod it read the
+			// readiness from, including which container instance is running -
+			// that is what registration records so a later termination record
+			// can be correlated with the admitted process.
+			CoordinatorPods: []trinoPoolCoordinatorPod{
+				{UID: "pod-uid-1", RunningContainerID: "containerd://admitted"},
+			},
 		},
 	}
 }

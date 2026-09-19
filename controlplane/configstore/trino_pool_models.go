@@ -147,9 +147,14 @@ type TrinoPoolInstance struct {
 	// member registered. It is a distinct value from the node id, and a loss
 	// claim has to carry both exactly as the Gateway recorded them, or the
 	// evidence is refused and the member keeps its live slot forever.
-	CoordinatorID     string `gorm:"column:coordinator_id"`
-	CoordinatorBootID string `gorm:"column:coordinator_boot_id"`
-	EndpointURL       string `gorm:"column:endpoint_url"`
+	CoordinatorID string `gorm:"column:coordinator_id"`
+	// CoordinatorContainerID is the container instance that hosted the admitted
+	// process. Termination records name a container instance, so this is what
+	// ties one to the process the Gateway admitted rather than to some earlier
+	// restart of the same pod.
+	CoordinatorContainerID string `gorm:"column:coordinator_container_id"`
+	CoordinatorBootID      string `gorm:"column:coordinator_boot_id"`
+	EndpointURL            string `gorm:"column:endpoint_url"`
 	// TLSServerName is retained on the row for the fixed-cell path only. A
 	// pooled instance is reached over plain in-cluster HTTP and has no
 	// certificate of its own, so the pool never sets it.

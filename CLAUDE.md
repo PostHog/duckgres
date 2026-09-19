@@ -1810,7 +1810,7 @@ Code: `controlplane/trinopool/` (pure: blueprint, phases, planner, catalog-versi
 port), `controlplane/trinocatalog/` (fenced catalog publisher),
 `controlplane/trinogateway/` (Gateway protocol v1 client),
 `controlplane/trino_pool_*.go` (config, effects, validation, operator, wiring,
-publication barrier), migrations `000041`-`000046` (upstream owns `000040`,
+publication barrier), migrations `000041`-`000048` (upstream owns `000040`,
 the Trino backend selection).
 
 - **Env, all default-off**: `DUCKGRES_TRINO_POOL_ENABLED` (a pooled cell with
@@ -1908,18 +1908,34 @@ the Trino backend selection).
   its floor keeps the flaky member rather than dropping below it.
 - **Two observations prove a process ended, and both are statements Kubernetes
   makes after the fact** (`processTerminationEvidence`): every recorded object
-  is gone, or the coordinator pod that hosted the admitted process is gone —
-  or is still there and its Trino container carries a RECORDED TERMINATION
-  while the endpoint now answers as a different process. The second path is
-  what a coordinator that restarts IN PLACE produces: it keeps every object it
-  had, so absence could never arrive, and the member was retained until the
-  drain timer — where a drain cannot finish either, because the dead JVM's
-  transactions stay pinned to it. That held the instance, and the repair slot
-  behind it, forever. A container hosts exactly one JVM, so a different process
-  answering there means the admitted one is not the running container, and the
-  kubelet's termination record is the corroboration. A timeout is never
-  evidence, an unenumerated pod list is "not observed" rather than "not there",
+  is verifiably absent, or **the exact container instance that hosted the
+  admitted process is no longer the one running in the pod that hosted it**.
+  The second is what a coordinator that restarts IN PLACE produces: it keeps
+  every object it had, so absence can never arrive, and the member was retained
+  until the drain timer — where a drain cannot finish either, because the dead
+  process's transactions stay pinned to it, holding the instance and its repair
+  slot forever.
+  **Exactness is the whole contract.** The container id is recorded at
+  registration (migration `000048`) precisely so a termination record can be
+  correlated with the admitted process. An earlier version accepted ANY
+  termination record on the hosting pod plus a differing identity from the
+  member's endpoint, and that is NOT evidence: a pod restarted once during
+  startup carries such a record for its whole life, and a second coordinator
+  pod makes the endpoint's answer ambiguous about which process replied —
+  together they declared a live, serving member dead and wrote off its pinned
+  work (regression:
+  `TestALiveAdmittedProcessIsNotDeclaredLostByAnUncorrelatedTermination`).
+  Everything ambiguous fails closed: an unreadable cluster, an unenumerated pod
+  list, more than one live coordinator pod, a member with no recorded container
+  id, a termination naming a different instance. A label-filtered listing
+  omission is NOT deletion (labels are mutable), a timeout is never evidence,
   and nothing is deleted or restarted to manufacture proof.
+  **Evidence boundary, stated honestly:** this rests on what the Kubernetes API
+  reports. A force-deleted pod object, or a node partitioned from the API
+  server, can leave a process running that the API no longer describes; neither
+  observation can see that. Within that boundary "proven dead" means
+  "Kubernetes reported it dead" — which is what the user accepts, as distinct
+  from a timeout or routing ambiguity being classified as death.
 - **A serving member's PROCESS is observed, not just its pod.** A container can
   restart inside a Pod and report ready with the same pod UID and a new Trino
   incarnation; the Gateway refuses to dispatch to anything but the boot identity
@@ -2039,7 +2055,15 @@ the Trino backend selection).
   (re-probed per attempt, so an in-place restart changed it). Where the request
   genuinely cannot be reproduced — registration's observed identity, a
   suspicion whose reason depends on which check fired first — the member is
-  READ BACK and what the Gateway recorded is adopted, never re-derived.
+  READ BACK and what the Gateway recorded is adopted, never re-derived. A
+  read-back that FAILS stays an error: an unresolved operation identity is not
+  permission to send a body this controller derived meanwhile. The accepted
+  read-back states are explicit SETS, not a rank — the lifecycle is a graph
+  (SUSPECT ↔ DRAINING), and a retirement counts as a recorded loss only when
+  its kind is FAILED, because a DRAINED one completed a different transition.
+  `observedAt` is omitted from the loss claim: it is optional, the Gateway
+  stamps its own receipt time, and every value available here is either
+  re-derived per attempt or not the termination-observation time at all.
   Regressions: `TestALostResponseDoesNotChangeTheRetriedRequest` and
   `TestALostResponseDoesNotChangeTheRetriedMemberRequest`, against a fake that
   journals the whole payload the way the Gateway does.

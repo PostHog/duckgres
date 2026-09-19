@@ -157,23 +157,27 @@ func TestASamePodRestartWithPinnedWorkReachesFailureRepair(t *testing.T) {
 		Phase:      "ACTIVE", OpenTransactions: 1, ActiveQueries: 2,
 	}
 
-	// The container restarted inside the same Pod: same pod UID, a new Trino
-	// process, and Kubernetes' own record that the previous container ended.
+	// The container restarted inside the same Pod: same pod UID, a DIFFERENT
+	// container instance running, and Kubernetes' own record that a container
+	// ended. The admitted container id is what makes that record about THIS
+	// process rather than about some earlier restart.
 	harness.operator.identity = func(context.Context, string) (string, error) { return "process-2", nil }
-	// The identity probe is paced; this is the first observation after the
-	// restart, which is what the real loop makes once the interval elapses.
 	harness.operator.identityObservedAt = nil
 	// Deleting the failed member's objects actually removes them, so the
 	// retirement this test is about can reach its end.
 	harness.kube.absentAfterDelete = true
 	harness.kube.observed.CoordinatorPods = []trinoPoolCoordinatorPod{{
-		UID:      "pod-uid-1",
-		Restarts: 1,
+		UID:                "pod-uid-1",
+		Restarts:           1,
+		RunningContainerID: "containerd://restarted",
 		LastTerminated: &trinoPoolContainerTermination{
 			ContainerID: "containerd://old", ExitCode: 137, Reason: "OOMKilled",
 			FinishedAt: "2026-09-19T12:00:00Z",
 		},
 	}}
+	if got := harness.store.instances[instanceID].CoordinatorContainerID; got != "containerd://admitted" {
+		t.Fatalf("recorded container = %q, want the container the member was registered with", got)
+	}
 
 	harness.tickTolerant(20)
 
@@ -232,5 +236,60 @@ func TestARestartlessSuspicionIsNeverDeclaredLost(t *testing.T) {
 		if call == "lost:"+instanceID {
 			t.Fatalf("claimed a loss without evidence that the process ended")
 		}
+	}
+}
+
+// A termination record that belongs to some OTHER container instance is not
+// evidence about the admitted one, and a second coordinator pod makes the
+// endpoint's answer ambiguous about which process replied.
+//
+// The admitted pod carries a termination from BEFORE it was admitted - a
+// restart during startup leaves exactly that - and is still serving its pinned
+// work. A second coordinator pod overlaps it, as Kubernetes recovery routinely
+// produces, and the endpoint answers as that pod's process. Nothing here says
+// the admitted process ended, so nothing may declare it dead.
+func TestALiveAdmittedProcessIsNotDeclaredLostByAnUncorrelatedTermination(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.tick(t, 20)
+	instanceID := harness.store.order[0]
+	instance := harness.placeInstance(t, instanceID, trinopool.PhaseSuspect, "SUSPECT")
+	harness.gateway.obligations[instanceID] = trinogateway.Obligations{
+		Generation: harness.gateway.members[instanceID].Generation,
+		Phase:      "SUSPECT", OpenTransactions: 1,
+	}
+
+	harness.kube.observed.CoordinatorPods = []trinoPoolCoordinatorPod{
+		{
+			// The admitted pod, still running the admitted container, carrying a
+			// termination record from a restart that happened before admission.
+			UID: "pod-uid-1", Restarts: 1, RunningContainerID: "containerd://admitted",
+			LastTerminated: &trinoPoolContainerTermination{
+				ContainerID: "containerd://before-admission", ExitCode: 1,
+				FinishedAt: "2026-09-19T10:00:00Z",
+			},
+		},
+		// A second coordinator pod overlapping it.
+		{UID: "pod-uid-2", RunningContainerID: "containerd://other"},
+	}
+	// The endpoint answers as the second pod's process.
+	harness.operator.identity = func(context.Context, string) (string, error) { return "process-2", nil }
+	harness.operator.identityObservedAt = nil
+	harness.kube.absentAfterDelete = true
+
+	harness.tickTolerant(12)
+
+	for _, call := range harness.gateway.calls {
+		if call == "lost:"+instanceID {
+			t.Fatalf("declared a live admitted process dead: its pinned work would be "+
+				"written off on an uncorrelated termination record. calls = %v", harness.gateway.calls)
+		}
+	}
+	if instance.Phase == string(trinopool.PhaseLost) ||
+		instance.Phase == string(trinopool.PhaseFailureRetired) {
+		t.Fatalf("phase = %s, want the member to stay suspect until it is actually proven dead",
+			instance.Phase)
+	}
+	if harness.kube.deleted[instance.ServiceName] {
+		t.Fatalf("deleted the objects of a member that was never proven dead")
 	}
 }
