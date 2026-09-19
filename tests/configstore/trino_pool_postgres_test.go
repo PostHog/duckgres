@@ -531,6 +531,12 @@ func TestTenantPublicationRecordsBindingAndAdmission(t *testing.T) {
 		publication.State != cpconfigstore.TrinoPublicationAdmitted {
 		t.Fatalf("publication = %+v, want an admitted tenant at the committed target", publication)
 	}
+	// The committed barrier stops being the LIVE one. Leaving it named here
+	// would make the driver select a finished publication as the attempt in
+	// flight forever, and the Gateway never retracts an opened admission gate.
+	if publication.PublicationID != "" || publication.TargetRevision != "" {
+		t.Fatalf("publication = %+v, want the finished barrier cleared", publication)
+	}
 
 	// Revocation KEEPS the row. Deleting it would read as "never published", and
 	// the next tick would republish the binding of a tenant meant to be gone.
@@ -551,6 +557,96 @@ func TestTenantPublicationRecordsBindingAndAdmission(t *testing.T) {
 	if err := store.RecordTrinoPoolTenantPrincipals(ctx, stale, poolID, "org-a", "binding-2"); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
 		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
 	}
+}
+
+// A new barrier does not retract an admission, and clearing a dead one does not
+// either.
+//
+// Both matter outside the driver: an operator surface keyed on the state would
+// otherwise flap a serving warehouse back to Provisioning every time one of its
+// logins changed, and an attempt that was abandoned has to leave the durable
+// record without taking the tenant's admission with it.
+func TestPublicationBarrierLivenessIsSeparateFromAdmission(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	if err := store.RecordTrinoPoolTenantPrincipals(ctx, lease, poolID, "org-a", "binding-1"); err != nil {
+		t.Fatalf("record principals: %v", err)
+	}
+	// A tenant that has never been admitted reports that it is being admitted.
+	if err := store.RecordTrinoPoolPublicationOpen(ctx, lease, poolID, "org-a", "pub-1", "b1.a1"); err != nil {
+		t.Fatalf("record open: %v", err)
+	}
+	if got := onePublication(t, store, "org-a"); got.State != cpconfigstore.TrinoPublicationAdmitting {
+		t.Fatalf("state = %q, want admitting for a tenant that was never admitted", got.State)
+	}
+	if err := store.RecordTrinoPoolPublicationCommitted(ctx, lease, poolID, "org-a", "b1.a1", `{"receipts":3}`); err != nil {
+		t.Fatalf("record commit: %v", err)
+	}
+
+	// Its next barrier - a new login - leaves the admission alone.
+	if err := store.RecordTrinoPoolTenantPrincipals(ctx, lease, poolID, "org-a", "binding-2"); err != nil {
+		t.Fatalf("record second principals: %v", err)
+	}
+	if err := store.RecordTrinoPoolPublicationOpen(ctx, lease, poolID, "org-a", "pub-2", "b2.a2"); err != nil {
+		t.Fatalf("record second open: %v", err)
+	}
+	got := onePublication(t, store, "org-a")
+	if got.State != cpconfigstore.TrinoPublicationAdmitted || got.AdmittedTargetRevision != "b1.a1" {
+		t.Fatalf("publication = %+v, want the serving tenant to stay admitted at its previous target", got)
+	}
+	if got.PublicationID != "pub-2" {
+		t.Fatalf("live barrier = %q, want pub-2", got.PublicationID)
+	}
+
+	// Clearing the attempt takes the barrier, not the admission.
+	if err := store.ClearTrinoPoolPublicationBarrier(ctx, lease, poolID, "org-a"); err != nil {
+		t.Fatalf("clear barrier: %v", err)
+	}
+	got = onePublication(t, store, "org-a")
+	if got.PublicationID != "" || got.TargetRevision != "" {
+		t.Fatalf("publication = %+v, want no live barrier", got)
+	}
+	if got.State != cpconfigstore.TrinoPublicationAdmitted || got.AdmittedTargetRevision != "b1.a1" {
+		t.Fatalf("publication = %+v, want the admission preserved", got)
+	}
+
+	// A tenant that was never admitted falls back to whether its binding was
+	// published at all.
+	if err := store.RecordTrinoPoolTenantPrincipals(ctx, lease, poolID, "org-b", "binding-1"); err != nil {
+		t.Fatalf("record principals for org-b: %v", err)
+	}
+	if err := store.RecordTrinoPoolPublicationOpen(ctx, lease, poolID, "org-b", "pub-3", "b1.a1"); err != nil {
+		t.Fatalf("record open for org-b: %v", err)
+	}
+	if err := store.ClearTrinoPoolPublicationBarrier(ctx, lease, poolID, "org-b"); err != nil {
+		t.Fatalf("clear barrier for org-b: %v", err)
+	}
+	if got := onePublication(t, store, "org-b"); got.State != cpconfigstore.TrinoPublicationPublished {
+		t.Fatalf("state = %q, want published for a tenant whose binding is current but was never admitted", got.State)
+	}
+
+	stale := lease
+	stale.Epoch--
+	if err := store.ClearTrinoPoolPublicationBarrier(ctx, stale, poolID, "org-a"); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
+	}
+}
+
+func onePublication(t *testing.T, store *cpconfigstore.ConfigStore, orgID string) cpconfigstore.TrinoPoolPublication {
+	t.Helper()
+	publications, err := store.ListTrinoPoolPublications(context.Background(), poolID)
+	if err != nil {
+		t.Fatalf("list publications: %v", err)
+	}
+	for _, publication := range publications {
+		if publication.OrgID == orgID {
+			return publication
+		}
+	}
+	t.Fatalf("no publication row for %s", orgID)
+	return cpconfigstore.TrinoPoolPublication{}
 }
 
 // A tenant's occurrence counter is what makes its NEXT barrier - or its next

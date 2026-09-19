@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -35,7 +36,20 @@ import (
 //  1. revoke a tenant that has disappeared from the projection (never skip it
 //     silently: its logins would stay dispatchable);
 //  2. publish a changed principal binding;
-//  3. advance ONE tenant's barrier by one step - open, one receipt, or commit.
+//  3. advance THE one live barrier by one step - open, one receipt, or commit.
+//
+// Two scheduling rules make that safe at fleet scale, and both are
+// load-bearing rather than tuning:
+//
+//   - At most ONE barrier is live at a time, and it is driven to completion
+//     rather than round-robined between steps. Every OPEN publication blocks
+//     every member admission (the Gateway requires a joining member to
+//     acknowledge the open publication's target revision, which a member
+//     registered under a release id can never do), so N concurrent barriers are
+//     N obstacles to the pool's own compute lifecycle.
+//   - While a member is waiting to join, no new barrier is opened and the live
+//     one is released, ONE per pass. Compute wins: a tenant waiting a few more
+//     seconds is cheaper than a pool that cannot grow back.
 //
 // Every decision reads the DURABLE record, never a leader's memory: a restart
 // or a leadership move must not republish blindly or assume an admission that
@@ -56,6 +70,10 @@ type trinoPoolPublicationStore interface {
 	RecordTrinoPoolPublicationOpen(ctx context.Context, lease configstore.TrinoPoolLease, poolID, orgID, publicationID, targetRevision string) error
 	RecordTrinoPoolPublicationCommitted(ctx context.Context, lease configstore.TrinoPoolLease, poolID, orgID, targetRevision, receipt string) error
 	RecordTrinoPoolTenantRevoked(ctx context.Context, lease configstore.TrinoPoolLease, poolID, orgID, reason string) error
+	// ClearTrinoPoolPublicationBarrier is the durable half of abandoning an
+	// attempt: without it the row keeps naming a finished publication and every
+	// later pass selects that same dead attempt again.
+	ClearTrinoPoolPublicationBarrier(ctx context.Context, lease configstore.TrinoPoolLease, poolID, orgID string) error
 	// BeginTrinoPoolPublicationAttempt bumps the tenant's occurrence counter,
 	// which every durable step identity for that tenant carries.
 	BeginTrinoPoolPublicationAttempt(ctx context.Context, lease configstore.TrinoPoolLease, poolID, orgID string) (int64, error)
@@ -74,6 +92,19 @@ type trinoPoolAcknowledgement struct {
 	// ProjectionCurrent reports that this member's authorization and
 	// authentication data are the ones this control plane is serving.
 	ProjectionCurrent bool
+}
+
+// trinoPoolBarrierBasis is the configuration ONE attempt is admitting against.
+//
+// It is captured when the barrier opens and every receipt of that attempt is
+// verified against it, so the receipts a commit rests on describe one coherent
+// configuration rather than whatever happened to be current when each was
+// taken. An attempt whose basis is gone (a leadership move) or no longer
+// current (the projection moved) is released and reopened rather than
+// completed on mixed evidence.
+type trinoPoolBarrierBasis struct {
+	Projection      trinoPoolProjectionRevisions
+	CatalogRevision int64
 }
 
 // advanceTenantAdmissions drives the barrier for this pool's tenants.
@@ -103,6 +134,13 @@ func (o *trinoPoolOperator) advanceTenantAdmissions(ctx context.Context) error {
 	for _, publication := range recorded {
 		state[publication.OrgID] = publication
 	}
+	// The instances are read once and reused: the receipt step needs them, and
+	// whether a candidate is waiting to be admitted decides whether a barrier
+	// may be open at all.
+	instances, err := o.store.ListTrinoPoolInstances(ctx, o.config.PoolID)
+	if err != nil {
+		return fmt.Errorf("list pool instances: %w", err)
+	}
 
 	if progressed, err := o.revokeDepartedTenant(ctx, bindings, recorded); progressed || err != nil {
 		return err
@@ -110,7 +148,23 @@ func (o *trinoPoolOperator) advanceTenantAdmissions(ctx context.Context) error {
 	if progressed, err := o.publishChangedBindings(ctx, bindings, state); progressed || err != nil {
 		return err
 	}
-	return o.advanceOneBarrier(ctx, bindings, state)
+	return o.advanceOneBarrier(ctx, bindings, recorded, state, instances)
+}
+
+// trinoPoolAwaitsMemberAdmission reports that a candidate is sitting at the
+// Gateway's admission call.
+//
+// A candidate stays VALIDATING until its admission is accepted, so this is
+// exactly "a member is blocked joining" - read from the durable instance rows
+// rather than remembered from the last refusal, which a leadership move would
+// lose and a durable admission backoff would delay by up to its whole wait.
+func trinoPoolAwaitsMemberAdmission(instances []configstore.TrinoPoolInstance) bool {
+	for _, instance := range instances {
+		if trinopool.Phase(instance.Phase) == trinopool.PhaseValidating {
+			return true
+		}
+	}
+	return false
 }
 
 // revokeDepartedTenant withdraws the admission of a tenant that is no longer in
@@ -152,13 +206,14 @@ func (o *trinoPoolOperator) revokeDepartedTenant(
 			// the tenant was re-enabled and admitted again - a new operation
 			// rather than a replay that returns the first revocation's outcome
 			// and leaves the tenant admitted.
-			Step:   o.step("tenant."+publication.OrgID, fmt.Sprintf("revoke.a%d", attempt)),
+			Step:   o.step("tenant."+publication.OrgID, trinoPoolStepID("revoke", trinoPoolOccurrence(attempt))),
 			Reason: "the warehouse is no longer served by this pool",
 		}); err != nil {
 			return true, o.dropAuthority(fmt.Errorf("revoke tenant %s: %w", publication.OrgID, err))
 		}
 		slog.Info("Trino pool tenant admission revoked.",
 			"pool", o.config.PublicID, "tenant", publication.OrgID)
+		o.forgetBarrierBasis(publication.PublicationID)
 		return true, o.dropAuthority(o.publications.RecordTrinoPoolTenantRevoked(ctx, o.lease,
 			o.config.PoolID, publication.OrgID, "the warehouse is no longer served by this pool"))
 	}
@@ -167,6 +222,16 @@ func (o *trinoPoolOperator) revokeDepartedTenant(
 
 // publishChangedBindings publishes one tenant's principal set when it differs
 // from the DURABLE record of what was last published.
+//
+// Every publication is a NEW durable occurrence, taken before the call. The
+// Gateway resolves a step identity it has already recorded by returning that
+// step's result and applying NOTHING, and a tenant's revision is a digest of
+// its principal set - so a login that is added and then removed again produces
+// a set, and therefore a body, byte-identical to an earlier one. Under a
+// constant step identity that publication is a replay: the removed login stays
+// bound to the tenant at the Gateway, and the next tenant to be given that
+// principal is refused for a conflict it cannot see. The same applies to
+// re-publishing after a revocation.
 func (o *trinoPoolOperator) publishChangedBindings(
 	ctx context.Context,
 	bindings []trinoPoolTenantBinding,
@@ -198,58 +263,117 @@ func (o *trinoPoolOperator) publishChangedBindings(
 	// Rotate, for the same reason the barrier does: a tenant whose publication
 	// keeps failing must not hold the front of the queue forever.
 	o.bindingCursor++
-	for offset := range eligible {
-		binding := eligible[(int(o.bindingCursor)+offset)%len(eligible)]
-		admission, err := o.gateway.PublishTenantPrincipals(ctx, o.config.RoutingGroup, binding.Tenant,
-			trinogateway.PublishPrincipalsRequest{
-				Step:       o.step("tenant."+binding.Tenant, "principals."+binding.Revision),
-				Revision:   binding.Revision,
-				Principals: binding.Principals,
-			})
-		if err != nil {
-			if o.fenced {
-				return true, err
-			}
-			// This tenant earned a wait; the next tick reaches a different one.
-			delay := trinoPoolRetryDelay(state[binding.Tenant].Attempts)
-			if recordErr := o.publications.RecordTrinoPoolPublicationFailure(ctx, o.lease,
-				o.config.PoolID, binding.Tenant, now.Add(delay), err.Error()); recordErr != nil {
-				return true, o.dropAuthority(recordErr)
-			}
-			return true, fmt.Errorf("publish principals for %s: %w", binding.Tenant, err)
-		}
-		slog.Info("Trino pool tenant binding published.",
-			"pool", o.config.PublicID, "tenant", binding.Tenant,
-			"principals", len(binding.Principals), "state", admission.State)
-		if err := o.publications.RecordTrinoPoolTenantPrincipals(ctx, o.lease,
-			o.config.PoolID, binding.Tenant, binding.Revision); err != nil {
-			return true, o.dropAuthority(err)
-		}
-		return true, o.dropAuthority(o.publications.ClearTrinoPoolPublicationFailure(ctx, o.lease,
-			o.config.PoolID, binding.Tenant))
+	binding := eligible[int(o.bindingCursor%uint64(len(eligible)))]
+
+	attempt, err := o.publications.BeginTrinoPoolPublicationAttempt(ctx, o.lease, o.config.PoolID, binding.Tenant)
+	if err != nil {
+		return true, o.dropAuthority(fmt.Errorf("start a publication for %s: %w", binding.Tenant, err))
 	}
-	return false, nil
+	admission, err := o.gateway.PublishTenantPrincipals(ctx, o.config.RoutingGroup, binding.Tenant,
+		trinogateway.PublishPrincipalsRequest{
+			Step:       o.step("tenant."+binding.Tenant, trinoPoolStepID("principals", trinoPoolOccurrence(attempt), binding.Revision)),
+			Revision:   binding.Revision,
+			Principals: binding.Principals,
+		})
+	if err != nil {
+		if o.fenced {
+			return true, err
+		}
+		// This tenant earned a wait; the next tick reaches a different one.
+		delay := trinoPoolRetryDelay(state[binding.Tenant].Attempts)
+		if recordErr := o.publications.RecordTrinoPoolPublicationFailure(ctx, o.lease,
+			o.config.PoolID, binding.Tenant, now.Add(delay), err.Error()); recordErr != nil {
+			return true, o.dropAuthority(recordErr)
+		}
+		return true, fmt.Errorf("publish principals for %s: %w", binding.Tenant, err)
+	}
+	slog.Info("Trino pool tenant binding published.",
+		"pool", o.config.PublicID, "tenant", binding.Tenant,
+		"principals", len(binding.Principals), "attempt", attempt, "state", admission.State)
+	if err := o.publications.RecordTrinoPoolTenantPrincipals(ctx, o.lease,
+		o.config.PoolID, binding.Tenant, binding.Revision); err != nil {
+		return true, o.dropAuthority(err)
+	}
+	return true, o.dropAuthority(o.publications.ClearTrinoPoolPublicationFailure(ctx, o.lease,
+		o.config.PoolID, binding.Tenant))
 }
 
-// advanceOneBarrier moves a single tenant one step closer to being admitted.
+// advanceOneBarrier moves THE live barrier one step, or opens one when there is
+// none and nothing is waiting on the pool's compute.
 //
-// Two properties matter at fleet scale, where a pool serves thousands of
+// Three properties matter at fleet scale, where a pool serves thousands of
 // warehouses:
 //
 //   - A tenant's target is ITS OWN, not a snapshot of the whole fleet's
-//     configuration. An admitted tenant is finished until its own catalog or
-//     its own logins change; provisioning a NEW warehouse must not re-admit
-//     every existing one, which at one external step per five-second tick would
-//     have delayed that new tenant by hours.
-//   - Selection ROTATES and honours each tenant's durable backoff. Always
-//     taking the first eligible tenant let one permanently failing warehouse
-//     starve every tenant behind it forever.
+//     configuration. An admitted tenant is finished until its own principals
+//     change; provisioning a NEW warehouse must not re-admit every existing
+//     one, which at one external step per five-second tick would have delayed
+//     that new tenant by hours.
+//   - ONE barrier is live at a time and is driven to completion. Rotating
+//     between steps spread each tenant's attempt over the whole fleet's
+//     rotation - long enough for ordinary membership churn to invalidate it
+//     before it could commit - and left one open publication per eligible
+//     tenant, every one of which blocks a member from joining.
+//   - Fairness comes from the durable backoff, not from rotating mid-attempt:
+//     a tenant whose step failed releases its barrier and serves its wait while
+//     the next tenant runs.
 func (o *trinoPoolOperator) advanceOneBarrier(
 	ctx context.Context,
 	bindings []trinoPoolTenantBinding,
+	recorded []configstore.TrinoPoolPublication,
 	state map[string]configstore.TrinoPoolPublication,
+	instances []configstore.TrinoPoolInstance,
 ) error {
 	now := nowUTC()
+	holder, live := trinoPoolBarrierHolder(recorded)
+
+	if trinoPoolAwaitsMemberAdmission(instances) {
+		// Compute wins. Every OPEN publication refuses the joining member, and
+		// below the serving floor that is not a delay but a pool that cannot
+		// grow back. One release per pass keeps the work bounded however many
+		// barriers an older version left behind.
+		if live {
+			return o.releaseBarrier(ctx, holder, "a pool member is waiting to join")
+		}
+		return nil
+	}
+
+	if live {
+		binding, known := trinoPoolBindingFor(bindings, holder.OrgID)
+		switch {
+		case !known || len(binding.Principals) == 0 || holder.PrincipalRevision != binding.Revision:
+			return o.releaseBarrier(ctx, holder, "the tenant's binding changed during the attempt")
+		case o.tenantIsCurrent(binding, holder):
+			return o.releaseBarrier(ctx, holder, "the tenant is already admitted at this intent")
+		case holder.NextAttemptAt != nil && now.Before(*holder.NextAttemptAt):
+			return o.releaseBarrier(ctx, holder, "the tenant is serving out the wait its last failure earned")
+		}
+		err := o.stepLiveBarrier(ctx, binding, holder, instances)
+		if err == nil {
+			return o.dropAuthority(o.publications.ClearTrinoPoolPublicationFailure(ctx, o.lease,
+				o.config.PoolID, binding.Tenant))
+		}
+		if o.fenced {
+			// Authority loss is not this tenant's problem and must not be
+			// recorded as one.
+			return err
+		}
+		// Record the wait this tenant earned, then report the failure. The next
+		// pass releases its barrier and moves on to somebody else.
+		delay := trinoPoolRetryDelay(holder.Attempts)
+		if recordErr := o.publications.RecordTrinoPoolPublicationFailure(ctx, o.lease,
+			o.config.PoolID, binding.Tenant, now.Add(delay), err.Error()); recordErr != nil {
+			return o.dropAuthority(recordErr)
+		}
+		return err
+	}
+
+	if o.expectedProjection().Policy == "" {
+		// Nothing has been published yet, so there is no configuration for a
+		// member to acknowledge. Opening a barrier against an unknown
+		// projection would admit a tenant against nothing.
+		return nil
+	}
 	eligible := make([]trinoPoolTenantBinding, 0, len(bindings))
 	for _, binding := range bindings {
 		publication := state[binding.Tenant]
@@ -273,70 +397,83 @@ func (o *trinoPoolOperator) advanceOneBarrier(
 	// Rotate the starting point so no tenant owns the front of the queue.
 	o.barrierCursor++
 	binding := eligible[int(o.barrierCursor%uint64(len(eligible)))]
-	publication := state[binding.Tenant]
-
-	if o.expectedProjection().Policy == "" {
-		// Nothing has been published yet, so there is no configuration for a
-		// member to acknowledge. Opening a barrier against an unknown
-		// projection would admit a tenant against nothing.
-		return nil
-	}
-	if publication.Attempt < 1 {
-		// This tenant has no occurrence yet. Starting one is this tick's step;
-		// the next tick opens its barrier.
-		return o.reopenBarrier(ctx, binding, "the tenant has no publication attempt yet")
-	}
-	target := o.targetRevisionFor(binding, publication)
-	if target == "" {
-		return nil
-	}
-	err := o.stepBarrier(ctx, binding, publication, target)
-	if err == nil {
-		return o.dropAuthority(o.publications.ClearTrinoPoolPublicationFailure(ctx, o.lease,
-			o.config.PoolID, binding.Tenant))
-	}
-	if o.fenced {
-		// Authority loss is not this tenant's problem and must not be recorded
-		// as one.
-		return err
-	}
-	// Record the wait this tenant earned, then report the failure. The next
-	// tick moves on to somebody else.
-	delay := trinoPoolRetryDelay(publication.Attempts)
-	if recordErr := o.publications.RecordTrinoPoolPublicationFailure(ctx, o.lease,
-		o.config.PoolID, binding.Tenant, now.Add(delay), err.Error()); recordErr != nil {
-		return o.dropAuthority(recordErr)
-	}
-	return err
+	return o.openBarrier(ctx, binding)
 }
 
-// tenantIsCurrent reports that this tenant's admission already covers its
-// current intent.
+// trinoPoolBarrierHolder returns the tenant whose durable row names a live
+// barrier. A row names one exactly while its attempt is in flight: the open
+// records it, and the commit, the revocation and the release all clear it.
+func trinoPoolBarrierHolder(recorded []configstore.TrinoPoolPublication) (configstore.TrinoPoolPublication, bool) {
+	for _, publication := range recorded {
+		if publication.PublicationID != "" && publication.State != configstore.TrinoPublicationRevoked {
+			return publication, true
+		}
+	}
+	return configstore.TrinoPoolPublication{}, false
+}
+
+func trinoPoolBindingFor(bindings []trinoPoolTenantBinding, tenant string) (trinoPoolTenantBinding, bool) {
+	for _, binding := range bindings {
+		if binding.Tenant == tenant {
+			return binding, true
+		}
+	}
+	return trinoPoolTenantBinding{}, false
+}
+
+// releaseBarrier retires the live attempt, at the Gateway AND in the durable
+// record, so the next pass is free to do something else.
 //
-// The intent is the tenant's OWN: the principal set it has now, admitted under
-// the attempt that is recorded for it. It deliberately does not include the
-// pool's current catalog revision or the fleet-wide projection digest - those
-// move every time ANY warehouse is provisioned or any login changes anywhere,
-// which would re-admit the entire fleet for one new tenant. What a member must
-// have applied is checked where it belongs: at receipt time, against that
-// member, before its acknowledgement is recorded.
-func (o *trinoPoolOperator) tenantIsCurrent(
-	binding trinoPoolTenantBinding,
+// Both halves are required. Abandoning without clearing leaves the row naming a
+// finished publication, which every later pass selects again - the loop that
+// kept re-abandoning one tenant's dead barrier while the barrier actually
+// blocking a member's admission stayed open. Clearing without abandoning leaves
+// an OPEN publication at the Gateway that nothing will ever close.
+func (o *trinoPoolOperator) releaseBarrier(
+	ctx context.Context,
 	publication configstore.TrinoPoolPublication,
-) bool {
-	return publication.State == configstore.TrinoPublicationAdmitted &&
-		publication.AdmittedTargetRevision != "" &&
-		publication.PrincipalRevision == binding.Revision &&
-		publication.AdmittedTargetRevision == o.targetRevisionFor(binding, publication)
+	reason string,
+) error {
+	slog.Info("Trino pool publication attempt released.",
+		"pool", o.config.PublicID, "tenant", publication.OrgID,
+		"publication", publication.PublicationID, "reason", reason)
+	_, err := o.gateway.AbandonPublication(ctx, o.config.RoutingGroup, publication.PublicationID,
+		o.step("publication."+publication.OrgID, trinoPoolStepID("abandon", publication.PublicationID)))
+	switch {
+	case err == nil, trinogateway.IsNotFound(err):
+		// Abandoned, or the Gateway never had it: either way it is finished.
+	case isTrinoPoolCommittedPublication(err):
+		// An opened admission gate is never retracted. The tenant IS admitted;
+		// the checkpoint simply never landed, so it is read back and recorded
+		// rather than lost.
+		current, readErr := o.gateway.GetPublication(ctx, o.config.RoutingGroup, publication.PublicationID)
+		if readErr != nil {
+			return o.dropAuthority(fmt.Errorf("read back publication %s: %w", publication.PublicationID, readErr))
+		}
+		binding := trinoPoolTenantBinding{Tenant: publication.OrgID}
+		return o.recordAdmitted(ctx, binding, current.TargetRevision, current)
+	default:
+		return o.dropAuthority(fmt.Errorf("abandon publication %s: %w", publication.PublicationID, err))
+	}
+	o.forgetBarrierBasis(publication.PublicationID)
+	return o.dropAuthority(o.publications.ClearTrinoPoolPublicationBarrier(ctx, o.lease,
+		o.config.PoolID, publication.OrgID))
 }
 
-// stepBarrier performs the ONE next step of a tenant's barrier.
-func (o *trinoPoolOperator) stepBarrier(
-	ctx context.Context,
-	binding trinoPoolTenantBinding,
-	publication configstore.TrinoPoolPublication,
-	target string,
-) error {
+// isTrinoPoolCommittedPublication reports the Gateway refusing to abandon a
+// publication because it has already admitted the tenant.
+func isTrinoPoolCommittedPublication(err error) bool {
+	return errors.Is(err, trinogateway.ErrIrreversible)
+}
+
+// openBarrier starts a NEW attempt for this tenant.
+//
+// The occurrence counter is durable and monotone, and every step identity
+// carries the publication it belongs to, so the new attempt shares nothing with
+// any it replaces: a new publication, a new open step, new receipts and a new
+// commit. Reusing an identity would resolve the previous attempt's recorded
+// outcome and leave this intent unapplied.
+func (o *trinoPoolOperator) openBarrier(ctx context.Context, binding trinoPoolTenantBinding) error {
 	poolState, err := o.gateway.GetPool(ctx, o.config.RoutingGroup)
 	if err != nil {
 		return fmt.Errorf("read pool state for %s: %w", o.config.PublicID, err)
@@ -348,74 +485,137 @@ func (o *trinoPoolOperator) stepBarrier(
 			"pool", o.config.PublicID, "tenant", binding.Tenant, "serving", poolState.ServingMembers)
 		return nil
 	}
-
+	attempt, err := o.publications.BeginTrinoPoolPublicationAttempt(ctx, o.lease, o.config.PoolID, binding.Tenant)
+	if err != nil {
+		return o.dropAuthority(fmt.Errorf("start a publication attempt for %s: %w", binding.Tenant, err))
+	}
+	target := trinoPoolTargetRevision(binding, attempt)
 	publicationID := trinoPoolPublicationID(binding.Tenant, target)
-	current, err := o.openOrReadBarrier(ctx, binding, publication, target, publicationID, poolState.MembershipGeneration)
-	if err != nil || current == nil {
+	// The identity is recorded BEFORE the Gateway call, so a lost response is
+	// resolved by reading that publication back instead of opening a second
+	// barrier - which the Gateway refuses anyway, leaving the first one open
+	// forever.
+	if err := o.publications.RecordTrinoPoolPublicationOpen(ctx, o.lease,
+		o.config.PoolID, binding.Tenant, publicationID, target); err != nil {
+		return o.dropAuthority(fmt.Errorf("record publication intent for %s: %w", binding.Tenant, err))
+	}
+	o.rememberBarrierBasis(publicationID)
+	opened, err := o.issueOpenPublication(ctx, binding, target, publicationID, poolState.MembershipGeneration)
+	if err != nil {
 		return err
 	}
-	switch current.Phase {
-	case "ADMITTED":
-		return o.recordAdmitted(ctx, binding, target, *current)
-	case "ABANDONED":
-		// An abandoned barrier is finished business, not a fault to escalate:
-		// membership changes during a deployment, and abandoning is how the
-		// protocol lets an attempt that can no longer commit get out of the way.
-		// The tenant gets a NEW attempt, which is a new identity end to end -
-		// reusing this one would replay the abandoned attempt's outcome forever.
-		return o.reopenBarrier(ctx, binding, "the previous attempt was abandoned")
-	}
-	// The membership this barrier was opened against has moved on: a member
-	// joined, failed or was replaced. Its commit can never satisfy the
-	// Gateway's generation check, and while it stays open a joining member
-	// cannot be admitted - which is the cycle where the commit is waiting for a
-	// replacement the open barrier itself refuses.
-	if current.MembershipGeneration != poolState.MembershipGeneration {
-		return o.abandonForMembershipChange(ctx, binding, *current, poolState.MembershipGeneration)
-	}
-	if len(current.MissingMembers) > 0 {
-		return o.recordOneReceipt(ctx, binding, *current, target)
-	}
-	return o.commitBarrier(ctx, binding, *current, target, poolState.MembershipGeneration)
+	slog.Info("Trino pool publication opened.",
+		"pool", o.config.PublicID, "tenant", binding.Tenant, "publication", publicationID,
+		"target", target, "attempt", attempt, "required", len(opened.RequiredMembers))
+	return nil
 }
 
-// abandonForMembershipChange retires an attempt whose membership moved, so the
-// next one can be opened against the membership that exists now.
-//
-// This is the ordinary case during a rollout, not an exception: replacing an
-// instance changes the membership generation, and an attempt opened before that
-// can neither commit nor step aside on its own.
-func (o *trinoPoolOperator) abandonForMembershipChange(
+func (o *trinoPoolOperator) issueOpenPublication(
 	ctx context.Context,
 	binding trinoPoolTenantBinding,
-	current trinogateway.Publication,
+	target, publicationID string,
 	membershipGeneration int64,
-) error {
-	slog.Info("Trino pool publication is being reopened against the current membership.",
-		"pool", o.config.PublicID, "tenant", binding.Tenant, "publication", current.PublicationID,
-		"openedAt", current.MembershipGeneration, "now", membershipGeneration)
-	if _, err := o.gateway.AbandonPublication(ctx, o.config.RoutingGroup, current.PublicationID,
-		o.step("publication."+binding.Tenant, "abandon."+current.PublicationID)); err != nil {
-		// An already-committed barrier refuses to be abandoned, which is a
-		// legitimate answer: the next tick reads it back as ADMITTED.
-		return o.dropAuthority(fmt.Errorf("abandon publication %s: %w", current.PublicationID, err))
+) (trinogateway.Publication, error) {
+	opened, err := o.gateway.OpenPublication(ctx, o.config.RoutingGroup, trinogateway.OpenPublicationRequest{
+		Step:                         o.step("publication."+binding.Tenant, trinoPoolStepID("open", publicationID)),
+		PublicationID:                publicationID,
+		Tenant:                       binding.Tenant,
+		TargetRevision:               target,
+		ExpectedMembershipGeneration: membershipGeneration,
+		PayloadHash:                  trinoPoolPublicationPlanHash(binding, target),
+	})
+	if err != nil {
+		return trinogateway.Publication{}, o.dropAuthority(fmt.Errorf("open publication for %s: %w", binding.Tenant, err))
 	}
-	return o.reopenBarrier(ctx, binding, "the pool membership changed during the attempt")
+	return opened, nil
 }
 
-// retireOpenBarrierForAdmission abandons an open tenant publication that is
+// stepLiveBarrier performs the ONE next step of the live attempt.
+func (o *trinoPoolOperator) stepLiveBarrier(
+	ctx context.Context,
+	binding trinoPoolTenantBinding,
+	publication configstore.TrinoPoolPublication,
+	instances []configstore.TrinoPoolInstance,
+) error {
+	poolState, err := o.gateway.GetPool(ctx, o.config.RoutingGroup)
+	if err != nil {
+		return fmt.Errorf("read pool state for %s: %w", o.config.PublicID, err)
+	}
+	if poolState.ServingMembers < int64(o.config.Spec.MinServing) {
+		slog.Debug("Trino pool publication is waiting for the serving floor.",
+			"pool", o.config.PublicID, "tenant", binding.Tenant, "serving", poolState.ServingMembers)
+		return nil
+	}
+
+	current, err := o.gateway.GetPublication(ctx, o.config.RoutingGroup, publication.PublicationID)
+	if err != nil {
+		if !trinogateway.IsNotFound(err) {
+			return fmt.Errorf("read publication %s: %w", publication.PublicationID, err)
+		}
+		// Recorded but absent on the Gateway: the open never landed. Re-issuing
+		// it under the SAME identity is the resolution, not a second barrier.
+		current, err = o.issueOpenPublication(ctx, binding, publication.TargetRevision,
+			publication.PublicationID, poolState.MembershipGeneration)
+		if err != nil {
+			return err
+		}
+		o.rememberBarrierBasis(publication.PublicationID)
+		return nil
+	}
+
+	switch current.Phase {
+	case "ADMITTED":
+		return o.recordAdmitted(ctx, binding, publication.TargetRevision, current)
+	case "ABANDONED":
+		// Finished business, not a fault to escalate: membership changes during
+		// a deployment, and abandoning is how the protocol lets an attempt that
+		// can no longer commit get out of the way. Clearing the durable pointer
+		// is what lets the next pass open a new attempt, under a new occurrence.
+		o.forgetBarrierBasis(publication.PublicationID)
+		return o.dropAuthority(o.publications.ClearTrinoPoolPublicationBarrier(ctx, o.lease,
+			o.config.PoolID, binding.Tenant))
+	}
+	if current.MembershipGeneration != poolState.MembershipGeneration {
+		// The membership this barrier was opened against has moved on: a member
+		// joined, failed or was replaced. Its commit can never satisfy the
+		// Gateway's generation check.
+		return o.releaseBarrier(ctx, publication, "the pool membership changed during the attempt")
+	}
+	basis, ok := o.barrierBasisFor(publication.PublicationID)
+	if !ok {
+		// This process did not open this attempt (a leadership move), so what
+		// its existing receipts attest to is unknown. Completing it would rest a
+		// commit on evidence nobody can describe.
+		return o.releaseBarrier(ctx, publication, "the configuration this attempt was opened against is unknown")
+	}
+	if basis.Projection != o.expectedProjection() {
+		// Receipts already recorded attest to the projection this attempt was
+		// opened against. Finishing it against a newer one would commit on
+		// mixed evidence; the tenant gets a fresh attempt on the current
+		// projection instead, and an already-admitted tenant is untouched
+		// because it has no attempt in flight.
+		return o.releaseBarrier(ctx, publication, "the accepted projection changed during the attempt")
+	}
+	if len(current.MissingMembers) > 0 {
+		return o.recordOneReceipt(ctx, binding, current, basis, instances)
+	}
+	return o.commitBarrier(ctx, binding, current, publication.TargetRevision, poolState.MembershipGeneration)
+}
+
+// retireOpenBarrierForAdmission releases the live tenant publication that is
 // standing in the way of a member's admission.
 //
 // The Gateway requires a member joining during an open publication to
 // acknowledge that publication's target revision. A member registers under its
 // RELEASE id, so it can never satisfy a tenant barrier's target, and the two
 // would wait for each other: the member for the barrier to close, the barrier
-// for a membership that includes the member. Compute wins - the barrier is
-// reopened afterwards against the membership that then exists, and a tenant
-// waiting a few more seconds is cheaper than a pool that cannot grow.
+// for a membership that includes the member.
 //
-// Best effort by construction: the admission has already failed and is being
-// reported. This only removes the obstacle for the next attempt.
+// The scheduler already suppresses new barriers and releases the live one while
+// a candidate is waiting, so this is the belt on that brace: it runs when an
+// admission has actually been refused, releases exactly ONE attempt, and
+// records that release durably so the next refusal reaches the next one instead
+// of re-abandoning the same finished publication.
 func (o *trinoPoolOperator) retireOpenBarrierForAdmission(ctx context.Context, instanceID string, cause error) {
 	if o.publications == nil {
 		return
@@ -426,86 +626,17 @@ func (o *trinoPoolOperator) retireOpenBarrierForAdmission(ctx context.Context, i
 			"pool", o.config.PublicID, "instance", instanceID, "error", err)
 		return
 	}
-	for _, publication := range recorded {
-		if publication.State != configstore.TrinoPublicationAdmitting || publication.PublicationID == "" {
-			continue
-		}
-		slog.Info("Trino pool is reopening a tenant publication so a member can be admitted.",
-			"pool", o.config.PublicID, "tenant", publication.OrgID,
-			"publication", publication.PublicationID, "instance", instanceID, "reason", cause)
-		if _, err := o.gateway.AbandonPublication(ctx, o.config.RoutingGroup, publication.PublicationID,
-			o.step("publication."+publication.OrgID, "abandon."+publication.PublicationID)); err != nil {
-			slog.Warn("Trino pool could not abandon the open publication.",
-				"pool", o.config.PublicID, "tenant", publication.OrgID, "error", err)
-			return
-		}
-		if _, err := o.publications.BeginTrinoPoolPublicationAttempt(ctx, o.lease, o.config.PoolID, publication.OrgID); err != nil {
-			slog.Warn("Trino pool could not start the next publication attempt.",
-				"pool", o.config.PublicID, "tenant", publication.OrgID, "error", err)
-		}
+	holder, live := trinoPoolBarrierHolder(recorded)
+	if !live {
 		return
 	}
-}
-
-// reopenBarrier starts a NEW attempt for this tenant.
-//
-// The attempt counter is durable and monotone, and every step identity carries
-// it, so the new attempt shares nothing with the one it replaces: the Gateway
-// sees a new publication, a new open step, new receipts and a new commit. The
-// next tick performs its first step.
-func (o *trinoPoolOperator) reopenBarrier(ctx context.Context, binding trinoPoolTenantBinding, reason string) error {
-	attempt, err := o.publications.BeginTrinoPoolPublicationAttempt(ctx, o.lease, o.config.PoolID, binding.Tenant)
-	if err != nil {
-		return o.dropAuthority(fmt.Errorf("start a new publication attempt for %s: %w", binding.Tenant, err))
+	slog.Info("Trino pool is releasing a tenant publication so a member can be admitted.",
+		"pool", o.config.PublicID, "tenant", holder.OrgID,
+		"publication", holder.PublicationID, "instance", instanceID, "reason", cause)
+	if err := o.releaseBarrier(ctx, holder, "a pool member is waiting to join"); err != nil {
+		slog.Warn("Trino pool could not release the open publication.",
+			"pool", o.config.PublicID, "tenant", holder.OrgID, "error", err)
 	}
-	slog.Info("Trino pool publication attempt started.",
-		"pool", o.config.PublicID, "tenant", binding.Tenant, "attempt", attempt, "reason", reason)
-	return nil
-}
-
-// openOrReadBarrier returns the live barrier, opening it when this tenant does
-// not have one at this target yet.
-//
-// The identity is recorded BEFORE the Gateway call, so a lost response is
-// resolved by reading that publication back instead of opening a second barrier
-// - which the Gateway refuses anyway, leaving the first one open forever.
-func (o *trinoPoolOperator) openOrReadBarrier(
-	ctx context.Context,
-	binding trinoPoolTenantBinding,
-	publication configstore.TrinoPoolPublication,
-	target, publicationID string,
-	membershipGeneration int64,
-) (*trinogateway.Publication, error) {
-	if publication.PublicationID == publicationID && publication.TargetRevision == target {
-		current, err := o.gateway.GetPublication(ctx, o.config.RoutingGroup, publicationID)
-		if err == nil {
-			return &current, nil
-		}
-		if !trinogateway.IsNotFound(err) {
-			return nil, fmt.Errorf("read publication %s: %w", publicationID, err)
-		}
-		// Recorded but absent on the Gateway: the open never landed. Falling
-		// through re-opens it under the same identity.
-	}
-	if err := o.publications.RecordTrinoPoolPublicationOpen(ctx, o.lease,
-		o.config.PoolID, binding.Tenant, publicationID, target); err != nil {
-		return nil, o.dropAuthority(fmt.Errorf("record publication intent for %s: %w", binding.Tenant, err))
-	}
-	opened, err := o.gateway.OpenPublication(ctx, o.config.RoutingGroup, trinogateway.OpenPublicationRequest{
-		Step:                         o.step("publication."+binding.Tenant, "open."+target),
-		PublicationID:                publicationID,
-		Tenant:                       binding.Tenant,
-		TargetRevision:               target,
-		ExpectedMembershipGeneration: membershipGeneration,
-		PayloadHash:                  trinoPoolPublicationPlanHash(binding, target),
-	})
-	if err != nil {
-		return nil, o.dropAuthority(fmt.Errorf("open publication for %s: %w", binding.Tenant, err))
-	}
-	slog.Info("Trino pool publication opened.",
-		"pool", o.config.PublicID, "tenant", binding.Tenant, "publication", publicationID,
-		"target", target, "required", len(opened.RequiredMembers))
-	return &opened, nil
 }
 
 // recordOneReceipt acknowledges ONE member, after verifying against that member
@@ -520,12 +651,9 @@ func (o *trinoPoolOperator) recordOneReceipt(
 	ctx context.Context,
 	binding trinoPoolTenantBinding,
 	current trinogateway.Publication,
-	target string,
+	basis trinoPoolBarrierBasis,
+	instances []configstore.TrinoPoolInstance,
 ) error {
-	instances, err := o.store.ListTrinoPoolInstances(ctx, o.config.PoolID)
-	if err != nil {
-		return fmt.Errorf("list pool instances: %w", err)
-	}
 	byID := make(map[string]configstore.TrinoPoolInstance, len(instances))
 	for _, instance := range instances {
 		byID[instance.InstanceID] = instance
@@ -537,7 +665,7 @@ func (o *trinoPoolOperator) recordOneReceipt(
 			return fmt.Errorf("publication %s requires member %s, which this pool has no record of",
 				current.PublicationID, instanceID)
 		}
-		acknowledgement, err := o.acknowledge(ctx, instance)
+		acknowledgement, err := o.acknowledge(ctx, instance, basis)
 		if err != nil {
 			slog.Info("Trino pool member is not serving the tenant's configuration yet.",
 				"pool", o.config.PublicID, "tenant", binding.Tenant, "instance", instanceID, "reason", err)
@@ -553,18 +681,27 @@ func (o *trinoPoolOperator) recordOneReceipt(
 		}
 		if _, err := o.gateway.RecordPublicationReceipt(ctx, o.config.RoutingGroup, current.PublicationID,
 			trinogateway.PublicationReceiptRequest{
-				Step:            o.step("publication."+binding.Tenant, "receipt."+instanceID),
+				// The step identity carries the PUBLICATION, so a receipt for
+				// this attempt is a different operation from one for any other
+				// attempt against the same member. Without it the second
+				// attempt's receipt is the first one's step identity carrying a
+				// different applied revision, which the Gateway refuses as a
+				// changed intent - permanently, since the identity never moves
+				// again. One ordinary membership change during a deployment
+				// stranded a tenant that way.
+				Step:            o.step("publication."+binding.Tenant, trinoPoolStepID("receipt", current.PublicationID, instanceID)),
 				InstanceID:      instanceID,
 				PodUID:          instance.CoordinatorPodUID,
 				BootID:          instance.CoordinatorBootID,
-				AppliedRevision: target,
-				AuthFingerprint: o.projectionFingerprint(),
+				AppliedRevision: current.TargetRevision,
+				AuthFingerprint: trinoPoolProjectionFingerprint(basis.Projection),
 			}); err != nil {
 			return o.dropAuthority(fmt.Errorf("record acknowledgement of %s for %s: %w",
 				instanceID, binding.Tenant, err))
 		}
 		slog.Info("Trino pool member acknowledged a tenant's configuration.",
-			"pool", o.config.PublicID, "tenant", binding.Tenant, "instance", instanceID, "target", target)
+			"pool", o.config.PublicID, "tenant", binding.Tenant, "instance", instanceID,
+			"target", current.TargetRevision)
 		return nil
 	}
 	return nil
@@ -581,7 +718,7 @@ func (o *trinoPoolOperator) commitBarrier(
 	var committed trinogateway.Publication
 	if err := o.runDurableStep(ctx,
 		configstore.TrinoPoolOperationSpec{
-			OperationID: "publication:" + binding.Tenant + ":" + target,
+			OperationID: "publication:" + binding.Tenant + ":" + current.PublicationID,
 			PoolID:      o.config.PoolID,
 			Kind:        configstore.TrinoPoolOperationPublish,
 			IntentHash:  trinoPoolPublicationPlanHash(binding, target),
@@ -591,7 +728,7 @@ func (o *trinoPoolOperator) commitBarrier(
 		func(ctx context.Context) (string, error) {
 			result, err := o.gateway.CommitPublication(ctx, o.config.RoutingGroup, current.PublicationID,
 				trinogateway.CommitPublicationRequest{
-					Step:                         o.step("publication."+binding.Tenant, "commit."+target),
+					Step:                         o.step("publication."+binding.Tenant, trinoPoolStepID("commit", current.PublicationID)),
 					ExpectedMembershipGeneration: membershipGeneration,
 				})
 			if err != nil {
@@ -639,19 +776,25 @@ func (o *trinoPoolOperator) recordAdmitted(
 	slog.Info("Trino pool tenant admitted.",
 		"pool", o.config.PublicID, "tenant", binding.Tenant, "target", target,
 		"members", len(publication.Receipts))
+	o.forgetBarrierBasis(publication.PublicationID)
 	return o.dropAuthority(o.publications.RecordTrinoPoolPublicationCommitted(ctx, o.lease,
 		o.config.PoolID, binding.Tenant, target, string(receipt)))
 }
 
-// acknowledge asks ONE member what it is actually serving.
-func (o *trinoPoolOperator) acknowledge(ctx context.Context, instance configstore.TrinoPoolInstance) (trinoPoolAcknowledgement, error) {
+// acknowledge asks ONE member what it is actually serving, against the
+// configuration THIS attempt was opened at.
+func (o *trinoPoolOperator) acknowledge(
+	ctx context.Context,
+	instance configstore.TrinoPoolInstance,
+	basis trinoPoolBarrierBasis,
+) (trinoPoolAcknowledgement, error) {
 	if o.acknowledgement == nil {
 		return trinoPoolAcknowledgement{}, fmt.Errorf("this control plane cannot probe pool members")
 	}
 	if trinopool.Phase(instance.Phase) != trinopool.PhaseServing && trinopool.Phase(instance.Phase) != trinopool.PhaseAdmitted {
 		return trinoPoolAcknowledgement{}, fmt.Errorf("member %s is %s", instance.InstanceID, instance.Phase)
 	}
-	acknowledgement, err := o.acknowledgement(ctx, instance.EndpointURL, o.expectedProjection(), o.publishedCatalogRevision())
+	acknowledgement, err := o.acknowledgement(ctx, instance.EndpointURL, basis.Projection, basis.CatalogRevision)
 	if err != nil {
 		return trinoPoolAcknowledgement{}, err
 	}
@@ -659,6 +802,47 @@ func (o *trinoPoolOperator) acknowledge(ctx context.Context, instance configstor
 		return trinoPoolAcknowledgement{}, fmt.Errorf("member %s is not serving the current authorization and authentication projection", instance.InstanceID)
 	}
 	return acknowledgement, nil
+}
+
+// rememberBarrierBasis captures the configuration an attempt is admitting
+// against. There is at most one live attempt, so this holds one entry.
+func (o *trinoPoolOperator) rememberBarrierBasis(publicationID string) {
+	if o.barrierBasis == nil {
+		o.barrierBasis = map[string]trinoPoolBarrierBasis{}
+	}
+	o.barrierBasis[publicationID] = trinoPoolBarrierBasis{
+		Projection:      o.expectedProjection(),
+		CatalogRevision: o.publishedCatalogRevision(),
+	}
+}
+
+func (o *trinoPoolOperator) barrierBasisFor(publicationID string) (trinoPoolBarrierBasis, bool) {
+	basis, ok := o.barrierBasis[publicationID]
+	return basis, ok
+}
+
+func (o *trinoPoolOperator) forgetBarrierBasis(publicationID string) {
+	delete(o.barrierBasis, publicationID)
+}
+
+// tenantIsCurrent reports that this tenant's admission already covers its
+// current intent.
+//
+// The intent is the tenant's OWN: the principal set it has now, admitted under
+// the occurrence that is recorded for it. It deliberately does not include the
+// pool's current catalog revision or the fleet-wide projection digest - those
+// move every time ANY warehouse is provisioned or any login changes anywhere,
+// which would re-admit the entire fleet for one new tenant. What a member must
+// have applied is checked where it belongs: at receipt time, against that
+// member, before its acknowledgement is recorded.
+func (o *trinoPoolOperator) tenantIsCurrent(
+	binding trinoPoolTenantBinding,
+	publication configstore.TrinoPoolPublication,
+) bool {
+	return publication.State == configstore.TrinoPublicationAdmitted &&
+		publication.AdmittedTargetRevision != "" &&
+		publication.PrincipalRevision == binding.Revision &&
+		publication.AdmittedTargetRevision == trinoPoolTargetRevision(binding, publication.Attempt)
 }
 
 func (o *trinoPoolOperator) expectedProjection() trinoPoolProjectionRevisions {
@@ -720,8 +904,8 @@ func (o *trinoPoolOperator) ensureCatalogWatermark(ctx context.Context) error {
 	return nil
 }
 
-// targetRevisionFor names ONE tenant's attempt: the principal set being
-// admitted, and which attempt is admitting it.
+// trinoPoolTargetRevision names ONE tenant's attempt: the principal set being
+// admitted, and which occurrence is admitting it.
 //
 // The Gateway compares this string verbatim between the barrier and every
 // receipt, so it identifies the attempt rather than describing the fleet. It is
@@ -733,20 +917,11 @@ func (o *trinoPoolOperator) ensureCatalogWatermark(ctx context.Context) error {
 //
 // What a member must actually be serving is checked against that member, at
 // receipt time - it must have applied the published catalog revision and be
-// deciding with the current projections - which is strictly stronger than
-// anything a name could assert, and costs nothing when nothing changed.
-//
-// An empty projection means this control plane has published nothing yet, so
-// there is no configuration for a member to acknowledge and no barrier to open.
-func (o *trinoPoolOperator) targetRevisionFor(
-	binding trinoPoolTenantBinding,
-	publication configstore.TrinoPoolPublication,
-) string {
-	projection := o.expectedProjection()
-	if projection.Policy == "" || projection.Password == "" || projection.Group == "" {
-		return ""
-	}
-	if publication.Attempt < 1 {
+// deciding with the projection this attempt was opened at - which is strictly
+// stronger than anything a name could assert, and costs nothing when nothing
+// changed.
+func trinoPoolTargetRevision(binding trinoPoolTenantBinding, attempt int64) string {
+	if attempt < 1 || binding.Revision == "" {
 		// No occurrence has been started for this tenant yet. Defaulting to one
 		// would make a tenant's FIRST barrier and its first post-revocation
 		// barrier share an identity, so the re-admission would replay the
@@ -754,18 +929,45 @@ func (o *trinoPoolOperator) targetRevisionFor(
 		// again.
 		return ""
 	}
-	return fmt.Sprintf("b%s.a%d", binding.Revision[:min(12, len(binding.Revision))], publication.Attempt)
+	return fmt.Sprintf("b%s.a%d", binding.Revision[:min(12, len(binding.Revision))], attempt)
 }
 
-// projectionFingerprint is the 64-hex value the Gateway records with a receipt.
-// It is derived from the same three revisions as the target, so an operator
-// reading a receipt can tell which projection was acknowledged.
-func (o *trinoPoolOperator) projectionFingerprint() string {
-	projection := o.expectedProjection()
+// trinoPoolProjectionFingerprint is the 64-hex value the Gateway records with a
+// receipt, derived from the projection the attempt was opened at, so an
+// operator reading a receipt can tell which projection was acknowledged.
+func trinoPoolProjectionFingerprint(projection trinoPoolProjectionRevisions) string {
 	digest := sha256.Sum256([]byte(strings.Join([]string{
 		projection.Policy, projection.Password, projection.Group,
 	}, "\x00")))
 	return hex.EncodeToString(digest[:])
+}
+
+// trinoPoolOccurrence names one durable occurrence inside a step identity.
+func trinoPoolOccurrence(attempt int64) string {
+	return fmt.Sprintf("a%d", attempt)
+}
+
+// trinoPoolStepID joins the parts of a step identity, within the Gateway's
+// 64-character column.
+//
+// A step identity must be STABLE (a retry has to resolve the recorded outcome)
+// and UNIQUE per intent (a different intent under one identity is refused
+// forever). Truncating would break uniqueness silently, so an identity that
+// does not fit keeps its leading parts and carries a digest of the rest: still
+// deterministic, still unique, and short enough that the Gateway stores it.
+func trinoPoolStepID(parts ...string) string {
+	const limit = 64
+	joined := strings.Join(parts, ".")
+	if len(joined) <= limit {
+		return joined
+	}
+	digest := sha256.Sum256([]byte(joined))
+	short := hex.EncodeToString(digest[:])[:24]
+	head := parts[0]
+	if len(head)+1+len(short) > limit {
+		head = head[:limit-1-len(short)]
+	}
+	return head + "." + short
 }
 
 // trinoPoolPublicationID is deterministic in the tenant and the target, so a

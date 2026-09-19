@@ -158,6 +158,13 @@ type trinoPoolOperator struct {
 	// memory rather than durable state because it only spaces out a question
 	// whose answer is re-read anyway; a restart simply asks again.
 	identityObservedAt map[string]time.Time
+	// barrierBasis is the configuration the live publication attempt was opened
+	// against, so every receipt it collects attests to ONE configuration rather
+	// than to whatever was current when each was taken. At most one attempt is
+	// live, so this holds at most one entry. It is deliberately per-process: an
+	// attempt this process did not open is released and reopened rather than
+	// completed on evidence nobody can describe.
+	barrierBasis map[string]trinoPoolBarrierBasis
 
 	lease configstore.TrinoPoolLease
 	// fenced records that this term lost the fence. It ends the loop rather

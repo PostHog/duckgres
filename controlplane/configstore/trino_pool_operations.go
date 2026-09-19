@@ -301,6 +301,14 @@ func (cs *ConfigStore) RecordTrinoPoolTenantPrincipals(ctx context.Context, leas
 // response is resolved by reading that publication back rather than by opening
 // a second barrier for the same tenant - which the Gateway refuses anyway, and
 // which would leave the first one open forever.
+//
+// A LIVE barrier is a non-empty publication_id, and that is the only thing
+// this writes about liveness. `state` describes the tenant's ADMISSION, which a new
+// barrier does not retract: a tenant that is admitted today stays admitted
+// while the barrier for its newest login runs, so an operator surface keyed on
+// the state cannot flap a serving warehouse back to Provisioning for a change
+// that has not landed yet. A tenant that has never been admitted moves to
+// `admitting`, which is the honest answer for it.
 func (cs *ConfigStore) RecordTrinoPoolPublicationOpen(ctx context.Context, lease TrinoPoolLease, poolID, orgID, publicationID, targetRevision string) error {
 	if orgID == "" || publicationID == "" || targetRevision == "" {
 		return errors.New("an open publication requires an org, a publication id and a target revision")
@@ -316,9 +324,46 @@ func (cs *ConfigStore) RecordTrinoPoolPublicationOpen(ctx context.Context, lease
 			ON CONFLICT (pool_id, org_id) DO UPDATE SET
 				publication_id = EXCLUDED.publication_id,
 				target_revision = EXCLUDED.target_revision,
-				state = EXCLUDED.state,
+				state = CASE WHEN duckgres_trino_pool_publications.admitted_target_revision = ''
+					THEN ? ELSE duckgres_trino_pool_publications.state END,
 				updated_at = now()`,
-			poolID, orgID, publicationID, targetRevision, TrinoPublicationAdmitting).Error
+			poolID, orgID, publicationID, targetRevision, TrinoPublicationAdmitting,
+			TrinoPublicationAdmitting).Error
+	})
+}
+
+// ClearTrinoPoolPublicationBarrier forgets a barrier that is no longer live,
+// so the driver stops treating it as the one attempt in flight.
+//
+// It is the durable half of abandoning an attempt. Without it the row keeps
+// naming a publication the Gateway has already ABANDONED, and every later pass
+// selects that same finished attempt again - which is how an open barrier that
+// was blocking a member's admission stayed selected, was re-abandoned on every
+// attempt, and never let the driver reach the barrier that was actually in the
+// way.
+//
+// The tenant's ADMISSION is not touched. A tenant that was admitted stays
+// admitted (its `admitted_target_revision` is the proof); one that never was
+// falls back to whether its binding has been published at all.
+func (cs *ConfigStore) ClearTrinoPoolPublicationBarrier(ctx context.Context, lease TrinoPoolLease, poolID, orgID string) error {
+	if orgID == "" {
+		return errors.New("clearing a barrier requires an org")
+	}
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Exec(`
+			UPDATE duckgres_trino_pool_publications SET
+				publication_id = '',
+				target_revision = '',
+				state = CASE
+					WHEN admitted_target_revision <> '' THEN state
+					WHEN principal_revision <> '' THEN ?
+					ELSE ? END,
+				updated_at = now()
+			WHERE pool_id = ? AND org_id = ?`,
+			TrinoPublicationPublished, TrinoPublicationPending, poolID, orgID).Error
 	})
 }
 
@@ -410,8 +455,17 @@ func (cs *ConfigStore) RecordTrinoPoolPublicationCommitted(ctx context.Context, 
 				"admitted_target_revision": targetRevision,
 				"state":                    TrinoPublicationAdmitted,
 				"gateway_receipt":          receipt,
-				"last_error":               "",
-				"updated_at":               time.Now().UTC(),
+				// The barrier is finished, so it stops being the live attempt.
+				// Leaving it named here would select a committed publication as
+				// the one in flight forever: the driver would try to abandon it,
+				// the Gateway would refuse (an opened admission gate is never
+				// retracted), and the pass would re-checkpoint the same
+				// admission instead of reaching the next tenant. The outcome
+				// survives in admitted_target_revision and the receipt.
+				"publication_id":  "",
+				"target_revision": "",
+				"last_error":      "",
+				"updated_at":      time.Now().UTC(),
 			})
 		if result.Error != nil {
 			return result.Error

@@ -227,14 +227,28 @@ type fakePoolGateway struct {
 	revoked      map[string]bool
 	configured   *trinogateway.ConfigurePoolRequest
 
-	// journal mirrors the Gateway's own request journal, keyed by step
-	// identity. The recorded payload INCLUDES the expected generation, because
-	// the Gateway hashes the whole request body: a repeat under the same step
-	// id carrying a different generation is POOL_INTENT_CHANGED, not a replay.
-	journal map[string]fakeJournalEntry
+	// memberJournal mirrors the Gateway's request journal for the MEMBER
+	// lifecycle steps, keyed by step identity. The recorded payload INCLUDES
+	// the expected generation, because the Gateway hashes the whole request
+	// body: a repeat under the same step id carrying a different generation is
+	// POOL_INTENT_CHANGED, not a replay. It also records the response, so a
+	// test can make an effect land while the caller sees a transport failure.
+	//
+	// The publication steps use `journal` + guardStep/recordStep below. They
+	// are kept separate because they answer different questions: this one is
+	// about resolving a lost response, that one about refusing a changed
+	// intent.
+	memberJournal map[string]fakeJournalEntry
 	// loseResponse names step ids whose effect must land while the caller sees
 	// a transport failure - the ambiguity every lifecycle retry has to survive.
 	loseResponse map[string]bool
+
+	journal      map[string]fakeStep
+	principalOf  map[string]string
+	clock        int64
+	// minServing is the floor the Gateway itself enforces on open and commit,
+	// taken from the pool configuration the operator publishes.
+	minServing int64
 }
 
 type fakeJournalEntry struct {
@@ -255,7 +269,7 @@ func newFakePoolGateway() *fakePoolGateway {
 // retry hits when it rebuilds its request from freshly read state instead of
 // from what it recorded when it first formed the intent.
 func (f *fakePoolGateway) replay(step trinogateway.Step, payload string) (trinogateway.Member, bool, error) {
-	entry, recorded := f.journal[step.OperationID+"/"+step.StepID]
+	entry, recorded := f.memberJournal[step.OperationID+"/"+step.StepID]
 	if !recorded {
 		return trinogateway.Member{}, false, nil
 	}
@@ -269,10 +283,10 @@ func (f *fakePoolGateway) replay(step trinogateway.Step, payload string) (trinog
 // commit records the outcome and then, when the test asked for it, hides the
 // response from the caller.
 func (f *fakePoolGateway) commit(step trinogateway.Step, payload string, member trinogateway.Member) (trinogateway.Member, error) {
-	if f.journal == nil {
-		f.journal = map[string]fakeJournalEntry{}
+	if f.memberJournal == nil {
+		f.memberJournal = map[string]fakeJournalEntry{}
 	}
-	f.journal[step.OperationID+"/"+step.StepID] = fakeJournalEntry{payload: payload, response: member}
+	f.memberJournal[step.OperationID+"/"+step.StepID] = fakeJournalEntry{payload: payload, response: member}
 	if f.loseResponse[step.StepID] {
 		delete(f.loseResponse, step.StepID)
 		return trinogateway.Member{}, errors.New("connection reset before the response was read")
@@ -301,18 +315,47 @@ func (f *fakePoolGateway) PublishTenantPrincipals(_ context.Context, _, tenant s
 		return trinogateway.TenantAdmission{}, err
 	}
 	if request.Revision == "" || len(request.Principals) == 0 {
-		return trinogateway.TenantAdmission{}, errors.New("a binding needs a revision and at least one principal")
+		return trinogateway.TenantAdmission{}, fmt.Errorf("%w: a binding needs a revision and at least one principal", trinogateway.ErrValidation)
+	}
+	intent := request.Revision + "|" + strings.Join(request.Principals, ",")
+	replayed, err := f.guardStep(request.Step, intent)
+	if err != nil {
+		return trinogateway.TenantAdmission{}, err
+	}
+	if replayed {
+		// PoolStore.inPool resolves the recorded step and applies NOTHING: the
+		// principal rows keep whatever the earlier publication left there.
+		return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
 	}
 	if f.principals == nil {
 		f.principals = map[string][]string{}
 	}
+	if f.principalOf == nil {
+		f.principalOf = map[string]string{}
+	}
+	// pool_tenant_principal is one flat namespace per pool: a principal already
+	// bound to another tenant is a conflict, never an ambiguous admission.
+	for _, principal := range request.Principals {
+		if owner, bound := f.principalOf[principal]; bound && owner != tenant {
+			return trinogateway.TenantAdmission{}, fmt.Errorf("%w: %s already belongs to %s",
+				trinogateway.ErrPrincipalConflict, principal, owner)
+		}
+	}
+	for _, principal := range f.principals[tenant] {
+		delete(f.principalOf, principal)
+	}
+	for _, principal := range request.Principals {
+		f.principalOf[principal] = tenant
+	}
 	f.principals[tenant] = request.Principals
+	f.recordStep(request.Step, intent)
 	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
 }
 
 func (f *fakePoolGateway) ConfigurePool(_ context.Context, _ string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
 	f.record("configure")
 	f.configured = &request
+	f.minServing = int64(request.MinServing)
 	return trinogateway.PoolState{}, nil
 }
 
@@ -346,7 +389,25 @@ func (f *fakePoolGateway) AdmitMember(_ context.Context, _, instanceID string, r
 	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
 		return trinogateway.Member{}, err
 	}
+	if member == nil {
+		return trinogateway.Member{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, instanceID)
+	}
+	// PoolStore.admitMember: a member joining while ANY publication is open must
+	// acknowledge that publication's target revision. A candidate registers
+	// under its RELEASE id, so it never can - which is what makes an open
+	// barrier block the pool's own compute lifecycle.
+	if barrier := f.oldestOpenPublication(); barrier != nil {
+		if request.Receipt.ConfigRevision != barrier.TargetRevision {
+			return trinogateway.Member{}, fmt.Errorf(
+				"%w: a member joining during a publication must acknowledge its target revision",
+				trinogateway.ErrPublicationBarrier)
+		}
+		barrier.received[instanceID] = fakeReceipt{bootID: member.BootID, fingerprint: request.Receipt.CertificateHash}
+	}
 	member.Phase, member.Generation, member.Eligible = "ACTIVE", member.Generation+1, true
+	// Admission changes the serving set, so the membership generation moves and
+	// every open barrier's commit CAS now fails.
+	f.membership++
 	return f.commit(request.Step, payload, *member)
 }
 
@@ -1520,14 +1581,88 @@ func TestLeadershipSwitchPublishesTheAPIObjectNotTheReplicaSnapshot(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
-// Publication barrier fakes. The Gateway's own rules (receipt identity,
-// membership CAS, serving floor) are its tests' business; these model the
-// parts the operator's decisions depend on.
+// Publication barrier fake.
+//
+// This models the rules PoolStore actually enforces, because the operator's
+// decisions are only correct against those rules and a permissive fake proves
+// the operator can drive a protocol nobody implements. Specifically:
+//
+//   - the operation/step JOURNAL: one row per (operationId, stepId); an
+//     identical body resolves to the recorded result and APPLIES NOTHING, a
+//     different body under the same identity is POOL_INTENT_CHANGED forever,
+//     and a step is recorded only when the effect succeeded;
+//   - the membership generation CAS on open and commit, and the serving floor;
+//   - one open publication per tenant, and an immutable plan per publication id;
+//   - receipts bound to the member's exact (podUid, bootId) and to the
+//     publication's target revision, accepted only while it is OPEN;
+//   - missing members computed from the CURRENT active membership, not from the
+//     list frozen when the barrier opened;
+//   - a joining member must acknowledge the open publication's target revision,
+//     which is what makes an open barrier block admission;
+//   - revocation keeps the tenant's principal rows (PoolStore only rewrites the
+//     admission row and abandons that tenant's open publications).
 // ---------------------------------------------------------------------------
 
 type fakePublication struct {
 	trinogateway.Publication
-	received map[string]bool
+	received map[string]fakeReceipt
+	opened   int64
+}
+
+// fakeReceipt is one row of pool_publication_receipt: what a member said it was
+// serving, bound to the process that said it.
+type fakeReceipt struct {
+	bootID      string
+	fingerprint string
+}
+
+// fakeStep is one row of the Gateway's pool_operation journal.
+type fakeStep struct {
+	payload string
+}
+
+// guardStep mirrors PoolStore.inPool's replay resolution. It returns true when
+// the step was already recorded, in which case the caller must apply nothing.
+func (f *fakePoolGateway) guardStep(step trinogateway.Step, intent string) (bool, error) {
+	if f.journal == nil {
+		f.journal = map[string]fakeStep{}
+	}
+	if step.OperationID == "" || step.StepID == "" {
+		return false, fmt.Errorf("%w: a step needs an operation and a step id", trinogateway.ErrValidation)
+	}
+	if len(step.StepID) > 64 {
+		// pool_operation.step_id is VARCHAR(64).
+		return false, fmt.Errorf("%w: step id %q exceeds 64 characters", trinogateway.ErrValidation, step.StepID)
+	}
+	recorded, found := f.journal[step.OperationID+"\x00"+step.StepID]
+	if !found {
+		return false, nil
+	}
+	if recorded.payload != intent {
+		return false, fmt.Errorf("%w: step %s of %s was recorded with a different intent",
+			trinogateway.ErrIntentChanged, step.StepID, step.OperationID)
+	}
+	return true, nil
+}
+
+// recordStep is the journal write PoolStore performs after a successful effect.
+func (f *fakePoolGateway) recordStep(step trinogateway.Step, intent string) {
+	f.journal[step.OperationID+"\x00"+step.StepID] = fakeStep{payload: intent}
+}
+
+// oldestOpenPublication is PoolStore.openPublicationRow: the pool's oldest OPEN
+// publication, which is the one a joining member is measured against.
+func (f *fakePoolGateway) oldestOpenPublication() *fakePublication {
+	var oldest *fakePublication
+	for _, publication := range f.publications {
+		if publication.Phase != "OPEN" {
+			continue
+		}
+		if oldest == nil || publication.opened < oldest.opened {
+			oldest = publication
+		}
+	}
+	return oldest
 }
 
 func (f *fakePoolGateway) GetPool(context.Context, string) (trinogateway.PoolState, error) {
@@ -1559,10 +1694,36 @@ func (f *fakePoolGateway) OpenPublication(_ context.Context, _ string, request t
 	if f.publications == nil {
 		f.publications = map[string]*fakePublication{}
 	}
-	if existing, found := f.publications[request.PublicationID]; found {
-		return f.publicationView(existing), nil
+	intent := strings.Join([]string{request.PublicationID, request.Tenant, request.TargetRevision,
+		request.PayloadHash, fmt.Sprint(request.ExpectedMembershipGeneration)}, "|")
+	replayed, err := f.guardStep(request.Step, intent)
+	if err != nil {
+		return trinogateway.Publication{}, err
+	}
+	if replayed {
+		return f.publicationView(f.publications[request.PublicationID]), nil
+	}
+	if request.ExpectedMembershipGeneration != f.membership {
+		return trinogateway.Publication{}, fmt.Errorf("%w: the pool membership generation changed", trinogateway.ErrMembershipChanged)
 	}
 	active := f.activeInstanceIDs()
+	if int64(len(active)) < f.minServing {
+		return trinogateway.Publication{}, fmt.Errorf("%w: a publication requires the minimum serving membership", trinogateway.ErrServingFloor)
+	}
+	if existing, found := f.publications[request.PublicationID]; found {
+		// The plan of a publication identity is immutable.
+		if existing.Tenant != request.Tenant || existing.TargetRevision != request.TargetRevision {
+			return trinogateway.Publication{}, fmt.Errorf("%w: this publication identity has a different plan", trinogateway.ErrIntentChanged)
+		}
+		f.recordStep(request.Step, intent)
+		return f.publicationView(existing), nil
+	}
+	for _, publication := range f.publications {
+		if publication.Tenant == request.Tenant && publication.Phase == "OPEN" {
+			return trinogateway.Publication{}, fmt.Errorf("%w: this tenant already has an open publication", trinogateway.ErrPublicationBarrier)
+		}
+	}
+	f.clock++
 	publication := &fakePublication{
 		Publication: trinogateway.Publication{
 			PublicationID:        request.PublicationID,
@@ -1573,17 +1734,26 @@ func (f *fakePoolGateway) OpenPublication(_ context.Context, _ string, request t
 			RequiredMembers:      active,
 			TenantState:          "PENDING",
 		},
-		received: map[string]bool{},
+		received: map[string]fakeReceipt{},
+		opened:   f.clock,
 	}
 	f.publications[request.PublicationID] = publication
+	f.recordStep(request.Step, intent)
 	return f.publicationView(publication), nil
 }
 
-func (f *fakePoolGateway) AbandonPublication(_ context.Context, _, publicationID string, _ trinogateway.Step) (trinogateway.Publication, error) {
+func (f *fakePoolGateway) AbandonPublication(_ context.Context, _, publicationID string, step trinogateway.Step) (trinogateway.Publication, error) {
 	f.record("abandon:" + publicationID)
 	publication, found := f.publications[publicationID]
 	if !found {
 		return trinogateway.Publication{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, publicationID)
+	}
+	replayed, err := f.guardStep(step, "abandon|"+publicationID)
+	if err != nil {
+		return trinogateway.Publication{}, err
+	}
+	if replayed {
+		return f.publicationView(publication), nil
 	}
 	// An admitted gate is never retracted by abandoning it: the Gateway refuses,
 	// and the caller reads it back as ADMITTED.
@@ -1591,6 +1761,7 @@ func (f *fakePoolGateway) AbandonPublication(_ context.Context, _, publicationID
 		return trinogateway.Publication{}, fmt.Errorf("%w: a committed publication cannot be abandoned", trinogateway.ErrIrreversible)
 	}
 	publication.Phase = "ABANDONED"
+	f.recordStep(step, "abandon|"+publicationID)
 	return f.publicationView(publication), nil
 }
 
@@ -1608,22 +1779,61 @@ func (f *fakePoolGateway) RecordPublicationReceipt(_ context.Context, _, publica
 	if !found {
 		return trinogateway.Publication{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, publicationID)
 	}
+	intent := strings.Join([]string{publicationID, request.InstanceID, request.PodUID,
+		request.BootID, request.AppliedRevision, request.AuthFingerprint}, "|")
+	replayed, err := f.guardStep(request.Step, intent)
+	if err != nil {
+		return trinogateway.Publication{}, err
+	}
+	if replayed {
+		return f.publicationView(publication), nil
+	}
+	if publication.Phase != "OPEN" {
+		return trinogateway.Publication{}, fmt.Errorf("%w: only an open publication accepts receipts", trinogateway.ErrPhase)
+	}
 	if request.AppliedRevision != publication.TargetRevision {
 		return trinogateway.Publication{}, fmt.Errorf("%w: applied revision does not match the target", trinogateway.ErrPublicationBarrier)
 	}
 	member := f.members[request.InstanceID]
-	if member == nil || member.BootID != request.BootID {
+	if member == nil || member.BootID != request.BootID || member.PodUID != request.PodUID {
 		return trinogateway.Publication{}, fmt.Errorf("%w: the acknowledgement does not identify this member's process", trinogateway.ErrPublicationBarrier)
 	}
-	publication.received[request.InstanceID] = true
+	if member.Phase != "ACTIVE" && member.Phase != "PREPARING" {
+		return trinogateway.Publication{}, fmt.Errorf("%w: a %s member cannot acknowledge a publication", trinogateway.ErrPhase, member.Phase)
+	}
+	publication.received[request.InstanceID] = fakeReceipt{bootID: request.BootID, fingerprint: request.AuthFingerprint}
+	f.recordStep(request.Step, intent)
 	return f.publicationView(publication), nil
 }
 
-func (f *fakePoolGateway) CommitPublication(_ context.Context, _, publicationID string, _ trinogateway.CommitPublicationRequest) (trinogateway.Publication, error) {
+func (f *fakePoolGateway) CommitPublication(_ context.Context, _, publicationID string, request trinogateway.CommitPublicationRequest) (trinogateway.Publication, error) {
 	f.record("commit:" + publicationID)
 	publication, found := f.publications[publicationID]
 	if !found {
 		return trinogateway.Publication{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, publicationID)
+	}
+	intent := fmt.Sprintf("commit|%s|%d", publicationID, request.ExpectedMembershipGeneration)
+	replayed, err := f.guardStep(request.Step, intent)
+	if err != nil {
+		return trinogateway.Publication{}, err
+	}
+	if replayed {
+		return f.publicationView(publication), nil
+	}
+	if publication.Phase == "ADMITTED" {
+		return f.publicationView(publication), nil
+	}
+	if publication.Phase != "OPEN" {
+		return trinogateway.Publication{}, fmt.Errorf("%w: an abandoned publication cannot be committed", trinogateway.ErrPhase)
+	}
+	// Both generations are checked, exactly as PoolStore.commitPublication does:
+	// the caller's view of the pool AND the membership this barrier was opened
+	// against.
+	if f.membership != request.ExpectedMembershipGeneration || publication.MembershipGeneration != request.ExpectedMembershipGeneration {
+		return trinogateway.Publication{}, fmt.Errorf("%w: the membership generation changed during the publication", trinogateway.ErrMembershipChanged)
+	}
+	if int64(len(f.activeInstanceIDs())) < f.minServing {
+		return trinogateway.Publication{}, fmt.Errorf("%w: the admitting membership fell below the minimum serving count", trinogateway.ErrServingFloor)
 	}
 	view := f.publicationView(publication)
 	if len(view.MissingMembers) > 0 {
@@ -1635,30 +1845,55 @@ func (f *fakePoolGateway) CommitPublication(_ context.Context, _, publicationID 
 		f.admitted = map[string]string{}
 	}
 	f.admitted[publication.Tenant] = publication.TargetRevision
+	f.recordStep(request.Step, intent)
 	return f.publicationView(publication), nil
 }
 
 func (f *fakePoolGateway) RevokeTenant(_ context.Context, _, tenant string, request trinogateway.RevokeTenantRequest) (trinogateway.TenantAdmission, error) {
 	f.record("revoke:" + tenant)
 	if request.Reason == "" {
-		return trinogateway.TenantAdmission{}, errors.New("a revocation must carry a reason")
+		return trinogateway.TenantAdmission{}, fmt.Errorf("%w: a revocation must carry a reason", trinogateway.ErrValidation)
+	}
+	intent := "revoke|" + tenant + "|" + request.Reason
+	replayed, err := f.guardStep(request.Step, intent)
+	if err != nil {
+		return trinogateway.TenantAdmission{}, err
+	}
+	if replayed {
+		return trinogateway.TenantAdmission{Tenant: tenant, State: "REVOKED"}, nil
 	}
 	delete(f.admitted, tenant)
-	delete(f.principals, tenant)
+	// PoolStore.revokeTenant rewrites the ADMISSION row and abandons the
+	// tenant's open publications. It does NOT delete pool_tenant_principal, so
+	// the binding survives a revocation - which is precisely why re-publishing
+	// an identical set after one is invisible unless it carries a new occurrence.
+	for _, publication := range f.publications {
+		if publication.Tenant == tenant && publication.Phase == "OPEN" {
+			publication.Phase = "ABANDONED"
+		}
+	}
 	if f.revoked == nil {
 		f.revoked = map[string]bool{}
 	}
 	f.revoked[tenant] = true
+	f.recordStep(request.Step, intent)
 	return trinogateway.TenantAdmission{Tenant: tenant, State: "REVOKED"}, nil
 }
 
+// publicationView mirrors PoolStore.publication: requiredMembers is the list
+// frozen when the barrier opened, but missingMembers is recomputed against the
+// CURRENT active membership and each receipt's recorded process identity.
 func (f *fakePoolGateway) publicationView(publication *fakePublication) trinogateway.Publication {
 	view := publication.Publication
 	view.Receipts = nil
 	view.MissingMembers = nil
-	for _, instanceID := range publication.RequiredMembers {
-		if publication.received[instanceID] {
-			view.Receipts = append(view.Receipts, trinogateway.PublicationReceipt{InstanceID: instanceID})
+	for _, instanceID := range f.activeInstanceIDs() {
+		member := f.members[instanceID]
+		if receipt, acknowledged := publication.received[instanceID]; acknowledged && receipt.bootID == member.BootID {
+			view.Receipts = append(view.Receipts, trinogateway.PublicationReceipt{
+				InstanceID: instanceID, BootID: receipt.bootID, AppliedRevision: publication.TargetRevision,
+				AuthFingerprint: receipt.fingerprint,
+			})
 			continue
 		}
 		view.MissingMembers = append(view.MissingMembers, instanceID)
@@ -1708,10 +1943,16 @@ func (f *fakePublicationStore) RecordTrinoPoolTenantPrincipals(_ context.Context
 	return nil
 }
 
+// RecordTrinoPoolPublicationOpen mirrors the real statement: it records the
+// LIVE barrier, and moves the state only for a tenant that has never been
+// admitted. A tenant that is admitted today stays admitted while the barrier
+// for its newest login runs.
 func (f *fakePublicationStore) RecordTrinoPoolPublicationOpen(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, publicationID, target string) error {
 	row := f.row(poolID, orgID)
 	row.PublicationID, row.TargetRevision = publicationID, target
-	row.State = configstore.TrinoPublicationAdmitting
+	if row.AdmittedTargetRevision == "" {
+		row.State = configstore.TrinoPublicationAdmitting
+	}
 	return nil
 }
 
@@ -1719,6 +1960,23 @@ func (f *fakePublicationStore) RecordTrinoPoolPublicationCommitted(_ context.Con
 	row := f.row(poolID, orgID)
 	row.AdmittedTargetRevision, row.GatewayReceipt = target, receipt
 	row.State = configstore.TrinoPublicationAdmitted
+	// The barrier is finished; its outcome lives in the admitted revision.
+	row.PublicationID, row.TargetRevision, row.LastError = "", "", ""
+	return nil
+}
+
+// ClearTrinoPoolPublicationBarrier mirrors the durable half of abandoning an
+// attempt: the barrier pointer goes, the tenant's admission does not.
+func (f *fakePublicationStore) ClearTrinoPoolPublicationBarrier(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID string) error {
+	row := f.row(poolID, orgID)
+	row.PublicationID, row.TargetRevision = "", ""
+	switch {
+	case row.AdmittedTargetRevision != "":
+	case row.PrincipalRevision != "":
+		row.State = configstore.TrinoPublicationPublished
+	default:
+		row.State = configstore.TrinoPublicationPending
+	}
 	return nil
 }
 
@@ -2056,8 +2314,8 @@ func TestANewTenantDoesNotWaitForTheWholeFleetToBeReadmitted(t *testing.T) {
 		row := harness.publications.row(harness.operator.config.PoolID, org.OrgID)
 		row.Attempt = 1
 		row.PrincipalRevision = binding.Revision
-		row.TargetRevision = harness.operator.targetRevisionFor(binding, *row)
-		row.AdmittedTargetRevision = row.TargetRevision
+		// An admitted tenant holds no live barrier: the commit cleared it.
+		row.AdmittedTargetRevision = trinoPoolTargetRevision(binding, row.Attempt)
 		row.State = configstore.TrinoPublicationAdmitted
 	}
 
@@ -2325,6 +2583,273 @@ func TestAnUnansweredIdentityProbeIsNotEvidence(t *testing.T) {
 	for _, call := range harness.gateway.calls {
 		if call == "suspect:"+instanceID {
 			t.Fatal("a member was suspected because its probe timed out")
+		}
+	}
+}
+
+// fullMembership ticks until every desired instance is ACTIVE at the Gateway.
+// A publication needs the serving floor, which the Gateway enforces on both
+// open and commit.
+func (h *operatorHarness) fullMembership(t *testing.T) {
+	t.Helper()
+	for tick := 0; tick < 120; tick++ {
+		h.tickTolerant(1)
+		if len(h.gateway.activeInstanceIDs()) >= h.store.pool.DesiredInstances {
+			return
+		}
+	}
+	t.Fatalf("the pool never reached %d active members: %v",
+		h.store.pool.DesiredInstances, h.phases())
+}
+
+// admitTenantBeyond ticks until the tenant is admitted at a target other than
+// the one it already held, and returns the new one.
+func (h *operatorHarness) admitTenantBeyond(t *testing.T, tenant, previous string) string {
+	t.Helper()
+	for tick := 0; tick < 120; tick++ {
+		h.tickTolerant(1)
+		if current := h.gateway.admitted[tenant]; current != "" && current != previous {
+			return current
+		}
+	}
+	t.Fatalf("tenant %s was never admitted past %q: %v", tenant, previous, h.gateway.calls)
+	return ""
+}
+
+// waitForPrincipals ticks until the Gateway's binding for a tenant has the
+// expected size, and returns what it holds.
+func (h *operatorHarness) waitForPrincipals(t *testing.T, tenant string, want int) []string {
+	t.Helper()
+	for tick := 0; tick < 120; tick++ {
+		h.tickTolerant(1)
+		if len(h.gateway.principals[tenant]) == want {
+			return h.gateway.principals[tenant]
+		}
+	}
+	t.Fatalf("tenant %s binds %v, want %d principals", tenant, h.gateway.principals[tenant], want)
+	return nil
+}
+
+// openBarriers is how many publications the Gateway currently holds OPEN.
+func (f *fakePoolGateway) openBarriers() int {
+	open := 0
+	for _, publication := range f.publications {
+		if publication.Phase == "OPEN" {
+			open++
+		}
+	}
+	return open
+}
+
+// A tenant needs a SECOND barrier whenever its own logins change, against the
+// very same members that acknowledged the first one.
+//
+// Every durable step identity therefore carries the publication it belongs to.
+// Without that, the second attempt's receipt for a member reuses the first
+// attempt's step identity while carrying a different applied revision, which
+// the Gateway refuses as a changed intent - and refuses forever, because the
+// identity never moves again. The tenant is then stranded: published, never
+// admitted, retried until somebody notices.
+func TestASecondBarrierForOneTenantAcknowledgesTheSameMembers(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+	first := harness.gateway.admitted["org-a"]
+	if first == "" {
+		t.Fatal("the tenant was not admitted by its first barrier")
+	}
+
+	// A second login: a new binding, a new barrier, the same members.
+	tenants.orgs[0].Users = append(tenants.orgs[0].Users,
+		configstore.TrinoOrgUser{Username: "engineer", PasswordHash: "hash"})
+	second := harness.admitTenantBeyond(t, "org-a", first)
+	if got := harness.gateway.principals["org-a"]; len(got) != 3 {
+		t.Fatalf("the Gateway binds %v, want the three current logins", got)
+	}
+	row := harness.publications.rows["org-a"]
+	if row.State != configstore.TrinoPublicationAdmitted || row.AdmittedTargetRevision != second {
+		t.Fatalf("durable publication = %+v, want an admission at %q", row, second)
+	}
+	// And the finished attempt is not left behind as the live one.
+	if row.PublicationID != "" {
+		t.Fatalf("a committed barrier is still recorded as live: %q", row.PublicationID)
+	}
+}
+
+// A login that is added and then removed again returns the tenant's principal
+// set - and therefore its revision, a digest of that set - to a value it has
+// held before.
+//
+// The publication body is then byte-identical to the earlier one, so under a
+// constant step identity the Gateway resolves it as a replay and applies
+// NOTHING: the removed login stays bound to the tenant, and the next tenant to
+// be given that principal is refused for a conflict nobody can see. Each
+// changed binding therefore takes a new durable occurrence first.
+func TestAPrincipalSetReturningToAnEarlierValueIsRepublished(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg()}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	tenants.orgs[0].Users = []configstore.TrinoOrgUser{{Username: "analyst", PasswordHash: "hash"}}
+	harness.waitForPrincipals(t, "org-a", 2)
+
+	tenants.orgs[0].Users = nil
+	if got := harness.waitForPrincipals(t, "org-a", 1); len(got) != 1 {
+		t.Fatalf("the removed login is still bound to the tenant: %v", got)
+	}
+	// The principal is free again, which is what lets another tenant hold it.
+	if owner, bound := harness.gateway.principalOf["acme.analyst"]; bound {
+		t.Fatalf("the removed principal is still owned by %s", owner)
+	}
+}
+
+// Every OPEN publication refuses a joining member, so leftovers - from an older
+// version, or from a leader that died mid-attempt - are an obstacle to the
+// pool's own compute lifecycle, not just to their tenants.
+//
+// The driver releases them ONE per pass, durably, and opens nothing new while a
+// candidate is waiting. Releasing without recording it durably was the loop
+// that re-abandoned one finished publication on every attempt while the barrier
+// actually in the way stayed open.
+func TestLeftoverBarriersDoNotBlockAMemberFromJoining(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	orgs := poolOrgs(3)
+	harness.operator.tenants = &fakeTenantStore{orgs: orgs}
+	harness.fullMembership(t)
+
+	// Three tenants, each left holding an open barrier: the shape an earlier
+	// scheduler produced by opening one barrier per eligible tenant.
+	for index, org := range orgs {
+		binding := trinoPoolTenantBindingFor(org)
+		target := trinoPoolTargetRevision(binding, 1)
+		publicationID := trinoPoolPublicationID(org.OrgID, target)
+		if _, err := harness.gateway.OpenPublication(context.Background(), "pool", trinogateway.OpenPublicationRequest{
+			Step:                         trinogateway.Step{OperationID: "seed:" + org.OrgID, StepID: fmt.Sprintf("open.%d", index)},
+			PublicationID:                publicationID,
+			Tenant:                       org.OrgID,
+			TargetRevision:               target,
+			ExpectedMembershipGeneration: harness.gateway.membership,
+			PayloadHash:                  trinoPoolPublicationPlanHash(binding, target),
+		}); err != nil {
+			t.Fatalf("seeding a leftover barrier for %s: %v", org.OrgID, err)
+		}
+		row := harness.publications.row(harness.operator.config.PoolID, org.OrgID)
+		row.Attempt = 1
+		row.PrincipalRevision = binding.Revision
+		row.PublicationID, row.TargetRevision = publicationID, target
+		row.State = configstore.TrinoPublicationAdmitting
+	}
+	if harness.gateway.openBarriers() != 3 {
+		t.Fatalf("expected three leftover barriers, got %d", harness.gateway.openBarriers())
+	}
+
+	// A replacement instance now has to join.
+	harness.store.pool.DesiredInstances++
+	harness.operator.config.Spec.DesiredInstances++
+	joined := false
+	for tick := 0; tick < 60 && !joined; tick++ {
+		harness.tickTolerant(1)
+		serving := 0
+		for _, instance := range harness.store.instances {
+			if trinopool.Phase(instance.Phase) == trinopool.PhaseServing {
+				serving++
+			}
+		}
+		joined = serving == harness.store.pool.DesiredInstances
+	}
+	if !joined {
+		t.Fatalf("the joining member never got past the leftover barriers; phases %v, calls %v",
+			harness.phases(), harness.gateway.calls)
+	}
+	// The releases are recorded durably, so no tenant is left naming a
+	// publication that is finished.
+	for _, org := range orgs {
+		row := harness.publications.rows[org.OrgID]
+		if row.PublicationID != "" && harness.gateway.publications[row.PublicationID].Phase != "OPEN" {
+			t.Fatalf("tenant %s still names the finished publication %s", org.OrgID, row.PublicationID)
+		}
+	}
+	// And they are still admitted afterwards: releasing an attempt is not
+	// abandoning the tenant.
+	harness.admitAll(t, len(orgs))
+}
+
+// One barrier is live at a time, and it is driven to completion.
+//
+// This is not tuning. Every open publication blocks every member admission, and
+// an attempt that is only advanced once per full rotation of the fleet stays
+// open long enough for ordinary membership churn to invalidate it before it can
+// commit.
+func TestOnlyOneBarrierIsLiveAtATime(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	orgs := poolOrgs(5)
+	harness.operator.tenants = &fakeTenantStore{orgs: orgs}
+	harness.fullMembership(t)
+
+	for tick := 0; tick < 120; tick++ {
+		harness.tickTolerant(1)
+		if open := harness.gateway.openBarriers(); open > 1 {
+			t.Fatalf("%d barriers were open at once after %d ticks: %v",
+				open, tick+1, harness.gateway.calls)
+		}
+	}
+	for _, org := range orgs {
+		if harness.gateway.admitted[org.OrgID] == "" {
+			t.Fatalf("tenant %s was never admitted: %v", org.OrgID, harness.gateway.calls)
+		}
+	}
+}
+
+// The receipts a commit rests on must describe ONE configuration.
+//
+// Each receipt is evidence that a member is serving what this control plane
+// serves, so an attempt that collects one receipt against the old projection
+// and one against the new admits the tenant on a mixture that no member ever
+// had. The attempt is released and reopened on the current projection instead -
+// and a tenant that is already admitted has no attempt in flight, so it is not
+// re-admitted for somebody else's change.
+func TestReceiptsRestOnTheProjectionTheAttemptWasOpenedAt(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	projection := trinoPoolProjectionRevisions{Policy: "policy-1", Password: "password-1", Group: "group-1"}
+	harness.operator.projection = func() trinoPoolProjectionRevisions { return projection }
+	harness.fullMembership(t)
+
+	// Get the attempt as far as its first receipt.
+	for tick := 0; tick < 8 && countGatewayCalls(harness.gateway.calls, "receipt:") == 0; tick++ {
+		harness.tickTolerant(1)
+	}
+	if countGatewayCalls(harness.gateway.calls, "receipt:") == 0 {
+		t.Fatalf("no receipt was recorded: %v", harness.gateway.calls)
+	}
+
+	// The projection moves under the open attempt.
+	projection = trinoPoolProjectionRevisions{Policy: "policy-2", Password: "password-2", Group: "group-2"}
+	harness.admitAll(t, 1)
+
+	admittedID := ""
+	for id, publication := range harness.gateway.publications {
+		if publication.Phase == "ADMITTED" {
+			admittedID = id
+		}
+	}
+	if admittedID == "" {
+		t.Fatalf("the tenant was never admitted: %v", harness.gateway.calls)
+	}
+	expected := trinoPoolProjectionFingerprint(projection)
+	for instanceID, receipt := range harness.gateway.publications[admittedID].received {
+		if receipt.fingerprint != expected {
+			t.Fatalf("member %s acknowledged projection %s, the committed attempt requires %s",
+				instanceID, receipt.fingerprint, expected)
 		}
 	}
 }
