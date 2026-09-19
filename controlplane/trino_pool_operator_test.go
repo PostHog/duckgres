@@ -2122,3 +2122,71 @@ func TestAnOpenBarrierDoesNotBlockAMemberFromJoining(t *testing.T) {
 		t.Fatalf("the open barrier was not reopened to let the member in: %v", harness.gateway.calls)
 	}
 }
+
+// A container can restart inside a Pod and come back ready with the SAME pod
+// UID and a NEW Trino process. The Gateway binds the member to the boot
+// identity it registered and refuses to dispatch to anything else, so a health
+// check that looks only at pod readiness reports SERVING while the pool has
+// quietly lost that member's capacity.
+func TestARestartedProcessInTheSamePodIsNotTheSameMember(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.servingPool(t)
+	instanceID := harness.store.order[0]
+	instance := harness.store.instances[instanceID]
+	if instance.CoordinatorBootID == "" {
+		t.Fatal("setup: the admitted boot identity was not recorded")
+	}
+	admitted := instance.CoordinatorBootID
+
+	// Same pod, same UID, ready - and a different process behind it. Clearing
+	// the pacing map stands in for the probe interval elapsing.
+	harness.operator.identity = func(context.Context, string) (string, error) {
+		return "process-restarted", nil
+	}
+	harness.operator.identityObservedAt = nil
+	harness.tick(t, 1)
+
+	if instance.Phase != string(trinopool.PhaseSuspect) {
+		t.Fatalf("phase = %s, want SUSPECT: the admitted incarnation is gone", instance.Phase)
+	}
+	if harness.gateway.members[instanceID].Phase != "SUSPECT" {
+		t.Fatalf("gateway member = %s, want the member excluded too", harness.gateway.members[instanceID].Phase)
+	}
+	// The recorded identity is what the Gateway admitted. Quietly adopting the
+	// new one would relabel a member nobody certified.
+	if instance.CoordinatorBootID != admitted {
+		t.Fatalf("stored boot identity = %q, want the admitted %q left alone",
+			instance.CoordinatorBootID, admitted)
+	}
+	// And it is replaced through the ordinary failure path.
+	harness.kube.absent = true
+	harness.kube.observed.PodsPresent = 0
+	harness.tick(t, 4)
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseFailureRetired) {
+		t.Fatalf("phase = %s, want the restarted member retired through the failure path", phase)
+	}
+}
+
+// A probe that does not answer is not evidence about the member: the
+// controller could not look, which is the same as a failed observation. A
+// member is never suspected on a timeout.
+func TestAnUnansweredIdentityProbeIsNotEvidence(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.servingPool(t)
+	instanceID := harness.store.order[0]
+
+	harness.operator.identity = func(context.Context, string) (string, error) {
+		return "", errors.New("connection refused")
+	}
+	harness.operator.identityObservedAt = nil
+	harness.tick(t, 3)
+
+	if phase := harness.store.instances[instanceID].Phase; phase != string(trinopool.PhaseServing) {
+		t.Fatalf("phase = %s, want SERVING: an unanswered probe is not evidence", phase)
+	}
+	for _, call := range harness.gateway.calls {
+		if call == "suspect:"+instanceID {
+			t.Fatal("a member was suspected because its probe timed out")
+		}
+	}
+}

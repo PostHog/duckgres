@@ -44,9 +44,15 @@ const trinoPoolSuspectAfter = 2 * time.Minute
 // receipt rather than a loss claim nobody could prove.
 const trinoPoolSuspectDrainAfter = 15 * time.Minute
 
+// trinoPoolIdentityObserveEvery paces the per-member identity probe. The
+// question it answers - "is this still the process that was admitted" - changes
+// only when a process restarts, so asking every tick would be one authenticated
+// request per member per five seconds for an answer that almost never moves.
+const trinoPoolIdentityObserveEvery = 30 * time.Second
+
 // observeHealth moves a serving or admitted instance onto the failure branch
-// when the cluster stops reporting a healthy coordinator, and back when it
-// recovers.
+// when the cluster stops reporting a healthy coordinator, or when the process
+// behind it is no longer the incarnation that was admitted.
 func (o *trinoPoolOperator) observeHealth(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
 	phase := trinopool.Phase(instance.Phase)
 	observed, err := o.kube(o.lease.Epoch).Observe(ctx, inventoryOf(instance))
@@ -59,7 +65,16 @@ func (o *trinoPoolOperator) observeHealth(ctx context.Context, instance configst
 	healthy := observed.CoordinatorReady && observed.CoordinatorPodUID == instance.CoordinatorPodUID
 	switch phase {
 	case trinopool.PhaseServing, trinopool.PhaseAdmitted:
-		if healthy || time.Since(instance.PhaseChangedAt) < trinoPoolSuspectAfter {
+		if healthy {
+			// A ready pod with the same UID is not the same PROCESS: a
+			// container can restart inside it and come back ready with a new
+			// Trino incarnation. The Gateway binds the member to the boot
+			// identity it registered and refuses to dispatch to anything else,
+			// so this row would report SERVING while the pool quietly lost
+			// capacity - green here, empty there.
+			return o.observeProcessIdentity(ctx, instance, phase)
+		}
+		if time.Since(instance.PhaseChangedAt) < trinoPoolSuspectAfter {
 			return false, nil
 		}
 		return true, o.suspectInstance(ctx, instance, phase, "the coordinator is not reporting healthy")
@@ -89,6 +104,53 @@ func (o *trinoPoolOperator) observeHealth(ctx context.Context, instance configst
 	default:
 		return false, nil
 	}
+}
+
+// observeProcessIdentity checks that the coordinator answering for a serving
+// member is still the incarnation that was admitted.
+//
+// Bounded on purpose: it is one authenticated request per member per
+// trinoPoolIdentityObserveEvery, not per tick, because the question it answers
+// changes only when a process restarts.
+//
+// A probe that does not answer is NOT evidence. A timeout means the controller
+// could not look - the same as a failed Observe - and a member is never
+// suspected, let alone declared dead, on that basis. Only a DIFFERENT process
+// identity is evidence, and the stored one is never quietly updated to match:
+// the recorded identity is what the Gateway admitted, and a new process is a
+// new member that has to earn its own admission.
+func (o *trinoPoolOperator) observeProcessIdentity(
+	ctx context.Context,
+	instance configstore.TrinoPoolInstance,
+	phase trinopool.Phase,
+) (bool, error) {
+	if o.identity == nil || instance.CoordinatorBootID == "" || instance.EndpointURL == "" {
+		return false, nil
+	}
+	if last, seen := o.identityObservedAt[instance.InstanceID]; seen &&
+		time.Since(last) < trinoPoolIdentityObserveEvery {
+		return false, nil
+	}
+
+	bootID, err := o.identity(ctx, instance.EndpointURL)
+	if err != nil {
+		slog.Debug("Trino pool member did not answer the identity probe.",
+			"pool", o.config.PublicID, "instance", instance.InstanceID, "reason", err)
+		return false, nil
+	}
+	if o.identityObservedAt == nil {
+		o.identityObservedAt = map[string]time.Time{}
+	}
+	o.identityObservedAt[instance.InstanceID] = time.Now()
+	if bootID == instance.CoordinatorBootID {
+		return false, nil
+	}
+
+	slog.Warn("Trino pool member is answering with a different process than the one admitted.",
+		"pool", o.config.PublicID, "instance", instance.InstanceID,
+		"admitted", instance.CoordinatorBootID, "observed", bootID)
+	return true, o.suspectInstance(ctx, instance, phase,
+		"the coordinator process restarted; the admitted incarnation is gone")
 }
 
 func (o *trinoPoolOperator) suspectInstance(ctx context.Context, instance configstore.TrinoPoolInstance, from trinopool.Phase, reason string) error {

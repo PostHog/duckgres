@@ -141,6 +141,10 @@ type trinoPoolOperator struct {
 	// thousands of warehouses, "forever" is not hyperbole.
 	bindingCursor uint64
 	barrierCursor uint64
+	// identityObservedAt paces the per-member process-identity probe. It is
+	// memory rather than durable state because it only spaces out a question
+	// whose answer is re-read anyway; a restart simply asks again.
+	identityObservedAt map[string]time.Time
 
 	lease configstore.TrinoPoolLease
 	// fenced records that this term lost the fence. It ends the loop rather

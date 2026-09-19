@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
+
 	"github.com/posthog/duckgres/controlplane/provisioner"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -127,5 +129,65 @@ func TestPoolWiringRefusesWithoutADesiredStateSource(t *testing.T) {
 
 	if _, err := buildTrinoPoolOperators(nil, testPoolFleet(), "cp-test"); err == nil {
 		t.Fatal("a pooled cell was wired with no authoritative desired-state source")
+	}
+}
+
+// The Ready gate asks whether this warehouse has ever been admitted and still
+// is - not whether a barrier happens to be open right now.
+//
+// Adding a login opens a new attempt, and the publication's state leaves
+// `admitted` while that attempt runs. Reading the state alone would flap a
+// warehouse that has been serving for weeks back to Provisioning because
+// somebody created a user.
+func TestReadyGateFollowsAdmissionNotTheAttemptInFlight(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		publication configstore.TrinoPoolPublication
+		ready       bool
+	}{
+		{
+			name: "serving while a new attempt is in flight",
+			publication: configstore.TrinoPoolPublication{
+				State:                  configstore.TrinoPublicationAdmitting,
+				AdmittedTargetRevision: "b0123456789a.a1",
+			},
+			ready: true,
+		},
+		{
+			name: "admitted and idle",
+			publication: configstore.TrinoPoolPublication{
+				State:                  configstore.TrinoPublicationAdmitted,
+				AdmittedTargetRevision: "b0123456789a.a1",
+			},
+			ready: true,
+		},
+		{
+			name:        "never admitted",
+			publication: configstore.TrinoPoolPublication{State: configstore.TrinoPublicationPublished},
+			ready:       false,
+		},
+		{
+			name: "revoked",
+			publication: configstore.TrinoPoolPublication{
+				State:                  configstore.TrinoPublicationRevoked,
+				AdmittedTargetRevision: "",
+			},
+			ready: false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ready, reason := trinoPoolTenantIsAdmitted(&testCase.publication)
+			if ready != testCase.ready {
+				t.Fatalf("ready = %v (%q), want %v", ready, reason, testCase.ready)
+			}
+			if !ready && reason == "" {
+				t.Fatal("a warehouse held at Provisioning must say why")
+			}
+		})
+	}
+
+	// An unreadable record is not a reason to report a warehouse ready.
+	if ready, reason := trinoPoolTenantIsAdmitted(nil); ready || reason == "" {
+		t.Fatalf("a missing publication reported ready=%v (%q)", ready, reason)
 	}
 }

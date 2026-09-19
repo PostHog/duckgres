@@ -232,13 +232,7 @@ func buildTrinoPoolOperators(
 				if err != nil {
 					return false, "the pool's publication state is unreadable"
 				}
-				if publication == nil {
-					return false, "waiting for the pool to publish this warehouse"
-				}
-				if publication.State != configstore.TrinoPublicationAdmitted {
-					return false, "waiting for the pool to admit this warehouse: " + publication.State
-				}
-				return true, ""
+				return trinoPoolTenantIsAdmitted(publication)
 			})
 		}
 
@@ -360,4 +354,30 @@ func trinoPoolOwnerIdentity(controlPlaneID string) string {
 		return fmt.Sprintf("%s.pid-%d", controlPlaneID, os.Getpid())
 	}
 	return controlPlaneID + "." + hex.EncodeToString(buffer)
+}
+
+// trinoPoolTenantIsAdmitted answers the Ready gate: may this warehouse be
+// reported as queryable?
+//
+// The question is whether it has EVER been admitted and still is - not whether
+// a barrier happens to be open right now. Adding a login opens a new attempt,
+// and the publication's state leaves `admitted` while that attempt runs, so a
+// state-only reading would flap a warehouse that has been serving for weeks
+// back to Provisioning because somebody created a user. The committed target
+// revision is the durable evidence that the Gateway has dispatched for it.
+//
+// A revoked tenant is not serving, one that never committed a barrier was never
+// dispatchable, and a missing record is not evidence of anything - all three
+// wait.
+func trinoPoolTenantIsAdmitted(publication *configstore.TrinoPoolPublication) (bool, string) {
+	if publication == nil {
+		return false, "waiting for the pool to publish this warehouse"
+	}
+	if publication.State == configstore.TrinoPublicationRevoked {
+		return false, "this warehouse's admission was revoked"
+	}
+	if publication.AdmittedTargetRevision == "" {
+		return false, "waiting for the pool to admit this warehouse: " + publication.State
+	}
+	return true, ""
 }
