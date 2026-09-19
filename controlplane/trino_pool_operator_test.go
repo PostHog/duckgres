@@ -3442,3 +3442,107 @@ func TestAnIdentifierDroppedFromABindingCanBeTakenByAnotherTenant(t *testing.T) 
 		t.Fatalf("another tenant cannot take the dropped identifier: %v", err)
 	}
 }
+
+// A refusal is not an unknown outcome.
+//
+// The Gateway runs a step in one transaction and every check throws before the
+// journal write, so a refused call applied nothing and never will: the request
+// is over. Holding the occurrence open for it pins the tenant on a body the
+// Gateway has already rejected, and since every other queue skips a tenant with
+// a request in flight, the corrected binding an operator produces by removing
+// the contested login can never be sent.
+//
+// The reachable case is a principal that belongs to another tenant, which is
+// permanent rather than transient: a revocation leaves the Gateway's principal
+// rows in place, so a departed tenant keeps owning its identifiers forever.
+func TestADefinitelyRefusedBindingCanBeCorrected(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	// A departed tenant still owns one of this tenant's principals.
+	contested := "acme.analyst"
+	harness.gateway.principalOf = map[string]string{contested: "org-old"}
+	harness.tickTolerant(20)
+	for tick := 0; tick < 30; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	// The operator fixes the cause: the contested login is removed, so the
+	// desired binding is publishable.
+	tenants.orgs[0].Users = nil
+	wanted := trinoPoolTenantBindingFor(tenants.orgs[0]).Principals
+	for tick := 0; tick < 60; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, wanted) {
+		row := harness.publications.rows["org-a"]
+		t.Fatalf("the Gateway binds %v, want the corrected %v (row: pending=%q payload=%s)",
+			got, wanted, row.PendingIntent, row.PendingPayload)
+	}
+	// The refusal closed the occurrence, and it did NOT checkpoint a binding the
+	// Gateway never accepted.
+	if row := harness.publications.rows["org-a"]; row.PendingIntent != "" {
+		t.Fatalf("publication = %+v, want no request in flight", row)
+	}
+}
+
+// The same pin also makes a deleted warehouse unrevocable: the revocation pass
+// skips a tenant with a request in flight, so its logins stay dispatchable at
+// the Gateway - the exact failure that pass exists to prevent.
+func TestADefinitelyRefusedTenantCanStillBeRevoked(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.gateway.principalOf = map[string]string{"acme.analyst": "org-old"}
+	harness.tickTolerant(20)
+
+	// The warehouse is deleted: it leaves the projection entirely.
+	tenants.orgs = nil
+	for tick := 0; tick < 60; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+	if !harness.gateway.revoked["org-a"] {
+		t.Fatalf("the departed tenant was never revoked; row: %+v", harness.publications.rows["org-a"])
+	}
+}
+
+// Which answers close a tenant's occurrence, stated directly.
+//
+// The line is "did the Gateway decide?", not "which code was it": a refusal
+// applied nothing and can never apply, an unknown outcome may still commit, and
+// a lost fence is about this process rather than about the request.
+func TestOnlyADefiniteRefusalClosesAnOccurrence(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		cause    error
+		definite bool
+	}{
+		{"principal conflict", trinogateway.ErrPrincipalConflict, true},
+		{"validation", trinogateway.ErrValidation, true},
+		{"changed intent", trinogateway.ErrIntentChanged, true},
+		{"unknown pool", trinogateway.ErrNotFound, true},
+		{"wrong api mode", trinogateway.ErrAPIMode, true},
+		{"protocol disabled", trinogateway.ErrPoolDisabled, true},
+		// A 503 from the Gateway's handler and one from anything in front of it
+		// are indistinguishable here, so the request may yet commit.
+		{"unavailable", trinogateway.ErrUnavailable, false},
+		// Definite for the request, but this process may no longer write: the
+		// term ends and the next leader settles the occurrence by replaying it.
+		{"stale epoch", trinogateway.ErrStaleEpoch, false},
+		// No verdict at all.
+		{"transport", errors.New("connection reset by peer"), false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			wrapped := fmt.Errorf("publish principals for org-a: %w", testCase.cause)
+			if got := trinoPoolRefusedDefinitively(wrapped); got != testCase.definite {
+				t.Fatalf("definite = %v, want %v for %v", got, testCase.definite, testCase.cause)
+			}
+		})
+	}
+}

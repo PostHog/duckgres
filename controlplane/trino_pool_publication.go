@@ -266,12 +266,30 @@ func (o *trinoPoolOperator) openOccurrence(
 // failTenantStep records the wait a failed request earned, and closes its
 // occurrence when - and only when - the Gateway's answer was definite.
 //
-// A changed-intent refusal should never happen now that every reissue carries
-// the stored body: it would mean something else recorded this step with
-// different content. It is still handled, because the answer IS definite - the
-// step exists, so nothing in flight can apply under it again - but it is logged
-// as the anomaly it is rather than relied on. Every other failure, a lost
-// response included, leaves the occurrence open: the request may yet commit.
+// A REFUSAL is definite. The Gateway runs a step in one transaction and every
+// check throws before the journal write, so a refused call applied nothing and
+// never will: that request is over, whatever is on the wire behind it. Holding
+// the occurrence open for it pins the tenant on a body the Gateway has already
+// rejected - and since every other queue skips a tenant with a request in
+// flight, neither a corrected binding nor a revocation could ever be sent. The
+// reachable case is a principal owned by another tenant, which does not heal on
+// its own: a revocation leaves the Gateway's principal rows in place.
+//
+// An UNKNOWN outcome keeps the pin, which is what the occurrence exists for.
+// Two answers count as unknown:
+//
+//   - no Gateway verdict at all (a transport error), which trinoPoolDecided
+//     already distinguishes - it is the same question runDurableStep asks;
+//   - ErrUnavailable, because a 503 from the Gateway's own handler and one from
+//     anything in front of it are indistinguishable here, so the effect may yet
+//     commit.
+//
+// A stale epoch is excluded for a different reason: the refusal is definite,
+// but this process has lost the authority to write anything. The term ends and
+// the next leader settles the occurrence by replaying it.
+//
+// Closing an occurrence NEVER moves the checkpoint: the tenant's recorded
+// binding must keep describing what the Gateway actually accepted.
 func (o *trinoPoolOperator) failTenantStep(
 	ctx context.Context,
 	orgID string,
@@ -279,10 +297,18 @@ func (o *trinoPoolOperator) failTenantStep(
 	cause error,
 	what string,
 ) error {
-	if errors.Is(cause, trinogateway.ErrIntentChanged) {
-		slog.Error("Trino pool tenant occurrence carries content the Gateway did not record for it.",
-			"pool", o.config.PublicID, "tenant", orgID,
-			"occurrence", publication.Attempt, "error", cause)
+	if trinoPoolRefusedDefinitively(cause) {
+		if errors.Is(cause, trinogateway.ErrIntentChanged) {
+			// With every reissue carrying the stored body this means something
+			// else recorded this step with different content.
+			slog.Error("Trino pool tenant occurrence carries content the Gateway did not record for it.",
+				"pool", o.config.PublicID, "tenant", orgID,
+				"occurrence", publication.Attempt, "error", cause)
+		} else {
+			slog.Warn("Trino pool tenant request was refused; closing its occurrence so the next intent can be sent.",
+				"pool", o.config.PublicID, "tenant", orgID, "occurrence", publication.Attempt,
+				"intent", publication.PendingIntent, "error", cause)
+		}
 		if err := o.publications.ResolveTrinoPoolPublicationIntent(ctx, o.lease,
 			o.config.PoolID, orgID); err != nil {
 			return o.dropAuthority(err)
@@ -294,6 +320,44 @@ func (o *trinoPoolOperator) failTenantStep(
 		return o.dropAuthority(err)
 	}
 	return fmt.Errorf("%s: %w", what, cause)
+}
+
+// trinoPoolRefusedDefinitively reports an answer that settles the request: the
+// Gateway decided, nothing was applied, and nothing in flight under that
+// identity can apply later either.
+//
+// It reuses the existing decision test rather than an enumeration of codes, so
+// a refusal the Gateway adds later is handled the same way it classifies every
+// other one. The two exclusions are the answers that are not verdicts about the
+// request: see failTenantStep.
+func trinoPoolRefusedDefinitively(cause error) bool {
+	if errors.Is(cause, trinogateway.ErrUnavailable) || errors.Is(cause, trinogateway.ErrStaleEpoch) {
+		return false
+	}
+	// A typed Gateway error IS the verdict, whatever code it carries - the same
+	// question runDurableStep asks - so a refusal the Gateway adds later needs
+	// no change here.
+	if trinoPoolDecided(cause) {
+		return true
+	}
+	// The sentinels a refusal of THESE two calls can carry, for a caller that
+	// hands back the sentinel without the typed envelope. Anything else stays
+	// unknown, which keeps the occurrence pinned: the conservative direction.
+	for _, refusal := range []error{
+		trinogateway.ErrPrincipalConflict,
+		trinogateway.ErrValidation,
+		trinogateway.ErrIntentChanged,
+		trinogateway.ErrNotFound,
+		trinogateway.ErrAPIMode,
+		trinogateway.ErrPoolDisabled,
+		trinogateway.ErrIdentityConflict,
+		trinogateway.ErrTenantNotAdmitted,
+	} {
+		if errors.Is(cause, refusal) {
+			return true
+		}
+	}
+	return false
 }
 
 // trinoPoolAwaitsMemberAdmission reports that a candidate is sitting at the
