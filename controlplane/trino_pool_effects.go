@@ -72,6 +72,32 @@ type trinoPoolObservation struct {
 	// nothing is a false statement in the Gateway's durable evidence.
 	CoordinatorImage string
 	WorkerImage      string
+	// CoordinatorPods is every coordinator pod of this instance, terminating
+	// ones included, with the container-level facts a loss claim needs. A
+	// coordinator that restarts in place keeps all of its objects, so absence
+	// can never become evidence for it; what CAN is Kubernetes' own record that
+	// the container hosting the admitted process ended.
+	CoordinatorPods []trinoPoolCoordinatorPod
+}
+
+// trinoPoolCoordinatorPod is one coordinator pod as the cluster reports it.
+type trinoPoolCoordinatorPod struct {
+	UID         string
+	Terminating bool
+	// Restarts and LastTerminated come from the pod's own container status for
+	// the Trino container - the kubelet writes them AFTER it observed the exit,
+	// so they are a statement about a container that ended, never a timeout.
+	Restarts       int32
+	LastTerminated *trinoPoolContainerTermination
+}
+
+// trinoPoolContainerTermination is Kubernetes' record of a container instance
+// that ended, carried into the loss claim so the evidence names what was seen.
+type trinoPoolContainerTermination struct {
+	ContainerID string
+	ExitCode    int32
+	Reason      string
+	FinishedAt  string
 }
 
 type trinoPoolEffects struct {
@@ -389,6 +415,9 @@ func (e *trinoPoolEffects) Observe(ctx context.Context, inventory trinoPoolInven
 	}
 	observation.PodsPresent = len(pods)
 	for _, pod := range pods {
+		if pod.Labels["app.kubernetes.io/component"] == componentCoordinatorLabel {
+			observation.CoordinatorPods = append(observation.CoordinatorPods, coordinatorPodStatus(pod))
+		}
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
@@ -405,6 +434,33 @@ func (e *trinoPoolEffects) Observe(ctx context.Context, inventory trinoPoolInven
 		}
 	}
 	return observation, nil
+}
+
+// coordinatorPodStatus projects the container-level facts a loss claim may rely
+// on. Only the Trino container is read - a sidecar that restarted says nothing
+// about the coordinator process - and a pod whose status the kubelet has not
+// filled in yet simply reports no termination, which is not evidence.
+func coordinatorPodStatus(pod corev1.Pod) trinoPoolCoordinatorPod {
+	status := trinoPoolCoordinatorPod{
+		UID:         string(pod.UID),
+		Terminating: pod.DeletionTimestamp != nil,
+	}
+	main := trinoContainerName(pod)
+	for _, container := range pod.Status.ContainerStatuses {
+		if container.Name != main {
+			continue
+		}
+		status.Restarts = container.RestartCount
+		if terminated := container.LastTerminationState.Terminated; terminated != nil {
+			status.LastTerminated = &trinoPoolContainerTermination{
+				ContainerID: terminated.ContainerID,
+				ExitCode:    terminated.ExitCode,
+				Reason:      terminated.Reason,
+				FinishedAt:  terminated.FinishedAt.UTC().Format(time.RFC3339),
+			}
+		}
+	}
+	return status
 }
 
 // instancePods lists the instance's pods, terminating ones included: a pod that
@@ -444,13 +500,27 @@ const (
 // name comes from the standard app label the chart already sets, so a sidecar's
 // image can never be mistaken for the release image.
 func trinoContainerImage(pod corev1.Pod) string {
+	if name := trinoContainerName(pod); name != "" {
+		for _, container := range pod.Spec.Containers {
+			if container.Name == name {
+				return container.Image
+			}
+		}
+	}
+	return ""
+}
+
+// trinoContainerName is the name of the pod's main Trino container. The name
+// comes from the standard app label the chart already sets, so a sidecar can
+// never be mistaken for the coordinator.
+func trinoContainerName(pod corev1.Pod) string {
 	main := pod.Labels["app.kubernetes.io/name"]
 	for _, container := range pod.Spec.Containers {
 		if main != "" && container.Name != main && !strings.HasPrefix(container.Name, "trino-") {
 			continue
 		}
 		if strings.HasPrefix(container.Name, "trino-") || container.Name == main {
-			return container.Image
+			return container.Name
 		}
 	}
 	return ""

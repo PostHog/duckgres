@@ -971,6 +971,13 @@ compute_usage_pull_api() { # org password
 #     TestAdmissionStaysClosedUntilTheCatalogWatermarkIsKnown (the operator
 #     loop) and the real-PostgreSQL TestPooledCatalogWriter* cases (the store
 #     side, as the scoped publisher role).
+#   - The member retry paths (a Gateway response that is LOST in transit, and
+#     the failure repair of a coordinator that restarted in place). Both need
+#     the serving path above AND a way to drop one specific Gateway response or
+#     kill one specific container mid-flight, neither of which this Job can do.
+#     They are covered by controlplane/trino_pool_member_retries_test.go against
+#     a fake that journals the whole request body the way the Gateway does, and
+#     stay UNVERIFIED against a live Gateway.
 trino_shared_pool_disabled() {
   log "shared Trino pool: asserting the feature is inert"
 

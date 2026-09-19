@@ -1896,7 +1896,7 @@ the Trino backend selection).
   proves it per member. Never read a published row as evidence that a catalog is
   operational.
 - **Failure is not drain.** SUSPECT excludes a member from new work; LOST
-  requires verified absence of every recorded object as evidence and is
+  requires positive evidence that the admitted process ENDED and is
   reported as failed. A repair NAMES the instance it replaces, so the Gateway
   charges the repair budget instead of the single planned surge. There is NO
   local path back from SUSPECT: the Gateway excluded the member and only a
@@ -1904,9 +1904,22 @@ the Trino backend selection).
   would claim a member serves while nothing is routed to it. A suspected member
   always leaves — proven dead through the loss claim, or replaced through the
   planned drain after `trinoPoolSuspectDrainAfter` when it cannot be proven
-  dead (a crash-looping coordinator keeps its Deployment, so LOST never gets its
-  evidence). The Gateway's serving-floor refusal stands either way, so a pool at
+  dead. The Gateway's serving-floor refusal stands either way, so a pool at
   its floor keeps the flaky member rather than dropping below it.
+- **Two observations prove a process ended, and both are statements Kubernetes
+  makes after the fact** (`processTerminationEvidence`): every recorded object
+  is gone, or the coordinator pod that hosted the admitted process is gone —
+  or is still there and its Trino container carries a RECORDED TERMINATION
+  while the endpoint now answers as a different process. The second path is
+  what a coordinator that restarts IN PLACE produces: it keeps every object it
+  had, so absence could never arrive, and the member was retained until the
+  drain timer — where a drain cannot finish either, because the dead JVM's
+  transactions stay pinned to it. That held the instance, and the repair slot
+  behind it, forever. A container hosts exactly one JVM, so a different process
+  answering there means the admitted one is not the running container, and the
+  kubelet's termination record is the corroboration. A timeout is never
+  evidence, an unenumerated pod list is "not observed" rather than "not there",
+  and nothing is deleted or restarted to manufacture proof.
 - **A serving member's PROCESS is observed, not just its pod.** A container can
   restart inside a Pod and report ready with the same pod UID and a new Trino
   incarnation; the Gateway refuses to dispatch to anything but the boot identity
@@ -2013,15 +2026,28 @@ the Trino backend selection).
   Candidate admission compares against the
   accepted projection, not against what the local process last published.
   Legacy cells install no fence and are byte-for-byte unchanged.
-- **A step's expected generation comes from the RECORD, never from a fresh
-  read.** The Gateway journals each step under its identity and hashes the whole
-  request, expected generation included, so a step whose effect landed while its
-  response was lost can only be resolved by repeating the IDENTICAL request.
-  Sealing used to carry the generation from the obligations it had just read —
-  which, once the lost seal had already landed, is the generation that seal
-  produced — so the retry reported a changed intent and that member could never
-  finish draining. Regression: `TestALostResponseDoesNotChangeTheRetriedRequest`,
-  against a fake that journals payloads the way the Gateway does.
+- **A retried step repeats the IDENTICAL request — every field, not just the
+  generation.** The Gateway journals each step under its identity and hashes
+  the WHOLE request body, minus the authority envelope, so a step whose effect
+  landed while its response was lost can only be resolved by repeating exactly
+  what was sent. Anything rebuilt from freshly read state reports a changed
+  intent, and that member can never finish the transition — not on the next
+  tick, not after a leader change, never. Three fields did that: the expected
+  generation (sealing read it back from the obligations the seal had just
+  moved), the loss claim's `observedAt` (re-stamped per attempt; it now carries
+  the durable moment the member was excluded), and registration's boot identity
+  (re-probed per attempt, so an in-place restart changed it). Where the request
+  genuinely cannot be reproduced — registration's observed identity, a
+  suspicion whose reason depends on which check fired first — the member is
+  READ BACK and what the Gateway recorded is adopted, never re-derived.
+  Regressions: `TestALostResponseDoesNotChangeTheRetriedRequest` and
+  `TestALostResponseDoesNotChangeTheRetriedMemberRequest`, against a fake that
+  journals the whole payload the way the Gateway does.
+- **One instance never stops the pool.** `progressInstances` records a failing
+  instance and carries on, and the planner still runs, so a member that cannot
+  make progress no longer holds every repair, drain and replacement behind it.
+  Only a lost fence ends the sweep. This is the isolation the tenant loop
+  already applies.
 - **Tenant admission is a committed publication, not a published binding.**
   Publishing principals (PUT `…/tenants/{t}/principals`) tells the Gateway which
   logins belong to a tenant; the Gateway dispatches work only for an ADMITTED
@@ -2071,6 +2097,7 @@ the Trino backend selection).
   `controlplane/trinogateway/*_test.go` (fixtures are generated from the real
   Java records — see `tools/gatewaywire/README.md`),
   `controlplane/trino_pool_*_test.go`,
+  `controlplane/trino_pool_member_retries_test.go`,
   `tests/configstore/trino_pool_postgres_test.go`,
   `tests/trinocatalog/*_postgres_test.go`, AND the
   `trino_shared_pool_disabled` assertion in `tests/mw-dev/e2e/harness.sh`.

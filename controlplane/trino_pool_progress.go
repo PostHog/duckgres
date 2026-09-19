@@ -23,7 +23,17 @@ import (
 // progressInstances advances the first instance that has work to do and reports
 // whether it did anything. Doing one at a time keeps a burst of instances from
 // issuing a burst of external effects under one lease.
+//
+// One instance is NOT allowed to stop the pool. Returning on the first error
+// ended the tick before the planner ran, so a member that could not make
+// progress - a Gateway decision no retry can change, an object nobody can
+// delete - held every repair, drain and replacement for as long as it stayed
+// broken. A failing instance is recorded and skipped; the errors are reported
+// together, and only a lost fence stops the sweep, because after that nothing
+// this process writes can land anyway. This is the isolation the tenant loop
+// already applies.
 func (o *trinoPoolOperator) progressInstances(ctx context.Context, instances []configstore.TrinoPoolInstance) (bool, error) {
+	var failures []error
 	for _, instance := range instances {
 		phase := trinopool.Phase(instance.Phase)
 		if phase.Terminal() {
@@ -31,13 +41,20 @@ func (o *trinoPoolOperator) progressInstances(ctx context.Context, instances []c
 		}
 		progressed, err := o.progressInstance(ctx, instance)
 		if err != nil {
-			return true, err
+			failures = append(failures, fmt.Errorf("instance %s: %w", instance.InstanceID, err))
+			if o.fenced {
+				return true, errors.Join(failures...)
+			}
+			slog.Warn("Trino pool instance step failed; continuing with the rest of the pool.",
+				"pool", o.config.PublicID, "instance", instance.InstanceID,
+				"phase", instance.Phase, "error", err)
+			continue
 		}
 		if progressed {
-			return true, nil
+			return true, errors.Join(failures...)
 		}
 	}
-	return false, nil
+	return false, errors.Join(failures...)
 }
 
 func (o *trinoPoolOperator) progressInstance(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
@@ -102,6 +119,17 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 	if err != nil {
 		return false, fmt.Errorf("observe %s: %w", instance.InstanceID, err)
 	}
+	// A lost registration response is resolved by reading the member back, not
+	// by building the request again. The request carries the coordinator's
+	// observed pod and boot identity, and the Gateway hashes the whole request
+	// under the step identity: once the coordinator has restarted in place, a
+	// rebuilt request carries a different boot id, reports a changed intent,
+	// and this instance can never leave CREATING while its member holds a live
+	// slot. What the Gateway recorded is also the only identity a later receipt
+	// or loss claim may present, so it is adopted verbatim.
+	if adopted, err := o.adoptRegisteredMember(ctx, instance); adopted || err != nil {
+		return adopted, err
+	}
 	if !observed.CoordinatorReady || observed.ReadyWorkers == 0 || observed.ReadyWorkers != observed.DesiredWorkers {
 		// Still converging. Not an error, and not something to time out into a
 		// failure: the plan's budgets already bound how many instances exist.
@@ -152,6 +180,45 @@ func (o *trinoPoolOperator) registerWhenReady(ctx context.Context, instance conf
 			// what it returned is the only way a later loss claim can present
 			// the identical pair; deriving them again would risk a value the
 			// Gateway never recorded, and the claim would be refused.
+			"coordinator_node_id":  member.NodeID,
+			"coordinator_id":       member.CoordinatorID,
+			"gateway_incarnation":  member.Incarnation,
+			"gateway_backend_name": member.BackendName,
+			"gateway_state":        member.Phase,
+			"gateway_generation":   member.Generation,
+		}))
+}
+
+// adoptRegisteredMember resolves a registration whose response was lost.
+//
+// The Gateway is authoritative for its own member, so the identity it recorded
+// is adopted rather than re-derived - including a boot identity the coordinator
+// has already replaced. That is the correct outcome, not a workaround: the
+// candidate then fails its validation against the live process and is replaced
+// through the path that exists for exactly that, which also releases the live
+// slot the member is holding.
+func (o *trinoPoolOperator) adoptRegisteredMember(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+	member, err := o.gateway.GetMember(ctx, o.config.RoutingGroup, instance.InstanceID)
+	if err != nil {
+		if errors.Is(err, trinogateway.ErrNotFound) {
+			// Nothing was registered under this identity, so registration has
+			// not happened yet and proceeds normally.
+			return false, nil
+		}
+		return true, fmt.Errorf("read back member %s: %w", instance.InstanceID, err)
+	}
+	if member.InstanceID != instance.InstanceID {
+		// Instance identities are never reused, so this cannot happen; adopting
+		// another member's incarnation would bind this row to a process it was
+		// never registered for, so it is refused rather than assumed.
+		return true, fmt.Errorf("read back member %s returned instance %q", instance.InstanceID, member.InstanceID)
+	}
+	slog.Info("Trino pool adopted a member whose registration response was lost.",
+		"pool", o.config.PublicID, "instance", instance.InstanceID, "phase", member.Phase)
+	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+		trinopool.PhaseCreating, trinopool.PhasePreparing, map[string]any{
+			"coordinator_pod_uid":  member.PodUID,
+			"coordinator_boot_id":  member.BootID,
 			"coordinator_node_id":  member.NodeID,
 			"coordinator_id":       member.CoordinatorID,
 			"gateway_incarnation":  member.Incarnation,

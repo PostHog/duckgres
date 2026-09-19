@@ -329,14 +329,19 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	}
 	// Advance the instances already in flight before starting anything new, so
 	// a slow rollout cannot be overtaken by its own successor.
-	progressed, err := o.progressInstances(ctx, instances)
-	if err != nil {
-		return errors.Join(tenantErr, err)
+	//
+	// An instance failure is reported but does not end the tick: the planner is
+	// what repairs and replaces members, and holding it back because one member
+	// is stuck is how a single unrecoverable instance took the whole pool's
+	// lifecycle with it.
+	progressed, instanceErr := o.progressInstances(ctx, instances)
+	if instanceErr != nil && o.fenced {
+		return errors.Join(tenantErr, instanceErr)
 	}
 	if progressed {
-		return tenantErr
+		return errors.Join(tenantErr, instanceErr)
 	}
-	return errors.Join(tenantErr, o.applyPlan(ctx, pool, instances))
+	return errors.Join(tenantErr, instanceErr, o.applyPlan(ctx, pool, instances))
 }
 
 // refreshConfig replaces the desired configuration with what the authoritative
