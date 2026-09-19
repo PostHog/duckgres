@@ -964,6 +964,13 @@ compute_usage_pull_api() { # org password
 #     covered by the controlplane/ unit tests (fake clientset + fake Gateway)
 #     and the real-PostgreSQL publisher tests, and stays UNVERIFIED against a
 #     live cluster until an authorized deployment enables the flags.
+#   - The catalog-watermark admission gate (a catalog that committed while its
+#     revision checkpoint failed must not let a tenant be admitted against the
+#     older revision). It needs the pooled catalog writer, which publishes to
+#     the Trino-side catalog store this Job holds no credential for. Covered by
+#     TestAdmissionStaysClosedUntilTheCatalogWatermarkIsKnown (the operator
+#     loop) and the real-PostgreSQL TestPooledCatalogWriter* cases (the store
+#     side, as the scoped publisher role).
 trino_shared_pool_disabled() {
   log "shared Trino pool: asserting the feature is inert"
 
