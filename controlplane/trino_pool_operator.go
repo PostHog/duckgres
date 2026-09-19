@@ -158,6 +158,10 @@ type trinoPoolOperator struct {
 	// memory rather than durable state because it only spaces out a question
 	// whose answer is re-read anyway; a restart simply asks again.
 	identityObservedAt map[string]time.Time
+	// tenantTurn alternates the two long queues - publishing a changed binding
+	// and opening the next barrier - so neither can starve the other at fleet
+	// scale.
+	tenantTurn uint64
 	// barrierBasis is the configuration the live publication attempt was opened
 	// against, so every receipt it collects attests to ONE configuration rather
 	// than to whatever was current when each was taken. At most one attempt is

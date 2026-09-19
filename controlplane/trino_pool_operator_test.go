@@ -246,6 +246,12 @@ type fakePoolGateway struct {
 	journal      map[string]fakeStep
 	principalOf  map[string]string
 	clock        int64
+	// deferPublish holds the next publication for a tenant at the server: the
+	// caller sees a lost response, and the effect commits when deliverDeferred
+	// runs.
+	deferPublish map[string]bool
+	deferred     []func()
+	deferRevoke  map[string]bool
 	// minServing is the floor the Gateway itself enforces on open and commit,
 	// taken from the pool configuration the operator publishes.
 	minServing int64
@@ -317,6 +323,31 @@ func (f *fakePoolGateway) PublishTenantPrincipals(_ context.Context, _, tenant s
 	if request.Revision == "" || len(request.Principals) == 0 {
 		return trinogateway.TenantAdmission{}, fmt.Errorf("%w: a binding needs a revision and at least one principal", trinogateway.ErrValidation)
 	}
+	if f.deferPublish[tenant] {
+		// The request REACHED the Gateway and is still executing there - behind
+		// the pool row lock, say - while the caller's response is lost. Its
+		// effect commits later, in arrival order at the Gateway, and is subject
+		// to the journal at THAT moment rather than at call time. This is the
+		// case an immediate retry of identical bytes does not cover.
+		delete(f.deferPublish, tenant)
+		captured := request
+		f.deferred = append(f.deferred, func() { _, _ = f.applyPublish(tenant, captured) })
+		return trinogateway.TenantAdmission{}, fmt.Errorf("%w: the response was lost", trinogateway.ErrUnavailable)
+	}
+	return f.applyPublish(tenant, request)
+}
+
+// deliverDeferred commits the effects that were left executing at the Gateway,
+// in the order they arrived.
+func (f *fakePoolGateway) deliverDeferred() {
+	deferred := f.deferred
+	f.deferred = nil
+	for _, apply := range deferred {
+		apply()
+	}
+}
+
+func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.PublishPrincipalsRequest) (trinogateway.TenantAdmission, error) {
 	intent := request.Revision + "|" + strings.Join(request.Principals, ",")
 	replayed, err := f.guardStep(request.Step, intent)
 	if err != nil {
@@ -1845,6 +1876,9 @@ func (f *fakePoolGateway) CommitPublication(_ context.Context, _, publicationID 
 		f.admitted = map[string]string{}
 	}
 	f.admitted[publication.Tenant] = publication.TargetRevision
+	// pool_tenant_admission holds ONE state per tenant: a commit moves a
+	// revoked tenant back to ADMITTED.
+	delete(f.revoked, publication.Tenant)
 	f.recordStep(request.Step, intent)
 	return f.publicationView(publication), nil
 }
@@ -1854,6 +1888,16 @@ func (f *fakePoolGateway) RevokeTenant(_ context.Context, _, tenant string, requ
 	if request.Reason == "" {
 		return trinogateway.TenantAdmission{}, fmt.Errorf("%w: a revocation must carry a reason", trinogateway.ErrValidation)
 	}
+	if f.deferRevoke[tenant] {
+		delete(f.deferRevoke, tenant)
+		captured := request
+		f.deferred = append(f.deferred, func() { _, _ = f.applyRevoke(tenant, captured) })
+		return trinogateway.TenantAdmission{}, fmt.Errorf("%w: the response was lost", trinogateway.ErrUnavailable)
+	}
+	return f.applyRevoke(tenant, request)
+}
+
+func (f *fakePoolGateway) applyRevoke(tenant string, request trinogateway.RevokeTenantRequest) (trinogateway.TenantAdmission, error) {
 	intent := "revoke|" + tenant + "|" + request.Reason
 	replayed, err := f.guardStep(request.Step, intent)
 	if err != nil {
@@ -1906,6 +1950,9 @@ func (f *fakePoolGateway) publicationView(publication *fakePublication) trinogat
 // own memory - so the tests below restart the operator and assert that.
 type fakePublicationStore struct {
 	rows map[string]*configstore.TrinoPoolPublication
+	// failPrincipalCheckpoint models the half this control plane owns failing
+	// on its own: the Gateway answered, the local write did not land.
+	failPrincipalCheckpoint bool
 }
 
 func newFakePublicationStore() *fakePublicationStore {
@@ -1935,11 +1982,16 @@ func (f *fakePublicationStore) row(poolID, orgID string) *configstore.TrinoPoolP
 }
 
 func (f *fakePublicationStore) RecordTrinoPoolTenantPrincipals(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, revision string) error {
+	if f.failPrincipalCheckpoint {
+		return errors.New("the checkpoint did not land")
+	}
 	row := f.row(poolID, orgID)
 	row.PrincipalRevision = revision
 	if row.State == configstore.TrinoPublicationRevoked || row.State == "" {
 		row.State = configstore.TrinoPublicationPublished
 	}
+	// The Gateway answered: the occurrence is spent.
+	row.PendingIntent = ""
 	return nil
 }
 
@@ -1984,6 +2036,7 @@ func (f *fakePublicationStore) RecordTrinoPoolTenantRevoked(_ context.Context, _
 	row := f.row(poolID, orgID)
 	row.State, row.LastError = configstore.TrinoPublicationRevoked, reason
 	row.AdmittedTargetRevision, row.TargetRevision, row.PublicationID = "", "", ""
+	row.PendingIntent = ""
 	return nil
 }
 
@@ -1991,6 +2044,18 @@ func (f *fakePublicationStore) BeginTrinoPoolPublicationAttempt(_ context.Contex
 	row := f.row(poolID, orgID)
 	row.Attempt++
 	return row.Attempt, nil
+}
+
+func (f *fakePublicationStore) BeginTrinoPoolPublicationIntent(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, kind string) (int64, error) {
+	row := f.row(poolID, orgID)
+	row.Attempt++
+	row.PendingIntent = kind
+	return row.Attempt, nil
+}
+
+func (f *fakePublicationStore) ResolveTrinoPoolPublicationIntent(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID string) error {
+	f.row(poolID, orgID).PendingIntent = ""
+	return nil
 }
 
 func (f *fakePublicationStore) RecordTrinoPoolPublicationFailure(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID string, nextAttemptAt time.Time, lastError string) error {
@@ -2851,5 +2916,307 @@ func TestReceiptsRestOnTheProjectionTheAttemptWasOpenedAt(t *testing.T) {
 			t.Fatalf("member %s acknowledged projection %s, the committed attempt requires %s",
 				instanceID, receipt.fingerprint, expected)
 		}
+	}
+}
+
+// clearBackoff is the durable wait elapsing. Ticks are instantaneous in a test,
+// so a tenant that earned a wait would otherwise never be reached again.
+func (h *operatorHarness) clearBackoff(tenant string) {
+	if row := h.publications.rows[tenant]; row != nil {
+		row.NextAttemptAt = nil
+	}
+}
+
+// A publication whose response was lost is NOT finished: it may still be
+// executing at the Gateway, and it commits whenever it gets there.
+//
+// If the driver moves on to the next desired binding under a new step
+// identity, the two are unordered at the Gateway - same controller, same epoch,
+// different steps - so the older one can commit last and leave the tenant bound
+// to a set nobody wants, while duckgres has checkpointed the newer one and will
+// never publish it again. The step identity is therefore pinned to the tenant's
+// open occurrence until that occurrence reaches a DEFINITE outcome, which makes
+// the late duplicate a journal replay rather than a second effect.
+func TestADelayedPublicationCannotOverwriteANewerBinding(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	// A second login. Its publication reaches the Gateway but the response is
+	// lost, and the effect is left executing there.
+	tenants.orgs[0].Users = append(tenants.orgs[0].Users,
+		configstore.TrinoOrgUser{Username: "engineer", PasswordHash: "hash"})
+	harness.gateway.deferPublish = map[string]bool{"org-a": true}
+	before := countGatewayCalls(harness.gateway.calls, "principals:")
+	for tick := 0; tick < 12 && countGatewayCalls(harness.gateway.calls, "principals:") == before; tick++ {
+		harness.tickTolerant(1)
+	}
+	if countGatewayCalls(harness.gateway.calls, "principals:") == before {
+		t.Fatalf("the changed binding was never published: %v", harness.gateway.calls)
+	}
+
+	// Before that lands, the desired binding changes AGAIN: the first login is
+	// removed, so the wanted set is neither the admitted one nor the one still
+	// executing at the Gateway.
+	tenants.orgs[0].Users = []configstore.TrinoOrgUser{{Username: "engineer", PasswordHash: "hash"}}
+	wanted := trinoPoolTenantBindingFor(tenants.orgs[0]).Principals
+	harness.clearBackoff("org-a")
+	for tick := 0; tick < 8; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	// The delayed effect finally commits, after the newer one.
+	harness.gateway.deliverDeferred()
+	for tick := 0; tick < 12; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, wanted) {
+		t.Fatalf("the Gateway binds %v, want the current %v: a delayed publication overwrote a newer binding",
+			got, wanted)
+	}
+	// And duckgres's checkpoint agrees with what the Gateway actually holds.
+	row := harness.publications.rows["org-a"]
+	if row.PrincipalRevision != trinoPoolTenantBindingFor(tenants.orgs[0]).Revision {
+		t.Fatalf("checkpointed revision %q does not describe the Gateway's binding %v",
+			row.PrincipalRevision, harness.gateway.principals["org-a"])
+	}
+}
+
+// The same hazard, in the direction that silently takes a warehouse off the
+// air: a revocation whose response was lost, a tenant that is re-enabled and
+// admitted again, and then the old revocation commits.
+//
+// duckgres would hold an admitted checkpoint for a tenant the Gateway refuses
+// to dispatch for, and nothing in the desired state ever changes again to
+// correct it.
+func TestADelayedRevocationCannotUnadmitAReenabledTenant(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	// The warehouse leaves the projection; its revocation is left executing at
+	// the Gateway.
+	all := tenants.orgs
+	tenants.orgs = nil
+	harness.gateway.deferRevoke = map[string]bool{"org-a": true}
+	for tick := 0; tick < 12 && countGatewayCalls(harness.gateway.calls, "revoke:") == 0; tick++ {
+		harness.tickTolerant(1)
+	}
+	if countGatewayCalls(harness.gateway.calls, "revoke:") == 0 {
+		t.Fatalf("the departed tenant was never revoked: %v", harness.gateway.calls)
+	}
+
+	// It comes back before that lands.
+	tenants.orgs = all
+	harness.clearBackoff("org-a")
+	for tick := 0; tick < 24; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	// The old revocation finally commits.
+	harness.gateway.deliverDeferred()
+	for tick := 0; tick < 24; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	row := harness.publications.rows["org-a"]
+	if row.State == configstore.TrinoPublicationAdmitted && harness.gateway.revoked["org-a"] {
+		t.Fatalf("duckgres holds an admitted checkpoint for a tenant the Gateway has revoked: %+v", row)
+	}
+	if !harness.gateway.revoked["org-a"] && row.State != configstore.TrinoPublicationAdmitted {
+		t.Fatalf("the re-enabled tenant is dispatchable at the Gateway but not checkpointed: %+v", row)
+	}
+}
+
+// The checkpoint is the half of a publication this control plane owns, and it
+// can be lost on its own: the Gateway answered, the local write did not land.
+//
+// The occurrence is still open, so the next pass reissues THAT step rather than
+// a new one. The Gateway replays its recorded outcome, and the checkpoint
+// catches up - without a second effect and without a new occurrence that an
+// older request could still undercut.
+func TestALostCheckpointIsSettledUnderTheSameOccurrence(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	tenants.orgs[0].Users = append(tenants.orgs[0].Users,
+		configstore.TrinoOrgUser{Username: "engineer", PasswordHash: "hash"})
+	harness.publications.failPrincipalCheckpoint = true
+	for tick := 0; tick < 12 && len(harness.gateway.principals["org-a"]) != 3; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+	if len(harness.gateway.principals["org-a"]) != 3 {
+		t.Fatalf("the binding never reached the Gateway: %v", harness.gateway.principals["org-a"])
+	}
+	row := harness.publications.rows["org-a"]
+	if row.PendingIntent != configstore.TrinoPublicationIntentPrincipals {
+		t.Fatalf("pending intent = %q, want the occurrence held open by the lost checkpoint", row.PendingIntent)
+	}
+	occurrence := row.Attempt
+
+	// The checkpoint works again. The SAME occurrence settles it: the Gateway
+	// replays, and no second effect is issued.
+	harness.publications.failPrincipalCheckpoint = false
+	published := countGatewayCalls(harness.gateway.calls, "principals:")
+	harness.clearBackoff("org-a")
+	harness.admitAll(t, 1)
+
+	row = harness.publications.rows["org-a"]
+	if row.PendingIntent != "" {
+		t.Fatalf("the occurrence is still open after the checkpoint landed: %+v", row)
+	}
+	if row.Attempt != occurrence {
+		t.Fatalf("occurrence moved from %d to %d to settle a lost checkpoint", occurrence, row.Attempt)
+	}
+	if row.PrincipalRevision != trinoPoolTenantBindingFor(tenants.orgs[0]).Revision {
+		t.Fatalf("checkpoint = %q, want the published binding", row.PrincipalRevision)
+	}
+	if again := countGatewayCalls(harness.gateway.calls, "principals:") - published; again != 1 {
+		t.Fatalf("%d publications were issued to settle a lost checkpoint, want exactly one replay", again)
+	}
+}
+
+// A leadership move in the middle of an unresolved request changes nothing: the
+// occurrence and what it stands for are durable, so the new leader reissues the
+// same step rather than minting one the old request could undercut.
+func TestANewLeaderSettlesTheOccurrenceItInherits(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	tenants.orgs[0].Users = append(tenants.orgs[0].Users,
+		configstore.TrinoOrgUser{Username: "engineer", PasswordHash: "hash"})
+	harness.gateway.deferPublish = map[string]bool{"org-a": true}
+	for tick := 0; tick < 12 && harness.publications.rows["org-a"].PendingIntent == ""; tick++ {
+		harness.tickTolerant(1)
+	}
+	row := harness.publications.rows["org-a"]
+	if row.PendingIntent != configstore.TrinoPublicationIntentPrincipals {
+		t.Fatalf("pending intent = %q, want an occurrence in flight", row.PendingIntent)
+	}
+	occurrence := row.Attempt
+
+	// A new leadership term: a fresh operator over the same durable record.
+	successor := newOperatorHarness(t)
+	successor.store, successor.publications = harness.store, harness.publications
+	successor.gateway = harness.gateway
+	successor.operator.store = harness.store
+	successor.operator.publications = harness.publications
+	successor.operator.gateway = harness.gateway
+	successor.operator.tenants = tenants
+	successor.operator.config.Pool.TenantAdmission = true
+	successor.clearBackoff("org-a")
+	for tick := 0; tick < 12 && successor.publications.rows["org-a"].PendingIntent != ""; tick++ {
+		successor.tickTolerant(1)
+		successor.clearBackoff("org-a")
+	}
+
+	row = successor.publications.rows["org-a"]
+	if row.PendingIntent != "" {
+		t.Fatalf("the new leader left the inherited occurrence open: %+v", row)
+	}
+	if row.Attempt != occurrence {
+		t.Fatalf("the new leader minted occurrence %d instead of settling %d", row.Attempt, occurrence)
+	}
+
+	// And the original, still executing at the old Gateway connection, cannot
+	// change anything now.
+	harness.gateway.deliverDeferred()
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, trinoPoolTenantBindingFor(tenants.orgs[0]).Principals) {
+		t.Fatalf("the late duplicate changed the binding to %v", got)
+	}
+}
+
+// The progress bound has to hold at the size the pool is actually for.
+//
+// A live barrier is finished before any new binding is published, so closing it
+// costs a number of passes that depends on the MEMBER count - not on how many
+// tenants happen to be waiting for their first publication. Servicing bindings
+// first meant a fleet's worth of pending tenants each took a pass before the
+// open barrier advanced at all.
+func TestManyPendingBindingsDoNotDelayTheLiveBarrier(t *testing.T) {
+	const tenants = 400
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	orgs := poolOrgs(tenants)
+	harness.operator.tenants = &fakeTenantStore{orgs: orgs}
+	harness.fullMembership(t)
+
+	// One tenant is published and has a barrier open; everybody else is still
+	// waiting for their first publication.
+	for tick := 0; tick < 200 && harness.gateway.openBarriers() == 0; tick++ {
+		harness.tickTolerant(1)
+	}
+	if harness.gateway.openBarriers() == 0 {
+		t.Fatalf("no barrier was opened in a fleet of %d tenants", tenants)
+	}
+	var open *fakePublication
+	for _, publication := range harness.gateway.publications {
+		if publication.Phase == "OPEN" {
+			open = publication
+		}
+	}
+
+	// One receipt per member, then the commit: the barrier closes within a
+	// bound set by the membership, with hundreds of bindings still pending.
+	bound := len(harness.gateway.activeInstanceIDs()) + 3
+	for tick := 0; tick < bound && open.Phase == "OPEN"; tick++ {
+		harness.tickTolerant(1)
+	}
+	if open.Phase != "ADMITTED" {
+		t.Fatalf("the barrier for %s is %s after %d passes with %d tenants pending",
+			open.Tenant, open.Phase, bound, tenants)
+	}
+}
+
+// The same bound for the pool's compute: a member waiting to join is not behind
+// the fleet's pending bindings either.
+func TestManyPendingBindingsDoNotDelayAJoiningMember(t *testing.T) {
+	const tenants = 400
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: poolOrgs(tenants)}
+	harness.fullMembership(t)
+	for tick := 0; tick < 200 && harness.gateway.openBarriers() == 0; tick++ {
+		harness.tickTolerant(1)
+	}
+
+	harness.store.pool.DesiredInstances++
+	harness.operator.config.Spec.DesiredInstances++
+	joined := false
+	// Create, observe, register, validate, admit, mark serving: a handful of
+	// passes, plus one to release the open barrier. Nothing here scales with
+	// the number of tenants waiting to be published.
+	for tick := 0; tick < 20 && !joined; tick++ {
+		harness.tickTolerant(1)
+		serving := 0
+		for _, instance := range harness.store.instances {
+			if trinopool.Phase(instance.Phase) == trinopool.PhaseServing {
+				serving++
+			}
+		}
+		joined = serving == harness.store.pool.DesiredInstances
+	}
+	if !joined {
+		t.Fatalf("the joining member was delayed behind %d pending bindings: %v", tenants, harness.phases())
 	}
 }

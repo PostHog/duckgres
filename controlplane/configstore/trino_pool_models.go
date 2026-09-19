@@ -283,6 +283,15 @@ type TrinoPoolPublication struct {
 	// barrier - or a second revocation after the tenant was re-enabled - is a
 	// new operation rather than a replay that returns the first one's outcome.
 	Attempt int64 `gorm:"column:attempt"`
+	// PendingIntent names the request the open occurrence stands for while its
+	// outcome is unknown: "principals", "revoke", or empty for none.
+	//
+	// A lost response is not a finished request. Until the Gateway gives a
+	// definite answer, the next pass reissues THAT occurrence's step identity
+	// rather than minting a new one, so a request still executing at the
+	// Gateway cannot commit after a newer desired intent has already been
+	// checkpointed here.
+	PendingIntent string `gorm:"column:pending_intent"`
 	// Attempts and NextAttemptAt are this tenant's own durable backoff. The
 	// driver takes one tenant at a time, so without them a permanently failing
 	// warehouse is retried every tick and starves every tenant behind it.

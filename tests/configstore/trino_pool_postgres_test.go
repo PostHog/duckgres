@@ -653,6 +653,72 @@ func onePublication(t *testing.T, store *cpconfigstore.ConfigStore, orgID string
 // revocation - a new operation. Sharing an identity with the previous one would
 // replay that one's recorded outcome, which for a revocation means a tenant
 // nobody revoked stays admitted.
+
+// An occurrence that stands for a request in flight is durable, and only a
+// DEFINITE outcome closes it.
+//
+// A lost response leaves the request possibly still executing at the Gateway,
+// so the next pass has to reissue that exact step rather than mint a new one -
+// which it can only do if what the occurrence stands for survived the restart
+// that may have happened in between.
+func TestPendingPublicationIntentIsDurable(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	first, err := store.BeginTrinoPoolPublicationIntent(ctx, lease, poolID, "org-a", cpconfigstore.TrinoPublicationIntentPrincipals)
+	if err != nil || first != 1 {
+		t.Fatalf("begin intent = %d, %v; want occurrence 1", first, err)
+	}
+	if got := onePublication(t, store, "org-a"); got.PendingIntent != cpconfigstore.TrinoPublicationIntentPrincipals {
+		t.Fatalf("pending intent = %q, want the publication it stands for", got.PendingIntent)
+	}
+
+	// The Gateway answered: the checkpoint closes the occurrence in the same
+	// write, so a crash cannot leave a checkpointed binding with an occurrence
+	// still claiming to be in flight.
+	if err := store.RecordTrinoPoolTenantPrincipals(ctx, lease, poolID, "org-a", "binding-1"); err != nil {
+		t.Fatalf("record principals: %v", err)
+	}
+	if got := onePublication(t, store, "org-a"); got.PendingIntent != "" || got.PrincipalRevision != "binding-1" {
+		t.Fatalf("publication = %+v, want a checkpointed binding and no open occurrence", got)
+	}
+
+	// A revocation takes its own occurrence, and a definite refusal closes it
+	// without moving the checkpoint.
+	second, err := store.BeginTrinoPoolPublicationIntent(ctx, lease, poolID, "org-a", cpconfigstore.TrinoPublicationIntentRevoke)
+	if err != nil || second != 2 {
+		t.Fatalf("begin revoke intent = %d, %v; want occurrence 2", second, err)
+	}
+	if err := store.ResolveTrinoPoolPublicationIntent(ctx, lease, poolID, "org-a"); err != nil {
+		t.Fatalf("resolve intent: %v", err)
+	}
+	got := onePublication(t, store, "org-a")
+	if got.PendingIntent != "" || got.Attempt != 2 || got.PrincipalRevision != "binding-1" {
+		t.Fatalf("publication = %+v, want the occurrence closed and the checkpoint untouched", got)
+	}
+
+	// A revocation clears it too, so a revoked tenant never looks like one with
+	// a request outstanding.
+	if _, err := store.BeginTrinoPoolPublicationIntent(ctx, lease, poolID, "org-a", cpconfigstore.TrinoPublicationIntentRevoke); err != nil {
+		t.Fatalf("begin second revoke intent: %v", err)
+	}
+	if err := store.RecordTrinoPoolTenantRevoked(ctx, lease, poolID, "org-a", "warehouse removed"); err != nil {
+		t.Fatalf("record revocation: %v", err)
+	}
+	if got := onePublication(t, store, "org-a"); got.PendingIntent != "" {
+		t.Fatalf("publication = %+v, want no open occurrence after a revocation", got)
+	}
+
+	if _, err := store.BeginTrinoPoolPublicationIntent(ctx, lease, poolID, "org-a", "something-else"); err == nil {
+		t.Fatal("an unknown intent kind was accepted")
+	}
+	stale := lease
+	stale.Epoch--
+	if _, err := store.BeginTrinoPoolPublicationIntent(ctx, stale, poolID, "org-a", cpconfigstore.TrinoPublicationIntentPrincipals); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
+	}
+}
 func TestPublicationAttemptsAreMonotonePerTenant(t *testing.T) {
 	ctx := context.Background()
 	store := newPoolStore(t)

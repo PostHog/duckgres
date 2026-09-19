@@ -288,6 +288,9 @@ func (cs *ConfigStore) RecordTrinoPoolTenantPrincipals(ctx context.Context, leas
 				-- is not an admission.
 				state = CASE WHEN duckgres_trino_pool_publications.state = ?
 					THEN ? ELSE duckgres_trino_pool_publications.state END,
+				-- The Gateway answered, so this occurrence is spent: the next
+				-- desired change takes a new one.
+				pending_intent = '',
 				last_error = '',
 				updated_at = now()`,
 			poolID, orgID, principalRevision, TrinoPublicationPublished,
@@ -396,6 +399,75 @@ func (cs *ConfigStore) BeginTrinoPoolPublicationAttempt(ctx context.Context, lea
 	return attempt, err
 }
 
+// Pending intents. A tenant has at most one request in flight, and the kind of
+// request its open occurrence stands for is durable.
+const (
+	TrinoPublicationIntentPrincipals = "principals"
+	TrinoPublicationIntentRevoke     = "revoke"
+)
+
+// BeginTrinoPoolPublicationIntent opens a NEW occurrence for a request whose
+// outcome will be unknown until the Gateway answers.
+//
+// It is the one write that both bumps the occurrence and records what that
+// occurrence stands for, so a leader that dies between the two can never leave
+// an occurrence nobody can attribute. Until the intent is resolved the driver
+// reissues THIS occurrence's step identity instead of minting another, which is
+// what stops a request still executing at the Gateway from committing after a
+// newer intent has been checkpointed here.
+func (cs *ConfigStore) BeginTrinoPoolPublicationIntent(ctx context.Context, lease TrinoPoolLease, poolID, orgID, kind string) (int64, error) {
+	if orgID == "" {
+		return 0, errors.New("a publication intent requires an org")
+	}
+	switch kind {
+	case TrinoPublicationIntentPrincipals, TrinoPublicationIntentRevoke:
+	default:
+		return 0, fmt.Errorf("unsupported publication intent %q", kind)
+	}
+	if poolID != lease.PoolID {
+		return 0, fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	var attempt int64
+	err := cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Raw(`
+			INSERT INTO duckgres_trino_pool_publications
+				(pool_id, org_id, attempt, pending_intent, state, gateway_receipt)
+			VALUES (?, ?, 1, ?, ?, '{}')
+			ON CONFLICT (pool_id, org_id) DO UPDATE SET
+				attempt = duckgres_trino_pool_publications.attempt + 1,
+				pending_intent = EXCLUDED.pending_intent,
+				updated_at = now()
+			RETURNING attempt`,
+			poolID, orgID, kind, TrinoPublicationPending).Scan(&attempt).Error
+	})
+	return attempt, err
+}
+
+// ResolveTrinoPoolPublicationIntent records that the open occurrence reached a
+// DEFINITE outcome at the Gateway, so the next desired change takes a new one.
+//
+// It is deliberately separate from the checkpoint: the Gateway can answer
+// definitively that an occurrence is spent WITHOUT this control plane knowing
+// which body committed under it - a step recorded with a different intent says
+// exactly that - and in that case the occurrence must be closed while the
+// checkpoint must not move.
+func (cs *ConfigStore) ResolveTrinoPoolPublicationIntent(ctx context.Context, lease TrinoPoolLease, poolID, orgID string) error {
+	if orgID == "" {
+		return errors.New("resolving an intent requires an org")
+	}
+	if poolID != lease.PoolID {
+		return fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
+	}
+	return cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		return tx.Model(&TrinoPoolPublication{}).
+			Where("pool_id = ? AND org_id = ?", poolID, orgID).
+			Updates(map[string]any{
+				"pending_intent": "",
+				"updated_at":     time.Now().UTC(),
+			}).Error
+	})
+}
+
 // RecordTrinoPoolPublicationFailure records a tenant's failed attempt and the
 // wait it earned, so one unserviceable warehouse cannot busy-loop or starve the
 // tenants the driver would otherwise reach after it.
@@ -492,8 +564,10 @@ func (cs *ConfigStore) RecordTrinoPoolTenantRevoked(ctx context.Context, lease T
 				"admitted_target_revision": "",
 				"publication_id":           "",
 				"target_revision":          "",
-				"last_error":               reason,
-				"updated_at":               time.Now().UTC(),
+				// The Gateway answered, so this occurrence is spent.
+				"pending_intent": "",
+				"last_error":     reason,
+				"updated_at":     time.Now().UTC(),
 			}).Error
 	})
 }
