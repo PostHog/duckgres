@@ -994,8 +994,6 @@ func TestUnhealthyMemberIsSuspectedThenLostOnlyWithEvidence(t *testing.T) {
 	}
 }
 
-// A member excluded on suspicion returns to service when it recovers: one bad
-// minute must not retire a healthy cluster.
 // A suspected member that starts looking healthy again is NOT returned to
 // service locally.
 //

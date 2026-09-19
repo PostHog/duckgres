@@ -1819,7 +1819,11 @@ publication barrier), migrations `000040`-`000044`.
   `DUCKGRES_TRINO_POOL_GATEWAY_URL`, `DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED`
   / `_BOOTSTRAP` / `_DSN_FILE` / `_WRITER_IDENTITY`, and
   `DUCKGRES_TRINO_POOL_CONFIG_CONFIGMAP` / `_NAMESPACE` / `_REGISTRY_KEY` (the
-  desired-state source, below — REQUIRED for a pooled cell).
+  desired-state source, below — REQUIRED for a pooled cell), and
+  `DUCKGRES_TRINO_POOL_CATALOG_SCHEMA` (REQUIRED with the catalog writer: the
+  publisher credential names a database only, and the role's privileges are on
+  the cell's schema, so unqualified SQL would resolve against `public` where it
+  can neither create nor read).
 - **The pool keeps the cell's identity**: routing group, namespace and the
   catalog store's `cell_id` are unchanged. Replacing compute never rewrites
   which warehouse lives where.
@@ -1865,16 +1869,26 @@ publication barrier), migrations `000040`-`000044`.
   and the fence would distinguish nobody), and a takeover needs a strictly
   higher epoch — an equal epoch held by another identity is a collision, not a
   handover.
-- **Failure is not drain.** SUSPECT excludes a member from new work and is
-  reversible; LOST requires verified absence of every recorded object as
-  evidence and is reported as failed. A repair NAMES the instance it replaces,
-  so the Gateway charges the repair budget instead of the single planned surge.
-  SUSPECT has a SECOND exit: a member that stays suspect without becoming
-  provably dead (a crash-looping coordinator keeps its Deployment, so LOST can
-  never be claimed) is replaced through the planned drain after
-  `trinoPoolSuspectDrainAfter`. The Gateway's serving-floor refusal still
-  stands, so a pool at its floor keeps the flaky member instead of dropping
-  below it.
+- **Failure is not drain.** SUSPECT excludes a member from new work; LOST
+  requires verified absence of every recorded object as evidence and is
+  reported as failed. A repair NAMES the instance it replaces, so the Gateway
+  charges the repair budget instead of the single planned surge. There is NO
+  local path back from SUSPECT: the Gateway excluded the member and only a
+  fresh certified admission un-excludes it, so flipping the row back to SERVING
+  would claim a member serves while nothing is routed to it. A suspected member
+  always leaves — proven dead through the loss claim, or replaced through the
+  planned drain after `trinoPoolSuspectDrainAfter` when it cannot be proven
+  dead (a crash-looping coordinator keeps its Deployment, so LOST never gets its
+  evidence). The Gateway's serving-floor refusal stands either way, so a pool at
+  its floor keeps the flaky member rather than dropping below it.
+- **A serving member's PROCESS is observed, not just its pod.** A container can
+  restart inside a Pod and report ready with the same pod UID and a new Trino
+  incarnation; the Gateway refuses to dispatch to anything but the boot identity
+  it registered, so a readiness-only check reports SERVING while that capacity
+  is gone. The identity is re-read against the admitted one, bounded to one
+  request per member per `trinoPoolIdentityObserveEvery`. A DIFFERENT identity
+  suspects the member; an unanswered probe is not evidence and changes nothing;
+  the stored identity is never quietly updated to match.
 - **A FAILED_PREPARING candidate is cleaned up, not abandoned.** It is NOT
   terminal: its objects are deleted (sound only because it provably never
   admitted work), then its Gateway member is walked PREPARING → SUSPECT → LOST,
@@ -1934,6 +1948,28 @@ publication barrier), migrations `000040`-`000044`.
   without `opa.policy.revision-uri` reports OPA as unacknowledged, the check is
   absent, and admission fails closed — deliberate, so `opa.policy.revision-uri`
   is REQUIRED on a pooled coordinator, pointed at that revision document.
+- **The authorization projection is FENCED for a pooled cell.** Every control
+  plane builds it from its own view and every replica serves it, so two things
+  are needed together. An ORDER: the config store records the accepted
+  projection (digest + revision) under the pool's authority, built from source
+  rows read INSIDE that transaction at `REPEATABLE READ`, with project scopes
+  derived from the same read rather than the polled snapshot — a revision
+  allocated for content read at another moment numbers bytes nobody can prove
+  were current. And an eligible PRODUCER: only a process whose own running
+  image equals the `publisher-image` key of the same pool ConfigMap may advance
+  it, compared after the authority is held. That is equality, never an ordering
+  of image identities — an older binary that wins the lease would otherwise
+  publish its own older `policy.rego` under a HIGHER revision, which no counter
+  can detect, and a deliberate rollback moves the desired value so the older
+  binary becomes eligible again. Every uncertainty fails closed, so a partial
+  rollout PAUSES pooled publication (OPA keeps its last-good bundle) rather than
+  regressing it. The auth Secret is written under that revision with the
+  object's own resourceVersion as the CAS and refuses to replace a newer stamp;
+  the bundle handler gates the bundle it CAPTURED before a 200 AND before a 304
+  (a 304 preserves exactly the stale bundle the fence exists to retire), and an
+  unreadable record is a refusal. Candidate admission compares against the
+  accepted projection, not against what the local process last published.
+  Legacy cells install no fence and are byte-for-byte unchanged.
 - **Tenant admission is a committed publication, not a published binding.**
   Publishing principals (PUT `…/tenants/{t}/principals`) tells the Gateway which
   logins belong to a tenant; the Gateway dispatches work only for an ADMITTED
@@ -1942,8 +1978,12 @@ publication barrier), migrations `000040`-`000044`.
   the published catalog revision applied and all three projection revisions
   current before duckgres records it. A tenant that leaves the projection is
   REVOKED, once (the durable row is kept); with the gate on, a warehouse is held
-  at Provisioning until its publication commits. All of it reads the durable
-  record (migration `000044`), never the leader's memory.
+  at Provisioning until its publication commits. Readiness then follows the
+  COMMITTED target revision, not the state field: a tenant that adds a login
+  opens a new attempt, and reading the state alone would flap a warehouse that
+  has served for weeks back to Provisioning because somebody created a user.
+  All of it reads the durable record (migrations `000044`/`000045`), never the
+  leader's memory.
 - **One authoritative boot identity.** The coordinator's `processId` is probed
   BEFORE member registration and is sent as `bootId` on both register and admit;
   the Gateway requires the receipt to carry the pair it recorded. A restart
