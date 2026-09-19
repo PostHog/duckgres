@@ -209,6 +209,20 @@ type fakePoolGateway struct {
 	admitted     map[string]string
 	revoked      map[string]bool
 	configured   *trinogateway.ConfigurePoolRequest
+
+	// journal mirrors the Gateway's own request journal, keyed by step
+	// identity. The recorded payload INCLUDES the expected generation, because
+	// the Gateway hashes the whole request body: a repeat under the same step
+	// id carrying a different generation is POOL_INTENT_CHANGED, not a replay.
+	journal map[string]fakeJournalEntry
+	// loseResponse names step ids whose effect must land while the caller sees
+	// a transport failure - the ambiguity every lifecycle retry has to survive.
+	loseResponse map[string]bool
+}
+
+type fakeJournalEntry struct {
+	payload  string
+	response trinogateway.Member
 }
 
 func newFakePoolGateway() *fakePoolGateway {
@@ -217,6 +231,40 @@ func newFakePoolGateway() *fakePoolGateway {
 		obligations: map[string]trinogateway.Obligations{},
 		backends:    map[string]trinogateway.Backend{},
 	}
+}
+
+// replay answers a repeated step from the journal, exactly as the Gateway does.
+// A repeat with a DIFFERENT payload is refused: that is the failure mode a
+// retry hits when it rebuilds its request from freshly read state instead of
+// from what it recorded when it first formed the intent.
+func (f *fakePoolGateway) replay(step trinogateway.Step, payload string) (trinogateway.Member, bool, error) {
+	entry, recorded := f.journal[step.OperationID+"/"+step.StepID]
+	if !recorded {
+		return trinogateway.Member{}, false, nil
+	}
+	if entry.payload != payload {
+		return trinogateway.Member{}, true, fmt.Errorf("%w: recorded %s, received %s",
+			trinogateway.ErrIntentChanged, entry.payload, payload)
+	}
+	return entry.response, true, nil
+}
+
+// commit records the outcome and then, when the test asked for it, hides the
+// response from the caller.
+func (f *fakePoolGateway) commit(step trinogateway.Step, payload string, member trinogateway.Member) (trinogateway.Member, error) {
+	if f.journal == nil {
+		f.journal = map[string]fakeJournalEntry{}
+	}
+	f.journal[step.OperationID+"/"+step.StepID] = fakeJournalEntry{payload: payload, response: member}
+	if f.loseResponse[step.StepID] {
+		delete(f.loseResponse, step.StepID)
+		return trinogateway.Member{}, errors.New("connection reset before the response was read")
+	}
+	return member, nil
+}
+
+func fakeStepPayload(name string, generation int64) string {
+	return fmt.Sprintf("%s@%d", name, generation)
 }
 
 func (f *fakePoolGateway) record(call string) { f.calls = append(f.calls, call) }
@@ -268,14 +316,21 @@ func (f *fakePoolGateway) RegisterMember(_ context.Context, poolID string, reque
 	return *member, nil
 }
 
-func (f *fakePoolGateway) AdmitMember(_ context.Context, _, instanceID string, _ trinogateway.AdmitMemberRequest) (trinogateway.Member, error) {
+func (f *fakePoolGateway) AdmitMember(_ context.Context, _, instanceID string, request trinogateway.AdmitMemberRequest) (trinogateway.Member, error) {
 	f.record("admit:" + instanceID)
 	if f.admitErr != nil {
 		return trinogateway.Member{}, f.admitErr
 	}
+	payload := fakeStepPayload("admit", request.ExpectedGeneration)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
+	}
 	member := f.members[instanceID]
+	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
+		return trinogateway.Member{}, err
+	}
 	member.Phase, member.Generation, member.Eligible = "ACTIVE", member.Generation+1, true
-	return *member, nil
+	return f.commit(request.Step, payload, *member)
 }
 
 func (f *fakePoolGateway) GetMember(_ context.Context, _, instanceID string) (trinogateway.Member, error) {
@@ -320,6 +375,10 @@ func (f *fakePoolGateway) DrainMember(_ context.Context, _, instanceID string, r
 	if f.drainErr != nil {
 		return trinogateway.Member{}, f.drainErr
 	}
+	payload := fakeStepPayload("drain", request.ExpectedGeneration)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
+	}
 	// ACTIVE is the planned drain. SUSPECT is the extension agreed with the
 	// Gateway for a member that is excluded but not provably dead: it is the
 	// only way such a member can ever leave, since a loss claim needs evidence
@@ -333,11 +392,15 @@ func (f *fakePoolGateway) DrainMember(_ context.Context, _, instanceID string, r
 	}
 	member.Phase, member.Generation = "DRAINING", member.Generation+1
 	f.membership++
-	return *member, nil
+	return f.commit(request.Step, payload, *member)
 }
 
 func (f *fakePoolGateway) SealMember(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("seal:" + instanceID)
+	payload := fakeStepPayload("seal", request.ExpectedGeneration)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
+	}
 	member, err := f.requirePhase(instanceID, "be sealed", "DRAINING")
 	if err != nil {
 		return trinogateway.Member{}, err
@@ -346,7 +409,13 @@ func (f *fakePoolGateway) SealMember(_ context.Context, _, instanceID string, re
 		return trinogateway.Member{}, err
 	}
 	member.Phase, member.Generation = "SEALED", member.Generation+1
-	return *member, nil
+	// Obligations are reported with the member's CURRENT generation, so a step
+	// that rebuilds its request from a fresh obligations read carries a
+	// different generation than the one the journal recorded.
+	obligations := f.obligations[instanceID]
+	obligations.Generation = member.Generation
+	f.obligations[instanceID] = obligations
+	return f.commit(request.Step, payload, *member)
 }
 
 func (f *fakePoolGateway) SuspectMember(_ context.Context, _, instanceID string, request trinogateway.SuspectMemberRequest) (trinogateway.Member, error) {
@@ -393,6 +462,10 @@ func (f *fakePoolGateway) LostMember(_ context.Context, _, instanceID string, re
 
 func (f *fakePoolGateway) RetireMember(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("retire:" + instanceID)
+	payload := fakeStepPayload("retire", request.ExpectedGeneration)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
+	}
 	// SEALED is a completed drain, LOST a proven failure, and PREPARING a
 	// candidate that never admitted work. Nothing else may claim retirement.
 	member, err := f.requirePhase(instanceID, "be retired", "SEALED", "LOST", "PREPARING")
@@ -407,13 +480,17 @@ func (f *fakePoolGateway) RetireMember(_ context.Context, _, instanceID string, 
 		kind = "FAILED"
 	}
 	member.Phase, member.Generation, member.RetirementKind = "RETIRING", member.Generation+1, kind
-	return *member, nil
+	return f.commit(request.Step, payload, *member)
 }
 
 func (f *fakePoolGateway) MemberRetired(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("retired:" + instanceID)
 	if !request.ResourcesAbsent {
 		return trinogateway.Member{}, errors.New("retirement reported without asserting absence")
+	}
+	payload := fakeStepPayload("retired", request.ExpectedGeneration)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
 	}
 	member, err := f.requirePhase(instanceID, "complete retirement", "RETIRING")
 	if err != nil {
@@ -423,7 +500,7 @@ func (f *fakePoolGateway) MemberRetired(_ context.Context, _, instanceID string,
 		return trinogateway.Member{}, err
 	}
 	member.Phase, member.Generation = "RETIRED", member.Generation+1
-	return *member, nil
+	return f.commit(request.Step, payload, *member)
 }
 
 type fakePoolKube struct {
@@ -803,6 +880,52 @@ func TestSealWaitsForObligations(t *testing.T) {
 	if instance.Phase != string(trinopool.PhaseSealed) {
 		t.Fatalf("phase = %s, want SEALED once drained", instance.Phase)
 	}
+}
+
+// A lost response must not change the request the retry sends.
+//
+// The Gateway journals each step under its identity and hashes the whole
+// request, expected generation included. So a step whose effect LANDED while
+// its response was lost can only be resolved by repeating the identical
+// request: rebuilding it from freshly read state sends the generation the
+// committed effect produced, the journal reports a changed intent, and that
+// member can never finish the transition - not on the next tick, not after a
+// leader change, never.
+func TestALostResponseDoesNotChangeTheRetriedRequest(t *testing.T) {
+	t.Run("admit", func(t *testing.T) {
+		harness := newOperatorHarness(t)
+		harness.tick(t, 2)
+		instanceID := harness.store.order[0]
+		harness.gateway.loseResponse = map[string]bool{"admit": true}
+
+		harness.tickTolerant(20)
+
+		instance := harness.store.instances[instanceID]
+		if instance.Phase != string(trinopool.PhaseServing) {
+			t.Fatalf("phase = %s, want the admission to be resolved from the journal", instance.Phase)
+		}
+		if member := harness.gateway.members[instanceID]; member.Phase != "ACTIVE" {
+			t.Fatalf("gateway phase = %s, want the admitted member to stay ACTIVE", member.Phase)
+		}
+	})
+
+	t.Run("seal", func(t *testing.T) {
+		harness := newOperatorHarness(t)
+		harness.tick(t, 20)
+
+		instanceID := harness.store.order[0]
+		instance := harness.placeInstance(t, instanceID, trinopool.PhaseDraining, "DRAINING")
+		harness.gateway.obligations[instanceID] = trinogateway.Obligations{
+			Generation: harness.gateway.members[instanceID].Generation, Drained: true,
+		}
+		harness.gateway.loseResponse = map[string]bool{"seal": true}
+
+		harness.tickTolerant(5)
+
+		if instance.Phase != string(trinopool.PhaseSealed) && instance.Phase != string(trinopool.PhaseRetiring) {
+			t.Fatalf("phase = %s, want the seal to be resolved from the journal", instance.Phase)
+		}
+	})
 }
 
 // Losing the authority CAS means this leader has been superseded. It must stop

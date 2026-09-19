@@ -319,8 +319,15 @@ func (o *trinoPoolOperator) sealWhenDrained(ctx context.Context, instance config
 		return false, nil
 	}
 	member, err := o.gateway.SealMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
-		Step:               o.step(instance.InstanceID, "seal"),
-		ExpectedGeneration: obligations.Generation,
+		Step: o.step(instance.InstanceID, "seal"),
+		// The generation comes from the RECORD, not from the obligations read
+		// above. The Gateway hashes the whole request under the step identity,
+		// so a seal whose response was lost can only be resolved by repeating
+		// the identical request - and the obligations of a member that has
+		// already been sealed report the generation that seal produced. Sending
+		// that back would be a changed intent, and this member could never
+		// finish draining.
+		ExpectedGeneration: instance.GatewayGeneration,
 	})
 	if err != nil {
 		return true, o.dropAuthority(fmt.Errorf("seal member %s: %w", instance.InstanceID, err))

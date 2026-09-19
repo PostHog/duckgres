@@ -56,7 +56,7 @@ var phaseTransitions = map[Phase][]Phase{
 	// pool can replace it with a certain one instead. Recording a local
 	// recovery would leave this row claiming a member serves while the Gateway
 	// refuses to route to it.
-	PhaseSuspect:         {PhaseDraining, PhaseLost},
+	PhaseSuspect:        {PhaseDraining, PhaseLost},
 	PhaseLost:           {PhaseFailureRetired},
 	PhaseFailureRetired: nil,
 	// A failed candidate is cleaned up and then recorded as failure-retired.
