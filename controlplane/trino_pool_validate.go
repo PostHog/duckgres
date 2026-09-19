@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/posthog/duckgres/controlplane/provisioner"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
 )
 
@@ -97,6 +98,11 @@ type trinoPoolExpectation struct {
 	// Empty means the projection is unknown here, and nothing may be claimed on
 	// its behalf - which fails admission closed at the Gateway.
 	PolicyRevision string
+	// ProjectionDigest is the ACCEPTED projection: the authorization bundle's
+	// revision and the two authentication-file fingerprints, as one value, read
+	// from the control plane's durable record rather than from this process's
+	// memory of what it last published.
+	ProjectionDigest string
 	// PasswordRevision and GroupRevision are the fingerprints of the
 	// authentication files this control plane has projected.
 	//
@@ -253,18 +259,13 @@ func validateTrinoPoolCandidate(
 	// others - a coordinator with the newest bundle and a password file from
 	// before the tenant existed refuses that tenant's first request while
 	// looking perfectly healthy.
-	expectations := map[string]string{
-		trinoAccessControlKind:      expected.PolicyRevision,
-		trinoPasswordAuthenticator:  expected.PasswordRevision,
-		trinoGroupProviderComponent: expected.GroupRevision,
-	}
-	projectionAcknowledged := true
-	for kind, revision := range expectations {
-		if revision == "" || !reportsRevision(sync.SecurityRevisions, kind, revision) {
-			projectionAcknowledged = false
-			break
-		}
-	}
+	//
+	// The comparison is against the ACCEPTED projection - the control plane's
+	// durable record - not against whatever this process last projected. A
+	// replica's own memory says what IT published, which is exactly the thing
+	// in question when replicas disagree.
+	projectionAcknowledged := expected.ProjectionDigest != "" &&
+		reportedProjectionDigest(sync.SecurityRevisions) == expected.ProjectionDigest
 	if len(acknowledged) > 0 && len(unacknowledged) == 0 && projectionAcknowledged {
 		checks = append(checks, trinoPoolCheckAuthRevision)
 	}
@@ -292,6 +293,37 @@ const (
 	trinoPasswordAuthenticator  = "password-authenticator"
 	trinoGroupProviderComponent = "group-provider"
 )
+
+// reportedProjectionDigest names the projection a coordinator says it is
+// deciding and authenticating with, in the SAME form the control plane names
+// what it published.
+//
+// It is empty - matching nothing - unless each required component is present
+// exactly once and reported a revision. A second password authenticator reads a
+// file this control plane does not write, so it could authenticate principals
+// outside the projection; two disagreeing answers are not a projection.
+func reportedProjectionDigest(revisions []componentRevision) string {
+	reported := map[string]string{}
+	for _, revision := range revisions {
+		switch revision.Kind {
+		case trinoAccessControlKind, trinoPasswordAuthenticator, trinoGroupProviderComponent:
+		default:
+			continue
+		}
+		if revision.Error != "" || strings.TrimSpace(revision.Revision) == "" {
+			return ""
+		}
+		if existing, seen := reported[revision.Kind]; seen && existing != revision.Revision {
+			return ""
+		}
+		reported[revision.Kind] = revision.Revision
+	}
+	return provisioner.TrinoProjectionDigest(
+		reported[trinoAccessControlKind],
+		reported[trinoPasswordAuthenticator],
+		reported[trinoGroupProviderComponent],
+	)
+}
 
 // reportsRevision reports whether this kind of component is present AND every
 // instance of it acknowledged exactly this revision.

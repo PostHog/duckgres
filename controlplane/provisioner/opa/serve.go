@@ -23,6 +23,19 @@ import (
 type Bundle struct {
 	bytes []byte
 	ETag  string
+	// Revision names the PROJECTION these bytes were built from, as the
+	// control plane's durable record names it. It is empty for a cell that
+	// does not fence its projection (every legacy cell), and the handler then
+	// serves exactly as before.
+	Revision string
+}
+
+// WithRevision labels a bundle with the projection it was built from, so a
+// serving replica can be asked whether that projection is still the accepted
+// one before the bytes leave the process.
+func (b Bundle) WithRevision(revision string) Bundle {
+	b.Revision = revision
+	return b
 }
 
 // NewBundle wraps a freshly built bundle in a Bundle, computing a strong
@@ -120,6 +133,18 @@ func (s *BundleStore) Current() (Bundle, bool) {
 type Handler struct {
 	Store *BundleStore
 	Auth  func(r *http.Request) bool
+	// AcceptedRevision reports the projection the control plane's durable
+	// record currently accepts, for deployments that fence it.
+	//
+	// Every replica builds and serves this bundle from its own view of the
+	// config store, so a replica whose view is behind would otherwise keep
+	// handing coordinators authorization data that has already been replaced -
+	// including, after a warehouse is removed, a roster that still contains it.
+	// An ETag cannot prevent that: it describes the bytes, not their age.
+	//
+	// Nil means the deployment does not fence its projection (every legacy
+	// cell), and serving is unchanged.
+	AcceptedRevision func() (string, bool)
 }
 
 // NewHandler constructs a bundle Handler. Both store and auth are
@@ -212,6 +237,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// bootstrap.
 		http.Error(w, "bundle not ready", http.StatusServiceUnavailable)
 		return
+	}
+	// The gate applies to the bundle CAPTURED above and to every answer derived
+	// from it. Two details are load-bearing:
+	//
+	//   - It is checked before the 304 as well as the 200. A 304 means "keep
+	//     what you have", so answering one from a projection this replica must
+	//     not serve preserves exactly the stale authorization data the fence
+	//     exists to retire.
+	//   - Nothing re-reads the store after this point. Gating one bundle and
+	//     serving whatever the store holds a moment later would check a
+	//     different object than the one on the wire.
+	if h.AcceptedRevision != nil {
+		accepted, known := h.AcceptedRevision()
+		if !known || accepted == "" || accepted != b.Revision {
+			// This replica is not holding the accepted projection: it is behind,
+			// or ahead of what the authority has recorded. Either way the bytes
+			// stay here. OPA treats 503 as transient, keeps the bundle it already
+			// activated, and retries - which is the safe direction, because the
+			// alternative is replacing current authorization data with older.
+			http.Error(w, "bundle is not the accepted projection", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("ETag", b.ETag)

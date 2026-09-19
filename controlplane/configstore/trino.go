@@ -256,12 +256,24 @@ func (cs *ConfigStore) DisableTrino(orgID string) error {
 // filters by cell (see TrinoEnabledOrg.CellID for why the filter is not in
 // the SQL).
 func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
+	return cs.listTrinoEnabledOrgs(cs.db)
+}
+
+// listTrinoEnabledOrgs reads the projection's source rows through the given
+// handle.
+//
+// It takes a handle rather than using cs.db so a caller can read it INSIDE the
+// transaction that allocates the projection's accepted revision. That coupling
+// is the point: a revision allocated for content read at some other moment
+// describes bytes nobody can prove were current, which is exactly how a stale
+// buffer ends up stamped with a fresh number.
+func (cs *ConfigStore) listTrinoEnabledOrgs(db *gorm.DB) ([]TrinoEnabledOrg, error) {
 	var out []TrinoEnabledOrg
 	// Inner join with duckgres_org_users on (org_id, username='root') so a
 	// missing OrgUser row drops the org from the result. Inner join with
 	// duckgres_orgs for database_name, which is the org's Trino principal —
 	// a missing or blank one drops the org for the same reason.
-	err := cs.db.Table("duckgres_managed_warehouse_trino AS t").
+	err := db.Table("duckgres_managed_warehouse_trino AS t").
 		Select(`t.org_id AS org_id,
 		         o.database_name AS database_name,
 		         t.tier AS tier,
@@ -281,7 +293,7 @@ func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 	if len(out) == 0 {
 		return out, nil
 	}
-	if err := cs.attachTrinoOrgUsers(out); err != nil {
+	if err := cs.attachTrinoOrgUsers(db, out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -323,13 +335,13 @@ type trinoOrgUserRow struct {
 // project login may read. A scoped row whose scope cannot be resolved is
 // dropped rather than projected unscoped: an unresolvable scope must never
 // silently widen into org-wide access.
-func (cs *ConfigStore) attachTrinoOrgUsers(orgs []TrinoEnabledOrg) error {
+func (cs *ConfigStore) attachTrinoOrgUsers(db *gorm.DB, orgs []TrinoEnabledOrg) error {
 	ids := make([]string, 0, len(orgs))
 	for _, o := range orgs {
 		ids = append(ids, o.OrgID)
 	}
 	var rows []trinoOrgUserRow
-	err := cs.db.Table("duckgres_org_users").
+	err := db.Table("duckgres_org_users").
 		Select("org_id, username, password, access_mode, team_id").
 		Where("org_id IN ?", ids).
 		Where("disabled = ?", false).

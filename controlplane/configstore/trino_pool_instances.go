@@ -158,6 +158,113 @@ func (cs *ConfigStore) RecordTrinoPoolInstanceFields(ctx context.Context, lease 
 	})
 }
 
+// AcceptTrinoPoolProjection records the authorization projection this pool
+// currently accepts, and returns the revision it was accepted at.
+//
+// This is the ORDERING the fence needs. A digest identifies a projection but
+// cannot say which of two came first, and every control plane builds the
+// projection from its own view of the config store - so without an authority
+// assigning an order, a replica that is behind cannot tell that it is. The
+// authority holder allocates the next revision for each new digest; an
+// unchanged digest keeps its revision, so a steady-state tick is a read.
+//
+// Serving replicas compare the projection they hold against the accepted digest
+// before emitting a bundle or overwriting the auth Secret, which is what stops
+// an older projection from replacing a newer one after it is already in effect.
+// AcceptTrinoPoolProjectionWith builds the projection and accepts it in ONE
+// transaction.
+//
+// The callback receives the projection's source rows read inside that
+// transaction, under the pool's authority lock, and returns the digest of the
+// bytes it built from exactly those rows. Allocating a revision for content
+// read at any other moment would number bytes nobody can prove were current -
+// the "fresh counter on a stale buffer" that makes the whole fence decorative.
+//
+// The caller keeps the bytes it built in the callback and writes THOSE, under
+// the returned revision.
+func (cs *ConfigStore) AcceptTrinoPoolProjectionWith(
+	ctx context.Context,
+	lease TrinoPoolLease,
+	build func(orgs []TrinoEnabledOrg) (digest string, err error),
+) (int64, string, error) {
+	if build == nil {
+		return 0, "", errors.New("accepting a projection requires a builder")
+	}
+	var (
+		revision int64
+		digest   string
+	)
+	err := cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		orgs, err := cs.listTrinoEnabledOrgs(tx)
+		if err != nil {
+			return err
+		}
+		digest, err = build(orgs)
+		if err != nil {
+			return err
+		}
+		if digest == "" {
+			return errors.New("the projection builder produced no digest")
+		}
+		revision, err = acceptProjectionTx(tx, lease, digest)
+		return err
+	})
+	return revision, digest, err
+}
+
+func (cs *ConfigStore) AcceptTrinoPoolProjection(ctx context.Context, lease TrinoPoolLease, digest string) (int64, error) {
+	if digest == "" {
+		return 0, errors.New("a projection digest is required")
+	}
+	var revision int64
+	err := cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
+		var err error
+		revision, err = acceptProjectionTx(tx, lease, digest)
+		return err
+	})
+	return revision, err
+}
+
+// acceptProjectionTx records the accepted projection inside an already-fenced
+// transaction and returns the revision it is accepted at.
+func acceptProjectionTx(tx *gorm.DB, lease TrinoPoolLease, digest string) (int64, error) {
+	var revision int64
+	existing := TrinoPoolProjection{}
+	err := tx.Where("pool_id = ?", lease.PoolID).First(&existing).Error
+	switch {
+	case err == nil:
+		if existing.AcceptedDigest == digest {
+			// Already the accepted projection. Allocating a new revision for
+			// identical content would make every tick look like a change and
+			// every replica refuse to serve for a moment.
+			return existing.AcceptedRevision, nil
+		}
+		revision = existing.AcceptedRevision + 1
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		revision = 1
+	default:
+		return 0, err
+	}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "pool_id"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"authority_epoch":   lease.Epoch,
+			"accepted_revision": revision,
+			"accepted_digest":   digest,
+			"updated_at":        time.Now().UTC(),
+		}),
+	}).Create(&TrinoPoolProjection{
+		PoolID:           lease.PoolID,
+		AuthorityEpoch:   lease.Epoch,
+		AcceptedRevision: revision,
+		AcceptedDigest:   digest,
+		UpdatedAt:        time.Now().UTC(),
+	}).Error; err != nil {
+		return 0, err
+	}
+	return revision, nil
+}
+
 // AdvanceTrinoPoolProjection moves the accepted authorization-projection
 // watermark forward. It is monotonic and fenced: a stale leader cannot move it,
 // and nobody can move it backwards. Serving replicas compare their own snapshot

@@ -65,6 +65,12 @@ type trinoPoolConfigSnapshot interface {
 	// element as the data key, which is exactly the mapping a ConfigMap volume
 	// mount performs, so one declaration addresses both sources.
 	Blueprint(declaredPath string) ([]byte, error)
+	// PublisherImage is the image the deployment currently WANTS to be running,
+	// rendered by the chart from the same helper as the Deployment's own image.
+	// It comes from this same snapshot so the desired publisher and the desired
+	// pool configuration are read together. Empty when the deployment does not
+	// declare one, which fails the projection fence closed.
+	PublisherImage() string
 }
 
 // trinoPoolFileConfigReader reads the mounted documents. It is the BOOT source:
@@ -90,6 +96,12 @@ func (r trinoPoolFileConfigReader) Snapshot(context.Context) (trinoPoolConfigSna
 type trinoPoolFileSnapshot struct{ registry []byte }
 
 func (s trinoPoolFileSnapshot) Registry() []byte { return s.registry }
+
+// PublisherImage is empty for the mounted files: they are the BOOT source, and
+// nothing is published from them. An empty value fails the projection fence
+// closed, which is the correct answer for a source that cannot establish who
+// the desired publisher is.
+func (trinoPoolFileSnapshot) PublisherImage() string { return "" }
 
 func (trinoPoolFileSnapshot) Blueprint(declaredPath string) ([]byte, error) {
 	info, err := os.Stat(declaredPath)
@@ -165,6 +177,13 @@ type trinoPoolAPISnapshot struct {
 }
 
 func (s trinoPoolAPISnapshot) Registry() []byte { return s.registry }
+
+// PublisherImage comes from the SAME read as the registry and the blueprint, so
+// the desired publisher cannot be paired with a different snapshot of the
+// desired configuration.
+func (s trinoPoolAPISnapshot) PublisherImage() string {
+	return strings.TrimSpace(string(s.data[trinoPoolPublisherImageKey]))
+}
 
 func (s trinoPoolAPISnapshot) Blueprint(declaredPath string) ([]byte, error) {
 	// A ConfigMap volume mounts each key as a file of that name, so the key is

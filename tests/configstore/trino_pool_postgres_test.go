@@ -623,3 +623,55 @@ func TestPublicationFailureRecordsADurableWait(t *testing.T) {
 		t.Fatalf("publication = %+v, want the backoff cleared after a step that worked", publication)
 	}
 }
+
+// The projection fence needs an ORDER, not just a fingerprint: every control
+// plane builds the projection from its own view, so a replica that is behind
+// cannot tell that it is from a digest alone. The authority assigns it.
+func TestAcceptedProjectionIsOrderedAndStableForUnchangedContent(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	first, err := store.AcceptTrinoPoolProjection(ctx, lease, "digest-1")
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	same, err := store.AcceptTrinoPoolProjection(ctx, lease, "digest-1")
+	if err != nil {
+		t.Fatalf("re-accept: %v", err)
+	}
+	if first != 1 || same != first {
+		t.Fatalf("revisions = %d then %d, want an unchanged projection to keep its revision", first, same)
+	}
+	next, err := store.AcceptTrinoPoolProjection(ctx, lease, "digest-2")
+	if err != nil {
+		t.Fatalf("accept a changed projection: %v", err)
+	}
+	if next != first+1 {
+		t.Fatalf("revision = %d, want %d", next, first+1)
+	}
+
+	projection, err := store.GetTrinoPoolProjection(ctx, poolID)
+	if err != nil {
+		t.Fatalf("read projection: %v", err)
+	}
+	if projection.AcceptedDigest != "digest-2" || projection.AcceptedRevision != next {
+		t.Fatalf("projection = %+v, want the accepted digest at revision %d", projection, next)
+	}
+
+	// A superseded leader cannot move it - which is the case that matters: a
+	// delayed write from the previous authority must not reinstate an older
+	// projection after a newer one is in effect.
+	stale := lease
+	stale.Epoch--
+	if _, err := store.AcceptTrinoPoolProjection(ctx, stale, "digest-old"); !errors.Is(err, cpconfigstore.ErrTrinoPoolConflict) {
+		t.Fatalf("stale leader error = %v, want ErrTrinoPoolConflict", err)
+	}
+	projection, err = store.GetTrinoPoolProjection(ctx, poolID)
+	if err != nil {
+		t.Fatalf("re-read projection: %v", err)
+	}
+	if projection.AcceptedDigest != "digest-2" {
+		t.Fatalf("a superseded leader changed the accepted projection: %+v", projection)
+	}
+}

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/posthog/duckgres/controlplane/provisioner"
 )
 
 type fakeCoordinator struct {
@@ -84,8 +86,10 @@ func (c *fakeCoordinator) validate(t *testing.T, observedWorkers int, requiredRe
 		CoordinatorImage: fakeCoordinatorImage, WorkerImage: fakeCoordinatorImage,
 	}, trinoPoolExpectation{
 		Image: fakeCoordinatorImage, CatalogRevision: requiredRevision,
-		PolicyRevision: fakePolicyRevision, PasswordRevision: fakePasswordRevision,
-		GroupRevision: fakeGroupRevision, InternalHTTP: false,
+		// The ACCEPTED projection, as the durable record names it.
+		ProjectionDigest: provisioner.TrinoProjectionDigest(
+			fakePolicyRevision, fakePasswordRevision, fakeGroupRevision),
+		InternalHTTP: false,
 	})
 }
 

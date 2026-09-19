@@ -58,6 +58,12 @@ type trinoPoolConfig struct {
 	Spec         configstore.TrinoPoolSpec
 	Blueprint    *trinopool.Blueprint
 	Pool         trinoRegisteredPool
+	// PublisherImage is the image this deployment currently wants its control
+	// planes to run, read from the same snapshot as everything else here. Only
+	// a process running exactly it may advance the pool's authorization
+	// projection - an older binary would otherwise publish its own older rules
+	// under a newer revision.
+	PublisherImage string
 
 	// Frozen marks a pool whose desired configuration could not be resolved.
 	// Reconciliation then holds the last-good state: no creates, no drains, no
@@ -196,6 +202,10 @@ func resolveTrinoPoolConfig(snapshot trinoPoolConfigSnapshot, cell trinoRegister
 		RoutingGroup: cell.RoutingGroup,
 		Namespace:    cell.Namespace,
 		Pool:         *pool,
+		// Read from the SAME snapshot as the registry and the blueprint, so the
+		// desired publisher and the desired configuration cannot be paired
+		// across an update.
+		PublisherImage: snapshot.PublisherImage(),
 		Spec: configstore.TrinoPoolSpec{
 			PoolID:           registeredTrinoCellPrefix + cell.ID,
 			PublicID:         cell.ID,

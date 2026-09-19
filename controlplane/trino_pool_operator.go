@@ -94,8 +94,14 @@ type trinoPoolOperator struct {
 	identity trinoPoolIdentityProbe
 	// projection reports what this control plane currently serves: the
 	// authorization bundle's revision and the fingerprints of the projected
-	// password and group files. A candidate must be deciding with all three.
+	// password and group files. It is what a member is compared against when
+	// its acknowledgement is recorded.
 	projection func() trinoPoolProjectionRevisions
+	// acceptedProjection reports the projection the pool's DURABLE record
+	// accepts. Candidate admission compares against this rather than against
+	// what this process last published, because a replica's own memory is
+	// exactly the thing in question when replicas disagree.
+	acceptedProjection func() string
 	// resolveConfig re-reads this pool's desired configuration from the
 	// authoritative source. It runs on every tick, immediately before the
 	// desired state is published, so a process that has been idle since boot
