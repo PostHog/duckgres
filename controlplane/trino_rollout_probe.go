@@ -116,12 +116,33 @@ type rolloutSQLClient struct {
 	baseURL            string
 	client             *http.Client
 	username, password string
+	// internalHTTP marks a pooled coordinator reached directly on its
+	// in-cluster Service over plain HTTP. TLS terminates at the Gateway, and
+	// the coordinator runs with http-server.process-forwarded=true, so an
+	// authenticated request has to carry the forwarded-HTTPS metadata the
+	// Gateway would supply. Authentication is NOT relaxed anywhere: without
+	// these headers Trino refuses the credential rather than accepting it in
+	// the clear. The legacy fixed-cell path leaves this false and keeps its
+	// HTTPS-only checks byte for byte.
+	internalHTTP bool
+}
+
+// forwardedScheme is what a coordinator behind a TLS-terminating proxy must be
+// told about the original request. It is a statement about the Gateway hop,
+// not a way to bypass the coordinator's own authentication.
+const forwardedScheme = "https"
+
+func (c rolloutSQLClient) scheme() string {
+	if c.internalHTTP {
+		return "http"
+	}
+	return "https"
 }
 
 func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string) ([]byte, error) {
 	base, baseErr := url.Parse(c.baseURL)
 	parsed, err := url.Parse(endpoint)
-	if baseErr != nil || err != nil || parsed.Scheme != "https" || parsed.Scheme != base.Scheme || !strings.EqualFold(parsed.Hostname(), base.Hostname()) || rolloutHTTPSPort(parsed) != rolloutHTTPSPort(base) || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "/v1/statement" && !strings.HasPrefix(parsed.Path, "/v1/statement/") && parsed.Path != "/v1/info") {
+	if baseErr != nil || err != nil || parsed.Scheme != c.scheme() || parsed.Scheme != base.Scheme || !strings.EqualFold(parsed.Hostname(), base.Hostname()) || rolloutHTTPSPort(parsed) != rolloutHTTPSPort(base) || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "/v1/statement" && !strings.HasPrefix(parsed.Path, "/v1/statement/") && parsed.Path != "/v1/info") {
 		return nil, errors.New("invalid coordinator response endpoint")
 	}
 	if c.username == "" || c.password == "" {
@@ -135,6 +156,14 @@ func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string
 	req.Header.Set("X-Trino-User", c.username)
 	req.Header.Set("X-Trino-Source", "rollout-readiness")
 	req.Header.Set("Content-Type", "text/plain")
+	if c.internalHTTP {
+		// Declare the Gateway's terminated TLS. A coordinator with
+		// process-forwarded=true reads these; without them it rejects an
+		// authenticated request over plain HTTP, which is the behavior we
+		// want to keep rather than disable.
+		req.Header.Set("X-Forwarded-Proto", forwardedScheme)
+		req.Header.Set("X-Forwarded-Port", "443")
+	}
 	response, err := c.client.Do(req)
 	if err != nil {
 		return nil, errors.New("coordinator request failed")
@@ -153,6 +182,9 @@ func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string
 func rolloutHTTPSPort(endpoint *url.URL) string {
 	if port := endpoint.Port(); port != "" {
 		return port
+	}
+	if endpoint.Scheme == "http" {
+		return "80"
 	}
 	return "443"
 }

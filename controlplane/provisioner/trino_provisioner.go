@@ -4,8 +4,10 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -227,6 +230,17 @@ func projectableTrinoUsername(username string) bool {
 	return len(username) <= 255 && trinoUsernamePattern.MatchString(username)
 }
 
+// ProjectableTrinoUsername reports whether a username reaches the coordinator's
+// password file at all.
+//
+// It is exported because the pooled admission binding must publish EXACTLY the
+// principals password.db contains: a username this refuses never authenticates,
+// so binding it would advertise a principal Trino rejects, and deriving the two
+// sets from different code is how they drift apart.
+func ProjectableTrinoUsername(username string) bool {
+	return projectableTrinoUsername(username)
+}
+
 // TrinoScopeGroupName returns the group label for a project-scoped login:
 // one group per (org, team), carrying that team's schema scope in the OPA
 // bundle.
@@ -250,6 +264,31 @@ func TrinoScopeGroupName(principal string, teamID int64) string {
 func TrinoResourceGroupName(principal string) string {
 	return "root.tenants." + trinoSanitize(principal)
 }
+
+// ErrTrinoCatalogNotThisReplica marks a catalog client that cannot answer on
+// THIS control plane, as opposed to one that failed.
+//
+// A shared-pool cell publishes catalogs through a fence that only the replica
+// holding the pool authority owns. The provisioning controller runs on every
+// replica, so on all the others every catalog call must refuse - but that
+// refusal is not a statement about the warehouse. Attributing it per org marked
+// every pooled tenant Failed every tick and flapped ready_at/failed_at on rows
+// that were serving perfectly. A reconcile that hits this leaves the Trino
+// state rows untouched instead.
+var ErrTrinoCatalogNotThisReplica = errors.New("this control plane does not own the catalog write path")
+
+// ErrTrinoNodeInventoryUnavailable marks a catalog client that cannot answer
+// "which nodes are in this cluster" because there is no ONE cluster to ask.
+//
+// A pooled cell publishes catalogs to the shared store and its compute is a set
+// of instances that come and go, so the legacy readiness probe - which asks a
+// fixed coordinator for its node inventory and then checks every tenant's
+// mounted credential on those nodes - has no coordinator to address. Its
+// evidence comes from the pool instead: every member proves it applied the
+// catalog and the projections before it is admitted, and (with the Gateway's
+// admission restriction on) a tenant is only queryable once every serving
+// member has acknowledged it.
+var ErrTrinoNodeInventoryUnavailable = errors.New("this catalog client has no single coordinator to read a node inventory from")
 
 // TrinoCatalogClient is the REST surface the provisioner needs against
 // the customer Trino cluster: enumerate, create, alter, drop catalogs.
@@ -444,29 +483,44 @@ type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingSta
 // fires on first install; thereafter ensureClusterSecrets adopts the
 // existing K8s Secrets.
 type TrinoProvisioner struct {
-	managed                 *TrinoManagedCatalogOpts
-	store                   TrinoStore
-	bootstrapSentinel       TrinoBootstrapSentinelStore
-	warehouses              TrinoWarehouseStore
-	ducklings               TrinoDucklingResolver
-	hoglakeDucklings        TrinoDucklingResolver
-	kubernetes              kubernetes.Interface
-	secretReadiness         TrinoSecretReadiness
-	authReadiness           TrinoAuthenticationReadiness
-	namespace               string
-	cellID                  string
-	explicitAssignmentOnly  bool
-	catalog                 TrinoCatalogClient
+	managed                *TrinoManagedCatalogOpts
+	store                  TrinoStore
+	bootstrapSentinel      TrinoBootstrapSentinelStore
+	warehouses             TrinoWarehouseStore
+	ducklings              TrinoDucklingResolver
+	hoglakeDucklings       TrinoDucklingResolver
+	kubernetes             kubernetes.Interface
+	secretReadiness        TrinoSecretReadiness
+	authReadiness          TrinoAuthenticationReadiness
+	namespace              string
+	cellID                 string
+	explicitAssignmentOnly bool
+	catalog                TrinoCatalogClient
+	// tenantAdmission reports whether a tenant's publication has committed on
+	// the pool that serves it. Nil everywhere except a shared-pool cell with the
+	// Gateway's admission restriction enabled.
+	tenantAdmission         TenantAdmissionGate
 	additionalCatalogs      []TrinoCatalogClient
 	catalogTimeout          time.Duration
 	existingInternalSecrets []string
 	bundleStore             *opa.BundleStore
 	bundleBuilder           opa.BundleBuilder
-	tenantSecretMountPath   string
-	awsRegion               string
-	s3MaxConnections        int
-	filesystemCacheEnabled  bool
-	managedHoglake          *TrinoManagedHoglakeConfig
+	// policyRevision is the revision of the authorization projection currently
+	// served. It is read from the pool operator's validation goroutine while
+	// the reconcile loop writes it, so it is atomic rather than a plain field.
+	policyRevision atomic.Pointer[string]
+	// authRevisions are the fingerprints of the projected password and group
+	// files, read from the same goroutine and for the same reason.
+	authRevisions atomic.Pointer[trinoAuthRevisions]
+	// projectionFence builds and accepts the projection in one transaction,
+	// returning the revision that acceptance allocated. Nil for every cell that
+	// does not fence its projection, where these writes are unchanged.
+	projectionFence        TrinoProjectionFence
+	tenantSecretMountPath  string
+	awsRegion              string
+	s3MaxConnections       int
+	filesystemCacheEnabled bool
+	managedHoglake         *TrinoManagedHoglakeConfig
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -618,6 +672,74 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 // startup logging and tests.
 func (p *TrinoProvisioner) CellID() string { return p.cellID }
 
+// SetCatalogClient replaces the catalog write path at runtime.
+//
+// A shared-pool cell has no fixed coordinator to issue CREATE CATALOG against,
+// so its catalogs are published directly to the shared store. The publisher can
+// only be built once a control plane holds the pool authority, which happens
+// after startup - hence a setter rather than a constructor argument. Everything
+// else about the reconcile loop is unchanged.
+func (p *TrinoProvisioner) SetCatalogClient(catalog TrinoCatalogClient) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.catalog = catalog
+}
+
+// TenantAdmissionGate answers whether a tenant is ADMITTED on the pool that
+// serves it - that is, whether its publication barrier has committed, so the
+// Gateway will actually dispatch its queries. The string is the operator-facing
+// reason when it is not.
+type TenantAdmissionGate func(orgID string) (admitted bool, reason string)
+
+// SetTenantAdmissionGate installs that check. It is set only for a shared-pool
+// cell that has the Gateway's admission restriction enabled; everywhere else it
+// stays nil and nothing changes.
+func (p *TrinoProvisioner) SetTenantAdmissionGate(gate TenantAdmissionGate) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.tenantAdmission = gate
+}
+
+func (p *TrinoProvisioner) tenantAdmissionGate() TenantAdmissionGate {
+	p.credMu.RLock()
+	defer p.credMu.RUnlock()
+	return p.tenantAdmission
+}
+
+// applyTenantAdmissionGate holds a warehouse at Provisioning until its tenant is
+// actually admitted.
+//
+// With the Gateway's admission restriction on, a catalog that exists and a
+// coordinator that is healthy are NOT enough: the Gateway refuses to dispatch
+// work for a tenant whose publication has not committed, so reporting Ready
+// would tell an operator - and PostHog - that a warehouse is queryable when
+// every query it receives is refused.
+func (p *TrinoProvisioner) applyTenantAdmissionGate(outcomes map[string]catalogOutcome) {
+	gate := p.tenantAdmissionGate()
+	if gate == nil {
+		return
+	}
+	for orgID, outcome := range outcomes {
+		if outcome.Err != nil || outcome.Pending {
+			continue
+		}
+		if admitted, reason := gate(orgID); !admitted {
+			if reason == "" {
+				reason = "waiting for the pool to admit this warehouse"
+			}
+			outcomes[orgID] = catalogOutcome{Pending: true, PendingReason: reason}
+		}
+	}
+}
+
+// catalogClient reads the current write path under the same lock the setter
+// takes, so a reconcile tick cannot observe a half-installed client.
+func (p *TrinoProvisioner) catalogClient() TrinoCatalogClient {
+	p.credMu.RLock()
+	defer p.credMu.RUnlock()
+	return p.catalog
+}
+
 // Reconcile runs one full projection: cluster secrets → auth files →
 // resource groups → OPA bundle → tenant passwords → catalogs. Errors in
 // any one output are logged and surfaced but the next output still runs —
@@ -689,12 +811,27 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	projectable, collisions := rejectPrincipalCollisions(orgs)
 
 	var errs []error
+	// fencedProjection records that the authorization and authentication
+	// projections were handled together under the projection fence, so the
+	// separate OPA-bundle step does not rebuild them from a different read.
+	fencedProjection := false
 
 	// 1. Auth file projection (K8s Secret). Atomic Secret update.
 	//    Runs BEFORE catalogs so the admin lines exist in password.db
 	//    + group.db when the catalog client's first request reaches
 	//    the coordinator on a cold-start tick.
-	authErr := p.reconcileAuthSecret(ctx, projectable)
+	//    A FENCED cell (a pooled one) does this differently: the authorization
+	//    and authentication projections are built from rows read inside the
+	//    transaction that accepts them, and written under the revision that
+	//    transaction allocated - so a replica can never stamp bytes it built
+	//    from some earlier view with a number it read later. It also covers
+	//    step 3 below, because the two projections are accepted together.
+	authErr := p.reconcileFencedProjection(ctx, projectable)
+	if authErr == errTrinoProjectionNotFenced {
+		authErr = p.reconcileAuthSecret(ctx, projectable)
+	} else {
+		fencedProjection = true
+	}
 	if authErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile auth secret: %w", authErr))
 	}
@@ -712,9 +849,12 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	//    the in-memory store the bundle HTTP handler serves. Pre-
 	//    catalog so the OPA sidecar's authorization decisions for the
 	//    catalog reconcile's own queries see the up-to-date roster.
-	opaErr := p.reconcileOPABundle(ctx, projectable)
-	if opaErr != nil {
-		errs = append(errs, fmt.Errorf("reconcile opa bundle: %w", opaErr))
+	var opaErr error
+	if !fencedProjection {
+		opaErr = p.reconcileOPABundle(ctx, projectable)
+		if opaErr != nil {
+			errs = append(errs, fmt.Errorf("reconcile opa bundle: %w", opaErr))
+		}
 	}
 
 	// 4. Tenant metadata-store passwords (K8s Secret). One key per
@@ -775,6 +915,14 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 			catalogOutcomes, catErr = p.reconcileCatalogs(ctx, projectable, tenants)
 		}
 		if catErr != nil {
+			if errors.Is(catErr, ErrTrinoCatalogNotThisReplica) {
+				// Not this replica's work. Nothing failed, nothing is reported,
+				// and above all nothing is written: the owning replica keeps the
+				// state rows current.
+				slog.Debug("trino reconcile: catalog step belongs to another control plane",
+					"reason", catErr)
+				return errors.Join(errs...)
+			}
 			errs = append(errs, fmt.Errorf("reconcile catalogs: %w", catErr))
 		}
 	} else {
@@ -787,6 +935,12 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	// since each is a single K8s API write — wrap them once. Per-org
 	// variance lives at the catalog step, which folds in the per-org
 	// tenant-password outcomes.
+	// A tenant the pool has not admitted is not queryable, whatever its catalog
+	// says. This runs before the state writes so such a warehouse reads as
+	// Provisioning rather than Ready.
+	if catalogOutcomes != nil {
+		p.applyTenantAdmissionGate(catalogOutcomes)
+	}
 	if len(collisions) > 0 {
 		if catalogOutcomes == nil {
 			catalogOutcomes = make(map[string]catalogOutcome, len(collisions))
@@ -1115,7 +1269,7 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 	p.setObserverCredential(observerPlaintext, observerHash)
 	// Push the admin plaintext into the catalog client if it supports
 	// runtime credential updates (test fakes don't).
-	if updater, ok := p.catalog.(TrinoCatalogCredentialUpdater); ok {
+	if updater, ok := p.catalogClient().(TrinoCatalogCredentialUpdater); ok {
 		updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
 	}
 	for _, catalog := range p.additionalCatalogs {
@@ -1631,7 +1785,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	orgs []configstore.TrinoEnabledOrg,
 	tenants tenantSecretProjection,
 ) (map[string]catalogOutcome, error) {
-	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalog, "primary")
+	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalogClient(), "primary")
 	errs := []error{firstErr}
 	for i, catalog := range p.additionalCatalogs {
 		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog, fmt.Sprintf("additional-%d", i))
@@ -1665,6 +1819,16 @@ func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []c
 	}
 
 	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected, backend)
+	if errors.Is(readinessErr, ErrTrinoNodeInventoryUnavailable) {
+		// A pooled cell has no single coordinator to take an inventory from, and
+		// inventing one would be worse than skipping: its readiness evidence is
+		// the pool's own admission, where each member proves it applied the
+		// catalog and the projections. Failing every tenant on a probe that
+		// cannot apply to them would mark the whole pool broken.
+		slog.Debug("trino reconcile: skipping the fixed-coordinator readiness probe for a pooled cell",
+			"reason", readinessErr)
+		return outcomes, catalogErr
+	}
 	for org := range expected {
 		if readinessErr != nil {
 			outcomes[org] = catalogOutcome{Err: readinessErr}
@@ -2127,6 +2291,9 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 		AdminPasswordHash:    p.adminPasswordHash,
 		ObserverPasswordHash: p.observerHash(),
 	})
+	// The unfenced path, unchanged: no projection revision is stamped and the
+	// write is the ordinary merge. A fenced cell does not come through here at
+	// all - see reconcileFencedProjection.
 	files := map[string][]byte{
 		TrinoAuthSecretKeyPasswordDB: []byte(passwordDB),
 		TrinoAuthSecretKeyGroupDB:    []byte(groupDB),
@@ -2137,7 +2304,217 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 	// Update even when no tenant catalogs remain: disabling must invalidate
 	// any previous authentication observation before a later re-enable.
 	p.authReadiness.SetExpected(files)
+	// The fingerprints of the bytes just projected. A pooled candidate must
+	// report loading exactly these before it may be admitted: its OPA bundle
+	// and its password file arrive by different paths and at different times,
+	// so a coordinator can be current on authorization data while its password
+	// store still predates the tenant that is about to be admitted - it would
+	// pass an authorization-only check and then reject that tenant's first
+	// request.
+	p.authRevisions.Store(&trinoAuthRevisions{
+		Password: TrinoFileFingerprint([]byte(passwordDB)),
+		Group:    TrinoFileFingerprint([]byte(groupDB)),
+	})
 	return nil
+}
+
+// trinoAuthRevisions are the fingerprints of the projected authentication
+// files, held together so a reader can never pair one file's fingerprint with
+// the other's projection.
+type trinoAuthRevisions struct {
+	Password string
+	Group    string
+}
+
+// TrinoFileFingerprint computes what Trino's file password authenticator and
+// file group provider report as their loaded revision.
+//
+// This is their PUBLISHED contract - `sha256:` followed by the lower-case
+// hexadecimal SHA-256 of the file's bytes - so a controller that wrote the file
+// can compute the value it expects to see acknowledged without asking a
+// coordinator what its revision means.
+func TrinoFileFingerprint(content []byte) string {
+	digest := sha256.Sum256(content)
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+// errTrinoProjectionNotFenced means this cell does not fence its projection -
+// every legacy cell - so the caller runs the ordinary projection steps.
+var errTrinoProjectionNotFenced = errors.New("this cell does not fence its projection")
+
+// trinoProjection is one coherent set of projected bytes: the authentication
+// files and the authorization bundle built from ONE read of the source rows,
+// together with the digest that identifies them.
+type trinoProjection struct {
+	passwordDB     string
+	groupDB        string
+	bundle         []byte
+	policyRevision string
+	digest         string
+}
+
+// reconcileFencedProjection builds and publishes the projection under the
+// control plane's durable projection fence.
+//
+// Two properties the unfenced path does not have:
+//
+//   - the bytes and the revision describe the SAME read. The source rows are
+//     read inside the transaction that allocates the revision, and the bytes
+//     written afterwards are the ones built from those rows - not a buffer
+//     computed earlier and stamped with a number read later.
+//   - only the process the deployment currently wants may advance it. An older
+//     control plane that wins the lease publishes its own older policy rules,
+//     and a counter cannot notice that: it orders acceptances, not rule sets.
+//
+// When the fence refuses - this replica is not the desired publisher, or the
+// projection has moved on - nothing is written and nothing is served. The
+// coordinators keep the authorization data they already have.
+func (p *TrinoProvisioner) reconcileFencedProjection(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
+	p.credMu.RLock()
+	fence := p.projectionFence
+	p.credMu.RUnlock()
+	if fence == nil {
+		return errTrinoProjectionNotFenced
+	}
+
+	var built trinoProjection
+	revision, err := fence.Accept(ctx, func(sourceOrgs []configstore.TrinoEnabledOrg) (string, error) {
+		projectable, _ := rejectPrincipalCollisions(sourceOrgs)
+		projection, buildErr := p.buildProjection(projectable)
+		if buildErr != nil {
+			return "", buildErr
+		}
+		built = projection
+		return projection.digest, nil
+	})
+	switch {
+	case err == nil:
+		// This replica advanced the projection, and `built` is the projection
+		// the accepted revision was allocated for - same read, same bytes.
+	case errors.Is(err, ErrTrinoProjectionNotAdvanceable):
+		// Every replica but one is here at any moment. It still BUILDS and
+		// SERVES the projection - refusing to would leave the coordinators that
+		// poll this replica on their last-good bundle forever - but it publishes
+		// nothing the record has not accepted.
+		built, err = p.buildProjection(orgs)
+		if err != nil {
+			return err
+		}
+		accepted, acceptedRevision, ok := fence.Accepted(ctx)
+		if !ok {
+			// The record cannot be read, so nothing can be said about what this
+			// replica holds. It keeps serving what it has; the gate on the
+			// bundle endpoint makes the same call independently.
+			p.publishProjectionLocally(built)
+			return nil
+		}
+		if accepted != built.digest {
+			// Behind, or ahead of what has been accepted. Serve nothing new and
+			// touch no Secret: the gate will refuse these bytes anyway, and
+			// writing them would be the regression the fence exists to prevent.
+			p.publishProjectionLocally(built)
+			return nil
+		}
+		revision = acceptedRevision
+	default:
+		return fmt.Errorf("accept the authorization projection: %w", err)
+	}
+	if built.digest == "" {
+		return errors.New("the projection fence accepted nothing to publish")
+	}
+
+	if err := p.upsertSecretMerge(ctx, TrinoAuthSecretName, map[string][]byte{
+		TrinoAuthSecretKeyPasswordDB: []byte(built.passwordDB),
+		TrinoAuthSecretKeyGroupDB:    []byte(built.groupDB),
+	}, revision); err != nil {
+		return err
+	}
+	p.publishProjectionLocally(built)
+	return nil
+}
+
+// publishProjectionLocally records what this process is serving. It does not
+// decide whether those bytes may leave the process - the accepted record does,
+// through the bundle handler's gate.
+func (p *TrinoProvisioner) publishProjectionLocally(built trinoProjection) {
+	p.authRevisions.Store(&trinoAuthRevisions{
+		Password: TrinoFileFingerprint([]byte(built.passwordDB)),
+		Group:    TrinoFileFingerprint([]byte(built.groupDB)),
+	})
+	policyRevision := built.policyRevision
+	p.policyRevision.Store(&policyRevision)
+	p.bundleStore.Set(opa.NewBundle(built.bundle).WithRevision(built.digest))
+}
+
+// buildProjection renders both projections from ONE set of source rows and
+// fingerprints exactly the bytes it produced.
+func (p *TrinoProvisioner) buildProjection(orgs []configstore.TrinoEnabledOrg) (trinoProjection, error) {
+	passwordDB, groupDB := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{
+		AdminPasswordHash:    p.adminPasswordHash,
+		ObserverPasswordHash: p.observerHash(),
+	})
+	gc, gs := p.authorizationDocuments(orgs)
+	bundle, err := p.bundleBuilder.BuildBundle(gc, gs)
+	if err != nil {
+		return trinoProjection{}, fmt.Errorf("build opa bundle: %w", err)
+	}
+	policyRevision, err := opa.PolicyRevision(gc, gs)
+	if err != nil {
+		return trinoProjection{}, fmt.Errorf("compute opa policy revision: %w", err)
+	}
+	projection := trinoProjection{
+		passwordDB: passwordDB, groupDB: groupDB, bundle: bundle, policyRevision: policyRevision,
+	}
+	// The digest fingerprints the bytes this call produced, not whatever the
+	// provisioner happens to hold later: that is what makes the revision the
+	// store allocates describe THESE bytes.
+	projection.digest = TrinoProjectionDigest(policyRevision,
+		TrinoFileFingerprint([]byte(passwordDB)), TrinoFileFingerprint([]byte(groupDB)))
+	return projection, nil
+}
+
+// TrinoProjectionDigest names one coherent projection: the authorization
+// bundle's revision and the fingerprints of the two authentication files.
+//
+// Exported because it is the SAME function on both sides of the fence: the
+// control plane digests what it published, and a candidate's admission digests
+// what that coordinator reports having loaded. Two implementations of this
+// would be two definitions of "the same projection".
+func TrinoProjectionDigest(policyRevision, passwordFingerprint, groupFingerprint string) string {
+	if policyRevision == "" || passwordFingerprint == "" || groupFingerprint == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(strings.Join(
+		[]string{policyRevision, passwordFingerprint, groupFingerprint}, "\x00")))
+	return hex.EncodeToString(digest[:])
+}
+
+// ProjectionDigest names the authorization and authentication data this
+// control plane has projected, as one value: the OPA bundle's revision and the
+// fingerprints of the password and group files.
+//
+// It is what the durable projection fence is keyed on. It is empty until all
+// three have been produced, which is the honest answer for a replica that has
+// not finished a projection yet - and an empty digest matches no accepted
+// projection, so such a replica serves nothing.
+func (p *TrinoProvisioner) ProjectionDigest() string {
+	password, group := p.PublishedAuthRevisions()
+	policy := p.PublishedPolicyRevision()
+	if policy == "" || password == "" || group == "" {
+		return ""
+	}
+	return TrinoProjectionDigest(policy, password, group)
+}
+
+// PublishedAuthRevisions reports the fingerprints of the authentication files
+// this control plane has projected, or ("", "") before the first projection.
+// Empty means nothing may be claimed on their behalf, which fails a pooled
+// admission closed.
+func (p *TrinoProvisioner) PublishedAuthRevisions() (password, group string) {
+	if revisions := p.authRevisions.Load(); revisions != nil {
+		return revisions.Password, revisions.Group
+	}
+	return "", ""
 }
 
 // TrinoClusterPrincipals carries the bcrypt hashes for the cell's two
@@ -2640,6 +3017,34 @@ func BuildTrinoResourceGroups() ([]byte, error) {
 // in-memory), but kept on the signature for parity with the other
 // reconcile* steps and to permit instrumented builders later.
 func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configstore.TrinoEnabledOrg) error {
+	gc, gs := p.authorizationDocuments(orgs)
+	bundle, err := p.bundleBuilder.BuildBundle(gc, gs)
+	if err != nil {
+		return fmt.Errorf("build opa bundle: %w", err)
+	}
+	// The revision of the projection now being served. A pooled candidate is
+	// only certified once its OPA reports deciding with THIS value: a
+	// structurally healthy coordinator whose policy engine still serves the
+	// previous projection would authorize against a tenant set that no longer
+	// exists. It is recorded before the bundle is published, so the value a
+	// reader sees is never newer than what is on the wire.
+	revision, err := opa.PolicyRevision(gc, gs)
+	if err != nil {
+		return fmt.Errorf("compute opa policy revision: %w", err)
+	}
+	p.policyRevision.Store(&revision)
+	// The bundle carries the PROJECTION it was built from, so a replica can be
+	// asked whether that projection is still the accepted one before these
+	// bytes leave the process. Empty for a cell that does not fence its
+	// projection, where the handler serves exactly as before.
+	p.bundleStore.Set(opa.NewBundle(bundle).WithRevision(p.ProjectionDigest()))
+	return nil
+}
+
+// authorizationDocuments renders the bundle's data documents from one set of
+// source rows. Shared by the fenced and unfenced paths so the two can never
+// authorize differently for the same input.
+func (p *TrinoProvisioner) authorizationDocuments(orgs []configstore.TrinoEnabledOrg) (opa.GroupCatalogs, opa.GroupScopes) {
 	gc := make(opa.GroupCatalogs, len(orgs)+1)
 	gs := opa.GroupScopes{}
 	adminCatalogs := make(map[string]bool, len(orgs))
@@ -2671,12 +3076,18 @@ func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configst
 		// docstring).
 		gc[opa.AdminGroup] = adminCatalogs
 	}
-	bundle, err := p.bundleBuilder.BuildBundle(gc, gs)
-	if err != nil {
-		return fmt.Errorf("build opa bundle: %w", err)
+	return gc, gs
+}
+
+// PublishedPolicyRevision is the authorization-data revision this control plane
+// currently serves, or "" before the first projection. It is the value a
+// candidate's OPA must report before the auth-revision check may be claimed;
+// empty means nothing may claim it, which fails admission closed.
+func (p *TrinoProvisioner) PublishedPolicyRevision() string {
+	if revision := p.policyRevision.Load(); revision != nil {
+		return *revision
 	}
-	p.bundleStore.Set(opa.NewBundle(bundle))
-	return nil
+	return ""
 }
 
 // upsertSecretMerge is the partial-owner Secret writer: it
@@ -2689,7 +3100,13 @@ func (p *TrinoProvisioner) reconcileOPABundle(_ context.Context, orgs []configst
 // Deterministic projections retry on the next reconcile tick.
 // Credential establishment uses ensureCredentialPair's conditional snapshot
 // update instead: this helper must not overwrite a concurrent credential winner.
-func (p *TrinoProvisioner) upsertSecretMerge(ctx context.Context, name string, data map[string][]byte) error {
+// projectionRevisions is the optional fence: `revision` is the accepted
+// projection this write belongs to (0 = the deployment does not fence).
+func (p *TrinoProvisioner) upsertSecretMerge(ctx context.Context, name string, data map[string][]byte, projectionRevision ...int64) error {
+	var revision int64
+	if len(projectionRevision) != 0 {
+		revision = projectionRevision[0]
+	}
 	secrets := p.kubernetes.CoreV1().Secrets(p.namespace)
 	existing, err := secrets.Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
@@ -2705,6 +3122,7 @@ func (p *TrinoProvisioner) upsertSecretMerge(ctx context.Context, name string, d
 					"app":              "trino",
 					"duckgres/managed": "true",
 				},
+				Annotations: projectionAnnotations(revision),
 			},
 			Type: corev1.SecretTypeOpaque,
 			Data: data,
@@ -2719,6 +3137,18 @@ func (p *TrinoProvisioner) upsertSecretMerge(ctx context.Context, name string, d
 				return fmt.Errorf("get secret %s after create race: %w", name, err)
 			}
 		} else {
+			return nil
+		}
+	}
+
+	// A fenced write never moves the projection backwards. The stamp on the
+	// object is what a replica compares against: a delayed write from a replica
+	// whose view is older must not land after a newer one, which is exactly how
+	// a removed warehouse's logins come back.
+	if revision > 0 {
+		if written := projectionRevisionOf(existing); written > revision {
+			slog.Debug("trino reconcile: not overwriting a newer projection",
+				"secret", name, "written", written, "holding", revision)
 			return nil
 		}
 	}
@@ -2738,11 +3168,79 @@ func (p *TrinoProvisioner) upsertSecretMerge(ctx context.Context, name string, d
 	}
 	existing.Labels["app"] = "trino"
 	existing.Labels["duckgres/managed"] = "true"
+	if revision > 0 {
+		if existing.Annotations == nil {
+			existing.Annotations = map[string]string{}
+		}
+		existing.Annotations[TrinoProjectionRevisionAnnotation] = strconv.FormatInt(revision, 10)
+	}
 
+	// The resourceVersion carried by `existing` makes this a compare-and-swap:
+	// a concurrent write between the read and here is a conflict rather than a
+	// silent last-writer-wins, and the next tick re-reads.
 	if _, err := secrets.Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
 		return fmt.Errorf("update secret %s (merge): %w", name, err)
 	}
 	return nil
+}
+
+// TrinoProjectionRevisionAnnotation records which accepted projection a
+// projected object was written from.
+const TrinoProjectionRevisionAnnotation = "duckgres.posthog.com/projection-revision"
+
+func projectionAnnotations(revision int64) map[string]string {
+	if revision <= 0 {
+		return nil
+	}
+	return map[string]string{TrinoProjectionRevisionAnnotation: strconv.FormatInt(revision, 10)}
+}
+
+func projectionRevisionOf(object metav1.Object) int64 {
+	value, present := object.GetAnnotations()[TrinoProjectionRevisionAnnotation]
+	if !present {
+		return 0
+	}
+	revision, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return revision
+}
+
+// TrinoProjectionFence is the durable record of which authorization projection
+// a pooled cell accepts.
+//
+// Accept builds and records one: the builder runs INSIDE the fence's
+// transaction and is handed the source rows it read, so the bytes and the
+// revision describe one read. It refuses when this process may not advance the
+// projection - it does not hold the pool's authority, or it is not the
+// publisher the deployment currently wants. An older control plane publishes
+// older authorization rules, and a revision counter cannot notice that: it
+// orders acceptances, not rule sets.
+//
+// Accepted reads the record without changing it. EVERY replica needs it: they
+// all serve the bundle and all project the auth Secret, so each must be able to
+// ask whether what it holds is the accepted projection.
+type TrinoProjectionFence interface {
+	Accept(ctx context.Context, build func(orgs []configstore.TrinoEnabledOrg) (digest string, err error)) (revision int64, err error)
+	Accepted(ctx context.Context) (digest string, revision int64, ok bool)
+}
+
+// ErrTrinoProjectionNotAdvanceable means this process may not ADVANCE the
+// accepted projection - it is not the authority, or not the desired publisher.
+//
+// It is not a failure of the reconcile: the replica still builds and serves the
+// projection, and the fence decides whether those bytes may be published. Every
+// replica but one is in this state at any moment, so treating it as an error
+// would mark every pooled warehouse failed on every replica that is not the
+// leader.
+var ErrTrinoProjectionNotAdvanceable = errors.New("this control plane may not advance the accepted projection")
+
+// SetProjectionFence installs the durable projection fence for a pooled cell.
+func (p *TrinoProvisioner) SetProjectionFence(fence TrinoProjectionFence) {
+	p.credMu.Lock()
+	defer p.credMu.Unlock()
+	p.projectionFence = fence
 }
 
 // replaceSecret is the sole-owner Secret writer: the given data map

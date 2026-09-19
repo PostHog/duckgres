@@ -946,6 +946,200 @@ compute_usage_pull_api() { # org password
 # the janitor's cap sweep (5s tick + config-poll snapshot reload — the poll
 # below covers both), retiring the OLDEST excess; restoring 0 (unlimited)
 # afterwards leaves the remaining parked worker alone.
+# The shared Trino compute pool ships DISABLED. What this asserts is exactly
+# that: with no pooled cell configured, the control plane creates no pool
+# workload at all. A feature that is supposed to change nothing is only
+# credible if "nothing changed" is actually checked.
+#
+# What CANNOT be asserted in-Job, and why:
+#
+#   - The durable pool tables. This Job reaches duckgres over pgwire and the
+#     admin API; it has no config-store credential, so a row-level assertion is
+#     not available here. The migration and every fenced write are covered by
+#     tests/configstore/trino_pool_postgres_test.go against a real PostgreSQL.
+#   - The serving path (create -> admit -> drain -> retire). It needs a registry
+#     entry with mode: "shared-pool", a Golden-Chart blueprint artifact with a
+#     real image digest, a Gateway running the pooled protocol, and the pool
+#     feature flags on - a configuration this Job does not provision. That path
+#     is covered by the controlplane/ unit tests (fake clientset + fake Gateway)
+#     and the real-PostgreSQL publisher tests, and stays UNVERIFIED against a
+#     live cluster until an authorized deployment enables the flags.
+#   - The catalog-watermark admission gate (a catalog that committed while its
+#     revision checkpoint failed must not let a tenant be admitted against the
+#     older revision). It needs the pooled catalog writer, which publishes to
+#     the Trino-side catalog store this Job holds no credential for. Covered by
+#     TestAdmissionStaysClosedUntilTheCatalogWatermarkIsKnown (the operator
+#     loop) and the real-PostgreSQL TestPooledCatalogWriter* cases (the store
+#     side, as the scoped publisher role).
+#   - The member retry paths: a Gateway response lost in transit, and the
+#     failure repair of a coordinator that restarted in place. Both need the
+#     serving path above, plus fault injection this Job cannot perform (drop one
+#     specific Gateway response; end one specific container mid-flight). They are
+#     covered by controlplane/trino_pool_member_retries_test.go and stay
+#     UNVERIFIED against a live Gateway.
+trino_shared_pool_disabled() {
+  log "shared Trino pool: asserting the feature is inert"
+
+  # Every object a pooled instance owns carries this label, so the check holds
+  # regardless of how the objects are named.
+  selector="app.kubernetes.io/managed-by=duckgres-trino-pool"
+
+  # Each count is fail-closed: an API permission problem or an unavailable
+  # apiserver must FAIL this assertion, never pass it. Defaulting an error to
+  # zero would turn "I could not look" into "there is nothing there", which is
+  # the one answer this check is supposed to earn.
+  for kind in pods deployments services; do
+    found="$(pool_object_count "$kind" "$selector")"
+    [ "$found" = "0" ] || fail "shared pool: $found pooled $kind exist with the feature disabled"
+  done
+
+  log "shared pool OK: no pooled workload exists (durable state + serving path are unit/PG-tested only)"
+}
+
+# pool_object_count counts objects of one kind, or FAILS. Both the API call and
+# the projection have to succeed for the number to mean anything.
+pool_object_count() { # kind selector
+  body="$(kubectl get "$1" -A -l "$2" -o json)" \
+    || fail "shared pool: could not list $1 (a failed observation is not evidence of absence)"
+  count="$(printf %s "$body" | jq -r '.items | length')" \
+    || fail "shared pool: could not read the $1 listing"
+  printf %s "$count"
+}
+
+# The ACTIVE path, for a cluster that has the pool enabled.
+#
+# It runs only when E2E_TRINO_POOL=1, because it needs a configuration this lane
+# does not provision by default: a registry entry with mode "shared-pool", a
+# blueprint artifact carrying a real image digest, a Gateway speaking the pooled
+# protocol, and the feature flags on. When those exist this is the acceptance
+# check, in three
+# separately reported stages, because each is evidence for less than the next:
+#
+#   [structure] ready, non-terminating coordinator pods, each with its own
+#               Service and its own workers. A ready pod routes nothing.
+#   [admission] the warehouse reports ready, which with the Gateway gate on
+#               means its publication committed on every serving member.
+#   [query]     a statement run with an EXISTING login of that org returns its
+#               result. Needs caller-supplied credentials; skipped, and said to
+#               be skipped, when they are not given. No canary warehouse and no
+#               new secret is introduced for it.
+trino_shared_pool_active() {
+  [ "${E2E_TRINO_POOL:-0}" = "1" ] || {
+    log "SKIP shared-pool active path (set E2E_TRINO_POOL=1 on a pool-enabled cluster)"
+    return 0
+  }
+  pool="${E2E_TRINO_POOL_ID:-cell-001}"
+  want="${E2E_TRINO_POOL_MIN_SERVING:-3}"
+  log "shared Trino pool [structure]: waiting for $want ready coordinator instances in $pool"
+
+  selector="app.kubernetes.io/managed-by=duckgres-trino-pool,posthog.com/trino-pool=$pool"
+  a=0 ready=0
+  while [ "$a" -lt 60 ]; do
+    # Ready, NON-TERMINATING coordinators, counted from the pods themselves: the
+    # operator's own view is what is under test, so it cannot also be the
+    # evidence. A terminating pod still reports Ready for its whole grace
+    # period, and counting it would claim capacity that is on its way out.
+    #
+    # This is a STRUCTURAL count only. A ready coordinator pod is not an
+    # admitted Gateway member and routes nothing by itself; admission is
+    # asserted separately below.
+    body="$(kubectl get pods -A -l "$selector,app.kubernetes.io/component=coordinator" -o json)" \
+      || fail "shared pool: could not list coordinator pods"
+    ready="$(printf %s "$body" | jq -r '[.items[]
+      | select(.metadata.deletionTimestamp == null)
+      | select(.status.phase=="Running")
+      | select([.status.conditions[]? | select(.type=="Ready" and .status=="True")] | length > 0)] | length')" \
+      || fail "shared pool: could not read the coordinator listing"
+    [ "${ready:-0}" -ge "$want" ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "${ready:-0}" -ge "$want" ] || fail "shared pool: only $ready serving coordinator(s), want $want"
+
+  # Each instance must have its OWN Service and its own workers: a shared
+  # Service or a shared discovery URI would silently merge two clusters, which
+  # no pod-count assertion would notice.
+  services="$(pool_object_count services "$selector")"
+  [ "${services:-0}" -ge "$want" ] || fail "shared pool: $services service(s) for $ready instance(s)"
+  instances="$(printf %s "$body" | jq -r '[.items[]
+    | select(.metadata.deletionTimestamp == null)
+    | .metadata.labels["posthog.com/trino-instance"]] | unique | length')" \
+    || fail "shared pool: could not read coordinator instance labels"
+  [ "${instances:-0}" -ge "$want" ] || fail "shared pool: $instances distinct instance(s) among the coordinators"
+
+  # Every worker must belong to an instance that has a coordinator: an orphaned
+  # worker set is the visible symptom of a half-retired instance.
+  workers="$(kubectl get pods -A -l "$selector,app.kubernetes.io/component=worker" -o json)" \
+    || fail "shared pool: could not list worker pods"
+  known="$(printf %s "$body" | jq -c '[.items[].metadata.labels["posthog.com/trino-instance"]]')" \
+    || fail "shared pool: could not read coordinator instance labels"
+  orphans="$(printf %s "$workers" | jq -r --argjson known "$known" \
+    '[.items[] | select(([.metadata.labels["posthog.com/trino-instance"]] | inside($known)) | not)] | length')" \
+    || fail "shared pool: could not compare workers against coordinators"
+  [ "${orphans:-0}" = "0" ] || fail "shared pool: $orphans worker pod(s) have no coordinator"
+
+  log "shared pool OK [structure]: $ready ready instance(s), each with its own service and workers"
+
+  # Tenant admission, when the cell has the Gateway restriction on. This is the
+  # user-visible end of the publication barrier: with the gate enabled a
+  # warehouse is NOT reported ready until its publication has committed, so a
+  # ready warehouse is evidence that every serving member acknowledged its
+  # configuration - not merely that a catalog row exists.
+  [ "${E2E_TRINO_POOL_TENANT_ADMISSION:-0}" = "1" ] || {
+    log "SKIP shared-pool tenant admission (set E2E_TRINO_POOL_TENANT_ADMISSION=1 on a cell with the gate on)"
+    return 0
+  }
+  org="${E2E_TRINO_POOL_ORG:?E2E_TRINO_POOL_TENANT_ADMISSION=1 needs E2E_TRINO_POOL_ORG}"
+  a=0 state=""
+  while [ "$a" -lt 30 ]; do
+    state="$(curl -fsS -H "$H" "$API/api/v1/orgs/$org" | jq -r '.trino.state // ""')" || state=""
+    [ "$state" = "ready" ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "$state" = "ready" ] || fail "shared pool: $org is '$state', want ready once its publication commits"
+  log "shared pool OK [admission]: $org is admitted (publication committed on every serving member)"
+
+  # And the end the user actually experiences: a statement, run with the
+  # caller's OWN credentials, returning a result. Structure and admission are
+  # both upstream of this and neither implies it - a member can be admitted and
+  # still answer nothing.
+  #
+  # The credentials come from the caller (an existing login for that org), so
+  # this introduces no canary warehouse and no new secret. Without them the
+  # query is skipped and said to be skipped, rather than quietly reported as
+  # passing.
+  [ -n "${E2E_TRINO_POOL_USER:-}" ] && [ -n "${E2E_TRINO_POOL_PASSWORD:-}" ] || {
+    log "SKIP shared-pool query (set E2E_TRINO_POOL_USER/E2E_TRINO_POOL_PASSWORD to an existing login of $org)"
+    return 0
+  }
+  endpoint="${E2E_TRINO_POOL_URL:?E2E_TRINO_POOL_USER needs E2E_TRINO_POOL_URL}"
+  answer="$(pool_scalar "$endpoint" "$E2E_TRINO_POOL_USER" "$E2E_TRINO_POOL_PASSWORD" \
+    'SELECT count(*) FROM (VALUES 1, 2, 3) AS t(x)')" \
+    || fail "shared pool: the admitted tenant could not run a statement"
+  [ "$answer" = "3" ] || fail "shared pool: query returned '$answer', want 3"
+  log "shared pool OK [query]: $E2E_TRINO_POOL_USER ran a statement and got its result"
+}
+
+# pool_scalar runs one statement through Trino's paging statement protocol and
+# prints the first column of the first row. Every page carries the same
+# credentials; an error in any page fails the call.
+pool_scalar() { # endpoint user password sql
+  endpoint="$1" user="$2" password="$3" sql="$4"
+  response="$(curl --connect-timeout 5 --max-time 60 -fsS --user "$user:$password" \
+    -H "X-Trino-User: $user" -H 'X-Trino-Time-Zone: UTC' \
+    --data-binary "$sql" "$endpoint/v1/statement")" || return 1
+  rows='[]'
+  while :; do
+    message="$(printf %s "$response" | jq -r '.error.message // empty')"
+    [ -z "$message" ] || { echo "$message" >&2; return 1; }
+    rows="$(printf %s "$response" | jq -c --argjson rows "$rows" '$rows + (.data // [])')"
+    next="$(printf %s "$response" | jq -r '.nextUri // empty')"
+    [ -n "$next" ] || break
+    response="$(curl --connect-timeout 5 --max-time 60 -fsS --user "$user:$password" \
+      -H "X-Trino-User: $user" "$next")" || return 1
+  done
+  printf %s "$rows" | jq -r '.[0][0] // empty'
+}
+
 hot_idle_reporting_and_cap() { # org
   org="$1"
   log "hot-idle reporting + cap sweep on $org"
@@ -4798,6 +4992,15 @@ engine_main() {
 
   # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
+
+  # ---- shared Trino compute pool ----
+  # Inert while disabled; the active acceptance path runs on a pool-enabled
+  # cluster (E2E_TRINO_POOL=1).
+  if [ "${E2E_TRINO_POOL:-0}" = "1" ]; then
+    trino_shared_pool_active
+  else
+    trino_shared_pool_disabled
+  fi
 
   # ---- hot-idle pool reporting + per-org cap sweep ----
   hot_idle_reporting_and_cap "$CNPG"

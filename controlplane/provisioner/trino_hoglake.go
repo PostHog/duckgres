@@ -183,6 +183,20 @@ func isManagedHoglake(org configstore.TrinoEnabledOrg) bool {
 	return configstore.EffectiveTrinoBackend(org.Backend) == configstore.TrinoBackendHoglake
 }
 
+// ManagedHoglakeConfigured reports whether this provisioner can provision a
+// managed Hoglake tenant at all: the service configuration AND the storage
+// resolver that supplies the tenant's IAM role and region.
+//
+// It is exported for the startup wiring's own test. A cell that silently lost
+// either input builds and reconciles perfectly until the first Hoglake tenant
+// is provisioned, and then holds that warehouse pending with an error about
+// configuration nobody changed - so "the pooled branch passes the same inputs
+// as the legacy one" is worth asserting at the boundary rather than
+// discovering per tenant.
+func (p *TrinoProvisioner) ManagedHoglakeConfigured() bool {
+	return p.managedHoglake != nil && p.hoglakeDucklings != nil
+}
+
 func (p *TrinoProvisioner) managedHoglakeProperties(orgID string, d *DucklingStatus) (map[string]string, error) {
 	if p.managedHoglake == nil {
 		return nil, errors.New("managed Hoglake is not configured")

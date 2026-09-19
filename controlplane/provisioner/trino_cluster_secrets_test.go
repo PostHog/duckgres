@@ -4,6 +4,8 @@ package provisioner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"sync"
 	"testing"
 
@@ -496,5 +498,21 @@ func TestBootstrap_ObserverKeyLossRegenerates(t *testing.T) {
 		regenerated.Data[TrinoAuthSecretKeyObserverPassword],
 	); err != nil {
 		t.Errorf("regenerated observer pair does not validate: %v", err)
+	}
+}
+
+// The fingerprint a controller computes for a file it wrote must equal what
+// Trino's file components report having loaded. Their published contract is
+// `sha256:` plus the lower-case hex SHA-256 of the file's bytes; if this
+// diverges, a pooled candidate can never be certified and nothing else would
+// say why.
+func TestTrinoFileFingerprintMatchesThePublishedContract(t *testing.T) {
+	digest := sha256.Sum256([]byte("alice:hash\n"))
+	want := "sha256:" + hex.EncodeToString(digest[:])
+	if got := TrinoFileFingerprint([]byte("alice:hash\n")); got != want {
+		t.Fatalf("fingerprint = %q, want %q", got, want)
+	}
+	if TrinoFileFingerprint([]byte("alice:hash\n")) == TrinoFileFingerprint([]byte("alice:other\n")) {
+		t.Fatal("two different files produced the same fingerprint")
 	}
 }

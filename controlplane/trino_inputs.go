@@ -130,6 +130,9 @@ func trinoProvisionerEnabled() bool {
 // Registered cells share projections across their independently scheduled backends.
 // Only the legacy cell claims unassigned tenants.
 type trinoCell struct {
+	// Mode selects the compute topology. An empty value is the existing fixed
+	// blue/green cell.
+	Mode              string
 	CatalogManagement string
 	ID                string
 	PublicID          string
@@ -308,6 +311,18 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	// is https but dials the in-cluster Service address (see
 	// envTrinoCoordinatorServerName).
 	catalogClient := provisioner.NewTrinoCatalogHTTPClient(cell.CoordinatorURL, opa.AdminPrincipal, "", cell.TLSServerName)
+	// A shared-pool cell has no fixed coordinator: its instances come and go,
+	// and the URL above would be empty. Its catalogs are published directly to
+	// the shared store under the pool's own authority fence instead, so the
+	// provisioner's reconcile loop is unchanged while the write path stops
+	// depending on any one replaceable coordinator.
+	//
+	// The writer is attached later, when the pool operator wins its authority
+	// (SetPoolCatalogWriter). Until then this cell publishes nothing rather
+	// than publishing through a coordinator that does not exist.
+	if cell.Mode == trinoPoolModeShared {
+		catalogClient = newUnavailableTrinoCatalogClient(cell.ID)
+	}
 	var additional []provisioner.TrinoCatalogClient
 	var managed *provisioner.TrinoManagedCatalogOpts
 	if cell.CatalogManagement != "" {
