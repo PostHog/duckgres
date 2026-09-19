@@ -803,7 +803,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	//    transaction allocated - so a replica can never stamp bytes it built
 	//    from some earlier view with a number it read later. It also covers
 	//    step 3 below, because the two projections are accepted together.
-	authErr := p.reconcileFencedProjection(ctx)
+	authErr := p.reconcileFencedProjection(ctx, projectable)
 	if authErr == errTrinoProjectionNotFenced {
 		authErr = p.reconcileAuthSecret(ctx, projectable)
 	} else {
@@ -2285,7 +2285,7 @@ type trinoProjection struct {
 // When the fence refuses - this replica is not the desired publisher, or the
 // projection has moved on - nothing is written and nothing is served. The
 // coordinators keep the authorization data they already have.
-func (p *TrinoProvisioner) reconcileFencedProjection(ctx context.Context) error {
+func (p *TrinoProvisioner) reconcileFencedProjection(ctx context.Context, orgs []configstore.TrinoEnabledOrg) error {
 	p.credMu.RLock()
 	fence := p.projectionFence
 	p.credMu.RUnlock()
@@ -2294,16 +2294,45 @@ func (p *TrinoProvisioner) reconcileFencedProjection(ctx context.Context) error 
 	}
 
 	var built trinoProjection
-	revision, err := fence(ctx, func(orgs []configstore.TrinoEnabledOrg) (string, error) {
-		projectable, _ := rejectPrincipalCollisions(orgs)
-		projection, err := p.buildProjection(projectable)
-		if err != nil {
-			return "", err
+	revision, err := fence.Accept(ctx, func(sourceOrgs []configstore.TrinoEnabledOrg) (string, error) {
+		projectable, _ := rejectPrincipalCollisions(sourceOrgs)
+		projection, buildErr := p.buildProjection(projectable)
+		if buildErr != nil {
+			return "", buildErr
 		}
 		built = projection
 		return projection.digest, nil
 	})
-	if err != nil {
+	switch {
+	case err == nil:
+		// This replica advanced the projection, and `built` is the projection
+		// the accepted revision was allocated for - same read, same bytes.
+	case errors.Is(err, ErrTrinoProjectionNotAdvanceable):
+		// Every replica but one is here at any moment. It still BUILDS and
+		// SERVES the projection - refusing to would leave the coordinators that
+		// poll this replica on their last-good bundle forever - but it publishes
+		// nothing the record has not accepted.
+		built, err = p.buildProjection(orgs)
+		if err != nil {
+			return err
+		}
+		accepted, acceptedRevision, ok := fence.Accepted(ctx)
+		if !ok {
+			// The record cannot be read, so nothing can be said about what this
+			// replica holds. It keeps serving what it has; the gate on the
+			// bundle endpoint makes the same call independently.
+			p.publishProjectionLocally(built)
+			return nil
+		}
+		if accepted != built.digest {
+			// Behind, or ahead of what has been accepted. Serve nothing new and
+			// touch no Secret: the gate will refuse these bytes anyway, and
+			// writing them would be the regression the fence exists to prevent.
+			p.publishProjectionLocally(built)
+			return nil
+		}
+		revision = acceptedRevision
+	default:
 		return fmt.Errorf("accept the authorization projection: %w", err)
 	}
 	if built.digest == "" {
@@ -2316,6 +2345,14 @@ func (p *TrinoProvisioner) reconcileFencedProjection(ctx context.Context) error 
 	}, revision); err != nil {
 		return err
 	}
+	p.publishProjectionLocally(built)
+	return nil
+}
+
+// publishProjectionLocally records what this process is serving. It does not
+// decide whether those bytes may leave the process - the accepted record does,
+// through the bundle handler's gate.
+func (p *TrinoProvisioner) publishProjectionLocally(built trinoProjection) {
 	p.authRevisions.Store(&trinoAuthRevisions{
 		Password: TrinoFileFingerprint([]byte(built.passwordDB)),
 		Group:    TrinoFileFingerprint([]byte(built.groupDB)),
@@ -2323,7 +2360,6 @@ func (p *TrinoProvisioner) reconcileFencedProjection(ctx context.Context) error 
 	policyRevision := built.policyRevision
 	p.policyRevision.Store(&policyRevision)
 	p.bundleStore.Set(opa.NewBundle(built.bundle).WithRevision(built.digest))
-	return nil
 }
 
 // buildProjection renders both projections from ONE set of source rows and
@@ -3087,15 +3123,34 @@ func projectionRevisionOf(object metav1.Object) int64 {
 	return revision
 }
 
-// TrinoProjectionFence accepts a projection built from the source rows it
-// reads, and returns the revision that acceptance allocated.
+// TrinoProjectionFence is the durable record of which authorization projection
+// a pooled cell accepts.
 //
-// The builder runs INSIDE the fence's transaction and is handed those rows, so
-// the bytes and the revision describe one read. An implementation refuses when
-// this process is not the publisher the deployment currently wants: an older
-// control plane publishes older authorization rules, and a revision counter
-// cannot notice that - it orders acceptances, not rule sets.
-type TrinoProjectionFence func(ctx context.Context, build func(orgs []configstore.TrinoEnabledOrg) (digest string, err error)) (revision int64, err error)
+// Accept builds and records one: the builder runs INSIDE the fence's
+// transaction and is handed the source rows it read, so the bytes and the
+// revision describe one read. It refuses when this process may not advance the
+// projection - it does not hold the pool's authority, or it is not the
+// publisher the deployment currently wants. An older control plane publishes
+// older authorization rules, and a revision counter cannot notice that: it
+// orders acceptances, not rule sets.
+//
+// Accepted reads the record without changing it. EVERY replica needs it: they
+// all serve the bundle and all project the auth Secret, so each must be able to
+// ask whether what it holds is the accepted projection.
+type TrinoProjectionFence interface {
+	Accept(ctx context.Context, build func(orgs []configstore.TrinoEnabledOrg) (digest string, err error)) (revision int64, err error)
+	Accepted(ctx context.Context) (digest string, revision int64, ok bool)
+}
+
+// ErrTrinoProjectionNotAdvanceable means this process may not ADVANCE the
+// accepted projection - it is not the authority, or not the desired publisher.
+//
+// It is not a failure of the reconcile: the replica still builds and serves the
+// projection, and the fence decides whether those bytes may be published. Every
+// replica but one is in this state at any moment, so treating it as an error
+// would mark every pooled warehouse failed on every replica that is not the
+// leader.
+var ErrTrinoProjectionNotAdvanceable = errors.New("this control plane may not advance the accepted projection")
 
 // SetProjectionFence installs the durable projection fence for a pooled cell.
 func (p *TrinoProvisioner) SetProjectionFence(fence TrinoProjectionFence) {

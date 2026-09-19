@@ -165,15 +165,11 @@ func buildTrinoPoolOperators(
 		// otherwise publish its own older rules under a newer revision, which a
 		// counter cannot detect.
 		//
-		// Both inputs come from objects the pool already reads: this pod (for
-		// the image it is running) and the pool ConfigMap, which is re-read
-		// immediately before every publication and carries the desired
+		// Both inputs are rendered by the chart from one image helper: this
+		// process's own startup environment, and the pool ConfigMap, which is
+		// re-read immediately before every publication and carries the desired
 		// publisher image alongside the desired configuration.
-		producer := &trinoPoolProducerIdentity{
-			client:    clientset,
-			namespace: config.Namespace,
-			podName:   strings.TrimSpace(os.Getenv("POD_NAME")),
-		}
+		producer := newTrinoPoolProducerIdentity()
 		// Serving is fenced by the same record, on EVERY replica - not just the
 		// one holding the authority. A replica whose projection has been
 		// replaced must stop handing it to coordinators, and it is precisely
@@ -192,34 +188,14 @@ func buildTrinoPoolOperators(
 			}
 			return digest
 		}
-		provisionerForProjection.SetProjectionFence(
-			func(ctx context.Context, build func(orgs []configstore.TrinoEnabledOrg) (string, error)) (int64, error) {
-				lease, held := authority.Load(), false
-				if lease != nil {
-					held = true
-				}
-				if !held {
-					return 0, fmt.Errorf("this control plane does not hold the authority for pool %s", config.PublicID)
-				}
-				// Read the desired publisher AFTER authority is held, from the
-				// live object: a delayed term that still holds a lease is
-				// refused by the database's own epoch check below, and a stale
-				// desired value cannot be carried in from boot.
-				snapshot, err := configSource.Snapshot(ctx)
-				if err != nil {
-					return 0, fmt.Errorf("read the desired publisher for pool %s: %w", config.PublicID, err)
-				}
-				eligible, own, err := producer.eligible(ctx, snapshot.PublisherImage())
-				if err != nil {
-					return 0, err
-				}
-				if !eligible {
-					return 0, fmt.Errorf("this control plane runs %q, which is not the desired publisher %q for pool %s",
-						own, snapshot.PublisherImage(), config.PublicID)
-				}
-				revision, _, err := store.AcceptTrinoPoolProjectionWith(ctx, *lease, build)
-				return revision, err
-			})
+		provisionerForProjection.SetProjectionFence(&trinoPoolProjectionFence{
+			store:        store,
+			publicID:     config.PublicID,
+			authority:    authority,
+			configSource: configSource,
+			producer:     producer,
+			accepted:     accepted,
+		})
 
 		// With the Gateway's admission restriction on, a warehouse is not
 		// queryable until its publication barrier commits - so it must not read

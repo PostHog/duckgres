@@ -6,23 +6,60 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
+	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
 )
 
-func controlPlanePod(image string) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "duckgres-cp-0", Namespace: "trino-pool-example"},
-		Spec: corev1.PodSpec{Containers: []corev1.Container{
-			// A sidecar first, deliberately: selecting containers[0] would read
-			// somebody else's image.
-			{Name: "linkerd-proxy", Image: "registry.example.invalid/proxy@sha256:aaaa"},
-			{Name: "duckgres", Image: image},
-		}},
+// recordedProjection is the durable record, with the accepted projection under
+// the test's control and every read counted.
+type recordedProjection struct {
+	digest atomic.Pointer[string]
+	reads  atomic.Int64
+}
+
+func (r *recordedProjection) GetTrinoPoolProjection(context.Context, string) (configstore.TrinoPoolProjection, error) {
+	r.reads.Add(1)
+	accepted := ""
+	if held := r.digest.Load(); held != nil {
+		accepted = *held
+	}
+	return configstore.TrinoPoolProjection{AcceptedDigest: accepted, AcceptedRevision: 1}, nil
+}
+
+func (r *recordedProjection) accept(digest string) { r.digest.Store(&digest) }
+
+// The serving gate reads the durable record on EVERY request.
+//
+// It used to cache the answer for two seconds, on the argument that the window
+// was no worse than propagation delay. It is worse: OPA's periodic downloader
+// activates each bundle inline as it is fetched, so a poll that lands inside
+// that window does not merely see a stale answer, it INSTALLS the superseded
+// authorization data - after a newer projection has already been accepted and a
+// warehouse admitted against it. Priming the reader must not make the next
+// request answer from what the previous one saw.
+func TestTheServingGateDoesNotServeAProjectionItHasAlreadySeenReplaced(t *testing.T) {
+	record := &recordedProjection{}
+	record.accept("projection-1")
+	gate := &trinoPoolAcceptedProjection{store: record, poolID: "pool-1"}
+
+	// Prime the reader: a coordinator polls this replica while it is current.
+	if digest, known := gate.digest(); !known || digest != "projection-1" {
+		t.Fatalf("digest = %q known=%v, want the accepted projection", digest, known)
+	}
+	primed := record.reads.Load()
+
+	// The pool accepts a new projection elsewhere, and a tenant is admitted
+	// against it.
+	record.accept("projection-2")
+
+	if digest, known := gate.digest(); !known || digest != "projection-2" {
+		t.Fatalf("digest = %q known=%v, want the replaced projection to be refused immediately", digest, known)
+	}
+	if record.reads.Load() <= primed {
+		t.Fatal("the gate answered from a cached read instead of the durable record")
 	}
 }
 
@@ -32,11 +69,7 @@ const (
 )
 
 func producerFor(image string) *trinoPoolProducerIdentity {
-	return &trinoPoolProducerIdentity{
-		client:    fake.NewClientset(controlPlanePod(image)),
-		namespace: "trino-pool-example",
-		podName:   "duckgres-cp-0",
-	}
+	return &trinoPoolProducerIdentity{ownImage: image}
 }
 
 // The counterexample the ordering alone does not answer: an OLD control plane
@@ -46,7 +79,7 @@ func producerFor(image string) *trinoPoolProducerIdentity {
 // the deployment currently wants may advance the projection.
 func TestAnOlderBinaryMayNotAdvanceTheProjection(t *testing.T) {
 	older := producerFor(olderImage)
-	eligible, own, err := older.eligible(context.Background(), currentImage)
+	eligible, own, err := older.eligible(currentImage)
 	if err != nil {
 		t.Fatalf("eligibility: %v", err)
 	}
@@ -54,13 +87,35 @@ func TestAnOlderBinaryMayNotAdvanceTheProjection(t *testing.T) {
 		t.Fatal("a control plane running an older image was allowed to publish authorization data")
 	}
 	if own != olderImage {
-		t.Fatalf("own image = %q, want the image this pod is actually running", own)
+		t.Fatalf("own image = %q, want the image this process was started with", own)
 	}
 
 	current := producerFor(currentImage)
-	eligible, _, err = current.eligible(context.Background(), currentImage)
+	eligible, _, err = current.eligible(currentImage)
 	if err != nil || !eligible {
 		t.Fatalf("the desired publisher was refused: eligible=%v err=%v", eligible, err)
+	}
+}
+
+// The identity this process publishes under is captured from the environment at
+// STARTUP and never re-derived. A pod specification can be edited under a
+// running process, so what the API says the pod should run is not evidence
+// about the code that is actually executing this check.
+func TestProducerIdentityComesFromTheStartupEnvironment(t *testing.T) {
+	t.Setenv(envTrinoPoolPublisherImage, currentImage)
+	producer := newTrinoPoolProducerIdentity()
+	if producer.ownImage != currentImage {
+		t.Fatalf("own image = %q, want the startup value", producer.ownImage)
+	}
+	eligible, _, err := producer.eligible(currentImage)
+	if err != nil || !eligible {
+		t.Fatalf("the desired publisher was refused: eligible=%v err=%v", eligible, err)
+	}
+
+	// The desired image moves. The captured identity does not follow it.
+	t.Setenv(envTrinoPoolPublisherImage, olderImage)
+	if eligible, _, err := producer.eligible(olderImage); err != nil || eligible {
+		t.Fatalf("a running process changed its identity mid-flight: eligible=%v err=%v", eligible, err)
 	}
 }
 
@@ -71,11 +126,11 @@ func TestAnOlderBinaryMayNotAdvanceTheProjection(t *testing.T) {
 func TestARollbackMovesEligibilityWithTheDesiredImage(t *testing.T) {
 	older, newer := producerFor(olderImage), producerFor(currentImage)
 
-	eligible, _, err := older.eligible(context.Background(), olderImage)
+	eligible, _, err := older.eligible(olderImage)
 	if err != nil || !eligible {
 		t.Fatalf("after a rollback the desired publisher was refused: eligible=%v err=%v", eligible, err)
 	}
-	eligible, _, err = newer.eligible(context.Background(), olderImage)
+	eligible, _, err = newer.eligible(olderImage)
 	if err != nil {
 		t.Fatalf("eligibility: %v", err)
 	}
@@ -89,25 +144,29 @@ func TestARollbackMovesEligibilityWithTheDesiredImage(t *testing.T) {
 // from it.
 func TestProjectionEligibilityFailsClosed(t *testing.T) {
 	// A partial Argo sync: the pods are new, the ConfigMap key is not there yet.
-	if eligible, _, err := producerFor(currentImage).eligible(context.Background(), ""); err == nil || eligible {
+	if eligible, _, err := producerFor(currentImage).eligible(""); err == nil || eligible {
 		t.Fatal("publication was permitted with no desired publisher declared")
 	}
-	// No pod identity.
-	anonymous := &trinoPoolProducerIdentity{client: fake.NewClientset(), namespace: "trino-pool-example"}
-	if eligible, _, err := anonymous.eligible(context.Background(), currentImage); err == nil || eligible {
+	// The process was started without its own image.
+	anonymous := &trinoPoolProducerIdentity{}
+	if eligible, _, err := anonymous.eligible(currentImage); err == nil || eligible {
 		t.Fatal("publication was permitted by a process that cannot identify itself")
 	}
-	// The pod exists but carries no container of this name.
-	wrongPod := &trinoPoolProducerIdentity{
-		client: fake.NewClientset(&corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{Name: "duckgres-cp-0", Namespace: "trino-pool-example"},
-			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "sidecar", Image: currentImage}}},
-		}),
-		namespace: "trino-pool-example",
-		podName:   "duckgres-cp-0",
+	// A floating tag on either side. Two equal tags are not evidence that two
+	// processes run the same bytes: a tag can be repointed at any time, which is
+	// precisely the skew the fence exists to catch.
+	floating := "registry.example.invalid/duckgres:latest"
+	if eligible, _, err := producerFor(currentImage).eligible(floating); err == nil || eligible {
+		t.Fatal("publication was permitted against a floating desired image")
 	}
-	if eligible, _, err := wrongPod.eligible(context.Background(), currentImage); err == nil || eligible {
-		t.Fatal("publication was permitted from a pod with no duckgres container")
+	if eligible, _, err := producerFor(floating).eligible(floating); err == nil || eligible {
+		t.Fatal("publication was permitted by a process whose own image is a floating tag")
+	}
+	// A digest-shaped value that is not a full sha256 digest is not pinned
+	// either.
+	truncated := "registry.example.invalid/duckgres@sha256:1111"
+	if eligible, _, err := producerFor(truncated).eligible(truncated); err == nil || eligible {
+		t.Fatal("publication was permitted against a truncated digest")
 	}
 }
 

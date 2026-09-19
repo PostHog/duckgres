@@ -4,15 +4,16 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"github.com/posthog/duckgres/controlplane/provisioner"
 )
 
 // Who may advance a pooled cell's authorization projection.
@@ -30,11 +31,14 @@ import (
 // The producer check is equality against the currently DESIRED image, never an
 // ordering of image identities: this process may advance the projection only
 // while the image it is running is the one the deployment currently wants. Both
-// values already exist - the running image comes from this pod (the control
-// plane already reads its own pod for exactly this kind of thing), and the
-// desired image is one key on the SAME ConfigMap the pool re-reads immediately
-// before every publication, rendered from the same helper that renders the
-// Deployment. During a rollout the two disagree in one direction or the other
+// values already exist and come from the same chart helper: the running image
+// is handed to the process at STARTUP in DUCKGRES_TRINO_POOL_PUBLISHER_IMAGE,
+// and the desired image is one key on the SAME ConfigMap the pool re-reads
+// immediately before every publication. The startup value is used rather than
+// the pod's own spec because a pod specification can be edited under a running
+// process, while the value the process started with cannot: what this binary
+// IS does not change after it starts. During a rollout the two disagree in one
+// direction or the other
 // and nobody publishes: the pooled bundle pauses, OPA keeps its last-good
 // bundle, and no older projection is ever accepted. An intentional rollback
 // moves the desired value, which makes the older pods eligible again - the
@@ -47,118 +51,165 @@ const (
 	// same image helper the Deployment uses.
 	trinoPoolPublisherImageKey = "publisher-image"
 
-	// trinoPoolOwnImageContainer is the container whose image identifies this
-	// process. Selected BY NAME: a pod with an injected sidecar has no
-	// meaningful "first" container.
-	trinoPoolOwnImageContainer = "duckgres"
+	// envTrinoPoolPublisherImage carries THIS process's own image, rendered by
+	// the chart from the same helper as the ConfigMap key above.
+	envTrinoPoolPublisherImage = "DUCKGRES_TRINO_POOL_PUBLISHER_IMAGE"
 
-	trinoPoolImageReadBudget = 10 * time.Second
+	trinoPoolProjectionReadBudget = 10 * time.Second
 )
 
-// trinoPoolAcceptedProjection reads the accepted projection for the serving
-// gate, with a short cache.
-//
-// OPA polls the bundle endpoint continuously, so an uncached read would put a
-// database round trip on every poll of every replica. The cache is deliberately
-// tiny: it bounds how long a replaced projection can still be served to roughly
-// one poll interval, which is the same order as the propagation delay the fence
-// already accepts.
-type trinoPoolAcceptedProjection struct {
-	store  *configstore.ConfigStore
-	poolID string
+// trinoPoolPinnedImage matches an image pinned by content digest. A floating
+// tag names different bytes at different times, so it cannot establish that
+// this binary is the desired publisher; only a digest can.
+var trinoPoolPinnedImage = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 
-	mu       sync.Mutex
-	accepted string
-	known    bool
-	readAt   time.Time
-	cacheFor time.Duration
+// trinoPoolAcceptedProjection reads the accepted projection for the serving
+// gate.
+//
+// The read is NOT cached. A cache - even a two-second one - is a window in
+// which a replica keeps handing out a projection the pool has already replaced,
+// and the downstream consumer does not repair it: OPA's periodic downloader
+// activates each bundle inline as it fetches it, so a poll that receives the
+// superseded bundle installs the superseded bundle. That is exactly the
+// regression this fence exists to prevent, so the freshness of the answer
+// cannot be traded for the round trip that produces it.
+type trinoPoolAcceptedProjection struct {
+	store  trinoPoolProjectionReader
+	poolID string
 }
 
-func (a *trinoPoolAcceptedProjection) digestTTL() time.Duration {
-	if a.cacheFor > 0 {
-		return a.cacheFor
-	}
-	return 2 * time.Second
+// trinoPoolProjectionReader is the durable record's read side.
+type trinoPoolProjectionReader interface {
+	GetTrinoPoolProjection(ctx context.Context, poolID string) (configstore.TrinoPoolProjection, error)
 }
 
 // digest reports the accepted projection, and whether it could be determined
 // at all. A read failure reports NOT known, so the gate refuses to serve: the
 // alternative is serving authorization data nobody can confirm is current.
 func (a *trinoPoolAcceptedProjection) digest() (string, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.known && time.Since(a.readAt) < a.digestTTL() {
-		return a.accepted, true
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), trinoPoolImageReadBudget)
+	digest, _, known := a.record(context.Background())
+	return digest, known
+}
+
+// record reports the accepted projection and the revision it was accepted at.
+// A replica that holds exactly the accepted bytes stamps its Secret with that
+// revision, so the revision has to come from the same read as the digest.
+func (a *trinoPoolAcceptedProjection) record(ctx context.Context) (string, int64, bool) {
+	ctx, cancel := context.WithTimeout(ctx, trinoPoolProjectionReadBudget)
 	defer cancel()
 	projection, err := a.store.GetTrinoPoolProjection(ctx, a.poolID)
 	if err != nil {
-		a.known = false
-		return "", false
+		return "", 0, false
 	}
-	a.accepted, a.known, a.readAt = projection.AcceptedDigest, true, time.Now()
-	return a.accepted, true
+	return projection.AcceptedDigest, projection.AcceptedRevision, true
+}
+
+// trinoPoolProjectionFence is the provisioner's view of the durable record.
+//
+// Accept refuses - as ErrTrinoProjectionNotAdvanceable - when this process is
+// not the one that may advance the projection: it does not hold the pool's
+// authority, or it is not running the desired publisher image. That is the
+// state every replica but one is in at any moment, so it is not a reconcile
+// failure; the replica keeps building and serving, and publishes nothing the
+// record has not accepted.
+//
+// A read that FAILS is a different thing and is returned as an error: on the
+// replica holding the authority, being unable to read the desired publisher or
+// this pod is a real fault, not a routine refusal.
+type trinoPoolProjectionFence struct {
+	store        *configstore.ConfigStore
+	publicID     string
+	authority    *atomic.Pointer[configstore.TrinoPoolLease]
+	configSource trinoPoolConfigReader
+	producer     *trinoPoolProducerIdentity
+	accepted     *trinoPoolAcceptedProjection
+}
+
+func (f *trinoPoolProjectionFence) Accept(
+	ctx context.Context,
+	build func(orgs []configstore.TrinoEnabledOrg) (string, error),
+) (int64, error) {
+	lease := f.authority.Load()
+	if lease == nil {
+		return 0, fmt.Errorf("%w: this control plane does not hold the authority for pool %s",
+			provisioner.ErrTrinoProjectionNotAdvanceable, f.publicID)
+	}
+	// Read the desired publisher AFTER authority is held, from the live object:
+	// a delayed term that still holds a lease is refused by the database's own
+	// epoch check below, and a stale desired value cannot be carried in from
+	// boot.
+	snapshot, err := f.configSource.Snapshot(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("read the desired publisher for pool %s: %w", f.publicID, err)
+	}
+	eligible, own, err := f.producer.eligible(snapshot.PublisherImage())
+	if err != nil {
+		return 0, err
+	}
+	if !eligible {
+		return 0, fmt.Errorf("%w: this control plane runs %q, which is not the desired publisher %q for pool %s",
+			provisioner.ErrTrinoProjectionNotAdvanceable, own, snapshot.PublisherImage(), f.publicID)
+	}
+	revision, _, err := f.store.AcceptTrinoPoolProjectionWith(ctx, *lease, build)
+	if err != nil {
+		// A refused fenced write means the authority moved while this call was
+		// in flight. Another process is publishing; this one is simply no
+		// longer the advancer.
+		if errors.Is(err, configstore.ErrTrinoPoolConflict) {
+			return 0, fmt.Errorf("%w: the pool authority moved: %w", provisioner.ErrTrinoProjectionNotAdvanceable, err)
+		}
+		return 0, err
+	}
+	return revision, nil
+}
+
+func (f *trinoPoolProjectionFence) Accepted(ctx context.Context) (string, int64, bool) {
+	return f.accepted.record(ctx)
 }
 
 // trinoPoolProducerIdentity answers whether THIS process is the eligible
 // publisher for a pooled cell.
+//
+// ownImage is read ONCE, at startup, from the environment. It is what this
+// process IS, and nothing observed later can change that: a pod's spec can be
+// edited, and a runtime image ID reports the platform-specific manifest the
+// node resolved rather than the multi-platform digest the chart names, so
+// neither answers the question the fence asks.
 type trinoPoolProducerIdentity struct {
-	client    kubernetes.Interface
-	namespace string
-	podName   string
-	// ownImage is cached after the first successful read: a pod's image is
-	// immutable for its lifetime, so re-reading it would add an API call per
-	// tick and could only ever return the same answer.
 	ownImage string
+}
+
+// newTrinoPoolProducerIdentity captures this process's own image at startup.
+func newTrinoPoolProducerIdentity() *trinoPoolProducerIdentity {
+	return &trinoPoolProducerIdentity{ownImage: strings.TrimSpace(os.Getenv(envTrinoPoolPublisherImage))}
 }
 
 // eligible reports whether this process may advance the projection, given the
 // desired image from the configuration snapshot it is publishing from.
 //
-// It fails CLOSED on every uncertainty - no desired value, no pod name, a pod
-// that cannot be read, a container that is not there - because the failure mode
-// it exists to prevent is an old binary publishing old rules, and "I could not
-// check" is indistinguishable from that.
-func (p *trinoPoolProducerIdentity) eligible(ctx context.Context, desiredImage string) (bool, string, error) {
+// It fails CLOSED on every uncertainty - no desired value, no startup value, or
+// either side naming an image by a floating tag instead of a content digest -
+// because the failure mode it exists to prevent is an old binary publishing old
+// rules, and "I could not check" is indistinguishable from that. A tag can name
+// different bytes at different times, so two equal tags are not evidence that
+// two processes run the same code.
+func (p *trinoPoolProducerIdentity) eligible(desiredImage string) (bool, string, error) {
 	desired := strings.TrimSpace(desiredImage)
 	if desired == "" {
 		return false, "", fmt.Errorf("the pool configuration carries no %q, so the eligible publisher is unknown", trinoPoolPublisherImageKey)
 	}
-	own, err := p.image(ctx)
-	if err != nil {
-		return false, "", err
+	if !trinoPoolPinnedImage.MatchString(desired) {
+		return false, "", fmt.Errorf("the pool configuration's %q is not pinned to a content digest, so it cannot identify the eligible publisher", trinoPoolPublisherImageKey)
+	}
+	own := p.ownImage
+	if own == "" {
+		return false, "", fmt.Errorf("this process was started without %s, so it cannot identify its own image", envTrinoPoolPublisherImage)
+	}
+	if !trinoPoolPinnedImage.MatchString(own) {
+		return false, own, fmt.Errorf("%s is not pinned to a content digest, so this process cannot prove which code it runs", envTrinoPoolPublisherImage)
 	}
 	if own != desired {
 		return false, own, nil
 	}
 	return true, own, nil
-}
-
-func (p *trinoPoolProducerIdentity) image(ctx context.Context) (string, error) {
-	if p.ownImage != "" {
-		return p.ownImage, nil
-	}
-	if p.client == nil || p.namespace == "" || p.podName == "" {
-		return "", fmt.Errorf("this process cannot identify its own image: POD_NAME or the namespace is unset")
-	}
-	ctx, cancel := context.WithTimeout(ctx, trinoPoolImageReadBudget)
-	defer cancel()
-
-	pod, err := p.client.CoreV1().Pods(p.namespace).Get(ctx, p.podName, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("read own pod %s/%s: %w", p.namespace, p.podName, err)
-	}
-	for _, container := range pod.Spec.Containers {
-		if container.Name != trinoPoolOwnImageContainer {
-			continue
-		}
-		image := strings.TrimSpace(container.Image)
-		if image == "" {
-			return "", fmt.Errorf("container %q of pod %s/%s has no image", trinoPoolOwnImageContainer, p.namespace, p.podName)
-		}
-		p.ownImage = image
-		return image, nil
-	}
-	return "", fmt.Errorf("pod %s/%s has no container named %q", p.namespace, p.podName, trinoPoolOwnImageContainer)
 }
