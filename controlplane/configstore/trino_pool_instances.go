@@ -158,19 +158,18 @@ func (cs *ConfigStore) RecordTrinoPoolInstanceFields(ctx context.Context, lease 
 	})
 }
 
-// AcceptTrinoPoolProjection records the authorization projection this pool
-// currently accepts, and returns the revision it was accepted at.
+// TrinoProjectionSources is one transaction's view of the projection's source
+// rows.
 //
-// This is the ORDERING the fence needs. A digest identifies a projection but
-// cannot say which of two came first, and every control plane builds the
-// projection from its own view of the config store - so without an authority
-// assigning an order, a replica that is behind cannot tell that it is. The
-// authority holder allocates the next revision for each new digest; an
-// unchanged digest keeps its revision, so a steady-state tick is a read.
-//
-// Serving replicas compare the projection they hold against the accepted digest
-// before emitting a bundle or overwriting the auth Secret, which is what stops
-// an older projection from replacing a newer one after it is already in effect.
+// Reread repeats the read through the SAME transaction. Production does not
+// need it - the projection is built once, from Orgs - but it is what lets a
+// test demonstrate the property this transaction exists for: a write committed
+// by somebody else in between must not become visible half way through.
+type TrinoProjectionSources struct {
+	Orgs   []TrinoEnabledOrg
+	Reread func() ([]TrinoEnabledOrg, error)
+}
+
 // AcceptTrinoPoolProjectionWith builds the projection and accepts it in ONE
 // transaction.
 //
@@ -187,6 +186,18 @@ func (cs *ConfigStore) AcceptTrinoPoolProjectionWith(
 	lease TrinoPoolLease,
 	build func(orgs []TrinoEnabledOrg) (digest string, err error),
 ) (int64, string, error) {
+	return cs.AcceptTrinoPoolProjectionFrom(ctx, lease, func(sources TrinoProjectionSources) (string, error) {
+		return build(sources.Orgs)
+	})
+}
+
+// AcceptTrinoPoolProjectionFrom is AcceptTrinoPoolProjectionWith with the
+// transaction's source view handed to the builder.
+func (cs *ConfigStore) AcceptTrinoPoolProjectionFrom(
+	ctx context.Context,
+	lease TrinoPoolLease,
+	build func(sources TrinoProjectionSources) (digest string, err error),
+) (int64, string, error) {
 	if build == nil {
 		return 0, "", errors.New("accepting a projection requires a builder")
 	}
@@ -194,24 +205,47 @@ func (cs *ConfigStore) AcceptTrinoPoolProjectionWith(
 		revision int64
 		digest   string
 	)
-	err := cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
-		orgs, err := cs.listTrinoEnabledOrgs(tx)
-		if err != nil {
+	// REPEATABLE READ, not the default.
+	//
+	// The pool row lock serializes acceptances against each other, but it does
+	// not lock the source of the projection: orgs, users and teams are written
+	// by entirely different code paths. Under READ COMMITTED the separate
+	// SELECTs this builds from can straddle such a write and produce a
+	// projection that never existed as a state of the database - and it would
+	// be accepted as the coherent one. A snapshot makes every read in the
+	// transaction see one instant.
+	err := cs.withSerializedRetry(ctx, func(attempt int) error {
+		revision, digest = 0, ""
+		return cs.withPoolAuthorityTx(ctx, lease, "REPEATABLE READ", func(tx *gorm.DB, _ *TrinoPool) error {
+			orgs, err := cs.listTrinoEnabledOrgsCoherently(tx)
+			if err != nil {
+				return err
+			}
+			digest, err = build(TrinoProjectionSources{
+				Orgs:   orgs,
+				Reread: func() ([]TrinoEnabledOrg, error) { return cs.listTrinoEnabledOrgsCoherently(tx) },
+			})
+			if err != nil {
+				return err
+			}
+			if digest == "" {
+				return errors.New("the projection builder produced no digest")
+			}
+			revision, err = acceptProjectionTx(tx, lease, digest)
 			return err
-		}
-		digest, err = build(orgs)
-		if err != nil {
-			return err
-		}
-		if digest == "" {
-			return errors.New("the projection builder produced no digest")
-		}
-		revision, err = acceptProjectionTx(tx, lease, digest)
-		return err
+		})
 	})
 	return revision, digest, err
 }
 
+// AcceptTrinoPoolProjection records an already-built projection's digest and
+// returns the revision it is accepted at.
+//
+// The revision is the ORDER the fence needs: a digest identifies a projection
+// but cannot say which of two came first, and every control plane builds one
+// from its own view - so without an authority assigning an order, a replica
+// that is behind cannot tell that it is. An unchanged digest keeps its
+// revision, so a steady-state tick allocates nothing.
 func (cs *ConfigStore) AcceptTrinoPoolProjection(ctx context.Context, lease TrinoPoolLease, digest string) (int64, error) {
 	if digest == "" {
 		return 0, errors.New("a projection digest is required")

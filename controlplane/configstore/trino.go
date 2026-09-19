@@ -268,6 +268,22 @@ func (cs *ConfigStore) ListTrinoEnabledOrgs() ([]TrinoEnabledOrg, error) {
 // describes bytes nobody can prove were current, which is exactly how a stale
 // buffer ends up stamped with a fresh number.
 func (cs *ConfigStore) listTrinoEnabledOrgs(db *gorm.DB) ([]TrinoEnabledOrg, error) {
+	return cs.listTrinoEnabledOrgsWith(db, cs.snapshotScopeResolver())
+}
+
+// listTrinoEnabledOrgsCoherently reads the projection's source rows AND each
+// scoped login's team row through one handle, so every part of the result comes
+// from the same view of the database.
+//
+// The snapshot-backed resolver cannot be used here: it is refreshed on a poll,
+// so a scope read from it can be older than the rows this transaction just
+// read - and a projection built from that mixture would be accepted as one
+// coherent thing.
+func (cs *ConfigStore) listTrinoEnabledOrgsCoherently(db *gorm.DB) ([]TrinoEnabledOrg, error) {
+	return cs.listTrinoEnabledOrgsWith(db, transactionScopeResolver(db))
+}
+
+func (cs *ConfigStore) listTrinoEnabledOrgsWith(db *gorm.DB, scope trinoScopeResolver) ([]TrinoEnabledOrg, error) {
 	var out []TrinoEnabledOrg
 	// Inner join with duckgres_org_users on (org_id, username='root') so a
 	// missing OrgUser row drops the org from the result. Inner join with
@@ -293,7 +309,7 @@ func (cs *ConfigStore) listTrinoEnabledOrgs(db *gorm.DB) ([]TrinoEnabledOrg, err
 	if len(out) == 0 {
 		return out, nil
 	}
-	if err := cs.attachTrinoOrgUsers(db, out); err != nil {
+	if err := cs.attachTrinoOrgUsersWith(db, out, scope); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -335,7 +351,44 @@ type trinoOrgUserRow struct {
 // project login may read. A scoped row whose scope cannot be resolved is
 // dropped rather than projected unscoped: an unresolvable scope must never
 // silently widen into org-wide access.
-func (cs *ConfigStore) attachTrinoOrgUsers(db *gorm.DB, orgs []TrinoEnabledOrg) error {
+// trinoScopeResolver answers "what may this project-scoped login see".
+//
+// The snapshot-backed resolver is the legacy behavior and stays the default.
+// The pooled acceptance path passes a resolver that reads the team row from ITS
+// OWN transaction instead: the in-memory snapshot is refreshed on a poll, so a
+// scope read from it can be older than the rows the same transaction just read,
+// and a projection accepted on that basis would be stamped as coherent while
+// mixing two ages of source data.
+type trinoScopeResolver func(orgID, username, mode string, teamID *int64) (OrgUserQueryAccess, bool)
+
+func (cs *ConfigStore) snapshotScopeResolver() trinoScopeResolver {
+	return func(orgID, username, _ string, _ *int64) (OrgUserQueryAccess, bool) {
+		return cs.OrgUserQueryAccess(orgID, username)
+	}
+}
+
+// transactionScopeResolver derives each scoped login's policy from the team
+// rows visible to THIS transaction.
+func transactionScopeResolver(db *gorm.DB) trinoScopeResolver {
+	return func(orgID, _, mode string, teamID *int64) (OrgUserQueryAccess, bool) {
+		if teamID == nil {
+			return OrgUserQueryAccess{}, false
+		}
+		var team OrgTeamConfig
+		err := db.Table("duckgres_org_teams").
+			Select("team_id, schema_name, enabled, events_table_name, persons_table_name, schema_data_imports_name").
+			Where("org_id = ? AND team_id = ?", orgID, *teamID).
+			Scan(&team).Error
+		if err != nil || team.TeamID != *teamID {
+			// No row, or the read failed: the scope is unresolvable, and an
+			// unresolvable scope must never widen into org-wide access.
+			return OrgUserQueryAccess{}, false
+		}
+		return OrgUserQueryAccessForTeam(mode, team), true
+	}
+}
+
+func (cs *ConfigStore) attachTrinoOrgUsersWith(db *gorm.DB, orgs []TrinoEnabledOrg, scope trinoScopeResolver) error {
 	ids := make([]string, 0, len(orgs))
 	for _, o := range orgs {
 		ids = append(ids, o.OrgID)
@@ -356,7 +409,7 @@ func (cs *ConfigStore) attachTrinoOrgUsers(db *gorm.DB, orgs []TrinoEnabledOrg) 
 	for _, r := range rows {
 		u := TrinoOrgUser{Username: r.Username, PasswordHash: r.Password}
 		if IsProjectScopedAccessMode(r.AccessMode) {
-			access, scoped := cs.OrgUserQueryAccess(r.OrgID, r.Username)
+			access, scoped := scope(r.OrgID, r.Username, r.AccessMode, r.TeamID)
 			if !scoped || r.TeamID == nil {
 				// The row says scoped but the snapshot does not agree --
 				// an unloaded or stale snapshot, or a user written since

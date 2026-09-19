@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -224,7 +225,27 @@ func checkLease(pool *TrinoPool, lease TrinoPoolLease) error {
 
 // withPoolAuthority runs fn under the pool row lock with the lease verified.
 func (cs *ConfigStore) withPoolAuthority(ctx context.Context, lease TrinoPoolLease, fn func(*gorm.DB, *TrinoPool) error) error {
+	return cs.withPoolAuthorityTx(ctx, lease, "", fn)
+}
+
+// withPoolAuthorityTx is withPoolAuthority at an explicit isolation level.
+//
+// Most lifecycle writes need only the row lock, so they run at the default.
+// Building a projection needs more: it reads several tables that other code
+// paths write, and under READ COMMITTED those reads can straddle a write and
+// produce a state the database never had.
+func (cs *ConfigStore) withPoolAuthorityTx(
+	ctx context.Context,
+	lease TrinoPoolLease,
+	isolation string,
+	fn func(*gorm.DB, *TrinoPool) error,
+) error {
 	return cs.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if isolation != "" {
+			if err := tx.Exec("SET TRANSACTION ISOLATION LEVEL " + isolation).Error; err != nil {
+				return fmt.Errorf("set transaction isolation: %w", err)
+			}
+		}
 		pool, err := lockTrinoPool(ctx, tx, lease.PoolID)
 		if err != nil {
 			return err
@@ -234,4 +255,39 @@ func (cs *ConfigStore) withPoolAuthority(ctx context.Context, lease TrinoPoolLea
 		}
 		return fn(tx, pool)
 	})
+}
+
+// withSerializedRetry retries a transaction that the database refused for
+// concurrency reasons.
+//
+// A snapshot transaction can be aborted by a concurrent writer, which is the
+// database doing its job rather than a fault: the work is simply re-read and
+// re-done. The bound is small and the error is surfaced afterwards, so a
+// genuinely contended or broken path fails visibly instead of spinning.
+func (cs *ConfigStore) withSerializedRetry(ctx context.Context, fn func(attempt int) error) error {
+	const attempts = 3
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		err = fn(attempt)
+		if err == nil || !isSerializationFailure(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	return err
+}
+
+// isSerializationFailure reports PostgreSQL's class 40 - serialization failure
+// and deadlock - which say "try again", not "this is wrong".
+func isSerializationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "40001" || pgErr.Code == "40P01"
+	}
+	return false
 }

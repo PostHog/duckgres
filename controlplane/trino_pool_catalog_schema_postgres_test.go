@@ -148,7 +148,12 @@ func TestCatalogWriterRefusesAnUnconfiguredSchema(t *testing.T) {
 func adminPostgresURL(t *testing.T) string {
 	t.Helper()
 	if dsn := strings.TrimSpace(os.Getenv("DUCKGRES_TEST_PG_DSN")); dsn != "" {
-		return dsn
+		// The suites that share this variable accept the keyword form, which
+		// the writer under test deliberately refuses (infra provisions a URL).
+		// Convert rather than skip: this test needs a real scoped role, and
+		// skipping it where the only PostgreSQL is configured that way would
+		// mean it never runs at all.
+		return postgresURLFromDSN(t, dsn)
 	}
 	const shared = "postgres://postgres:postgres@127.0.0.1:35432/testdb?sslmode=disable"
 	db, err := sql.Open("pgx", shared)
@@ -160,6 +165,40 @@ func adminPostgresURL(t *testing.T) string {
 		t.Skipf("no administrative PostgreSQL available: %v", err)
 	}
 	return shared
+}
+
+// postgresURLFromDSN accepts either form and returns a URL.
+func postgresURLFromDSN(t *testing.T, dsn string) string {
+	t.Helper()
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		return dsn
+	}
+	settings := map[string]string{}
+	for _, field := range strings.Fields(dsn) {
+		key, value, found := strings.Cut(field, "=")
+		if !found {
+			t.Skipf("DUCKGRES_TEST_PG_DSN is not a URL or a keyword DSN: %q", dsn)
+		}
+		settings[key] = value
+	}
+	host, database := settings["host"], settings["dbname"]
+	if host == "" || database == "" {
+		t.Skipf("DUCKGRES_TEST_PG_DSN names no host or database: %q", dsn)
+	}
+	user := url.User(settings["user"])
+	if password, present := settings["password"]; present {
+		user = url.UserPassword(settings["user"], password)
+	}
+	port := settings["port"]
+	if port == "" {
+		port = "5432"
+	}
+	query := url.Values{}
+	if sslmode, present := settings["sslmode"]; present {
+		query.Set("sslmode", sslmode)
+	}
+	built := url.URL{Scheme: "postgres", User: user, Host: host + ":" + port, Path: "/" + database, RawQuery: query.Encode()}
+	return built.String()
 }
 
 func mustExec(t *testing.T, db *sql.DB, statement string) {

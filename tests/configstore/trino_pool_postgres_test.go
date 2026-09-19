@@ -675,3 +675,118 @@ func TestAcceptedProjectionIsOrderedAndStableForUnchangedContent(t *testing.T) {
 		t.Fatalf("a superseded leader changed the accepted projection: %+v", projection)
 	}
 }
+
+// The projection a pooled cell accepts must describe ONE state of the database.
+//
+// The pool row lock serializes acceptances against each other, but nothing
+// stops the org/user/team writers - so under the default isolation the separate
+// reads this builds from could straddle such a write and be accepted as a
+// coherent projection that never existed.
+func TestAcceptedProjectionReadsOneSnapshotOfItsSources(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	seedTrinoOrg(t, store, "acme")
+	if err := store.EnableTrino("acme", cpconfigstore.TrinoSettings{}); err != nil {
+		t.Fatalf("EnableTrino: %v", err)
+	}
+
+	// A writer commits a NEW tenant while the builder is between its reads.
+	var seenFirst, seenSecond int
+	_, _, err := store.AcceptTrinoPoolProjectionFrom(ctx, lease, func(sources cpconfigstore.TrinoProjectionSources) (string, error) {
+		seenFirst = len(sources.Orgs)
+		// This commits in another session, after the transaction's snapshot was
+		// taken. A repeatable-read transaction must not see it.
+		seedTrinoOrg(t, store, "beta")
+		if err := store.EnableTrino("beta", cpconfigstore.TrinoSettings{}); err != nil {
+			return "", err
+		}
+		again, err := sources.Reread()
+		if err != nil {
+			return "", err
+		}
+		seenSecond = len(again)
+		return "digest-1", nil
+	})
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if seenFirst != 1 {
+		t.Fatalf("the builder saw %d orgs, want the one that existed", seenFirst)
+	}
+	if seenSecond != seenFirst {
+		t.Fatalf("a second read inside the same acceptance saw %d orgs after %d: the projection is built from two different states",
+			seenSecond, seenFirst)
+	}
+}
+
+// A project-scoped login's policy must come from the SAME read as the rest of
+// the projection.
+//
+// The snapshot-backed resolver is refreshed on a poll, so a scope taken from it
+// can be older than the rows the acceptance transaction just read - and the
+// result would be accepted as one coherent projection. Here the team is
+// disabled in the database and the snapshot is deliberately NOT reloaded: the
+// accepted projection must reflect the database.
+func TestAcceptedProjectionDerivesScopesFromItsOwnRead(t *testing.T) {
+	ctx := context.Background()
+	store := newPoolStore(t)
+	lease := claimPool(t, store, "cp-a")
+
+	seedTrinoOrg(t, store, "acme")
+	if err := store.EnableTrino("acme", cpconfigstore.TrinoSettings{}); err != nil {
+		t.Fatalf("EnableTrino: %v", err)
+	}
+	if _, err := cpconfigstore.UpsertOrgTeamTx(store.DB(), "acme", cpconfigstore.OrgTeamUpsert{
+		TeamID: 7, SchemaName: "posthog_7",
+	}); err != nil {
+		t.Fatalf("UpsertOrgTeamTx: %v", err)
+	}
+	if err := store.CreateOrgUser("acme", "posthog_team_7", "$2a$10$team7"); err != nil {
+		t.Fatalf("CreateOrgUser: %v", err)
+	}
+	if err := store.DB().Exec(
+		`UPDATE duckgres_org_users SET access_mode = 'project_reader', team_id = 7
+		  WHERE org_id = 'acme' AND username = 'posthog_team_7'`).Error; err != nil {
+		t.Fatalf("bind the project login: %v", err)
+	}
+	if err := store.ReloadSnapshot(); err != nil {
+		t.Fatalf("ReloadSnapshot: %v", err)
+	}
+
+	// The team is disabled in the database. Nothing reloads the snapshot, so
+	// the cache still reports the login as scoped to an enabled team.
+	if err := store.DB().Exec(
+		`UPDATE duckgres_org_teams SET enabled = false WHERE org_id = 'acme' AND team_id = 7`).Error; err != nil {
+		t.Fatalf("disable the team: %v", err)
+	}
+
+	var scoped *cpconfigstore.TrinoOrgUser
+	if _, _, err := store.AcceptTrinoPoolProjectionWith(ctx, lease, func(orgs []cpconfigstore.TrinoEnabledOrg) (string, error) {
+		for i := range orgs {
+			for j := range orgs[i].Users {
+				if orgs[i].Users[j].Username == "posthog_team_7" {
+					scoped = &orgs[i].Users[j]
+				}
+			}
+		}
+		return "digest-1", nil
+	}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if scoped == nil || scoped.Scope == nil {
+		t.Fatalf("the project login was dropped or unscoped: %+v", scoped)
+	}
+	if len(scoped.Scope.AllowedSchemas) != 0 || !scoped.Scope.ReadOnly {
+		t.Fatalf("scope = %+v, want the fail-closed policy the DISABLED team implies, not the cached one",
+			*scoped.Scope)
+	}
+
+	// The cache, unreloaded, still reports the old policy - which is exactly
+	// why the projection must not be built from it.
+	cached, ok := store.OrgUserQueryAccess("acme", "posthog_team_7")
+	if !ok || len(cached.AllowedSchemas) == 0 {
+		t.Fatalf("the snapshot cache no longer holds the stale policy (%+v, ok=%v); this test proves nothing", cached, ok)
+	}
+}
