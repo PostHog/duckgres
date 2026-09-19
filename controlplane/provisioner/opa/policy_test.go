@@ -2061,7 +2061,8 @@ func TestTrinoProvisionerCatalogStatesAreNarrow(t *testing.T) {
 		allowed bool
 	}{
 		{AdminPrincipal, []string{"catalog_name", "state"}, true},
-		{AdminPrincipal, []string{"connector_name"}, false},
+		{AdminPrincipal, []string{"connector_name"}, true},
+		{AdminPrincipal, []string{"connector_id"}, false},
 		{ObserverPrincipal, []string{"catalog_name", "state"}, false},
 		{"42", []string{"catalog_name", "state"}, false},
 	} {

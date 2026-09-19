@@ -56,34 +56,36 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 35)
 	requireGooseMigrationRecorded(t, db, 36)
 	requireGooseMigrationRecorded(t, db, 38)
+	requireGooseMigrationRecorded(t, db, 39)
 	requireGooseMigrationRecorded(t, db, 40)
 	requireGooseMigrationRecorded(t, db, 41)
 	requireGooseMigrationRecorded(t, db, 42)
 	requireGooseMigrationRecorded(t, db, 43)
 	requireGooseMigrationRecorded(t, db, 44)
 	requireGooseMigrationRecorded(t, db, 45)
-	requireGooseLatestVersion(t, db, 45)
+	requireGooseMigrationRecorded(t, db, 46)
+	requireGooseLatestVersion(t, db, 46)
 	requireTablePresent(t, db, "duckgres_trino_cell_lifecycle")
 	for _, column := range []string{"reconcile_owner", "reconcile_epoch", "intent_sequence", "intent", "admission_epoch", "freeze_operation_id", "freeze_stable", "certificate"} {
 		requireColumnPresent(t, db, "duckgres_trino_cell_lifecycle", column)
 	}
 	requireTableAbsent(t, db, "duckgres_schema_migrations")
 
-	// Migration 000040 added the shared Trino compute pool tables. They stay
+	// Migration 000041 added the shared Trino compute pool tables. They stay
 	// empty and unread while the feature flags are off.
 	requireTablePresent(t, db, "duckgres_trino_pools")
-	// Migration 000042 added the desired generation: the authority epoch says
+	// Migration 000043 added the desired generation: the authority epoch says
 	// who may write, not whether what they hold is current.
 	requireColumnPresent(t, db, "duckgres_trino_pools", "desired_generation")
 	for _, column := range []string{"api_mode", "desired_release_id", "desired_instances", "min_serving", "max_surge", "max_repair", "authority_epoch", "authority_owner", "publication_revision", "admitted_revision", "frozen", "frozen_reason"} {
 		requireColumnPresent(t, db, "duckgres_trino_pools", column)
 	}
 	requireTablePresent(t, db, "duckgres_trino_pool_instances")
-	// Migration 000041 added the worker config map inventory (it leaked on every
+	// Migration 000042 added the worker config map inventory (it leaked on every
 	// retirement without it), the repair target the Gateway needs to charge the
 	// repair budget, and the recorded failure reason.
 	for _, column := range []string{"release_id", "spec_digest", "blueprint_snapshot", "phase", "owner_epoch", "repair", "repair_for", "failure_reason", "coordinator_deployment_uid", "worker_deployment_uid", "service_uid", "config_map_uid", "worker_config_map_name", "worker_config_map_uid", "coordinator_pod_uid", "coordinator_node_id", "coordinator_boot_id", "endpoint_url", "gateway_incarnation", "gateway_generation", "applied_catalog_revision", "validation_receipt", "retirement_receipt",
-		// Migration 000043: the coordinator identity the GATEWAY observed at
+		// Migration 000044: the coordinator identity the GATEWAY observed at
 		// registration. A loss claim must present it exactly, or a failed member
 		// keeps its live slot forever.
 		"coordinator_id"} {
@@ -96,12 +98,12 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireTablePresent(t, db, "duckgres_trino_pool_operation_steps")
 	requireColumnPresent(t, db, "duckgres_trino_pool_operation_steps", "payload_hash")
 	requireTablePresent(t, db, "duckgres_trino_pool_publications")
-	// Migration 000044 added the barrier's own revision strings: which binding
+	// Migration 000045 added the barrier's own revision strings: which binding
 	// was published, which target is open, and which one committed. They are
 	// durable because an in-memory record cannot survive a leadership move.
 	for _, column := range []string{"desired_revision", "published_revision", "admitted_revision", "publication_id", "state", "gateway_receipt",
 		"principal_revision", "target_revision", "admitted_target_revision",
-		// Migration 000045: which attempt is in flight for this tenant, and the
+		// Migration 000046: which attempt is in flight for this tenant, and the
 		// durable per-tenant backoff that keeps one failing warehouse from
 		// starving the queue the driver walks one tenant at a time.
 		"attempt", "attempts", "next_attempt_at"} {
@@ -301,6 +303,9 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 		"enabled",
 		"tier",
 		"trino_cell_id",
+		"backend",
+		"backend_selected",
+		"hoglake_initialized",
 		"state",
 		"status_message",
 		"ready_at",
@@ -376,7 +381,8 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_trino_pool_operations;
 			DROP TABLE IF EXISTS duckgres_trino_pool_instances;
 			DROP TABLE IF EXISTS duckgres_trino_pools;
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45);
+			DROP FUNCTION IF EXISTS duckgres_select_trino_backend_on_enable();
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -427,7 +433,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 35)
 	requireGooseMigrationRecorded(t, upgradedDB, 36)
 	requireGooseMigrationRecorded(t, upgradedDB, 38)
-	requireGooseLatestVersion(t, upgradedDB, 45)
+	requireGooseLatestVersion(t, upgradedDB, 46)
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
 	requireColumnDefault(t, upgradedDB, "duckgres_orgs", "max_vcpus", "0")
@@ -483,7 +489,8 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		DROP TABLE IF EXISTS duckgres_trino_pool_operations;
 		DROP TABLE IF EXISTS duckgres_trino_pool_instances;
 		DROP TABLE IF EXISTS duckgres_trino_pools;
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45);
+		DROP FUNCTION IF EXISTS duckgres_select_trino_backend_on_enable();
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}
@@ -1390,4 +1397,63 @@ func metadataDiff[T any](migrated, gorm map[string]T) string {
 		out += fmt.Sprintf("%s\n  migrated: %#v\n  gorm:     %#v\n", key, migratedValue, gormValue)
 	}
 	return out
+}
+
+func TestConfigStoreMigration40PinsExistingTrinoBackends(t *testing.T) {
+	_, connStr := newIsolatedConfigStoreSchema(t)
+	store, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := storeDB(t, store)
+	t.Cleanup(func() { _ = db.Close() })
+	if err := store.DB().Exec(`
+  DROP TRIGGER duckgres_select_trino_backend_on_enable ON duckgres_managed_warehouse_trino;
+  DROP FUNCTION duckgres_select_trino_backend_on_enable();
+  ALTER TABLE duckgres_managed_warehouse_trino DROP COLUMN backend, DROP COLUMN backend_selected, DROP COLUMN hoglake_initialized;
+  -- The shared Trino pool's migrations sit ABOVE this one, so rewinding 40
+  -- alone would leave the database at version 46 with 40 missing, which goose
+  -- refuses as an out-of-order migration. Rewind the pool's versions with it
+  -- and let the upgrade re-apply 40 through 46 in order: the pool tables are
+  -- self-contained, so dropping them restores exactly the pre-40 shape this
+  -- test needs.
+  DROP TABLE IF EXISTS duckgres_trino_pool_projection;
+  DROP TABLE IF EXISTS duckgres_trino_pool_publications;
+  DROP TABLE IF EXISTS duckgres_trino_pool_operation_steps;
+  DROP TABLE IF EXISTS duckgres_trino_pool_operations;
+  DROP TABLE IF EXISTS duckgres_trino_pool_instances;
+  DROP TABLE IF EXISTS duckgres_trino_pools;
+  DELETE FROM goose_db_version WHERE version_id >= 40;
+  INSERT INTO duckgres_orgs (name,database_name) VALUES ('old-enabled','old_enabled'),('old-disabled','old_disabled'),('old-cell-only','old_cell_only');
+  INSERT INTO duckgres_managed_warehouse_trino (org_id,enabled) VALUES ('old-enabled',TRUE),('old-disabled',FALSE),('old-cell-only',FALSE);
+ `).Error; err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := cpconfigStoreNew(connStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upgradedDB := storeDB(t, upgraded)
+	t.Cleanup(func() { _ = upgradedDB.Close() })
+	for _, org := range []string{"old-enabled", "old-disabled", "old-cell-only"} {
+		row, err := upgraded.GetManagedWarehouseTrino(org)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.Backend != cpconfigstore.TrinoBackendDuckLake || !row.BackendSelected {
+			t.Fatalf("existing backend not pinned: %+v", row)
+		}
+	}
+	// During a rolling upgrade old binaries omit the new columns. They must
+	// still pin newly enabled/disabled DuckLake catalogs to their original backend.
+	if err := upgraded.DB().Exec(`INSERT INTO duckgres_orgs (name,database_name) VALUES ('old-binary','old_binary'); INSERT INTO duckgres_managed_warehouse_trino (org_id,enabled) VALUES ('old-binary',FALSE)`).Error; err != nil {
+		t.Fatal(err)
+	}
+	row, err := upgraded.GetManagedWarehouseTrino("old-binary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !row.BackendSelected {
+		t.Fatal("old binary did not pin default backend")
+	}
 }

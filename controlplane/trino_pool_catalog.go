@@ -110,8 +110,54 @@ func (w *trinoPoolCatalogWriter) ClaimWriter(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, err := publisher.Takeover(ctx); err != nil {
+	state, err := publisher.Takeover(ctx)
+	if err != nil {
 		return fmt.Errorf("claim catalog writer: %w", err)
+	}
+	// Checkpoint the watermark from the state the takeover just read.
+	//
+	// The catalog store is authoritative for which revision is published; the
+	// pool row only CACHES it for the admission gate. A previous term can have
+	// committed a catalog and then failed to record the revision, and nothing
+	// else republishes it - later catalogs already exist, so no later mutation
+	// arrives to carry the number forward. Reading it here is the bounded
+	// recovery: a leadership change is exactly when somebody can fix it.
+	//
+	// A failed checkpoint fails the claim. Installing the writer anyway would
+	// leave the gate believing an older revision, which is how a tenant is
+	// admitted and reported ready without its catalog.
+	if err := w.checkpoint(ctx, state.Revision); err != nil {
+		return err
+	}
+	return nil
+}
+
+// PublishedRevision reports the revision the catalog store itself is at.
+//
+// This is the authority for the admission gate: the pool row's
+// publication_revision is a cache of it, and a cache that failed to update is
+// indistinguishable from "nothing new was published" unless somebody asks the
+// store.
+func (w *trinoPoolCatalogWriter) PublishedRevision(ctx context.Context) (int64, error) {
+	publisher, err := w.publisher()
+	if err != nil {
+		return 0, err
+	}
+	state, err := publisher.State(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("read catalog writer state: %w", err)
+	}
+	return state.Revision, nil
+}
+
+// checkpoint records a revision on the pool row under the CURRENT authority.
+func (w *trinoPoolCatalogWriter) checkpoint(ctx context.Context, revision int64) error {
+	lease, held := w.authority()
+	if !held || w.store == nil || revision <= 0 {
+		return nil
+	}
+	if err := w.store.RecordTrinoPoolPublicationRevision(ctx, lease, w.cellID, revision); err != nil {
+		return fmt.Errorf("checkpoint published catalog revision %d: %w", revision, err)
 	}
 	return nil
 }
@@ -150,6 +196,47 @@ func (w *trinoPoolCatalogWriter) ListCatalogs(ctx context.Context) ([]string, er
 		return nil, fmt.Errorf("read published catalogs: %w", err)
 	}
 	return catalogs, nil
+}
+
+// CatalogConnectors reports which connector each published catalog declares.
+//
+// The managed-Hoglake path refuses to adopt an existing catalog it cannot
+// inspect: an org whose catalog is still DuckLake must be migrated explicitly,
+// never silently re-pointed at Hoglake metadata. On a coordinator-mediated cell
+// that inspection is a `system.metadata.catalogs` query; a pooled cell has no
+// fixed coordinator to ask, so the same question is answered from the store the
+// coordinators reconcile FROM.
+//
+// What this reports is the PUBLISHED definition, not a running coordinator's
+// applied state, and the two differ while a member is still catching up. That
+// is sound for this check and only this check - it decides whether duckgres may
+// replace its own published definition. Whether any member has actually applied
+// it stays with pool admission, which proves it per member against the
+// published revision; nothing here may be read as evidence that a catalog is
+// operational.
+func (w *trinoPoolCatalogWriter) CatalogConnectors(ctx context.Context) (map[string]string, error) {
+	rows, err := w.db.QueryContext(ctx,
+		`SELECT catalog_name, connector_name FROM trino_catalogs WHERE cell_id = $1`, w.cellID)
+	if err != nil {
+		return nil, fmt.Errorf("read published catalog connectors: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	connectors := map[string]string{}
+	for rows.Next() {
+		var name, connector string
+		if err := rows.Scan(&name, &connector); err != nil {
+			return nil, fmt.Errorf("read published catalog connector: %w", err)
+		}
+		if name == "" || connector == "" {
+			return nil, fmt.Errorf("published catalog inventory is incomplete for cell %s", w.cellID)
+		}
+		connectors[name] = connector
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read published catalog connectors: %w", err)
+	}
+	return connectors, nil
 }
 
 func (w *trinoPoolCatalogWriter) CreateCatalog(ctx context.Context, name string, properties map[string]string) error {
@@ -226,14 +313,20 @@ func (w *trinoPoolCatalogWriter) publish(ctx context.Context, mutation trinocata
 	// can be admitted. Recording it is what arms that gate; without it every
 	// coordinator is certified at revision zero and a member missing the newest
 	// tenant looks current.
+	//
+	// A failed checkpoint is RETURNED, not logged and dropped. The catalog is
+	// committed either way, but nothing republishes it: later catalogs already
+	// exist, so no future mutation carries the number forward, and the gate
+	// would keep certifying members against a revision that predates this
+	// tenant - admitting it, and reporting the warehouse ready, without its
+	// catalog. Surfacing it holds that org not-ready until a later tick or the
+	// next leadership claim checkpoints the watermark, and the publication
+	// itself resolves as a replay.
 	if held && w.store != nil && result.Revision > 0 {
 		if err := w.store.RecordTrinoPoolPublicationRevision(ctx, lease, w.cellID, result.Revision); err != nil {
-			// The catalog IS published; only the gate lags. Failing the
-			// provisioner's reconcile here would mark a tenant failed over a
-			// bookkeeping write, so this is surfaced and retried on the next
-			// publication rather than propagated.
-			slog.Warn("Trino pool publication revision could not be recorded.",
+			slog.Error("Trino pool publication revision could not be recorded; tenant admission stays closed until it is.",
 				"cell", w.cellID, "revision", result.Revision, "error", err)
+			return fmt.Errorf("checkpoint published catalog revision %d: %w", result.Revision, err)
 		}
 	}
 	return nil

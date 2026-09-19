@@ -3,7 +3,14 @@
 Duckgres reports a tenant ready only after its catalog reconciles and its
 current metadata password has been observed in the mounted Secret on every
 active member of every configured running backend. This includes an active
-coordinator and at least one active worker. Successful `CREATE CATALOG` checks
+coordinator and at least one active worker. Coordinator `password.db` and `group.db` must
+also match the desired authentication projection, and their configured file
+refresh periods must expire after observation on the same container. Until
+then, readiness remains pending across reconcile ticks. The observer reads the
+file-provider configuration; it does not assume a fixed refresh interval. The
+mounted Secret generation invalidates cached observations even if another
+control-plane replica handles a full disable/re-enable cycle between checks.
+Successful `CREATE CATALOG` checks
 the coordinator; it does not acknowledge workers' independent Secret mounts.
 
 The provisioner queries `system.runtime.nodes`, matches member addresses to
@@ -30,7 +37,7 @@ on every reconcile, including for existing catalogs and ready tenants.
   container. The default mount is `/etc/trino/tenant-secrets`; an explicit
   `DUCKGRES_TRINO_TENANT_SECRET_MOUNT_PATH` must match the actual mount. A
   `subPath` mount cannot receive projected Secret updates and is rejected.
-- The Trino image must contain `/bin/sh` and `sha256sum`. Member HTTP URIs must
+- The Trino image must contain `/bin/sh`, `sha256sum`, `cat`, and `readlink`. Member HTTP URIs must
   identify pod IPs in that namespace. Ambiguous container mappings are rejected.
 - Publish the updated Duckgres OPA bundle. The provisioner administrator needs
   narrow read access to `system.runtime.nodes`; tenant access remains denied.

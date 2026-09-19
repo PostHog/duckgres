@@ -34,6 +34,23 @@ type fakePoolStore struct {
 	// staleGeneration simulates a desired spec whose generation is behind the
 	// published one.
 	staleGeneration bool
+	// failRevisionCheckpoint simulates the write of the published catalog
+	// revision failing after the catalog itself committed.
+	failRevisionCheckpoint bool
+	// recordedRevisions is every checkpoint the operator wrote, in order.
+	recordedRevisions []int64
+}
+
+func (f *fakePoolStore) RecordTrinoPoolPublicationRevision(_ context.Context, lease configstore.TrinoPoolLease, _ string, revision int64) error {
+	if lease.Epoch != f.epoch {
+		return configstore.ErrTrinoPoolConflict
+	}
+	if f.failRevisionCheckpoint {
+		return errors.New("checkpoint refused")
+	}
+	f.recordedRevisions = append(f.recordedRevisions, revision)
+	f.pool.PublicationRevision = revision
+	return nil
 }
 
 func newFakePoolStore(spec configstore.TrinoPoolSpec) *fakePoolStore {

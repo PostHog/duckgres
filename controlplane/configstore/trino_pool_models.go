@@ -7,7 +7,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/trinopool"
 )
 
-// Durable state of the shared Trino compute pool. Migration 000040 owns the
+// Durable state of the shared Trino compute pool. Migration 000041 owns the
 // physical schema. Everything here is inert unless a registered cell declares
 // shared-pool mode and the feature flag is on.
 

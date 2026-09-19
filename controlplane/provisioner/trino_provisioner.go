@@ -335,7 +335,8 @@ type TrinoProvisionerOpts struct {
 	// there is exactly ONE definition of "the tenant's metadata password"
 	// in the control plane. Required: without it the tenant Secret cannot
 	// be projected and every catalog would sit pending forever.
-	Ducklings TrinoDucklingResolver
+	Ducklings        TrinoDucklingResolver
+	HoglakeDucklings TrinoDucklingResolver
 
 	// Kubernetes is used for the auth Secret, tenant-password Secret and
 	// resource-groups ConfigMap projections in the Trino namespace.
@@ -344,6 +345,10 @@ type TrinoProvisionerOpts struct {
 	// SecretReadiness confirms the tenant credentials visible on serving Trino
 	// nodes. Nil uses Kubernetes pod exec with in-cluster credentials.
 	SecretReadiness TrinoSecretReadiness
+
+	// AuthenticationReadiness observes coordinator login files and cache expiry.
+	// Nil uses the Kubernetes observer.
+	AuthenticationReadiness TrinoAuthenticationReadiness
 
 	// Namespace overrides TrinoCustomerNamespace. Empty == default.
 	// Useful for dev clusters that namespace Trino differently.
@@ -405,9 +410,11 @@ type TrinoProvisionerOpts struct {
 	// catalogs. Defaults to false. Trino nodes must configure a cache manager.
 	FilesystemCacheEnabled bool
 
-	// HoglakeURI selects Hoglake catalogs using the pod's S3 credentials.
-	// Empty retains the default DuckLake catalog configuration.
-	HoglakeURI string
+	// HoglakeURI is deprecated and has no effect on catalog selection.
+	// Retained so older deployment settings do not prevent existing clients
+	// from starting; persisted tenant backends are authoritative in all cells.
+	HoglakeURI     string
+	ManagedHoglake *TrinoManagedHoglakeConfig
 }
 
 // TrinoBootstrapSentinelStore is the narrow configstore surface the
@@ -481,8 +488,10 @@ type TrinoProvisioner struct {
 	bootstrapSentinel      TrinoBootstrapSentinelStore
 	warehouses             TrinoWarehouseStore
 	ducklings              TrinoDucklingResolver
+	hoglakeDucklings       TrinoDucklingResolver
 	kubernetes             kubernetes.Interface
 	secretReadiness        TrinoSecretReadiness
+	authReadiness          TrinoAuthenticationReadiness
 	namespace              string
 	cellID                 string
 	explicitAssignmentOnly bool
@@ -511,7 +520,7 @@ type TrinoProvisioner struct {
 	awsRegion              string
 	s3MaxConnections       int
 	filesystemCacheEnabled bool
-	hoglakeURI             string
+	managedHoglake         *TrinoManagedHoglakeConfig
 
 	// adminPasswordHash is cached on each Reconcile from the
 	// trino-auth K8s Secret and prepended to password.db on projection.
@@ -565,6 +574,14 @@ func (p *TrinoProvisioner) setObserverCredential(plaintext, hash string) {
 // Returns an error if any required dep is missing rather than panicking
 // downstream on the first reconcile tick.
 func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
+	if opts.HoglakeURI != "" {
+		slog.Warn("Legacy Trino Hoglake URI setting is ignored; configure managed Hoglake provisioning for new clients.")
+	}
+	if opts.ManagedHoglake != nil {
+		if err := opts.ManagedHoglake.Validate(); err != nil {
+			return nil, err
+		}
+	}
 	if opts.Store == nil {
 		return nil, errors.New("TrinoProvisioner: Store is required")
 	}
@@ -614,14 +631,20 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if secretReadiness == nil {
 		secretReadiness = NewKubernetesTrinoSecretReadiness(opts.Kubernetes, nil)
 	}
+	authReadiness := opts.AuthenticationReadiness
+	if authReadiness == nil {
+		authReadiness = NewKubernetesTrinoAuthenticationReadiness(opts.Kubernetes, nil)
+	}
 	result := &TrinoProvisioner{
 		managed:                 opts.ManagedCatalogs,
 		store:                   opts.Store,
 		bootstrapSentinel:       opts.BootstrapSentinel,
 		warehouses:              opts.Warehouses,
 		ducklings:               opts.Ducklings,
+		hoglakeDucklings:        opts.HoglakeDucklings,
 		kubernetes:              opts.Kubernetes,
 		secretReadiness:         secretReadiness,
+		authReadiness:           authReadiness,
 		namespace:               ns,
 		cellID:                  cell,
 		explicitAssignmentOnly:  opts.ExplicitAssignmentOnly,
@@ -635,7 +658,7 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 		awsRegion:               opts.AWSRegion,
 		s3MaxConnections:        maxConns,
 		filesystemCacheEnabled:  opts.FilesystemCacheEnabled,
-		hoglakeURI:              opts.HoglakeURI,
+		managedHoglake:          opts.ManagedHoglake,
 	}
 	if opts.ManagedCatalogs != nil {
 		if err := result.ConfigureManagedCatalogs(opts.ManagedCatalogs); err != nil {
@@ -1708,12 +1731,29 @@ func (p *TrinoProvisioner) reconcileTenantSecrets(ctx context.Context, orgs []co
 				"org id %q is not a valid Kubernetes Secret data key ([-._a-zA-Z0-9]+); its metadata-store password cannot be projected", o.OrgID)
 			continue
 		}
-		status, err := p.ducklings(ctx, o.OrgID)
+		resolve := p.ducklings
+		if isManagedHoglake(o) {
+			if p.hoglakeDucklings == nil {
+				proj.failed[o.OrgID] = errors.New("Hoglake storage status resolver is unavailable")
+				continue
+			}
+			resolve = p.hoglakeDucklings
+		}
+		status, err := resolve(ctx, o.OrgID)
 		if err != nil {
 			// Deliberately not wrapped with the org's infrastructure
 			// detail beyond what the resolver said — this string ends up
 			// in status_message, which operators read.
 			proj.failed[o.OrgID] = fmt.Errorf("resolve metadata-store password: %w", err)
+			continue
+		}
+		if isManagedHoglake(o) {
+			if status == nil || status.IAMRoleARN == "" || !status.ReadyCondition {
+				proj.pending[o.OrgID] = "waiting for the tenant storage composition and IAM role"
+				continue
+			}
+			proj.projected[o.OrgID] = true
+			proj.statuses[o.OrgID] = status
 			continue
 		}
 		if status == nil || status.MetadataStore.Password == "" {
@@ -1745,10 +1785,10 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	orgs []configstore.TrinoEnabledOrg,
 	tenants tenantSecretProjection,
 ) (map[string]catalogOutcome, error) {
-	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalogClient())
+	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalogClient(), "primary")
 	errs := []error{firstErr}
 	for i, catalog := range p.additionalCatalogs {
-		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog)
+		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog, fmt.Sprintf("additional-%d", i))
 		if err != nil {
 			errs = append(errs, fmt.Errorf("additional running backend %d: %w", i, err))
 		}
@@ -1764,7 +1804,7 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	return outcomes, errors.Join(errs...)
 }
 
-func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []configstore.TrinoEnabledOrg, tenants tenantSecretProjection, catalog TrinoCatalogClient) (map[string]catalogOutcome, error) {
+func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []configstore.TrinoEnabledOrg, tenants tenantSecretProjection, catalog TrinoCatalogClient, backend string) (map[string]catalogOutcome, error) {
 	backendCtx, cancel := context.WithTimeout(ctx, p.catalogTimeout)
 	defer cancel()
 	outcomes, catalogErr := p.reconcileBackendCatalogs(backendCtx, orgs, tenants, catalog)
@@ -1778,7 +1818,7 @@ func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []c
 		return outcomes, catalogErr
 	}
 
-	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected)
+	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected, backend)
 	if errors.Is(readinessErr, ErrTrinoNodeInventoryUnavailable) {
 		// A pooled cell has no single coordinator to take an inventory from, and
 		// inventing one would be worse than skipping: its readiness evidence is
@@ -1802,7 +1842,7 @@ func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []c
 // A successful CREATE CATALOG only validates the coordinator's local files.
 // Observe the same credentials on every active member before declaring this
 // backend ready, including when the catalog already existed on this tick.
-func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalog TrinoCatalogClient, expected map[string][]byte) (map[string]string, error) {
+func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalog TrinoCatalogClient, expected map[string][]byte, backend string) (map[string]string, error) {
 	nodes, err := catalog.ListNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("read Trino readiness membership: %w", err)
@@ -1816,10 +1856,24 @@ func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalo
 	if !coordinator || !worker {
 		return trinoAllPending(expected, "waiting for an active Trino coordinator and worker"), nil
 	}
-	pending, err := p.secretReadiness.Check(ctx, p.namespace, p.tenantSecretMountPath, expected, active)
+	credentials := make(map[string][]byte)
+	for org, password := range expected {
+		if len(password) != 0 {
+			credentials[org] = password
+		}
+	}
+	pending, err := p.secretReadiness.Check(ctx, p.namespace, p.tenantSecretMountPath, credentials, active)
 	if err != nil {
 		return nil, fmt.Errorf("verify Trino mounted credentials: %w", err)
 	}
+	authReady, err := p.authReadiness.Check(ctx, p.namespace, backend, active)
+	if err != nil {
+		return nil, fmt.Errorf("verify Trino coordinator authentication: %w", err)
+	}
+	if !authReady {
+		return trinoAllPending(expected, "waiting for coordinator authentication projection and refresh"), nil
+	}
+
 	after, err := catalog.ListNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("verify Trino readiness membership: %w", err)
@@ -1885,6 +1939,8 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 		wanted[TrinoCatalogName(o.TrinoPrincipal())] = true
 	}
 
+	connectors, inventoryErr := hoglakeConnectorInventory(ctx, catalog, orgs)
+	createdHoglake := make(map[string]string)
 	var errs []error
 	for _, o := range orgs {
 		// No principal means no derivable catalog name. The listing query
@@ -1914,6 +1970,23 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 		}
 		if !tenants.projected[o.OrgID] {
 			outcomes[o.OrgID] = catalogOutcome{Pending: true, PendingReason: "metadata-store password not projected yet"}
+			continue
+		}
+
+		if isManagedHoglake(o) {
+			err := inventoryErr
+			if err == nil {
+				err = p.reconcileHoglakeCatalog(ctx, catalog, name, o.OrgID, tenants.statuses[o.OrgID], existingSet[name], connectors)
+			}
+			if err != nil {
+				outcomes[o.OrgID] = catalogOutcome{Err: err}
+				errs = append(errs, err)
+			} else {
+				outcomes[o.OrgID] = catalogOutcome{Created: !existingSet[name], Existed: existingSet[name]}
+				if !existingSet[name] {
+					createdHoglake[o.OrgID] = name
+				}
+			}
 			continue
 		}
 
@@ -1974,6 +2047,21 @@ func (p *TrinoProvisioner) reconcileBackendCatalogs(
 		}
 		slog.Info("Trino reconcile: catalog created.", "org", o.OrgID, "catalog", name)
 		outcomes[o.OrgID] = catalogOutcome{Created: true}
+	}
+
+	// Verify actual post-DDL state once for the entire batch before admission.
+	if len(createdHoglake) > 0 {
+		refreshed, refreshErr := hoglakeConnectorInventory(ctx, catalog, orgs)
+		for orgID, name := range createdHoglake {
+			err := refreshErr
+			if err == nil {
+				err = verifyHoglakeConnector(refreshed, name)
+			}
+			if err != nil {
+				outcomes[orgID] = catalogOutcome{Err: err}
+				errs = append(errs, fmt.Errorf("verify created catalog %s: %w", name, err))
+			}
+		}
 	}
 
 	for _, c := range existing {
@@ -2074,15 +2162,7 @@ func (p *TrinoProvisioner) buildCatalogProperties(orgID string, w *configstore.M
 	if region == "" {
 		region = p.awsRegion
 	}
-	if p.hoglakeURI != "" {
-		return map[string]string{
-			"connector.name":    "hoglake",
-			"hoglake.uri":       p.hoglakeURI,
-			"hoglake.catalog":   orgID,
-			"fs.cache.enabled":  strconv.FormatBool(p.filesystemCacheEnabled),
-			"hoglake.s3.region": region,
-		}
-	}
+
 	return map[string]string{
 		"connector.name":                    "ducklake",
 		"ducklake.metadata.connection-url":  ducklakeMetadataJDBCURL(d),
@@ -2214,12 +2294,16 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 	// The unfenced path, unchanged: no projection revision is stamped and the
 	// write is the ordinary merge. A fenced cell does not come through here at
 	// all - see reconcileFencedProjection.
-	if err := p.upsertSecretMerge(ctx, TrinoAuthSecretName, map[string][]byte{
+	files := map[string][]byte{
 		TrinoAuthSecretKeyPasswordDB: []byte(passwordDB),
 		TrinoAuthSecretKeyGroupDB:    []byte(groupDB),
-	}); err != nil {
+	}
+	if err := p.upsertSecretMerge(ctx, TrinoAuthSecretName, files); err != nil {
 		return err
 	}
+	// Update even when no tenant catalogs remain: disabling must invalidate
+	// any previous authentication observation before a later re-enable.
+	p.authReadiness.SetExpected(files)
 	// The fingerprints of the bytes just projected. A pooled candidate must
 	// report loading exactly these before it may be admitted: its OPA bundle
 	// and its password file arrive by different paths and at different times,

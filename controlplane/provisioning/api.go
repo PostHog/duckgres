@@ -91,6 +91,7 @@ type Store interface {
 	// leaves the row in place so the provisioner observes the transition
 	// and cleans up the catalog, the tenant Secret key and the password
 	// file entry on next reconcile.
+	GetManagedWarehouseTrino(orgID string) (*configstore.ManagedWarehouseTrino, error)
 	EnableTrino(orgID string, settings configstore.TrinoSettings) error
 	DisableTrino(orgID string) error
 	// Team CRUD for the PostHog backend (duckgres_org_teams rows — config
@@ -141,8 +142,11 @@ func RegisterAPIWithIngressSuffix(r *gin.RouterGroup, store Store, tenantStore T
 }
 
 // RegisterAPIWithTrinoAdmission optionally checks cell assignment before enabling Trino.
-func RegisterAPIWithTrinoAdmission(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout, ingressSuffix string, admission func(string) error) {
+func RegisterAPIWithTrinoAdmission(r *gin.RouterGroup, store Store, tenantStore TenantStore, bucketSuffix string, peerFanout PeerFanout, ingressSuffix string, admission func(string) error, options ...Option) {
 	h := &handler{store: store, bucketSuffix: bucketSuffix, peerFanout: peerFanout, ingressSuffix: ingressSuffix, trinoAdmission: admission}
+	for _, option := range options {
+		option(h)
+	}
 	r.POST("/orgs/:id/provision", h.provisionWarehouse)
 	r.POST("/orgs/:id/deprovision", h.deprovisionWarehouse)
 	r.GET("/orgs/:id/warehouse/status", h.getWarehouseStatus)
@@ -185,8 +189,9 @@ func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
 }
 
 type handler struct {
-	store          Store
-	trinoAdmission func(string) error
+	store                 Store
+	trinoAdmission        func(string) error
+	trinoBackendValidator func(configstore.TrinoBackend) error
 	// bucketSuffix is the env suffix (e.g. "mw-prod-us") used to compute the
 	// CP-owned s3bucket name; empty disables CP naming. See
 	// configstore.DucklingBucketName.
@@ -263,6 +268,7 @@ type provisionRequest struct {
 // standalone POST /orgs/:id/trino body (trinoRequest below) so both
 // surfaces accept the same shape.
 type provisionTrinoReq struct {
+	Backend configstore.TrinoBackend `json:"backend,omitempty"`
 	// Enabled flips Trino on for this org. False (or omitted) is a no-op:
 	// existing rows are not affected, so the provision endpoint can be
 	// retried with Trino={Enabled:false} without disabling a previously
@@ -278,8 +284,9 @@ type provisionTrinoReq struct {
 // enable on an existing org). Mirrors provisionTrinoReq so callers can
 // use one schema for both surfaces.
 type trinoRequest struct {
-	Enabled bool   `json:"enabled"`
-	Tier    string `json:"tier,omitempty"`
+	Backend configstore.TrinoBackend `json:"backend,omitempty"`
+	Enabled bool                     `json:"enabled"`
+	Tier    string                   `json:"tier,omitempty"`
 }
 
 type provisionMetadataReq struct {
@@ -343,6 +350,14 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	if req.Trino != nil && req.Trino.Enabled {
+		backend, ok := h.resolveTrinoBackend(c, orgID, req.Trino.Backend)
+		if !ok {
+			return
+		}
+		req.Trino.Backend = backend
 	}
 
 	if err := validateDucklingOrgID(orgID); err != nil {
@@ -488,11 +503,15 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 	// Secret data key, which the tenant-password projection requires. No
 	// extra per-Trino constraint.
 	var trinoSettings *configstore.TrinoSettings
+	if req.Trino != nil && req.Trino.Backend != "" && !req.Trino.Backend.Valid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "backend must be ducklake or hoglake"})
+		return
+	}
 	if req.Trino != nil && req.Trino.Enabled {
 		if !h.admitTrino(c, orgID) {
 			return
 		}
-		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier}
+		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier, Backend: req.Trino.Backend}
 	}
 
 	// One transaction wraps warehouse + root user + optional Trino opt-in.
@@ -508,6 +527,10 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		RootUserHash: hash,
 		Trino:        trinoSettings,
 	}); err != nil {
+		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) || errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		// The warehouse-already-exists conflict is the only error
 		// shape that maps to 409. Everything else (DB write failure,
 		// OnConflict surprise) is internal. The sentinel here
@@ -632,10 +655,20 @@ func (h *handler) enableTrino(c *gin.Context) {
 		return
 	}
 
+	backend, ok := h.resolveTrinoBackend(c, orgID, req.Backend)
+	if !ok {
+		return
+	}
+	req.Backend = backend
+
 	if !h.admitTrino(c, orgID) {
 		return
 	}
-	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier}); err != nil {
+	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend}); err != nil {
+		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) || errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -711,6 +744,11 @@ func (h *handler) deprovisionWarehouse(c *gin.Context) {
 			c.JSON(http.StatusAccepted, gin.H{"status": "deprovisioning started", "org": orgID})
 			return
 		}
+	}
+
+	if errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
 	}
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {

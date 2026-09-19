@@ -873,9 +873,10 @@ allow if {
 	table.catalogName == "system"
 	table.schemaName == "metadata"
 	table.tableName == "catalogs"
-	every column in table.columns {
-		column in {"catalog_name", "state"}
-	}
+	# The inventory has three permitted columns, independent of tenant count.
+	count(table.columns) <= 3
+	requested := {column | column := table.columns[_]}
+	count(requested - {"catalog_name", "connector_name", "state"}) == 0
 }
 
 # ---------------------------------------------------------------------------

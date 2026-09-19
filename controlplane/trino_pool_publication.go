@@ -88,6 +88,12 @@ func (o *trinoPoolOperator) advanceTenantAdmissions(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list tenants for pool %s: %w", o.config.PublicID, err)
 	}
+	// The admission gate certifies members against the published catalog
+	// revision, so that number has to be the one the catalog STORE is at - not
+	// the last one a publication managed to write down.
+	if err := o.ensureCatalogWatermark(ctx); err != nil {
+		return err
+	}
 	bindings := trinoPoolBindingsFor(orgs, o.config.PoolID)
 	recorded, err := o.publications.ListTrinoPoolPublications(ctx, o.config.PoolID)
 	if err != nil {
@@ -667,6 +673,51 @@ func (o *trinoPoolOperator) publishedCatalogRevision() int64 {
 		return 0
 	}
 	return o.pool.PublicationRevision
+}
+
+// ensureCatalogWatermark makes the admission gate's revision authoritative
+// before any tenant is published, admitted or certified against it.
+//
+// The failure this exists for: a catalog commits, the follow-up write of its
+// revision onto the pool row fails, and NOTHING republishes it. That catalog
+// already exists, so no later mutation carries the number forward; the gate
+// keeps certifying members against a revision that predates the tenant, and a
+// warehouse can be admitted - and reported ready - without its catalog. The
+// tenant loop reads the enabled orgs on its own, so it would not even notice
+// that a provisioner call had failed.
+//
+// Recovery is a bounded read of the store's own writer state, and it fails
+// CLOSED: a watermark that cannot be read or cannot be checkpointed stops this
+// tick's admissions rather than proceeding against a number nobody can
+// confirm. The instance lifecycle is unaffected - reconcileOnce isolates this
+// step's error - so a pool still repairs and drains while admissions hold.
+func (o *trinoPoolOperator) ensureCatalogWatermark(ctx context.Context) error {
+	if o.catalogWatermark == nil {
+		// This cell publishes through a coordinator, which owns the catalog
+		// store itself. There is no duckgres-side authority to compare against,
+		// so the behaviour is exactly what it was.
+		return nil
+	}
+	published, err := o.catalogWatermark(ctx)
+	if err != nil {
+		return fmt.Errorf("read the published catalog revision for pool %s: %w", o.config.PublicID, err)
+	}
+	if o.pool == nil {
+		return fmt.Errorf("pool %s has no durable row to checkpoint against", o.config.PublicID)
+	}
+	if published <= o.pool.PublicationRevision {
+		return nil
+	}
+	// The row is behind the store. Checkpoint it under this term's authority
+	// before anything is certified against the stale value.
+	if err := o.store.RecordTrinoPoolPublicationRevision(ctx, o.lease, o.config.PoolID, published); err != nil {
+		return o.dropAuthority(fmt.Errorf("checkpoint the published catalog revision %d for pool %s: %w",
+			published, o.config.PublicID, err))
+	}
+	slog.Warn("Trino pool recovered a catalog revision the publication never checkpointed.",
+		"pool", o.config.PublicID, "recorded", o.pool.PublicationRevision, "published", published)
+	o.pool.PublicationRevision = published
+	return nil
 }
 
 // targetRevisionFor names ONE tenant's attempt: the principal set being

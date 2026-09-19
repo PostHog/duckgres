@@ -861,8 +861,8 @@ export function useSelectTrinoCell() {
 export function useSetTrinoEnabled() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ org, enabled, tier }: { org: string; enabled: boolean; tier: string }) =>
-      enabled ? api.enableTrino(org, tier) : api.disableTrino(org),
+    mutationFn: ({ org, enabled, tier, backend }: { org: string; enabled: boolean; tier: string; backend?: "ducklake" | "hoglake" }) =>
+      enabled ? api.enableTrino(org, tier, backend) : api.disableTrino(org),
     // Refresh authoritative state after errors too: a timed-out write can commit.
     onSettled: () => qc.invalidateQueries({ queryKey: ["trino"] }),
   });

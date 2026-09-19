@@ -237,6 +237,10 @@ func buildTrinoPoolOperators(
 		}
 		if writer != nil {
 			provisionerForCell := wire.Provisioner
+			// The admission gate's revision is read from the catalog store
+			// itself, so a checkpoint that failed after a committed catalog is
+			// recovered rather than waiting for a mutation that will never come.
+			operator.catalogWatermark = writer.PublishedRevision
 			operator.installWriter = func(ctx context.Context, lease configstore.TrinoPoolLease) error {
 				held := lease
 				authority.Store(&held)

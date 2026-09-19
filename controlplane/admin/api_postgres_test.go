@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -848,5 +850,54 @@ func TestAdminCreateOrgTeamDisabledPostgres(t *testing.T) {
 	// gorm's RETURNING write-back either.
 	if team.Enabled {
 		t.Fatal("returned team struct carries enabled=true (RETURNING write-back not undone)")
+	}
+}
+
+func TestHoglakeOwnershipBlocksOrgDeletionAndWarehouseReplacementPostgres(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		base := newPostgresConfigStore(t)
+		schema := fmt.Sprintf("hoglake_lifecycle_%d", time.Now().UnixNano())
+		if err := base.DB().Exec("CREATE SCHEMA " + schema).Error; err != nil {
+			t.Fatal(err)
+		}
+		store, err := configstore.NewConfigStore(testConfigStoreConnString+" search_path="+schema, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			db, err := store.DB().DB()
+			if err == nil {
+				_ = db.Close()
+			}
+			_ = base.DB().Exec("DROP SCHEMA " + schema + " CASCADE").Error
+		})
+		apiStore := newGormAPIStore(store).(*gormAPIStore)
+		if err := store.DB().Create(&configstore.Org{Name: "retained-tenant", DatabaseName: "retained_tenant"}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DB().Create(&configstore.ManagedWarehouse{OrgID: "retained-tenant", DucklingName: "retained-tenant", State: configstore.ManagedWarehouseStateDeleted}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DB().Create(&configstore.ManagedWarehouseTrino{OrgID: "retained-tenant", Enabled: enabled, Backend: configstore.TrinoBackendHoglake, BackendSelected: true}).Error; err != nil {
+			t.Fatal(err)
+		}
+		router := newTestAPIRouter(apiStore)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/api/v1/orgs/retained-tenant", nil))
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("delete API status=%d", rec.Code)
+		}
+		if _, err := apiStore.DeleteOrg("retained-tenant"); !errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+			t.Fatalf("org deletion: %v", err)
+		}
+		if _, _, err := apiStore.UpsertManagedWarehouse("retained-tenant", &configstore.ManagedWarehouse{DucklingName: "replacement"}); !errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+			t.Fatalf("warehouse replacement: %v", err)
+		}
+		if _, _, err := apiStore.MutateManagedWarehouse("retained-tenant", func(w *configstore.ManagedWarehouse) error { w.DucklingName = "replacement"; return nil }); !errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
+			t.Fatalf("warehouse identity change: %v", err)
+		}
+		if _, _, err := apiStore.MutateManagedWarehouse("retained-tenant", func(w *configstore.ManagedWarehouse) error { w.Image = "example/image:test"; return nil }); err != nil {
+			t.Fatalf("ordinary image pin must remain supported: %v", err)
+		}
 	}
 }

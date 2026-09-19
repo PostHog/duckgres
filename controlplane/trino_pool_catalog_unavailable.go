@@ -52,3 +52,14 @@ func (c unavailableTrinoCatalogClient) AlterCatalog(context.Context, string, map
 func (c unavailableTrinoCatalogClient) DropCatalog(context.Context, string) error {
 	return c.err()
 }
+
+// CatalogConnectors refuses with the same sentinel rather than being absent.
+//
+// Managed Hoglake asks the catalog client to inspect an existing catalog's
+// connector before adopting it. A client without this method is reported as
+// "cannot verify the Hoglake connector", which reads as a broken cell; the
+// sentinel says the truthful thing instead - this control plane does not own
+// the write path - so the reconcile leaves the org's state row alone.
+func (c unavailableTrinoCatalogClient) CatalogConnectors(context.Context) (map[string]string, error) {
+	return nil, c.err()
+}

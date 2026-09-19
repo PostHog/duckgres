@@ -36,7 +36,11 @@ func (stubProvisioningStore) GetOrgUser(string, string) (*configstore.OrgUser, e
 func (stubProvisioningStore) SetWarehouseDeleting(string, configstore.ManagedWarehouseProvisioningState) error {
 	return nil
 }
-func (stubProvisioningStore) IsDatabaseNameAvailable(string) (bool, error)        { return true, nil }
+func (stubProvisioningStore) IsDatabaseNameAvailable(string) (bool, error) { return true, nil }
+func (stubProvisioningStore) GetManagedWarehouseTrino(string) (*configstore.ManagedWarehouseTrino, error) {
+	return nil, nil
+}
+
 func (stubProvisioningStore) EnableTrino(string, configstore.TrinoSettings) error { return nil }
 func (stubProvisioningStore) DisableTrino(string) error                           { return nil }
 func (stubProvisioningStore) ListOrgTeams(string) ([]configstore.OrgTeam, error) {

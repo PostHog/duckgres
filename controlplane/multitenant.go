@@ -313,6 +313,7 @@ func SetupMultiTenant(
 
 	// Initialize Duckling CR resolver for reading infrastructure details from Crossplane CRs (best-effort)
 	var resolveDucklingStatus func(context.Context, string) (*provisioner.DucklingStatus, error)
+	var resolveHoglakeStorageStatus provisioner.TrinoDucklingResolver
 	dc, dcErr := provisioner.NewDucklingClient()
 	if dcErr != nil {
 		slog.Warn("Duckling client unavailable, will use config store for infrastructure details.", "error", dcErr)
@@ -330,6 +331,19 @@ func SetupMultiTenant(
 				name = orgID
 			}
 			return dc.Get(ctx, name)
+		}
+	}
+
+	if dcErr == nil {
+		resolveHoglakeStorageStatus = func(ctx context.Context, orgID string) (*provisioner.DucklingStatus, error) {
+			warehouse, err := store.GetManagedWarehouse(orgID)
+			if err != nil {
+				return nil, err
+			}
+			if warehouse == nil || warehouse.DucklingName == "" {
+				return nil, nil
+			}
+			return dc.GetStorageStatus(ctx, warehouse.DucklingName)
 		}
 	}
 
@@ -542,7 +556,7 @@ func SetupMultiTenant(
 			// Same Duckling CR read the worker activation path uses; nil
 			// when the Duckling client couldn't be built, which
 			// buildTrinoWiring rejects rather than half-wiring.
-			trinoWire, twErr := buildTrinoFleetWiring(store, kc, resolveDucklingStatus)
+			trinoWire, twErr := buildTrinoFleetWiring(store, kc, resolveDucklingStatus, resolveHoglakeStorageStatus)
 			if twErr != nil {
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
 			}
@@ -760,7 +774,8 @@ func SetupMultiTenant(
 	if len(cfg.ManagedHostnameSuffixes) > 0 {
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
-	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store))
+	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store),
+		provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability))
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

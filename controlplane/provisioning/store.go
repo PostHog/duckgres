@@ -127,6 +127,10 @@ func createPendingWarehouseTx(tx *gorm.DB, orgID, databaseName string, teamID in
 	if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
 		return err
 	}
+	if err := configstore.CheckHoglakeLifecycleTx(tx, orgID); err != nil {
+		return err
+	}
+
 	// Auto-create org if it doesn't exist (PostHog calls provision, duckgres
 	// creates everything). A NEW org MUST carry team_id — a warehouse cannot
 	// exist without a team; the id becomes the org's first
@@ -265,21 +269,12 @@ func (s *gormStore) Provision(req ProvisionRequest) error {
 		}
 
 		// 3. Optional Trino opt-in. State seeds to Pending so the
-		// reconcile loop sees a fresh row to act on; the OnConflict
-		// columns deliberately exclude State / StatusMessage / ReadyAt /
+		// reconcile loop sees a fresh row to act on; the helper preserves
+		// State / StatusMessage / ReadyAt /
 		// FailedAt / TrinoCellID so a re-provision doesn't clobber the
 		// reconcile loop's prior outcome or move the org between cells.
 		if req.Trino != nil {
-			trinoRow := configstore.ManagedWarehouseTrino{
-				OrgID:   req.OrgID,
-				Enabled: true,
-				Tier:    req.Trino.Tier,
-				State:   configstore.ManagedWarehouseStatePending,
-			}
-			if err := tx.Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "org_id"}},
-				DoUpdates: clause.AssignmentColumns([]string{"enabled", "tier", "updated_at"}),
-			}).Create(&trinoRow).Error; err != nil {
+			if err := configstore.EnableTrinoInTransaction(tx, req.OrgID, *req.Trino); err != nil {
 				return fmt.Errorf("enable trino: %w", err)
 			}
 		}
@@ -318,25 +313,35 @@ func (s *gormStore) SetWarehouseDeleting(orgID string, expectedState configstore
 	// provisioning phases stamp status_message. Without this the message stays
 	// stale (e.g. "Infrastructure ready") until the provisioner flips it to
 	// "Resources deleted" at the very end.
-	result := s.cs.DB().Model(&configstore.ManagedWarehouse{}).
-		Where("org_id = ? AND state = ?", orgID, expectedState).
-		Updates(map[string]interface{}{
-			"state":          configstore.ManagedWarehouseStateDeleting,
-			"status_message": "Deprovisioning...",
-		})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		// Distinguish "not found" from "wrong state"
-		var count int64
-		s.cs.DB().Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", orgID).Count(&count)
-		if count == 0 {
-			return gorm.ErrRecordNotFound
+	return s.cs.DB().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
 		}
-		return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
-	}
-	return nil
+		if err := configstore.CheckHoglakeLifecycleTx(tx, orgID); err != nil {
+			return err
+		}
+		result := tx.Model(&configstore.ManagedWarehouse{}).
+			Where("org_id = ? AND state = ?", orgID, expectedState).
+			Updates(map[string]interface{}{
+				"state":          configstore.ManagedWarehouseStateDeleting,
+				"status_message": "Deprovisioning...",
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			// Distinguish "not found" from "wrong state"
+			var count int64
+			if err := tx.Model(&configstore.ManagedWarehouse{}).Where("org_id = ?", orgID).Count(&count).Error; err != nil {
+				return err
+			}
+			if count == 0 {
+				return gorm.ErrRecordNotFound
+			}
+			return fmt.Errorf("warehouse %q not in expected state %q", orgID, expectedState)
+		}
+		return nil
+	})
 }
 
 // MintServiceCredential delegates to the config store: create a fresh
@@ -426,4 +431,8 @@ func (s *gormStore) ListOrgTeamsByOrgIDs(orgIDs []string) ([]configstore.OrgTeam
 func (s *gormStore) LatestConfigChange() (time.Time, error) {
 	return s.cs.LatestConfigChange()
 
+}
+
+func (s *gormStore) GetManagedWarehouseTrino(orgID string) (*configstore.ManagedWarehouseTrino, error) {
+	return s.cs.GetManagedWarehouseTrino(orgID)
 }

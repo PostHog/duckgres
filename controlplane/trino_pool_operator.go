@@ -45,6 +45,12 @@ type trinoPoolStore interface {
 	CreateTrinoPoolInstance(context.Context, configstore.TrinoPoolLease, configstore.TrinoPoolInstanceSpec) error
 	AdvanceTrinoPoolInstance(ctx context.Context, lease configstore.TrinoPoolLease, instanceID string, from, to trinopool.Phase, updates map[string]any) error
 	RecordTrinoPoolInstanceFields(ctx context.Context, lease configstore.TrinoPoolLease, instanceID string, updates map[string]any) error
+	// RecordTrinoPoolPublicationRevision checkpoints the published catalog
+	// revision the admission gate certifies members against. The operator needs
+	// it directly, not only through the catalog writer: a revision the writer
+	// committed but failed to record has to be recoverable by whoever next holds
+	// the authority.
+	RecordTrinoPoolPublicationRevision(ctx context.Context, lease configstore.TrinoPoolLease, poolID string, revision int64) error
 }
 
 // trinoPoolGateway is the Gateway surface the operator uses.
@@ -135,6 +141,13 @@ type trinoPoolOperator struct {
 	// acknowledgement asks ONE member what configuration it is serving, which
 	// is what a publication receipt asserts.
 	acknowledgement func(ctx context.Context, endpoint string, expected trinoPoolProjectionRevisions, catalogRevision int64) (trinoPoolAcknowledgement, error)
+	// catalogWatermark reports the revision the CATALOG STORE is at, which is
+	// the authority for the admission gate. The pool row's publication_revision
+	// is a cache of it, and a cache whose write failed is indistinguishable from
+	// "nothing new was published" unless the store is asked. Nil for a cell that
+	// publishes through a coordinator, where the store is not duckgres-side and
+	// this question has no local answer.
+	catalogWatermark func(ctx context.Context) (int64, error)
 	// bindingCursor and barrierCursor rotate which tenant is worked on. The
 	// driver performs one external step per tick, so a fixed order lets one
 	// permanently failing tenant hold the front of the queue forever - and with

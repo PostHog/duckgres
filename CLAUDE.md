@@ -1810,7 +1810,8 @@ Code: `controlplane/trinopool/` (pure: blueprint, phases, planner, catalog-versi
 port), `controlplane/trinocatalog/` (fenced catalog publisher),
 `controlplane/trinogateway/` (Gateway protocol v1 client),
 `controlplane/trino_pool_*.go` (config, effects, validation, operator, wiring,
-publication barrier), migrations `000040`-`000044`.
+publication barrier), migrations `000041`-`000046` (upstream owns `000040`,
+the Trino backend selection).
 
 - **Env, all default-off**: `DUCKGRES_TRINO_POOL_ENABLED` (a pooled cell with
   this off FAILS startup — falling back to blue/green would hand the operator a
@@ -1872,6 +1873,28 @@ publication barrier), migrations `000040`-`000044`.
   and the fence would distinguish nobody), and a takeover needs a strictly
   higher epoch — an equal epoch held by another identity is a collision, not a
   handover.
+- **The published catalog revision is read from the catalog STORE, not from
+  whatever a publication last managed to write down.** The pool row's
+  `publication_revision` is a cache of it, and the admission gate certifies
+  members against that number. A catalog can commit while the follow-up write
+  of its revision fails — and nothing republishes it, because that catalog now
+  exists, so no later mutation carries the number forward. The gate would keep
+  certifying members against a revision predating the tenant, admitting it and
+  reporting the warehouse ready without its catalog. So: a failed checkpoint is
+  RETURNED from the publish path (not logged and dropped), the writer's claim
+  checkpoints the revision the takeover already read, and every tenant-admission
+  tick reconciles the row against the store's own writer state and fails CLOSED
+  when it cannot. Holding admissions does not hold the compute lifecycle —
+  `reconcileOnce` isolates that step — so a pool still repairs and drains.
+- **A pooled cell answers the managed-Hoglake connector question from the
+  store.** Adoption of an existing catalog is refused unless its connector is
+  confirmed (`CatalogConnectors`), which on a coordinator-mediated cell is a
+  `system.metadata.catalogs` query. A pooled cell has no fixed coordinator, so
+  the pool writer answers from the `trino_catalogs` rows the coordinators
+  reconcile FROM. That is the PUBLISHED definition and is sound only for that
+  decision — whether any member has applied it stays with pool admission, which
+  proves it per member. Never read a published row as evidence that a catalog is
+  operational.
 - **Failure is not drain.** SUSPECT excludes a member from new work; LOST
   requires verified absence of every recorded object as evidence and is
   reported as failed. A repair NAMES the instance it replaces, so the Gateway
@@ -1899,7 +1922,7 @@ publication barrier), migrations `000040`-`000044`.
   FAILURE_RETIRED. Leaving it terminal leaked a whole Trino cluster and, at
   desired+surge, refused every later registration — no repair, no rollout. The
   loss claim carries the coordinator identity the GATEWAY observed at
-  registration (recorded from the registration response, migration `000043`);
+  registration (recorded from the registration response, migration `000044`);
   anything re-derived is refused as evidence.
 - **Admission is a durable step.** The intent is recorded before the call, so a
   lost response is resolved by read-back under the same identity. OK, FAILED
@@ -2011,7 +2034,7 @@ publication barrier), migrations `000040`-`000044`.
   COMMITTED target revision, not the state field: a tenant that adds a login
   opens a new attempt, and reading the state alone would flap a warehouse that
   has served for weeks back to Provisioning because somebody created a user.
-  All of it reads the durable record (migrations `000044`/`000045`), never the
+  All of it reads the durable record (migrations `000045`/`000046`), never the
   leader's memory.
 - **One authoritative boot identity.** The coordinator's `processId` is probed
   BEFORE member registration and is sent as `bootId` on both register and admit;
@@ -2051,6 +2074,12 @@ publication barrier), migrations `000040`-`000044`.
   `tests/configstore/trino_pool_postgres_test.go`,
   `tests/trinocatalog/*_postgres_test.go`, AND the
   `trino_shared_pool_disabled` assertion in `tests/mw-dev/e2e/harness.sh`.
+  The pool's migrations are numbered ABOVE upstream's, so adding one means
+  extending `TestMigrationVersionsAreUnique`'s range implicitly (it reads the
+  embedded directory) and updating the version asserts in
+  `tests/configstore/migrations_postgres_test.go` — including
+  `TestConfigStoreMigration40PinsExistingTrinoBackends`, which rewinds every
+  version at or above 40 so goose can re-apply them in order.
 
 ## Logical Catalog Alias (`org_<database_name>` as the startup `database`)
 

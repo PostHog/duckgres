@@ -54,6 +54,7 @@ export function OrgTrinoSettings({ orgId, hasWarehouse, tier }: {
       <div className="flex flex-wrap items-center gap-2 text-sm">
         <Badge variant="outline">{enabled ? "Enabled" : "Disabled"}</Badge>
         <span>Cell: {assigned ? trino.data?.cell.id : "Not selected"}</span>
+        <span>Backend: {trino.data?.backend ?? "hoglake"}</span>
       </div>
       {assigned ? (
         <p className="text-xs text-muted-foreground">The assigned cell cannot change here, including while Trino is disabled.</p>
@@ -61,6 +62,7 @@ export function OrgTrinoSettings({ orgId, hasWarehouse, tier }: {
         <p className="text-xs text-muted-foreground">Select an initial cell before enabling Trino. Selection is permanent here and does not enable Trino.</p>
       )}
       {!hasWarehouse && <p className="text-xs text-muted-foreground">Provision a warehouse before selecting a cell or enabling Trino.</p>}
+      <p className="text-xs text-muted-foreground">New Trino clients use Hoglake. Existing clients retain their backend, including after disable and re-enable. Hoglake does not migrate the existing DuckLake warehouse.</p>
       {isAdmin && <div className="flex flex-wrap items-center gap-2">
         {!assigned && !enabled && <>
           <select aria-label="Initial Trino cell" value={chosen} disabled={busy || !hasWarehouse}

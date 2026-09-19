@@ -18,7 +18,7 @@ import (
 
 type trinoFleet []*trinoWiring
 
-func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver) (trinoFleet, error) {
+func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver, storageResolvers ...provisioner.TrinoDucklingResolver) (trinoFleet, error) {
 	if !trinoProvisionerEnabled() {
 		return nil, nil
 	}
@@ -28,7 +28,7 @@ func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, duck
 	}
 	fleet := make(trinoFleet, 0, len(cells))
 	for _, cell := range cells {
-		wire, err := buildTrinoCellWiring(store, kc, ducklings, cell)
+		wire, err := buildTrinoCellWiring(store, kc, ducklings, cell, storageResolvers...)
 		if err != nil {
 			return nil, fmt.Errorf("wire Trino cell %s: %w", cell.consoleCell().ID, err)
 		}

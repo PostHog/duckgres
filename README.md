@@ -69,10 +69,13 @@ The optional [rollout readiness endpoint](docs/runbooks/trino-rollout-readiness.
 observes registered backend pods, coordinator identity, workers, and a dedicated
 warehouse canary. It is disabled by default and does not provision or move tenants.
 
-`DUCKGRES_TRINO_HOGLAKE_URI` defaults to empty (DuckLake catalog provisioning).
-The frozen perf deployments set it automatically to their namespace-local Hoglake
-service, replacing the Trino backend in the existing cached and uncached scenarios.
-See the [scenario runbook](docs/runbooks/scenario-runner.md).
+Existing Trino clients retain their DuckLake backend. New Trino clients use
+Hoglake automatically; there is no backend chooser or DuckLake fallback for new
+onboarding. Hoglake requires `DUCKGRES_TRINO_MANAGED_HOGLAKE_URI` and a dedicated
+`DUCKGRES_TRINO_HOGLAKE_DATA_PATH`; the namespace defaults to `main`.
+Disable/re-enable preserves the stored backend. This creates a separate catalog
+and does not migrate DuckLake data. Manual migration is outside this rollout.
+See the [managed Hoglake provisioning runbook](docs/runbooks/trino-hoglake-provisioning.md).
 
 The existing Trino deployment appears as `legacy` in the Trino console API.
 This name does not change its stored org assignments or catalog-store key.
