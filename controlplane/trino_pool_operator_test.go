@@ -4,6 +4,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -220,7 +221,11 @@ type fakePoolGateway struct {
 	calls        []string
 	drainErr     error
 	admitErr     error
+	lostErr      error
 	membership   int64
+	// lastLost is the loss claim the Gateway recorded, so a test can assert
+	// WHICH evidence a repair rested on.
+	lastLost trinogateway.LostMemberRequest
 	principalErr map[string]error
 	publications map[string]*fakePublication
 	admitted     map[string]string
@@ -304,8 +309,32 @@ func (f *fakePoolGateway) commit(step trinogateway.Step, payload string, member 
 	return member, nil
 }
 
-func fakeStepPayload(name string, generation int64) string {
-	return fmt.Sprintf("%s@%d", name, generation)
+// fakeRequestPayload mirrors what the Gateway actually hashes under a step
+// identity: the WHOLE canonical request body, minus the authority envelope it
+// strips (controllerEpoch, ownerIdentity) so a successor leader can resume a
+// step its predecessor committed.
+//
+// Hashing a stand-in - the call name and the expected generation - modelled
+// generation drift and nothing else, so a retry that rebuilt any OTHER field
+// (a re-stamped observation time, a re-read boot identity, a reason chosen by
+// whichever check fired first) looked like a clean replay here and was refused
+// by the real Gateway.
+func fakeRequestPayload(request any) string {
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		panic(fmt.Sprintf("marshal gateway request: %v", err))
+	}
+	var body map[string]any
+	if err := json.Unmarshal(encoded, &body); err != nil {
+		panic(fmt.Sprintf("decode gateway request: %v", err))
+	}
+	delete(body, "controllerEpoch")
+	delete(body, "ownerIdentity")
+	canonical, err := json.Marshal(body)
+	if err != nil {
+		panic(fmt.Sprintf("canonicalize gateway request: %v", err))
+	}
+	return string(canonical)
 }
 
 func (f *fakePoolGateway) record(call string) { f.calls = append(f.calls, call) }
@@ -396,6 +425,10 @@ func (f *fakePoolGateway) ConfigurePool(_ context.Context, _ string, request tri
 
 func (f *fakePoolGateway) RegisterMember(_ context.Context, poolID string, request trinogateway.RegisterMemberRequest) (trinogateway.Member, error) {
 	f.record("register:" + request.InstanceID)
+	payload := fakeRequestPayload(request)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
+	}
 	// The Gateway probes the coordinator itself at registration and binds the
 	// member to the identity it observed, so the response - not the request -
 	// is where those values come from.
@@ -408,7 +441,7 @@ func (f *fakePoolGateway) RegisterMember(_ context.Context, poolID string, reque
 		PodUID: request.PodUID, BootID: request.BootID,
 	}
 	f.members[request.InstanceID] = member
-	return *member, nil
+	return f.commit(request.Step, payload, *member)
 }
 
 func (f *fakePoolGateway) AdmitMember(_ context.Context, _, instanceID string, request trinogateway.AdmitMemberRequest) (trinogateway.Member, error) {
@@ -416,7 +449,7 @@ func (f *fakePoolGateway) AdmitMember(_ context.Context, _, instanceID string, r
 	if f.admitErr != nil {
 		return trinogateway.Member{}, f.admitErr
 	}
-	payload := fakeStepPayload("admit", request.ExpectedGeneration)
+	payload := fakeRequestPayload(request)
 	if replayed, done, err := f.replay(request.Step, payload); done {
 		return replayed, err
 	}
@@ -449,7 +482,10 @@ func (f *fakePoolGateway) AdmitMember(_ context.Context, _, instanceID string, r
 func (f *fakePoolGateway) GetMember(_ context.Context, _, instanceID string) (trinogateway.Member, error) {
 	member, exists := f.members[instanceID]
 	if !exists {
-		return trinogateway.Member{}, errors.New("unknown member")
+		// The real client maps the Gateway's POOL_NOT_FOUND to this sentinel,
+		// and a read-back that resolves a lost response has to tell "nothing was
+		// ever recorded" from "the Gateway could not be reached".
+		return trinogateway.Member{}, fmt.Errorf("%w: %s", trinogateway.ErrNotFound, instanceID)
 	}
 	return *member, nil
 }
@@ -488,7 +524,7 @@ func (f *fakePoolGateway) DrainMember(_ context.Context, _, instanceID string, r
 	if f.drainErr != nil {
 		return trinogateway.Member{}, f.drainErr
 	}
-	payload := fakeStepPayload("drain", request.ExpectedGeneration)
+	payload := fakeRequestPayload(request)
 	if replayed, done, err := f.replay(request.Step, payload); done {
 		return replayed, err
 	}
@@ -510,7 +546,7 @@ func (f *fakePoolGateway) DrainMember(_ context.Context, _, instanceID string, r
 
 func (f *fakePoolGateway) SealMember(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("seal:" + instanceID)
-	payload := fakeStepPayload("seal", request.ExpectedGeneration)
+	payload := fakeRequestPayload(request)
 	if replayed, done, err := f.replay(request.Step, payload); done {
 		return replayed, err
 	}
@@ -536,6 +572,10 @@ func (f *fakePoolGateway) SuspectMember(_ context.Context, _, instanceID string,
 	if request.Reason == "" {
 		return trinogateway.Member{}, errors.New("a suspicion must carry a reason")
 	}
+	payload := fakeRequestPayload(request)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
+	}
 	member, err := f.requirePhase(instanceID, "become suspect", "PREPARING", "ACTIVE", "DRAINING", "SEALED")
 	if err != nil {
 		return trinogateway.Member{}, err
@@ -548,13 +588,20 @@ func (f *fakePoolGateway) SuspectMember(_ context.Context, _, instanceID string,
 	if wasActive {
 		f.membership++
 	}
-	return *member, nil
+	return f.commit(request.Step, payload, *member)
 }
 
 func (f *fakePoolGateway) LostMember(_ context.Context, _, instanceID string, request trinogateway.LostMemberRequest) (trinogateway.Member, error) {
 	f.record("lost:" + instanceID)
+	if f.lostErr != nil {
+		return trinogateway.Member{}, f.lostErr
+	}
 	if request.Evidence == "" || request.Termination.Source == "" {
 		return trinogateway.Member{}, errors.New("a loss claim needs termination evidence")
+	}
+	payload := fakeRequestPayload(request)
+	if replayed, done, err := f.replay(request.Step, payload); done {
+		return replayed, err
 	}
 	member, err := f.requirePhase(instanceID, "be declared lost", "SUSPECT")
 	if err != nil {
@@ -570,12 +617,13 @@ func (f *fakePoolGateway) LostMember(_ context.Context, _, instanceID string, re
 			trinogateway.ErrEvidenceRequired)
 	}
 	member.Phase, member.Generation, member.RetirementKind = "LOST", member.Generation+1, "FAILED"
-	return *member, nil
+	f.lastLost = request
+	return f.commit(request.Step, payload, *member)
 }
 
 func (f *fakePoolGateway) RetireMember(_ context.Context, _, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error) {
 	f.record("retire:" + instanceID)
-	payload := fakeStepPayload("retire", request.ExpectedGeneration)
+	payload := fakeRequestPayload(request)
 	if replayed, done, err := f.replay(request.Step, payload); done {
 		return replayed, err
 	}
@@ -601,7 +649,7 @@ func (f *fakePoolGateway) MemberRetired(_ context.Context, _, instanceID string,
 	if !request.ResourcesAbsent {
 		return trinogateway.Member{}, errors.New("retirement reported without asserting absence")
 	}
-	payload := fakeStepPayload("retired", request.ExpectedGeneration)
+	payload := fakeRequestPayload(request)
 	if replayed, done, err := f.replay(request.Step, payload); done {
 		return replayed, err
 	}
@@ -621,6 +669,10 @@ type fakePoolKube struct {
 	deleted    map[string]bool
 	observed   trinoPoolObservation
 	absent     bool
+	// absentAfterDelete makes deletion actually remove the objects, which is
+	// what lets a test drive a teardown to its end rather than asserting only
+	// the step that starts it.
+	absentAfterDelete bool
 	epochsSeen []int64
 }
 
@@ -665,7 +717,10 @@ func (f *fakePoolKube) Delete(_ context.Context, inventory trinoPoolInventory) e
 	return nil
 }
 
-func (f *fakePoolKube) ResourcesAbsent(context.Context, trinoPoolInventory) (bool, error) {
+func (f *fakePoolKube) ResourcesAbsent(_ context.Context, inventory trinoPoolInventory) (bool, error) {
+	if f.absentAfterDelete && f.deleted[inventory.ServiceName] {
+		return true, nil
+	}
 	return f.absent, nil
 }
 
@@ -2247,10 +2302,14 @@ func TestFailedStepEarnsADurableWaitAndSuccessClosesTheOperation(t *testing.T) {
 		t.Fatal("a failed attempt closed the operation; it must stay open to be retried")
 	}
 
-	// The wait is honoured rather than retried on the next tick.
-	attempts := countGatewayCalls(harness.gateway.calls, "admit:")
+	// The wait is honoured rather than retried on the next tick. The count is
+	// per INSTANCE: the backoff is recorded against this instance's operation,
+	// and its siblings keep making their own attempts - one member's failure
+	// does not stop the rest of the pool.
+	waiting := "admit:" + harness.store.order[0]
+	attempts := countGatewayCalls(harness.gateway.calls, waiting)
 	harness.tickTolerant(3)
-	if countGatewayCalls(harness.gateway.calls, "admit:") != attempts {
+	if countGatewayCalls(harness.gateway.calls, waiting) != attempts {
 		t.Fatalf("the admission was retried during its recorded wait: %v", harness.gateway.calls)
 	}
 
