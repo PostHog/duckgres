@@ -292,6 +292,14 @@ type TrinoPoolPublication struct {
 	// Gateway cannot commit after a newer desired intent has already been
 	// checkpointed here.
 	PendingIntent string `gorm:"column:pending_intent"`
+	// PendingPayload is that request's body, so the reissue is byte-identical
+	// to the original: the same step identity carrying the same bytes is an
+	// ordinary replay, which is far easier to reason about than sending a new
+	// body under an old identity and reading the refusal as a success.
+	//
+	// It carries principal identifiers and the revision naming them - never a
+	// password or a hash.
+	PendingPayload string `gorm:"column:pending_payload;type:jsonb"`
 	// Attempts and NextAttemptAt are this tenant's own durable backoff. The
 	// driver takes one tenant at a time, so without them a permanently failing
 	// warehouse is retried every tick and starves every tenant behind it.

@@ -291,6 +291,7 @@ func (cs *ConfigStore) RecordTrinoPoolTenantPrincipals(ctx context.Context, leas
 				-- The Gateway answered, so this occurrence is spent: the next
 				-- desired change takes a new one.
 				pending_intent = '',
+				pending_payload = '{}',
 				last_error = '',
 				updated_at = now()`,
 			poolID, orgID, principalRevision, TrinoPublicationPublished,
@@ -407,15 +408,19 @@ const (
 )
 
 // BeginTrinoPoolPublicationIntent opens a NEW occurrence for a request whose
-// outcome will be unknown until the Gateway answers.
+// outcome will be unknown until the Gateway answers, and stores the request
+// itself.
 //
-// It is the one write that both bumps the occurrence and records what that
-// occurrence stands for, so a leader that dies between the two can never leave
-// an occurrence nobody can attribute. Until the intent is resolved the driver
-// reissues THIS occurrence's step identity instead of minting another, which is
-// what stops a request still executing at the Gateway from committing after a
-// newer intent has been checkpointed here.
-func (cs *ConfigStore) BeginTrinoPoolPublicationIntent(ctx context.Context, lease TrinoPoolLease, poolID, orgID, kind string) (int64, error) {
+// It is the one write that bumps the occurrence, records what that occurrence
+// stands for AND keeps its exact body, so a leader that dies between them can
+// never leave an occurrence nobody can attribute or reissue. Until the intent is
+// resolved the driver replays THIS occurrence - same identity, same bytes -
+// instead of minting another, which is what stops a request still executing at
+// the Gateway from committing after a newer intent has been checkpointed here.
+//
+// The payload is principal identifiers and the revision naming them. No
+// credential of any kind belongs in it.
+func (cs *ConfigStore) BeginTrinoPoolPublicationIntent(ctx context.Context, lease TrinoPoolLease, poolID, orgID, kind, payload string) (int64, error) {
 	if orgID == "" {
 		return 0, errors.New("a publication intent requires an org")
 	}
@@ -424,6 +429,11 @@ func (cs *ConfigStore) BeginTrinoPoolPublicationIntent(ctx context.Context, leas
 	default:
 		return 0, fmt.Errorf("unsupported publication intent %q", kind)
 	}
+	if payload == "" {
+		// An occurrence with no body could not be replayed, which is the whole
+		// point of recording it.
+		return 0, errors.New("a publication intent requires its request body")
+	}
 	if poolID != lease.PoolID {
 		return 0, fmt.Errorf("%w: publication belongs to pool %q", ErrTrinoPoolConflict, poolID)
 	}
@@ -431,14 +441,15 @@ func (cs *ConfigStore) BeginTrinoPoolPublicationIntent(ctx context.Context, leas
 	err := cs.withPoolAuthority(ctx, lease, func(tx *gorm.DB, _ *TrinoPool) error {
 		return tx.Raw(`
 			INSERT INTO duckgres_trino_pool_publications
-				(pool_id, org_id, attempt, pending_intent, state, gateway_receipt)
-			VALUES (?, ?, 1, ?, ?, '{}')
+				(pool_id, org_id, attempt, pending_intent, pending_payload, state, gateway_receipt)
+			VALUES (?, ?, 1, ?, CAST(? AS jsonb), ?, '{}')
 			ON CONFLICT (pool_id, org_id) DO UPDATE SET
 				attempt = duckgres_trino_pool_publications.attempt + 1,
 				pending_intent = EXCLUDED.pending_intent,
+				pending_payload = EXCLUDED.pending_payload,
 				updated_at = now()
 			RETURNING attempt`,
-			poolID, orgID, kind, TrinoPublicationPending).Scan(&attempt).Error
+			poolID, orgID, kind, payload, TrinoPublicationPending).Scan(&attempt).Error
 	})
 	return attempt, err
 }
@@ -462,8 +473,9 @@ func (cs *ConfigStore) ResolveTrinoPoolPublicationIntent(ctx context.Context, le
 		return tx.Model(&TrinoPoolPublication{}).
 			Where("pool_id = ? AND org_id = ?", poolID, orgID).
 			Updates(map[string]any{
-				"pending_intent": "",
-				"updated_at":     time.Now().UTC(),
+				"pending_intent":  "",
+				"pending_payload": "{}",
+				"updated_at":      time.Now().UTC(),
 			}).Error
 	})
 }
@@ -565,9 +577,10 @@ func (cs *ConfigStore) RecordTrinoPoolTenantRevoked(ctx context.Context, lease T
 				"publication_id":           "",
 				"target_revision":          "",
 				// The Gateway answered, so this occurrence is spent.
-				"pending_intent": "",
-				"last_error":     reason,
-				"updated_at":     time.Now().UTC(),
+				"pending_intent":  "",
+				"pending_payload": "{}",
+				"last_error":      reason,
+				"updated_at":      time.Now().UTC(),
 			}).Error
 	})
 }

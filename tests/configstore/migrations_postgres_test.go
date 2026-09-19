@@ -111,7 +111,11 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 		// Migration 000047: which request the open occurrence stands for while
 		// its outcome is unknown, so a request still executing at the Gateway
 		// cannot commit after a newer intent has been checkpointed here.
-		"pending_intent"} {
+		"pending_intent",
+		// And the request itself, so the reissue is byte-identical rather than
+		// a new body under an old identity. Principal identifiers only; no
+		// credential material ever enters it.
+		"pending_payload"} {
 		requireColumnPresent(t, db, "duckgres_trino_pool_publications", column)
 	}
 	requireTablePresent(t, db, "duckgres_trino_pool_projection")

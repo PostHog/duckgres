@@ -17,10 +17,22 @@
 --
 -- '' means the tenant has no request in flight: its occurrence is spent and the
 -- next desired change takes a new one.
+--
+-- pending_payload is the request itself, stored so the reissue is BYTE-IDENTICAL
+-- to the original rather than a new body sent under the old identity. A tenant
+-- whose last login disappears while its publication is in flight still has
+-- something to replay, and a changed-intent refusal stays what it should be - an
+-- anomaly - instead of becoming the ordinary way an occurrence is closed.
+--
+-- It holds principal IDENTIFIERS and the revision that names them, and nothing
+-- else: no password, no hash, no credential of any kind ever enters this column.
 ALTER TABLE duckgres_trino_pool_publications
     ADD COLUMN IF NOT EXISTS pending_intent TEXT NOT NULL DEFAULT ''
-        CHECK (pending_intent IN ('', 'principals', 'revoke'));
+        CHECK (pending_intent IN ('', 'principals', 'revoke')),
+    ADD COLUMN IF NOT EXISTS pending_payload JSONB NOT NULL DEFAULT '{}'
+        CHECK (jsonb_typeof(pending_payload) = 'object');
 
 -- +goose Down
 ALTER TABLE duckgres_trino_pool_publications
+    DROP COLUMN IF EXISTS pending_payload,
     DROP COLUMN IF EXISTS pending_intent;

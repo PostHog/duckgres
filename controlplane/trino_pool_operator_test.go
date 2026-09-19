@@ -252,6 +252,10 @@ type fakePoolGateway struct {
 	deferPublish map[string]bool
 	deferred     []func()
 	deferRevoke  map[string]bool
+	// intentConflicts counts refusals of a step identity that carries content
+	// the journal did not record for it. Settling a request must never depend
+	// on provoking one: it is an anomaly, not a protocol.
+	intentConflicts int
 	// minServing is the floor the Gateway itself enforces on open and commit,
 	// taken from the pool configuration the operator publishes.
 	minServing int64
@@ -1670,6 +1674,7 @@ func (f *fakePoolGateway) guardStep(step trinogateway.Step, intent string) (bool
 		return false, nil
 	}
 	if recorded.payload != intent {
+		f.intentConflicts++
 		return false, fmt.Errorf("%w: step %s of %s was recorded with a different intent",
 			trinogateway.ErrIntentChanged, step.StepID, step.OperationID)
 	}
@@ -1991,7 +1996,7 @@ func (f *fakePublicationStore) RecordTrinoPoolTenantPrincipals(_ context.Context
 		row.State = configstore.TrinoPublicationPublished
 	}
 	// The Gateway answered: the occurrence is spent.
-	row.PendingIntent = ""
+	row.PendingIntent, row.PendingPayload = "", "{}"
 	return nil
 }
 
@@ -2036,7 +2041,7 @@ func (f *fakePublicationStore) RecordTrinoPoolTenantRevoked(_ context.Context, _
 	row := f.row(poolID, orgID)
 	row.State, row.LastError = configstore.TrinoPublicationRevoked, reason
 	row.AdmittedTargetRevision, row.TargetRevision, row.PublicationID = "", "", ""
-	row.PendingIntent = ""
+	row.PendingIntent, row.PendingPayload = "", "{}"
 	return nil
 }
 
@@ -2046,15 +2051,20 @@ func (f *fakePublicationStore) BeginTrinoPoolPublicationAttempt(_ context.Contex
 	return row.Attempt, nil
 }
 
-func (f *fakePublicationStore) BeginTrinoPoolPublicationIntent(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, kind string) (int64, error) {
+func (f *fakePublicationStore) BeginTrinoPoolPublicationIntent(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID, kind, payload string) (int64, error) {
+	if payload == "" {
+		return 0, errors.New("a publication intent requires its request body")
+	}
 	row := f.row(poolID, orgID)
 	row.Attempt++
 	row.PendingIntent = kind
+	row.PendingPayload = payload
 	return row.Attempt, nil
 }
 
 func (f *fakePublicationStore) ResolveTrinoPoolPublicationIntent(_ context.Context, _ configstore.TrinoPoolLease, poolID, orgID string) error {
-	f.row(poolID, orgID).PendingIntent = ""
+	row := f.row(poolID, orgID)
+	row.PendingIntent, row.PendingPayload = "", "{}"
 	return nil
 }
 
@@ -3218,5 +3228,217 @@ func TestManyPendingBindingsDoNotDelayAJoiningMember(t *testing.T) {
 	}
 	if !joined {
 		t.Fatalf("the joining member was delayed behind %d pending bindings: %v", tenants, harness.phases())
+	}
+}
+
+// A tenant can lose its last projectable login while its publication is still
+// executing at the Gateway.
+//
+// The stored request is what makes that settleable: there is nothing left in
+// the desired state to send, but the occurrence's own body is still there, so
+// it is replayed byte for byte and reaches a definite outcome. Abandoning it
+// instead - the only option before the body was stored - left the delayed
+// original free to commit after the revocation and rebind principals for a
+// tenant nobody serves.
+func TestALastLoginRemovedWhileAPublicationIsInFlightIsStillSettled(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	// A second login, whose publication is left executing at the Gateway.
+	tenants.orgs[0].Users = append(tenants.orgs[0].Users,
+		configstore.TrinoOrgUser{Username: "engineer", PasswordHash: "hash"})
+	inFlight := trinoPoolTenantBindingFor(tenants.orgs[0]).Principals
+	harness.gateway.deferPublish = map[string]bool{"org-a": true}
+	for tick := 0; tick < 12 && harness.publications.rows["org-a"].PendingIntent == ""; tick++ {
+		harness.tickTolerant(1)
+	}
+	if harness.publications.rows["org-a"].PendingIntent != configstore.TrinoPublicationIntentPrincipals {
+		t.Fatalf("no publication is in flight: %+v", harness.publications.rows["org-a"])
+	}
+
+	// Now the warehouse leaves the projection entirely: there is no desired
+	// binding left to send under that occurrence.
+	tenants.orgs = nil
+	for tick := 0; tick < 24; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	// It was settled by replaying its own stored request, and then revoked.
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, inFlight) {
+		t.Fatalf("the Gateway binds %v, want the set the occurrence stood for %v", got, inFlight)
+	}
+	if !harness.gateway.revoked["org-a"] {
+		t.Fatalf("the departed tenant was never revoked: %v", harness.gateway.calls)
+	}
+	row := harness.publications.rows["org-a"]
+	if row.PendingIntent != "" || row.PendingPayload != "{}" {
+		t.Fatalf("publication = %+v, want no request in flight", row)
+	}
+
+	// And the delayed original, arriving now, changes nothing.
+	harness.gateway.deliverDeferred()
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, inFlight) {
+		t.Fatalf("the late duplicate rebound the tenant to %v", got)
+	}
+}
+
+// Revoked, then re-enabled with a DIFFERENT set, while the revocation is still
+// executing at the Gateway.
+//
+// The revocation is settled from its own stored body first, so the new binding
+// and the admission that follows are strictly after it. The late duplicate is a
+// replay and cannot take the warehouse back off the air.
+func TestAReenabledTenantWithADifferentSetSettlesTheOldRevocationFirst(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	all := tenants.orgs
+	tenants.orgs = nil
+	harness.gateway.deferRevoke = map[string]bool{"org-a": true}
+	for tick := 0; tick < 12 && harness.publications.rows["org-a"].PendingIntent == ""; tick++ {
+		harness.tickTolerant(1)
+	}
+	if harness.publications.rows["org-a"].PendingIntent != configstore.TrinoPublicationIntentRevoke {
+		t.Fatalf("no revocation is in flight: %+v", harness.publications.rows["org-a"])
+	}
+
+	// Back, with a different set of logins.
+	all[0].Users = []configstore.TrinoOrgUser{{Username: "engineer", PasswordHash: "hash"}}
+	tenants.orgs = all
+	wanted := trinoPoolTenantBindingFor(all[0]).Principals
+	for tick := 0; tick < 40; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+	harness.gateway.deliverDeferred()
+	for tick := 0; tick < 40; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, wanted) {
+		t.Fatalf("the Gateway binds %v, want the re-enabled tenant's set %v", got, wanted)
+	}
+	if harness.gateway.revoked["org-a"] {
+		t.Fatalf("the late revocation took the re-enabled tenant off the air: %v", harness.gateway.calls)
+	}
+	if harness.gateway.admitted["org-a"] == "" {
+		t.Fatalf("the re-enabled tenant was never admitted again: %v", harness.gateway.calls)
+	}
+	if row := harness.publications.rows["org-a"]; row.State != configstore.TrinoPublicationAdmitted {
+		t.Fatalf("durable publication = %+v, want an admitted tenant", row)
+	}
+}
+
+// A duplicate that arrives after the tenant is fully admitted must be inert:
+// not a rebinding, not a re-admission, not a change of any kind.
+func TestALateDuplicateAfterFinalAdmissionChangesNothing(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+
+	tenants.orgs[0].Users = append(tenants.orgs[0].Users,
+		configstore.TrinoOrgUser{Username: "engineer", PasswordHash: "hash"})
+	harness.gateway.deferPublish = map[string]bool{"org-a": true}
+	for tick := 0; tick < 12 && harness.publications.rows["org-a"].PendingIntent == ""; tick++ {
+		harness.tickTolerant(1)
+	}
+	for tick := 0; tick < 40; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+	admitted := harness.gateway.admitted["org-a"]
+	principals := append([]string(nil), harness.gateway.principals["org-a"]...)
+	if admitted == "" {
+		t.Fatalf("the tenant was not admitted at its new binding: %v", harness.gateway.calls)
+	}
+
+	harness.gateway.deliverDeferred()
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, principals) {
+		t.Fatalf("the late duplicate rebound the tenant from %v to %v", principals, got)
+	}
+	if harness.gateway.admitted["org-a"] != admitted {
+		t.Fatalf("the late duplicate moved the admission from %q to %q",
+			admitted, harness.gateway.admitted["org-a"])
+	}
+	if harness.gateway.revoked["org-a"] {
+		t.Fatal("the late duplicate revoked an admitted tenant")
+	}
+}
+
+// An identifier a tenant no longer binds must be free for whoever legitimately
+// holds it next - and freeing it must not depend on provoking a refusal.
+//
+// A publication carrying that identifier is in flight when the binding shrinks.
+// Settling it byte-identically and then publishing the smaller set under a new
+// occurrence releases the identifier through two ordinary successes. Sending the
+// smaller set under the OLD occurrence instead reaches the same place only by
+// way of a changed-intent refusal, which means the ordinary path depends on an
+// error the Gateway raises for a genuine bug.
+func TestAnIdentifierDroppedFromABindingCanBeTakenByAnotherTenant(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	tenants := &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.operator.tenants = tenants
+	harness.fullMembership(t)
+	harness.admitAll(t, 1)
+	dropped := "acme.analyst"
+
+	// A second login is added, and its publication is left executing at the
+	// Gateway.
+	tenants.orgs[0].Users = append(tenants.orgs[0].Users,
+		configstore.TrinoOrgUser{Username: "engineer", PasswordHash: "hash"})
+	harness.gateway.deferPublish = map[string]bool{"org-a": true}
+	for tick := 0; tick < 12 && harness.publications.rows["org-a"].PendingIntent == ""; tick++ {
+		harness.tickTolerant(1)
+	}
+	if harness.publications.rows["org-a"].PendingIntent == "" {
+		t.Fatalf("no publication is in flight: %+v", harness.publications.rows["org-a"])
+	}
+
+	// Then the first login is removed: the desired set no longer has it.
+	tenants.orgs[0].Users = []configstore.TrinoOrgUser{{Username: "engineer", PasswordHash: "hash"}}
+	wanted := trinoPoolTenantBindingFor(tenants.orgs[0]).Principals
+	conflicts := harness.gateway.intentConflicts
+	for tick := 0; tick < 40; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+	harness.gateway.deliverDeferred()
+	for tick := 0; tick < 40; tick++ {
+		harness.tickTolerant(1)
+		harness.clearBackoff("org-a")
+	}
+
+	if got := harness.gateway.principals["org-a"]; !slices.Equal(got, wanted) {
+		t.Fatalf("the Gateway binds %v, want the current %v", got, wanted)
+	}
+	if owner, bound := harness.gateway.principalOf[dropped]; bound {
+		t.Fatalf("%s is still owned by %s after being dropped from the binding", dropped, owner)
+	}
+	if got := harness.gateway.intentConflicts - conflicts; got != 0 {
+		t.Fatalf("%d changed-intent refusals were needed to settle the binding; that error is an anomaly, not a protocol", got)
+	}
+	// And a different tenant can hold it, which the ownership check would have
+	// refused while it was still bound.
+	if _, err := harness.gateway.PublishTenantPrincipals(context.Background(), "pool", "org-b",
+		trinogateway.PublishPrincipalsRequest{
+			Step:       trinogateway.Step{OperationID: "tenant.org-b", StepID: "principals.a1"},
+			Revision:   "binding-b",
+			Principals: []string{dropped},
+		}); err != nil {
+		t.Fatalf("another tenant cannot take the dropped identifier: %v", err)
 	}
 }
