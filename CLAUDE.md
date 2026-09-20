@@ -2153,6 +2153,14 @@ the Trino backend selection).
   real records — regenerate with `tools/gatewaywire`. Pooled registration needs
   a Gateway backend record, created INACTIVE and never activated through the
   legacy route.
+- **Gateway administration has two authentication layers when form auth is enabled.**
+  `DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME` selects the existing API-role
+  identity. The pool client sends Basic authentication with that username and
+  the existing rollout token as password, plus
+  `X-Gateway-Transaction-Admin-Token` for the pool capability check. An opaque
+  token is not a form-session JWT. An unset username preserves the token-only
+  Bearer mode for Gateways without the outer form-auth requirement. No new
+  secret or API authorization exception is introduced.
 - **Principal binding is duckgres-authoritative.** The tenant's principal set
   is derived from the SAME projection that writes `password.db`, asserted
   identical in test; the gate would otherwise block real users or admit

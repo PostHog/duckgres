@@ -23,6 +23,13 @@ client still validates its token independently. A mixed registry requires canari
 only for its fixed cells. Explicit canary configuration remains fail-closed, and
 a canary entry for a shared-pool cell is rejected.
 
+For a Gateway with form authentication enabled, also set
+`DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME` to its existing API-role identity.
+The pool client sends Basic authentication using that username and the existing
+token as password. It also sends `X-Gateway-Transaction-Admin-Token` for the
+separate capability check. Without a username, the client retains Bearer
+authentication; that mode does not satisfy a form-authenticated Gateway API.
+
 | Variable | Content |
 | --- | --- |
 | `DUCKGRES_TRINO_ROLLOUT_TOKEN_FILE` | Mounted private capability value, at least 32 characters. |

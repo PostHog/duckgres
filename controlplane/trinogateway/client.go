@@ -29,8 +29,11 @@ const (
 // Config configures the client. The credential is the Gateway's EXISTING admin
 // token; this protocol introduces no new secret and no client certificate.
 type Config struct {
-	BaseURL       string
-	AdminToken    string
+	BaseURL    string
+	AdminToken string
+	// APIUsername enables Basic authentication for the Gateway API role.
+	// Empty preserves token-only Bearer authentication.
+	APIUsername   string
 	TLSServerName string
 	// AllowPlaintext permits an http:// origin. Only tests set it: the token
 	// would otherwise cross the network in the clear.
@@ -41,10 +44,11 @@ type Config struct {
 
 // Client speaks the pooled member lifecycle protocol.
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
-	timeout time.Duration
+	baseURL  string
+	username string
+	token    string
+	http     *http.Client
+	timeout  time.Duration
 }
 
 // NewClient validates the origin and credential up front, so a misconfigured
@@ -63,6 +67,10 @@ func NewClient(config Config) (*Client, error) {
 	token := strings.TrimSpace(config.AdminToken)
 	if len(token) < minAdminTokenLength || strings.IndexFunc(token, unicode.IsControl) != -1 {
 		return nil, errors.New("gateway client requires the existing admin token")
+	}
+	if username := config.APIUsername; username != "" &&
+		(len(username) > 255 || strings.TrimSpace(username) != username || strings.Contains(username, ":") || strings.IndexFunc(username, unicode.IsControl) != -1) {
+		return nil, errors.New("gateway client has an invalid API username")
 	}
 
 	client := config.HTTPClient
@@ -87,10 +95,11 @@ func NewClient(config Config) (*Client, error) {
 		timeout = defaultRequestTimeout
 	}
 	return &Client{
-		baseURL: strings.TrimSuffix(origin.String(), "/"),
-		token:   token,
-		http:    client,
-		timeout: timeout,
+		baseURL:  strings.TrimSuffix(origin.String(), "/"),
+		username: config.APIUsername,
+		token:    token,
+		http:     client,
+		timeout:  timeout,
 	}, nil
 }
 
@@ -312,9 +321,13 @@ func (c *Client) doRaw(ctx context.Context, method, path string, body []byte, co
 	if err != nil {
 		return fmt.Errorf("build gateway request: %w", err)
 	}
-	// The Gateway accepts either form of the existing admin credential; sending
-	// both keeps the client working across its own auth refactors.
-	request.Header.Set("Authorization", "Bearer "+c.token)
+	// Form-authenticated Gateways require an API identity before the capability check.
+	// The dedicated header carries the capability without replacing Basic authentication.
+	if c.username != "" {
+		request.SetBasicAuth(c.username, c.token)
+	} else {
+		request.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	request.Header.Set("X-Gateway-Transaction-Admin-Token", c.token)
 	request.Header.Set("Accept", "application/json")
 	if body != nil {
