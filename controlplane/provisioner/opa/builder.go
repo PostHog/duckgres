@@ -2,9 +2,13 @@ package opa
 
 import (
 	"bytes"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 
 	"github.com/open-policy-agent/opa/v1/bundle"
 )
@@ -16,10 +20,10 @@ import (
 //go:embed policy.rego
 var policyRego []byte
 
-// bundleRevision is the manifest.revision stamped on bundles. OPA logs
-// the revision on activation; bumping it on policy edits makes bundle
-// pushes visible in OPA logs. The build encoding (data hash) further
-// disambiguates bundles with the same revision but different data.
+// bundleRevision is the schema prefix of every revision this package stamps.
+// The revision itself is the prefix plus a digest of the projected data (see
+// PolicyRevision): a constant could not tell a coordinator serving today's
+// tenant set from one that predates it.
 const bundleRevision = "v2"
 
 // policyPath is the in-bundle path of policy.rego. The bundle library
@@ -58,10 +62,25 @@ func (defaultBuilder) BuildBundle(gc GroupCatalogs, gs GroupScopes) ([]byte, err
 	if err != nil {
 		return nil, fmt.Errorf("build data document: %w", err)
 	}
+	revision, err := PolicyRevision(gc, gs)
+	if err != nil {
+		return nil, err
+	}
+	// data.trino.revision is what a coordinator's OPA answers when it is asked
+	// which authorization data it decides with (`opa.policy.revision-uri`).
+	// Without this document OPA answers "undefined", the access control reports
+	// no loaded revision, and a controller has no way to tell a coordinator
+	// deciding with the current policy from one still serving a bundle from
+	// before a tenant existed. The manifest revision alone cannot do it: it is
+	// not queryable as a document.
+	data["trino"] = map[string]interface{}{"revision": revision}
 
 	b := bundle.Bundle{
 		Manifest: bundle.Manifest{
-			Revision: bundleRevision,
+			// The manifest revision carries the same value, so OPA's activation
+			// log names the exact projection it loaded rather than a constant
+			// that never changes.
+			Revision: revision,
 			Roots:    &[]string{"trino", "group_catalogs", "group_scopes"},
 		},
 		Modules: []bundle.ModuleFile{
@@ -85,6 +104,47 @@ func (defaultBuilder) BuildBundle(gc GroupCatalogs, gs GroupScopes) ([]byte, err
 		return nil, fmt.Errorf("write bundle: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// PolicyRevision is the revision stamped on the bundle built from exactly this
+// projection.
+//
+// It is a digest of the policy and its data, not a counter, for two reasons: the
+// producer is whichever control-plane replica serves the bundle, so no replica
+// owns a counter, and the value has to be comparable in both directions - a
+// controller asks "is the coordinator deciding with the data I currently
+// serve?", which is an equality question, not an ordering one.
+//
+// The POLICY BYTES are part of it, not just the data. policy.rego is embedded
+// in the CONTROL PLANE binary and served to OPA as a remote bundle, so it is
+// not covered by the candidate's image check at all: two duckgres versions can
+// serve different rules to the same Trino and OPA images with an identical
+// group map. A revision over the data alone would call a coordinator deciding
+// with the previous RULES current.
+func PolicyRevision(gc GroupCatalogs, gs GroupScopes) (string, error) {
+	data, err := buildDataDocument(gc, gs)
+	if err != nil {
+		return "", fmt.Errorf("build data document: %w", err)
+	}
+	// Marshalling a map[string]interface{} sorts object keys, so the digest is
+	// stable across builds of the same projection.
+	canonical, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize bundle data: %w", err)
+	}
+	digest := sha256.New()
+	// Length-prefixed, so no rearrangement of policy and data bytes can produce
+	// the same digest as a different pair.
+	writeDigestField(digest, policyRego)
+	writeDigestField(digest, canonical)
+	return bundleRevision + "." + hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func writeDigestField(digest hash.Hash, field []byte) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(field)))
+	_, _ = digest.Write(length[:])
+	_, _ = digest.Write(field)
 }
 
 // buildDataDocument builds the JSON-decoded map[string]interface{} that OPA

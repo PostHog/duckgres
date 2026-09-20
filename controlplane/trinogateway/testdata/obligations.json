@@ -1,0 +1,12 @@
+{
+  "protocolVersion" : 1,
+  "instanceId" : "i-0007",
+  "incarnation" : "11111111-1111-4111-8111-111111111111",
+  "phase" : "DRAINING",
+  "generation" : 5,
+  "pendingRequests" : 2,
+  "openTransactions" : 1,
+  "activeQueries" : 3,
+  "readyToSeal" : false,
+  "drained" : false
+}

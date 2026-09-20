@@ -91,7 +91,21 @@ trino_query() { # principal password sql
   rows='[]'
   while :; do
     err="$(printf %s "$response" | jq -r '.error.message // empty')"
-    [ -z "$err" ] || { echo "$err" >&2; return 1; }
+    if [ -n "$err" ]; then
+      echo "$err" >&2
+      # Show bounded exception classes, not nested messages, SQL, URLs, or credentials.
+      printf %s "$response" | jq -c '
+        def matched($pattern): if type == "string" and test($pattern) then . else null end;
+        {
+          queryId: (.id | matched("^[0-9]{8}_[0-9]{6}_[0-9]+_[a-z0-9]+$")),
+          errorName: (.error.errorName | matched("^[A-Z][A-Z0-9_]{0,127}$")),
+          errorType: (.error.errorType | matched("^[A-Z][A-Z0-9_]{0,63}$")),
+          errorCode: (.error.errorCode | if type == "number" then . else null end),
+          causeTypes: [limit(12; .error.failureInfo | recurse(.cause // empty) |
+            .type | matched("^[A-Za-z_$][A-Za-z0-9_.$]{0,255}$") | select(. != null))]
+        }' >&2 2>/dev/null || true
+      return 1
+    fi
     rows="$(printf %s "$response" | jq -c --argjson rows "$rows" '$rows + (.data // [])')"
     next="$(printf %s "$response" | jq -r '.nextUri // empty')"
     [ -n "$next" ] || break

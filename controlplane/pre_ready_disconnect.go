@@ -79,10 +79,11 @@ func (w *preReadyDisconnectWatcher) watch() {
 }
 
 func (w *preReadyDisconnectWatcher) finish(result preReadyDisconnectResult) {
+	// Publish the result before cancellation lets session creation call Stop.
+	w.done <- result
 	if result.ClientCanceled {
 		w.cancel()
 	}
-	w.done <- result
 }
 
 // Stop joins the watcher and clears the temporary read deadline before the
