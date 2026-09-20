@@ -27,6 +27,24 @@ func buildTrinoRolloutReadiness(fleet trinoFleet, store rolloutCanaryStore) (*tr
 	if tokenPath == "" && canaryPath == "" {
 		return nil, nil
 	}
+	// Pool Gateway authentication reuses the token without enabling fixed-slot readiness.
+	// An explicit canary file still requests validation, even for a pool-only fleet.
+	var fixed trinoFleet
+	hasPool := false
+	for _, wire := range fleet {
+		if wire.Cell.PublicID == "" {
+			continue
+		}
+		if wire.Cell.Mode == trinoPoolModeShared {
+			hasPool = true
+			continue
+		}
+		fixed = append(fixed, wire)
+	}
+	if hasPool && len(fixed) == 0 && canaryPath == "" {
+		return nil, nil
+	}
+	fleet = fixed
 	if tokenPath == "" || canaryPath == "" || len(fleet) == 0 {
 		return nil, errors.New("rollout readiness requires token, canaries, and registered cells")
 	}
