@@ -13,7 +13,15 @@ provisioning state, or Gateway routes.
 
 Both variables are empty by default; the endpoint is then not registered.
 Supplying only one variable, invalid content, or incomplete cell configuration
-fails startup.
+fails startup for fixed-cell readiness.
+
+Shared-pool Gateway authentication reuses `DUCKGRES_TRINO_ROLLOUT_TOKEN_FILE`,
+but this does not enable the fixed-slot endpoint. When all registered cells use
+`mode: shared-pool` and no canary file is configured, the endpoint stays disabled;
+the legacy single coordinator can coexist with those pools. The pool Gateway
+client still validates its token independently. A mixed registry requires canaries
+only for its fixed cells. Explicit canary configuration remains fail-closed, and
+a canary entry for a shared-pool cell is rejected.
 
 | Variable | Content |
 | --- | --- |

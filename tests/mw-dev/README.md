@@ -884,6 +884,24 @@ IDs, TLS service names, auth projections, and cache-manager configuration. Run
 namespace before retrying. Namespace teardown removes both clusters, cached
 catalog rows in the throwaway database, and all ephemeral cache volumes.
 
+### Shared-pool startup acceptance
+
+The existing `trino_shared_pool_active` assertion in `e2e/harness.sh` requires
+`E2E_TRINO_POOL=1` and a separately configured shared-pool deployment. Its
+structure stage waits for ready, independent coordinator instances; subsequent
+opt-in stages check warehouse admission and a real query with an existing login.
+Run it after rolling a candidate control-plane image with a shared-pool registry,
+the Gateway token file, and no `DUCKGRES_TRINO_ROLLOUT_CANARIES_FILE`. Reusing
+the token must not activate the obsolete fixed-slot canary endpoint or crash
+control-plane startup.
+
+The default in-Job fixture does not configure a shared pool, and its harness runs
+only after the control plane starts. It cannot reproduce this startup failure by
+changing its own environment: the control plane reads these settings at process
+startup. `TestTrinoRolloutReadinessScopesFixedCells` covers the startup selection
+and malformed fixed/mixed configurations locally. The active-pool harness remains
+the real-cluster acceptance check; passing unit tests alone does not prove it ran.
+
 ### Optional shared catalog rollout lane
 
 `TRINO_SHARED_CATALOGS_ENABLED=true` adds an isolated, real Gateway to the
