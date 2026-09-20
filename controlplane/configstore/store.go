@@ -427,35 +427,53 @@ func orgUserQueryAccessFromSnapshot(snapshot *Snapshot, orgID, username string) 
 		return policy, true
 	}
 	for _, team := range org.Teams {
-		if team.TeamID != *access.TeamID || !team.Enabled {
+		if team.TeamID != *access.TeamID {
 			continue
 		}
-		policy.ReadOnly = access.Mode != OrgUserAccessModeProjectUser
-		importsSchema := team.SchemaName + "_data_imports"
-		if team.SchemaDataImportsName != nil && *team.SchemaDataImportsName != "" {
-			importsSchema = *team.SchemaDataImportsName
-		}
-		policy.AllowedSchemas = []string{
-			importsSchema,
-			fmt.Sprintf("shadow_%d_models", team.TeamID),
-			team.SchemaName,
-		}
-		// A non-NULL override means the team's table lives in the shared
-		// legacy posthog schema — even when the override spells the derived
-		// default name (posthog org team 2 is events_table_name="events" →
-		// posthog.events). NULL means derive from schema_name, which the
-		// AllowedSchemas grant above already covers.
-		if team.EventsTableName != nil && *team.EventsTableName != "" {
-			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.EventsTableName)
-		}
-		if team.PersonsTableName != nil && *team.PersonsTableName != "" {
-			policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.PersonsTableName)
-		}
-		sort.Strings(policy.AllowedSchemas)
-		sort.Strings(policy.AllowedRelations)
-		return policy, true
+		return OrgUserQueryAccessForTeam(access.Mode, team), true
 	}
 	return policy, true
+}
+
+// OrgUserQueryAccessForTeam derives a project-scoped login's policy from ITS
+// TEAM ROW.
+//
+// It is the one derivation, shared by the snapshot-backed reader above and by
+// the pooled projection path that reads the same row inside its own
+// transaction. Two implementations would be two answers to "what may this login
+// see", and the pgwire gateway and the Trino bundle would eventually disagree.
+//
+// A disabled team resolves to the fail-closed policy: no namespaces and no
+// write authorization, whatever the mode says.
+func OrgUserQueryAccessForTeam(mode string, team OrgTeamConfig) OrgUserQueryAccess {
+	policy := OrgUserQueryAccess{ReadOnly: true}
+	if !team.Enabled {
+		return policy
+	}
+	policy.ReadOnly = mode != OrgUserAccessModeProjectUser
+	importsSchema := team.SchemaName + "_data_imports"
+	if team.SchemaDataImportsName != nil && *team.SchemaDataImportsName != "" {
+		importsSchema = *team.SchemaDataImportsName
+	}
+	policy.AllowedSchemas = []string{
+		importsSchema,
+		fmt.Sprintf("shadow_%d_models", team.TeamID),
+		team.SchemaName,
+	}
+	// A non-NULL override means the team's table lives in the shared
+	// legacy posthog schema — even when the override spells the derived
+	// default name (posthog org team 2 is events_table_name="events" →
+	// posthog.events). NULL means derive from schema_name, which the
+	// AllowedSchemas grant above already covers.
+	if team.EventsTableName != nil && *team.EventsTableName != "" {
+		policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.EventsTableName)
+	}
+	if team.PersonsTableName != nil && *team.PersonsTableName != "" {
+		policy.AllowedRelations = append(policy.AllowedRelations, "posthog."+*team.PersonsTableName)
+	}
+	sort.Strings(policy.AllowedSchemas)
+	sort.Strings(policy.AllowedRelations)
+	return policy
 }
 
 // Snapshot returns the current config snapshot.

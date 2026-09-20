@@ -41,6 +41,41 @@ func TestPreReadyDisconnectWatcherCancelsContextWhenClientCloses(t *testing.T) {
 	}
 }
 
+func TestPreReadyDisconnectWatcherPublishesResultBeforeCancellation(t *testing.T) {
+	cancelStarted := make(chan struct{})
+	releaseCancel := make(chan struct{})
+	finished := make(chan struct{})
+	watcher := &preReadyDisconnectWatcher{
+		done: make(chan preReadyDisconnectResult, 1),
+		cancel: func() {
+			close(cancelStarted)
+			<-releaseCancel
+		},
+	}
+	defer func() {
+		close(releaseCancel)
+		<-finished
+	}()
+	want := preReadyDisconnectResult{ClientCanceled: true, Err: io.EOF}
+	go func() {
+		watcher.finish(want)
+		close(finished)
+	}()
+	select {
+	case <-cancelStarted:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not cancel session creation")
+	}
+	select {
+	case got := <-watcher.done:
+		if got != want {
+			t.Fatalf("published result = %+v, want %+v", got, want)
+		}
+	default:
+		t.Fatal("session cancellation became visible before its disconnect result")
+	}
+}
+
 func TestPreReadyDisconnectWatcherStopLeavesReaderUsable(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer func() { _ = clientConn.Close() }()

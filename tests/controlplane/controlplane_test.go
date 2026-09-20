@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 	"github.com/posthog/duckgres/server"
 )
 
@@ -207,13 +207,19 @@ users:
 	return h
 }
 
-func (h *cpHarness) openConn(t *testing.T) *sql.DB {
+func (h *cpHarness) openConn(t *testing.T, dialers ...pq.Dialer) *sql.DB {
 	t.Helper()
-	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require connect_timeout=10", h.port)
-	db, err := sql.Open("postgres", dsn)
+	// lib/pq applies connect_timeout through ReadyForQuery, including worker initialization.
+	// Allow the default session initialization timeout; lib/pq clears it before queries.
+	dsn := fmt.Sprintf("host=127.0.0.1 port=%d user=testuser password=testpass sslmode=require connect_timeout=%d", h.port, int(server.DefaultSessionInitTimeout/time.Second))
+	connector, err := pq.NewConnector(dsn)
 	if err != nil {
 		t.Fatalf("Failed to open connection: %v", err)
 	}
+	if len(dialers) > 0 {
+		connector.Dialer(dialers[0])
+	}
+	db := sql.OpenDB(connector)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	t.Cleanup(func() { _ = db.Close() })
@@ -240,6 +246,11 @@ func (h *cpHarness) waitForLog(substr string, timeout time.Duration) error {
 
 func (h *cpHarness) cleanup(t *testing.T) {
 	t.Helper()
+	defer func() {
+		if t.Failed() {
+			t.Logf("Control plane logs:\n%s", h.logBuf.String())
+		}
+	}()
 
 	if h.cmd.Process == nil {
 		return
@@ -316,6 +327,66 @@ func TestControlPlaneBasic(t *testing.T) {
 	if result != 1 {
 		t.Fatalf("Expected 1, got %d", result)
 	}
+}
+
+func TestControlPlaneConnectionWaitsForDelayedStartup(t *testing.T) {
+	h := startControlPlane(t, defaultOpts())
+	if err := h.sendSignal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("Pause control plane: %v", err)
+	}
+	dialer := &delayedStartupDialer{connected: make(chan struct{})}
+	stopDelay := make(chan struct{})
+	resumeErr := make(chan error, 1)
+	go func() {
+		select {
+		case <-dialer.connected:
+			delay := time.NewTimer(11 * time.Second)
+			defer delay.Stop()
+			select {
+			case <-delay.C:
+			case <-stopDelay:
+			}
+		case <-stopDelay:
+		}
+		resumeErr <- h.sendSignal(syscall.SIGCONT)
+	}()
+	defer func() {
+		close(stopDelay)
+		if err := <-resumeErr; err != nil {
+			t.Errorf("Resume control plane: %v", err)
+		}
+	}()
+
+	db := h.openConn(t, dialer)
+	ctx, cancel := context.WithTimeout(context.Background(), server.DefaultSessionInitTimeout)
+	defer cancel()
+	var result int
+	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&result); err != nil {
+		t.Fatalf("Delayed startup query failed: %v\nLogs:\n%s", err, h.logBuf.String())
+	}
+	if result != 1 {
+		t.Fatalf("Expected 1, got %d", result)
+	}
+	if attempts := strings.Count(h.logBuf.String(), "Connection accepted."); attempts != 1 {
+		t.Fatalf("Delayed startup used %d connection attempts, want 1", attempts)
+	}
+}
+
+type delayedStartupDialer struct {
+	connected chan struct{}
+	once      sync.Once
+}
+
+func (d *delayedStartupDialer) Dial(network, address string) (net.Conn, error) {
+	return d.DialTimeout(network, address, 0)
+}
+
+func (d *delayedStartupDialer) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout(network, address, timeout)
+	if err == nil {
+		d.once.Do(func() { close(d.connected) })
+	}
+	return conn, err
 }
 
 func TestHandoverPreservesActiveQuery(t *testing.T) {
@@ -732,11 +803,9 @@ func TestUpgradeWithMaxWorkers(t *testing.T) {
 
 	h.doHandover(t)
 
-	// Verify new connections work after upgrade. The first post-handover
-	// query has to spawn and DuckDB-pre-warm a fresh worker process; on slow
-	// CI runners that easily exceeds the default lib/pq read deadline. Wrap
-	// the query in an explicit 60s context so we wait long enough for the
-	// worker to come up rather than racing the warmup.
+	// Verify new connections work after upgrade. openConn bounds the handshake,
+	// which includes starting and pre-warming a worker. The context also bounds
+	// query execution; it cannot extend lib/pq's connect_timeout deadline.
 	db := h.openConn(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

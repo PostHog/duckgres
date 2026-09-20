@@ -1,0 +1,14 @@
+{
+  "protocolVersion" : 1,
+  "poolId" : "pool-001",
+  "instanceId" : "i-0007",
+  "incarnation" : "11111111-1111-4111-8111-111111111111",
+  "evidence" : "PROCESS_TERMINATED",
+  "detail" : {
+    "source" : "kubernetes-pod-absent"
+  },
+  "outstandingAdmissions" : 0,
+  "outstandingTransactions" : 1,
+  "outstandingQueries" : 2,
+  "recordedAt" : "2026-09-18T00:00:00Z"
+}

@@ -171,6 +171,11 @@ store; upstream `trinodb/trino` is not compatible. Update the default in
 `run.sh` and `e2e-mw-dev.yml` together when promoting the regular E2E
 Trino build. The frozen benchmark retains its separate pin in `scenario-dev.yml`
 until its independent migration.
+On statement failure, the harness reports the query ID, error codes and a bounded
+exception-class chain alongside the existing top-level message. It excludes nested
+messages, stack traces and response URLs because these can contain credentials or
+internal infrastructure details. A failure still stops the test without retrying
+the statement; these diagnostics do not classify a storage failure as transient.
 The suite asserts per-user logins on every run: an org user authenticates as
 `<database_name>.<username>` with its pgwire password, reads only its own org's
 catalog, is attributed to its org in the admin query list, and stops
