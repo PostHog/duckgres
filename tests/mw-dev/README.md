@@ -938,6 +938,29 @@ configuration change, immutable snapshots, lost retirement response, verified
 absence, and replacement locally. The companion tests preserve admission
 ambiguity, Gateway retirement refusals, configuration freeze, and lease fencing.
 
+### Shared-pool rollout sealing acceptance
+
+A DRAINING member with no remaining obligations reports `readyToSeal=true` and
+`drained=false`. Duckgres uses that readiness to request sealing; it does not
+wait for the post-seal `drained` result before making the first request. If the
+seal commits but its response is lost, a subsequent `drained=true` observation
+allows replay with the original operation identity and expected generation.
+Pending requests, open transactions, and active or retained queries still block
+sealing. Only Gateway-authorized retirement permits resource deletion.
+
+For live acceptance, keep an existing read-only transaction open while a desired
+release update admits a replacement and drains its predecessor. The old member
+must remain present while that transaction continues to query successfully.
+After committing and waiting for result retention to finish, verify the old
+member seals and retires while the pool retains its configured serving floor.
+Run this only through the deployment controller during an authorized test window;
+restarting a coordinator does not test graceful retirement.
+
+The default in-Job fixture does not own a shared pool or publish its desired
+release, so it cannot perform that rollout safely. `TestPoolSeal*` covers the
+Gateway obligation contract, each blocker, refusal, and lost-response replay
+locally. These tests do not establish live rollout continuity by themselves.
+
 ### Optional shared catalog rollout lane
 
 `TRINO_SHARED_CATALOGS_ENABLED=true` adds an isolated, real Gateway to the
