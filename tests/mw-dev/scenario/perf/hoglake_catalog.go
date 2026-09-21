@@ -16,9 +16,10 @@ import (
 	trinodriver "github.com/posthog/duckgres/tests/perf/drivers/trino"
 )
 
-// selectHoglakeCatalog switches only the backend dataset of the disposable
-// tenant catalog. Its name, principal, credentials, cache mode and OPA grant
-// remain identical. Callers select the original dataset explicitly on retries.
+// selectHoglakeCatalog switches the disposable tenant catalog to a fixture
+// dataset using the read-only storage Pod Identity. Tenant authentication,
+// cache mode and OPA grant remain identical. Callers select the original
+// dataset explicitly on retries.
 func (f defaultDriverFactory) selectHoglakeCatalog(ctx context.Context, connection trinodriver.ConnectionConfig) error {
 	if f.trinoCatalogStoreDSN == "" || connection.CatalogStoreCellID == "" {
 		return errors.New("dataset selection requires an explicit isolated benchmark catalog store and cell")
@@ -44,11 +45,10 @@ func (f defaultDriverFactory) selectHoglakeCatalog(ctx context.Context, connecti
 	if original == nil {
 		return errors.New("no benchmark catalog in the configured catalog-store cell; verify DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID (not the public API cell ID)")
 	}
-	if original["connector.name"] != "hoglake" || original["hoglake.catalog"] == "" || original["hoglake.uri"] == "" || original["fs.cache.enabled"] != "false" {
-		return errors.New("dataset selection requires an existing uncached Hoglake benchmark catalog")
+	desired, err := fixtureHoglakeProperties(original, connection.HoglakeCatalog)
+	if err != nil {
+		return err
 	}
-	desired := maps.Clone(original)
-	desired["hoglake.catalog"] = connection.HoglakeCatalog
 	if maps.Equal(original, desired) {
 		return waitHoglakeSchema(ctx, connection)
 	}
@@ -119,6 +119,21 @@ func (f defaultDriverFactory) selectHoglakeCatalog(ctx context.Context, connecti
 		case <-time.After(interval):
 		}
 	}
+}
+
+func fixtureHoglakeProperties(original map[string]string, catalog string) (map[string]string, error) {
+	if original["connector.name"] != "hoglake" || original["hoglake.catalog"] == "" || original["hoglake.uri"] == "" || original["fs.cache.enabled"] != "false" || original["s3.auth-type"] != "IAM_ROLE" {
+		return nil, errors.New("dataset selection requires an existing uncached Hoglake benchmark catalog using IAM_ROLE authentication")
+	}
+	if original["s3.iam-role"] != "" && original["hoglake.catalog"] == catalog {
+		return nil, errors.New("read-only benchmark fixtures require a separate Hoglake catalog from the managed tenant")
+	}
+	desired := maps.Clone(original)
+	desired["hoglake.catalog"] = catalog
+	// Managed onboarding assumes a tenant's writable storage role. Immutable
+	// benchmark fixtures are read through the isolated Trino Pod Identity instead.
+	delete(desired, "s3.iam-role")
+	return desired, nil
 }
 
 // Metadata access establishes that the connector loaded the selected dataset;

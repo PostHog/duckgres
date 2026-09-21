@@ -115,6 +115,10 @@ jobs:
           # collect artifacts and tear down the isolated namespace.
           role-duration-seconds: 16200
 
+      - name: Discover managed Hoglake configuration
+        if: env.E2E_SUITE == 'trino'
+        run: bash tests/mw-dev/discover-hoglake.sh
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4.1.2
         with:

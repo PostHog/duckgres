@@ -1064,7 +1064,21 @@ for fixture writers to terminate and deletes only the numeric PR's exact prefix.
 The initialized metadata-loss protection has unit regression coverage; this
 lane does not corrupt the server database to simulate metadata loss.
 
-The frozen performance workflow remains a separate, deferred migration. Its
-external read-only catalog bootstrap is not proof of managed Hoglake onboarding
-and must be adapted independently before relying on it with the new backend
-ownership rules. This change does not copy or rewrite the frozen dataset.
+The frozen performance workflow also discovers the dedicated managed storage
+base and configures managed Hoglake admission. It uses the same Hoglake server
+pin, which supports atomic table creation, but keeps the frozen-data read-only
+Pod Identity for fixture reads. The control plane owns the tenant's managed
+catalog; the importer registers immutable Parquet in a separate `<org>-frozen`
+catalog (and `<org>-properties` for the optional suite). The isolated benchmark
+selector uses the read-only Pod Identity instead of assuming the managed tenant
+storage role. It does not copy, rewrite or grant writes to the frozen dataset.
+
+For local frozen runs, supply `HOGLAKE_DATA_PATH` with the dedicated
+`s3://<bucket>/trino/` base before deployment. Missing configuration fails before
+namespace mutation. Managed Hoglake rejects public deprovision by design, so the
+frozen scenario leaves cleanup to the workflow's always-run `run.sh teardown`.
+Direct/local scenario invocations must run that teardown even after failures;
+it removes the isolated Duckling and namespace before cleaning the scoped managed
+storage prefix. Do not use the frozen source prefix as `HOGLAKE_DATA_PATH`.
+Collect `run.sh diagnostics` and preserve scenario artifacts before teardown, then
+redeploy a fresh isolated stack before retrying.
