@@ -65,6 +65,23 @@ func TestPoolWiringRefusesAnOperatorWithoutAGateway(t *testing.T) {
 	}
 }
 
+func TestPoolGatewayWiringValidatesTheConfiguredAPIUsername(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte(strings.Repeat("x", 48)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envTrinoPoolGatewayURL, "https://gateway.example.test")
+	t.Setenv("DUCKGRES_TRINO_ROLLOUT_TOKEN_FILE", tokenPath)
+	for _, username := range []string{"pool-controller", "", "invalid:username", "invalid\nusername"} {
+		t.Setenv("DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME", username)
+		_, err := buildTrinoPoolGateway()
+		invalid := strings.ContainsAny(username, ":\n")
+		if (err != nil) != invalid {
+			t.Fatalf("username valid=%v, gateway configuration error=%v", !invalid, err)
+		}
+	}
+}
+
 // A pooled cell with the operator disabled still wires: the durable desired
 // state is kept in sync and nothing external is touched.
 func TestPoolWiringBuildsAReadOnlyOperator(t *testing.T) {

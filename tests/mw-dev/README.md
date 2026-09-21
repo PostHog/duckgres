@@ -894,6 +894,10 @@ Run it after rolling a candidate control-plane image with a shared-pool registry
 the Gateway token file, and no `DUCKGRES_TRINO_ROLLOUT_CANARIES_FILE`. Reusing
 the token must not activate the obsolete fixed-slot canary endpoint or crash
 control-plane startup.
+When the Gateway uses form authentication, configure the existing API-role
+username through `DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME`. The same active
+acceptance path requires successful API and capability authentication before
+the operator can create and admit compute instances.
 
 The default in-Job fixture does not configure a shared pool, and its harness runs
 only after the control plane starts. It cannot reproduce this startup failure by

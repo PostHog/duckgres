@@ -287,6 +287,7 @@ func buildTrinoPoolGateway() (trinoPoolGateway, error) {
 	client, err := trinogateway.NewClient(trinogateway.Config{
 		BaseURL:       endpoint,
 		AdminToken:    token,
+		APIUsername:   os.Getenv("DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME"),
 		TLSServerName: strings.TrimSpace(os.Getenv("DUCKGRES_TRINO_MANAGED_GATEWAY_SERVER_NAME")),
 	})
 	if err != nil {
