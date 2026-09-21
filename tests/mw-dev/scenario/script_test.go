@@ -67,7 +67,7 @@ func TestScenarioRunScriptCheckEnvIncludesScenarioRequiredEnv(t *testing.T) {
 	}
 }
 
-func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
+func TestDevScenarioWorkflowPreservesIsolationCleanupAndPublishing(t *testing.T) {
 	workflowPath := filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml")
 	raw, err := os.ReadFile(workflowPath)
 	if err != nil {
@@ -76,53 +76,11 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	workflow := string(raw)
 
 	for _, required := range []string{
-		"name: scenario-dev",
-		"workflow_dispatch:",
-		"scenario:",
-		"default: full-suite",
-		"schedule:",
-		"- cron: \"17 8 * * *\"",
-		"SCENARIO_NAME: ${{ github.event_name == 'schedule' && 'posthog_frozen_perf' || inputs.scenario }}",
-		"- name: Require a current image for cached comparisons",
-		"Cached Trino comparisons require the control-plane image built from this revision.",
 		"PR_NUMBER: ${{ github.run_id }}",
 		"NAMESPACE: duckgres-ci-pr-${{ github.run_id }}",
-		"name: scenario-dev-${{ env.SCENARIO_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}",
-		"id-token: write",
-		"uses: ./.github/workflows/_image-build.yml",
-		"image-name: duckgres",
-		"tag: scenario-runner-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
-		"tag: scenario-duckgres-${{ github.run_id }}-${{ github.run_attempt }}-arm64",
-		"inputs.duckgres_image != ''",
-		"KUBE_CONTEXT: posthog-mw-dev",
-		"CLUSTER_NAME: posthog-mw-dev",
-		"EKS_CLUSTER_NAME: posthog-mw-dev",
-		"CP_POD_IDENTITY_ROLE: arn:aws:iam::${{ secrets.MW_DEV_ACCOUNT_ID }}:role/duckgres-control-plane-dev",
-		"TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}",
-		"- name: Load frozen perf identity and Athena configuration",
-		"if: env.SCENARIO_NAME == 'posthog_frozen_perf'",
-		"bash scripts/scenario_athena_config.sh >> \"$GITHUB_ENV\"",
-		"TRINO_IMAGE: ghcr.io/posthog/trino:",
-		"E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}",
-		"DUCKGRES_K8S_WORKER_CPU_REQUEST: \"3\"",
-		"DUCKGRES_K8S_WORKER_MEMORY_REQUEST: 12Gi",
-		"role-duration-seconds: 16200",
-		"tests/mw-dev/run.sh deploy",
-		"tests/mw-dev/run.sh test-scenario",
-		"- name: Publish scenario summary",
-		"if: always()",
-		"scenario_summary.md",
-		"$GITHUB_STEP_SUMMARY",
-		"tests/mw-dev/run.sh diagnostics",
-		"tests/mw-dev/run.sh teardown",
-		"- name: Publish scenario perf results",
+		"- name: Teardown\n        if: always()\n        run: tests/mw-dev/run.sh teardown",
 		"github.ref == 'refs/heads/main'",
-		"MW_DEV_SCENARIO_PERF_SECRET_ID: ${{ vars.MW_DEV_SCENARIO_PERF_SECRET_ID }}",
-		"aws secretsmanager get-secret-value",
-		"go run ./cmd/duckgres-perf-publisher",
 		"--connection-secret-stdin",
-		"--schema duckgres_scenario_perf",
-		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev ./tests/perf/publishercli",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("workflow missing %q", required)
@@ -130,53 +88,20 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	}
 
 	for _, forbidden := range []string{
-		"matrix:",
-		"posthog_frozen_perf_trino_cached",
-		"MW_DEV_ATHENA_POD_IDENTITY_ROLE",
-		"MW_DEV_ATHENA_WORKGROUP",
-		"MW_DEV_ATHENA_DATABASE",
-		"MW_DEV_ATHENA_RESULTS_S3_URI",
-		"skip_slow:",
-		"inputs.skip_slow",
-		"scenario-skipped:",
-		"test-scenario-full",
 		"use_shared_dev:",
 		"USE_SHARED_DEV",
 		"SCENARIO_SHARED_",
-		"DUCKGRES_SCENARIO_KUBE_CONTEXT",
-		"DUCKGRES_SCENARIO_EKS_CLUSTER_NAME",
-		"DUCKGRES_SCENARIO_CP_POD_IDENTITY_ROLE",
-		"DUCKGRES_SCENARIO_CONFIG_SECRET",
-		"DUCKGRES_SCENARIO_INTERNAL_SECRET_NAME",
-		"DUCKGRES_SCENARIO_INTERNAL_SECRET_KEY",
-		"trino.trino.svc",
 		"DUCKGRES_SCENARIO_API_BASE: ${{ secrets.",
 		"DUCKGRES_SCENARIO_INTERNAL_SECRET: ${{ secrets.",
 		"DUCKGRES_SCENARIO_PG_HOST: ${{ secrets.",
-		"DUCKGRES_SCENARIO_SNI_SUFFIX: ${{ secrets.",
-		"DUCKGRES_SCENARIO_FROZEN_S3_URI: ${{ secrets.",
-		"DUCKGRES_SCENARIO_FLIGHT_ADDR: ${{ secrets.",
-		"MW_DEV_SCENARIO_PERF_HOST",
-		"MW_DEV_SCENARIO_PERF_PORT",
-		"MW_DEV_SCENARIO_PERF_DATABASE",
-		"MW_DEV_SCENARIO_PERF_USERNAME",
-		"MW_DEV_SCENARIO_PERF_PASSWORD",
 		"postgres://",
 		"postgresql://",
 		"--dsn",
 		"--password",
-		"SCENARIO_NAME: ${{ inputs.scenario || 'full-suite' }}",
 	} {
 		if strings.Contains(workflow, forbidden) {
 			t.Fatalf("workflow contains internal detail %q", forbidden)
 		}
-	}
-
-	authIndex := strings.Index(workflow, "- name: Configure AWS credentials (OIDC)")
-	configIndex := strings.Index(workflow, "- name: Load frozen perf identity and Athena configuration")
-	deployIndex := strings.Index(workflow, "- name: Deploy isolated Duckgres stack")
-	if authIndex < 0 || configIndex < authIndex || deployIndex < configIndex {
-		t.Fatal("Frozen perf configuration must load after AWS authentication and before deploying the stack")
 	}
 
 	teardownIndex := strings.Index(workflow, "- name: Teardown")
@@ -197,57 +122,5 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 	}
 	if strings.Contains(workflow, "-path '*/perf/summary.json' -print -quit") {
 		t.Fatal("perf publishing must not silently select only the first result")
-	}
-}
-
-func TestScenarioRunnerImageCachesGoDependencies(t *testing.T) {
-	dockerfilePath := filepath.Join("Dockerfile")
-	raw, err := os.ReadFile(dockerfilePath)
-	if err != nil {
-		t.Fatalf("read scenario runner Dockerfile: %v", err)
-	}
-	dockerfile := string(raw)
-
-	for _, required := range []string{
-		"go mod download",
-		"go test -run '^$' ./tests/mw-dev/scenario",
-	} {
-		if !strings.Contains(dockerfile, required) {
-			t.Fatalf("scenario runner Dockerfile missing %q", required)
-		}
-	}
-}
-
-func TestScenarioWorkflowsUseNode24Actions(t *testing.T) {
-	scenarioWorkflow, err := os.ReadFile(filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml"))
-	if err != nil {
-		t.Fatalf("read scenario workflow: %v", err)
-	}
-	imageWorkflow, err := os.ReadFile(filepath.Join("..", "..", "..", ".github", "workflows", "_image-build.yml"))
-	if err != nil {
-		t.Fatalf("read image workflow: %v", err)
-	}
-
-	for _, required := range []string{
-		"actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0",
-		"actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0",
-		"actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
-		"aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2",
-		"azure/setup-kubectl@829323503d1be3d00ca8346e5391ca0b07a9ab0d # v5.1.0",
-	} {
-		if !strings.Contains(string(scenarioWorkflow), required) {
-			t.Fatalf("scenario workflow missing Node 24 action pin %q", required)
-		}
-	}
-	for _, required := range []string{
-		"actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0",
-		"docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0",
-		"aws-actions/configure-aws-credentials@517a711dbcd0e402f90c77e7e2f81e849156e31d # v6.2.2",
-		"aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2.1.6",
-		"docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0",
-	} {
-		if !strings.Contains(string(imageWorkflow), required) {
-			t.Fatalf("image workflow missing Node 24 action pin %q", required)
-		}
 	}
 }

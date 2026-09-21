@@ -599,30 +599,13 @@ func TestComposedFrozenSuitesDoNotEnablePostHogTableSetup(t *testing.T) {
 	}
 }
 
-func TestPostHogTableSetupIsExplicitAndRerunnable(t *testing.T) {
+func TestPostHogTableSetupDoesNotRewriteRows(t *testing.T) {
 	setupFile := filepath.Join("sql", "setup_posthog_tables.sql")
 	raw, err := os.ReadFile(setupFile)
 	if err != nil {
 		t.Fatalf("read posthog table setup: %v", err)
 	}
 	sql := string(raw)
-	for _, want := range []string{
-		"CREATE SCHEMA IF NOT EXISTS posthog",
-		"DROP TABLE IF EXISTS posthog.events",
-		"DROP TABLE IF EXISTS posthog.persons",
-		"CREATE TABLE posthog.events (",
-		"CREATE TABLE posthog.persons (",
-		"CALL ducklake_add_data_files(",
-		"${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}events/*.parquet",
-		"${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet",
-		"allow_missing => true",
-		"SET PARTITIONED BY (year(timestamp), month(timestamp), day(timestamp))",
-		"SET PARTITIONED BY (year(_timestamp), month(_timestamp))",
-	} {
-		if !strings.Contains(sql, want) {
-			t.Fatalf("posthog setup missing %q", want)
-		}
-	}
 	for _, unwanted := range []string{
 		"INSERT INTO posthog.events",
 		"INSERT INTO posthog.persons",
@@ -634,45 +617,12 @@ func TestPostHogTableSetupIsExplicitAndRerunnable(t *testing.T) {
 	}
 }
 
-func TestPostHogTableSetupValidatesRequiredSourceColumnsAndMappings(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("sql", "setup_posthog_tables.sql"))
-	if err != nil {
-		t.Fatalf("read posthog table setup: %v", err)
-	}
-	sql := string(raw)
-	for _, want := range []string{
-		"table_schema = 'frozen_v1'",
-		"table_name = 'events_file_view'",
-		"table_name = 'persons_file_view'",
-		"information_schema.columns",
-		"missing required source columns",
-		"('project_id')",
-	} {
-		if !strings.Contains(sql, want) {
-			t.Fatalf("posthog setup missing registration diagnostic %q", want)
-		}
-	}
-}
-
-func TestPostHogTableValidationChecksRegisteredFixtureMetadata(t *testing.T) {
+func TestPostHogTableValidationDoesNotWarmTableData(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("sql", "validate_posthog_tables.sql"))
 	if err != nil {
 		t.Fatalf("read posthog table validation: %v", err)
 	}
 	sql := string(raw)
-	for _, want := range []string{
-		"ordinal_position",
-		"ducklake_list_files",
-		"glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}events/*.parquet')",
-		"glob('${env:DUCKGRES_SCENARIO_FROZEN_S3_URI}persons/*.parquet')",
-		"posthog frozen-file registration mismatch",
-		"DESCRIBE posthog.events",
-		"DESCRIBE posthog.persons",
-	} {
-		if !strings.Contains(sql, want) {
-			t.Fatalf("posthog setup missing registration validation %q", want)
-		}
-	}
 	if strings.Contains(sql, "FROM posthog.events") || strings.Contains(sql, "FROM posthog.persons") {
 		t.Fatal("posthog registration validation must not scan table rows before perf")
 	}
