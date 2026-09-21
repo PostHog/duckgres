@@ -899,6 +899,21 @@ username through `DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME`. The same active
 acceptance path requires successful API and capability authentication before
 the operator can create and admit compute instances.
 
+Internal HTTP coordinator probes declare forwarded HTTPS on port 443. Trino
+uses that advertised origin in statement continuation URLs. Duckgres validates
+the same coordinator hostname, HTTPS port 443, and statement-result path before
+mapping those continuations back to the configured internal HTTP endpoint.
+Other origins, user information, query strings, fragments, and HTTP redirects
+remain rejected. Fixed HTTPS coordinator probes retain their exact-origin rule.
+No new configuration or credential is needed.
+
+`TestPoolCandidateConsumesForwardedHTTPSContinuation` exercises full candidate
+validation with queued and executing result pages and both HTTPS port spellings.
+The fixture follows Trino's request-derived URI construction, including forwarded
+headers; returning all node rows from the initial POST would miss this failure.
+Run the active-pool acceptance stage after deployment to verify real coordinator
+admission and querying. This local regression does not replace that cluster check.
+
 The default in-Job fixture does not configure a shared pool, and its harness runs
 only after the control plane starts. It cannot reproduce this startup failure by
 changing its own environment: the control plane reads these settings at process
