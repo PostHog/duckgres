@@ -64,6 +64,20 @@ func (o *trinoPoolOperator) progressInstance(ctx context.Context, instance confi
 	case trinopool.PhaseCreating:
 		return o.registerWhenReady(ctx, instance)
 	case trinopool.PhasePreparing:
+		if o.pool == nil || o.pool.DesiredReleaseID == "" || o.pool.DesiredBlueprintDigest == "" {
+			return false, errors.New("candidate supersession requires a complete desired pool specification")
+		}
+		blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot))
+		if err != nil {
+			return false, fmt.Errorf("read candidate blueprint for supersession: %w", err)
+		}
+		// Configuration changes cannot repair an immutable candidate snapshot.
+		// Only PREPARING is safe here: VALIDATING can have an unknown admission outcome.
+		// Cleanup still requires the Gateway's guarded retirement claim before deletion.
+		if instance.ReleaseID != o.pool.DesiredReleaseID || blueprint.Digest() != o.pool.DesiredBlueprintDigest {
+			return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing,
+				"candidate blueprint was superseded before admission")
+		}
 		return o.validateCandidate(ctx, instance)
 	case trinopool.PhaseValidating:
 		return true, o.admitCandidate(ctx, instance)
@@ -556,11 +570,8 @@ func (o *trinoPoolOperator) expectationFor(instance configstore.TrinoPoolInstanc
 
 // failCandidate records a candidate that can never be admitted.
 //
-// FAILED_PREPARING is the only terminal state reachable without a Gateway
-// retirement receipt, and it is sound exactly because the member never admitted
-// work: it was refused before activation. The instance stops occupying a live
-// slot, so the planner can replace it instead of blocking behind it forever -
-// which is what happened while no failure branch existed at all.
+// FAILED_PREPARING retains its capacity until cleanup verifies resource absence.
+// Cleanup requires the Gateway's retirement claim for any registered member.
 func (o *trinoPoolOperator) failCandidate(ctx context.Context, instance configstore.TrinoPoolInstance, from trinopool.Phase, reason string) error {
 	o.closeInstanceOperation(ctx, instance.InstanceID, "failed", reason)
 	return o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,

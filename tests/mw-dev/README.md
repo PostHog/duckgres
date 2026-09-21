@@ -906,6 +906,23 @@ startup. `TestTrinoRolloutReadinessScopesFixedCells` covers the startup selectio
 and malformed fixed/mixed configurations locally. The active-pool harness remains
 the real-cluster acceptance check; passing unit tests alone does not prove it ran.
 
+A corrected blueprint supersedes a never-admitted `PREPARING` candidate when
+its release ID or blueprint digest changes, including configuration-only changes
+with the same image. Duckgres records `FAILED_PREPARING`, obtains the Gateway's
+guarded retirement claim, and deletes only that candidate's UID-bound resources.
+It keeps the capacity slot until resource absence is verified. `VALIDATING`,
+`ADMITTED`, and `SERVING` instances do not use this shortcut: admission may
+already have happened, so their ordinary admission/drain protocol still applies.
+No manual database edits or pod deletion are required for superseded candidates.
+
+For recovery acceptance, publish a corrected blueprint while an old candidate
+cannot pass validation, then run the active-pool stage after replacement.
+The default in-Job fixture has no shared-pool controller or authority to change
+its desired blueprint. `TestSupersededPreparingCandidateRecovers` exercises that
+configuration change, immutable snapshots, lost retirement response, verified
+absence, and replacement locally. The companion tests preserve admission
+ambiguity, Gateway retirement refusals, configuration freeze, and lease fencing.
+
 ### Optional shared catalog rollout lane
 
 `TRINO_SHARED_CATALOGS_ENABLED=true` adds an isolated, real Gateway to the

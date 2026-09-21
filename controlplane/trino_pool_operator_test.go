@@ -60,7 +60,7 @@ func newFakePoolStore(spec configstore.TrinoPoolSpec) *fakePoolStore {
 			PoolID: spec.PoolID, PublicID: spec.PublicID, APIMode: spec.APIMode,
 			DesiredInstances: spec.DesiredInstances, MinServing: spec.MinServing,
 			MaxSurge: spec.MaxSurge, MaxRepair: spec.MaxRepair,
-			DesiredReleaseID: spec.DesiredReleaseID,
+			DesiredReleaseID: spec.DesiredReleaseID, DesiredBlueprintDigest: spec.DesiredBlueprintDigest,
 		},
 		instances: map[string]*configstore.TrinoPoolInstance{},
 	}
@@ -80,6 +80,7 @@ func (f *fakePoolStore) UpsertTrinoPoolSpec(_ context.Context, lease configstore
 	f.pool.DesiredInstances, f.pool.MinServing = spec.DesiredInstances, spec.MinServing
 	f.pool.MaxSurge, f.pool.MaxRepair = spec.MaxSurge, spec.MaxRepair
 	f.pool.DesiredReleaseID = spec.DesiredReleaseID
+	f.pool.DesiredBlueprintDigest = spec.DesiredBlueprintDigest
 	return nil
 }
 
@@ -948,6 +949,7 @@ func TestOperatorSurgesThenDrainsForANewRelease(t *testing.T) {
 	harness.store.pool.DesiredReleaseID = "next-release"
 	harness.operator.config.Spec.DesiredReleaseID = "next-release"
 	harness.operator.config.Blueprint.ReleaseID = "next-release"
+	harness.operator.config.Spec.DesiredBlueprintDigest = harness.operator.config.Blueprint.Digest()
 
 	// One tick creates the surge instance; it then needs ticks to reach
 	// SERVING before any drain may start.
@@ -975,6 +977,7 @@ func TestServingFloorRefusalIsNotOverridden(t *testing.T) {
 	harness.store.pool.DesiredReleaseID = "next-release"
 	harness.operator.config.Spec.DesiredReleaseID = "next-release"
 	harness.operator.config.Blueprint.ReleaseID = "next-release"
+	harness.operator.config.Spec.DesiredBlueprintDigest = harness.operator.config.Blueprint.Digest()
 	// The refusal surfaces as an error from the tick that attempts the drain,
 	// so these ticks are allowed to fail.
 	for index := 0; index < 11; index++ {
