@@ -420,11 +420,17 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
 }
 
-func (f *fakePoolGateway) ConfigurePool(_ context.Context, _ string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
+func (f *fakePoolGateway) ConfigurePool(_ context.Context, poolID string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
 	f.record("configure")
 	f.configured = &request
 	f.minServing = int64(request.MinServing)
-	return trinogateway.PoolState{}, nil
+	return trinogateway.PoolState{
+		PoolID: poolID, ControllerEpoch: request.ControllerEpoch,
+		APIMode: request.APIMode, MinServing: request.MinServing,
+		DesiredMembers: request.DesiredMembers, MaxSurge: request.MaxSurge,
+		MaxRepair: request.MaxRepair, DesiredRevision: request.DesiredRevision,
+		TenantAdmissionEnabled: request.TenantAdmissionEnabled,
+	}, nil
 }
 
 func (f *fakePoolGateway) RegisterMember(_ context.Context, poolID string, request trinogateway.RegisterMemberRequest) (trinogateway.Member, error) {
