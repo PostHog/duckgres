@@ -427,7 +427,7 @@ func fetchCatalogSync(ctx context.Context, client *http.Client, coordinatorURL, 
 func registeredWorkerCount(ctx context.Context, sql rolloutSQLClient, coordinatorNodeID string) (int, error) {
 	rows, err := sql.statement(ctx, "SELECT node_id, coordinator, state FROM system.runtime.nodes")
 	if err != nil {
-		return 0, fmt.Errorf("%w: node inventory unavailable", errTrinoPoolCandidateNotReady)
+		return 0, fmt.Errorf("%w: node inventory unavailable: %v", errTrinoPoolCandidateNotReady, err)
 	}
 	workers, coordinators := 0, 0
 	for _, row := range rows {

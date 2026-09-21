@@ -142,7 +142,18 @@ func (c rolloutSQLClient) scheme() string {
 func (c rolloutSQLClient) read(ctx context.Context, method, endpoint, sql string) ([]byte, error) {
 	base, baseErr := url.Parse(c.baseURL)
 	parsed, err := url.Parse(endpoint)
-	if baseErr != nil || err != nil || parsed.Scheme != c.scheme() || parsed.Scheme != base.Scheme || !strings.EqualFold(parsed.Hostname(), base.Hostname()) || rolloutHTTPSPort(parsed) != rolloutHTTPSPort(base) || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "/v1/statement" && !strings.HasPrefix(parsed.Path, "/v1/statement/") && parsed.Path != "/v1/info") {
+	if baseErr != nil || err != nil || base.Scheme != c.scheme() || !strings.EqualFold(parsed.Hostname(), base.Hostname()) || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || (parsed.Path != "/v1/statement" && !strings.HasPrefix(parsed.Path, "/v1/statement/") && parsed.Path != "/v1/info") {
+		return nil, errors.New("invalid coordinator response endpoint")
+	}
+	internalContinuation := c.internalHTTP && method == http.MethodGet &&
+		strings.HasPrefix(parsed.Path, "/v1/statement/") &&
+		parsed.Scheme == forwardedScheme && rolloutHTTPSPort(parsed) == "443"
+	if internalContinuation {
+		// Trino returns the HTTPS origin declared by our forwarded headers.
+		// Keep validated result paths on the configured internal coordinator transport.
+		parsed.Scheme, parsed.Host = base.Scheme, base.Host
+		endpoint = parsed.String()
+	} else if parsed.Scheme != base.Scheme || rolloutHTTPSPort(parsed) != rolloutHTTPSPort(base) {
 		return nil, errors.New("invalid coordinator response endpoint")
 	}
 	if c.username == "" || c.password == "" {
