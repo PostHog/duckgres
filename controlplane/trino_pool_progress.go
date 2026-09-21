@@ -421,7 +421,9 @@ func (o *trinoPoolOperator) sealWhenDrained(ctx context.Context, instance config
 	if err != nil {
 		return false, fmt.Errorf("read obligations for %s: %w", instance.InstanceID, err)
 	}
-	if !obligations.Drained || obligations.Outstanding() > 0 {
+	// ReadyToSeal permits the first attempt. Drained permits replay after a lost seal response.
+	// Neither observation permits deletion; the Gateway must still grant sealing and retirement.
+	if (!obligations.ReadyToSeal && !obligations.Drained) || obligations.Outstanding() > 0 {
 		slog.Debug("Trino pool instance is still draining.",
 			"pool", o.config.PublicID, "instance", instance.InstanceID,
 			"outstanding", obligations.Outstanding())

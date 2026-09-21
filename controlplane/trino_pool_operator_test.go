@@ -223,6 +223,7 @@ type fakePoolGateway struct {
 	principals  map[string][]string
 	calls       []string
 	drainErr    error
+	sealErr     error
 	admitErr    error
 	lostErr     error
 	membership  int64
@@ -494,7 +495,17 @@ func (f *fakePoolGateway) GetMember(_ context.Context, _, instanceID string) (tr
 }
 
 func (f *fakePoolGateway) GetObligations(_ context.Context, _, instanceID string) (trinogateway.Obligations, error) {
-	return f.obligations[instanceID], nil
+	member, exists := f.members[instanceID]
+	if !exists {
+		return trinogateway.Obligations{}, trinogateway.ErrNotFound
+	}
+	obligations := f.obligations[instanceID]
+	obligations.InstanceID, obligations.Incarnation = instanceID, member.Incarnation
+	obligations.Phase, obligations.Generation = member.Phase, member.Generation
+	obligations.ReadyToSeal = member.Phase == "DRAINING" && obligations.Outstanding() == 0
+	obligations.Drained = member.Phase == "SEALED" ||
+		((member.Phase == "RETIRING" || member.Phase == "RETIRED") && member.RetirementKind == "DRAINED")
+	return obligations, nil
 }
 
 // requirePhase mirrors the Gateway's own phase preconditions. Without them a
@@ -559,6 +570,12 @@ func (f *fakePoolGateway) SealMember(_ context.Context, _, instanceID string, re
 	}
 	if err := requireGeneration(member, request.ExpectedGeneration); err != nil {
 		return trinogateway.Member{}, err
+	}
+	if f.sealErr != nil {
+		return trinogateway.Member{}, f.sealErr
+	}
+	if f.obligations[instanceID].Outstanding() != 0 {
+		return trinogateway.Member{}, trinogateway.ErrNotDrained
 	}
 	member.Phase, member.Generation = "SEALED", member.Generation+1
 	// Obligations are reported with the member's CURRENT generation, so a step
@@ -1044,7 +1061,7 @@ func TestSealWaitsForObligations(t *testing.T) {
 	instance := harness.placeInstance(t, instanceID, trinopool.PhaseDraining, "DRAINING")
 	generation := harness.gateway.members[instanceID].Generation
 	harness.gateway.obligations[instanceID] = trinogateway.Obligations{
-		Generation: generation, OpenTransactions: 1, Drained: false,
+		Generation: generation, OpenTransactions: 1,
 	}
 
 	harness.tick(t, 3)
@@ -1055,7 +1072,7 @@ func TestSealWaitsForObligations(t *testing.T) {
 		t.Fatal("a member with an open transaction was sealed")
 	}
 
-	harness.gateway.obligations[instanceID] = trinogateway.Obligations{Generation: generation, Drained: true}
+	harness.gateway.obligations[instanceID] = trinogateway.Obligations{Generation: generation}
 	harness.tick(t, 1)
 	if instance.Phase != string(trinopool.PhaseSealed) {
 		t.Fatalf("phase = %s, want SEALED once drained", instance.Phase)
@@ -1095,9 +1112,6 @@ func TestALostResponseDoesNotChangeTheRetriedRequest(t *testing.T) {
 
 		instanceID := harness.store.order[0]
 		instance := harness.placeInstance(t, instanceID, trinopool.PhaseDraining, "DRAINING")
-		harness.gateway.obligations[instanceID] = trinogateway.Obligations{
-			Generation: harness.gateway.members[instanceID].Generation, Drained: true,
-		}
 		harness.gateway.loseResponse = map[string]bool{"seal": true}
 
 		harness.tickTolerant(5)
