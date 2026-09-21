@@ -60,7 +60,7 @@ func newFakePoolStore(spec configstore.TrinoPoolSpec) *fakePoolStore {
 			PoolID: spec.PoolID, PublicID: spec.PublicID, APIMode: spec.APIMode,
 			DesiredInstances: spec.DesiredInstances, MinServing: spec.MinServing,
 			MaxSurge: spec.MaxSurge, MaxRepair: spec.MaxRepair,
-			DesiredReleaseID: spec.DesiredReleaseID,
+			DesiredReleaseID: spec.DesiredReleaseID, DesiredBlueprintDigest: spec.DesiredBlueprintDigest,
 		},
 		instances: map[string]*configstore.TrinoPoolInstance{},
 	}
@@ -80,6 +80,7 @@ func (f *fakePoolStore) UpsertTrinoPoolSpec(_ context.Context, lease configstore
 	f.pool.DesiredInstances, f.pool.MinServing = spec.DesiredInstances, spec.MinServing
 	f.pool.MaxSurge, f.pool.MaxRepair = spec.MaxSurge, spec.MaxRepair
 	f.pool.DesiredReleaseID = spec.DesiredReleaseID
+	f.pool.DesiredBlueprintDigest = spec.DesiredBlueprintDigest
 	return nil
 }
 

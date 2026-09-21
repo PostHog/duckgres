@@ -1969,14 +1969,14 @@ the Trino backend selection).
   suspects the member; an unanswered probe is not evidence and changes nothing;
   the stored identity is never quietly updated to match.
 - **A FAILED_PREPARING candidate is cleaned up, not abandoned.** It is NOT
-  terminal: its objects are deleted (sound only because it provably never
-  admitted work), then its Gateway member is walked PREPARING → SUSPECT → LOST,
-  which is what releases the pool's live slot, and only then does it become
-  FAILURE_RETIRED. Leaving it terminal leaked a whole Trino cluster and, at
-  desired+surge, refused every later registration — no repair, no rollout. The
-  loss claim carries the coordinator identity the GATEWAY observed at
-  registration (recorded from the registration response, migration `000041`);
-  anything re-derived is refused as evidence.
+  terminal. The Gateway must grant never-admitted retirement before Duckgres
+  deletes a registered candidate's UID-bound objects. Verified resource absence
+  then completes retirement and moves the local row to FAILURE_RETIRED, freeing
+  its capacity. No loss claim is needed. A PREPARING candidate whose immutable
+  release or blueprint digest differs from the fresh desired specification uses
+  this path, including configuration-only changes with the same image. Compare
+  the snapshot's blueprint digest, not the identity-bound instance SpecDigest.
+  VALIDATING may have an unknown admission result and must not use this shortcut.
 - **Admission is a durable step.** The intent is recorded before the call, so a
   lost response is resolved by read-back under the same identity. OK, FAILED
   (a decision) and UNKNOWN (no answer) stay distinct. The step identity is the
