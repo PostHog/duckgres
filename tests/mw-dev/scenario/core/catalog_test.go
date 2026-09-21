@@ -213,7 +213,7 @@ steps:
 	}
 }
 
-func TestFrozenPerfScenarioCombinesAllTargetsAndCleanup(t *testing.T) {
+func TestFrozenPerfScenarioCombinesAllTargets(t *testing.T) {
 	for _, tc := range []struct {
 		file    string
 		targets []string
@@ -245,10 +245,6 @@ func TestFrozenPerfScenarioCombinesAllTargetsAndCleanup(t *testing.T) {
 			}
 			if !found {
 				t.Fatal("missing perf queries")
-			}
-			last := scenario.Steps[len(scenario.Steps)-1]
-			if last.ID != "deprovision" || !last.AlwaysRun {
-				t.Fatal("missing unconditional cleanup")
 			}
 		})
 	}

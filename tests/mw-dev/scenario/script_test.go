@@ -114,7 +114,8 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"scenario_summary.md",
 		"$GITHUB_STEP_SUMMARY",
 		"tests/mw-dev/run.sh diagnostics",
-		"tests/mw-dev/run.sh teardown",
+		"- name: Teardown\n        if: always()\n        run: tests/mw-dev/run.sh teardown",
+		"- name: Discover managed Hoglake configuration\n        if: env.E2E_SUITE == 'trino'\n        run: bash tests/mw-dev/discover-hoglake.sh",
 		"- name: Publish scenario perf results",
 		"github.ref == 'refs/heads/main'",
 		"MW_DEV_SCENARIO_PERF_SECRET_ID: ${{ vars.MW_DEV_SCENARIO_PERF_SECRET_ID }}",
@@ -122,7 +123,7 @@ func TestDevScenarioWorkflowUsesUnifiedMwDevHarness(t *testing.T) {
 		"go run ./cmd/duckgres-perf-publisher",
 		"--connection-secret-stdin",
 		"--schema duckgres_scenario_perf",
-		"go test -count=1 ./tests/mw-dev/scenario ./tests/mw-dev ./tests/perf/publishercli",
+		"go test -count=1 ./tests/mw-dev/scenario/... ./tests/mw-dev ./tests/perf/publishercli",
 	} {
 		if !strings.Contains(workflow, required) {
 			t.Fatalf("workflow missing %q", required)

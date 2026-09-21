@@ -61,11 +61,8 @@ else
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
 fi
 TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
-if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
-  HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:f10c34f9c779e2794fca662d5302f97dc26e48a6b2a601ae344cad945e70483c}"
-else
-  HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:fcd2bdc2b17cbe7bdf4b52b19ebe1c901c853c5ec925cf52a94609e464e96a02}"
-fi
+# Managed admission requires atomic-table-creation-v1, including frozen perf.
+HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:fcd2bdc2b17cbe7bdf4b52b19ebe1c901c853c5ec925cf52a94609e464e96a02}"
 HOGLAKE_DATA_PATH="${HOGLAKE_DATA_PATH:-}"
 if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "$HOGLAKE_DATA_PATH" ]; then
   hoglake_bucket="${HOGLAKE_DATA_PATH#s3://}"
@@ -542,8 +539,10 @@ cleanup_hoglake_storage() {
 # END isolated Hoglake cleanup
 
 cmd_deploy() {
-  if [ "$E2E_SUITE" = trino ] && ! hoglake_perf_enabled; then
-    : "${HOGLAKE_CI_POD_IDENTITY_ROLE:?Dedicated Hoglake CI role is required}"
+  if [ "$E2E_SUITE" = trino ]; then
+    if ! hoglake_perf_enabled; then
+      : "${HOGLAKE_CI_POD_IDENTITY_ROLE:?Dedicated Hoglake CI role is required}"
+    fi
     [[ "$HOGLAKE_DATA_PATH" =~ ^s3://[a-z0-9][a-z0-9.-]+/trino/$ ]] || { echo "HOGLAKE_DATA_PATH must be the configured dedicated bucket/trino/ base" >&2; return 1; }
   fi
   reset_pr_stack
@@ -577,13 +576,10 @@ cmd_deploy() {
     sleep 15
     "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-hoglake --type=merge -p '{"spec":{"replicas":1}}'
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-hoglake --timeout=300s
-    if hoglake_perf_enabled; then
-      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
-        "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"controlplane\",\"env\":[{\"name\":\"DUCKGRES_TRINO_HOGLAKE_URI\",\"value\":\"http://duckgres-hoglake.$NS.svc:8080\"}]}]}}}}"
-    else
-      patch="$(jq -cn --arg uri "http://duckgres-hoglake.$NS.svc:8080" --arg path "$HOGLAKE_DATA_PATH" '{spec:{template:{spec:{containers:[{name:"controlplane",env:[{name:"DUCKGRES_TRINO_MANAGED_HOGLAKE_URI",value:$uri},{name:"DUCKGRES_TRINO_HOGLAKE_DATA_PATH",value:$path},{name:"DUCKGRES_TRINO_HOGLAKE_NAMESPACE",value:"main"}]}]}}}}')"
-      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch"
-    fi
+    # Fresh tenants use managed Hoglake admission in every Trino lane.
+    # Frozen fixture catalogs are imported separately and keep read-only identity.
+    patch="$(jq -cn --arg uri "http://duckgres-hoglake.$NS.svc:8080" --arg path "$HOGLAKE_DATA_PATH" '{spec:{template:{spec:{containers:[{name:"controlplane",env:[{name:"DUCKGRES_TRINO_MANAGED_HOGLAKE_URI",value:$uri},{name:"DUCKGRES_TRINO_HOGLAKE_DATA_PATH",value:$path},{name:"DUCKGRES_TRINO_HOGLAKE_NAMESPACE",value:"main"}]}]}}}}')"
+    "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p "$patch"
     if trino_multicell_enabled; then
       NS="$TRINO_CELL_NS" ensure_trino_pod_identity
       "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-control-plane --type=strategic -p \
