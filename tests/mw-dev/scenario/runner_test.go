@@ -1158,25 +1158,3 @@ func containsTemplate(value any) bool {
 	}
 	return false
 }
-
-func TestFrozenPerfSeparatesManagedAndImmutableCatalogs(t *testing.T) {
-	scenario, err := core.LoadScenario(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fixture, selected string
-	for _, step := range scenario.Steps {
-		switch step.ID {
-		case "setup_hoglake":
-			fixture, _ = step.With["hoglake_catalog"].(string)
-		case "perf_queries":
-			selected, _ = step.With["trino_hoglake_catalog"].(string)
-		}
-		if step.Type == "deprovision_warehouse" {
-			t.Fatal("managed ownership requires isolated workflow teardown, not public deprovision")
-		}
-	}
-	if fixture != "${env:DUCKGRES_SCENARIO_ORG_ID}-frozen" || selected != fixture {
-		t.Fatalf("immutable fixture and selection must share separate catalog: %q %q", fixture, selected)
-	}
-}

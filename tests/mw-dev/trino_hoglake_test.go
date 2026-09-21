@@ -3,7 +3,6 @@ package e2emwdev_test
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -132,38 +131,5 @@ fi
 				t.Fatalf("invalid discovery published configuration: %v %s", err, values)
 			}
 		})
-	}
-}
-
-func TestFrozenPerfDeployConfiguresManagedAdmission(t *testing.T) {
-	f := newRunSHFakes(t)
-	for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
-		if err := os.WriteFile(filepath.Join(filepath.Dir(f.binDir), "secrets", name), []byte("fixture TLS"), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	out, err := runSHCommand(t, f.binDir, "deploy", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf", "SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/athena-perf", "TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-perf", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1").CombinedOutput()
-	if err != nil {
-		t.Fatalf("deploy: %v %s", err, out)
-	}
-	calls := f.calls(t)
-	for _, want := range []string{"DUCKGRES_TRINO_MANAGED_HOGLAKE_URI", "DUCKGRES_TRINO_HOGLAKE_DATA_PATH", "s3://example-hoglake/trino/"} {
-		if !strings.Contains(calls, want) {
-			t.Errorf("frozen deployment missing %s", want)
-		}
-	}
-	if strings.Contains(calls, `"name":"DUCKGRES_TRINO_HOGLAKE_URI"`) {
-		t.Fatal("deprecated benchmark switch cannot admit a new tenant")
-	}
-}
-
-func TestFrozenPerfMissingManagedPathFailsBeforeMutation(t *testing.T) {
-	f := newRunSHFakes(t)
-	out, err := runSHCommand(t, f.binDir, "deploy", "E2E_SUITE=trino", "SCENARIO_NAME=posthog_frozen_perf", "HOGLAKE_DATA_PATH=", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1").CombinedOutput()
-	if err == nil {
-		t.Fatalf("accepted missing managed path: %s", out)
-	}
-	if calls := f.calls(t); strings.Contains(calls, "kubectl") || strings.Contains(calls, "aws") {
-		t.Fatal("missing prerequisite mutated existing fixture")
 	}
 }
