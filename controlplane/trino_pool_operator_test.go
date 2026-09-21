@@ -949,6 +949,7 @@ func TestOperatorSurgesThenDrainsForANewRelease(t *testing.T) {
 	harness.store.pool.DesiredReleaseID = "next-release"
 	harness.operator.config.Spec.DesiredReleaseID = "next-release"
 	harness.operator.config.Blueprint.ReleaseID = "next-release"
+	harness.operator.config.Spec.DesiredBlueprintDigest = harness.operator.config.Blueprint.Digest()
 
 	// One tick creates the surge instance; it then needs ticks to reach
 	// SERVING before any drain may start.
@@ -976,6 +977,7 @@ func TestServingFloorRefusalIsNotOverridden(t *testing.T) {
 	harness.store.pool.DesiredReleaseID = "next-release"
 	harness.operator.config.Spec.DesiredReleaseID = "next-release"
 	harness.operator.config.Blueprint.ReleaseID = "next-release"
+	harness.operator.config.Spec.DesiredBlueprintDigest = harness.operator.config.Blueprint.Digest()
 	// The refusal surfaces as an error from the tick that attempts the drain,
 	// so these ticks are allowed to fail.
 	for index := 0; index < 11; index++ {
