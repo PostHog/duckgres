@@ -961,6 +961,24 @@ release, so it cannot perform that rollout safely. `TestPoolSeal*` covers the
 Gateway obligation contract, each blocker, refusal, and lost-response replay
 locally. These tests do not establish live rollout continuity by themselves.
 
+Configuration rollback must also work within one control-plane leadership term.
+Each change to the Gateway configuration gets a new attempt ID, including a
+return to an earlier release or tenant-admission setting. Unchanged settings
+reuse their attempt. An unknown result must settle before a newer configuration
+can proceed; resolving an obsolete attempt does not authorize lifecycle work
+against settings the Gateway has not applied yet. A new authority epoch resets
+the attempt sequence and fences requests from the previous term.
+The routing group must remain stable within a term. Changing it fails closed;
+an unresolved request must never be redirected to a different pool.
+
+`TestPoolConfigure*` exercises repeated rollback, unchanged replay, ambiguous
+responses, delayed requests, rejection, and leadership changes locally. The
+in-Job fixture cannot change shared-pool desired configuration, so live acceptance
+requires an authorized desired-release A-to-B-to-A rollout while queries continue.
+Verify the Gateway's desired revision as well as member replacement and serving
+capacity. Do not restart the control plane between configuration changes: that
+would hide a same-term rollback regression.
+
 ### Optional shared catalog rollout lane
 
 `TRINO_SHARED_CATALOGS_ENABLED=true` adds an isolated, real Gateway to the

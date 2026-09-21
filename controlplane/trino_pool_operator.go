@@ -177,6 +177,10 @@ type trinoPoolOperator struct {
 	// pool is the durable row read at the start of the tick, so the steps agree
 	// on one view of the desired state.
 	pool *configstore.TrinoPool
+	// Configure attempts are ordered within one term. Every new term acquires a new durable epoch.
+	gatewayConfigEpoch    int64
+	gatewayConfigSequence uint64
+	gatewayConfigAttempt  *trinoPoolConfigureAttempt
 }
 
 // Run is the leader-attached loop. It is started fresh on every leadership
@@ -426,26 +430,7 @@ func (o *trinoPoolOperator) dropAuthority(err error) error {
 }
 
 func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
-	_, err := o.gateway.ConfigurePool(ctx, o.config.RoutingGroup, trinogateway.ConfigurePoolRequest{
-		Step: trinogateway.Step{
-			OperationID: "pool-config:" + o.config.PublicID,
-			// The step identity carries BOTH the desired shape and this
-			// leader's epoch.
-			//
-			// The Gateway hashes the whole request body, epoch included, so a
-			// new leader re-sending an unchanged configuration under the same
-			// step id would hash differently and conflict forever. Putting the
-			// epoch in the step id makes each leadership term its own step:
-			// a repeat within one term is still a replay, and a new term is a
-			// new step rather than a permanent conflict.
-			StepID:          fmt.Sprintf("configure.e%d.%s", o.lease.Epoch, o.configDigest()),
-			ControllerEpoch: o.lease.Epoch,
-			// The owner is what makes an EQUAL epoch from a different process
-			// refusable. Without it the Gateway's recorded owner stays NULL and
-			// the epoch alone fences, which admits a second controller at the
-			// same epoch.
-			OwnerIdentity: o.owner,
-		},
+	desired := trinogateway.ConfigurePoolRequest{
 		APIMode:         "POOLED",
 		MinServing:      o.config.Spec.MinServing,
 		DesiredMembers:  o.config.Spec.DesiredInstances,
@@ -457,23 +442,81 @@ func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
 		// cannot dispatch work. Publishing the binding is therefore part of the
 		// same loop (see publishTenantBindings).
 		TenantAdmissionEnabled: o.config.Pool.TenantAdmission,
-	})
+	}
+	if o.gatewayConfigEpoch != o.lease.Epoch {
+		o.gatewayConfigEpoch = o.lease.Epoch
+		o.gatewayConfigSequence = 0
+		o.gatewayConfigAttempt = nil
+	}
+	attempt := o.gatewayConfigAttempt
+	if attempt != nil && attempt.routingGroup != o.config.RoutingGroup {
+		return fmt.Errorf("gateway pool routing identity changed within an authority term")
+	}
+	if attempt == nil || (attempt.settled && attempt.payload != desired) {
+		o.gatewayConfigSequence++
+		request := desired
+		request.Step = trinogateway.Step{
+			OperationID:     "pool-config:" + o.config.PublicID,
+			StepID:          fmt.Sprintf("configure.e%d.s%d", o.lease.Epoch, o.gatewayConfigSequence),
+			ControllerEpoch: o.lease.Epoch,
+			OwnerIdentity:   o.owner,
+		}
+		attempt = &trinoPoolConfigureAttempt{routingGroup: o.config.RoutingGroup, payload: desired, request: request}
+		o.gatewayConfigAttempt = attempt
+	}
+	// Settle an unknown request before sending another configuration in this epoch.
+	// An earlier delayed request must not overwrite newer settings.
+	state, err := o.gateway.ConfigurePool(ctx, attempt.routingGroup, attempt.request)
 	if err != nil {
+		if !attempt.unknown && configureRequestRejected(err) {
+			attempt.settled = true
+		} else if !attempt.settled {
+			attempt.unknown = true
+		}
 		return o.dropAuthority(fmt.Errorf("configure gateway pool: %w", err))
+	}
+	if !configuredPoolMatches(state, attempt.routingGroup, attempt.request) {
+		attempt.unknown = true
+		attempt.settled = false
+		return fmt.Errorf("gateway pool configuration response does not match the requested settings")
+	}
+	attempt.settled = true
+	attempt.unknown = false
+	if attempt.payload != desired {
+		return fmt.Errorf("%w: previous gateway configuration settled; current settings must be applied next", errTrinoPoolBackoff)
 	}
 	return nil
 }
 
-func (o *trinoPoolOperator) configDigest() string {
-	digest := o.config.Spec.DesiredBlueprintDigest
-	if len(digest) > 8 {
-		digest = digest[:8]
+type trinoPoolConfigureAttempt struct {
+	routingGroup string
+	payload      trinogateway.ConfigurePoolRequest
+	request      trinogateway.ConfigurePoolRequest
+	settled      bool
+	unknown      bool
+}
+
+func configureRequestRejected(err error) bool {
+	var refusal *trinogateway.Error
+	if !errors.As(err, &refusal) || (refusal.Status != 400 && refusal.Status != 403 && refusal.Status != 409) {
+		return false
 	}
-	if digest == "" {
-		digest = "none"
+	// Only application-level refusals establish that this request did not commit.
+	// Proxy errors and timeouts leave its outcome unknown.
+	switch refusal.Code {
+	case "POOL_VALIDATION", "TENANT_IDENTITY_UNVERIFIED", "POOL_APIMODE":
+		return true
+	default:
+		return false
 	}
-	return fmt.Sprintf("%s-%d-%d-%d-%d", digest,
-		o.config.Spec.DesiredInstances, o.config.Spec.MinServing, o.config.Spec.MaxSurge, o.config.Spec.MaxRepair)
+}
+
+func configuredPoolMatches(state trinogateway.PoolState, poolID string, request trinogateway.ConfigurePoolRequest) bool {
+	return state.PoolID == poolID && state.ControllerEpoch == request.ControllerEpoch &&
+		state.APIMode == request.APIMode && state.MinServing == request.MinServing &&
+		state.DesiredMembers == request.DesiredMembers && state.MaxSurge == request.MaxSurge &&
+		state.MaxRepair == request.MaxRepair && state.DesiredRevision == request.DesiredRevision &&
+		state.TenantAdmissionEnabled == request.TenantAdmissionEnabled
 }
 
 // applyPlan starts at most one lifecycle action.
