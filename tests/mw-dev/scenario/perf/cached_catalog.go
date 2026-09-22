@@ -10,19 +10,21 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	perfcore "github.com/posthog/duckgres/tests/perf/core"
 	trinodriver "github.com/posthog/duckgres/tests/perf/drivers/trino"
 )
 
 var benchmarkCatalogName = regexp.MustCompile(`^org_[a-z0-9_]+$`)
 var benchmarkConnectorName = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
-func cachedCatalogStatement(catalog string, baseline map[string]string) (string, error) {
-	if !benchmarkCatalogName.MatchString(catalog) || !benchmarkConnectorName.MatchString(baseline["connector.name"]) || baseline["fs.cache.enabled"] != "false" {
-		return "", errors.New("cached benchmark requires a managed baseline catalog with caching explicitly disabled")
+func benchmarkCatalogStatement(catalog string, baseline map[string]string) (string, error) {
+	if !benchmarkCatalogName.MatchString(catalog) || !benchmarkConnectorName.MatchString(baseline["connector.name"]) || (baseline["fs.cache.enabled"] != "false" && baseline["fs.cache.enabled"] != "true") {
+		return "", errors.New("benchmark requires a valid catalog with an explicit cache mode")
 	}
 	quoteIdentifier := func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 	keys := make([]string, 0, len(baseline))
@@ -35,23 +37,11 @@ func cachedCatalogStatement(catalog string, baseline map[string]string) (string,
 	properties := make([]string, 0, len(keys))
 	for _, key := range keys {
 		value := baseline[key]
-		if key == "fs.cache.enabled" {
-			value = "true"
-		}
 		properties = append(properties, quoteIdentifier(key)+" = '"+strings.ReplaceAll(value, "'", "''")+"'")
 	}
 	// Trino validates Identifier.toString() as the connector name; quoting adds
 	// literal quote characters. The validated connector token must be bare.
 	return "CREATE CATALOG " + quoteIdentifier(catalog) + " USING " + baseline["connector.name"] + " WITH (" + strings.Join(properties, ", ") + ")", nil
-}
-
-func checkCachedCatalogProperties(baseline, cached map[string]string) error {
-	expected := maps.Clone(baseline)
-	expected["fs.cache.enabled"] = "true"
-	if !maps.Equal(expected, cached) {
-		return errors.New("cached Trino catalog differs from the baseline dataset or cache configuration; recreate the benchmark namespace")
-	}
-	return nil
 }
 
 // The store belongs to the disposable benchmark namespace. Always scope reads
@@ -74,12 +64,12 @@ func readBenchmarkCatalog(ctx context.Context, db catalogCacheQuery, cell, catal
 	return props, nil
 }
 
-func (f defaultDriverFactory) prepareCachedCatalog(ctx context.Context, baseline trinodriver.ConnectionConfig) error {
-	if f.trinoCachedURL == "" || f.trinoCachedCellID == "" || f.trinoAdminPasswordFile == "" {
-		return errors.New("trino_cached requires DUCKGRES_SCENARIO_TRINO_CACHED_URL, DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID and DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE")
+func (f defaultDriverFactory) prepareBenchmarkCatalog(ctx context.Context, baseline, target trinodriver.ConnectionConfig) error {
+	if target.ServerURL == "" || target.CatalogStoreCellID == "" || f.trinoAdminPasswordFile == "" {
+		return errors.New("benchmark requires an explicit isolated coordinator, catalog-store cell and admin password file")
 	}
-	if baseline.ServerURL == f.trinoCachedURL || baseline.CatalogStoreCellID == f.trinoCachedCellID {
-		return errors.New("cached Trino must use a separate coordinator and catalog store cell")
+	if baseline.ServerURL == target.ServerURL || baseline.CatalogStoreCellID == target.CatalogStoreCellID {
+		return errors.New("benchmark must use a separate coordinator and catalog-store cell from the managed tenant")
 	}
 	timeout := baseline.Startup.Timeout
 	if timeout <= 0 {
@@ -92,15 +82,25 @@ func (f defaultDriverFactory) prepareCachedCatalog(ctx context.Context, baseline
 		return errors.New("connect to isolated benchmark catalog store")
 	}
 	defer func() { _ = conn.Close(context.Background()) }()
-	return f.initializeCachedCatalog(ctx, conn, baseline)
+	return f.initializeBenchmarkCatalog(ctx, conn, baseline, target)
 }
 
-func (f defaultDriverFactory) initializeCachedCatalog(ctx context.Context, conn catalogCacheQuery, baseline trinodriver.ConnectionConfig) error {
+func (f defaultDriverFactory) initializeBenchmarkCatalog(ctx context.Context, conn catalogCacheQuery, baseline, target trinodriver.ConnectionConfig) error {
 	props, err := readBenchmarkCatalog(ctx, conn, baseline.CatalogStoreCellID, baseline.Catalog)
 	if err != nil {
 		return err
 	}
-	statement, err := cachedCatalogStatement(baseline.Catalog, props)
+	if baseline.HoglakeCatalog != "" {
+		props, err = fixtureHoglakeProperties(props, baseline.HoglakeCatalog)
+		if err != nil {
+			return err
+		}
+	}
+	if props == nil {
+		return errors.New("managed baseline catalog is missing")
+	}
+	props["fs.cache.enabled"] = strconv.FormatBool(target.Protocol == perfcore.ProtocolTrinoCached)
+	statement, err := benchmarkCatalogStatement(target.Catalog, props)
 	if err != nil {
 		return err
 	}
@@ -108,8 +108,7 @@ func (f defaultDriverFactory) initializeCachedCatalog(ctx context.Context, conn 
 	if err != nil || len(strings.TrimSpace(string(password))) == 0 {
 		return errors.New("read benchmark Trino admin password file")
 	}
-	admin := baseline
-	admin.ServerURL = f.trinoCachedURL
+	admin := target
 	admin.Username = "__admin_provisioner"
 	admin.Password = strings.TrimSpace(string(password))
 	admin.Catalog = "system"
@@ -117,22 +116,21 @@ func (f defaultDriverFactory) initializeCachedCatalog(ctx context.Context, conn 
 	admin.Source = "duckgres-perf-catalog-setup"
 	dsn, err := admin.DSN()
 	if err != nil {
-		return errors.New("configure verified cached Trino admin connection")
+		return errors.New("configure verified benchmark Trino admin connection")
 	}
 	adminDB, err := sql.Open("trino", dsn)
 	if err != nil {
-		return errors.New("open cached Trino admin connection")
+		return errors.New("open benchmark Trino admin connection")
 	}
 	defer func() { _ = adminDB.Close() }()
-	tenant := baseline
-	tenant.ServerURL = f.trinoCachedURL
+	tenant := target
 	tenantDSN, err := tenant.DSN()
 	if err != nil {
-		return errors.New("configure cached Trino tenant connection")
+		return errors.New("configure benchmark Trino tenant connection")
 	}
 	tenantDB, err := sql.Open("trino", tenantDSN)
 	if err != nil {
-		return errors.New("open cached Trino tenant connection")
+		return errors.New("open benchmark Trino tenant connection")
 	}
 	defer func() { _ = tenantDB.Close() }()
 	interval := baseline.Startup.PollInterval
@@ -142,10 +140,10 @@ func (f defaultDriverFactory) initializeCachedCatalog(ctx context.Context, conn 
 	createFailure, readinessFailure := "none", "none"
 	createAttempts, readinessAttempts := 0, 0
 	timeoutError := func() error {
-		return fmt.Errorf("cached Trino catalog did not become ready within startup timeout: create_attempts=%d last_create_failure=[%s]; readiness_attempts=%d last_readiness_failure=[%s]", createAttempts, createFailure, readinessAttempts, readinessFailure)
+		return fmt.Errorf("benchmark Trino catalog did not become ready within startup timeout: create_attempts=%d last_create_failure=[%s]; readiness_attempts=%d last_readiness_failure=[%s]", createAttempts, createFailure, readinessAttempts, readinessFailure)
 	}
 	for {
-		cached, readErr := readBenchmarkCatalog(ctx, conn, f.trinoCachedCellID, baseline.Catalog)
+		cached, readErr := readBenchmarkCatalog(ctx, conn, target.CatalogStoreCellID, target.Catalog)
 		if readErr != nil {
 			if ctx.Err() != nil {
 				return timeoutError()
@@ -160,8 +158,8 @@ func (f defaultDriverFactory) initializeCachedCatalog(ctx context.Context, conn 
 			_, createErr := adminDB.ExecContext(ctx, statement)
 			retainTrinoFailure("catalog creation", createErr, &createFailure)
 		} else {
-			if err := checkCachedCatalogProperties(props, cached); err != nil {
-				return err
+			if !maps.Equal(props, cached) {
+				return errors.New("benchmark catalog properties differ from the fixture; recreate the isolated stack")
 			}
 			// SELECT 1 alone does not resolve the catalog. Check tenant access to its
 			// real metadata before timed queries use the independently started cluster.

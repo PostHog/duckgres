@@ -53,14 +53,15 @@ Generated files contain private locations and must stay out of public artifacts.
 
 Duckgres adds the supported JSON/STRUCT projection under
 `properties_perf.events_supported`, without changing the original tables.
-Hoglake registers the JSON projection in an isolated catalog suffixed
-`-properties`, whose `data_path` is the selected properties prefix. After the
-original benchmarks, the disposable tenant Trino catalog is recreated with only
-its `hoglake.catalog` mapping changed to this properties catalog. Tenant
-credentials, permissions, and cache settings are preserved. The original
-Hoglake catalog and its fixture root remain intact. The original benchmark step
-explicitly selects the original mapping when rerun. Both locations must be
-readable by the isolated stack's existing AWS identity.
+Hoglake registers the JSON projection under `properties_perf` in the same fixture
+catalog as the original `posthog` tables. The catalog's data path is the frozen
+bucket root; each importer lists only its selected immutable prefix. Properties
+must be in that bucket and readable by the existing read-only fixture identity.
+The managed tenant catalog stays untouched. Uncached and cached benchmark clusters
+have their own catalog-store cells, using the existing tenant catalog name and
+authorization, and both point to the shared fixture catalog. There is no
+DROP/CREATE or dataset switch between phases. Namespace teardown removes all
+fixture catalogs and metadata without deleting source S3 files.
 
 | Properties run label | Cache | Representation |
 | --- | --- | --- |
@@ -94,7 +95,7 @@ panels retain their existing query selection.
 
 For missing/inaccessible prefixes, correct the selection or access and rerun.
 For Athena mapping failures, use the generated SQL and approved fixture
-configuration to correct the table before retrying. If catalog switching fails,
+configuration to correct the table before retrying. If fixture catalog setup fails,
 recreate the isolated stack rather than timing an unverified mapping. Preserve
 private diagnostics before cleanup. Scenario deprovisioning and workflow
 teardown remove the owned warehouse and isolated stack; follow the existing

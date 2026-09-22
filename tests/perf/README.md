@@ -248,18 +248,16 @@ Optional artifact publisher:
 
 ### Cached Trino comparison
 
-The scheduled workflow and manual `posthog_frozen_perf` selection run one scenario
-in one throwaway namespace. It provisions the dataset once, then measures all five
-targets sequentially into one result set. Both Trino targets use the same SQL,
-one warm-up iteration and four measured iterations per query. CSV/history rows
-retain the distinct `trino` and `trino_cached` protocol labels.
-
-The harness deploys two Trino clusters with separate discovery services, catalog
-store cell IDs, and ephemeral cache volumes. They share tenant authentication,
-authorization, and the registered Hoglake dataset. The control plane provisions
-the baseline catalog with `fs.cache.enabled=false`. Before measurement the runner
-creates the same catalog on the second cluster, copying its properties with only
-`fs.cache.enabled=true`. It validates persisted properties by cell and catalog.
+The scheduled workflow and manual `posthog_frozen_perf` scenario use separate
+uncached and cached benchmark clusters, in addition to the managed onboarding
+cluster. Each has its own discovery service, catalog-store cell and cache volumes.
+The managed catalog supplies the baseline properties but is never modified. Both
+benchmark catalogs retain the tenant's authorized name and credentials, point to
+one fixture Hoglake catalog containing `posthog` and `properties_perf` namespaces,
+and read immutable S3 objects through the fixture Pod Identity. The runner creates
+them once with explicit `fs.cache.enabled=false` and `true` respectively, and
+verifies persisted properties before measurements. Teardown removes the isolated
+stack and catalog metadata; it never deletes fixture objects.
 Both clusters load the same Alluxio and memory cache managers.
 Each node has a 16GB disk-cache budget in a 20Gi ephemeral volume, with 64kB pages
 and a seven-day TTL. For connectors that use this cache, entries persist between

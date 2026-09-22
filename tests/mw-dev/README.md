@@ -845,18 +845,21 @@ control-plane build explicitly persists the expected baseline cache setting.
 
 For local invocation, set `SCENARIO_NAME=posthog_frozen_perf` and `E2E_SUITE=trino`
 before both `tests/mw-dev/run.sh deploy` and `test-scenario`. Use the existing lane
-credentials, images, and namespace requirements. The harness starts a baseline
-and a cached Trino cluster in the same namespace, each with one coordinator and
-three 1-CPU/4Gi workers. This doubles the deployed Trino worker reservation to
-6 CPU/24Gi, while each measured target retains a 3-CPU/12Gi execution budget.
-Separate discovery services and ephemeral volumes isolate the clusters' state.
+credentials, images, and namespace requirements. The harness starts three Trino
+clusters: the managed onboarding cluster, an uncached benchmark cluster, and a
+cached benchmark cluster. Each has one coordinator and three 1-CPU/4Gi workers;
+the total worker reservation is 9 CPU/36Gi, while each measured target retains a
+3-CPU/12Gi execution budget. Separate discovery services, catalog-store cells,
+and ephemeral volumes isolate their state.
 
-The baseline control-plane cache flag remains false. The runner reads its catalog
-properties from the throwaway database, then creates the same catalog on the
-second cluster with only `fs.cache.enabled` changed to true. Tenant credentials,
-authorization, table data, and queries are shared. An admin credential mounted
-from the namespace's `trino-auth` Secret is used only for catalog setup; benchmark
-queries authenticate as the tenant. Cache validation is scoped to each cell ID.
+The managed tenant catalog is left untouched. The runner reads its properties,
+then creates fixture catalogs in the two benchmark cells with the same authorized
+tenant catalog name. Both point to the shared fixture Hoglake catalog and use the
+read-only Pod Identity; only their explicit cache setting differs. Tenant
+credentials and OPA authorization remain unchanged. The admin credential is used
+only for creation; measurements authenticate as the tenant. Existing catalog
+properties must match exactly, and no catalog is dropped or switched between
+benchmark phases.
 
 `run.sh` supplies these runner settings automatically. Direct runner invocations
 must supply them for the isolated deployment:
@@ -864,6 +867,8 @@ must supply them for the isolated deployment:
 | Variable | Harness value / purpose |
 | --- | --- |
 | `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN` | Throwaway catalog database connection |
+| `DUCKGRES_SCENARIO_TRINO_PERF_URL` | HTTPS endpoint of `duckgres-trino-perf` |
+| `DUCKGRES_SCENARIO_TRINO_PERF_CELL_ID` | Managed cell ID with `-perf` suffix |
 | `DUCKGRES_SCENARIO_TRINO_CACHED_URL` | HTTPS endpoint of `duckgres-trino-cached` |
 | `DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID` | Baseline cell ID with `-cached` suffix |
 | `DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE` | `/trino-admin/admin-password` |
@@ -877,11 +882,11 @@ The current pinned Hoglake connector ignores `fs.cache.enabled`; the two labels
 currently distinguish requested configuration, not verified caching behavior.
 See `tests/perf/README.md` for cache budgets and this existing connector limitation.
 
-If setup or readiness fails, preserve artifacts and inspect logs for both
-`duckgres-trino` and `duckgres-trino-cached` deployments. Check catalog-store cell
+If setup or readiness fails, preserve artifacts and inspect logs for
+`duckgres-trino`, `duckgres-trino-perf`, and `duckgres-trino-cached` deployments. Check catalog-store cell
 IDs, TLS service names, auth projections, and cache-manager configuration. Run
 `tests/mw-dev/run.sh diagnostics`, then the normal `teardown`, and redeploy a fresh
-namespace before retrying. Namespace teardown removes both clusters, cached
+namespace before retrying. Namespace teardown removes all three clusters, fixture
 catalog rows in the throwaway database, and all ephemeral cache volumes.
 
 ### Shared-pool startup acceptance
@@ -1086,9 +1091,10 @@ base and configures managed Hoglake admission. It uses the same Hoglake server
 pin, which supports atomic table creation, but keeps the frozen-data read-only
 Pod Identity for fixture reads. The control plane owns the tenant's managed
 catalog; the importer registers immutable Parquet in a separate `<org>-frozen`
-catalog (and `<org>-properties` for the optional suite). The isolated benchmark
-selector uses the read-only Pod Identity instead of assuming the managed tenant
-storage role. It does not copy, rewrite or grant writes to the frozen dataset.
+catalog containing `posthog` and `properties_perf` namespaces. Its data path is
+the frozen bucket root, while each import enumerates only its exact source prefix.
+The two isolated benchmark cells use the read-only Pod Identity instead of assuming
+the managed tenant storage role. It does not copy, rewrite or grant writes to the frozen dataset.
 
 For local frozen runs, supply `HOGLAKE_DATA_PATH` with the dedicated
 `s3://<bucket>/trino/` base before deployment. Missing configuration fails before

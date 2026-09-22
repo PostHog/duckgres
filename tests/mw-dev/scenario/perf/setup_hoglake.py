@@ -137,7 +137,7 @@ def run(store, api, source, catalog):
     # Validate all files before registering the catalog.
     root = "/v1/catalogs/" + catalog
     api.post(
-        "/v1/catalogs", {"name": catalog, "data_path": source.rstrip("/") + "/"}
+        "/v1/catalogs", {"name": catalog, "data_path": f"s3://{source_bucket}/"}
     )
     api.post(root + "/namespaces", {"name": "posthog"})
     registrations = []
@@ -183,7 +183,7 @@ def run(store, api, source, catalog):
 
 
 def run_properties(store, api, source, catalog, representation):
-    """Create the scenario catalog at the properties prefix and register projections.
+    """Register properties in the existing fixture catalog, under its own namespace.
 
     column_type intentionally remains authoritative: unsupported physical VARIANT
     representations fail before writes, without coercion or omitted columns.
@@ -214,10 +214,13 @@ def run_properties(store, api, source, catalog, representation):
         if any(c["type"] != expected_types[c["name"]] for c in columns if c["name"] in expected_types):
             raise ValueError("properties fixture logical column type mismatch")
         plans[table] = columns, files
-    # The catalog only accepts files below its data_path. Use this dataset,
-    # rather than inheriting the unrelated original frozen fixture prefix.
+    # Reuse the frozen fixture catalog. Its bucket-root data_path covers both
+    # immutable prefixes; object discovery still uses only the selected prefix.
     root = "/v1/catalogs/" + catalog
-    api.post("/v1/catalogs", {"name": catalog, "data_path": source.rstrip("/") + "/"})
+    info = api.get(root)
+    data_bucket, data_prefix = location(info["data_path"])
+    if bucket != data_bucket or any(not obj["key"].startswith(data_prefix) for obj in objects):
+        raise ValueError("properties files must be inside the existing fixture catalog data_path")
     api.post(root + "/namespaces", {"name": "properties_perf"})
     registrations = []
     for table, (columns, files) in plans.items():
@@ -287,6 +290,10 @@ class RestAPI:
         ):
             raise ValueError("invalid Hoglake API URI")
         self.uri = uri.rstrip("/")
+
+    def get(self, path):
+        with urlopen(self.uri + path, timeout=120) as response:
+            return json.load(response)
 
     def post(self, path, body):
         headers = {"Content-Type": "application/json"}
