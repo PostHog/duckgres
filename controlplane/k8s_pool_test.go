@@ -109,6 +109,7 @@ type captureRuntimeWorkerStore struct {
 	spawnPodNamePrefix               string
 	spawnMaxOrgWorkers               int
 	hotIdleClaimResult               *configstore.WorkerRecord
+	hotIdleClaimOnce                 bool // return hotIdleClaimResult once, then miss
 	hotIdleClaimMissReason           configstore.WorkerClaimMissReason
 	hotIdleClaimCPID                 string
 	hotIdleClaimOrgID                string
@@ -202,6 +203,11 @@ func (s *captureRuntimeWorkerStore) ClaimHotIdleWorker(ownerCPInstanceID, orgID,
 	s.hotIdleClaimMaxOrgWorkers = maxOrgWorkers
 	if s.hotIdleClaimResult != nil {
 		r := *s.hotIdleClaimResult
+		if s.hotIdleClaimOnce {
+			// Hand the record out once, then miss — mirrors a real store
+			// where a retired claim is no longer claimable on the retry.
+			s.hotIdleClaimResult = nil
+		}
 		return &r, configstore.WorkerClaimMissReasonNone, nil
 	}
 	return nil, s.hotIdleClaimMissReason, nil

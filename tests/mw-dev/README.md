@@ -401,6 +401,18 @@ normal `go test ./...` lane.
 
 ### Deliberately not covered here
 
+- **Hot-idle claim refused on a disrupted pod** (`k8s_pool_doomed_claim.go`) —
+  the check fires when a claimed hot-idle worker's pod already carries a
+  `deletionTimestamp` or its node carries Karpenter's `karpenter.sh/disrupted`
+  taint at the instant of adoption. Staging that in-Job would need the harness
+  to delete a specific hot-idle worker pod (or taint its node) in the
+  sub-second window between the CP's durable claim and its pod read, and the
+  e2e Job holds no pod-delete/node-taint RBAC (deliberately — the harness must
+  never be able to disrupt the shared mw-dev fleet). The decision matrix and
+  the retire-and-fall-through path are covered by
+  `controlplane/k8s_pool_doomed_claim_test.go` against a fake clientset and a
+  capturing runtime store.
+
 - **Portal suspension (extended-query Execute row limit)** — the harness
   drives all SQL through psql, and libpq never sends a nonzero Execute row
   limit, so a paging client (JDBC `setFetchSize`, Hex) cannot be simulated

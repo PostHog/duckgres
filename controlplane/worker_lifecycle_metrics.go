@@ -70,6 +70,12 @@ const (
 	// ReserveSharedWorker observes a claim that cannot be activated
 	// (stale-claim retries excepted) and falls back to retire-and-retry.
 	LifecycleOriginReserveFailure LifecycleOrigin = "reserve_failure"
+	// LifecycleOriginReserveDoomedPod marks a hot-idle claim retired at
+	// adoption because its pod was already being disrupted (terminating, not
+	// running, or on a Karpenter-tainted node) — k8s_pool_doomed_claim.go.
+	// Distinct from reserve_failure so an eviction race is not read as a
+	// crash.
+	LifecycleOriginReserveDoomedPod LifecycleOrigin = "reserve_doomed_pod"
 	// LifecycleOriginIdleTimeout marks retire paths from the idle-worker
 	// reaper (reapIdleWorkers).
 	LifecycleOriginIdleTimeout LifecycleOrigin = "idle_timeout"
@@ -206,6 +212,10 @@ const (
 	// thread after its pod spawn failed (k8s_pool_acquire.go), so the org+global
 	// cap is released immediately instead of waiting for the stale-spawning sweep.
 	RetireReasonSpawnFailure = "spawn_failure"
+	// RetireReasonPodDoomed marks a hot-idle claim refused at adoption because
+	// the pod was already being disrupted (k8s_pool_doomed_claim.go). Terminal
+	// state is `retired`, not `lost`: the worker did not crash, its node did.
+	RetireReasonPodDoomed = "pod_doomed"
 )
 
 // --- Metric definitions ---

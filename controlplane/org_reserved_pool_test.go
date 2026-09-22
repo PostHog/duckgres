@@ -618,3 +618,39 @@ func TestOrgReservedPoolAbandonedSpawnActivationFailureRetiresWorker(t *testing.
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A worker that is locally draining (its pod received SIGTERM and reported
+// draining on a health check) must never be handed out by the idle-reuse path,
+// even though it carries the org's assignment and has no active session. The
+// only reusable lifecycle is Hot.
+func TestOrgReservedPoolIdleReuseSkipsDrainingWorker(t *testing.T) {
+	shared, _ := newTestK8sPool(t, 5)
+	pool := NewOrgReservedPool(shared, "analytics", 2, shared.workerImage, nil)
+	assignment := &WorkerAssignment{OrgID: "analytics", Image: shared.workerImage}
+
+	draining := &ManagedWorker{ID: 1, done: make(chan struct{})}
+	if err := draining.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleDraining, Assignment: assignment}); err != nil {
+		t.Fatalf("SetSharedState draining: %v", err)
+	}
+	shared.workers[draining.ID] = draining
+
+	shared.mu.Lock()
+	got := pool.findIdleAssignedWorkerLocked(nil)
+	shared.mu.Unlock()
+	if got != nil {
+		t.Fatalf("draining worker %d must not be reused, got %d", draining.ID, got.ID)
+	}
+
+	hot := &ManagedWorker{ID: 2, done: make(chan struct{})}
+	if err := hot.SetSharedState(SharedWorkerState{Lifecycle: WorkerLifecycleHot, Assignment: assignment}); err != nil {
+		t.Fatalf("SetSharedState hot: %v", err)
+	}
+	shared.workers[hot.ID] = hot
+
+	shared.mu.Lock()
+	got = pool.findIdleAssignedWorkerLocked(nil)
+	shared.mu.Unlock()
+	if got == nil || got.ID != hot.ID {
+		t.Fatalf("expected hot worker %d to be reused, got %#v", hot.ID, got)
+	}
+}
