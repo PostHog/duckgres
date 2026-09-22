@@ -553,11 +553,10 @@ func (o *trinoPoolOperator) createInstance(ctx context.Context, plan trinopool.P
 	suffix := o.newInstanceID()
 	if suffix == "" {
 		// A random suffix is what keeps instance identities from being reused.
-		// Without one, this create would mint "<pool>-" and collide with itself
-		// on the next attempt.
+		// An empty suffix would reuse "cell-" on each attempt.
 		return errors.New("could not generate an instance identity")
 	}
-	instanceID := o.config.PublicID + "-" + suffix
+	instanceID := "cell-" + suffix
 	identity := o.identityFor(instanceID)
 	objects, err := o.config.Blueprint.Instantiate(identity)
 	if err != nil {

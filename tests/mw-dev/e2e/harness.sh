@@ -1077,6 +1077,28 @@ trino_shared_pool_active() {
     || fail "shared pool: could not compare workers against coordinators"
   [ "${orphans:-0}" = "0" ] || fail "shared pool: $orphans worker pod(s) have no coordinator"
 
+  if [ "${E2E_TRINO_POOL_SHORT_NAMES:-0}" = "1" ]; then
+    deployments="$(kubectl get deployments -A -l "$selector" -o json)" \
+      || fail "shared pool: could not list deployments for the naming assertion"
+    printf %s "$deployments" | jq -e '
+      (.items | length > 0) and all(.items[];
+        .metadata.labels["posthog.com/trino-instance"] as $instance
+        | .metadata.labels["app.kubernetes.io/component"] as $component
+        | ($instance | test("^cell-[0-9a-f]{8}$"))
+          and ($component == "coordinator" or $component == "worker")
+          and (.metadata.name == ($instance + "-" + $component)))' >/dev/null \
+      || fail "shared pool: deployment names do not use the short instance identity"
+    for pods in "$body" "$workers"; do
+      printf %s "$pods" | jq -e 'all(.items[];
+        .metadata.labels["posthog.com/trino-instance"] as $instance
+        | .metadata.labels["app.kubernetes.io/component"] as $component
+        | (.metadata.name | startswith($instance + "-" + $component + "-"))
+          and any(.metadata.ownerReferences[]?; .kind == "ReplicaSet"))' >/dev/null \
+        || fail "shared pool: pods must keep their Kubernetes-managed suffixes"
+    done
+    log "shared pool OK [names]: short instance names with Kubernetes-managed pod suffixes"
+  fi
+
   log "shared pool OK [structure]: $ready ready instance(s), each with its own service and workers"
 
   # Tenant admission, when the cell has the Gateway restriction on. This is the
