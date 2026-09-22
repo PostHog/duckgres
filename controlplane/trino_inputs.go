@@ -130,8 +130,6 @@ func trinoProvisionerEnabled() bool {
 // Registered cells share projections across their independently scheduled backends.
 // Only the legacy cell claims unassigned tenants.
 type trinoCell struct {
-	TenantAdmission  bool
-	DefaultPlacement bool
 	// Mode selects the compute topology. An empty value is the existing fixed
 	// blue/green cell.
 	Mode              string

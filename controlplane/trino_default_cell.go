@@ -11,38 +11,27 @@ import (
 
 const envTrinoDefaultCell = "DUCKGRES_TRINO_DEFAULT_CELL"
 
-// configureTrinoDefaultCell validates placement before any fleet bootstrap writes.
+// resolveTrinoDefaultCell validates placement before any fleet bootstrap writes.
 // Only new assignments use this default; it never changes a persisted owner.
-func configureTrinoDefaultCell(cells []trinoCell) error {
+func resolveTrinoDefaultCell(cells []trinoRegisteredCell) (string, error) {
 	target := strings.TrimSpace(os.Getenv(envTrinoDefaultCell))
 	if target == "" {
-		return nil
+		return "", nil
 	}
-	for i := range cells {
-		cell := &cells[i]
-		if cell.PublicID != target {
+	for _, cell := range cells {
+		if cell.ID != target {
 			continue
 		}
-		if cell.Mode != trinoPoolModeShared || !cell.TenantAdmission {
-			return fmt.Errorf("%s requires a registered shared-pool cell with tenant_admission enabled", envTrinoDefaultCell)
+		if strings.TrimSpace(cell.Mode) != trinoPoolModeShared || cell.Pool == nil || !cell.Pool.TenantAdmission {
+			return "", fmt.Errorf("%s requires a registered shared-pool cell with tenant_admission enabled", envTrinoDefaultCell)
 		}
 		for _, key := range []string{envTrinoPoolEnabled, envTrinoPoolOperatorEnabled, envTrinoPoolCatalogWriter} {
 			enabled, err := strconv.ParseBool(strings.TrimSpace(os.Getenv(key)))
 			if err != nil || !enabled {
-				return fmt.Errorf("%s requires %s=true", envTrinoDefaultCell, key)
+				return "", fmt.Errorf("%s requires %s=true", envTrinoDefaultCell, key)
 			}
 		}
-		cell.DefaultPlacement = true
-		return nil
+		return registeredTrinoCellPrefix + cell.ID, nil
 	}
-	return fmt.Errorf("%s does not name a registered cell", envTrinoDefaultCell)
-}
-
-func (f trinoFleet) defaultCellID() string {
-	for _, wire := range f {
-		if wire.Cell.DefaultPlacement {
-			return wire.Cell.ID
-		}
-	}
-	return ""
+	return "", fmt.Errorf("%s does not name a registered cell", envTrinoDefaultCell)
 }

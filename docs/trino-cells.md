@@ -96,38 +96,22 @@ cells through this endpoint, even when disabled.
 
 ### Automatic placement runbook
 
-Set `DUCKGRES_TRINO_DEFAULT_CELL` to the registry's public cell ID (for example,
-`pool-test`). The default is unset. It must identify a `shared-pool` cell with
-`pool.tenant_admission=true`; `DUCKGRES_TRINO_POOL_ENABLED`,
-`DUCKGRES_TRINO_POOL_OPERATOR_ENABLED`, and
-`DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED` must all be true. An invalid default
-fails control-plane startup before fleet bootstrap writes. Existing pool wiring
-still validates the Gateway, catalog store, and other required configuration.
+Set `DUCKGRES_TRINO_DEFAULT_CELL` (default unset) to a registered shared-pool ID.
+The pool must have `tenant_admission=true`, with the pool, operator, and catalog
+writer enabled. Invalid configuration fails startup; fix or revert it and restart.
 
-Both `POST /orgs/:id/provision` with Trino enabled and `POST /orgs/:id/trino`
-(including the admin UI) apply the default. The same database transaction writes
-placement and enablement, so legacy cannot claim a newly enabled tenant in
-between. Stored ownership wins, including an operator's initial selection and
-existing legacy tenants; retries and disable/re-enable never move them.
-An unassigned existing org also gets the default on its next enable request.
+Both provision and standalone Trino enablement assign this default atomically,
+only when the org has no owner. Existing assignments always win, including across
+retries and disable/re-enable. An unavailable pool stays pending without fallback.
 
-For local development, configure a shared pool as described below, set the env
-variable, restart the control plane, then provision a fresh synthetic org without
-sending any cell field. Read `/api/v1/orgs/<org>/trino`: `cell.id` must match the
-configured public ID. Verify admission and an authenticated query separately;
-placement does not imply that serving compute is currently available.
-
-For deployment acceptance, run the mw-dev harness with
-`E2E_TRINO_DEFAULT_CELL=<public-id>` and
-`E2E_TRINO_DEFAULT_CELL_ORG=<fresh-dedicated-test-org>`. This provisions a new
-warehouse and checks placement without an operator selection. The test keeps
-that org because Hoglake retirement is not supported. It is not run against a
-live deployment until the new binary and configuration are installed.
-
-On configuration failure, fix the named setting or roll back the configuration
-and restart. On pool unavailability, restore that pool and let reconciliation
-retry; there is no fallback to legacy. Changing or removing the default only
-affects future unassigned enables and does not migrate already assigned orgs.
+For local or deployment acceptance, restart with the configuration and provision a
+fresh synthetic org; verify `/api/v1/orgs/<org>/trino` reports the expected `cell.id`,
+then test an authenticated query. The mw-dev harness supports this placement check
+with `E2E_TRINO_DEFAULT_CELL=<id>` and `E2E_TRINO_DEFAULT_CELL_ORG=<fresh-org>`;
+it retains the test warehouse because Hoglake retirement is unsupported.
+Fully roll out the backend before setting the default, and finish the configuration
+rollout before acceptance: pods with old configuration can still assign legacy.
+Changing or reverting the default never migrates existing assignments.
 
 Operational API calls require `?cell=<logical-id>` when no legacy cell exists.
 The Trino pages provide an explicit cell selector; they never select an arbitrary

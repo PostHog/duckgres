@@ -3,9 +3,6 @@
 package controlplane
 
 import (
-	"errors"
-	"github.com/posthog/duckgres/controlplane/configstore"
-	"github.com/posthog/duckgres/controlplane/provisioning"
 	"os"
 	"strings"
 	"testing"
@@ -18,6 +15,7 @@ func TestTrinoDefaultCellConfiguration(t *testing.T) {
 	}{
 		{"unset", "", "", false, false, false},
 		{"shared pool", "pool-test", trinoPoolModeShared, true, true, false},
+		{"padded mode", "pool-test", " shared-pool ", true, true, false},
 		{"unknown", "missing", trinoPoolModeShared, true, true, true},
 		{"legacy", "legacy", trinoPoolModeShared, true, true, true},
 		{"fixed", "pool-test", trinoPoolModeFixed, true, true, true},
@@ -33,35 +31,18 @@ func TestTrinoDefaultCellConfiguration(t *testing.T) {
 				}
 				t.Setenv(key, value)
 			}
-			cells := []trinoCell{{ID: "legacy-owner"}, {ID: "registered:pool-test", PublicID: "pool-test", Mode: tc.mode, TenantAdmission: tc.admission}}
-			err := configureTrinoDefaultCell(cells)
+			cells := []trinoRegisteredCell{{ID: "pool-test", Mode: tc.mode, Pool: &trinoRegisteredPool{TenantAdmission: tc.admission}}}
+			id, err := resolveTrinoDefaultCell(cells)
 			if (err != nil) != tc.wantError {
 				t.Fatalf("error = %v", err)
 			}
-			if err == nil && tc.target != "" && !cells[1].DefaultPlacement {
+			if err == nil && tc.target != "" && id != "registered:pool-test" {
 				t.Fatal("default not selected")
 			}
-			if cells[0].DefaultPlacement {
-				t.Fatal("legacy selected")
+			if tc.target == "" && id != "" {
+				t.Fatal("unset default selected a cell")
 			}
 		})
-	}
-}
-
-func TestTrinoDefaultCellAdmissionPreservesOwnership(t *testing.T) {
-	fleet := trinoFleet{&trinoWiring{Cell: trinoCell{ID: "legacy-owner"}}, &trinoWiring{Cell: trinoCell{ID: "registered:pool-test", PublicID: "pool-test", DefaultPlacement: true}}}
-	for _, owner := range []string{"", "legacy-owner", "registered:pool-test"} {
-		store := registryOnlyOrgStore{row: nil}
-		if owner != "" {
-			store.row = &configstore.ManagedWarehouseTrino{TrinoCellID: owner}
-		}
-		check := fleet.enablementCheck(store)
-		if check == nil || check("tenant") != nil {
-			t.Fatalf("owner %q rejected", owner)
-		}
-	}
-	if fleet.defaultCellID() != "registered:pool-test" {
-		t.Fatal("wrong durable ID")
 	}
 }
 
@@ -76,25 +57,11 @@ func TestTrinoDefaultCellRegistryWiring(t *testing.T) {
 		t.Fatal(err)
 	}
 	withPoolEnv(t, map[string]string{envTrinoCellsFile: path, envTrinoRegistryOnly: "true", envTrinoCoordinatorURL: "", envTrinoDefaultCell: "cell-001", envTrinoPoolEnabled: "true", envTrinoPoolOperatorEnabled: "true", envTrinoPoolCatalogWriter: "true"})
-	cells, err := resolveTrinoCells()
+	cells, id, err := resolveTrinoCells()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := configureTrinoDefaultCell(cells); err != nil {
-		t.Fatal(err)
-	}
-	if len(cells) != 1 || !cells[0].DefaultPlacement || cells[0].ID != "registered:cell-001" {
+	if len(cells) != 1 || id != "registered:cell-001" || cells[0].ID != "registered:cell-001" {
 		t.Fatalf("wrong cells: %+v", cells)
-	}
-}
-func TestTrinoDefaultCellAdmissionDoesNotHideUnknownOwnerOrReadFailure(t *testing.T) {
-	fleet := trinoFleet{&trinoWiring{Cell: trinoCell{ID: "registered:pool-test", PublicID: "pool-test", DefaultPlacement: true}}, &trinoWiring{Cell: trinoCell{ID: "legacy-owner"}}}
-	unknown := registryOnlyOrgStore{row: &configstore.ManagedWarehouseTrino{TrinoCellID: "registered:removed"}}
-	if err := fleet.enablementCheck(unknown)("tenant"); !errors.Is(err, provisioning.ErrTrinoCellNotConfigured) {
-		t.Fatalf("unknown owner: %v", err)
-	}
-	readErr := errors.New("store unavailable")
-	if err := fleet.enablementCheck(registryOnlyOrgStore{err: readErr})("tenant"); !errors.Is(err, readErr) {
-		t.Fatalf("read failure: %v", err)
 	}
 }

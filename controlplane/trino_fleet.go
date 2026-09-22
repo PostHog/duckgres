@@ -18,38 +18,35 @@ import (
 
 type trinoFleet []*trinoWiring
 
-func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver, storageResolvers ...provisioner.TrinoDucklingResolver) (trinoFleet, error) {
+func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, ducklings provisioner.TrinoDucklingResolver, storageResolvers ...provisioner.TrinoDucklingResolver) (trinoFleet, string, error) {
 	if !trinoProvisionerEnabled() {
-		return nil, nil
+		return nil, "", nil
 	}
-	cells, err := resolveTrinoCells()
+	cells, defaultCell, err := resolveTrinoCells()
 	if err != nil {
-		return nil, err
-	}
-	if err := configureTrinoDefaultCell(cells); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	fleet := make(trinoFleet, 0, len(cells))
 	for _, cell := range cells {
 		wire, err := buildTrinoCellWiring(store, kc, ducklings, cell, storageResolvers...)
 		if err != nil {
-			return nil, fmt.Errorf("wire Trino cell %s: %w", cell.consoleCell().ID, err)
+			return nil, "", fmt.Errorf("wire Trino cell %s: %w", cell.consoleCell().ID, err)
 		}
 		fleet = append(fleet, wire)
 	}
-	return fleet, nil
+	return fleet, defaultCell, nil
 }
 
-// enablementCheck requires explicit placement when no legacy provisioner exists.
+// enablementCheck requires placement when neither legacy nor a default is available.
 func (f trinoFleet) enablementCheck(store interface {
 	GetManagedWarehouseTrino(string) (*configstore.ManagedWarehouseTrino, error)
-}) func(string) error {
+}, defaultCell string) func(string) error {
 	if len(f) == 0 {
 		return nil
 	}
 	owners := make(map[string]bool, len(f))
 	for _, wire := range f {
-		if wire.Cell.PublicID == "" && f.defaultCellID() == "" {
+		if wire.Cell.PublicID == "" && defaultCell == "" {
 			return nil
 		}
 		owners[wire.Cell.ID] = true
@@ -60,7 +57,7 @@ func (f trinoFleet) enablementCheck(store interface {
 			return err
 		}
 		if row == nil || row.TrinoCellID == "" {
-			if f.defaultCellID() != "" {
+			if defaultCell != "" {
 				return nil
 			}
 			return provisioning.ErrTrinoCellSelectionRequired

@@ -1630,11 +1630,10 @@ The optional `DUCKGRES_TRINO_CELLS_FILE` adds namespace-isolated logical cells
 with blue/green backends. It requires legacy unless
 `DUCKGRES_TRINO_REGISTRY_ONLY=true` explicitly selects a registry-only deployment.
 That mode requires a valid registry and forbids a legacy coordinator URL.
-Registered reconcilers never claim unassigned warehouses or reinterpret legacy ownership.
-`DUCKGRES_TRINO_DEFAULT_CELL` optionally selects a registered shared pool during
-both provision and standalone enable transactions, only when ownership is empty.
-It requires the pool, operator, catalog writer, and tenant admission gates; invalid
-configuration fails startup. Unset preserves legacy/manual placement behavior. With no Trino configuration, the branch never wires and nothing changes. **Trino is binary: if
+Registered reconcilers never claim unassigned warehouses. The optional
+`DUCKGRES_TRINO_DEFAULT_CELL` assigns unowned tenants atomically at enablement;
+see [the placement runbook](docs/trino-cells.md#automatic-placement-runbook).
+With no Trino configuration, the branch never wires. **Trino is binary: if
 you asked for it, a wiring failure is fatal at startup**, because silently
 skipping leaves the cell's OPA sidecar serving a last-good bundle while
 password/tenant/catalog changes never propagate.

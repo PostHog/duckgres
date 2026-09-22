@@ -23,7 +23,7 @@ func TestTrinoInitialSelectionPreservesOwnershipPostgres(t *testing.T) {
 	if row := trinoRow(t, store, "tenant"); row.Enabled || row.TrinoCellID != "registered:cell-001" {
 		t.Fatalf("selection enabled or misassigned tenant: %+v", row)
 	}
-	if err := store.EnableTrino("tenant", configstore.TrinoSettings{}); err != nil {
+	if err := store.EnableTrino("tenant", configstore.TrinoSettings{DefaultCellID: "registered:default-pool"}); err != nil {
 		t.Fatal(err)
 	}
 	if claimed, err := store.ClaimTrinoCell("tenant", "cell-001"); err != nil || claimed {
@@ -46,7 +46,16 @@ func TestTrinoInitialSelectionPreservesOwnershipPostgres(t *testing.T) {
 	}
 }
 
-func TestTrinoSelectionRacesFirstLegacyClaimPostgres(t *testing.T) {
+func TestTrinoSelectionRacesEnablementPostgres(t *testing.T) {
+	for _, defaultCell := range []string{"", "registered:default-pool"} {
+		t.Run("default="+defaultCell, func(t *testing.T) {
+			testTrinoSelectionRace(t, defaultCell)
+		})
+	}
+}
+
+func testTrinoSelectionRace(t *testing.T, defaultCell string) {
+	t.Helper()
 	store := newIsolatedConfigStore(t)
 	for i := 0; i < 20; i++ {
 		org := fmt.Sprintf("tenant-%d", i)
@@ -67,7 +76,7 @@ func TestTrinoSelectionRacesFirstLegacyClaimPostgres(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if claimErr = store.EnableTrino(org, configstore.TrinoSettings{}); claimErr == nil {
+			if claimErr = store.EnableTrino(org, configstore.TrinoSettings{DefaultCellID: defaultCell}); claimErr == nil {
 				claimed, claimErr = store.ClaimTrinoCell(org, "cell-001")
 			}
 		}()
@@ -81,8 +90,14 @@ func TestTrinoSelectionRacesFirstLegacyClaimPostgres(t *testing.T) {
 			if claimed || row.TrinoCellID != "registered:cell-001" {
 				t.Fatalf("successful selection lost ownership: claim=%v row=%+v", claimed, row)
 			}
-		} else if !claimed || row.TrinoCellID != "cell-001" {
-			t.Fatalf("legacy winner not authoritative: claim=%v row=%+v", claimed, row)
+		} else {
+			wantOwner, wantClaim := defaultCell, false
+			if defaultCell == "" {
+				wantOwner, wantClaim = "cell-001", true
+			}
+			if claimed != wantClaim || row.TrinoCellID != wantOwner {
+				t.Fatalf("enablement winner not authoritative: claim=%v row=%+v", claimed, row)
+			}
 		}
 	}
 }

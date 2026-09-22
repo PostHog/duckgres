@@ -4,7 +4,6 @@ package configstore_test
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -38,27 +37,6 @@ func TestTrinoDefaultCellIsVisibleWithEnablePostgres(t *testing.T) {
 	}
 }
 
-func TestTrinoDefaultCellPreservesOperatorAndLegacyOwnershipPostgres(t *testing.T) {
-	for _, owner := range []string{"registered:operator-pool", "legacy-cell"} {
-		t.Run(owner, func(t *testing.T) {
-			store := newIsolatedConfigStore(t)
-			seedTrinoOrg(t, store, "tenant")
-			if err := store.DB().Create(&configstore.ManagedWarehouse{OrgID: "tenant", DucklingName: "tenant"}).Error; err != nil {
-				t.Fatal(err)
-			}
-			if err := store.SelectTrinoCell("tenant", owner); err != nil {
-				t.Fatal(err)
-			}
-			if err := store.EnableTrino("tenant", configstore.TrinoSettings{DefaultCellID: "registered:default-pool"}); err != nil {
-				t.Fatal(err)
-			}
-			if row := trinoRow(t, store, "tenant"); !row.Enabled || row.TrinoCellID != owner {
-				t.Fatalf("default overwrote prior placement: %+v", row)
-			}
-		})
-	}
-}
-
 func TestTrinoDefaultCellRollsBackWithProvisionTransactionPostgres(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	seedTrinoOrg(t, store, "tenant")
@@ -81,41 +59,5 @@ func TestTrinoDefaultCellRollsBackWithProvisionTransactionPostgres(t *testing.T)
 	}
 	if row := trinoRow(t, store, "tenant"); row.TrinoCellID != "registered:pool-b" {
 		t.Fatalf("retry retained rolled-back placement: %+v", row)
-	}
-}
-
-func TestTrinoDefaultCellRacesOperatorSelectionPostgres(t *testing.T) {
-	store := newIsolatedConfigStore(t)
-	for i := 0; i < 20; i++ {
-		org := fmt.Sprintf("tenant-%d", i)
-		seedTrinoOrg(t, store, org)
-		if err := store.DB().Create(&configstore.ManagedWarehouse{OrgID: org, DucklingName: org}).Error; err != nil {
-			t.Fatal(err)
-		}
-		start := make(chan struct{})
-		selected, enabled := make(chan error, 1), make(chan error, 1)
-		go func() {
-			<-start
-			selected <- store.SelectTrinoCell(org, "registered:operator-pool")
-		}()
-		go func() {
-			<-start
-			enabled <- store.EnableTrino(org, configstore.TrinoSettings{DefaultCellID: "registered:default-pool"})
-		}()
-		close(start)
-		selectionErr, enableErr := <-selected, <-enabled
-		if enableErr != nil || (selectionErr != nil && !errors.Is(selectionErr, configstore.ErrTrinoCellSelectionConflict)) {
-			t.Fatalf("placement race: enable=%v selection=%v", enableErr, selectionErr)
-		}
-		owner := "registered:default-pool"
-		if selectionErr == nil {
-			owner = "registered:operator-pool"
-		}
-		if row := trinoRow(t, store, org); !row.Enabled || row.TrinoCellID != owner {
-			t.Fatalf("placement winner not preserved: want=%s row=%+v", owner, row)
-		}
-		if claimed, err := store.ClaimTrinoCell(org, "legacy-cell"); err != nil || claimed {
-			t.Fatalf("legacy stole race winner: claimed=%v err=%v", claimed, err)
-		}
 	}
 }

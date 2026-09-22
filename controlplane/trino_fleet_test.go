@@ -34,27 +34,38 @@ func (s registryOnlyOrgStore) GetManagedWarehouseTrino(string) (*configstore.Man
 
 func TestTrinoRegistryOnlyAdmissionUsesStoredOwnership(t *testing.T) {
 	fleet := trinoFleet{&trinoWiring{Cell: trinoCell{ID: "registered:cell-test", PublicID: "cell-test"}}}
-	for _, tc := range []struct {
-		owner string
-		want  error
-	}{
-		{"", provisioning.ErrTrinoCellSelectionRequired}, {"cell-001", provisioning.ErrTrinoCellNotConfigured},
-		{"legacy", provisioning.ErrTrinoCellNotConfigured}, {"registered:unknown", provisioning.ErrTrinoCellNotConfigured}, {"registered:cell-test", nil},
-	} {
-		store := registryOnlyOrgStore{row: &configstore.ManagedWarehouseTrino{TrinoCellID: tc.owner}}
-		if err := fleet.enablementCheck(store)("tenant"); !errors.Is(err, tc.want) {
-			t.Fatalf("owner %q: %v", tc.owner, err)
+	for _, defaultCell := range []string{"", "registered:cell-test"} {
+		if defaultCell != "" {
+			fleet = append(fleet, &trinoWiring{Cell: trinoCell{ID: "cell-001"}})
+		}
+		for _, tc := range []struct {
+			owner string
+			want  error
+		}{
+			{"", provisioning.ErrTrinoCellSelectionRequired}, {"cell-001", provisioning.ErrTrinoCellNotConfigured},
+			{"legacy", provisioning.ErrTrinoCellNotConfigured}, {"registered:unknown", provisioning.ErrTrinoCellNotConfigured}, {"registered:cell-test", nil},
+		} {
+			if defaultCell != "" && (tc.owner == "" || tc.owner == "cell-001") {
+				tc.want = nil
+			}
+			store := registryOnlyOrgStore{row: &configstore.ManagedWarehouseTrino{TrinoCellID: tc.owner}}
+			if err := fleet.enablementCheck(store, defaultCell)("tenant"); !errors.Is(err, tc.want) {
+				t.Fatalf("default %q owner %q: %v", defaultCell, tc.owner, err)
+			}
+		}
+		var missingWant error
+		if defaultCell == "" {
+			missingWant = provisioning.ErrTrinoCellSelectionRequired
+		}
+		if err := fleet.enablementCheck(registryOnlyOrgStore{}, defaultCell)("tenant"); !errors.Is(err, missingWant) {
+			t.Fatalf("missing row: %v", err)
+		}
+		dbErr := errors.New("database unavailable")
+		if err := fleet.enablementCheck(registryOnlyOrgStore{err: dbErr}, defaultCell)("tenant"); !errors.Is(err, dbErr) {
+			t.Fatal("read failure admitted")
 		}
 	}
-	if err := fleet.enablementCheck(registryOnlyOrgStore{})("tenant"); !errors.Is(err, provisioning.ErrTrinoCellSelectionRequired) {
-		t.Fatal("missing row admitted")
-	}
-	dbErr := errors.New("database unavailable")
-	if err := fleet.enablementCheck(registryOnlyOrgStore{err: dbErr})("tenant"); !errors.Is(err, dbErr) {
-		t.Fatal("read failure admitted")
-	}
-	fleet = append(fleet, &trinoWiring{Cell: trinoCell{ID: "cell-001"}})
-	if fleet.enablementCheck(registryOnlyOrgStore{}) != nil || (trinoFleet(nil)).enablementCheck(registryOnlyOrgStore{}) != nil {
+	if fleet.enablementCheck(registryOnlyOrgStore{}, "") != nil || (trinoFleet(nil)).enablementCheck(registryOnlyOrgStore{}, "") != nil {
 		t.Fatal("legacy or disabled behavior changed")
 	}
 }
@@ -77,7 +88,7 @@ func TestTrinoRegistryOnlyBootstrapHasNoLegacyDependency(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	fleet, err := buildTrinoFleetWiring(store, kc, func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil })
+	fleet, _, err := buildTrinoFleetWiring(store, kc, func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil })
 	if err != nil {
 		t.Fatal(err)
 	}

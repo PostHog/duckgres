@@ -72,9 +72,8 @@ func TestEnableTrinoIsIdempotentAndPreservesReconcileState(t *testing.T) {
 		t.Fatalf("UpdateTrinoState: %v", err)
 	}
 
-	// ...and a re-enable (tier change) must NOT clobber it. This is the
-	// whole reason the upsert names only enabled/tier/updated_at.
-	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "growth"}); err != nil {
+	// A tier or default-cell change must preserve the reconciled ownership.
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "growth", DefaultCellID: "registered:default-pool"}); err != nil {
 		t.Fatalf("EnableTrino (re-enable): %v", err)
 	}
 	row = trinoRow(t, store, "acme")
