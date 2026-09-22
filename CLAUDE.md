@@ -1822,8 +1822,7 @@ password/tenant/catalog changes never propagate.
   boolean: a lost claim must never project the losing cell's tenant. Only
   legacy claims unassigned warehouses. Registered logical IDs have the reserved
   storage prefix `registered:`; the old stored `cell-001` remains legacy.
-  Configured default placement is committed atomically with enablement; existing
-  ownership always wins. Admin-only initial selection runs before first enablement and refuses changes
+  Admin-only initial selection runs before first enablement and refuses changes
   to any already owned warehouse, including a disabled one. No maintenance move,
   capacity model, rebalancer, drain, or Gateway routing controller is included.
   See [docs/trino-cells.md](docs/trino-cells.md) for configuration and recovery.

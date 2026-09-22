@@ -27,7 +27,8 @@ type fakeStore struct {
 	// lastProvision records the ProvisionRequest the handler dispatched, so
 	// tests can assert the request-field → store-request threading (the real
 	// billing-row/schema writes are covered by the Postgres-backed tests).
-	lastProvision *ProvisionRequest
+	lastProvision     *ProvisionRequest
+	lastTrinoSettings configstore.TrinoSettings
 
 	listWarehousesErr error // set non-nil to fail ListWarehousesByStates
 	listOrgTeamsErr   error // set non-nil to fail ListOrgTeamsByOrgIDs
@@ -310,6 +311,7 @@ func (s *fakeStore) Provision(req ProvisionRequest) error {
 }
 
 func (s *fakeStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
+	s.lastTrinoSettings = settings
 	backend, err := configstore.ResolveTrinoBackend(s.trino[orgID], settings.Backend)
 	if err != nil {
 		return err

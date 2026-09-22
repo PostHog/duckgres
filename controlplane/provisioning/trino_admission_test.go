@@ -29,7 +29,7 @@ func TestTrinoAdmissionGuardsBothEnableSurfaces(t *testing.T) {
 					return ErrTrinoCellSelectionRequired
 				}
 				return nil
-			}, WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }))
+			}, WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }), WithTrinoDefaultCell("registered:pool-test"))
 			body := `{"enabled":true,"tier":"free"}`
 			if endpoint == "provision" {
 				body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true}}`
@@ -44,6 +44,15 @@ func TestTrinoAdmissionGuardsBothEnableSurfaces(t *testing.T) {
 			}
 			if rec.Code != want || calls != 1 {
 				t.Fatalf("%s allowed=%v status=%d calls=%d body=%s", endpoint, allowed, rec.Code, calls, rec.Body.String())
+			}
+			if allowed {
+				settings := store.lastTrinoSettings
+				if endpoint == "provision" {
+					settings = *store.lastProvision.Trino
+				}
+				if settings.DefaultCellID != "registered:pool-test" {
+					t.Fatal("deployment placement missing from transaction")
+				}
 			}
 			if !allowed && (store.trino["tenant"] != nil || store.lastProvision != nil) {
 				t.Fatal("admission rejection mutated warehouse")
@@ -60,49 +69,5 @@ func TestTrinoAdmissionHidesStoreErrors(t *testing.T) {
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "private database") {
 		t.Fatalf("unsafe error: %d %s", rec.Code, rec.Body.String())
-	}
-}
-
-// Capture the settings crossing the HTTP/store boundary; the real PostgreSQL
-// tests assert durable ownership and concurrency separately.
-type defaultCellStore struct {
-	*fakeStore
-	settings configstore.TrinoSettings
-}
-
-func (s *defaultCellStore) EnableTrino(orgID string, settings configstore.TrinoSettings) error {
-	s.settings = settings
-	return s.fakeStore.EnableTrino(orgID, settings)
-}
-func (s *defaultCellStore) Provision(req ProvisionRequest) error {
-	if req.Trino != nil {
-		s.settings = *req.Trino
-	}
-	return s.fakeStore.Provision(req)
-}
-func TestTrinoDefaultCellReachesBothEnableTransactions(t *testing.T) {
-	for _, endpoint := range []string{"trino", "provision"} {
-		t.Run(endpoint, func(t *testing.T) {
-			store := &defaultCellStore{fakeStore: newFakeStore()}
-			store.orgs["tenant"] = &configstore.Org{Name: "tenant"}
-			store.users[configstore.OrgUserKey{OrgID: "tenant", Username: "root"}] = "hash"
-			r := gin.New()
-			RegisterAPIWithTrinoAdmission(r.Group("/api/v1"), store, store, "", nil, "", nil,
-				WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }), WithTrinoDefaultCell("registered:pool-test"))
-			body := `{"enabled":true}`
-			if endpoint == "provision" {
-				body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true}}`
-			}
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/tenant/"+endpoint, strings.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-			if rec.Code != http.StatusAccepted {
-				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
-			}
-			if store.settings.DefaultCellID != "registered:pool-test" {
-				t.Fatal("deployment placement missing from transaction")
-			}
-		})
 	}
 }
