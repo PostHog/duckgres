@@ -102,16 +102,26 @@ func (f defaultDriverFactory) selectHoglakeCatalog(ctx context.Context, connecti
 			return waitHoglakeSchema(ctx, connection)
 		}
 		if current != nil {
-			if !maps.Equal(current, original) {
+			// The provisioner may recreate the managed tenant catalog between
+			// DROP and CREATE. Accept only that tenant's managed mapping with
+			// otherwise identical properties; keep rejecting unrelated drift.
+			restored := maps.Clone(current)
+			managedCatalog := strings.TrimSuffix(strings.TrimSuffix(connection.HoglakeCatalog, "-properties"), "-frozen")
+			if managedCatalog != connection.HoglakeCatalog && current["hoglake.catalog"] == managedCatalog && current["s3.iam-role"] != "" {
+				delete(restored, "s3.iam-role")
+				restored["hoglake.catalog"] = original["hoglake.catalog"]
+			}
+			if !maps.Equal(current, original) && !maps.Equal(restored, original) {
 				return errors.New("benchmark catalog changed unexpectedly during dataset selection")
 			}
 
 			// A transport error can follow a committed DROP. Inspect persisted
 			// state on the next pass before deciding whether DROP or CREATE is needed.
 			_, _ = db.ExecContext(ctx, "DROP CATALOG "+quote(connection.Catalog))
-		} else {
-			_, _ = db.ExecContext(ctx, create)
 		}
+		// Recreate immediately instead of leaving the catalog absent for a
+		// poll interval. On ambiguous DDL errors, inspect persisted state again.
+		_, _ = db.ExecContext(ctx, create)
 
 		select {
 		case <-ctx.Done():
