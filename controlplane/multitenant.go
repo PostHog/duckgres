@@ -780,7 +780,7 @@ func SetupMultiTenant(
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
 	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store),
-		provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability))
+		provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability), provisioning.WithTrinoDefaultCell(trinoCells.defaultCellID()))
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

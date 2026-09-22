@@ -1630,8 +1630,11 @@ The optional `DUCKGRES_TRINO_CELLS_FILE` adds namespace-isolated logical cells
 with blue/green backends. It requires legacy unless
 `DUCKGRES_TRINO_REGISTRY_ONLY=true` explicitly selects a registry-only deployment.
 That mode requires a valid registry and forbids a legacy coordinator URL.
-It never claims unassigned warehouses or reinterprets legacy ownership. With neither
-setting, the branch never wires and nothing changes. **Trino is binary: if
+Registered reconcilers never claim unassigned warehouses or reinterpret legacy ownership.
+`DUCKGRES_TRINO_DEFAULT_CELL` optionally selects a registered shared pool during
+both provision and standalone enable transactions, only when ownership is empty.
+It requires the pool, operator, catalog writer, and tenant admission gates; invalid
+configuration fails startup. Unset preserves legacy/manual placement behavior. With no Trino configuration, the branch never wires and nothing changes. **Trino is binary: if
 you asked for it, a wiring failure is fatal at startup**, because silently
 skipping leaves the cell's OPA sidecar serving a last-good bundle while
 password/tenant/catalog changes never propagate.
@@ -1820,7 +1823,8 @@ password/tenant/catalog changes never propagate.
   boolean: a lost claim must never project the losing cell's tenant. Only
   legacy claims unassigned warehouses. Registered logical IDs have the reserved
   storage prefix `registered:`; the old stored `cell-001` remains legacy.
-  Admin-only initial selection runs before first enablement and refuses changes
+  Configured default placement is committed atomically with enablement; existing
+  ownership always wins. Admin-only initial selection runs before first enablement and refuses changes
   to any already owned warehouse, including a disabled one. No maintenance move,
   capacity model, rebalancer, drain, or Gateway routing controller is included.
   See [docs/trino-cells.md](docs/trino-cells.md) for configuration and recovery.

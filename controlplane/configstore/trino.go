@@ -18,6 +18,9 @@ import (
 // fields can be added without changing call sites — the zero value matches
 // the new-client default (Hoglake, no tier, enabled).
 type TrinoSettings struct {
+	// DefaultCellID is a validated deployment default, never a client-supplied choice.
+	// It only fills an empty assignment in the enable transaction.
+	DefaultCellID string
 	// Tier is the resource-group tier label. Empty == default tier.
 	Tier string
 	// Backend may only confirm the existing selection or Hoglake for a new client.
@@ -31,9 +34,9 @@ type TrinoSettings struct {
 // `POST /orgs/:id/provision` path or the standalone
 // `POST /orgs/:id/trino` endpoint.
 //
-// The cell is deliberately NOT set here. The enable surfaces are HTTP
-// handlers with no knowledge of the Trino fleet; the reconciling
-// provisioner claims unassigned rows into its own cell (AssignTrinoCell).
+// A validated deployment default fills an unassigned cell atomically with
+// enablement. Existing ownership always wins. Without a default, legacy
+// reconciliation retains its conditional claim behavior.
 func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
 	if orgID == "" {
 		return errors.New("EnableTrino: orgID is required")
@@ -111,8 +114,13 @@ func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings)
 				return err
 			}
 		}
+		cellID := row.TrinoCellID
+		if cellID == "" {
+			cellID = settings.DefaultCellID
+		}
 		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ?", orgID).Updates(map[string]any{
-			"enabled": true, "tier": settings.Tier, "backend": backend, "backend_selected": true, "updated_at": time.Now().UTC(),
+			"trino_cell_id": cellID,
+			"enabled":       true, "tier": settings.Tier, "backend": backend, "backend_selected": true, "updated_at": time.Now().UTC(),
 		}).Error
 	})
 }

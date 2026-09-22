@@ -65,3 +65,9 @@ func (h *handler) resolveTrinoBackend(c *gin.Context, orgID string, requested co
 	}
 	return backend, true
 }
+
+// WithTrinoDefaultCell supplies the validated deployment placement. The store
+// persists it atomically with enablement and preserves any existing assignment.
+func WithTrinoDefaultCell(cellID string) Option {
+	return func(h *handler) { h.trinoDefaultCell = cellID }
+}

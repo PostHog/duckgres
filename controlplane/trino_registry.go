@@ -82,6 +82,9 @@ func resolveTrinoCells() ([]trinoCell, error) {
 			return nil, errors.New("registered cell must not share the legacy namespace")
 		}
 		cell := trinoCell{Mode: strings.TrimSpace(entry.Mode), ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, RoutingGroup: entry.RoutingGroup, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends, CatalogManagement: entry.CatalogManagement}
+		if entry.Pool != nil {
+			cell.TenantAdmission = entry.Pool.TenantAdmission
+		}
 		for _, backend := range entry.Backends {
 			endpoint, _ := trinoEndpointKey(backend.CoordinatorURL)
 			if !registryOnly && endpoint == legacyEndpoint {

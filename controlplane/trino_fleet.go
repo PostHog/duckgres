@@ -26,6 +26,9 @@ func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, duck
 	if err != nil {
 		return nil, err
 	}
+	if err := configureTrinoDefaultCell(cells); err != nil {
+		return nil, err
+	}
 	fleet := make(trinoFleet, 0, len(cells))
 	for _, cell := range cells {
 		wire, err := buildTrinoCellWiring(store, kc, ducklings, cell, storageResolvers...)
@@ -46,7 +49,7 @@ func (f trinoFleet) enablementCheck(store interface {
 	}
 	owners := make(map[string]bool, len(f))
 	for _, wire := range f {
-		if wire.Cell.PublicID == "" {
+		if wire.Cell.PublicID == "" && f.defaultCellID() == "" {
 			return nil
 		}
 		owners[wire.Cell.ID] = true
@@ -57,6 +60,9 @@ func (f trinoFleet) enablementCheck(store interface {
 			return err
 		}
 		if row == nil || row.TrinoCellID == "" {
+			if f.defaultCellID() != "" {
+				return nil
+			}
 			return provisioning.ErrTrinoCellSelectionRequired
 		}
 		if !owners[row.TrinoCellID] {
