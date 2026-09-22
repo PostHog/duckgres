@@ -3,12 +3,14 @@
 package configstore_test
 
 import (
+	"errors"
 	"reflect"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
+	"gorm.io/gorm"
 )
 
 // seedTrinoOrg creates the org + its `root` user, the two rows every
@@ -72,9 +74,8 @@ func TestEnableTrinoIsIdempotentAndPreservesReconcileState(t *testing.T) {
 		t.Fatalf("UpdateTrinoState: %v", err)
 	}
 
-	// ...and a re-enable (tier change) must NOT clobber it. This is the
-	// whole reason the upsert names only enabled/tier/updated_at.
-	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "growth"}); err != nil {
+	// A tier or default-cell change must preserve the reconciled ownership.
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "growth", DefaultCellID: "registered:default-pool"}); err != nil {
 		t.Fatalf("EnableTrino (re-enable): %v", err)
 	}
 	row = trinoRow(t, store, "acme")
@@ -168,11 +169,8 @@ func TestUpdateTrinoStateTruncatesLongStatusMessage(t *testing.T) {
 func TestDisableTrinoPreservesTheCellAndClearsFailure(t *testing.T) {
 	store := newIsolatedConfigStore(t)
 	seedTrinoOrg(t, store, "acme")
-	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "scale"}); err != nil {
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{Tier: "scale", DefaultCellID: "registered:pool-a"}); err != nil {
 		t.Fatalf("EnableTrino: %v", err)
-	}
-	if err := store.AssignTrinoCell("acme", "cell-001"); err != nil {
-		t.Fatalf("AssignTrinoCell: %v", err)
 	}
 	failedAt := time.Now().UTC()
 	if err := store.UpdateTrinoState("acme", configstore.TrinoStateUpdate{
@@ -201,8 +199,14 @@ func TestDisableTrinoPreservesTheCellAndClearsFailure(t *testing.T) {
 	}
 	// The cell that owns the org is the one that still has to drop its
 	// catalog and Secret key, so the stamp must survive.
-	if row.TrinoCellID != "cell-001" {
-		t.Errorf("trino_cell_id = %q, want cell-001 to survive a disable", row.TrinoCellID)
+	if row.TrinoCellID != "registered:pool-a" {
+		t.Errorf("trino_cell_id = %q, want registered:pool-a to survive a disable", row.TrinoCellID)
+	}
+	if err := store.EnableTrino("acme", configstore.TrinoSettings{DefaultCellID: "registered:pool-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if row := trinoRow(t, store, "acme"); !row.Enabled || row.TrinoCellID != "registered:pool-a" {
+		t.Fatalf("changed default moved existing tenant: %+v", row)
 	}
 }
 
@@ -222,12 +226,16 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 	seedOrg(t, store, "rootless")
 
 	for _, org := range []string{"acme", "beta", "rootless"} {
-		if err := store.EnableTrino(org, configstore.TrinoSettings{Tier: "free"}); err != nil {
+		settings := configstore.TrinoSettings{Tier: "free"}
+		if org == "acme" {
+			settings.DefaultCellID = "registered:pool-a"
+		}
+		if err := store.EnableTrino(org, settings); err != nil {
 			t.Fatalf("EnableTrino(%s): %v", org, err)
 		}
 	}
-	if err := store.AssignTrinoCell("acme", "cell-001"); err != nil {
-		t.Fatalf("AssignTrinoCell: %v", err)
+	if claimed, err := store.ClaimTrinoCell("acme", "legacy-cell"); err != nil || claimed {
+		t.Fatalf("legacy claimed default-placed tenant: claimed=%v err=%v", claimed, err)
 	}
 	// beta stays unassigned — the listing must still return it so a cell
 	// can claim it. Filtering by cell in SQL would make a freshly enabled
@@ -244,8 +252,8 @@ func TestListTrinoEnabledOrgsJoinsRootUserAndCarriesCell(t *testing.T) {
 	if got[0].OrgID != "acme" || got[1].OrgID != "beta" {
 		t.Fatalf("expected [acme beta] in order, got %+v", got)
 	}
-	if got[0].CellID != "cell-001" {
-		t.Errorf("acme CellID = %q, want cell-001", got[0].CellID)
+	if got[0].CellID != "registered:pool-a" {
+		t.Errorf("acme CellID = %q, want registered:pool-a", got[0].CellID)
 	}
 	if got[1].CellID != "" {
 		t.Errorf("beta CellID = %q, want empty (unassigned)", got[1].CellID)
@@ -470,5 +478,30 @@ func TestListTrinoEnabledOrgsCarriesProjectScopes(t *testing.T) {
 	}
 	if !slices.Contains(scoped.Scope.AllowedSchemas, "posthog_7") {
 		t.Errorf("AllowedSchemas = %v, must contain the team's schema", scoped.Scope.AllowedSchemas)
+	}
+}
+
+func TestTrinoDefaultCellRollsBackWithProvisionTransactionPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "tenant")
+	abort := errors.New("later provisioning step failed")
+	err := store.DB().Transaction(func(tx *gorm.DB) error {
+		if err := configstore.EnableTrinoInTransaction(tx, "tenant", configstore.TrinoSettings{DefaultCellID: "registered:pool-a"}); err != nil {
+			return err
+		}
+		return abort
+	})
+	if !errors.Is(err, abort) {
+		t.Fatal(err)
+	}
+	row, err := store.GetManagedWarehouseTrino("tenant")
+	if err != nil || row != nil {
+		t.Fatalf("failed transaction leaked enabled tenant/placement: row=%+v err=%v", row, err)
+	}
+	if err := store.EnableTrino("tenant", configstore.TrinoSettings{DefaultCellID: "registered:pool-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if row := trinoRow(t, store, "tenant"); row.TrinoCellID != "registered:pool-b" {
+		t.Fatalf("retry retained rolled-back placement: %+v", row)
 	}
 }

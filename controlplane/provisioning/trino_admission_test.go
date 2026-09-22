@@ -29,7 +29,7 @@ func TestTrinoAdmissionGuardsBothEnableSurfaces(t *testing.T) {
 					return ErrTrinoCellSelectionRequired
 				}
 				return nil
-			}, WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }))
+			}, WithTrinoBackendValidator(func(configstore.TrinoBackend) error { return nil }), WithTrinoDefaultCell("registered:pool-test"))
 			body := `{"enabled":true,"tier":"free"}`
 			if endpoint == "provision" {
 				body = `{"database_name":"tenant","team_id":1,"metadata_store":{"type":"cnpg-shard"},"ducklake":{"enabled":true},"trino":{"enabled":true}}`
@@ -44,6 +44,15 @@ func TestTrinoAdmissionGuardsBothEnableSurfaces(t *testing.T) {
 			}
 			if rec.Code != want || calls != 1 {
 				t.Fatalf("%s allowed=%v status=%d calls=%d body=%s", endpoint, allowed, rec.Code, calls, rec.Body.String())
+			}
+			if allowed {
+				settings := store.lastTrinoSettings
+				if endpoint == "provision" {
+					settings = *store.lastProvision.Trino
+				}
+				if settings.DefaultCellID != "registered:pool-test" {
+					t.Fatal("deployment placement missing from transaction")
+				}
 			}
 			if !allowed && (store.trino["tenant"] != nil || store.lastProvision != nil) {
 				t.Fatal("admission rejection mutated warehouse")

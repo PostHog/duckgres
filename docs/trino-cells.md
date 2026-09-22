@@ -85,8 +85,8 @@ reserved storage prefix `registered:`, so logical `cell-001` stores
 Use the authenticated operator console to select a cell **before first enabling
 Trino**, or use its admin-only `PUT /api/v1/orgs/<org>/trino/cell` endpoint with
 `{"cell":"cell-001"}`. Selection itself does not enable Trino. Unselected new
-warehouses retain the existing default: legacy claims them when enabled.
-In registry-only mode there is no default placement: both enablement endpoints
+warehouses retain the existing default when `DUCKGRES_TRINO_DEFAULT_CELL` is unset:
+legacy claims them when enabled. In registry-only mode with no configured default, both enablement endpoints
 reject an unassigned warehouse with "select an initial Trino cell before
 enabling Trino". Provision without Trino, select the initial cell, then enable.
 Already-enabled unassigned rows remain unprovisioned; disable them before
@@ -94,9 +94,29 @@ initial selection. Unknown stored ownership fails closed without mutation.
 Assignments survive disable/re-enable. Already owned warehouses cannot change
 cells through this endpoint, even when disabled.
 
+### Automatic placement runbook
+
+Set `DUCKGRES_TRINO_DEFAULT_CELL` (default unset) to a registered shared-pool ID.
+The pool must have `tenant_admission=true`, with the pool, operator, and catalog
+writer enabled. Invalid configuration fails startup; fix or revert it and restart.
+
+Both provision and standalone Trino enablement assign this default atomically,
+only when the org has no owner. Existing assignments always win, including across
+retries and disable/re-enable. An unavailable pool stays pending without fallback.
+
+For local or deployment acceptance, restart with the configuration and provision a
+fresh synthetic org; verify `/api/v1/orgs/<org>/trino` reports the expected `cell.id`,
+then test an authenticated query. The mw-dev harness supports this placement check
+with `E2E_TRINO_DEFAULT_CELL=<id>` and `E2E_TRINO_DEFAULT_CELL_ORG=<fresh-org>`;
+it retains the test warehouse because Hoglake retirement is unsupported.
+Fully roll out the backend before setting the default, and finish the configuration
+rollout before acceptance: pods with old configuration can still assign legacy.
+Changing or reverting the default never migrates existing assignments.
+
 Operational API calls require `?cell=<logical-id>` when no legacy cell exists.
 The Trino pages provide an explicit cell selector; they never select an arbitrary
-registered cell. The legacy default remains unchanged when legacy is configured.
+registered cell. The legacy console selection remains unchanged when legacy is configured;
+this is separate from the warehouse placement default.
 
 `client_url` is the opaque client endpoint, not a cell-selection instruction to
 customers. This PR does not implement authenticated Gateway assignment lookup.

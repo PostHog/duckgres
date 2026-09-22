@@ -123,7 +123,7 @@ const (
 func trinoProvisionerEnabled() bool {
 	mode := strings.TrimSpace(os.Getenv(envTrinoRegistryOnly))
 	registryOnly, err := strconv.ParseBool(mode)
-	return strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" || strings.TrimSpace(os.Getenv(envTrinoCellsFile)) != "" || registryOnly || (mode != "" && err != nil)
+	return strings.TrimSpace(os.Getenv(envTrinoDefaultCell)) != "" || strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" || strings.TrimSpace(os.Getenv(envTrinoCellsFile)) != "" || registryOnly || (mode != "" && err != nil)
 }
 
 // trinoCell separates durable ownership from the operator-visible identity.

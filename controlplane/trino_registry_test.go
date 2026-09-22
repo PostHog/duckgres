@@ -18,7 +18,7 @@ func TestTrinoRegistryRuntimePreservesLegacyAndSkipsStoppedBackend(t *testing.T)
 	t.Setenv(envTrinoCoordinatorURL, "https://legacy.example.test")
 	t.Setenv(envTrinoCellID, "cell-001")
 	t.Setenv(envTrinoNamespace, "trino-legacy")
-	cells, err := resolveTrinoCells()
+	cells, _, err := resolveTrinoCells()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestTrinoRegistryRuntimePreservesLegacyAndSkipsStoppedBackend(t *testing.T)
 		t.Fatal("runtime discarded blue or stopped green")
 	}
 	t.Setenv(envTrinoCoordinatorURL, "")
-	if _, err := resolveTrinoCells(); err == nil {
+	if _, _, err := resolveTrinoCells(); err == nil {
 		t.Fatal("registry silently removed legacy")
 	}
 }
@@ -63,7 +63,7 @@ func TestTrinoRegistryOnlyRequiresExplicitValidConfiguration(t *testing.T) {
 			if !trinoProvisionerEnabled() {
 				t.Fatal("explicit or invalid Trino configuration must reach startup validation")
 			}
-			cells, err := resolveTrinoCells()
+			cells, _, err := resolveTrinoCells()
 			if (err == nil) != tc.valid {
 				t.Fatalf("valid=%v error=%v", tc.valid, err)
 			}
@@ -161,7 +161,7 @@ func TestTrinoRegistryRuntimeRejectsLegacyCollisions(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(tc.key, tc.value)
-			if _, err := resolveTrinoCells(); err == nil {
+			if _, _, err := resolveTrinoCells(); err == nil {
 				t.Fatal("unsafe registry accepted")
 			}
 		})

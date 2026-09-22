@@ -977,6 +977,25 @@ compute_usage_pull_api() { # org password
 #     specific Gateway response; end one specific container mid-flight). They are
 #     covered by controlplane/trino_pool_member_retries_test.go and stay
 #     UNVERIFIED against a live Gateway.
+# Opt-in deployment acceptance: provision a dedicated fresh org with no cell
+# selection, then verify the placement exposed by the control plane. Keep the
+# warehouse: Hoglake lifecycle protection currently forbids automatic retirement.
+trino_default_cell_placement() {
+  [ -n "${E2E_TRINO_DEFAULT_CELL:-}" ] || return 0
+  default_org="${E2E_TRINO_DEFAULT_CELL_ORG:?default-cell acceptance requires a fresh dedicated org}"
+  default_body="$(jq -nc --arg name "$default_org" '{database_name:$name,team_id:9001,metadata_store:{type:"cnpg-shard"},ducklake:{enabled:true},trino:{enabled:true}}')"
+  # The one-time password response is deliberately discarded, never logged.
+  curl -fsS -o /dev/null -H "$H" -H 'Content-Type: application/json' \
+    -d "$default_body" "$API/api/v1/orgs/$default_org/provision" \
+    || fail "default-cell provisioning request failed"
+  default_detail="$(curl -fsS -H "$H" "$API/api/v1/orgs/$default_org/trino")" \
+    || fail "could not read default-cell placement"
+  printf %s "$default_detail" | jq -e --arg cell "$E2E_TRINO_DEFAULT_CELL" \
+    '.enabled == true and .assigned == true and .cell.id == $cell' >/dev/null \
+    || fail "new warehouse did not receive the configured default cell"
+  log "default-cell placement OK: warehouse enablement includes the configured assignment"
+}
+
 trino_shared_pool_disabled() {
   log "shared Trino pool: asserting the feature is inert"
 
@@ -5024,6 +5043,8 @@ engine_main() {
 
   # ---- compute-usage billing pull API (meter → buffer → GET → ack) ----
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
+
+  trino_default_cell_placement
 
   # ---- shared Trino compute pool ----
   # Inert while disabled; the active acceptance path runs on a pool-enabled

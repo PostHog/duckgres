@@ -65,6 +65,9 @@ A PostgreSQL wire protocol compatible server backed by DuckDB. Connect with any 
 
 ## Trino API identity
 
+For automatic initial placement, configure [`DUCKGRES_TRINO_DEFAULT_CELL`
+(default unset)](docs/trino-cells.md#automatic-placement-runbook).
+
 The optional [rollout readiness endpoint](docs/runbooks/trino-rollout-readiness.md)
 observes registered backend pods, coordinator identity, workers, and a dedicated
 warehouse canary. It is disabled by default and does not provision or move tenants.

@@ -25,13 +25,14 @@ const envTrinoRegistryOnly = "DUCKGRES_TRINO_REGISTRY_ONLY"
 const registeredTrinoCellPrefix = "registered:"
 
 // resolveTrinoCells preserves legacy unless registry-only mode explicitly excludes it.
-func resolveTrinoCells() ([]trinoCell, error) {
+// The second result is the validated stored ID for initial default placement.
+func resolveTrinoCells() ([]trinoCell, string, error) {
 	registryOnly := false
 	if value := strings.TrimSpace(os.Getenv(envTrinoRegistryOnly)); value != "" {
 		var err error
 		registryOnly, err = strconv.ParseBool(value)
 		if err != nil {
-			return nil, fmt.Errorf("%s must be a boolean", envTrinoRegistryOnly)
+			return nil, "", fmt.Errorf("%s must be a boolean", envTrinoRegistryOnly)
 		}
 	}
 	path := strings.TrimSpace(os.Getenv(envTrinoCellsFile))
@@ -39,32 +40,33 @@ func resolveTrinoCells() ([]trinoCell, error) {
 	var cells []trinoCell
 	if registryOnly {
 		if path == "" {
-			return nil, fmt.Errorf("%s requires %s", envTrinoRegistryOnly, envTrinoCellsFile)
+			return nil, "", fmt.Errorf("%s requires %s", envTrinoRegistryOnly, envTrinoCellsFile)
 		}
 		if strings.TrimSpace(os.Getenv(envTrinoCoordinatorURL)) != "" {
-			return nil, fmt.Errorf("%s cannot be combined with %s", envTrinoRegistryOnly, envTrinoCoordinatorURL)
+			return nil, "", fmt.Errorf("%s cannot be combined with %s", envTrinoRegistryOnly, envTrinoCoordinatorURL)
 		}
 	} else {
 		var err error
 		legacy, err = resolveTrinoCell()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if strings.HasPrefix(legacy.ID, registeredTrinoCellPrefix) {
-			return nil, errors.New("legacy Trino cell ID uses the reserved registered prefix")
+			return nil, "", errors.New("legacy Trino cell ID uses the reserved registered prefix")
 		}
 		cells = append(cells, legacy)
 	}
 	if path == "" {
-		return cells, nil
+		defaultCell, err := resolveTrinoDefaultCell(nil)
+		return cells, defaultCell, err
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read Trino registry: %w", err)
+		return nil, "", fmt.Errorf("read Trino registry: %w", err)
 	}
 	registered, err := parseTrinoCellRegistry(data)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	legacyNS := legacy.Namespace
 	if legacyNS == "" {
@@ -74,18 +76,18 @@ func resolveTrinoCells() ([]trinoCell, error) {
 	if !registryOnly {
 		legacyEndpoint, err = trinoEndpointKey(legacy.CoordinatorURL)
 		if err != nil {
-			return nil, fmt.Errorf("legacy coordinator URL: %w", err)
+			return nil, "", fmt.Errorf("legacy coordinator URL: %w", err)
 		}
 	}
 	for _, entry := range registered {
 		if !registryOnly && entry.Namespace == legacyNS {
-			return nil, errors.New("registered cell must not share the legacy namespace")
+			return nil, "", errors.New("registered cell must not share the legacy namespace")
 		}
 		cell := trinoCell{Mode: strings.TrimSpace(entry.Mode), ID: registeredTrinoCellPrefix + entry.ID, PublicID: entry.ID, RoutingGroup: entry.RoutingGroup, Namespace: entry.Namespace, ClientURL: entry.ClientURL, Backends: entry.Backends, CatalogManagement: entry.CatalogManagement}
 		for _, backend := range entry.Backends {
 			endpoint, _ := trinoEndpointKey(backend.CoordinatorURL)
 			if !registryOnly && endpoint == legacyEndpoint {
-				return nil, errors.New("registered cell must not share a legacy coordinator")
+				return nil, "", errors.New("registered cell must not share a legacy coordinator")
 			}
 			if backend.RoutingActive {
 				cell.CoordinatorURL, cell.TLSServerName = backend.CoordinatorURL, backend.TLSServerName
@@ -93,7 +95,8 @@ func resolveTrinoCells() ([]trinoCell, error) {
 		}
 		cells = append(cells, cell)
 	}
-	return cells, nil
+	defaultCell, err := resolveTrinoDefaultCell(registered)
+	return cells, defaultCell, err
 }
 
 type trinoRegisteredCell struct {

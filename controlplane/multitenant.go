@@ -527,6 +527,7 @@ func SetupMultiTenant(
 
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	var trinoCells trinoFleet
+	var trinoDefaultCell string
 	var rolloutReadiness *trinoRolloutReadinessHandler
 	var rolloutProvisioning *trinoRolloutProvisioningHandler
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
@@ -561,7 +562,7 @@ func SetupMultiTenant(
 			// Same Duckling CR read the worker activation path uses; nil
 			// when the Duckling client couldn't be built, which
 			// buildTrinoWiring rejects rather than half-wiring.
-			trinoWire, twErr := buildTrinoFleetWiring(store, kc, resolveDucklingStatus, resolveHoglakeStorageStatus)
+			trinoWire, defaultCell, twErr := buildTrinoFleetWiring(store, kc, resolveDucklingStatus, resolveHoglakeStorageStatus)
 			if twErr != nil {
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner wiring failed: %w", twErr)
 			}
@@ -581,6 +582,7 @@ func SetupMultiTenant(
 			}
 			provCtrl.WithTrinoReconciler(trinoWire)
 			trinoCells = trinoWire
+			trinoDefaultCell = defaultCell
 			for _, wire := range trinoWire {
 				slog.Info("Trino provisioner enabled.", "cell", wire.Cell.consoleCell().ID, "coordinator", wire.Cell.CoordinatorURL)
 			}
@@ -779,8 +781,8 @@ func SetupMultiTenant(
 	if len(cfg.ManagedHostnameSuffixes) > 0 {
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
-	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store),
-		provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability))
+	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store, trinoDefaultCell),
+		provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability), provisioning.WithTrinoDefaultCell(trinoDefaultCell))
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

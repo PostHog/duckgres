@@ -191,6 +191,7 @@ func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
 type handler struct {
 	store                 Store
 	trinoAdmission        func(string) error
+	trinoDefaultCell      string
 	trinoBackendValidator func(configstore.TrinoBackend) error
 	// bucketSuffix is the env suffix (e.g. "mw-prod-us") used to compute the
 	// CP-owned s3bucket name; empty disables CP naming. See
@@ -511,7 +512,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		if !h.admitTrino(c, orgID) {
 			return
 		}
-		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier, Backend: req.Trino.Backend}
+		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier, Backend: req.Trino.Backend, DefaultCellID: h.trinoDefaultCell}
 	}
 
 	// One transaction wraps warehouse + root user + optional Trino opt-in.
@@ -664,7 +665,7 @@ func (h *handler) enableTrino(c *gin.Context) {
 	if !h.admitTrino(c, orgID) {
 		return
 	}
-	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend}); err != nil {
+	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend, DefaultCellID: h.trinoDefaultCell}); err != nil {
 		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) || errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
