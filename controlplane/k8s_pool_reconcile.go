@@ -411,3 +411,22 @@ func (p *K8sWorkerPool) onPodTerminated(pod *corev1.Pod) {
 		close(w.done)
 	}
 }
+
+// workerPodGone reports whether the named worker pod no longer exists in the
+// worker namespace (NotFound) or has reached a terminal phase. It backs the
+// leader janitor's orphaned-draining sweep (ControlPlaneJanitor.workerPodGone).
+// Any other API error is returned so the caller leaves the row alone rather
+// than retiring a worker it could not verify.
+func (p *K8sWorkerPool) workerPodGone(ctx context.Context, podName string) (bool, error) {
+	if p == nil || p.clientset == nil {
+		return false, fmt.Errorf("no kubernetes clientset")
+	}
+	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed, nil
+}

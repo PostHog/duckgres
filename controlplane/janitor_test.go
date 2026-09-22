@@ -27,6 +27,11 @@ type captureControlPlaneExpiryStore struct {
 	// orgHotIdle fixtures the cap sweep's per-org listing (oldest-first, as
 	// the store guarantees).
 	orgHotIdle map[string][]configstore.WorkerRecord
+	// staleByState fixtures the orphaned-draining sweep's listing; rows are
+	// filtered by state + updated_at like the real query.
+	staleByState        []configstore.WorkerRecord
+	staleByStateErr     error
+	staleByStateCutoffs []time.Time
 }
 
 func (s *captureControlPlaneExpiryStore) ExpireControlPlaneInstances(cutoff time.Time) (int64, error) {
@@ -110,6 +115,27 @@ func (s *captureControlPlaneExpiryStore) ListOrgHotIdleSnapshots(orgID string) (
 	snaps := make([]configstore.WorkerSnapshot, len(records))
 	for i, r := range records {
 		snaps[i] = configstore.NewWorkerSnapshot(r)
+	}
+	return snaps, nil
+}
+
+// ListWorkerRecordSnapshotsByStatesBefore serves the staleByState fixture
+// for the orphaned-draining sweep and records the cutoff it was asked for.
+func (s *captureControlPlaneExpiryStore) ListWorkerRecordSnapshotsByStatesBefore(states []configstore.WorkerState, updatedBefore time.Time) ([]configstore.WorkerSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.staleByStateCutoffs = append(s.staleByStateCutoffs, updatedBefore)
+	if s.staleByStateErr != nil {
+		return nil, s.staleByStateErr
+	}
+	var snaps []configstore.WorkerSnapshot
+	for _, r := range s.staleByState {
+		for _, st := range states {
+			if r.State == st && !r.UpdatedAt.After(updatedBefore) {
+				snaps = append(snaps, configstore.NewWorkerSnapshot(r))
+				break
+			}
+		}
 	}
 	return snaps, nil
 }

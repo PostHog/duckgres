@@ -577,6 +577,30 @@ release lets shutdown kill live work); `reapIdle` releases tokens stranded by a
 `GetFlightInfo` whose `DoGet` never arrived. `terminationGracePeriodSeconds=3600`
 (`k8s_pool.go`) must stay above `workerShutdownDrainTime` (55m).
 
+**An adopted worker gets NO informer event on its owning CP.** Each CP's pod
+informer (`startInformer`, `k8s_pool_reconcile.go`) is label-scoped to pods
+THAT CP spawned (`duckgres/control-plane=<POD_NAME>`), so a worker claimed
+from another CP's hot-idle pool (`k8s_pool_acquire.go`, fresh `done`
+channel) never has `w.done` closed when its pod exits. The `HealthCheckLoop`
+draining branch therefore MUST NOT rely on the informer as its only exit:
+after `drainingPodVerifyThreshold` consecutive failed probes it `Get`s the
+pod itself and, on NotFound / terminal phase, takes the same drained-lease
+path the informer would (`handleTerminatedWorkerLease`, origin
+`health_check_drained_pod_gone`). Without this, an adopted worker that was
+SIGTERM'd (node disruption) and exited is probed every 2s tick forever —
+one zombie is ~300 failed health checks per 10m, and four of them leaked for
+three days in a production cluster and tripped the health-check-ratio alert.
+The leader janitor's `reapOrphanedDrainingWorkers` (origin
+`janitor_draining_orphan`, grace `defaultDrainingOrphanGrace`) is the
+cluster-wide backstop: a durable `draining` row past its grace whose pod is
+gone is retired via the fenced `RetireFromSnapshot` CAS, which also unsticks
+the owner's local object (its next probe sees a non-draining row and drops
+it). Both are pod-verified — a pod that still exists is left to drain, however
+many probes fail. Touching the informer selector, the draining branch, or the
+sweep → update `controlplane/k8s_pool_draining_orphan_test.go` +
+`janitor_draining_orphan_test.go` (unit-only; see `tests/mw-dev/README.md`
+for why the e2e cannot stage a cross-CP adoption + pod exit).
+
 ## PostHog Logs (OTLP) — LOAD-BEARING CONTRACT
 
 Process-level slog → PostHog Logs via OTLP (`internal/cliboot.InitLogging`).
