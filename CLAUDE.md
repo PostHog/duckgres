@@ -314,6 +314,23 @@ very margin the cap exists to reserve.
   (`session_mgr.go`) MUST await the worker-side `DestroySession` RPC *before*
   `ReleaseWorker`, so a reused (hot-idle) worker's prior session is gone before
   the next one is assigned (otherwise cap=1 spuriously rejects the reuse).
+- **A hot-idle claim refuses a pod that is already being disrupted.**
+  Karpenter honours `karpenter.sh/do-not-disrupt` only while a session is
+  assigned (#757, `k8s_pool_disruption.go`), so an idle worker can be
+  SIGTERM'd between the durable `ClaimHotIdleWorker` CAS and adoption; a
+  session created on it fails on its first RPC. `adoptClaimedWorker` therefore
+  checks the pod it just read (`claimedPodDoomReason`,
+  `k8s_pool_doomed_claim.go`): a `deletionTimestamp`, a non-Running phase, or
+  a node carrying Karpenter's `karpenter.sh/disrupted` taint → the claim is
+  retired (`retired`, reason `pod_doomed`, origin `reserve_doomed_pod` — not
+  `lost`/crash), counted on
+  `duckgres_control_plane_hot_idle_claim_skipped_total{reason}`, and the
+  acquisition re-runs its decision (next candidate or a fresh spawn) instead
+  of failing the client. A node lookup failure is "unknown", never "doomed":
+  refusing every claim during an API-server blip would turn a transient into
+  a spawn storm. The local idle-reuse path is unaffected — it already reuses
+  only `Hot` workers, and the lifecycle state machine forbids
+  `Draining → Reserved`.
 - **Cap-drift is recovered, not fatal:** if a worker still rejects a CP-scheduled
   session at its cap (CP↔worker accounting drift — should never happen),
   `SessionManager.CreateSessionWithProtocol` does NOT fail the client: it logs
@@ -375,6 +392,7 @@ Touching any of: `controlplane/org_reserved_pool.go`, `org_acquire_gate.go`,
 `duckdbservice/instance_fatal.go`, or
 `duckdbservice` session counting → update the unit tests
 (`org_reserved_pool_test.go`, `org_acquire_gate_test.go`,
+`k8s_pool_doomed_claim_test.go`,
 `duckdbservice/service_test.go`, `duckdbservice/instance_fatal_test.go`,
 `controlplane/instance_invalidated_test.go`) AND the
 `one_session_per_worker` + `cold_burst_parallel_spawns` assertions in

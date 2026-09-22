@@ -435,6 +435,13 @@ func (p *K8sWorkerPool) completeSharedWorkerReservation(ctx context.Context, cla
 			slog.Warn("Hot-idle worker claim was stale, retrying.", "worker", claim.hotClaimed.WorkerID, "worker_pod", claim.hotClaimed.PodName, "org", claim.hotClaimed.OrgID, "error", reserveErr)
 			return nil, true, reserveErr
 		}
+		if stderrors.Is(reserveErr, errDoomedHotIdleClaim) {
+			// Not a crash: the pod is being evicted under it. Retire the
+			// claim (terminal `retired`, not `lost`) so the record cannot be
+			// claimed again by the next caller, then re-run the decision.
+			p.retireClaimedWorker(claim.hotClaimed, RetireReasonPodDoomed, LifecycleOriginReserveDoomedPod)
+			return nil, true, reserveErr
+		}
 		slog.Warn("Hot-idle worker could not be reserved, retiring.", "worker", claim.hotClaimed.WorkerID, "worker_pod", claim.hotClaimed.PodName, "org", claim.hotClaimed.OrgID, "error", reserveErr)
 		p.retireClaimedWorker(claim.hotClaimed, RetireReasonCrash, LifecycleOriginReserveFailure)
 		// Pre-split ReserveSharedWorker fell through to a fresh spawn here; the
@@ -567,6 +574,18 @@ func (p *K8sWorkerPool) adoptClaimedWorker(ctx context.Context, claimed *configs
 	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(ctx, claimed.PodName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get claimed worker pod %s: %w", claimed.PodName, err)
+	}
+	// Refuse a pod that is already being disrupted (terminating, not
+	// running, or on a Karpenter-tainted node). Karpenter only honours the
+	// do-not-disrupt annotation while a session is assigned, so an idle
+	// worker can be SIGTERM'd between the durable claim and this adoption;
+	// a session created on it would fail on its first RPC. The caller
+	// retires the claim and retries (next candidate or fresh spawn).
+	if reason := p.claimedPodDoomReason(ctx, pod); reason != "" {
+		observeHotIdleClaimSkipped(reason, claimed.Image)
+		p.logw(claimed.WorkerID).Info("Refusing hot-idle worker claim: pod is being disrupted.",
+			"worker_pod", claimed.PodName, "org", claimed.OrgID, "reason", reason, "node", pod.Spec.NodeName)
+		return nil, fmt.Errorf("claimed worker pod %s: %s: %w", claimed.PodName, reason, errDoomedHotIdleClaim)
 	}
 
 	// For hot-idle workers, skip the epoch-validated health check. The worker's
