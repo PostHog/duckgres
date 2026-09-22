@@ -199,6 +199,56 @@ func TestK8sPoolHealthCheckLoopDrainingVerifyIsNoopWithoutClientset(t *testing.T
 	}
 }
 
+// A locally-draining worker whose durable row is draining under ANOTHER
+// owner (it was claimed by a sibling CP after this CP's local object went
+// stale) must not be waited on forever either: the durable check fails, the
+// failure falls through to the ordinary mark-lost path, and after
+// maxConsecutiveHealthFailures the lease is recognised as stale and the local
+// object dropped — no retire-draining CAS, no crash notification, and the
+// other owner's row untouched.
+func TestK8sPoolHealthCheckLoopDropsLocallyDrainingWorkerWhoseRowBelongsToAnotherCP(t *testing.T) {
+	pool, _, store, worker, checks := newDrainingOrphanFixture(t)
+	store.mu.Lock()
+	store.preloadedRecords[worker.ID].OwnerCPInstanceID = "some-other-cp:boot-xyz"
+	store.preloadedRecords[worker.ID].OwnerEpoch = 7
+	store.mu.Unlock()
+
+	crashed := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pool.HealthCheckLoop(ctx, 2*time.Millisecond, func(workerID int) {
+		crashed <- workerID
+	}, nil)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		pool.mu.RLock()
+		_, stillPresent := pool.workers[worker.ID]
+		pool.mu.RUnlock()
+		if !stillPresent {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("stale draining worker must be dropped after %d failures, still present after %d checks", maxConsecutiveHealthFailures, checks.Load())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
+	select {
+	case workerID := <-crashed:
+		t.Fatalf("stale lease drop must not notify sessions as crashed, got worker %d", workerID)
+	default:
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.retireDrainingCalls != 0 {
+		t.Fatalf("another CP's draining row must not be retired by a stale holder, got %d retire-draining CAS", store.retireDrainingCalls)
+	}
+	if rec := store.preloadedRecords[worker.ID]; rec.State != configstore.WorkerStateDraining || rec.OwnerCPInstanceID != "some-other-cp:boot-xyz" || rec.OwnerEpoch != 7 {
+		t.Fatalf("other owner's row must be untouched, got %+v", *rec)
+	}
+}
+
 // The pool-side helper the janitor sweep is wired to: NotFound and terminal
 // phases are "gone"; a running pod is not; a missing clientset is an error
 // (never a silent "gone").

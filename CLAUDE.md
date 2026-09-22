@@ -596,7 +596,15 @@ cluster-wide backstop: a durable `draining` row past its grace whose pod is
 gone is retired via the fenced `RetireFromSnapshot` CAS, which also unsticks
 the owner's local object (its next probe sees a non-draining row and drops
 it). Both are pod-verified — a pod that still exists is left to drain, however
-many probes fail. Touching the informer selector, the draining branch, or the
+many probes fail. A local object whose durable row is draining under ANOTHER
+owner is not waited on: the durable check fails and the ordinary 3-failure
+mark-lost path drops it as a stale lease. Expect a steady trickle of
+`duckgres_worker_lifecycle_transitions_total{operation="drain",origin="worker_drain",outcome="fence_miss_lease"}`:
+a SIGTERM'd worker reports `draining` to EVERY CP still holding a local object
+for it (previous owners keep theirs after a sibling claims the worker from
+hot-idle), and only the current owner's lease can land the CAS — the misses
+are the fence working, not the owner's drain failing. Touching the informer
+selector, the draining branch, or the
 sweep → update `controlplane/k8s_pool_draining_orphan_test.go` +
 `janitor_draining_orphan_test.go` (unit-only; see `tests/mw-dev/README.md`
 for why the e2e cannot stage a cross-CP adoption + pod exit).
