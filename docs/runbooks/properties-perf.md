@@ -1,10 +1,11 @@
 # Properties in frozen performance scenarios
 
 `posthog_frozen_perf` first runs the existing frozen corpus on all five targets.
-An optional properties comparison follows in the same scenario and isolated
-stack. Leave `DUCKGRES_SCENARIO_PROPERTIES_S3_URI` empty (the default) to run only
-the original suite. No properties S3/Glue access or preparation occurs in that
-case. No completion manifest or new repository secret is required.
+The properties comparison follows in the same scenario and isolated stack.
+When `DUCKGRES_SCENARIO_PROPERTIES_S3_URI` is empty, the runner uses the S3
+location of the existing `properties_events_supported` Athena table. An explicit
+value overrides discovery and must match that table. Missing configuration fails
+the properties phase; original benchmark artifacts remain available.
 
 ## Select the fixture
 
@@ -20,7 +21,7 @@ fixture-derived statistics in private generation notes, outside this repository.
 ## Prepare and run
 
 ```sh
-# Original benchmarks only:
+# Original and properties benchmarks using the configured fixture:
 just scenario-frozen-perf
 
 # After the replacement single-day fixture has been generated:
@@ -29,8 +30,8 @@ just scenario-frozen-perf
 ```
 
 For GitHub Actions, dispatch `scenario-dev` with
-`scenario=posthog_frozen_perf`. Supply `properties_s3_uri` only once the fixture
-is ready. The workflow masks this input and uses its existing AWS role.
+`scenario=posthog_frozen_perf`. Leave `properties_s3_uri` blank to use the configured fixture, or supply an
+explicit override. The workflow masks this input and uses its existing AWS role.
 
 The properties step discovers the object inventory and prepares private SQL and
 catalog files in a temporary directory, removed when the step returns. Discovery

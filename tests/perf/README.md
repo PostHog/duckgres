@@ -280,14 +280,15 @@ external-read/hit counters to distinguish storage traffic from cached reads.
 ## Published properties workload
 
 The frozen-perf scenario runs its existing catalog and frozen dataset first,
-unchanged. An optional `properties_comparison` step then compares browser
-properties on a separate generated single-day fixture. Set
-`DUCKGRES_SCENARIO_PROPERTIES_S3_URI` (workflow input `properties_s3_uri`) to its
-immutable Parquet directory. The default is empty: no properties preparation or
-queries run. No completion manifest or new repository secret is required.
+unchanged. A `properties_comparison` step then compares browser properties on
+its generated single-day fixture. By default, it reads the S3 location of the
+existing `properties_events_supported` Athena table. Scheduled runs therefore
+include properties without a workflow input. Override the location with
+`DUCKGRES_SCENARIO_PROPERTIES_S3_URI` (workflow input `properties_s3_uri`); the
+selected prefix must still match that table. A missing default fails the phase
+instead of silently omitting measurements. No new repository secret is required.
 
-Choose a modest full day and generate matching JSON/VARIANT/STRUCT files before
-enabling this phase. The large previously generated fixture is not a default.
+Generate matching files for a modest full day before changing the table location.
 Queries cover the entire selected prefix, with one warmup and four measured
 iterations. Merely filtering a large mixed-day file set does not guarantee small
 scans. The runner does not generate data or enforce a row-count limit.

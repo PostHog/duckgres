@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -19,19 +20,16 @@ import (
 
 const stepTypePropertiesComparison = "properties_comparison"
 
-// This optional phase runs only after the original benchmarks have written their
+// This phase runs only after the original benchmarks have written their
 // artifacts. Fixture preparation errors cannot prevent those results publishing.
 func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core.Step) error {
 	source := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI")
-	if source == "" {
-		fmt.Println("Properties comparison omitted: no generated single-day fixture selected.")
-		return nil
-	}
 	prepared, err := preparePropertiesComparison(ctx, source, step)
 	if err != nil {
-		return fmt.Errorf("prepare optional properties comparison: %w", err)
+		return fmt.Errorf("prepare properties comparison: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(prepared.directory) }()
+	source = prepared.dataset.Prefix
 	orgID := step.With["org_id"]
 	if err := e.sql.ExecuteStep(ctx, core.Step{ID: step.ID + "_setup", Type: scenariosql.StepTypeSQL, With: map[string]any{
 		"org_id": orgID, "catalog": "ducklake", "file": filepath.Join(prepared.directory, "setup.sql"),
@@ -68,16 +66,26 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 	if err != nil {
 		return nil, err
 	}
-	dataset, err := properties.Discover(ctx, s3.NewFromConfig(cfg), source)
-	if err != nil {
-		return nil, err
-	}
 	if region, _ := step.With["athena_region"].(string); region != "" {
 		cfg.Region = region
 	}
 	client := glue.NewFromConfig(cfg)
 	database, _ := step.With["athena_database"].(string)
 	const table = "properties_events_supported"
+	if source == "" {
+		out, err := client.GetTable(ctx, &glue.GetTableInput{DatabaseName: aws.String(database), Name: aws.String(table)})
+		if err != nil {
+			return nil, fmt.Errorf("discover default properties fixture from Athena table: %w", err)
+		}
+		if out.Table == nil || out.Table.StorageDescriptor == nil || aws.ToString(out.Table.StorageDescriptor.Location) == "" {
+			return nil, fmt.Errorf("Athena properties table has no default fixture location")
+		}
+		source = aws.ToString(out.Table.StorageDescriptor.Location)
+	}
+	dataset, err := properties.Discover(ctx, s3.NewFromConfig(cfg), source)
+	if err != nil {
+		return nil, err
+	}
 	if err := dataset.VerifyAthenaTable(ctx, client, database, table); err != nil {
 		return nil, fmt.Errorf("selected fixture must match the preprovisioned Athena properties table; update its mapping when generating the replacement fixture: %w", err)
 	}
@@ -95,6 +103,6 @@ func preparePropertiesComparison(ctx context.Context, source string, step core.S
 			return nil, err
 		}
 	}
-	fmt.Printf("Selected %d generated properties Parquet objects for the optional comparison.\n", len(dataset.Files))
+	fmt.Printf("Selected %d generated properties Parquet objects for the properties comparison.\n", len(dataset.Files))
 	return &preparedPropertiesComparison{directory: dir, dataset: dataset}, nil
 }
