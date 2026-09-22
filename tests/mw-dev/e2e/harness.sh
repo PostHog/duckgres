@@ -1956,6 +1956,16 @@ hot_idle_retired() { # org password catalog cpu memory
 # Hot, skip busy, no session decrement) by k8s_pool_test.go
 # (TestK8sPoolReleaseIdleHotWorkers*/ParkIdleHotWorker*), and the reaper
 # destination (hot_idle -> pod delete within TTL) by hot_idle_retired above.
+#
+# NOTE — orphaned-draining worker reaping (HealthCheckLoop pod verification +
+# the leader janitor's reapOrphanedDrainingWorkers): NOT asserted in-Job. The
+# leak needs a worker spawned by one CP replica, hot-idle-adopted by another,
+# then SIGTERM'd + exited under the adopter (whose informer never sees it);
+# this Job runs one CP replica, cannot steer adoption, and has no config-store
+# access to stage a stale `draining` row. Unit-only by design — see
+# tests/mw-dev/README.md and controlplane/k8s_pool_draining_orphan_test.go +
+# janitor_draining_orphan_test.go, which drive the real loop/janitor against
+# a fake clientset with the pod absent vs present.
 
 # ---- org default worker profile --------------------------------------------
 # Operators can give a tenant a server-side default worker shape + hot-idle TTL

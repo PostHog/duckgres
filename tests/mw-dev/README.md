@@ -561,6 +561,19 @@ normal `go test ./...` lane.
   and the event stream back, which the Job cannot do for the reason above; the
   key resolution is covered by `TestAnalyticsAPIKeyPrefersDedicatedKey` in
   `internal/cliboot/analytics_test.go`.
+- **Orphaned-draining worker reaping is unit-only, deliberately.** The bug it
+  fixes needs a worker spawned by CP replica A, claimed (hot-idle adopted) by
+  replica B, then SIGTERM'd and exited while B owns it — B's pod informer is
+  label-scoped to A's spawns, so B never sees the exit and used to probe the
+  dead pod every tick forever. The e2e Job runs against a single-replica
+  control plane, has no way to force which replica adopts a parked worker,
+  and has no config-store access to stage a stale `draining` row for the
+  janitor sweep. Both halves are pinned by unit tests that drive the real
+  `HealthCheckLoop` against a fake clientset with the pod absent/present
+  (`controlplane/k8s_pool_draining_orphan_test.go`) and the real janitor
+  `runOnce` against fixture rows (`controlplane/janitor_draining_orphan_test.go`).
+  The drain path the harness DOES cover (`hot_idle_retired`, the pod-delete
+  → retire chain on the spawning CP) is unchanged by the fix.
 - **`--statement-timeout` (`DUCKGRES_STATEMENT_TIMEOUT`) is unit-only, deliberately.**
   The knob is server-global and defaults to `0` (unbounded), so asserting it
   in-Job needs one of two bad options: set a short global timeout on the e2e

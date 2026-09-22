@@ -44,15 +44,15 @@ const (
 type LifecycleOrigin string
 
 const (
-	LifecycleOriginJanitorOrphan           LifecycleOrigin = "janitor_orphan"
-	LifecycleOriginJanitorHotIdleTTL       LifecycleOrigin = "janitor_hot_idle_ttl"
-	LifecycleOriginJanitorStuckActivating  LifecycleOrigin = "janitor_stuck_activating"
+	LifecycleOriginJanitorOrphan          LifecycleOrigin = "janitor_orphan"
+	LifecycleOriginJanitorHotIdleTTL      LifecycleOrigin = "janitor_hot_idle_ttl"
+	LifecycleOriginJanitorStuckActivating LifecycleOrigin = "janitor_stuck_activating"
 	// LifecycleOriginJanitorHotIdleCap marks the janitor's hot-idle cap sweep
 	// (reapHotIdleCaps) retiring the oldest parked workers of an org past its
 	// configured max_hot_idle_* limits. Distinct from the TTL reaper: a
 	// nonzero rate here means an operator's cost ceiling is biting, not that
 	// warm capacity went stale.
-	LifecycleOriginJanitorHotIdleCap LifecycleOrigin = "janitor_hot_idle_cap"
+	LifecycleOriginJanitorHotIdleCap       LifecycleOrigin = "janitor_hot_idle_cap"
 	LifecycleOriginMismatchedVersionReaper LifecycleOrigin = "mismatched_version_reaper"
 	LifecycleOriginShutdownAll             LifecycleOrigin = "shutdown_all"
 	// LifecycleOriginDrainReleaseIdle marks the hot -> hot_idle park performed
@@ -60,12 +60,12 @@ const (
 	// Hot workers are released so the unfenced hot-idle TTL reaper reclaims them
 	// during the drain wait instead of pinning vCPU until the CP is declared
 	// expired. A nonzero rate here during a rollout is the leak fix working.
-	LifecycleOriginDrainReleaseIdle LifecycleOrigin = "drain_release_idle"
-	LifecycleOriginHealthCheckCrash        LifecycleOrigin = "health_check_crash"
-	LifecycleOriginWorkerDrain             LifecycleOrigin = "worker_drain"
-	LifecycleOriginSpawnFailure            LifecycleOrigin = "spawn_failure"
-	LifecycleOriginReserveImageMismatch    LifecycleOrigin = "reserve_image_mismatch"
-	LifecycleOriginCredRefresh             LifecycleOrigin = "cred_refresh"
+	LifecycleOriginDrainReleaseIdle     LifecycleOrigin = "drain_release_idle"
+	LifecycleOriginHealthCheckCrash     LifecycleOrigin = "health_check_crash"
+	LifecycleOriginWorkerDrain          LifecycleOrigin = "worker_drain"
+	LifecycleOriginSpawnFailure         LifecycleOrigin = "spawn_failure"
+	LifecycleOriginReserveImageMismatch LifecycleOrigin = "reserve_image_mismatch"
+	LifecycleOriginCredRefresh          LifecycleOrigin = "cred_refresh"
 	// LifecycleOriginReserveFailure marks retire paths that fire when
 	// ReserveSharedWorker observes a claim that cannot be activated
 	// (stale-claim retries excepted) and falls back to retire-and-retry.
@@ -93,6 +93,21 @@ const (
 	// pod terminations (eviction, OOM, manual delete, node drain) from
 	// our own health-check decisions.
 	LifecycleOriginInformerCrash LifecycleOrigin = "informer_crash"
+	// LifecycleOriginHealthCheckDrainedPodGone marks HealthCheckLoop's
+	// draining branch retiring a locally-draining worker after it verified
+	// the pod itself (NotFound / terminal phase) because no informer event
+	// ever arrived — the informer only watches pods THIS CP spawned, so a
+	// worker adopted from another CP's hot-idle pool has no informer exit
+	// from Draining. Distinct from LifecycleOriginWorkerDrain (the informer
+	// path) so a nonzero rate here reads as "adopted draining workers are
+	// being cleaned up by the probe fallback".
+	LifecycleOriginHealthCheckDrainedPodGone LifecycleOrigin = "health_check_drained_pod_gone"
+	// LifecycleOriginJanitorDrainingOrphan marks the leader janitor's
+	// orphaned-draining sweep (reapOrphanedDrainingWorkers): a durable
+	// `draining` row past its grace whose pod no longer exists. It is the
+	// cluster-wide backstop for the same gap the health-check fallback
+	// closes locally (the owning CP may have restarted, or never noticed).
+	LifecycleOriginJanitorDrainingOrphan LifecycleOrigin = "janitor_draining_orphan"
 	// LifecycleOriginPerCPHotIdleTTL marks the per-CP fallback hot-idle reaper
 	// (per_cp_hot_idle_reaper.go), which runs on EVERY replica independent of the
 	// janitor leader lease. Distinct from LifecycleOriginJanitorHotIdleTTL (the

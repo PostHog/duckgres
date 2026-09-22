@@ -12,6 +12,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/posthog/duckgres/controlplane/configstore"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -360,6 +361,13 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 
 	var mu sync.Mutex
 	failures := make(map[workerLeaseSnapshot]int)
+	// drainingMisses counts consecutive failed probes of a worker this CP
+	// holds in the Draining lifecycle. It is separate from `failures`
+	// because a draining worker's health failure is EXPECTED (its pod is
+	// exiting) and must not feed the mark-lost threshold; it only decides
+	// when the loop stops trusting the informer and verifies the pod
+	// itself (see drainingPodVerifyThreshold).
+	drainingMisses := make(map[workerLeaseSnapshot]int)
 
 	for {
 		select {
@@ -399,67 +407,10 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						// LifecycleOriginHealthCheckCrash.
 						mu.Lock()
 						delete(failures, lease)
+						delete(drainingMisses, lease)
 						mu.Unlock()
 
-						removedWorker, workerCount, err := p.removeWorkerAfterDrainedLease(lease, LifecycleOriginWorkerDrain)
-						if err != nil {
-							p.logw(lease.workerID).Error("K8s worker terminated after draining but retire CAS failed; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
-							return
-						}
-						if removedWorker != nil {
-							observeControlPlaneWorkers(workerCount)
-							p.logw(lease.workerID).Info("K8s worker terminated after draining.")
-							if removedWorker.client != nil {
-								_ = removedWorker.client.Close()
-							}
-							return
-						}
-
-						lostDisposition, err := p.markWorkerLostForHealthLease(lease, LifecycleOriginInformerCrash)
-						if err != nil {
-							p.logw(lease.workerID).Error("K8s worker terminated but lease validation failed; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
-							return
-						}
-						if lostDisposition == workerLostLeaseRetry {
-							p.logw(lease.workerID).Warn("K8s worker terminated while runtime lease is newer for this CP; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
-							return
-						}
-						if lostDisposition == workerLostLeaseStale {
-							p.mu.Lock()
-							removedWorker, workerCount := p.dropLocalWorkerIfSameLeaseLocked(lease)
-							p.mu.Unlock()
-							if removedWorker == nil {
-								return
-							}
-							observeControlPlaneWorkers(workerCount)
-							p.logw(lease.workerID).Warn("K8s worker terminated under stale lease; dropping local worker without pod delete.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
-							if removedWorker.client != nil {
-								_ = removedWorker.client.Close()
-							}
-							return
-						}
-
-						p.mu.Lock()
-						removedWorker, workerCount = p.removeWorkerAfterLostLeaseLocked(lease)
-						p.mu.Unlock()
-						if removedWorker == nil {
-							return
-						}
-						observeControlPlaneWorkers(workerCount)
-						p.logw(lease.workerID).Warn("K8s worker crashed.")
-						if onCrash != nil {
-							onCrash(lease.workerID)
-						}
-						if removedWorker.client != nil {
-							_ = removedWorker.client.Close()
-						}
-						// Delete the failed pod from K8s
-						podName := p.workerPodName(removedWorker)
-						delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
-						_ = p.clientset.CoreV1().Pods(p.namespace).Delete(delCtx, podName, metav1.DeleteOptions{
-							GracePeriodSeconds: int64Ptr(0),
-						})
-						delCancel()
+						p.handleTerminatedWorkerLease(lease, LifecycleOriginWorkerDrain, LifecycleOriginInformerCrash, onCrash)
 					default:
 						// Worker alive, do health check
 						var healthErr error
@@ -514,7 +465,46 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						if healthErr != nil || instanceDead {
 							if healthErr != nil && p.workerLeaseLocallyDraining(lease) {
 								if p.workerLeaseDurablyDrainingOrRepair(lease) {
-									p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining; waiting for pod exit.", "error", healthErr)
+									// The informer is the normal exit from Draining
+									// (it closes w.done when the pod terminates). But
+									// the informer's selector is scoped to pods THIS
+									// CP spawned, so a worker adopted from another
+									// CP's hot-idle pool never gets that event. After
+									// a few consecutive misses, stop trusting the
+									// informer and ask the API server directly; a
+									// pod that is gone (or terminal) takes the same
+									// path the informer's w.done case would have.
+									// Without this, an adopted draining worker whose
+									// pod exited is probed every tick forever — one
+									// such zombie is 300 failed health checks per
+									// 10m, and four of them leaked for three days in
+									// a production cluster.
+									mu.Lock()
+									drainingMisses[lease]++
+									misses := drainingMisses[lease]
+									mu.Unlock()
+									if misses < drainingPodVerifyThreshold {
+										p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining; waiting for pod exit.", "error", healthErr, "consecutive_failures", misses)
+										return
+									}
+									switch p.drainingWorkerPodState(ctx, w) {
+									case drainingPodGone:
+										mu.Lock()
+										delete(drainingMisses, lease)
+										mu.Unlock()
+										p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining and its pod is gone; retiring worker without informer event.", "error", healthErr, "consecutive_failures", misses)
+										p.handleTerminatedWorkerLease(lease, LifecycleOriginHealthCheckDrainedPodGone, LifecycleOriginHealthCheckCrash, onCrash)
+									case drainingPodPresent:
+										// Log at the threshold and then once a minute
+										// (30 ticks at the 2s default), not every tick.
+										if misses == drainingPodVerifyThreshold || misses%30 == 0 {
+											p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining; pod still present, waiting for pod exit.", "error", healthErr, "consecutive_failures", misses)
+										}
+									default:
+										// Unverifiable (no clientset, API error): keep
+										// today's behavior and try again next tick.
+										p.logw(lease.workerID).Warn("K8s worker health check failed while worker is draining; waiting for pod exit.", "error", healthErr, "consecutive_failures", misses)
+									}
 									return
 								}
 								p.logw(lease.workerID).Warn("K8s worker health check failed while worker is locally draining but durable state is not draining; treating as health failure.", "error", healthErr)
@@ -628,6 +618,7 @@ func (p *K8sWorkerPool) HealthCheckLoop(ctx context.Context, interval time.Durat
 						} else {
 							mu.Lock()
 							delete(failures, lease)
+							delete(drainingMisses, lease)
 							mu.Unlock()
 
 							if hcResult != nil && hcResult.Draining {
@@ -1305,6 +1296,129 @@ func (p *K8sWorkerPool) removeWorkerAfterDrainedLease(lease workerLeaseSnapshot,
 	p.markWorkerRetiredInMemoryLocked(current)
 	delete(p.workers, current.ID)
 	return current, len(p.workers), nil
+}
+
+// drainingPodVerifyThreshold is the number of consecutive failed health
+// probes of a locally-draining worker after which HealthCheckLoop stops
+// waiting for the informer and verifies the pod's existence itself. Three
+// misses at the 2s default interval is the same budget the mark-lost path
+// gives a non-draining worker (maxConsecutiveHealthFailures).
+const drainingPodVerifyThreshold = maxConsecutiveHealthFailures
+
+// drainingPodState is the outcome of drainingWorkerPodState.
+type drainingPodState int
+
+const (
+	// drainingPodUnknown: the pod could not be verified (no clientset wired,
+	// API error, no pod name). Callers keep waiting.
+	drainingPodUnknown drainingPodState = iota
+	// drainingPodGone: the pod is NotFound or in a terminal phase
+	// (Succeeded/Failed). The worker will never answer again.
+	drainingPodGone
+	// drainingPodPresent: the pod object still exists and is not terminal.
+	drainingPodPresent
+)
+
+// drainingWorkerPodState asks the API server (bounded, 2s) whether the
+// draining worker's pod still exists. It is the informer-independent exit
+// from the Draining lifecycle for workers whose pod events this CP never
+// receives (adopted from another CP — see startInformer's label selector).
+// Nil clientset (process backend / minimal test pools) reports unknown so
+// today's wait-for-informer behavior is preserved there.
+func (p *K8sWorkerPool) drainingWorkerPodState(ctx context.Context, w *ManagedWorker) drainingPodState {
+	if p == nil || p.clientset == nil {
+		return drainingPodUnknown
+	}
+	podName := p.workerPodName(w)
+	if podName == "" {
+		return drainingPodUnknown
+	}
+	getCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	pod, err := p.clientset.CoreV1().Pods(p.namespace).Get(getCtx, podName, metav1.GetOptions{})
+	switch {
+	case errors.IsNotFound(err):
+		return drainingPodGone
+	case err != nil:
+		p.logw(w.ID).Debug("K8s worker draining pod verification failed.", "worker_pod", podName, "error", err)
+		return drainingPodUnknown
+	case pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed:
+		return drainingPodGone
+	default:
+		return drainingPodPresent
+	}
+}
+
+// handleTerminatedWorkerLease is the shared "this worker's pod is gone"
+// path of HealthCheckLoop, reached either from the informer (w.done closed)
+// or from the draining branch's own pod verification. A draining worker is
+// retired via the drained-lease CAS (drainOrigin); a non-draining one is
+// marked lost (crashOrigin) with the crash notification + pod delete the
+// informer path has always done. The two origins keep the lifecycle metric
+// honest about WHICH detector fired.
+func (p *K8sWorkerPool) handleTerminatedWorkerLease(lease workerLeaseSnapshot, drainOrigin, crashOrigin LifecycleOrigin, onCrash WorkerCrashHandler) {
+	removedWorker, workerCount, err := p.removeWorkerAfterDrainedLease(lease, drainOrigin)
+	if err != nil {
+		p.logw(lease.workerID).Error("K8s worker terminated after draining but retire CAS failed; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+		return
+	}
+	if removedWorker != nil {
+		observeControlPlaneWorkers(workerCount)
+		p.logw(lease.workerID).Info("K8s worker terminated after draining.", "origin", drainOrigin)
+		if removedWorker.client != nil {
+			_ = removedWorker.client.Close()
+		}
+		return
+	}
+
+	lostDisposition, err := p.markWorkerLostForHealthLease(lease, crashOrigin)
+	if err != nil {
+		p.logw(lease.workerID).Error("K8s worker terminated but lease validation failed; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch, "error", err)
+		return
+	}
+	if lostDisposition == workerLostLeaseRetry {
+		p.logw(lease.workerID).Warn("K8s worker terminated while runtime lease is newer for this CP; leaving cleanup to retry.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
+		return
+	}
+	if lostDisposition == workerLostLeaseStale {
+		p.mu.Lock()
+		removedWorker, workerCount := p.dropLocalWorkerIfSameLeaseLocked(lease)
+		p.mu.Unlock()
+		if removedWorker == nil {
+			return
+		}
+		observeControlPlaneWorkers(workerCount)
+		p.logw(lease.workerID).Warn("K8s worker terminated under stale lease; dropping local worker without pod delete.", "owner_cp_instance_id", lease.ownerCPInstanceID, "owner_epoch", lease.ownerEpoch)
+		if removedWorker.client != nil {
+			_ = removedWorker.client.Close()
+		}
+		return
+	}
+
+	p.mu.Lock()
+	removedWorker, workerCount = p.removeWorkerAfterLostLeaseLocked(lease)
+	p.mu.Unlock()
+	if removedWorker == nil {
+		return
+	}
+	observeControlPlaneWorkers(workerCount)
+	p.logw(lease.workerID).Warn("K8s worker crashed.")
+	if onCrash != nil {
+		onCrash(lease.workerID)
+	}
+	if removedWorker.client != nil {
+		_ = removedWorker.client.Close()
+	}
+	// Delete the failed pod from K8s (NotFound is fine — it may already be
+	// gone, which is exactly how the draining verifier gets here).
+	if p.clientset != nil {
+		podName := p.workerPodName(removedWorker)
+		delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = p.clientset.CoreV1().Pods(p.namespace).Delete(delCtx, podName, metav1.DeleteOptions{
+			GracePeriodSeconds: int64Ptr(0),
+		})
+		delCancel()
+	}
 }
 
 func (p *K8sWorkerPool) retireLocalDrainingLease(lease workerLeaseSnapshot, reason string, origin LifecycleOrigin) (bool, error) {

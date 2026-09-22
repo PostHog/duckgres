@@ -14,7 +14,16 @@ const (
 	janitorRetireReasonOrphaned        = "orphaned"
 	janitorRetireReasonStuckActivating = "stuck_activating"
 	janitorRetireReasonHotIdleCap      = "hot_idle_cap_exceeded"
+	janitorRetireReasonDrainingOrphan  = "draining_pod_gone"
 )
+
+// defaultDrainingOrphanGrace is how long a durable `draining` row must have
+// been untouched (updated_at) before the leader janitor checks whether its
+// pod still exists. A live drain keeps the row fresh through the owner's
+// lifecycle writes; once the pod exits nothing touches the row again, so a
+// row that is both stale AND podless is an orphan. The grace only bounds
+// API-server reads per tick — the pod check is the actual gate.
+const defaultDrainingOrphanGrace = 10 * time.Minute
 
 // orgHotIdleLimit is one org's configured hot-idle pool ceiling. Zero/empty
 // fields are unlimited. DefaultCPU/DefaultMemory are the org's default worker
@@ -66,6 +75,10 @@ type controlPlaneExpiryStore interface {
 	ListExpiredHotIdleSnapshots(now time.Time, defaultTTL time.Duration) ([]configstore.WorkerSnapshot, error)
 	CountHotIdleWorkers(orgID, image, profileCPU, profileMemory string) (int, error)
 	ListOrgHotIdleSnapshots(orgID string) ([]configstore.WorkerSnapshot, error)
+	// ListWorkerRecordSnapshotsByStatesBefore backs the orphaned-draining
+	// sweep: rows in the given states whose updated_at is at or before the
+	// cutoff, as fenced snapshots for RetireFromSnapshot.
+	ListWorkerRecordSnapshotsByStatesBefore(states []configstore.WorkerState, updatedBefore time.Time) ([]configstore.WorkerSnapshot, error)
 }
 
 type ControlPlaneJanitor struct {
@@ -91,6 +104,15 @@ type ControlPlaneJanitor struct {
 	// from the config snapshot in multitenant.go, so a cap edit takes effect
 	// on the next tick after the poll reload.
 	hotIdleCaps func() map[string]orgHotIdleLimit
+	// drainingOrphanGrace is the updated_at staleness a `draining` row needs
+	// before reapOrphanedDrainingWorkers verifies its pod. 0 disables the
+	// sweep.
+	drainingOrphanGrace time.Duration
+	// workerPodGone reports whether the named worker pod no longer exists
+	// (NotFound or terminal phase). nil disables the orphaned-draining
+	// sweep (no K8s clientset — process backend, tests). An error means
+	// "could not verify" and the row is left alone for the tick.
+	workerPodGone func(ctx context.Context, podName string) (bool, error)
 }
 
 func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeout time.Duration) *ControlPlaneJanitor {
@@ -116,10 +138,11 @@ func NewControlPlaneJanitor(store controlPlaneExpiryStore, interval, expiryTimeo
 		// cutoff). Reserved/Activating rows get their updated_at bumped at
 		// each lifecycle transition, so activateTimeout only needs to cover
 		// the connect+activate tail, with slack for clock/poll skew.
-		spawnTimeout:    10 * time.Minute,
-		activateTimeout: 5 * time.Minute,
-		maxDrainTimeout: 15 * time.Minute,
-		now:             time.Now,
+		spawnTimeout:        10 * time.Minute,
+		activateTimeout:     5 * time.Minute,
+		maxDrainTimeout:     15 * time.Minute,
+		drainingOrphanGrace: defaultDrainingOrphanGrace,
+		now:                 time.Now,
 	}
 }
 
@@ -247,6 +270,7 @@ func (j *ControlPlaneJanitor) runOnce() {
 		}
 
 		j.reapHotIdleCaps()
+		j.reapOrphanedDrainingWorkers()
 	}
 
 	// Gradual rolling replacement of workers whose Deployment version
@@ -377,4 +401,55 @@ func quantityBytes(s string) int64 {
 		return 0
 	}
 	return q.Value()
+}
+
+// reapOrphanedDrainingWorkers retires durable `draining` rows whose pod no
+// longer exists. A draining row normally reaches `retired` through its
+// owning CP's drained-lease CAS, fired by that CP's pod informer when the
+// pod terminates. That informer only watches pods the CP itself spawned, so
+// a worker adopted from another CP's hot-idle pool has no informer exit from
+// Draining: the owning CP keeps probing a dead pod every health-check tick
+// and the row stays `draining` forever (four such rows leaked for three days
+// in a production cluster, each costing ~300 failed health checks per 10m).
+// HealthCheckLoop now verifies the pod itself on the owning CP; this sweep
+// is the cluster-wide backstop for rows whose owner restarted, or never
+// noticed. It is convergent (one tick retires every verified orphan), fenced
+// (RetireFromSnapshot CAS on the observed row), and stops the tick on a
+// retire error rather than marching on. Disabled when workerPodGone is nil
+// (no clientset) or drainingOrphanGrace is 0.
+func (j *ControlPlaneJanitor) reapOrphanedDrainingWorkers() {
+	if j.workerPodGone == nil || j.drainingOrphanGrace <= 0 {
+		return
+	}
+	before := j.now().Add(-j.drainingOrphanGrace)
+	snaps, err := j.store.ListWorkerRecordSnapshotsByStatesBefore([]configstore.WorkerState{configstore.WorkerStateDraining}, before)
+	if err != nil {
+		slog.Warn("Janitor failed to list stale draining workers.", "error", err)
+		return
+	}
+	for _, snap := range snaps {
+		podName := snap.PodName()
+		if podName == "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		gone, err := j.workerPodGone(ctx, podName)
+		cancel()
+		if err != nil {
+			slog.Warn("Janitor could not verify pod of stale draining worker; leaving it for the next tick.", "worker", snap.WorkerID(), "worker_pod", podName, "org", snap.OrgID(), "error", err)
+			continue
+		}
+		if !gone {
+			continue
+		}
+		outcome, err := j.lifecycle.RetireFromSnapshot(snap, configstore.WorkerStateRetired, janitorRetireReasonDrainingOrphan, LifecycleOriginJanitorDrainingOrphan)
+		if err != nil {
+			slog.Warn("Janitor failed to retire orphaned draining worker; stopping sweep for this tick.", "worker", snap.WorkerID(), "worker_pod", podName, "org", snap.OrgID(), "error", err)
+			return
+		}
+		if outcome.Transitioned {
+			record := snap.Record()
+			slog.Warn("Janitor retired orphaned draining worker: durable row was draining but its pod is gone.", "worker", snap.WorkerID(), "worker_pod", podName, "org", snap.OrgID(), "owner_cp_instance_id", record.OwnerCPInstanceID, "owner_epoch", record.OwnerEpoch, "updated_at", record.UpdatedAt)
+		}
+	}
 }

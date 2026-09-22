@@ -392,6 +392,11 @@ func SetupMultiTenant(
 		defer cancel()
 		router.sharedPool.RetireOneMismatchedVersionWorker(ctx)
 	}
+	// Leader-only backstop for durable `draining` rows whose pod is gone
+	// (adopted workers get no informer event on their owning CP; see
+	// reapOrphanedDrainingWorkers). Verification goes through the shared
+	// pool's clientset.
+	janitor.workerPodGone = router.sharedPool.workerPodGone
 	janitor.cleanupOrphanedWorkerPods = func() {
 		// Pods and secrets each get their own 30s deadline so a slow
 		// pod-list (large namespace) can't starve the secret reaper
