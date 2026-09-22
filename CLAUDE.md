@@ -1992,6 +1992,11 @@ the Trino backend selection).
   names are deterministic, so a lost create is resolved by read-back rather
   than by creating a second instance. Identities and live endpoints are never
   reused (PK over terminal rows + partial unique index).
+  New instance names are `cell-<eight random hexadecimal digits>`, independent
+  of the logical pool ID. The suffix uses four cryptographically random bytes,
+  not a UUID or sequence. Coordinator and worker Deployments retain their
+  normal Kubernetes ReplicaSet and pod suffixes. Existing persisted instance
+  names and endpoints are unchanged; the shorter names appear on new instances.
 - **Blueprint is not a template engine.** Argo delivers a validated JSON with
   real `corev1.PodTemplateSpec`s; duckgres injects only object names, labels,
   selectors, replica counts and the three env vars the `identity_binding`

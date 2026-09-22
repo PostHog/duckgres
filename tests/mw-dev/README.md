@@ -886,6 +886,23 @@ catalog rows in the throwaway database, and all ephemeral cache volumes.
 
 ### Shared-pool startup acceptance
 
+New compute instances use `cell-<eight random hexadecimal digits>` independently
+of their logical pool ID. Their Deployments are `<instance>-coordinator` and
+`<instance>-worker`; Kubernetes still adds its normal pod suffixes. Existing
+instances keep their persisted names and endpoints until normal replacement.
+The config-store primary key prevents identity reuse across pools, including
+retired instances. A collision fails before creating Kubernetes resources; the
+next reconciliation generates a fresh random suffix.
+
+Set `E2E_TRINO_POOL_SHORT_NAMES=1` with `E2E_TRINO_POOL=1` after all old instances
+have retired to verify Deployment names and Kubernetes-managed pod suffixes.
+The naming assertion defaults off so a mixed old/new fleet remains supported.
+The default in-Job fixture has no pooled workload, so this requires an authorized
+deployment of the candidate image and a completed instance replacement before
+it can provide live evidence. No namespace move or resource rename is performed
+by the naming change. Namespace moves require a separate maintenance procedure;
+do not change the configured namespace while old instance snapshots remain live.
+
 The existing `trino_shared_pool_active` assertion in `e2e/harness.sh` requires
 `E2E_TRINO_POOL=1` and a separately configured shared-pool deployment. Its
 structure stage waits for ready, independent coordinator instances; subsequent
