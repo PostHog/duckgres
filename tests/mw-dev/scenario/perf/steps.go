@@ -29,6 +29,8 @@ type DriverFactory interface {
 type ExecutorConfig struct {
 	TrinoCatalogStoreCellID string
 	TrinoCatalogStoreDSN    string
+	TrinoPerfURL            string
+	TrinoPerfCellID         string
 	TrinoCachedURL          string
 	TrinoCachedCellID       string
 	TrinoAdminPasswordFile  string
@@ -90,6 +92,8 @@ type stepSpec struct {
 
 type defaultDriverFactory struct {
 	trinoCatalogStoreDSN   string
+	trinoPerfURL           string
+	trinoPerfCellID        string
 	trinoCachedURL         string
 	trinoCachedCellID      string
 	trinoAdminPasswordFile string
@@ -100,6 +104,8 @@ func NewExecutor(cfg ExecutorConfig) *Executor {
 	if factory == nil {
 		factory = defaultDriverFactory{
 			trinoCatalogStoreDSN:   cfg.TrinoCatalogStoreDSN,
+			trinoPerfURL:           cfg.TrinoPerfURL,
+			trinoPerfCellID:        cfg.TrinoPerfCellID,
 			trinoCachedURL:         cfg.TrinoCachedURL,
 			trinoCachedCellID:      cfg.TrinoCachedCellID,
 			trinoAdminPasswordFile: cfg.TrinoAdminPasswordFile,
@@ -525,20 +531,23 @@ func (defaultDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, p
 }
 
 func (f defaultDriverFactory) NewTrino(ctx context.Context, connection trinodriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
-	if connection.HoglakeCatalog != "" {
-		if err := f.selectHoglakeCatalog(ctx, connection); err != nil {
-			return nil, err
-		}
-	}
 	if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, connection.Catalog, perfcore.ProtocolTrino, connection.CatalogStoreCellID); err != nil {
 		return nil, err
 	}
+	target := connection
 	if connection.Protocol == perfcore.ProtocolTrinoCached {
-		if err := f.prepareCachedCatalog(ctx, connection); err != nil {
+		target.ServerURL, target.CatalogStoreCellID = f.trinoCachedURL, f.trinoCachedCellID
+	} else if connection.HoglakeCatalog != "" {
+		target.ServerURL, target.CatalogStoreCellID = f.trinoPerfURL, f.trinoPerfCellID
+	}
+	if connection.HoglakeCatalog != "" || connection.Protocol == perfcore.ProtocolTrinoCached {
+		if err := f.prepareBenchmarkCatalog(ctx, connection, target); err != nil {
 			return nil, err
 		}
-		connection.ServerURL = f.trinoCachedURL
-		connection.CatalogStoreCellID = f.trinoCachedCellID
+		if err := validateTrinoCacheMode(ctx, f.trinoCatalogStoreDSN, target.Catalog, target.Protocol, target.CatalogStoreCellID); err != nil {
+			return nil, err
+		}
+		connection = target
 	}
 
 	return trinodriver.New(ctx, connection)

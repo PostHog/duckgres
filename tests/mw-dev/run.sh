@@ -73,8 +73,8 @@ if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "$HOGLAKE_DATA_PATH" ]; then
     printf '::add-mask::%s\n' "${hoglake_role_account%%:*}" >&2
   fi
 fi
-# The control plane provisions the uncached baseline. The runner creates the
-# cached catalog in the second cluster's isolated catalog-store cell.
+# The control plane owns its managed catalog. Frozen perf uses independent
+# uncached and cached clusters with the same tenant auth and isolated stores.
 TRINO_FILESYSTEM_CACHE_ENABLED=false
 if [ "$SCENARIO_NAME" = "posthog_frozen_perf_trino_cached" ]; then
   echo "use posthog_frozen_perf; it includes both Trino cache modes" >&2
@@ -163,18 +163,19 @@ render_trino_backend() {
 # Reuse the baseline template so both clusters retain identical resource budgets.
 # Select only cluster-specific resources; TLS, auth, tenant secrets, OPA and the
 # config-store connection are intentionally shared in the throwaway namespace.
-render_trino_cached() {
-  local cached_secret_file="$secret_dir/trino-cached-internal"
-  [ -s "$cached_secret_file" ] || (umask 077; openssl rand -base64 32 > "$cached_secret_file")
+render_trino_perf_cluster() {
+  local mode="$1"
+  local cluster_secret_file="$secret_dir/trino-$mode-internal"
+  [ -s "$cluster_secret_file" ] || (umask 077; openssl rand -base64 32 > "$cluster_secret_file")
   cat <<EOF
 ---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: trino-cached-internal
+  name: trino-$mode-internal
   namespace: $NS
 stringData:
-  shared-secret: "$(cat "$cached_secret_file")"
+  shared-secret: "$(cat "$cluster_secret_file")"
 EOF
   TRINO_IMAGE="$TRINO_IMAGE" NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
     envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE' < "$HERE/manifests.trino.tmpl.yaml" \
@@ -183,14 +184,14 @@ EOF
       { document=document $0 "\n" }
       /^  name: duckgres-trino(-coordinator|-worker)?$/ { selected=1 }
       END { if (selected) printf "%s", document }
-    ' | sed -e 's/duckgres-trino-coordinator/duckgres-trino-cached-coordinator/g' \
-      -e 's/duckgres-trino-worker/duckgres-trino-cached-worker/g' \
-      -e 's/app: duckgres-trino/app: duckgres-trino-cached/g' \
-      -e 's/name: duckgres-trino$/name: duckgres-trino-cached/' \
-      -e "s/duckgres-trino\.$NS\.svc/duckgres-trino-cached.$NS.svc/g" \
-      -e 's/trino-internal-communication/trino-cached-internal/g' \
-      -e "s/node.environment=ci_pr_${PR_NUMBER}$/node.environment=ci_pr_${PR_NUMBER}_cached/" \
-      -e "s/catalog-store.cell-id=ci-pr-${PR_NUMBER}$/catalog-store.cell-id=ci-pr-${PR_NUMBER}-cached/"
+    ' | sed -e "s/duckgres-trino-coordinator/duckgres-trino-$mode-coordinator/g" \
+      -e "s/duckgres-trino-worker/duckgres-trino-$mode-worker/g" \
+      -e "s/app: duckgres-trino/app: duckgres-trino-$mode/g" \
+      -e "s/name: duckgres-trino$/name: duckgres-trino-$mode/" \
+      -e "s/duckgres-trino\.$NS\.svc/duckgres-trino-$mode.$NS.svc/g" \
+      -e "s/trino-internal-communication/trino-$mode-internal/g" \
+      -e "s/node.environment=ci_pr_${PR_NUMBER}$/node.environment=ci_pr_${PR_NUMBER}_$mode/" \
+      -e "s/catalog-store.cell-id=ci-pr-${PR_NUMBER}$/catalog-store.cell-id=ci-pr-${PR_NUMBER}-$mode/"
 }
 
 render_trino_multicell() {
@@ -280,7 +281,10 @@ render() {
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
       envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
       < "$HERE/manifests.trino.tmpl.yaml"
-    if hoglake_perf_enabled; then render_trino_cached; fi
+    if hoglake_perf_enabled; then
+      render_trino_perf_cluster perf
+      render_trino_perf_cluster cached
+    fi
     HOGLAKE_SERVICE_ACCOUNT=hoglake
     if hoglake_perf_enabled; then HOGLAKE_SERVICE_ACCOUNT=trino; fi
     NAMESPACE="$NS" HOGLAKE_IMAGE="$HOGLAKE_IMAGE" AWS_REGION="$AWS_REGION" HOGLAKE_SERVICE_ACCOUNT="$HOGLAKE_SERVICE_ACCOUNT" \
@@ -293,7 +297,7 @@ ensure_trino_tls() {
   local san="duckgres-trino.$NS.svc"
   local sans="DNS:$san"
   if hoglake_perf_enabled; then
-    sans="$sans,DNS:duckgres-trino-cached.$NS.svc"
+    sans="$sans,DNS:duckgres-trino-perf.$NS.svc,DNS:duckgres-trino-cached.$NS.svc"
   fi
   if trino_multicell_enabled; then
     sans="$sans,DNS:duckgres-trino-blue.$TRINO_CELL_NS.svc,DNS:duckgres-trino-green.$TRINO_CELL_NS.svc"
@@ -610,10 +614,12 @@ cmd_deploy() {
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
     if hoglake_perf_enabled; then
-      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-cached-coordinator --type=merge -p '{"spec":{"replicas":1}}'
-      "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-cached-worker --type=merge -p '{"spec":{"replicas":3}}'
-      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-cached-coordinator --timeout=300s
-      "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-cached-worker --timeout=300s
+      for mode in perf cached; do
+        "${KUBECTL[@]}" -n "$NS" patch deployment "duckgres-trino-$mode-coordinator" --type=merge -p '{"spec":{"replicas":1}}'
+        "${KUBECTL[@]}" -n "$NS" patch deployment "duckgres-trino-$mode-worker" --type=merge -p '{"spec":{"replicas":3}}'
+        "${KUBECTL[@]}" -n "$NS" rollout status "deploy/duckgres-trino-$mode-coordinator" --timeout=300s
+        "${KUBECTL[@]}" -n "$NS" rollout status "deploy/duckgres-trino-$mode-worker" --timeout=300s
+      done
     fi
     if trino_multicell_enabled; then
       "${KUBECTL[@]}" -n "$TRINO_CELL_NS" wait --for=create secret/trino-auth --timeout=120s
@@ -815,6 +821,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_SNI_SUFFIX, value: "$suffix" }
             - { name: DUCKGRES_SCENARIO_FROZEN_S3_URI, value: "$FROZEN_S3_URI" }
             - { name: DUCKGRES_SCENARIO_HOGLAKE_URI, value: "$hoglake_uri" }
+            - { name: DUCKGRES_SCENARIO_TRINO_PERF_URL, value: "https://duckgres-trino-perf.$NS.svc:8443" }
+            - { name: DUCKGRES_SCENARIO_TRINO_PERF_CELL_ID, value: "ci-pr-${PR_NUMBER}-perf" }
             - { name: DUCKGRES_SCENARIO_TRINO_CACHED_URL, value: "https://duckgres-trino-cached.$NS.svc:8443" }
             - { name: DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID, value: "ci-pr-${PR_NUMBER}" }
             - { name: DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID, value: "ci-pr-${PR_NUMBER}-cached" }
@@ -1071,9 +1079,11 @@ cmd_diagnostics() {
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c duckgres-trino-opa --tail=300 || true
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-worker -c trino-worker --tail=300 || true
   if hoglake_perf_enabled; then
-    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-coordinator -c trino-coordinator --tail=300 || true
-    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-coordinator -c duckgres-trino-opa --tail=300 || true
-    "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-cached-worker -c trino-worker --tail=300 || true
+    for mode in perf cached; do
+      "${KUBECTL[@]}" -n "$NS" logs "deploy/duckgres-trino-$mode-coordinator" -c trino-coordinator --tail=300 || true
+      "${KUBECTL[@]}" -n "$NS" logs "deploy/duckgres-trino-$mode-coordinator" -c duckgres-trino-opa --tail=300 || true
+      "${KUBECTL[@]}" -n "$NS" logs "deploy/duckgres-trino-$mode-worker" -c trino-worker --tail=300 || true
+    done
   fi
   if [ "$E2E_SUITE" = trino ]; then
     "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-hoglake --tail=300 || true

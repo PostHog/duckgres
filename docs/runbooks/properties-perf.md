@@ -1,10 +1,11 @@
 # Properties in frozen performance scenarios
 
 `posthog_frozen_perf` first runs the existing frozen corpus on all five targets.
-An optional properties comparison follows in the same scenario and isolated
-stack. Leave `DUCKGRES_SCENARIO_PROPERTIES_S3_URI` empty (the default) to run only
-the original suite. No properties S3/Glue access or preparation occurs in that
-case. No completion manifest or new repository secret is required.
+The properties comparison follows in the same scenario and isolated stack.
+When `DUCKGRES_SCENARIO_PROPERTIES_S3_URI` is empty, the runner uses the S3
+location of the existing `properties_events_supported` Athena table. An explicit
+value overrides discovery and must match that table. Missing configuration fails
+the properties phase; original benchmark artifacts remain available.
 
 ## Select the fixture
 
@@ -20,7 +21,7 @@ fixture-derived statistics in private generation notes, outside this repository.
 ## Prepare and run
 
 ```sh
-# Original benchmarks only:
+# Original and properties benchmarks using the configured fixture:
 just scenario-frozen-perf
 
 # After the replacement single-day fixture has been generated:
@@ -29,8 +30,8 @@ just scenario-frozen-perf
 ```
 
 For GitHub Actions, dispatch `scenario-dev` with
-`scenario=posthog_frozen_perf`. Supply `properties_s3_uri` only once the fixture
-is ready. The workflow masks this input and uses its existing AWS role.
+`scenario=posthog_frozen_perf`. Leave `properties_s3_uri` blank to use the configured fixture, or supply an
+explicit override. The workflow masks this input and uses its existing AWS role.
 
 The properties step discovers the object inventory and prepares private SQL and
 catalog files in a temporary directory, removed when the step returns. Discovery
@@ -52,14 +53,15 @@ Generated files contain private locations and must stay out of public artifacts.
 
 Duckgres adds the supported JSON/STRUCT projection under
 `properties_perf.events_supported`, without changing the original tables.
-Hoglake registers the JSON projection in an isolated catalog suffixed
-`-properties`, whose `data_path` is the selected properties prefix. After the
-original benchmarks, the disposable tenant Trino catalog is recreated with only
-its `hoglake.catalog` mapping changed to this properties catalog. Tenant
-credentials, permissions, and cache settings are preserved. The original
-Hoglake catalog and its fixture root remain intact. The original benchmark step
-explicitly selects the original mapping when rerun. Both locations must be
-readable by the isolated stack's existing AWS identity.
+Hoglake registers the JSON projection under `properties_perf` in the same fixture
+catalog as the original `posthog` tables. The catalog's data path is the frozen
+bucket root; each importer lists only its selected immutable prefix. Properties
+must be in that bucket and readable by the existing read-only fixture identity.
+The managed tenant catalog stays untouched. Uncached and cached benchmark clusters
+have their own catalog-store cells, using the existing tenant catalog name and
+authorization, and both point to the shared fixture catalog. There is no
+DROP/CREATE or dataset switch between phases. Namespace teardown removes all
+fixture catalogs and metadata without deleting source S3 files.
 
 | Properties run label | Cache | Representation |
 | --- | --- | --- |
@@ -93,7 +95,7 @@ panels retain their existing query selection.
 
 For missing/inaccessible prefixes, correct the selection or access and rerun.
 For Athena mapping failures, use the generated SQL and approved fixture
-configuration to correct the table before retrying. If catalog switching fails,
+configuration to correct the table before retrying. If fixture catalog setup fails,
 recreate the isolated stack rather than timing an unverified mapping. Preserve
 private diagnostics before cleanup. Scenario deprovisioning and workflow
 teardown remove the owned warehouse and isolated stack; follow the existing

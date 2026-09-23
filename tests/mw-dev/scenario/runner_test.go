@@ -83,6 +83,8 @@ func TestScenarioRunner(t *testing.T) {
 	perfExecutor := scenarioperf.NewExecutor(scenarioperf.ExecutorConfig{
 		TrinoCatalogStoreDSN:    os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_DSN"),
 		TrinoCatalogStoreCellID: os.Getenv("DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_ID"),
+		TrinoPerfURL:            os.Getenv("DUCKGRES_SCENARIO_TRINO_PERF_URL"),
+		TrinoPerfCellID:         os.Getenv("DUCKGRES_SCENARIO_TRINO_PERF_CELL_ID"),
 		TrinoCachedURL:          os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_URL"),
 		TrinoCachedCellID:       os.Getenv("DUCKGRES_SCENARIO_TRINO_CACHED_CELL_ID"),
 		TrinoAdminPasswordFile:  os.Getenv("DUCKGRES_SCENARIO_TRINO_ADMIN_PASSWORD_FILE"),
