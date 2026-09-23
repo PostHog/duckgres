@@ -1092,13 +1092,15 @@ pool_object_count() { # kind selector
 # does not provision by default: a registry entry with mode "shared-pool", a
 # blueprint artifact carrying a real image digest, a Gateway speaking the pooled
 # protocol, and the feature flags on. When those exist this is the acceptance
-# check, in three
+# check, in four
 # separately reported stages, because each is evidence for less than the next:
 #
 #   [structure] ready, non-terminating coordinator pods, each with its own
 #               Service and its own workers. A ready pod routes nothing.
 #   [admission] the warehouse reports ready, which with the Gateway gate on
 #               means its publication committed on every serving member.
+#   [observer]  the console observes the pool through its live instances and
+#               advertises the org's connection (#1216).
 #   [query]     a statement run with an EXISTING login of that org returns its
 #               result. Needs caller-supplied credentials; skipped, and said to
 #               be skipped, when they are not given. No canary warehouse and no
@@ -1199,6 +1201,23 @@ trino_shared_pool_active() {
   done
   [ "$state" = "ready" ] || fail "shared pool: $org is '$state', want ready once its publication commits"
   log "shared pool OK [admission]: $org is admitted (publication committed on every serving member)"
+
+  # The console must be able to SEE the pool (#1216). A pool has no fixed
+  # coordinator, so the observer reads the pool's live instances; before that
+  # it dialled an empty URL, reported every pooled org unavailable and never
+  # advertised its connection, and usage metering skipped the pool entirely.
+  # Retried because the observer's first poll can race a member replacement.
+  a=0 detail=""
+  while [ "$a" -lt 12 ]; do
+    detail="$(curl -fsS -H "$H" "$API/api/v1/orgs/$org/trino")" || detail=""
+    printf %s "$detail" | jq -e '.available == true and ((.status.connection.host // "") != "")' >/dev/null && break
+    sleep 5; a=$((a + 1))
+  done
+  printf %s "$detail" | jq -e '.available == true' >/dev/null \
+    || fail "shared pool: console cannot observe the pool for $org: $(printf %s "$detail" | head -c 400)"
+  printf %s "$detail" | jq -e '(.status.connection.host // "") != ""' >/dev/null \
+    || fail "shared pool: $org is ready and observed but advertises no connection: $(printf %s "$detail" | head -c 400)"
+  log "shared pool OK [observer]: console observes the pool and advertises $(printf %s "$detail" | jq -r '.status.connection.host') for $org"
 
   # And the end the user actually experiences: a statement, run with the
   # caller's OWN credentials, returning a result. Structure and admission are
