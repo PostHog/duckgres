@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -115,6 +116,21 @@ type QueryResult struct {
 	ServiceMetrics   *ServiceMetrics `json:"service_metrics,omitempty"`
 }
 
+// Suites published under one dataset. Dashboards filter on this closed set.
+const (
+	SuiteTables     = "tables"
+	SuiteProperties = "properties"
+)
+
+// ValidateSuite rejects a suite outside the closed set, so a typo fails when a
+// run starts rather than after hours of measurement at publish time.
+func ValidateSuite(suite string) error {
+	if suite != SuiteTables && suite != SuiteProperties {
+		return fmt.Errorf("unknown suite %q (want %q or %q)", suite, SuiteTables, SuiteProperties)
+	}
+	return nil
+}
+
 type RunSummary struct {
 	RunID          string `json:"run_id"`
 	DatasetVersion string `json:"dataset_version"`
@@ -123,12 +139,15 @@ type RunSummary struct {
 	Suite string `json:"suite,omitempty"`
 	// FixtureVersion identifies the exact fixture a suite measured when it is
 	// finer-grained than the dataset (e.g. the properties object inventory).
-	FixtureVersion string    `json:"fixture_version,omitempty"`
-	StartedAt      time.Time `json:"started_at"`
-	FinishedAt     time.Time `json:"finished_at"`
-	TotalQueries   int       `json:"total_queries"`
-	TotalErrors    int       `json:"total_errors"`
-	WarmupQueries  int       `json:"warmup_queries"`
+	FixtureVersion string `json:"fixture_version,omitempty"`
+	// NightlyRunID names the run every suite of one nightly belongs to: the
+	// table-suite run's ID. Consumers pair suites by it rather than by run IDs.
+	NightlyRunID  string    `json:"nightly_run_id,omitempty"`
+	StartedAt     time.Time `json:"started_at"`
+	FinishedAt    time.Time `json:"finished_at"`
+	TotalQueries  int       `json:"total_queries"`
+	TotalErrors   int       `json:"total_errors"`
+	WarmupQueries int       `json:"warmup_queries"`
 }
 
 // SQLFor preserves canonical SQL except for the JSON scalar extractor in the

@@ -111,7 +111,7 @@ steps:
       athena_poll_interval: 500ms
       athena_query_timeout: 30m
       run_id: ${run_id}
-      dataset_version: posthog-file-views-v1
+      dataset_version: &nightly_dataset posthog-file-views-v1
       fail_on_query_errors: true
       worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
       worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
@@ -140,7 +140,7 @@ steps:
       athena_query_timeout: 30m
       run_id: ${run_id}
       # Same dataset as perf_queries: both suites of one nightly publish together.
-      dataset_version: posthog-file-views-v1
+      dataset_version: *nightly_dataset
       output_subdir: perf-properties
       fail_on_query_errors: true
       worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}

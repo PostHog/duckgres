@@ -262,9 +262,9 @@ three workers at 1 CPU/4Gi per cluster; cache volumes reserve additional storage
 
 The frozen suite runs the newest PostHog/trino master build, whose Hoglake
 connector honors `fs.cache.enabled` through Trino's shared filesystem module
-(PostHog/trino#43). Builds before that change ignored the property, so
-`trino_cached` results published before 2026-09-23 measured an uncached cluster
-under the cached label. The baseline also does not guarantee cold JVM, OS, or
+(PostHog/trino#43). Builds before that change ignored the property, so every
+`trino_cached` result from the pinned build, through the 2026-09-23 08:35 UTC
+nightly, measured an uncached cluster under the cached label. The baseline also does not guarantee cold JVM, OS, or
 storage-service caches. Keep the protocol labels separate in history.
 
 Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
@@ -296,17 +296,25 @@ rows with a reason and no timings. Skipped rows use iteration zero and are
 excluded from measured/warmup query counts.
 
 Both suites of one nightly publish under the same dataset version
-(`posthog-file-views-v1`), distinguished by a `suite` column (`tables` or
-`properties`) on `runs` and `query_results`. The properties suite keeps its own
-`perf-properties/` directory and a `-properties` run ID suffix, so the publisher
-never overwrites one result set with the other, and records the hash of the
-selected object inventory as `fixture_version`, so history never mixes fixtures.
-The publisher's schema bootstrap adds both columns and classifies rows published
-before they existed (by the `-properties` suffix; a properties run's old
-inventory-hash dataset version becomes its `fixture_version`). A summary without
-a suite publishes as `tables`; an unknown suite is rejected. Only main-branch
-runs publish to the shared database. Dashboards select a suite with the `suite`
-column rather than by dataset version.
+(`posthog-file-views-v1`, shared through a YAML anchor in the scenario), with
+three columns on `runs` and `query_results`:
+
+- `suite` (`tables` | `properties`, a closed set in `core`, validated when the
+  step starts so a typo fails before hours of measurement);
+- `nightly_run_id`, the table-suite run's ID, which pairs a nightly's suites
+  explicitly (a standalone run is its own nightly);
+- `fixture_version`, the hash of the selected properties object inventory.
+
+The properties suite keeps its own `perf-properties/` directory and a distinct
+`-properties` run ID, so the publisher never overwrites one result set with the
+other. `fixture_version` records which fixture each properties run measured; it
+does not by itself stop a history chart from spanning a fixture change, so the
+dashboard marks those changes on its history. The schema migration is one-shot:
+it adds the columns and classifies older rows (by the `-properties` suffix they
+used to carry) only when `suite` is missing. On main, the scenario workflow runs
+it with `duckgres-perf-publisher --bootstrap-only` before deploying, so a schema
+change lands hours before the first data in its shape. A summary without a suite
+publishes as `tables`. Only main-branch runs publish to the shared database.
 
 All properties preparation happens after the original result files are complete,
 so a properties setup or validation failure cannot prevent their publication.

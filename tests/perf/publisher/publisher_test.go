@@ -175,11 +175,15 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 		t.Fatalf("unexpected run insert args: %#v", runInsert.args)
 	}
 	// A summary without a suite is a table run and carries no fixture version.
-	if got := runInsert.args[8]; got != SuiteTables {
-		t.Fatalf("run suite = %#v, want %q", got, SuiteTables)
+	if got := runInsert.args[8]; got != core.SuiteTables {
+		t.Fatalf("run suite = %#v, want %q", got, core.SuiteTables)
 	}
 	if got, ok := runInsert.args[9].(*string); !ok || got != nil {
 		t.Fatalf("run fixture_version = %#v, want nil", runInsert.args[9])
+	}
+	// A standalone run is its own nightly.
+	if got := runInsert.args[10]; got != "nightly-v1-20260311T234300Z" {
+		t.Fatalf("run nightly_run_id = %#v, want the run's own ID", got)
 	}
 	firstResultInsert := db.tx.execs[bootstrap+3]
 	if !strings.Contains(firstResultInsert.query, "INSERT INTO duckgres_perf.query_results") {
@@ -188,8 +192,8 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 	if got, ok := firstResultInsert.args[8].(*int64); !ok || got == nil || *got != 1 {
 		t.Fatalf("expected rows pointer with value 1, got %#v", firstResultInsert.args[8])
 	}
-	if got := firstResultInsert.args[15]; got != SuiteTables {
-		t.Fatalf("result suite = %#v, want %q", got, SuiteTables)
+	if got := firstResultInsert.args[15]; got != core.SuiteTables {
+		t.Fatalf("result suite = %#v, want %q", got, core.SuiteTables)
 	}
 	secondResultInsert := db.tx.execs[bootstrap+4]
 	if got, ok := secondResultInsert.args[6].(*string); !ok || got == nil || *got != "boom" {
@@ -204,6 +208,7 @@ func TestPublishArtifactsWritesSuiteAndFixtureVersion(t *testing.T) {
 		"dataset_version": "posthog-file-views-v1",
 		"suite":           "properties",
 		"fixture_version": "properties-sha256-abc",
+		"nightly_run_id":  "scenario-dev-posthog-frozen-perf-1",
 		"started_at":      "2026-03-11T23:43:03Z",
 		"finished_at":     "2026-03-11T23:43:14Z",
 	})
@@ -217,18 +222,24 @@ func TestPublishArtifactsWritesSuiteAndFixtureVersion(t *testing.T) {
 		t.Fatalf("publishArtifacts returned error: %v", err)
 	}
 	runInsert := db.tx.execs[2]
-	if runInsert.args[1] != "posthog-file-views-v1" || runInsert.args[8] != SuiteProperties {
+	if runInsert.args[1] != "posthog-file-views-v1" || runInsert.args[8] != core.SuiteProperties {
 		t.Fatalf("run dataset/suite = %#v/%#v", runInsert.args[1], runInsert.args[8])
 	}
 	if got, ok := runInsert.args[9].(*string); !ok || got == nil || *got != "properties-sha256-abc" {
 		t.Fatalf("run fixture_version = %#v", runInsert.args[9])
 	}
+	if got := runInsert.args[10]; got != "scenario-dev-posthog-frozen-perf-1" {
+		t.Fatalf("run nightly_run_id = %#v", got)
+	}
 	for _, result := range db.tx.execs[3:] {
-		if result.args[11] != "posthog-file-views-v1" || result.args[15] != SuiteProperties {
+		if result.args[11] != "posthog-file-views-v1" || result.args[15] != core.SuiteProperties {
 			t.Fatalf("result dataset/suite = %#v/%#v", result.args[11], result.args[15])
 		}
 		if got, ok := result.args[16].(*string); !ok || got == nil || *got != "properties-sha256-abc" {
 			t.Fatalf("result fixture_version = %#v", result.args[16])
+		}
+		if got := result.args[17]; got != "scenario-dev-posthog-frozen-perf-1" {
+			t.Fatalf("result nightly_run_id = %#v", got)
 		}
 	}
 }
@@ -271,26 +282,24 @@ func TestBootstrapSchemaDoesNotUseUnsupportedConstraints(t *testing.T) {
 		t.Fatalf("runs ddl should not use unsupported constraints: %s", runsDDL)
 	}
 
-	// Suite columns come after both CREATE TABLEs, on both tables, with
-	// backfills that only classify rows that are still unclassified.
-	var rest []string
-	for _, exec := range tx.execs[6:] {
-		rest = append(rest, exec.query)
+	// The suite migration follows both CREATE TABLEs, once per table, and is
+	// guarded so it adds the columns and classifies old rows only once.
+	migrations := tx.execs[6:]
+	if len(migrations) != 2 {
+		t.Fatalf("expected 2 migration statements, got %d", len(migrations))
 	}
-	for _, want := range []string{
-		"ALTER TABLE duckgres_perf.runs ADD COLUMN IF NOT EXISTS suite TEXT",
-		"ALTER TABLE duckgres_perf.runs ADD COLUMN IF NOT EXISTS fixture_version TEXT",
-		"ALTER TABLE duckgres_perf.query_results ADD COLUMN IF NOT EXISTS suite TEXT",
-		"ALTER TABLE duckgres_perf.query_results ADD COLUMN IF NOT EXISTS fixture_version TEXT",
-		"UPDATE duckgres_perf.runs SET suite = CASE WHEN run_id LIKE '%-properties' THEN 'properties' ELSE 'tables' END WHERE suite IS NULL",
-		"UPDATE duckgres_perf.query_results SET fixture_version = dataset_version WHERE fixture_version IS NULL AND dataset_version LIKE 'properties-sha256-%'",
-	} {
-		found := false
-		for _, query := range rest {
-			found = found || query == want
-		}
-		if !found {
-			t.Errorf("bootstrap missing %q; got %q", want, rest)
+	for i, table := range []string{"runs", "query_results"} {
+		stmt := migrations[i].query
+		for _, want := range []string{
+			"table_schema = 'duckgres_perf' AND table_name = '" + table + "' AND column_name = 'suite'",
+			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN suite TEXT, ADD COLUMN fixture_version TEXT, ADD COLUMN nightly_run_id TEXT",
+			"suite = CASE WHEN run_id LIKE '%-properties' THEN 'properties' ELSE 'tables' END",
+			"nightly_run_id = CASE WHEN run_id LIKE '%-properties' THEN LEFT(run_id, LENGTH(run_id) - LENGTH('-properties')) ELSE run_id END",
+			"fixture_version = CASE WHEN dataset_version LIKE 'properties-sha256-%' THEN dataset_version END",
+		} {
+			if !strings.Contains(stmt, want) {
+				t.Errorf("%s migration missing %q:\n%s", table, want, stmt)
+			}
 		}
 	}
 }

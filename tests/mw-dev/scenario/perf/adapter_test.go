@@ -66,6 +66,10 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	if result.Summary.RunID != "scenario-run-1" || result.Summary.TotalQueries != 1 || result.Summary.TotalErrors != 0 {
 		t.Fatalf("summary = %+v", result.Summary)
 	}
+	// A perf step with no suite is the table suite and its own nightly.
+	if result.Summary.Suite != perfcore.SuiteTables || result.Summary.NightlyRunID != "scenario-run-1" {
+		t.Fatalf("summary suite/nightly = %q/%q", result.Summary.Suite, result.Summary.NightlyRunID)
+	}
 	pgwireDSN := factory.pgwireConnection.DSN
 	if !strings.Contains(pgwireDSN, "host=scenario-org.dev.example") || !strings.Contains(pgwireDSN, "password=root-password") {
 		t.Fatalf("pgwire dsn = %q, want scenario org host and provision password", pgwireDSN)
@@ -96,6 +100,36 @@ func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
 	}
 	if !strings.Contains(csvText, "\nq1,i1,1,pgwire,ok,") {
 		t.Fatalf("query_results.csv missing measured pgwire row: %q", csvText)
+	}
+}
+
+func TestExecutorStampsSuiteMetadataAndRejectsUnknownSuites(t *testing.T) {
+	targets := []perfcore.Protocol{perfcore.ProtocolPGWire}
+	run := func(extra map[string]any) (*Executor, error) {
+		executor := NewExecutor(ExecutorConfig{
+			Connection: scenariosql.ConnectionConfig{DialHost: "127.0.0.1", SNISuffix: ".example.test", SSLMode: "require"},
+			OutputDir:  t.TempDir(), DriverFactory: &fakeDriverFactory{},
+		})
+		with := map[string]any{
+			"org_id": "scenario-org", "username": "root", "password": "test-password",
+			"catalog_file": writePerfCatalog(t, targets), "run_id": "nightly-1-properties",
+		}
+		for key, value := range extra {
+			with[key] = value
+		}
+		return executor, executor.ExecuteStep(context.Background(), core.Step{ID: "properties", Type: StepTypePerfQueries, With: with})
+	}
+	executor, err := run(map[string]any{"suite": "properties", "fixture_version": "properties-sha256-abc", "nightly_run_id": "nightly-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, _ := executor.State().Result("properties")
+	if result.Summary.Suite != perfcore.SuiteProperties || result.Summary.FixtureVersion != "properties-sha256-abc" || result.Summary.NightlyRunID != "nightly-1" {
+		t.Fatalf("summary = %+v", result.Summary)
+	}
+	// A typo fails before any measurement, not hours later at publish time.
+	if _, err := run(map[string]any{"suite": "property"}); err == nil || !strings.Contains(err.Error(), "unknown suite") {
+		t.Fatalf("expected unknown suite error, got %v", err)
 	}
 }
 

@@ -23,13 +23,6 @@ const defaultSchema = "duckgres_perf"
 
 var schemaNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// Suites published under one dataset. Dashboards filter on this closed set, so
-// an unknown value is rejected rather than silently published.
-const (
-	SuiteTables     = "tables"
-	SuiteProperties = "properties"
-)
-
 var keywordPasswordPattern = regexp.MustCompile(`(^|\s)password=(?:'[^']*(?:''[^']*)*'|\S+)`)
 
 var expectedQueryResultsHeader = []string{
@@ -98,6 +91,38 @@ func (c Config) Enabled() bool {
 	return strings.TrimSpace(c.DSN) != ""
 }
 
+// Bootstrap creates or migrates the publish schema without publishing a run, so
+// a schema change can land before the first run that depends on it.
+func Bootstrap(ctx context.Context, cfg Config) (err error) {
+	schema, err := validatedSchema(cfg.Schema)
+	if err != nil {
+		return err
+	}
+	db, err := openDB(cfg)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin bootstrap transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if err = bootstrapSchema(ctx, tx, schema); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit bootstrap transaction: %w", err)
+	}
+	return nil
+}
+
 func PublishRunDir(ctx context.Context, cfg Config, runDir string) error {
 	loaded, err := loadArtifacts(runDir)
 	if err != nil {
@@ -156,12 +181,15 @@ func loadSummary(path string) (core.RunSummary, error) {
 	if summary.RunID == "" {
 		return core.RunSummary{}, fmt.Errorf("summary.json is missing run_id")
 	}
-	// Summaries written before suites existed are table runs.
+	// Summaries written before suites existed are standalone table runs.
 	if summary.Suite == "" {
-		summary.Suite = SuiteTables
+		summary.Suite = core.SuiteTables
 	}
-	if summary.Suite != SuiteTables && summary.Suite != SuiteProperties {
-		return core.RunSummary{}, fmt.Errorf("summary.json has unknown suite %q", summary.Suite)
+	if err := core.ValidateSuite(summary.Suite); err != nil {
+		return core.RunSummary{}, fmt.Errorf("summary.json: %w", err)
+	}
+	if summary.NightlyRunID == "" {
+		summary.NightlyRunID = summary.RunID
 	}
 	if summary.StartedAt.IsZero() {
 		return core.RunSummary{}, fmt.Errorf("summary.json is missing started_at")
@@ -297,18 +325,18 @@ func publishArtifacts(ctx context.Context, cfg Config, db dbHandle, loaded artif
 	}
 	fixtureVersion := stringPtrOrNil(loaded.Summary.FixtureVersion)
 	if _, err = tx.ExecContext(ctx, fmt.Sprintf(
-		"INSERT INTO %s.runs (run_id, dataset_version, started_at, finished_at, total_queries, total_errors, warmup_queries, run_date, suite, fixture_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+		"INSERT INTO %s.runs (run_id, dataset_version, started_at, finished_at, total_queries, total_errors, warmup_queries, run_date, suite, fixture_version, nightly_run_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
 		schema,
-	), loaded.Summary.RunID, loaded.Summary.DatasetVersion, loaded.Summary.StartedAt, loaded.Summary.FinishedAt, loaded.Summary.TotalQueries, loaded.Summary.TotalErrors, loaded.Summary.WarmupQueries, loaded.Summary.StartedAt.UTC().Format("2006-01-02"), loaded.Summary.Suite, fixtureVersion); err != nil {
+	), loaded.Summary.RunID, loaded.Summary.DatasetVersion, loaded.Summary.StartedAt, loaded.Summary.FinishedAt, loaded.Summary.TotalQueries, loaded.Summary.TotalErrors, loaded.Summary.WarmupQueries, loaded.Summary.StartedAt.UTC().Format("2006-01-02"), loaded.Summary.Suite, fixtureVersion, loaded.Summary.NightlyRunID); err != nil {
 		return fmt.Errorf("insert run summary: %w", err)
 	}
 	insertQuery := fmt.Sprintf(
-		"INSERT INTO %s.query_results (run_id, query_id, intent_id, measure_iteration, protocol, status, error, error_class, rows, duration_ms, started_at, dataset_version, run_date, representation, run_label, suite, fixture_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+		"INSERT INTO %s.query_results (run_id, query_id, intent_id, measure_iteration, protocol, status, error, error_class, rows, duration_ms, started_at, dataset_version, run_date, representation, run_label, suite, fixture_version, nightly_run_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
 		schema,
 	)
 	runDate := loaded.Summary.StartedAt.UTC().Format("2006-01-02")
 	for _, result := range loaded.Results {
-		if _, err = tx.ExecContext(ctx, insertQuery, loaded.Summary.RunID, result.QueryID, result.IntentID, result.MeasureIteration, result.Protocol, result.Status, result.Error, result.ErrorClass, result.Rows, result.DurationMS, result.StartedAt, loaded.Summary.DatasetVersion, runDate, result.Representation, core.Protocol(result.Protocol).RunLabel(result.Representation), loaded.Summary.Suite, fixtureVersion); err != nil {
+		if _, err = tx.ExecContext(ctx, insertQuery, loaded.Summary.RunID, result.QueryID, result.IntentID, result.MeasureIteration, result.Protocol, result.Status, result.Error, result.ErrorClass, result.Rows, result.DurationMS, result.StartedAt, loaded.Summary.DatasetVersion, runDate, result.Representation, core.Protocol(result.Protocol).RunLabel(result.Representation), loaded.Summary.Suite, fixtureVersion, loaded.Summary.NightlyRunID); err != nil {
 			return fmt.Errorf("insert query result (%s/%s/%d/%s): %w", loaded.Summary.RunID, result.QueryID, result.MeasureIteration, result.Protocol, err)
 		}
 	}
@@ -350,17 +378,26 @@ func bootstrapSchema(ctx context.Context, tx txHandle, schema string) error {
   run_date DATE NOT NULL
 )`, schema),
 	}
-	// Suites share one dataset. Rows published before these columns existed are
-	// classified by the one convention that distinguished them: properties runs
-	// carry a -properties run ID suffix and published their fixture hash as the
-	// dataset version. The backfills touch only unclassified rows.
+	// Suites share one dataset. This is a one-shot migration: the columns are
+	// added and the existing rows classified only when suite is missing, so
+	// later publishes pay nothing. Rows published before it are classified by
+	// the one convention that told suites apart then: properties runs carried a
+	// -properties run ID suffix and published their fixture hash as the
+	// dataset version. New rows always carry explicit values. The schema name is
+	// a validated identifier, so it is safe to interpolate.
 	for _, table := range []string{"runs", "query_results"} {
-		statements = append(statements,
-			fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN IF NOT EXISTS suite TEXT", schema, table),
-			fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN IF NOT EXISTS fixture_version TEXT", schema, table),
-			fmt.Sprintf("UPDATE %s.%s SET suite = CASE WHEN run_id LIKE '%%-properties' THEN '%s' ELSE '%s' END WHERE suite IS NULL", schema, table, SuiteProperties, SuiteTables),
-			fmt.Sprintf("UPDATE %s.%s SET fixture_version = dataset_version WHERE fixture_version IS NULL AND dataset_version LIKE 'properties-sha256-%%'", schema, table),
-		)
+		statements = append(statements, fmt.Sprintf(`DO $migrate$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+      WHERE table_schema = '%[1]s' AND table_name = '%[2]s' AND column_name = 'suite') THEN
+    ALTER TABLE %[1]s.%[2]s ADD COLUMN suite TEXT, ADD COLUMN fixture_version TEXT, ADD COLUMN nightly_run_id TEXT;
+    UPDATE %[1]s.%[2]s SET
+      suite = CASE WHEN run_id LIKE '%%-properties' THEN '%[3]s' ELSE '%[4]s' END,
+      nightly_run_id = CASE WHEN run_id LIKE '%%-properties' THEN LEFT(run_id, LENGTH(run_id) - LENGTH('-properties')) ELSE run_id END,
+      fixture_version = CASE WHEN dataset_version LIKE 'properties-sha256-%%' THEN dataset_version END;
+  END IF;
+END
+$migrate$`, schema, table, core.SuiteProperties, core.SuiteTables))
 	}
 	for _, stmt := range statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
