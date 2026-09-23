@@ -17,10 +17,9 @@ import (
 )
 
 type Dependencies struct {
-	Stdin     io.Reader
-	Stdout    io.Writer
-	Publish   func(context.Context, publisher.Config, string) error
-	Bootstrap func(context.Context, publisher.Config) error
+	Stdin   io.Reader
+	Stdout  io.Writer
+	Publish func(context.Context, publisher.Config, string) error
 }
 
 type connectionSecret struct {
@@ -44,10 +43,6 @@ func Run(ctx context.Context, args []string, deps Dependencies) error {
 	if publish == nil {
 		publish = publisher.PublishRunDir
 	}
-	bootstrapOnly := deps.Bootstrap
-	if bootstrapOnly == nil {
-		bootstrapOnly = publisher.Bootstrap
-	}
 
 	flags := flag.NewFlagSet("duckgres-perf-publisher", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -58,21 +53,13 @@ func Run(ctx context.Context, args []string, deps Dependencies) error {
 	schema := flags.String("schema", "", "target schema (publisher default when empty)")
 	bootstrap := flags.Bool("bootstrap-schema", true, "create the target schema and tables when missing")
 	publishTimeout := flags.Duration("publish-timeout", 2*time.Minute, "maximum duration for publishing one perf artifact")
-	schemaOnly := flags.Bool("bootstrap-only", false, "create or migrate the target schema without publishing a run (no --run-dir)")
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("parse flags: %w", err)
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	if *schemaOnly {
-		if strings.TrimSpace(*runDir) != "" {
-			return errors.New("--bootstrap-only takes no --run-dir")
-		}
-		if !*bootstrap {
-			return errors.New("--bootstrap-only requires --bootstrap-schema")
-		}
-	} else if strings.TrimSpace(*runDir) == "" {
+	if strings.TrimSpace(*runDir) == "" {
 		return errors.New("run-dir is required")
 	}
 	if (strings.TrimSpace(*dsn) == "") == !*secretStdin {
@@ -98,15 +85,6 @@ func Run(ctx context.Context, args []string, deps Dependencies) error {
 	}
 
 	publishCtx, cancel := context.WithTimeout(ctx, *publishTimeout)
-	if *schemaOnly {
-		err := bootstrapOnly(publishCtx, cfg)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("bootstrap perf schema: %w", err)
-		}
-		_, _ = fmt.Fprintln(stdout, "bootstrapped perf schema")
-		return nil
-	}
 	err := publish(publishCtx, cfg, *runDir)
 	cancel()
 	if err != nil {

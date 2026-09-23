@@ -91,38 +91,6 @@ func (c Config) Enabled() bool {
 	return strings.TrimSpace(c.DSN) != ""
 }
 
-// Bootstrap creates or migrates the publish schema without publishing a run, so
-// a schema change can land before the first run that depends on it.
-func Bootstrap(ctx context.Context, cfg Config) (err error) {
-	schema, err := validatedSchema(cfg.Schema)
-	if err != nil {
-		return err
-	}
-	db, err := openDB(cfg)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = db.Close()
-	}()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin bootstrap transaction: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
-	if err = bootstrapSchema(ctx, tx, schema); err != nil {
-		return err
-	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("commit bootstrap transaction: %w", err)
-	}
-	return nil
-}
-
 func PublishRunDir(ctx context.Context, cfg Config, runDir string) error {
 	loaded, err := loadArtifacts(runDir)
 	if err != nil {
@@ -378,26 +346,22 @@ func bootstrapSchema(ctx context.Context, tx txHandle, schema string) error {
   run_date DATE NOT NULL
 )`, schema),
 	}
-	// Suites share one dataset. This is a one-shot migration: the columns are
-	// added and the existing rows classified only when suite is missing, so
-	// later publishes pay nothing. Rows published before it are classified by
-	// the one convention that told suites apart then: properties runs carried a
-	// -properties run ID suffix and published their fixture hash as the
-	// dataset version. New rows always carry explicit values. The schema name is
-	// a validated identifier, so it is safe to interpolate.
+	// Suites share one dataset. Rows published before these columns existed are
+	// classified by the one convention that told suites apart then: properties
+	// runs carried a -properties run ID suffix and published their fixture hash
+	// as the dataset version. New rows always carry explicit values, so the
+	// backfills only ever touch pre-migration rows.
 	for _, table := range []string{"runs", "query_results"} {
-		statements = append(statements, fmt.Sprintf(`DO $migrate$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-      WHERE table_schema = '%[1]s' AND table_name = '%[2]s' AND column_name = 'suite') THEN
-    ALTER TABLE %[1]s.%[2]s ADD COLUMN suite TEXT, ADD COLUMN fixture_version TEXT, ADD COLUMN nightly_run_id TEXT;
-    UPDATE %[1]s.%[2]s SET
-      suite = CASE WHEN run_id LIKE '%%-properties' THEN '%[3]s' ELSE '%[4]s' END,
-      nightly_run_id = CASE WHEN run_id LIKE '%%-properties' THEN LEFT(run_id, LENGTH(run_id) - LENGTH('-properties')) ELSE run_id END,
-      fixture_version = CASE WHEN dataset_version LIKE 'properties-sha256-%%' THEN dataset_version END;
-  END IF;
-END
-$migrate$`, schema, table, core.SuiteProperties, core.SuiteTables))
+		statements = append(statements,
+			fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN IF NOT EXISTS suite TEXT", schema, table),
+			fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN IF NOT EXISTS fixture_version TEXT", schema, table),
+			fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN IF NOT EXISTS nightly_run_id TEXT", schema, table),
+			fmt.Sprintf(`UPDATE %[1]s.%[2]s SET
+  suite = CASE WHEN run_id LIKE '%%-properties' THEN '%[3]s' ELSE '%[4]s' END,
+  nightly_run_id = CASE WHEN run_id LIKE '%%-properties' THEN LEFT(run_id, LENGTH(run_id) - LENGTH('-properties')) ELSE run_id END,
+  fixture_version = CASE WHEN dataset_version LIKE 'properties-sha256-%%' THEN dataset_version END
+WHERE suite IS NULL`, schema, table, core.SuiteProperties, core.SuiteTables),
+		)
 	}
 	for _, stmt := range statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {

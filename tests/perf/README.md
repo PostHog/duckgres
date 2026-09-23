@@ -308,13 +308,12 @@ three columns on `runs` and `query_results`:
 The properties suite keeps its own `perf-properties/` directory and a distinct
 `-properties` run ID, so the publisher never overwrites one result set with the
 other. `fixture_version` records which fixture each properties run measured; it
-does not by itself stop a history chart from spanning a fixture change, so the
-dashboard marks those changes on its history. The schema migration is one-shot:
-it adds the columns and classifies older rows (by the `-properties` suffix they
-used to carry) only when `suite` is missing. On main, the scenario workflow runs
-it with `duckgres-perf-publisher --bootstrap-only` before deploying, so a schema
-change lands hours before the first data in its shape. A summary without a suite
-publishes as `tables`. Only main-branch runs publish to the shared database.
+does not by itself stop a history chart from spanning a fixture change, so
+regenerating the fixture is a deliberate history break. The publisher's schema
+bootstrap adds the columns and classifies rows published before they existed
+(by the `-properties` suffix they used to carry); rows with explicit values are
+never touched. A summary without a suite publishes as `tables`. Only
+main-branch runs publish to the shared database.
 
 All properties preparation happens after the original result files are complete,
 so a properties setup or validation failure cannot prevent their publication.

@@ -166,27 +166,6 @@ jobs:
             fi
           fi
 
-      # Migrate the history schema before the multi-hour run, so a publisher
-      # schema change (and any dashboard that depends on it) can land before
-      # the first data in the new shape is published.
-      - name: Bootstrap scenario perf schema
-        if: ${{ github.ref == 'refs/heads/main' }}
-        timeout-minutes: 5
-        env:
-          MW_DEV_SCENARIO_PERF_SECRET_ID: ${{ vars.MW_DEV_SCENARIO_PERF_SECRET_ID }}
-        run: |
-          set -euo pipefail
-          : "${MW_DEV_SCENARIO_PERF_SECRET_ID:?MW_DEV_SCENARIO_PERF_SECRET_ID repository variable is required}"
-          aws secretsmanager get-secret-value \
-            --secret-id "$MW_DEV_SCENARIO_PERF_SECRET_ID" \
-            --query SecretString \
-            --output text \
-            | go run ./cmd/duckgres-perf-publisher \
-                --bootstrap-only \
-                --connection-secret-stdin \
-                --publish-timeout 2m \
-                --schema duckgres_scenario_perf
-
       - name: Deploy isolated Duckgres stack
         run: tests/mw-dev/run.sh deploy
 

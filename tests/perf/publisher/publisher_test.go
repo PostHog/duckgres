@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -282,23 +283,36 @@ func TestBootstrapSchemaDoesNotUseUnsupportedConstraints(t *testing.T) {
 		t.Fatalf("runs ddl should not use unsupported constraints: %s", runsDDL)
 	}
 
-	// The suite migration follows both CREATE TABLEs, once per table, and is
-	// guarded so it adds the columns and classifies old rows only once.
-	migrations := tx.execs[6:]
-	if len(migrations) != 2 {
-		t.Fatalf("expected 2 migration statements, got %d", len(migrations))
+	// Suite columns follow both CREATE TABLEs, on both tables, with a backfill
+	// that only classifies rows published before the columns existed.
+	var rest []string
+	for _, exec := range tx.execs[6:] {
+		rest = append(rest, exec.query)
 	}
-	for i, table := range []string{"runs", "query_results"} {
-		stmt := migrations[i].query
+	for _, table := range []string{"runs", "query_results"} {
 		for _, want := range []string{
-			"table_schema = 'duckgres_perf' AND table_name = '" + table + "' AND column_name = 'suite'",
-			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN suite TEXT, ADD COLUMN fixture_version TEXT, ADD COLUMN nightly_run_id TEXT",
+			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN IF NOT EXISTS suite TEXT",
+			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN IF NOT EXISTS fixture_version TEXT",
+			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN IF NOT EXISTS nightly_run_id TEXT",
+		} {
+			if !slices.Contains(rest, want) {
+				t.Errorf("bootstrap missing %q", want)
+			}
+		}
+		backfill := ""
+		for _, query := range rest {
+			if strings.HasPrefix(query, "UPDATE duckgres_perf."+table+" SET") {
+				backfill = query
+			}
+		}
+		for _, want := range []string{
 			"suite = CASE WHEN run_id LIKE '%-properties' THEN 'properties' ELSE 'tables' END",
 			"nightly_run_id = CASE WHEN run_id LIKE '%-properties' THEN LEFT(run_id, LENGTH(run_id) - LENGTH('-properties')) ELSE run_id END",
 			"fixture_version = CASE WHEN dataset_version LIKE 'properties-sha256-%' THEN dataset_version END",
+			"WHERE suite IS NULL",
 		} {
-			if !strings.Contains(stmt, want) {
-				t.Errorf("%s migration missing %q:\n%s", table, want, stmt)
+			if !strings.Contains(backfill, want) {
+				t.Errorf("%s backfill missing %q:\n%s", table, want, backfill)
 			}
 		}
 	}
