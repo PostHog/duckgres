@@ -72,6 +72,11 @@ before deploying the readiness-aware control plane.
 New-cell OPA sidecars poll `/bundles/trino/<cell-id>` with that namespace's
 bundle token. Legacy keeps `/bundles/trino`. Tokens cannot read another cell's
 bundle. The observer credential remains separate from the catalog administrator.
+A shared-pool cell has no fixed coordinator, so its observer reads the pool's
+current instances from the config store on each call and asks every instance
+that can hold queries (ADMITTED, SERVING, DRAINING, SEALED or SUSPECT) on its
+own Service, declaring the Gateway's forwarded HTTPS hop. The console and usage
+metering see the union; one unreachable member does not hide the others.
 In registry-only mode, `/bundles/trino` is absent and returns HTTP 404. Missing
 bundle URLs never fall back to the admin UI page.
 

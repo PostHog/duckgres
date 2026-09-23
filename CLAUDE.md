@@ -994,7 +994,11 @@ impersonation, audit log; sliceable by org + user). Design + decisions:
   passwords remain write-only provision/reset results.
   Every read is cached + timeout-bounded and degrades to `available:false`
   plus a reason rather than erroring the page: the console must render
-  during exactly the incident it exists for. Unset
+  during exactly the incident it exists for. A shared-pool cell has no fixed
+  coordinator, so its observer (`trino_pool_observer.go`) lists the pool's
+  live instances on every call and fans out to each instance's Service over
+  forwarded HTTPS; usage metering polls the same observer. Never build a
+  pool observer from `CoordinatorURL` - it is empty (#1216). Unset
   legacy URL and registry configuration leaves the routes unregistered.
 - Touching any of the above → update `controlplane/admin/*_test.go` (esp
   `authz_test.go`, `kill_switch_test.go`, `operators_api_test.go`,

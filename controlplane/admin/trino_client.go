@@ -251,6 +251,11 @@ type trinoCoordinatorHTTPClient struct {
 	baseURL string
 	hc      *http.Client
 	creds   TrinoCredentialSource
+	// forwardedHTTPS declares the TLS hop the Gateway terminated. A pool
+	// member serves plain HTTP on its in-cluster Service and, like every
+	// other client of that Service, must say so rather than have the
+	// coordinator relax password authentication for cleartext.
+	forwardedHTTPS bool
 }
 
 // newTrinoCoordinatorClient builds a client with a fixed password. Used by
@@ -287,6 +292,19 @@ func NewTrinoCoordinatorClient(baseURL, tlsServerName string, creds TrinoCredent
 	}
 }
 
+// NewTrinoPoolMemberClient builds an observer client for one shared-pool
+// instance, addressed on its in-cluster Service over plain HTTP. TLS for a
+// pool terminates at the Gateway, so the request declares that forwarded
+// hop the same way the pool operator's own probes do.
+func NewTrinoPoolMemberClient(baseURL string, creds TrinoCredentialSource) TrinoCoordinatorClient {
+	return &trinoCoordinatorHTTPClient{
+		baseURL:        strings.TrimSuffix(baseURL, "/"),
+		hc:             &http.Client{Timeout: trinoCoordinatorTimeout},
+		creds:          creds,
+		forwardedHTTPS: true,
+	}
+}
+
 // do issues one authenticated request and returns the body. Non-2xx is an
 // error carrying the status, except two cases that are not cell failures:
 //
@@ -316,6 +334,10 @@ func (c *trinoCoordinatorHTTPClient) doURL(ctx context.Context, method, rawURL, 
 	req.Header.Set("X-Trino-Source", TrinoAdminSource)
 	req.Header.Set("Accept", "application/json")
 	req.SetBasicAuth(user, password)
+	if c.forwardedHTTPS {
+		req.Header.Set("X-Forwarded-Proto", "https")
+		req.Header.Set("X-Forwarded-Port", "443")
+	}
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -645,11 +667,36 @@ func (c *trinoCoordinatorHTTPClient) runStatement(ctx context.Context, sql strin
 		if r.NextURI == "" {
 			return all, nil
 		}
-		if body, err = c.doURL(ctx, http.MethodGet, r.NextURI, "/v1/statement", nil); err != nil {
+		next, err := c.continuationURL(r.NextURI)
+		if err != nil {
+			return nil, err
+		}
+		if body, err = c.doURL(ctx, http.MethodGet, next, "/v1/statement", nil); err != nil {
 			return nil, err
 		}
 	}
 	return nil, fmt.Errorf("statement drain exceeded %d hops without completing", maxDrainHops)
+}
+
+// continuationURL maps a nextUri back onto the transport this client dials.
+//
+// A pool member honors the forwarded headers, so its nextUri names the HTTPS
+// origin the Gateway would serve (https://<service host>:443) rather than the
+// plain-HTTP Service the request actually reached. Only a statement path on
+// the same host is rewritten; anything else is refused rather than followed.
+func (c *trinoCoordinatorHTTPClient) continuationURL(nextURI string) (string, error) {
+	if !c.forwardedHTTPS {
+		return nextURI, nil
+	}
+	base, baseErr := url.Parse(c.baseURL)
+	next, err := url.Parse(nextURI)
+	if baseErr != nil || err != nil || next.User != nil ||
+		!strings.EqualFold(next.Hostname(), base.Hostname()) ||
+		!strings.HasPrefix(next.Path, "/v1/statement/") {
+		return "", errors.New("trino: statement continuation points outside the pool member")
+	}
+	next.Scheme, next.Host = base.Scheme, base.Host
+	return next.String(), nil
 }
 
 // announcedNodes reads the ANNOUNCE inventory: the set of node URIs that

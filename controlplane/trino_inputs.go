@@ -142,6 +142,10 @@ type trinoCell struct {
 	CoordinatorURL    string
 	TLSServerName     string
 	ClientURL         string
+	// PoolCoordinatorPort is a shared-pool cell's per-instance coordinator
+	// Service port. A pool has no CoordinatorURL; its observer reaches each
+	// instance on this port instead.
+	PoolCoordinatorPort int32
 }
 
 // consoleCell preserves legacy ownership and exposes each logical identity.
@@ -386,6 +390,17 @@ func buildTrinoCellWiring(store trinoWiringStore, kc kubernetes.Interface, duckl
 	// with a token a real client could match by accident.
 	bundleHandler := opa.NewHandler(bundleStore, opa.BearerTokenAuth(bundleToken))
 	observer := admin.NewTrinoCoordinatorClient(cell.CoordinatorURL, cell.TLSServerName, trinoProv.ObserverCredential)
+	if cell.Mode == trinoPoolModeShared {
+		// A pool has no fixed coordinator, so the client above would dial an
+		// empty URL: the console would report every pooled org unavailable
+		// and usage metering would skip the pool (#1216). Observe the pool's
+		// current instances instead.
+		lister, ok := store.(trinoPoolInstanceLister)
+		if !ok {
+			return nil, fmt.Errorf("Trino cell %s is a shared pool but its store cannot list pool instances", cell.PublicID)
+		}
+		observer = newTrinoPoolObserver(cell.ID, cell.Namespace, cell.PoolCoordinatorPort, lister, trinoProv.ObserverCredential)
+	}
 	observers := []admin.TrinoCoordinatorClient{observer}
 	for _, backend := range cell.Backends {
 		if backend.Running && !backend.RoutingActive {
