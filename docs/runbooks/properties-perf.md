@@ -68,6 +68,7 @@ fixture catalogs and metadata without deleting source S3 files.
 | duckgres (vanilla) | Off | JSON |
 | duckgres (cache) | On | JSON |
 | trino (vanilla) | Off | JSON |
+| trino (cache) | On | JSON |
 | trino (cache+variant) | On | VARIANT — explicitly skipped |
 | Athena | — | STRUCT |
 
@@ -83,15 +84,15 @@ do not substitute JSON under a VARIANT label.
 
 ## Results and recovery
 
-Original results retain `perf/`, the original run ID, and dataset version.
-Properties use `perf-properties/`, a `-properties` run ID suffix, and an
-inventory-derived dataset version. Both summaries are handled by the existing
-publisher; only main-branch runs publish to the historical database. A
+Both suites publish under the nightly's dataset version with a `suite` column
+(`tables` / `properties`). Properties use `perf-properties/`, a `-properties`
+run ID suffix, and record the inventory-derived hash as `fixture_version`. Both
+summaries are handled by the existing publisher; only main-branch runs publish
+to the historical database. A
 properties failure still fails the scenario, but previously completed original
 results remain available for upload and publication. No timing result is
 claimed for a skipped comparison. Dashboard comparisons should filter
-`status = 'ok'` and use the matching properties intent; original aggregate
-panels retain their existing query selection.
+`status = 'ok'` and select the suite with the `suite` column.
 
 For missing/inaccessible prefixes, correct the selection or access and rerun.
 For Athena mapping failures, use the generated SQL and approved fixture

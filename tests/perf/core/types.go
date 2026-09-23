@@ -26,6 +26,8 @@ func (p Protocol) RunLabel(representation string) string {
 		return "duckgres (cache)"
 	case p == ProtocolTrino && representation == "json":
 		return "trino (vanilla)"
+	case p == ProtocolTrinoCached && representation == "json":
+		return "trino (cache)"
 	case p == ProtocolTrinoCached && representation == "variant":
 		return "trino (cache+variant)"
 	default:
@@ -114,8 +116,14 @@ type QueryResult struct {
 }
 
 type RunSummary struct {
-	RunID          string    `json:"run_id"`
-	DatasetVersion string    `json:"dataset_version"`
+	RunID          string `json:"run_id"`
+	DatasetVersion string `json:"dataset_version"`
+	// Suite names the comparison family inside a dataset ("tables" or
+	// "properties"); one nightly publishes several suites under one dataset.
+	Suite string `json:"suite,omitempty"`
+	// FixtureVersion identifies the exact fixture a suite measured when it is
+	// finer-grained than the dataset (e.g. the properties object inventory).
+	FixtureVersion string    `json:"fixture_version,omitempty"`
 	StartedAt      time.Time `json:"started_at"`
 	FinishedAt     time.Time `json:"finished_at"`
 	TotalQueries   int       `json:"total_queries"`

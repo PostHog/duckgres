@@ -71,6 +71,8 @@ type stepSpec struct {
 	Targets              []perfcore.Protocol
 	RunID                string
 	DatasetVersion       string
+	Suite                string
+	FixtureVersion       string
 	Database             string
 	OutputSubdir         string
 	ReadOnly             bool
@@ -203,6 +205,8 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		RunID:          spec.RunID,
 		Catalog:        catalog,
 		DatasetVersion: spec.DatasetVersion,
+		Suite:          spec.Suite,
+		FixtureVersion: spec.FixtureVersion,
 		Drivers:        drivers,
 		Sink:           closingSink{sink: sink, closeFunc: closeSink},
 		Now:            e.now,
@@ -298,6 +302,8 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		Targets:             targets,
 		RunID:               runID,
 		DatasetVersion:      stringFromWith(step, "dataset_version", ""),
+		Suite:               stringFromWith(step, "suite", "tables"),
+		FixtureVersion:      stringFromWith(step, "fixture_version", ""),
 		Database:            stringFromWith(step, "catalog", "ducklake"),
 		OutputSubdir:        stringFromWith(step, "output_subdir", "perf"),
 		ReadOnly:            boolFromWith(step, "read_only", true),

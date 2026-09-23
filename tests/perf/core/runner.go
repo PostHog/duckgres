@@ -24,6 +24,8 @@ type RunnerConfig struct {
 	RunID          string
 	Catalog        Catalog
 	DatasetVersion string
+	Suite          string
+	FixtureVersion string
 	Drivers        map[Protocol]ProtocolDriver
 	Sink           ResultSink
 	OnSetup        func(context.Context) error
@@ -57,6 +59,8 @@ func (r *QueryRunner) Run(ctx context.Context) (RunSummary, error) {
 	summary := RunSummary{
 		RunID:          runID,
 		DatasetVersion: r.cfg.DatasetVersion,
+		Suite:          r.cfg.Suite,
+		FixtureVersion: r.cfg.FixtureVersion,
 		StartedAt:      startedAt,
 		FinishedAt:     startedAt,
 	}

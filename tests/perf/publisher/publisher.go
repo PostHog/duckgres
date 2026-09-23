@@ -22,6 +22,14 @@ import (
 const defaultSchema = "duckgres_perf"
 
 var schemaNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// Suites published under one dataset. Dashboards filter on this closed set, so
+// an unknown value is rejected rather than silently published.
+const (
+	SuiteTables     = "tables"
+	SuiteProperties = "properties"
+)
+
 var keywordPasswordPattern = regexp.MustCompile(`(^|\s)password=(?:'[^']*(?:''[^']*)*'|\S+)`)
 
 var expectedQueryResultsHeader = []string{
@@ -147,6 +155,13 @@ func loadSummary(path string) (core.RunSummary, error) {
 	}
 	if summary.RunID == "" {
 		return core.RunSummary{}, fmt.Errorf("summary.json is missing run_id")
+	}
+	// Summaries written before suites existed are table runs.
+	if summary.Suite == "" {
+		summary.Suite = SuiteTables
+	}
+	if summary.Suite != SuiteTables && summary.Suite != SuiteProperties {
+		return core.RunSummary{}, fmt.Errorf("summary.json has unknown suite %q", summary.Suite)
 	}
 	if summary.StartedAt.IsZero() {
 		return core.RunSummary{}, fmt.Errorf("summary.json is missing started_at")
@@ -280,19 +295,20 @@ func publishArtifacts(ctx context.Context, cfg Config, db dbHandle, loaded artif
 	if _, err = tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s.runs WHERE run_id = $1", schema), loaded.Summary.RunID); err != nil {
 		return fmt.Errorf("delete existing run summary: %w", err)
 	}
+	fixtureVersion := stringPtrOrNil(loaded.Summary.FixtureVersion)
 	if _, err = tx.ExecContext(ctx, fmt.Sprintf(
-		"INSERT INTO %s.runs (run_id, dataset_version, started_at, finished_at, total_queries, total_errors, warmup_queries, run_date) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+		"INSERT INTO %s.runs (run_id, dataset_version, started_at, finished_at, total_queries, total_errors, warmup_queries, run_date, suite, fixture_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
 		schema,
-	), loaded.Summary.RunID, loaded.Summary.DatasetVersion, loaded.Summary.StartedAt, loaded.Summary.FinishedAt, loaded.Summary.TotalQueries, loaded.Summary.TotalErrors, loaded.Summary.WarmupQueries, loaded.Summary.StartedAt.UTC().Format("2006-01-02")); err != nil {
+	), loaded.Summary.RunID, loaded.Summary.DatasetVersion, loaded.Summary.StartedAt, loaded.Summary.FinishedAt, loaded.Summary.TotalQueries, loaded.Summary.TotalErrors, loaded.Summary.WarmupQueries, loaded.Summary.StartedAt.UTC().Format("2006-01-02"), loaded.Summary.Suite, fixtureVersion); err != nil {
 		return fmt.Errorf("insert run summary: %w", err)
 	}
 	insertQuery := fmt.Sprintf(
-		"INSERT INTO %s.query_results (run_id, query_id, intent_id, measure_iteration, protocol, status, error, error_class, rows, duration_ms, started_at, dataset_version, run_date, representation, run_label) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+		"INSERT INTO %s.query_results (run_id, query_id, intent_id, measure_iteration, protocol, status, error, error_class, rows, duration_ms, started_at, dataset_version, run_date, representation, run_label, suite, fixture_version) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
 		schema,
 	)
 	runDate := loaded.Summary.StartedAt.UTC().Format("2006-01-02")
 	for _, result := range loaded.Results {
-		if _, err = tx.ExecContext(ctx, insertQuery, loaded.Summary.RunID, result.QueryID, result.IntentID, result.MeasureIteration, result.Protocol, result.Status, result.Error, result.ErrorClass, result.Rows, result.DurationMS, result.StartedAt, loaded.Summary.DatasetVersion, runDate, result.Representation, core.Protocol(result.Protocol).RunLabel(result.Representation)); err != nil {
+		if _, err = tx.ExecContext(ctx, insertQuery, loaded.Summary.RunID, result.QueryID, result.IntentID, result.MeasureIteration, result.Protocol, result.Status, result.Error, result.ErrorClass, result.Rows, result.DurationMS, result.StartedAt, loaded.Summary.DatasetVersion, runDate, result.Representation, core.Protocol(result.Protocol).RunLabel(result.Representation), loaded.Summary.Suite, fixtureVersion); err != nil {
 			return fmt.Errorf("insert query result (%s/%s/%d/%s): %w", loaded.Summary.RunID, result.QueryID, result.MeasureIteration, result.Protocol, err)
 		}
 	}
@@ -333,6 +349,18 @@ func bootstrapSchema(ctx context.Context, tx txHandle, schema string) error {
   warmup_queries BIGINT NOT NULL,
   run_date DATE NOT NULL
 )`, schema),
+	}
+	// Suites share one dataset. Rows published before these columns existed are
+	// classified by the one convention that distinguished them: properties runs
+	// carry a -properties run ID suffix and published their fixture hash as the
+	// dataset version. The backfills touch only unclassified rows.
+	for _, table := range []string{"runs", "query_results"} {
+		statements = append(statements,
+			fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN IF NOT EXISTS suite TEXT", schema, table),
+			fmt.Sprintf("ALTER TABLE %s.%s ADD COLUMN IF NOT EXISTS fixture_version TEXT", schema, table),
+			fmt.Sprintf("UPDATE %s.%s SET suite = CASE WHEN run_id LIKE '%%-properties' THEN '%s' ELSE '%s' END WHERE suite IS NULL", schema, table, SuiteProperties, SuiteTables),
+			fmt.Sprintf("UPDATE %s.%s SET fixture_version = dataset_version WHERE fixture_version IS NULL AND dataset_version LIKE 'properties-sha256-%%'", schema, table),
+		)
 	}
 	for _, stmt := range statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {

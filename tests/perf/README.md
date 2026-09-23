@@ -260,11 +260,11 @@ queries/iterations until eviction or teardown; one warm-up does not guarantee
 every replica holds the complete working set. Worker CPU/memory limits remain
 three workers at 1 CPU/4Gi per cluster; cache volumes reserve additional storage.
 
-The current frozen suite uses the pinned Hoglake connector, which ignores
-`fs.cache.enabled`; actual filesystem-cache support remains deferred. Thus
-`trino_cached` currently labels the requested configuration, not verified cache
-hits or a demonstrated cache benefit. Consolidating the scenario does not change
-that connector behavior. The baseline also does not guarantee cold JVM, OS, or
+The frozen suite runs the newest PostHog/trino master build, whose Hoglake
+connector honors `fs.cache.enabled` through Trino's shared filesystem module
+(PostHog/trino#43). Builds before that change ignored the property, so
+`trino_cached` results published before 2026-09-23 measured an uncached cluster
+under the cached label. The baseline also does not guarantee cold JVM, OS, or
 storage-service caches. Keep the protocol labels separate in history.
 
 Trino `physicalInputBytes` can include bytes served from cache. Use cache-manager
@@ -287,22 +287,26 @@ iterations. Merely filtering a large mixed-day file set does not guarantee small
 scans. The runner does not generate data or enforce a row-count limit.
 
 The properties catalog measures JSON with `duckgres (vanilla)`, `duckgres (cache)`,
-and `trino (vanilla)`, plus STRUCT with Athena. Athena executes only STRUCT;
+`trino (vanilla)` and `trino (cache)`, plus STRUCT with Athena, so every engine
+covers every properties intent. Athena executes only STRUCT;
 its complete ordered results must match the shared Duckgres/Trino JSON baseline
 for each intent before properties measurements start. `trino (cache+variant)` is explicitly
 unsupported until Hoglake supports VARIANT: its two comparisons emit `skipped`
-rows with a reason and no timings, and do not connect to cached Trino. Skipped
-rows use iteration zero and are excluded from measured/warmup query counts.
-Original cached Trino benchmarks continue running normally.
+rows with a reason and no timings. Skipped rows use iteration zero and are
+excluded from measured/warmup query counts.
 
-Original results retain `perf/`, the scenario run ID, and
-`posthog-file-views-v1`. Properties results use `perf-properties/`, a
-`-properties` run ID suffix, and a version derived from the selected object
-inventory. This keeps the original dashboard history stable and prevents the
-publisher from overwriting one result set with the other. Both use the existing
-publisher; only main-branch runs publish to the shared database. Dashboard
-comparisons must match properties intent IDs and successful statuses; existing
-full-corpus aggregate panels do not automatically include properties queries.
+Both suites of one nightly publish under the same dataset version
+(`posthog-file-views-v1`), distinguished by a `suite` column (`tables` or
+`properties`) on `runs` and `query_results`. The properties suite keeps its own
+`perf-properties/` directory and a `-properties` run ID suffix, so the publisher
+never overwrites one result set with the other, and records the hash of the
+selected object inventory as `fixture_version`, so history never mixes fixtures.
+The publisher's schema bootstrap adds both columns and classifies rows published
+before they existed (by the `-properties` suffix; a properties run's old
+inventory-hash dataset version becomes its `fixture_version`). A summary without
+a suite publishes as `tables`; an unknown suite is rejected. Only main-branch
+runs publish to the shared database. Dashboards select a suite with the `suite`
+column rather than by dataset version.
 
 All properties preparation happens after the original result files are complete,
 so a properties setup or validation failure cannot prevent their publication.
