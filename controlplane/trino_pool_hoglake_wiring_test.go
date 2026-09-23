@@ -24,7 +24,7 @@ func TestPooledCellCarriesTheManagedHoglakeInputs(t *testing.T) {
 	t.Setenv(envTrinoHoglakeDataPath, "s3://example-bucket/trino/")
 	t.Setenv(envTrinoHoglakeNamespace, "")
 
-	store := &fleetBootstrapStore{initialized: map[string]bool{}}
+	store := &poolObserverWiringStore{fleetBootstrapStore: &fleetBootstrapStore{initialized: map[string]bool{}}}
 	kc := kubefake.NewClientset()
 	ducklings := func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil }
 	storage := func(context.Context, string) (*provisioner.DucklingStatus, error) { return nil, nil }
