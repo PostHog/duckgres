@@ -73,23 +73,23 @@ under either explicit cache-mode label. Teardown removes the test workers.
 Warmup does not imply that the entire dataset fits in memory. Query-local
 buffering, prefetching, DuckLake catalog caching, and separate cache
 proxies/extensions are unaffected, so "uncached" here is not a fully cold
-end-to-end read path. The full-corpus paired catalog uses `balanced_v4`
-query and intent IDs to separate its methodology from `balanced_v3`. The frozen
+end-to-end read path. The full-corpus paired catalog uses `_v5` query and
+intent IDs to separate its methodology from `balanced_v4`, which also measured
+raw Parquet views on PGWire and alternated them with the DuckLake tables on the
+same worker, so the table measurements shared cache state with their raw twin.
+The frozen
 scenario retains this catalog and optionally appends the properties comparison described below.
 
 ## Paired Query Catalogs
 
 Existing catalogs continue to use `queries:` unchanged. A catalog may contain
 legacy `queries:`, `paired_queries:`, or both. Paired definitions let one
-semantic SQL template run against the frozen raw Parquet views and the
-production-shaped DuckLake tables without changing the runner or artifact
-contracts:
+semantic SQL template run against the production-shaped relation each engine
+exposes over the same frozen Parquet files, without changing the runner or
+artifact contracts:
 
 ```yaml
 relation_variants:
-  raw_view:
-    events: frozen_v1.events_file_view
-    persons: frozen_v1.persons_file_view
   ducklake_table:
     events: posthog.events
     persons: posthog.persons
@@ -108,10 +108,10 @@ paired_queries:
       ORDER BY 1
 ```
 
-Paired catalogs without Athena declare exactly the `raw_view` and
-`ducklake_table` variants. Athena catalogs add `athena_external`, whose generic
-table names are resolved in the configured Glue database. A template expands
-in stable order: `raw_view`, `ducklake_table`, then `athena_external`. Generated queries retain the same
+Paired catalogs always declare `ducklake_table`. Catalogs targeting Trino add
+`hoglake_table`, and Athena catalogs add `athena_external`, whose generic table
+names are resolved in the configured Glue database. A template expands in
+stable order: `ducklake_table`, `hoglake_table`, then `athena_external`. Generated queries retain the same
 `intent_id`, tags, parameters, and semantic template; only declared relation
 placeholders differ. They carry in-memory storage-target metadata, so later
 code does not need to infer the target from the generated ID. Legacy queries
@@ -119,18 +119,13 @@ remain unpaired. The v1 artifact and publisher schemas remain unchanged, so
 artifact rows distinguish paired targets only by these generated query IDs;
 they do not include a storage-target column.
 
-During measured execution, the runner alternates every generated pair by
-iteration: odd iterations run `raw_view` then `ducklake_table`, and even
-iterations run `ducklake_table` then `raw_view`. Paired benchmark catalogs
-should therefore use an even `measure_iterations` value so each target runs
-first the same number of times. The catalog loader rejects odd measurement
-counts for paired catalogs. Warmup work and legacy queries retain catalog
-order. Query and intent IDs must be versioned when their measurement
+Each protocol runs exactly one variant, so every iteration executes queries in
+catalog order. Query and intent IDs must be versioned when their measurement
 methodology changes so historical latency series do not mix different cache
 contexts, including dashboards that aggregate by intent.
 
 Templating is intentionally limited to `{{ relation "<role>" }}`. Each role
-must have a binding in both variants, and multiple roles may be used in one
+must have a binding in every declared variant, and multiple roles may be used in one
 template. Bindings are unquoted, dot-separated identifiers such as
 `posthog.events`; the loader validates every identifier segment and emits it
 as a safely quoted relation. SQL expressions, comments, semicolons,
@@ -143,8 +138,8 @@ stored in the PGWire SQL field.
 
 This abstraction preserves the artifact contract while allowing downstream
 dashboards to compare paired targets by their generated query-ID suffixes.
-PGWire executes `raw_view` and `ducklake_table`; Trino executes only
-`ducklake_table`; Athena executes only `athena_external`.
+PGWire executes only `ducklake_table`; Trino executes only `hoglake_table`;
+Athena executes only `athena_external`.
 
 ## Local Smoke Run
 

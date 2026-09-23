@@ -107,10 +107,7 @@ paired_queries:
 	if _, err := runner.Run(context.Background()); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	wantIDs := []string{
-		"q_events__raw_view", "q_events__ducklake_table",
-		"q_events__ducklake_table", "q_events__raw_view",
-	}
+	wantIDs := []string{"q_events__ducklake_table", "q_events__ducklake_table"}
 	if !reflect.DeepEqual(driver.queryIDs, wantIDs) {
 		t.Fatalf("driver query order: got %v want %v", driver.queryIDs, wantIDs)
 	}
@@ -120,95 +117,6 @@ paired_queries:
 	}
 	if !reflect.DeepEqual(gotIDs, wantIDs) {
 		t.Fatalf("result query IDs: got %v want %v", gotIDs, wantIDs)
-	}
-}
-
-func TestQueriesForIterationSwapsOnlyCompletePairsWithoutMutatingCatalogOrder(t *testing.T) {
-	queries := []Query{
-		{QueryID: "legacy_before"},
-		{QueryID: "pair_a_raw", IntentID: "intent_a", StorageTarget: StorageTargetRawView},
-		{QueryID: "pair_a_table", IntentID: "intent_a", StorageTarget: StorageTargetDuckLakeTable},
-		{QueryID: "legacy_middle"},
-		{QueryID: "pair_b_raw", IntentID: "intent_b", StorageTarget: StorageTargetRawView},
-		{QueryID: "pair_b_table", IntentID: "intent_b", StorageTarget: StorageTargetDuckLakeTable},
-		{QueryID: "legacy_after"},
-	}
-	declaredOrder := queryIDOrder(queries)
-	if got := queryIDOrder(queriesForIteration(queries, 1)); !reflect.DeepEqual(got, declaredOrder) {
-		t.Fatalf("odd iteration order: got %v want %v", got, declaredOrder)
-	}
-	wantEven := []string{
-		"legacy_before",
-		"pair_a_table", "pair_a_raw",
-		"legacy_middle",
-		"pair_b_table", "pair_b_raw",
-		"legacy_after",
-	}
-	if got := queryIDOrder(queriesForIteration(queries, 2)); !reflect.DeepEqual(got, wantEven) {
-		t.Fatalf("even iteration order: got %v want %v", got, wantEven)
-	}
-	if got := queryIDOrder(queries); !reflect.DeepEqual(got, declaredOrder) {
-		t.Fatalf("catalog order mutated: got %v want %v", got, declaredOrder)
-	}
-}
-
-func queryIDOrder(queries []Query) []string {
-	ids := make([]string, 0, len(queries))
-	for _, query := range queries {
-		ids = append(ids, query.QueryID)
-	}
-	return ids
-}
-
-func TestRunnerBalancesPairedQueryOrderAcrossMeasuredIterations(t *testing.T) {
-	driver := &testDriver{protocol: ProtocolPGWire}
-	sink := &inMemorySink{}
-	runner := NewQueryRunner(RunnerConfig{
-		Catalog: Catalog{
-			Name:              "paired",
-			MeasureIterations: 4,
-			Targets:           []Protocol{ProtocolPGWire},
-			Queries: []Query{
-				{
-					QueryID:       "q_events__raw_view",
-					IntentID:      "intent_events",
-					PGWireSQL:     "SELECT COUNT(*) FROM frozen_v1.events_file_view",
-					StorageTarget: StorageTargetRawView,
-				},
-				{
-					QueryID:       "q_events__ducklake_table",
-					IntentID:      "intent_events",
-					PGWireSQL:     "SELECT COUNT(*) FROM posthog.events",
-					StorageTarget: StorageTargetDuckLakeTable,
-				},
-				{QueryID: "q_events__hoglake_table", IntentID: "intent_events", PGWireSQL: "SELECT COUNT(*) FROM posthog.events", StorageTarget: StorageTargetHoglakeTable},
-			},
-		},
-		Drivers: map[Protocol]ProtocolDriver{
-			ProtocolPGWire: driver,
-		},
-		Sink: sink,
-		Now:  func() time.Time { return time.Unix(1700000000, 0) },
-	})
-
-	if _, err := runner.Run(context.Background()); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-	wantIDs := []string{
-		"q_events__raw_view", "q_events__ducklake_table",
-		"q_events__ducklake_table", "q_events__raw_view",
-		"q_events__raw_view", "q_events__ducklake_table",
-		"q_events__ducklake_table", "q_events__raw_view",
-	}
-	if !reflect.DeepEqual(driver.queryIDs, wantIDs) {
-		t.Fatalf("driver query order: got %v want %v", driver.queryIDs, wantIDs)
-	}
-	gotIDs := make([]string, 0, len(sink.results))
-	for _, result := range sink.results {
-		gotIDs = append(gotIDs, result.QueryID)
-	}
-	if !reflect.DeepEqual(gotIDs, wantIDs) {
-		t.Fatalf("result query order: got %v want %v", gotIDs, wantIDs)
 	}
 }
 
@@ -223,12 +131,6 @@ func TestRunnerKeepsDuckLakeOnPGWireAndRunsHoglakeOnTrino(t *testing.T) {
 			MeasureIterations: 1,
 			Targets:           []Protocol{ProtocolPGWire, trino},
 			Queries: []Query{
-				{
-					QueryID:       "q_events__raw_view",
-					IntentID:      "intent_events",
-					PGWireSQL:     "SELECT COUNT(*) FROM frozen_v1.events_file_view",
-					StorageTarget: StorageTargetRawView,
-				},
 				{
 					QueryID:       "q_events__ducklake_table",
 					IntentID:      "intent_events",
@@ -255,17 +157,17 @@ func TestRunnerKeepsDuckLakeOnPGWireAndRunsHoglakeOnTrino(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if got, want := pg.queryIDs, []string{"q_events__raw_view", "q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := pg.queryIDs, []string{"q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("pgwire query IDs: got %v want %v", got, want)
 	}
 	if got, want := trinoDriver.queryIDs, []string{"q_events__hoglake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("trino query IDs: got %v want %v", got, want)
 	}
-	if summary.TotalQueries != 3 {
-		t.Fatalf("total measured queries = %d, want 3", summary.TotalQueries)
+	if summary.TotalQueries != 2 {
+		t.Fatalf("total measured queries = %d, want 2", summary.TotalQueries)
 	}
-	if len(sink.results) != 3 {
-		t.Fatalf("recorded results = %d, want 3", len(sink.results))
+	if len(sink.results) != 2 {
+		t.Fatalf("recorded results = %d, want 2", len(sink.results))
 	}
 }
 
@@ -281,7 +183,6 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 			MeasureIterations: 1,
 			Targets:           []Protocol{ProtocolPGWire, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena},
 			Queries: []Query{
-				{QueryID: "q__raw_view", IntentID: "intent", StorageTarget: StorageTargetRawView},
 				{QueryID: "q__ducklake_table", IntentID: "intent", StorageTarget: StorageTargetDuckLakeTable},
 				{QueryID: "q__hoglake_table", IntentID: "intent", StorageTarget: StorageTargetHoglakeTable},
 				{QueryID: "q__athena_external", IntentID: "intent", StorageTarget: StorageTargetAthenaExternal},
@@ -301,7 +202,7 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 	if err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
-	if got, want := pg.queryIDs, []string{"q__raw_view", "q__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := pg.queryIDs, []string{"q__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("PGWire query IDs: got %v want %v", got, want)
 	}
 	if got, want := trinoDriver.queryIDs, []string{"q__hoglake_table"}; !reflect.DeepEqual(got, want) {
@@ -313,8 +214,8 @@ func TestRunnerRoutesEachStorageVariantOnlyToItsComparableProtocol(t *testing.T)
 	if got, want := cachedDriver.queryIDs, []string{"q__hoglake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("Cached Trino query IDs: got %v want %v", got, want)
 	}
-	if summary.TotalQueries != 5 {
-		t.Fatalf("total measured queries = %d, want 5", summary.TotalQueries)
+	if summary.TotalQueries != 4 {
+		t.Fatalf("total measured queries = %d, want 4", summary.TotalQueries)
 	}
 }
 
@@ -329,7 +230,6 @@ func TestRunnerRunsUncachedAndCachedPGWireAsDistinctComparableResults(t *testing
 		Catalog: Catalog{
 			Targets: []Protocol{uncached, cached}, WarmupIterations: 1, MeasureIterations: 1,
 			Queries: []Query{
-				{QueryID: "q__raw_view", IntentID: "intent", StorageTarget: StorageTargetRawView},
 				{QueryID: "q__ducklake_table", IntentID: "intent", StorageTarget: StorageTargetDuckLakeTable},
 				{QueryID: "q__hoglake_table", IntentID: "intent", StorageTarget: StorageTargetHoglakeTable},
 				{QueryID: "q__athena_external", IntentID: "intent", StorageTarget: StorageTargetAthenaExternal},
@@ -341,26 +241,24 @@ func TestRunnerRunsUncachedAndCachedPGWireAsDistinctComparableResults(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.RunID != "cache-comparison" || summary.TotalQueries != 4 || summary.WarmupQueries != 4 {
+	if summary.RunID != "cache-comparison" || summary.TotalQueries != 2 || summary.WarmupQueries != 2 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
 	for _, driver := range []*testDriver{uncachedDriver, cachedDriver} {
-		if want := []string{"q__raw_view", "q__ducklake_table", "q__raw_view", "q__ducklake_table"}; !reflect.DeepEqual(driver.queryIDs, want) {
+		if want := []string{"q__ducklake_table", "q__ducklake_table"}; !reflect.DeepEqual(driver.queryIDs, want) {
 			t.Fatalf("%s routed queries = %v, want %v", driver.protocol, driver.queryIDs, want)
 		}
 	}
 	wantEvents := []string{
-		"pgwire_uncached/q__raw_view", "pgwire_uncached/q__ducklake_table",
-		"pgwire_uncached/q__raw_view", "pgwire_uncached/q__ducklake_table",
-		"pgwire_cached/q__raw_view", "pgwire_cached/q__ducklake_table",
-		"pgwire_cached/q__raw_view", "pgwire_cached/q__ducklake_table",
+		"pgwire_uncached/q__ducklake_table", "pgwire_uncached/q__ducklake_table",
+		"pgwire_cached/q__ducklake_table", "pgwire_cached/q__ducklake_table",
 	}
 	if !reflect.DeepEqual(events, wantEvents) {
 		t.Fatalf("execution order = %v, want %v", events, wantEvents)
 	}
 	for index, result := range sink.results {
 		wantProtocol := uncached
-		if index >= 2 {
+		if index >= 1 {
 			wantProtocol = cached
 		}
 		if result.Protocol != wantProtocol || result.IntentID != "intent" || result.MeasureIteration != 1 {

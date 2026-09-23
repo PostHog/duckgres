@@ -48,86 +48,63 @@ func TestCheckedInPostHogCatalogPublishesCompleteStablePairs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadCatalog: %v", err)
 	}
-	want := []string{
-		"q_events_total_balanced_v4__raw_view",
-		"q_events_total_balanced_v4__ducklake_table",
-		"q_events_total_balanced_v4__hoglake_table",
-		"q_events_total_balanced_v4__athena_external",
-		"q_events_count_one_day_balanced_v4__raw_view",
-		"q_events_count_one_day_balanced_v4__ducklake_table",
-		"q_events_count_one_day_balanced_v4__hoglake_table",
-		"q_events_count_one_day_balanced_v4__athena_external",
-		"q_events_by_name_march_2026_balanced_v4__raw_view",
-		"q_events_by_name_march_2026_balanced_v4__ducklake_table",
-		"q_events_by_name_march_2026_balanced_v4__hoglake_table",
-		"q_events_by_name_march_2026_balanced_v4__athena_external",
-		"q_events_distinct_persons_balanced_v4__raw_view",
-		"q_events_distinct_persons_balanced_v4__ducklake_table",
-		"q_events_distinct_persons_balanced_v4__hoglake_table",
-		"q_events_distinct_persons_balanced_v4__athena_external",
-		"q_persons_total_balanced_v4__raw_view",
-		"q_persons_total_balanced_v4__ducklake_table",
-		"q_persons_total_balanced_v4__hoglake_table",
-		"q_persons_total_balanced_v4__athena_external",
-		"q_persons_daily_april_2026_balanced_v4__raw_view",
-		"q_persons_daily_april_2026_balanced_v4__ducklake_table",
-		"q_persons_daily_april_2026_balanced_v4__hoglake_table",
-		"q_persons_daily_april_2026_balanced_v4__athena_external",
-		"q_events_daily_march_2026_balanced_v4__raw_view",
-		"q_events_daily_march_2026_balanced_v4__ducklake_table",
-		"q_events_daily_march_2026_balanced_v4__hoglake_table",
-		"q_events_daily_march_2026_balanced_v4__athena_external",
+	var want []string
+	for _, base := range []string{
+		"q_events_total_v5",
+		"q_events_count_one_day_v5",
+		"q_events_by_name_march_2026_v5",
+		"q_events_distinct_persons_v5",
+		"q_persons_total_v5",
+		"q_persons_daily_april_2026_v5",
+		"q_events_daily_march_2026_v5",
+	} {
+		want = append(want, base+"__ducklake_table", base+"__hoglake_table", base+"__athena_external")
 	}
 	if got := queryIDs(catalog); !reflect.DeepEqual(got, want) {
 		t.Fatalf("checked-in PostHog query IDs changed: got %v want %v", got, want)
 	}
-	if catalog.MeasureIterations != 4 {
-		t.Fatalf("checked-in PostHog measure iterations = %d, want 4 for balanced target order", catalog.MeasureIterations)
-	}
 	for _, query := range catalog.Queries {
-		if !strings.HasSuffix(query.IntentID, "_balanced_v4") {
+		if !strings.HasSuffix(query.IntentID, "_v5") {
 			t.Fatalf("checked-in PostHog query %s has unversioned methodology intent %q", query.QueryID, query.IntentID)
 		}
 		if strings.Contains(query.PGWireSQL, "TIMESTAMPTZ '") {
 			t.Fatalf("query %s uses a DuckDB-only timestamp literal instead of protocol-portable SQL: %s", query.QueryID, query.PGWireSQL)
 		}
+		if strings.Contains(query.PGWireSQL, "frozen_v1") {
+			t.Fatalf("query %s reads the raw Parquet file views, which are no longer benchmarked: %s", query.QueryID, query.PGWireSQL)
+		}
 	}
 	for index, query := range catalog.Queries {
-		wantTarget := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable, StorageTargetHoglakeTable, StorageTargetAthenaExternal}[index%4]
+		wantTarget := []StorageTarget{StorageTargetDuckLakeTable, StorageTargetHoglakeTable, StorageTargetAthenaExternal}[index%3]
 		if query.StorageTarget != wantTarget {
 			t.Fatalf("query %s storage target = %q, want %q", query.QueryID, query.StorageTarget, wantTarget)
 		}
-		if index%4 != 3 {
+		if index%3 != 2 {
 			continue
 		}
 
-		rawQuery := catalog.Queries[index-3]
 		duckLakeQuery := catalog.Queries[index-2]
 		hoglakeQuery := catalog.Queries[index-1]
 		if hoglakeQuery.PGWireSQL != duckLakeQuery.PGWireSQL || hoglakeQuery.IntentID != duckLakeQuery.IntentID {
 			t.Fatalf("Hoglake query %s must use the shared SQL and intent", hoglakeQuery.QueryID)
 		}
-		if query.IntentID != rawQuery.IntentID || duckLakeQuery.IntentID != rawQuery.IntentID {
-			t.Fatalf("query variants have mismatched intents: %q/%q/%q", rawQuery.IntentID, duckLakeQuery.IntentID, query.IntentID)
+		if query.IntentID != duckLakeQuery.IntentID {
+			t.Fatalf("query variants have mismatched intents: %q/%q", duckLakeQuery.IntentID, query.IntentID)
 		}
-		if !reflect.DeepEqual(query.Tags, rawQuery.Tags) || !reflect.DeepEqual(query.Params, rawQuery.Params) ||
-			!reflect.DeepEqual(duckLakeQuery.Tags, rawQuery.Tags) || !reflect.DeepEqual(duckLakeQuery.Params, rawQuery.Params) {
-			t.Fatalf("query variants for %s must share tags and params", rawQuery.IntentID)
+		if !reflect.DeepEqual(query.Tags, duckLakeQuery.Tags) || !reflect.DeepEqual(query.Params, duckLakeQuery.Params) {
+			t.Fatalf("query variants for %s must share tags and params", duckLakeQuery.IntentID)
 		}
 
-		rawRelation := `"frozen_v1"."events_file_view"`
 		duckLakeRelation := `"posthog"."events"`
 		athenaRelation := `"events"`
 		if strings.HasPrefix(query.IntentID, "intent_persons_") {
-			rawRelation = `"frozen_v1"."persons_file_view"`
 			duckLakeRelation = `"posthog"."persons"`
 			athenaRelation = `"persons"`
 		}
-		rawShape := strings.ReplaceAll(rawQuery.PGWireSQL, rawRelation, "<relation>")
 		duckLakeShape := strings.ReplaceAll(duckLakeQuery.PGWireSQL, duckLakeRelation, "<relation>")
 		athenaShape := strings.ReplaceAll(query.PGWireSQL, athenaRelation, "<relation>")
-		if rawShape != duckLakeShape || rawShape != athenaShape {
-			t.Fatalf("query variants for %s differ beyond their relation", rawQuery.IntentID)
+		if duckLakeShape != athenaShape {
+			t.Fatalf("query variants for %s differ beyond their relation", duckLakeQuery.IntentID)
 		}
 	}
 }
@@ -142,10 +119,10 @@ paired_queries:
 	if err != nil {
 		t.Fatalf("ParseCatalog returned error: %v", err)
 	}
-	if got, want := queryIDs(catalog), []string{"q_events__raw_view", "q_events__ducklake_table", "q_events__hoglake_table", "q_events__athena_external"}; !reflect.DeepEqual(got, want) {
+	if got, want := queryIDs(catalog), []string{"q_events__ducklake_table", "q_events__hoglake_table", "q_events__athena_external"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected generated query order: got %v want %v", got, want)
 	}
-	athenaQuery := catalog.Queries[3]
+	athenaQuery := catalog.Queries[2]
 	if got, want := athenaQuery.StorageTarget, StorageTargetAthenaExternal; got != want {
 		t.Fatalf("Athena query target: got %q want %q", got, want)
 	}
@@ -202,16 +179,17 @@ queries:
 	}
 }
 
-func TestParseCatalogRejectsOddMeasureIterationsForPairedQueries(t *testing.T) {
+func TestParseCatalogAcceptsOddMeasureIterationsForPairedQueries(t *testing.T) {
 	raw := strings.Replace(pairedCatalogYAML(`
 paired_queries:
   - query_id_base: q_events
     intent_id: ph.events.v1
     sql_template: SELECT COUNT(*) FROM {{ relation "events" }}
 `), "measure_iterations: 2", "measure_iterations: 3", 1)
-	_, err := ParseCatalog([]byte(raw))
-	if err == nil || !strings.Contains(err.Error(), "even") {
-		t.Fatalf("ParseCatalog error = %v, want even measure_iterations requirement", err)
+	// Without a raw-view twin on the same protocol there is no pair order to
+	// balance, so paired catalogs no longer need an even iteration count.
+	if _, err := ParseCatalog([]byte(raw)); err != nil {
+		t.Fatalf("ParseCatalog returned error: %v", err)
 	}
 }
 
@@ -233,7 +211,7 @@ paired_queries:
 	if err != nil {
 		t.Fatalf("ParseCatalog returned error: %v", err)
 	}
-	if got, want := queryIDs(catalog), []string{"q_events_daily__raw_view", "q_events_daily__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := queryIDs(catalog), []string{"q_events_daily__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected generated query order: got %v want %v", got, want)
 	}
 	for _, query := range catalog.Queries {
@@ -244,16 +222,10 @@ paired_queries:
 			t.Fatalf("generated query did not retain shared metadata: %+v", query)
 		}
 	}
-	if got, want := catalog.Queries[0].StorageTarget, StorageTargetRawView; got != want {
-		t.Fatalf("raw query target: got %q want %q", got, want)
-	}
-	if got, want := catalog.Queries[1].StorageTarget, StorageTargetDuckLakeTable; got != want {
+	if got, want := catalog.Queries[0].StorageTarget, StorageTargetDuckLakeTable; got != want {
 		t.Fatalf("managed query target: got %q want %q", got, want)
 	}
-	if got, want := catalog.Queries[0].PGWireSQL, "SELECT date_trunc('day', \"timestamp\") AS day, COUNT(*) AS events\nFROM \"frozen_v1\".\"events_file_view\"\nWHERE \"timestamp\" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'\nGROUP BY 1\nORDER BY 1\n"; got != want {
-		t.Fatalf("raw query SQL: got %q want %q", got, want)
-	}
-	if got, want := catalog.Queries[1].PGWireSQL, "SELECT date_trunc('day', \"timestamp\") AS day, COUNT(*) AS events\nFROM \"posthog\".\"events\"\nWHERE \"timestamp\" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'\nGROUP BY 1\nORDER BY 1\n"; got != want {
+	if got, want := catalog.Queries[0].PGWireSQL, "SELECT date_trunc('day', \"timestamp\") AS day, COUNT(*) AS events\nFROM \"posthog\".\"events\"\nWHERE \"timestamp\" >= TIMESTAMPTZ '2026-03-01 00:00:00+00'\nGROUP BY 1\nORDER BY 1\n"; got != want {
 		t.Fatalf("managed query SQL: got %q want %q", got, want)
 	}
 }
@@ -279,13 +251,10 @@ queries:
 	if err != nil {
 		t.Fatalf("ParseCatalog returned error: %v", err)
 	}
-	if got, want := queryIDs(catalog), []string{"q_join__raw_view", "q_join__ducklake_table", "q_events__raw_view", "q_events__ducklake_table", "legacy_after"}; !reflect.DeepEqual(got, want) {
+	if got, want := queryIDs(catalog), []string{"q_join__ducklake_table", "q_events__ducklake_table", "legacy_after"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected mixed catalog order: got %v want %v", got, want)
 	}
-	if got, want := catalog.Queries[0].PGWireSQL, "SELECT COUNT(*) FROM \"frozen_v1\".\"events_file_view\" e JOIN \"frozen_v1\".\"persons_file_view\" p ON e.person_id = p.id"; got != want {
-		t.Fatalf("raw multi-relation SQL: got %q want %q", got, want)
-	}
-	if got, want := catalog.Queries[1].PGWireSQL, "SELECT COUNT(*) FROM \"posthog\".\"events\" e JOIN \"posthog\".\"persons\" p ON e.person_id = p.id"; got != want {
+	if got, want := catalog.Queries[0].PGWireSQL, "SELECT COUNT(*) FROM \"posthog\".\"events\" e JOIN \"posthog\".\"persons\" p ON e.person_id = p.id"; got != want {
 		t.Fatalf("managed multi-relation SQL: got %q want %q", got, want)
 	}
 }
@@ -297,25 +266,25 @@ func TestParseCatalogRejectsInvalidPairedDefinitions(t *testing.T) {
 		want string
 	}{
 		{name: "missing variants", yaml: catalogYAML("relation_variants: {}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "storage variants"},
-		{name: "invalid variant", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  managed_table: {events: posthog.events}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "storage variants"},
+		{name: "invalid variant", yaml: catalogYAML("relation_variants:\n  ducklake_table: {events: posthog.events}\n  managed_table: {events: posthog.events}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "storage variants"},
+		{name: "raw view variant", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  ducklake_table: {events: posthog.events}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "storage variants"},
 		{name: "missing base id", yaml: pairedCatalogYAML("paired_queries:\n  - intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "query_id_base"},
 		{name: "missing intent", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "intent_id"},
-		{name: "missing binding", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  ducklake_table: {persons: posthog.persons}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "missing relation binding"},
+		{name: "missing binding", yaml: catalogYAML("relation_variants:\n  ducklake_table: {persons: posthog.persons}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "missing relation binding"},
 		{name: "unknown binding", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"orders\" }}\n"), want: "missing relation binding"},
-		{name: "malicious identifier", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  ducklake_table: {events: 'posthog.events; DROP TABLE posthog.events'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
-		{name: "whitespace identifier", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  ducklake_table: {events: 'posthog. events'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
-		{name: "comment identifier", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  ducklake_table: {events: 'posthog.events -- managed table'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
-		{name: "expression identifier", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  ducklake_table: {events: 'lower(posthog.events)'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
+		{name: "malicious identifier", yaml: catalogYAML("relation_variants:\n  ducklake_table: {events: 'posthog.events; DROP TABLE posthog.events'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
+		{name: "whitespace identifier", yaml: catalogYAML("relation_variants:\n  ducklake_table: {events: 'posthog. events'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
+		{name: "comment identifier", yaml: catalogYAML("relation_variants:\n  ducklake_table: {events: 'posthog.events -- managed table'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
+		{name: "expression identifier", yaml: catalogYAML("relation_variants:\n  ducklake_table: {events: 'lower(posthog.events)'}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "invalid relation identifier"},
 		{name: "unsupported action", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ .Events }}\n"), want: "unsupported template action"},
-		{name: "placeholder in line comment", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT COUNT(*) FROM frozen_v1.events_file_view -- {{ relation \"events\" }}\n"), want: "relation placeholder"},
-		{name: "placeholder in block comment", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT COUNT(*) FROM frozen_v1.events_file_view /* {{ relation \"events\" }} */\n"), want: "relation placeholder"},
+		{name: "placeholder in line comment", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT COUNT(*) FROM posthog.events -- {{ relation \"events\" }}\n"), want: "relation placeholder"},
+		{name: "placeholder in block comment", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT COUNT(*) FROM posthog.events /* {{ relation \"events\" }} */\n"), want: "relation placeholder"},
 		{name: "placeholder in string literal", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT '{{ relation \"events\" }}'\n"), want: "relation placeholder"},
 		{name: "placeholder in quoted identifier", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT \"{{ relation \"\"events\"\" }}\"\n"), want: "relation placeholder"},
 		{name: "placeholder in dollar-quoted string", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT $tag${{ relation \"events\" }}$tag$\n"), want: "relation placeholder"},
 		{name: "real and commented placeholders", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }} -- {{ relation \"unbound\" }}\n"), want: "relation placeholder"},
 		{name: "surplus template braces", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{{ relation \"events\" }}}\n"), want: "unsupported template action"},
 		{name: "no placeholder", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT 1\n"), want: "relation placeholder"},
-		{name: "identical target relations", yaml: catalogYAML("relation_variants:\n  raw_view: {events: frozen_v1.events_file_view}\n  ducklake_table: {events: frozen_v1.events_file_view}\npaired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * FROM {{ relation \"events\" }}\n"), want: "must differ"},
 		{name: "rendered write", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: INSERT INTO {{ relation \"events\" }} VALUES (1)\n"), want: "SELECT-only"},
 		{name: "rendered select into", yaml: pairedCatalogYAML("paired_queries:\n  - query_id_base: q\n    intent_id: i\n    sql_template: SELECT * INTO derived_events FROM {{ relation \"events\" }}\n"), want: "SELECT-only"},
 	}
@@ -336,7 +305,7 @@ func TestParseCatalogRejectsGeneratedQueryIDCollisions(t *testing.T) {
 	}{
 		{name: "explicit legacy id", yaml: pairedCatalogYAML(`
 queries:
-  - query_id: q_events__raw_view
+  - query_id: q_events__ducklake_table
     intent_id: legacy.intent
     pgwire_sql: SELECT 1
 paired_queries:
@@ -425,7 +394,7 @@ paired_queries:
 	if err != nil {
 		t.Fatalf("ParseCatalog returned error: %v", err)
 	}
-	if got, want := queryIDs(catalog), []string{"q_dollar_quote__raw_view", "q_dollar_quote__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := queryIDs(catalog), []string{"q_dollar_quote__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected generated query IDs: got %v want %v", got, want)
 	}
 }
@@ -460,10 +429,10 @@ paired_queries:
 	if err != nil {
 		t.Fatalf("ParseCatalog returned error: %v", err)
 	}
-	if got, want := queryIDs(catalog), []string{"q_events__raw_view", "q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
+	if got, want := queryIDs(catalog), []string{"q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected runtime query representation: got %v want %v", got, want)
 	}
-	if got := catalog.Queries[0].StorageTarget; got != StorageTargetRawView {
+	if got := catalog.Queries[0].StorageTarget; got != StorageTargetDuckLakeTable {
 		t.Fatalf("unexpected storage target %q", got)
 	}
 }
@@ -471,9 +440,6 @@ paired_queries:
 func pairedCatalogYAML(body string) string {
 	return catalogYAML(strings.TrimSuffix(`
 relation_variants:
-  raw_view:
-    events: frozen_v1.events_file_view
-    persons: frozen_v1.persons_file_view
   ducklake_table:
     events: posthog.events
     persons: posthog.persons
@@ -483,9 +449,6 @@ relation_variants:
 func athenaCatalogYAML(body string) string {
 	return strings.Replace(catalogYAML(strings.TrimSuffix(`
 relation_variants:
-  raw_view:
-    events: frozen_v1.events_file_view
-    persons: frozen_v1.persons_file_view
   ducklake_table:
     events: posthog.events
     persons: posthog.persons

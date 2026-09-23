@@ -138,8 +138,11 @@ paired_queries:
 	if !reflect.DeepEqual(records[0], wantHeader) {
 		t.Fatalf("CSV header: got %v want %v", records[0], wantHeader)
 	}
-	if got, want := []string{records[1][0], records[2][0]}, []string{"q_events__raw_view", "q_events__ducklake_table"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("CSV query IDs: got %v want %v", got, want)
+	if got, want := len(records), 2; got != want {
+		t.Fatalf("CSV rows: got %d want %d", got, want)
+	}
+	if got, want := records[1][0], "q_events__ducklake_table"; got != want {
+		t.Fatalf("CSV query ID: got %v want %v", got, want)
 	}
 }
 

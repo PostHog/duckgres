@@ -134,7 +134,7 @@ func (r *QueryRunner) MetricsGatherer() prometheus.Gatherer {
 }
 
 func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, measure bool, measureIteration int, summary *RunSummary) error {
-	for _, query := range queriesForIteration(r.cfg.Catalog.Queries, measureIteration) {
+	for _, query := range r.cfg.Catalog.Queries {
 		if query.SkipReason != "" || query.ValidationOnly || !querySupportsProtocol(query, protocol) {
 			continue
 		}
@@ -184,9 +184,9 @@ func (r *QueryRunner) executeIteration(ctx context.Context, protocol Protocol, m
 }
 
 // Each physical relation family is routed only to protocols which expose it.
-// PGWire measures both the raw Parquet view and production-shaped DuckLake
-// table, Trino measures the Hoglake table, and Athena measures its
-// Glue external table over the same immutable Parquet files.
+// PGWire measures the production-shaped DuckLake table, Trino measures the
+// Hoglake table, and Athena measures its Glue external table over the same
+// immutable Parquet files.
 func querySupportsProtocol(query Query, protocol Protocol) bool {
 	if len(query.Targets) > 0 {
 		allowed := false
@@ -203,8 +203,6 @@ func querySupportsProtocol(query Query, protocol Protocol) bool {
 	switch query.StorageTarget {
 	case "":
 		return true
-	case StorageTargetRawView:
-		return protocol == ProtocolPGWire || protocol == ProtocolPGWireUncached || protocol == ProtocolPGWireCached
 	case StorageTargetDuckLakeTable:
 		return protocol == ProtocolPGWire || protocol == ProtocolPGWireUncached || protocol == ProtocolPGWireCached
 	case StorageTargetHoglakeTable:
@@ -214,28 +212,6 @@ func querySupportsProtocol(query Query, protocol Protocol) bool {
 	default:
 		return false
 	}
-}
-
-// queriesForIteration alternates each generated raw-view/DuckLake-table pair
-// on measured iterations. This balances which storage target runs first and
-// prevents one target from consistently inheriting cache state from the other.
-// Legacy queries retain their declared order.
-func queriesForIteration(queries []Query, measureIteration int) []Query {
-	if measureIteration <= 0 || measureIteration%2 == 1 {
-		return queries
-	}
-	ordered := append([]Query(nil), queries...)
-	for index := 0; index+1 < len(ordered); index++ {
-		first, second := ordered[index], ordered[index+1]
-		if first.StorageTarget != StorageTargetRawView ||
-			second.StorageTarget != StorageTargetDuckLakeTable ||
-			first.IntentID != second.IntentID {
-			continue
-		}
-		ordered[index], ordered[index+1] = second, first
-		index++
-	}
-	return ordered
 }
 
 func orderedParamValues(params map[string]any) []any {
