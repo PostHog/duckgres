@@ -2285,3 +2285,59 @@ func TestFixedCellStillFailsWhenTheNodeInventoryIsUnreadable(t *testing.T) {
 		t.Fatalf("org state = %+v, want Failed", state)
 	}
 }
+
+// The source side of a move. Once an org is reassigned to another cell, the
+// cell that used to own it removes everything it projected - catalog, tenant
+// password and password.db line - on its next tick, and every state write it
+// makes is fenced to its own cell id so a tick that listed the org before the
+// move cannot stamp a stale outcome onto the moved row.
+func TestReconcile_MovedOrgIsCleanedUpBySourceCell(t *testing.T) {
+	orgs := []configstore.TrinoEnabledOrg{
+		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
+		{OrgID: "43", DatabaseName: "db43", CellID: testCellID, RootPasswordHash: "$2a$10$hash43"},
+	}
+	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{
+		"42": readyWarehouse("42"),
+		"43": readyWarehouse("43"),
+	})
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, org := range []string{"42", "43"} {
+		upd, ok := h.store.lastState(org)
+		if !ok || upd.CellID != testCellID {
+			t.Fatalf("state write for %s = %+v, want it fenced to %s", org, upd, testCellID)
+		}
+	}
+	if _, present := h.tenantSecret(t)["43"]; !present {
+		t.Fatal("org 43 was not projected before the move")
+	}
+
+	// Move 43 to another cell.
+	h.store.mu.Lock()
+	h.store.orgs[1].CellID = "registered:cell-001"
+	h.store.states = nil
+	h.store.mu.Unlock()
+	if err := h.provisioner.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after move: %v", err)
+	}
+	if !contains(h.catalog.dropped, TrinoCatalogName("db43")) {
+		t.Errorf("source kept the moved org's catalog; dropped %v", h.catalog.dropped)
+	}
+	if _, present := h.tenantSecret(t)["43"]; present {
+		t.Error("source kept the moved org's tenant password")
+	}
+	sec, err := h.kube.CoreV1().Secrets(TrinoCustomerNamespace).Get(context.Background(), TrinoAuthSecretName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get auth secret: %v", err)
+	}
+	if strings.Contains(string(sec.Data[TrinoAuthSecretKeyPasswordDB]), "db43") {
+		t.Errorf("source password.db still carries the moved org: %q", sec.Data[TrinoAuthSecretKeyPasswordDB])
+	}
+	if _, ok := h.store.lastState("43"); ok {
+		t.Error("source wrote state for an org it no longer owns")
+	}
+	if _, present := h.tenantSecret(t)["42"]; !present {
+		t.Error("the org that stayed lost its projection")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
@@ -125,5 +126,116 @@ func TestTrinoSelectionRejectsUnknownWarehouseAndEnabledRowPostgres(t *testing.T
 	}
 	if claimed, err := store.ClaimTrinoCell("tenant", "registered:cell-001"); err != nil || claimed {
 		t.Fatalf("second claim: %v %v", claimed, err)
+	}
+}
+
+// A move is a compare-and-swap on the owner: it applies only while the org is
+// on the named source, resets readiness so nothing reports the org ready
+// before the destination provisions it, and is idempotent when repeated.
+func TestTrinoMoveCellPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	seedTrinoOrg(t, store, "tenant")
+	if err := store.DB().Create(&configstore.ManagedWarehouse{OrgID: "tenant", DucklingName: "tenant"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnableTrino("tenant", configstore.TrinoSettings{}); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTrinoCell("tenant", "cell-001"); err != nil || !claimed {
+		t.Fatalf("legacy claim: %v %v", claimed, err)
+	}
+	now := time.Now().UTC()
+	if err := store.UpdateTrinoState("tenant", configstore.TrinoStateUpdate{State: configstore.ManagedWarehouseStateReady, ReadyAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.MoveTrinoCell("tenant", "registered:other", "registered:cell-001"); !errors.Is(err, configstore.ErrTrinoCellMoveConflict) {
+		t.Fatalf("move from a cell that does not own the org: %v, want conflict", err)
+	}
+	if err := store.MoveTrinoCell("missing", "cell-001", "registered:cell-001"); !errors.Is(err, configstore.ErrTrinoWarehouseNotFound) {
+		t.Fatalf("move of an org with no Trino row: %v, want not found", err)
+	}
+	if err := store.MoveTrinoCell("tenant", "cell-001", "registered:cell-001"); err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	row := trinoRow(t, store, "tenant")
+	if row.TrinoCellID != "registered:cell-001" || !row.Enabled || row.State != configstore.ManagedWarehouseStatePending || row.ReadyAt != nil || row.FailedAt != nil {
+		t.Fatalf("moved row = %+v, want enabled, on the destination, pending with readiness cleared", row)
+	}
+	if err := store.MoveTrinoCell("tenant", "cell-001", "registered:cell-001"); err != nil {
+		t.Fatalf("repeated move must be a no-op: %v", err)
+	}
+
+	// The source cell's reconcile tick may have listed the org before the
+	// move. Its fenced state write must not land on the moved row.
+	if err := store.UpdateTrinoState("tenant", configstore.TrinoStateUpdate{State: configstore.ManagedWarehouseStateReady, ReadyAt: &now, CellID: "cell-001"}); err != nil {
+		t.Fatal(err)
+	}
+	if row := trinoRow(t, store, "tenant"); row.State != configstore.ManagedWarehouseStatePending || row.ReadyAt != nil {
+		t.Fatalf("stale source write reached the moved row: %+v", row)
+	}
+	// The destination's write does.
+	if err := store.UpdateTrinoState("tenant", configstore.TrinoStateUpdate{State: configstore.ManagedWarehouseStateReady, ReadyAt: &now, CellID: "registered:cell-001"}); err != nil {
+		t.Fatal(err)
+	}
+	if row := trinoRow(t, store, "tenant"); row.State != configstore.ManagedWarehouseStateReady {
+		t.Fatalf("destination write did not land: %+v", row)
+	}
+
+	// The legacy claim path cannot take the moved org back.
+	if claimed, err := store.ClaimTrinoCell("tenant", "cell-001"); err != nil || claimed {
+		t.Fatalf("legacy reclaimed a moved org: %v %v", claimed, err)
+	}
+	// And moving back is the same operation in the other direction.
+	if err := store.MoveTrinoCell("tenant", "registered:cell-001", "cell-001"); err != nil {
+		t.Fatalf("move back: %v", err)
+	}
+	if row := trinoRow(t, store, "tenant"); row.TrinoCellID != "cell-001" || row.State != configstore.ManagedWarehouseStatePending {
+		t.Fatalf("moved-back row = %+v", row)
+	}
+}
+
+// Moves racing each other: exactly one of two moves from the same source to
+// different destinations wins, and the loser sees a conflict.
+func TestTrinoMoveCellRacesPostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	for i := 0; i < 10; i++ {
+		org := fmt.Sprintf("tenant-%d", i)
+		seedTrinoOrg(t, store, org)
+		if err := store.DB().Create(&configstore.ManagedWarehouse{OrgID: org, DucklingName: org}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EnableTrino(org, configstore.TrinoSettings{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimTrinoCell(org, "cell-001"); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for j, to := range []string{"registered:a", "registered:b"} {
+			wg.Add(1)
+			go func(j int, to string) {
+				defer wg.Done()
+				<-start
+				errs[j] = store.MoveTrinoCell(org, "cell-001", to)
+			}(j, to)
+		}
+		close(start)
+		wg.Wait()
+		wins := 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				wins++
+			case errors.Is(err, configstore.ErrTrinoCellMoveConflict):
+			default:
+				t.Fatalf("%s: unexpected error %v", org, err)
+			}
+		}
+		if wins != 1 {
+			t.Fatalf("%s: %d moves won, want exactly one (%v)", org, wins, errs)
+		}
 	}
 }

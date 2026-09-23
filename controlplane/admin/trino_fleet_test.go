@@ -138,3 +138,49 @@ func TestTrinoFleetSelectionIsAdminOnly(t *testing.T) {
 		t.Fatalf("unknown cell selected: %d", code)
 	}
 }
+
+type movingTrinoStore struct {
+	fakeTrinoOrgStore
+	from, to string
+	err      error
+}
+
+func (s *movingTrinoStore) MoveTrinoCell(_, from, to string) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.from, s.to = from, to
+	return nil
+}
+
+// Moving an owned org is admin-only, names both cells by console id, and
+// hands the store their stored ids so the move is a compare-and-swap on the
+// owner the operator saw.
+func TestTrinoFleetMoveCell(t *testing.T) {
+	store := &movingTrinoStore{}
+	api := NewTrinoFleetAPI([]TrinoCell{{ID: "legacy", StoredID: "cell-001"}, {ID: "cell-001", StoredID: "registered:cell-001"}}, []TrinoCoordinatorClient{&fakeTrinoCoordinator{}, &fakeTrinoCoordinator{}}, store, nil)
+	const path = "/api/v1/orgs/tenant/trino/cell/move"
+
+	code, _ := doTrinoJSON(t, trinoTestRouter(api, RoleViewer), http.MethodPost, path, `{"from":"legacy","to":"cell-001"}`)
+	if code != http.StatusForbidden || store.to != "" {
+		t.Fatalf("viewer moved an org: %d", code)
+	}
+	for _, body := range []string{`{"from":"legacy","to":"unknown"}`, `{"from":"unknown","to":"cell-001"}`, `{"from":"legacy","to":"legacy"}`, `{"to":"cell-001"}`} {
+		if code, _ := doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodPost, path, body); code != http.StatusBadRequest || store.to != "" {
+			t.Fatalf("%s: %d, want 400 and no move", body, code)
+		}
+	}
+	code, _ = doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodPost, path, `{"from":"legacy","to":"cell-001"}`)
+	if code != http.StatusOK || store.from != "cell-001" || store.to != "registered:cell-001" {
+		t.Fatalf("admin move: %d from=%q to=%q", code, store.from, store.to)
+	}
+
+	store.err = configstore.ErrTrinoCellMoveConflict
+	if code, _ := doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodPost, path, `{"from":"legacy","to":"cell-001"}`); code != http.StatusConflict {
+		t.Fatalf("stale source: %d, want 409", code)
+	}
+	store.err = configstore.ErrTrinoWarehouseNotFound
+	if code, _ := doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodPost, path, `{"from":"legacy","to":"cell-001"}`); code != http.StatusNotFound {
+		t.Fatalf("unknown org: %d, want 404", code)
+	}
+}
