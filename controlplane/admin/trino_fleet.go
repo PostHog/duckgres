@@ -43,6 +43,7 @@ func registerTrinoFleetAPI(r *gin.RouterGroup, api *TrinoAPI) {
 	r.GET("/trino/orgs", api.forCell((*TrinoAPI).handleOrgs))
 	r.GET("/orgs/:id/trino", api.handleFleetOrg)
 	r.PUT("/orgs/:id/trino/cell", api.handleSelectCell)
+	r.POST("/orgs/:id/trino/cell/move", api.handleMoveCell)
 }
 
 func (a *TrinoAPI) forCell(handle func(*TrinoAPI, *gin.Context)) gin.HandlerFunc {
@@ -136,4 +137,52 @@ func (a *TrinoAPI) handleSelectCell(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"cell": a.fleet[req.Cell].cell, "assigned": true})
+}
+
+type trinoCellMover interface {
+	MoveTrinoCell(orgID, fromCellID, toCellID string) error
+}
+
+// handleMoveCell reassigns an org that a cell already owns to another
+// configured cell. Both cells are named by their console id and the move
+// applies only while the org is still on `from`, so a stale console cannot
+// move an org it has not seen. The org has no Trino between the source's
+// cleanup and the destination's readiness; see docs/trino-cells.md.
+func (a *TrinoAPI) handleMoveCell(c *gin.Context) {
+	identity := IdentityFromContext(c)
+	if identity == nil || identity.Role != RoleAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+		return
+	}
+	var req struct {
+		From string `json:"from" binding:"required"`
+		To   string `json:"to" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || a.fleet[req.From] == nil || a.fleet[req.To] == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "configured source and destination Trino cells are required"})
+		return
+	}
+	if req.From == req.To {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "the source and destination Trino cells are the same"})
+		return
+	}
+	mover, ok := a.orgs.(trinoCellMover)
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "moving a Trino cell is unavailable"})
+		return
+	}
+	if err := mover.MoveTrinoCell(c.Param("id"), a.fleet[req.From].cell.storedID(), a.fleet[req.To].cell.storedID()); err != nil {
+		switch {
+		case errors.Is(err, configstore.ErrTrinoCellMoveConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, configstore.ErrTrinoWarehouseNotFound):
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		case errors.Is(err, configstore.ErrHoglakeLifecycleProtected):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot move Trino cell"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"cell": a.fleet[req.To].cell, "moved_from": a.fleet[req.From].cell.ID})
 }

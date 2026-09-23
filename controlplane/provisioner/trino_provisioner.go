@@ -1650,6 +1650,7 @@ func (p *TrinoProvisioner) writePerOrgStates(
 		upd := configstore.TrinoStateUpdate{
 			State:         nextState,
 			StatusMessage: msg,
+			CellID:        p.cellID,
 		}
 		if nextState == configstore.ManagedWarehouseStateReady && o.State != configstore.ManagedWarehouseStateReady {
 			// Transitioning INTO Ready — stamp ready_at, clear any

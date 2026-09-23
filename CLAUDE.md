@@ -1827,8 +1827,15 @@ password/tenant/catalog changes never propagate.
   legacy claims unassigned warehouses. Registered logical IDs have the reserved
   storage prefix `registered:`; the old stored `cell-001` remains legacy.
   Admin-only initial selection runs before first enablement and refuses changes
-  to any already owned warehouse, including a disabled one. No maintenance move,
-  capacity model, rebalancer, drain, or Gateway routing controller is included.
+  to any already owned warehouse, including a disabled one. An owned org moves
+  only through `POST /orgs/:id/trino/cell/move` (`ConfigStore.MoveTrinoCell`): a
+  compare-and-swap on the named source under the admission lock that resets
+  the row to pending. The source's authoritative projection then cleans the org
+  up and the destination provisions it, with NO overlap - the org has no Trino
+  in between. Per-org state writes carry `TrinoStateUpdate.CellID` so a stale
+  source tick cannot mark a moved row ready; keep that fence. No live
+  migration, capacity model, rebalancer, drain, or Gateway routing controller
+  is included.
   See [docs/trino-cells.md](docs/trino-cells.md) for configuration and recovery.
 - **Blue/green projections share one logical cell's namespace**, but internal
   communication Secrets remain distinct, chart-owned read-only references.
@@ -1855,7 +1862,10 @@ password/tenant/catalog changes never propagate.
   `tests/configstore/migrations_postgres_test.go`, and — for anything the
   admin console reads — `controlplane/admin/trino{,_client}_test.go` plus
   the `ui/src/lib/trino.test.ts` derivations and
-  `tests/mw-dev/e2e/trino.sh`.
+  `tests/mw-dev/e2e/trino.sh`. Cell moves → also
+  `tests/configstore/trino_selection_postgres_test.go`,
+  `controlplane/admin/trino_fleet_test.go` and the `trino_cell_move`
+  assertion in `tests/mw-dev/e2e/harness.sh`.
 
 ## Shared Trino Compute Pool (`mode: "shared-pool"`, `kubernetes` tag) — LOAD-BEARING CONTRACT
 

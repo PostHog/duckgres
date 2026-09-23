@@ -136,6 +136,11 @@ type TrinoStateUpdate struct {
 	StatusMessage string
 	ReadyAt       *time.Time
 	FailedAt      *time.Time
+	// CellID, when set, fences the write to the cell that owns the org. A
+	// reconcile tick that listed an org before MoveTrinoCell reassigned it
+	// must not stamp the source cell's outcome onto the moved row: a stale
+	// "ready" would claim the destination has provisioned it.
+	CellID string
 }
 
 // UpdateTrinoState writes the reconcile loop's per-tick outcome onto
@@ -182,9 +187,12 @@ func (cs *ConfigStore) UpdateTrinoState(orgID string, upd TrinoStateUpdate) erro
 			updates["failed_at"] = upd.FailedAt
 		}
 	}
-	result := cs.db.Model(&ManagedWarehouseTrino{}).
-		Where("org_id = ? AND enabled = ?", orgID, true).
-		Updates(updates)
+	query := cs.db.Model(&ManagedWarehouseTrino{}).
+		Where("org_id = ? AND enabled = ?", orgID, true)
+	if upd.CellID != "" {
+		query = query.Where("trino_cell_id = ?", upd.CellID)
+	}
+	result := query.Updates(updates)
 	if result.Error != nil {
 		return fmt.Errorf("update trino state for %q: %w", orgID, result.Error)
 	}
@@ -267,6 +275,63 @@ func (cs *ConfigStore) SelectTrinoCell(orgID, cellID string) error {
 		}
 		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ?", orgID).
 			Updates(map[string]any{"trino_cell_id": cellID, "updated_at": time.Now().UTC()}).Error
+	})
+}
+
+var ErrTrinoCellMoveConflict = errors.New("the org is not assigned to the source Trino cell")
+
+// MoveTrinoCell reassigns an org from one Trino cell to another.
+//
+// The move is a compare-and-swap on the owner: it applies only while the org
+// is still assigned to fromCellID, under the same per-org admission lock and
+// row lock as initial selection, so it cannot race a claim, a selection or a
+// second move. Moving to the cell that already owns the org is a no-op, so a
+// retried request is safe.
+//
+// The row goes back to pending with its readiness cleared: the destination
+// has not provisioned the org yet, and nothing may report it ready until the
+// destination does. The source finds the org gone from its wanted set on its
+// next tick and removes the catalog, passwords and policy it projected -
+// the same authoritative cleanup a disable gets. There is deliberately no
+// overlap: between the source's cleanup and the destination's readiness the
+// org has no Trino. This is the accepted cost of a move; a live handover
+// would need a source admission barrier and a verified drain.
+func (cs *ConfigStore) MoveTrinoCell(orgID, fromCellID, toCellID string) error {
+	if orgID == "" || fromCellID == "" || toCellID == "" {
+		return errors.New("MoveTrinoCell: orgID, fromCellID and toCellID are required")
+	}
+	if fromCellID == toCellID {
+		return errors.New("MoveTrinoCell: the source and destination cells are the same")
+	}
+	return cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+		if err := checkHoglakeWarehouseActiveTx(tx, orgID); err != nil {
+			return err
+		}
+		var row ManagedWarehouseTrino
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "org_id = ?", orgID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrTrinoWarehouseNotFound
+			}
+			return err
+		}
+		if row.TrinoCellID == toCellID {
+			return nil
+		}
+		if row.TrinoCellID != fromCellID {
+			return ErrTrinoCellMoveConflict
+		}
+		return tx.Model(&ManagedWarehouseTrino{}).Where("org_id = ? AND trino_cell_id = ?", orgID, fromCellID).
+			Updates(map[string]any{
+				"trino_cell_id":  toCellID,
+				"state":          ManagedWarehouseStatePending,
+				"status_message": "moving to another Trino cell",
+				"ready_at":       nil,
+				"failed_at":      nil,
+				"updated_at":     time.Now().UTC(),
+			}).Error
 	})
 }
 

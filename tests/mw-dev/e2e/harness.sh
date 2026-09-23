@@ -996,6 +996,67 @@ trino_default_cell_placement() {
   log "default-cell placement OK: warehouse enablement includes the configured assignment"
 }
 
+# Opt-in: move an existing Trino-enabled org to another cell and back.
+#
+# E2E_TRINO_CELL_MOVE_ORG names an org that is Trino-enabled and ready on some
+# cell; E2E_TRINO_CELL_MOVE_TO names another configured cell (console id, e.g.
+# "cell-001" for the pool or "legacy"). The round trip leaves the org where it
+# started. Each leg asserts the user-visible contract of a move:
+#   - the move is refused while the named source does not own the org (409);
+#   - an accepted move reports the org on the destination, pending, not ready;
+#   - the destination provisions it to ready;
+#   - repeating the same move is a no-op.
+# The org has no Trino between the source's cleanup and the destination's
+# readiness; that gap is accepted and documented, not asserted against.
+trino_cell_move() {
+  [ -n "${E2E_TRINO_CELL_MOVE_ORG:-}" ] || {
+    log "SKIP Trino cell move (set E2E_TRINO_CELL_MOVE_ORG and E2E_TRINO_CELL_MOVE_TO)"
+    return 0
+  }
+  org="$E2E_TRINO_CELL_MOVE_ORG"
+  to="${E2E_TRINO_CELL_MOVE_TO:?E2E_TRINO_CELL_MOVE_ORG needs E2E_TRINO_CELL_MOVE_TO}"
+  from="$(curl -fsS -H "$H" "$API/api/v1/orgs/$org/trino" | jq -r '.cell.id // ""')" \
+    || fail "cell move: could not read $org's Trino cell"
+  [ -n "$from" ] && [ "$from" != "$to" ] || fail "cell move: $org is on '$from', need a different cell than '$to'"
+
+  trino_cell_move_leg "$org" "$from" "$to"
+  trino_cell_move_leg "$org" "$to" "$from"
+  log "Trino cell move OK: $org moved $from -> $to -> $from, ready on each destination"
+}
+
+trino_cell_move_leg() { # org from to
+  org="$1" from="$2" to="$3"
+  # A move naming a cell that does not own the org is refused.
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -H "$H" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg f "$to" --arg t "$from" '{from:$f,to:$t}')" \
+    "$API/api/v1/orgs/$org/trino/cell/move")"
+  [ "$code" = "409" ] || fail "cell move: moving $org from non-owner $to returned $code, want 409"
+
+  curl -fsS -o /dev/null -H "$H" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg f "$from" --arg t "$to" '{from:$f,to:$t}')" \
+    "$API/api/v1/orgs/$org/trino/cell/move" || fail "cell move: $from -> $to request failed for $org"
+  detail="$(curl -fsS -H "$H" "$API/api/v1/orgs/$org/trino")" || fail "cell move: could not read $org after the move"
+  printf %s "$detail" | jq -e --arg t "$to" '.cell.id == $t and .status.state != "ready"' >/dev/null \
+    || fail "cell move: $org after $from -> $to is not on $to pending: $(printf %s "$detail" | head -c 400)"
+
+  a=0 state=""
+  while [ "$a" -lt 36 ]; do
+    detail="$(curl -fsS -H "$H" "$API/api/v1/orgs/$org/trino")" || detail=""
+    state="$(printf %s "$detail" | jq -r --arg t "$to" 'select(.cell.id == $t) | .status.state // ""')"
+    [ "$state" = "ready" ] && break
+    sleep 10; a=$((a + 1))
+  done
+  [ "$state" = "ready" ] || fail "cell move: $org never became ready on $to (state '$state'): $(printf %s "$detail" | head -c 400)"
+
+  # Idempotent: the org is already on `to`, so the same request is a no-op.
+  curl -fsS -o /dev/null -H "$H" -H 'Content-Type: application/json' \
+    -d "$(jq -nc --arg f "$from" --arg t "$to" '{from:$f,to:$t}')" \
+    "$API/api/v1/orgs/$org/trino/cell/move" || fail "cell move: repeating $from -> $to was not a no-op for $org"
+  state="$(curl -fsS -H "$H" "$API/api/v1/orgs/$org/trino" | jq -r '.status.state // ""')"
+  [ "$state" = "ready" ] || fail "cell move: repeating the move reset $org to '$state'"
+  log "Trino cell move OK [leg]: $org $from -> $to, ready on $to"
+}
+
 trino_shared_pool_disabled() {
   log "shared Trino pool: asserting the feature is inert"
 
@@ -5064,6 +5125,7 @@ engine_main() {
   compute_usage_pull_api "$CNPG" "$cnpg_pw"
 
   trino_default_cell_placement
+  trino_cell_move
 
   # ---- shared Trino compute pool ----
   # Inert while disabled; the active acceptance path runs on a pool-enabled

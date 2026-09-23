@@ -97,7 +97,7 @@ enabling Trino". Provision without Trino, select the initial cell, then enable.
 Already-enabled unassigned rows remain unprovisioned; disable them before
 initial selection. Unknown stored ownership fails closed without mutation.
 Assignments survive disable/re-enable. Already owned warehouses cannot change
-cells through this endpoint, even when disabled.
+cells through this endpoint, even when disabled; use the move endpoint below.
 
 ### Automatic placement runbook
 
@@ -172,15 +172,35 @@ internal credentials as a recovery shortcut. Preserve the registry while any
 warehouse remains assigned to it. Removing a configured cell does not migrate
 its warehouses: unknown ownership fails closed in the console.
 
-## Existing-warehouse migration follow-up
+## Moving an existing warehouse
 
-Initial assignment is deliberately not a live-migration API. Disabling Trino
-does not prove that cached credentials, open transactions, or direct coordinator
-clients can no longer submit work. A maintenance move needs an enforced source
-admission barrier, verified drain, destination provisioning, an explicit
-assignment/routing switch, and source cleanup. Until that barrier exists, use a
-previously non-Trino-enabled test warehouse for new-cell testing. Do not change
-an existing warehouse's row to simulate a completed move.
+`POST /api/v1/orgs/<org>/trino/cell/move` with `{"from":"legacy","to":"cell-001"}`
+reassigns an org that a cell already owns. It is admin-only and audited, and it
+names both cells by their console id. The move is a compare-and-swap on the
+owner, taken under the org's admission lock: it applies only while the org is
+still on `from` (otherwise 409), so a stale console cannot move an org it has
+not seen, and repeating a completed move is a no-op. The row returns to
+`pending` with `ready_at`/`failed_at` cleared, because the destination has not
+provisioned the org yet.
+
+Nothing else is special about a move. On its next tick the source cell finds
+the org absent from its wanted set and removes what it projected (catalog,
+tenant password, `password.db` lines, policy group), exactly as it does for a
+disabled org. The destination provisions the org like a new assignment; a pool
+with tenant admission holds it at provisioning until its publication commits.
+Per-org state writes are fenced to the owning cell, so a source tick that
+listed the org before the move cannot mark the moved row ready.
+
+**A move is not a live migration.** Between the source's cleanup and the
+destination's readiness the org has no Trino, typically a reconcile tick or
+two. Queries running on the source when its catalog is dropped fail, and
+clients that address the source directly (for example the legacy
+`trino.dw.<env>.postwh.com` endpoint) stop working for that org. Clients on the
+org's tenant host follow the Gateway to the destination. Tell the org's Trino
+users before moving it. A zero-downtime handover would need an enforced source
+admission barrier, a verified drain and overlapping ownership; none of that
+exists. Do not edit `trino_cell_id` by hand to simulate a move: it skips the
+readiness reset and the ownership check.
 
 Gateway public exposure is also a separate gate: authenticate every externally
 reachable API and UI before publishing it; keep unauthenticated probes internal.
