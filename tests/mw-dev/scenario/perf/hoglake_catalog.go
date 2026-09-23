@@ -15,7 +15,10 @@ func fixtureHoglakeProperties(original map[string]string, catalog string) (map[s
 	desired := maps.Clone(original)
 	desired["hoglake.catalog"] = catalog
 	// Managed onboarding assumes a tenant's writable storage role. Immutable
-	// benchmark fixtures are read through the isolated Trino Pod Identity instead.
+	// benchmark fixtures are read through the isolated Trino Pod Identity instead,
+	// which is the default credential chain. Trino requires s3.iam-role to be set
+	// exactly when s3.auth-type=IAM_ROLE, so the auth type goes with the role.
 	delete(desired, "s3.iam-role")
+	delete(desired, "s3.auth-type")
 	return desired, nil
 }
