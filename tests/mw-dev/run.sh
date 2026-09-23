@@ -54,9 +54,12 @@ case "$TRINO_SHARED_CATALOGS_ENABLED" in
     ;;
   *) echo "TRINO_SHARED_CATALOGS_ENABLED must be true or false" >&2; exit 2 ;;
 esac
-# Frozen perf keeps its independent image pin. Regular Trino tests require atomic writes.
+# Frozen perf tracks the newest PostHog/trino master build; cmd_deploy resolves
+# it to a digest pin when TRINO_IMAGE is unset. Regular Trino tests keep a
+# promoted pin because they require atomic writes.
+TRINO_MASTER_IMAGE_RESOLVER="${TRINO_MASTER_IMAGE_RESOLVER:-$HERE/../../scripts/resolve_trino_master_image.sh}"
 if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
-  TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:f3bddd334a9e08f54788779ec7c723b8c296765a@sha256:9a4bf1293d0b4b73aa3b46c16bf014ed22bb9fc12b8ea28617cfed06534c8f2d}"
+  TRINO_IMAGE="${TRINO_IMAGE:-}"
 else
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
 fi
@@ -544,6 +547,10 @@ cleanup_hoglake_storage() {
 
 cmd_deploy() {
   if [ "$E2E_SUITE" = trino ]; then
+    if [ -z "$TRINO_IMAGE" ]; then
+      TRINO_IMAGE="$("$TRINO_MASTER_IMAGE_RESOLVER")"
+    fi
+    echo "Trino image: $TRINO_IMAGE"
     if ! hoglake_perf_enabled; then
       : "${HOGLAKE_CI_POD_IDENTITY_ROLE:?Dedicated Hoglake CI role is required}"
     fi
