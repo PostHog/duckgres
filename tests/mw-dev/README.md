@@ -169,8 +169,12 @@ The lane defaults `TRINO_IMAGE` to the pinned PostHog fork promoted for these
 tests. That fork contains atomic Hoglake writes and the PostgreSQL dynamic catalog
 store; upstream `trinodb/trino` is not compatible. Update the default in
 `run.sh` and `e2e-mw-dev.yml` together when promoting the regular E2E
-Trino build. The frozen benchmark retains its separate pin in `scenario-dev.yml`
-until its independent migration.
+Trino build. The frozen benchmark (`posthog_frozen_perf`) is not pinned: it
+always tests the newest PostHog/trino master build, which
+`scripts/resolve_trino_master_image.sh` resolves to a digest-pinned reference
+from the fork's source-ordered `r<position>-<sha>` GHCR tags. `scenario-dev.yml`
+resolves it once per run, records it in the job summary, and accepts a
+`trino_image` dispatch input to benchmark a specific build instead.
 On statement failure, the harness reports the query ID, error codes and a bounded
 exception-class chain alongside the existing top-level message. It excludes nested
 messages, stack traces and response URLs because these can contain credentials or

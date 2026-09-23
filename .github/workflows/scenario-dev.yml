@@ -18,6 +18,11 @@ on:
         required: false
         default: ""
         type: string
+      trino_image:
+        description: Trino image for posthog_frozen_perf; blank uses the newest PostHog/trino master build
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "17 8 * * *"
 
@@ -77,7 +82,6 @@ jobs:
       # Frozen perf uses a namespace-local Trino cell. The dedicated role is
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      TRINO_IMAGE: ghcr.io/posthog/trino:f3bddd334a9e08f54788779ec7c723b8c296765a@sha256:9a4bf1293d0b4b73aa3b46c16bf014ed22bb9fc12b8ea28617cfed06534c8f2d
       E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}
       PR_NUMBER: ${{ github.run_id }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
@@ -94,6 +98,18 @@ jobs:
         run: |
           echo "::error::Cached Trino comparisons require the control-plane image built from this revision. Omit duckgres_image so an older image cannot silently ignore the cache flag."
           exit 1
+
+      - name: Resolve Trino image
+        if: env.E2E_SUITE == 'trino'
+        env:
+          TRINO_IMAGE_OVERRIDE: ${{ inputs.trino_image }}
+        run: |
+          set -euo pipefail
+          # Frozen perf follows PostHog/trino master; resolve once so every
+          # run.sh step deploys and reports the same digest.
+          image="${TRINO_IMAGE_OVERRIDE:-$(scripts/resolve_trino_master_image.sh)}"
+          echo "TRINO_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "Trino image: \`$image\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Scenario dev target selected
         run: echo "Deploying an isolated Duckgres stack for $SCENARIO_NAME."

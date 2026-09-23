@@ -1791,6 +1791,11 @@ func newRunSHFakes(t *testing.T) runSHFakes {
 		t.Fatalf("write fake internal secret: %v", err)
 	}
 
+	writeFake(t, binDir, "resolve-trino-master-image", `#!/usr/bin/env bash
+printf 'resolve-trino-master-image\n' >> "$RUN_SH_TEST_CALLS"
+echo `+fakeTrinoMasterImage+`
+`)
+
 	writeFake(t, binDir, "kubectl", `#!/usr/bin/env bash
 printf 'kubectl %s\n' "$*" >> "$RUN_SH_TEST_CALLS"
 
@@ -2042,6 +2047,9 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"SCENARIO_POD_IDENTITY_ROLE=",
 		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),
 		"DUCKGRES_CI_SECRET_DIR="+filepath.Join(filepath.Dir(binDir), "secrets"),
+		// Workflows export a pinned TRINO_IMAGE; clear it so frozen perf resolves.
+		"TRINO_IMAGE=",
+		"TRINO_MASTER_IMAGE_RESOLVER="+filepath.Join(binDir, "resolve-trino-master-image"),
 	)
 	for _, value := range extraEnv {
 		if value == "E2E_SUITE=trino" {
@@ -2155,6 +2163,57 @@ func TestTrinoCacheManagersHaveWritableBoundedStorage(t *testing.T) {
 	}
 	if configs != 2 || deployments != 2 {
 		t.Fatalf("found %d configs and %d deployments", configs, deployments)
+	}
+}
+
+const fakeTrinoMasterImage = "example.invalid/trino:master@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+func TestFrozenPerfDeploysNewestTrinoMasterImage(t *testing.T) {
+	for _, tc := range []struct {
+		name, override, want string
+		resolves             bool
+	}{
+		{name: "resolved", want: fakeTrinoMasterImage, resolves: true},
+		{name: "override", override: "example.invalid/trino:pinned", want: "example.invalid/trino:pinned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+			writeFake(t, fakes.binDir, "envsubst", `#!/usr/bin/env bash
+printf 'trino-image %s\n' "${TRINO_IMAGE:-unset}" >> "$RUN_SH_TEST_CALLS"
+cat
+`)
+			secretDir := filepath.Join(filepath.Dir(fakes.binDir), "secrets")
+			for _, name := range []string{"duckgres-ci-trino-ca.crt", "duckgres-ci-trino-server.p12"} {
+				if err := os.WriteFile(filepath.Join(secretDir, name), []byte("test-tls-material\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := runSHCommand(t, fakes.binDir, "deploy", "SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1", "E2E_SUITE=trino",
+				"SCENARIO_NAME=posthog_frozen_perf", "TRINO_IMAGE="+tc.override,
+				"TRINO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/trino-test",
+				"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/scenario-test")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("deploy: %v\n%s", err, out)
+			}
+			calls := fakes.calls(t)
+			if got := strings.Count(calls, "resolve-trino-master-image\n"); tc.resolves != (got == 1) || got > 1 {
+				t.Fatalf("resolver ran %d times (want resolve=%v): %s", got, tc.resolves, calls)
+			}
+			var images []string
+			for _, line := range strings.Split(calls, "\n") {
+				if image, ok := strings.CutPrefix(line, "trino-image "); ok && image != "unset" {
+					images = append(images, image)
+				}
+			}
+			if len(images) == 0 {
+				t.Fatalf("no Trino manifest was rendered: %s", calls)
+			}
+			for _, image := range images {
+				if image != tc.want {
+					t.Fatalf("rendered Trino image %q, want %q", image, tc.want)
+				}
+			}
+		})
 	}
 }
 
