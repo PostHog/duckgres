@@ -140,7 +140,7 @@ func validateRelationVariants(targets []Protocol, variants map[StorageTarget]map
 	if !hasPairedQueries {
 		return nil
 	}
-	requiredTargets := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable}
+	requiredTargets := []StorageTarget{StorageTargetDuckLakeTable}
 	for _, target := range targets {
 		if target == ProtocolTrino || target == ProtocolTrinoCached {
 			requiredTargets = append(requiredTargets, StorageTargetHoglakeTable)
@@ -187,7 +187,7 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 		return nil, fmt.Errorf("paired query %s must contain at least one relation placeholder", def.QueryIDBase)
 	}
 
-	targets := []StorageTarget{StorageTargetRawView, StorageTargetDuckLakeTable}
+	targets := []StorageTarget{StorageTargetDuckLakeTable}
 	if _, ok := variants[StorageTargetHoglakeTable]; ok {
 		targets = append(targets, StorageTargetHoglakeTable)
 	}
@@ -212,11 +212,6 @@ func expandPairedQuery(def pairedQueryDefinition, variants map[StorageTarget]map
 			PGWireSQL:     rendered,
 			StorageTarget: target,
 		})
-	}
-	// Identical relation names are valid across engines, but the raw-view and
-	// DuckLake variants run on the same PGWire target and must differ.
-	if queries[0].PGWireSQL == queries[1].PGWireSQL {
-		return nil, fmt.Errorf("paired query %s relation bindings must differ between storage targets", def.QueryIDBase)
 	}
 	return queries, nil
 }
@@ -409,7 +404,6 @@ func validateCatalog(c Catalog) error {
 		return fmt.Errorf("queries must include at least one entry")
 	}
 	seenQueryIDs := map[string]struct{}{}
-	hasPairedQueries := false
 	for _, q := range c.Queries {
 		if q.QueryID == "" {
 			return fmt.Errorf("query_id is required")
@@ -444,12 +438,6 @@ func validateCatalog(c Catalog) error {
 				return fmt.Errorf("query %s variant is not supported for Athena", q.QueryID)
 			}
 		}
-		if q.StorageTarget != "" {
-			hasPairedQueries = true
-		}
-	}
-	if hasPairedQueries && c.MeasureIterations%2 != 0 {
-		return fmt.Errorf("paired catalogs require an even measure_iterations value to balance storage-target execution order")
 	}
 	return nil
 }

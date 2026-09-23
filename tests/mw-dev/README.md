@@ -144,10 +144,11 @@ bounded Secret-projection window. It also passes the deployed
 `DUCKGRES_K8S_WORKER_CPU_REQUEST` and `DUCKGRES_K8S_WORKER_MEMORY_REQUEST` into
 the perf step, which requests that exact shape through PGWire startup options
 and therefore bypasses the exploratory worker tier. The paired catalog remains the single SQL
-source: direct-Parquet `raw_view` members run only through PGWire,
-production-shaped `ducklake_table` members run through PGWire and Trino, and
-`athena_external` members run through Athena against Glue tables over the same
-immutable Parquet objects. Athena is on-demand, result reuse is disabled, and
+source: production-shaped `ducklake_table` members run through PGWire,
+`hoglake_table` members run through Trino, and `athena_external` members run
+through Athena against Glue tables over the same immutable Parquet objects.
+The raw `read_parquet` file views are still created for table setup and the
+dbt scenario, but are no longer benchmarked. Athena is on-demand, result reuse is disabled, and
 the harness records service-side timing and scanned bytes in
 `query_service_metrics.csv`.
 To reproduce the scheduled run, deploy and test with `E2E_SUITE=trino` and the
