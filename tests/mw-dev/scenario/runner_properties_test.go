@@ -14,6 +14,7 @@ import (
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 	scenarioperf "github.com/posthog/duckgres/tests/mw-dev/scenario/perf"
 	scenariosql "github.com/posthog/duckgres/tests/mw-dev/scenario/sql"
+	perfcore "github.com/posthog/duckgres/tests/perf/core"
 	"github.com/posthog/duckgres/tests/perf/properties"
 	"gopkg.in/yaml.v3"
 )
@@ -23,6 +24,12 @@ const stepTypePropertiesComparison = "properties_comparison"
 // This phase runs only after the original benchmarks have written their
 // artifacts. Fixture preparation errors cannot prevent those results publishing.
 func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core.Step) error {
+	// Properties results publish under the nightly's dataset so one dashboard
+	// selection covers every suite; the fixture hash is kept as fixture_version.
+	datasetVersion, _ := step.With["dataset_version"].(string)
+	if datasetVersion == "" {
+		return fmt.Errorf("properties comparison requires the nightly dataset_version")
+	}
 	source := os.Getenv("DUCKGRES_SCENARIO_PROPERTIES_S3_URI")
 	prepared, err := preparePropertiesComparison(ctx, source, step)
 	if err != nil {
@@ -43,13 +50,18 @@ func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core
 	}}); err != nil {
 		return err
 	}
-	with := make(map[string]any, len(step.With)+3)
+	with := make(map[string]any, len(step.With)+6)
 	for key, value := range step.With {
 		with[key] = value
 	}
 	with["catalog_file"] = filepath.Join(prepared.directory, "catalog.yaml")
-	with["dataset_version"] = "properties-sha256-" + prepared.dataset.SHA256
+	with["dataset_version"] = datasetVersion
+	with["suite"] = perfcore.SuiteProperties
+	with["fixture_version"] = "properties-sha256-" + prepared.dataset.SHA256
 	with["output_subdir"] = "perf-properties"
+	// Distinct run ID so the publisher never overwrites the table-suite run;
+	// consumers pair the two through nightly_run_id, not this suffix.
+	with["nightly_run_id"] = fmt.Sprint(step.With["run_id"])
 	with["run_id"] = fmt.Sprint(step.With["run_id"]) + "-properties"
 	return e.perf.ExecuteStep(ctx, core.Step{ID: step.ID, Type: scenarioperf.StepTypePerfQueries, With: with})
 }

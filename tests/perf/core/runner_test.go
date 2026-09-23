@@ -82,6 +82,29 @@ func summaryProtocolIterations(sink *inMemorySink) []string {
 	return got
 }
 
+func TestRunnerStampsSuiteAndFixtureVersionOnTheSummary(t *testing.T) {
+	runner := NewQueryRunner(RunnerConfig{
+		RunID:          "run-properties",
+		DatasetVersion: "posthog-file-views-v1",
+		Suite:          "properties",
+		FixtureVersion: "properties-sha256-abc",
+		Catalog: Catalog{
+			Name: "suite", MeasureIterations: 1, Targets: []Protocol{ProtocolPGWire},
+			Queries: []Query{{QueryID: "q1", IntentID: "i1", PGWireSQL: "SELECT 1"}},
+		},
+		Drivers: map[Protocol]ProtocolDriver{ProtocolPGWire: &testDriver{protocol: ProtocolPGWire}},
+		Sink:    &inMemorySink{},
+		Now:     func() time.Time { return time.Unix(1700000000, 0) },
+	})
+	summary, err := runner.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if summary.DatasetVersion != "posthog-file-views-v1" || summary.Suite != "properties" || summary.FixtureVersion != "properties-sha256-abc" {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
 func TestRunnerExecutesPairedQueriesThroughExistingRuntimeContract(t *testing.T) {
 	catalog, err := ParseCatalog([]byte(pairedCatalogYAML(`
 paired_queries:

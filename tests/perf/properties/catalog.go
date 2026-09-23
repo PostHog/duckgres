@@ -14,7 +14,7 @@ func Catalog() core.Catalog {
 		for _, rep := range []string{"json", "struct", "variant"} {
 			relation := `"properties_perf"."events_supported"`
 			expr := `json_extract_string(properties, '$."$browser"')`
-			qt := []core.Protocol{core.ProtocolPGWireUncached, core.ProtocolPGWireCached, core.ProtocolTrino}
+			qt := []core.Protocol{core.ProtocolPGWireUncached, core.ProtocolPGWireCached, core.ProtocolTrino, core.ProtocolTrinoCached}
 			switch rep {
 			case "struct":
 				expr = `properties_typed."$browser"`

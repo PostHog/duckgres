@@ -554,6 +554,11 @@ func TestFrozenPerfScenarioRunsOptionalPropertiesAfterOriginalPerf(t *testing.T)
 	if got := comparison.DependsOn; len(got) != 1 || got[0] != "perf_queries" {
 		t.Fatalf("properties dependencies = %#v, want original perf first", got)
 	}
+	// One nightly publishes both suites under one dataset, so the dashboard's
+	// comparison sees them together.
+	if got, want := comparison.With["dataset_version"], steps["perf_queries"].With["dataset_version"]; got == nil || got != want {
+		t.Fatalf("properties dataset_version = %#v, want the perf_queries dataset %#v", got, want)
+	}
 	for _, name := range scenario.RequiredEnv {
 		if name == "DUCKGRES_SCENARIO_PROPERTIES_S3_URI" {
 			t.Fatal("properties fixture must remain optional")

@@ -71,6 +71,9 @@ type stepSpec struct {
 	Targets              []perfcore.Protocol
 	RunID                string
 	DatasetVersion       string
+	Suite                string
+	FixtureVersion       string
+	NightlyRunID         string
 	Database             string
 	OutputSubdir         string
 	ReadOnly             bool
@@ -203,6 +206,9 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		RunID:          spec.RunID,
 		Catalog:        catalog,
 		DatasetVersion: spec.DatasetVersion,
+		Suite:          spec.Suite,
+		FixtureVersion: spec.FixtureVersion,
+		NightlyRunID:   spec.NightlyRunID,
 		Drivers:        drivers,
 		Sink:           closingSink{sink: sink, closeFunc: closeSink},
 		Now:            e.now,
@@ -249,6 +255,10 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 	runID, err := requiredString(step, "run_id")
 	if err != nil {
 		return stepSpec{}, err
+	}
+	suite := stringFromWith(step, "suite", perfcore.SuiteTables)
+	if err := perfcore.ValidateSuite(suite); err != nil {
+		return stepSpec{}, classified(ErrorClassConfig, err)
 	}
 	if e.outputDir == "" {
 		return stepSpec{}, classified(ErrorClassConfig, fmt.Errorf("perf output dir is required"))
@@ -298,6 +308,9 @@ func (e *Executor) parseStep(step core.Step) (stepSpec, error) {
 		Targets:             targets,
 		RunID:               runID,
 		DatasetVersion:      stringFromWith(step, "dataset_version", ""),
+		Suite:               suite,
+		FixtureVersion:      stringFromWith(step, "fixture_version", ""),
+		NightlyRunID:        stringFromWith(step, "nightly_run_id", runID),
 		Database:            stringFromWith(step, "catalog", "ducklake"),
 		OutputSubdir:        stringFromWith(step, "output_subdir", "perf"),
 		ReadOnly:            boolFromWith(step, "read_only", true),

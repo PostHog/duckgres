@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -162,27 +163,110 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 	if db.tx.rolledBack {
 		t.Fatalf("did not expect rollback")
 	}
-	if len(db.tx.execs) != 11 {
-		t.Fatalf("expected 11 execs, got %d", len(db.tx.execs))
+	// bootstrap, two deletes, one run insert, two result inserts
+	bootstrap := bootstrapStatementCount(t)
+	if len(db.tx.execs) != bootstrap+5 {
+		t.Fatalf("expected %d execs, got %d", bootstrap+5, len(db.tx.execs))
 	}
-	runInsert := db.tx.execs[8]
+	runInsert := db.tx.execs[bootstrap+2]
 	if !strings.Contains(runInsert.query, "INSERT INTO duckgres_perf.runs") {
 		t.Fatalf("unexpected run insert query: %s", runInsert.query)
 	}
 	if got, ok := runInsert.args[0].(string); !ok || got != "nightly-v1-20260311T234300Z" {
 		t.Fatalf("unexpected run insert args: %#v", runInsert.args)
 	}
-	firstResultInsert := db.tx.execs[9]
+	// A summary without a suite is a table run and carries no fixture version.
+	if got := runInsert.args[8]; got != core.SuiteTables {
+		t.Fatalf("run suite = %#v, want %q", got, core.SuiteTables)
+	}
+	if got, ok := runInsert.args[9].(*string); !ok || got != nil {
+		t.Fatalf("run fixture_version = %#v, want nil", runInsert.args[9])
+	}
+	// A standalone run is its own nightly.
+	if got := runInsert.args[10]; got != "nightly-v1-20260311T234300Z" {
+		t.Fatalf("run nightly_run_id = %#v, want the run's own ID", got)
+	}
+	firstResultInsert := db.tx.execs[bootstrap+3]
 	if !strings.Contains(firstResultInsert.query, "INSERT INTO duckgres_perf.query_results") {
 		t.Fatalf("unexpected result insert query: %s", firstResultInsert.query)
 	}
 	if got, ok := firstResultInsert.args[8].(*int64); !ok || got == nil || *got != 1 {
 		t.Fatalf("expected rows pointer with value 1, got %#v", firstResultInsert.args[8])
 	}
-	secondResultInsert := db.tx.execs[10]
+	if got := firstResultInsert.args[15]; got != core.SuiteTables {
+		t.Fatalf("result suite = %#v, want %q", got, core.SuiteTables)
+	}
+	secondResultInsert := db.tx.execs[bootstrap+4]
 	if got, ok := secondResultInsert.args[6].(*string); !ok || got == nil || *got != "boom" {
 		t.Fatalf("expected error arg, got %#v", secondResultInsert.args[6])
 	}
+}
+
+func TestPublishArtifactsWritesSuiteAndFixtureVersion(t *testing.T) {
+	runDir := t.TempDir()
+	writeCustomSummaryFile(t, runDir, map[string]any{
+		"run_id":          "scenario-dev-posthog-frozen-perf-1-properties",
+		"dataset_version": "posthog-file-views-v1",
+		"suite":           "properties",
+		"fixture_version": "properties-sha256-abc",
+		"nightly_run_id":  "scenario-dev-posthog-frozen-perf-1",
+		"started_at":      "2026-03-11T23:43:03Z",
+		"finished_at":     "2026-03-11T23:43:14Z",
+	})
+	writeFixtureCSVFile(t, runDir)
+	artifacts, err := loadArtifacts(runDir)
+	if err != nil {
+		t.Fatalf("loadArtifacts returned error: %v", err)
+	}
+	db := &fakeDB{tx: &fakeTx{}}
+	if err := publishArtifacts(context.Background(), Config{Schema: "duckgres_perf"}, db, artifacts); err != nil {
+		t.Fatalf("publishArtifacts returned error: %v", err)
+	}
+	runInsert := db.tx.execs[2]
+	if runInsert.args[1] != "posthog-file-views-v1" || runInsert.args[8] != core.SuiteProperties {
+		t.Fatalf("run dataset/suite = %#v/%#v", runInsert.args[1], runInsert.args[8])
+	}
+	if got, ok := runInsert.args[9].(*string); !ok || got == nil || *got != "properties-sha256-abc" {
+		t.Fatalf("run fixture_version = %#v", runInsert.args[9])
+	}
+	if got := runInsert.args[10]; got != "scenario-dev-posthog-frozen-perf-1" {
+		t.Fatalf("run nightly_run_id = %#v", got)
+	}
+	for _, result := range db.tx.execs[3:] {
+		if result.args[11] != "posthog-file-views-v1" || result.args[15] != core.SuiteProperties {
+			t.Fatalf("result dataset/suite = %#v/%#v", result.args[11], result.args[15])
+		}
+		if got, ok := result.args[16].(*string); !ok || got == nil || *got != "properties-sha256-abc" {
+			t.Fatalf("result fixture_version = %#v", result.args[16])
+		}
+		if got := result.args[17]; got != "scenario-dev-posthog-frozen-perf-1" {
+			t.Fatalf("result nightly_run_id = %#v", got)
+		}
+	}
+}
+
+func TestLoadArtifactsRejectsUnknownSuite(t *testing.T) {
+	runDir := t.TempDir()
+	writeCustomSummaryFile(t, runDir, map[string]any{
+		"run_id":          "r",
+		"dataset_version": "v1",
+		"suite":           "Properties",
+		"started_at":      "2026-03-11T23:43:03Z",
+		"finished_at":     "2026-03-11T23:43:14Z",
+	})
+	writeFixtureCSVFile(t, runDir)
+	if _, err := loadArtifacts(runDir); err == nil || !strings.Contains(err.Error(), "unknown suite") {
+		t.Fatalf("expected unknown suite error, got %v", err)
+	}
+}
+
+func bootstrapStatementCount(t *testing.T) int {
+	t.Helper()
+	tx := &fakeTx{}
+	if err := bootstrapSchema(context.Background(), tx, "duckgres_perf"); err != nil {
+		t.Fatalf("bootstrapSchema returned error: %v", err)
+	}
+	return len(tx.execs)
 }
 
 func TestBootstrapSchemaDoesNotUseUnsupportedConstraints(t *testing.T) {
@@ -191,16 +275,46 @@ func TestBootstrapSchemaDoesNotUseUnsupportedConstraints(t *testing.T) {
 	if err := bootstrapSchema(context.Background(), tx, "duckgres_perf"); err != nil {
 		t.Fatalf("bootstrapSchema returned error: %v", err)
 	}
-	if len(tx.execs) != 6 {
-		t.Fatalf("expected 6 bootstrap statements, got %d", len(tx.execs))
-	}
-
 	runsDDL := tx.execs[5].query
 	if !strings.Contains(runsDDL, "CREATE TABLE IF NOT EXISTS duckgres_perf.runs") {
 		t.Fatalf("unexpected runs ddl: %s", runsDDL)
 	}
 	if strings.Contains(runsDDL, "PRIMARY KEY") || strings.Contains(runsDDL, "UNIQUE") {
 		t.Fatalf("runs ddl should not use unsupported constraints: %s", runsDDL)
+	}
+
+	// Suite columns follow both CREATE TABLEs, on both tables, with a backfill
+	// that only classifies rows published before the columns existed.
+	var rest []string
+	for _, exec := range tx.execs[6:] {
+		rest = append(rest, exec.query)
+	}
+	for _, table := range []string{"runs", "query_results"} {
+		for _, want := range []string{
+			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN IF NOT EXISTS suite TEXT",
+			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN IF NOT EXISTS fixture_version TEXT",
+			"ALTER TABLE duckgres_perf." + table + " ADD COLUMN IF NOT EXISTS nightly_run_id TEXT",
+		} {
+			if !slices.Contains(rest, want) {
+				t.Errorf("bootstrap missing %q", want)
+			}
+		}
+		backfill := ""
+		for _, query := range rest {
+			if strings.HasPrefix(query, "UPDATE duckgres_perf."+table+" SET") {
+				backfill = query
+			}
+		}
+		for _, want := range []string{
+			"suite = CASE WHEN run_id LIKE '%-properties' THEN 'properties' ELSE 'tables' END",
+			"nightly_run_id = CASE WHEN run_id LIKE '%-properties' THEN LEFT(run_id, LENGTH(run_id) - LENGTH('-properties')) ELSE run_id END",
+			"fixture_version = CASE WHEN dataset_version LIKE 'properties-sha256-%' THEN dataset_version END",
+			"WHERE suite IS NULL",
+		} {
+			if !strings.Contains(backfill, want) {
+				t.Errorf("%s backfill missing %q:\n%s", table, want, backfill)
+			}
+		}
 	}
 }
 
@@ -211,7 +325,7 @@ func TestPublishArtifactsRollsBackOnInsertFailure(t *testing.T) {
 		t.Fatalf("loadArtifacts returned error: %v", err)
 	}
 
-	db := &fakeDB{tx: &fakeTx{failOnExec: 9}}
+	db := &fakeDB{tx: &fakeTx{failOnExec: bootstrapStatementCount(t) + 3}}
 	cfg := Config{Schema: "duckgres_perf", BootstrapSchema: true}
 	err = publishArtifacts(context.Background(), cfg, db, artifacts)
 	if err == nil || !strings.Contains(err.Error(), "insert run summary") {
