@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
 )
@@ -44,6 +45,15 @@ func (e *Executor) setupHoglake(ctx context.Context, step core.Step) error {
 			return fmt.Errorf("properties representation must be json or variant")
 		}
 		args = append(args, "--properties-representation", representation)
+	}
+	// Optional: how long the importer waits for its registered files'
+	// stats to hydrate before failing (the script's default otherwise).
+	hydrationTimeout, err := durationFromWith(step, "hydration_timeout")
+	if err != nil {
+		return err
+	}
+	if hydrationTimeout > 0 {
+		args = append(args, "--hydration-timeout", strconv.FormatFloat(hydrationTimeout.Seconds(), 'f', -1, 64))
 	}
 	cmd := exec.CommandContext(ctx, "python3", args...)
 	cmd.Stdout = os.Stdout

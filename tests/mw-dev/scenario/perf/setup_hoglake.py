@@ -5,7 +5,9 @@ import io
 import json
 import re
 import struct
-from urllib.parse import urlparse
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 import pyarrow as pa
@@ -178,7 +180,7 @@ def run(store, api, source, catalog):
             "message": "Register immutable benchmark fixtures",
         },
     )
-    return result
+    return registered_tables(result, registrations)
 
 
 
@@ -235,8 +237,90 @@ def run_properties(store, api, source, catalog, representation):
             "files": [{"path": f"s3://{bucket}/{obj['key']}", "record_count": obj["rows"],
                        "file_size_bytes": obj["size"], "footer_size": obj["footer_size"]} for obj in files],
         })
-    return api.post(root + "/commit", {"appends": registrations, "author": "perf-fixture",
-                                      "message": "Register immutable properties fixtures"})
+    result = api.post(root + "/commit", {"appends": registrations, "author": "perf-fixture",
+                                        "message": "Register immutable properties fixtures"})
+    return registered_tables(result, registrations)
+
+
+def registered_tables(result, registrations):
+    """The commit receipt plus the (namespace, table) pairs it registered files into."""
+    return dict(result, tables=[{"namespace": r["namespace"], "table": r["table"]} for r in registrations])
+
+
+def wait_for_stats(api, catalog, tables, timeout, poll_interval=5.0, clock=time.monotonic, sleep=time.sleep):
+    """Block until every registered file of ``tables`` has hydrated stats.
+
+    The importer registers footers only (deferred stats), so each file
+    starts ``pending`` and carries no column bounds until the Hoglake
+    hydrator reads its footer. A benchmark measured before that runs every
+    query against stat-less files, which no engine can prune: it would
+    report the no-pruning cost as if it were the steady state, where
+    production writers ship stats at commit. So the import is not done
+    until hydration is, and a file the hydrator refuses (``failed``) or a
+    sweep that never arrives fails the scenario instead of silently
+    producing that benchmark.
+
+    ``tables`` is a list of (namespace, table) pairs. Returns the number of
+    files checked. A transient API failure (connection error, timeout, 5xx,
+    429) is retried until the deadline, and no call outlives it; any other
+    HTTP error fails immediately.
+    """
+    root = "/v1/catalogs/" + quote(catalog, safe="")
+    deadline = clock() + timeout
+    while True:
+        try:
+            counts, failed = _stats_states(api, root, tables, max(1.0, deadline - clock()))
+            transient = None
+        except HTTPError as e:
+            if e.code < 500 and e.code != 429:
+                raise
+            transient = e
+        except (URLError, OSError) as e:
+            transient = e
+        if transient is not None:
+            if clock() >= deadline:
+                raise TimeoutError(
+                    f"Hoglake stats hydration incomplete after {timeout:g}s: API unreachable ({transient})"
+                ) from transient
+            print(f"Hoglake API error while waiting for stats hydration, retrying: {transient}")
+            sleep(poll_interval)
+            continue
+        if counts["failed"]:
+            raise ValueError(
+                f"Hoglake stats hydration failed for {counts['failed']} fixture file(s) "
+                f"(e.g. {', '.join(failed)}); benchmarking stat-less files would measure no pruning"
+            )
+        if counts["pending"] == 0:
+            return counts["provided"]
+        if clock() >= deadline:
+            raise TimeoutError(
+                f"Hoglake stats hydration incomplete after {timeout:g}s: "
+                f"{counts['pending']} of {sum(counts.values())} fixture files still pending "
+                "(is the hydrator loop enabled with a short HOGLAKE_HYDRATOR_INTERVAL_MS?)"
+            )
+        print(f"Waiting for Hoglake stats hydration: {counts['pending']} of {sum(counts.values())} files pending")
+        sleep(poll_interval)
+
+
+def _stats_states(api, root, tables, call_timeout):
+    """One poll round: per-state file counts over ``tables``, and up to five failed paths."""
+    counts = {"provided": 0, "pending": 0, "failed": 0}
+    failed = []
+    for namespace, table in tables:
+        files = api.get(
+            f"{root}/namespaces/{quote(namespace, safe='')}/tables/{quote(table, safe='')}/files",
+            timeout=call_timeout,
+        )
+        if not files:
+            raise ValueError(f"{namespace}.{table} has no registered files to hydrate")
+        for f in files:
+            state = f.get("stats_state")
+            if state not in counts:
+                raise ValueError(f"{namespace}.{table}: unexpected stats_state {state!r}")
+            counts[state] += 1
+            if state == "failed" and len(failed) < 5:
+                failed.append(f"{namespace}.{table}:{f.get('path')}")
+    return counts, failed
 
 
 class S3Store:
@@ -291,8 +375,8 @@ class RestAPI:
             raise ValueError("invalid Hoglake API URI")
         self.uri = uri.rstrip("/")
 
-    def get(self, path):
-        with urlopen(self.uri + path, timeout=120) as response:
+    def get(self, path, timeout=120):
+        with urlopen(self.uri + path, timeout=timeout) as response:
             return json.load(response)
 
     def post(self, path, body):
@@ -317,6 +401,12 @@ def main():
     parser.add_argument("--properties-representation", choices=("json", "variant"), default="variant")
     parser.add_argument("--catalog", required=True)
     parser.add_argument("--uri", required=True)
+    parser.add_argument(
+        "--hydration-timeout",
+        type=float,
+        default=600.0,
+        help="seconds to wait for every registered file's stats to hydrate",
+    )
     args = parser.parse_args()
     store, api = S3Store(boto3.client("s3")), RestAPI(args.uri)
     if args.properties_source:
@@ -324,6 +414,9 @@ def main():
     else:
         result = run(store, api, args.source, args.catalog)
     print(f"Registered frozen fixtures at snapshot {result['snapshot_id']}")
+    tables = [(t["namespace"], t["table"]) for t in result["tables"]]
+    checked = wait_for_stats(api, args.catalog, tables, args.hydration_timeout)
+    print(f"Hoglake stats hydrated for all {checked} fixture files")
 
 
 if __name__ == "__main__":
