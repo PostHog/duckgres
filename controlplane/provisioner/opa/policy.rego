@@ -459,6 +459,16 @@ allow if {
 	)
 }
 
+# Trino uses this operation for both SHOW CREATE TABLE and SHOW CREATE VIEW.
+allow if {
+	input.action.operation == "ShowCreateTable"
+	readable_table(
+		input.action.resource.table.catalogName,
+		input.action.resource.table.schemaName,
+		input.action.resource.table.tableName,
+	)
+}
+
 allow if {
 	input.action.operation == "FilterTables"
 	readable_table(

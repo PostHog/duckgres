@@ -96,6 +96,11 @@ for deployment requirements, local verification, and recovery.
 See the [Trino admin API documentation](controlplane/admin/README.md#trino-cell-views-trinogo--trino_clientgo)
 for local verification, compatibility details, and recovery instructions.
 
+Trino `SHOW CREATE TABLE` and `SHOW CREATE VIEW` use the same catalog, schema,
+and relation read grants as table reads. Project-scoped logins can inspect only
+relations their scope permits; this does not grant access to the `system` catalog.
+Run `just test-trino-opa` to check the authorization policy locally.
+
 ## Metrics
 
 Duckgres exposes Prometheus metrics on `:9090/metrics`. The metrics port is currently fixed at 9090 and cannot be changed via configuration.

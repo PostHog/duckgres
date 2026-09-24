@@ -333,6 +333,11 @@ test-controlplane:
 test-configstore-integration:
     go test -v -count=1 ./tests/configstore/...
 
+# Test Trino authorization policy, including tenant and project isolation
+[group('test')]
+test-trino-opa pattern="":
+    go test -v -count=1 -run '{{pattern}}' ./controlplane/provisioner/opa
+
 # Run Kubernetes-only control plane package tests
 [group('test')]
 test-trino pattern="Trino":

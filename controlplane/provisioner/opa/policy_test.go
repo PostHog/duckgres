@@ -293,7 +293,7 @@ func TestSchemaScopeOps(t *testing.T) {
 func TestTableScopeOps(t *testing.T) {
 	q := preparedPolicy(t, twoOrgFixture())
 
-	for _, op := range []string{"SelectFromColumns", "FilterTables", "ShowColumns", "FilterColumns"} {
+	for _, op := range []string{"SelectFromColumns", "ShowCreateTable", "FilterTables", "ShowColumns", "FilterColumns"} {
 		if !evalAllow(t, q, buildInput("42", op, tableResource("org_42", "public", "events"))) {
 			t.Errorf("%s on own catalog must allow", op)
 		}
@@ -303,6 +303,30 @@ func TestTableScopeOps(t *testing.T) {
 		if evalAllow(t, q, buildInput("99", op, tableResource("org_42", "public", "events"))) {
 			t.Errorf("%s by unknown user must deny", op)
 		}
+	}
+}
+
+func TestShowCreateTableReadAuthority(t *testing.T) {
+	q := preparedPolicy(t, twoOrgFixture())
+	for _, tc := range []struct {
+		name    string
+		user    string
+		catalog string
+		allowed bool
+	}{
+		{"admin bundle read grant", AdminPrincipal, "org_42", true},
+		{"admin orphan catalog", AdminPrincipal, "org_99", false},
+		{"observer", ObserverPrincipal, "org_42", false},
+		{"tenant system catalog", "42", "system", false},
+		{"admin system catalog", AdminPrincipal, "system", false},
+		{"observer system catalog", ObserverPrincipal, "system", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evalAllow(t, q, buildInput(tc.user, "ShowCreateTable", tableResource(tc.catalog, "metadata", "table_comments")))
+			if got != tc.allowed {
+				t.Errorf("ShowCreateTable = %v, want %v", got, tc.allowed)
+			}
+		})
 	}
 }
 
@@ -853,6 +877,7 @@ func TestIsolationMatrix(t *testing.T) {
 		{"FilterSchemas", func(c string) map[string]interface{} { return schemaResource(c, "s") }},
 		{"ShowTables", func(c string) map[string]interface{} { return schemaResource(c, "s") }},
 		{"SelectFromColumns", func(c string) map[string]interface{} { return tableResource(c, "s", "t") }},
+		{"ShowCreateTable", func(c string) map[string]interface{} { return tableResource(c, "s", "t") }},
 		{"FilterTables", func(c string) map[string]interface{} { return tableResource(c, "s", "t") }},
 		{"ShowColumns", func(c string) map[string]interface{} { return tableResource(c, "s", "t") }},
 		{"FilterColumns", func(c string) map[string]interface{} { return tableResource(c, "s", "t") }},
@@ -1959,7 +1984,7 @@ func TestScopedGroupReadsOnlyItsOwnSchemas(t *testing.T) {
 		{"a shared schema it holds no grant in", "public", "anything", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, op := range []string{"SelectFromColumns", "FilterTables", "ShowColumns"} {
+			for _, op := range []string{"SelectFromColumns", "ShowCreateTable", "FilterTables", "ShowColumns"} {
 				got := evalAllow(t, q, tableInput(op, "org_acme", tc.schema, tc.table, scopedIdentity()))
 				if got != tc.want {
 					t.Errorf("%s on %s.%s = %v, want %v", op, tc.schema, tc.table, got, tc.want)
@@ -1978,11 +2003,13 @@ func TestScopedGroupRelationGrantDoesNotLeakItsSchema(t *testing.T) {
 	gc, gs := scopedFixture()
 	q := preparedScopedPolicy(t, gc, gs)
 
-	if !evalAllow(t, q, tableInput("SelectFromColumns", "org_acme", "posthog", "events", scopedIdentity())) {
-		t.Error("granted relation posthog.events must be readable")
-	}
-	if evalAllow(t, q, tableInput("SelectFromColumns", "org_acme", "posthog", "persons", scopedIdentity())) {
-		t.Error("posthog.persons was NOT granted and must not be readable")
+	for _, op := range []string{"SelectFromColumns", "ShowCreateTable"} {
+		if !evalAllow(t, q, tableInput(op, "org_acme", "posthog", "events", scopedIdentity())) {
+			t.Errorf("%s must allow the granted relation posthog.events", op)
+		}
+		if evalAllow(t, q, tableInput(op, "org_acme", "posthog", "persons", scopedIdentity())) {
+			t.Errorf("%s must deny the ungranted relation posthog.persons", op)
+		}
 	}
 }
 
@@ -2013,7 +2040,7 @@ func TestScopedGroupStillCannotCrossTenants(t *testing.T) {
 	gc, gs := scopedFixture()
 	q := preparedScopedPolicy(t, gc, gs)
 
-	for _, op := range []string{"SelectFromColumns", "FilterTables", "ShowColumns"} {
+	for _, op := range []string{"SelectFromColumns", "ShowCreateTable", "FilterTables", "ShowColumns"} {
 		if evalAllow(t, q, tableInput(op, "org_other", "posthog_7", "events", scopedIdentity())) {
 			t.Errorf("%s reached another tenant's catalog", op)
 		}
