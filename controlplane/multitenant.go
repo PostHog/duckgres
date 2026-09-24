@@ -658,6 +658,10 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, nil, err
 	}
 	readOnlyTokens := admin.NewTokenSet(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks)
+	trinoServiceAuthSecret, err := loadTrinoServiceAuthSecret(adminTokens, readOnlyTokens)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
 	if readOnlyTokens.Count() == 0 {
 		// Keyed off the TokenSet, not just cfg.ReadOnlySecret: fallbacks
 		// alone (mid-rotation) still validate, and saying otherwise here
@@ -673,6 +677,7 @@ func SetupMultiTenant(
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+	provisioning.RegisterTrinoServiceCredentialAuth(engine, store, trinoServiceAuthSecret)
 
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
@@ -781,8 +786,11 @@ func SetupMultiTenant(
 	if len(cfg.ManagedHostnameSuffixes) > 0 {
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
-	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store, trinoDefaultCell),
-		provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability), provisioning.WithTrinoDefaultCell(trinoDefaultCell))
+	provisioningOptions := []provisioning.Option{provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability), provisioning.WithTrinoDefaultCell(trinoDefaultCell)}
+	if trinoServiceAuthSecret != "" {
+		provisioningOptions = append(provisioningOptions, provisioning.WithTrinoServiceCredentialConnect(trinoCells.serviceCredentialConnect(gormStore)))
+	}
+	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store, trinoDefaultCell), provisioningOptions...)
 	// Discovery endpoints live in their OWN group (see discovery_group.go
 	// for the security rationale and the topology tripwire test).
 	registerReadOnlyGroup(engine, readOnlyTokens, adminTokens, provisioning.NewGormStore(store))

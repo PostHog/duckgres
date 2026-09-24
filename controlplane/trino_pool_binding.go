@@ -38,7 +38,8 @@ type trinoPoolTenantBinding struct {
 	Catalog string `json:"catalog"`
 	// Principals are the exact strings the coordinator's password file
 	// contains, sorted for a stable revision.
-	Principals []string `json:"principals"`
+	Principals             []string `json:"principals"`
+	ServicePrincipalPrefix string   `json:"service_principal_prefix,omitempty"`
 	// Revision changes whenever the principal set changes, so a stale binding
 	// is detectable rather than silently served.
 	Revision string `json:"revision"`
@@ -93,13 +94,18 @@ func trinoPoolBindingRevision(principals []string) string {
 
 // trinoPoolBindingsFor derives the bindings of every org a pool serves, sorted
 // by tenant so a republication decision is reproducible.
-func trinoPoolBindingsFor(orgs []configstore.TrinoEnabledOrg, poolID string) []trinoPoolTenantBinding {
+func trinoPoolBindingsFor(orgs []configstore.TrinoEnabledOrg, poolID string, serviceCredentialsEnabled ...bool) []trinoPoolTenantBinding {
 	bindings := make([]trinoPoolTenantBinding, 0, len(orgs))
 	for _, org := range orgs {
 		if org.CellID != poolID {
 			continue
 		}
-		bindings = append(bindings, trinoPoolTenantBindingFor(org))
+		binding := trinoPoolTenantBindingFor(org)
+		if len(serviceCredentialsEnabled) > 0 && serviceCredentialsEnabled[0] && configstore.ValidateDatabaseName(org.DatabaseName) == nil {
+			binding.ServicePrincipalPrefix = org.DatabaseName + "." + configstore.ServiceCredentialPrefix
+			binding.Revision = trinoPoolBindingRevision(append(append([]string{}, binding.Principals...), "service_principal_prefix="+binding.ServicePrincipalPrefix))
+		}
+		bindings = append(bindings, binding)
 	}
 	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Tenant < bindings[j].Tenant })
 	return bindings

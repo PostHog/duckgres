@@ -1098,8 +1098,11 @@ with a new `credential_id` and secret, even when principals are identical.
 (default 15 min, the RDS-IAM precedent). Response is
 `{credential_id, credential_secret, expires_at, connect}`; all fields are
 always present. `POST /api/v1/orgs/:id/service-credentials/refresh` with
-`{credential_id, ttl_seconds?}` **ALWAYS rotates** the named grant's secret
-and returns `{credential_id, credential_secret, expires_at, connect}`.
+`{credential_id, ttl_seconds?}` rotates the named grant's secret by default.
+Explicit `rotate_secret: false` renews only a live, non-revoked grant without changing its secret, preserving Trino gateway query ownership.
+Mint and default refresh return `secret_rotated: true`; non-rotating renewal returns `secret_rotated: false` and omits `credential_secret`.
+Clients must require the explicit false marker before retaining their in-memory secret, because an old server may ignore the renewal option and rotate.
+When Trino service authentication is configured and the assigned cell is ready, responses also include `trino_connect` from that cell's authoritative client endpoint.
 The caller is the internal-secret-authed PostHog backend — the routes sit
 next to the other provisioning routes for exactly that trust class, NOT on
 the admin/console side.

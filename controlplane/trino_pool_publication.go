@@ -142,9 +142,10 @@ const trinoPoolRevocationReason = "the warehouse is no longer served by this poo
 //
 // Principal identifiers and the revision naming them. Never a credential.
 type trinoPoolPendingRequest struct {
-	Revision   string   `json:"revision,omitempty"`
-	Principals []string `json:"principals,omitempty"`
-	Reason     string   `json:"reason,omitempty"`
+	Revision               string   `json:"revision,omitempty"`
+	Principals             []string `json:"principals,omitempty"`
+	ServicePrincipalPrefix string   `json:"service_principal_prefix,omitempty"`
+	Reason                 string   `json:"reason,omitempty"`
 }
 
 func (r trinoPoolPendingRequest) encode() (string, error) {
@@ -184,7 +185,7 @@ func (o *trinoPoolOperator) advanceTenantAdmissions(ctx context.Context) error {
 	if err := o.ensureCatalogWatermark(ctx); err != nil {
 		return err
 	}
-	bindings := trinoPoolBindingsFor(orgs, o.config.PoolID)
+	bindings := trinoPoolBindingsFor(orgs, o.config.PoolID, o.serviceCredentialsEnabled)
 	recorded, err := o.publications.ListTrinoPoolPublications(ctx, o.config.PoolID)
 	if err != nil {
 		return fmt.Errorf("read publications for pool %s: %w", o.config.PublicID, err)
@@ -485,10 +486,14 @@ func (o *trinoPoolOperator) reissuePublication(
 ) error {
 	admission, err := o.gateway.PublishTenantPrincipals(ctx, o.config.RoutingGroup, publication.OrgID,
 		trinogateway.PublishPrincipalsRequest{
-			Step:       o.step("tenant."+publication.OrgID, trinoPoolStepID("principals", trinoPoolOccurrence(publication.Attempt))),
-			Revision:   request.Revision,
-			Principals: request.Principals,
+			Step:                   o.step("tenant."+publication.OrgID, trinoPoolStepID("principals", trinoPoolOccurrence(publication.Attempt))),
+			Revision:               request.Revision,
+			Principals:             request.Principals,
+			ServicePrincipalPrefix: request.ServicePrincipalPrefix,
 		})
+	if err == nil && admission.ServicePrincipalPrefix != request.ServicePrincipalPrefix {
+		err = fmt.Errorf("%w: gateway did not confirm the service principal binding", trinogateway.ErrUnavailable)
+	}
 	if err != nil {
 		if o.fenced {
 			return err
@@ -624,7 +629,7 @@ func (o *trinoPoolOperator) publishChangedBindings(
 	publication := state[binding.Tenant]
 	// The request is stored with the occurrence, so every later attempt at it -
 	// by this leader or the next - sends these exact bytes.
-	request := trinoPoolPendingRequest{Revision: binding.Revision, Principals: binding.Principals}
+	request := trinoPoolPendingRequest{Revision: binding.Revision, Principals: binding.Principals, ServicePrincipalPrefix: binding.ServicePrincipalPrefix}
 	attempt, err := o.openOccurrence(ctx, binding.Tenant, configstore.TrinoPublicationIntentPrincipals, request)
 	if err != nil {
 		return true, o.dropAuthority(fmt.Errorf("start a publication for %s: %w", binding.Tenant, err))
@@ -635,10 +640,14 @@ func (o *trinoPoolOperator) publishChangedBindings(
 	// a second effect that overwrites the binding published since.
 	admission, err := o.gateway.PublishTenantPrincipals(ctx, o.config.RoutingGroup, binding.Tenant,
 		trinogateway.PublishPrincipalsRequest{
-			Step:       o.step("tenant."+binding.Tenant, trinoPoolStepID("principals", trinoPoolOccurrence(attempt))),
-			Revision:   request.Revision,
-			Principals: request.Principals,
+			Step:                   o.step("tenant."+binding.Tenant, trinoPoolStepID("principals", trinoPoolOccurrence(attempt))),
+			Revision:               request.Revision,
+			Principals:             request.Principals,
+			ServicePrincipalPrefix: request.ServicePrincipalPrefix,
 		})
+	if err == nil && admission.ServicePrincipalPrefix != request.ServicePrincipalPrefix {
+		err = fmt.Errorf("%w: gateway did not confirm the service principal binding", trinogateway.ErrUnavailable)
+	}
 	if err != nil {
 		if o.fenced {
 			return true, err

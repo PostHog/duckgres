@@ -36,6 +36,11 @@ case "$E2E_SUITE" in
   *) echo "E2E_SUITE must be neutral, duckdb, trino, or reshard (got $E2E_SUITE)" >&2; exit 2 ;;
 esac
 TRINO_SHARED_CATALOGS_ENABLED="${TRINO_SHARED_CATALOGS_ENABLED:-false}"
+TRINO_SERVICE_CREDENTIALS_ENABLED="${TRINO_SERVICE_CREDENTIALS_ENABLED:-false}"
+case "$TRINO_SERVICE_CREDENTIALS_ENABLED" in
+  true|false) ;;
+  *) echo "TRINO_SERVICE_CREDENTIALS_ENABLED must be true or false" >&2; exit 2 ;;
+esac
 TRINO_GATEWAY_IMAGE="${TRINO_GATEWAY_IMAGE:-}"
 case "$TRINO_SHARED_CATALOGS_ENABLED" in
   false) ;;
@@ -659,6 +664,7 @@ cmd_test_e2e() {
     --from-file=harness.sh="$harness_file" \
     --from-file=trino-multicell.sh="$HERE/e2e/trino-multicell.sh" \
     --from-file=trino-shared-catalogs.sh="$HERE/e2e/trino-shared-catalogs.sh" \
+    --from-file=trino-service-credentials.sh="$HERE/e2e/trino-service-credentials.sh" \
     --dry-run=client -o yaml | "${KUBECTL[@]}" apply --server-side --force-conflicts -f -
 
   INTERNAL_SECRET="$(cat "$internal_secret_file")"
@@ -701,6 +707,7 @@ spec:
             - { name: TRINO_CELL_NAMESPACE, value: "$TRINO_CELL_NS" }
             - { name: TRINO_MULTICELL_ENABLED, value: "$TRINO_MULTICELL_ENABLED" }
             - { name: TRINO_SHARED_CATALOGS_ENABLED, value: "$TRINO_SHARED_CATALOGS_ENABLED" }
+            - { name: TRINO_SERVICE_CREDENTIALS_ENABLED, value: "$TRINO_SERVICE_CREDENTIALS_ENABLED" }
             - { name: INTERNAL_SECRET, value: "$INTERNAL_SECRET" }
             - { name: INTERNAL_SECRET_FALLBACK, value: "$INTERNAL_SECRET_FALLBACK" }
             - { name: CP_API, value: "http://duckgres-control-plane.$NS.svc:8080" }

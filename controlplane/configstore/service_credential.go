@@ -29,6 +29,8 @@ var ErrServiceCredentialNotFound = errors.New("service credential not found")
 // resurrect it. HTTP handlers map it to 410.
 var ErrServiceCredentialRevoked = errors.New("service credential revoked")
 
+var ErrServiceCredentialExpired = errors.New("service credential expired")
+
 // ServiceCredentialIssue is the result of minting a service credential or
 // refreshing one by credential ID.
 type ServiceCredentialIssue struct {
@@ -232,6 +234,44 @@ func (cs *ConfigStore) RefreshServiceCredential(
 		return nil, err
 	}
 	return issue, nil
+}
+
+// RenewServiceCredential extends a live grant without changing its login or
+// secret, preserving HTTP gateway query-ownership fingerprints while polling.
+func (cs *ConfigStore) RenewServiceCredential(orgID, credentialID string, ttl time.Duration) (*ServiceCredentialIssue, error) {
+	if orgID == "" || credentialID == "" || ttl <= 0 {
+		return nil, errors.New("org, credential ID and positive TTL are required")
+	}
+	var issue *ServiceCredentialIssue
+	err := cs.db.Transaction(func(tx *gorm.DB) error {
+		if err := LockOrgConnectionAdmissionTx(tx, orgID); err != nil {
+			return err
+		}
+		var grant ServiceGrant
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&grant, "org_id = ? AND credential_id = ?", orgID, credentialID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrServiceCredentialNotFound
+			}
+			return err
+		}
+		if grant.RevokedAt != nil {
+			return ErrServiceCredentialRevoked
+		}
+		now := time.Now().UTC()
+		if !grant.ExpiresAt.After(now) {
+			return ErrServiceCredentialExpired
+		}
+		expiresAt := now.Add(ttl)
+		if grant.ExpiresAt.After(expiresAt) {
+			expiresAt = grant.ExpiresAt
+		}
+		if err := tx.Model(&ServiceGrant{}).Where("org_id = ? AND credential_id = ?", orgID, credentialID).Updates(map[string]any{"expires_at": expiresAt, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		issue = &ServiceCredentialIssue{CredentialID: grant.CredentialID, Principal: grant.Principal, ExpiresAt: expiresAt}
+		return nil
+	})
+	return issue, err
 }
 
 // ListServiceGrants returns every grant row for the org — all statuses

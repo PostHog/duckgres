@@ -259,9 +259,11 @@ type fakePoolGateway struct {
 	// deferPublish holds the next publication for a tenant at the server: the
 	// caller sees a lost response, and the effect commits when deliverDeferred
 	// runs.
-	deferPublish map[string]bool
-	deferred     []func()
-	deferRevoke  map[string]bool
+	deferPublish          map[string]bool
+	servicePrefixes       map[string]string
+	omitServicePrefixEcho bool
+	deferred              []func()
+	deferRevoke           map[string]bool
 	// intentConflicts counts refusals of a step identity that carries content
 	// the journal did not record for it. Settling a request must never depend
 	// on provoking one: it is an anomaly, not a protocol.
@@ -386,7 +388,7 @@ func (f *fakePoolGateway) deliverDeferred() {
 }
 
 func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.PublishPrincipalsRequest) (trinogateway.TenantAdmission, error) {
-	intent := request.Revision + "|" + strings.Join(request.Principals, ",")
+	intent := request.Revision + "|" + strings.Join(request.Principals, ",") + "|" + request.ServicePrincipalPrefix
 	replayed, err := f.guardStep(request.Step, intent)
 	if err != nil {
 		return trinogateway.TenantAdmission{}, err
@@ -394,7 +396,7 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 	if replayed {
 		// PoolStore.inPool resolves the recorded step and applies NOTHING: the
 		// principal rows keep whatever the earlier publication left there.
-		return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
+		return f.principalAdmission(tenant, request), nil
 	}
 	if f.principals == nil {
 		f.principals = map[string][]string{}
@@ -417,8 +419,20 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 		f.principalOf[principal] = tenant
 	}
 	f.principals[tenant] = request.Principals
+	if f.servicePrefixes == nil {
+		f.servicePrefixes = make(map[string]string)
+	}
+	f.servicePrefixes[tenant] = request.ServicePrincipalPrefix
 	f.recordStep(request.Step, intent)
-	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
+	return f.principalAdmission(tenant, request), nil
+}
+
+func (f *fakePoolGateway) principalAdmission(tenant string, request trinogateway.PublishPrincipalsRequest) trinogateway.TenantAdmission {
+	prefix := request.ServicePrincipalPrefix
+	if f.omitServicePrefixEcho {
+		prefix = ""
+	}
+	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision, ServicePrincipalPrefix: prefix}
 }
 
 func (f *fakePoolGateway) ConfigurePool(_ context.Context, poolID string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
@@ -1240,6 +1254,46 @@ func TestTenantBindingIsPublishedWhenTheGateIsOn(t *testing.T) {
 	}
 	if !sawBare {
 		t.Fatalf("published principals = %v, want the bare root login included", published)
+	}
+}
+
+func TestTrinoServiceCredentialPrefixPublishedAndRemoved(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.serviceCredentialsEnabled = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 1)
+	if got := harness.gateway.servicePrefixes["org-a"]; got != "acme.svc_" {
+		t.Fatalf("service prefix=%q", got)
+	}
+	harness.operator.serviceCredentialsEnabled = false
+	harness.tick(t, 1)
+	if got := harness.gateway.servicePrefixes["org-a"]; got != "" {
+		t.Fatalf("disabled service prefix still published: %q", got)
+	}
+}
+
+func TestTrinoServiceCredentialPrefixRequiresGatewayAcknowledgement(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.serviceCredentialsEnabled = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.gateway.omitServicePrefixEcho = true
+	harness.tickTolerant(1)
+	row := harness.publications.rows["org-a"]
+	if row == nil || row.PrincipalRevision != "" {
+		t.Fatal("unacknowledged prefix was checkpointed")
+	}
+	harness.clearBackoff("org-a")
+	harness.tickTolerant(1)
+	if row.PrincipalRevision != "" {
+		t.Fatal("replayed missing prefix was checkpointed")
+	}
+	harness.gateway.omitServicePrefixEcho = false
+	harness.clearBackoff("org-a")
+	harness.tick(t, 1)
+	if row.PrincipalRevision == "" {
+		t.Fatal("acknowledged prefix was not checkpointed")
 	}
 }
 

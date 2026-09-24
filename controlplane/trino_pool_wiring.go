@@ -79,15 +79,16 @@ func buildTrinoPoolOperators(
 		observerCredential := wire.Provisioner.ObserverCredential
 
 		operator := &trinoPoolOperator{
-			config:          config,
-			store:           store,
-			gateway:         gateway,
-			owner:           owner,
-			operatorEnabled: operatorEnabled,
-			newInstanceID:   newTrinoPoolInstanceID,
-			tenants:         store,
-			publications:    store,
-			operations:      store,
+			config:                    config,
+			store:                     store,
+			gateway:                   gateway,
+			owner:                     owner,
+			operatorEnabled:           operatorEnabled,
+			serviceCredentialsEnabled: strings.TrimSpace(os.Getenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE")) != "",
+			newInstanceID:             newTrinoPoolInstanceID,
+			tenants:                   store,
+			publications:              store,
+			operations:                store,
 		}
 		// Desired state is published from the ConfigMap the chart projects the
 		// registry and blueprint from, read through the Kubernetes API.

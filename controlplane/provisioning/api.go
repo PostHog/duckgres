@@ -164,9 +164,9 @@ func RegisterAPIWithTrinoAdmission(r *gin.RouterGroup, store Store, tenantStore 
 	// backend job (dagster) mints a per-credential grant — its own
 	// duckgres_service_grants row, never a duckgres_org_users row — and
 	// connects with (credential_id, secret). Every mint creates a fresh grant;
-	// principal is audit metadata only. Refresh ALWAYS rotates the explicitly
-	// named grant. Plaintext is returned only here; the store persists only
-	// the bcrypt hash.
+	// principal is audit metadata only. Refresh rotates the named grant by
+	// default; explicit non-rotating renewal preserves live HTTP sessions.
+	// The store persists only the bcrypt hash.
 	r.POST("/orgs/:id/service-credentials", func(c *gin.Context) {
 		h.issueServiceCredential(c, tenantStore)
 	})
@@ -189,10 +189,11 @@ func RegisterDiscoveryAPI(r *gin.RouterGroup, store Store) {
 }
 
 type handler struct {
-	store                 Store
-	trinoAdmission        func(string) error
-	trinoDefaultCell      string
-	trinoBackendValidator func(configstore.TrinoBackend) error
+	store                         Store
+	trinoAdmission                func(string) error
+	trinoDefaultCell              string
+	trinoBackendValidator         func(configstore.TrinoBackend) error
+	trinoServiceCredentialConnect func(string, string) *TrinoServiceCredentialConnect
 	// bucketSuffix is the env suffix (e.g. "mw-prod-us") used to compute the
 	// CP-owned s3bucket name; empty disables CP naming. See
 	// configstore.DucklingBucketName.

@@ -21,6 +21,15 @@ func bindingOrg(users ...string) configstore.TrinoEnabledOrg {
 	return org
 }
 
+func TestBindingServiceCredentialsAreExplicitAndRevisioned(t *testing.T) {
+	org := bindingOrg("analyst")
+	disabled := trinoPoolBindingsFor([]configstore.TrinoEnabledOrg{org}, org.CellID)
+	enabled := trinoPoolBindingsFor([]configstore.TrinoEnabledOrg{org}, org.CellID, true)
+	if disabled[0].ServicePrincipalPrefix != "" || enabled[0].ServicePrincipalPrefix != "acme.svc_" || disabled[0].Revision == enabled[0].Revision {
+		t.Fatalf("bindings do not isolate rollout: disabled=%+v enabled=%+v", disabled, enabled)
+	}
+}
+
 // A warehouse has many logins and they all belong to one tenant. A binding that
 // carried only the root principal would block every named user at the gate.
 func TestBindingCoversEveryLoginOfTheWarehouse(t *testing.T) {

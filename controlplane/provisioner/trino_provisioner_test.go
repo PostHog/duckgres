@@ -1928,21 +1928,23 @@ func TestBuildTrinoAuthFiles_ProjectsEveryOrgUser(t *testing.T) {
 		Users: []configstore.TrinoOrgUser{
 			{Username: "root", PasswordHash: "$2a$10$roothash"},
 			{Username: "analyst", PasswordHash: "$2a$10$analysthash"},
+			{Username: "svc_airbyte", PasswordHash: "$2a$10$servicehash"},
 		},
 	}}
 	pw, grp := BuildTrinoAuthFiles(orgs, TrinoClusterPrincipals{})
 
 	wantPW := "acme:$2a$10$roothash\n" +
 		"acme.root:$2a$10$roothash\n" +
-		"acme.analyst:$2a$10$analysthash\n"
+		"acme.analyst:$2a$10$analysthash\n" +
+		"acme.svc_airbyte:$2a$10$servicehash\n"
 	if pw != wantPW {
 		t.Errorf("password.db =\n%q\nwant\n%q", pw, wantPW)
 	}
-	// All three principals share the org group, which the bundle grants the
-	// whole catalog, and all three carry the tier claim that routes them to
+	// All principals share the org group, which the bundle grants the
+	// whole catalog, and all carry the tier claim that routes them to
 	// the org's resource group.
-	wantGrp := "org_acme:acme,acme.analyst,acme.root\n" +
-		"tier_free:acme,acme.analyst,acme.root\n"
+	wantGrp := "org_acme:acme,acme.analyst,acme.root,acme.svc_airbyte\n" +
+		"tier_free:acme,acme.analyst,acme.root,acme.svc_airbyte\n"
 	if grp != wantGrp {
 		t.Errorf("group.db =\n%q\nwant\n%q", grp, wantGrp)
 	}

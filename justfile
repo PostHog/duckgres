@@ -343,6 +343,12 @@ test-trino-opa pattern="":
 test-trino pattern="Trino":
     go test -v -count=1 -tags kubernetes -run '{{pattern}}' ./controlplane ./controlplane/admin ./controlplane/provisioner ./controlplane/provisioning
 
+# Verify the Trino service-grant lifecycle against local integration Postgres.
+[group('test')]
+test-trino-service-credentials:
+    go test -v -count=1 -run 'TestTrinoServiceCredential' ./controlplane/configstore ./tests/configstore
+    just test-trino 'TestTrinoService|TestBinding|TestBuildTrinoAuthFiles_Refuses|TestTrinoUsageCollector'
+
 [group('test')]
 test-controlplane-k8s:
     go test -v -count=1 -tags kubernetes . ./controlplane ./controlplane/admin ./controlplane/provisioner
