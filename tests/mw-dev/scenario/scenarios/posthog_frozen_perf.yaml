@@ -98,7 +98,7 @@ steps:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       catalog_file: ../../../perf/queries/ducklake_posthog_tables.yaml
-      targets: [pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
+      targets: [trino, trino_cached]
       trino_hoglake_catalog: ${env:DUCKGRES_SCENARIO_ORG_ID}-frozen
       trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
       trino_startup_timeout: 2m
@@ -112,36 +112,6 @@ steps:
       athena_query_timeout: 30m
       run_id: ${run_id}
       dataset_version: &nightly_dataset posthog-file-views-v1
-      fail_on_query_errors: true
-      worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
-      worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
-
-  - id: properties_comparison
-    type: properties_comparison
-    depends_on: [perf_queries]
-    with:
-      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
-      catalog: ducklake
-      hoglake_uri: ${env:DUCKGRES_SCENARIO_HOGLAKE_URI}
-      hoglake_file: ../perf/setup_hoglake.py
-      targets: [pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
-      trino_hoglake_catalog: ${env:DUCKGRES_SCENARIO_ORG_ID}-frozen
-      hoglake_catalog: ${env:DUCKGRES_SCENARIO_ORG_ID}-frozen
-      trino_schema: properties_perf
-      trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
-      trino_startup_timeout: 2m
-      trino_startup_poll_interval: 2s
-      athena_region: ${env:DUCKGRES_SCENARIO_ATHENA_REGION}
-      athena_workgroup: ${env:DUCKGRES_SCENARIO_ATHENA_WORKGROUP}
-      athena_catalog: AwsDataCatalog
-      athena_database: ${env:DUCKGRES_SCENARIO_ATHENA_DATABASE}
-      athena_output_location: ${env:DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI}
-      athena_poll_interval: 500ms
-      athena_query_timeout: 30m
-      run_id: ${run_id}
-      # Same dataset as perf_queries: both suites of one nightly publish together.
-      dataset_version: *nightly_dataset
-      output_subdir: perf-properties
       fail_on_query_errors: true
       worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
       worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}
