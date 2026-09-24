@@ -289,9 +289,13 @@ render() {
       render_trino_perf_cluster cached
     fi
     HOGLAKE_SERVICE_ACCOUNT=hoglake
-    if hoglake_perf_enabled; then HOGLAKE_SERVICE_ACCOUNT=trino; fi
+    # Server default (15 min). Frozen perf registers footer-only fixtures and
+    # waits for them to hydrate before measuring, so it sweeps every 10s.
+    HOGLAKE_HYDRATOR_INTERVAL_MS=900000
+    if hoglake_perf_enabled; then HOGLAKE_SERVICE_ACCOUNT=trino; HOGLAKE_HYDRATOR_INTERVAL_MS=10000; fi
     NAMESPACE="$NS" HOGLAKE_IMAGE="$HOGLAKE_IMAGE" AWS_REGION="$AWS_REGION" HOGLAKE_SERVICE_ACCOUNT="$HOGLAKE_SERVICE_ACCOUNT" \
-      envsubst '$NAMESPACE $HOGLAKE_IMAGE $AWS_REGION $HOGLAKE_SERVICE_ACCOUNT' < "$HERE/manifests.hoglake.tmpl.yaml"
+      HOGLAKE_HYDRATOR_INTERVAL_MS="$HOGLAKE_HYDRATOR_INTERVAL_MS" \
+      envsubst '$NAMESPACE $HOGLAKE_IMAGE $AWS_REGION $HOGLAKE_SERVICE_ACCOUNT $HOGLAKE_HYDRATOR_INTERVAL_MS' < "$HERE/manifests.hoglake.tmpl.yaml"
     if trino_multicell_enabled; then render_trino_multicell; fi
   fi
 }

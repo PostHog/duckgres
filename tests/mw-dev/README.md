@@ -1126,12 +1126,14 @@ the frozen bucket root, while each import enumerates only its exact source prefi
 The importer registers footers only (deferred stats), so every file starts with
 `stats_state=pending` and carries no column bounds until the Hoglake hydrator
 reads its footer. Each import therefore waits until every file it registered is
-`provided` before the step completes (`--hydration-timeout`, default 600s), and
+`provided` before the step completes (default 600s), and
 fails the scenario if any file is `failed` or the wait times out: a benchmark
-over stat-less files measures no file pruning at all. The isolated server runs
-its hydrator every 10s (`HOGLAKE_HYDRATOR_INTERVAL_MS` in
-`manifests.hoglake.tmpl.yaml`) rather than the 15-minute server default, whose
-only early sweep happens at startup, before any import.
+over stat-less files measures no file pruning at all. Transient API errors
+during the wait are retried until the deadline. For frozen perf, `run.sh` sets
+the isolated server's `HOGLAKE_HYDRATOR_INTERVAL_MS` to 10s rather than the
+15-minute server default (which every other lane keeps), whose only early sweep
+happens at startup, before any import. The `setup_hoglake` step's optional
+`hydration_timeout` (a duration, e.g. `10m`) overrides the wait's default.
 The two isolated benchmark cells use the read-only Pod Identity instead of assuming
 the managed tenant storage role. It does not copy, rewrite or grant writes to the frozen dataset.
 
