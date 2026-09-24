@@ -1123,6 +1123,15 @@ Pod Identity for fixture reads. The control plane owns the tenant's managed
 catalog; the importer registers immutable Parquet in a separate `<org>-frozen`
 catalog containing `posthog` and `properties_perf` namespaces. Its data path is
 the frozen bucket root, while each import enumerates only its exact source prefix.
+The importer registers footers only (deferred stats), so every file starts with
+`stats_state=pending` and carries no column bounds until the Hoglake hydrator
+reads its footer. Each import therefore waits until every file it registered is
+`provided` before the step completes (`--hydration-timeout`, default 600s), and
+fails the scenario if any file is `failed` or the wait times out: a benchmark
+over stat-less files measures no file pruning at all. The isolated server runs
+its hydrator every 10s (`HOGLAKE_HYDRATOR_INTERVAL_MS` in
+`manifests.hoglake.tmpl.yaml`) rather than the 15-minute server default, whose
+only early sweep happens at startup, before any import.
 The two isolated benchmark cells use the read-only Pod Identity instead of assuming
 the managed tenant storage role. It does not copy, rewrite or grant writes to the frozen dataset.
 

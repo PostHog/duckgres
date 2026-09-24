@@ -92,6 +92,12 @@ spec:
             - { name: HOGLAKE_S3_REGION, value: "${AWS_REGION}" }
             - { name: HOGLAKE_S3_PATH_STYLE, value: "false" }
             - { name: HOGLAKE_COMPACTION_INTERVAL_MS, value: "0" }
+            # Deferred-stats fixtures (the frozen perf importer registers
+            # footers only) must hydrate before they are benchmarked, and
+            # setup_hoglake.py waits for it. The server default sweeps every
+            # 15 minutes, once at startup before any import; 10s keeps that
+            # wait short. Harmless for lanes whose writers ship stats.
+            - { name: HOGLAKE_HYDRATOR_INTERVAL_MS, value: "10000" }
           ports: [{ containerPort: 8080 }]
           resources:
             requests: { cpu: 500m, memory: 1Gi }
