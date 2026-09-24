@@ -92,6 +92,10 @@ spec:
             - { name: HOGLAKE_S3_REGION, value: "${AWS_REGION}" }
             - { name: HOGLAKE_S3_PATH_STYLE, value: "false" }
             - { name: HOGLAKE_COMPACTION_INTERVAL_MS, value: "0" }
+            # run.sh: 10s for frozen perf, whose footer-only fixtures must
+            # hydrate before they are measured; the 15-minute server default
+            # everywhere else.
+            - { name: HOGLAKE_HYDRATOR_INTERVAL_MS, value: "${HOGLAKE_HYDRATOR_INTERVAL_MS}" }
           ports: [{ containerPort: 8080 }]
           resources:
             requests: { cpu: 500m, memory: 1Gi }

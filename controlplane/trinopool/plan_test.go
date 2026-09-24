@@ -1,6 +1,53 @@
 package trinopool
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestPlanConfigurationOnlyRollout(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		serving, surge int
+		action         PlanAction
+	}{
+		{"surge at serving floor", 3, 1, PlanActionCreate},
+		{"drain above serving floor", 4, 1, PlanActionDrain},
+		{"wait without surge budget", 3, 0, PlanActionNone},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := servingPool("r1", test.serving)
+			state.MaxSurge = test.surge
+			state.Instances[0].SpecOutdated = true
+			plan := PlanNext(state)
+			if plan.Action != test.action || plan.Repair {
+				t.Fatalf("plan = %+v", plan)
+			}
+			if plan.Action == PlanActionDrain && plan.InstanceID != state.Instances[0].ID {
+				t.Fatal("drained a current instance")
+			}
+			if strings.Contains(plan.Reason, "release") {
+				t.Fatalf("configuration-only reason names a release: %s", plan.Reason)
+			}
+		})
+	}
+}
+
+func TestPlanUnreadableRolloutEvidenceIsInstanceLocal(t *testing.T) {
+	state := servingPool("r1", 4)
+	state.Instances[0].RolloutBlocked = true
+	state.Instances[0].ReleaseID = "r0"
+	state.Instances[1].SpecOutdated = true
+	plan := PlanNext(state)
+	if plan.Action != PlanActionDrain || plan.InstanceID != state.Instances[1].ID {
+		t.Fatalf("unreadable sibling blocked a safe configuration drain: %+v", plan)
+	}
+	state.Instances[1].SpecOutdated = false
+	plan = PlanNext(state)
+	if plan.Action != PlanActionNone || !strings.Contains(plan.Reason, "unreadable") {
+		t.Fatalf("unreadable evidence was ignored or selected for drain: %+v", plan)
+	}
+}
 
 func servingPool(release string, count int) PoolState {
 	state := PoolState{DesiredInstances: 3, MinServing: 3, MaxSurge: 1, MaxRepair: 1, DesiredReleaseID: release}

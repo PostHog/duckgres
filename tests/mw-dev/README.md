@@ -990,6 +990,32 @@ configuration change, immutable snapshots, lost retirement response, verified
 absence, and replacement locally. The companion tests preserve admission
 ambiguity, Gateway retirement refusals, configuration freeze, and lease fencing.
 
+Serving instances also roll when the desired blueprint changes without an image
+change. The immutable blueprint snapshot and desired blueprint are compared
+under the same current interpretation. Stored ownership digests remain unchanged,
+so historical encoder differences and hex casing do not cause a rollout.
+The ordinary serving
+floor, planned surge, transaction drain, and retirement rules still apply.
+`TestTrinoServingBlueprintChangesRollOutWithoutAnImageChange` covers replica,
+resource, and configuration changes through complete replacement and convergence.
+Companion tests cover stable configuration, authority changes, and invalid stored
+digests. A malformed ownership digest with a readable snapshot uses guarded
+replacement. An unreadable snapshot reports an error and excludes only that
+member from planned replacement; independent repairs, scaling, and eligible
+sibling replacements still proceed. Repair the unreadable record first: its
+namespace must never be inferred from the current desired configuration.
+Registry-only node-environment or service-port changes do not trigger this
+blueprint rollout path.
+
+The in-Job fixture cannot publish a different shared-pool blueprint, so it cannot
+drive this rollout itself. After deploying the controller, publish a same-image
+worker-count change in an isolated pool through its normal configuration source.
+Observe one planned surge, admission before drain, and retention of an old member
+while a transaction remains open. After the transaction completes, verify that
+all replacements use the requested worker count and the pool stops creating new
+instances. Run `trino_shared_pool_active` before and after to check admission and
+querying. Local fixture tests do not establish live-cluster rollout acceptance.
+
 ### Shared-pool rollout sealing acceptance
 
 A DRAINING member with no remaining obligations reports `readyToSeal=true` and
@@ -1123,6 +1149,17 @@ Pod Identity for fixture reads. The control plane owns the tenant's managed
 catalog; the importer registers immutable Parquet in a separate `<org>-frozen`
 catalog containing `posthog` and `properties_perf` namespaces. Its data path is
 the frozen bucket root, while each import enumerates only its exact source prefix.
+The importer registers footers only (deferred stats), so every file starts with
+`stats_state=pending` and carries no column bounds until the Hoglake hydrator
+reads its footer. Each import therefore waits until every file it registered is
+`provided` before the step completes (default 600s), and
+fails the scenario if any file is `failed` or the wait times out: a benchmark
+over stat-less files measures no file pruning at all. Transient API errors
+during the wait are retried until the deadline. For frozen perf, `run.sh` sets
+the isolated server's `HOGLAKE_HYDRATOR_INTERVAL_MS` to 10s rather than the
+15-minute server default (which every other lane keeps), whose only early sweep
+happens at startup, before any import. The `setup_hoglake` step's optional
+`hydration_timeout` (a duration, e.g. `10m`) overrides the wait's default.
 The two isolated benchmark cells use the read-only Pod Identity instead of assuming
 the managed tenant storage role. It does not copy, rewrite or grant writes to the frozen dataset.
 

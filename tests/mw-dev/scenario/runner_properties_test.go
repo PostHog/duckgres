@@ -44,10 +44,14 @@ func (e dispatchExecutor) runPropertiesComparison(ctx context.Context, step core
 	}}); err != nil {
 		return err
 	}
-	if err := e.perf.ExecuteStep(ctx, core.Step{ID: step.ID + "_hoglake", Type: scenarioperf.StepTypeSetupHoglake, With: map[string]any{
+	hoglakeWith := map[string]any{
 		"org_id": orgID, "uri": step.With["hoglake_uri"], "file": step.With["hoglake_file"],
 		"properties_source": source, "representation": "json", "hoglake_catalog": step.With["hoglake_catalog"],
-	}}); err != nil {
+	}
+	if timeout, ok := step.With["hydration_timeout"]; ok {
+		hoglakeWith["hydration_timeout"] = timeout
+	}
+	if err := e.perf.ExecuteStep(ctx, core.Step{ID: step.ID + "_hoglake", Type: scenarioperf.StepTypeSetupHoglake, With: hoglakeWith}); err != nil {
 		return err
 	}
 	with := make(map[string]any, len(step.With)+6)
