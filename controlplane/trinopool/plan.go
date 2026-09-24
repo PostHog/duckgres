@@ -20,6 +20,8 @@ type InstanceView struct {
 	ReleaseID string
 	// SpecOutdated compares desired configuration with this instance's immutable specification.
 	SpecOutdated bool
+	// RolloutBlocked retains capacity accounting but excludes a member with unreadable rollout evidence.
+	RolloutBlocked bool
 	// Repair marks an instance created against the failure-repair budget rather
 	// than the planned surge budget. The two budgets are separate so a failure
 	// during a release rollout does not stall capacity restoration.
@@ -138,6 +140,11 @@ func PlanNext(state PoolState) Plan {
 
 	outdated := outdatedServing(state)
 	if len(outdated) == 0 {
+		for _, instance := range state.Instances {
+			if instance.Phase.Serving() && instance.RolloutBlocked {
+				return Plan{Action: PlanActionNone, Reason: "a serving instance has unreadable rollout evidence; repair its record"}
+			}
+		}
 		return Plan{Action: PlanActionNone, Reason: "pool matches the desired specification and instance count"}
 	}
 
@@ -148,7 +155,7 @@ func PlanNext(state PoolState) Plan {
 
 	// 5. Otherwise surge one replacement, within the surge budget.
 	if live >= state.DesiredInstances+state.MaxSurge {
-		return Plan{Action: PlanActionNone, Reason: "release rollout is waiting for the surge budget to free up"}
+		return Plan{Action: PlanActionNone, Reason: "specification rollout is waiting for the surge budget to free up"}
 	}
 	return Plan{Action: PlanActionCreate, Reason: "surging a replacement for an instance with an outdated specification"}
 }
@@ -158,7 +165,7 @@ func PlanNext(state PoolState) Plan {
 func outdatedServing(state PoolState) []InstanceView {
 	var outdated []InstanceView
 	for _, instance := range state.Instances {
-		if instance.Phase.Serving() && (instance.ReleaseID != state.DesiredReleaseID || instance.SpecOutdated) {
+		if instance.Phase.Serving() && !instance.RolloutBlocked && (instance.ReleaseID != state.DesiredReleaseID || instance.SpecOutdated) {
 			outdated = append(outdated, instance)
 		}
 	}

@@ -529,15 +529,22 @@ func configuredPoolMatches(state trinogateway.PoolState, poolID string, request 
 // applyPlan starts at most one lifecycle action.
 func (o *trinoPoolOperator) applyPlan(ctx context.Context, pool *configstore.TrinoPool, instances []configstore.TrinoPoolInstance) error {
 	views := make([]trinopool.InstanceView, 0, len(instances))
+	var failures []error
+	desiredBlueprintDigest := o.config.Blueprint.Digest()
 	for _, instance := range instances {
 		view := instance.View()
 		if view.Phase.Serving() {
-			digest, err := hex.DecodeString(instance.SpecDigest)
-			if err != nil || len(digest) != 32 {
-				return fmt.Errorf("instance %s has an invalid immutable specification digest", instance.InstanceID)
+			blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot))
+			if err != nil {
+				// An unreadable snapshot cannot establish the namespace for safe retirement.
+				view.RolloutBlocked = true
+				failures = append(failures, fmt.Errorf("instance %s has an unreadable rollout blueprint: %w", instance.InstanceID, err))
+			} else {
+				// Interpret both blueprints with this binary; stored ownership hashes may use an older encoder.
+				// A malformed ownership hash uses guarded replacement without rewriting the original record.
+				digest, decodeErr := hex.DecodeString(instance.SpecDigest)
+				view.SpecOutdated = decodeErr != nil || len(digest) != 32 || blueprint.Digest() != desiredBlueprintDigest
 			}
-			// Compare the same instance identity; leadership epochs do not change execution configuration.
-			view.SpecOutdated = instance.SpecDigest != o.config.Blueprint.SpecDigest(o.identityFor(instance.InstanceID))
 		}
 		views = append(views, view)
 	}
@@ -553,12 +560,11 @@ func (o *trinoPoolOperator) applyPlan(ctx context.Context, pool *configstore.Tri
 	})
 	switch plan.Action {
 	case trinopool.PlanActionCreate:
-		return o.createInstance(ctx, plan)
+		failures = append(failures, o.createInstance(ctx, plan))
 	case trinopool.PlanActionDrain:
-		return o.beginDrain(ctx, plan)
-	default:
-		return nil
+		failures = append(failures, o.beginDrain(ctx, plan))
 	}
+	return errors.Join(failures...)
 }
 
 // createInstance persists the identity BEFORE anything exists in Kubernetes.

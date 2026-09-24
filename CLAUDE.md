@@ -2070,13 +2070,19 @@ the Trino backend selection).
   keeps its OWN blueprint snapshot, so a new release cannot change what a
   running instance reads. Worker anti-affinity is NARROWED to the instance, not
   dropped — a pool-wide selector would make instances fight for nodes.
-- **Serving instances roll on configuration changes, not only image changes.**
-  The planner compares each stored `SpecDigest` with the desired blueprint
-  instantiated for that same instance identity. Worker replicas, pod resources,
-  and configuration files therefore use the existing surge, admission, drain,
-  and retirement protocol. The authority epoch is excluded from this digest,
-  so leadership changes do not create rollouts. Invalid stored digests stop
-  planning with an error; serving snapshots are never rewritten in place.
+- **Serving instances roll on blueprint changes, not only image changes.**
+  The planner parses each immutable blueprint snapshot and compares it with the
+  desired blueprint using the same current representation on both sides.
+  Worker replicas, pod resources, and configuration files use the existing
+  surge, admission, drain, and retirement protocol. Stored `SpecDigest` values
+  remain ownership and operation identities; encoder changes or uppercase hex
+  do not trigger rollouts or rewrite them. A malformed digest with a readable
+  snapshot nominates only that instance for guarded replacement. An unreadable
+  snapshot blocks only that instance's planned replacement and reports an error;
+  unrelated repairs, scaling, and eligible rollouts can continue. Repair the
+  unreadable record before attempting its retirement; never infer its namespace
+  from desired configuration. Registry-only identity changes such as node
+  environment or service port are not blueprint rollout triggers.
 - **Deletion requires an irreversible Gateway retirement claim** for that exact
   incarnation; the phase machine permits it only from `RETIRING` onwards (plus
   `FAILED_PREPARING`, which provably never admitted work). Delete verifies each

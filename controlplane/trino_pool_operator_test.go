@@ -123,7 +123,8 @@ func (f *fakePoolStore) CreateTrinoPoolInstance(_ context.Context, lease configs
 	f.instances[spec.InstanceID] = &configstore.TrinoPoolInstance{
 		InstanceID: spec.InstanceID, PoolID: spec.PoolID, ReleaseID: spec.ReleaseID,
 		SpecDigest: spec.SpecDigest, BlueprintSnapshot: spec.BlueprintSnapshot,
-		Phase: string(spec.Phase), Repair: spec.Repair, EndpointURL: spec.EndpointURL,
+		RepairFor: spec.RepairFor,
+		Phase:     string(spec.Phase), Repair: spec.Repair, EndpointURL: spec.EndpointURL,
 		ValidationReceipt: "{}", RetirementReceipt: "{}",
 	}
 	f.order = append(f.order, spec.InstanceID)

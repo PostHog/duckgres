@@ -991,13 +991,21 @@ absence, and replacement locally. The companion tests preserve admission
 ambiguity, Gateway retirement refusals, configuration freeze, and lease fencing.
 
 Serving instances also roll when the desired blueprint changes without an image
-change. The immutable per-instance specification digest is compared using the
-same instance identity, excluding the authority epoch. The ordinary serving
+change. The immutable blueprint snapshot and desired blueprint are compared
+under the same current interpretation. Stored ownership digests remain unchanged,
+so historical encoder differences and hex casing do not cause a rollout.
+The ordinary serving
 floor, planned surge, transaction drain, and retirement rules still apply.
 `TestTrinoServingBlueprintChangesRollOutWithoutAnImageChange` covers replica,
 resource, and configuration changes through complete replacement and convergence.
 Companion tests cover stable configuration, authority changes, and invalid stored
-digests. An invalid digest reports an error without starting a replacement.
+digests. A malformed ownership digest with a readable snapshot uses guarded
+replacement. An unreadable snapshot reports an error and excludes only that
+member from planned replacement; independent repairs, scaling, and eligible
+sibling replacements still proceed. Repair the unreadable record first: its
+namespace must never be inferred from the current desired configuration.
+Registry-only node-environment or service-port changes do not trigger this
+blueprint rollout path.
 
 The in-Job fixture cannot publish a different shared-pool blueprint, so it cannot
 drive this rollout itself. After deploying the controller, publish a same-image
