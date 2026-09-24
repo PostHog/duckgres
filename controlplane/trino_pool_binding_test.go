@@ -44,7 +44,20 @@ func TestBindingCoversEveryLoginOfTheWarehouse(t *testing.T) {
 // contains. Deriving the two from different rules is how a gate ends up
 // blocking a user Trino would authenticate, or admitting one it would not.
 func TestBindingMatchesTheProjectedAuthFile(t *testing.T) {
-	org := bindingOrg("analyst", "dagster")
+	rootless := bindingOrg("analyst", "dagster")
+	// No enabled root: the bare principal leaves password.db, so it must
+	// leave the binding too.
+	rootless.RootPasswordHash = ""
+	for name, org := range map[string]configstore.TrinoEnabledOrg{
+		"with root": bindingOrg("analyst", "dagster"),
+		"rootless":  rootless,
+	} {
+		t.Run(name, func(t *testing.T) { assertBindingMatchesAuthFile(t, org) })
+	}
+}
+
+func assertBindingMatchesAuthFile(t *testing.T, org configstore.TrinoEnabledOrg) {
+	t.Helper()
 	binding := trinoPoolTenantBindingFor(org)
 
 	passwordDB, _ := provisioner.BuildTrinoAuthFiles([]configstore.TrinoEnabledOrg{org},

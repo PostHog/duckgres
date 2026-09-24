@@ -1083,8 +1083,6 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	// numeric team_id — opts into Trino via the standalone endpoint.
 	store := newFakeStore()
 	store.orgs["ben-ducklake-cnpg"] = &configstore.Org{Name: "ben-ducklake-cnpg"}
-	// The org's root login is its Trino principal; the endpoint preflights it.
-	store.users[configstore.OrgUserKey{OrgID: "ben-ducklake-cnpg", Username: "root"}] = "hash"
 	router := newTestRouter(store)
 
 	body := []byte(`{"enabled": true, "tier": "growth"}`)
@@ -1102,12 +1100,11 @@ func TestEnableTrinoStandaloneEndpoint(t *testing.T) {
 	}
 }
 
-// An org with no `root` login cannot be projected into a cell:
-// ListTrinoEnabledOrgs inner-joins on it, so the reconcile loop drops the org
-// and never says why. Orgs provisioned before the root-user convention are
-// exactly this shape. Reject at the API instead of queueing a row that can
-// never provision.
-func TestEnableTrinoRejectsOrgWithoutRootUser(t *testing.T) {
+// An org with no `root` login is still enabled: every duckgres login is its
+// own Trino principal, so a root-less org is served through its other logins
+// and only the bare `<database_name>` principal is absent. Orgs provisioned
+// before the root-user convention are exactly this shape.
+func TestEnableTrinoAcceptsOrgWithoutRootUser(t *testing.T) {
 	store := newFakeStore()
 	store.orgs["legacy-org"] = &configstore.Org{Name: "legacy-org", DatabaseName: "legacy"}
 	// Its primary login predates the convention.
@@ -1119,14 +1116,11 @@ func TestEnableTrinoRejectsOrgWithoutRootUser(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusConflict, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusAccepted, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "reset-password") {
-		t.Errorf("the error should point at the remedy, got %s", rec.Body.String())
-	}
-	if store.trino["legacy-org"] != nil {
-		t.Error("no trino row may be written for an org that cannot be provisioned")
+	if row := store.trino["legacy-org"]; row == nil || !row.Enabled {
+		t.Fatalf("expected an enabled trino row; got %+v", row)
 	}
 }
 
