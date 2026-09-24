@@ -416,6 +416,60 @@ clamp_min(
 )
 ```
 
+## Shared Trino pool lifecycle
+
+The pool operator exports these metrics when it is enabled and running under
+the leader lease:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `duckgres_trino_pool_members` | `pool`, `phase` | Durable instance rows at the last successful inventory read. `RETIRED` and `FAILURE_RETIRED` count historical rows, not running resources. Unknown phases use `UNKNOWN`. |
+| `duckgres_trino_pool_oldest_drain_seconds` | `pool` | Maximum age of a durable `DRAINING` phase at that snapshot, or zero when none exist. Missing or future phase timestamps contribute zero. |
+| `duckgres_trino_pool_snapshot_timestamp_seconds` | `pool` | Unix timestamp of that successful inventory read. Missing before the first read in a term. |
+| `duckgres_trino_pool_reconcile_failures_total` | `pool`, `reason` | Failed reconciliation ticks. Reasons are `fenced`, `timeout`, `canceled`, `gateway_unavailable`, `gateway_refused`, and `internal`. Pure scheduled backoff waits do not increment it; mixed backoff and failure does. Shutdown cancellation is not counted. |
+
+These are Duckgres snapshots, not Gateway obligation counts or proof that
+coordinators are healthy. The snapshot precedes the tick's lifecycle effects,
+so phase counts can lag a successful transition by one reconciliation interval
+(normally five seconds). Failed reads preserve the previous snapshot and its
+timestamp. Check freshness before interpreting counts. Frozen pools may stop
+refreshing inventory. All three gauges disappear when the operator term ends;
+disabled operators export none. Failure counters remain cumulative for the
+process lifetime. Labels never include member, query, transaction, tenant or
+operation IDs.
+
+At INFO level, `Trino pool member phase advanced.` records confirmed durable
+transitions into `DRAINING`, `SEALED`, `RETIRING`, and `RETIRED`. The log includes
+the pool, member, authority epoch, previous phase, and previous phase age.
+`Trino pool member is waiting.` explains a blocked member:
+
+- `reason=gateway_obligations`: pending requests, open transactions, active
+  queries, and Gateway readiness flags from the existing obligations poll.
+  Active queries include Gateway result-retention obligations; they are not
+  necessarily queries still executing on a coordinator.
+- `reason=kubernetes_resources`: retirement was claimed but resource absence
+  is not yet confirmed. No obligation counts are inferred in this case.
+
+The first observation is logged immediately. Changed observations are logged
+at most once per member every 30 seconds; unchanged observations have a
+five-minute heartbeat. Phase age comes from the durable phase timestamp and
+therefore survives a leader change. These intervals are fixed, with no new
+configuration flags. No extra Gateway or database calls are made.
+
+For a slow deployment, first distinguish stale inventory or reconcile errors
+from a fresh snapshot with a long-running drain. Use the member ID in the wait
+log to correlate Gateway diagnostics. An old drain is a signal to investigate,
+not permission to expire transactions, force deletion, or modify database rows.
+This instrumentation does not establish why an individual query remains pinned;
+Gateway remains authoritative for that detail.
+
+Local regression command: `just test-trino 'Trino|Pool|Seal'`. The existing
+in-cluster `tests/mw-dev/e2e/harness.sh` checks pool readiness and querying, but
+does not drive a blocked drain, and its Job cannot reach the metrics port under
+the current NetworkPolicy. These new lifecycle/logging assertions are covered
+by operator tests; a real blocked-drain deployment remains a separate validation
+step. No network permissions or live deployment behavior change in this work.
+
 ## Admission metric migration
 
 The pre-canonical admission family is retired. Existing TSDB history remains,

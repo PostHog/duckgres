@@ -187,6 +187,11 @@ type trinoPoolOperator struct {
 // acquisition and cancelled on loss, so it re-acquires authority each time
 // rather than trusting a lease it held before.
 func (o *trinoPoolOperator) Run(ctx context.Context) {
+	if o.operatorEnabled {
+		var finish func()
+		ctx, finish = trinoPoolMetrics.beginTerm(ctx, o.config.PublicID)
+		defer finish()
+	}
 	interval := o.interval
 	if interval <= 0 {
 		interval = trinoPoolReconcileInterval
@@ -209,6 +214,7 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 	defer ticker.Stop()
 	for {
 		if err := o.reconcileOnce(ctx); err != nil && ctx.Err() == nil {
+			poolObservation(ctx).failure(err)
 			if errors.Is(err, errTrinoPoolBackoff) {
 				// Nothing was attempted: an operation is serving out the wait a
 				// previous failure earned. That is the retry schedule working,
@@ -331,6 +337,7 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list pool instances: %w", err)
 	}
+	poolObservation(ctx).snapshot(instances, time.Now())
 	// Advance the instances already in flight before starting anything new, so
 	// a slow rollout cannot be overtaken by its own successor.
 	//
@@ -600,11 +607,15 @@ func (o *trinoPoolOperator) beginDrain(ctx context.Context, plan trinopool.Plan)
 		// and retried on a later tick, never overridden.
 		return o.dropAuthority(fmt.Errorf("drain member %s: %w", instance.InstanceID, err))
 	}
-	return o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+	err = o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseServing, trinopool.PhaseDraining, map[string]any{
 			"gateway_state":      member.Phase,
 			"gateway_generation": member.Generation,
 		}))
+	if err == nil {
+		o.logDrainTransition(instance, string(trinopool.PhaseDraining))
+	}
+	return err
 }
 
 func (o *trinoPoolOperator) instanceByID(ctx context.Context, instanceID string) (configstore.TrinoPoolInstance, error) {

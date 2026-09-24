@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
@@ -424,9 +425,8 @@ func (o *trinoPoolOperator) sealWhenDrained(ctx context.Context, instance config
 	// ReadyToSeal permits the first attempt. Drained permits replay after a lost seal response.
 	// Neither observation permits deletion; the Gateway must still grant sealing and retirement.
 	if (!obligations.ReadyToSeal && !obligations.Drained) || obligations.Outstanding() > 0 {
-		slog.Debug("Trino pool instance is still draining.",
-			"pool", o.config.PublicID, "instance", instance.InstanceID,
-			"outstanding", obligations.Outstanding())
+		poolObservation(ctx).waiting(slog.Default(), instance, o.lease.Epoch,
+			"gateway_obligations", obligations, time.Now())
 		return false, nil
 	}
 	member, err := o.gateway.SealMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
@@ -443,11 +443,15 @@ func (o *trinoPoolOperator) sealWhenDrained(ctx context.Context, instance config
 	if err != nil {
 		return true, o.dropAuthority(fmt.Errorf("seal member %s: %w", instance.InstanceID, err))
 	}
-	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+	err = o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseDraining, trinopool.PhaseSealed, map[string]any{
 			"gateway_state":      member.Phase,
 			"gateway_generation": member.Generation,
 		}))
+	if err == nil {
+		o.logDrainTransition(instance, string(trinopool.PhaseSealed))
+	}
+	return true, err
 }
 
 // claimRetirement takes the irreversible retirement claim. Nothing is deleted
@@ -464,12 +468,16 @@ func (o *trinoPoolOperator) claimRetirement(ctx context.Context, instance config
 	if err != nil {
 		return err
 	}
-	return o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+	err = o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseSealed, trinopool.PhaseRetiring, map[string]any{
 			"gateway_state":      member.Phase,
 			"gateway_generation": member.Generation,
 			"retirement_receipt": receipt,
 		}))
+	if err == nil {
+		o.logDrainTransition(instance, string(trinopool.PhaseRetiring))
+	}
+	return err
 }
 
 // deleteResources removes the recorded objects and completes retirement only
@@ -488,6 +496,8 @@ func (o *trinoPoolOperator) deleteResources(ctx context.Context, instance config
 		// Deletion is in progress. The instance stays RETIRING and keeps its
 		// slot until absence is observed, so a terminating pod is never counted
 		// as freed capacity.
+		poolObservation(ctx).waiting(slog.Default(), instance, o.lease.Epoch,
+			"kubernetes_resources", trinogateway.Obligations{}, time.Now())
 		return false, nil
 	}
 	if _, err := o.gateway.MemberRetired(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
@@ -497,10 +507,13 @@ func (o *trinoPoolOperator) deleteResources(ctx context.Context, instance config
 	}); err != nil {
 		return true, o.dropAuthority(fmt.Errorf("report retirement of %s: %w", instance.InstanceID, err))
 	}
-	slog.Info("Trino pool instance retired.", "pool", o.config.PublicID, "instance", instance.InstanceID)
 	o.closeInstanceOperation(ctx, instance.InstanceID, "retired", "")
-	return true, o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
+	err = o.dropAuthority(o.store.AdvanceTrinoPoolInstance(ctx, o.lease, instance.InstanceID,
 		trinopool.PhaseRetiring, trinopool.PhaseRetired, nil))
+	if err == nil {
+		o.logDrainTransition(instance, string(trinopool.PhaseRetired))
+	}
+	return true, err
 }
 
 func inventoryOf(instance configstore.TrinoPoolInstance) trinoPoolInventory {
