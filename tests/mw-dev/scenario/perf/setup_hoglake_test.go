@@ -15,6 +15,7 @@ import (
 // test runs wherever python3 does, and drives a fake API and clock.
 const waitForStatsHarness = `
 import importlib.util, sys, types
+sys.dont_write_bytecode = True  # leave no __pycache__ in the source tree
 pa = types.ModuleType("pyarrow"); pq = types.ModuleType("pyarrow.parquet")
 pa.parquet = pq
 sys.modules["pyarrow"] = pa; sys.modules["pyarrow.parquet"] = pq
