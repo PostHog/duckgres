@@ -13,7 +13,7 @@ The groups contain the organization's catalog group and resource tier, preservin
 Service grants are organization-wide, matching their existing Duckgres permissions.
 
 The control plane reads the organization, Trino enabled state, grant hash, expiration, revocation, and tier from Postgres on every request.
-It caches only successful bcrypt comparisons, keyed by a digest of the stored hash and supplied secret, for up to five minutes and 4,096 entries.
+It caches only successful bcrypt comparisons, indexed by HMAC-SHA-256 of the stored hash and supplied secret using an ephemeral process-local random key, for up to five minutes and 4,096 entries.
 A cached comparison cannot bypass expiry, revocation, secret rotation, tenant disablement, or a tier change.
 Database errors fail closed with HTTP 503; invalid credentials return HTTP 401.
 The request body is bounded to 4 KiB and database work has a three-second deadline.

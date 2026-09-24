@@ -3,6 +3,8 @@ package configstore
 import (
 	"container/list"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"regexp"
@@ -34,6 +36,7 @@ type trinoServiceCredentialRecord struct {
 // Only expensive bcrypt work is cached. Every request still reads the live
 // grant, expiry, revocation, tenant enablement, and tier from Postgres.
 type servicePasswordCache struct {
+	key     []byte
 	mu      sync.Mutex
 	entries map[[sha256.Size]byte]*list.Element
 	order   list.List
@@ -44,10 +47,21 @@ type servicePasswordCacheEntry struct {
 	expiresAt time.Time
 }
 
-var trinoServicePasswords = servicePasswordCache{entries: make(map[[sha256.Size]byte]*list.Element)}
+func newServicePasswordCache() *servicePasswordCache {
+	return &servicePasswordCache{
+		key:     []byte(rand.Text()),
+		entries: make(map[[sha256.Size]byte]*list.Element),
+	}
+}
+
+var trinoServicePasswords = newServicePasswordCache()
 
 func (c *servicePasswordCache) matches(hash, password string) bool {
-	key := sha256.Sum256([]byte(hash + "\x00" + password))
+	// An ephemeral key prevents cache entries becoming reusable password digests.
+	mac := hmac.New(sha256.New, c.key)
+	_, _ = mac.Write([]byte(hash + "\x00" + password))
+	var key [sha256.Size]byte
+	copy(key[:], mac.Sum(nil))
 	c.mu.Lock()
 	if entry, found := c.entries[key]; found {
 		if entry.Value.(servicePasswordCacheEntry).expiresAt.After(time.Now()) {

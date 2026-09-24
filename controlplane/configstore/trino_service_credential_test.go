@@ -8,6 +8,29 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+func TestTrinoServiceCredentialCacheUsesIndependentKeys(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("synthetic-secret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := newServicePasswordCache(), newServicePasswordCache()
+	for _, cache := range []*servicePasswordCache{first, second} {
+		for range 2 {
+			if !cache.matches(string(hash), "synthetic-secret") {
+				t.Fatal("valid secret was rejected")
+			}
+		}
+		if cache.matches(string(hash), "different-secret") || len(cache.entries) != 1 {
+			t.Fatal("cache accepted or retained an unverified secret")
+		}
+	}
+	for key := range first.entries {
+		if _, exists := second.entries[key]; exists {
+			t.Fatal("independent caches produced a reusable password digest")
+		}
+	}
+}
+
 func TestTrinoServiceCredentialLiveState(t *testing.T) {
 	const username = "acme.svc_0123456789abcdef01234567"
 	const password = "synthetic-secret"
