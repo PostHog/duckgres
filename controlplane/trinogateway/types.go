@@ -335,12 +335,11 @@ type TenantAdmission struct {
 	// recorded as an idempotent step, so it stays bounded however many logins a
 	// tenant has: a publication response carries the count and the hash instead
 	// and leaves the list empty.
-	PrincipalRevision      string   `json:"principalRevision"`
-	ServicePrincipalPrefix string   `json:"service_principal_prefix,omitempty"`
-	PrincipalCount         int      `json:"principalCount"`
-	PrincipalsHash         string   `json:"principalsHash"`
-	Principals             []string `json:"principals"`
-	Replayed               bool     `json:"replayed"`
+	PrincipalRevision string   `json:"principalRevision"`
+	PrincipalCount    int      `json:"principalCount"`
+	PrincipalsHash    string   `json:"principalsHash"`
+	Principals        []string `json:"principals"`
+	Replayed          bool     `json:"replayed"`
 }
 
 // PublishPrincipalsRequest publishes a tenant's authoritative principal set.
@@ -355,9 +354,8 @@ type TenantAdmission struct {
 // The set is replaced whole: a login removed here stops being admitted.
 type PublishPrincipalsRequest struct {
 	Step
-	Revision               string   `json:"revision"`
-	Principals             []string `json:"principals"`
-	ServicePrincipalPrefix string   `json:"service_principal_prefix,omitempty"`
+	Revision   string   `json:"revision"`
+	Principals []string `json:"principals"`
 }
 
 // RevokeTenantRequest closes a tenant's admission gate. Revocation is not

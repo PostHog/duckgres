@@ -21,12 +21,14 @@ func bindingOrg(users ...string) configstore.TrinoEnabledOrg {
 	return org
 }
 
-func TestBindingServiceCredentialsAreExplicitAndRevisioned(t *testing.T) {
+func TestBindingServiceAuthenticationPreservesExistingProjection(t *testing.T) {
 	org := bindingOrg("analyst")
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
 	disabled := trinoPoolBindingsFor([]configstore.TrinoEnabledOrg{org}, org.CellID)
-	enabled := trinoPoolBindingsFor([]configstore.TrinoEnabledOrg{org}, org.CellID, true)
-	if disabled[0].ServicePrincipalPrefix != "" || enabled[0].ServicePrincipalPrefix != "acme.svc_" || disabled[0].Revision == enabled[0].Revision {
-		t.Fatalf("bindings do not isolate rollout: disabled=%+v enabled=%+v", disabled, enabled)
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	enabled := trinoPoolBindingsFor([]configstore.TrinoEnabledOrg{org}, org.CellID)
+	if disabled[0].Revision != enabled[0].Revision || strings.Join(disabled[0].Principals, ",") != strings.Join(enabled[0].Principals, ",") {
+		t.Fatalf("service authentication changed existing bindings: disabled=%+v enabled=%+v", disabled, enabled)
 	}
 }
 

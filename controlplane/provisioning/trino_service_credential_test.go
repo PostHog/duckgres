@@ -18,10 +18,12 @@ type fakeTrinoServiceCredentialValidator struct {
 	identity *configstore.TrinoServiceCredentialIdentity
 	err      error
 	calls    int
+	cellID   string
 }
 
-func (f *fakeTrinoServiceCredentialValidator) ValidateTrinoServiceCredential(ctx context.Context, username, password string) (*configstore.TrinoServiceCredentialIdentity, error) {
+func (f *fakeTrinoServiceCredentialValidator) ValidateTrinoServiceCredential(ctx context.Context, cellID, username, password string) (*configstore.TrinoServiceCredentialIdentity, error) {
 	f.calls++
+	f.cellID = cellID
 	if _, ok := ctx.Deadline(); !ok {
 		panic("validation must have a deadline")
 	}
@@ -39,6 +41,7 @@ func TestTrinoServiceCredentialAuthentication(t *testing.T) {
 		{"valid", "Bearer " + token, `{"username":"` + username + `","password":"synthetic-secret"}`, nil, 200, 1},
 		{"no token", "", `{}`, nil, 401, 0},
 		{"wrong token", "Bearer unrelated", `{}`, nil, 401, 0},
+		{"body cannot override cell", "Bearer " + token, `{"username":"` + username + `","password":"secret","cell_id":"registered:cell-b"}`, nil, 400, 0},
 		{"malformed", "Bearer " + token, `{`, nil, 400, 0},
 		{"oversized", "Bearer " + token, strings.Repeat("x", 20000), nil, 400, 0},
 		{"denied", "Bearer " + token, `{"username":"` + username + `","password":"bad"}`, configstore.ErrTrinoServiceCredentialDenied, 401, 1},
@@ -47,7 +50,7 @@ func TestTrinoServiceCredentialAuthentication(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			validator := &fakeTrinoServiceCredentialValidator{identity: &configstore.TrinoServiceCredentialIdentity{User: username, Groups: []string{"org_acme", "tier_scale"}, ExpiresAt: time.Now().Add(time.Minute)}, err: tc.err}
 			r := gin.New()
-			RegisterTrinoServiceCredentialAuth(r, validator, token)
+			RegisterTrinoServiceCredentialAuth(r, validator, []TrinoServiceAuthCell{{CellID: "registered:cell-a", Tokens: []string{token}}})
 			req := httptest.NewRequest(http.MethodPost, "/auth/trino/service-credentials", strings.NewReader(tc.body))
 			req.Header.Set("Authorization", tc.auth)
 			req.Header.Set("Content-Type", "application/json")
@@ -58,6 +61,9 @@ func TestTrinoServiceCredentialAuthentication(t *testing.T) {
 			}
 			if strings.Contains(rec.Body.String(), "sensitive backend error") || strings.Contains(rec.Body.String(), "synthetic-secret") {
 				t.Fatal("response leaked secrets or database detail")
+			}
+			if tc.calls > 0 && validator.cellID != "registered:cell-a" {
+				t.Fatalf("wrong authenticated cell: %s", validator.cellID)
 			}
 			if tc.status == 200 {
 				var got configstore.TrinoServiceCredentialIdentity
@@ -72,9 +78,27 @@ func TestTrinoServiceCredentialAuthentication(t *testing.T) {
 	}
 }
 
+func TestTrinoServiceCredentialTokenSelectsCell(t *testing.T) {
+	validator := &fakeTrinoServiceCredentialValidator{identity: &configstore.TrinoServiceCredentialIdentity{}}
+	r := gin.New()
+	RegisterTrinoServiceCredentialAuth(r, validator, []TrinoServiceAuthCell{
+		{CellID: "registered:cell-a", Tokens: []string{"current-a", "previous-a"}},
+		{CellID: "registered:cell-b", Tokens: []string{"current-b"}},
+	})
+	for token, cellID := range map[string]string{"current-a": "registered:cell-a", "previous-a": "registered:cell-a", "current-b": "registered:cell-b"} {
+		req := httptest.NewRequest(http.MethodPost, "/auth/trino/service-credentials", strings.NewReader(`{"username":"test","password":"synthetic"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != 200 || validator.cellID != cellID {
+			t.Fatalf("status=%d cell=%s", rec.Code, validator.cellID)
+		}
+	}
+}
+
 func TestTrinoServiceCredentialAuthenticationDisabled(t *testing.T) {
 	r := gin.New()
-	RegisterTrinoServiceCredentialAuth(r, &fakeTrinoServiceCredentialValidator{}, "")
+	RegisterTrinoServiceCredentialAuth(r, &fakeTrinoServiceCredentialValidator{}, nil)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/auth/trino/service-credentials", nil))
 	if rec.Code != http.StatusNotFound {

@@ -259,11 +259,9 @@ type fakePoolGateway struct {
 	// deferPublish holds the next publication for a tenant at the server: the
 	// caller sees a lost response, and the effect commits when deliverDeferred
 	// runs.
-	deferPublish          map[string]bool
-	servicePrefixes       map[string]string
-	omitServicePrefixEcho bool
-	deferred              []func()
-	deferRevoke           map[string]bool
+	deferPublish map[string]bool
+	deferred     []func()
+	deferRevoke  map[string]bool
 	// intentConflicts counts refusals of a step identity that carries content
 	// the journal did not record for it. Settling a request must never depend
 	// on provoking one: it is an anomaly, not a protocol.
@@ -388,7 +386,7 @@ func (f *fakePoolGateway) deliverDeferred() {
 }
 
 func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.PublishPrincipalsRequest) (trinogateway.TenantAdmission, error) {
-	intent := request.Revision + "|" + strings.Join(request.Principals, ",") + "|" + request.ServicePrincipalPrefix
+	intent := request.Revision + "|" + strings.Join(request.Principals, ",")
 	replayed, err := f.guardStep(request.Step, intent)
 	if err != nil {
 		return trinogateway.TenantAdmission{}, err
@@ -419,20 +417,12 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 		f.principalOf[principal] = tenant
 	}
 	f.principals[tenant] = request.Principals
-	if f.servicePrefixes == nil {
-		f.servicePrefixes = make(map[string]string)
-	}
-	f.servicePrefixes[tenant] = request.ServicePrincipalPrefix
 	f.recordStep(request.Step, intent)
 	return f.principalAdmission(tenant, request), nil
 }
 
 func (f *fakePoolGateway) principalAdmission(tenant string, request trinogateway.PublishPrincipalsRequest) trinogateway.TenantAdmission {
-	prefix := request.ServicePrincipalPrefix
-	if f.omitServicePrefixEcho {
-		prefix = ""
-	}
-	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision, ServicePrincipalPrefix: prefix}
+	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}
 }
 
 func (f *fakePoolGateway) ConfigurePool(_ context.Context, poolID string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
@@ -1257,43 +1247,52 @@ func TestTenantBindingIsPublishedWhenTheGateIsOn(t *testing.T) {
 	}
 }
 
-func TestTrinoServiceCredentialPrefixPublishedAndRemoved(t *testing.T) {
+func TestTrinoServiceCredentialAuthPreservesPublishedPrincipals(t *testing.T) {
 	harness := newOperatorHarness(t)
 	harness.operator.config.Pool.TenantAdmission = true
-	harness.operator.serviceCredentialsEnabled = true
 	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
 	harness.tick(t, 1)
-	if got := harness.gateway.servicePrefixes["org-a"]; got != "acme.svc_" {
-		t.Fatalf("service prefix=%q", got)
-	}
-	harness.operator.serviceCredentialsEnabled = false
+	initial := strings.Join(harness.gateway.principals["org-a"], ",")
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
 	harness.tick(t, 1)
-	if got := harness.gateway.servicePrefixes["org-a"]; got != "" {
-		t.Fatalf("disabled service prefix still published: %q", got)
+	if got := strings.Join(harness.gateway.principals["org-a"], ","); got != initial {
+		t.Fatalf("service authentication changed published principals: before=%s after=%s", initial, got)
+	}
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
+	harness.tick(t, 1)
+	if got := strings.Join(harness.gateway.principals["org-a"], ","); got != initial {
+		t.Fatalf("authentication rollback changed published principals: before=%s after=%s", initial, got)
 	}
 }
 
-func TestTrinoServiceCredentialPrefixRequiresGatewayAcknowledgement(t *testing.T) {
+func TestTrinoServiceCredentialAuthAcceptsExistingGatewayReply(t *testing.T) {
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
 	harness := newOperatorHarness(t)
 	harness.operator.config.Pool.TenantAdmission = true
-	harness.operator.serviceCredentialsEnabled = true
 	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
-	harness.gateway.omitServicePrefixEcho = true
-	harness.tickTolerant(1)
-	row := harness.publications.rows["org-a"]
-	if row == nil || row.PrincipalRevision != "" {
-		t.Fatal("unacknowledged prefix was checkpointed")
-	}
-	harness.clearBackoff("org-a")
-	harness.tickTolerant(1)
-	if row.PrincipalRevision != "" {
-		t.Fatal("replayed missing prefix was checkpointed")
-	}
-	harness.gateway.omitServicePrefixEcho = false
-	harness.clearBackoff("org-a")
 	harness.tick(t, 1)
-	if row.PrincipalRevision == "" {
-		t.Fatal("acknowledged prefix was not checkpointed")
+	row := harness.publications.rows["org-a"]
+	if row == nil || row.PrincipalRevision == "" {
+		t.Fatal("existing Gateway principal publication reply was not checkpointed")
+	}
+}
+
+func TestTrinoServiceCredentialAuthDoesNotRepublishBindings(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 3)
+	initial := countCalls(harness.gateway.calls, "principals:")
+	revision := harness.publications.rows["org-a"].PrincipalRevision
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	harness.tick(t, 3)
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
+	harness.tick(t, 3)
+	if got := countCalls(harness.gateway.calls, "principals:"); got != initial {
+		t.Fatalf("service authentication toggles republished bindings: before=%d after=%d", initial, got)
+	}
+	if got := harness.publications.rows["org-a"].PrincipalRevision; got != revision {
+		t.Fatalf("service authentication changed binding revision: before=%s after=%s", revision, got)
 	}
 }
 

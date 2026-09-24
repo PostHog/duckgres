@@ -17,28 +17,41 @@ import (
 )
 
 type TrinoServiceCredentialValidator interface {
-	ValidateTrinoServiceCredential(context.Context, string, string) (*configstore.TrinoServiceCredentialIdentity, error)
+	ValidateTrinoServiceCredential(context.Context, string, string, string) (*configstore.TrinoServiceCredentialIdentity, error)
+}
+
+type TrinoServiceAuthCell struct {
+	CellID string   `json:"cell_id"`
+	Tokens []string `json:"tokens"`
 }
 
 // RegisterTrinoServiceCredentialAuth mounts only the credential-check surface.
 // Its dedicated token must not be accepted by any provisioning/admin route.
-func RegisterTrinoServiceCredentialAuth(engine *gin.Engine, store TrinoServiceCredentialValidator, secret string) {
-	if secret == "" {
+func RegisterTrinoServiceCredentialAuth(engine *gin.Engine, store TrinoServiceCredentialValidator, cells []TrinoServiceAuthCell) {
+	if len(cells) == 0 {
 		return
 	}
-	var expected [][sha256.Size]byte
-	for _, token := range strings.Fields(secret) {
-		expected = append(expected, sha256.Sum256([]byte(token)))
+	type cellToken struct {
+		digest [sha256.Size]byte
+		cellID string
+	}
+	var expected []cellToken
+	for _, cell := range cells {
+		for _, token := range cell.Tokens {
+			expected = append(expected, cellToken{sha256.Sum256([]byte(token)), cell.CellID})
+		}
 	}
 	engine.POST("/auth/trino/service-credentials", func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		authorization := c.GetHeader("Authorization")
 		provided := sha256.Sum256([]byte(strings.TrimPrefix(authorization, "Bearer ")))
-		match := 0
-		for _, digest := range expected {
-			match |= subtle.ConstantTimeCompare(digest[:], provided[:])
+		cellID := ""
+		for _, token := range expected {
+			if subtle.ConstantTimeCompare(token.digest[:], provided[:]) == 1 {
+				cellID = token.cellID
+			}
 		}
-		if !strings.HasPrefix(authorization, "Bearer ") || match != 1 {
+		if !strings.HasPrefix(authorization, "Bearer ") || cellID == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
 		}
@@ -59,7 +72,7 @@ func RegisterTrinoServiceCredentialAuth(engine *gin.Engine, store TrinoServiceCr
 		}
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 		defer cancel()
-		identity, err := store.ValidateTrinoServiceCredential(ctx, input.Username, input.Password)
+		identity, err := store.ValidateTrinoServiceCredential(ctx, cellID, input.Username, input.Password)
 		if errors.Is(err, configstore.ErrTrinoServiceCredentialDenied) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 			return

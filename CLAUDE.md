@@ -1102,7 +1102,9 @@ always present. `POST /api/v1/orgs/:id/service-credentials/refresh` with
 Explicit `rotate_secret: false` renews only a live, non-revoked grant without changing its secret, preserving Trino gateway query ownership.
 Mint and default refresh return `secret_rotated: true`; non-rotating renewal returns `secret_rotated: false` and omits `credential_secret`.
 Clients must require the explicit false marker before retaining their in-memory secret, because an old server may ignore the renewal option and rotate.
-When Trino service authentication is configured and the assigned cell is ready, responses also include `trino_connect` from that cell's authoritative client endpoint.
+When Trino service authentication is configured for the assigned cell and that cell is ready, responses also include `trino_connect` from its authoritative client endpoint.
+`DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE` is an opt-in JSON map of configured immutable stored cell IDs to dedicated token rotation sets (see the Trino service credential runbook).
+The validation endpoint derives the calling coordinator cell from its bearer token and checks the org's current persisted cell assignment on every request; empty assignments and cross-cell grants are denied.
 The caller is the internal-secret-authed PostHog backend — the routes sit
 next to the other provisioning routes for exactly that trust class, NOT on
 the admin/console side.

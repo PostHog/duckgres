@@ -34,7 +34,7 @@ type trinoServiceCredentialRecord struct {
 }
 
 // Only expensive bcrypt work is cached. Every request still reads the live
-// grant, expiry, revocation, tenant enablement, and tier from Postgres.
+// grant, expiry, revocation, tenant enablement, cell assignment, and tier from Postgres.
 type servicePasswordCache struct {
 	key     []byte
 	mu      sync.Mutex
@@ -111,9 +111,9 @@ func trinoServiceIdentity(username string, row trinoServiceCredentialRecord, pas
 
 // ValidateTrinoServiceCredential authenticates a tenant-qualified service grant.
 // Unlike pgwire, Trino authenticates each HTTP request, including query polling.
-func (cs *ConfigStore) ValidateTrinoServiceCredential(ctx context.Context, username, password string) (*TrinoServiceCredentialIdentity, error) {
+func (cs *ConfigStore) ValidateTrinoServiceCredential(ctx context.Context, cellID, username, password string) (*TrinoServiceCredentialIdentity, error) {
 	parts := trinoServiceCredentialUsername.FindStringSubmatch(username)
-	if parts == nil || len(parts[1]) > 63 || len(password) == 0 || len(password) > 72 {
+	if cellID == "" || parts == nil || len(parts[1]) > 63 || len(password) == 0 || len(password) > 72 {
 		return nil, ErrTrinoServiceCredentialDenied
 	}
 	var row trinoServiceCredentialRecord
@@ -122,7 +122,7 @@ func (cs *ConfigStore) ValidateTrinoServiceCredential(ctx context.Context, usern
 		FROM duckgres_orgs AS o
 		JOIN duckgres_service_grants AS g ON g.org_id = o.name
 		JOIN duckgres_managed_warehouse_trino AS t ON t.org_id = o.name
-		WHERE o.database_name = ? AND g.credential_id = ?`, parts[1], parts[2]).Scan(&row)
+		WHERE o.database_name = ? AND g.credential_id = ? AND t.trino_cell_id = ?`, parts[1], parts[2], cellID).Scan(&row)
 	if result.Error != nil {
 		return nil, result.Error
 	}

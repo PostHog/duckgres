@@ -301,10 +301,12 @@ become valid if that org name is created again.
 
 Trino can validate the same grants through `POST /auth/trino/service-credentials`.
 This route is disabled by default.
-Set `DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE` to a mounted file containing a dedicated token of at least 32 bytes; it must differ from the admin and discovery secrets.
-The file may contain newline-separated current and previous tokens for a rolling rotation, and the control plane reads it at startup.
-The validation token authorizes only this endpoint and cannot mint, refresh, or revoke grants.
-With this configured, mint and refresh responses include an optional `trino_connect` block when the organization's assigned Trino cell is ready.
+Set `DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE` to a mounted JSON file with `cells` entries containing an exact configured `cell_id` and a `tokens` array.
+Each token must be at least 32 bytes, unique to one cell, and different from the admin and discovery secrets.
+The control plane loads the map at startup and accepts up to four tokens per cell for overlapping rotation.
+Each coordinator receives only its own cell's plain-text token file; never distribute the complete map to coordinators.
+The token identifies the caller's cell and authorizes only validation for organizations currently assigned to that cell; it cannot mint, refresh, or revoke grants.
+With this configured, mint and refresh responses include an optional `trino_connect` block only when the organization's assigned Trino cell is ready and has a token mapping.
 It contains `host`, `port`, `catalog`, `username`, and `http_scheme`, and uses the same `credential_secret` as the pgwire connection.
 Trino clients renew live grants with `rotate_secret: false` on the refresh endpoint so their gateway query-owner fingerprint remains stable.
 Such responses contain `secret_rotated: false` and omit the secret; default refresh continues to rotate it.

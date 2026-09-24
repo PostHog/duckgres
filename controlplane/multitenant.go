@@ -658,7 +658,7 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, nil, err
 	}
 	readOnlyTokens := admin.NewTokenSet(cfg.ReadOnlySecret, cfg.ReadOnlySecretFallbacks)
-	trinoServiceAuthSecret, err := loadTrinoServiceAuthSecret(adminTokens, readOnlyTokens)
+	trinoServiceAuthCells, err := trinoCells.loadTrinoServiceAuthCells(adminTokens, readOnlyTokens)
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
@@ -677,7 +677,7 @@ func SetupMultiTenant(
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery())
-	provisioning.RegisterTrinoServiceCredentialAuth(engine, store, trinoServiceAuthSecret)
+	provisioning.RegisterTrinoServiceCredentialAuth(engine, store, trinoServiceAuthCells)
 
 	// Health endpoint (unauthenticated, used by K8s probes)
 	engine.GET("/health", newHealthHandler(isHealthy))
@@ -787,8 +787,8 @@ func SetupMultiTenant(
 		ingressSuffix = cfg.ManagedHostnameSuffixes[0]
 	}
 	provisioningOptions := []provisioning.Option{provisioning.WithTrinoBackendValidator(validateTrinoBackendAvailability), provisioning.WithTrinoDefaultCell(trinoDefaultCell)}
-	if trinoServiceAuthSecret != "" {
-		provisioningOptions = append(provisioningOptions, provisioning.WithTrinoServiceCredentialConnect(trinoCells.serviceCredentialConnect(gormStore)))
+	if len(trinoServiceAuthCells) > 0 {
+		provisioningOptions = append(provisioningOptions, provisioning.WithTrinoServiceCredentialConnect(trinoCells.serviceCredentialConnect(gormStore, trinoServiceAuthCells)))
 	}
 	provisioning.RegisterAPIWithTrinoAdmission(api, gormStore, gormStore, cfg.DucklingBucketSuffix, liveFetcher, ingressSuffix, trinoCells.enablementCheck(store, trinoDefaultCell), provisioningOptions...)
 	// Discovery endpoints live in their OWN group (see discovery_group.go

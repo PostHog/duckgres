@@ -118,9 +118,8 @@ type trinoPoolOperator struct {
 	// operatorEnabled gates every external effect. With it off the operator
 	// keeps the durable desired state in sync and touches nothing else, which
 	// is how the feature ships disabled without the code path rotting.
-	operatorEnabled           bool
-	serviceCredentialsEnabled bool
-	newInstanceID             func() string
+	operatorEnabled bool
+	newInstanceID   func() string
 	// installWriter claims the catalog store's writer fence under the lease
 	// just acquired and installs it as the cell's catalog write path.
 	installWriter func(context.Context, configstore.TrinoPoolLease) error
