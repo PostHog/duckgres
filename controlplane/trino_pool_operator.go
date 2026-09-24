@@ -530,7 +530,16 @@ func configuredPoolMatches(state trinogateway.PoolState, poolID string, request 
 func (o *trinoPoolOperator) applyPlan(ctx context.Context, pool *configstore.TrinoPool, instances []configstore.TrinoPoolInstance) error {
 	views := make([]trinopool.InstanceView, 0, len(instances))
 	for _, instance := range instances {
-		views = append(views, instance.View())
+		view := instance.View()
+		if view.Phase.Serving() {
+			digest, err := hex.DecodeString(instance.SpecDigest)
+			if err != nil || len(digest) != 32 {
+				return fmt.Errorf("instance %s has an invalid immutable specification digest", instance.InstanceID)
+			}
+			// Compare the same instance identity; leadership epochs do not change execution configuration.
+			view.SpecOutdated = instance.SpecDigest != o.config.Blueprint.SpecDigest(o.identityFor(instance.InstanceID))
+		}
+		views = append(views, view)
 	}
 	plan := trinopool.PlanNext(trinopool.PoolState{
 		DesiredInstances: pool.DesiredInstances,

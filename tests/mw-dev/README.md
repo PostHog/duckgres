@@ -990,6 +990,24 @@ configuration change, immutable snapshots, lost retirement response, verified
 absence, and replacement locally. The companion tests preserve admission
 ambiguity, Gateway retirement refusals, configuration freeze, and lease fencing.
 
+Serving instances also roll when the desired blueprint changes without an image
+change. The immutable per-instance specification digest is compared using the
+same instance identity, excluding the authority epoch. The ordinary serving
+floor, planned surge, transaction drain, and retirement rules still apply.
+`TestTrinoServingBlueprintChangesRollOutWithoutAnImageChange` covers replica,
+resource, and configuration changes through complete replacement and convergence.
+Companion tests cover stable configuration, authority changes, and invalid stored
+digests. An invalid digest reports an error without starting a replacement.
+
+The in-Job fixture cannot publish a different shared-pool blueprint, so it cannot
+drive this rollout itself. After deploying the controller, publish a same-image
+worker-count change in an isolated pool through its normal configuration source.
+Observe one planned surge, admission before drain, and retention of an old member
+while a transaction remains open. After the transaction completes, verify that
+all replacements use the requested worker count and the pool stops creating new
+instances. Run `trino_shared_pool_active` before and after to check admission and
+querying. Local fixture tests do not establish live-cluster rollout acceptance.
+
 ### Shared-pool rollout sealing acceptance
 
 A DRAINING member with no remaining obligations reports `readyToSeal=true` and

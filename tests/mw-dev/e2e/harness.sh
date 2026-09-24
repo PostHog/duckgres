@@ -1106,6 +1106,8 @@ pool_object_count() { # kind selector
 #               be skipped, when they are not given. No canary warehouse and no
 #               new secret is introduced for it.
 trino_shared_pool_active() {
+  # This Job cannot change a shared-pool blueprint to trigger a rollout.
+  # See tests/mw-dev/README.md for configuration-only rollout acceptance.
   # Drain telemetry has operator-test coverage; this lane does not drive a drain.
   # The metrics port is blocked from this Job. See docs/metrics.md for validation limits.
   [ "${E2E_TRINO_POOL:-0}" = "1" ] || {
