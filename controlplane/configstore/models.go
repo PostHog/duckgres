@@ -619,8 +619,14 @@ type TrinoPrincipalOwners map[string]TrinoPrincipalOwner
 func NewTrinoPrincipalOwners(orgs []TrinoEnabledOrg) TrinoPrincipalOwners {
 	owners := make(TrinoPrincipalOwners, len(orgs))
 	for _, o := range orgs {
-		if p := o.TrinoPrincipal(); p != "" && o.RootPasswordHash != "" {
-			owners[p] = TrinoPrincipalOwner{OrgID: o.OrgID, Username: "root"}
+		if p := o.TrinoPrincipal(); p != "" {
+			// The database index attributes minted service credentials
+			// (`<db>.svc_…`), which are not projected logins and exist whether
+			// or not root does.
+			owners[trinoDatabaseOwnerKey(p)] = TrinoPrincipalOwner{OrgID: o.OrgID}
+			if o.RootPasswordHash != "" {
+				owners[p] = TrinoPrincipalOwner{OrgID: o.OrgID, Username: "root"}
+			}
 		}
 		for _, u := range o.Users {
 			if p := o.TrinoUserPrincipal(u.Username); p != "" {
@@ -629,6 +635,13 @@ func NewTrinoPrincipalOwners(orgs []TrinoEnabledOrg) TrinoPrincipalOwners {
 		}
 	}
 	return owners
+}
+
+// trinoDatabaseOwnerKey keys the database -> org index inside the owners map.
+// The NUL prefix cannot occur in a principal (password.db is line-oriented and
+// usernames are allowlisted), so an index entry never resolves as a login.
+func trinoDatabaseOwnerKey(databaseName string) string {
+	return "\x00db:" + databaseName
 }
 
 // OrgID returns the org that owns principal, or "" for an operational or
@@ -642,7 +655,7 @@ func (owners TrinoPrincipalOwners) OrgID(principal string) string {
 // authentication or authorization to a caller-supplied username.
 func (owners TrinoPrincipalOwners) Resolve(principal string) (TrinoPrincipalOwner, bool) {
 	if parts := trinoServiceCredentialUsername.FindStringSubmatch(principal); parts != nil {
-		owner, found := owners[parts[1]]
+		owner, found := owners[trinoDatabaseOwnerKey(parts[1])]
 		owner.Username = parts[2]
 		return owner, found
 	}

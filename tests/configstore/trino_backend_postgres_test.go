@@ -147,3 +147,48 @@ func TestTrinoBackendExistingDuckLakePreservedPostgres(t *testing.T) {
 		t.Fatalf("existing client switched: %v", err)
 	}
 }
+
+// A deployment without managed Hoglake passes DuckLake as the new-client
+// backend. That covers a brand-new org and one whose cell was selected before
+// any backend was (SelectTrinoCell writes a row with BackendSelected=false).
+// The selection then pins exactly like a Hoglake one.
+func TestTrinoBackendDeploymentNewClientDuckLakePostgres(t *testing.T) {
+	store := newIsolatedConfigStore(t)
+	duckLakeDefault := configstore.TrinoSettings{NewClientBackend: configstore.TrinoBackendDuckLake}
+
+	seedTrinoOrg(t, store, "fresh")
+	if err := store.EnableTrino("fresh", duckLakeDefault); err != nil {
+		t.Fatal(err)
+	}
+	if row := trinoRow(t, store, "fresh"); row.Backend != configstore.TrinoBackendDuckLake || !row.BackendSelected {
+		t.Fatalf("new client did not get the deployment backend: %+v", row)
+	}
+
+	seedTrinoOrg(t, store, "cell-first")
+	if err := store.DB().Create(&configstore.ManagedWarehouse{OrgID: "cell-first", DucklingName: "cell-first"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SelectTrinoCell("cell-first", "registered:test-cell"); err != nil {
+		t.Fatal(err)
+	}
+	explicit := duckLakeDefault
+	explicit.Backend = configstore.TrinoBackendDuckLake
+	if err := store.EnableTrino("cell-first", explicit); err != nil {
+		t.Fatal(err)
+	}
+	row := trinoRow(t, store, "cell-first")
+	if row.Backend != configstore.TrinoBackendDuckLake || !row.BackendSelected || row.TrinoCellID != "registered:test-cell" {
+		t.Fatalf("cell-selected client: %+v", row)
+	}
+
+	// Pinned now: a later Hoglake request is a conflict and changes nothing.
+	if err := store.DisableTrino("cell-first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnableTrino("cell-first", configstore.TrinoSettings{Backend: configstore.TrinoBackendHoglake}); !errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) {
+		t.Fatalf("pinned DuckLake switched: %v", err)
+	}
+	if row := trinoRow(t, store, "cell-first"); row.Enabled || row.Backend != configstore.TrinoBackendDuckLake {
+		t.Fatalf("conflict changed row: %+v", row)
+	}
+}

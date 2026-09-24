@@ -23,9 +23,15 @@ type TrinoSettings struct {
 	DefaultCellID string
 	// Tier is the resource-group tier label. Empty == default tier.
 	Tier string
-	// Backend may only confirm the existing selection or Hoglake for a new client.
-	// Empty preserves a pinned selection and otherwise selects Hoglake.
+	// Backend may only confirm the existing selection or, for a new client,
+	// the new-client backend. Empty preserves a pinned selection and otherwise
+	// selects the new-client backend.
 	Backend TrinoBackend
+	// NewClientBackend is the deployment's backend for a client with no
+	// selection yet. Empty means Hoglake. A deployment without managed Hoglake
+	// passes DuckLake, so enabling Trino serves the org's existing warehouse
+	// instead of failing.
+	NewClientBackend TrinoBackend
 }
 
 // EnableTrino marks the org as Trino-enabled and stores the per-org Trino
@@ -64,15 +70,22 @@ func (backend TrinoBackend) Valid() bool {
 	return backend == TrinoBackendDuckLake || backend == TrinoBackendHoglake
 }
 
-var ErrTrinoBackendSelectionConflict = errors.New("existing Trino backends cannot change; new clients must use Hoglake")
+var ErrTrinoBackendSelectionConflict = errors.New("existing Trino backends cannot change; new clients must use the deployment's new-client backend")
 
 // ResolveTrinoBackend preserves existing clients while sending every new client
-// to Hoglake. Disabled, previously enabled rows retain their pinned backend.
-func ResolveTrinoBackend(row *ManagedWarehouseTrino, requested TrinoBackend) (TrinoBackend, error) {
+// to the deployment's new-client backend (Hoglake unless newClient names
+// another). Disabled, previously enabled rows retain their pinned backend.
+func ResolveTrinoBackend(row *ManagedWarehouseTrino, requested, newClient TrinoBackend) (TrinoBackend, error) {
 	if requested != "" && !requested.Valid() {
 		return "", errors.New("invalid Trino backend")
 	}
+	if newClient != "" && !newClient.Valid() {
+		return "", errors.New("invalid new-client Trino backend")
+	}
 	backend := TrinoBackendHoglake
+	if newClient != "" {
+		backend = newClient
+	}
 	if row != nil && row.BackendSelected {
 		backend = EffectiveTrinoBackend(row.Backend)
 	}
@@ -105,7 +118,7 @@ func EnableTrinoInTransaction(db *gorm.DB, orgID string, settings TrinoSettings)
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&row, "org_id = ?", orgID).Error; err != nil {
 			return err
 		}
-		backend, err := ResolveTrinoBackend(&row, settings.Backend)
+		backend, err := ResolveTrinoBackend(&row, settings.Backend, settings.NewClientBackend)
 		if err != nil {
 			return err
 		}

@@ -2,12 +2,20 @@
 
 ## Client backend policy
 
-Existing Trino clients retain DuckLake. All new Trino clients use Hoglake; the
-admin UI reports the backend without offering a choice. API callers can omit
-`backend`: the server preserves an existing selection or assigns Hoglake to a
-new client. A request to create a new DuckLake client is rejected. Disable and
-re-enable retain the selected backend. Manual migration of existing clients is
-outside this rollout.
+Existing Trino clients retain DuckLake. New Trino clients use the deployment's
+new-client backend: Hoglake where managed Hoglake is configured, DuckLake where
+it is not. The admin UI reports the backend without offering a choice. API
+callers can omit `backend`: the server preserves an existing selection or
+assigns the new-client backend. A request for any other backend on a new client
+is rejected (an explicit `hoglake` on a deployment without it is 503, not
+configured). Disable and re-enable retain the selected backend. Manual
+migration of existing clients is outside this rollout.
+
+The DuckLake fallback exists because onboarding enables Trino in the provision
+call. Without it, a deployment with no managed Hoglake (prod-us today) rejected
+every new org's provision with 503. A DuckLake client's Trino catalog is the
+org's existing warehouse; configuring managed Hoglake later changes only what
+NEW clients receive, never a pinned selection.
 
 Existing Trino configuration rows migrate to locked DuckLake selections,
 including disabled rows whose previous enablement history is unknown. This

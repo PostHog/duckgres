@@ -513,7 +513,7 @@ func (h *handler) provisionWarehouse(c *gin.Context) {
 		if !h.admitTrino(c, orgID) {
 			return
 		}
-		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier, Backend: req.Trino.Backend, DefaultCellID: h.trinoDefaultCell}
+		trinoSettings = &configstore.TrinoSettings{Tier: req.Trino.Tier, Backend: req.Trino.Backend, NewClientBackend: h.newClientTrinoBackend(), DefaultCellID: h.trinoDefaultCell}
 	}
 
 	// One transaction wraps warehouse + root user + optional Trino opt-in.
@@ -648,7 +648,7 @@ func (h *handler) enableTrino(c *gin.Context) {
 	if !h.admitTrino(c, orgID) {
 		return
 	}
-	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend, DefaultCellID: h.trinoDefaultCell}); err != nil {
+	if err := h.store.EnableTrino(orgID, configstore.TrinoSettings{Tier: req.Tier, Backend: req.Backend, NewClientBackend: h.newClientTrinoBackend(), DefaultCellID: h.trinoDefaultCell}); err != nil {
 		if errors.Is(err, configstore.ErrTrinoBackendSelectionConflict) || errors.Is(err, configstore.ErrHoglakeLifecycleProtected) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
