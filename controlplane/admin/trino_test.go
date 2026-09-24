@@ -610,7 +610,7 @@ func TestReadyOrgDetailReturnsTenantClientConnection(t *testing.T) {
 // Trino qualifies that login with the org the host names.
 func TestReadyOrgDetailAdvertisesPerOrgClientHost(t *testing.T) {
 	store := &fakeTrinoOrgStore{
-		orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-a", CellID: "cell-test", State: configstore.ManagedWarehouseStateReady}},
+		orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-a", CellID: "cell-test", RootPasswordHash: "hash", State: configstore.ManagedWarehouseStateReady}},
 		rows: map[string]*configstore.ManagedWarehouseTrino{
 			"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: "cell-test", State: configstore.ManagedWarehouseStateReady},
 		},
@@ -625,6 +625,33 @@ func TestReadyOrgDetailAdvertisesPerOrgClientHost(t *testing.T) {
 	connection := body["status"].(map[string]any)["connection"].(map[string]any)
 	if connection["host"] != "tenant-a.dw.example.com" || connection["port"] != float64(443) || connection["username"] != "root" {
 		t.Errorf("connection = %v, want tenant-a.dw.example.com:443 as root", connection)
+	}
+}
+
+// The advertised login (root on a per-org host, the bare principal
+// otherwise) authenticates with root's hash. An org without an enabled root
+// is still ready -- its other logins work -- but must not be handed a
+// username that cannot authenticate.
+func TestReadyOrgWithoutRootAdvertisesNoConnection(t *testing.T) {
+	store := &fakeTrinoOrgStore{
+		orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "tenant-a", CellID: "cell-test", State: configstore.ManagedWarehouseStateReady}},
+		rows: map[string]*configstore.ManagedWarehouseTrino{
+			"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: "cell-test", State: configstore.ManagedWarehouseStateReady},
+		},
+	}
+	api := NewTrinoAPI(TrinoCell{ID: "cell-test", CoordinatorURL: "https://coordinator.invalid", ClientURL: "https://{database_name}.dw.example.com"}, &fakeTrinoCoordinator{}, store, nil)
+	r := trinoTestRouter(api, RoleViewer)
+
+	code, body := doTrinoJSON(t, r, http.MethodGet, "/api/v1/orgs/org-a/trino", "")
+	if code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	status := body["status"].(map[string]any)
+	if status["state"] != string(configstore.ManagedWarehouseStateReady) {
+		t.Errorf("state = %v, want ready", status["state"])
+	}
+	if connection, ok := status["connection"]; ok && connection != nil {
+		t.Errorf("connection = %v, want none without an enabled root", connection)
 	}
 }
 
@@ -654,7 +681,7 @@ func TestTrinoCellAPIAliasPreservesStoredOwnership(t *testing.T) {
 	for _, storedID := range []string{"stored-cell", "another-cell", "legacy", ""} {
 		t.Run("stored="+storedID, func(t *testing.T) {
 			store := &fakeTrinoOrgStore{
-				orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "db_a", CellID: storedID, State: configstore.ManagedWarehouseStateReady}},
+				orgs: []configstore.TrinoEnabledOrg{{OrgID: "org-a", DatabaseName: "db_a", CellID: storedID, RootPasswordHash: "hash", State: configstore.ManagedWarehouseStateReady}},
 				rows: map[string]*configstore.ManagedWarehouseTrino{
 					"org-a": {OrgID: "org-a", Enabled: true, TrinoCellID: storedID, State: configstore.ManagedWarehouseStateReady},
 				},

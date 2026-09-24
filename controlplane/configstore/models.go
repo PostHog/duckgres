@@ -530,7 +530,7 @@ type TrinoEnabledOrg struct {
 	DatabaseName       string
 	Tier               string
 	CellID             string
-	RootPasswordHash   string                            // bcrypt hash from OrgUser row where Username = "root"
+	RootPasswordHash   string                            // bcrypt hash of an enabled `root` OrgUser; "" = no bare principal
 	State              ManagedWarehouseProvisioningState // current state at read time
 	// Users are the org's own duckgres logins, each of which authenticates
 	// to Trino under TrinoUserPrincipal(Username) with the very same bcrypt
@@ -616,11 +616,11 @@ type TrinoPrincipalOwners map[string]TrinoPrincipalOwner
 
 // NewTrinoPrincipalOwners indexes the projected principals of orgs. The bare
 // org principal authenticates with the root login's hash, so it resolves to
-// root.
+// root -- and, like the password file, exists only while root has a hash.
 func NewTrinoPrincipalOwners(orgs []TrinoEnabledOrg) TrinoPrincipalOwners {
 	owners := make(TrinoPrincipalOwners, len(orgs))
 	for _, o := range orgs {
-		if p := o.TrinoPrincipal(); p != "" {
+		if p := o.TrinoPrincipal(); p != "" && o.RootPasswordHash != "" {
 			owners[p] = TrinoPrincipalOwner{OrgID: o.OrgID, Username: "root"}
 		}
 		for _, u := range o.Users {

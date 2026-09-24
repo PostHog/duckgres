@@ -409,6 +409,25 @@ done
 trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 && fail "old Trino password still authenticates"
 pw_a="$new_pw"
 
+# The bare <database_name> principal authenticates with root's hash, so the
+# per-user kill switch on root must revoke it too (it used to survive a root
+# disable). The org stays enabled; re-enabling root restores the login.
+log "disabling root revokes the bare org principal"
+api -X POST "$API/api/v1/orgs/$ORG_A/users/root/disable" >/dev/null
+i=0
+while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
+  trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 || break
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
+done
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "bare org principal still authenticates after root was disabled"
+api -X POST "$API/api/v1/orgs/$ORG_A/users/root/enable" >/dev/null
+i=0
+while [ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ]; do
+  trino_query "$DB_A" "$pw_a" 'SELECT 1' >/dev/null 2>&1 && break
+  sleep "$TRINO_AUTH_ROTATION_RETRY_SECONDS"; i=$((i + 1))
+done
+[ "$i" -lt "$TRINO_AUTH_ROTATION_ATTEMPTS" ] || fail "bare org principal did not come back after root was re-enabled"
+
 log "worker restart preserves Hoglake data"
 "$KUBECTL" -n "$NS" delete pod -l 'app=duckgres-trino,component=worker' --wait=true >/dev/null
 "$KUBECTL" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=240s >/dev/null

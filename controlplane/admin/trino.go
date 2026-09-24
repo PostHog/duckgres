@@ -720,7 +720,10 @@ func (a *TrinoAPI) writeOrgDetail(c *gin.Context, orgID string, row *configstore
 	status.FailedAt = row.FailedAt
 	status.Tier = row.Tier
 	status.Cell = a.cell.publicID(row.TrinoCellID)
-	if available && status.State == string(configstore.ManagedWarehouseStateReady) && row.TrinoCellID != "" && row.TrinoCellID == a.cell.storedID() {
+	// The advertised username is root (per-org host) or the bare principal,
+	// and both authenticate with root's hash: an org without an enabled root
+	// has neither, so it advertises no connection rather than a dead login.
+	if available && status.State == string(configstore.ManagedWarehouseStateReady) && row.TrinoCellID != "" && row.TrinoCellID == a.cell.storedID() && enabled.RootPasswordHash != "" {
 		status.Connection = a.cell.connectionFor(status.Principal)
 	}
 

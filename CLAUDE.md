@@ -1733,7 +1733,13 @@ password/tenant/catalog changes never propagate.
   `BuildTrinoAuthFiles` writes one `password.db` line per login with the
   bcrypt hash **copied through unchanged** — it is the same hash pgwire
   verifies, so one password works on both engines and nothing is re-hashed or
-  minted. The bare `<database_name>` principal survives alongside them. Three
+  minted. The bare `<database_name>` principal survives alongside them and
+  authenticates with root's hash, so it follows root's login row exactly: no
+  `root` row, a disabled root or a blank password leaves `RootPasswordHash`
+  empty and drops ONLY the bare principal — from `password.db`, the pool's
+  Gateway binding, `TrinoPrincipalOwners` and the advertised
+  `status.connection` alike. The org is still listed and its other logins
+  still work; a root-less org is enabled normally (no root preflight). Three
   rules that are load-bearing rather than cosmetic: (1) usernames are
   projected through an **allowlist** (`trinoUsernamePattern`) because
   duckgres barely validates them and a `:`, `,` or newline would let whoever

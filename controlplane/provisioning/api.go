@@ -638,24 +638,6 @@ func (h *handler) enableTrino(c *gin.Context) {
 		return
 	}
 
-	// Preflight: the org's `root` login is the tenant's Trino principal —
-	// ListTrinoEnabledOrgs inner-joins on it, so an org without one is
-	// dropped from every projection and the reconcile loop never reports
-	// why. Orgs provisioned before the root-user convention are exactly
-	// this shape. Reject here so the caller learns immediately instead of
-	// watching the org sit at Pending forever; POST /orgs/:id/reset-password
-	// creates the missing login on a Ready warehouse.
-	if _, err := h.store.GetOrgUser(orgID, "root"); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": "org has no root user, so it cannot be projected into a Trino cell; POST /orgs/" + orgID + "/reset-password to create one",
-			})
-			return
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
 	backend, ok := h.resolveTrinoBackend(c, orgID, req.Backend)
 	if !ok {
 		return

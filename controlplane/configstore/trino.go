@@ -374,20 +374,17 @@ func (cs *ConfigStore) DisableTrino(orgID string) error {
 }
 
 // ListTrinoEnabledOrgs returns every org with ManagedWarehouseTrino.Enabled
-// = true joined against its `root` OrgUser row, each carrying the org's full
-// set of projectable logins in Users. The provisioner needs the bcrypt hashes
-// to project the Trino password file.
+// = true, each carrying the org's full set of projectable logins in Users.
+// The provisioner needs the bcrypt hashes to project the Trino password file.
 //
-// The `root` join stays because database_name alone remains a principal in
-// its own right (TrinoPrincipal) for service-to-service use and for every
-// client configured before per-user logins existed. Users is the ADDITIONAL
-// per-human projection; root therefore appears twice, as `<db>` and as
-// `<db>.root`, and both authenticate against the same hash.
-//
-// Orgs that are Trino-enabled but have no `root` OrgUser are skipped — that
-// shape can't legitimately happen via the provisioning API (CreateOrgUser
-// runs in the same handler that toggles Enabled), and silently skipping is
-// safer than projecting a half-built password file.
+// RootPasswordHash backs the bare `<database_name>` principal, kept for
+// service-to-service use and for every client configured before per-user
+// logins existed. It follows the same rules as every other projected login:
+// it is empty when the org has no `root` row, when root is disabled, or when
+// root has a blank password. An empty hash drops only the bare principal --
+// the org still gets its catalog and its per-user logins -- so a root-less
+// org is served rather than silently skipped, and disabling root revokes
+// the bare principal exactly as it revokes `<database_name>.root`.
 //
 // Orgs with no duckgres_orgs row, or a blank database_name, are skipped for
 // the same reason: database_name is the org's Trino principal (see
@@ -428,10 +425,12 @@ func (cs *ConfigStore) listTrinoEnabledOrgsCoherently(db *gorm.DB) ([]TrinoEnabl
 
 func (cs *ConfigStore) listTrinoEnabledOrgsWith(db *gorm.DB, scope trinoScopeResolver) ([]TrinoEnabledOrg, error) {
 	var out []TrinoEnabledOrg
-	// Inner join with duckgres_org_users on (org_id, username='root') so a
-	// missing OrgUser row drops the org from the result. Inner join with
-	// duckgres_orgs for database_name, which is the org's Trino principal —
-	// a missing or blank one drops the org for the same reason.
+	// LEFT join with duckgres_org_users on root: a missing, disabled or
+	// password-less root leaves RootPasswordHash empty (the bare principal is
+	// not projected) without dropping the org. The disabled/password filters
+	// live in the ON clause so they null the hash rather than the row. Inner
+	// join with duckgres_orgs for database_name, which is the org's Trino
+	// principal — a missing or blank one drops the org.
 	err := db.Table("duckgres_managed_warehouse_trino AS t").
 		Select(`t.org_id AS org_id,
 		         o.database_name AS database_name,
@@ -439,10 +438,11 @@ func (cs *ConfigStore) listTrinoEnabledOrgsWith(db *gorm.DB, scope trinoScopeRes
 		         t.backend AS backend,
 		         t.hoglake_initialized AS hoglake_initialized,
 		         COALESCE(t.trino_cell_id, '') AS cell_id,
-		         u.password AS root_password_hash,
+		         COALESCE(u.password, '') AS root_password_hash,
 		         t.state AS state`).
-		Joins(`INNER JOIN duckgres_org_users AS u
-		        ON u.org_id = t.org_id AND u.username = 'root'`).
+		Joins(`LEFT JOIN duckgres_org_users AS u
+		        ON u.org_id = t.org_id AND u.username = 'root'
+		       AND u.disabled = false AND u.password <> ''`).
 		Joins(`INNER JOIN duckgres_orgs AS o ON o.name = t.org_id`).
 		Where("t.enabled = ?", true).
 		Where("o.database_name <> ''").
