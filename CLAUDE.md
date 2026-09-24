@@ -1743,7 +1743,9 @@ password/tenant/catalog changes never propagate.
   `root` row, a disabled root or a blank password leaves `RootPasswordHash`
   empty and drops ONLY the bare principal — from `password.db`, the pool's
   Gateway binding, `TrinoPrincipalOwners` and the advertised
-  `status.connection` alike. The org is still listed and its other logins
+  `status.connection` alike. (`TrinoPrincipalOwners` separately keeps a
+  root-independent database -> org index, so minted `<db>.svc_…` service
+  credentials are attributed whether or not root exists.) The org is still listed and its other logins
   still work; a root-less org is enabled normally (no root preflight). Three
   rules that are load-bearing rather than cosmetic: (1) usernames are
   projected through an **allowlist** (`trinoUsernamePattern`) because

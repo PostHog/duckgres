@@ -25,4 +25,15 @@ func TestTrinoPrincipalOwnersFollowTheRootHash(t *testing.T) {
 	if got := owners.OrgID("beta.analyst"); got != "org-b" {
 		t.Errorf("beta.analyst org = %q, want org-b", got)
 	}
+	// A minted service credential is attributed by database, independent of
+	// root: it is not a projected login.
+	if got := owners.OrgID("beta.svc_0123456789abcdef01234567"); got != "org-b" {
+		t.Errorf("rootless service credential org = %q, want org-b", got)
+	}
+	// The database index is never itself a principal.
+	for principal := range owners {
+		if principal == "beta" {
+			t.Error("index entry leaked as the bare principal")
+		}
+	}
 }
