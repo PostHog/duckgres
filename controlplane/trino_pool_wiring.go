@@ -127,6 +127,9 @@ func buildTrinoPoolOperators(
 		operator.validate = func(ctx context.Context, endpoint string, observed trinoPoolObservation, expected trinoPoolExpectation) (trinoPoolValidation, error) {
 			return validateTrinoPoolCandidate(ctx, client, endpoint, observerCredential, observed, expected)
 		}
+		operator.queryDrainStatus = func(ctx context.Context, endpoint, queryID string) (trinoQueryDrainStatus, error) {
+			return probeTrinoQueryDrainStatus(ctx, client, endpoint, observerCredential, queryID)
+		}
 		operator.identity = func(ctx context.Context, endpoint string) (string, error) {
 			return probeProcessIdentity(ctx, client, endpoint, observerCredential, true)
 		}

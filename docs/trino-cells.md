@@ -204,3 +204,27 @@ readiness reset and the ownership check.
 
 Gateway public exposure is also a separate gate: authenticate every externally
 reachable API and UI before publishing it; keep unauthenticated probes internal.
+
+### Query obligations that outlive their clients
+
+A client can stop polling before the Gateway observes the query's terminal response.
+For draining pool members, the operator checks up to ten query obligations per tick, within a five-second read budget and a one-second timeout per coordinator probe.
+The cursor rotates so long-running queries do not prevent checking later candidates.
+These limits are fixed safety defaults, with no additional activation flag beyond the existing pool operator switch.
+
+The operator uses the pool's observer credential against the exact member's `/v1/query/{queryId}/drain-status` endpoint.
+Only an explicit `absent: true` response with the registered node and coordinator identities permits submission to Gateway reconciliation.
+Gateway independently verifies the member identity, fences the controller epoch and generation, and checks that admissions have not changed.
+It retains reconciled terminal records for the normal retry window.
+The operator reads obligations again on a later tick before attempting the existing seal and retirement protocol.
+Open transactions, live queries, retained results, and pending or uncertain admissions still prevent draining.
+
+Deploy the Gateway reconciliation API and the Trino drain-status endpoint before relying on this recovery path.
+Configure finite completed-query history retention, such as `query.max-history-age=15m`, on supporting Trino images so a quiet member can eventually prove absence.
+An older endpoint returning HTTP 404, missing proof fields, authentication failures, timeouts, or a coordinator identity change leaves the query obligation intact.
+No elapsed-time cutoff marks a query complete.
+A member already running an older Trino image cannot use this path to unblock its own replacement.
+Recover such a drain through the Gateway's authorized owner cancellation procedure before expecting the new image to serve it.
+For a blocked drain, inspect the bounded `Trino drain proof unavailable` diagnostic and the existing Gateway obligation counters; verify both endpoint versions and observer authorization.
+Successful recovery logs `Trino drain query obligations reconciled` with an aggregate count, without query text or identifiers.
+Do not remove ledger rows or bypass the Gateway's seal refusal.

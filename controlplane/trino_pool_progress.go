@@ -427,8 +427,9 @@ func (o *trinoPoolOperator) sealWhenDrained(ctx context.Context, instance config
 	if (!obligations.ReadyToSeal && !obligations.Drained) || obligations.Outstanding() > 0 {
 		poolObservation(ctx).waiting(slog.Default(), instance, o.lease.Epoch,
 			"gateway_obligations", obligations, time.Now())
-		return false, nil
+		return o.reconcileDrainingQueries(ctx, instance, obligations)
 	}
+	delete(o.drainCursors, instance.InstanceID)
 	member, err := o.gateway.SealMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{
 		Step: o.step(instance.InstanceID, "seal"),
 		// The generation comes from the RECORD, not from the obligations read

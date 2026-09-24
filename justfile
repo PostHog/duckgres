@@ -343,6 +343,12 @@ test-trino-opa pattern="":
 test-trino pattern="Trino":
     go test -v -count=1 -tags kubernetes -run '{{pattern}}' ./controlplane ./controlplane/admin ./controlplane/provisioner ./controlplane/provisioning
 
+# Verify bounded query-obligation reconciliation and the existing seal gates.
+[group('test')]
+test-trino-drain:
+    go test -v -count=1 ./controlplane/trinogateway
+    just test-trino 'TestTrinoPoolReconcil|TestTrinoPoolDrain|TestTrinoDrainProof|TestPoolSeal|TestSealWaits'
+
 # Verify the Trino service-grant lifecycle against local integration Postgres.
 [group('test')]
 test-trino-service-credentials:

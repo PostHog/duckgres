@@ -69,6 +69,8 @@ type trinoPoolGateway interface {
 	AdmitMember(ctx context.Context, poolID, instanceID string, request trinogateway.AdmitMemberRequest) (trinogateway.Member, error)
 	GetMember(ctx context.Context, poolID, instanceID string) (trinogateway.Member, error)
 	GetObligations(ctx context.Context, poolID, instanceID string) (trinogateway.Obligations, error)
+	GetDrainCandidates(ctx context.Context, poolID, instanceID, after string) ([]trinogateway.DrainQueryCandidate, error)
+	ReconcileQueries(ctx context.Context, poolID, instanceID string, request trinogateway.ReconcileQueriesRequest) (trinogateway.ReconcileQueriesResult, error)
 	DrainMember(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
 	SealMember(ctx context.Context, poolID, instanceID string, request trinogateway.MemberStepRequest) (trinogateway.Member, error)
 	SuspectMember(ctx context.Context, poolID, instanceID string, request trinogateway.SuspectMemberRequest) (trinogateway.Member, error)
@@ -92,12 +94,14 @@ type trinoPoolValidator func(ctx context.Context, endpoint string, observed trin
 type trinoPoolIdentityProbe func(ctx context.Context, endpoint string) (string, error)
 
 type trinoPoolOperator struct {
-	config   trinoPoolConfig
-	store    trinoPoolStore
-	gateway  trinoPoolGateway
-	kube     func(epoch int64) trinoPoolKube
-	validate trinoPoolValidator
-	identity trinoPoolIdentityProbe
+	config           trinoPoolConfig
+	store            trinoPoolStore
+	gateway          trinoPoolGateway
+	kube             func(epoch int64) trinoPoolKube
+	validate         trinoPoolValidator
+	identity         trinoPoolIdentityProbe
+	queryDrainStatus func(context.Context, string, string) (trinoQueryDrainStatus, error)
+	drainCursors     map[string]string
 	// projection reports what this control plane currently serves: the
 	// authorization bundle's revision and the fingerprints of the projected
 	// password and group files. It is what a member is compared against when
@@ -197,6 +201,7 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 		interval = trinoPoolReconcileInterval
 	}
 	o.fenced = false
+	o.drainCursors = nil
 
 	// A new Run is a NEW leadership term. Any lease left on the struct belongs
 	// to the previous term and must not be reused: the janitor lease may have
