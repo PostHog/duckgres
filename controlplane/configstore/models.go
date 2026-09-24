@@ -609,9 +609,8 @@ type TrinoPrincipalOwner struct {
 // consumer that attributes a query to a tenant (usage metering, the admin
 // console) must see a per-user login as its org's, not as an unknown user.
 //
-// It is built from the SAME principals BuildTrinoAuthFiles projects, by exact
-// match, rather than by splitting on the separator, so a principal that is not
-// in the password file never resolves to an org.
+// Persistent users resolve by exact projection membership. Authenticated
+// service grants resolve through their reserved namespace and known tenant.
 type TrinoPrincipalOwners map[string]TrinoPrincipalOwner
 
 // NewTrinoPrincipalOwners indexes the projected principals of orgs. The bare
@@ -635,7 +634,20 @@ func NewTrinoPrincipalOwners(orgs []TrinoEnabledOrg) TrinoPrincipalOwners {
 // OrgID returns the org that owns principal, or "" for an operational or
 // unknown principal.
 func (owners TrinoPrincipalOwners) OrgID(principal string) string {
-	return owners[principal].OrgID
+	owner, _ := owners.Resolve(principal)
+	return owner.OrgID
+}
+
+// Resolve attributes a coordinator-authenticated identity; it does not grant
+// authentication or authorization to a caller-supplied username.
+func (owners TrinoPrincipalOwners) Resolve(principal string) (TrinoPrincipalOwner, bool) {
+	if parts := trinoServiceCredentialUsername.FindStringSubmatch(principal); parts != nil {
+		owner, found := owners[parts[1]]
+		owner.Username = parts[2]
+		return owner, found
+	}
+	owner, found := owners[principal]
+	return owner, found
 }
 
 // TrinoPrincipal is the tenant's customer-facing identity in Trino: the

@@ -394,7 +394,7 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 	if replayed {
 		// PoolStore.inPool resolves the recorded step and applies NOTHING: the
 		// principal rows keep whatever the earlier publication left there.
-		return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
+		return f.principalAdmission(tenant, request), nil
 	}
 	if f.principals == nil {
 		f.principals = map[string][]string{}
@@ -418,7 +418,11 @@ func (f *fakePoolGateway) applyPublish(tenant string, request trinogateway.Publi
 	}
 	f.principals[tenant] = request.Principals
 	f.recordStep(request.Step, intent)
-	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}, nil
+	return f.principalAdmission(tenant, request), nil
+}
+
+func (f *fakePoolGateway) principalAdmission(tenant string, request trinogateway.PublishPrincipalsRequest) trinogateway.TenantAdmission {
+	return trinogateway.TenantAdmission{Tenant: tenant, State: "PENDING", PrincipalRevision: request.Revision}
 }
 
 func (f *fakePoolGateway) ConfigurePool(_ context.Context, poolID string, request trinogateway.ConfigurePoolRequest) (trinogateway.PoolState, error) {
@@ -1240,6 +1244,55 @@ func TestTenantBindingIsPublishedWhenTheGateIsOn(t *testing.T) {
 	}
 	if !sawBare {
 		t.Fatalf("published principals = %v, want the bare root login included", published)
+	}
+}
+
+func TestTrinoServiceCredentialAuthPreservesPublishedPrincipals(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 1)
+	initial := strings.Join(harness.gateway.principals["org-a"], ",")
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	harness.tick(t, 1)
+	if got := strings.Join(harness.gateway.principals["org-a"], ","); got != initial {
+		t.Fatalf("service authentication changed published principals: before=%s after=%s", initial, got)
+	}
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
+	harness.tick(t, 1)
+	if got := strings.Join(harness.gateway.principals["org-a"], ","); got != initial {
+		t.Fatalf("authentication rollback changed published principals: before=%s after=%s", initial, got)
+	}
+}
+
+func TestTrinoServiceCredentialAuthAcceptsExistingGatewayReply(t *testing.T) {
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 1)
+	row := harness.publications.rows["org-a"]
+	if row == nil || row.PrincipalRevision == "" {
+		t.Fatal("existing Gateway principal publication reply was not checkpointed")
+	}
+}
+
+func TestTrinoServiceCredentialAuthDoesNotRepublishBindings(t *testing.T) {
+	harness := newOperatorHarness(t)
+	harness.operator.config.Pool.TenantAdmission = true
+	harness.operator.tenants = &fakeTenantStore{orgs: []configstore.TrinoEnabledOrg{poolOrg("analyst")}}
+	harness.tick(t, 3)
+	initial := countCalls(harness.gateway.calls, "principals:")
+	revision := harness.publications.rows["org-a"].PrincipalRevision
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "/synthetic/service-auth-token")
+	harness.tick(t, 3)
+	t.Setenv("DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE", "")
+	harness.tick(t, 3)
+	if got := countCalls(harness.gateway.calls, "principals:"); got != initial {
+		t.Fatalf("service authentication toggles republished bindings: before=%d after=%d", initial, got)
+	}
+	if got := harness.publications.rows["org-a"].PrincipalRevision; got != revision {
+		t.Fatalf("service authentication changed binding revision: before=%s after=%s", revision, got)
 	}
 }
 

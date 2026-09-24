@@ -299,6 +299,20 @@ server could still receive a reused credential without plaintext. Org
 deletion permanently removes its service-grant rows so an old secret cannot
 become valid if that org name is created again.
 
+Trino can validate the same grants through `POST /auth/trino/service-credentials`.
+This route is disabled by default.
+Set `DUCKGRES_TRINO_SERVICE_AUTH_SECRET_FILE` to a mounted JSON file with `cells` entries containing an exact configured `cell_id` and a `tokens` array.
+Each token must be at least 32 bytes, unique to one cell, and different from the admin and discovery secrets.
+The control plane loads the map at startup and accepts up to four tokens per cell for overlapping rotation.
+Each coordinator receives only its own cell's plain-text token file; never distribute the complete map to coordinators.
+The token identifies the caller's cell and authorizes only validation for organizations currently assigned to that cell; it cannot mint, refresh, or revoke grants.
+With this configured, mint and refresh responses include an optional `trino_connect` block only when the organization's assigned Trino cell is ready and has a token mapping.
+It contains `host`, `port`, `catalog`, `username`, and `http_scheme`, and uses the same `credential_secret` as the pgwire connection.
+Trino clients renew live grants with `rotate_secret: false` on the refresh endpoint so their gateway query-owner fingerprint remains stable.
+Such responses contain `secret_rotated: false` and omit the secret; default refresh continues to rotate it.
+Persistent user passwords remain available for external clients.
+See [Trino service credentials](docs/runbooks/trino-service-credentials.md) for coordinated rollout, local validation, rotation, and failure recovery.
+
 ## Quick Start
 
 The project uses [just](https://github.com/casey/just) as a command runner. Run `just` to see all available recipes.

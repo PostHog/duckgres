@@ -74,6 +74,26 @@ type TrinoConnection struct {
 	Username string `json:"username"`
 }
 
+// ServiceCredentialConnection preserves the cell's authoritative endpoint and
+// uses a bare grant only when that endpoint supplies the tenant qualification.
+func (c TrinoCell) ServiceCredentialConnection(principal, credentialID string) *TrinoConnection {
+	connection := c.connectionFor(principal)
+	if connection == nil {
+		return nil
+	}
+	clientURL := c.ClientURL
+	if clientURL == "" {
+		clientURL = c.CoordinatorURL
+	}
+	_, perOrgHost, _ := ResolveTrinoClientURL(clientURL, principal)
+	if perOrgHost {
+		connection.Username = credentialID
+	} else {
+		connection.Username = principal + configstore.TrinoPrincipalSeparator + credentialID
+	}
+	return connection
+}
+
 // TrinoOrgStatus is one org's Trino provisioning state, joined with what
 // the coordinator currently shows for it.
 //

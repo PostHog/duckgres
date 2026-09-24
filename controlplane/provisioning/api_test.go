@@ -486,6 +486,16 @@ func (s *fakeStore) ReloadSnapshot() error {
 	return s.reloadSnapshotEr
 }
 
+func (s *fakeStore) RenewServiceCredential(orgID, credentialID string, ttl time.Duration) (*configstore.ServiceCredentialIssue, error) {
+	issued, err := s.RefreshServiceCredential(orgID, credentialID, ttl)
+	if err != nil {
+		return nil, err
+	}
+	copy := *issued
+	copy.Plaintext = ""
+	return &copy, nil
+}
+
 func newTestRouter(store Store) *gin.Engine {
 	return newTestRouterWithBucketSuffix(store, "")
 }

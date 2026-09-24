@@ -278,6 +278,9 @@ pw_b="$(provision "$ORG_B" "$DB_B" "$TEAM_B" | jq -r .password)"
 [ -n "$pw_b" ] && [ "$pw_b" != null ] || fail "tenant B provision returned no password"
 wait_warehouse "$ORG_B"
 wait_trino "$ORG_B" "$DB_B" "$CAT_B"
+if [ "${TRINO_SERVICE_CREDENTIALS_ENABLED:-false}" = true ]; then
+  . /harness/trino-service-credentials.sh
+fi
 [ "$("$KUBECTL" -n "$NS" get pod -l 'app=duckgres-trino,component=coordinator' -o jsonpath='{.items[0].metadata.uid}')" = "$coord_uid_before" ] \
   || fail "adding tenant B restarted the Trino coordinator"
 [ "$(scalar "$DB_B" "$pw_b" 'SELECT 1')" = 1 ] || fail "hot-added tenant cannot authenticate"
