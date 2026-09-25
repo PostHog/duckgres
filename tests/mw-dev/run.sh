@@ -72,8 +72,8 @@ TRINO_TLS_PASSWORD="${TRINO_TLS_PASSWORD:-duckgres-e2e-keystore}"
 # Managed admission requires atomic-table-creation-v1, including frozen perf.
 # hoglake main bcaecde8: hydrator zone maps for REQUIRED columns without
 # null_count (PostHog/hoglake#213) and /scan include=split_offsets (#214).
-# Runs 2-3 (do not merge): hoglake main 5a3e5197 (PostHog/hoglake#213 only), so Trino/config changes attribute alone.
-HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:9d0ec140f2673423e386a76a6be759787c908997c36e3b965f6e7737df855c8f}"
+# Run 4 (do not merge): hoglake main bcaecde8 — adds /scan include=split_offsets (PostHog/hoglake#214) on top of #213.
+HOGLAKE_IMAGE="${HOGLAKE_IMAGE:-ghcr.io/posthog/hoglake-server@sha256:e0809561a60a595ff0c36143dd5b8901c293c813def8e8c0ecf89cc0d31596d1}"
 HOGLAKE_DATA_PATH="${HOGLAKE_DATA_PATH:-}"
 if [ "${GITHUB_ACTIONS:-}" = true ] && [ -n "$HOGLAKE_DATA_PATH" ]; then
   hoglake_bucket="${HOGLAKE_DATA_PATH#s3://}"
