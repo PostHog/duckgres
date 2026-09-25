@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { api, ApiError } from "@/lib/api";
 import { POLL } from "@/lib/query";
 import {
-  RECOVERY_PREVIEW_MAX_AGE_MS, readRecoveryRequest, recoveryAccessDenied, recoveryAllowed, recoveryComplete,
+  RECOVERY_PREVIEW_MAX_AGE_MS, readRecoveryRequest, recoveryAccessDenied, recoveryAllowed, recoveryBlockers, recoveryComplete,
   recoveryError, recoveryIdentity, recoveryPollingPaused, recoveryReviewKey, recoveryStorageKey, validRecoveryReason,
 } from "@/lib/trinoRecovery";
 import type { TrinoRecoveryBody } from "@/types/api";
@@ -78,6 +78,7 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
     refetchInterval: (query) => recoveryComplete(query.state.data?.instance.phase ?? "") || recoveryPollingPaused(query.state.error) ? false : POLL.normal,
   });
   const snapshot = preview.data?.cell === cell && preview.data.instance.instance_id === instance ? preview.data : undefined;
+  const blockers = snapshot ? recoveryBlockers(snapshot) : [];
   const mutation = useMutation({
     mutationFn: ({ body }: { body: TrinoRecoveryBody; previouslyUnknown: boolean }) => api.requestTrinoRecovery(instance, body, cell), retry: false,
     onSettled: async (_data, error, { body, previouslyUnknown }) => {
@@ -178,6 +179,10 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
     {preview.error && <p role="alert">{recoveryError(preview.error)} The previous preview cannot authorize a new request.</p>}
     {localError && <p role="alert">{localError}</p>}
     {notice && <p role="status">{notice}</p>}
+    {!snapshot && <div className="space-y-2">
+      <p>A valid preview is required before requesting recovery.</p>
+      <Button variant="destructive" disabled>Request destructive recovery</Button>
+    </div>}
     {snapshot && <>
       <p className="rounded border border-warning/40 p-3">This stored snapshot does not verify live workload or capacity. Check workload and remaining capacity before requesting recovery. The operator verifies its safety gates separately.</p>
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
@@ -216,10 +221,21 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
           onClick={() => submit(pending)}>Retry identical request</Button>}
         {rejected && !recorded && <Button variant="outline" disabled={!fresh} onClick={reviewAgain}>Review a new preview</Button>}
       </div>}
-      {!pending && !recorded && !complete && (recoveryAllowed(snapshot) ?
-        <RecoveryForm key={reviewKey} instance={instance} disabled={denied || checking || !!localError}
-          submitDisabled={!fresh} onSubmit={start} /> :
-        <p>Recovery requires a DRAINING instance with a complete admitted identity, an unfrozen pool, and stored serving capacity at or above the minimum.</p>)}
+      {!pending && !recorded && !complete ? <>
+        {blockers.length > 0 && <div className="space-y-1" role="status">
+          <p>Recovery is unavailable for this instance:</p>
+          <ul className="list-disc space-y-1 pl-5" aria-label="Recovery blockers">
+            {blockers.map((blocker) => <li key={blocker}>{blocker}</li>)}
+          </ul>
+        </div>}
+        <RecoveryForm key={reviewKey} instance={instance} disabled={denied || checking || !!localError || blockers.length > 0}
+          submitDisabled={!fresh} onSubmit={start} />
+      </> : <div className="space-y-2">
+        <p>{complete ? "This instance is already retired. It cannot receive a new recovery request." : recorded ?
+          "An immutable recovery request already exists for this instance. Follow its progress above." :
+          "Resolve the existing request before creating a new recovery request. Its status and available actions are shown above."}</p>
+        <Button variant="destructive" disabled>Request destructive recovery</Button>
+      </div>}
     </>}
     <p className="text-xs text-muted-foreground">Recovery may lose retained results and continuations. Accepted requests are immutable. This tab saves the exact request for manual retries; it never automatically submits or retries recovery.</p>
   </section>;

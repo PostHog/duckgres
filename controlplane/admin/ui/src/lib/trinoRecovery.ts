@@ -19,14 +19,33 @@ export function recoveryIdentity(identity: TrinoRecoveryIdentity): TrinoRecovery
 }
 
 export function validRecoveryIdentity(identity: TrinoRecoveryIdentity): boolean {
-  return Number.isSafeInteger(identity.expected_generation) && identity.expected_generation > 0 &&
-    [identity.incarnation, identity.pod_uid, identity.boot_id, identity.node_id, identity.coordinator_id]
-      .every((value) => typeof value === "string" && value.trim().length > 0);
+  return invalidRecoveryIdentityFields(identity).length === 0;
+}
+
+function invalidRecoveryIdentityFields(identity: TrinoRecoveryIdentity): string[] {
+  const fields: string[] = [];
+  if (!Number.isSafeInteger(identity.expected_generation) || identity.expected_generation <= 0) fields.push("expected_generation");
+  for (const field of ["incarnation", "pod_uid", "boot_id", "node_id", "coordinator_id"] as const) {
+    if (typeof identity[field] !== "string" || !identity[field].trim()) fields.push(field);
+  }
+  return fields;
 }
 
 export function recoveryAllowed(preview: TrinoRecoveryPreview): boolean {
-  return !preview.request && !preview.capacity.frozen && validRecoveryIdentity(preview.instance) &&
-    preview.capacity.stored_serving >= preview.capacity.min_serving && preview.instance.phase === "DRAINING";
+  return recoveryBlockers(preview).length === 0;
+}
+
+export function recoveryBlockers(preview: TrinoRecoveryPreview): string[] {
+  const blockers: string[] = [];
+  if (preview.request) blockers.push(`Recovery operation ${preview.request.operation_id} is already recorded. A new request is not allowed.`);
+  if (preview.instance.phase !== "DRAINING") blockers.push(`Instance phase is ${preview.instance.phase}; recovery requires DRAINING.`);
+  if (preview.capacity.frozen) blockers.push("The pool is frozen. Recovery cannot proceed while it is frozen.");
+  const invalidIdentity = invalidRecoveryIdentityFields(preview.instance);
+  if (invalidIdentity.length) blockers.push(`Missing or invalid admitted identity fields: ${invalidIdentity.join(", ")}.`);
+  if (!(preview.capacity.stored_serving >= preview.capacity.min_serving)) {
+    blockers.push(`Stored serving count is ${preview.capacity.stored_serving}; minimum required is ${preview.capacity.min_serving}. Recovery cannot proceed below this minimum.`);
+  }
+  return blockers;
 }
 
 export function recoveryReviewKey(preview: TrinoRecoveryPreview): string {

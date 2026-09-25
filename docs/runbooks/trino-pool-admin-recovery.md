@@ -30,6 +30,15 @@ Automatic inventory and preview polling stops when the API returns `404` or
 `503`. Use the corresponding refresh button after recovery becomes available.
 Authentication and permission failures also stop polling; restore access first.
 
+After selecting an instance, the recovery action remains visible when it cannot
+be used. The preview lists each failed prerequisite: a phase other than
+`DRAINING`, a frozen pool, missing or invalid admitted identity fields, or a
+stored serving count below the minimum. The capacity message shows both counts.
+A draining phase alone does not make an instance eligible. Do not bypass the
+minimum by editing lifecycle records. Restore sufficient serving capacity before
+requesting recovery. Existing requests and retired instances show their status
+with the new-request action disabled.
+
 Before submitting, complete the independent checks above, enter a short reason,
 type the exact instance ID, and acknowledge both those checks and the potential
 loss of results. The confirmation applies to the displayed process identity and
