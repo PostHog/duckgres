@@ -3,6 +3,8 @@ package trino
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 )
 
 // Temporary diagnostic branch only. Whitelist numeric counters and engine
@@ -61,7 +63,23 @@ func printDiagnosticProfile(body []byte) {
 	walk(document["outputStage"])
 	output := map[string]any{"queryId": document["queryId"], "totals": pick(document["queryStats"], keys), "stages": stages}
 	encoded, err := json.Marshal(output)
-	if err == nil {
-		fmt.Printf("DISTINCT_PROFILE %s\n", encoded)
+	if err != nil {
+		return
+	}
+	// Successful non-verbose go tests suppress stdout, so retain the sanitized
+	// profile directly alongside the scenario artifacts.
+	directory := os.Getenv("DUCKGRES_SCENARIO_OUTPUT_BASE")
+	if directory == "" {
+		return
+	}
+	file, err := os.OpenFile(filepath.Join(directory, "distinct-profiles.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		fmt.Println("Diagnostic profile file unavailable")
+		return
+	}
+	_, writeErr := file.Write(append(encoded, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		fmt.Println("Diagnostic profile write failed")
 	}
 }
