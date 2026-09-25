@@ -68,10 +68,12 @@ func printDiagnosticProfile(body []byte) {
 	}
 	// Successful non-verbose go tests suppress stdout, so retain the sanitized
 	// profile directly alongside the scenario artifacts.
-	directory := os.Getenv("DUCKGRES_SCENARIO_OUTPUT_BASE")
-	if directory == "" {
+	base := os.Getenv("DUCKGRES_SCENARIO_OUTPUT_BASE")
+	runID := os.Getenv("DUCKGRES_SCENARIO_RUN_ID")
+	if base == "" || runID == "" {
 		return
 	}
+	directory := filepath.Join(base, runID)
 	file, err := os.OpenFile(filepath.Join(directory, "distinct-profiles.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		fmt.Println("Diagnostic profile file unavailable")
