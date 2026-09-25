@@ -210,8 +210,8 @@ execute query tasks (`node-scheduler.include-coordinator=false`) and is
 additional Trino control-plane overhead rather than part of the matched
 execution budget.
 
-The isolated lane explicitly sets `task.max-worker-threads=8` and
-`task.min-drivers=16` per worker, four times the pinned engine's expected
+The isolated lane explicitly sets `task.max-worker-threads=24` and
+`task.min-drivers=48` per worker, twelve times the pinned engine's expected
 one-CPU defaults of 2 and 4. The latter is a leaf-driver target, not a hard
 limit or a count of simultaneous storage requests. These settings apply to
 both the isolated Trino E2E suite and `posthog_frozen_perf`; they do not change
