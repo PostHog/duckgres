@@ -31,7 +31,9 @@ Before submitting, complete the independent checks above, enter a short reason,
 type the exact instance ID, and acknowledge both those checks and the potential
 loss of results. The confirmation applies to the displayed process identity and
 generation, not merely to a reusable coordinator name. A changed snapshot requires
-new confirmation.
+new confirmation; the UI explains when it resets the confirmation fields.
+Background preview polling does not prevent editing those fields. Submission
+requires a fresh preview, and an expired preview requires an explicit refresh.
 
 The UI uses the same recovery API documented below; it does not bypass its guards.
 An accepted request is immutable. The progress view follows the original request
@@ -121,6 +123,23 @@ Unexpected server errors require checking the control-plane logs and durable ope
 Leader changes or a crash between Gateway and local writes must resume the recorded operation.
 Do not hand-edit Gateway or Duckgres rows, borrow another leader's epoch, cancel queries as a substitute for recovery, or delete pods independently.
 If progress stops, diagnose the recorded operation and ownership fences; do not bypass them.
+
+### Resolve an ambiguous conflict
+
+If a submission has an unknown outcome and an identical retry returns `409`,
+stop retrying and preserve the original operation ID and payload. A conflict
+does not cancel an earlier request or prove that no request can still commit.
+For example, a retry can reach the server before the original submission while
+the pool has insufficient capacity; the original can arrive after capacity recovers.
+
+Use **Refresh preview** to check the recorded request and current identity.
+If a request exists, follow that recorded operation. If none appears, inspect
+the control-plane logs and durable operation state using the original operation
+ID, cell, and instance. Confirm the original submission's outcome before deciding
+whether another authorization is appropriate. Use the API procedure above only
+after that investigation; it is not a bypass for an unresolved submission.
+Do not clear browser storage or create a new operation merely to remove the
+conflict warning. The UI deliberately preserves uncertainty across reloads.
 
 ## Rollback
 

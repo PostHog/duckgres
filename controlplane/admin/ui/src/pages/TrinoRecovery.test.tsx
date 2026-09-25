@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -32,7 +32,7 @@ function preview() {
 
 function mount(cell = "pool-a") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><TrinoRecovery cell={cell} /></QueryClientProvider>);
+  return { ...render(<QueryClientProvider client={client}><TrinoRecovery cell={cell} /></QueryClientProvider>), client };
 }
 
 async function selectInstance() {
@@ -49,6 +49,7 @@ async function confirmRecovery() {
 }
 
 describe("Trino recovery", () => {
+  afterEach(() => vi.restoreAllMocks());
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
@@ -296,5 +297,75 @@ describe("Trino recovery", () => {
     await act(async () => { rejectOld?.(new ApiError(409, "changed")); });
     const key = Object.keys(sessionStorage).find((entry) => entry.startsWith("trino-recovery:"));
     expect(JSON.parse(sessionStorage.getItem(key!)!).mayHaveBeenAccepted).toBe(true);
+  });
+
+  it("keeps the focused form editable during a background preview refresh while blocking submission", async () => {
+    const page = mount();
+    await selectInstance();
+    await confirmRecovery();
+    const reason = screen.getByLabelText("Reason");
+    await userEvent.click(reason);
+    let resolveRead: ((value: unknown) => void) | undefined;
+    mocks.trinoRecovery.mockReturnValue(new Promise((resolve) => { resolveRead = resolve; }));
+    await act(async () => { void page.client.refetchQueries({ queryKey: ["trino-recovery"] }); });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled());
+    expect(reason).toBeEnabled();
+    expect(reason).toHaveFocus();
+    expect(screen.getByLabelText("Type the instance ID")).toBeEnabled();
+    expect(screen.getByRole("checkbox", { name: /retained results/ })).toBeEnabled();
+    await userEvent.type(reason, " after review");
+    await act(async () => { resolveRead?.(preview()); });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeEnabled());
+    expect(reason).toHaveValue("Retire a blocked instance after review");
+    expect(reason).toHaveFocus();
+    expect(mocks.requestTrinoRecovery).not.toHaveBeenCalled();
+  });
+
+  it("explains a stale preview when a previously enabled submit button is clicked", async () => {
+    mount();
+    await selectInstance();
+    await confirmRecovery();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 31_000);
+    fireEvent.click(screen.getByRole("button", { name: "Request destructive recovery" }));
+    expect(await screen.findByText(/preview is stale.*refresh preview/i)).toBeInTheDocument();
+    expect(screen.getByLabelText("Reason")).toHaveValue("Retire a blocked instance");
+    expect(mocks.requestTrinoRecovery).not.toHaveBeenCalled();
+  });
+
+  it("explains why background capacity changes reset the confirmation", async () => {
+    const page = mount();
+    await selectInstance();
+    expect(screen.queryByText(/preview changed/i)).not.toBeInTheDocument();
+    await confirmRecovery();
+    const changed = preview();
+    changed.capacity.desired_instances = 4;
+    mocks.trinoRecovery.mockResolvedValue(changed);
+    await act(async () => { await page.client.refetchQueries({ queryKey: ["trino-recovery"] }); });
+    await waitFor(() => expect(screen.getByLabelText("Type the instance ID")).toHaveValue(""));
+    expect(await screen.findByText(/preview changed.*confirm again/i)).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /retained results/ })).not.toBeChecked();
+    expect(mocks.requestTrinoRecovery).not.toHaveBeenCalled();
+  });
+
+  it("gives actionable investigation guidance for an ambiguous 409 without clearing the original operation", async () => {
+    mocks.requestTrinoRecovery.mockRejectedValueOnce(new ApiError(0, "connection lost")).mockRejectedValue(new ApiError(409, "changed"));
+    mount();
+    await selectInstance();
+    await confirmRecovery();
+    await userEvent.click(screen.getByRole("button", { name: "Request destructive recovery" }));
+    await screen.findByText(/acceptance is unknown/i);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Retry identical request" })).toBeEnabled());
+    await userEvent.click(screen.getByRole("button", { name: "Retry identical request" }));
+    await screen.findByText(/identity or recorded intent changed/i);
+    expect(await screen.findByText(/stop retrying.*original operation/i)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open recorded recovery status" })).toHaveAttribute("href", "/api/v1/trino/instances/instance-a/recovery?cell=pool-a");
+    expect(screen.getByRole("link", { name: "Ambiguous-conflict runbook" })).toHaveAttribute("href", "https://github.com/PostHog/duckgres/blob/main/docs/runbooks/trino-pool-admin-recovery.md#resolve-an-ambiguous-conflict");
+    expect(screen.queryByRole("button", { name: "Review a new preview" })).not.toBeInTheDocument();
+    const key = Object.keys(sessionStorage).find((entry) => entry.startsWith("trino-recovery:"));
+    const saved = JSON.parse(sessionStorage.getItem(key!)!);
+    expect(saved.mayHaveBeenAccepted).toBe(true);
+    expect(saved.body).toEqual(mocks.requestTrinoRecovery.mock.calls[0][1]);
+    expect(mocks.requestTrinoRecovery).toHaveBeenCalledTimes(2);
   });
 });

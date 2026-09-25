@@ -98,8 +98,17 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
   const rejected = !mayHaveBeenAccepted && (saved.request?.mayHaveBeenAccepted === false ||
     (errorStatus !== undefined && [400, 401, 403, 404, 409].includes(errorStatus)));
   const recorded = snapshot?.request;
+  const reviewKey = snapshot ? recoveryReviewKey(snapshot) : undefined;
+  const previousReviewKey = useRef<string>();
+  useEffect(() => {
+    if (reviewKey && previousReviewKey.current && reviewKey !== previousReviewKey.current && !pending && !recorded) {
+      setNotice("The preview changed. Review the updated identity and capacity, then confirm again. No request was sent.");
+    }
+    if (reviewKey) previousReviewKey.current = reviewKey;
+  }, [reviewKey, pending, recorded]);
   const complete = snapshot && recoveryComplete(snapshot.instance.phase);
   const uncertain = pending && !recorded && !rejected && !complete && !mutation.isSuccess;
+  const ambiguousConflict = uncertain && errorStatus === 409;
   const denied = accessDenied || recoveryAccessDenied(preview.error);
   const fresh = !!snapshot && !denied && !preview.isFetching && !preview.error && Date.now() - preview.dataUpdatedAt < RECOVERY_PREVIEW_MAX_AGE_MS;
 
@@ -125,7 +134,12 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
   }
 
   async function start(reason: string) {
-    if (submitting.current || !fresh || !snapshot || !recoveryAllowed(snapshot) || pending || Date.now() - preview.dataUpdatedAt >= RECOVERY_PREVIEW_MAX_AGE_MS) return;
+    if (submitting.current || !snapshot || !recoveryAllowed(snapshot) || pending || denied) return;
+    if (Date.now() - preview.dataUpdatedAt >= RECOVERY_PREVIEW_MAX_AGE_MS) {
+      setNotice("The preview is stale. Click Refresh preview, review the current identity and capacity, then submit again. No request was sent.");
+      return;
+    }
+    if (!fresh) return;
     submitting.current = true;
     setChecking(true);
     setNotice("");
@@ -188,26 +202,36 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
       {pending && !recorded && !complete && <div className="space-y-2 rounded border p-3">
         <p>Operation: <code>{pending.operation_id}</code></p>
         {mutation.isPending ? <p>Submitting recovery request…</p> : mutation.isSuccess ?
-          <p>Recovery accepted. Waiting for its recorded status.</p> : uncertain ?
+          <p>Recovery accepted. Waiting for its recorded status.</p> : uncertain && !ambiguousConflict ?
             <p>Acceptance is unknown. After a successful preview refresh, you can explicitly retry the identical request. Do not start a different operation.</p> : null}
         {mutation.error && <p role="alert">{recoveryError(mutation.error)}</p>}
-        {!rejected && <Button variant="outline" disabled={mutation.isPending || !fresh || (!mutation.isIdle && !readBackReady) || !!localError || mutation.isSuccess || denied}
+        {ambiguousConflict && <div className="space-y-2">
+          <p>Stop retrying and preserve the original operation. A conflict does not prove that the earlier request was rejected. Inspect the recorded recovery status and control-plane logs before continuing. Do not clear this tab&apos;s saved request or create another operation.</p>
+          <p className="flex flex-wrap gap-4">
+            <a className="underline" href={`/api/v1/trino/instances/${encodeURIComponent(instance)}/recovery?cell=${encodeURIComponent(cell)}`} target="_blank" rel="noreferrer">Open recorded recovery status</a>
+            <a className="underline" href="https://github.com/PostHog/duckgres/blob/main/docs/runbooks/trino-pool-admin-recovery.md#resolve-an-ambiguous-conflict" target="_blank" rel="noreferrer">Ambiguous-conflict runbook</a>
+          </p>
+        </div>}
+        {!rejected && !ambiguousConflict && <Button variant="outline" disabled={mutation.isPending || !fresh || (!mutation.isIdle && !readBackReady) || !!localError || mutation.isSuccess || denied}
           onClick={() => submit(pending)}>Retry identical request</Button>}
         {rejected && !recorded && <Button variant="outline" disabled={!fresh} onClick={reviewAgain}>Review a new preview</Button>}
       </div>}
       {!pending && !recorded && !complete && (recoveryAllowed(snapshot) ?
-        <RecoveryForm key={recoveryReviewKey(snapshot)} instance={instance} disabled={!fresh || checking || !!localError} onSubmit={start} /> :
+        <RecoveryForm key={reviewKey} instance={instance} disabled={denied || checking || !!localError}
+          submitDisabled={!fresh} onSubmit={start} /> :
         <p>Recovery requires a DRAINING instance with a complete admitted identity, an unfrozen pool, and stored serving capacity at or above the minimum.</p>)}
     </>}
     <p className="text-xs text-muted-foreground">Recovery may lose retained results and continuations. Accepted requests are immutable. This tab saves the exact request for manual retries; it never automatically submits or retries recovery.</p>
   </section>;
 }
 
-function RecoveryForm({ instance, disabled, onSubmit }: { instance: string; disabled: boolean; onSubmit: (reason: string) => void }) {
+function RecoveryForm({ instance, disabled, submitDisabled, onSubmit }: {
+  instance: string; disabled: boolean; submitDisabled: boolean; onSubmit: (reason: string) => void;
+}) {
   const [reason, setReason] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
-  const ready = !disabled && acknowledged && confirmation === instance && validRecoveryReason(reason);
+  const ready = !disabled && !submitDisabled && acknowledged && confirmation === instance && validRecoveryReason(reason);
   return <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); if (ready) onSubmit(reason); }}>
     <label className="block space-y-1"><span>Reason</span><Input value={reason} maxLength={256} disabled={disabled}
       onChange={(event) => setReason(event.target.value)} /></label>
