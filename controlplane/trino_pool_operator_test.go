@@ -3691,3 +3691,10 @@ func TestOnlyADefiniteRefusalClosesAnOccurrence(t *testing.T) {
 		})
 	}
 }
+
+func (f *fakePoolGateway) GetDrainCandidates(context.Context, string, string, string) ([]trinogateway.DrainQueryCandidate, error) {
+	return nil, nil
+}
+func (f *fakePoolGateway) ReconcileQueries(context.Context, string, string, trinogateway.ReconcileQueriesRequest) (trinogateway.ReconcileQueriesResult, error) {
+	return trinogateway.ReconcileQueriesResult{}, nil
+}

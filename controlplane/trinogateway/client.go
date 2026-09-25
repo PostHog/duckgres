@@ -357,3 +357,17 @@ func (c *Client) doRaw(ctx context.Context, method, path string, body []byte, co
 	}
 	return nil
 }
+
+// GetDrainCandidates pages only query obligations eligible for absence checks.
+func (c *Client) GetDrainCandidates(ctx context.Context, poolID, instanceID, after string) ([]DrainQueryCandidate, error) {
+	var candidates []DrainQueryCandidate
+	path := c.memberPath(poolID, instanceID) + "/drain-candidates?after=" + url.QueryEscape(after)
+	err := c.do(ctx, http.MethodGet, path, nil, &candidates)
+	return candidates, err
+}
+
+func (c *Client) ReconcileQueries(ctx context.Context, poolID, instanceID string, request ReconcileQueriesRequest) (ReconcileQueriesResult, error) {
+	var result ReconcileQueriesResult
+	err := c.do(ctx, http.MethodPost, c.memberPath(poolID, instanceID)+"/reconcile-queries", request, &result)
+	return result, err
+}
