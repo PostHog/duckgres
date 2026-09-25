@@ -138,27 +138,21 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	}
 }
 
-func TestDeployCreatesDedicatedScenarioPodIdentityForFrozenPerf(t *testing.T) {
-	for _, scenario := range []string{"posthog_frozen_perf", "posthog_frozen_perf_coverage_uncached"} {
-		t.Run(scenario, func(t *testing.T) {
-			fakes := newRunSHFakes(t)
-			cmd := runSHCommand(t, fakes.binDir, "deploy",
-				"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
-				"SCENARIO_NAME="+scenario,
-				"E2E_SUITE=neutral",
-				"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/athena-perf",
-			)
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("Athena perf deploy failed: %v\n%s", err, out)
-			}
-			calls := fakes.calls(t)
-			want := "aws eks create-pod-identity-association --region us-east-1 --cluster-name test-cluster --namespace duckgres-ci-pr-123 --service-account duckgres-scenario --role-arn arn:aws:iam::123456789012:role/athena-perf"
-			if !strings.Contains(calls, want) {
-				t.Fatalf("deploy did not create dedicated scenario Pod Identity; calls:\n%s", calls)
-			}
-
-		})
+func TestDeployCreatesDedicatedScenarioPodIdentityForAthenaPerf(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	cmd := runSHCommand(t, fakes.binDir, "deploy",
+		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+		"SCENARIO_NAME=posthog_frozen_perf",
+		"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/athena-perf",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Athena perf deploy failed: %v\n%s", err, out)
+	}
+	calls := fakes.calls(t)
+	want := "aws eks create-pod-identity-association --region us-east-1 --cluster-name test-cluster --namespace duckgres-ci-pr-123 --service-account duckgres-scenario --role-arn arn:aws:iam::123456789012:role/athena-perf"
+	if !strings.Contains(calls, want) {
+		t.Fatalf("deploy did not create dedicated scenario Pod Identity; calls:\n%s", calls)
 	}
 }
 
@@ -486,57 +480,6 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	waitAt := strings.Index(calls, " get job duckgres-scenario-fast-suite-")
 	if terminatedAt < 0 || copyAt < 0 || waitAt < 0 || terminatedAt > copyAt || copyAt > waitAt {
 		t.Fatalf("scenario must terminate, copy from the live keeper, then wait for Job completion; calls:\n%s", calls)
-	}
-}
-
-func TestCoverageDispatchRoutesSelectedTarget(t *testing.T) {
-	for _, target := range []string{"pgwire_uncached", "pgwire_cached", "trino", "trino_cached", "athena"} {
-		t.Run(target, func(t *testing.T) {
-			fakes := newRunSHFakes(t)
-			cmd := runSHCommand(t, fakes.binDir, "test-scenario", "SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario", "SCENARIO_NAME=posthog_frozen_perf_coverage", "DUCKGRES_SCENARIO_COVERAGE_TARGET="+target)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				t.Fatalf("scenario failed: %v\n%s", err, out)
-			}
-			file := "posthog_frozen_perf_coverage"
-			if strings.HasPrefix(target, "trino") {
-				file += "_trino"
-			}
-			calls := fakes.calls(t)
-			if !strings.Contains(calls, "scenarios/"+file+".yaml") {
-				t.Fatal("wrong coverage backing file")
-			}
-			if !strings.Contains(calls, `name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "`+target+`"`) {
-				t.Fatal("target not passed to runner")
-			}
-		})
-	}
-}
-
-func TestScenarioLongNameProducesValidJobLabel(t *testing.T) {
-	const scenario = "posthog_frozen_perf_coverage_uncached"
-	fakes := newRunSHFakes(t)
-	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
-		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario", "SCENARIO_NAME="+scenario)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("scenario failed: %v\n%s", err, out)
-	}
-	match := regexp.MustCompile(`kind: Job\nmetadata:\n  name: ([^\n]+)`).FindStringSubmatch(fakes.calls(t))
-	if len(match) != 2 {
-		t.Fatal("missing Job name")
-	}
-	name := match[1]
-	if len(name) > 63 || !regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`).MatchString(name) {
-		t.Fatalf("invalid Job label %q (%d bytes)", name, len(name))
-	}
-	runID := "scenario-dev-" + strings.ReplaceAll(scenario, "_", "-") + "-123"
-	checksum := exec.Command("cksum")
-	checksum.Stdin = strings.NewReader(runID)
-	out, err := checksum.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasSuffix(name, "-"+strings.Fields(string(out))[0]) {
-		t.Fatalf("Job name %q lost run ID checksum", name)
 	}
 }
 

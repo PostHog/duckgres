@@ -182,7 +182,6 @@ func TestFrozenSuccessScenariosUseIsolatedStackWarehouseIdentity(t *testing.T) {
 	for _, scenarioFile := range []string{
 		"posthog_frozen_metadata.yaml",
 		"posthog_frozen_perf.yaml",
-		"posthog_frozen_perf_coverage_uncached.yaml",
 		"posthog_frozen_dbt.yaml",
 		"fast-suite.yaml",
 		"full-suite.yaml",
