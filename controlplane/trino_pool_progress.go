@@ -34,15 +34,31 @@ import (
 // this process writes can land anyway. This is the isolation the tenant loop
 // already applies.
 func (o *trinoPoolOperator) progressInstances(ctx context.Context, instances []configstore.TrinoPoolInstance) (bool, error) {
+	recoveries, err := o.recoveryRequests(ctx)
+	if err != nil {
+		return true, err
+	}
 	var failures []error
 	for _, instance := range instances {
 		phase := trinopool.Phase(instance.Phase)
 		if phase.Terminal() {
 			continue
 		}
-		progressed, err := o.progressInstance(ctx, instance)
+		var progressed bool
+		if recovery, ok := recoveries[instance.InstanceID]; ok {
+			progressed, err = o.recoverInstance(ctx, instance, recovery)
+		} else {
+			progressed, err = o.progressInstance(ctx, instance)
+		}
 		if err != nil {
 			failures = append(failures, fmt.Errorf("instance %s: %w", instance.InstanceID, err))
+			if _, recovering := recoveries[instance.InstanceID]; recovering && !o.fenced {
+				checkpointErr := o.store.RecordTrinoPoolInstanceFields(ctx, o.lease, instance.InstanceID,
+					map[string]any{"last_error": configstore.TrinoPoolRecoveryBlockedMessage})
+				if checkpointErr != nil {
+					failures = append(failures, o.dropAuthority(checkpointErr))
+				}
+			}
 			if o.fenced {
 				return true, errors.Join(failures...)
 			}

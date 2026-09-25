@@ -319,6 +319,8 @@ func registerTrinoAPI(r *gin.RouterGroup, api *TrinoAPI) {
 		registerTrinoFleetAPI(r, api)
 		return
 	}
+	r.GET("/trino/instances/:id/recovery", api.handleRecoveryPreview)
+	r.POST("/trino/instances/:id/recovery", api.handleRequestRecovery)
 	r.GET("/trino/status", api.handleStatus)
 	r.GET("/trino/queries", api.handleQueries)
 	r.GET("/trino/queries/:id", api.handleQueryDetail)

@@ -274,6 +274,7 @@ column cannot be added to a populated table).
 - [Dev Scenario Runner](docs/runbooks/scenario-dev.md): Scheduled and manually dispatched scenario runs against the configured dev environment.
 - [Control Plane Rollout](docs/runbooks/control-plane-rollout.md): Zero-downtime deployment process for the control plane itself.
 - [Org Connection Admission](docs/runbooks/org-connection-admission.md): Global vCPU admission, exact cleanup ownership, failure recovery, and operational metrics.
+- [Trino Pool Administrative Recovery](docs/runbooks/trino-pool-admin-recovery.md): Explicitly authorized failure retirement of one draining instance, with preview and resumable operator execution.
 - [Managed Warehouse Provisioning Recovery](docs/runbooks/managed-warehouse-provisioning-recovery.md): Diagnose a failed warehouse whose Duckling dependencies were repaired and verify automatic convergence back to ready.
 - [Managed Warehouse Deprovision](docs/runbooks/managed-warehouse-deprovision.md): Destructive teardown process for managed warehouse infrastructure and org cleanup.
 - [Resharding Operations](docs/runbooks/resharding.md): Runner recovery, durable respawn reset, safety checks, and local verification.
