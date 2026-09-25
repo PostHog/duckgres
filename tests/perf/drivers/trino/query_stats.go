@@ -443,7 +443,8 @@ func (c *statsCollector) fetchQueryInfo(ctx context.Context, queryID string) (Qu
 func (c *statsCollector) readQueryInfo(ctx context.Context, queryID string) (QueryInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.options.Timeout)
 	defer cancel()
-	endpoint := c.baseURL + "/v1/query/" + url.PathEscape(queryID) + "?pruned=true"
+	diagnostic := os.Getenv("DUCKGRES_TRINO_DIAGNOSTIC_PROFILE") == "1"
+	endpoint := c.baseURL + "/v1/query/" + url.PathEscape(queryID) + "?pruned=" + strconv.FormatBool(!diagnostic)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return QueryInfo{}, queryInfoError{reason: "build query info request"}
@@ -475,6 +476,9 @@ func (c *statsCollector) readQueryInfo(ctx context.Context, queryID string) (Que
 	}
 	if info.QueryID != queryID {
 		return QueryInfo{}, queryInfoError{reason: "query info answered for a different query"}
+	}
+	if diagnostic && info.Final {
+		printDiagnosticProfile(body)
 	}
 	return info, nil
 }

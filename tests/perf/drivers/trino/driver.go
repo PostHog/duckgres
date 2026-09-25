@@ -193,6 +193,10 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	if sqlText == "" {
 		return core.ExecutionResult{}, fmt.Errorf("query %s missing canonical SQL", query.QueryID)
 	}
+	// Temporary diagnostic variant; preserve exact DISTINCT semantics.
+	if strings.HasPrefix(query.QueryID, "distinct_dictionary__") {
+		sqlText = "WITH SESSION dictionary_aggregation = true " + sqlText
+	}
 	execCtx := ctx
 	var capture *queryCapture
 	if d.stats != nil {

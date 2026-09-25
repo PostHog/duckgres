@@ -836,6 +836,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args: ["$scenario_file"]
           env:
+            - { name: DUCKGRES_TRINO_DIAGNOSTIC_PROFILE, value: "1" }
             - { name: DUCKGRES_SCENARIO_API_BASE, value: "$api_base" }
             - { name: DUCKGRES_SCENARIO_INTERNAL_SECRET, value: "$internal_secret" }
             - { name: DUCKGRES_SCENARIO_PG_HOST, value: "$pg" }
