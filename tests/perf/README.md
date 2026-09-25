@@ -2,6 +2,13 @@
 
 This package contains the golden-query performance harness.
 
+Manual-only extended coverage scenarios exercise twelve additional workload shapes in
+`queries/ducklake_posthog_coverage.yaml`. They retain separate `perf-coverage/`
+artifacts and versioned intent IDs. These queries are excluded from standard
+nightly runs and execute only when explicitly dispatched. For the focused uncached DuckDB run,
+baseline recording, runtime estimates, and failure recovery, see the
+[coverage runbook](../../docs/runbooks/perf-coverage.md).
+
 ## Protocol Drivers
 
 Catalogs may target `pgwire`, `pgwire_uncached`, `pgwire_cached`, `trino`, `trino_cached`,
@@ -367,7 +374,7 @@ Both suites of one nightly publish under the same dataset version
 (`posthog-file-views-v1`, shared through a YAML anchor in the scenario), with
 three columns on `runs` and `query_results`:
 
-- `suite` (`tables` | `properties`, a closed set in `core`, validated when the
+- `suite` (`tables` | `properties` | `coverage`, a closed set in `core`, validated when the
   step starts so a typo fails before hours of measurement);
 - `nightly_run_id`, the table-suite run's ID, which pairs a nightly's suites
   explicitly (a standalone run is its own nightly);

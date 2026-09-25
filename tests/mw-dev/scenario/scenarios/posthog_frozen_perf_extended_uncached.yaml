@@ -1,0 +1,84 @@
+name: posthog-frozen-perf-extended-uncached
+run_id_prefix: scenario-frozen-extended-uncached
+required_env:
+  - DUCKGRES_SCENARIO_ORG_ID
+  - DUCKGRES_SCENARIO_FROZEN_S3_URI
+  - DUCKGRES_K8S_WORKER_CPU_REQUEST
+  - DUCKGRES_K8S_WORKER_MEMORY_REQUEST
+steps:
+  - id: provision
+    type: provision_warehouse
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      request:
+        database_name: scenario-frozen-extended-uncached-${run_id_token}
+        team_id: 1
+        metadata_store:
+          type: cnpg-shard
+        ducklake:
+          enabled: true
+        data_store:
+          type: s3bucket
+
+  - id: wait_ready
+    type: wait_warehouse_ready
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      timeout: 15m
+      poll_interval: 10s
+
+  - id: setup_frozen_views
+    type: sql
+    depends_on: [wait_ready]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/setup_frozen_views.sql
+      max_attempts: 12
+      retry_interval: 10s
+
+  - id: setup_posthog_tables
+    type: sql
+    depends_on: [setup_frozen_views]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/setup_posthog_tables.sql
+      max_attempts: 3
+      retry_interval: 10s
+
+  - id: validate_posthog_tables
+    type: sql
+    depends_on: [setup_posthog_tables]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/validate_posthog_tables.sql
+      max_attempts: 3
+      retry_interval: 10s
+
+  - id: validate_coverage
+    type: sql
+    depends_on: [validate_posthog_tables]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      file: ../sql/validate_posthog_coverage.sql
+      max_attempts: 1
+
+  - id: coverage_queries
+    type: perf_queries
+    depends_on: [validate_coverage]
+    with:
+      org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
+      catalog: ducklake
+      catalog_file: ../../../perf/queries/ducklake_posthog_coverage.yaml
+      targets: [pgwire_uncached]
+      run_id: ${run_id}-coverage
+      nightly_run_id: ${run_id}
+      output_subdir: perf-coverage
+      suite: coverage
+      dataset_version: posthog-file-views-v1
+      fail_on_query_errors: true
+      worker_cpu: ${env:DUCKGRES_K8S_WORKER_CPU_REQUEST}
+      worker_memory: ${env:DUCKGRES_K8S_WORKER_MEMORY_REQUEST}

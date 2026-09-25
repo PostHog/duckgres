@@ -76,8 +76,8 @@ func TestDevScenarioWorkflowPreservesIsolationCleanupAndPublishing(t *testing.T)
 	workflow := string(raw)
 
 	for _, required := range []string{
-		"PR_NUMBER: ${{ github.run_id }}",
-		"NAMESPACE: duckgres-ci-pr-${{ github.run_id }}",
+		"PR_NUMBER: ${{ github.run_id }}${{ matrix.id_suffix }}",
+		"NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.id_suffix }}",
 		"- name: Teardown\n        if: always()\n        run: tests/mw-dev/run.sh teardown",
 		"github.ref == 'refs/heads/main'",
 		"--connection-secret-stdin",
