@@ -20,7 +20,34 @@ Use it only with explicit authorization for the exact instance and this loss of 
 - Confirm the selected pool and instance, including the exact coordinator process identity.
   Do not use a logical pool name in place of an individual instance ID.
 
+## Use the admin console
+
+Open **Trino cell**, select the logical cell, and find **Instance recovery**.
+This section requires an admin role. Select an individual instance to load its
+stored-state preview. The list excludes terminal instances and does not report
+live workload or health.
+
+Before submitting, complete the independent checks above, enter a short reason,
+type the exact instance ID, and acknowledge both those checks and the potential
+loss of results. The confirmation applies to the displayed process identity and
+generation, not merely to a reusable coordinator name. A changed snapshot requires
+new confirmation.
+
+The UI uses the same recovery API documented below; it does not bypass its guards.
+An accepted request is immutable. The progress view follows the original request
+even after the instance disappears from the active list. Terminal retirement is
+not evidence that its replacement is already serving.
+
+If the response is lost, use the status check before retrying. The UI preserves
+the original operation and payload for an identical retry. Do not create a new
+operation to bypass a conflict. Consult the API procedure below if browser state
+is unavailable.
+
 ## Preview without changes
+
+`GET /api/v1/trino/instances?cell=<configured-cell-id>` lists nonterminal
+instances for selection. It returns only each instance ID, local phase, Gateway
+state, and phase timestamp. Legacy cells have no shared-pool inventory.
 
 Read `GET /api/v1/trino/instances/<instance-id>/recovery?cell=<configured-cell-id>` through the existing authenticated admin connection.
 The `cell` parameter is the configured public pool ID shown by the admin API.

@@ -1187,6 +1187,25 @@ trino_shared_pool_active() {
 
   log "shared pool OK [structure]: $ready ready instance(s), each with its own service and workers"
 
+  # Validate the recovery UI's read-only contract without authorizing retirement.
+  inventory="$(curl -fsS -H "$H" --get --data-urlencode "cell=$pool" "$API/api/v1/trino/instances")" \
+    || fail "shared pool: recovery inventory request failed"
+  printf %s "$inventory" | jq -e --arg cell "$pool" '
+    .cell == $cell and (.instances | length > 0) and all(.instances[];
+      (keys == ["gateway_state", "instance_id", "phase", "phase_changed_at"])
+      and (.instance_id | type == "string" and length > 0)
+      and .phase != "RETIRED" and .phase != "FAILURE_RETIRED")' >/dev/null \
+    || fail "shared pool: recovery inventory is not scoped and sanitized"
+  recovery_instance="$(printf %s "$inventory" | jq -r '.instances[0].instance_id')"
+  preview="$(curl -fsS -H "$H" --get --data-urlencode "cell=$pool" "$API/api/v1/trino/instances/$recovery_instance/recovery")" \
+    || fail "shared pool: recovery preview request failed"
+  printf %s "$preview" | jq -e --arg cell "$pool" --arg instance "$recovery_instance" '
+    .cell == $cell and .instance.instance_id == $instance and .live_work_verified == false
+    and (.instance | has("blueprint_snapshot") | not)
+    and (.instance | has("endpoint_url") | not)' >/dev/null \
+    || fail "shared pool: recovery preview contract changed"
+  log "shared pool OK [recovery preview]: scoped inventory and stored-state preview; no recovery submitted"
+
   # Tenant admission, when the cell has the Gateway restriction on. This is the
   # user-visible end of the publication barrier: with the gate enabled a
   # warehouse is NOT reported ready until its publication has committed, so a

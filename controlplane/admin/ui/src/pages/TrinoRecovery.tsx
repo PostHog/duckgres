@@ -1,0 +1,223 @@
+import { useEffect, useRef, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useIdentity } from "@/components/IdentityProvider";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { api, ApiError } from "@/lib/api";
+import { POLL } from "@/lib/query";
+import {
+  RECOVERY_PREVIEW_MAX_AGE_MS, readRecoveryRequest, recoveryAccessDenied, recoveryAllowed, recoveryComplete,
+  recoveryError, recoveryIdentity, recoveryReviewKey, recoveryStorageKey, validRecoveryReason,
+} from "@/lib/trinoRecovery";
+import type { TrinoRecoveryBody } from "@/types/api";
+
+export function TrinoRecovery({ cell }: { cell?: string }) {
+  const { isAdmin, me, error, unauthorized } = useIdentity();
+  return (
+    <Card className="mb-4">
+      <CardHeader><CardTitle>Instance recovery</CardTitle></CardHeader>
+      <CardContent className="space-y-4 text-sm">
+        {!isAdmin || error || unauthorized || !me?.email ? <p>Admin role required for instance recovery.</p> : !cell ?
+          <p>Select a logical cell to inspect its instances.</p> : <RecoveryCell key={`${cell}:${me.email}`} cell={cell} actor={me.email} />}
+      </CardContent>
+    </Card>
+  );
+}
+
+function RecoveryCell({ cell, actor }: { cell: string; actor: string }) {
+  const [instance, setInstance] = useState("");
+  const inventory = useQuery({
+    queryKey: ["trino-recovery-instances", actor, cell], queryFn: () => api.trinoInstances(cell),
+    retry: false, refetchInterval: (query) => recoveryAccessDenied(query.state.error) ? false : POLL.slow,
+  });
+  const instances = inventory.data?.cell === cell ? inventory.data.instances : [];
+  return <>
+    <p>Recover an instance that cannot finish draining. This is a destructive failure recovery, not a zero-loss deployment.</p>
+    {inventory.error && <p role="alert">{recoveryError(inventory.error)}</p>}
+    <div className="flex items-center gap-2">
+      <select aria-label="Trino instance" className="h-9 rounded border bg-background px-2" value={instance}
+        disabled={inventory.isLoading || !!inventory.error}
+        onChange={(event) => setInstance(event.target.value)}>
+        <option value="">{inventory.isLoading ? "Loading instances…" : "Choose an instance"}</option>
+        {(instances ?? []).map((entry) => <option key={entry.instance_id} value={entry.instance_id}>
+          {entry.instance_id} · {entry.phase}
+        </option>)}
+        {instance && !instances?.some((entry) => entry.instance_id === instance) &&
+          <option value={instance}>{instance} · not in active inventory</option>}
+      </select>
+      <Button variant="outline" disabled={inventory.isFetching || recoveryAccessDenied(inventory.error)} onClick={() => void inventory.refetch()}>Refresh instances</Button>
+    </div>
+    {inventory.isSuccess && !instances?.length && !instance && <p>No active shared-pool instances.</p>}
+    {instance && !recoveryAccessDenied(inventory.error) && <RecoveryInstance key={instance} cell={cell} instance={instance} actor={actor} />}
+  </>;
+}
+
+function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: string; actor: string }) {
+  const storageKey = recoveryStorageKey(cell, instance, actor);
+  const [saved] = useState(() => {
+    try { return { request: readRecoveryRequest(storageKey), error: "" }; }
+    catch (error) { return { request: null, error: recoveryError(error) }; }
+  });
+  const [pending, setPending] = useState<TrinoRecoveryBody | null>(saved.request?.body ?? null);
+  const [mayHaveBeenAccepted, setMayHaveBeenAccepted] = useState(saved.request?.mayHaveBeenAccepted ?? false);
+  const [localError, setLocalError] = useState(saved.error);
+  const [accessDenied, setAccessDenied] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [readBackReady, setReadBackReady] = useState(false);
+  const [notice, setNotice] = useState("");
+  const submitting = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const preview = useQuery({
+    queryKey: ["trino-recovery", actor, cell, instance], queryFn: () => api.trinoRecovery(instance, cell),
+    retry: false, staleTime: 0, refetchOnMount: "always", enabled: !accessDenied,
+    refetchInterval: (query) => recoveryComplete(query.state.data?.instance.phase ?? "") || recoveryAccessDenied(query.state.error) ? false : POLL.normal,
+  });
+  const snapshot = preview.data?.cell === cell && preview.data.instance.instance_id === instance ? preview.data : undefined;
+  const mutation = useMutation({
+    mutationFn: ({ body }: { body: TrinoRecoveryBody; previouslyUnknown: boolean }) => api.requestTrinoRecovery(instance, body, cell), retry: false,
+    onSettled: async (_data, error, { body, previouslyUnknown }) => {
+      submitting.current = false;
+      if (mounted.current && !previouslyUnknown && error instanceof ApiError && [400, 401, 403, 404, 409].includes(error.status)) {
+        try {
+          sessionStorage.setItem(storageKey, JSON.stringify({ body, mayHaveBeenAccepted: false }));
+          setMayHaveBeenAccepted(false);
+        } catch {
+          setLocalError("Cannot save the rejected request status. Keep the original operation ID and inspect the recorded status.");
+        }
+      }
+      if (recoveryAccessDenied(error)) setAccessDenied(true);
+      else if (mounted.current) await refreshPreview();
+    },
+  });
+  const errorStatus = mutation.error instanceof ApiError ? mutation.error.status : undefined;
+  const rejected = !mayHaveBeenAccepted && (saved.request?.mayHaveBeenAccepted === false ||
+    (errorStatus !== undefined && [400, 401, 403, 404, 409].includes(errorStatus)));
+  const recorded = snapshot?.request;
+  const complete = snapshot && recoveryComplete(snapshot.instance.phase);
+  const uncertain = pending && !recorded && !rejected && !complete && !mutation.isSuccess;
+  const denied = accessDenied || recoveryAccessDenied(preview.error);
+  const fresh = !!snapshot && !denied && !preview.isFetching && !preview.error && Date.now() - preview.dataUpdatedAt < RECOVERY_PREVIEW_MAX_AGE_MS;
+
+  async function refreshPreview() {
+    const result = await preview.refetch();
+    setReadBackReady(!result.error && result.data?.cell === cell && result.data.instance.instance_id === instance);
+    return result;
+  }
+
+  function submit(body: TrinoRecoveryBody) {
+    if (!mounted.current || submitting.current || mutation.isPending || recorded || complete || localError || denied) return;
+    try {
+      sessionStorage.setItem(storageKey, JSON.stringify({ body, mayHaveBeenAccepted: true }));
+    } catch {
+      setLocalError("Cannot save the exact recovery request in this tab. No request was sent. Enable session storage before continuing.");
+      return;
+    }
+    submitting.current = true;
+    setReadBackReady(false);
+    setPending(body);
+    setMayHaveBeenAccepted(true);
+    mutation.mutate({ body, previouslyUnknown: mayHaveBeenAccepted });
+  }
+
+  async function start(reason: string) {
+    if (submitting.current || !fresh || !snapshot || !recoveryAllowed(snapshot) || pending || Date.now() - preview.dataUpdatedAt >= RECOVERY_PREVIEW_MAX_AGE_MS) return;
+    submitting.current = true;
+    setChecking(true);
+    setNotice("");
+    let sent = false;
+    try {
+      const latest = await refreshPreview();
+      if (!mounted.current) return;
+      if (latest.error || latest.data?.cell !== cell || latest.data.instance.instance_id !== instance) return;
+      if (!recoveryAllowed(latest.data) || recoveryReviewKey(latest.data) !== recoveryReviewKey(snapshot)) {
+        setNotice("The preview changed. Review the updated identity and capacity, then confirm again. No request was sent.");
+        return;
+      }
+      submitting.current = false;
+      submit({ ...recoveryIdentity(latest.data.instance), operation_id: crypto.randomUUID(), reason, destructive_authorization: true });
+      sent = true;
+    } catch {
+      setLocalError("Cannot create a secure operation ID. No request was sent.");
+    } finally {
+      if (!sent) submitting.current = false;
+      setChecking(false);
+    }
+  }
+
+  function reviewAgain() {
+    if (!rejected || recorded || !fresh) return;
+    try { sessionStorage.removeItem(storageKey); }
+    catch { setLocalError("Cannot clear the rejected request from this tab."); return; }
+    setPending(null);
+    mutation.reset();
+    void refreshPreview();
+  }
+
+  return <section className="space-y-4" aria-label="Recovery preview">
+    <Button variant="outline" disabled={preview.isFetching || denied} onClick={() => void refreshPreview()}>Refresh preview</Button>
+    {preview.isLoading && <p>Loading recovery preview…</p>}
+    {preview.error && <p role="alert">{recoveryError(preview.error)} The previous preview cannot authorize a new request.</p>}
+    {localError && <p role="alert">{localError}</p>}
+    {notice && <p role="status">{notice}</p>}
+    {snapshot && <>
+      <p className="rounded border border-warning/40 p-3">This stored snapshot does not verify live workload or capacity. Check workload and remaining capacity before requesting recovery. The operator verifies its safety gates separately.</p>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+        <dt>Cell</dt><dd>{cell}</dd>
+        <dt>Instance</dt><dd>{instance}</dd>
+        <dt>Phase</dt><dd>{snapshot.instance.phase}</dd>
+        <dt>Gateway state</dt><dd>{snapshot.instance.gateway_state || "unknown"}</dd>
+        {Object.entries(recoveryIdentity(snapshot.instance)).map(([key, value]) =>
+          <div key={key} className="contents"><dt>{key}</dt><dd className="break-all font-mono">{value || "missing"}</dd></div>)}
+        <dt>Phase changed</dt><dd>{snapshot.instance.phase_changed_at}</dd>
+        <dt>Stored serving / minimum / desired</dt><dd>{snapshot.capacity.stored_serving} / {snapshot.capacity.min_serving} / {snapshot.capacity.desired_instances}</dd>
+        <dt>Pool frozen</dt><dd>{snapshot.capacity.frozen ? "yes" : "no"}</dd>
+      </dl>
+      {snapshot.instance.last_error && <p role="alert">{snapshot.instance.last_error}</p>}
+      {complete && <p role="status">{snapshot.instance.phase === "FAILURE_RETIRED" ? "Recovery completed: FAILURE_RETIRED." : "Normal retirement completed: RETIRED."} Verify replacement instances are serving.</p>}
+      {recorded && <div className="space-y-1 rounded border p-3" role="status">
+        <p>Recovery request recorded. It cannot be cancelled or amended.</p>
+        <p>Operation: <code>{recorded.operation_id}</code></p>
+        <p>Requested by: {recorded.requested_by} · {recorded.created_at}</p>
+        <p>Reason: {recorded.reason}</p>
+      </div>}
+      {pending && !recorded && !complete && <div className="space-y-2 rounded border p-3">
+        <p>Operation: <code>{pending.operation_id}</code></p>
+        {mutation.isPending ? <p>Submitting recovery request…</p> : mutation.isSuccess ?
+          <p>Recovery accepted. Waiting for its recorded status.</p> : uncertain ?
+            <p>Acceptance is unknown. After a successful preview refresh, you can explicitly retry the identical request. Do not start a different operation.</p> : null}
+        {mutation.error && <p role="alert">{recoveryError(mutation.error)}</p>}
+        {!rejected && <Button variant="outline" disabled={mutation.isPending || !fresh || (!mutation.isIdle && !readBackReady) || !!localError || mutation.isSuccess || denied}
+          onClick={() => submit(pending)}>Retry identical request</Button>}
+        {rejected && !recorded && <Button variant="outline" disabled={!fresh} onClick={reviewAgain}>Review a new preview</Button>}
+      </div>}
+      {!pending && !recorded && !complete && (recoveryAllowed(snapshot) ?
+        <RecoveryForm key={recoveryReviewKey(snapshot)} instance={instance} disabled={!fresh || checking || !!localError} onSubmit={start} /> :
+        <p>Recovery requires a DRAINING instance with a complete admitted identity, an unfrozen pool, and stored serving capacity at or above the minimum.</p>)}
+    </>}
+    <p className="text-xs text-muted-foreground">Recovery may lose retained results and continuations. Accepted requests are immutable. This tab saves the exact request for manual retries; it never automatically submits or retries recovery.</p>
+  </section>;
+}
+
+function RecoveryForm({ instance, disabled, onSubmit }: { instance: string; disabled: boolean; onSubmit: (reason: string) => void }) {
+  const [reason, setReason] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const [acknowledged, setAcknowledged] = useState(false);
+  const ready = !disabled && acknowledged && confirmation === instance && validRecoveryReason(reason);
+  return <form className="space-y-3" onSubmit={(event) => { event.preventDefault(); if (ready) onSubmit(reason); }}>
+    <label className="block space-y-1"><span>Reason</span><Input value={reason} maxLength={256} disabled={disabled}
+      onChange={(event) => setReason(event.target.value)} /></label>
+    <p className="text-xs text-muted-foreground">Required, maximum 256 UTF-8 bytes. Do not include credentials or query text.</p>
+    <label className="block space-y-1"><span>Type the instance ID</span><Input value={confirmation} disabled={disabled}
+      onChange={(event) => setConfirmation(event.target.value)} autoComplete="off" /></label>
+    <label className="flex items-start gap-2"><input type="checkbox" checked={acknowledged} disabled={disabled}
+      onChange={(event) => setAcknowledged(event.target.checked)} />
+      <span>I authorize destructive recovery and accept losing retained results and continuations on this instance. I checked its workload and remaining capacity.</span>
+    </label>
+    <Button variant="destructive" type="submit" disabled={!ready}>Request destructive recovery</Button>
+  </form>;
+}
