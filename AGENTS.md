@@ -16,6 +16,7 @@
 
 ##  Testing
 
+- Perftest query and coverage additions are exempt from the TDD requirement: do not add tests solely to test perftests. Only make minimal compatibility updates to existing tests when needed.
 - Tests should model realistic user behavior, not work around current service limitations.
 - If a test exposes a platform bug, report the bug with exact failure details instead of fixing the test.
 
