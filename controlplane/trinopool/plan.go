@@ -22,10 +22,11 @@ type InstanceView struct {
 	SpecOutdated bool
 	// RolloutBlocked retains capacity accounting but excludes a member with unreadable rollout evidence.
 	RolloutBlocked bool
-	// Repair marks an instance created against the failure-repair budget rather
-	// than the planned surge budget. The two budgets are separate so a failure
-	// during a release rollout does not stall capacity restoration.
+	// Repair marks an instance created against the capacity-repair budget.
+	// Its slot stays charged until the instance retires, including while serving.
 	Repair bool
+	// RepairFor reserves a replacement target until this repair is retired.
+	RepairFor string
 	// CreatedAt orders drain candidates deterministically; zero is fine, ID is
 	// the tiebreaker.
 	CreatedAt int64
@@ -53,7 +54,7 @@ type Plan struct {
 	Action     PlanAction
 	InstanceID string
 	Repair     bool
-	// RepairFor names the failed instance a repair replaces. The Gateway
+	// RepairFor names the unavailable instance a repair replaces. The Gateway
 	// charges an activation to the repair budget only when it is set, so a
 	// repair without it silently spends the single planned surge instead.
 	RepairFor string
@@ -79,41 +80,35 @@ func PlanNext(state PoolState) Plan {
 		return Plan{Action: PlanActionNone, Reason: "pool has no desired instance count"}
 	}
 
-	var live, healthy, serving, preparing, repairing, draining int
+	var live, serving, preparing, repairing, draining int
 	for _, instance := range state.Instances {
 		if !instance.Phase.OccupiesCapacity() {
 			continue
 		}
 		live++
-		switch instance.Phase {
-		case PhaseSuspect, PhaseLost, PhaseFailedPreparing:
-			// Still holds a pod, but cannot be counted on to serve. A failed
-			// candidate is in this group until its cleanup completes: counting
-			// it as healthy would hide the capacity deficit it caused.
-		default:
-			healthy++
+		if instance.Repair {
+			repairing++
 		}
 		if instance.Phase.Serving() {
 			serving++
 		}
 		if preServing(instance.Phase) {
 			preparing++
-			if instance.Repair {
-				repairing++
-			}
 		}
 		if instance.Phase == PhaseDraining || instance.Phase == PhaseSealed || instance.Phase == PhaseRetiring {
 			draining++
 		}
 	}
 
-	// 2. Capacity deficit. Counting `preparing` here is what keeps a slow
-	// replacement from being duplicated every tick.
-	if deficit := state.DesiredInstances - healthy; deficit > preparing {
-		// Filling an empty pool needs no special budget. Only a deficit caused
-		// by instances that still HOLD a slot while being unable to serve
-		// (SUSPECT/LOST, pods not yet verified absent) needs the repair budget,
-		// because the replacement necessarily runs above the desired count.
+	// A candidate must resolve before another create starts, including capacity repairs.
+	if preparing > 0 {
+		return Plan{Action: PlanActionNone, Reason: "an instance is already preparing"}
+	}
+
+	// Departing instances keep their compute slots but cannot satisfy serving capacity.
+	if serving < max(state.DesiredInstances, state.MinServing) {
+		// Filling unused normal capacity needs no repair budget.
+		// Unavailable instances retain their slots until retirement completes.
 		if live < state.DesiredInstances {
 			return Plan{Action: PlanActionCreate, Reason: "creating an instance to reach the desired instance count"}
 		}
@@ -123,17 +118,18 @@ func PlanNext(state PoolState) Plan {
 		if live >= state.DesiredInstances+state.MaxSurge+state.MaxRepair {
 			return Plan{Action: PlanActionNone, Reason: "capacity is short but no live compute slot is free; investigate the failed instances"}
 		}
+		target := repairTarget(state)
+		if target == "" {
+			return Plan{Action: PlanActionNone, Reason: "capacity is short but no unreplaced instance is eligible for repair"}
+		}
 		return Plan{
 			Action: PlanActionCreate, Repair: true,
-			RepairFor: repairTarget(state),
-			Reason:    "restoring capacity lost to a failed instance",
+			RepairFor: target,
+			Reason:    "restoring capacity lost to an unavailable instance",
 		}
 	}
 
 	// 3. One lifecycle operation at a time.
-	if preparing > 0 {
-		return Plan{Action: PlanActionNone, Reason: "an instance is already preparing"}
-	}
 	if draining > 0 {
 		return Plan{Action: PlanActionNone, Reason: "an instance is already draining"}
 	}
@@ -194,14 +190,22 @@ func blockedReason(base, detail string) string {
 	return base + ": " + detail
 }
 
-// repairTarget picks the instance a repair replaces: a PROVEN failure first,
-// because a SUSPECT member may still recover and charging the repair budget for
-// it would spend a budget on a member that never failed. Oldest first, so the
-// choice is stable across leaders.
+// repairTarget prefers lost, then suspect, then departing instances.
+// Stable ID ordering and durable target reservations prevent duplicate repairs.
 func repairTarget(state PoolState) string {
+	replaced := make(map[string]bool)
+	for _, instance := range state.Instances {
+		if instance.Phase.OccupiesCapacity() && instance.RepairFor != "" {
+			replaced[instance.RepairFor] = true
+		}
+	}
 	var suspect string
 	var lost string
+	var departing string
 	for _, instance := range state.Instances {
+		if replaced[instance.ID] {
+			continue
+		}
 		switch instance.Phase {
 		case PhaseLost:
 			if lost == "" || instance.ID < lost {
@@ -211,10 +215,17 @@ func repairTarget(state PoolState) string {
 			if suspect == "" || instance.ID < suspect {
 				suspect = instance.ID
 			}
+		case PhaseDraining, PhaseSealed, PhaseRetiring:
+			if departing == "" || instance.ID < departing {
+				departing = instance.ID
+			}
 		}
 	}
 	if lost != "" {
 		return lost
 	}
-	return suspect
+	if suspect != "" {
+		return suspect
+	}
+	return departing
 }

@@ -181,6 +181,7 @@ func (i TrinoPoolInstance) View() trinopool.InstanceView {
 		Phase:     trinopool.Phase(i.Phase),
 		ReleaseID: i.ReleaseID,
 		Repair:    i.Repair,
+		RepairFor: i.RepairFor,
 		CreatedAt: i.CreatedAt.UnixNano(),
 	}
 }
