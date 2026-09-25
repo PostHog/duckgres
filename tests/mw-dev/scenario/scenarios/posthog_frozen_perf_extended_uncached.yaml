@@ -1,11 +1,6 @@
-name: posthog-frozen-perf-coverage
-run_id_prefix: scenario-frozen-coverage
+name: posthog-frozen-perf-extended-uncached
+run_id_prefix: scenario-frozen-extended-uncached
 required_env:
-  - DUCKGRES_SCENARIO_COVERAGE_TARGET
-  - DUCKGRES_SCENARIO_ATHENA_REGION
-  - DUCKGRES_SCENARIO_ATHENA_WORKGROUP
-  - DUCKGRES_SCENARIO_ATHENA_DATABASE
-  - DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI
   - DUCKGRES_SCENARIO_ORG_ID
   - DUCKGRES_SCENARIO_FROZEN_S3_URI
   - DUCKGRES_K8S_WORKER_CPU_REQUEST
@@ -16,7 +11,7 @@ steps:
     with:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       request:
-        database_name: scenario-frozen-coverage-${run_id_token}
+        database_name: scenario-frozen-extended-uncached-${run_id_token}
         team_id: 1
         metadata_store:
           type: cnpg-shard
@@ -78,14 +73,7 @@ steps:
       org_id: ${env:DUCKGRES_SCENARIO_ORG_ID}
       catalog: ducklake
       catalog_file: ../../../perf/queries/ducklake_posthog_coverage.yaml
-      targets: ["${env:DUCKGRES_SCENARIO_COVERAGE_TARGET}"]
-      athena_region: ${env:DUCKGRES_SCENARIO_ATHENA_REGION}
-      athena_workgroup: ${env:DUCKGRES_SCENARIO_ATHENA_WORKGROUP}
-      athena_catalog: AwsDataCatalog
-      athena_database: ${env:DUCKGRES_SCENARIO_ATHENA_DATABASE}
-      athena_output_location: ${env:DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI}
-      athena_poll_interval: 500ms
-      athena_query_timeout: 30m
+      targets: [pgwire_uncached]
       run_id: ${run_id}-coverage
       nightly_run_id: ${run_id}
       output_subdir: perf-coverage

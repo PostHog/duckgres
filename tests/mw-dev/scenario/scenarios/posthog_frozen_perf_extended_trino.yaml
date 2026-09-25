@@ -1,5 +1,5 @@
-name: posthog-frozen-perf-coverage-trino
-run_id_prefix: scenario-frozen-coverage-trino
+name: posthog-frozen-perf-extended-trino
+run_id_prefix: scenario-frozen-extended-trino
 required_env:
   - DUCKGRES_SCENARIO_COVERAGE_TARGET
   - DUCKGRES_SCENARIO_ORG_ID

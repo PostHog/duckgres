@@ -3,7 +3,9 @@
 This is the initial comparison base for the twelve coverage v1 intents on
 `pgwire_uncached`. [Successful source run](https://github.com/PostHog/duckgres/actions/runs/36159233201)
 measured commit `9c9f5f305f87b7f0d41c0b54d64e5648aeb8ef83` on 2026-09-25.
-The focused scenario and catalog are unchanged by subsequent launch-path edits.
+The catalog and query settings match the measured revision. The focused entry
+point was subsequently renamed to `posthog_frozen_perf_extended_uncached`; the
+manifest preserves the original scenario name used by the source run.
 
 [Samples](samples.csv) retain all 48 successful measurements;
 [manifest](manifest.json) records the catalog hash, dataset version, cache

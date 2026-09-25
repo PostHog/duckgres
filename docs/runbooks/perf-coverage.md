@@ -16,22 +16,22 @@ not share one four-hour scenario budget:
 
 ```sh
 gh workflow run scenario-dev.yml --ref <branch> \
-  -f scenario=posthog_frozen_perf_coverage \
+  -f scenario=posthog_frozen_perf_extended \
   -f coverage_target=pgwire_uncached
 ```
 
 `coverage_target` defaults to `pgwire_uncached`; supported choices are
 `pgwire_uncached`, `pgwire_cached`, `trino`, `trino_cached`, and `athena`.
 Dispatch once per configuration. Trino targets select the declarative
-`posthog_frozen_perf_coverage_trino.yaml` backing scenario and deploy the Trino
+`posthog_frozen_perf_extended_trino.yaml` backing scenario and deploy the Trino
 lane. Other targets use the neutral lane. Both reuse the existing frozen setup;
 Athena configuration also supplies the frozen runner identity.
 
-The original focused baseline entry point remains unchanged:
+For the focused uncached DuckDB baseline:
 
 ```sh
 gh workflow run scenario-dev.yml --ref <branch> \
-  -f scenario=posthog_frozen_perf_coverage_uncached
+  -f scenario=posthog_frozen_perf_extended_uncached
 ```
 
 Each coverage dispatch executes all twelve queries with one warmup and four

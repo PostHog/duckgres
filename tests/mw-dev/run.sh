@@ -63,7 +63,7 @@ esac
 # it to a digest pin when TRINO_IMAGE is unset. Regular Trino tests keep a
 # promoted pin because they require atomic writes.
 TRINO_MASTER_IMAGE_RESOLVER="${TRINO_MASTER_IMAGE_RESOLVER:-$HERE/../../scripts/resolve_trino_master_image.sh}"
-if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage ]; then
+if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-}"
 else
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
@@ -130,7 +130,7 @@ require_pr_identity() {
 }
 
 frozen_perf_scenario() {
-  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage_uncached ]
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended_uncached ]
 }
 
 hoglake_perf_enabled() {
@@ -790,10 +790,10 @@ cmd_test_scenario() {
   esac
 
   local backing_scenario="$SCENARIO_NAME"
-  if [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage ]; then
+  if [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ]; then
     case "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" in
       pgwire_uncached|pgwire_cached|athena) ;;
-      trino|trino_cached) backing_scenario=posthog_frozen_perf_coverage_trino ;;
+      trino|trino_cached) backing_scenario=posthog_frozen_perf_extended_trino ;;
       *) echo "DUCKGRES_SCENARIO_COVERAGE_TARGET must select one coverage protocol" >&2; return 2 ;;
     esac
   fi
