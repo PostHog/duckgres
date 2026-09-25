@@ -1,0 +1,109 @@
+# Trino pool administrative recovery
+
+Administrative recovery retires one draining instance as a **failure**, then lets the pool operator replace it.
+It can invalidate query continuations and retained results, including results from queries that already finished.
+It is not a clean drain and does not silently clear query accounting.
+Use it only with explicit authorization for the exact instance and this loss of results.
+
+## Prerequisites
+
+- Deploy the recovery-capable control plane and verify the active pool leader uses that version before submitting a request.
+  An older leader does not process recovery intents.
+  Complete the rollout before use so leadership cannot move back to an older replica.
+- Verify Gateway supports destructive loss evidence and failed retirement claims.
+- Use the authenticated admin API with an admin role.
+  Viewer access cannot preview or request recovery.
+- Independently check current coordinator workload, pending requests, open transactions, retained-result impact, and the readiness and capacity of the other serving instances.
+  The preview reads stored lifecycle state only; it does **not** establish that there is no live work or that the remaining instances are healthy.
+  Obligation checks are point-in-time observations, not an atomic guarantee against a later client continuation.
+  The explicit override authorizes invalidating all retained work on the exact instance, including work that races with these checks.
+- Confirm the selected pool and instance, including the exact coordinator process identity.
+  Do not use a logical pool name in place of an individual instance ID.
+
+## Preview without changes
+
+Read `GET /api/v1/trino/instances/<instance-id>/recovery?cell=<configured-cell-id>` through the existing authenticated admin connection.
+The `cell` parameter is the configured public pool ID shown by the admin API.
+The response contains a sanitized instance snapshot, stored serving counts and floor, and any existing recovery request.
+It excludes blueprint contents, credentials, and coordinator endpoints.
+`live_work_verified` is always false.
+
+Record these fields from `instance`:
+
+- `expected_generation`
+- `incarnation`
+- `pod_uid`
+- `boot_id`
+- `node_id`
+- `coordinator_id`
+
+The preview is read-only and does not reserve the instance or authorize an operation.
+Repeat it immediately before submitting a request.
+
+## Submit an authorized recovery
+
+POST to the same URL with an independently generated, unique `operation_id`, the exact snapshot fields, a short reason, and `destructive_authorization: true`.
+Use at most 128 characters from `A-Z`, `a-z`, `0-9`, `_`, `.`, `:`, and `-` in the operation ID:
+
+```json
+{
+  "operation_id": "recovery-example-unique-id",
+  "expected_generation": 7,
+  "incarnation": "incarnation-from-preview",
+  "pod_uid": "pod-from-preview",
+  "boot_id": "boot-from-preview",
+  "node_id": "node-from-preview",
+  "coordinator_id": "coordinator-from-preview",
+  "reason": "Approved retirement after independent workload and capacity checks",
+  "destructive_authorization": true
+}
+```
+
+Do not send `requested_by`; the server binds the request to the authenticated administrator.
+Do not include passwords, SQL, query results, or customer details in the reason.
+A `202 Accepted` response means durable intent was recorded, not that resources were deleted or the replacement is ready.
+No Gateway or Kubernetes mutation runs in the HTTP handler.
+
+The store accepts a new request only for a draining instance with a matching identity and generation and sufficient stored serving capacity.
+The active pool leader executes the request under its normal fencing and journaling, coordinates Gateway and local lifecycle state, obtains a failed-retirement claim, and only then deletes the owned resources.
+Before the first Gateway transition, the operator checks that the live coordinator matches the approved process identity.
+After the operation has started, it resumes the same recorded transitions even if that process exits; deletion remains guarded by the original resource identities.
+A changed identity before the operation starts fails closed.
+There is no cancellation or amendment endpoint for an accepted request.
+The failure classification and durable authorization remain recorded.
+A clean drain can win concurrently before the destructive transition.
+In that case the operator preserves the clean drain and completes its existing retirement instead; the local terminal phase is `RETIRED` and the Gateway retirement kind is `DRAINED`.
+
+## Follow progress and handle interruption
+
+Repeat GET on the same URL to inspect the stored phase, Gateway state and generation, and original request.
+`instance.last_error` contains a fixed, non-sensitive message when recovery is blocked; inspect the control-plane logs for details.
+Verify the instance reaches `FAILURE_RETIRED` (or `RETIRED` if a clean drain won), its owned resources are absent, and a replacement reaches `SERVING` on the intended release.
+Also verify the surviving instances stay healthy and the blocked rollout resumes.
+
+If submission times out, repeat GET first.
+If the original request exists, repeat the identical POST only when needed; keep its operation ID and full original snapshot unchanged.
+A retry of an accepted intent remains the same operation even after lifecycle progress changes the current snapshot.
+A changed operation ID, actor, reason, or identity is not an idempotent retry.
+
+A `409 Conflict` means the intent or current state cannot be accepted safely.
+Read a fresh preview and investigate; do not automatically replace the snapshot and resubmit authorization.
+A `503 Service Unavailable` means this API deployment has no recovery-store capability.
+Unexpected server errors require checking the control-plane logs and durable operation state before retrying.
+
+Leader changes or a crash between Gateway and local writes must resume the recorded operation.
+Do not hand-edit Gateway or Duckgres rows, borrow another leader's epoch, cancel queries as a substitute for recovery, or delete pods independently.
+If progress stops, diagnose the recorded operation and ownership fences; do not bypass them.
+
+## Rollback
+
+Finish accepted recoveries before rolling the control-plane binary back.
+An older leader does not understand pending intents and can leave a partially completed recovery waiting.
+If recovery was interrupted, roll forward and resume the same immutable request.
+Do not downgrade the recovery migration after it has been used; retain its authorization and audit records.
+
+## Local validation
+
+Run `just test-trino 'TestTrinoRecovery|TestTrinoPoolRecovery'` for the handler and operator behavior.
+Run the config-store integration tests with the local test database configured to verify atomic acceptance and conflicting retries.
+Production verification and recovery authorization are separate from these local tests.

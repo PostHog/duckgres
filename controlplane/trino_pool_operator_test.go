@@ -630,6 +630,9 @@ func (f *fakePoolGateway) LostMember(_ context.Context, _, instanceID string, re
 	if request.Evidence == "" || request.Termination.Source == "" {
 		return trinogateway.Member{}, errors.New("a loss claim needs termination evidence")
 	}
+	if request.Evidence == trinogateway.EvidenceDestructiveOverride && (!request.DestructiveAuthorization || request.Reason == "") {
+		return trinogateway.Member{}, trinogateway.ErrEvidenceRequired
+	}
 	payload := fakeRequestPayload(request)
 	if replayed, done, err := f.replay(request.Step, payload); done {
 		return replayed, err
