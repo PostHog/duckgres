@@ -229,3 +229,80 @@ func TestTrinoPoolRecoveryResumesAfterCoordinatorDisappears(t *testing.T) {
 		t.Fatal("accepted recovery was stranded by process exit")
 	}
 }
+
+type recoveryTerminationKube struct {
+	*fakePoolKube
+	absent bool
+	err    error
+}
+
+func (k *recoveryTerminationKube) CoordinatorPodAbsent(context.Context, trinoPoolInventory, string) (bool, error) {
+	return k.absent, k.err
+}
+
+func TestTrinoPoolRecoveryRetiresProvenAbsentCoordinatorWithObligations(t *testing.T) {
+	for _, lostReply := range []string{"", "recovery-suspect", "recovery-lost", "recovery-retire", "recovery-retired"} {
+		t.Run(lostReply, func(t *testing.T) {
+			h, s, id := recoveryHarness(t)
+			kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+			h.operator.kube = func(int64) trinoPoolKube { return kube }
+			h.kube.observed.CoordinatorPods = []trinoPoolCoordinatorPod{{UID: "replacement-pod", RunningContainerID: "containerd://replacement"}}
+			h.operator.identity = func(context.Context, string) (string, error) {
+				t.Fatal("a replacement process must not authorize the old process's recovery")
+				return "", nil
+			}
+			obligations := h.gateway.obligations[id]
+			obligations.PendingRequests = 2
+			obligations.OpenTransactions = 1
+			h.gateway.obligations[id] = obligations
+			h.gateway.loseResponse = map[string]bool{lostReply: true}
+			for range 16 {
+				if err := h.operator.reconcileOnce(context.Background()); err != nil {
+					successor := newOperatorHarness(t).operator
+					successor.config = h.operator.config
+					successor.store = s
+					successor.gateway = h.gateway
+					successor.kube = func(int64) trinoPoolKube { return kube }
+					successor.owner = "successor"
+					h.operator = successor
+				}
+			}
+			if got := h.store.instances[id].Phase; got != string(trinopool.PhaseFailureRetired) {
+				t.Fatalf("proven-dead recovery stuck at %s", got)
+			}
+			if h.gateway.members[id].RetirementKind != "FAILED" || h.gateway.obligations[id].PendingRequests != 2 || h.gateway.obligations[id].OpenTransactions != 1 {
+				t.Fatal("recovery must retain the failed work accounting")
+			}
+			if len(h.kube.deleted) != 1 || !h.kube.deleted[h.store.instances[id].ServiceName] {
+				t.Fatal("recovery deleted another instance")
+			}
+		})
+	}
+}
+
+func TestTrinoPoolRecoveryAbsentEvidenceFailsClosed(t *testing.T) {
+	for _, scenario := range []string{"pod-present", "lookup-error", "capacity", "wrong-identity", "wrong-generation"} {
+		t.Run(scenario, func(t *testing.T) {
+			h, s, id := recoveryHarness(t)
+			kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+			h.operator.kube = func(int64) trinoPoolKube { return kube }
+			h.kube.observed.CoordinatorPods = nil
+			switch scenario {
+			case "pod-present":
+				kube.absent = false
+			case "lookup-error":
+				kube.err = errors.New("pod inventory unavailable")
+			case "capacity":
+				h.gateway.members[h.store.order[1]].Phase = "SUSPECT"
+			case "wrong-identity":
+				s.requests[0].PodUID = "different-pod"
+			case "wrong-generation":
+				s.requests[0].ExpectedGeneration++
+			}
+			h.tickTolerant(4)
+			if h.gateway.members[id].Phase != "DRAINING" || len(h.kube.deleted) != 0 {
+				t.Fatal("ambiguous evidence or failed guard authorized retirement")
+			}
+		})
+	}
+}

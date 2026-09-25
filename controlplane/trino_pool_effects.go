@@ -392,6 +392,32 @@ func (e *trinoPoolEffects) ResourcesAbsent(ctx context.Context, inventory trinoP
 	return len(pods) == 0, nil
 }
 
+// CoordinatorPodAbsent verifies the admitted UID against an unfiltered namespace inventory.
+// Mutable labels cannot establish absence. A failed or incomplete listing cannot either.
+func (e *trinoPoolEffects) CoordinatorPodAbsent(ctx context.Context, inventory trinoPoolInventory, podUID string) (bool, error) {
+	if podUID == "" || inventory.Namespace == "" || inventory.Namespace != e.namespace {
+		return false, errors.New("coordinator absence requires a pod UID and the configured namespace")
+	}
+	ctx, cancel := context.WithTimeout(ctx, trinoPoolRequestBudget)
+	defer cancel()
+	options := metav1.ListOptions{Limit: trinoPoolListLimit}
+	for {
+		pods, err := e.clientset.CoreV1().Pods(inventory.Namespace).List(ctx, options)
+		if err != nil {
+			return false, fmt.Errorf("verify admitted coordinator pod absence: %w", err)
+		}
+		for _, pod := range pods.Items {
+			if string(pod.UID) == podUID {
+				return false, nil
+			}
+		}
+		if pods.Continue == "" {
+			return true, nil
+		}
+		options.Continue = pods.Continue
+	}
+}
+
 // Observe reports the cluster's current view of the instance.
 func (e *trinoPoolEffects) Observe(ctx context.Context, inventory trinoPoolInventory) (trinoPoolObservation, error) {
 	ctx, cancel := context.WithTimeout(ctx, trinoPoolRequestBudget)

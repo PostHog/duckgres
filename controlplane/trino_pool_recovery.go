@@ -155,7 +155,22 @@ func (o *trinoPoolOperator) checkRecoveryPreconditions(ctx context.Context, i co
 	if err != nil {
 		return err
 	}
-	if obligations.InstanceID != i.InstanceID || obligations.Incarnation != r.Incarnation || obligations.Generation != m.Generation || obligations.PendingRequests != 0 || obligations.OpenTransactions != 0 {
+	if obligations.InstanceID != i.InstanceID || obligations.Incarnation != r.Incarnation || obligations.Generation != m.Generation {
+		return errors.New("recovery requires obligations for the authorized incarnation and current generation")
+	}
+	kube := o.kube(o.lease.Epoch)
+	absent, err := kube.CoordinatorPodAbsent(ctx, inventoryOf(i), r.PodUID)
+	if err != nil {
+		return err
+	}
+	if absent {
+		// Keep the immutable override payload for every replay, regardless of the current evidence.
+		// Failed retirement retains obligations that the absent process can no longer complete.
+		slog.Info("Trino pool recovery verified the admitted coordinator pod is absent.",
+			"pool", o.config.PublicID, "instance", i.InstanceID, "operation", r.OperationID)
+		return nil
+	}
+	if obligations.PendingRequests != 0 || obligations.OpenTransactions != 0 {
 		return errors.New("recovery requires current obligations without pending requests or open transactions")
 	}
 	// Once our suspicion step commits, a process exit must not strand recovery.
@@ -164,7 +179,7 @@ func (o *trinoPoolOperator) checkRecoveryPreconditions(ctx context.Context, i co
 	if m.Phase != "DRAINING" {
 		return nil
 	}
-	observed, err := o.kube(o.lease.Epoch).Observe(ctx, inventoryOf(i))
+	observed, err := kube.Observe(ctx, inventoryOf(i))
 	if err != nil {
 		return err
 	}

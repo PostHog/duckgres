@@ -1188,6 +1188,9 @@ trino_shared_pool_active() {
   log "shared pool OK [structure]: $ready ready instance(s), each with its own service and workers"
 
   # Validate the recovery UI's read-only contract without authorizing retirement.
+  # Absent-pod recovery needs an isolated pool and destructive authorization.
+  # This shared-pool Job must not delete coordinators to manufacture that evidence.
+  # See the administrative recovery runbook for the isolated regression procedure.
   inventory="$(curl -fsS -H "$H" --get --data-urlencode "cell=$pool" "$API/api/v1/trino/instances")" \
     || fail "shared pool: recovery inventory request failed"
   printf %s "$inventory" | jq -e --arg cell "$pool" '
