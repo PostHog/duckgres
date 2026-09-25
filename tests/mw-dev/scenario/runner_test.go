@@ -495,8 +495,8 @@ func TestFrozenPerfScenarioUsesSupportedStepsAndOriginalCatalog(t *testing.T) {
 		if !ok || !filepath.IsAbs(catalogFile) {
 			t.Fatalf("perf catalog_file = %#v, want absolute path", step.With["catalog_file"])
 		}
-		if !strings.HasSuffix(catalogFile, filepath.Join("perf", "queries", "ducklake_posthog_tables.yaml")) {
-			t.Fatalf("perf catalog_file = %q, want original checked-in corpus", catalogFile)
+		if !strings.HasSuffix(catalogFile, filepath.Join("perf", "queries", "diagnostic", "hoglake_distinct_profile.yaml")) {
+			t.Fatalf("perf catalog_file = %q, want diagnostic corpus on this temporary branch", catalogFile)
 		}
 		if runID, _ := step.With["run_id"].(string); runID != "scenario-frozen-perf-20260102t030405z" {
 			t.Fatalf("perf run_id = %q, want scenario run id", runID)
