@@ -9,7 +9,7 @@ on:
         default: full-suite
         type: string
       coverage_target:
-        description: Target for posthog_frozen_perf_coverage; dispatch once per configuration
+        description: Manual extended coverage target for posthog_frozen_perf_coverage; excluded from nightly
         required: false
         default: pgwire_uncached
         type: choice

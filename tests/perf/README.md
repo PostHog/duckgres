@@ -2,9 +2,10 @@
 
 This package contains the golden-query performance harness.
 
-Separate frozen coverage scenarios exercise twelve additional workload shapes in
+Manual-only extended coverage scenarios exercise twelve additional workload shapes in
 `queries/ducklake_posthog_coverage.yaml`. They retain separate `perf-coverage/`
-artifacts and versioned intent IDs. For the focused uncached DuckDB run,
+artifacts and versioned intent IDs. These queries are excluded from standard
+nightly runs and execute only when explicitly dispatched. For the focused uncached DuckDB run,
 baseline recording, runtime estimates, and failure recovery, see the
 [coverage runbook](../../docs/runbooks/perf-coverage.md).
 

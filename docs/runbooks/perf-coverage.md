@@ -1,4 +1,4 @@
-# Workload coverage benchmark
+# Extended workload coverage benchmark
 
 The workload coverage catalog supplements the original frozen table and
 properties comparisons. It measures filtered unique users, grouped trends,
@@ -9,8 +9,10 @@ the SELECT computation, not writes or a complete materialization job.
 ## Run
 
 The regular `posthog_frozen_perf` nightly retains the original table and
-properties workloads. Coverage runs separately, one configuration per dispatch,
-so five configurations do not share one four-hour scenario budget:
+properties workloads. The twelve additional queries are an **extended, manual-only
+run**: scheduled nightly runs never include them. Start them explicitly through
+`workflow_dispatch`, one configuration per dispatch, so five configurations do
+not share one four-hour scenario budget:
 
 ```sh
 gh workflow run scenario-dev.yml --ref <branch> \
