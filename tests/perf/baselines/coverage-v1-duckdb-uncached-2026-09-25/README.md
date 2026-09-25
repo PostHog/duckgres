@@ -36,9 +36,9 @@ result values or internal fixture locations are retained.
 | Daily-person model | 22.81 | 23.04 | 20.99–24.17 |
 | Session model | 53.31 | 52.58 | 51.32–56.74 |
 
-## Expanded campaign estimate
+## Original separate-dispatch estimate
 
-Keep the original nightly suite separate and dispatch coverage once per
+The original planning estimate assumed a separate workflow dispatch per
 configuration. With one warmup plus four measurements, equal query speeds
 would add **7h16m of query work** across five configurations. Using the measured
 15m39s overhead for each dispatch adds another **1h18m**. Adding the
@@ -57,7 +57,11 @@ Holding DuckDB uncached fixed and varying the other four configurations:
 
 These are scenarios, not statistical confidence bounds. Even the equal-speed
 query work exceeds the four-hour scenario limit, which is why coverage uses
-separate target dispatches. This baseline does not establish Trino or Athena
+separate target jobs. The current workflow builds images once and runs targets
+as sequential matrix jobs, reducing the equal-speed planning estimate to
+approximately **8h16m extended-only**, or **9h19m including the original suite**.
+The manifest retains the original estimate for provenance; see the runbook for
+the shared-build calculation. This baseline does not establish Trino or Athena
 performance. Resource requests are 3 CPU / 12Gi for DuckDB workers only.
 
 ## Future comparisons
