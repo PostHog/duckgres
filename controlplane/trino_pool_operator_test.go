@@ -2230,7 +2230,21 @@ func (f *fakePublicationStore) ClearTrinoPoolPublicationFailure(_ context.Contex
 // serving, which is what a publication barrier requires.
 func (h *operatorHarness) servingPool(t *testing.T) {
 	t.Helper()
-	h.tick(t, 12)
+	for tick := 0; tick < 32; tick++ {
+		serving := 0
+		for _, instance := range h.store.instances {
+			if instance.Phase == string(trinopool.PhaseServing) {
+				serving++
+			}
+		}
+		if serving == h.operator.config.Spec.DesiredInstances {
+			break
+		}
+		h.tick(t, 1)
+	}
+	if len(h.store.instances) != h.operator.config.Spec.DesiredInstances {
+		t.Fatalf("instance count = %d, want %d", len(h.store.instances), h.operator.config.Spec.DesiredInstances)
+	}
 	for id, instance := range h.store.instances {
 		if instance.Phase != string(trinopool.PhaseServing) {
 			t.Fatalf("instance %s is %s, want SERVING before a publication", id, instance.Phase)

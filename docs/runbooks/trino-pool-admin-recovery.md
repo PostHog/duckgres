@@ -39,6 +39,32 @@ minimum by editing lifecycle records. Restore sufficient serving capacity before
 requesting recovery. Existing requests and retired instances show their status
 with the new-request action disabled.
 
+### Restore capacity when several instances are draining
+
+Deploy Gateway support for capacity-deficit repairs of departing members before
+deploying the corresponding Duckgres planner. The operator creates one candidate
+at a time, validates it normally, and records a distinct replacement target for
+each live repair. Draining instances retain their work and are not deleted to
+make room. A pending candidate retains its original repair target if that target
+advances through draining or retirement while registration is retried.
+
+Size the configured repair budget explicitly for the simultaneous failures you
+intend to cover. For example, four pinned draining instances and three required
+serving instances need seven live slots: desired three, surge one, and repair
+three. A repair budget of one cannot restore that capacity without first
+retiring some pinned instances. Increase the budget through reviewed desired
+configuration, not by changing lifecycle rows or lowering the minimum. The
+planner stops at the configured live and repair limits.
+
+Repair instances remain charged to the repair budget while serving. Retiring
+their targets does not currently convert them into ordinary instances. Budget
+normalization requires coordinated Gateway and control-plane work and remains
+a separate TODO. Do not clear repair flags manually.
+
+After the required serving count is restored, use the existing recovery process
+below for each remaining stuck drain. Pending requests, open transactions,
+identity checks and explicit destructive authorization still apply.
+
 Before submitting, complete the independent checks above, enter a short reason,
 type the exact instance ID, and acknowledge both those checks and the potential
 loss of results. The confirmation applies to the displayed process identity and

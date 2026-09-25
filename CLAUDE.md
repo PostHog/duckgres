@@ -2007,8 +2007,23 @@ the Trino backend selection).
   would claim a member serves while nothing is routed to it. A suspected member
   always leaves — proven dead through the loss claim, or replaced through the
   planned drain after `trinoPoolSuspectDrainAfter` when it cannot be proven
-  dead. The Gateway's serving-floor refusal stands either way, so a pool at
-  its floor keeps the flaky member rather than dropping below it.
+  dead. A suspect is already excluded from serving capacity, so its drain does
+  not reduce the Gateway's serving count again. Planned ACTIVE drains retain
+  the serving-floor guard.
+- **Capacity repair counts SERVING, not departing instances.** DRAINING,
+  SEALED and RETIRING members retain physical capacity and pinned work, but do
+  not satisfy desired serving capacity. Only one candidate may prepare at a
+  time. A repair keeps its configured repair slot throughout its nonterminal
+  lifetime, including SERVING. Its persisted `repair_for` reserves one target;
+  a second live repair must not target that same instance. When no normal slot
+  is free, an unreplaced departing member can be a repair target only while
+  serving capacity is short. Gateway independently validates registration
+  against active plus preparing capacity and its own repair budget. Deploy
+  that Gateway support before this planner. No repair permits deletion of the
+  original member, skips validation, lowers the serving floor, or exceeds the
+  configured desired + surge + repair capacity. Automatic normalization of
+  serving repair slots after their targets retire remains a separate TODO;
+  never clear the local repair flag without matching Gateway semantics.
 - **Two observations prove a process ended, and both are statements Kubernetes
   makes after the fact** (`processTerminationEvidence`): every recorded object
   is verifiably absent, or **the exact container instance that hosted the
