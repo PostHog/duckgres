@@ -773,7 +773,9 @@ scenario_name_for_file() {
 scenario_job_name() {
   local name="$1" run_hash
   run_hash="$(printf '%s' "${DUCKGRES_SCENARIO_RUN_ID:?DUCKGRES_SCENARIO_RUN_ID is required}" | cksum | awk '{print $1}')"
-  printf 'duckgres-scenario-%s-%s\n' "$name" "$run_hash" | tr '_' '-'
+  # Kubernetes copies the Job name into a label, whose limit is 63 bytes.
+  # Reserve 18 for the prefix, one separator, and ten for the cksum value.
+  printf 'duckgres-scenario-%s-%s\n' "${name:0:34}" "$run_hash" | tr '_' '-'
 }
 
 cmd_test_scenario() {

@@ -489,6 +489,34 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	}
 }
 
+func TestScenarioLongNameProducesValidJobLabel(t *testing.T) {
+	const scenario = "posthog_frozen_perf_coverage_uncached"
+	fakes := newRunSHFakes(t)
+	cmd := runSHCommand(t, fakes.binDir, "test-scenario",
+		"SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario", "SCENARIO_NAME="+scenario)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("scenario failed: %v\n%s", err, out)
+	}
+	match := regexp.MustCompile(`kind: Job\nmetadata:\n  name: ([^\n]+)`).FindStringSubmatch(fakes.calls(t))
+	if len(match) != 2 {
+		t.Fatal("missing Job name")
+	}
+	name := match[1]
+	if len(name) > 63 || !regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`).MatchString(name) {
+		t.Fatalf("invalid Job label %q (%d bytes)", name, len(name))
+	}
+	runID := "scenario-dev-" + strings.ReplaceAll(scenario, "_", "-") + "-123"
+	checksum := exec.Command("cksum")
+	checksum.Stdin = strings.NewReader(runID)
+	out, err := checksum.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(name, "-"+strings.Fields(string(out))[0]) {
+		t.Fatalf("Job name %q lost run ID checksum", name)
+	}
+}
+
 func TestScenarioStopsJobWithoutCollectingArtifactsWhenContainerTerminationCannotBeConfirmed(t *testing.T) {
 	fakes := newRunSHFakes(t)
 
