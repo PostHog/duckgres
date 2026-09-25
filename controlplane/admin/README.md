@@ -192,6 +192,11 @@ The **Trino cell → Instance recovery** panel lets admins select a shared-pool
 instance, review its exact identity, explicitly authorize failure retirement,
 and follow progress. It reuses the existing recovery API. It does not verify
 live workload or health, cancel an accepted recovery, or bypass a conflict.
+The recovery action remains visible but disabled when prerequisites fail. The
+preview identifies the exact phase, frozen-pool, identity-field, and stored
+capacity blockers instead of hiding the form. Existing requests and retired
+instances retain their progress or terminal status and cannot start another
+recovery operation.
 See the [recovery runbook](../../docs/runbooks/trino-pool-admin-recovery.md)
 for prerequisites, result-loss risks, and identical-request retry rules.
 

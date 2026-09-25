@@ -132,7 +132,7 @@ describe("Trino recovery", () => {
     fireEvent.click(button);
     fireEvent.click(button);
     await waitFor(() => expect(mocks.requestTrinoRecovery).toHaveBeenCalledTimes(1));
-    expect(screen.queryByRole("button", { name: "Request destructive recovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
   });
 
   it("restores an unknown request after remount with the identical operation ID and body", async () => {
@@ -146,7 +146,7 @@ describe("Trino recovery", () => {
     firstPage.unmount();
     mount();
     await selectInstance();
-    expect(screen.queryByRole("button", { name: "Request destructive recovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
     await userEvent.click(screen.getByRole("button", { name: "Retry identical request" }));
     await waitFor(() => expect(mocks.requestTrinoRecovery).toHaveBeenCalledTimes(2));
     expect(mocks.requestTrinoRecovery.mock.calls[1]).toEqual(first);
@@ -166,7 +166,7 @@ describe("Trino recovery", () => {
     firstPage.unmount();
     mount();
     await selectInstance();
-    expect(screen.queryByRole("button", { name: "Request destructive recovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "Review a new preview" })).not.toBeInTheDocument();
     expect(mocks.requestTrinoRecovery).toHaveBeenCalledTimes(2);
   });
@@ -196,7 +196,7 @@ describe("Trino recovery", () => {
     await selectInstance();
     expect(screen.getByText(/cannot be cancelled or amended/)).toBeInTheDocument();
     expect(screen.getByText("operation-existing")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Request destructive recovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
     expect(mocks.requestTrinoRecovery).not.toHaveBeenCalled();
   });
 
@@ -207,7 +207,7 @@ describe("Trino recovery", () => {
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Trino instance" }), "instance-a");
     await screen.findByText(/Check your sign-in and permissions/);
     expect(screen.getByRole("button", { name: "Refresh preview" })).toBeDisabled();
-    expect(screen.queryByRole("button", { name: "Request destructive recovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
   });
 
   it("blocks writes when identity refresh failed even if the cached role is admin", () => {
@@ -226,7 +226,7 @@ describe("Trino recovery", () => {
     await screen.findByText(/identity or recorded intent changed/i);
     expect(mocks.requestTrinoRecovery).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole("button", { name: "Retry identical request" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Request destructive recovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
     await waitFor(() => expect(screen.getByRole("button", { name: "Review a new preview" })).toBeEnabled());
     await userEvent.click(screen.getByRole("button", { name: "Review a new preview" }));
     expect(await screen.findByLabelText("Type the instance ID")).toHaveValue("");
@@ -255,7 +255,7 @@ describe("Trino recovery", () => {
     await userEvent.click(screen.getByRole("button", { name: "Refresh preview" }));
     await screen.findByText(/retirement completed|recovery completed/i);
     expect(screen.getByRole("combobox", { name: "Trino instance" })).toHaveValue("instance-a");
-    expect(screen.queryByRole("button", { name: "Request destructive recovery" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
   });
 
   it("isolates a cell switch from an old in-flight response", async () => {
@@ -438,5 +438,54 @@ describe("Trino recovery", () => {
     expect(mocks.trinoInstances).toHaveBeenLastCalledWith("pool-b");
     expect(mocks.trinoInstances).toHaveBeenCalledTimes(2);
     expect(screen.getByText("No active shared-pool instances.")).toBeInTheDocument();
+  });
+
+  it("shows why a draining instance cannot recover when stored capacity is zero", async () => {
+    const blocked = preview();
+    blocked.capacity.stored_serving = 0;
+    blocked.capacity.min_serving = 3;
+    mocks.trinoRecovery.mockResolvedValue(blocked);
+    mount();
+    await selectInstance();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
+    expect(screen.getByText("Stored serving count is 0; minimum required is 3. Recovery cannot proceed below this minimum.")).toBeInTheDocument();
+    expect(mocks.requestTrinoRecovery).not.toHaveBeenCalled();
+  });
+
+  it("lists every failed eligibility condition instead of a generic missing button", async () => {
+    const blocked = preview();
+    blocked.instance.phase = "CREATING";
+    blocked.instance.boot_id = "";
+    blocked.instance.pod_uid = "";
+    blocked.instance.expected_generation = 0;
+    blocked.capacity.frozen = true;
+    blocked.capacity.stored_serving = 1;
+    mocks.trinoRecovery.mockResolvedValue(blocked);
+    mount();
+    await selectInstance();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
+    expect(screen.getByText("Instance phase is CREATING; recovery requires DRAINING.")).toBeInTheDocument();
+    expect(screen.getByText("The pool is frozen. Recovery cannot proceed while it is frozen.")).toBeInTheDocument();
+    expect(screen.getByText("Missing or invalid admitted identity fields: expected_generation, pod_uid, boot_id.")).toBeInTheDocument();
+    expect(screen.getByText("Stored serving count is 1; minimum required is 2. Recovery cannot proceed below this minimum.")).toBeInTheDocument();
+    expect(mocks.requestTrinoRecovery).not.toHaveBeenCalled();
+  });
+
+  it("requires confirmation again after a capacity blocker clears", async () => {
+    mount();
+    await selectInstance();
+    await confirmRecovery();
+    const blocked = preview();
+    blocked.capacity.stored_serving = 0;
+    mocks.trinoRecovery.mockResolvedValue(blocked);
+    await userEvent.click(screen.getByRole("button", { name: "Refresh preview" }));
+    expect(await screen.findByText(/Stored serving count is 0/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
+    mocks.trinoRecovery.mockResolvedValue(preview());
+    await userEvent.click(screen.getByRole("button", { name: "Refresh preview" }));
+    await waitFor(() => expect(screen.getByLabelText("Type the instance ID")).toHaveValue(""));
+    expect(screen.getByRole("button", { name: "Request destructive recovery" })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: /retained results/ })).not.toBeChecked();
+    expect(mocks.requestTrinoRecovery).not.toHaveBeenCalled();
   });
 });
