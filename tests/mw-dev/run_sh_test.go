@@ -489,6 +489,29 @@ func TestScenarioRunsSelectedScenarioAgainstIsolatedStack(t *testing.T) {
 	}
 }
 
+func TestCoverageDispatchRoutesSelectedTarget(t *testing.T) {
+	for _, target := range []string{"pgwire_uncached", "pgwire_cached", "trino", "trino_cached", "athena"} {
+		t.Run(target, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+			cmd := runSHCommand(t, fakes.binDir, "test-scenario", "SCENARIO_RUNNER_IMAGE=example.invalid/duckgres:scenario", "SCENARIO_NAME=posthog_frozen_perf_coverage", "DUCKGRES_SCENARIO_COVERAGE_TARGET="+target)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("scenario failed: %v\n%s", err, out)
+			}
+			file := "posthog_frozen_perf_coverage"
+			if strings.HasPrefix(target, "trino") {
+				file += "_trino"
+			}
+			calls := fakes.calls(t)
+			if !strings.Contains(calls, "scenarios/"+file+".yaml") {
+				t.Fatal("wrong coverage backing file")
+			}
+			if !strings.Contains(calls, `name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "`+target+`"`) {
+				t.Fatal("target not passed to runner")
+			}
+		})
+	}
+}
+
 func TestScenarioLongNameProducesValidJobLabel(t *testing.T) {
 	const scenario = "posthog_frozen_perf_coverage_uncached"
 	fakes := newRunSHFakes(t)

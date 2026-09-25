@@ -63,7 +63,7 @@ esac
 # it to a digest pin when TRINO_IMAGE is unset. Regular Trino tests keep a
 # promoted pin because they require atomic writes.
 TRINO_MASTER_IMAGE_RESOLVER="${TRINO_MASTER_IMAGE_RESOLVER:-$HERE/../../scripts/resolve_trino_master_image.sh}"
-if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
+if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-}"
 else
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
@@ -130,7 +130,7 @@ require_pr_identity() {
 }
 
 frozen_perf_scenario() {
-  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage_uncached ]
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage_uncached ]
 }
 
 hoglake_perf_enabled() {
@@ -789,8 +789,16 @@ cmd_test_scenario() {
       ;;
   esac
 
-  scenario_file="tests/mw-dev/scenario/scenarios/${SCENARIO_NAME}.yaml"
-  if [ ! -f "$HERE/scenario/scenarios/${SCENARIO_NAME}.yaml" ]; then
+  local backing_scenario="$SCENARIO_NAME"
+  if [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage ]; then
+    case "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" in
+      pgwire_uncached|pgwire_cached|athena) ;;
+      trino|trino_cached) backing_scenario=posthog_frozen_perf_coverage_trino ;;
+      *) echo "DUCKGRES_SCENARIO_COVERAGE_TARGET must select one coverage protocol" >&2; return 2 ;;
+    esac
+  fi
+  scenario_file="tests/mw-dev/scenario/scenarios/${backing_scenario}.yaml"
+  if [ ! -f "$HERE/scenario/scenarios/${backing_scenario}.yaml" ]; then
     echo "Scenario '$SCENARIO_NAME' does not exist at $scenario_file." >&2
     return 2
   fi
@@ -866,6 +874,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_ORG_ID, value: "ci-pr-${PR_NUMBER}-cnpg" }
             - { name: DUCKGRES_SCENARIO_OUTPUT_BASE, value: "/artifacts/scenario-dev" }
             - { name: DUCKGRES_SCENARIO_RUN_ID, value: "$DUCKGRES_SCENARIO_RUN_ID" }
+            - { name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" }
             - { name: DUCKGRES_SCENARIO_MAX_RUNTIME, value: "${DUCKGRES_SCENARIO_MAX_RUNTIME:-4h}" }
             - { name: DUCKGRES_SCENARIO_GO_TEST_TIMEOUT, value: "${DUCKGRES_SCENARIO_GO_TEST_TIMEOUT:-4h15m}" }
             - { name: GOCACHE, value: "/tmp/go-cache" }

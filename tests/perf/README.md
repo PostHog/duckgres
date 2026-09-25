@@ -2,7 +2,7 @@
 
 This package contains the golden-query performance harness.
 
-The frozen suite also includes twelve additional workload shapes in
+Separate frozen coverage scenarios exercise twelve additional workload shapes in
 `queries/ducklake_posthog_coverage.yaml`. They retain separate `perf-coverage/`
 artifacts and versioned intent IDs. For the focused uncached DuckDB run,
 baseline recording, runtime estimates, and failure recovery, see the

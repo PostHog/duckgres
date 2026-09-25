@@ -1,19 +1,21 @@
 package scenario
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/posthog/duckgres/tests/mw-dev/scenario/core"
+	"gopkg.in/yaml.v3"
 )
 
 func TestCoverageScenariosPreserveBaselineAndFocusedIsolation(t *testing.T) {
 	for _, focused := range []bool{false, true} {
-		name := "posthog_frozen_perf"
+		name := "posthog_frozen_perf_coverage"
 		if focused {
-			name += "_coverage_uncached"
+			name += "_uncached"
 		}
 		t.Run(name, func(t *testing.T) {
 			scenario, err := core.LoadScenario(filepath.Join("scenarios", name+".yaml"))
@@ -69,8 +71,82 @@ func TestCoverageScenariosPreserveBaselineAndFocusedIsolation(t *testing.T) {
 					t.Fatal("focused run provisions Trino")
 				}
 			} else {
-				assertPerfTargetsPGWireTrinoAndAthena(t, *coverage)
+				if !reflect.DeepEqual(coverage.With["targets"], []any{"${env:DUCKGRES_SCENARIO_COVERAGE_TARGET}"}) {
+					t.Fatal("general coverage must select one target")
+				}
 			}
 		})
+	}
+}
+
+func TestOriginalNightlyExcludesCoverage(t *testing.T) {
+	scenario, err := core.LoadScenario(filepath.Join("scenarios", "posthog_frozen_perf.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range scenario.Steps {
+		if strings.Contains(step.ID, "coverage") {
+			t.Fatal("nightly must not include long-running coverage")
+		}
+	}
+}
+
+func TestCoverageTargetTemplatesResolve(t *testing.T) {
+	for _, target := range []string{"pgwire_uncached", "pgwire_cached", "trino", "trino_cached", "athena"} {
+		t.Run(target, func(t *testing.T) {
+			name := "posthog_frozen_perf_coverage"
+			if strings.HasPrefix(target, "trino") {
+				name += "_trino"
+			}
+			scenario, err := core.LoadScenario(filepath.Join("scenarios", name+".yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range scenario.RequiredEnv {
+				t.Setenv(key, "example")
+			}
+			t.Setenv("DUCKGRES_SCENARIO_COVERAGE_TARGET", target)
+			resolved, err := resolveRunTemplates(scenario, "example-run")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var gotTrino bool
+			for _, step := range resolved.Steps {
+				if step.Type == "wait_trino_ready" {
+					gotTrino = true
+				}
+				if step.ID == "coverage_queries" && !reflect.DeepEqual(step.With["targets"], []any{target}) {
+					t.Fatalf("targets = %v", step.With["targets"])
+				}
+			}
+			if gotTrino != strings.HasPrefix(target, "trino") {
+				t.Fatalf("wrong setup for %s", target)
+			}
+		})
+	}
+}
+
+func TestCoverageWorkflowOffersExactlySupportedTargets(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", ".github", "workflows", "scenario-dev.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		On struct {
+			Dispatch struct {
+				Inputs map[string]struct {
+					Default string   `yaml:"default"`
+					Type    string   `yaml:"type"`
+					Options []string `yaml:"options"`
+				} `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+	}
+	if err := yaml.Unmarshal(raw, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	input := workflow.On.Dispatch.Inputs["coverage_target"]
+	if input.Default != "pgwire_uncached" || input.Type != "choice" || !reflect.DeepEqual(input.Options, []string{"pgwire_uncached", "pgwire_cached", "trino", "trino_cached", "athena"}) {
+		t.Fatalf("coverage workflow input = %#v", input)
 	}
 }

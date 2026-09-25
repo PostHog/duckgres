@@ -8,6 +8,12 @@ on:
         required: true
         default: full-suite
         type: string
+      coverage_target:
+        description: Target for posthog_frozen_perf_coverage; dispatch once per configuration
+        required: false
+        default: pgwire_uncached
+        type: choice
+        options: [pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
       properties_s3_uri:
         description: Properties Parquet S3 prefix override; blank uses the existing Athena table location
         required: false
@@ -82,7 +88,8 @@ jobs:
       # Frozen perf uses a namespace-local Trino cell. The dedicated role is
       # consumed only when E2E_SUITE selects that isolated deployment.
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
-      E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf') && 'trino' || 'neutral' }}
+      E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || (inputs.scenario == 'posthog_frozen_perf_coverage' && (inputs.coverage_target == 'trino' || inputs.coverage_target == 'trino_cached'))) && 'trino' || 'neutral' }}
+      DUCKGRES_SCENARIO_COVERAGE_TARGET: ${{ inputs.coverage_target || 'pgwire_uncached' }}
       PR_NUMBER: ${{ github.run_id }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
@@ -94,7 +101,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Require a current image for cached comparisons
-        if: ${{ inputs.duckgres_image != '' && inputs.scenario == 'posthog_frozen_perf' }}
+        if: ${{ inputs.duckgres_image != '' && (inputs.scenario == 'posthog_frozen_perf' || (inputs.scenario == 'posthog_frozen_perf_coverage' && (inputs.coverage_target == 'trino' || inputs.coverage_target == 'trino_cached'))) }}
         run: |
           echo "::error::Cached Trino comparisons require the control-plane image built from this revision. Omit duckgres_image so an older image cannot silently ignore the cache flag."
           exit 1
@@ -149,7 +156,7 @@ jobs:
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
 
       - name: Load frozen perf identity and Athena configuration
-        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_coverage_uncached'
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_coverage' || env.SCENARIO_NAME == 'posthog_frozen_perf_coverage_uncached'
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
       - name: Load properties fixture override

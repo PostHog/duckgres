@@ -8,21 +8,42 @@ the SELECT computation, not writes or a complete materialization job.
 
 ## Run
 
-The regular `posthog_frozen_perf` scenario includes all five configurations.
-For a focused DuckDB baseline, dispatch the same workflow on the PR branch:
+The regular `posthog_frozen_perf` nightly retains the original table and
+properties workloads. Coverage runs separately, one configuration per dispatch,
+so five configurations do not share one four-hour scenario budget:
+
+```sh
+gh workflow run scenario-dev.yml --ref <branch> \
+  -f scenario=posthog_frozen_perf_coverage \
+  -f coverage_target=pgwire_uncached
+```
+
+`coverage_target` defaults to `pgwire_uncached`; supported choices are
+`pgwire_uncached`, `pgwire_cached`, `trino`, `trino_cached`, and `athena`.
+Dispatch once per configuration. Trino targets select the declarative
+`posthog_frozen_perf_coverage_trino.yaml` backing scenario and deploy the Trino
+lane. Other targets use the neutral lane. Both reuse the existing frozen setup;
+Athena configuration also supplies the frozen runner identity.
+
+The original focused baseline entry point remains unchanged:
 
 ```sh
 gh workflow run scenario-dev.yml --ref <branch> \
   -f scenario=posthog_frozen_perf_coverage_uncached
 ```
 
-The focused scenario builds the revision being tested, deploys an isolated
-warehouse, registers the same frozen files, and executes only
-`pgwire_uncached`. It does not require a running local database. Both scenarios
-use one warmup and four measured repetitions per query, sequential execution,
-and the workflow's explicit worker resource settings. "Uncached" disables the
-DuckDB external file cache; it does not guarantee cold OS or storage caches.
-See [cache settings](../../tests/perf/README.md#duckdb-cache-comparison).
+Each coverage dispatch executes all twelve queries with one warmup and four
+measured repetitions, sequentially, using the same frozen files. The explicit
+3 CPU / 12 GiB settings describe DuckDB workers, not equivalent resources across
+engines. "Uncached" disables the DuckDB external file cache; it does not
+guarantee cold OS or storage caches. See
+[cache settings](../../tests/perf/README.md#duckdb-cache-comparison).
+
+Independent dispatches have different run and nightly IDs. Compare matching
+recorded commits, catalog versions, fixture versions, resource settings, and
+methodology. Pin the same `trino_image` digest for both Trino configurations.
+The workflow serializes dispatches on the same branch; complete one before
+starting the next.
 
 Artifacts live in `perf-coverage/`, with a `-coverage` run ID suffix. The
 original `perf/` and `perf-properties/` histories are preserved. Main-branch
@@ -62,13 +83,17 @@ five configurations, the equal-speed estimate is:
 
 ```text
 additional query time = sum(uncached means) * 5 repetitions * 5 configurations
-full workflow estimate = original full workflow time + additional query time
+full campaign estimate = original workflow time + additional query time
+                         + sum(overhead for each coverage dispatch)
 ```
 
 Report this explicitly as an equal-speed estimate, not a forecast of engine
 performance. Include a sensitivity range for the other four configurations.
-Account separately for fixture validation, setup, collection, and teardown;
-the focused workflow's build/deployment time must not be multiplied by five.
+Each independent coverage dispatch repeats build, deployment, fixture validation,
+collection, and teardown. Estimate that overhead per dispatch; do not count it
+as query time. A hypothetical single sequential workflow would share setup,
+but is not the supported launch method and may exceed the four-hour scenario
+limit.
 Use the measured coverage phase wall time to check the sum-based estimate,
 because warmups and harness overhead are not in `query_results.csv`.
 
