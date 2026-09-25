@@ -25,7 +25,7 @@ func TestCheckedInCatalogsLoad(t *testing.T) {
 				t.Fatalf("LoadCatalog(%s): %v", path, err)
 			}
 			wantTargets := []Protocol{ProtocolPGWire}
-			if filepath.Base(path) == "ducklake_posthog_tables.yaml" {
+			if filepath.Base(path) == "ducklake_posthog_tables.yaml" || filepath.Base(path) == "ducklake_posthog_coverage.yaml" {
 				wantTargets = []Protocol{ProtocolPGWireUncached, ProtocolPGWireCached, ProtocolTrino, ProtocolTrinoCached, ProtocolAthena}
 			}
 			if !reflect.DeepEqual(catalog.Targets, wantTargets) {

@@ -203,45 +203,50 @@ func TestPublishArtifactsBootstrapsAndReplacesRunData(t *testing.T) {
 }
 
 func TestPublishArtifactsWritesSuiteAndFixtureVersion(t *testing.T) {
-	runDir := t.TempDir()
-	writeCustomSummaryFile(t, runDir, map[string]any{
-		"run_id":          "scenario-dev-posthog-frozen-perf-1-properties",
-		"dataset_version": "posthog-file-views-v1",
-		"suite":           "properties",
-		"fixture_version": "properties-sha256-abc",
-		"nightly_run_id":  "scenario-dev-posthog-frozen-perf-1",
-		"started_at":      "2026-03-11T23:43:03Z",
-		"finished_at":     "2026-03-11T23:43:14Z",
-	})
-	writeFixtureCSVFile(t, runDir)
-	artifacts, err := loadArtifacts(runDir)
-	if err != nil {
-		t.Fatalf("loadArtifacts returned error: %v", err)
-	}
-	db := &fakeDB{tx: &fakeTx{}}
-	if err := publishArtifacts(context.Background(), Config{Schema: "duckgres_perf"}, db, artifacts); err != nil {
-		t.Fatalf("publishArtifacts returned error: %v", err)
-	}
-	runInsert := db.tx.execs[2]
-	if runInsert.args[1] != "posthog-file-views-v1" || runInsert.args[8] != core.SuiteProperties {
-		t.Fatalf("run dataset/suite = %#v/%#v", runInsert.args[1], runInsert.args[8])
-	}
-	if got, ok := runInsert.args[9].(*string); !ok || got == nil || *got != "properties-sha256-abc" {
-		t.Fatalf("run fixture_version = %#v", runInsert.args[9])
-	}
-	if got := runInsert.args[10]; got != "scenario-dev-posthog-frozen-perf-1" {
-		t.Fatalf("run nightly_run_id = %#v", got)
-	}
-	for _, result := range db.tx.execs[3:] {
-		if result.args[11] != "posthog-file-views-v1" || result.args[15] != core.SuiteProperties {
-			t.Fatalf("result dataset/suite = %#v/%#v", result.args[11], result.args[15])
-		}
-		if got, ok := result.args[16].(*string); !ok || got == nil || *got != "properties-sha256-abc" {
-			t.Fatalf("result fixture_version = %#v", result.args[16])
-		}
-		if got := result.args[17]; got != "scenario-dev-posthog-frozen-perf-1" {
-			t.Fatalf("result nightly_run_id = %#v", got)
-		}
+	for _, suite := range []string{"properties", "coverage"} {
+		t.Run(suite, func(t *testing.T) {
+			runDir := t.TempDir()
+			writeCustomSummaryFile(t, runDir, map[string]any{
+				"run_id":          "scenario-dev-posthog-frozen-perf-1-" + suite,
+				"dataset_version": "posthog-file-views-v1",
+				"suite":           suite,
+				"fixture_version": suite + "-sha256-abc",
+				"nightly_run_id":  "scenario-dev-posthog-frozen-perf-1",
+				"started_at":      "2026-03-11T23:43:03Z",
+				"finished_at":     "2026-03-11T23:43:14Z",
+			})
+			writeFixtureCSVFile(t, runDir)
+			artifacts, err := loadArtifacts(runDir)
+			if err != nil {
+				t.Fatalf("loadArtifacts returned error: %v", err)
+			}
+			db := &fakeDB{tx: &fakeTx{}}
+			if err := publishArtifacts(context.Background(), Config{Schema: "duckgres_perf"}, db, artifacts); err != nil {
+				t.Fatalf("publishArtifacts returned error: %v", err)
+			}
+			runInsert := db.tx.execs[2]
+			if runInsert.args[1] != "posthog-file-views-v1" || runInsert.args[8] != suite {
+				t.Fatalf("run dataset/suite = %#v/%#v", runInsert.args[1], runInsert.args[8])
+			}
+			if got, ok := runInsert.args[9].(*string); !ok || got == nil || *got != suite+"-sha256-abc" {
+				t.Fatalf("run fixture_version = %#v", runInsert.args[9])
+			}
+			if got := runInsert.args[10]; got != "scenario-dev-posthog-frozen-perf-1" {
+				t.Fatalf("run nightly_run_id = %#v", got)
+			}
+			for _, result := range db.tx.execs[3:] {
+				if result.args[11] != "posthog-file-views-v1" || result.args[15] != suite {
+					t.Fatalf("result dataset/suite = %#v/%#v", result.args[11], result.args[15])
+				}
+				if got, ok := result.args[16].(*string); !ok || got == nil || *got != suite+"-sha256-abc" {
+					t.Fatalf("result fixture_version = %#v", result.args[16])
+				}
+				if got := result.args[17]; got != "scenario-dev-posthog-frozen-perf-1" {
+					t.Fatalf("result nightly_run_id = %#v", got)
+				}
+			}
+
+		})
 	}
 }
 

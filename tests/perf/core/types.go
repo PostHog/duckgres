@@ -157,13 +157,14 @@ type QueryResult struct {
 const (
 	SuiteTables     = "tables"
 	SuiteProperties = "properties"
+	SuiteCoverage   = "coverage"
 )
 
 // ValidateSuite rejects a suite outside the closed set, so a typo fails when a
 // run starts rather than after hours of measurement at publish time.
 func ValidateSuite(suite string) error {
-	if suite != SuiteTables && suite != SuiteProperties {
-		return fmt.Errorf("unknown suite %q (want %q or %q)", suite, SuiteTables, SuiteProperties)
+	if suite != SuiteTables && suite != SuiteProperties && suite != SuiteCoverage {
+		return fmt.Errorf("unknown suite %q (want %q, %q, or %q)", suite, SuiteTables, SuiteProperties, SuiteCoverage)
 	}
 	return nil
 }
@@ -171,8 +172,8 @@ func ValidateSuite(suite string) error {
 type RunSummary struct {
 	RunID          string `json:"run_id"`
 	DatasetVersion string `json:"dataset_version"`
-	// Suite names the comparison family inside a dataset ("tables" or
-	// "properties"); one nightly publishes several suites under one dataset.
+	// Suite names the comparison family inside a dataset (tables, properties,
+	// or coverage); one nightly publishes several suites under one dataset.
 	Suite string `json:"suite,omitempty"`
 	// FixtureVersion identifies the exact fixture a suite measured when it is
 	// finer-grained than the dataset (e.g. the properties object inventory).

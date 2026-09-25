@@ -149,7 +149,7 @@ jobs:
         run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION" --alias "$KUBE_CONTEXT"
 
       - name: Load frozen perf identity and Athena configuration
-        if: env.SCENARIO_NAME == 'posthog_frozen_perf'
+        if: env.SCENARIO_NAME == 'posthog_frozen_perf' || env.SCENARIO_NAME == 'posthog_frozen_perf_coverage_uncached'
         run: bash scripts/scenario_athena_config.sh >> "$GITHUB_ENV"
 
       - name: Load properties fixture override
@@ -212,7 +212,7 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -d '' perf_summaries < <(
-            find artifacts/scenario-dev -type f \( -path '*/perf/summary.json' -o -path '*/perf-properties/summary.json' \) -print0 2>/dev/null | sort -z
+            find artifacts/scenario-dev -type f \( -path '*/perf/summary.json' -o -path '*/perf-properties/summary.json' -o -path '*/perf-coverage/summary.json' \) -print0 2>/dev/null | sort -z
           )
           if [ "${#perf_summaries[@]}" -eq 0 ]; then
             echo "No scenario perf artifact was produced; skipping historical publish."

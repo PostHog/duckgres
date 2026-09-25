@@ -130,7 +130,7 @@ require_pr_identity() {
 }
 
 frozen_perf_scenario() {
-  [ "$SCENARIO_NAME" = posthog_frozen_perf ]
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_coverage_uncached ]
 }
 
 hoglake_perf_enabled() {

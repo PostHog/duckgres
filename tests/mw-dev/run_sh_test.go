@@ -138,21 +138,27 @@ func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	}
 }
 
-func TestDeployCreatesDedicatedScenarioPodIdentityForAthenaPerf(t *testing.T) {
-	fakes := newRunSHFakes(t)
-	cmd := runSHCommand(t, fakes.binDir, "deploy",
-		"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
-		"SCENARIO_NAME=posthog_frozen_perf",
-		"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/athena-perf",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Athena perf deploy failed: %v\n%s", err, out)
-	}
-	calls := fakes.calls(t)
-	want := "aws eks create-pod-identity-association --region us-east-1 --cluster-name test-cluster --namespace duckgres-ci-pr-123 --service-account duckgres-scenario --role-arn arn:aws:iam::123456789012:role/athena-perf"
-	if !strings.Contains(calls, want) {
-		t.Fatalf("deploy did not create dedicated scenario Pod Identity; calls:\n%s", calls)
+func TestDeployCreatesDedicatedScenarioPodIdentityForFrozenPerf(t *testing.T) {
+	for _, scenario := range []string{"posthog_frozen_perf", "posthog_frozen_perf_coverage_uncached"} {
+		t.Run(scenario, func(t *testing.T) {
+			fakes := newRunSHFakes(t)
+			cmd := runSHCommand(t, fakes.binDir, "deploy",
+				"SCENARIO_DEV_ALLOW_DUCKLING_DELETE=1",
+				"SCENARIO_NAME="+scenario,
+				"E2E_SUITE=neutral",
+				"SCENARIO_POD_IDENTITY_ROLE=arn:aws:iam::123456789012:role/athena-perf",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("Athena perf deploy failed: %v\n%s", err, out)
+			}
+			calls := fakes.calls(t)
+			want := "aws eks create-pod-identity-association --region us-east-1 --cluster-name test-cluster --namespace duckgres-ci-pr-123 --service-account duckgres-scenario --role-arn arn:aws:iam::123456789012:role/athena-perf"
+			if !strings.Contains(calls, want) {
+				t.Fatalf("deploy did not create dedicated scenario Pod Identity; calls:\n%s", calls)
+			}
+
+		})
 	}
 }
 
