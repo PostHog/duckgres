@@ -2,9 +2,9 @@ name: hoglake-distinct-diagnostic
 description: Temporary scan and exact distinct comparison with operator profiles.
 seed: 42
 dataset_scale: 1
-targets: [trino, trino_cached]
+targets: [trino]
 warmup_iterations: 1
-measure_iterations: 2
+measure_iterations: 1
 relation_variants:
   ducklake_table:
     events: posthog.events
@@ -13,11 +13,6 @@ relation_variants:
 paired_queries:
   - query_id_base: distinct_baseline
     intent_id: distinct_baseline
-    tags: [diagnostic]
-    params: {}
-    sql_template: SELECT COUNT(DISTINCT person_id) FROM {{ relation "events" }} WHERE person_id IS NOT NULL
-  - query_id_base: distinct_dictionary
-    intent_id: distinct_dictionary
     tags: [diagnostic]
     params: {}
     sql_template: SELECT COUNT(DISTINCT person_id) FROM {{ relation "events" }} WHERE person_id IS NOT NULL

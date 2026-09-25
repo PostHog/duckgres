@@ -717,8 +717,8 @@ func assertPerfTargetsPGWireTrinoAndAthena(t *testing.T, step core.Step) {
 	t.Helper()
 	targets, ok := step.With["targets"].([]any)
 	// Targeted Hoglake footer-cache run: Trino targets only.
-	if !ok || len(targets) != 2 || targets[0] != "trino" || targets[1] != "trino_cached" {
-		t.Fatalf("perf step %s targets = %#v, want [trino trino_cached]", step.ID, step.With["targets"])
+	if !ok || len(targets) != 1 || targets[0] != "trino" {
+		t.Fatalf("perf step %s targets = %#v, want [trino] for this diagnostic", step.ID, step.With["targets"])
 	}
 }
 

@@ -99,7 +99,7 @@ steps:
       catalog: ducklake
       catalog_file: ../../../perf/queries/diagnostic/hoglake_distinct_profile.yaml
       output_subdir: perf-distinct-diagnostic
-      targets: [trino, trino_cached]
+      targets: [trino]
       trino_hoglake_catalog: ${env:DUCKGRES_SCENARIO_ORG_ID}-frozen
       trino_ca_cert_file: ${env:DUCKGRES_SCENARIO_TRINO_CA_CERT}
       trino_startup_timeout: 2m

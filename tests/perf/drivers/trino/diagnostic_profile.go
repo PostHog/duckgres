@@ -61,7 +61,23 @@ func printDiagnosticProfile(body []byte) {
 		}
 	}
 	walk(document["outputStage"])
-	output := map[string]any{"queryId": document["queryId"], "totals": pick(document["queryStats"], keys), "stages": stages}
+	// This Trino version uses a flat StagesInfo graph, rather than outputStage.
+	if graph, ok := document["stages"].(map[string]any); ok {
+		if entries, ok := graph["stages"].([]any); ok {
+			for _, stage := range entries {
+				walk(stage)
+			}
+		}
+	}
+	var queryOperators []any
+	if stats, ok := document["queryStats"].(map[string]any); ok {
+		if entries, ok := stats["operatorSummaries"].([]any); ok {
+			for _, op := range entries {
+				queryOperators = append(queryOperators, pick(op, operatorKeys))
+			}
+		}
+	}
+	output := map[string]any{"queryId": document["queryId"], "totals": pick(document["queryStats"], keys), "stages": stages, "queryOperators": queryOperators}
 	encoded, err := json.Marshal(output)
 	if err != nil {
 		return

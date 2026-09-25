@@ -191,6 +191,17 @@ jobs:
         if: failure()
         run: tests/mw-dev/run.sh diagnostics
 
+      - name: Upload diagnostic operator profiles
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distinct-operators-${{ github.run_id }}
+          path: |
+            artifacts/scenario-dev/**/distinct-profiles.jsonl
+            artifacts/scenario-dev/**/perf-distinct-diagnostic/*.csv
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Teardown
         if: always()
         run: tests/mw-dev/run.sh teardown
