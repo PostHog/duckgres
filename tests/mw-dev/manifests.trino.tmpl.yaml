@@ -152,10 +152,10 @@ data:
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
     query.max-memory=6GB
     query.max-memory-per-node=2GB
-    # Overlap scan work at the existing CPU/memory budget: 4x the expected
-    # one-CPU defaults (2 threads / 4 leaf drivers). Keep task.concurrency default.
-    task.max-worker-threads=8
-    task.min-drivers=16
+    # 1-CPU workers: raised from 8/16 to overlap S3 latency (keep task.concurrency default).
+    # Experiment measured by the targeted frozen perf run; revert if events by-name uncached does not improve.
+    task.max-worker-threads=24
+    task.min-drivers=48
     shutdown.grace-period=10s
     catalog.management=dynamic
     # Both targets load the same managers; catalog fs.cache.enabled gates use.
