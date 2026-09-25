@@ -10,6 +10,39 @@ import (
 	"time"
 )
 
+// ServiceMetricsColumns is the query_service_metrics.csv header. Columns are
+// only ever appended: the first LegacyServiceMetricsColumnCount columns are the
+// original Athena-era contract, and the Trino query statistics follow. Athena
+// rows leave the Trino columns blank; Trino rows leave dpu_count,
+// result_reused, and engine_version blank.
+var ServiceMetricsColumns = []string{
+	"query_id",
+	"intent_id",
+	"measure_iteration",
+	"protocol",
+	"queue_ms",
+	"planning_ms",
+	"engine_ms",
+	"service_ms",
+	"bytes_scanned",
+	"dpu_count",
+	"result_reused",
+	"engine_version",
+	"representation",
+	"run_label",
+	"total_splits",
+	"completed_splits",
+	"physical_input_rows",
+	"cpu_ms",
+	"peak_memory_bytes",
+	"engine_query_id",
+	"stats_source",
+}
+
+// LegacyServiceMetricsColumnCount is the width of the header written before
+// the Trino query statistics columns were appended.
+const LegacyServiceMetricsColumnCount = 14
+
 type ArtifactSink struct {
 	dir                  string
 	csvFile              *os.File
@@ -59,23 +92,7 @@ func NewArtifactSink(dir string) (*ArtifactSink, error) {
 		return nil, fmt.Errorf("create service metrics artifact: %w", err)
 	}
 	serviceMetricsWriter := csv.NewWriter(serviceMetricsFile)
-	serviceMetricsHeader := []string{
-		"query_id",
-		"intent_id",
-		"measure_iteration",
-		"protocol",
-		"queue_ms",
-		"planning_ms",
-		"engine_ms",
-		"service_ms",
-		"bytes_scanned",
-		"dpu_count",
-		"result_reused",
-		"engine_version",
-		"representation",
-		"run_label",
-	}
-	if err := serviceMetricsWriter.Write(serviceMetricsHeader); err != nil {
+	if err := serviceMetricsWriter.Write(ServiceMetricsColumns); err != nil {
 		_ = serviceMetricsFile.Close()
 		_ = f.Close()
 		return nil, fmt.Errorf("write service metrics header: %w", err)
@@ -121,23 +138,7 @@ func (s *ArtifactSink) Record(result QueryResult) error {
 		return fmt.Errorf("flush csv row: %w", err)
 	}
 	if result.ServiceMetrics != nil {
-		metrics := result.ServiceMetrics
-		serviceMetricsRow := []string{
-			result.QueryID,
-			result.IntentID,
-			strconv.Itoa(result.MeasureIteration),
-			string(result.Protocol),
-			formatMilliseconds(metrics.QueueDuration),
-			formatMilliseconds(metrics.PlanningDuration),
-			formatMilliseconds(metrics.EngineDuration),
-			formatMilliseconds(metrics.ServiceDuration),
-			strconv.FormatInt(metrics.BytesScanned, 10),
-			strconv.FormatFloat(metrics.DPUCount, 'f', -1, 64),
-			strconv.FormatBool(metrics.ResultReused),
-			metrics.EngineVersion,
-			result.Representation,
-			result.Protocol.RunLabel(result.Representation),
-		}
+		serviceMetricsRow := serviceMetricsRecord(result)
 		if err := s.serviceMetricsWriter.Write(serviceMetricsRow); err != nil {
 			return fmt.Errorf("write service metrics row: %w", err)
 		}
@@ -197,6 +198,50 @@ func (s *ArtifactSink) Close(summary RunSummary, serverMetrics string) error {
 		return fmt.Errorf("write server metrics: %w", err)
 	}
 	return nil
+}
+
+func serviceMetricsRecord(result QueryResult) []string {
+	metrics := result.ServiceMetrics
+	engineMS := ""
+	if metrics.HasEngineDuration() {
+		engineMS = formatMilliseconds(metrics.EngineDuration)
+	}
+	dpuCount := strconv.FormatFloat(metrics.DPUCount, 'f', -1, 64)
+	resultReused := strconv.FormatBool(metrics.ResultReused)
+	trinoColumns := make([]string, len(ServiceMetricsColumns)-LegacyServiceMetricsColumnCount)
+	if trino := metrics.Trino; trino != nil {
+		// DPUs and result reuse are Athena concepts; a zero would mislead.
+		dpuCount, resultReused = "", ""
+		physicalInputRows := ""
+		if trino.PhysicalInputRows != nil {
+			physicalInputRows = strconv.FormatInt(*trino.PhysicalInputRows, 10)
+		}
+		trinoColumns = []string{
+			strconv.FormatInt(trino.TotalSplits, 10),
+			strconv.FormatInt(trino.CompletedSplits, 10),
+			physicalInputRows,
+			formatMilliseconds(trino.CPUDuration),
+			strconv.FormatInt(trino.PeakMemoryBytes, 10),
+			trino.QueryID,
+			trino.Source,
+		}
+	}
+	return append([]string{
+		result.QueryID,
+		result.IntentID,
+		strconv.Itoa(result.MeasureIteration),
+		string(result.Protocol),
+		formatMilliseconds(metrics.QueueDuration),
+		formatMilliseconds(metrics.PlanningDuration),
+		engineMS,
+		formatMilliseconds(metrics.ServiceDuration),
+		strconv.FormatInt(metrics.BytesScanned, 10),
+		dpuCount,
+		resultReused,
+		metrics.EngineVersion,
+		result.Representation,
+		result.Protocol.RunLabel(result.Representation),
+	}, trinoColumns...)
 }
 
 func formatMilliseconds(duration time.Duration) string {

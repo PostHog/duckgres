@@ -208,6 +208,34 @@ queue, planning, engine, and service time; bytes scanned; DPU count when the
 service returns it; result reuse; and engine version. `query_results.csv`
 remains the canonical latency/status artifact. Both CSVs append the representation label; stable query IDs also include it.
 
+Trino rows (one per measured Trino iteration) come from the coordinator's
+query info (`GET /v1/query/{queryId}?pruned=true`), read after the timed
+window with the benchmark credentials. The driver learns each query's ID from
+its client-protocol statement responses through a wrapping HTTP transport, so
+no extra SQL runs. Column mapping: `queue_ms` = `queuedTime`, `planning_ms` =
+`analysisTime` + `planningTime`, `engine_ms` = `executionTime`, `service_ms` =
+`elapsedTime`, `bytes_scanned` = `physicalInputDataSize`. Columns appended
+after `run_label`, blank on Athena rows:
+
+- `total_splits`, `completed_splits` (Trino `totalDrivers`/`completedDrivers`,
+  which the client protocol and web UI call splits)
+- `physical_input_rows` (`physicalInputPositions`)
+- `cpu_ms` (`totalCpuTime`)
+- `peak_memory_bytes` (`peakUserMemoryReservation`)
+- `engine_query_id` (the Trino query ID)
+- `stats_source`: `query_info`, or `statement_stats` when the coordinator did
+  not answer and the final statement response's statistics were recorded
+  instead; that fallback has no `engine_ms` or `physical_input_rows`
+
+Trino rows leave `dpu_count`, `result_reused`, and `engine_version` blank. A
+query whose statistics could not be read at all has no row.
+
+The publisher loads the sidecar when it exists (both the original 14-column
+header and the current one) and replaces the run's rows in
+`<schema>.query_service_metrics`. It only touches that table when the run has
+service metrics rows, so PGWire-only runs keep publishing to schemas that were
+bootstrapped before the table existed.
+
 ## Nightly Run
 
 ```bash

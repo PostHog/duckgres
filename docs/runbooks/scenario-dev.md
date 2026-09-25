@@ -117,8 +117,10 @@ uploadable in a visible `*.partial/` directory with an
   published in the GitHub Actions job summary.
 - `step_results.csv` contains per-step duration, status, and error class.
 - `events.jsonl` contains the execution timeline.
-- `perf/query_service_metrics.csv` separates Athena queue/planning/engine time
-  and records bytes scanned for cost analysis.
+- `perf/query_service_metrics.csv` separates Athena and Trino
+  queue/planning/engine time and records bytes scanned; Trino rows add split
+  counts, physical input rows, CPU time, peak memory, and the Trino query ID,
+  which is the first thing to check when a Trino latency moves.
 
 Perf query errors mark the `perf_queries` DAG step failed. They do not stop
 independent sibling branches: for example, `dbt_models` still runs because it
@@ -127,8 +129,9 @@ skipped, and `always_run` teardown still executes. The final workflow result is
 reported after all eligible steps and artifact collection finish.
 
 After teardown, scheduled and manually dispatched runs on `main` publish any
-collected `perf/summary.json` and `perf/query_results.csv` into the persistent
-scenario perf result schema. Publishing runs with `if: always()` so measured
+collected `perf/summary.json`, `perf/query_results.csv`, and (when it has rows)
+`perf/query_service_metrics.csv` into the persistent scenario perf result
+schema. Publishing runs with `if: always()` so measured
 query failures remain visible. Runs without a perf artifact skip publishing,
 and non-`main` branch runs never publish into the shared history. Each artifact
 has a two-minute publish timeout so one stalled database operation cannot

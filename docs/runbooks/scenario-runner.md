@@ -67,7 +67,8 @@ export DUCKGRES_SCENARIO_ATHENA_RESULTS_S3_URI="s3://<results-bucket>/<prefix>/"
 
 The full and fast suites exercise PGWire only. The targeted frozen perf
 scenario compares PGWire on DuckLake, Trino on Hoglake, and on-demand Athena. It records per-query
-success and failure rows in `query_results.csv` and Athena service details in
+success and failure rows in `query_results.csv` and Athena and Trino service
+details (Trino splits and physical input included) in
 `query_service_metrics.csv`.
 Measured query errors fail the perf DAG step after its artifacts are written;
 independent sibling steps continue to run.
