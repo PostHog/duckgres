@@ -150,7 +150,9 @@ through Athena against Glue tables over the same immutable Parquet objects.
 The raw `read_parquet` file views are still created for table setup and the
 dbt scenario, but are no longer benchmarked. Athena is on-demand, result reuse is disabled, and
 the harness records service-side timing and scanned bytes in
-`query_service_metrics.csv`.
+`query_service_metrics.csv`. Trino rows in the same file carry the
+coordinator's query statistics (splits, physical input, CPU, peak memory, and
+the Trino query ID) for each measured iteration.
 To reproduce the scheduled run, deploy and test with `E2E_SUITE=trino` and the
 same `TRINO_POD_IDENTITY_ROLE` required by the isolated Trino lane. Teardown and
 the scheduled cleanup sweep remove both namespace-local workloads and their

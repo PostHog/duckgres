@@ -46,8 +46,9 @@ type Config struct {
 }
 
 type artifacts struct {
-	Summary core.RunSummary
-	Results []resultRow
+	Summary        core.RunSummary
+	Results        []resultRow
+	ServiceMetrics []serviceMetricsRow
 }
 
 type resultRow struct {
@@ -131,9 +132,14 @@ func loadArtifacts(runDir string) (artifacts, error) {
 	if err != nil {
 		return artifacts{}, err
 	}
+	serviceMetrics, err := loadServiceMetrics(filepath.Join(runDir, "query_service_metrics.csv"))
+	if err != nil {
+		return artifacts{}, err
+	}
 	return artifacts{
-		Summary: summary,
-		Results: results,
+		Summary:        summary,
+		Results:        results,
+		ServiceMetrics: serviceMetrics,
 	}, nil
 }
 
@@ -308,6 +314,9 @@ func publishArtifacts(ctx context.Context, cfg Config, db dbHandle, loaded artif
 			return fmt.Errorf("insert query result (%s/%s/%d/%s): %w", loaded.Summary.RunID, result.QueryID, result.MeasureIteration, result.Protocol, err)
 		}
 	}
+	if err = publishServiceMetrics(ctx, tx, schema, loaded); err != nil {
+		return err
+	}
 	if err = tx.Commit(); err != nil {
 		return fmt.Errorf("commit publish transaction: %w", err)
 	}
@@ -363,6 +372,7 @@ func bootstrapSchema(ctx context.Context, tx txHandle, schema string) error {
 WHERE suite IS NULL`, schema, table, core.SuiteProperties, core.SuiteTables),
 		)
 	}
+	statements = append(statements, serviceMetricsBootstrapStatements(schema)...)
 	for _, stmt := range statements {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("bootstrap publish schema: %w", err)

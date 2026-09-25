@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/posthog/duckgres/tests/perf/core"
@@ -48,9 +50,17 @@ type ConnectionConfig struct {
 	Source         string
 	CACertFile     string
 	Startup        StartupOptions
+	// QueryStats bounds the coordinator query info read after each measured query.
+	QueryStats QueryStatsOptions
 }
 
 func (c ConnectionConfig) DSN() (string, error) {
+	return c.dsn("")
+}
+
+// dsn formats the DSN. A custom client carries its own TLS configuration, so
+// the CA file is omitted from the DSN when one is named.
+func (c ConnectionConfig) dsn(customClient string) (string, error) {
 	server, err := url.Parse(strings.TrimSpace(c.ServerURL))
 	if err != nil {
 		return "", fmt.Errorf("parse Trino coordinator URL: %w", err)
@@ -87,11 +97,15 @@ func (c ConnectionConfig) DSN() (string, error) {
 		User:   url.UserPassword(c.Username, c.Password),
 	}
 	config := trinoclient.Config{
-		ServerURI:   authenticatedServer.String(),
-		Source:      source,
-		Catalog:     c.Catalog,
-		Schema:      schema,
-		SSLCertPath: c.CACertFile,
+		ServerURI:        authenticatedServer.String(),
+		Source:           source,
+		Catalog:          c.Catalog,
+		Schema:           schema,
+		SSLCertPath:      c.CACertFile,
+		CustomClientName: customClient,
+	}
+	if customClient != "" {
+		config.SSLCertPath = ""
 	}
 	dsn, err := config.FormatDSN()
 	if err != nil {
@@ -103,7 +117,14 @@ func (c ConnectionConfig) DSN() (string, error) {
 type Driver struct {
 	protocol core.Protocol
 	exec     Executor
+	// stats reads Trino query statistics after each measured query; nil
+	// leaves ServiceMetrics empty.
+	stats *statsCollector
+	// clientKey names the trino-go-client custom HTTP client registration.
+	clientKey string
 }
+
+var customClientSequence atomic.Uint64
 
 func New(ctx context.Context, config ConnectionConfig) (*Driver, error) {
 	protocol := config.Protocol
@@ -113,15 +134,36 @@ func New(ctx context.Context, config ConnectionConfig) (*Driver, error) {
 	if protocol != core.ProtocolTrino && protocol != core.ProtocolTrinoCached {
 		return nil, fmt.Errorf("unsupported Trino protocol %q", protocol)
 	}
-	dsn, err := config.DSN()
+	if _, err := config.DSN(); err != nil {
+		return nil, err
+	}
+	transport, err := newCoordinatorTransport(config.CACertFile)
 	if err != nil {
+		return nil, err
+	}
+	// The registered client observes statement responses to learn each
+	// measured query's ID; the collector reads query info without it.
+	clientKey := fmt.Sprintf("duckgres-perf-%d", customClientSequence.Add(1))
+	if err := trinoclient.RegisterCustomClient(clientKey, &http.Client{Transport: captureTransport{base: transport}}); err != nil {
+		return nil, fmt.Errorf("register Trino HTTP client: %w", err)
+	}
+	dsn, err := config.dsn(clientKey)
+	if err != nil {
+		trinoclient.DeregisterCustomClient(clientKey)
 		return nil, err
 	}
 	db, err := sql.Open("trino", dsn)
 	if err != nil {
+		trinoclient.DeregisterCustomClient(clientKey)
 		return nil, fmt.Errorf("open Trino connection: %w", err)
 	}
-	driver := &Driver{exec: &sqlExecutor{db: db}, protocol: protocol}
+	server, _ := url.Parse(strings.TrimSpace(config.ServerURL))
+	driver := &Driver{
+		exec:      &sqlExecutor{db: db},
+		protocol:  protocol,
+		stats:     newStatsCollector(server.Scheme+"://"+server.Host, config.Username, config.Password, transport, config.QueryStats),
+		clientKey: clientKey,
+	}
 	if err := driver.WaitReady(ctx, config.Startup); err != nil {
 		_ = driver.Close()
 		return nil, err
@@ -151,12 +193,23 @@ func (d *Driver) Execute(ctx context.Context, query core.Query, args []any) (cor
 	if sqlText == "" {
 		return core.ExecutionResult{}, fmt.Errorf("query %s missing canonical SQL", query.QueryID)
 	}
+	execCtx := ctx
+	var capture *queryCapture
+	if d.stats != nil {
+		capture = &queryCapture{}
+		execCtx = withQueryCapture(ctx, capture)
+	}
 	started := time.Now()
-	rows, err := d.exec.Execute(ctx, sqlText, args)
-	return core.ExecutionResult{
+	rows, err := d.exec.Execute(execCtx, sqlText, args)
+	result := core.ExecutionResult{
 		Rows:     rows,
 		Duration: time.Since(started),
-	}, err
+	}
+	// Statistics are read after the timed window, for failed queries too.
+	if capture != nil {
+		result.ServiceMetrics = d.stats.collect(ctx, capture)
+	}
+	return result, err
 }
 
 // WaitReady performs an authenticated query before the runner starts timing
@@ -199,6 +252,9 @@ func (d *Driver) WaitReady(ctx context.Context, options StartupOptions) error {
 }
 
 func (d *Driver) Close() error {
+	if d.clientKey != "" {
+		defer trinoclient.DeregisterCustomClient(d.clientKey)
+	}
 	if d.exec == nil {
 		return nil
 	}

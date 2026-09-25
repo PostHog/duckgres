@@ -71,6 +71,9 @@ type Query struct {
 	Params         map[string]any `yaml:"params"`
 	PGWireSQL      string         `yaml:"pgwire_sql"`
 	StorageTarget  StorageTarget  `yaml:"-" json:"-"`
+	// Expectations holds optional perf gate bounds per protocol, parsed from
+	// the query's `expectations:` mapping by the catalog loader.
+	Expectations map[Protocol]QueryExpectations `yaml:"-" json:"-"`
 }
 
 // CanonicalSQL returns the single rendered SQL statement shared by protocol
@@ -89,7 +92,9 @@ type ExecutionResult struct {
 
 // ServiceMetrics captures provider-side execution details which are useful
 // for separating queueing and planning from engine work. It is optional so
-// PGWire and Trino keep their existing artifact contract.
+// PGWire keeps its existing artifact contract. Athena fills the provider
+// fields from its query statistics; Trino fills the shared timing and
+// bytes-scanned fields from the coordinator plus the Trino-only details.
 type ServiceMetrics struct {
 	QueueDuration    time.Duration `json:"queue_duration_ns"`
 	PlanningDuration time.Duration `json:"planning_duration_ns"`
@@ -99,6 +104,38 @@ type ServiceMetrics struct {
 	DPUCount         float64       `json:"dpu_count"`
 	ResultReused     bool          `json:"result_reused"`
 	EngineVersion    string        `json:"engine_version"`
+	// Trino is set only for Trino targets. Athena rows leave it nil, which
+	// keeps their Trino-only artifact columns blank.
+	Trino *TrinoQueryStats `json:"trino,omitempty"`
+}
+
+// Sources of Trino query statistics, recorded so a reader can tell the
+// complete coordinator query info from the client-protocol fallback.
+const (
+	// TrinoStatsSourceQueryInfo is the coordinator's GET /v1/query/{queryId}.
+	TrinoStatsSourceQueryInfo = "query_info"
+	// TrinoStatsSourceStatement is the final client-protocol statement
+	// response. It has no execution time or physical input row count.
+	TrinoStatsSourceStatement = "statement_stats"
+)
+
+// TrinoQueryStats records the Trino query statistics that explain where a
+// query's time went: planning a split per file, reading footers, scanning.
+type TrinoQueryStats struct {
+	QueryID         string `json:"query_id"`
+	Source          string `json:"source"`
+	TotalSplits     int64  `json:"total_splits"`
+	CompletedSplits int64  `json:"completed_splits"`
+	// PhysicalInputRows is nil when the statistics source does not report it.
+	PhysicalInputRows *int64        `json:"physical_input_rows,omitempty"`
+	CPUDuration       time.Duration `json:"cpu_duration_ns"`
+	PeakMemoryBytes   int64         `json:"peak_memory_bytes"`
+}
+
+// HasEngineDuration reports whether EngineDuration was measured rather than
+// left at zero by a statistics source that does not report it.
+func (m ServiceMetrics) HasEngineDuration() bool {
+	return m.Trino == nil || m.Trino.Source != TrinoStatsSourceStatement
 }
 
 type QueryResult struct {

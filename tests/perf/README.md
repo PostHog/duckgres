@@ -141,6 +141,46 @@ dashboards to compare paired targets by their generated query-ID suffixes.
 PGWire executes only `ducklake_table`; Trino executes only `hoglake_table`;
 Athena executes only `athena_external`.
 
+## Perf Gate Expectations
+
+Any legacy or paired query may declare optional `expectations:`: per-protocol
+bounds on the provider statistics in `query_service_metrics.csv`. Catalogs
+without them are not checked.
+
+```yaml
+paired_queries:
+  - query_id_base: q_events_total_v5
+    intent_id: intent_events_total_v5
+    sql_template: SELECT COUNT(*) AS events FROM {{ relation "events" }}
+    expectations:
+      trino:
+        max_total_splits: 200
+        max_bytes_scanned: 10MiB
+```
+
+Supported bounds are `max_total_splits` (Trino split count; Trino targets
+only) and `max_bytes_scanned` (Trino physical input or Athena data scanned; a
+byte count or a size in `KiB`, `MiB`, `GiB`, or `TiB`). Bounds are inclusive.
+Latency is deliberately not boundable. The loader rejects unknown bound names,
+protocols the query does not target, and entries without a bound, so a typo
+cannot silently disable the gate. A paired query's bounds attach to the
+variant each protocol executes (Trino: `hoglake_table`).
+
+After the measured iterations, the `perf_queries` scenario step checks every
+bound against each successful measured iteration of its (query, protocol)
+pair. A bound that any iteration exceeds, or whose metric was not captured
+for an iteration, fails the step with a message naming the query, protocol,
+observed value, bound, and the worst iteration's Trino query ID, for example:
+
+```text
+perf gate failed: 1 expectation(s) violated:
+- q_events_total_v5__hoglake_table on trino: total_splits 7300 exceeds max_total_splits 200 in 4 of 4 measured iterations (worst: iteration 1, Trino query <query-id>)
+```
+
+The check runs after the artifacts are written and is independent of
+`fail_on_query_errors`; warmups and failed iterations are not checked, since
+query errors are reported on their own.
+
 ## Local Smoke Run
 
 ```bash
@@ -207,6 +247,34 @@ The publisher accepts both the original ten-column v1 header and the v2 header w
 queue, planning, engine, and service time; bytes scanned; DPU count when the
 service returns it; result reuse; and engine version. `query_results.csv`
 remains the canonical latency/status artifact. Both CSVs append the representation label; stable query IDs also include it.
+
+Trino rows (one per measured Trino iteration) come from the coordinator's
+query info (`GET /v1/query/{queryId}?pruned=true`), read after the timed
+window with the benchmark credentials. The driver learns each query's ID from
+its client-protocol statement responses through a wrapping HTTP transport, so
+no extra SQL runs. Column mapping: `queue_ms` = `queuedTime`, `planning_ms` =
+`analysisTime` + `planningTime`, `engine_ms` = `executionTime`, `service_ms` =
+`elapsedTime`, `bytes_scanned` = `physicalInputDataSize`. Columns appended
+after `run_label`, blank on Athena rows:
+
+- `total_splits`, `completed_splits` (Trino `totalDrivers`/`completedDrivers`,
+  which the client protocol and web UI call splits)
+- `physical_input_rows` (`physicalInputPositions`)
+- `cpu_ms` (`totalCpuTime`)
+- `peak_memory_bytes` (`peakUserMemoryReservation`)
+- `engine_query_id` (the Trino query ID)
+- `stats_source`: `query_info`, or `statement_stats` when the coordinator did
+  not answer and the final statement response's statistics were recorded
+  instead; that fallback has no `engine_ms` or `physical_input_rows`
+
+Trino rows leave `dpu_count`, `result_reused`, and `engine_version` blank. A
+query whose statistics could not be read at all has no row.
+
+The publisher loads the sidecar when it exists (both the original 14-column
+header and the current one) and replaces the run's rows in
+`<schema>.query_service_metrics`. It only touches that table when the run has
+service metrics rows, so PGWire-only runs keep publishing to schemas that were
+bootstrapped before the table existed.
 
 ## Nightly Run
 

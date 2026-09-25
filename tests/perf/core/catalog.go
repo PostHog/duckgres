@@ -36,6 +36,15 @@ type pairedQueryDefinition struct {
 	Tags        []string       `yaml:"tags"`
 	Params      map[string]any `yaml:"params"`
 	SQLTemplate string         `yaml:"sql_template"`
+	// Expectations is parsed by parseExpectations so errors name the query.
+	Expectations yaml.Node `yaml:"expectations"`
+}
+
+// legacyQueryExpectations reads each legacy query's optional bounds alongside
+// the runtime Query decode.
+type legacyQueryExpectations struct {
+	QueryID      string    `yaml:"query_id"`
+	Expectations yaml.Node `yaml:"expectations"`
 }
 
 type catalogEntry struct {
@@ -77,11 +86,29 @@ func ParseCatalog(raw []byte) (Catalog, error) {
 	for _, entry := range entries {
 		switch {
 		case entry.legacy != nil:
+			targets := entry.legacy.Targets
+			if len(targets) == 0 {
+				targets = file.Targets
+			}
+			if err := validateExpectations("query "+entry.legacy.QueryID, entry.legacy.Expectations, targets); err != nil {
+				return Catalog{}, err
+			}
 			c.Queries = append(c.Queries, *entry.legacy)
 		case entry.paired != nil:
+			owner := "paired query " + entry.paired.QueryIDBase
+			expectations, err := parseExpectations(owner, entry.paired.Expectations)
+			if err != nil {
+				return Catalog{}, err
+			}
+			if err := validateExpectations(owner, expectations, file.Targets); err != nil {
+				return Catalog{}, err
+			}
 			queries, err := expandPairedQuery(*entry.paired, file.RelationVariants)
 			if err != nil {
 				return Catalog{}, err
+			}
+			for i := range queries {
+				queries[i].Expectations = expectationsForStorageTarget(expectations, queries[i].StorageTarget)
 			}
 			c.Queries = append(c.Queries, queries...)
 		}
@@ -112,6 +139,17 @@ func catalogEntries(raw []byte) ([]catalogEntry, error) {
 			var queries []Query
 			if err := value.Decode(&queries); err != nil {
 				return nil, fmt.Errorf("parse legacy queries: %w", err)
+			}
+			var bounds []legacyQueryExpectations
+			if err := value.Decode(&bounds); err != nil {
+				return nil, fmt.Errorf("parse legacy queries: %w", err)
+			}
+			for i := range queries {
+				expectations, err := parseExpectations("query "+bounds[i].QueryID, bounds[i].Expectations)
+				if err != nil {
+					return nil, err
+				}
+				queries[i].Expectations = expectations
 			}
 			for i := range queries {
 				entries = append(entries, catalogEntry{legacy: &queries[i]})
