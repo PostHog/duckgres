@@ -916,3 +916,42 @@ export interface TrinoKillResult {
   query_id: string;
   org: string;
 }
+export interface TrinoRecoveryIdentity {
+  expected_generation: number;
+  incarnation: string;
+  pod_uid: string;
+  boot_id: string;
+  node_id: string;
+  coordinator_id: string;
+}
+
+export interface TrinoRecoveryBody extends TrinoRecoveryIdentity {
+  operation_id: string;
+  reason: string;
+  destructive_authorization: true;
+}
+
+export interface TrinoRecoveryRequest extends TrinoRecoveryBody {
+  instance_id: string;
+  requested_by: string;
+  created_at: string;
+}
+
+export interface TrinoRecoveryPreview {
+  cell: string;
+  instance: TrinoRecoveryIdentity & {
+    instance_id: string;
+    phase: string;
+    gateway_state: string;
+    phase_changed_at: string;
+    last_error: string;
+  };
+  capacity: { stored_serving: number; min_serving: number; desired_instances: number; frozen: boolean };
+  live_work_verified: boolean;
+  request: TrinoRecoveryRequest | null;
+}
+
+export interface TrinoInstancesResponse {
+  cell: string;
+  instances: { instance_id: string; phase: string; gateway_state: string; phase_changed_at: string }[];
+}

@@ -8,7 +8,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/posthog/duckgres/controlplane/configstore"
@@ -33,6 +35,53 @@ type trinoRecoveryRequest struct {
 	CoordinatorID            string `json:"coordinator_id"`
 	Reason                   string `json:"reason"`
 	DestructiveAuthorization bool   `json:"destructive_authorization"`
+}
+
+type trinoRecoveryInstanceSummary struct {
+	InstanceID     string    `json:"instance_id"`
+	Phase          string    `json:"phase"`
+	GatewayState   string    `json:"gateway_state"`
+	PhaseChangedAt time.Time `json:"phase_changed_at"`
+}
+
+func (a *TrinoAPI) handleRecoveryInstances(c *gin.Context) {
+	identity := IdentityFromContext(c)
+	if identity == nil || identity.Role != RoleAdmin || strings.TrimSpace(identity.Email) == "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+		return
+	}
+	store, ok := a.orgs.(trinoRecoveryStore)
+	if !ok {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Trino recovery is unavailable"})
+		return
+	}
+	ctx := c.Request.Context()
+	pool, err := store.GetTrinoPool(ctx, a.cell.storedID())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read Trino pool"})
+		return
+	}
+	if pool == nil || pool.APIMode != configstore.TrinoPoolAPIModeShared {
+		c.JSON(http.StatusNotFound, gin.H{"error": "unknown shared Trino pool"})
+		return
+	}
+	instances, err := store.ListTrinoPoolInstances(ctx, pool.PoolID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot read Trino instances"})
+		return
+	}
+	rows := make([]trinoRecoveryInstanceSummary, 0)
+	for _, instance := range instances {
+		if instance.PoolID != pool.PoolID || trinopool.Phase(instance.Phase).Terminal() {
+			continue
+		}
+		rows = append(rows, trinoRecoveryInstanceSummary{
+			InstanceID: instance.InstanceID, Phase: instance.Phase,
+			GatewayState: instance.GatewayState, PhaseChangedAt: instance.PhaseChangedAt,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].InstanceID < rows[j].InstanceID })
+	c.JSON(http.StatusOK, gin.H{"cell": a.cell.ID, "instances": rows})
 }
 
 func recoveryRequestView(request *configstore.TrinoPoolRecovery) any {

@@ -22,6 +22,7 @@ type recoveryTrinoStore struct {
 	writes        int
 	requestedPool string
 	requestErr    error
+	listErr       error
 }
 
 func (s *recoveryTrinoStore) GetTrinoPoolInstance(_ context.Context, id string) (*configstore.TrinoPoolInstance, error) {
@@ -37,7 +38,7 @@ func (s *recoveryTrinoStore) GetTrinoPool(_ context.Context, id string) (*config
 	return nil, nil
 }
 func (s *recoveryTrinoStore) ListTrinoPoolInstances(context.Context, string) ([]configstore.TrinoPoolInstance, error) {
-	return s.instances, nil
+	return s.instances, s.listErr
 }
 func (s *recoveryTrinoStore) GetTrinoPoolRecovery(context.Context, string, string) (*configstore.TrinoPoolRecovery, error) {
 	return s.request, nil
@@ -63,6 +64,73 @@ func recoveryTrinoAPI() (*TrinoAPI, *recoveryTrinoStore) {
 
 const recoveryPath = "/api/v1/trino/instances/instance-a/recovery?cell=pool-a"
 const recoveryBody = `{"operation_id":"recovery-test-a","expected_generation":7,"incarnation":"incarnation-a","pod_uid":"pod-a","boot_id":"boot-a","node_id":"node-a","coordinator_id":"coordinator-a","reason":"Discard retained results after independent verification","destructive_authorization":true}`
+
+func TestTrinoRecoveryInstancesAreScopedReadOnlyAndSanitized(t *testing.T) {
+	api, store := recoveryTrinoAPI()
+	store.instances = []configstore.TrinoPoolInstance{
+		{InstanceID: "instance-z", PoolID: store.pool.PoolID, Phase: "SERVING", GatewayState: "ACTIVE"},
+		*store.instance,
+		{InstanceID: "foreign", PoolID: "registered:other-pool", Phase: "DRAINING"},
+		{InstanceID: "retired", PoolID: store.pool.PoolID, Phase: "RETIRED"},
+		{InstanceID: "failure-retired", PoolID: store.pool.PoolID, Phase: "FAILURE_RETIRED"},
+	}
+	code, data := doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, "/api/v1/trino/instances?cell=pool-a", "")
+	if code != http.StatusOK || data["cell"] != "pool-a" || store.writes != 0 {
+		t.Fatalf("inventory: %d %#v writes=%d", code, data, store.writes)
+	}
+	rows := data["instances"].([]any)
+	if len(rows) != 2 || rows[0].(map[string]any)["instance_id"] != "instance-a" || rows[1].(map[string]any)["instance_id"] != "instance-z" {
+		t.Fatalf("unexpected inventory: %#v", rows)
+	}
+	row := rows[0].(map[string]any)
+	if len(row) != 4 || row["phase"] != "DRAINING" || row["gateway_state"] != "DRAINING" {
+		t.Fatalf("unexpected projection: %#v", row)
+	}
+	encoded, _ := json.Marshal(data)
+	for _, forbidden := range []string{"do-not-expose", "private.example.test", "blueprint", "endpoint_url", "foreign", "retired"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("inventory exposes %s", forbidden)
+		}
+	}
+}
+
+func TestTrinoRecoveryInstancesRejectViewerAndUnavailablePool(t *testing.T) {
+	api, store := recoveryTrinoAPI()
+	path := "/api/v1/trino/instances?cell=pool-a"
+	code, _ := doTrinoJSON(t, trinoTestRouter(api, RoleViewer), http.MethodGet, path, "")
+	if code != http.StatusForbidden {
+		t.Fatalf("viewer inventory: %d", code)
+	}
+	store.instances = nil
+	code, data := doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, path, "")
+	if code != http.StatusOK || len(data["instances"].([]any)) != 0 {
+		t.Fatalf("empty inventory: %d %#v", code, data)
+	}
+	store.listErr = errors.New("private database endpoint")
+	code, data = doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, path, "")
+	if code != http.StatusInternalServerError || strings.Contains(data["error"].(string), "private database") {
+		t.Fatalf("inventory error: %d %#v", code, data)
+	}
+	store.pool.APIMode = "legacy"
+	code, _ = doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, path, "")
+	if code != http.StatusNotFound {
+		t.Fatalf("legacy inventory: %d", code)
+	}
+	store.pool = nil
+	code, _ = doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, path, "")
+	if code != http.StatusNotFound {
+		t.Fatalf("missing pool: %d", code)
+	}
+	code, _ = doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, "/api/v1/trino/instances?cell=unknown", "")
+	if code != http.StatusNotFound || store.writes != 0 {
+		t.Fatalf("unknown pool: %d writes=%d", code, store.writes)
+	}
+	api = NewTrinoFleetAPI([]TrinoCell{{ID: "pool-a", StoredID: "registered:pool-a"}}, []TrinoCoordinatorClient{&fakeTrinoCoordinator{}}, &fakeTrinoOrgStore{}, nil)
+	code, _ = doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, path, "")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("unavailable recovery store: %d", code)
+	}
+}
 
 func TestTrinoRecoveryPreviewIsReadOnlyAndSanitized(t *testing.T) {
 	api, store := recoveryTrinoAPI()

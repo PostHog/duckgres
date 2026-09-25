@@ -35,6 +35,7 @@ func NewTrinoFleetAPI(cells []TrinoCell, clients []TrinoCoordinatorClient, orgs 
 
 func registerTrinoFleetAPI(r *gin.RouterGroup, api *TrinoAPI) {
 	r.GET("/trino/cells", api.handleCells)
+	r.GET("/trino/instances", api.forCell((*TrinoAPI).handleRecoveryInstances))
 	r.GET("/trino/instances/:id/recovery", api.forCell((*TrinoAPI).handleRecoveryPreview))
 	r.POST("/trino/instances/:id/recovery", api.forCell((*TrinoAPI).handleRequestRecovery))
 	r.GET("/trino/status", api.forCell((*TrinoAPI).handleStatus))

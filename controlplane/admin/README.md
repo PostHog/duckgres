@@ -83,6 +83,9 @@ Added for the console:
 | `GET /api/v1/orgs/:id/users/:username/secrets`, `DELETE .../:name` | viewer/admin | list/delete stored persistent secrets (ciphertext never returned) |
 | `POST /api/v1/orgs/:id/impersonate/query` | admin | run SQL as an org user on their worker |
 | `GET /api/v1/trino/status` | viewer | Trino cell overview: cell id, coordinator `/v1/info` (version, environment, uptime, starting), query counts by state, blocked-query count, node/failed-node counts, and Trino-enabled orgs by provisioning state. `available:false` + `error` when the coordinator can't be read — the provisioning half still comes from the config store, so "the cell is down" and "these tenants never provisioned" stay distinguishable |
+| `GET /api/v1/trino/instances` | admin | Nonterminal shared-pool instance IDs and lifecycle states, scoped by `?cell=`; no blueprints or credentials |
+| `GET /api/v1/trino/instances/:id/recovery` | admin | Stored-state recovery preview and progress; not a live workload or capacity check |
+| `POST /api/v1/trino/instances/:id/recovery` | admin | Immutable authorization for coordinated failure retirement; can invalidate retained results |
 | `GET /api/v1/trino/queries` | viewer | live queries, `?org=&state=&active=1` slicing, longest-running first. SQL is redacted server-side; each row is stamped with the duckgres org resolved from the Trino principal |
 | `GET /api/v1/trino/queries/:id` | viewer | one query; 404 when the coordinator has aged it out (410 Gone upstream) |
 | `POST /api/v1/trino/queries/:id/kill` | admin | fail a query with a reason (`PUT /v1/query/{id}/killed`). The reason reaches the TENANT as the query's error message. Audited as `trino.query.kill` with the owning org |
@@ -184,6 +187,13 @@ the corresponding chart. Unknown metrics and windows return 400; unknown orgs
 return 404 with `code: "managed_warehouse_not_found"` before Prometheus is called.
 
 ### Trino cell views (`trino.go` + `trino_client.go`)
+
+The **Trino cell → Instance recovery** panel lets admins select a shared-pool
+instance, review its exact identity, explicitly authorize failure retirement,
+and follow progress. It reuses the existing recovery API. It does not verify
+live workload or health, cancel an accepted recovery, or bypass a conflict.
+See the [recovery runbook](../../docs/runbooks/trino-pool-admin-recovery.md)
+for prerequisites, result-loss risks, and identical-request retry rules.
 
 The console observes the shared Trino cell through the coordinator's REST
 API, as a dedicated **observer principal** (`opa.ObserverPrincipal` =

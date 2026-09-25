@@ -944,6 +944,10 @@ The existing `trino_shared_pool_active` assertion in `e2e/harness.sh` requires
 `E2E_TRINO_POOL=1` and a separately configured shared-pool deployment. Its
 structure stage waits for ready, independent coordinator instances; subsequent
 opt-in stages check warehouse admission and a real query with an existing login.
+The structure stage also checks the recovery UI's admin inventory and preview
+API contracts. It never submits recovery: an actual failure retirement requires
+separate authorization and can invalidate retained results. Browser interactions
+and ambiguous-response retries are covered by the admin UI tests.
 Run it after rolling a candidate control-plane image with a shared-pool registry,
 the Gateway token file, and no `DUCKGRES_TRINO_ROLLOUT_CANARIES_FILE`. Reusing
 the token must not activate the obsolete fixed-slot canary endpoint or crash
