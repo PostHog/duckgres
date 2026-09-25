@@ -125,7 +125,7 @@ func (cs *ConfigStore) RequestTrinoPoolRecovery(ctx context.Context, poolID, ins
 			return fmt.Errorf("%w: pool is below its minimum serving count", ErrTrinoPoolRecoveryConflict)
 		}
 		request.CreatedAt = time.Now().UTC()
-		if err := tx.Create(&request).Error; err != nil {
+		if err := tx.Clauses(clause.Returning{}).Create(&request).Error; err != nil {
 			return err
 		}
 		result = request

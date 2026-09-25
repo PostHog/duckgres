@@ -100,6 +100,39 @@ func TestTrinoPoolRecoverySubmissionAndReplay(t *testing.T) {
 	}
 }
 
+func TestTrinoPoolRecoveryReturnsPersistedTimestamp(t *testing.T) {
+	ctx := context.Background()
+	store, _, req := recoveryStore(t)
+	// Force database timestamp normalization regardless of the host clock's precision.
+	if err := store.DB().Exec(`
+		CREATE FUNCTION recovery_test_timestamp() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.created_at := TIMESTAMPTZ '2030-01-02 03:04:05.123456789+00';
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER recovery_test_timestamp BEFORE INSERT ON duckgres_trino_pool_recoveries
+		FOR EACH ROW EXECUTE FUNCTION recovery_test_timestamp();
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.RequestTrinoPoolRecovery(ctx, poolID, req.InstanceID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := store.GetTrinoPoolRecovery(ctx, poolID, req.InstanceID)
+	if err != nil || persisted == nil {
+		t.Fatalf("read persisted recovery = %+v, %v", persisted, err)
+	}
+	if !first.CreatedAt.Equal(persisted.CreatedAt) {
+		t.Fatalf("submission timestamp = %s, persisted timestamp = %s", first.CreatedAt, persisted.CreatedAt)
+	}
+	replayed, err := store.RequestTrinoPoolRecovery(ctx, poolID, req.InstanceID, req)
+	if err != nil || replayed == nil || !first.CreatedAt.Equal(replayed.CreatedAt) {
+		t.Fatalf("replay = %+v, %v; initial timestamp = %s", replayed, err, first.CreatedAt)
+	}
+}
+
 func TestTrinoPoolRecoveryRejectsUnapprovedOrStaleIntent(t *testing.T) {
 	ctx := context.Background()
 	store, _, req := recoveryStore(t)
