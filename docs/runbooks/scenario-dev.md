@@ -122,6 +122,15 @@ uploadable in a visible `*.partial/` directory with an
   counts, physical input rows, CPU time, peak memory, and the Trino query ID,
   which is the first thing to check when a Trino latency moves.
 
+The frozen perf catalog (`tests/perf/queries/ducklake_posthog_tables.yaml`)
+also declares perf gate expectations: upper bounds on Trino split counts and
+bytes scanned for the metadata-only counts. A broken bound, or a bounded
+metric that was not captured, fails `perf_queries` after its artifacts are
+written; the step log and error list every violation with the observed value,
+the bound, and the Trino query ID, and `perf/query_service_metrics.csv` has
+the per-iteration numbers. Raise a bound only with evidence that the new plan
+is intended; see `tests/perf/README.md` for the syntax.
+
 Perf query errors mark the `perf_queries` DAG step failed. They do not stop
 independent sibling branches: for example, `dbt_models` still runs because it
 depends on `setup_frozen_views`, not `perf_queries`. Only true dependants are

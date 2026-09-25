@@ -558,6 +558,98 @@ func TestExecutorCanReportPerfQueryErrorsWithoutFailingStep(t *testing.T) {
 	}
 }
 
+func TestExecutorPerfGateFailsStepAfterWritingArtifacts(t *testing.T) {
+	for name, tc := range map[string]struct {
+		bytesScanned int64
+		wantErr      string
+	}{
+		"bound met":      {bytesScanned: 1024},
+		"bound violated": {bytesScanned: 4096, wantErr: "q1 on athena: bytes_scanned 4096 (4.0 KiB) exceeds max_bytes_scanned 1024 (1.0 KiB) in 1 of 1 measured iterations"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			catalogPath := writePerfCatalogWithExpectations(t, []perfcore.Protocol{perfcore.ProtocolAthena},
+				"    expectations:\n      athena:\n        max_bytes_scanned: 1KiB\n")
+			executor := NewExecutor(ExecutorConfig{
+				OutputDir: t.TempDir(),
+				DriverFactory: &fakeDriverFactory{
+					athenaMetrics: &perfcore.ServiceMetrics{BytesScanned: tc.bytesScanned},
+				},
+			})
+			err := executor.ExecuteStep(context.Background(), core.Step{
+				ID:   "perf_queries",
+				Type: StepTypePerfQueries,
+				With: map[string]any{
+					"org_id": "scenario-org", "username": "root", "password": "test-password",
+					"catalog_file": catalogPath, "run_id": "scenario-run-1",
+					"athena_region": "us-east-1", "athena_workgroup": "benchmark",
+					"athena_database": "benchmark_frozen", "athena_output_location": "s3://benchmark-results/run/",
+				},
+			})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ExecuteStep returned error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "perf gate failed") || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want perf gate failure containing %q", err, tc.wantErr)
+			}
+			var classified core.ClassifiedError
+			if !errors.As(err, &classified) || classified.ErrorClass() != ErrorClassPerf {
+				t.Fatalf("error = %T %v, want class %q", err, err, ErrorClassPerf)
+			}
+			// The measurements behind a gate failure are kept for triage.
+			if _, ok := executor.State().Result("perf_queries"); !ok {
+				t.Fatal("expected perf result to be recorded despite the gate failure")
+			}
+			for _, name := range []string{"summary.json", "query_results.csv", "query_service_metrics.csv"} {
+				if _, err := os.Stat(filepath.Join(executor.OutputDir(), "perf", name)); err != nil {
+					t.Fatalf("expected perf artifact %s before gate failure: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestExecutorPerfGateAppliesWhenQueryErrorsDoNotFailStep(t *testing.T) {
+	catalogPath := writePerfCatalogWithExpectations(t, []perfcore.Protocol{perfcore.ProtocolAthena},
+		"    expectations:\n      athena:\n        max_bytes_scanned: 1KiB\n")
+	executor := NewExecutor(ExecutorConfig{
+		OutputDir: t.TempDir(),
+		DriverFactory: &fakeDriverFactory{
+			athenaMetrics: &perfcore.ServiceMetrics{BytesScanned: 4096},
+		},
+	})
+	err := executor.ExecuteStep(context.Background(), core.Step{
+		ID:   "perf_queries",
+		Type: StepTypePerfQueries,
+		With: map[string]any{
+			"org_id": "scenario-org", "username": "root", "password": "test-password",
+			"catalog_file": catalogPath, "run_id": "scenario-run-1", "targets": []any{"athena"},
+			"athena_region": "us-east-1", "athena_workgroup": "benchmark",
+			"athena_database": "benchmark_frozen", "athena_output_location": "s3://benchmark-results/run/",
+			"fail_on_query_errors": false,
+		},
+	})
+	// fail_on_query_errors only governs query errors; the gate still applies.
+	if err == nil || !strings.Contains(err.Error(), "perf gate failed: 1 expectation(s) violated") {
+		t.Fatalf("error = %v, want perf gate failure", err)
+	}
+}
+
+func writePerfCatalogWithExpectations(t *testing.T, targets []perfcore.Protocol, expectations string) string {
+	t.Helper()
+	path := writePerfCatalog(t, targets)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(raw, []byte(expectations)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 	t.Helper()
 	var targetLines strings.Builder
@@ -597,6 +689,7 @@ type fakeDriverFactory struct {
 	athenaConnection  athenadriver.ConnectionConfig
 	athenaContext     context.Context
 	athenaDriver      *fakeProtocolDriver
+	athenaMetrics     *perfcore.ServiceMetrics
 }
 
 func (f *fakeDriverFactory) NewPGWire(connection scenariosql.PGWireConnection, protocol perfcore.Protocol) (perfcore.ProtocolDriver, error) {
@@ -619,20 +712,21 @@ func (f *fakeDriverFactory) NewTrino(ctx context.Context, connection trinodriver
 func (f *fakeDriverFactory) NewAthena(ctx context.Context, connection athenadriver.ConnectionConfig) (perfcore.ProtocolDriver, error) {
 	f.athenaContext = ctx
 	f.athenaConnection = connection
-	f.athenaDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolAthena}
+	f.athenaDriver = &fakeProtocolDriver{protocol: perfcore.ProtocolAthena, metrics: f.athenaMetrics}
 	return f.athenaDriver, nil
 }
 
 type fakeProtocolDriver struct {
 	protocol perfcore.Protocol
 	err      error
+	metrics  *perfcore.ServiceMetrics
 	closed   bool
 }
 
 func (d *fakeProtocolDriver) Protocol() perfcore.Protocol { return d.protocol }
 
 func (d *fakeProtocolDriver) Execute(context.Context, perfcore.Query, []any) (perfcore.ExecutionResult, error) {
-	return perfcore.ExecutionResult{Rows: 1, Duration: time.Millisecond}, d.err
+	return perfcore.ExecutionResult{Rows: 1, Duration: time.Millisecond, ServiceMetrics: d.metrics}, d.err
 }
 
 func (d *fakeProtocolDriver) Close() error {

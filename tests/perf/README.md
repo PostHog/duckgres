@@ -141,6 +141,46 @@ dashboards to compare paired targets by their generated query-ID suffixes.
 PGWire executes only `ducklake_table`; Trino executes only `hoglake_table`;
 Athena executes only `athena_external`.
 
+## Perf Gate Expectations
+
+Any legacy or paired query may declare optional `expectations:`: per-protocol
+bounds on the provider statistics in `query_service_metrics.csv`. Catalogs
+without them are not checked.
+
+```yaml
+paired_queries:
+  - query_id_base: q_events_total_v5
+    intent_id: intent_events_total_v5
+    sql_template: SELECT COUNT(*) AS events FROM {{ relation "events" }}
+    expectations:
+      trino:
+        max_total_splits: 200
+        max_bytes_scanned: 10MiB
+```
+
+Supported bounds are `max_total_splits` (Trino split count; Trino targets
+only) and `max_bytes_scanned` (Trino physical input or Athena data scanned; a
+byte count or a size in `KiB`, `MiB`, `GiB`, or `TiB`). Bounds are inclusive.
+Latency is deliberately not boundable. The loader rejects unknown bound names,
+protocols the query does not target, and entries without a bound, so a typo
+cannot silently disable the gate. A paired query's bounds attach to the
+variant each protocol executes (Trino: `hoglake_table`).
+
+After the measured iterations, the `perf_queries` scenario step checks every
+bound against each successful measured iteration of its (query, protocol)
+pair. A bound that any iteration exceeds, or whose metric was not captured
+for an iteration, fails the step with a message naming the query, protocol,
+observed value, bound, and the worst iteration's Trino query ID, for example:
+
+```text
+perf gate failed: 1 expectation(s) violated:
+- q_events_total_v5__hoglake_table on trino: total_splits 7300 exceeds max_total_splits 200 in 4 of 4 measured iterations (worst: iteration 1, Trino query <query-id>)
+```
+
+The check runs after the artifacts are written and is independent of
+`fail_on_query_errors`; warmups and failed iterations are not checked, since
+query errors are reported on their own.
+
 ## Local Smoke Run
 
 ```bash

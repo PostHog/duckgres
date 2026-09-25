@@ -11,6 +11,17 @@ targets:
 warmup_iterations: 1
 measure_iterations: 4
 
+# Optional per-query `expectations:` form the perf gate: per-protocol bounds on
+# provider statistics (query_service_metrics.csv), checked over the measured
+# iterations after the run. A broken bound, or a bounded metric that was not
+# captured, fails the perf_queries step with the query, protocol, observed
+# value and bound. Supported bounds:
+#   max_total_splits   Trino split (driver) count; Trino targets only.
+#   max_bytes_scanned  Trino physical input / Athena data scanned; a byte
+#                      count or a size in KiB, MiB, GiB or TiB.
+# Latency is deliberately not boundable. Bounds apply to the variant each
+# protocol executes (Trino: hoglake_table).
+
 relation_variants:
   ducklake_table:
     events: posthog.events
@@ -28,6 +39,16 @@ paired_queries:
     tags: [nightly, frozen, posthog, events, aggregate, paired]
     params: {}
     sql_template: SELECT COUNT(*) AS events FROM {{ relation "events" }}
+    # Hoglake answers this from catalog metadata: ~92 whole-file splits and no
+    # data reads since PostHog/trino#77. A split per footer (thousands of
+    # splits, as in PostHog/trino#67) or a data scan fails the gate.
+    expectations:
+      trino:
+        max_total_splits: 200
+        max_bytes_scanned: 10MiB
+      trino_cached:
+        max_total_splits: 200
+        max_bytes_scanned: 10MiB
 
   - query_id_base: q_events_count_one_day_v5
     intent_id: intent_events_count_one_day_v5
@@ -38,6 +59,14 @@ paired_queries:
       FROM {{ relation "events" }}
       WHERE "timestamp" >= CAST('2026-03-01 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
         AND "timestamp" < CAST('2026-03-02 00:00:00+00:00' AS TIMESTAMP WITH TIME ZONE)
+    # With timestamp pruning live this reads Parquet footers only. Add
+    # max_total_splits once split pruning is confirmed on the scenario lane;
+    # until then the split count is recorded but not bounded.
+    expectations:
+      trino:
+        max_bytes_scanned: 64MiB
+      trino_cached:
+        max_bytes_scanned: 64MiB
 
   - query_id_base: q_events_by_name_march_2026_v5
     intent_id: intent_events_by_name_march_2026_v5
@@ -56,6 +85,13 @@ paired_queries:
     tags: [nightly, frozen, posthog, persons, aggregate, paired]
     params: {}
     sql_template: SELECT COUNT(*) AS persons FROM {{ relation "persons" }}
+    # Metadata-only like the events count: whole-file splits, far below one
+    # per footer.
+    expectations:
+      trino:
+        max_total_splits: 150
+      trino_cached:
+        max_total_splits: 150
 
   - query_id_base: q_persons_daily_april_2026_v5
     intent_id: intent_persons_daily_april_2026_v5

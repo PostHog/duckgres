@@ -71,6 +71,9 @@ type Query struct {
 	Params         map[string]any `yaml:"params"`
 	PGWireSQL      string         `yaml:"pgwire_sql"`
 	StorageTarget  StorageTarget  `yaml:"-" json:"-"`
+	// Expectations holds optional perf gate bounds per protocol, parsed from
+	// the query's `expectations:` mapping by the catalog loader.
+	Expectations map[Protocol]QueryExpectations `yaml:"-" json:"-"`
 }
 
 // CanonicalSQL returns the single rendered SQL statement shared by protocol
