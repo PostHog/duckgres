@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 const mocks = vi.hoisted(() => ({
   trinoInstances: vi.fn(), trinoRecovery: vi.fn(), requestTrinoRecovery: vi.fn(),
@@ -49,7 +49,12 @@ async function confirmRecovery() {
 }
 
 describe("Trino recovery", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    cleanup();
+    focusManager.setFocused(undefined);
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
@@ -367,5 +372,71 @@ describe("Trino recovery", () => {
     expect(saved.mayHaveBeenAccepted).toBe(true);
     expect(saved.body).toEqual(mocks.requestTrinoRecovery.mock.calls[0][1]);
     expect(mocks.requestTrinoRecovery).toHaveBeenCalledTimes(2);
+  });
+
+  it("hides the retry action after acceptance while waiting for the recorded request", async () => {
+    mount();
+    await selectInstance();
+    await confirmRecovery();
+    await userEvent.click(screen.getByRole("button", { name: "Request destructive recovery" }));
+    await screen.findByText("Recovery accepted. Waiting for its recorded status.");
+    expect(screen.queryByRole("button", { name: "Retry identical request" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh preview" })).toBeEnabled();
+    expect(mocks.requestTrinoRecovery).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([404, 503])("stops unavailable inventory polling (%s), permits manual refresh, and resumes after success", async (status) => {
+    vi.useFakeTimers();
+    focusManager.setFocused(true);
+    mocks.trinoInstances.mockRejectedValue(new ApiError(status, "unavailable"));
+    mount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(mocks.trinoInstances).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(mocks.trinoInstances).toHaveBeenCalledTimes(1);
+    const refresh = screen.getByRole("button", { name: "Refresh instances" });
+    expect(refresh).toBeEnabled();
+    mocks.trinoInstances.mockResolvedValue({ cell: "pool-a", instances: [] });
+    fireEvent.click(refresh);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(mocks.trinoInstances).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(mocks.trinoInstances).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([404, 503])("stops unavailable preview polling (%s) without disabling manual refresh", async (status) => {
+    vi.useFakeTimers();
+    focusManager.setFocused(true);
+    mocks.trinoRecovery.mockRejectedValue(new ApiError(status, "unavailable"));
+    mount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    fireEvent.change(screen.getByRole("combobox", { name: "Trino instance" }), { target: { value: "instance-a" } });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(mocks.trinoRecovery).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(mocks.trinoRecovery).toHaveBeenCalledTimes(1);
+    const refresh = screen.getByRole("button", { name: "Refresh preview" });
+    expect(refresh).toBeEnabled();
+    mocks.trinoRecovery.mockResolvedValue(preview());
+    fireEvent.click(refresh);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(mocks.trinoRecovery).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(mocks.trinoRecovery).toHaveBeenCalledTimes(3);
+  });
+
+  it("loads a newly selected cell after unavailable inventory stopped polling", async () => {
+    vi.useFakeTimers();
+    focusManager.setFocused(true);
+    mocks.trinoInstances.mockRejectedValue(new ApiError(404, "not a shared pool"));
+    const page = mount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(mocks.trinoInstances).toHaveBeenCalledTimes(1);
+    mocks.trinoInstances.mockResolvedValue({ cell: "pool-b", instances: [] });
+    page.rerender(<QueryClientProvider client={page.client}><TrinoRecovery cell="pool-b" /></QueryClientProvider>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(mocks.trinoInstances).toHaveBeenLastCalledWith("pool-b");
+    expect(mocks.trinoInstances).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("No active shared-pool instances.")).toBeInTheDocument();
   });
 });

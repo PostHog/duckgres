@@ -26,6 +26,9 @@ Open **Trino cell**, select the logical cell, and find **Instance recovery**.
 This section requires an admin role. Select an individual instance to load its
 stored-state preview. The list excludes terminal instances and does not report
 live workload or health.
+Automatic inventory and preview polling stops when the API returns `404` or
+`503`. Use the corresponding refresh button after recovery becomes available.
+Authentication and permission failures also stop polling; restore access first.
 
 Before submitting, complete the independent checks above, enter a short reason,
 type the exact instance ID, and acknowledge both those checks and the potential
@@ -39,6 +42,7 @@ The UI uses the same recovery API documented below; it does not bypass its guard
 An accepted request is immutable. The progress view follows the original request
 even after the instance disappears from the active list. Terminal retirement is
 not evidence that its replacement is already serving.
+After acceptance, the UI shows progress without a retry button.
 
 If the response is lost, use the status check before retrying. The UI preserves
 the original operation and payload for an identical retry. Do not create a new

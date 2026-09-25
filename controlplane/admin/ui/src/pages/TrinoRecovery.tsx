@@ -8,7 +8,7 @@ import { api, ApiError } from "@/lib/api";
 import { POLL } from "@/lib/query";
 import {
   RECOVERY_PREVIEW_MAX_AGE_MS, readRecoveryRequest, recoveryAccessDenied, recoveryAllowed, recoveryComplete,
-  recoveryError, recoveryIdentity, recoveryReviewKey, recoveryStorageKey, validRecoveryReason,
+  recoveryError, recoveryIdentity, recoveryPollingPaused, recoveryReviewKey, recoveryStorageKey, validRecoveryReason,
 } from "@/lib/trinoRecovery";
 import type { TrinoRecoveryBody } from "@/types/api";
 
@@ -29,7 +29,7 @@ function RecoveryCell({ cell, actor }: { cell: string; actor: string }) {
   const [instance, setInstance] = useState("");
   const inventory = useQuery({
     queryKey: ["trino-recovery-instances", actor, cell], queryFn: () => api.trinoInstances(cell),
-    retry: false, refetchInterval: (query) => recoveryAccessDenied(query.state.error) ? false : POLL.slow,
+    retry: false, refetchInterval: (query) => recoveryPollingPaused(query.state.error) ? false : POLL.slow,
   });
   const instances = inventory.data?.cell === cell ? inventory.data.instances : [];
   return <>
@@ -75,7 +75,7 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
   const preview = useQuery({
     queryKey: ["trino-recovery", actor, cell, instance], queryFn: () => api.trinoRecovery(instance, cell),
     retry: false, staleTime: 0, refetchOnMount: "always", enabled: !accessDenied,
-    refetchInterval: (query) => recoveryComplete(query.state.data?.instance.phase ?? "") || recoveryAccessDenied(query.state.error) ? false : POLL.normal,
+    refetchInterval: (query) => recoveryComplete(query.state.data?.instance.phase ?? "") || recoveryPollingPaused(query.state.error) ? false : POLL.normal,
   });
   const snapshot = preview.data?.cell === cell && preview.data.instance.instance_id === instance ? preview.data : undefined;
   const mutation = useMutation({
@@ -212,7 +212,7 @@ function RecoveryInstance({ cell, instance, actor }: { cell: string; instance: s
             <a className="underline" href="https://github.com/PostHog/duckgres/blob/main/docs/runbooks/trino-pool-admin-recovery.md#resolve-an-ambiguous-conflict" target="_blank" rel="noreferrer">Ambiguous-conflict runbook</a>
           </p>
         </div>}
-        {!rejected && !ambiguousConflict && <Button variant="outline" disabled={mutation.isPending || !fresh || (!mutation.isIdle && !readBackReady) || !!localError || mutation.isSuccess || denied}
+        {!rejected && !ambiguousConflict && !mutation.isSuccess && <Button variant="outline" disabled={mutation.isPending || !fresh || (!mutation.isIdle && !readBackReady) || !!localError || denied}
           onClick={() => submit(pending)}>Retry identical request</Button>}
         {rejected && !recorded && <Button variant="outline" disabled={!fresh} onClick={reviewAgain}>Review a new preview</Button>}
       </div>}

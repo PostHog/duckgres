@@ -41,6 +41,10 @@ export function recoveryAccessDenied(error: unknown): boolean {
   return error instanceof ApiError && [401, 403].includes(error.status);
 }
 
+export function recoveryPollingPaused(error: unknown): boolean {
+  return recoveryAccessDenied(error) || error instanceof ApiError && [404, 503].includes(error.status);
+}
+
 export function recoveryError(error: unknown): string {
   if (error instanceof ApiError) {
     if (recoveryAccessDenied(error)) return "Admin access is required. Check your sign-in and permissions.";
