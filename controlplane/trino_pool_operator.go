@@ -85,6 +85,7 @@ type trinoPoolKube interface {
 	Observe(context.Context, trinoPoolInventory) (trinoPoolObservation, error)
 	Delete(context.Context, trinoPoolInventory) error
 	ResourcesAbsent(context.Context, trinoPoolInventory) (bool, error)
+	CoordinatorPodAbsent(context.Context, trinoPoolInventory, string) (bool, error)
 }
 
 // trinoPoolValidator probes a candidate through its own endpoint.

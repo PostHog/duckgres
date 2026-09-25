@@ -2120,6 +2120,17 @@ the Trino backend selection).
 - **Drain has no deadline.** Sealing is driven by the Gateway's obligations
   endpoint; a timer would be a decision to lose open transactions. The serving
   floor refusal is surfaced, never overridden.
+- **Administrative recovery can retire an absent admitted pod.** The operator
+  verifies the original pod UID against every page of an unfiltered namespace
+  inventory. Labels, readiness and a different process answering the Service
+  are not absence evidence. With explicit immutable destructive authorization,
+  a verified absent pod may retain pending requests and open transactions;
+  Gateway records `DESTRUCTIVE_OVERRIDE` and `FAILED`, keeping obligation
+  accounting. The serving floor, exact admitted identity, leader fencing and
+  UID-scoped teardown still apply. An existing pod keeps the original live-work
+  and process-identity requirements. This is manual recovery, not automatic
+  draining cleanup. Kubernetes may omit a force-deleted or partitioned process;
+  the evidence boundary is the API inventory, not certainty of physical death.
 - **Candidate validation uses no canary.** The candidate is probed through its
   OWN Service with the existing observer credential: `/v1/catalog/sync` must be
   enabled, ready, zero failed catalogs, applied revision at least the pool's
