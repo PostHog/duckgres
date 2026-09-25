@@ -61,6 +61,13 @@ turning joins or funnels into cheap empty-result benchmarks.
 
 ## Record a comparison baseline
 
+The initial uncached DuckDB comparison base is the
+[2026-09-25 coverage v1 baseline](../../tests/perf/baselines/coverage-v1-duckdb-uncached-2026-09-25/README.md).
+It retains 48 successful measurements and the complete methodology. The query
+phase took 87m06s; the workflow took 1h42m45s. The equal-speed expanded campaign
+estimate is about 9h37m across separate target dispatches plus the original suite.
+
+
 Keep the successful focused run URL, tested commit, catalog version/hash,
 dataset version, worker resources, cache settings, and repetition counts
 alongside sanitized per-query timing samples. Do not commit query result

@@ -1,0 +1,56 @@
+{
+  "baseline_id": "coverage-v1-duckdb-uncached-2026-09-25",
+  "source_run_url": "https://github.com/PostHog/duckgres/actions/runs/36159233201",
+  "tested_commit": "9c9f5f305f87b7f0d41c0b54d64e5648aeb8ef83",
+  "catalog_path": "tests/perf/queries/ducklake_posthog_coverage.yaml",
+  "catalog_sha256": "e2971f25433a6067f1c0ac42229bf7dc7c82c0c8ab51d6e476b4848df5c59226",
+  "dataset_version": "posthog-file-views-v1",
+  "suite": "coverage",
+  "protocol": "pgwire_uncached",
+  "scenario": "posthog_frozen_perf_coverage_uncached",
+  "worker_resource_requests": {
+    "cpu": "3",
+    "memory": "12Gi"
+  },
+  "cache_settings": {
+    "enable_external_file_cache": false,
+    "parquet_metadata_cache": false,
+    "enable_http_metadata_cache": false
+  },
+  "warmup_iterations": 1,
+  "measure_iterations": 4,
+  "query_intents": 12,
+  "measured_queries": 48,
+  "warmup_queries": 12,
+  "query_errors": 0,
+  "timing_seconds": {
+    "coverage_phase": 5225.503589484,
+    "coverage_fixture_validation": 230.235161795,
+    "workflow_created_to_completed_updated_at": 6165,
+    "workflow_outside_coverage_phase": 939.4964105159997,
+    "measured_query_total": 4183.687134048,
+    "sum_query_means": 1045.921783512
+  },
+  "workflow_created_at": "2026-09-25T16:12:09Z",
+  "completed_workflow_updated_at": "2026-09-25T17:54:54Z",
+  "coverage_started_at": "2026-09-25T16:26:19.084523672Z",
+  "coverage_finished_at": "2026-09-25T17:53:24.58464969Z",
+  "estimate": {
+    "original_workflow_url": "https://github.com/PostHog/duckgres/actions/runs/36113843696",
+    "original_workflow_seconds": 3800,
+    "repetitions_per_configuration": 5,
+    "configurations": 5,
+    "query_seconds_at_equal_speed": 26148.044587800003,
+    "assumed_overhead_per_dispatch_seconds": 939.4964105159997,
+    "campaign_seconds_at_equal_speed": 34645.526640380005
+  },
+  "limitations": [
+    "Only uncached DuckDB was measured; peer speeds and setup overhead are assumptions.",
+    "Resource values are DuckDB worker requests, not equal engine hardware budgets.",
+    "Uncached disables named DuckDB caches, not OS or storage caches.",
+    "Frozen fixture contains sampled days; retention is a performance shape, not a production rate.",
+    "Four repetitions characterize observed variation, not tail latency.",
+    "Independent coverage starts with different cache history from coverage appended after other suites.",
+    "Workflow wall time uses createdAt through the completed run updatedAt; no queue time from separate future dispatches is estimated."
+  ]
+}
