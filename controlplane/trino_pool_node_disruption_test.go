@@ -12,8 +12,189 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
 	"github.com/posthog/duckgres/controlplane/trinopool"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
+
+func attachNodeFixture(t *testing.T, h *operatorHarness, instance *configstore.TrinoPoolInstance) (*trinoPoolNodeGuard, trinoPoolInventory, *trinoNodeClaim) {
+	t.Helper()
+	g, _, inventory, claim := nodeGuardFixture(t)
+	instance.ServiceName = inventory.ServiceName
+	instance.CoordinatorDeploymentName = inventory.CoordinatorDeploymentName
+	instance.CoordinatorDeploymentUID = inventory.CoordinatorDeploymentUID
+	instance.WorkerDeploymentName = inventory.WorkerDeploymentName
+	instance.WorkerDeploymentUID = inventory.WorkerDeploymentUID
+	blueprint, _, _ := testPoolObjects(t, 7)
+	instance.BlueprintSnapshot, _ = blueprint.MarshalSnapshot()
+	h.operator.nodeGuard = g
+	h.operator.lease.Epoch = 7
+	h.store.epoch = 7
+	return g, inventory, claim
+}
+
+func TestTrinoNodePreparingCandidateRejectsDefinitivePlacement(t *testing.T) {
+	for _, scenario := range []string{"drift", "unschedulable", "missing-claim", "mismatched-claim", "api-error", "scheduling"} {
+		t.Run(scenario, func(t *testing.T) {
+			h, instance := validatingNodeFixture(t)
+			instance.Phase = string(trinopool.PhasePreparing)
+			g, inventory, claim := attachNodeFixture(t, h, instance)
+			switch scenario {
+			case "drift":
+				claim.Status.Conditions = []metav1.Condition{{Type: "Drifted", Status: metav1.ConditionTrue}}
+			case "unschedulable":
+				node, _ := g.client.CoreV1().Nodes().Get(context.Background(), "compute-node", metav1.GetOptions{})
+				node.Spec.Unschedulable = true
+				if _, err := g.client.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			case "missing-claim":
+				g.listClaims = func(context.Context) ([]trinoNodeClaim, error) { return nil, nil }
+			case "mismatched-claim":
+				claim.Status.ProviderID = "different"
+			case "api-error":
+				g.listClaims = func(context.Context) ([]trinoNodeClaim, error) { return nil, errors.New("API unavailable") }
+			case "scheduling":
+				pod, _ := g.client.CoreV1().Pods(inventory.Namespace).Get(context.Background(), inventory.WorkerDeploymentName+"-0", metav1.GetOptions{})
+				pod.Spec.NodeName = ""
+				if _, err := g.client.CoreV1().Pods(inventory.Namespace).Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			progressed, err := h.operator.validateCandidate(context.Background(), *instance)
+			switch scenario {
+			case "api-error":
+				if err == nil || progressed || instance.Phase != string(trinopool.PhasePreparing) {
+					t.Fatal("API error retired or admitted candidate")
+				}
+			case "scheduling":
+				if err != nil || progressed || instance.Phase != string(trinopool.PhasePreparing) {
+					t.Fatalf("scheduling was treated as failure: %v", err)
+				}
+			default:
+				if err != nil || !progressed || instance.Phase != string(trinopool.PhaseFailedPreparing) {
+					t.Fatalf("invalid candidate retained preparation slot: phase=%s err=%v", instance.Phase, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTrinoNodeProtectionTreatsCandidateSchedulingAsProgress(t *testing.T) {
+	for _, phase := range []trinopool.Phase{trinopool.PhaseCreating, trinopool.PhasePreparing, trinopool.PhaseServing} {
+		t.Run(string(phase), func(t *testing.T) {
+			h, instance := validatingNodeFixture(t)
+			instance.Phase = string(phase)
+			g, inventory, _ := attachNodeFixture(t, h, instance)
+			if err := g.client.CoreV1().Pods(inventory.Namespace).Delete(context.Background(), inventory.WorkerDeploymentName+"-0", metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			err := h.operator.protectPoolNodes(context.Background(), []configstore.TrinoPoolInstance{*instance})
+			if phase == trinopool.PhaseServing {
+				if err == nil {
+					t.Fatal("incomplete serving inventory was ignored")
+				}
+			} else if err != nil || len(h.operator.nodeProtectionErrors) != 0 {
+				t.Fatalf("normal scheduling reported reconcile failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestTrinoNodeValidatingCandidateRetiresOnlyDefinitivePlacement(t *testing.T) {
+	for _, scenario := range []string{"mismatched-claim", "finite-grace", "api-error"} {
+		t.Run(scenario, func(t *testing.T) {
+			h, instance := validatingNodeFixture(t)
+			g, _, claim := attachNodeFixture(t, h, instance)
+			switch scenario {
+			case "mismatched-claim":
+				claim.Status.ProviderID = "different"
+			case "finite-grace":
+				duration := "1h"
+				claim.Spec.TerminationGracePeriod = &duration
+			case "api-error":
+				g.listClaims = func(context.Context) ([]trinoNodeClaim, error) { return nil, errors.New("API unavailable") }
+			}
+			err := h.operator.admitCandidate(context.Background(), *instance)
+			if scenario == "api-error" {
+				if err == nil || instance.Phase != string(trinopool.PhaseValidating) || countCalls(h.gateway.calls, "retire:") != 0 {
+					t.Fatal("transient API failure authorized candidate retirement")
+				}
+			} else if err != nil || instance.Phase != string(trinopool.PhaseFailedPreparing) || h.gateway.members[instance.InstanceID].Phase != "RETIRING" {
+				t.Fatalf("invalid placement did not obtain retirement claim: phase=%s err=%v", instance.Phase, err)
+			}
+			if len(h.kube.deleted) != 0 {
+				t.Fatal("candidate deleted before retirement cleanup")
+			}
+		})
+	}
+}
+
+func TestTrinoNodeObservedReplacementPersistsAndUsesNormalRollout(t *testing.T) {
+	for _, deleting := range []bool{false, true} {
+		t.Run(map[bool]string{false: "drift", true: "deletion"}[deleting], func(t *testing.T) {
+			h := newOperatorHarness(t)
+			h.tick(t, 20)
+			instance := h.store.instances[h.store.order[0]]
+			g, _, claim := attachNodeFixture(t, h, instance)
+			claim.Status.Conditions = []metav1.Condition{{Type: "Drifted", Status: metav1.ConditionTrue}}
+			if deleting {
+				stamp := metav1.Now()
+				claim.DeletionTimestamp = &stamp
+				claim.Status.Conditions = nil
+			}
+			if err := h.operator.protectPoolNodes(context.Background(), []configstore.TrinoPoolInstance{*instance}); err != nil {
+				t.Fatal(err)
+			}
+			if instance.NodeReplacementEvidence == nil {
+				t.Fatal("observation did not persist evidence")
+			}
+			var evidence trinopool.NodeReplacementEvidence
+			if err := json.Unmarshal([]byte(*instance.NodeReplacementEvidence), &evidence); err != nil {
+				t.Fatal(err)
+			}
+			if evidence.NodeUID != "node-uid" || evidence.NodeClaimUID != string(claim.UID) || evidence.Reason != map[bool]string{false: "Drifted", true: "Deleting"}[deleting] {
+				t.Fatalf("wrong evidence: %+v", evidence)
+			}
+			node, _ := g.client.CoreV1().Nodes().Get(context.Background(), "compute-node", metav1.GetOptions{})
+			if !node.Spec.Unschedulable {
+				t.Fatal("durable request did not exclude old node")
+			}
+			instances, _ := h.store.ListTrinoPoolInstances(context.Background(), h.operator.config.PoolID)
+			before := len(instances)
+			if err := h.operator.applyPlan(context.Background(), h.store.pool, instances); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.store.order) != before+1 || instance.Phase != string(trinopool.PhaseServing) {
+				t.Fatal("drained before normal replacement existed")
+			}
+			replacement := h.store.instances[h.store.order[len(h.store.order)-1]]
+			if replacement.Repair || replacement.RepairFor != "" {
+				t.Fatal("voluntary replacement consumed repair allowance")
+			}
+			// Drive replacement admission on both sides before the original may drain.
+			h.operator.nodeGuard = nil
+			for range 8 {
+				if replacement.Phase == string(trinopool.PhaseServing) {
+					break
+				}
+				if _, err := h.operator.progressInstance(context.Background(), *replacement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			h.operator.nodeGuard = g
+			if replacement.Phase != string(trinopool.PhaseServing) || h.gateway.members[replacement.InstanceID].Phase != "ACTIVE" {
+				t.Fatal("replacement was not admitted before drain")
+			}
+			instances, _ = h.store.ListTrinoPoolInstances(context.Background(), h.operator.config.PoolID)
+			if err := h.operator.applyPlan(context.Background(), h.store.pool, instances); err != nil {
+				t.Fatal(err)
+			}
+			if instance.Phase != string(trinopool.PhaseDraining) {
+				t.Fatalf("serving replacement did not release drain: %s", instance.Phase)
+			}
+		})
+	}
+}
 
 type trinoNodeAdmissionRaceGateway struct {
 	*fakePoolGateway

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ const trinoNodeRetirementAnnotation = "posthog.com/trino-node-retirement"
 
 var errTrinoUnschedulableNode = errors.New("pool pod is on an unschedulable node")
 var errTrinoPodProtectionIncomplete = errors.New("pool pod protection inventory is not complete")
+var errTrinoNodePlacementInvalid = errors.New("pool pod has an invalid NodeClaim placement")
 
 type trinoNodeClaim struct {
 	metav1.ObjectMeta `json:"metadata"`
@@ -110,14 +112,14 @@ func (g *trinoPoolNodeGuard) nodeClaim(ctx context.Context, node *corev1.Node) (
 		}
 		claim, ok := g.claims[string(owner.UID)]
 		if !ok || owner.UID == "" || claim.Name != owner.Name || claim.Status.NodeName != node.Name || node.Spec.ProviderID == "" || claim.Status.ProviderID != node.Spec.ProviderID {
-			return trinoNodeClaim{}, errors.New("node lacks an exact matching NodeClaim")
+			return trinoNodeClaim{}, fmt.Errorf("%w: node lacks an exact matching NodeClaim", errTrinoNodePlacementInvalid)
 		}
 		if claim.Spec.TerminationGracePeriod != nil {
-			return trinoNodeClaim{}, errors.New("finite NodeClaim termination grace period can override query protection")
+			return trinoNodeClaim{}, fmt.Errorf("%w: finite NodeClaim termination grace period can override query protection", errTrinoNodePlacementInvalid)
 		}
 		return claim, nil
 	}
-	return trinoNodeClaim{}, errors.New("pool pod node is not owned by a NodeClaim")
+	return trinoNodeClaim{}, fmt.Errorf("%w: pool pod node is not owned by a NodeClaim", errTrinoNodePlacementInvalid)
 }
 
 // inspect protects existing pods without modifying their Deployment templates.

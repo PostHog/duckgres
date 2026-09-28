@@ -58,7 +58,11 @@ New candidates on drifted, deleting, unschedulable, or unverifiable nodes cannot
 be admitted. Admission whose response was lost still replays the same Gateway
 request; a concurrent successful admission cannot be deleted as a failed candidate.
 
-API errors or missing/pending worker inventory pause voluntary replacement.
+API errors pause voluntary replacement. Missing or pending worker inventory is
+normal convergence for a new candidate, but blocks voluntary replacement of a
+serving instance. A candidate with definitively invalid placement fails through
+the guarded candidate-retirement path, freeing its slot after cleanup. A
+candidate waiting for scheduling or an unavailable API retains its slot and retries.
 Health detection, explicit administrative recovery, and irreversible retirement
 continue through their existing guards. A node lookup failure is neither drift
 evidence nor proof that the admitted process died.

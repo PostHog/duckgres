@@ -22,6 +22,10 @@ type trinoPoolNodeReplacementStore interface {
 var errTrinoCandidateNodeReplacement = errors.New("candidate node requires replacement before admission")
 var errTrinoCandidateNodeRetired = errors.New("candidate retired before admission because its node requires replacement")
 
+func definitiveTrinoNodePlacement(err error) bool {
+	return errors.Is(err, errTrinoCandidateNodeReplacement) || errors.Is(err, errTrinoUnschedulableNode) || errors.Is(err, errTrinoNodePlacementInvalid)
+}
+
 // protectPoolNodes visits all live instances before any instance advances.
 // A busy candidate cannot starve the protection of existing serving pods.
 func (o *trinoPoolOperator) protectPoolNodes(ctx context.Context, instances []configstore.TrinoPoolInstance) error {
@@ -48,6 +52,10 @@ func (o *trinoPoolOperator) protectPoolNodes(ctx context.Context, instances []co
 			continue
 		}
 		evidence, err := o.nodeGuard.inspect(ctx, inventoryOf(*instance))
+		if errors.Is(err, errTrinoPodProtectionIncomplete) && (instance.Phase == string(trinopool.PhaseCreating) || instance.Phase == string(trinopool.PhasePreparing)) {
+			// Pending pods are normal convergence, not failed protection of serving work.
+			continue
+		}
 		if errors.Is(err, errTrinoUnschedulableNode) && instance.NodeReplacementEvidence != nil {
 			err = nil
 		}
@@ -117,7 +125,7 @@ func (o *trinoPoolOperator) nodeSafeAdmission(ctx context.Context, instance conf
 			return trinogateway.Member{}, errTrinoCandidateNodeRetired
 		}
 		if err := o.candidateNodeCheck(ctx, instance); err != nil {
-			if errors.Is(err, errTrinoCandidateNodeReplacement) {
+			if definitiveTrinoNodePlacement(err) {
 				_, retireErr := o.gateway.RetireMember(ctx, o.config.RoutingGroup, instance.InstanceID, trinogateway.MemberStepRequest{Step: o.step(instance.InstanceID, "retire"), ExpectedGeneration: current.Generation})
 				if retireErr != nil {
 					return trinogateway.Member{}, retireErr

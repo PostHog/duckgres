@@ -293,6 +293,12 @@ func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance conf
 		return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing, "candidate node requires replacement before admission")
 	}
 	if err := o.candidateNodeCheck(ctx, instance); err != nil {
+		if definitiveTrinoNodePlacement(err) {
+			return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing, "candidate has an invalid node placement before admission")
+		}
+		if errors.Is(err, errTrinoPodProtectionIncomplete) {
+			return false, nil
+		}
 		return false, err
 	}
 	observed, err := o.kube(o.lease.Epoch).Observe(ctx, inventoryOf(instance))
