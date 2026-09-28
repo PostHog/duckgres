@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strings"
 	"time"
 
 	perfcore "github.com/posthog/duckgres/tests/perf/core"
@@ -86,8 +88,8 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 	}
 	version, profileErr := reader.ReadResults(ctx, versionQuery, nil)
 	document["engine_version"] = version
+	var results [][]*string
 	if profileErr == nil {
-		var results [][]*string
 		results, profileErr = reader.ReadResults(ctx, query, nil)
 		document["results"] = results
 	}
@@ -102,8 +104,21 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 				document["query_info"] = json.RawMessage(raw)
 			}
 		} else {
-			query.PGWireSQL = "EXPLAIN ANALYZE " + query.CanonicalSQL()
-			plan, profileErr = reader.ReadResults(ctx, query, nil)
+			// ExplainStmt traversal currently misses interval typmods in the
+			// pgwire transpiler. Keep the original SQL opaque to that AST path;
+			// DuckDB's query() binder parses it with its original interval units.
+			query.PGWireSQL = "SELECT * FROM query('" + strings.ReplaceAll(query.CanonicalSQL(), "'", "''") + "')"
+			document["diagnostic_sql"] = query.PGWireSQL
+			var wrappedResults [][]*string
+			wrappedResults, profileErr = reader.ReadResults(ctx, query, nil)
+			document["diagnostic_results"] = wrappedResults
+			if profileErr == nil && !reflect.DeepEqual(results, wrappedResults) {
+				profileErr = fmt.Errorf("diagnostic wrapper result values differ from the benchmark query")
+			}
+			if profileErr == nil {
+				query.PGWireSQL = "EXPLAIN ANALYZE " + query.PGWireSQL
+				plan, profileErr = reader.ReadResults(ctx, query, nil)
+			}
 		}
 	}
 	document["explain_analyze"] = plan

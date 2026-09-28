@@ -431,6 +431,14 @@ identifiers, and detailed failures are encrypted in memory using `age` before
 writing `perf-coverage/profile-<target>.json.age` into the workflow artifact.
 Do not publish decrypted files or the private key.
 
+DuckDB diagnostics wrap the canonical SQL in `SELECT * FROM query('<sql>')` and
+compare its complete result values to the ordinary query before explaining it.
+This avoids a pgwire `ExplainStmt` traversal bug: an unwrapped `INTERVAL '7' DAY`
+can become `'7'::interval day`, which DuckDB interprets as seven seconds. The
+wrapper leaves the inner SQL opaque to the PostgreSQL AST and lets DuckDB parse
+the original units. Ordinary benchmark SQL and timing samples are unchanged.
+Inspect the resulting plan's seven-day predicate as well as the result match.
+
 Download the artifact and decrypt locally:
 
 ```sh
