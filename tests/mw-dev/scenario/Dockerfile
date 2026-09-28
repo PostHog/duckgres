@@ -3,7 +3,7 @@ FROM public.ecr.aws/docker/library/golang:1.25-bookworm
 WORKDIR /workspace
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3-pip \
+    && apt-get install -y --no-install-recommends python3-pip age \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --break-system-packages --no-cache-dir dbt-postgres boto3 pyarrow
 

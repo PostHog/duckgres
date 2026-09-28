@@ -178,6 +178,10 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 	if err != nil {
 		return classified(ErrorClassConfig, err)
 	}
+	catalog, profileRecipient, err := profileCatalog(catalog)
+	if err != nil {
+		return classified(ErrorClassConfig, err)
+	}
 	if spec.ReadOnly {
 		if err := perfcore.ValidateReadOnlyCatalog(catalog); err != nil {
 			return classified(ErrorClassConfig, fmt.Errorf("read-only perf catalog validation failed: %w", err))
@@ -226,6 +230,11 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 		Summary:   summary,
 	}
 	e.state.StoreResult(result)
+	if profileRecipient != "" {
+		if err := captureProfiles(ctx, catalog, drivers, perfDir, profileRecipient); err != nil {
+			return classified(ErrorClassPerf, err)
+		}
+	}
 	// Both checks run after the artifacts are closed, so a failure keeps the
 	// measurements that explain it.
 	var failures []error
