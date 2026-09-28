@@ -421,7 +421,8 @@ digest of the comparison run. Preserve its DuckDB extension build arguments and
 resource configuration (three 7 CPU / 28Gi Trino workers; one 21 CPU / 84Gi DuckDB
 worker). Wait for other benchmark runs to finish before starting a comparison.
 
-The same prepared connections first capture `SELECT version()` and the actual
+The same prepared connections first capture the engine version (`pragma_version()`
+for DuckDB, `SELECT version()` for Trino), the frozen source locator, and the actual
 aggregate result values, then execute DuckDB `EXPLAIN ANALYZE` or Trino
 `EXPLAIN ANALYZE VERBOSE`. Trino also fetches the unpruned coordinator query JSON
 immediately, bounded to 256 MiB and the existing query-stat retry/timeout settings.

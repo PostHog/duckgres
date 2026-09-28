@@ -76,8 +76,15 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 		return fmt.Errorf("profiling driver cannot read result values")
 	}
 	// Save all sensitive details together, encrypted before touching disk.
-	document := map[string]any{"protocol": driver.Protocol(), "query_id": query.QueryID, "sql": query.CanonicalSQL()}
+	document := map[string]any{
+		"protocol": driver.Protocol(), "query_id": query.QueryID, "sql": query.CanonicalSQL(),
+		"frozen_source": os.Getenv("DUCKGRES_SCENARIO_FROZEN_S3_URI"),
+	}
 	versionQuery := perfcore.Query{PGWireSQL: "SELECT version()"}
+	if driver.Protocol() == perfcore.ProtocolPGWireCached || driver.Protocol() == perfcore.ProtocolPGWireUncached {
+		// version() is a PostgreSQL compatibility string on the pgwire endpoint.
+		versionQuery.PGWireSQL = "SELECT library_version, source_id FROM pragma_version()"
+	}
 	version, profileErr := reader.ReadResults(ctx, versionQuery, nil)
 	document["engine_version"] = version
 	if profileErr == nil {
