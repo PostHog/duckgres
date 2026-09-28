@@ -838,6 +838,10 @@ cmd_test_scenario() {
 
 run_scenario() {
   local scenario_name="$1" scenario_file="$2" job pod api_base pg suffix internal_secret artifact_rc=0 container_rc=0 container_exit_code scenario_rc=0
+  local pg_connect_timeout=10
+  # Sized benchmark workers may cold-start during the PostgreSQL handshake.
+  # Allow the server's five-minute worker queue budget plus startup headroom.
+  if frozen_perf_scenario; then pg_connect_timeout=360; fi
   api_base="http://duckgres-control-plane.$NS.svc:8080"
   pg="$("${KUBECTL[@]}" -n "$NS" get svc duckgres-control-plane -o jsonpath='{.spec.clusterIP}')"
   suffix=".ci.duckgres.local"
@@ -903,6 +907,7 @@ spec:
             - { name: DUCKGRES_SCENARIO_OUTPUT_BASE, value: "/artifacts/scenario-dev" }
             - { name: DUCKGRES_SCENARIO_RUN_ID, value: "$DUCKGRES_SCENARIO_RUN_ID" }
             - { name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" }
+            - { name: DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT, value: "${DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT:-$pg_connect_timeout}" }
             - { name: DUCKGRES_SCENARIO_MAX_RUNTIME, value: "${DUCKGRES_SCENARIO_MAX_RUNTIME:-4h}" }
             - { name: DUCKGRES_SCENARIO_GO_TEST_TIMEOUT, value: "${DUCKGRES_SCENARIO_GO_TEST_TIMEOUT:-4h15m}" }
             - { name: GOCACHE, value: "/tmp/go-cache" }

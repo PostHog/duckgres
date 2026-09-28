@@ -405,3 +405,19 @@ Scenario Trino connections require `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_I
 (no default), matching the baseline coordinator's `catalog-store.cell-id`.
 The isolated workflow supplies it; local runs must set it. The public readiness
 API cell ID is used only for API identity validation, not catalog-store lookups.
+
+### Benchmark worker connection startup
+
+Frozen core and extended scenario runs default PostgreSQL connection startup to
+360 seconds, allowing the server's five-minute worker-acquisition budget plus
+headroom for cold worker startup. Other scenarios retain a 10-second default.
+Override with `DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT` (seconds) when invoking
+`tests/mw-dev/run.sh`. This timeout is passed into the scenario Job; query
+execution timeouts and measured query durations are unchanged.
+
+If a run reports `pin pgwire cache-variant connection` timeouts, inspect
+control-plane worker-acquisition logs and pod scheduling/startup events. The
+cache-variant driver retains its initial setup error, so one failed connection
+can mark every query for that target as failed. Resolve worker readiness or
+connection-timeout configuration before rerunning; these are not query latency
+measurements.
