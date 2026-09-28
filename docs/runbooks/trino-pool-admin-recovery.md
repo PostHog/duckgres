@@ -63,7 +63,9 @@ a separate TODO. Do not clear repair flags manually.
 
 After the required serving count is restored, use the existing recovery process
 below for each remaining stuck drain. Pending requests, open transactions,
-identity checks and explicit destructive authorization still apply.
+identity checks and explicit destructive authorization still apply. If Kubernetes
+proves the originally admitted pod is absent, the operator can retire that exact
+incarnation despite retained requests or transactions, as described below.
 
 Before submitting, complete the independent checks above, enter a short reason,
 type the exact instance ID, and acknowledge both those checks and the potential
@@ -134,15 +136,61 @@ No Gateway or Kubernetes mutation runs in the HTTP handler.
 
 The store accepts a new request only for a draining instance with a matching identity and generation and sufficient stored serving capacity.
 The active pool leader executes the request under its normal fencing and journaling, coordinates Gateway and local lifecycle state, obtains a failed-retirement claim, and only then deletes the owned resources.
-Before the first Gateway transition, the operator checks that the live coordinator matches the approved process identity.
+Before the first Gateway transition, the operator checks that the live coordinator matches the approved process identity,
+or proves that the admitted pod UID is absent from a complete, unfiltered Kubernetes namespace inventory.
+The absence check includes every pagination page and every pod, including pods with changed labels and terminating pods.
+A failed listing, missing identity, or omitted page cannot establish absence.
+The lookup uses the instance's pinned namespace, including after the pool's desired namespace changes.
+The operator must retain permission to list pods in that pinned namespace until recovery finishes.
+Kubernetes absence is the evidence boundary: a force-deleted pod or partitioned node can leave an unreported process running.
+The existing explicit destructive authorization accepts loss of that exact incarnation's work; absence is not a successful drain.
+
+The original live-process check and already-started recovery with no pending requests or open transactions need no namespace listing.
+Other requests share a complete namespace inventory for 30 seconds, including throttling after API errors.
+Only authorizations known before the inventory started may use that inventory; a newly discovered authorization waits for the next refresh.
+An API error or partial inventory never proves absence.
+Once an exact request proves its pod UID absent, retries retain that proof for the current leadership term.
+The operator removes proofs after recovery terminates and clears all cached evidence on leadership acquisition.
+Each retry verifies the current serving floor before Gateway grants failed retirement.
+After that irreversible claim, cleanup resumes without checking the floor again; exact Gateway identity and resource UIDs remain required.
+
+For a pod proved absent, retained pending requests and open transactions cannot finish on its original process and do not block the authorized failure retirement.
+Gateway keeps their accounting and records the existing `DESTRUCTIVE_OVERRIDE` evidence with a `FAILED` retirement.
+The operator does not rewrite the admitted identity to match a replacement pod, erase obligation rows, or lower the serving floor.
+The override request remains identical across retries and leader changes, even when later observations differ.
+If the original pod still exists, the original zero-pending-request, zero-open-transaction and process identity checks remain in force.
+This change does not automatically retire draining instances, and does not treat an in-place container restart as pod absence.
 After the operation has started, it resumes the same recorded transitions even if that process exits; deletion remains guarded by the original resource identities.
-A changed identity before the operation starts fails closed.
+A changed process identity in an existing pod before the operation starts fails closed.
 There is no cancellation or amendment endpoint for an accepted request.
 The failure classification and durable authorization remain recorded.
 A clean drain can win concurrently before the destructive transition.
 In that case the operator preserves the clean drain and completes its existing retirement instead; the local terminal phase is `RETIRED` and the Gateway retirement kind is `DRAINED`.
 
 ## Follow progress and handle interruption
+
+### Isolated absent-pod regression
+
+The shared development E2E Job validates the read-only inventory and preview contract.
+It cannot safely delete shared coordinators to create this destructive regression.
+Run `just test-trino-recovery-isolated <dev-context> <gateway-image>` instead.
+This executable harness creates and removes its own namespace, real Postgres and Gateway,
+and lightweight coordinator/worker Deployments with synthetic admitted identities and obligations.
+It drives the real recovery implementation through live-process refusal, original-Pod deletion,
+replacement-Pod creation, failed retirement, leader handoff, and UID-scoped resource cleanup.
+Assertions require both terminal lifecycle stores, retained failure accounting, unchanged authorization,
+and an unchanged healthy sibling. See [the E2E setup](../../tests/mw-dev/README.md#isolated-trino-recovery-boundary).
+
+This is an isolated recovery-boundary test, not a Trino SQL or provisioning test.
+Synthetic pending requests, transactions and queries validate recovery accounting without an actual SQL engine.
+Query-continuation behavior is tested separately in the Gateway protocol suite.
+
+The package regression suite also covers lost replies at every recovery transition, successor leaders, wrong identities,
+insufficient capacity, unfiltered pagination, changed labels, terminating pods, and failed inventory reads.
+Run `just test-trino 'TestTrinoPoolRecovery|TestTrinoPoolCoordinatorAbsence'` for those deterministic checks.
+Do not describe a production administrative recovery as a substitute for this isolated E2E test.
+
+### Recovery status
 
 Repeat GET on the same URL to inspect the stored phase, Gateway state and generation, and original request.
 `instance.last_error` contains a fixed, non-sensitive message when recovery is blocked; inspect the control-plane logs for details.

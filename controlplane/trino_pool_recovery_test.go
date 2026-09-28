@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
@@ -227,5 +228,217 @@ func TestTrinoPoolRecoveryResumesAfterCoordinatorDisappears(t *testing.T) {
 	h.tick(t, 8)
 	if h.store.instances[id].Phase != string(trinopool.PhaseFailureRetired) {
 		t.Fatal("accepted recovery was stranded by process exit")
+	}
+}
+
+type recoveryTerminationKube struct {
+	*fakePoolKube
+	absent bool
+	err    error
+	scans  int
+	uids   map[string]bool
+}
+
+func (k *recoveryTerminationKube) NamespacePodUIDs(context.Context, string) (map[string]bool, error) {
+	k.scans++
+	if k.uids != nil {
+		return k.uids, k.err
+	}
+	if k.absent {
+		return map[string]bool{}, k.err
+	}
+	return map[string]bool{"pod-uid-1": true}, k.err
+}
+
+func TestTrinoPoolRecoveryLivePathDoesNotScanNamespace(t *testing.T) {
+	h, _, id := recoveryHarness(t)
+	kube := &recoveryTerminationKube{fakePoolKube: h.kube, err: errors.New("namespace listing unavailable")}
+	h.operator.kube = func(int64) trinoPoolKube { return kube }
+	h.tickTolerant(12)
+	if h.store.instances[id].Phase != string(trinopool.PhaseFailureRetired) || kube.scans != 0 {
+		t.Fatalf("live recovery depends on namespace scan: phase=%s scans=%d", h.store.instances[id].Phase, kube.scans)
+	}
+}
+
+func TestTrinoPoolRecoveryRetainsAbsentProofAcrossRetries(t *testing.T) {
+	h, _, id := recoveryHarness(t)
+	kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+	h.operator.kube = func(int64) trinoPoolKube { return kube }
+	obligations := h.gateway.obligations[id]
+	obligations.PendingRequests = 1
+	h.gateway.obligations[id] = obligations
+	h.gateway.lostErr = errors.New("gateway unavailable")
+	h.tickTolerant(1)
+	kube.err = errors.New("namespace listing unavailable after proof")
+	h.gateway.lostErr = nil
+	h.tickTolerant(12)
+	if h.store.instances[id].Phase != string(trinopool.PhaseFailureRetired) || kube.scans != 1 {
+		t.Fatalf("recovery rechecks immutable pod absence: phase=%s scans=%d", h.store.instances[id].Phase, kube.scans)
+	}
+}
+
+func TestTrinoPoolRecoverySharesNamespaceProofOnlyAcrossKnownRequests(t *testing.T) {
+	h, s, id := recoveryHarness(t)
+	kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+	h.operator.kube = func(int64) trinoPoolKube { return kube }
+	first := *h.store.instances[id]
+	second := first
+	second.InstanceID = "another-instance"
+	second.CoordinatorPodUID = "another-pod"
+	secondRequest := s.requests[0]
+	secondRequest.InstanceID = second.InstanceID
+	secondRequest.PodUID = second.CoordinatorPodUID
+	secondRequest.OperationID = "another-recovery"
+	requests := map[string]configstore.TrinoPoolRecovery{first.InstanceID: s.requests[0], second.InstanceID: secondRequest}
+	h.operator.recoveryEvidence.prepare([]configstore.TrinoPoolInstance{first, second}, requests)
+	for _, instance := range []configstore.TrinoPoolInstance{first, second} {
+		absent, err := h.operator.recoveryPodAbsent(context.Background(), instance, requests[instance.InstanceID])
+		if !absent || err != nil {
+			t.Fatalf("known request did not share complete inventory: absent=%v err=%v", absent, err)
+		}
+	}
+	if kube.scans != 1 {
+		t.Fatalf("same-namespace requests caused %d scans", kube.scans)
+	}
+	lateRequest := secondRequest
+	lateRequest.OperationID = "later-recovery"
+	if absent, err := h.operator.recoveryPodAbsent(context.Background(), second, lateRequest); absent || err == nil || kube.scans != 1 {
+		t.Fatal("a later authorization reused an earlier snapshot or bypassed scan throttling")
+	}
+	namespace := instanceNamespace(first)
+	inventory := h.operator.recoveryEvidence.inventory[namespace]
+	inventory.nextAttempt = time.Now().Add(-time.Second)
+	h.operator.recoveryEvidence.inventory[namespace] = inventory
+	kube.uids = map[string]bool{second.CoordinatorPodUID: true}
+	if absent, err := h.operator.recoveryPodAbsent(context.Background(), second, lateRequest); absent || err != nil || kube.scans != 2 {
+		t.Fatalf("later request did not observe current pod: absent=%v err=%v scans=%d", absent, err, kube.scans)
+	}
+	first.Phase = string(trinopool.PhaseFailureRetired)
+	second.Phase = string(trinopool.PhaseFailureRetired)
+	h.operator.recoveryEvidence.prepare([]configstore.TrinoPoolInstance{first, second}, requests)
+	if len(h.operator.recoveryEvidence.inventory) != 0 || len(h.operator.recoveryEvidence.absent) != 0 {
+		t.Fatal("terminal recoveries retained namespace inventories or absence proofs")
+	}
+}
+
+func TestTrinoPoolRecoveryThrottlesFailedInventoryWithoutAuthorizingAbsence(t *testing.T) {
+	h, s, id := recoveryHarness(t)
+	kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true, err: errors.New("incomplete inventory")}
+	h.operator.kube = func(int64) trinoPoolKube { return kube }
+	i := *h.store.instances[id]
+	for range 8 {
+		if absent, err := h.operator.recoveryPodAbsent(context.Background(), i, s.requests[0]); absent || err == nil {
+			t.Fatal("incomplete inventory authorized absence")
+		}
+	}
+	if kube.scans != 1 || len(h.operator.recoveryEvidence.absent) != 0 {
+		t.Fatal("failed inventory was repeated or cached as positive evidence")
+	}
+}
+
+func TestTrinoPoolRecoveryEvidenceResetsOnLeadershipTerm(t *testing.T) {
+	h, s, id := recoveryHarness(t)
+	kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+	h.operator.kube = func(int64) trinoPoolKube { return kube }
+	i := *h.store.instances[id]
+	h.operator.recoveryEvidence.prepare([]configstore.TrinoPoolInstance{i}, map[string]configstore.TrinoPoolRecovery{id: s.requests[0]})
+	if absent, err := h.operator.recoveryPodAbsent(context.Background(), i, s.requests[0]); !absent || err != nil {
+		t.Fatalf("initial absence proof failed: absent=%v err=%v", absent, err)
+	}
+	h.operator.operatorEnabled = false
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.operator.Run(ctx)
+	e := &h.operator.recoveryEvidence
+	if len(e.active) != 0 || len(e.absent) != 0 || len(e.inventory) != 0 {
+		t.Fatal("new leadership term retained previous recovery evidence")
+	}
+	kube.err = errors.New("inventory unavailable after leadership change")
+	if absent, err := h.operator.recoveryPodAbsent(context.Background(), i, s.requests[0]); absent || err == nil || kube.scans != 2 {
+		t.Fatalf("new term trusted old evidence: absent=%v err=%v scans=%d", absent, err, kube.scans)
+	}
+}
+
+func TestTrinoPoolRecoveryCachedProofCannotBypassServingFloor(t *testing.T) {
+	h, _, id := recoveryHarness(t)
+	kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+	h.operator.kube = func(int64) trinoPoolKube { return kube }
+	obligations := h.gateway.obligations[id]
+	obligations.PendingRequests = 1
+	h.gateway.obligations[id] = obligations
+	h.gateway.lostErr = errors.New("gateway unavailable")
+	h.tickTolerant(1)
+	h.gateway.lostErr = nil
+	h.gateway.members[h.store.order[1]].Phase = "SUSPECT"
+	h.tickTolerant(5)
+	if h.gateway.members[id].Phase != "SUSPECT" || len(h.kube.deleted) > 0 {
+		t.Fatal("cached absence bypassed the current serving floor")
+	}
+}
+
+func TestTrinoPoolRecoveryRetiresProvenAbsentCoordinatorWithObligations(t *testing.T) {
+	for _, lostReply := range []string{"", "recovery-suspect", "recovery-lost", "recovery-retire", "recovery-retired"} {
+		t.Run(lostReply, func(t *testing.T) {
+			h, s, id := recoveryHarness(t)
+			kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+			h.operator.kube = func(int64) trinoPoolKube { return kube }
+			h.kube.observed.CoordinatorPods = []trinoPoolCoordinatorPod{{UID: "replacement-pod", RunningContainerID: "containerd://replacement"}}
+			h.operator.identity = func(context.Context, string) (string, error) {
+				t.Fatal("a replacement process must not authorize the old process's recovery")
+				return "", nil
+			}
+			obligations := h.gateway.obligations[id]
+			obligations.PendingRequests = 2
+			obligations.OpenTransactions = 1
+			h.gateway.obligations[id] = obligations
+			h.gateway.loseResponse = map[string]bool{lostReply: true}
+			for range 16 {
+				if err := h.operator.reconcileOnce(context.Background()); err != nil {
+					successor := newOperatorHarness(t).operator
+					successor.config = h.operator.config
+					successor.store = s
+					successor.gateway = h.gateway
+					successor.kube = func(int64) trinoPoolKube { return kube }
+					successor.owner = "successor"
+					h.operator = successor
+				}
+			}
+			if got := h.store.instances[id].Phase; got != string(trinopool.PhaseFailureRetired) {
+				t.Fatalf("proven-dead recovery stuck at %s", got)
+			}
+			if h.gateway.members[id].RetirementKind != "FAILED" || h.gateway.obligations[id].PendingRequests != 2 || h.gateway.obligations[id].OpenTransactions != 1 {
+				t.Fatal("recovery must retain the failed work accounting")
+			}
+			if len(h.kube.deleted) != 1 || !h.kube.deleted[h.store.instances[id].ServiceName] {
+				t.Fatal("recovery deleted another instance")
+			}
+		})
+	}
+}
+
+func TestTrinoPoolRecoveryAbsentEvidenceFailsClosed(t *testing.T) {
+	for _, scenario := range []string{"pod-present", "lookup-error", "capacity", "wrong-identity", "wrong-generation"} {
+		t.Run(scenario, func(t *testing.T) {
+			h, s, id := recoveryHarness(t)
+			kube := &recoveryTerminationKube{fakePoolKube: h.kube, absent: true}
+			h.operator.kube = func(int64) trinoPoolKube { return kube }
+			h.kube.observed.CoordinatorPods = nil
+			switch scenario {
+			case "pod-present":
+				kube.absent = false
+			case "lookup-error":
+				kube.err = errors.New("pod inventory unavailable")
+			case "capacity":
+				h.gateway.members[h.store.order[1]].Phase = "SUSPECT"
+			case "wrong-identity":
+				s.requests[0].PodUID = "different-pod"
+			case "wrong-generation":
+				s.requests[0].ExpectedGeneration++
+			}
+			h.tickTolerant(4)
+			if h.gateway.members[id].Phase != "DRAINING" || len(h.kube.deleted) != 0 {
+				t.Fatal("ambiguous evidence or failed guard authorized retirement")
+			}
+		})
 	}
 }

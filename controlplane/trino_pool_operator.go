@@ -85,6 +85,7 @@ type trinoPoolKube interface {
 	Observe(context.Context, trinoPoolInventory) (trinoPoolObservation, error)
 	Delete(context.Context, trinoPoolInventory) error
 	ResourcesAbsent(context.Context, trinoPoolInventory) (bool, error)
+	NamespacePodUIDs(context.Context, string) (map[string]bool, error)
 }
 
 // trinoPoolValidator probes a candidate through its own endpoint.
@@ -102,6 +103,7 @@ type trinoPoolOperator struct {
 	identity         trinoPoolIdentityProbe
 	queryDrainStatus func(context.Context, string, string) (trinoQueryDrainStatus, error)
 	drainCursors     map[string]string
+	recoveryEvidence trinoPoolRecoveryEvidence
 	// projection reports what this control plane currently serves: the
 	// authorization bundle's revision and the fingerprints of the projected
 	// password and group files. It is what a member is compared against when
@@ -202,6 +204,7 @@ func (o *trinoPoolOperator) Run(ctx context.Context) {
 	}
 	o.fenced = false
 	o.drainCursors = nil
+	o.recoveryEvidence = trinoPoolRecoveryEvidence{}
 
 	// A new Run is a NEW leadership term. Any lease left on the struct belongs
 	// to the previous term and must not be reused: the janitor lease may have

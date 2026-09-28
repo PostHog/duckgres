@@ -155,15 +155,38 @@ func (o *trinoPoolOperator) checkRecoveryPreconditions(ctx context.Context, i co
 	if err != nil {
 		return err
 	}
-	if obligations.InstanceID != i.InstanceID || obligations.Incarnation != r.Incarnation || obligations.Generation != m.Generation || obligations.PendingRequests != 0 || obligations.OpenTransactions != 0 {
-		return errors.New("recovery requires current obligations without pending requests or open transactions")
+	if obligations.InstanceID != i.InstanceID || obligations.Incarnation != r.Incarnation || obligations.Generation != m.Generation {
+		return errors.New("recovery requires obligations for the authorized incarnation and current generation")
 	}
-	// Once our suspicion step commits, a process exit must not strand recovery.
-	// Replaying that exact step below proves this request owns the transition;
-	// deletion remains scoped to the instance's original resource UIDs.
-	if m.Phase != "DRAINING" {
+	var liveError error
+	if obligations.PendingRequests == 0 && obligations.OpenTransactions == 0 {
+		// Replaying the identical suspicion step below proves this recovery owns an accepted transition.
+		if m.Phase != "DRAINING" {
+			return nil
+		}
+		liveError = o.checkRecoveryLiveCoordinator(ctx, i, r)
+		if liveError == nil {
+			return nil
+		}
+	}
+	absent, err := o.recoveryPodAbsent(ctx, i, r)
+	if err != nil {
+		return err
+	}
+	if absent {
+		// Keep the immutable override payload for every replay, regardless of the current evidence.
+		// Failed retirement retains obligations that the absent process can no longer complete.
+		slog.Info("Trino pool recovery verified the admitted coordinator pod is absent.",
+			"pool", o.config.PublicID, "instance", i.InstanceID, "operation", r.OperationID)
 		return nil
 	}
+	if liveError != nil {
+		return liveError
+	}
+	return errors.New("recovery requires current obligations without pending requests or open transactions")
+}
+
+func (o *trinoPoolOperator) checkRecoveryLiveCoordinator(ctx context.Context, i configstore.TrinoPoolInstance, r configstore.TrinoPoolRecovery) error {
 	observed, err := o.kube(o.lease.Epoch).Observe(ctx, inventoryOf(i))
 	if err != nil {
 		return err

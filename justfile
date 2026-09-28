@@ -343,6 +343,15 @@ test-trino-opa pattern="":
 test-trino pattern="Trino":
     go test -v -count=1 -tags kubernetes -run '{{pattern}}' ./controlplane ./controlplane/admin ./controlplane/provisioner ./controlplane/provisioning
 
+# Run the opt-in recovery boundary against disposable fixtures.
+[group('test')]
+test-trino-recovery-boundary:
+    go test -v -count=1 -tags kubernetes -timeout 8m -run '^TestTrinoPoolRecoveryIsolatedBoundary$' ./controlplane
+
+[group('test')]
+test-trino-recovery-isolated context gateway_image:
+    sh tests/mw-dev/e2e/harness.sh --isolated-trino-recovery --context '{{context}}' --gateway-image '{{gateway_image}}'
+
 # Verify bounded query-obligation reconciliation and the existing seal gates.
 [group('test')]
 test-trino-drain:
