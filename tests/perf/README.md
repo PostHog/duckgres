@@ -405,3 +405,46 @@ Scenario Trino connections require `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_I
 (no default), matching the baseline coordinator's `catalog-store.cell-id`.
 The isolated workflow supplies it; local runs must set it. The public readiness
 API cell ID is used only for API identity validation, not catalog-store lookups.
+# Focused ordered funnel profiling
+
+Manual `scenario-dev` runs can set `profile_ordered_funnel=true` with scenario
+`posthog_frozen_perf_extended`. It defaults to false; ordinary and nightly runs
+retain their existing query catalog and behavior. `coverage_target=all` selects
+the two DuckDB and two Trino cache modes, sequentially, and excludes Athena.
+Only `intent_coverage_ordered_funnel_v1` is selected from the existing catalog.
+The ordinary one warmup and four timing samples finish before diagnostics begin.
+The diagnostic executions never enter timing samples or historical baselines.
+
+Generate a local key with `age-keygen -o profile-key.txt`, keep it private, and
+pass its public recipient as `profile_recipient`. Pin `trino_image` to the image
+digest of the comparison run. Preserve its DuckDB extension build arguments and
+resource configuration (three 7 CPU / 28Gi Trino workers; one 21 CPU / 84Gi DuckDB
+worker). Wait for other benchmark runs to finish before starting a comparison.
+
+The same prepared connections first capture `SELECT version()` and the actual
+aggregate result values, then execute DuckDB `EXPLAIN ANALYZE` or Trino
+`EXPLAIN ANALYZE VERBOSE`. Trino also fetches the unpruned coordinator query JSON
+immediately, bounded to 256 MiB and the existing query-stat retry/timeout settings.
+Each target has a 30-minute diagnostic deadline. Raw plans, results, internal
+identifiers, and detailed failures are encrypted in memory using `age` before
+writing `perf-coverage/profile-<target>.json.age` into the workflow artifact.
+Do not publish decrypted files or the private key.
+
+Download the artifact and decrypt locally:
+
+```sh
+age --decrypt -i profile-key.txt -o profile.json profile-trino_cached.json.age
+```
+
+For local scenario development, install `age` on PATH and set
+`DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL=true` and
+`DUCKGRES_SCENARIO_PROFILE_RECIPIENT` alongside the existing scenario environment,
+then use `just scenario tests/mw-dev/scenario/scenarios/posthog_frozen_perf_extended.yaml`.
+The scenario runner image installs `age` for workflow runs.
+
+If diagnostics fail, the timing files remain valid and the job fails explicitly.
+Decrypt the partial profile to inspect the exact engine or coordinator error;
+rerun only that target after correcting access or protocol support. Encryption
+failures intentionally produce no plaintext fallback. Existing workflow teardown
+and artifact collection still run on failure. Missing final query information is
+an incomplete profile, not evidence for any optimizer or CPU bottleneck.

@@ -903,6 +903,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_OUTPUT_BASE, value: "/artifacts/scenario-dev" }
             - { name: DUCKGRES_SCENARIO_RUN_ID, value: "$DUCKGRES_SCENARIO_RUN_ID" }
             - { name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" }
+            - { name: DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL, value: "${DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL:-false}" }
+            - { name: DUCKGRES_SCENARIO_PROFILE_RECIPIENT, value: "${DUCKGRES_SCENARIO_PROFILE_RECIPIENT:-}" }
             - { name: DUCKGRES_SCENARIO_MAX_RUNTIME, value: "${DUCKGRES_SCENARIO_MAX_RUNTIME:-4h}" }
             - { name: DUCKGRES_SCENARIO_GO_TEST_TIMEOUT, value: "${DUCKGRES_SCENARIO_GO_TEST_TIMEOUT:-4h15m}" }
             - { name: GOCACHE, value: "/tmp/go-cache" }
