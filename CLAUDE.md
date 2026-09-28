@@ -2137,7 +2137,9 @@ the Trino backend selection).
   30 seconds per namespace, but only if authorization was known before listing.
   Errors are throttled, never evidence. Exact-request absence proofs last only
   for the current leadership term and are pruned after recovery terminates.
-  Every retry still checks current serving capacity and Gateway identity.
+  Retries check current serving capacity until Gateway grants failed retirement.
+  After that irreversible claim, retries finish UID-scoped cleanup without
+  requiring the serving floor again. Exact Gateway identity remains required.
 - **Candidate validation uses no canary.** The candidate is probed through its
   OWN Service with the existing observer credential: `/v1/catalog/sync` must be
   enabled, ready, zero failed catalogs, applied revision at least the pool's

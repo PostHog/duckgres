@@ -1178,3 +1178,32 @@ it removes the isolated Duckling and namespace before cleaning the scoped manage
 storage prefix. Do not use the frozen source prefix as `HOGLAKE_DATA_PATH`.
 Collect `run.sh diagnostics` and preserve scenario artifacts before teardown, then
 redeploy a fresh isolated stack before retrying.
+
+## Isolated Trino recovery boundary
+
+Run `just test-trino-recovery-isolated <dev-context> <gateway-image>` to validate
+administrative recovery without changing a shared pool. Use a Gateway image
+that supports pooled transaction-aware lifecycle APIs. The runner requires
+Python 3, kubectl, Go, just, and permission to create a disposable namespace.
+
+This opt-in `e2e/harness.sh --isolated-trino-recovery` lane creates fresh
+Postgres and Gateway Pods, two fixture instances with one coordinator and one
+worker Deployment each, and synthetic pending-request, open-transaction, and
+query records. It executes the real Duckgres recovery implementation against
+the real Gateway API,
+configstore, Gateway database, and Kubernetes API. It verifies live-process
+refusal, original-Pod UID disappearance while a replacement Pod exists,
+irreversible failed retirement, leader handoff and fencing, retained failure
+evidence, exact resource cleanup, and protection of a healthy sibling.
+
+The fixture does not run Trino SQL or validate tenant provisioning, catalog
+publication, workload draining, or end-to-end query correctness. It seeds
+admitted lifecycle state explicitly to isolate the recovery regression.
+Normal shared-pool tests remain read-only for recovery authorization.
+
+The runner generates disposable credentials and does not provision dedicated
+AWS services or persistent volumes; normal cluster autoscaling can still add
+nodes. It deletes its uniquely named namespace on success or failure.
+Namespace ownership is checked before cleanup. A process killed with
+SIGKILL cannot run cleanup; inspect namespaces labeled
+`duckgres.io/recovery-e2e` and verify ownership before removing leftovers.

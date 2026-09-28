@@ -92,6 +92,11 @@ set -eu
 # explicit so a silent death is distinguishable from an eviction.
 trap 'rc=$?; [ "$rc" = 0 ] || echo "HARNESS EXIT rc=$rc (no FAIL line above = killed by set -e or external signal)" >&2' EXIT
 
+if [ "${1:-}" = "--isolated-trino-recovery" ]; then
+    shift
+    exec python3 "$(dirname "$0")/trino-recovery-isolated.py" "$@"
+fi
+
 API="${CP_API:?}"
 PGHOST="${CP_PG_HOST:?}"
 SECRET="${INTERNAL_SECRET:?}"
@@ -1190,7 +1195,7 @@ trino_shared_pool_active() {
   # Validate the recovery UI's read-only contract without authorizing retirement.
   # Absent-pod recovery needs an isolated pool and destructive authorization.
   # This shared-pool Job must not delete coordinators to manufacture that evidence.
-  # See the administrative recovery runbook for the isolated regression procedure.
+  # Run this harness with --isolated-trino-recovery for the destructive fixture.
   inventory="$(curl -fsS -H "$H" --get --data-urlencode "cell=$pool" "$API/api/v1/trino/instances")" \
     || fail "shared pool: recovery inventory request failed"
   printf %s "$inventory" | jq -e --arg cell "$pool" '

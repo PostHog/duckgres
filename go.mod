@@ -144,6 +144,7 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/tchap/go-patricia/v2 v2.3.3 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect

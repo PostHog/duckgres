@@ -151,7 +151,8 @@ Only authorizations known before the inventory started may use that inventory; a
 An API error or partial inventory never proves absence.
 Once an exact request proves its pod UID absent, retries retain that proof for the current leadership term.
 The operator removes proofs after recovery terminates and clears all cached evidence on leadership acquisition.
-Each retry still verifies the current serving floor and exact Gateway identity before using an absence proof.
+Each retry verifies the current serving floor before Gateway grants failed retirement.
+After that irreversible claim, cleanup resumes without checking the floor again; exact Gateway identity and resource UIDs remain required.
 
 For a pod proved absent, retained pending requests and open transactions cannot finish on its original process and do not block the authorized failure retirement.
 Gateway keeps their accounting and records the existing `DESTRUCTIVE_OVERRIDE` evidence with a `FAILED` retirement.
@@ -171,15 +172,18 @@ In that case the operator preserves the clean drain and completes its existing r
 ### Isolated absent-pod regression
 
 The shared development E2E Job validates the read-only inventory and preview contract.
-It cannot safely create this destructive regression: the coordinators serve a shared pool, not Job-owned test resources.
-Run the following only against a dedicated disposable pool with explicitly authorized coordinator deletion:
+It cannot safely delete shared coordinators to create this destructive regression.
+Run `just test-trino-recovery-isolated <dev-context> <gateway-image>` instead.
+This executable harness creates and removes its own namespace, real Postgres and Gateway,
+and lightweight coordinator/worker Deployments with synthetic admitted identities and obligations.
+It drives the real recovery implementation through live-process refusal, original-Pod deletion,
+replacement-Pod creation, failed retirement, leader handoff, and UID-scoped resource cleanup.
+Assertions require both terminal lifecycle stores, retained failure accounting, unchanged authorization,
+and an unchanged healthy sibling. See [the E2E setup](../../tests/mw-dev/README.md#isolated-trino-recovery-boundary).
 
-1. Admit a coordinator, retain an unfinished query and an open transaction, and record its admitted pod UID and recovery preview.
-2. Drain the instance and restore the configured serving minimum with independently healthy replacements.
-3. Delete only that test coordinator pod. Wait until the original UID is absent and its Deployment creates a different pod UID.
-4. Submit recovery using the original admitted identity, not the replacement pod's identity.
-5. Assert the instance reaches `FAILURE_RETIRED`, Gateway reports `RETIRED` with retirement kind `FAILED`, and only its owned resources disappear.
-6. Assert the original obligations remain in Gateway's failure accounting and surviving instances still answer queries.
+This is an isolated recovery-boundary test, not a Trino SQL or provisioning test.
+Synthetic pending requests, transactions and queries validate recovery accounting without an actual SQL engine.
+Query-continuation behavior is tested separately in the Gateway protocol suite.
 
 The package regression suite also covers lost replies at every recovery transition, successor leaders, wrong identities,
 insufficient capacity, unfiltered pagination, changed labels, terminating pods, and failed inventory reads.
