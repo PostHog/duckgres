@@ -53,11 +53,10 @@ func profileCatalog(catalog perfcore.Catalog) (perfcore.Catalog, string, error) 
 func captureProfiles(ctx context.Context, catalog perfcore.Catalog, drivers map[perfcore.Protocol]perfcore.ProtocolDriver, outputDir, recipient string) error {
 	for _, target := range catalog.Targets {
 		for _, query := range catalog.Queries {
-			supported := len(query.Targets) == 0
-			for _, protocol := range query.Targets {
-				supported = supported || protocol == target
-			}
-			if !supported {
+			// Reuse the runner's protocol and storage-variant routing. Paired
+			// catalog queries carry StorageTarget even when Targets is empty.
+			singleQuery := perfcore.Catalog{Queries: []perfcore.Query{query}}
+			if !singleQuery.NeedsDriver(target) {
 				continue
 			}
 			if err := captureProfile(ctx, drivers[target], query, outputDir, recipient); err != nil {
