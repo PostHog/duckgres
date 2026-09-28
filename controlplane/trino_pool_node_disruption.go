@@ -52,22 +52,20 @@ func (o *trinoPoolOperator) protectPoolNodes(ctx context.Context, instances []co
 			continue
 		}
 		evidence, err := o.nodeGuard.inspect(ctx, inventoryOf(*instance))
-		if errors.Is(err, errTrinoPodProtectionIncomplete) && (instance.Phase == string(trinopool.PhaseCreating) || instance.Phase == string(trinopool.PhasePreparing)) {
-			// Pending pods are normal convergence, not failed protection of serving work.
-			continue
-		}
-		if errors.Is(err, errTrinoUnschedulableNode) && instance.NodeReplacementEvidence != nil {
+		if err == errTrinoUnschedulableNode && instance.NodeReplacementEvidence != nil {
 			err = nil
 		}
-		if err == nil && len(evidence) > 0 {
-			err = o.dropAuthority(store.RecordTrinoPoolNodeReplacement(ctx, o.lease, instance.InstanceID, evidence[0]))
-			if instance.NodeReplacementEvidence == nil {
-				if err == nil {
-					encoded, _ := json.Marshal(evidence[0])
-					value := string(encoded)
-					instance.NodeReplacementEvidence = &value
-					slog.Info("Trino pool requested voluntary node replacement.", "pool", o.config.PublicID, "instance", instance.InstanceID, "node_uid", evidence[0].NodeUID, "nodeclaim_uid", evidence[0].NodeClaimUID, "reason", evidence[0].Reason)
-				}
+		if len(evidence) > 0 {
+			// Exact positive evidence remains valid when another pod or node is unavailable.
+			recordErr := o.dropAuthority(store.RecordTrinoPoolNodeReplacement(ctx, o.lease, instance.InstanceID, evidence[0]))
+			if recordErr == nil && instance.NodeReplacementEvidence == nil {
+				encoded, _ := json.Marshal(evidence[0])
+				value := string(encoded)
+				instance.NodeReplacementEvidence = &value
+				slog.Info("Trino pool requested voluntary node replacement.", "pool", o.config.PublicID, "instance", instance.InstanceID, "node_uid", evidence[0].NodeUID, "nodeclaim_uid", evidence[0].NodeClaimUID, "reason", evidence[0].Reason)
+			}
+			if recordErr != nil {
+				err = errors.Join(err, recordErr)
 			}
 			if err == nil {
 				for _, node := range evidence {
@@ -76,6 +74,10 @@ func (o *trinoPoolOperator) protectPoolNodes(ctx context.Context, instances []co
 					}
 				}
 			}
+		}
+		if err == errTrinoPodProtectionIncomplete && (instance.Phase == string(trinopool.PhaseCreating) || instance.Phase == string(trinopool.PhasePreparing)) {
+			// Pending pods are normal convergence, not failed protection of serving work.
+			continue
 		}
 		if err != nil {
 			o.nodeProtectionErrors[instance.InstanceID] = err
@@ -96,6 +98,8 @@ func (o *trinoPoolOperator) candidateNodeCheck(ctx context.Context, instance con
 		return errTrinoCandidateNodeReplacement
 	}
 	o.nodeGuard.reset()
+	defer o.nodeGuard.reset()
+	o.nodeGuard.namedClaims = true
 	o.nodeGuard.epoch = o.lease.Epoch
 	evidence, err := o.nodeGuard.inspect(ctx, inventoryOf(instance))
 	if err != nil {

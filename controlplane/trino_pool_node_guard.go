@@ -14,6 +14,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/trinopool"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -38,17 +39,30 @@ type trinoNodeClaim struct {
 }
 
 type trinoPoolNodeGuard struct {
-	client     kubernetes.Interface
-	listClaims func(context.Context) ([]trinoNodeClaim, error)
-	claims     map[string]trinoNodeClaim
-	claimsErr  error
-	loaded     bool
-	nodes      map[string]*corev1.Node
-	epoch      int64
+	client      kubernetes.Interface
+	listClaims  func(context.Context) ([]trinoNodeClaim, error)
+	getClaim    func(context.Context, string) (trinoNodeClaim, error)
+	namedClaims bool
+	claims      map[string]trinoNodeClaim
+	claimsErr   error
+	loaded      bool
+	nodes       map[string]*corev1.Node
+	epoch       int64
 }
 
 func newTrinoPoolNodeGuard(client kubernetes.Interface) *trinoPoolNodeGuard {
 	g := &trinoPoolNodeGuard{client: client}
+	g.getClaim = func(ctx context.Context, name string) (trinoNodeClaim, error) {
+		ctx, cancel := context.WithTimeout(ctx, trinoPoolRequestBudget)
+		defer cancel()
+		raw, err := client.CoreV1().RESTClient().Get().AbsPath("/apis/karpenter.sh/v1").Resource("nodeclaims").Name(name).SetHeader("Accept", "application/json").Do(ctx).Raw()
+		if err != nil {
+			return trinoNodeClaim{}, err
+		}
+		var claim trinoNodeClaim
+		err = json.Unmarshal(raw, &claim)
+		return claim, err
+	}
 	g.listClaims = func(ctx context.Context) ([]trinoNodeClaim, error) {
 		ctx, cancel := context.WithTimeout(ctx, trinoPoolRequestBudget)
 		defer cancel()
@@ -87,6 +101,7 @@ func newTrinoPoolNodeGuard(client kubernetes.Interface) *trinoPoolNodeGuard {
 }
 
 func (g *trinoPoolNodeGuard) reset() {
+	g.namedClaims = false
 	g.loaded = false
 	g.claims = nil
 	g.claimsErr = nil
@@ -94,7 +109,7 @@ func (g *trinoPoolNodeGuard) reset() {
 }
 
 func (g *trinoPoolNodeGuard) nodeClaim(ctx context.Context, node *corev1.Node) (trinoNodeClaim, error) {
-	if !g.loaded {
+	if !g.loaded && !g.namedClaims {
 		g.loaded = true
 		claims, err := g.listClaims(ctx)
 		g.claimsErr = err
@@ -111,7 +126,22 @@ func (g *trinoPoolNodeGuard) nodeClaim(ctx context.Context, node *corev1.Node) (
 			continue
 		}
 		claim, ok := g.claims[string(owner.UID)]
-		if !ok || owner.UID == "" || claim.Name != owner.Name || claim.Status.NodeName != node.Name || node.Spec.ProviderID == "" || claim.Status.ProviderID != node.Spec.ProviderID {
+		if g.namedClaims && !ok {
+			var err error
+			claim, err = g.getClaim(ctx, owner.Name)
+			if apierrors.IsNotFound(err) {
+				return trinoNodeClaim{}, fmt.Errorf("%w: NodeClaim no longer exists", errTrinoNodePlacementInvalid)
+			}
+			if err != nil {
+				return trinoNodeClaim{}, err
+			}
+			ok = claim.UID == owner.UID
+			if g.claims == nil {
+				g.claims = make(map[string]trinoNodeClaim)
+			}
+			g.claims[string(owner.UID)] = claim
+		}
+		if !ok || owner.UID == "" || claim.UID != owner.UID || claim.Name != owner.Name || claim.Status.NodeName != node.Name || node.Spec.ProviderID == "" || claim.Status.ProviderID != node.Spec.ProviderID {
 			return trinoNodeClaim{}, fmt.Errorf("%w: node lacks an exact matching NodeClaim", errTrinoNodePlacementInvalid)
 		}
 		if claim.Spec.TerminationGracePeriod != nil {
@@ -197,6 +227,7 @@ func (g *trinoPoolNodeGuard) inspect(ctx context.Context, inventory trinoPoolInv
 		}
 	}
 	var evidence []trinopool.NodeReplacementEvidence
+	var failures []error
 	ordered := make([]string, 0, len(nodeNames))
 	for name := range nodeNames {
 		ordered = append(ordered, name)
@@ -207,7 +238,8 @@ func (g *trinoPoolNodeGuard) inspect(ctx context.Context, inventory trinoPoolInv
 		if node == nil {
 			node, err = g.client.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
 			if err != nil {
-				return nil, err
+				failures = append(failures, err)
+				continue
 			}
 			if g.nodes == nil {
 				g.nodes = make(map[string]*corev1.Node)
@@ -216,7 +248,8 @@ func (g *trinoPoolNodeGuard) inspect(ctx context.Context, inventory trinoPoolInv
 		}
 		claim, err := g.nodeClaim(ctx, node)
 		if err != nil {
-			return nil, err
+			failures = append(failures, err)
+			continue
 		}
 		reason := ""
 		for _, condition := range claim.Status.Conditions {
@@ -230,19 +263,24 @@ func (g *trinoPoolNodeGuard) inspect(ctx context.Context, inventory trinoPoolInv
 		if reason != "" {
 			e := trinopool.NodeReplacementEvidence{NodeName: node.Name, NodeUID: string(node.UID), NodeClaimName: claim.Name, NodeClaimUID: string(claim.UID), Reason: reason}
 			if err := e.Validate(); err != nil {
-				return nil, err
+				failures = append(failures, err)
+				continue
 			}
 			evidence = append(evidence, e)
 		} else if node.Spec.Unschedulable {
-			return nil, errTrinoUnschedulableNode
+			failures = append(failures, errTrinoUnschedulableNode)
 		}
 	}
 	for uid, deployment := range deployments {
 		if scheduled[uid] != int(*deployment.Spec.Replicas) {
-			return evidence, errTrinoPodProtectionIncomplete
+			failures = append(failures, errTrinoPodProtectionIncomplete)
+			break
 		}
 	}
-	return evidence, nil
+	if len(failures) == 1 {
+		return evidence, failures[0]
+	}
+	return evidence, errors.Join(failures...)
 }
 
 // cordon only excludes future scheduling. It never evicts pods or deletes nodes.

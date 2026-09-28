@@ -549,14 +549,17 @@ func (o *trinoPoolOperator) applyPlan(ctx context.Context, pool *configstore.Tri
 	desiredBlueprintDigest := o.config.Blueprint.Digest()
 	for _, instance := range instances {
 		view := instance.View()
+		validNodeEvidence := false
 		if instance.NodeReplacementEvidence != nil {
 			var evidence trinopool.NodeReplacementEvidence
 			if err := json.Unmarshal([]byte(*instance.NodeReplacementEvidence), &evidence); err != nil || evidence.Validate() != nil {
 				view.RolloutBlocked = true
 				failures = append(failures, fmt.Errorf("instance %s has unreadable node replacement evidence", instance.InstanceID))
+			} else {
+				validNodeEvidence = true
 			}
 		}
-		if o.nodeProtectionErrors[instance.InstanceID] != nil {
+		if o.nodeProtectionErrors[instance.InstanceID] != nil && !validNodeEvidence {
 			view.RolloutBlocked = true
 		}
 		if view.Phase.Serving() {

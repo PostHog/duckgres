@@ -15,7 +15,9 @@ import (
 	"github.com/posthog/duckgres/controlplane/trinopool"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -65,6 +67,18 @@ func nodeGuardFixture(t *testing.T) (*trinoPoolNodeGuard, *fake.Clientset, trino
 	g := newTrinoPoolNodeGuard(client)
 	g.epoch = 7
 	g.listClaims = func(context.Context) ([]trinoNodeClaim, error) { return []trinoNodeClaim{*claim}, nil }
+	g.getClaim = func(ctx context.Context, name string) (trinoNodeClaim, error) {
+		claims, err := g.listClaims(ctx)
+		if err != nil {
+			return trinoNodeClaim{}, err
+		}
+		for _, candidate := range claims {
+			if candidate.Name == name {
+				return candidate, nil
+			}
+		}
+		return trinoNodeClaim{}, apierrors.NewNotFound(schema.GroupResource{Group: "karpenter.sh", Resource: "nodeclaims"}, name)
+	}
 	g.reset()
 	return g, client, inventory, claim
 }
@@ -227,5 +241,63 @@ func TestTrinoNodeClaimInventoryRequestsJSONAndAllPages(t *testing.T) {
 	encoded, _ := json.Marshal(claims)
 	if len(encoded) == 0 {
 		t.Fatal("empty encoded claims")
+	}
+}
+
+func TestTrinoNodeGuardCollectsDriftPastUnrelatedCordon(t *testing.T) {
+	for _, name := range []string{"a-cordoned", "z-cordoned"} {
+		t.Run(name, func(t *testing.T) {
+			g, client, inventory, claim := nodeGuardFixture(t)
+			ctx := context.Background()
+			claim.Status.Conditions = []metav1.Condition{{Type: "Drifted", Status: metav1.ConditionTrue}}
+			other := *claim
+			other.Name, other.UID = "other-claim", "other-uid"
+			other.Status.NodeName, other.Status.ProviderID, other.Status.Conditions = name, "test://other", nil
+			g.listClaims = func(context.Context) ([]trinoNodeClaim, error) { return []trinoNodeClaim{*claim, other}, nil }
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, UID: "other-node-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: other.Name, UID: other.UID}}}, Spec: corev1.NodeSpec{ProviderID: other.Status.ProviderID, Unschedulable: true}}
+			if _, err := client.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			pod, _ := client.CoreV1().Pods(inventory.Namespace).Get(ctx, inventory.WorkerDeploymentName+"-0", metav1.GetOptions{})
+			pod.Spec.NodeName = name
+			if _, err := client.CoreV1().Pods(inventory.Namespace).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := g.inspect(ctx, inventory)
+			if !errors.Is(err, errTrinoUnschedulableNode) || len(evidence) != 1 || evidence[0].NodeUID != "node-uid" {
+				t.Fatalf("order-dependent observation: %v %v", evidence, err)
+			}
+		})
+	}
+}
+
+func TestTrinoNodeNamedClaimRejectsCachedWrongUID(t *testing.T) {
+	g, client, _, claim := nodeGuardFixture(t)
+	g.namedClaims = true
+	claim.UID = "replaced-claim-uid"
+	node, _ := client.CoreV1().Nodes().Get(context.Background(), "compute-node", metav1.GetOptions{})
+	for range 2 {
+		if _, err := g.nodeClaim(context.Background(), node); !errors.Is(err, errTrinoNodePlacementInvalid) {
+			t.Fatalf("accepted wrong cached UID: %v", err)
+		}
+	}
+}
+
+func TestTrinoNodeNamedClaimRequestsFreshJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/apis/karpenter.sh/v1/nodeclaims/claim-a" || r.Header.Get("Accept") != "application/json" {
+			t.Errorf("unexpected request: %s accept=%s", r.URL, r.Header.Get("Accept"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"metadata":{"name":"claim-a","uid":"uid-a"}}`))
+	}))
+	defer server.Close()
+	client, err := kubernetes.NewForConfig(&rest.Config{Host: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := newTrinoPoolNodeGuard(client).getClaim(context.Background(), "claim-a")
+	if err != nil || claim.Name != "claim-a" || claim.UID != "uid-a" {
+		t.Fatalf("claim=%v err=%v", claim, err)
 	}
 }

@@ -12,8 +12,11 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/trinogateway"
 	"github.com/posthog/duckgres/controlplane/trinopool"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 func attachNodeFixture(t *testing.T, h *operatorHarness, instance *configstore.TrinoPoolInstance) (*trinoPoolNodeGuard, trinoPoolInventory, *trinoNodeClaim) {
@@ -380,5 +383,192 @@ func TestTrinoNodeReplacementRemainsAfterDriftClears(t *testing.T) {
 	}
 	if err := h.operator.candidateNodeCheck(context.Background(), *i); !errors.Is(err, errTrinoCandidateNodeReplacement) {
 		t.Fatalf("candidate bypassed durable replacement: %v", err)
+	}
+}
+
+func TestTrinoNodeDurableReplacementSurvivesProtectionFailure(t *testing.T) {
+	for _, evidenceState := range []string{"valid", "absent", "invalid"} {
+		t.Run(evidenceState, func(t *testing.T) {
+			h := newOperatorHarness(t)
+			h.tick(t, 20)
+			instance := h.store.instances[h.store.order[0]]
+			value := `{"node_name":"node","node_uid":"uid","nodeclaim_name":"claim","nodeclaim_uid":"claim-uid","reason":"Drifted"}`
+			if evidenceState == "invalid" {
+				value = `{}`
+			}
+			if evidenceState != "absent" {
+				instance.NodeReplacementEvidence = &value
+			}
+			h.operator.nodeProtectionErrors = map[string]error{instance.InstanceID: errors.New("node API unavailable")}
+			instances, _ := h.store.ListTrinoPoolInstances(context.Background(), h.operator.config.PoolID)
+			before := len(instances)
+			err := h.operator.applyPlan(context.Background(), h.store.pool, instances)
+			if evidenceState != "valid" {
+				if len(h.store.order) != before {
+					t.Fatal("unproven replacement bypassed protection failure")
+				}
+				return
+			}
+			if err != nil || len(h.store.order) != before+1 {
+				t.Fatalf("durable replacement blocked: %v", err)
+			}
+			replacement := h.store.instances[h.store.order[len(h.store.order)-1]]
+			for range 8 {
+				if replacement.Phase == string(trinopool.PhaseServing) {
+					break
+				}
+				if _, err := h.operator.progressInstance(context.Background(), *replacement); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if replacement.Phase != string(trinopool.PhaseServing) || h.gateway.members[replacement.InstanceID].Phase != "ACTIVE" {
+				t.Fatal("replacement not admitted")
+			}
+			instances, _ = h.store.ListTrinoPoolInstances(context.Background(), h.operator.config.PoolID)
+			if err := h.operator.applyPlan(context.Background(), h.store.pool, instances); err != nil {
+				t.Fatal(err)
+			}
+			if instance.Phase != string(trinopool.PhaseDraining) {
+				t.Fatal("accepted replacement could not drain")
+			}
+		})
+	}
+}
+
+func TestTrinoNodePartialInventoryPreservesEvidenceWithoutCordon(t *testing.T) {
+	for _, phase := range []trinopool.Phase{trinopool.PhaseServing, trinopool.PhasePreparing} {
+		t.Run(string(phase), func(t *testing.T) {
+			h := newOperatorHarness(t)
+			h.tick(t, 20)
+			instance := h.store.instances[h.store.order[0]]
+			instance.Phase = string(phase)
+			g, inventory, claim := attachNodeFixture(t, h, instance)
+			claim.Status.Conditions = []metav1.Condition{{Type: "Drifted", Status: metav1.ConditionTrue}}
+			ctx := context.Background()
+			if err := g.client.CoreV1().Pods(inventory.Namespace).Delete(ctx, inventory.WorkerDeploymentName+"-0", metav1.DeleteOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			err := h.operator.protectPoolNodes(ctx, []configstore.TrinoPoolInstance{*instance})
+			if phase == trinopool.PhaseServing && !errors.Is(err, errTrinoPodProtectionIncomplete) {
+				t.Fatalf("lost inventory error: %v", err)
+			}
+			if phase == trinopool.PhasePreparing && err != nil {
+				t.Fatalf("scheduling became failure: %v", err)
+			}
+			if instance.NodeReplacementEvidence == nil {
+				t.Fatal("proven drift was discarded")
+			}
+			node, _ := g.client.CoreV1().Nodes().Get(ctx, "compute-node", metav1.GetOptions{})
+			if node.Spec.Unschedulable {
+				t.Fatal("incomplete protection authorized cordon")
+			}
+		})
+	}
+}
+
+func TestTrinoNodeCompoundProtectionErrorsRetainEvidenceAndFaults(t *testing.T) {
+	h := newOperatorHarness(t)
+	h.tick(t, 20)
+	instance := h.store.instances[h.store.order[0]]
+	g, inventory, claim := attachNodeFixture(t, h, instance)
+	claim.Status.Conditions = []metav1.Condition{{Type: "Drifted", Status: metav1.ConditionTrue}}
+	ctx := context.Background()
+	other := *claim
+	other.Name, other.UID = "other-claim", "other-uid"
+	other.Status.NodeName, other.Status.ProviderID, other.Status.Conditions = "a-cordoned", "test://other", nil
+	g.listClaims = func(context.Context) ([]trinoNodeClaim, error) { return []trinoNodeClaim{*claim, other}, nil }
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "a-cordoned", UID: "other-node-uid", ResourceVersion: "1", OwnerReferences: []metav1.OwnerReference{{APIVersion: "karpenter.sh/v1", Kind: "NodeClaim", Name: other.Name, UID: other.UID}}}, Spec: corev1.NodeSpec{ProviderID: other.Status.ProviderID, Unschedulable: true}}
+	if _, err := g.client.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for suffix, nodeName := range map[string]string{"-0": "a-cordoned", "-1": "b-unavailable", "-2": ""} {
+		pod, err := g.client.CoreV1().Pods(inventory.Namespace).Get(ctx, inventory.WorkerDeploymentName+suffix, metav1.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pod.Spec.NodeName = nodeName
+		if _, err := g.client.CoreV1().Pods(inventory.Namespace).Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apiFailure := errors.New("node API unavailable")
+	g.client.(*fake.Clientset).PrependReactor("get", "nodes", func(action ktesting.Action) (bool, runtime.Object, error) {
+		if action.(ktesting.GetAction).GetName() == "b-unavailable" {
+			return true, nil, apiFailure
+		}
+		return false, nil, nil
+	})
+	// Repeat after persistence to exercise the existing-evidence suppression path.
+	for range 2 {
+		err := h.operator.protectPoolNodes(ctx, []configstore.TrinoPoolInstance{*instance})
+		if !errors.Is(err, apiFailure) || !errors.Is(err, errTrinoUnschedulableNode) || !errors.Is(err, errTrinoPodProtectionIncomplete) {
+			t.Fatalf("compound error was lost: %v", err)
+		}
+		if instance.NodeReplacementEvidence == nil {
+			t.Fatal("exact drift discarded beside unrelated fault")
+		}
+		drifted, _ := g.client.CoreV1().Nodes().Get(ctx, "compute-node", metav1.GetOptions{})
+		if drifted.Spec.Unschedulable {
+			t.Fatal("compound fault authorized cordon")
+		}
+	}
+}
+
+func TestTrinoNodeCandidateUsesFreshNamedClaimsWithoutRelisting(t *testing.T) {
+	h, instance := validatingNodeFixture(t)
+	g, _, claim := attachNodeFixture(t, h, instance)
+	listCalls, getCalls := 0, 0
+	g.listClaims = func(context.Context) ([]trinoNodeClaim, error) { listCalls++; return []trinoNodeClaim{*claim}, nil }
+	g.getClaim = func(ctx context.Context, name string) (trinoNodeClaim, error) {
+		getCalls++
+		if name != claim.Name {
+			t.Fatalf("wrong named claim: %s", name)
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("claim read has no deadline")
+		}
+		return *claim, nil
+	}
+	ctx := context.Background()
+	if err := h.operator.protectPoolNodes(ctx, []configstore.TrinoPoolInstance{*instance}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.operator.candidateNodeCheck(ctx, *instance); err != nil {
+		t.Fatal(err)
+	}
+	claim.Status.Conditions = []metav1.Condition{{Type: "Drifted", Status: metav1.ConditionTrue}}
+	if err := h.operator.candidateNodeCheck(ctx, *instance); !errors.Is(err, errTrinoCandidateNodeReplacement) {
+		t.Fatalf("cached claim admitted new drift: %v", err)
+	}
+	claim.Status.Conditions = nil
+	node, _ := g.client.CoreV1().Nodes().Get(ctx, "compute-node", metav1.GetOptions{})
+	node.Spec.Unschedulable = true
+	if _, err := g.client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.operator.candidateNodeCheck(ctx, *instance); !errors.Is(err, errTrinoUnschedulableNode) {
+		t.Fatalf("cached node admitted new cordon: %v", err)
+	}
+	if listCalls != 1 || getCalls != 3 {
+		t.Fatalf("inventory=%d named reads=%d", listCalls, getCalls)
+	}
+	if g.namedClaims || g.loaded || len(g.claims) != 0 || len(g.nodes) != 0 {
+		t.Fatal("candidate snapshot escaped its check")
+	}
+}
+
+func TestTrinoNodeCandidateDoesNotHideSchedulingAndAPIFailure(t *testing.T) {
+	h, instance := validatingNodeFixture(t)
+	instance.Phase = string(trinopool.PhasePreparing)
+	g, inventory, _ := attachNodeFixture(t, h, instance)
+	ctx := context.Background()
+	if err := g.client.CoreV1().Pods(inventory.Namespace).Delete(ctx, inventory.WorkerDeploymentName+"-0", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	apiFailure := errors.New("claim API unavailable")
+	g.getClaim = func(context.Context, string) (trinoNodeClaim, error) { return trinoNodeClaim{}, apiFailure }
+	progressed, err := h.operator.validateCandidate(ctx, *instance)
+	if progressed || !errors.Is(err, apiFailure) || !errors.Is(err, errTrinoPodProtectionIncomplete) || instance.Phase != string(trinopool.PhasePreparing) {
+		t.Fatalf("candidate hid API fault or retired: progressed=%v phase=%s err=%v", progressed, instance.Phase, err)
 	}
 }

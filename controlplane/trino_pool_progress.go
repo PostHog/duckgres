@@ -296,7 +296,7 @@ func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance conf
 		if definitiveTrinoNodePlacement(err) {
 			return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing, "candidate has an invalid node placement before admission")
 		}
-		if errors.Is(err, errTrinoPodProtectionIncomplete) {
+		if err == errTrinoPodProtectionIncomplete {
 			return false, nil
 		}
 		return false, err

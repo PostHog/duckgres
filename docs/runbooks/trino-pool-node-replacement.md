@@ -18,6 +18,10 @@ Trino, intercept SIGTERM, expire transactions, or convert failure into successfu
 3. Add `karpenter.sh/do-not-disrupt: "true"` to both blueprint pod templates and
    enable the environment variable alongside the existing pool/operator flags.
    The source binary alone does not inject this annotation with the feature off.
+   Every node eligible for these pods must have a `karpenter.sh/v1` NodeClaim
+   owner, with matching Node/NodeClaim UIDs, names, and provider IDs. Verify the
+   pool's scheduling constraints before enabling this feature. Non-Karpenter
+   nodes and older owner-reference API versions are not supported.
 4. Confirm every live coordinator and worker has the annotation before testing
    disruption. Existing immutable Deployments are not rolled to add it: the
    controller patches only the metadata of their exact owned pods.
@@ -37,7 +41,12 @@ belong to the recorded Deployment through an exact ReplicaSet UID chain; labels
 alone do not establish ownership. A protection pass has a 30-second budget and
 rotates its starting instance. Individual Kubernetes calls use a 10-second budget.
 One paginated NodeClaim inventory is shared within the pass, capped at 10,000
-claims; errors and incomplete inventories never prove drift.
+claims. Candidate validation and admission read fresh Nodes and fetch only their
+named NodeClaims, instead of listing every claim again. These reads share a
+10-second inspection deadline. Each candidate check caches its own claim reads
+and discards them afterward; it cannot reuse the protection pass's older snapshot.
+API errors never prove drift. Missing pods do not invalidate positive drift
+evidence from other exactly identified nodes.
 
 The first exact Node/NodeClaim identity with `Drifted=True`, or a deletion timestamp,
 is recorded once in `node_replacement_evidence`. Later observations cannot rewrite
@@ -58,11 +67,17 @@ New candidates on drifted, deleting, unschedulable, or unverifiable nodes cannot
 be admitted. Admission whose response was lost still replays the same Gateway
 request; a concurrent successful admission cannot be deleted as a failed candidate.
 
-API errors pause voluntary replacement. Missing or pending worker inventory is
-normal convergence for a new candidate, but blocks voluntary replacement of a
-serving instance. A candidate with definitively invalid placement fails through
-the guarded candidate-retirement path, freeing its slot after cleanup. A
-candidate waiting for scheduling or an unavailable API retains its slot and retries.
+API errors and missing or pending worker inventory block new cordons. Pending
+pods alone are normal convergence for a new candidate. Independently verified
+drift is still recorded when another pod or node is unavailable. Valid, durable
+replacement evidence permits the normal create/admit/drain sequence to continue
+despite later observation faults. Missing or malformed evidence does not.
+A candidate with definitively invalid placement fails through the guarded
+candidate-retirement path. `FAILED_PREPARING` is not terminal: its capacity slot
+stays charged until cleanup finishes. A consistently unsupported node placement
+can still cause repeated creation failures after cleanup; fix the scheduling
+constraints or disable new node handling instead of waiting for those retries.
+A candidate waiting for scheduling or an unavailable API retains its slot and retries.
 Health detection, explicit administrative recovery, and irreversible retirement
 continue through their existing guards. A node lookup failure is neither drift
 evidence nor proof that the admitted process died.
