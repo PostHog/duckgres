@@ -43,8 +43,11 @@ func (d *Driver) Profile(ctx context.Context, query core.Query) ([][]*string, []
 			continue
 		}
 		info, parseErr := ParseQueryInfo(raw)
-		if parseErr != nil || info.QueryID != id {
-			return plan, nil, fmt.Errorf("invalid full coordinator query info")
+		if parseErr != nil {
+			return plan, raw, fmt.Errorf("parse full coordinator query info: %w", parseErr)
+		}
+		if info.QueryID != id {
+			return plan, raw, fmt.Errorf("full coordinator query info answered for a different query")
 		}
 		if info.Final {
 			return plan, raw, nil
