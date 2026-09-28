@@ -36,7 +36,8 @@ Each target has a four-hour scenario limit and a 270-minute workflow job limit.
 The Go process limit is 4h15m, leaving time for artifact collection and cleanup.
 These limits apply independently to each job, not to the sum of all target jobs.
 A single target can still time out; peer runtimes have not yet been measured.
-The measured uncached DuckDB coverage phase took 87m06s.
+These runtime estimates use the historical small-worker profile, not the larger
+profile below. The measured uncached DuckDB coverage phase took 87m06s.
 
 Running all five targets sequentially inside one job would likely time out:
 the equal-speed query-work estimate alone is 7h16m. The matrix avoids that
@@ -53,10 +54,45 @@ gh workflow run scenario-dev.yml --ref <branch> \
 ```
 
 Each target job executes all twelve queries with one warmup and four
-measured repetitions, sequentially, using the same frozen files. The explicit
-3 CPU / 12 GiB settings describe DuckDB workers, not equivalent resources across
-engines. "Uncached" disables the DuckDB external file cache; it does not
-guarantee cold OS or storage caches. See
+measured repetitions, sequentially, using the same frozen files.
+
+### Worker sizing
+
+Standard frozen perf and extended perf use the following execution budgets:
+
+| Engine | Workers | CPU per worker | RAM per worker | JVM heap | Query memory per worker |
+|---|---:|---:|---:|---:|---:|
+| Trino (each cache mode) | 3 | 16 | 64 GiB | 48 GiB | 32 GiB |
+| DuckDB (each cache mode) | 1 | 48 | 192 GiB | N/A | Derived by Duckgres from pod memory |
+
+Both have **48 CPU / 192 GiB of worker resources**, with requests equal to
+limits. This compares aggregate execution resources; Trino coordinator and
+support services are additional overhead. Athena capacity is service-managed.
+Trino's cluster-wide query memory cap is 96 GiB. Its 48 GiB heap leaves 16 GiB
+outside the JVM, and its 32 GiB per-node query cap leaves room for JVM headroom.
+This is a chosen production-oriented profile consistent with
+[Trino's guidance](https://trino.io/docs/current/installation/deployment.html#jvm-config),
+not a universal prescribed CPU/RAM size.
+
+DuckDB's client sizing caps are raised alongside its worker resources so the
+explicit benchmark profile is not silently clamped. At 192 GiB, the current
+Duckgres headroom policy sets DuckDB's memory limit to 144 GiB; engine memory
+limits differ even though container resources match. Other scenario types and
+the auxiliary Trino bootstrap cluster retain their small defaults.
+
+The benchmark node pool must admit nodes large enough for a 48-CPU / 192Gi
+DuckDB pod and 16-CPU / 64Gi Trino pods, with additional allocatable capacity for
+system services. Deploy the [node-size allowlist change](https://github.com/PostHog/charts/pull/16434)
+before running this profile. If pods remain Pending, inspect scheduling events and
+node-pool constraints rather than counting setup failure as query latency.
+
+The retained September 25 baseline used the old 3 CPU / 12 GiB aggregate
+profile. Keep it as historical data; it is **not a like-for-like baseline** for
+these larger workers. Runtime estimates above also describe the old profile;
+measure a fresh run before setting a new baseline or runtime forecast.
+
+"Uncached" disables the DuckDB external file cache; it does not guarantee cold
+OS or storage caches. See
 [cache settings](../../tests/perf/README.md#duckdb-cache-comparison).
 
 Target jobs have distinct benchmark run and nightly IDs. Group an all-target

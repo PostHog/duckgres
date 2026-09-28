@@ -1,6 +1,6 @@
 # Coverage v1: uncached DuckDB baseline
 
-This is the initial comparison base for the twelve coverage v1 intents on
+This is the historical small-resource comparison base for the twelve coverage v1 intents on
 `pgwire_uncached`. [Successful source run](https://github.com/PostHog/duckgres/actions/runs/36159233201)
 measured commit `9c9f5f305f87b7f0d41c0b54d64e5648aeb8ef83` on 2026-09-25.
 The catalog and query settings match the measured revision. The focused entry
@@ -11,6 +11,10 @@ manifest preserves the original scenario name used by the source run.
 [manifest](manifest.json) records the catalog hash, dataset version, cache
 settings, resource requests, methodology, and timing calculations. No query
 result values or internal fixture locations are retained.
+
+The current benchmark uses larger workers. These samples and runtime estimates
+apply only to the original 3 CPU / 12 GiB aggregate profile; they must not be
+used as a like-for-like baseline for the new 48 CPU / 192 GiB profile.
 
 ## Measured times
 

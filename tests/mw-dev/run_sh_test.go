@@ -168,6 +168,13 @@ func TestTrinoWorkersMatchDuckgresAggregateCompute(t *testing.T) {
 		"${TRINO_TLS_PASSWORD}", "test-password",
 		"${TRINO_CA_CERT_B64}", "dGVzdA==",
 		"${TRINO_SERVER_P12_B64}", "dGVzdA==",
+		"${TRINO_WORKER_CPU}", "1",
+		"${TRINO_WORKER_MEMORY}", "4Gi",
+		"${TRINO_WORKER_HEAP}", "3G",
+		"${TRINO_QUERY_MEMORY}", "6GB",
+		"${TRINO_WORKER_QUERY_MEMORY}", "2GB",
+		"${TRINO_WORKER_THREADS}", "24",
+		"${TRINO_WORKER_MIN_DRIVERS}", "48",
 	).Replace(string(raw))
 
 	decoder := utilyaml.NewYAMLOrJSONDecoder(strings.NewReader(rendered), 4096)
