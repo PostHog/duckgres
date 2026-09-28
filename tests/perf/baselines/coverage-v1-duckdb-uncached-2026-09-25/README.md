@@ -14,7 +14,7 @@ result values or internal fixture locations are retained.
 
 The current benchmark uses larger workers. These samples and runtime estimates
 apply only to the original 3 CPU / 12 GiB aggregate profile; they must not be
-used as a like-for-like baseline for the new 48 CPU / 192 GiB profile.
+used as a like-for-like baseline for the new 21 CPU / 84 GiB profile.
 
 ## Measured times
 

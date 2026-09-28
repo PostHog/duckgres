@@ -146,13 +146,13 @@ jobs:
       TRINO_IMAGE: ${{ needs.plan.outputs.trino_image }}
       DUCKGRES_SCENARIO_MAX_RUNTIME: 4h
       DUCKGRES_SCENARIO_GO_TEST_TIMEOUT: 4h15m
-      # Match the benchmark Trino fleet: three 16-CPU / 64Gi workers.
+      # Match the benchmark Trino fleet: three 7-CPU / 28Gi workers.
       # Non-benchmark scenarios retain their existing small resource budget.
-      DUCKGRES_K8S_WORKER_CPU_REQUEST: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '48' || '3' }}
-      DUCKGRES_K8S_WORKER_MEMORY_REQUEST: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '192Gi' || '12Gi' }}
+      DUCKGRES_K8S_WORKER_CPU_REQUEST: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '21' || '3' }}
+      DUCKGRES_K8S_WORKER_MEMORY_REQUEST: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '84Gi' || '12Gi' }}
       # The perf driver passes explicit sizing GUCs: keep their admission caps aligned.
-      DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '48' || '8' }}
-      DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '192Gi' || '16Gi' }}
+      DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '21' || '8' }}
+      DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || inputs.scenario == 'posthog_frozen_perf_extended' || inputs.scenario == 'posthog_frozen_perf_extended_uncached') && '84Gi' || '16Gi' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 

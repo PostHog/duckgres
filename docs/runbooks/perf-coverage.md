@@ -62,26 +62,26 @@ Standard frozen perf and extended perf use the following execution budgets:
 
 | Engine | Workers | CPU per worker | RAM per worker | JVM heap | Query memory per worker |
 |---|---:|---:|---:|---:|---:|
-| Trino (each cache mode) | 3 | 16 | 64 GiB | 48 GiB | 32 GiB |
-| DuckDB (each cache mode) | 1 | 48 | 192 GiB | N/A | Derived by Duckgres from pod memory |
+| Trino (each cache mode) | 3 | 7 | 28 GiB | 20 GiB | 10 GiB |
+| DuckDB (each cache mode) | 1 | 21 | 84 GiB | N/A | Derived by Duckgres from pod memory |
 
-Both have **48 CPU / 192 GiB of worker resources**, with requests equal to
+Both have **21 CPU / 84 GiB of worker resources**, with requests equal to
 limits. This compares aggregate execution resources; Trino coordinator and
 support services are additional overhead. Athena capacity is service-managed.
-Trino's cluster-wide query memory cap is 96 GiB. Its 48 GiB heap leaves 16 GiB
-outside the JVM, and its 32 GiB per-node query cap leaves room for JVM headroom.
-This is a chosen production-oriented profile consistent with
-[Trino's guidance](https://trino.io/docs/current/installation/deployment.html#jvm-config),
-not a universal prescribed CPU/RAM size.
+Trino's cluster-wide query memory cap is 30 GiB. Its 20 GiB heap leaves 8 GiB
+outside the JVM, and its 10 GiB per-node query cap leaves room for JVM headroom.
+Worker CPU, RAM, heap and per-node query memory match the configured dev
+worker size. The cluster-wide cap scales to the requested three-worker fleet;
+this is a benchmark profile, not a copy of the complete dev deployment.
 
 DuckDB's client sizing caps are raised alongside its worker resources so the
-explicit benchmark profile is not silently clamped. At 192 GiB, the current
-Duckgres headroom policy sets DuckDB's memory limit to 144 GiB; engine memory
+explicit benchmark profile is not silently clamped. At 84 GiB, the current
+Duckgres headroom policy sets DuckDB's memory limit to 63 GiB; engine memory
 limits differ even though container resources match. Other scenario types and
 the auxiliary Trino bootstrap cluster retain their small defaults.
 
-The benchmark node pool must admit nodes large enough for a 48-CPU / 192Gi
-DuckDB pod and 16-CPU / 64Gi Trino pods, with additional allocatable capacity for
+The benchmark node pool must admit nodes large enough for a 21-CPU / 84Gi
+DuckDB pod and 7-CPU / 28Gi Trino pods, with additional allocatable capacity for
 system services. Deploy the [node-size allowlist change](https://github.com/PostHog/charts/pull/16434)
 before running this profile. If pods remain Pending, inspect scheduling events and
 node-pool constraints rather than counting setup failure as query latency.

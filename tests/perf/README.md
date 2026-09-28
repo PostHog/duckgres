@@ -8,9 +8,9 @@ artifacts and versioned intent IDs. These queries are excluded from standard
 nightly runs and execute only when explicitly dispatched. For the focused uncached DuckDB run,
 baseline recording, runtime estimates, and failure recovery, see the
 [coverage runbook](../../docs/runbooks/perf-coverage.md). Frozen standard and extended benchmarks
-use three Trino workers at 16 CPU / 64 GiB each and one DuckDB worker at
-48 CPU / 192 GiB, matching aggregate worker resources. Trino uses a 48 GiB JVM
-heap, 32 GiB per-worker query cap, and 96 GiB cluster-wide query cap.
+use three Trino workers at 7 CPU / 28 GiB each and one DuckDB worker at
+21 CPU / 84 GiB, matching aggregate worker resources. Trino uses a 20 GiB JVM
+heap, 10 GiB per-worker query cap, and 30 GiB cluster-wide query cap.
 Historical 3 CPU / 12 GiB results require a new baseline before comparison to
 this larger profile; see the runbook for scheduling prerequisites.
 
