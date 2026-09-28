@@ -21,6 +21,10 @@ const funnelIntent = "intent_coverage_ordered_funnel_v1"
 // Profiling is deliberately restricted to this bounded aggregate workload.
 // No raw plans, query info or result values enter public logs or artifacts.
 func profileCatalog(catalog perfcore.Catalog) (perfcore.Catalog, string, error) {
+	experiment := os.Getenv("DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL") == "true"
+	if experiment && os.Getenv("DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL") != "true" {
+		return catalog, "", fmt.Errorf("funnel experiment requires profiling")
+	}
 	if os.Getenv("DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL") != "true" {
 		return catalog, "", nil
 	}
@@ -32,6 +36,9 @@ func profileCatalog(catalog perfcore.Catalog) (perfcore.Catalog, string, error) 
 		return catalog, "", fmt.Errorf("profiling requires age on PATH")
 	}
 	for _, target := range catalog.Targets {
+		if experiment && target != perfcore.ProtocolTrino && target != perfcore.ProtocolTrinoCached {
+			return catalog, "", fmt.Errorf("funnel experiment requires Trino targets")
+		}
 		if target != perfcore.ProtocolPGWireCached && target != perfcore.ProtocolPGWireUncached && target != perfcore.ProtocolTrino && target != perfcore.ProtocolTrinoCached {
 			return catalog, "", fmt.Errorf("unsupported profiling target")
 		}
@@ -93,6 +100,12 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 		results, profileErr = reader.ReadResults(ctx, query, nil)
 		document["results"] = results
 	}
+	var experiment map[string]any
+	var rewritten perfcore.Query
+	if profileErr == nil && os.Getenv("DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL") == "true" {
+		experiment, rewritten, profileErr = measureFunnelExperiment(ctx, reader, query, results)
+		document["experiment"] = experiment
+	}
 	var plan [][]*string
 	if profileErr == nil {
 		if profiler, ok := driver.(interface {
@@ -102,6 +115,14 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 			plan, raw, profileErr = profiler.Profile(ctx, query)
 			if json.Valid(raw) {
 				document["query_info"] = json.RawMessage(raw)
+			}
+			if profileErr == nil && experiment != nil {
+				var rewrittenPlan [][]*string
+				rewrittenPlan, raw, profileErr = profiler.Profile(ctx, rewritten)
+				experiment["explain_analyze"] = rewrittenPlan
+				if json.Valid(raw) {
+					experiment["query_info"] = json.RawMessage(raw)
+				}
 			}
 		} else {
 			// ExplainStmt traversal currently misses interval typmods in the

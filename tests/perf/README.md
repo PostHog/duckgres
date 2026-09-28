@@ -457,3 +457,23 @@ rerun only that target after correcting access or protocol support. Encryption
 failures intentionally produce no plaintext fallback. Existing workflow teardown
 and artifact collection still run on failure. Missing final query information is
 an incomplete profile, not evidence for any optimizer or CPU bottleneck.
+
+For the single-reference `starts` experiment, also set
+`experiment_ordered_funnel=true` (default false). It requires profiling, and
+`coverage_target=all` then selects only Trino uncached and cached, sequentially.
+The original catalog and its ordinary timing artifacts remain unchanged. The
+experiment preserves the catalog's starts definition and completion predicates,
+but uses one left join with the predicates in `ON`, one group per start, and a
+completion marker. It fails if the expected original SQL shape changes.
+
+Before either EXPLAIN, both variants must match the original full result values.
+After validation and one explicit warmup each, eight executions follow the order
+original/rewrite/rewrite/original twice (four samples each). Every execution
+checks full result equality. Durations cover query submission through result
+consumption and exclude validation, warmups, and EXPLAIN. These are paired
+follow-up samples on already-used connections, not cold-start measurements or
+replacements for the catalog's ordinary results. The encrypted profile's
+`experiment` field contains the rewrite SQL, samples, matching values, its plan,
+and full coordinator query info; the top-level plan remains the original.
+A mismatch fails the run and retains available encrypted diagnostics. The local
+equivalent flag is `DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL=true`.

@@ -19,6 +19,11 @@ on:
         required: false
         default: false
         type: boolean
+      experiment_ordered_funnel:
+        description: Compare single-start rewrite with original (requires profiling; Trino only)
+        required: false
+        default: false
+        type: boolean
       profile_recipient:
         description: age public recipient for encrypted diagnostic artifacts
         required: false
@@ -70,12 +75,17 @@ jobs:
           scenario = "posthog_frozen_perf" if os.environ["EVENT_NAME"] == "schedule" else inputs.get("scenario", "")
           targets = ["pgwire_uncached", "pgwire_cached", "trino", "trino_cached", "athena"]
           profile = str(inputs.get("profile_ordered_funnel", "false")).lower() == "true"
+          experiment = str(inputs.get("experiment_ordered_funnel", "false")).lower() == "true"
+          if experiment and not profile:
+              raise SystemExit("Funnel experiment requires profiling")
           if profile:
               if scenario != "posthog_frozen_perf_extended":
                   raise SystemExit("Ordered funnel profiling requires posthog_frozen_perf_extended")
               if not re.fullmatch(r"age1[a-z0-9]+", inputs.get("profile_recipient", "")):
                   raise SystemExit("Ordered funnel profiling requires an age public recipient")
               targets.remove("athena")
+          if experiment:
+              targets = ["trino", "trino_cached"]
           if scenario == "posthog_frozen_perf_extended":
               selected = inputs.get("coverage_target") or "all"
               if selected not in ["all", *targets]:
@@ -159,6 +169,7 @@ jobs:
       E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || (inputs.scenario == 'posthog_frozen_perf_extended' && (matrix.target == 'trino' || matrix.target == 'trino_cached'))) && 'trino' || 'neutral' }}
       DUCKGRES_SCENARIO_COVERAGE_TARGET: ${{ matrix.target }}
       DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL: ${{ inputs.profile_ordered_funnel || false }}
+      DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL: ${{ inputs.experiment_ordered_funnel || false }}
       DUCKGRES_SCENARIO_PROFILE_RECIPIENT: ${{ inputs.profile_ordered_funnel && inputs.profile_recipient || '' }}
       PR_NUMBER: ${{ github.run_id }}${{ matrix.id_suffix }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.id_suffix }}
