@@ -20,6 +20,8 @@ type InstanceView struct {
 	ReleaseID string
 	// SpecOutdated compares desired configuration with this instance's immutable specification.
 	SpecOutdated bool
+	// NodeReplacement requires a serving replacement before voluntary infrastructure retirement.
+	NodeReplacement bool
 	// RolloutBlocked retains capacity accounting but excludes a member with unreadable rollout evidence.
 	RolloutBlocked bool
 	// Repair marks an instance created against the capacity-repair budget.
@@ -145,7 +147,10 @@ func PlanNext(state PoolState) Plan {
 	}
 
 	// 4. Drain only when the floor survives it.
-	if serving-1 >= state.MinServing {
+	if serving-1 >= state.MinServing && (!outdated[0].NodeReplacement || serving > state.DesiredInstances) {
+		if outdated[0].NodeReplacement {
+			return Plan{Action: PlanActionDrain, InstanceID: outdated[0].ID, Reason: "replacing an instance whose node is retiring"}
+		}
 		return Plan{Action: PlanActionDrain, InstanceID: outdated[0].ID, Reason: "replacing an instance with an outdated specification"}
 	}
 
@@ -161,7 +166,7 @@ func PlanNext(state PoolState) Plan {
 func outdatedServing(state PoolState) []InstanceView {
 	var outdated []InstanceView
 	for _, instance := range state.Instances {
-		if instance.Phase.Serving() && !instance.RolloutBlocked && (instance.ReleaseID != state.DesiredReleaseID || instance.SpecOutdated) {
+		if instance.Phase.Serving() && !instance.RolloutBlocked && (instance.ReleaseID != state.DesiredReleaseID || instance.SpecOutdated || instance.NodeReplacement) {
 			outdated = append(outdated, instance)
 		}
 	}

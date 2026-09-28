@@ -1912,6 +1912,24 @@ the Trino backend selection).
   below compares the two).
 - **The pool keeps the cell's identity**: routing group and namespace are
   unchanged. Replacing compute never rewrites which warehouse lives where.
+- **Voluntary node replacement is opt-in** through
+  `DUCKGRES_TRINO_POOL_NODE_DISRUPTION_ENABLED` (default false, requires the pool
+  operator). Charts protect new coordinator and worker templates with
+  `karpenter.sh/do-not-disrupt=true`. The enabled operator protects existing pod
+  metadata after checking pod/ReplicaSet/recorded Deployment UID ownership.
+  A complete NodeClaim inventory and exact node/provider/claim identity establish
+  Drifted or deleting-node evidence. Migration 000043 preserves the first request
+  per instance under the pool fence. The operator then cordons that exact node
+  with a UID/resource-version update; it never evicts pods or deletes nodes.
+  This is not SIGTERM-triggered draining. Normal desired+surge capacity admits a
+  replacement before draining the original, even when desired exceeds the floor.
+  No repair allowance or query timeout is added. Current Gateway obligations and
+  UID-scoped retirement still control deletion. Fresh candidates reject unsafe
+  nodes; ambiguous admission first replays its original Gateway intent.
+  Node lookup errors block voluntary rollout, not health checks, explicit
+  recovery, or already-authorized retirement. Disabling observation does not
+  cancel a durable replacement request. See the
+  [node replacement runbook](docs/runbooks/trino-pool-node-replacement.md).
 - **The catalog store's partition is its OWN identity**
   (`DUCKGRES_TRINO_POOL_CATALOG_CELL_ID`, resolved by
   `trinoPoolCatalogCellID`): it is the value every coordinator of the cell
