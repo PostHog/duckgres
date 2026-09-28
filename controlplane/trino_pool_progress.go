@@ -38,6 +38,7 @@ func (o *trinoPoolOperator) progressInstances(ctx context.Context, instances []c
 	if err != nil {
 		return true, err
 	}
+	o.recoveryEvidence.prepare(instances, recoveries)
 	var failures []error
 	for _, instance := range instances {
 		phase := trinopool.Phase(instance.Phase)

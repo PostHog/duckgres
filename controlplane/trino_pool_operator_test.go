@@ -753,8 +753,8 @@ func (f *fakePoolKube) Observe(context.Context, trinoPoolInventory) (trinoPoolOb
 	return f.observed, nil
 }
 
-func (f *fakePoolKube) CoordinatorPodAbsent(context.Context, trinoPoolInventory, string) (bool, error) {
-	return false, nil
+func (f *fakePoolKube) NamespacePodUIDs(context.Context, string) (map[string]bool, error) {
+	return map[string]bool{"pod-uid-1": true}, nil
 }
 
 func (f *fakePoolKube) Delete(_ context.Context, inventory trinoPoolInventory) error {

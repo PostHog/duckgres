@@ -158,8 +158,18 @@ func (o *trinoPoolOperator) checkRecoveryPreconditions(ctx context.Context, i co
 	if obligations.InstanceID != i.InstanceID || obligations.Incarnation != r.Incarnation || obligations.Generation != m.Generation {
 		return errors.New("recovery requires obligations for the authorized incarnation and current generation")
 	}
-	kube := o.kube(o.lease.Epoch)
-	absent, err := kube.CoordinatorPodAbsent(ctx, inventoryOf(i), r.PodUID)
+	var liveError error
+	if obligations.PendingRequests == 0 && obligations.OpenTransactions == 0 {
+		// Replaying the identical suspicion step below proves this recovery owns an accepted transition.
+		if m.Phase != "DRAINING" {
+			return nil
+		}
+		liveError = o.checkRecoveryLiveCoordinator(ctx, i, r)
+		if liveError == nil {
+			return nil
+		}
+	}
+	absent, err := o.recoveryPodAbsent(ctx, i, r)
 	if err != nil {
 		return err
 	}
@@ -170,16 +180,14 @@ func (o *trinoPoolOperator) checkRecoveryPreconditions(ctx context.Context, i co
 			"pool", o.config.PublicID, "instance", i.InstanceID, "operation", r.OperationID)
 		return nil
 	}
-	if obligations.PendingRequests != 0 || obligations.OpenTransactions != 0 {
-		return errors.New("recovery requires current obligations without pending requests or open transactions")
+	if liveError != nil {
+		return liveError
 	}
-	// Once our suspicion step commits, a process exit must not strand recovery.
-	// Replaying that exact step below proves this request owns the transition;
-	// deletion remains scoped to the instance's original resource UIDs.
-	if m.Phase != "DRAINING" {
-		return nil
-	}
-	observed, err := kube.Observe(ctx, inventoryOf(i))
+	return errors.New("recovery requires current obligations without pending requests or open transactions")
+}
+
+func (o *trinoPoolOperator) checkRecoveryLiveCoordinator(ctx context.Context, i configstore.TrinoPoolInstance, r configstore.TrinoPoolRecovery) error {
+	observed, err := o.kube(o.lease.Epoch).Observe(ctx, inventoryOf(i))
 	if err != nil {
 		return err
 	}

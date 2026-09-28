@@ -392,27 +392,26 @@ func (e *trinoPoolEffects) ResourcesAbsent(ctx context.Context, inventory trinoP
 	return len(pods) == 0, nil
 }
 
-// CoordinatorPodAbsent verifies the admitted UID against an unfiltered namespace inventory.
-// Mutable labels cannot establish absence. A failed or incomplete listing cannot either.
-func (e *trinoPoolEffects) CoordinatorPodAbsent(ctx context.Context, inventory trinoPoolInventory, podUID string) (bool, error) {
-	if podUID == "" || inventory.Namespace == "" || inventory.Namespace != e.namespace {
-		return false, errors.New("coordinator absence requires a pod UID and the configured namespace")
+// NamespacePodUIDs reads a complete unfiltered inventory in the instance's pinned namespace.
+// Desired namespace changes must not redirect evidence or teardown for an existing instance.
+func (e *trinoPoolEffects) NamespacePodUIDs(ctx context.Context, namespace string) (map[string]bool, error) {
+	if namespace == "" {
+		return nil, errors.New("coordinator absence requires the instance's pinned namespace")
 	}
 	ctx, cancel := context.WithTimeout(ctx, trinoPoolRequestBudget)
 	defer cancel()
+	uids := make(map[string]bool)
 	options := metav1.ListOptions{Limit: trinoPoolListLimit}
 	for {
-		pods, err := e.clientset.CoreV1().Pods(inventory.Namespace).List(ctx, options)
+		pods, err := e.clientset.CoreV1().Pods(namespace).List(ctx, options)
 		if err != nil {
-			return false, fmt.Errorf("verify admitted coordinator pod absence: %w", err)
+			return nil, fmt.Errorf("verify admitted coordinator pod absence: %w", err)
 		}
 		for _, pod := range pods.Items {
-			if string(pod.UID) == podUID {
-				return false, nil
-			}
+			uids[string(pod.UID)] = true
 		}
 		if pods.Continue == "" {
-			return true, nil
+			return uids, nil
 		}
 		options.Continue = pods.Continue
 	}

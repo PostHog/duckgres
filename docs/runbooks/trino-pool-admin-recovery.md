@@ -139,9 +139,19 @@ The active pool leader executes the request under its normal fencing and journal
 Before the first Gateway transition, the operator checks that the live coordinator matches the approved process identity,
 or proves that the admitted pod UID is absent from a complete, unfiltered Kubernetes namespace inventory.
 The absence check includes every pagination page and every pod, including pods with changed labels and terminating pods.
-A failed listing, missing identity, different namespace, or omitted page cannot establish absence.
+A failed listing, missing identity, or omitted page cannot establish absence.
+The lookup uses the instance's pinned namespace, including after the pool's desired namespace changes.
+The operator must retain permission to list pods in that pinned namespace until recovery finishes.
 Kubernetes absence is the evidence boundary: a force-deleted pod or partitioned node can leave an unreported process running.
 The existing explicit destructive authorization accepts loss of that exact incarnation's work; absence is not a successful drain.
+
+The original live-process check and already-started recovery with no pending requests or open transactions need no namespace listing.
+Other requests share a complete namespace inventory for 30 seconds, including throttling after API errors.
+Only authorizations known before the inventory started may use that inventory; a newly discovered authorization waits for the next refresh.
+An API error or partial inventory never proves absence.
+Once an exact request proves its pod UID absent, retries retain that proof for the current leadership term.
+The operator removes proofs after recovery terminates and clears all cached evidence on leadership acquisition.
+Each retry still verifies the current serving floor and exact Gateway identity before using an absence proof.
 
 For a pod proved absent, retained pending requests and open transactions cannot finish on its original process and do not block the authorized failure retirement.
 Gateway keeps their accounting and records the existing `DESTRUCTIVE_OVERRIDE` evidence with a `FAILED` retirement.

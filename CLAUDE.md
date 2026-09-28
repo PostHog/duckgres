@@ -2131,6 +2131,13 @@ the Trino backend selection).
   and process-identity requirements. This is manual recovery, not automatic
   draining cleanup. Kubernetes may omit a force-deleted or partitioned process;
   the evidence boundary is the API inventory, not certainty of physical death.
+  Inventory uses the instance's pinned namespace even after desired placement
+  changes. The original live-process path and zero-obligation suspicion replay
+  need no namespace inventory. Other requests share complete inventories for
+  30 seconds per namespace, but only if authorization was known before listing.
+  Errors are throttled, never evidence. Exact-request absence proofs last only
+  for the current leadership term and are pruned after recovery terminates.
+  Every retry still checks current serving capacity and Gateway identity.
 - **Candidate validation uses no canary.** The candidate is probed through its
   OWN Service with the existing observer credential: `/v1/catalog/sync` must be
   enabled, ready, zero failed catalogs, applied revision at least the pool's
