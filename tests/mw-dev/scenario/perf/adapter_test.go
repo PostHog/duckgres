@@ -18,6 +18,7 @@ import (
 )
 
 func TestExecutorRunsPerfStepAndWritesArtifacts(t *testing.T) {
+	t.Setenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT", "true")
 	catalogPath := writePerfCatalog(t, []perfcore.Protocol{perfcore.ProtocolPGWire})
 	provisionState := provision.NewState()
 	provisionState.StoreProvisionResponse("scenario-org", provision.ProvisionResponse{
@@ -652,6 +653,8 @@ func writePerfCatalogWithExpectations(t *testing.T, targets []perfcore.Protocol,
 
 func writePerfCatalog(t *testing.T, targets []perfcore.Protocol) string {
 	t.Helper()
+	// These synthetic catalogs exercise ordinary runs, independent of CI inputs.
+	t.Setenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT", "false")
 	var targetLines strings.Builder
 	for _, target := range targets {
 		targetLines.WriteString("  - ")

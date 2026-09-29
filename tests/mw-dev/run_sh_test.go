@@ -103,6 +103,7 @@ func TestDiagnosticsHarnessPodJSONPathParses(t *testing.T) {
 
 func TestTrinoDeployStartsWorkloadsWithoutScaleSubresource(t *testing.T) {
 	// Scenario workflows export these before running the script tests.
+	t.Setenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT", "true")
 	t.Setenv("SCENARIO_NAME", "posthog_frozen_perf")
 	t.Setenv("SCENARIO_POD_IDENTITY_ROLE", "")
 	fakes := newRunSHFakes(t)
@@ -2054,6 +2055,8 @@ func runSHCommand(t *testing.T, binDir, subcommand string, extraEnv ...string) *
 		"SCENARIO_POD_IDENTITY_ROLE=",
 		"SCENARIO_ARTIFACTS_DIR="+filepath.Join(filepath.Dir(binDir), "scenario-artifacts"),
 		"DUCKGRES_CI_SECRET_DIR="+filepath.Join(filepath.Dir(binDir), "secrets"),
+		// Fixtures opt into diagnostics explicitly, regardless of workflow inputs.
+		"DUCKGRES_SCENARIO_PROFILE_DISTINCT=false",
 		// Workflows export a pinned TRINO_IMAGE; clear it so frozen perf resolves.
 		"TRINO_IMAGE=",
 		"TRINO_MASTER_IMAGE_RESOLVER="+filepath.Join(binDir, "resolve-trino-master-image"),
