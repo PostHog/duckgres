@@ -1192,6 +1192,15 @@ trino_shared_pool_active() {
 
   log "shared pool OK [structure]: $ready ready instance(s), each with its own service and workers"
 
+  if [ "${E2E_TRINO_POOL_NODE_PROTECTION:-0}" = "1" ]; then
+    for pods in "$body" "$workers"; do
+      printf %s "$pods" | jq -e 'all(.items[];
+        .metadata.annotations["karpenter.sh/do-not-disrupt"] == "true")' >/dev/null \
+        || fail "shared pool: a coordinator or worker lacks node-disruption protection"
+    done
+    log "shared pool OK [node protection]: coordinators and workers retain do-not-disrupt"
+  fi
+
   # Validate the recovery UI's read-only contract without authorizing retirement.
   # Absent-pod recovery needs an isolated pool and destructive authorization.
   # This shared-pool Job must not delete coordinators to manufacture that evidence.
@@ -1200,7 +1209,7 @@ trino_shared_pool_active() {
     || fail "shared pool: recovery inventory request failed"
   printf %s "$inventory" | jq -e --arg cell "$pool" '
     .cell == $cell and (.instances | length > 0) and all(.instances[];
-      (keys == ["gateway_state", "instance_id", "phase", "phase_changed_at"])
+      ((keys - ["node_replacement"]) == ["gateway_state", "instance_id", "phase", "phase_changed_at"])
       and (.instance_id | type == "string" and length > 0)
       and .phase != "RETIRED" and .phase != "FAILURE_RETIRED")' >/dev/null \
     || fail "shared pool: recovery inventory is not scoped and sanitized"

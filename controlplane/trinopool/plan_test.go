@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+func TestPlanNodeReplacementWaitsForServingReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		serving, surge, floor int
+		action                PlanAction
+	}{
+		{"at desired count above floor", 3, 1, 2, PlanActionCreate},
+		{"replacement serving", 4, 1, 2, PlanActionDrain},
+		{"no surge budget", 3, 0, 2, PlanActionNone},
+		{"serving floor", 3, 1, 3, PlanActionCreate},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := servingPool("r1", test.serving)
+			state.MinServing = test.floor
+			state.MaxSurge = test.surge
+			state.Instances[0].NodeReplacement = true
+			plan := PlanNext(state)
+			if plan.Action != test.action || plan.Repair || plan.RepairFor != "" {
+				t.Fatalf("node replacement plan = %+v", plan)
+			}
+			if plan.Action == PlanActionDrain && plan.InstanceID != state.Instances[0].ID {
+				t.Fatalf("drained unrelated member: %+v", plan)
+			}
+		})
+	}
+}
+
 func TestPlanConfigurationOnlyRollout(t *testing.T) {
 	for _, test := range []struct {
 		name           string

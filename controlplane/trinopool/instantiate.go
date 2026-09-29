@@ -28,6 +28,7 @@ const (
 	AnnotationSpecDigest     = "posthog.com/trino-spec-digest"
 	AnnotationAuthorityEpoch = "posthog.com/trino-authority-epoch"
 	AnnotationReleaseID      = "posthog.com/trino-release-id"
+	AnnotationDoNotDisrupt   = "karpenter.sh/do-not-disrupt"
 
 	componentCoordinator = "coordinator"
 	componentWorker      = "worker"

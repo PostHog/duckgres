@@ -3,6 +3,11 @@
 Trino operators: see [cell registration and placement](docs/trino-cells.md) for
 the optional registry, unchanged legacy defaults, and migration limitations.
 
+`DUCKGRES_TRINO_POOL_NODE_DISRUPTION_ENABLED` defaults to `false`. Enabled shared-pool
+operators protect owned pods and replace instances on drifted or deleting Karpenter
+nodes through normal admission and drain. See the [node replacement runbook](docs/runbooks/trino-pool-node-replacement.md)
+for required permissions, rollout order, and failure boundaries.
+
 <p align="center">
   <img src="media/oh_duck.png" alt="Duckgres Mascot" width="200">
 </p>

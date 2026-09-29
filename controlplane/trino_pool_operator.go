@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -95,15 +96,18 @@ type trinoPoolValidator func(ctx context.Context, endpoint string, observed trin
 type trinoPoolIdentityProbe func(ctx context.Context, endpoint string) (string, error)
 
 type trinoPoolOperator struct {
-	config           trinoPoolConfig
-	store            trinoPoolStore
-	gateway          trinoPoolGateway
-	kube             func(epoch int64) trinoPoolKube
-	validate         trinoPoolValidator
-	identity         trinoPoolIdentityProbe
-	queryDrainStatus func(context.Context, string, string) (trinoQueryDrainStatus, error)
-	drainCursors     map[string]string
-	recoveryEvidence trinoPoolRecoveryEvidence
+	config               trinoPoolConfig
+	store                trinoPoolStore
+	gateway              trinoPoolGateway
+	kube                 func(epoch int64) trinoPoolKube
+	validate             trinoPoolValidator
+	identity             trinoPoolIdentityProbe
+	queryDrainStatus     func(context.Context, string, string) (trinoQueryDrainStatus, error)
+	drainCursors         map[string]string
+	recoveryEvidence     trinoPoolRecoveryEvidence
+	nodeGuard            *trinoPoolNodeGuard
+	nodeProtectionErrors map[string]error
+	nodeProtectionCursor uint64
 	// projection reports what this control plane currently serves: the
 	// authorization bundle's revision and the fingerprints of the projected
 	// password and group files. It is what a member is compared against when
@@ -346,6 +350,10 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 		return fmt.Errorf("list pool instances: %w", err)
 	}
 	poolObservation(ctx).snapshot(instances, time.Now())
+	nodeErr := o.protectPoolNodes(ctx, instances)
+	if o.fenced {
+		return errors.Join(tenantErr, nodeErr)
+	}
 	// Advance the instances already in flight before starting anything new, so
 	// a slow rollout cannot be overtaken by its own successor.
 	//
@@ -355,12 +363,12 @@ func (o *trinoPoolOperator) reconcileOnce(ctx context.Context) error {
 	// lifecycle with it.
 	progressed, instanceErr := o.progressInstances(ctx, instances)
 	if instanceErr != nil && o.fenced {
-		return errors.Join(tenantErr, instanceErr)
+		return errors.Join(tenantErr, nodeErr, instanceErr)
 	}
 	if progressed {
-		return errors.Join(tenantErr, instanceErr)
+		return errors.Join(tenantErr, nodeErr, instanceErr)
 	}
-	return errors.Join(tenantErr, instanceErr, o.applyPlan(ctx, pool, instances))
+	return errors.Join(tenantErr, nodeErr, instanceErr, o.applyPlan(ctx, pool, instances))
 }
 
 // refreshConfig replaces the desired configuration with what the authoritative
@@ -541,6 +549,19 @@ func (o *trinoPoolOperator) applyPlan(ctx context.Context, pool *configstore.Tri
 	desiredBlueprintDigest := o.config.Blueprint.Digest()
 	for _, instance := range instances {
 		view := instance.View()
+		validNodeEvidence := false
+		if instance.NodeReplacementEvidence != nil {
+			var evidence trinopool.NodeReplacementEvidence
+			if err := json.Unmarshal([]byte(*instance.NodeReplacementEvidence), &evidence); err != nil || evidence.Validate() != nil {
+				view.RolloutBlocked = true
+				failures = append(failures, fmt.Errorf("instance %s has unreadable node replacement evidence", instance.InstanceID))
+			} else {
+				validNodeEvidence = true
+			}
+		}
+		if o.nodeProtectionErrors[instance.InstanceID] != nil && !validNodeEvidence {
+			view.RolloutBlocked = true
+		}
 		if view.Phase.Serving() {
 			blueprint, err := trinopool.ParseBlueprint([]byte(instance.BlueprintSnapshot))
 			if err != nil {

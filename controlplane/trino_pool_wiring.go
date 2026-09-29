@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -88,6 +89,9 @@ func buildTrinoPoolOperators(
 			tenants:         store,
 			publications:    store,
 			operations:      store,
+		}
+		if enabled, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv(envTrinoPoolNodeDisruptionEnabled))); enabled && operatorEnabled {
+			operator.nodeGuard = newTrinoPoolNodeGuard(clientset)
 		}
 		// Desired state is published from the ConfigMap the chart projects the
 		// registry and blueprint from, read through the Kubernetes API.

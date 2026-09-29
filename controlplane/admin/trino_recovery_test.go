@@ -94,6 +94,50 @@ func TestTrinoRecoveryInstancesAreScopedReadOnlyAndSanitized(t *testing.T) {
 	}
 }
 
+func TestTrinoRecoveryInstancesExposeTypedNodeReplacementEvidence(t *testing.T) {
+	api, store := recoveryTrinoAPI()
+	for _, test := range []struct {
+		name, evidence string
+		present        bool
+	}{
+		{"valid", `{"node_name":"node-a","node_uid":"node-uid-a","nodeclaim_name":"claim-a","nodeclaim_uid":"claim-uid-a","reason":"Drifted","private_extra":"do-not-expose"}`, true},
+		{"malformed", `not-json`, false},
+		{"incomplete", `{"reason":"Drifted"}`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			instance := *store.instance
+			instance.NodeReplacementEvidence = &test.evidence
+			store.instances = []configstore.TrinoPoolInstance{instance}
+			code, data := doTrinoJSON(t, trinoTestRouter(api, RoleAdmin), http.MethodGet, "/api/v1/trino/instances?cell=pool-a", "")
+			if code != http.StatusOK || store.writes != 0 {
+				t.Fatalf("inventory: %d %#v", code, data)
+			}
+			row := data["instances"].([]any)[0].(map[string]any)
+			projection, ok := row["node_replacement"].(map[string]any)
+			if ok != test.present {
+				t.Fatalf("unexpected evidence projection: %#v", row)
+			}
+			if ok {
+				want := map[string]string{"node_name": "node-a", "node_uid": "node-uid-a", "nodeclaim_name": "claim-a", "nodeclaim_uid": "claim-uid-a", "reason": "Drifted"}
+				if len(projection) != len(want) || len(row) != 5 {
+					t.Fatalf("unexpected fields: %#v", row)
+				}
+				for key, value := range want {
+					if projection[key] != value {
+						t.Fatalf("%s = %#v", key, projection[key])
+					}
+				}
+			}
+			encoded, _ := json.Marshal(data)
+			for _, forbidden := range []string{"do-not-expose", "private.example.test", "blueprint", "endpoint_url", "private_extra"} {
+				if strings.Contains(string(encoded), forbidden) {
+					t.Fatalf("exposes %s", forbidden)
+				}
+			}
+		})
+	}
+}
+
 func TestTrinoRecoveryInstancesRejectViewerAndUnavailablePool(t *testing.T) {
 	api, store := recoveryTrinoAPI()
 	path := "/api/v1/trino/instances?cell=pool-a"

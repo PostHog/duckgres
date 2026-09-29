@@ -38,10 +38,11 @@ type trinoRecoveryRequest struct {
 }
 
 type trinoRecoveryInstanceSummary struct {
-	InstanceID     string    `json:"instance_id"`
-	Phase          string    `json:"phase"`
-	GatewayState   string    `json:"gateway_state"`
-	PhaseChangedAt time.Time `json:"phase_changed_at"`
+	InstanceID      string                             `json:"instance_id"`
+	Phase           string                             `json:"phase"`
+	GatewayState    string                             `json:"gateway_state"`
+	PhaseChangedAt  time.Time                          `json:"phase_changed_at"`
+	NodeReplacement *trinopool.NodeReplacementEvidence `json:"node_replacement,omitempty"`
 }
 
 func (a *TrinoAPI) handleRecoveryInstances(c *gin.Context) {
@@ -75,10 +76,17 @@ func (a *TrinoAPI) handleRecoveryInstances(c *gin.Context) {
 		if instance.PoolID != pool.PoolID || trinopool.Phase(instance.Phase).Terminal() {
 			continue
 		}
-		rows = append(rows, trinoRecoveryInstanceSummary{
+		row := trinoRecoveryInstanceSummary{
 			InstanceID: instance.InstanceID, Phase: instance.Phase,
 			GatewayState: instance.GatewayState, PhaseChangedAt: instance.PhaseChangedAt,
-		})
+		}
+		if instance.NodeReplacementEvidence != nil {
+			var evidence trinopool.NodeReplacementEvidence
+			if json.Unmarshal([]byte(*instance.NodeReplacementEvidence), &evidence) == nil && evidence.Validate() == nil {
+				row.NodeReplacement = &evidence
+			}
+		}
+		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].InstanceID < rows[j].InstanceID })
 	c.JSON(http.StatusOK, gin.H{"cell": a.cell.ID, "instances": rows})

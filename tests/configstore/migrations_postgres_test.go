@@ -60,7 +60,10 @@ func TestConfigStoreRunsVersionedSQLMigrations(t *testing.T) {
 	requireGooseMigrationRecorded(t, db, 40)
 	requireGooseMigrationRecorded(t, db, 41)
 	requireGooseMigrationRecorded(t, db, 42)
-	requireGooseLatestVersion(t, db, 42)
+	requireGooseMigrationRecorded(t, db, 43)
+	requireGooseLatestVersion(t, db, 43)
+	requireColumnType(t, db, "duckgres_trino_pool_instances", "node_replacement_evidence", "jsonb")
+	requireColumnNullable(t, db, "duckgres_trino_pool_instances", "node_replacement_evidence")
 	requireTablePresent(t, db, "duckgres_trino_pool_recoveries")
 	requireTablePresent(t, db, "duckgres_trino_cell_lifecycle")
 	for _, column := range []string{"reconcile_owner", "reconcile_epoch", "intent_sequence", "intent", "admission_epoch", "freeze_operation_id", "freeze_stable", "certificate"} {
@@ -391,7 +394,7 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 			DROP TABLE IF EXISTS duckgres_trino_pool_instances;
 			DROP TABLE IF EXISTS duckgres_trino_pools;
 			DROP FUNCTION IF EXISTS duckgres_select_trino_backend_on_enable();
-			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42);
+			DELETE FROM goose_db_version WHERE version_id IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43);
 		`).Error; err != nil {
 		t.Fatalf("downgrade baseline schema to pre-v9 shape: %v", err)
 	}
@@ -444,7 +447,10 @@ func TestConfigStoreSQLMigrationsUpgradeVersion8Schema(t *testing.T) {
 	requireGooseMigrationRecorded(t, upgradedDB, 38)
 	requireGooseMigrationRecorded(t, upgradedDB, 41)
 	requireGooseMigrationRecorded(t, upgradedDB, 42)
-	requireGooseLatestVersion(t, upgradedDB, 42)
+	requireGooseMigrationRecorded(t, upgradedDB, 43)
+	requireGooseLatestVersion(t, upgradedDB, 43)
+	requireColumnType(t, upgradedDB, "duckgres_trino_pool_instances", "node_replacement_evidence", "jsonb")
+	requireColumnNullable(t, upgradedDB, "duckgres_trino_pool_instances", "node_replacement_evidence")
 	requireTablePresent(t, upgradedDB, "duckgres_trino_pool_recoveries")
 	requireColumnPresent(t, upgradedDB, "duckgres_reshard_operations", "password_url")
 	requireTablePresent(t, upgradedDB, "duckgres_worker_spawn_log")
@@ -503,7 +509,7 @@ func TestConfigStoreSQLMigration34VersionsExistingAndNewOrgs(t *testing.T) {
 		DROP TABLE IF EXISTS duckgres_trino_pool_instances;
 		DROP TABLE IF EXISTS duckgres_trino_pools;
 		DROP FUNCTION IF EXISTS duckgres_select_trino_backend_on_enable();
-		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40, 41, 42);
+		DELETE FROM goose_db_version WHERE version_id IN (34, 35, 36, 37, 38, 39, 40, 41, 42, 43);
 	`).Error; err != nil {
 		t.Fatalf("restore pre-migration-34 schema: %v", err)
 	}

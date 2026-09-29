@@ -289,6 +289,18 @@ func runningCoordinatorContainer(observed trinoPoolObservation, podUID string) s
 }
 
 func (o *trinoPoolOperator) validateCandidate(ctx context.Context, instance configstore.TrinoPoolInstance) (bool, error) {
+	if instance.NodeReplacementEvidence != nil {
+		return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing, "candidate node requires replacement before admission")
+	}
+	if err := o.candidateNodeCheck(ctx, instance); err != nil {
+		if definitiveTrinoNodePlacement(err) {
+			return true, o.failCandidate(ctx, instance, trinopool.PhasePreparing, "candidate has an invalid node placement before admission")
+		}
+		if err == errTrinoPodProtectionIncomplete {
+			return false, nil
+		}
+		return false, err
+	}
 	observed, err := o.kube(o.lease.Epoch).Observe(ctx, inventoryOf(instance))
 	if err != nil {
 		return false, fmt.Errorf("observe %s: %w", instance.InstanceID, err)
@@ -377,7 +389,7 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 			BootID:          validation.ProcessID,
 		},
 		func(ctx context.Context) (string, error) {
-			admitted, err := o.gateway.AdmitMember(ctx, o.config.RoutingGroup, instance.InstanceID, request)
+			admitted, err := o.nodeSafeAdmission(ctx, instance, request)
 			if err != nil {
 				return "", err
 			}
@@ -385,6 +397,9 @@ func (o *trinoPoolOperator) admitCandidate(ctx context.Context, instance configs
 			return fmt.Sprintf(`{"phase":%q,"generation":%d}`, admitted.Phase, admitted.Generation), nil
 		},
 	); err != nil {
+		if errors.Is(err, errTrinoCandidateNodeRetired) {
+			return o.failCandidate(ctx, instance, trinopool.PhaseValidating, "candidate node required replacement before admission")
+		}
 		if errors.Is(err, trinogateway.ErrPublicationBarrier) {
 			// A member joining while a tenant publication is open must
 			// acknowledge that publication's target revision, which a member

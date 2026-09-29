@@ -26,9 +26,10 @@ import (
 // (`DUCKGRES_TRINO_POOL_CATALOG_CELL_ID`, see trino_pool_catalog.go) to match
 // what the cell's coordinators read.
 const (
-	envTrinoPoolEnabled         = "DUCKGRES_TRINO_POOL_ENABLED"
-	envTrinoPoolOperatorEnabled = "DUCKGRES_TRINO_POOL_OPERATOR_ENABLED"
-	envTrinoPoolGatewayURL      = "DUCKGRES_TRINO_POOL_GATEWAY_URL"
+	envTrinoPoolEnabled               = "DUCKGRES_TRINO_POOL_ENABLED"
+	envTrinoPoolOperatorEnabled       = "DUCKGRES_TRINO_POOL_OPERATOR_ENABLED"
+	envTrinoPoolGatewayURL            = "DUCKGRES_TRINO_POOL_GATEWAY_URL"
+	envTrinoPoolNodeDisruptionEnabled = "DUCKGRES_TRINO_POOL_NODE_DISRUPTION_ENABLED"
 
 	trinoPoolModeFixed  = "fixed"
 	trinoPoolModeShared = "shared-pool"
