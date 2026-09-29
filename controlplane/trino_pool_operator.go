@@ -108,6 +108,10 @@ type trinoPoolOperator struct {
 	nodeGuard            *trinoPoolNodeGuard
 	nodeProtectionErrors map[string]error
 	nodeProtectionCursor uint64
+	// Registration can commit after its caller times out, even after a member 404.
+	// Only a confirmed higher Gateway fence clears unresolved attempts from a term.
+	registrationAttemptEpoch int64
+	registrationAttempts     map[string]bool
 	// projection reports what this control plane currently serves: the
 	// authorization bundle's revision and the fingerprints of the projected
 	// password and group files. It is what a member is compared against when
@@ -507,6 +511,10 @@ func (o *trinoPoolOperator) configureGatewayPool(ctx context.Context) error {
 	attempt.unknown = false
 	if attempt.payload != desired {
 		return fmt.Errorf("%w: previous gateway configuration settled; current settings must be applied next", errTrinoPoolBackoff)
+	}
+	if o.registrationAttemptEpoch != o.lease.Epoch {
+		o.registrationAttempts = nil
+		o.registrationAttemptEpoch = o.lease.Epoch
 	}
 	return nil
 }
