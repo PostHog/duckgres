@@ -90,3 +90,20 @@ func TestDistinctTraceWaitsForAllStageLifetimes(t *testing.T) {
 		t.Fatalf("expected to wait for second stage, got %d calls, %v", calls, err)
 	}
 }
+
+func TestDistinctTracePreservesIncompleteResponse(t *testing.T) {
+	const response = `{"data":[{"traceID":"0123456789abcdef0123456789abcdef","spans":[{"operationName":"stage","duration":1000,"tags":[{"key":"trino.query_id","value":"query-test"},{"key":"trino.stage_id","value":"query-test.0"}]}]}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/select/jaeger/api/traces" {
+			t.Errorf("expected trace lookup")
+		}
+		_, _ = fmt.Fprint(w, response)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	raw, err := captureDistinctTraceFrom(ctx, server.URL, []byte(`{"queryId":"query-test","stages":{"stages":[{"stageId":"query-test.0"},{"stageId":"query-test.1"}]}}`), time.Second)
+	if string(raw) != response || err == nil || !strings.Contains(err.Error(), "1/2 stage spans") {
+		t.Fatalf("expected retained incomplete trace and numeric completeness: %s, %v", raw, err)
+	}
+}

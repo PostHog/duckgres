@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -65,10 +66,22 @@ func captureDistinctTraceFrom(ctx context.Context, endpoint string, rawQueryInfo
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	var lastRaw json.RawMessage
+	lastSeen := 0
+	timeoutError := func() error {
+		return fmt.Errorf("trace capture timed out or was canceled: %d/%d stage spans received", lastSeen, len(expectedStages))
+	}
 	for {
-		raw, found, err := fetchDistinctTrace(ctx, client, target.String(), info.QueryID, expectedStages)
+		raw, found, seen, err := fetchDistinctTrace(ctx, client, target.String(), info.QueryID, expectedStages)
 		if err != nil {
-			return nil, err
+			if ctx.Err() != nil {
+				return lastRaw, timeoutError()
+			}
+			return lastRaw, err
+		}
+		if len(raw) > 0 {
+			lastRaw = raw
+			lastSeen = seen
 		}
 		if found {
 			return raw, nil
@@ -77,31 +90,31 @@ func captureDistinctTraceFrom(ctx context.Context, endpoint string, rawQueryInfo
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, errors.New("trace capture timed out or was canceled")
+			return lastRaw, timeoutError()
 		case <-timer.C:
 		}
 	}
 }
 
-func fetchDistinctTrace(ctx context.Context, client *http.Client, endpoint, queryID string, expectedStages map[string]bool) (json.RawMessage, bool, error) {
+func fetchDistinctTrace(ctx context.Context, client *http.Client, endpoint, queryID string, expectedStages map[string]bool) (json.RawMessage, bool, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, false, errors.New("trace request creation failed")
+		return nil, false, 0, errors.New("trace request creation failed")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, false, errors.New("trace request failed")
+		return nil, false, 0, errors.New("trace request failed")
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, false, errors.New("trace service returned unsuccessful status")
+		return nil, false, 0, errors.New("trace service returned unsuccessful status")
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxDistinctTraceBytes+1))
 	if err != nil {
-		return nil, false, errors.New("trace response read failed")
+		return nil, false, 0, errors.New("trace response read failed")
 	}
 	if len(raw) > maxDistinctTraceBytes {
-		return nil, false, errors.New("trace response exceeds size limit")
+		return nil, false, 0, errors.New("trace response exceeds size limit")
 	}
 	var result struct {
 		Data []struct {
@@ -117,13 +130,13 @@ func fetchDistinctTrace(ctx context.Context, client *http.Client, endpoint, quer
 		Errors json.RawMessage `json:"errors"`
 	}
 	if json.Unmarshal(raw, &result) != nil {
-		return nil, false, errors.New("invalid trace response")
+		return nil, false, 0, errors.New("invalid trace response")
 	}
 	if len(result.Errors) > 0 && string(result.Errors) != "null" && string(result.Errors) != "[]" {
-		return nil, false, errors.New("trace response contains errors")
+		return nil, false, 0, errors.New("trace response contains errors")
 	}
 	if len(result.Data) == 0 {
-		return nil, false, nil
+		return json.RawMessage(raw), false, 0, nil
 	}
 	seenStages := make(map[string]bool)
 	for _, trace := range result.Data {
@@ -139,20 +152,21 @@ func fetchDistinctTrace(ctx context.Context, client *http.Client, endpoint, quer
 				if tag.Key == "trino.query_id" {
 					var value string
 					if json.Unmarshal(tag.Value, &value) != nil || value != queryID {
-						return nil, false, errors.New("trace query identity mismatch")
+						return nil, false, 0, errors.New("trace query identity mismatch")
 					}
 					matched = true
 				}
 			}
 		}
 		if !matched {
-			return nil, false, errors.New("trace query identity missing")
+			return nil, false, 0, errors.New("trace query identity missing")
 		}
 	}
+	seen := 0
 	for stageID := range expectedStages {
-		if !seenStages[stageID] {
-			return nil, false, nil
+		if seenStages[stageID] {
+			seen++
 		}
 	}
-	return json.RawMessage(raw), true, nil
+	return json.RawMessage(raw), seen == len(expectedStages), seen, nil
 }
