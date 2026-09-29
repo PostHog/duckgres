@@ -205,6 +205,28 @@ readiness reset and the ownership check.
 Gateway public exposure is also a separate gate: authenticate every externally
 reachable API and UI before publishing it; keep unauthenticated probes internal.
 
+### Replace an unready, superseded candidate
+
+An instance in `CREATING` can hold the only creation slot even when its
+coordinator or workers never become ready. Publish a corrected release or
+blueprint through the normal deployment path. The operator compares the
+candidate's immutable specification with the current authoritative desired
+specification before waiting for readiness. An unchanged slow candidate has
+no automatic expiration deadline.
+
+Before retiring an obsolete candidate, the operator resolves any Gateway
+registration. A recorded member follows the existing guarded retirement path;
+an unregistered candidate retains its capacity until its owned resources are
+confirmed absent. This does not alter admission replay or serving-member drains.
+
+A registration request can commit after its caller times out and after a member
+lookup returns `404`. If this controller attempted registration in the current
+authority term, supersession remains blocked until the member can be adopted or
+a genuine leadership takeover establishes a higher Gateway fence. A request
+that never commits can therefore require a control-plane restart or normal
+leadership handoff; repeated `404` responses alone never authorize deletion.
+Do not clear lifecycle records or edit authority epochs to bypass that wait.
+
 ### Query obligations that outlive their clients
 
 A client can stop polling before the Gateway observes the query's terminal response.
