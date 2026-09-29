@@ -30,6 +30,8 @@ SCENARIO_NAME="${SCENARIO_NAME:-full-suite}"
 SCENARIO_ARTIFACTS_DIR="${SCENARIO_ARTIFACTS_DIR:-$HERE/../../artifacts/scenario-dev}"
 DUCKGRES_K8S_WORKER_CPU_REQUEST="${DUCKGRES_K8S_WORKER_CPU_REQUEST:-750m}"
 DUCKGRES_K8S_WORKER_MEMORY_REQUEST="${DUCKGRES_K8S_WORKER_MEMORY_REQUEST:-1536Mi}"
+DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU="${DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU:-8}"
+DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY="${DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY:-16Gi}"
 E2E_SUITE="${E2E_SUITE:-neutral}"
 case "$E2E_SUITE" in
   neutral|duckdb|trino|reshard) ;;
@@ -63,7 +65,7 @@ esac
 # it to a digest pin when TRINO_IMAGE is unset. Regular Trino tests keep a
 # promoted pin because they require atomic writes.
 TRINO_MASTER_IMAGE_RESOLVER="${TRINO_MASTER_IMAGE_RESOLVER:-$HERE/../../scripts/resolve_trino_master_image.sh}"
-if [ "$SCENARIO_NAME" = posthog_frozen_perf ]; then
+if [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ]; then
   TRINO_IMAGE="${TRINO_IMAGE:-}"
 else
   TRINO_IMAGE="${TRINO_IMAGE:-ghcr.io/posthog/trino:86468a7955788b90fe2072f80d86d548972ff28b@sha256:64927a71d2870802a56b671828c6052e7aa37317a7c3a50bd50a93960402d67b}"
@@ -130,7 +132,7 @@ require_pr_identity() {
 }
 
 frozen_perf_scenario() {
-  [ "$SCENARIO_NAME" = posthog_frozen_perf ]
+  [ "$SCENARIO_NAME" = posthog_frozen_perf ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ] || [ "$SCENARIO_NAME" = posthog_frozen_perf_extended_uncached ]
 }
 
 hoglake_perf_enabled() {
@@ -139,6 +141,33 @@ hoglake_perf_enabled() {
 
 trino_multicell_enabled() {
   [ "$E2E_SUITE" = trino ] && [ "$SCENARIO_NAME" = full-suite ]
+}
+
+# Bootstrap and general E2E keep the small fleet. Only comparison clusters
+# use dev-sized workers; both cache modes use the same profile.
+render_trino_template() {
+  local TRINO_WORKER_CPU=1 TRINO_WORKER_MEMORY=4Gi TRINO_WORKER_HEAP=3G
+  local TRINO_QUERY_MEMORY=6GB TRINO_WORKER_QUERY_MEMORY=2GB
+  local TRINO_WORKER_THREADS=24 TRINO_WORKER_MIN_DRIVERS=48
+  if [ "${1:-}" = perf ]; then
+    TRINO_WORKER_CPU=7 TRINO_WORKER_MEMORY=28Gi TRINO_WORKER_HEAP=20G
+    TRINO_QUERY_MEMORY=30GB TRINO_WORKER_QUERY_MEMORY=10GB
+    TRINO_WORKER_THREADS=14 TRINO_WORKER_MIN_DRIVERS=28
+  fi
+  export TRINO_WORKER_CPU TRINO_WORKER_MEMORY TRINO_WORKER_HEAP
+  export TRINO_QUERY_MEMORY TRINO_WORKER_QUERY_MEMORY TRINO_WORKER_THREADS TRINO_WORKER_MIN_DRIVERS
+  envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD $TRINO_WORKER_CPU $TRINO_WORKER_MEMORY $TRINO_WORKER_HEAP $TRINO_QUERY_MEMORY $TRINO_WORKER_QUERY_MEMORY $TRINO_WORKER_THREADS $TRINO_WORKER_MIN_DRIVERS' < "$HERE/manifests.trino.tmpl.yaml"
+}
+
+trino_perf_modes() {
+  if [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ]; then
+    case "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" in
+      trino) echo perf ;;
+      trino_cached) echo cached ;;
+    esac
+  else
+    echo 'perf cached'
+  fi
 }
 
 render_trino_backend() {
@@ -152,8 +181,7 @@ render_trino_backend() {
   TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
   CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
   NAMESPACE="$TRINO_CELL_NS" PR_NUMBER="$PR_NUMBER" \
-    envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
-    < "$HERE/manifests.trino.tmpl.yaml" \
+    render_trino_template \
     | sed -e "s/duckgres-trino-coordinator/duckgres-trino-$color-coordinator/g" \
       -e "s/duckgres-trino-worker/duckgres-trino-$color-worker/g" \
       -e "s/labels: { app: duckgres-trino, component: coordinator }/labels: { app: duckgres-trino, component: coordinator, posthog.com\/trino-cell: cell-test, posthog.com\/trino-color: $color, app.kubernetes.io\/component: coordinator, app.kubernetes.io\/name: trino-coordinator }/" \
@@ -170,7 +198,7 @@ render_trino_backend() {
       -e "$forwarded_config"
 }
 
-# Reuse the baseline template so both clusters retain identical resource budgets.
+# Reuse the template with the larger comparison-worker profile for both modes.
 # Select only cluster-specific resources; TLS, auth, tenant secrets, OPA and the
 # config-store connection are intentionally shared in the throwaway namespace.
 render_trino_perf_cluster() {
@@ -188,7 +216,7 @@ stringData:
   shared-secret: "$(cat "$cluster_secret_file")"
 EOF
   TRINO_IMAGE="$TRINO_IMAGE" NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
-    envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE' < "$HERE/manifests.trino.tmpl.yaml" \
+    render_trino_template perf \
     | awk '
       /^---$/ { if (selected) printf "%s", document; document="---\n"; selected=0; next }
       { document=document $0 "\n" }
@@ -277,9 +305,11 @@ render() {
   USER_SECRET_KEY="$(cat "$user_secret_key_file")" \
   NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
   WORKER_IMAGE="$WORKER_IMAGE" CONTROLPLANE_IMAGE="$CONTROLPLANE_IMAGE" \
+  DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU="$DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU" \
+  DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY="$DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY" \
   DUCKGRES_K8S_WORKER_CPU_REQUEST="$DUCKGRES_K8S_WORKER_CPU_REQUEST" \
   DUCKGRES_K8S_WORKER_MEMORY_REQUEST="$DUCKGRES_K8S_WORKER_MEMORY_REQUEST" \
-    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY $DUCKGRES_K8S_WORKER_CPU_REQUEST $DUCKGRES_K8S_WORKER_MEMORY_REQUEST $CONFIG_STORE_PASSWORD' \
+    envsubst '$NAMESPACE $PR_NUMBER $WORKER_IMAGE $CONTROLPLANE_IMAGE $INTERNAL_SECRET $INTERNAL_SECRET_FALLBACK $USER_SECRET_KEY $DUCKGRES_K8S_WORKER_CPU_REQUEST $DUCKGRES_K8S_WORKER_MEMORY_REQUEST $DUCKGRES_K8S_WORKER_PROFILE_MAX_CPU $DUCKGRES_K8S_WORKER_PROFILE_MAX_MEMORY $CONFIG_STORE_PASSWORD' \
     < "$HERE/manifests.tmpl.yaml"
 
   if [ "$E2E_SUITE" = "trino" ]; then
@@ -289,11 +319,10 @@ render() {
     TRINO_IMAGE="$TRINO_IMAGE" TRINO_TLS_PASSWORD="$TRINO_TLS_PASSWORD" \
       CONFIG_STORE_PASSWORD="$(cat "$config_store_password_file")" \
       NAMESPACE="$NS" PR_NUMBER="$PR_NUMBER" \
-      envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD' \
-      < "$HERE/manifests.trino.tmpl.yaml"
+      render_trino_template
     if hoglake_perf_enabled; then
-      render_trino_perf_cluster perf
-      render_trino_perf_cluster cached
+      local mode
+      for mode in $(trino_perf_modes); do render_trino_perf_cluster "$mode"; done
     fi
     HOGLAKE_SERVICE_ACCOUNT=hoglake
     # Server default (15 min). Frozen perf registers footer-only fixtures and
@@ -622,9 +651,8 @@ cmd_deploy() {
     # Patch the Deployment resources directly. The CI deployer intentionally
     # cannot patch the deployments/scale subresource, while it already needs
     # narrowly scoped Deployment patch access for the control-plane config.
-    # Three 1-CPU/4Gi workers match the frozen-perf Duckgres worker's
-    # aggregate 3-CPU/12Gi execution budget while exercising Trino's
-    # distributed path.
+    # The bootstrap cluster keeps three small workers for catalog admission.
+    # Comparison clusters below use their own larger worker profile.
     "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-coordinator \
       --type=merge -p '{"spec":{"replicas":1}}'
     "${KUBECTL[@]}" -n "$NS" patch deployment duckgres-trino-worker \
@@ -632,7 +660,7 @@ cmd_deploy() {
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-coordinator --timeout=300s
     "${KUBECTL[@]}" -n "$NS" rollout status deploy/duckgres-trino-worker --timeout=300s
     if hoglake_perf_enabled; then
-      for mode in perf cached; do
+      for mode in $(trino_perf_modes); do
         "${KUBECTL[@]}" -n "$NS" patch deployment "duckgres-trino-$mode-coordinator" --type=merge -p '{"spec":{"replicas":1}}'
         "${KUBECTL[@]}" -n "$NS" patch deployment "duckgres-trino-$mode-worker" --type=merge -p '{"spec":{"replicas":3}}'
         "${KUBECTL[@]}" -n "$NS" rollout status "deploy/duckgres-trino-$mode-coordinator" --timeout=300s
@@ -773,7 +801,9 @@ scenario_name_for_file() {
 scenario_job_name() {
   local name="$1" run_hash
   run_hash="$(printf '%s' "${DUCKGRES_SCENARIO_RUN_ID:?DUCKGRES_SCENARIO_RUN_ID is required}" | cksum | awk '{print $1}')"
-  printf 'duckgres-scenario-%s-%s\n' "$name" "$run_hash" | tr '_' '-'
+  # Kubernetes copies the Job name into a label, whose limit is 63 bytes.
+  # Reserve 18 for the prefix, one separator, and ten for the cksum value.
+  printf 'duckgres-scenario-%s-%s\n' "${name:0:34}" "$run_hash" | tr '_' '-'
 }
 
 cmd_test_scenario() {
@@ -787,8 +817,16 @@ cmd_test_scenario() {
       ;;
   esac
 
-  scenario_file="tests/mw-dev/scenario/scenarios/${SCENARIO_NAME}.yaml"
-  if [ ! -f "$HERE/scenario/scenarios/${SCENARIO_NAME}.yaml" ]; then
+  local backing_scenario="$SCENARIO_NAME"
+  if [ "$SCENARIO_NAME" = posthog_frozen_perf_extended ]; then
+    case "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" in
+      pgwire_uncached|pgwire_cached|athena) ;;
+      trino|trino_cached) backing_scenario=posthog_frozen_perf_extended_trino ;;
+      *) echo "DUCKGRES_SCENARIO_COVERAGE_TARGET must select one coverage protocol" >&2; return 2 ;;
+    esac
+  fi
+  scenario_file="tests/mw-dev/scenario/scenarios/${backing_scenario}.yaml"
+  if [ ! -f "$HERE/scenario/scenarios/${backing_scenario}.yaml" ]; then
     echo "Scenario '$SCENARIO_NAME' does not exist at $scenario_file." >&2
     return 2
   fi
@@ -800,6 +838,10 @@ cmd_test_scenario() {
 
 run_scenario() {
   local scenario_name="$1" scenario_file="$2" job pod api_base pg suffix internal_secret artifact_rc=0 container_rc=0 container_exit_code scenario_rc=0
+  local pg_connect_timeout=10
+  # Sized benchmark workers may cold-start during the PostgreSQL handshake.
+  # Allow the server's five-minute worker queue budget plus startup headroom.
+  if frozen_perf_scenario; then pg_connect_timeout=360; fi
   api_base="http://duckgres-control-plane.$NS.svc:8080"
   pg="$("${KUBECTL[@]}" -n "$NS" get svc duckgres-control-plane -o jsonpath='{.spec.clusterIP}')"
   suffix=".ci.duckgres.local"
@@ -864,6 +906,8 @@ spec:
             - { name: DUCKGRES_SCENARIO_ORG_ID, value: "ci-pr-${PR_NUMBER}-cnpg" }
             - { name: DUCKGRES_SCENARIO_OUTPUT_BASE, value: "/artifacts/scenario-dev" }
             - { name: DUCKGRES_SCENARIO_RUN_ID, value: "$DUCKGRES_SCENARIO_RUN_ID" }
+            - { name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" }
+            - { name: DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT, value: "${DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT:-$pg_connect_timeout}" }
             - { name: DUCKGRES_SCENARIO_MAX_RUNTIME, value: "${DUCKGRES_SCENARIO_MAX_RUNTIME:-4h}" }
             - { name: DUCKGRES_SCENARIO_GO_TEST_TIMEOUT, value: "${DUCKGRES_SCENARIO_GO_TEST_TIMEOUT:-4h15m}" }
             - { name: GOCACHE, value: "/tmp/go-cache" }
@@ -1099,7 +1143,7 @@ cmd_diagnostics() {
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-coordinator -c duckgres-trino-opa --tail=300 || true
   "${KUBECTL[@]}" -n "$NS" logs deploy/duckgres-trino-worker -c trino-worker --tail=300 || true
   if hoglake_perf_enabled; then
-    for mode in perf cached; do
+    for mode in $(trino_perf_modes); do
       "${KUBECTL[@]}" -n "$NS" logs "deploy/duckgres-trino-$mode-coordinator" -c trino-coordinator --tail=300 || true
       "${KUBECTL[@]}" -n "$NS" logs "deploy/duckgres-trino-$mode-coordinator" -c duckgres-trino-opa --tail=300 || true
       "${KUBECTL[@]}" -n "$NS" logs "deploy/duckgres-trino-$mode-worker" -c trino-worker --tail=300 || true

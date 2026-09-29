@@ -90,9 +90,9 @@ data:
     http-server.https.keystore.path=/etc/trino/tls/keystore.p12
     http-server.https.keystore.key=${ENV:TRINO_TLS_KEYSTORE_PASSWORD}
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=6GB
+    query.max-memory=${TRINO_QUERY_MEMORY}
     # The coordinator does not execute tasks and retains headroom in its 2G
-    # heap; execution workers carry the 2GB per-node allowance below.
+    # heap; execution workers use the selected profile below.
     query.max-memory-per-node=1GB
     catalog.management=dynamic
     # Both targets load the same managers; catalog fs.cache.enabled gates use.
@@ -134,7 +134,7 @@ data:
     node.data-dir=/data/trino
   jvm.config: |
     -server
-    -Xmx3G
+    -Xmx${TRINO_WORKER_HEAP}
     -XX:+UseG1GC
     -XX:+ExitOnOutOfMemoryError
     -Dfile.encoding=UTF-8
@@ -150,12 +150,11 @@ data:
     coordinator=false
     http-server.http.port=8080
     discovery.uri=http://duckgres-trino.${NAMESPACE}.svc:8080
-    query.max-memory=6GB
-    query.max-memory-per-node=2GB
-    # 1-CPU workers: raised from 8/16 to overlap S3 latency (keep task.concurrency default).
-    # Experiment measured by the targeted frozen perf run; revert if events by-name uncached does not improve.
-    task.max-worker-threads=24
-    task.min-drivers=48
+    query.max-memory=${TRINO_QUERY_MEMORY}
+    query.max-memory-per-node=${TRINO_WORKER_QUERY_MEMORY}
+    # Worker parallelism follows the rendering profile; task.concurrency stays default.
+    task.max-worker-threads=${TRINO_WORKER_THREADS}
+    task.min-drivers=${TRINO_WORKER_MIN_DRIVERS}
     shutdown.grace-period=10s
     catalog.management=dynamic
     # Both targets load the same managers; catalog fs.cache.enabled gates use.
@@ -319,11 +318,9 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 5
           resources:
-            requests: { cpu: "1", memory: 4Gi }
-            # Three replicas provide the same aggregate 3-CPU/12Gi execution
-            # budget as the frozen-perf Duckgres worker. Keep requests equal
-            # to limits so node contention cannot change the comparison.
-            limits: { cpu: "1", memory: 4Gi }
+            requests: { cpu: "${TRINO_WORKER_CPU}", memory: "${TRINO_WORKER_MEMORY}" }
+            # Requests equal limits for the selected three-worker profile.
+            limits: { cpu: "${TRINO_WORKER_CPU}", memory: "${TRINO_WORKER_MEMORY}" }
           volumeMounts:
             - { name: config, mountPath: /etc/trino/node.properties, subPath: node.properties }
             - { name: config, mountPath: /etc/trino/jvm.config, subPath: jvm.config }

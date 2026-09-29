@@ -2,6 +2,18 @@
 
 This package contains the golden-query performance harness.
 
+Manual-only extended coverage scenarios exercise twelve additional workload shapes in
+`queries/ducklake_posthog_coverage.yaml`. They retain separate `perf-coverage/`
+artifacts and versioned intent IDs. These queries are excluded from standard
+nightly runs and execute only when explicitly dispatched. For the focused uncached DuckDB run,
+baseline recording, runtime estimates, and failure recovery, see the
+[coverage runbook](../../docs/runbooks/perf-coverage.md). Frozen standard and extended benchmarks
+use three Trino workers at 7 CPU / 28 GiB each and one DuckDB worker at
+21 CPU / 84 GiB, matching aggregate worker resources. Trino uses a 20 GiB JVM
+heap, 10 GiB per-worker query cap, and 30 GiB cluster-wide query cap.
+Historical 3 CPU / 12 GiB results require a new baseline before comparison to
+this larger profile; see the runbook for scheduling prerequisites.
+
 ## Protocol Drivers
 
 Catalogs may target `pgwire`, `pgwire_uncached`, `pgwire_cached`, `trino`, `trino_cached`,
@@ -325,8 +337,10 @@ Both clusters load the same Alluxio and memory cache managers.
 Each node has a 16GB disk-cache budget in a 20Gi ephemeral volume, with 64kB pages
 and a seven-day TTL. For connectors that use this cache, entries persist between
 queries/iterations until eviction or teardown; one warm-up does not guarantee
-every replica holds the complete working set. Worker CPU/memory limits remain
-three workers at 1 CPU/4Gi per cluster; cache volumes reserve additional storage.
+every replica holds the complete working set. Each comparison cluster uses
+three workers at 7 CPU / 28 GiB each, matching the DuckDB worker's aggregate
+21 CPU / 84 GiB budget. The auxiliary bootstrap cluster retains three workers
+at 1 CPU / 4 GiB each; cache volumes reserve additional storage.
 
 The frozen suite runs the newest PostHog/trino master build, whose Hoglake
 connector honors `fs.cache.enabled` through Trino's shared filesystem module
@@ -367,7 +381,7 @@ Both suites of one nightly publish under the same dataset version
 (`posthog-file-views-v1`, shared through a YAML anchor in the scenario), with
 three columns on `runs` and `query_results`:
 
-- `suite` (`tables` | `properties`, a closed set in `core`, validated when the
+- `suite` (`tables` | `properties` | `coverage`, a closed set in `core`, validated when the
   step starts so a typo fails before hours of measurement);
 - `nightly_run_id`, the table-suite run's ID, which pairs a nightly's suites
   explicitly (a standalone run is its own nightly);
@@ -393,3 +407,19 @@ Scenario Trino connections require `DUCKGRES_SCENARIO_TRINO_CATALOG_STORE_CELL_I
 (no default), matching the baseline coordinator's `catalog-store.cell-id`.
 The isolated workflow supplies it; local runs must set it. The public readiness
 API cell ID is used only for API identity validation, not catalog-store lookups.
+
+### Benchmark worker connection startup
+
+Frozen core and extended scenario runs default PostgreSQL connection startup to
+360 seconds, allowing the server's five-minute worker-acquisition budget plus
+headroom for cold worker startup. Other scenarios retain a 10-second default.
+Override with `DUCKGRES_SCENARIO_PG_CONNECT_TIMEOUT` (seconds) when invoking
+`tests/mw-dev/run.sh`. This timeout is passed into the scenario Job; query
+execution timeouts and measured query durations are unchanged.
+
+If a run reports `pin pgwire cache-variant connection` timeouts, inspect
+control-plane worker-acquisition logs and pod scheduling/startup events. The
+cache-variant driver retains its initial setup error, so one failed connection
+can mark every query for that target as failed. Resolve worker readiness or
+connection-timeout configuration before rerunning; these are not query latency
+measurements.
