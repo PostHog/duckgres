@@ -50,6 +50,17 @@ func TestDistinctDiagnosticRenderer(t *testing.T) {
 				if strings.Count(string(out), "otel.exporter.endpoint="+tc.endpoint) != 2 {
 					t.Fatal("missing tracing on coordinator or workers")
 				}
+				for _, role := range []string{"coordinator=true", "coordinator=false"} {
+					found := false
+					for _, document := range strings.Split(string(out), "\n---") {
+						if strings.Contains(document, "    "+role+"\n") {
+							found = strings.Contains(document, "optimizer.dictionary-aggregation="+tc.dictionary)
+						}
+					}
+					if !found {
+						t.Fatalf("dictionary setting missing for %s", role)
+					}
+				}
 				if !strings.Contains(string(out), "task.max-partial-aggregation-memory="+tc.memory) || !strings.Contains(string(out), "optimizer.dictionary-aggregation="+tc.dictionary) {
 					t.Fatal("missing experiment configuration")
 				}
