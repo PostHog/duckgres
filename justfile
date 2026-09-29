@@ -381,7 +381,7 @@ test-trino-hoglake-smoke:
 # Test isolated deployment fixtures without contacting a cluster.
 [group('test')]
 test-mw-fixtures:
-    go test -v -count=1 ./tests/mw-dev
+    go test -v -count=1 ./tests/mw-dev/...
 
 # Print the test impact plan for the current branch
 [group('test')]

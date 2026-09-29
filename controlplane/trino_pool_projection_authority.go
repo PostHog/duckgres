@@ -44,8 +44,7 @@ import (
 // moves the desired value, which makes the older pods eligible again - the
 // wanted semantics, not a regression.
 //
-// Everything here is pooled-only. A legacy cell installs no fence and its
-// projection behaves exactly as before.
+// Every configured pool uses this projection fence.
 const (
 	// trinoPoolPublisherImageKey is the ConfigMap key charts render from the
 	// same image helper the Deployment uses.

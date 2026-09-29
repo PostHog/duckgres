@@ -55,7 +55,7 @@ function query(over: Partial<TrinoQuery> = {}): TrinoQuery {
 
 function status(over: Partial<TrinoStatus> = {}): TrinoStatus {
   return {
-    cell: { id: "legacy", coordinator_url: "https://coordinator" },
+    cell: { id: "legacy" },
     available: true,
     queries_by_state: {},
     blocked_queries: 0,
@@ -165,10 +165,10 @@ describe("TrinoQueries page", () => {
 
   it("explains an unconfigured deployment differently from an outage", () => {
     hooks.useTrinoStatus.mockReturnValue(
-      ok(status({ cell: { id: "", coordinator_url: "" }, available: false })),
+      ok(status({ cell: { id: "" }, available: false })),
     );
     renderPage();
-    expect(screen.getByText(/DUCKGRES_TRINO_COORDINATOR_URL/)).toBeInTheDocument();
+    expect(screen.getByText(/DUCKGRES_TRINO_CELLS_FILE/)).toBeInTheDocument();
 
     hooks.useTrinoStatus.mockReturnValue(
       ok(status({ available: false, error: "dial tcp: connection refused" })),

@@ -32,9 +32,8 @@ var ErrTrinoPoolIntentChanged = errors.New("trino pool operation was replayed wi
 // problem, and handed the pool to a replica that would do exactly the same.
 var ErrTrinoPoolStaleGeneration = errors.New("trino pool desired generation is behind the published generation")
 
-// API modes. `legacy` keeps today's fixed blue/green behavior for the cell.
+// The shared-pool API manages all Trino compute instances.
 const (
-	TrinoPoolAPIModeLegacy = "legacy"
 	TrinoPoolAPIModeShared = "shared-pool"
 )
 

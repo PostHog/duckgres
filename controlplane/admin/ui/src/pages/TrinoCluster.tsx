@@ -50,7 +50,7 @@ export function TrinoCluster() {
         actions={<TrinoCellPicker />}
         description={
           status.data?.cell.id
-            ? `${status.data.cell.id} · ${status.data.cell.coordinator_url}`
+            ? status.data.cell.id
             : "The shared multi-tenant Trino cell."
         }
       />

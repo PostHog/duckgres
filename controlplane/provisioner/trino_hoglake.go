@@ -20,7 +20,7 @@ import (
 	"github.com/posthog/duckgres/controlplane/configstore"
 )
 
-// TrinoManagedHoglakeConfig is separate from the legacy benchmark switch.
+// TrinoManagedHoglakeConfig supplies the managed Hoglake service and storage settings.
 // DataPath reserves a dedicated prefix; each catalog owns its warehouse Duckling-name child.
 // Disabling Trino never deletes Hoglake metadata or data.
 type TrinoManagedHoglakeConfig struct {
@@ -190,9 +190,7 @@ func isManagedHoglake(org configstore.TrinoEnabledOrg) bool {
 // It is exported for the startup wiring's own test. A cell that silently lost
 // either input builds and reconciles perfectly until the first Hoglake tenant
 // is provisioned, and then holds that warehouse pending with an error about
-// configuration nobody changed - so "the pooled branch passes the same inputs
-// as the legacy one" is worth asserting at the boundary rather than
-// discovering per tenant.
+// configuration nobody changed. Test these dependencies at the pool wiring boundary.
 func (p *TrinoProvisioner) ManagedHoglakeConfigured() bool {
 	return p.managedHoglake != nil && p.hoglakeDucklings != nil
 }
@@ -241,51 +239,6 @@ func verifyHoglakeConnector(connectors map[string]string, name string) error {
 		return errors.New("existing Trino catalog is not an operational Hoglake catalog; explicit migration required")
 	}
 	return nil
-}
-
-func parseTrinoConnectors(rows [][]interface{}) (map[string]string, error) {
-	result := make(map[string]string, len(rows))
-	for _, row := range rows {
-		if len(row) != 3 {
-			return nil, errors.New("invalid catalog connector inventory")
-		}
-		name, nok := row[0].(string)
-		connector, cok := row[1].(string)
-		state, sok := row[2].(string)
-		if !nok || !cok || !sok || name == "" || connector == "" || result[name] != "" || (state != "OPERATIONAL" && state != "FAILING") {
-			return nil, errors.New("invalid catalog connector inventory")
-		}
-		if state == "OPERATIONAL" {
-			result[name] = connector
-		} else {
-			result[name] = "FAILING"
-		}
-	}
-	return result, nil
-}
-
-const trinoConnectorInventorySQL = "SELECT catalog_name, connector_name, state FROM system.metadata.catalogs"
-
-func (c *trinoCatalogHTTPClient) CatalogConnectors(ctx context.Context) (map[string]string, error) {
-	rows, err := c.runStatement(ctx, trinoConnectorInventorySQL)
-	if err != nil {
-		return nil, err
-	}
-	return parseTrinoConnectors(rows)
-}
-func (c *trinoSharedCatalogHTTPClient) CatalogConnectors(ctx context.Context) (map[string]string, error) {
-	rows, err := c.runStatement(ctx, trinoConnectorInventorySQL)
-	if err != nil {
-		return nil, err
-	}
-	return parseTrinoConnectors(rows)
-}
-func (c *trinoManagedCatalogClient) CatalogConnectors(ctx context.Context) (map[string]string, error) {
-	inventory, ok := c.TrinoCatalogClient.(trinoConnectorInventory)
-	if !ok {
-		return nil, errors.New("managed catalog client lacks connector inventory")
-	}
-	return inventory.CatalogConnectors(ctx)
 }
 
 func (p *TrinoProvisioner) reconcileHoglakeCatalog(ctx context.Context, client TrinoCatalogClient, name, orgID string, status *DucklingStatus, exists bool, connectors map[string]string) error {

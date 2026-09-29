@@ -2,7 +2,7 @@
 # Sourced only by the disposable two-tenant Trino fixture lane.
 [ "$NS" = "duckgres-ci-pr-$PR" ] || fail "service credential checks require an isolated PR namespace"
 [ "$ORG_A" = "ci-pr-${PR}-trinoa" ] || fail "service credential checks require the fixture organization"
-api "$API/api/v1/orgs/$ORG_A" | jq -e --arg cell "ci-pr-$PR" \
+api "$API/api/v1/orgs/$ORG_A" | jq -e --arg cell "registered:pool-test" \
   '.trino.trino_cell_id == $cell and .trino.enabled == true' >/dev/null \
   || fail "service fixture requires its exact persisted cell assignment"
 log "checking Trino service credentials and non-rotating renewal"

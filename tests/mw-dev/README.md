@@ -195,13 +195,6 @@ pinned image predates. When promoting such a build, set that property to the
 same domain on the lane's coordinator and pass the domain to the harness Job.
 The harness sends the tenant host as the `Host` header against the lane's own
 TLS name, so no DNS or certificate for the tenant host is needed.
-The provisioner cancels a statement it abandons at its reconcile deadline
-(`DELETE` on the pending `nextUri`), so abandoned queries cannot fill the
-`root.admin.__admin_provisioner` resource group. The lane does not assert this:
-it needs a coordinator that holds `SHOW CATALOGS` past the 30-second reconcile
-budget, which the Job cannot produce deterministically. The contract is pinned
-by `TestTrinoStatementDrainCancelsAbandonedStatement` against a fake
-coordinator whose statement never leaves the queue.
 Each Trino worker has requests and limits of 1 CPU and 4Gi. Together they
 match the frozen perf Duckgres worker's aggregate 3 CPU and 12Gi execution
 budget while exercising Trino's distributed execution path. Trino permits 2GB
@@ -646,45 +639,13 @@ deterministic regression. The fixture grants patch only on its named control-pla
 Deployment and `trino-auth` Secret. Normal workflow teardown removes the fixture
 on failure, including any extra replicas. No shared environment is modified.
 
-### Trino multicell lane
+### Shared-pool Trino lane
 
-The full Trino E2E lane adds a second disposable namespace,
-`duckgres-ci-pr-0<N>`, alongside the canonical `duckgres-ci-pr-<N>` identity.
-Canonical lane identities must be positive numbers without a leading zero.
-The secondary namespace carries the original lane label and a `trino-cell`
-component label. It owns no control plane, config-store, or Duckling resources.
-Performance scenarios keep the existing single-cell fixture and resource budget.
-
-The additional `cell-test` starts with one blue coordinator and one worker;
-green remains at zero replicas. Both colors use distinct internal credentials,
-node environments, discovery Services, and catalog-store keys. Their shared
-cell-local auth, tenant-password, OPA, and resource-group projections are
-managed by the primary control plane through a scoped RoleBinding.
-
-`e2e/trino-multicell.sh` provisions a new warehouse without Trino, selects its
-initial cell, enables Trino, and verifies real Hoglake writes and reads. It
-asserts that legacy remains queryable, credentials and OPA tokens cannot cross
-cells, and an existing legacy assignment cannot be changed. It then starts
-green, updates the startup-loaded registry, restarts the control plane, and
-queries the same data through green's independently hydrated catalog. Direct
-coordinator URLs are fixture-only; this does not test Gateway routing or a
-maintenance move of an existing warehouse.
-
-After these checks, the lane restarts its control plane in registry-only mode,
-verifies both registered backends still query the warehouse, rejects legacy
-ownership and implicit cell selection, and verifies the legacy bundle endpoint
-is absent. It restores the original configuration on success. Workflow teardown
-removes the disposable namespaces on failure, including during this phase.
-The registry-only phase also checks enablement admission for existing registered
-and legacy-owned warehouses. Initial assignment without a legacy default is
-covered by startup, admin, provisioning, and projection package tests; the
-real initial-placement flow runs earlier while both cells are configured.
-
-The fixture preserves the existing CI network-policy posture. It does not
-create network policies or add cluster-wide RBAC grants. Isolation assertions
-cover application authentication and OPA authorization, not network isolation.
-If an existing cluster policy blocks the fixture, investigate that policy;
-do not weaken it to make the test pass.
+The control plane creates its coordinator and three workers dynamically in the
+primary disposable namespace. Gateway routes tenant statements after admission.
+The fixture publishes catalogs once through the fenced database writer.
+The harness changes the blueprint release and checks replacement, retirement,
+and existing data. There are no static slot deployments or migration switches.
 
 All lanes generate a random config-store password in `DUCKGRES_CI_SECRET_DIR`
 and reuse it for that run. PostgreSQL, the control plane, and benchmark Jobs
@@ -697,11 +658,6 @@ real acceptance gate is the PR's Trino E2E workflow. A rendered fixture is not
 proof that CI has the required cross-namespace RBAC and Pod Identity grants.
 On failure, keep the PR in draft and inspect its isolated job/deployment logs.
 Do not redirect the suite to an existing shared cell.
-
-Normal reset/teardown and stale cleanup delete the secondary namespace only
-after its name, original lane label, component label, and UID match. Namespace
-deletion uses a UID precondition. Secondary cleanup removes its Pod Identity
-association but never independently deletes the primary lane's warehouses.
 
 Dedicated CP + throwaway config-store **per e2e lane**, provisioning three **real**
 CNPG-backed ducklings (org IDs `ci-pr-<N>-cnpg` plus the ducklake-only
@@ -934,9 +890,8 @@ next reconciliation generates a fresh random suffix.
 Set `E2E_TRINO_POOL_SHORT_NAMES=1` with `E2E_TRINO_POOL=1` after all old instances
 have retired to verify Deployment names and Kubernetes-managed pod suffixes.
 The naming assertion defaults off so a mixed old/new fleet remains supported.
-The default in-Job fixture has no pooled workload, so this requires an authorized
-deployment of the candidate image and a completed instance replacement before
-it can provide live evidence. No namespace move or resource rename is performed
+The isolated Trino lane creates a shared pool; the generic harness can also
+inspect a separately authorized deployment. No namespace move or resource rename is performed
 by the naming change. Namespace moves require a separate maintenance procedure;
 do not change the configured namespace while old instance snapshots remain live.
 
@@ -948,10 +903,8 @@ The structure stage also checks the recovery UI's admin inventory and preview
 API contracts. It never submits recovery: an actual failure retirement requires
 separate authorization and can invalidate retained results. Browser interactions
 and ambiguous-response retries are covered by the admin UI tests.
-Run it after rolling a candidate control-plane image with a shared-pool registry,
-the Gateway token file, and no `DUCKGRES_TRINO_ROLLOUT_CANARIES_FILE`. Reusing
-the token must not activate the obsolete fixed-slot canary endpoint or crash
-control-plane startup.
+Run it after rolling a candidate image with a shared-pool registry and the
+Gateway token file.
 When the Gateway uses form authentication, configure the existing API-role
 username through `DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME`. The same active
 acceptance path requires successful API and capability authentication before
@@ -972,12 +925,8 @@ headers; returning all node rows from the initial POST would miss this failure.
 Run the active-pool acceptance stage after deployment to verify real coordinator
 admission and querying. This local regression does not replace that cluster check.
 
-The default in-Job fixture does not configure a shared pool, and its harness runs
-only after the control plane starts. It cannot reproduce this startup failure by
-changing its own environment: the control plane reads these settings at process
-startup. `TestTrinoRolloutReadinessScopesFixedCells` covers the startup selection
-and malformed fixed/mixed configurations locally. The active-pool harness remains
-the real-cluster acceptance check; passing unit tests alone does not prove it ran.
+The isolated Trino lane enables the pool operator and catalog publisher before
+startup. Passing local fixture tests alone does not prove this cluster lane ran.
 
 A corrected blueprint supersedes a never-admitted `PREPARING` candidate when
 its release ID or blueprint digest changes, including configuration-only changes
@@ -990,8 +939,7 @@ No manual database edits or pod deletion are required for superseded candidates.
 
 For recovery acceptance, publish a corrected blueprint while an old candidate
 cannot pass validation, then run the active-pool stage after replacement.
-The default in-Job fixture has no shared-pool controller or authority to change
-its desired blueprint. `TestSupersededPreparingCandidateRecovers` exercises that
+The isolated Trino lane changes only its own desired blueprint. `TestSupersededPreparingCandidateRecovers` exercises that
 configuration change, immutable snapshots, lost retirement response, verified
 absence, and replacement locally. The companion tests preserve admission
 ambiguity, Gateway retirement refusals, configuration freeze, and lease fencing.
@@ -1013,8 +961,7 @@ namespace must never be inferred from the current desired configuration.
 Registry-only node-environment or service-port changes do not trigger this
 blueprint rollout path.
 
-The in-Job fixture cannot publish a different shared-pool blueprint, so it cannot
-drive this rollout itself. After deploying the controller, publish a same-image
+The isolated Trino lane drives a same-image blueprint replacement. After deploying the controller, publish a same-image
 worker-count change in an isolated pool through its normal configuration source.
 Observe one planned surge, admission before drain, and retention of an old member
 while a transaction remains open. After the transaction completes, verify that
@@ -1063,63 +1010,18 @@ Verify the Gateway's desired revision as well as member replacement and serving
 capacity. Do not restart the control plane between configuration changes: that
 would hide a same-term rollback regression.
 
-### Optional shared catalog rollout lane
+### Gateway fixture image
 
-`TRINO_SHARED_CATALOGS_ENABLED=true` adds an isolated, real Gateway to the
-`E2E_SUITE=trino`, `SCENARIO_NAME=full-suite` fixture. The default remains false;
-the existing static multicell tests still run first. This option requires:
+The runner reads the digest-pinned image from the existing Gateway Deployment
+in the explicitly selected test context. It does not modify that Deployment.
+GitHub Actions masks the resolved reference. Set `TRINO_GATEWAY_IMAGE` to an
+explicit digest-pinned candidate to reproduce a run or test another revision.
+An unavailable Deployment or a mutable image fails before fixture cleanup.
 
-- A control-plane image with the managed shared-catalog runtime, lifecycle store,
-  provisioning freeze/release endpoints, and readiness endpoint.
-- `TRINO_GATEWAY_IMAGE` containing an explicit `@sha256:` digest from a build
-  with fenced rollout administration. A mutable tag is rejected before any cluster
-  operation. Verify the image's source revision before supplying its digest.
-- A fresh private `DUCKGRES_CI_SECRET_DIR`, so the per-run TLS certificate includes
-  the isolated Gateway service. Existing certificates without this identity fail
-  closed. No customer credentials or production secrets are reused.
-
-Set those variables on the existing `run.sh deploy` and `run.sh test-e2e` commands,
-using the same disposable namespace, PR identity, and explicit test context as the
-normal fixture. The regular CI lane does not automatically enable this option.
-The Gateway PR's Docker check alone is not a published-image prerequisite: the
-main-only image publisher must have produced the reviewed candidate first, or a
-separately reviewed build must supply that exact source as a digest-pinned image.
-
-The optional lane pauses catalog management, waits for old control-plane pods to
-terminate, stops green, and points green at blue's persisted catalog identity.
-It then exercises the actual Gateway operation and control-plane admission APIs:
-
-1. Freeze admission before starting green. A newly enabled fixture warehouse
-   cannot become Ready or create a catalog while frozen.
-2. Start green from zero pods. Its startup reads the shared catalog without
-   changing the existing row's version, properties, or update timestamp.
-3. Require the prepared certificate to match the target's actual process and
-   admitted roster, then query existing DuckLake data on green.
-4. Cut over and release admission. The new warehouse becomes Ready only on green;
-   the still-running blue coordinator does not gain its catalog. Require its
-   persisted connector name to be `ducklake`, without SQL identifier quotes,
-   and read its `main` schema through Gateway using the new tenant's credentials.
-5. Drain and seal blue, require actual pod absence, and complete the operation.
-
-Before and after cutover, warehouse DuckLake queries pass through the real
-Gateway. An administrator's node query must identify the active coordinator.
-Every advertised continuation must remain on the verified Gateway origin; the
-harness rejects direct-backend or foreign-host continuations before sending
-credentials. The two fixture coordinators enable forwarded-header processing
-only when this option is selected; the legacy fixture remains unchanged.
-
-The Gateway uses its own schema in the disposable PostgreSQL database. Generated
-Gateway keys, signing material, and the dedicated fixture canary remain Kubernetes
-Secrets. No mock Gateway is accepted for this lane. The publication evidence is
-synthetic because this test does not create Git branches or PRs; native Kargo/Git
-publication safety is covered separately. This lane does not claim transaction
-affinity or load-test coverage.
-
-On failure, retain only redacted diagnostics and use the normal fixture teardown.
-Do not clear a held catalog mutation or bypass the freeze to make a test pass.
-The additional fixture warehouse is included in the existing cleanup inventory.
-Local `just test-mw-fixtures` validates opt-in checks, real rendering, and shell
-request construction; it is not proof that this real-cluster lane has executed.
+Gateway owns a separate schema in the disposable PostgreSQL database. The
+fixture generates all Gateway keys and TLS material per run. The runner starts
+Gateway before enabling the pool operator. No canary warehouse, Kargo state,
+or external secret is required.
 
 ## Regular Trino + Hoglake prerequisites
 

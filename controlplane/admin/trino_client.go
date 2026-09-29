@@ -24,7 +24,6 @@ import (
 // own coordinator reads. Trino records it verbatim as
 // system.runtime.queries.source, so tagging lets an operator (and this
 // console's own live view) tell console traffic apart from tenant SQL.
-// Mirrors provisioner.TrinoProvisionerSource for the reconcile loop.
 const TrinoAdminSource = "duckgres-admin"
 
 // trinoObserverUser is the Trino principal the console authenticates as.

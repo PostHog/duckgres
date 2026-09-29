@@ -5,16 +5,12 @@ package provisioner
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
@@ -23,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/posthog/duckgres/controlplane/configstore"
 	"github.com/posthog/duckgres/controlplane/provisioner/opa"
 	"golang.org/x/crypto/bcrypt"
@@ -32,20 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
-
-// TrinoProvisionerSource is the `X-Trino-Source` the provisioner stamps on
-// its catalog-management statements. Trino records the header verbatim as
-// the `source` column of system.runtime.queries and shows it in the query
-// listing, so tagging it is what lets an operator tell control-plane
-// traffic apart from tenant SQL — including filtering it out of the admin
-// console's own live-query view. Untagged, every reconcile tick's SHOW
-// CATALOGS looks like a mystery query from a privileged user.
-const TrinoProvisionerSource = "duckgres-provisioner"
-
-// TrinoCustomerNamespace is the K8s namespace where the shared Trino cell
-// lives. The auth Secret, tenant-password Secret and resource-groups
-// ConfigMap are projected into this namespace by the provisioner.
-const TrinoCustomerNamespace = "trino-customer"
 
 // TrinoAuthSecretName is the K8s Secret that holds the projected
 // password.db + group.db. Mounted only into the coordinator pod, not
@@ -99,7 +80,7 @@ const TrinoOPABundleTokenSecretKey = "token"
 // The auth Secret carries the projected file content (consumed by the
 // coordinator's file-password-authenticator) plus the admin
 // principal's plaintext + bcrypt hash (consumed by the provisioner's
-// own catalog REST client). Keeping all four keys on one Secret reduces
+// own catalog publication client). Keeping all four keys on one Secret reduces
 // the chart-side mount surface; the admin pair is written/regenerated
 // together by ensureAdminCredential, merged into the Secret so the
 // per-tick password.db/group.db projection isn't clobbered.
@@ -277,26 +258,9 @@ func TrinoResourceGroupName(principal string) string {
 // state rows untouched instead.
 var ErrTrinoCatalogNotThisReplica = errors.New("this control plane does not own the catalog write path")
 
-// ErrTrinoNodeInventoryUnavailable marks a catalog client that cannot answer
-// "which nodes are in this cluster" because there is no ONE cluster to ask.
-//
-// A pooled cell publishes catalogs to the shared store and its compute is a set
-// of instances that come and go, so the legacy readiness probe - which asks a
-// fixed coordinator for its node inventory and then checks every tenant's
-// mounted credential on those nodes - has no coordinator to address. Its
-// evidence comes from the pool instead: every member proves it applied the
-// catalog and the projections before it is admitted, and (with the Gateway's
-// admission restriction on) a tenant is only queryable once every serving
-// member has acknowledged it.
-var ErrTrinoNodeInventoryUnavailable = errors.New("this catalog client has no single coordinator to read a node inventory from")
-
-// TrinoCatalogClient is the REST surface the provisioner needs against
-// the customer Trino cluster: enumerate, create, alter, drop catalogs.
-// Concrete implementation in trinoCatalogHTTPClient below; the interface
-// is exported so tests can inject a fake at the function boundary.
+// TrinoCatalogClient publishes catalogs through the pool writer fence.
 type TrinoCatalogClient interface {
 	ListCatalogs(ctx context.Context) ([]string, error)
-	ListNodes(ctx context.Context) ([]TrinoNode, error)
 	CreateCatalog(ctx context.Context, name string, props map[string]string) error
 	AlterCatalog(ctx context.Context, name string, props map[string]string) error
 	DropCatalog(ctx context.Context, name string) error
@@ -306,7 +270,6 @@ type TrinoCatalogClient interface {
 // needs. Each is required at construction time — partial wiring would
 // cause silent reconcile no-ops, which we'd rather surface at startup.
 type TrinoProvisionerOpts struct {
-	ManagedCatalogs *TrinoManagedCatalogOpts
 	// Store is the cross-cutting Trino read/write surface.
 	Store TrinoStore
 
@@ -342,34 +305,12 @@ type TrinoProvisionerOpts struct {
 	// resource-groups ConfigMap projections in the Trino namespace.
 	Kubernetes kubernetes.Interface
 
-	// SecretReadiness confirms the tenant credentials visible on serving Trino
-	// nodes. Nil uses Kubernetes pod exec with in-cluster credentials.
-	SecretReadiness TrinoSecretReadiness
-
-	// AuthenticationReadiness observes coordinator login files and cache expiry.
-	// Nil uses the Kubernetes observer.
-	AuthenticationReadiness TrinoAuthenticationReadiness
-
-	// Namespace overrides TrinoCustomerNamespace. Empty == default.
+	// Namespace identifies the pool projection namespace. It is required.
 	// Useful for dev clusters that namespace Trino differently.
 	Namespace string
 
-	// CellID is the Trino cell this provisioner reconciles. It claims
-	// Trino-enabled orgs with no cell yet, reconciles the orgs stamped
-	// with this cell, and IGNORES orgs stamped with any other cell.
-	// Empty == configstore.DefaultTrinoCellID.
+	// CellID is the explicit stored pool identity. Reconciliation never assigns warehouses.
 	CellID string
-
-	// ExplicitAssignmentOnly prevents this cell from claiming unassigned tenants.
-	ExplicitAssignmentOnly bool
-
-	// AdditionalCatalogs contains other running backends in this logical cell.
-	// Stopped backends must not be included. All running backends gate readiness.
-	AdditionalCatalogs []TrinoCatalogClient
-
-	// ExistingInternalSecrets names chart-owned internal-communication secrets.
-	// When set, the provisioner validates these references without modifying them.
-	ExistingInternalSecrets []string
 
 	// TenantSecretMountPath is the in-pod path the chart mounts
 	// TrinoTenantSecretName at; each org's catalog points its
@@ -378,13 +319,7 @@ type TrinoProvisionerOpts struct {
 	// catalog fails to open a metadata connection.
 	TenantSecretMountPath string
 
-	// Catalog is the Trino REST client used to issue CREATE / ALTER /
-	// DROP CATALOG. The provisioner authenticates as opa.AdminPrincipal;
-	// the underlying HTTP client's Basic-auth credential is now set
-	// from the bootstrapped admin plaintext at first Reconcile (the
-	// caller passes in a SetCredentials-aware client, see
-	// TrinoCatalogClient interface). For unit tests a fake catalog
-	// client with no auth surface is fine.
+	// Catalog is the fenced shared-store catalog publisher. Tests may inject a fake.
 	Catalog TrinoCatalogClient
 
 	// BundleStore is the in-memory holder of the most recently built OPA
@@ -410,10 +345,6 @@ type TrinoProvisionerOpts struct {
 	// catalogs. Defaults to false. Trino nodes must configure a cache manager.
 	FilesystemCacheEnabled bool
 
-	// HoglakeURI is deprecated and has no effect on catalog selection.
-	// Retained so older deployment settings do not prevent existing clients
-	// from starting; persisted tenant backends are authoritative in all cells.
-	HoglakeURI     string
 	ManagedHoglake *TrinoManagedHoglakeConfig
 }
 
@@ -432,16 +363,6 @@ type TrinoBootstrapSentinelStore interface {
 	MarkTrinoClusterBootstrapped(ctx context.Context, namespace string) error
 }
 
-// TrinoCatalogCredentialUpdater is the optional credential-rotation
-// hook a catalog client exposes. Some HTTP-backed clients need to
-// rebuild the cached Basic-auth header when the admin password
-// changes; clients without runtime-mutable credentials (test fakes,
-// bearer-token clients) implement no-op or omit the interface entirely
-// (the provisioner type-asserts on each Reconcile).
-type TrinoCatalogCredentialUpdater interface {
-	SetCredentials(username, password string)
-}
-
 // TrinoStore is the read/write surface trino_provisioner.go uses for the
 // per-reconcile projection inputs and outcomes. Defined as a narrow
 // interface so unit tests can swap a fake and so the type doesn't drag the
@@ -449,8 +370,6 @@ type TrinoCatalogCredentialUpdater interface {
 type TrinoStore interface {
 	ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error)
 	UpdateTrinoState(orgID string, upd configstore.TrinoStateUpdate) error
-	// ClaimTrinoCell returns true only when this call acquires ownership.
-	ClaimTrinoCell(orgID, cellID string) (bool, error)
 }
 
 // TrinoWarehouseStore reads a single org's warehouse row to populate the
@@ -474,7 +393,7 @@ type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingSta
 // TrinoProvisioner owns the customer Trino cluster's projected state:
 // cluster-level Secrets (internal-communication shared secret, auth
 // password + group files, OPA bundle bearer token), per-org auth file
-// projection, resource-groups JSON, OPA bundle, and catalog REST state.
+// projection, resource-groups JSON, OPA bundle, and catalog publication state.
 //
 // Per-tick deterministic projection: given the same inputs, every K8s
 // write produces byte-equal output, so re-running a tick is a no-op
@@ -483,28 +402,22 @@ type TrinoDucklingResolver func(ctx context.Context, orgID string) (*DucklingSta
 // fires on first install; thereafter ensureClusterSecrets adopts the
 // existing K8s Secrets.
 type TrinoProvisioner struct {
-	managed                *TrinoManagedCatalogOpts
-	store                  TrinoStore
-	bootstrapSentinel      TrinoBootstrapSentinelStore
-	warehouses             TrinoWarehouseStore
-	ducklings              TrinoDucklingResolver
-	hoglakeDucklings       TrinoDucklingResolver
-	kubernetes             kubernetes.Interface
-	secretReadiness        TrinoSecretReadiness
-	authReadiness          TrinoAuthenticationReadiness
-	namespace              string
-	cellID                 string
-	explicitAssignmentOnly bool
-	catalog                TrinoCatalogClient
+	store             TrinoStore
+	bootstrapSentinel TrinoBootstrapSentinelStore
+	warehouses        TrinoWarehouseStore
+	ducklings         TrinoDucklingResolver
+	hoglakeDucklings  TrinoDucklingResolver
+	kubernetes        kubernetes.Interface
+	namespace         string
+	cellID            string
+	catalog           TrinoCatalogClient
 	// tenantAdmission reports whether a tenant's publication has committed on
 	// the pool that serves it. Nil everywhere except a shared-pool cell with the
 	// Gateway's admission restriction enabled.
-	tenantAdmission         TenantAdmissionGate
-	additionalCatalogs      []TrinoCatalogClient
-	catalogTimeout          time.Duration
-	existingInternalSecrets []string
-	bundleStore             *opa.BundleStore
-	bundleBuilder           opa.BundleBuilder
+	tenantAdmission TenantAdmissionGate
+	catalogTimeout  time.Duration
+	bundleStore     *opa.BundleStore
+	bundleBuilder   opa.BundleBuilder
 	// policyRevision is the revision of the authorization projection currently
 	// served. It is read from the pool operator's validation goroutine while
 	// the reconcile loop writes it, so it is atomic rather than a plain field.
@@ -574,9 +487,6 @@ func (p *TrinoProvisioner) setObserverCredential(plaintext, hash string) {
 // Returns an error if any required dep is missing rather than panicking
 // downstream on the first reconcile tick.
 func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
-	if opts.HoglakeURI != "" {
-		slog.Warn("Legacy Trino Hoglake URI setting is ignored; configure managed Hoglake provisioning for new clients.")
-	}
 	if opts.ManagedHoglake != nil {
 		if err := opts.ManagedHoglake.Validate(); err != nil {
 			return nil, err
@@ -600,11 +510,6 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if opts.Catalog == nil {
 		return nil, errors.New("TrinoProvisioner: Catalog client is required")
 	}
-	for _, catalog := range opts.AdditionalCatalogs {
-		if catalog == nil {
-			return nil, errors.New("TrinoProvisioner: additional catalog client must not be nil")
-		}
-	}
 	if opts.BundleStore == nil {
 		return nil, errors.New("TrinoProvisioner: BundleStore is required")
 	}
@@ -613,11 +518,11 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	}
 	ns := opts.Namespace
 	if ns == "" {
-		ns = TrinoCustomerNamespace
+		return nil, errors.New("TrinoProvisioner: Namespace is required")
 	}
 	cell := opts.CellID
 	if cell == "" {
-		cell = configstore.DefaultTrinoCellID
+		return nil, errors.New("TrinoProvisioner: CellID is required")
 	}
 	mountPath := opts.TenantSecretMountPath
 	if mountPath == "" {
@@ -627,43 +532,24 @@ func NewTrinoProvisioner(opts TrinoProvisionerOpts) (*TrinoProvisioner, error) {
 	if maxConns <= 0 {
 		maxConns = defaultTrinoS3MaxConnections
 	}
-	secretReadiness := opts.SecretReadiness
-	if secretReadiness == nil {
-		secretReadiness = NewKubernetesTrinoSecretReadiness(opts.Kubernetes, nil)
-	}
-	authReadiness := opts.AuthenticationReadiness
-	if authReadiness == nil {
-		authReadiness = NewKubernetesTrinoAuthenticationReadiness(opts.Kubernetes, nil)
-	}
 	result := &TrinoProvisioner{
-		managed:                 opts.ManagedCatalogs,
-		store:                   opts.Store,
-		bootstrapSentinel:       opts.BootstrapSentinel,
-		warehouses:              opts.Warehouses,
-		ducklings:               opts.Ducklings,
-		hoglakeDucklings:        opts.HoglakeDucklings,
-		kubernetes:              opts.Kubernetes,
-		secretReadiness:         secretReadiness,
-		authReadiness:           authReadiness,
-		namespace:               ns,
-		cellID:                  cell,
-		explicitAssignmentOnly:  opts.ExplicitAssignmentOnly,
-		catalog:                 opts.Catalog,
-		additionalCatalogs:      append([]TrinoCatalogClient(nil), opts.AdditionalCatalogs...),
-		catalogTimeout:          30 * time.Second,
-		existingInternalSecrets: append([]string(nil), opts.ExistingInternalSecrets...),
-		bundleStore:             opts.BundleStore,
-		bundleBuilder:           opts.BundleBuilder,
-		tenantSecretMountPath:   strings.TrimRight(mountPath, "/"),
-		awsRegion:               opts.AWSRegion,
-		s3MaxConnections:        maxConns,
-		filesystemCacheEnabled:  opts.FilesystemCacheEnabled,
-		managedHoglake:          opts.ManagedHoglake,
-	}
-	if opts.ManagedCatalogs != nil {
-		if err := result.ConfigureManagedCatalogs(opts.ManagedCatalogs); err != nil {
-			return nil, err
-		}
+		store:                  opts.Store,
+		bootstrapSentinel:      opts.BootstrapSentinel,
+		warehouses:             opts.Warehouses,
+		ducklings:              opts.Ducklings,
+		hoglakeDucklings:       opts.HoglakeDucklings,
+		kubernetes:             opts.Kubernetes,
+		namespace:              ns,
+		cellID:                 cell,
+		catalog:                opts.Catalog,
+		catalogTimeout:         30 * time.Second,
+		bundleStore:            opts.BundleStore,
+		bundleBuilder:          opts.BundleBuilder,
+		tenantSecretMountPath:  strings.TrimRight(mountPath, "/"),
+		awsRegion:              opts.AWSRegion,
+		s3MaxConnections:       maxConns,
+		filesystemCacheEnabled: opts.FilesystemCacheEnabled,
+		managedHoglake:         opts.ManagedHoglake,
 	}
 	return result, nil
 }
@@ -750,41 +636,10 @@ func (p *TrinoProvisioner) catalogClient() TrinoCatalogClient {
 // surface them in observability without losing detail. nil iff every
 // step succeeded.
 func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
-	// 0. Cluster-level Secrets. Bootstrap-or-load on every tick (cheap
-	//    after first run; the configstore row exists and the call
-	//    returns it without touching K8s). Catalog REST calls in step 5
-	//    authenticate as the admin principal whose password lives in
-	//    the trino-auth Secret this step ensures exists — so this MUST
-	//    run before any catalog REST call, otherwise cold-start hits a
-	//    401 against an empty password.db.
-	//
-	//    Failure here is fatal for the tick: catalog reconciles would
-	//    401 and auth projection would have nothing to project the
-	//    admin lines from. The next tick retries.
+	// 0. Load cluster credentials before projecting authentication files.
+	// Catalog publication uses its separate database credential and authority fence.
 	if _, err := p.ensureClusterSecrets(ctx); err != nil {
 		return fmt.Errorf("ensure trino cluster secrets: %w", err)
-	}
-	var managedLease *configstore.TrinoCellLease
-	managedFollower := false
-	if p.managed != nil && !p.managed.Paused {
-		var acquired bool
-		var err error
-		managedLease, acquired, err = p.managed.Store.BeginTrinoCellReconcile(ctx, p.cellID, uuid.NewString())
-		if err != nil {
-			return err
-		}
-		if !acquired {
-			managedFollower = true
-			managedLease = nil
-		} else {
-			defer func() {
-				finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
-				defer cancel()
-				if err := p.managed.Store.FinishTrinoCellReconcile(finishCtx, *managedLease); err != nil {
-					slog.Error("Could not confirm managed Trino ownership release.", "cell", p.cellID)
-				}
-			}()
-		}
 	}
 
 	allOrgs, err := p.store.ListTrinoEnabledOrgs()
@@ -797,7 +652,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	// password file, group file, tenant Secret, resource groups, OPA
 	// bundle, catalogs — is a projection of exactly this slice, so a
 	// tenant that belongs to another cell is invisible to every step.
-	orgs := p.claimCellOrgs(allOrgs)
+	orgs := p.assignedCellOrgs(allOrgs)
 
 	// Stable iteration order so logs and projections are deterministic
 	// regardless of how the DB driver returned the rows.
@@ -874,46 +729,14 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 	if tenantErr != nil {
 		errs = append(errs, fmt.Errorf("reconcile tenant secrets: %w", tenantErr))
 	}
-	if p.managed != nil && (p.managed.Paused || managedFollower) {
-		return errors.Join(errs...)
-	}
 
-	// 5. Catalogs (REST). Per-org idempotent CREATE; orgs disabled
-	//    since last tick get DROP. Runs last so all the prerequisite
-	//    state (admin auth file + resource-groups + OPA bundle + the
-	//    tenant password Secret) is in place before the coordinator gets
-	//    a REST call.
-	//
-	//    Skip catalogs if ANY of the projection steps failed: the
-	//    auth-secret failure case is the killer — a Trino coordinator
-	//    that just lost its password.db keys would 401 every catalog
-	//    REST call from us, and we'd surface that as a misleading
-	//    "catalog reconcile failed" error masking the real projection
-	//    problem. Resource-groups + OPA bundle failures are less
-	//    immediately broken but still mean the coordinator is in an
-	//    inconsistent state from the chart's perspective. Better to
-	//    retry the full prerequisite + catalog chain on the next tick
-	//    than to push partial state.
-	//
-	//    On skip, every org gets attributed the projection error via
-	//    writePerOrgStates' globalErr path (state -> Failed with the
-	//    join-of-errors as StatusMessage); no per-org catalog outcome
-	//    is recorded.
+	// 5. Publish catalogs only after every prerequisite projection succeeds.
+	// Pool admission verifies applied revisions before admitting each tenant.
 	globalErr := errors.Join(authErr, rgErr, opaErr, tenantErr)
 	var catalogOutcomes map[string]catalogOutcome
 	if globalErr == nil {
 		var catErr error
-		if managedLease != nil {
-			catalogOutcomes, catErr = p.managedCatalogs(ctx, *managedLease, projectable, tenants)
-			if catErr != nil && catalogOutcomes == nil {
-				catalogOutcomes = make(map[string]catalogOutcome, len(projectable))
-				for _, org := range projectable {
-					catalogOutcomes[org.OrgID] = catalogOutcome{Err: catErr}
-				}
-			}
-		} else {
-			catalogOutcomes, catErr = p.reconcileCatalogs(ctx, projectable, tenants)
-		}
+		catalogOutcomes, catErr = p.reconcileCatalogs(ctx, projectable, tenants)
 		if catErr != nil {
 			if errors.Is(catErr, ErrTrinoCatalogNotThisReplica) {
 				// Not this replica's work. Nothing failed, nothing is reported,
@@ -926,7 +749,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("reconcile catalogs: %w", catErr))
 		}
 	} else {
-		slog.Warn("trino reconcile: skipping catalog REST step because projection prerequisites failed",
+		slog.Warn("trino reconcile: skipping catalog publication step because projection prerequisites failed",
 			"projection_error", globalErr)
 	}
 
@@ -952,22 +775,7 @@ func (p *TrinoProvisioner) Reconcile(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("org %s: %w", orgID, err))
 		}
 	}
-	if managedLease == nil {
-		p.writePerOrgStates(orgs, catalogOutcomes, globalErr)
-	} else {
-		previous := make(map[string]configstore.TrinoEnabledOrg, len(orgs))
-		for _, org := range orgs {
-			previous[org.OrgID] = org
-		}
-		p.writePerOrgStates(orgs, catalogOutcomes, globalErr, func(org string, update configstore.TrinoStateUpdate) error {
-			if previous[org].State == configstore.ManagedWarehouseStateReady && globalErr == nil && collisions[org] == nil && tenants.failed[org] == nil && tenants.projected[org] {
-				update.State = configstore.ManagedWarehouseStateReady
-				update.FailedAt = nil
-			}
-			_, err := p.managed.Store.UpdateManagedTrinoState(ctx, *managedLease, org, update)
-			return err
-		})
-	}
+	p.writePerOrgStates(orgs, catalogOutcomes, globalErr)
 
 	if len(errs) > 0 {
 		return errors.Join(errs...)
@@ -1111,56 +919,19 @@ func orgLabel(orgID string) string {
 	return "org " + orgID
 }
 
-// claimCellOrgs filters the fleet-wide Trino-enabled listing down to the
-// orgs this cell is responsible for, claiming any that have no cell yet.
-//
-// Three outcomes per row:
-//
-//   - cell == p.cellID    -> ours; reconcile it.
-//   - cell == ""          -> unassigned; claim it (AssignTrinoCell) and
-//     reconcile it. The claim is conditional in SQL, so if a second cell
-//     claimed it first this write is a no-op and we DROP the org from
-//     this tick rather than projecting a tenant we may not own.
-//   - anything else       -> another cell's tenant; skip silently. Not an
-//     error and not a state write: writing state for an org we don't own
-//     would fight the owning cell's writer every tick.
-//
-// Registered cells require explicit assignment and never claim the default fleet.
-func (p *TrinoProvisioner) claimCellOrgs(orgs []configstore.TrinoEnabledOrg) []configstore.TrinoEnabledOrg {
+// assignedCellOrgs selects only warehouses explicitly assigned to this pool.
+func (p *TrinoProvisioner) assignedCellOrgs(orgs []configstore.TrinoEnabledOrg) []configstore.TrinoEnabledOrg {
 	mine := make([]configstore.TrinoEnabledOrg, 0, len(orgs))
-	for _, o := range orgs {
-		switch o.CellID {
-		case p.cellID:
-			mine = append(mine, o)
-		case "":
-			if p.explicitAssignmentOnly {
-				continue
-			}
-			claimed, err := p.store.ClaimTrinoCell(o.OrgID, p.cellID)
-			if err != nil {
-				// Transient write failure — leave the org unassigned and
-				// let the next tick claim it. Projecting it now would
-				// mean serving a tenant whose ownership is unrecorded.
-				slog.Warn("Trino reconcile: failed to claim org into cell.",
-					"org", o.OrgID, "cell", p.cellID, "error", err)
-				continue
-			}
-			if !claimed {
-				continue
-			}
-			slog.Info("Trino reconcile: org claimed into cell.", "org", o.OrgID, "cell", p.cellID)
-			o.CellID = p.cellID
-			mine = append(mine, o)
-		default:
-			slog.Debug("Trino reconcile: skipping org owned by another cell.",
-				"org", o.OrgID, "org_cell", o.CellID, "this_cell", p.cellID)
+	for _, org := range orgs {
+		if org.CellID != "" && org.CellID == p.cellID {
+			mine = append(mine, org)
 		}
 	}
 	return mine
 }
 
 // Bootstrap is the public entry point, run SYNCHRONOUSLY at process
-// startup (buildTrinoWiring calls it before constructing the bundle
+// startup (buildTrinoCellWiring calls it before constructing the bundle
 // HTTP handler). It returns the OPA bundle bearer token so the caller
 // can build the handler with the real token directly — there's no
 // placeholder-then-swap window because the handler can't be constructed
@@ -1169,7 +940,7 @@ func (p *TrinoProvisioner) claimCellOrgs(orgs []configstore.TrinoEnabledOrg) []c
 // Idempotent: re-running adopts the existing K8s Secrets and refreshes
 // the in-memory admin-hash cache. A non-nil error is safe to surface to
 // a startup-time fatal log — without these credentials the bundle
-// endpoint can't authenticate and catalog REST can't authorize.
+// endpoint can't authenticate and catalog publication can't authorize.
 func (p *TrinoProvisioner) Bootstrap(ctx context.Context) (bundleToken string, err error) {
 	return p.ensureClusterSecrets(ctx)
 }
@@ -1214,16 +985,8 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 	// internal-communication shared secret: write-once + immutable. The
 	// provisioner doesn't consume its value at runtime (it's env-
 	// projected to Trino pods by the chart), but it must exist.
-	if len(p.existingInternalSecrets) == 0 {
-		if _, err := p.ensureWriteOnceSecret(ctx, TrinoInternalCommunicationSecretName, TrinoInternalCommunicationSecretKey, bootstrapped); err != nil {
-			return "", err
-		}
-	} else {
-		for _, name := range p.existingInternalSecrets {
-			if _, err := p.readSecretKey(ctx, name, TrinoInternalCommunicationSecretKey); err != nil {
-				return "", fmt.Errorf("read chart-owned internal secret %s: %w", name, err)
-			}
-		}
+	if _, err := p.ensureWriteOnceSecret(ctx, TrinoInternalCommunicationSecretName, TrinoInternalCommunicationSecretKey, bootstrapped); err != nil {
+		return "", err
 	}
 
 	// OPA bundle bearer token: write-once + immutable. Returned so the
@@ -1240,7 +1003,7 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 	// consumer (the provisioner owns both sides), so loss self-heals
 	// rather than wedging. Written/validated together; merge retried on
 	// conflict.
-	adminPlaintext, adminHash, err := p.ensureAdminCredential(ctx)
+	_, adminHash, err := p.ensureAdminCredential(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -1267,24 +1030,6 @@ func (p *TrinoProvisioner) ensureClusterSecrets(ctx context.Context) (bundleToke
 
 	p.adminPasswordHash = adminHash
 	p.setObserverCredential(observerPlaintext, observerHash)
-	// Push the admin plaintext into the catalog client if it supports
-	// runtime credential updates (test fakes don't).
-	if updater, ok := p.catalogClient().(TrinoCatalogCredentialUpdater); ok {
-		updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
-	}
-	for _, catalog := range p.additionalCatalogs {
-		if updater, ok := catalog.(TrinoCatalogCredentialUpdater); ok {
-			updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
-		}
-	}
-
-	if p.managed != nil {
-		for _, catalog := range p.managed.CatalogClients {
-			if updater, ok := catalog.(TrinoCatalogCredentialUpdater); ok {
-				updater.SetCredentials(opa.AdminPrincipal, adminPlaintext)
-			}
-		}
-	}
 	return bundleToken, nil
 }
 
@@ -1354,7 +1099,7 @@ func (p *TrinoProvisioner) ensureWriteOnceSecret(ctx context.Context, name, key 
 // it has no external long-lived consumer: the provisioner controls both
 // sides — it writes the bcrypt hash into password.db (which the
 // coordinator's file-authenticator refreshes) AND authenticates its own
-// catalog REST client with the plaintext (SetCredentials). So if the
+// catalog publication client with the plaintext (SetCredentials). So if the
 // pair is lost (e.g. a stray wholesale write of trino-auth during a
 // rolling upgrade wiped the admin keys), regenerating it self-heals
 // within one password-file refresh window — no split-brain, no wedge.
@@ -1636,7 +1381,7 @@ func (p *TrinoProvisioner) writePerOrgStates(
 				msg = "waiting for warehouse provisioning to complete"
 			}
 		default:
-			// Catalog reconciled, member credentials observed, no global failure.
+			// Catalog publication and the configured tenant admission gate succeeded.
 			nextState = configstore.ManagedWarehouseStateReady
 			msg = ""
 		}
@@ -1786,123 +1531,10 @@ func (p *TrinoProvisioner) reconcileCatalogs(
 	orgs []configstore.TrinoEnabledOrg,
 	tenants tenantSecretProjection,
 ) (map[string]catalogOutcome, error) {
-	outcomes, firstErr := p.reconcileBoundedBackend(ctx, orgs, tenants, p.catalogClient(), "primary")
-	errs := []error{firstErr}
-	for i, catalog := range p.additionalCatalogs {
-		backendOutcomes, err := p.reconcileBoundedBackend(ctx, orgs, tenants, catalog, fmt.Sprintf("additional-%d", i))
-		if err != nil {
-			errs = append(errs, fmt.Errorf("additional running backend %d: %w", i, err))
-		}
-		for orgID, next := range backendOutcomes {
-			previous := outcomes[orgID]
-			if next.Err != nil {
-				outcomes[orgID] = catalogOutcome{Err: errors.Join(previous.Err, next.Err)}
-			} else if previous.Err == nil && next.Pending {
-				outcomes[orgID] = next
-			}
-		}
-	}
-	return outcomes, errors.Join(errs...)
-}
-
-func (p *TrinoProvisioner) reconcileBoundedBackend(ctx context.Context, orgs []configstore.TrinoEnabledOrg, tenants tenantSecretProjection, catalog TrinoCatalogClient, backend string) (map[string]catalogOutcome, error) {
 	backendCtx, cancel := context.WithTimeout(ctx, p.catalogTimeout)
 	defer cancel()
-	outcomes, catalogErr := p.reconcileBackendCatalogs(backendCtx, orgs, tenants, catalog)
-	expected := make(map[string][]byte)
-	for org, outcome := range outcomes {
-		if outcome.Err == nil && !outcome.Pending && (outcome.Created || outcome.Existed) {
-			expected[org] = tenants.data[org]
-		}
-	}
-	if len(expected) == 0 {
-		return outcomes, catalogErr
-	}
-
-	pending, readinessErr := p.reconcileBackendReadiness(backendCtx, catalog, expected, backend)
-	if errors.Is(readinessErr, ErrTrinoNodeInventoryUnavailable) {
-		// A pooled cell has no single coordinator to take an inventory from, and
-		// inventing one would be worse than skipping: its readiness evidence is
-		// the pool's own admission, where each member proves it applied the
-		// catalog and the projections. Failing every tenant on a probe that
-		// cannot apply to them would mark the whole pool broken.
-		slog.Debug("trino reconcile: skipping the fixed-coordinator readiness probe for a pooled cell",
-			"reason", readinessErr)
-		return outcomes, catalogErr
-	}
-	for org := range expected {
-		if readinessErr != nil {
-			outcomes[org] = catalogOutcome{Err: readinessErr}
-		} else if reason, waiting := pending[org]; waiting {
-			outcomes[org] = catalogOutcome{Pending: true, PendingReason: reason}
-		}
-	}
-	return outcomes, errors.Join(catalogErr, readinessErr)
-}
-
-// A successful CREATE CATALOG only validates the coordinator's local files.
-// Observe the same credentials on every active member before declaring this
-// backend ready, including when the catalog already existed on this tick.
-func (p *TrinoProvisioner) reconcileBackendReadiness(ctx context.Context, catalog TrinoCatalogClient, expected map[string][]byte, backend string) (map[string]string, error) {
-	nodes, err := catalog.ListNodes(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("read Trino readiness membership: %w", err)
-	}
-	active := activeTrinoMembers(nodes)
-	coordinator, worker := false, false
-	for _, node := range active {
-		coordinator = coordinator || node.Coordinator
-		worker = worker || !node.Coordinator
-	}
-	if !coordinator || !worker {
-		return trinoAllPending(expected, "waiting for an active Trino coordinator and worker"), nil
-	}
-	credentials := make(map[string][]byte)
-	for org, password := range expected {
-		if len(password) != 0 {
-			credentials[org] = password
-		}
-	}
-	pending, err := p.secretReadiness.Check(ctx, p.namespace, p.tenantSecretMountPath, credentials, active)
-	if err != nil {
-		return nil, fmt.Errorf("verify Trino mounted credentials: %w", err)
-	}
-	authReady, err := p.authReadiness.Check(ctx, p.namespace, backend, active)
-	if err != nil {
-		return nil, fmt.Errorf("verify Trino coordinator authentication: %w", err)
-	}
-	if !authReady {
-		return trinoAllPending(expected, "waiting for coordinator authentication projection and refresh"), nil
-	}
-
-	after, err := catalog.ListNodes(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("verify Trino readiness membership: %w", err)
-	}
-	current := activeTrinoMembers(after)
-	if len(active) != len(current) {
-		return trinoAllPending(expected, "Trino membership changed during credential observation"), nil
-	}
-	for i := range active {
-		if active[i] != current[i] {
-			return trinoAllPending(expected, "Trino membership changed during credential observation"), nil
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return pending, nil
-}
-
-func activeTrinoMembers(nodes []TrinoNode) []TrinoNode {
-	active := make([]TrinoNode, 0, len(nodes))
-	for _, node := range nodes {
-		if strings.EqualFold(node.State, "active") {
-			active = append(active, node)
-		}
-	}
-	sort.Slice(active, func(i, j int) bool { return active[i].ID < active[j].ID })
-	return active
+	// Pool admission verifies each instance's catalog and credential revisions.
+	return p.reconcileBackendCatalogs(backendCtx, orgs, tenants, p.catalogClient())
 }
 
 func (p *TrinoProvisioner) reconcileBackendCatalogs(
@@ -2302,9 +1934,6 @@ func (p *TrinoProvisioner) reconcileAuthSecret(ctx context.Context, orgs []confi
 	if err := p.upsertSecretMerge(ctx, TrinoAuthSecretName, files); err != nil {
 		return err
 	}
-	// Update even when no tenant catalogs remain: disabling must invalidate
-	// any previous authentication observation before a later re-enable.
-	p.authReadiness.SetExpected(files)
 	// The fingerprints of the bytes just projected. A pooled candidate must
 	// report loading exactly these before it may be admitted: its OPA bundle
 	// and its password file arrive by different paths and at different times,
@@ -2339,8 +1968,7 @@ func TrinoFileFingerprint(content []byte) string {
 	return "sha256:" + hex.EncodeToString(digest[:])
 }
 
-// errTrinoProjectionNotFenced means this cell does not fence its projection -
-// every legacy cell - so the caller runs the ordinary projection steps.
+// errTrinoProjectionNotFenced identifies a provisioner without an installed projection fence.
 var errTrinoProjectionNotFenced = errors.New("this cell does not fence its projection")
 
 // trinoProjection is one coherent set of projected bytes: the authentication
@@ -3320,116 +2948,6 @@ func (p *TrinoProvisioner) upsertConfigMap(ctx context.Context, name string, dat
 	return nil
 }
 
-// =====================================================================
-// HTTP implementation of TrinoCatalogClient.
-// =====================================================================
-
-// trinoCatalogHTTPClient drives the Trino REST API for catalog
-// management. Authentication is HTTP Basic (Trino's standard for the
-// file password authenticator); the configured user is
-// opa.AdminPrincipal, with the password living in a K8s Secret mounted
-// only into the provisioner pod.
-//
-// One client per provisioner instance — the underlying http.Client is
-// goroutine-safe; the username/password pair is guarded by mu and
-// updated by SetCredentials at each cluster-secrets rotation. Reads
-// per-request are uncontended in steady state (Trino REST calls are
-// once per catalog reconcile, dwarfed by HTTP round-trip time).
-type trinoCatalogHTTPClient struct {
-	baseURL  string
-	hc       *http.Client
-	mu       sync.RWMutex
-	username string
-	password string
-}
-
-// NewTrinoCatalogHTTPClient builds an HTTP-backed TrinoCatalogClient.
-// baseURL is the customer Trino coordinator endpoint. Prefer HTTPS: Trino
-// only accepts password (Basic) authentication over a secure channel — over
-// plain HTTP it routes to the insecure (passwordless) authenticator and
-// rejects a Basic password outright ("Password not allowed for insecure
-// authentication"). A plain-http baseURL therefore cannot authenticate the
-// admin principal for catalog DDL.
-//
-// tlsServerName, when non-empty, is the name the coordinator's TLS certificate
-// is verified against, overriding the baseURL host for verification (Go's
-// crypto/tls ServerName). cert-manager issues the coordinator cert for the
-// EXTERNAL hostname (e.g. trino.dw.dev.postwh.com), which doesn't match the
-// in-cluster Service address the provisioner dials; this keeps FULL cert
-// verification (chain + the overridden name) instead of disabling it. Empty =
-// standard verification against the baseURL host (correct when baseURL already
-// uses the cert hostname). Ignored for http URLs.
-//
-// Credentials are typically empty here and populated by the first
-// Reconcile via SetCredentials (after ensureClusterSecrets bootstraps
-// the admin password). Production callers MAY pre-supply credentials
-// for the rare case where the bootstrap is known upfront (e.g. tests);
-// the username defaults to opa.AdminPrincipal if empty.
-func NewTrinoCatalogHTTPClient(baseURL, username, password, tlsServerName string) TrinoCatalogClient {
-	if username == "" {
-		username = opa.AdminPrincipal
-	}
-	hc := &http.Client{Timeout: 30 * time.Second}
-	if tlsServerName != "" {
-		// Clone the default transport to keep its proxy/dial/keepalive
-		// defaults, then pin the TLS verification name. This is NOT
-		// InsecureSkipVerify — the cert chain is still validated, just against
-		// tlsServerName rather than the dialed host. Applies to every request
-		// the client makes, including the /v1/statement nextUri follow-ups.
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = &tls.Config{
-			ServerName: tlsServerName,
-			MinVersion: tls.VersionTLS12,
-		}
-		hc.Transport = transport
-	}
-	return &trinoCatalogHTTPClient{
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		hc:       hc,
-		username: username,
-		password: password,
-	}
-}
-
-// SetCredentials updates the cached Basic-auth pair. Called from the
-// provisioner's ensureClusterSecrets path after the bootstrap-or-load
-// step resolves the live admin plaintext. Idempotent and goroutine-
-// safe — concurrent readers see either the old or the new pair
-// atomically (a single in-flight statement won't observe a mixed
-// username/password).
-func (c *trinoCatalogHTTPClient) SetCredentials(username, password string) {
-	c.mu.Lock()
-	c.username = username
-	c.password = password
-	c.mu.Unlock()
-}
-
-// credentials reads the cached pair under the read lock. Used by the
-// per-request authn path.
-func (c *trinoCatalogHTTPClient) credentials() (string, string) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.username, c.password
-}
-
-// trinoStatementResponse is the subset of the Trino /v1/statement
-// response we need: nextUri for paging, plus a coarse status check.
-// The full response is much larger; we ignore the rest.
-type trinoStatementResponse struct {
-	ID      string                   `json:"id"`
-	NextURI string                   `json:"nextUri,omitempty"`
-	Stats   map[string]interface{}   `json:"stats,omitempty"`
-	Data    [][]interface{}          `json:"data,omitempty"`
-	Error   *trinoStatementErrorBody `json:"error,omitempty"`
-}
-
-type trinoStatementErrorBody struct {
-	Message   string `json:"message"`
-	ErrorCode int    `json:"errorCode"`
-	ErrorName string `json:"errorName"`
-	ErrorType string `json:"errorType"`
-}
-
 // TrinoStatementError is a statement the coordinator rejected, carrying
 // Trino's own error classification instead of flattening it into a string.
 //
@@ -3445,228 +2963,3 @@ type TrinoStatementError struct {
 func (e *TrinoStatementError) Error() string {
 	return fmt.Sprintf("trino: %s (%s): %s", e.ErrorName, e.ErrorType, e.Message)
 }
-
-// runStatement executes a single Trino statement via /v1/statement and
-// drains the nextUri chain. Returns the accumulated data rows (may be
-// empty for DDL).
-func (c *trinoCatalogHTTPClient) runStatement(ctx context.Context, sql string) ([][]interface{}, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/statement", strings.NewReader(sql))
-	if err != nil {
-		return nil, fmt.Errorf("build statement request: %w", err)
-	}
-	req.Header.Set("Content-Type", "text/plain")
-	username, password := c.credentials()
-	req.Header.Set("X-Trino-User", username)
-	req.Header.Set("X-Trino-Source", TrinoProvisionerSource)
-	req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
-
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("post statement: %w", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("post statement: status %d: %s", resp.StatusCode, string(body))
-	}
-
-	return c.drainStatement(ctx, body)
-}
-
-// trinoStatementCancelTimeout bounds the best-effort DELETE that cancels a
-// statement the drain abandons. It runs on a context detached from the
-// (already expired) reconcile context.
-const trinoStatementCancelTimeout = 5 * time.Second
-
-// drainStatement reads the nextUri chain until the statement
-// completes. Each hop is a GET; the final body carries the result
-// data (already-accumulated rows from earlier hops are kept).
-//
-// Bounded to maxDrainHops to defend against a pathological Trino
-// (or test fake) that perpetually returns a nextUri without ever
-// completing. Catalog management statements are DDL and finish in a
-// handful of hops in practice; 1000 is generous for any sane Trino.
-// Each hop also honors ctx — a cancelled reconcile context aborts
-// promptly rather than waiting for the next request to time out.
-//
-// A drain that stops early CANCELS the statement (DELETE on its nextUri).
-// Trino keeps a query whose client walked away alive until
-// query.client.timeout; until then it holds a concurrency slot in the
-// provisioner's resource group (root.admin.__admin_provisioner, 4 running).
-// Every control-plane replica reconciles, so a slow coordinator used to
-// fill that group with abandoned SHOW CATALOGS, queue the next tick's
-// statements behind them, time those out too, and never recover on its
-// own (mw-prod-us legacy cell, 2026-09-17: QUERY_QUEUE_FULL until the
-// abandoned queries were killed by hand).
-func (c *trinoCatalogHTTPClient) drainStatement(ctx context.Context, initial []byte) (rows [][]interface{}, err error) {
-	const maxDrainHops = 1000
-	var all [][]interface{}
-	body := initial
-	pending := ""
-	defer func() {
-		if err != nil && pending != "" {
-			c.cancelStatement(ctx, pending)
-		}
-	}()
-	for hop := 0; hop < maxDrainHops; hop++ {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("statement drain aborted: %w", err)
-		}
-		var r trinoStatementResponse
-		if err := json.Unmarshal(body, &r); err != nil {
-			return nil, fmt.Errorf("parse statement response: %w (body=%q)", err, string(body))
-		}
-		if r.Error != nil {
-			// Trino reported the statement failed: it is already terminal.
-			pending = ""
-			return nil, &TrinoStatementError{
-				ErrorName: r.Error.ErrorName,
-				ErrorType: r.Error.ErrorType,
-				Message:   r.Error.Message,
-			}
-		}
-		all = append(all, r.Data...)
-		if r.NextURI == "" {
-			return all, nil
-		}
-		pending = r.NextURI
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.NextURI, nil)
-		if err != nil {
-			return nil, fmt.Errorf("build nextUri request: %w", err)
-		}
-		c.setStatementHeaders(req)
-		resp, err := c.hc.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("get nextUri: %w", err)
-		}
-		body, _ = io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode/100 != 2 {
-			return nil, fmt.Errorf("get nextUri: status %d: %s", resp.StatusCode, string(body))
-		}
-	}
-	return nil, fmt.Errorf("statement drain exceeded %d hops without completing", maxDrainHops)
-}
-
-// cancelStatement asks Trino to cancel the statement behind nextURI. Best
-// effort: a failure only means the query lingers until Trino abandons it.
-func (c *trinoCatalogHTTPClient) cancelStatement(ctx context.Context, nextURI string) {
-	cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), trinoStatementCancelTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cancelCtx, http.MethodDelete, nextURI, nil)
-	if err != nil {
-		return
-	}
-	c.setStatementHeaders(req)
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		slog.Warn("Trino provisioner could not cancel an abandoned statement.", "error", err)
-		return
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-}
-
-func (c *trinoCatalogHTTPClient) setStatementHeaders(req *http.Request) {
-	username, password := c.credentials()
-	req.Header.Set("X-Trino-User", username)
-	req.Header.Set("X-Trino-Source", TrinoProvisionerSource)
-	req.Header.Set("Authorization", "Basic "+basicAuth(username, password))
-}
-
-// ListCatalogs runs SHOW CATALOGS and returns the catalog names.
-func (c *trinoCatalogHTTPClient) ListCatalogs(ctx context.Context) ([]string, error) {
-	rows, err := c.runStatement(ctx, "SHOW CATALOGS")
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, len(rows))
-	for _, r := range rows {
-		if len(r) == 0 {
-			continue
-		}
-		if s, ok := r[0].(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out, nil
-}
-
-// CreateCatalog issues CREATE CATALOG <name> USING <connector> WITH (...)
-// with the given properties.
-func (c *trinoCatalogHTTPClient) CreateCatalog(ctx context.Context, name string, props map[string]string) error {
-	connector := props["connector.name"]
-	if connector == "" {
-		return fmt.Errorf("CreateCatalog %q: connector.name property is required", name)
-	}
-	// Copy props minus connector.name into withProps; do not mutate the
-	// caller's map. (Earlier versions did `withProps := props; delete(withProps, "connector.name")`,
-	// which silently shared backing storage with the caller and stripped
-	// connector.name from their copy too.)
-	withProps := make(map[string]string, len(props))
-	for k, v := range props {
-		if k == "connector.name" {
-			continue
-		}
-		withProps[k] = v
-	}
-	sql := fmt.Sprintf("CREATE CATALOG %s USING %s%s", quoteTrinoIdentifier(name), connector, renderWithClause(withProps))
-	_, err := c.runStatement(ctx, sql)
-	return err
-}
-
-// AlterCatalog is not exercised in v1 (no property drift while
-// Lakekeeper stays allowall — see plan), but the method is wired so
-// post-v1 OAuth2 rotation has a place to go. Implemented as DROP +
-// CREATE under the hood — Trino's ALTER CATALOG covers a narrow set
-// of property updates, and the simplest sane fallback is recreate.
-func (c *trinoCatalogHTTPClient) AlterCatalog(ctx context.Context, name string, props map[string]string) error {
-	if err := c.DropCatalog(ctx, name); err != nil {
-		return fmt.Errorf("alter catalog %q (drop step): %w", name, err)
-	}
-	return c.CreateCatalog(ctx, name, props)
-}
-
-// DropCatalog issues DROP CATALOG <name>.
-func (c *trinoCatalogHTTPClient) DropCatalog(ctx context.Context, name string) error {
-	_, err := c.runStatement(ctx, "DROP CATALOG "+quoteTrinoIdentifier(name))
-	return err
-}
-
-// quoteTrinoIdentifier wraps the identifier in double quotes and
-// escapes any embedded double quote per Trino's SQL grammar.
-func quoteTrinoIdentifier(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-// renderWithClause renders a sorted-by-key `WITH ("k" = '...')` clause
-// suitable for CREATE CATALOG. Sorted output makes the SQL
-// deterministic for snapshot tests. Returns an empty string when there
-// are no properties.
-func renderWithClause(props map[string]string) string {
-	if len(props) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(props))
-	for k := range props {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf(`"%s" = '%s'`, k, strings.ReplaceAll(props[k], "'", "''")))
-	}
-	return " WITH (" + strings.Join(parts, ", ") + ")"
-}
-
-// basicAuth produces the base64-encoded value for the Authorization
-// header. Matches net/http's internal helper.
-func basicAuth(username, password string) string {
-	return base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-}
-
-// Bundle distribution is pull-based (plan "Open Questions #6"): the
-// provisioner Set()s built bundles into an opa.BundleStore; the
-// customer-Trino OPA sidecar polls opa.Handler with If-None-Match.
-// There is no provisioner-side push client. See reconcileOPABundle and
-// TrinoProvisionerOpts.BundleStore.

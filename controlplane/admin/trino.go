@@ -48,10 +48,8 @@ type TrinoOrgStore interface {
 type TrinoCell struct {
 	ID string `json:"id"`
 	// StoredID separates persisted ownership from the API identity. Empty uses ID.
-	StoredID       string `json:"-"`
-	CoordinatorURL string `json:"coordinator_url"`
-	TLSServerName  string `json:"-"`
-	ClientURL      string `json:"-"`
+	StoredID  string `json:"-"`
+	ClientURL string `json:"-"`
 }
 
 func (c TrinoCell) storedID() string {
@@ -82,9 +80,6 @@ func (c TrinoCell) ServiceCredentialConnection(principal, credentialID string) *
 		return nil
 	}
 	clientURL := c.ClientURL
-	if clientURL == "" {
-		clientURL = c.CoordinatorURL
-	}
 	_, perOrgHost, _ := ResolveTrinoClientURL(clientURL, principal)
 	if perOrgHost {
 		connection.Username = credentialID
@@ -155,9 +150,6 @@ func (c TrinoCell) connectionFor(principal string) *TrinoConnection {
 	}
 
 	clientURL := c.ClientURL
-	if clientURL == "" {
-		clientURL = c.CoordinatorURL
-	}
 	clientURL, perOrgHost, ok := ResolveTrinoClientURL(clientURL, principal)
 	if !ok {
 		return nil
@@ -176,9 +168,6 @@ func (c TrinoCell) connectionFor(principal string) *TrinoConnection {
 	}
 
 	host := parsedClientURL.Hostname()
-	if c.ClientURL == "" && c.TLSServerName != "" {
-		host = c.TLSServerName
-	}
 
 	username := principal
 	if perOrgHost {
@@ -347,7 +336,7 @@ func (a *TrinoAPI) index() (principalIndex, error) {
 	if a.filterCell {
 		idx.rows = nil
 		for _, row := range rows {
-			if row.CellID == a.cell.storedID() || (row.CellID == "" && a.cell.ID == "legacy") {
+			if row.CellID == a.cell.storedID() {
 				idx.rows = append(idx.rows, row)
 			}
 		}

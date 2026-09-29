@@ -224,12 +224,4 @@ func TestPooledCellWiresThePoolObserver(t *testing.T) {
 		t.Fatalf("usage observers = %v, want exactly the pool observer", wire.Observers)
 	}
 
-	fixed := trinoCell{ID: "cell-legacy", Namespace: "legacy", CoordinatorURL: "https://legacy.example.test"}
-	wire, err = buildTrinoCellWiring(store, kc, ducklings, fixed)
-	if err != nil {
-		t.Fatalf("wire fixed cell: %v", err)
-	}
-	if _, ok := wire.Console.Observer.(*trinoPoolObserver); ok {
-		t.Fatal("a fixed cell was given the pool observer")
-	}
 }

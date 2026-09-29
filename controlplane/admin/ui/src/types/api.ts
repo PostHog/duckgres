@@ -760,7 +760,6 @@ export interface HotIdleOrg {
 
 export interface TrinoCell {
   id: string;
-  coordinator_url: string;
 }
 
 // TrinoQuery.query is REDACTED server-side (usersecrets.RedactForLog) — raw

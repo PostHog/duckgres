@@ -198,7 +198,7 @@ export function trinoUnavailableReason(status: TrinoStatus | undefined): TrinoUn
 export function trinoUnavailableMessage(reason: TrinoUnavailableReason): string {
   switch (reason) {
     case "no_cell":
-      return "This control plane has no Trino cell configured (DUCKGRES_TRINO_COORDINATOR_URL is unset).";
+      return "This control plane has no Trino shared pool configured. Check DUCKGRES_TRINO_CELLS_FILE.";
     case "unauthorized":
       return "The coordinator rejected the control plane's observer credential. The cell's OPA bundle may not have rolled out yet.";
     case "unreachable":

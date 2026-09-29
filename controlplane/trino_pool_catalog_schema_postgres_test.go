@@ -64,7 +64,7 @@ func TestCatalogWriterPublishesInsideItsGrantedSchema(t *testing.T) {
 
 	lease := configstore.TrinoPoolLease{PoolID: "registered:example-pool", Owner: "cp-test", Epoch: 1}
 	writer, err := buildTrinoPoolCatalogWriter(lease.PoolID, nil,
-		func() (configstore.TrinoPoolLease, bool) { return lease, true }, nil)
+		func() (configstore.TrinoPoolLease, bool) { return lease, true })
 	if err != nil {
 		t.Fatalf("build the catalog writer as the scoped publisher role: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestCatalogWriterRefusesAnUnconfiguredSchema(t *testing.T) {
 	t.Setenv(envTrinoPoolCatalogSchema, "")
 
 	if _, err := buildTrinoPoolCatalogWriter("registered:example-pool", nil,
-		func() (configstore.TrinoPoolLease, bool) { return configstore.TrinoPoolLease{}, false }, nil); err == nil {
+		func() (configstore.TrinoPoolLease, bool) { return configstore.TrinoPoolLease{}, false }); err == nil {
 		t.Fatal("the writer was built with no schema configured")
 	}
 
@@ -139,7 +139,7 @@ func TestCatalogWriterRefusesAnUnconfiguredSchema(t *testing.T) {
 	// interpolated into a connection parameter.
 	t.Setenv(envTrinoPoolCatalogSchema, `weird"; DROP TABLE x --`)
 	if _, err := buildTrinoPoolCatalogWriter("registered:example-pool", nil,
-		func() (configstore.TrinoPoolLease, bool) { return configstore.TrinoPoolLease{}, false }, nil); err == nil {
+		func() (configstore.TrinoPoolLease, bool) { return configstore.TrinoPoolLease{}, false }); err == nil {
 		t.Fatal("a schema name needing quotes was accepted")
 	}
 }

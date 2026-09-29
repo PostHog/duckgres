@@ -528,8 +528,6 @@ func SetupMultiTenant(
 	// Start provisioning controller (best-effort — K8s API may not be available locally)
 	var trinoCells trinoFleet
 	var trinoDefaultCell string
-	var rolloutReadiness *trinoRolloutReadinessHandler
-	var rolloutProvisioning *trinoRolloutProvisioningHandler
 	provCtrl, err := provisioner.NewController(store, 10*time.Second)
 	if err != nil {
 		// Without the controller, the Trino reconcile loop cannot run.
@@ -572,19 +570,11 @@ func SetupMultiTenant(
 				// that. So a nil here is a wiring bug.
 				return nil, nil, nil, nil, nil, nil, fmt.Errorf("trino provisioner enabled but buildTrinoWiring returned no wiring; this should be unreachable")
 			}
-			rolloutReadiness, twErr = buildTrinoRolloutReadiness(trinoWire, store)
-			if twErr != nil {
-				return nil, nil, nil, nil, nil, nil, twErr
-			}
-			rolloutProvisioning, twErr = buildTrinoManagedFleet(trinoWire, store, rolloutReadiness)
-			if twErr != nil {
-				return nil, nil, nil, nil, nil, nil, twErr
-			}
 			provCtrl.WithTrinoReconciler(trinoWire)
 			trinoCells = trinoWire
 			trinoDefaultCell = defaultCell
 			for _, wire := range trinoWire {
-				slog.Info("Trino provisioner enabled.", "cell", wire.Cell.consoleCell().ID, "coordinator", wire.Cell.CoordinatorURL)
+				slog.Info("Trino provisioner enabled.", "cell", wire.Cell.consoleCell().ID)
 			}
 		}
 		// SIGTERM stops the reconcile loop immediately, rather than letting a
@@ -843,20 +833,6 @@ func SetupMultiTenant(
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("shared Trino pool wiring failed: %w", poolErr)
 	}
 	attachTrinoPoolOperators(janitorLeader, poolOperators)
-
-	if rolloutReadiness == nil {
-		var rolloutErr error
-		rolloutReadiness, rolloutErr = buildTrinoRolloutReadiness(trinoCells, store)
-		if rolloutErr != nil {
-			return nil, nil, nil, nil, nil, nil, rolloutErr
-		}
-	}
-	if rolloutReadiness != nil {
-		engine.Any(rolloutReadinessPrefix+"*slot", gin.WrapH(rolloutReadiness))
-	}
-	if rolloutProvisioning != nil {
-		engine.Any(trinoRolloutProvisioningPrefix+"*group", gin.WrapH(rolloutProvisioning))
-	}
 
 	// Trino OPA bundle endpoint. Mounted OUTSIDE the /api/v1 admin group on
 	// purpose — it does its own bearer-token auth (the bundle exposes the

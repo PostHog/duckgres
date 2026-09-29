@@ -146,38 +146,6 @@ func TestTrinoHoglakeFailedRegistrationStillProtectsMetadata(t *testing.T) {
 	}
 }
 
-type hoglakeTargetCatalog struct{ *hoglakeTestCatalog }
-
-func (c *hoglakeTargetCatalog) CatalogStates(context.Context) (map[string]string, error) {
-	return map[string]string{"org_tenant_a": "OPERATIONAL"}, nil
-}
-
-func TestTrinoHoglakeRolloutCertificationNeverBootstraps(t *testing.T) {
-	for _, missing := range []string{"catalog", "namespace"} {
-		t.Run(missing, func(t *testing.T) {
-			h, lifecycle, _ := managedHarness(t)
-			org := configstore.TrinoEnabledOrg{OrgID: "tenant-a", DatabaseName: "tenant_a", Backend: configstore.TrinoBackendHoglake, HoglakeInitialized: true}
-			h.store.orgs = []configstore.TrinoEnabledOrg{org}
-			lifecycle.admitted = []configstore.TrinoEnabledOrg{org}
-			warehouse := readyWarehouse(org.OrgID)
-			warehouse.DucklingName = "warehouse-a"
-			h.warehouses.rows[org.OrgID] = warehouse
-			fixture := &hoglakeMetadataFixture{catalog: missing != "catalog", namespace: missing != "namespace"}
-			srv := httptest.NewServer(http.HandlerFunc(fixture.serve))
-			defer srv.Close()
-			h.provisioner.managedHoglake = &TrinoManagedHoglakeConfig{URI: srv.URL, DataPath: "s3://example-bucket/trino/", Namespace: "main"}
-			target := &hoglakeTargetCatalog{&hoglakeTestCatalog{fakeCatalogClient: &fakeCatalogClient{existing: []string{"org_tenant_a"}}, connector: "hoglake"}}
-			h.provisioner.managed.Target = func(context.Context, *configstore.TrinoCellFreeze) (*TrinoManagedBackend, error) {
-				return &TrinoManagedBackend{Name: "green", Catalog: target}, nil
-			}
-			err := h.provisioner.prepareManagedTarget(context.Background(), configstore.TrinoCellLease{}, &configstore.TrinoCellFreeze{Stable: true, TargetBackend: "green"}, tenantSecretProjection{projected: map[string]bool{org.OrgID: true}})
-			if err == nil || lifecycle.certificate != nil || fixture.posts != 0 {
-				t.Fatal("rollout certification recreated or accepted lost metadata")
-			}
-		})
-	}
-}
-
 func (s *fakeTrinoStore) GetTrinoHoglakeInitialized(_ context.Context, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

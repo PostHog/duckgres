@@ -18,7 +18,7 @@ func TestTrinoDefaultCellConfiguration(t *testing.T) {
 		{"padded mode", "pool-test", " shared-pool ", true, true, false},
 		{"unknown", "missing", trinoPoolModeShared, true, true, true},
 		{"legacy", "legacy", trinoPoolModeShared, true, true, true},
-		{"fixed", "pool-test", trinoPoolModeFixed, true, true, true},
+		{"fixed", "pool-test", "fixed", true, true, true},
 		{"no admission", "pool-test", trinoPoolModeShared, false, true, true},
 		{"disabled gates", "pool-test", trinoPoolModeShared, true, false, true},
 	} {
@@ -56,7 +56,7 @@ func TestTrinoDefaultCellRegistryWiring(t *testing.T) {
 	if err := os.WriteFile(path, body, 0600); err != nil {
 		t.Fatal(err)
 	}
-	withPoolEnv(t, map[string]string{envTrinoCellsFile: path, envTrinoRegistryOnly: "true", envTrinoCoordinatorURL: "", envTrinoDefaultCell: "cell-001", envTrinoPoolEnabled: "true", envTrinoPoolOperatorEnabled: "true", envTrinoPoolCatalogWriter: "true"})
+	withPoolEnv(t, map[string]string{envTrinoCellsFile: path, envTrinoDefaultCell: "cell-001", envTrinoPoolEnabled: "true", envTrinoPoolOperatorEnabled: "true", envTrinoPoolCatalogWriter: "true"})
 	cells, id, err := resolveTrinoCells()
 	if err != nil {
 		t.Fatal(err)

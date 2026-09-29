@@ -27,9 +27,6 @@ func TestTrinoInitialSelectionPreservesOwnershipPostgres(t *testing.T) {
 	if err := store.EnableTrino("tenant", configstore.TrinoSettings{DefaultCellID: "registered:default-pool"}); err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := store.ClaimTrinoCell("tenant", "cell-001"); err != nil || claimed {
-		t.Fatalf("legacy stole selected tenant: %v %v", claimed, err)
-	}
 	if err := store.DisableTrino("tenant"); err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +64,6 @@ func testTrinoSelectionRace(t *testing.T, defaultCell string) {
 		start := make(chan struct{})
 		var wg sync.WaitGroup
 		var selectionErr, claimErr error
-		var claimed bool
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -77,9 +73,7 @@ func testTrinoSelectionRace(t *testing.T, defaultCell string) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if claimErr = store.EnableTrino(org, configstore.TrinoSettings{DefaultCellID: defaultCell}); claimErr == nil {
-				claimed, claimErr = store.ClaimTrinoCell(org, "cell-001")
-			}
+			claimErr = store.EnableTrino(org, configstore.TrinoSettings{DefaultCellID: defaultCell})
 		}()
 		close(start)
 		wg.Wait()
@@ -88,16 +82,12 @@ func testTrinoSelectionRace(t *testing.T, defaultCell string) {
 		}
 		row := trinoRow(t, store, org)
 		if selectionErr == nil {
-			if claimed || row.TrinoCellID != "registered:cell-001" {
-				t.Fatalf("successful selection lost ownership: claim=%v row=%+v", claimed, row)
+			if row.TrinoCellID != "registered:cell-001" {
+				t.Fatalf("successful selection lost ownership: row=%+v", row)
 			}
 		} else {
-			wantOwner, wantClaim := defaultCell, false
-			if defaultCell == "" {
-				wantOwner, wantClaim = "cell-001", true
-			}
-			if claimed != wantClaim || row.TrinoCellID != wantOwner {
-				t.Fatalf("enablement winner not authoritative: claim=%v row=%+v", claimed, row)
+			if row.TrinoCellID != defaultCell {
+				t.Fatalf("enablement winner not authoritative: row=%+v", row)
 			}
 		}
 	}
@@ -121,11 +111,8 @@ func TestTrinoSelectionRejectsUnknownWarehouseAndEnabledRowPostgres(t *testing.T
 	if err := store.SelectTrinoCell("tenant", "registered:cell-001"); !errors.Is(err, configstore.ErrTrinoCellSelectionConflict) {
 		t.Fatalf("selection after enable must fail: %v", err)
 	}
-	if claimed, err := store.ClaimTrinoCell("tenant", "cell-001"); err != nil || !claimed {
-		t.Fatalf("first claim: %v %v", claimed, err)
-	}
-	if claimed, err := store.ClaimTrinoCell("tenant", "registered:cell-001"); err != nil || claimed {
-		t.Fatalf("second claim: %v %v", claimed, err)
+	if err := store.DB().Model(&configstore.ManagedWarehouseTrino{}).Where("org_id = ?", "tenant").Update("trino_cell_id", "cell-001").Error; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -141,8 +128,8 @@ func TestTrinoMoveCellPostgres(t *testing.T) {
 	if err := store.EnableTrino("tenant", configstore.TrinoSettings{}); err != nil {
 		t.Fatal(err)
 	}
-	if claimed, err := store.ClaimTrinoCell("tenant", "cell-001"); err != nil || !claimed {
-		t.Fatalf("legacy claim: %v %v", claimed, err)
+	if err := store.DB().Model(&configstore.ManagedWarehouseTrino{}).Where("org_id = ?", "tenant").Update("trino_cell_id", "cell-001").Error; err != nil {
+		t.Fatal(err)
 	}
 	now := time.Now().UTC()
 	if err := store.UpdateTrinoState("tenant", configstore.TrinoStateUpdate{State: configstore.ManagedWarehouseStateReady, ReadyAt: &now}); err != nil {
@@ -183,9 +170,6 @@ func TestTrinoMoveCellPostgres(t *testing.T) {
 	}
 
 	// The legacy claim path cannot take the moved org back.
-	if claimed, err := store.ClaimTrinoCell("tenant", "cell-001"); err != nil || claimed {
-		t.Fatalf("legacy reclaimed a moved org: %v %v", claimed, err)
-	}
 	// And moving back is the same operation in the other direction.
 	if err := store.MoveTrinoCell("tenant", "registered:cell-001", "cell-001"); err != nil {
 		t.Fatalf("move back: %v", err)
@@ -208,7 +192,7 @@ func TestTrinoMoveCellRacesPostgres(t *testing.T) {
 		if err := store.EnableTrino(org, configstore.TrinoSettings{}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.ClaimTrinoCell(org, "cell-001"); err != nil {
+		if err := store.DB().Model(&configstore.ManagedWarehouseTrino{}).Where("org_id = ?", org).Update("trino_cell_id", "cell-001").Error; err != nil {
 			t.Fatal(err)
 		}
 		start := make(chan struct{})

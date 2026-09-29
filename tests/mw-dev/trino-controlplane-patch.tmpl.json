@@ -1,68 +1,34 @@
 {
-  "spec": {
-    "template": {
-      "spec": {
-        "containers": [
-          {
-            "name": "controlplane",
-            "env": [
-              {
-                "name": "DUCKGRES_TRINO_COORDINATOR_URL",
-                "value": "https://duckgres-trino.${NAMESPACE}.svc:8443"
-              },
-              {
-                "name": "DUCKGRES_TRINO_COORDINATOR_SERVER_NAME",
-                "value": "duckgres-trino.${NAMESPACE}.svc"
-              },
-              {
-                "name": "DUCKGRES_TRINO_CLIENT_URL",
-                "value": "https://duckgres-trino.${NAMESPACE}.svc:8443"
-              },
-              {
-                "name": "DUCKGRES_TRINO_NAMESPACE",
-                "value": "${NAMESPACE}"
-              },
-              {
-                "name": "DUCKGRES_TRINO_CELL_ID",
-                "value": "ci-pr-${PR_NUMBER}"
-              },
-              {
-                "name": "DUCKGRES_TRINO_AWS_REGION",
-                "value": "us-east-1"
-              },
-              {
-                "name": "SSL_CERT_FILE",
-                "value": "/etc/duckgres/trino-ca/ca.crt"
-              },
-              {
-                "name": "DUCKGRES_TRINO_FILESYSTEM_CACHE_ENABLED",
-                "value": "${TRINO_FILESYSTEM_CACHE_ENABLED}"
-              }
-            ],
-            "volumeMounts": [
-              {
-                "name": "trino-ca",
-                "mountPath": "/etc/duckgres/trino-ca",
-                "readOnly": true
-              }
-            ]
-          }
-        ],
-        "volumes": [
-          {
-            "name": "trino-ca",
-            "secret": {
-              "secretName": "duckgres-trino-tls",
-              "items": [
-                {
-                  "key": "ca.crt",
-                  "path": "ca.crt"
-                }
-              ]
-            }
-          }
-        ]
-      }
-    }
-  }
+  "spec": {"template": {"spec": {
+    "containers": [{"name": "controlplane", "env": [
+      {"name": "DUCKGRES_TRINO_CELLS_FILE", "value": "/etc/duckgres/trino-pool/cells.json"},
+      {"name": "DUCKGRES_TRINO_DEFAULT_CELL", "value": "pool-test"},
+      {"name": "DUCKGRES_TRINO_AWS_REGION", "value": "us-east-1"},
+      {"name": "DUCKGRES_TRINO_POOL_ENABLED", "value": "true"},
+      {"name": "DUCKGRES_TRINO_POOL_OPERATOR_ENABLED", "value": "true"},
+      {"name": "DUCKGRES_TRINO_POOL_CATALOG_WRITER_ENABLED", "value": "true"},
+      {"name": "DUCKGRES_TRINO_POOL_CATALOG_BOOTSTRAP", "value": "true"},
+      {"name": "DUCKGRES_TRINO_POOL_CATALOG_SCHEMA", "value": "public"},
+      {"name": "DUCKGRES_TRINO_POOL_CATALOG_CELL_ID", "value": "ci-pr-${PR_NUMBER}"},
+      {"name": "DUCKGRES_TRINO_POOL_CATALOG_DSN_FILE", "value": "/etc/duckgres/trino-store/dsn"},
+      {"name": "DUCKGRES_TRINO_POOL_CONFIG_CONFIGMAP", "value": "trino-pool-config"},
+      {"name": "DUCKGRES_TRINO_POOL_CONFIG_NAMESPACE", "value": "${NAMESPACE}"},
+      {"name": "DUCKGRES_TRINO_POOL_PUBLISHER_IMAGE", "value": "${CONTROLPLANE_IMAGE}"},
+      {"name": "DUCKGRES_TRINO_POOL_GATEWAY_URL", "value": "https://duckgres-trino-gateway.${NAMESPACE}.svc:8443"},
+      {"name": "DUCKGRES_TRINO_ROLLOUT_TOKEN_FILE", "value": "/etc/duckgres/trino-gateway/admin-token"},
+      {"name": "DUCKGRES_TRINO_MANAGED_GATEWAY_USERNAME", "value": "cell-rollout"},
+      {"name": "SSL_CERT_FILE", "value": "/etc/duckgres/trino-ca/ca.crt"}
+    ], "volumeMounts": [
+      {"name": "trino-pool", "mountPath": "/etc/duckgres/trino-pool", "readOnly": true},
+      {"name": "trino-store", "mountPath": "/etc/duckgres/trino-store", "readOnly": true},
+      {"name": "trino-gateway", "mountPath": "/etc/duckgres/trino-gateway", "readOnly": true},
+      {"name": "trino-ca", "mountPath": "/etc/duckgres/trino-ca", "readOnly": true}
+    ]}],
+    "volumes": [
+      {"name": "trino-pool", "configMap": {"name": "trino-pool-config"}},
+      {"name": "trino-store", "secret": {"secretName": "duckgres-config-store-credentials"}},
+      {"name": "trino-gateway", "secret": {"secretName": "trino-shared-gateway"}},
+      {"name": "trino-ca", "secret": {"secretName": "duckgres-trino-tls", "items": [{"key": "ca.crt", "path": "ca.crt"}]}}
+    ]
+  }}}
 }

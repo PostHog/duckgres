@@ -41,8 +41,7 @@ type TrinoSettings struct {
 // `POST /orgs/:id/trino` endpoint.
 //
 // A validated deployment default fills an unassigned cell atomically with
-// enablement. Existing ownership always wins. Without a default, legacy
-// reconciliation retains its conditional claim behavior.
+// enablement. Existing ownership always wins. Unassigned rows remain unassigned.
 func (cs *ConfigStore) EnableTrino(orgID string, settings TrinoSettings) error {
 	if orgID == "" {
 		return errors.New("EnableTrino: orgID is required")
@@ -210,42 +209,6 @@ func (cs *ConfigStore) UpdateTrinoState(orgID string, upd TrinoStateUpdate) erro
 		return fmt.Errorf("update trino state for %q: %w", orgID, result.Error)
 	}
 	return nil
-}
-
-// AssignTrinoCell claims an UNASSIGNED Trino-enabled org into a cell. The
-// WHERE clause is the whole point: it only ever writes a row whose
-// trino_cell_id is empty/NULL, so a second cell's provisioner can never
-// steal an org that this cell already owns (which would leave two
-// coordinators projecting the same tenant's credentials and catalog).
-// Moving an org between cells is deliberately NOT expressible here — it
-// needs a drain of the source cell's catalog first and is out of scope.
-//
-// RowsAffected==0 is not an error: it means the row was claimed by someone
-// else (or disabled) between the list and the write. The next tick re-reads
-// and skips the org because its cell no longer matches.
-func (cs *ConfigStore) AssignTrinoCell(orgID, cellID string) error {
-	_, err := cs.ClaimTrinoCell(orgID, cellID)
-	return err
-}
-
-// ClaimTrinoCell reports whether this call acquired the previously unassigned row.
-func (cs *ConfigStore) ClaimTrinoCell(orgID, cellID string) (bool, error) {
-	if orgID == "" {
-		return false, errors.New("ClaimTrinoCell: orgID is required")
-	}
-	if cellID == "" {
-		return false, errors.New("ClaimTrinoCell: cellID is required")
-	}
-	result := cs.db.Model(&ManagedWarehouseTrino{}).
-		Where("org_id = ? AND enabled = ? AND (trino_cell_id IS NULL OR trino_cell_id = ?)", orgID, true, "").
-		Updates(map[string]interface{}{
-			"trino_cell_id": cellID,
-			"updated_at":    time.Now().UTC(),
-		})
-	if result.Error != nil {
-		return false, fmt.Errorf("assign trino cell for %q: %w", orgID, result.Error)
-	}
-	return result.RowsAffected == 1, nil
 }
 
 var (

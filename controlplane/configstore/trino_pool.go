@@ -96,7 +96,7 @@ func (s TrinoPoolSpec) validate() error {
 	if s.PoolID == "" || s.PublicID == "" {
 		return errors.New("trino pool spec requires a pool identity")
 	}
-	if s.APIMode != TrinoPoolAPIModeLegacy && s.APIMode != TrinoPoolAPIModeShared {
+	if s.APIMode != TrinoPoolAPIModeShared {
 		return fmt.Errorf("unsupported trino pool api mode %q", s.APIMode)
 	}
 	// A desired count of zero is missing configuration, never an instruction to

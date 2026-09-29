@@ -3,165 +3,38 @@
 package controlplane
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestTrinoRegistryRuntimePreservesLegacyAndSkipsStoppedBackend(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cells.json")
-	if err := os.WriteFile(path, []byte(testTrinoRegistryJSON), 0600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(envTrinoCellsFile, path)
-	t.Setenv(envTrinoCoordinatorURL, "https://legacy.example.test")
-	t.Setenv(envTrinoCellID, "cell-001")
-	t.Setenv(envTrinoNamespace, "trino-legacy")
-	cells, _, err := resolveTrinoCells()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cells) != 2 || cells[0].ID != "cell-001" || cells[0].consoleCell().ID != "legacy" {
-		t.Fatalf("legacy ownership changed: %+v", cells)
-	}
-	if cells[1].ID != "registered:cell-test" || cells[1].consoleCell().ID != "cell-test" {
-		t.Fatalf("registry storage identity collision: %+v", cells[1])
-	}
-	if cells[1].CoordinatorURL != "https://blue.example.test" || len(cells[1].Backends) != 2 {
-		t.Fatal("runtime discarded blue or stopped green")
-	}
-	t.Setenv(envTrinoCoordinatorURL, "")
-	if _, _, err := resolveTrinoCells(); err == nil {
-		t.Fatal("registry silently removed legacy")
-	}
-}
-
 const testTrinoRegistryJSON = `{"cells":[{"id":"cell-test","namespace":"trino-test","client_url":"https://gateway.example.test","routing_group":"cell-test","backends":[{"id":"blue","coordinator_url":"https://blue.example.test","running":true,"routing_active":true,"internal_secret_name":"blue-internal"},{"id":"green","coordinator_url":"https://green.example.test","running":false,"routing_active":false,"internal_secret_name":"green-internal"}]}]}`
+const testTrinoPoolRegistryJSON = `{"cells":[{"id":"cell-test","namespace":"trino-test","client_url":"https://gateway.example.test","routing_group":"cell-test","mode":"shared-pool","pool":{"coordinator_service_port":8080}}]}`
 
-func TestTrinoRegistryOnlyRequiresExplicitValidConfiguration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cells.json")
-	if err := os.WriteFile(path, []byte(testTrinoRegistryJSON), 0600); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		name, mode, url, file string
-		valid                 bool
-	}{
-		{"explicit", "true", "", path, true},
-		{"default still requires legacy", "", "", path, false},
-		{"disabled still requires legacy", "false", "", path, false},
-		{"mixed", "true", "https://legacy.example.test", path, false},
-		{"missing registry", "true", "", "", false},
-		{"unreadable registry", "true", "", path + "-missing", false},
-		{"invalid boolean", "invalid", "", path, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("DUCKGRES_TRINO_REGISTRY_ONLY", tc.mode)
-			t.Setenv(envTrinoCoordinatorURL, tc.url)
-			t.Setenv(envTrinoCellsFile, tc.file)
-			if !trinoProvisionerEnabled() {
-				t.Fatal("explicit or invalid Trino configuration must reach startup validation")
-			}
-			cells, _, err := resolveTrinoCells()
-			if (err == nil) != tc.valid {
-				t.Fatalf("valid=%v error=%v", tc.valid, err)
-			}
-			if tc.valid && (len(cells) != 1 || cells[0].PublicID != "cell-test" || cells[0].ID != "registered:cell-test") {
-				t.Fatalf("unexpected registry-only fleet: %+v", cells)
-			}
-		})
-	}
-}
-
-func TestTrinoRegistryOnlyDisabledLeavesUnconfiguredDeploymentOff(t *testing.T) {
-	t.Setenv(envTrinoCoordinatorURL, "")
-	t.Setenv(envTrinoCellsFile, "")
-	for _, value := range []string{"", "false", "0"} {
-		t.Setenv(envTrinoRegistryOnly, value)
-		if trinoProvisionerEnabled() {
-			t.Fatalf("disabled mode %q unexpectedly enabled Trino", value)
+func TestTrinoRegistryAcceptsSharedPools(t *testing.T) {
+	for _, endpoint := range []string{"https://gateway.example.test", "https://{database_name}.example.test"} {
+		cells, err := parseTrinoCellRegistry([]byte(strings.Replace(testTrinoPoolRegistryJSON, "https://gateway.example.test", endpoint, 1)))
+		if err != nil || len(cells) != 1 || cells[0].ID != "cell-test" {
+			t.Fatalf("cells=%+v error=%v", cells, err)
 		}
 	}
 }
 
-func TestTrinoRegistryPreservesStoppedBackend(t *testing.T) {
-	cells, err := parseTrinoCellRegistry([]byte(testTrinoRegistryJSON))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cells) != 1 || cells[0].ID != "cell-test" {
-		t.Fatalf("unexpected cell identities: %+v", cells)
-	}
-	if len(cells[0].Backends) != 2 || !cells[0].Backends[0].Running || cells[0].Backends[1].Running || cells[0].Backends[1].RoutingActive {
-		t.Fatalf("stopped backend configuration changed: %+v", cells[0].Backends)
-	}
-}
-
-// A per-org client URL gives every org the host name it already uses for
-// pgwire; the placeholder is validated as the org label it will become.
-func TestTrinoRegistryAcceptsPerOrgClientHost(t *testing.T) {
-	data := strings.Replace(testTrinoRegistryJSON, `https://gateway.example.test`, `https://{database_name}.example.test`, 1)
-	cells, err := parseTrinoCellRegistry([]byte(data))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cells[0].ClientURL != "https://{database_name}.example.test" {
-		t.Fatalf("client URL = %q", cells[0].ClientURL)
-	}
-}
-
 func TestTrinoRegistryRejectsUnsafeConfiguration(t *testing.T) {
-	tests := map[string]string{
-		"unknown field":                 strings.Replace(testTrinoRegistryJSON, `"cells":`, `"typo":`, 1),
-		"reserved legacy identity":      strings.Replace(testTrinoRegistryJSON, `"id":"cell-test"`, `"id":"legacy"`, 1),
-		"unsafe namespace":              strings.Replace(testTrinoRegistryJSON, `"namespace":"trino-test"`, `"namespace":"../other"`, 1),
-		"credentials field":             strings.Replace(testTrinoRegistryJSON, `"cells":`, `"password":"secret","cells":`, 1),
-		"empty registry":                `{"cells":[]}`,
-		"no backends":                   `{"cells":[{"id":"cell-test","namespace":"trino-test","client_url":"https://gateway.example.test","routing_group":"cell-test","backends":[]}]}`,
-		"plain HTTP":                    strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `http://blue.example.test`, 1),
-		"embedded credentials":          strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://user:secret@blue.example.test`, 1),
-		"URL query":                     strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://blue.example.test?token=value`, 1),
-		"URL path":                      strings.Replace(testTrinoRegistryJSON, `https://blue.example.test`, `https://blue.example.test/catalogs`, 1),
-		"active backend stopped":        strings.Replace(testTrinoRegistryJSON, `"running":true`, `"running":false`, 1),
-		"no active backend":             strings.Replace(testTrinoRegistryJSON, `"routing_active":true`, `"routing_active":false`, 1),
-		"two active backends":           strings.Replace(testTrinoRegistryJSON, `"running":false,"routing_active":false`, `"running":true,"routing_active":true`, 1),
-		"duplicate backend identity":    strings.Replace(testTrinoRegistryJSON, `"id":"green"`, `"id":"blue"`, 1),
-		"duplicate endpoint":            strings.Replace(testTrinoRegistryJSON, `https://green.example.test`, `https://blue.example.test`, 1),
-		"duplicate canonical endpoint":  strings.Replace(testTrinoRegistryJSON, `https://green.example.test`, `https://BLUE.example.test.:0443/`, 1),
-		"shared internal secret":        strings.Replace(testTrinoRegistryJSON, `green-internal`, `blue-internal`, 1),
-		"invalid internal secret":       strings.Replace(testTrinoRegistryJSON, `green-internal`, `../other`, 1),
-		"header injection":              strings.Replace(testTrinoRegistryJSON, `"routing_group":"cell-test"`, `"routing_group":"cell-test\r\nHost: other"`, 1),
-		"trailing document":             testTrinoRegistryJSON + `{}`,
-		"placeholder not leading label": strings.Replace(testTrinoRegistryJSON, `https://gateway.example.test`, `https://gateway.{database_name}.example.test`, 1),
-		"placeholder in path":           strings.Replace(testTrinoRegistryJSON, `https://gateway.example.test`, `https://gateway.example.test/{database_name}`, 1),
-	}
-	for name, data := range tests {
-		t.Run(name, func(t *testing.T) {
-			if _, err := parseTrinoCellRegistry([]byte(data)); err == nil {
-				t.Fatal("unsafe registry accepted")
-			}
-		})
-	}
-}
-
-func TestTrinoRegistryRuntimeRejectsLegacyCollisions(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cells.json")
-	if err := os.WriteFile(path, []byte(testTrinoRegistryJSON), 0600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(envTrinoCellsFile, path)
-	t.Setenv(envTrinoCoordinatorURL, "https://legacy.example.test")
-	t.Setenv(envTrinoNamespace, "legacy")
-	t.Setenv(envTrinoCellID, "legacy-owned")
-	for _, tc := range []struct{ name, key, value string }{
-		{"namespace", envTrinoNamespace, "trino-test"},
-		{"endpoint", envTrinoCoordinatorURL, "https://blue.example.test.:0443/"},
-		{"storage prefix", envTrinoCellID, "registered:cell-test"},
+	for name, body := range map[string]string{
+		"unknown field":     strings.Replace(testTrinoPoolRegistryJSON, `"cells":`, `"typo":`, 1),
+		"unsafe namespace":  strings.Replace(testTrinoPoolRegistryJSON, `"namespace":"trino-test"`, `"namespace":"../other"`, 1),
+		"invalid group":     strings.Replace(testTrinoPoolRegistryJSON, `"routing_group":"cell-test"`, `"routing_group":"bad group"`, 1),
+		"legacy identity":   strings.Replace(testTrinoPoolRegistryJSON, `"id":"cell-test"`, `"id":"legacy"`, 1),
+		"empty registry":    `{"cells":[]}`,
+		"fixed topology":    testTrinoRegistryJSON,
+		"unknown topology":  strings.Replace(testTrinoPoolRegistryJSON, "shared-pool", "unknown", 1),
+		"credentials":       strings.Replace(testTrinoPoolRegistryJSON, "https://gateway.example.test", "https://user:secret@example.test", 1),
+		"plain HTTP":        strings.Replace(testTrinoPoolRegistryJSON, "https://gateway.example.test", "http://gateway.example.test", 1),
+		"bad placeholder":   strings.Replace(testTrinoPoolRegistryJSON, "https://gateway.example.test", "https://gateway.{database_name}.example.test", 1),
+		"trailing document": testTrinoPoolRegistryJSON + `{}`,
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(tc.key, tc.value)
-			if _, _, err := resolveTrinoCells(); err == nil {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseTrinoCellRegistry([]byte(body)); err == nil {
 				t.Fatal("unsafe registry accepted")
 			}
 		})
@@ -169,17 +42,16 @@ func TestTrinoRegistryRuntimeRejectsLegacyCollisions(t *testing.T) {
 }
 
 func TestTrinoRegistryRejectsDuplicateCellOwnership(t *testing.T) {
-	cell := strings.TrimSuffix(strings.TrimPrefix(testTrinoRegistryJSON, `{"cells":[`), `]}`)
-	other := strings.NewReplacer("cell-test", "cell-other", "trino-test", "trino-other", "blue.example", "other-blue.example", "green.example", "other-green.example").Replace(cell)
+	cell := strings.TrimSuffix(strings.TrimPrefix(testTrinoPoolRegistryJSON, `{"cells":[`), `]}`)
+	other := strings.NewReplacer("cell-test", "cell-other", "trino-test", "trino-other").Replace(cell)
 	for name, second := range map[string]string{
 		"identity":      strings.Replace(other, `"id":"cell-other"`, `"id":"cell-test"`, 1),
 		"namespace":     strings.Replace(other, "trino-other", "trino-test", 1),
 		"routing group": strings.Replace(other, `"routing_group":"cell-other"`, `"routing_group":"cell-test"`, 1),
-		"endpoint":      strings.Replace(other, "other-blue.example", "blue.example", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := parseTrinoCellRegistry([]byte(`{"cells":[` + cell + `,` + second + `]}`)); err == nil {
-				t.Fatal("duplicate cell ownership accepted")
+				t.Fatal("duplicate ownership accepted")
 			}
 		})
 	}

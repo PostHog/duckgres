@@ -18,10 +18,10 @@ it("requires explicit selection even when only one registered cell exists", () =
   fireEvent.change(screen.getByLabelText("Trino cell"), { target: { value: "cell-test" } });
   expect(screen.getByLabelText("Location")).toHaveTextContent("active=true&cell=cell-test");
 });
-it("preserves the legacy operational default only when configured", () => {
+it("does not infer a default from a cell name", () => {
   hooks.useTrinoCells.mockReturnValue({ data: { cells: [{ id: "legacy" }, { id: "cell-test" }] } });
   mount();
-  expect(screen.getByLabelText("Trino cell")).toHaveValue("legacy");
+  expect(screen.getByLabelText("Trino cell")).toHaveValue("");
 });
 it("does not silently replace an unknown explicit cell", () => {
   mount("/trino/queries?cell=removed");

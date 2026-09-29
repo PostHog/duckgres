@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -26,6 +27,12 @@ func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, duck
 	if err != nil {
 		return nil, "", err
 	}
+	orgs, auditErr := store.ListTrinoEnabledOrgs()
+	if auditErr != nil {
+		slog.Warn("Cannot audit enabled Trino ownership.", "error", auditErr)
+	} else if count := unconfiguredTrinoOwnerCount(cells, orgs); count != 0 {
+		slog.Warn("Enabled Trino warehouses have no configured pool owner; review assignments before rollout.", "count", count)
+	}
 	fleet := make(trinoFleet, 0, len(cells))
 	for _, cell := range cells {
 		wire, err := buildTrinoCellWiring(store, kc, ducklings, cell, storageResolvers...)
@@ -37,7 +44,21 @@ func buildTrinoFleetWiring(store trinoWiringStore, kc kubernetes.Interface, duck
 	return fleet, defaultCell, nil
 }
 
-// enablementCheck requires placement when neither legacy nor a default is available.
+func unconfiguredTrinoOwnerCount(cells []trinoCell, orgs []configstore.TrinoEnabledOrg) int {
+	owners := make(map[string]bool, len(cells))
+	for _, cell := range cells {
+		owners[cell.ID] = true
+	}
+	count := 0
+	for _, org := range orgs {
+		if org.CellID == "" || !owners[org.CellID] {
+			count++
+		}
+	}
+	return count
+}
+
+// enablementCheck requires a configured owner or an explicit placement default.
 func (f trinoFleet) enablementCheck(store interface {
 	GetManagedWarehouseTrino(string) (*configstore.ManagedWarehouseTrino, error)
 }, defaultCell string) func(string) error {
@@ -46,9 +67,6 @@ func (f trinoFleet) enablementCheck(store interface {
 	}
 	owners := make(map[string]bool, len(f))
 	for _, wire := range f {
-		if wire.Cell.PublicID == "" && defaultCell == "" {
-			return nil
-		}
 		owners[wire.Cell.ID] = true
 	}
 	return func(orgID string) error {
@@ -101,9 +119,6 @@ func (f trinoFleet) adminAPI(orgs admin.TrinoOrgStore, audit *admin.AuditStore) 
 }
 
 func (w *trinoWiring) bundlePath() string {
-	if w.Cell.PublicID == "" {
-		return "/bundles/trino"
-	}
 	return "/bundles/trino/" + w.Cell.PublicID
 }
 

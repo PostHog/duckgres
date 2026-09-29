@@ -47,7 +47,7 @@ Use an authorized operator connection if a revoked job needs cancellation.
 The example contains nonfunctional placeholders, not valid tokens.
 Use a distinct cryptographically random token of at least 32 bytes for each cell.
 Each `cell_id` must exactly match its immutable stored ID in the active configured fleet; public display IDs and aliases are not accepted.
-Legacy cells use their exact configured stored ID, not an assumed `legacy` value.
+Use the exact stored `registered:<pool-id>` owner, not its public label alone.
 The file supports up to four rotation tokens per cell and 64 KiB in total.
 Unknown IDs, duplicate cells, tokens shared across cells, and reused admin or discovery tokens fail startup.
 An unmapped cell does not receive `trino_connect` in mint or renewal responses.
@@ -104,6 +104,6 @@ The disposable `tests/mw-dev/e2e/trino.sh` lane accepts `TRINO_SERVICE_CREDENTIA
 It then runs `e2e/trino-service-credentials.sh` against only its two freshly provisioned fixture tenants, testing statement submission, renewal without rotation, continuation polling, catalog isolation, wrong-tenant authentication, and revocation.
 It fails if the candidate control plane omits `trino_connect`; it never silently skips missing auth wiring.
 Before using this opt-in, configure the isolated fixture control plane and candidate Trino image with the cell-specific authentication token, control-plane cell map, and endpoint above.
-The fixture map uses the exact stored ID `ci-pr-<PR number>`; its public status label `legacy` is not the stored cell ID.
+The fixture map uses `registered:pool-test`; its public status label is `pool-test`.
 The lane checks the persisted assignment before minting and does not generate or mount these authentication files.
 The lane cannot prove cross-service behavior against an old Trino image that lacks the authenticator.

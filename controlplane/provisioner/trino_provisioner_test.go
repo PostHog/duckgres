@@ -6,9 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"regexp"
 	"sort"
@@ -29,13 +26,12 @@ import (
 
 // --- fakes ---
 
+const TrinoCustomerNamespace = "trino-test"
+
 type fakeTrinoStore struct {
-	mu       sync.Mutex
-	orgs     []configstore.TrinoEnabledOrg
-	states   map[string]configstore.TrinoStateUpdate // captured per-org state writes
-	cells    map[string]string                       // captured cell claims
-	cellErr  error                                   // injectable: fail AssignTrinoCell
-	claimLog []string
+	mu     sync.Mutex
+	orgs   []configstore.TrinoEnabledOrg
+	states map[string]configstore.TrinoStateUpdate // captured per-org state writes
 }
 
 func (s *fakeTrinoStore) ListTrinoEnabledOrgs() ([]configstore.TrinoEnabledOrg, error) {
@@ -54,27 +50,6 @@ func (s *fakeTrinoStore) UpdateTrinoState(orgID string, upd configstore.TrinoSta
 	}
 	s.states[orgID] = upd
 	return nil
-}
-
-func (s *fakeTrinoStore) ClaimTrinoCell(orgID, cellID string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.claimLog = append(s.claimLog, orgID+"->"+cellID)
-	if s.cellErr != nil {
-		return false, s.cellErr
-	}
-	if s.cells == nil {
-		s.cells = make(map[string]string)
-	}
-	s.cells[orgID] = cellID
-	// Mirror the real store: the claim is durable, so the next listing
-	// returns the row already stamped.
-	for i := range s.orgs {
-		if s.orgs[i].OrgID == orgID && s.orgs[i].CellID == "" {
-			s.orgs[i].CellID = cellID
-		}
-	}
-	return true, nil
 }
 
 func (s *fakeTrinoStore) lastState(orgID string) (configstore.TrinoStateUpdate, bool) {
@@ -138,18 +113,6 @@ type fakeCatalogClient struct {
 	dropped   []string
 	listErr   error
 	createErr error
-	nodes     []TrinoNode
-	nodesErr  error
-}
-
-func (c *fakeCatalogClient) ListNodes(context.Context) ([]TrinoNode, error) {
-	if c.nodesErr != nil {
-		return nil, c.nodesErr
-	}
-	if c.nodes != nil {
-		return append([]TrinoNode{}, c.nodes...), nil
-	}
-	return readyTrinoNodes(), nil
 }
 
 func (c *fakeCatalogClient) ListCatalogs(ctx context.Context) ([]string, error) {
@@ -802,15 +765,13 @@ func newTestTrinoProvisioner(t *testing.T, orgs []configstore.TrinoEnabledOrg, w
 			}
 			return h.ducklings[orgID], nil
 		},
-		Kubernetes:              h.kube,
-		SecretReadiness:         &fakeTrinoSecretReadiness{},
-		AuthenticationReadiness: &fakeTrinoAuthenticationReadiness{ready: true},
-		Namespace:               TrinoCustomerNamespace,
-		CellID:                  testCellID,
-		Catalog:                 h.catalog,
-		BundleStore:             h.bundles,
-		BundleBuilder:           h.builder,
-		AWSRegion:               "us-east-1",
+		Kubernetes:    h.kube,
+		Namespace:     TrinoCustomerNamespace,
+		CellID:        testCellID,
+		Catalog:       h.catalog,
+		BundleStore:   h.bundles,
+		BundleBuilder: h.builder,
+		AWSRegion:     "us-east-1",
 	})
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)
@@ -1505,32 +1466,6 @@ func TestTenantSecretNotMountedYetOnlyMatchesThisOrgsMissingPasswordFile(t *test
 
 // --- cell awareness ---
 
-func TestReconcile_ClaimsUnassignedOrgsIntoThisCell(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", CellID: "", RootPasswordHash: "$2a$10$h"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
-	if got := h.store.cells["42"]; got != testCellID {
-		t.Errorf("expected org 42 claimed into %q, got %q", testCellID, got)
-	}
-	if _, ok := h.catalog.created[TrinoCatalogName("db42")]; !ok {
-		t.Errorf("a newly claimed org must be reconciled in the same tick, got %+v", h.catalog.created)
-	}
-
-	// Second tick: the row is already stamped, so no re-claim.
-	before := len(h.store.claimLog)
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("Reconcile (2): %v", err)
-	}
-	if len(h.store.claimLog) != before {
-		t.Errorf("an already-claimed org must not be re-claimed, log=%v", h.store.claimLog)
-	}
-}
-
 func TestReconcile_IgnoresOrgsOwnedByAnotherCell(t *testing.T) {
 	orgs := []configstore.TrinoEnabledOrg{
 		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$hash42"},
@@ -1568,14 +1503,13 @@ func TestReconcile_IgnoresOrgsOwnedByAnotherCell(t *testing.T) {
 	}
 }
 
-func TestReconcile_FailedClaimDefersTheOrg(t *testing.T) {
+func TestReconcile_NeverClaimsUnassignedOrgs(t *testing.T) {
 	// A claim that doesn't land means ownership is unrecorded; projecting
 	// the tenant anyway risks two cells serving it.
 	orgs := []configstore.TrinoEnabledOrg{
 		{OrgID: "42", DatabaseName: "db42", CellID: "", RootPasswordHash: "$2a$10$h"},
 	}
 	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.store.cellErr = errors.New("db unavailable")
 
 	if err := h.provisioner.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1593,8 +1527,8 @@ func TestNewTrinoProvisioner_DefaultsCellAndMountPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTrinoProvisioner: %v", err)
 	}
-	if p.CellID() != configstore.DefaultTrinoCellID {
-		t.Errorf("CellID() = %q, want the default %q", p.CellID(), configstore.DefaultTrinoCellID)
+	if p.CellID() != testCellID {
+		t.Errorf("CellID() = %q, want the default %q", p.CellID(), testCellID)
 	}
 	if got := p.tenantPasswordFilePath("42"); got != DefaultTrinoTenantSecretMountPath+"/42" {
 		t.Errorf("tenantPasswordFilePath = %q, want the default mount path", got)
@@ -1612,23 +1546,10 @@ func TestNewTrinoProvisioner_DefaultsCellAndMountPath(t *testing.T) {
 	}
 }
 
-func TestRenderWithClauseDeterministic(t *testing.T) {
-	a := renderWithClause(map[string]string{"k1": "v1", "k2": "v2"})
-	b := renderWithClause(map[string]string{"k2": "v2", "k1": "v1"})
-	if a != b {
-		t.Errorf("renderWithClause not deterministic:\n a=%q\n b=%q", a, b)
-	}
-}
-
-func TestRenderWithClauseEscapesQuotes(t *testing.T) {
-	got := renderWithClause(map[string]string{"k": "v'with'quotes"})
-	if !strings.Contains(got, "v''with''quotes") {
-		t.Errorf("expected SQL-escaped quotes, got %q", got)
-	}
-}
-
 func baseTestOpts() TrinoProvisionerOpts {
 	return TrinoProvisionerOpts{
+		CellID:            testCellID,
+		Namespace:         TrinoCustomerNamespace,
 		Store:             &fakeTrinoStore{},
 		BootstrapSentinel: newFakeSentinel(),
 		Warehouses:        &fakeWarehouseStore{},
@@ -1847,50 +1768,6 @@ func TestReconcile_BundleGrantsObserverNoCatalog(t *testing.T) {
 // an operator (and the admin console's live view) tells reconcile-loop DDL
 // apart from tenant SQL. An untagged hop shows up as an unattributed query
 // from a privileged principal.
-func TestCatalogHTTPClientTagsItsSource(t *testing.T) {
-	var mu sync.Mutex
-	var sources, users []string
-
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		sources = append(sources, r.Header.Get("X-Trino-Source"))
-		users = append(users, r.Header.Get("X-Trino-User"))
-		hop := len(sources)
-		mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		if hop == 1 {
-			// First hop hands back a nextUri so the drain loop runs and
-			// the follow-up GET's headers are exercised too.
-			fmt.Fprintf(w, `{"id":"q1","nextUri":%q}`, srv.URL+"/v1/statement/q1/1")
-			return
-		}
-		fmt.Fprint(w, `{"id":"q1","data":[["system"]]}`)
-	}))
-	defer srv.Close()
-
-	c := NewTrinoCatalogHTTPClient(srv.URL, opa.AdminPrincipal, "pw", "")
-	if _, err := c.ListCatalogs(context.Background()); err != nil {
-		t.Fatalf("ListCatalogs: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(sources) < 2 {
-		t.Fatalf("expected the POST and at least one nextUri GET, got %d requests", len(sources))
-	}
-	for i, got := range sources {
-		if got != TrinoProvisionerSource {
-			t.Errorf("request %d: X-Trino-Source = %q, want %q", i, got, TrinoProvisionerSource)
-		}
-	}
-	for i, got := range users {
-		if got != opa.AdminPrincipal {
-			t.Errorf("request %d: X-Trino-User = %q, want %q", i, got, opa.AdminPrincipal)
-		}
-	}
-}
 
 func TestCatalogFilesystemCacheSetting(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
@@ -2247,44 +2124,6 @@ func TestTenantAdmissionGateIsInertWhenUnset(t *testing.T) {
 	provisioner.applyTenantAdmissionGate(outcomes)
 	if outcomes["org-a"].Pending {
 		t.Fatalf("an outcome changed with no gate installed: %+v", outcomes["org-a"])
-	}
-}
-
-// A pooled cell has no fixed coordinator, so the legacy readiness probe - which
-// asks one coordinator for its node inventory - cannot apply to it. Treating
-// that as a failure marked EVERY pooled warehouse failed on every tick with
-// "no coordinator client for node inventory"; the pool proves the same thing
-// per member, at admission.
-func TestPooledCellSkipsTheFixedCoordinatorReadinessProbe(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.catalog.nodesErr = ErrTrinoNodeInventoryUnavailable
-
-	if err := h.provisioner.Reconcile(context.Background()); err != nil {
-		t.Fatalf("reconcile with a pooled catalog client: %v", err)
-	}
-
-	if state := h.store.states["42"]; state.State == configstore.ManagedWarehouseStateFailed {
-		t.Fatalf("a pooled warehouse was marked failed by a probe that does not apply to it: %+v", state)
-	}
-}
-
-// The legacy path is unchanged: a fixed cell whose coordinator cannot answer is
-// still a failure, because there the inventory IS the readiness evidence.
-func TestFixedCellStillFailsWhenTheNodeInventoryIsUnreadable(t *testing.T) {
-	orgs := []configstore.TrinoEnabledOrg{
-		{OrgID: "42", DatabaseName: "db42", CellID: testCellID, RootPasswordHash: "$2a$10$h"},
-	}
-	h := newTestTrinoProvisioner(t, orgs, map[string]*configstore.ManagedWarehouse{"42": readyWarehouse("42")})
-	h.catalog.nodesErr = errors.New("coordinator unreachable")
-
-	if err := h.provisioner.Reconcile(context.Background()); err == nil {
-		t.Fatal("an unreadable node inventory was accepted on a fixed cell")
-	}
-	if state := h.store.states["42"]; state.State != configstore.ManagedWarehouseStateFailed {
-		t.Fatalf("org state = %+v, want Failed", state)
 	}
 }
 

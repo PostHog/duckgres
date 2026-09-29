@@ -1718,7 +1718,6 @@ func TestBackwardsGenerationFreezesAndKeepsTheLease(t *testing.T) {
 // the API object at the moment of the write - by both replicas, in either
 // order.
 func TestLeadershipSwitchPublishesTheAPIObjectNotTheReplicaSnapshot(t *testing.T) {
-	t.Setenv(envTrinoRegistryOnly, "true")
 	t.Setenv(envTrinoPoolEnabled, "true")
 	t.Setenv(envTrinoCellsFile, mountedRegistry(t, 3, 3))
 	client := poolConfigMap(t, 5, 4)

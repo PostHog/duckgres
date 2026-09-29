@@ -19,7 +19,7 @@ func TestTrinoServiceAuthSecretConfiguration(t *testing.T) {
 	adminSecret := strings.Repeat("a", 32)
 	adminTokens := admin.NewTokenSet(adminSecret, nil)
 	readOnlyTokens := admin.NewTokenSet(strings.Repeat("d", 32), nil)
-	fleet := trinoFleet{&trinoWiring{Cell: trinoCell{ID: "registered:cell-a"}}, &trinoWiring{Cell: trinoCell{ID: "legacy-stored-id"}}}
+	fleet := trinoFleet{&trinoWiring{Cell: trinoCell{ID: "registered:cell-a"}}, &trinoWiring{Cell: trinoCell{ID: "registered:cell-b"}}}
 	if got, err := fleet.loadTrinoServiceAuthCells(adminTokens, readOnlyTokens); err != nil || len(got) != 0 {
 		t.Fatalf("disabled: %v %v", got, err)
 	}
@@ -34,7 +34,7 @@ func TestTrinoServiceAuthSecretConfiguration(t *testing.T) {
 		cells []provisioning.TrinoServiceAuthCell
 		valid bool
 	}{
-		{"rotation", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a", good, strings.Repeat("c", 32)), cell("legacy-stored-id", strings.Repeat("e", 32))}, true},
+		{"rotation", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a", good, strings.Repeat("c", 32)), cell("registered:cell-b", strings.Repeat("e", 32))}, true},
 		{"empty", nil, false},
 		{"short", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a", "short")}, false},
 		{"no tokens", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a")}, false},
@@ -44,7 +44,7 @@ func TestTrinoServiceAuthSecretConfiguration(t *testing.T) {
 		{"public legacy alias", []provisioning.TrinoServiceAuthCell{cell("legacy", good)}, false},
 		{"empty cell", []provisioning.TrinoServiceAuthCell{cell("", good)}, false},
 		{"duplicate cells", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a", good), cell("registered:cell-a", strings.Repeat("e", 32))}, false},
-		{"shared token", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a", good), cell("legacy-stored-id", good)}, false},
+		{"shared token", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a", good), cell("registered:cell-b", good)}, false},
 		{"too many rotations", []provisioning.TrinoServiceAuthCell{cell("registered:cell-a", good, good, good, good, good)}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -59,7 +59,7 @@ func scopedCatalogWriter(t *testing.T, poolID string, store trinoPoolRevisionSto
 	t.Setenv(envTrinoPoolCatalogCellID, testCatalogPartition)
 
 	writer, err := buildTrinoPoolCatalogWriter(poolID, store,
-		func() (configstore.TrinoPoolLease, bool) { return lease, true }, nil)
+		func() (configstore.TrinoPoolLease, bool) { return lease, true })
 	if err != nil || writer == nil {
 		t.Fatalf("build the catalog writer: %v", err)
 	}

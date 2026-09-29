@@ -146,7 +146,7 @@ jobs:
       - name: Test e2e harness scripts
         env:
           E2E_SUITE: neutral
-        run: go test -count=1 ./tests/mw-dev
+        run: go test -count=1 ./tests/mw-dev/...
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1

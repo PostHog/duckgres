@@ -400,17 +400,6 @@ type ManagedWarehouse struct {
 
 func (ManagedWarehouse) TableName() string { return "duckgres_managed_warehouses" }
 
-// DefaultTrinoCellID is the cell every Trino-enabled org lands on until a
-// second cell exists. Cells are the unit a shared Trino cluster is scaled
-// in: one coordinator + worker fleet + one OPA sidecar per cell, with the
-// orgs assigned to it. Today there is exactly ONE, named by
-// DUCKGRES_TRINO_CELL_ID; the column exists so adding a second cell is a
-// data change plus a per-cell coordinator lookup, not a schema migration
-// mid-incident. There is deliberately NO assignment policy, rebalancer, or
-// fleet manager — an org lands on the cell whose provisioner claims it
-// first, and today only one provisioner runs.
-const DefaultTrinoCellID = "cell-001"
-
 // ManagedWarehouseTrino captures per-org opt-in for the shared, multi-tenant
 // Trino cell. Trino access is granted at the org level: when Enabled is true,
 // the provisioner extension (controlplane/provisioner/trino_provisioner.go)
@@ -450,8 +439,7 @@ type ManagedWarehouseTrino struct {
 	Tier string `gorm:"size:64" json:"tier"`
 
 	// TrinoCellID names the Trino cell that owns this org. Empty means
-	// UNASSIGNED: the first reconciling provisioner claims the org into its
-	// own cell (AssignTrinoCell) and every later tick sees the stamp. A
+	// UNASSIGNED: explicit selection or the configured default selects a pool. A
 	// provisioner NEVER touches an org stamped with a different cell — that
 	// is what keeps two cells from both projecting the same tenant.
 	TrinoCellID string `gorm:"column:trino_cell_id;size:64" json:"trino_cell_id"`
