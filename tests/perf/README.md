@@ -337,8 +337,10 @@ Both clusters load the same Alluxio and memory cache managers.
 Each node has a 16GB disk-cache budget in a 20Gi ephemeral volume, with 64kB pages
 and a seven-day TTL. For connectors that use this cache, entries persist between
 queries/iterations until eviction or teardown; one warm-up does not guarantee
-every replica holds the complete working set. Worker CPU/memory limits remain
-three workers at 1 CPU/4Gi per cluster; cache volumes reserve additional storage.
+every replica holds the complete working set. Each comparison cluster uses
+three workers at 7 CPU / 28 GiB each, matching the DuckDB worker's aggregate
+21 CPU / 84 GiB budget. The auxiliary bootstrap cluster retains three workers
+at 1 CPU / 4 GiB each; cache volumes reserve additional storage.
 
 The frozen suite runs the newest PostHog/trino master build, whose Hoglake
 connector honors `fs.cache.enabled` through Trino's shared filesystem module
