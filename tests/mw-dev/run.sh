@@ -11,6 +11,14 @@
 #   EKS_CLUSTER_NAME, AWS_REGION.
 set -euo pipefail
 
+# Diagnostic subprocess errors can contain endpoints, SQL, or credentials.
+# Fail closed: expose only exit status, and retain query evidence encrypted.
+if [ "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" = true ]; then
+  exec 3>&1
+  exec >/dev/null 2>&1
+  trap 'rc=$?; printf "Distinct profiling command completed (exit %s).\n" "$rc" >&3' EXIT
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTX="${KUBE_CONTEXT:?}"
 # NAMESPACE is required by deploy|test|diagnostics|teardown but NOT by
@@ -990,8 +998,10 @@ YAML
     delete_scenario_job "$job" || true
     return 1
   fi
-  "${KUBECTL[@]}" -n "$NS" logs -f "pod/$pod" -c scenario \
-    --pod-running-timeout="${SCENARIO_POD_START_TIMEOUT_SECONDS}s" || true
+  if [ "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" != true ]; then
+    "${KUBECTL[@]}" -n "$NS" logs -f "pod/$pod" -c scenario \
+      --pod-running-timeout="${SCENARIO_POD_START_TIMEOUT_SECONDS}s" || true
+  fi
   wait_for_scenario_container "$pod" || container_rc=$?
   if [ "$container_rc" -ne 0 ]; then
     echo "Scenario container for $job did not reach a terminated state; refusing to collect a potentially partial snapshot." >&2
@@ -1161,6 +1171,9 @@ release_artifact_keeper() {
 }
 
 cmd_diagnostics() {
+  if [ "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" = true ]; then
+    return 0
+  fi
   local cell_uid color
   cell_uid="$(trino_cell_namespace_uid 2>/dev/null || true)"
   if [ -n "$cell_uid" ]; then

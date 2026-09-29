@@ -118,3 +118,37 @@ func TestDistinctTracingReusesDevConfiguration(t *testing.T) {
 		})
 	}
 }
+
+func TestDistinctDiagnosticsNeverCollectOrPrintRawData(t *testing.T) {
+	fakes := newRunSHFakes(t)
+	cmd := runSHCommand(t, fakes.binDir, "diagnostics", "DUCKGRES_SCENARIO_PROFILE_DISTINCT=true")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("diagnostics failed: %v", err)
+	}
+	if string(out) != "Distinct profiling command completed (exit 0).\n" {
+		t.Fatal("diagnostic output was not limited to sanitized status")
+	}
+	if calls := fakes.calls(t); strings.Contains(calls, "kubectl") {
+		t.Fatal("distinct diagnostics collected Kubernetes data")
+	}
+}
+
+func TestDistinctWorkflowUploadsOnlyEncryptedProfiles(t *testing.T) {
+	raw, err := os.ReadFile("../../.github/workflows/scenario-dev.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(raw)
+	for _, requirement := range []string{
+		"- name: Publish scenario summary\n        if: ${{ always() && !inputs.profile_distinct }}",
+		"- name: Collect diagnostics\n        if: ${{ failure() && !inputs.profile_distinct }}",
+		"- name: Upload scenario artifacts\n        if: ${{ always() && !inputs.profile_distinct }}",
+		"- name: Upload encrypted distinct profiles\n        if: ${{ always() && inputs.profile_distinct }}",
+		"path: artifacts/scenario-dev/**/profile-*.json.age",
+	} {
+		if !strings.Contains(workflow, requirement) {
+			t.Fatalf("missing distinct privacy guard: %s", requirement)
+		}
+	}
+}

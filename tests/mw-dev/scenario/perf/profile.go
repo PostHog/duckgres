@@ -169,6 +169,20 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 			}
 		}
 	}
+	if os.Getenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT") == "true" {
+		// Ordinary CSV/event artifacts are never uploaded for this diagnostic.
+		// Keep measured samples alongside the private plan before encryption.
+		for _, name := range []string{"query_results.csv", "query_service_metrics.csv"} {
+			contents, err := os.ReadFile(filepath.Join(outputDir, name))
+			if err != nil {
+				if profileErr == nil {
+					profileErr = fmt.Errorf("diagnostic timing artifact unavailable")
+				}
+				continue
+			}
+			document[name] = string(contents)
+		}
+	}
 	document["explain_analyze"] = plan
 	if profileErr != nil {
 		document["error"] = profileErr.Error()

@@ -267,7 +267,7 @@ jobs:
         run: tests/mw-dev/run.sh test-scenario
 
       - name: Publish scenario summary
-        if: always()
+        if: ${{ always() && !inputs.profile_distinct }}
         run: |
           set -euo pipefail
           summary_file="$(find artifacts/scenario-dev -type f -name scenario_summary.md -print -quit 2>/dev/null || true)"
@@ -282,7 +282,7 @@ jobs:
           fi
 
       - name: Collect diagnostics
-        if: failure()
+        if: ${{ failure() && !inputs.profile_distinct }}
         run: tests/mw-dev/run.sh diagnostics
 
       - name: Teardown
@@ -290,11 +290,20 @@ jobs:
         run: tests/mw-dev/run.sh teardown
 
       - name: Upload scenario artifacts
-        if: always()
+        if: ${{ always() && !inputs.profile_distinct }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scenario-dev-${{ env.SCENARIO_NAME }}-${{ github.run_id }}-${{ github.run_attempt }}${{ matrix.artifact_suffix }}
           path: artifacts/scenario-dev/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload encrypted distinct profiles
+        if: ${{ always() && inputs.profile_distinct }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distinct-profile-${{ github.run_id }}-${{ github.run_attempt }}${{ matrix.artifact_suffix }}
+          path: artifacts/scenario-dev/**/profile-*.json.age
           if-no-files-found: warn
           retention-days: 14
 

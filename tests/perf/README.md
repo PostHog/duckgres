@@ -503,7 +503,7 @@ VictoriaTraces endpoint, with its Jaeger query API on the same origin. The
 resolved endpoint is masked and reused at runtime; no new secret is required.
 Both deployment and scenario execution resolve it independently. Distinct runs enable
 full sampling on their comparison coordinator and workers. Diagnostic timings
-are retained in workflow artifacts and never published to historical series. The scenario runner
+are included in the encrypted profile and never published to historical series. The scenario runner
 uses the same endpoint to retrieve the query-specific trace; store raw traces,
 plans, results, and internal identifiers only in the encrypted diagnostic artifact.
 Decrypt locally using the existing age instructions above. Check the trace and
@@ -518,4 +518,6 @@ configuration. Ordinary runs and cleanup never read this configuration.
 Use the existing isolated scenario deployment entrypoint; do not apply these
 settings to a production cluster. Missing collector configuration fails rendering;
 profile or trace capture failures preserve encrypted partial diagnostics and fail
-the run. Existing always-run teardown owns cleanup.
+the run. Distinct runs suppress raw command and pod logs, skip cluster diagnostic
+collection and public scenario summaries, and upload only encrypted profile files.
+No ordinary CSV, event, or raw diagnostic artifact is uploaded. Existing always-run teardown owns cleanup.
