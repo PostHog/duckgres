@@ -107,3 +107,17 @@ func TestDistinctTracePreservesIncompleteResponse(t *testing.T) {
 		t.Fatalf("expected retained incomplete trace and numeric completeness: %s, %v", raw, err)
 	}
 }
+
+func TestDistinctTraceAcceptsLargeValidResponse(t *testing.T) {
+	// Split-heavy queries can export traces larger than 32 MiB. Keep the fixture
+	// synthetic while exercising the HTTP reader and JSON validation together.
+	response := `{"data":[{"spans":[{"operationName":"stage","duration":1000,"tags":[{"key":"trino.query_id","value":"query-test"},{"key":"trino.stage_id","value":"query-test.0"},{"key":"synthetic.padding","value":"` + strings.Repeat("x", 40<<20) + `"}]}]}]}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, response)
+	}))
+	defer server.Close()
+	raw, err := captureDistinctTraceFrom(context.Background(), server.URL, []byte(`{"queryId":"query-test","stages":{"stages":[{"stageId":"query-test.0"}]}}`), time.Millisecond)
+	if err != nil || len(raw) != len(response) {
+		t.Fatalf("expected complete large trace: bytes=%d, err=%v", len(raw), err)
+	}
+}

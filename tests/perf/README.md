@@ -506,6 +506,7 @@ full sampling on their comparison coordinator and workers. Diagnostic timings
 are included in the encrypted profile and never published to historical series. The scenario runner
 uses the same endpoint to retrieve the query-specific trace; store raw traces,
 plans, results, and internal identifiers only in the encrypted diagnostic artifact.
+Trace responses are limited to 64 MiB; larger responses fail capture.
 Decrypt locally using the existing age instructions above. Check the trace and
 operator statistics together: stage lifetimes overlap and include waiting.
 

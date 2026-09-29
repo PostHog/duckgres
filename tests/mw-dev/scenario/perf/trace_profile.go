@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const maxDistinctTraceBytes = 32 << 20
+const maxDistinctTraceBytes = 64 << 20
 
 // captureDistinctTrace returns private diagnostic data for encrypted storage only.
 // Export can lag query completion, so searches missing expected stage spans are
