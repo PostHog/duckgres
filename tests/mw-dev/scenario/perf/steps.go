@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -169,6 +170,9 @@ func (e *Executor) ExecuteStep(ctx context.Context, step core.Step) error {
 	spec, err := e.parseStep(step)
 	if err != nil {
 		return err
+	}
+	if os.Getenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT") == "true" {
+		spec.CatalogFile = filepath.Join(filepath.Dir(spec.CatalogFile), "ducklake_posthog_tables.yaml")
 	}
 	catalog, err := perfcore.LoadCatalog(spec.CatalogFile)
 	if err != nil {

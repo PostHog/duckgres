@@ -143,9 +143,48 @@ trino_multicell_enabled() {
   [ "$E2E_SUITE" = trino ] && [ "$SCENARIO_NAME" = full-suite ]
 }
 
+# Reuse only the existing dev tracing destination; never dump whole config maps.
+# Both commands run in separate processes, so each resolves and exports it.
+resolve_distinct_tracing() {
+  [ "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" = true ] || return 0
+  local config endpoint="" candidate enabled protocol name
+  for name in trino-coordinator trino-worker; do
+    if ! config="$("${KUBECTL[@]}" -n trino get configmap "$name" -o 'jsonpath={.data.config\.properties}' 2>/dev/null)"; then
+      echo "Unable to read existing dev Trino tracing configuration" >&2; return 1
+    fi
+    enabled="$(printf '%s\n' "$config" | awk -F= '$1 ~ /^[[:space:]]*tracing[.]enabled[[:space:]]*$/ {value=substr($0,index($0,"=")+1);gsub(/^[[:space:]]+|[[:space:]]+$/,"",value);print value}')"
+    protocol="$(printf '%s\n' "$config" | awk -F= '$1 ~ /^[[:space:]]*otel[.]exporter[.]protocol[[:space:]]*$/ {value=substr($0,index($0,"=")+1);gsub(/^[[:space:]]+|[[:space:]]+$/,"",value);print value}')"
+    candidate="$(printf '%s\n' "$config" | awk -F= '$1 ~ /^[[:space:]]*otel[.]exporter[.]endpoint[[:space:]]*$/ {value=substr($0,index($0,"=")+1);gsub(/^[[:space:]]+|[[:space:]]+$/,"",value);print value}')"
+    if [ "$enabled" != true ] || [ "$protocol" != http/protobuf ] || [[ ! "$candidate" =~ ^https?://[a-zA-Z0-9._:/-]+$ ]]; then
+      echo "Existing dev Trino tracing must enable HTTP/protobuf with a valid endpoint" >&2; return 1
+    fi
+    if [ -n "$endpoint" ] && [ "$endpoint" != "$candidate" ]; then
+      echo "Existing dev Trino tracing destinations disagree" >&2; return 1
+    fi
+    endpoint="$candidate"
+  done
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then printf '::add-mask::%s\n' "$endpoint"; fi
+  export DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT="$endpoint"
+}
+
 # Bootstrap and general E2E keep the small fleet. Only comparison clusters
 # use dev-sized workers; both cache modes use the same profile.
 render_trino_template() {
+  local TRINO_DISTINCT_COMMON="" TRINO_DISTINCT_COORDINATOR="" TRINO_DISTINCT_WORKER=""
+  if [ "${1:-}" = perf ] && [ "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" = true ]; then
+    case "${DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY:-16MB}" in 16MB|64MB) ;; *) echo "Invalid distinct partial budget" >&2; return 1 ;; esac
+    case "${DUCKGRES_SCENARIO_DISTINCT_DICTIONARY:-false}" in true|false) ;; *) echo "Invalid distinct dictionary setting" >&2; return 1 ;; esac
+    if [[ ! "${DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT:-}" =~ ^https?://[a-zA-Z0-9._:/-]+$ ]]; then
+      echo "Distinct profiling requires a valid OTLP HTTP endpoint" >&2; return 1
+    fi
+    TRINO_DISTINCT_COMMON="    tracing.enabled=true
+    otel.exporter.protocol=http/protobuf
+    otel.exporter.endpoint=${DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT}
+    otel.tracing.sampling-ratio=1"
+    TRINO_DISTINCT_COORDINATOR="    optimizer.dictionary-aggregation=${DUCKGRES_SCENARIO_DISTINCT_DICTIONARY:-false}"
+    TRINO_DISTINCT_WORKER="    task.max-partial-aggregation-memory=${DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY:-16MB}"
+  fi
+  export TRINO_DISTINCT_COMMON TRINO_DISTINCT_COORDINATOR TRINO_DISTINCT_WORKER
   local TRINO_WORKER_CPU=1 TRINO_WORKER_MEMORY=4Gi TRINO_WORKER_HEAP=3G
   local TRINO_QUERY_MEMORY=6GB TRINO_WORKER_QUERY_MEMORY=2GB
   local TRINO_WORKER_THREADS=24 TRINO_WORKER_MIN_DRIVERS=48
@@ -156,7 +195,11 @@ render_trino_template() {
   fi
   export TRINO_WORKER_CPU TRINO_WORKER_MEMORY TRINO_WORKER_HEAP
   export TRINO_QUERY_MEMORY TRINO_WORKER_QUERY_MEMORY TRINO_WORKER_THREADS TRINO_WORKER_MIN_DRIVERS
-  envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD $TRINO_WORKER_CPU $TRINO_WORKER_MEMORY $TRINO_WORKER_HEAP $TRINO_QUERY_MEMORY $TRINO_WORKER_QUERY_MEMORY $TRINO_WORKER_THREADS $TRINO_WORKER_MIN_DRIVERS' < "$HERE/manifests.trino.tmpl.yaml"
+  envsubst '$NAMESPACE $PR_NUMBER $TRINO_IMAGE $TRINO_TLS_PASSWORD $TRINO_CA_CERT_B64 $TRINO_SERVER_P12_B64 $CONFIG_STORE_PASSWORD $TRINO_WORKER_CPU $TRINO_WORKER_MEMORY $TRINO_WORKER_HEAP $TRINO_QUERY_MEMORY $TRINO_WORKER_QUERY_MEMORY $TRINO_WORKER_THREADS $TRINO_WORKER_MIN_DRIVERS' < "$HERE/manifests.trino.tmpl.yaml" | awk '
+    { print }
+    /^    coordinator=true$/ && ENVIRON["TRINO_DISTINCT_COMMON"] != "" { print ENVIRON["TRINO_DISTINCT_COMMON"]; print ENVIRON["TRINO_DISTINCT_COORDINATOR"] }
+    /^    coordinator=false$/ && ENVIRON["TRINO_DISTINCT_COMMON"] != "" { print ENVIRON["TRINO_DISTINCT_COMMON"]; print ENVIRON["TRINO_DISTINCT_WORKER"] }
+  '
 }
 
 trino_perf_modes() {
@@ -903,6 +946,10 @@ spec:
             - { name: DUCKGRES_SCENARIO_OUTPUT_BASE, value: "/artifacts/scenario-dev" }
             - { name: DUCKGRES_SCENARIO_RUN_ID, value: "$DUCKGRES_SCENARIO_RUN_ID" }
             - { name: DUCKGRES_SCENARIO_COVERAGE_TARGET, value: "${DUCKGRES_SCENARIO_COVERAGE_TARGET:-}" }
+            - { name: DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT, value: "${DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT:-}" }
+            - { name: DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY, value: "${DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY:-16MB}" }
+            - { name: DUCKGRES_SCENARIO_DISTINCT_DICTIONARY, value: "${DUCKGRES_SCENARIO_DISTINCT_DICTIONARY:-false}" }
+            - { name: DUCKGRES_SCENARIO_PROFILE_DISTINCT, value: "${DUCKGRES_SCENARIO_PROFILE_DISTINCT:-false}" }
             - { name: DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL, value: "${DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL:-false}" }
             - { name: DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL, value: "${DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL:-false}" }
             - { name: DUCKGRES_SCENARIO_PROFILE_RECIPIENT, value: "${DUCKGRES_SCENARIO_PROFILE_RECIPIENT:-}" }
@@ -1291,9 +1338,9 @@ cmd_e2e_cleanup() {
 }
 
 case "${1:?usage: run.sh deploy|test-e2e|test-scenario|diagnostics|teardown|e2e-cleanup}" in
-  deploy) : "${NAMESPACE:?}"; require_pr_identity; cmd_deploy ;;
+  deploy) : "${NAMESPACE:?}"; require_pr_identity; resolve_distinct_tracing; cmd_deploy ;;
   test-e2e|test) : "${NAMESPACE:?}"; require_pr_identity; cmd_test_e2e ;;
-  test-scenario) : "${NAMESPACE:?}"; require_pr_identity; cmd_test_scenario ;;
+  test-scenario) : "${NAMESPACE:?}"; require_pr_identity; resolve_distinct_tracing; cmd_test_scenario ;;
   diagnostics) : "${NAMESPACE:?}"; require_pr_identity; cmd_diagnostics ;;
   teardown) : "${NAMESPACE:?}"; require_pr_identity; cmd_teardown ;;
   e2e-cleanup) cmd_e2e_cleanup ;;

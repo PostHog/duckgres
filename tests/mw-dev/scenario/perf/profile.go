@@ -21,11 +21,16 @@ const funnelIntent = "intent_coverage_ordered_funnel_v1"
 // Profiling is deliberately restricted to this bounded aggregate workload.
 // No raw plans, query info or result values enter public logs or artifacts.
 func profileCatalog(catalog perfcore.Catalog) (perfcore.Catalog, string, error) {
+	distinct := os.Getenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT") == "true"
+	funnel := os.Getenv("DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL") == "true"
+	if distinct && funnel {
+		return catalog, "", fmt.Errorf("profiling modes are mutually exclusive")
+	}
 	experiment := os.Getenv("DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL") == "true"
 	if experiment && os.Getenv("DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL") != "true" {
 		return catalog, "", fmt.Errorf("funnel experiment requires profiling")
 	}
-	if os.Getenv("DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL") != "true" {
+	if !funnel && !distinct {
 		return catalog, "", nil
 	}
 	recipient := os.Getenv("DUCKGRES_SCENARIO_PROFILE_RECIPIENT")
@@ -36,6 +41,9 @@ func profileCatalog(catalog perfcore.Catalog) (perfcore.Catalog, string, error) 
 		return catalog, "", fmt.Errorf("profiling requires age on PATH")
 	}
 	for _, target := range catalog.Targets {
+		if distinct && target != perfcore.ProtocolTrino && target != perfcore.ProtocolTrinoCached {
+			return catalog, "", fmt.Errorf("distinct profiling requires Trino targets")
+		}
 		if experiment && target != perfcore.ProtocolTrino && target != perfcore.ProtocolTrinoCached {
 			return catalog, "", fmt.Errorf("funnel experiment requires Trino targets")
 		}
@@ -43,9 +51,15 @@ func profileCatalog(catalog perfcore.Catalog) (perfcore.Catalog, string, error) 
 			return catalog, "", fmt.Errorf("unsupported profiling target")
 		}
 	}
+	intent := funnelIntent
+	if distinct {
+		intent = "intent_events_distinct_persons_v5"
+		catalog.WarmupIterations = 5
+		catalog.MeasureIterations = 5
+	}
 	var queries []perfcore.Query
 	for _, query := range catalog.Queries {
-		if query.IntentID == funnelIntent {
+		if query.IntentID == intent {
 			if len(query.Params) != 0 {
 				return catalog, "", fmt.Errorf("profiling requires a parameter-free query")
 			}
@@ -53,7 +67,7 @@ func profileCatalog(catalog perfcore.Catalog) (perfcore.Catalog, string, error) 
 		}
 	}
 	if len(queries) == 0 {
-		return catalog, "", fmt.Errorf("ordered funnel query missing from catalog")
+		return catalog, "", fmt.Errorf("profiling query missing from catalog")
 	}
 	catalog.Queries = queries
 	return catalog, recipient, nil
@@ -88,6 +102,12 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 		"protocol": driver.Protocol(), "query_id": query.QueryID, "sql": query.CanonicalSQL(),
 		"frozen_source": os.Getenv("DUCKGRES_SCENARIO_FROZEN_S3_URI"),
 	}
+	if os.Getenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT") == "true" {
+		document["diagnostic_configuration"] = map[string]string{
+			"partial_aggregation_memory": os.Getenv("DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY"),
+			"dictionary_aggregation":     os.Getenv("DUCKGRES_SCENARIO_DISTINCT_DICTIONARY"),
+		}
+	}
 	versionQuery := perfcore.Query{PGWireSQL: "SELECT version()"}
 	if driver.Protocol() == perfcore.ProtocolPGWireCached || driver.Protocol() == perfcore.ProtocolPGWireUncached {
 		// version() is a PostgreSQL compatibility string on the pgwire endpoint.
@@ -115,6 +135,13 @@ func captureProfile(ctx context.Context, driver perfcore.ProtocolDriver, query p
 			plan, raw, profileErr = profiler.Profile(ctx, query)
 			if json.Valid(raw) {
 				document["query_info"] = json.RawMessage(raw)
+				if os.Getenv("DUCKGRES_SCENARIO_PROFILE_DISTINCT") == "true" && profileErr == nil {
+					var trace json.RawMessage
+					trace, profileErr = captureDistinctTrace(ctx, raw)
+					if len(trace) > 0 {
+						document["trace"] = trace
+					}
+				}
 			}
 			if profileErr == nil && experiment != nil {
 				var rewrittenPlan [][]*string

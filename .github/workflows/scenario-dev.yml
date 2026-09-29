@@ -14,6 +14,15 @@ on:
         default: all
         type: choice
         options: [all, pgwire_uncached, pgwire_cached, trino, trino_cached, athena]
+      profile_distinct:
+        description: Profile exact distinct on isolated Trino workers
+        type: boolean
+        default: false
+      distinct_variant:
+        description: Exact distinct diagnostic treatment
+        type: choice
+        options: [baseline, memory64, dictionary]
+        default: baseline
       profile_ordered_funnel:
         description: Capture ordered funnel diagnostics after timings (extended scenario only)
         required: false
@@ -78,12 +87,19 @@ jobs:
           experiment = str(inputs.get("experiment_ordered_funnel", "false")).lower() == "true"
           if experiment and not profile:
               raise SystemExit("Funnel experiment requires profiling")
-          if profile:
+          distinct = str(inputs.get("profile_distinct", "false")).lower() == "true"
+          if distinct and (profile or experiment):
+              raise SystemExit("Distinct profiling cannot combine with funnel profiling")
+          if distinct:
+              if inputs.get("distinct_variant", "baseline") not in ("baseline", "memory64", "dictionary"):
+                  raise SystemExit("Unsupported distinct diagnostic variant")
+              targets = ["trino", "trino_cached"]
+          if profile or distinct:
               if scenario != "posthog_frozen_perf_extended":
-                  raise SystemExit("Ordered funnel profiling requires posthog_frozen_perf_extended")
+                  raise SystemExit("Profiling requires posthog_frozen_perf_extended")
               if not re.fullmatch(r"age1[a-z0-9]+", inputs.get("profile_recipient", "")):
-                  raise SystemExit("Ordered funnel profiling requires an age public recipient")
-              targets.remove("athena")
+                  raise SystemExit("Profiling requires an age public recipient")
+              if "athena" in targets: targets.remove("athena")
           if experiment:
               targets = ["trino", "trino_cached"]
           if scenario == "posthog_frozen_perf_extended":
@@ -168,9 +184,12 @@ jobs:
       TRINO_POD_IDENTITY_ROLE: ${{ secrets.MW_DEV_TRINO_POD_IDENTITY_ROLE }}
       E2E_SUITE: ${{ (github.event_name == 'schedule' || inputs.scenario == 'posthog_frozen_perf' || (inputs.scenario == 'posthog_frozen_perf_extended' && (matrix.target == 'trino' || matrix.target == 'trino_cached'))) && 'trino' || 'neutral' }}
       DUCKGRES_SCENARIO_COVERAGE_TARGET: ${{ matrix.target }}
+      DUCKGRES_SCENARIO_PROFILE_DISTINCT: ${{ inputs.profile_distinct || false }}
+      DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY: ${{ inputs.profile_distinct && inputs.distinct_variant == 'memory64' && '64MB' || '16MB' }}
+      DUCKGRES_SCENARIO_DISTINCT_DICTIONARY: ${{ inputs.profile_distinct && inputs.distinct_variant == 'dictionary' || false }}
       DUCKGRES_SCENARIO_PROFILE_ORDERED_FUNNEL: ${{ inputs.profile_ordered_funnel || false }}
       DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL: ${{ inputs.experiment_ordered_funnel || false }}
-      DUCKGRES_SCENARIO_PROFILE_RECIPIENT: ${{ inputs.profile_ordered_funnel && inputs.profile_recipient || '' }}
+      DUCKGRES_SCENARIO_PROFILE_RECIPIENT: ${{ (inputs.profile_ordered_funnel || inputs.profile_distinct) && inputs.profile_recipient || '' }}
       PR_NUMBER: ${{ github.run_id }}${{ matrix.id_suffix }}
       NAMESPACE: duckgres-ci-pr-${{ github.run_id }}${{ matrix.id_suffix }}
       TRINO_IMAGE: ${{ needs.plan.outputs.trino_image }}
@@ -280,7 +299,7 @@ jobs:
           retention-days: 14
 
       - name: Publish scenario perf results
-        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        if: ${{ always() && github.ref == 'refs/heads/main' && !inputs.profile_distinct }}
         timeout-minutes: 10
         env:
           MW_DEV_SCENARIO_PERF_SECRET_ID: ${{ vars.MW_DEV_SCENARIO_PERF_SECRET_ID }}

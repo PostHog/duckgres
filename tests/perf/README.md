@@ -477,3 +477,45 @@ replacements for the catalog's ordinary results. The encrypted profile's
 and full coordinator query info; the top-level plan remains the original.
 A mismatch fails the run and retains available encrypted diagnostics. The local
 equivalent flag is `DUCKGRES_SCENARIO_EXPERIMENT_ORDERED_FUNNEL=true`.
+
+# Focused exact distinct profiling
+
+Manual `scenario-dev` runs with `scenario=posthog_frozen_perf_extended`,
+`coverage_target=trino_cached` (or `trino`), and `profile_distinct=true` select
+only `intent_events_distinct_persons_v5` from the core frozen query catalog.
+They run five warmups and five measured samples before the separate encrypted
+EXPLAIN/query-info/trace capture. This mode excludes Athena and cannot combine
+with funnel profiling or its rewrite experiment. Normal runs remain unchanged.
+
+Pin `trino_image` and use the same resource configuration for all comparisons.
+`distinct_variant` defaults to `baseline` (16MB partial aggregation budget,
+dictionary aggregation disabled). Choose `memory64` for a 64MB partial budget,
+or `dictionary` to enable dictionary aggregation with the baseline 16MB budget. These settings
+apply only to the isolated comparison workers/coordinator. Bootstrap resources
+retain their ordinary configuration. Each workflow run recreates its isolated
+cluster; allow cache and JIT warmup before interpreting measured samples.
+
+Set `profile_recipient` to an age public recipient, keeping the private key local.
+The isolated runner reads the existing dev `trino-coordinator` and `trino-worker`
+ConfigMaps in namespace `trino`, requiring read-only access to their
+`config.properties`. Both must enable HTTP/protobuf tracing and agree on the
+VictoriaTraces endpoint, with its Jaeger query API on the same origin. The
+resolved endpoint is masked and reused at runtime; no new secret is required.
+Both deployment and scenario execution resolve it independently. Distinct runs enable
+full sampling on their comparison coordinator and workers. Diagnostic timings
+are retained in workflow artifacts and never published to historical series. The scenario runner
+uses the same endpoint to retrieve the query-specific trace; store raw traces,
+plans, results, and internal identifiers only in the encrypted diagnostic artifact.
+Decrypt locally using the existing age instructions above. Check the trace and
+operator statistics together: stage lifetimes overlap and include waiting.
+
+For local execution the corresponding environment variables are
+`DUCKGRES_SCENARIO_PROFILE_DISTINCT=true`,
+`DUCKGRES_SCENARIO_DISTINCT_PARTIAL_MEMORY=16MB`,
+`DUCKGRES_SCENARIO_DISTINCT_DICTIONARY=false`, and the existing profile recipient.
+The isolated runner exports `DUCKGRES_SCENARIO_TRINO_OTLP_ENDPOINT` from dev
+configuration. Ordinary runs and cleanup never read this configuration.
+Use the existing isolated scenario deployment entrypoint; do not apply these
+settings to a production cluster. Missing collector configuration fails rendering;
+profile or trace capture failures preserve encrypted partial diagnostics and fail
+the run. Existing always-run teardown owns cleanup.
